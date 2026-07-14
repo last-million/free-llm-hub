@@ -25,6 +25,7 @@ import secrets
 import stat
 import tempfile
 import threading
+import time
 from typing import Optional
 
 
@@ -89,7 +90,28 @@ def save_config(cfg: dict) -> None:
                 os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
             except OSError:
                 pass
-        os.replace(tmp_path, path)
+        # os.replace is atomic, but on Windows an antivirus scanner or a cloud
+        # sync client (OneDrive/Dropbox) can briefly hold a handle on the
+        # destination or temp file -> PermissionError [WinError 5]. Retry a few
+        # times with tiny backoff; if it still fails, fall back to a direct
+        # (non-atomic) write so a save NEVER 500s the app. Cross-platform safe.
+        replaced = False
+        for _attempt in range(6):
+            try:
+                os.replace(tmp_path, path)
+                replaced = True
+                break
+            except PermissionError:
+                time.sleep(0.15)
+            except OSError:
+                break
+        if not replaced:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(data)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     except BaseException:
         try:
             os.unlink(tmp_path)
