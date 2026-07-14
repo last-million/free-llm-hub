@@ -227,12 +227,16 @@
   .site-footer {
     max-width: 1120px; margin: 8px auto 34px; padding: 20px 22px 0;
     border-top: 1px solid var(--line, rgba(255,255,255,.08));
-    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    display: flex; flex-direction: column; gap: 8px;
     font-size: 12.5px; color: var(--muted, #8a8f98);
   }
+  .site-footer .footer-line { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .site-footer strong { color: var(--fg, #e8eaed); font-weight: 600; }
   .site-footer .footer-sep { opacity: .5; }
   .site-footer .footer-brand { opacity: .75; }
+  .site-footer .footer-legal {
+    font-size: 11.5px; line-height: 1.55; opacity: .7; max-width: 720px;
+  }
 
   /* ---------- footer note / toast / misc ---------- */
   .confignote{
@@ -357,9 +361,16 @@
 </main>
 
 <footer class="site-footer">
-  <span>Created by <strong>DAVID SEO</strong></span>
-  <span class="footer-sep" aria-hidden="true">&middot;</span>
-  <span class="footer-brand">Branched from Calvoun</span>
+  <div class="footer-line">
+    <span>Created by <strong>DAVID SEO</strong></span>
+    <span class="footer-sep" aria-hidden="true">&middot;</span>
+    <span class="footer-brand">Branched from Calvoun</span>
+  </div>
+  <div class="footer-legal">
+    &copy; 2026 DAVID SEO &mdash; NOT a free/open copyright system.
+    Noncommercial use only (PolyForm Noncommercial 1.0.0).
+    Must NOT be sold or used for any commercial purpose.
+  </div>
 </footer>
 
 <div id="toasts" aria-live="polite"></div>

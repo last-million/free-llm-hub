@@ -154,4 +154,10 @@ Free tiers are a gift from these providers — **respect each provider's Terms o
 
 ## License
 
-[MIT](LICENSE) © 2026 last-million
+**[PolyForm Noncommercial License 1.0.0](LICENSE)** © 2026 DAVID SEO
+
+This is **not** an MIT / free-for-all project. It is source-available for
+**noncommercial use only** — personal, hobby, research, and study. You may
+**not** sell it, offer it as a paid or hosted service, or use it to build or
+operate a commercial product or web app. For commercial use, contact the
+author for a separate license.
