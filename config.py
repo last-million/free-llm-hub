@@ -314,6 +314,22 @@ def set_default(provider: str, model: str) -> None:
         save_config(cfg)
 
 
+def get_flag(name: str, default: bool = False) -> bool:
+    """Read a top-level boolean flag from the config (survives round-trips)."""
+    with _LOCK:
+        cfg = load_config()
+    v = cfg.get(name)
+    return v if isinstance(v, bool) else default
+
+
+def set_flag(name: str, value: bool) -> None:
+    """Persist a top-level boolean flag."""
+    with _LOCK:
+        cfg = load_config()
+        cfg[name] = bool(value)
+        save_config(cfg)
+
+
 def get_local_api_key() -> Optional[str]:
     """Optional bearer clients must present on /v1/*; None = open on localhost."""
     with _LOCK:
