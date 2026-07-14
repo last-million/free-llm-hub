@@ -946,6 +946,10 @@ def _p_qwen_env():
     return os.path.join(_home(), ".qwen", ".env")
 
 
+def _p_codex():
+    return os.path.join(_home(), ".codex", "config.toml")
+
+
 # The CLI registry: known local AI CLIs and how each connects to a custom
 # OpenAI/Anthropic endpoint. `autofix` names a safe writer strategy (JSON/
 # YAML/dotenv merge) or is None for CLIs we won't touch automatically (TOML,
@@ -997,19 +1001,25 @@ CLI_REGISTRY = [
         "name": "OpenAI Codex CLI",
         "kind": "openai",
         "bins": ["codex"],
-        "config_paths": [os.path.join(_home(), ".codex", "config.toml")],
+        "config_paths": [_p_codex()],
         "env_check": ["OPENAI_BASE_URL", "OPENAI_API_BASE"],
-        "autofix": None,  # TOML — no safe stdlib writer/merger, so manual only
+        "autofix": "codex",  # TOML edited ADDITIVELY (top keys) + one [table], reversible
+        "write_path": _p_codex(),
         "default_method": "config",
-        "hint": "Installed. Needs a manual [model_providers] block in ~/.codex/config.toml (see instructions).",
+        "hint": ("Installed. Run Auto-fix to add a [model_providers.freehub] block "
+                 "(wire_api = \"responses\") to ~/.codex/config.toml and set model_provider/model; "
+                 "then export FREE_LLM_HUB_KEY in your environment."),
         "manual_note": (
-            "Codex uses ~/.codex/config.toml (TOML — not auto-edited here). Add:\n"
+            "Codex (2026+) speaks ONLY the OpenAI Responses API (wire_api = \"responses\"). "
+            "Auto-fix adds to ~/.codex/config.toml:\n"
             "  [model_providers.freehub]\n"
             "  name = \"Free LLM Hub\"\n"
             "  base_url = \"http://127.0.0.1:%d/v1\"\n"
-            "  env_key = \"OPENAI_API_KEY\"\n"
-            "then set  model_provider = \"freehub\"  and  model = \"<provider>/<model>\"  at the top "
-            "level, and export OPENAI_API_KEY (below)." % PORT
+            "  wire_api = \"responses\"\n"
+            "  env_key = \"FREE_LLM_HUB_KEY\"\n"
+            "and sets  model_provider = \"freehub\"  +  model = \"auto\"  in the top (pre-table) "
+            "section. Then export FREE_LLM_HUB_KEY (the local hub key, or any non-empty value when "
+            "the hub has no local key set) and restart Codex." % PORT
         ),
     },
     {
@@ -1404,11 +1414,93 @@ def _autofix_qwen(entry, key, base_root, base_v1, model):
     }
 
 
+_CODEX_TABLE_RE = re.compile(r"^\s*\[")
+
+
+def _codex_apply_text(text, base_v1):
+    """Pure transform for ~/.codex/config.toml (no IO). ADDITIVELY + REVERSIBLY:
+      1. In the TOP section (every line before the first '[table]' header — the
+         only place bare keys are valid TOML) replace an existing model_provider=
+         line with model_provider = "freehub" (else prepend it), and likewise
+         force model = "auto".
+      2. Append a [model_providers.freehub] table once (wire_api = "responses",
+         env_key = FREE_LLM_HUB_KEY) if the file doesn't already declare it.
+    Every other line (model_reasoning_effort, [mcp_servers.*], other providers,
+    comments) is preserved verbatim. Returns the new file text."""
+    lines = text.splitlines()
+    top, rest, in_rest = [], [], False
+    for ln in lines:
+        if not in_rest and _CODEX_TABLE_RE.match(ln):
+            in_rest = True
+        (rest if in_rest else top).append(ln)
+
+    def _set_top_key(key_name, value_line):
+        pat = re.compile(r"^\s*%s\s*=" % re.escape(key_name))
+        for i, ln in enumerate(top):
+            if pat.match(ln):
+                top[i] = value_line
+                return
+        top.insert(0, value_line)
+
+    _set_top_key("model_provider", 'model_provider = "freehub"')
+    _set_top_key("model", 'model = "auto"')
+
+    new_text = "\n".join(top + rest)
+    if "[model_providers.freehub]" not in new_text:
+        block = (
+            "[model_providers.freehub]\n"
+            'name = "Free LLM Hub"\n'
+            'base_url = "%s"\n'
+            'wire_api = "responses"\n'
+            'env_key = "FREE_LLM_HUB_KEY"\n' % base_v1
+        )
+        if new_text and not new_text.endswith("\n"):
+            new_text += "\n"
+        new_text += "\n" + block
+    if new_text and not new_text.endswith("\n"):
+        new_text += "\n"
+    return new_text
+
+
+def _autofix_codex(entry, key, base_root, base_v1, model):
+    """Point the OpenAI Codex CLI at this hub. Codex only supports
+    wire_api="responses" (served by POST /v1/responses). Edits config.toml
+    additively/reversibly; a .freehub-bak backup is made first. The provider's
+    api key is read from the FREE_LLM_HUB_KEY env var (env_key), which we can't
+    set for the user — so we hand back the commands to set it."""
+    path = _p_codex()
+    backup = _backup_once(path)
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        else:
+            text = ""
+    except OSError as exc:
+        return {"ok": False, "reason": _sanitize("could not read %s: %s" % (_short(path), exc))}
+    _cli_write_text(path, _codex_apply_text(text, base_v1))
+    env_value = config.get_local_api_key() or "free-llm-hub-local"
+    return {
+        "ok": True,
+        "wrote_path": path,
+        "backup_path": backup,
+        "applied": {"file_top": {"model_provider": "freehub", "model": "auto"},
+                    "table": "[model_providers.freehub]", "base_url": base_v1,
+                    "wire_api": "responses", "env_key": "FREE_LLM_HUB_KEY"},
+        "note": ("Codex reads the api key from the FREE_LLM_HUB_KEY environment variable "
+                 "(env_key in the TOML) — it is NOT written into the config file. Set it with "
+                 "the commands below before starting Codex."),
+        "commands": _env_commands({"FREE_LLM_HUB_KEY": env_value}),
+        "restart_hint": "Restart Codex (open a new terminal) after setting the env var.",
+    }
+
+
 _AUTOFIXERS = {
     "claude": _autofix_claude,
     "aider": _autofix_aider,
     "opencode": _autofix_opencode,
     "qwen": _autofix_qwen,
+    "codex": _autofix_codex,
 }
 
 
@@ -1522,11 +1614,72 @@ def _disconnect_qwen(entry):
             "changed": changed, "restart_hint": hint}
 
 
+def _remove_toml_table(text, table_name):
+    """Remove a '[<table_name>]' block (its header line through the line before
+    the next '[table]' header, or EOF). Returns (new_text, removed_bool)."""
+    lines = text.splitlines()
+    target = re.compile(r"^\s*\[\s*%s\s*\]\s*$" % re.escape(table_name))
+    out, removed, i, n = [], False, 0, len(lines)
+    while i < n:
+        if target.match(lines[i]):
+            removed = True
+            i += 1
+            while i < n and not _CODEX_TABLE_RE.match(lines[i]):
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    new_text = "\n".join(out).rstrip("\n")
+    return (new_text + "\n" if new_text else ""), removed
+
+
+def _strip_codex_top_keys(text):
+    """Remove our exact 'model_provider = "freehub"' / 'model = "auto"' lines from
+    the TOP (pre-table) section only. Returns (new_text, removed_bool)."""
+    lines = text.splitlines()
+    mp = re.compile(r'^\s*model_provider\s*=\s*"freehub"\s*$')
+    md = re.compile(r'^\s*model\s*=\s*"auto"\s*$')
+    out, removed, in_rest = [], False, False
+    for ln in lines:
+        if not in_rest and _CODEX_TABLE_RE.match(ln):
+            in_rest = True
+        if not in_rest and (mp.match(ln) or md.match(ln)):
+            removed = True
+            continue
+        out.append(ln)
+    new_text = "\n".join(out).rstrip("\n")
+    return (new_text + "\n" if new_text else ""), removed
+
+
+def _disconnect_codex(entry):
+    path = entry.get("write_path") or _p_codex()
+    hint = "Restart Codex (open a new terminal) so it re-reads ~/.codex/config.toml."
+    if _restore_backup(path):
+        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
+    # No backup (autofix created the file): strip ONLY the additions we made.
+    changed = False
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except OSError:
+            text = None
+        if text is not None:
+            text2, tbl_removed = _remove_toml_table(text, "model_providers.freehub")
+            text3, top_removed = _strip_codex_top_keys(text2)
+            if tbl_removed or top_removed:
+                _cli_write_text(path, text3)
+                changed = True
+    return {"restored_from_backup": False, "wrote_path": path,
+            "changed": changed, "restart_hint": hint}
+
+
 _DISCONNECTERS = {
     "claude": _disconnect_claude,
     "aider": _disconnect_aider,
     "opencode": _disconnect_opencode,
     "qwen": _disconnect_qwen,
+    "codex": _disconnect_codex,
 }
 
 
@@ -1734,6 +1887,393 @@ def v1_chat_completions():
                          "json": body_json, "text": body_text}
         resp.close()
         continue
+    if last_hard is not None:
+        if last_hard["json"] is not None:
+            return jsonify(last_hard["json"]), last_hard["status"]
+        return _openai_error("Upstream returned non-JSON (%s, HTTP %d): %s"
+                             % (last_hard["pid"], last_hard["status"], last_hard["text"]),
+                             502, "upstream_error")
+    return _openai_error("All providers failed: " + ("; ".join(errors) or "none available"),
+                         502, "upstream_error")
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Responses API gateway (OpenAI Codex CLI support)
+# ---------------------------------------------------------------------------
+# Codex (2026+) speaks ONLY the Responses API (wire_api="responses"), never chat
+# completions. Strategy: translate the Responses request DOWN to OpenAI chat
+# messages, reuse the SAME difficulty routing + provider chain + key rotation +
+# fallback as /v1/chat/completions, then translate the chat result (JSON or SSE)
+# back UP into Responses objects/events. No new orchestration is introduced.
+
+
+def _responses_tools_to_chat(tools):
+    """Responses tools ({"type":"function","name","description","parameters"},
+    sometimes nested under a "function" key) -> OpenAI chat tools."""
+    out = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        inner = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = inner.get("name")
+        if not name:
+            continue
+        out.append({"type": "function", "function": {
+            "name": name,
+            "description": inner.get("description") or "",
+            "parameters": inner.get("parameters") or {"type": "object", "properties": {}},
+        }})
+    return out
+
+
+def _responses_to_chat(body):
+    """Translate a Responses request body into OpenAI chat-completions messages.
+    Handles `instructions` (-> leading system), a STRING or LIST `input`, and the
+    message / function_call / function_call_output item types (unknown item types,
+    e.g. reasoning, are skipped)."""
+    messages = []
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        messages.append({"role": "system", "content": instructions})
+
+    inp = body.get("input")
+    if isinstance(inp, str):
+        messages.append({"role": "user", "content": inp})
+        return messages
+    for item in inp or []:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        itype = item.get("type")
+        if itype == "function_call":
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": item.get("call_id") or item.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name") or "",
+                        "arguments": item.get("arguments") or "{}",
+                    },
+                }],
+            })
+        elif itype == "function_call_output":
+            output = item.get("output")
+            content = output if isinstance(output, str) else json.dumps(output)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": item.get("call_id"),
+                "content": content,
+            })
+        elif itype == "message" or itype is None:
+            role = item.get("role") or "user"
+            content = item.get("content")
+            if isinstance(content, str):
+                text = content
+            else:
+                parts = []
+                for part in content or []:
+                    if isinstance(part, str):
+                        parts.append(part)
+                    elif isinstance(part, dict) and part.get("type") in (
+                            "input_text", "output_text", "text"):
+                        parts.append(part.get("text") or "")
+                text = "".join(parts)
+            messages.append({"role": role, "content": text})
+        # else: unknown item type (reasoning, etc.) -> skip
+    return messages
+
+
+def _chat_to_responses(chat_json, model_label):
+    """Non-streaming OpenAI chat-completions JSON -> a Responses `response` object."""
+    choice = (chat_json.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    output = []
+    content = msg.get("content")
+    if content:
+        output.append({
+            "type": "message",
+            "id": "msg_" + uuid.uuid4().hex,
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content, "annotations": []}],
+        })
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        output.append({
+            "type": "function_call",
+            "id": "fc_" + uuid.uuid4().hex,
+            "call_id": tc.get("id"),
+            "name": fn.get("name") or "",
+            "arguments": fn.get("arguments") or "",
+            "status": "completed",
+        })
+    usage = chat_json.get("usage") or {}
+    pt = int(usage.get("prompt_tokens") or 0)
+    ct = int(usage.get("completion_tokens") or 0)
+    return {
+        "id": "resp_" + uuid.uuid4().hex,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": model_label,
+        "output": output,
+        "usage": {"input_tokens": pt, "output_tokens": ct, "total_tokens": pt + ct},
+    }
+
+
+def _responses_stream(resp, model_label):
+    """Consume an upstream OpenAI chat SSE stream and re-emit it as Responses API
+    events for Codex. Event order:
+      response.created
+      [text]  output_item.added -> content_part.added -> output_text.delta* ->
+              output_text.done -> content_part.done -> output_item.done
+      [tools] output_item.added -> function_call_arguments.delta* ->
+              function_call_arguments.done -> output_item.done
+      response.completed
+    The assistant message (if any) is output_index 0; each tool call takes the
+    next index. Defensive: unparseable chunks are skipped, and a mid-stream
+    failure still emits a terminal response.completed so Codex never hangs."""
+    resp_id = "resp_" + uuid.uuid4().hex
+    created = int(time.time())
+
+    def _obj(status, output_items, usage=None):
+        o = {"id": resp_id, "object": "response", "created_at": created,
+             "status": status, "model": model_label, "output": output_items}
+        if usage is not None:
+            o["usage"] = usage
+        return o
+
+    done_items = []          # [(output_index, item)] assembled so far
+    next_index = 0
+    text_started = False
+    text_item_id = text_index = None
+    text_buf = []
+    tools = {}               # oai tool index -> {out_index,item_id,call_id,name,args[]}
+    usage = None
+    try:
+        yield _sse_event("response.created",
+                         {"type": "response.created", "response": _obj("in_progress", [])})
+
+        for raw in resp.iter_lines(decode_unicode=False):
+            if not raw or not raw.startswith(b"data:"):
+                continue
+            data = raw[5:].strip()
+            if data == b"[DONE]":
+                break
+            try:
+                chunk = json.loads(data.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            u = chunk.get("usage")
+            if isinstance(u, dict) and (u.get("prompt_tokens") is not None
+                                        or u.get("completion_tokens") is not None):
+                usage = u
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = (choices[0] or {}).get("delta") or {}
+
+            dtext = delta.get("content")
+            if dtext:
+                if not text_started:
+                    text_started = True
+                    text_item_id = "msg_" + uuid.uuid4().hex
+                    text_index = next_index
+                    next_index += 1
+                    yield _sse_event("response.output_item.added", {
+                        "type": "response.output_item.added",
+                        "output_index": text_index,
+                        "item": {"type": "message", "id": text_item_id,
+                                 "status": "in_progress", "role": "assistant",
+                                 "content": []}})
+                    yield _sse_event("response.content_part.added", {
+                        "type": "response.content_part.added",
+                        "item_id": text_item_id, "output_index": text_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": "", "annotations": []}})
+                text_buf.append(dtext)
+                yield _sse_event("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "item_id": text_item_id, "output_index": text_index,
+                    "content_index": 0, "delta": dtext})
+
+            for tcd in delta.get("tool_calls") or []:
+                if not isinstance(tcd, dict):
+                    continue
+                oai_idx = tcd.get("index", 0)
+                fn = tcd.get("function") or {}
+                st = tools.get(oai_idx)
+                if st is None:
+                    st = {"out_index": next_index,
+                          "item_id": "fc_" + uuid.uuid4().hex,
+                          "call_id": tcd.get("id") or ("call_" + uuid.uuid4().hex[:24]),
+                          "name": fn.get("name") or "", "args": []}
+                    next_index += 1
+                    tools[oai_idx] = st
+                    yield _sse_event("response.output_item.added", {
+                        "type": "response.output_item.added",
+                        "output_index": st["out_index"],
+                        "item": {"type": "function_call", "id": st["item_id"],
+                                 "call_id": st["call_id"], "name": st["name"],
+                                 "arguments": "", "status": "in_progress"}})
+                else:
+                    if tcd.get("id"):
+                        st["call_id"] = tcd["id"]
+                    if fn.get("name"):
+                        st["name"] = fn["name"]
+                args = fn.get("arguments")
+                if args:
+                    st["args"].append(args)
+                    yield _sse_event("response.function_call_arguments.delta", {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": st["item_id"], "output_index": st["out_index"],
+                        "delta": args})
+
+        if text_started:
+            full = "".join(text_buf)
+            yield _sse_event("response.output_text.done", {
+                "type": "response.output_text.done",
+                "item_id": text_item_id, "output_index": text_index,
+                "content_index": 0, "text": full})
+            yield _sse_event("response.content_part.done", {
+                "type": "response.content_part.done",
+                "item_id": text_item_id, "output_index": text_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": full, "annotations": []}})
+            item = {"type": "message", "id": text_item_id, "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": full, "annotations": []}]}
+            yield _sse_event("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": text_index, "item": item})
+            done_items.append((text_index, item))
+
+        for _oai_idx, st in sorted(tools.items(), key=lambda kv: kv[1]["out_index"]):
+            full_args = "".join(st["args"])
+            yield _sse_event("response.function_call_arguments.done", {
+                "type": "response.function_call_arguments.done",
+                "item_id": st["item_id"], "output_index": st["out_index"],
+                "arguments": full_args})
+            item = {"type": "function_call", "id": st["item_id"],
+                    "call_id": st["call_id"], "name": st["name"],
+                    "arguments": full_args, "status": "completed"}
+            yield _sse_event("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": st["out_index"], "item": item})
+            done_items.append((st["out_index"], item))
+
+        final_usage = None
+        if usage is not None:
+            pt = int(usage.get("prompt_tokens") or 0)
+            ct = int(usage.get("completion_tokens") or 0)
+            final_usage = {"input_tokens": pt, "output_tokens": ct, "total_tokens": pt + ct}
+        final_output = [it for _i, it in sorted(done_items, key=lambda t: t[0])]
+        yield _sse_event("response.completed", {
+            "type": "response.completed",
+            "response": _obj("completed", final_output, final_usage)})
+    except Exception as exc:  # never leave Codex hanging on a mid-stream failure
+        _log.error("Responses stream error: %s", _sanitize(str(exc)))
+        partial = [it for _i, it in sorted(done_items, key=lambda t: t[0])]
+        try:
+            yield _sse_event("response.completed", {
+                "type": "response.completed",
+                "response": _obj("completed", partial)})
+        except Exception:
+            pass
+    finally:
+        resp.close()
+
+
+@app.route("/v1/responses", methods=["POST"])
+def v1_responses():
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return _openai_error("Invalid JSON body.", 400)
+    try:
+        messages = _responses_to_chat(body)
+    except Exception as exc:
+        return _openai_error("Could not translate request: " + _sanitize(str(exc)), 400)
+    if not messages:
+        return _openai_error("No input to send.", 400)
+
+    # Same routing as /v1/chat/completions: Auto/empty/claude-* -> difficulty
+    # route across available providers; explicit '<pid>/<model>' bypasses.
+    if _is_orchestrate(body.get("model")):
+        pid, resolved, _diff = _route_by_difficulty(messages, body.get("max_output_tokens"))
+        if pid is None:
+            pid, resolved = _resolve_model(body.get("model"))
+    else:
+        pid, resolved = _resolve_model(body.get("model"))
+    if pid is None:
+        return _openai_error(resolved, 400)
+    if not prov.is_model_allowed(resolved):
+        return _openai_error("Model '%s' is blocked by the safety filter." % resolved, 403,
+                             "permission_error")
+    not_ready = _check_provider_ready(pid)
+    if not_ready:
+        return _openai_error(not_ready, 400)
+
+    base_payload = {"messages": messages}
+    if body.get("max_output_tokens"):
+        try:
+            base_payload["max_tokens"] = int(body["max_output_tokens"])
+        except (TypeError, ValueError):
+            pass
+    if body.get("temperature") is not None:
+        base_payload["temperature"] = body["temperature"]
+    if body.get("top_p") is not None:
+        base_payload["top_p"] = body["top_p"]
+    tools = _responses_tools_to_chat(body.get("tools"))
+    if tools:
+        base_payload["tools"] = tools
+        if body.get("tool_choice") is not None:
+            base_payload["tool_choice"] = body["tool_choice"]
+
+    stream = bool(body.get("stream"))
+    errors = []
+    last_hard = None  # last hard (non-retryable) upstream error, relayed if chain is exhausted
+    for hop_pid, hop_model in _build_chain(pid, resolved):
+        if not prov.is_model_allowed(hop_model):
+            continue
+        payload = dict(base_payload)
+        payload["model"] = hop_model
+        payload["stream"] = stream
+        try:
+            resp = _upstream_chat(hop_pid, payload, stream)
+        except (requests.RequestException, RuntimeError) as exc:
+            errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
+            continue
+        if resp.status_code == 200:
+            model_label = hop_pid + "/" + hop_model
+            if stream:
+                return Response(stream_with_context(_responses_stream(resp, model_label)),
+                                mimetype="text/event-stream", headers=_SSE_HEADERS)
+            try:
+                data = resp.json()
+            except ValueError:
+                return _openai_error("Upstream returned non-JSON (%s, HTTP 200): %s"
+                                     % (hop_pid, _sanitize(resp.text)), 502, "upstream_error")
+            return jsonify(_chat_to_responses(data, model_label)), 200
+        errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+        if not _retryable(resp.status_code):
+            try:
+                body_json = resp.json()
+                body_text = None
+            except ValueError:
+                body_json = None
+                body_text = _sanitize(resp.text)
+            last_hard = {"pid": hop_pid, "status": resp.status_code,
+                         "json": body_json, "text": body_text}
+        resp.close()
+        continue
+    # No provider yielded a 200. We have NOT emitted any SSE yet, so return a
+    # normal non-200 JSON OpenAI-style error (Codex checks the HTTP status before
+    # opening the event stream and surfaces this cleanly) rather than a fake 200
+    # SSE stream carrying an error.
     if last_hard is not None:
         if last_hard["json"] is not None:
             return jsonify(last_hard["json"]), last_hard["status"]
