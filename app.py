@@ -30,7 +30,7 @@ import time
 import uuid
 
 import requests
-from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+from flask import Flask, Response, g, jsonify, render_template, request, stream_with_context
 
 try:
     from jinja2 import TemplateNotFound
@@ -609,6 +609,109 @@ def _guard_v1():
     if request.path.startswith("/v1/messages"):
         return _anthropic_error("authentication_error", msg, 401)
     return _openai_error(msg, 401, "authentication_error")
+
+
+# ---------------------------------------------------------------------------
+# Live activity feed — a small ring buffer of recent gateway calls so the
+# dashboard can show, per CLI/tool, what request is in flight, which model it
+# landed on, and whether it succeeded. In-memory only; localhost, single user.
+# ---------------------------------------------------------------------------
+import collections  # noqa: E402  (local, stdlib)
+
+_ACTIVITY_MAX = 40
+_activity = collections.deque(maxlen=_ACTIVITY_MAX)
+_activity_lock = threading.Lock()
+_activity_seq = [0]
+_INFERENCE_PATHS = {
+    "/v1/chat/completions": "openai",
+    "/v1/responses": "responses",
+    "/v1/messages": "anthropic",
+}
+# Map a client's User-Agent to a friendly CLI/tool label (best-effort).
+_UA_CLI = (
+    ("codex", "Codex"), ("claude-cli", "Claude Code"), ("claude", "Claude Code"),
+    ("aider", "Aider"), ("opencode", "OpenCode"), ("cursor", "Cursor"),
+    ("qwen", "Qwen Code"), ("llm/", "llm"), ("openai", "OpenAI SDK"),
+    ("anthropic", "Anthropic SDK"), ("python-requests", "script"),
+    ("node", "node"), ("curl", "curl"),
+)
+
+
+def _guess_cli():
+    ua = (request.headers.get("User-Agent") or "").lower()
+    for sub, name in _UA_CLI:
+        if sub in ua:
+            return name
+    return (ua.split("/")[0][:24] or "unknown") if ua else "unknown"
+
+
+def _act_pick(pid, model):
+    """Record the provider/model the orchestrator actually landed on."""
+    act = getattr(g, "act", None)
+    if act is not None:
+        with _activity_lock:
+            act["provider"] = pid
+            act["model"] = model
+
+
+def _activity_done(act, status, http=None):
+    with _activity_lock:
+        if act.get("finished") is None:
+            act["status"] = status
+            act["http"] = http
+            act["finished"] = time.time()
+
+
+@app.before_request
+def _activity_before():
+    if request.method != "POST":
+        return None
+    proto = _INFERENCE_PATHS.get(request.path)
+    if not proto:
+        return None
+    body = request.get_json(force=True, silent=True) if request.is_json or True else None
+    model_req = body.get("model") if isinstance(body, dict) else None
+    with _activity_lock:
+        _activity_seq[0] += 1
+        act = {
+            "id": _activity_seq[0], "protocol": proto, "cli": _guess_cli(),
+            "model_req": model_req if isinstance(model_req, str) else None,
+            "provider": None, "model": None, "status": "in_progress",
+            "http": None, "stream": False,
+            "started": time.time(), "finished": None,
+        }
+        _activity.appendleft(act)
+    g.act = act
+    return None
+
+
+@app.after_request
+def _activity_after(response):
+    act = getattr(g, "act", None)
+    if act is None:
+        return response
+    if response.mimetype == "text/event-stream" and 200 <= response.status_code < 300:
+        with _activity_lock:
+            act["stream"] = True
+            act["status"] = "streaming"
+            act["http"] = response.status_code
+        response.call_on_close(lambda: _activity_done(act, "ok", response.status_code))
+    else:
+        ok = 200 <= response.status_code < 300
+        _activity_done(act, "ok" if ok else "error", response.status_code)
+    return response
+
+
+@app.route("/api/activity", methods=["GET"])
+def api_activity():
+    now = time.time()
+    with _activity_lock:
+        rows = list(_activity)
+    out = []
+    for a in rows:
+        end = a["finished"] if a["finished"] else now
+        out.append({**a, "duration_ms": int((end - a["started"]) * 1000)})
+    return jsonify({"activity": out})
 
 
 # ---------------------------------------------------------------------------
@@ -1853,6 +1956,7 @@ def v1_chat_completions():
         payload = dict(body)
         payload["model"] = hop_model
         try:
+            _act_pick(hop_pid, hop_model)
             resp = _upstream_chat(hop_pid, payload, stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
@@ -2243,6 +2347,7 @@ def v1_responses():
         payload["model"] = hop_model
         payload["stream"] = stream
         try:
+            _act_pick(hop_pid, hop_model)
             resp = _upstream_chat(hop_pid, payload, stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
@@ -2604,6 +2709,7 @@ def v1_messages():
         payload["model"] = hop_model
         payload["stream"] = stream
         try:
+            _act_pick(hop_pid, hop_model)
             resp = _upstream_chat(hop_pid, payload, stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
