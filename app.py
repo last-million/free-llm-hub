@@ -1565,12 +1565,55 @@ def _codex_apply_text(text, base_v1):
     return new_text
 
 
+def _persist_env_var(name, value):
+    """Set a PERSISTENT user env var on the host OS so a CLI (e.g. Codex) can read
+    it — Windows: `setx` (HKCU\\Environment, picked up by NEW shells); POSIX: append
+    an idempotent `export` line to the user's shell rc. Also sets it in the current
+    process. Never raises — returns {ok, method, ...} or {ok:False, reason} so the
+    caller can fall back to showing manual commands. New shell/`source` still needed."""
+    try:
+        os.environ[name] = value  # helps any child process we spawn right now
+        if os.name == "nt":
+            r = subprocess.run(["setx", name, value],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                return {"ok": True, "method": "setx",
+                        "target": "Windows user environment",
+                        "note": "Open a NEW terminal so Codex sees it (existing shells won't)."}
+            return {"ok": False,
+                    "reason": _sanitize((r.stderr or r.stdout or "setx failed").strip()[:160])}
+        # POSIX (macOS / Linux): append to the shell rc matching $SHELL.
+        home = os.path.expanduser("~")
+        shell = os.environ.get("SHELL", "")
+        if "zsh" in shell:
+            target = os.path.join(home, ".zshrc")
+        elif "bash" in shell:
+            target = os.path.join(home, ".bashrc")
+        else:
+            target = os.path.join(home, ".profile")
+        try:
+            existing = ""
+            if os.path.isfile(target):
+                with open(target, "r", encoding="utf-8", errors="ignore") as f:
+                    existing = f.read()
+            if ("export %s=" % name) not in existing:
+                with open(target, "a", encoding="utf-8") as f:
+                    f.write("\n# added by Free LLM Hub\nexport %s='%s'\n" % (name, value))
+            return {"ok": True, "method": "shell-rc", "target": target,
+                    "note": "Run  source %s  or open a new terminal." % target}
+        except OSError as exc:
+            return {"ok": False, "reason": _sanitize("could not write %s: %s" % (target, exc))}
+    except Exception as exc:
+        return {"ok": False, "reason": _sanitize("%s: %s" % (exc.__class__.__name__, exc))}
+
+
 def _autofix_codex(entry, key, base_root, base_v1, model):
     """Point the OpenAI Codex CLI at this hub. Codex only supports
     wire_api="responses" (served by POST /v1/responses). Edits config.toml
     additively/reversibly; a .freehub-bak backup is made first. The provider's
-    api key is read from the FREE_LLM_HUB_KEY env var (env_key), which we can't
-    set for the user — so we hand back the commands to set it."""
+    api key is read from the FREE_LLM_HUB_KEY env var (env_key), which we ALSO set
+    automatically on the host OS (setx / shell rc) — commands are handed back too
+    as a cross-platform fallback."""
     path = _p_codex()
     backup = _backup_once(path)
     try:
@@ -1583,6 +1626,17 @@ def _autofix_codex(entry, key, base_root, base_v1, model):
         return {"ok": False, "reason": _sanitize("could not read %s: %s" % (_short(path), exc))}
     _cli_write_text(path, _codex_apply_text(text, base_v1))
     env_value = config.get_local_api_key() or "free-llm-hub-local"
+    # Set FREE_LLM_HUB_KEY on the host OS automatically (setx / shell rc) so the
+    # user doesn't have to. Commands are still returned as a cross-platform fallback.
+    env_set = _persist_env_var("FREE_LLM_HUB_KEY", env_value)
+    if env_set.get("ok"):
+        note = ("Connected. FREE_LLM_HUB_KEY was set automatically (%s). Open a NEW terminal, "
+                "then run Codex. If it still can't see the key, run the command below manually."
+                % env_set.get("method", "auto"))
+    else:
+        note = ("Codex reads its key from FREE_LLM_HUB_KEY. Auto-set didn't work (%s) — run the "
+                "command for your OS below, then open a new terminal."
+                % env_set.get("reason", "unknown"))
     return {
         "ok": True,
         "wrote_path": path,
@@ -1590,11 +1644,10 @@ def _autofix_codex(entry, key, base_root, base_v1, model):
         "applied": {"file_top": {"model_provider": "freehub", "model": "auto"},
                     "table": "[model_providers.freehub]", "base_url": base_v1,
                     "wire_api": "responses", "env_key": "FREE_LLM_HUB_KEY"},
-        "note": ("Codex reads the api key from the FREE_LLM_HUB_KEY environment variable "
-                 "(env_key in the TOML) — it is NOT written into the config file. Set it with "
-                 "the commands below before starting Codex."),
+        "env_set": env_set,
+        "note": note,
         "commands": _env_commands({"FREE_LLM_HUB_KEY": env_value}),
-        "restart_hint": "Restart Codex (open a new terminal) after setting the env var.",
+        "restart_hint": "Open a NEW terminal, then run Codex (env vars don't apply to open shells).",
     }
 
 
