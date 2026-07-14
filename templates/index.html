@@ -182,6 +182,33 @@
     display:grid;place-items:center;
   }
   .eye:hover{color:var(--text)}
+
+  /* saved keys pool */
+  .saved-keys{display:flex;flex-direction:column;gap:6px}
+  .saved-key{
+    display:flex;align-items:center;gap:6px;
+    background:var(--surface-2);border:1px solid var(--border-soft);
+    border-radius:var(--radius-sm);padding:5px 6px 5px 11px;
+  }
+  .saved-key .sk-mask{
+    flex:1;min-width:0;font-family:var(--mono);font-size:12px;color:var(--text-dim);
+    overflow-wrap:anywhere;word-break:break-all;
+  }
+  .saved-key.revealed .sk-mask{color:var(--accent)}
+  .saved-key .sk-eye,.saved-key .sk-remove{
+    background:none;border:none;color:var(--text-faint);padding:5px;border-radius:6px;
+    display:grid;place-items:center;flex:none;transition:color .15s ease,background .15s ease;
+  }
+  .saved-key .sk-eye:hover{color:var(--text)}
+  .saved-key .sk-eye.on{color:var(--accent)}
+  .saved-key .sk-remove:hover{color:var(--danger);background:var(--danger-soft)}
+  .saved-key .sk-eye:disabled,.saved-key .sk-remove:disabled{opacity:.4;cursor:not-allowed}
+  .key-warn{
+    font-size:11.5px;line-height:1.5;color:var(--warn);
+    background:var(--warn-soft);border:1px solid rgba(245,158,11,.2);
+    border-radius:var(--radius-sm);padding:7px 10px;
+  }
+
   .adv{font-size:12px}
   .adv summary{color:var(--text-faint);cursor:pointer;user-select:none;list-style:none;display:inline-flex;align-items:center;gap:4px}
   .adv summary::-webkit-details-marker{display:none}
@@ -531,12 +558,30 @@
     });
   }
 
+  var EYE_SVG = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
+  var X_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+  var KEY_WARN = '⚠ Using several keys for the same provider to get around free limits may break their terms and can get your accounts banned. Use your own keys responsibly.';
+
   function cardHTML(p){
+    var keys = Array.isArray(p.keys) ? p.keys : [];
+    var kc = (typeof p.key_count === 'number') ? p.key_count : keys.length;
     var badges = '';
     if (p.paid) badges += '<span class="badge paid">paid</span>';
     else if (p.trial) badges += '<span class="badge trial">trial</span>';
     else badges += '<span class="badge free">free</span>';
-    if (p.has_key) badges += '<span class="badge keyed">key saved</span>';
+    if (p.has_key) badges += '<span class="badge keyed">' + kc + ' key' + (kc > 1 ? 's' : '') + ' saved</span>';
+
+    var savedKeysHTML = '';
+    if (keys.length){
+      savedKeysHTML = '<div class="saved-keys">' + keys.map(function(k){
+        return '<div class="saved-key" data-idx="' + esc(k.index) + '">' +
+          '<code class="sk-mask">' + esc(k.masked) + '</code>' +
+          '<button type="button" class="sk-eye" title="Reveal key" aria-label="Reveal key">' + EYE_SVG + '</button>' +
+          '<button type="button" class="sk-remove" title="Remove key" aria-label="Remove key">' + X_SVG + '</button>' +
+        '</div>';
+      }).join('') + '</div>';
+    }
+
     var fm = Array.isArray(p.free_models) ? p.free_models : [];
     var fmPrev = fm.slice(0, 3).join(', ') + (fm.length > 3 ? ' +' + (fm.length - 3) + ' more' : '');
     return '' +
@@ -550,14 +595,15 @@
         '<a class="keylink" href="' + esc(p.signup_url) + '" target="_blank" rel="noopener noreferrer">' +
           '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>' +
           'Get a free key</a>' : '') +
+      savedKeysHTML +
       '<div class="keyrow">' +
         '<div class="kwrap">' +
-          '<input type="password" class="key-input" placeholder="' + esc(p.key_hint || (p.has_key ? 'key saved — paste to replace' : 'paste API key')) + '" autocomplete="off" spellcheck="false" aria-label="API key for ' + esc(p.name || p.id) + '">' +
-          '<button type="button" class="eye" title="Show / hide key" aria-label="Show or hide key">' +
-            '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>' +
+          '<input type="password" class="key-input" placeholder="' + esc(p.key_hint || (keys.length ? 'paste another key to add' : 'paste API key')) + '" autocomplete="off" spellcheck="false" aria-label="Add an API key for ' + esc(p.name || p.id) + '">' +
+          '<button type="button" class="eye" title="Show / hide key" aria-label="Show or hide key">' + EYE_SVG +
           '</button>' +
         '</div>' +
       '</div>' +
+      '<div class="key-warn">' + esc(KEY_WARN) + '</div>' +
       '<details class="adv"><summary>' +
         '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>' +
         'Advanced: custom base URL</summary>' +
@@ -624,26 +670,69 @@
     });
 
     $('.act-save', card).addEventListener('click', function(){
-      var body = {};
-      if (keyInput.value.trim()) body.api_key = keyInput.value.trim();
-      if (baseTouched) body.base_url = baseInput.value.trim();  /* '' clears the override */
-      if (!Object.keys(body).length){ toast('Nothing to save — paste a key first', true); return; }
+      var keyVal = keyInput.value.trim();
+      var doBase = baseTouched;
+      if (!keyVal && !doBase){ toast('Nothing to save — paste a key first', true); return; }
       var btn = this; btn.disabled = true; btn.textContent = 'Saving…';
-      api('/api/providers/' + encodeURIComponent(p.id), { method:'POST', body: body })
-        .then(function(row){
-          updateProvider(row, p.id);
-          keyInput.value = '';
-          keyInput.placeholder = 'key saved — paste to replace';
-          $('.act-test', card).disabled = false;
-          $('.act-test', card).removeAttribute('title');
-          if (!$('.badge.keyed', card)){
-            $('.badges', card).insertAdjacentHTML('beforeend', '<span class="badge keyed">key saved</span>');
-          }
-          toast((row.name || p.id) + ' saved');
-          return Promise.all([loadStatus(), loadModels()]);
-        })
-        .catch(function(e){ toast('Save failed: ' + e.message, true); })
-        .then(function(){ btn.disabled = false; btn.textContent = 'Save'; });
+      var chain = Promise.resolve(null);
+      /* base URL still saved via the existing provider route ('' clears the override) */
+      if (doBase){
+        chain = chain.then(function(){
+          return api('/api/providers/' + encodeURIComponent(p.id), { method:'POST', body:{ base_url: baseInput.value.trim() } });
+        });
+      }
+      /* a key is now ADDED to the pool (not a replace) */
+      if (keyVal){
+        chain = chain.then(function(){
+          return api('/api/providers/' + encodeURIComponent(p.id) + '/keys', { method:'POST', body:{ api_key: keyVal } });
+        });
+      }
+      chain.then(function(row){
+        if (row) applyRow(card, row, p.id);   /* rebuilds the card => fresh saved-keys list + badge */
+        toast((p.name || p.id) + ' saved');
+        return Promise.all([loadStatus(), loadModels()]);
+      })
+        .catch(function(e){ toast('Save failed: ' + e.message, true); btn.disabled = false; btn.textContent = 'Save'; });
+    });
+
+    /* saved-keys pool: reveal (eye) + remove (x) */
+    Array.prototype.forEach.call(card.querySelectorAll('.saved-key'), function(row){
+      var idx = row.getAttribute('data-idx');
+      var maskEl = $('.sk-mask', row);
+      var eyeBtn = $('.sk-eye', row);
+      var maskedText = maskEl.textContent;
+      var revealed = false;
+
+      eyeBtn.addEventListener('click', function(){
+        if (revealed){
+          maskEl.textContent = maskedText;
+          revealed = false;
+          eyeBtn.classList.remove('on');
+          row.classList.remove('revealed');
+          return;
+        }
+        eyeBtn.disabled = true;
+        api('/api/providers/' + encodeURIComponent(p.id) + '/keys/' + encodeURIComponent(idx) + '/reveal')
+          .then(function(r){
+            maskEl.textContent = (r && r.api_key) ? r.api_key : maskedText;
+            revealed = true;
+            eyeBtn.classList.add('on');
+            row.classList.add('revealed');
+          })
+          .catch(function(e){ toast('Reveal failed: ' + e.message, true); })
+          .then(function(){ eyeBtn.disabled = false; });
+      });
+
+      $('.sk-remove', row).addEventListener('click', function(){
+        var rmBtn = this; rmBtn.disabled = true;
+        api('/api/providers/' + encodeURIComponent(p.id) + '/keys/' + encodeURIComponent(idx), { method:'DELETE' })
+          .then(function(newRow){
+            applyRow(card, newRow, p.id);   /* re-render with the key removed + re-indexed pool */
+            toast('Key removed');
+            return Promise.all([loadStatus(), loadModels()]);
+          })
+          .catch(function(e){ rmBtn.disabled = false; toast('Remove failed: ' + e.message, true); });
+      });
     });
 
     $('.act-test', card).addEventListener('click', function(){
@@ -676,6 +765,19 @@
     for (var i = 0; i < providers.length; i++){
       if (providers[i].id === (row.id || pid)){ providers[i] = Object.assign({}, providers[i], row); return; }
     }
+  }
+  function findProvider(id){
+    for (var i = 0; i < providers.length; i++){ if (providers[i].id === id) return providers[i]; }
+    return null;
+  }
+  /* merge the fresh _provider_row into state and rebuild the card in place */
+  function applyRow(card, row, pid){
+    updateProvider(row, pid);
+    var p2 = findProvider((row && row.id) ? row.id : pid);
+    if (!p2) return;
+    card.className = 'card' + (p2.enabled ? ' enabled' : '');
+    card.innerHTML = cardHTML(p2);
+    wireCard(card, p2);
   }
 
   /* ---------- copy buttons ---------- */
