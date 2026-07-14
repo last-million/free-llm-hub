@@ -76,6 +76,19 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": ["meta/llama-3.3-70b-instruct", "nvidia/llama-3.1-nemotron-70b-instruct"],
         "notes": "Large open models incl. Llama 405B. Free key needs phone verification. ~40 req/min.",
     },
+    "morph": {
+        "name": "Morph",
+        "base_url": "https://api.morphllm.com/v1",
+        "models_url": "https://api.morphllm.com/v1/models",
+        "signup_url": "https://morphllm.com/dashboard",
+        "key_hint": "sk-...",
+        "free_filter": "all",
+        "default_free_models": [
+            "morph-glm52-744b", "morph-minimax3-428b",
+            "morph-dsv4flash", "morph-qwen36-27b",
+        ],
+        "notes": "OpenAI-compatible. Free tier ~200 req/mo + trial credits. Fast general models (GLM/MiniMax/DeepSeek/Qwen) plus fast-apply code editing.",
+    },
     "google": {
         "name": "Google Gemini (AI Studio)",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
