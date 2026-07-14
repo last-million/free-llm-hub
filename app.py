@@ -38,7 +38,26 @@ except Exception:  # pragma: no cover - jinja2 always ships with flask
 import config
 import providers as prov
 
+import logging
+import traceback as _traceback
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+_log = logging.getLogger("free-llm-hub")
+
 app = Flask(__name__)
+
+
+@app.errorhandler(Exception)
+def _json_error(exc):
+    """Safety net: any unhandled exception becomes a clean JSON 500 (never a
+    bare HTML 500), with the real cause logged locally. Keeps the dashboard
+    usable and gives an actionable message instead of 'Save failed: 500'."""
+    from werkzeug.exceptions import HTTPException
+    if isinstance(exc, HTTPException):
+        return exc  # preserve intended 4xx/redirects
+    _log.error("Unhandled error on %s:\n%s", request.path, _traceback.format_exc())
+    return jsonify({"error": _sanitize(str(exc)) or "internal error"}), 500
+
 
 PORT = int(os.environ.get("PORT", "8787") or "8787")
 HOST = "127.0.0.1"
@@ -346,9 +365,12 @@ def index():
 # Config API
 # ---------------------------------------------------------------------------
 
-def _provider_row(pid):
+def _provider_row(pid, live_models=False):
     p = prov.get_provider(pid) or {}
     pcfg = config.get_provider_config(pid)
+    # Provider rows never trigger a network model-discovery call by default:
+    # a save/list must be instant and can't fail on a provider's flaky /models
+    # endpoint. The live model list is served separately by GET /api/models.
     return {
         "id": pid,
         "name": p.get("name") or pid,
@@ -359,7 +381,7 @@ def _provider_row(pid):
         "notes": p.get("notes") or "",
         "paid": bool(p.get("paid")),
         "trial": bool(p.get("trial")),
-        "free_models": provider_free_models(pid),
+        "free_models": provider_free_models(pid, live=live_models),
     }
 
 
