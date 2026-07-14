@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Free LLM Hub — Local Gateway</title>
+<style>
+  :root{
+    --bg:#0B0F19;
+    --surface:#111827;
+    --surface-2:#1a2234;
+    --surface-3:#232d45;
+    --border:#2a3550;
+    --border-soft:#1f2940;
+    --text:#F1F5F9;
+    --text-dim:#94A3B8;
+    --text-faint:#64748B;
+    --accent:#22C55E;
+    --accent-dim:#16A34A;
+    --accent-soft:rgba(34,197,94,.12);
+    --danger:#EF4444;
+    --danger-soft:rgba(239,68,68,.12);
+    --warn:#F59E0B;
+    --warn-soft:rgba(245,158,11,.12);
+    --info:#38BDF8;
+    --info-soft:rgba(56,189,248,.12);
+    --mono:ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,'Helvetica Neue',Arial,sans-serif;
+    --radius:12px;
+    --radius-sm:8px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scrollbar-color:var(--surface-3) var(--bg)}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    font-size:15px;
+    line-height:1.5;
+    min-height:100dvh;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--info);text-decoration:none}
+  a:hover{text-decoration:underline}
+  button{font-family:inherit;cursor:pointer}
+  input,select{font-family:inherit}
+  ::placeholder{color:var(--text-faint)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+
+  .wrap{max-width:1180px;margin:0 auto;padding:0 20px 80px}
+
+  /* ---------- header ---------- */
+  header{
+    position:sticky;top:0;z-index:40;
+    background:rgba(11,15,25,.88);
+    backdrop-filter:blur(12px);
+    border-bottom:1px solid var(--border-soft);
+  }
+  .hd{max-width:1180px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;letter-spacing:-.01em}
+  .logo-mark{
+    width:32px;height:32px;border-radius:9px;flex:none;
+    background:linear-gradient(135deg,var(--accent) 0%,#0d9455 100%);
+    display:grid;place-items:center;color:#04110a;
+    box-shadow:0 0 18px rgba(34,197,94,.35);
+  }
+  .logo small{display:block;font-weight:500;font-size:11px;color:var(--text-faint);letter-spacing:.04em}
+  .statusbar{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
+  .pill{
+    display:inline-flex;align-items:center;gap:6px;
+    font-size:12px;font-weight:600;color:var(--text-dim);
+    background:var(--surface);border:1px solid var(--border-soft);
+    border-radius:999px;padding:5px 12px;white-space:nowrap;
+  }
+  .pill .dot{width:7px;height:7px;border-radius:50%;background:var(--text-faint);flex:none}
+  .pill.ok .dot{background:var(--accent);box-shadow:0 0 8px rgba(34,197,94,.7)}
+  .pill.ok{color:var(--text)}
+  .pill.bad .dot{background:var(--warn)}
+
+  /* ---------- sections ---------- */
+  .section{margin-top:28px}
+  .section-h{display:flex;align-items:baseline;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+  .section-h h2{font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim)}
+  .section-h .sub{font-size:12.5px;color:var(--text-faint)}
+
+  /* ---------- connect panel ---------- */
+  .connect{
+    display:grid;grid-template-columns:1fr 1fr;gap:14px;
+  }
+  .snippet{
+    background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
+    padding:16px;display:flex;flex-direction:column;gap:10px;min-width:0;
+  }
+  .snippet-h{display:flex;align-items:center;gap:8px}
+  .snippet-h svg{flex:none;color:var(--accent)}
+  .snippet-h .t{font-weight:700;font-size:14px}
+  .snippet-h .copy{margin-left:auto}
+  .snippet pre{
+    font-family:var(--mono);font-size:12.5px;line-height:1.65;color:#c9f0d6;
+    background:#070b13;border:1px solid var(--border-soft);border-radius:var(--radius-sm);
+    padding:12px 14px;overflow-x:auto;white-space:pre;
+  }
+  .snippet .hint{font-size:12px;color:var(--text-faint)}
+  .btn{
+    display:inline-flex;align-items:center;gap:6px;justify-content:center;
+    background:var(--surface-2);color:var(--text);border:1px solid var(--border);
+    border-radius:var(--radius-sm);padding:7px 14px;font-size:13px;font-weight:600;
+    transition:background .18s ease,border-color .18s ease,transform .12s ease;
+  }
+  .btn:hover{background:var(--surface-3);border-color:#3b4a6e}
+  .btn:active{transform:scale(.97)}
+  .btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
+  .btn.primary{background:var(--accent-dim);border-color:var(--accent-dim);color:#04110a}
+  .btn.primary:hover{background:var(--accent);border-color:var(--accent)}
+  .btn.ghost{background:transparent;border-color:var(--border)}
+  .btn.sm{padding:5px 10px;font-size:12px}
+
+  /* ---------- default model ---------- */
+  .default-row{
+    background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
+    padding:16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;
+  }
+  .default-row label{font-size:13px;font-weight:600;color:var(--text-dim)}
+  select{
+    background:var(--surface-2);color:var(--text);border:1px solid var(--border);
+    border-radius:var(--radius-sm);padding:8px 12px;font-size:13.5px;min-width:260px;max-width:100%;
+    appearance:none;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394A3B8' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;background-position:right 12px center;padding-right:34px;
+  }
+  .current-default{
+    font-family:var(--mono);font-size:12.5px;color:var(--accent);
+    background:var(--accent-soft);border:1px solid rgba(34,197,94,.25);
+    border-radius:6px;padding:3px 9px;
+  }
+
+  /* ---------- toolbar / search ---------- */
+  .toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+  .search{
+    flex:1;min-width:220px;position:relative;
+  }
+  .search svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--text-faint);pointer-events:none}
+  .search input{
+    width:100%;background:var(--surface);border:1px solid var(--border-soft);
+    border-radius:var(--radius-sm);color:var(--text);font-size:14px;
+    padding:9px 14px 9px 38px;transition:border-color .18s ease;
+  }
+  .search input:focus{border-color:var(--accent);outline:none}
+  .count-note{font-size:12.5px;color:var(--text-faint);white-space:nowrap}
+
+  /* ---------- provider grid ---------- */
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
+  .card{
+    background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
+    padding:16px;display:flex;flex-direction:column;gap:11px;min-width:0;
+    transition:border-color .2s ease;
+  }
+  .card:hover{border-color:var(--border)}
+  .card.enabled{border-color:rgba(34,197,94,.35)}
+  .card-top{display:flex;align-items:flex-start;gap:10px}
+  .card-top .name{font-weight:700;font-size:15px;letter-spacing:-.01em;min-width:0;overflow-wrap:anywhere}
+  .card-top .pid{font-family:var(--mono);font-size:11px;color:var(--text-faint)}
+  .badges{display:flex;gap:5px;margin-left:auto;flex:none;flex-wrap:wrap;justify-content:flex-end}
+  .badge{font-size:10.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;border-radius:5px;padding:2.5px 7px;white-space:nowrap}
+  .badge.free{background:var(--accent-soft);color:var(--accent)}
+  .badge.trial{background:var(--info-soft);color:var(--info)}
+  .badge.paid{background:var(--warn-soft);color:var(--warn)}
+  .badge.keyed{background:var(--surface-3);color:var(--text-dim)}
+  .notes{font-size:12.5px;color:var(--text-dim);line-height:1.55}
+  .keylink{font-size:12.5px;display:inline-flex;align-items:center;gap:5px}
+  .keyrow{display:flex;gap:8px}
+  .keyrow .kwrap{position:relative;flex:1;min-width:0}
+  .keyrow input[type=password],.keyrow input[type=text]{
+    width:100%;background:var(--surface-2);border:1px solid var(--border);
+    border-radius:var(--radius-sm);color:var(--text);font-family:var(--mono);font-size:12.5px;
+    padding:8px 36px 8px 12px;transition:border-color .18s ease;
+  }
+  .keyrow input:focus{border-color:var(--accent);outline:none}
+  .eye{
+    position:absolute;right:4px;top:50%;transform:translateY(-50%);
+    background:none;border:none;color:var(--text-faint);padding:6px;border-radius:6px;
+    display:grid;place-items:center;
+  }
+  .eye:hover{color:var(--text)}
+  .adv{font-size:12px}
+  .adv summary{color:var(--text-faint);cursor:pointer;user-select:none;list-style:none;display:inline-flex;align-items:center;gap:4px}
+  .adv summary::-webkit-details-marker{display:none}
+  .adv summary:hover{color:var(--text-dim)}
+  .adv[open] summary svg{transform:rotate(90deg)}
+  .adv summary svg{transition:transform .15s ease}
+  .adv input{
+    margin-top:8px;width:100%;background:var(--surface-2);border:1px solid var(--border);
+    border-radius:var(--radius-sm);color:var(--text);font-family:var(--mono);font-size:12px;
+    padding:7px 11px;
+  }
+  .card-actions{display:flex;align-items:center;gap:8px;margin-top:auto;flex-wrap:wrap}
+
+  /* toggle switch */
+  .switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer;user-select:none}
+  .switch input{position:absolute;opacity:0;width:0;height:0}
+  .track{
+    width:38px;height:21px;border-radius:999px;background:var(--surface-3);
+    border:1px solid var(--border);position:relative;transition:background .2s ease,border-color .2s ease;flex:none;
+  }
+  .track::after{
+    content:'';position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;
+    background:var(--text-dim);transition:transform .2s ease,background .2s ease;
+  }
+  .switch input:checked + .track{background:var(--accent-dim);border-color:var(--accent-dim)}
+  .switch input:checked + .track::after{transform:translateX(17px);background:#04110a}
+  .switch input:focus-visible + .track{outline:2px solid var(--accent);outline-offset:2px}
+  .switch .lbl{font-size:12.5px;font-weight:600;color:var(--text-dim)}
+
+  .testout{font-size:12px;border-radius:var(--radius-sm);padding:9px 11px;display:none;overflow-wrap:anywhere}
+  .testout.show{display:block}
+  .testout.ok{background:var(--accent-soft);color:#86efac;border:1px solid rgba(34,197,94,.25)}
+  .testout.fail{background:var(--danger-soft);color:#fca5a5;border:1px solid rgba(239,68,68,.25)}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
+  .chip{font-family:var(--mono);font-size:10.5px;background:rgba(255,255,255,.06);color:var(--text-dim);border-radius:5px;padding:2px 7px}
+
+  .models-preview{font-size:11.5px;color:var(--text-faint);font-family:var(--mono);line-height:1.7;overflow-wrap:anywhere}
+  .models-preview b{color:var(--text-dim);font-weight:600}
+
+  /* ---------- byline + site footer ---------- */
+  .pill.byline { color: var(--muted, #8a8f98); }
+  .pill.byline strong { color: var(--accent, #7c9cff); font-weight: 600; letter-spacing: .01em; }
+  .site-footer {
+    max-width: 1120px; margin: 8px auto 34px; padding: 20px 22px 0;
+    border-top: 1px solid var(--line, rgba(255,255,255,.08));
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    font-size: 12.5px; color: var(--muted, #8a8f98);
+  }
+  .site-footer strong { color: var(--fg, #e8eaed); font-weight: 600; }
+  .site-footer .footer-sep { opacity: .5; }
+  .site-footer .footer-brand { opacity: .75; }
+
+  /* ---------- footer note / toast / misc ---------- */
+  .confignote{
+    margin-top:34px;text-align:center;font-size:12.5px;color:var(--text-faint);
+  }
+  .confignote code{font-family:var(--mono);background:var(--surface);border:1px solid var(--border-soft);border-radius:5px;padding:2px 7px;font-size:11.5px}
+  #toasts{position:fixed;bottom:20px;right:20px;z-index:100;display:flex;flex-direction:column;gap:8px;max-width:min(360px,calc(100vw - 40px))}
+  .toast{
+    background:var(--surface-2);border:1px solid var(--border);border-left:3px solid var(--accent);
+    color:var(--text);font-size:13px;border-radius:var(--radius-sm);padding:11px 15px;
+    box-shadow:0 8px 24px rgba(0,0,0,.5);
+    animation:slidein .25s ease;overflow-wrap:anywhere;
+  }
+  .toast.err{border-left-color:var(--danger)}
+  @keyframes slidein{from{transform:translateY(8px);opacity:0}to{transform:none;opacity:1}}
+  .empty{
+    grid-column:1/-1;text-align:center;color:var(--text-faint);
+    padding:48px 20px;border:1px dashed var(--border);border-radius:var(--radius);font-size:14px;
+  }
+  .spin{animation:spin 1s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @media (prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation-duration:.01ms !important;transition-duration:.01ms !important}
+  }
+  @media (max-width:820px){
+    .connect{grid-template-columns:1fr}
+    .grid{grid-template-columns:1fr}
+    .statusbar{margin-left:0;width:100%}
+    select{min-width:0;flex:1}
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="hd">
+    <div class="logo">
+      <span class="logo-mark" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 11-13h-7l1-7z"/></svg>
+      </span>
+      <span>Free LLM Hub<small>local gateway &middot; 127.0.0.1</small></span>
+    </div>
+    <div class="statusbar" id="statusbar" aria-live="polite">
+      <span class="pill" id="pill-providers"><span class="dot"></span>providers: &hellip;</span>
+      <span class="pill" id="pill-default"><span class="dot"></span>default: &hellip;</span>
+      <span class="pill" id="pill-auth"><span class="dot"></span>gateway auth: &hellip;</span>
+      <span class="pill byline">created by <strong>DAVID SEO</strong></span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- Connect -->
+  <section class="section" aria-labelledby="h-connect">
+    <div class="section-h">
+      <h2 id="h-connect">Connect your tools</h2>
+      <span class="sub">point any CLI at this gateway — it routes to your free providers</span>
+    </div>
+    <div class="connect">
+      <div class="snippet">
+        <div class="snippet-h">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          <span class="t">Claude Code</span>
+          <button class="btn sm ghost copy" data-copy="claude_code" type="button">Copy</button>
+        </div>
+        <pre id="snippet-claude" aria-label="Claude Code connection snippet">loading&hellip;</pre>
+        <div class="hint">Anthropic Messages API emulation &mdash; then just run <code>claude</code>.</div>
+      </div>
+      <div class="snippet">
+        <div class="snippet-h">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m6 9 3 3-3 3"/><line x1="12" y1="15" x2="17" y2="15"/></svg>
+          <span class="t">OpenAI-compatible CLIs</span>
+          <button class="btn sm ghost copy" data-copy="openai" type="button">Copy</button>
+        </div>
+        <pre id="snippet-openai" aria-label="OpenAI CLI connection snippet">loading&hellip;</pre>
+        <div class="hint">Works with aider, opencode, llm, continue &mdash; anything OpenAI-compatible.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Default model -->
+  <section class="section" aria-labelledby="h-default">
+    <div class="section-h">
+      <h2 id="h-default">Default model</h2>
+      <span class="sub">used when a client sends a bare / unknown model name</span>
+    </div>
+    <div class="default-row">
+      <label for="model-select">Route to</label>
+      <select id="model-select" aria-label="Default model">
+        <option value="">— add a provider key first —</option>
+      </select>
+      <button class="btn primary" id="btn-set-default" type="button">Set default</button>
+      <span id="current-default" class="current-default" hidden></span>
+      <button class="btn sm ghost" id="btn-refresh-models" type="button" title="Re-discover models from enabled providers">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+        Refresh
+      </button>
+    </div>
+  </section>
+
+  <!-- Providers -->
+  <section class="section" aria-labelledby="h-providers">
+    <div class="section-h">
+      <h2 id="h-providers">Providers</h2>
+      <span class="sub">paste a free API key, enable, test &mdash; done</span>
+    </div>
+    <div class="toolbar">
+      <div class="search">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="search" id="search" placeholder="Search providers, models, notes&hellip;" aria-label="Search providers">
+      </div>
+      <span class="count-note" id="count-note"></span>
+    </div>
+    <div class="grid" id="grid" aria-live="polite">
+      <div class="empty">Loading providers&hellip;</div>
+    </div>
+  </section>
+
+  <p class="confignote">
+    Keys are stored locally only, in <code id="cfg-path">~/.free-llm-hub/config.json</code> &mdash; nothing ever leaves this machine except your direct calls to the providers you enable.
+  </p>
+</main>
+
+<footer class="site-footer">
+  <span>Created by <strong>DAVID SEO</strong></span>
+  <span class="footer-sep" aria-hidden="true">&middot;</span>
+  <span class="footer-brand">Branched from Calvoun</span>
+</footer>
+
+<div id="toasts" aria-live="polite"></div>
+
+<script>
+(function(){
+  'use strict';
+  var providers = [];
+  var statusData = null;
+
+  /* ---------- helpers ---------- */
+  function $(s, el){ return (el||document).querySelector(s); }
+  function esc(s){
+    return String(s == null ? '' : s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  }
+  function toast(msg, err){
+    var t = document.createElement('div');
+    t.className = 'toast' + (err ? ' err' : '');
+    t.textContent = msg;
+    $('#toasts').appendChild(t);
+    setTimeout(function(){ t.style.opacity = '0'; t.style.transition = 'opacity .3s'; }, 3400);
+    setTimeout(function(){ t.remove(); }, 3800);
+  }
+  function api(path, opts){
+    opts = opts || {};
+    if (opts.body && typeof opts.body !== 'string'){
+      opts.body = JSON.stringify(opts.body);
+      opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers || {});
+    }
+    return fetch(path, opts).then(function(r){
+      return r.json().catch(function(){ return {}; }).then(function(j){
+        if (!r.ok){
+          var msg = (j && (j.error || j.detail || j.message)) || (r.status + ' ' + r.statusText);
+          throw new Error(msg);
+        }
+        return j;
+      });
+    });
+  }
+  function asList(j, keys){
+    if (Array.isArray(j)) return j;
+    for (var i = 0; i < keys.length; i++){
+      if (j && Array.isArray(j[keys[i]])) return j[keys[i]];
+    }
+    return [];
+  }
+  function copyText(txt, btn){
+    function done(ok){
+      if (!btn) return;
+      var old = btn.textContent;
+      btn.textContent = ok ? 'Copied!' : 'Failed';
+      setTimeout(function(){ btn.textContent = old; }, 1400);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){ done(true); }, function(){ fallback(); });
+    } else { fallback(); }
+    function fallback(){
+      var ta = document.createElement('textarea');
+      ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch(e){}
+      ta.remove(); done(ok);
+    }
+  }
+
+  /* ---------- status ---------- */
+  function loadStatus(){
+    return api('/api/status').then(function(s){
+      statusData = s;
+      var n = s.providers_enabled != null ? s.providers_enabled : 0;
+      setPill('pill-providers', n > 0, n + ' enabled');
+      setPill('pill-default', !!s.has_default, s.has_default ? 'default set' : 'no default');
+      setPill('pill-auth', true, s.local_api_key_set ? 'gateway key set' : 'open (localhost)');
+      if (!s.local_api_key_set) $('#pill-auth').classList.remove('ok');
+      var sn = s.connect_snippets || {};
+      $('#snippet-claude').textContent = sn.claude_code || '# gateway not ready';
+      $('#snippet-openai').textContent = sn.openai || '# gateway not ready';
+    }).catch(function(e){ toast('Status: ' + e.message, true); });
+  }
+  function setPill(id, ok, label){
+    var p = document.getElementById(id);
+    p.className = 'pill ' + (ok ? 'ok' : 'bad');
+    p.innerHTML = '<span class="dot"></span>' + esc(label);
+  }
+
+  /* ---------- default model ---------- */
+  function loadModels(){
+    return api('/api/models').then(function(j){
+      var models = asList(j, ['models','data']);
+      var sel = $('#model-select');
+      var cur = sel.value;
+      sel.innerHTML = '';
+      if (!models.length){
+        sel.innerHTML = '<option value="">— add a provider key first —</option>';
+        return;
+      }
+      var byProv = {};
+      models.forEach(function(m){
+        var pid = m.provider || (m.id ? m.id.split('/')[0] : '?');
+        (byProv[pid] = byProv[pid] || []).push(m);
+      });
+      Object.keys(byProv).sort().forEach(function(pid){
+        var og = document.createElement('optgroup');
+        og.label = pid;
+        byProv[pid].forEach(function(m){
+          var o = document.createElement('option');
+          o.value = m.id || (pid + '/' + m.model);
+          o.textContent = m.model || m.id;
+          og.appendChild(o);
+        });
+        sel.appendChild(og);
+      });
+      if (cur && sel.querySelector('option[value="' + CSS.escape(cur) + '"]')) sel.value = cur;
+    }).catch(function(e){ toast('Models: ' + e.message, true); });
+  }
+  function loadDefault(){
+    return api('/api/default').then(function(j){
+      var d = (j && j.provider) ? j : (j && j.default) ? j.default : null;
+      var el = $('#current-default');
+      if (d && d.provider && d.model){
+        el.textContent = 'current: ' + d.provider + '/' + d.model;
+        el.hidden = false;
+        var full = d.provider + '/' + d.model;
+        var sel = $('#model-select');
+        if (sel.querySelector('option[value="' + CSS.escape(full) + '"]')) sel.value = full;
+      } else {
+        el.hidden = true;
+      }
+    }).catch(function(){ /* default may be unset */ });
+  }
+  $('#btn-set-default').addEventListener('click', function(){
+    var v = $('#model-select').value;
+    if (!v){ toast('Pick a model first', true); return; }
+    var i = v.indexOf('/');
+    var payload = { provider: v.slice(0, i), model: v.slice(i + 1) };
+    var btn = this; btn.disabled = true;
+    api('/api/default', { method:'POST', body: payload }).then(function(){
+      toast('Default set: ' + v);
+      return Promise.all([loadDefault(), loadStatus()]);
+    }).catch(function(e){ toast('Set default: ' + e.message, true); })
+      .then(function(){ btn.disabled = false; });
+  });
+  $('#btn-refresh-models').addEventListener('click', function(){
+    var b = this; b.disabled = true;
+    loadModels().then(function(){ toast('Model list refreshed'); b.disabled = false; });
+  });
+
+  /* ---------- providers ---------- */
+  function loadProviders(){
+    return api('/api/providers').then(function(j){
+      providers = asList(j, ['providers']);
+      renderGrid();
+    }).catch(function(e){
+      $('#grid').innerHTML = '<div class="empty">Failed to load providers: ' + esc(e.message) + '</div>';
+    });
+  }
+
+  function cardHTML(p){
+    var badges = '';
+    if (p.paid) badges += '<span class="badge paid">paid</span>';
+    else if (p.trial) badges += '<span class="badge trial">trial</span>';
+    else badges += '<span class="badge free">free</span>';
+    if (p.has_key) badges += '<span class="badge keyed">key saved</span>';
+    var fm = Array.isArray(p.free_models) ? p.free_models : [];
+    var fmPrev = fm.slice(0, 3).join(', ') + (fm.length > 3 ? ' +' + (fm.length - 3) + ' more' : '');
+    return '' +
+      '<div class="card-top">' +
+        '<div><div class="name">' + esc(p.name || p.id) + '</div><div class="pid">' + esc(p.id) + '</div></div>' +
+        '<div class="badges">' + badges + '</div>' +
+      '</div>' +
+      (p.notes ? '<div class="notes">' + esc(p.notes) + '</div>' : '') +
+      (fm.length ? '<div class="models-preview"><b>' + fm.length + ' free model' + (fm.length > 1 ? 's' : '') + ':</b> ' + esc(fmPrev) + '</div>' : '') +
+      (p.signup_url ?
+        '<a class="keylink" href="' + esc(p.signup_url) + '" target="_blank" rel="noopener noreferrer">' +
+          '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>' +
+          'Get a free key</a>' : '') +
+      '<div class="keyrow">' +
+        '<div class="kwrap">' +
+          '<input type="password" class="key-input" placeholder="' + esc(p.key_hint || (p.has_key ? 'key saved — paste to replace' : 'paste API key')) + '" autocomplete="off" spellcheck="false" aria-label="API key for ' + esc(p.name || p.id) + '">' +
+          '<button type="button" class="eye" title="Show / hide key" aria-label="Show or hide key">' +
+            '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>' +
+          '</button>' +
+        '</div>' +
+      '</div>' +
+      '<details class="adv"><summary>' +
+        '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>' +
+        'Advanced: custom base URL</summary>' +
+        '<input type="text" class="base-input" placeholder="override base URL (leave empty for default)" autocomplete="off" spellcheck="false" aria-label="Custom base URL for ' + esc(p.name || p.id) + '">' +
+      '</details>' +
+      '<div class="card-actions">' +
+        '<label class="switch"><input type="checkbox" class="enable-toggle"' + (p.enabled ? ' checked' : '') + '><span class="track" aria-hidden="true"></span><span class="lbl">Enabled</span></label>' +
+        '<span style="flex:1"></span>' +
+        '<button type="button" class="btn sm primary act-save">Save</button>' +
+        '<button type="button" class="btn sm act-test"' + (p.has_key ? '' : ' disabled title="Save a key first"') + '>Test</button>' +
+      '</div>' +
+      '<div class="testout" role="status"></div>';
+  }
+
+  function renderGrid(){
+    var q = ($('#search').value || '').toLowerCase().trim();
+    var grid = $('#grid');
+    var shown = providers.filter(function(p){
+      if (!q) return true;
+      var hay = [p.id, p.name, p.notes, (p.free_models || []).join(' ')].join(' ').toLowerCase();
+      return hay.indexOf(q) !== -1;
+    });
+    $('#count-note').textContent = shown.length + ' / ' + providers.length + ' providers';
+    grid.innerHTML = '';
+    if (!shown.length){
+      grid.innerHTML = '<div class="empty">No providers match &ldquo;' + esc(q) + '&rdquo;</div>';
+      return;
+    }
+    shown.forEach(function(p){
+      var card = document.createElement('div');
+      card.className = 'card' + (p.enabled ? ' enabled' : '');
+      card.dataset.pid = p.id;
+      card.innerHTML = cardHTML(p);
+      wireCard(card, p);
+      grid.appendChild(card);
+    });
+  }
+
+  function wireCard(card, p){
+    var keyInput = $('.key-input', card);
+    var baseInput = $('.base-input', card);
+    var toggle = $('.enable-toggle', card);
+    var out = $('.testout', card);
+    var baseTouched = false;
+    baseInput.addEventListener('input', function(){ baseTouched = true; });
+
+    $('.eye', card).addEventListener('click', function(){
+      keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
+    });
+
+    toggle.addEventListener('change', function(){
+      var want = toggle.checked;
+      api('/api/providers/' + encodeURIComponent(p.id), { method:'POST', body:{ enabled: want } })
+        .then(function(row){
+          updateProvider(row, p.id);
+          card.classList.toggle('enabled', want);
+          toast((row.name || p.id) + (want ? ' enabled' : ' disabled'));
+          return Promise.all([loadStatus(), loadModels()]);
+        })
+        .catch(function(e){
+          toggle.checked = !want;
+          toast('Enable failed: ' + e.message, true);
+        });
+    });
+
+    $('.act-save', card).addEventListener('click', function(){
+      var body = {};
+      if (keyInput.value.trim()) body.api_key = keyInput.value.trim();
+      if (baseTouched) body.base_url = baseInput.value.trim();  /* '' clears the override */
+      if (!Object.keys(body).length){ toast('Nothing to save — paste a key first', true); return; }
+      var btn = this; btn.disabled = true; btn.textContent = 'Saving…';
+      api('/api/providers/' + encodeURIComponent(p.id), { method:'POST', body: body })
+        .then(function(row){
+          updateProvider(row, p.id);
+          keyInput.value = '';
+          keyInput.placeholder = 'key saved — paste to replace';
+          $('.act-test', card).disabled = false;
+          $('.act-test', card).removeAttribute('title');
+          if (!$('.badge.keyed', card)){
+            $('.badges', card).insertAdjacentHTML('beforeend', '<span class="badge keyed">key saved</span>');
+          }
+          toast((row.name || p.id) + ' saved');
+          return Promise.all([loadStatus(), loadModels()]);
+        })
+        .catch(function(e){ toast('Save failed: ' + e.message, true); })
+        .then(function(){ btn.disabled = false; btn.textContent = 'Save'; });
+    });
+
+    $('.act-test', card).addEventListener('click', function(){
+      var btn = this; btn.disabled = true;
+      btn.innerHTML = '<svg class="spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg> Testing';
+      out.className = 'testout';
+      api('/api/test/' + encodeURIComponent(p.id), { method:'POST' })
+        .then(function(r){
+          var ok = !!r.ok;
+          out.className = 'testout show ' + (ok ? 'ok' : 'fail');
+          var html = (ok ? '&check; ' : '&cross; ') + esc(r.detail || (ok ? 'Key works' : 'Test failed'));
+          var sm = Array.isArray(r.sample_models) ? r.sample_models : [];
+          if (sm.length){
+            html += '<div class="chips">' + sm.slice(0, 8).map(function(m){
+              return '<span class="chip">' + esc(m) + '</span>';
+            }).join('') + '</div>';
+          }
+          out.innerHTML = html;
+        })
+        .catch(function(e){
+          out.className = 'testout show fail';
+          out.textContent = '✗ ' + e.message;
+        })
+        .then(function(){ btn.disabled = false; btn.textContent = 'Test'; });
+    });
+  }
+
+  function updateProvider(row, pid){
+    if (!row || !row.id) return;
+    for (var i = 0; i < providers.length; i++){
+      if (providers[i].id === (row.id || pid)){ providers[i] = Object.assign({}, providers[i], row); return; }
+    }
+  }
+
+  /* ---------- copy buttons ---------- */
+  document.querySelectorAll('.copy').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var which = btn.dataset.copy;
+      var txt = (statusData && statusData.connect_snippets && statusData.connect_snippets[which]) || '';
+      if (!txt){ toast('Snippet not ready yet', true); return; }
+      copyText(txt, btn);
+    });
+  });
+
+  /* ---------- search ---------- */
+  var searchTimer = null;
+  $('#search').addEventListener('input', function(){
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(renderGrid, 120);
+  });
+
+  /* ---------- boot ---------- */
+  loadStatus();
+  loadProviders();
+  loadModels().then(loadDefault);
+})();
+</script>
+</body>
+</html>
