@@ -9,11 +9,16 @@ gateway bearer key. No secrets ever live in code.
 Shape:
 {
   "providers": {
-    "<pid>": {"api_key": "sk-...", "enabled": true, "base_url": null}
+    "<pid>": {"api_keys": ["sk-...", "sk-..."], "enabled": true, "base_url": null}
   },
   "default": {"provider": "groq", "model": "llama-3.3-70b-versatile"},  # or null
   "local_api_key": "..."   # or null (open on localhost)
 }
+
+Each provider now holds a POOL of keys ("api_keys": list[str]) that the gateway
+rotates across for load spreading + failover. Legacy rows that still carry a
+single "api_key" string are migrated to api_keys=[that] on load and the old
+field is dropped on the next save (fully backward-compatible).
 
 Pure stdlib: json, os, secrets, stat, tempfile, threading, typing.
 """
@@ -52,6 +57,40 @@ def _config_path() -> str:
     return _default_config_path()
 
 
+def _blank_row() -> dict:
+    """A fresh, well-formed provider row (new multi-key shape, no legacy field)."""
+    return {"enabled": False, "base_url": None, "api_keys": []}
+
+
+def _normalize_provider_row(row):
+    """Return a normalized COPY of one provider row.
+
+    - 'api_keys' becomes a de-duplicated, stripped list[str].
+    - A legacy single 'api_key' (str) is migrated into api_keys IFF no api_keys
+      list is already present, then the legacy field is dropped (so it vanishes
+      from the file on the next save — one-time forward migration).
+    Non-dict rows are returned untouched.
+    """
+    if not isinstance(row, dict):
+        return row
+    row = dict(row)
+    clean = []
+    raw_keys = row.get("api_keys")
+    if isinstance(raw_keys, list):
+        for k in raw_keys:
+            if isinstance(k, str):
+                s = k.strip()
+                if s and s not in clean:
+                    clean.append(s)
+    if not clean:
+        legacy = row.get("api_key")
+        if isinstance(legacy, str) and legacy.strip():
+            clean = [legacy.strip()]
+    row["api_keys"] = clean
+    row.pop("api_key", None)  # drop legacy field on next save
+    return row
+
+
 def load_config() -> dict:
     """Load the config file; return a well-formed dict even if missing/corrupt."""
     path = _config_path()
@@ -66,6 +105,12 @@ def load_config() -> dict:
     # Normalize shape (never let callers see a missing key)
     if not isinstance(cfg.get("providers"), dict):
         cfg["providers"] = {}
+    else:
+        # Migrate every row to the multi-key shape (legacy api_key -> api_keys).
+        cfg["providers"] = {
+            pid: _normalize_provider_row(row)
+            for pid, row in cfg["providers"].items()
+        }
     if not isinstance(cfg.get("default"), dict):
         cfg["default"] = None
     if not isinstance(cfg.get("local_api_key"), str) or not cfg.get("local_api_key"):
@@ -129,15 +174,26 @@ _PROVIDER_DEFAULTS = {"api_key": None, "enabled": False, "base_url": None}
 
 
 def get_provider_config(pid: str) -> dict:
-    """Return {'api_key','enabled','base_url'} for `pid` with sane defaults."""
+    """Return {'api_key','api_keys','enabled','base_url'} for `pid`.
+
+    Back-compat: 'api_key' is the FIRST key in the pool (or None). 'api_keys' is
+    the full rotation pool (list[str], possibly empty).
+    """
     with _LOCK:
         cfg = load_config()
     row = cfg["providers"].get(pid) or {}
     out = dict(_PROVIDER_DEFAULTS)
+    keys = []
     if isinstance(row, dict):
-        for k in out:
-            if k in row and row[k] is not None:
-                out[k] = row[k]
+        raw_keys = row.get("api_keys")
+        if isinstance(raw_keys, list):
+            keys = [k for k in raw_keys if isinstance(k, str) and k]
+        if row.get("enabled") is not None:
+            out["enabled"] = row.get("enabled")
+        if row.get("base_url") is not None:
+            out["base_url"] = row.get("base_url")
+    out["api_keys"] = list(keys)
+    out["api_key"] = keys[0] if keys else None
     out["enabled"] = bool(out["enabled"])
     return out
 
@@ -148,20 +204,95 @@ def set_provider_config(pid: str, *, api_key: Optional[str] = None,
     """Partial update for one provider — merges into the existing row, persists.
 
     Only the keyword args explicitly passed (non-None) are changed; existing
-    values are preserved. To CLEAR a value, pass an empty string ('') for
-    api_key/base_url — it is stored as None.
+    values are preserved. Back-compat for the single-Save UI:
+      - api_key = '<non-empty>'  -> REPLACE the whole pool with [that key]
+      - api_key = ''             -> CLEAR the whole pool
+    To multi-key without clobbering, use add_provider_key/remove_provider_key.
+    To CLEAR base_url, pass an empty string ('') — it is stored as None.
     """
     with _LOCK:
         cfg = load_config()
         row = cfg["providers"].get(pid)
         if not isinstance(row, dict):
-            row = dict(_PROVIDER_DEFAULTS)
+            row = _blank_row()
+        row.pop("api_key", None)
+        if not isinstance(row.get("api_keys"), list):
+            row["api_keys"] = []
         if api_key is not None:
-            row["api_key"] = api_key.strip() or None if isinstance(api_key, str) else api_key
+            if isinstance(api_key, str):
+                s = api_key.strip()
+                row["api_keys"] = [s] if s else []
+            else:
+                row["api_keys"] = [api_key] if api_key else []
         if enabled is not None:
             row["enabled"] = bool(enabled)
         if base_url is not None:
             row["base_url"] = base_url.strip() or None if isinstance(base_url, str) else base_url
+        cfg["providers"][pid] = row
+        save_config(cfg)
+
+
+def list_provider_keys(pid: str) -> list:
+    """Return the provider's key rotation pool as a list[str] (may be empty)."""
+    with _LOCK:
+        cfg = load_config()
+    row = cfg["providers"].get(pid) or {}
+    keys = row.get("api_keys") if isinstance(row, dict) else None
+    return [k for k in keys if isinstance(k, str) and k] if isinstance(keys, list) else []
+
+
+def add_provider_key(pid: str, key: str) -> None:
+    """Append one key to the pool: strip, ignore empty, DEDUPE, persist."""
+    if not isinstance(key, str):
+        return
+    key = key.strip()
+    if not key:
+        return
+    with _LOCK:
+        cfg = load_config()
+        row = cfg["providers"].get(pid)
+        if not isinstance(row, dict):
+            row = _blank_row()
+        row.pop("api_key", None)
+        keys = row.get("api_keys")
+        if not isinstance(keys, list):
+            keys = []
+        if key not in keys:
+            keys.append(key)
+        row["api_keys"] = keys
+        cfg["providers"][pid] = row
+        save_config(cfg)
+
+
+def remove_provider_key(pid: str, index: int) -> bool:
+    """Remove the key at `index` from the pool. Return True if removed + persisted."""
+    if not isinstance(index, int) or isinstance(index, bool):
+        return False
+    with _LOCK:
+        cfg = load_config()
+        row = cfg["providers"].get(pid)
+        if not isinstance(row, dict):
+            return False
+        keys = row.get("api_keys")
+        if not isinstance(keys, list) or index < 0 or index >= len(keys):
+            return False
+        keys.pop(index)
+        row["api_keys"] = keys
+        row.pop("api_key", None)
+        cfg["providers"][pid] = row
+        save_config(cfg)
+        return True
+
+
+def clear_provider_keys(pid: str) -> None:
+    """Empty the provider's key pool (keeps enabled/base_url), persist."""
+    with _LOCK:
+        cfg = load_config()
+        row = cfg["providers"].get(pid)
+        if not isinstance(row, dict):
+            return
+        row["api_keys"] = []
+        row.pop("api_key", None)
         cfg["providers"][pid] = row
         save_config(cfg)
 
