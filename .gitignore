@@ -1,0 +1,13 @@
+# virtualenv
+venv/
+.venv/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# secrets / local config — NEVER commit keys
+config.json
+.free-llm-hub/
+.env
