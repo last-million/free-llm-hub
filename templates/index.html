@@ -113,6 +113,8 @@
   .btn.primary{background:var(--accent-dim);border-color:var(--accent-dim);color:#04110a}
   .btn.primary:hover{background:var(--accent);border-color:var(--accent)}
   .btn.ghost{background:transparent;border-color:var(--border)}
+  .btn.danger{background:transparent;border-color:rgba(239,68,68,.4);color:#fca5a5}
+  .btn.danger:hover{background:var(--danger-soft);border-color:var(--danger)}
   .btn.sm{padding:5px 10px;font-size:12px}
 
   /* ---------- default model ---------- */
@@ -346,6 +348,7 @@
   .cli-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-left:auto}
   .cli-site{font-size:12.5px;color:var(--text-faint)}
   .cli-site a{color:var(--info)}
+  .cli-help{font-size:12.5px;line-height:1.5;color:var(--text-faint);margin-bottom:12px}
 
   /* ---------- modal ---------- */
   .modal-overlay{
@@ -402,7 +405,7 @@
       <span class="pill" id="pill-providers"><span class="dot"></span>providers: &hellip;</span>
       <span class="pill" id="pill-default"><span class="dot"></span>default: &hellip;</span>
       <span class="pill" id="pill-auth"><span class="dot"></span>gateway auth: &hellip;</span>
-      <span class="pill byline">created by <strong>DAVID SEO</strong></span>
+      <span class="pill byline">made by <strong>DAVID SEO</strong> from Calvoun</span>
     </div>
   </div>
 </header>
@@ -443,6 +446,7 @@
       <h2 id="h-clis">Connected tools</h2>
       <span class="sub">local AI CLIs detected on this machine &mdash; auto-fix or set them up by hand</span>
     </div>
+    <p class="cli-help">Auto-fix points a CLI at the hub (free models); Disconnect restores its normal setup.</p>
     <div class="cli-list" id="cli-list" aria-live="polite">
       <div class="empty">Detecting local CLIs&hellip;</div>
     </div>
@@ -477,13 +481,13 @@
     <div class="chat-panel">
       <div class="chat-bar">
         <select id="chat-model" aria-label="Model to chat with">
-          <option value="">&mdash; add a provider key first &mdash;</option>
+          <option value="auto" selected>&#128256; Auto &mdash; best free (orchestrated)</option>
         </select>
         <button class="btn sm ghost" id="chat-clear" type="button">Clear</button>
       </div>
       <div class="chat-note" id="chat-note" role="status"></div>
       <div class="chat-messages" id="chat-messages" aria-live="polite">
-        <div class="chat-empty">Add a provider key and pick a model to start chatting.</div>
+        <div class="chat-empty">Pick a model &mdash; or leave it on &#128256; Auto, which works once at least one provider is enabled + keyed &mdash; and start chatting.</div>
       </div>
       <div class="chat-input-row">
         <textarea id="chat-text" placeholder="Type a message&hellip;  (Enter to send, Shift+Enter for a new line)" aria-label="Message" rows="2"></textarea>
@@ -520,9 +524,7 @@
 
 <footer class="site-footer">
   <div class="footer-line">
-    <span>Created by <strong>DAVID SEO</strong></span>
-    <span class="footer-sep" aria-hidden="true">&middot;</span>
-    <span class="footer-brand">Branched from Calvoun</span>
+    <span>Made by <strong>DAVID SEO</strong> from <strong>Calvoun</strong></span>
   </div>
   <div class="footer-legal">
     &copy; 2026 DAVID SEO &mdash; NOT a free/open copyright system.
@@ -979,11 +981,12 @@
       var sel = $('#chat-model'); if (!sel) return;
       var cur = sel.value;
       sel.innerHTML = '';
-      if (!models.length){
-        var o0 = document.createElement('option');
-        o0.value = ''; o0.textContent = '— add a provider key first —';
-        sel.appendChild(o0); return;
-      }
+      /* Auto is always the first option and the default — the gateway resolves
+         'auto' to the manager's choice + cross-provider fallback. */
+      var autoOpt = document.createElement('option');
+      autoOpt.value = 'auto';
+      autoOpt.textContent = '🔀 Auto — best free (orchestrated)';
+      sel.appendChild(autoOpt);
       models.forEach(function(m){
         var id = m.id || ((m.provider || '?') + '/' + (m.model || ''));
         var o = document.createElement('option');
@@ -991,6 +994,7 @@
         sel.appendChild(o);
       });
       if (cur && sel.querySelector('option[value="' + CSS.escape(cur) + '"]')) sel.value = cur;
+      else sel.value = 'auto';
     }).catch(function(){ /* models may be empty */ });
   }
 
@@ -1019,7 +1023,7 @@
 
     function setStreaming(on){ streaming = on; sendBtn.disabled = on; stopBtn.disabled = !on; }
     function autoGrow(){ textEl.style.height = 'auto'; textEl.style.height = Math.min(textEl.scrollHeight, 200) + 'px'; }
-    function renderEmpty(){ msgsEl.innerHTML = '<div class="chat-empty">Add a provider key and pick a model to start chatting.</div>'; }
+    function renderEmpty(){ msgsEl.innerHTML = '<div class="chat-empty">Pick a model — or leave it on 🔀 Auto, which works once at least one provider is enabled + keyed — and start chatting.</div>'; }
     function appendBubble(role, who, text){
       var wrap = document.createElement('div'); wrap.className = 'msg ' + role;
       var w = document.createElement('span'); w.className = 'who'; w.textContent = who;
@@ -1180,6 +1184,8 @@
       } else if (!c.connected){
         actions = '<button type="button" class="btn sm primary act-autofix">Auto-fix</button>' +
                   '<button type="button" class="btn sm ghost act-manual">Manual setup</button>';
+      } else {
+        actions = '<button type="button" class="btn sm danger act-disconnect">Disconnect</button>';
       }
       row.innerHTML = '' +
         '<div class="cli-main">' +
@@ -1196,8 +1202,14 @@
   function openManualCommands(c, r){
     var box = frag();
     if (r.note){ var n = document.createElement('div'); n.className = 'note'; n.textContent = r.note; box.appendChild(n); }
-    var cmds = Array.isArray(r.commands) ? r.commands : [];
-    if (cmds.length) box.appendChild(blockNode('Run these commands', cmds.join('\n')));
+    var cm = r.commands;
+    if (Array.isArray(cm)){
+      if (cm.length) box.appendChild(blockNode('Run these commands', cm.join('\n')));
+    } else if (cm && typeof cm === 'object'){
+      /* {windows, unix} shape returned by the autofix-manual and disconnect-manual paths */
+      if (cm.windows) box.appendChild(blockNode('Windows (PowerShell/cmd)', cm.windows));
+      if (cm.unix) box.appendChild(blockNode('macOS / Linux', cm.unix));
+    }
     openModal((c.name || c.id) + ' — manual setup', box);
   }
 
@@ -1246,6 +1258,24 @@
         openInstructions(c, r);
       }).catch(function(e){ toast('Instructions: ' + e.message, true); })
         .then(function(){ btn.disabled = false; });
+    });
+    var dis = row.querySelector('.act-disconnect');
+    if (dis) dis.addEventListener('click', function(){
+      var btn = this; btn.disabled = true; btn.textContent = 'Disconnecting…';
+      api('/api/clis/' + encodeURIComponent(c.id) + '/disconnect', { method: 'POST' }).then(function(r){
+        if (r && r.ok){
+          var msg = (c.name || c.id) + ' disconnected';
+          if (r.restart_hint) msg += ' · ' + r.restart_hint;
+          toast(msg);
+          return loadClis();
+        }
+        if (r && r.manual){ openManualCommands(c, r); btn.disabled = false; btn.textContent = 'Disconnect'; return; }
+        toast((r && r.reason) || 'Disconnect unavailable', true);
+        btn.disabled = false; btn.textContent = 'Disconnect';
+      }).catch(function(e){
+        toast('Disconnect failed: ' + e.message, true);
+        btn.disabled = false; btn.textContent = 'Disconnect';
+      });
     });
   }
 

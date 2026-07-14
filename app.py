@@ -206,8 +206,82 @@ def aggregated_models():
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Benchmark heuristic — rank free models best-first WITHOUT any live network or
+# hard-coded model list, so it keeps working as providers rotate their catalogs.
+# Score = capability-family tokens + parameter size + version recency. Higher is
+# stronger. Used to (a) auto-pick the orchestration default and (b) order the
+# cross-provider fallback chain best-first.
+# --------------------------------------------------------------------------- #
+# Capability families, strongest first. Matched case-insensitively as substrings.
+_BENCH_FAMILY = [
+    (("deepseek-v4", "deepseek-r2", "grok-4", "gpt-5", "claude-opus", "claude-sonnet-5",
+      "gemini-3", "llama-4-maverick", "qwen3.5", "qwen3-max"), 100),
+    (("deepseek-v3", "deepseek-r1", "gpt-oss-120b", "llama-4", "qwen3", "gemini-2.5-pro",
+      "mixtral-8x22", "command-r-plus", "minimax", "glm-5", "glm52", "kimi"), 82),
+    (("llama-3.3-70b", "llama-3.1-405", "qwen2.5-72", "gemini-2.5-flash", "gemma-3-27",
+      "mistral-large", "nemotron-70", "command-r", "gpt-4o"), 68),
+    (("70b", "72b", "gemini-2.0", "gpt-4o-mini", "mistral-small", "codestral", "gemma-2-27"), 52),
+    (("32b", "27b", "gemma-3", "phi-4", "qwen2.5-coder"), 40),
+    (("8b", "9b", "7b", "flash-lite", "mini", "small", "nemo"), 24),
+]
+
+
+def _benchmark_score(pid, model_id):
+    """Heuristic strength score for a '<model>' on provider `pid` (higher=better).
+    Pure string heuristic — no network, future-proof against catalog churn."""
+    low = (model_id or "").lower()
+    score = 10  # base so an unknown model still ranks above nothing
+    for names, pts in _BENCH_FAMILY:
+        if any(n in low for n in names):
+            score = max(score, pts)
+            break
+    # Explicit parameter size nudges within a family (…-70b > …-8b).
+    m = re.search(r"(\d{1,4})\s*b\b", low)
+    if m:
+        try:
+            score += min(int(m.group(1)), 500) / 25.0
+        except ValueError:
+            pass
+    # Prefer instruct/chat tunes over raw/base for a chat gateway.
+    if any(t in low for t in ("instruct", "chat", "-it")):
+        score += 3
+    # A tiny provider bias breaks ties toward fast, reliable free hosts.
+    score += {"cerebras": 2.0, "groq": 1.8, "nvidia": 1.2, "google": 1.0}.get(pid, 0.0)
+    return score
+
+
+def _best_free_pair():
+    """Scan every enabled+keyed provider's free models and return the single
+    highest-benchmark (pid, model) pair, or (None, None) if nothing is ready."""
+    best, best_pid, best_score = None, None, -1.0
+    for pid in _enabled_keyed():
+        for m in provider_free_models(pid):
+            s = _benchmark_score(pid, m)
+            if s > best_score:
+                best, best_pid, best_score = m, pid, s
+    return (best_pid, best) if best else (None, None)
+
+
+def _autoselect_default_if_unset():
+    """If no orchestration default is configured yet, auto-pick the best free
+    model across the newly-ready providers and persist it. Never overrides a
+    default the user already chose. Best-effort (never raises to the caller)."""
+    try:
+        if config.get_default():
+            return
+        pid, model = _best_free_pair()
+        if pid and model and prov.is_model_allowed(model):
+            config.set_default(pid, model)
+    except Exception:
+        pass
+
+
 def _resolve_model(model):
-    """'<pid>/<model>' -> (pid, model); bare -> default provider.
+    """'<pid>/<model>' -> (pid, model). 'auto'/empty/claude-* -> ORCHESTRATE:
+    the free-LLM manager picks the primary itself (configured default, else the
+    single highest-benchmark free model across all enabled+keyed providers) and
+    the caller's _build_chain adds cross-provider fallback + key rotation on top.
     Returns (pid, model_id) or (None, error_message)."""
     model = model if isinstance(model, str) else ""
     model = model.strip()
@@ -215,17 +289,28 @@ def _resolve_model(model):
         head, rest = model.split("/", 1)
         if prov.get_provider(head):
             return head, rest
+
     default = config.get_default()
-    if not default or not default.get("provider") or not default.get("model"):
-        return None, ("No default provider/model configured. Set one on the "
-                      "dashboard (or POST /api/default), or request a model as "
-                      "'<provider>/<model>'.")
-    pid = default["provider"]
-    # Bare claude-* names (Claude Code's built-in defaults / small fast model)
-    # route to the configured default model on the default provider.
-    if not model or model.lower().startswith("claude"):
-        return pid, default["model"]
-    return pid, model
+    # 'auto' (dashboard Auto mode), empty, or Claude Code's built-in claude-*
+    # names all mean "let the manager choose + orchestrate".
+    is_auto = (not model) or model.lower() in ("auto", "orchestrate", "default") \
+        or model.lower().startswith("claude")
+    if is_auto:
+        if default and default.get("provider") and default.get("model"):
+            return default["provider"], default["model"]
+        # No default set yet -> orchestrate: pick the single highest-benchmark
+        # free model across every enabled+keyed provider (not just the first).
+        pid, best = _best_free_pair()
+        if pid and best:
+            return pid, best
+        return None, ("No enabled provider with a saved key yet. Add a key and "
+                      "enable a provider on the dashboard, then try again.")
+
+    # Explicit bare model name -> run it on the default provider if one is set.
+    if default and default.get("provider"):
+        return default["provider"], model
+    return None, ("Pick 'Auto' or a '<provider>/<model>', or set a default on "
+                  "the dashboard.")
 
 
 def _check_provider_ready(pid):
@@ -257,11 +342,12 @@ def _comparable_model(model_id, candidates):
 
 def _build_chain(primary_pid, model_id):
     """[(pid, model)] -- primary first, then fallback providers with a
-    comparable free model. Capped at MAX_HOPS."""
+    comparable free model, ORDERED BEST-FIRST by benchmark. Capped at MAX_HOPS."""
     chain = [(primary_pid, model_id)]
+    # Score each other enabled+keyed provider's best comparable model, then add
+    # them strongest-first so a fallback is an upgrade path, not a random hop.
+    candidates = []
     for pid in _enabled_keyed():
-        if len(chain) >= MAX_HOPS:
-            break
         if pid == primary_pid:
             continue
         free = provider_free_models(pid)
@@ -269,7 +355,12 @@ def _build_chain(primary_pid, model_id):
             continue
         alt = model_id if model_id in free else _comparable_model(model_id, free)
         if alt and prov.is_model_allowed(alt):
-            chain.append((pid, alt))
+            candidates.append((_benchmark_score(pid, alt), pid, alt))
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    for _score, pid, alt in candidates:
+        if len(chain) >= MAX_HOPS:
+            break
+        chain.append((pid, alt))
     return chain
 
 
@@ -465,6 +556,11 @@ def api_provider_update(pid):
     if "api_key" in body:
         val = body["api_key"]
         kwargs["api_key"] = val.strip() if isinstance(val, str) else val
+        # Saving a NON-EMPTY key auto-enables the provider (so it starts working
+        # immediately) — unless the caller explicitly set `enabled` in the same
+        # request. The user can still turn it off manually afterwards.
+        if kwargs["api_key"] and "enabled" not in body:
+            kwargs["enabled"] = True
     if "enabled" in body:
         kwargs["enabled"] = bool(body["enabled"])
     if "base_url" in body:
@@ -476,6 +572,7 @@ def api_provider_update(pid):
         config.set_provider_config(pid, **kwargs)
         with _model_cache_lock:
             _model_cache.pop(pid, None)  # key/base changed -> rediscover
+        _autoselect_default_if_unset()  # first keyed provider -> best default
     return jsonify(_provider_row(pid))
 
 
@@ -492,8 +589,13 @@ def api_provider_add_key(pid):
     if not key:
         return jsonify({"error": "api_key is required"}), 400
     config.add_provider_key(pid, key)
+    # Adding a key signals intent to use this provider -> auto-enable it (the
+    # user can still toggle it off). Idempotent: only flips a disabled row.
+    if not config.get_provider_config(pid).get("enabled"):
+        config.set_provider_config(pid, enabled=True)
     with _model_cache_lock:
         _model_cache.pop(pid, None)  # pool changed -> rediscover
+    _autoselect_default_if_unset()  # first keyed provider -> pick a best default
     return jsonify(_provider_row(pid))
 
 
@@ -855,6 +957,22 @@ def _hub_fragments():
     return ["127.0.0.1:%d" % PORT, "localhost:%d" % PORT, "[::1]:%d" % PORT]
 
 
+def _points_at_hub(val):
+    """True if a config value (string) targets THIS hub's origin/port."""
+    return isinstance(val, str) and any(fr in val for fr in _hub_fragments())
+
+
+def _file_points_at_hub(path):
+    """True if the file's raw text contains a hub origin substring. Fail-open:
+    an unreadable file reads as 'not pointing here' (never raises)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            txt = f.read()
+    except OSError:
+        return False
+    return any(fr in txt for fr in _hub_fragments())
+
+
 def _cli_connected(entry):
     """(connected, method, detail) — best-effort, never raises.
     method is 'env' or 'config' when connected, else the entry default."""
@@ -1016,6 +1134,38 @@ def _merge_dotenv(path, updates):
     return "\n".join(out).rstrip("\n") + "\n"
 
 
+def _strip_lines(path, keys, matches):
+    """Drop lines whose top-level identity is in `keys`, preserving every other
+    line. `matches(stripped_line, key)` decides whether a line belongs to `key`.
+    Returns (new_text, removed_count). new_text is '' when nothing is left."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None, 0
+    out, removed = [], 0
+    for ln in lines:
+        s = ln.strip()
+        if any(matches(s, k) for k in keys):
+            removed += 1
+            continue
+        out.append(ln)
+    text = "\n".join(out).rstrip("\n")
+    return (text + "\n" if text else ""), removed
+
+
+def _remove_flat_yaml_keys(path, keys):
+    """Remove top-level `key: ...` lines (aider's flat conf)."""
+    return _strip_lines(path, keys, lambda s, k: s.startswith(k + ":"))
+
+
+def _remove_dotenv_keys(path, keys):
+    """Remove `KEY=...` / `export KEY=...` lines (qwen's dotenv)."""
+    return _strip_lines(
+        path, keys,
+        lambda s, k: s.startswith(k + "=") or s.startswith("export " + k + "="))
+
+
 def _autofix_claude(entry, key, base_root, base_v1, model):
     path = _p_claude()
     data = {}
@@ -1123,6 +1273,136 @@ _AUTOFIXERS = {
 }
 
 
+# --- Disconnect / revert: turn an auto-fixed CLI back to its NORMAL config ----
+# Each reverter restores the pre-autofix state of the CLI's OWN config file:
+#   1. if a <write_path>.freehub-bak backup exists (autofix made one), copy it
+#      back verbatim and delete the backup — this is the user's 'normal case';
+#   2. otherwise (autofix created a fresh file) strip ONLY the hub-specific keys
+#      we added, leaving every unrelated user setting untouched.
+# Never raises for expected IO/parse issues; the route wraps OSErrors. Returns a
+# dict with restored_from_backup / wrote_path / restart_hint (no secrets).
+
+def _restore_backup(path):
+    """Copy <path>.freehub-bak back over path and delete the backup.
+    Returns True if a backup existed and was restored."""
+    bak = path + ".freehub-bak"
+    if not os.path.isfile(bak):
+        return False
+    shutil.copy2(bak, path)
+    try:
+        os.remove(bak)
+    except OSError:
+        pass  # restore succeeded; a lingering backup is harmless
+    return True
+
+
+def _disconnect_claude(entry):
+    path = entry["write_path"]
+    hint = "Restart Claude Code (open a new terminal) so it re-reads ~/.claude/settings.json."
+    if _restore_backup(path):
+        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
+    changed = False
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            env = data.get("env")
+            # Only touch keys we set, and only when the base URL is ours.
+            if isinstance(env, dict) and _points_at_hub(env.get("ANTHROPIC_BASE_URL")):
+                for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"):
+                    if env.pop(k, None) is not None:
+                        changed = True
+                if not env:
+                    data.pop("env", None)
+            if changed:
+                _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return {"restored_from_backup": False, "wrote_path": path,
+            "changed": changed, "restart_hint": hint}
+
+
+def _disconnect_aider(entry):
+    path = entry["write_path"]
+    hint = "Re-run aider in a new session; it reads ~/.aider.conf.yml on startup."
+    if _restore_backup(path):
+        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
+    changed = False
+    if os.path.isfile(path) and _file_points_at_hub(path):
+        text, removed = _remove_flat_yaml_keys(
+            path, ["openai-api-base", "openai-api-key", "model"])
+        if text is not None and removed:
+            _cli_write_text(path, text)
+            changed = True
+    return {"restored_from_backup": False, "wrote_path": path,
+            "changed": changed, "restart_hint": hint}
+
+
+def _disconnect_opencode(entry):
+    path = entry["write_path"]
+    hint = "Restart opencode so it re-reads ~/.config/opencode/opencode.json."
+    if _restore_backup(path):
+        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
+    changed = False
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            providers = data.get("provider")
+            if isinstance(providers, dict) and providers.pop("free-llm-hub", None) is not None:
+                changed = True
+                if not providers:
+                    data.pop("provider", None)
+            m = data.get("model")
+            if isinstance(m, str) and m.startswith("free-llm-hub/"):
+                data.pop("model", None)
+                changed = True
+            if changed:
+                _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return {"restored_from_backup": False, "wrote_path": path,
+            "changed": changed, "restart_hint": hint}
+
+
+def _disconnect_qwen(entry):
+    path = entry["write_path"]
+    hint = "Re-run `qwen` in a new terminal; it reloads ~/.qwen/.env on startup."
+    if _restore_backup(path):
+        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
+    changed = False
+    if os.path.isfile(path) and _file_points_at_hub(path):
+        text, removed = _remove_dotenv_keys(
+            path, ["OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"])
+        if text is not None and removed:
+            _cli_write_text(path, text)
+            changed = True
+    return {"restored_from_backup": False, "wrote_path": path,
+            "changed": changed, "restart_hint": hint}
+
+
+_DISCONNECTERS = {
+    "claude": _disconnect_claude,
+    "aider": _disconnect_aider,
+    "opencode": _disconnect_opencode,
+    "qwen": _disconnect_qwen,
+}
+
+
+def _env_unset_commands(entry):
+    """Copy-paste commands to REMOVE the hub env vars a manual CLI would use.
+    Names only — never a value, so no secret can leak."""
+    if entry.get("kind") == "anthropic":
+        names = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"]
+    else:
+        names = ["OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"]
+    win = "\n".join('setx %s ""' % n for n in names)
+    unix = "\n".join("unset %s" % n for n in names)
+    return {"windows": win, "unix": unix}
+
+
 @app.route("/api/clis", methods=["GET"])
 def api_clis():
     return jsonify([_cli_row(e) for e in CLI_REGISTRY])
@@ -1158,6 +1438,44 @@ def api_cli_autofix(cid):
     except OSError as exc:
         return jsonify({"ok": False, "reason": _sanitize("could not write config: %s" % exc)})
     return jsonify(result)
+
+
+@app.route("/api/clis/<cid>/disconnect", methods=["POST"])
+def api_cli_disconnect(cid):
+    """Revert a CLI to its NORMAL (non-hub) config. For an auto-fixable CLI this
+    restores the .freehub-bak backup (the user's original file) or, if autofix
+    created a fresh file, strips only the hub keys we added. Manual-only CLIs get
+    copy-paste unset commands instead. Never 500s; never logs a secret."""
+    entry = _get_cli_entry(cid)
+    if not entry:
+        return jsonify({"error": "unknown CLI '%s'" % cid}), 404
+    strategy = entry.get("autofix")
+    reverter = _DISCONNECTERS.get(strategy) if strategy else None
+    if not reverter:
+        # Manual-only (TOML / protocol-incompatible / uncertain): we never wrote
+        # this CLI's config, so we can't safely revert it — guide the user.
+        return jsonify({
+            "ok": False, "manual": True,
+            "note": ("This CLI was configured manually; remove the hub env vars/config "
+                     "yourself"),
+            "commands": _env_unset_commands(entry),
+        })
+    try:
+        result = reverter(entry)
+    except OSError as exc:
+        return jsonify({"ok": False, "reason": _sanitize("could not restore config: %s" % exc)})
+    # Recompute freshly from disk so 'connected' reflects the revert immediately.
+    connected = _cli_row(entry).get("connected")
+    out = {
+        "ok": True,
+        "restored_from_backup": bool(result.get("restored_from_backup")),
+        "wrote_path": result.get("wrote_path"),
+        "restart_hint": result.get("restart_hint"),
+        "connected": bool(connected),
+    }
+    if "changed" in result:
+        out["changed"] = bool(result["changed"])
+    return jsonify(out)
 
 
 @app.route("/api/clis/<cid>/instructions", methods=["GET"])
@@ -1228,6 +1546,7 @@ def v1_chat_completions():
 
     stream = bool(body.get("stream"))
     errors = []
+    last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
     for hop_pid, hop_model in _build_chain(pid, resolved):
         if not prov.is_model_allowed(hop_model):
             continue
@@ -1238,23 +1557,42 @@ def v1_chat_completions():
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             continue
-        if _retryable(resp.status_code):
-            errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
-            resp.close()
-            continue
-        if stream and resp.status_code == 200:
-            return Response(stream_with_context(_proxy_sse(resp)),
-                            mimetype="text/event-stream", headers=_SSE_HEADERS)
-        # Non-stream success, or a non-retryable upstream error: relay it.
-        try:
-            data = resp.json()
-        except ValueError:
-            return _openai_error("Upstream returned non-JSON (%s, HTTP %d): %s"
-                                 % (hop_pid, resp.status_code, _sanitize(resp.text)),
-                                 502, "upstream_error")
-        if resp.status_code == 200 and isinstance(data, dict):
-            data["model"] = hop_pid + "/" + hop_model
-        return jsonify(data), resp.status_code
+        if resp.status_code == 200:
+            if stream:
+                return Response(stream_with_context(_proxy_sse(resp)),
+                                mimetype="text/event-stream", headers=_SSE_HEADERS)
+            try:
+                data = resp.json()
+            except ValueError:
+                return _openai_error("Upstream returned non-JSON (%s, HTTP 200): %s"
+                                     % (hop_pid, _sanitize(resp.text)), 502, "upstream_error")
+            if isinstance(data, dict):
+                data["model"] = hop_pid + "/" + hop_model
+            return jsonify(data), 200
+        # Non-2xx. Retryable (429/5xx) and HARD errors (404/400/model-not-found)
+        # both advance to the NEXT provider — each chain hop is a DIFFERENT
+        # provider, so a broken model/provider should fall through before we give
+        # up. Key rotation for the SAME provider already happened in _upstream_chat.
+        errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+        if not _retryable(resp.status_code):
+            # Capture the body once so the last hard error can be relayed verbatim
+            # after the chain is exhausted (retryable errors stay generic 502).
+            try:
+                body_json = resp.json()
+                body_text = None
+            except ValueError:
+                body_json = None
+                body_text = _sanitize(resp.text)
+            last_hard = {"pid": hop_pid, "status": resp.status_code,
+                         "json": body_json, "text": body_text}
+        resp.close()
+        continue
+    if last_hard is not None:
+        if last_hard["json"] is not None:
+            return jsonify(last_hard["json"]), last_hard["status"]
+        return _openai_error("Upstream returned non-JSON (%s, HTTP %d): %s"
+                             % (last_hard["pid"], last_hard["status"], last_hard["text"]),
+                             502, "upstream_error")
     return _openai_error("All providers failed: " + ("; ".join(errors) or "none available"),
                          502, "upstream_error")
 
@@ -1563,6 +1901,7 @@ def v1_messages():
     input_est = _estimate_input_tokens(body)
 
     errors = []
+    last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
     for hop_pid, hop_model in _build_chain(pid, resolved):
         if not prov.is_model_allowed(hop_model):
             continue
@@ -1574,27 +1913,35 @@ def v1_messages():
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             continue
-        if _retryable(resp.status_code):
-            errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
-            resp.close()
-            continue
-        model_str = requested_model or (hop_pid + "/" + hop_model)
-        if resp.status_code != 200:
+        if resp.status_code == 200:
+            model_str = requested_model or (hop_pid + "/" + hop_model)
+            if stream:
+                return Response(stream_with_context(
+                    _anthropic_stream(resp, model_str, input_est)),
+                    mimetype="text/event-stream", headers=_SSE_HEADERS)
+            try:
+                data = resp.json()
+            except ValueError:
+                return _anthropic_error("api_error",
+                                        "Upstream %s returned non-JSON." % hop_pid, 502)
+            return jsonify(_openai_resp_to_anthropic(data, model_str))
+        # Non-2xx. Retryable (429/5xx) AND hard errors (404/400/model-not-found)
+        # both advance to the NEXT provider (a different provider/model) before we
+        # surface an error; within-provider key rotation already ran upstream.
+        errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+        if not _retryable(resp.status_code):
+            # Capture the last hard error's detail to relay once the chain is done.
             detail = _upstream_error_detail(resp)
             status = resp.status_code if 400 <= resp.status_code < 500 else 502
-            return _anthropic_error("api_error",
-                                    "Upstream %s error (HTTP %d): %s"
-                                    % (hop_pid, resp.status_code, detail), status)
-        if stream:
-            return Response(stream_with_context(
-                _anthropic_stream(resp, model_str, input_est)),
-                mimetype="text/event-stream", headers=_SSE_HEADERS)
-        try:
-            data = resp.json()
-        except ValueError:
-            return _anthropic_error("api_error",
-                                    "Upstream %s returned non-JSON." % hop_pid, 502)
-        return jsonify(_openai_resp_to_anthropic(data, model_str))
+            last_hard = {"pid": hop_pid, "http": resp.status_code,
+                         "status": status, "detail": detail}
+        resp.close()
+        continue
+    if last_hard is not None:
+        return _anthropic_error("api_error",
+                                "Upstream %s error (HTTP %d): %s"
+                                % (last_hard["pid"], last_hard["http"], last_hard["detail"]),
+                                last_hard["status"])
     return _anthropic_error("api_error",
                             "All providers failed: " + ("; ".join(errors) or "none available"),
                             502)

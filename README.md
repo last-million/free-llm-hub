@@ -1,6 +1,10 @@
 # Free LLM Hub
 
+*Made by **DAVID SEO** from **Calvoun**.*
+
 **A tiny local gateway that gives every CLI on your machine — including Claude Code — access to free LLM providers.**
+
+> **License notice:** This is **not** free/MIT software. It is source-available under the **PolyForm Noncommercial License 1.0.0** — personal, hobby, research and study use only. **You may not sell it, host it as a paid service, or use it in a commercial product/web app.** See [`LICENSE`](LICENSE). For commercial use, contact the author.
 
 Drop this folder anywhere, run one command, open the dashboard, paste a couple of free API keys, and every OpenAI-compatible tool *and* Claude Code can talk to Groq, Cerebras, Google AI Studio, OpenRouter and more — through a single `http://localhost:8787` endpoint with automatic failover between providers.
 
