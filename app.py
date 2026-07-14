@@ -82,9 +82,14 @@ def _secret_values():
     try:
         cfg = config.load_config()
         for pcfg in (cfg.get("providers") or {}).values():
-            key = (pcfg or {}).get("api_key")
-            if key:
-                vals.append(key)
+            if not isinstance(pcfg, dict):
+                continue
+            for key in (pcfg.get("api_keys") or []):
+                if key:
+                    vals.append(key)
+            legacy = pcfg.get("api_key")  # defensive: normally migrated away on load
+            if legacy:
+                vals.append(legacy)
         local = cfg.get("local_api_key")
         if local:
             vals.append(local)
@@ -266,23 +271,68 @@ def _build_chain(primary_pid, model_id):
     return chain
 
 
+# Key-pool rotation: statuses that mean "this key is bad/throttled, try the
+# next key for the SAME provider before falling back to another provider".
+_KEY_ROTATE_STATUSES = (401, 403, 429)
+_provider_key_cursor = {}          # pid -> next round-robin start offset
+_key_cursor_lock = threading.Lock()
+
+
+def _next_key_start(pid, n):
+    """Round-robin starting index for provider `pid`, advanced per request so
+    load spreads across the pool instead of always hammering key[0]."""
+    if n <= 1:
+        return 0
+    with _key_cursor_lock:
+        start = _provider_key_cursor.get(pid, 0) % n
+        _provider_key_cursor[pid] = (start + 1) % n
+    return start
+
+
 def _upstream_chat(pid, payload, stream):
-    """POST {base_url}/chat/completions for provider pid. May raise
-    requests.RequestException or RuntimeError."""
+    """POST {base_url}/chat/completions for provider pid, rotating across the
+    provider's api_keys pool. Tries a round-robin start key; on 401/403/429 it
+    advances to the next key for the SAME provider. Returns the first non-
+    rotatable response (or the last response/exception once keys are exhausted,
+    so the caller's provider-level fallback still kicks in). May raise
+    requests.RequestException or RuntimeError. Never logs a key."""
     pcfg = config.get_provider_config(pid)
     base = prov.base_url_for(pid, pcfg.get("base_url"))
     if not base:
         raise RuntimeError("no base_url for provider " + pid)
-    key = pcfg.get("api_key")
-    if not key:
+    keys = pcfg.get("api_keys") or []
+    if not keys:
         raise RuntimeError("no api key for provider " + pid)
-    return requests.post(
-        base.rstrip("/") + "/chat/completions",
-        json=payload,
-        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
-        stream=stream,
-        timeout=(CONNECT_TIMEOUT, CHAT_READ_TIMEOUT),
-    )
+    url = base.rstrip("/") + "/chat/completions"
+    n = len(keys)
+    start = _next_key_start(pid, n)
+    last_exc = None
+    for i in range(n):
+        is_last = (i == n - 1)
+        key = keys[(start + i) % n]
+        try:
+            resp = requests.post(
+                url,
+                json=payload,
+                headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+                stream=stream,
+                timeout=(CONNECT_TIMEOUT, CHAT_READ_TIMEOUT),
+            )
+        except requests.RequestException as exc:
+            last_exc = exc
+            if is_last:
+                raise
+            continue
+        # Auth/rate-limit on this key -> try the next key before this provider
+        # is given up on. On the last key, return it so the caller can react
+        # (429/5xx -> provider fallback; 401/403 -> surfaced as an error).
+        if resp.status_code in _KEY_ROTATE_STATUSES and not is_last:
+            resp.close()
+            continue
+        return resp
+    if last_exc is not None:  # only reachable if the pool was somehow empty
+        raise last_exc
+    raise RuntimeError("no api key for provider " + pid)
 
 
 def _retryable(status):
@@ -365,9 +415,19 @@ def index():
 # Config API
 # ---------------------------------------------------------------------------
 
+def _mask_key(k):
+    """Safe display form of a key: first4 + '…' + last4 (or '••••' if <9 chars).
+    NEVER returns the full key — the reveal route is the only full-key surface."""
+    s = k if isinstance(k, str) else str(k or "")
+    if len(s) < 9:
+        return "••••"
+    return s[:4] + "…" + s[-4:]
+
+
 def _provider_row(pid, live_models=False):
     p = prov.get_provider(pid) or {}
     pcfg = config.get_provider_config(pid)
+    keys = pcfg.get("api_keys") or []
     # Provider rows never trigger a network model-discovery call by default:
     # a save/list must be instant and can't fail on a provider's flaky /models
     # endpoint. The live model list is served separately by GET /api/models.
@@ -375,7 +435,9 @@ def _provider_row(pid, live_models=False):
         "id": pid,
         "name": p.get("name") or pid,
         "enabled": bool(pcfg.get("enabled")),
-        "has_key": bool(pcfg.get("api_key")),
+        "has_key": bool(keys),
+        "key_count": len(keys),
+        "keys": [{"masked": _mask_key(k), "index": i} for i, k in enumerate(keys)],
         "signup_url": prov.signup_url(pid),
         "key_hint": p.get("key_hint") or "",
         "notes": p.get("notes") or "",
@@ -413,6 +475,48 @@ def api_provider_update(pid):
         with _model_cache_lock:
             _model_cache.pop(pid, None)  # key/base changed -> rediscover
     return jsonify(_provider_row(pid))
+
+
+@app.route("/api/providers/<pid>/keys", methods=["POST"])
+def api_provider_add_key(pid):
+    """Add ONE key to the provider's rotation pool (dedupes)."""
+    if not prov.get_provider(pid):
+        return jsonify({"error": "unknown provider '%s'" % pid}), 404
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "invalid JSON body"}), 400
+    val = body.get("api_key")
+    key = val.strip() if isinstance(val, str) else ""
+    if not key:
+        return jsonify({"error": "api_key is required"}), 400
+    config.add_provider_key(pid, key)
+    with _model_cache_lock:
+        _model_cache.pop(pid, None)  # pool changed -> rediscover
+    return jsonify(_provider_row(pid))
+
+
+@app.route("/api/providers/<pid>/keys/<int:idx>", methods=["DELETE"])
+def api_provider_remove_key(pid, idx):
+    """Remove the key at `idx` from the provider's rotation pool."""
+    if not prov.get_provider(pid):
+        return jsonify({"error": "unknown provider '%s'" % pid}), 404
+    if not config.remove_provider_key(pid, idx):
+        return jsonify({"error": "no key at index %d" % idx}), 404
+    with _model_cache_lock:
+        _model_cache.pop(pid, None)  # pool changed -> rediscover
+    return jsonify(_provider_row(pid))
+
+
+@app.route("/api/providers/<pid>/keys/<int:idx>/reveal", methods=["GET"])
+def api_provider_reveal_key(pid, idx):
+    """Return the FULL key at `idx` (localhost-only, single-user, in-threat-model
+    per the plaintext local store) so the dashboard eye-toggle can show it."""
+    if not prov.get_provider(pid):
+        return jsonify({"error": "unknown provider '%s'" % pid}), 404
+    keys = config.list_provider_keys(pid)
+    if idx < 0 or idx >= len(keys):
+        return jsonify({"error": "no key at index %d" % idx}), 404
+    return jsonify({"api_key": keys[idx]})
 
 
 @app.route("/api/test/<pid>", methods=["POST"])
