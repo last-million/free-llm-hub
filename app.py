@@ -22,6 +22,8 @@ import hmac
 import json
 import os
 import re
+import shutil
+import sys
 import threading
 import time
 import uuid
@@ -637,6 +639,551 @@ def api_status():
         "has_default": bool(default and default.get("provider") and default.get("model")),
         "local_api_key_set": bool(config.get_local_api_key()),
         "connect_snippets": _connect_snippets(),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Local CLI detection / connection status / auto-fix
+# ---------------------------------------------------------------------------
+# Detect known local AI CLIs, report whether each one is already pointed at
+# THIS hub, and (safely, additively) rewrite the CLI's OWN config file to use
+# a free model served here. All /api/clis/* routes are localhost-open like the
+# rest of /api/*. Everything fails open — a missing/garbled config never
+# crashes a row, it just reads as connected:false. Provider API keys are never
+# written into a response (masked); the local gateway key is treated the same
+# way _connect_snippets() already does (shown so the user can paste it, never
+# logged).
+
+
+def _home():
+    return os.path.expanduser("~")
+
+
+def _xdg_config():
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(_home(), ".config")
+
+
+def _llm_user_dir():
+    """Best-effort user dir for Simon Willison's `llm` (click app dir)."""
+    override = os.environ.get("LLM_USER_PATH")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    if sys.platform == "darwin":
+        return os.path.join(_home(), "Library", "Application Support", "io.datasette.llm")
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(_home(), "AppData", "Local")
+        return os.path.join(base, "io.datasette.llm")
+    return os.path.join(_xdg_config(), "io.datasette.llm")
+
+
+def _short(path):
+    """Display a path with ~ for the home dir (cosmetic only)."""
+    try:
+        home = _home()
+        if path == home:
+            return "~"
+        if path.startswith(home + os.sep):
+            return "~" + path[len(home):]
+    except Exception:
+        pass
+    return path
+
+
+def _p_claude():
+    return os.path.join(_home(), ".claude", "settings.json")
+
+
+def _p_opencode():
+    return os.path.join(_xdg_config(), "opencode", "opencode.json")
+
+
+def _p_aider():
+    return os.path.join(_home(), ".aider.conf.yml")
+
+
+def _p_qwen_env():
+    return os.path.join(_home(), ".qwen", ".env")
+
+
+# The CLI registry: known local AI CLIs and how each connects to a custom
+# OpenAI/Anthropic endpoint. `autofix` names a safe writer strategy (JSON/
+# YAML/dotenv merge) or is None for CLIs we won't touch automatically (TOML,
+# protocol-incompatible, or uncertain — handled via a manual instructions
+# payload). Paths are resolved at import; env path overrides (XDG_CONFIG_HOME,
+# LLM_USER_PATH) are read live inside the path helpers above.
+CLI_REGISTRY = [
+    {
+        "id": "claude",
+        "name": "Claude Code",
+        "kind": "anthropic",
+        "bins": ["claude"],
+        "config_paths": [_p_claude(), os.path.join(_home(), ".claude", "settings.local.json")],
+        "env_check": ["ANTHROPIC_BASE_URL"],
+        "autofix": "claude",
+        "write_path": _p_claude(),
+        "default_method": "config",
+        "hint": ("Installed. Set ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN/ANTHROPIC_MODEL, "
+                 "or run Auto-fix to write the 'env' block of ~/.claude/settings.json."),
+    },
+    {
+        "id": "aider",
+        "name": "Aider",
+        "kind": "openai",
+        "bins": ["aider"],
+        "config_paths": [_p_aider()],
+        "env_check": ["OPENAI_API_BASE", "OPENAI_BASE_URL"],
+        "autofix": "aider",
+        "write_path": _p_aider(),
+        "default_method": "config",
+        "hint": ("Installed. Set OPENAI_API_BASE + OPENAI_API_KEY, or run Auto-fix to write "
+                 "openai-api-base/openai-api-key/model into ~/.aider.conf.yml."),
+    },
+    {
+        "id": "opencode",
+        "name": "OpenCode",
+        "kind": "openai",
+        "bins": ["opencode"],
+        "config_paths": [_p_opencode(), os.path.join(_xdg_config(), "opencode", "opencode.jsonc")],
+        "env_check": ["OPENAI_BASE_URL", "OPENAI_API_BASE"],
+        "autofix": "opencode",
+        "write_path": _p_opencode(),
+        "default_method": "config",
+        "hint": ("Installed. Run Auto-fix to add a 'free-llm-hub' openai-compatible provider to "
+                 "~/.config/opencode/opencode.json (provider schema can vary by opencode version)."),
+    },
+    {
+        "id": "codex",
+        "name": "OpenAI Codex CLI",
+        "kind": "openai",
+        "bins": ["codex"],
+        "config_paths": [os.path.join(_home(), ".codex", "config.toml")],
+        "env_check": ["OPENAI_BASE_URL", "OPENAI_API_BASE"],
+        "autofix": None,  # TOML — no safe stdlib writer/merger, so manual only
+        "default_method": "config",
+        "hint": "Installed. Needs a manual [model_providers] block in ~/.codex/config.toml (see instructions).",
+        "manual_note": (
+            "Codex uses ~/.codex/config.toml (TOML — not auto-edited here). Add:\n"
+            "  [model_providers.freehub]\n"
+            "  name = \"Free LLM Hub\"\n"
+            "  base_url = \"http://127.0.0.1:%d/v1\"\n"
+            "  env_key = \"OPENAI_API_KEY\"\n"
+            "then set  model_provider = \"freehub\"  and  model = \"<provider>/<model>\"  at the top "
+            "level, and export OPENAI_API_KEY (below)." % PORT
+        ),
+    },
+    {
+        "id": "gemini",
+        "name": "Gemini CLI",
+        "kind": "openai",  # nearest allowed kind; see manual_note — not natively OpenAI
+        "bins": ["gemini"],
+        "config_paths": [os.path.join(_home(), ".gemini", "settings.json")],
+        "env_check": ["GOOGLE_GEMINI_BASE_URL", "GEMINI_API_BASE_URL"],
+        "autofix": None,  # protocol mismatch — uncertain/unsupported, do not auto-config
+        "default_method": "manual",
+        "hint": ("Installed, but Gemini CLI speaks Google's native API — this OpenAI/Anthropic hub "
+                 "cannot serve it directly (uncertain)."),
+        "manual_note": (
+            "UNCERTAIN / likely incompatible: Google's Gemini CLI targets the native Gemini API, not "
+            "an OpenAI- or Anthropic-shaped endpoint, so this hub can't serve it as-is. Even builds that "
+            "honor GOOGLE_GEMINI_BASE_URL still expect Google's wire format. Use the Qwen Code CLI (an "
+            "OpenAI-compatible Gemini-CLI fork) instead if you want a Gemini-CLI-style tool on this hub."
+        ),
+    },
+    {
+        "id": "qwen",
+        "name": "Qwen Code",
+        "kind": "openai",
+        "bins": ["qwen"],
+        "config_paths": [os.path.join(_home(), ".qwen", "settings.json"), _p_qwen_env()],
+        "env_check": ["OPENAI_API_BASE", "OPENAI_BASE_URL"],
+        "autofix": "qwen",
+        "write_path": _p_qwen_env(),
+        "default_method": "config",
+        "hint": ("Installed. Set OPENAI_API_BASE/OPENAI_API_KEY/OPENAI_MODEL, or run Auto-fix to write "
+                 "them into ~/.qwen/.env (the CLI's own dotenv, not a global shell profile)."),
+    },
+    {
+        "id": "llm",
+        "name": "llm (Simon Willison)",
+        "kind": "openai",
+        "bins": ["llm"],
+        "config_paths": [os.path.join(_llm_user_dir(), "extra-openai-models.yaml")],
+        "env_check": ["OPENAI_BASE_URL", "OPENAI_API_BASE"],
+        "autofix": None,  # needs a YAML *list* entry + `llm keys set`; safer to guide manually
+        "default_method": "config",
+        "hint": "Installed. Add an OpenAI-compatible model via extra-openai-models.yaml + `llm keys set` (see instructions).",
+        "manual_note": (
+            "`llm` needs an OpenAI-compatible model registered in %s :\n"
+            "  - model_id: freehub\n"
+            "    model_name: <provider>/<model>\n"
+            "    api_base: http://127.0.0.1:%d/v1\n"
+            "    api_key_name: freehub\n"
+            "then run  llm keys set freehub  (paste the local key), and use  llm -m freehub ...  ."
+            % (_short(os.path.join(_llm_user_dir(), "extra-openai-models.yaml")), PORT)
+        ),
+    },
+    {
+        "id": "cursor-agent",
+        "name": "Cursor Agent CLI",
+        "kind": "openai",
+        "bins": ["cursor-agent"],
+        "config_paths": [os.path.join(_home(), ".cursor", "cli-config.json"),
+                         os.path.join(_home(), ".cursor", "config.json")],
+        "env_check": ["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "OPENAI_API_BASE"],
+        "autofix": None,  # uncertain: custom-endpoint support is unofficial
+        "default_method": "manual",
+        "hint": "Installed. Custom-endpoint support is uncertain/unofficial (see instructions).",
+        "manual_note": (
+            "UNCERTAIN: cursor-agent authenticates to Cursor's own backend; pointing it at a custom "
+            "OpenAI/Anthropic endpoint is not an officially documented flow. Only try the env vars below "
+            "if your cursor-agent version explicitly supports a base-URL override."
+        ),
+    },
+]
+
+_CLI_BY_ID = {e["id"]: e for e in CLI_REGISTRY}
+
+
+def _get_cli_entry(cid):
+    return _CLI_BY_ID.get(cid)
+
+
+def _hub_fragments():
+    """Substrings that, if present in a CLI's config/env, mean it points here.
+    The PORT is the discriminator, so this matches both the bare origin and the
+    /v1 form (http://127.0.0.1:<PORT>, http://127.0.0.1:<PORT>/v1, ...)."""
+    return ["127.0.0.1:%d" % PORT, "localhost:%d" % PORT, "[::1]:%d" % PORT]
+
+
+def _cli_connected(entry):
+    """(connected, method, detail) — best-effort, never raises.
+    method is 'env' or 'config' when connected, else the entry default."""
+    frags = _hub_fragments()
+    for ev in entry.get("env_check", []):
+        val = os.environ.get(ev)
+        if val and any(fr in val for fr in frags):
+            return True, "env", "Connected via the %s environment variable." % ev
+    for path in entry.get("config_paths", []):
+        try:
+            if not os.path.isfile(path):
+                continue
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                txt = f.read()
+        except OSError:
+            continue  # fail open
+        if any(fr in txt for fr in frags):
+            return True, "config", "Connected via %s." % _short(path)
+    return False, entry.get("default_method", "manual"), None
+
+
+def _cli_installed(entry):
+    for b in entry.get("bins", []):
+        p = shutil.which(b)
+        if p:
+            return True, p
+    return False, None
+
+
+def _cli_row(entry):
+    installed, path = _cli_installed(entry)
+    connected, method, cdetail = _cli_connected(entry)
+    if not installed:
+        connected = False  # can't be "connected" if the binary isn't on PATH
+        detail = "Not installed (looked for: %s)." % ", ".join(entry.get("bins", []))
+    elif connected:
+        detail = cdetail
+    else:
+        detail = entry.get("hint") or "Installed. Not pointed at this hub yet."
+    return {
+        "id": entry["id"],
+        "name": entry["name"],
+        "kind": entry["kind"],
+        "installed": installed,
+        "path": path,
+        "connected": connected,
+        "connect_method": method if connected else entry.get("default_method", "manual"),
+        "detail": detail,
+    }
+
+
+def _first_free_model_id():
+    """First aggregated (enabled+keyed) free model id '<pid>/<model>', or None."""
+    models = aggregated_models()
+    return models[0]["id"] if models else None
+
+
+def _manual_env(entry, key, base_root, base_v1, model):
+    """The env vars this CLI would need, resolved with the live port/key/model."""
+    if entry["kind"] == "anthropic":
+        return {"ANTHROPIC_BASE_URL": base_root,
+                "ANTHROPIC_AUTH_TOKEN": key,
+                "ANTHROPIC_MODEL": model}
+    return {"OPENAI_API_BASE": base_v1,
+            "OPENAI_BASE_URL": base_v1,
+            "OPENAI_API_KEY": key,
+            "OPENAI_MODEL": model}
+
+
+def _env_commands(env):
+    """Shell one-liners to set env vars persistently (per-CLI, NOT a profile edit
+    we make for the user — we only *print* these for them to run)."""
+    win = "\n".join('setx %s "%s"' % (k, v) for k, v in env.items())
+    unix = "\n".join("export %s='%s'" % (k, v) for k, v in env.items())
+    return {"windows": win, "unix": unix}
+
+
+def _backup_once(path):
+    """Copy path -> path.freehub-bak exactly once (never clobber an existing
+    backup). Returns the backup path if one exists, else None."""
+    bak = path + ".freehub-bak"
+    try:
+        if os.path.isfile(path) and not os.path.exists(bak):
+            shutil.copy2(path, bak)
+        return bak if os.path.exists(bak) else None
+    except OSError:
+        return None
+
+
+def _cli_write_text(path, text):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _yaml_dq(v):
+    """Double-quote a scalar for a flat YAML value."""
+    s = str(v).replace("\\", "\\\\").replace('"', '\\"')
+    return '"%s"' % s
+
+
+def _merge_flat_yaml(path, updates):
+    """Additively set top-level `key: value` pairs in a flat YAML file,
+    preserving every other line. Only rewrites lines whose top-level key matches
+    (no indentation), appends the rest — safe for aider's flat conf."""
+    lines = []
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+    remaining = dict(updates)
+    out = []
+    for ln in lines:
+        replaced = False
+        for k in list(remaining):
+            if ln.startswith(k + ":"):
+                out.append("%s: %s" % (k, _yaml_dq(remaining[k])))
+                del remaining[k]
+                replaced = True
+                break
+        if not replaced:
+            out.append(ln)
+    for k, v in updates.items():
+        if k in remaining:
+            out.append("%s: %s" % (k, _yaml_dq(v)))
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def _merge_dotenv(path, updates):
+    """Additively set KEY=VALUE lines in a dotenv file, preserving other lines.
+    Matches `KEY=` and `export KEY=` at line start."""
+    lines = []
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+    remaining = dict(updates)
+    out = []
+    for ln in lines:
+        s = ln.strip()
+        replaced = False
+        for k in list(remaining):
+            if s.startswith(k + "=") or s.startswith("export " + k + "="):
+                out.append("%s=%s" % (k, remaining[k]))
+                del remaining[k]
+                replaced = True
+                break
+        if not replaced:
+            out.append(ln)
+    for k, v in updates.items():
+        if k in remaining:
+            out.append("%s=%s" % (k, v))
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def _autofix_claude(entry, key, base_root, base_v1, model):
+    path = _p_claude()
+    data = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {"ok": False, "reason": "existing %s is not valid JSON — fix or remove it, then retry."
+                    % _short(path)}
+        if not isinstance(data, dict):
+            return {"ok": False, "reason": "existing %s is not a JSON object; not overwriting." % _short(path)}
+    backup = _backup_once(path)
+    env = data.get("env")
+    if not isinstance(env, dict):
+        env = {}
+    env["ANTHROPIC_BASE_URL"] = base_root
+    env["ANTHROPIC_AUTH_TOKEN"] = key
+    env["ANTHROPIC_MODEL"] = model
+    data["env"] = env
+    _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return {
+        "ok": True,
+        "wrote_path": path,
+        "backup_path": backup,
+        "applied": {"file_key": "env", "ANTHROPIC_BASE_URL": base_root,
+                    "ANTHROPIC_AUTH_TOKEN": _mask_key(key), "ANTHROPIC_MODEL": model},
+        "restart_hint": "Restart Claude Code (open a new terminal) so it re-reads ~/.claude/settings.json.",
+    }
+
+
+def _autofix_aider(entry, key, base_root, base_v1, model):
+    path = _p_aider()
+    updates = {"openai-api-base": base_v1, "openai-api-key": key, "model": "openai/" + model}
+    backup = _backup_once(path)
+    _cli_write_text(path, _merge_flat_yaml(path, updates))
+    return {
+        "ok": True,
+        "wrote_path": path,
+        "backup_path": backup,
+        "applied": {"openai-api-base": base_v1, "openai-api-key": _mask_key(key),
+                    "model": "openai/" + model},
+        "restart_hint": "Re-run aider in a new session; it reads ~/.aider.conf.yml on startup.",
+    }
+
+
+def _autofix_opencode(entry, key, base_root, base_v1, model):
+    path = _p_opencode()
+    data = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {"ok": False, "reason": ("existing %s is not valid JSON (jsonc comments aren't "
+                    "auto-merged) — configure it by hand, then retry." % _short(path))}
+        if not isinstance(data, dict):
+            return {"ok": False, "reason": "existing %s is not a JSON object; not overwriting." % _short(path)}
+    backup = _backup_once(path)
+    data.setdefault("$schema", "https://opencode.ai/config.json")
+    providers = data.get("provider")
+    if not isinstance(providers, dict):
+        providers = {}
+    providers["free-llm-hub"] = {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "Free LLM Hub",
+        "options": {"baseURL": base_v1, "apiKey": key},
+        "models": {model: {"name": model}},
+    }
+    data["provider"] = providers
+    data["model"] = "free-llm-hub/" + model
+    _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return {
+        "ok": True,
+        "wrote_path": path,
+        "backup_path": backup,
+        "applied": {"provider": "free-llm-hub", "baseURL": base_v1, "apiKey": _mask_key(key),
+                    "model": "free-llm-hub/" + model},
+        "restart_hint": ("Restart opencode. If it complains about the provider, run its install/auth "
+                         "step for @ai-sdk/openai-compatible (schema varies by version)."),
+    }
+
+
+def _autofix_qwen(entry, key, base_root, base_v1, model):
+    path = _p_qwen_env()
+    updates = {"OPENAI_API_BASE": base_v1, "OPENAI_BASE_URL": base_v1,
+               "OPENAI_API_KEY": key, "OPENAI_MODEL": model}
+    backup = _backup_once(path)
+    _cli_write_text(path, _merge_dotenv(path, updates))
+    return {
+        "ok": True,
+        "wrote_path": path,
+        "backup_path": backup,
+        "applied": {"OPENAI_API_BASE": base_v1, "OPENAI_BASE_URL": base_v1,
+                    "OPENAI_API_KEY": _mask_key(key), "OPENAI_MODEL": model},
+        "restart_hint": "Re-run `qwen` in a new terminal; it loads ~/.qwen/.env on startup.",
+    }
+
+
+_AUTOFIXERS = {
+    "claude": _autofix_claude,
+    "aider": _autofix_aider,
+    "opencode": _autofix_opencode,
+    "qwen": _autofix_qwen,
+}
+
+
+@app.route("/api/clis", methods=["GET"])
+def api_clis():
+    return jsonify([_cli_row(e) for e in CLI_REGISTRY])
+
+
+@app.route("/api/clis/<cid>/autofix", methods=["POST"])
+def api_cli_autofix(cid):
+    entry = _get_cli_entry(cid)
+    if not entry:
+        return jsonify({"error": "unknown CLI '%s'" % cid}), 404
+    key = config.get_local_api_key() or "free-llm-hub"
+    base_root = "http://127.0.0.1:%d" % PORT
+    base_v1 = base_root + "/v1"
+    strategy = entry.get("autofix")
+    if not strategy:
+        # env-only / TOML / uncertain: never touch a global shell profile —
+        # hand back copy-paste commands + a CLI-specific note instead.
+        model = _first_free_model_id() or _suggested_model()
+        env = _manual_env(entry, key, base_root, base_v1, model)
+        return jsonify({
+            "ok": False, "manual": True,
+            "commands": _env_commands(env),
+            "note": entry.get("manual_note", "Configure this CLI manually with the env vars above."),
+        })
+    model = _first_free_model_id()
+    if not model:
+        return jsonify({"ok": False, "reason": "no free model configured yet — add a provider key first"})
+    fixer = _AUTOFIXERS.get(strategy)
+    if not fixer:
+        return jsonify({"ok": False, "reason": "no autofix strategy '%s'" % strategy})
+    try:
+        result = fixer(entry, key, base_root, base_v1, model)
+    except OSError as exc:
+        return jsonify({"ok": False, "reason": _sanitize("could not write config: %s" % exc)})
+    return jsonify(result)
+
+
+@app.route("/api/clis/<cid>/instructions", methods=["GET"])
+def api_cli_instructions(cid):
+    entry = _get_cli_entry(cid)
+    if not entry:
+        return jsonify({"error": "unknown CLI '%s'" % cid}), 404
+    key = config.get_local_api_key() or "free-llm-hub"
+    model = _first_free_model_id() or _suggested_model()
+    base_root = "http://127.0.0.1:%d" % PORT
+    base_v1 = base_root + "/v1"
+    env = _manual_env(entry, key, base_root, base_v1, model)
+    snippets = _connect_snippets()
+    steps = []
+    if entry.get("autofix"):
+        steps.append("Auto-fix (recommended): POST /api/clis/%s/autofix to write %s for you "
+                     "(a .freehub-bak backup is made first)." % (entry["id"], _short(entry.get("write_path", "the CLI config"))))
+    steps.append("Manual: set the environment variables in `env` below, then restart the CLI.")
+    if entry.get("manual_note"):
+        steps.append(entry["manual_note"])
+    steps.append("Verify: run `%s` and confirm it answers via this hub using %s." % (entry["bins"][0], model))
+    return jsonify({
+        "steps": steps,
+        "env": env,
+        "snippet_openai": snippets["openai"],
+        "snippet_anthropic": snippets["claude_code"],
     })
 
 
