@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -39,6 +40,7 @@ except Exception:  # pragma: no cover - jinja2 always ships with flask
 
 import config
 import providers as prov
+import quota
 
 import logging
 import traceback as _traceback
@@ -122,6 +124,15 @@ def _enabled_keyed():
         if pcfg.get("enabled") and pcfg.get("api_key"):
             out.append(pid)
     return out
+
+
+def _available_providers():
+    """Enabled+keyed providers that still have free quota (not exhausted/throttled).
+    Falls back to ALL enabled+keyed when every one is exhausted, so the gateway
+    still tries (and the dashboard's red banner tells the user why it may fail)."""
+    keyed = _enabled_keyed()
+    live = [pid for pid in keyed if not quota.is_exhausted(pid)]
+    return live or keyed
 
 
 def _models_url_for(pid, pcfg):
@@ -252,15 +263,118 @@ def _benchmark_score(pid, model_id):
 
 
 def _best_free_pair():
-    """Scan every enabled+keyed provider's free models and return the single
-    highest-benchmark (pid, model) pair, or (None, None) if nothing is ready."""
+    """Scan every AVAILABLE (enabled+keyed+quota-left) provider's free models and
+    return the single highest-benchmark (pid, model) pair, or (None, None)."""
     best, best_pid, best_score = None, None, -1.0
-    for pid in _enabled_keyed():
+    for pid in _available_providers():
         for m in provider_free_models(pid):
             s = _benchmark_score(pid, m)
             if s > best_score:
                 best, best_pid, best_score = m, pid, s
     return (best_pid, best) if best else (None, None)
+
+
+# --------------------------------------------------------------------------- #
+# Difficulty-aware routing ("caveman" mode) — don't waste a strong model (or its
+# scarce free quota) on an easy task, and don't hand a hard task to a weak model.
+# Classify the request, then pick the CHEAPEST model that still clears the bar
+# for simple/medium tasks, and the STRONGEST available for hard ones.
+# --------------------------------------------------------------------------- #
+_HARD_HINTS = (
+    "refactor", "debug", "stack trace", "traceback", "algorithm", "architecture",
+    "optimize", "optimise", "prove", "derive", "analyze", "analyse", "reason",
+    "step by step", "step-by-step", "complex", "design a", "implement", "write code",
+    "full code", "entire", "compile", "regex", "sql", "concurrency", "async",
+    "benchmark", "vulnerab", "exploit", "math", "theorem",
+)
+_SIMPLE_HINTS = (
+    "translate", "summarize", "summarise", "tl;dr", "rephrase", "reword",
+    "spell", "grammar", "fix typo", "capitalize", "lowercase", "uppercase",
+    "yes or no", "one word", "one line", "define ", "what is ", "who is ",
+    "list ", "hello", "hi ", "thanks", "thank you",
+)
+# Minimum benchmark score a model needs to be trusted with each tier.
+_DIFFICULTY_FLOOR = {"simple": 20, "medium": 50, "hard": 78}
+
+
+def _messages_text(messages):
+    parts = []
+    for m in messages or []:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                    parts.append(b["text"])
+                elif isinstance(b, str):
+                    parts.append(b)
+    return "\n".join(parts)
+
+
+def _classify_difficulty(messages, max_tokens=None):
+    """'simple' | 'medium' | 'hard' from prompt length, task hints, code, and the
+    requested output size. Pure heuristic (no network)."""
+    text = _messages_text(messages)
+    low = text.lower()
+    length = len(text)
+    score = 0
+    if "```" in text or re.search(r"\bdef \w+\(|\bclass \w+|function \w+\(|;\s*$", text):
+        score += 2
+    score += sum(1 for h in _HARD_HINTS if h in low)
+    score -= sum(1 for h in _SIMPLE_HINTS if h in low)
+    if length > 4000:
+        score += 2
+    elif length > 1500:
+        score += 1
+    elif length < 180:
+        score -= 1
+    if len(messages or []) > 8:
+        score += 1
+    try:
+        if max_tokens and int(max_tokens) > 1500:
+            score += 1
+    except (TypeError, ValueError):
+        pass
+    if score >= 3:
+        return "hard"
+    if score <= 0:
+        return "simple"
+    return "medium"
+
+
+def _route_by_difficulty(messages, max_tokens=None):
+    """Pick (pid, model) by task difficulty across AVAILABLE providers.
+    - hard  -> strongest model available (best output wins).
+    - simple/medium -> the CHEAPEST model whose benchmark clears the tier floor,
+      so weak models take easy work and quota on strong ones is preserved.
+    Returns (None, None) if nothing is ready (caller falls back)."""
+    difficulty = _classify_difficulty(messages, max_tokens)
+    cands = []  # (score, pid, model)
+    for pid in _available_providers():
+        for m in provider_free_models(pid):
+            if prov.is_model_allowed(m):
+                cands.append((_benchmark_score(pid, m), pid, m))
+    if not cands:
+        return None, None, difficulty
+    if difficulty == "hard":
+        _s, pid, model = max(cands, key=lambda t: t[0])
+        return pid, model, difficulty
+    floor = _DIFFICULTY_FLOOR[difficulty]
+    qualified = [c for c in cands if c[0] >= floor]
+    pool = qualified or cands
+    # cheapest (lowest benchmark) that still clears the bar -> saves strong quota
+    _s, pid, model = min(pool, key=lambda t: t[0])
+    return pid, model, difficulty
+
+
+def _is_orchestrate(model):
+    """True when the caller wants the manager to choose (Auto / empty / claude-*)."""
+    model = (model or "").strip().lower()
+    if "/" in model:
+        return False
+    return (not model) or model in ("auto", "orchestrate", "default") \
+        or model.startswith("claude")
 
 
 def _autoselect_default_if_unset():
@@ -344,10 +458,10 @@ def _build_chain(primary_pid, model_id):
     """[(pid, model)] -- primary first, then fallback providers with a
     comparable free model, ORDERED BEST-FIRST by benchmark. Capped at MAX_HOPS."""
     chain = [(primary_pid, model_id)]
-    # Score each other enabled+keyed provider's best comparable model, then add
-    # them strongest-first so a fallback is an upgrade path, not a random hop.
+    # Score each other AVAILABLE provider's best comparable model, then add them
+    # strongest-first so a fallback is an upgrade path, not a random hop.
     candidates = []
-    for pid in _enabled_keyed():
+    for pid in _available_providers():
         if pid == primary_pid:
             continue
         free = provider_free_models(pid)
@@ -416,6 +530,17 @@ def _upstream_chat(pid, payload, stream):
             if is_last:
                 raise
             continue
+        quota.record(pid)  # a request left the building -> counts against free quota
+        # A 429 means this provider's free budget is spent -> mark it throttled so
+        # orchestration skips it until the window resets (drives the red banner).
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            secs = None
+            try:
+                secs = float(retry_after) if retry_after else None
+            except ValueError:
+                secs = None
+            quota.mark_throttled(pid, secs)
         # Auth/rate-limit on this key -> try the next key before this provider
         # is given up on. On the last key, return it so the caller can react
         # (429/5xx -> provider fallback; 401/403 -> surfaced as an error).
@@ -736,11 +861,25 @@ def _connect_snippets():
 @app.route("/api/status", methods=["GET"])
 def api_status():
     default = config.get_default()
+    keyed = _enabled_keyed()
+    # Per-provider free-quota snapshot (used, remaining, reset countdown, throttled).
+    q = {}
+    exhausted = 0
+    for pid in keyed:
+        s = quota.status(pid)
+        p = prov.get_provider(pid) or {}
+        s["name"] = p.get("name", pid)
+        q[pid] = s
+        if s["exhausted"]:
+            exhausted += 1
     return jsonify({
-        "providers_enabled": len(_enabled_keyed()),
+        "providers_enabled": len(keyed),
         "has_default": bool(default and default.get("provider") and default.get("model")),
         "local_api_key_set": bool(config.get_local_api_key()),
         "connect_snippets": _connect_snippets(),
+        "quota": q,
+        "all_exhausted": bool(keyed) and exhausted == len(keyed),
+        "any_exhausted": exhausted > 0,
     })
 
 
@@ -1534,7 +1673,15 @@ def v1_chat_completions():
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return _openai_error("Invalid JSON body.", 400)
-    pid, resolved = _resolve_model(body.get("model"))
+    # Orchestrate (Auto): route by task difficulty so weak models take easy work
+    # and quota on strong models is preserved. Explicit '<pid>/<model>' bypasses.
+    if _is_orchestrate(body.get("model")):
+        pid, resolved, _diff = _route_by_difficulty(body.get("messages"),
+                                                     body.get("max_tokens"))
+        if pid is None:
+            pid, resolved = _resolve_model(body.get("model"))  # default/best or error
+    else:
+        pid, resolved = _resolve_model(body.get("model"))
     if pid is None:
         return _openai_error(resolved, 400)
     if not prov.is_model_allowed(resolved):
@@ -1859,7 +2006,15 @@ def v1_messages():
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return _anthropic_error("invalid_request_error", "Invalid JSON body.", 400)
-    pid, resolved = _resolve_model(body.get("model"))
+    # Claude Code sends model 'claude-*' -> orchestrate: difficulty-route so easy
+    # turns run on cheap models and hard ones get the strongest available.
+    if _is_orchestrate(body.get("model")):
+        pid, resolved, _diff = _route_by_difficulty(body.get("messages"),
+                                                     body.get("max_tokens"))
+        if pid is None:
+            pid, resolved = _resolve_model(body.get("model"))
+    else:
+        pid, resolved = _resolve_model(body.get("model"))
     if pid is None:
         return _anthropic_error("invalid_request_error", resolved, 400)
     if not prov.is_model_allowed(resolved):
@@ -1957,6 +2112,132 @@ def v1_count_tokens():
 
 
 # ---------------------------------------------------------------------------
+# Auto-update: git-pull every N hours and self-restart when the repo owner ships
+# new commits. Opt-in (on by default), skipped if the working tree is dirty so a
+# user's local edits are never clobbered. Never touches ~/.free-llm-hub config
+# (that lives outside the repo), so keys/enabled flags survive every update.
+# ---------------------------------------------------------------------------
+_REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+_AUTO_UPDATE_INTERVAL_H = float(os.environ.get("AUTO_UPDATE_INTERVAL_HOURS", "5") or "5")
+_auto_update_state = {
+    "enabled": None,          # resolved at boot from env + config
+    "interval_hours": _AUTO_UPDATE_INTERVAL_H,
+    "last_check": 0,          # epoch of last pull attempt
+    "last_result": "not run yet",
+    "updating": False,
+}
+_auto_update_thread = None
+_auto_update_lock = threading.Lock()
+
+
+def _git(*args, timeout=120):
+    """Run a git command in the repo dir; return (rc, stdout, stderr). Never raises."""
+    try:
+        r = subprocess.run(["git", "-C", _REPO_DIR, *args],
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    except Exception as exc:
+        return 1, "", "%s: %s" % (exc.__class__.__name__, exc)
+
+
+def _is_git_repo():
+    rc, out, _ = _git("rev-parse", "--is-inside-work-tree")
+    return rc == 0 and out == "true"
+
+
+def _auto_update_enabled():
+    """Env AUTO_UPDATE overrides; else the config flag (default ON)."""
+    env = os.environ.get("AUTO_UPDATE")
+    if env is not None:
+        return env.strip().lower() not in ("0", "false", "no", "off", "")
+    return config.get_flag("auto_update", True)
+
+
+def _do_update_check():
+    """One pull cycle: skip if dirty, pull --ff-only, re-exec if HEAD moved.
+    Returns a short human status string (also stored in _auto_update_state)."""
+    with _auto_update_lock:
+        _auto_update_state["last_check"] = int(time.time())
+        if not _is_git_repo():
+            _auto_update_state["last_result"] = "not a git repo — auto-update off"
+            return _auto_update_state["last_result"]
+        rc, dirty, _ = _git("status", "--porcelain")
+        if rc == 0 and dirty:
+            _auto_update_state["last_result"] = "skipped: local uncommitted changes"
+            return _auto_update_state["last_result"]
+        rc, before, _ = _git("rev-parse", "HEAD")
+        rc2, _out, err = _git("pull", "--ff-only")
+        if rc2 != 0:
+            _auto_update_state["last_result"] = "pull failed: " + _sanitize(err)[:160]
+            return _auto_update_state["last_result"]
+        _rc, after, _ = _git("rev-parse", "HEAD")
+        if before and after and before != after:
+            _auto_update_state["last_result"] = "updated %s->%s — restarting" % (before[:7], after[:7])
+            _auto_update_state["updating"] = True
+            _log.info("Auto-update: new commits pulled (%s -> %s), re-executing.",
+                     before[:7], after[:7])
+            _reexec_soon()
+            return _auto_update_state["last_result"]
+        _auto_update_state["last_result"] = "up to date (%s)" % (after[:7] if after else "?")
+        return _auto_update_state["last_result"]
+
+
+def _reexec_soon():
+    """Replace this process with a fresh one (applies pulled code). Env (incl.
+    PORT) is inherited across execv, so the gateway comes back on the same port."""
+    def _go():
+        time.sleep(1.0)
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as exc:
+            _log.error("Auto-update re-exec failed: %s", exc)
+            _auto_update_state["updating"] = False
+    threading.Thread(target=_go, daemon=True).start()
+
+
+def _auto_update_loop():
+    interval = max(0.25, _auto_update_state["interval_hours"]) * 3600.0
+    # A short initial delay lets the server finish booting before the first check.
+    time.sleep(min(interval, 60))
+    while True:
+        if _auto_update_enabled():
+            try:
+                _do_update_check()
+            except Exception as exc:
+                _log.error("Auto-update cycle error: %s", exc)
+        # Sleep in small slices so a disabled->enabled flip is honored promptly.
+        slept = 0.0
+        while slept < interval:
+            time.sleep(min(30.0, interval - slept))
+            slept += 30.0
+
+
+def _start_auto_update():
+    global _auto_update_thread
+    _auto_update_state["enabled"] = _auto_update_enabled()
+    if _auto_update_thread is not None:
+        return
+    _auto_update_thread = threading.Thread(target=_auto_update_loop, daemon=True)
+    _auto_update_thread.start()
+
+
+@app.route("/api/auto-update", methods=["GET", "POST"])
+def api_auto_update():
+    """GET -> current state. POST {enabled:bool} -> toggle. POST {check:true} ->
+    run one update cycle now (may restart the server if new commits are found)."""
+    if request.method == "POST":
+        body = request.get_json(force=True, silent=True) or {}
+        if "enabled" in body:
+            config.set_flag("auto_update", bool(body["enabled"]))
+        if body.get("check"):
+            threading.Thread(target=_do_update_check, daemon=True).start()
+    st = dict(_auto_update_state)
+    st["enabled"] = _auto_update_enabled()
+    st["is_git_repo"] = _is_git_repo()
+    return jsonify(st)
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -1986,4 +2267,5 @@ def _print_banner():
 
 if __name__ == "__main__":
     _print_banner()
+    _start_auto_update()
     app.run(host=HOST, port=PORT, threaded=True, debug=False)
