@@ -51,7 +51,7 @@
 
   /* ---------- header ---------- */
   header{
-    position:sticky;top:0;z-index:40;
+    position:sticky;top:var(--exhaust-h,0px);z-index:40;
     background:rgba(11,15,25,.88);
     backdrop-filter:blur(12px);
     border-bottom:1px solid var(--border-soft);
@@ -377,6 +377,59 @@
     padding:11px 13px;overflow-x:auto;white-space:pre;margin:0;
   }
 
+  /* ---------- exhaustion banner (A) ---------- */
+  #exhaust-banner{
+    position:sticky;top:0;z-index:50;display:none;width:100%;
+    font-size:13px;line-height:1.5;padding:10px 20px;
+    border-bottom:1px solid transparent;
+    transition:background .2s ease,color .2s ease;
+  }
+  #exhaust-banner.show{display:block}
+  #exhaust-banner.red{background:var(--danger);color:#fff;border-bottom-color:rgba(0,0,0,.28)}
+  #exhaust-banner.amber{background:rgba(245,158,11,.14);color:#fcd34d;border-bottom-color:rgba(245,158,11,.38)}
+  #exhaust-banner .eb-inner{max-width:1180px;margin:0 auto;display:flex;align-items:baseline;gap:6px 16px;flex-wrap:wrap}
+  #exhaust-banner .eb-msg{font-weight:700}
+  #exhaust-banner .eb-list{font-weight:500;opacity:.95}
+  #exhaust-banner .eb-list b{font-family:var(--mono);font-weight:700}
+  #exhaust-banner .eb-sep{opacity:.5}
+
+  /* ---------- free-quota panel (B) ---------- */
+  .quota-panel{
+    background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
+    padding:16px;
+  }
+  .quota-empty{font-size:13px;color:var(--text-faint);padding:6px 2px}
+  .quota-list{display:flex;flex-direction:column;gap:10px}
+  .quota-row{
+    display:flex;flex-direction:column;gap:7px;
+    background:var(--surface-2);border:1px solid var(--border-soft);
+    border-radius:var(--radius-sm);padding:11px 13px;
+  }
+  .quota-row .qr-top{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+  .quota-row .qr-name{font-weight:700;font-size:14px;letter-spacing:-.01em}
+  .quota-row .qr-usage{font-family:var(--mono);font-size:12.5px;color:var(--text-dim)}
+  .quota-row .qr-win{font-size:11.5px;color:var(--text-faint);text-transform:lowercase}
+  .quota-row .qr-throttle{
+    font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+    background:var(--warn-soft);color:var(--warn);border-radius:5px;padding:2px 7px;
+  }
+  .quota-row .qr-exhausted{background:var(--danger-soft);color:#fca5a5}
+  .quota-bar{height:6px;border-radius:999px;background:var(--surface-3);overflow:hidden}
+  .quota-bar > i{display:block;height:100%;border-radius:999px;transition:width .3s ease}
+  .quota-bar.good > i{background:var(--accent)}
+  .quota-bar.warn > i{background:var(--warn)}
+  .quota-bar.bad > i{background:var(--danger)}
+  .quota-row .qr-reset{font-size:12px;color:var(--text-faint)}
+  .quota-row .qr-reset b{font-family:var(--mono);font-weight:600;color:var(--text-dim)}
+
+  /* ---------- auto-update control (C) ---------- */
+  .au-row{
+    background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
+    padding:14px 16px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+  }
+  .au-row .switch .lbl{font-size:13px;color:var(--text)}
+  .au-row .au-status{font-size:12px;color:var(--text-faint);overflow-wrap:anywhere}
+
   @media (prefers-reduced-motion:reduce){
     *,*::before,*::after{animation-duration:.01ms !important;transition-duration:.01ms !important}
   }
@@ -393,6 +446,8 @@
 </style>
 </head>
 <body>
+<!-- Exhaustion banner (A) — hidden until a provider runs out of free quota -->
+<div id="exhaust-banner"></div>
 <header>
   <div class="hd">
     <div class="logo">
@@ -499,6 +554,19 @@
     </div>
   </section>
 
+  <!-- Free quota (B) -->
+  <section class="section" aria-labelledby="h-quota">
+    <div class="section-h">
+      <h2 id="h-quota">Free quota</h2>
+      <span class="sub">how much of each provider&rsquo;s free allowance is left today</span>
+    </div>
+    <div class="quota-panel">
+      <div class="quota-list" id="quota-list">
+        <div class="quota-empty">Add a provider key to see free-quota usage.</div>
+      </div>
+    </div>
+  </section>
+
   <!-- Providers -->
   <section class="section" aria-labelledby="h-providers">
     <div class="section-h">
@@ -514,6 +582,23 @@
     </div>
     <div class="grid" id="grid" aria-live="polite">
       <div class="empty">Loading providers&hellip;</div>
+    </div>
+  </section>
+
+  <!-- Advanced / auto-update (C) -->
+  <section class="section" aria-labelledby="h-advanced">
+    <div class="section-h">
+      <h2 id="h-advanced">Advanced</h2>
+      <span class="sub">keep the hub up to date from git automatically</span>
+    </div>
+    <div class="au-row" id="au-row">
+      <label class="switch">
+        <input type="checkbox" id="au-toggle">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Auto-update (git pull every 5h)</span>
+      </label>
+      <button class="btn sm ghost" id="au-check" type="button">Check now</button>
+      <span id="au-status" class="au-status" aria-live="polite"></span>
     </div>
   </section>
 
@@ -550,6 +635,9 @@
   'use strict';
   var providers = [];
   var statusData = null;
+  var quotaState = {};        /* pid -> live quota model; resets_in ticks down locally */
+  var autoUpdateData = null;
+  var _ebSig = '';            /* last structural signature of the exhaustion banner */
 
   /* ---------- helpers ---------- */
   function $(s, el){ return (el||document).querySelector(s); }
@@ -610,7 +698,7 @@
   }
 
   /* ---------- status ---------- */
-  function loadStatus(){
+  function loadStatus(silent){
     return api('/api/status').then(function(s){
       statusData = s;
       var n = s.providers_enabled != null ? s.providers_enabled : 0;
@@ -621,12 +709,197 @@
       var sn = s.connect_snippets || {};
       $('#snippet-claude').textContent = sn.claude_code || '# gateway not ready';
       $('#snippet-openai').textContent = sn.openai || '# gateway not ready';
-    }).catch(function(e){ toast('Status: ' + e.message, true); });
+      ingestStatus(s);
+    }).catch(function(e){ if (!silent) toast('Status: ' + e.message, true); });
   }
   function setPill(id, ok, label){
     var p = document.getElementById(id);
     p.className = 'pill ' + (ok ? 'ok' : 'bad');
     p.innerHTML = '<span class="dot"></span>' + esc(label);
+  }
+
+  /* ---------- free-quota model + exhaustion banner (A + B) ---------- */
+  function numOr(v, d){ var n = Number(v); return isFinite(n) ? n : d; }
+  function fmtCountdown(sec){
+    sec = Math.floor(numOr(sec, 0));
+    if (sec <= 0) return 'now';
+    if (sec < 60) return sec + 's';
+    if (sec < 3600) return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's';
+    return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm';
+  }
+  function setBannerOffset(px){
+    document.documentElement.style.setProperty('--exhaust-h', numOr(px, 0) + 'px');
+  }
+
+  /* rebuild the local quota model from a /api/status payload, then render both pieces */
+  function ingestStatus(s){
+    var q = (s && s.quota && typeof s.quota === 'object') ? s.quota : {};
+    quotaState = {};
+    Object.keys(q).forEach(function(pid){
+      var e = q[pid] || {};
+      var limit = numOr(e.limit, 0);
+      var used = numOr(e.used, 0);
+      quotaState[pid] = {
+        name: e.name || pid,
+        used: used,
+        limit: limit,
+        remaining: (e.remaining != null) ? Math.max(0, numOr(e.remaining, 0)) : Math.max(0, limit - used),
+        window: e.window || '',
+        resets_in: Math.max(0, numOr(e.resets_in, 0)),
+        throttled: !!e.throttled,
+        exhausted: !!e.exhausted
+      };
+    });
+    renderExhaustion(s);
+    renderQuota();
+  }
+
+  function renderExhaustion(s){
+    var banner = document.getElementById('exhaust-banner');
+    if (!banner) return;
+    var all = !!(s && s.all_exhausted);
+    var any = !!(s && s.any_exhausted);
+    var pids = Object.keys(quotaState);
+    var listPids = all ? pids : pids.filter(function(pid){ return quotaState[pid].exhausted; });
+
+    if ((!all && !any) || (all && !pids.length)){
+      if (banner.classList.contains('show')){
+        banner.classList.remove('show', 'red', 'amber');
+        banner.innerHTML = '';
+      }
+      _ebSig = '';
+      setBannerOffset(0);
+      return;
+    }
+
+    var sig = (all ? 'R' : 'A') + '|' + listPids.join(',');
+    if (sig !== _ebSig){
+      _ebSig = sig;
+      var msg = all
+        ? '⛔ No free quota left today — all providers are exhausted.'
+        : '⚠️ Some providers are out of free quota';
+      var listHTML = listPids.map(function(pid){
+        var st = quotaState[pid];
+        return esc(st.name) + ' resets in <b class="js-reset" data-pid="' + esc(pid) + '">' +
+               esc(fmtCountdown(st.resets_in)) + '</b>';
+      }).join(' <span class="eb-sep">·</span> ');
+      banner.innerHTML =
+        '<div class="eb-inner">' +
+          '<span class="eb-msg"' + (all ? ' role="alert"' : '') + '>' + esc(msg) + '</span>' +
+          (listHTML ? '<span class="eb-list">' + listHTML + '</span>' : '') +
+        '</div>';
+      banner.classList.add('show');
+      banner.classList.toggle('red', all);
+      banner.classList.toggle('amber', !all);
+    }
+    setBannerOffset(banner.offsetHeight);
+  }
+
+  function renderQuota(){
+    var host = document.getElementById('quota-list');
+    if (!host) return;
+    var pids = Object.keys(quotaState);
+    if (!pids.length){
+      host.innerHTML = '<div class="quota-empty">Add a provider key to see free-quota usage.</div>';
+      return;
+    }
+    host.innerHTML = pids.map(function(pid){
+      var st = quotaState[pid];
+      var pct = st.limit > 0 ? Math.max(0, Math.min(100, (st.remaining / st.limit) * 100)) : 0;
+      var barClass = (st.exhausted || st.throttled) ? 'bad' : (pct <= 25 ? 'warn' : 'good');
+      var winLabel = st.window ? ('per ' + st.window) : '';
+      return '' +
+        '<div class="quota-row" data-pid="' + esc(pid) + '">' +
+          '<div class="qr-top">' +
+            '<span class="qr-name">' + esc(st.name) + '</span>' +
+            '<span class="qr-usage">' + esc(st.used) + ' / ' + esc(st.limit) + '</span>' +
+            (winLabel ? '<span class="qr-win">' + esc(winLabel) + '</span>' : '') +
+            (st.throttled ? '<span class="qr-throttle">throttled</span>' : '') +
+            (st.exhausted ? '<span class="qr-throttle qr-exhausted">exhausted</span>' : '') +
+          '</div>' +
+          '<div class="quota-bar ' + barClass + '"><i style="width:' + pct.toFixed(1) + '%"></i></div>' +
+          '<div class="qr-reset">resets in <b class="js-reset" data-pid="' + esc(pid) + '">' +
+            esc(fmtCountdown(st.resets_in)) + '</b></div>' +
+        '</div>';
+    }).join('');
+  }
+
+  /* 1s local tick: decrement every countdown, then refresh only the number spans */
+  function tick(){
+    var pids = Object.keys(quotaState);
+    for (var i = 0; i < pids.length; i++){
+      var st = quotaState[pids[i]];
+      if (st.resets_in > 0) st.resets_in = Math.max(0, st.resets_in - 1);
+    }
+    updateCountdowns();
+  }
+  function updateCountdowns(){
+    var els = document.querySelectorAll('.js-reset');
+    for (var i = 0; i < els.length; i++){
+      var st = quotaState[els[i].getAttribute('data-pid')];
+      if (st) els[i].textContent = fmtCountdown(st.resets_in);
+    }
+  }
+
+  /* ---------- auto-update control (C) ---------- */
+  function fmtAutoResult(d){
+    if (!d) return '';
+    if (d.updating) return 'checking for updates…';
+    if (d.last_result) return String(d.last_result);
+    return d.enabled ? 'auto-update on' : 'auto-update off';
+  }
+  function renderAutoUpdate(d){
+    var toggle = document.getElementById('au-toggle');
+    var checkBtn = document.getElementById('au-check');
+    var statusEl = document.getElementById('au-status');
+    if (!toggle) return;
+    if (d && d.is_git_repo === false){
+      toggle.checked = false;
+      toggle.disabled = true;
+      if (checkBtn) checkBtn.disabled = true;
+      if (statusEl) statusEl.textContent = 'Not a git checkout — auto-update unavailable.';
+      return;
+    }
+    toggle.disabled = false;
+    toggle.checked = !!(d && d.enabled);
+    if (checkBtn) checkBtn.disabled = !!(d && d.updating);
+    if (statusEl) statusEl.textContent = fmtAutoResult(d);
+  }
+  function loadAutoUpdate(){
+    return api('/api/auto-update').then(function(d){
+      autoUpdateData = d;
+      renderAutoUpdate(d);
+    }).catch(function(){ /* endpoint may be unavailable */ });
+  }
+  function initAutoUpdate(){
+    var toggle = document.getElementById('au-toggle');
+    var checkBtn = document.getElementById('au-check');
+    if (toggle){
+      toggle.addEventListener('change', function(){
+        var want = toggle.checked;
+        toggle.disabled = true;
+        api('/api/auto-update', { method: 'POST', body: { enabled: want } }).then(function(d){
+          autoUpdateData = d || { enabled: want, is_git_repo: true };
+          renderAutoUpdate(autoUpdateData);
+          toast('Auto-update ' + (want ? 'enabled' : 'disabled'));
+        }).catch(function(e){
+          toggle.checked = !want;
+          toggle.disabled = false;
+          toast('Auto-update: ' + e.message, true);
+        });
+      });
+    }
+    if (checkBtn){
+      checkBtn.addEventListener('click', function(){
+        var btn = this; btn.disabled = true;
+        toast('Checking for updates… (the hub will restart if an update is found)');
+        api('/api/auto-update', { method: 'POST', body: { check: true } }).then(function(d){
+          if (d){ autoUpdateData = d; renderAutoUpdate(d); }
+        }).catch(function(){ /* server may restart mid-response */ }).then(function(){
+          if (!(autoUpdateData && (autoUpdateData.updating || autoUpdateData.is_git_repo === false))) btn.disabled = false;
+        });
+      });
+    }
   }
 
   /* ---------- default model ---------- */
@@ -1282,10 +1555,18 @@
   /* ---------- boot ---------- */
   initModal();
   initChat();
+  initAutoUpdate();
   loadStatus().then(updateChatAuthNote);
   loadProviders();
   loadModels().then(loadDefault).then(loadChatModels);
   loadClis();
+  loadAutoUpdate();
+  setInterval(function(){ loadStatus(true); }, 15000);   /* server re-sync (banner + quota) */
+  setInterval(tick, 1000);                               /* local 1s countdown */
+  window.addEventListener('resize', function(){
+    var b = document.getElementById('exhaust-banner');
+    if (b && b.classList.contains('show')) setBannerOffset(b.offsetHeight);
+  });
 })();
 </script>
 </body>
