@@ -1,0 +1,19 @@
+brand: rename to "Calvoun Free LLM Hub" + link byline to calvoun.com
+
+18 user-visible "Free LLM Hub" display strings -> "Calvoun Free LLM Hub"
+across app.py, config.py, providers.py, quota.py, README, run.bat, run.sh
+and the dashboard.
+
+Same safe pattern as the WP plugin rename - display strings ONLY:
+- `free-llm-hub` slug is hyphenated, so it can never match the spaced
+  display name: repo name, package, log prefixes untouched.
+- `~/.free-llm-hub/config.json` UNCHANGED - renaming it would orphan every
+  saved API key on every existing install.
+- port, routes, /api paths untouched.
+
+Byline now links Calvoun -> https://calvoun.com (the marketing goal);
+attribution "Made by DAVID SEO" kept as-is.
+
+Verified live: title "Calvoun Free LLM Hub - Local Gateway", 3 branded
+occurrences rendered, calvoun.com link present, 0 stale un-branded strings,
+config dir intact, all modules compile.
