@@ -382,12 +382,14 @@ PROVIDERS: Dict[str, dict] = {
         # The old families missed 5 free general-chat models and pinned
         # DeepSeek-R1-Distill-Qwen-7B, which is NOT free anywhere (0 occurrences
         # in the .cn catalog; $0.05/M on .com).
-        # KNOWN GAP: 'qwen/qwen2.5-7b-instruct' also substring-matches the PAID
-        # twin 'Pro/Qwen/Qwen2.5-7B-Instruct' (¥0.35/M). SiliconFlow's rule is
-        # free = original name, paid = 'Pro/' prefix — a per-provider exclude on
-        # ids starting 'pro/' is the proper fix.
+        # CLOSED: 'qwen/qwen2.5-7b-instruct' also substring-matched the PAID twin
+        # 'Pro/Qwen/Qwen2.5-7B-Instruct' (¥0.35/M). SiliconFlow's rule is
+        # free = original name, paid = 'Pro/' prefix, so the free_families match
+        # hit both. exclude_families is checked BEFORE every filter rule, so the
+        # paid twin can never be re-admitted.
         # This list is LOAD-BEARING, not a mere fallback: /v1/models requires
         # auth and exposes no pricing, so free-ness is not discoverable at runtime.
+        "exclude_families": ["pro/"],
         "free_filter": "family",
         "free_families": ["qwen/qwen3-8b", "qwen/qwen3.5-4b", "qwen/qwen2.5-7b-instruct",
                           "thudm/glm-4-9b-0414", "thudm/glm-z1-9b-0414",
@@ -770,6 +772,10 @@ _NON_CHAT_PATTERNS = [
     r"voxtral-mini",     # audio-only; NOTE voxtral-SMALL *is* chat-capable and must stay
     r"native-audio",     # gemini-*-native-audio-* -> 404 on chat (Live API surface)
     r"live-preview",     # gemini-*-live-preview -> 404 on chat (Live API surface)
+    # Image GENERATION ids (gemini-2.5-flash-image, *-pro-image). Anchored to a
+    # trailing '-image' so multimodal CHAT models that merely accept images
+    # (llama-3.2-11b-vision-instruct, *-vl-*) are NOT caught.
+    r"[-_/]image(?:[-_.]|$)",
 ]
 _NONCHAT_RE = re.compile("|".join(_NON_CHAT_PATTERNS), re.IGNORECASE)
 
@@ -798,6 +804,14 @@ def is_free_model(provider_id: str, model_id: Optional[str],
     if prov.get("paid"):
         return False  # a provider-level paid gateway is never "free"
     mid = str(model_id)
+    # Per-provider PAID exclusions. Needed where a paid id can't be told from a
+    # free one by the provider's own filter rule — e.g. SiliconFlow ships a PAID
+    # 'Pro/'-prefixed twin of each free model ('Pro/Qwen/Qwen2.5-7B-Instruct'),
+    # which a family/substring match on the free id matches too. Checked before
+    # every filter below so no rule can re-admit an excluded id.
+    for ex in (prov.get("exclude_families") or []):
+        if str(ex).lower() in mid.lower():
+            return False
     if known_free:
         low_free = {str(k).lower() for k in known_free}
         return mid.lower() in low_free
