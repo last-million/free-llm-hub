@@ -79,9 +79,40 @@
 
   /* ---------- sections ---------- */
   .section{margin-top:28px}
-  .section-h{display:flex;align-items:baseline;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+  .section-h{display:flex;align-items:baseline;gap:10px;margin-bottom:12px;flex-wrap:wrap;cursor:pointer;user-select:none}
   .section-h h2{font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim)}
   .section-h .sub{font-size:12.5px;color:var(--text-faint)}
+  /* collapsible sections: the whole header row toggles; the button carries aria-expanded.
+     Body is hidden via the `hidden` attribute (stays in the DOM so pollers keep rendering). */
+  .sec-toggle{
+    font:inherit;letter-spacing:inherit;text-transform:inherit;color:inherit;
+    background:none;border:0;padding:0;margin:0;text-align:left;
+    display:inline-flex;align-items:center;gap:7px;transition:color .15s ease;
+  }
+  .section-h:hover .sec-toggle{color:var(--text)}
+  .sec-chev{flex:none;transition:transform .18s ease}
+  .sec-toggle[aria-expanded="true"] .sec-chev{transform:rotate(90deg)}
+  .sec-chip{
+    margin-left:auto;flex:none;font-size:11px;font-weight:700;letter-spacing:.03em;
+    color:var(--text-faint);background:var(--surface-2);
+    border:1px solid var(--border-soft);border-radius:999px;padding:2px 9px;white-space:nowrap;
+  }
+  .section.sec-open .sec-chip{display:none}   /* summary chip is a collapsed-state affordance only */
+  .section-body{min-width:0}
+
+  /* ---------- scroll to top (B) ---------- */
+  .scroll-top{
+    position:fixed;bottom:20px;right:20px;z-index:60;   /* above the page, below .modal-overlay (90) */
+    width:42px;height:42px;border-radius:50%;
+    background:var(--surface-2);border:1px solid var(--border);color:var(--text-dim);
+    display:grid;place-items:center;
+    box-shadow:0 6px 20px rgba(0,0,0,.45);
+    opacity:0;visibility:hidden;transform:translateY(8px);
+    transition:opacity .2s ease,transform .2s ease,visibility .2s ease,background .18s ease,border-color .18s ease,color .18s ease;
+  }
+  .scroll-top.show{opacity:1;visibility:visible;transform:none}
+  .scroll-top:hover{background:var(--surface-3);border-color:#3b4a6e;color:var(--text)}
+  .scroll-top:active{transform:scale(.94)}
 
   /* ---------- connect panel ---------- */
   .connect{
@@ -296,7 +327,8 @@
     margin-top:34px;text-align:center;font-size:12.5px;color:var(--text-faint);
   }
   .confignote code{font-family:var(--mono);background:var(--surface);border:1px solid var(--border-soft);border-radius:5px;padding:2px 7px;font-size:11.5px}
-  #toasts{position:fixed;bottom:20px;right:20px;z-index:100;display:flex;flex-direction:column;gap:8px;max-width:min(360px,calc(100vw - 40px))}
+  /* raised above the .scroll-top button (42px + 20px bottom + gap) so toasts never cover it */
+  #toasts{position:fixed;bottom:74px;right:20px;z-index:100;display:flex;flex-direction:column;gap:8px;max-width:min(360px,calc(100vw - 40px))}
   .toast{
     background:var(--surface-2);border:1px solid var(--border);border-left:3px solid var(--accent);
     color:var(--text);font-size:13px;border-radius:var(--radius-sm);padding:11px 15px;
@@ -584,9 +616,13 @@
   <!-- Connect -->
   <section class="section" aria-labelledby="h-connect">
     <div class="section-h">
-      <h2 id="h-connect">Connect your tools</h2>
+      <h2 id="h-connect"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-connect">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Connect your tools
+      </button></h2>
       <span class="sub">point any CLI at this gateway — it routes to your free providers</span>
     </div>
+    <div class="section-body" id="sec-connect" hidden>
     <div class="connect">
       <div class="snippet">
         <div class="snippet-h">
@@ -607,26 +643,37 @@
         <div class="hint">Works with aider, opencode, llm, continue &mdash; anything OpenAI-compatible.</div>
       </div>
     </div>
+    </div>
   </section>
 
-  <!-- Connected tools -->
+  <!-- Connected tools — the primary surface: the only section expanded by default -->
   <section class="section" aria-labelledby="h-clis">
     <div class="section-h">
-      <h2 id="h-clis">Connected tools</h2>
+      <h2 id="h-clis"><button type="button" class="sec-toggle" aria-expanded="true" aria-controls="sec-clis">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Connected tools
+      </button></h2>
       <span class="sub">local AI CLIs detected on this machine &mdash; auto-fix or set them up by hand</span>
+      <span class="sec-chip" id="chip-clis" hidden></span>
     </div>
-    <p class="cli-help">One-click <b>Connect</b> points a CLI at the hub (free models); <b>Disconnect</b> restores its normal setup. Expand <b>Setup details</b> for manual, cross-platform commands.</p>
-    <div class="cli-list" id="cli-list" aria-live="polite">
-      <div class="empty">Detecting local CLIs&hellip;</div>
+    <div class="section-body" id="sec-clis">
+      <p class="cli-help">One-click <b>Connect</b> points a CLI at the hub (free models); <b>Disconnect</b> restores its normal setup. Expand <b>Setup details</b> for manual, cross-platform commands.</p>
+      <div class="cli-list" id="cli-list" aria-live="polite">
+        <div class="empty">Detecting local CLIs&hellip;</div>
+      </div>
     </div>
   </section>
 
   <!-- Default model -->
   <section class="section" aria-labelledby="h-default">
     <div class="section-h">
-      <h2 id="h-default">Default model</h2>
+      <h2 id="h-default"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-default">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Default model
+      </button></h2>
       <span class="sub">used when a client sends a bare / unknown model name</span>
     </div>
+    <div class="section-body" id="sec-default" hidden>
     <div class="default-row">
       <label for="model-select">Route to</label>
       <select id="model-select" aria-label="Default model">
@@ -639,14 +686,19 @@
         Refresh
       </button>
     </div>
+    </div>
   </section>
 
   <!-- Chat / Test playground -->
   <section class="section" aria-labelledby="h-chat">
     <div class="section-h">
-      <h2 id="h-chat">Chat / Test</h2>
+      <h2 id="h-chat"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-chat">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Chat / Test
+      </button></h2>
       <span class="sub">send a live prompt through the gateway to any enabled model</span>
     </div>
+    <div class="section-body" id="sec-chat" hidden>
     <div class="chat-panel">
       <div class="chat-bar">
         <select id="chat-model" aria-label="Model to chat with">
@@ -666,17 +718,24 @@
         </div>
       </div>
     </div>
+    </div>
   </section>
 
-  <!-- Live activity -->
+  <!-- Live activity — body stays mounted while collapsed so the 3s poll keeps rendering into it -->
   <section class="section" aria-labelledby="h-activity">
     <div class="section-h">
-      <h2 id="h-activity">Live activity</h2>
+      <h2 id="h-activity"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-activity">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Live activity
+      </button></h2>
       <span class="sub">requests flowing through the gateway, newest first &mdash; updates every 3s</span>
+      <span class="sec-chip" id="chip-activity" hidden></span>
     </div>
-    <div class="af-panel">
-      <div class="af-list" id="activity-list" aria-live="polite">
-        <div class="af-empty">No requests yet &mdash; connect a CLI and run it, or use the chat above.</div>
+    <div class="section-body" id="sec-activity" hidden>
+      <div class="af-panel">
+        <div class="af-list" id="activity-list" aria-live="polite">
+          <div class="af-empty">No requests yet &mdash; connect a CLI and run it, or use the chat above.</div>
+        </div>
       </div>
     </div>
   </section>
@@ -684,12 +743,17 @@
   <!-- Free quota (B) -->
   <section class="section" aria-labelledby="h-quota">
     <div class="section-h">
-      <h2 id="h-quota">Free quota</h2>
+      <h2 id="h-quota"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-quota">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Free quota
+      </button></h2>
       <span class="sub">how much of each provider&rsquo;s free allowance is left today</span>
     </div>
-    <div class="quota-panel">
-      <div class="quota-list" id="quota-list">
-        <div class="quota-empty">Add a provider key to see free-quota usage.</div>
+    <div class="section-body" id="sec-quota" hidden>
+      <div class="quota-panel">
+        <div class="quota-list" id="quota-list">
+          <div class="quota-empty">Add a provider key to see free-quota usage.</div>
+        </div>
       </div>
     </div>
   </section>
@@ -697,9 +761,14 @@
   <!-- Providers -->
   <section class="section" aria-labelledby="h-providers">
     <div class="section-h">
-      <h2 id="h-providers">Providers</h2>
+      <h2 id="h-providers"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-providers">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Providers
+      </button></h2>
       <span class="sub">paste a free API key, enable, test &mdash; done</span>
+      <span class="sec-chip" id="chip-providers" hidden></span>
     </div>
+    <div class="section-body" id="sec-providers" hidden>
     <div class="toolbar">
       <div class="search">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
@@ -710,14 +779,19 @@
     <div class="grid" id="grid" aria-live="polite">
       <div class="empty">Loading providers&hellip;</div>
     </div>
+    </div>
   </section>
 
   <!-- Advanced / auto-update (C) -->
   <section class="section" aria-labelledby="h-advanced">
     <div class="section-h">
-      <h2 id="h-advanced">Advanced</h2>
+      <h2 id="h-advanced"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-advanced">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Advanced
+      </button></h2>
       <span class="sub">keep the hub up to date from git automatically</span>
     </div>
+    <div class="section-body" id="sec-advanced" hidden>
     <div class="au-row" id="au-row">
       <label class="switch">
         <input type="checkbox" id="au-toggle">
@@ -726,6 +800,7 @@
       </label>
       <button class="btn sm ghost" id="au-check" type="button">Check now</button>
       <span id="au-status" class="au-status" aria-live="polite"></span>
+    </div>
     </div>
   </section>
 
@@ -758,6 +833,10 @@
     <div id="modal-body" class="modal-body"></div>
   </div>
 </div>
+
+<button id="scroll-top" class="scroll-top" type="button" aria-label="Scroll to top" title="Scroll to top">
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="18 15 12 9 6 15"/></svg>
+</button>
 
 <div id="toasts" aria-live="polite"></div>
 
@@ -1199,6 +1278,9 @@
       return hay.indexOf(q) !== -1;
     });
     $('#count-note').textContent = shown.length + ' / ' + providers.length + ' providers';
+    var keyed = 0;
+    for (var i = 0; i < providers.length; i++){ if (providers[i] && providers[i].has_key) keyed++; }
+    setSecChip('providers', keyed ? (keyed + ' keyed') : (providers.length ? providers.length + ' available' : ''));
     grid.innerHTML = '';
     if (!shown.length){
       grid.innerHTML = '<div class="empty">No providers match &ldquo;' + esc(q) + '&rdquo;</div>';
@@ -1677,6 +1759,8 @@
     if (!rows.length){ host.innerHTML = '<div class="empty">No known CLIs.</div>'; return; }
     var installed = rows.filter(function(c){ return c.installed; });
     var missing = rows.filter(function(c){ return !c.installed; });
+    var connected = installed.filter(function(c){ return c.connected; }).length;
+    setSecChip('clis', installed.length ? (connected + ' / ' + installed.length + ' connected') : '');
 
     if (!installed.length){
       var none = document.createElement('div');
@@ -1989,6 +2073,7 @@
   }
   function renderActivity(){
     var host = $('#activity-list'); if (!host) return;
+    setSecChip('activity', activityState.length ? (activityState.length + ' recent') : '');
     if (!activityState.length){
       host.innerHTML = '<div class="af-empty">No requests yet — connect a CLI and run it, or use the chat above.</div>';
       return;
@@ -2027,7 +2112,92 @@
     }
   }
 
+  /* ---------- collapsible sections (A) ----------
+     Every major <section class="section"> collapses from its header row. Only the
+     CLI / "Connected tools" section is expanded on a first-ever visit; everything
+     else starts collapsed and the user's choice is then remembered per section.
+
+     Collapsing only sets `hidden` on .section-body — the nodes stay mounted and every
+     poller (activity 3s, status/quota 15s, 1s local ticks) keeps rendering into them
+     exactly as before. No timer is started, stopped or re-created here. The one piece
+     of measurement-dependent code, setBannerOffset(banner.offsetHeight), reads the
+     exhaustion banner, which lives outside <main> and is never collapsible. */
+  var SEC_DEFAULT_OPEN = { 'h-clis': true };   /* anything not listed defaults to collapsed */
+  var SEC_LS_PREFIX = 'flh.sec.';              /* flh.sec.<heading-id> = '1' (open) | '0' (collapsed) */
+
+  function secStored(id){
+    try { return localStorage.getItem(SEC_LS_PREFIX + id); } catch(e){ return null; }
+  }
+  function secStore(id, open){
+    try { localStorage.setItem(SEC_LS_PREFIX + id, open ? '1' : '0'); } catch(e){ /* private mode / quota */ }
+  }
+  function setSectionOpen(sec, open, persist){
+    var btn = sec.querySelector('.sec-toggle');
+    var body = sec.querySelector('.section-body');
+    if (!btn || !body) return;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    body.hidden = !open;
+    sec.classList.toggle('sec-open', open);
+    if (persist) secStore(sec.getAttribute('aria-labelledby'), open);
+  }
+  function initCollapsibles(){
+    var secs = document.querySelectorAll('main.wrap section.section[aria-labelledby]');
+    Array.prototype.forEach.call(secs, function(sec){
+      var id = sec.getAttribute('aria-labelledby');
+      var btn = sec.querySelector('.sec-toggle');
+      var head = sec.querySelector('.section-h');
+      if (!btn || !sec.querySelector('.section-body')) return;
+      var stored = secStored(id);
+      var open = (stored === '1') ? true : (stored === '0') ? false : !!SEC_DEFAULT_OPEN[id];
+      setSectionOpen(sec, open, false);
+      btn.addEventListener('click', function(){
+        setSectionOpen(sec, btn.getAttribute('aria-expanded') !== 'true', true);
+      });
+      /* the whole header row is a click target; the button handles its own clicks */
+      if (head) head.addEventListener('click', function(e){
+        if (e.target && e.target.closest && e.target.closest('.sec-toggle')) return;
+        btn.click();
+      });
+    });
+  }
+  /* tiny live summary shown on a collapsed header (hidden by CSS while open) */
+  function setSecChip(key, text){
+    var el = document.getElementById('chip-' + key);
+    if (!el) return;
+    var t = text ? String(text) : '';
+    el.textContent = t;
+    el.hidden = !t;
+  }
+
+  /* ---------- scroll to top (B) ---------- */
+  function prefersReducedMotion(){
+    return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  }
+  function initScrollTop(){
+    var btn = document.getElementById('scroll-top');
+    if (!btn) return;
+    var ticking = false;
+    function apply(){
+      ticking = false;
+      var y = window.pageYOffset || document.documentElement.scrollTop || 0;
+      btn.classList.toggle('show', y > 300);
+    }
+    function onScroll(){
+      if (ticking) return;              /* rAF-throttled: at most one read per frame */
+      ticking = true;
+      window.requestAnimationFrame(apply);
+    }
+    window.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onScroll, { passive: true });
+    btn.addEventListener('click', function(){
+      window.scrollTo(prefersReducedMotion() ? { top: 0 } : { top: 0, behavior: 'smooth' });
+    });
+    apply();
+  }
+
   /* ---------- boot ---------- */
+  initCollapsibles();
+  initScrollTop();
   initModal();
   initChat();
   initAutoUpdate();
