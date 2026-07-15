@@ -750,13 +750,26 @@ def is_model_allowed(model_id: Optional[str]) -> bool:
     return True
 
 
-# Non-chat models (audio / embeddings / moderation / image) — excluded from the
-# chat free-model list so the gateway never picks e.g. Whisper for text gen.
+# Non-chat models (audio / OCR / embeddings / moderation / image) — excluded from
+# the chat free-model list so the gateway never picks e.g. Whisper for text gen.
+# These are NOT "paid" and NOT "dead": they're a different API surface, so they
+# hard-fail on /chat/completions no matter what key or quota you have.
+#
+# The second block was added from a LIVE 150-model bulk test: every id there was
+# observed failing on /chat/completions with this exact key. Without them,
+# free_filter='all' leaked them into routing (11 of mistral's 13 failures).
 _NON_CHAT_PATTERNS = [
     r"whisper", r"\btts\b", r"text-to-speech", r"\bstt\b", r"speech",
     r"orpheus", r"canopylabs", r"parler", r"bark",  # TTS voice models
     r"embed", r"rerank", r"moderation", r"guard", r"safeguard",
     r"stable-diffusion", r"\bflux\b", r"\bsdxl\b", r"image-gen", r"\bdall",
+    # --- verified non-chat by live bulk test (2026-07-15) ---
+    r"\bocr\b",          # mistral-ocr-* -> HTTP 400 (document OCR, not chat)
+    r"transcribe",       # voxtral-mini-transcribe-* -> 400
+    r"realtime",         # voxtral-mini-realtime-*, *-realtime-* -> 400 (streaming audio API)
+    r"voxtral-mini",     # audio-only; NOTE voxtral-SMALL *is* chat-capable and must stay
+    r"native-audio",     # gemini-*-native-audio-* -> 404 on chat (Live API surface)
+    r"live-preview",     # gemini-*-live-preview -> 404 on chat (Live API surface)
 ]
 _NONCHAT_RE = re.compile("|".join(_NON_CHAT_PATTERNS), re.IGNORECASE)
 
