@@ -362,9 +362,13 @@ def _route_by_difficulty(messages, max_tokens=None):
         return pid, model, difficulty
     floor = _DIFFICULTY_FLOOR[difficulty]
     qualified = [c for c in cands if c[0] >= floor]
-    pool = qualified or cands
-    # cheapest (lowest benchmark) that still clears the bar -> saves strong quota
-    _s, pid, model = min(pool, key=lambda t: t[0])
+    if qualified:
+        # cheapest (lowest benchmark) that still clears the bar -> saves strong quota
+        _s, pid, model = min(qualified, key=lambda t: t[0])
+    else:
+        # nothing clears the tier bar -> use the STRONGEST available, not the
+        # cheapest (don't under-serve a hard task when only weak models are keyed)
+        _s, pid, model = max(cands, key=lambda t: t[0])
     return pid, model, difficulty
 
 
@@ -1622,10 +1626,11 @@ def _persist_env_var(name, value):
 def _autofix_codex(entry, key, base_root, base_v1, model):
     """Point the OpenAI Codex CLI at this hub. Codex only supports
     wire_api="responses" (served by POST /v1/responses). Edits config.toml
-    additively/reversibly; a .freehub-bak backup is made first. The provider's
-    api key is read from the FREE_LLM_HUB_KEY env var (env_key), which we ALSO set
-    automatically on the host OS (setx / shell rc) — commands are handed back too
-    as a cross-platform fallback."""
+    additively/reversibly; a .freehub-bak backup is made first. NO auth is
+    written when the hub is open on localhost (Codex connects unauthenticated —
+    zero env-var setup); if the hub has a local key it is embedded directly as
+    experimental_bearer_token. Only real caveat: restart an already-open Codex
+    session so it re-reads config.toml."""
     path = _p_codex()
     backup = _backup_once(path)
     try:
