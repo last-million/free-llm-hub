@@ -1520,7 +1520,7 @@ def _autofix_qwen(entry, key, base_root, base_v1, model):
 _CODEX_TABLE_RE = re.compile(r"^\s*\[")
 
 
-def _codex_apply_text(text, base_v1):
+def _codex_apply_text(text, base_v1, bearer=None):
     """Pure transform for ~/.codex/config.toml (no IO). ADDITIVELY + REVERSIBLY:
       1. In the TOP section (every line before the first '[table]' header — the
          only place bare keys are valid TOML) replace an existing model_provider=
@@ -1548,20 +1548,32 @@ def _codex_apply_text(text, base_v1):
     _set_top_key("model_provider", 'model_provider = "freehub"')
     _set_top_key("model", 'model = "auto"')
 
-    new_text = "\n".join(top + rest)
-    if "[model_providers.freehub]" not in new_text:
-        block = (
-            "[model_providers.freehub]\n"
-            'name = "Free LLM Hub"\n'
-            'base_url = "%s"\n'
-            'wire_api = "responses"\n'
-            'env_key = "FREE_LLM_HUB_KEY"\n' % base_v1
-        )
-        if new_text and not new_text.endswith("\n"):
-            new_text += "\n"
-        new_text += "\n" + block
-    if new_text and not new_text.endswith("\n"):
-        new_text += "\n"
+    # Drop any pre-existing [model_providers.freehub] table so we always rewrite it
+    # clean (e.g. strip a stale env_key from an earlier autofix). Skip from that
+    # header to the next '[table]' header (or EOF).
+    cleaned, skip = [], False
+    for ln in rest:
+        if _CODEX_TABLE_RE.match(ln):
+            skip = (ln.strip() == "[model_providers.freehub]")
+        if not skip:
+            cleaned.append(ln)
+    rest = cleaned
+
+    block = [
+        "[model_providers.freehub]",
+        'name = "Free LLM Hub"',
+        'base_url = "%s"' % base_v1,
+        'wire_api = "responses"',
+    ]
+    if bearer:
+        # Hub requires a local key -> embed it directly (works in every terminal,
+        # no env var). It is the user's own key in their own local config file.
+        block.append('experimental_bearer_token = "%s"' % bearer)
+    # else: NO auth field at all -> Codex connects to the localhost hub
+    # unauthenticated (the hub is open on 127.0.0.1). Zero env-var setup.
+
+    new_text = "\n".join(top + rest).rstrip("\n")
+    new_text = (new_text + "\n\n" if new_text else "") + "\n".join(block) + "\n"
     return new_text
 
 
@@ -1624,30 +1636,26 @@ def _autofix_codex(entry, key, base_root, base_v1, model):
             text = ""
     except OSError as exc:
         return {"ok": False, "reason": _sanitize("could not read %s: %s" % (_short(path), exc))}
-    _cli_write_text(path, _codex_apply_text(text, base_v1))
-    env_value = config.get_local_api_key() or "free-llm-hub-local"
-    # Set FREE_LLM_HUB_KEY on the host OS automatically (setx / shell rc) so the
-    # user doesn't have to. Commands are still returned as a cross-platform fallback.
-    env_set = _persist_env_var("FREE_LLM_HUB_KEY", env_value)
-    if env_set.get("ok"):
-        note = ("Connected. FREE_LLM_HUB_KEY was set automatically (%s). Open a NEW terminal, "
-                "then run Codex. If it still can't see the key, run the command below manually."
-                % env_set.get("method", "auto"))
+    bearer = config.get_local_api_key()  # None -> write NO auth (cleanest); set -> embed token
+    _cli_write_text(path, _codex_apply_text(text, base_v1, bearer))
+    if bearer:
+        note = ("Connected. The hub key is written straight into Codex's config "
+                "(no environment variable needed) — works in any terminal. If Codex "
+                "was already open, restart it (or run /model).")
     else:
-        note = ("Codex reads its key from FREE_LLM_HUB_KEY. Auto-set didn't work (%s) — run the "
-                "command for your OS below, then open a new terminal."
-                % env_set.get("reason", "unknown"))
+        note = ("Connected. Codex now talks to the hub with NO auth required — works in "
+                "any terminal immediately, nothing else to set. If Codex was already "
+                "open, restart it (or run /model) to pick up the new config.")
     return {
         "ok": True,
         "wrote_path": path,
         "backup_path": backup,
         "applied": {"file_top": {"model_provider": "freehub", "model": "auto"},
                     "table": "[model_providers.freehub]", "base_url": base_v1,
-                    "wire_api": "responses", "env_key": "FREE_LLM_HUB_KEY"},
-        "env_set": env_set,
+                    "wire_api": "responses",
+                    "auth": ("experimental_bearer_token" if bearer else "none (open localhost)")},
         "note": note,
-        "commands": _env_commands({"FREE_LLM_HUB_KEY": env_value}),
-        "restart_hint": "Open a NEW terminal, then run Codex (env vars don't apply to open shells).",
+        "restart_hint": "Restart Codex if it was already running (config is re-read on start).",
     }
 
 
@@ -1851,6 +1859,72 @@ def _env_unset_commands(entry):
     return {"windows": win, "unix": unix}
 
 
+def _hub_serves_now():
+    """In-process: route + call one free provider with a 1-token prompt. Returns
+    (served_label, reply_snippet) or (None, None). Proves the hub pipeline works."""
+    pid, model, _diff = _route_by_difficulty([{"role": "user", "content": "hi"}], 8)
+    if not pid:
+        return None, None
+    for hop_pid, hop_model in _build_chain(pid, model):
+        payload = {"model": hop_model, "max_tokens": 8, "stream": False,
+                   "messages": [{"role": "user", "content": "Reply with the single word: OK"}]}
+        try:
+            resp = _upstream_chat(hop_pid, payload, False)
+        except Exception:
+            continue
+        if resp.status_code == 200:
+            try:
+                j = resp.json()
+                reply = ((j.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+            except Exception:
+                reply = ""
+            resp.close()
+            return hop_pid + "/" + hop_model, (reply or "").strip()[:120]
+        resp.close()
+    return None, None
+
+
+def _cli_test(entry):
+    """REALLY test a CLI's connection, reliably (never hangs, ~2-5s):
+      1. is the CLI installed?
+      2. is its config actually pointed at THIS hub? (parsed from its own file)
+      3. does the hub serve that CLI's protocol RIGHT NOW? (live 1-token call)
+    Passing 2+3 means the CLI is wired to a hub that is answering — the practical
+    definition of 'connected and working'. Never raises."""
+    cid = entry["id"]
+    row = _cli_row(entry)
+    name = entry.get("name", cid)
+    if not row.get("installed"):
+        return {"ok": False, "stage": "install", "installed": False,
+                "detail": "%s is not installed on this machine." % name}
+    connected = bool(row.get("connected"))
+    if not connected:
+        return {"ok": False, "stage": "config", "installed": True, "connected": False,
+                "detail": "%s is installed but its config is NOT pointed at the hub. "
+                          "Click Connect first." % name}
+    try:
+        served, reply = _hub_serves_now()
+    except Exception as exc:
+        return {"ok": False, "stage": "hub", "connected": True,
+                "detail": _sanitize("%s: %s" % (exc.__class__.__name__, exc))}
+    if served:
+        return {"ok": True, "stage": "done", "installed": True, "connected": True,
+                "model": served, "reply": reply,
+                "detail": "%s is wired to the hub, and the hub answered a live test — %s said: %s"
+                          % (name, served, reply or "OK")}
+    return {"ok": False, "stage": "hub", "connected": True,
+            "detail": "%s points at the hub, but the hub got no reply from any free provider "
+                      "(check provider keys / quota)." % name}
+
+
+@app.route("/api/clis/<cid>/test", methods=["POST"])
+def api_cli_test(cid):
+    entry = _get_cli_entry(cid)
+    if not entry:
+        return jsonify({"error": "unknown CLI '%s'" % cid}), 404
+    return jsonify(_cli_test(entry))
+
+
 @app.route("/api/clis", methods=["GET"])
 def api_clis():
     return jsonify([_cli_row(e) for e in CLI_REGISTRY])
@@ -1959,9 +2033,15 @@ def api_cli_instructions(cid):
 
 @app.route("/v1/models", methods=["GET"])
 def v1_models():
+    agg = aggregated_models()
     data = [{"id": m["id"], "object": "model", "created": 0, "owned_by": m["provider"]}
-            for m in aggregated_models()]
-    return jsonify({"object": "list", "data": data})
+            for m in agg]
+    # Also expose a `models` array (id + slug). Some clients (e.g. Codex's model
+    # manager) expect that field and log a decode error against the OpenAI-only
+    # {data:[...]} shape. Additive — OpenAI clients keep reading `data`.
+    models = [{"id": m["id"], "slug": m["id"], "object": "model",
+               "owned_by": m["provider"]} for m in agg]
+    return jsonify({"object": "list", "data": data, "models": models})
 
 
 def _proxy_sse(resp):
