@@ -1180,20 +1180,32 @@ def api_status():
     q = {}
     exhausted = 0
     for pid in keyed:
-        s = quota.status(pid)
         p = prov.get_provider(pid) or {}
+        # A PAID provider has no free tier, so it has no free quota to report.
+        # It IS "exhausted" by quota.status() (limit 0), but surfacing that would
+        # make the banner cry "out of free quota - resets in 389h" about providers
+        # that never had a free allowance. Report free quota for free providers only.
+        if p.get("paid"):
+            continue
+        s = quota.status(pid)
         s["name"] = p.get("name", pid)
         s["models"] = quota.models(pid)  # {model_id: used_count} this window
         q[pid] = s
         if s["exhausted"]:
             exhausted += 1
+    # Exhaustion is about the FREE fleet only: `q` holds just the free providers
+    # (paid ones were skipped above). Comparing against len(keyed) would include
+    # paid providers in the denominator, so all_exhausted could never be true
+    # while any paid provider was keyed.
+    free_count = len(q)
     return jsonify({
         "providers_enabled": len(keyed),
+        "free_providers": free_count,
         "has_default": bool(default and default.get("provider") and default.get("model")),
         "local_api_key_set": bool(config.get_local_api_key()),
         "connect_snippets": _connect_snippets(),
         "quota": q,
-        "all_exhausted": bool(keyed) and exhausted == len(keyed),
+        "all_exhausted": free_count > 0 and exhausted == free_count,
         "any_exhausted": exhausted > 0,
     })
 
