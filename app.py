@@ -67,7 +67,16 @@ PORT = int(os.environ.get("PORT", "8787") or "8787")
 HOST = "127.0.0.1"
 
 CONNECT_TIMEOUT = 10          # seconds
-CHAT_READ_TIMEOUT = 300       # seconds (long generations)
+CHAT_READ_TIMEOUT = 300       # seconds (long NON-streaming generations)
+# Streaming (stream=True) timeouts. A hung/slow 200 must not stall the client for
+# the full CHAT_READ_TIMEOUT with no fallback:
+#   STREAM_FIRST_BYTE_TIMEOUT — max wait for the FIRST streamed byte before we give
+#     up on this provider and fall through to the next hop in the chain.
+#   STREAM_IDLE_TIMEOUT — the requests read timeout for streaming; bounds the gap
+#     between chunks once the stream is committed (a mid-stream stall fails in ~90s
+#     instead of 300s).
+STREAM_FIRST_BYTE_TIMEOUT = 25   # seconds
+STREAM_IDLE_TIMEOUT = 90         # seconds
 MODELS_READ_TIMEOUT = 10      # seconds (model discovery / key tests)
 MODEL_CACHE_TTL = 60          # seconds
 MAX_HOPS = 6                  # primary + up to 5 fallback models (across providers)
@@ -647,7 +656,11 @@ def _upstream_chat(pid, payload, stream):
                 json=payload,
                 headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
                 stream=stream,
-                timeout=(CONNECT_TIMEOUT, CHAT_READ_TIMEOUT),
+                # Streaming: bound the inter-chunk (idle) read at STREAM_IDLE_TIMEOUT
+                # so a stalled stream fails in ~90s not 300s (the handler's first-byte
+                # peek falls through even sooner, at ~25s). Non-streaming keeps the
+                # long CHAT_READ_TIMEOUT for slow one-shot generations.
+                timeout=(CONNECT_TIMEOUT, STREAM_IDLE_TIMEOUT if stream else CHAT_READ_TIMEOUT),
             )
         except requests.RequestException as exc:
             last_exc = exc
@@ -655,16 +668,20 @@ def _upstream_chat(pid, payload, stream):
                 raise
             continue
         quota.record(pid, payload.get("model"))  # counts against free quota (per provider + model)
-        # A 429 means this provider's free budget is spent -> mark it throttled so
-        # orchestration skips it until the window resets (drives the red banner).
-        if resp.status_code == 429:
+        # A 429 on a SINGLE key just rotates to the next key below. Only when the
+        # LAST key also 429s (every key for this provider is rate-limited) do we
+        # sideline the whole provider. And when there's no numeric Retry-After,
+        # cool down for a SHORT 60s (assume a per-minute burst) instead of pegging
+        # it exhausted until the day/month window resets — `secs or 60` keeps the
+        # provider usable ~1 min later; a real Retry-After is honored as-is.
+        if resp.status_code == 429 and is_last:
             retry_after = resp.headers.get("Retry-After")
             secs = None
             try:
                 secs = float(retry_after) if retry_after else None
             except ValueError:
                 secs = None
-            quota.mark_throttled(pid, secs)
+            quota.mark_throttled(pid, secs or 60)
         # Auth/rate-limit on this key -> try the next key before this provider
         # is given up on. On the last key, return it so the caller can react
         # (429/5xx -> provider fallback; 401/403 -> surfaced as an error).
@@ -1143,7 +1160,9 @@ def _llm_user_dir():
     if sys.platform == "darwin":
         return os.path.join(_home(), "Library", "Application Support", "io.datasette.llm")
     if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA") or os.path.join(_home(), "AppData", "Local")
+        # `llm` (click, app_dir with roaming=True) uses %APPDATA%\Roaming, NOT
+        # %LOCALAPPDATA% — match it so we find/edit the same config file.
+        base = os.environ.get("APPDATA") or os.path.join(_home(), "AppData", "Roaming")
         return os.path.join(base, "io.datasette.llm")
     return os.path.join(_xdg_config(), "io.datasette.llm")
 
@@ -1435,9 +1454,17 @@ def _manual_env(entry, key, base_root, base_v1, model):
 
 
 def _env_commands(env):
-    """Shell one-liners to set env vars persistently (per-CLI, NOT a profile edit
-    we make for the user — we only *print* these for them to run)."""
-    win = "\n".join('setx %s "%s"' % (k, v) for k, v in env.items())
+    """Shell one-liners to set env vars (per-CLI, NOT a profile edit we make for
+    the user — we only *print* these for them to run).
+    Windows: emit BOTH `set "VAR=VALUE"` (takes effect in the CURRENT shell so the
+    CLI works right now) AND `setx VAR "VALUE"` (persists for FUTURE shells) per
+    var — setx alone never touches the live session. One command per line so the
+    whole block stays copy-pasteable."""
+    win_lines = []
+    for k, v in env.items():
+        win_lines.append('set "%s=%s"' % (k, v))   # current shell (this session)
+        win_lines.append('setx %s "%s"' % (k, v))  # persist for future shells
+    win = "\n".join(win_lines)
     unix = "\n".join("export %s='%s'" % (k, v) for k, v in env.items())
     return {"windows": win, "unix": unix}
 
@@ -1452,6 +1479,22 @@ def _backup_once(path):
         return bak if os.path.exists(bak) else None
     except OSError:
         return None
+
+
+def _abort_if_backup_failed(path, backup):
+    """Guard for the auto-fixers: if `path` is a NON-EMPTY existing file but
+    `_backup_once` returned None (the backup genuinely failed), return an abort
+    dict so we refuse to overwrite the user's only copy. Returns None when it's
+    safe to proceed (no file, empty file, or a backup exists). Never raises."""
+    try:
+        if backup is None and os.path.isfile(path) and os.path.getsize(path) > 0:
+            return {"ok": False,
+                    "reason": "could not back up your existing config — refusing to overwrite it"}
+    except OSError:
+        # Can't even stat it -> be conservative and refuse rather than risk a loss.
+        return {"ok": False,
+                "reason": "could not back up your existing config — refusing to overwrite it"}
+    return None
 
 
 def _cli_write_text(path, text):
@@ -1563,7 +1606,7 @@ def _autofix_claude(entry, key, base_root, base_v1, model):
     data = {}
     if os.path.isfile(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:  # tolerate a UTF-8 BOM
                 data = json.load(f)
         except (OSError, ValueError):
             return {"ok": False, "reason": "existing %s is not valid JSON — fix or remove it, then retry."
@@ -1571,6 +1614,9 @@ def _autofix_claude(entry, key, base_root, base_v1, model):
         if not isinstance(data, dict):
             return {"ok": False, "reason": "existing %s is not a JSON object; not overwriting." % _short(path)}
     backup = _backup_once(path)
+    abort = _abort_if_backup_failed(path, backup)
+    if abort:
+        return abort
     env = data.get("env")
     if not isinstance(env, dict):
         env = {}
@@ -1593,6 +1639,9 @@ def _autofix_aider(entry, key, base_root, base_v1, model):
     path = _p_aider()
     updates = {"openai-api-base": base_v1, "openai-api-key": key, "model": "openai/" + model}
     backup = _backup_once(path)
+    abort = _abort_if_backup_failed(path, backup)  # scalar-replace: never overwrite an un-backed-up conf
+    if abort:
+        return abort
     _cli_write_text(path, _merge_flat_yaml(path, updates))
     return {
         "ok": True,
@@ -1609,7 +1658,7 @@ def _autofix_opencode(entry, key, base_root, base_v1, model):
     data = {}
     if os.path.isfile(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:  # tolerate a UTF-8 BOM
                 data = json.load(f)
         except (OSError, ValueError):
             return {"ok": False, "reason": ("existing %s is not valid JSON (jsonc comments aren't "
@@ -1617,6 +1666,9 @@ def _autofix_opencode(entry, key, base_root, base_v1, model):
         if not isinstance(data, dict):
             return {"ok": False, "reason": "existing %s is not a JSON object; not overwriting." % _short(path)}
     backup = _backup_once(path)
+    abort = _abort_if_backup_failed(path, backup)
+    if abort:
+        return abort
     data.setdefault("$schema", "https://opencode.ai/config.json")
     providers = data.get("provider")
     if not isinstance(providers, dict):
@@ -1646,6 +1698,9 @@ def _autofix_qwen(entry, key, base_root, base_v1, model):
     updates = {"OPENAI_API_BASE": base_v1, "OPENAI_BASE_URL": base_v1,
                "OPENAI_API_KEY": key, "OPENAI_MODEL": model}
     backup = _backup_once(path)
+    abort = _abort_if_backup_failed(path, backup)  # scalar-replace: never overwrite an un-backed-up .env
+    if abort:
+        return abort
     _cli_write_text(path, _merge_dotenv(path, updates))
     return {
         "ok": True,
@@ -1727,6 +1782,9 @@ def _autofix_codex(entry, key, base_root, base_v1, model):
     session so it re-reads config.toml."""
     path = _p_codex()
     backup = _backup_once(path)
+    abort = _abort_if_backup_failed(path, backup)
+    if abort:
+        return abort
     try:
         if os.path.isfile(path):
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -1790,19 +1848,36 @@ def _restore_backup(path):
     return True
 
 
+def _discard_backup(path):
+    """Delete a <path>.freehub-bak backup if present (best-effort, never raises).
+    Called after a successful NON-destructive strip revert so the frozen backup —
+    which was captured at FIRST connect and is now stale — can never later shadow
+    or overwrite config the user added after connecting."""
+    bak = path + ".freehub-bak"
+    try:
+        if os.path.isfile(bak):
+            os.remove(bak)
+    except OSError:
+        pass
+
+
 def _disconnect_claude(entry):
     path = entry["write_path"]
     hint = "Restart Claude Code (open a new terminal) so it re-reads ~/.claude/settings.json."
-    if _restore_backup(path):
-        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
-    changed = False
+    # #2 STRUCTURED-CONFIG revert: prefer the NON-DESTRUCTIVE strip path over
+    # restoring the .freehub-bak backup. The backup is frozen at FIRST connect, so
+    # restoring it would silently wipe any MCP servers / settings the user added to
+    # settings.json AFTER connecting. As long as the live file still parses as JSON
+    # we strip ONLY our three env keys and keep everything else, then drop the stale
+    # backup. The backup restore is a last resort for a file that no longer parses.
     if os.path.isfile(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:  # tolerate a UTF-8 BOM
                 data = json.load(f)
         except (OSError, ValueError):
             data = None
         if isinstance(data, dict):
+            changed = False
             env = data.get("env")
             # Only touch keys we set, and only when the base URL is ours.
             if isinstance(env, dict) and _points_at_hub(env.get("ANTHROPIC_BASE_URL")):
@@ -1813,8 +1888,14 @@ def _disconnect_claude(entry):
                     data.pop("env", None)
             if changed:
                 _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+            _discard_backup(path)  # strip succeeded -> stale backup no longer needed
+            return {"restored_from_backup": False, "wrote_path": path,
+                    "changed": changed, "restart_hint": hint}
+    # Live file missing or no longer valid JSON -> fall back to the frozen backup.
+    if _restore_backup(path):
+        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
     return {"restored_from_backup": False, "wrote_path": path,
-            "changed": changed, "restart_hint": hint}
+            "changed": False, "restart_hint": hint}
 
 
 def _disconnect_aider(entry):
@@ -1836,13 +1917,15 @@ def _disconnect_aider(entry):
 def _disconnect_opencode(entry):
     path = entry["write_path"]
     hint = "Restart opencode so it re-reads ~/.config/opencode/opencode.json."
-    if _restore_backup(path):
-        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
+    # #2 STRUCTURED-CONFIG revert: strip ONLY our provider + model entries so any
+    # provider/agent/setting the user added after connecting survives — never blind-
+    # restore the stale first-connect backup. Backup restore is the last resort for
+    # a file that no longer parses as JSON.
     changed = False
     deleted = False
     if os.path.isfile(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:  # tolerate a UTF-8 BOM
                 data = json.load(f)
         except (OSError, ValueError):
             data = None
@@ -1857,11 +1940,10 @@ def _disconnect_opencode(entry):
                 data.pop("model", None)
                 changed = True
             if changed:
-                # No backup existed -> Auto-fix CREATED this file, so everything in
-                # it (including the "$schema" we seeded) is ours. If nothing but
-                # that schema stub is left, delete the file for a clean revert
-                # instead of leaving a lone {"$schema": ...} shell. Any other
-                # remaining key means the user added content post-autofix -> keep.
+                # A lone "$schema" (or nothing) left means the file holds nothing of
+                # the user's — remove it for a clean revert instead of leaving a
+                # {"$schema": ...} shell. ANY other remaining key means the user
+                # added real content -> keep it (this is the invariant #2 protects).
                 remaining = set(data.keys())
                 if not remaining or remaining == {"$schema"}:
                     try:
@@ -1871,11 +1953,17 @@ def _disconnect_opencode(entry):
                         _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
                 else:
                     _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-    out = {"restored_from_backup": False, "wrote_path": path,
-           "changed": changed, "restart_hint": hint}
-    if deleted:
-        out["deleted"] = True
-    return out
+            _discard_backup(path)  # strip succeeded -> stale backup no longer needed
+            out = {"restored_from_backup": False, "wrote_path": path,
+                   "changed": changed, "restart_hint": hint}
+            if deleted:
+                out["deleted"] = True
+            return out
+    # Live file missing or no longer valid JSON -> fall back to the frozen backup.
+    if _restore_backup(path):
+        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
+    return {"restored_from_backup": False, "wrote_path": path,
+            "changed": False, "restart_hint": hint}
 
 
 def _disconnect_qwen(entry):
@@ -1948,10 +2036,15 @@ def _strip_codex_top_keys(text):
 def _disconnect_codex(entry):
     path = entry.get("write_path") or _p_codex()
     hint = "Restart Codex (open a new terminal) so it re-reads ~/.codex/config.toml."
-    if _restore_backup(path):
-        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
-    # No backup (autofix created the file): strip ONLY the additions we made.
-    changed = False
+    # #2 STRUCTURED-CONFIG revert: strip ONLY our additions (the
+    # [model_providers.freehub] table + the two top keys we set) so any provider /
+    # [mcp_servers.*] / setting the user added to config.toml after connecting
+    # survives — never blind-restore the stale first-connect backup. Restore the
+    # frozen backup only if the file can't be read at all.
+    # Trade-off (documented): if the user had their OWN model/model_provider before
+    # connecting, autofix overwrote those scalars and the strip removes them rather
+    # than restoring the originals — the same limitation as the line-based CLIs.
+    # Preserving newly-added MCP servers outweighs restoring a trivially-reset scalar.
     if os.path.isfile(path):
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -1961,11 +2054,18 @@ def _disconnect_codex(entry):
         if text is not None:
             text2, tbl_removed = _remove_toml_table(text, "model_providers.freehub")
             text3, top_removed = _strip_codex_top_keys(text2)
+            changed = False
             if tbl_removed or top_removed:
                 _cli_write_text(path, text3)
                 changed = True
+            _discard_backup(path)  # strip succeeded -> stale backup no longer needed
+            return {"restored_from_backup": False, "wrote_path": path,
+                    "changed": changed, "restart_hint": hint}
+    # Unreadable / missing -> fall back to the frozen backup.
+    if _restore_backup(path):
+        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
     return {"restored_from_backup": False, "wrote_path": path,
-            "changed": changed, "restart_hint": hint}
+            "changed": False, "restart_hint": hint}
 
 
 _LLM_ITEM_RE = re.compile(r"^\s*-\s+\S")
@@ -2052,7 +2152,15 @@ def _env_unset_commands(entry):
         names = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"]
     else:
         names = ["OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"]
-    win = "\n".join('setx %s ""' % n for n in names)
+    # Windows: `setx VAR ""` stores an EMPTY value, it does NOT delete the var, so
+    # the CLI still sees a (blank) override. Actually remove it: `reg delete` drops
+    # the persisted user var (future shells) and `set "VAR="` clears it in the
+    # CURRENT shell. Unix `unset` already removes it outright.
+    win_lines = []
+    for n in names:
+        win_lines.append('set "%s="' % n)                                # current shell
+        win_lines.append('reg delete "HKCU\\Environment" /F /V %s' % n)   # future shells
+    win = "\n".join(win_lines)
     unix = "\n".join("unset %s" % n for n in names)
     return {"windows": win, "unix": unix}
 
@@ -2275,10 +2383,63 @@ def v1_models():
     return jsonify({"object": "list", "data": data, "models": models})
 
 
-def _proxy_sse(resp):
-    """Pass upstream SSE bytes through unchanged."""
+_MISSING = object()  # sentinel: "no pre-read first item" for the peeked streamers
+
+
+def _chain_first(first, iterator):
+    """Yield `first` (unless it's the _MISSING sentinel) then the rest of
+    `iterator` — used to prepend a first item pulled during the first-byte peek
+    back onto the stream so no chunk is lost."""
+    if first is not _MISSING:
+        yield first
+    for item in iterator:
+        yield item
+
+
+def _peek_first_chunk(iterator, deadline_s):
+    """First-byte peek for streaming fallback (#4). Pull the FIRST item from an
+    already-created `iterator` (resp.iter_content(...) for raw SSE, or
+    resp.iter_lines(...) for the translating parsers) in a daemon worker thread
+    bounded to ~deadline_s. Returns (ok, first):
+      ok=True  -> `first` is the first item; the upstream is responsive. The worker
+                  has finished (join returned), so the caller keeps iterating the
+                  SAME iterator sequentially — no concurrency, no lost/duplicated
+                  item.
+      ok=False -> no usable first byte: the read timed out (slow/hung provider), the
+                  stream ended immediately (StopIteration), or the read errored. The
+                  caller should resp.close() and fall through to the next provider.
+    A worker still blocked past the deadline is abandoned (daemon); the caller's
+    resp.close() unblocks/ends its read. requests' STREAM_IDLE_TIMEOUT read timeout
+    is the hard backstop if the tighter join deadline is ever exceeded."""
+    box = {}
+
+    def _worker():
+        try:
+            box["v"] = next(iterator)
+            box["ok"] = True
+        except StopIteration:
+            box["ok"] = False
+        except Exception:  # requests read timeout / connection reset / etc.
+            box["ok"] = False
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(deadline_s)
+    if t.is_alive() or not box.get("ok"):
+        return False, None
+    return True, box.get("v")
+
+
+def _proxy_sse(resp, iterator=None, first=_MISSING):
+    """Pass upstream SSE bytes through unchanged. When `iterator`/`first` are
+    supplied (the first-byte peek already pulled the first chunk from this exact
+    iterator), yield that chunk first, then continue the SAME iterator — so the
+    fast-path byte stream is byte-for-byte identical to before. Empty chunks are
+    still filtered exactly as before."""
     try:
-        for chunk in resp.iter_content(chunk_size=None):
+        if iterator is None:
+            iterator = resp.iter_content(chunk_size=None)
+        for chunk in _chain_first(first, iterator):
             if chunk:
                 yield chunk
     finally:
@@ -2331,7 +2492,17 @@ def v1_chat_completions():
             continue
         if resp.status_code == 200:
             if stream:
-                return Response(stream_with_context(_proxy_sse(resp)),
+                # #4: peek the first byte BEFORE committing the 200. A hung/slow
+                # stream (no first byte within STREAM_FIRST_BYTE_TIMEOUT) falls
+                # through to the next provider instead of stalling the client.
+                it = resp.iter_content(chunk_size=None)
+                ok, first = _peek_first_chunk(it, STREAM_FIRST_BYTE_TIMEOUT)
+                if not ok:
+                    errors.append("%s: no first byte within %ds"
+                                  % (hop_pid, STREAM_FIRST_BYTE_TIMEOUT))
+                    resp.close()
+                    continue
+                return Response(stream_with_context(_proxy_sse(resp, it, first)),
                                 mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
@@ -2509,9 +2680,12 @@ def _chat_to_responses(chat_json, model_label):
     }
 
 
-def _responses_stream(resp, model_label):
+def _responses_stream(resp, model_label, line_iter=None, first=_MISSING):
     """Consume an upstream OpenAI chat SSE stream and re-emit it as Responses API
-    events for Codex. Event order:
+    events for Codex. When `line_iter`/`first` are supplied (the first-byte peek
+    already pulled the first line from this exact iterator) the pre-read line is
+    processed first, then the rest of the SAME iterator — so fast-path output is
+    identical to before. Event order:
       response.created
       [text]  output_item.added -> content_part.added -> output_text.delta* ->
               output_text.done -> content_part.done -> output_item.done
@@ -2538,11 +2712,13 @@ def _responses_stream(resp, model_label):
     text_buf = []
     tools = {}               # oai tool index -> {out_index,item_id,call_id,name,args[]}
     usage = None
+    if line_iter is None:
+        line_iter = resp.iter_lines(decode_unicode=False)
     try:
         yield _sse_event("response.created",
                          {"type": "response.created", "response": _obj("in_progress", [])})
 
-        for raw in resp.iter_lines(decode_unicode=False):
+        for raw in _chain_first(first, line_iter):
             if not raw or not raw.startswith(b"data:"):
                 continue
             data = raw[5:].strip()
@@ -2741,8 +2917,18 @@ def v1_responses():
         if resp.status_code == 200:
             model_label = hop_pid + "/" + hop_model
             if stream:
-                return Response(stream_with_context(_responses_stream(resp, model_label)),
-                                mimetype="text/event-stream", headers=_SSE_HEADERS)
+                # #4: peek the first line BEFORE committing the 200 SSE stream so a
+                # hung/slow provider falls through to the next hop instead of stalling.
+                line_it = resp.iter_lines(decode_unicode=False)
+                ok, first = _peek_first_chunk(line_it, STREAM_FIRST_BYTE_TIMEOUT)
+                if not ok:
+                    errors.append("%s: no first byte within %ds"
+                                  % (hop_pid, STREAM_FIRST_BYTE_TIMEOUT))
+                    resp.close()
+                    continue
+                return Response(stream_with_context(
+                    _responses_stream(resp, model_label, line_it, first)),
+                    mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
             except ValueError:
@@ -2933,11 +3119,16 @@ def _sse_event(name, obj):
     return ("event: %s\ndata: %s\n\n" % (name, json.dumps(obj, ensure_ascii=False))).encode("utf-8")
 
 
-def _anthropic_stream(resp, model_str, input_tokens):
+def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISSING):
     """Translate an upstream OpenAI SSE stream into the Anthropic event
     sequence: message_start -> content_block_start -> content_block_delta* ->
-    content_block_stop -> message_delta -> message_stop."""
+    content_block_stop -> message_delta -> message_stop. When `line_iter`/`first`
+    are supplied (the first-byte peek already pulled the first line from this exact
+    iterator) the pre-read line is processed first, then the rest of the SAME
+    iterator — fast-path output is identical to before."""
     msg_id = "msg_" + uuid.uuid4().hex
+    if line_iter is None:
+        line_iter = resp.iter_lines(decode_unicode=False)
     try:
         yield _sse_event("message_start", {"type": "message_start", "message": {
             "id": msg_id, "type": "message", "role": "assistant", "model": model_str,
@@ -2952,7 +3143,7 @@ def _anthropic_stream(resp, model_str, input_tokens):
         out_tokens = None
         text_chars = 0
 
-        for raw in resp.iter_lines(decode_unicode=False):
+        for raw in _chain_first(first, line_iter):
             if not raw or not raw.startswith(b"data:"):
                 continue
             data = raw[5:].strip()
@@ -3111,8 +3302,17 @@ def v1_messages():
         if resp.status_code == 200:
             model_str = requested_model or (hop_pid + "/" + hop_model)
             if stream:
+                # #4: peek the first line BEFORE committing the 200 SSE stream so a
+                # hung/slow provider falls through to the next hop instead of stalling.
+                line_it = resp.iter_lines(decode_unicode=False)
+                ok, first = _peek_first_chunk(line_it, STREAM_FIRST_BYTE_TIMEOUT)
+                if not ok:
+                    errors.append("%s: no first byte within %ds"
+                                  % (hop_pid, STREAM_FIRST_BYTE_TIMEOUT))
+                    resp.close()
+                    continue
                 return Response(stream_with_context(
-                    _anthropic_stream(resp, model_str, input_est)),
+                    _anthropic_stream(resp, model_str, input_est, line_it, first)),
                     mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
