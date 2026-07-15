@@ -174,8 +174,9 @@ PROVIDERS: Dict[str, dict] = {
         ],
         # Same 4 ids: this list is served WITHOUT a free-ness re-check when live
         # discovery fails, so it must never contain an unverified id.
-        # kimi-k2.7-code-free is advertised free but hung >90s on every probe -
-        # left out until it actually answers.
+        # kimi-k2.7-code-free is advertised as free but is BROKEN upstream, not
+        # merely slow: 3 probes, each ~126s, all Cloudflare 524 (origin timeout).
+        # Re-probe before ever pinning it; a hang is not a free-ness verdict.
         "default_free_models": [
             "agnes-2.0-flash",
             "mistral-large",
