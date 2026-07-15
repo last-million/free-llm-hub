@@ -405,14 +405,37 @@ PROVIDERS: Dict[str, dict] = {
         # impossible (the OpenAI-compat models endpoint returns no pricing), so
         # default_free_models is the real safety net; a per-provider exclude
         # list is the proper fix.
+        #
+        # RETIRED-BUT-STILL-LISTED (probed live 2026-07-15): Google's own
+        # /v1beta/openai/models STILL RETURNS gemini-2.5-flash and
+        # gemini-2.5-flash-lite, but calling either gives
+        #   404 "This model models/gemini-2.5-flash is no longer available to
+        #        new users."
+        # So live discovery advertises models that can never work. Without this
+        # exclude the family match on "flash" re-admits them every cycle: each
+        # gets tried, 404s, is sidelined by the dead-model tracker for 6h, then
+        # re-probed forever - burning a request every 6h per model, and showing
+        # phantom models in the dashboard. One substring covers both ("-lite"
+        # contains the base id as a prefix) and matches nothing we want:
+        # gemini-3.5-flash / 3.1-flash-lite / 2.5-pro are unaffected.
+        # The dead-tracker is the safety net, NOT the fix - it only reacts after
+        # a wasted call.
+        "exclude_families": ["gemini-2.5-flash"],
         "free_filter": "family",
         "free_families": ["flash", "gemma", "2.5-pro"],
+        # Probed 2026-07-15: these 6 answered AND all read text out of a test
+        # PNG (real vision). gemini-2.0-flash returned 429 = free quota spent by
+        # probing, NOT broken, so it stays.
         "default_free_models": [
-            "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash",
-            "gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-2.5-pro",
-            "gemini-2.0-flash", "gemma-4-31b-it",
+            "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
+            "gemini-2.5-pro", "gemini-2.0-flash", "gemma-4-31b-it",
         ],
-        "notes": "Free tier = Flash family + Gemma + 2.5-Pro. ToS: free-tier prompts/responses may be used to improve Google's products outside EU/UK/CH.",
+        "notes": ("Free tier = Flash family + Gemma + 2.5-Pro. Best free VISION in the fleet "
+                  "(verified: all 6 read text from an image). ⚠ gemini-2.5-flash and "
+                  "gemini-2.5-flash-lite are RETIRED ('no longer available to new users') yet "
+                  "Google still lists them - excluded above, do not re-add from the /models list. "
+                  "ToS: free-tier prompts/responses may be used to improve Google's products "
+                  "outside EU/UK/CH."),
     },
     "mistral": {
         "name": "Mistral",
