@@ -567,14 +567,6 @@
   .quota-row .qr-model .qm-count{flex:none;font-family:var(--mono);font-size:11.5px;color:var(--text-faint);white-space:nowrap}
   .quota-row .qr-models-empty{font-size:11.5px;color:var(--text-faint);font-style:italic}
 
-  /* ---------- auto-update control (C) ---------- */
-  .au-row{
-    background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
-    padding:14px 16px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;
-  }
-  .au-row .switch .lbl{font-size:13px;color:var(--text)}
-  .au-row .au-status{font-size:12px;color:var(--text-faint);overflow-wrap:anywhere}
-
   @media (prefers-reduced-motion:reduce){
     *,*::before,*::after{animation-duration:.01ms !important;transition-duration:.01ms !important}
   }
@@ -831,7 +823,6 @@
   var providers = [];
   var statusData = null;
   var quotaState = {};        /* pid -> live quota model; resets_in ticks down locally */
-  var autoUpdateData = null;
   var _ebSig = '';            /* last structural signature of the exhaustion banner */
   var keyHealth = {};         /* pid -> {state:'ok'|'bad'|'unknown', detail} — cached per session, NOT re-run on the 15s poll */
   var _healthTesting = {};    /* pid -> true while an /api/test key-health check is in flight */
@@ -1058,66 +1049,10 @@
     }
   }
 
-  /* ---------- auto-update control (C) ---------- */
-  function fmtAutoResult(d){
-    if (!d) return '';
-    if (d.updating) return 'checking for updates…';
-    if (d.last_result) return String(d.last_result);
-    return d.enabled ? 'auto-update on' : 'auto-update off';
-  }
-  function renderAutoUpdate(d){
-    var toggle = document.getElementById('au-toggle');
-    var checkBtn = document.getElementById('au-check');
-    var statusEl = document.getElementById('au-status');
-    if (!toggle) return;
-    if (d && d.is_git_repo === false){
-      toggle.checked = false;
-      toggle.disabled = true;
-      if (checkBtn) checkBtn.disabled = true;
-      if (statusEl) statusEl.textContent = 'Not a git checkout — auto-update unavailable.';
-      return;
-    }
-    toggle.disabled = false;
-    toggle.checked = !!(d && d.enabled);
-    if (checkBtn) checkBtn.disabled = !!(d && d.updating);
-    if (statusEl) statusEl.textContent = fmtAutoResult(d);
-  }
-  function loadAutoUpdate(){
-    return api('/api/auto-update').then(function(d){
-      autoUpdateData = d;
-      renderAutoUpdate(d);
-    }).catch(function(){ /* endpoint may be unavailable */ });
-  }
-  function initAutoUpdate(){
-    var toggle = document.getElementById('au-toggle');
-    var checkBtn = document.getElementById('au-check');
-    if (toggle){
-      toggle.addEventListener('change', function(){
-        var want = toggle.checked;
-        toggle.disabled = true;
-        api('/api/auto-update', { method: 'POST', body: { enabled: want } }).then(function(d){
-          autoUpdateData = d || { enabled: want, is_git_repo: true };
-          renderAutoUpdate(autoUpdateData);
-          toast('Auto-update ' + (want ? 'enabled' : 'disabled'));
-        }).catch(function(e){
-          toggle.checked = !want;
-          toggle.disabled = false;
-          toast('Auto-update: ' + e.message, true);
-        });
-      });
-    }
-    if (checkBtn){
-      checkBtn.addEventListener('click', function(){
-        var btn = this; btn.disabled = true;
-        toast('Checking for updates… (the hub will restart if an update is found)');
-        api('/api/auto-update', { method: 'POST', body: { check: true } }).then(function(d){
-          if (d){ autoUpdateData = d; renderAutoUpdate(d); }
-        }).catch(function(){ /* server may restart mid-response */ }).then(function(){
-          if (!(autoUpdateData && (autoUpdateData.updating || autoUpdateData.is_git_repo === false))) btn.disabled = false;
-        });
-      });
-    }
-  }
+  /* auto-update: ALWAYS ON, no UI. The hub git-pulls every 5h and restarts only when
+     new commits arrived; it skips a dirty tree and never touches your keys
+     (~/.free-llm-hub lives outside the repo). Nothing to toggle, so nothing rendered.
+     GET /api/auto-update still exposes state for diagnostics. */
 
   /* ---------- default model ---------- */
   function loadModels(){
@@ -2205,12 +2140,10 @@
   initScrollTop();
   initModal();
   initChat();
-  initAutoUpdate();
   loadStatus().then(updateChatAuthNote);
   loadProviders().then(scheduleKeyHealthChecks);   /* colour keyed cards by live key health, capped concurrency */
   loadModels().then(loadDefault).then(loadChatModels);
   loadClis();
-  loadAutoUpdate();
   loadActivity();
   setInterval(function(){ loadStatus(true); }, 15000);   /* server re-sync (banner + quota) */
   setInterval(loadActivity, 3000);                       /* live activity feed poll */
