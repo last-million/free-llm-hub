@@ -343,15 +343,67 @@ def _classify_difficulty(messages, max_tokens=None):
     return "medium"
 
 
-def _route_by_difficulty(messages, max_tokens=None):
-    """Pick (pid, model) by task difficulty across AVAILABLE providers.
-    - hard  -> strongest model available (best output wins).
-    - simple/medium -> the CHEAPEST model whose benchmark clears the tier floor,
-      so weak models take easy work and quota on strong ones is preserved.
-    Returns (None, None) if nothing is ready (caller falls back)."""
+# Approx FREE-tier tokens-per-minute per provider. A single request whose tokens
+# exceed this gets a 413 "Payload Too Large" (Groq free = 6k TPM is the classic
+# one that rejects an agentic CLI like Codex, whose requests are ~13k tokens of
+# system prompt + tool schemas). Used to keep big requests off small providers.
+_PROVIDER_TPM = {
+    "groq": 6000, "github-models": 8000, "huggingface": 20000, "mistral": 30000,
+    "morph": 30000, "sambanova": 50000, "cerebras": 60000, "deepseek": 60000,
+    "openrouter": 100000, "cohere": 100000, "nvidia": 200000, "google": 250000,
+}
+_DEFAULT_TPM = 20000
+
+
+def _provider_tpm(pid):
+    return _PROVIDER_TPM.get(pid, _DEFAULT_TPM)
+
+
+def _est_tokens(messages, tools=None):
+    """Rough token estimate of a request (~4 chars/token). Counts message text,
+    tool-call arguments, AND tool schemas — tools dominate an agentic CLI's size."""
+    chars = 0
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            chars += len(c)
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                    chars += len(b["text"])
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            chars += len(str(fn.get("arguments") or "")) + len(str(fn.get("name") or ""))
+    if tools:
+        try:
+            chars += len(json.dumps(tools))
+        except Exception:
+            pass
+    return chars // 4 + 400  # + overhead for roles/formatting
+
+
+def _provider_capable(pid, est):
+    """Can this provider's free tier take a single `est`-token request? (margin
+    for the model's own reply added.)"""
+    return est <= 0 or _provider_tpm(pid) >= int(est * 1.15) + 512
+
+
+def _route_by_difficulty(messages, max_tokens=None, est=None):
+    """Pick (pid, model) by task difficulty across AVAILABLE providers that can
+    also HANDLE the request size (skip small-TPM providers for big requests).
+    - hard  -> strongest capable model.
+    - simple/medium -> cheapest capable model clearing the tier floor.
+    Returns (None, None, difficulty) if nothing is ready (caller falls back)."""
     difficulty = _classify_difficulty(messages, max_tokens)
+    if est is None:
+        est = _est_tokens(messages)
+    providers = [p for p in _available_providers() if _provider_capable(p, est)]
+    if not providers:  # request too big for every free tier -> try the biggest anyway
+        providers = sorted(_available_providers(), key=_provider_tpm, reverse=True)
     cands = []  # (score, pid, model)
-    for pid in _available_providers():
+    for pid in providers:
         for m in provider_free_models(pid):
             if prov.is_model_allowed(m):
                 cands.append((_benchmark_score(pid, m), pid, m))
@@ -458,15 +510,17 @@ def _comparable_model(model_id, candidates):
     return best or candidates[0]
 
 
-def _build_chain(primary_pid, model_id):
-    """[(pid, model)] -- primary first, then fallback providers with a
-    comparable free model, ORDERED BEST-FIRST by benchmark. Capped at MAX_HOPS."""
+def _build_chain(primary_pid, model_id, est=0):
+    """[(pid, model)] -- primary first, then fallback providers with a comparable
+    free model, ORDERED BEST-FIRST by benchmark. Providers whose free tier can't
+    take an `est`-token request are skipped (so a big request doesn't fall back
+    onto a provider that will 413). Capped at MAX_HOPS."""
     chain = [(primary_pid, model_id)]
-    # Score each other AVAILABLE provider's best comparable model, then add them
-    # strongest-first so a fallback is an upgrade path, not a random hop.
+    # Score each other AVAILABLE, size-CAPABLE provider's best comparable model,
+    # then add them strongest-first so a fallback is an upgrade path, not random.
     candidates = []
     for pid in _available_providers():
-        if pid == primary_pid:
+        if pid == primary_pid or not _provider_capable(pid, est):
             continue
         free = provider_free_models(pid)
         if not free:
@@ -955,7 +1009,10 @@ def _suggested_model():
 def _connect_snippets():
     key = config.get_local_api_key()
     shown_key = key or "free-llm-hub"
-    model = _suggested_model()
+    # Use the SAME model id the CLI auto-fixers write (first aggregated free model),
+    # falling back to the suggestion only when nothing is keyed yet — so the shown
+    # snippet and the written env block never disagree.
+    model = _first_free_model_id() or _suggested_model()
     claude = ("export ANTHROPIC_BASE_URL=http://localhost:%d\n"
               "export ANTHROPIC_AUTH_TOKEN=%s\n"
               "export ANTHROPIC_MODEL=%s\n"
@@ -1114,19 +1171,22 @@ CLI_REGISTRY = [
         "write_path": _p_codex(),
         "default_method": "config",
         "hint": ("Installed. Run Auto-fix to add a [model_providers.freehub] block "
-                 "(wire_api = \"responses\") to ~/.codex/config.toml and set model_provider/model; "
-                 "then export FREE_LLM_HUB_KEY in your environment."),
+                 "(wire_api = \"responses\") to ~/.codex/config.toml — the localhost hub needs "
+                 "NO auth, so there's no API key or env var to set. Just restart Codex afterwards."),
         "manual_note": (
-            "Codex (2026+) speaks ONLY the OpenAI Responses API (wire_api = \"responses\"). "
-            "Auto-fix adds to ~/.codex/config.toml:\n"
+            "Codex (2026+) speaks ONLY the OpenAI Responses API (wire_api = \"responses\") and is "
+            "wired through ~/.codex/config.toml, NOT environment variables — the "
+            "OPENAI_API_BASE/OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL chat vars do NOT connect "
+            "it. Auto-fix adds:\n"
             "  [model_providers.freehub]\n"
             "  name = \"Free LLM Hub\"\n"
             "  base_url = \"http://127.0.0.1:%d/v1\"\n"
             "  wire_api = \"responses\"\n"
-            "  env_key = \"FREE_LLM_HUB_KEY\"\n"
             "and sets  model_provider = \"freehub\"  +  model = \"auto\"  in the top (pre-table) "
-            "section. Then export FREE_LLM_HUB_KEY (the local hub key, or any non-empty value when "
-            "the hub has no local key set) and restart Codex." % PORT
+            "section. The localhost hub needs NO auth, so there is no API key or environment "
+            "variable to set (if the hub has a local key, Auto-fix embeds it in config.toml for "
+            "you). The only manual step: if Codex was already open, restart it (or run /model) so "
+            "it re-reads config.toml." % PORT
         ),
     },
     {
@@ -1141,10 +1201,11 @@ CLI_REGISTRY = [
         "hint": ("Installed, but Gemini CLI speaks Google's native API — this OpenAI/Anthropic hub "
                  "cannot serve it directly (uncertain)."),
         "manual_note": (
-            "UNCERTAIN / likely incompatible: Google's Gemini CLI targets the native Gemini API, not "
-            "an OpenAI- or Anthropic-shaped endpoint, so this hub can't serve it as-is. Even builds that "
-            "honor GOOGLE_GEMINI_BASE_URL still expect Google's wire format. Use the Qwen Code CLI (an "
-            "OpenAI-compatible Gemini-CLI fork) instead if you want a Gemini-CLI-style tool on this hub."
+            "INCOMPATIBLE: Google's Gemini CLI reads GEMINI_API_BASE_URL / GOOGLE_GEMINI_BASE_URL "
+            "and speaks Google's native wire format — it is NOT OpenAI-shaped, so this hub cannot "
+            "serve it and the usual OPENAI_* env vars do nothing for it. Use Qwen Code (qwen) "
+            "instead — it's an OpenAI-compatible Gemini-CLI fork that this hub fully supports "
+            "(Auto-fix wires it into ~/.qwen/.env)."
         ),
     },
     {
@@ -1204,6 +1265,14 @@ _CLI_BY_ID = {e["id"]: e for e in CLI_REGISTRY}
 
 def _get_cli_entry(cid):
     return _CLI_BY_ID.get(cid)
+
+
+# CLIs that are NOT wired through OPENAI_*/ANTHROPIC_* environment variables, so
+# handing out an env-var block or unset commands for them is misleading:
+#   codex  -> Responses API via ~/.codex/config.toml (Auto-fix writes it; no auth)
+#   gemini -> Google-native wire format; this OpenAI/Anthropic hub can't serve it
+#   llm    -> extra-openai-models.yaml + `llm keys` (not env vars)
+_ENVLESS_CLIS = {"codex", "gemini", "llm"}
 
 
 def _hub_fragments():
@@ -1581,48 +1650,6 @@ def _codex_apply_text(text, base_v1, bearer=None):
     return new_text
 
 
-def _persist_env_var(name, value):
-    """Set a PERSISTENT user env var on the host OS so a CLI (e.g. Codex) can read
-    it — Windows: `setx` (HKCU\\Environment, picked up by NEW shells); POSIX: append
-    an idempotent `export` line to the user's shell rc. Also sets it in the current
-    process. Never raises — returns {ok, method, ...} or {ok:False, reason} so the
-    caller can fall back to showing manual commands. New shell/`source` still needed."""
-    try:
-        os.environ[name] = value  # helps any child process we spawn right now
-        if os.name == "nt":
-            r = subprocess.run(["setx", name, value],
-                               capture_output=True, text=True, timeout=15)
-            if r.returncode == 0:
-                return {"ok": True, "method": "setx",
-                        "target": "Windows user environment",
-                        "note": "Open a NEW terminal so Codex sees it (existing shells won't)."}
-            return {"ok": False,
-                    "reason": _sanitize((r.stderr or r.stdout or "setx failed").strip()[:160])}
-        # POSIX (macOS / Linux): append to the shell rc matching $SHELL.
-        home = os.path.expanduser("~")
-        shell = os.environ.get("SHELL", "")
-        if "zsh" in shell:
-            target = os.path.join(home, ".zshrc")
-        elif "bash" in shell:
-            target = os.path.join(home, ".bashrc")
-        else:
-            target = os.path.join(home, ".profile")
-        try:
-            existing = ""
-            if os.path.isfile(target):
-                with open(target, "r", encoding="utf-8", errors="ignore") as f:
-                    existing = f.read()
-            if ("export %s=" % name) not in existing:
-                with open(target, "a", encoding="utf-8") as f:
-                    f.write("\n# added by Free LLM Hub\nexport %s='%s'\n" % (name, value))
-            return {"ok": True, "method": "shell-rc", "target": target,
-                    "note": "Run  source %s  or open a new terminal." % target}
-        except OSError as exc:
-            return {"ok": False, "reason": _sanitize("could not write %s: %s" % (target, exc))}
-    except Exception as exc:
-        return {"ok": False, "reason": _sanitize("%s: %s" % (exc.__class__.__name__, exc))}
-
-
 def _autofix_codex(entry, key, base_root, base_v1, model):
     """Point the OpenAI Codex CLI at this hub. Codex only supports
     wire_api="responses" (served by POST /v1/responses). Edits config.toml
@@ -1745,6 +1772,7 @@ def _disconnect_opencode(entry):
     if _restore_backup(path):
         return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
     changed = False
+    deleted = False
     if os.path.isfile(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -1762,9 +1790,25 @@ def _disconnect_opencode(entry):
                 data.pop("model", None)
                 changed = True
             if changed:
-                _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-    return {"restored_from_backup": False, "wrote_path": path,
-            "changed": changed, "restart_hint": hint}
+                # No backup existed -> Auto-fix CREATED this file, so everything in
+                # it (including the "$schema" we seeded) is ours. If nothing but
+                # that schema stub is left, delete the file for a clean revert
+                # instead of leaving a lone {"$schema": ...} shell. Any other
+                # remaining key means the user added content post-autofix -> keep.
+                remaining = set(data.keys())
+                if not remaining or remaining == {"$schema"}:
+                    try:
+                        os.remove(path)
+                        deleted = True
+                    except OSError:
+                        _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+                else:
+                    _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    out = {"restored_from_backup": False, "wrote_path": path,
+           "changed": changed, "restart_hint": hint}
+    if deleted:
+        out["deleted"] = True
+    return out
 
 
 def _disconnect_qwen(entry):
@@ -1773,14 +1817,28 @@ def _disconnect_qwen(entry):
     if _restore_backup(path):
         return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
     changed = False
+    deleted = False
     if os.path.isfile(path) and _file_points_at_hub(path):
         text, removed = _remove_dotenv_keys(
             path, ["OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"])
         if text is not None and removed:
-            _cli_write_text(path, text)
+            # No backup existed -> Auto-fix CREATED this .env. If removing our 4 keys
+            # leaves it empty, delete it for a clean revert rather than leaving an
+            # empty file lying around.
+            if text.strip() == "":
+                try:
+                    os.remove(path)
+                    deleted = True
+                except OSError:
+                    _cli_write_text(path, text)
+            else:
+                _cli_write_text(path, text)
             changed = True
-    return {"restored_from_backup": False, "wrote_path": path,
-            "changed": changed, "restart_hint": hint}
+    out = {"restored_from_backup": False, "wrote_path": path,
+           "changed": changed, "restart_hint": hint}
+    if deleted:
+        out["deleted"] = True
+    return out
 
 
 def _remove_toml_table(text, table_name):
@@ -1843,12 +1901,80 @@ def _disconnect_codex(entry):
             "changed": changed, "restart_hint": hint}
 
 
+_LLM_ITEM_RE = re.compile(r"^\s*-\s+\S")
+_LLM_FREEHUB_RE = re.compile(r"^\s*-?\s*model_id\s*:\s*[\"']?freehub[\"']?\s*$")
+
+
+def _remove_llm_freehub_entry(text):
+    """Strip the `model_id: freehub` block item from an llm extra-openai-models.yaml
+    (a YAML block *list* of model dicts), preserving every other item plus any
+    leading comments/preamble. Line-based (no PyYAML dependency): split the file
+    into list items on `- ` header lines, drop the item whose block declares
+    `model_id: freehub`, keep the rest. Returns (new_text, removed_bool)."""
+    lines = text.splitlines()
+    preamble, items, cur = [], [], None
+    for ln in lines:
+        if _LLM_ITEM_RE.match(ln):
+            if cur is not None:
+                items.append(cur)
+            cur = [ln]
+        elif cur is None:
+            preamble.append(ln)
+        else:
+            cur.append(ln)
+    if cur is not None:
+        items.append(cur)
+    kept, removed = [], False
+    for block in items:
+        if any(_LLM_FREEHUB_RE.match(l) for l in block):
+            removed = True
+            continue
+        kept.append(block)
+    if not removed:
+        return text, False
+    out_lines = list(preamble)
+    for block in kept:
+        out_lines.extend(block)
+    new_text = "\n".join(out_lines).rstrip("\n")
+    # Nothing but our entry existed -> leave a valid (empty) YAML file.
+    return (new_text + "\n" if new_text.strip() else ""), True
+
+
+def _disconnect_llm(entry):
+    """Revert Simon Willison's `llm`: remove the `model_id: freehub` entry from
+    extra-openai-models.yaml (its REAL connection surface — `llm` never used env
+    vars here), preserving every other registered model. The saved key lives in
+    llm's own encrypted keys store, which we never touch — the restart hint tells
+    the user to run `llm keys remove freehub` to drop it. Never raises for
+    expected IO."""
+    path = (entry.get("config_paths") or [None])[0] \
+        or os.path.join(_llm_user_dir(), "extra-openai-models.yaml")
+    hint = ("Removed the freehub model from extra-openai-models.yaml. Also run  "
+            "llm keys remove freehub  to delete the stored key, then re-run llm.")
+    changed = False
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except OSError:
+            text = None
+        if text is not None:
+            new_text, removed = _remove_llm_freehub_entry(text)
+            if removed:
+                _cli_write_text(path, new_text)
+                changed = True
+    return {"restored_from_backup": False, "wrote_path": path,
+            "changed": changed, "restart_hint": hint,
+            "note": "Also run  llm keys remove freehub  to remove the saved key."}
+
+
 _DISCONNECTERS = {
     "claude": _disconnect_claude,
     "aider": _disconnect_aider,
     "opencode": _disconnect_opencode,
     "qwen": _disconnect_qwen,
     "codex": _disconnect_codex,
+    "llm": _disconnect_llm,   # id-keyed: `llm` has no autofix strategy string
 }
 
 
@@ -1945,8 +2071,16 @@ def api_cli_autofix(cid):
     base_v1 = base_root + "/v1"
     strategy = entry.get("autofix")
     if not strategy:
-        # env-only / TOML / uncertain: never touch a global shell profile —
-        # hand back copy-paste commands + a CLI-specific note instead.
+        # No autofix strategy. For CLIs that AREN'T wired via env vars (gemini is
+        # protocol-incompatible; llm uses extra-openai-models.yaml + `llm keys`),
+        # handing back OPENAI_* commands is misleading -> return the note only.
+        if entry["id"] in _ENVLESS_CLIS:
+            return jsonify({
+                "ok": False, "manual": True,
+                "note": entry.get("manual_note", "See this CLI's setup details."),
+            })
+        # env-based but uncertain (e.g. cursor-agent): never touch a global shell
+        # profile — hand back copy-paste commands + a CLI-specific note instead.
         model = _first_free_model_id() or _suggested_model()
         env = _manual_env(entry, key, base_root, base_v1, model)
         return jsonify({
@@ -1977,10 +2111,21 @@ def api_cli_disconnect(cid):
     if not entry:
         return jsonify({"error": "unknown CLI '%s'" % cid}), 404
     strategy = entry.get("autofix")
-    reverter = _DISCONNECTERS.get(strategy) if strategy else None
+    # Reverters are resolved by autofix strategy first, then by CLI id — so a CLI
+    # with no autofix strategy but a real config surface (e.g. `llm`'s YAML) can
+    # still register a disconnecter under its id.
+    reverter = (_DISCONNECTERS.get(strategy) if strategy else None) \
+        or _DISCONNECTERS.get(entry["id"])
     if not reverter:
-        # Manual-only (TOML / protocol-incompatible / uncertain): we never wrote
-        # this CLI's config, so we can't safely revert it — guide the user.
+        # Manual-only (protocol-incompatible / uncertain): we never wrote this
+        # CLI's config, so we can't safely revert it — guide the user.
+        if entry["id"] in _ENVLESS_CLIS:
+            # Never wired via OPENAI_*/ANTHROPIC_* env vars -> no bogus unset block.
+            return jsonify({
+                "ok": False, "manual": True,
+                "note": (entry.get("manual_note")
+                         or "This CLI isn't wired through environment variables; nothing to unset."),
+            })
         return jsonify({
             "ok": False, "manual": True,
             "note": ("This CLI was configured manually; remove the hub env vars/config "
@@ -2014,22 +2159,36 @@ def api_cli_instructions(cid):
     model = _first_free_model_id() or _suggested_model()
     base_root = "http://127.0.0.1:%d" % PORT
     base_v1 = base_root + "/v1"
-    env = _manual_env(entry, key, base_root, base_v1, model)
     snippets = _connect_snippets()
+    # Some CLIs are NOT wired via OPENAI_*/ANTHROPIC_* env vars (codex -> config.toml,
+    # gemini -> incompatible, llm -> extra-openai-models.yaml). For those, an env
+    # block / OpenAI snippet is misleading — show the note + config path only.
+    env_based = entry["id"] not in _ENVLESS_CLIS
     steps = []
     if entry.get("autofix"):
         steps.append("Auto-fix (recommended): POST /api/clis/%s/autofix to write %s for you "
                      "(a .freehub-bak backup is made first)." % (entry["id"], _short(entry.get("write_path", "the CLI config"))))
-    steps.append("Manual: set the environment variables in `env` below, then restart the CLI.")
+    if env_based:
+        steps.append("Manual: set the environment variables in `env` below, then restart the CLI.")
+    else:
+        steps.append("Manual: follow the note below — this CLI is not wired through "
+                     "OPENAI_*/ANTHROPIC_* environment variables.")
     if entry.get("manual_note"):
         steps.append(entry["manual_note"])
     steps.append("Verify: run `%s` and confirm it answers via this hub using %s." % (entry["bins"][0], model))
-    return jsonify({
+    # Env block is resolved with the SAME model id the auto-fixers write, and the
+    # cross-platform commands (setx AND export) are emitted here too so a Windows
+    # user on the manual path isn't handed a unix-only `export`.
+    env = _manual_env(entry, key, base_root, base_v1, model) if env_based else {}
+    out = {
         "steps": steps,
         "env": env,
-        "snippet_openai": snippets["openai"],
-        "snippet_anthropic": snippets["claude_code"],
-    })
+        "snippet_openai": snippets["openai"] if env_based else None,
+        "snippet_anthropic": snippets["claude_code"] if env_based else None,
+    }
+    if env_based:
+        out["commands"] = _env_commands(env)
+    return jsonify(out)
 
 
 # ---------------------------------------------------------------------------
@@ -2067,11 +2226,13 @@ def v1_chat_completions():
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return _openai_error("Invalid JSON body.", 400)
-    # Orchestrate (Auto): route by task difficulty so weak models take easy work
-    # and quota on strong models is preserved. Explicit '<pid>/<model>' bypasses.
+    # Orchestrate (Auto): route by task difficulty AND request size so weak/small
+    # providers take easy work and big requests avoid small-TPM providers (413).
+    # Explicit '<pid>/<model>' bypasses model choice (chain still size-filters).
+    est = _est_tokens(body.get("messages"), body.get("tools"))
     if _is_orchestrate(body.get("model")):
         pid, resolved, _diff = _route_by_difficulty(body.get("messages"),
-                                                     body.get("max_tokens"))
+                                                     body.get("max_tokens"), est)
         if pid is None:
             pid, resolved = _resolve_model(body.get("model"))  # default/best or error
     else:
@@ -2088,7 +2249,7 @@ def v1_chat_completions():
     stream = bool(body.get("stream"))
     errors = []
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
-    for hop_pid, hop_model in _build_chain(pid, resolved):
+    for hop_pid, hop_model in _build_chain(pid, resolved, est):
         if not prov.is_model_allowed(hop_model):
             continue
         payload = dict(body)
@@ -2454,10 +2615,15 @@ def v1_responses():
     if not messages:
         return _openai_error("No input to send.", 400)
 
+    # Tools + size estimate up front (Codex sends huge tool schemas — they must
+    # count toward routing so a big request doesn't land on a small-TPM provider).
+    tools = _responses_tools_to_chat(body.get("tools"))
+    est = _est_tokens(messages, tools)
+
     # Same routing as /v1/chat/completions: Auto/empty/claude-* -> difficulty
-    # route across available providers; explicit '<pid>/<model>' bypasses.
+    # route across available, SIZE-CAPABLE providers; explicit '<pid>/<model>' bypasses.
     if _is_orchestrate(body.get("model")):
-        pid, resolved, _diff = _route_by_difficulty(messages, body.get("max_output_tokens"))
+        pid, resolved, _diff = _route_by_difficulty(messages, body.get("max_output_tokens"), est)
         if pid is None:
             pid, resolved = _resolve_model(body.get("model"))
     else:
@@ -2481,7 +2647,6 @@ def v1_responses():
         base_payload["temperature"] = body["temperature"]
     if body.get("top_p") is not None:
         base_payload["top_p"] = body["top_p"]
-    tools = _responses_tools_to_chat(body.get("tools"))
     if tools:
         base_payload["tools"] = tools
         if body.get("tool_choice") is not None:
@@ -2490,7 +2655,7 @@ def v1_responses():
     stream = bool(body.get("stream"))
     errors = []
     last_hard = None  # last hard (non-retryable) upstream error, relayed if chain is exhausted
-    for hop_pid, hop_model in _build_chain(pid, resolved):
+    for hop_pid, hop_model in _build_chain(pid, resolved, est):
         if not prov.is_model_allowed(hop_model):
             continue
         payload = dict(base_payload)
@@ -2801,11 +2966,17 @@ def v1_messages():
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return _anthropic_error("invalid_request_error", "Invalid JSON body.", 400)
-    # Claude Code sends model 'claude-*' -> orchestrate: difficulty-route so easy
-    # turns run on cheap models and hard ones get the strongest available.
+    # Claude Code sends model 'claude-*' + a big system/tools payload -> orchestrate
+    # by difficulty AND request size (skip small-TPM providers for large requests).
+    est = _estimate_input_tokens(body)
+    try:
+        if body.get("tools"):
+            est += len(json.dumps(body.get("tools"))) // 4
+    except Exception:
+        pass
     if _is_orchestrate(body.get("model")):
         pid, resolved, _diff = _route_by_difficulty(body.get("messages"),
-                                                     body.get("max_tokens"))
+                                                     body.get("max_tokens"), est)
         if pid is None:
             pid, resolved = _resolve_model(body.get("model"))
     else:
@@ -2852,7 +3023,7 @@ def v1_messages():
 
     errors = []
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
-    for hop_pid, hop_model in _build_chain(pid, resolved):
+    for hop_pid, hop_model in _build_chain(pid, resolved, est):
         if not prov.is_model_allowed(hop_model):
             continue
         payload = dict(base_payload)
