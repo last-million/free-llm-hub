@@ -146,14 +146,42 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://router.bynara.id/v1/models",
         "signup_url": "https://router.bynara.id/register",
         "key_hint": "sk-nry-...",
-        # 'all' is safe HERE specifically because NaraRouter sells SUBSCRIPTIONS
-        # (fixed IDR/day plans), not pay-per-token: with no plan, a model outside
-        # your tier ERRORS, it cannot bill you. So the usual "a paid model leaks
-        # and silently charges" risk - the one that produced 13 bad rows here -
-        # does not exist. Out-of-tier ids just fail once and the dead-model
-        # tracker sidelines them.
-        "free_filter": "all",
-        "default_free_models": [],   # real ids unknown until a key enables live discovery
+        # DO NOT restore free_filter 'all' here. It was set on the theory that
+        # NaraRouter sells fixed-price SUBSCRIPTIONS, so an out-of-tier model
+        # would error rather than bill. Probing all 35 ids with a real key on
+        # 2026-07-15 disproved that outright - it is PAY-PER-TOKEN off a credit
+        # balance, and says so itself:
+        #   402 "Insufficient credits: your balance is 0.000000000 but this
+        #        request needs about 0.189000000. Top up to continue"
+        # So this provider DOES sell models, which is exactly the case the
+        # header rule forbids 'all' for. Only 4/35 ids answered on the free
+        # tier; the other 31 (claude-opus-4.8, claude-sonnet-5, gpt-5.5/5.6-*,
+        # gemini-3.5-flash, grok-4.5, deepseek-v4-*, qwen3.7-max ...) all
+        # demanded a top-up. With a 0 balance they merely refuse - but the day
+        # a balance exists, 'all' would spend it on Opus. Hence exact pins.
+        #
+        # free_exact: substring matching cannot express this catalog safely -
+        # 'mistral-large' is free while 'minimax-m3' is not, and note that
+        # 'glm-5.2-free' is NOT free despite the name (429, top-up required).
+        # Never infer free-ness from an id here; re-probe with a key instead.
+        "free_filter": "family",
+        "free_exact": True,
+        "free_families": [
+            "agnes-2.0-flash",      # verified 200, 7.5s
+            "mistral-large",        # verified 200, 2.1s
+            "mistral-medium-3-5",   # verified 200, 1.8s
+            "tencent-hy3",          # verified 200, 4.5s
+        ],
+        # Same 4 ids: this list is served WITHOUT a free-ness re-check when live
+        # discovery fails, so it must never contain an unverified id.
+        # kimi-k2.7-code-free is advertised free but hung >90s on every probe -
+        # left out until it actually answers.
+        "default_free_models": [
+            "agnes-2.0-flash",
+            "mistral-large",
+            "mistral-medium-3-5",
+            "tencent-hy3",
+        ],
         "notes": ("SETUP - the key does NOT work until you do these 2 steps (verified live 2026-07-15). "
                   "STEP 1: link your Telegram account at router.bynara.id/settings. "
                   "STEP 2: follow/join their Telegram channel. "
@@ -164,13 +192,19 @@ PROVIDERS: Dict[str, dict] = {
                   "nothing else in the hub breaks). "
                   "That gate is also why this is a bonus tier, never a dependency: leave the "
                   "channel and your key can die. "
-                  "Free plan: 6M tokens/DAY (resets 07:00 WIB) + 10 req/min, ~5 models "
-                  "(Agnes 2.0 Flash, Kimi K2.7 Code Free, Mistral Large +2). Free forever, "
+                  "Free plan: 6M tokens/DAY (resets 07:00 WIB) + 10 req/min. Free forever, "
                   "no credit card, OpenAI AND Anthropic compatible. "
-                  "NOTE the viral '7M tokens/day, 30+ models free' claim is marketing - the "
-                  "pricing page says 6M/day and ~5 models on Free. "
-                  "NO SILENT-BILL RISK: plans are fixed-price subscriptions, so without a "
-                  "paid plan an out-of-tier model errors rather than charging you. "
+                  "FREE MODELS (probed with a real key 2026-07-15, only 4 of the 35 listed "
+                  "actually answer): agnes-2.0-flash, mistral-large, mistral-medium-3-5, "
+                  "tencent-hy3. The catalog also LISTS claude-opus-4.8, claude-sonnet-5, "
+                  "gpt-5.5/5.6, gemini-3.5-flash, grok-4.5 etc - those are PAID and refuse "
+                  "with 402/429 'insufficient credits' until you top up. Even 'glm-5.2-free' "
+                  "is paid despite its name. The hub only routes the 4 verified ids. "
+                  "NOTE the viral '7M tokens/day, 30+ models free' claim is marketing - and "
+                  "even the '~5 free models' on the pricing page measured as 4. "
+                  "BILLING: this is pay-per-token off a credit balance (NOT a flat "
+                  "subscription). At balance 0 paid ids simply refuse, so nothing can be "
+                  "charged silently - but if you ever top up, only the 4 pinned ids stay free. "
                   "⚠ TRUST: this is a reseller, not an inference provider - it lists "
                   "'Claude Fams' family-plan access and 8 'Out of stock' tiers (an API does "
                   "not run out of stock unless it pools accounts), uses rebranded ids "
