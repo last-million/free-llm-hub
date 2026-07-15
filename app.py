@@ -271,12 +271,21 @@ def _benchmark_score(pid, model_id):
     return score
 
 
-def _best_free_pair():
+def _best_free_pair(working_only=True):
     """Scan every AVAILABLE (enabled+keyed+quota-left) provider's free models and
-    return the single highest-benchmark (pid, model) pair, or (None, None)."""
+    return the single highest-benchmark (pid, model) pair, or (None, None).
+
+    `working_only` (default) skips models we KNOW are unusable — blocked by the
+    safety filter, or sidelined by the dead-model tracker after a real 403/404.
+    That check is why this exists: without it the picker happily returned
+    github-models/llama-4-maverick as "best", an id that 403s on EVERY call
+    (the token lacks the models:read scope), and it got saved as the default.
+    "Best" must mean best AMONG MODELS THAT ANSWER."""
     best, best_pid, best_score = None, None, -1.0
     for pid in _available_providers():
         for m in provider_free_models(pid):
+            if working_only and (not prov.is_model_allowed(m) or _is_model_dead(pid, m)):
+                continue
             s = _benchmark_score(pid, m)
             if s > best_score:
                 best, best_pid, best_score = m, pid, s
@@ -1119,6 +1128,93 @@ def api_test_provider(pid):
 @app.route("/api/models", methods=["GET"])
 def api_models():
     return jsonify(aggregated_models())
+
+
+def _ranked_free_pairs(limit=6):
+    """[(score, pid, model)] best-first across available providers, skipping
+    safety-blocked and known-dead ids."""
+    cands = []
+    for pid in _available_providers():
+        for m in provider_free_models(pid):
+            if not prov.is_model_allowed(m) or _is_model_dead(pid, m):
+                continue
+            cands.append((_benchmark_score(pid, m), pid, m))
+    cands.sort(key=lambda t: t[0], reverse=True)
+    return cands[:limit]
+
+
+def _probe_pair(pid, model, timeout_s=25):
+    """Send ONE tiny real request to (pid, model). Returns (ok, detail).
+    Marks the model dead on a 403/404 so the rest of the hub routes around it."""
+    payload = {"model": model, "max_tokens": 4, "stream": False,
+               "messages": [{"role": "user", "content": "hi"}]}
+    try:
+        r = _upstream_chat(pid, payload, False)
+    except Exception as exc:
+        return False, "%s: %s" % (exc.__class__.__name__, _sanitize(str(exc))[:60])
+    try:
+        if r.status_code == 200:
+            return True, "answered"
+        # _upstream_chat already marks 403/404 dead on the last key
+        try:
+            b = r.json()
+            e = b.get("error")
+            msg = e.get("message") if isinstance(e, dict) else str(e)
+        except Exception:
+            msg = (r.text or "")[:60]
+        return False, "HTTP %d: %s" % (r.status_code, _sanitize(str(msg))[:60])
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+
+
+@app.route("/api/default/auto", methods=["POST"])
+def api_default_auto():
+    """Auto-pick the best ORCHESTRATOR from models that ACTUALLY WORK, then save it.
+
+    This PROBES before committing, on purpose. Ranking alone is not enough: the
+    picker's honest favourite here is github-models/llama-4-maverick, which 403s
+    on EVERY call (the user's token lacks the models:read scope) — and it really
+    did get saved as the default that way. The dead-model tracker only learns
+    after a live failure and is in-memory, so a fresh process would re-pick the
+    same broken id. So: walk the ranked list, send ONE 4-token probe per
+    candidate, save the first that answers (each failure marks itself dead via
+    _upstream_chat, so the whole hub routes around it afterwards).
+
+    Costs at most a few tiny requests, only when the user explicitly asks."""
+    ranked = _ranked_free_pairs()
+    if not ranked:
+        return jsonify({
+            "ok": False,
+            "reason": ("No working free model available. Add a provider key, or "
+                       "everything keyed is exhausted/sidelined (see the quota "
+                       "panel and /api/dead-models)."),
+        }), 409
+    tried = []
+    for _score, pid, model in ranked:
+        ok, detail = _probe_pair(pid, model)
+        tried.append({"model": "%s/%s" % (pid, model), "ok": ok, "detail": detail})
+        if ok:
+            config.set_default(pid, model)
+            return jsonify({
+                "ok": True,
+                "provider": pid, "model": model, "label": "%s/%s" % (pid, model),
+                "score": round(_benchmark_score(pid, model), 1),
+                "fast": _is_fast(pid, model),
+                "tried": tried,
+                "note": ("Verified live: this is the highest-benchmark model that "
+                         "actually answered. Rejected candidates were marked dead "
+                         "so routing avoids them too."),
+            })
+    return jsonify({
+        "ok": False,
+        "tried": tried,
+        "reason": ("Every top candidate failed a live probe — none of them answer "
+                   "right now. See 'tried' for why (e.g. 403 = the provider's key "
+                   "lacks permission)."),
+    }), 409
 
 
 @app.route("/api/default", methods=["GET", "POST"])
