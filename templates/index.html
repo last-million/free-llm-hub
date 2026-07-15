@@ -375,6 +375,15 @@
   .cli-card-detail{font-size:12px;color:var(--text-faint);line-height:1.5;overflow-wrap:anywhere}
   .cli-card-foot{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .cli-card-foot .btn{min-width:120px}
+  .cli-card-foot .act-test{min-width:88px}
+  .cli-test-result{
+    width:100%;font-size:12px;line-height:1.5;border-radius:var(--radius-sm);
+    padding:8px 11px;display:none;align-items:flex-start;gap:7px;overflow-wrap:anywhere;
+  }
+  .cli-test-result.ok,.cli-test-result.err{display:flex}
+  .cli-test-result .tr-i{flex:none;font-weight:700;line-height:1.45}
+  .cli-test-result.ok{background:var(--accent-soft);color:#86efac;border:1px solid rgba(34,197,94,.25)}
+  .cli-test-result.err{background:var(--danger-soft);color:#fca5a5;border:1px solid rgba(239,68,68,.25)}
   .cli-setup{font-size:12.5px;width:100%;margin-top:auto}
   .cli-setup summary{color:var(--text-faint);cursor:pointer;user-select:none;list-style:none;display:inline-flex;align-items:center;gap:5px;padding:2px 0}
   .cli-setup summary::-webkit-details-marker{display:none}
@@ -1581,7 +1590,9 @@
       (c.detail ? '<div class="cli-card-detail">' + esc(c.detail) + '</div>' : '') +
       '<div class="cli-card-foot">' +
         '<button type="button" class="' + btnClass + '">' + btnLabel + '</button>' +
+        '<button type="button" class="btn sm ghost act-test" title="Send a live 1-token request through the hub to verify it works">Test</button>' +
       '</div>' +
+      '<div class="cli-test-result" role="status" aria-live="polite"></div>' +
       '<details class="cli-setup">' +
         '<summary>' + CHEV_SVG + 'Setup details</summary>' +
         '<div class="cli-setup-body"><div class="cli-setup-note">Loading setup details&hellip;</div></div>' +
@@ -1657,6 +1668,8 @@
       if (c.connected) doDisconnect(c, connBtn);
       else doConnect(c, connBtn);
     });
+    var testBtn = card.querySelector('.act-test');
+    if (testBtn) testBtn.addEventListener('click', function(){ doTest(c, testBtn, card); });
     var setup = card.querySelector('.cli-setup');
     if (setup){
       var loaded = false;
@@ -1718,6 +1731,45 @@
       toast('Disconnect failed: ' + e.message, true);
       resetBtn(btn, 'Disconnect');
     });
+  }
+
+  /* Test = live end-to-end probe. POST /api/clis/<id>/test makes a real 1-token
+     model call, so it can be slow — abort after ~40s. Renders the result inline on
+     the card (green ✔ / red ✗ + the human `detail` sentence) and toasts a short
+     version. The button (not the card) is rebuilt, so we reset it ourselves. */
+  function doTest(c, btn, card){
+    var out = card ? card.querySelector('.cli-test-result') : null;
+    if (out){ out.className = 'cli-test-result'; out.innerHTML = ''; }   /* clear previous result */
+    busyBtn(btn, 'Testing…');
+    var controller = new AbortController();
+    var timer = setTimeout(function(){ controller.abort(); }, 40000);
+    api('/api/clis/' + encodeURIComponent(c.id) + '/test', { method: 'POST', signal: controller.signal })
+      .then(function(r){
+        r = r || {};
+        var ok = !!r.ok;
+        var detail = r.detail || (ok ? 'Connected to the hub and it answered.' : 'Test failed.');
+        if (out){
+          out.className = 'cli-test-result ' + (ok ? 'ok' : 'err');
+          out.innerHTML = '<span class="tr-i" aria-hidden="true">' + (ok ? '&check;' : '&cross;') + '</span>' +
+                          '<span>' + esc(detail) + '</span>';
+        }
+        var shortD = detail.length > 90 ? detail.slice(0, 88) + '…' : detail;
+        toast((c.name || c.id) + (ok ? ' ✔ ' : ' ✗ ') + shortD, !ok);
+      })
+      .catch(function(e){
+        var msg = (e && e.name === 'AbortError')
+          ? 'Test timed out — no response in 40s.'
+          : ((e && e.message) || 'Test failed');
+        if (out){
+          out.className = 'cli-test-result err';
+          out.innerHTML = '<span class="tr-i" aria-hidden="true">&cross;</span><span>' + esc(msg) + '</span>';
+        }
+        toast((c.name || c.id) + ' ✗ ' + msg, true);
+      })
+      .then(function(){
+        clearTimeout(timer);
+        resetBtn(btn, 'Test');
+      });
   }
 
   /* ---------- live activity feed ---------- */
