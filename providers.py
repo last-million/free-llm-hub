@@ -145,7 +145,7 @@ PROVIDERS: Dict[str, dict] = {
         "base_url": "https://router.bynara.id/v1",
         "models_url": "https://router.bynara.id/v1/models",
         "signup_url": "https://router.bynara.id/register",
-        "key_hint": "sk-nara-...",
+        "key_hint": "sk-nry-...",
         # 'all' is safe HERE specifically because NaraRouter sells SUBSCRIPTIONS
         # (fixed IDR/day plans), not pay-per-token: with no plan, a model outside
         # your tier ERRORS, it cannot bill you. So the usual "a paid model leaks
@@ -154,7 +154,17 @@ PROVIDERS: Dict[str, dict] = {
         # tracker sidelines them.
         "free_filter": "all",
         "default_free_models": [],   # real ids unknown until a key enables live discovery
-        "notes": ("Free plan: 6M tokens/DAY (resets 07:00 WIB) + 10 req/min, ~5 models "
+        "notes": ("SETUP - the key does NOT work until you do these 2 steps (verified live 2026-07-15). "
+                  "STEP 1: link your Telegram account at router.bynara.id/settings. "
+                  "STEP 2: follow/join their Telegram channel. "
+                  "Then the API key starts working - order matters, and a key you minted before "
+                  "finishing both stays blocked until you relink. Until then EVERY endpoint "
+                  "(/v1/models, /v1/chat/completions, /v1/usage, /v1/me) returns "
+                  "403 'telegram_required' and this provider just stays unused (fail-safe, "
+                  "nothing else in the hub breaks). "
+                  "That gate is also why this is a bonus tier, never a dependency: leave the "
+                  "channel and your key can die. "
+                  "Free plan: 6M tokens/DAY (resets 07:00 WIB) + 10 req/min, ~5 models "
                   "(Agnes 2.0 Flash, Kimi K2.7 Code Free, Mistral Large +2). Free forever, "
                   "no credit card, OpenAI AND Anthropic compatible. "
                   "NOTE the viral '7M tokens/day, 30+ models free' claim is marketing - the "
