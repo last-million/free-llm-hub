@@ -782,27 +782,12 @@
     </div>
   </section>
 
-  <!-- Advanced / auto-update (C) -->
-  <section class="section" aria-labelledby="h-advanced">
-    <div class="section-h">
-      <h2 id="h-advanced"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-advanced">
-        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
-        Advanced
-      </button></h2>
-      <span class="sub">keep the hub up to date from git automatically</span>
-    </div>
-    <div class="section-body" id="sec-advanced" hidden>
-    <div class="au-row" id="au-row">
-      <label class="switch">
-        <input type="checkbox" id="au-toggle">
-        <span class="track" aria-hidden="true"></span>
-        <span class="lbl">Auto-update (git pull every 5h)</span>
-      </label>
-      <button class="btn sm ghost" id="au-check" type="button">Check now</button>
-      <span id="au-status" class="au-status" aria-live="polite"></span>
-    </div>
-    </div>
-  </section>
+  <!-- Auto-update is ALWAYS ON and deliberately has NO UI: the hub git-pulls
+       every 5h and restarts only when new commits actually arrived. It skips a
+       dirty tree, no-ops outside a git checkout, and never touches
+       ~/.free-llm-hub (your keys/config live outside the repo) — so there is
+       nothing to configure and nothing to opt out of. State is still readable at
+       GET /api/auto-update for diagnostics. -->
 
   <p class="confignote">
     Keys are stored locally only, in <code id="cfg-path">~/.free-llm-hub/config.json</code> &mdash; nothing ever leaves this machine except your direct calls to the providers you enable.
@@ -1991,6 +1976,26 @@
         toast(r.reason || 'Disconnect unavailable', true);
         resetBtn(btn, 'Disconnect');
         return;
+      }
+      /* The backend re-checks reality after reverting: `still_connected` means the
+         config revert worked but something else — usually a hub-pointing env var,
+         which overrides the config file — still wires the CLI to the hub. Warn
+         instead of claiming a clean success (the old lie behind "I clicked
+         Disconnect, it said done, but the CLI is still connected"). The card will
+         keep showing "Connected" after loadClis(); that is now truthful. */
+      if (r.still_connected){
+        var via = r.still_connected_via || 'an env var';
+        var warnHtml = r.note
+          ? esc(r.note)
+          : ('Config was reverted, but ' + safe + ' is still pointed at the hub via ' + esc(via) + '.');
+        toast(via === 'env'
+          ? 'Disconnected in config — but an env var still points ' + name + ' at the hub'
+          : name + ' disconnected in config — but it still reports as connected', true);
+        return loadClis().then(function(){
+          var wlines = [ { cls:'chat-note show', html: '⚠️ ' + warnHtml } ];
+          if (r.restart_hint) wlines.push({ cls:'cli-setup-note', html: esc(r.restart_hint) });
+          openRestartModal('⚠️ ' + name + ' — still connected', wlines, r.commands || null);
+        });
       }
       /* success (r.ok truthy, or not an error) */
       var msg = name + ' disconnected';
