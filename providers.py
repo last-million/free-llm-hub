@@ -140,6 +140,62 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": [],
         "notes": "No free models — all 8 models bill per token. The '200 req free every month' headline actually meters TOKENS ($2.50 / 250K credits per month): a coding CLI's 20-50K-token turns make the real allowance ~5-12 requests/month.",
     },
+    "pollinations": {
+        "name": "Pollinations.AI",
+        "base_url": "https://text.pollinations.ai/openai",
+        "models_url": "https://text.pollinations.ai/models",
+        "signup_url": "https://enter.pollinations.ai",
+        "key_hint": "(no key needed)",
+        "no_key": True,   # anonymous tier: no signup, no API key, no card
+        # 'family' pinned to the one verified anonymous-tier model, NOT 'all':
+        # Pollinations DOES run a large paid catalog, and pinning keeps this row
+        # safe even if the legacy endpoint later gains paid entries.
+        "free_filter": "family",
+        "free_families": ["openai-fast"],
+        "default_free_models": ["openai-fast"],
+        "notes": ("Anonymous tier: NO key, NO signup, NO card. LIVE-VERIFIED — POST "
+                  "text.pollinations.ai/openai/chat/completions returns 200 with "
+                  "user_tier:anonymous, served by openai-fast (GPT-OSS 20B). Leak test "
+                  "PASSED: claude/gpt-5/grok all 404 here, so a paid model is structurally "
+                  "unreachable and a surprise bill is impossible. Documented rate is 1 req "
+                  "per 15s (a burst test saw no 429, but the published figure is used). "
+                  "DO NOT switch to gen.pollinations.ai/v1 — that catalog is 186 models "
+                  "ALL priced in consumable 'pollen' with 402 PAYMENT_REQUIRED: exactly the "
+                  "free-until-the-credits-burn pattern that produced 13 bad providers here. "
+                  "GOTCHA: it 403s python-urllib's default User-Agent — the hub uses "
+                  "`requests`, which gets a clean 200, so this only bites hand-rolled tests."),
+    },
+    "cloudflare": {
+        "name": "Cloudflare Workers AI",
+        # ACCOUNT-SCOPED: this template is documentation, not a usable URL. The
+        # user MUST paste their resolved base into the card's "Advanced: custom
+        # base URL" field (base_url_for honors it). Until they do, calls fail.
+        "base_url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+        # Cloudflare's model list is NOT OpenAI-shaped (returns a CF envelope, and
+        # the OpenAI-compat base exposes no /v1/models at all), so live discovery
+        # cannot parse it and falls back to default_free_models below. That is fine.
+        "models_url": None,
+        "signup_url": "https://dash.cloudflare.com/sign-up",
+        "key_hint": "Cloudflare API token (Workers AI scope)",
+        "free_filter": "family",
+        "free_families": ["@cf/meta", "@cf/openai"],
+        "default_free_models": [
+            "@cf/meta/llama-3.1-8b-instruct",
+            "@cf/openai/gpt-oss-120b",
+            "@cf/meta/llama-4-scout-17b-16e-instruct",
+        ],
+        "notes": ("SAFE-FREE: 10,000 Neurons/day, reset 00:00 UTC. On the Workers FREE plan "
+                  "the allocation is a HARD CAP — exceeding it fails with an error, it does "
+                  "NOT bill (Workers Paid bills $0.011/1k Neurons past it). Free plan is the "
+                  "default, no card for the first call. "
+                  "⚠ SETUP: the base URL is account-scoped — paste "
+                  "https://api.cloudflare.com/client/v4/accounts/<YOUR_ACCOUNT_ID>/ai/v1 into "
+                  "'Advanced: custom base URL' on this card, or nothing will work. "
+                  "Quota is denominated in NEURONS (varies per model), not requests, so the "
+                  "hub tracks it as UNKNOWN rather than inventing a request count. Model ids "
+                  "verified from individual model pages (the index renders bare slugs without "
+                  "the @cf/ prefix and is NOT a safe source)."),
+    },
     "agentrouter": {
         "name": "AgentRouter",
         "base_url": "https://agentrouter.org/v1",
@@ -883,6 +939,20 @@ def signup_url(provider_id: str) -> Optional[str]:
 
 
 def base_url_for(provider_id: str, custom_base: Optional[str] = None) -> Optional[str]:
+    """Resolve a provider's base URL. A user-set `custom_base` ALWAYS wins.
+
+    It used to be honored ONLY for pid=="custom"/unknown ids, which made the
+    dashboard's per-provider "Advanced: custom base URL" field a no-op for all
+    ~53 known providers: config.py stores it, the API saves it, _upstream_chat
+    passes it in — and this function dropped it on the floor. An explicit
+    override the user typed must take effect.
+
+    It also makes account-scoped providers expressible: Cloudflare Workers AI's
+    base is `.../accounts/{account_id}/ai/v1`, so the registry row can only carry
+    a template and the user pastes their resolved URL here.
+    """
+    if isinstance(custom_base, str) and custom_base.strip():
+        return custom_base.strip()
     if provider_id == "custom" or (provider_id not in PROVIDERS):
         return custom_base
     return PROVIDERS[provider_id].get("base_url")
