@@ -44,6 +44,7 @@ FREE_LIMITS = {
     "sambanova":     {"limit": 20,    "window": "day"},     # medium: official Free Tier table = 20 RPM / 20 RPD / 200k TPD (was 300/day = 15x too high)
     "modelscope":    {"limit": 2000,  "window": "day"},     # high: 2,000 calls/day per account, sub-cap 500/model/day (was absent -> self-throttled at 10% of real capacity)
     "siliconflow":   {"limit": 100,   "window": "day"},     # medium: cap for accounts without Chinese real-name verification (实名认证), which most hub users cannot complete
+    "nararouter":    {"limit": 10,    "window": "minute"},  # high: Free plan = 10 req/min (its own pricing page). The real budget is 6M TOKENS/day (resets 07:00 WIB) which a request counter can't express, so we track the documented REQUEST rate — the limit a caller actually trips first.
     "google":        {"limit": 200,   "window": "day"},     # UNVERIFIED (low): Google no longer publishes a free-tier RPD table; best third-party figure is ~250/day for 2.5-flash and sources conflict. 200 kept as the conservative legacy value.
     "mistral":       {"limit": 500,   "window": "day"},     # UNVERIFIED (low): Mistral deliberately publishes NO free-tier figure (per-org, Admin Console only). Real shape is req/SEC + tok/min + tok/month — there is no documented req/day cap. Legacy number; do not cite it as fact.
 

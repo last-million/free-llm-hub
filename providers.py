@@ -140,6 +140,35 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": [],
         "notes": "No free models — all 8 models bill per token. The '200 req free every month' headline actually meters TOKENS ($2.50 / 250K credits per month): a coding CLI's 20-50K-token turns make the real allowance ~5-12 requests/month.",
     },
+    "nararouter": {
+        "name": "NaraRouter",
+        "base_url": "https://router.bynara.id/v1",
+        "models_url": "https://router.bynara.id/v1/models",
+        "signup_url": "https://router.bynara.id/register",
+        "key_hint": "sk-nara-...",
+        # 'all' is safe HERE specifically because NaraRouter sells SUBSCRIPTIONS
+        # (fixed IDR/day plans), not pay-per-token: with no plan, a model outside
+        # your tier ERRORS, it cannot bill you. So the usual "a paid model leaks
+        # and silently charges" risk - the one that produced 13 bad rows here -
+        # does not exist. Out-of-tier ids just fail once and the dead-model
+        # tracker sidelines them.
+        "free_filter": "all",
+        "default_free_models": [],   # real ids unknown until a key enables live discovery
+        "notes": ("Free plan: 6M tokens/DAY (resets 07:00 WIB) + 10 req/min, ~5 models "
+                  "(Agnes 2.0 Flash, Kimi K2.7 Code Free, Mistral Large +2). Free forever, "
+                  "no credit card, OpenAI AND Anthropic compatible. "
+                  "NOTE the viral '7M tokens/day, 30+ models free' claim is marketing - the "
+                  "pricing page says 6M/day and ~5 models on Free. "
+                  "NO SILENT-BILL RISK: plans are fixed-price subscriptions, so without a "
+                  "paid plan an out-of-tier model errors rather than charging you. "
+                  "⚠ TRUST: this is a reseller, not an inference provider - it lists "
+                  "'Claude Fams' family-plan access and 8 'Out of stock' tiers (an API does "
+                  "not run out of stock unless it pools accounts), uses rebranded ids "
+                  "(DeepSeek V4 Pro byNara), and is Telegram-supported. The curated MIT list "
+                  "cheahjs/free-llm-api-resources - which excludes non-legitimate services - "
+                  "does NOT list it. Could disappear without notice; keep it as a bonus tier, "
+                  "never a dependency. Model ids are discovered live once you add a key."),
+    },
     "codestral": {
         "name": "Mistral Codestral (free)",
         # SEPARATE endpoint + SEPARATE key from La Plateforme ("mistral" above):
