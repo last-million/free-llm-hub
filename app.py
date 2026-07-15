@@ -390,6 +390,61 @@ def _provider_capable(pid, est):
     return est <= 0 or _provider_tpm(pid) >= int(est * 1.15) + 512
 
 
+# --------------------------------------------------------------------------- #
+# SPEED tier — the dispatcher prefers FAST, good models and pushes slow reasoning
+# models to the back (used only once the fast ones are rate-limited/exhausted).
+# Speed = provider throughput minus a big penalty for reasoning models (they emit
+# a long hidden 'thinking' pass -> slow to a useful answer) and huge params.
+# --------------------------------------------------------------------------- #
+_PROVIDER_SPEED = {
+    "cerebras": 100, "groq": 92, "sambanova": 78, "morph": 70, "deepseek": 66,
+    "mistral": 66, "google": 62, "agentrouter": 60, "nvidia": 54, "openrouter": 52,
+    "huggingface": 46, "github-models": 44, "cohere": 60,
+}
+_DEFAULT_SPEED = 55
+# Reasoning / "thinking" model families — slow to first useful token.
+_SLOW_MODEL_RE = re.compile(
+    r"(reasoning|thinking|\bqwq\b|deepseek[-_]?r\d|[-/]r1\b|\bo1\b|\bo3\b|magistral|"
+    r"nemotron[-_](ultra|super)|gpt[-_]?oss|[-_]think\b|deepthink)", re.I)
+
+
+def _speed_score(pid, model):
+    """0-ish..100, higher = faster to a useful answer. Pure heuristic (no network)."""
+    s = _PROVIDER_SPEED.get(pid, _DEFAULT_SPEED)
+    low = (model or "").lower()
+    if _SLOW_MODEL_RE.search(low):
+        s -= 45                          # reasoning models: big latency hit
+    m = re.search(r"(\d{2,4})\s*b\b", low)
+    if m:
+        try:
+            n = int(m.group(1))
+            s -= 22 if n >= 400 else 14 if n >= 200 else 7 if n >= 100 else 0
+        except ValueError:
+            pass
+    return s
+
+
+def _is_fast(pid, model):
+    """A model quick enough for interactive use (non-reasoning on a decent host)."""
+    return _speed_score(pid, model) >= 55
+
+
+# Reasoning EFFORT the manager assigns per task difficulty. A simple question gets
+# minimal thinking (fast); a hard task gets more. Applied ONLY to reasoning models
+# (non-reasoning models ignore it). This is what makes "the manager decides the
+# effort by the question" real — and it also overrides whatever a client (e.g.
+# Codex) hard-coded, since the hub, not the CLI, knows the task.
+_DIFFICULTY_EFFORT = {"simple": "low", "medium": "medium", "hard": "high"}
+
+
+def _apply_reasoning_effort(payload, model, difficulty):
+    """For a reasoning model, set reasoning_effort from the task difficulty so easy
+    questions answer fast and hard ones think more. No-op for non-reasoning models."""
+    if difficulty and _SLOW_MODEL_RE.search((model or "").lower()):
+        payload["reasoning_effort"] = _DIFFICULTY_EFFORT.get(difficulty, "medium")
+    return payload
+
+
 def _route_by_difficulty(messages, max_tokens=None, est=None):
     """Pick (pid, model) by task difficulty across AVAILABLE providers that can
     also HANDLE the request size (skip small-TPM providers for big requests).
@@ -409,18 +464,21 @@ def _route_by_difficulty(messages, max_tokens=None, est=None):
                 cands.append((_benchmark_score(pid, m), pid, m))
     if not cands:
         return None, None, difficulty
+    # Prefer FAST models — the primary should be a good model the user won't wait
+    # on. Slow reasoning models are used only if NO fast model is available (and
+    # they still appear later in _build_chain as a last-resort fallback).
+    pool = [c for c in cands if _is_fast(c[1], c[2])] or cands
     if difficulty == "hard":
-        _s, pid, model = max(cands, key=lambda t: t[0])
+        # best QUALITY among the fast models (good + fast, not the slow giant).
+        _s, pid, model = max(pool, key=lambda t: t[0])
         return pid, model, difficulty
     floor = _DIFFICULTY_FLOOR[difficulty]
-    qualified = [c for c in cands if c[0] >= floor]
+    qualified = [c for c in pool if c[0] >= floor]
     if qualified:
-        # cheapest (lowest benchmark) that still clears the bar -> saves strong quota
+        # cheapest fast model that still clears the bar -> saves strong quota
         _s, pid, model = min(qualified, key=lambda t: t[0])
     else:
-        # nothing clears the tier bar -> use the STRONGEST available, not the
-        # cheapest (don't under-serve a hard task when only weak models are keyed)
-        _s, pid, model = max(cands, key=lambda t: t[0])
+        _s, pid, model = max(pool, key=lambda t: t[0])
     return pid, model, difficulty
 
 
@@ -521,31 +579,26 @@ def _build_chain(primary_pid, model_id, est=0):
     a big request never falls onto one that will 413. Capped at MAX_HOPS."""
     chain = [(primary_pid, model_id)]
     seen = {(primary_pid, model_id)}
-    # Per provider: its allowed free models, best-first (excluding the primary pair).
-    by_prov = {}
+    # Split every available, size-capable candidate into FAST and SLOW tiers.
+    # FAST models are tried first (best-first); SLOW reasoning models are the LAST
+    # resort — only reached once the fast+good ones are exhausted/rate-limited.
+    fast, slow = [], []
     for pid in _available_providers():
         if not _provider_capable(pid, est):
             continue
-        scored = [(_benchmark_score(pid, m), m) for m in provider_free_models(pid)
-                  if prov.is_model_allowed(m) and (pid, m) not in seen]
-        if scored:
-            scored.sort(key=lambda t: t[0], reverse=True)
-            by_prov[pid] = scored
-    # Provider order: OTHER providers first (strongest-first), the PRIMARY provider
-    # last — so a rate-limited primary (often an account-wide 429) hands off to a
-    # DIFFERENT provider before retrying its own other models.
-    prov_order = sorted(by_prov, key=lambda p: (p == primary_pid, -by_prov[p][0][0]))
-    rnd = 0
-    while len(chain) < MAX_HOPS and any(rnd < len(by_prov[p]) for p in prov_order):
-        for pid in prov_order:
-            if len(chain) >= MAX_HOPS:
-                break
-            if rnd < len(by_prov[pid]):
-                m = by_prov[pid][rnd][1]
-                if (pid, m) not in seen:
-                    chain.append((pid, m))
-                    seen.add((pid, m))
-        rnd += 1
+        for m in provider_free_models(pid):
+            if (pid, m) in seen or not prov.is_model_allowed(m):
+                continue
+            entry = (_benchmark_score(pid, m), pid, m)
+            (fast if _is_fast(pid, m) else slow).append(entry)
+    fast.sort(key=lambda t: t[0], reverse=True)   # best fast model first
+    slow.sort(key=lambda t: t[0], reverse=True)   # then best slow model
+    for _score, pid, m in fast + slow:
+        if len(chain) >= MAX_HOPS:
+            break
+        if (pid, m) not in seen:
+            chain.append((pid, m))
+            seen.add((pid, m))
     return chain
 
 
@@ -2244,9 +2297,10 @@ def v1_chat_completions():
     # providers take easy work and big requests avoid small-TPM providers (413).
     # Explicit '<pid>/<model>' bypasses model choice (chain still size-filters).
     est = _est_tokens(body.get("messages"), body.get("tools"))
+    diff = None
     if _is_orchestrate(body.get("model")):
-        pid, resolved, _diff = _route_by_difficulty(body.get("messages"),
-                                                     body.get("max_tokens"), est)
+        pid, resolved, diff = _route_by_difficulty(body.get("messages"),
+                                                    body.get("max_tokens"), est)
         if pid is None:
             pid, resolved = _resolve_model(body.get("model"))  # default/best or error
     else:
@@ -2268,6 +2322,7 @@ def v1_chat_completions():
             continue
         payload = dict(body)
         payload["model"] = hop_model
+        _apply_reasoning_effort(payload, hop_model, diff)
         try:
             _act_pick(hop_pid, hop_model)
             resp = _upstream_chat(hop_pid, payload, stream)
@@ -2636,8 +2691,9 @@ def v1_responses():
 
     # Same routing as /v1/chat/completions: Auto/empty/claude-* -> difficulty
     # route across available, SIZE-CAPABLE providers; explicit '<pid>/<model>' bypasses.
+    diff = None
     if _is_orchestrate(body.get("model")):
-        pid, resolved, _diff = _route_by_difficulty(messages, body.get("max_output_tokens"), est)
+        pid, resolved, diff = _route_by_difficulty(messages, body.get("max_output_tokens"), est)
         if pid is None:
             pid, resolved = _resolve_model(body.get("model"))
     else:
@@ -2674,6 +2730,7 @@ def v1_responses():
             continue
         payload = dict(base_payload)
         payload["model"] = hop_model
+        _apply_reasoning_effort(payload, hop_model, diff)
         payload["stream"] = stream
         try:
             _act_pick(hop_pid, hop_model)
@@ -2988,9 +3045,10 @@ def v1_messages():
             est += len(json.dumps(body.get("tools"))) // 4
     except Exception:
         pass
+    diff = None
     if _is_orchestrate(body.get("model")):
-        pid, resolved, _diff = _route_by_difficulty(body.get("messages"),
-                                                     body.get("max_tokens"), est)
+        pid, resolved, diff = _route_by_difficulty(body.get("messages"),
+                                                    body.get("max_tokens"), est)
         if pid is None:
             pid, resolved = _resolve_model(body.get("model"))
     else:
@@ -3042,6 +3100,7 @@ def v1_messages():
             continue
         payload = dict(base_payload)
         payload["model"] = hop_model
+        _apply_reasoning_effort(payload, hop_model, diff)
         payload["stream"] = stream
         try:
             _act_pick(hop_pid, hop_model)
