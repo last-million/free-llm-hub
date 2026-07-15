@@ -1,6 +1,6 @@
 # Calvoun Free LLM Hub
 
-*Made by **DAVID SEO** from **Calvoun**.*
+*Made by **Last-Million** from **Calvoun**.*
 
 ▶️ **[Subscribe on YouTube — @QuantumSEO-AR](https://www.youtube.com/@QuantumSEO-AR)** for updates & news.
 
@@ -160,7 +160,7 @@ Free tiers are a gift from these providers — **respect each provider's Terms o
 
 ## License
 
-**[PolyForm Noncommercial License 1.0.0](LICENSE)** © 2026 DAVID SEO
+**[PolyForm Noncommercial License 1.0.0](LICENSE)** © 2026 Last-Million
 
 This is **not** an MIT / free-for-all project. It is source-available for
 **noncommercial use only** — personal, hobby, research, and study. You may
