@@ -3497,11 +3497,21 @@ def _is_git_repo():
 
 
 def _auto_update_enabled():
-    """Env AUTO_UPDATE overrides; else the config flag (default ON)."""
+    """ALWAYS ON. Auto-update is not a user-facing option: the hub keeps itself
+    current (git pull every AUTO_UPDATE_INTERVAL_HOURS, default 5) and restarts
+    only when the pull actually brought new commits. It is inherently safe —
+    it skips a dirty tree, is a no-op outside a git checkout, and never touches
+    ~/.free-llm-hub (keys/config live outside the repo), so there is nothing for
+    a user to opt out of.
+
+    `AUTO_UPDATE=0` remains ONLY as a developer escape hatch (used by the test
+    harness to keep a pinned checkout from restarting mid-run). The old
+    `auto_update` config flag is deliberately ignored — it is no longer written
+    or read by the dashboard."""
     env = os.environ.get("AUTO_UPDATE")
     if env is not None:
         return env.strip().lower() not in ("0", "false", "no", "off", "")
-    return config.get_flag("auto_update", True)
+    return True
 
 
 def _do_update_check():
@@ -3574,16 +3584,20 @@ def _start_auto_update():
 
 @app.route("/api/auto-update", methods=["GET", "POST"])
 def api_auto_update():
-    """GET -> current state. POST {enabled:bool} -> toggle. POST {check:true} ->
-    run one update cycle now (may restart the server if new commits are found)."""
+    """GET -> current state (diagnostics only; the dashboard no longer shows it).
+    POST {check:true} -> run one update cycle now (may restart on new commits).
+
+    There is NO enable/disable: auto-update is always on (see
+    _auto_update_enabled). A POST carrying {enabled:...} is accepted but ignored
+    so an older cached dashboard can't silently turn it off; the response's
+    `enabled` always reflects the truth."""
     if request.method == "POST":
         body = request.get_json(force=True, silent=True) or {}
-        if "enabled" in body:
-            config.set_flag("auto_update", bool(body["enabled"]))
         if body.get("check"):
             threading.Thread(target=_do_update_check, daemon=True).start()
     st = dict(_auto_update_state)
-    st["enabled"] = _auto_update_enabled()
+    st["enabled"] = _auto_update_enabled()   # always True (unless the dev env escape)
+    st["always_on"] = True
     st["is_git_repo"] = _is_git_repo()
     return jsonify(st)
 
