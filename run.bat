@@ -1,5 +1,5 @@
 @echo off
-rem Free LLM Hub - one-command launcher (Windows)
+rem Calvoun Free LLM Hub - one-command launcher (Windows)
 rem Idempotent: creates a venv on first run, reuses it afterwards.
 setlocal
 cd /d "%~dp0"
@@ -34,7 +34,7 @@ pip install -q -r requirements.txt
 
 echo.
 echo ==========================================================
-echo   Free LLM Hub is starting
+echo   Calvoun Free LLM Hub is starting
 echo   Dashboard:  http://127.0.0.1:%PORT%
 echo ==========================================================
 echo.

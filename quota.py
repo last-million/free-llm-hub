@@ -1,5 +1,5 @@
 """
-Free LLM Hub — per-provider free-quota tracking.
+Calvoun Free LLM Hub — per-provider free-quota tracking.
 
 Counts upstream requests per provider inside that provider's free-tier window
 (minute / day / month), reports how many remain and when the window resets, and

@@ -1,5 +1,5 @@
 """
-Free LLM Hub — Provider Registry (source of truth).
+Calvoun Free LLM Hub — Provider Registry (source of truth).
 
 Central catalog of BYOK (bring-your-own-key) providers that offer free-tier
 models via an OpenAI-compatible API. Consumed by:

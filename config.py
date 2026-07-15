@@ -1,5 +1,5 @@
 """
-Free LLM Hub — local config store.
+Calvoun Free LLM Hub — local config store.
 
 JSON config at ~/.free-llm-hub/config.json (override with env
 FREE_LLM_HUB_CONFIG). Holds per-provider API keys / enabled flags /
