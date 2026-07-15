@@ -44,6 +44,8 @@ DEFAULT_LIMIT = {"limit": 200, "window": "day"}
 _LOCK = threading.RLock()
 # pid -> {"count": int, "window_start": float, "throttled_until": float}
 _STATE: dict = {}
+# pid -> {"window_start": float, "models": {model_id: count}}  (per-model usage)
+_MODEL_STATE: dict = {}
 
 
 def _limit_for(pid: str) -> dict:
@@ -68,8 +70,10 @@ def _window_bounds(window: str, now: float):
     return start, start + 86400
 
 
-def record(pid: str, n: int = 1) -> None:
-    """Count `n` upstream requests against pid's current window (auto rolls over)."""
+def record(pid: str, model: str = None, n: int = 1) -> None:
+    """Count `n` upstream requests against pid's current window (auto rolls over).
+    If `model` is given, ALSO count it per-model so the dashboard can show usage
+    per provider AND per model."""
     lim = _limit_for(pid)
     now = time.time()
     start, _reset = _window_bounds(lim["window"], now)
@@ -80,6 +84,25 @@ def record(pid: str, n: int = 1) -> None:
                   "throttled_until": (st.get("throttled_until", 0) if st else 0)}
         st["count"] = st.get("count", 0) + n
         _STATE[pid] = st
+        if isinstance(model, str) and model:
+            ms = _MODEL_STATE.get(pid)
+            if not ms or ms.get("window_start") != start:
+                ms = {"window_start": start, "models": {}}
+            ms["models"][model] = ms["models"].get(model, 0) + n
+            _MODEL_STATE[pid] = ms
+
+
+def models(pid: str) -> dict:
+    """{model_id: used_count} for pid's CURRENT window (only models actually hit).
+    Empty once the window rolls over."""
+    lim = _limit_for(pid)
+    now = time.time()
+    start, _reset = _window_bounds(lim["window"], now)
+    with _LOCK:
+        ms = _MODEL_STATE.get(pid)
+        if not ms or ms.get("window_start") != start:
+            return {}
+        return dict(ms.get("models") or {})
 
 
 def mark_throttled(pid: str, seconds: float = None) -> None:

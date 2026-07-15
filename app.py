@@ -70,7 +70,7 @@ CONNECT_TIMEOUT = 10          # seconds
 CHAT_READ_TIMEOUT = 300       # seconds (long generations)
 MODELS_READ_TIMEOUT = 10      # seconds (model discovery / key tests)
 MODEL_CACHE_TTL = 60          # seconds
-MAX_HOPS = 3                  # primary + up to 2 fallback providers
+MAX_HOPS = 6                  # primary + up to 5 fallback models (across providers)
 
 _model_cache = {}             # pid -> (timestamp, [model ids])
 _model_cache_lock = threading.Lock()
@@ -511,28 +511,41 @@ def _comparable_model(model_id, candidates):
 
 
 def _build_chain(primary_pid, model_id, est=0):
-    """[(pid, model)] -- primary first, then fallback providers with a comparable
-    free model, ORDERED BEST-FIRST by benchmark. Providers whose free tier can't
-    take an `est`-token request are skipped (so a big request doesn't fall back
-    onto a provider that will 413). Capped at MAX_HOPS."""
+    """Priority-ordered [(pid, model)] fallback chain. Primary first, then the
+    next-best MODELS across every AVAILABLE, size-capable provider, INTERLEAVED
+    across providers (best model of each provider, then each provider's 2nd, ...).
+    So if the chosen model is rate-limited (429) the gateway auto-switches to the
+    next model in priority: a different PROVIDER first (handles per-account limits
+    like NVIDIA), while later rounds still try other models of the same provider
+    (handles per-model limits like Groq). Size-incapable providers are skipped so
+    a big request never falls onto one that will 413. Capped at MAX_HOPS."""
     chain = [(primary_pid, model_id)]
-    # Score each other AVAILABLE, size-CAPABLE provider's best comparable model,
-    # then add them strongest-first so a fallback is an upgrade path, not random.
-    candidates = []
+    seen = {(primary_pid, model_id)}
+    # Per provider: its allowed free models, best-first (excluding the primary pair).
+    by_prov = {}
     for pid in _available_providers():
-        if pid == primary_pid or not _provider_capable(pid, est):
+        if not _provider_capable(pid, est):
             continue
-        free = provider_free_models(pid)
-        if not free:
-            continue
-        alt = model_id if model_id in free else _comparable_model(model_id, free)
-        if alt and prov.is_model_allowed(alt):
-            candidates.append((_benchmark_score(pid, alt), pid, alt))
-    candidates.sort(key=lambda t: t[0], reverse=True)
-    for _score, pid, alt in candidates:
-        if len(chain) >= MAX_HOPS:
-            break
-        chain.append((pid, alt))
+        scored = [(_benchmark_score(pid, m), m) for m in provider_free_models(pid)
+                  if prov.is_model_allowed(m) and (pid, m) not in seen]
+        if scored:
+            scored.sort(key=lambda t: t[0], reverse=True)
+            by_prov[pid] = scored
+    # Provider order: OTHER providers first (strongest-first), the PRIMARY provider
+    # last — so a rate-limited primary (often an account-wide 429) hands off to a
+    # DIFFERENT provider before retrying its own other models.
+    prov_order = sorted(by_prov, key=lambda p: (p == primary_pid, -by_prov[p][0][0]))
+    rnd = 0
+    while len(chain) < MAX_HOPS and any(rnd < len(by_prov[p]) for p in prov_order):
+        for pid in prov_order:
+            if len(chain) >= MAX_HOPS:
+                break
+            if rnd < len(by_prov[pid]):
+                m = by_prov[pid][rnd][1]
+                if (pid, m) not in seen:
+                    chain.append((pid, m))
+                    seen.add((pid, m))
+        rnd += 1
     return chain
 
 
@@ -588,7 +601,7 @@ def _upstream_chat(pid, payload, stream):
             if is_last:
                 raise
             continue
-        quota.record(pid)  # a request left the building -> counts against free quota
+        quota.record(pid, payload.get("model"))  # counts against free quota (per provider + model)
         # A 429 means this provider's free budget is spent -> mark it throttled so
         # orchestration skips it until the window resets (drives the red banner).
         if resp.status_code == 429:
@@ -1033,6 +1046,7 @@ def api_status():
         s = quota.status(pid)
         p = prov.get_provider(pid) or {}
         s["name"] = p.get("name", pid)
+        s["models"] = quota.models(pid)  # {model_id: used_count} this window
         q[pid] = s
         if s["exhausted"]:
             exhausted += 1
