@@ -166,6 +166,22 @@
     background:var(--accent-soft);border:1px solid rgba(34,197,94,.25);
     border-radius:6px;padding:3px 9px;
   }
+  /* auto-pick: helper line + live probe trail (both are full-width rows inside .default-row's flex-wrap) */
+  .auto-help{flex-basis:100%;margin:0;font-size:12px;color:var(--text-dim);line-height:1.5}
+  .auto-trail{
+    flex-basis:100%;background:var(--surface-2);border:1px solid var(--border-soft);
+    border-radius:var(--radius-sm);padding:10px 12px;
+    font-family:var(--mono);font-size:12px;line-height:1.65;
+    max-height:220px;overflow:auto;overflow-wrap:anywhere;
+  }
+  .auto-trail .at-row{display:flex;gap:8px;align-items:baseline}
+  .auto-trail .at-mark{flex:none;font-weight:700}
+  .auto-trail .at-ok .at-mark{color:var(--accent)}
+  .auto-trail .at-no .at-mark{color:var(--danger)}
+  .auto-trail .at-model{color:var(--text)}
+  .auto-trail .at-detail{color:var(--text-dim)}
+  .auto-trail .at-msg{color:var(--danger)}
+  .auto-trail .at-note{color:var(--text-dim);margin-top:6px}
 
   /* ---------- toolbar / search ---------- */
   .toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
@@ -659,24 +675,27 @@
   <!-- Default model -->
   <section class="section" aria-labelledby="h-default">
     <div class="section-h">
-      <h2 id="h-default"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-default">
+      <h2 id="h-default"><button type="button" class="sec-toggle" aria-expanded="true" aria-controls="sec-default">
         <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
         Default model
       </button></h2>
       <span class="sub">used when a client sends a bare / unknown model name</span>
     </div>
-    <div class="section-body" id="sec-default" hidden>
+    <div class="section-body" id="sec-default">
     <div class="default-row">
       <label for="model-select">Route to</label>
       <select id="model-select" aria-label="Default model">
         <option value="">— add a provider key first —</option>
       </select>
       <button class="btn primary" id="btn-set-default" type="button">Set default</button>
+      <button class="btn" id="default-auto" type="button" title="Probe the top-ranked models live and keep the first that answers">Auto-pick best</button>
       <span id="current-default" class="current-default" hidden></span>
       <button class="btn sm ghost" id="btn-refresh-models" type="button" title="Re-discover models from enabled providers">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
         Refresh
       </button>
+      <p class="auto-help">Picks the highest-ranked model that actually answers a live test &mdash; skips ones that are blocked or dead.</p>
+      <div class="auto-trail" id="auto-trail" role="status" hidden></div>
     </div>
     </div>
   </section>
@@ -684,13 +703,13 @@
   <!-- Chat / Test playground -->
   <section class="section" aria-labelledby="h-chat">
     <div class="section-h">
-      <h2 id="h-chat"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-chat">
+      <h2 id="h-chat"><button type="button" class="sec-toggle" aria-expanded="true" aria-controls="sec-chat">
         <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
         Chat / Test
       </button></h2>
       <span class="sub">send a live prompt through the gateway to any enabled model</span>
     </div>
-    <div class="section-body" id="sec-chat" hidden>
+    <div class="section-body" id="sec-chat">
     <div class="chat-panel">
       <div class="chat-bar">
         <select id="chat-model" aria-label="Model to chat with">
@@ -709,6 +728,30 @@
           <button class="btn" id="chat-stop" type="button" disabled>Stop</button>
         </div>
       </div>
+    </div>
+    </div>
+  </section>
+
+  <!-- Providers -->
+  <section class="section" aria-labelledby="h-providers">
+    <div class="section-h">
+      <h2 id="h-providers"><button type="button" class="sec-toggle" aria-expanded="true" aria-controls="sec-providers">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Providers
+      </button></h2>
+      <span class="sub">paste a free API key, enable, test &mdash; done</span>
+      <span class="sec-chip" id="chip-providers" hidden></span>
+    </div>
+    <div class="section-body" id="sec-providers">
+    <div class="toolbar">
+      <div class="search">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="search" id="search" placeholder="Search providers, models, notes&hellip;" aria-label="Search providers">
+      </div>
+      <span class="count-note" id="count-note"></span>
+    </div>
+    <div class="grid" id="grid" aria-live="polite">
+      <div class="empty">Loading providers&hellip;</div>
     </div>
     </div>
   </section>
@@ -747,30 +790,6 @@
           <div class="quota-empty">Add a provider key to see free-quota usage.</div>
         </div>
       </div>
-    </div>
-  </section>
-
-  <!-- Providers -->
-  <section class="section" aria-labelledby="h-providers">
-    <div class="section-h">
-      <h2 id="h-providers"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-providers">
-        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
-        Providers
-      </button></h2>
-      <span class="sub">paste a free API key, enable, test &mdash; done</span>
-      <span class="sec-chip" id="chip-providers" hidden></span>
-    </div>
-    <div class="section-body" id="sec-providers" hidden>
-    <div class="toolbar">
-      <div class="search">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <input type="search" id="search" placeholder="Search providers, models, notes&hellip;" aria-label="Search providers">
-      </div>
-      <span class="count-note" id="count-note"></span>
-    </div>
-    <div class="grid" id="grid" aria-live="polite">
-      <div class="empty">Loading providers&hellip;</div>
-    </div>
     </div>
   </section>
 
@@ -1115,6 +1134,68 @@
     var b = this; b.disabled = true;
     loadModels().then(function(){ toast('Model list refreshed'); b.disabled = false; });
   });
+
+  /* ---------- auto-pick best default ----------
+     POST /api/default/auto walks the benchmark ranking and sends ONE tiny real probe
+     per candidate, saving the first that answers — so it can take ~5-30s (hence the
+     60s AbortController budget, well above the server's own per-probe timeouts).
+
+     This deliberately uses raw fetch() instead of api(): on a 409 the body still
+     carries `reason` + the `tried` trail, and api() throws that body away. Rendering
+     the trail — especially WHY a top-ranked model was rejected (e.g. a 403) — is the
+     whole point of the feature. */
+  function renderAutoTrail(tried, msg, note){
+    var el = $('#auto-trail');
+    if (!el) return;
+    var html = '';
+    if (msg) html += '<div class="at-msg">' + esc(msg) + '</div>';
+    (tried || []).forEach(function(t){
+      html += '<div class="at-row ' + (t && t.ok ? 'at-ok' : 'at-no') + '">' +
+                '<span class="at-mark" aria-hidden="true">' + (t && t.ok ? '✔' : '✗') + '</span>' +
+                '<span><span class="at-model">' + esc(t && t.model) + '</span>' +
+                (t && t.detail ? ' <span class="at-detail">&mdash; ' + esc(t.detail) + '</span>' : '') +
+                '</span>' +
+              '</div>';
+    });
+    if (note) html += '<div class="at-note">' + esc(note) + '</div>';
+    el.innerHTML = html;
+    el.hidden = !html;
+  }
+  function doAutoPickDefault(btn){
+    var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function(){ ctrl.abort(); }, 60000) : null;
+    busyBtn(btn, 'Probing…');
+    renderAutoTrail([], 'Probing the top-ranked models live… this can take a few seconds.');
+    return fetch('/api/default/auto', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: ctrl ? ctrl.signal : undefined
+    }).then(function(r){
+      return r.json().catch(function(){ return {}; }).then(function(j){ return { status: r.status, body: j || {} }; });
+    }).then(function(res){
+      var r = res.body;
+      if (res.status === 200 && r.ok){
+        /* same refresh path as saving a default by hand — no duplicated render logic */
+        renderAutoTrail(r.tried, '', r.note);
+        return Promise.all([loadDefault(), loadStatus()]).then(function(){
+          toast('Default → ' + (r.label || (r.provider + '/' + r.model)) + ' (verified)');
+        });
+      }
+      /* 409 (or anything else): existing default is left untouched, show why */
+      renderAutoTrail(r.tried, r.reason || ('Auto-pick failed (HTTP ' + res.status + ')'));
+      toast('Auto-pick: ' + (r.reason || ('HTTP ' + res.status)), true);
+    }).catch(function(e){
+      var msg = (e && e.name === 'AbortError')
+        ? 'Timed out after 60s — the probes are still running server-side; try again in a moment.'
+        : ('Auto-pick failed: ' + ((e && e.message) || 'network error'));
+      renderAutoTrail([], msg);
+      toast(msg, true);
+    }).then(function(){
+      if (timer) clearTimeout(timer);
+      resetBtn(btn, 'Auto-pick best');
+    });
+  }
+  $('#default-auto').addEventListener('click', function(){ doAutoPickDefault(this); });
 
   /* ---------- providers ---------- */
   function loadProviders(){
@@ -2053,16 +2134,24 @@
   }
 
   /* ---------- collapsible sections (A) ----------
-     Every major <section class="section"> collapses from its header row. Only the
-     CLI / "Connected tools" section is expanded on a first-ever visit; everything
-     else starts collapsed and the user's choice is then remembered per section.
+     Every major <section class="section"> collapses from its header row. The four
+     working surfaces (Connected tools, Chat, Providers, Default model) are expanded
+     on a first-ever visit; everything else starts collapsed and the user's choice is
+     then remembered per section (a stored choice always beats the default below).
+
+     IMPORTANT: the markup in <main> is authored to MATCH SEC_DEFAULT_OPEN exactly
+     (aria-expanded + the presence/absence of `hidden` on .section-body), so the
+     first-visit state paints correctly before this script runs — no collapse/expand
+     flash. If you change a default here, change that section's markup to match.
 
      Collapsing only sets `hidden` on .section-body — the nodes stay mounted and every
      poller (activity 3s, status/quota 15s, 1s local ticks) keeps rendering into them
      exactly as before. No timer is started, stopped or re-created here. The one piece
      of measurement-dependent code, setBannerOffset(banner.offsetHeight), reads the
      exhaustion banner, which lives outside <main> and is never collapsible. */
-  var SEC_DEFAULT_OPEN = { 'h-clis': true };   /* anything not listed defaults to collapsed */
+  var SEC_DEFAULT_OPEN = {                     /* anything not listed defaults to collapsed */
+    'h-clis': true, 'h-chat': true, 'h-providers': true, 'h-default': true
+  };
   var SEC_LS_PREFIX = 'flh.sec.';              /* flh.sec.<heading-id> = '1' (open) | '0' (collapsed) */
 
   function secStored(id){

@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -405,6 +406,12 @@ def _est_tokens(messages, tools=None):
 def _provider_capable(pid, est):
     """Can this provider's free tier take a single `est`-token request? (margin
     for the model's own reply added.)"""
+    if _is_sub(pid):
+        # A local subscription CLI has no free-tier TPM ceiling to bust: it is the
+        # user's own paid session, sized by the model's real context window. The
+        # only size guard that applies is _SUB_MAX_PROMPT_CHARS, enforced at run
+        # time in _sub_run(). Never let the free-tier filter drop it.
+        return True
     return est <= 0 or _provider_tpm(pid) >= int(est * 1.15) + 512
 
 
@@ -498,6 +505,434 @@ def _dead_model_rows():
         return [(p, m, int(exp - now)) for (p, m), exp in _dead_models.items() if exp > now]
 
 
+# --------------------------------------------------------------------------- #
+# LOCAL SUBSCRIPTION providers — OPT-IN, DEFAULT OFF ("sub-*").
+#
+# The user already pays for Claude Code and ChatGPT/Codex, and both CLIs are
+# already signed in locally against those subscriptions. These two VIRTUAL
+# providers let the hub use that PAID capacity as extra models alongside the free
+# fleet, while keeping every bit of its orchestration (difficulty routing, chain
+# fallback, dead-model tracking, quota accounting).
+#
+# They are deliberately NOT in providers.py: that module is the registry of HTTP
+# api-key providers, and these have no base_url, no key and no /v1/models. Each
+# one is a LOCAL SUBPROCESS driven through its CLI's documented non-interactive
+# mode, as a plain text completion (no tool access, no permission bypass).
+#
+# HARD RULES — a sub hop spends the user's real money, so:
+#   * THREE gates must all pass or the provider does not exist at all (master
+#     flag + per-provider flag + installed & authenticated). The master flag is
+#     OFF by default => zero behavior delta vs. the free-only hub.
+#   * LAST RESORT ONLY: appended after BOTH free tiers in _build_chain, and
+#     _route_by_difficulty may pick one as primary ONLY when no free candidate
+#     exists at all.
+#   * NEVER on streaming requests (a one-shot CLI cannot emit a token stream).
+#   * NEVER when the CLI is currently pointed at this hub (that would be a
+#     hub -> CLI -> hub loop). See _sub_loops_back().
+# --------------------------------------------------------------------------- #
+_SUB_MASTER_FLAG = "use_local_subscriptions"     # config flag, default False
+_SUB_PROVIDERS = {
+    "sub-claude": {
+        "name": "Claude subscription (local)",
+        "bin": "claude",             # resolved via shutil.which() at call time
+        "model": "claude",           # exposed as 'sub-claude/claude'
+        "cli_id": "claude",          # CLI_REGISTRY row (loop-guard reuse)
+        "flag": "sub_claude_enabled",
+    },
+    "sub-codex": {
+        "name": "Codex subscription (local)",
+        "bin": "codex",
+        "model": "codex",            # exposed as 'sub-codex/codex'
+        "cli_id": "codex",
+        "flag": "sub_codex_enabled",
+    },
+}
+_SUB_TIMEOUT = 120        # seconds for one run (CLI cold start + generation)
+# `claude -p --output-format json` is known to HANG on very large prompts (~148KB
+# observed). We use --output-format text, but keep a hard ceiling far below that:
+# a sub hop is a last resort, not a bulk-context path. Over the cap the hop
+# returns 413 and the chain moves on instead of freezing for the full timeout.
+_SUB_MAX_PROMPT_CHARS = 100000
+
+
+def _is_sub(pid):
+    """True for a local-subscription virtual provider id ('sub-claude'/'sub-codex')."""
+    return pid in _SUB_PROVIDERS
+
+
+def _sub_models(pid):
+    """The model id(s) a sub provider exposes (one each, by design)."""
+    cfg = _SUB_PROVIDERS.get(pid)
+    return [cfg["model"]] if cfg else []
+
+
+def _sub_master_on():
+    """The master opt-in. DEFAULT FALSE — with it off, nothing below ever runs."""
+    return bool(config.get_flag(_SUB_MASTER_FLAG, False))
+
+
+def _sub_bin(pid):
+    """Absolute path to the CLI binary, or None. Never raises."""
+    cfg = _SUB_PROVIDERS.get(pid)
+    if not cfg:
+        return None
+    try:
+        return shutil.which(cfg["bin"])
+    except Exception:
+        return None
+
+
+def _codex_subscription_auth():
+    """(ok, detail) for ~/.codex/auth.json — is Codex signed in with a ChatGPT
+    SUBSCRIPTION (not an API key)? Reads the file's shape only; no token is ever
+    returned, logged or copied. Never raises.
+
+    auth_mode == 'chatgpt' (or an OAuth token pair) == subscription. An
+    API-key-only auth.json is deliberately REJECTED: that bills per token, which
+    is not what this feature offers."""
+    path = os.path.join(_home(), ".codex", "auth.json")
+    if not os.path.isfile(path):
+        return False, "Not signed in (no ~/.codex/auth.json). Run: codex login"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False, "~/.codex/auth.json is unreadable or not valid JSON."
+    if not isinstance(data, dict):
+        return False, "~/.codex/auth.json has an unexpected shape."
+    mode = str(data.get("auth_mode") or "").lower()
+    tokens = data.get("tokens")
+    has_tokens = isinstance(tokens, dict) and bool(
+        tokens.get("access_token") or tokens.get("refresh_token"))
+    if mode == "chatgpt":
+        return True, "Signed in with a ChatGPT subscription (auth_mode=chatgpt)."
+    if has_tokens:
+        return True, "Signed in (OAuth session present in ~/.codex/auth.json)."
+    return False, ("~/.codex/auth.json holds no ChatGPT subscription session "
+                   "(API-key mode). Run: codex login")
+
+
+def _sub_loops_back(cli_id):
+    """(loops, detail) — True when that CLI is CURRENTLY POINTED AT THIS HUB.
+
+    This hub's own Auto-fix writes ANTHROPIC_BASE_URL / ~/.codex/config.toml to
+    point a CLI here. Spawning such a CLI from inside the hub would make the hub
+    call ITSELF (hub -> CLI -> hub -> ...) until something times out. So a
+    connected CLI is withheld as a subscription provider. Reuses the existing
+    connection detector, so it stays true to whatever Auto-fix/Disconnect did."""
+    entry = _get_cli_entry(cli_id)
+    if not entry:
+        return False, None
+    try:
+        connected, _method, detail = _cli_connected(entry)
+    except Exception:
+        return False, None       # fail open: detection problems don't block the user
+    if connected:
+        return True, ("%s is currently connected to this hub (%s). Using it as a "
+                      "subscription provider would make the hub call itself — "
+                      "disconnect it first."
+                      % (entry.get("name", cli_id), detail or "config/env"))
+    return False, None
+
+
+def _sub_state(pid):
+    """(enabled, installed, authenticated, detail) for one sub provider.
+
+    Pure inspection: never runs the CLI (so it costs nothing), never raises."""
+    cfg = _SUB_PROVIDERS.get(pid)
+    if not cfg:
+        return False, False, False, "Unknown subscription provider."
+    enabled = bool(config.get_flag(cfg["flag"], True))   # per-provider default ON
+    path = _sub_bin(pid)
+    if not path:
+        return enabled, False, False, "Not installed (no '%s' on PATH)." % cfg["bin"]
+    loops, loop_detail = _sub_loops_back(cfg["cli_id"])
+    if loops:
+        return enabled, True, False, loop_detail
+    if pid == "sub-codex":
+        ok, detail = _codex_subscription_auth()
+        return enabled, True, ok, detail
+    # sub-claude: do NOT try to parse Claude Code's credentials. They live across
+    # an OS keychain / OAuth store / managed settings depending on the install, so
+    # any check here would be a guess that wrongly hides a working CLI. Installed
+    # == usable; a failed run marks the model dead and routing skips it for 6h.
+    return enabled, True, True, ("Installed (%s). Uses the local Claude Code session; "
+                                 "a failed run sidelines it automatically." % _short(path))
+
+
+def _sub_available_providers():
+    """Sub provider ids usable RIGHT NOW (master flag + per-provider flag +
+    installed + authenticated + no hub loop + not dead).
+
+    Returns [] whenever the master flag is off — which is the default, so every
+    caller below is a no-op on a stock hub. NOTE: deliberately NOT merged into
+    _available_providers(): that function feeds _best_free_pair() /
+    aggregated_models() / the FREE quota banner, and a paid subscription must
+    never leak into "best FREE model" or be auto-persisted as the default."""
+    if not _sub_master_on():
+        return []
+    out = []
+    for pid, cfg in _SUB_PROVIDERS.items():
+        enabled, _installed, authed, _detail = _sub_state(pid)
+        if enabled and authed and not _is_model_dead(pid, cfg["model"]):
+            out.append(pid)
+    return out
+
+
+# Chat roles -> readable labels for a CLI that only takes plain text.
+_SUB_ROLE_LABEL = {"system": "System", "developer": "System", "user": "User",
+                   "assistant": "Assistant", "tool": "Tool result"}
+
+
+def _sub_flatten(messages):
+    """OpenAI chat messages -> ONE readable prompt string.
+
+    Content blocks ([{type:'text',text:..}]) are flattened; non-text parts
+    (images) are dropped — a sub hop is a text completion. A single lone user
+    message is passed through verbatim (the common case: no labels added)."""
+    msgs = [m for m in (messages or []) if isinstance(m, dict)]
+    if len(msgs) == 1 and isinstance(msgs[0].get("content"), str) \
+            and str(msgs[0].get("role") or "user").lower() == "user":
+        return msgs[0]["content"].strip()
+    parts = []
+    for m in msgs:
+        role = _SUB_ROLE_LABEL.get(str(m.get("role") or "user").lower(), "User")
+        c = m.get("content")
+        text = ""
+        if isinstance(c, str):
+            text = c
+        elif isinstance(c, list):
+            text = "\n".join(b["text"] for b in c
+                             if isinstance(b, dict) and isinstance(b.get("text"), str)
+                             and b.get("text"))
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if isinstance(fn, dict):
+                text += "\n[tool call] %s(%s)" % (fn.get("name") or "",
+                                                  fn.get("arguments") or "")
+        text = text.strip()
+        if text:
+            parts.append("%s: %s" % (role, text))
+    return "\n\n".join(parts)
+
+
+def _sub_launcher(path):
+    """argv prefix that can actually execute `path`.
+
+    On Windows an npm-installed CLI is a .cmd/.bat shim (codex -> codex.CMD):
+    CreateProcess cannot run a batch file directly, so it must go through the
+    command interpreter. A native .exe (and every POSIX binary) runs directly.
+    Only the interpreter + the resolved path are passed here — the prompt goes in
+    on stdin, so no untrusted text is ever handed to cmd.exe for parsing."""
+    if os.name == "nt" and os.path.splitext(path)[1].lower() in (".cmd", ".bat"):
+        return [os.environ.get("COMSPEC") or "cmd.exe", "/c", path]
+    return [path]
+
+
+def _sub_env():
+    """Child env with every HUB-POINTING override stripped, so the CLI talks to
+    its own subscription backend and can't be redirected back into this hub.
+    Defense in depth — _sub_loops_back() already refuses a CLI configured to
+    point here; this also covers a hub process that merely inherited such a var.
+    Everything else (PATH, HOME, the user's own settings) is passed through."""
+    env = dict(os.environ)
+    for k in list(env.keys()):
+        if _points_at_hub(env.get(k)):
+            env.pop(k, None)
+    return env
+
+
+# Codex prints a banner + event log on stdout. `-o/--output-last-message` gives us
+# the final message exactly, so this stripper is only a FALLBACK for when that
+# file comes back empty. Best-effort by design: drop the known banner/meta lines
+# and keep the rest.
+_CODEX_NOISE_RE = re.compile(
+    r"^\s*(-{3,}|_{3,}|\[?\d{4}-\d{2}-\d{2}T?[\d:.]*\]?\s|>_|OpenAI Codex|codex\b|"
+    r"(workdir|model|provider|approval|sandbox|reasoning( effort| summaries)?|"
+    r"session|version|tokens used|user instructions?)\s*:)", re.I)
+
+
+def _codex_strip_noise(out):
+    """Best-effort: strip Codex's banner/meta lines from stdout. Fallback only."""
+    lines = [ln for ln in (out or "").splitlines() if not _CODEX_NOISE_RE.match(ln)]
+    return "\n".join(lines).strip()
+
+
+def _read_text(path):
+    """Read a file, '' on any problem. Never raises."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+# Substrings that mean "this CLI is not usable with this session" -> mark dead so
+# routing stops picking it for 6h (instead of retrying a broken login every hop).
+_SUB_AUTH_ERR = ("not logged in", "not authenticated", "unauthorized", "401",
+                 "please run /login", "please login", "run `codex login`",
+                 "run codex login", "invalid api key", "no credentials",
+                 "authentication_error", "session expired", "oauth")
+
+
+def _sub_run(pid, prompt):
+    """Run the local CLI ONCE, non-interactively. NEVER raises.
+
+    Returns (status, text, detail) where `status` mirrors an HTTP code the chain
+    loops already understand:
+      200 -> `text` is the assistant's reply
+      403 -> unusable (off / not installed / not signed in / loops back) -> DEAD
+      413 -> prompt over _SUB_MAX_PROMPT_CHARS (request-specific, NOT dead)
+      504 -> timed out       502 -> ran but failed / produced nothing
+
+    Invocation (flags verified against `claude --help` / `codex exec --help`):
+      claude -> `claude -p --output-format text`, prompt on STDIN (print mode
+        reads a piped stdin as the prompt). NO --dangerously-skip-permissions and
+        no tool flags: a plain text completion, nothing else. NOT `--bare` either
+        — that mode refuses to read the OAuth session and demands an API key,
+        i.e. the exact opposite of "use my subscription".
+      codex  -> `codex exec --skip-git-repo-check --color never --sandbox
+        read-only -o <tmp> -`. The trailing '-' reads the prompt from STDIN, and
+        -o writes ONLY the final assistant message to <tmp>, so Codex's banner /
+        event noise on stdout never has to be parsed at all.
+
+    The prompt always travels on STDIN, never in argv: a Windows command line
+    caps around 8k chars, and this can carry a whole conversation.
+    cwd is a temp dir so neither CLI picks up THIS repo as project context."""
+    cfg = _SUB_PROVIDERS.get(pid)
+    if not cfg:
+        return 403, "", "Unknown subscription provider '%s'." % pid
+    if not _sub_master_on():
+        return 403, "", "Local subscription providers are turned off."
+    enabled, installed, authed, detail = _sub_state(pid)
+    if not enabled:
+        return 403, "", "%s is switched off." % cfg["name"]
+    if not (installed and authed):
+        return 403, "", detail or "%s is not usable." % cfg["name"]
+    if not prompt:
+        return 502, "", "Nothing to send (empty prompt)."
+    if len(prompt) > _SUB_MAX_PROMPT_CHARS:
+        return 413, "", ("Prompt is %d chars; the local %s CLI is capped at %d here "
+                         "(a CLI hangs on very large prompts)."
+                         % (len(prompt), cfg["bin"], _SUB_MAX_PROMPT_CHARS))
+    path = _sub_bin(pid)
+    if not path:
+        return 403, "", "'%s' is no longer on PATH." % cfg["bin"]
+    tmp_out = None
+    try:
+        if pid == "sub-codex":
+            try:
+                fd, tmp_out = tempfile.mkstemp(prefix="hub-sub-", suffix=".txt")
+                os.close(fd)
+            except OSError as exc:
+                return 502, "", "Could not create a temp file: %s" % exc.__class__.__name__
+            argv = _sub_launcher(path) + ["exec", "--skip-git-repo-check",
+                                          "--color", "never", "--sandbox", "read-only",
+                                          "-o", tmp_out, "-"]
+        else:
+            argv = _sub_launcher(path) + ["-p", "--output-format", "text"]
+        try:
+            proc = subprocess.run(argv, input=prompt, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace",
+                                  timeout=_SUB_TIMEOUT, env=_sub_env(),
+                                  cwd=tempfile.gettempdir())
+        except subprocess.TimeoutExpired:
+            return 504, "", "%s timed out after %ds." % (cfg["bin"], _SUB_TIMEOUT)
+        except (OSError, ValueError) as exc:
+            return 502, "", "%s failed to start: %s" % (cfg["bin"], exc.__class__.__name__)
+        text = (proc.stdout or "").strip()
+        if pid == "sub-codex":
+            last = _read_text(tmp_out).strip()
+            text = last or _codex_strip_noise(proc.stdout)
+        if not text:
+            err = _sanitize((proc.stderr or "").strip(), 300)
+            if proc.returncode != 0:
+                low = (err or "").lower()
+                status = 403 if any(s in low for s in _SUB_AUTH_ERR) else 502
+                return status, "", ("%s exited %d: %s"
+                                    % (cfg["bin"], proc.returncode, err or "no detail"))
+            return 502, "", "%s produced no output. %s" % (cfg["bin"], err or "")
+        return 200, text, None
+    finally:
+        if tmp_out:
+            try:
+                os.unlink(tmp_out)
+            except OSError:
+                pass
+
+
+class _SubResponse:
+    """A minimal `requests.Response` look-alike — EXACTLY the surface the chain
+    loops touch (.status_code / .json() / .text / .close()), so a sub-* hop flows
+    through the same loop as an HTTP provider with no special-casing.
+
+    iter_content/iter_lines exist only so that a hypothetical streaming caller
+    degrades to the loops' "no first byte" fall-through instead of raising
+    AttributeError. The loops already skip sub hops when stream is requested."""
+
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = json.dumps(payload)
+        self.headers = {}
+
+    def json(self):
+        return self._payload
+
+    def close(self):
+        return None
+
+    def iter_content(self, chunk_size=None):
+        return iter(())
+
+    def iter_lines(self, decode_unicode=False):
+        return iter(())
+
+
+def _subscription_chat(pid, payload):
+    """The sub-* twin of _upstream_chat(): run the user's local, already-signed-in
+    CLI and return an OpenAI chat-completions response shim. Never raises, never
+    streams. Shape matches _upstream_chat's contract so every downstream
+    translator (_chat_to_responses / _openai_resp_to_anthropic) just works."""
+    cfg = _SUB_PROVIDERS.get(pid) or {}
+    model = payload.get("model") or cfg.get("model") or "cli"
+    prompt = _sub_flatten(payload.get("messages"))
+    status, text, detail = _sub_run(pid, prompt)
+    # Count usage like any other provider so the dashboard shows it. sub-* has no
+    # researched row in quota.FREE_LIMITS, so it inherits DEFAULT_LIMIT
+    # (limit: None) -> reported as UNKNOWN and NEVER as exhausted, which is right:
+    # a subscription's remaining budget is not something this hub can know.
+    quota.record(pid, model)
+    if status in _DEAD_STATUSES:
+        _mark_model_dead(pid, model, status)
+    if status != 200:
+        return _SubResponse(status, {"error": {
+            "message": "%s: %s" % (cfg.get("name", pid), detail or "run failed"),
+            "type": "upstream_error", "code": status}})
+    # A CLI reports no token accounting, so usage is ESTIMATED (chars/4) — same
+    # heuristic the rest of the hub uses for sizing.
+    pt = max(1, len(prompt) // 4)
+    ct = max(1, len(text) // 4)
+    return _SubResponse(200, {
+        "id": "chatcmpl-sub-" + uuid.uuid4().hex,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "finish_reason": "stop",
+                     "message": {"role": "assistant", "content": text}}],
+        "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
+    })
+
+
+def _dispatch_chat(pid, payload, stream):
+    """Single entry point for the chain loops: a local subscription CLI for a
+    sub-* hop, the HTTP upstream for everything else. Keeps the loops
+    provider-agnostic and the HTTP path byte-identical to before."""
+    if _is_sub(pid):
+        return _subscription_chat(pid, payload)
+    return _upstream_chat(pid, payload, stream)
+
+
 # Reasoning EFFORT the manager assigns per task difficulty. A simple question gets
 # minimal thinking (fast); a hard task gets more. Applied ONLY to reasoning models
 # (non-reasoning models ignore it). This is what makes "the manager decides the
@@ -533,6 +968,14 @@ def _route_by_difficulty(messages, max_tokens=None, est=None):
             if prov.is_model_allowed(m) and not _is_model_dead(pid, m):
                 cands.append((_benchmark_score(pid, m), pid, m))
     if not cands:
+        # No FREE model exists at all (nothing keyed/enabled, or every candidate is
+        # dead/exhausted). ONLY here may an opt-in local subscription become the
+        # primary — it costs the user real money, so it never competes with a free
+        # model for that slot. With the master flag off this list is empty and the
+        # function returns exactly what it always did.
+        for sub_pid in _sub_available_providers():
+            for m in _sub_models(sub_pid):
+                return sub_pid, m, difficulty
         return None, None, difficulty
     # Prefer FAST models — the primary should be a good model the user won't wait
     # on. Slow reasoning models are used only if NO fast model is available (and
@@ -587,6 +1030,20 @@ def _resolve_model(model):
         head, rest = model.split("/", 1)
         if prov.get_provider(head):
             return head, rest
+        # Explicit local-subscription pick ('sub-codex/codex'). Honored ONLY while
+        # that provider is actually enabled+usable, and answered with an honest
+        # error otherwise — never silently downgraded onto the default provider
+        # (which would send a nonsense 'sub-codex/codex' model id upstream), and
+        # never able to spend the subscription while the feature is switched off.
+        if _is_sub(head):
+            if head in _sub_available_providers():
+                return head, (rest or _SUB_PROVIDERS[head]["model"])
+            if not _sub_master_on():
+                return None, ("Local subscription providers are off. Turn them on "
+                              "first — they spend your PAID Claude/ChatGPT plan.")
+            _e, _i, _a, detail = _sub_state(head)
+            return None, ("%s is not available: %s"
+                          % (_SUB_PROVIDERS[head]["name"], detail or "disabled"))
 
     default = config.get_default()
     # 'auto' (dashboard Auto mode), empty, or Claude Code's built-in claude-*
@@ -613,6 +1070,18 @@ def _resolve_model(model):
 
 def _check_provider_ready(pid):
     """None if usable, else a human error message."""
+    if _is_sub(pid):
+        # A local subscription provider has no key and no base_url: its gates are
+        # the two flags, the binary, and the CLI's own local session.
+        if not _sub_master_on():
+            return ("Local subscription providers are off. Turn them on first — "
+                    "they spend your PAID Claude/ChatGPT plan.")
+        enabled, _installed, authed, detail = _sub_state(pid)
+        if not enabled:
+            return "%s is switched off." % _SUB_PROVIDERS[pid]["name"]
+        if not authed:
+            return detail or ("%s is not usable." % _SUB_PROVIDERS[pid]["name"])
+        return None
     if not prov.get_provider(pid):
         return "Unknown provider '%s'." % pid
     pcfg = config.get_provider_config(pid)
@@ -669,6 +1138,20 @@ def _build_chain(primary_pid, model_id, est=0):
         if (pid, m) not in seen:
             chain.append((pid, m))
             seen.add((pid, m))
+    # LAST RESORT — the user's PAID local subscriptions, opt-in and OFF by
+    # default (so this loop normally adds NOTHING and the chain is identical to
+    # before). Appended after BOTH free tiers: a sub hop must only ever run once
+    # every free model has been tried and failed.
+    # Deliberately allowed past MAX_HOPS: that cap bounds free-provider fan-out,
+    # and the explicit last-resort fallback the user opted into must not be
+    # crowded out by the very free models that just failed.
+    for pid in _sub_available_providers():
+        if not _provider_capable(pid, est):   # always True today; keeps the rule honest
+            continue
+        for m in _sub_models(pid):
+            if (pid, m) not in seen:
+                chain.append((pid, m))
+                seen.add((pid, m))
     return chain
 
 
@@ -1304,6 +1787,84 @@ def api_status():
         "all_exhausted": free_count > 0 and exhausted == free_count,
         "any_exhausted": exhausted > 0,
     })
+
+
+# ---------------------------------------------------------------------------
+# Local subscription providers API (opt-in, default OFF)
+# ---------------------------------------------------------------------------
+# Localhost-open like the rest of /api/*. Read the state, flip the master switch,
+# flip one provider. Flags persist through config.get_flag/set_flag.
+
+_SUB_WARNING = (
+    "These providers spend your PAID Claude Code / ChatGPT subscriptions — they are "
+    "NOT free, and this hub cannot see how much of your plan is left. Each request "
+    "starts a local CLI process, so they are noticeably slower than the free HTTP "
+    "models, and they cannot stream. The hub only uses them as a LAST RESORT (after "
+    "every free model has failed) or when you pick one explicitly. They run the CLIs "
+    "as your local user with your own logged-in session: keep the hub bound to "
+    "127.0.0.1 and never expose it to a network."
+)
+
+
+def _sub_provider_rows():
+    """One row per sub provider for the dashboard. Inspection only — never runs a
+    CLI, so opening the page costs nothing."""
+    rows = []
+    for pid, cfg in _SUB_PROVIDERS.items():
+        enabled, installed, authed, detail = _sub_state(pid)
+        rows.append({
+            "id": pid,
+            "name": cfg["name"],
+            "model": pid + "/" + cfg["model"],
+            "bin": cfg["bin"],
+            "installed": installed,
+            "authenticated": authed,
+            "enabled": enabled,
+            "usable": bool(_sub_master_on() and enabled and authed),
+            "detail": detail,
+        })
+    return rows
+
+
+def _sub_payload():
+    return {"enabled": _sub_master_on(), "providers": _sub_provider_rows(),
+            "warning": _SUB_WARNING}
+
+
+@app.route("/api/subscriptions", methods=["GET"])
+def api_subscriptions():
+    """{enabled, providers:[{id,name,installed,authenticated,enabled,detail,...}],
+    warning}."""
+    return jsonify(_sub_payload())
+
+
+@app.route("/api/subscriptions", methods=["POST"])
+def api_subscriptions_update():
+    """Toggle the master switch or ONE provider, then return the same shape.
+
+      {"enabled": bool}                        -> master switch
+      {"provider": "sub-codex", "enabled": bool} -> that provider only
+
+    When 'provider' is present, 'enabled' applies to THAT provider (the master
+    switch is only touched by a body without 'provider') — so one call can never
+    silently mean both."""
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "Invalid JSON body."}), 400
+    pid = body.get("provider")
+    if pid is not None:
+        if pid not in _SUB_PROVIDERS:
+            return jsonify({"error": "Unknown subscription provider '%s'."
+                                     % _sanitize(str(pid), 40)}), 400
+        if not isinstance(body.get("enabled"), bool):
+            return jsonify({"error": "Pass 'enabled' (bool) with 'provider'."}), 400
+        config.set_flag(_SUB_PROVIDERS[pid]["flag"], bool(body["enabled"]))
+    elif isinstance(body.get("enabled"), bool):
+        config.set_flag(_SUB_MASTER_FLAG, bool(body["enabled"]))
+    else:
+        return jsonify({"error": "Pass {enabled: bool} and/or "
+                                 "{provider: 'sub-codex', enabled: bool}."}), 400
+    return jsonify(_sub_payload())
 
 
 # ---------------------------------------------------------------------------
@@ -2354,6 +2915,10 @@ def _hub_serves_now():
     if not pid:
         return None, None
     for hop_pid, hop_model in _build_chain(pid, model):
+        if _is_sub(hop_pid):
+            # A connectivity probe must NEVER spend the user's paid subscription:
+            # this proves the FREE pipeline works, and a sub hop is not part of it.
+            continue
         payload = {"model": hop_model, "max_tokens": 8, "stream": False,
                    "messages": [{"role": "user", "content": "Reply with the single word: OK"}]}
         try:
@@ -2688,12 +3253,15 @@ def v1_chat_completions():
     for hop_pid, hop_model in _build_chain(pid, resolved, est):
         if not prov.is_model_allowed(hop_model):
             continue
+        if stream and _is_sub(hop_pid):
+            errors.append("%s: skipped (a local CLI cannot stream)" % hop_pid)
+            continue
         payload = dict(body)
         payload["model"] = hop_model
         _apply_reasoning_effort(payload, hop_model, diff)
         try:
             _act_pick(hop_pid, hop_model)
-            resp = _upstream_chat(hop_pid, payload, stream)
+            resp = _dispatch_chat(hop_pid, payload, stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             continue
@@ -3111,13 +3679,16 @@ def v1_responses():
     for hop_pid, hop_model in _build_chain(pid, resolved, est):
         if not prov.is_model_allowed(hop_model):
             continue
+        if stream and _is_sub(hop_pid):
+            errors.append("%s: skipped (a local CLI cannot stream)" % hop_pid)
+            continue
         payload = dict(base_payload)
         payload["model"] = hop_model
         _apply_reasoning_effort(payload, hop_model, diff)
         payload["stream"] = stream
         try:
             _act_pick(hop_pid, hop_model)
-            resp = _upstream_chat(hop_pid, payload, stream)
+            resp = _dispatch_chat(hop_pid, payload, stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             continue
@@ -3496,13 +4067,16 @@ def v1_messages():
     for hop_pid, hop_model in _build_chain(pid, resolved, est):
         if not prov.is_model_allowed(hop_model):
             continue
+        if stream and _is_sub(hop_pid):
+            errors.append("%s: skipped (a local CLI cannot stream)" % hop_pid)
+            continue
         payload = dict(base_payload)
         payload["model"] = hop_model
         _apply_reasoning_effort(payload, hop_model, diff)
         payload["stream"] = stream
         try:
             _act_pick(hop_pid, hop_model)
-            resp = _upstream_chat(hop_pid, payload, stream)
+            resp = _dispatch_chat(hop_pid, payload, stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             continue
