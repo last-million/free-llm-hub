@@ -11,3 +11,6 @@ __pycache__/
 config.json
 .free-llm-hub/
 .env
+
+# scratch commit-message files (never commit)
+cm*.txt

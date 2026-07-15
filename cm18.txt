@@ -1,7 +1,0 @@
-brand: DAVID SEO -> Last-Million (7 occurrences)
-
-Byline, README, dashboard footer, and the PolyForm Required Notice in
-LICENSE. Now consistent with the github.com/last-million URL the notice
-already carried.
-
-Verified on a confirmed-fresh process: Last-Million x3 rendered, DAVID x0.
