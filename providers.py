@@ -273,19 +273,75 @@ PROVIDERS: Dict[str, dict] = {
         # Families widened from the maintained MIT list cheahjs/free-llm-api-resources:
         # the earlier @cf/meta + @cf/openai pair silently excluded most of the free
         # catalog (gemma, granite, kimi, nemotron, qwen, glm, sea-lion).
+        # DO NOT enable live discovery here without fixing BOTH problems below.
+        # 1) Shape: CF returns {"result":[...]} - _parse_model_ids only reads
+        #    "data"/"models" - and each row's "id" is a UUID while the real model
+        #    id is in "name", so the parser would pin UUIDs.
+        # 2) LEAK: free_filter 'family' includes "@cf/zai-org", which matches the
+        #    PAID @cf/zai-org/glm-5.2 as well as the free glm-4.7-flash. Live
+        #    discovery would route a paid model as free - the exact bug class that
+        #    produced the 13 bad rows here. Family matching cannot express this
+        #    catalog; only exact pins can.
         "free_filter": "family",
-        "free_families": ["@cf/meta", "@cf/openai", "@cf/google", "@cf/qwen",
-                          "@cf/zai-org", "@cf/moonshotai", "@cf/nvidia",
-                          "@cf/ibm-granite", "@cf/aisingapore", "@cf/mistral"],
-        "default_free_models": [
-            "@cf/openai/gpt-oss-120b",
+        "free_exact": True,
+        # Probed 2026-07-15 against the real catalog (GET /ai/models/search: 61
+        # models, 26 Text Generation) with a live key. 24/26 answered; the list
+        # below is the 22 that are actually USABLE for chat, fastest first.
+        # Excluded on evidence, do not "restore" them:
+        #   @cf/zai-org/glm-5.2                   403 "not available on this plan" (PAID)
+        #   @cf/meta/llama-3.2-11b-vision-instruct 403 needs a Model Agreement accepted
+        #   @cf/meta/llama-guard-3-8b             a MODERATION model - replies "safe",
+        #                                         not chat (same trap as groq prompt-guard)
+        #   @cf/meta-llama/llama-2-7b-chat-hf-lora 51s and returns gibberish
+        # NOTE the previously-shipped "@cf/meta/llama-3.1-8b-instruct" DOES NOT
+        # EXIST - the real id is "-fp8". It was a guess and it was wrong.
+        "free_families": [
+            "@cf/meta/llama-3.2-3b-instruct",
+            "@cf/mistral/mistral-7b-instruct-v0.2-lora",
+            "@cf/meta/llama-4-scout-17b-16e-instruct",      # VISION, 0.7s
+            "@cf/google/gemma-2b-it-lora",
+            "@cf/qwen/qwen2.5-coder-32b-instruct",
+            "@cf/aisingapore/gemma-sea-lion-v4-27b-it",
             "@cf/openai/gpt-oss-20b",
-            "@cf/qwen/qwen3-30b-a3b-fp8",
-            "@cf/zai-org/glm-4.7-flash",
-            "@cf/moonshotai/kimi-k2.7-code",
-            "@cf/nvidia/nemotron-3-120b-a12b",
+            "@cf/meta/llama-3.1-8b-instruct-fp8",
+            "@cf/meta/llama-3.2-1b-instruct",
             "@cf/google/gemma-4-26b-a4b-it",
-            "@cf/meta/llama-3.1-8b-instruct",
+            "@cf/ibm-granite/granite-4.0-h-micro",
+            "@cf/nvidia/nemotron-3-120b-a12b",
+            "@cf/mistralai/mistral-small-3.1-24b-instruct",
+            "@cf/openai/gpt-oss-120b",
+            "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            "@cf/qwen/qwen3-30b-a3b-fp8",
+            "@cf/moonshotai/kimi-k2.7-code",
+            "@cf/moonshotai/kimi-k2.6",
+            "@cf/google/gemma-7b-it-lora",
+            "@cf/zai-org/glm-4.7-flash",
+            "@cf/qwen/qwq-32b",                             # reasoning, slow
+            "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",  # reasoning, slow
+        ],
+        "default_free_models": [
+            "@cf/meta/llama-3.2-3b-instruct",
+            "@cf/mistral/mistral-7b-instruct-v0.2-lora",
+            "@cf/meta/llama-4-scout-17b-16e-instruct",
+            "@cf/google/gemma-2b-it-lora",
+            "@cf/qwen/qwen2.5-coder-32b-instruct",
+            "@cf/aisingapore/gemma-sea-lion-v4-27b-it",
+            "@cf/openai/gpt-oss-20b",
+            "@cf/meta/llama-3.1-8b-instruct-fp8",
+            "@cf/meta/llama-3.2-1b-instruct",
+            "@cf/google/gemma-4-26b-a4b-it",
+            "@cf/ibm-granite/granite-4.0-h-micro",
+            "@cf/nvidia/nemotron-3-120b-a12b",
+            "@cf/mistralai/mistral-small-3.1-24b-instruct",
+            "@cf/openai/gpt-oss-120b",
+            "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            "@cf/qwen/qwen3-30b-a3b-fp8",
+            "@cf/moonshotai/kimi-k2.7-code",
+            "@cf/moonshotai/kimi-k2.6",
+            "@cf/google/gemma-7b-it-lora",
+            "@cf/zai-org/glm-4.7-flash",
+            "@cf/qwen/qwq-32b",
+            "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
         ],
         "notes": ("SAFE-FREE: 10,000 Neurons/day, reset 00:00 UTC. On the Workers FREE plan "
                   "the allocation is a HARD CAP — exceeding it fails with an error, it does "
