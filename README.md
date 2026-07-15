@@ -2,6 +2,8 @@
 
 *Made by **DAVID SEO** from **Calvoun**.*
 
+▶️ **[Subscribe on YouTube — @QuantumSEO-AR](https://www.youtube.com/@QuantumSEO-AR)** for updates & news.
+
 **A tiny local gateway that gives every CLI on your machine — including Claude Code — access to free LLM providers.**
 
 > **License notice:** This is **not** free/MIT software. It is source-available under the **PolyForm Noncommercial License 1.0.0** — personal, hobby, research and study use only. **You may not sell it, host it as a paid service, or use it in a commercial product/web app.** See [`LICENSE`](LICENSE). For commercial use, contact the author.
