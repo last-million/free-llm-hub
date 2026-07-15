@@ -265,7 +265,17 @@ PROVIDERS: Dict[str, dict] = {
             "cohere/cohere-command-a", "microsoft/phi-4", "openai/gpt-4.1",
             "meta/llama-3.3-70b-instruct", "deepseek/deepseek-v3-0324",
         ],
-        "notes": "Genuinely free with a GitHub PAT (models:read) — nothing is consumed. 150 req/day (low-tier ids) / 50 req/day (high-tier). GOTCHA: the free tier caps EVERY request at 8K in / 4K out regardless of the model's advertised context.",
+        "notes": ("Genuinely free with a GitHub PAT — nothing is consumed. 150 req/day (low-tier ids) "
+                  "/ 50 req/day (high-tier). "
+                  "⚠ THE TOKEN NEEDS THE 'models' SCOPE, or EVERY call returns 403 'No access to "
+                  "model' even though the catalog lists fine (a key test that only lists models will "
+                  "look OK - verified live: 0 of 23 models worked without it). "
+                  "Fine-grained token: github.com/settings/personal-access-tokens/new -> Permissions -> "
+                  "Account permissions -> Models: Read. "
+                  "Classic token: github.com/settings/tokens/new -> tick the 'models' scope. "
+                  "No repo access is needed - Models is an ACCOUNT permission, so grant nothing else. "
+                  "GOTCHA: the free tier caps EVERY request at 8K in / 4K out regardless of the "
+                  "model's advertised context."),
     },
     "deepseek": {
         "name": "DeepSeek",
