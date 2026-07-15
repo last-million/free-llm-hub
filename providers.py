@@ -140,6 +140,24 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": [],
         "notes": "No free models — all 8 models bill per token. The '200 req free every month' headline actually meters TOKENS ($2.50 / 250K credits per month): a coding CLI's 20-50K-token turns make the real allowance ~5-12 requests/month.",
     },
+    "codestral": {
+        "name": "Mistral Codestral (free)",
+        # SEPARATE endpoint + SEPARATE key from La Plateforme ("mistral" above):
+        # a Codestral key does NOT work on api.mistral.ai and vice versa.
+        "base_url": "https://codestral.mistral.ai/v1",
+        "models_url": "https://codestral.mistral.ai/v1/models",
+        "signup_url": "https://console.mistral.ai/codestral",
+        "key_hint": "codestral key",
+        "free_filter": "family",
+        "free_families": ["codestral"],
+        "default_free_models": ["codestral-latest"],
+        "notes": ("Genuinely free code model, and the most generous free coding tier here: "
+                  "30 req/min, 2,000 req/day (per cheahjs/free-llm-api-resources, MIT). "
+                  "Requires PHONE VERIFICATION to get the key, and it is a DIFFERENT key + "
+                  "endpoint from Mistral La Plateforme — a La Plateforme key will not work "
+                  "here. Codestral only (code completion/chat), so the family is pinned; "
+                  "no general chat catalog to leak."),
+    },
     "pollinations": {
         "name": "Pollinations.AI",
         "base_url": "https://text.pollinations.ai/openai",
@@ -173,24 +191,37 @@ PROVIDERS: Dict[str, dict] = {
         "base_url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
         # Cloudflare's model list is NOT OpenAI-shaped (returns a CF envelope, and
         # the OpenAI-compat base exposes no /v1/models at all), so live discovery
-        # cannot parse it and falls back to default_free_models below. That is fine.
+        # can't parse it and falls back to default_free_models below. That is fine.
+        # Kept templated (not None) so it stays documented; app.py fills {account_id}.
         "models_url": None,
         "signup_url": "https://dash.cloudflare.com/sign-up",
         "key_hint": "Cloudflare API token (Workers AI scope)",
+        # Families widened from the maintained MIT list cheahjs/free-llm-api-resources:
+        # the earlier @cf/meta + @cf/openai pair silently excluded most of the free
+        # catalog (gemma, granite, kimi, nemotron, qwen, glm, sea-lion).
         "free_filter": "family",
-        "free_families": ["@cf/meta", "@cf/openai"],
+        "free_families": ["@cf/meta", "@cf/openai", "@cf/google", "@cf/qwen",
+                          "@cf/zai-org", "@cf/moonshotai", "@cf/nvidia",
+                          "@cf/ibm-granite", "@cf/aisingapore", "@cf/mistral"],
         "default_free_models": [
-            "@cf/meta/llama-3.1-8b-instruct",
             "@cf/openai/gpt-oss-120b",
-            "@cf/meta/llama-4-scout-17b-16e-instruct",
+            "@cf/openai/gpt-oss-20b",
+            "@cf/qwen/qwen3-30b-a3b-fp8",
+            "@cf/zai-org/glm-4.7-flash",
+            "@cf/moonshotai/kimi-k2.7-code",
+            "@cf/nvidia/nemotron-3-120b-a12b",
+            "@cf/google/gemma-4-26b-a4b-it",
+            "@cf/meta/llama-3.1-8b-instruct",
         ],
         "notes": ("SAFE-FREE: 10,000 Neurons/day, reset 00:00 UTC. On the Workers FREE plan "
                   "the allocation is a HARD CAP — exceeding it fails with an error, it does "
                   "NOT bill (Workers Paid bills $0.011/1k Neurons past it). Free plan is the "
                   "default, no card for the first call. "
-                  "⚠ SETUP: the base URL is account-scoped — paste "
-                  "https://api.cloudflare.com/client/v4/accounts/<YOUR_ACCOUNT_ID>/ai/v1 into "
-                  "'Advanced: custom base URL' on this card, or nothing will work. "
+                  "SETUP: just paste a Workers-AI-scoped API token — the hub resolves your "
+                  "account id from the token itself (GET /client/v4/accounts) and fills in the "
+                  "account-scoped base URL for you. If that lookup fails (token too narrowly "
+                  "scoped), paste https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1 "
+                  "into 'Advanced: custom base URL' instead. "
                   "Quota is denominated in NEURONS (varies per model), not requests, so the "
                   "hub tracks it as UNKNOWN rather than inventing a request count. Model ids "
                   "verified from individual model pages (the index renders bare slugs without "

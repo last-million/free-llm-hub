@@ -38,7 +38,7 @@ import time
 FREE_LIMITS = {
     # ── genuinely free tiers (researched) ───────────────────────────────────
     "groq":          {"limit": 1000,  "window": "day"},     # high: RPD floor across free chat models (llama-3.1-8b-instant is 14.4k/day)
-    "cerebras":      {"limit": 5,     "window": "minute"},  # high: 5 RPM + 1M tok/day. NO req/day cap is documented at all — the old 14400/day tracked a window Cerebras does not enforce (looked like stale Groq cross-contamination).
+    "cerebras":      {"limit": 14400, "window": "day"},     # high: 30 req/min, 900/hour, 14,400 req/day, 1M tok/day (per-model, gpt-oss-120b & Llama-3.1-8B). CORRECTED BACK from a wrong 5/minute: a research pass claimed no daily cap existed and that 14400 was "stale Groq cross-contamination" — it is not. Cerebras really is 14,400/day; Groq's llama-3.1-8b sharing that exact number is the coincidence that caused the mistake. Cross-checked against cheahjs/free-llm-api-resources (MIT). The 30/min burst limit is handled by the 429 -> 60s cooldown path, not by this daily budget.
     "openrouter":    {"limit": 50,    "window": "day"},     # high: 50/day TOTAL across all ':free' models (1000/day after a one-time $10 top-up)
     "github-models": {"limit": 150,   "window": "day"},     # high: Copilot Free low-tier RPD (high-tier ids are 50/day, deepseek-r1 8/day — separate buckets)
     "sambanova":     {"limit": 20,    "window": "day"},     # medium: official Free Tier table = 20 RPM / 20 RPD / 200k TPD (was 300/day = 15x too high)

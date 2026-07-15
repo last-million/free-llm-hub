@@ -84,6 +84,7 @@ MAX_HOPS = 6                  # primary + up to 5 fallback models (across provid
 
 _model_cache = {}             # pid -> (timestamp, [model ids])
 _model_cache_lock = threading.Lock()
+_cf_account_cache = {}        # cloudflare api token -> account id (see _cf_account_id)
 
 
 # ---------------------------------------------------------------------------
@@ -125,13 +126,49 @@ def _sanitize(text, limit=400):
 # Helpers: providers / models
 # ---------------------------------------------------------------------------
 
+def _needs_key(pid):
+    """False for providers that are usable with NO api key at all (e.g.
+    Pollinations' anonymous tier: no key, no signup, no card). Everything in the
+    key path has to honor this or such a provider is registered but unreachable."""
+    p = prov.get_provider(pid) or {}
+    return not p.get("no_key")
+
+
+def _bootstrap_no_key_providers():
+    """Enable each no-key provider ONCE, on first sight.
+
+    A keyed provider is enabled implicitly by the act of saving a key. A no-key
+    provider has nothing to save, so without this it would sit disabled forever
+    and be registered-but-unusable — which is exactly what happened: Pollinations
+    answered fine on its own, but the hub refused it with "is disabled".
+
+    Only ever writes when the user has NOT expressed an opinion (no `enabled` key
+    stored). Disable it in the dashboard and that decision sticks — the row then
+    carries enabled=False and this never touches it again. Best-effort."""
+    try:
+        rows = (config.load_config() or {}).get("providers") or {}
+        for p in prov.list_providers():
+            pid = p["id"]
+            if not (prov.get_provider(pid) or {}).get("no_key"):
+                continue
+            row = rows.get(pid)
+            if isinstance(row, dict) and row.get("enabled") is not None:
+                continue  # user already chose — respect it
+            config.set_provider_config(pid, enabled=True)
+    except Exception:
+        pass  # never block startup over a convenience default
+
+
 def _enabled_keyed():
-    """Provider ids that are enabled AND have an API key saved."""
+    """Provider ids that are enabled AND have an API key saved — plus enabled
+    no-key providers, which are usable precisely because they need no key."""
     out = []
     for p in prov.list_providers():
         pid = p["id"]
         pcfg = config.get_provider_config(pid)
-        if pcfg.get("enabled") and pcfg.get("api_key"):
+        if not pcfg.get("enabled"):
+            continue
+        if pcfg.get("api_key") or not _needs_key(pid):
             out.append(pid)
     return out
 
@@ -145,12 +182,56 @@ def _available_providers():
     return live or keyed
 
 
+def _cf_account_id(api_key):
+    """Resolve the Cloudflare account id from the API token itself.
+
+    Cloudflare's base URL is account-scoped
+    (.../accounts/{account_id}/ai/v1), which is why it can't just be a registry
+    row. But the token can tell us: GET /client/v4/accounts returns the accounts
+    it can see, so the user pastes ONLY a token and the hub fills in the rest.
+    Cached; returns None on any failure (caller falls back to the custom base)."""
+    if not api_key:
+        return None
+    hit = _cf_account_cache.get(api_key)
+    if hit:
+        return hit
+    try:
+        r = requests.get("https://api.cloudflare.com/client/v4/accounts",
+                         headers={"Authorization": "Bearer " + api_key},
+                         timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
+        if r.status_code == 200:
+            res = (r.json() or {}).get("result") or []
+            if res and isinstance(res[0], dict) and res[0].get("id"):
+                _cf_account_cache[api_key] = res[0]["id"]
+                return res[0]["id"]
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_base_url(pid, pcfg):
+    """Provider base URL, with Cloudflare's {account_id} filled in from the token.
+
+    A user-set custom base still wins (base_url_for); this only rescues the case
+    where the registry base carries a template and the user pasted just a token."""
+    base = prov.base_url_for(pid, pcfg.get("base_url"))
+    if base and "{account_id}" in base:
+        acct = _cf_account_id(pcfg.get("api_key"))
+        if acct:
+            return base.replace("{account_id}", acct)
+    return base
+
+
 def _models_url_for(pid, pcfg):
     p = prov.get_provider(pid) or {}
     custom = pcfg.get("base_url")
     if custom:
         return custom.rstrip("/") + "/models"
-    return p.get("models_url")
+    murl = p.get("models_url")
+    if murl and "{account_id}" in murl:
+        acct = _cf_account_id(pcfg.get("api_key"))
+        return murl.replace("{account_id}", acct) if acct else None
+    return murl
 
 
 def _parse_model_ids(payload):
@@ -183,7 +264,9 @@ def provider_free_models(pid, live=True):
         return []
     defaults = [m for m in (p.get("default_free_models") or []) if prov.is_model_allowed(m)]
     pcfg = config.get_provider_config(pid)
-    if not live or not pcfg.get("api_key"):
+    # A no-key provider can still be discovered live (its /models needs no auth);
+    # everything else without a key has nothing to authenticate with.
+    if not live or (not pcfg.get("api_key") and _needs_key(pid)):
         return defaults
 
     now = time.time()
@@ -198,7 +281,10 @@ def provider_free_models(pid, live=True):
         try:
             resp = requests.get(
                 url,
-                headers={"Authorization": "Bearer " + pcfg["api_key"]},
+                # no_key providers have no key to send (and pcfg["api_key"] would
+                # KeyError); their /models is public.
+                headers=({"Authorization": "Bearer " + pcfg["api_key"]}
+                         if pcfg.get("api_key") else {}),
                 timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT),
             )
             if resp.status_code == 200:
@@ -1085,7 +1171,7 @@ def _check_provider_ready(pid):
     if not prov.get_provider(pid):
         return "Unknown provider '%s'." % pid
     pcfg = config.get_provider_config(pid)
-    if not pcfg.get("api_key"):
+    if not pcfg.get("api_key") and _needs_key(pid):
         return "Provider '%s' has no API key saved. Add one on the dashboard." % pid
     if not pcfg.get("enabled"):
         return "Provider '%s' is disabled. Enable it on the dashboard." % pid
@@ -1181,12 +1267,22 @@ def _upstream_chat(pid, payload, stream):
     so the caller's provider-level fallback still kicks in). May raise
     requests.RequestException or RuntimeError. Never logs a key."""
     pcfg = config.get_provider_config(pid)
-    base = prov.base_url_for(pid, pcfg.get("base_url"))
+    # _resolve_base_url, not base_url_for: it also fills Cloudflare's
+    # {account_id} from the token so the user only pastes a key.
+    base = _resolve_base_url(pid, pcfg)
     if not base:
         raise RuntimeError("no base_url for provider " + pid)
+    if "{account_id}" in base:
+        raise RuntimeError(
+            "could not resolve the Cloudflare account id from this token — paste your "
+            "account-scoped base URL into 'Advanced: custom base URL' on the card")
     keys = pcfg.get("api_keys") or []
     if not keys:
-        raise RuntimeError("no api key for provider " + pid)
+        if _needs_key(pid):
+            raise RuntimeError("no api key for provider " + pid)
+        # No-key provider (e.g. Pollinations' anonymous tier): run exactly one
+        # "key-less" pass. None is the sentinel -> no Authorization header below.
+        keys = [None]
     url = base.rstrip("/") + "/chat/completions"
     n = len(keys)
     start = _next_key_start(pid, n)
@@ -1198,7 +1294,9 @@ def _upstream_chat(pid, payload, stream):
             resp = requests.post(
                 url,
                 json=payload,
-                headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+                headers=({"Content-Type": "application/json"} if key is None else
+                         {"Authorization": "Bearer " + key,
+                          "Content-Type": "application/json"}),
                 stream=stream,
                 # Streaming: bound the inter-chunk (idle) read at STREAM_IDLE_TIMEOUT
                 # so a stalled stream fails in ~90s not 300s (the handler's first-byte
@@ -4301,6 +4399,7 @@ def _print_banner():
 
 
 if __name__ == "__main__":
+    _bootstrap_no_key_providers()  # no-key providers have nothing to configure -> on
     _print_banner()
     _start_auto_update()
     app.run(host=HOST, port=PORT, threaded=True, debug=False)
