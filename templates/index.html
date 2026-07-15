@@ -1755,6 +1755,31 @@
     appendCommandBlocks(box, commands);
     openModal((c.name || c.id) + ' — ' + (kind || 'setup'), box);
   }
+  /* Prominent post-connect / post-disconnect modal — a toast is too easy to miss, so
+     this reuses the shared #modal-overlay via openModal() (same role="dialog", same
+     close affordance + Escape-to-close wired in initModal). `lines` is an array of
+     {cls, html}; html is caller-escaped safe markup (dynamic names go through esc()).
+     Optional `commands` reuses appendCommandBlocks() so env-based CLIs still surface
+     their copy blocks. A single "Got it" button routes to the existing closeModal(). */
+  function openRestartModal(title, lines, commands){
+    var box = frag();
+    (lines || []).forEach(function(ln){
+      if (!ln || !ln.html) return;
+      var d = document.createElement('div');
+      d.className = ln.cls || 'note';
+      d.innerHTML = ln.html;
+      box.appendChild(d);
+    });
+    if (commands) appendCommandBlocks(box, commands);
+    var act = document.createElement('div'); act.className = 'modal-block';
+    var got = document.createElement('button');
+    got.type = 'button'; got.className = 'btn primary'; got.textContent = 'Got it';
+    got.addEventListener('click', closeModal);
+    act.appendChild(got);
+    box.appendChild(act);
+    openModal(title, box);
+    setTimeout(function(){ try { got.focus(); } catch(e){} }, 0);
+  }
   /* Mirror the backend's _env_commands so the collapsed Setup details also shows
      cross-platform command blocks (the /instructions route returns an env map). */
   function envToCommands(env){
@@ -1827,14 +1852,23 @@
     busyBtn(btn, 'Connecting…');
     api('/api/clis/' + encodeURIComponent(c.id) + '/autofix', { method: 'POST' }).then(function(r){
       if (r && r.ok){
-        var msg = (c.name || c.id) + ' connected';
+        var name = c.name || c.id;
+        var safe = esc(name);
+        var msg = name + ' connected';
         if (r.wrote_path) msg += ' → ' + shortPath(r.wrote_path);
         if (r.restart_hint) msg += ' · ' + r.restart_hint;
         toast(msg);
-        if (r.commands && (typeof r.commands === 'object' || Array.isArray(r.commands))){
-          openCommandsModal(c, r.note || 'One more step to finish connecting — run this:', r.commands, 'one more step');
-        }
-        return loadClis();
+        var cmds = (r.commands && (typeof r.commands === 'object' || Array.isArray(r.commands))) ? r.commands : null;
+        /* refresh the card first, THEN raise the prominent restart modal */
+        return loadClis().then(function(){
+          var lines = [
+            { cls:'note', html: safe + ' is now pointed at the Free LLM Hub (free models).' },
+            { cls:'chat-note show', html: '⚠️ If ' + safe + ' is already open, restart it now — close it and reopen (or open a new terminal) — so it picks up the new config. A running session keeps its old config until you restart.' }
+          ];
+          if (r.restart_hint) lines.push({ cls:'cli-setup-note', html: esc(r.restart_hint) });
+          if (r.note) lines.push({ cls:'cli-setup-note', html: esc(r.note) });
+          openRestartModal('✅ ' + name + ' connected', lines, cmds);
+        });
       }
       if (r && r.manual){
         openCommandsModal(c, r.note, r.commands, 'manual setup');
@@ -1852,19 +1886,40 @@
   function doDisconnect(c, btn){
     busyBtn(btn, 'Disconnecting…');
     api('/api/clis/' + encodeURIComponent(c.id) + '/disconnect', { method: 'POST' }).then(function(r){
-      if (r && r.ok){
-        var msg = (c.name || c.id) + ' disconnected';
-        if (r.restart_hint) msg += ' · ' + r.restart_hint;
-        toast(msg);
-        return loadClis();
-      }
-      if (r && r.manual){
-        openCommandsModal(c, r.note, r.commands, 'manual disconnect');
+      r = r || {};
+      var name = c.name || c.id;
+      var safe = esc(name);
+      var warnLine = { cls:'chat-note show', html: '⚠️ If ' + safe + ' is still open, restart it now — close and reopen (or open a new terminal) — so it stops using the hub and uses its normal model. A running session won’t switch until you restart.' };
+      /* manual CLI: card state is unchanged (user must run the commands), so no refresh —
+         but still raise the prominent restart modal with the commands. */
+      if (r.manual){
+        var mlines = [
+          { cls:'note', html: 'Run the commands below to finish disconnecting ' + safe + ' from the hub.' },
+          warnLine
+        ];
+        if (r.restart_hint) mlines.push({ cls:'cli-setup-note', html: esc(r.restart_hint) });
+        if (r.note) mlines.push({ cls:'cli-setup-note', html: esc(r.note) });
+        openRestartModal('↩︎ ' + name + ' disconnected', mlines, r.commands || null);
         resetBtn(btn, 'Disconnect');
         return;
       }
-      toast((r && r.reason) || 'Disconnect unavailable', true);
-      resetBtn(btn, 'Disconnect');
+      if (r.ok === false){
+        toast(r.reason || 'Disconnect unavailable', true);
+        resetBtn(btn, 'Disconnect');
+        return;
+      }
+      /* success (r.ok truthy, or not an error) */
+      var msg = name + ' disconnected';
+      if (r.restart_hint) msg += ' · ' + r.restart_hint;
+      toast(msg);
+      return loadClis().then(function(){
+        var lines = [
+          { cls:'note', html: safe + ' is back to its normal setup (no longer using the hub).' },
+          warnLine
+        ];
+        if (r.restart_hint) lines.push({ cls:'cli-setup-note', html: esc(r.restart_hint) });
+        openRestartModal('↩︎ ' + name + ' disconnected', lines, null);
+      });
     }).catch(function(e){
       toast('Disconnect failed: ' + e.message, true);
       resetBtn(btn, 'Disconnect');
