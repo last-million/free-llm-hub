@@ -159,6 +159,25 @@
   }
   .card:hover{border-color:var(--border)}
   .card.enabled{border-color:rgba(34,197,94,.35)}
+  /* provider-card API-key health (B): green = key works, red = key fails, grey = testing/unknown.
+     Left accent uses inset box-shadow (no layout shift); no-key cards stay neutral (no state class). */
+  .card.key-ok{border-color:rgba(34,197,94,.45);box-shadow:inset 3px 0 0 var(--accent)}
+  .card.key-bad{border-color:rgba(239,68,68,.5);box-shadow:inset 3px 0 0 var(--danger)}
+  .card.key-testing,.card.key-unknown{box-shadow:inset 3px 0 0 var(--text-faint)}
+  .key-health{
+    display:none;align-items:center;gap:5px;flex:none;
+    font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+    border-radius:5px;padding:2.5px 7px;white-space:nowrap;
+    background:var(--surface-3);color:var(--text-faint);
+  }
+  .card.key-ok .key-health,.card.key-bad .key-health,.card.key-testing .key-health,.card.key-unknown .key-health{display:inline-flex}
+  .key-health .kh-dot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--text-faint)}
+  .card.key-ok .key-health{background:var(--accent-soft);color:var(--accent)}
+  .card.key-ok .key-health .kh-dot{background:var(--accent);box-shadow:0 0 6px rgba(34,197,94,.6)}
+  .card.key-bad .key-health{background:var(--danger-soft);color:#fca5a5}
+  .card.key-bad .key-health .kh-dot{background:var(--danger)}
+  .card.key-testing .key-health .kh-dot{animation:khpulse 1.1s ease-in-out infinite}
+  @keyframes khpulse{0%,100%{opacity:1}50%{opacity:.25}}
   .card-top{display:flex;align-items:flex-start;gap:10px}
   .card-top .name{font-weight:700;font-size:15px;letter-spacing:-.01em;min-width:0;overflow-wrap:anywhere}
   .card-top .pid{font-family:var(--mono);font-size:11px;color:var(--text-faint)}
@@ -501,6 +520,15 @@
   .quota-bar.bad > i{background:var(--danger)}
   .quota-row .qr-reset{font-size:12px;color:var(--text-faint)}
   .quota-row .qr-reset b{font-family:var(--mono);font-weight:600;color:var(--text-dim)}
+  /* per-model usage sub-list (A) — one line per model actually served this window */
+  .quota-row .qr-models{display:flex;flex-direction:column;gap:3px;margin-top:1px}
+  .quota-row .qr-model{display:flex;align-items:baseline;gap:8px;min-width:0;line-height:1.5}
+  .quota-row .qr-model .qm-id{
+    flex:1;min-width:0;font-family:var(--mono);font-size:11.5px;color:var(--text-dim);
+    overflow-wrap:anywhere;word-break:break-all;
+  }
+  .quota-row .qr-model .qm-count{flex:none;font-family:var(--mono);font-size:11.5px;color:var(--text-faint);white-space:nowrap}
+  .quota-row .qr-models-empty{font-size:11.5px;color:var(--text-faint);font-style:italic}
 
   /* ---------- auto-update control (C) ---------- */
   .au-row{
@@ -732,6 +760,8 @@
   var quotaState = {};        /* pid -> live quota model; resets_in ticks down locally */
   var autoUpdateData = null;
   var _ebSig = '';            /* last structural signature of the exhaustion banner */
+  var keyHealth = {};         /* pid -> {state:'ok'|'bad'|'unknown', detail} — cached per session, NOT re-run on the 15s poll */
+  var _healthTesting = {};    /* pid -> true while an /api/test key-health check is in flight */
 
   /* ---------- helpers ---------- */
   function $(s, el){ return (el||document).querySelector(s); }
@@ -841,7 +871,8 @@
         window: e.window || '',
         resets_in: Math.max(0, numOr(e.resets_in, 0)),
         throttled: !!e.throttled,
-        exhausted: !!e.exhausted
+        exhausted: !!e.exhausted,
+        models: (e.models && typeof e.models === 'object') ? e.models : {}  /* {model_id: used_count} this window */
       };
     });
     renderExhaustion(s);
@@ -889,6 +920,24 @@
     setBannerOffset(banner.offsetHeight);
   }
 
+  /* per-model usage sub-list for one provider's quota row (A): sorted by count desc;
+     muted line when the provider hasn't served anything this window. */
+  function quotaModelsHTML(st){
+    var m = (st && st.models) || {};
+    var ids = Object.keys(m);
+    if (!ids.length){
+      var win = st && st.window ? st.window : 'window';
+      return '<div class="qr-models-empty">no models used yet this ' + esc(win) + '</div>';
+    }
+    ids.sort(function(a, b){ return numOr(m[b], 0) - numOr(m[a], 0); });
+    return '<div class="qr-models">' + ids.map(function(id){
+      return '<div class="qr-model">' +
+               '<code class="qm-id">' + esc(id) + '</code>' +
+               '<span class="qm-count">— ' + esc(numOr(m[id], 0)) + ' used</span>' +
+             '</div>';
+    }).join('') + '</div>';
+  }
+
   function renderQuota(){
     var host = document.getElementById('quota-list');
     if (!host) return;
@@ -914,6 +963,7 @@
           '<div class="quota-bar ' + barClass + '"><i style="width:' + pct.toFixed(1) + '%"></i></div>' +
           '<div class="qr-reset">resets in <b class="js-reset" data-pid="' + esc(pid) + '">' +
             esc(fmtCountdown(st.resets_in)) + '</b></div>' +
+          quotaModelsHTML(st) +
         '</div>';
     }).join('');
   }
@@ -1097,7 +1147,10 @@
     return '' +
       '<div class="card-top">' +
         '<div><div class="name">' + esc(p.name || p.id) + '</div><div class="pid">' + esc(p.id) + '</div></div>' +
-        '<div class="badges">' + badges + '</div>' +
+        '<div class="badges">' +
+          '<span class="key-health"><span class="kh-dot"></span><span class="kh-lbl"></span></span>' +
+          badges +
+        '</div>' +
       '</div>' +
       (p.notes ? '<div class="notes">' + esc(p.notes) + '</div>' : '') +
       (fm.length ? '<div class="models-preview"><b>' + fm.length + ' free model' + (fm.length > 1 ? 's' : '') + ':</b> ' + esc(fmPrev) + '</div>' : '') +
@@ -1148,6 +1201,7 @@
       card.dataset.pid = p.id;
       card.innerHTML = cardHTML(p);
       wireCard(card, p);
+      applyCardHealth(card, p.id);   /* colour from cached key-health (survives search re-render) */
       grid.appendChild(card);
     });
   }
@@ -1199,6 +1253,7 @@
       }
       chain.then(function(row){
         if (row) applyRow(card, row, p.id);   /* rebuilds the card => fresh saved-keys list + badge */
+        if (keyVal){ delete keyHealth[p.id]; testKeyHealth(p.id); }   /* key changed -> re-test just this one */
         toast((p.name || p.id) + ' saved');
         return Promise.all([loadStatus(), loadModels()]);
       })
@@ -1237,6 +1292,7 @@
         var rmBtn = this; rmBtn.disabled = true;
         api('/api/providers/' + encodeURIComponent(p.id) + '/keys/' + encodeURIComponent(idx), { method:'DELETE' })
           .then(function(newRow){
+            delete keyHealth[p.id];         /* removing a key invalidates cached health -> neutral */
             applyRow(card, newRow, p.id);   /* re-render with the key removed + re-indexed pool */
             toast('Key removed');
             return Promise.all([loadStatus(), loadModels()]);
@@ -1249,9 +1305,11 @@
       var btn = this; btn.disabled = true;
       btn.innerHTML = '<svg class="spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg> Testing';
       out.className = 'testout';
+      _healthTesting[p.id] = true; applyCardHealth(card, p.id);   /* reflect the manual test on the card too */
       api('/api/test/' + encodeURIComponent(p.id), { method:'POST' })
         .then(function(r){
           var ok = !!r.ok;
+          keyHealth[p.id] = { state: ok ? 'ok' : 'bad', detail: r.detail || '' };   /* cache the manual result */
           out.className = 'testout show ' + (ok ? 'ok' : 'fail');
           var html = (ok ? '&check; ' : '&cross; ') + esc(r.detail || (ok ? 'Key works' : 'Test failed'));
           var sm = Array.isArray(r.sample_models) ? r.sample_models : [];
@@ -1263,10 +1321,14 @@
           out.innerHTML = html;
         })
         .catch(function(e){
+          keyHealth[p.id] = { state: 'unknown', detail: (e && e.message) || '' };   /* network blip -> neutral, not red */
           out.className = 'testout show fail';
           out.textContent = '✗ ' + e.message;
         })
-        .then(function(){ btn.disabled = false; btn.textContent = 'Test'; });
+        .then(function(){
+          delete _healthTesting[p.id]; applyCardHealth(card, p.id);
+          btn.disabled = false; btn.textContent = 'Test';
+        });
     });
   }
 
@@ -1288,6 +1350,73 @@
     card.className = 'card' + (p2.enabled ? ' enabled' : '');
     card.innerHTML = cardHTML(p2);
     wireCard(card, p2);
+    applyCardHealth(card, p2.id);   /* rebuild keeps whatever key-health we already know */
+  }
+
+  /* ---------- provider-card API-key health (B) ---------- */
+  function cardForPid(pid){
+    return document.querySelector('.card[data-pid="' + CSS.escape(pid) + '"]');
+  }
+  /* paint one card from the cached (or in-flight) health state. No key / no cache = neutral. */
+  function applyCardHealth(card, pid){
+    if (!card) return;
+    card.classList.remove('key-ok', 'key-bad', 'key-testing', 'key-unknown');
+    var hEl = card.querySelector('.key-health');
+    var lbl = hEl ? hEl.querySelector('.kh-lbl') : null;
+    var state = _healthTesting[pid] ? 'testing' : (keyHealth[pid] ? keyHealth[pid].state : null);
+    if (!state){ if (hEl){ hEl.title = ''; } return; }   /* neutral */
+    card.classList.add('key-' + state);
+    if (!hEl) return;
+    if (state === 'ok'){ if (lbl) lbl.textContent = 'key OK'; hEl.title = 'Saved key works'; }
+    else if (state === 'bad'){ if (lbl) lbl.textContent = 'key error'; hEl.title = (keyHealth[pid] && keyHealth[pid].detail) || 'Saved key failed a live test'; }
+    else if (state === 'testing'){ if (lbl) lbl.textContent = 'testing…'; hEl.title = 'Testing saved key…'; }
+    else { if (lbl) lbl.textContent = 'unknown'; hEl.title = (keyHealth[pid] && keyHealth[pid].detail) || 'Key test inconclusive'; }
+  }
+  /* run one live key check via the shared /api/test route (20s cap). Result is CACHED;
+     a network blip / timeout => 'unknown' (neutral grey), never red. Never rejects. */
+  function testKeyHealth(pid){
+    _healthTesting[pid] = true;
+    applyCardHealth(cardForPid(pid), pid);
+    var controller = new AbortController();
+    var timer = setTimeout(function(){ controller.abort(); }, 20000);
+    return api('/api/test/' + encodeURIComponent(pid), { method: 'POST', signal: controller.signal })
+      .then(function(r){
+        r = r || {};
+        keyHealth[pid] = { state: r.ok ? 'ok' : 'bad', detail: r.detail || '' };
+      })
+      .catch(function(e){
+        keyHealth[pid] = {
+          state: 'unknown',
+          detail: (e && e.name === 'AbortError') ? 'Key test timed out.' : ((e && e.message) || 'Key test could not complete.')
+        };
+      })
+      .then(function(){
+        clearTimeout(timer);
+        delete _healthTesting[pid];
+        applyCardHealth(cardForPid(pid), pid);
+      });
+  }
+  /* fan out key checks with a small concurrency cap so many keys don't fire at once */
+  function runHealthChecks(pids){
+    var queue = pids.slice();
+    var CAP = 4;
+    var active = 0;
+    function pump(){
+      while (active < CAP && queue.length){
+        active++;
+        testKeyHealth(queue.shift()).then(function(){ active--; pump(); });
+      }
+    }
+    pump();
+  }
+  /* on load / after providers render: test every keyed provider we haven't tested yet */
+  function scheduleKeyHealthChecks(){
+    var pids = [];
+    for (var i = 0; i < providers.length; i++){
+      var p = providers[i];
+      if (p && p.has_key && !keyHealth[p.id] && !_healthTesting[p.id]) pids.push(p.id);
+    }
+    if (pids.length) runHealthChecks(pids);
   }
 
   /* ---------- copy buttons ---------- */
@@ -1839,7 +1968,7 @@
   initChat();
   initAutoUpdate();
   loadStatus().then(updateChatAuthNote);
-  loadProviders();
+  loadProviders().then(scheduleKeyHealthChecks);   /* colour keyed cards by live key health, capped concurrency */
   loadModels().then(loadDefault).then(loadChatModels);
   loadClis();
   loadAutoUpdate();
