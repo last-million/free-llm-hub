@@ -353,9 +353,24 @@ PROVIDERS: Dict[str, dict] = {
                   "scoped), paste https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1 "
                   "into 'Advanced: custom base URL' instead. "
                   "Quota is denominated in NEURONS (varies per model), not requests, so the "
-                  "hub tracks it as UNKNOWN rather than inventing a request count. Model ids "
-                  "verified from individual model pages (the index renders bare slugs without "
-                  "the @cf/ prefix and is NOT a safe source)."),
+                  "hub tracks it as UNKNOWN rather than inventing a request count — a fixed "
+                  "request cap CANNOT honestly represent it (cost/request varies ~14x by model "
+                  "and with every prompt length; one long glm-5.2 completion could eat 80% of "
+                  "the day). WHAT 10k NEURONS ACTUALLY BUYS (computed from CF's published "
+                  "per-model rates, docs dateModified 2026-07-08, on a 300-in/500-out turn): "
+                  "~1,800 req/day granite-4.0-h-micro (cheapest) | ~535 llama-3.1-8b-fp8-fast | "
+                  "~524 gpt-oss-20b | ~229 gpt-oss-120b | ~221 plain llama-3.1-8b. "
+                  "COUNTERINTUITIVE: neurons track GPU compute, NOT parameter count — plain "
+                  "llama-3.1-8b costs MORE per output token (75,147/M) than the 120B "
+                  "gpt-oss-120b (68,182/M). Prefer the -fp8/-awq variants; that is why the "
+                  "pinned list carries llama-3.1-8b-instruct-fp8, not the bare id. "
+                  "Also a separate 300 req/MINUTE text-gen cap, which never binds in practice "
+                  "(the daily neuron budget runs out first). No official REST endpoint exists "
+                  "to read remaining neurons — dashboard only. "
+                  "⚠ CF's docs claim no model is plan-gated; our LIVE probe disproves that "
+                  "(glm-5.2 -> 403 'not available on this plan'). Trust the probe, not the docs. "
+                  "Model ids verified by probing the real catalog with a live key, not read off "
+                  "the docs index (which renders bare slugs without the @cf/ prefix)."),
     },
     "agentrouter": {
         "name": "AgentRouter",
