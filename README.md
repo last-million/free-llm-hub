@@ -39,6 +39,30 @@ http://127.0.0.1:8787
 
 > Want a different port? Set the `PORT` environment variable before launching.
 
+> Running it twice is safe: the launcher refuses to start a second copy on a
+> port that's already served, so you can't end up with two hubs fighting over
+> the same port. (`HUB_FORCE=1` overrides.)
+
+### Keep it running (optional but recommended)
+
+The hub is a normal foreground process — close the window, log out, or reboot
+and it's gone, and any tool pointed at it quietly loses the free fleet. To make
+it permanent:
+
+```bat
+autostart.bat            REM Windows  — install (no admin needed)
+autostart.bat remove     REM          — uninstall
+```
+
+```bash
+./autostart.sh           # Linux (systemd --user) / macOS (launchd)
+./autostart.sh remove
+```
+
+It starts at logon **and** re-checks every 5 minutes, so a crash recovers by
+itself instead of going unnoticed. Everything is per-user — no root, no admin,
+and your keys in `~/.free-llm-hub` stay readable by you alone.
+
 ---
 
 ## Step 1 — Add free provider keys
