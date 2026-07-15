@@ -28,9 +28,31 @@ from typing import Dict, List, Optional
 # --------------------------------------------------------------------------- #
 # free_filter values:
 #   'suffix_free' -> model id ends with ':free' (OpenRouter)
-#   'pricing_zero'-> models_url row has zero prompt+completion price
-#   'all'         -> the whole listed catalog is usable on the free tier
-#   'family'      -> only ids matching `free_families` are free
+#   'pricing_zero'-> models_url row has zero prompt+completion price. Fails
+#                    CLOSED without a live catalog, so it is also the honest
+#                    encoding for "nothing here is free" (see `paid` below).
+#   'all'         -> the whole listed catalog is usable on the free tier. Reads
+#                    as unsafe but is CORRECT wherever the provider has no
+#                    paid catalog to leak (cerebras/mistral/modelscope/
+#                    ollama-cloud — each says why inline). Never use it on a
+#                    provider that also sells models.
+#   'family'      -> only ids matching `free_families` are free (substring,
+#                    case-insensitive). Add `free_exact: True` to match the
+#                    FULL id instead — needed when a paid id has a free id as
+#                    its prefix (glm-4.7-flash vs the PAID glm-4.7-flashX),
+#                    which substring matching structurally cannot express.
+#
+# `paid: True` = this provider has NO genuine free tier. It is the mechanism
+# that keeps a provider out of free routing: is_free_model() then rejects every
+# id, so live discovery yields nothing — which is why `paid` rows ALSO carry
+# `default_free_models: []` (the discovery-failure fallback is served WITHOUT a
+# free-ness re-check, so a non-empty list there would still be routed as free).
+# Both halves are required. Explicit '<pid>/<model>' pins still work.
+#
+# Free-tier facts below were researched per provider against official docs and
+# live catalogs (2026-07-15). Do NOT "tidy" a filter or model id from memory:
+# roughly half of what looked obvious here was wrong, in the direction of
+# billing the user. See quota.py FREE_LIMITS for the matching request budgets.
 PROVIDERS: Dict[str, dict] = {
     "openrouter": {
         "name": "OpenRouter",
@@ -38,13 +60,22 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://openrouter.ai/api/v1/models",
         "signup_url": "https://openrouter.ai/keys",
         "key_hint": "sk-or-...",
+        # KEEP suffix_free — do NOT "upgrade" this to pricing_zero. 3 zero-priced
+        # non-':free' models exist and 2 of them (google/lyria-3-*) bill PER
+        # SONG/CLIP ($0.08/$0.04), a unit the prompt/completion pricing fields
+        # don't model: they report 0 and would silently spend real money.
+        # All 20 ':free' ids are zero across every pricing field — no false positives.
         "free_filter": "suffix_free",
         "default_free_models": [
             "meta-llama/llama-3.3-70b-instruct:free",
+            "qwen/qwen3-next-80b-a3b-instruct:free",
+            "nvidia/nemotron-3-super-120b-a12b:free",
+            "openai/gpt-oss-20b:free",
+            "google/gemma-4-31b-it:free",
             "qwen/qwen3-coder:free",
-            "deepseek/deepseek-chat:free",
+            "nousresearch/hermes-3-llama-3.1-405b:free",
         ],
-        "notes": "One key unlocks many models. Free = ids ending ':free'. ~50 req/day (1000 after a one-time $10 top-up).",
+        "notes": "One key unlocks many models. Free = ids ending ':free' (always free, never billed against credits). 50 req/day TOTAL across all free models (1,000/day after a one-time $10 top-up).",
     },
     "groq": {
         "name": "Groq",
@@ -52,9 +83,23 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.groq.com/openai/v1/models",
         "signup_url": "https://console.groq.com/keys",
         "key_hint": "gsk_...",
-        "free_filter": "all",
-        "default_free_models": ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "llama-3.1-8b-instant"],
-        "notes": "Extremely fast. Free tier, no card. ~1,000 req/day per model.",
+        # 'family', not 'all': Groq exposes NO machine-readable free signal (no
+        # ':free' suffix, no pricing field in /v1/models), and 'all' leaked
+        # non-chat ids that hard-fail on /chat/completions (whisper STT, orpheus
+        # TTS, llama-prompt-guard classifiers) plus kimi-k2-instruct-0905, which
+        # is absent from the official Free Plan Limits table. Substrings are
+        # deliberately precise: bare 'llama' would match llama-prompt-guard,
+        # bare 'qwen3' would match enterprise-only qwen3-vl-32b.
+        # Groq rotates models aggressively — re-validate this list periodically.
+        "free_filter": "family",
+        "free_families": ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama-4-scout",
+                          "gpt-oss", "qwen3-32b", "qwen3.6-27b", "compound", "allam-2-7b"],
+        "default_free_models": [
+            "llama-3.3-70b-versatile", "openai/gpt-oss-120b",
+            "meta-llama/llama-4-scout-17b-16e-instruct", "openai/gpt-oss-20b",
+            "qwen/qwen3-32b", "llama-3.1-8b-instant",
+        ],
+        "notes": "Extremely fast. Free tier, no card. ~1,000 req/day per model (llama-3.1-8b-instant: 14,400/day).",
     },
     "cerebras": {
         "name": "Cerebras",
@@ -62,9 +107,16 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.cerebras.ai/v1/models",
         "signup_url": "https://cloud.cerebras.ai/",
         "key_hint": "csk-...",
+        # 'all' is CORRECT here and must stay, despite reading as unsafe: docs
+        # state verbatim "All models on Cerebras public endpoints are free to
+        # use, subject to rate limits" — there is no paid model that could leak.
+        # (Free vs Developer is a rate-limit tier over the same 3 ids.) /v1/models
+        # returns no pricing field, so pricing_zero is impossible anyway.
         "free_filter": "all",
-        "default_free_models": ["gpt-oss-120b", "llama-3.3-70b", "llama3.1-8b"],
-        "notes": "Fastest tokens/sec. Free: 14,400 req/day, 1M tok/day.",
+        # gpt-oss-120b first: the only PRODUCTION-tier id (the other two are
+        # PREVIEW and can be pulled with less notice).
+        "default_free_models": ["gpt-oss-120b", "zai-glm-4.7", "gemma-4-31b"],
+        "notes": "Fastest tokens/sec. Free: 5 req/min, 1M tok/day (no req/day cap is documented). Limits apply per ORG, not per user.",
     },
     "nvidia": {
         "name": "NVIDIA NIM",
@@ -72,9 +124,10 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://integrate.api.nvidia.com/v1/models",
         "signup_url": "https://build.nvidia.com/settings/api-keys",
         "key_hint": "nvapi-...",
-        "free_filter": "all",
-        "default_free_models": ["meta/llama-3.3-70b-instruct", "nvidia/llama-3.1-nemotron-70b-instruct"],
-        "notes": "Large open models incl. Llama 405B. Free key needs phone verification. ~40 req/min.",
+        "paid": True,  # TRIAL credits, NOT a free tier — keep OUT of free routing
+        "free_filter": "pricing_zero",
+        "default_free_models": [],
+        "notes": "TRIAL, not a free tier — 1,000 lifetime credits (max 5,000 via business email), 90-day expiry, then HTTP 402 'Cloud credits expired'. Not renewable: every remote call to an NVIDIA-hosted endpoint spends the balance. Self-hosting the NIM containers is separately free for Developer Program members.",
     },
     "morph": {
         "name": "Morph",
@@ -82,12 +135,10 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.morphllm.com/v1/models",
         "signup_url": "https://morphllm.com/dashboard",
         "key_hint": "sk-...",
-        "free_filter": "all",
-        "default_free_models": [
-            "morph-glm52-744b", "morph-minimax3-428b",
-            "morph-dsv4flash", "morph-qwen36-27b",
-        ],
-        "notes": "OpenAI-compatible. Free tier ~200 req/mo + trial credits. Fast general models (GLM/MiniMax/DeepSeek/Qwen) plus fast-apply code editing.",
+        "paid": True,  # credit allowance, NOT a free tier — keep OUT of free routing
+        "free_filter": "pricing_zero",
+        "default_free_models": [],
+        "notes": "No free models — all 8 models bill per token. The '200 req free every month' headline actually meters TOKENS ($2.50 / 250K credits per month): a coding CLI's 20-50K-token turns make the real allowance ~5-12 requests/month.",
     },
     "agentrouter": {
         "name": "AgentRouter",
@@ -95,14 +146,16 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://agentrouter.org/v1/models",
         "signup_url": "https://agentrouter.org/console/token",
         "key_hint": "sk-...",
-        "free_filter": "family",
-        "free_families": ["glm-4.5-air", "glm-4.6", "glm-4", "deepseek-v2-lite",
-                          "qwen2-7b", "qwen3-coder", "mistral-7b"],
-        "default_free_models": [
-            "glm-4.6", "glm-4.5-air", "deepseek-v2-lite",
-            "qwen2-7b-instruct", "mistral-7b-instruct",
-        ],
-        "notes": "Non-profit OpenAI-compatible gateway (30+ providers). Truly-free models = GLM/DeepSeek/Qwen/Mistral (family-filtered here); GPT/Claude/Gemini consume the free signup credits (~$100 via GitHub, no card). Key: agentrouter.org/console/token. Also speaks /v1/responses + /v1/messages.",
+        "paid": True,  # consumable signup credits only — keep OUT of free routing
+        # The previous free_families/default_free_models here were FABRICATED
+        # upstream: they trace verbatim to a single referral-spam gist (which
+        # appears to have borrowed OpenRouter's ':free' reputation), not to any
+        # official source. deepseek-v2-lite/qwen2-7b/mistral-7b are 2024-era
+        # models no 2026 Claude-relay would serve. Removed rather than re-tuned.
+        "free_filter": "pricing_zero",
+        "free_families": [],
+        "default_free_models": [],
+        "notes": "No free models — a third-party API relay running on consumable signup credits ($100 via GitHub, $200 via referral); every call burns them. Publishes no rate limits and /v1/models 401s without a key, so nothing here can be verified as free. All prompts transit a third-party reseller. Consider removing.",
     },
     "google": {
         "name": "Google Gemini (AI Studio)",
@@ -110,10 +163,24 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://generativelanguage.googleapis.com/v1beta/openai/models",
         "signup_url": "https://aistudio.google.com/apikey",
         "key_hint": "AIza...",
+        # gemini-2.5-pro IS "Free of charge" in Google's own pricing HTML (the
+        # third-party claim that Pro left the free tier in Apr 2026 is FALSE) —
+        # it's the one free model worth routing hard tasks to. 'flash-lite' was
+        # dead weight (already a substring of 'flash'); 'gemma-3-27b-it' is stale.
+        # KNOWN GAP: substring families can't close this alone — 'flash' also
+        # matches paid/unavailable-on-free *-image, omni-*, *-live, *-audio ids
+        # and '2.5-pro' matches gemini-2.5-pro-preview-tts. pricing_zero is
+        # impossible (the OpenAI-compat models endpoint returns no pricing), so
+        # default_free_models is the real safety net; a per-provider exclude
+        # list is the proper fix.
         "free_filter": "family",
-        "free_families": ["flash", "gemma", "flash-lite"],
-        "default_free_models": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemma-3-27b-it"],
-        "notes": "Free tier = Flash family + Gemma. ToS: prompts may be used for training outside EU/UK/CH.",
+        "free_families": ["flash", "gemma", "2.5-pro"],
+        "default_free_models": [
+            "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash",
+            "gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-2.5-pro",
+            "gemini-2.0-flash", "gemma-4-31b-it",
+        ],
+        "notes": "Free tier = Flash family + Gemma + 2.5-Pro. ToS: free-tier prompts/responses may be used to improve Google's products outside EU/UK/CH.",
     },
     "mistral": {
         "name": "Mistral",
@@ -121,9 +188,22 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.mistral.ai/v1/models",
         "signup_url": "https://console.mistral.ai/api-keys/",
         "key_hint": "...",
+        # 'all' is CORRECT: "Free mode" is a rate-limit tier over the WHOLE
+        # catalog, not a model subset, so there is no free/paid split to leak
+        # across. (Caveat: 'all' also surfaces non-chat ids — mistral-embed,
+        # mistral-ocr-*, mistral-moderation-*, voxtral-* — but that's a
+        # chat-capability concern, handled by filter_models(), not free-ness.)
         "free_filter": "all",
-        "default_free_models": ["mistral-small-latest", "open-mistral-nemo", "codestral-latest"],
-        "notes": "Free 'Experiment' plan requires opting into data-training + phone verification.",
+        # All '-latest' aliases ON PURPOSE: the previous pinned 'open-mistral-nemo'
+        # RETIRES 2026-07-31 and sat in this discovery-failure fallback, i.e. it
+        # would have broken exactly in the scenario the fallback exists for.
+        # Aliases can't rot the same way. (Mistral names Ministral 3 8B as nemo's
+        # replacement.)
+        "default_free_models": [
+            "mistral-small-latest", "mistral-medium-latest", "mistral-large-latest",
+            "ministral-8b-latest", "ministral-3b-latest", "codestral-latest",
+        ],
+        "notes": "Free mode (the default plan) = $0 access to the full catalog, no card. Requires phone verification; requests may be used to train Mistral's models unless you opt out (Settings -> Privacy). Limits are per-org and unpublished (Admin Console -> Limits).",
     },
     "sambanova": {
         "name": "SambaNova Cloud",
@@ -131,9 +211,21 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.sambanova.ai/v1/models",
         "signup_url": "https://cloud.sambanova.ai/apis",
         "key_hint": "...",
-        "free_filter": "all",
-        "default_free_models": ["Meta-Llama-3.3-70B-Instruct", "DeepSeek-V3-0324"],
-        "notes": "Fast inference, free trial tier.",
+        # 'family', not 'all': 'all' leaked MiniMax-M2.7, which is in the catalog
+        # and the Developer-tier limits table but deliberately ABSENT from the
+        # Free-tier table — it fails on a card-less account. These 4 families
+        # select exactly the 5 documented free models.
+        # pricing_zero is a TRAP here: /v1/models DOES return a pricing object,
+        # but the prices are non-zero for every model INCLUDING the free ones
+        # (it's a rate card, not a free marker) — free-ness is account-level
+        # (no payment method linked), so pricing_zero would silently yield [].
+        "free_filter": "family",
+        "free_families": ["DeepSeek", "Meta-Llama", "gpt-oss", "gemma"],
+        "default_free_models": [
+            "Meta-Llama-3.3-70B-Instruct", "DeepSeek-V3.1", "gpt-oss-120b",
+            "DeepSeek-V3.2", "gemma-4-31B-it",
+        ],
+        "notes": "Genuinely free tier — applied automatically while no payment method is linked (nothing is consumed, it doesn't expire). 20 req/min, 20 req/day, 200k tokens/day. The separate $5 Developer credit is a trial, not this.",
     },
     "huggingface": {
         "name": "HuggingFace Router",
@@ -141,9 +233,15 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://router.huggingface.co/v1/models",
         "signup_url": "https://huggingface.co/settings/tokens",
         "key_hint": "hf_...",
-        "free_filter": "all",
-        "default_free_models": ["meta-llama/Llama-3.3-70B-Instruct", "Qwen/Qwen2.5-72B-Instruct"],
-        "notes": "Unified router across HF partners. Free credit ~$0.10/month.",
+        "paid": True,  # credit allowance, NOT a free tier — keep OUT of free routing
+        # Live router catalog: is_free:true matches EXACTLY 0 of 102 models, so
+        # 'all' was admitting 100% paid inventory as free. NOTE for any future
+        # pricing_zero implementation: HF nests pricing PER PROVIDER
+        # (data[].providers[].pricing), and ships an explicit is_free boolean
+        # that outranks pricing==0.
+        "free_filter": "pricing_zero",
+        "default_free_models": [],
+        "notes": "No free models — a $0.10/month credit allowance consumed at full pay-as-you-go rates (~17 requests on GLM-5.2, ~1,400 on Llama-3.1-8B), 'subject to change'. Note the widely-cited '1,000 requests / 5 min' is the Hub API bucket, NOT inference.",
     },
     "github-models": {
         "name": "GitHub Models",
@@ -151,9 +249,23 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://models.github.ai/catalog/models",
         "signup_url": "https://github.com/settings/tokens",
         "key_hint": "github_pat_... (models:read)",
-        "free_filter": "all",
-        "default_free_models": ["openai/gpt-4o-mini", "meta/Llama-3.3-70B-Instruct", "deepseek/DeepSeek-V3-0324"],
-        "notes": "Auth with a GitHub PAT (models:read). Tight token limits; scales with Copilot tier.",
+        # Not a pricing leak (every catalog model is $0) — but 'all' surfaced 10
+        # custom-tier OpenAI ids (gpt-5*, o1*, o3*, o4-mini) marked "Not
+        # applicable" on Copilot Free, i.e. guaranteed hard failures, plus 2
+        # embeddings models. These 6 families select exactly the 23 low/high-tier
+        # models. deepseek-r1 is deliberately excluded by the narrow family:
+        # it's free but capped at 8 req/day.
+        "free_filter": "family",
+        "free_families": ["openai/gpt-4", "meta/", "mistral-ai/", "microsoft/",
+                          "cohere/", "deepseek/deepseek-v3"],
+        # Low-tier (150/day) before high-tier (50/day). Lowercase ids: the live
+        # catalog no longer uses the old CamelCase Azure names.
+        "default_free_models": [
+            "openai/gpt-4.1-mini", "openai/gpt-4o-mini", "mistral-ai/mistral-medium-2505",
+            "cohere/cohere-command-a", "microsoft/phi-4", "openai/gpt-4.1",
+            "meta/llama-3.3-70b-instruct", "deepseek/deepseek-v3-0324",
+        ],
+        "notes": "Genuinely free with a GitHub PAT (models:read) — nothing is consumed. 150 req/day (low-tier ids) / 50 req/day (high-tier). GOTCHA: the free tier caps EVERY request at 8K in / 4K out regardless of the model's advertised context.",
     },
     "deepseek": {
         "name": "DeepSeek",
@@ -161,10 +273,10 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.deepseek.com/v1/models",
         "signup_url": "https://platform.deepseek.com/api_keys",
         "key_hint": "sk-...",
-        "free_filter": "all",
+        "free_filter": "pricing_zero",
         "paid": True,  # PAID/credit-based, NOT a free tier — only surface when paid models are allowed
-        "default_free_models": ["deepseek-v4-flash", "deepseek-v4-pro"],
-        "notes": "PAID (credit-based) — not a free tier, but explicitly allowed. Legacy deepseek-chat/deepseek-reasoner retire 2026-07-24 (alias to deepseek-v4-flash/pro).",
+        "default_free_models": [],
+        "notes": "PAID (credit-based) — not a free tier, but explicitly allowed: pin 'deepseek/deepseek-v4-flash' or 'deepseek/deepseek-v4-pro' explicitly to use it. Both models bill per token; the widely-cited '5M free tokens on signup' appears on ZERO official pages. Only CONCURRENCY is published (no RPD/RPM) — the real limiter is account balance. Legacy deepseek-chat/deepseek-reasoner retire 2026-07-24 (alias to deepseek-v4-flash/pro).",
     },
     "together": {
         "name": "Together AI",
@@ -172,10 +284,17 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.together.ai/v1/models",
         "signup_url": "https://api.together.ai/settings/api-keys",
         "key_hint": "...",
-        "free_filter": "family",
-        "free_families": ["-free"],
-        "default_free_models": ["meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"],
-        "notes": "$25 signup credit; a few '-Free' endpoints. Mostly credit-based.",
+        "paid": True,  # no free endpoints remain — keep OUT of free routing
+        # free_families ['-free'] now matches ZERO live models and would leak a
+        # billable one if Together ever ships an id containing '-free'.
+        # pricing_zero is self-correcting: empty today, auto-picks up a real $0
+        # endpoint later. CAVEAT for that implementation: test input==0 AND
+        # output==0 only — Together's own docs show a paid model ($0.30/M) with
+        # base:0, finetune:0, hourly:0.
+        "free_filter": "pricing_zero",
+        "free_families": [],
+        "default_free_models": [],
+        "notes": "No free tier — all four '-Free' serverless endpoints were removed during 2025 (Llama-Vision-Free 2025-08-28, Llama-3.3-70B-Turbo-Free and DeepSeek-R1-Distill-Llama-70B-free 2025-11-13, FLUX.1-schnell-free 2025-12-23). Paid credits only; the '$25 signup credit' was retired July 2025.",
     },
     "scaleway": {
         "name": "Scaleway",
@@ -183,9 +302,10 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.scaleway.ai/v1/models",
         "signup_url": "https://console.scaleway.com/iam/api-keys",
         "key_hint": "...",
-        "free_filter": "all",
-        "default_free_models": ["llama-3.3-70b-instruct", "gpt-oss-120b"],
-        "notes": "Free beta of the Generative API.",
+        "paid": True,  # card mandatory + silent billing — keep OUT of free routing
+        "free_filter": "pricing_zero",
+        "default_free_models": [],
+        "notes": "No free tier — a validated payment method is MANDATORY before the first call. The only free part is a one-time 1,000,000-token allowance for new customers; after it, calls do NOT fail, they silently bill the card (llama-3.3-70b EUR 0.90/0.90 per M, glm-5.2 EUR 1.80/5.50) and NO response header exposes the remaining free tokens, so the switchover is undetectable. The old 'free beta' ended — the Generative API is GA with published per-token pricing.",
     },
     # --- Chinese / additional free-tier providers (verified against official docs) ---
     "glm": {
@@ -194,10 +314,17 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.z.ai/api/paas/v4/models",
         "signup_url": "https://z.ai/manage-apikey/apikey-list",
         "key_hint": "...",
+        # PAID-MODEL LEAK, now closed. free_families ['flash'] matched the PAID
+        # glm-4.7-flashX ($0.07/$0.40 per M) — naming trap: 'Flash' = free,
+        # 'FlashX' = paid, same generation. Tightening the substring CANNOT fix
+        # this: 'glm-4.7-flash' is itself a substring of 'glm-4.7-flashx'.
+        # Hence free_exact: the free set is exactly these 3 named ids, so an
+        # exact-id match is both feasible and the only correct encoding.
         "free_filter": "family",
-        "free_families": ["flash"],
-        "default_free_models": ["glm-4.5-flash", "glm-4.7-flash"],
-        "notes": "PERMANENT free: GLM-4.5/4.7-Flash. International z.ai (email/Google signup, no China phone). ~1 req/s.",
+        "free_exact": True,
+        "free_families": ["glm-4.7-flash", "glm-4.5-flash", "glm-4.6v-flash"],
+        "default_free_models": ["glm-4.7-flash", "glm-4.5-flash", "glm-4.6v-flash"],
+        "notes": "PERMANENT free ($0 in/out): GLM-4.7-Flash (200K ctx), GLM-4.5-Flash, GLM-4.6V-Flash (vision). Note glm-4.7-FlashX is PAID despite the name. International z.ai (email/Google signup, no China phone). ~1 req/s, 1 concurrent; Z.AI publishes no request quota.",
     },
     "kimi": {
         "name": "Kimi (Moonshot)",
@@ -205,21 +332,28 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.moonshot.ai/v1/models",
         "signup_url": "https://platform.moonshot.ai/console/api-keys",
         "key_hint": "sk-...",
-        "free_filter": "all",
+        "paid": True,  # docs: "There is no free tier" — keep OUT of free routing
+        "free_filter": "pricing_zero",
         "trial": True,
-        "default_free_models": ["moonshot-v1-8k", "kimi-k2.5"],
-        "notes": "TRIAL credits only (one-time, ~small), then pay-per-token. International platform.moonshot.ai.",
+        "default_free_models": [],
+        "notes": "No free tier — docs verbatim: 'There is no free tier. To prevent abuse, you need to recharge at least $1 to start using.' All 11 models are paid, so calls either hard-fail on an unfunded account or bill per token. The only documented incentive is a $5 voucher AFTER $5 of cumulative recharge (a rebate, not credit). For free Kimi weights, route via OpenRouter's moonshotai/* ':free' variants instead.",
     },
     "minimax": {
         "name": "MiniMax",
         "base_url": "https://api.minimax.io/v1",
-        "models_url": None,  # no documented /models endpoint — use defaults
+        # GET /v1/models IS documented now (this "no endpoint" note was stale),
+        # but discovery stays off deliberately: with the classification fixed
+        # (paid=True), is_free_model() rejects every id anyway, so enabling it
+        # would only enumerate a paid catalog. Wire it up only alongside a real
+        # zero-pricing check.
+        "models_url": None,
         "signup_url": "https://platform.minimax.io/user-center/basic-information/interface-key",
         "key_hint": "...",
-        "free_filter": "all",
+        "paid": True,  # NO free tier + fails by BILLING — keep OUT of free routing
+        "free_filter": "pricing_zero",
         "trial": True,
-        "default_free_models": ["MiniMax-M2", "MiniMax-M2.5"],
-        "notes": "TRIAL credits at signup, then pay-as-you-go. Global api.minimax.io (China = api.minimaxi.com). No /models list.",
+        "default_free_models": [],
+        "notes": "No free tier — the word 'free' appears nowhere in MiniMax's pricing docs (per-token billing or monthly subscription only). DANGEROUS: MiniMax-M2/M2.5 are real ids that cost ~$0.30/$1.20 per M, so calls SUCCEED, silently burn the ~30-day trial credits, then bill real money — nothing surfaces the mistake. Global api.minimax.io (China = api.minimaxi.com).",
     },
     "qwen": {
         "name": "Qwen (Alibaba Model Studio)",
@@ -227,10 +361,17 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
         "signup_url": "https://bailian.console.alibabacloud.com/",
         "key_hint": "sk-...",
-        "free_filter": "family",
-        "free_families": ["plus", "turbo", "flash", "coder", "air", "lite"],
-        "default_free_models": ["qwen-plus", "qwen-turbo", "qwen3-coder-plus"],
-        "notes": "FREE 1,000,000 tokens PER MODEL, 90 days. Scoped to the cheaper siblings (plus/turbo/flash/coder) so the flagship qwen-max isn't the auto-default. MUST use the International (Singapore) region base above — US/China modes get NO free quota.",
+        "paid": True,  # 90-day consumable trial, NOT a free tier — keep OUT of free routing
+        # The old families were leaky in both directions: 'air' matched ZERO Qwen
+        # models (a GLM/Zhipu convention, copy-pasted), while bare 'plus'/'flash'/
+        # 'lite' pulled in non-chat ids that break a CLI (qwen-mt-* translation,
+        # qwen3-vl-* vision, qwen-image-plus whose quota is denominated in IMAGES)
+        # and even deepseek-v4-flash. Cleared rather than re-tuned: nothing here
+        # is free, so no family should assert free-ness.
+        "free_filter": "pricing_zero",
+        "free_families": [],
+        "default_free_models": [],
+        "notes": "Not a free tier — a consumable trial: 1,000,000 tokens PER MODEL, expiring 90 days after activating Model Studio, International (Singapore) deployment only. 'After the quota expires or is exhausted, you will be charged for continued use' (then AllocationQuota.FreeTierOnly errors). No permanently-free model exists. NOTE: the qwen-code CLI's OAuth path IS a genuine renewing free tier (2,000/day, 60 RPM) — different auth, would need its own entry.",
     },
     "siliconflow": {
         "name": "SiliconFlow",
@@ -238,10 +379,25 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.siliconflow.cn/v1/models",
         "signup_url": "https://cloud.siliconflow.cn/account/ak",
         "key_hint": "sk-...",
+        # The old families missed 5 free general-chat models and pinned
+        # DeepSeek-R1-Distill-Qwen-7B, which is NOT free anywhere (0 occurrences
+        # in the .cn catalog; $0.05/M on .com).
+        # KNOWN GAP: 'qwen/qwen2.5-7b-instruct' also substring-matches the PAID
+        # twin 'Pro/Qwen/Qwen2.5-7B-Instruct' (¥0.35/M). SiliconFlow's rule is
+        # free = original name, paid = 'Pro/' prefix — a per-provider exclude on
+        # ids starting 'pro/' is the proper fix.
+        # This list is LOAD-BEARING, not a mere fallback: /v1/models requires
+        # auth and exposes no pricing, so free-ness is not discoverable at runtime.
         "free_filter": "family",
-        "free_families": ["qwen3-8b", "distill-qwen-7b", "deepseek-ocr"],
-        "default_free_models": ["Qwen/Qwen3-8B", "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"],
-        "notes": "PERMANENT free: Qwen3-8B, DeepSeek-R1-Distill-Qwen-7B, DeepSeek-OCR (rate-limited).",
+        "free_families": ["qwen/qwen3-8b", "qwen/qwen3.5-4b", "qwen/qwen2.5-7b-instruct",
+                          "thudm/glm-4-9b-0414", "thudm/glm-z1-9b-0414",
+                          "deepseek-ai/deepseek-r1-0528-qwen3-8b", "tencent/hunyuan-mt-7b"],
+        "default_free_models": [
+            "Qwen/Qwen3-8B", "Qwen/Qwen3.5-4B", "THUDM/GLM-Z1-9B-0414",
+            "THUDM/GLM-4-9B-0414", "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+            "Qwen/Qwen2.5-7B-Instruct",
+        ],
+        "notes": "PERMANENT free ($0) models on the CHINA platform only (api.siliconflow.cn — the same model is billed on .com). CAVEAT: the full free set needs Chinese real-name verification (实名认证, mainland ID/HK-Macau-Taiwan permit + Alipay facial recognition); without it accounts are capped ~100 req/day. The ¥14 coupon / '20M free tokens' promos are credits, not this tier.",
     },
     "modelscope": {
         "name": "ModelScope (Alibaba)",
@@ -249,9 +405,21 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api-inference.modelscope.cn/v1/models",
         "signup_url": "https://modelscope.cn/my/myaccesstoken",
         "key_hint": "ms-...",
+        # 'all' is CORRECT: everything on api-inference.modelscope.cn IS the free
+        # service (paid/SLA inference is a different product on a different
+        # base_url), and /v1/models carries no pricing so nothing else is even
+        # implementable.
         "free_filter": "all",
-        "default_free_models": ["Qwen/Qwen3-235B-A22B-Instruct", "deepseek-ai/DeepSeek-V3"],
-        "notes": "Free 2,000 API calls/day (500/model) over 900+ models. Requires a ModelScope account.",
+        # BOTH previous ids were DEAD (100% dead fallback): the real ids carry
+        # the -2507 suffix / are DeepSeek-V3.2. Spread across vendors so the
+        # 500/model/day sub-cap doesn't exhaust them together; DeepSeek-V3.2 sits
+        # mid-list because its family carries a lower ~100/model/day cap.
+        "default_free_models": [
+            "Qwen/Qwen3-235B-A22B-Instruct-2507", "ZhipuAI/GLM-5",
+            "Qwen/Qwen3-Next-80B-A3B-Instruct", "moonshotai/Kimi-K2.5",
+            "deepseek-ai/DeepSeek-V3.2", "MiniMax/MiniMax-M2.5", "Qwen/Qwen3-32B",
+        ],
+        "notes": "Free 2,000 API calls/day per account (500/model/day; some large models ~100/day), resets 00:00 UTC+8, no rollover. Signup needs an Alibaba Cloud account (KYC).",
     },
     "baidu": {
         "name": "Baidu Qianfan (ERNIE)",
@@ -301,10 +469,14 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.studio.nebius.com/v1/models",
         "signup_url": "https://studio.nebius.com/",
         "key_hint": "...",
-        "free_filter": "all",
+        "paid": True,  # $1 trial credit + card required — keep OUT of free routing
+        # pricing_zero is honest AND self-correcting here: GET
+        # /v1/models?verbose=true returns a Pricing object, so it matches nothing
+        # today and would auto-pick up a real $0 model later.
+        "free_filter": "pricing_zero",
         "trial": True,
-        "default_free_models": ["meta-llama/Llama-3.3-70B-Instruct", "Qwen/Qwen2.5-72B-Instruct"],
-        "notes": "Trial credits (no card). Then pay-as-you-go.",
+        "default_free_models": [],
+        "notes": "No free tier — $1 trial credit valid 30 days, and a bank card (or bank transfer) IS required at onboarding; no $0 models. All 60+ models are paid. Note: 'Nebius AI Studio' is now 'Nebius Token Factory' (canonical base api.tokenfactory.nebius.com/v1); the studio host above is aliased, not broken.",
     },
     "novita": {
         "name": "Novita AI",
@@ -367,9 +539,13 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://llm.chutes.ai/v1/models",
         "signup_url": "https://chutes.ai",
         "key_hint": "cpk_...",
-        "free_filter": "all",
-        "default_free_models": ["deepseek-ai/DeepSeek-V3", "Qwen/Qwen3-235B"],
-        "notes": "Decentralized (Bittensor) compute; free/cheap open models. OpenAI-compatible.",
+        "paid": True,  # free tier retired 2026-03-15 — keep OUT of free routing
+        # pricing_zero is mechanically supported here (the keyless endpoint DOES
+        # expose pricing:{prompt,completion}) and correct under either the TEE or
+        # full catalog — it just matches nothing today, which is the truth.
+        "free_filter": "pricing_zero",
+        "default_free_models": [],
+        "notes": "No free tier — fully retired 2026-03-15 (and the prior '200 free requests/day' Early Access always required a $5 deposit). Every one of the 13 live models is paid, $0.0245/$0.0978 up to GLM-5.2-TEE at $1.40/$4.40 per M. Subscription or pay-per-use only. NOTE: Chutes is a major upstream for OpenRouter's ':free' variants — those are free because OPENROUTER subsidizes them, and this hub already has that access via the openrouter entry.",
     },
     "targon": {
         "name": "Targon",
@@ -417,9 +593,20 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://ollama.com/v1/models",
         "signup_url": "https://ollama.com/settings/keys",
         "key_hint": "any",
+        # 'all' is CORRECT: /v1/models returns only cloud models and access is
+        # NOT tier-gated — free vs Pro is quota + concurrency, not catalog.
         "free_filter": "all",
-        "default_free_models": ["gpt-oss:120b", "qwen3-coder:480b"],
-        "notes": "Ollama's hosted cloud, free tier. OpenAI-compatible.",
+        # Low-Usage models FIRST. The previous two ids were real and live, but
+        # were the two most quota-hungry choices possible ('Medium Usage'
+        # gpt-oss:120b and 'High Usage' qwen3-coder:480b), so a discovery failure
+        # fell back to exactly the models that burn a light free tier fastest.
+        # ID GOTCHA: use BARE ids — the ':cloud'/'-cloud' suffix exists only for
+        # the local daemon proxying to cloud; the hosted API returns bare ids.
+        "default_free_models": [
+            "gpt-oss:20b", "gemma3:12b", "gemma3:4b", "ministral-3:8b",
+            "gpt-oss:120b", "gemma3:27b", "qwen3-coder-next",
+        ],
+        "notes": "Ollama's hosted cloud, genuinely free ($0, no card). Metered on GPU TIME, not tokens/requests — usage weight varies hugely per model (gpt-oss:20b Low ... deepseek-v4-pro Extra High). Session limits reset every 5h, weekly every 7d; no numeric quota is published. Free allows only ONE concurrent cloud model, so parallel fan-out will contend.",
     },
     "clarifai": {
         "name": "Clarifai",
@@ -491,7 +678,7 @@ PROVIDERS: Dict[str, dict] = {
         "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Lambda Cloud inference. OpenAI-compatible."},
     "perplexity": {"name": "Perplexity", "base_url": "https://api.perplexity.ai",
         "models_url": None, "signup_url": "https://www.perplexity.ai/account/api/keys",
-        "key_hint": "pplx-...", "free_filter": "all", "default_free_models": ["sonar", "sonar-pro"], "paid": True, "notes": "Sonar models with live web search. Paid."},
+        "key_hint": "pplx-...", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Sonar models with live web search. Paid — no free tier."},
     "requesty": {"name": "Requesty", "base_url": "https://router.requesty.ai/v1",
         "models_url": "https://router.requesty.ai/v1/models", "signup_url": "https://app.requesty.ai/api-keys",
         "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Model router/aggregator. Paid."},
@@ -503,7 +690,7 @@ PROVIDERS: Dict[str, dict] = {
         "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Arcee small-model host. Paid."},
     "inception": {"name": "Inception (Mercury)", "base_url": "https://api.inceptionlabs.ai/v1",
         "models_url": "https://api.inceptionlabs.ai/v1/models", "signup_url": "https://platform.inceptionlabs.ai",
-        "key_hint": "any", "free_filter": "all", "default_free_models": ["mercury-coder"], "paid": True, "notes": "Diffusion-LLM (Mercury) — very fast. Paid."},
+        "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Diffusion-LLM (Mercury) — very fast. Paid — no free tier."},
     "302ai": {"name": "302.AI", "base_url": "https://api.302.ai/v1",
         "models_url": "https://api.302.ai/v1/models", "signup_url": "https://dash.302.ai",
         "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Multi-model aggregator. Paid."},
@@ -607,7 +794,16 @@ def is_free_model(provider_id: str, model_id: Optional[str],
         return low.endswith(":free")
     if free_filter == "family":
         families = [f.lower() for f in (prov.get("free_families") or [])]
-        return bool(families) and any(fam in low for fam in families)
+        if not families:
+            return False
+        if prov.get("free_exact"):
+            # Exact-id match: the provider's free set is a fixed named list AND
+            # a paid id has a free id as its prefix (glm-4.7-flash is a
+            # substring of the PAID glm-4.7-flashX), so substring matching would
+            # leak the paid model. Fails closed on unseen snapshot ids, which is
+            # the safe direction — default_free_models still covers the fallback.
+            return low in families
+        return any(fam in low for fam in families)
     if free_filter == "pricing_zero":
         # Live pricing can't be verified without a fetch; without a
         # known_free list to check against, don't claim a free-ness we can't
