@@ -2163,11 +2163,23 @@ def _responses_tools_to_chat(tools):
     return out
 
 
+# Responses/Codex roles -> roles every OpenAI-chat model template accepts. The
+# big one: Codex sends its system prompt with role "developer", which most open
+# model chat templates reject ("Unexpected message role"). Map it to system.
+_RESP_ROLE_MAP = {"system": "system", "developer": "system", "user": "user",
+                  "assistant": "assistant", "tool": "tool"}
+
+
+def _norm_role(role):
+    return _RESP_ROLE_MAP.get(str(role or "user").lower(), "user")
+
+
 def _responses_to_chat(body):
     """Translate a Responses request body into OpenAI chat-completions messages.
     Handles `instructions` (-> leading system), a STRING or LIST `input`, and the
     message / function_call / function_call_output item types (unknown item types,
-    e.g. reasoning, are skipped)."""
+    e.g. reasoning, are skipped). Roles are normalized (developer -> system) so
+    open model chat templates don't reject the request."""
     messages = []
     instructions = body.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
@@ -2206,7 +2218,7 @@ def _responses_to_chat(body):
                 "content": content,
             })
         elif itype == "message" or itype is None:
-            role = item.get("role") or "user"
+            role = _norm_role(item.get("role"))
             content = item.get("content")
             if isinstance(content, str):
                 text = content
