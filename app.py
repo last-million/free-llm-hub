@@ -438,6 +438,57 @@ def _is_fast(pid, model):
     return _speed_score(pid, model) >= 55
 
 
+# --------------------------------------------------------------------------- #
+# DEAD-MODEL tracker — "only route to models that actually work".
+#
+# A provider's catalog lies: it lists models the key has no access to (403), that
+# no longer exist (404), or that reject chat (400 on a non-chat id). A live bulk
+# test found 78 of 150 listed free models unusable — e.g. every github-models id
+# returns 403 "No access to model" when the token lacks the models:read scope.
+#
+# Rather than hard-code today's results (they rot as catalogs change), LEARN: the
+# first time a model answers with a hard MODEL-level error, sideline it and route
+# around it. Self-healing — entries expire, so a fixed token/restored model comes
+# back on its own.
+#
+# Deliberately NOT tracked here: 429 (quota — that's quota.mark_throttled's job,
+# the model is fine) and 5xx (transient upstream). Only 403/404 are treated as
+# "this exact model is unusable with this key", because they are unambiguous.
+# 400 is NOT auto-sidelined: it is just as often a bad payload as a bad model,
+# and blocklisting a good model off one malformed request would be worse.
+# --------------------------------------------------------------------------- #
+_DEAD_MODEL_TTL = 6 * 3600         # 6h, then re-probe (token fixed? model back?)
+_dead_models = {}                  # (pid, model) -> expiry epoch
+_dead_lock = threading.Lock()
+_DEAD_STATUSES = (403, 404)
+
+
+def _mark_model_dead(pid, model, status):
+    if not model or status not in _DEAD_STATUSES:
+        return
+    with _dead_lock:
+        _dead_models[(pid, str(model))] = time.time() + _DEAD_MODEL_TTL
+
+
+def _is_model_dead(pid, model):
+    key = (pid, str(model))
+    with _dead_lock:
+        exp = _dead_models.get(key)
+        if not exp:
+            return False
+        if exp <= time.time():
+            _dead_models.pop(key, None)   # TTL expired -> give it another chance
+            return False
+        return True
+
+
+def _dead_model_rows():
+    """[(pid, model, seconds_left)] for the dashboard / diagnostics."""
+    now = time.time()
+    with _dead_lock:
+        return [(p, m, int(exp - now)) for (p, m), exp in _dead_models.items() if exp > now]
+
+
 # Reasoning EFFORT the manager assigns per task difficulty. A simple question gets
 # minimal thinking (fast); a hard task gets more. Applied ONLY to reasoning models
 # (non-reasoning models ignore it). This is what makes "the manager decides the
@@ -469,7 +520,8 @@ def _route_by_difficulty(messages, max_tokens=None, est=None):
     cands = []  # (score, pid, model)
     for pid in providers:
         for m in provider_free_models(pid):
-            if prov.is_model_allowed(m):
+            # skip ids this key provably can't use (403/404 learned at runtime)
+            if prov.is_model_allowed(m) and not _is_model_dead(pid, m):
                 cands.append((_benchmark_score(pid, m), pid, m))
     if not cands:
         return None, None, difficulty
@@ -596,7 +648,7 @@ def _build_chain(primary_pid, model_id, est=0):
         if not _provider_capable(pid, est):
             continue
         for m in provider_free_models(pid):
-            if (pid, m) in seen or not prov.is_model_allowed(m):
+            if (pid, m) in seen or not prov.is_model_allowed(m) or _is_model_dead(pid, m):
                 continue
             entry = (_benchmark_score(pid, m), pid, m)
             (fast if _is_fast(pid, m) else slow).append(entry)
@@ -682,6 +734,12 @@ def _upstream_chat(pid, payload, stream):
             except ValueError:
                 secs = None
             quota.mark_throttled(pid, secs or 60)
+        # 403 (no access to this model with this key) / 404 (model gone) are about
+        # the MODEL, not the key or the quota: sideline just that id so routing
+        # stops picking it. Only on the last key — an earlier key's 403 may just
+        # mean THAT key lacks access, and rotation below still gets a chance.
+        if resp.status_code in _DEAD_STATUSES and is_last:
+            _mark_model_dead(pid, payload.get("model"), resp.status_code)
         # Auth/rate-limit on this key -> try the next key before this provider
         # is given up on. On the last key, return it so the caller can react
         # (429/5xx -> provider fallback; 401/403 -> surfaced as an error).
@@ -841,6 +899,15 @@ def _activity_after(response):
         ok = 200 <= response.status_code < 300
         _activity_done(act, "ok" if ok else "error", response.status_code)
     return response
+
+
+@app.route("/api/dead-models", methods=["GET"])
+def api_dead_models():
+    """Models sidelined at runtime because this key provably can't use them
+    (403 no-access / 404 gone). Self-healing: each entry expires and is re-probed."""
+    rows = [{"provider": p, "model": m, "expires_in": s} for p, m, s in _dead_model_rows()]
+    rows.sort(key=lambda r: (r["provider"], r["model"]))
+    return jsonify({"dead": rows, "count": len(rows), "ttl_seconds": _DEAD_MODEL_TTL})
 
 
 @app.route("/api/activity", methods=["GET"])
