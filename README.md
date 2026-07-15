@@ -1,4 +1,4 @@
-# Free LLM Hub
+# Calvoun Free LLM Hub
 
 *Made by **DAVID SEO** from **Calvoun**.*
 
@@ -111,7 +111,7 @@ Free tiers change often — the numbers above are indicative. Always check the p
 ```
 ┌────────────────┐   Anthropic Messages     ┌──────────────────────┐   OpenAI Chat        ┌────────────────┐
 │  Claude Code   │ ───────────────────────► │                      │ ───────────────────► │  Groq (free)   │
-└────────────────┘   POST /v1/messages      │    Free LLM Hub      │                      ├────────────────┤
+└────────────────┘   POST /v1/messages      │    Calvoun Free LLM Hub      │                      ├────────────────┤
                                             │  127.0.0.1:8787      │   429/5xx? rotate ─► │ Cerebras (free)│
 ┌────────────────┐   OpenAI Chat            │                      │                      ├────────────────┤
 │ aider/opencode │ ───────────────────────► │  · protocol xlate    │                      │ Google (free)  │

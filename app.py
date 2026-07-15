@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Free LLM Hub -- local gateway that serves FREE LLM providers to any tool.
+"""Calvoun Free LLM Hub -- local gateway that serves FREE LLM providers to any tool.
 
 Surfaces:
   GET  /                        dashboard (templates/index.html)
@@ -1522,7 +1522,7 @@ def index():
         return render_template("index.html")
     except TemplateNotFound:
         return (
-            "<h1>Free LLM Hub</h1>"
+            "<h1>Calvoun Free LLM Hub</h1>"
             "<p>Gateway is running, but <code>templates/index.html</code> is "
             "missing. The API surface is live: <code>/api/status</code>, "
             "<code>/api/providers</code>, <code>/v1/models</code>, "
@@ -2106,7 +2106,7 @@ CLI_REGISTRY = [
             "OPENAI_API_BASE/OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL chat vars do NOT connect "
             "it. Auto-fix adds:\n"
             "  [model_providers.freehub]\n"
-            "  name = \"Free LLM Hub\"\n"
+            "  name = \"Calvoun Free LLM Hub\"\n"
             "  base_url = \"http://127.0.0.1:%d/v1\"\n"
             "  wire_api = \"responses\"\n"
             "and sets  model_provider = \"freehub\"  +  model = \"auto\"  in the top (pre-table) "
@@ -2516,7 +2516,7 @@ def _autofix_opencode(entry, key, base_root, base_v1, model):
         providers = {}
     providers["free-llm-hub"] = {
         "npm": "@ai-sdk/openai-compatible",
-        "name": "Free LLM Hub",
+        "name": "Calvoun Free LLM Hub",
         "options": {"baseURL": base_v1, "apiKey": key},
         "models": {model: {"name": model}},
     }
@@ -2597,7 +2597,7 @@ def _codex_apply_text(text, base_v1, bearer=None):
 
     block = [
         "[model_providers.freehub]",
-        'name = "Free LLM Hub"',
+        'name = "Calvoun Free LLM Hub"',
         'base_url = "%s"' % base_v1,
         'wire_api = "responses"',
     ]
@@ -4379,7 +4379,7 @@ def _print_banner():
     snippets = _connect_snippets()
     line = "=" * 74
     print(line)
-    print("  Free LLM Hub -- local gateway for free LLM providers")
+    print("  Calvoun Free LLM Hub -- local gateway for free LLM providers")
     print(line)
     print("  Dashboard:   http://%s:%d/" % (HOST, PORT))
     print("  OpenAI API:  http://%s:%d/v1  (chat/completions, models)" % (HOST, PORT))

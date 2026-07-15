@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Free LLM Hub — Local Gateway</title>
+<title>Calvoun Free LLM Hub — Local Gateway</title>
 <style>
   :root{
     --bg:#0B0F19;
@@ -334,6 +334,8 @@
     display: inline-flex; align-items: center; gap: 6px;
   }
   .site-footer .footer-yt:hover { text-decoration: underline; }
+  .site-footer .footer-brand { color: inherit; text-decoration: none; }
+  .site-footer .footer-brand:hover { text-decoration: underline; }
   .site-footer .footer-legal {
     font-size: 11.5px; line-height: 1.55; opacity: .7; max-width: 720px;
   }
@@ -608,7 +610,7 @@
       <span class="logo-mark" aria-hidden="true">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 11-13h-7l1-7z"/></svg>
       </span>
-      <span>Free LLM Hub<small>local gateway &middot; 127.0.0.1</small></span>
+      <span>Calvoun Free LLM Hub<small>local gateway &middot; 127.0.0.1</small></span>
     </div>
     <div class="statusbar" id="statusbar" aria-live="polite">
       <span class="pill" id="pill-providers"><span class="dot"></span>providers: &hellip;</span>
@@ -807,7 +809,7 @@
 
 <footer class="site-footer">
   <div class="footer-line">
-    <span>Made by <strong>DAVID SEO</strong> from <strong>Calvoun</strong></span>
+    <span>Made by <strong>DAVID SEO</strong> from <a class="footer-brand" href="https://calvoun.com" target="_blank" rel="noopener noreferrer"><strong>calvoun.com</strong></a></span>
     <span class="footer-sep" aria-hidden="true">&middot;</span>
     <a class="footer-yt" href="https://www.youtube.com/@QuantumSEO-AR" target="_blank" rel="noopener noreferrer">
       &#9654; Subscribe on YouTube &mdash; QuantumSEO-AR
@@ -1947,7 +1949,7 @@
         /* refresh the card first, THEN raise the prominent restart modal */
         return loadClis().then(function(){
           var lines = [
-            { cls:'note', html: safe + ' is now pointed at the Free LLM Hub (free models).' },
+            { cls:'note', html: safe + ' is now pointed at the Calvoun Free LLM Hub (free models).' },
             { cls:'chat-note show', html: '⚠️ If ' + safe + ' is already open, restart it now — close it and reopen (or open a new terminal) — so it picks up the new config. A running session keeps its old config until you restart.' }
           ];
           if (r.restart_hint) lines.push({ cls:'cli-setup-note', html: esc(r.restart_hint) });

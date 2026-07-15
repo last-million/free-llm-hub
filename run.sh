@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Free LLM Hub — one-command launcher (Linux / macOS / Git Bash)
+# Calvoun Free LLM Hub — one-command launcher (Linux / macOS / Git Bash)
 # Idempotent: creates a venv on first run, reuses it afterwards.
 set -e
 cd "$(dirname "$0")"
@@ -36,7 +36,7 @@ pip install -q -r requirements.txt
 
 echo ""
 echo "=========================================================="
-echo "  Free LLM Hub is starting"
+echo "  Calvoun Free LLM Hub is starting"
 echo "  Dashboard:  http://127.0.0.1:${PORT}"
 echo "=========================================================="
 echo ""
