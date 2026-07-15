@@ -6,6 +6,21 @@ cd "$(dirname "$0")"
 
 PORT="${PORT:-8787}"
 
+# --- refuse to double-bind -------------------------------------------------
+# Werkzeug sets SO_REUSEADDR, so on some platforms a SECOND process can bind a
+# port that is already served. You then get two hubs alive at once and requests
+# land on whichever won - typically the OLD one, so code changes appear not to
+# take effect and any check you run "passes" against a stale process. Cheaper to
+# refuse than to debug. HUB_FORCE=1 overrides.
+if [ -z "${HUB_FORCE:-}" ]; then
+  if command -v curl >/dev/null 2>&1 && curl -fsS -m 2 "http://127.0.0.1:${PORT}/api/providers" >/dev/null 2>&1; then
+    echo "[free-llm-hub] Already running and healthy on port ${PORT} - nothing to do."
+    echo "               Dashboard: http://127.0.0.1:${PORT}"
+    echo "               (restart it instead of starting a second copy; HUB_FORCE=1 to override)"
+    exit 0
+  fi
+fi
+
 # --- find python ---
 if command -v python3 >/dev/null 2>&1; then
   PY=python3

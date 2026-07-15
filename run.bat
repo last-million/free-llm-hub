@@ -6,6 +6,22 @@ cd /d "%~dp0"
 
 if "%PORT%"=="" set "PORT=8787"
 
+rem --- refuse to double-bind -------------------------------------------------
+rem Werkzeug sets SO_REUSEADDR, so Windows lets a SECOND process bind a port
+rem that is already served. You then get two hubs alive at once and requests
+rem land on whichever won - typically the OLD one, so code changes look like
+rem they "didn't take effect" and any check you run passes against a stale
+rem process. Cheaper to refuse than to debug. Set HUB_FORCE=1 to override.
+if not defined HUB_FORCE (
+  netstat -ano -p TCP | findstr /R /C:"LISTENING" | findstr /C:":%PORT% " >nul 2>nul
+  if not errorlevel 1 (
+    echo [free-llm-hub] Port %PORT% is already being served - not starting a second copy.
+    echo                Dashboard: http://127.0.0.1:%PORT%
+    echo                Restart it instead, or set HUB_FORCE=1 to override.
+    exit /b 0
+  )
+)
+
 rem --- find python ---
 set "PY="
 where python >nul 2>nul && set "PY=python"
