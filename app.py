@@ -1331,7 +1331,14 @@ CLI_REGISTRY = [
         "kind": "openai",
         "bins": ["codex"],
         "config_paths": [_p_codex()],
-        "env_check": ["OPENAI_BASE_URL", "OPENAI_API_BASE"],
+        # NO env_check on purpose. Codex is wired ONLY by ~/.codex/config.toml
+        # (model_provider + [model_providers.*] with wire_api="responses"); it
+        # never reads OPENAI_BASE_URL/OPENAI_API_BASE. Checking them here was a
+        # real bug: _cli_connected tests env FIRST and short-circuits, so a stale
+        # OPENAI_BASE_URL left over from another tool's manual setup made Codex
+        # report "Connected via the OPENAI_BASE_URL environment variable" even
+        # right after Disconnect had correctly cleaned config.toml — the popup
+        # said disconnected, the badge said connected, and the badge was wrong.
         "autofix": "codex",  # TOML edited ADDITIVELY (top keys) + one [table], reversible
         "write_path": _p_codex(),
         "default_method": "config",
@@ -2390,17 +2397,42 @@ def api_cli_disconnect(cid):
         result = reverter(entry)
     except OSError as exc:
         return jsonify({"ok": False, "reason": _sanitize("could not restore config: %s" % exc)})
-    # Recompute freshly from disk so 'connected' reflects the revert immediately.
-    connected = _cli_row(entry).get("connected")
+    # VERIFY THE REVERT. Recompute freshly from disk/env so 'connected' reflects
+    # reality, and if the CLI is STILL wired to the hub, say so instead of
+    # reporting a clean success. This is the honest answer to "I clicked
+    # Disconnect, it said done, but the CLI is still connected": the config
+    # revert worked, but a hub-pointing env var (OPENAI_BASE_URL / ANTHROPIC_
+    # BASE_URL, often left over from an older manual setup) still overrides it,
+    # and we do NOT silently unset a user's environment. Hand back the exact
+    # commands instead so the popup can show them.
+    row = _cli_row(entry)
+    connected = bool(row.get("connected"))
     out = {
         "ok": True,
         "restored_from_backup": bool(result.get("restored_from_backup")),
         "wrote_path": result.get("wrote_path"),
         "restart_hint": result.get("restart_hint"),
-        "connected": bool(connected),
+        "connected": connected,
     }
     if "changed" in result:
         out["changed"] = bool(result["changed"])
+    if connected:
+        method = row.get("connect_method")
+        out["still_connected"] = True
+        out["still_connected_via"] = method
+        out["still_connected_detail"] = row.get("detail")
+        if method == "env":
+            out["note"] = (
+                "Config reverted, but %s is STILL pointed at the hub by an environment "
+                "variable (%s). Environment variables override the config file, so run "
+                "the commands below to finish disconnecting, then open a NEW terminal."
+                % (entry.get("name", entry["id"]), row.get("detail") or "an env var"))
+            out["commands"] = _env_unset_commands(entry)
+        else:
+            out["note"] = (
+                "Config reverted, but %s still reports as connected (%s). Nothing else "
+                "was changed — check that path manually."
+                % (entry.get("name", entry["id"]), row.get("detail") or "unknown source"))
     return jsonify(out)
 
 
