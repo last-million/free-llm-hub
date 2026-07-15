@@ -89,6 +89,21 @@ PROVIDERS: Dict[str, dict] = {
         ],
         "notes": "OpenAI-compatible. Free tier ~200 req/mo + trial credits. Fast general models (GLM/MiniMax/DeepSeek/Qwen) plus fast-apply code editing.",
     },
+    "agentrouter": {
+        "name": "AgentRouter",
+        "base_url": "https://agentrouter.org/v1",
+        "models_url": "https://agentrouter.org/v1/models",
+        "signup_url": "https://agentrouter.org/console/token",
+        "key_hint": "sk-...",
+        "free_filter": "family",
+        "free_families": ["glm-4.5-air", "glm-4.6", "glm-4", "deepseek-v2-lite",
+                          "qwen2-7b", "qwen3-coder", "mistral-7b"],
+        "default_free_models": [
+            "glm-4.6", "glm-4.5-air", "deepseek-v2-lite",
+            "qwen2-7b-instruct", "mistral-7b-instruct",
+        ],
+        "notes": "Non-profit OpenAI-compatible gateway (30+ providers). Truly-free models = GLM/DeepSeek/Qwen/Mistral (family-filtered here); GPT/Claude/Gemini consume the free signup credits (~$100 via GitHub, no card). Key: agentrouter.org/console/token. Also speaks /v1/responses + /v1/messages.",
+    },
     "google": {
         "name": "Google Gemini (AI Studio)",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
