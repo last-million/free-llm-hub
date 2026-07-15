@@ -106,9 +106,15 @@ def models(pid: str) -> dict:
 
 
 def mark_throttled(pid: str, seconds: float = None) -> None:
-    """Provider returned 429 -> treat as exhausted until the window resets (or for
-    `seconds` if the provider sent a Retry-After). Also pegs `used` to the limit so
-    `remaining` reads 0 immediately."""
+    """Provider returned 429.
+
+    - `seconds` given (a Retry-After value OR the hub's short default cooldown):
+      sideline the provider for JUST that long and do NOT peg `used`. A per-minute
+      burst 429 must not read as 'daily/monthly budget spent' for the rest of the
+      window — once the short throttle lifts the provider is usable again.
+    - `seconds` is None: treat it as full-window exhaustion — peg `used` to the
+      limit (so `remaining` reads 0 immediately) and sideline until the window
+      resets. This is the legacy behavior, preserved for callers that mean it."""
     lim = _limit_for(pid)
     now = time.time()
     start, reset = _window_bounds(lim["window"], now)
@@ -116,8 +122,9 @@ def mark_throttled(pid: str, seconds: float = None) -> None:
     with _LOCK:
         st = _STATE.get(pid)
         if not st or st.get("window_start") != start:
-            st = {"count": lim["limit"], "window_start": start, "throttled_until": 0}
-        else:
+            st = {"count": 0, "window_start": start, "throttled_until": 0}
+        if not seconds:
+            # Full-window throttle: peg usage so `remaining` reads 0 immediately.
             st["count"] = max(st.get("count", 0), lim["limit"])
         st["throttled_until"] = max(st.get("throttled_until", 0), until)
         _STATE[pid] = st
@@ -134,8 +141,20 @@ def status(pid: str) -> dict:
         throttled_until = (st.get("throttled_until", 0) if st else 0)
     throttled = throttled_until > now
     remaining = max(0, lim["limit"] - used)
-    exhausted = throttled or remaining <= 0
-    reset_at = max(reset, throttled_until) if throttled else reset
+    quota_exhausted = remaining <= 0
+    exhausted = throttled or quota_exhausted
+    # Countdown = when the provider becomes usable AGAIN:
+    #   - budget genuinely spent -> wait for the window reset (or a later throttle);
+    #   - only throttled (short 429 cooldown, budget left) -> wait out the throttle,
+    #     NOT the far-off window reset — otherwise a 1-minute burst limit would show
+    #     an end-of-day countdown and the provider would look dead all day;
+    #   - neither -> next window (informational).
+    if quota_exhausted:
+        reset_at = max(reset, throttled_until)
+    elif throttled:
+        reset_at = throttled_until
+    else:
+        reset_at = reset
     return {
         "used": used, "limit": lim["limit"], "remaining": remaining,
         "window": lim["window"], "resets_in": max(0, int(reset_at - now)),
