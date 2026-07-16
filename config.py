@@ -12,7 +12,8 @@ Shape:
     "<pid>": {"api_keys": ["sk-...", "sk-..."], "enabled": true, "base_url": null}
   },
   "default": {"provider": "groq", "model": "llama-3.3-70b-versatile"},  # or null
-  "local_api_key": "..."   # or null (open on localhost)
+  "local_api_key": "...",  # or null (open on localhost, gates /v1/*)
+  "control_token": "..."   # or null (generated on first use, gates /api/*)
 }
 
 Each provider now holds a POOL of keys ("api_keys": list[str]) that the gateway
@@ -31,6 +32,11 @@ import stat
 import tempfile
 import threading
 import time
+import copy
+import contextlib
+import datetime
+import hashlib
+import uuid
 from typing import Optional
 
 
@@ -45,11 +51,114 @@ CONFIG_PATH: str = _default_config_path()
 
 _LOCK = threading.RLock()
 
+SCHEMA_VERSION = 2
+
+
+def _new_hub_mode() -> dict:
+    # Existing installs already behave as "on".  Defaulting a migrated config to
+    # off would make the new switch lie while leaving CLI files connected.
+    return {
+        "desired": "on",
+        "phase": "unmanaged",
+        "revision": 0,
+        "generation": None,
+        "updated_at": None,
+        "clients": {},
+    }
+
+
+def _new_runtime() -> dict:
+    return {
+        "desired": "running",
+        "phase": "running",
+        "revision": 0,
+        "shutdown_requested_at": None,
+        "last_error": None,
+    }
+
+
+def _new_media() -> dict:
+    return {
+        "revision": 0,
+        "priority_mode": "auto",
+        "manual_priority": [],
+    }
+
+
 _EMPTY_CONFIG = {
+    "schema_version": SCHEMA_VERSION,
     "providers": {},
     "default": None,
     "local_api_key": None,
+    "hub_mode": _new_hub_mode(),
+    "runtime": _new_runtime(),
+    "media": _new_media(),
 }
+
+
+class ConfigCorruptError(RuntimeError):
+    """The on-disk config exists but is not a JSON object.
+
+    Read-only callers still receive a safe normalized view.  Every mutating
+    caller uses ``strict=True`` and refuses to destroy the recoverable file.
+    """
+
+
+class RevisionConflict(RuntimeError):
+    def __init__(self, current_revision: int):
+        super().__init__("state revision changed")
+        self.current_revision = int(current_revision)
+
+
+def _utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _normalize_state(raw, defaults):
+    out = copy.deepcopy(defaults)
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if key in out:
+                out[key] = value
+    try:
+        out["revision"] = max(0, int(out.get("revision") or 0))
+    except (TypeError, ValueError):
+        out["revision"] = 0
+    return out
+
+
+@contextlib.contextmanager
+def _cross_process_lock():
+    """Serialize lifecycle/media compare-and-swap across hub processes."""
+    path = _config_path() + ".lock"
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    f = open(path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if os.path.getsize(path) == 0:
+                f.seek(0)
+                f.write(b"0")
+                f.flush()
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        finally:
+            f.close()
 
 
 def _config_path() -> str:
@@ -91,8 +200,12 @@ def _normalize_provider_row(row):
     return row
 
 
-def load_config() -> dict:
-    """Load the config file; return a well-formed dict even if missing/corrupt."""
+def load_config(strict: bool = False) -> dict:
+    """Load and normalize config.
+
+    Read-only callers get a safe view if the file is corrupt.  Mutators pass
+    ``strict=True`` so malformed user data is never silently truncated.
+    """
     path = _config_path()
     cfg: dict = {}
     try:
@@ -100,7 +213,17 @@ def load_config() -> dict:
             loaded = json.load(f)
         if isinstance(loaded, dict):
             cfg = loaded
-    except (OSError, ValueError):
+        elif strict:
+            raise ConfigCorruptError("config root is not a JSON object")
+    except FileNotFoundError:
+        cfg = {}
+    except OSError:
+        if strict:
+            raise
+        cfg = {}
+    except ValueError as exc:
+        if strict:
+            raise ConfigCorruptError("config is not valid JSON") from exc
         cfg = {}
     # Normalize shape (never let callers see a missing key)
     if not isinstance(cfg.get("providers"), dict):
@@ -115,11 +238,31 @@ def load_config() -> dict:
         cfg["default"] = None
     if not isinstance(cfg.get("local_api_key"), str) or not cfg.get("local_api_key"):
         cfg["local_api_key"] = cfg.get("local_api_key") if isinstance(cfg.get("local_api_key"), str) and cfg.get("local_api_key") else None
+    cfg["schema_version"] = SCHEMA_VERSION
+    cfg["hub_mode"] = _normalize_state(cfg.get("hub_mode"), _new_hub_mode())
+    if not isinstance(cfg["hub_mode"].get("clients"), dict):
+        cfg["hub_mode"]["clients"] = {}
+    if cfg["hub_mode"].get("desired") not in ("on", "off"):
+        cfg["hub_mode"]["desired"] = "on"
+    if cfg["hub_mode"].get("phase") not in (
+            "unmanaged", "on", "off", "changing", "conflict", "error"):
+        cfg["hub_mode"]["phase"] = "unmanaged"
+    cfg["runtime"] = _normalize_state(cfg.get("runtime"), _new_runtime())
+    if cfg["runtime"].get("desired") not in ("running", "stopped"):
+        cfg["runtime"]["desired"] = "running"
+    if cfg["runtime"].get("phase") not in ("running", "draining", "stopped", "error"):
+        cfg["runtime"]["phase"] = (
+            "stopped" if cfg["runtime"].get("desired") == "stopped" else "running")
+    cfg["media"] = _normalize_state(cfg.get("media"), _new_media())
+    if cfg["media"].get("priority_mode") not in ("auto", "manual"):
+        cfg["media"]["priority_mode"] = "auto"
+    if not isinstance(cfg["media"].get("manual_priority"), list):
+        cfg["media"]["manual_priority"] = []
     return cfg
 
 
 def save_config(cfg: dict) -> None:
-    """Persist config atomically; chmod 0600 on POSIX (best-effort on Windows)."""
+    """Persist atomically; never fall back to truncating the live file."""
     path = _config_path()
     parent = os.path.dirname(path)
     if parent:
@@ -130,16 +273,15 @@ def save_config(cfg: dict) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
         if os.name == "posix":
             try:
                 os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
             except OSError:
                 pass
-        # os.replace is atomic, but on Windows an antivirus scanner or a cloud
-        # sync client (OneDrive/Dropbox) can briefly hold a handle on the
-        # destination or temp file -> PermissionError [WinError 5]. Retry a few
-        # times with tiny backoff; if it still fails, fall back to a direct
-        # (non-atomic) write so a save NEVER 500s the app. Cross-platform safe.
+        # Antivirus/cloud-sync may briefly hold the destination on Windows.
+        # Retry the atomic replace, but never truncate the only known-good file.
         replaced = False
         for _attempt in range(6):
             try:
@@ -151,12 +293,7 @@ def save_config(cfg: dict) -> None:
             except OSError:
                 break
         if not replaced:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(data)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            raise OSError("could not atomically replace config after retries")
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -166,6 +303,14 @@ def save_config(cfg: dict) -> None:
     if os.name == "posix":
         try:
             os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        except OSError:
+            pass
+        try:
+            dfd = os.open(parent or ".", os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         except OSError:
             pass
 
@@ -211,7 +356,7 @@ def set_provider_config(pid: str, *, api_key: Optional[str] = None,
     To CLEAR base_url, pass an empty string ('') — it is stored as None.
     """
     with _LOCK:
-        cfg = load_config()
+        cfg = load_config(strict=True)
         row = cfg["providers"].get(pid)
         if not isinstance(row, dict):
             row = _blank_row()
@@ -249,7 +394,7 @@ def add_provider_key(pid: str, key: str) -> None:
     if not key:
         return
     with _LOCK:
-        cfg = load_config()
+        cfg = load_config(strict=True)
         row = cfg["providers"].get(pid)
         if not isinstance(row, dict):
             row = _blank_row()
@@ -269,7 +414,7 @@ def remove_provider_key(pid: str, index: int) -> bool:
     if not isinstance(index, int) or isinstance(index, bool):
         return False
     with _LOCK:
-        cfg = load_config()
+        cfg = load_config(strict=True)
         row = cfg["providers"].get(pid)
         if not isinstance(row, dict):
             return False
@@ -287,7 +432,7 @@ def remove_provider_key(pid: str, index: int) -> bool:
 def clear_provider_keys(pid: str) -> None:
     """Empty the provider's key pool (keeps enabled/base_url), persist."""
     with _LOCK:
-        cfg = load_config()
+        cfg = load_config(strict=True)
         row = cfg["providers"].get(pid)
         if not isinstance(row, dict):
             return
@@ -309,7 +454,7 @@ def get_default() -> Optional[dict]:
 
 def set_default(provider: str, model: str) -> None:
     with _LOCK:
-        cfg = load_config()
+        cfg = load_config(strict=True)
         cfg["default"] = {"provider": provider, "model": model}
         save_config(cfg)
 
@@ -325,7 +470,7 @@ def get_flag(name: str, default: bool = False) -> bool:
 def set_flag(name: str, value: bool) -> None:
     """Persist a top-level boolean flag."""
     with _LOCK:
-        cfg = load_config()
+        cfg = load_config(strict=True)
         cfg[name] = bool(value)
         save_config(cfg)
 
@@ -341,7 +486,7 @@ def get_local_api_key() -> Optional[str]:
 def ensure_local_api_key() -> str:
     """Return the local gateway key, generating + persisting one if absent."""
     with _LOCK:
-        cfg = load_config()
+        cfg = load_config(strict=True)
         key = cfg.get("local_api_key")
         if isinstance(key, str) and key:
             return key
@@ -349,3 +494,153 @@ def ensure_local_api_key() -> str:
         cfg["local_api_key"] = key
         save_config(cfg)
         return key
+
+
+def get_control_token() -> Optional[str]:
+    """The dashboard/control-plane bearer token, if one has been generated."""
+    with _LOCK:
+        cfg = load_config()
+    token = cfg.get("control_token")
+    return token if isinstance(token, str) and token else None
+
+
+def ensure_control_token() -> str:
+    """Return the per-install control-plane token, generating + persisting one
+    if absent. Required on every /api/* request (see app.py's
+    _local_control_guard). This is what stops a DIFFERENT local OS user who can
+    reach the loopback port from driving the control plane: the token lives in
+    this 0600 config file, so only the owning account can read it, and it is
+    never rendered into the dashboard HTML (any user's browser can load the
+    page, only the owning user's shell sees the token printed at startup)."""
+    with _LOCK:
+        cfg = load_config(strict=True)
+        token = cfg.get("control_token")
+        if isinstance(token, str) and token:
+            return token
+        token = secrets.token_urlsafe(32)
+        cfg["control_token"] = token
+        save_config(cfg)
+        return token
+
+
+def _cas_update(section: str, expected_revision: int, updater) -> dict:
+    """Locked compare-and-swap for lifecycle/runtime/media state."""
+    with _LOCK:
+        with _cross_process_lock():
+            cfg = load_config(strict=True)
+            current = copy.deepcopy(cfg[section])
+            revision = int(current.get("revision") or 0)
+            try:
+                expected = int(expected_revision)
+            except (TypeError, ValueError) as exc:
+                raise RevisionConflict(revision) from exc
+            if expected != revision:
+                raise RevisionConflict(revision)
+            replacement = updater(copy.deepcopy(current))
+            if replacement is not None:
+                current = replacement
+            if not isinstance(current, dict):
+                raise ValueError("state updater must return a dict or None")
+            current["revision"] = revision + 1
+            if section == "hub_mode":
+                current["updated_at"] = _utc_now()
+            cfg[section] = current
+            cfg["schema_version"] = SCHEMA_VERSION
+            save_config(cfg)
+            return copy.deepcopy(current)
+
+
+def get_hub_mode_state() -> dict:
+    with _LOCK:
+        return copy.deepcopy(load_config().get("hub_mode") or _new_hub_mode())
+
+
+def update_hub_mode_state(expected_revision: int, updater) -> dict:
+    return _cas_update("hub_mode", expected_revision, updater)
+
+
+def get_runtime_state() -> dict:
+    with _LOCK:
+        return copy.deepcopy(load_config().get("runtime") or _new_runtime())
+
+
+def update_runtime_state(expected_revision: int, updater) -> dict:
+    return _cas_update("runtime", expected_revision, updater)
+
+
+def get_media_state() -> dict:
+    with _LOCK:
+        return copy.deepcopy(load_config().get("media") or _new_media())
+
+
+def update_media_state(expected_revision: int, updater) -> dict:
+    return _cas_update("media", expected_revision, updater)
+
+
+def new_generation_id() -> str:
+    return "%s-%s" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), uuid.uuid4().hex[:12])
+
+
+def state_dir() -> str:
+    return os.path.dirname(_config_path())
+
+
+def snapshots_dir() -> str:
+    return os.path.join(state_dir(), "snapshots")
+
+
+def snapshot_dir(generation: str, cli_id: str) -> str:
+    safe_generation = re_safe_component(generation)
+    safe_cli = re_safe_component(cli_id)
+    return os.path.join(snapshots_dir(), safe_generation, safe_cli)
+
+
+def re_safe_component(value: str) -> str:
+    value = str(value or "")
+    safe = "".join(ch for ch in value if ch.isalnum() or ch in ("-", "_", "."))
+    if not safe or safe in (".", ".."):
+        raise ValueError("invalid state path component")
+    return safe
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def intentional_stop_path() -> str:
+    return os.path.join(state_dir(), "intentional-stop")
+
+
+def is_intentionally_stopped() -> bool:
+    return os.path.isfile(intentional_stop_path())
+
+
+def set_intentional_stop() -> str:
+    """Atomically create the supervisor-visible intentional-stop marker."""
+    path = intentional_stop_path()
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".intentional-stop-", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"requested_at": _utc_now()}) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name == "posix":
+            os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def clear_intentional_stop() -> bool:
+    try:
+        os.remove(intentional_stop_path())
+        return True
+    except FileNotFoundError:
+        return False
