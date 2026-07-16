@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Calvoun Free LLM Hub — Local Gateway</title>
-<style>
+<style nonce="{{ csp_nonce }}">
   :root{
     --bg:#0B0F19;
     --surface:#111827;
@@ -76,6 +76,15 @@
   .pill.ok .dot{background:var(--accent);box-shadow:0 0 8px rgba(34,197,94,.7)}
   .pill.ok{color:var(--text)}
   .pill.bad .dot{background:var(--warn)}
+
+  .lifecycle-row{
+    background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
+    padding:16px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+  }
+  .lifecycle-row .group{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+  .lifecycle-row .group.media{margin-left:auto}
+  .lifecycle-detail{flex-basis:100%;font-size:12px;color:var(--text-dim);overflow-wrap:anywhere}
+  .lifecycle-detail.warn{color:var(--warn)}
 
   /* ---------- sections ---------- */
   .section{margin-top:28px}
@@ -596,7 +605,8 @@
     select{min-width:0;flex:1}
     .chat-bar select{min-width:0}
     .chat-send-col{width:auto;flex-direction:row}
-    .chat-send-col .btn{flex:1}
+  .chat-send-col .btn{flex:1}
+    .lifecycle-row .group.media{margin-left:0;width:100%}
     .cli-actions{margin-left:0;width:100%}
   }
 </style>
@@ -613,6 +623,7 @@
       <span>Calvoun Free LLM Hub<small>local gateway &middot; 127.0.0.1</small></span>
     </div>
     <div class="statusbar" id="statusbar" aria-live="polite">
+      <span class="pill" id="pill-hub"><span class="dot"></span>hub: &hellip;</span>
       <span class="pill" id="pill-providers"><span class="dot"></span>providers: &hellip;</span>
       <span class="pill" id="pill-default"><span class="dot"></span>default: &hellip;</span>
       <span class="pill" id="pill-auth"><span class="dot"></span>gateway auth: &hellip;</span>
@@ -622,6 +633,37 @@
 </header>
 
 <main class="wrap">
+
+  <!-- Lifecycle and multimodal routing -->
+  <section class="section" aria-labelledby="h-lifecycle">
+    <div class="section-h">
+      <h2 id="h-lifecycle"><button type="button" class="sec-toggle" aria-expanded="true" aria-controls="sec-lifecycle">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Hub controls
+      </button></h2>
+      <span class="sub">connect compatible CLIs together, choose vision priority, or stop cleanly</span>
+    </div>
+    <div class="section-body" id="sec-lifecycle">
+      <div class="lifecycle-row">
+        <div class="group">
+          <label class="switch" title="Connect or disconnect all installed compatible CLIs as one transaction">
+            <input id="hub-mode-switch" type="checkbox" aria-label="Hub mode">
+            <span class="track"></span><span class="lbl">Hub mode</span>
+          </label>
+          <span id="hub-mode-label" class="current-default">loading&hellip;</span>
+        </div>
+        <div class="group media">
+          <label for="media-primary">Vision priority</label>
+          <select id="media-primary" aria-label="Preferred vision model">
+            <option value="">Auto &mdash; best available vision model</option>
+          </select>
+          <button class="btn sm" id="media-save" type="button">Save</button>
+        </div>
+        <button class="btn danger sm" id="hub-stop" type="button">Stop hub</button>
+        <div id="lifecycle-detail" class="lifecycle-detail" role="status">Loading lifecycle state&hellip;</div>
+      </div>
+    </div>
+  </section>
 
   <!-- Connect -->
   <section class="section" aria-labelledby="h-connect">
@@ -726,10 +768,13 @@
       <div class="chat-input-row">
         <textarea id="chat-text" placeholder="Type a message&hellip;  (Enter to send, Shift+Enter for a new line)" aria-label="Message" rows="2"></textarea>
         <div class="chat-send-col">
+          <input id="chat-images" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+          <button class="btn" id="chat-attach" type="button" title="Attach up to 8 images">Attach</button>
           <button class="btn primary" id="chat-send" type="button">Send</button>
           <button class="btn" id="chat-stop" type="button" disabled>Stop</button>
         </div>
       </div>
+      <div class="chat-note" id="chat-image-note" role="status"></div>
     </div>
     </div>
   </section>
@@ -838,11 +883,14 @@
 
 <div id="toasts" aria-live="polite"></div>
 
-<script>
+<script nonce="{{ csp_nonce }}">
 (function(){
   'use strict';
   var providers = [];
   var statusData = null;
+  var hubModeState = null;
+  var mediaState = null;
+  var runtimeState = null;
   var quotaState = {};        /* pid -> live quota model; resets_in ticks down locally */
   var _ebSig = '';            /* last structural signature of the exhaustion banner */
   var keyHealth = {};         /* pid -> {state:'ok'|'bad'|'unknown', detail} — cached per session, NOT re-run on the 15s poll */
@@ -863,14 +911,54 @@
     setTimeout(function(){ t.style.opacity = '0'; t.style.transition = 'opacity .3s'; }, 3400);
     setTimeout(function(){ t.remove(); }, 3800);
   }
-  function api(path, opts){
+  var HUB_TOKEN_LS_KEY = 'freehub_control_token';
+  var _hubTokenPromptPromise = null;
+  function getHubToken(){
+    try { return localStorage.getItem(HUB_TOKEN_LS_KEY) || ''; } catch(e){ return ''; }
+  }
+  function setHubToken(tok){
+    try { localStorage.setItem(HUB_TOKEN_LS_KEY, tok); } catch(e){ /* private mode / quota */ }
+  }
+  function ensureHubToken(){
+    /* Shared across concurrent 401s so parallel /api/* calls on first load
+       prompt once, not once per call. */
+    if (getHubToken()) return Promise.resolve(getHubToken());
+    if (!_hubTokenPromptPromise){
+      _hubTokenPromptPromise = Promise.resolve().then(function(){
+        var tok = window.prompt(
+          'Paste the control token printed in the terminal where this hub was ' +
+          'started (run.bat / run.sh). It authorizes this browser to control ' +
+          'the hub and is only shown there.');
+        tok = tok ? tok.trim() : '';
+        if (tok) setHubToken(tok);
+        return tok;
+      }).then(function(tok){ _hubTokenPromptPromise = null; return tok; });
+    }
+    return _hubTokenPromptPromise;
+  }
+  function api(path, opts, _retried){
     opts = opts || {};
+    var headers = Object.assign({}, opts.headers || {});
     if (opts.body && typeof opts.body !== 'string'){
       opts.body = JSON.stringify(opts.body);
-      opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers || {});
+      headers['Content-Type'] = 'application/json';
     }
+    if (opts.method && String(opts.method).toUpperCase() !== 'GET'){
+      headers['X-Free-LLM-Hub'] = 'dashboard';
+    }
+    if (path.indexOf('/api/') === 0){
+      var tok = getHubToken();
+      if (tok) headers['X-Free-LLM-Hub-Token'] = tok;
+    }
+    opts.headers = headers;
     return fetch(path, opts).then(function(r){
       return r.json().catch(function(){ return {}; }).then(function(j){
+        if (r.status === 401 && j && j.code === 'token_required' && !_retried){
+          return ensureHubToken().then(function(tok){
+            if (!tok) throw new Error((j && j.error) || 'control token required');
+            return api(path, opts, true);
+          });
+        }
         if (!r.ok){
           var msg = (j && (j.error || j.detail || j.message)) || (r.status + ' ' + r.statusText);
           throw new Error(msg);
@@ -925,6 +1013,91 @@
     var p = document.getElementById(id);
     p.className = 'pill ' + (ok ? 'ok' : 'bad');
     p.innerHTML = '<span class="dot"></span>' + esc(label);
+  }
+
+  /* ---------- lifecycle + multimodal priority ---------- */
+  function loadLifecycle(silent){
+    return Promise.all([api('/api/hub-mode'), api('/api/media'), api('/api/runtime')])
+      .then(function(all){
+        var hub = all[0] || {}, media = all[1] || {}, runtime = all[2] || {};
+        hubModeState = hub.state || {};
+        mediaState = media.state || {};
+        runtimeState = runtime.state || {};
+        var phase = hubModeState.phase || 'unmanaged';
+        setPill('pill-hub', phase === 'on', 'hub: ' + phase);
+        var sw = $('#hub-mode-switch');
+        sw.checked = phase === 'on';
+        sw.disabled = phase === 'changing';
+        $('#hub-mode-label').textContent = phase;
+
+        var rows = hubModeState.clients || {};
+        var conflicts = Object.keys(rows).filter(function(k){
+          return rows[k] && (rows[k].status === 'conflict' || rows[k].status === 'error');
+        });
+        var detail = $('#lifecycle-detail');
+        if (conflicts.length){
+          detail.className = 'lifecycle-detail warn';
+          detail.textContent = 'Needs attention: ' + conflicts.join(', ') + '. Changed files were left untouched.';
+        } else if (phase === 'on'){
+          detail.className = 'lifecycle-detail';
+          detail.textContent = 'Compatible installed CLIs are managed as one snapshot-backed generation. Restart open CLI sessions after switching.';
+        } else if (phase === 'off'){
+          detail.className = 'lifecycle-detail';
+          detail.textContent = 'Managed CLI configs were restored. Restart open CLI sessions to use their normal setup.';
+        } else {
+          detail.className = 'lifecycle-detail';
+          detail.textContent = 'Individual CLI controls are active. Turn Hub mode on to manage compatible installed CLIs together.';
+        }
+
+        var select = $('#media-primary');
+        var chosen = mediaState.priority_mode === 'manual' && mediaState.manual_priority
+          ? (mediaState.manual_priority[0] || '') : '';
+        select.innerHTML = '<option value="">Auto &mdash; best available vision model</option>';
+        (media.models || []).forEach(function(m){
+          var option = document.createElement('option');
+          option.value = m.id;
+          option.textContent = (m.configured ? '' : 'Not configured &mdash; ') + m.id;
+          select.appendChild(option);
+        });
+        select.value = chosen;
+        $('#hub-stop').disabled = runtimeState.phase === 'draining' || runtimeState.phase === 'stopped';
+      }).catch(function(e){ if (!silent) toast('Lifecycle: ' + e.message, true); });
+  }
+
+  function initLifecycle(){
+    $('#hub-mode-switch').addEventListener('change', function(){
+      var sw = this;
+      if (!hubModeState){ sw.checked = false; return; }
+      sw.disabled = true;
+      api('/api/hub-mode', {method:'POST', body:{
+        revision: hubModeState.revision, desired: sw.checked ? 'on' : 'off'
+      }}).then(function(){
+        toast('Hub mode switched ' + (sw.checked ? 'on' : 'off') + '. Restart open CLI sessions.');
+        return Promise.all([loadLifecycle(), loadClis()]);
+      }).catch(function(e){
+        toast('Hub mode: ' + e.message, true);
+        loadLifecycle(true);
+      });
+    });
+    $('#media-save').addEventListener('click', function(){
+      if (!mediaState) return;
+      var value = $('#media-primary').value;
+      api('/api/media', {method:'POST', body:{
+        revision: mediaState.revision,
+        priority_mode: value ? 'manual' : 'auto',
+        manual_priority: value ? [value] : []
+      }}).then(function(){ toast('Vision priority saved'); return loadLifecycle(true); })
+        .catch(function(e){ toast('Vision priority: ' + e.message, true); loadLifecycle(true); });
+    });
+    $('#hub-stop').addEventListener('click', function(){
+      if (!runtimeState || !window.confirm('Stop the hub after active requests finish? Autostart will respect this intentional stop.')) return;
+      var btn = this; btn.disabled = true;
+      api('/api/runtime/stop', {method:'POST', body:{revision:runtimeState.revision}})
+        .then(function(){
+          $('#lifecycle-detail').textContent = 'Shutdown accepted. Active inference requests are draining; start run.sh/run.bat manually to resume.';
+          toast('Hub is stopping cleanly');
+        }).catch(function(e){ btn.disabled = false; toast('Stop: ' + e.message, true); loadLifecycle(true); });
+    });
   }
 
   /* ---------- free-quota model + exhaustion banner (A + B) ---------- */
@@ -1170,7 +1343,7 @@
     renderAutoTrail([], 'Probing the top-ranked models live… this can take a few seconds.');
     return fetch('/api/default/auto', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Free-LLM-Hub': 'dashboard' },
       signal: ctrl ? ctrl.signal : undefined
     }).then(function(r){
       return r.json().catch(function(){ return {}; }).then(function(j){ return { status: r.status, body: j || {} }; });
@@ -1250,13 +1423,13 @@
           '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>' +
           'Get a free key</a>' : '') +
       savedKeysHTML +
-      '<div class="keyrow">' +
+      '<form class="keyrow key-form">' +
         '<div class="kwrap">' +
           '<input type="password" class="key-input" placeholder="' + esc(p.key_hint || (keys.length ? 'paste another key to add' : 'paste API key')) + '" autocomplete="off" spellcheck="false" aria-label="Add an API key for ' + esc(p.name || p.id) + '">' +
           '<button type="button" class="eye" title="Show / hide key" aria-label="Show or hide key">' + EYE_SVG +
           '</button>' +
         '</div>' +
-      '</div>' +
+      '</form>' +
       '<div class="key-warn">' + esc(KEY_WARN) + '</div>' +
       '<details class="adv"><summary>' +
         '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>' +
@@ -1306,6 +1479,10 @@
     var toggle = $('.enable-toggle', card);
     var out = $('.testout', card);
     var baseTouched = false;
+    $('.key-form', card).addEventListener('submit', function(e){
+      e.preventDefault();
+      $('.act-save', card).click();
+    });
     baseInput.addEventListener('input', function(){ baseTouched = true; });
 
     $('.eye', card).addEventListener('click', function(){
@@ -1607,7 +1784,11 @@
     var stopBtn = $('#chat-stop');
     var clearBtn = $('#chat-clear');
     var modelSel = $('#chat-model');
+    var attachBtn = $('#chat-attach');
+    var imageInput = $('#chat-images');
+    var imageNote = $('#chat-image-note');
     var history = [];       /* [{role, content, error?}] */
+    var pendingImages = []; /* [{name,url,size}] data URLs, sent directly to the provider */
     var controller = null;
     var streaming = false;
 
@@ -1624,16 +1805,54 @@
       return wrap;
     }
 
+    function renderPendingImages(){
+      if (!pendingImages.length){
+        imageNote.classList.remove('show'); imageNote.textContent = ''; return;
+      }
+      imageNote.textContent = pendingImages.length + ' image(s) attached: ' +
+        pendingImages.map(function(x){ return x.name; }).join(', ');
+      imageNote.classList.add('show');
+    }
+
+    attachBtn.addEventListener('click', function(){ imageInput.click(); });
+    imageInput.addEventListener('change', function(){
+      var files = Array.prototype.slice.call(imageInput.files || []);
+      imageInput.value = '';
+      if (!files.length) return;
+      if (pendingImages.length + files.length > 8){ toast('At most 8 images per request', true); return; }
+      var total = pendingImages.reduce(function(n, x){ return n + x.size; }, 0) +
+                  files.reduce(function(n, x){ return n + x.size; }, 0);
+      if (total > 8 * 1024 * 1024){ toast('Combined images must be 8 MiB or smaller', true); return; }
+      files.forEach(function(file){
+        var reader = new FileReader();
+        reader.onload = function(){
+          pendingImages.push({name:file.name, url:String(reader.result || ''), size:file.size});
+          renderPendingImages();
+        };
+        reader.onerror = function(){ toast('Could not read ' + file.name, true); };
+        reader.readAsDataURL(file);
+      });
+    });
+
     function sendChat(){
       if (streaming) return;
       var content = textEl.value.trim();
-      if (!content) return;
+      if (!content && !pendingImages.length) return;
       var model = modelSel.value;
       if (!model){ toast('Pick a model first', true); return; }
 
       if (!history.length) msgsEl.innerHTML = '';   /* drop empty state */
-      history.push({ role: 'user', content: content });
-      appendBubble('user', 'You', content);
+      var userContent = content;
+      if (pendingImages.length){
+        userContent = (content ? [{type:'text', text:content}] : []).concat(pendingImages.map(function(img){
+          return {type:'image_url', image_url:{url:img.url}};
+        }));
+      }
+      var imageCount = pendingImages.length;
+      history.push({ role: 'user', content: userContent });
+      appendBubble('user', 'You', (content || '(image only)') +
+                   (imageCount ? '\n\n[' + imageCount + ' image(s) attached]' : ''));
+      pendingImages = []; renderPendingImages();
       textEl.value = ''; autoGrow();
 
       var asstEl = appendBubble('assistant', 'Assistant', '');
@@ -1719,7 +1938,7 @@
     stopBtn.addEventListener('click', function(){ if (controller) controller.abort(); });
     clearBtn.addEventListener('click', function(){
       if (controller) controller.abort();
-      history = []; renderEmpty();
+      history = []; pendingImages = []; renderPendingImages(); renderEmpty();
     });
     textEl.addEventListener('input', autoGrow);
     textEl.addEventListener('keydown', function(e){
@@ -2152,7 +2371,7 @@
      of measurement-dependent code, setBannerOffset(banner.offsetHeight), reads the
      exhaustion banner, which lives outside <main> and is never collapsible. */
   var SEC_DEFAULT_OPEN = {                     /* anything not listed defaults to collapsed */
-    'h-clis': true, 'h-chat': true, 'h-providers': true, 'h-default': true
+    'h-lifecycle': true, 'h-clis': true, 'h-chat': true, 'h-providers': true, 'h-default': true
   };
   var SEC_LS_PREFIX = 'flh.sec.';              /* flh.sec.<heading-id> = '1' (open) | '0' (collapsed) */
 
@@ -2230,13 +2449,15 @@
   initCollapsibles();
   initScrollTop();
   initModal();
+  initLifecycle();
   initChat();
+  loadLifecycle();
   loadStatus().then(updateChatAuthNote);
   loadProviders().then(scheduleKeyHealthChecks);   /* colour keyed cards by live key health, capped concurrency */
   loadModels().then(loadDefault).then(loadChatModels);
   loadClis();
   loadActivity();
-  setInterval(function(){ loadStatus(true); }, 15000);   /* server re-sync (banner + quota) */
+  setInterval(function(){ loadStatus(true); loadLifecycle(true); }, 15000);   /* server re-sync */
   setInterval(loadActivity, 3000);                       /* live activity feed poll */
   setInterval(tick, 1000);                               /* local 1s countdown */
   setInterval(tickActivity, 1000);                       /* local 1s in-flight duration */

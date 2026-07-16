@@ -6,6 +6,17 @@ cd /d "%~dp0"
 
 if "%PORT%"=="" set "PORT=8787"
 
+if defined FREE_LLM_HUB_CONFIG (
+  for %%I in ("%FREE_LLM_HUB_CONFIG%") do set "STOP_MARKER=%%~dpIintentional-stop"
+) else (
+  set "STOP_MARKER=%USERPROFILE%\.free-llm-hub\intentional-stop"
+)
+if "%HUB_SUPERVISED%"=="1" if exist "%STOP_MARKER%" (
+  echo [free-llm-hub] Intentionally stopped from the dashboard - supervisor restart skipped.
+  exit /b 0
+)
+if not "%HUB_SUPERVISED%"=="1" if exist "%STOP_MARKER%" del /f /q "%STOP_MARKER%" >nul 2>nul
+
 rem --- refuse to double-bind -------------------------------------------------
 rem Werkzeug sets SO_REUSEADDR, so Windows lets a SECOND process bind a port
 rem that is already served. You then get two hubs alive at once and requests

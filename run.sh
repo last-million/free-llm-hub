@@ -6,6 +6,23 @@ cd "$(dirname "$0")"
 
 PORT="${PORT:-8787}"
 
+# A dashboard Stop is intentional, not a crash. Supervisors set
+# HUB_SUPERVISED=1; in that mode the marker makes this launcher a clean no-op.
+# A person running this script explicitly clears the marker and starts again.
+if [ -n "${FREE_LLM_HUB_CONFIG:-}" ]; then
+  CONFIG_FILE="${FREE_LLM_HUB_CONFIG/#\~/$HOME}"
+else
+  CONFIG_FILE="$HOME/.free-llm-hub/config.json"
+fi
+STOP_MARKER="$(dirname "$CONFIG_FILE")/intentional-stop"
+if [ "${HUB_SUPERVISED:-}" = "1" ] && [ -f "$STOP_MARKER" ]; then
+  echo "[free-llm-hub] Intentionally stopped from the dashboard - supervisor restart skipped."
+  exit 0
+fi
+if [ "${HUB_SUPERVISED:-}" != "1" ]; then
+  rm -f "$STOP_MARKER"
+fi
+
 # --- refuse to double-bind -------------------------------------------------
 # Werkzeug sets SO_REUSEADDR, so on some platforms a SECOND process can bind a
 # port that is already served. You then get two hubs alive at once and requests
