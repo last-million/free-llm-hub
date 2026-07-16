@@ -22,22 +22,33 @@ remain for a production or multi-user deployment.
 ### SEC-001: Any local OS user can access the localhost control plane
 
 - Rule ID: FLASK-AUTH-001 / FLASK-CSRF-001
-- Severity: Medium
-- Location: `app.py:1567` (`_local_control_guard`), `app.py:1910`
-  (`api_provider_reveal_key`), and `app.py:4037` (`api_cli_instructions`)
-- Evidence: The guard limits `Host` and `Origin` to loopback and requires the
-  literal `X-Free-LLM-Hub: dashboard` header for writes, but does not require a
-  secret or authenticate the caller. The key-reveal and CLI-instructions routes
-  are GET endpoints and return secrets to a loopback caller.
-- Impact: On a shared machine, another local user/process that can connect to
-  the bound loopback port can read provider/gateway keys, alter CLI settings,
-  spend quota, or stop the hub. This is distinct from a web-site CSRF attack.
-- Fix: Add an authenticated local control plane (for example, a per-install
-  bearer token stored with `0600` permissions and supplied by the dashboard),
-  or use an OS-authenticated local transport such as a Unix-domain socket.
-- Mitigation: Keep the service bound to loopback, use a single-user account,
-  and do not run it on multi-user hosts. The current implementation blocks
-  browser cross-site/DNS-rebinding writes but does not separate OS users.
+- Severity: Medium (accepted for this deployment model, see below)
+- Location: `app.py` `_local_control_guard`, `api_provider_reveal_key`,
+  `api_cli_instructions`, and the `index()` route that renders the token.
+- Evidence: The guard limits `Host`/`Origin` to loopback, requires the literal
+  `X-Free-LLM-Hub: dashboard` header for writes, and now also requires
+  `X-Free-LLM-Hub-Token: <token>` on every `/api/*` request. The token is
+  generated once (`config.ensure_control_token()`), stored `0600`, and printed
+  at startup — but is ALSO rendered directly into `index.html` (`{{
+  control_token | tojson }}`) so the dashboard needs no manual paste step.
+- Impact: A cross-site browser request still cannot succeed (no Origin
+  spoofing, no custom header, can't read the token from a page it never
+  loaded). A DIFFERENT local OS account on a shared machine that loads the
+  SAME dashboard URL in its own browser gets the token from the page same as
+  the legitimate user, so it is not actually isolated from the control plane —
+  the token only closes the gap for callers that cannot load `/` at all
+  (e.g. a bare `curl`/script pointed at `/api/*` without ever fetching the
+  page).
+- Fix (if the shared-machine case matters for a given install): stop rendering
+  the token into the page; require it to be entered once (e.g. via a browser
+  prompt into `localStorage`) sourced only from the process's console output
+  or the `0600` config file, or use an OS-authenticated transport (Unix-domain
+  socket) instead of a shared loopback TCP port.
+- Mitigation / accepted trade-off: this hub targets a single-user local dev
+  machine; the maintainer explicitly chose zero-friction auto-embedding over
+  the stricter prompt-once flow. Keep the service bound to loopback, use a
+  single-user account, and do not run it on a multi-user host if that
+  assumption changes.
 
 ### SEC-002: Automatic `git pull` executes newly fetched repository code
 
