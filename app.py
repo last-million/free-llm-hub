@@ -58,6 +58,10 @@ app = Flask(__name__)
 # Bound JSON/image requests before Flask buffers them. Eight 1 MiB images plus
 # JSON/base64 overhead fit; accidental multi-hundred-megabyte data URLs do not.
 app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
+# Without this, Flask caches the compiled template on first render and a
+# dashboard edit (like this footer link) won't appear until the process is
+# restarted, not just on browser refresh.
+app.config["TEMPLATES_AUTO_RELOAD"] = True
 
 
 @app.errorhandler(Exception)
@@ -1795,7 +1799,8 @@ def api_activity():
 @app.route("/")
 def index():
     try:
-        return render_template("index.html", csp_nonce=getattr(g, "csp_nonce", ""))
+        return render_template("index.html", csp_nonce=getattr(g, "csp_nonce", ""),
+                                control_token=config.ensure_control_token())
     except TemplateNotFound:
         return (
             "<h1>Calvoun Free LLM Hub</h1>"

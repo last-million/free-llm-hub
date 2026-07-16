@@ -215,12 +215,15 @@ control plane.
 "reveal" toggle) also requires `X-Free-LLM-Hub-Token: <token>` once a token has
 been generated. The hub generates one on first startup, prints it to the
 console the process is running in, and stores it in `~/.free-llm-hub/config.json`
-(`0600` on POSIX). The dashboard prompts for it once (a plain browser prompt,
-Jupyter-style) and remembers it in that browser's `localStorage`. This exists
-because the loopback port itself is not isolated per OS user — Host/Origin
-checks alone stop a cross-site browser request, not a different local account
-that can also reach `127.0.0.1:<port>`. Scripting against `/api/*` directly?
-Read the token from the same config file or the process's startup output.
+(`0600` on POSIX). The dashboard page embeds it automatically (same trust
+boundary as the CSP nonce), so there is nothing to copy/paste in normal use.
+This exists because the loopback port itself is not isolated per OS user —
+Host/Origin checks alone stop a cross-site browser request, not a different
+local account that can also reach `127.0.0.1:<port>`; that residual case is
+accepted for a single-user local dev tool (auto-embedding trades it away for
+zero friction — a co-resident OS user who loads the same dashboard URL gets
+the token too). Scripting against `/api/*` directly? Read the token from the
+same config file or the process's startup output.
 
 ---
 

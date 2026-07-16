@@ -859,6 +859,10 @@
     <a class="footer-yt" href="https://www.youtube.com/@QuantumSEO-AR" target="_blank" rel="noopener noreferrer">
       &#9654; Subscribe on YouTube &mdash; QuantumSEO-AR
     </a>
+    <span class="footer-sep" aria-hidden="true">&middot;</span>
+    <a class="footer-yt" href="https://discord.gg/HK9qKNKGY" target="_blank" rel="noopener noreferrer">
+      Join our Discord
+    </a>
   </div>
   <div class="footer-legal">
     &copy; 2026 Last-Million &mdash; NOT a free/open copyright system.
@@ -911,32 +915,17 @@
     setTimeout(function(){ t.style.opacity = '0'; t.style.transition = 'opacity .3s'; }, 3400);
     setTimeout(function(){ t.remove(); }, 3800);
   }
-  var HUB_TOKEN_LS_KEY = 'freehub_control_token';
-  var _hubTokenPromptPromise = null;
-  function getHubToken(){
-    try { return localStorage.getItem(HUB_TOKEN_LS_KEY) || ''; } catch(e){ return ''; }
-  }
-  function setHubToken(tok){
-    try { localStorage.setItem(HUB_TOKEN_LS_KEY, tok); } catch(e){ /* private mode / quota */ }
-  }
-  function ensureHubToken(){
-    /* Shared across concurrent 401s so parallel /api/* calls on first load
-       prompt once, not once per call. */
-    if (getHubToken()) return Promise.resolve(getHubToken());
-    if (!_hubTokenPromptPromise){
-      _hubTokenPromptPromise = Promise.resolve().then(function(){
-        var tok = window.prompt(
-          'Paste the control token printed in the terminal where this hub was ' +
-          'started (run.bat / run.sh). It authorizes this browser to control ' +
-          'the hub and is only shown there.');
-        tok = tok ? tok.trim() : '';
-        if (tok) setHubToken(tok);
-        return tok;
-      }).then(function(tok){ _hubTokenPromptPromise = null; return tok; });
-    }
-    return _hubTokenPromptPromise;
-  }
-  function api(path, opts, _retried){
+  /* The control token gates /api/* against a DIFFERENT local OS account
+     hitting the loopback port directly (see security_best_practices_report.md,
+     SEC-001). This page is rendered by the same hub process the token
+     belongs to, so it is embedded here automatically — no copy/paste step —
+     the same trust boundary the CSP nonce above already relies on. It still
+     stops a generic cross-site "simple request" (which can't read this page
+     or set custom headers), just not a co-resident OS user who can load this
+     same URL themselves; that residual case is accepted for a single-user
+     local dev tool. */
+  var HUB_CONTROL_TOKEN = {{ control_token | tojson }};
+  function api(path, opts){
     opts = opts || {};
     var headers = Object.assign({}, opts.headers || {});
     if (opts.body && typeof opts.body !== 'string'){
@@ -946,19 +935,12 @@
     if (opts.method && String(opts.method).toUpperCase() !== 'GET'){
       headers['X-Free-LLM-Hub'] = 'dashboard';
     }
-    if (path.indexOf('/api/') === 0){
-      var tok = getHubToken();
-      if (tok) headers['X-Free-LLM-Hub-Token'] = tok;
+    if (path.indexOf('/api/') === 0 && HUB_CONTROL_TOKEN){
+      headers['X-Free-LLM-Hub-Token'] = HUB_CONTROL_TOKEN;
     }
     opts.headers = headers;
     return fetch(path, opts).then(function(r){
       return r.json().catch(function(){ return {}; }).then(function(j){
-        if (r.status === 401 && j && j.code === 'token_required' && !_retried){
-          return ensureHubToken().then(function(tok){
-            if (!tok) throw new Error((j && j.error) || 'control token required');
-            return api(path, opts, true);
-          });
-        }
         if (!r.ok){
           var msg = (j && (j.error || j.detail || j.message)) || (r.status + ' ' + r.statusText);
           throw new Error(msg);

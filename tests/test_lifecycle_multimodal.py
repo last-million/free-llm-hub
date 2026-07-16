@@ -230,6 +230,14 @@ def test_local_control_guard_and_security_headers(isolated_config):
     assert ('nonce="%s"' % nonce).encode() in page.data
     assert page.headers["X-Content-Type-Options"] == "nosniff"
 
+    token = config.ensure_control_token()
+    embedded = client.get("/")
+    assert json.dumps(token).encode() in embedded.data
+    no_header = client.get("/api/runtime")
+    assert no_header.status_code == 401
+    with_token = client.get("/api/runtime", headers={"X-Free-LLM-Hub-Token": token})
+    assert with_token.status_code == 200
+
 
 def test_chat_image_route_preserves_payload_and_requires_vision(
         isolated_config, monkeypatch):
