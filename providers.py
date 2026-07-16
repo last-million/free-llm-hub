@@ -343,6 +343,9 @@ PROVIDERS: Dict[str, dict] = {
             "@cf/qwen/qwq-32b",
             "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
         ],
+        # Multimodal routing is deliberately fail-closed. Only image-capable
+        # chat ids that were verified end-to-end belong in this exact list.
+        "vision_models": ["@cf/meta/llama-4-scout-17b-16e-instruct"],
         "notes": ("SAFE-FREE: 10,000 Neurons/day, reset 00:00 UTC. On the Workers FREE plan "
                   "the allocation is a HARD CAP — exceeding it fails with an error, it does "
                   "NOT bill (Workers Paid bills $0.011/1k Neurons past it). Free plan is the "
@@ -427,6 +430,10 @@ PROVIDERS: Dict[str, dict] = {
         # PNG (real vision). gemini-2.0-flash returned 429 = free quota spent by
         # probing, NOT broken, so it stays.
         "default_free_models": [
+            "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
+            "gemini-2.5-pro", "gemini-2.0-flash", "gemma-4-31b-it",
+        ],
+        "vision_models": [
             "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
             "gemini-2.5-pro", "gemini-2.0-flash", "gemma-4-31b-it",
         ],
@@ -589,6 +596,7 @@ PROVIDERS: Dict[str, dict] = {
         "free_exact": True,
         "free_families": ["glm-4.7-flash", "glm-4.5-flash", "glm-4.6v-flash"],
         "default_free_models": ["glm-4.7-flash", "glm-4.5-flash", "glm-4.6v-flash"],
+        "vision_models": ["glm-4.6v-flash"],
         "notes": "PERMANENT free ($0 in/out): GLM-4.7-Flash (200K ctx), GLM-4.5-Flash, GLM-4.6V-Flash (vision). Note glm-4.7-FlashX is PAID despite the name. International z.ai (email/Google signup, no China phone). ~1 req/s, 1 concurrent; Z.AI publishes no request quota.",
     },
     "kimi": {

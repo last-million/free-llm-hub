@@ -3,7 +3,7 @@
 
 Surfaces:
   GET  /                        dashboard (templates/index.html)
-  /api/*                        config API (localhost-open, no auth)
+  /api/*                        localhost control API (dashboard control header for writes)
   GET  /v1/models               OpenAI-compatible model list
   POST /v1/chat/completions     OpenAI-compatible chat (streaming passthrough)
   POST /v1/messages             Anthropic Messages API (translated to OpenAI
@@ -13,12 +13,16 @@ Surfaces:
 
 Auth: if a local API key is configured (config.get_local_api_key()), all /v1/*
 routes require it as 'Authorization: Bearer <key>' or 'x-api-key: <key>'.
-Dashboard and /api/* stay open (the server only binds 127.0.0.1).
+The dashboard/control API is loopback-only; browser writes also require a
+non-simple local-control header to prevent cross-site localhost requests.
 
 Run:  python app.py    (PORT env overrides default 8787)
 """
 
 import hmac
+import base64
+import binascii
+import copy
 import json
 import os
 import re
@@ -29,6 +33,7 @@ import tempfile
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 
 import requests
 from flask import Flask, Response, g, jsonify, render_template, request, stream_with_context
@@ -50,6 +55,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 _log = logging.getLogger("free-llm-hub")
 
 app = Flask(__name__)
+# Bound JSON/image requests before Flask buffers them. Eight 1 MiB images plus
+# JSON/base64 overhead fit; accidental multi-hundred-megabyte data URLs do not.
+app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
 
 
 @app.errorhandler(Exception)
@@ -81,6 +89,10 @@ STREAM_IDLE_TIMEOUT = 90         # seconds
 MODELS_READ_TIMEOUT = 10      # seconds (model discovery / key tests)
 MODEL_CACHE_TTL = 60          # seconds
 MAX_HOPS = 6                  # primary + up to 5 fallback models (across providers)
+
+MAX_IMAGE_COUNT = 8
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
 _model_cache = {}             # pid -> (timestamp, [model ids])
 _model_cache_lock = threading.Lock()
@@ -209,12 +221,33 @@ def _cf_account_id(api_key):
     return None
 
 
+def _validate_custom_base_url(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ValueError("custom base URL is invalid") from exc
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in ("http", "https") or not host:
+        raise ValueError("custom base URL must use http:// or https://")
+    if parsed.username or parsed.password:
+        raise ValueError("custom base URL must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("custom base URL must not contain a query or fragment")
+    if parsed.scheme == "http" and host not in _LOOPBACK_HOSTS:
+        raise ValueError("non-loopback custom base URLs must use https://")
+    return value.rstrip("/")
+
+
 def _resolve_base_url(pid, pcfg):
     """Provider base URL, with Cloudflare's {account_id} filled in from the token.
 
     A user-set custom base still wins (base_url_for); this only rescues the case
     where the registry base carries a template and the user pasted just a token."""
-    base = prov.base_url_for(pid, pcfg.get("base_url"))
+    custom = pcfg.get("base_url")
+    base = _validate_custom_base_url(custom) if custom else prov.base_url_for(pid, None)
     if base and "{account_id}" in base:
         acct = _cf_account_id(pcfg.get("api_key"))
         if acct:
@@ -226,7 +259,7 @@ def _models_url_for(pid, pcfg):
     p = prov.get_provider(pid) or {}
     custom = pcfg.get("base_url")
     if custom:
-        return custom.rstrip("/") + "/models"
+        return _validate_custom_base_url(custom) + "/models"
     murl = p.get("models_url")
     if murl and "{account_id}" in murl:
         acct = _cf_account_id(pcfg.get("api_key"))
@@ -385,6 +418,141 @@ def _best_free_pair(working_only=True):
 # Classify the request, then pick the CHEAPEST model that still clears the bar
 # for simple/medium tasks, and the STRONGEST available for hard ones.
 # --------------------------------------------------------------------------- #
+def _vision_model_ids(pid):
+    """Verified image-capable model ids for one provider (exact matches only)."""
+    p = prov.get_provider(pid) or {}
+    return [m for m in (p.get("vision_models") or []) if isinstance(m, str) and m]
+
+
+def _is_vision_model(pid, model):
+    needle = str(model or "").lower()
+    return any(needle == m.lower() for m in _vision_model_ids(pid))
+
+
+def _data_image_bytes(url):
+    """Validate an image data URL and return its decoded byte length."""
+    match = re.match(r"^data:([^;,]+);base64,(.*)$", url, re.I | re.S)
+    if not match:
+        raise ValueError("image data URLs must use data:<image-type>;base64,...")
+    mime = match.group(1).lower()
+    if mime not in _IMAGE_MIMES:
+        raise ValueError("unsupported image type '%s'" % mime)
+    encoded = re.sub(r"\s+", "", match.group(2))
+    if len(encoded) > ((MAX_IMAGE_BYTES + 2) // 3) * 4:
+        raise ValueError("image payload exceeds the %d MiB limit" % (MAX_IMAGE_BYTES // 1048576))
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("image data is not valid base64") from exc
+    return len(raw)
+
+
+def _normalize_image_url(value):
+    """Return OpenAI's canonical {url, detail?} image_url object."""
+    if isinstance(value, str):
+        obj = {"url": value}
+    elif isinstance(value, dict):
+        obj = {"url": value.get("url")}
+        if value.get("detail") in ("auto", "low", "high"):
+            obj["detail"] = value["detail"]
+    else:
+        raise ValueError("image_url must be a URL string or object")
+    url = obj.get("url")
+    if not isinstance(url, str) or not url:
+        raise ValueError("image_url.url is required")
+    if url.lower().startswith("data:"):
+        _data_image_bytes(url)
+    elif not re.match(r"^https?://", url, re.I):
+        raise ValueError("image URLs must use https://, http://, or a supported data URL")
+    elif len(url) > 8192:
+        raise ValueError("image URL is too long")
+    return obj
+
+
+def _normalize_openai_messages(messages):
+    """Validate/canonicalize message content and return (messages, image_count).
+
+    The hub never fetches image URLs itself. Known audio/video blocks fail
+    explicitly; silently flattening them would answer a different question.
+    """
+    if not isinstance(messages, list):
+        raise ValueError("messages must be an array")
+    out, images, image_bytes = [], 0, 0
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError("each message must be an object")
+        row = copy.deepcopy(message)
+        content = row.get("content")
+        if not isinstance(content, list):
+            out.append(row)
+            continue
+        blocks = []
+        for block in content:
+            if not isinstance(block, dict):
+                blocks.append(block)
+                continue
+            btype = str(block.get("type") or "").lower()
+            if btype in ("image_url", "input_image"):
+                value = block.get("image_url")
+                if value is None and block.get("url") is not None:
+                    value = block.get("url")
+                normalized = _normalize_image_url(value)
+                images += 1
+                if normalized["url"].lower().startswith("data:"):
+                    image_bytes += _data_image_bytes(normalized["url"])
+                blocks.append({"type": "image_url", "image_url": normalized})
+            elif btype in ("input_audio", "audio", "video", "input_video"):
+                raise ValueError("audio and video inputs are not supported by this hub")
+            else:
+                blocks.append(copy.deepcopy(block))
+        row["content"] = blocks
+        out.append(row)
+    if images > MAX_IMAGE_COUNT:
+        raise ValueError("at most %d images are allowed per request" % MAX_IMAGE_COUNT)
+    if image_bytes > MAX_IMAGE_BYTES:
+        raise ValueError("combined image payload exceeds the %d MiB limit"
+                         % (MAX_IMAGE_BYTES // 1048576))
+    return out, images
+
+
+def _vision_candidates(est=0):
+    """Available verified vision pairs in the persisted priority order."""
+    available = []
+    for pid in _available_providers():
+        if not _provider_capable(pid, est):
+            continue
+        free = {m.lower(): m for m in provider_free_models(pid)}
+        for verified in _vision_model_ids(pid):
+            model = free.get(verified.lower())
+            if model and prov.is_model_allowed(model) and not _is_model_dead(pid, model):
+                available.append((pid, model))
+
+    state = config.get_media_state()
+    manual = state.get("manual_priority") if state.get("priority_mode") == "manual" else []
+    by_id = {pid + "/" + model: (pid, model) for pid, model in available}
+    ordered = []
+    for item in manual or []:
+        pair = by_id.pop(str(item), None)
+        if pair:
+            ordered.append(pair)
+    # The automatic tail keeps manual mode resilient if a preferred model fails.
+    tail = list(by_id.values())
+    tail.sort(key=lambda pair: (_benchmark_score(pair[0], pair[1]),
+                                _speed_score(pair[0], pair[1])), reverse=True)
+    return ordered + tail
+
+
+def _route_for_vision(messages, max_tokens=None, est=None):
+    if est is None:
+        est = _est_tokens(messages)
+    candidates = _vision_candidates(est)
+    difficulty = _classify_difficulty(messages, max_tokens)
+    if not candidates:
+        return None, None, difficulty
+    pid, model = candidates[0]
+    return pid, model, difficulty
+
+
 _HARD_HINTS = (
     "refactor", "debug", "stack trace", "traceback", "algorithm", "architecture",
     "optimize", "optimise", "prove", "derive", "analyze", "analyse", "reason",
@@ -478,6 +646,10 @@ def _est_tokens(messages, tools=None):
             for b in c:
                 if isinstance(b, dict) and isinstance(b.get("text"), str):
                     chars += len(b["text"])
+                elif isinstance(b, dict) and b.get("type") in ("image_url", "input_image"):
+                    # Provider tokenization varies with resolution/detail. A
+                    # conservative fixed allowance is enough for TPM routing.
+                    chars += 4000
         for tc in m.get("tool_calls") or []:
             fn = tc.get("function") or {}
             chars += len(str(fn.get("arguments") or "")) + len(str(fn.get("name") or ""))
@@ -1193,7 +1365,7 @@ def _comparable_model(model_id, candidates):
     return best or candidates[0]
 
 
-def _build_chain(primary_pid, model_id, est=0):
+def _build_chain(primary_pid, model_id, est=0, require_vision=False):
     """Priority-ordered [(pid, model)] fallback chain. Primary first, then the
     next-best MODELS across every AVAILABLE, size-capable provider, INTERLEAVED
     across providers (best model of each provider, then each provider's 2nd, ...).
@@ -1214,6 +1386,8 @@ def _build_chain(primary_pid, model_id, est=0):
         for m in provider_free_models(pid):
             if (pid, m) in seen or not prov.is_model_allowed(m) or _is_model_dead(pid, m):
                 continue
+            if require_vision and not _is_vision_model(pid, m):
+                continue
             entry = (_benchmark_score(pid, m), pid, m)
             (fast if _is_fast(pid, m) else slow).append(entry)
     fast.sort(key=lambda t: t[0], reverse=True)   # best fast model first
@@ -1231,7 +1405,7 @@ def _build_chain(primary_pid, model_id, est=0):
     # Deliberately allowed past MAX_HOPS: that cap bounds free-provider fan-out,
     # and the explicit last-resort fallback the user opted into must not be
     # crowded out by the very free models that just failed.
-    for pid in _sub_available_providers():
+    for pid in ([] if require_vision else _sub_available_providers()):
         if not _provider_capable(pid, est):   # always True today; keeps the rule honest
             continue
         for m in _sub_models(pid):
@@ -1378,6 +1552,108 @@ def _anthropic_error(err_type, message, status):
 # Auth guard: /v1/* only (dashboard + /api/* stay localhost-open)
 # ---------------------------------------------------------------------------
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _hostname(value, origin=False):
+    try:
+        parsed = urlsplit(value if origin else "//" + value)
+        return (parsed.hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+@app.before_request
+def _local_control_guard():
+    """Block DNS rebinding and cross-site writes to the localhost control API."""
+    g.csp_nonce = base64.b64encode(os.urandom(18)).decode("ascii")
+    if _hostname(request.host) not in _LOOPBACK_HOSTS:
+        return jsonify({"error": "this service accepts loopback Host headers only"}), 403
+    origin = request.headers.get("Origin")
+    if origin and _hostname(origin, origin=True) not in _LOOPBACK_HOSTS:
+        return jsonify({"error": "cross-origin requests are not allowed"}), 403
+    if request.path.startswith("/api/"):
+        if (request.method in ("POST", "PUT", "PATCH", "DELETE") and
+                request.headers.get("X-Free-LLM-Hub") != "dashboard"):
+            # A custom header forces a browser CORS preflight. This app emits no
+            # CORS permission, so an arbitrary website cannot reconfigure/stop the
+            # user's localhost hub with a "simple" text/plain request.
+            return jsonify({"error": "missing local control header"}), 403
+        # The loopback port itself is not user-isolated: on a shared machine a
+        # DIFFERENT local OS account can also connect to 127.0.0.1:PORT. This
+        # per-install token (0600 config file, printed once at startup, never
+        # rendered into the HTML) is what actually gates control of the hub —
+        # Host/Origin only stop a browser-borne cross-site request.
+        token = config.get_control_token()
+        supplied = request.headers.get("X-Free-LLM-Hub-Token") or request.args.get("token")
+        if token and not (supplied and hmac.compare_digest(str(supplied), token)):
+            return jsonify({"error": "missing or invalid control token",
+                            "code": "token_required"}), 401
+    return None
+
+
+@app.after_request
+def _security_headers(response):
+    nonce = getattr(g, "csp_nonce", "")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'none'; script-src 'nonce-%s'; "
+        "style-src 'unsafe-inline'; img-src 'self' data:; "
+        "connect-src 'self'; base-uri 'none'; form-action 'none'; "
+        "frame-ancestors 'none'; object-src 'none'" % nonce)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    if request.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+_runtime_condition = threading.Condition()
+_runtime_active = [0]
+_runtime_server = [None]
+_runtime_shutdown_thread = [None]
+
+
+def _runtime_error():
+    message = "The hub is draining and is not accepting new inference requests."
+    if request.path.startswith("/v1/messages"):
+        return _anthropic_error("overloaded_error", message, 503)
+    return _openai_error(message, 503, "server_error")
+
+
+@app.before_request
+def _runtime_before():
+    if not request.path.startswith("/v1"):
+        return None
+    state = config.get_runtime_state()
+    if state.get("desired") == "stopped" or state.get("phase") in ("draining", "stopped"):
+        return _runtime_error()
+    with _runtime_condition:
+        _runtime_active[0] += 1
+    g.runtime_counted = True
+    return None
+
+
+def _runtime_request_done():
+    with _runtime_condition:
+        if _runtime_active[0] > 0:
+            _runtime_active[0] -= 1
+        _runtime_condition.notify_all()
+
+
+@app.after_request
+def _runtime_after(response):
+    if not getattr(g, "runtime_counted", False):
+        return response
+    g.runtime_counted = False
+    if response.is_streamed:
+        response.call_on_close(_runtime_request_done)
+    else:
+        _runtime_request_done()
+    return response
+
 @app.before_request
 def _guard_v1():
     if not request.path.startswith("/v1"):
@@ -1519,7 +1795,7 @@ def api_activity():
 @app.route("/")
 def index():
     try:
-        return render_template("index.html")
+        return render_template("index.html", csp_nonce=getattr(g, "csp_nonce", ""))
     except TemplateNotFound:
         return (
             "<h1>Calvoun Free LLM Hub</h1>"
@@ -1528,6 +1804,12 @@ def index():
             "<code>/api/providers</code>, <code>/v1/models</code>, "
             "<code>/v1/chat/completions</code>, <code>/v1/messages</code>.</p>"
         )
+
+
+@app.route("/favicon.ico")
+def favicon():
+    """Avoid a noisy 404 when no branded favicon asset is installed."""
+    return Response(status=204)
 
 
 # ---------------------------------------------------------------------------
@@ -1593,7 +1875,10 @@ def api_provider_update(pid):
         val = body["base_url"]
         # config.set_provider_config treats None as "leave untouched" and ''
         # as "clear" — so an empty/null base_url must be passed as '' here.
-        kwargs["base_url"] = val.strip() if isinstance(val, str) else ""
+        try:
+            kwargs["base_url"] = _validate_custom_base_url(val) if val else ""
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
     if kwargs:
         config.set_provider_config(pid, **kwargs)
         with _model_cache_lock:
@@ -1885,6 +2170,156 @@ def api_status():
         "all_exhausted": free_count > 0 and exhausted == free_count,
         "any_exhausted": exhausted > 0,
     })
+
+
+def _media_payload():
+    state = config.get_media_state()
+    models = []
+    for p in prov.list_providers():
+        pid = p["id"]
+        pcfg = config.get_provider_config(pid)
+        defaults = {m.lower() for m in provider_free_models(pid, live=False)}
+        for model in _vision_model_ids(pid):
+            models.append({
+                "id": pid + "/" + model,
+                "provider": pid,
+                "model": model,
+                "provider_name": p.get("name") or pid,
+                "configured": bool(pcfg.get("enabled") and
+                                   (pcfg.get("api_key") or not _needs_key(pid))),
+                "listed": model.lower() in defaults,
+                "dead": _is_model_dead(pid, model),
+            })
+    available_order = [pid + "/" + model for pid, model in _vision_candidates()]
+    return {"state": state, "models": models, "effective_priority": available_order,
+            "limits": {"max_images": MAX_IMAGE_COUNT,
+                       "max_image_bytes": MAX_IMAGE_BYTES,
+                       "supported_types": sorted(_IMAGE_MIMES)}}
+
+
+@app.route("/api/media", methods=["GET", "POST"])
+@app.route("/api/multimodal", methods=["GET", "POST"])
+def api_media():
+    if request.method == "GET":
+        return jsonify(_media_payload())
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "invalid JSON body"}), 400
+    if "revision" not in body:
+        return jsonify({"error": "revision is required"}), 400
+    mode = body.get("priority_mode")
+    if mode not in ("auto", "manual"):
+        return jsonify({"error": "priority_mode must be 'auto' or 'manual'"}), 400
+    manual = body.get("manual_priority", [])
+    if not isinstance(manual, list) or any(not isinstance(v, str) for v in manual):
+        return jsonify({"error": "manual_priority must be an array of model ids"}), 400
+    valid = {p["id"] + "/" + model for p in prov.list_providers()
+             for model in _vision_model_ids(p["id"])}
+    unknown = [value for value in manual if value not in valid]
+    if unknown:
+        return jsonify({"error": "unknown vision model(s): " + ", ".join(unknown)}), 400
+    deduped = []
+    for value in manual:
+        if value not in deduped:
+            deduped.append(value)
+
+    def _update(state):
+        state["priority_mode"] = mode
+        state["manual_priority"] = deduped if mode == "manual" else []
+        return state
+
+    try:
+        config.update_media_state(body["revision"], _update)
+    except config.RevisionConflict as exc:
+        return jsonify({"error": "media state changed; reload and retry",
+                        "current_revision": exc.current_revision,
+                        "state": config.get_media_state()}), 409
+    return jsonify(_media_payload())
+
+
+def _set_runtime_phase(phase, last_error=None):
+    for _attempt in range(3):
+        state = config.get_runtime_state()
+
+        def _update(value):
+            value["phase"] = phase
+            value["last_error"] = last_error
+            return value
+
+        try:
+            return config.update_runtime_state(state["revision"], _update)
+        except config.RevisionConflict:
+            continue
+    return config.get_runtime_state()
+
+
+def _graceful_shutdown_worker(timeout=30):
+    # Give the HTTP handler enough time to flush its accepted response.
+    time.sleep(0.2)
+    deadline = time.time() + timeout
+    with _runtime_condition:
+        while _runtime_active[0] > 0 and time.time() < deadline:
+            _runtime_condition.wait(timeout=min(0.5, max(0, deadline - time.time())))
+    _set_runtime_phase("stopped")
+    server = _runtime_server[0]
+    if server is not None:
+        try:
+            server.shutdown()
+        except Exception as exc:
+            _set_runtime_phase("error", _sanitize(str(exc)))
+
+
+@app.route("/api/runtime", methods=["GET"])
+def api_runtime():
+    with _runtime_condition:
+        active = _runtime_active[0]
+    return jsonify({"state": config.get_runtime_state(), "active_requests": active,
+                    "intentional_stop": config.is_intentionally_stopped()})
+
+
+@app.route("/api/runtime/stop", methods=["POST"])
+@app.route("/api/lifecycle/stop", methods=["POST"])
+def api_runtime_stop():
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "invalid JSON body"}), 400
+    if "revision" not in body:
+        return jsonify({"error": "revision is required"}), 400
+
+    def _drain(state):
+        state.update({"desired": "stopped", "phase": "draining",
+                      "shutdown_requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      "last_error": None})
+        return state
+
+    try:
+        state = config.update_runtime_state(body["revision"], _drain)
+    except config.RevisionConflict as exc:
+        return jsonify({"error": "runtime state changed; reload and retry",
+                        "current_revision": exc.current_revision,
+                        "state": config.get_runtime_state()}), 409
+    try:
+        config.set_intentional_stop()
+    except OSError as exc:
+        for _attempt in range(3):
+            current = config.get_runtime_state()
+            try:
+                config.update_runtime_state(current["revision"], lambda value: {
+                    **value, "desired": "running", "phase": "error",
+                    "last_error": _sanitize(str(exc))})
+                break
+            except config.RevisionConflict:
+                continue
+        return jsonify({"error": "could not create the intentional-stop marker",
+                        "state": config.get_runtime_state()}), 500
+    thread = _runtime_shutdown_thread[0]
+    if thread is None or not thread.is_alive():
+        thread = threading.Thread(target=_graceful_shutdown_worker,
+                                  name="freehub-shutdown", daemon=True)
+        _runtime_shutdown_thread[0] = thread
+        thread.start()
+    return jsonify({"ok": True, "state": state, "active_requests": _runtime_active[0],
+                    "message": "Shutdown accepted; draining active inference requests."}), 202
 
 
 # ---------------------------------------------------------------------------
@@ -2342,8 +2777,21 @@ def _cli_write_text(path, text):
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+    fd, tmp = tempfile.mkstemp(prefix=".freehub-write-", dir=parent or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name == "posix":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _yaml_dq(v):
@@ -2986,6 +3434,362 @@ _DISCONNECTERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Transactional hub mode (bulk connect/disconnect)
+# ---------------------------------------------------------------------------
+_hub_switch_lock = threading.Lock()
+
+
+def _read_optional_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        return True, data
+    except FileNotFoundError:
+        return False, b""
+
+
+def _atomic_write_bytes(path, data, mode=None):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".freehub-restore-", dir=parent or ".")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name == "posix":
+            os.chmod(tmp, int(mode) & 0o777 if mode is not None else 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _snapshot_manifest_path(generation, cid):
+    return os.path.join(config.snapshot_dir(generation, cid), "manifest.json")
+
+
+def _write_snapshot_manifest(generation, cid, manifest):
+    directory = config.snapshot_dir(generation, cid)
+    os.makedirs(directory, exist_ok=True)
+    if os.name == "posix":
+        os.chmod(directory, 0o700)
+    _atomic_write_bytes(_snapshot_manifest_path(generation, cid),
+                        (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+                        0o600)
+
+
+def _load_snapshot_manifest(generation, cid):
+    try:
+        with open(_snapshot_manifest_path(generation, cid), "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _capture_cli_snapshot(generation, entry):
+    """Capture the pre-hub bytes before a bulk connect touches a CLI file.
+
+    If an older one-click connect already made a .freehub-bak, that backup is
+    the real pre-hub state and is adopted. This makes the first master-switch
+    cycle backward-compatible with existing installs.
+    """
+    cid = entry["id"]
+    path = entry.get("write_path")
+    if not path:
+        raise ValueError("CLI has no managed write path")
+    source = path
+    connected, _method, _detail = _cli_connected(entry)
+    has_prior_backup = connected and os.path.isfile(path + ".freehub-bak")
+    if has_prior_backup:
+        source = path + ".freehub-bak"
+    existed, original = _read_optional_bytes(source)
+    try:
+        mode = os.stat(source).st_mode & 0o777 if existed else None
+    except OSError:
+        mode = None
+    directory = config.snapshot_dir(generation, cid)
+    os.makedirs(directory, exist_ok=True)
+    if existed:
+        _atomic_write_bytes(os.path.join(directory, "original.bin"), original, 0o600)
+    manifest = {
+        "version": 1,
+        "cli_id": cid,
+        "path": path,
+        "original_exists": existed,
+        "original_sha256": config.sha256_bytes(original) if existed else None,
+        "original_mode": mode,
+        "managed_sha256": None,
+        "restore_strategy": "snapshot" if (not connected or has_prior_backup) else "semantic",
+    }
+    _write_snapshot_manifest(generation, cid, manifest)
+    return manifest
+
+
+def _current_file_sha(path):
+    exists, data = _read_optional_bytes(path)
+    return exists, (config.sha256_bytes(data) if exists else None)
+
+
+def _restore_cli_snapshot(generation, cid):
+    """Restore only when the live file still equals our managed output."""
+    manifest = _load_snapshot_manifest(generation, cid)
+    if not manifest:
+        return {"status": "conflict", "detail": "snapshot manifest is missing or corrupt"}
+    path = manifest.get("path")
+    if not isinstance(path, str) or not path:
+        return {"status": "conflict", "detail": "snapshot path is invalid"}
+    exists, current_sha = _current_file_sha(path)
+    managed_sha = manifest.get("managed_sha256")
+    original_sha = manifest.get("original_sha256")
+    if (manifest.get("restore_strategy") != "semantic" and
+            exists == bool(manifest.get("original_exists")) and current_sha == original_sha):
+        return {"status": "off", "path": path, "changed": False}
+    if not managed_sha or not exists or current_sha != managed_sha:
+        return {"status": "conflict", "path": path,
+                "detail": "CLI config changed after hub mode enabled; left untouched"}
+    if manifest.get("restore_strategy") == "semantic":
+        entry = _get_cli_entry(cid)
+        reverter = _DISCONNECTERS.get(entry.get("autofix")) if entry else None
+        if not reverter:
+            return {"status": "conflict", "path": path,
+                    "detail": "no safe semantic disconnect strategy is available"}
+        _discard_backup(path)  # a re-connect backup would contain the hub config
+        result = reverter(entry)
+        if _cli_connected(entry)[0]:
+            return {"status": "conflict", "path": path,
+                    "detail": "CLI still points at the hub after safe disconnect"}
+        return {"status": "off", "path": path,
+                "changed": bool(result.get("changed", True))}
+    if manifest.get("original_exists"):
+        try:
+            with open(os.path.join(config.snapshot_dir(generation, cid), "original.bin"), "rb") as f:
+                original = f.read()
+        except OSError:
+            return {"status": "conflict", "path": path,
+                    "detail": "snapshot bytes are missing; live config left untouched"}
+        if config.sha256_bytes(original) != original_sha:
+            return {"status": "conflict", "path": path,
+                    "detail": "snapshot checksum failed; live config left untouched"}
+        _atomic_write_bytes(path, original, manifest.get("original_mode"))
+    else:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    _discard_backup(path)
+    return {"status": "off", "path": path, "changed": True}
+
+
+def _hub_mode_payload():
+    return {"state": config.get_hub_mode_state(),
+            "clients": [_cli_row(entry) for entry in CLI_REGISTRY]}
+
+
+def _finalize_hub_state(revision, phase, clients):
+    def _update(state):
+        state["phase"] = phase
+        state["clients"] = clients
+        return state
+    return config.update_hub_mode_state(revision, _update)
+
+
+def _bulk_hub_on(expected_revision):
+    generation = config.new_generation_id()
+
+    def _begin(state):
+        state.update({"desired": "on", "phase": "changing",
+                      "generation": generation, "clients": {}})
+        return state
+
+    changing = config.update_hub_mode_state(expected_revision, _begin)
+    clients = {}
+    failures = False
+    changed_ids = []
+    key = config.get_local_api_key() or "free-llm-hub"
+    base_root = "http://127.0.0.1:%d" % PORT
+    base_v1 = base_root + "/v1"
+    model = _first_free_model_id()
+    if not model:
+        clients["_hub"] = {"status": "error", "detail": "no free model configured"}
+        return _finalize_hub_state(changing["revision"], "error", clients)
+    for entry in CLI_REGISTRY:
+        cid = entry["id"]
+        manifest = None
+        installed, _binary = _cli_installed(entry)
+        fixer = _AUTOFIXERS.get(entry.get("autofix"))
+        if not installed or not fixer:
+            clients[cid] = {"status": "skipped",
+                            "detail": "not installed" if not installed else "manual-only CLI"}
+            continue
+        try:
+            manifest = _capture_cli_snapshot(generation, entry)
+            result = fixer(entry, key, base_root, base_v1, model)
+            if not result.get("ok"):
+                failures = True
+                clients[cid] = {"status": "error", "detail": result.get("reason") or "connect failed"}
+                exists, current_sha = _current_file_sha(manifest["path"])
+                if exists and current_sha != manifest.get("original_sha256"):
+                    manifest["managed_sha256"] = current_sha
+                    _write_snapshot_manifest(generation, cid, manifest)
+                    rollback = _restore_cli_snapshot(generation, cid)
+                    clients[cid]["rollback"] = rollback["status"]
+                continue
+            exists, managed_sha = _current_file_sha(manifest["path"])
+            if not exists:
+                raise OSError("CLI config was not created")
+            manifest["managed_sha256"] = managed_sha
+            _write_snapshot_manifest(generation, cid, manifest)
+            changed_ids.append(cid)
+            clients[cid] = {"status": "on", "path": _short(manifest["path"]),
+                            "original_sha256": manifest["original_sha256"],
+                            "managed_sha256": managed_sha,
+                            "restart_hint": result.get("restart_hint")}
+        except Exception as exc:
+            failures = True
+            clients[cid] = {"status": "error", "detail": _sanitize(str(exc))}
+            # A writer may have changed the file and then raised (disk/fsync
+            # errors are the classic case). If so, checksum that exact output
+            # and use the already-captured original to roll it back safely.
+            try:
+                if manifest and manifest.get("cli_id") == cid:
+                    exists, current_sha = _current_file_sha(manifest["path"])
+                    if exists and current_sha != manifest.get("original_sha256"):
+                        manifest["managed_sha256"] = current_sha
+                        _write_snapshot_manifest(generation, cid, manifest)
+                        rollback = _restore_cli_snapshot(generation, cid)
+                        clients[cid]["rollback"] = rollback["status"]
+            except Exception as rollback_exc:
+                clients[cid]["rollback"] = "conflict"
+                clients[cid]["rollback_detail"] = _sanitize(str(rollback_exc))
+    if failures:
+        # All-or-nothing on enable: clean managed files are rolled back. A file
+        # concurrently edited by the user becomes a conflict and is untouched.
+        for cid in changed_ids:
+            try:
+                rollback = _restore_cli_snapshot(generation, cid)
+                clients[cid]["rollback"] = rollback["status"]
+                if rollback["status"] == "conflict":
+                    clients[cid]["detail"] = rollback.get("detail")
+            except Exception as exc:
+                clients[cid]["rollback"] = "conflict"
+                clients[cid]["detail"] = _sanitize(str(exc))
+        return _finalize_hub_state(changing["revision"], "error", clients)
+    return _finalize_hub_state(changing["revision"], "on", clients)
+
+
+def _bulk_hub_off(expected_revision):
+    previous = config.get_hub_mode_state()
+
+    def _begin(state):
+        state.update({"desired": "off", "phase": "changing"})
+        return state
+
+    changing = config.update_hub_mode_state(expected_revision, _begin)
+    generation = previous.get("generation")
+    clients = {}
+    conflicts = False
+    if generation:
+        managed_ids = [cid for cid, row in (previous.get("clients") or {}).items()
+                       if isinstance(row, dict) and row.get("status") in ("on", "conflict")]
+        for cid in managed_ids:
+            try:
+                result = _restore_cli_snapshot(generation, cid)
+            except Exception as exc:
+                result = {"status": "conflict", "detail": _sanitize(str(exc))}
+            clients[cid] = result
+            conflicts = conflicts or result.get("status") == "conflict"
+    else:
+        # Migration path for installations connected before master mode existed.
+        for entry in CLI_REGISTRY:
+            connected, _method, _detail = _cli_connected(entry)
+            reverter = _DISCONNECTERS.get(entry.get("autofix"))
+            if not connected or not reverter:
+                clients[entry["id"]] = {"status": "skipped"}
+                continue
+            try:
+                result = reverter(entry)
+                still_connected = _cli_connected(entry)[0]
+                clients[entry["id"]] = {"status": "conflict" if still_connected else "off",
+                                        "path": result.get("wrote_path")}
+                conflicts = conflicts or still_connected
+            except Exception as exc:
+                clients[entry["id"]] = {"status": "conflict", "detail": _sanitize(str(exc))}
+                conflicts = True
+    return _finalize_hub_state(changing["revision"], "conflict" if conflicts else "off", clients)
+
+
+def _mark_hub_mode_unmanaged():
+    """An individual CLI edit intentionally exits bulk-managed mode."""
+    for _attempt in range(2):
+        state = config.get_hub_mode_state()
+        if state.get("phase") in ("unmanaged", "changing"):
+            return
+        try:
+            config.update_hub_mode_state(state["revision"], lambda value: {
+                **value, "phase": "unmanaged", "generation": None, "clients": {}})
+            return
+        except config.RevisionConflict:
+            continue
+
+
+def _recover_interrupted_hub_transition():
+    """Finish a crashed disable, or roll back a crashed enable at startup."""
+    state = config.get_hub_mode_state()
+    if state.get("phase") != "changing":
+        return
+    if not _hub_switch_lock.acquire(blocking=False):
+        return
+    try:
+        state = config.get_hub_mode_state()
+        if state.get("phase") != "changing":
+            return
+        if state.get("desired") == "off":
+            _bulk_hub_off(state["revision"])
+            return
+        generation = state.get("generation")
+        clients = {}
+        conflicts = False
+        if generation:
+            try:
+                root = os.path.join(config.snapshots_dir(), config.re_safe_component(generation))
+                cids = os.listdir(root)
+            except (OSError, ValueError):
+                cids = []
+            for cid in cids:
+                try:
+                    safe_cid = config.re_safe_component(cid)
+                    manifest = _load_snapshot_manifest(generation, safe_cid)
+                    if not manifest:
+                        raise ValueError("snapshot manifest is missing or corrupt")
+                    exists, current_sha = _current_file_sha(manifest["path"])
+                    original_same = (exists == bool(manifest.get("original_exists")) and
+                                     current_sha == manifest.get("original_sha256"))
+                    if original_same and not manifest.get("managed_sha256"):
+                        result = {"status": "off", "changed": False,
+                                  "detail": "enable interrupted before this CLI was changed"}
+                    else:
+                        result = _restore_cli_snapshot(generation, safe_cid)
+                    clients[safe_cid] = result
+                    conflicts = conflicts or result.get("status") == "conflict"
+                except Exception as exc:
+                    clients[str(cid)] = {"status": "conflict", "detail": _sanitize(str(exc))}
+                    conflicts = True
+        clients["_recovery"] = {
+            "status": "error",
+            "detail": "an interrupted enable was rolled back at startup; retry Hub mode",
+        }
+        _finalize_hub_state(state["revision"], "conflict" if conflicts else "error", clients)
+    finally:
+        _hub_switch_lock.release()
+
+
 def _env_unset_commands(entry):
     """Copy-paste commands to REMOVE the hub env vars a manual CLI would use.
     Names only — never a value, so no secret can leak."""
@@ -3081,6 +3885,53 @@ def api_clis():
     return jsonify([_cli_row(e) for e in CLI_REGISTRY])
 
 
+@app.route("/api/hub-mode", methods=["GET", "POST"])
+@app.route("/api/lifecycle/hub", methods=["GET", "POST"])
+def api_hub_mode():
+    if request.method == "GET":
+        return jsonify(_hub_mode_payload())
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "invalid JSON body"}), 400
+    desired = body.get("desired")
+    if desired is None and isinstance(body.get("enabled"), bool):
+        desired = "on" if body["enabled"] else "off"
+    if desired not in ("on", "off"):
+        return jsonify({"error": "desired must be 'on' or 'off'"}), 400
+    if "revision" not in body:
+        return jsonify({"error": "revision is required"}), 400
+    if not _hub_switch_lock.acquire(blocking=False):
+        return jsonify({"error": "a hub mode transition is already running",
+                        "state": config.get_hub_mode_state()}), 409
+    try:
+        current = config.get_hub_mode_state()
+        try:
+            expected = int(body["revision"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "revision must be an integer"}), 400
+        if expected != current["revision"]:
+            return jsonify({"error": "hub state changed; reload and retry",
+                            "current_revision": current["revision"], "state": current}), 409
+        if current.get("desired") == desired and current.get("phase") == desired:
+            return jsonify(_hub_mode_payload())
+        try:
+            if desired == "on":
+                _bulk_hub_on(expected)
+            else:
+                _bulk_hub_off(expected)
+        except config.RevisionConflict as exc:
+            return jsonify({"error": "hub state changed during transition",
+                            "current_revision": exc.current_revision,
+                            "state": config.get_hub_mode_state()}), 409
+        except Exception as exc:
+            _log.error("Hub mode transition failed: %s", _sanitize(str(exc)))
+            return jsonify({"error": _sanitize(str(exc)) or "hub transition failed",
+                            "state": config.get_hub_mode_state()}), 500
+        return jsonify(_hub_mode_payload())
+    finally:
+        _hub_switch_lock.release()
+
+
 @app.route("/api/clis/<cid>/autofix", methods=["POST"])
 def api_cli_autofix(cid):
     entry = _get_cli_entry(cid)
@@ -3118,6 +3969,8 @@ def api_cli_autofix(cid):
         result = fixer(entry, key, base_root, base_v1, model)
     except OSError as exc:
         return jsonify({"ok": False, "reason": _sanitize("could not write config: %s" % exc)})
+    if result.get("ok"):
+        _mark_hub_mode_unmanaged()
     return jsonify(result)
 
 
@@ -3156,6 +4009,7 @@ def api_cli_disconnect(cid):
         result = reverter(entry)
     except OSError as exc:
         return jsonify({"ok": False, "reason": _sanitize("could not restore config: %s" % exc)})
+    _mark_hub_mode_unmanaged()
     # VERIFY THE REVERT. Recompute freshly from disk/env so 'connected' reflects
     # reality, and if the CLI is STILL wired to the hub, say so instead of
     # reporting a clean success. This is the honest answer to "I clicked
@@ -3324,15 +4178,24 @@ def v1_chat_completions():
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return _openai_error("Invalid JSON body.", 400)
+    try:
+        body["messages"], image_count = _normalize_openai_messages(body.get("messages"))
+    except ValueError as exc:
+        return _openai_error(str(exc), 400)
+    has_images = image_count > 0
     # Orchestrate (Auto): route by task difficulty AND request size so weak/small
     # providers take easy work and big requests avoid small-TPM providers (413).
     # Explicit '<pid>/<model>' bypasses model choice (chain still size-filters).
     est = _est_tokens(body.get("messages"), body.get("tools"))
     diff = None
     if _is_orchestrate(body.get("model")):
-        pid, resolved, diff = _route_by_difficulty(body.get("messages"),
-                                                    body.get("max_tokens"), est)
+        router = _route_for_vision if has_images else _route_by_difficulty
+        pid, resolved, diff = router(body.get("messages"), body.get("max_tokens"), est)
         if pid is None:
+            if has_images:
+                return _openai_error(
+                    "No enabled verified vision model is available. Enable Google, "
+                    "Cloudflare, or Z.AI with a usable vision model.", 400)
             pid, resolved = _resolve_model(body.get("model"))  # default/best or error
     else:
         pid, resolved = _resolve_model(body.get("model"))
@@ -3341,6 +4204,9 @@ def v1_chat_completions():
     if not prov.is_model_allowed(resolved):
         return _openai_error("Model '%s' is blocked by the safety filter." % resolved, 403,
                              "permission_error")
+    if has_images and not _is_vision_model(pid, resolved):
+        return _openai_error(
+            "Model '%s/%s' is not a verified vision model." % (pid, resolved), 400)
     not_ready = _check_provider_ready(pid)
     if not_ready:
         return _openai_error(not_ready, 400)
@@ -3348,7 +4214,7 @@ def v1_chat_completions():
     stream = bool(body.get("stream"))
     errors = []
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
-    for hop_pid, hop_model in _build_chain(pid, resolved, est):
+    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images):
         if not prov.is_model_allowed(hop_model):
             continue
         if stream and _is_sub(hop_pid):
@@ -3503,13 +4369,27 @@ def _responses_to_chat(body):
                 text = content
             else:
                 parts = []
+                multimodal = False
                 for part in content or []:
                     if isinstance(part, str):
                         parts.append(part)
-                    elif isinstance(part, dict) and part.get("type") in (
-                            "input_text", "output_text", "text"):
-                        parts.append(part.get("text") or "")
-                text = "".join(parts)
+                    elif isinstance(part, dict):
+                        ptype = part.get("type")
+                        if ptype in ("input_text", "output_text", "text"):
+                            parts.append(part.get("text") or "")
+                        elif ptype in ("input_image", "image_url"):
+                            if part.get("file_id") and not part.get("image_url"):
+                                raise ValueError("Responses file_id images cannot be resolved by this hub")
+                            image = _normalize_image_url(part.get("image_url") or part.get("url"))
+                            parts.append({"type": "image_url", "image_url": image})
+                            multimodal = True
+                        elif ptype in ("input_audio", "audio", "input_video", "video"):
+                            raise ValueError("audio and video inputs are not supported by this hub")
+                if multimodal:
+                    text = [({"type": "text", "text": p} if isinstance(p, str) else p)
+                            for p in parts]
+                else:
+                    text = "".join(parts)
             messages.append({"role": role, "content": text})
         # else: unknown item type (reasoning, etc.) -> skip
     return messages
@@ -3728,10 +4608,12 @@ def v1_responses():
         return _openai_error("Invalid JSON body.", 400)
     try:
         messages = _responses_to_chat(body)
+        messages, image_count = _normalize_openai_messages(messages)
     except Exception as exc:
         return _openai_error("Could not translate request: " + _sanitize(str(exc)), 400)
     if not messages:
         return _openai_error("No input to send.", 400)
+    has_images = image_count > 0
 
     # Tools + size estimate up front (Codex sends huge tool schemas — they must
     # count toward routing so a big request doesn't land on a small-TPM provider).
@@ -3742,8 +4624,13 @@ def v1_responses():
     # route across available, SIZE-CAPABLE providers; explicit '<pid>/<model>' bypasses.
     diff = None
     if _is_orchestrate(body.get("model")):
-        pid, resolved, diff = _route_by_difficulty(messages, body.get("max_output_tokens"), est)
+        router = _route_for_vision if has_images else _route_by_difficulty
+        pid, resolved, diff = router(messages, body.get("max_output_tokens"), est)
         if pid is None:
+            if has_images:
+                return _openai_error(
+                    "No enabled verified vision model is available. Enable Google, "
+                    "Cloudflare, or Z.AI with a usable vision model.", 400)
             pid, resolved = _resolve_model(body.get("model"))
     else:
         pid, resolved = _resolve_model(body.get("model"))
@@ -3752,6 +4639,9 @@ def v1_responses():
     if not prov.is_model_allowed(resolved):
         return _openai_error("Model '%s' is blocked by the safety filter." % resolved, 403,
                              "permission_error")
+    if has_images and not _is_vision_model(pid, resolved):
+        return _openai_error(
+            "Model '%s/%s' is not a verified vision model." % (pid, resolved), 400)
     not_ready = _check_provider_ready(pid)
     if not_ready:
         return _openai_error(not_ready, 400)
@@ -3774,7 +4664,7 @@ def v1_responses():
     stream = bool(body.get("stream"))
     errors = []
     last_hard = None  # last hard (non-retryable) upstream error, relayed if chain is exhausted
-    for hop_pid, hop_model in _build_chain(pid, resolved, est):
+    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images):
         if not prov.is_model_allowed(hop_model):
             continue
         if stream and _is_sub(hop_pid):
@@ -3862,6 +4752,24 @@ def _blocks_to_text(content):
     return ""
 
 
+def _anthropic_image_to_openai(block):
+    source = block.get("source") if isinstance(block, dict) else None
+    if not isinstance(source, dict):
+        raise ValueError("Anthropic image.source must be an object")
+    stype = source.get("type")
+    if stype == "base64":
+        mime = str(source.get("media_type") or "").lower()
+        data = source.get("data")
+        if mime not in _IMAGE_MIMES or not isinstance(data, str):
+            raise ValueError("Anthropic base64 images need a supported media_type and data")
+        value = "data:%s;base64,%s" % (mime, data)
+    elif stype == "url":
+        value = source.get("url")
+    else:
+        raise ValueError("unsupported Anthropic image source type '%s'" % stype)
+    return {"type": "image_url", "image_url": _normalize_image_url(value)}
+
+
 def _anthropic_to_openai_messages(body):
     """Anthropic system+messages -> OpenAI messages (tools included)."""
     out = []
@@ -3908,9 +4816,20 @@ def _anthropic_to_openai_messages(body):
                             "content": _blocks_to_text(tr.get("content")) or ""})
             rest = [b for b in blocks
                     if not (isinstance(b, dict) and b.get("type") == "tool_result")]
-            text = _blocks_to_text(rest)
-            if text or not tool_results:
-                out.append({"role": "user", "content": text})
+            content_parts = []
+            has_image = False
+            for block in rest:
+                if isinstance(block, str):
+                    content_parts.append({"type": "text", "text": block})
+                elif isinstance(block, dict) and block.get("type") == "text":
+                    content_parts.append({"type": "text", "text": block.get("text") or ""})
+                elif isinstance(block, dict) and block.get("type") == "image":
+                    content_parts.append(_anthropic_image_to_openai(block))
+                    has_image = True
+            text = "".join(p.get("text", "") for p in content_parts
+                           if p.get("type") == "text")
+            if content_parts or not tool_results:
+                out.append({"role": "user", "content": content_parts if has_image else text})
     return out
 
 
@@ -3948,12 +4867,17 @@ def _map_stop_reason(finish_reason):
 
 def _estimate_input_tokens(body):
     total = 0
+    images = 0
     system = body.get("system")
     if system:
         total += len(_blocks_to_text(system))
     for msg in body.get("messages") or []:
         total += len(_blocks_to_text(msg.get("content")))
-    return max(1, total // 4)
+        content = msg.get("content")
+        if isinstance(content, list):
+            images += sum(1 for block in content
+                          if isinstance(block, dict) and block.get("type") == "image")
+    return max(1, total // 4 + images * 1000)
 
 
 def _openai_resp_to_anthropic(data, model_str):
@@ -4104,19 +5028,29 @@ def v1_messages():
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return _anthropic_error("invalid_request_error", "Invalid JSON body.", 400)
+    try:
+        oai_messages = _anthropic_to_openai_messages(body)
+        oai_messages, image_count = _normalize_openai_messages(oai_messages)
+    except Exception as exc:
+        return _anthropic_error("invalid_request_error",
+                                "Could not translate request: " + _sanitize(exc), 400)
+    if not oai_messages:
+        return _anthropic_error("invalid_request_error", "No messages to send.", 400)
+    has_images = image_count > 0
     # Claude Code sends model 'claude-*' + a big system/tools payload -> orchestrate
     # by difficulty AND request size (skip small-TPM providers for large requests).
-    est = _estimate_input_tokens(body)
-    try:
-        if body.get("tools"):
-            est += len(json.dumps(body.get("tools"))) // 4
-    except Exception:
-        pass
+    tools = _anthropic_tools_to_openai(body.get("tools"))
+    est = _est_tokens(oai_messages, tools)
     diff = None
     if _is_orchestrate(body.get("model")):
-        pid, resolved, diff = _route_by_difficulty(body.get("messages"),
-                                                    body.get("max_tokens"), est)
+        router = _route_for_vision if has_images else _route_by_difficulty
+        pid, resolved, diff = router(oai_messages, body.get("max_tokens"), est)
         if pid is None:
+            if has_images:
+                return _anthropic_error(
+                    "invalid_request_error",
+                    "No enabled verified vision model is available. Enable Google, "
+                    "Cloudflare, or Z.AI with a usable vision model.", 400)
             pid, resolved = _resolve_model(body.get("model"))
     else:
         pid, resolved = _resolve_model(body.get("model"))
@@ -4125,17 +5059,13 @@ def v1_messages():
     if not prov.is_model_allowed(resolved):
         return _anthropic_error("permission_error",
                                 "Model '%s' is blocked by the safety filter." % resolved, 403)
+    if has_images and not _is_vision_model(pid, resolved):
+        return _anthropic_error(
+            "invalid_request_error",
+            "Model '%s/%s' is not a verified vision model." % (pid, resolved), 400)
     not_ready = _check_provider_ready(pid)
     if not_ready:
         return _anthropic_error("invalid_request_error", not_ready, 400)
-
-    try:
-        oai_messages = _anthropic_to_openai_messages(body)
-    except Exception as exc:
-        return _anthropic_error("invalid_request_error",
-                                "Could not translate request: " + _sanitize(exc), 400)
-    if not oai_messages:
-        return _anthropic_error("invalid_request_error", "No messages to send.", 400)
 
     base_payload = {"messages": oai_messages}
     if body.get("max_tokens"):
@@ -4149,7 +5079,6 @@ def v1_messages():
         base_payload["top_p"] = body["top_p"]
     if body.get("stop_sequences"):
         base_payload["stop"] = body["stop_sequences"]
-    tools = _anthropic_tools_to_openai(body.get("tools"))
     if tools:
         base_payload["tools"] = tools
         tc = _anthropic_tool_choice_to_openai(body.get("tool_choice"))
@@ -4162,7 +5091,7 @@ def v1_messages():
 
     errors = []
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
-    for hop_pid, hop_model in _build_chain(pid, resolved, est):
+    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images):
         if not prov.is_model_allowed(hop_model):
             continue
         if stream and _is_sub(hop_pid):
@@ -4264,6 +5193,22 @@ def _is_git_repo():
     return rc == 0 and out == "true"
 
 
+# Auto-update pulls and then os.execv's freshly fetched code, so an `origin`
+# repointed to an untrusted fork (accidentally or by a compromised dependency/
+# setup step) would otherwise run arbitrary code as this user. This does not
+# defend against the upstream repo itself being compromised — only against
+# a wrong/hostile remote — the accepted residual risk is documented in
+# security_best_practices_report.md (SEC-002).
+_TRUSTED_REMOTE_RE = re.compile(
+    r"^(?:https://github\.com/|git@github\.com:)last-million/free-llm-hub(?:\.git)?/?$",
+    re.IGNORECASE)
+
+
+def _origin_is_trusted():
+    rc, url, _ = _git("remote", "get-url", "origin")
+    return rc == 0 and bool(_TRUSTED_REMOTE_RE.match(url.strip()))
+
+
 def _auto_update_enabled():
     """ALWAYS ON. Auto-update is not a user-facing option: the hub keeps itself
     current (git pull every AUTO_UPDATE_INTERVAL_HOURS, default 5) and restarts
@@ -4289,6 +5234,11 @@ def _do_update_check():
         _auto_update_state["last_check"] = int(time.time())
         if not _is_git_repo():
             _auto_update_state["last_result"] = "not a git repo — auto-update off"
+            return _auto_update_state["last_result"]
+        if not _origin_is_trusted():
+            _auto_update_state["last_result"] = (
+                "skipped: 'origin' is not the trusted last-million/free-llm-hub repo")
+            _log.warning("Auto-update: refusing to pull — origin remote is untrusted.")
             return _auto_update_state["last_result"]
         rc, dirty, _ = _git("status", "--porcelain")
         if rc == 0 and dirty:
@@ -4376,6 +5326,7 @@ def api_auto_update():
 
 def _print_banner():
     key = config.get_local_api_key()
+    control_token = config.ensure_control_token()
     snippets = _connect_snippets()
     line = "=" * 74
     print(line)
@@ -4389,6 +5340,11 @@ def _print_banner():
     else:
         print("  Local key:   not set -- /v1/* is open on localhost")
     print(line)
+    print("  Control token (paste into the dashboard once, first load):")
+    print("    " + control_token)
+    print("  This gates /api/* (dashboard config, hub mode, shutdown). It is")
+    print("  stored in config.json (0600) and never sent to any provider.")
+    print(line)
     print("  Connect Claude Code:")
     for ln in snippets["claude_code"].splitlines():
         print("    " + ln)
@@ -4398,8 +5354,35 @@ def _print_banner():
     print(line)
 
 
+def _mark_runtime_started():
+    config.clear_intentional_stop()
+    for _attempt in range(3):
+        state = config.get_runtime_state()
+
+        def _running(value):
+            value.update({"desired": "running", "phase": "running",
+                          "shutdown_requested_at": None, "last_error": None})
+            return value
+
+        try:
+            config.update_runtime_state(state["revision"], _running)
+            return
+        except config.RevisionConflict:
+            continue
+
+
 if __name__ == "__main__":
+    from werkzeug.serving import make_server
+
+    _recover_interrupted_hub_transition()
+    _mark_runtime_started()
     _bootstrap_no_key_providers()  # no-key providers have nothing to configure -> on
     _print_banner()
     _start_auto_update()
-    app.run(host=HOST, port=PORT, threaded=True, debug=False)
+    server = make_server(HOST, PORT, app, threaded=True)
+    _runtime_server[0] = server
+    try:
+        server.serve_forever()
+    finally:
+        _runtime_server[0] = None
+        server.server_close()

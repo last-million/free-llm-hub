@@ -40,7 +40,7 @@ rem --- 1. logon launcher (silent, no admin) ---
 >> "%LAUNCHER%" echo Set sh = CreateObject("WScript.Shell")
 >> "%LAUNCHER%" echo sh.CurrentDirectory = "%HERE%"
 >> "%LAUNCHER%" echo ' 0 = hidden window, False = do not wait
->> "%LAUNCHER%" echo sh.Run "cmd /c run.bat", 0, False
+>> "%LAUNCHER%" echo sh.Run "cmd /c set HUB_SUPERVISED=1 && call run.bat", 0, False
 if not exist "%LAUNCHER%" (
   echo [autostart] ERROR: could not write to the Startup folder:
   echo             %STARTUP%
@@ -51,7 +51,7 @@ echo [autostart] Logon launcher installed.
 rem --- 2. self-heal every 5 minutes (no admin) ---
 schtasks /Delete /TN "%TASK%" /F >nul 2>nul
 schtasks /Create /TN "%TASK%" /SC MINUTE /MO 5 /F ^
-  /TR "cmd /c cd /d \"%HERE%\" && run.bat" >nul 2>nul
+  /TR "cmd /c cd /d \"%HERE%\" && set HUB_SUPERVISED=1 && call run.bat" >nul 2>nul
 if errorlevel 1 (
   echo [autostart] NOTE: the 5-minute self-heal task could not be created.
   echo             The hub will still start at logon - it just will not come

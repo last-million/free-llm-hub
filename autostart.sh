@@ -54,8 +54,9 @@ After=network-online.target
 Type=simple
 WorkingDirectory=$HERE
 Environment=PORT=$PORT
+Environment=HUB_SUPERVISED=1
 ExecStart=$HERE/run.sh
-Restart=always
+Restart=on-failure
 RestartSec=10
 
 [Install]
@@ -96,9 +97,13 @@ cat > "$PLIST" <<EOF
   <array><string>$HERE/run.sh</string></array>
   <key>WorkingDirectory</key><string>$HERE</string>
   <key>EnvironmentVariables</key>
-  <dict><key>PORT</key><string>$PORT</string></dict>
+  <dict>
+    <key>PORT</key><string>$PORT</string>
+    <key>HUB_SUPERVISED</key><string>1</string>
+  </dict>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
   <key>StandardOutPath</key><string>/tmp/free-llm-hub.log</string>
   <key>StandardErrorPath</key><string>/tmp/free-llm-hub.err</string>
 </dict>

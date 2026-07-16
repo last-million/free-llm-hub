@@ -115,6 +115,32 @@ Model names are `<provider>/<model>` (e.g. `cerebras/llama-4-scout`). A bare mod
 
 ---
 
+### Hub lifecycle controls
+
+The dashboard's **Hub mode** switch connects or disconnects every installed,
+compatible CLI as one revision-checked transaction. Before it writes anything,
+the hub stores an exact snapshot under `~/.free-llm-hub/snapshots/`. Switching
+off restores only files that still match the hub-managed checksum; a file edited
+afterward is reported as a conflict and left untouched. Individual per-CLI
+Connect/Disconnect buttons remain available and intentionally return the hub to
+`unmanaged` mode.
+
+**Stop hub** drains active inference streams, rejects new `/v1/*` work, records
+an intentional-stop marker, then exits. The included systemd, launchd, Startup,
+and Scheduled Task installers honor that marker, so an intentional stop is not
+mistaken for a crash. Run `run.sh` or `run.bat` manually to clear the marker and
+start again.
+
+### Images / vision
+
+Images work through OpenAI Chat Completions, OpenAI Responses, and Anthropic
+Messages. The hub preserves image blocks and restricts the entire fallback chain
+to an exact list of vision models verified in the provider registry. Choose a
+preferred vision model in **Hub controls**, or leave priority on Auto. The chat
+playground can attach PNG, JPEG, WebP, or GIF images (up to 8 images / 8 MiB
+decoded data per request). Audio and video are rejected explicitly rather than
+being silently dropped.
+
 ## Notable free providers
 
 A few of the providers in the built-in registry (the dashboard shows the full list with signup links and per-provider notes):
@@ -161,6 +187,8 @@ Free tiers change often — the numbers above are indicative. Always check the p
 - **Keys at rest.** Provider keys live in `~/.free-llm-hub/config.json`, written with `0600` permissions on POSIX systems. The repo's `.gitignore` excludes every config/secret path — never commit that file.
 - **Safety filter.** Models flagged as uncensored/NSFW-oriented are blocked at the gateway regardless of provider.
 - **No secrets in code.** The codebase contains zero keys; everything sensitive is runtime config.
+- **Safe lifecycle writes.** CLI files and hub state are replaced atomically. Bulk mode uses checksummed snapshots and never overwrites a config changed by the user after connection.
+- **Media is not fetched locally.** Remote image URLs are passed to the selected provider; the hub never dereferences them, and local/file URL schemes are rejected.
 
 ---
 
@@ -172,7 +200,27 @@ Free tiers change often — the numbers above are indicative. Always check the p
 | `GET /v1/models` | OpenAI-shaped list of all available free models |
 | `POST /v1/chat/completions` | OpenAI Chat Completions (streaming supported) |
 | `POST /v1/messages` | Anthropic Messages API (streaming supported) — Claude Code entry point |
+| `GET/POST /api/hub-mode` | Revision-checked bulk CLI connect/disconnect state |
+| `GET/POST /api/media` | Verified vision models and persisted priority |
+| `GET /api/runtime` | Runtime/draining state and active request count |
+| `POST /api/runtime/stop` | Mark an intentional stop and drain before exit |
 | `GET/POST /api/*` | Dashboard configuration API (localhost only) |
+
+For non-browser calls to a state-changing `/api/*` endpoint, send
+`X-Free-LLM-Hub: dashboard`. The dashboard adds it automatically; the header
+prevents a remote website from issuing a browser "simple" request to the local
+control plane.
+
+**Control token.** Every `/api/*` route (including read-only ones like the key
+"reveal" toggle) also requires `X-Free-LLM-Hub-Token: <token>` once a token has
+been generated. The hub generates one on first startup, prints it to the
+console the process is running in, and stores it in `~/.free-llm-hub/config.json`
+(`0600` on POSIX). The dashboard prompts for it once (a plain browser prompt,
+Jupyter-style) and remembers it in that browser's `localStorage`. This exists
+because the loopback port itself is not isolated per OS user — Host/Origin
+checks alone stop a cross-site browser request, not a different local account
+that can also reach `127.0.0.1:<port>`. Scripting against `/api/*` directly?
+Read the token from the same config file or the process's startup output.
 
 ---
 
