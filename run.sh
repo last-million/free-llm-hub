@@ -30,7 +30,12 @@ fi
 # take effect and any check you run "passes" against a stale process. Cheaper to
 # refuse than to debug. HUB_FORCE=1 overrides.
 if [ -z "${HUB_FORCE:-}" ]; then
-  if command -v curl >/dev/null 2>&1 && curl -fsS -m 2 "http://127.0.0.1:${PORT}/api/providers" >/dev/null 2>&1; then
+  # No -f: any completed HTTP response counts as "already running" -- since
+  # SEC-001 added a control-token requirement to every /api/* route (this one
+  # included), an unauthenticated request now gets a 401, and -f treats that
+  # as failure. That silently broke this exact double-bind check (it always
+  # said "not running" once a token existed, so a second copy would start).
+  if command -v curl >/dev/null 2>&1 && curl -sS -m 2 -o /dev/null "http://127.0.0.1:${PORT}/api/providers"; then
     echo "[free-llm-hub] Already running and healthy on port ${PORT} - nothing to do."
     echo "               Dashboard: http://127.0.0.1:${PORT}"
     echo "               (restart it instead of starting a second copy; HUB_FORCE=1 to override)"

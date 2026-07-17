@@ -85,6 +85,14 @@ def _new_media() -> dict:
     }
 
 
+def _new_images() -> dict:
+    return {
+        "revision": 0,
+        "priority_mode": "auto",
+        "manual_priority": [],
+    }
+
+
 _EMPTY_CONFIG = {
     "schema_version": SCHEMA_VERSION,
     "providers": {},
@@ -93,6 +101,7 @@ _EMPTY_CONFIG = {
     "hub_mode": _new_hub_mode(),
     "runtime": _new_runtime(),
     "media": _new_media(),
+    "images": _new_images(),
 }
 
 
@@ -258,6 +267,11 @@ def load_config(strict: bool = False) -> dict:
         cfg["media"]["priority_mode"] = "auto"
     if not isinstance(cfg["media"].get("manual_priority"), list):
         cfg["media"]["manual_priority"] = []
+    cfg["images"] = _normalize_state(cfg.get("images"), _new_images())
+    if cfg["images"].get("priority_mode") not in ("auto", "manual"):
+        cfg["images"]["priority_mode"] = "auto"
+    if not isinstance(cfg["images"].get("manual_priority"), list):
+        cfg["images"]["manual_priority"] = []
     return cfg
 
 
@@ -459,6 +473,17 @@ def set_default(provider: str, model: str) -> None:
         save_config(cfg)
 
 
+def clear_default() -> None:
+    """Explicitly clear the default provider/model (distinct from never having
+    set one). Added for settings import/export round-tripping: without this,
+    an exported {"default": null} (source machine had none configured) had no
+    way to overwrite a target machine's existing default back to 'unset'."""
+    with _LOCK:
+        cfg = load_config(strict=True)
+        cfg["default"] = None
+        save_config(cfg)
+
+
 def get_flag(name: str, default: bool = False) -> bool:
     """Read a top-level boolean flag from the config (survives round-trips)."""
     with _LOCK:
@@ -481,6 +506,18 @@ def get_local_api_key() -> Optional[str]:
         cfg = load_config()
     key = cfg.get("local_api_key")
     return key if isinstance(key, str) and key else None
+
+
+def set_local_api_key(value: Optional[str]) -> None:
+    """Explicitly set (or, with None/'', clear) the /v1/* bearer key. Added for
+    settings import/export round-tripping (see clear_default() for the same
+    reasoning): ensure_local_api_key() only ever GENERATES a fresh key when
+    none is set, it cannot restore/clear a SPECIFIC value, which a settings
+    restore onto a fresh or differently-configured machine needs to do."""
+    with _LOCK:
+        cfg = load_config(strict=True)
+        cfg["local_api_key"] = value.strip() if isinstance(value, str) and value.strip() else None
+        save_config(cfg)
 
 
 def ensure_local_api_key() -> str:
@@ -575,6 +612,15 @@ def get_media_state() -> dict:
 
 def update_media_state(expected_revision: int, updater) -> dict:
     return _cas_update("media", expected_revision, updater)
+
+
+def get_images_state() -> dict:
+    with _LOCK:
+        return copy.deepcopy(load_config().get("images") or _new_images())
+
+
+def update_images_state(expected_revision: int, updater) -> dict:
+    return _cas_update("images", expected_revision, updater)
 
 
 def new_generation_id() -> str:
