@@ -164,17 +164,15 @@ def test_start_session_rejects_when_binary_not_installed(agent_config, monkeypat
     assert "not installed" in str(exc.value)
 
 
-def test_start_session_codex_cleanly_refuses_unsupported(agent_config, monkeypatch):
-    """Codex's resume+bypass compatibility came back unclear/unconfirmed in the
-    research pass -- start_session() must refuse cleanly rather than attempt an
-    unverified flag combination."""
+def test_start_session_codex_now_supported(agent_config, monkeypatch):
+    """Codex agentic mode was live-verified on codex-cli 0.144.5 (resume+bypass
+    confirmed) and is now the default/supported backend -- start_session() must
+    register a codex session instead of refusing it."""
     _enable()
     monkeypatch.setattr(agentic_chat.shutil, "which", lambda name: "/usr/bin/" + name)
-    with pytest.raises(agentic_chat.AgenticError) as exc:
-        agentic_chat.start_session("codex", str(agent_config))
-    assert exc.value.status == 400
-    assert "not currently supported" in str(exc.value)
-    assert agentic_chat.cli_support()["codex"]["supported"] is False
+    sid = agentic_chat.start_session("codex", str(agent_config))
+    assert agentic_chat.get_session(sid)["cli"] == "codex"
+    assert agentic_chat.cli_support()["codex"]["supported"] is True
     assert agentic_chat.cli_support()["claude"]["supported"] is True
 
 
@@ -490,7 +488,7 @@ def test_api_agent_settings_get_default_off(agent_config):
     assert resp.status_code == 200
     body = resp.get_json()
     assert body["enabled"] is False
-    assert body["clis"]["codex"]["supported"] is False
+    assert body["clis"]["codex"]["supported"] is True
     assert body["clis"]["claude"]["supported"] is True
 
 
@@ -592,48 +590,48 @@ def test_api_agent_start_session_bad_cli_400(agent_config):
     _enable()
     client = app.app.test_client()
     resp = client.post("/api/agent/sessions",
-                       json={"cli": "codex", "project_dir": str(agent_config)}, headers=_DASH)
+                       json={"cli": "notacli", "project_dir": str(agent_config)}, headers=_DASH)
     assert resp.status_code == 400
-    assert "not currently supported" in resp.get_json()["error"]
+    assert "cli must be" in resp.get_json()["error"]
 
 
 # --------------------------------------------------------------------------- #
-# Default CLI -- Claude Code is the only working backend, so it must be the
-# default wherever a default is offered (API default when `cli` is omitted,
-# and the value the frontend picker should preselect).
+# Default CLI -- Codex is the user-chosen default wherever a default is offered
+# (API default when `cli` is omitted, and the value the frontend picker
+# preselects). Claude Code remains supported and selectable.
 # --------------------------------------------------------------------------- #
 
-def test_default_cli_helper_returns_claude():
-    assert agentic_chat.default_cli() == "claude"
+def test_default_cli_helper_returns_codex():
+    assert agentic_chat.default_cli() == "codex"
 
 
-def test_start_session_defaults_cli_to_claude_when_omitted(agent_config, monkeypatch):
+def test_start_session_defaults_cli_to_codex_when_omitted(agent_config, monkeypatch):
     _enable()
     monkeypatch.setattr(agentic_chat.shutil, "which", lambda name: "/usr/bin/" + name)
     sid = agentic_chat.start_session(None, str(agent_config))
-    assert agentic_chat.get_session(sid)["cli"] == "claude"
+    assert agentic_chat.get_session(sid)["cli"] == "codex"
 
 
 def test_start_session_defaults_cli_for_empty_string(agent_config, monkeypatch):
     _enable()
     monkeypatch.setattr(agentic_chat.shutil, "which", lambda name: "/usr/bin/" + name)
     sid = agentic_chat.start_session("", str(agent_config))
-    assert agentic_chat.get_session(sid)["cli"] == "claude"
+    assert agentic_chat.get_session(sid)["cli"] == "codex"
 
 
 def test_api_agent_settings_get_includes_default_cli(agent_config):
     client = app.app.test_client()
     resp = client.get("/api/agent/settings")
-    assert resp.get_json()["default_cli"] == "claude"
+    assert resp.get_json()["default_cli"] == "codex"
 
 
-def test_api_agent_start_session_omits_cli_defaults_to_claude(agent_config, monkeypatch):
+def test_api_agent_start_session_omits_cli_defaults_to_codex(agent_config, monkeypatch):
     _enable()
     monkeypatch.setattr(agentic_chat.shutil, "which", lambda name: "/usr/bin/" + name)
     client = app.app.test_client()
     resp = client.post("/api/agent/sessions", json={"project_dir": str(agent_config)}, headers=_DASH)
     assert resp.status_code == 200
-    assert resp.get_json()["cli"] == "claude"
+    assert resp.get_json()["cli"] == "codex"
 
 
 # --------------------------------------------------------------------------- #
@@ -685,15 +683,12 @@ def test_start_session_codex_not_installed_gives_sub_codex_provider(agent_config
     assert exc.value.extra == {"install_provider": "sub-codex"}
 
 
-def test_start_session_codex_installed_but_unsupported_has_no_install_code(agent_config, monkeypatch):
-    """Once installed, codex falls through to the pre-existing "not currently
-    supported" error, which carries no .code (a plain validation error)."""
+def test_start_session_codex_installed_creates_session(agent_config, monkeypatch):
+    """Once installed, codex (now a supported backend) registers a session."""
     _enable()
     monkeypatch.setattr(agentic_chat.shutil, "which", lambda name: "/usr/bin/" + name)
-    with pytest.raises(agentic_chat.AgenticError) as exc:
-        agentic_chat.start_session("codex", str(agent_config))
-    assert exc.value.code is None
-    assert "not currently supported" in str(exc.value)
+    sid = agentic_chat.start_session("codex", str(agent_config))
+    assert agentic_chat.get_session(sid)["cli"] == "codex"
 
 
 def test_api_agent_start_session_not_installed_error_shape(agent_config, monkeypatch):
