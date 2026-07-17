@@ -378,7 +378,8 @@ _BENCH_FAMILY = [
       "gemini-3-pro", "gemini-3.5-pro", "gemini-3-ultra", "gemini-3.5-ultra",
       "llama-4-maverick", "qwen3.5", "qwen3-max"), 100),
     (("deepseek-v3", "deepseek-r1", "gpt-oss-120b", "llama-4", "qwen3", "gemini-2.5-pro",
-      "mixtral-8x22", "command-r-plus", "minimax", "glm-5", "glm52", "kimi"), 82),
+      "mixtral-8x22", "command-r-plus", "minimax", "glm-5", "glm52", "kimi",
+      "hy3", "hunyuan", "tencent-hy"), 82),
     (("llama-3.3-70b", "llama-3.1-405", "qwen2.5-72", "gemini-2.5-flash", "gemma-3-27",
       "mistral-large", "nemotron-70", "command-r", "gpt-4o"), 68),
     (("70b", "72b", "gemini-2.0", "gpt-4o-mini", "mistral-small", "codestral", "gemma-2-27"), 52),
@@ -413,6 +414,17 @@ def _benchmark_score(pid, model_id):
         score += 3
     # A tiny provider bias breaks ties toward fast, reliable free hosts.
     score += {"cerebras": 2.0, "groq": 1.8, "nvidia": 1.2, "google": 1.0}.get(pid, 0.0)
+    # Coding-strength adjustment: this hub is coding-heavy, and raw strength != code
+    # ability. Boost known-strong coders, and penalize the Mistral chat family (weak
+    # at coding, per user feedback) so 'auto' stops picking it for code work. Note
+    # `codestral` (Mistral's dedicated code model) is deliberately exempt from the
+    # penalty and gets the coder boost.
+    if any(c in low for c in ("deepseek", "qwen3-coder", "qwen2.5-coder", "qwen3",
+                              "kimi", "glm-5", "glm52", "glm-4.7", "gpt-oss", "claude",
+                              "gpt-5", "hy3", "hunyuan", "codestral", "starcoder", "devstral")):
+        score += 8
+    if ("mistral" in low or "mixtral" in low or "ministral" in low) and "codestral" not in low:
+        score -= 14
     return score
 
 
