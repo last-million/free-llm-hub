@@ -990,6 +990,21 @@
     transition:color .18s, border-color .18s, background .18s; }
   .cx-side-link:hover{ color:var(--neon-cyan); border-color:rgba(34,211,238,.4); background:var(--surface-2); }
   .cx-side-link svg{ width:18px; height:18px; }
+  /* provider notes "Read more" + modal */
+  .notes-more{ background:none; border:none; color:var(--neon-cyan); cursor:pointer; font:inherit;
+    font-size:12.5px; padding:0; text-decoration:underline; white-space:nowrap; }
+  .notes-more:hover{ color:#67e8f9; }
+  .notes-modal-scrim{ position:fixed; inset:0; background:rgba(0,0,0,.62); z-index:400;
+    display:grid; place-items:center; padding:20px; }
+  .notes-modal{ background:var(--surface); border:1px solid var(--border); border-radius:14px;
+    max-width:560px; width:100%; max-height:80vh; display:flex; flex-direction:column;
+    box-shadow:0 24px 64px rgba(0,0,0,.55); }
+  .notes-modal-h{ display:flex; align-items:center; justify-content:space-between; gap:12px;
+    padding:14px 18px; border-bottom:1px solid var(--border-soft); font-weight:700; color:var(--text); }
+  .notes-modal-x{ background:none; border:none; color:var(--text-dim); font-size:22px; line-height:1; cursor:pointer; }
+  .notes-modal-x:hover{ color:var(--text); }
+  .notes-modal-b{ padding:16px 18px; overflow:auto; font-size:13px; line-height:1.65;
+    color:var(--text-dim); white-space:pre-wrap; word-break:break-word; }
 </style>
 </head>
 <body>
@@ -2216,6 +2231,28 @@
   var X_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
   var KEY_WARN = '⚠ Using several keys for the same provider to get around free limits may break their terms and can get your accounts banned. Use your own keys responsibly.';
 
+  function notesCardHTML(n){
+    if (n && n.length > 200){
+      return '<div class="notes">' + esc(n.slice(0, 200)) + '… ' +
+             '<button type="button" class="notes-more">Read more</button></div>';
+    }
+    return '<div class="notes">' + esc(n) + '</div>';
+  }
+  function openNotesModal(title, text){
+    var scrim = document.createElement('div');
+    scrim.className = 'notes-modal-scrim';
+    scrim.innerHTML = '<div class="notes-modal" role="dialog" aria-modal="true">' +
+      '<div class="notes-modal-h"><span>' + esc(title) + '</span>' +
+      '<button type="button" class="notes-modal-x" aria-label="Close">&times;</button></div>' +
+      '<div class="notes-modal-b">' + esc(text) + '</div></div>';
+    document.body.appendChild(scrim);
+    function close(){ scrim.remove(); document.removeEventListener('keydown', onKey); }
+    function onKey(e){ if (e.key === 'Escape') close(); }
+    scrim.addEventListener('click', function(e){ if (e.target === scrim) close(); });
+    scrim.querySelector('.notes-modal-x').addEventListener('click', close);
+    document.addEventListener('keydown', onKey);
+  }
+
   function cardHTML(p){
     var keys = Array.isArray(p.keys) ? p.keys : [];
     var kc = (typeof p.key_count === 'number') ? p.key_count : keys.length;
@@ -2246,7 +2283,7 @@
           badges +
         '</div>' +
       '</div>' +
-      (p.notes ? '<div class="notes">' + esc(p.notes) + '</div>' : '') +
+      (p.notes ? notesCardHTML(p.notes) : '') +
       (fm.length ? '<div class="models-preview"><b>' + fm.length + ' free model' + (fm.length > 1 ? 's' : '') + ':</b> ' + esc(fmPrev) + '</div>' : '') +
       (p.signup_url ?
         '<a class="keylink" href="' + esc(p.signup_url) + '" target="_blank" rel="noopener noreferrer">' +
@@ -2331,6 +2368,9 @@
     $('.eye', card).addEventListener('click', function(){
       keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
     });
+
+    var moreBtn = $('.notes-more', card);
+    if (moreBtn) moreBtn.addEventListener('click', function(){ openNotesModal(p.name || p.id, p.notes); });
 
     toggle.addEventListener('change', function(){
       var want = toggle.checked;
