@@ -3940,7 +3940,10 @@ def _autofix_codex(entry, key, base_root, base_v1, model):
         return abort
     try:
         if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            # utf-8-sig: strip a leading UTF-8 BOM so it never lands mid-file after
+            # we prepend model_provider/model above it (a mid-file BOM makes Codex
+            # reject config.toml with "invalid unquoted key" at that line).
+            with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
                 text = f.read()
         else:
             text = ""
@@ -4200,7 +4203,8 @@ def _disconnect_codex(entry):
     # Preserving newly-added MCP servers outweighs restoring a trivially-reset scalar.
     if os.path.isfile(path):
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            # utf-8-sig: tolerate/strip a leading UTF-8 BOM on the way back out too.
+            with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
                 text = f.read()
         except OSError:
             text = None
