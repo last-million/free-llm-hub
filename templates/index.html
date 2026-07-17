@@ -1015,6 +1015,11 @@
   .cx-soc.yt{ background:#FF0000; }
   .cx-soc.dc{ background:#5865F2; }
   .cx-soc:hover{ filter:brightness(1.12); }
+  /* no-key (open gateway) providers */
+  .card.nokey .key-form, .card.nokey .key-warn{ display:none; }
+  .nokey-note{ font-size:12.5px; color:var(--accent); background:var(--accent-soft);
+    border:1px solid rgba(34,197,94,.25); border-radius:var(--radius-sm); padding:7px 10px; }
+  .prov-cat-h.open .pc-t{ color:var(--accent); }
 </style>
 </head>
 <body>
@@ -2332,6 +2337,7 @@
           '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>' +
           'Get a free key</a>' : '') +
       savedKeysHTML +
+      (p.no_key ? '<div class="nokey-note">&#10003; No API key needed — this gateway works instantly.</div>' : '') +
       '<form class="keyrow key-form">' +
         '<div class="kwrap">' +
           '<input type="password" class="key-input" placeholder="' + esc(p.key_hint || (keys.length ? 'paste another key to add' : 'paste API key')) + '" autocomplete="off" spellcheck="false" aria-label="Add an API key for ' + esc(p.name || p.id) + '">' +
@@ -2372,7 +2378,7 @@
     }
     function renderCard(p){
       var card = document.createElement('div');
-      card.className = 'card' + (p.enabled ? ' enabled' : '');
+      card.className = 'card' + (p.enabled ? ' enabled' : '') + (p.no_key ? ' nokey' : '');
       card.dataset.pid = p.id;
       card.innerHTML = cardHTML(p);
       wireCard(card, p);
@@ -2388,8 +2394,10 @@
     // Two categories: free/trial providers first, then a "Paid APIs" section
     // (bring-your-own paid key: Anthropic / OpenAI / Kimi / …). Ungrouped while
     // searching would be confusing, so the split is kept even under a query.
-    var freeG = shown.filter(function(p){ return !p.paid; });
-    var paidG = shown.filter(function(p){ return p.paid; });
+    var openG = shown.filter(function(p){ return p.no_key; });
+    var freeG = shown.filter(function(p){ return !p.no_key && !p.paid; });
+    var paidG = shown.filter(function(p){ return !p.no_key && p.paid; });
+    if (openG.length){ catHeader('open', 'No key needed', openG.length + ' — open gateways, work instantly'); openG.forEach(renderCard); }
     if (freeG.length){ catHeader('', 'Free providers', freeG.length + ' — no cost, just add a key'); freeG.forEach(renderCard); }
     if (paidG.length){ catHeader('paid', 'Paid APIs', paidG.length + ' — optional: bring your own paid key'); paidG.forEach(renderCard); }
   }
