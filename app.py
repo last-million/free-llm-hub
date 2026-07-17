@@ -2912,6 +2912,45 @@ def api_agent_send_message(session_id):
     return jsonify({"status": status, "text": text, "detail": detail}), status
 
 
+@app.route("/api/agent/sessions/<session_id>/message/stream", methods=["POST"])
+def api_agent_send_message_stream(session_id):
+    """Live version of the message route: relays agentic_chat.send_message_stream's
+    normalized progress events over SSE so the dashboard shows the agent working in
+    real time. Records the user turn up front and the agent's final reply on done."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("text"), str):
+        return jsonify({"error": "Pass {\"text\": string}."}), 400
+    text = body["text"]
+    sess_info = agentic_chat.get_session(session_id)
+    if sess_info:
+        agentic_history.record_turn(session_id, sess_info["cli"], sess_info["project_dir"],
+                                    "user", text)
+
+    def gen():
+        final_reply = None
+        try:
+            for ev in agentic_chat.send_message_stream(session_id, text):
+                if ev.get("event") == "done":
+                    final_reply = ev.get("text")
+                yield "data: " + json.dumps(ev) + "\n\n"
+        except Exception as exc:  # never leak a traceback into the stream
+            yield "data: " + json.dumps({"event": "error", "status": 500,
+                                         "detail": _sanitize(str(exc), 300)}) + "\n\n"
+        finally:
+            if sess_info and final_reply:
+                try:
+                    agentic_history.record_turn(session_id, sess_info["cli"],
+                                                sess_info["project_dir"], "agent", final_reply)
+                except Exception:
+                    pass
+            yield "event: end\ndata: {}\n\n"
+
+    return Response(stream_with_context(gen()), mimetype="text/event-stream", headers=_SSE_HEADERS)
+
+
 @app.route("/api/agent/sessions/<session_id>/stop", methods=["POST"])
 def api_agent_stop_session(session_id):
     stopped = agentic_chat.stop_session(session_id)
