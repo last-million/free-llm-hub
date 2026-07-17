@@ -2963,6 +2963,21 @@ def api_agent_end_session(session_id):
     return jsonify({"ended": ended})
 
 
+@app.route("/api/agent/new-project", methods=["POST"])
+def api_agent_new_project():
+    """One-click 'Create new project': auto-create a fresh uniquely-named folder
+    under ~/calvoun-projects and return its path, so the dashboard can fill it in
+    and the user just clicks Start session."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    try:
+        path = agentic_chat.new_project_dir()
+    except OSError as exc:
+        return jsonify({"error": "Could not create a new project folder: %s" % exc.__class__.__name__}), 500
+    return jsonify({"path": path})
+
+
 # ---------------------------------------------------------------------------
 # Agentic chat -- persisted conversation history + rewind checkpoints.
 # None of these five routes call _agent_gate(): they never touch a live CLI
