@@ -5019,14 +5019,26 @@ def api_cli_instructions(cid):
 @app.route("/v1/models", methods=["GET"])
 def v1_models():
     agg = aggregated_models()
-    data = [{"id": m["id"], "object": "model", "created": 0, "owned_by": m["provider"]}
-            for m in agg]
-    # Also expose a `models` array (id + slug). Some clients (e.g. Codex's model
-    # manager) expect that field and log a decode error against the OpenAI-only
-    # {data:[...]} shape. Additive — OpenAI clients keep reading `data`.
-    models = [{"id": m["id"], "slug": m["id"], "object": "model",
-               "owned_by": m["provider"]} for m in agg]
-    return jsonify({"object": "list", "data": data, "models": models})
+    return jsonify({"object": "list",
+                    "data": [_codex_model_entry(m) for m in agg],
+                    "models": [dict(_codex_model_entry(m), slug=m["id"]) for m in agg]})
+
+
+# Model row for /v1/models. `display_name` is additive and harmless for every
+# client. We deliberately do NOT try to mirror Codex's full, strict model-manager
+# schema (reasoning-effort presets, capability structs, ...): it changes across
+# Codex versions, so chasing it here would break on every Codex update. Codex is
+# therefore best pointed at its NATIVE subscription for the agentic Chat CLI (the
+# hub's free models remain great for the Chat/Test playground + general CLI use,
+# which use /v1/chat/completions and don't hit this strict schema).
+def _codex_model_entry(m):
+    return {
+        "id": m["id"],
+        "object": "model",
+        "created": 0,
+        "owned_by": m["provider"],
+        "display_name": m["id"],
+    }
 
 
 _MISSING = object()  # sentinel: "no pre-read first item" for the peeked streamers
