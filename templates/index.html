@@ -959,6 +959,18 @@
     body.cx-on main.wrap > section.section.cx-active{ animation:none; }
     .cx-sidebar{ transition:none; }
   }
+  /* Chat CLI live terminal */
+  .agent-term{ font-family:var(--mono); font-size:12px; line-height:1.5; background:#080b14;
+    border:1px solid var(--border-soft); border-radius:8px; padding:8px 10px; margin:4px 0 8px;
+    max-height:340px; overflow:auto; }
+  .agent-term-line{ white-space:pre-wrap; word-break:break-word; padding:1px 0; color:var(--text-dim); }
+  .agent-term-line.run{ color:var(--text); display:flex; align-items:center; gap:6px; }
+  .agent-term-line.tool{ color:var(--neon-cyan); }
+  .agent-term-line.out{ color:var(--text-faint); }
+  .agent-term-line.notice{ color:var(--warn); }
+  .agent-term-line.err{ color:var(--danger); }
+  .agent-term-line.done{ color:var(--accent); }
+  .agent-answer{ white-space:pre-wrap; word-break:break-word; }
 </style>
 </head>
 <body>
@@ -3826,9 +3838,7 @@
     }
 
     function doSend(){
-      // Re-entrancy guard — same pattern as chat playground's sendChat()/image
-      // generator's generate(): check the button's OWN disabled state at the top,
-      // not a separate flag that can drift out of sync with it.
+      // Re-entrancy guard — same pattern as chat playground's sendChat().
       if (sendBtn.disabled) return;
       if (!sessionId) return;
       var text = textEl.value.trim();
@@ -3839,36 +3849,68 @@
 
       var asstEl = appendAgentBubble('assistant', 'Agent', '');
       var bubble = asstEl.querySelector('.bubble');
-      bubble.innerHTML = SPIN_SVG + ' Agent is working… this can take a few minutes <span class="agent-elapsed">(0s)</span>';
+      bubble.textContent = '';
+      var term = document.createElement('div'); term.className = 'agent-term';
+      var ans = document.createElement('div'); ans.className = 'agent-answer';
+      bubble.appendChild(term); bubble.appendChild(ans);
+      var head = document.createElement('div'); head.className = 'agent-term-line run';
+      head.innerHTML = SPIN_SVG + ' <span>running…</span> <span class="agent-elapsed">(0s)</span>';
+      term.appendChild(head);
       var elapsedStart = Date.now();
       var elapsedTimer = setInterval(function(){
-        var el = bubble.querySelector('.agent-elapsed');
-        if (!el){ clearInterval(elapsedTimer); return; }
-        el.textContent = '(' + Math.round((Date.now() - elapsedStart) / 1000) + 's)';
+        var el = head.querySelector('.agent-elapsed');
+        if (el) el.textContent = '(' + Math.round((Date.now() - elapsedStart) / 1000) + 's)';
       }, 1000);
+      function line(cls, txt){
+        var d = document.createElement('div'); d.className = 'agent-term-line ' + (cls || '');
+        d.textContent = txt; term.appendChild(d);
+        term.scrollTop = term.scrollHeight; msgsEl.scrollTop = msgsEl.scrollHeight;
+      }
+      function handle(ev){
+        if (!ev || !ev.event) return;
+        if (ev.event === 'tool') line('tool', '▸ ' + ev.text);
+        else if (ev.event === 'output') line('out', ev.text);
+        else if (ev.event === 'notice') line('notice', ev.text);
+        else if (ev.event === 'message'){ finalText = ev.text; ans.textContent = ev.text; msgsEl.scrollTop = msgsEl.scrollHeight; }
+        else if (ev.event === 'done'){ finalText = ev.text || finalText; ans.textContent = finalText || '(done)'; }
+        else if (ev.event === 'stopped') line('notice', 'Stopped.');
+        else if (ev.event === 'error'){ asstEl.className = 'msg assistant error'; line('err', ev.detail || 'error'); }
+      }
 
       setBusy(true);
-      api('/api/agent/sessions/' + encodeURIComponent(sessionId) + '/message', { method: 'POST', body: { text: text } })
-        .then(function(r){
-          // api() rejects on any non-2xx HTTP status (it throws using j.error/
-          // j.detail/j.message before resolving) -- the /message route always
-          // returns HTTP status === body.status, so this .then() is ONLY ever
-          // reached for a real 200 success. The failure path below (.catch) is
-          // where every non-200 status (400/403/404/409/499/502/504) lands,
-          // already carrying the right message via j.detail.
-          r = r || {};
-          clearInterval(elapsedTimer);
-          bubble.textContent = r.text || '(empty response)';
-          checkpointBtn.disabled = false;
-          var artifactHtml = extractArtifactHTML(r.text);
-          if (artifactHtml) addArtifactButton(asstEl, artifactHtml);
+      var finalText = '';
+      var headers = { 'Content-Type': 'application/json', 'X-Free-LLM-Hub': 'dashboard' };
+      var tok = (window.HUB_CONTROL_TOKEN || '');
+      if (tok) headers['X-Free-LLM-Hub-Token'] = tok;
+
+      fetch('/api/agent/sessions/' + encodeURIComponent(sessionId) + '/message/stream',
+            { method: 'POST', headers: headers, body: JSON.stringify({ text: text }) })
+        .then(function(resp){
+          if (!resp.ok || !resp.body) throw new Error('stream failed (HTTP ' + resp.status + ')');
+          var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '';
+          function pump(){
+            return reader.read().then(function(res){
+              if (res.done) return;
+              buf += dec.decode(res.value, { stream: true });
+              var parts = buf.split('\n\n'); buf = parts.pop();
+              parts.forEach(function(block){
+                block.split('\n').forEach(function(ln){
+                  ln = ln.replace(/^data:\s?/, '');
+                  if (!ln || ln === '{}' || ln.indexOf('event:') === 0) return;
+                  try { handle(JSON.parse(ln)); } catch (e) {}
+                });
+              });
+              return pump();
+            });
+          }
+          return pump();
         })
-        .catch(function(e){
-          clearInterval(elapsedTimer);
-          asstEl.className = 'msg assistant error';
-          bubble.textContent = String((e && e.message) || e);
-        })
+        .catch(function(e){ asstEl.className = 'msg assistant error'; line('err', String((e && e.message) || e)); })
         .then(function(){
+          clearInterval(elapsedTimer);
+          head.className = 'agent-term-line done'; head.textContent = '✓ finished';
+          if (finalText){ var art = extractArtifactHTML(finalText); if (art) addArtifactButton(asstEl, art); }
+          checkpointBtn.disabled = false;
           setBusy(false);
           msgsEl.scrollTop = msgsEl.scrollHeight;
           refreshSessionInfo();
