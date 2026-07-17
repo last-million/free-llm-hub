@@ -521,6 +521,26 @@ def start_session(cli_id, project_dir, create_new=False) -> str:
     return sess.id
 
 
+def new_project_dir():
+    """Create a fresh, uniquely-named empty project folder under
+    ~/calvoun-projects and return its absolute path -- powers the dashboard's
+    one-click "Create new project" (auto-name + auto-create, no typing). Retries
+    on a name clash; OSError (e.g. permission) propagates to the caller."""
+    import time
+    base = os.path.join(os.path.expanduser("~"), "calvoun-projects")
+    os.makedirs(base, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for i in range(1, 100):
+        name = "project-%s" % stamp if i == 1 else "project-%s-%d" % (stamp, i)
+        path = os.path.join(base, name)
+        if not os.path.exists(path):
+            os.makedirs(path)
+            return path
+    path = os.path.join(base, "project-%s-%x" % (stamp, abs(hash(stamp)) & 0xffff))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 # Claude Code CLI --model alias (confirmed via a live WebFetch against the
 # current code.claude.com/docs/en/cli-reference: --model accepts the aliases
 # sonnet|opus|haiku|fable, or a full model name). We deliberately pin "opus",

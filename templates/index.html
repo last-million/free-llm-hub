@@ -3697,7 +3697,27 @@
         : 'Absolute path for the NEW project folder (created for you), e.g. C:\\Users\\you\\projects\\my-app';
     }
     modeExistingBtn.addEventListener('click', function(){ setDirMode('existing'); });
-    modeNewBtn.addEventListener('click', function(){ setDirMode('new'); });
+    // "Create new project" = one click: auto-create a fresh folder, fill its path,
+    // and switch to 'existing' (the folder now exists) so Start session just works.
+    modeNewBtn.addEventListener('click', function(){
+      if (modeNewBtn.disabled) return;
+      setDirMode('new');
+      modeNewBtn.disabled = true;
+      var lbl = modeNewBtn.textContent;
+      modeNewBtn.textContent = 'Creating…';
+      api('/api/agent/new-project', { method: 'POST' })
+        .then(function(r){
+          r = r || {};
+          if (r.path){
+            dirInput.value = r.path;
+            setDirMode('existing');   // folder exists now -> Start uses it directly
+            setStartResult(true, 'New project created: ' + r.path + ' — now click Start session.');
+            loadRecentProjects();
+          }
+        })
+        .catch(function(e){ toast('Create project: ' + ((e && e.message) || e), true); })
+        .then(function(){ modeNewBtn.disabled = false; modeNewBtn.textContent = lbl; });
+    });
 
     function loadRecentProjects(){
       api('/api/agent/recent-projects').then(function(r){
