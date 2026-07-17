@@ -2132,6 +2132,7 @@ def _provider_row(pid, live_models=False):
         "notes": p.get("notes") or "",
         "paid": bool(p.get("paid")),
         "trial": bool(p.get("trial")),
+        "no_key": bool(p.get("no_key")),   # open gateway: usable with NO api key
         "free_models": provider_free_models(pid, live=live_models),
     }
 
