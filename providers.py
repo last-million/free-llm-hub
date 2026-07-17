@@ -75,6 +75,14 @@ PROVIDERS: Dict[str, dict] = {
             "qwen/qwen3-coder:free",
             "nousresearch/hermes-3-llama-3.1-405b:free",
         ],
+        # IMAGE GENERATION — PAID, "free": False so it never enters auto image
+        # routing (see _image_candidates() in app.py): reachable only via an
+        # explicit "openrouter/<id>" pin. Billed against the same paid credits
+        # as any non-':free' chat model on this key.
+        "image_models": [
+            {"id": "bytedance-seed/seedream-4.5", "label": "Seedream 4.5",
+             "text_in_image": "excellent", "free": False},
+        ],
         "notes": "One key unlocks many models. Free = ids ending ':free' (always free, never billed against credits). 50 req/day TOTAL across all free models (1,000/day after a one-time $10 top-up).",
     },
     "groq": {
@@ -245,6 +253,15 @@ PROVIDERS: Dict[str, dict] = {
         "free_filter": "family",
         "free_families": ["openai-fast"],
         "default_free_models": ["openai-fast"],
+        # IMAGE GENERATION — separate anonymous GET-URL image API (NOT chat),
+        # image.pollinations.ai/prompt/{prompt}, no key required. Only the two
+        # genuinely-free models are listed; nanobanana/gptimage/seedream need
+        # paid Pollen credits and are deliberately excluded so "free" stays true
+        # (cross-checked against the shipped SEO Quantum Pro image registry).
+        "image_models": [
+            {"id": "flux", "label": "FLUX", "text_in_image": "medium"},
+            {"id": "turbo", "label": "Turbo", "text_in_image": "medium"},
+        ],
         "notes": ("Anonymous tier: NO key, NO signup, NO card. LIVE-VERIFIED — POST "
                   "text.pollinations.ai/openai/chat/completions returns 200 with "
                   "user_tier:anonymous, served by openai-fast (GPT-OSS 20B). Leak test "
@@ -346,6 +363,25 @@ PROVIDERS: Dict[str, dict] = {
         # Multimodal routing is deliberately fail-closed. Only image-capable
         # chat ids that were verified end-to-end belong in this exact list.
         "vision_models": ["@cf/meta/llama-4-scout-17b-16e-instruct"],
+        # IMAGE GENERATION (text-to-image, not chat). Separate REST surface from
+        # the OpenAI-compat chat path: POST .../accounts/{account_id}/ai/run/{id}
+        # (native Cloudflare shape, not /chat/completions). Ids cross-verified
+        # against the already-shipped, production Cloudflare image path in the
+        # main SEO Quantum Pro app (services/image_provider_registry.py +
+        # image_generation_service.py) rather than re-derived from scratch.
+        # Shares the SAME 10k-Neurons/day budget as chat — quota.record("cloudflare", ...)
+        # is deliberately reused as-is (not a separate image quota) because the
+        # underlying account-level budget really is one shared pool.
+        "image_models": [
+            {"id": "@cf/black-forest-labs/flux-1-schnell", "label": "FLUX.1 Schnell",
+             "text_in_image": "medium", "notes": "fast 4-step, short text only"},
+            {"id": "@cf/bytedance/stable-diffusion-xl-lightning", "label": "SDXL Lightning",
+             "text_in_image": "poor"},
+            {"id": "@cf/stabilityai/stable-diffusion-xl-base-1.0", "label": "Stable Diffusion XL",
+             "text_in_image": "poor"},
+            {"id": "@cf/lykon/dreamshaper-8-lcm", "label": "DreamShaper 8 LCM",
+             "text_in_image": "poor"},
+        ],
         "notes": ("SAFE-FREE: 10,000 Neurons/day, reset 00:00 UTC. On the Workers FREE plan "
                   "the allocation is a HARD CAP — exceeding it fails with an error, it does "
                   "NOT bill (Workers Paid bills $0.011/1k Neurons past it). Free plan is the "
@@ -436,6 +472,17 @@ PROVIDERS: Dict[str, dict] = {
         "vision_models": [
             "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
             "gemini-2.5-pro", "gemini-2.0-flash", "gemma-4-31b-it",
+        ],
+        # IMAGE GENERATION — PAID, "free": False so these never enter auto image
+        # routing (see _image_candidates() in app.py's per-model "free" filter):
+        # reachable only via an explicit "google/<id>" pin. Google's own
+        # pricing page confirms no free tier for image generation (2026-07).
+        "image_models": [
+            {"id": "gemini-3.1-flash-image", "label": "Nano Banana 2",
+             "text_in_image": "excellent", "free": False,
+             "notes": "PAID -- Google's own pricing page confirms no free tier for image generation (verified 2026-07)."},
+            {"id": "gemini-3-pro-image-preview", "label": "Nano Banana Pro",
+             "text_in_image": "excellent", "free": False},
         ],
         "notes": ("Free tier = Flash family + Gemma + 2.5-Pro. Best free VISION in the fleet "
                   "(verified: all 6 read text from an image). ⚠ gemini-2.5-flash and "
@@ -693,6 +740,19 @@ PROVIDERS: Dict[str, dict] = {
             "Qwen/Qwen3-235B-A22B-Instruct-2507", "ZhipuAI/GLM-5",
             "Qwen/Qwen3-Next-80B-A3B-Instruct", "moonshotai/Kimi-K2.5",
             "deepseek-ai/DeepSeek-V3.2", "MiniMax/MiniMax-M2.5", "Qwen/Qwen3-32B",
+        ],
+        # IMAGE GENERATION — bespoke async endpoint, NOT the OpenAI-compat chat
+        # path: POST /v1/images/generations with X-ModelScope-Async-Mode:true
+        # returns a task_id; poll /v1/tasks/{id} until SUCCEED. Same 2,000
+        # calls/day account budget as chat, so no separate quota tracking.
+        # Ids/shape cross-verified against the shipped SEO Quantum Pro image
+        # path (services/image_generation_service.py generate_images_with_modelscope).
+        "image_models": [
+            {"id": "Qwen/Qwen-Image", "label": "Qwen-Image", "text_in_image": "excellent",
+             "notes": "best open model for EN+CN typography"},
+            {"id": "Tongyi/Z-Image-Turbo", "label": "Z-Image Turbo", "text_in_image": "excellent"},
+            {"id": "black-forest-labs/FLUX.1-dev", "label": "FLUX.1 Dev", "text_in_image": "good"},
+            {"id": "black-forest-labs/FLUX.1-schnell", "label": "FLUX.1 Schnell", "text_in_image": "medium"},
         ],
         "notes": "Free 2,000 API calls/day per account (500/model/day; some large models ~100/day), resets 00:00 UTC+8, no rollover. Signup needs an Alibaba Cloud account (KYC).",
     },
@@ -969,6 +1029,72 @@ PROVIDERS: Dict[str, dict] = {
     "302ai": {"name": "302.AI", "base_url": "https://api.302.ai/v1",
         "models_url": "https://api.302.ai/v1/models", "signup_url": "https://dash.302.ai",
         "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Multi-model aggregator. Paid."},
+    # ── PAID image-generation-only providers (opt-in, explicit "<pid>/<model>"
+    # pin ONLY — every image_models row here carries "free": False, which keeps
+    # them out of _image_candidates()'s auto/manual rotation exactly like the
+    # paid chat providers above). No default_free_models/chat models: these
+    # rows exist purely to carry an image_models list.
+    "openai": {
+        "name": "OpenAI (GPT Image)",
+        "base_url": "https://api.openai.com/v1",
+        "models_url": None,
+        "signup_url": "https://platform.openai.com/api-keys",
+        "key_hint": "sk-...",
+        "paid": True,
+        "free_filter": "pricing_zero",
+        "default_free_models": [],
+        "image_models": [
+            {"id": "gpt-image-1.5", "label": "GPT Image 1.5", "text_in_image": "excellent", "free": False},
+            {"id": "gpt-image-2", "label": "GPT Image 2", "text_in_image": "excellent", "free": False},
+        ],
+        "notes": "OpenAI's real Images API (gpt-image family). Paid, pay-as-you-go. Near pixel-perfect typography.",
+    },
+    "higgsfield": {
+        "name": "Higgsfield AI",
+        "base_url": "https://platform.higgsfield.ai",
+        "models_url": None,
+        "signup_url": "https://cloud.higgsfield.ai/api-keys",
+        "key_hint": "KEY_ID:KEY_SECRET (paste both, colon-separated, e.g. abc123:def456)",
+        "paid": True,
+        "free_filter": "pricing_zero",
+        "default_free_models": [],
+        "image_models": [
+            {"id": "higgsfield/text2image/soul", "label": "Higgsfield Soul 2.0", "text_in_image": "good", "free": False},
+            {"id": "flux-pro/kontext/max/text-to-image", "label": "Flux Pro Kontext", "text_in_image": "good", "free": False},
+            {"id": "bytedance/seedream/v4/text-to-image", "label": "Seedream 4 (Higgsfield)", "text_in_image": "excellent", "free": False},
+            {"id": "higgsfield/nano-banana-pro", "label": "Nano Banana Pro (Higgsfield)", "text_in_image": "excellent", "free": False},
+        ],
+        "notes": "Bespoke API (not OpenAI-compatible). Composite credential: paste as KEY_ID:KEY_SECRET in the single key field. Async submit-then-poll. IMAGE ONLY -- this hub does not do video generation.",
+    },
+    "aiand": {
+        "name": "AIAND",
+        # CONFIRMED live 2026-07-17 (docs.aiand.com code samples + a real,
+        # unauthenticated request to the endpoint itself -- api.aiand.com
+        # returned a proper OpenAI-shaped {"error":{"message","type","param",
+        # "code":"invalid_api_key"}} for GET /v1/models with no key, and the
+        # bare host returned {"error":{"message":"Not found. Use
+        # /v1/chat/completions, /v1/completions, /v1/responses, or
+        # /v1/models",...}} -- confirms both the base URL and genuine OpenAI
+        # compatibility). Model ids look vendor-prefixed (docs example:
+        # "openai/gpt-oss-120b"), suggesting a multi-provider router similar
+        # to OpenRouter.
+        # NOT CONFIRMED: exact free-tier terms/limits and which specific
+        # models are actually free vs. credit-metered -- the marketing site is
+        # a JS-rendered SPA (curl got the raw HTML, no "free"/"credit" text
+        # anywhere in it; the claim comes from the user, not hub research).
+        # free_filter:"all" is a placeholder until a real key is tested here --
+        # use the dashboard's Test button once a key is saved to see the REAL
+        # live model list, and treat any specific model as free only after
+        # confirming it actually answers (same discipline as every other
+        # provider in this file: probe, don't infer a free tier from a page).
+        "base_url": "https://api.aiand.com/v1",
+        "models_url": "https://api.aiand.com/v1/models",
+        "signup_url": "https://console.aiand.com/api-keys",
+        "key_hint": "sk-...",
+        "free_filter": "all",
+        "default_free_models": [],
+        "notes": "UNVERIFIED free-tier terms (base URL + OpenAI-compatibility ARE confirmed live). Says it gives free model credits per the user, not yet independently confirmed which models. Save a key, then hit Test to see the real live catalog.",
+    },
     "custom": {
         "name": "Custom (OpenAI-compatible)",
         "base_url": None,  # user supplies via per-provider config base_url
