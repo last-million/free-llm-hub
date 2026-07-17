@@ -2257,9 +2257,14 @@
     var keys = Array.isArray(p.keys) ? p.keys : [];
     var kc = (typeof p.key_count === 'number') ? p.key_count : keys.length;
     var badges = '';
+    var fmCount = Array.isArray(p.free_models) ? p.free_models.length : 0;
+    // Additive badges: a provider can be BOTH — show `free` whenever it exposes
+    // free models, AND `paid` when it has a paid tier, so users can see a paid
+    // provider still has free models available.
+    if (fmCount) badges += '<span class="badge free">free</span>';
     if (p.paid) badges += '<span class="badge paid">paid</span>';
-    else if (p.trial) badges += '<span class="badge trial">trial</span>';
-    else badges += '<span class="badge free">free</span>';
+    if (p.trial) badges += '<span class="badge trial">trial</span>';
+    if (!fmCount && !p.paid && !p.trial) badges += '<span class="badge free">free</span>';
     if (p.has_key) badges += '<span class="badge keyed">' + kc + ' key' + (kc > 1 ? 's' : '') + ' saved</span>';
 
     var savedKeysHTML = '';
