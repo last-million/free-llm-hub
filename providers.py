@@ -1029,13 +1029,28 @@ PROVIDERS: Dict[str, dict] = {
     "302ai": {"name": "302.AI", "base_url": "https://api.302.ai/v1",
         "models_url": "https://api.302.ai/v1/models", "signup_url": "https://dash.302.ai",
         "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Multi-model aggregator. Paid."},
+    "anthropic": {
+        "name": "Anthropic (Claude)",
+        # Anthropic's real API is POST /v1/messages (x-api-key + anthropic-version),
+        # NOT natively OpenAI-shaped. The hub posts {base_url}/chat/completions, so
+        # base_url points at Anthropic's OpenAI-compat endpoint (.../v1 -> /v1/chat/
+        # completions), NOT the bare host.
+        "base_url": "https://api.anthropic.com/v1",
+        "models_url": None,
+        "signup_url": "https://console.anthropic.com/settings/keys",
+        "key_hint": "sk-ant-...",
+        "paid": True,
+        "free_filter": "pricing_zero",
+        "default_free_models": [],
+        "notes": "Anthropic Claude — PAID, pay-as-you-go. Reachable via Anthropic's OpenAI-compat endpoint; pin models as anthropic/claude-...",
+    },
     # ── PAID image-generation-only providers (opt-in, explicit "<pid>/<model>"
     # pin ONLY — every image_models row here carries "free": False, which keeps
     # them out of _image_candidates()'s auto/manual rotation exactly like the
     # paid chat providers above). No default_free_models/chat models: these
     # rows exist purely to carry an image_models list.
     "openai": {
-        "name": "OpenAI (GPT Image)",
+        "name": "OpenAI",
         "base_url": "https://api.openai.com/v1",
         "models_url": None,
         "signup_url": "https://platform.openai.com/api-keys",
@@ -1047,7 +1062,7 @@ PROVIDERS: Dict[str, dict] = {
             {"id": "gpt-image-1.5", "label": "GPT Image 1.5", "text_in_image": "excellent", "free": False},
             {"id": "gpt-image-2", "label": "GPT Image 2", "text_in_image": "excellent", "free": False},
         ],
-        "notes": "OpenAI's real Images API (gpt-image family). Paid, pay-as-you-go. Near pixel-perfect typography.",
+        "notes": "One OpenAI key does everything: TEXT via an openai/gpt-... pin (chat/completions) AND images via openai/gpt-image-2. Paid, pay-as-you-go.",
     },
     "higgsfield": {
         "name": "Higgsfield AI",
