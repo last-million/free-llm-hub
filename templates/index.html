@@ -30,6 +30,17 @@
     --radius-sm:8px;
   }
   *{box-sizing:border-box;margin:0;padding:0}
+  /* The plain HTML `hidden` attribute is a normal-priority UA-stylesheet rule
+     ([hidden]{display:none}), and normal AUTHOR declarations always beat normal
+     UA declarations in the cascade regardless of selector specificity — so any
+     element that ALSO carries its own `display:flex/grid/...` class rule (most
+     of this file's toggled panels do) silently ignores `el.hidden = true` and
+     stays visually visible despite the attribute being set (verified live: this
+     was already true for the pre-existing .agent-session container before this
+     pass touched it). One global !important override restores `hidden`'s real
+     semantics everywhere in this page, instead of hunting down and patching each
+     individual container's CSS one at a time. */
+  [hidden]{display:none !important}
   html{scrollbar-color:var(--surface-3) var(--bg)}
   body{
     background:var(--bg);
@@ -47,7 +58,7 @@
   ::placeholder{color:var(--text-faint)}
   :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
 
-  .wrap{max-width:1180px;margin:0 auto;padding:0 20px 80px}
+  .wrap{max-width:90%;margin:0 auto;padding:0 20px 80px}
 
   /* ---------- header ---------- */
   header{
@@ -56,7 +67,7 @@
     backdrop-filter:blur(12px);
     border-bottom:1px solid var(--border-soft);
   }
-  .hd{max-width:1180px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .hd{max-width:90%;margin:0 auto;padding:14px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
   .logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;letter-spacing:-.01em}
   .logo-mark{
     width:32px;height:32px;border-radius:9px;flex:none;
@@ -207,7 +218,7 @@
   .count-note{font-size:12.5px;color:var(--text-faint);white-space:nowrap}
 
   /* ---------- provider grid ---------- */
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
   .card{
     background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
     padding:16px;display:flex;flex-direction:column;gap:11px;min-width:0;
@@ -412,6 +423,54 @@
   .chat-send-col{display:flex;flex-direction:column;gap:8px;flex:none;width:98px}
   .chat-send-col .btn{width:100%}
 
+  /* ---------- image generation ---------- */
+  .image-panel{
+    background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
+    padding:16px;display:flex;flex-direction:column;gap:12px;
+  }
+  .image-priority-row{
+    display:flex;gap:9px;align-items:center;flex-wrap:wrap;
+    padding-bottom:12px;border-bottom:1px solid var(--border-soft);
+  }
+  .image-priority-row label{font-size:13px;font-weight:600;color:var(--text-dim)}
+  .image-priority-row select{min-width:240px;flex:1}
+  .image-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .image-bar select{min-width:160px}
+  .image-bar select#image-model{min-width:240px;flex:2}
+  .image-input-row{display:flex;gap:10px;align-items:stretch}
+  .image-input-row textarea{
+    flex:1;min-width:0;resize:vertical;min-height:56px;max-height:200px;
+    background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);
+    color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5;padding:10px 12px;
+    transition:border-color .18s ease;
+  }
+  .image-input-row textarea:focus{border-color:var(--accent);outline:none}
+  .image-input-row .btn{flex:none;align-self:stretch;min-width:110px}
+  .image-results{
+    display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;
+    min-height:120px;
+  }
+  .image-results.empty{display:flex;min-height:0}
+  .image-thumb{
+    padding:0;border:1px solid var(--border-soft);border-radius:var(--radius-sm);
+    overflow:hidden;background:var(--surface-2);cursor:zoom-in;aspect-ratio:1/1;display:block;
+    transition:border-color .18s ease;
+  }
+  .image-thumb:hover{border-color:var(--accent)}
+  .image-thumb img{width:100%;height:100%;object-fit:cover;display:block}
+  .image-history-head{
+    display:flex;align-items:center;justify-content:space-between;gap:10px;
+    margin-top:4px;padding-top:12px;border-top:1px solid var(--border-soft);
+  }
+  .image-thumb.history{position:relative}
+  .image-thumb .thumb-delete{
+    position:absolute;top:4px;right:4px;width:22px;height:22px;border-radius:50%;
+    background:rgba(0,0,0,.55);color:#fff;border:none;cursor:pointer;font-size:14px;line-height:1;
+    display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s ease;
+  }
+  .image-thumb.history:hover .thumb-delete{opacity:1}
+  .modal-image{max-width:100%;height:auto;display:block;border-radius:var(--radius-sm)}
+
   /* ---------- connected tools ---------- */
   .cli-list{display:flex;flex-direction:column;gap:10px}
   .cli-row{
@@ -485,6 +544,201 @@
   }
   .cli-missing-item .pid{font-family:var(--mono);font-size:11px}
 
+  /* ---------- local subscription providers (paid, opt-in) ---------- */
+  .sub-warning{
+    font-size:12px;line-height:1.6;color:var(--text-dim);background:var(--warn-soft);
+    border:1px solid rgba(245,158,11,.3);border-radius:var(--radius-sm);padding:11px 14px;margin-bottom:14px;
+  }
+  .sub-master-row{margin-bottom:14px}
+  .sub-mode-pill{
+    display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;
+    padding:3px 9px;border-radius:999px;background:var(--surface-3);color:var(--text-faint);white-space:nowrap;
+  }
+  .sub-mode-pill.iso{background:var(--accent-soft);color:var(--accent)}
+  .sub-card-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .sub-install-result{
+    width:100%;font-size:12px;line-height:1.5;border-radius:var(--radius-sm);
+    padding:8px 11px;display:none;align-items:flex-start;gap:7px;overflow-wrap:anywhere;
+  }
+  .sub-install-result.ok,.sub-install-result.err{display:flex}
+  .sub-install-result .tr-i{flex:none;font-weight:700;line-height:1.45}
+  .sub-install-result.ok{background:var(--accent-soft);color:#86efac;border:1px solid rgba(34,197,94,.25)}
+  .sub-install-result.err{background:var(--danger-soft);color:#fca5a5;border:1px solid rgba(239,68,68,.25)}
+  .sub-login-box{
+    margin-top:2px;padding-top:11px;border-top:1px solid var(--border-soft);
+    display:flex;flex-direction:column;gap:8px;
+  }
+
+  /* ---------- agentic chat (opt-in, full tool/file access) ----------
+     .agent-warning lives OUTSIDE .section-body in the markup (a sibling of
+     .section-h, not a child of the collapsible body) so the safety disclosure
+     stays visible even while the section is collapsed — see the note at its
+     usage site in <main>. */
+  .agent-warning{
+    font-size:12.5px;line-height:1.6;color:#fca5a5;background:var(--danger-soft);
+    border:1px solid rgba(239,68,68,.3);border-radius:var(--radius-sm);padding:11px 14px;margin-bottom:14px;
+  }
+  .agent-warning strong{color:#fff}
+  .agent-off-note{font-size:13px;color:var(--text-faint);padding:6px 2px}
+  .agent-start-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .agent-start-row select{min-width:170px;flex:none}
+  .agent-start-row input[type=text]{
+    flex:1;min-width:220px;background:var(--surface-2);border:1px solid var(--border);
+    border-radius:var(--radius-sm);color:var(--text);font-family:var(--mono);font-size:12.5px;
+    padding:8px 12px;transition:border-color .18s ease;
+  }
+  .agent-start-row input[type=text]:focus{border-color:var(--accent);outline:none}
+  .agent-start-result{
+    width:100%;font-size:12px;line-height:1.5;border-radius:var(--radius-sm);
+    padding:8px 11px;display:none;align-items:flex-start;gap:7px;overflow-wrap:anywhere;margin-top:10px;
+  }
+  .agent-start-result.ok,.agent-start-result.err{display:flex}
+  .agent-start-result .tr-i{flex:none;font-weight:700;line-height:1.45}
+  .agent-start-result.ok{background:var(--accent-soft);color:#86efac;border:1px solid rgba(34,197,94,.25)}
+  .agent-start-result.err{background:var(--danger-soft);color:#fca5a5;border:1px solid rgba(239,68,68,.25)}
+  .agent-session{display:flex;flex-direction:column;gap:12px;margin-top:14px}
+  .agent-session-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .agent-session-info{font-size:12.5px;color:var(--text-dim);font-family:var(--mono);overflow-wrap:anywhere}
+  .agent-session-bar .btn{margin-left:auto}
+
+  /* ---------- segmented control (workspace mode / session-history tabs) ---------- */
+  .seg-toggle{
+    display:inline-flex;gap:2px;background:var(--surface-2);border:1px solid var(--border-soft);
+    border-radius:999px;padding:3px;width:fit-content;margin-bottom:12px;
+  }
+  .seg-btn{
+    font:inherit;font-size:12.5px;font-weight:600;color:var(--text-faint);
+    background:none;border:0;border-radius:999px;padding:6px 14px;min-height:32px;
+    transition:background .15s ease,color .15s ease;
+  }
+  .seg-btn:hover{color:var(--text-dim)}
+  .seg-btn[aria-selected="true"]{background:var(--surface-3);color:var(--text)}
+  .seg-toggle.sm .seg-btn{padding:5px 11px;font-size:12px;min-height:28px}
+
+  /* ---------- CLI picker (Chat CLI) ---------- */
+  .agent-cli-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+  .agent-cli-row select{min-width:190px}
+  .agent-cli-note{font-size:12px;color:var(--text-faint);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .agent-cli-note.warn{color:var(--warn)}
+  .agent-cli-note .btn{flex:none}
+  select option:disabled{color:#5a6480}
+
+  /* ---------- recent folders chips ---------- */
+  .agent-recent-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .agent-recent-chips .chip{
+    font-family:var(--mono);font-size:11.5px;color:var(--text-dim);
+    background:var(--surface-2);border:1px solid var(--border-soft);border-radius:999px;
+    padding:4px 11px;min-height:26px;transition:border-color .15s ease,color .15s ease;
+  }
+  .agent-recent-chips .chip:hover{border-color:var(--accent);color:var(--text)}
+
+  /* ---------- history browser ---------- */
+  .agent-history-list{display:flex;flex-direction:column;gap:9px}
+  .ah-row{
+    background:var(--surface-2);border:1px solid var(--border-soft);border-radius:var(--radius-sm);
+    padding:11px 13px;display:flex;flex-direction:column;gap:6px;
+  }
+  .ah-top{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+  .ah-cli{font-weight:700;font-size:13px}
+  .ah-dir{font-family:var(--mono);font-size:11.5px;color:var(--text-faint);overflow-wrap:anywhere;word-break:break-all}
+  .ah-meta{font-size:11.5px;color:var(--text-faint);margin-left:auto;white-space:nowrap}
+  .ah-actions{display:flex;gap:8px;flex-wrap:wrap}
+  .ahv-bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+  .ahv-note{font-size:11.5px;color:var(--text-faint);line-height:1.5}
+  .ah-checkpoint-marker{
+    align-self:center;font-size:11px;font-weight:700;letter-spacing:.03em;color:var(--info);
+    background:var(--info-soft);border:1px dashed rgba(56,189,248,.4);border-radius:999px;
+    padding:4px 12px;margin:4px 0;
+  }
+
+  /* ---------- artifact render trigger + panel ---------- */
+  .artifact-render-btn{
+    margin-top:6px;font-size:11.5px;font-weight:700;letter-spacing:.02em;
+    background:var(--accent-soft);color:var(--accent);border:1px solid rgba(34,197,94,.3);
+    border-radius:999px;padding:5px 12px;min-height:28px;display:inline-flex;align-items:center;gap:6px;
+  }
+  .artifact-render-btn:hover{background:rgba(34,197,94,.2)}
+  .artifact-panel{
+    position:fixed;right:20px;bottom:20px;z-index:70;
+    width:min(560px,calc(100vw - 40px));height:420px;
+    background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    box-shadow:0 20px 60px rgba(0,0,0,.55);display:flex;flex-direction:column;overflow:hidden;
+    resize:both;min-width:320px;min-height:220px;
+  }
+  .artifact-panel.size-wide{width:min(920px,calc(100vw - 40px));height:460px}
+  .artifact-panel.size-tall{width:min(560px,calc(100vw - 40px));height:min(780px,calc(100vh - 40px))}
+  .artifact-panel.size-compact{width:420px;height:340px}
+  .artifact-panel.is-fullscreen{
+    position:fixed;inset:0;right:0;bottom:0;width:100vw;height:100dvh;
+    border-radius:0;resize:none;
+  }
+  .artifact-bar{
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:9px 11px;
+    border-bottom:1px solid var(--border-soft);background:var(--surface-2);flex:none;
+  }
+  .artifact-title{font-size:12px;font-weight:700;color:var(--text-dim);margin-right:auto}
+  .artifact-controls{display:flex;gap:6px;flex-wrap:wrap}
+  .artifact-controls .btn{padding:4px 9px;font-size:11.5px}
+  #artifact-frame{flex:1;width:100%;border:0;background:#fff}
+  .artifact-note{
+    flex:none;font-size:10.5px;line-height:1.5;color:var(--text-faint);
+    padding:6px 11px;border-top:1px solid var(--border-soft);background:var(--surface-2);
+  }
+
+  /* ---------- vision-gap hover badge ---------- */
+  .badge.warn-badge{
+    background:var(--warn-soft);color:var(--warn);border:1px solid rgba(245,158,11,.3);
+    font-size:11px;font-weight:700;letter-spacing:.02em;text-transform:none;
+    border-radius:999px;padding:4px 10px;cursor:default;
+  }
+  .vg-wrap{position:relative;display:inline-flex}
+  .vg-pop{
+    display:none;position:absolute;top:calc(100% + 8px);left:0;z-index:55;width:280px;
+    background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);
+    box-shadow:0 14px 34px rgba(0,0,0,.5);padding:12px 13px;font-size:12px;line-height:1.55;color:var(--text-dim);
+  }
+  .vg-wrap:hover .vg-pop,.vg-wrap:focus-within .vg-pop{display:block}
+  .vg-pop p{margin-bottom:8px}
+  .vg-pop ul{list-style:none;display:flex;flex-direction:column;gap:8px}
+  .vg-pop label{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--text-dim);cursor:pointer}
+
+  /* ---------- header settings entry + drawer ---------- */
+  .icon-btn{
+    display:inline-flex;align-items:center;gap:7px;min-height:34px;
+    background:var(--surface);border:1px solid var(--border-soft);color:var(--text-dim);
+    border-radius:999px;padding:6px 14px;font-size:12.5px;font-weight:600;
+    transition:border-color .15s ease,color .15s ease,background .15s ease;
+  }
+  .icon-btn:hover{color:var(--text);border-color:var(--border);background:var(--surface-2)}
+  .settings-drawer-scrim{
+    position:fixed;inset:0;z-index:88;background:rgba(4,7,13,.6);backdrop-filter:blur(2px);
+  }
+  .settings-drawer-scrim[hidden]{display:none}
+  .settings-drawer{
+    position:fixed;top:0;right:0;bottom:0;z-index:89;width:min(380px,100vw);
+    background:var(--surface);border-left:1px solid var(--border);
+    box-shadow:-20px 0 60px rgba(0,0,0,.5);display:flex;flex-direction:column;
+    animation:drawerin .22s ease;
+  }
+  .settings-drawer[hidden]{display:none}
+  @keyframes drawerin{from{transform:translateX(100%)}to{transform:translateX(0)}}
+  .settings-drawer-h{
+    display:flex;align-items:center;gap:10px;padding:16px 18px;border-bottom:1px solid var(--border-soft);
+    font-weight:700;font-size:15px;flex:none;
+  }
+  .settings-drawer-body{padding:18px;display:flex;flex-direction:column;gap:20px;overflow-y:auto}
+  .sd-group{display:flex;flex-direction:column;gap:7px;padding-bottom:18px;border-bottom:1px solid var(--border-soft)}
+  .sd-group:last-child{border-bottom:0;padding-bottom:0}
+  .sd-label{font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--text-dim)}
+  .sd-help{font-size:12px;color:var(--text-faint);line-height:1.5}
+  .sd-actions{display:flex;gap:8px;flex-wrap:wrap}
+
+  /* ---------- export/import modal contents ---------- */
+  .export-opts{display:flex;flex-direction:column;gap:9px}
+  .export-opts label{display:flex;align-items:center;gap:9px;font-size:13px;color:var(--text);cursor:pointer}
+  .export-opts .sep{height:1px;background:var(--border-soft);margin:2px 0}
+  .export-note{font-size:11.5px;color:var(--text-faint);line-height:1.5}
+
   /* ---------- live activity feed ---------- */
   .af-panel{background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);padding:16px}
   .af-empty{font-size:13px;color:var(--text-faint);padding:6px 2px}
@@ -550,7 +804,7 @@
   #exhaust-banner.show{display:block}
   #exhaust-banner.red{background:var(--danger);color:#fff;border-bottom-color:rgba(0,0,0,.28)}
   #exhaust-banner.amber{background:rgba(245,158,11,.14);color:#fcd34d;border-bottom-color:rgba(245,158,11,.38)}
-  #exhaust-banner .eb-inner{max-width:1180px;margin:0 auto;display:flex;align-items:baseline;gap:6px 16px;flex-wrap:wrap}
+  #exhaust-banner .eb-inner{max-width:90%;margin:0 auto;display:flex;align-items:baseline;gap:6px 16px;flex-wrap:wrap}
   #exhaust-banner .eb-msg{font-weight:700}
   #exhaust-banner .eb-list{font-weight:500;opacity:.95}
   #exhaust-banner .eb-list b{font-family:var(--mono);font-weight:700}
@@ -594,6 +848,30 @@
   .quota-row .qr-model .qm-count{flex:none;font-family:var(--mono);font-size:11.5px;color:var(--text-faint);white-space:nowrap}
   .quota-row .qr-models-empty{font-size:11.5px;color:var(--text-faint);font-style:italic}
 
+  /* ---------- daily usage ---------- */
+  .usage-panel{
+    background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
+    padding:16px;display:flex;flex-direction:column;gap:12px;
+  }
+  .usage-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .usage-bar label{font-size:13px;font-weight:600;color:var(--text-dim)}
+  .usage-summary{font-size:12.5px;color:var(--text-dim)}
+  .usage-empty{font-size:13px;color:var(--text-faint);padding:6px 2px}
+  .usage-list{display:flex;flex-direction:column;gap:7px}
+  .usage-row{
+    display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    background:var(--surface-2);border:1px solid var(--border-soft);
+    border-radius:var(--radius-sm);padding:9px 12px;
+  }
+  .usage-row .ur-id{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--text);min-width:150px;flex:1;overflow-wrap:anywhere;word-break:break-all}
+  .usage-row .ur-stat{font-family:var(--mono);font-size:11.5px;color:var(--text-faint);flex:none;white-space:nowrap}
+  .usage-row .ur-stat b{color:var(--text-dim);font-weight:700}
+  .usage-row .ur-total b{color:var(--accent)}
+  .usage-row .ur-approx{
+    font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.02em;
+    background:var(--info-soft);color:var(--info);border-radius:5px;padding:1px 6px;margin-left:2px;white-space:nowrap;
+  }
+
   @media (prefers-reduced-motion:reduce){
     *,*::before,*::after{animation-duration:.01ms !important;transition-duration:.01ms !important}
   }
@@ -608,6 +886,18 @@
   .chat-send-col .btn{flex:1}
     .lifecycle-row .group.media{margin-left:0;width:100%}
     .cli-actions{margin-left:0;width:100%}
+    .image-bar select{min-width:0}
+    .image-input-row{flex-direction:column}
+    .image-input-row .btn{width:100%}
+    .usage-bar select{min-width:0;flex:1}
+    .agent-start-row{flex-direction:column;align-items:stretch}
+    .agent-start-row input[type=text]{min-width:0}
+    .agent-session-bar .btn{margin-left:0}
+    .agent-cli-row select{min-width:0;width:100%}
+    .artifact-panel{left:10px;right:10px;bottom:10px;width:auto !important;max-width:none}
+    .settings-drawer{width:100vw}
+    .icon-btn span{display:none}
+    .vg-pop{left:auto;right:0;width:min(280px,calc(100vw - 40px))}
   }
 </style>
 </head>
@@ -628,9 +918,48 @@
       <span class="pill" id="pill-default"><span class="dot"></span>default: &hellip;</span>
       <span class="pill" id="pill-auth"><span class="dot"></span>gateway auth: &hellip;</span>
       <span class="pill byline">made by <strong>Last-Million</strong> from Calvoun</span>
+      <button class="icon-btn" id="settings-drawer-open" type="button" aria-haspopup="dialog" aria-controls="settings-drawer" aria-label="Open settings">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
+        <span>Settings</span>
+      </button>
     </div>
   </div>
 </header>
+
+<div class="settings-drawer-scrim" id="settings-drawer-scrim" hidden></div>
+<aside class="settings-drawer" id="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="settings-drawer-title" hidden>
+  <div class="settings-drawer-h">
+    <span id="settings-drawer-title">Settings</span>
+    <button class="modal-close" id="settings-drawer-close" type="button" aria-label="Close settings">&times;</button>
+  </div>
+  <div class="settings-drawer-body">
+    <div class="sd-group">
+      <label class="switch" title="Connect or disconnect all installed compatible CLIs as one transaction">
+        <input id="drawer-hub-mode-switch" type="checkbox" aria-label="Enable all CLI's">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Enable all CLI&rsquo;s</span>
+      </label>
+      <p class="sd-help">Connects every compatible installed CLI to this hub together, in one step.</p>
+    </div>
+    <div class="sd-group">
+      <label class="switch" title="Let the agent use its own tool access (e.g. Playwright) to test and verify its work this session">
+        <input id="drawer-test-verification-switch" type="checkbox" aria-label="Test-and-verification mode">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Test-and-verification mode</span>
+      </label>
+      <p class="sd-help">Tells the Chat CLI agent that testing/debugging its own work with tools like Playwright is expected this session.</p>
+    </div>
+    <div class="sd-group">
+      <div class="sd-label">Backup &amp; restore</div>
+      <div class="sd-actions">
+        <button class="btn sm" id="settings-export-open" type="button">Export settings&hellip;</button>
+        <button class="btn sm ghost" id="settings-import-open" type="button">Import settings&hellip;</button>
+      </div>
+      <input type="file" id="settings-import-file" accept="application/json" hidden>
+      <p class="sd-help">A portable JSON backup of your provider keys and hub settings &mdash; stays on this machine.</p>
+    </div>
+  </div>
+</aside>
 
 <main class="wrap">
 
@@ -647,8 +976,8 @@
       <div class="lifecycle-row">
         <div class="group">
           <label class="switch" title="Connect or disconnect all installed compatible CLIs as one transaction">
-            <input id="hub-mode-switch" type="checkbox" aria-label="Hub mode">
-            <span class="track"></span><span class="lbl">Hub mode</span>
+            <input id="hub-mode-switch" type="checkbox" aria-label="Enable all CLI's">
+            <span class="track"></span><span class="lbl">Enable all CLI's</span>
           </label>
           <span id="hub-mode-label" class="current-default">loading&hellip;</span>
         </div>
@@ -659,7 +988,8 @@
           </select>
           <button class="btn sm" id="media-save" type="button">Save</button>
         </div>
-        <button class="btn danger sm" id="hub-stop" type="button">Stop hub</button>
+        <button class="btn sm" id="hub-stop" type="button" title="Disconnect all CLIs and stop being the default LLM — the local server keeps running">Stop being default (disconnect CLIs)</button>
+        <button class="btn danger sm" id="hub-shutdown" type="button" title="Fully shut down the local hub server and free the port">Shut down server</button>
         <div id="lifecycle-detail" class="lifecycle-detail" role="status">Loading lifecycle state&hellip;</div>
       </div>
     </div>
@@ -716,22 +1046,154 @@
     </div>
   </section>
 
+  <!-- Local subscription providers (paid, opt-in last-resort tier) -->
+  <section class="section" aria-labelledby="h-subs">
+    <div class="section-h">
+      <h2 id="h-subs"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-subs">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Local subscriptions
+      </button></h2>
+      <span class="sub">use your PAID Claude Code / ChatGPT Codex plan as a last-resort tier &mdash; opt-in, off by default</span>
+      <span class="sec-chip" id="chip-subs" hidden></span>
+    </div>
+    <div class="section-body" id="sec-subs" hidden>
+      <div class="sub-warning" id="sub-warning">Loading&hellip;</div>
+      <div class="sub-master-row">
+        <label class="switch" title="Master opt-in — every provider below is a no-op while this is off">
+          <input id="sub-master-switch" type="checkbox">
+          <span class="track" aria-hidden="true"></span>
+          <span class="lbl">Use local subscriptions</span>
+        </label>
+      </div>
+      <div class="cli-grid" id="sub-list" aria-live="polite">
+        <div class="empty">Loading&hellip;</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Agentic chat: runs the user's own Claude Code / Codex subscription as a real coding
+       agent (full file + shell tool access) against a project folder on disk. Distinct
+       from "Local subscriptions" above (that's a stateless orchestration fallback) and
+       from "Chat / Test" below (that's a stateless free-model text completion) — this is
+       a stateful, high-permission session, so it gets its own master switch and its own
+       persistent safety disclosure. -->
+  <section class="section" aria-labelledby="h-agent">
+    <div class="section-h">
+      <h2 id="h-agent"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-agent">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Chat CLI
+      </button></h2>
+      <span class="sub">run your real Claude Code / ChatGPT Codex subscription as a full coding agent on a project folder</span>
+      <span class="vg-wrap" id="vision-gap-wrap" hidden tabindex="0" aria-describedby="vision-gap-pop">
+        <span class="badge warn-badge" id="vision-gap-badge">&#9888; No vision model</span>
+        <div class="vg-pop" id="vision-gap-pop" role="tooltip">
+          <p>No vision-capable model is currently configured, so the agent can&rsquo;t look at images this session.</p>
+          <ul>
+            <li><label><input type="checkbox" id="vg-notify-toggle"> Notify me in this tab once one becomes available</label></li>
+            <li>Already rechecked automatically in the background every ~45 minutes &mdash; no action needed.</li>
+            <li><button type="button" class="btn sm ghost" id="vg-dismiss">Skip for now</button></li>
+          </ul>
+        </div>
+      </span>
+      <span class="sec-chip" id="chip-agent" hidden></span>
+    </div>
+    <!-- Persistent safety disclosure — deliberately a sibling of .section-body, NOT a
+         child of it, so it stays visible even while this section is collapsed (its
+         default state, matching "Local subscriptions" / "Image generation" above).
+         Never gate this behind the master switch, a <details>, or JS visibility logic. -->
+    <div class="agent-warning" id="agent-warning">
+      <strong>Full permissions.</strong> This runs your real Claude Code / Codex subscription with FULL file/command permissions in the folder you choose &mdash; it can create, edit, and delete files, and run shell commands, without asking first.
+    </div>
+    <div class="section-body" id="sec-agent" hidden>
+      <div class="sub-master-row">
+        <label class="switch" title="Master opt-in — nothing below runs while this is off">
+          <input id="agent-master-switch" type="checkbox">
+          <span class="track" aria-hidden="true"></span>
+          <span class="lbl">Enable agentic chat</span>
+        </label>
+      </div>
+
+      <div class="agent-off-note" id="agent-off-note">Turn on the switch above to start a session.</div>
+
+      <div class="agent-panel" id="agent-panel" hidden>
+        <div class="seg-toggle" id="agent-view-toggle" role="tablist" aria-label="Chat CLI view">
+          <button type="button" class="seg-btn" id="agent-view-session" role="tab" aria-selected="true">Session</button>
+          <button type="button" class="seg-btn" id="agent-view-history" role="tab" aria-selected="false">History</button>
+        </div>
+
+        <div id="agent-session-tab" role="tabpanel">
+        <div class="agent-cli-row">
+          <select id="agent-cli" aria-label="Agent CLI">
+            <option value="claude">Claude Code</option>
+            <option value="codex">ChatGPT Codex</option>
+          </select>
+          <span class="agent-cli-note" id="agent-cli-note"></span>
+        </div>
+
+        <div class="seg-toggle sm" id="agent-dir-mode" role="tablist" aria-label="Workspace mode">
+          <button type="button" class="seg-btn" id="agent-mode-existing" role="tab" aria-selected="true">Use existing folder</button>
+          <button type="button" class="seg-btn" id="agent-mode-new" role="tab" aria-selected="false">Create new project</button>
+        </div>
+        <div class="agent-start-row" id="agent-start-row">
+          <input id="agent-dir" type="text" placeholder="Absolute project folder, e.g. C:\Users\you\project"
+                 autocomplete="off" spellcheck="false" aria-label="Project folder" list="agent-dir-history">
+          <datalist id="agent-dir-history"></datalist>
+          <button class="btn primary" id="agent-start" type="button">Start session</button>
+        </div>
+        <div class="agent-recent-chips" id="agent-recent-chips" hidden></div>
+        <div class="agent-start-result" id="agent-start-result"></div>
+
+        <div class="agent-session" id="agent-session" hidden>
+          <div class="agent-session-bar">
+            <span class="agent-session-info" id="agent-session-info"></span>
+            <button class="btn sm ghost" id="agent-checkpoint" type="button" title="Bookmark this point in the conversation — not a filesystem undo">Bookmark</button>
+            <button class="btn sm ghost" id="agent-end" type="button">End session</button>
+          </div>
+          <div class="chat-messages" id="agent-messages" aria-live="polite">
+            <div class="chat-empty">Send a message to start working with the agent in this folder.</div>
+          </div>
+          <div class="chat-input-row">
+            <textarea id="agent-text" placeholder="Tell the agent what to do&hellip;  (Enter to send, Shift+Enter for a new line)" aria-label="Message to agent" rows="2"></textarea>
+            <div class="chat-send-col">
+              <button class="btn primary" id="agent-send" type="button">Send</button>
+              <button class="btn" id="agent-stop" type="button" disabled>Stop</button>
+            </div>
+          </div>
+        </div>
+        </div>
+
+        <div id="agent-history-tab" role="tabpanel" hidden>
+          <div class="agent-history-list" id="agent-history-list" aria-live="polite">
+            <div class="chat-empty">Loading past conversations&hellip;</div>
+          </div>
+          <div class="agent-history-viewer" id="agent-history-viewer" hidden>
+            <div class="ahv-bar">
+              <button type="button" class="btn sm ghost" id="agent-history-back">&larr; Back to list</button>
+              <span class="ahv-note">Checkpoints are conversation bookmarks only &mdash; they do not undo or restore any files the agent edited.</span>
+            </div>
+            <div class="chat-messages" id="agent-history-transcript" aria-live="polite"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- Default model -->
   <section class="section" aria-labelledby="h-default">
     <div class="section-h">
       <h2 id="h-default"><button type="button" class="sec-toggle" aria-expanded="true" aria-controls="sec-default">
         <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
-        Default model
+        Orchestrator model
       </button></h2>
       <span class="sub">used when a client sends a bare / unknown model name</span>
     </div>
     <div class="section-body" id="sec-default">
     <div class="default-row">
       <label for="model-select">Route to</label>
-      <select id="model-select" aria-label="Default model">
+      <select id="model-select" aria-label="Orchestrator model">
         <option value="">— add a provider key first —</option>
       </select>
-      <button class="btn primary" id="btn-set-default" type="button">Set default</button>
+      <button class="btn primary" id="btn-set-default" type="button">Set orchestrator</button>
       <button class="btn" id="default-auto" type="button" title="Probe the top-ranked models live and keep the first that answers">Auto-pick best</button>
       <span id="current-default" class="current-default" hidden></span>
       <button class="btn sm ghost" id="btn-refresh-models" type="button" title="Re-discover models from enabled providers">
@@ -775,6 +1237,58 @@
         </div>
       </div>
       <div class="chat-note" id="chat-image-note" role="status"></div>
+    </div>
+    </div>
+  </section>
+
+  <!-- Image generation -->
+  <section class="section" aria-labelledby="h-images">
+    <div class="section-h">
+      <h2 id="h-images"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-images">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Image generation
+      </button></h2>
+      <span class="sub">generate images with free providers &mdash; Cloudflare, ModelScope, Pollinations</span>
+    </div>
+    <div class="section-body" id="sec-images" hidden>
+    <div class="image-panel">
+      <div class="image-priority-row">
+        <label for="image-priority">Image priority</label>
+        <select id="image-priority" aria-label="Preferred image model">
+          <option value="">Auto &mdash; best available image model</option>
+        </select>
+        <button class="btn sm" id="image-priority-save" type="button">Save</button>
+      </div>
+      <div class="image-bar">
+        <select id="image-model" aria-label="Model to generate with">
+          <option value="auto" selected>&#128256; Auto &mdash; best free (orchestrated)</option>
+        </select>
+        <select id="image-size" aria-label="Image size"
+                title="Cloudflare and ModelScope always generate a fixed-shape image regardless of this pick; only Pollinations honors a non-square size.">
+          <option value="1024x1024" selected>1024 &times; 1024</option>
+          <option value="768x1024">768 &times; 1024 (portrait)</option>
+          <option value="1024x768">1024 &times; 768 (landscape)</option>
+        </select>
+        <select id="image-count" aria-label="Number of images">
+          <option value="1" selected>1 image</option>
+          <option value="2">2 images</option>
+          <option value="3">3 images</option>
+          <option value="4">4 images</option>
+        </select>
+      </div>
+      <div class="chat-note" id="image-note" role="status"></div>
+      <div class="image-input-row">
+        <textarea id="image-prompt" placeholder="Describe the image you want&hellip;  (e.g. a red fox in a forest)" aria-label="Image prompt" rows="2"></textarea>
+        <button class="btn primary" id="image-generate" type="button">Generate</button>
+      </div>
+      <div class="image-results empty" id="image-results" aria-live="polite">
+        <div class="chat-empty">Describe an image above and hit Generate.</div>
+      </div>
+      <div class="image-history-head">
+        <span class="sub" style="margin:0">Previously generated</span>
+      </div>
+      <div class="chat-empty" id="image-history-empty-note">No images generated yet.</div>
+      <div class="image-results" id="image-history-list" aria-live="polite" style="display:none"></div>
     </div>
     </div>
   </section>
@@ -840,6 +1354,30 @@
     </div>
   </section>
 
+  <!-- Daily usage -->
+  <section class="section" aria-labelledby="h-usage">
+    <div class="section-h">
+      <h2 id="h-usage"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-usage">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Daily usage
+      </button></h2>
+      <span class="sub">tokens spent per model, today and recent days</span>
+      <span class="sec-chip" id="chip-usage" hidden></span>
+    </div>
+    <div class="section-body" id="sec-usage" hidden>
+      <div class="usage-panel">
+        <div class="usage-bar">
+          <label for="usage-day">Day</label>
+          <select id="usage-day" aria-label="Day to show token usage for"></select>
+        </div>
+        <div class="usage-summary" id="usage-summary" role="status"></div>
+        <div class="usage-list" id="usage-list" aria-live="polite">
+          <div class="usage-empty">Loading usage&hellip;</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- Auto-update is ALWAYS ON and deliberately has NO UI: the hub git-pulls
        every 5h and restarts only when new commits actually arrived. It skips a
        dirty tree, no-ops outside a git checkout, and never touches
@@ -871,6 +1409,22 @@
   </div>
 </footer>
 
+<div class="artifact-panel" id="artifact-panel" hidden role="dialog" aria-modal="false" aria-label="Rendered artifact preview">
+  <div class="artifact-bar">
+    <span class="artifact-title">Artifact preview</span>
+    <div class="artifact-controls">
+      <button type="button" class="btn sm ghost" data-size="compact">Compact</button>
+      <button type="button" class="btn sm ghost" data-size="wide">Wide</button>
+      <button type="button" class="btn sm ghost" data-size="tall">Tall</button>
+      <button type="button" class="btn sm ghost" id="artifact-fullscreen">Fullscreen</button>
+      <button type="button" class="btn sm ghost" id="artifact-newtab">Open in new tab</button>
+      <button type="button" class="btn sm ghost" id="artifact-close" aria-label="Close artifact preview">&times;</button>
+    </div>
+  </div>
+  <iframe id="artifact-frame" title="Rendered artifact" sandbox="allow-scripts"></iframe>
+  <div class="artifact-note">Renders HTML/CSS/SVG markup. Inline &lt;script&gt; tags are blocked here by this dashboard&rsquo;s own security policy (same protection that keeps agent-produced content isolated from the dashboard itself).</div>
+</div>
+
 <div id="modal-overlay" class="modal-overlay" hidden>
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <div class="modal-h">
@@ -894,6 +1448,7 @@
   var statusData = null;
   var hubModeState = null;
   var mediaState = null;
+  var imagesState = null;
   var runtimeState = null;
   var quotaState = {};        /* pid -> live quota model; resets_in ticks down locally */
   var _ebSig = '';            /* last structural signature of the exhaustion banner */
@@ -943,7 +1498,14 @@
       return r.json().catch(function(){ return {}; }).then(function(j){
         if (!r.ok){
           var msg = (j && (j.error || j.detail || j.message)) || (r.status + ' ' + r.statusText);
-          throw new Error(msg);
+          var err = new Error(msg);
+          // Full JSON body + HTTP status, for callers that need a machine-readable
+          // `code`/extra field beyond the plain message (e.g. agentic chat's
+          // "cli_not_installed" + install_provider) — every EXISTING caller only
+          // ever reads e.message, so this is purely additive.
+          err.body = j || {};
+          err.status = r.status;
+          throw err;
         }
         return j;
       });
@@ -1007,9 +1569,16 @@
         runtimeState = runtime.state || {};
         var phase = hubModeState.phase || 'unmanaged';
         setPill('pill-hub', phase === 'on', 'hub: ' + phase);
-        var sw = $('#hub-mode-switch');
-        sw.checked = phase === 'on';
-        sw.disabled = phase === 'changing';
+        // Two DOM checkboxes render this ONE piece of state (the section body's own
+        // switch + its mirror in the header Settings drawer) — both are synced from
+        // hubModeState here, and both funnel writes through the same
+        // onHubModeToggle() handler in initLifecycle(), so they can never drift.
+        ['#hub-mode-switch', '#drawer-hub-mode-switch'].forEach(function(sel){
+          var sw = $(sel);
+          if (!sw) return;
+          sw.checked = phase === 'on';
+          sw.disabled = phase === 'changing';
+        });
         $('#hub-mode-label').textContent = phase;
 
         var rows = hubModeState.clients || {};
@@ -1042,25 +1611,34 @@
           select.appendChild(option);
         });
         select.value = chosen;
-        $('#hub-stop').disabled = runtimeState.phase === 'draining' || runtimeState.phase === 'stopped';
+        $('#hub-stop').disabled = !hubModeState || hubModeState.phase === 'changing';
+        var _sd = $('#hub-shutdown'); if (_sd) _sd.disabled = runtimeState.phase === 'draining' || runtimeState.phase === 'stopped';
       }).catch(function(e){ if (!silent) toast('Lifecycle: ' + e.message, true); });
   }
 
   function initLifecycle(){
-    $('#hub-mode-switch').addEventListener('change', function(){
-      var sw = this;
+    // Single handler shared by BOTH the section-body switch and its drawer mirror —
+    // whichever one the user actually clicked drives the POST; loadLifecycle()'s
+    // render pass above then re-syncs BOTH from the server's truth afterwards.
+    function onHubModeToggle(sw){
       if (!hubModeState){ sw.checked = false; return; }
-      sw.disabled = true;
+      var checked = sw.checked;
+      $('#hub-mode-switch').disabled = true;
+      var drawerSw = $('#drawer-hub-mode-switch');
+      if (drawerSw) drawerSw.disabled = true;
       api('/api/hub-mode', {method:'POST', body:{
-        revision: hubModeState.revision, desired: sw.checked ? 'on' : 'off'
+        revision: hubModeState.revision, desired: checked ? 'on' : 'off'
       }}).then(function(){
-        toast('Hub mode switched ' + (sw.checked ? 'on' : 'off') + '. Restart open CLI sessions.');
+        toast('Hub mode switched ' + (checked ? 'on' : 'off') + '. Restart open CLI sessions.');
         return Promise.all([loadLifecycle(), loadClis()]);
       }).catch(function(e){
         toast('Hub mode: ' + e.message, true);
         loadLifecycle(true);
       });
-    });
+    }
+    $('#hub-mode-switch').addEventListener('change', function(){ onHubModeToggle(this); });
+    var drawerHubSw = $('#drawer-hub-mode-switch');
+    if (drawerHubSw) drawerHubSw.addEventListener('change', function(){ onHubModeToggle(this); });
     $('#media-save').addEventListener('click', function(){
       if (!mediaState) return;
       var value = $('#media-primary').value;
@@ -1071,14 +1649,28 @@
       }}).then(function(){ toast('Vision priority saved'); return loadLifecycle(true); })
         .catch(function(e){ toast('Vision priority: ' + e.message, true); loadLifecycle(true); });
     });
+    // "Stop being default" = hub-mode OFF: disconnect ALL managed CLIs and restore their
+    // real cloud endpoints, but LEAVE the local server listening (does NOT kill localhost).
     $('#hub-stop').addEventListener('click', function(){
-      if (!runtimeState || !window.confirm('Stop the hub after active requests finish? Autostart will respect this intentional stop.')) return;
+      if (!hubModeState || !window.confirm('Disconnect all CLIs and stop being the default LLM?\n\nThe local hub server keeps running — this only frees Claude Code / Codex to use their real cloud again. Restart any open CLI sessions afterwards.')) return;
+      var btn = this; btn.disabled = true;
+      api('/api/hub-mode', {method:'POST', body:{revision: hubModeState.revision, desired: 'off'}})
+        .then(function(){
+          $('#lifecycle-detail').textContent = 'Stopped being the default hub. Managed CLIs were disconnected and restored to their real cloud endpoints; the local server is still running. Restart any open CLI sessions.';
+          toast('No longer the default hub — CLIs disconnected');
+          return Promise.all([loadLifecycle(), loadClis()]);
+        }).catch(function(e){ btn.disabled = false; toast('Stop: ' + e.message, true); loadLifecycle(true); });
+    });
+    // "Shut down server" = the real process stop (drains, writes the intentional-stop
+    // marker so nothing auto-restarts it, then frees the port).
+    $('#hub-shutdown').addEventListener('click', function(){
+      if (!runtimeState || !window.confirm('Fully shut down the local hub server and free the port?\n\nActive requests finish first. It will NOT auto-restart.')) return;
       var btn = this; btn.disabled = true;
       api('/api/runtime/stop', {method:'POST', body:{revision:runtimeState.revision}})
         .then(function(){
-          $('#lifecycle-detail').textContent = 'Shutdown accepted. Active inference requests are draining; start run.sh/run.bat manually to resume.';
-          toast('Hub is stopping cleanly');
-        }).catch(function(e){ btn.disabled = false; toast('Stop: ' + e.message, true); loadLifecycle(true); });
+          $('#lifecycle-detail').textContent = 'Server shutdown accepted. Active inference requests are draining; start run.bat/run.sh manually to resume.';
+          toast('Hub server is stopping cleanly');
+        }).catch(function(e){ btn.disabled = false; toast('Shutdown: ' + e.message, true); loadLifecycle(true); });
     });
   }
 
@@ -1225,6 +1817,83 @@
     }
   }
 
+  /* ---------- daily usage: read-only, no CAS state to save — simple GET + render,
+     same spirit as loadImages() but without any save/priority step. ---------- */
+  var usageState = null;       /* last-loaded /api/usage response */
+  var usageTodayStr = null;    /* UTC "today" date string, captured from the first no-date load */
+
+  function fmtNum(n){ return numOr(n, 0).toLocaleString(); }
+  function usageDayLabel(d){ return (d === usageTodayStr) ? 'Today' : d; }
+
+  function populateUsageDayPicker(days, selected){
+    var sel = $('#usage-day');
+    if (!sel) return;
+    sel.innerHTML = days.map(function(d){
+      return '<option value="' + esc(d) + '">' + esc(usageDayLabel(d)) + '</option>';
+    }).join('');
+    if (selected && sel.querySelector('option[value="' + CSS.escape(selected) + '"]')) sel.value = selected;
+  }
+
+  function renderUsage(){
+    var host = $('#usage-list');
+    var summary = $('#usage-summary');
+    if (!host || !usageState) return;
+    var models = Array.isArray(usageState.models) ? usageState.models : [];
+    var total = numOr(usageState.total_tokens, 0);
+    var dateTxt = (usageState.date === usageTodayStr) ? 'today' : ('on ' + usageState.date);
+
+    if (summary){
+      summary.textContent = models.length
+        ? (fmtNum(total) + ' tokens ' + dateTxt + ' across ' + models.length + ' model' + (models.length === 1 ? '' : 's'))
+        : '';
+    }
+    setSecChip('usage', total > 0 ? (fmtNum(total) + ' tokens ' + dateTxt) : '');
+
+    if (!models.length){
+      host.innerHTML = '<div class="usage-empty">No usage recorded yet ' + esc(dateTxt) + '.</div>';
+      return;
+    }
+
+    var sorted = models.slice().sort(function(a, b){ return numOr(b.total_tokens, 0) - numOr(a.total_tokens, 0); });
+    host.innerHTML = sorted.map(function(m){
+      var reqs = numOr(m.requests, 0);
+      var est = numOr(m.estimated_requests, 0);
+      /* estimated_requests > 0: honestly surface that some of the request counts are
+         estimated (streaming responses without a real usage object from the provider)
+         rather than exact — a "~" marker plus a title tooltip, never hidden. */
+      var estBadge = est > 0
+        ? ' <span class="ur-approx" title="' + est + ' of these ' + reqs + ' request(s) are estimated — streaming responses without a real usage object from the provider">~' + fmtNum(est) + ' est.</span>'
+        : '';
+      var modelId = m.id || ((m.provider && m.model) ? (m.provider + '/' + m.model) : 'unknown');
+      return '' +
+        '<div class="usage-row">' +
+          '<span class="ur-id">' + esc(modelId) + '</span>' +
+          '<span class="ur-stat"><b>' + fmtNum(m.prompt_tokens) + '</b> prompt</span>' +
+          '<span class="ur-stat"><b>' + fmtNum(m.completion_tokens) + '</b> completion</span>' +
+          '<span class="ur-stat ur-total"><b>' + fmtNum(m.total_tokens) + '</b> total</span>' +
+          '<span class="ur-stat">' + fmtNum(reqs) + ' req' + (reqs === 1 ? '' : 's') + estBadge + '</span>' +
+        '</div>';
+    }).join('');
+  }
+
+  function loadUsage(dateStr, silent){
+    var qs = dateStr ? ('?date=' + encodeURIComponent(dateStr)) : '';
+    return api('/api/usage' + qs).then(function(j){
+      usageState = j || {};
+      if (usageTodayStr == null && !dateStr) usageTodayStr = usageState.date;
+      var days = Array.isArray(usageState.available_days) ? usageState.available_days.slice() : [];
+      if (usageState.date && days.indexOf(usageState.date) === -1) days.unshift(usageState.date);
+      populateUsageDayPicker(days, usageState.date);
+      renderUsage();
+    }).catch(function(e){ if (!silent) toast('Usage: ' + e.message, true); });
+  }
+
+  function initUsage(){
+    var sel = $('#usage-day');
+    if (!sel) return;
+    sel.addEventListener('change', function(){ loadUsage(this.value); });
+  }
+
   /* auto-update: ALWAYS ON, no UI. The hub git-pulls every 5h and restarts only when
      new commits arrived; it skips a dirty tree and never touches your keys
      (~/.free-llm-hub lives outside the repo). Nothing to toggle, so nothing rendered.
@@ -1282,9 +1951,9 @@
     var payload = { provider: v.slice(0, i), model: v.slice(i + 1) };
     var btn = this; btn.disabled = true;
     api('/api/default', { method:'POST', body: payload }).then(function(){
-      toast('Default set: ' + v);
+      toast('Orchestrator set: ' + v);
       return Promise.all([loadDefault(), loadStatus()]);
-    }).catch(function(e){ toast('Set default: ' + e.message, true); })
+    }).catch(function(e){ toast('Set orchestrator: ' + e.message, true); })
       .then(function(){ btn.disabled = false; });
   });
   $('#btn-refresh-models').addEventListener('click', function(){
@@ -1930,6 +2599,237 @@
     updateChatAuthNote();
   }
 
+  /* ---------- image generation ---------- */
+  function loadImages(silent){
+    return api('/api/images').then(function(j){
+      imagesState = (j && j.state) || {};
+      var models = (j && j.models) || [];
+
+      /* persisted "Image priority" select — same convention as Vision priority (media-primary) */
+      var prSel = $('#image-priority');
+      if (prSel){
+        var chosen = imagesState.priority_mode === 'manual' && imagesState.manual_priority
+          ? (imagesState.manual_priority[0] || '') : '';
+        prSel.innerHTML = '<option value="">Auto &mdash; best available image model</option>';
+        models.forEach(function(m){
+          var o = document.createElement('option');
+          o.value = m.id;
+          o.textContent = (m.configured ? '' : 'Not configured &mdash; ') + m.id;
+          prSel.appendChild(o);
+        });
+        prSel.value = chosen;
+      }
+
+      /* per-generation model override select */
+      var modSel = $('#image-model');
+      if (modSel){
+        var curModel = modSel.value || 'auto';
+        modSel.innerHTML = '';
+        var autoOpt = document.createElement('option');
+        autoOpt.value = 'auto';
+        autoOpt.textContent = '🔀 Auto — best free (orchestrated)';
+        modSel.appendChild(autoOpt);
+        models.forEach(function(m){
+          var o = document.createElement('option');
+          o.value = m.id;
+          o.textContent = (m.provider_name || m.provider) + ' — ' + (m.label || m.model || m.id) +
+                           (m.configured ? '' : ' (not configured)');
+          modSel.appendChild(o);
+        });
+        if (curModel && modSel.querySelector('option[value="' + CSS.escape(curModel) + '"]')) modSel.value = curModel;
+        else modSel.value = 'auto';
+      }
+    }).catch(function(e){ if (!silent) toast('Images: ' + e.message, true); });
+  }
+
+  /* gateway key can't be read back from the dashboard (no reveal endpoint); we call
+     /v1/* without auth, which only succeeds while the gateway is open on localhost —
+     same limitation and same wording as the chat playground's updateChatAuthNote(). */
+  function updateImageAuthNote(){
+    var note = $('#image-note'); if (!note) return;
+    if (statusData && statusData.local_api_key_set){
+      note.textContent = 'A gateway key is set. This dashboard can’t read it back, so image generation here is sent unauthenticated and the gateway will reject it — test from your CLI instead, or clear the gateway key to generate here.';
+      note.classList.add('show');
+    } else {
+      note.classList.remove('show');
+    }
+  }
+
+  function initImages(){
+    $('#image-priority-save').addEventListener('click', function(){
+      // Re-entrancy guard: without this, a rapid double-click (or a click
+      // while a prior save is still in flight) fires a second concurrent
+      // POST carrying the SAME stale `imagesState.revision` -- the first
+      // request bumps the server's revision, and every request after it
+      // 409s against that now-stale number. Same bug class already fixed
+      // on the image-generate button; this button was missing the guard.
+      if (this.disabled || !imagesState) return;
+      var btn = this;
+      btn.disabled = true;
+      var value = $('#image-priority').value;
+      api('/api/images', {method:'POST', body:{
+        revision: imagesState.revision,
+        priority_mode: value ? 'manual' : 'auto',
+        manual_priority: value ? [value] : []
+      }}).then(function(){ toast('Image priority saved'); return loadImages(true); })
+        .catch(function(e){ toast('Image priority: ' + e.message, true); return loadImages(true); })
+        .then(function(){ btn.disabled = false; });
+    });
+
+    var promptEl = $('#image-prompt');
+    var modelSel = $('#image-model');
+    var sizeSel = $('#image-size');
+    var countSel = $('#image-count');
+    var genBtn = $('#image-generate');
+    var resultsEl = $('#image-results');
+    var noteEl = $('#image-note');
+
+    function setNote(text){
+      if (!text){ noteEl.classList.remove('show'); noteEl.textContent = ''; return; }
+      noteEl.textContent = text;
+      noteEl.classList.add('show');
+    }
+
+    function renderResults(data, modelUsed){
+      resultsEl.className = 'image-results';
+      resultsEl.innerHTML = '';
+      var promptText = promptEl.value.trim();
+      data.forEach(function(item, i){
+        if (!item || !item.b64_json) return;
+        var src = 'data:image/png;base64,' + item.b64_json;
+        var thumb = document.createElement('button');
+        thumb.type = 'button';
+        thumb.className = 'image-thumb';
+        thumb.setAttribute('aria-label', 'Open generated image ' + (i + 1) + ' full size');
+        var img = document.createElement('img');
+        img.src = src;
+        img.alt = 'Generated image ' + (i + 1) + (promptText ? ' — ' + promptText : '');
+        thumb.appendChild(img);
+        thumb.addEventListener('click', function(){
+          var big = document.createElement('img');
+          big.src = src;
+          big.alt = img.alt;
+          big.className = 'modal-image';
+          openModal('Generated image', big);
+        });
+        resultsEl.appendChild(thumb);
+      });
+      setNote(data.length + ' image(s) generated' + (modelUsed ? ' with ' + modelUsed : '') + '.');
+    }
+
+    var historyEl = $('#image-history-list');
+    var historyEmptyEl = $('#image-history-empty-note');
+
+    function renderImageHistory(images){
+      historyEl.innerHTML = '';
+      if (!images.length){
+        historyEmptyEl.style.display = '';
+        historyEl.style.display = 'none';
+        return;
+      }
+      historyEmptyEl.style.display = 'none';
+      historyEl.style.display = '';
+      images.forEach(function(item){
+        var src = '/api/images/history/' + encodeURIComponent(item.id) +
+          (HUB_CONTROL_TOKEN ? '?token=' + encodeURIComponent(HUB_CONTROL_TOKEN) : '');
+        var thumb = document.createElement('div');
+        thumb.className = 'image-thumb history';
+        thumb.title = item.prompt || '';
+        var img = document.createElement('img');
+        img.src = src;
+        img.loading = 'lazy';
+        img.alt = 'Generated image' + (item.prompt ? ' — ' + item.prompt : '');
+        thumb.appendChild(img);
+        thumb.addEventListener('click', function(e){
+          if (e.target.closest('.thumb-delete')) return;
+          var big = document.createElement('img');
+          big.src = src;
+          big.alt = img.alt;
+          big.className = 'modal-image';
+          openModal('Generated image', big);
+        });
+        var delBtn = document.createElement('button');
+        delBtn.type = 'button';
+        delBtn.className = 'thumb-delete';
+        delBtn.setAttribute('aria-label', 'Delete this generated image');
+        delBtn.textContent = '×';
+        delBtn.addEventListener('click', function(e){
+          e.stopPropagation();
+          if (!window.confirm('Delete this generated image? This cannot be undone.')) return;
+          api('/api/images/history/' + encodeURIComponent(item.id), {method: 'DELETE'})
+            .then(function(){ return loadImageHistory(); })
+            .catch(function(err){ toast('Delete failed: ' + err.message, true); });
+        });
+        thumb.appendChild(delBtn);
+        historyEl.appendChild(thumb);
+      });
+    }
+
+    function loadImageHistory(){
+      return api('/api/images/history').then(function(j){
+        renderImageHistory((j && j.images) || []);
+      }).catch(function(){ /* non-critical -- gallery just stays empty */ });
+    }
+
+    function generate(){
+      // Re-entrancy guard: the Enter-keydown handler below calls generate()
+      // directly and doesn't check this itself, so without this check a
+      // rapid double-Enter (or a held key auto-repeating) fires a second
+      // concurrent request and leaves the button stuck reading "Generating…"
+      // once the first request's finally-block restores the SECOND call's
+      // already-mutated label. Mirrors the chat playground's `if (streaming)
+      // return;` guard at the top of sendChat().
+      if (genBtn.disabled) return;
+      var prompt = promptEl.value.trim();
+      if (!prompt){ toast('Describe an image first', true); return; }
+      var model = modelSel.value || 'auto';
+      var size = sizeSel.value || '1024x1024';
+      var n = Number(countSel.value) || 1;
+
+      genBtn.disabled = true;
+      var oldLabel = genBtn.textContent;
+      genBtn.textContent = 'Generating…';
+      setNote('Generating…');
+
+      /* Raw fetch (not the api() helper) — mirrors the chat playground's /v1/chat/completions
+         call: /v1/images/generations returns the same {"error":{message,type,code}} OpenAI-style
+         shape via _openai_error(), and api()'s generic .catch() would stringify that whole object
+         into a useless "[object Object]" message. Same extraction as sendChat() above. */
+      fetch('/v1/images/generations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: prompt, model: model, n: n, size: size })
+      }).then(function(resp){
+        return resp.json().catch(function(){ return {}; }).then(function(j){
+          if (!resp.ok){
+            var em = (j && j.error && (j.error.message || j.error)) || (j && j.message) || ('HTTP ' + resp.status);
+            throw new Error(typeof em === 'string' ? em : JSON.stringify(em));
+          }
+          return j;
+        });
+      }).then(function(j){
+        var data = (j && j.data) || [];
+        if (!data.length){ setNote('No images returned.'); return; }
+        renderResults(data, j.model);
+        loadImageHistory();
+      }).catch(function(e){
+        var msg = String((e && e.message) || e);
+        setNote(msg);
+        toast('Image generation: ' + msg, true);
+      }).then(function(){
+        genBtn.disabled = false;
+        genBtn.textContent = oldLabel;
+      });
+    }
+
+    genBtn.addEventListener('click', generate);
+    promptEl.addEventListener('keydown', function(e){
+      if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); generate(); }
+    });
+    updateImageAuthNote();
+    loadImageHistory();
+  }
+
   /* ---------- connected tools ---------- */
   var CLI_SITES = {
     'claude': 'https://www.anthropic.com/claude-code',
@@ -2273,6 +3173,761 @@
       });
   }
 
+  /* ---------- local subscription providers (paid, opt-in) ---------- */
+  function loadSubscriptions(silent){
+    var host = $('#sub-list'); if (!host) return;
+    return api('/api/subscriptions').then(function(r){
+      renderSubs(r || {});
+    }).catch(function(e){
+      if (!silent) host.innerHTML = '<div class="empty">Failed to load: ' + esc(e.message) + '</div>';
+    });
+  }
+
+  function renderSubs(data){
+    var master = $('#sub-master-switch');
+    var warn = $('#sub-warning');
+    var host = $('#sub-list');
+    if (warn) warn.textContent = data.warning || '';
+    if (master) master.checked = !!data.enabled;
+    var rows = Array.isArray(data.providers) ? data.providers : [];
+    var usable = rows.filter(function(r){ return r.usable; }).length;
+    setSecChip('subs', rows.length ? (data.enabled ? (usable + ' / ' + rows.length + ' usable') : 'off') : '');
+    if (!host) return;
+    host.innerHTML = '';
+    if (!rows.length){ host.innerHTML = '<div class="empty">No subscription providers known.</div>'; return; }
+    rows.forEach(function(r){
+      var card = document.createElement('div');
+      card.className = 'cli-card' + (r.usable ? ' is-connected' : '');
+      card.dataset.pid = r.id;
+      card.innerHTML = subCardHTML(r);
+      wireSub(card, r);
+      host.appendChild(card);
+    });
+  }
+
+  /* Reuses the exact .cli-card / .conn-pill visual language from "Connected
+     tools" above — same status-card language, different subject (a paid CLI
+     subscription instead of a free HTTP key). */
+  function subCardHTML(r){
+    var statusPill = r.usable
+      ? '<span class="conn-pill on"><span class="d"></span>Usable</span>'
+      : '<span class="conn-pill off"><span class="d"></span>Not usable</span>';
+    var modePill = r.isolated
+      ? '<span class="sub-mode-pill iso">Isolated profile</span>'
+      : '<span class="sub-mode-pill">Shared install</span>';
+    var installBtnLabel = r.isolated_installed ? 'Reinstall isolated copy' : 'Install isolated copy';
+    return '' +
+      '<div class="cli-card-top">' +
+        '<div class="cli-card-id">' +
+          '<div class="cli-card-name">' + esc(r.name || r.id) + '<span class="pid">' + esc(r.model || r.id) + '</span></div>' +
+          modePill +
+        '</div>' +
+        statusPill +
+      '</div>' +
+      (r.detail ? '<div class="cli-card-detail">' + esc(r.detail) + '</div>' : '') +
+      '<div class="sub-card-actions">' +
+        '<label class="switch" title="Let the hub use this as a last-resort orchestration fallback">' +
+          '<input type="checkbox" class="act-sub-enable"' + (r.enabled ? ' checked' : '') + '>' +
+          '<span class="track" aria-hidden="true"></span><span class="lbl">Enabled</span>' +
+        '</label>' +
+        '<label class="switch" title="Run a completely separate install + login, never touching your regular ' + esc(r.bin || 'CLI') + ' setup">' +
+          '<input type="checkbox" class="act-sub-isolated"' + (r.isolated ? ' checked' : '') + '>' +
+          '<span class="track" aria-hidden="true"></span><span class="lbl">Isolated profile</span>' +
+        '</label>' +
+        (r.isolated ? '<button type="button" class="btn sm act-install-iso">' + esc(installBtnLabel) + '</button>' : '') +
+      '</div>' +
+      '<div class="sub-install-result" role="status" aria-live="polite"></div>' +
+      '<div class="sub-login-slot"></div>';
+  }
+
+  function wireSub(card, r){
+    var enableToggle = card.querySelector('.act-sub-enable');
+    if (enableToggle) enableToggle.addEventListener('change', function(){
+      postSubFlag({ provider: r.id, enabled: enableToggle.checked }, enableToggle, enableToggle.checked);
+    });
+    var isoToggle = card.querySelector('.act-sub-isolated');
+    if (isoToggle) isoToggle.addEventListener('change', function(){
+      postSubFlag({ provider: r.id, isolated: isoToggle.checked }, isoToggle, isoToggle.checked);
+    });
+    var installBtn = card.querySelector('.act-install-iso');
+    if (installBtn) installBtn.addEventListener('click', function(){ doInstallIsolated(r, installBtn, card); });
+    var slot = card.querySelector('.sub-login-slot');
+    if (slot && r.isolated){
+      if (r.isolated_login_command){
+        var box = document.createElement('div'); box.className = 'sub-login-box';
+        var note = document.createElement('div'); note.className = 'cli-setup-note';
+        note.textContent = 'Neither CLI\'s subscription login can be scripted headlessly — run this yourself once, in your own terminal, to sign the isolated copy in:';
+        box.appendChild(note);
+        box.appendChild(blockNode('Run this to sign in', r.isolated_login_command));
+        slot.appendChild(box);
+      } else if (r.isolated_login_note){
+        var n2 = document.createElement('div'); n2.className = 'cli-setup-note';
+        n2.textContent = r.isolated_login_note;
+        slot.appendChild(n2);
+      }
+    }
+  }
+
+  /* enabled/isolated flag toggle -> POST, then re-render from the server's
+     truth (so a rejected/roundtripped value can never desync the switch). */
+  function postSubFlag(body, toggle, wantChecked){
+    if (toggle) toggle.disabled = true;
+    api('/api/subscriptions', { method: 'POST', body: body }).then(function(){
+      return loadSubscriptions();
+    }).catch(function(e){
+      toast('Update failed: ' + e.message, true);
+      if (toggle){ toggle.checked = !wantChecked; toggle.disabled = false; }
+    });
+  }
+
+  function doInstallIsolated(r, btn, card){
+    var out = card ? card.querySelector('.sub-install-result') : null;
+    if (out){ out.className = 'sub-install-result'; out.innerHTML = ''; }
+    busyBtn(btn, 'Installing…');
+    api('/api/subscriptions/' + encodeURIComponent(r.id) + '/install-isolated', { method: 'POST' })
+      .then(function(resp){
+        resp = resp || {};
+        if (out){
+          out.className = 'sub-install-result ok';
+          out.innerHTML = '<span class="tr-i" aria-hidden="true">&check;</span><span>Installed at ' +
+                          esc(resp.bin_path || resp.install_dir || '') + '</span>';
+        }
+        toast((r.name || r.id) + ' isolated copy installed');
+        return loadSubscriptions();
+      })
+      .catch(function(e){
+        if (out){
+          out.className = 'sub-install-result err';
+          out.innerHTML = '<span class="tr-i" aria-hidden="true">&cross;</span><span>' + esc(e.message) + '</span>';
+        }
+        toast('Install failed: ' + e.message, true);
+        resetBtn(btn, r.isolated_installed ? 'Reinstall isolated copy' : 'Install isolated copy');
+      });
+  }
+
+  function initSubscriptions(){
+    var m = $('#sub-master-switch');
+    if (!m) return;
+    m.addEventListener('change', function(){
+      var want = m.checked;
+      m.disabled = true;
+      api('/api/subscriptions', { method: 'POST', body: { enabled: want } }).then(function(){
+        return loadSubscriptions();
+      }).catch(function(e){
+        toast('Update failed: ' + e.message, true);
+        m.checked = !want; m.disabled = false;
+      });
+    });
+  }
+
+  /* ---------- agentic chat (opt-in, full tool/file access) ----------
+     Runs the user's own Claude Code / Codex subscription as a stateful coding-agent
+     session against a project folder. Fundamentally different trust level from the
+     stateless Chat/Test playground above, so it gets its own master switch (mirrors
+     initSubscriptions()'s POST-then-reload-from-server convention) and its own
+     session lifecycle: Start -> (Send/Stop)* -> End. No sessions-list endpoint exists,
+     so an active session is tracked client-side only — a page refresh always lands
+     back on the "Start session" state (the backend session, if still open, is simply
+     orphaned until it times out server-side; acceptable for a single-user local tool). */
+  var agentState = { enabled: false, clis: {}, defaultCli: 'claude', cliPreselected: false };
+
+  function updateAgentPanelVisibility(){
+    var panel = $('#agent-panel');
+    var offNote = $('#agent-off-note');
+    if (panel) panel.hidden = !agentState.enabled;
+    if (offNote) offNote.hidden = !!agentState.enabled;
+  }
+
+  /* CLI picker (stage A's cli_support() shape: {claude:{supported,reason,installed}, codex:{...}}).
+     Codex is currently hard-blocked server-side (supported:false) — start_session() refuses it
+     outright, so the <option> itself is disabled (not just badged "experimental") and the Start
+     button is guarded defensively too; see agentic_chat.py's _SUPPORT table for the real reason,
+     shown verbatim via the option's title + the note line below the picker. */
+  function renderCliPicker(){
+    var sel = $('#agent-cli');
+    var note = $('#agent-cli-note');
+    if (!sel) return;
+    var clis = agentState.clis || {};
+    ['claude', 'codex'].forEach(function(id){
+      var opt = sel.querySelector('option[value="' + id + '"]');
+      if (!opt) return;
+      var info = clis[id] || {};
+      var base = id === 'claude' ? 'Claude Code' : 'ChatGPT Codex';
+      opt.disabled = info.supported === false;
+      opt.textContent = base + (info.supported === false ? ' (not available)' : '');
+      if (info.reason) opt.title = info.reason;
+    });
+    if (!agentState.cliPreselected && agentState.defaultCli){
+      sel.value = agentState.defaultCli;
+      agentState.cliPreselected = true;
+    }
+    renderCliNote();
+  }
+
+  function renderCliNote(){
+    var sel = $('#agent-cli');
+    var note = $('#agent-cli-note');
+    var startBtn = $('#agent-start');
+    if (!sel || !note) return;
+    var info = (agentState.clis || {})[sel.value] || {};
+    if (info.supported === false){
+      note.className = 'agent-cli-note warn';
+      note.textContent = info.reason || 'This CLI is not available for Chat CLI yet.';
+      if (startBtn) startBtn.disabled = true;
+      return;
+    }
+    if (startBtn) startBtn.disabled = false;
+    if (info.installed === false){
+      var installLabel = sel.value === 'claude' ? 'Claude Code' : 'ChatGPT Codex';
+      note.className = 'agent-cli-note warn';
+      note.innerHTML = esc(installLabel + ' isn’t installed yet.') +
+        ' <button type="button" class="btn sm" id="agent-cli-install">Install ' + esc(installLabel) + '</button>';
+      var btn = note.querySelector('#agent-cli-install');
+      if (btn) btn.addEventListener('click', function(){ doAgentCliInstall(sel.value, btn, note); });
+    } else {
+      note.className = 'agent-cli-note';
+      note.textContent = '';
+    }
+  }
+
+  function doAgentCliInstall(cliId, btn, note){
+    if (btn.disabled) return;
+    var label = btn.textContent;
+    var installProvider = cliId === 'claude' ? 'sub-claude' : 'sub-codex';
+    busyBtn(btn, 'Installing…');
+    api('/api/subscriptions/' + encodeURIComponent(installProvider) + '/install-isolated', { method: 'POST' })
+      .then(function(){
+        toast((cliId === 'claude' ? 'Claude Code' : 'ChatGPT Codex') + ' isolated copy installed');
+        return loadAgentSettings(true);
+      })
+      .catch(function(e){ toast('Install failed: ' + e.message, true); resetBtn(btn, label); });
+  }
+
+  function renderAgentSettings(data){
+    data = data || {};
+    agentState.enabled = !!data.enabled;
+    agentState.clis = data.clis || agentState.clis;
+    agentState.defaultCli = data.default_cli || agentState.defaultCli;
+    var master = $('#agent-master-switch');
+    if (master) master.checked = agentState.enabled;
+    setSecChip('agent', agentState.enabled ? 'on' : '');
+    updateAgentPanelVisibility();
+    renderCliPicker();
+  }
+
+  function loadAgentSettings(silent){
+    return api('/api/agent/settings').then(function(r){
+      renderAgentSettings(r);
+    }).catch(function(e){
+      if (!silent) toast('Agentic chat: ' + e.message, true);
+    });
+  }
+
+  function initAgentSettings(){
+    var m = $('#agent-master-switch');
+    if (!m) return;
+    m.addEventListener('change', function(){
+      var want = m.checked;
+      m.disabled = true;
+      api('/api/agent/settings', { method: 'POST', body: { enabled: want } }).then(function(r){
+        renderAgentSettings(r);
+      }).catch(function(e){
+        toast('Agentic chat: ' + e.message, true);
+        m.checked = !want;
+      }).then(function(){ m.disabled = false; });
+    });
+  }
+
+  /* ---------- artifact rendering (shared by live chat + history transcript) ----------
+     Detection is deliberately conservative: only offers the button when the reply text
+     itself plausibly contains a small renderable HTML/SVG document or fragment (a fenced
+     ```html/```svg code block, or raw text that already looks like markup) — never
+     auto-renders, and NEVER injects agent-produced content into the dashboard's own DOM
+     via innerHTML; the iframe below only ever receives it through `srcdoc`, sandboxed. */
+  function extractArtifactHTML(text){
+    if (!text || typeof text !== 'string') return null;
+    var fence = text.match(/```(?:html|htm|svg|xml)?[ \t]*\n([\s\S]*?)```/i);
+    var candidate = (fence ? fence[1] : text).trim();
+    if (!candidate) return null;
+    var looksLikeMarkup = /<!doctype html/i.test(candidate) || /<html[\s>]/i.test(candidate) ||
+      /<svg[\s>]/i.test(candidate) || (/^</.test(candidate) && /<\/[a-z][^>]*>/i.test(candidate));
+    return looksLikeMarkup ? candidate : null;
+  }
+  function addArtifactButton(container, html){
+    if (!container || !html) return;
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'artifact-render-btn';
+    btn.textContent = 'Render as artifact';
+    btn.addEventListener('click', function(){ openArtifactPanel(html); });
+    container.appendChild(btn);
+  }
+  function openArtifactPanel(html){
+    var panel = $('#artifact-panel');
+    var frame = $('#artifact-frame');
+    if (!panel || !frame) return;
+    frame.srcdoc = html;               // sandboxed iframe only — never innerHTML into the page
+    panel.hidden = false;
+  }
+  function closeArtifactPanel(){
+    var panel = $('#artifact-panel');
+    if (!panel) return;
+    panel.hidden = true;
+    panel.classList.remove('is-fullscreen');
+    var frame = $('#artifact-frame');
+    if (frame) frame.srcdoc = '';
+  }
+  function initArtifactPanel(){
+    var panel = $('#artifact-panel');
+    if (!panel) return;
+    panel.querySelectorAll('[data-size]').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        panel.classList.remove('size-compact', 'size-wide', 'size-tall');
+        panel.classList.add('size-' + btn.getAttribute('data-size'));
+      });
+    });
+    var fsBtn = $('#artifact-fullscreen');
+    if (fsBtn) fsBtn.addEventListener('click', function(){ panel.classList.toggle('is-fullscreen'); });
+    var closeBtn = $('#artifact-close');
+    if (closeBtn) closeBtn.addEventListener('click', closeArtifactPanel);
+    var newTabBtn = $('#artifact-newtab');
+    if (newTabBtn) newTabBtn.addEventListener('click', function(){
+      var frame = $('#artifact-frame');
+      var html = frame && frame.srcdoc;
+      if (!html){ toast('Nothing to open yet', true); return; }
+      var blob = new Blob([html], { type: 'text/html' });
+      var url = URL.createObjectURL(blob);
+      window.open(url, '_blank', 'noopener');
+      setTimeout(function(){ URL.revokeObjectURL(url); }, 60000);
+    });
+  }
+
+  function initAgent(){
+    var cliSel = $('#agent-cli');
+    var dirInput = $('#agent-dir');
+    var dirHistoryList = $('#agent-dir-history');
+    var recentChips = $('#agent-recent-chips');
+    var modeExistingBtn = $('#agent-mode-existing');
+    var modeNewBtn = $('#agent-mode-new');
+    var startBtn = $('#agent-start');
+    var startRow = $('#agent-start-row');
+    var startResult = $('#agent-start-result');
+    var sessionBox = $('#agent-session');
+    var sessionInfo = $('#agent-session-info');
+    var checkpointBtn = $('#agent-checkpoint');
+    var endBtn = $('#agent-end');
+    var msgsEl = $('#agent-messages');
+    var textEl = $('#agent-text');
+    var sendBtn = $('#agent-send');
+    var stopBtn = $('#agent-stop');
+    var viewSessionBtn = $('#agent-view-session');
+    var viewHistoryBtn = $('#agent-view-history');
+    var sessionTab = $('#agent-session-tab');
+    var historyTab = $('#agent-history-tab');
+    var historyList = $('#agent-history-list');
+    var historyViewer = $('#agent-history-viewer');
+    var historyTranscript = $('#agent-history-transcript');
+    var historyBackBtn = $('#agent-history-back');
+    if (!cliSel || !startBtn || !sendBtn) return;
+
+    var sessionId = null;
+    var dirMode = 'existing';
+
+    cliSel.addEventListener('change', renderCliNote);
+
+    /* ---------- workspace mode: existing folder vs. create-new-project ---------- */
+    function setDirMode(mode){
+      dirMode = mode;
+      modeExistingBtn.setAttribute('aria-selected', String(mode === 'existing'));
+      modeNewBtn.setAttribute('aria-selected', String(mode === 'new'));
+      dirInput.placeholder = mode === 'existing'
+        ? 'Absolute project folder, e.g. C:\\Users\\you\\project'
+        : 'Absolute path for the NEW project folder (created for you), e.g. C:\\Users\\you\\projects\\my-app';
+    }
+    modeExistingBtn.addEventListener('click', function(){ setDirMode('existing'); });
+    modeNewBtn.addEventListener('click', function(){ setDirMode('new'); });
+
+    function loadRecentProjects(){
+      api('/api/agent/recent-projects').then(function(r){
+        var dirs = (r && Array.isArray(r.recent_projects)) ? r.recent_projects : [];
+        if (dirHistoryList) dirHistoryList.innerHTML = dirs.map(function(d){ return '<option value="' + esc(d) + '">'; }).join('');
+        if (!recentChips) return;
+        if (!dirs.length){ recentChips.hidden = true; recentChips.innerHTML = ''; return; }
+        recentChips.hidden = false;
+        recentChips.innerHTML = dirs.slice(0, 6).map(function(d){
+          return '<button type="button" class="chip" title="' + esc(d) + '">' + esc(d) + '</button>';
+        }).join('');
+        var chipEls = recentChips.querySelectorAll('.chip');
+        for (var i = 0; i < chipEls.length; i++){
+          (function(dir){
+            chipEls[i].addEventListener('click', function(){ dirInput.value = dir; dirInput.focus(); });
+          })(dirs[i]);
+        }
+      }).catch(function(){ /* non-critical, and 403s silently while agentic chat is off */ });
+    }
+
+    function setStartResult(ok, msg, installProviderId, cliId){
+      if (!startResult) return;
+      if (!msg){ startResult.className = 'agent-start-result'; startResult.innerHTML = ''; return; }
+      startResult.className = 'agent-start-result ' + (ok ? 'ok' : 'err');
+      startResult.innerHTML = '<span class="tr-i" aria-hidden="true">' + (ok ? '&check;' : '&cross;') + '</span>' +
+                              '<span>' + esc(msg) + '</span>';
+      if (!ok && installProviderId){
+        var installBtn = document.createElement('button');
+        installBtn.type = 'button';
+        installBtn.className = 'btn sm';
+        installBtn.style.marginLeft = '8px';
+        installBtn.textContent = 'Install ' + cliLabel(cliId);
+        installBtn.addEventListener('click', function(){ doAgentCliInstall(cliId, installBtn, startResult); });
+        startResult.appendChild(installBtn);
+      }
+    }
+
+    function cliLabel(id){
+      return id === 'claude' ? 'Claude Code' : id === 'codex' ? 'ChatGPT Codex' : (id || '?');
+    }
+
+    function switchTab(which){
+      var toSession = which === 'session';
+      viewSessionBtn.setAttribute('aria-selected', String(toSession));
+      viewHistoryBtn.setAttribute('aria-selected', String(!toSession));
+      sessionTab.hidden = !toSession;
+      historyTab.hidden = toSession;
+      if (!toSession) loadAgentHistory();
+    }
+    viewSessionBtn.addEventListener('click', function(){ switchTab('session'); });
+    viewHistoryBtn.addEventListener('click', function(){ switchTab('history'); });
+
+    function showStartState(){
+      sessionId = null;
+      startRow.hidden = false;
+      sessionBox.hidden = true;
+      checkpointBtn.disabled = true;
+      setSecChip('agent', agentState.enabled ? 'on' : '');
+    }
+
+    function showSessionState(cli, dir){
+      startRow.hidden = true;
+      sessionBox.hidden = false;
+      setStartResult(null);
+      sessionInfo.textContent = cliLabel(cli) + ' — ' + dir;
+      msgsEl.innerHTML = '<div class="chat-empty">Send a message to start working with the agent in this folder.</div>';
+      checkpointBtn.disabled = true;
+      setSecChip('agent', 'session active');
+    }
+
+    function refreshSessionInfo(){
+      if (!sessionId) return;
+      api('/api/agent/sessions/' + encodeURIComponent(sessionId)).then(function(r){
+        r = r || {};
+        var extra = [];
+        if (r.turn_count != null) extra.push('turn ' + r.turn_count);
+        if (r.currently_running) extra.push('running');
+        sessionInfo.textContent = cliLabel(r.cli) + ' — ' + (r.project_dir || '') +
+                                   (extra.length ? ' · ' + extra.join(' · ') : '');
+      }).catch(function(){ /* non-critical — the static label already set at start covers this */ });
+    }
+
+    function doStart(){
+      // Re-entrancy guard — mirrors the chat playground's `if (streaming) return;` /
+      // the image generator's `if (genBtn.disabled) return;` (this file has shipped
+      // more than one button without this guard before; don't repeat that here).
+      if (startBtn.disabled) return;
+      var cli = cliSel.value;
+      var info = (agentState.clis || {})[cli] || {};
+      if (info.supported === false){ toast(info.reason || (cliLabel(cli) + ' is not available yet.'), true); return; }
+      var dir = dirInput.value.trim();
+      if (!dir){ toast('Enter an absolute project folder first', true); return; }
+      startBtn.disabled = true;
+      var oldLabel = startBtn.textContent;
+      startBtn.textContent = 'Starting…';
+      setStartResult(null);
+      api('/api/agent/sessions', { method: 'POST', body: { cli: cli, project_dir: dir, create_new: dirMode === 'new' } })
+        .then(function(r){
+          r = r || {};
+          sessionId = r.session_id;
+          showSessionState(r.cli || cli, r.project_dir || dir);
+          toast('Agent session started');
+          loadRecentProjects();
+        })
+        .catch(function(e){
+          var body = (e && e.body) || {};
+          if (body.code === 'cli_not_installed'){
+            setStartResult(false, e.message, body.install_provider, cli);
+          } else {
+            setStartResult(false, e.message);
+          }
+          toast('Chat CLI: ' + e.message, true);
+        })
+        .then(function(){
+          startBtn.disabled = false;
+          startBtn.textContent = oldLabel;
+        });
+    }
+
+    function appendAgentBubble(role, who, text){
+      var wrap = document.createElement('div'); wrap.className = 'msg ' + role;
+      var w = document.createElement('span'); w.className = 'who'; w.textContent = who;
+      var b = document.createElement('div'); b.className = 'bubble'; b.textContent = text;
+      wrap.appendChild(w); wrap.appendChild(b);
+      msgsEl.appendChild(wrap);
+      msgsEl.scrollTop = msgsEl.scrollHeight;
+      return wrap;
+    }
+
+    function setBusy(on){
+      // Send disabled while a turn is in flight, Stop only enabled while in flight —
+      // End session is disabled too, so a session can't be torn down mid-turn without
+      // stopping it first (avoids a confusing race between DELETE and the in-flight
+      // /message call).
+      sendBtn.disabled = on;
+      stopBtn.disabled = !on;
+      endBtn.disabled = on;
+    }
+
+    function doSend(){
+      // Re-entrancy guard — same pattern as chat playground's sendChat()/image
+      // generator's generate(): check the button's OWN disabled state at the top,
+      // not a separate flag that can drift out of sync with it.
+      if (sendBtn.disabled) return;
+      if (!sessionId) return;
+      var text = textEl.value.trim();
+      if (!text) return;
+
+      appendAgentBubble('user', 'You', text);
+      textEl.value = '';
+
+      var asstEl = appendAgentBubble('assistant', 'Agent', '');
+      var bubble = asstEl.querySelector('.bubble');
+      bubble.innerHTML = SPIN_SVG + ' Agent is working… this can take a few minutes <span class="agent-elapsed">(0s)</span>';
+      var elapsedStart = Date.now();
+      var elapsedTimer = setInterval(function(){
+        var el = bubble.querySelector('.agent-elapsed');
+        if (!el){ clearInterval(elapsedTimer); return; }
+        el.textContent = '(' + Math.round((Date.now() - elapsedStart) / 1000) + 's)';
+      }, 1000);
+
+      setBusy(true);
+      api('/api/agent/sessions/' + encodeURIComponent(sessionId) + '/message', { method: 'POST', body: { text: text } })
+        .then(function(r){
+          // api() rejects on any non-2xx HTTP status (it throws using j.error/
+          // j.detail/j.message before resolving) -- the /message route always
+          // returns HTTP status === body.status, so this .then() is ONLY ever
+          // reached for a real 200 success. The failure path below (.catch) is
+          // where every non-200 status (400/403/404/409/499/502/504) lands,
+          // already carrying the right message via j.detail.
+          r = r || {};
+          clearInterval(elapsedTimer);
+          bubble.textContent = r.text || '(empty response)';
+          checkpointBtn.disabled = false;
+          var artifactHtml = extractArtifactHTML(r.text);
+          if (artifactHtml) addArtifactButton(asstEl, artifactHtml);
+        })
+        .catch(function(e){
+          clearInterval(elapsedTimer);
+          asstEl.className = 'msg assistant error';
+          bubble.textContent = String((e && e.message) || e);
+        })
+        .then(function(){
+          setBusy(false);
+          msgsEl.scrollTop = msgsEl.scrollHeight;
+          refreshSessionInfo();
+        });
+    }
+
+    function doStop(){
+      // Re-entrancy guard: Stop is only enabled while a message is in flight, but a
+      // rapid double-click before the first click's disable takes effect could still
+      // fire two stop calls without this.
+      if (stopBtn.disabled) return;
+      if (!sessionId) return;
+      stopBtn.disabled = true;
+      // Interrupts the CURRENTLY in-flight /message call server-side; that fetch's own
+      // .then()/.catch() (in doSend above) is what calls setBusy(false) once it
+      // resolves — we deliberately don't touch sendBtn/endBtn here.
+      api('/api/agent/sessions/' + encodeURIComponent(sessionId) + '/stop', { method: 'POST' })
+        .catch(function(e){ toast('Stop: ' + e.message, true); });
+    }
+
+    function doEnd(){
+      // Re-entrancy guard, same convention as Start/Send/Stop above.
+      if (endBtn.disabled) return;
+      if (!sessionId) return;
+      endBtn.disabled = true;
+      var id = sessionId;
+      api('/api/agent/sessions/' + encodeURIComponent(id), { method: 'DELETE' })
+        .then(function(){ toast('Agent session ended'); })
+        .catch(function(e){ toast('End session: ' + e.message, true); })
+        .then(function(){
+          endBtn.disabled = false;
+          showStartState();
+        });
+    }
+
+    function doCheckpoint(){
+      if (checkpointBtn.disabled || !sessionId) return;
+      var label = window.prompt('Optional label for this bookmark (leave blank for none):', '');
+      if (label === null) return; // user cancelled
+      checkpointBtn.disabled = true;
+      api('/api/agent/history/' + encodeURIComponent(sessionId) + '/checkpoints',
+          { method: 'POST', body: { label: label || undefined } })
+        .then(function(cp){
+          toast('Bookmarked' + (cp && cp.turn_index != null ? ' at turn ' + cp.turn_index : '') +
+                ' — a conversation marker only, not a file backup.');
+        })
+        .catch(function(e){ toast('Bookmark: ' + e.message, true); })
+        .then(function(){ checkpointBtn.disabled = false; });
+    }
+
+    /* ---------- history browser (stage B: persisted transcripts + checkpoints) ---------- */
+    function fmtHistDate(sec){
+      if (!sec) return '';
+      try { return new Date(sec * 1000).toLocaleString(); } catch(e){ return ''; }
+    }
+
+    function turnsWithCheckpoints(conv){
+      var turns = (conv.turns || []).slice();
+      var checkpoints = (conv.checkpoints || []).slice();
+      var byIndex = {};
+      checkpoints.forEach(function(cp){
+        (byIndex[cp.turn_index] = byIndex[cp.turn_index] || []).push(cp);
+      });
+      var out = [];
+      for (var i = 0; i <= turns.length; i++){
+        (byIndex[i] || []).forEach(function(cp){ out.push({ type: 'checkpoint', checkpoint: cp }); });
+        if (turns[i]) out.push({ type: 'turn', turn: turns[i] });
+      }
+      return out;
+    }
+
+    function renderTranscriptHTML(conv){
+      var items = turnsWithCheckpoints(conv || {});
+      if (!items.length) return '<div class="chat-empty">No messages in this conversation yet.</div>';
+      return items.map(function(item){
+        if (item.type === 'checkpoint'){
+          var cp = item.checkpoint;
+          return '<div class="ah-checkpoint-marker">&#128278; Checkpoint' + (cp.label ? ': ' + esc(cp.label) : ' (bookmark)') +
+                 ' &mdash; ' + esc(fmtHistDate(cp.created_at)) + '</div>';
+        }
+        var t = item.turn;
+        var role = t.role === 'user' ? 'user' : 'assistant';
+        var who = t.role === 'user' ? 'You' : 'Agent';
+        return '<div class="msg ' + role + '"><span class="who">' + who + '</span><div class="bubble">' + esc(t.text) + '</div></div>';
+      }).join('');
+    }
+
+    function mountTranscript(container, conv){
+      container.innerHTML = renderTranscriptHTML(conv);
+      var bubbleWraps = container.querySelectorAll('.msg.assistant');
+      var agentTurns = ((conv && conv.turns) || []).filter(function(t){ return t.role === 'agent'; });
+      for (var i = 0; i < bubbleWraps.length; i++){
+        var t = agentTurns[i];
+        if (!t) continue;
+        var artifactHtml = extractArtifactHTML(t.text);
+        if (artifactHtml) addArtifactButton(bubbleWraps[i], artifactHtml);
+      }
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function loadAgentHistory(){
+      historyList.hidden = false;
+      historyViewer.hidden = true;
+      historyList.innerHTML = '<div class="chat-empty">Loading past conversations&hellip;</div>';
+      api('/api/agent/history').then(function(r){
+        var convs = (r && Array.isArray(r.conversations)) ? r.conversations : [];
+        if (!convs.length){ historyList.innerHTML = '<div class="chat-empty">No past conversations yet.</div>'; return; }
+        historyList.innerHTML = convs.map(function(c){
+          return '<div class="ah-row" data-id="' + esc(c.session_id) + '">' +
+            '<div class="ah-top">' +
+              '<span class="ah-cli">' + esc(cliLabel(c.cli_id)) + '</span>' +
+              '<span class="ah-meta">' + (c.turn_count || 0) + ' turn' + (c.turn_count === 1 ? '' : 's') +
+                ' &middot; ' + esc(fmtHistDate(c.last_active_at)) + '</span>' +
+            '</div>' +
+            '<div class="ah-dir">' + esc(c.project_dir || '') + '</div>' +
+            '<div class="ah-actions">' +
+              '<button type="button" class="btn sm ghost act-view">View</button>' +
+              '<button type="button" class="btn sm ghost act-continue">Continue</button>' +
+              '<button type="button" class="btn sm danger act-delete">Delete</button>' +
+            '</div>' +
+          '</div>';
+        }).join('');
+        var rows = historyList.querySelectorAll('.ah-row');
+        for (var i = 0; i < rows.length; i++){
+          (function(row){
+            var id = row.getAttribute('data-id');
+            var conv = convs.filter(function(c){ return c.session_id === id; })[0];
+            row.querySelector('.act-view').addEventListener('click', function(){
+              if (this.disabled) return; viewConversation(id);
+            });
+            row.querySelector('.act-continue').addEventListener('click', function(){
+              if (this.disabled) return; this.disabled = true; continueConversation(conv, this);
+            });
+            row.querySelector('.act-delete').addEventListener('click', function(){
+              if (this.disabled) return; this.disabled = true; deleteConversation(id, this);
+            });
+          })(rows[i]);
+        }
+      }).catch(function(e){ historyList.innerHTML = '<div class="chat-empty">Failed to load: ' + esc(e.message) + '</div>'; });
+    }
+
+    function viewConversation(id){
+      api('/api/agent/history/' + encodeURIComponent(id)).then(function(conv){
+        historyList.hidden = true;
+        historyViewer.hidden = false;
+        mountTranscript(historyTranscript, conv || {});
+      }).catch(function(e){ toast('History: ' + e.message, true); });
+    }
+
+    function deleteConversation(id, btn){
+      if (!window.confirm('Delete this saved conversation? This only removes the transcript — it never touches any files the agent edited.')){
+        if (btn) btn.disabled = false;
+        return;
+      }
+      api('/api/agent/history/' + encodeURIComponent(id), { method: 'DELETE' })
+        .then(function(){ toast('Conversation deleted'); loadAgentHistory(); })
+        .catch(function(e){ toast('Delete: ' + e.message, true); if (btn) btn.disabled = false; });
+    }
+
+    function continueConversation(conv, btn){
+      // "Continue" only works while the CLI subprocess session is still live in the
+      // hub's in-memory registry (see agentic_chat.py's module docstring — sessions
+      // never survive a hub restart). GET /sessions/<id> 404ing means it's gone;
+      // we then honestly offer to start a FRESH session in the same folder instead
+      // of pretending to resume something that no longer exists.
+      api('/api/agent/sessions/' + encodeURIComponent(conv.session_id)).then(function(r){
+        sessionId = conv.session_id;
+        showSessionState(r.cli || conv.cli_id, r.project_dir || conv.project_dir);
+        api('/api/agent/history/' + encodeURIComponent(conv.session_id)).then(function(full){
+          mountTranscript(msgsEl, full || {});
+          if (full && (full.turns || []).length) checkpointBtn.disabled = false;
+        });
+        switchTab('session');
+        toast('Resumed — this session is still live, send a message to continue.');
+      }).catch(function(){
+        toast('That session has ended (hub may have restarted) — starting a new one in the same folder instead.', true);
+        if (conv.cli_id) cliSel.value = conv.cli_id;
+        renderCliNote();
+        setDirMode('existing');
+        dirInput.value = conv.project_dir || '';
+        switchTab('session');
+      }).then(function(){ if (btn) btn.disabled = false; });
+    }
+
+    startBtn.addEventListener('click', doStart);
+    endBtn.addEventListener('click', doEnd);
+    sendBtn.addEventListener('click', doSend);
+    stopBtn.addEventListener('click', doStop);
+    checkpointBtn.addEventListener('click', doCheckpoint);
+    historyBackBtn.addEventListener('click', function(){ historyViewer.hidden = true; historyList.hidden = false; });
+    textEl.addEventListener('keydown', function(e){
+      if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); doSend(); }
+    });
+
+    setDirMode('existing');
+    checkpointBtn.disabled = true;   // no active session yet — matches showStartState()'s invariant
+    loadRecentProjects();
+  }
+
   /* ---------- live activity feed ---------- */
   var activityState = [];   /* newest-first, ≤40 (server-capped) */
 
@@ -2427,19 +4082,228 @@
     apply();
   }
 
+  /* ---------- test-and-verification toggle (stage C) ----------
+     Global (not per-session), and lives ONLY in the header Settings drawer — that IS
+     its "header-level" placement per the spec, so there is exactly one DOM instance
+     and no mirroring/drift risk to manage. */
+  function loadTestVerification(silent){
+    return api('/api/agent/test-verification').then(function(r){
+      var sw = $('#drawer-test-verification-switch');
+      if (sw) sw.checked = !!(r && r.enabled);
+    }).catch(function(e){ if (!silent) toast('Test-verification: ' + e.message, true); });
+  }
+  function initTestVerification(){
+    var sw = $('#drawer-test-verification-switch');
+    if (!sw) return;
+    sw.addEventListener('change', function(){
+      var want = sw.checked;
+      sw.disabled = true;
+      api('/api/agent/test-verification', { method: 'POST', body: { enabled: want } })
+        .then(function(r){
+          sw.checked = !!(r && r.enabled);
+          toast('Test-and-verification mode ' + (sw.checked ? 'on' : 'off'));
+        })
+        .catch(function(e){ toast('Test-verification: ' + e.message, true); sw.checked = !want; })
+        .then(function(){ sw.disabled = false; });
+    });
+  }
+
+  /* ---------- vision-gap badge (stage C) ----------
+     Three choices, matched honestly to what the backend actually does (see
+     vision_status.py): "report once available" is a REAL client-side action (poll +
+     toast on the unavailable->available flip, this browser tab only — no server push
+     exists); "schedule automatic recheck" is NOT a togglable action because the
+     backend already reruns this check unconditionally every ~45 minutes, so it's
+     shown as a plain informational line, not a button; "skip for now" just dismisses
+     the badge locally until the next page load. */
+  var visionState = { available: null, notify: false, dismissed: false };
+  function loadVisionStatus(silent){
+    return api('/api/agent/vision-status').then(function(r){
+      r = r || {};
+      var was = visionState.available;
+      var now = !!r.available;
+      if (visionState.notify && was === false && now === true){
+        toast('A vision-capable model is now available.');
+      }
+      visionState.available = now;
+      var wrap = $('#vision-gap-wrap');
+      if (wrap) wrap.hidden = now || visionState.dismissed;
+    }).catch(function(e){ if (!silent) toast('Vision status: ' + e.message, true); });
+  }
+  function initVisionGap(){
+    var notifyCb = $('#vg-notify-toggle');
+    if (notifyCb) notifyCb.addEventListener('change', function(){ visionState.notify = notifyCb.checked; });
+    var dismissBtn = $('#vg-dismiss');
+    if (dismissBtn) dismissBtn.addEventListener('click', function(){
+      visionState.dismissed = true;
+      var wrap = $('#vision-gap-wrap');
+      if (wrap) wrap.hidden = true;
+    });
+  }
+
+  /* ---------- header Settings drawer ---------- */
+  function openSettingsDrawer(){
+    $('#settings-drawer').hidden = false;
+    $('#settings-drawer-scrim').hidden = false;
+    loadTestVerification(true);
+  }
+  function closeSettingsDrawer(){
+    $('#settings-drawer').hidden = true;
+    $('#settings-drawer-scrim').hidden = true;
+  }
+  function initSettingsDrawer(){
+    var openBtn = $('#settings-drawer-open');
+    var closeBtn = $('#settings-drawer-close');
+    var scrim = $('#settings-drawer-scrim');
+    if (openBtn) openBtn.addEventListener('click', openSettingsDrawer);
+    if (closeBtn) closeBtn.addEventListener('click', closeSettingsDrawer);
+    if (scrim) scrim.addEventListener('click', closeSettingsDrawer);
+    document.addEventListener('keydown', function(e){
+      if (e.key === 'Escape' && !$('#settings-drawer').hidden) closeSettingsDrawer();
+    });
+  }
+
+  /* ---------- settings export / import ----------
+     Sections are the REAL backend list (_SETTINGS_SECTIONS in app.py) — deliberately
+     NOT "API keys / history / other settings" as a first draft might assume: the
+     export/import routes have no "history" section (conversation transcripts are
+     explicitly out of scope server-side, see app.py's own comment on that), so this
+     bundles the real remaining sections into one "Other settings" checkbox and says
+     so plainly instead of offering a checkbox that would silently no-op. */
+  var _EXPORT_SECTION_MAP = { api: ['api_keys'], other: ['flags', 'default', 'local_api_key', 'media', 'images'] };
+  function openExportModal(){
+    var body = frag();
+    var opts = document.createElement('div'); opts.className = 'export-opts';
+    opts.innerHTML =
+      '<label><input type="checkbox" id="exp-all" checked> Select all</label>' +
+      '<div class="sep"></div>' +
+      '<label><input type="checkbox" id="exp-api" checked> API keys &amp; connections</label>' +
+      '<label><input type="checkbox" id="exp-other" checked> Other settings (default model, feature toggles, media priorities)</label>' +
+      '<p class="export-note">Conversation history isn&rsquo;t included in export yet.</p>';
+    body.appendChild(opts);
+    var actions = document.createElement('div'); actions.className = 'sd-actions';
+    var goBtn = document.createElement('button');
+    goBtn.type = 'button'; goBtn.className = 'btn primary'; goBtn.textContent = 'Download export';
+    actions.appendChild(goBtn);
+    body.appendChild(actions);
+    openModal('Export settings', body);
+
+    var allCb = opts.querySelector('#exp-all');
+    var apiCb = opts.querySelector('#exp-api');
+    var otherCb = opts.querySelector('#exp-other');
+    allCb.addEventListener('change', function(){ apiCb.checked = otherCb.checked = allCb.checked; });
+    [apiCb, otherCb].forEach(function(cb){
+      cb.addEventListener('change', function(){ allCb.checked = apiCb.checked && otherCb.checked; });
+    });
+
+    goBtn.addEventListener('click', function(){
+      if (goBtn.disabled) return;
+      var sections = [];
+      if (apiCb.checked) sections = sections.concat(_EXPORT_SECTION_MAP.api);
+      if (otherCb.checked) sections = sections.concat(_EXPORT_SECTION_MAP.other);
+      if (!sections.length){ toast('Pick at least one section first', true); return; }
+      goBtn.disabled = true;
+      var oldLabel = goBtn.textContent;
+      goBtn.textContent = 'Preparing…';
+      // Fetched via api() (control-token header attached automatically) rather than a
+      // plain <a href> navigation, so the token never has to travel in a URL/history.
+      api('/api/settings/export?sections=' + encodeURIComponent(sections.join(','))).then(function(json){
+        var blob = new Blob([JSON.stringify(json, null, 2)], { type: 'application/json' });
+        var url = URL.createObjectURL(blob);
+        var d = new Date();
+        var pad = function(n){ return n < 10 ? '0' + n : '' + n; };
+        var filename = 'calvoun-hub-settings-' + d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + '.json';
+        var a = document.createElement('a');
+        a.href = url; a.download = filename;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function(){ URL.revokeObjectURL(url); }, 4000);
+        toast('Export downloaded');
+        closeModal();
+      }).catch(function(e){
+        toast('Export failed: ' + e.message, true);
+      }).then(function(){
+        goBtn.disabled = false;
+        goBtn.textContent = oldLabel;
+      });
+    });
+  }
+
+  function initSettingsExportImport(){
+    var expBtn = $('#settings-export-open');
+    if (expBtn) expBtn.addEventListener('click', function(){ if (expBtn.disabled) return; openExportModal(); });
+    var impOpenBtn = $('#settings-import-open');
+    var impFile = $('#settings-import-file');
+    if (!impOpenBtn || !impFile) return;
+    impOpenBtn.addEventListener('click', function(){ if (impOpenBtn.disabled) return; impFile.click(); });
+    impFile.addEventListener('change', function(){
+      var file = impFile.files && impFile.files[0];
+      impFile.value = '';   // allow re-selecting the same file again later
+      if (!file) return;
+      impOpenBtn.disabled = true;
+      var oldLabel = impOpenBtn.textContent;
+      impOpenBtn.textContent = 'Importing…';
+      var reader = new FileReader();
+      reader.onload = function(){
+        var parsed;
+        try { parsed = JSON.parse(String(reader.result)); }
+        catch(e){
+          toast('That file is not valid JSON', true);
+          impOpenBtn.disabled = false; impOpenBtn.textContent = oldLabel;
+          return;
+        }
+        api('/api/settings/import', { method: 'POST', body: parsed }).then(function(r){
+          var imported = (r && Array.isArray(r.imported)) ? r.imported.join(', ') : 'settings';
+          toast('Imported ' + imported + ' — reloading to apply…');
+          // Auto-reload (rather than just prompting) so every panel that reads this
+          // config (providers, default model, media/image priorities, flags) is
+          // guaranteed consistent immediately, with no leftover stale in-memory state.
+          setTimeout(function(){ window.location.reload(); }, 1600);
+        }).catch(function(e){
+          toast('Import failed: ' + e.message, true);
+        }).then(function(){
+          impOpenBtn.disabled = false;
+          impOpenBtn.textContent = oldLabel;
+        });
+      };
+      reader.onerror = function(){
+        toast('Could not read that file', true);
+        impOpenBtn.disabled = false; impOpenBtn.textContent = oldLabel;
+      };
+      reader.readAsText(file);
+    });
+  }
+
   /* ---------- boot ---------- */
   initCollapsibles();
   initScrollTop();
   initModal();
   initLifecycle();
   initChat();
+  initImages();
+  initUsage();
+  initSubscriptions();
+  initAgentSettings();
+  initAgent();
+  initArtifactPanel();
+  initVisionGap();
+  initTestVerification();
+  initSettingsDrawer();
+  initSettingsExportImport();
   loadLifecycle();
-  loadStatus().then(updateChatAuthNote);
+  loadImages();
+  loadUsage();
+  loadStatus().then(function(){ updateChatAuthNote(); updateImageAuthNote(); });
   loadProviders().then(scheduleKeyHealthChecks);   /* colour keyed cards by live key health, capped concurrency */
   loadModels().then(loadDefault).then(loadChatModels);
   loadClis();
+  loadSubscriptions();
+  loadAgentSettings();
+  loadVisionStatus();
   loadActivity();
-  setInterval(function(){ loadStatus(true); loadLifecycle(true); }, 15000);   /* server re-sync */
+  setInterval(function(){
+    loadStatus(true); loadLifecycle(true); loadImages(true); loadSubscriptions(true);
+    loadAgentSettings(true); loadVisionStatus(true);
+  }, 15000);   /* server re-sync */
   setInterval(loadActivity, 3000);                       /* live activity feed poll */
   setInterval(tick, 1000);                               /* local 1s countdown */
   setInterval(tickActivity, 1000);                       /* local 1s in-flight duration */

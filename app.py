@@ -23,17 +23,20 @@ import hmac
 import base64
 import binascii
 import copy
+import ipaddress
 import json
 import os
+import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import uuid
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import requests
 from flask import Flask, Response, g, jsonify, render_template, request, stream_with_context
@@ -44,9 +47,14 @@ except Exception:  # pragma: no cover - jinja2 always ships with flask
     class TemplateNotFound(Exception):
         pass
 
+import agentic_chat
+import agentic_history
 import config
+import image_history
 import providers as prov
 import quota
+import usage_history
+import vision_status
 
 import logging
 import traceback as _traceback
@@ -359,15 +367,28 @@ def aggregated_models():
 # --------------------------------------------------------------------------- #
 # Capability families, strongest first. Matched case-insensitively as substrings.
 _BENCH_FAMILY = [
+    # NOTE: "gemini-3-pro"/"gemini-3.5-pro"/"*-ultra" ONLY -- a bare "gemini-3"
+    # here was a live, reproduced bug: it's a substring of "gemini-3.1-flash-
+    # lite-preview" (Google's CHEAPEST free tier), which was outscoring every
+    # other candidate at 101.0 and getting picked as "the best" by /api/default/
+    # auto. Flash/flash-lite variants must fall through to a lower tier (see
+    # "flash-lite" in the weakest tier below) based on their OWN merits, not
+    # inherit the flagship family's score just for sharing a version prefix.
     (("deepseek-v4", "deepseek-r2", "grok-4", "gpt-5", "claude-opus", "claude-sonnet-5",
-      "gemini-3", "llama-4-maverick", "qwen3.5", "qwen3-max"), 100),
+      "gemini-3-pro", "gemini-3.5-pro", "gemini-3-ultra", "gemini-3.5-ultra",
+      "llama-4-maverick", "qwen3.5", "qwen3-max"), 100),
     (("deepseek-v3", "deepseek-r1", "gpt-oss-120b", "llama-4", "qwen3", "gemini-2.5-pro",
       "mixtral-8x22", "command-r-plus", "minimax", "glm-5", "glm52", "kimi"), 82),
     (("llama-3.3-70b", "llama-3.1-405", "qwen2.5-72", "gemini-2.5-flash", "gemma-3-27",
       "mistral-large", "nemotron-70", "command-r", "gpt-4o"), 68),
     (("70b", "72b", "gemini-2.0", "gpt-4o-mini", "mistral-small", "codestral", "gemma-2-27"), 52),
     (("32b", "27b", "gemma-3", "phi-4", "qwen2.5-coder"), 40),
-    (("8b", "9b", "7b", "flash-lite", "mini", "small", "nemo"), 24),
+    # "-mini" (not bare "mini") -- a bare substring match also silently caught
+    # every "gemini-*" id (ge-MINI-...), a second live-verified scoring bug
+    # found right alongside the "gemini-3" one above: any Gemini model that
+    # didn't hit an earlier explicit tier was getting an unearned tier-6 floor
+    # score just for containing "mini" inside its own family name.
+    (("8b", "9b", "7b", "flash-lite", "-mini", "small", "nemo"), 24),
 ]
 
 
@@ -665,6 +686,31 @@ def _est_tokens(messages, tools=None):
     return chars // 4 + 400  # + overhead for roles/formatting
 
 
+def _record_chat_usage(hop_pid, hop_model, data, prompt_est):
+    """Record usage from a completed OpenAI-shaped chat response `data` (the
+    raw upstream JSON -- all three protocol handlers dispatch through the
+    same OpenAI-shaped upstream call, so this is one shared hook point).
+    Uses the REAL usage object when the provider returned one; otherwise
+    falls back to the same char/4 estimate this file already uses elsewhere
+    (_est_tokens). Never raises -- usage_history.record() already swallows
+    its own errors, but guard the data-parsing here too."""
+    try:
+        usage = data.get("usage") if isinstance(data, dict) else None
+        if isinstance(usage, dict) and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
+            usage_history.record(hop_pid, hop_model,
+                                 usage.get("prompt_tokens") or 0,
+                                 usage.get("completion_tokens") or 0, estimated=False)
+            return
+        content = ""
+        choice = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
+        msg = choice.get("message") or {}
+        if isinstance(msg.get("content"), str):
+            content = msg["content"]
+        usage_history.record(hop_pid, hop_model, prompt_est, len(content) // 4, estimated=True)
+    except Exception:
+        pass
+
+
 def _provider_capable(pid, est):
     """Can this provider's free tier take a single `est`-token request? (margin
     for the model's own reply added.)"""
@@ -800,6 +846,7 @@ _SUB_PROVIDERS = {
         "model": "claude",           # exposed as 'sub-claude/claude'
         "cli_id": "claude",          # CLI_REGISTRY row (loop-guard reuse)
         "flag": "sub_claude_enabled",
+        "isolated_flag": "sub_claude_isolated",   # opt-in, default OFF (see below)
     },
     "sub-codex": {
         "name": "Codex subscription (local)",
@@ -807,6 +854,7 @@ _SUB_PROVIDERS = {
         "model": "codex",            # exposed as 'sub-codex/codex'
         "cli_id": "codex",
         "flag": "sub_codex_enabled",
+        "isolated_flag": "sub_codex_isolated",
     },
 }
 _SUB_TIMEOUT = 120        # seconds for one run (CLI cold start + generation)
@@ -815,6 +863,138 @@ _SUB_TIMEOUT = 120        # seconds for one run (CLI cold start + generation)
 # a sub hop is a last resort, not a bulk-context path. Over the cap the hop
 # returns 413 and the chain moves on instead of freezing for the full timeout.
 _SUB_MAX_PROMPT_CHARS = 100000
+
+
+# --------------------------------------------------------------------------- #
+# ISOLATED installs — OPT-IN, per-provider, default OFF.
+#
+# By default a sub-* hop runs the SAME `claude`/`codex` binary and config the
+# user's own interactive terminal uses (whatever `shutil.which()` finds, reading
+# ~/.claude or ~/.codex like normal). Some users want the hub's hop to be a
+# COMPLETELY SEPARATE copy — signed into the SAME subscription, but never
+# sharing config/credentials/session state with their own terminal. This block
+# is that: a private npm --prefix install + the CLI's own OFFICIAL config-dir
+# override env var, both scoped under ~/.free-llm-hub/isolated-clis/<cli_id>/.
+#
+# Env vars (verified against OFFICIAL docs, not guessed — see comments below):
+#   codex  -> CODEX_HOME          confirmed: developers.openai.com/codex/environment-variables
+#             ("Sets the root for Codex state... If you set it, the directory
+#             must already exist" — Codex will NOT create it for you).
+#   claude -> CLAUDE_CONFIG_DIR   confirmed: code.claude.com/docs/en/authentication
+#             ("If you've set the CLAUDE_CONFIG_DIR environment variable on
+#             Linux or Windows, the .credentials.json file lives under that
+#             directory instead" — stated for Linux/Windows; macOS always uses
+#             the system Keychain regardless of this var, which is fine here
+#             since this hub only ever spawns a LOCAL subprocess, not macOS
+#             Keychain-mediated auth).
+#
+# Both are confirmed, so isolation is fully implemented for BOTH providers —
+# no guessed env var, no silent no-op.
+#
+# Login itself (OAuth/subscription sign-in) is NOT scriptable headlessly for
+# either CLI — both vendors' docs require a human to complete a browser step
+# (or, for Codex, enter a device code into a browser on any device) — see
+# _isolated_login_command(). This hub can create the isolated dir, install the
+# isolated binary, and hand the user the exact command to run themselves; it
+# cannot click through OAuth consent for them.
+# --------------------------------------------------------------------------- #
+_ISOLATED_ENV_VAR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
+_ISOLATED_NPM_PACKAGE = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex"}
+_ISOLATED_INSTALL_TIMEOUT = 300   # npm install can be slow; this is an admin click, not a hop
+
+
+def _isolated_root():
+    """~/.free-llm-hub/isolated-clis — separate from wherever the user's own
+    interactive install lives. Path only; no filesystem side effects."""
+    return os.path.join(_home(), ".free-llm-hub", "isolated-clis")
+
+
+def _isolated_cli_dir(cli_id):
+    """~/.free-llm-hub/isolated-clis/<claude|codex>. Path only — see
+    _ensure_isolated_dirs() for the actual mkdir."""
+    return os.path.join(_isolated_root(), cli_id)
+
+
+def _isolated_install_dir(cli_id):
+    """`npm install -g <pkg> --prefix <this>` target for the isolated copy."""
+    return os.path.join(_isolated_cli_dir(cli_id), "install")
+
+
+def _isolated_config_dir(cli_id):
+    """Value handed to CODEX_HOME / CLAUDE_CONFIG_DIR for the isolated copy."""
+    return os.path.join(_isolated_cli_dir(cli_id), "config")
+
+
+def _ensure_isolated_dirs(cli_id):
+    """Create the isolated install+config dirs if missing. Never raises
+    (best-effort — a failure here just means the caller's own next filesystem/
+    subprocess call fails with its own clear error instead).
+
+    Codex's docs are explicit it will NOT create CODEX_HOME itself ("the
+    directory must already exist"), so this always runs BEFORE the isolated
+    npm install and before any isolated subprocess env is built — for both
+    providers, for consistency, even though only Codex is documented to need
+    it pre-created."""
+    for d in (_isolated_install_dir(cli_id), _isolated_config_dir(cli_id)):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+
+
+def _isolated_bin_path(cli_id, bin_name):
+    """Resolve the isolated binary, or None. Never raises. Pure read — does NOT
+    create any directory (safe to call from a GET / dashboard render).
+
+    npm's global-install layout under --prefix differs by OS: POSIX puts the
+    launcher at <prefix>/bin/<name>; Windows puts the .cmd/.ps1 shim directly in
+    <prefix> itself. shutil.which(..., path=...) already does PATHEXT-aware
+    resolution (.cmd/.exe/etc on Windows, no extension on POSIX), so searching
+    both candidate directories through it covers both layouts without
+    hand-rolling an extension guess."""
+    install_dir = _isolated_install_dir(cli_id)
+    search = os.pathsep.join([install_dir, os.path.join(install_dir, "bin")])
+    try:
+        return shutil.which(bin_name, path=search)
+    except Exception:
+        return None
+
+
+def _sub_isolated_on(pid):
+    """The per-provider isolated-profile opt-in. DEFAULT FALSE — with it off,
+    _sub_bin/_sub_env/_sub_state behave EXACTLY as they did before this feature
+    (shared install, shared ~/.claude or ~/.codex)."""
+    cfg = _SUB_PROVIDERS.get(pid)
+    flag = cfg.get("isolated_flag") if cfg else None
+    return bool(flag and config.get_flag(flag, False))
+
+
+def _isolated_login_command(pid):
+    """(command:str|None, note:str|None) — the EXACT command the user runs
+    THEMSELVES in their own terminal to sign the isolated copy in.
+
+    Neither CLI's subscription/OAuth login can be scripted headlessly — both
+    vendors' docs require a human to complete a browser step (Claude: a login
+    URL/code; Codex: the default browser callback OR `--device-auth`, which
+    prints a code to enter into a browser on ANY device). So this hands back a
+    ready-to-paste command with the isolated env var pre-set, never an attempt
+    to drive the login itself. Returns (None, reason) when there's no isolated
+    binary yet — install it first."""
+    cfg = _SUB_PROVIDERS.get(pid)
+    if not cfg:
+        return None, "Unknown subscription provider."
+    cli_id = cfg["cli_id"]
+    bin_path = _isolated_bin_path(cli_id, cfg["bin"])
+    if not bin_path:
+        return None, "Install the isolated copy first."
+    conf_dir = _isolated_config_dir(cli_id)
+    var = _ISOLATED_ENV_VAR[cli_id]
+    login_arg = " login" if cli_id == "codex" else ""   # `claude` itself walks first-launch login
+    if os.name == "nt":
+        cmd = "$env:%s = '%s'; & '%s'%s" % (var, conf_dir, bin_path, login_arg)
+    else:
+        cmd = "%s='%s' '%s'%s" % (var, conf_dir, bin_path, login_arg)
+    return cmd, None
 
 
 def _is_sub(pid):
@@ -834,34 +1014,49 @@ def _sub_master_on():
 
 
 def _sub_bin(pid):
-    """Absolute path to the CLI binary, or None. Never raises."""
+    """Absolute path to the CLI binary, or None. Never raises.
+
+    When the isolated profile is ON for this provider, resolves ONLY inside its
+    isolated install dir — it deliberately does NOT fall back to the shared
+    PATH copy, since silently mixing the two would defeat the point of
+    isolation (a "not installed" isolated provider must show as not installed,
+    even if the user's regular `claude`/`codex` is right there on PATH)."""
     cfg = _SUB_PROVIDERS.get(pid)
     if not cfg:
         return None
     try:
+        if _sub_isolated_on(pid):
+            return _isolated_bin_path(cfg["cli_id"], cfg["bin"])
         return shutil.which(cfg["bin"])
     except Exception:
         return None
 
 
-def _codex_subscription_auth():
-    """(ok, detail) for ~/.codex/auth.json — is Codex signed in with a ChatGPT
+def _codex_subscription_auth(codex_home=None):
+    """(ok, detail) for <codex_home>/auth.json — is Codex signed in with a ChatGPT
     SUBSCRIPTION (not an API key)? Reads the file's shape only; no token is ever
     returned, logged or copied. Never raises.
+
+    codex_home=None (default) checks the shared ~/.codex — byte-identical to
+    this function's original behavior. Pass the isolated config dir instead to
+    check an isolated profile's own auth.json (same file shape, different
+    CODEX_HOME) — the message text switches to the actual path in that case.
 
     auth_mode == 'chatgpt' (or an OAuth token pair) == subscription. An
     API-key-only auth.json is deliberately REJECTED: that bills per token, which
     is not what this feature offers."""
-    path = os.path.join(_home(), ".codex", "auth.json")
+    base = codex_home or os.path.join(_home(), ".codex")
+    path = os.path.join(base, "auth.json")
+    label = "~/.codex/auth.json" if codex_home is None else _short(path)
     if not os.path.isfile(path):
-        return False, "Not signed in (no ~/.codex/auth.json). Run: codex login"
+        return False, "Not signed in (no %s). Run: codex login" % label
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return False, "~/.codex/auth.json is unreadable or not valid JSON."
+        return False, "%s is unreadable or not valid JSON." % label
     if not isinstance(data, dict):
-        return False, "~/.codex/auth.json has an unexpected shape."
+        return False, "%s has an unexpected shape." % label
     mode = str(data.get("auth_mode") or "").lower()
     tokens = data.get("tokens")
     has_tokens = isinstance(tokens, dict) and bool(
@@ -869,9 +1064,9 @@ def _codex_subscription_auth():
     if mode == "chatgpt":
         return True, "Signed in with a ChatGPT subscription (auth_mode=chatgpt)."
     if has_tokens:
-        return True, "Signed in (OAuth session present in ~/.codex/auth.json)."
-    return False, ("~/.codex/auth.json holds no ChatGPT subscription session "
-                   "(API-key mode). Run: codex login")
+        return True, "Signed in (OAuth session present in %s)." % label
+    return False, ("%s holds no ChatGPT subscription session "
+                   "(API-key mode). Run: codex login" % label)
 
 
 def _sub_loops_back(cli_id):
@@ -900,26 +1095,44 @@ def _sub_loops_back(cli_id):
 def _sub_state(pid):
     """(enabled, installed, authenticated, detail) for one sub provider.
 
-    Pure inspection: never runs the CLI (so it costs nothing), never raises."""
+    Pure inspection: never runs the CLI, never touches the filesystem beyond
+    reads (so it costs nothing and is safe on every dashboard poll), never
+    raises."""
     cfg = _SUB_PROVIDERS.get(pid)
     if not cfg:
         return False, False, False, "Unknown subscription provider."
     enabled = bool(config.get_flag(cfg["flag"], True))   # per-provider default ON
+    isolated = _sub_isolated_on(pid)
     path = _sub_bin(pid)
     if not path:
+        if isolated:
+            return enabled, False, False, ("Isolated copy not installed yet (looked under %s). "
+                                           "Click \"Install isolated copy\"."
+                                           % _short(_isolated_install_dir(cfg["cli_id"])))
         return enabled, False, False, "Not installed (no '%s' on PATH)." % cfg["bin"]
-    loops, loop_detail = _sub_loops_back(cfg["cli_id"])
+    if isolated:
+        # An isolated install reads ONLY its own CODEX_HOME/CLAUDE_CONFIG_DIR — a
+        # directory Auto-fix never writes to — so it can NEVER loop back into this
+        # hub. Checking the SHARED CLI entry's connection status here would wrongly
+        # block isolation for exactly the user who ALSO has their main CLI
+        # connected via Auto-fix (arguably the main reason to want isolation in the
+        # first place), so the loop-guard is skipped for an isolated profile.
+        loops, loop_detail = False, None
+    else:
+        loops, loop_detail = _sub_loops_back(cfg["cli_id"])
     if loops:
         return enabled, True, False, loop_detail
     if pid == "sub-codex":
-        ok, detail = _codex_subscription_auth()
+        codex_home = _isolated_config_dir("codex") if isolated else None
+        ok, detail = _codex_subscription_auth(codex_home)
         return enabled, True, ok, detail
     # sub-claude: do NOT try to parse Claude Code's credentials. They live across
     # an OS keychain / OAuth store / managed settings depending on the install, so
     # any check here would be a guess that wrongly hides a working CLI. Installed
     # == usable; a failed run marks the model dead and routing skips it for 6h.
-    return enabled, True, True, ("Installed (%s). Uses the local Claude Code session; "
-                                 "a failed run sidelines it automatically." % _short(path))
+    where = "an isolated profile" if isolated else "the local Claude Code session"
+    return enabled, True, True, ("Installed (%s). Uses %s; "
+                                 "a failed run sidelines it automatically." % (_short(path), where))
 
 
 def _sub_available_providers():
@@ -991,16 +1204,30 @@ def _sub_launcher(path):
     return [path]
 
 
-def _sub_env():
+def _sub_env(pid=None):
     """Child env with every HUB-POINTING override stripped, so the CLI talks to
     its own subscription backend and can't be redirected back into this hub.
     Defense in depth — _sub_loops_back() already refuses a CLI configured to
     point here; this also covers a hub process that merely inherited such a var.
-    Everything else (PATH, HOME, the user's own settings) is passed through."""
+    Everything else (PATH, HOME, the user's own settings) is passed through.
+
+    pid=None (default) is byte-identical to this function's original behavior.
+    When `pid` is given AND its isolated profile is on, this ALSO points that
+    CLI's own config-dir override env var (CODEX_HOME / CLAUDE_CONFIG_DIR) at
+    its isolated config dir (creating it first — Codex refuses to use a
+    CODEX_HOME that doesn't already exist), so the subprocess never touches
+    ~/.claude or ~/.codex at all."""
     env = dict(os.environ)
     for k in list(env.keys()):
         if _points_at_hub(env.get(k)):
             env.pop(k, None)
+    if pid and _sub_isolated_on(pid):
+        cfg = _SUB_PROVIDERS.get(pid) or {}
+        cli_id = cfg.get("cli_id")
+        var = _ISOLATED_ENV_VAR.get(cli_id)
+        if var and cli_id:
+            _ensure_isolated_dirs(cli_id)
+            env[var] = _isolated_config_dir(cli_id)
     return env
 
 
@@ -1096,7 +1323,7 @@ def _sub_run(pid, prompt):
         try:
             proc = subprocess.run(argv, input=prompt, capture_output=True, text=True,
                                   encoding="utf-8", errors="replace",
-                                  timeout=_SUB_TIMEOUT, env=_sub_env(),
+                                  timeout=_SUB_TIMEOUT, env=_sub_env(pid),
                                   cwd=tempfile.gettempdir())
         except subprocess.TimeoutExpired:
             return 504, "", "%s timed out after %ds." % (cfg["bin"], _SUB_TIMEOUT)
@@ -1524,6 +1751,49 @@ def _retryable(status):
     return status == 429 or status >= 500
 
 
+# --------------------------------------------------------------------------- #
+# SOFT 400s — errors that _retryable() correctly treats as "hard" (never
+# auto-retried) but that are actually just "this exact model/provider can't
+# serve THIS request", not "everything is broken". Two observed in the wild:
+#   - a small-context model rejecting a request that's too big for its window
+#     ("context_length_exceeded" / "reduce the length of the messages")
+#   - Gemini's 400 "missing thought_signature in functionCall parts" on
+#     multi-turn tool use — a protocol quirk of GEMINI'S OWN tool-calling
+#     continuity that a stateless proxy cannot repair by editing the payload
+#     (the signature must come from a prior Gemini turn the hub never saw).
+#     The fix is routing around it, not patching the payload.
+# Both must fall through to the next chain hop SILENTLY instead of being
+# replayed to the CLI as `last_hard` once the chain is exhausted — surfacing
+# either one just breaks the CLI's turn for a cause it can't act on, when a
+# different free model would likely have answered fine.
+# --------------------------------------------------------------------------- #
+_SOFT_400_CONTEXT_RE = re.compile(
+    r"context_length_exceeded|reduce the length of the (?:messages|prompt)|"
+    r"maximum context length|prompt is too long", re.I)
+_SOFT_400_TOOL_RE = re.compile(r"thought_signature", re.I)
+
+
+def _classify_soft_400(resp):
+    """True for a response ALREADY KNOWN to be HTTP 400 that matches a known
+    SHOULD-NEVER-REACH-THE-CLIENT signature — don't treat it as a hard/
+    relayable error, just move on to the next hop. False for a genuine hard
+    error that should still be relayed if the whole chain is exhausted.
+
+    Deliberately does NOT try to parse a "required token count" out of the
+    error body to pre-emptively skip smaller-context hops: an adversarial
+    review found that a blind digit-scan over the whole JSON body can pick up
+    an unrelated large number (a request/trace id) and inflate the learned
+    size into the billions, which then fails EVERY remaining hop's capacity
+    check and collapses the fallback chain to nothing — worse than the
+    original bug. The safe fix is simpler: just don't surface these two
+    signatures raw, and let the existing hop loop try the next candidate."""
+    try:
+        text = json.dumps(resp.json())
+    except ValueError:
+        text = resp.text or ""
+    return bool(_SOFT_400_TOOL_RE.search(text) or _SOFT_400_CONTEXT_RE.search(text))
+
+
 def _upstream_error_detail(resp):
     try:
         data = resp.json()
@@ -1695,6 +1965,7 @@ _INFERENCE_PATHS = {
     "/v1/chat/completions": "openai",
     "/v1/responses": "responses",
     "/v1/messages": "anthropic",
+    "/v1/images/generations": "images",
 }
 # Map a client's User-Agent to a friendly CLI/tool label (best-effort).
 _UA_CLI = (
@@ -1855,6 +2126,11 @@ def _provider_row(pid, live_models=False):
 
 @app.route("/api/providers", methods=["GET"])
 def api_providers():
+    # include_custom stays the default (False): the generic "Custom
+    # (OpenAI-compatible)" card was briefly surfaced here so a not-yet-
+    # registered provider (AIAND) could be configured through it, but AIAND
+    # now has its own proper registry row with a confirmed base_url -- the
+    # generic card is redundant again and the user asked for it hidden.
     return jsonify([_provider_row(p["id"]) for p in prov.list_providers()])
 
 
@@ -2177,6 +2453,16 @@ def api_status():
     })
 
 
+@app.route("/api/usage", methods=["GET"])
+def api_usage():
+    date_str = request.args.get("date")
+    if date_str and not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+    payload = usage_history.get_day(date_str)
+    payload["available_days"] = usage_history.recent_days()
+    return jsonify(payload)
+
+
 def _media_payload():
     state = config.get_media_state()
     models = []
@@ -2346,10 +2632,14 @@ _SUB_WARNING = (
 
 def _sub_provider_rows():
     """One row per sub provider for the dashboard. Inspection only — never runs a
-    CLI, so opening the page costs nothing."""
+    CLI or writes to disk, so opening the page costs nothing."""
     rows = []
     for pid, cfg in _SUB_PROVIDERS.items():
         enabled, installed, authed, detail = _sub_state(pid)
+        cli_id = cfg["cli_id"]
+        isolated = _sub_isolated_on(pid)
+        iso_bin = _isolated_bin_path(cli_id, cfg["bin"])
+        login_cmd, login_note = _isolated_login_command(pid)
         rows.append({
             "id": pid,
             "name": cfg["name"],
@@ -2360,6 +2650,17 @@ def _sub_provider_rows():
             "enabled": enabled,
             "usable": bool(_sub_master_on() and enabled and authed),
             "detail": detail,
+            # Isolated-install profile (opt-in, default off — see _sub_isolated_on).
+            "isolated": isolated,
+            "isolated_supported": True,   # both CODEX_HOME and CLAUDE_CONFIG_DIR are
+                                          # CONFIRMED official env vars (see comments
+                                          # above _ISOLATED_ENV_VAR) -- no guessed gap.
+            "isolated_installed": bool(iso_bin),
+            "isolated_install_dir": _short(_isolated_install_dir(cli_id)),
+            "isolated_config_dir": _short(_isolated_config_dir(cli_id)),
+            "isolated_env_var": _ISOLATED_ENV_VAR.get(cli_id),
+            "isolated_login_command": login_cmd,
+            "isolated_login_note": login_note,
         })
     return rows
 
@@ -2378,14 +2679,17 @@ def api_subscriptions():
 
 @app.route("/api/subscriptions", methods=["POST"])
 def api_subscriptions_update():
-    """Toggle the master switch or ONE provider, then return the same shape.
+    """Toggle the master switch, or ONE provider's enabled/isolated flags, then
+    return the same shape.
 
-      {"enabled": bool}                        -> master switch
-      {"provider": "sub-codex", "enabled": bool} -> that provider only
+      {"enabled": bool}                             -> master switch
+      {"provider": "sub-codex", "enabled": bool}     -> that provider's enabled flag
+      {"provider": "sub-codex", "isolated": bool}    -> that provider's isolated-profile flag
+      (the last two keys may be combined in one body; each is applied independently)
 
-    When 'provider' is present, 'enabled' applies to THAT provider (the master
-    switch is only touched by a body without 'provider') — so one call can never
-    silently mean both."""
+    When 'provider' is present, 'enabled'/'isolated' apply to THAT provider (the
+    master switch is only touched by a body without 'provider') — so one call can
+    never silently mean both."""
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return jsonify({"error": "Invalid JSON body."}), 400
@@ -2394,15 +2698,570 @@ def api_subscriptions_update():
         if pid not in _SUB_PROVIDERS:
             return jsonify({"error": "Unknown subscription provider '%s'."
                                      % _sanitize(str(pid), 40)}), 400
-        if not isinstance(body.get("enabled"), bool):
-            return jsonify({"error": "Pass 'enabled' (bool) with 'provider'."}), 400
-        config.set_flag(_SUB_PROVIDERS[pid]["flag"], bool(body["enabled"]))
+        touched = False
+        if isinstance(body.get("enabled"), bool):
+            config.set_flag(_SUB_PROVIDERS[pid]["flag"], bool(body["enabled"]))
+            touched = True
+        if isinstance(body.get("isolated"), bool):
+            config.set_flag(_SUB_PROVIDERS[pid]["isolated_flag"], bool(body["isolated"]))
+            touched = True
+        if not touched:
+            return jsonify({"error": "Pass 'enabled' and/or 'isolated' (bool) with 'provider'."}), 400
     elif isinstance(body.get("enabled"), bool):
         config.set_flag(_SUB_MASTER_FLAG, bool(body["enabled"]))
     else:
         return jsonify({"error": "Pass {enabled: bool} and/or "
-                                 "{provider: 'sub-codex', enabled: bool}."}), 400
+                                 "{provider: 'sub-codex', enabled: bool, isolated: bool}."}), 400
     return jsonify(_sub_payload())
+
+
+@app.route("/api/subscriptions/<pid>/install-isolated", methods=["POST"])
+def api_subscriptions_install_isolated(pid):
+    """Install an ISOLATED copy of a sub provider's CLI via `npm install -g
+    <pkg> --prefix <isolated dir>`, so it never touches the shared ~/.claude or
+    ~/.codex the user's own terminal session uses.
+
+    Does NOT require the master/per-provider enable flags — installing spends
+    no money and never touches the shared CLI; those flags still gate actually
+    USING the result as a sub-* hop (_sub_state / _check_provider_ready,
+    unchanged). This IS a real subprocess call the user authorized by clicking
+    the dashboard button — every failure mode (npm missing, network,
+    permissions, timeout, non-zero exit) is surfaced in the response, never
+    swallowed."""
+    if pid not in _SUB_PROVIDERS:
+        return jsonify({"error": "Unknown subscription provider '%s'."
+                                 % _sanitize(str(pid), 40)}), 400
+    cfg = _SUB_PROVIDERS[pid]
+    cli_id = cfg["cli_id"]
+    pkg = _ISOLATED_NPM_PACKAGE.get(cli_id)
+    if not pkg:
+        return jsonify({"ok": False, "error": "No known npm package for '%s'." % cli_id}), 400
+    npm = shutil.which("npm")
+    if not npm:
+        return jsonify({"ok": False, "error":
+                        "npm is not on PATH. Install Node.js first (nodejs.org), then retry."}), 400
+    _ensure_isolated_dirs(cli_id)
+    install_dir = _isolated_install_dir(cli_id)
+    argv = _sub_launcher(npm) + ["install", "-g", pkg, "--prefix", install_dir]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=_ISOLATED_INSTALL_TIMEOUT,
+                              cwd=tempfile.gettempdir())
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "npm install timed out after %ds."
+                                              % _ISOLATED_INSTALL_TIMEOUT}), 504
+    except (OSError, ValueError) as exc:
+        return jsonify({"ok": False, "error": "npm failed to start: %s"
+                                              % exc.__class__.__name__}), 502
+    if proc.returncode != 0:
+        err = _sanitize(((proc.stderr or "") + "\n" + (proc.stdout or "")).strip(), 2000)
+        return jsonify({"ok": False, "error": "npm install exited %d: %s"
+                                              % (proc.returncode, err or "no detail")}), 502
+    bin_path = _isolated_bin_path(cli_id, cfg["bin"])
+    if not bin_path:
+        return jsonify({"ok": False, "error":
+                        ("npm reported success but no '%s' binary was found under %s."
+                         % (cfg["bin"], _short(install_dir)))}), 502
+    return jsonify({"ok": True, "bin_path": _short(bin_path), "install_dir": _short(install_dir)})
+
+
+# ---------------------------------------------------------------------------
+# Agentic chat -- opt-in, full-tool-access coding-agent mode (project-scoped).
+# ADDITIVE to the _SUB_PROVIDERS/_sub_run/_subscription_chat system above; that
+# one-shot, no-tool-access orchestration fallback is completely untouched by
+# this. See agentic_chat.py for the session registry + subprocess handling.
+# ---------------------------------------------------------------------------
+
+def _agent_gate():
+    """None when agentic chat is enabled; otherwise a (response, status) pair
+    the route should return immediately. NOT applied to /api/agent/settings
+    (that route is how the flag gets turned on/off in the first place) nor to
+    stop/end (a kill switch must still be able to kill/clean up a session even
+    after the master flag is flipped off)."""
+    if not agentic_chat.master_enabled():
+        return jsonify({"error": "Agentic chat is turned off. Enable it via "
+                                 "POST /api/agent/settings {\"enabled\": true}.",
+                        "code": "agentic_chat_disabled"}), 403
+    return None
+
+
+@app.route("/api/agent/settings", methods=["GET"])
+def api_agent_settings():
+    return jsonify({"enabled": agentic_chat.master_enabled(), "clis": agentic_chat.cli_support(),
+                    "default_cli": agentic_chat.default_cli()})
+
+
+@app.route("/api/agent/settings", methods=["POST"])
+def api_agent_settings_update():
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return jsonify({"error": "Pass {\"enabled\": bool}."}), 400
+    agentic_chat.set_master_enabled(body["enabled"])
+    return jsonify({"enabled": agentic_chat.master_enabled(), "clis": agentic_chat.cli_support(),
+                    "default_cli": agentic_chat.default_cli()})
+
+
+@app.route("/api/agent/test-verification", methods=["GET"])
+def api_agent_test_verification():
+    """Master, GLOBAL (not per-session) toggle for the test-verification
+    system-prompt notice -- mirrors /api/agent/settings' shape exactly. Not
+    gated by _agent_gate(): same reasoning as /api/agent/settings itself,
+    this IS the route that configures the behavior in the first place."""
+    return jsonify({"enabled": agentic_chat.test_verification_enabled()})
+
+
+@app.route("/api/agent/test-verification", methods=["POST"])
+def api_agent_test_verification_update():
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return jsonify({"error": "Pass {\"enabled\": bool}."}), 400
+    agentic_chat.set_test_verification_enabled(body["enabled"])
+    return jsonify({"enabled": agentic_chat.test_verification_enabled()})
+
+
+@app.route("/api/agent/vision-status", methods=["GET"])
+def api_agent_vision_status():
+    """Read-only capability probe: is at least one enabled+keyed provider
+    carrying a verified vision model? See vision_status.py. Deliberately NOT
+    gated by _agent_gate() (contrast with /api/agent/recent-projects, which
+    IS gated): this is a general hub capability signal a settings/status
+    panel should be able to show even before agentic chat itself is turned
+    on, not an agentic-session-scoped resource -- same "informational, no
+    live CLI subprocess touched" reasoning as the history routes below."""
+    return jsonify(vision_status.status())
+
+
+@app.route("/api/agent/sessions", methods=["POST"])
+def api_agent_start_session():
+    gate = _agent_gate()
+    if gate:
+        return gate
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "Invalid JSON body."}), 400
+    create_new = body.get("create_new", False)
+    if not isinstance(create_new, bool):
+        return jsonify({"error": "create_new must be a boolean."}), 400
+    try:
+        session_id = agentic_chat.start_session(body.get("cli"), body.get("project_dir"),
+                                                 create_new=create_new)
+    except agentic_chat.AgenticError as exc:
+        # exc.code/.extra carry the DISTINCT "not installed, but installable"
+        # shape (code="cli_not_installed", extra={"install_provider": "sub-..."})
+        # so the frontend can offer a one-click Install button that calls the
+        # EXISTING /api/subscriptions/<pid>/install-isolated route, instead of
+        # just failing. Plain validation errors have no .code and pass through
+        # as a generic {"error": ...} exactly as before.
+        payload = {"error": _sanitize(str(exc))}
+        if exc.code:
+            payload["code"] = exc.code
+        payload.update(exc.extra)
+        return jsonify(payload), exc.status
+    return jsonify(agentic_chat.get_session(session_id))
+
+
+@app.route("/api/agent/sessions", methods=["GET"])
+def api_agent_list_sessions():
+    gate = _agent_gate()
+    if gate:
+        return gate
+    return jsonify({"sessions": agentic_chat.list_sessions()})
+
+
+@app.route("/api/agent/recent-projects", methods=["GET"])
+def api_agent_recent_projects():
+    """Recently-used project_dir values (this process lifetime) -- lets the
+    workspace folder picker show a list instead of a blank text box."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    return jsonify({"recent_projects": agentic_chat.get_recent_projects()})
+
+
+@app.route("/api/agent/sessions/<session_id>", methods=["GET"])
+def api_agent_get_session(session_id):
+    gate = _agent_gate()
+    if gate:
+        return gate
+    sess = agentic_chat.get_session(session_id)
+    if sess is None:
+        return jsonify({"error": "No such agentic session."}), 404
+    return jsonify(sess)
+
+
+@app.route("/api/agent/sessions/<session_id>/message", methods=["POST"])
+def api_agent_send_message(session_id):
+    gate = _agent_gate()
+    if gate:
+        return gate
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("text"), str):
+        return jsonify({"error": "Pass {\"text\": string}."}), 400
+    # Persist the user's side BEFORE the (possibly long-running, up to
+    # _TURN_TIMEOUT) subprocess call -- so a hub restart mid-turn never loses
+    # the outgoing message. Only persist the agent's reply if a turn actually
+    # produced one (status 200); a 4xx/409/499/5xx has no reply text to save.
+    sess_info = agentic_chat.get_session(session_id)
+    if sess_info:
+        agentic_history.record_turn(session_id, sess_info["cli"], sess_info["project_dir"],
+                                    "user", body["text"])
+    status, text, detail = agentic_chat.send_message(session_id, body["text"])
+    if sess_info and status == 200 and text:
+        agentic_history.record_turn(session_id, sess_info["cli"], sess_info["project_dir"],
+                                    "agent", text)
+    return jsonify({"status": status, "text": text, "detail": detail}), status
+
+
+@app.route("/api/agent/sessions/<session_id>/stop", methods=["POST"])
+def api_agent_stop_session(session_id):
+    stopped = agentic_chat.stop_session(session_id)
+    return jsonify({"stopped": stopped})
+
+
+@app.route("/api/agent/sessions/<session_id>", methods=["DELETE"])
+def api_agent_end_session(session_id):
+    ended = agentic_chat.end_session(session_id)
+    return jsonify({"ended": ended})
+
+
+# ---------------------------------------------------------------------------
+# Agentic chat -- persisted conversation history + rewind checkpoints.
+# None of these five routes call _agent_gate(): they never touch a live CLI
+# subprocess, only the locally-persisted transcript (agentic_history.py), so
+# gating them behind agentic_chat_enabled would only block the user from
+# browsing/managing their OWN past conversations after turning the live
+# feature off -- that isn't what the master flag is for (same reasoning the
+# pre-existing stop/end routes above already use, and the same precedent as
+# /api/images/history's routes, which carry no image-generation-flag gate
+# either). They still go through the normal global request guard in
+# _local_control_guard() (loopback host/origin + dashboard header + control
+# token for any POST/PUT/PATCH/DELETE under /api/).
+#
+# Checkpoint scope reminder (see agentic_history.py docstring): a checkpoint
+# is a TRANSCRIPT BOOKMARK (turn index + timestamp + optional label), never a
+# filesystem snapshot/undo -- this hub has no sandboxing/versioning of the
+# project folder's actual files.
+# ---------------------------------------------------------------------------
+
+@app.route("/api/agent/history", methods=["GET"])
+def api_agent_history_list():
+    limit = request.args.get("limit", "50")
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    return jsonify({"conversations": agentic_history.list_conversations(limit=limit)})
+
+
+@app.route("/api/agent/history/<session_id>", methods=["GET"])
+def api_agent_history_get(session_id):
+    conv = agentic_history.get_conversation(session_id)
+    if conv is None:
+        return jsonify({"error": "No such conversation."}), 404
+    return jsonify(conv)
+
+
+@app.route("/api/agent/history/<session_id>", methods=["DELETE"])
+def api_agent_history_delete(session_id):
+    deleted = agentic_history.delete_conversation(session_id)
+    if not deleted:
+        return jsonify({"error": "No such conversation."}), 404
+    return jsonify({"deleted": True})
+
+
+@app.route("/api/agent/history/<session_id>/checkpoints", methods=["POST"])
+def api_agent_history_create_checkpoint(session_id):
+    body = request.get_json(force=True, silent=True)
+    label = body.get("label") if isinstance(body, dict) else None
+    if label is not None and not isinstance(label, str):
+        return jsonify({"error": "label must be a string."}), 400
+    checkpoint = agentic_history.create_checkpoint(session_id, label=label)
+    if checkpoint is None:
+        return jsonify({"error": "No such conversation."}), 404
+    return jsonify(checkpoint)
+
+
+@app.route("/api/agent/history/<session_id>/checkpoints", methods=["GET"])
+def api_agent_history_list_checkpoints(session_id):
+    return jsonify({"checkpoints": agentic_history.list_checkpoints(session_id)})
+
+
+# ---------------------------------------------------------------------------
+# Settings export/import -- a portable backup/restore of config.py's ACTUAL
+# persisted state (config.json: providers/keys, boolean flags, the default
+# model, the /v1/* local bearer key, and media/images priority preferences).
+#
+# Deliberately OUT OF SCOPE (not guessed at, not silently included):
+#   - hub_mode / runtime: process LIFECYCLE state -- current phase (running/
+#     stopped/draining/changing/conflict/error), a CAS revision counter, a
+#     "generation" id + per-client snapshot dirs that are real paths on THIS
+#     machine's filesystem, shutdown_requested_at, last_error. Restoring an
+#     old "phase: stopped/changing" snapshot onto a freshly-booted process,
+#     or a generation id whose snapshot dir doesn't exist on the target
+#     machine, would corrupt the target's own lifecycle rather than restore
+#     anything a user actually wants preserved -- a local-only runtime
+#     artifact, not a portable setting.
+#   - control_token: the per-install control-plane secret (see its own
+#     docstring in config.py). Every install should mint its own; shipping it
+#     in a portable file would hand control-plane access to whoever later
+#     reads that file.
+#   - schema_version: stamped by config.py itself on every load, not a
+#     user-set value.
+#   - conversation history (agentic_history.py/usage_history.py/
+#     image_history.py): each lives in its OWN JSON store OUTSIDE
+#     config.py entirely -- a separate concern (large, potentially sensitive
+#     transcript content, its own backup/restore story) left for a future
+#     pass rather than folded in here without being asked.
+# ---------------------------------------------------------------------------
+
+# Every section this pair understands. "all" (the sections=... shortcut, and
+# the default when the param is omitted) expands to exactly this tuple.
+_SETTINGS_SECTIONS = ("api_keys", "flags", "default", "local_api_key", "media", "images")
+
+# cfg top-level keys that are NEVER auto-detected as a "flag" (see
+# _export_settings's "flags" branch below) -- each already has its own named
+# section above, or is one of the excluded runtime/lifecycle keys documented
+# above. Also used defensively on IMPORT so a crafted `flags` payload can
+# never clobber a structural section by reusing its key name.
+_SETTINGS_RESERVED_KEYS = {
+    "schema_version", "providers", "default", "local_api_key",
+    "hub_mode", "runtime", "media", "images", "control_token",
+}
+
+
+def _settings_flags(cfg):
+    """Every top-level boolean flag in cfg (config.py's set_flag()/get_flag()
+    store arbitrary top-level bool keys with no fixed registry of names, so
+    this is a generic scan, not a hardcoded list -- future flags are picked
+    up automatically). Verified against the actual current flag names in
+    this codebase (agentic_chat_enabled, agentic_test_verification_enabled,
+    use_local_subscriptions, sub_claude_enabled, sub_claude_isolated,
+    sub_codex_enabled, sub_codex_isolated) -- none of config.py's structural
+    fields (providers/default/local_api_key/hub_mode/runtime/media/images/
+    schema_version/control_token) are ever booleans, so this can't
+    accidentally swallow one of those."""
+    return {k: v for k, v in cfg.items()
+            if k not in _SETTINGS_RESERVED_KEYS and isinstance(v, bool)}
+
+
+def _export_settings(sections):
+    cfg = config.load_config()
+    out = {}
+    if "api_keys" in sections:
+        out["api_keys"] = copy.deepcopy(cfg.get("providers") or {})
+    if "flags" in sections:
+        out["flags"] = _settings_flags(cfg)
+    if "default" in sections:
+        out["default"] = copy.deepcopy(cfg.get("default"))
+    if "local_api_key" in sections:
+        out["local_api_key"] = cfg.get("local_api_key")
+    if "media" in sections:
+        m = cfg.get("media") or {}
+        out["media"] = {"priority_mode": m.get("priority_mode"),
+                        "manual_priority": list(m.get("manual_priority") or [])}
+    if "images" in sections:
+        i = cfg.get("images") or {}
+        out["images"] = {"priority_mode": i.get("priority_mode"),
+                         "manual_priority": list(i.get("manual_priority") or [])}
+    return out
+
+
+def _parse_sections_param(raw):
+    """'all' (or omitted/blank) -> every section. Otherwise a comma-separated
+    subset of _SETTINGS_SECTIONS. Returns (sections_tuple, error_or_None)."""
+    if raw is None or not str(raw).strip() or str(raw).strip().lower() == "all":
+        return _SETTINGS_SECTIONS, None
+    requested = [s.strip() for s in str(raw).split(",") if s.strip()]
+    unknown = [s for s in requested if s not in _SETTINGS_SECTIONS]
+    if unknown:
+        return None, ("unknown section(s): %s -- valid: %s, or 'all'"
+                      % (", ".join(unknown), ", ".join(_SETTINGS_SECTIONS)))
+    return tuple(requested), None
+
+
+@app.route("/api/settings/export", methods=["GET"])
+def api_settings_export():
+    raw = request.args.get("sections")
+    if raw is None:
+        body = request.get_json(force=True, silent=True)
+        if isinstance(body, dict):
+            raw = body.get("sections")
+    sections, err = _parse_sections_param(raw)
+    if err:
+        return jsonify({"error": err}), 400
+    payload = {
+        "schema_version": config.SCHEMA_VERSION,
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "sections": list(sections),
+    }
+    payload.update(_export_settings(sections))
+    return jsonify(payload)
+
+
+def _validate_settings_import(body):
+    """Structural validation ONLY -- no side effects, nothing written yet.
+    Returns (normalized_sections_dict, error_or_None). Only keys present in
+    `body` are validated/returned (auto-detect, per the task spec); unknown
+    top-level keys are silently ignored (forward-compat with a newer export
+    format) rather than rejected. Any structural violation in ANY present
+    section rejects the WHOLE import before this function returns -- the
+    caller must not apply a partial result."""
+    if not isinstance(body, dict):
+        return None, "request body must be a JSON object."
+    present = [s for s in _SETTINGS_SECTIONS if s in body]
+    if not present:
+        return None, ("no recognized settings section found in the uploaded JSON -- "
+                      "expected one or more of: %s" % ", ".join(_SETTINGS_SECTIONS))
+    out = {}
+    if "api_keys" in present:
+        raw = body["api_keys"]
+        if not isinstance(raw, dict):
+            return None, "'api_keys' must be an object of {provider_id: {...}}."
+        rows = {}
+        for pid, row in raw.items():
+            if not isinstance(pid, str) or not pid:
+                return None, "'api_keys' keys must be non-empty provider id strings."
+            if not isinstance(row, dict):
+                return None, "'api_keys.%s' must be an object." % pid
+            norm = {}
+            if "enabled" in row:
+                if not isinstance(row["enabled"], bool):
+                    return None, "'api_keys.%s.enabled' must be a boolean." % pid
+                norm["enabled"] = row["enabled"]
+            if "base_url" in row:
+                bu = row["base_url"]
+                if bu is not None and not isinstance(bu, str):
+                    return None, "'api_keys.%s.base_url' must be a string or null." % pid
+                norm["base_url"] = bu
+            if "api_keys" in row:
+                keys = row["api_keys"]
+                if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+                    return None, "'api_keys.%s.api_keys' must be an array of strings." % pid
+                norm["api_keys"] = keys
+            rows[pid] = norm
+        out["api_keys"] = rows
+    if "flags" in present:
+        raw = body["flags"]
+        if not isinstance(raw, dict):
+            return None, "'flags' must be an object of {name: bool}."
+        flags = {}
+        for k, v in raw.items():
+            if not isinstance(k, str) or not k:
+                return None, "'flags' keys must be non-empty strings."
+            if not isinstance(v, bool):
+                return None, "'flags.%s' must be a boolean." % k
+            if k in _SETTINGS_RESERVED_KEYS:
+                continue  # never let a flags payload clobber a structural section
+            flags[k] = v
+        out["flags"] = flags
+    if "default" in present:
+        raw = body["default"]
+        if raw is not None:
+            if (not isinstance(raw, dict) or not isinstance(raw.get("provider"), str)
+                    or not raw.get("provider") or not isinstance(raw.get("model"), str)
+                    or not raw.get("model")):
+                return None, "'default' must be null or {\"provider\": str, \"model\": str}."
+        out["default"] = raw
+    if "local_api_key" in present:
+        raw = body["local_api_key"]
+        if raw is not None and not isinstance(raw, str):
+            return None, "'local_api_key' must be a string or null."
+        out["local_api_key"] = raw
+    for section in ("media", "images"):
+        if section in present:
+            raw = body[section]
+            if not isinstance(raw, dict):
+                return None, "'%s' must be an object." % section
+            norm = {}
+            if "priority_mode" in raw:
+                if raw["priority_mode"] not in ("auto", "manual"):
+                    return None, "'%s.priority_mode' must be 'auto' or 'manual'." % section
+                norm["priority_mode"] = raw["priority_mode"]
+            if "manual_priority" in raw:
+                mp = raw["manual_priority"]
+                if not isinstance(mp, list) or not all(isinstance(x, str) for x in mp):
+                    return None, "'%s.manual_priority' must be an array of strings." % section
+                norm["manual_priority"] = mp
+            out[section] = norm
+    return out, None
+
+
+def _apply_media_like(getter, updater_call, section_data):
+    """CAS-merge helper for media/images -- retries on RevisionConflict (same
+    read-revision/retry shape as _mark_runtime_started() below). A no-op when
+    the imported section carried neither field (e.g. an empty {})."""
+    if not section_data:
+        return
+    for _attempt in range(5):
+        current = getter()
+        rev = current.get("revision", 0)
+
+        def _upd(cur, section_data=section_data):
+            if "priority_mode" in section_data:
+                cur["priority_mode"] = section_data["priority_mode"]
+            if "manual_priority" in section_data:
+                cur["manual_priority"] = list(section_data["manual_priority"])
+            return cur
+
+        try:
+            updater_call(rev, _upd)
+            return
+        except config.RevisionConflict:
+            continue
+    # 5 concurrent writers on a local single-user desktop app is not a
+    # realistic scenario -- give up silently rather than fail the whole
+    # import over an already-vanishingly-unlikely race.
+
+
+def _apply_settings_import(sections):
+    """Merge each present, already-VALIDATED section back into the live
+    config via config.py's existing setters (add_provider_key/
+    clear_provider_keys/set_provider_config/set_flag/set_default/
+    clear_default/set_local_api_key/update_media_state/update_images_state)
+    -- every one of these already does its own atomic save_config() write
+    (see config.py), so no new persistence mechanism is introduced here."""
+    if "api_keys" in sections:
+        for pid, row in sections["api_keys"].items():
+            if "api_keys" in row:
+                config.clear_provider_keys(pid)
+                for key in row["api_keys"]:
+                    config.add_provider_key(pid, key)
+            base_url_arg = None
+            if "base_url" in row:
+                bu = row["base_url"]
+                base_url_arg = bu if isinstance(bu, str) and bu.strip() else ""
+            config.set_provider_config(pid, enabled=row.get("enabled"), base_url=base_url_arg)
+    if "flags" in sections:
+        for name, value in sections["flags"].items():
+            config.set_flag(name, value)
+    if "default" in sections:
+        d = sections["default"]
+        if d is None:
+            config.clear_default()
+        else:
+            config.set_default(d["provider"], d["model"])
+    if "local_api_key" in sections:
+        config.set_local_api_key(sections["local_api_key"])
+    if "media" in sections:
+        _apply_media_like(config.get_media_state, config.update_media_state, sections["media"])
+    if "images" in sections:
+        _apply_media_like(config.get_images_state, config.update_images_state, sections["images"])
+
+
+@app.route("/api/settings/import", methods=["POST"])
+def api_settings_import():
+    body = request.get_json(force=True, silent=True)
+    sections, err = _validate_settings_import(body)
+    if err:
+        return jsonify({"error": err}), 400
+    # Every present section is FULLY structurally validated above BEFORE this
+    # point -- a malformed/partial upload is rejected wholesale, nothing is
+    # written. That validate-first pass is what "all-or-nothing" buys here;
+    # it does NOT make the several setter calls below into one filesystem
+    # transaction (each is its own already-atomic save_config() call, same as
+    # every other multi-field settings change in this app).
+    _apply_settings_import(sections)
+    return jsonify({"imported": sorted(sections.keys())})
 
 
 # ---------------------------------------------------------------------------
@@ -4253,6 +5112,7 @@ def v1_chat_completions():
             except ValueError:
                 return _openai_error("Upstream returned non-JSON (%s, HTTP 200): %s"
                                      % (hop_pid, _sanitize(resp.text)), 502, "upstream_error")
+            _record_chat_usage(hop_pid, hop_model, data, est)
             if isinstance(data, dict):
                 data["model"] = hop_pid + "/" + hop_model
             return jsonify(data), 200
@@ -4261,6 +5121,9 @@ def v1_chat_completions():
         # provider, so a broken model/provider should fall through before we give
         # up. Key rotation for the SAME provider already happened in _upstream_chat.
         errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+        if resp.status_code == 400 and _classify_soft_400(resp):
+            resp.close()
+            continue
         if not _retryable(resp.status_code):
             # Capture the body once so the last hard error can be relayed verbatim
             # after the chain is exhausted (retryable errors stay generic 502).
@@ -4438,7 +5301,7 @@ def _chat_to_responses(chat_json, model_label):
     }
 
 
-def _responses_stream(resp, model_label, line_iter=None, first=_MISSING):
+def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_est=0):
     """Consume an upstream OpenAI chat SSE stream and re-emit it as Responses API
     events for Codex. When `line_iter`/`first` are supplied (the first-byte peek
     already pulled the first line from this exact iterator) the pre-read line is
@@ -4603,6 +5466,17 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING):
         except Exception:
             pass
     finally:
+        try:
+            hop_pid, _sep, hop_model = model_label.partition("/")
+            if usage is not None:
+                pt = int(usage.get("prompt_tokens") or 0)
+                ct = int(usage.get("completion_tokens") or 0)
+                usage_history.record(hop_pid, hop_model, pt, ct, estimated=False)
+            else:
+                usage_history.record(hop_pid, hop_model, prompt_est,
+                                     len("".join(text_buf)) // 4, estimated=True)
+        except Exception:
+            pass
         resp.close()
 
 
@@ -4698,15 +5572,19 @@ def v1_responses():
                     resp.close()
                     continue
                 return Response(stream_with_context(
-                    _responses_stream(resp, model_label, line_it, first)),
+                    _responses_stream(resp, model_label, line_it, first, prompt_est=est)),
                     mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
             except ValueError:
                 return _openai_error("Upstream returned non-JSON (%s, HTTP 200): %s"
                                      % (hop_pid, _sanitize(resp.text)), 502, "upstream_error")
+            _record_chat_usage(hop_pid, hop_model, data, est)
             return jsonify(_chat_to_responses(data, model_label)), 200
         errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+        if resp.status_code == 400 and _classify_soft_400(resp):
+            resp.close()
+            continue
         if not _retryable(resp.status_code):
             try:
                 body_json = resp.json()
@@ -4924,13 +5802,18 @@ def _sse_event(name, obj):
     return ("event: %s\ndata: %s\n\n" % (name, json.dumps(obj, ensure_ascii=False))).encode("utf-8")
 
 
-def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISSING):
+def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISSING,
+                      hop_pid=None, hop_model=None):
     """Translate an upstream OpenAI SSE stream into the Anthropic event
     sequence: message_start -> content_block_start -> content_block_delta* ->
     content_block_stop -> message_delta -> message_stop. When `line_iter`/`first`
     are supplied (the first-byte peek already pulled the first line from this exact
     iterator) the pre-read line is processed first, then the rest of the SAME
-    iterator — fast-path output is identical to before."""
+    iterator — fast-path output is identical to before.
+
+    `hop_pid`/`hop_model` (the REAL resolved provider/model, not the client-facing
+    `model_str` -- Claude Code sends its own requested model string, which is not
+    necessarily "pid/model") are used only to key usage_history recording."""
     msg_id = "msg_" + uuid.uuid4().hex
     if line_iter is None:
         line_iter = resp.iter_lines(decode_unicode=False)
@@ -4946,6 +5829,8 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
         tool_blocks = {}        # openai tool_call index -> anthropic block index
         finish_reason = None
         out_tokens = None
+        real_out_tokens = None   # usage_history: only set from a REAL upstream usage object
+        real_in_tokens = None
         text_chars = 0
 
         for raw in _chain_first(first, line_iter):
@@ -4961,6 +5846,9 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
             usage = chunk.get("usage")
             if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
                 out_tokens = usage.get("completion_tokens")
+                real_out_tokens = out_tokens
+                if usage.get("prompt_tokens") is not None:
+                    real_in_tokens = usage.get("prompt_tokens")
             choices = chunk.get("choices") or []
             if not choices:
                 continue
@@ -5025,6 +5913,17 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
             "usage": {"output_tokens": int(out_tokens)}})
         yield _sse_event("message_stop", {"type": "message_stop"})
     finally:
+        try:
+            if hop_pid and hop_model:
+                if real_out_tokens is not None:
+                    pt = real_in_tokens if real_in_tokens is not None else int(input_tokens or 0)
+                    usage_history.record(hop_pid, hop_model, pt, int(real_out_tokens),
+                                         estimated=False)
+                else:
+                    usage_history.record(hop_pid, hop_model, int(input_tokens or 0),
+                                         int(out_tokens or (text_chars // 4)), estimated=True)
+        except Exception:
+            pass
         resp.close()
 
 
@@ -5125,18 +6024,23 @@ def v1_messages():
                     resp.close()
                     continue
                 return Response(stream_with_context(
-                    _anthropic_stream(resp, model_str, input_est, line_it, first)),
+                    _anthropic_stream(resp, model_str, input_est, line_it, first,
+                                     hop_pid=hop_pid, hop_model=hop_model)),
                     mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
             except ValueError:
                 return _anthropic_error("api_error",
                                         "Upstream %s returned non-JSON." % hop_pid, 502)
+            _record_chat_usage(hop_pid, hop_model, data, est)
             return jsonify(_openai_resp_to_anthropic(data, model_str))
         # Non-2xx. Retryable (429/5xx) AND hard errors (404/400/model-not-found)
         # both advance to the NEXT provider (a different provider/model) before we
         # surface an error; within-provider key rotation already ran upstream.
         errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+        if resp.status_code == 400 and _classify_soft_400(resp):
+            resp.close()
+            continue
         if not _retryable(resp.status_code):
             # Capture the last hard error's detail to relay once the chain is done.
             detail = _upstream_error_detail(resp)
@@ -5162,6 +6066,671 @@ def v1_count_tokens():
     if not isinstance(body, dict):
         return _anthropic_error("invalid_request_error", "Invalid JSON body.", 400)
     return jsonify({"input_tokens": _estimate_input_tokens(body)})
+
+
+# ---------------------------------------------------------------------------
+# Image generation (Text-to-Image) — a few free providers offer a genuinely
+# free image-gen endpoint alongside their free chat models. NONE of these are
+# OpenAI /chat/completions-compatible (each is a bespoke shape), so they get
+# their own dispatch functions and their own /v1/images/generations route,
+# separate from the chat gateway above. Deliberately NO Pillow/webp dependency
+# added — the hub stays "Flask + requests only" (README's stated contract);
+# images pass through as whatever bytes the provider returns, base64-encoded
+# for the JSON response. `response_format` is always answered as `b64_json`
+# regardless of what the caller asks for — there is no hosting here to hand
+# back a real fetchable `url`, and a `data:` URI in the `url` field would
+# break any client (including the real OpenAI SDK) that tries to GET it.
+# ---------------------------------------------------------------------------
+_IMAGE_PROVIDER_ORDER = ("cloudflare", "modelscope", "pollinations")
+MAX_IMAGE_HOPS = 4              # bound worst-case latency (ModelScope polls up to 60s/hop)
+_MODELSCOPE_POLL_DEADLINE = 60  # seconds
+
+
+def _image_model_rows(pid):
+    """Registry image-model rows ({'id','label',...}) for one provider."""
+    p = prov.get_provider(pid) or {}
+    return [m for m in (p.get("image_models") or []) if isinstance(m, dict) and m.get("id")]
+
+
+def _image_candidates():
+    """Available (pid, model_id) image-generation pairs, in priority order —
+    same manual/auto shape as _vision_candidates(), backed by config's
+    separate `images` CAS state (independent priority from vision/chat).
+
+    The auto tail is INTERLEAVED across providers (best model of provider A,
+    best of B, best of C, then each provider's 2nd, ...) rather than grouped
+    by provider. MAX_IMAGE_HOPS bounds how many candidates a single request
+    will try, and Cloudflare alone lists 4 image models — grouping would let
+    every hop be spent on one broken/exhausted provider before a working,
+    entirely different provider is ever reached.
+
+    PAID image models (row["free"] is False) are deliberately EXCLUDED here —
+    they never appear in auto/manual rotation and are reachable only via an
+    explicit '<provider>/<model>' pin through _resolve_image_model, exactly
+    like every paid CHAT provider already works in this hub. This is
+    per-MODEL, not per-provider, because a provider can mix free and paid
+    image models in the same row (e.g. google has both)."""
+    by_provider = {}
+    for pid in _available_providers():
+        for row in _image_model_rows(pid):
+            if not row.get("free", True):
+                continue
+            model = row["id"]
+            if prov.is_model_allowed(model) and not _is_model_dead(pid, model):
+                by_provider.setdefault(pid, []).append((pid, model))
+
+    state = config.get_images_state()
+    manual = state.get("manual_priority") if state.get("priority_mode") == "manual" else []
+    ordered = []
+    for item in manual or []:
+        if "/" not in str(item):
+            continue
+        head, rest = str(item).split("/", 1)
+        pair = (head, rest)
+        lst = by_provider.get(head) or []
+        if pair in lst:
+            lst.remove(pair)
+            ordered.append(pair)
+
+    provider_order = sorted(by_provider.keys(),
+                            key=lambda pid: _IMAGE_PROVIDER_ORDER.index(pid)
+                            if pid in _IMAGE_PROVIDER_ORDER else 99)
+    tail = []
+    max_len = max((len(v) for v in by_provider.values()), default=0)
+    for round_i in range(max_len):
+        for pid in provider_order:
+            models = by_provider.get(pid) or []
+            if round_i < len(models):
+                tail.append(models[round_i])
+    return ordered + tail
+
+
+def _resolve_image_model(model):
+    """'<pid>/<model>' -> (pid, model). 'auto'/empty -> top _image_candidates()
+    pick. Returns (pid, model) or (None, error_message)."""
+    model = model.strip() if isinstance(model, str) else ""
+    if "/" in model:
+        head, rest = model.split("/", 1)
+        if prov.get_provider(head) and any(row["id"] == rest for row in _image_model_rows(head)):
+            return head, rest
+        return None, "Unknown image model '%s'." % model
+    candidates = _image_candidates()
+    if not candidates:
+        return None, ("No enabled provider offers free image generation yet. Enable "
+                      "Cloudflare Workers AI, ModelScope, or Pollinations on the dashboard.")
+    return candidates[0]
+
+
+def _b64_bytes(raw_bytes):
+    return base64.b64encode(raw_bytes).decode("ascii")
+
+
+def _cf_account_id_for_image(pcfg, api_key):
+    """Resolve the Cloudflare account id for the IMAGE endpoint (.../ai/run/
+    {model}), honoring a user-pasted custom base URL FIRST — the same
+    fallback _resolve_base_url already gives the chat-completions path when a
+    narrowly-scoped token can't self-resolve via _cf_account_id. Without this,
+    the documented workaround ("paste your account-scoped base URL") had zero
+    effect here even though the error message told the user to do exactly
+    that (found in review: image generation stayed permanently broken for
+    such tokens while chat on the same token worked fine)."""
+    custom = pcfg.get("base_url")
+    if custom:
+        match = re.search(r"/accounts/([^/]+)/ai", custom)
+        if match:
+            return match.group(1)
+    return _cf_account_id(api_key)
+
+
+def _cf_generate_image(pcfg, model, prompt, size=1024, steps=4):
+    """Cloudflare Workers AI's NATIVE image endpoint (NOT /chat/completions):
+    POST .../accounts/{account_id}/ai/run/{model}. flux-1-schnell returns JSON
+    {"result":{"image": "<base64 png>"}}; SD-family models return raw PNG
+    bytes directly. Returns (status, b64_or_None, error_detail_or_None)."""
+    keys = pcfg.get("api_keys") or []
+    if not keys:
+        return 400, None, "no api key for provider cloudflare"
+    api_key = keys[0]
+    account_id = _cf_account_id_for_image(pcfg, api_key)
+    if not account_id:
+        return 400, None, ("could not resolve the Cloudflare account id from this token — "
+                           "paste your account-scoped base URL into 'Advanced: custom base "
+                           "URL' on the Cloudflare card")
+    url = "https://api.cloudflare.com/client/v4/accounts/%s/ai/run/%s" % (account_id, model)
+    try:
+        resp = requests.post(
+            url, headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
+            json={"prompt": (prompt or "")[:2048], "steps": int(steps or 4)},
+            timeout=(CONNECT_TIMEOUT, CHAT_READ_TIMEOUT))
+    except requests.RequestException as exc:
+        return 502, None, exc.__class__.__name__
+    if resp.status_code != 200:
+        return resp.status_code, None, _upstream_error_detail(resp)
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if "application/json" in ctype:
+        data = resp.json()
+        if not data.get("success", True):
+            return 502, None, _sanitize(str(data.get("errors")))
+        b64 = (data.get("result") or {}).get("image")
+        if not b64:
+            return 502, None, "Cloudflare Workers AI returned no image data"
+        return 200, b64, None
+    if not resp.content:
+        return 502, None, "Cloudflare Workers AI returned an empty body"
+    return 200, _b64_bytes(resp.content), None
+
+
+def _is_safe_external_url(url):
+    """Lightweight SSRF guard for a URL the hub is about to fetch SERVER-SIDE
+    on the strength of an upstream provider's own response (not user input
+    directly) — e.g. ModelScope's task-result image URL. Review found the
+    prior code fetched such a URL with no validation at all despite a comment
+    claiming "no SSRF surface"; that claim only holds if the URL is actually
+    checked. Blocks non-https schemes, embedded credentials, and any hostname
+    that resolves to a private/loopback/link-local/reserved/multicast address
+    (defends a misbehaving or compromised upstream, not just a malicious one)."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    if parsed.username or parsed.password:
+        return False
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if ip.is_private or ip.is_loopback or ip.is_link_local \
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            return False
+    return True
+
+
+def _modelscope_generate_image(pcfg, model, prompt, size=1024, steps=4):
+    """ModelScope's async task API (NOT /chat/completions): POST
+    /v1/images/generations with X-ModelScope-Async-Mode:true returns a
+    task_id; poll /v1/tasks/{id} (X-ModelScope-Task-Type: image_generation)
+    until SUCCEED, then download output_images[0]. The hub called ModelScope
+    itself, but the returned URL still comes from that response's JSON body,
+    so a misbehaving/compromised upstream could point it somewhere else —
+    validated via _is_safe_external_url() before the download, same as this
+    codebase already requires for a comparable provider-returned-URL fetch
+    elsewhere. Returns (status, b64_or_None, error_detail)."""
+    keys = pcfg.get("api_keys") or []
+    if not keys:
+        return 400, None, "no api key for provider modelscope"
+    api_key = keys[0]
+    base = "https://api-inference.modelscope.cn"
+    try:
+        resp = requests.post(
+            base + "/v1/images/generations",
+            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json",
+                     "X-ModelScope-Async-Mode": "true"},
+            json={"model": model, "prompt": (prompt or "")[:2000]},
+            timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
+    except requests.RequestException as exc:
+        return 502, None, exc.__class__.__name__
+    if resp.status_code not in (200, 201):
+        return resp.status_code, None, _upstream_error_detail(resp)
+    task_id = (resp.json() or {}).get("task_id")
+    if not task_id:
+        return 502, None, "ModelScope returned no task_id"
+    deadline = time.time() + _MODELSCOPE_POLL_DEADLINE
+    img_url = None
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            pr = requests.get(base + "/v1/tasks/" + task_id,
+                              headers={"Authorization": "Bearer " + api_key,
+                                       "X-ModelScope-Task-Type": "image_generation"},
+                              timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
+        except requests.RequestException:
+            continue
+        pd = pr.json() if pr.status_code == 200 else {}
+        status = str(pd.get("task_status") or "").upper()
+        if status in ("SUCCEED", "SUCCEEDED"):
+            outs = pd.get("output_images") or (pd.get("output") or {}).get("images") or []
+            img_url = outs[0] if outs else None
+            break
+        if status in ("FAILED", "FAIL", "ERROR"):
+            return 502, None, "ModelScope task failed: %s" % _sanitize(str(pd), 200)
+    if not img_url:
+        return 504, None, "ModelScope task timed out or returned no image"
+    if not _is_safe_external_url(img_url):
+        return 502, None, "ModelScope returned an unsafe image URL"
+    try:
+        img_resp = requests.get(img_url, timeout=(CONNECT_TIMEOUT, 30))
+    except requests.RequestException as exc:
+        return 502, None, "Could not download the generated image: %s" % exc.__class__.__name__
+    if img_resp.status_code != 200 or not img_resp.content:
+        return 502, None, "Could not download the generated image (HTTP %d)" % img_resp.status_code
+    return 200, _b64_bytes(img_resp.content), None
+
+
+def _parse_wh(size, default=1024):
+    """'WIDTHxHEIGHT' -> (width, height), each clamped to [256, 1536].
+    Falls back to a square `default` for anything unparseable. A single
+    scalar in, squared for both dimensions, was the prior bug here — a
+    'portrait' pick silently became a square image."""
+    width = height = default
+    if isinstance(size, str) and "x" in size.lower():
+        parts = size.lower().split("x")
+        try:
+            width = max(256, min(1536, int(parts[0])))
+            height = max(256, min(1536, int(parts[1]))) if len(parts) > 1 else width
+        except (ValueError, IndexError):
+            width = height = default
+    return width, height
+
+
+def _pollinations_generate_image(pcfg, model, prompt, size=1024, steps=4):
+    """Pollinations' anonymous GET-URL image API (NOT /chat/completions): GET
+    image.pollinations.ai/prompt/{prompt}?... -> raw image bytes. No key
+    required; an optional saved key/token just lifts limits."""
+    keys = pcfg.get("api_keys") or []
+    api_key = keys[0] if keys else None
+    width, height = _parse_wh(size)
+    query = "width=%d&height=%d&model=%s&nologo=true&seed=%d" % (
+        width, height, quote(model or "flux", safe=""), random.randint(1, 1_000_000))
+    url = "https://image.pollinations.ai/prompt/%s?%s" % (
+        quote((prompt or "")[:1500], safe=""), query)
+    headers = {"Authorization": "Bearer " + api_key} if api_key else {}
+    try:
+        resp = requests.get(url, headers=headers, timeout=(CONNECT_TIMEOUT, 90))
+    except requests.RequestException as exc:
+        return 502, None, exc.__class__.__name__
+    if resp.status_code != 200 or not resp.content:
+        status = resp.status_code if resp.status_code != 200 else 502
+        return status, None, _sanitize(resp.text or "empty body", 300)
+    return 200, _b64_bytes(resp.content), None
+
+
+# --------------------------------------------------------------------------- #
+# PAID image generators — OpenAI, Google (Gemini image), OpenRouter, Higgsfield.
+# Every model these dispatch is registered with "free": False in providers.py,
+# so _image_candidates() (per-model "free" filter) never auto/manual-routes to
+# them — reachable ONLY via an explicit "<provider>/<model>" pin through
+# _resolve_image_model, same as this hub's existing paid CHAT providers
+# (deepseek/kimi/minimax): enabled+keyed but excluded from auto, usable only
+# when explicitly named. Same (status, b64_or_None, error_detail_or_None)
+# return convention as the free generators above.
+# --------------------------------------------------------------------------- #
+
+def _openai_generate_image(pcfg, model, prompt, size="1024x1024", steps=4):
+    """OpenAI's real Images API: POST /v1/images/generations. Standard,
+    stable, well-documented REST shape (model, prompt, n, size) ->
+    {"data":[{"b64_json":...} or {"url":...}]}."""
+    keys = pcfg.get("api_keys") or []
+    if not keys:
+        return 400, None, "no api key for provider openai"
+    api_key = keys[0]
+    valid_sizes = {"1024x1024", "1536x1024", "1024x1536"}
+    body = {"model": model, "prompt": (prompt or "")[:32000], "n": 1,
+            "size": size if size in valid_sizes else "1024x1024"}
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/images/generations",
+            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
+            json=body, timeout=(CONNECT_TIMEOUT, CHAT_READ_TIMEOUT))
+    except requests.RequestException as exc:
+        return 502, None, exc.__class__.__name__
+    if resp.status_code != 200:
+        return resp.status_code, None, _upstream_error_detail(resp)
+    data = (resp.json() or {}).get("data") or []
+    if not data:
+        return 502, None, "OpenAI returned no image data"
+    item = data[0]
+    b64 = item.get("b64_json")
+    if b64:
+        return 200, b64, None
+    url = item.get("url")
+    if url and _is_safe_external_url(url):
+        try:
+            img = requests.get(url, timeout=(CONNECT_TIMEOUT, 30))
+        except requests.RequestException as exc:
+            return 502, None, "could not download image: %s" % exc.__class__.__name__
+        if img.status_code == 200 and img.content:
+            return 200, _b64_bytes(img.content), None
+    return 502, None, "OpenAI returned neither b64_json nor a fetchable url"
+
+
+def _google_generate_image(pcfg, model, prompt, size="1024x1024", steps=4):
+    """Gemini's generateContent REST endpoint with responseModalities:["IMAGE"]
+    -- the standard, stable Gemini REST shape (verified against
+    ai.google.dev/api/generate-content): response image bytes appear at
+    candidates[].content.parts[].inlineData.data."""
+    keys = pcfg.get("api_keys") or []
+    if not keys:
+        return 400, None, "no api key for provider google"
+    api_key = keys[0]
+    url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % model
+    body = {"contents": [{"parts": [{"text": (prompt or "")[:8000]}]}],
+            "generationConfig": {"responseModalities": ["IMAGE"]}}
+    try:
+        resp = requests.post(url, params={"key": api_key},
+                             headers={"Content-Type": "application/json"}, json=body,
+                             timeout=(CONNECT_TIMEOUT, CHAT_READ_TIMEOUT))
+    except requests.RequestException as exc:
+        return 502, None, exc.__class__.__name__
+    if resp.status_code != 200:
+        return resp.status_code, None, _upstream_error_detail(resp)
+    data = resp.json() or {}
+    for cand in data.get("candidates") or []:
+        for part in (cand.get("content") or {}).get("parts") or []:
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                return 200, inline["data"], None
+    return 502, None, "Google returned no image data"
+
+
+def _openrouter_generate_image(pcfg, model, prompt, size="1024x1024", steps=4):
+    """OpenRouter's image-capable chat/completions: modalities:["image"] on
+    a normal chat request; the image comes back in
+    choices[0].message.images[].image_url.url, either a data: URI or a real
+    fetchable URL depending on the model."""
+    keys = pcfg.get("api_keys") or []
+    if not keys:
+        return 400, None, "no api key for provider openrouter"
+    api_key = keys[0]
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
+            json={"model": model, "modalities": ["image"],
+                  "messages": [{"role": "user", "content": prompt or ""}]},
+            timeout=(CONNECT_TIMEOUT, CHAT_READ_TIMEOUT))
+    except requests.RequestException as exc:
+        return 502, None, exc.__class__.__name__
+    if resp.status_code != 200:
+        return resp.status_code, None, _upstream_error_detail(resp)
+    data = resp.json() or {}
+    choice = (data.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    for img in (msg.get("images") or []):
+        url = (img.get("image_url") or {}).get("url") if isinstance(img, dict) else None
+        if isinstance(url, str) and url.startswith("data:"):
+            try:
+                return 200, url.split(",", 1)[1], None
+            except IndexError:
+                continue
+        if url and _is_safe_external_url(url):
+            try:
+                r2 = requests.get(url, timeout=(CONNECT_TIMEOUT, 30))
+            except requests.RequestException:
+                continue
+            if r2.status_code == 200 and r2.content:
+                return 200, _b64_bytes(r2.content), None
+    return 502, None, "OpenRouter returned no image data"
+
+
+def _higgsfield_generate_image(pcfg, model, prompt, size="1024x1024", steps=4):
+    """Higgsfield's bespoke API (NOT OpenAI-compatible): composite credential
+    "Authorization: Key <id>:<secret>", async submit (model-specific endpoint
+    path) -> request_id -> poll /requests/{id}/status until completed, then
+    fetch images[].url. The composite credential is stored as a single
+    "KEY_ID:KEY_SECRET" string in the existing api_keys slot -- split it here."""
+    keys = pcfg.get("api_keys") or []
+    if not keys or ":" not in keys[0]:
+        return 400, None, "Higgsfield needs a KEY_ID:KEY_SECRET credential (paste both, colon-separated)"
+    key_id, key_secret = keys[0].split(":", 1)
+    endpoints = {
+        "higgsfield/text2image/soul": "/v1/text2image/soul",
+        "flux-pro/kontext/max/text-to-image": "/v1/flux-pro/kontext/max/text-to-image",
+        "bytedance/seedream/v4/text-to-image": "/v1/bytedance/seedream/v4/text-to-image",
+        "higgsfield/nano-banana-pro": "/v1/text2image/nano-banana-pro",
+    }
+    endpoint = endpoints.get(model, "/v1/text2image/soul")
+    base = "https://platform.higgsfield.ai"
+    headers = {"Authorization": "Key %s:%s" % (key_id, key_secret), "Content-Type": "application/json"}
+    width, height = _parse_wh(size)
+    body = {"prompt": (prompt or "")[:2000], "width_and_height": "%dx%d" % (width, height), "batch_size": 1}
+    try:
+        resp = requests.post(base + endpoint, headers=headers, json=body,
+                             timeout=(CONNECT_TIMEOUT, 60))
+    except requests.RequestException as exc:
+        return 502, None, exc.__class__.__name__
+    if resp.status_code not in (200, 201, 202):
+        return resp.status_code, None, _upstream_error_detail(resp)
+    sj = resp.json() if resp.content else {}
+    rid = sj.get("request_id") or sj.get("id") or (sj.get("data") or {}).get("id")
+    if not rid:
+        return 502, None, "Higgsfield returned no request id"
+    deadline = time.time() + 90
+    img_url = None
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            pr = requests.get(base + "/requests/" + rid + "/status", headers=headers,
+                              timeout=(CONNECT_TIMEOUT, 30))
+        except requests.RequestException:
+            continue
+        pd = pr.json() if pr.status_code == 200 else {}
+        st = str(pd.get("status") or "").lower()
+        if st in ("completed", "succeeded", "success"):
+            imgs = pd.get("images") or (pd.get("result") or {}).get("images") or []
+            if imgs:
+                first = imgs[0]
+                img_url = first.get("url") if isinstance(first, dict) else first
+            break
+        if st in ("failed", "nsfw", "cancelled", "error"):
+            return 502, None, "Higgsfield task %s" % st
+    if not img_url:
+        return 504, None, "Higgsfield timed out or returned no image"
+    if not _is_safe_external_url(img_url):
+        return 502, None, "Higgsfield returned an unsafe image URL"
+    try:
+        img = requests.get(img_url, timeout=(CONNECT_TIMEOUT, 60))
+    except requests.RequestException as exc:
+        return 502, None, "could not download image: %s" % exc.__class__.__name__
+    if img.status_code != 200 or not img.content:
+        return 502, None, "could not download image (HTTP %d)" % img.status_code
+    return 200, _b64_bytes(img.content), None
+
+
+_IMAGE_GENERATORS = {
+    "cloudflare": _cf_generate_image,
+    "modelscope": _modelscope_generate_image,
+    "pollinations": _pollinations_generate_image,
+    "openai": _openai_generate_image,
+    "google": _google_generate_image,
+    "openrouter": _openrouter_generate_image,
+    "higgsfield": _higgsfield_generate_image,
+}
+
+
+def _save_generated_image(b64, prompt, pid, model):
+    """Best-effort persist of one successful generation for the history
+    gallery. Never raises -- a history-tracking bug must never break a real
+    image-generation response."""
+    try:
+        image_history.save(base64.b64decode(b64), prompt, pid, model)
+    except Exception:
+        pass
+
+
+@app.route("/v1/images/generations", methods=["POST"])
+def v1_images_generations():
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return _openai_error("Invalid JSON body.", 400)
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return _openai_error("'prompt' is required.", 400)
+    try:
+        n = max(1, min(4, int(body.get("n") or 1)))
+    except (TypeError, ValueError):
+        n = 1
+    # Kept as the original "WxH" string (not pre-parsed into one scalar) so
+    # each generator decides for itself what to do with it: Cloudflare/
+    # ModelScope don't accept a size param at all and ignore it; Pollinations
+    # (the one provider that does) parses width/height independently via
+    # _parse_wh() so a non-square pick isn't silently squared.
+    size = body.get("size") if isinstance(body.get("size"), str) else "1024x1024"
+    try:
+        steps = max(1, min(8, int(body.get("steps") or 4)))
+    except (TypeError, ValueError):
+        steps = 4
+
+    requested = body.get("model") if isinstance(body.get("model"), str) else "auto"
+    pid, model = _resolve_image_model(requested)
+    if pid is None:
+        return _openai_error(model, 400)
+    not_ready = _check_provider_ready(pid)
+    if not_ready:
+        return _openai_error(not_ready, 400)
+
+    tried = {(pid, model)}
+    chain = [(pid, model)] + [c for c in _image_candidates() if c not in tried]
+    errors = []
+    images_b64 = []
+    landed_pid = landed_model = None
+    for hop_pid, hop_model in chain[:MAX_IMAGE_HOPS]:
+        generator = _IMAGE_GENERATORS.get(hop_pid)
+        if not generator:
+            continue
+        pcfg = config.get_provider_config(hop_pid)
+        try:
+            status, b64, detail = generator(pcfg, hop_model, prompt, size=size, steps=steps)
+        except (requests.RequestException, RuntimeError) as exc:
+            errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
+            continue
+        quota.record(hop_pid, hop_model)
+        if status == 200 and b64:
+            images_b64.append(b64)
+            landed_pid, landed_model = hop_pid, hop_model
+            _save_generated_image(b64, prompt, hop_pid, hop_model)
+            break
+        if status == 429:
+            # Unlike _upstream_chat, these generators don't surface a
+            # Retry-After header through their (status, b64, detail) return
+            # shape, so assume the same short per-minute-burst cooldown the
+            # chat path uses when no Retry-After is present. Without this the
+            # rate-limited provider stayed top-ranked and got retried again on
+            # the very next request instead of cooling down.
+            quota.mark_throttled(hop_pid, 60)
+        if status in _DEAD_STATUSES:
+            _mark_model_dead(hop_pid, hop_model, status)
+        errors.append("%s: HTTP %s %s" % (hop_pid, status, _sanitize(detail or "")))
+    if not images_b64:
+        return _openai_error(
+            "All image providers failed: " + ("; ".join(errors) or "none available"),
+            502, "upstream_error")
+
+    # n > 1: reuse the SAME confirmed-working hop for the rest — no need to
+    # re-run the fallback chain once we know this hop actually answers.
+    generator = _IMAGE_GENERATORS[landed_pid]
+    pcfg = config.get_provider_config(landed_pid)
+    for _extra in range(n - 1):
+        try:
+            status, b64, _detail = generator(pcfg, landed_model, prompt, size=size, steps=steps)
+        except (requests.RequestException, RuntimeError):
+            break
+        quota.record(landed_pid, landed_model)
+        if status == 200 and b64:
+            images_b64.append(b64)
+        else:
+            break
+
+    return jsonify({
+        "created": int(time.time()),
+        "model": landed_pid + "/" + landed_model,
+        "data": [{"b64_json": b} for b in images_b64],
+    }), 200
+
+
+def _images_payload():
+    state = config.get_images_state()
+    models = []
+    for p in prov.list_providers():
+        pid = p["id"]
+        pcfg = config.get_provider_config(pid)
+        for row in _image_model_rows(pid):
+            model = row["id"]
+            models.append({
+                "id": pid + "/" + model,
+                "provider": pid,
+                "model": model,
+                "provider_name": p.get("name") or pid,
+                "label": row.get("label") or model,
+                "text_in_image": row.get("text_in_image"),
+                "configured": bool(pcfg.get("enabled") and
+                                   (pcfg.get("api_key") or not _needs_key(pid))),
+                "dead": _is_model_dead(pid, model),
+            })
+    available_order = [pid + "/" + model for pid, model in _image_candidates()]
+    return {"state": state, "models": models, "effective_priority": available_order}
+
+
+@app.route("/api/images", methods=["GET", "POST"])
+def api_images():
+    if request.method == "GET":
+        return jsonify(_images_payload())
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "invalid JSON body"}), 400
+    if "revision" not in body:
+        return jsonify({"error": "revision is required"}), 400
+    mode = body.get("priority_mode")
+    if mode not in ("auto", "manual"):
+        return jsonify({"error": "priority_mode must be 'auto' or 'manual'"}), 400
+    manual = body.get("manual_priority", [])
+    if not isinstance(manual, list) or any(not isinstance(v, str) for v in manual):
+        return jsonify({"error": "manual_priority must be an array of model ids"}), 400
+    valid = {p["id"] + "/" + row["id"] for p in prov.list_providers()
+             for row in _image_model_rows(p["id"])}
+    unknown = [value for value in manual if value not in valid]
+    if unknown:
+        return jsonify({"error": "unknown image model(s): " + ", ".join(unknown)}), 400
+    deduped = []
+    for value in manual:
+        if value not in deduped:
+            deduped.append(value)
+
+    def _update(state):
+        state["priority_mode"] = mode
+        state["manual_priority"] = deduped if mode == "manual" else []
+        return state
+
+    try:
+        config.update_images_state(body["revision"], _update)
+    except config.RevisionConflict as exc:
+        return jsonify({"error": "images state changed; reload and retry",
+                        "current_revision": exc.current_revision,
+                        "state": config.get_images_state()}), 409
+    return jsonify(_images_payload())
+
+
+@app.route("/api/images/history", methods=["GET"])
+def api_images_history():
+    """Metadata for previously generated images (newest first), no image
+    bytes -- the dashboard gallery fetches each thumbnail separately via
+    GET /api/images/history/<id>, so listing many entries here stays cheap."""
+    return jsonify({"images": image_history.list_entries()})
+
+
+@app.route("/api/images/history/<image_id>", methods=["GET"])
+def api_images_history_file(image_id):
+    """Raw bytes of one generated image, for <img src> use. Auth still goes
+    through the normal /api/* control-token guard -- an <img> tag can't set a
+    custom header, so this relies on the guard's existing '?token=' query-
+    param fallback (already used elsewhere in this file for the same reason)."""
+    raw, mime_type = image_history.get_file(image_id)
+    if raw is None:
+        return jsonify({"error": "not found"}), 404
+    return Response(raw, mimetype=mime_type or "image/png")
+
+
+@app.route("/api/images/history/<image_id>", methods=["DELETE"])
+def api_images_history_delete(image_id):
+    if not image_history.delete(image_id):
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -5214,6 +6783,20 @@ def _origin_is_trusted():
     return rc == 0 and bool(_TRUSTED_REMOTE_RE.match(url.strip()))
 
 
+def _hub_mode_is_off():
+    """True only when the user has DELIBERATELY stood the hub down as the machine
+    default (a completed hub-mode 'off' transition: desired=='off' AND phase=='off').
+    A fresh/never-managed config defaults to desired='on'/phase='unmanaged', so this
+    stays False there and leaves always-on auto-update unaffected. Used so auto-update
+    won't silently re-exec (respawn) a hub the user just switched off."""
+    try:
+        st = config.get_hub_mode_state() or {}
+    except Exception:
+        return False
+    return (str(st.get("desired") or "").lower() == "off"
+            and str(st.get("phase") or "").lower() == "off")
+
+
 def _auto_update_enabled():
     """ALWAYS ON. Auto-update is not a user-facing option: the hub keeps itself
     current (git pull every AUTO_UPDATE_INTERVAL_HOURS, default 5) and restarts
@@ -5256,6 +6839,17 @@ def _do_update_check():
             return _auto_update_state["last_result"]
         _rc, after, _ = _git("rev-parse", "HEAD")
         if before and after and before != after:
+            # New commits pulled. Normally we re-exec to apply them — but if the user
+            # has deliberately switched the hub OFF as the default (hub-mode off), respect
+            # that "leave me stood down" intent and do NOT respawn the process; the update
+            # applies on the next manual restart instead.
+            if _hub_mode_is_off():
+                _auto_update_state["last_result"] = (
+                    "updated %s->%s — restart deferred (hub switched off as default)"
+                    % (before[:7], after[:7]))
+                _log.info("Auto-update: pulled %s->%s but hub-mode is off; deferring re-exec.",
+                         before[:7], after[:7])
+                return _auto_update_state["last_result"]
             _auto_update_state["last_result"] = "updated %s->%s — restarting" % (before[:7], after[:7])
             _auto_update_state["updating"] = True
             _log.info("Auto-update: new commits pulled (%s -> %s), re-executing.",
@@ -5384,6 +6978,7 @@ if __name__ == "__main__":
     _bootstrap_no_key_providers()  # no-key providers have nothing to configure -> on
     _print_banner()
     _start_auto_update()
+    vision_status.start_heartbeat()
     server = make_server(HOST, PORT, app, threaded=True)
     _runtime_server[0] = server
     try:
