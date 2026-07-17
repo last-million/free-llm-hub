@@ -21,16 +21,15 @@ sibling capability with a different contract:
     module-level master flag (config flag "agentic_chat_enabled", default
     OFF) is on AND the user has explicitly started a session.
 
-Codex is intentionally NOT enabled for this feature (see _SUPPORT below):
-official docs list only --last/--all/--image/PROMPT/SESSION_ID as accepted
-`codex exec resume` flags (no approval/sandbox override in that table), and
-multiple open upstream reports (openai/codex #9144, #5322) describe
-`--dangerously-bypass-approvals-and-sandbox` being silently ignored after
-`codex exec resume`. Since every turn from turn 2 onward NEEDS resume+bypass
-together, and this feature runs fully non-interactively (no human to click
-through an approval prompt that silently came back), an unverified combination
-here could hang or block a turn with no recovery. Scoped down rather than
-guessed at -- see start_session().
+Codex IS enabled (and is the default), after live verification on codex-cli
+0.144.5 (2026-07-17): `codex exec --json` runs with full tool access under
+`--dangerously-bypass-approvals-and-sandbox`, and -- the combination the earlier
+scoping could not confirm from docs alone -- that bypass flag DOES survive
+`codex exec resume <thread_id>` for turn 2+ (verified end to end: a resumed turn
+ran shell commands with no approval hang). Writes land in the subprocess cwd
+(this module spawns with cwd=project_dir), so resume needs no -C. Codex's prompt
+is positional and it has no --append-system-prompt, so the optional test/vision
+notice is prepended into the prompt text. See _build_argv_codex().
 
 Prompt delivery: the message text travels as a POSITIONAL argv argument, not
 stdin. This diverges from `_sub_run()` in app.py on purpose: every real,
@@ -129,10 +128,13 @@ _TEST_VERIFICATION_FLAG = "agentic_test_verification_enabled"
 
 _CLI_BIN = {"claude": "claude", "codex": "codex"}
 
-# Claude Code is the only currently-working agentic backend (see _SUPPORT) --
-# this is the API default when a caller omits `cli`, AND the value the
-# dashboard's CLI picker should preselect (read via default_cli()).
-_DEFAULT_CLI = "claude"
+# Codex is the default agentic backend (the user's explicit choice) -- verified
+# on codex-cli 0.144.5 that `codex exec --json` runs with full tool access and
+# that --dangerously-bypass-approvals-and-sandbox survives `codex exec resume`.
+# Claude Code remains fully supported and selectable. This is the API default
+# when a caller omits `cli`, AND the value the dashboard's CLI picker preselects
+# (read via default_cli()).
+_DEFAULT_CLI = "codex"
 
 # Maps our cli_id ("claude"/"codex") -> the subscription-provider id
 # (_SUB_PROVIDERS key in app.py) that owns the isolated-install mechanism this
@@ -146,17 +148,14 @@ _INSTALL_PROVIDER_ID = {"claude": "sub-claude", "codex": "sub-codex"}
 # given reason instead of attempting an unverified flag combination.
 _SUPPORT = {
     "claude": (True, None),
-    "codex": (False, (
-        "Codex agentic mode is not enabled: full-permission bypass "
-        "(--dangerously-bypass-approvals-and-sandbox) is not confirmed to survive "
-        "`codex exec resume` -- the official resume flag table lists only "
-        "--last/--all/--image/PROMPT/SESSION_ID (no approval/sandbox override), and open "
-        "upstream reports (openai/codex #9144, #5322) describe the bypass flag being "
-        "silently ignored after resume. Every turn from turn 2 onward needs resume+bypass "
-        "together here, and this feature is fully non-interactive -- a silently-reverted "
-        "approval prompt would have no human to answer it and no clean way to recover. "
-        "Scoped down rather than risking an unverified flag combination."
-    )),
+    # Codex enabled after live verification on codex-cli 0.144.5 (2026-07-17):
+    # `codex exec --json` streams JSONL events and runs shell/file tools under
+    # --dangerously-bypass-approvals-and-sandbox, and that bypass flag DOES
+    # survive `codex exec resume <thread_id>` for turn 2+ (empirically confirmed
+    # end to end -- the resumed turn executed a command with no approval hang),
+    # which the earlier scoping could not confirm from docs. Writes go to the
+    # subprocess cwd (we spawn with cwd=project_dir), so resume needs no -C.
+    "codex": (True, None),
 }
 
 # Each agentic turn can run real tool use (file edits, shell commands), so this
@@ -585,11 +584,10 @@ def _system_prompt_addition() -> str:
 
 
 def _build_argv(sess: _Session, bin_path: str, text: str):
+    if sess.cli_id == "codex":
+        return _build_argv_codex(sess, bin_path, text)
     if sess.cli_id != "claude":
-        # Unreachable in practice -- start_session() already refuses any CLI
-        # whose _SUPPORT entry is False, and _SUPPORT only allows "claude"
-        # through today. Fail loudly rather than silently mis-running it if
-        # that ever changes without updating this function.
+        # Fail loudly rather than silently mis-running an unknown CLI.
         raise AgenticError("No known invocation for CLI '%s'." % sess.cli_id, 400)
     args = ["-p", text]
     if sess.native_session_id:
@@ -600,6 +598,76 @@ def _build_argv(sess: _Session, bin_path: str, text: str):
     if addition:
         args += ["--append-system-prompt", addition]
     return _launcher(bin_path) + args
+
+
+def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
+    """Codex agentic invocation (codex-cli 0.144.5, live-verified).
+
+    Turn 1:  codex exec --json --dangerously-bypass-approvals-and-sandbox
+                          --skip-git-repo-check <prompt>
+    Turn 2+: codex exec resume <thread_id> --json
+                          --dangerously-bypass-approvals-and-sandbox <prompt>
+
+    The prompt is POSITIONAL (codex has no -p). The project dir is the subprocess
+    cwd (set by send_message's Popen), NOT -C -- that is what makes `resume` (which
+    has no -C flag) still write to the right folder. Codex has no
+    --append-system-prompt, so the optional test/vision notice is prepended into
+    the prompt text. --skip-git-repo-check is only passed on the fresh turn (the
+    `resume` subcommand doesn't accept it and the repo was already checked)."""
+    addition = _system_prompt_addition()
+    prompt = (addition + "\n\n" + text) if addition else text
+    base = ["exec"]
+    if sess.native_session_id:
+        base += ["resume", sess.native_session_id, "--json",
+                 "--dangerously-bypass-approvals-and-sandbox", prompt]
+    else:
+        base += ["--json", "--dangerously-bypass-approvals-and-sandbox",
+                 "--skip-git-repo-check", prompt]
+    return _launcher(bin_path) + base
+
+
+def _parse_codex_json(stdout, stderr, returncode):
+    """Parse `codex exec --json` JSONL stdout -> (text, native_session_id, detail).
+
+    `text` is None on failure. Collects the LAST agent_message as the reply and
+    the thread.started id for --resume. Non-JSON log noise interleaved on stdout
+    (e.g. "Reading additional input from stdin...") is skipped. `item.type ==
+    "error"` events are notices (model-metadata / service-tier warnings) -- only
+    surfaced as the failure detail if no agent_message ever arrived."""
+    native_id = None
+    final_text = None
+    last_error = None
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        etype = ev.get("type")
+        if etype == "thread.started":
+            tid = ev.get("thread_id")
+            if isinstance(tid, str) and tid:
+                native_id = tid
+        elif etype in ("item.completed", "item.started"):
+            item = ev.get("item") or {}
+            itype = item.get("type")
+            if itype == "agent_message":
+                txt = item.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    final_text = txt
+            elif itype == "error":
+                msg = item.get("message")
+                if isinstance(msg, str) and msg:
+                    last_error = msg
+    if final_text is not None:
+        return _sanitize(final_text), native_id, None
+    detail = last_error or (stderr or "").strip() or (
+        "codex exited %d with no agent message." % returncode)
+    return None, native_id, _sanitize(str(detail), 500)
 
 
 def _parse_claude_json(stdout, stderr, returncode):
@@ -743,7 +811,10 @@ def send_message(session_id, text):
             return 499, None, "Turn was stopped."
         if timed_out:
             return 504, None, "%s timed out after %ds." % (sess.cli_id, _TURN_TIMEOUT)
-        result_text, native_id, detail = _parse_claude_json(stdout, stderr, proc.returncode)
+        if sess.cli_id == "codex":
+            result_text, native_id, detail = _parse_codex_json(stdout, stderr, proc.returncode)
+        else:
+            result_text, native_id, detail = _parse_claude_json(stdout, stderr, proc.returncode)
         if result_text is None:
             detail = detail or "%s produced no output." % sess.cli_id
             status = 403 if _looks_like_auth_error(detail) else 502
