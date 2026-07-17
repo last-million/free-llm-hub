@@ -583,17 +583,19 @@ def _system_prompt_addition() -> str:
     return " ".join(parts)
 
 
-def _build_argv(sess: _Session, bin_path: str, text: str):
+def _build_argv(sess: _Session, bin_path: str, text: str, stream=False):
     if sess.cli_id == "codex":
-        return _build_argv_codex(sess, bin_path, text)
+        return _build_argv_codex(sess, bin_path, text)  # --json serves stream + non-stream
     if sess.cli_id != "claude":
         # Fail loudly rather than silently mis-running an unknown CLI.
         raise AgenticError("No known invocation for CLI '%s'." % sess.cli_id, 400)
     args = ["-p", text]
     if sess.native_session_id:
         args += ["--resume", sess.native_session_id]
-    args += ["--output-format", "json", "--dangerously-skip-permissions",
-             "--model", _MODEL_ALIAS]
+    args += ["--output-format", "stream-json" if stream else "json",
+             "--dangerously-skip-permissions", "--model", _MODEL_ALIAS]
+    if stream:
+        args += ["--verbose"]  # claude -p requires --verbose alongside stream-json
     addition = _system_prompt_addition()
     if addition:
         args += ["--append-system-prompt", addition]
@@ -824,6 +826,201 @@ def send_message(session_id, text):
         sess.turn_count += 1
         return 200, result_text, None
     finally:
+        sess.turn_lock.release()
+
+
+# --------------------------------------------------------------------------- #
+# Live streaming — same one-subprocess-per-turn + tree-kill model as
+# send_message(), but stdout is read line-by-line and normalized into progress
+# events AS the turn runs, so the dashboard can show the agent working live
+# (the commands it runs, its messages) instead of a spinner + a final dump.
+# Events carry `_native` (resume id) / `_final` (final reply) internally; only
+# keys under "event" are forwarded to the client.
+# --------------------------------------------------------------------------- #
+
+def _codex_stream_events(line):
+    """One `codex exec --json` JSONL line -> list of normalized event dicts."""
+    line = (line or "").strip()
+    if not line.startswith("{"):
+        return []
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return []
+    if not isinstance(ev, dict):
+        return []
+    etype = ev.get("type")
+    out = []
+    if etype == "thread.started":
+        tid = ev.get("thread_id")
+        if isinstance(tid, str) and tid:
+            out.append({"_native": tid})
+    elif etype == "item.started":
+        item = ev.get("item") or {}
+        if item.get("type") == "command_execution":
+            cmd = item.get("command")
+            if isinstance(cmd, str) and cmd:
+                out.append({"event": "tool", "text": cmd})
+    elif etype == "item.completed":
+        item = ev.get("item") or {}
+        it = item.get("type")
+        if it == "agent_message":
+            txt = item.get("text")
+            if isinstance(txt, str) and txt.strip():
+                out.append({"event": "message", "text": txt})
+                out.append({"_final": txt})
+        elif it == "command_execution":
+            ag = item.get("aggregated_output") or item.get("output")
+            if isinstance(ag, str) and ag.strip():
+                out.append({"event": "output", "text": ag[:4000]})
+        elif it == "error":
+            msg = item.get("message")
+            if isinstance(msg, str) and msg:
+                out.append({"event": "notice", "text": msg})
+    return out
+
+
+def _claude_stream_events(line):
+    """One `claude --output-format stream-json` line -> normalized event dicts."""
+    line = (line or "").strip()
+    if not line.startswith("{"):
+        return []
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return []
+    if not isinstance(ev, dict):
+        return []
+    etype = ev.get("type")
+    out = []
+    if etype == "system" and isinstance(ev.get("session_id"), str):
+        out.append({"_native": ev["session_id"]})
+    elif etype == "assistant":
+        msg = ev.get("message") or {}
+        for block in (msg.get("content") or []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and block.get("text"):
+                out.append({"event": "message", "text": block["text"]})
+            elif block.get("type") == "tool_use":
+                inp = block.get("input") or {}
+                desc = (inp.get("command") or inp.get("file_path") or inp.get("path")
+                        or (json.dumps(inp)[:200] if inp else ""))
+                out.append({"event": "tool", "text": "%s: %s" % (block.get("name") or "tool", desc)})
+    elif etype == "result":
+        if isinstance(ev.get("session_id"), str):
+            out.append({"_native": ev["session_id"]})
+        res = ev.get("result")
+        if isinstance(res, str) and res:
+            out.append({"_final": res})
+            if not ev.get("is_error"):
+                out.append({"event": "message", "text": res})
+    return out
+
+
+def send_message_stream(session_id, text):
+    """Generator: run ONE turn, yielding normalized progress events as they occur.
+    Same validation / turn-lock / tree-kill model as send_message(). Always ends
+    with exactly one {"event":"done",...}, {"event":"error",...}, or
+    {"event":"stopped"}. Never raises."""
+    def err(status, detail):
+        return {"event": "error", "status": status, "detail": detail}
+    if not _master_on():
+        yield err(403, "Agentic chat is turned off (agentic_chat_enabled=False)."); return
+    with _REGISTRY_LOCK:
+        sess = _REGISTRY.get(session_id)
+    if sess is None:
+        yield err(404, "No such agentic session."); return
+    if not isinstance(text, str) or not text.strip():
+        yield err(400, "Message text is required."); return
+    if len(text) > _MAX_MESSAGE_CHARS:
+        yield err(400, "Message is %d chars; capped at %d per turn." % (len(text), _MAX_MESSAGE_CHARS)); return
+    supported, reason = _SUPPORT.get(sess.cli_id, (False, "unknown CLI"))
+    if not supported:
+        yield err(403, "%s agentic mode is not supported: %s" % (sess.cli_id, reason)); return
+    if not sess.turn_lock.acquire(blocking=False):
+        yield err(409, "A turn is already running for this session."); return
+    proc = None
+    timer = None
+    timed_out = [False]
+    stderr_buf = []
+    try:
+        bin_path = shutil.which(_CLI_BIN[sess.cli_id])
+        if not bin_path:
+            yield err(502, "'%s' is no longer on PATH." % _CLI_BIN[sess.cli_id]); return
+        if _should_check_binary_identity(sess):
+            ok, detail = _verify_claude_binary_identity(bin_path)
+            if not ok:
+                yield err(_BINARY_IDENTITY_FAIL_STATUS, detail); return
+        argv = _build_argv(sess, bin_path, text, stream=True)
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=sess.project_dir, env=_agentic_env(),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                **_tree_popen_kwargs())
+        except (OSError, ValueError) as exc:
+            yield err(502, "%s failed to start: %s" % (sess.cli_id, exc.__class__.__name__)); return
+        sess.last_interrupted = False
+        with sess.proc_lock:
+            sess.proc = proc
+
+        # Drain stderr in a background thread so a full stderr pipe can never
+        # deadlock the stdout read loop (codex/claude both log a lot to stderr).
+        def _drain():
+            try:
+                for l in proc.stderr:
+                    stderr_buf.append(l)
+                    if len(stderr_buf) > 200:
+                        del stderr_buf[0]
+            except Exception:
+                pass
+        threading.Thread(target=_drain, daemon=True).start()
+
+        def _kill_on_timeout():
+            timed_out[0] = True
+            _terminate(proc)
+        timer = threading.Timer(_TURN_TIMEOUT, _kill_on_timeout)
+        timer.daemon = True
+        timer.start()
+
+        parse = _codex_stream_events if sess.cli_id == "codex" else _claude_stream_events
+        native_id = None
+        final_text = None
+        try:
+            for line in proc.stdout:
+                for e in parse(line):
+                    if "_native" in e:
+                        native_id = e["_native"]
+                    if "_final" in e:
+                        final_text = e["_final"]
+                    if e.get("event"):
+                        yield e
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=_KILL_GRACE)
+        except Exception:
+            pass
+        if timer:
+            timer.cancel()
+        if sess.last_interrupted:
+            yield {"event": "stopped"}; return
+        if timed_out[0]:
+            yield err(504, "%s timed out after %ds." % (sess.cli_id, _TURN_TIMEOUT)); return
+        if native_id:
+            sess.native_session_id = native_id
+        if final_text is None:
+            detail = _sanitize("".join(stderr_buf).strip(), 400) or ("%s produced no reply." % sess.cli_id)
+            yield err(403 if _looks_like_auth_error(detail) else 502, detail); return
+        sess.turn_count += 1
+        yield {"event": "done", "text": _sanitize(final_text), "native": native_id}
+    finally:
+        if timer:
+            timer.cancel()
+        with sess.proc_lock:
+            if sess.proc is proc:
+                sess.proc = None
         sess.turn_lock.release()
 
 

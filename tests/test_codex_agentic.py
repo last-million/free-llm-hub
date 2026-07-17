@@ -80,3 +80,47 @@ def test_build_argv_codex_prepends_system_prompt(monkeypatch):
 def test_codex_is_default_and_supported():
     assert ac.default_cli() == "codex"
     assert ac.cli_support()["codex"]["supported"] is True
+
+
+# --- live-streaming event parsers ---------------------------------------------
+
+def test_codex_stream_events_tool_message_and_noise():
+    assert ac._codex_stream_events(
+        '{"type":"item.started","item":{"type":"command_execution","command":"echo hi"}}'
+    ) == [{"event": "tool", "text": "echo hi"}]
+    msg = ac._codex_stream_events(
+        '{"type":"item.completed","item":{"type":"agent_message","text":"All done."}}')
+    assert {"event": "message", "text": "All done."} in msg
+    assert {"_final": "All done."} in msg
+    assert ac._codex_stream_events('{"type":"thread.started","thread_id":"T1"}') == [{"_native": "T1"}]
+    assert ac._codex_stream_events("Reading additional input from stdin...") == []
+
+
+def test_claude_stream_events_text_and_tool():
+    a = ac._claude_stream_events(
+        '{"type":"assistant","message":{"content":['
+        '{"type":"text","text":"hello"},'
+        '{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}')
+    assert {"event": "message", "text": "hello"} in a
+    assert any(e.get("event") == "tool" and "ls" in e.get("text", "") for e in a)
+    r = ac._claude_stream_events('{"type":"result","session_id":"S1","result":"final ans"}')
+    assert {"_native": "S1"} in r
+    assert {"_final": "final ans"} in r
+
+
+def test_build_argv_claude_stream_uses_stream_json(monkeypatch):
+    monkeypatch.setattr(ac, "_system_prompt_addition", lambda: "")
+    monkeypatch.setattr(ac, "_launcher", lambda b: [b])
+    s = types.SimpleNamespace(cli_id="claude", native_session_id=None)
+    argv = ac._build_argv(s, "claude", "hi", stream=True)
+    assert "stream-json" in argv and "--verbose" in argv
+    argv2 = ac._build_argv(s, "claude", "hi", stream=False)
+    assert "json" in argv2 and "stream-json" not in argv2 and "--verbose" not in argv2
+
+
+def test_build_argv_codex_stream_matches_nonstream(monkeypatch):
+    monkeypatch.setattr(ac, "_system_prompt_addition", lambda: "")
+    monkeypatch.setattr(ac, "_launcher", lambda b: [b])
+    s = types.SimpleNamespace(cli_id="codex", native_session_id=None)
+    assert ac._build_argv(s, "codex", "hi", stream=True) == ac._build_argv(s, "codex", "hi", stream=False)
+    assert "--json" in ac._build_argv(s, "codex", "hi", stream=True)
