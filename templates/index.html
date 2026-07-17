@@ -899,11 +899,112 @@
     .icon-btn span{display:none}
     .vg-pop{left:auto;right:0;width:min(280px,calc(100vw - 40px))}
   }
+  /* ============================================================ */
+  /* Futuristic left-sidebar shell (cx-*) — 2026-07-17            */
+  /* Additive: fixed sidebar + margin-pushed content + SPA views. */
+  /* ============================================================ */
+  :root{ --cx-w:252px; --neon-cyan:#22d3ee; --neon-violet:#8b5cf6;
+         --neon-grad:linear-gradient(135deg,#22d3ee,#8b5cf6); }
+  .cx-sidebar{ position:fixed; top:0; left:0; bottom:0; width:var(--cx-w);
+    background:linear-gradient(180deg,#0c1120,#0a0e18 62%);
+    border-right:1px solid var(--border-soft); display:flex; flex-direction:column;
+    z-index:200; overflow-y:auto; overscroll-behavior:contain;
+    box-shadow:2px 0 28px rgba(0,0,0,.4); }
+  .cx-brand{ display:flex; align-items:center; gap:10px; padding:18px 16px 14px;
+    font-family:var(--mono); font-weight:700; letter-spacing:.3px; color:var(--text);
+    position:sticky; top:0; z-index:1;
+    background:linear-gradient(180deg,#0c1120 60%,rgba(12,17,32,0)); }
+  .cx-brand .cx-mark{ width:30px; height:30px; border-radius:9px; display:grid; place-items:center;
+    background:var(--neon-grad); color:#04121a; box-shadow:0 0 18px rgba(34,211,238,.45); }
+  .cx-brand small{ display:block; font-size:10px; font-weight:500; color:var(--text-faint); letter-spacing:.4px; }
+  .cx-nav{ padding:2px 10px 22px; display:flex; flex-direction:column; }
+  .cx-group{ margin-top:12px; }
+  .cx-group-label{ font-size:10px; text-transform:uppercase; letter-spacing:1.4px;
+    color:var(--text-faint); padding:5px 12px 3px; font-weight:700; }
+  .cx-nav-item{ display:flex; align-items:center; gap:11px; width:100%; padding:9px 12px;
+    border:0; background:transparent; cursor:pointer; color:var(--text-dim); font:inherit;
+    font-size:13.5px; text-align:left; border-radius:10px; position:relative;
+    transition:background .18s, color .18s, box-shadow .18s; }
+  .cx-nav-item svg{ width:17px; height:17px; flex:none; opacity:.85; }
+  .cx-nav-item:hover{ background:var(--surface-2); color:var(--text); }
+  .cx-nav-item:focus-visible{ outline:2px solid var(--neon-cyan); outline-offset:2px; }
+  .cx-nav-item.active{ color:#fff;
+    background:linear-gradient(90deg,rgba(34,211,238,.16),rgba(139,92,246,.10));
+    box-shadow:inset 0 0 0 1px rgba(34,211,238,.25), 0 0 20px rgba(34,211,238,.10); }
+  .cx-nav-item.active::before{ content:""; position:absolute; left:0; top:8px; bottom:8px; width:3px;
+    border-radius:3px; background:var(--neon-grad); box-shadow:0 0 10px var(--neon-cyan); }
+  .cx-nav-item.active svg{ opacity:1; color:var(--neon-cyan); }
+  body.cx-on{ padding-left:var(--cx-w); }
+  body.cx-on main.wrap > section.section{ display:none; }
+  body.cx-on main.wrap > section.section.cx-active{ display:block; animation:cxFade .22s ease-out; }
+  @keyframes cxFade{ from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:none;} }
+  body.cx-on .sec-toggle{ pointer-events:none; }   /* disable accordion collapse in SPA mode */
+  body.cx-on .sec-chev{ display:none; }
+  .cx-viewhead{ display:none; }
+  body.cx-on .cx-viewhead{ display:flex; align-items:baseline; gap:12px; margin:2px 0 20px;
+    padding-bottom:14px; border-bottom:1px solid var(--border-soft); }
+  .cx-viewhead h1{ font-size:22px; font-weight:700; margin:0; font-family:var(--mono); letter-spacing:.2px; }
+  .cx-viewhead .cx-accent{ background:var(--neon-grad); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .cx-burger{ display:none; }
+  @media (max-width:1024px){
+    body.cx-on{ padding-left:0; }
+    .cx-sidebar{ transform:translateX(-100%); transition:transform .25s ease; }
+    body.cx-drawer-open .cx-sidebar{ transform:none; }
+    .cx-burger{ display:inline-grid; place-items:center; position:fixed; top:12px; left:12px; z-index:210;
+      width:42px; height:42px; border-radius:11px; border:1px solid var(--border);
+      background:var(--surface); color:var(--text); cursor:pointer; box-shadow:0 4px 16px rgba(0,0,0,.4); }
+    body.cx-drawer-open::after{ content:""; position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:199; }
+  }
+  @media (prefers-reduced-motion:reduce){
+    body.cx-on main.wrap > section.section.cx-active{ animation:none; }
+    .cx-sidebar{ transition:none; }
+  }
 </style>
 </head>
 <body>
 <!-- Exhaustion banner (A) — hidden until a provider runs out of free quota -->
 <div id="exhaust-banner"></div>
+<button class="cx-burger" id="cx-burger" type="button" aria-label="Open navigation menu">
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+</button>
+<aside class="cx-sidebar" id="cx-sidebar" aria-label="Dashboard navigation">
+  <div class="cx-brand">
+    <span class="cx-mark" aria-hidden="true"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 11-13h-7l1-7z"/></svg></span>
+    <span>Calvoun Hub<small>local gateway &middot; 127.0.0.1</small></span>
+  </div>
+  <nav class="cx-nav" id="cx-nav">
+    <div class="cx-group">
+      <div class="cx-group-label">Control</div>
+      <button class="cx-nav-item" data-view="sec-lifecycle" data-title="Hub controls" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="2" y1="14" x2="6" y2="14"/><line x1="10" y1="8" x2="14" y2="8"/><line x1="18" y1="16" x2="22" y2="16"/></svg><span>Hub controls</span></button>
+    </div>
+    <div class="cx-group">
+      <div class="cx-group-label">Connect</div>
+      <button class="cx-nav-item" data-view="sec-connect" data-title="Connect your tools" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg><span>Connect tools</span></button>
+      <button class="cx-nav-item" data-view="sec-clis" data-title="Connected tools" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><span>Connected tools</span></button>
+      <button class="cx-nav-item" data-view="sec-subs" data-title="Local subscriptions" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.5 12.5 20 3"/><path d="m16 6 3 3"/></svg><span>Subscriptions</span></button>
+    </div>
+    <div class="cx-group">
+      <div class="cx-group-label">Chat</div>
+      <button class="cx-nav-item" data-view="sec-agent" data-title="Chat CLI (agentic)" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="m7 9 3 3-3 3"/><line x1="13" y1="15" x2="17" y2="15"/></svg><span>Chat CLI</span></button>
+      <button class="cx-nav-item" data-view="sec-chat" data-title="Chat / Test" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>Chat / Test</span></button>
+    </div>
+    <div class="cx-group">
+      <div class="cx-group-label">Models</div>
+      <button class="cx-nav-item" data-view="sec-default" data-title="Orchestrator model" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg><span>Orchestrator</span></button>
+      <button class="cx-nav-item" data-view="sec-providers" data-title="Providers" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg><span>Providers</span></button>
+    </div>
+    <div class="cx-group">
+      <div class="cx-group-label">Media</div>
+      <button class="cx-nav-item" data-view="sec-images" data-title="Image generation" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg><span>Images</span></button>
+    </div>
+    <div class="cx-group">
+      <div class="cx-group-label">Insights</div>
+      <button class="cx-nav-item" data-view="sec-activity" data-title="Live activity" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span>Activity</span></button>
+      <button class="cx-nav-item" data-view="sec-quota" data-title="Free quota" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg><span>Free quota</span></button>
+      <button class="cx-nav-item" data-view="sec-usage" data-title="Daily usage" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg><span>Usage</span></button>
+    </div>
+  </nav>
+</aside>
 <header>
   <div class="hd">
     <div class="logo">
@@ -962,6 +1063,7 @@
 </aside>
 
 <main class="wrap">
+  <div class="cx-viewhead"><h1><span class="cx-accent" id="cx-view-title">Hub controls</span></h1></div>
 
   <!-- Lifecycle and multimodal routing -->
   <section class="section" aria-labelledby="h-lifecycle">
@@ -1408,6 +1510,44 @@
     Must NOT be sold or used for any commercial purpose.
   </div>
 </footer>
+<script nonce="{{ csp_nonce }}">
+/* Futuristic sidebar: SPA view-switching over the existing 12 sections. */
+(function(){
+  function items(){ return Array.prototype.slice.call(document.querySelectorAll('.cx-nav-item')); }
+  function cxShow(view){
+    var body = document.getElementById(view);
+    if(!body) return;
+    var sec = body.closest('section.section');
+    if(!sec) return;
+    document.querySelectorAll('main.wrap > section.section').forEach(function(s){
+      s.classList.toggle('cx-active', s === sec);
+    });
+    body.hidden = false;                                   // force the active view's body open
+    var tog = sec.querySelector('.sec-toggle');
+    if(tog){ tog.setAttribute('aria-expanded','true'); }
+    items().forEach(function(b){ b.classList.toggle('active', b.dataset.view === view); });
+    var active = document.querySelector('.cx-nav-item[data-view="'+view+'"]');
+    var title = document.getElementById('cx-view-title');
+    if(title && active){ title.textContent = active.getAttribute('data-title') || active.textContent.trim(); }
+    document.body.classList.remove('cx-drawer-open');
+    try{ history.replaceState(null, '', '#'+view); }catch(e){}
+    try{ window.scrollTo(0, 0); }catch(e){}
+  }
+  function init(){
+    if(!document.getElementById('cx-sidebar')) return;
+    document.body.classList.add('cx-on');
+    items().forEach(function(b){ b.addEventListener('click', function(){ cxShow(b.dataset.view); }); });
+    var burger = document.getElementById('cx-burger');
+    if(burger){ burger.addEventListener('click', function(){ document.body.classList.toggle('cx-drawer-open'); }); }
+    var start = (location.hash || '').replace('#','');
+    if(!start || !document.getElementById(start)){ start = 'sec-lifecycle'; }
+    cxShow(start);
+    window.cxShow = cxShow;   // let other code deep-link a view (e.g. a wizard launcher)
+  }
+  if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', init); }
+  else { init(); }
+})();
+</script>
 
 <div class="artifact-panel" id="artifact-panel" hidden role="dialog" aria-modal="false" aria-label="Rendered artifact preview">
   <div class="artifact-bar">
