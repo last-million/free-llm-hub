@@ -218,13 +218,24 @@
   .count-note{font-size:12.5px;color:var(--text-faint);white-space:nowrap}
 
   /* ---------- provider grid ---------- */
-  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+  @media (max-width:1280px){ .grid{grid-template-columns:repeat(2,minmax(0,1fr))} }
   .card{
-    background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
+    background:linear-gradient(180deg,var(--surface-2),var(--surface));
+    border:1px solid var(--border-soft);border-radius:14px;
     padding:16px;display:flex;flex-direction:column;gap:11px;min-width:0;
-    transition:border-color .2s ease;
+    position:relative;box-shadow:0 1px 2px rgba(0,0,0,.25);
+    transition:border-color .2s ease, transform .2s ease, box-shadow .2s ease;
   }
-  .card:hover{border-color:var(--border)}
+  .card:hover{ border-color:var(--border); transform:translateY(-2px);
+    box-shadow:0 12px 32px rgba(0,0,0,.42), 0 0 0 1px rgba(34,211,238,.10); }
+  /* provider category headers (Free providers / Paid APIs) — full-width grid rows */
+  .prov-cat-h{ grid-column:1/-1; display:flex; align-items:center; gap:10px;
+    margin:10px 2px 0; font-family:var(--mono); }
+  .prov-cat-h .pc-t{ font-size:13px; font-weight:700; letter-spacing:.4px; color:var(--text); white-space:nowrap; }
+  .prov-cat-h .pc-sub{ font-size:11px; color:var(--text-faint); white-space:nowrap; }
+  .prov-cat-h::after{ content:""; flex:1; height:1px; background:linear-gradient(90deg,var(--border),transparent); }
+  .prov-cat-h.paid .pc-t{ background:linear-gradient(135deg,#22d3ee,#8b5cf6); -webkit-background-clip:text; background-clip:text; color:transparent; }
   .card.enabled{border-color:rgba(34,197,94,.35)}
   /* provider-card API-key health (B): green = key works, red = key fails, grey = testing/unknown.
      Left accent uses inset box-shadow (no layout shift); no-key cards stay neutral (no state class). */
@@ -246,7 +257,8 @@
   .card.key-testing .key-health .kh-dot{animation:khpulse 1.1s ease-in-out infinite}
   @keyframes khpulse{0%,100%{opacity:1}50%{opacity:.25}}
   .card-top{display:flex;align-items:flex-start;gap:10px}
-  .card-top .name{font-weight:700;font-size:15px;letter-spacing:-.01em;min-width:0;overflow-wrap:anywhere}
+  .card-top>div:first-child{min-width:0}
+  .card-top .name{font-weight:700;font-size:15px;letter-spacing:-.01em;min-width:0;overflow-wrap:break-word}
   .card-top .pid{font-family:var(--mono);font-size:11px;color:var(--text-faint)}
   .badges{display:flex;gap:5px;margin-left:auto;flex:none;flex-wrap:wrap;justify-content:flex-end}
   .badge{font-size:10.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;border-radius:5px;padding:2.5px 7px;white-space:nowrap}
@@ -2280,7 +2292,7 @@
       grid.innerHTML = '<div class="empty">No providers match &ldquo;' + esc(q) + '&rdquo;</div>';
       return;
     }
-    shown.forEach(function(p){
+    function renderCard(p){
       var card = document.createElement('div');
       card.className = 'card' + (p.enabled ? ' enabled' : '');
       card.dataset.pid = p.id;
@@ -2288,7 +2300,20 @@
       wireCard(card, p);
       applyCardHealth(card, p.id);   /* colour from cached key-health (survives search re-render) */
       grid.appendChild(card);
-    });
+    }
+    function catHeader(cls, title, sub){
+      var h = document.createElement('div');
+      h.className = 'prov-cat-h' + (cls ? ' ' + cls : '');
+      h.innerHTML = '<span class="pc-t">' + esc(title) + '</span><span class="pc-sub">' + esc(sub) + '</span>';
+      grid.appendChild(h);
+    }
+    // Two categories: free/trial providers first, then a "Paid APIs" section
+    // (bring-your-own paid key: Anthropic / OpenAI / Kimi / …). Ungrouped while
+    // searching would be confusing, so the split is kept even under a query.
+    var freeG = shown.filter(function(p){ return !p.paid; });
+    var paidG = shown.filter(function(p){ return p.paid; });
+    if (freeG.length){ catHeader('', 'Free providers', freeG.length + ' — no cost, just add a key'); freeG.forEach(renderCard); }
+    if (paidG.length){ catHeader('paid', 'Paid APIs', paidG.length + ' — optional: bring your own paid key'); paidG.forEach(renderCard); }
   }
 
   function wireCard(card, p){
