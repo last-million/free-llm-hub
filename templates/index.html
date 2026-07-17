@@ -3880,8 +3880,7 @@
       setBusy(true);
       var finalText = '';
       var headers = { 'Content-Type': 'application/json', 'X-Free-LLM-Hub': 'dashboard' };
-      var tok = (window.HUB_CONTROL_TOKEN || '');
-      if (tok) headers['X-Free-LLM-Hub-Token'] = tok;
+      if (typeof HUB_CONTROL_TOKEN !== 'undefined' && HUB_CONTROL_TOKEN) headers['X-Free-LLM-Hub-Token'] = HUB_CONTROL_TOKEN;
 
       fetch('/api/agent/sessions/' + encodeURIComponent(sessionId) + '/message/stream',
             { method: 'POST', headers: headers, body: JSON.stringify({ text: text }) })
@@ -3908,8 +3907,10 @@
         .catch(function(e){ asstEl.className = 'msg assistant error'; line('err', String((e && e.message) || e)); })
         .then(function(){
           clearInterval(elapsedTimer);
-          head.className = 'agent-term-line done'; head.textContent = '✓ finished';
-          if (finalText){ var art = extractArtifactHTML(finalText); if (art) addArtifactButton(asstEl, art); }
+          var failed = (' ' + asstEl.className + ' ').indexOf(' error ') >= 0;
+          head.className = 'agent-term-line ' + (failed ? 'err' : 'done');
+          head.textContent = failed ? '✕ failed' : '✓ finished';
+          if (!failed && finalText){ var art = extractArtifactHTML(finalText); if (art) addArtifactButton(asstEl, art); }
           checkpointBtn.disabled = false;
           setBusy(false);
           msgsEl.scrollTop = msgsEl.scrollHeight;
