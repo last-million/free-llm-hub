@@ -14,3 +14,6 @@ config.json
 
 # scratch commit-message files (never commit)
 cm*.txt
+
+# local hub run logs - never commit (may contain the control token)
+.hublog.*
