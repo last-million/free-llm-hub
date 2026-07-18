@@ -73,6 +73,18 @@ FREE_LIMITS = {
     "ovh":           {"limit": 300,   "window": "day"},
 }
 
+# PER-MODEL sub-caps: providers that meter EACH model on its own budget INSIDE the
+# provider's window, so one model can exhaust while its siblings keep serving. Only
+# documented figures — a provider absent here has no per-model cap (its models share
+# the provider-level FREE_LIMITS budget). The window is inherited from FREE_LIMITS.
+PER_MODEL_LIMITS = {
+    "modelscope":    500,   # 2,000 calls/day account-wide, but max 500/day PER MODEL
+    # NB: github-models is deliberately NOT here — its per-id cap is per-TIER
+    # (low-tier ids share 150/day, high-tier are 50/day each, deepseek-r1 8/day), so
+    # a single flat number would wrongly throttle the low tier. Those are handled by
+    # the real-429 per-model throttle below, which needs no fabricated figure.
+}
+
 # UNKNOWN provider — deliberately NOT a free budget.
 #
 # Was {"limit": 200, "window": "day"}: every provider missing from FREE_LIMITS
@@ -95,6 +107,27 @@ _LOCK = threading.RLock()
 _STATE: dict = {}
 # pid -> {"window_start": float, "models": {model_id: count}}  (per-model usage)
 _MODEL_STATE: dict = {}
+# (pid, model) -> {"throttled_until": float, "strikes": int, "last_strike": float}
+# Per-MODEL 429 sideline: when ONE model rate-limits (not the whole provider), only
+# that id is parked, so the provider's other models keep serving. Independent of the
+# provider-level _STATE throttle and NOT cleared by provider note_success().
+_MODEL_THROTTLE: dict = {}
+
+# pid -> {"remaining": int, "limit": int|None, "reset_at": float|None, "seen": float}
+# DYNAMIC quota learned from the provider's OWN rate-limit response headers. This is
+# what makes the hub adapt when a real quota differs from the static FREE_LIMITS
+# guess — a top-up that RAISES the limit, or a tightening that LOWERS it — with zero
+# probe waste: status() trusts a fresh header reading over the static table. Absent
+# for providers that send no such headers (they keep using the static budget).
+_DYNAMIC: dict = {}
+_DYNAMIC_TTL = 3600.0   # a reading older than this is ignored (window likely rolled)
+
+# Rate-limit header conventions, widest-support first. "-requests" variants are the
+# request buckets (not token buckets) most free providers expose; the bare names
+# cover OpenRouter/OpenAI-style; the un-prefixed names cover the IETF draft.
+_RL_REMAINING = ("x-ratelimit-remaining-requests", "x-ratelimit-remaining", "ratelimit-remaining")
+_RL_LIMIT     = ("x-ratelimit-limit-requests", "x-ratelimit-limit", "ratelimit-limit")
+_RL_RESET     = ("x-ratelimit-reset-requests", "x-ratelimit-reset", "ratelimit-reset", "retry-after")
 
 # Consecutive-429 backoff. Fixes "provider quota is spent but the hub keeps calling
 # it every 60s": each recurring 429 within _STRIKE_TTL of the last DOUBLES the short
@@ -161,6 +194,148 @@ def models(pid: str) -> dict:
         if not ms or ms.get("window_start") != start:
             return {}
         return dict(ms.get("models") or {})
+
+
+def _hdr(headers, names):
+    for n in names:
+        try:
+            v = headers.get(n)
+        except Exception:
+            v = None
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def _parse_int(v):
+    if v is None:
+        return None
+    try:
+        return int(float(str(v).strip()))
+    except Exception:
+        import re as _re
+        m = _re.search(r"-?\d+", str(v))
+        return int(m.group()) if m else None
+
+
+def _parse_reset(v, now):
+    """A rate-limit reset header -> absolute epoch. Handles seconds-from-now, epoch
+    seconds, epoch millis, and duration strings ('60s', '1m30s', '500ms'). None if
+    unparseable (caller then falls back to the static window reset)."""
+    if v is None:
+        return None
+    import re as _re
+    s = str(v).strip().lower()
+    if _re.search(r"[a-z]", s):                       # duration like '1m30s'
+        total, matched = 0.0, False
+        for num, unit in _re.findall(r"(\d+(?:\.\d+)?)\s*(ms|s|m|h)", s):
+            matched = True
+            total += float(num) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unit]
+        return now + total if matched else None
+    n = _parse_int(s)
+    if n is None:
+        return None
+    if n > 1e12:                                       # epoch millis
+        return n / 1000.0
+    if n > 1e9:                                        # epoch seconds
+        return float(n)
+    return now + n                                     # seconds-from-now
+
+
+def observe_headers(pid: str, headers) -> None:
+    """Learn a provider's REAL request quota from its rate-limit response headers,
+    so the hub adapts to any quota change (raised by a top-up, or lowered) with no
+    probe waste. Best-effort: no usable 'remaining' header -> no-op (static budget
+    stays in force). Never raises."""
+    if not headers:
+        return
+    rem = _parse_int(_hdr(headers, _RL_REMAINING))
+    if rem is None:
+        return
+    now = time.time()
+    lim = _parse_int(_hdr(headers, _RL_LIMIT))
+    reset_at = _parse_reset(_hdr(headers, _RL_RESET), now)
+    with _LOCK:
+        _DYNAMIC[pid] = {"remaining": max(0, rem), "limit": lim,
+                         "reset_at": reset_at, "seen": now}
+
+
+def _dynamic(pid: str, now: float):
+    """Fresh dynamic reading for pid, or None if absent/stale/window-rolled."""
+    d = _DYNAMIC.get(pid)
+    if not d:
+        return None
+    if now - d.get("seen", 0) > _DYNAMIC_TTL:
+        return None
+    if d.get("reset_at") and d["reset_at"] <= now:     # its window already reset
+        return None
+    return d
+
+
+def mark_model_throttled(pid: str, model: str, seconds: float = 60) -> None:
+    """A SINGLE model returned 429 — sideline just this id (its siblings on the same
+    provider keep serving). Consecutive-429 backoff mirrors the provider path: a 429
+    recurring within _STRIKE_TTL doubles the cooldown (capped at _MAX_BACKOFF, never
+    past the window reset), so an individually-spent model is retried exponentially
+    less often instead of every 60s. No-op without a model id."""
+    if not (isinstance(model, str) and model):
+        return
+    lim = _limit_for(pid)
+    now = time.time()
+    _start, reset = _window_bounds(lim["window"], now)
+    key = (pid, model)
+    with _LOCK:
+        mt = _MODEL_THROTTLE.get(key) or {"throttled_until": 0, "strikes": 0, "last_strike": 0.0}
+        if now - mt.get("last_strike", 0.0) <= _STRIKE_TTL:
+            mt["strikes"] = min(mt.get("strikes", 0) + 1, 16)
+        else:
+            mt["strikes"] = 1
+        mt["last_strike"] = now
+        backoff = min((seconds or 60) * (2 ** (mt["strikes"] - 1)), _MAX_BACKOFF)
+        mt["throttled_until"] = max(mt.get("throttled_until", 0), min(now + backoff, reset))
+        _MODEL_THROTTLE[key] = mt
+
+
+def note_model_success(pid: str, model: str) -> None:
+    """This exact model answered 2xx: clear ITS 429-backoff streak/sideline (a real
+    burst recovers here). Leaves other models and the provider state untouched."""
+    if not (isinstance(model, str) and model):
+        return
+    with _LOCK:
+        mt = _MODEL_THROTTLE.get((pid, model))
+        if mt:
+            mt["strikes"] = 0
+            mt["last_strike"] = 0.0
+            mt["throttled_until"] = 0
+
+
+def is_model_throttled(pid: str, model: str) -> bool:
+    """True while this specific id is inside its per-model 429 cooldown."""
+    with _LOCK:
+        mt = _MODEL_THROTTLE.get((pid, model))
+    return bool(mt and mt.get("throttled_until", 0) > time.time())
+
+
+def model_status(pid: str, model: str) -> dict:
+    """Per-model view: {used, limit, remaining, limit_known, throttled, exhausted}.
+    `limit` is the PER_MODEL_LIMITS sub-cap (None if the provider has none — then the
+    model shares the provider budget and only a real 429 sidelines it). `exhausted`
+    is per-model only (sub-cap hit OR per-model 429 cooldown); it does NOT fold in
+    provider-level exhaustion — use is_model_exhausted() for the full picture."""
+    per = PER_MODEL_LIMITS.get(pid)
+    used = models(pid).get(model, 0)
+    limit_known = isinstance(per, int)
+    remaining = max(0, per - used) if limit_known else None
+    throttled = is_model_throttled(pid, model)
+    exhausted = throttled or bool(limit_known and remaining <= 0)
+    return {"used": used, "limit": per, "limit_known": limit_known,
+            "remaining": remaining, "throttled": throttled, "exhausted": exhausted}
+
+
+def is_model_exhausted(pid: str, model: str) -> bool:
+    """Full per-(provider, model) gate for routing: True if the PROVIDER is spent OR
+    this individual model hit its sub-cap / is in its own 429 cooldown."""
+    return is_exhausted(pid) or model_status(pid, model)["exhausted"]
 
 
 def mark_throttled(pid: str, seconds: float = None) -> None:
@@ -246,6 +421,20 @@ def status(pid: str) -> dict:
     throttled = throttled_until > now
     remaining = max(0, limit - used) if limit_known else None
     quota_exhausted = bool(limit_known and remaining <= 0)
+    # ADAPT: a fresh reading from the provider's own rate-limit headers overrides the
+    # static guess (both ways — a raised limit un-exhausts, a lowered one exhausts),
+    # so quota changes are tracked with zero probe waste. `reset` moves to the header's
+    # own reset when it gave one, so the countdown is the provider's real one.
+    dyn = _dynamic(pid, now)
+    if dyn is not None:
+        remaining = dyn["remaining"]
+        if isinstance(dyn.get("limit"), int):
+            limit, limit_known = dyn["limit"], True
+        else:
+            limit_known = True                     # we at least know real remaining
+        quota_exhausted = remaining <= 0
+        if dyn.get("reset_at"):
+            reset = dyn["reset_at"]
     exhausted = throttled or quota_exhausted
     # Countdown = when the provider becomes usable AGAIN:
     #   - budget genuinely spent -> wait for the window reset (or a later throttle);
