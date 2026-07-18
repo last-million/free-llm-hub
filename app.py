@@ -2031,6 +2031,12 @@ def _guard_v1():
 import collections  # noqa: E402  (local, stdlib)
 
 _ACTIVITY_MAX = 40
+# A streaming/in-progress request still unfinished after this many seconds is
+# treated as dead (client hung, or an upstream that never closed the stream) and
+# shown as 'stalled' — instead of "streaming" forever with a timer that climbs
+# without bound. CLI-agnostic: protects the feed from ANY client that abandons a
+# stream, not just codex.
+_ACTIVITY_STALL_SECS = 600
 _activity = collections.deque(maxlen=_ACTIVITY_MAX)
 _activity_lock = threading.Lock()
 _activity_seq = [0]
@@ -2128,11 +2134,20 @@ def api_dead_models():
 def api_activity():
     now = time.time()
     with _activity_lock:
+        # Self-heal abandoned streams: anything still unfinished past the stall
+        # window is finalized as 'stalled' (fixed end time) so it stops showing
+        # "streaming" and its timer stops climbing.
+        for a in _activity:
+            if a.get("finished") is None and (now - a["started"]) > _ACTIVITY_STALL_SECS:
+                a["status"] = "stalled"
+                a["finished"] = now
         rows = list(_activity)
     out = []
     for a in rows:
         end = a["finished"] if a["finished"] else now
-        out.append({**a, "duration_ms": int((end - a["started"]) * 1000)})
+        out.append({**a,
+                    "duration_ms": int((end - a["started"]) * 1000),
+                    "started_ms": int(a["started"] * 1000)})
     return jsonify({"activity": out})
 
 
