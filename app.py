@@ -640,11 +640,14 @@ def _vision_candidates(est=0):
     return ordered + tail
 
 
-def _route_for_vision(messages, max_tokens=None, est=None):
+def _route_for_vision(messages, max_tokens=None, est=None, require_tools=False):
     if est is None:
         est = _est_tokens(messages)
-    candidates = _vision_candidates(est)
+    candidates = _vision_candidates(est)  # [(pid, model), ...]
     difficulty = _classify_difficulty(messages, max_tokens)
+    if require_tools and candidates:
+        # vision + tools: prefer a vision model that also calls tools; fail-open.
+        candidates = [c for c in candidates if _supports_tools(c[0], c[1])] or candidates
     if not candidates:
         return None, None, difficulty
     pid, model = candidates[0]
@@ -1511,7 +1514,58 @@ def _apply_reasoning_effort(payload, model, difficulty):
     return payload
 
 
-def _route_by_difficulty(messages, max_tokens=None, est=None):
+# --------------------------------------------------------------------------- #
+# Tool/function-calling capability. A request carrying a non-empty tools schema
+# (Codex over /v1/responses incl. spawn_agent; Claude Code over /v1/messages;
+# any /v1/* with tools) must route to a model that can DO function calling —
+# never a completion-only model (codestral, tiny/base models). Lowercase
+# substrings; NOT_TOOL_CAPABLE (exclusions) always wins. FAIL-OPEN: an id in
+# NEITHER list is assumed capable, so a new/unknown model is never dropped.
+# --------------------------------------------------------------------------- #
+NOT_TOOL_CAPABLE = (
+    "codestral", "codestral-mamba", "mamba-codestral",
+    "-fim", "/fim", "fim-", "fill-in", "text-completion",
+    "qwen2.5-coder", "qwen2-5-coder", "qwen2.5coder",
+    "deepseek-coder-v2", "deepseek-coder-6.7", "deepseek-coder-33",
+    "-1b", "-1.5b", "-1.1b", "-2b", "-3b", "-0.5b",
+    "llama-3.2-1b", "llama-3.2-3b", "llama3.2:1b", "llama3.2:3b",
+    "tinyllama", "gemma-2b", "gemma-2-2b", "qwen1.5-0.5b", "qwen2-0.5b",
+    "mixtral", "mistral-7b-instruct-v0.1", "mistral-7b-instruct-v0.2",
+    "open-mistral-7b", "open-mixtral",
+    "gemma-2-", "gemma-3-", "gemma:2", "gemma:3",
+    "embed", "rerank", "-mt", "hunyuan-mt", "whisper", "-tts", "-asr",
+    "-ocr", "guard", "llama-guard", "moderation",
+    "nova-canvas", "nova-reel", "flux", "stable-diffusion", "sdxl",
+    "-vl-", "-vision-only",
+)
+TOOL_CAPABLE = (
+    "deepseek-chat", "deepseek-v3", "deepseek-r1", "deepseek-reasoner",
+    "qwen2.5-", "qwen-2.5", "qwen3", "qwen-3", "qwen-max", "qwen-plus", "qwen-turbo", "qwq",
+    "kimi", "moonshot", "-k2",
+    "glm-4.5", "glm-4.6", "glm-4.7", "glm-5", "zai", "z-ai",
+    "llama-3.1", "llama3.1", "llama-3.3", "llama3.3", "llama-4", "llama4", "scout", "maverick",
+    "gpt-oss", "gpt-4", "gpt-5", "claude", "command-r", "nemotron",
+    "hunyuan-large", "hunyuan-turbo", "hunyuan-a13b", "hunyuan-3", "hy3",
+    "mistral-large", "mistral-medium", "mistral-small", "ministral", "devstral", "magistral",
+    "pixtral-large", "voxtral-small",
+    "gemini", "gemma-4", "functiongemma",
+    "nova-micro", "nova-lite", "nova-pro", "nova-premier",
+    "minimax", "abab6.5",
+)
+
+
+def _supports_tools(pid, model):
+    """True if (pid, model) can do OpenAI function/tool calling. FAIL-OPEN: an id
+    matching NEITHER list is assumed capable, so a new/unknown model is never
+    silently dropped from a tools request. An explicit NOT_TOOL_CAPABLE hit
+    (codestral, base/completion-only models) always wins over TOOL_CAPABLE."""
+    low = (model or "").lower()
+    if any(n in low for n in NOT_TOOL_CAPABLE):
+        return False
+    return True  # fail-open (TOOL_CAPABLE documents known-good; unknown -> allow)
+
+
+def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=False):
     """Pick (pid, model) by task difficulty across AVAILABLE providers that can
     also HANDLE the request size (skip small-TPM providers for big requests).
     - hard  -> strongest capable model.
@@ -1529,6 +1583,10 @@ def _route_by_difficulty(messages, max_tokens=None, est=None):
             # skip ids this key provably can't use (403/404 learned at runtime)
             if prov.is_model_allowed(m) and not _is_model_dead(pid, m):
                 cands.append((_benchmark_score(pid, m), pid, m))
+    if require_tools:
+        # A tools request must never land on a completion-only model. FAIL-OPEN:
+        # keep the unfiltered list if NO candidate is known tool-capable.
+        cands = [c for c in cands if _supports_tools(c[1], c[2])] or cands
     if not cands:
         # No FREE model exists at all (nothing keyed/enabled, or every candidate is
         # dead/exhausted). ONLY here may an opt-in local subscription become the
@@ -1669,7 +1727,7 @@ def _comparable_model(model_id, candidates):
     return best or candidates[0]
 
 
-def _build_chain(primary_pid, model_id, est=0, require_vision=False):
+def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_tools=False):
     """Priority-ordered [(pid, model)] fallback chain. Primary first, then the
     next-best MODELS across every AVAILABLE, size-capable provider, INTERLEAVED
     across providers (best model of each provider, then each provider's 2nd, ...).
@@ -1696,7 +1754,12 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False):
             (fast if _is_fast(pid, m) else slow).append(entry)
     fast.sort(key=lambda t: t[0], reverse=True)   # best fast model first
     slow.sort(key=lambda t: t[0], reverse=True)   # then best slow model
-    for _score, pid, m in fast + slow:
+    ordered = fast + slow
+    if require_tools:
+        # A tools request must never fall back onto a completion-only model.
+        # FAIL-OPEN: keep the full list if none are known tool-capable.
+        ordered = [e for e in ordered if _supports_tools(e[1], e[2])] or ordered
+    for _score, pid, m in ordered:
         if len(chain) >= MAX_HOPS:
             break
         if (pid, m) not in seen:
@@ -2104,6 +2167,18 @@ def _activity_before():
     return None
 
 
+# Terminal-success / content / error markers scanned in the streamed SSE body to
+# tell the activity feed whether an ANSWER was actually delivered. Bytes-level,
+# protocol-agnostic (marker strings don't collide across openai/responses/
+# anthropic). Terminal: [DONE] (chat), response.completed (responses),
+# message_stop (messages). Content: a real text/tool delta in any dialect.
+_STREAM_TERMINAL_RE = re.compile(rb"\[DONE\]|response\.completed|message_stop")
+_STREAM_CONTENT_RE = re.compile(
+    rb'output_text\.delta|function_call_arguments\.delta|content_block_delta'
+    rb'|"tool_calls"|"content"\s*:\s*"(?:\\|[^"])')
+_STREAM_ERROR_RE = re.compile(rb'event:\s*error|"error"\s*:')
+
+
 @app.after_request
 def _activity_after(response):
     act = getattr(g, "act", None)
@@ -2124,11 +2199,31 @@ def _activity_after(response):
         _body = response.response
 
         def _finalizing_body(src=_body, a=act, http=code):
+            saw_content = saw_terminal = saw_error = False
             try:
                 for chunk in src:
+                    b = chunk if isinstance(chunk, (bytes, bytearray)) \
+                        else str(chunk).encode("utf-8", "replace")
+                    if not saw_content and _STREAM_CONTENT_RE.search(b):
+                        saw_content = True
+                    if not saw_terminal and _STREAM_TERMINAL_RE.search(b):
+                        saw_terminal = True
+                    if not saw_error and _STREAM_ERROR_RE.search(b):
+                        saw_error = True
                     yield chunk
             finally:
-                _activity_done(a, "ok", http)
+                # 'ok'   -> a real answer (text or tool call) was delivered
+                # 'empty'-> stream finished cleanly but produced nothing
+                # 'error'-> an error event, or the stream cut off before any output
+                if saw_content:
+                    status = "ok"
+                elif saw_error:
+                    status = "error"
+                elif saw_terminal:
+                    status = "empty"
+                else:
+                    status = "error"
+                _activity_done(a, status, http)
 
         response.response = _finalizing_body()
         # Backstop: if the client disconnects before the body is fully consumed,
@@ -5553,10 +5648,12 @@ def v1_chat_completions():
     # providers take easy work and big requests avoid small-TPM providers (413).
     # Explicit '<pid>/<model>' bypasses model choice (chain still size-filters).
     est = _est_tokens(body.get("messages"), body.get("tools"))
+    has_tools = bool(body.get("tools"))
     diff = None
     if _is_orchestrate(body.get("model")):
         router = _route_for_vision if has_images else _route_by_difficulty
-        pid, resolved, diff = router(body.get("messages"), body.get("max_tokens"), est)
+        pid, resolved, diff = router(body.get("messages"), body.get("max_tokens"), est,
+                                     require_tools=has_tools)
         if pid is None:
             if has_images:
                 return _openai_error(
@@ -5580,7 +5677,8 @@ def v1_chat_completions():
     stream = bool(body.get("stream"))
     errors = []
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
-    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images):
+    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
+                                           require_tools=has_tools):
         if not prov.is_model_allowed(hop_model):
             continue
         if stream and _is_sub(hop_pid):
@@ -6003,10 +6101,12 @@ def v1_responses():
 
     # Same routing as /v1/chat/completions: Auto/empty/claude-* -> difficulty
     # route across available, SIZE-CAPABLE providers; explicit '<pid>/<model>' bypasses.
+    has_tools = bool(tools)
     diff = None
     if _is_orchestrate(body.get("model")):
         router = _route_for_vision if has_images else _route_by_difficulty
-        pid, resolved, diff = router(messages, body.get("max_output_tokens"), est)
+        pid, resolved, diff = router(messages, body.get("max_output_tokens"), est,
+                                     require_tools=has_tools)
         if pid is None:
             if has_images:
                 return _openai_error(
@@ -6045,7 +6145,8 @@ def v1_responses():
     stream = bool(body.get("stream"))
     errors = []
     last_hard = None  # last hard (non-retryable) upstream error, relayed if chain is exhausted
-    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images):
+    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
+                                           require_tools=has_tools):
         if not prov.is_model_allowed(hop_model):
             continue
         if stream and _is_sub(hop_pid):
@@ -6447,10 +6548,12 @@ def v1_messages():
     # by difficulty AND request size (skip small-TPM providers for large requests).
     tools = _anthropic_tools_to_openai(body.get("tools"))
     est = _est_tokens(oai_messages, tools)
+    has_tools = bool(tools)
     diff = None
     if _is_orchestrate(body.get("model")):
         router = _route_for_vision if has_images else _route_by_difficulty
-        pid, resolved, diff = router(oai_messages, body.get("max_tokens"), est)
+        pid, resolved, diff = router(oai_messages, body.get("max_tokens"), est,
+                                     require_tools=has_tools)
         if pid is None:
             if has_images:
                 return _anthropic_error(
@@ -6497,7 +6600,8 @@ def v1_messages():
 
     errors = []
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
-    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images):
+    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
+                                           require_tools=has_tools):
         if not prov.is_model_allowed(hop_model):
             continue
         if stream and _is_sub(hop_pid):
