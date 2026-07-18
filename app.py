@@ -441,13 +441,14 @@ _BENCH_FAMILY = [
       "gemini-3.5-flash", "gemini-3-flash",
       "deepseek-v4", "deepseek-r2", "glm-5", "glm5", "glm-6",
       "kimi-k2.6", "kimi-k2.7", "kimi-k2-thinking",
+      "hy3", "hunyuan-3", "tencent-hy",
       "minimax-m3", "qwen3.5", "qwen3-max"), 100),
     # Tier A — strong open workhorses (production SEO + coding drivers).
     (("deepseek-v3", "deepseek-r1", "deepseek-chat",
       "qwen3-235b", "qwen3-next", "qwen3-coder", "qwen3-32b",
       "glm-4.7", "glm-4.6", "kimi-k2", "minimax-m2",
       "gpt-oss-120b", "nemotron-3-ultra", "nemotron-3-super",
-      "hy3", "hunyuan-a13", "hunyuan-turbos", "command-a"), 84),
+      "hunyuan-a13", "hunyuan-turbos", "command-a"), 84),  # hy3 promoted to Tier S above
     # Tier B — capable mid (routine content, not hard reasoning).
     (("qwen3", "gemma-4", "gemma4", "mistral-medium", "mistral-large",
       "nemotron-3-120b", "phi-4", "solar-pro", "nova-2-pro", "granite-4",
@@ -538,6 +539,13 @@ def _benchmark_score(pid, model_id):
                               "gpt-oss", "claude", "gpt-5", "minimax-m", "hy3",
                               "hunyuan", "starcoder")):
         score += 8
+    # USER PREFERENCE: hy3 (Tencent HunYuan) is the #1 pick for coding + heavy tasks,
+    # then latest kimi / qwen / deepseek (all already Tier S). Floor it above every
+    # other model's realistic max (~133: tier 100 + coder 8 + size 20 + instruct 3 +
+    # provider 2) so hy3 wins the top slot whenever it's available/keyed. Only affects
+    # the max-based (hard/tools/agentic) routing — light tasks still pick cheapest.
+    if "hy3" in low or "hunyuan-3" in low or "tencent-hy" in low:
+        score = max(score, 135)
     if (("mistral" in low or "mixtral" in low or "ministral" in low)
             and not any(k in low for k in ("mistral-large", "mistral-medium"))):
         score -= 14
