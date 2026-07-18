@@ -1020,6 +1020,14 @@
   .nokey-note{ font-size:12.5px; color:var(--accent); background:var(--accent-soft);
     border:1px solid rgba(34,197,94,.25); border-radius:var(--radius-sm); padding:7px 10px; }
   .prov-cat-h.open .pc-t{ color:var(--accent); }
+  /* Auto provider mode: Free only / Mix / Paid only */
+  .prov-mode{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:0 0 14px; }
+  .prov-mode-lbl{ font-size:13px; color:var(--text-dim); font-weight:600; }
+  .prov-mode .seg{ display:inline-flex; background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:3px; gap:2px; }
+  .prov-mode-btn{ border:0; background:transparent; color:var(--text-dim); font:inherit; font-size:13px; font-weight:600; padding:6px 14px; border-radius:8px; cursor:pointer; transition:background .15s, color .15s; }
+  .prov-mode-btn:hover{ color:var(--text); }
+  .prov-mode-btn[aria-pressed="true"]{ background:linear-gradient(135deg,#22d3ee,#8b5cf6); color:#04121a; box-shadow:0 0 14px rgba(34,211,238,.25); }
+  .prov-mode-help{ font-size:12px; color:var(--text-faint); }
 </style>
 </head>
 <body>
@@ -1481,6 +1489,15 @@
         <input type="search" id="search" placeholder="Search providers, models, notes&hellip;" aria-label="Search providers">
       </div>
       <span class="count-note" id="count-note"></span>
+    </div>
+    <div class="prov-mode" id="prov-mode">
+      <span class="prov-mode-lbl">Auto uses:</span>
+      <div class="seg" role="group" aria-label="Which providers Auto may use">
+        <button type="button" class="prov-mode-btn" data-mode="free" aria-pressed="true">Free only</button>
+        <button type="button" class="prov-mode-btn" data-mode="mix" aria-pressed="false">Mix</button>
+        <button type="button" class="prov-mode-btn" data-mode="paid" aria-pressed="false">Paid only</button>
+      </div>
+      <span class="prov-mode-help" id="prov-mode-help"></span>
     </div>
     <div class="key-warn prov-warn">&#9888; Using several keys for the same provider to get around free limits may break their terms and can get your accounts banned. Use your own keys responsibly.</div>
     <div class="grid" id="grid" aria-live="polite">
@@ -2260,6 +2277,29 @@
   $('#default-auto').addEventListener('click', function(){ doAutoPickDefault(this); });
 
   /* ---------- providers ---------- */
+  function loadProviderMode(){
+    var wrap = $('#prov-mode');
+    if (!wrap) return;
+    var help = $('#prov-mode-help');
+    var HELP = { free: 'Auto uses only free models (default).', mix: 'Auto uses free + your saved paid keys.', paid: 'Auto uses only your saved paid keys.' };
+    var btns = wrap.querySelectorAll('.prov-mode-btn');
+    function paint(mode){
+      for (var i = 0; i < btns.length; i++){ btns[i].setAttribute('aria-pressed', String(btns[i].dataset.mode === mode)); }
+      if (help) help.textContent = HELP[mode] || '';
+    }
+    api('/api/auto/provider-mode').then(function(r){ paint((r && r.mode) || 'free'); }).catch(function(){ paint('free'); });
+    for (var i = 0; i < btns.length; i++){
+      (function(btn){
+        btn.addEventListener('click', function(){
+          var mode = btn.dataset.mode; paint(mode);
+          api('/api/auto/provider-mode', { method: 'POST', body: { mode: mode } })
+            .then(function(r){ paint((r && r.mode) || mode); toast('Auto now uses: ' + mode + ' models'); })
+            .catch(function(e){ toast('Mode: ' + e.message, true); loadProviderMode(); });
+        });
+      })(btns[i]);
+    }
+  }
+
   function loadProviders(){
     return api('/api/providers').then(function(j){
       providers = asList(j, ['providers']);
@@ -4626,6 +4666,7 @@
   loadUsage();
   loadStatus().then(function(){ updateChatAuthNote(); updateImageAuthNote(); });
   loadProviders().then(scheduleKeyHealthChecks);   /* colour keyed cards by live key health, capped concurrency */
+  loadProviderMode();
   loadModels().then(loadDefault).then(loadChatModels);
   loadClis();
   loadSubscriptions();
