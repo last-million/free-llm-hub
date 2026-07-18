@@ -439,7 +439,7 @@ _BENCH_FAMILY = [
       "gemini-3-pro", "gemini-3.5-pro", "gemini-3-ultra", "gemini-3.5-ultra",
       "llama-4-maverick", "qwen3.5", "qwen3-max"), 100),
     (("deepseek-v3", "deepseek-r1", "gpt-oss-120b", "llama-4", "qwen3", "gemini-2.5-pro",
-      "mixtral-8x22", "command-r-plus", "minimax", "glm-5", "glm52", "kimi",
+      "command-r-plus", "minimax", "glm-5", "glm52", "kimi",
       "hy3", "hunyuan", "tencent-hy"), 82),
     (("llama-3.3-70b", "llama-3.1-405", "qwen2.5-72", "gemini-2.5-flash", "gemma-3-27",
       "mistral-large", "nemotron-70", "command-r", "gpt-4o"), 68),
@@ -2114,7 +2114,26 @@ def _activity_after(response):
             act["stream"] = True
             act["status"] = "streaming"
             act["http"] = response.status_code
-        response.call_on_close(lambda: _activity_done(act, "ok", response.status_code))
+        code = response.status_code
+        # Finalize when the streamed BODY is exhausted (the generator's finally
+        # runs on the terminal next()), NOT only when the connection closes.
+        # Codex keeps the HTTP connection alive across its interactive session,
+        # so response.call_on_close() alone would not fire until the socket is
+        # torn down (or the 600s stall-guard trips) — leaving the row "streaming"
+        # with a climbing timer long after response.completed already shipped.
+        _body = response.response
+
+        def _finalizing_body(src=_body, a=act, http=code):
+            try:
+                for chunk in src:
+                    yield chunk
+            finally:
+                _activity_done(a, "ok", http)
+
+        response.response = _finalizing_body()
+        # Backstop: if the client disconnects before the body is fully consumed,
+        # connection-close still finalizes (no-op if already done).
+        response.call_on_close(lambda: _activity_done(act, "ok", code))
     else:
         ok = 200 <= response.status_code < 300
         _activity_done(act, "ok" if ok else "error", response.status_code)
