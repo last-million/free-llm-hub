@@ -90,10 +90,20 @@ FREE_LIMITS = {
 DEFAULT_LIMIT = {"limit": None, "window": "day", "unknown": True}
 
 _LOCK = threading.RLock()
-# pid -> {"count": int, "window_start": float, "throttled_until": float}
+# pid -> {"count": int, "window_start": float, "throttled_until": float,
+#         "strikes": int, "last_strike": float}
 _STATE: dict = {}
 # pid -> {"window_start": float, "models": {model_id: count}}  (per-model usage)
 _MODEL_STATE: dict = {}
+
+# Consecutive-429 backoff. Fixes "provider quota is spent but the hub keeps calling
+# it every 60s": each recurring 429 within _STRIKE_TTL of the last DOUBLES the short
+# cooldown, so a provider whose window budget is actually spent is retried
+# exponentially less often (60s -> 2m -> 4m -> ... capped), never past the window
+# reset — while a genuine 1-minute burst still recovers on its next success
+# (note_success clears the streak).
+_STRIKE_TTL = 1800.0     # seconds: 429s farther apart than this restart the streak
+_MAX_BACKOFF = 3600.0    # seconds: cap one sideline at 1h (the window reset caps it too)
 
 
 def _limit_for(pid: str) -> dict:
@@ -166,11 +176,11 @@ def mark_throttled(pid: str, seconds: float = None) -> None:
     lim = _limit_for(pid)
     now = time.time()
     start, reset = _window_bounds(lim["window"], now)
-    until = now + seconds if seconds else reset
     with _LOCK:
         st = _STATE.get(pid)
         if not st or st.get("window_start") != start:
-            st = {"count": 0, "window_start": start, "throttled_until": 0}
+            st = {"count": 0, "window_start": start, "throttled_until": 0,
+                  "strikes": 0, "last_strike": 0.0}
         if not seconds:
             # Full-window throttle: peg usage so `remaining` reads 0 immediately.
             # No-op for UNKNOWN-limit providers — there is no budget to peg, so
@@ -178,8 +188,38 @@ def mark_throttled(pid: str, seconds: float = None) -> None:
             # resets), which is the honest signal we actually have.
             if isinstance(lim.get("limit"), int):
                 st["count"] = max(st.get("count", 0), lim["limit"])
+            until = reset
+        else:
+            # CONSECUTIVE-429 BACKOFF: a 429 that recurs within _STRIKE_TTL of the
+            # last means the short cooldown didn't clear it — the window budget is
+            # spent, not a 1-minute burst — so double the cooldown per strike
+            # (capped at _MAX_BACKOFF, never past the window reset). Stops the hub
+            # re-calling an exhausted provider every 60s forever.
+            if now - st.get("last_strike", 0.0) <= _STRIKE_TTL:
+                st["strikes"] = min(st.get("strikes", 0) + 1, 16)
+            else:
+                st["strikes"] = 1
+            st["last_strike"] = now
+            backoff = min(seconds * (2 ** (st["strikes"] - 1)), _MAX_BACKOFF)
+            until = min(now + backoff, reset)
+        st["window_start"] = start
         st["throttled_until"] = max(st.get("throttled_until", 0), until)
         _STATE[pid] = st
+
+
+def note_success(pid: str) -> None:
+    """A successful (2xx) upstream response: the provider is alive, so reset its
+    consecutive-429 backoff streak (a genuine short burst recovers here). Usage
+    counts are untouched."""
+    with _LOCK:
+        st = _STATE.get(pid)
+        if st and (st.get("strikes") or st.get("last_strike") or st.get("throttled_until")):
+            st["strikes"] = 0
+            st["last_strike"] = 0.0
+            # A live provider isn't throttled — drop any residual sideline so it's
+            # eligible again (a later 429 re-throttles from the 60s base). Does NOT
+            # un-exhaust a KNOWN-limit provider whose count already hit its budget.
+            st["throttled_until"] = 0
 
 
 def status(pid: str) -> dict:

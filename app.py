@@ -1924,6 +1924,8 @@ def _upstream_chat(pid, payload, stream):
                 raise
             continue
         quota.record(pid, payload.get("model"))  # counts against free quota (per provider + model)
+        if 200 <= resp.status_code < 300:
+            quota.note_success(pid)  # provider answered -> clear its 429-backoff streak
         # A 429 on a SINGLE key just rotates to the next key below. Only when the
         # LAST key also 429s (every key for this provider is rate-limited) do we
         # sideline the whole provider. And when there's no numeric Retry-After,
@@ -1980,6 +1982,14 @@ _SOFT_400_CONTEXT_RE = re.compile(
     r"context_length_exceeded|reduce the length of the (?:messages|prompt)|"
     r"maximum context length|prompt is too long", re.I)
 _SOFT_400_TOOL_RE = re.compile(r"thought_signature", re.I)
+# Some providers return a VAGUE 400 ("we could not process your request / please
+# check your input / invalid_request_error") for a request THIS model can't serve
+# (usually an oversized context or an unsupported field) WITHOUT the tell-tale
+# 'context_length' text. Route around it to the next (often larger-context) model
+# instead of hard-failing the turn — codex's 'continue' on a big conversation hit
+# exactly this and errored every time instead of trying another free model.
+_SOFT_400_GENERIC_RE = re.compile(
+    r"could not process your request|please check your input|unable to process", re.I)
 
 
 def _classify_soft_400(resp):
@@ -2000,7 +2010,8 @@ def _classify_soft_400(resp):
         text = json.dumps(resp.json())
     except ValueError:
         text = resp.text or ""
-    return bool(_SOFT_400_TOOL_RE.search(text) or _SOFT_400_CONTEXT_RE.search(text))
+    return bool(_SOFT_400_TOOL_RE.search(text) or _SOFT_400_CONTEXT_RE.search(text)
+                or _SOFT_400_GENERIC_RE.search(text))
 
 
 def _upstream_error_detail(resp):
