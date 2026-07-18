@@ -2313,6 +2313,12 @@
   var X_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
   var KEY_WARN = '⚠ Using several keys for the same provider to get around free limits may break their terms and can get your accounts banned. Use your own keys responsibly.';
 
+  // ONLY these three have no free tier at all (pure paid). Every other provider
+  // has a free tier too, so it shows BOTH a free and a paid badge and sits under
+  // "Free providers". (Auto still won't spend on paid models unless you pick the
+  // Paid/Mix mode above — so this is display, not billing.)
+  var PURE_PAID = { openai: 1, anthropic: 1, higgsfield: 1 };
+
   function notesCardHTML(n){
     if (n && n.length > 200){
       return '<div class="notes">' + esc(n.slice(0, 200)) + '… ' +
@@ -2340,13 +2346,13 @@
     var kc = (typeof p.key_count === 'number') ? p.key_count : keys.length;
     var badges = '';
     var fmCount = Array.isArray(p.free_models) ? p.free_models.length : 0;
-    // Additive badges: a provider can be BOTH — show `free` whenever it exposes
-    // free models, AND `paid` when it has a paid tier, so users can see a paid
-    // provider still has free models available.
-    if (fmCount) badges += '<span class="badge free">free</span>';
+    // Additive badges. Only PURE_PAID providers (OpenAI/Claude/Higgsfield) lack a
+    // free tier; every other provider has one, so it shows BOTH free + paid.
+    var hasFree = fmCount > 0 || (p.paid && !PURE_PAID[p.id]);
+    if (hasFree) badges += '<span class="badge free">free</span>';
     if (p.paid) badges += '<span class="badge paid">paid</span>';
     if (p.trial) badges += '<span class="badge trial">trial</span>';
-    if (!fmCount && !p.paid && !p.trial) badges += '<span class="badge free">free</span>';
+    if (!hasFree && !p.paid && !p.trial) badges += '<span class="badge free">free</span>';
     if (p.has_key) badges += '<span class="badge keyed">' + kc + ' key' + (kc > 1 ? 's' : '') + ' saved</span>';
 
     var savedKeysHTML = '';
@@ -2434,12 +2440,13 @@
     // Two categories: free/trial providers first, then a "Paid APIs" section
     // (bring-your-own paid key: Anthropic / OpenAI / Kimi / …). Ungrouped while
     // searching would be confusing, so the split is kept even under a query.
+    function isPurePaid(p){ return p.paid && PURE_PAID[p.id]; }
     var openG = shown.filter(function(p){ return p.no_key; });
-    var freeG = shown.filter(function(p){ return !p.no_key && !p.paid; });
-    var paidG = shown.filter(function(p){ return !p.no_key && p.paid; });
+    var freeG = shown.filter(function(p){ return !p.no_key && !isPurePaid(p); });
+    var paidG = shown.filter(function(p){ return !p.no_key && isPurePaid(p); });
     if (openG.length){ catHeader('open', 'No key needed', openG.length + ' — open gateways, work instantly'); openG.forEach(renderCard); }
-    if (freeG.length){ catHeader('', 'Free providers', freeG.length + ' — no cost, just add a key'); freeG.forEach(renderCard); }
-    if (paidG.length){ catHeader('paid', 'Paid APIs', paidG.length + ' — optional: bring your own paid key'); paidG.forEach(renderCard); }
+    if (freeG.length){ catHeader('', 'Free providers', freeG.length + ' — free tier available (some have paid tiers too)'); freeG.forEach(renderCard); }
+    if (paidG.length){ catHeader('paid', 'Paid only', paidG.length + ' — no free tier (OpenAI / Claude / Higgsfield)'); paidG.forEach(renderCard); }
   }
 
   function wireCard(card, p){
