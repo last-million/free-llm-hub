@@ -6047,6 +6047,13 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
             delta = (choices[0] or {}).get("delta") or {}
 
             dtext = delta.get("content")
+            if dtext is not None and not isinstance(dtext, str):
+                # Some upstreams stream a non-string content delta (an int, or a
+                # content-parts list). Coerce to str so `"".join(text_buf)` below
+                # can't crash ("sequence item N: expected str instance, int found").
+                dtext = "".join(
+                    (p.get("text") or "") for p in dtext
+                    if isinstance(p, dict)) if isinstance(dtext, list) else str(dtext)
             if dtext:
                 if not text_started:
                     text_started = True
@@ -6095,6 +6102,8 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                     if fn.get("name"):
                         st["name"] = fn["name"]
                 args = fn.get("arguments")
+                if args is not None and not isinstance(args, str):
+                    args = str(args)  # tool-call args must be str for the join()
                 if args:
                     st["args"].append(args)
                     yield _sse_event("response.function_call_arguments.delta", {
@@ -6549,6 +6558,13 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
             delta = choice.get("delta") or {}
 
             dtext = delta.get("content")
+            if dtext is not None and not isinstance(dtext, str):
+                # Coerce a non-string content delta (int / content-parts list) so
+                # len(dtext) and the text_delta below can't crash — same upstream
+                # quirk that broke the /v1/responses stream.
+                dtext = "".join(
+                    (p.get("text") or "") for p in dtext
+                    if isinstance(p, dict)) if isinstance(dtext, list) else str(dtext)
             if dtext:
                 if block_kind != "text":
                     if block_kind is not None:
@@ -6584,6 +6600,8 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
                             "name": fn.get("name") or "",
                             "input": {}}})
                 args = fn.get("arguments")
+                if args is not None and not isinstance(args, str):
+                    args = str(args)
                 if args:
                     yield _sse_event("content_block_delta", {
                         "type": "content_block_delta", "index": tool_blocks[oai_idx],
