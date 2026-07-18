@@ -500,6 +500,21 @@ def set_flag(name: str, value: bool) -> None:
         save_config(cfg)
 
 
+def get_setting(name: str, default=None):
+    """Read a top-level non-boolean setting (e.g. a string mode) from the config."""
+    with _LOCK:
+        cfg = load_config()
+    return cfg.get(name, default)
+
+
+def set_setting(name: str, value) -> None:
+    """Persist a top-level non-boolean setting (e.g. a string mode)."""
+    with _LOCK:
+        cfg = load_config(strict=True)
+        cfg[name] = value
+        save_config(cfg)
+
+
 def get_local_api_key() -> Optional[str]:
     """Optional bearer clients must present on /v1/*; None = open on localhost."""
     with _LOCK:

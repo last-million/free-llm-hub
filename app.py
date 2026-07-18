@@ -349,6 +349,67 @@ def provider_free_models(pid, live=True):
     return models
 
 
+# --- Auto provider mode: free (default) / paid / mix -------------------------
+_paid_model_cache = {}  # pid -> (timestamp, [paid model ids]); separate from _model_cache
+
+
+def _auto_provider_mode():
+    """Which models AUTO routing may use: 'free' (default), 'paid', or 'mix'.
+    Persisted as a top-level config string; anything unexpected falls back to 'free'."""
+    m = config.get_setting("auto_provider_mode", "free")
+    return m if m in ("free", "paid", "mix") else "free"
+
+
+def _provider_paid_models(pid):
+    """A provider's NON-free (paid) models via live /models discovery, safety- and
+    non-chat-filtered. Empty unless the provider is enabled+keyed with a models_url.
+    Cached 60s separately from the free cache."""
+    p = prov.get_provider(pid)
+    if not p:
+        return []
+    pcfg = config.get_provider_config(pid)
+    if not pcfg.get("api_key") and _needs_key(pid):
+        return []
+    now = time.time()
+    with _model_cache_lock:
+        hit = _paid_model_cache.get(pid)
+        if hit and (now - hit[0]) < MODEL_CACHE_TTL:
+            return list(hit[1])
+    out = []
+    url = _models_url_for(pid, pcfg)
+    if url:
+        try:
+            resp = requests.get(
+                url,
+                headers=({"Authorization": "Bearer " + pcfg["api_key"]}
+                         if pcfg.get("api_key") else {}),
+                timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT),
+            )
+            if resp.status_code == 200:
+                ids = _parse_model_ids(resp.json())
+                out = prov.filter_models([m for m in ids if not prov.is_free_model(pid, m)])
+        except Exception:
+            pass
+    with _model_cache_lock:
+        _paid_model_cache[pid] = (now, list(out))
+    return out
+
+
+def _auto_models(pid):
+    """Models a provider contributes to AUTO routing, honoring _auto_provider_mode():
+    'free' -> free only (provider_free_models); 'paid' -> paid only; 'mix' -> both.
+    Display code keeps calling provider_free_models directly (always free-only)."""
+    mode = _auto_provider_mode()
+    free = provider_free_models(pid)
+    if mode == "free":
+        return free
+    paid = _provider_paid_models(pid)
+    if mode == "paid":
+        return paid
+    seen = set(free)
+    return free + [m for m in paid if m not in seen]
+
+
 def aggregated_models():
     """[{id:'<pid>/<model>', provider, model}] across enabled+keyed providers."""
     out = []
@@ -440,7 +501,7 @@ def _best_free_pair(working_only=True):
     "Best" must mean best AMONG MODELS THAT ANSWER."""
     best, best_pid, best_score = None, None, -1.0
     for pid in _available_providers():
-        for m in provider_free_models(pid):
+        for m in _auto_models(pid):
             if working_only and (not prov.is_model_allowed(m) or _is_model_dead(pid, m)):
                 continue
             s = _benchmark_score(pid, m)
@@ -1464,7 +1525,7 @@ def _route_by_difficulty(messages, max_tokens=None, est=None):
         providers = sorted(_available_providers(), key=_provider_tpm, reverse=True)
     cands = []  # (score, pid, model)
     for pid in providers:
-        for m in provider_free_models(pid):
+        for m in _auto_models(pid):
             # skip ids this key provably can't use (403/404 learned at runtime)
             if prov.is_model_allowed(m) and not _is_model_dead(pid, m):
                 cands.append((_benchmark_score(pid, m), pid, m))
@@ -1626,7 +1687,7 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False):
     for pid in _available_providers():
         if not _provider_capable(pid, est):
             continue
-        for m in provider_free_models(pid):
+        for m in _auto_models(pid):
             if (pid, m) in seen or not prov.is_model_allowed(m) or _is_model_dead(pid, m):
                 continue
             if require_vision and not _is_vision_model(pid, m):
@@ -2295,7 +2356,7 @@ def _ranked_free_pairs(limit=6):
     safety-blocked and known-dead ids."""
     cands = []
     for pid in _available_providers():
-        for m in provider_free_models(pid):
+        for m in _auto_models(pid):
             if not prov.is_model_allowed(m) or _is_model_dead(pid, m):
                 continue
             cands.append((_benchmark_score(pid, m), pid, m))
@@ -2830,6 +2891,21 @@ def api_agent_test_verification_update():
         return jsonify({"error": "Pass {\"enabled\": bool}."}), 400
     agentic_chat.set_test_verification_enabled(body["enabled"])
     return jsonify({"enabled": agentic_chat.test_verification_enabled()})
+
+
+@app.route("/api/auto/provider-mode", methods=["GET"])
+def api_auto_provider_mode():
+    return jsonify({"mode": _auto_provider_mode()})
+
+
+@app.route("/api/auto/provider-mode", methods=["POST"])
+def api_auto_provider_mode_update():
+    body = request.get_json(force=True, silent=True)
+    mode = body.get("mode") if isinstance(body, dict) else None
+    if mode not in ("free", "paid", "mix"):
+        return jsonify({"error": "mode must be 'free', 'paid', or 'mix'."}), 400
+    config.set_setting("auto_provider_mode", mode)
+    return jsonify({"mode": _auto_provider_mode()})
 
 
 @app.route("/api/agent/vision-status", methods=["GET"])
