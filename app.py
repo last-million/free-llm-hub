@@ -1674,8 +1674,12 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     # on. Slow reasoning models are used only if NO fast model is available (and
     # they still appear later in _build_chain as a last-resort fallback).
     pool = [c for c in cands if _is_fast(c[1], c[2])] or cands
-    if difficulty == "hard":
+    if difficulty == "hard" or require_tools:
         # best QUALITY among the fast models (good + fast, not the slow giant).
+        # `require_tools` (codex/agentic, MCP, tool calling) ALSO takes the TOP
+        # model regardless of difficulty — a mid model can't drive an agent, and
+        # the 'medium' cheapness rule below would hand codex a weak model (this is
+        # why codex kept landing on qwen3-30b instead of kimi-k2.6/gpt-oss-120b).
         _s, pid, model = max(pool, key=lambda t: t[0])
         return pid, model, difficulty
     floor = _DIFFICULTY_FLOOR[difficulty]
