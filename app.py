@@ -546,6 +546,11 @@ def _benchmark_score(pid, model_id):
     # the max-based (hard/tools/agentic) routing — light tasks still pick cheapest.
     if "hy3" in low or "hunyuan-3" in low or "tencent-hy" in low:
         score = max(score, 135)
+    # USER PREFERENCE: Kimi K3 (Moonshot) — top pick for the heaviest tasks, right
+    # behind hy3 and above every other model. Auto-applies when a provider serves a
+    # kimi-k3 id (nothing lists it yet). Matches kimi-k3 / kimi-k3.x / .../kimi-k3.
+    if "kimi-k3" in low or "kimik3" in low:
+        score = max(score, 134)
     if (("mistral" in low or "mixtral" in low or "ministral" in low)
             and not any(k in low for k in ("mistral-large", "mistral-medium"))):
         score -= 14
@@ -1646,6 +1651,60 @@ def _supports_tools(pid, model):
     return True  # fail-open (TOOL_CAPABLE documents known-good; unknown -> allow)
 
 
+def _quota_headroom(pid: str) -> float:
+    """Fraction of a provider's free budget still available: 1.0 = fresh (or an
+    unknown/uncapped ceiling), 0.0 = spent. Used ONLY as a TIEBREAKER among
+    equal-benchmark models so the router keeps using a provider that still has
+    quota instead of re-picking a nearly-drained one — it NEVER overrides model
+    quality (a weaker-but-fresh model can't jump a stronger one). Fully-exhausted
+    providers are already dropped upstream by _available_providers()."""
+    try:
+        s = quota.status(pid)
+    except Exception:
+        return 1.0
+    if not s.get("limit_known"):      # no researched ceiling -> treat as fresh
+        return 1.0
+    lim = s.get("limit") or 0
+    if lim <= 0:                      # documented no-free-tier (already excluded)
+        return 0.0
+    rem = s.get("remaining")
+    if rem is None:
+        return 1.0
+    return max(0.0, min(1.0, rem / lim))
+
+
+# Orchestrator load-spreading. On agentic/hard turns the strict "always the single
+# best model" rule made codex hammer ONE provider+model for a whole project, so that
+# provider's quota drained while every other strong model sat idle. Instead ROTATE
+# across the TOP-TIER BAND (models within _ORCH_BAND points of the best) turn by
+# turn: same quality, but consumption spreads across providers and a single account's
+# budget lasts far longer. The current best id keeps DOUBLE weight, so hy3 (or a
+# future kimi-k3) still leads the rotation — "prioritize hy3" AND "mix the best ones"
+# both hold. Rotation only runs in Auto/orchestrate mode; an explicit '<pid>/<model>'
+# request bypasses the router entirely and is untouched.
+_ORCH_BAND = 30.0
+_orch_cursor = 0
+_orch_lock = threading.Lock()
+
+
+def _spread_pick(pool):
+    """pool = [(score, pid, model)] of fast candidates. Return one top-tier entry,
+    rotating across the band so consecutive agentic turns land on DIFFERENT strong
+    providers. The top-scored model gets double weight (stays the lead). Exhausted
+    models are already filtered out of `pool` upstream."""
+    global _orch_cursor
+    if not pool:
+        return None
+    top = max(p[0] for p in pool)
+    band = [p for p in pool if p[0] >= top - _ORCH_BAND]
+    band.sort(key=lambda t: (-t[0], t[1], t[2]))    # deterministic, best first
+    ring = [band[0]] + band                          # best id twice -> ~2x weight
+    with _orch_lock:
+        pick = ring[_orch_cursor % len(ring)]
+        _orch_cursor += 1
+    return pick
+
+
 def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=False):
     """Pick (pid, model) by task difficulty across AVAILABLE providers that can
     also HANDLE the request size (skip small-TPM providers for big requests).
@@ -1661,8 +1720,11 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     cands = []  # (score, pid, model)
     for pid in providers:
         for m in _auto_models(pid):
-            # skip ids this key provably can't use (403/404 learned at runtime)
-            if prov.is_model_allowed(m) and not _is_model_dead(pid, m):
+            # skip ids this key provably can't use (403/404 learned at runtime) and
+            # ids individually rate-limited / over their per-model sub-cap.
+            if (prov.is_model_allowed(m) and not _is_model_dead(pid, m)
+                    and not quota.is_model_throttled(pid, m)
+                    and not quota.model_status(pid, m)["exhausted"]):
                 cands.append((_benchmark_score(pid, m), pid, m))
     if require_tools:
         # A tools request must never land on a completion-only model. FAIL-OPEN:
@@ -1688,15 +1750,18 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # model regardless of difficulty — a mid model can't drive an agent, and
         # the 'medium' cheapness rule below would hand codex a weak model (this is
         # why codex kept landing on qwen3-30b instead of kimi-k2.6/gpt-oss-120b).
-        _s, pid, model = max(pool, key=lambda t: t[0])
+        # Tie among equal-best models -> the one with the MOST free quota left.
+        _s, pid, model = max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
         return pid, model, difficulty
     floor = _DIFFICULTY_FLOOR[difficulty]
     qualified = [c for c in pool if c[0] >= floor]
     if qualified:
-        # cheapest fast model that still clears the bar -> saves strong quota
-        _s, pid, model = min(qualified, key=lambda t: t[0])
+        # cheapest fast model that still clears the bar -> saves strong quota;
+        # tie among equal-cheap models -> the one with the MOST free quota left
+        # (-headroom so min() picks lowest score THEN highest remaining budget).
+        _s, pid, model = min(qualified, key=lambda t: (t[0], -_quota_headroom(t[1])))
     else:
-        _s, pid, model = max(pool, key=lambda t: t[0])
+        _s, pid, model = max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
     return pid, model, difficulty
 
 
@@ -1833,12 +1898,17 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         for m in _auto_models(pid):
             if (pid, m) in seen or not prov.is_model_allowed(m) or _is_model_dead(pid, m):
                 continue
+            # skip a model that's individually rate-limited or over its per-model cap
+            if quota.is_model_throttled(pid, m) or quota.model_status(pid, m)["exhausted"]:
+                continue
             if require_vision and not _is_vision_model(pid, m):
                 continue
             entry = (_benchmark_score(pid, m), pid, m)
             (fast if _is_fast(pid, m) else slow).append(entry)
-    fast.sort(key=lambda t: t[0], reverse=True)   # best fast model first
-    slow.sort(key=lambda t: t[0], reverse=True)   # then best slow model
+    # best model first; tie among equal-score models -> most free quota left, so
+    # the fallback chain keeps using providers that still have budget.
+    fast.sort(key=lambda t: (t[0], _quota_headroom(t[1])), reverse=True)
+    slow.sort(key=lambda t: (t[0], _quota_headroom(t[1])), reverse=True)
     ordered = fast + slow
     if require_tools:
         # A tools request must never fall back onto a completion-only model.
@@ -1936,8 +2006,10 @@ def _upstream_chat(pid, payload, stream):
                 raise
             continue
         quota.record(pid, payload.get("model"))  # counts against free quota (per provider + model)
+        quota.observe_headers(pid, resp.headers)  # ADAPT to the provider's real quota
         if 200 <= resp.status_code < 300:
             quota.note_success(pid)  # provider answered -> clear its 429-backoff streak
+            quota.note_model_success(pid, payload.get("model"))  # and THIS model's streak
         # A 429 on a SINGLE key just rotates to the next key below. Only when the
         # LAST key also 429s (every key for this provider is rate-limited) do we
         # sideline the whole provider. And when there's no numeric Retry-After,
@@ -1952,6 +2024,10 @@ def _upstream_chat(pid, payload, stream):
             except ValueError:
                 secs = None
             quota.mark_throttled(pid, secs or 60)
+            # ALSO park just this model: it survives provider note_success(), so when
+            # a sibling model revives the provider, the id that actually 429'd stays
+            # sidelined instead of being re-picked and 429'ing again.
+            quota.mark_model_throttled(pid, payload.get("model"), secs or 60)
         # 403 (no access to this model with this key) / 404 (model gone) are about
         # the MODEL, not the key or the quota: sideline just that id so routing
         # stops picking it. Only on the last key — an earlier key's 403 may just
@@ -6268,7 +6344,12 @@ def v1_responses():
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             continue
         if resp.status_code == 200:
-            model_label = hop_pid + "/" + hop_model
+            # Echo back the id the client ASKED for (codex sends "auto", which now has
+            # config metadata) instead of the resolved "pid/model" — otherwise codex
+            # re-warns "Model metadata for `pid/model` not found" on every response
+            # (issue #21070). The real model that answered is still shown on the hub
+            # dashboard + activity feed, so no transparency is lost.
+            model_label = (body.get("model") or "").strip() or (hop_pid + "/" + hop_model)
             if stream:
                 # #4: peek the first line BEFORE committing the 200 SSE stream so a
                 # hung/slow provider falls through to the next hop instead of stalling.
