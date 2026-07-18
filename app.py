@@ -427,31 +427,81 @@ def aggregated_models():
 # cross-provider fallback chain best-first.
 # --------------------------------------------------------------------------- #
 # Capability families, strongest first. Matched case-insensitively as substrings.
+# First matching tier wins (break). Order S→A→B→C→D so a specific strong id beats
+# a generic weak token. Scores refreshed to Jul-2026 AA-II / SWE-bench tiers.
+# NOTE: strong flagships live here so their CURRENT pins score top even without a
+# parsable version bump; the new-version heuristic below auto-covers FUTURE bumps.
+# Flash/flash-lite/mini/<14B variants are demoted by the CAP in _benchmark_score,
+# never by inheriting a flagship family's tier (the historical "gemini-3" /
+# bare-"mini" scoring bugs).
 _BENCH_FAMILY = [
-    # NOTE: "gemini-3-pro"/"gemini-3.5-pro"/"*-ultra" ONLY -- a bare "gemini-3"
-    # here was a live, reproduced bug: it's a substring of "gemini-3.1-flash-
-    # lite-preview" (Google's CHEAPEST free tier), which was outscoring every
-    # other candidate at 101.0 and getting picked as "the best" by /api/default/
-    # auto. Flash/flash-lite variants must fall through to a lower tier (see
-    # "flash-lite" in the weakest tier below) based on their OWN merits, not
-    # inherit the flagship family's score just for sharing a version prefix.
-    (("deepseek-v4", "deepseek-r2", "grok-4", "gpt-5", "claude-opus", "claude-sonnet-5",
+    # Tier S — frontier proprietary (pinned) + strongest free/open 2026 flagships.
+    (("grok-4", "gpt-5", "claude-opus", "claude-sonnet-5", "claude-fable",
       "gemini-3-pro", "gemini-3.5-pro", "gemini-3-ultra", "gemini-3.5-ultra",
-      "llama-4-maverick", "qwen3.5", "qwen3-max"), 100),
-    (("deepseek-v3", "deepseek-r1", "gpt-oss-120b", "llama-4", "qwen3", "gemini-2.5-pro",
-      "command-r-plus", "minimax", "glm-5", "glm52", "kimi",
-      "hy3", "hunyuan", "tencent-hy"), 82),
-    (("llama-3.3-70b", "llama-3.1-405", "qwen2.5-72", "gemini-2.5-flash", "gemma-3-27",
-      "mistral-large", "nemotron-70", "command-r", "gpt-4o"), 68),
-    (("70b", "72b", "gemini-2.0", "gpt-4o-mini", "mistral-small", "codestral", "gemma-2-27"), 52),
-    (("32b", "27b", "gemma-3", "phi-4", "qwen2.5-coder"), 40),
-    # "-mini" (not bare "mini") -- a bare substring match also silently caught
-    # every "gemini-*" id (ge-MINI-...), a second live-verified scoring bug
-    # found right alongside the "gemini-3" one above: any Gemini model that
-    # didn't hit an earlier explicit tier was getting an unearned tier-6 floor
-    # score just for containing "mini" inside its own family name.
-    (("8b", "9b", "7b", "flash-lite", "-mini", "small", "nemo"), 24),
+      "gemini-3.5-flash", "gemini-3-flash",
+      "deepseek-v4", "deepseek-r2", "glm-5", "glm5", "glm-6",
+      "kimi-k2.6", "kimi-k2.7", "kimi-k2-thinking",
+      "minimax-m3", "qwen3.5", "qwen3-max"), 100),
+    # Tier A — strong open workhorses (production SEO + coding drivers).
+    (("deepseek-v3", "deepseek-r1", "deepseek-chat",
+      "qwen3-235b", "qwen3-next", "qwen3-coder", "qwen3-32b",
+      "glm-4.7", "glm-4.6", "kimi-k2", "minimax-m2",
+      "gpt-oss-120b", "nemotron-3-ultra", "nemotron-3-super",
+      "hy3", "hunyuan-a13", "hunyuan-turbos", "command-a"), 84),
+    # Tier B — capable mid (routine content, not hard reasoning).
+    (("qwen3", "gemma-4", "gemma4", "mistral-medium", "mistral-large",
+      "nemotron-3-120b", "phi-4", "solar-pro", "nova-2-pro", "granite-4",
+      "command-r-plus", "gemini-2.5-pro"), 56),
+    # Tier C-hi — older mid / mid-small usable.
+    (("llama-4", "llama4", "gemma-3-27", "gemma3-27", "qwen2.5-72",
+      "llama-3.3-70", "mistral-small", "command-r", "gpt-4o", "gpt-oss-20b",
+      "nemotron-70"), 40),
+    # Tier C — legacy / superseded / specialized (avoid for heavy).
+    (("qwen2.5", "qwen2", "llama-3", "llama-2", "gemma-3", "gemma3", "gemma-2",
+      "mixtral", "moonshot-v1", "qwq", "distill", "codestral", "devstral",
+      "mercury", "sonar", "ernie", "hermes", "gemini-2.0", "gemini-2.5-flash",
+      "gpt-4o-mini"), 26),
+    # Tier D — tiny / lite / mini / flash-lite / nano (the CAP also enforces this).
+    (("flash-lite", "-lite", "-mini", "nano", "small", "mistral-nemo", "tiny",
+      "ministral", "instant", "1b", "2b", "3b", "4b", "7b", "8b", "9b"), 18),
 ]
+
+# NEW-VERSION HEURISTIC — a known-strong family ROOT at a version >= its pinned
+# CURRENT strong version scores in the TOP band, so a brand-new release
+# (deepseek-v5, glm-6, kimi-k3, qwen4, minimax-m4, gemini-4) auto-ranks strong the
+# moment a free provider lists it — no table edit needed. Numbered families only
+# (clean version parse); flat-named strong families (gpt-oss-120b, command-a,
+# hunyuan hy3, nemotron-3-ultra) are covered by _BENCH_FAMILY above.
+_STRONG_ROOTS = (
+    # (root_substring, pinned_version, top_score)
+    ("deepseek-v", 3.1, 100),   # v3.1/v3.2/v4/v5…  (bare v3 orig -> 3.0 < 3.1)
+    ("glm",        5.0, 100),   # glm-5/5.1/5.2/6…  (glm-4.x -> <5, stays weak)
+    ("qwen",       3.0, 100),   # qwen3/qwen3.5/qwen4…  (qwen2.5 -> 2.5 < 3)
+    ("kimi-k",     2.0, 100),   # kimi-k2/k2.6/k3…
+    ("minimax-m",  2.0, 100),   # minimax-m2/m2.5/m3/m4…
+    ("gemini",     3.0, 100),   # gemini-3/3.5/4…  (gemini-2.x -> <3; flash-lite CAPed)
+    ("llama",      5.0, 100),   # llama-5+ only (Llama-4 flopped -> stays mid)
+)
+_VER_AFTER_RE = re.compile(r"(\d+(?:\.\d+)?)")
+
+
+def _strong_new_version_score(low):
+    """New-version heuristic (fail-safe): the highest top-score whose known-strong
+    family ROOT appears with a version >= its pin, else 0."""
+    best = 0
+    for root, pin, pts in _STRONG_ROOTS:
+        idx = low.find(root)
+        if idx < 0:
+            continue
+        m = _VER_AFTER_RE.search(low[idx + len(root):])
+        if not m:
+            continue
+        try:
+            if float(m.group(1)) >= pin:
+                best = max(best, pts)
+        except ValueError:
+            pass
+    return best
 
 
 def _benchmark_score(pid, model_id):
@@ -463,11 +513,16 @@ def _benchmark_score(pid, model_id):
         if any(n in low for n in names):
             score = max(score, pts)
             break
+    # NEW-VERSION HEURISTIC: auto-rank a newer release of a known-strong family.
+    sv = _strong_new_version_score(low)
+    score = max(score, sv)
     # Explicit parameter size nudges within a family (…-70b > …-8b).
+    params_b = None
     m = re.search(r"(\d{1,4})\s*b\b", low)
     if m:
         try:
-            score += min(int(m.group(1)), 500) / 25.0
+            params_b = int(m.group(1))
+            score += min(params_b, 500) / 25.0
         except ValueError:
             pass
     # Prefer instruct/chat tunes over raw/base for a chat gateway.
@@ -476,16 +531,34 @@ def _benchmark_score(pid, model_id):
     # A tiny provider bias breaks ties toward fast, reliable free hosts.
     score += {"cerebras": 2.0, "groq": 1.8, "nvidia": 1.2, "google": 1.0}.get(pid, 0.0)
     # Coding-strength adjustment: this hub is coding-heavy, and raw strength != code
-    # ability. Boost known-strong coders, and penalize the Mistral chat family (weak
-    # at coding, per user feedback) so 'auto' stops picking it for code work. Note
-    # `codestral` (Mistral's dedicated code model) is deliberately exempt from the
-    # penalty and gets the coder boost.
+    # ability. Boost known-strong 2026 coders; penalize the weak Mistral CHAT family
+    # (mistral-large/medium exempt — they are the capable big ones).
     if any(c in low for c in ("deepseek", "qwen3-coder", "qwen2.5-coder", "qwen3",
-                              "kimi", "glm-5", "glm52", "glm-4.7", "gpt-oss", "claude",
-                              "gpt-5", "hy3", "hunyuan", "codestral", "starcoder", "devstral")):
+                              "kimi", "glm-5", "glm5", "glm-6", "glm-4.7", "glm-4.6",
+                              "gpt-oss", "claude", "gpt-5", "minimax-m", "hy3",
+                              "hunyuan", "starcoder")):
         score += 8
-    if ("mistral" in low or "mixtral" in low or "ministral" in low) and "codestral" not in low:
+    if (("mistral" in low or "mixtral" in low or "ministral" in low)
+            and not any(k in low for k in ("mistral-large", "mistral-medium"))):
         score -= 14
+    # SPEED/TINY CAP (last word): flash/lite/mini/nano/distill variants and any model
+    # < 14B params are latency/edge tier — cap them out of the heavy band even when
+    # their family root is a flagship (glm-4.7-FLASH, gemini-3.1-flash-lite,
+    # deepseek-r1-DISTILL). gemini-3(.5)-flash / gemini-4 are the kept exceptions.
+    flash_ok = ("gemini-3.5-flash", "gemini-3-flash", "gemini-4")
+    speed = ("flash-lite", "-lite", "-mini", "nano", "distill", "-air",
+             "instant", "-tiny", "-edge", "mixtral", "moonshot-v1",
+             "ernie-speed", "ernie-lite", "mistral-nemo", "qwq")
+    capped = any(s in low for s in speed)
+    # 'flash' is ambiguous: weak on gemini-3.1/glm-4.x, but STRONG on
+    # deepseek-v4-flash / gemini-3.5-flash. Don't cap a model the version
+    # heuristic already flagged as a strong new release (sv > 0).
+    if "flash" in low and not any(ok in low for ok in flash_ok) and not sv:
+        capped = True
+    if params_b is not None and params_b < 14:
+        capped = True
+    if capped:
+        score = min(score, 30)
     return score
 
 
