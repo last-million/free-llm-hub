@@ -3476,6 +3476,35 @@ def _p_codex():
     return os.path.join(_home(), ".codex", "config.toml")
 
 
+def _p_openclaw():
+    """OpenClaw's config file. Default ~/.openclaw/openclaw.json, but a --config /
+    OPENCLAW_CONFIG override wins (this machine uses ~/openclaw-config/openclaw.json).
+    Prefer the env override, then the first candidate that exists, else the default."""
+    env = os.environ.get("OPENCLAW_CONFIG")
+    if env and env.strip():
+        return env if env.lower().endswith(".json") else os.path.join(env, "openclaw.json")
+    candidates = [
+        os.path.join(_home(), "openclaw-config", "openclaw.json"),
+        os.path.join(_home(), ".openclaw", "openclaw.json"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return candidates[1]
+
+
+def _p_hermes():
+    """Hermes Agent's config.yaml. HERMES_HOME wins; else %LOCALAPPDATA%\\hermes on
+    Windows, ~/.hermes elsewhere."""
+    env = os.environ.get("HERMES_HOME")
+    if env and env.strip():
+        return os.path.join(env, "config.yaml")
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(_home(), "AppData", "Local")
+        return os.path.join(base, "hermes", "config.yaml")
+    return os.path.join(_home(), ".hermes", "config.yaml")
+
+
 # The CLI registry: known local AI CLIs and how each connects to a custom
 # OpenAI/Anthropic endpoint. `autofix` names a safe writer strategy (JSON/
 # YAML/dotenv merge) or is None for CLIs we won't touch automatically (TOML,
@@ -3627,6 +3656,58 @@ CLI_REGISTRY = [
             "if your cursor-agent version explicitly supports a base-URL override."
         ),
     },
+    {
+        "id": "openclaw",
+        "name": "OpenClaw",
+        "kind": "openai",
+        "bins": ["openclaw"],
+        "config_paths": [_p_openclaw()],
+        # OpenClaw is set up via openclaw.json even when its bin/daemon isn't on this
+        # shell's PATH, so the presence of that file counts as "installed".
+        "config_means_installed": True,
+        # NO env_check: OpenClaw ignores OPENAI_BASE_URL for custom endpoints; it is
+        # wired ONLY by a models.providers.<id> block inside openclaw.json.
+        "autofix": "openclaw",
+        "write_path": _p_openclaw(),
+        "default_method": "config",
+        "hint": ("Configured. Run Auto-fix to add a 'freehub' openai-compatible provider to "
+                 "openclaw.json (models.providers.freehub + the agents allowlist + "
+                 "primary = freehub/auto). OpenClaw hot-reloads — no restart."),
+        "manual_note": (
+            "OpenClaw is wired by openclaw.json, NOT environment variables. Auto-fix (merge-safe) adds:\n"
+            "  models.providers.freehub = { baseUrl: \"http://127.0.0.1:%d/v1\", apiKey: \"<local key>\",\n"
+            "    api: \"openai-completions\", models: [{ id: \"auto\", name: \"Calvoun Free LLM Hub\" }] }\n"
+            "then allowlists \"freehub/auto\" in agents.defaults.models and sets\n"
+            "  agents.defaults.model.primary = \"freehub/auto\"  (your previous primary is remembered and\n"
+            "restored on Disconnect). The localhost hub needs no real key; a dummy string is fine. OpenClaw\n"
+            "watches the file and hot-reloads, so no restart is needed." % PORT
+        ),
+    },
+    {
+        "id": "hermes",
+        "name": "Hermes Agent",
+        "kind": "openai",
+        "bins": ["hermes"],
+        "config_paths": [_p_hermes()],
+        "env_check": ["OPENAI_BASE_URL", "OPENAI_API_BASE"],
+        "autofix": "hermes",
+        "write_path": _p_hermes(),
+        "default_method": "config",
+        "hint": ("Installed. Run Auto-fix to set model.provider = custom + base_url in Hermes' "
+                 "config.yaml. Restart the Hermes session afterwards."),
+        "manual_note": (
+            "Hermes (Nous Research) is wired by config.yaml (%%LOCALAPPDATA%%\\hermes on Windows, "
+            "~/.hermes elsewhere), NOT environment variables for a custom endpoint. Auto-fix "
+            "(merge-safe) sets:\n"
+            "  model:\n"
+            "    provider: custom\n"
+            "    base_url: http://127.0.0.1:%d/v1   # end at /v1; Hermes appends /chat/completions\n"
+            "    default: auto\n"
+            "    api_key: <local key>               # optional for a keyless local server\n"
+            "Changing base_url needs a RESTART of Hermes. (Alternatively set model.provider: openai-api "
+            "and put OPENAI_BASE_URL + OPENAI_API_KEY in the sibling .env.)" % PORT
+        ),
+    },
 ]
 
 _CLI_BY_ID = {e["id"]: e for e in CLI_REGISTRY}
@@ -3693,6 +3774,12 @@ def _cli_installed(entry):
         p = shutil.which(b)
         if p:
             return True, p
+    # Some tools (e.g. OpenClaw) run as a daemon / via npx and aren't on the
+    # current shell's PATH, yet an existing config file proves they're set up.
+    if entry.get("config_means_installed"):
+        for cp in entry.get("config_paths", []):
+            if cp and os.path.isfile(cp):
+                return True, cp
     return False, None
 
 
@@ -4115,12 +4202,136 @@ def _autofix_codex(entry, key, base_root, base_v1, model):
     }
 
 
+def _autofix_openclaw(entry, key, base_root, base_v1, model):
+    """Merge a 'freehub' OpenAI-compatible provider into openclaw.json: register it
+    under models.providers, allowlist freehub/auto in agents.defaults.models, and set
+    agents.defaults.model.primary = freehub/auto (remembering the previous primary so
+    Disconnect can restore it). OpenClaw hot-reloads the file — no restart."""
+    path = _p_openclaw()
+    data = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:  # tolerate a UTF-8 BOM
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {"ok": False, "reason": ("existing %s isn't plain JSON (OpenClaw allows JSON5 "
+                    "comments, which aren't auto-merged) — add the freehub provider by hand, then retry."
+                    % _short(path))}
+        if not isinstance(data, dict):
+            return {"ok": False, "reason": "existing %s is not a JSON object; not overwriting." % _short(path)}
+    backup = _backup_once(path)
+    abort = _abort_if_backup_failed(path, backup)
+    if abort:
+        return abort
+    models = data.get("models")
+    if not isinstance(models, dict):
+        models = {}
+    models.setdefault("mode", "merge")  # merge = keep OpenClaw's built-in providers
+    providers = models.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    providers["freehub"] = {
+        "baseUrl": base_v1,
+        "apiKey": key,
+        "api": "openai-completions",
+        "timeoutSeconds": 300,
+        "models": [{
+            "id": "auto",
+            "name": "Calvoun Free LLM Hub (auto)",
+            "reasoning": False,
+            "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 200000,
+            "maxTokens": 8192,
+        }],
+    }
+    models["providers"] = providers
+    data["models"] = models
+    agents = data.get("agents")
+    if not isinstance(agents, dict):
+        agents = {}
+    defaults = agents.get("defaults")
+    if not isinstance(defaults, dict):
+        defaults = {}
+    amodels = defaults.get("models")
+    if not isinstance(amodels, dict):
+        amodels = {}
+    amodels["freehub/auto"] = {"alias": "Free LLM Hub"}  # allowlist (else "model not allowed")
+    defaults["models"] = amodels
+    mdl = defaults.get("model")
+    if not isinstance(mdl, dict):
+        mdl = {}
+    prev = mdl.get("primary")
+    if isinstance(prev, str) and prev and not prev.startswith("freehub/"):
+        config.set_setting("openclaw_prev_primary", prev)  # remember for Disconnect
+    mdl["primary"] = "freehub/auto"
+    defaults["model"] = mdl
+    agents["defaults"] = defaults
+    data["agents"] = agents
+    _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return {
+        "ok": True,
+        "wrote_path": path,
+        "backup_path": backup,
+        "applied": {"provider": "freehub", "baseURL": base_v1, "apiKey": _mask_key(key),
+                    "primary": "freehub/auto"},
+        "restart_hint": "OpenClaw watches openclaw.json and hot-reloads — no restart needed.",
+    }
+
+
+def _autofix_hermes(entry, key, base_root, base_v1, model):
+    """Set model.{provider,base_url,default,api_key} in Hermes' config.yaml (merge-safe
+    via PyYAML). Hermes needs a restart to re-read it."""
+    path = _p_hermes()
+    try:
+        import yaml
+    except ImportError:
+        return {"ok": False, "reason": ("PyYAML isn't available to safely edit Hermes' config.yaml — "
+                "add the model block by hand (see the instructions).")}
+    data = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:  # tolerate a UTF-8 BOM
+                loaded = yaml.safe_load(f)
+            if loaded is not None:
+                data = loaded
+        except (OSError, yaml.YAMLError):
+            return {"ok": False, "reason": "existing %s is not valid YAML — fix or remove it, then retry."
+                    % _short(path)}
+        if not isinstance(data, dict):
+            return {"ok": False, "reason": "existing %s is not a YAML mapping; not overwriting." % _short(path)}
+    backup = _backup_once(path)
+    abort = _abort_if_backup_failed(path, backup)
+    if abort:
+        return abort
+    mdl = data.get("model")
+    if not isinstance(mdl, dict):
+        mdl = {}
+    mdl["provider"] = "custom"
+    mdl["base_url"] = base_v1   # end at /v1; Hermes appends /chat/completions
+    mdl["default"] = "auto"
+    mdl["api_key"] = key
+    data["model"] = mdl
+    _cli_write_text(path, yaml.safe_dump(data, default_flow_style=False, sort_keys=False,
+                                         allow_unicode=True))
+    return {
+        "ok": True,
+        "wrote_path": path,
+        "backup_path": backup,
+        "applied": {"model.provider": "custom", "model.base_url": base_v1,
+                    "model.default": "auto", "model.api_key": _mask_key(key)},
+        "restart_hint": "Restart the Hermes CLI/session so it re-reads config.yaml.",
+    }
+
+
 _AUTOFIXERS = {
     "claude": _autofix_claude,
     "aider": _autofix_aider,
     "opencode": _autofix_opencode,
     "qwen": _autofix_qwen,
     "codex": _autofix_codex,
+    "openclaw": _autofix_openclaw,
+    "hermes": _autofix_hermes,
 }
 
 
@@ -4435,6 +4646,102 @@ def _disconnect_llm(entry):
             "note": "Also run  llm keys remove freehub  to remove the saved key."}
 
 
+def _disconnect_openclaw(entry):
+    path = entry["write_path"]
+    hint = "OpenClaw watches openclaw.json and hot-reloads — no restart needed."
+    # STRUCTURED-CONFIG revert: strip ONLY the freehub provider + allowlist entry we
+    # added and restore the previous primary, so any provider/channel/plugin the user
+    # added after connecting survives. Backup restore is the last resort for a file
+    # that no longer parses as JSON.
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:  # tolerate a UTF-8 BOM
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            changed = False
+            models = data.get("models")
+            if isinstance(models, dict):
+                providers = models.get("providers")
+                if isinstance(providers, dict) and providers.pop("freehub", None) is not None:
+                    changed = True
+                    if not providers:
+                        models.pop("providers", None)
+            agents = data.get("agents")
+            defaults = agents.get("defaults") if isinstance(agents, dict) else None
+            if isinstance(defaults, dict):
+                amodels = defaults.get("models")
+                if isinstance(amodels, dict) and amodels.pop("freehub/auto", None) is not None:
+                    changed = True
+                mdl = defaults.get("model")
+                if isinstance(mdl, dict) and mdl.get("primary") == "freehub/auto":
+                    prev = config.get_setting("openclaw_prev_primary")
+                    if prev:
+                        mdl["primary"] = prev      # restore what they had before connecting
+                    else:
+                        mdl.pop("primary", None)   # no memory -> let OpenClaw use its own default
+                    changed = True
+            if changed:
+                config.set_setting("openclaw_prev_primary", "")  # clear the stash
+                _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+            _discard_backup(path)  # strip succeeded -> stale backup no longer needed
+            return {"restored_from_backup": False, "wrote_path": path,
+                    "changed": changed, "restart_hint": hint}
+    # Live file missing or no longer valid JSON -> fall back to the frozen backup.
+    if _restore_backup(path):
+        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
+    return {"restored_from_backup": False, "wrote_path": path,
+            "changed": False, "restart_hint": hint}
+
+
+def _disconnect_hermes(entry):
+    path = entry["write_path"]
+    hint = "Restart the Hermes CLI/session so it re-reads config.yaml."
+    # STRUCTURED-CONFIG revert: strip ONLY our model.* keys (and only when base_url
+    # points HERE), so any other Hermes setting in config.yaml survives.
+    if os.path.isfile(path):
+        try:
+            import yaml
+            with open(path, "r", encoding="utf-8-sig") as f:  # tolerate a UTF-8 BOM
+                data = yaml.safe_load(f)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            changed = False
+            mdl = data.get("model")
+            if isinstance(mdl, dict) and _points_at_hub(mdl.get("base_url")):
+                for k in ("provider", "base_url", "default", "api_key"):
+                    if mdl.pop(k, None) is not None:
+                        changed = True
+                if not mdl:
+                    data.pop("model", None)
+            deleted = False
+            if changed:
+                if not data:
+                    # Auto-fix CREATED this file (Hermes had no config.yaml) -> remove
+                    # the now-empty shell for a clean revert.
+                    try:
+                        os.remove(path)
+                        deleted = True
+                    except OSError:
+                        _cli_write_text(path, yaml.safe_dump(data, default_flow_style=False,
+                                                             sort_keys=False, allow_unicode=True))
+                else:
+                    _cli_write_text(path, yaml.safe_dump(data, default_flow_style=False,
+                                                         sort_keys=False, allow_unicode=True))
+            _discard_backup(path)
+            out = {"restored_from_backup": False, "wrote_path": path,
+                   "changed": changed, "restart_hint": hint}
+            if deleted:
+                out["deleted"] = True
+            return out
+    if _restore_backup(path):
+        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
+    return {"restored_from_backup": False, "wrote_path": path,
+            "changed": False, "restart_hint": hint}
+
+
 _DISCONNECTERS = {
     "claude": _disconnect_claude,
     "aider": _disconnect_aider,
@@ -4442,6 +4749,8 @@ _DISCONNECTERS = {
     "qwen": _disconnect_qwen,
     "codex": _disconnect_codex,
     "llm": _disconnect_llm,   # id-keyed: `llm` has no autofix strategy string
+    "openclaw": _disconnect_openclaw,
+    "hermes": _disconnect_hermes,
 }
 
 
