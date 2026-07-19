@@ -760,6 +760,12 @@ _HARD_HINTS = (
     "step by step", "step-by-step", "complex", "design a", "implement", "write code",
     "full code", "entire", "compile", "regex", "sql", "concurrency", "async",
     "benchmark", "vulnerab", "exploit", "math", "theorem",
+    # coding-build heaviness (short asks like "build the auth module" are HEAVY even
+    # though they're brief) -> route to the strongest coder, never a small model:
+    "build", "create", "rewrite", "scaffold", "generate", "module", "backend",
+    "frontend", "endpoint", "database", "schema", "migration", "component", "feature",
+    "the whole", "the full", "a full", "complete ", "integrate", "wire ", "add auth",
+    "authentication", "payment", "deploy", "dockerfile", "test suite", "unit test",
 )
 _SIMPLE_HINTS = (
     "translate", "summarize", "summarise", "tl;dr", "rephrase", "reword",
@@ -786,23 +792,42 @@ def _messages_text(messages):
     return "\n".join(parts)
 
 
+def _latest_user_text(messages):
+    """Text of the LAST user message — the ACTUAL current ask. Heaviness is judged on
+    THIS, not the whole request, so a fixed multi-KB system prompt (codex ships ~13K)
+    doesn't make every agentic turn look 'hard' and hog the strongest models on a
+    trivial sub-task ('run ls', 'read config')."""
+    try:
+        for m in reversed(messages or []):
+            if isinstance(m, dict) and m.get("role") == "user":
+                c = m.get("content")
+                if isinstance(c, list):
+                    return " ".join((p.get("text") or "") for p in c if isinstance(p, dict))
+                return str(c or "")
+    except Exception:
+        pass
+    return ""
+
+
 def _classify_difficulty(messages, max_tokens=None):
-    """'simple' | 'medium' | 'hard' from prompt length, task hints, code, and the
-    requested output size. Pure heuristic (no network)."""
-    text = _messages_text(messages)
-    low = text.lower()
-    length = len(text)
+    """'simple' | 'medium' | 'hard' from the CURRENT ask's length, task hints, code,
+    and the requested output size. Pure heuristic (no network). Judged on the latest
+    user turn so a big fixed system prompt doesn't inflate every turn to 'hard'."""
+    recent = _latest_user_text(messages) or _messages_text(messages)
+    low = recent.lower()
+    length = len(recent)
     score = 0
-    if "```" in text or re.search(r"\bdef \w+\(|\bclass \w+|function \w+\(|;\s*$", text):
+    if "```" in recent or re.search(r"\bdef \w+\(|\bclass \w+|function \w+\(|;\s*$", recent):
         score += 2
-    score += sum(1 for h in _HARD_HINTS if h in low)
+    hard_hits = sum(1 for h in _HARD_HINTS if h in low)
+    score += hard_hits
     score -= sum(1 for h in _SIMPLE_HINTS if h in low)
     if length > 4000:
         score += 2
     elif length > 1500:
         score += 1
-    elif length < 180:
-        score -= 1
+    elif length < 180 and hard_hits == 0:
+        score -= 1   # short AND no heavy signal -> trivial; a short heavy ask is NOT
     if len(messages or []) > 8:
         score += 1
     try:
@@ -1828,24 +1853,31 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     # on. Slow reasoning models are used only if NO fast model is available (and
     # they still appear later in _build_chain as a last-resort fallback).
     pool = [c for c in cands if _is_fast(c[1], c[2])] or cands
-    if difficulty == "hard" or require_tools:
-        # SPREAD across the top-tier band instead of always the single argmax, so
-        # consecutive agentic turns (and codex sub-agents, each its own request)
-        # land on DIFFERENT strong providers — no single provider's quota drains
-        # alone, and the user sees the best models MIXED instead of one pinned id.
-        # The best model keeps double weight (still leads); band==1 == old argmax.
-        agentic_pool = pool
-        if require_tools:
-            # CODING/AGENTIC: hard-restrict to S-tier models (a mid model can't drive
-            # a coding agent — it plans then under-builds). Only the strongest free
-            # coders (hy3/qwen3-coder/deepseek-v4/kimi-k2/glm-5.2/gpt-oss-120b class)
-            # are eligible; spread runs WITHIN that top set. Fail-open: if none clear
-            # the bar (all keys weak/exhausted), keep the full pool rather than fail.
-            strong = [c for c in pool if c[0] >= _TOOLS_MIN_SCORE]
-            if strong:
-                agentic_pool = strong
-        picked = _spread_pick(agentic_pool) or max(
-            agentic_pool, key=lambda t: (t[0], _quota_headroom(t[1])))
+    if require_tools:
+        # CODING/AGENTIC: the primary is ALWAYS a STRONG model (>= _TOOLS_MIN_SCORE) —
+        # a weak model plans then under-builds, and mistral (56) only ever appears
+        # later in the fallback CHAIN once these are exhausted, never as the primary.
+        # Fail-open: if nothing clears the bar (all strong keys weak/exhausted), keep
+        # the full pool rather than fail.
+        agentic = [c for c in pool if c[0] >= _TOOLS_MIN_SCORE] or pool
+        if difficulty == "hard":
+            # HEAVY coding -> the STRONGEST, SPREAD across the top band (hy3 leads, then
+            # kimi/qwen/deepseek) so consecutive heavy turns + codex sub-agents mix the
+            # best models instead of pinning one and draining its quota.
+            picked = _spread_pick(agentic) or max(
+                agentic, key=lambda t: (t[0], _quota_headroom(t[1])))
+        else:
+            # LIGHTER coding (simple/medium sub-task) -> the CHEAPEST model that is STILL
+            # STRONG, tie to most free quota. This leans on the deep-quota strong coders
+            # (gpt-oss-120b on cerebras 14400/day, glm-4.7, deepseek-v3) and SAVES the
+            # scarce top models (hy3 openrouter 50/day) for the heavy turns — "best by
+            # heaviness", never a weak model for coding.
+            picked = min(agentic, key=lambda t: (t[0], -_quota_headroom(t[1])))
+        _s, pid, model = picked
+        return pid, model, difficulty
+    if difficulty == "hard":
+        # Non-tool HARD -> strongest fast model (spread keeps variety across turns).
+        picked = _spread_pick(pool) or max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
         _s, pid, model = picked
         return pid, model, difficulty
     floor = _DIFFICULTY_FLOOR[difficulty]
