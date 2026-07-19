@@ -813,12 +813,22 @@ def _classify_difficulty(messages, max_tokens=None):
 # exceed this gets a 413 "Payload Too Large" (Groq free = 6k TPM is the classic
 # one that rejects an agentic CLI like Codex, whose requests are ~13k tokens of
 # system prompt + tool schemas). Used to keep big requests off small providers.
+# Effective SINGLE-REQUEST token budget per provider. This is the pre-filter that
+# keeps an oversized request off a provider that can't hold it. It must reflect the
+# provider's CONTEXT window, NOT its per-minute rate: a real per-minute 429 is now
+# handled by fall-through + throttle, and a genuine over-context 400 self-heals via
+# _learn_context_limit. Sizing these to the per-minute rate (old groq=6000,
+# default=20000) pre-filtered a typical agentic request (system prompt + tools +
+# apply_patch + history ≈ 15-40K) OFF the strong large-context models
+# (hy3/kimi/qwen3, all >=128K ctx) and onto the exhausted high-quota ones -> 503 storm.
 _PROVIDER_TPM = {
-    "groq": 6000, "github-models": 8000, "huggingface": 20000, "mistral": 30000,
-    "morph": 30000, "sambanova": 50000, "cerebras": 60000, "deepseek": 60000,
-    "openrouter": 100000, "cohere": 100000, "nvidia": 200000, "google": 250000,
+    "groq": 120000, "github-models": 60000, "huggingface": 30000, "mistral": 120000,
+    "morph": 30000, "sambanova": 120000, "cerebras": 60000, "deepseek": 120000,
+    "openrouter": 128000, "cohere": 100000, "nvidia": 250000, "google": 900000,
+    "cloudflare": 120000, "nararouter": 120000, "kimi": 128000, "glm": 128000,
+    "aiand": 120000, "xiaomi": 60000, "minimax": 120000,
 }
-_DEFAULT_TPM = 20000
+_DEFAULT_TPM = 100000
 
 
 def _provider_tpm(pid):
