@@ -2199,6 +2199,42 @@ def _retryable(status):
     return status == 429 or status >= 500
 
 
+def _capacity_eta(cap=60):
+    """Seconds until the SOONEST enabled+keyed provider becomes usable again — the min
+    of every provider's throttle/quota-reset countdown — capped at `cap`. Used as a
+    Retry-After hint on a chain-EXHAUSTED response so the CLIENT waits out a short
+    throttle and AUTO-CONTINUES once a model frees (a per-minute cap like nararouter's
+    10/min resets in <=60s), instead of surfacing the failure. `cap` bounds it so the
+    client never sleeps for a far-off daily reset — it just re-attempts every `cap`s
+    within its own retry budget. Returns `cap` when nothing's close/known."""
+    best = None
+    try:
+        for pid in _enabled_keyed():
+            try:
+                s = quota.status(pid)
+            except Exception:
+                continue
+            if not s.get("exhausted"):
+                return 1                       # something is usable right now
+            r = s.get("resets_in")
+            if isinstance(r, int) and r > 0:
+                best = r if best is None else min(best, r)
+    except Exception:
+        return cap
+    return max(1, min(int(best), cap)) if best is not None else cap
+
+
+def _with_retry_after(resp_tuple, seconds):
+    """Attach a Retry-After header to an (response, status) error tuple so the client
+    waits `seconds` then auto-retries the turn. Best-effort; returns input on error."""
+    try:
+        resp, status = resp_tuple
+        resp.headers["Retry-After"] = str(max(1, int(seconds)))
+        return resp, status
+    except Exception:
+        return resp_tuple
+
+
 def _retryable_relay_status(status):
     """Chain-EXHAUSTED relay only: turn a non-retryable hard 4xx (400/401/403/404/422
     — the last provider's incidental error) into a client-retryable 503, so a CLI SDK
@@ -6319,14 +6355,18 @@ def v1_chat_completions():
             errors.append("%s: %s reading error body" % (hop_pid, _sanitize(exc.__class__.__name__)))
         resp.close()
         continue
+    # Chain exhausted. Tell the client HOW LONG until a model frees (Retry-After) so
+    # its SDK waits out a short throttle and auto-continues once capacity returns.
+    eta = _capacity_eta()
     if last_hard is not None:
         if last_hard["json"] is not None:
-            return jsonify(last_hard["json"]), _retryable_relay_status(last_hard["status"])
-        return _openai_error("Upstream returned non-JSON (%s, HTTP %d): %s"
-                             % (last_hard["pid"], last_hard["status"], last_hard["text"]),
-                             502, "upstream_error")
-    return _openai_error("All providers failed: " + ("; ".join(errors) or "none available"),
-                         502, "upstream_error")
+            return _with_retry_after(
+                (jsonify(last_hard["json"]), _retryable_relay_status(last_hard["status"])), eta)
+        return _with_retry_after(_openai_error(
+            "Upstream returned non-JSON (%s, HTTP %d): %s"
+            % (last_hard["pid"], last_hard["status"], last_hard["text"]), 503, "upstream_error"), eta)
+    return _with_retry_after(_openai_error(
+        "All providers failed: " + ("; ".join(errors) or "none available"), 503, "upstream_error"), eta)
 
 
 # ---------------------------------------------------------------------------
@@ -6815,14 +6855,18 @@ def v1_responses():
     # normal non-200 JSON OpenAI-style error (Codex checks the HTTP status before
     # opening the event stream and surfaces this cleanly) rather than a fake 200
     # SSE stream carrying an error.
+    # Chain exhausted. Tell the client HOW LONG until a model frees (Retry-After) so
+    # its SDK waits out a short throttle and auto-continues once capacity returns.
+    eta = _capacity_eta()
     if last_hard is not None:
         if last_hard["json"] is not None:
-            return jsonify(last_hard["json"]), _retryable_relay_status(last_hard["status"])
-        return _openai_error("Upstream returned non-JSON (%s, HTTP %d): %s"
-                             % (last_hard["pid"], last_hard["status"], last_hard["text"]),
-                             502, "upstream_error")
-    return _openai_error("All providers failed: " + ("; ".join(errors) or "none available"),
-                         502, "upstream_error")
+            return _with_retry_after(
+                (jsonify(last_hard["json"]), _retryable_relay_status(last_hard["status"])), eta)
+        return _with_retry_after(_openai_error(
+            "Upstream returned non-JSON (%s, HTTP %d): %s"
+            % (last_hard["pid"], last_hard["status"], last_hard["text"]), 503, "upstream_error"), eta)
+    return _with_retry_after(_openai_error(
+        "All providers failed: " + ("; ".join(errors) or "none available"), 503, "upstream_error"), eta)
 
 
 # ---------------------------------------------------------------------------
@@ -7294,14 +7338,16 @@ def v1_messages():
             errors.append("%s: %s reading error body" % (hop_pid, _sanitize(exc.__class__.__name__)))
         resp.close()
         continue
+    # Chain exhausted -> Retry-After so the client waits out a short throttle + auto-continues.
+    eta = _capacity_eta()
     if last_hard is not None:
-        return _anthropic_error("api_error",
+        return _with_retry_after(_anthropic_error("api_error",
                                 "Upstream %s error (HTTP %d): %s"
                                 % (last_hard["pid"], last_hard["http"], last_hard["detail"]),
-                                last_hard["status"])
-    return _anthropic_error("api_error",
+                                last_hard["status"]), eta)
+    return _with_retry_after(_anthropic_error("api_error",
                             "All providers failed: " + ("; ".join(errors) or "none available"),
-                            502)
+                            503), eta)
 
 
 @app.route("/v1/messages/count_tokens", methods=["POST"])
