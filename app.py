@@ -2043,6 +2043,51 @@ def _sanitize_tool_messages(messages):
     return out
 
 
+def _model_ctx_budget(pid, model):
+    """Best estimate of a model's usable INPUT context: the limit LEARNED from a real
+    400 (authoritative) if we have one, else the provider's context-sized _PROVIDER_TPM."""
+    lim = _MODEL_MAX_INPUT.get((pid, model))
+    if isinstance(lim, int) and lim > 0:
+        return lim
+    return _provider_tpm(pid)
+
+
+def _compact_to_budget(messages, tools, budget):
+    """AUTO-COMPACT: if a conversation is bigger than a model's context budget, drop
+    the OLDEST turns (keeping ALL leading system messages + the most RECENT turns that
+    fit + tool-call/result pairing, which _sanitize_tool_messages then repairs) and
+    insert a truncation marker. This is what lets a SMALL-context model still serve a
+    long agentic conversation (recent context only) instead of 400ing — per-model
+    memory management. Returns (messages, compacted_bool). No-op when it already fits
+    or the budget is unknown/zero."""
+    if not isinstance(messages, list) or not messages or not budget or budget <= 0:
+        return messages, False
+    target = int(budget * 0.85)   # leave ~15% headroom for the model's own reply
+    if _est_tokens(messages, tools) <= target:
+        return messages, False
+    lead_sys, rest = [], []
+    for m in messages:
+        if not rest and isinstance(m, dict) and m.get("role") == "system":
+            lead_sys.append(m)
+        else:
+            rest.append(m)
+    base = _est_tokens(lead_sys, tools)
+    kept, running = [], base
+    for m in reversed(rest):                       # keep newest-first until full
+        c = _est_tokens([m])
+        if kept and running + c > target:
+            break
+        kept.append(m)
+        running += c
+    kept.reverse()
+    if len(kept) >= len(rest):
+        return messages, False                     # nothing actually dropped
+    notice = {"role": "system",
+              "content": "[Note: earlier conversation was truncated to fit this model's "
+                         "context window. Ask the user to re-share anything you need.]"}
+    return lead_sys + [notice] + kept, True
+
+
 def _upstream_chat(pid, payload, stream):
     """POST {base_url}/chat/completions for provider pid, rotating across the
     provider's api_keys pool. Tries a round-robin start key; on 401/403/429 it
@@ -2050,11 +2095,17 @@ def _upstream_chat(pid, payload, stream):
     rotatable response (or the last response/exception once keys are exhausted,
     so the caller's provider-level fallback still kicks in). May raise
     requests.RequestException or RuntimeError. Never logs a key."""
-    # Repair any dangling tool_call / orphan tool message so a strict upstream can't
-    # 400 the whole agentic turn ('tool_call_ids did not have response messages').
     if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
-        fixed = _sanitize_tool_messages(payload["messages"])
-        if fixed is not payload["messages"]:
+        # (1) AUTO-COMPACT the history to THIS model's context window (per-model
+        # memory management — a small-context model gets recent turns only), then
+        # (2) repair tool-pairing so a strict upstream can't 400 the agentic turn
+        # ('tool_call_ids did not have response messages') — compaction may itself
+        # orphan a tool msg / dangle a tool_call, so sanitize runs AFTER compaction.
+        msgs = payload["messages"]
+        compacted, did = _compact_to_budget(msgs, payload.get("tools"),
+                                            _model_ctx_budget(pid, payload.get("model")))
+        fixed = _sanitize_tool_messages(compacted)
+        if did or fixed is not msgs:
             payload = dict(payload)
             payload["messages"] = fixed
     pcfg = config.get_provider_config(pid)
