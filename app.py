@@ -208,8 +208,16 @@ def _available_providers():
     Falls back to ALL enabled+keyed when every one is exhausted, so the gateway
     still tries (and the dashboard's red banner tells the user why it may fail)."""
     keyed = _enabled_keyed()
-    live = [pid for pid in keyed if not quota.is_exhausted(pid)]
-    return live or keyed
+    # Skip providers with a bad key (auth/credit-sidelined) AND those out of quota.
+    live = [pid for pid in keyed
+            if not quota.is_exhausted(pid) and not _is_provider_dead(pid)]
+    if live:
+        return live
+    # Nothing fully available: prefer providers that are merely quota-exhausted (they
+    # recover on reset) over auth-dead ones (bad key), and only fall back to ALL keyed
+    # as the last resort so the gateway still tries something rather than nothing.
+    not_broken = [pid for pid in keyed if not _is_provider_dead(pid)]
+    return not_broken or keyed
 
 
 def _cf_account_id(api_key):
@@ -987,6 +995,51 @@ def _is_model_dead(pid, model):
             _dead_models.pop(key, None)   # TTL expired -> give it another chance
             return False
         return True
+
+
+# PROVIDER-level sideline. When a provider fails AUTH/credit (401/402/403) across
+# several DIFFERENT models, the KEY itself is the problem (wrong token / no model
+# access / out of credits — e.g. a github-models token with 403 on everything, or
+# nararouter/aiand at 402 "balance 0"), so trying its other 20+ models every request
+# just burns hops. Sideline the WHOLE provider for a while, then re-probe (a fixed
+# token / topped-up balance revives it on its own).
+_PROVIDER_DEAD_TTL = 30 * 60           # 30 min, then re-probe the provider
+_PROVIDER_AUTHFAIL_THRESHOLD = 3       # distinct models failing auth -> kill provider
+_AUTH_FAIL_STATUSES = (401, 402, 403)
+_dead_providers = {}                   # pid -> expiry epoch
+_provider_authfail = {}                # pid -> set(models that auth-failed this window)
+_provider_dead_lock = threading.Lock()
+
+
+def _mark_provider_authfail(pid, model, status):
+    """Record an auth/credit failure; once enough DISTINCT models of a provider fail
+    this way, the key is bad — sideline the whole provider (not just each model)."""
+    if status not in _AUTH_FAIL_STATUSES:
+        return
+    with _provider_dead_lock:
+        s = _provider_authfail.setdefault(pid, set())
+        if model:
+            s.add(str(model))
+        if len(s) >= _PROVIDER_AUTHFAIL_THRESHOLD:
+            _dead_providers[pid] = time.time() + _PROVIDER_DEAD_TTL
+
+
+def _is_provider_dead(pid):
+    with _provider_dead_lock:
+        exp = _dead_providers.get(pid)
+        if not exp:
+            return False
+        if exp <= time.time():
+            _dead_providers.pop(pid, None)
+            _provider_authfail.pop(pid, None)   # reset counter -> a clean re-probe
+            return False
+        return True
+
+
+def _dead_provider_rows():
+    now = time.time()
+    with _provider_dead_lock:
+        return [(pid, int(exp - now)) for pid, exp in _dead_providers.items() if exp > now]
 
 
 def _dead_model_rows():
@@ -2183,6 +2236,11 @@ def _upstream_chat(pid, payload, stream):
         # mean THAT key lacks access, and rotation below still gets a chance.
         if resp.status_code in _DEAD_STATUSES and is_last:
             _mark_model_dead(pid, payload.get("model"), resp.status_code)
+        # Track auth/credit failures per provider: once enough distinct models fail
+        # this way the KEY is bad (no access / no credits) -> sideline the whole
+        # provider so routing stops trying its other 20+ models every request.
+        if resp.status_code in _AUTH_FAIL_STATUSES and is_last:
+            _mark_provider_authfail(pid, payload.get("model"), resp.status_code)
         # Auth/rate-limit on this key -> try the next key before this provider
         # is given up on. On the last key, return it so the caller can react
         # (429/5xx -> provider fallback; 401/403 -> surfaced as an error).
@@ -2963,7 +3021,8 @@ def api_tracking():
                 score = round(_benchmark_score(pid, m), 1)
             except Exception:
                 score = 0.0
-            state = ("dead" if is_dead else
+            state = ("provider-dead" if _is_provider_dead(pid) else
+                     "dead" if is_dead else
                      "blocked" if not allowed else
                      "provider-exhausted" if qs.get("exhausted") else
                      "throttled" if thr else "ok")
