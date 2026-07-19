@@ -1761,7 +1761,11 @@ _ORCH_BAND = 30.0
 # the _benchmark_score scale — hy3/qwen3-coder/deepseek-v4/kimi-k2/glm-5.2/
 # gpt-oss-120b class) may serve a coding agent. Below it a model plans then
 # under-builds. Fail-open when nothing clears it (weak/exhausted pool).
-_TOOLS_MIN_SCORE = 100.0
+_TOOLS_MIN_SCORE = 90.0   # include the deep-quota strong coders (gpt-oss-120b 99 /
+                          # glm-4.7 94 / deepseek-v3 92 on cerebras+groq+github) in the
+                          # agentic pool — they're the sustainable workhorses when the
+                          # shallow top-tier (openrouter/google) burns out. Was 100,
+                          # which excluded them and forced the cascade onto weak mistral.
 _orch_cursor = 0
 _orch_lock = threading.Lock()
 
@@ -2002,11 +2006,17 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # the fallback chain keeps using providers that still have budget.
     fast.sort(key=lambda t: (t[0], _quota_headroom(t[1])), reverse=True)
     slow.sort(key=lambda t: (t[0], _quota_headroom(t[1])), reverse=True)
-    ordered = fast + slow
     if require_tools:
-        # A tools request must never fall back onto a completion-only model.
-        # FAIL-OPEN: keep the full list if none are known tool-capable.
+        # AGENTIC/coding: order by STRENGTH, not speed. A strong deep-quota model
+        # (gpt-oss-120b / glm-4.7 / deepseek on cerebras+groq — flagged 'slow' for
+        # their size but actually fast on those providers, and cerebras has 14400/day)
+        # MUST be tried BEFORE a fast-but-weak model (mistral, score 56). Otherwise
+        # the fast/slow split buries the strong deep-quota models behind mistral and
+        # codex cascades onto mistral while they sit unused. FAIL-OPEN on tool-capable.
+        ordered = sorted(fast + slow, key=lambda t: (t[0], _quota_headroom(t[1])), reverse=True)
         ordered = [e for e in ordered if _supports_tools(e[1], e[2])] or ordered
+    else:
+        ordered = fast + slow
     for _score, pid, m in ordered:
         if len(chain) >= MAX_HOPS:
             break
