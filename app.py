@@ -1964,46 +1964,50 @@ def _next_key_start(pid, n):
 
 
 def _sanitize_tool_messages(messages):
-    """Repair a chat history so strict upstreams don't 400 with 'An assistant message
-    with tool_calls must be followed by tool messages ... did not have response
-    messages'. An agentic client (codex) can leave a DANGLING assistant tool_call
-    (its result turn failed / got cut off) or an ORPHAN tool message (no preceding
-    call). This injects a stub tool result for each unanswered tool_call and drops
-    orphan tool messages, so the request is valid and the agent can continue instead
-    of dead-ending. Returns the SAME list untouched when the history is already valid
-    (the overwhelming common case) so nothing is copied needlessly."""
+    """Rebuild a chat history into the CANONICAL tool-calling shape strict upstreams
+    require — every assistant `tool_calls` message IMMEDIATELY followed by exactly one
+    tool message per tool_call_id, in order. Fixes the 400 'An assistant message with
+    tool_calls must be followed by tool messages ... did not have response messages':
+      * DANGLING tool_call (no result — the turn failed/was cut off) -> stub result;
+      * OUT-OF-ORDER result (assistant -> user -> tool) -> moved to right after its
+        call (a plain presence check misses this — it's why codex kept 400ing);
+      * ORPHAN tool message (no matching call) -> dropped.
+    Returns the SAME list untouched when there are NO tool_calls/tool messages at all
+    (the vast majority of requests) so nothing is copied needlessly."""
     if not isinstance(messages, list) or not messages:
         return messages
-    answered, issued = set(), set()
+    has_tools = False
+    tool_by_id = {}        # tool_call_id -> its tool message (first occurrence wins)
     for m in messages:
         if not isinstance(m, dict):
             continue
-        if m.get("role") == "tool" and m.get("tool_call_id"):
-            answered.add(m["tool_call_id"])
-        elif m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list):
-            for tc in m["tool_calls"]:
-                if isinstance(tc, dict) and tc.get("id"):
-                    issued.add(tc["id"])
-    dangling = issued - answered      # tool_calls with no response -> inject stub
-    orphans = answered - issued       # tool responses with no call -> drop
-    if not dangling and not orphans:
-        return messages               # already valid
+        role = m.get("role")
+        if role == "tool":
+            has_tools = True
+            tcid = m.get("tool_call_id")
+            if tcid is not None:
+                tool_by_id.setdefault(tcid, m)
+        elif role == "assistant" and isinstance(m.get("tool_calls"), list):
+            if any(isinstance(tc, dict) and tc.get("id") for tc in m["tool_calls"]):
+                has_tools = True
+    if not has_tools:
+        return messages
     out = []
     for m in messages:
         if not isinstance(m, dict):
             out.append(m)
             continue
         if m.get("role") == "tool":
-            if m.get("tool_call_id") in orphans:
-                continue              # drop the orphan
-            out.append(m)
-            continue
+            continue  # every tool message is (re)emitted next to its call, below
         out.append(m)
         if m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list):
             for tc in m["tool_calls"]:
-                if isinstance(tc, dict) and tc.get("id") in dangling:
-                    out.append({"role": "tool", "tool_call_id": tc["id"],
-                                "content": "(tool result unavailable)"})
+                if not (isinstance(tc, dict) and tc.get("id")):
+                    continue
+                tid = tc["id"]
+                out.append(tool_by_id.get(tid) or {
+                    "role": "tool", "tool_call_id": tid,
+                    "content": "(tool result unavailable)"})
     return out
 
 
@@ -6136,7 +6140,7 @@ def _responses_to_chat(body):
             content = output if isinstance(output, str) else json.dumps(output)
             messages.append({
                 "role": "tool",
-                "tool_call_id": item.get("call_id"),
+                "tool_call_id": item.get("call_id") or item.get("id"),
                 "content": content,
             })
         elif itype == "message" or itype is None:
