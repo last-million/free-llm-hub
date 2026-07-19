@@ -2203,6 +2203,13 @@ def _upstream_chat(pid, payload, stream):
         if did or fixed is not msgs:
             payload = dict(payload)
             payload["messages"] = fixed
+    # Perplexity rejects max_tokens < 16 ("max_tokens must be at least 16"). Clamp up
+    # harmlessly so a small-output request (classification, a probe) doesn't 400.
+    if pid == "perplexity" and isinstance(payload, dict):
+        mt = payload.get("max_tokens")
+        if isinstance(mt, int) and mt < 16:
+            payload = dict(payload)
+            payload["max_tokens"] = 16
     pcfg = config.get_provider_config(pid)
     # _resolve_base_url, not base_url_for: it also fills Cloudflare's
     # {account_id} from the token so the user only pastes a key.
@@ -3005,7 +3012,7 @@ def api_test_provider(pid):
     try:
         resp = _upstream_chat(pid, {"model": model,
                                     "messages": [{"role": "user", "content": "hi"}],
-                                    "max_tokens": 1}, stream=False)
+                                    "max_tokens": 16}, stream=False)  # 16 = Perplexity's floor
     except (requests.RequestException, RuntimeError) as exc:
         return jsonify({"ok": False,
                         "detail": _sanitize("%s: %s" % (exc.__class__.__name__, exc)),
@@ -3133,7 +3140,7 @@ def _ranked_free_pairs(limit=6):
 def _probe_pair(pid, model, timeout_s=25):
     """Send ONE tiny real request to (pid, model). Returns (ok, detail).
     Marks the model dead on a 403/404 so the rest of the hub routes around it."""
-    payload = {"model": model, "max_tokens": 4, "stream": False,
+    payload = {"model": model, "max_tokens": 16, "stream": False,  # 16 = Perplexity's floor
                "messages": [{"role": "user", "content": "hi"}]}
     try:
         r = _upstream_chat(pid, payload, False)
@@ -5907,7 +5914,7 @@ def _hub_serves_now():
             # A connectivity probe must NEVER spend the user's paid subscription:
             # this proves the FREE pipeline works, and a sub hop is not part of it.
             continue
-        payload = {"model": hop_model, "max_tokens": 8, "stream": False,
+        payload = {"model": hop_model, "max_tokens": 16, "stream": False,  # 16 = Perplexity's floor
                    "messages": [{"role": "user", "content": "Reply with the single word: OK"}]}
         try:
             resp = _upstream_chat(hop_pid, payload, False)
