@@ -1735,7 +1735,8 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
             # ids individually rate-limited / over their per-model sub-cap.
             if (prov.is_model_allowed(m) and not _is_model_dead(pid, m)
                     and not quota.is_model_throttled(pid, m)
-                    and not quota.model_status(pid, m)["exhausted"]):
+                    and not quota.model_status(pid, m)["exhausted"]
+                    and _context_ok(pid, m, est)):
                 cands.append((_benchmark_score(pid, m), pid, m))
     if require_tools:
         # A tools request must never land on a completion-only model. FAIL-OPEN:
@@ -1923,6 +1924,8 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
             # skip a model that's individually rate-limited or over its per-model cap
             if quota.is_model_throttled(pid, m) or quota.model_status(pid, m)["exhausted"]:
                 continue
+            if not _context_ok(pid, m, est):   # learned too-small context for this request
+                continue
             if require_vision and not _is_vision_model(pid, m):
                 continue
             entry = (_benchmark_score(pid, m), pid, m)
@@ -2084,6 +2087,8 @@ def _upstream_chat(pid, payload, stream):
             continue
         quota.record(pid, payload.get("model"))  # counts against free quota (per provider + model)
         quota.observe_headers(pid, resp.headers)  # ADAPT to the provider's real quota
+        if resp.status_code == 400:               # learn a small context window from the error
+            _learn_context_limit(pid, payload.get("model"), resp)
         if 200 <= resp.status_code < 300:
             quota.note_success(pid)  # provider answered -> clear its 429-backoff streak
             quota.note_model_success(pid, payload.get("model"))  # and THIS model's streak
@@ -2145,7 +2150,11 @@ def _retryable(status):
 # --------------------------------------------------------------------------- #
 _SOFT_400_CONTEXT_RE = re.compile(
     r"context_length_exceeded|reduce the length of the (?:messages|prompt)|"
-    r"maximum context length|prompt is too long", re.I)
+    r"maximum context length|prompt is too long|"
+    # smaller-context providers phrase it differently — all mean "route to a bigger
+    # model": 'Max_len exceeded: Input is 16685 tokens but this model only supports 16384'
+    r"max_?len exceeded|input is \d+ tokens|only supports \d+|"
+    r"too many (?:input )?tokens|exceeds? the (?:model'?s )?maximum", re.I)
 _SOFT_400_TOOL_RE = re.compile(r"thought_signature", re.I)
 # Some providers return a VAGUE 400 ("we could not process your request / please
 # check your input / invalid_request_error") for a request THIS model can't serve
@@ -2177,6 +2186,56 @@ def _classify_soft_400(resp):
         text = resp.text or ""
     return bool(_SOFT_400_TOOL_RE.search(text) or _SOFT_400_CONTEXT_RE.search(text)
                 or _SOFT_400_GENERIC_RE.search(text))
+
+
+# Learned per-(pid, model) max INPUT tokens, populated when a provider 400s with a
+# context-size error that reveals its real limit ('... only supports 16384'). Lets
+# routing STOP sending a growing agentic context to a small-context model instead of
+# 400ing + falling through on every single turn.
+_MODEL_MAX_INPUT = {}
+_model_max_input_lock = threading.Lock()
+# Priority-ordered: match the phrasing that names the LIMIT, never the request size.
+# 'Max_len exceeded: Input is 16685 tokens but this model only supports 16384' must
+# learn 16384 (the cap), NOT 16685 (the input) — so 'only supports N' wins first and
+# a generic 'maximum ... N tokens' (which would grab 'Max_len ... 16685') is last.
+_CTX_LIMIT_PATS = (
+    re.compile(r"only supports (\d{3,7})", re.I),
+    re.compile(r"supports (\d{3,7})\s*tokens", re.I),
+    re.compile(r"context (?:window|length)[^0-9]{0,20}?(\d{4,7})", re.I),
+    re.compile(r"maximum(?: context)?(?: length| window)?[^0-9]{0,20}?(\d{4,7})", re.I),
+)
+
+
+def _learn_context_limit(pid, model, resp):
+    """Remember a model's real max input when a 400 reveals it. Best-effort, no raise."""
+    if not model:
+        return
+    try:
+        text = resp.text or ""
+    except Exception:
+        return
+    if not _SOFT_400_CONTEXT_RE.search(text):
+        return
+    limit = None
+    for pat in _CTX_LIMIT_PATS:
+        m = pat.search(text)
+        if m:
+            limit = int(m.group(1))
+            break
+    if not limit or limit < 1000:
+        return
+    with _model_max_input_lock:
+        cur = _MODEL_MAX_INPUT.get((pid, model))
+        _MODEL_MAX_INPUT[(pid, model)] = min(cur, limit) if cur else limit
+
+
+def _context_ok(pid, model, est):
+    """False once we've LEARNED this (pid, model) can't hold an est-token request
+    (5% headroom for estimate error). True when unknown — never blocks on a guess."""
+    if not est:
+        return True
+    lim = _MODEL_MAX_INPUT.get((pid, model))
+    return lim is None or est <= lim * 0.95
 
 
 def _upstream_error_detail(resp):
