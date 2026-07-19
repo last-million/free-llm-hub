@@ -830,6 +830,22 @@
     padding:16px;
   }
   .quota-empty{font-size:13px;color:var(--text-faint);padding:6px 2px}
+  .track-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:11px}
+  .track-btn{padding:6px 12px;font-size:.82rem}
+  .track-summary{font-size:.82rem;color:var(--text-dim)}
+  .track-list{display:flex;flex-direction:column;gap:6px;max-height:60vh;overflow-y:auto}
+  .track-empty{color:var(--text-dim);font-size:.85rem;padding:10px}
+  .track-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    background:var(--surface-2);border:1px solid var(--border-soft);
+    border-radius:var(--radius-sm);padding:7px 11px;font-size:.82rem}
+  .tk-score{font-family:var(--mono,monospace);font-weight:600;min-width:42px;text-align:right;color:var(--text)}
+  .tk-state{min-width:70px;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+  .tk-ok{color:#3ddc84}.tk-dead{color:#ff5c6c}.tk-throttled{color:#ffb020}
+  .tk-provider-exhausted{color:#ff8c42}.tk-blocked{color:#9aa}
+  .tk-model{flex:1;min-width:180px;font-family:var(--mono,monospace);color:var(--text-dim)}
+  .tk-tags{display:flex;gap:5px;flex-wrap:wrap}
+  .tk-tag{font-size:.68rem;padding:1px 6px;border-radius:6px;background:var(--surface-3,rgba(255,255,255,.06));color:var(--text-dim)}
+  .tk-quota{min-width:74px;text-align:right;font-family:var(--mono,monospace);color:var(--text-dim)}
   .quota-list{display:flex;flex-direction:column;gap:10px}
   .quota-row{
     display:flex;flex-direction:column;gap:7px;
@@ -1073,6 +1089,7 @@
       <button class="cx-nav-item" data-view="sec-activity" data-title="Live activity" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span>Activity</span></button>
       <button class="cx-nav-item" data-view="sec-quota" data-title="Free quota" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg><span>Free quota</span></button>
       <button class="cx-nav-item" data-view="sec-usage" data-title="Daily usage" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg><span>Usage</span></button>
+      <button class="cx-nav-item" data-view="sec-tracking" data-title="Model tracking" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.9 4.9l2.9 2.9M16.2 16.2l2.9 2.9M4.9 19.1l2.9-2.9M16.2 7.8l2.9-2.9"/></svg><span>Tracking</span></button>
     </div>
   </nav>
   <div class="cx-side-foot">
@@ -1564,6 +1581,30 @@
         <div class="usage-summary" id="usage-summary" role="status"></div>
         <div class="usage-list" id="usage-list" aria-live="polite">
           <div class="usage-empty">Loading usage&hellip;</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Model tracking -->
+  <section class="section" aria-labelledby="h-tracking">
+    <div class="section-h">
+      <h2 id="h-tracking"><button type="button" class="sec-toggle" aria-expanded="false" aria-controls="sec-tracking">
+        <svg class="sec-chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+        Model tracking
+      </button></h2>
+      <span class="sub">every provider &amp; model the hub sees, with live state &mdash; score, tools, quota, dead/throttled/context</span>
+      <span class="sec-chip" id="chip-tracking" hidden></span>
+    </div>
+    <div class="section-body" id="sec-tracking" hidden>
+      <div class="track-panel">
+        <div class="track-bar">
+          <button type="button" class="btn track-btn" id="track-refresh">Refresh</button>
+          <button type="button" class="btn track-btn" id="track-probe" title="Send one tiny real request to each model to verify it actually answers (uses a little free quota)">Health check (live)</button>
+          <span class="track-summary" id="track-summary" role="status"></span>
+        </div>
+        <div class="track-list" id="track-list" aria-live="polite">
+          <div class="track-empty">Loading model tracking&hellip;</div>
         </div>
       </div>
     </div>
@@ -4371,6 +4412,49 @@
         '</div>';
     }).join('');
   }
+  /* --- Model tracking ----------------------------------------------------- */
+  var trackState = [];
+  function loadTracking(){
+    return api('/api/tracking').then(function(j){
+      trackState = (j && Array.isArray(j.models)) ? j.models : [];
+      var by = (j && j.by_state) || {};
+      var sum = $('#track-summary');
+      if (sum && j) sum.textContent = j.usable + '/' + j.total + ' usable' +
+        (by.dead ? ' · ' + by.dead + ' dead' : '') +
+        (by.throttled ? ' · ' + by.throttled + ' throttled' : '') +
+        (by['provider-exhausted'] ? ' · ' + by['provider-exhausted'] + ' exhausted' : '');
+      renderTracking();
+    }).catch(function(){});
+  }
+  function renderTracking(){
+    var host = $('#track-list'); if (!host) return;
+    setSecChip('tracking', trackState.length ? (trackState.length + ' models') : '');
+    if (!trackState.length){ host.innerHTML = '<div class="track-empty">No models yet — add a provider key.</div>'; return; }
+    host.innerHTML = trackState.map(function(r){
+      var q = r.quota || {};
+      var qtxt = q.exhausted ? 'exhausted' : (q.limit == null ? (q.remaining == null ? 'no cap' : String(q.remaining)) : (q.remaining + '/' + q.limit));
+      var extra = r.dead_expires_in ? (' ' + Math.round(r.dead_expires_in / 60) + 'm') : '';
+      var tags = (r.tool_capable ? '<span class="tk-tag">tools</span>' : '') +
+                 (r.fast ? '<span class="tk-tag">fast</span>' : '') +
+                 (r.learned_ctx ? '<span class="tk-tag">ctx ' + esc(r.learned_ctx) + '</span>' : '');
+      return '<div class="track-row">' +
+          '<span class="tk-score">' + esc(r.score) + '</span>' +
+          '<span class="tk-state tk-' + esc(r.state) + '">' + esc(r.state) + esc(extra) + '</span>' +
+          '<span class="tk-model">' + esc(r.id) + '</span>' +
+          '<span class="tk-tags">' + tags + '</span>' +
+          '<span class="tk-quota">' + esc(qtxt) + '</span>' +
+        '</div>';
+    }).join('');
+  }
+  function probeAllModels(){
+    var btn = $('#track-probe'); if (btn){ btn.disabled = true; btn.textContent = 'Probing…'; }
+    api('/api/probe-all', { method: 'POST' }).then(function(j){
+      if (btn){ btn.disabled = false; btn.textContent = 'Health check (live)'; }
+      if (j){ var s = $('#track-summary'); if (s) s.textContent = 'Probed: ' + j.working + ' working, ' + j.failed + ' failed'; }
+      loadTracking();
+    }).catch(function(){ if (btn){ btn.disabled = false; btn.textContent = 'Health check (live)'; } });
+  }
+
   /* Keep in-flight rows' duration ticking up locally between 3s polls. */
   function tickActivity(){
     var els = document.querySelectorAll('.js-af-dur');
@@ -4700,6 +4784,13 @@
     loadAgentSettings(true); loadVisionStatus(true);
   }, 15000);   /* server re-sync */
   setInterval(loadActivity, 3000);                       /* live activity feed poll */
+  /* Model tracking: wire buttons, load once, poll every 8s. */
+  (function(){
+    var tr = $('#track-refresh'); if (tr) tr.addEventListener('click', loadTracking);
+    var tp = $('#track-probe'); if (tp) tp.addEventListener('click', probeAllModels);
+    loadTracking();
+    setInterval(loadTracking, 8000);
+  })();
   setInterval(tick, 1000);                               /* local 1s countdown */
   setInterval(tickActivity, 1000);                       /* local 1s in-flight duration */
   window.addEventListener('resize', function(){
