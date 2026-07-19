@@ -1963,6 +1963,50 @@ def _next_key_start(pid, n):
     return start
 
 
+def _sanitize_tool_messages(messages):
+    """Repair a chat history so strict upstreams don't 400 with 'An assistant message
+    with tool_calls must be followed by tool messages ... did not have response
+    messages'. An agentic client (codex) can leave a DANGLING assistant tool_call
+    (its result turn failed / got cut off) or an ORPHAN tool message (no preceding
+    call). This injects a stub tool result for each unanswered tool_call and drops
+    orphan tool messages, so the request is valid and the agent can continue instead
+    of dead-ending. Returns the SAME list untouched when the history is already valid
+    (the overwhelming common case) so nothing is copied needlessly."""
+    if not isinstance(messages, list) or not messages:
+        return messages
+    answered, issued = set(), set()
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "tool" and m.get("tool_call_id"):
+            answered.add(m["tool_call_id"])
+        elif m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list):
+            for tc in m["tool_calls"]:
+                if isinstance(tc, dict) and tc.get("id"):
+                    issued.add(tc["id"])
+    dangling = issued - answered      # tool_calls with no response -> inject stub
+    orphans = answered - issued       # tool responses with no call -> drop
+    if not dangling and not orphans:
+        return messages               # already valid
+    out = []
+    for m in messages:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        if m.get("role") == "tool":
+            if m.get("tool_call_id") in orphans:
+                continue              # drop the orphan
+            out.append(m)
+            continue
+        out.append(m)
+        if m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list):
+            for tc in m["tool_calls"]:
+                if isinstance(tc, dict) and tc.get("id") in dangling:
+                    out.append({"role": "tool", "tool_call_id": tc["id"],
+                                "content": "(tool result unavailable)"})
+    return out
+
+
 def _upstream_chat(pid, payload, stream):
     """POST {base_url}/chat/completions for provider pid, rotating across the
     provider's api_keys pool. Tries a round-robin start key; on 401/403/429 it
@@ -1970,6 +2014,13 @@ def _upstream_chat(pid, payload, stream):
     rotatable response (or the last response/exception once keys are exhausted,
     so the caller's provider-level fallback still kicks in). May raise
     requests.RequestException or RuntimeError. Never logs a key."""
+    # Repair any dangling tool_call / orphan tool message so a strict upstream can't
+    # 400 the whole agentic turn ('tool_call_ids did not have response messages').
+    if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
+        fixed = _sanitize_tool_messages(payload["messages"])
+        if fixed is not payload["messages"]:
+            payload = dict(payload)
+            payload["messages"] = fixed
     pcfg = config.get_provider_config(pid)
     # _resolve_base_url, not base_url_for: it also fills Cloudflare's
     # {account_id} from the token so the user only pastes a key.
