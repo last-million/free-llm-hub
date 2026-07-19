@@ -944,15 +944,20 @@ def _is_fast(pid, model):
 # back on its own.
 #
 # Deliberately NOT tracked here: 429 (quota — that's quota.mark_throttled's job,
-# the model is fine) and 5xx (transient upstream). Only 403/404 are treated as
-# "this exact model is unusable with this key", because they are unambiguous.
+# the model is fine) and 5xx (transient upstream). 402/403/404 are treated as
+# "this exact model is unusable with this key", because they are unambiguous:
+#   404 = model doesn't exist on this provider (e.g. aiand/glm-5.2),
+#   403 = this key has no access to it,
+#   402 = payment required / insufficient credits — a trial provider with no free
+#         balance (e.g. aiand/deepseek-v4) that would 402 EVERY turn otherwise.
 # 400 is NOT auto-sidelined: it is just as often a bad payload as a bad model,
 # and blocklisting a good model off one malformed request would be worse.
+# All self-heal: entries expire after the TTL, so a topped-up/restored model returns.
 # --------------------------------------------------------------------------- #
 _DEAD_MODEL_TTL = 6 * 3600         # 6h, then re-probe (token fixed? model back?)
 _dead_models = {}                  # (pid, model) -> expiry epoch
 _dead_lock = threading.Lock()
-_DEAD_STATUSES = (403, 404)
+_DEAD_STATUSES = (402, 403, 404)
 
 
 def _mark_model_dead(pid, model, status):
@@ -2089,6 +2094,7 @@ def _upstream_chat(pid, payload, stream):
         quota.observe_headers(pid, resp.headers)  # ADAPT to the provider's real quota
         if resp.status_code == 400:               # learn a small context window from the error
             _learn_context_limit(pid, payload.get("model"), resp)
+            _maybe_mark_missing_model(pid, payload.get("model"), resp)  # gone/renamed id -> sideline
         if 200 <= resp.status_code < 300:
             quota.note_success(pid)  # provider answered -> clear its 429-backoff streak
             quota.note_model_success(pid, payload.get("model"))  # and THIS model's streak
@@ -2130,6 +2136,19 @@ def _upstream_chat(pid, payload, stream):
 
 def _retryable(status):
     return status == 429 or status >= 500
+
+
+def _retryable_relay_status(status):
+    """Chain-EXHAUSTED relay only: turn a non-retryable hard 4xx (400/401/403/404/422
+    — the last provider's incidental error) into a client-retryable 503, so a CLI SDK
+    (codex/Claude Code retry on 408/409/429/>=500) RE-ATTEMPTS the whole agentic turn
+    instead of hard-stopping. By the time we relay, a throttle window may have reset or
+    a sidelined model revived, so the retry often succeeds. 409/429/5xx pass through.
+    The original status + body are preserved in the relayed payload for diagnostics."""
+    try:
+        return status if (status in (408, 409, 429) or status >= 500) else 503
+    except Exception:
+        return 503
 
 
 # --------------------------------------------------------------------------- #
@@ -2236,6 +2255,25 @@ def _context_ok(pid, model, est):
         return True
     lim = _MODEL_MAX_INPUT.get((pid, model))
     return lim is None or est <= lim * 0.95
+
+
+_MISSING_MODEL_RE = re.compile(
+    r"model_not_found|model not found|no such model|does not exist|"
+    r"unknown model|invalid model|model .* not (?:found|available)", re.I)
+
+
+def _maybe_mark_missing_model(pid, model, resp):
+    """A 400 that says the MODEL doesn't exist (some providers 400 instead of 404 for
+    a gone/renamed id) -> sideline it like a 404 so routing stops picking it. Only on
+    an unambiguous 'model missing' signature; a generic bad-request 400 is untouched."""
+    if not model:
+        return
+    try:
+        text = resp.text or ""
+    except Exception:
+        return
+    if _MISSING_MODEL_RE.search(text):
+        _mark_model_dead(pid, model, 404)
 
 
 def _upstream_error_detail(resp):
@@ -5989,7 +6027,11 @@ def _chat_json_is_empty(data):
             content = "".join((p.get("text") or "") for p in content
                               if isinstance(p, dict))
         has_text = bool(content and str(content).strip())
-        has_tools = bool(msg.get("tool_calls"))
+        # A tool_call counts as content ONLY if it has a usable function name — a
+        # nameless/blank tool_call is unusable and should fall through to a real model.
+        has_tools = any(
+            isinstance(tc, dict) and ((tc.get("function") or {}).get("name") or "").strip()
+            for tc in (msg.get("tool_calls") or []))
         return not (has_text or has_tools)
     except Exception:
         return False
@@ -6091,9 +6133,11 @@ def v1_chat_completions():
                                 mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
-            except ValueError:
-                return _openai_error("Upstream returned non-JSON (%s, HTTP 200): %s"
-                                     % (hop_pid, _sanitize(resp.text)), 502, "upstream_error")
+            except (ValueError, requests.RequestException):
+                # Non-JSON / broken 200 body -> don't dead-end, try the next model.
+                errors.append("%s: non-JSON 200 body" % hop_pid)
+                resp.close()
+                continue
             if _chat_json_is_empty(data):
                 errors.append("%s: empty (200 but no content)" % hop_pid)
                 resp.close()
@@ -6106,26 +6150,31 @@ def v1_chat_completions():
         # both advance to the NEXT provider — each chain hop is a DIFFERENT
         # provider, so a broken model/provider should fall through before we give
         # up. Key rotation for the SAME provider already happened in _upstream_chat.
-        errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
-        if resp.status_code == 400 and _classify_soft_400(resp):
-            resp.close()
-            continue
-        if not _retryable(resp.status_code):
-            # Capture the body once so the last hard error can be relayed verbatim
-            # after the chain is exhausted (retryable errors stay generic 502).
-            try:
-                body_json = resp.json()
-                body_text = None
-            except ValueError:
-                body_json = None
-                body_text = _sanitize(resp.text)
-            last_hard = {"pid": hop_pid, "status": resp.status_code,
-                         "json": body_json, "text": body_text}
+        # A network error while INSPECTING the error body (stream=True leaves the body
+        # unread) must also just advance, never escape the loop into a 500.
+        try:
+            errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+            if resp.status_code == 400 and _classify_soft_400(resp):
+                resp.close()
+                continue
+            if not _retryable(resp.status_code):
+                # Capture the body once so the last hard error can be relayed verbatim
+                # after the chain is exhausted (retryable errors stay generic 502).
+                try:
+                    body_json = resp.json()
+                    body_text = None
+                except ValueError:
+                    body_json = None
+                    body_text = _sanitize(resp.text)
+                last_hard = {"pid": hop_pid, "status": resp.status_code,
+                             "json": body_json, "text": body_text}
+        except requests.RequestException as exc:
+            errors.append("%s: %s reading error body" % (hop_pid, _sanitize(exc.__class__.__name__)))
         resp.close()
         continue
     if last_hard is not None:
         if last_hard["json"] is not None:
-            return jsonify(last_hard["json"]), last_hard["status"]
+            return jsonify(last_hard["json"]), _retryable_relay_status(last_hard["status"])
         return _openai_error("Upstream returned non-JSON (%s, HTTP %d): %s"
                              % (last_hard["pid"], last_hard["status"], last_hard["text"]),
                              502, "upstream_error")
@@ -6255,6 +6304,8 @@ def _chat_to_responses(chat_json, model_label):
     msg = choice.get("message") or {}
     output = []
     content = msg.get("content")
+    if isinstance(content, list):   # content-parts -> join their text (never relay a list)
+        content = "".join((p.get("text") or "") for p in content if isinstance(p, dict))
     if content:
         output.append({
             "type": "message",
@@ -6335,6 +6386,9 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                 chunk = json.loads(data.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
                 continue
+            if isinstance(chunk, dict) and chunk.get("error"):
+                break  # provider streamed an error object on a 200 -> stop cleanly,
+                       # emit the terminal below (never relay the error as content)
             u = chunk.get("usage")
             if isinstance(u, dict) and (u.get("prompt_tokens") is not None
                                         or u.get("completion_tokens") is not None):
@@ -6582,28 +6636,32 @@ def v1_responses():
                     mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
-            except ValueError:
-                return _openai_error("Upstream returned non-JSON (%s, HTTP 200): %s"
-                                     % (hop_pid, _sanitize(resp.text)), 502, "upstream_error")
+            except (ValueError, requests.RequestException):
+                errors.append("%s: non-JSON 200 body" % hop_pid)
+                resp.close()
+                continue
             if _chat_json_is_empty(data):
                 errors.append("%s: empty (200 but no content)" % hop_pid)
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est)
             return jsonify(_chat_to_responses(data, model_label)), 200
-        errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
-        if resp.status_code == 400 and _classify_soft_400(resp):
-            resp.close()
-            continue
-        if not _retryable(resp.status_code):
-            try:
-                body_json = resp.json()
-                body_text = None
-            except ValueError:
-                body_json = None
-                body_text = _sanitize(resp.text)
-            last_hard = {"pid": hop_pid, "status": resp.status_code,
-                         "json": body_json, "text": body_text}
+        try:
+            errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+            if resp.status_code == 400 and _classify_soft_400(resp):
+                resp.close()
+                continue
+            if not _retryable(resp.status_code):
+                try:
+                    body_json = resp.json()
+                    body_text = None
+                except ValueError:
+                    body_json = None
+                    body_text = _sanitize(resp.text)
+                last_hard = {"pid": hop_pid, "status": resp.status_code,
+                             "json": body_json, "text": body_text}
+        except requests.RequestException as exc:
+            errors.append("%s: %s reading error body" % (hop_pid, _sanitize(exc.__class__.__name__)))
         resp.close()
         continue
     # No provider yielded a 200. We have NOT emitted any SSE yet, so return a
@@ -6612,7 +6670,7 @@ def v1_responses():
     # SSE stream carrying an error.
     if last_hard is not None:
         if last_hard["json"] is not None:
-            return jsonify(last_hard["json"]), last_hard["status"]
+            return jsonify(last_hard["json"]), _retryable_relay_status(last_hard["status"])
         return _openai_error("Upstream returned non-JSON (%s, HTTP %d): %s"
                              % (last_hard["pid"], last_hard["status"], last_hard["text"]),
                              502, "upstream_error")
@@ -6778,10 +6836,14 @@ def _openai_resp_to_anthropic(data, model_str):
     msg = choice.get("message") or {}
     content = []
     text = msg.get("content")
+    if isinstance(text, list):   # content-parts -> join their text (never relay a list)
+        text = "".join((p.get("text") or "") for p in text if isinstance(p, dict))
     if text:
         content.append({"type": "text", "text": text})
     for tc in msg.get("tool_calls") or []:
         fn = tc.get("function") or {}
+        if not ((fn.get("name") or "").strip()):
+            continue   # drop a nameless tool_call — never emit a blank-name tool_use
         try:
             args = json.loads(fn.get("arguments") or "{}")
         except ValueError:
@@ -6790,7 +6852,7 @@ def _openai_resp_to_anthropic(data, model_str):
             args = {}
         content.append({"type": "tool_use",
                         "id": tc.get("id") or ("toolu_" + uuid.uuid4().hex[:16]),
-                        "name": fn.get("name") or "",
+                        "name": fn.get("name"),
                         "input": args})
     if not content:
         content = [{"type": "text", "text": ""}]
@@ -6853,6 +6915,8 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
                 chunk = json.loads(data.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
                 continue
+            if isinstance(chunk, dict) and chunk.get("error"):
+                break  # error object on a 200 stream -> stop cleanly, emit terminal below
             usage = chunk.get("usage")
             if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
                 out_tokens = usage.get("completion_tokens")
@@ -7053,9 +7117,10 @@ def v1_messages():
                     mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
-            except ValueError:
-                return _anthropic_error("api_error",
-                                        "Upstream %s returned non-JSON." % hop_pid, 502)
+            except (ValueError, requests.RequestException):
+                errors.append("%s: non-JSON 200 body" % hop_pid)
+                resp.close()
+                continue
             if _chat_json_is_empty(data):
                 errors.append("%s: empty (200 but no content)" % hop_pid)
                 resp.close()
@@ -7064,17 +7129,22 @@ def v1_messages():
             return jsonify(_openai_resp_to_anthropic(data, model_str))
         # Non-2xx. Retryable (429/5xx) AND hard errors (404/400/model-not-found)
         # both advance to the NEXT provider (a different provider/model) before we
-        # surface an error; within-provider key rotation already ran upstream.
-        errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
-        if resp.status_code == 400 and _classify_soft_400(resp):
-            resp.close()
-            continue
-        if not _retryable(resp.status_code):
-            # Capture the last hard error's detail to relay once the chain is done.
-            detail = _upstream_error_detail(resp)
-            status = resp.status_code if 400 <= resp.status_code < 500 else 502
-            last_hard = {"pid": hop_pid, "http": resp.status_code,
-                         "status": status, "detail": detail}
+        # surface an error; within-provider key rotation already ran upstream. A
+        # network error reading the (unread, stream=True) error body must also just
+        # advance, never escape the loop into a 500.
+        try:
+            errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+            if resp.status_code == 400 and _classify_soft_400(resp):
+                resp.close()
+                continue
+            if not _retryable(resp.status_code):
+                # Capture the last hard error's detail to relay once the chain is done.
+                detail = _upstream_error_detail(resp)
+                last_hard = {"pid": hop_pid, "http": resp.status_code,
+                             "status": _retryable_relay_status(resp.status_code),
+                             "detail": detail}
+        except requests.RequestException as exc:
+            errors.append("%s: %s reading error body" % (hop_pid, _sanitize(exc.__class__.__name__)))
         resp.close()
         continue
     if last_hard is not None:
