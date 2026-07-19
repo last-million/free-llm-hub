@@ -97,6 +97,12 @@ CHAT_READ_TIMEOUT = 300       # seconds (long NON-streaming generations)
 #     between chunks once the stream is committed (a mid-stream stall fails in ~90s
 #     instead of 300s).
 STREAM_FIRST_BYTE_TIMEOUT = 25   # seconds
+# Bound for the "peek until real content" look-ahead that tells a genuine answer
+# from an empty 200 (some free providers return 200 then stream only a role delta +
+# [DONE]). An empty stream reaches its terminal FAST (well under this), and a normal
+# model emits content within a few seconds; this ceiling only bites a stream that
+# goes idle without ever producing content, which then falls through to the next model.
+STREAM_CONTENT_PEEK_TIMEOUT = 35  # seconds
 STREAM_IDLE_TIMEOUT = 90         # seconds
 MODELS_READ_TIMEOUT = 10      # seconds (model discovery / key tests)
 MODEL_CACHE_TTL = 60          # seconds
@@ -5789,6 +5795,78 @@ def _peek_first_chunk(iterator, deadline_s):
     return True, box.get("v")
 
 
+def _peek_until_content(iterator, deadline_s, max_lines=400):
+    """Look ahead on a streaming 200 to tell a REAL answer from an EMPTY one before
+    committing it to the client. Reads SSE items (bytes) until one carries actual
+    content / a tool call (the provider is really answering), or the stream
+    TERMINATES with none (an empty 200 — some free providers 200 then stream only a
+    role delta + [DONE], which left codex with nothing and no retry), or the stream
+    goes idle past `deadline_s` (hung). Buffers everything it reads so the caller can
+    replay it losslessly. Returns (status, buffered):
+      'content' -> commit; stream `buffered` then the rest of the SAME iterator.
+      'empty'   -> carried no content; caller closes resp + falls through to next model.
+      'timeout' -> nothing usable arrived in time; caller falls through.
+    Same daemon-worker discipline as _peek_first_chunk: the buffer/iterator are only
+    used when the worker FINISHED (status set) so there's never concurrent iteration."""
+    box = {"buf": [], "status": None}
+
+    def _worker():
+        buf = box["buf"]
+        try:
+            for _ in range(max_lines):
+                item = next(iterator)
+                buf.append(item)
+                if not item:
+                    continue
+                b = item if isinstance(item, (bytes, bytearray)) \
+                    else str(item).encode("utf-8", "ignore")
+                if _STREAM_CONTENT_RE.search(b):
+                    box["status"] = "content"
+                    return
+                if _STREAM_TERMINAL_RE.search(b):
+                    box["status"] = "empty"
+                    return
+            box["status"] = "content"   # lots of data, no terminal yet -> real stream
+        except StopIteration:
+            box["status"] = "empty"     # ended before any content
+        except Exception:
+            box["status"] = "empty"     # read error/timeout -> unusable, fall through
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(deadline_s)
+    if t.is_alive():
+        return "timeout", []
+    return box.get("status") or "empty", list(box["buf"])
+
+
+def _chain_buffered(buffered, iterator):
+    """Yield each already-read item in `buffered`, then the rest of `iterator` — the
+    multi-item version of _chain_first, used to replay a look-ahead losslessly."""
+    for item in buffered or ():
+        yield item
+    for item in iterator:
+        yield item
+
+
+def _chat_json_is_empty(data):
+    """True if an OpenAI chat-completions JSON carried NO assistant content AND no
+    tool calls — a non-streamed 'empty 200' that should fall through to the next
+    model. Conservative: returns False on anything unexpected so a real answer is
+    never discarded."""
+    try:
+        msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, list):  # content-parts -> join their text
+            content = "".join((p.get("text") or "") for p in content
+                              if isinstance(p, dict))
+        has_text = bool(content and str(content).strip())
+        has_tools = bool(msg.get("tool_calls"))
+        return not (has_text or has_tools)
+    except Exception:
+        return False
+
+
 def _proxy_sse(resp, iterator=None, first=_MISSING):
     """Pass upstream SSE bytes through unchanged. When `iterator`/`first` are
     supplied (the first-byte peek already pulled the first chunk from this exact
@@ -5873,19 +5951,25 @@ def v1_chat_completions():
                 # stream (no first byte within STREAM_FIRST_BYTE_TIMEOUT) falls
                 # through to the next provider instead of stalling the client.
                 it = resp.iter_content(chunk_size=None)
-                ok, first = _peek_first_chunk(it, STREAM_FIRST_BYTE_TIMEOUT)
-                if not ok:
-                    errors.append("%s: no first byte within %ds"
-                                  % (hop_pid, STREAM_FIRST_BYTE_TIMEOUT))
+                # Peek until REAL content: a 200 that streams no content must fall
+                # through to the next model, not be handed to the client as empty.
+                status, buffered = _peek_until_content(it, STREAM_CONTENT_PEEK_TIMEOUT)
+                if status != "content":
+                    errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     resp.close()
                     continue
-                return Response(stream_with_context(_proxy_sse(resp, it, first)),
+                chained = _chain_buffered(buffered, it)
+                return Response(stream_with_context(_proxy_sse(resp, chained)),
                                 mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
             except ValueError:
                 return _openai_error("Upstream returned non-JSON (%s, HTTP 200): %s"
                                      % (hop_pid, _sanitize(resp.text)), 502, "upstream_error")
+            if _chat_json_is_empty(data):
+                errors.append("%s: empty (200 but no content)" % hop_pid)
+                resp.close()
+                continue
             _record_chat_usage(hop_pid, hop_model, data, est)
             if isinstance(data, dict):
                 data["model"] = hop_pid + "/" + hop_model
@@ -6356,20 +6440,27 @@ def v1_responses():
                 # #4: peek the first line BEFORE committing the 200 SSE stream so a
                 # hung/slow provider falls through to the next hop instead of stalling.
                 line_it = resp.iter_lines(decode_unicode=False)
-                ok, first = _peek_first_chunk(line_it, STREAM_FIRST_BYTE_TIMEOUT)
-                if not ok:
-                    errors.append("%s: no first byte within %ds"
-                                  % (hop_pid, STREAM_FIRST_BYTE_TIMEOUT))
+                # Peek until REAL content (not just the first byte): an empty 200
+                # (role delta + [DONE], no content) must fall through to the next
+                # model instead of being streamed to codex as a dead-end answer.
+                status, buffered = _peek_until_content(line_it, STREAM_CONTENT_PEEK_TIMEOUT)
+                if status != "content":
+                    errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     resp.close()
                     continue
+                chained = _chain_buffered(buffered, line_it)
                 return Response(stream_with_context(
-                    _responses_stream(resp, model_label, line_it, first, prompt_est=est)),
+                    _responses_stream(resp, model_label, line_iter=chained, prompt_est=est)),
                     mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
             except ValueError:
                 return _openai_error("Upstream returned non-JSON (%s, HTTP 200): %s"
                                      % (hop_pid, _sanitize(resp.text)), 502, "upstream_error")
+            if _chat_json_is_empty(data):
+                errors.append("%s: empty (200 but no content)" % hop_pid)
+                resp.close()
+                continue
             _record_chat_usage(hop_pid, hop_model, data, est)
             return jsonify(_chat_to_responses(data, model_label)), 200
         errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
@@ -6820,14 +6911,16 @@ def v1_messages():
                 # #4: peek the first line BEFORE committing the 200 SSE stream so a
                 # hung/slow provider falls through to the next hop instead of stalling.
                 line_it = resp.iter_lines(decode_unicode=False)
-                ok, first = _peek_first_chunk(line_it, STREAM_FIRST_BYTE_TIMEOUT)
-                if not ok:
-                    errors.append("%s: no first byte within %ds"
-                                  % (hop_pid, STREAM_FIRST_BYTE_TIMEOUT))
+                # Peek until REAL content so an empty 200 falls through to the next
+                # model instead of being handed to the client as a dead-end answer.
+                status, buffered = _peek_until_content(line_it, STREAM_CONTENT_PEEK_TIMEOUT)
+                if status != "content":
+                    errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     resp.close()
                     continue
+                chained = _chain_buffered(buffered, line_it)
                 return Response(stream_with_context(
-                    _anthropic_stream(resp, model_str, input_est, line_it, first,
+                    _anthropic_stream(resp, model_str, input_est, line_iter=chained,
                                      hop_pid=hop_pid, hop_model=hop_model)),
                     mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
@@ -6835,6 +6928,10 @@ def v1_messages():
             except ValueError:
                 return _anthropic_error("api_error",
                                         "Upstream %s returned non-JSON." % hop_pid, 502)
+            if _chat_json_is_empty(data):
+                errors.append("%s: empty (200 but no content)" % hop_pid)
+                resp.close()
+                continue
             _record_chat_usage(hop_pid, hop_model, data, est)
             return jsonify(_openai_resp_to_anthropic(data, model_str))
         # Non-2xx. Retryable (429/5xx) AND hard errors (404/400/model-not-found)
