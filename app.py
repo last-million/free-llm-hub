@@ -1689,6 +1689,11 @@ def _quota_headroom(pid: str) -> float:
 # both hold. Rotation only runs in Auto/orchestrate mode; an explicit '<pid>/<model>'
 # request bypasses the router entirely and is untouched.
 _ORCH_BAND = 30.0
+# Agentic/coding (require_tools) floor: only models scoring at/above this (S-tier on
+# the _benchmark_score scale — hy3/qwen3-coder/deepseek-v4/kimi-k2/glm-5.2/
+# gpt-oss-120b class) may serve a coding agent. Below it a model plans then
+# under-builds. Fail-open when nothing clears it (weak/exhausted pool).
+_TOOLS_MIN_SCORE = 100.0
 _orch_cursor = 0
 _orch_lock = threading.Lock()
 
@@ -1756,9 +1761,18 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # land on DIFFERENT strong providers — no single provider's quota drains
         # alone, and the user sees the best models MIXED instead of one pinned id.
         # The best model keeps double weight (still leads); band==1 == old argmax.
-        # `require_tools` (codex/agentic, MCP) always uses this top band — a mid
-        # model can't drive an agent. Fail-safe: fall back to the argmax if empty.
-        picked = _spread_pick(pool) or max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
+        agentic_pool = pool
+        if require_tools:
+            # CODING/AGENTIC: hard-restrict to S-tier models (a mid model can't drive
+            # a coding agent — it plans then under-builds). Only the strongest free
+            # coders (hy3/qwen3-coder/deepseek-v4/kimi-k2/glm-5.2/gpt-oss-120b class)
+            # are eligible; spread runs WITHIN that top set. Fail-open: if none clear
+            # the bar (all keys weak/exhausted), keep the full pool rather than fail.
+            strong = [c for c in pool if c[0] >= _TOOLS_MIN_SCORE]
+            if strong:
+                agentic_pool = strong
+        picked = _spread_pick(agentic_pool) or max(
+            agentic_pool, key=lambda t: (t[0], _quota_headroom(t[1])))
         _s, pid, model = picked
         return pid, model, difficulty
     floor = _DIFFICULTY_FLOOR[difficulty]
