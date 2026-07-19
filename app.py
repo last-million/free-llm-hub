@@ -3081,9 +3081,16 @@ def api_tracking():
     by_state = {}
     for r in out:
         by_state[r["state"]] = by_state.get(r["state"], 0) + 1
+    # Enabled+keyed providers that surfaced NO free model — not routed in Free mode
+    # because they're paid/trial-credit (no free tier). Surfaced so they're never
+    # silently 'excluded': the user sees them and why (switch Auto-uses to Mix/Paid
+    # to actually use them with their key).
+    shown = {r["provider"] for r in out}
+    keyed_no_free = sorted(pid for pid in _enabled_keyed() if pid not in shown)
     return jsonify({"models": out, "total": len(out), "by_state": by_state,
                     "providers": sorted({r["provider"] for r in out}),
-                    "usable": sum(1 for r in out if r["state"] == "ok")})
+                    "usable": sum(1 for r in out if r["state"] == "ok"),
+                    "keyed_no_free": keyed_no_free})
 
 
 @app.route("/api/probe-all", methods=["POST"])
