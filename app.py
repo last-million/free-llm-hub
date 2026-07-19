@@ -1745,13 +1745,15 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     # they still appear later in _build_chain as a last-resort fallback).
     pool = [c for c in cands if _is_fast(c[1], c[2])] or cands
     if difficulty == "hard" or require_tools:
-        # best QUALITY among the fast models (good + fast, not the slow giant).
-        # `require_tools` (codex/agentic, MCP, tool calling) ALSO takes the TOP
-        # model regardless of difficulty — a mid model can't drive an agent, and
-        # the 'medium' cheapness rule below would hand codex a weak model (this is
-        # why codex kept landing on qwen3-30b instead of kimi-k2.6/gpt-oss-120b).
-        # Tie among equal-best models -> the one with the MOST free quota left.
-        _s, pid, model = max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
+        # SPREAD across the top-tier band instead of always the single argmax, so
+        # consecutive agentic turns (and codex sub-agents, each its own request)
+        # land on DIFFERENT strong providers — no single provider's quota drains
+        # alone, and the user sees the best models MIXED instead of one pinned id.
+        # The best model keeps double weight (still leads); band==1 == old argmax.
+        # `require_tools` (codex/agentic, MCP) always uses this top band — a mid
+        # model can't drive an agent. Fail-safe: fall back to the argmax if empty.
+        picked = _spread_pick(pool) or max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
+        _s, pid, model = picked
         return pid, model, difficulty
     floor = _DIFFICULTY_FLOOR[difficulty]
     qualified = [c for c in pool if c[0] >= floor]
