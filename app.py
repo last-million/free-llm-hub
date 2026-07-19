@@ -2887,6 +2887,92 @@ def api_models():
     return jsonify(aggregated_models())
 
 
+@app.route("/api/tracking", methods=["GET"])
+def api_tracking():
+    """LIVE tracking of every EXISTING (provider, model) the hub knows: benchmark
+    score, tool-capability, speed, and the full runtime state it self-tracks —
+    dead (402/403/404, with re-probe countdown), per-model throttle, provider
+    quota (used/limit/remaining/resets), and any LEARNED context limit. Read-only:
+    reflects exactly what routing currently sees; makes NO upstream calls."""
+    now = time.time()
+    with _dead_lock:
+        dead = dict(_dead_models)
+    with _model_max_input_lock:
+        learned = dict(_MODEL_MAX_INPUT)
+    prov_status, out = {}, []
+    for pid in _enabled_keyed():
+        if pid not in prov_status:
+            try:
+                prov_status[pid] = quota.status(pid)
+            except Exception:
+                prov_status[pid] = {}
+        qs = prov_status[pid]
+        try:
+            models = _auto_models(pid)
+        except Exception:
+            models = []
+        for m in models:
+            key = (pid, str(m))
+            dexp = dead.get(key)
+            is_dead = bool(dexp and dexp > now)
+            try:
+                thr = quota.is_model_throttled(pid, m)
+            except Exception:
+                thr = False
+            try:
+                allowed = prov.is_model_allowed(m)
+            except Exception:
+                allowed = True
+            try:
+                score = round(_benchmark_score(pid, m), 1)
+            except Exception:
+                score = 0.0
+            state = ("dead" if is_dead else
+                     "blocked" if not allowed else
+                     "provider-exhausted" if qs.get("exhausted") else
+                     "throttled" if thr else "ok")
+            out.append({
+                "id": pid + "/" + m, "provider": pid, "model": m,
+                "score": score, "tool_capable": _supports_tools(pid, m),
+                "fast": _is_fast(pid, m), "state": state,
+                "dead_expires_in": int(dexp - now) if is_dead else None,
+                "throttled": thr, "learned_ctx": learned.get(key),
+                "quota": {k: qs.get(k) for k in
+                          ("used", "limit", "remaining", "exhausted", "resets_in", "window")},
+            })
+    out.sort(key=lambda r: (-r["score"], r["provider"], r["model"]))
+    by_state = {}
+    for r in out:
+        by_state[r["state"]] = by_state.get(r["state"], 0) + 1
+    return jsonify({"models": out, "total": len(out), "by_state": by_state,
+                    "providers": sorted({r["provider"] for r in out}),
+                    "usable": sum(1 for r in out if r["state"] == "ok")})
+
+
+@app.route("/api/probe-all", methods=["POST"])
+def api_probe_all():
+    """ACTIVE health check: send ONE tiny real request to each enabled+keyed
+    (provider, model) and record whether it answers — marking 402/403/404 ids dead so
+    routing stops picking them. Uses a little free quota (opt-in, POST). Skips ids
+    already dead/exhausted so it doesn't waste calls. Returns the per-model verdict."""
+    results = []
+    for pid in _available_providers():
+        try:
+            models = _auto_models(pid)
+        except Exception:
+            models = []
+        for m in models:
+            if not prov.is_model_allowed(m) or _is_model_dead(pid, m):
+                continue
+            ok, detail = _probe_pair(pid, m)
+            results.append({"id": pid + "/" + m, "provider": pid, "model": m,
+                            "ok": bool(ok), "detail": detail})
+    results.sort(key=lambda r: (not r["ok"], r["provider"]))
+    return jsonify({"results": results, "total": len(results),
+                    "working": sum(1 for r in results if r["ok"]),
+                    "failed": sum(1 for r in results if not r["ok"])})
+
+
 def _ranked_free_pairs(limit=6):
     """[(score, pid, model)] best-first across available providers, skipping
     safety-blocked and known-dead ids."""
