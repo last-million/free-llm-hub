@@ -17,3 +17,7 @@ cm*.txt
 
 # local hub run logs - never commit (may contain the control token)
 .hublog.*
+
+# hub runtime logs (local only)
+hub.err.log
+hub.out.log
