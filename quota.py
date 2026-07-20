@@ -61,7 +61,6 @@ FREE_LIMITS = {
     "xiaomi":        {"limit": 0,     "window": "day"},     # high: chat/LLM is pay-as-you-go or paid Token Plans; the only $0 models are TTS (non-chat, "limited time")
     "nvidia":        {"limit": 0,     "window": "day"},     # medium: TRIAL, not a tier — a LIFETIME 1,000-credit budget (max 5,000, 90-day expiry) returning 402 "Cloud credits expired". The old 40/minute was a real rate baseline but never the binding constraint; a window counter cannot express a finite consumable balance.
     "morph":         {"limit": 0,     "window": "month"},   # medium: the official "200 req free every month" headline meters TOKENS (250K/mo = $2.50); a coding CLI's 20-50K-token turns make the real allowance ~5-12 req/month, so 200 reported quota long after Morph starts rejecting.
-    "agentrouter":   {"limit": 0,     "window": "day"},     # medium: consumable $100/$200 signup credits; publishes no rate limits anywhere and /v1/models 401s without a key
     "qwen":          {"limit": 0,     "window": "day"},     # medium: consumable 1M-tokens-PER-MODEL / 90-day trial, then AllocationQuota.FreeTierOnly on every call. (Documented rate is 600 RPM with no per-day cap.)
 
     # ── legacy rows, NOT researched, and both are DEAD KEYS ─────────────────
@@ -143,11 +142,43 @@ def _limit_for(pid: str) -> dict:
     return FREE_LIMITS.get(pid, DEFAULT_LIMIT)
 
 
-def _window_bounds(window: str, now: float):
-    """(start_epoch, reset_epoch) for the window CONTAINING `now`, in UTC."""
+# Providers whose DAILY quota does not roll over at UTC midnight. Google states it
+# explicitly: "Requests per day (RPD) quotas reset at midnight Pacific time"
+# (https://ai.google.dev/gemini-api/docs/rate-limits) — 7-8h off UTC depending on
+# DST, so a UTC assumption either keeps hammering a still-exhausted key for hours or
+# writes the provider off long after it recovered. Named zones (not fixed offsets)
+# so DST is handled for us. Everything absent from this map stays UTC.
+DAY_RESET_TZ = {"google": "America/Los_Angeles"}
+
+
+def _day_bounds_tz(zone: str, now: float):
+    """(start, reset) of the LOCAL day containing `now` in `zone`, as epochs.
+    Falls back to UTC if the tz database is unavailable (bare containers)."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime, timedelta
+        tz = ZoneInfo(zone)
+        local = datetime.fromtimestamp(now, tz)
+        midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        # Re-resolve the NEXT midnight from the calendar date (not +86400): across a
+        # DST switch the local day is 23 or 25 hours long.
+        nxt = (midnight + timedelta(days=1)).replace(hour=0, minute=0, second=0,
+                                                     microsecond=0)
+        return midnight.timestamp(), nxt.timestamp()
+    except Exception:
+        return None
+
+
+def _window_bounds(window: str, now: float, pid: str = None):
+    """(start_epoch, reset_epoch) for the window CONTAINING `now`. UTC unless the
+    provider is listed in DAY_RESET_TZ (day window only)."""
     if window == "minute":
         start = now - (now % 60)
         return start, start + 60
+    if window == "day" and pid in DAY_RESET_TZ:
+        bounds = _day_bounds_tz(DAY_RESET_TZ[pid], now)
+        if bounds:
+            return bounds
     tm = time.gmtime(now)
     if window == "month":
         start = calendar.timegm((tm.tm_year, tm.tm_mon, 1, 0, 0, 0, 0, 0, 0))
@@ -167,7 +198,7 @@ def record(pid: str, model: str = None, n: int = 1) -> None:
     per provider AND per model."""
     lim = _limit_for(pid)
     now = time.time()
-    start, _reset = _window_bounds(lim["window"], now)
+    start, _reset = _window_bounds(lim["window"], now, pid)
     with _LOCK:
         st = _STATE.get(pid)
         if not st or st.get("window_start") != start:
@@ -188,7 +219,7 @@ def models(pid: str) -> dict:
     Empty once the window rolls over."""
     lim = _limit_for(pid)
     now = time.time()
-    start, _reset = _window_bounds(lim["window"], now)
+    start, _reset = _window_bounds(lim["window"], now, pid)
     with _LOCK:
         ms = _MODEL_STATE.get(pid)
         if not ms or ms.get("window_start") != start:
@@ -282,7 +313,7 @@ def mark_model_throttled(pid: str, model: str, seconds: float = 60) -> None:
         return
     lim = _limit_for(pid)
     now = time.time()
-    _start, reset = _window_bounds(lim["window"], now)
+    _start, reset = _window_bounds(lim["window"], now, pid)
     key = (pid, model)
     with _LOCK:
         mt = _MODEL_THROTTLE.get(key) or {"throttled_until": 0, "strikes": 0, "last_strike": 0.0}
@@ -350,7 +381,7 @@ def mark_throttled(pid: str, seconds: float = None) -> None:
       resets. This is the legacy behavior, preserved for callers that mean it."""
     lim = _limit_for(pid)
     now = time.time()
-    start, reset = _window_bounds(lim["window"], now)
+    start, reset = _window_bounds(lim["window"], now, pid)
     with _LOCK:
         st = _STATE.get(pid)
         if not st or st.get("window_start") != start:
@@ -413,7 +444,7 @@ def status(pid: str) -> dict:
     limit = lim.get("limit")
     limit_known = isinstance(limit, int)
     now = time.time()
-    start, reset = _window_bounds(lim["window"], now)
+    start, reset = _window_bounds(lim["window"], now, pid)
     with _LOCK:
         st = _STATE.get(pid)
         used = st["count"] if st and st.get("window_start") == start else 0
