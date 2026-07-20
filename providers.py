@@ -517,51 +517,6 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": [],
         "notes": "No free models — a $0.10/month credit allowance consumed at full pay-as-you-go rates (~17 requests on GLM-5.2, ~1,400 on Llama-3.1-8B), 'subject to change'. Note the widely-cited '1,000 requests / 5 min' is the Hub API bucket, NOT inference.",
     },
-    "github-models": {
-        "name": "GitHub Models",
-        "base_url": "https://models.github.ai/inference",
-        "models_url": "https://models.github.ai/catalog/models",
-        "signup_url": "https://github.com/settings/tokens",
-        "key_hint": "github_pat_... (models:read)",
-        # Not a pricing leak (every catalog model is $0) — but 'all' surfaced 10
-        # custom-tier OpenAI ids (gpt-5*, o1*, o3*, o4-mini) marked "Not
-        # applicable" on Copilot Free, i.e. guaranteed hard failures, plus 2
-        # embeddings models. These 6 families select exactly the 23 low/high-tier
-        # models. deepseek-r1 is deliberately excluded by the narrow family:
-        # it's free but capped at 8 req/day.
-        "free_filter": "family",
-        "free_families": ["openai/gpt-4", "meta/", "mistral-ai/", "microsoft/",
-                          "cohere/", "deepseek/deepseek-v3"],
-        # Low-tier (150/day) before high-tier (50/day). Lowercase ids: the live
-        # catalog no longer uses the old CamelCase Azure names.
-        "default_free_models": [
-            "openai/gpt-4.1-mini", "openai/gpt-4o-mini", "mistral-ai/mistral-medium-2505",
-            "cohere/cohere-command-a", "microsoft/phi-4", "openai/gpt-4.1",
-            "meta/llama-3.3-70b-instruct", "deepseek/deepseek-v3-0324",
-        ],
-        "notes": ("Genuinely free with a GitHub PAT — nothing is consumed. 150 req/day (low-tier ids) "
-                  "/ 50 req/day (high-tier). "
-                  "⚠ THE TOKEN NEEDS THE 'models' SCOPE, or EVERY call returns 403 'No access to "
-                  "model' even though the catalog lists fine (a key test that only lists models will "
-                  "look OK - verified live: 0 of 23 models worked without it). "
-                  "Fine-grained token: github.com/settings/personal-access-tokens/new -> Permissions -> "
-                  "Account permissions -> Models: Read. "
-                  "Classic token: github.com/settings/tokens/new -> tick the 'models' scope. "
-                  "No repo access is needed - Models is an ACCOUNT permission, so grant nothing else. "
-                  "GOTCHA: the free tier caps EVERY request at 8K in / 4K out regardless of the "
-                  "model's advertised context."),
-    },
-    "deepseek": {
-        "name": "DeepSeek",
-        "base_url": "https://api.deepseek.com/v1",
-        "models_url": "https://api.deepseek.com/v1/models",
-        "signup_url": "https://platform.deepseek.com/api_keys",
-        "key_hint": "sk-...",
-        "free_filter": "pricing_zero",
-        "paid": True,  # PAID/credit-based, NOT a free tier — only surface when paid models are allowed
-        "default_free_models": [],
-        "notes": "PAID (credit-based) — not a free tier, but explicitly allowed: pin 'deepseek/deepseek-v4-flash' or 'deepseek/deepseek-v4-pro' explicitly to use it. Both models bill per token; the widely-cited '5M free tokens on signup' appears on ZERO official pages. Only CONCURRENCY is published (no RPD/RPM) — the real limiter is account balance. Legacy deepseek-chat/deepseek-reasoner retire 2026-07-24 (alias to deepseek-v4-flash/pro).",
-    },
     "scaleway": {
         "name": "Scaleway",
         "base_url": "https://api.scaleway.ai/v1",
@@ -771,20 +726,6 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": ["meta-llama/llama-3.1-8b-instruct"],
         "notes": "Small one-time free credit. Then pay-as-you-go.",
     },
-    "xiaomi": {
-        "name": "Xiaomi MiMo",
-        "base_url": "https://api.xiaomimimo.com/v1",
-        "models_url": "https://api.xiaomimimo.com/v1/models",
-        "signup_url": "https://platform.xiaomimimo.com/",
-        "key_hint": "MiMo API key from platform.xiaomimimo.com",
-        "paid": True,
-        "free_filter": "pricing_zero",
-        "default_free_models": [],
-        "notes": "Xiaomi MiMo-V2.5-Pro — OpenAI-compatible, paid (~$1/$3 per M tokens). Reasoning + multimodal.",
-    },
-    # ── OpenCode / models.dev free-capable providers (July 2026 catalog) ───────
-    # All OpenAI-compatible; the SAFETY block below still strips any uncensored
-    # models post-discovery. Routers use 'pricing_zero' so only $0 models surface.
     "opencode-zen": {
         "name": "OpenCode Zen",
         "base_url": "https://opencode.ai/zen/v1",
@@ -946,25 +887,12 @@ PROVIDERS: Dict[str, dict] = {
     "fireworks": {"name": "Fireworks AI", "base_url": "https://api.fireworks.ai/inference/v1",
         "models_url": "https://api.fireworks.ai/inference/v1/models", "signup_url": "https://app.fireworks.ai/settings/users/api-keys",
         "key_hint": "fw_...", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Fast OpenAI-compatible host (Llama/Qwen/DeepSeek/Flux). Pay-as-you-go."},
-    "deepinfra": {"name": "DeepInfra", "base_url": "https://api.deepinfra.com/v1/openai",
-        "models_url": "https://api.deepinfra.com/v1/openai/models", "signup_url": "https://deepinfra.com/dash/api_keys",
-        "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Cheap OpenAI-compatible host for open models. Pay-as-you-go."},
-    "hyperbolic": {"name": "Hyperbolic", "base_url": "https://api.hyperbolic.xyz/v1",
-        "models_url": "https://api.hyperbolic.xyz/v1/models", "signup_url": "https://app.hyperbolic.ai/settings",
-        "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Low-cost open-model inference. OpenAI-compatible."},
     "perplexity": {"name": "Perplexity", "base_url": "https://api.perplexity.ai",
         "models_url": None, "signup_url": "https://www.perplexity.ai/account/api/keys",
         "key_hint": "pplx-...", "free_filter": "all",
         "default_free_models": ["sonar", "sonar-pro", "sonar-reasoning", "sonar-reasoning-pro", "sonar-deep-research"],
         "paid": True,
         "notes": "Sonar models w/ live web search. Endpoint /chat/completions (NO /models list -> models hardcoded, was empty=unusable). $5 FREE API credit on first signup (trial), then paid."},
-    "requesty": {"name": "Requesty", "base_url": "https://router.requesty.ai/v1",
-        "models_url": "https://router.requesty.ai/v1/models", "signup_url": "https://app.requesty.ai/api-keys",
-        "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Model router/aggregator. Paid."},
-    "arcee": {"name": "Arcee", "base_url": "https://api.arcee.ai/api/v1",
-        "models_url": "https://api.arcee.ai/api/v1/models", "signup_url": "https://chat.arcee.ai/api/api-keys",
-        "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True,
-        "notes": "Arcee Platform (OpenAI-compat). Was models.arcee.ai (dead DNS); fixed to api.arcee.ai/api/v1 (live, 401 without key). Key from chat.arcee.ai/api/api-keys. Paid/trial."},
     "inception": {"name": "Inception (Mercury)", "base_url": "https://api.inceptionlabs.ai/v1",
         "models_url": "https://api.inceptionlabs.ai/v1/models", "signup_url": "https://platform.inceptionlabs.ai",
         "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Diffusion-LLM (Mercury) — very fast. Paid — no free tier."},
