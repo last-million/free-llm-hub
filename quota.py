@@ -52,7 +52,6 @@ FREE_LIMITS = {
     # Kept as explicit rows (not deleted) so they can never inherit DEFAULT_LIMIT.
     "kimi":          {"limit": 0,     "window": "day"},     # high: docs verbatim "There is no free tier... recharge at least $1 to start using."
     "minimax":       {"limit": 0,     "window": "day"},     # high: no free tier in any official doc; pay-per-token or subscription only. FAILS UNSAFELY (200 OK + a bill).
-    "together":      {"limit": 0,     "window": "day"},     # high: all four '-Free' serverless endpoints were removed during 2025 (last 2025-12-23)
     "chutes":        {"limit": 0,     "window": "day"},     # high: free tier fully retired 2026-03-15 (the old 200/day Early Access always required a $5 deposit). FAILS UNSAFELY.
     "huggingface":   {"limit": 0,     "window": "month"},   # high: allowance is $0.10/MONTH of credits at full rates (~17 req on GLM-5.2), not a request count. is_free:true matches 0 of 102 router models. FAILS UNSAFELY.
     "scaleway":      {"limit": 0,     "window": "day"},     # high: card mandatory before the first call; one-time 1M-token allowance then silent billing. The old "300/day" was the PAID 300/MINUTE figure with the window swapped. FAILS UNSAFELY.

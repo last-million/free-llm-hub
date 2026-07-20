@@ -222,24 +222,6 @@ PROVIDERS: Dict[str, dict] = {
                   "does NOT list it. Could disappear without notice; keep it as a bonus tier, "
                   "never a dependency. Model ids are discovered live once you add a key."),
     },
-    "codestral": {
-        "name": "Mistral Codestral (free)",
-        # SEPARATE endpoint + SEPARATE key from La Plateforme ("mistral" above):
-        # a Codestral key does NOT work on api.mistral.ai and vice versa.
-        "base_url": "https://codestral.mistral.ai/v1",
-        "models_url": "https://codestral.mistral.ai/v1/models",
-        "signup_url": "https://console.mistral.ai/codestral",
-        "key_hint": "codestral key",
-        "free_filter": "family",
-        "free_families": ["codestral"],
-        "default_free_models": ["codestral-latest"],
-        "notes": ("Genuinely free code model, and the most generous free coding tier here: "
-                  "30 req/min, 2,000 req/day (per cheahjs/free-llm-api-resources, MIT). "
-                  "Requires PHONE VERIFICATION to get the key, and it is a DIFFERENT key + "
-                  "endpoint from Mistral La Plateforme — a La Plateforme key will not work "
-                  "here. Codestral only (code completion/chat), so the family is pinned; "
-                  "no general chat catalog to leak."),
-    },
     "pollinations": {
         "name": "Pollinations.AI",
         "base_url": "https://text.pollinations.ai/openai",
@@ -579,24 +561,6 @@ PROVIDERS: Dict[str, dict] = {
         "paid": True,  # PAID/credit-based, NOT a free tier — only surface when paid models are allowed
         "default_free_models": [],
         "notes": "PAID (credit-based) — not a free tier, but explicitly allowed: pin 'deepseek/deepseek-v4-flash' or 'deepseek/deepseek-v4-pro' explicitly to use it. Both models bill per token; the widely-cited '5M free tokens on signup' appears on ZERO official pages. Only CONCURRENCY is published (no RPD/RPM) — the real limiter is account balance. Legacy deepseek-chat/deepseek-reasoner retire 2026-07-24 (alias to deepseek-v4-flash/pro).",
-    },
-    "together": {
-        "name": "Together AI",
-        "base_url": "https://api.together.ai/v1",
-        "models_url": "https://api.together.ai/v1/models",
-        "signup_url": "https://api.together.ai/settings/api-keys",
-        "key_hint": "...",
-        "paid": True,  # no free endpoints remain — keep OUT of free routing
-        # free_families ['-free'] now matches ZERO live models and would leak a
-        # billable one if Together ever ships an id containing '-free'.
-        # pricing_zero is self-correcting: empty today, auto-picks up a real $0
-        # endpoint later. CAVEAT for that implementation: test input==0 AND
-        # output==0 only — Together's own docs show a paid model ($0.30/M) with
-        # base:0, finetune:0, hourly:0.
-        "free_filter": "pricing_zero",
-        "free_families": [],
-        "default_free_models": [],
-        "notes": "No free tier — all four '-Free' serverless endpoints were removed during 2025 (Llama-Vision-Free 2025-08-28, Llama-3.3-70B-Turbo-Free and DeepSeek-R1-Distill-Llama-70B-free 2025-11-13, FLUX.1-schnell-free 2025-12-23). Paid credits only; the '$25 signup credit' was retired July 2025.",
     },
     "scaleway": {
         "name": "Scaleway",
