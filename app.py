@@ -519,6 +519,13 @@ def _strong_new_version_score(low):
     return best
 
 
+# User-preference floors applied by _benchmark_score: (hy3, kimi-k3). They are
+# deliberate thumb-on-the-scale values, NOT measured strength, so any code that
+# reasons about the SHAPE of the score distribution (the spread band) must exclude
+# them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
+_PREF_FLOORS = (135, 134)
+
+
 def _benchmark_score(pid, model_id):
     """Heuristic strength score for a '<model>' on provider `pid` (higher=better).
     Pure string heuristic — no network, future-proof against catalog churn."""
@@ -553,18 +560,24 @@ def _benchmark_score(pid, model_id):
                               "gpt-oss", "claude", "gpt-5", "minimax-m", "hy3",
                               "hunyuan", "starcoder")):
         score += 8
+    # PREFERENCE FLOORS (not measured scores). These lift a favourite model above
+    # every natural score so it wins the top slot — but because they are ARTIFICIAL
+    # they must never define the top of the load-spreading band (a 135 floor on a
+    # model whose real score is 108 drags the band cutoff from 82.8 up to 105 and
+    # starves the rotation down to a couple of ids). _spread_pick therefore computes
+    # the band from NATURAL scores only; see _PREF_FLOORS use there.
     # USER PREFERENCE: hy3 (Tencent HunYuan) is the #1 pick for coding + heavy tasks,
     # then latest kimi / qwen / deepseek (all already Tier S). Floor it above every
     # other model's realistic max (~133: tier 100 + coder 8 + size 20 + instruct 3 +
     # provider 2) so hy3 wins the top slot whenever it's available/keyed. Only affects
     # the max-based (hard/tools/agentic) routing — light tasks still pick cheapest.
     if "hy3" in low or "hunyuan-3" in low or "tencent-hy" in low:
-        score = max(score, 135)
+        score = max(score, _PREF_FLOORS[0])
     # USER PREFERENCE: Kimi K3 (Moonshot) — top pick for the heaviest tasks, right
     # behind hy3 and above every other model. Auto-applies when a provider serves a
     # kimi-k3 id (nothing lists it yet). Matches kimi-k3 / kimi-k3.x / .../kimi-k3.
     if "kimi-k3" in low or "kimik3" in low:
-        score = max(score, 134)
+        score = max(score, _PREF_FLOORS[1])
     if (("mistral" in low or "mixtral" in low or "ministral" in low)
             and not any(k in low for k in ("mistral-large", "mistral-medium"))):
         score -= 14
@@ -1029,23 +1042,48 @@ def _is_model_dead(pid, model):
 # just burns hops. Sideline the WHOLE provider for a while, then re-probe (a fixed
 # token / topped-up balance revives it on its own).
 _PROVIDER_DEAD_TTL = 30 * 60           # 30 min, then re-probe the provider
-_PROVIDER_AUTHFAIL_THRESHOLD = 3       # distinct models failing auth -> kill provider
+_PROVIDER_AUTHFAIL_THRESHOLD = 3       # distinct models 401/402 -> the KEY is bad
+_PROVIDER_FORBIDDEN_THRESHOLD = 8      # 403-only: usually per-model, not a bad key
 _AUTH_FAIL_STATUSES = (401, 402, 403)
 _dead_providers = {}                   # pid -> expiry epoch
 _provider_authfail = {}                # pid -> set(models that auth-failed this window)
+_provider_keyfail = set()              # pids that saw a real 401/402 this window
 _provider_dead_lock = threading.Lock()
 
 
 def _mark_provider_authfail(pid, model, status):
     """Record an auth/credit failure; once enough DISTINCT models of a provider fail
-    this way, the key is bad — sideline the whole provider (not just each model)."""
+    this way, the key is bad — sideline the whole provider (not just each model).
+
+    403 is graded SEPARATELY and far more leniently than 401/402. 401 (bad token)
+    and 402 (no credit) are properties of the KEY, so three models is already proof.
+    403 usually is not: free gateways return it per-MODEL (gated/preview/regional
+    ids) while the key works fine elsewhere. Sidelining a whole provider on three
+    such 403s silently deleted most of the candidate pool, which funnelled every
+    request onto whatever single model was left — and left a real 403 with nowhere
+    to fall through to. Per-model 403s are already handled by _mark_model_dead."""
     if status not in _AUTH_FAIL_STATUSES:
         return
     with _provider_dead_lock:
         s = _provider_authfail.setdefault(pid, set())
         if model:
             s.add(str(model))
-        if len(s) >= _PROVIDER_AUTHFAIL_THRESHOLD:
+        if status in (401, 402):
+            _provider_keyfail.add(pid)      # this window saw a KEY-level failure
+        if status == 402:
+            # 402 = "insufficient balance" — an ACCOUNT fact, never a property of one
+            # model, so there is nothing to learn from trying a second id. Sideline at
+            # once: otherwise a broke provider keeps winning the primary slot, burns a
+            # hop on every single request, and the turn is always finished by whichever
+            # provider still works — which looks exactly like "it only uses one model".
+            _dead_providers[pid] = time.time() + _PROVIDER_DEAD_TTL
+            return
+        # A key-level failure anywhere in the window keeps the strict threshold; a
+        # 403-only window needs far more distinct models before we blame the key
+        # (a token 403ing on EVERY model still trips it, just a little later).
+        threshold = (_PROVIDER_AUTHFAIL_THRESHOLD if pid in _provider_keyfail
+                     else _PROVIDER_FORBIDDEN_THRESHOLD)
+        if len(s) >= threshold:
             _dead_providers[pid] = time.time() + _PROVIDER_DEAD_TTL
 
 
@@ -1057,6 +1095,7 @@ def _is_provider_dead(pid):
         if exp <= time.time():
             _dead_providers.pop(pid, None)
             _provider_authfail.pop(pid, None)   # reset counter -> a clean re-probe
+            _provider_keyfail.discard(pid)
             return False
         return True
 
@@ -1691,11 +1730,33 @@ def _dispatch_chat(pid, payload, stream):
 _DIFFICULTY_EFFORT = {"simple": "low", "medium": "medium", "hard": "high"}
 
 
+# (output-token budget, HIGHEST effort still allowed below it), strictest last.
+_EFFORT_MIN_BUDGET = ((2000, "medium"), (800, "low"))
+
+
 def _apply_reasoning_effort(payload, model, difficulty):
     """For a reasoning model, set reasoning_effort from the task difficulty so easy
-    questions answer fast and hard ones think more. No-op for non-reasoning models."""
-    if difficulty and _SLOW_MODEL_RE.search((model or "").lower()):
-        payload["reasoning_effort"] = _DIFFICULTY_EFFORT.get(difficulty, "medium")
+    questions answer fast and hard ones think more. No-op for non-reasoning models.
+
+    The effort is CAPPED by the output budget. Thinking is spent from the same
+    max_tokens as the answer, so 'high' effort on a small budget makes the model
+    burn the whole allowance reasoning and return finish_reason='length' with EMPTY
+    content — which the chain then discards as a dead hop. That silently knocked the
+    deep-quota reasoning workhorses (gpt-oss-120b, glm-4.7) out of every heavy turn
+    and funnelled the work onto whichever non-reasoning model was left."""
+    if not (difficulty and _SLOW_MODEL_RE.search((model or "").lower())):
+        return payload
+    effort = _DIFFICULTY_EFFORT.get(difficulty, "medium")
+    try:
+        budget = int(payload.get("max_tokens") or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    if budget > 0:
+        order = {"low": 0, "medium": 1, "high": 2}
+        for need, cap in _EFFORT_MIN_BUDGET:
+            if budget < need and order.get(effort, 1) > order[cap]:
+                effort = cap
+    payload["reasoning_effort"] = effort
     return payload
 
 
@@ -1791,25 +1852,67 @@ _TOOLS_MIN_SCORE = 90.0   # include the deep-quota strong coders (gpt-oss-120b 9
                           # agentic pool — they're the sustainable workhorses when the
                           # shallow top-tier (openrouter/google) burns out. Was 100,
                           # which excluded them and forced the cascade onto weak mistral.
+_ORCH_CHEAP_BAND = 10.0   # tight band for light sub-tasks: rotate only among the
+                          # near-equal-cost strong coders, so the scarce top models
+                          # stay saved for the heavy turns.
 _orch_cursor = 0
+_orch_cheap_cursor = 0
 _orch_lock = threading.Lock()
 
 
-def _spread_pick(pool):
-    """pool = [(score, pid, model)] of fast candidates. Return one top-tier entry,
-    rotating across the band so consecutive agentic turns land on DIFFERENT strong
-    providers. The top-scored model gets double weight (stays the lead). Exhausted
-    models are already filtered out of `pool` upstream."""
-    global _orch_cursor
+def _spread_band(pool):
+    """The top-tier band of `pool`, best first. The band top is computed from
+    NATURAL scores only: a preference floor (hy3 135 / kimi-k3 134) is a thumb on
+    the scale, not a measurement, and letting it define the top drags the cutoff up
+    ~27 points and collapses the band to one or two ids — which is exactly how a
+    single model ends up serving a whole project."""
     if not pool:
-        return None
-    top = max(p[0] for p in pool)
+        return []
+    scores = sorted({p[0] for p in pool}, reverse=True)
+    natural = [s for s in scores if s not in _PREF_FLOORS]
+    top = natural[0] if natural else scores[0]
     band = [p for p in pool if p[0] >= top - _ORCH_BAND]
-    band.sort(key=lambda t: (-t[0], t[1], t[2]))    # deterministic, best first
-    ring = [band[0]] + band                          # best id twice -> ~2x weight
+    # Quality first; among EQUAL-benchmark models prefer the one with more free
+    # budget left (headroom never outranks quality — see _quota_headroom).
+    band.sort(key=lambda t: (-t[0], -round(_quota_headroom(t[1]), 1), t[1], t[2]))
+    return band
+
+
+def _spread_pick(pool):
+    """pool = [(score, pid, model)] of candidates. Return one top-tier entry,
+    rotating across the band so consecutive agentic turns land on DIFFERENT strong
+    providers — one project then draws on the strength of MANY good models instead
+    of draining the single best one. Exhausted models are filtered out upstream."""
+    global _orch_cursor
+    band = _spread_band(pool)
+    if not band:
+        return None
+    lead = band[0]
+    # The lead keeps DOUBLE weight only while it still has budget. Once it is
+    # nearly drained it falls back to a normal single slot — never dropped (quality
+    # still wins), it just stops being consumed at twice everyone else's rate.
+    ring = ([lead] + band) if _quota_headroom(lead[1]) >= 0.25 else band
     with _orch_lock:
         pick = ring[_orch_cursor % len(ring)]
         _orch_cursor += 1
+    return pick
+
+
+def _spread_pick_cheap(pool):
+    """Rotate across the CHEAP band — the near-equal-cost strong coders just above
+    the agentic floor — for lighter sub-tasks. Deliberately tight (_ORCH_CHEAP_BAND)
+    so the scarce top-tier models stay reserved for the heavy turns, and on its own
+    cursor so it can't phase-shift the hard-turn rotation."""
+    global _orch_cheap_cursor
+    if not pool:
+        return None
+    base = min(p[0] for p in pool)
+    band = [p for p in pool if p[0] <= base + _ORCH_CHEAP_BAND]
+    # cheapest first, then most free budget among equals
+    band.sort(key=lambda t: (t[0], -round(_quota_headroom(t[1]), 1), t[1], t[2]))
+    with _orch_lock:
+        pick = band[_orch_cheap_cursor % len(band)]
+        _orch_cheap_cursor += 1
     return pick
 
 
@@ -1852,7 +1955,13 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     # Prefer FAST models — the primary should be a good model the user won't wait
     # on. Slow reasoning models are used only if NO fast model is available (and
     # they still appear later in _build_chain as a last-resort fallback).
-    pool = [c for c in cands if _is_fast(c[1], c[2])] or cands
+    # NOTE: the fast-only prefilter is skipped for AGENTIC (tools) turns. A coding
+    # agent waits on quality, not on first-token latency, and the speed heuristic
+    # scores several of the strongest sustainable coders (openrouter's hy3,
+    # gpt-oss-120b) as "slow" — filtering them here removed them from the agentic
+    # pool ENTIRELY, before the strength floor below ever saw them, which is a big
+    # part of why one model ended up serving everything.
+    pool = cands if require_tools else ([c for c in cands if _is_fast(c[1], c[2])] or cands)
     if require_tools:
         # CODING/AGENTIC: the primary is ALWAYS a STRONG model (>= _TOOLS_MIN_SCORE) —
         # a weak model plans then under-builds, and mistral (56) only ever appears
@@ -1867,12 +1976,14 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
             picked = _spread_pick(agentic) or max(
                 agentic, key=lambda t: (t[0], _quota_headroom(t[1])))
         else:
-            # LIGHTER coding (simple/medium sub-task) -> the CHEAPEST model that is STILL
-            # STRONG, tie to most free quota. This leans on the deep-quota strong coders
-            # (gpt-oss-120b on cerebras 14400/day, glm-4.7, deepseek-v3) and SAVES the
-            # scarce top models (hy3 openrouter 50/day) for the heavy turns — "best by
-            # heaviness", never a weak model for coding.
-            picked = min(agentic, key=lambda t: (t[0], -_quota_headroom(t[1])))
+            # LIGHTER coding (simple/medium sub-task) -> ROTATE across the cheap band:
+            # the near-equal-cost models that are STILL STRONG. This leans on the
+            # deep-quota coders (gpt-oss-120b on cerebras 14400/day, glm-4.7,
+            # deepseek-v3) and SAVES the scarce top models (hy3 openrouter 50/day) for
+            # the heavy turns — "best by heaviness", never a weak model for coding, and
+            # never the SAME cheap model every light turn either.
+            picked = _spread_pick_cheap(agentic) or min(
+                agentic, key=lambda t: (t[0], -_quota_headroom(t[1])))
         _s, pid, model = picked
         return pid, model, difficulty
     if difficulty == "hard":
@@ -2004,6 +2115,24 @@ def _comparable_model(model_id, candidates):
     return best or candidates[0]
 
 
+def _rotate_band(ordered):
+    """Rotate the TOP BAND of a strength-ordered candidate list so consecutive
+    requests don't all fall back onto the same model. Everything below the band
+    keeps its exact order — only which of the equally-strong models gets the first
+    fallback slot varies. Uses the shared spread cursor WITHOUT advancing it, so it
+    tracks the primary rotation instead of fighting it."""
+    if len(ordered) < 3:
+        return ordered
+    band = _spread_band(ordered)
+    if len(band) < 2:
+        return ordered
+    keys = {(e[1], e[2]) for e in band}
+    rest = [e for e in ordered if (e[1], e[2]) not in keys]
+    with _orch_lock:
+        off = _orch_cursor % len(band)
+    return band[off:] + band[:off] + rest
+
+
 def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_tools=False):
     """Priority-ordered [(pid, model)] fallback chain. Primary first, then the
     next-best MODELS across every AVAILABLE, size-capable provider, INTERLEAVED
@@ -2047,6 +2176,13 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # codex cascades onto mistral while they sit unused. FAIL-OPEN on tool-capable.
         ordered = sorted(fast + slow, key=lambda t: (t[0], _quota_headroom(t[1])), reverse=True)
         ordered = [e for e in ordered if _supports_tools(e[1], e[2])] or ordered
+        # ROTATE the top band of the fallback too. Strict strength order means the
+        # single highest-scored model is hop 2 of EVERY chain, so each time a primary
+        # refuses (429/402/404 — routine on free tiers) the same model answers, and
+        # it alone carries the project no matter how well the primary rotated. Spread
+        # the second chance across the equally-strong models instead; below the band
+        # the order is untouched, so quality still decides who gets tried at all.
+        ordered = _rotate_band(ordered)
     else:
         ordered = fast + slow
     for _score, pid, m in ordered:
@@ -2684,6 +2820,37 @@ def _act_pick(pid, model):
         with _activity_lock:
             act["provider"] = pid
             act["model"] = model
+            # First pick = what the ROUTER chose; later ones are fallback hops.
+            hops = act.setdefault("hops", [])
+            if len(hops) < 12:
+                hops.append("%s/%s" % (pid, model))
+            act["routed"] = act.get("routed") or ("%s/%s" % (pid, model))
+
+
+def _act_hop_failed(reason):
+    """Annotate the hop currently being attempted with why it fell through, so the
+    activity feed shows the REAL story ('router picked A, A refused, answered by B')
+    instead of only the model that happened to answer."""
+    act = getattr(g, "act", None)
+    if act is None:
+        return
+    with _activity_lock:
+        hops = act.get("hops")
+        if hops and "!" not in hops[-1]:
+            hops[-1] = "%s ! %s" % (hops[-1], str(reason)[:40])
+
+
+class _HopErrors(list):
+    """The per-request fallback-error list, with one addition: every append also
+    marks WHY the hop being attempted fell through, on the activity trail. Plain
+    list semantics otherwise ('; '.join(errors), truthiness, len — all unchanged)."""
+
+    def append(self, item):
+        list.append(self, item)
+        try:
+            _act_hop_failed(item)
+        except Exception:
+            pass    # diagnostics must never break a request
 
 
 def _activity_done(act, status, http=None):
@@ -2727,6 +2894,18 @@ _STREAM_CONTENT_RE = re.compile(
     rb'output_text\.delta|function_call_arguments\.delta|content_block_delta'
     rb'|"tool_calls"|"content"\s*:\s*"(?:\\|[^"])')
 _STREAM_ERROR_RE = re.compile(rb'event:\s*error|"error"\s*:')
+# Peek-safe variant: only an error that actually CARRIES a value (an object or a
+# string). The shared _STREAM_ERROR_RE also matches `"error": null` / `"error": {}`,
+# which several OpenAI-compatible gateways put in every envelope — harmless in
+# _finalizing_body (real content later in the stream wins) but fatal in the peek,
+# which returns on the FIRST match and would drop a perfectly healthy stream.
+_STREAM_ERROR_VALUE_RE = re.compile(rb'event:\s*error\b|"error"\s*:\s*(?:"|\{(?!\s*\}))')
+# Reasoning/thinking deltas. NOT final content (so they can't satisfy the content
+# gate on their own) but they ARE proof the upstream is alive and working, which is
+# what lets a slow reasoning model keep its turn instead of being judged empty.
+_STREAM_REASONING_RE = re.compile(
+    rb'"reasoning_content"\s*:\s*"(?:\\|[^"])|"(?:thinking|reasoning)"\s*:\s*"(?:\\|[^"])'
+    rb'|thinking_delta|reasoning_summary_text\.delta')
 
 
 @app.after_request
@@ -2791,7 +2970,16 @@ def api_dead_models():
     (403 no-access / 404 gone). Self-healing: each entry expires and is re-probed."""
     rows = [{"provider": p, "model": m, "expires_in": s} for p, m, s in _dead_model_rows()]
     rows.sort(key=lambda r: (r["provider"], r["model"]))
-    return jsonify({"dead": rows, "count": len(rows), "ttl_seconds": _DEAD_MODEL_TTL})
+    # Whole providers sidelined by repeated key-level failures. These silently
+    # remove EVERY model of a provider from routing, so they must be visible —
+    # an invisible sideline looks exactly like "the router keeps choosing one model".
+    pr = [{"provider": p, "expires_in": s,
+           "reason": "key (401/402)" if p in _provider_keyfail else "forbidden (403)"}
+          for p, s in _dead_provider_rows()]
+    pr.sort(key=lambda r: r["provider"])
+    return jsonify({"dead": rows, "count": len(rows), "ttl_seconds": _DEAD_MODEL_TTL,
+                    "dead_providers": pr, "provider_count": len(pr),
+                    "provider_ttl_seconds": _PROVIDER_DEAD_TTL})
 
 
 @app.route("/api/activity", methods=["GET"])
@@ -3249,14 +3437,15 @@ def _suggested_model():
 def _connect_snippets():
     key = config.get_local_api_key()
     shown_key = key or "free-llm-hub"
-    # Use the SAME model id the CLI auto-fixers write (first aggregated free model),
-    # falling back to the suggestion only when nothing is keyed yet — so the shown
-    # snippet and the written env block never disagree.
-    model = _first_free_model_id() or _suggested_model()
+    # Advertise 'auto' — the SAME value the Claude auto-fixer writes, so the shown
+    # snippet and the written env block never disagree. It must NOT be a concrete
+    # '<pid>/<model>': _is_orchestrate() bails on any id containing '/', which pins
+    # every Claude Code request to one provider and skips difficulty/vision routing
+    # (that pin is how a single model ended up serving an entire project).
     claude = ("export ANTHROPIC_BASE_URL=http://localhost:%d\n"
               "export ANTHROPIC_AUTH_TOKEN=%s\n"
-              "export ANTHROPIC_MODEL=%s\n"
-              "claude" % (PORT, shown_key, model))
+              "export ANTHROPIC_MODEL=auto\n"
+              "claude" % (PORT, shown_key))
     openai = ("export OPENAI_BASE_URL=http://localhost:%d/v1\n"
               "export OPENAI_API_KEY=%s" % (PORT, shown_key))
     return {"claude_code": claude, "openai": openai}
@@ -4587,9 +4776,10 @@ def _first_free_model_id():
 def _manual_env(entry, key, base_root, base_v1, model):
     """The env vars this CLI would need, resolved with the live port/key/model."""
     if entry["kind"] == "anthropic":
+        # 'auto', never a '<pid>/<model>' pin — see _autofix_claude / _connect_snippets.
         return {"ANTHROPIC_BASE_URL": base_root,
                 "ANTHROPIC_AUTH_TOKEN": key,
-                "ANTHROPIC_MODEL": model}
+                "ANTHROPIC_MODEL": "auto"}
     return {"OPENAI_API_BASE": base_v1,
             "OPENAI_BASE_URL": base_v1,
             "OPENAI_API_KEY": key,
@@ -4778,7 +4968,11 @@ def _autofix_claude(entry, key, base_root, base_v1, model):
         env = {}
     env["ANTHROPIC_BASE_URL"] = base_root
     env["ANTHROPIC_AUTH_TOKEN"] = key
-    env["ANTHROPIC_MODEL"] = model
+    # ALWAYS 'auto' (never the passed-in '<pid>/<model>'): _is_orchestrate() returns
+    # False for any id containing '/', so a pinned id sends every Claude Code request
+    # to ONE provider and skips difficulty/vision routing + load spreading entirely.
+    # Assigned rather than skipped so a stale pin from an earlier connect is cleared.
+    env["ANTHROPIC_MODEL"] = "auto"
     data["env"] = env
     _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     return {
@@ -4786,7 +4980,7 @@ def _autofix_claude(entry, key, base_root, base_v1, model):
         "wrote_path": path,
         "backup_path": backup,
         "applied": {"file_key": "env", "ANTHROPIC_BASE_URL": base_root,
-                    "ANTHROPIC_AUTH_TOKEN": _mask_key(key), "ANTHROPIC_MODEL": model},
+                    "ANTHROPIC_AUTH_TOKEN": _mask_key(key), "ANTHROPIC_MODEL": "auto"},
         "restart_hint": "Restart Claude Code (open a new terminal) so it re-reads ~/.claude/settings.json.",
     }
 
@@ -4851,8 +5045,11 @@ def _autofix_opencode(entry, key, base_root, base_v1, model):
 
 def _autofix_qwen(entry, key, base_root, base_v1, model):
     path = _p_qwen_env()
+    # 'auto' (not a '<pid>/<model>' pin) so every request is orchestrated — same
+    # reasoning as _autofix_claude / _autofix_codex, and 'auto' is advertised by
+    # /v1/models so a model-validating client still accepts it.
     updates = {"OPENAI_API_BASE": base_v1, "OPENAI_BASE_URL": base_v1,
-               "OPENAI_API_KEY": key, "OPENAI_MODEL": model}
+               "OPENAI_API_KEY": key, "OPENAI_MODEL": "auto"}
     backup = _backup_once(path)
     abort = _abort_if_backup_failed(path, backup)  # scalar-replace: never overwrite an un-backed-up .env
     if abort:
@@ -4863,7 +5060,7 @@ def _autofix_qwen(entry, key, base_root, base_v1, model):
         "wrote_path": path,
         "backup_path": backup,
         "applied": {"OPENAI_API_BASE": base_v1, "OPENAI_BASE_URL": base_v1,
-                    "OPENAI_API_KEY": _mask_key(key), "OPENAI_MODEL": model},
+                    "OPENAI_API_KEY": _mask_key(key), "OPENAI_MODEL": "auto"},
         "restart_hint": "Re-run `qwen` in a new terminal; it loads ~/.qwen/.env on startup.",
     }
 
@@ -6190,9 +6387,17 @@ def api_cli_instructions(cid):
 @app.route("/v1/models", methods=["GET"])
 def v1_models():
     agg = aggregated_models()
+    # 'auto' is a REAL, selectable id here (it is what _is_orchestrate accepts) and
+    # is listed FIRST so a CLI that validates its configured model — or just takes
+    # the first row as its default — lands on the orchestrator instead of being
+    # pinned to one provider's model for every request.
+    auto = {"id": "auto", "object": "model", "created": 0, "owned_by": "free-llm-hub",
+            "display_name": "auto (orchestrated — best free model per task)"}
+    rows = [_codex_model_entry(m) for m in agg]
     return jsonify({"object": "list",
-                    "data": [_codex_model_entry(m) for m in agg],
-                    "models": [dict(_codex_model_entry(m), slug=m["id"]) for m in agg]})
+                    "data": [auto] + rows,
+                    "models": [dict(auto, slug="auto")]
+                              + [dict(_codex_model_entry(m), slug=m["id"]) for m in agg]})
 
 
 # Model row for /v1/models. `display_name` is additive and harmless for every
@@ -6269,6 +6474,8 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
     replay it losslessly. Returns (status, buffered):
       'content' -> commit; stream `buffered` then the rest of the SAME iterator.
       'empty'   -> carried no content; caller closes resp + falls through to next model.
+      'error'   -> the 200 body carries an upstream error frame (a 403/quota refusal
+                   delivered inside the stream); caller falls through to next model.
       'timeout' -> nothing usable arrived in time; caller falls through.
     Same daemon-worker discipline as _peek_first_chunk: the buffer/iterator are only
     used when the worker FINISHED (status set) so there's never concurrent iteration."""
@@ -6276,6 +6483,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
 
     def _worker():
         buf = box["buf"]
+        saw_reasoning = False
         try:
             for _ in range(max_lines):
                 item = next(iterator)
@@ -6287,10 +6495,24 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
                 if _STREAM_CONTENT_RE.search(b):
                     box["status"] = "content"
                     return
+                # An error INSIDE a 200 stream (403/429/quota reported as an SSE
+                # error frame instead of an HTTP status) — the single most common
+                # way a provider dead-ends a turn. Report it so the caller drops
+                # this hop and tries the next model instead of committing a stream
+                # that will never produce an answer.
+                if _STREAM_ERROR_VALUE_RE.search(b):
+                    box["status"] = "error"
+                    return
                 if _STREAM_TERMINAL_RE.search(b):
                     box["status"] = "empty"
                     return
-            box["status"] = "content"   # lots of data, no terminal yet -> real stream
+                if _STREAM_REASONING_RE.search(b):
+                    saw_reasoning = True
+            # Budget exhausted with no content marker. Only treat that as a real
+            # stream if we saw the model THINKING (reasoning deltas) — otherwise it
+            # was 400 lines of keepalives/role deltas and committing it hands the
+            # CLI a stream that never answers.
+            box["status"] = "content" if saw_reasoning else "empty"
         except StopIteration:
             box["status"] = "empty"     # ended before any content
         except Exception:
@@ -6341,12 +6563,28 @@ def _proxy_sse(resp, iterator=None, first=_MISSING):
     iterator), yield that chunk first, then continue the SAME iterator — so the
     fast-path byte stream is byte-for-byte identical to before. Empty chunks are
     still filtered exactly as before."""
+    saw_done = False
     try:
         if iterator is None:
             iterator = resp.iter_content(chunk_size=None)
         for chunk in _chain_first(first, iterator):
             if chunk:
+                if not saw_done and _STREAM_TERMINAL_RE.search(
+                        chunk if isinstance(chunk, (bytes, bytearray))
+                        else str(chunk).encode("utf-8", "ignore")):
+                    saw_done = True
                 yield chunk
+    except Exception as exc:
+        # Upstream died mid-stream (reset / ChunkedEncodingError / read timeout).
+        # Without a terminator the client sits on a half-open SSE body waiting for
+        # a [DONE] that will never come. Byte passthrough is unchanged on the happy
+        # path; this only appends the terminator the upstream failed to send.
+        _log.error("SSE passthrough error: %s", _sanitize(str(exc)))
+        if not saw_done:
+            try:
+                yield b"data: [DONE]\n\n"
+            except Exception:
+                pass
     finally:
         resp.close()
 
@@ -6395,7 +6633,7 @@ def v1_chat_completions():
         return _openai_error(not_ready, 400)
 
     stream = bool(body.get("stream"))
-    errors = []
+    errors = _HopErrors()
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools):
@@ -6700,6 +6938,13 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                 continue
             delta = (choices[0] or {}).get("delta") or {}
 
+            # Reasoning-phase keepalive: a thinking model sends reasoning deltas for
+            # up to a minute before its first visible token. Forward an SSE COMMENT
+            # (ignored by every compliant parser, invents no event type codex would
+            # have to understand) so the connection is visibly alive meanwhile.
+            if delta.get("reasoning_content") or delta.get("reasoning"):
+                yield ": keepalive\n\n"
+
             dtext = delta.get("content")
             if dtext is not None and not isinstance(dtext, str):
                 # Some upstreams stream a non-string content delta (an int, or a
@@ -6894,7 +7139,7 @@ def v1_responses():
             base_payload["tool_choice"] = body["tool_choice"]
 
     stream = bool(body.get("stream"))
-    errors = []
+    errors = _HopErrors()
     last_hard = None  # last hard (non-retryable) upstream error, relayed if chain is exhausted
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools):
@@ -7237,6 +7482,13 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
                 finish_reason = choice["finish_reason"]
             delta = choice.get("delta") or {}
 
+            # A reasoning model can think for a minute before its first visible
+            # token. Upstream is sending reasoning deltas the whole time, but we
+            # forward nothing — so the CLI sees a dead connection and may give up.
+            # A ping is the protocol's own keepalive: no content, no shape change.
+            if delta.get("reasoning_content") or delta.get("reasoning"):
+                yield _sse_event("ping", {"type": "ping"})
+
             dtext = delta.get("content")
             if dtext is not None and not isinstance(dtext, str):
                 # Coerce a non-string content delta (int / content-parts list) so
@@ -7301,6 +7553,33 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
             "delta": {"stop_reason": _map_stop_reason(finish_reason), "stop_sequence": None},
             "usage": {"output_tokens": int(out_tokens)}})
         yield _sse_event("message_stop", {"type": "message_stop"})
+    except Exception as exc:
+        # A mid-stream upstream failure (connection reset, ChunkedEncodingError,
+        # read timeout) used to propagate out of this generator and truncate the
+        # SSE body with NO terminal event, which leaves Claude Code waiting forever
+        # on a turn that is already dead. Always close the message properly instead:
+        # the client gets a well-formed (if short) turn and can continue.
+        # NOTE: `except Exception` deliberately does not catch GeneratorExit, so a
+        # normal client disconnect still tears the generator down as before.
+        _log.error("Anthropic stream error: %s", _sanitize(str(exc)))
+        try:
+            if block_index < 0:
+                block_index = 0
+                yield _sse_event("content_block_start", {
+                    "type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""}})
+            yield _sse_event("content_block_stop",
+                             {"type": "content_block_stop", "index": block_index})
+            if out_tokens is None:
+                out_tokens = max(1, text_chars // 4)
+            yield _sse_event("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": _map_stop_reason(finish_reason),
+                          "stop_sequence": None},
+                "usage": {"output_tokens": int(out_tokens)}})
+            yield _sse_event("message_stop", {"type": "message_stop"})
+        except Exception:
+            pass    # client socket already gone / state not yet bound
     finally:
         try:
             if hop_pid and hop_model:
@@ -7384,7 +7663,7 @@ def v1_messages():
     requested_model = body.get("model") if isinstance(body.get("model"), str) else None
     input_est = _estimate_input_tokens(body)
 
-    errors = []
+    errors = _HopErrors()
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools):
