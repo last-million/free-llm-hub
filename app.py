@@ -599,7 +599,33 @@ def _benchmark_score(pid, model_id):
         capped = True
     if capped:
         score = min(score, 30)
+    score -= _shared_budget_penalty(pid, low)
     return score
+
+
+# Some providers meter every model against ONE shared daily allowance, and the
+# per-model price varies enormously — so an expensive id doesn't just cost more,
+# it eats the budget its cheaper siblings would have used. Cloudflare Workers AI
+# is the concrete case: 10,000 free neurons/day, all models sharing it
+# (developers.cloudflare.com/workers-ai/platform/pricing). Per 1M tokens:
+#   @cf/openai/gpt-oss-120b        31,818 in /  68,182 out  -> ~150 calls/day
+#   @cf/qwen/qwen3-30b-a3b-fp8      4,625 in /  30,475 out  -> ~500 calls/day
+#   @cf/moonshotai/kimi-k2.6       86,364 in / 363,636 out  -> ~37 calls/day
+#   @cf/moonshotai/kimi-k2.7-code  86,364 in / 363,636 out  -> ~37 calls/day
+# The kimi ids are ~5x the output cost for no better coding score than the qwen /
+# gpt-oss siblings, so preferring them spends the whole day's allowance in a few
+# turns. The penalty demotes them WITHIN Cloudflare (they stay available, just
+# last) and is scoped by provider — kimi via any other provider is untouched.
+_SHARED_BUDGET_PENALTY = {
+    "cloudflare": ((("kimi-k2.6", "kimi-k2.7"), 12),),
+}
+
+
+def _shared_budget_penalty(pid, low):
+    for subs, points in _SHARED_BUDGET_PENALTY.get(pid, ()):
+        if any(s in low for s in subs):
+            return points
+    return 0
 
 
 def _best_free_pair(working_only=True):
@@ -955,7 +981,7 @@ def _provider_capable(pid, est):
 # --------------------------------------------------------------------------- #
 _PROVIDER_SPEED = {
     "cerebras": 100, "groq": 92, "sambanova": 78, "morph": 70, "deepseek": 66,
-    "mistral": 66, "google": 62, "agentrouter": 60, "nvidia": 54, "openrouter": 52,
+    "mistral": 66, "google": 62, "nvidia": 54, "openrouter": 52,
     "huggingface": 46, "github-models": 44, "cohere": 60,
 }
 _DEFAULT_SPEED = 55
@@ -1044,11 +1070,41 @@ def _is_model_dead(pid, model):
 _PROVIDER_DEAD_TTL = 30 * 60           # 30 min, then re-probe the provider
 _PROVIDER_AUTHFAIL_THRESHOLD = 3       # distinct models 401/402 -> the KEY is bad
 _PROVIDER_FORBIDDEN_THRESHOLD = 8      # 403-only: usually per-model, not a bad key
+_PROVIDER_NOCREDIT_THRESHOLD = 2       # 402 on 2 distinct models = the ACCOUNT is broke
 _AUTH_FAIL_STATUSES = (401, 402, 403)
 _dead_providers = {}                   # pid -> expiry epoch
 _provider_authfail = {}                # pid -> set(models that auth-failed this window)
 _provider_keyfail = set()              # pids that saw a real 401/402 this window
 _provider_dead_lock = threading.Lock()
+
+
+# A 429 whose body says the DAILY allowance (not a per-minute burst) is spent.
+# Cloudflare Workers AI is the concrete case: 10,000 neurons/day, reset 00:00 UTC,
+# error "you have used up your daily free allocation of 10,000 neurons" (code 3036,
+# also seen as 4006). Google's free-tier RPD message is matched too. Deliberately
+# NARROW — a generic 429 must keep the short 60s cooldown, since most are bursts.
+_DAILY_EXHAUSTED_RE = re.compile(
+    r"daily (?:free )?(?:allocation|quota|limit)|used up your daily|"
+    r"free_tier_requests|requests per day|\bRPD\b|neurons", re.I)
+
+
+def _daily_exhaustion_secs(pid, resp, cap=6 * 3600):
+    """Seconds until pid's quota window resets, when a 429 body says the DAILY
+    budget is gone. Returns None for an ordinary burst 429 (caller keeps its 60s).
+    Capped so a mis-read never sidelines a provider for a whole day."""
+    try:
+        body = (resp.text or "")[:2000]
+    except Exception:
+        return None
+    if not _DAILY_EXHAUSTED_RE.search(body):
+        return None
+    try:
+        secs = quota.status(pid).get("resets_in")
+    except Exception:
+        return None
+    if not secs or secs <= 0:
+        return None
+    return min(float(secs), cap)
 
 
 def _mark_provider_authfail(pid, model, status):
@@ -1070,12 +1126,14 @@ def _mark_provider_authfail(pid, model, status):
             s.add(str(model))
         if status in (401, 402):
             _provider_keyfail.add(pid)      # this window saw a KEY-level failure
-        if status == 402:
-            # 402 = "insufficient balance" — an ACCOUNT fact, never a property of one
-            # model, so there is nothing to learn from trying a second id. Sideline at
-            # once: otherwise a broke provider keeps winning the primary slot, burns a
-            # hop on every single request, and the turn is always finished by whichever
-            # provider still works — which looks exactly like "it only uses one model".
+        if status == 402 and len(s) >= _PROVIDER_NOCREDIT_THRESHOLD:
+            # 402 is USUALLY an account fact ("balance is 0, top up to continue") and a
+            # broke provider that keeps winning the primary slot burns a hop on every
+            # request. But it is not ALWAYS account-wide: some aggregators serve their
+            # free models fine and 402 only on the premium ids (verified live on aiand,
+            # which answers on qwen3.6 while other ids 402). So confirm on a SECOND
+            # distinct model before sidelining the whole provider — one 402 only kills
+            # that model (_mark_model_dead already did), never its working siblings.
             _dead_providers[pid] = time.time() + _PROVIDER_DEAD_TTL
             return
         # A key-level failure anywhere in the window keeps the strict threshold; a
@@ -2410,6 +2468,13 @@ def _upstream_chat(pid, payload, stream):
                 secs = float(retry_after) if retry_after else None
             except ValueError:
                 secs = None
+            if secs is None:
+                # A DAILY allowance that is spent will not come back in 60s, and
+                # retrying it every minute burns a chain hop on every request for the
+                # rest of the day (Cloudflare: "you have used up your daily free
+                # allocation of 10,000 neurons"). Park it until the window actually
+                # resets instead — the same self-healing path, just with an honest ETA.
+                secs = _daily_exhaustion_secs(pid, resp)
             quota.mark_throttled(pid, secs or 60)
             # ALSO park just this model: it survives provider note_success(), so when
             # a sibling model revives the provider, the id that actually 429'd stays

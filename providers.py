@@ -411,23 +411,6 @@ PROVIDERS: Dict[str, dict] = {
                   "Model ids verified by probing the real catalog with a live key, not read off "
                   "the docs index (which renders bare slugs without the @cf/ prefix)."),
     },
-    "agentrouter": {
-        "name": "AgentRouter",
-        "base_url": "https://agentrouter.org/v1",
-        "models_url": "https://agentrouter.org/v1/models",
-        "signup_url": "https://agentrouter.org/console/token",
-        "key_hint": "sk-...",
-        "paid": True,  # consumable signup credits only — keep OUT of free routing
-        # The previous free_families/default_free_models here were FABRICATED
-        # upstream: they trace verbatim to a single referral-spam gist (which
-        # appears to have borrowed OpenRouter's ':free' reputation), not to any
-        # official source. deepseek-v2-lite/qwen2-7b/mistral-7b are 2024-era
-        # models no 2026 Claude-relay would serve. Removed rather than re-tuned.
-        "free_filter": "pricing_zero",
-        "free_families": [],
-        "default_free_models": [],
-        "notes": "No free models — a third-party API relay running on consumable signup credits ($100 via GitHub, $200 via referral); every call burns them. Publishes no rate limits and /v1/models 401s without a key, so nothing here can be verified as free. All prompts transit a third-party reseller. Consider removing.",
-    },
     "google": {
         "name": "Google Gemini (AI Studio)",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -1098,9 +1081,21 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.aiand.com/v1/models",
         "signup_url": "https://console.aiand.com/api-keys",
         "key_hint": "sk-...",
-        "free_filter": "all",
-        "default_free_models": [],
-        "notes": "UNVERIFIED free-tier terms (base URL + OpenAI-compatibility ARE confirmed live). Says it gives free model credits per the user, not yet independently confirmed which models. Save a key, then hit Test to see the real live catalog.",
+        # PROBED with a real key 2026-07-20 — the placeholder above is now resolved.
+        # Of the 7 ids the live catalog advertises, exactly ONE answers:
+        #   qwen/qwen3.6-27b              200  (vendor catalog lists it Free / Free)
+        #   deepseek-ai/deepseek-v4-pro   402  insufficient_credits  (priced $1.00/$2.50)
+        #   deepseek-ai/deepseek-v4-flash 402  insufficient_credits  (priced $0.15/$0.25)
+        #   zai-org/glm-5.2               404  |  moonshotai/kimi-k2.7-code   404
+        #   google/gemma-4-31b-it         404  |  openai/gpt-oss-120b         404
+        # ai& is prepaid-only (docs.aiand.com/billing/credits: "prepaid credit
+        # model", no signup grant, no monthly grant) — at a zero balance every
+        # PRICED id 402s forever, so routing to them only ever burns a chain hop.
+        # Pinned to the probed-free id; widen this ONLY after re-probing with credit.
+        "free_filter": "family",
+        "free_families": ["qwen/qwen3.6-27b"],
+        "default_free_models": ["qwen/qwen3.6-27b"],
+        "notes": "Prepaid only — NO free tier and no signup credits (docs.aiand.com/billing/credits). Exactly one model is free to call at a zero balance: qwen/qwen3.6-27b (probed live 2026-07-20). Every other id is either priced (402 insufficient_credits) or not served on this account (404). Add credit at console.aiand.com/settings/billing ($1 minimum) to unlock deepseek-v4/kimi/glm.",
     },
     "custom": {
         "name": "Custom (OpenAI-compatible)",
