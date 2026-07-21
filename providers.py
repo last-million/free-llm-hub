@@ -896,18 +896,6 @@ PROVIDERS: Dict[str, dict] = {
     "inception": {"name": "Inception (Mercury)", "base_url": "https://api.inceptionlabs.ai/v1",
         "models_url": "https://api.inceptionlabs.ai/v1/models", "signup_url": "https://platform.inceptionlabs.ai",
         "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Diffusion-LLM (Mercury) — very fast. Paid — no free tier."},
-    # jiekou.ai — third-party multi-model RELAY (181 models incl. Claude/GPT/Gemini/
-    # Kimi/GLM). PAID, pay-per-token from a credit balance; NO free tier, NO daily
-    # quota. Probed 2026-07-21: valid key but every model 403s "not enough balance"
-    # until topped up. It is a third-party proxy ("proxy communication services" per
-    # its own ToS) — your prompts pass through it; data is not private. Overseas base
-    # URL used (api.jiekou.ai); the api.highwayapi.ai domain is the mainland-China
-    # direct route. See https://docs.jiekou.ai and its terms before relying on it.
-    "jiekou": {"name": "jiekou.ai (relay)", "base_url": "https://api.jiekou.ai/openai",
-        "models_url": "https://api.jiekou.ai/openai/models", "signup_url": "https://jiekou.ai/en",
-        "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True,
-        "data_policy_url": "https://jiekou.ai/en/legal/terms-of-service",
-        "notes": "Third-party API relay (181 models incl. Claude/GPT/Gemini). PAID, pay-per-token — NO free tier, NO daily quota. A proxy: your prompts pass through it, data is not private. Needs a topped-up balance (probed: 403 'not enough balance' at $0)."},
     "anthropic": {
         "name": "Anthropic (Claude)",
         # Anthropic's real API is POST /v1/messages (x-api-key + anthropic-version),
