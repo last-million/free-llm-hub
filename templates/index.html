@@ -220,6 +220,26 @@
   /* ---------- provider grid ---------- */
   .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
   @media (max-width:1280px){ .grid{grid-template-columns:repeat(2,minmax(0,1fr))} }
+  /* Collapsible connection categories: connected (top, collapsed) + available
+     (below, expanded). Native <details> spanning the full grid width. */
+  .prov-cat{ grid-column:1/-1; border:1px solid var(--border); border-radius:14px;
+             background:rgba(255,255,255,.015); overflow:hidden; margin:0 }
+  .prov-cat>summary{ list-style:none; cursor:pointer; user-select:none;
+    display:flex; align-items:center; gap:10px; padding:12px 16px;
+    font-weight:700; font-size:13px; letter-spacing:.3px; color:var(--text);
+    transition:background .14s ease }
+  .prov-cat>summary::-webkit-details-marker{ display:none }
+  .prov-cat>summary:hover{ background:rgba(255,255,255,.03) }
+  .prov-cat .cat-chev{ transition:transform .2s ease; color:var(--text-dim); flex-shrink:0 }
+  .prov-cat[open] .cat-chev{ transform:rotate(90deg) }
+  .prov-cat .cat-sub{ font-size:11px; font-weight:500; color:var(--text-faint) }
+  .prov-cat .cat-count{ margin-left:auto; font-size:11px; color:var(--text-dim);
+    background:var(--surface-3); border-radius:999px; padding:2px 9px }
+  .prov-cat.connected{ border-left:3px solid var(--accent) }
+  .prov-cat.connected .cat-count{ color:var(--accent) }
+  .prov-subgrid{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr));
+    gap:16px; padding:0 16px 16px }
+  @media (max-width:1280px){ .prov-subgrid{grid-template-columns:repeat(2,minmax(0,1fr))} }
   .card{
     background:linear-gradient(180deg,var(--surface-2),var(--surface));
     border:1px solid var(--border-soft);border-radius:14px;
@@ -2465,31 +2485,42 @@
       grid.innerHTML = '<div class="empty">No providers match &ldquo;' + esc(q) + '&rdquo;</div>';
       return;
     }
-    function renderCard(p){
+    function renderCard(p, target){
       var card = document.createElement('div');
       card.className = 'card' + (p.enabled ? ' enabled' : '') + (p.no_key ? ' nokey' : '');
       card.dataset.pid = p.id;
       card.innerHTML = cardHTML(p);
       wireCard(card, p);
       applyCardHealth(card, p.id);   /* colour from cached key-health (survives search re-render) */
-      grid.appendChild(card);
+      (target || grid).appendChild(card);
     }
-    function catHeader(cls, title, sub){
-      var h = document.createElement('div');
-      h.className = 'prov-cat-h' + (cls ? ' ' + cls : '');
-      h.innerHTML = '<span class="pc-t">' + esc(title) + '</span><span class="pc-sub">' + esc(sub) + '</span>';
-      grid.appendChild(h);
+    // Build a collapsible <details> category with its own sub-grid, return the grid.
+    function catSection(cls, title, sub, count, open){
+      var d = document.createElement('details');
+      d.className = 'prov-cat' + (cls ? ' ' + cls : '');
+      if (open) d.open = true;
+      var chev = '<svg class="cat-chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>';
+      d.innerHTML = '<summary>' + chev + '<span>' + esc(title) + '</span>' +
+        (sub ? '<span class="cat-sub">' + esc(sub) + '</span>' : '') +
+        '<span class="cat-count">' + count + '</span></summary>' +
+        '<div class="prov-subgrid"></div>';
+      grid.appendChild(d);
+      return d.querySelector('.prov-subgrid');
     }
-    // Two categories: free/trial providers first, then a "Paid APIs" section
-    // (bring-your-own paid key: Anthropic / OpenAI / Kimi / …). Ungrouped while
-    // searching would be confusing, so the split is kept even under a query.
-    function isPurePaid(p){ return p.paid && PURE_PAID[p.id]; }
-    var openG = shown.filter(function(p){ return p.no_key; });
-    var freeG = shown.filter(function(p){ return !p.no_key && !isPurePaid(p); });
-    var paidG = shown.filter(function(p){ return !p.no_key && isPurePaid(p); });
-    if (openG.length){ catHeader('open', 'No key needed', openG.length + ' — open gateways, work instantly'); openG.forEach(renderCard); }
-    if (freeG.length){ catHeader('', 'Free providers', freeG.length + ' — free tier available (some have paid tiers too)'); freeG.forEach(renderCard); }
-    if (paidG.length){ catHeader('paid', 'Paid only', paidG.length + ' — no free tier (OpenAI / Claude / Higgsfield)'); paidG.forEach(renderCard); }
+    // TWO categories by CONNECTION status: providers ready to use now (a key
+    // saved, or an open gateway that needs none) collapse on top; everything that
+    // still needs a key expands below so it's easy to add one. Add a key and the
+    // provider jumps to the top group on the next render.
+    var connG = shown.filter(function(p){ return p.has_key || p.no_key; });
+    var availG = shown.filter(function(p){ return !p.has_key && !p.no_key; });
+    if (connG.length){
+      var g1 = catSection('connected', 'Connected providers', 'ready to use', connG.length, false);
+      connG.forEach(function(p){ renderCard(p, g1); });
+    }
+    if (availG.length){
+      var g2 = catSection('', 'Available providers', 'add a free key to start', availG.length, true);
+      availG.forEach(function(p){ renderCard(p, g2); });
+    }
   }
 
   function wireCard(card, p){
