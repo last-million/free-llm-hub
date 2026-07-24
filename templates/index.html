@@ -285,7 +285,13 @@
   .badges{display:flex;gap:5px;margin-left:0;flex:none;flex-wrap:wrap;justify-content:flex-start}
   .badge{font-size:10.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;border-radius:5px;padding:2.5px 7px;white-space:nowrap}
   .badge.free{background:var(--accent-soft);color:var(--accent)}
-  .badge.trial{background:var(--info-soft);color:var(--info)}
+  /* Trial-credit badge: a ONE-TIME credit grant, not a recurring free tier — it
+     stops working the day the balance runs out (402 / "insufficient credits").
+     inline-flex + gap so the hourglass SVG sits on the text baseline; cursor:help
+     advertises the title tooltip that explains what "trial" actually means. */
+  .badge.trial{background:var(--info-soft);color:var(--info);
+    display:inline-flex;align-items:center;gap:4px;cursor:help}
+  .badge.trial svg{flex:none;opacity:.9}
   .badge.paid{background:var(--warn-soft);color:var(--warn)}
   .badge.keyed{background:var(--surface-3);color:var(--text-dim)}
   .notes{font-size:12.5px;color:var(--text-dim);line-height:1.55}
@@ -2376,6 +2382,12 @@
 
   var EYE_SVG = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
   var X_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+  // Trial-credit badge. Inline SVG (not an emoji) so it inherits currentColor and
+  // matches every other icon in this file. The tooltip is the whole point of the
+  // badge: "free" and "one-time credits that run out" look identical until a
+  // provider suddenly starts 402-ing.
+  var HOURGLASS_SVG = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2h12M6 22h12"/><path d="M8 2v4.5c0 1.2 4 3.4 4 5.5s-4 4.3-4 5.5V22"/><path d="M16 2v4.5c0 1.2-4 3.4-4 5.5s4 4.3 4 5.5V22"/></svg>';
+  var TRIAL_TIP = 'One-time credits — stops working when they run out (not a recurring free tier)';
   var KEY_WARN = '⚠ Using several keys for the same provider to get around free limits may break their terms and can get your accounts banned. Use your own keys responsibly.';
 
   // ONLY these three have no free tier at all (pure paid). Every other provider
@@ -2416,7 +2428,7 @@
     var hasFree = fmCount > 0 || (p.paid && !PURE_PAID[p.id]);
     if (hasFree) badges += '<span class="badge free">free</span>';
     if (p.paid) badges += '<span class="badge paid">paid</span>';
-    if (p.trial) badges += '<span class="badge trial">trial</span>';
+    if (p.trial) badges += '<span class="badge trial" title="' + esc(TRIAL_TIP) + '">' + HOURGLASS_SVG + 'Trial credits</span>';
     if (!hasFree && !p.paid && !p.trial) badges += '<span class="badge free">free</span>';
     if (p.has_key) badges += '<span class="badge keyed">' + kc + ' key' + (kc > 1 ? 's' : '') + ' saved</span>';
 
