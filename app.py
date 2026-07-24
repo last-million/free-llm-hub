@@ -716,6 +716,46 @@ def _normalize_image_url(value):
     return obj
 
 
+def _repair_tool_arguments(s):
+    """A tool-call `arguments` field must be exactly ONE JSON value. Some upstreams
+    stream cumulative or duplicated argument deltas which the gateway concatenated into
+    'X{...}' — two JSON values back-to-back. Strict providers (google/groq/cerebras)
+    then reject the WHOLE request with 400 'invalid character { after top-level value',
+    and because the malformed tool_call sits in the conversation it re-poisons EVERY
+    later turn — one bad tool_call 503s the CLI forever. Return a single valid JSON
+    string: unchanged when already valid, the FIRST complete JSON value when there is
+    trailing junk, else '{}' (empty args beats a hard 400 every turn)."""
+    if not isinstance(s, str):
+        return s
+    t = s.strip()
+    if not t:
+        return s
+    try:
+        json.loads(t)
+        return s                      # already a single valid JSON value — leave as-is
+    except ValueError:
+        pass
+    try:
+        obj, _end = json.JSONDecoder().raw_decode(t)  # first value; ignore trailing junk
+        return json.dumps(obj)
+    except ValueError:
+        return "{}"
+
+
+def _repair_message_tool_calls(row):
+    """Heal malformed tool-call arguments on one message (in place). Shared by all 3
+    CLI endpoints via _normalize_openai_messages so a poisoned agentic history self-
+    heals on the next turn instead of 503-ing forever. See _repair_tool_arguments."""
+    tcs = row.get("tool_calls")
+    if not isinstance(tcs, list):
+        return
+    for tc in tcs:
+        if isinstance(tc, dict):
+            fn = tc.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                fn["arguments"] = _repair_tool_arguments(fn["arguments"])
+
+
 def _normalize_openai_messages(messages):
     """Validate/canonicalize message content and return (messages, image_count).
 
@@ -729,6 +769,7 @@ def _normalize_openai_messages(messages):
         if not isinstance(message, dict):
             raise ValueError("each message must be an object")
         row = copy.deepcopy(message)
+        _repair_message_tool_calls(row)  # un-poison doubled tool_call arguments (all CLIs)
         content = row.get("content")
         if not isinstance(content, list):
             out.append(row)
@@ -2504,6 +2545,8 @@ def _upstream_chat(pid, payload, stream):
         if resp.status_code == 400:               # learn a small context window from the error
             _learn_context_limit(pid, payload.get("model"), resp)
             _maybe_mark_missing_model(pid, payload.get("model"), resp)  # gone/renamed id -> sideline
+        if resp.status_code == 413:               # 'too large for this model's TPM' -> learn the cap
+            _learn_tpm_limit(pid, payload.get("model"), resp)
         if 200 <= resp.status_code < 300:
             quota.note_success(pid)  # provider answered -> clear its 429-backoff streak
             quota.note_model_success(pid, payload.get("model"))  # and THIS model's streak
@@ -2716,6 +2759,36 @@ def _learn_context_limit(pid, model, resp):
             limit = int(m.group(1))
             break
     if not limit or limit < 1000:
+        return
+    with _model_max_input_lock:
+        cur = _MODEL_MAX_INPUT.get((pid, model))
+        _MODEL_MAX_INPUT[(pid, model)] = min(cur, limit) if cur else limit
+
+
+# A per-MINUTE token cap phrased as a size rejection: groq free is
+# 'Request too large ... on tokens per minute (TPM): Limit 8000, Requested 36430'.
+# Grab the LIMIT (8000), never the Requested figure — anchored on 'Limit' right
+# after the TPM/token-per-minute phrase so a big 'Requested N' can't be mismatched.
+_TPM_LIMIT_RE = re.compile(
+    r"(?:TPM|tokens[\s_-]*per[\s_-]*minute)[^0-9]{0,40}?Limit\s+(\d{3,7})", re.I)
+
+
+def _learn_tpm_limit(pid, model, resp):
+    """A 413 'request too large for the per-minute token budget' names a cap this
+    model can NEVER exceed in one request (groq free = 8000 TPM). Treat it as an
+    effective max-input so routing stops sending oversized agentic requests here —
+    they 413 100% of the time otherwise, burning a hop every turn. Best-effort."""
+    if not model:
+        return
+    try:
+        text = resp.text or ""
+    except Exception:
+        return
+    m = _TPM_LIMIT_RE.search(text)
+    if not m:
+        return
+    limit = int(m.group(1))
+    if limit < 1000:
         return
     with _model_max_input_lock:
         cur = _MODEL_MAX_INPUT.get((pid, model))
@@ -7001,7 +7074,7 @@ def _chat_to_responses(chat_json, model_label):
             "id": "fc_" + uuid.uuid4().hex,
             "call_id": tc.get("id"),
             "name": fn.get("name") or "",
-            "arguments": fn.get("arguments") or "",
+            "arguments": _repair_tool_arguments(fn.get("arguments") or ""),
             "status": "completed",
         })
     usage = chat_json.get("usage") or {}
@@ -7170,7 +7243,9 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
             done_items.append((text_index, item))
 
         for _oai_idx, st in sorted(tools.items(), key=lambda kv: kv[1]["out_index"]):
-            full_args = "".join(st["args"])
+            # Repair before emitting so we never hand the CLI a doubled-JSON tool_call
+            # that it will replay and 503 on every later turn (see _repair_tool_arguments).
+            full_args = _repair_tool_arguments("".join(st["args"]))
             yield _sse_event("response.function_call_arguments.done", {
                 "type": "response.function_call_arguments.done",
                 "item_id": st["item_id"], "output_index": st["out_index"],
@@ -7282,6 +7357,7 @@ def v1_responses():
     errors = _HopErrors()
     last_hard = None  # last hard (non-retryable) upstream error, relayed if chain is exhausted
     _tried = []  # DIAG: every hop the chain actually offered (root-cause the 503s)
+    _err_bodies = {}  # DIAG: first raw error body per (pid:status) — reveals soft-400 reasons
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools):
         _tried.append(hop_pid + "/" + hop_model)
@@ -7337,6 +7413,12 @@ def v1_responses():
             return jsonify(_chat_to_responses(data, model_label)), 200
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+            _ekey = "%s:%d" % (hop_pid, resp.status_code)  # DIAG: capture first raw body
+            if _ekey not in _err_bodies:
+                try:
+                    _err_bodies[_ekey] = _sanitize(resp.text)[:200]
+                except Exception:
+                    _err_bodies[_ekey] = "?"
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
@@ -7363,11 +7445,20 @@ def v1_responses():
     # DIAG (temporary): the access log only shows "503" — record WHY the responses
     # chain (Codex's path) exhausted so the real root cause is visible, not guessed.
     try:
+        _lh_body = "none"
+        if last_hard:
+            try:
+                _lh_body = (json.dumps(last_hard.get("json"))
+                            if last_hard.get("json") is not None
+                            else str(last_hard.get("text")))[:700]
+            except Exception:
+                _lh_body = "?"
         _log.warning(
-            "RESPONSES-503 stream=%s tools=%s images=%s est=%d hops=%d tried=[%s] errors=[%s] last_hard=%s",
+            "RESPONSES-503 stream=%s tools=%s images=%s est=%d hops=%d tried=[%s] errors=[%s] last_hard=%s body=%s bodies=%s",
             stream, has_tools, has_images, est, len(_tried), ", ".join(_tried),
             "; ".join(errors) or "none",
-            (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none")
+            (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none",
+            _lh_body, json.dumps(_err_bodies)[:1400])
     except Exception:
         pass
     if last_hard is not None:
