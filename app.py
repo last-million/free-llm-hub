@@ -107,6 +107,16 @@ STREAM_IDLE_TIMEOUT = 90         # seconds
 MODELS_READ_TIMEOUT = 10      # seconds (model discovery / key tests)
 MODEL_CACHE_TTL = 60          # seconds
 MAX_HOPS = 6                  # primary + up to 5 fallback models (across providers)
+# Agentic (tool-calling) requests — Codex / Claude Code / hermes / openclaw loops —
+# hammer the gateway far harder than a one-shot chat, so the small tool-capable pool
+# throttles together in bursts. Give that path a DEEPER fallback so a transient
+# multi-provider throttle window reaches the still-fresh models instead of 503-ing.
+TOOLS_MAX_HOPS = 10
+# Providers that enforce their free rate limit PER MODEL (not per account): one
+# model's per-minute 429 must NOT bench the whole provider — its sibling models each
+# keep their own budget. Google is 15 RPM *per model* (measured, see memory). Benching
+# all of Google on one gemini's burst is what thinned the agentic pool into a 503.
+_PER_MODEL_RATE_LIMIT_PROVIDERS = {"google"}
 
 MAX_IMAGE_COUNT = 8
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -2281,8 +2291,12 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         ordered = _rotate_band(ordered)
     else:
         ordered = fast + slow
+    # Agentic loops burn through the tool-capable pool in bursts, so give them a
+    # deeper chain (reaches the still-fresh sibling models when the top providers are
+    # momentarily throttled) than a one-shot chat needs.
+    hop_cap = TOOLS_MAX_HOPS if require_tools else MAX_HOPS
     for _score, pid, m in ordered:
-        if len(chain) >= MAX_HOPS:
+        if len(chain) >= hop_cap:
             break
         if (pid, m) not in seen:
             chain.append((pid, m))
@@ -2507,14 +2521,23 @@ def _upstream_chat(pid, payload, stream):
                 secs = float(retry_after) if retry_after else None
             except ValueError:
                 secs = None
+            daily_secs = None
             if secs is None:
                 # A DAILY allowance that is spent will not come back in 60s, and
                 # retrying it every minute burns a chain hop on every request for the
                 # rest of the day (Cloudflare: "you have used up your daily free
                 # allocation of 10,000 neurons"). Park it until the window actually
                 # resets instead — the same self-healing path, just with an honest ETA.
-                secs = _daily_exhaustion_secs(pid, resp)
-            quota.mark_throttled(pid, secs or 60)
+                daily_secs = _daily_exhaustion_secs(pid, resp)
+                secs = daily_secs
+            # Per-model-limited providers (Google: 15 RPM PER MODEL): a per-minute
+            # burst 429 on ONE model must not bench the whole fleet — the sibling
+            # models each still have budget and are exactly the capacity that keeps an
+            # agentic loop off a 503. Park only the offending model for the short burst;
+            # only bench the whole provider when the DAILY window is truly spent.
+            per_model_only = pid in _PER_MODEL_RATE_LIMIT_PROVIDERS and daily_secs is None
+            if not per_model_only:
+                quota.mark_throttled(pid, secs or 60)
             # ALSO park just this model: it survives provider note_success(), so when
             # a sibling model revives the provider, the id that actually 429'd stays
             # sidelined instead of being re-picked and 429'ing again.
@@ -6822,6 +6845,12 @@ def v1_chat_completions():
     # Chain exhausted. Tell the client HOW LONG until a model frees (Retry-After) so
     # its SDK waits out a short throttle and auto-continues once capacity returns.
     eta = _capacity_eta()
+    try:  # DIAG (temporary): record WHY the chat chain exhausted (any CLI's 503).
+        _log.warning("CHAT-503 stream=%s tools=%s images=%s est=%d errors=[%s] last_hard=%s",
+                     stream, has_tools, has_images, est, "; ".join(errors) or "none",
+                     (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none")
+    except Exception:
+        pass
     if last_hard is not None:
         if last_hard["json"] is not None:
             return _with_retry_after(
@@ -7252,8 +7281,10 @@ def v1_responses():
     stream = bool(body.get("stream"))
     errors = _HopErrors()
     last_hard = None  # last hard (non-retryable) upstream error, relayed if chain is exhausted
+    _tried = []  # DIAG: every hop the chain actually offered (root-cause the 503s)
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools):
+        _tried.append(hop_pid + "/" + hop_model)
         if not prov.is_model_allowed(hop_model):
             continue
         if stream and _is_sub(hop_pid):
@@ -7329,6 +7360,16 @@ def v1_responses():
     # Chain exhausted. Tell the client HOW LONG until a model frees (Retry-After) so
     # its SDK waits out a short throttle and auto-continues once capacity returns.
     eta = _capacity_eta()
+    # DIAG (temporary): the access log only shows "503" — record WHY the responses
+    # chain (Codex's path) exhausted so the real root cause is visible, not guessed.
+    try:
+        _log.warning(
+            "RESPONSES-503 stream=%s tools=%s images=%s est=%d hops=%d tried=[%s] errors=[%s] last_hard=%s",
+            stream, has_tools, has_images, est, len(_tried), ", ".join(_tried),
+            "; ".join(errors) or "none",
+            (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none")
+    except Exception:
+        pass
     if last_hard is not None:
         if last_hard["json"] is not None:
             return _with_retry_after(
@@ -7845,6 +7886,12 @@ def v1_messages():
         continue
     # Chain exhausted -> Retry-After so the client waits out a short throttle + auto-continues.
     eta = _capacity_eta()
+    try:  # DIAG (temporary): record WHY the messages chain exhausted (Claude Code's 503).
+        _log.warning("MESSAGES-503 stream=%s tools=%s images=%s est=%d errors=[%s] last_hard=%s",
+                     stream, has_tools, has_images, est, "; ".join(errors) or "none",
+                     (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none")
+    except Exception:
+        pass
     if last_hard is not None:
         return _with_retry_after(_anthropic_error("api_error",
                                 "Upstream %s error (HTTP %d): %s"
