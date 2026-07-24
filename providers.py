@@ -132,9 +132,41 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://integrate.api.nvidia.com/v1/models",
         "signup_url": "https://build.nvidia.com/settings/api-keys",
         "key_hint": "nvapi-...",
-        "paid": True,  # TRIAL credits, NOT a free tier — keep OUT of free routing
-        "free_filter": "pricing_zero",
-        "default_free_models": [],
+        # 2026-07-24 RE-CLASSIFIED (owner decision, live-probed). Was
+        # paid=True + pricing_zero, which made is_free_model() return False for
+        # EVERY id (providers.py:1143) -> the hub reported "0 free models" and
+        # never routed here. A full-catalog probe (97 chat ids) found
+        # **39 WORKING** models and ZERO 402s: nemotron-3-ultra-550b-a55b,
+        # deepseek-v4-pro/flash, llama-4-maverick, llama-3.3-70b, minimax-m3,
+        # qwen3-next-80b, mistral-small-4-119b, step-3.7-flash, gpt-oss-20b...
+        # So the credits are live and the capacity is real. trial=True keeps the
+        # "Trial credits" badge so the finite/expiring balance stays visible, and
+        # a real 402 ("Cloud credits expired") still sidelines the provider via
+        # the normal authfail path — so enabling this cannot fail silently.
+        # pricing_zero is impossible here (NVIDIA's /models returns no pricing),
+        # hence "all" + an exclude list for the legacy ids that 404.
+        "paid": False,
+        "trial": True,  # finite 1,000-credit lifetime budget (90-day expiry); 402s once spent
+        "free_filter": "all",
+        "exclude_families": [
+            # probed 2026-07-24: these 404 (retired) or are non-chat
+            "yi-large", "fuyu", "jamba", "sea-lion", "starcoder", "dbrx",
+            "codegemma", "deplot", "coder-6.7b", "bge", "embed", "rerank",
+            "nemoguard", "nemoretriever", "ocr", "parakeet", "riva", "clip",
+        ],
+        "default_free_models": [
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "deepseek-ai/deepseek-v4-pro",
+            "deepseek-ai/deepseek-v4-flash",
+            "meta/llama-4-maverick-17b-128e-instruct",
+            "meta/llama-3.3-70b-instruct",
+            "qwen/qwen3-next-80b-a3b-instruct",
+            "minimaxai/minimax-m3",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "mistralai/mistral-small-4-119b-2603",
+            "stepfun-ai/step-3.7-flash",
+            "openai/gpt-oss-20b",
+        ],
         "notes": "TRIAL, not a free tier — 1,000 lifetime credits (max 5,000 via business email), 90-day expiry, then HTTP 402 'Cloud credits expired'. Not renewable: every remote call to an NVIDIA-hosted endpoint spends the balance. Self-hosting the NIM containers is separately free for Developer Program members.",
     },
     "morph": {
@@ -143,9 +175,27 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.morphllm.com/v1/models",
         "signup_url": "https://morphllm.com/dashboard",
         "key_hint": "sk-...",
-        "paid": True,  # credit allowance, NOT a free tier — keep OUT of free routing
-        "free_filter": "pricing_zero",
-        "default_free_models": [],
+        # 2026-07-24 RE-CLASSIFIED (same bug as nvidia): paid=True made
+        # is_free_model() reject every id, so the hub showed "0 free models"
+        # even though a live probe answered 200 on TEN of them (morph-v3-large,
+        # morph-v3-fast, auto, morph-compactor, morph-minimax3-428b,
+        # morph-minimax27-230b, morph-gemma4-31b, morph-dsv4flash,
+        # deepseek/deepseek-v4-flash[-20260423]). The monthly TOKEN allowance is
+        # partly spent (3 ids already 402 "Monthly quota exceeded"), so this is
+        # genuinely finite — trial=True keeps that visible and a real 402 still
+        # sidelines the provider. pricing_zero yields [] here (no pricing field).
+        "paid": False,
+        "trial": True,  # 250K tokens/month, token-metered; 402s when spent
+        "free_filter": "all",
+        "exclude_families": ["computer-use", "warp-grep", "embed", "rerank"],
+        "default_free_models": [
+            "morph-v3-large",
+            "morph-v3-fast",
+            "morph-minimax3-428b",
+            "morph-dsv4flash",
+            "deepseek/deepseek-v4-flash",
+            "morph-gemma4-31b",
+        ],
         "notes": "No free models — all 8 models bill per token. The '200 req free every month' headline actually meters TOKENS ($2.50 / 250K credits per month): a coding CLI's 20-50K-token turns make the real allowance ~5-12 requests/month.",
     },
     "nararouter": {
@@ -178,7 +228,13 @@ PROVIDERS: Dict[str, dict] = {
             "agnes-2.0-flash",      # verified 200, 7.5s
             "mistral-large",        # verified 200, 2.1s
             "mistral-medium-3-5",   # verified 200, 1.8s
-            "tencent-hy3",          # verified 200, 4.5s
+            # "tencent-hy3",        # PULLED 2026-07-24: now 402 "Insufficient
+            #   credits. Please top up your balance." hy3 carries the +135
+            #   preference floor (_PREF_FLOORS), so it was tried FIRST on every
+            #   agentic request and 402'd every time — burning the top slot of
+            #   the chain and pushing Codex down to cerebras/gpt-oss-120b on
+            #   every turn. Re-enable the moment the NaraRouter balance is
+            #   topped up (it answered 200 in 4.5s when it had credit).
         ],
         # Same 4 ids: this list is served WITHOUT a free-ness re-check when live
         # discovery fails, so it must never contain an unverified id.
@@ -189,7 +245,7 @@ PROVIDERS: Dict[str, dict] = {
             "agnes-2.0-flash",
             "mistral-large",
             "mistral-medium-3-5",
-            "tencent-hy3",
+            # "tencent-hy3",  # PULLED 2026-07-24 - 402 insufficient credits (see above)
         ],
         "notes": ("SETUP - the key does NOT work until you do these 2 steps (verified live 2026-07-15). "
                   "STEP 1: link your Telegram account at router.bynara.id/settings. "
@@ -424,9 +480,37 @@ PROVIDERS: Dict[str, dict] = {
         # gemini-3.5-flash / 3.1-flash-lite / 2.5-pro are unaffected.
         # The dead-tracker is the safety net, NOT the fix - it only reacts after
         # a wasted call.
-        "exclude_families": ["gemini-2.5-flash"],
+        #
+        # RE-PROBED 2026-07-24 (live, real key) — the note above about 2.5-pro
+        # being free is NOW STALE. Google's API answers with an explicit
+        # `limit: 0` free-tier quota for these ids, i.e. NO free tier at all
+        # (not "quota spent"): gemini-2.5-pro, gemini-2.0-flash(-001),
+        # gemini-2.0-flash-lite(-001), gemini-2.5-computer-use, gemini-3-pro-
+        # preview, gemini-3.1-pro-preview, gemini-omni-flash-preview,
+        # gemini-pro-latest, lyria-*, nano-banana-pro. Because "flash" also
+        # matches gemini-2.0-flash* and "2.5-pro" whitelisted a dead id, the
+        # router kept picking models that can NEVER serve free -> every pick
+        # burned a 429 and looked like "Gemini free tier is broken".
+        # CONFIRMED-FREE on the same probe (HTTP 200): gemini-3-flash-preview,
+        # gemini-3.1-flash-lite(-preview), gemini-3.5-flash-lite,
+        # gemini-flash-lite-latest, gemma-4-26b-a4b-it, gemma-4-31b-it, plus
+        # gemini-3.5-flash / 3.6-flash / gemini-flash-latest (reasoning models:
+        # answer once max_tokens is large enough).
+        # Google no longer PUBLISHES per-model free RPM/RPD (docs defer to AI
+        # Studio), so limits stay dynamically learned from real 429 headers
+        # rather than hardcoded to an invented number.
+        "exclude_families": [
+            "gemini-2.5-flash",   # retired for new users (404)
+            "gemini-2.0",         # limit: 0 - no free tier
+            "gemini-2.5-pro",     # limit: 0 - no free tier (was free, no longer)
+            "-pro-preview",       # gemini-3/3.1-pro-preview: limit: 0
+            "pro-latest",         # gemini-pro-latest: limit: 0
+            "omni",               # gemini-omni-flash-preview: limit: 0
+            "computer-use",       # limit: 0
+            "lyria", "nano-banana",
+        ],
         "free_filter": "family",
-        "free_families": ["flash", "gemma", "2.5-pro"],
+        "free_families": ["flash", "gemma"],
         # Probed 2026-07-15: these 6 answered AND all read text out of a test
         # PNG (real vision). gemini-2.0-flash returned 429 = free quota spent by
         # probing, NOT broken, so it stays.
@@ -485,6 +569,13 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.sambanova.ai/v1/models",
         "signup_url": "https://cloud.sambanova.ai/apis",
         "key_hint": "...",
+        # PROBED 2026-07-24 with a real key: 402 "A payment method is required" —
+        # the free tier below is NOT being applied on a real account, so the only
+        # thing this key ever bought was the one-time $5 Developer credit. Flagged
+        # trial so the UI warns before a user relies on it. NB this contradicts the
+        # researched `notes` (and quota.py's 20/day row), which are deliberately
+        # left intact: the doc says one thing, the live 402 says another.
+        "trial": True,
         # 'family', not 'all': 'all' leaked MiniMax-M2.7, which is in the catalog
         # and the Developer-tier limits table but deliberately ABSENT from the
         # Free-tier table — it fails on a card-less account. These 4 families
@@ -508,6 +599,7 @@ PROVIDERS: Dict[str, dict] = {
         "signup_url": "https://huggingface.co/settings/tokens",
         "key_hint": "hf_...",
         "paid": True,  # credit allowance, NOT a free tier — keep OUT of free routing
+        "trial": True,  # quota.py FREE_LIMITS huggingface limit:0 — $0.10/MONTH of credits, not a request tier; PROBED 2026-07-24: 402 "You have depleted your monthly included credits"
         # Live router catalog: is_free:true matches EXACTLY 0 of 102 models, so
         # 'all' was admitting 100% paid inventory as free. NOTE for any future
         # pricing_zero implementation: HF nests pricing PER PROVIDER
@@ -524,6 +616,7 @@ PROVIDERS: Dict[str, dict] = {
         "signup_url": "https://console.scaleway.com/iam/api-keys",
         "key_hint": "...",
         "paid": True,  # card mandatory + silent billing — keep OUT of free routing
+        "trial": True,  # quota.py FREE_LIMITS scaleway limit:0 — card mandatory before the first call, then a ONE-TIME 1M-token allowance and silent billing after it
         "free_filter": "pricing_zero",
         "default_free_models": [],
         "notes": "No free tier — a validated payment method is MANDATORY before the first call. The only free part is a one-time 1,000,000-token allowance for new customers; after it, calls do NOT fail, they silently bill the card (llama-3.3-70b EUR 0.90/0.90 per M, glm-5.2 EUR 1.80/5.50) and NO response header exposes the remaining free tokens, so the switchover is undetectable. The old 'free beta' ended — the Generative API is GA with published per-token pricing.",
@@ -584,6 +677,7 @@ PROVIDERS: Dict[str, dict] = {
         "signup_url": "https://bailian.console.alibabacloud.com/",
         "key_hint": "sk-...",
         "paid": True,  # 90-day consumable trial, NOT a free tier — keep OUT of free routing
+        "trial": True,  # quota.py FREE_LIMITS qwen limit:0 — consumable 1M-tokens-PER-MODEL / 90-day trial, then AllocationQuota.FreeTierOnly on every call
         # The old families were leaky in both directions: 'air' matched ZERO Qwen
         # models (a GLM/Zhipu convention, copy-pasted), while bare 'plus'/'flash'/
         # 'lite' pulled in non-chat ids that break a CLI (qwen-mt-* translation,
@@ -763,6 +857,7 @@ PROVIDERS: Dict[str, dict] = {
         "signup_url": "https://chutes.ai",
         "key_hint": "cpk_...",
         "paid": True,  # free tier retired 2026-03-15 — keep OUT of free routing
+        "trial": True,  # quota.py FREE_LIMITS chutes limit:0 — free tier retired 2026-03-15 and the prior "200/day Early Access" always required a $5 deposit (a consumable balance, never a tier)
         # pricing_zero is mechanically supported here (the keyless endpoint DOES
         # expose pricing:{prompt,completion}) and correct under either the TEE or
         # full catalog — it just matches nothing today, which is the truth.
@@ -973,6 +1068,11 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://api.aiand.com/v1/models",
         "signup_url": "https://console.aiand.com/api-keys",
         "key_hint": "sk-...",
+        # PROBED 2026-07-24: /balance, /credits and /me ALL return 402 "Insufficient
+        # credits. Add credits at console.aiand.com" — prepaid only, no signup grant
+        # and no monthly grant. Worse, it MASKS the empty balance as a 404
+        # model_not_found on chat calls, so the card must say "trial" out loud.
+        "trial": True,
         # PROBED with a real key 2026-07-20 — the placeholder above is now resolved.
         # Of the 7 ids the live catalog advertises, exactly ONE answers:
         #   qwen/qwen3.6-27b              200  (vendor catalog lists it Free / Free)
