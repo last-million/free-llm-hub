@@ -945,8 +945,14 @@ def _classify_difficulty(messages, max_tokens=None):
 # apply_patch + history ≈ 15-40K) OFF the strong large-context models
 # (hy3/kimi/qwen3, all >=128K ctx) and onto the exhausted high-quota ones -> 503 storm.
 _PROVIDER_TPM = {
-    "groq": 120000, "github-models": 60000, "huggingface": 30000, "mistral": 120000,
-    "morph": 30000, "sambanova": 120000, "cerebras": 60000, "deepseek": 120000,
+    # groq free is a HARD 8000 tokens/minute — a single 30-42k agentic request 413s
+    # on it 100% of the time, so it must be prefiltered OFF large requests (it stays
+    # usable for the small turns it can actually hold). cerebras gpt-oss-120b is a
+    # real 128k context on a 14,400/day budget (the sustainable large-agentic
+    # workhorse) — 60000 wrongly dropped it once a growing conversation passed ~52k,
+    # exactly when it was needed most.
+    "groq": 8000, "github-models": 60000, "huggingface": 30000, "mistral": 120000,
+    "morph": 30000, "sambanova": 120000, "cerebras": 128000, "deepseek": 120000,
     "openrouter": 128000, "cohere": 100000, "nvidia": 250000, "google": 900000,
     "cloudflare": 120000, "nararouter": 120000, "kimi": 128000, "glm": 128000,
     "aiand": 120000, "xiaomi": 60000, "minimax": 120000,
@@ -2021,7 +2027,7 @@ def _spread_band(pool):
     band = [p for p in pool if p[0] >= top - _ORCH_BAND]
     # Quality first; among EQUAL-benchmark models prefer the one with more free
     # budget left (headroom never outranks quality — see _quota_headroom).
-    band.sort(key=lambda t: (-t[0], -round(_quota_headroom(t[1]), 1), t[1], t[2]))
+    band.sort(key=lambda t: (-_agentic_score(t), -round(_quota_headroom(t[1]), 1), t[1], t[2]))
     return band
 
 
@@ -2321,7 +2327,7 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # MUST be tried BEFORE a fast-but-weak model (mistral, score 56). Otherwise
         # the fast/slow split buries the strong deep-quota models behind mistral and
         # codex cascades onto mistral while they sit unused. FAIL-OPEN on tool-capable.
-        ordered = sorted(fast + slow, key=lambda t: (t[0], _quota_headroom(t[1])), reverse=True)
+        ordered = sorted(fast + slow, key=lambda t: (_agentic_score(t), _quota_headroom(t[1])), reverse=True)
         ordered = [e for e in ordered if _supports_tools(e[1], e[2])] or ordered
         # ROTATE the top band of the fallback too. Strict strength order means the
         # single highest-scored model is hop 2 of EVERY chain, so each time a primary
@@ -2793,6 +2799,31 @@ def _learn_tpm_limit(pid, model, resp):
     with _model_max_input_lock:
         cur = _MODEL_MAX_INPUT.get((pid, model))
         _MODEL_MAX_INPUT[(pid, model)] = min(cur, limit) if cur else limit
+
+
+def _sustain_penalty(pid):
+    """Score demotion (points) for a SCARCE daily budget, applied only in agentic
+    ordering. A coding CLI fires hundreds of turns; a 50/day tier (openrouter free)
+    drains in an hour and then 503s, so it must NOT out-rank the sustainable large
+    providers (cerebras 14,400/day, google 200/day, or any uncapped one) just because
+    its benchmark score is a couple points higher. 0 for uncapped / >=150-day budgets;
+    grows as the daily allowance shrinks below that (50/day -> ~6.7 points)."""
+    try:
+        s = quota.status(pid)
+    except Exception:
+        return 0.0
+    if not s.get("limit_known"):
+        return 0.0
+    lim = s.get("limit") or 0
+    if lim <= 0 or lim >= 150:
+        return 0.0
+    return (150 - lim) / 15.0
+
+
+def _agentic_score(entry):
+    """Benchmark score minus the scarce-budget penalty — the ordering key for agentic
+    (tool) routing so sustainable providers lead and the load actually spreads."""
+    return entry[0] - _sustain_penalty(entry[1])
 
 
 def _context_ok(pid, model, est):
