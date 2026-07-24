@@ -1077,6 +1077,22 @@ _provider_authfail = {}                # pid -> set(models that auth-failed this
 _provider_keyfail = set()              # pids that saw a real 401/402 this window
 _provider_dead_lock = threading.Lock()
 
+# CONSECUTIVE-HARD-FAILURE breaker — a status-agnostic safety net ON TOP OF
+# _mark_provider_authfail. The distinct-model rule above misses two real cases
+# seen live 2026-07-24: (1) a provider that MASKS an empty wallet as 404
+# model_not_found (aiand: /balance says 402 "Insufficient credits" but chat calls
+# 404) never trips the 401/402/403 counter at all; (2) a provider whose ONE hot
+# model repeatedly fails (nararouter/hy3 402) never reaches "2 DISTINCT models".
+# Both let a dead provider keep winning a chain slot on every request. This net
+# counts consecutive HARD failures (4xx that mean "produced no usable answer")
+# with NO 2xx in between; a single success resets it, so a provider that 404s on
+# a retired id but serves others (nvidia) never accumulates. Ignores 429/5xx
+# (transient / handled by mark_throttled) so a rate-limit blip can't park a
+# healthy provider. Same 30-min TTL + auto-re-probe as the rest.
+_PROVIDER_CONSEC_FAIL_THRESHOLD = 4
+_HARD_FAIL_STATUSES = (401, 402, 403, 404)
+_provider_consec_fail = {}             # pid -> consecutive hard-fails since last 2xx
+
 
 # A 429 whose body says the DAILY allowance (not a per-minute burst) is spent.
 # Cloudflare Workers AI is the concrete case: 10,000 neurons/day, reset 00:00 UTC,
@@ -1145,6 +1161,27 @@ def _mark_provider_authfail(pid, model, status):
             _dead_providers[pid] = time.time() + _PROVIDER_DEAD_TTL
 
 
+def _note_provider_result(pid, ok, hard_fail=False):
+    """Consecutive-hard-failure provider breaker (see _provider_consec_fail).
+    ok=True (any 2xx) clears the streak; hard_fail=True (a 4xx that produced no
+    usable answer, INCLUDING a 404-masked no-credit) increments it, and at the
+    threshold the whole provider is parked with the standard TTL + auto-re-probe.
+    Neither flag set (429/5xx) leaves the streak untouched."""
+    if not pid:
+        return
+    with _provider_dead_lock:
+        if ok:
+            _provider_consec_fail.pop(pid, None)
+            return
+        if not hard_fail:
+            return
+        n = _provider_consec_fail.get(pid, 0) + 1
+        _provider_consec_fail[pid] = n
+        if n >= _PROVIDER_CONSEC_FAIL_THRESHOLD:
+            _dead_providers[pid] = time.time() + _PROVIDER_DEAD_TTL
+            _provider_consec_fail.pop(pid, None)
+
+
 def _is_provider_dead(pid):
     with _provider_dead_lock:
         exp = _dead_providers.get(pid)
@@ -1154,6 +1191,7 @@ def _is_provider_dead(pid):
             _dead_providers.pop(pid, None)
             _provider_authfail.pop(pid, None)   # reset counter -> a clean re-probe
             _provider_keyfail.discard(pid)
+            _provider_consec_fail.pop(pid, None)
             return False
         return True
 
@@ -2455,6 +2493,7 @@ def _upstream_chat(pid, payload, stream):
         if 200 <= resp.status_code < 300:
             quota.note_success(pid)  # provider answered -> clear its 429-backoff streak
             quota.note_model_success(pid, payload.get("model"))  # and THIS model's streak
+            _note_provider_result(pid, ok=True)  # clear the consecutive-hard-fail streak
         # A 429 on a SINGLE key just rotates to the next key below. Only when the
         # LAST key also 429s (every key for this provider is rate-limited) do we
         # sideline the whole provider. And when there's no numeric Retry-After,
@@ -2491,6 +2530,13 @@ def _upstream_chat(pid, payload, stream):
         # provider so routing stops trying its other 20+ models every request.
         if resp.status_code in _AUTH_FAIL_STATUSES and is_last:
             _mark_provider_authfail(pid, payload.get("model"), resp.status_code)
+        # Consecutive-hard-failure safety net: increments on any 401/402/403/404
+        # (incl. a 404-masked empty wallet) with no 2xx in between, parks the whole
+        # provider at the threshold. 429/5xx leave the streak untouched.
+        if is_last and not (200 <= resp.status_code < 300):
+            _note_provider_result(
+                pid, ok=False,
+                hard_fail=resp.status_code in _HARD_FAIL_STATUSES)
         # Auth/rate-limit on this key -> try the next key before this provider
         # is given up on. On the last key, return it so the caller can react
         # (429/5xx -> provider fallback; 401/403 -> surfaced as an error).
