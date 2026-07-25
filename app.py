@@ -19,6 +19,7 @@ non-simple local-control header to prevent cross-site localhost requests.
 Run:  python app.py    (PORT env overrides default 8787)
 """
 
+import hashlib
 import hmac
 import base64
 import binascii
@@ -2082,6 +2083,75 @@ def _spread_pick_cheap(pool):
     return pick
 
 
+# Session affinity state: conversation-key -> (pid, model, expires_at).
+_SESSION_PIN_TTL = 4 * 3600     # a coding session comfortably outlives this
+_session_pins = {}
+_session_pin_lock = threading.Lock()
+
+
+def _session_key(messages):
+    """Stable id for a CONVERSATION, derived from the parts that do not change
+    as it grows: the system prompt plus the FIRST user turn. Later turns append
+    history, so hashing the whole thing would mint a new key every turn (which
+    is exactly the per-turn re-routing we're fixing). Returns None when there is
+    nothing stable to key on — then no pinning happens and behaviour is as before."""
+    try:
+        system_txt = ""
+        first_user = ""
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            content = m.get("content")
+            if isinstance(content, list):      # content-parts -> join their text
+                content = "".join(p.get("text") or "" for p in content
+                                  if isinstance(p, dict))
+            if not isinstance(content, str):
+                continue
+            if role == "system" and not system_txt:
+                system_txt = content
+            elif role == "user" and not first_user:
+                first_user = content
+            if system_txt and first_user:
+                break
+        basis = (system_txt[:4000] + "\x00" + first_user[:4000]).strip()
+        if len(basis) < 16:                    # too little to identify a session
+            return None
+        return hashlib.sha256(basis.encode("utf-8", "ignore")).hexdigest()[:20]
+    except Exception:
+        return None
+
+
+def _session_pin_get(key):
+    """(pid, model) pinned to this conversation, or None. Expired pins are dropped."""
+    if not key:
+        return None
+    now = time.time()
+    with _session_pin_lock:
+        row = _session_pins.get(key)
+        if not row:
+            return None
+        pid, model, exp = row
+        if exp <= now:
+            _session_pins.pop(key, None)
+            return None
+        return (pid, model)
+
+
+def _session_pin_set(key, pid, model):
+    """Pin this conversation to (pid, model). Also opportunistically evicts
+    expired rows so the dict cannot grow without bound in a long-lived process."""
+    if not (key and pid and model):
+        return
+    now = time.time()
+    with _session_pin_lock:
+        if len(_session_pins) > 512:
+            for k, (_p, _m, exp) in list(_session_pins.items()):
+                if exp <= now:
+                    _session_pins.pop(k, None)
+        _session_pins[key] = (pid, model, now + _SESSION_PIN_TTL)
+
+
 def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=False):
     """Pick (pid, model) by task difficulty across AVAILABLE providers that can
     also HANDLE the request size (skip small-TPM providers for big requests).
@@ -2135,30 +2205,42 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # Fail-open: if nothing clears the bar (all strong keys weak/exhausted), keep
         # the full pool rather than fail.
         agentic = [c for c in pool if c[0] >= _TOOLS_MIN_SCORE] or pool
-        if difficulty == "hard":
-            # HEAVY coding -> the STRONGEST, SPREAD across the top band (hy3 leads, then
-            # kimi/qwen/deepseek) so consecutive heavy turns + codex sub-agents mix the
-            # best models instead of pinning one and draining its quota.
-            picked = _spread_pick(agentic) or max(
-                agentic, key=lambda t: (t[0], _quota_headroom(t[1])))
-        else:
-            # LIGHTER coding (simple/medium sub-task) -> ALSO the strongest band.
-            # This used to rotate the CHEAP band to reserve the top models for heavy
-            # turns, but _classify_difficulty judges only the latest user turn, and a
-            # real agentic CLI turn ("now write styles.css", a tool result, a 40k
-            # context continuation) scores 'simple'/'medium' almost every time — so
-            # in practice EVERY coding turn landed on the WEAKEST models in the pool
-            # (the cheap band bottoms out at glm-4.7/kimi, incl. ids that 400 on a big
-            # request), which is exactly the "why doesn't it use the best models?"
-            # complaint. A coding agent's every turn is real work: a weak model writes
-            # worse code and the agent then burns MORE turns (and more quota) fixing
-            # it, so cheap-picking doesn't even save budget. Quota safety is already
-            # handled properly by _agentic_score/_sustain_penalty inside _spread_band
-            # (scarce tiers are demoted) and by _spread_pick rotating the top band, so
-            # strength-first no longer means draining one scarce provider.
-            picked = _spread_pick(agentic) or max(
-                agentic, key=lambda t: (t[0], _quota_headroom(t[1])))
+        # ════════════════════════════════════════════════════════════════════
+        # SESSION AFFINITY — one model per TASK, rotation only between tasks.
+        # Rotating per-TURN spread the load nicely but wrecked the OUTPUT: a
+        # coding agent builds a landing page over many turns, and each turn was
+        # answered by a different model with no idea what the previous one chose.
+        # Turn 1 writes one CSS approach, turn 2 restructures it another way,
+        # turn 3 changes it again -> incoherent, "fucked" result even though
+        # every individual model was strong and every request returned 200.
+        # So: pin the first model a conversation lands on and keep using it for
+        # that conversation. Quota spreading still happens — across SESSIONS,
+        # which is where it belongs — and if the pinned model becomes
+        # unavailable (throttled/dead/too small) it simply is not in `agentic`
+        # any more and we re-pick + re-pin. Nothing is ever forced.
+        # ════════════════════════════════════════════════════════════════════
+        _skey = _session_key(messages)
+        _pinned = _session_pin_get(_skey)
+        if _pinned:
+            for _c in agentic:
+                if (_c[1], _c[2]) == _pinned:
+                    return _pinned[0], _pinned[1], difficulty
+        # ALWAYS THE BEST AVAILABLE MODEL — no band rotation for agentic work.
+        # Rotating across a 30-point "top band" meant a landing page could be built
+        # by nemotron on one turn and gpt-oss on the next; both score well on a
+        # generic strength heuristic, neither is the best model on offer, and the
+        # mixture produced incoherent output. `agentic` has ALREADY been filtered to
+        # models that are available, not throttled, not exhausted, tool-capable and
+        # big enough for this request — so taking the maximum here means "the best
+        # model that can actually serve this request right now".
+        # This still self-balances: the moment the leader is rate-limited or spent
+        # it leaves the candidate list and the next-best takes over, which is real
+        # availability-driven spreading rather than artificial round-robin. Scarce
+        # tiers (openrouter 50/day) and de-prioritised families (qwen) stay demoted
+        # through _agentic_score, so "best" respects those preferences too.
+        picked = max(agentic, key=lambda t: (_agentic_score(t), _quota_headroom(t[1])))
         _s, pid, model = picked
+        _session_pin_set(_skey, pid, model)
         return pid, model, difficulty
     if difficulty == "hard":
         # Non-tool HARD -> strongest fast model (spread keeps variety across turns).
