@@ -2129,14 +2129,22 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
             picked = _spread_pick(agentic) or max(
                 agentic, key=lambda t: (t[0], _quota_headroom(t[1])))
         else:
-            # LIGHTER coding (simple/medium sub-task) -> ROTATE across the cheap band:
-            # the near-equal-cost models that are STILL STRONG. This leans on the
-            # deep-quota coders (gpt-oss-120b on cerebras 14400/day, glm-4.7,
-            # deepseek-v3) and SAVES the scarce top models (hy3 openrouter 50/day) for
-            # the heavy turns — "best by heaviness", never a weak model for coding, and
-            # never the SAME cheap model every light turn either.
-            picked = _spread_pick_cheap(agentic) or min(
-                agentic, key=lambda t: (t[0], -_quota_headroom(t[1])))
+            # LIGHTER coding (simple/medium sub-task) -> ALSO the strongest band.
+            # This used to rotate the CHEAP band to reserve the top models for heavy
+            # turns, but _classify_difficulty judges only the latest user turn, and a
+            # real agentic CLI turn ("now write styles.css", a tool result, a 40k
+            # context continuation) scores 'simple'/'medium' almost every time — so
+            # in practice EVERY coding turn landed on the WEAKEST models in the pool
+            # (the cheap band bottoms out at glm-4.7/kimi, incl. ids that 400 on a big
+            # request), which is exactly the "why doesn't it use the best models?"
+            # complaint. A coding agent's every turn is real work: a weak model writes
+            # worse code and the agent then burns MORE turns (and more quota) fixing
+            # it, so cheap-picking doesn't even save budget. Quota safety is already
+            # handled properly by _agentic_score/_sustain_penalty inside _spread_band
+            # (scarce tiers are demoted) and by _spread_pick rotating the top band, so
+            # strength-first no longer means draining one scarce provider.
+            picked = _spread_pick(agentic) or max(
+                agentic, key=lambda t: (t[0], _quota_headroom(t[1])))
         _s, pid, model = picked
         return pid, model, difficulty
     if difficulty == "hard":
@@ -2743,6 +2751,12 @@ _model_max_input_lock = threading.Lock()
 _CTX_LIMIT_PATS = (
     re.compile(r"only supports (\d{3,7})", re.I),
     re.compile(r"supports (\d{3,7})\s*tokens", re.I),
+    # cerebras/zai-glm-4.7: 'Please reduce the length of the messages or completion.
+    # Current length is 23633 while limit is 8192'. Nothing below matched that
+    # phrasing, so its real 8192 cap was never learned and routing kept offering it
+    # for 30k+ agentic turns — a guaranteed 400 + wasted hop on every request.
+    # Anchored on 'limit is' so it takes the CAP (8192), never the length (23633).
+    re.compile(r"limit is (\d{3,7})", re.I),
     re.compile(r"context (?:window|length)[^0-9]{0,20}?(\d{4,7})", re.I),
     re.compile(r"maximum(?: context)?(?: length| window)?[^0-9]{0,20}?(\d{4,7})", re.I),
 )
