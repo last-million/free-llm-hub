@@ -24,3 +24,4 @@ hub.err.log*
 hub.out.log
 hub.out.log*
 graphify-out/
+.opencode/
