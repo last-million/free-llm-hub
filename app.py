@@ -2834,7 +2834,14 @@ def _sustain_penalty(pid):
     drains in an hour and then 503s, so it must NOT out-rank the sustainable large
     providers (cerebras 14,400/day, google 200/day, or any uncapped one) just because
     its benchmark score is a couple points higher. 0 for uncapped / >=150-day budgets;
-    grows as the daily allowance shrinks below that (50/day -> ~6.7 points)."""
+    grows as the daily allowance shrinks below that.
+
+    Divisor 5.0 (was 15.0): the first cut demoted openrouter by only ~6.7 points
+    while the spread band is _ORCH_BAND (30) wide, so a 50/day tier stayed well
+    inside the band and still took ~half of all agentic picks — draining the
+    SCARCEST provider first while cerebras sat on 14,400/day. At /5 a 50/day tier
+    loses 20 points (nemotron 104 -> 84), which puts it below cerebras (98.8) and
+    google (101) instead of beside them. It stays in the fallback chain."""
     try:
         s = quota.status(pid)
     except Exception:
@@ -2844,7 +2851,7 @@ def _sustain_penalty(pid):
     lim = s.get("limit") or 0
     if lim <= 0 or lim >= 150:
         return 0.0
-    return (150 - lim) / 15.0
+    return (150 - lim) / 5.0
 
 
 def _agentic_score(entry):
