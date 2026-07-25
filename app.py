@@ -534,6 +534,9 @@ def _strong_new_version_score(low):
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
 _PREF_FLOORS = (135, 134)
+# User preference (2026-07-25): rank the qwen family LAST. Points subtracted from the
+# NATURAL score (not a floor), so the band/spread maths stay valid. See _benchmark_score.
+_PREF_QWEN_DEMOTION = 45
 
 
 def _benchmark_score(pid, model_id):
@@ -588,6 +591,16 @@ def _benchmark_score(pid, model_id):
     # kimi-k3 id (nothing lists it yet). Matches kimi-k3 / kimi-k3.x / .../kimi-k3.
     if "kimi-k3" in low or "kimik3" in low:
         score = max(score, _PREF_FLOORS[1])
+    # USER PREFERENCE (2026-07-25): the qwen family goes LAST. Not a measured verdict —
+    # the user prefers hy3 / kimi-k3 first and everything else ahead of qwen, with qwen
+    # kept only as a late fallback. Unlike the floors above this is a DEMOTION applied
+    # to the natural score, so the spread band still computes normally; it just moves
+    # every qwen id below the other candidates (the strongest, qwen3.5-397b at ~125,
+    # lands near ~80 — under gemini/cerebras/deepseek and below _TOOLS_MIN_SCORE, so it
+    # drops out of the agentic PRIMARY pool while remaining available in the fallback
+    # chain). Relative order WITHIN the qwen family is preserved.
+    if "qwen" in low:
+        score -= _PREF_QWEN_DEMOTION
     if (("mistral" in low or "mixtral" in low or "ministral" in low)
             and not any(k in low for k in ("mistral-large", "mistral-medium"))):
         score -= 14
