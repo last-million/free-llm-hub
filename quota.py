@@ -58,7 +58,20 @@ FREE_LIMITS = {
     "deepseek":      {"limit": 0,     "window": "day"},     # high: 2 models, both paid. The old 500/day was mis-derived from the v4-pro CONCURRENCY limit; no RPD/RPM is published anywhere.
     "nebius":        {"limit": 0,     "window": "day"},     # high: $1 trial credit, 30 days, bank card required at onboarding; no $0 models
     "xiaomi":        {"limit": 0,     "window": "day"},     # high: chat/LLM is pay-as-you-go or paid Token Plans; the only $0 models are TTS (non-chat, "limited time")
-    "nvidia":        {"limit": 0,     "window": "day"},     # medium: TRIAL, not a tier — a LIFETIME 1,000-credit budget (max 5,000, 90-day expiry) returning 402 "Cloud credits expired". The old 40/minute was a real rate baseline but never the binding constraint; a window counter cannot express a finite consumable balance.
+    # nvidia: was {"limit": 0} — but 0 means "researched: NO free tier", and that is
+    # not what nvidia is. Probed live 2026-07-25: it answers 200 with 88 usable
+    # models (deepseek-v4-pro, minimax-m3, glm-5.2, kimi-k2.6, nemotron-3-ultra;
+    # 250k ctx) and holds ranks 3-13 of the whole fleet. The documented zero was
+    # silently benching the best models we actually have — is_exhausted() returns
+    # True unconditionally for limit 0, so routing never picked it even once.
+    # The reasoning behind the 0 is still correct — it IS a finite lifetime credit
+    # balance (1,000 credits, 90-day expiry) and a per-window counter genuinely
+    # cannot express that — so the honest value is UNKNOWN, not zero: don't claim a
+    # budget we can't measure, and let real 402s retire it. When the credits do run
+    # out, "Cloud credits expired" trips _mark_provider_authfail + the
+    # consecutive-hard-failure breaker, which parks nvidia for 30min and re-probes,
+    # so it retires itself automatically instead of being permanently pre-banned.
+    "nvidia":        {"limit": None,  "window": "day", "unknown": True},
     "morph":         {"limit": 0,     "window": "month"},   # medium: the official "200 req free every month" headline meters TOKENS (250K/mo = $2.50); a coding CLI's 20-50K-token turns make the real allowance ~5-12 req/month, so 200 reported quota long after Morph starts rejecting.
     "qwen":          {"limit": 0,     "window": "day"},     # medium: consumable 1M-tokens-PER-MODEL / 90-day trial, then AllocationQuota.FreeTierOnly on every call. (Documented rate is 600 RPM with no per-day cap.)
 
