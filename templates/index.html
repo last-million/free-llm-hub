@@ -3133,7 +3133,13 @@
   function loadImages(silent){
     return api('/api/images').then(function(j){
       imagesState = (j && j.state) || {};
-      var models = (j && j.models) || [];
+      /* This picker only ever offers genuinely free image generation — paid
+         models (Google Nano Banana, OpenAI GPT Image, Higgsfield, ...) have no
+         free tier at all and would just fail then silently fall back to a free
+         provider, which is confusing ("I picked Gemini, why did I get a
+         Cloudflare image?"). Keeping them out of the list removes the dead-end
+         entirely instead of labeling it. */
+      var models = ((j && j.models) || []).filter(function(m){ return m.free !== false; });
 
       /* persisted "Image priority" select — same convention as Vision priority (media-primary) */
       var prSel = $('#image-priority');
