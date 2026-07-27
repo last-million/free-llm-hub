@@ -9243,6 +9243,14 @@ def _aihorde_generate_image(pcfg, model, prompt, size=1024, steps=4):
     headers = {"apikey": api_key, "Content-Type": "application/json",
                "Client-Agent": "free-llm-hub:1.0:https://github.com/last-million/free-llm-hub"}
     width, height = _parse_wh(size)
+    if not keys:
+        # MEASURED 2026-07-27: the anonymous key 0000000000 gets a real 403
+        # ("the client needs to already have the required kudos") for any
+        # request over 661x661px -- a real anti-abuse limit, not a fluke; the
+        # hub's own default size (1024x1024) blew straight past it. A
+        # personal key (real kudos balance) isn't capped the same way, so
+        # only clamp when actually running anonymous.
+        width, height = min(width, 640), min(height, 640)
     body = {"prompt": (prompt or "")[:2000],
             "params": {"width": width, "height": height, "steps": 20,
                        "sampler_name": "k_euler", "cfg_scale": 7.5},
