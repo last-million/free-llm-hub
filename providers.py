@@ -788,8 +788,28 @@ PROVIDERS: Dict[str, dict] = {
         "models_url": "https://opencode.ai/zen/v1/models",
         "signup_url": "https://opencode.ai/auth",
         "key_hint": "sk-...",
-        "free_filter": "pricing_zero",
-        "default_free_models": ["deepseek-v4-flash-free", "minimax-m2.5-free"],
+        # SWITCHED from 'pricing_zero' 2026-07-27: that filter fails closed with
+        # no live pricing data (by design — "don't claim free-ness we can't
+        # prove"), so it NEVER once picked up live catalog changes; the stale
+        # 'minimax-m2.5-free' (removed from OpenCode's own catalog, 401 on every
+        # call) sat undetected until manually re-verified. Their catalog already
+        # marks free ids with a bare '-free' suffix (mimo-v2.5-free, deepseek-v4-
+        # flash-free, ...) — same convention as openrouter's ':free', just a
+        # different literal suffix — so suffix_free + free_suffix makes this
+        # provider's free list genuinely LIVE: new/removed '-free' ids are
+        # detected automatically, no more hand-re-verification needed.
+        "free_filter": "suffix_free",
+        "free_suffix": "-free",
+        # RE-VERIFIED 2026-07-27 via the live /v1/models catalog + a real generation
+        # per id. Removed 'minimax-m2.5-free': not in the live catalog at all (401
+        # "Model minimax-m2.5-free is not supported" — the paid 'minimax-m2.5' exists,
+        # the '-free' suffix on it never did). Added 'north-mini-code-free' (confirmed:
+        # real content, cost 0) and 'mimo-v2.5-free' (real, cost 0, but a heavy
+        # reasoner — burned 500 tokens on reasoning_content with zero visible output in
+        # this probe; needs a generous max_tokens or reasoning-aware detection to be
+        # recognized as alive, same class of issue _peek_until_content already handles
+        # for streaming via saw_reasoning — see _finish()'s non-streaming probe path).
+        "default_free_models": ["deepseek-v4-flash-free", "north-mini-code-free", "mimo-v2.5-free"],
         "notes": "OpenCode's own multi-model gateway. Free = zero-priced '-free' models (DeepSeek/MiniMax/GLM/Nemotron).",
     },
     "llama": {
@@ -1130,7 +1150,13 @@ def is_free_model(provider_id: str, model_id: Optional[str],
     free_filter = prov.get("free_filter", "all")
     low = mid.lower()
     if free_filter == "suffix_free":
-        return low.endswith(":free")
+        # Default ':free' matches openrouter's convention; a provider whose own
+        # catalog marks free ids with a DIFFERENT suffix (opencode-zen uses a
+        # bare '-free', e.g. 'mimo-v2.5-free') overrides via free_suffix so its
+        # free-model list stays genuinely LIVE — new/removed '-free' ids are
+        # picked up automatically instead of needing a hand-maintained
+        # default_free_models list re-verified by hand every time it drifts.
+        return low.endswith(str(prov.get("free_suffix") or ":free"))
     if free_filter == "family":
         families = [f.lower() for f in (prov.get("free_families") or [])]
         if not families:
