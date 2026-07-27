@@ -9533,6 +9533,7 @@ def _images_payload():
                 "provider_name": p.get("name") or pid,
                 "label": row.get("label") or model,
                 "text_in_image": row.get("text_in_image"),
+                "free": row.get("free", True),
                 "configured": bool(pcfg.get("enabled") and
                                    (pcfg.get("api_key") or not _needs_key(pid))),
                 "dead": _is_model_dead(pid, model),
