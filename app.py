@@ -26,6 +26,7 @@ import binascii
 import copy
 import ipaddress
 import json
+import math
 import os
 import random
 import re
@@ -95,8 +96,17 @@ CHAT_READ_TIMEOUT = 300       # seconds (long NON-streaming generations)
 #   STREAM_FIRST_BYTE_TIMEOUT — max wait for the FIRST streamed byte before we give
 #     up on this provider and fall through to the next hop in the chain.
 #   STREAM_IDLE_TIMEOUT — the requests read timeout for streaming; bounds the gap
-#     between chunks once the stream is committed (a mid-stream stall fails in ~90s
-#     instead of 300s).
+#     between chunks. Only guards against a genuinely dead connection: the decision
+#     to abandon a SLOW-but-alive provider in favor of a fallback hop happens
+#     separately and much sooner, via STREAM_CONTENT_PEEK_TIMEOUT below (an
+#     independent thread-join, not this socket timeout) — once that peek has
+#     already committed the 200 to the client there is no fallback left to gain by
+#     cutting a still-working heavy reasoning model off early, so this is set close
+#     to CHAT_READ_TIMEOUT rather than far below it (a heavy reasoning model can go
+#     genuinely idle for well over a minute between the plan text and its first tool
+#     call on a large Codex-style prompt — confirmed via hub.err.log 'Read timed
+#     out' entries that lined up exactly with real builds stopping after the plan
+#     with zero tool calls, at the old 90s ceiling).
 STREAM_FIRST_BYTE_TIMEOUT = 25   # seconds
 # Bound for the "peek until real content" look-ahead that tells a genuine answer
 # from an empty 200 (some free providers return 200 then stream only a role delta +
@@ -104,7 +114,7 @@ STREAM_FIRST_BYTE_TIMEOUT = 25   # seconds
 # model emits content within a few seconds; this ceiling only bites a stream that
 # goes idle without ever producing content, which then falls through to the next model.
 STREAM_CONTENT_PEEK_TIMEOUT = 35  # seconds
-STREAM_IDLE_TIMEOUT = 90         # seconds
+STREAM_IDLE_TIMEOUT = 280        # seconds
 MODELS_READ_TIMEOUT = 10      # seconds (model discovery / key tests)
 MODEL_CACHE_TTL = 60          # seconds
 MAX_HOPS = 6                  # primary + up to 5 fallback models (across providers)
@@ -754,6 +764,57 @@ def _repair_tool_arguments(s):
         return json.dumps(obj)
     except ValueError:
         return "{}"
+
+
+# Git-diff preamble lines a strict CLI's apply_patch parser does not expect. Codex's
+# parser (and most agentic apply_patch implementations) accept EITHER its own V4A
+# envelope ("*** Begin Patch" / "*** Update File: ...") OR a bare unified diff
+# ("--- a/f\n+++ b/f\n@@ ...") — but NOT git's full `diff --git` header block. A model
+# trained mostly on `git diff` output naturally includes that header even when asked
+# for a plain patch, and the payload is otherwise perfectly correct: the SAME hunk body
+# that works from other models is sitting right after these lines.
+# MEASURED 2026-07-27: deepseek-v4-pro (nvidia) emitted exactly this shape —
+#   'diff --git a/hello.txt b/hello.txt\nnew file mode 100644\nindex 0000000..45b983b\n
+#    --- /dev/null\n+++ b/hello.txt\n@@ -0,0 +1 @@\n+hi'
+# — and codex_core::tools::router rejected the WHOLE turn with "Fatal error: tool
+# apply_patch invoked with incompatible payload", producing zero files despite the
+# patch itself being valid. Earlier fix (_TOOL_DIALECT_MISMATCH) demoted such models
+# out of agentic routing entirely — correct as a stopgap, wrong as the end state: it
+# throws away a model's real capability over a fixable formatting quirk. Normalizing
+# the payload is strictly better than excluding the model.
+_GIT_DIFF_PREAMBLE_RE = re.compile(
+    r"^(?:diff --git .*|index [0-9a-fA-F]{4,40}\.\.[0-9a-fA-F]{4,40}(?: \d+)?|"
+    r"new file mode \d+|deleted file mode \d+|old mode \d+|new mode \d+|"
+    r"similarity index \d+%|dissimilarity index \d+%|"
+    r"rename (?:from|to) .*|copy (?:from|to) .*)\n",
+    re.MULTILINE,
+)
+
+
+def _normalize_apply_patch_diff(name, arguments):
+    """Strip git's `diff --git` header block from an apply_patch tool call's
+    `input`, leaving the bare unified-diff hunk a CLI's parser actually expects.
+    Only touches the apply_patch tool (name check) and only when the payload
+    parses as JSON with a string `input` field containing the git preamble —
+    anything else (a different tool, an already-clean patch, a malformed
+    payload _repair_tool_arguments will handle separately) passes through
+    byte-for-byte unchanged. Never raises."""
+    if name != "apply_patch" or not isinstance(arguments, str) or "diff --git" not in arguments:
+        return arguments
+    try:
+        obj = json.loads(arguments)
+    except ValueError:
+        return arguments
+    if not isinstance(obj, dict) or not isinstance(obj.get("input"), str):
+        return arguments
+    cleaned = _GIT_DIFF_PREAMBLE_RE.sub("", obj["input"])
+    if cleaned == obj["input"]:
+        return arguments  # nothing matched — leave untouched rather than re-serialize for no reason
+    obj["input"] = cleaned
+    try:
+        return json.dumps(obj)
+    except (TypeError, ValueError):
+        return arguments
 
 
 def _repair_message_tool_calls(row):
@@ -2271,6 +2332,48 @@ def _session_pin_set(key, pid, model):
         _session_pins[key] = (pid, model, now + _SESSION_PIN_TTL)
 
 
+_AGENTIC_PICK_TEMPERATURE = 5.0  # score points at which weight roughly e-folds
+
+
+def _weighted_pick(pool, sustain_override=None):
+    """Pick one (score, pid, model) from `pool` with OpenRouter's own approach to
+    provider selection, not a strict argmax: OpenRouter's documented default
+    routing weights stable providers by the INVERSE SQUARE of price (a provider
+    3x cheaper gets 9x the traffic, not 100%) rather than always sending every
+    request to the single cheapest one. This is that idea applied to quality
+    instead of price — softmax over _agentic_score at a temperature where a
+    close competitor (a few points back) wins a real, meaningful minority of
+    picks, while one 20+ points back is picked only rarely.
+    Deterministic max() (tried first this session) starved every provider but
+    the single highest scorer, every NEW session, forever — confirmed live via
+    /api/activity showing nvidia picked as the sole primary across every fresh
+    request. Wide-band rotation (tried before that) mixed genuinely different-
+    strength models turn to turn on the SAME build and produced incoherent
+    output — this sits between the two. Session pinning (the caller, unchanged)
+    still keeps one session on whichever model this returns.
+
+    `sustain_override` — see _model_identity_min_penalty — lets a scarce-quota
+    copy of a model that also exists uncapped elsewhere in `pool` compete on
+    the uncapped copy's penalty instead of its own."""
+    if len(pool) <= 1:
+        return pool[0]
+    scores = [_agentic_score(c, sustain_override) for c in pool]
+    best = max(scores)
+    weights = [math.exp((s - best) / _AGENTIC_PICK_TEMPERATURE)
+               * (0.5 + 0.5 * _quota_headroom(c[1]))
+               for c, s in zip(pool, scores)]
+    total = sum(weights)
+    if total <= 0:
+        return max(pool, key=lambda t: (_agentic_score(t, sustain_override), _quota_headroom(t[1])))
+    r = random.random() * total
+    acc = 0.0
+    for c, w in zip(pool, weights):
+        acc += w
+        if r <= acc:
+            return c
+    return pool[-1]  # float-rounding fallback
+
+
 def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=False):
     """Pick (pid, model) by task difficulty across AVAILABLE providers that can
     also HANDLE the request size (skip small-TPM providers for big requests).
@@ -2344,19 +2447,13 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
             for _c in agentic:
                 if (_c[1], _c[2]) == _pinned:
                     return _pinned[0], _pinned[1], difficulty
-        # ALWAYS THE BEST AVAILABLE MODEL — no band rotation for agentic work.
-        # Rotating across a 30-point "top band" meant a landing page could be built
-        # by nemotron on one turn and gpt-oss on the next; both score well on a
-        # generic strength heuristic, neither is the best model on offer, and the
-        # mixture produced incoherent output. `agentic` has ALREADY been filtered to
-        # models that are available, not throttled, not exhausted, tool-capable and
-        # big enough for this request — so taking the maximum here means "the best
-        # model that can actually serve this request right now".
-        # This still self-balances: the moment the leader is rate-limited or spent
-        # it leaves the candidate list and the next-best takes over, which is real
-        # availability-driven spreading rather than artificial round-robin. Scarce
-        # tiers (openrouter 50/day) and de-prioritised families (qwen) stay demoted
-        # through _agentic_score, so "best" respects those preferences too.
+        # WEIGHTED pick, not strict argmax — see _weighted_pick. `agentic` has
+        # ALREADY been filtered to models that are available, not throttled, not
+        # exhausted, tool-capable and big enough for this request — so this picks
+        # from "the models that can actually serve this request right now",
+        # strongly favoring the best one without starving every close competitor.
+        # Scarce tiers (openrouter 50/day) and de-prioritised families (qwen) stay
+        # demoted through _agentic_score, so the weighting still respects those.
         # Prefer models PROVEN to drive a CLI to completion. Strength only counts
         # if the CLI can actually execute what the model emits — a brilliant model
         # whose tool payloads codex rejects builds nothing at all (measured: three
@@ -2364,8 +2461,8 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # Fail-OPEN: if none of the proven models can serve this request right now,
         # fall back to the full agentic pool rather than refusing to answer.
         _proven = [c for c in agentic if _is_tool_proven(c[2])]
-        picked = max(_proven or agentic,
-                     key=lambda t: (_agentic_score(t), _quota_headroom(t[1])))
+        _pool = _proven or agentic
+        picked = _weighted_pick(_pool, _model_identity_min_penalty(_pool))
         _s, pid, model = picked
         _session_pin_set(_skey, pid, model)
         return pid, model, difficulty
@@ -2516,6 +2613,39 @@ def _rotate_band(ordered):
     return band[off:] + band[:off] + rest
 
 
+def _interleave_by_provider(ordered):
+    """Re-arrange a strength-sorted [(score, pid, model), ...] list so
+    consecutive entries favor DIFFERENT providers: round 1 = each provider's
+    best model (providers visited in the order their own best entry ranks —
+    already the case since `ordered` arrives strength-sorted and this only
+    reorders INTER-provider adjacency), round 2 = each provider's 2nd-best,
+    etc. Each provider's own internal strength order is untouched.
+    MEASURED 2026-07-27: a real agentic chain had 3 straight nvidia hops
+    (nemotron-3-ultra timeout -> kimi-k2.6 404 -> glm-5.2) while 13 other
+    available, fresh providers (cerebras 14,400/day, groq 1000/day, ...) sat
+    untried, because nvidia's catalog alone had 3+ models that outranked every
+    other provider's best — the flat sort this replaces had no cross-provider
+    diversity despite _build_chain's own docstring claiming it did. Without
+    this, one provider's account-level outage/429 can eat several consecutive
+    fallback hops before a healthy provider is ever reached."""
+    buckets, order_by_pid = {}, []
+    for e in ordered:
+        pid = e[1]
+        if pid not in buckets:
+            buckets[pid] = []
+            order_by_pid.append(pid)
+        buckets[pid].append(e)
+    result = []
+    round_idx = 0
+    while len(result) < len(ordered):
+        for pid in order_by_pid:
+            b = buckets[pid]
+            if round_idx < len(b):
+                result.append(b[round_idx])
+        round_idx += 1
+    return result
+
+
 def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_tools=False):
     """Priority-ordered [(pid, model)] fallback chain. Primary first, then the
     next-best MODELS across every AVAILABLE, size-capable provider, INTERLEAVED
@@ -2557,8 +2687,17 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # MUST be tried BEFORE a fast-but-weak model (mistral, score 56). Otherwise
         # the fast/slow split buries the strong deep-quota models behind mistral and
         # codex cascades onto mistral while they sit unused. FAIL-OPEN on tool-capable.
-        ordered = sorted(fast + slow, key=lambda t: (_agentic_score(t), _quota_headroom(t[1])), reverse=True)
+        _sustain_map = _model_identity_min_penalty(fast + slow)
+        ordered = sorted(fast + slow,
+                         key=lambda t: (_agentic_score(t, _sustain_map), _quota_headroom(t[1])),
+                         reverse=True)
         ordered = [e for e in ordered if _supports_tools(e[1], e[2])] or ordered
+        # INTERLEAVE by provider before rotating — see _interleave_by_provider.
+        # Must run BEFORE _rotate_band: rotation varies which model gets first
+        # dibs ACROSS separate requests, interleaving fixes adjacency WITHIN one
+        # chain; composing them the other way would let the rotated top band
+        # re-cluster back onto a single dominant provider.
+        ordered = _interleave_by_provider(ordered)
         # ROTATE the top band of the fallback too. Strict strength order means the
         # single highest-scored model is hop 2 of EVERY chain, so each time a primary
         # refuses (429/402/404 — routine on free tiers) the same model answers, and
@@ -2567,7 +2706,7 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # the order is untouched, so quality still decides who gets tried at all.
         ordered = _rotate_band(ordered)
     else:
-        ordered = fast + slow
+        ordered = _interleave_by_provider(fast + slow)
     # Agentic loops burn through the tool-capable pool in bursts, so give them a
     # deeper chain (reaches the still-fresh sibling models when the top providers are
     # momentarily throttled) than a one-shot chat needs.
@@ -3063,6 +3202,43 @@ def _sustain_penalty(pid):
     return (150 - lim) / 5.0
 
 
+_MODEL_ID_SUFFIX_RE = re.compile(r"(?::free|:beta|:extended|:nitro|:floor|:online)+$", re.IGNORECASE)
+
+
+def _normalize_model_identity(model_id):
+    """Strip provider-added suffixes (openrouter's ':free', ':beta', etc.) and
+    lowercase, so the SAME underlying model hosted by two different providers
+    compares equal — e.g. nvidia's 'nvidia/nemotron-3-ultra-550b-a55b' and
+    openrouter's 'nvidia/nemotron-3-ultra-550b-a55b:free' are recognized as
+    one model, not two unrelated ones."""
+    return _MODEL_ID_SUFFIX_RE.sub("", (model_id or "").strip().lower())
+
+
+def _model_identity_min_penalty(pool):
+    """For a candidate pool [(score, pid, model), ...], map each (pid, model) to
+    the LOWEST _sustain_penalty found among every candidate offering the exact
+    same underlying model (by _normalize_model_identity), including itself.
+
+    MEASURED 2026-07-27: nvidia's nemotron-3-ultra-550b (uncapped, penalty 0)
+    and openrouter's identical model (50/day, penalty 20) scored 21 points
+    apart for being the SAME model — the scarcity penalty exists to stop the
+    router over-relying on a genuinely limited resource, which doesn't apply
+    when an uncapped copy of the exact same model is sitting right there in
+    the same pool. This lets the scarce copy inherit its sibling's penalty
+    instead of eating its own, so _weighted_pick can give it a fair, non-
+    trivial share instead of ~0%. A model with no same-identity sibling (the
+    normal case) is completely unaffected — it only ever sees its own
+    penalty, min() over a single-element list."""
+    by_identity = {}
+    for _score, pid, model in pool:
+        by_identity.setdefault(_normalize_model_identity(model), []).append(pid)
+    effective = {}
+    for _score, pid, model in pool:
+        sibling_pids = by_identity.get(_normalize_model_identity(model), [pid])
+        effective[(pid, model)] = min(_sustain_penalty(p) for p in sibling_pids)
+    return effective
+
+
 # ── TOOL-PROTOCOL COMPATIBILITY ────────────────────────────────────────────
 # A benchmark score measures how SMART a model is. It says nothing about whether
 # the model speaks the tool dialect the calling CLI can actually consume — and a
@@ -3085,11 +3261,24 @@ def _sustain_penalty(pid):
 #                      so codex sees a malformed turn and exits silently: exit 0,
 #                      no error, no files, ONE request. Hardest failure to spot —
 #                      the hub logs a clean 200 and nothing looks wrong.
+# RE-MEASURED 2026-07-27 (6 direct apply_patch repros, raw deltas captured before
+# any hub-side normalization): deepseek-v4-pro and zai-glm-4.7 BOTH invent a
+# DIFFERENT JSON shape almost every call for the exact same tool/prompt — seen:
+# {"input":"diff --git..."} (git-header pollution, the one _normalize_apply_patch_diff
+# targets), {"lines":[{"type":"new_file",...}]}, {"operation":{"create_file":{...}}},
+# a STRINGIFIED nested JSON blob under a random key ("d43bd"), a "_scratchpad"
+# wrapper, bare {"patch": "..."} (sometimes valid, sometimes not), {"content",
+# "filepath"}, and even a bare "{}". This is not one fixable pattern — a
+# normalizer can only ever chase the shapes already seen. zai-glm-4.7 additionally
+# produced a run with ZERO files after 2 fatal attempts and no shell fallback
+# (session just gave up). deepseek-v4-pro was already excluded below; zai-glm-4.7
+# is added on this evidence rather than promoted to _TOOL_PROVEN as originally
+# considered.
 # PROVEN GOOD (each completed a full multi-file Codex build end-to-end tonight):
 #   cerebras/gpt-oss-120b, nvidia+openrouter nemotron-3-*, google gemini-3.x,
 #   mistral-medium. Those built the pest-control site and the SVG dashboard.
 _TOOL_DIALECT_PENALTY = 25.0
-_TOOL_DIALECT_MISMATCH = ("deepseek-v4", "minimax-m2.7", "minimax-m3")
+_TOOL_DIALECT_MISMATCH = ("deepseek-v4", "minimax-m2.7", "minimax-m3", "glm-4.7")
 
 # A blacklist of broken dialects is whack-a-mole: three runs found three DIFFERENT
 # model-specific ways to fail, each invisible to the hub (clean 200 every time).
@@ -3121,14 +3310,21 @@ def _tool_dialect_penalty(model_id):
     return _TOOL_DIALECT_PENALTY if any(f in low for f in _TOOL_DIALECT_MISMATCH) else 0.0
 
 
-def _agentic_score(entry):
+def _agentic_score(entry, sustain_override=None):
     """Ordering key for agentic (tool) routing: raw strength, minus the scarce-budget
     penalty (so sustainable providers lead), minus the tool-dialect penalty (so a model
     that a CLI cannot actually execute never wins the slot no matter how strong it is).
-    A model that writes brilliant code the CLI throws away is worth nothing here."""
-    return (entry[0]
-            - _sustain_penalty(entry[1])
-            - _tool_dialect_penalty(entry[2]))
+    A model that writes brilliant code the CLI throws away is worth nothing here.
+
+    `sustain_override` (from _model_identity_min_penalty, computed once per pool by
+    the caller) lets a scarce-quota copy of a model inherit a non-scarce sibling's
+    penalty instead of its own — omit it (default None) to get the plain per-
+    provider penalty, exactly as before this parameter existed."""
+    penalty = (sustain_override.get((entry[1], entry[2])) if sustain_override is not None
+               else None)
+    if penalty is None:
+        penalty = _sustain_penalty(entry[1])
+    return (entry[0] - penalty - _tool_dialect_penalty(entry[2]))
 
 
 def _context_ok(pid, model, est):
@@ -3757,10 +3953,20 @@ def api_test_provider(pid):
             return _finish(False, _sanitize("%s: %s" % (exc.__class__.__name__, exc)), [])
         if resp.status_code == 200:
             try:
-                sample_models = _parse_model_ids(resp.json())
+                all_ids = _parse_model_ids(resp.json())
             except ValueError:
-                sample_models = []
-            models_list_note = "%d models listed" % len(sample_models)
+                all_ids = []
+            # FREE-filter before this goes anywhere near a user: the raw catalog
+            # includes every PAID model too (a live bug — a user testing openrouter
+            # saw "claude", "opus", "fable 5" listed as if recognized/free, when
+            # they were just unfiltered paid entries from the same /models response
+            # provider_free_models() already filters correctly elsewhere; this path
+            # never did). "% listed" and sample_models must both reflect only what
+            # is_free_model() actually confirms is free for this provider.
+            sample_models = prov.filter_models(
+                [m for m in all_ids if prov.is_free_model(pid, m)])
+            models_list_note = "%d free models listed (%d total in catalog)" % (
+                len(sample_models), len(all_ids))
         else:
             # Can't even list models -> the key itself is bad. No point spending a
             # generation attempt to learn the same thing twice.
@@ -7490,7 +7696,8 @@ def _chat_to_responses(chat_json, model_label):
             "id": "fc_" + uuid.uuid4().hex,
             "call_id": tc.get("id"),
             "name": fn.get("name") or "",
-            "arguments": _repair_tool_arguments(fn.get("arguments") or ""),
+            "arguments": _normalize_apply_patch_diff(
+                fn.get("name") or "", _repair_tool_arguments(fn.get("arguments") or "")),
             "status": "completed",
         })
     usage = chat_json.get("usage") or {}
@@ -7541,6 +7748,53 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
     usage = None
     if line_iter is None:
         line_iter = resp.iter_lines(decode_unicode=False)
+
+    def _finalize_open_items():
+        """Emit done-events for whatever text/tool item is still in_progress and
+        append it to done_items. Called once, either after a clean finish or from
+        the except handler on a mid-stream failure (e.g. an upstream idle-read
+        timeout) — without this, a caught exception left done_items empty even
+        though real text had already been streamed to the client via delta events,
+        so response.completed reported output: [] and the caller saw a clean
+        'nothing happened' turn instead of the partial answer it actually got."""
+        if text_started:
+            full = "".join(text_buf)
+            yield _sse_event("response.output_text.done", {
+                "type": "response.output_text.done",
+                "item_id": text_item_id, "output_index": text_index,
+                "content_index": 0, "text": full})
+            yield _sse_event("response.content_part.done", {
+                "type": "response.content_part.done",
+                "item_id": text_item_id, "output_index": text_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": full, "annotations": []}})
+            item = {"type": "message", "id": text_item_id, "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": full, "annotations": []}]}
+            yield _sse_event("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": text_index, "item": item})
+            done_items.append((text_index, item))
+
+        for _oai_idx, st in sorted(tools.items(), key=lambda kv: kv[1]["out_index"]):
+            # Repair before emitting so we never hand the CLI a doubled-JSON tool_call
+            # that it will replay and 503 on every later turn (see _repair_tool_arguments),
+            # then strip a git-diff header block apply_patch parsers reject even though
+            # the underlying hunk is valid (see _normalize_apply_patch_diff).
+            full_args = _normalize_apply_patch_diff(
+                st["name"], _repair_tool_arguments("".join(st["args"])))
+            yield _sse_event("response.function_call_arguments.done", {
+                "type": "response.function_call_arguments.done",
+                "item_id": st["item_id"], "output_index": st["out_index"],
+                "arguments": full_args})
+            item = {"type": "function_call", "id": st["item_id"],
+                    "call_id": st["call_id"], "name": st["name"],
+                    "arguments": full_args, "status": "completed"}
+            yield _sse_event("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": st["out_index"], "item": item})
+            done_items.append((st["out_index"], item))
+
     try:
         yield _sse_event("response.created",
                          {"type": "response.created", "response": _obj("in_progress", [])})
@@ -7639,40 +7893,7 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                         "item_id": st["item_id"], "output_index": st["out_index"],
                         "delta": args})
 
-        if text_started:
-            full = "".join(text_buf)
-            yield _sse_event("response.output_text.done", {
-                "type": "response.output_text.done",
-                "item_id": text_item_id, "output_index": text_index,
-                "content_index": 0, "text": full})
-            yield _sse_event("response.content_part.done", {
-                "type": "response.content_part.done",
-                "item_id": text_item_id, "output_index": text_index,
-                "content_index": 0,
-                "part": {"type": "output_text", "text": full, "annotations": []}})
-            item = {"type": "message", "id": text_item_id, "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": full, "annotations": []}]}
-            yield _sse_event("response.output_item.done", {
-                "type": "response.output_item.done",
-                "output_index": text_index, "item": item})
-            done_items.append((text_index, item))
-
-        for _oai_idx, st in sorted(tools.items(), key=lambda kv: kv[1]["out_index"]):
-            # Repair before emitting so we never hand the CLI a doubled-JSON tool_call
-            # that it will replay and 503 on every later turn (see _repair_tool_arguments).
-            full_args = _repair_tool_arguments("".join(st["args"]))
-            yield _sse_event("response.function_call_arguments.done", {
-                "type": "response.function_call_arguments.done",
-                "item_id": st["item_id"], "output_index": st["out_index"],
-                "arguments": full_args})
-            item = {"type": "function_call", "id": st["item_id"],
-                    "call_id": st["call_id"], "name": st["name"],
-                    "arguments": full_args, "status": "completed"}
-            yield _sse_event("response.output_item.done", {
-                "type": "response.output_item.done",
-                "output_index": st["out_index"], "item": item})
-            done_items.append((st["out_index"], item))
+        yield from _finalize_open_items()
 
         final_usage = None
         if usage is not None:
@@ -7685,6 +7906,10 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
             "response": _obj("completed", final_output, final_usage)})
     except Exception as exc:  # never leave Codex hanging on a mid-stream failure
         _log.error("Responses stream error: %s", _sanitize(str(exc)))
+        try:
+            yield from _finalize_open_items()
+        except Exception:
+            pass
         partial = [it for _i, it in sorted(done_items, key=lambda t: t[0])]
         try:
             yield _sse_event("response.completed", {

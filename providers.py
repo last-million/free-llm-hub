@@ -66,14 +66,25 @@ PROVIDERS: Dict[str, dict] = {
         # don't model: they report 0 and would silently spend real money.
         # All 20 ':free' ids are zero across every pricing field — no false positives.
         "free_filter": "suffix_free",
+        # RE-VERIFIED 2026-07-27 against the live /models catalog + a real 1-token
+        # generation per id through the hub itself. Removed: llama-3.3-70b-instruct
+        # (openrouter itself 503s "unavailable for free, use this slug instead"),
+        # qwen3-next-80b-a3b-instruct/qwen3-coder (no longer in the live catalog at
+        # all), hermes-3-llama-3.1-405b (same), gpt-oss-20b/gemma-4-31b-it (both
+        # return a 200 with EMPTY content on openrouter specifically — the hub's own
+        # cross-provider fallback was silently rescuing these onto sambanova, masking
+        # that openrouter itself never actually answers them). Added the models that
+        # verifiably produced real content THROUGH openrouter, incl. nemotron-3-ultra-
+        # 550b-a55b — the same top-ranked model nvidia hosts, now also a real
+        # openrouter candidate instead of nvidia being the only source of it.
         "default_free_models": [
-            "meta-llama/llama-3.3-70b-instruct:free",
-            "qwen/qwen3-next-80b-a3b-instruct:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
             "nvidia/nemotron-3-super-120b-a12b:free",
-            "openai/gpt-oss-20b:free",
-            "google/gemma-4-31b-it:free",
-            "qwen/qwen3-coder:free",
-            "nousresearch/hermes-3-llama-3.1-405b:free",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            "nvidia/nemotron-3-nano-30b-a3b:free",
+            "nvidia/nemotron-nano-12b-v2-vl:free",
+            "google/gemma-4-26b-a4b-it:free",
+            "poolside/laguna-s-2.1:free",
         ],
         # IMAGE GENERATION — PAID, "free": False so it never enters auto image
         # routing (see _image_candidates() in app.py): reachable only via an
