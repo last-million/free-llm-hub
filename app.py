@@ -2615,6 +2615,7 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     providers = [p for p in _available_providers() if _provider_capable(p, est)]
     if not providers:  # request too big for every free tier -> try the biggest anyway
         providers = sorted(_available_providers(), key=_provider_tpm, reverse=True)
+    providers = _exclude_google_for_foreign_tool_history(providers, require_tools, messages)
     cands = []  # (score, pid, model)
     for pid in providers:
         for m in _auto_models(pid):
@@ -2875,7 +2876,35 @@ def _interleave_by_provider(ordered):
     return result
 
 
-def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_tools=False):
+def _history_has_tool_calls(messages):
+    """True if any prior assistant turn in this conversation already made a tool
+    call. Google's Gemini API rejects a request outright (400: "Function call is
+    missing a thought_signature") whenever a tool_calls message in history lacks
+    Gemini's own signing token — which is guaranteed for a tool call that came
+    from a DIFFERENT model (glm/deepseek/nvidia/... fallback hop, or a session
+    that re-picked away from Gemini and back). The hub doesn't track per-message
+    provenance, so any prior tool call at all is treated as a foreign one and
+    Google is excluded from the candidate pool for that request — a deterministic
+    hard-fail, not a soft dialect mismatch like _TOOL_DIALECT_MISMATCH, so this is
+    a hard exclusion rather than a ranking penalty. MEASURED live 2026-07-27."""
+    for m in messages or []:
+        if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls"):
+            return True
+    return False
+
+
+def _exclude_google_for_foreign_tool_history(pids, require_tools, messages):
+    """Drop 'google' from a candidate provider list when this is a tool-calling
+    continuation (see _history_has_tool_calls) — fail-open if that would empty
+    the pool (google is the only option left)."""
+    if not require_tools or "google" not in pids or not _history_has_tool_calls(messages):
+        return pids
+    filtered = [p for p in pids if p != "google"]
+    return filtered or pids
+
+
+def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_tools=False,
+                  messages=None):
     """Priority-ordered [(pid, model)] fallback chain. Primary first, then the
     next-best MODELS across every AVAILABLE, size-capable provider, INTERLEAVED
     across providers (best model of each provider, then each provider's 2nd, ...).
@@ -2890,7 +2919,9 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # FAST models are tried first (best-first); SLOW reasoning models are the LAST
     # resort — only reached once the fast+good ones are exhausted/rate-limited.
     fast, slow = [], []
-    for pid in _available_providers():
+    _cand_pids = _exclude_google_for_foreign_tool_history(
+        _available_providers(), require_tools, messages)
+    for pid in _cand_pids:
         if not _provider_capable(pid, est):
             continue
         for m in _auto_models(pid):
@@ -7732,7 +7763,8 @@ def v1_chat_completions():
     errors = _HopErrors()
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
-                                           require_tools=has_tools):
+                                           require_tools=has_tools,
+                                           messages=body.get("messages")):
         if not prov.is_model_allowed(hop_model):
             continue
         if stream and _is_sub(hop_pid):
@@ -8267,7 +8299,7 @@ def v1_responses():
     _tried = []  # DIAG: every hop the chain actually offered (root-cause the 503s)
     _err_bodies = {}  # DIAG: first raw error body per (pid:status) — reveals soft-400 reasons
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
-                                           require_tools=has_tools):
+                                           require_tools=has_tools, messages=messages):
         _tried.append(hop_pid + "/" + hop_model)
         if not prov.is_model_allowed(hop_model):
             continue
@@ -8817,7 +8849,7 @@ def v1_messages():
     errors = _HopErrors()
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
-                                           require_tools=has_tools):
+                                           require_tools=has_tools, messages=oai_messages):
         if not prov.is_model_allowed(hop_model):
             continue
         if stream and _is_sub(hop_pid):
