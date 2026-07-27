@@ -575,6 +575,28 @@ def ensure_control_token() -> str:
         return token
 
 
+def get_aa_api_key() -> Optional[str]:
+    """The user's own Artificial Analysis API key (artificialanalysis.ai), used
+    ONLY to fetch real Intelligence Index benchmark scores for routing — never
+    sent to any LLM provider. Absent by default; routing falls back to the
+    static family-tier table until the user pastes one in."""
+    with _LOCK:
+        cfg = load_config()
+    key = cfg.get("artificial_analysis_api_key")
+    return key if isinstance(key, str) and key else None
+
+
+def set_aa_api_key(key: Optional[str]) -> None:
+    """Store (or, with key=None, clear) the Artificial Analysis API key."""
+    with _LOCK:
+        cfg = load_config(strict=True)
+        if key:
+            cfg["artificial_analysis_api_key"] = key
+        else:
+            cfg.pop("artificial_analysis_api_key", None)
+        save_config(cfg)
+
+
 def _cas_update(section: str, expected_revision: int, updater) -> dict:
     """Locked compare-and-swap for lifecycle/runtime/media state."""
     with _LOCK:
