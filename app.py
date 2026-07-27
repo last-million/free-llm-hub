@@ -550,15 +550,244 @@ _PREF_FLOORS = (135, 134)
 _PREF_QWEN_DEMOTION = 45
 
 
-def _benchmark_score(pid, model_id):
-    """Heuristic strength score for a '<model>' on provider `pid` (higher=better).
-    Pure string heuristic — no network, future-proof against catalog churn."""
-    low = (model_id or "").lower()
-    score = 10  # base so an unknown model still ranks above nothing
-    for names, pts in _BENCH_FAMILY:
-        if any(n in low for n in names):
-            score = max(score, pts)
+# --------------------------------------------------------------------------- #
+# ARTIFICIAL ANALYSIS — real, independently-measured Intelligence Index scores
+# (artificialanalysis.ai), replacing the hand-typed _BENCH_FAMILY guess with
+# actual data WHEN a confident match exists. Everything else in _benchmark_score
+# (size nudge, instruct bonus, provider bias, coding boost, hy3/kimi-k3
+# PREFERENCE floors, qwen demotion, mistral penalty, speed cap) still applies
+# on top unchanged — those are deliberate user decisions, not attempts to
+# measure capability, so real benchmark data must not silently overrule them.
+# Free tier: 100 requests/day (resets 00:00 UTC) — refreshed on a long interval
+# (not per-request) so routing never makes a network call in the hot path.
+# --------------------------------------------------------------------------- #
+AA_API_BASE = "https://artificialanalysis.ai/api/v2"
+AA_SCORE_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".free-llm-hub", "aa_scores.json")
+AA_REFRESH_INTERVAL = 6 * 3600  # seconds
+_aa_cache_lock = threading.Lock()
+_aa_scores = {}          # normalized slug -> calibrated hub-scale score (in-memory, hot path reads this)
+_aa_last_refresh = 0.0   # monotonic-ish wall clock of the last successful fetch
+
+
+def _load_aa_cache():
+    try:
+        with open(AA_SCORE_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_aa_cache(cache):
+    """Same atomic-write discipline as _save_test_cache / config.save_config."""
+    try:
+        parent = os.path.dirname(AA_SCORE_CACHE_PATH)
+        os.makedirs(parent, exist_ok=True)
+        data = json.dumps(cache, indent=2, ensure_ascii=False)
+        fd, tmp_path = tempfile.mkstemp(prefix=".aa_scores-", suffix=".tmp", dir=parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        for _attempt in range(6):
+            try:
+                os.replace(tmp_path, AA_SCORE_CACHE_PATH)
+                return
+            except PermissionError:
+                time.sleep(0.15)
+            except OSError:
+                break
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    except Exception:
+        _log.debug("[aa] cache save failed", exc_info=True)
+
+
+_AA_SLUG_STRIP_RE = re.compile(
+    r"^(?:@cf/|nvidia/|z-ai/|zai-org/|moonshotai/|meta/|meta-llama/|google/|models/|"
+    r"deepseek-ai/|minimaxai/|openai/|nousresearch/|inclusionai/|poolside/|cohere/)+")
+_AA_SLUG_SUFFIX_RE = re.compile(r"(?::free|:beta|:extended|:nitro|:floor|:online)+$", re.IGNORECASE)
+_AA_SLUG_PUNCT_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_aa_slug(text):
+    """Collapse a hub model id OR an Artificial Analysis slug/name onto a bare
+    alnum core for fuzzy matching — strips vendor path prefixes (nvidia's own
+    ids nest 'vendor/model', openrouter mirrors that plus a ':free' suffix,
+    cloudflare uses '@cf/vendor/model'), then any non-alphanumeric separator,
+    so 'nvidia/nemotron-3-ultra-550b-a55b' and AA's 'nemotron-3-ultra-550b'
+    compare as the same core string regardless of punctuation drift."""
+    t = (text or "").strip().lower()
+    t = _AA_SLUG_SUFFIX_RE.sub("", t)
+    for _ in range(3):  # a couple of ids double-nest (nvidia's own catalog: 'nvidia/nvidia/...')
+        stripped = _AA_SLUG_STRIP_RE.sub("", t)
+        if stripped == t:
             break
+        t = stripped
+    return _AA_SLUG_PUNCT_RE.sub("", t)
+
+
+def _fetch_aa_scores():
+    """One full paginated fetch of Artificial Analysis's LLM Intelligence Index,
+    calibrated onto the hub's existing ~0-110 scoring scale. Returns
+    {normalized_slug: hub_scale_score} or {} on any failure (missing key,
+    network error, empty/malformed response) — always fail-open, callers keep
+    using whatever was cached before (or the static table if nothing ever
+    succeeded)."""
+    key = config.get_aa_api_key()
+    if not key:
+        return {}
+    raw = {}   # normalized_slug -> aa_intelligence_index
+    page = 1
+    try:
+        while True:
+            resp = requests.get(
+                AA_API_BASE + "/language/models",
+                headers={"x-api-key": key},
+                params={"page": page, "page_size": 200},
+                timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
+            if resp.status_code != 200:
+                _log.warning("[aa] fetch HTTP %d on page %d", resp.status_code, page)
+                break
+            body = resp.json()
+            for row in (body.get("data") or []):
+                idx = row.get("artificial_analysis_intelligence_index")
+                slug = row.get("slug") or row.get("name")
+                if idx is None or not slug:
+                    continue
+                norm = _normalize_aa_slug(slug)
+                if norm:
+                    raw[norm] = max(raw.get(norm, 0.0), float(idx))
+            pagination = body.get("pagination") or {}
+            if not pagination.get("has_more") or page > 10:  # hard stop, never loop forever
+                break
+            page += 1
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        _log.debug("[aa] fetch failed", exc_info=True)
+        return {}
+    if not raw:
+        return {}
+    return _calibrate_aa_scores(raw)
+
+
+def _calibrate_aa_scores(raw):
+    """Fit AA's raw Intelligence Index values onto the hub's existing ~0-110
+    heuristic scale via ordinary least squares, using every model this hub
+    ALREADY has an opinion on (from _BENCH_FAMILY et al, computed via the
+    static-only path) as training pairs. This anchors AA's real data to the
+    same scale every other constant in this file already depends on
+    (_TOOLS_MIN_SCORE, _ORCH_BAND, _sustain_penalty's point deductions) rather
+    than requiring a full, riskier rescale of the whole routing system.
+    Falls back to returning `raw` unscaled (better than nothing) if fewer than
+    5 training pairs are found — not enough points for a trustworthy fit."""
+    xs, ys = [], []
+    for norm, aa_score in raw.items():
+        existing = _static_benchmark_score(norm)
+        if existing is not None:
+            xs.append(aa_score)
+            ys.append(existing)
+    n = len(xs)
+    if n < 5:
+        _log.debug("[aa] only %d calibration pairs found, using raw AA scores unscaled", n)
+        return dict(raw)
+    sx, sy = sum(xs), sum(ys)
+    sxx = sum(x * x for x in xs)
+    sxy = sum(x * y for x, y in zip(xs, ys))
+    denom = n * sxx - sx * sx
+    if abs(denom) < 1e-9:
+        return dict(raw)
+    slope = (n * sxy - sx * sy) / denom
+    intercept = (sy - slope * sx) / n
+    return {norm: slope * v + intercept for norm, v in raw.items()}
+
+
+def _static_benchmark_score(normalized_model_text):
+    """The OLD hand-typed _BENCH_FAMILY tier lookup only (no size/instruct/
+    provider/preference adjustments) — used solely as calibration training
+    data for _calibrate_aa_scores. Takes an already-normalized string (no
+    provider context, so no provider-bias term) since this exists only to
+    anchor AA's scale, not to route anything itself."""
+    for names, pts in _BENCH_FAMILY:
+        if any(_AA_SLUG_PUNCT_RE.sub("", n) in normalized_model_text for n in names):
+            return float(pts)
+    return None
+
+
+def _aa_score_for(model_id):
+    """Look up a confident Artificial Analysis score for a hub model id, or
+    None if AA has never been fetched / has no matching model. Exact match on
+    the normalized core string only — no loose substring fallback here, unlike
+    _static_benchmark_score's family-tier matching, because a wrong AA match
+    would silently misinform routing with a specific, confident-looking wrong
+    number rather than an admittedly-generic tier guess."""
+    if not _aa_scores:
+        return None
+    return _aa_scores.get(_normalize_aa_slug(model_id))
+
+
+def _aa_refresh_once():
+    global _aa_scores, _aa_last_refresh
+    scores = _fetch_aa_scores()
+    if scores:
+        with _aa_cache_lock:
+            _aa_scores = scores
+            _aa_last_refresh = time.time()
+            _save_aa_cache({"fetched_at": _aa_last_refresh, "scores": scores})
+        _log.info("[aa] refreshed %d model scores from Artificial Analysis", len(scores))
+
+
+def _aa_refresh_loop():
+    # Load whatever was cached from a previous run immediately (no network wait).
+    cached = _load_aa_cache()
+    if isinstance(cached.get("scores"), dict):
+        global _aa_scores, _aa_last_refresh
+        _aa_scores = cached["scores"]
+        _aa_last_refresh = cached.get("fetched_at") or 0.0
+    time.sleep(5)  # let the server finish booting before the first live fetch
+    while True:
+        if config.get_aa_api_key():
+            try:
+                _aa_refresh_once()
+            except Exception:
+                _log.debug("[aa] refresh cycle error", exc_info=True)
+        slept = 0.0
+        while slept < AA_REFRESH_INTERVAL:
+            time.sleep(min(60.0, AA_REFRESH_INTERVAL - slept))
+            slept += 60.0
+
+
+_aa_refresh_thread = None
+
+
+def _start_aa_refresh():
+    global _aa_refresh_thread
+    if _aa_refresh_thread is not None:
+        return
+    _aa_refresh_thread = threading.Thread(target=_aa_refresh_loop, daemon=True)
+    _aa_refresh_thread.start()
+
+
+def _benchmark_score(pid, model_id):
+    """Strength score for a '<model>' on provider `pid` (higher=better). Base
+    tier comes from a REAL Artificial Analysis Intelligence Index match when
+    one exists (calibrated onto this same scale — see _aa_score_for), else the
+    hand-typed _BENCH_FAMILY guess as before. Every adjustment below (size,
+    instruct bonus, provider bias, coding boost, hy3/kimi-k3 preference floors,
+    qwen demotion, mistral penalty, speed cap) still applies on top either
+    way — those encode deliberate product decisions, not a capability
+    estimate, so real data augments them rather than replacing them."""
+    low = (model_id or "").lower()
+    aa = _aa_score_for(model_id)
+    if aa is not None:
+        score = aa
+    else:
+        score = 10  # base so an unknown model still ranks above nothing
+        for names, pts in _BENCH_FAMILY:
+            if any(n in low for n in names):
+                score = max(score, pts)
+                break
     # NEW-VERSION HEURISTIC: auto-rank a newer release of a known-strong family.
     sv = _strong_new_version_score(low)
     score = max(score, sv)
@@ -1224,7 +1453,7 @@ def _save_test_cache(cache):
         except OSError:
             pass
     except Exception:
-        logger.debug("[test-cache] save failed", exc_info=True)
+        _log.debug("[test-cache] save failed", exc_info=True)
 
 
 def _record_test_result(pid, ok, detail, sample_models, attempted=None):
@@ -2706,6 +2935,20 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # the dice) plus _weighted_pick on the primary — removed here, not narrowed,
         # since a narrower band would still fight interleaving's ordering somewhat.
         ordered = _interleave_by_provider(ordered)
+        # PROVEN-first, same fail-open allowlist _route_by_difficulty already
+        # applies to the primary pick — but until now ONLY to the primary. The
+        # fallback chain built above ranks by raw strength alone, so an unproven
+        # model that happens to benchmark high (glm-5.2 / kimi-k2.6, both above
+        # nemotron-3-ultra) won every early fallback slot whenever the primary or
+        # an earlier hop failed — MEASURED live: glm-5.2 hit 2 real "apply_patch
+        # invoked with incompatible payload" fatal errors in tonight's own build
+        # test, yet kept winning fallback hops in a real user session afterward,
+        # because nothing here ever checked _is_tool_proven. Unproven models are
+        # NOT dropped — only demoted to a last-resort tail — so a request still
+        # gets served if every proven option is exhausted/throttled.
+        _proven_ordered = [e for e in ordered if _is_tool_proven(e[2])]
+        if _proven_ordered:
+            ordered = _proven_ordered + [e for e in ordered if not _is_tool_proven(e[2])]
     else:
         ordered = _interleave_by_provider(fast + slow)
     # Agentic loops burn through the tool-capable pool in bursts, so give them a
@@ -3933,7 +4176,7 @@ def api_test_provider(pid):
                 payload["new_models"] = new_models
                 payload["stale_models"] = stale_models
             except Exception:
-                logger.debug("[test-cache] record failed for %s", pid, exc_info=True)
+                _log.debug("[test-cache] record failed for %s", pid, exc_info=True)
                 payload["new_models"] = []
                 payload["stale_models"] = []
         return jsonify(payload)
@@ -4041,6 +4284,28 @@ def api_test_cache():
     sample_models, tested_at, ...}}. Read-only, makes no upstream calls."""
     with _test_cache_lock:
         return jsonify(_load_test_cache())
+
+
+@app.route("/api/aa-benchmarks", methods=["GET", "POST"])
+def api_aa_benchmarks():
+    """GET -> status of the Artificial Analysis benchmark integration (has_key,
+    how many models are currently scored from real data, when it last
+    refreshed successfully). Never returns the key itself.
+    POST {api_key: "..."} -> save a new key (or {api_key: null} to clear one)
+    and kick off an immediate refresh in the background so the dashboard
+    doesn't have to wait out the normal 6h interval to see it take effect."""
+    if request.method == "POST":
+        body = request.get_json(force=True, silent=True) or {}
+        if "api_key" in body:
+            val = body.get("api_key")
+            config.set_aa_api_key(val.strip() if isinstance(val, str) and val.strip() else None)
+            threading.Thread(target=_aa_refresh_once, daemon=True).start()
+    return jsonify({
+        "has_key": bool(config.get_aa_api_key()),
+        "score_count": len(_aa_scores),
+        "last_refresh": _aa_last_refresh or None,
+        "refresh_interval_hours": AA_REFRESH_INTERVAL / 3600,
+    })
 
 
 @app.route("/api/models", methods=["GET"])
@@ -4961,6 +5226,7 @@ _SETTINGS_SECTIONS = ("api_keys", "flags", "default", "local_api_key", "media", 
 _SETTINGS_RESERVED_KEYS = {
     "schema_version", "providers", "default", "local_api_key",
     "hub_mode", "runtime", "media", "images", "control_token",
+    "artificial_analysis_api_key",
 }
 
 
@@ -9554,6 +9820,7 @@ if __name__ == "__main__":
     _bootstrap_no_key_providers()  # no-key providers have nothing to configure -> on
     _print_banner()
     _start_auto_update()
+    _start_aa_refresh()
     vision_status.start_heartbeat()
     server = make_server(HOST, PORT, app, threaded=True)
     _runtime_server[0] = server
