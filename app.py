@@ -2238,7 +2238,15 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # availability-driven spreading rather than artificial round-robin. Scarce
         # tiers (openrouter 50/day) and de-prioritised families (qwen) stay demoted
         # through _agentic_score, so "best" respects those preferences too.
-        picked = max(agentic, key=lambda t: (_agentic_score(t), _quota_headroom(t[1])))
+        # Prefer models PROVEN to drive a CLI to completion. Strength only counts
+        # if the CLI can actually execute what the model emits — a brilliant model
+        # whose tool payloads codex rejects builds nothing at all (measured: three
+        # separate runs, three different silent failures, zero files each time).
+        # Fail-OPEN: if none of the proven models can serve this request right now,
+        # fall back to the full agentic pool rather than refusing to answer.
+        _proven = [c for c in agentic if _is_tool_proven(c[2])]
+        picked = max(_proven or agentic,
+                     key=lambda t: (_agentic_score(t), _quota_headroom(t[1])))
         _s, pid, model = picked
         _session_pin_set(_skey, pid, model)
         return pid, model, difficulty
@@ -2936,10 +2944,72 @@ def _sustain_penalty(pid):
     return (150 - lim) / 5.0
 
 
+# ── TOOL-PROTOCOL COMPATIBILITY ────────────────────────────────────────────
+# A benchmark score measures how SMART a model is. It says nothing about whether
+# the model speaks the tool dialect the calling CLI can actually consume — and a
+# mismatch there is fatal, silently: the hub returns a clean 200, the tool_call
+# arguments are valid JSON, and the CLI then dies locally on the payload.
+# MEASURED 2026-07-25 with Codex's own apply_patch schema:
+#   deepseek-v4-pro -> '{"input":"diff --git a/hello.txt b/hello.txt\nnew file
+#                        mode 100644\nindex 0000000..45b983b\n--- /dev/null..."}'
+#                      i.e. a GIT-style unified diff -> codex_core::tools::router
+#                      "Fatal error: tool apply_patch invoked with incompatible
+#                      payload" -> whole run produced ZERO files.
+#   gpt-oss-120b    -> '{"input":"--- /dev/null\n+++ b/hello.txt\n@@\n+hi\n"}'
+#                      i.e. the plain patch form codex accepts -> run succeeded.
+# So the strongest model on paper was the one that could not build anything.
+# Demote the dialects proven to break agentic CLIs; this is a COMPATIBILITY
+# penalty, not a quality judgement, and it only applies to tool/agentic routing
+# (plain chat is unaffected — these models are excellent there).
+#   minimax-m2.7    -> emits a well-formed apply_patch call BUT also leaks the same
+#                      JSON into the TEXT channel ('{\"input\":...' as output_text),
+#                      so codex sees a malformed turn and exits silently: exit 0,
+#                      no error, no files, ONE request. Hardest failure to spot —
+#                      the hub logs a clean 200 and nothing looks wrong.
+# PROVEN GOOD (each completed a full multi-file Codex build end-to-end tonight):
+#   cerebras/gpt-oss-120b, nvidia+openrouter nemotron-3-*, google gemini-3.x,
+#   mistral-medium. Those built the pest-control site and the SVG dashboard.
+_TOOL_DIALECT_PENALTY = 25.0
+_TOOL_DIALECT_MISMATCH = ("deepseek-v4", "minimax-m2.7", "minimax-m3")
+
+# A blacklist of broken dialects is whack-a-mole: three runs found three DIFFERENT
+# model-specific ways to fail, each invisible to the hub (clean 200 every time).
+# So agentic routing prefers an ALLOWLIST instead — models that have actually driven
+# a coding CLI to completion. New/unknown models are then "unproven" (fallback)
+# rather than "assumed good", which is the safe default for a protocol this strict.
+# EVIDENCE (2026-07-25, real Codex runs, output browser-verified):
+#   gpt-oss-120b     built the single-file SVG dashboard (chart, sortable table,
+#                    theme toggle) — all interactions worked.
+#   nemotron-3-*     built the 3-file French pest-control site — nav toggle, FAQ
+#                    accordion, form validation all verified in a browser.
+#   gemini-3.x       served turns in both successful builds.
+#   mistral-medium   served turns in the first successful build.
+# Add to this list ONLY after a model completes a real multi-file build.
+_TOOL_PROVEN = ("gpt-oss", "nemotron", "gemini-3", "mistral-medium")
+
+
+def _is_tool_proven(model_id):
+    """True for a model empirically shown to complete an agentic CLI build."""
+    low = (model_id or "").lower()
+    return any(f in low for f in _TOOL_PROVEN)
+
+
+def _tool_dialect_penalty(model_id):
+    """Points deducted from an AGENTIC pick for a model whose tool-call payloads
+    a CLI cannot consume. Extend _TOOL_DIALECT_MISMATCH only with EVIDENCE from a
+    real failed run — never on suspicion."""
+    low = (model_id or "").lower()
+    return _TOOL_DIALECT_PENALTY if any(f in low for f in _TOOL_DIALECT_MISMATCH) else 0.0
+
+
 def _agentic_score(entry):
-    """Benchmark score minus the scarce-budget penalty — the ordering key for agentic
-    (tool) routing so sustainable providers lead and the load actually spreads."""
-    return entry[0] - _sustain_penalty(entry[1])
+    """Ordering key for agentic (tool) routing: raw strength, minus the scarce-budget
+    penalty (so sustainable providers lead), minus the tool-dialect penalty (so a model
+    that a CLI cannot actually execute never wins the slot no matter how strong it is).
+    A model that writes brilliant code the CLI throws away is worth nothing here."""
+    return (entry[0]
+            - _sustain_penalty(entry[1])
+            - _tool_dialect_penalty(entry[2]))
 
 
 def _context_ok(pid, model, est):
@@ -3512,19 +3582,35 @@ def api_provider_reveal_key(pid, idx):
 
 @app.route("/api/test/<pid>", methods=["POST"])
 def api_test_provider(pid):
+    """Test a saved key. ok=True means ONLY ONE THING: a real 1-token generation
+    just succeeded — this key can actually produce free output right now.
+
+    Used to stop at a clean /models listing and call that "Key OK". That is a
+    false positive for a spent trial/wallet: a $0-balance account still lists its
+    full catalog with HTTP 200 (proved live on aimlapi — 909 models listed, 200 OK,
+    while every one of 4 keys 403'd on generation with "You've run out of funds").
+    A green card that can't generate is worse than a red one — it hides the
+    problem instead of surfacing it. So /models (when available) is now used ONLY
+    to pick a real model id to test with and to enrich the response's
+    sample_models; the PASS/FAIL verdict always comes from an actual generation.
+    """
     p = prov.get_provider(pid)
     if not p:
         return jsonify({"ok": False, "detail": "unknown provider", "sample_models": []}), 404
     pcfg = config.get_provider_config(pid)
     key = pcfg.get("api_key")
-    if not key:
+    # Pollinations-style anonymous tiers need no key at all — the ORIGINAL test
+    # required one unconditionally, so a genuinely-working keyless provider always
+    # read "No API key saved", the same kind of lie this rewrite exists to remove.
+    if not key and _needs_key(pid):
         return jsonify({"ok": False, "detail": "No API key saved for this provider.",
                         "sample_models": []})
-    headers = {"Authorization": "Bearer " + key}
     models_url = _models_url_for(pid, pcfg)
-    if models_url:
+    sample_models = []
+    models_list_note = None
+    if models_url and key:  # an anonymous tier has nothing to authenticate the GET with
         try:
-            resp = requests.get(models_url, headers=headers,
+            resp = requests.get(models_url, headers={"Authorization": "Bearer " + key},
                                 timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
         except requests.RequestException as exc:
             return jsonify({"ok": False,
@@ -3532,39 +3618,77 @@ def api_test_provider(pid):
                             "sample_models": []})
         if resp.status_code == 200:
             try:
-                ids = _parse_model_ids(resp.json())
+                sample_models = _parse_model_ids(resp.json())
             except ValueError:
-                ids = []
-            return jsonify({"ok": True,
-                            "detail": "Key OK (HTTP 200, %d models listed)." % len(ids),
-                            "sample_models": ids[:5]})
-        return jsonify({"ok": False,
-                        "detail": "HTTP %d: %s" % (resp.status_code, _upstream_error_detail(resp)),
-                        "sample_models": []})
-    # No models_url -> 1-token chat probe
-    model = None
-    for m in (p.get("default_free_models") or []):
-        if prov.is_model_allowed(m):
-            model = m
-            break
-    if not model:
+                sample_models = []
+            models_list_note = "%d models listed" % len(sample_models)
+        else:
+            # Can't even list models -> the key itself is bad. No point spending a
+            # generation attempt to learn the same thing twice.
+            return jsonify({"ok": False,
+                            "detail": "HTTP %d: %s" % (resp.status_code, _upstream_error_detail(resp)),
+                            "sample_models": []})
+
+    # ALWAYS verify with a REAL generation — see docstring. Try every registry-
+    # pinned default (not just the first): a provider often lists several free
+    # ids, and one going stale (a rotated-out ':free' slug, a renamed model)
+    # must not paint the whole provider red when its siblings still work —
+    # exactly what happened testing this rewrite: openrouter's FIRST pinned id
+    # 404'd "unavailable for free, use this slug instead: ..." while its other
+    # 6 pinned ids were fine. /models results are tried too, deduped, in order.
+    candidates, seen = [], set()
+    for m in (p.get("default_free_models") or []) + sample_models:
+        if m and m not in seen and prov.is_model_allowed(m):
+            seen.add(m)
+            candidates.append(m)
+    if not candidates:
+        if models_list_note:
+            return jsonify({"ok": False,
+                            "detail": "Key authenticates (%s) but no allowed model to verify "
+                                      "generation with." % models_list_note,
+                            "sample_models": sample_models[:5]})
         return jsonify({"ok": False,
                         "detail": "Provider has no models_url and no default model to test with.",
                         "sample_models": []})
-    try:
-        resp = _upstream_chat(pid, {"model": model,
-                                    "messages": [{"role": "user", "content": "hi"}],
-                                    "max_tokens": 16}, stream=False)  # 16 = Perplexity's floor
-    except (requests.RequestException, RuntimeError) as exc:
-        return jsonify({"ok": False,
-                        "detail": _sanitize("%s: %s" % (exc.__class__.__name__, exc)),
-                        "sample_models": []})
-    if resp.status_code == 200:
-        return jsonify({"ok": True, "detail": "Key OK (1-token chat succeeded on %s)." % model,
-                        "sample_models": [model]})
-    return jsonify({"ok": False,
-                    "detail": "HTTP %d: %s" % (resp.status_code, _upstream_error_detail(resp)),
-                    "sample_models": []})
+
+    # Transient statuses (a live rate-limit blip, momentary overload) get ONE
+    # retry after a short pause before moving to the next candidate — without
+    # this, testing this very rewrite painted glm/huggingface red on a passing
+    # 429/503 that a re-click a second later cleared on its own. 402/403/404 are
+    # NOT retried: those mean "will never work", not "try again".
+    _TRANSIENT = (429, 500, 502, 503, 504)
+    last_reason = None
+    for model in candidates[:5]:  # cap attempts — this call is user-interactive
+        resp = None
+        for attempt in range(2):
+            try:
+                resp = _upstream_chat(pid, {"model": model,
+                                            "messages": [{"role": "user", "content": "hi"}],
+                                            "max_tokens": 16}, stream=False)  # 16 = Perplexity's floor
+            except (requests.RequestException, RuntimeError) as exc:
+                last_reason = _sanitize("%s: %s" % (exc.__class__.__name__, exc))
+                resp = None
+                break
+            if resp.status_code == 200:
+                return jsonify({"ok": True,
+                                "detail": "Key OK — verified FREE generation works "
+                                          "(1-token chat succeeded on %s)." % model,
+                                "sample_models": (sample_models[:5] or [model])})
+            if resp.status_code in _TRANSIENT and attempt == 0:
+                time.sleep(2)
+                continue
+            last_reason = "HTTP %d: %s" % (resp.status_code, _upstream_error_detail(resp))
+            break
+    # Every candidate authenticated but none could actually generate — the
+    # spent-wallet case this whole rewrite exists to catch. Plain language, not
+    # a bare HTTP status, so the verdict answers "will this work for free usage".
+    if models_list_note:
+        detail = ("Key authenticates and lists models (%s), but generation FAILS on "
+                  "every candidate tried — this will NOT work for free usage: %s"
+                  % (models_list_note, last_reason))
+    else:
+        detail = last_reason or "generation failed"
+    return jsonify({"ok": False, "detail": detail, "sample_models": sample_models[:5]})
 
 
 @app.route("/api/models", methods=["GET"])
