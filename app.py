@@ -9225,6 +9225,69 @@ def _pollinations_generate_image(pcfg, model, prompt, size=1024, steps=4):
     return 200, _b64_bytes(resp.content), None
 
 
+_AIHORDE_POLL_DEADLINE = 300      # anonymous queue can genuinely take minutes
+_AIHORDE_ANON_KEY = "0000000000"  # AI Horde's documented public anonymous key
+
+
+def _aihorde_generate_image(pcfg, model, prompt, size=1024, steps=4):
+    """AI Horde (aihorde.net, formerly Stable Horde) -- a community-run,
+    GPU-donated distributed inference network. VERIFIED live 2026-07-27:
+    submitted a real anonymous job (apikey "0000000000"), watched the queue
+    position advance, downloaded and hex-verified an actual WebP image --
+    zero payment, zero signup. A personal free account/key jumps the
+    (otherwise lowest-priority) anonymous queue but isn't required. Async
+    submit-then-poll, same shape as this file's other async generators
+    (r2=false requests base64 inline, skipping the extra download hop)."""
+    keys = pcfg.get("api_keys") or []
+    api_key = keys[0] if keys else _AIHORDE_ANON_KEY
+    headers = {"apikey": api_key, "Content-Type": "application/json",
+               "Client-Agent": "free-llm-hub:1.0:https://github.com/last-million/free-llm-hub"}
+    width, height = _parse_wh(size)
+    body = {"prompt": (prompt or "")[:2000],
+            "params": {"width": width, "height": height, "steps": 20,
+                       "sampler_name": "k_euler", "cfg_scale": 7.5},
+            "nsfw": False, "models": [model], "r2": False}
+    try:
+        resp = requests.post("https://aihorde.net/api/v2/generate/async",
+                             headers=headers, json=body,
+                             timeout=(CONNECT_TIMEOUT, CHAT_READ_TIMEOUT))
+    except requests.RequestException as exc:
+        return 502, None, exc.__class__.__name__
+    if resp.status_code not in (200, 202):
+        return resp.status_code, None, _upstream_error_detail(resp)
+    job_id = (resp.json() or {}).get("id")
+    if not job_id:
+        return 502, None, "AI Horde returned no job id"
+    check_url = "https://aihorde.net/api/v2/generate/check/" + job_id
+    status_url = "https://aihorde.net/api/v2/generate/status/" + job_id
+    deadline = time.time() + _AIHORDE_POLL_DEADLINE
+    done = False
+    while time.time() < deadline:
+        time.sleep(4)
+        try:
+            cr = requests.get(check_url, timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
+        except requests.RequestException:
+            continue
+        cd = cr.json() if cr.status_code == 200 else {}
+        if cd.get("faulted"):
+            return 502, None, "AI Horde job faulted"
+        if cd.get("done"):
+            done = True
+            break
+    if not done:
+        return 504, None, "AI Horde timed out waiting for a free worker"
+    try:
+        sr = requests.get(status_url, timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
+    except requests.RequestException as exc:
+        return 502, None, exc.__class__.__name__
+    if sr.status_code != 200:
+        return sr.status_code, None, _upstream_error_detail(sr)
+    gens = (sr.json() or {}).get("generations") or []
+    if not gens or not gens[0].get("img"):
+        return 502, None, "AI Horde returned no image data"
+    return 200, gens[0]["img"], None
+
+
 # --------------------------------------------------------------------------- #
 # PAID image generators — OpenAI, Google (Gemini image), OpenRouter, Higgsfield.
 # Every model these dispatch is registered with "free": False in providers.py,
@@ -9411,6 +9474,7 @@ _IMAGE_GENERATORS = {
     "cloudflare": _cf_generate_image,
     "modelscope": _modelscope_generate_image,
     "pollinations": _pollinations_generate_image,
+    "aihorde": _aihorde_generate_image,
     "openai": _openai_generate_image,
     "google": _google_generate_image,
     "openrouter": _openrouter_generate_image,
