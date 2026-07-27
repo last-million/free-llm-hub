@@ -4076,6 +4076,8 @@ def _provider_row(pid, live_models=False):
         "trial": bool(p.get("trial")),
         "no_key": bool(p.get("no_key")),   # open gateway: usable with NO api key
         "free_models": provider_free_models(pid, live=live_models),
+        "image_free_count": sum(1 for r in _image_model_rows(pid) if r.get("free", True)),
+        "image_paid_count": sum(1 for r in _image_model_rows(pid) if not r.get("free", True)),
     }
 
 
