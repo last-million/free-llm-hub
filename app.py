@@ -9418,6 +9418,35 @@ _IMAGE_GENERATORS = {
 }
 
 
+def _call_image_generator(pid, generator, pcfg, model, prompt, size, steps):
+    """Same key-pool-rotation policy as the chat path's _upstream_chat
+    (_KEY_ROTATE_STATUSES / _next_key_start, app.py ~3012-3027) -- MEASURED
+    2026-07-27: every one of the 7 generators above only ever reads
+    api_keys[0], so a provider with a 3-key pool where key[0] is
+    revoked/exhausted had the whole provider abandoned for image generation
+    instead of trying key[1]/key[2], unlike text chat which already recovers
+    within a hop. Generators are left untouched -- each attempt gets a pcfg
+    view scoped to exactly ONE key, so their existing single-key logic
+    (async polling, SSRF-checked downloads, composite Higgsfield
+    KEY_ID:KEY_SECRET credentials) runs exactly as before; rotation only
+    decides which key populates that view on the next attempt."""
+    keys = pcfg.get("api_keys") or []
+    if len(keys) <= 1:
+        return generator(pcfg, model, prompt, size=size, steps=steps)
+    n = len(keys)
+    start = _next_key_start(pid, n)
+    result = (400, None, "no api key for provider %s" % pid)
+    for i in range(n):
+        is_last = (i == n - 1)
+        one_key_cfg = dict(pcfg)
+        one_key_cfg["api_keys"] = [keys[(start + i) % n]]
+        result = generator(one_key_cfg, model, prompt, size=size, steps=steps)
+        if result[0] in _KEY_ROTATE_STATUSES and not is_last:
+            continue
+        return result
+    return result
+
+
 def _save_generated_image(b64, prompt, pid, model):
     """Best-effort persist of one successful generation for the history
     gallery. Never raises -- a history-tracking bug must never break a real
@@ -9470,7 +9499,8 @@ def v1_images_generations():
             continue
         pcfg = config.get_provider_config(hop_pid)
         try:
-            status, b64, detail = generator(pcfg, hop_model, prompt, size=size, steps=steps)
+            status, b64, detail = _call_image_generator(
+                hop_pid, generator, pcfg, hop_model, prompt, size, steps)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             continue
@@ -9502,7 +9532,8 @@ def v1_images_generations():
     pcfg = config.get_provider_config(landed_pid)
     for _extra in range(n - 1):
         try:
-            status, b64, _detail = generator(pcfg, landed_model, prompt, size=size, steps=steps)
+            status, b64, _detail = _call_image_generator(
+                landed_pid, generator, pcfg, landed_model, prompt, size, steps)
         except (requests.RequestException, RuntimeError):
             break
         quota.record(landed_pid, landed_model)

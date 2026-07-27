@@ -17,9 +17,17 @@ Drop this folder anywhere, run one command, open the dashboard, paste a couple o
 
 ---
 
+## Get the code (one command)
+
+```bash
+git clone https://github.com/last-million/free-llm-hub.git && cd free-llm-hub
+```
+
 ## Quickstart (one command)
 
-**Windows**
+Pick the command for your OS — it creates a virtualenv on first run, installs the two dependencies, and starts the gateway. Nothing to choose manually: `run.bat` is Windows, `run.sh` is Linux/macOS, and each only ever does the right thing for the machine it's run on.
+
+**Windows** (cmd or PowerShell)
 
 ```bat
 run.bat
@@ -31,7 +39,7 @@ run.bat
 ./run.sh
 ```
 
-That's it. The script creates a virtualenv on first run, installs the two dependencies, and starts the gateway. Then open the dashboard:
+Then open the dashboard — this is the address the hub listens on, on THIS machine, once either script is running:
 
 ```
 http://127.0.0.1:8787
