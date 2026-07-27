@@ -2692,19 +2692,20 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
                          key=lambda t: (_agentic_score(t, _sustain_map), _quota_headroom(t[1])),
                          reverse=True)
         ordered = [e for e in ordered if _supports_tools(e[1], e[2])] or ordered
-        # INTERLEAVE by provider before rotating — see _interleave_by_provider.
-        # Must run BEFORE _rotate_band: rotation varies which model gets first
-        # dibs ACROSS separate requests, interleaving fixes adjacency WITHIN one
-        # chain; composing them the other way would let the rotated top band
-        # re-cluster back onto a single dominant provider.
+        # INTERLEAVE by provider — see _interleave_by_provider. _rotate_band used to
+        # run here too ("spread which model gets the first fallback slot"), but its
+        # _ORCH_BAND=30 is wide enough to sweep in MOST of a 100+ candidate pool (not
+        # the small near-tied handful it was designed for), so rotating it after
+        # interleaving reshuffled almost the whole list on every call — MEASURED
+        # 2026-07-27: openrouter's nemotron-3-ultra survived every step up through
+        # interleaving, then vanished from the final 10-hop chain entirely, purely
+        # because that rotation's offset happened to push it past the hop cap.
+        # _rotate_band's original job (don't let the same model own hop 2 forever,
+        # vary it across separate requests) is now handled more precisely by THIS
+        # interleaving (guarantees a different provider, not just a different roll of
+        # the dice) plus _weighted_pick on the primary — removed here, not narrowed,
+        # since a narrower band would still fight interleaving's ordering somewhat.
         ordered = _interleave_by_provider(ordered)
-        # ROTATE the top band of the fallback too. Strict strength order means the
-        # single highest-scored model is hop 2 of EVERY chain, so each time a primary
-        # refuses (429/402/404 — routine on free tiers) the same model answers, and
-        # it alone carries the project no matter how well the primary rotated. Spread
-        # the second chance across the equally-strong models instead; below the band
-        # the order is untouched, so quality still decides who gets tried at all.
-        ordered = _rotate_band(ordered)
     else:
         ordered = _interleave_by_provider(fast + slow)
     # Agentic loops burn through the tool-capable pool in bursts, so give them a
