@@ -518,6 +518,12 @@
     margin-top:4px;padding-top:12px;border-top:1px solid var(--border-soft);
   }
   .image-thumb.history{position:relative}
+  .image-thumb .thumb-model{
+    position:absolute;left:0;right:0;bottom:0;padding:3px 6px;
+    background:linear-gradient(transparent,rgba(0,0,0,.72) 55%);
+    color:#fff;font-size:10.5px;line-height:1.3;white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;pointer-events:none;text-align:left;
+  }
   .image-thumb .thumb-delete{
     position:absolute;top:4px;right:4px;width:22px;height:22px;border-radius:50%;
     background:rgba(0,0,0,.55);color:#fff;border:none;cursor:pointer;font-size:14px;line-height:1;
@@ -3241,12 +3247,19 @@
         img.src = src;
         img.alt = 'Generated image ' + (i + 1) + (promptText ? ' — ' + promptText : '');
         thumb.appendChild(img);
+        if (modelUsed){
+          var modelTag = document.createElement('div');
+          modelTag.className = 'thumb-model';
+          modelTag.textContent = modelUsed;
+          thumb.classList.add('history');  /* reuses the relative-positioned overlay layout */
+          thumb.appendChild(modelTag);
+        }
         thumb.addEventListener('click', function(){
           var big = document.createElement('img');
           big.src = src;
           big.alt = img.alt;
           big.className = 'modal-image';
-          openModal('Generated image', big);
+          openModal('Generated image' + (modelUsed ? ' — ' + modelUsed : ''), big);
         });
         resultsEl.appendChild(thumb);
       });
@@ -3268,21 +3281,28 @@
       images.forEach(function(item){
         var src = '/api/images/history/' + encodeURIComponent(item.id) +
           (HUB_CONTROL_TOKEN ? '?token=' + encodeURIComponent(HUB_CONTROL_TOKEN) : '');
+        var modelLabel = item.provider ? (item.provider + (item.model ? '/' + item.model : '')) : (item.model || '');
         var thumb = document.createElement('div');
         thumb.className = 'image-thumb history';
-        thumb.title = item.prompt || '';
+        thumb.title = (item.prompt || '') + (modelLabel ? '\n' + modelLabel : '');
         var img = document.createElement('img');
         img.src = src;
         img.loading = 'lazy';
         img.alt = 'Generated image' + (item.prompt ? ' — ' + item.prompt : '');
         thumb.appendChild(img);
+        if (modelLabel){
+          var modelTag = document.createElement('div');
+          modelTag.className = 'thumb-model';
+          modelTag.textContent = modelLabel;
+          thumb.appendChild(modelTag);
+        }
         thumb.addEventListener('click', function(e){
           if (e.target.closest('.thumb-delete')) return;
           var big = document.createElement('img');
           big.src = src;
           big.alt = img.alt;
           big.className = 'modal-image';
-          openModal('Generated image', big);
+          openModal('Generated image' + (modelLabel ? ' — ' + modelLabel : ''), big);
         });
         var delBtn = document.createElement('button');
         delBtn.type = 'button';
