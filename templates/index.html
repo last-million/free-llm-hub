@@ -217,6 +217,21 @@
   .search input:focus{border-color:var(--accent);outline:none}
   .count-note{font-size:12.5px;color:var(--text-faint);white-space:nowrap}
 
+  .btn-test-all{
+    display:inline-flex;align-items:center;gap:6px;margin-left:auto;
+    border:1px solid var(--border);background:var(--surface-2);color:var(--text-dim);
+    font:inherit;font-size:12.5px;font-weight:600;padding:7px 12px;border-radius:8px;
+    cursor:pointer;transition:background .15s,color .15s,border-color .15s;white-space:nowrap;
+  }
+  .btn-test-all:hover{background:var(--surface-3);color:var(--text)}
+  .btn-test-all:disabled{opacity:.55;cursor:default}
+  .btn-test-all svg.spin{animation:spin .9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .test-progress{display:flex;align-items:center;gap:10px;padding:2px 0 4px}
+  .test-progress-bar{flex:1;height:5px;border-radius:3px;background:var(--surface-3);overflow:hidden}
+  .test-progress-fill{height:100%;width:0%;background:var(--accent);border-radius:3px;transition:width .25s ease}
+  .test-progress-lbl{font-size:12px;color:var(--text-faint);white-space:nowrap;min-width:8ch;text-align:right}
+
   /* ---------- provider grid ---------- */
   .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
   @media (max-width:1280px){ .grid{grid-template-columns:repeat(2,minmax(0,1fr))} }
@@ -1536,6 +1551,14 @@
         <input type="search" id="search" placeholder="Search providers, models, notes&hellip;" aria-label="Search providers">
       </div>
       <span class="count-note" id="count-note"></span>
+      <button type="button" class="btn-test-all" id="test-all-btn" title="Re-verify every connected provider with a real generation request">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg>
+        Test all
+      </button>
+    </div>
+    <div class="test-progress" id="test-progress" hidden>
+      <div class="test-progress-bar"><div class="test-progress-fill" id="test-progress-fill"></div></div>
+      <span class="test-progress-lbl" id="test-progress-lbl"></span>
     </div>
     <div class="prov-mode" id="prov-mode">
       <span class="prov-mode-lbl">Auto uses:</span>
@@ -1778,6 +1801,9 @@
   var _ebSig = '';            /* last structural signature of the exhaustion banner */
   var keyHealth = {};         /* pid -> {state:'ok'|'bad'|'unknown', detail} — cached per session, NOT re-run on the 15s poll */
   var _healthTesting = {};    /* pid -> true while an /api/test key-health check is in flight */
+  var testCache = {};         /* pid -> persisted /api/test-cache row (tested_at, sample_models, ...) */
+  var TEST_STALE_MS = 12 * 3600 * 1000;   /* re-test automatically once a result is this old */
+  var _testProgress = { total: 0, done: 0 };
 
   /* ---------- helpers ---------- */
   function $(s, el){ return (el||document).querySelector(s); }
@@ -2477,7 +2503,7 @@
         '<label class="switch"><input type="checkbox" class="enable-toggle"' + (p.enabled ? ' checked' : '') + '><span class="track" aria-hidden="true"></span><span class="lbl">Enabled</span></label>' +
         '<span style="flex:1"></span>' +
         '<button type="button" class="btn sm primary act-save">Save</button>' +
-        '<button type="button" class="btn sm act-test"' + (p.has_key ? '' : ' disabled title="Save a key first"') + '>Test</button>' +
+        '<button type="button" class="btn sm act-test"' + ((p.has_key || p.no_key) ? '' : ' disabled title="Save a key first"') + '>Test</button>' +
       '</div>' +
       '<div class="testout" role="status"></div>';
   }
@@ -2710,7 +2736,35 @@
     else if (state === 'testing'){ if (lbl) lbl.textContent = 'testing…'; hEl.title = 'Testing saved key…'; }
     else { if (lbl) lbl.textContent = 'unknown'; hEl.title = (keyHealth[pid] && keyHealth[pid].detail) || 'Key test inconclusive'; }
   }
-  /* run one live key check via the shared /api/test route (20s cap). Result is CACHED;
+  /* Persisted results survive a page reload / hub restart — hydrate keyHealth from
+     them BEFORE deciding what (if anything) needs a fresh live test. Without this,
+     every single page visit re-tested every connected provider: a real generation
+     request spent just to redraw the dashboard. Best-effort: a fetch failure just
+     means nothing is pre-populated, same as before this existed. */
+  function hydrateTestCache(){
+    return api('/api/test-cache').then(function(r){
+      testCache = r || {};
+      Object.keys(testCache).forEach(function(pid){
+        var row = testCache[pid];
+        if (!row) return;
+        keyHealth[pid] = { state: row.ok ? 'ok' : 'bad', detail: row.detail || '' };
+      });
+    }).catch(function(){ /* no cache yet, or offline — fall through to live testing */ });
+  }
+  function updateTestProgress(){
+    var wrap = $('#test-progress'), fill = $('#test-progress-fill'), lbl = $('#test-progress-lbl');
+    if (!wrap) return;
+    var t = _testProgress.total, d = _testProgress.done;
+    if (t <= 0){ wrap.hidden = true; return; }
+    wrap.hidden = false;
+    if (fill) fill.style.width = Math.round((d / t) * 100) + '%';
+    if (lbl) lbl.textContent = d + ' / ' + t + ' tested';
+    if (d >= t){
+      setTimeout(function(){ if (_testProgress.done >= _testProgress.total) wrap.hidden = true; }, 1500);
+    }
+  }
+  /* run one live key check via the shared /api/test route (20s cap). Result is CACHED
+     (both in-memory and — server-side, via /api/test itself — to disk);
      a network blip / timeout => 'unknown' (neutral grey), never red. Never rejects. */
   function testKeyHealth(pid){
     _healthTesting[pid] = true;
@@ -2721,6 +2775,18 @@
       .then(function(r){
         r = r || {};
         keyHealth[pid] = { state: r.ok ? 'ok' : 'bad', detail: r.detail || '' };
+        testCache[pid] = Object.assign({}, testCache[pid], { ok: r.ok, detail: r.detail, tested_at: Date.now() / 1000 });
+        var newM = Array.isArray(r.new_models) ? r.new_models : [];
+        var staleM = Array.isArray(r.stale_models) ? r.stale_models : [];
+        if (newM.length){
+          toast('🆕 ' + (findProvider(pid) && findProvider(pid).name || pid) + ': new free model' +
+                (newM.length > 1 ? 's' : '') + ' detected — ' + newM.slice(0, 4).join(', '));
+        }
+        if (staleM.length){
+          toast('⚠ ' + (findProvider(pid) && findProvider(pid).name || pid) + ': ' +
+                staleM.slice(0, 3).join(', ') + (staleM.length > 3 ? '…' : '') +
+                ' no longer works (removed or deprecated)', true);
+        }
       })
       .catch(function(e){
         keyHealth[pid] = {
@@ -2732,10 +2798,16 @@
         clearTimeout(timer);
         delete _healthTesting[pid];
         applyCardHealth(cardForPid(pid), pid);
+        _testProgress.done++;
+        updateTestProgress();
       });
   }
   /* fan out key checks with a small concurrency cap so many keys don't fire at once */
   function runHealthChecks(pids){
+    if (!pids.length) return;
+    _testProgress.total = pids.length;
+    _testProgress.done = 0;
+    updateTestProgress();
     var queue = pids.slice();
     var CAP = 4;
     var active = 0;
@@ -2747,14 +2819,56 @@
     }
     pump();
   }
-  /* on load / after providers render: test every keyed provider we haven't tested yet */
+  /* on load / after providers render: auto-test only what's NEVER been verified or
+     whose persisted result has gone stale (TEST_STALE_MS) — not everything, every
+     time, which is what made a page reload cost a real generation request per
+     connected provider. */
   function scheduleKeyHealthChecks(){
+    var pids = [];
+    var now = Date.now();
+    for (var i = 0; i < providers.length; i++){
+      var p = providers[i];
+      if (!p || (!p.has_key && !p.no_key) || _healthTesting[p.id]) continue;
+      var cached = testCache[p.id];
+      var staleOrMissing = !cached || !cached.tested_at || (now - cached.tested_at * 1000) > TEST_STALE_MS;
+      if (staleOrMissing) pids.push(p.id);
+    }
+    if (pids.length) runHealthChecks(pids);
+  }
+  /* explicit "Test all" button: FORCE re-verification of every connected provider
+     right now, ignoring cache freshness — for right after adding/rotating keys. */
+  function testAllProviders(){
+    var btn = $('#test-all-btn');
     var pids = [];
     for (var i = 0; i < providers.length; i++){
       var p = providers[i];
-      if (p && p.has_key && !keyHealth[p.id] && !_healthTesting[p.id]) pids.push(p.id);
+      if (p && (p.has_key || p.no_key) && !_healthTesting[p.id]) pids.push(p.id);
     }
-    if (pids.length) runHealthChecks(pids);
+    if (!pids.length){ toast('No connected providers to test'); return; }
+    if (btn){
+      btn.disabled = true;
+      btn.innerHTML = '<svg class="spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg> Testing…';
+    }
+    _testProgress.total = pids.length;
+    _testProgress.done = 0;
+    updateTestProgress();
+    var queue = pids.slice();
+    var CAP = 4;
+    var active = 0;
+    function pump(){
+      if (!queue.length && !active){
+        if (btn){
+          btn.disabled = false;
+          btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg> Test all';
+        }
+        return;
+      }
+      while (active < CAP && queue.length){
+        active++;
+        testKeyHealth(queue.shift()).then(function(){ active--; pump(); });
+      }
+    }
+    pump();
   }
 
   /* ---------- copy buttons ---------- */
@@ -4816,7 +4930,14 @@
   loadImages();
   loadUsage();
   loadStatus().then(function(){ updateChatAuthNote(); updateImageAuthNote(); });
-  loadProviders().then(scheduleKeyHealthChecks);   /* colour keyed cards by live key health, capped concurrency */
+  /* hydrate persisted test results FIRST so cards paint instantly with the last
+     known status, THEN only live-test what's missing or stale — not everything. */
+  Promise.all([loadProviders(), hydrateTestCache()]).then(function(){
+    providers.forEach(function(p){ applyCardHealth(cardForPid(p.id), p.id); });
+    scheduleKeyHealthChecks();
+  });
+  var testAllBtn = $('#test-all-btn');
+  if (testAllBtn) testAllBtn.addEventListener('click', testAllProviders);
   loadProviderMode();
   loadModels().then(loadDefault).then(loadChatModels);
   loadClis();
