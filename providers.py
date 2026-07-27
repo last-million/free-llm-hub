@@ -323,6 +323,35 @@ PROVIDERS: Dict[str, dict] = {
                   "GOTCHA: it 403s python-urllib's default User-Agent — the hub uses "
                   "`requests`, which gets a clean 200, so this only bites hand-rolled tests."),
     },
+    "aihorde": {
+        "name": "AI Horde",
+        "base_url": "https://aihorde.net/api",
+        "models_url": None,
+        "signup_url": "https://aihorde.net/register",
+        "key_hint": "(optional — anonymous key 0000000000 used automatically if you skip this)",
+        "no_key": True,   # anonymous tier: no signup, no API key, no card required to use it
+        "free_filter": "pricing_zero",
+        "default_free_models": [],
+        # IMAGE GENERATION ONLY -- community-run, GPU-donated distributed
+        # inference network (formerly "Stable Horde"). LIVE-VERIFIED
+        # 2026-07-27: submitted a real job with the public anonymous key
+        # "0000000000", watched queue_position genuinely advance, downloaded
+        # the completed generation, hex-dumped it -> real WebP file
+        # (RIFF....WEBP header), zero payment, zero registration. Anonymous
+        # requests sit at the BACK of the queue (real test: ~24min initial
+        # ETA for a 512x512/20-step job, though it finished faster in
+        # practice) -- a free personal account/key (signup_url above) jumps
+        # priority dramatically and is worth doing if this becomes a
+        # regular fallback, but is not required for it to work at all.
+        "image_models": [
+            {"id": "stable_diffusion", "label": "Stable Diffusion (AI Horde)",
+             "text_in_image": "medium"},
+        ],
+        "notes": ("Volunteer GPU network, not a company -- no SLA, quality/speed depends on "
+                  "which workers are online right now. Genuinely free and keyless (fixed "
+                  "public anonymous key, not per-user). Register a free account for a "
+                  "personal key to skip the anonymous queue's low priority."),
+    },
     "cloudflare": {
         "name": "Cloudflare Workers AI",
         # ACCOUNT-SCOPED: this template is documentation, not a usable URL. The
