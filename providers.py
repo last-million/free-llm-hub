@@ -609,18 +609,6 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": [],
         "notes": "No free models — a $0.10/month credit allowance consumed at full pay-as-you-go rates (~17 requests on GLM-5.2, ~1,400 on Llama-3.1-8B), 'subject to change'. Note the widely-cited '1,000 requests / 5 min' is the Hub API bucket, NOT inference.",
     },
-    "scaleway": {
-        "name": "Scaleway",
-        "base_url": "https://api.scaleway.ai/v1",
-        "models_url": "https://api.scaleway.ai/v1/models",
-        "signup_url": "https://console.scaleway.com/iam/api-keys",
-        "key_hint": "...",
-        "paid": True,  # card mandatory + silent billing — keep OUT of free routing
-        "trial": True,  # quota.py FREE_LIMITS scaleway limit:0 — card mandatory before the first call, then a ONE-TIME 1M-token allowance and silent billing after it
-        "free_filter": "pricing_zero",
-        "default_free_models": [],
-        "notes": "No free tier — a validated payment method is MANDATORY before the first call. The only free part is a one-time 1,000,000-token allowance for new customers; after it, calls do NOT fail, they silently bill the card (llama-3.3-70b EUR 0.90/0.90 per M, glm-5.2 EUR 1.80/5.50) and NO response header exposes the remaining free tokens, so the switchover is undetectable. The old 'free beta' ended — the Generative API is GA with published per-token pricing.",
-    },
     # --- Chinese / additional free-tier providers (verified against official docs) ---
     "glm": {
         "name": "Z.AI (Zhipu GLM)",
@@ -640,35 +628,6 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": ["glm-4.7-flash", "glm-4.5-flash", "glm-4.6v-flash"],
         "vision_models": ["glm-4.6v-flash"],
         "notes": "PERMANENT free ($0 in/out): GLM-4.7-Flash (200K ctx), GLM-4.5-Flash, GLM-4.6V-Flash (vision). Note glm-4.7-FlashX is PAID despite the name. International z.ai (email/Google signup, no China phone). ~1 req/s, 1 concurrent; Z.AI publishes no request quota.",
-    },
-    "kimi": {
-        "name": "Kimi (Moonshot)",
-        "base_url": "https://api.moonshot.ai/v1",
-        "models_url": "https://api.moonshot.ai/v1/models",
-        "signup_url": "https://platform.moonshot.ai/console/api-keys",
-        "key_hint": "sk-...",
-        "paid": True,  # docs: "There is no free tier" — keep OUT of free routing
-        "free_filter": "pricing_zero",
-        "trial": True,
-        "default_free_models": [],
-        "notes": "No free tier — docs verbatim: 'There is no free tier. To prevent abuse, you need to recharge at least $1 to start using.' All 11 models are paid, so calls either hard-fail on an unfunded account or bill per token. The only documented incentive is a $5 voucher AFTER $5 of cumulative recharge (a rebate, not credit). For free Kimi weights, route via OpenRouter's moonshotai/* ':free' variants instead.",
-    },
-    "minimax": {
-        "name": "MiniMax",
-        "base_url": "https://api.minimax.io/v1",
-        # GET /v1/models IS documented now (this "no endpoint" note was stale),
-        # but discovery stays off deliberately: with the classification fixed
-        # (paid=True), is_free_model() rejects every id anyway, so enabling it
-        # would only enumerate a paid catalog. Wire it up only alongside a real
-        # zero-pricing check.
-        "models_url": None,
-        "signup_url": "https://platform.minimax.io/user-center/basic-information/interface-key",
-        "key_hint": "...",
-        "paid": True,  # NO free tier + fails by BILLING — keep OUT of free routing
-        "free_filter": "pricing_zero",
-        "trial": True,
-        "default_free_models": [],
-        "notes": "No free tier — the word 'free' appears nowhere in MiniMax's pricing docs (per-token billing or monthly subscription only). DANGEROUS: MiniMax-M2/M2.5 are real ids that cost ~$0.30/$1.20 per M, so calls SUCCEED, silently burn the ~30-day trial credits, then bill real money — nothing surfaces the mistake. Global api.minimax.io (China = api.minimaxi.com).",
     },
     "qwen": {
         "name": "Qwen (Alibaba Model Studio)",
@@ -794,21 +753,6 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": ["Meta-Llama-3_3-70B-Instruct", "Mixtral-8x7B-Instruct-v0.1"],
         "notes": "RECURRING free: ~2 req/min per IP, 20+ open models, EU-hosted. Full keys via an OVHcloud account.",
     },
-    "nebius": {
-        "name": "Nebius AI Studio",
-        "base_url": "https://api.studio.nebius.com/v1",
-        "models_url": "https://api.studio.nebius.com/v1/models",
-        "signup_url": "https://studio.nebius.com/",
-        "key_hint": "...",
-        "paid": True,  # $1 trial credit + card required — keep OUT of free routing
-        # pricing_zero is honest AND self-correcting here: GET
-        # /v1/models?verbose=true returns a Pricing object, so it matches nothing
-        # today and would auto-pick up a real $0 model later.
-        "free_filter": "pricing_zero",
-        "trial": True,
-        "default_free_models": [],
-        "notes": "No free tier — $1 trial credit valid 30 days, and a bank card (or bank transfer) IS required at onboarding; no $0 models. All 60+ models are paid. Note: 'Nebius AI Studio' is now 'Nebius Token Factory' (canonical base api.tokenfactory.nebius.com/v1); the studio host above is aliased, not broken.",
-    },
     "novita": {
         "name": "Novita AI",
         "base_url": "https://api.novita.ai/v3/openai",
@@ -849,31 +793,6 @@ PROVIDERS: Dict[str, dict] = {
         "free_filter": "all",
         "default_free_models": ["nova-2-pro-v1", "nova-2-lite-v1"],
         "notes": "Amazon Nova free developer tier (nova.amazon.com/dev). OpenAI-compatible.",
-    },
-    "chutes": {
-        "name": "Chutes",
-        "base_url": "https://llm.chutes.ai/v1",
-        "models_url": "https://llm.chutes.ai/v1/models",
-        "signup_url": "https://chutes.ai",
-        "key_hint": "cpk_...",
-        "paid": True,  # free tier retired 2026-03-15 — keep OUT of free routing
-        "trial": True,  # quota.py FREE_LIMITS chutes limit:0 — free tier retired 2026-03-15 and the prior "200/day Early Access" always required a $5 deposit (a consumable balance, never a tier)
-        # pricing_zero is mechanically supported here (the keyless endpoint DOES
-        # expose pricing:{prompt,completion}) and correct under either the TEE or
-        # full catalog — it just matches nothing today, which is the truth.
-        "free_filter": "pricing_zero",
-        "default_free_models": [],
-        "notes": "No free tier — fully retired 2026-03-15 (and the prior '200 free requests/day' Early Access always required a $5 deposit). Every one of the 13 live models is paid, $0.0245/$0.0978 up to GLM-5.2-TEE at $1.40/$4.40 per M. Subscription or pay-per-use only. NOTE: Chutes is a major upstream for OpenRouter's ':free' variants — those are free because OPENROUTER subsidizes them, and this hub already has that access via the openrouter entry.",
-    },
-    "targon": {
-        "name": "Targon",
-        "base_url": "https://api.targon.com/v1",
-        "models_url": "https://api.targon.com/v1/models",
-        "signup_url": "https://targon.com/",
-        "key_hint": "sn4_...",
-        "free_filter": "all",
-        "default_free_models": ["deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1"],
-        "notes": "Bittensor-backed inference; free tier for open models. OpenAI-compatible.",
     },
     "aimlapi": {
         "name": "AI/ML API",
@@ -988,24 +907,6 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": ["sonar", "sonar-pro", "sonar-reasoning", "sonar-reasoning-pro", "sonar-deep-research"],
         "paid": True,
         "notes": "Sonar models w/ live web search. Endpoint /chat/completions (NO /models list -> models hardcoded, was empty=unusable). $5 FREE API credit on first signup (trial), then paid."},
-    "inception": {"name": "Inception (Mercury)", "base_url": "https://api.inceptionlabs.ai/v1",
-        "models_url": "https://api.inceptionlabs.ai/v1/models", "signup_url": "https://platform.inceptionlabs.ai",
-        "key_hint": "any", "free_filter": "all", "default_free_models": [], "paid": True, "notes": "Diffusion-LLM (Mercury) — very fast. Paid — no free tier."},
-    "anthropic": {
-        "name": "Anthropic (Claude)",
-        # Anthropic's real API is POST /v1/messages (x-api-key + anthropic-version),
-        # NOT natively OpenAI-shaped. The hub posts {base_url}/chat/completions, so
-        # base_url points at Anthropic's OpenAI-compat endpoint (.../v1 -> /v1/chat/
-        # completions), NOT the bare host.
-        "base_url": "https://api.anthropic.com/v1",
-        "models_url": None,
-        "signup_url": "https://console.anthropic.com/settings/keys",
-        "key_hint": "sk-ant-...",
-        "paid": True,
-        "free_filter": "pricing_zero",
-        "default_free_models": [],
-        "notes": "Anthropic Claude — PAID, pay-as-you-go. Reachable via Anthropic's OpenAI-compat endpoint; pin models as anthropic/claude-...",
-    },
     # ── PAID image-generation-only providers (opt-in, explicit "<pid>/<model>"
     # pin ONLY — every image_models row here carries "free": False, which keeps
     # them out of _image_candidates()'s auto/manual rotation exactly like the
