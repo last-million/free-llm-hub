@@ -1113,6 +1113,125 @@ _dead_lock = threading.Lock()
 _DEAD_STATUSES = (402, 403, 404)
 
 
+# --------------------------------------------------------------------------- #
+# Persisted test-result cache. The dashboard used to re-test every keyed
+# provider on EVERY page load (nothing survived past the in-memory JS variable),
+# which meant a real generation request per provider on every single visit —
+# real quota spent just to redraw a page. Persist each /api/test/<pid> outcome
+# to disk so the dashboard can hydrate instantly from the LAST known result and
+# only re-test what's actually stale, while still detecting genuinely NEW free
+# models a provider adds over time (routing already discovers those live via
+# provider_free_models(); this is what makes the TEST/verification side of the
+# dashboard aware of them too, instead of only the invisible routing layer).
+# --------------------------------------------------------------------------- #
+TEST_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".free-llm-hub", "test_cache.json")
+_test_cache_lock = threading.Lock()
+
+
+def _load_test_cache():
+    try:
+        with open(TEST_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_test_cache(cache):
+    """Same atomic-write discipline as config.save_config: temp file + os.replace,
+    with a short retry loop for a Windows AV/cloud-sync lock. Best-effort — a
+    failure here must never break the test response the user is waiting on."""
+    try:
+        parent = os.path.dirname(TEST_CACHE_PATH)
+        os.makedirs(parent, exist_ok=True)
+        data = json.dumps(cache, indent=2, ensure_ascii=False)
+        fd, tmp_path = tempfile.mkstemp(prefix=".test_cache-", suffix=".tmp", dir=parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        for _attempt in range(6):
+            try:
+                os.replace(tmp_path, TEST_CACHE_PATH)
+                return
+            except PermissionError:
+                time.sleep(0.15)
+            except OSError:
+                break
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    except Exception:
+        logger.debug("[test-cache] save failed", exc_info=True)
+
+
+def _record_test_result(pid, ok, detail, sample_models, attempted=None):
+    """Persist one /api/test/<pid> outcome. Detects two things a provider can do
+    between visits, in EITHER direction:
+      new_models   — an id never seen in this provider's catalog before (a union
+                     across every test ever recorded, not just the last one, so
+                     a model added while the dashboard was closed still shows up).
+      stale_models — an id that was VERIFIED WORKING by an earlier real generation
+                     and is now either delisted (missing from the current catalog)
+                     or still listed but failing generation THIS run (silently
+                     deprecated — exactly the openrouter/nvidia/google cases found
+                     by hand tonight: still in /models, 404/410/429 on generation).
+    `attempted` is every (model, ok) pair this call actually ran a generation
+    against — normally just the ones tried before the loop found a winner or gave
+    up, NOT the whole candidate list, so this is coverage that accumulates over
+    repeated tests rather than a single exhaustive pass (keeps quota cost the
+    same as before; a full per-model audit is a separate, opt-in feature).
+    Returns (new_models, stale_models); both empty on the first recorded test for
+    a provider, so day-one never floods everything as new/stale."""
+    sample_models = [m for m in (sample_models or []) if isinstance(m, str)]
+    attempted = [(m, bool(a_ok)) for m, a_ok in (attempted or []) if isinstance(m, str)]
+    with _test_cache_lock:
+        cache = _load_test_cache()
+        prev = cache.get(pid) or {}
+        known_before = set(prev.get("known_models") or [])
+        verified_before = dict(prev.get("verified_models") or {})
+        new_models = [m for m in sample_models if m not in known_before] if prev else []
+
+        verified_now = dict(verified_before)
+        stale_models = []
+        if prev:
+            # (a) previously verified-working, now missing from the catalog entirely.
+            # Mark it ok=False in verified_now IMMEDIATELY (not just append to the
+            # report list) — otherwise the next run reads the same stale
+            # verified_before entry and re-flags the same model forever. This makes
+            # stale_models a one-time TRANSITION notice, not a recurring nag.
+            for m, info in verified_before.items():
+                if info.get("ok") and m not in sample_models:
+                    stale_models.append(m)
+                    verified_now[m] = {"ok": False, "at": time.time()}
+            # (b) previously verified-working, still listed, but THIS attempt failed.
+            for m, a_ok in attempted:
+                if not a_ok and verified_before.get(m, {}).get("ok") and m not in stale_models:
+                    stale_models.append(m)
+
+        # This run's actual attempts are the most current signal — apply them last
+        # so they win over the delisted-mark above if a model is somehow both.
+        for m, a_ok in attempted:
+            verified_now[m] = {"ok": a_ok, "at": time.time()}
+        # Bound growth: a provider's model list is at most a few hundred ids; drop
+        # the oldest once past a generous cap so this file can't grow unbounded.
+        if len(verified_now) > 300:
+            for m in sorted(verified_now, key=lambda k: verified_now[k].get("at", 0))[:len(verified_now) - 300]:
+                verified_now.pop(m, None)
+
+        cache[pid] = {
+            "ok": bool(ok),
+            "detail": detail or "",
+            "sample_models": sample_models[:8],
+            "known_models": sorted(known_before | set(sample_models))[:200],
+            "verified_models": verified_now,
+            "tested_at": time.time(),
+        }
+        _save_test_cache(cache)
+    return new_models, stale_models
+
+
 def _mark_model_dead(pid, model, status):
     if not model or status not in _DEAD_STATUSES:
         return
@@ -3599,12 +3718,34 @@ def api_test_provider(pid):
         return jsonify({"ok": False, "detail": "unknown provider", "sample_models": []}), 404
     pcfg = config.get_provider_config(pid)
     key = pcfg.get("api_key")
+    attempted = []  # (model, ok) for every REAL generation this call actually ran
+
+    def _finish(ok, detail, sample_models, cache=True):
+        """Single exit point for every REAL attempt (everything past the
+        precondition checks below). Persists the outcome and folds in any
+        newly-discovered or newly-broken free model ids so the dashboard can
+        show '🆕 <model>' / '⚠ <model> no longer works' without a separate
+        polling mechanism. cache=False is only for preconditions (unknown
+        provider, no key at all) that say nothing new about the provider's
+        live state and would just churn tested_at."""
+        payload = {"ok": bool(ok), "detail": detail, "sample_models": sample_models or []}
+        if cache:
+            try:
+                new_models, stale_models = _record_test_result(
+                    pid, ok, detail, sample_models, attempted=attempted)
+                payload["new_models"] = new_models
+                payload["stale_models"] = stale_models
+            except Exception:
+                logger.debug("[test-cache] record failed for %s", pid, exc_info=True)
+                payload["new_models"] = []
+                payload["stale_models"] = []
+        return jsonify(payload)
+
     # Pollinations-style anonymous tiers need no key at all — the ORIGINAL test
     # required one unconditionally, so a genuinely-working keyless provider always
     # read "No API key saved", the same kind of lie this rewrite exists to remove.
     if not key and _needs_key(pid):
-        return jsonify({"ok": False, "detail": "No API key saved for this provider.",
-                        "sample_models": []})
+        return _finish(False, "No API key saved for this provider.", [], cache=False)
     models_url = _models_url_for(pid, pcfg)
     sample_models = []
     models_list_note = None
@@ -3613,9 +3754,7 @@ def api_test_provider(pid):
             resp = requests.get(models_url, headers={"Authorization": "Bearer " + key},
                                 timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
         except requests.RequestException as exc:
-            return jsonify({"ok": False,
-                            "detail": _sanitize("%s: %s" % (exc.__class__.__name__, exc)),
-                            "sample_models": []})
+            return _finish(False, _sanitize("%s: %s" % (exc.__class__.__name__, exc)), [])
         if resp.status_code == 200:
             try:
                 sample_models = _parse_model_ids(resp.json())
@@ -3625,9 +3764,7 @@ def api_test_provider(pid):
         else:
             # Can't even list models -> the key itself is bad. No point spending a
             # generation attempt to learn the same thing twice.
-            return jsonify({"ok": False,
-                            "detail": "HTTP %d: %s" % (resp.status_code, _upstream_error_detail(resp)),
-                            "sample_models": []})
+            return _finish(False, "HTTP %d: %s" % (resp.status_code, _upstream_error_detail(resp)), [])
 
     # ALWAYS verify with a REAL generation — see docstring. Try every registry-
     # pinned default (not just the first): a provider often lists several free
@@ -3643,13 +3780,9 @@ def api_test_provider(pid):
             candidates.append(m)
     if not candidates:
         if models_list_note:
-            return jsonify({"ok": False,
-                            "detail": "Key authenticates (%s) but no allowed model to verify "
-                                      "generation with." % models_list_note,
-                            "sample_models": sample_models[:5]})
-        return jsonify({"ok": False,
-                        "detail": "Provider has no models_url and no default model to test with.",
-                        "sample_models": []})
+            return _finish(False, "Key authenticates (%s) but no allowed model to verify "
+                                  "generation with." % models_list_note, sample_models[:5])
+        return _finish(False, "Provider has no models_url and no default model to test with.", [])
 
     # Transient statuses (a live rate-limit blip, momentary overload) get ONE
     # retry after a short pause before moving to the next candidate — without
@@ -3670,15 +3803,17 @@ def api_test_provider(pid):
                 resp = None
                 break
             if resp.status_code == 200:
-                return jsonify({"ok": True,
-                                "detail": "Key OK — verified FREE generation works "
-                                          "(1-token chat succeeded on %s)." % model,
-                                "sample_models": (sample_models[:5] or [model])})
+                attempted.append((model, True))
+                return _finish(True,
+                               "Key OK — verified FREE generation works "
+                               "(1-token chat succeeded on %s)." % model,
+                               (sample_models[:5] or [model]))
             if resp.status_code in _TRANSIENT and attempt == 0:
                 time.sleep(2)
                 continue
             last_reason = "HTTP %d: %s" % (resp.status_code, _upstream_error_detail(resp))
             break
+        attempted.append((model, False))  # this candidate did not pan out — try the next
     # Every candidate authenticated but none could actually generate — the
     # spent-wallet case this whole rewrite exists to catch. Plain language, not
     # a bare HTTP status, so the verdict answers "will this work for free usage".
@@ -3688,7 +3823,17 @@ def api_test_provider(pid):
                   % (models_list_note, last_reason))
     else:
         detail = last_reason or "generation failed"
-    return jsonify({"ok": False, "detail": detail, "sample_models": sample_models[:5]})
+    return _finish(False, detail, sample_models[:5])
+
+
+@app.route("/api/test-cache", methods=["GET"])
+def api_test_cache():
+    """Persisted results from every /api/test/<pid> call ever made, so the
+    dashboard can hydrate instantly on load instead of re-testing (spending a
+    real generation request) on every single page visit. {pid: {ok, detail,
+    sample_models, tested_at, ...}}. Read-only, makes no upstream calls."""
+    with _test_cache_lock:
+        return jsonify(_load_test_cache())
 
 
 @app.route("/api/models", methods=["GET"])
