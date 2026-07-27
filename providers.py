@@ -511,16 +511,23 @@ PROVIDERS: Dict[str, dict] = {
         ],
         "free_filter": "family",
         "free_families": ["flash", "gemma"],
-        # Probed 2026-07-15: these 6 answered AND all read text out of a test
-        # PNG (real vision). gemini-2.0-flash returned 429 = free quota spent by
-        # probing, NOT broken, so it stays.
+        # Probed 2026-07-15: 6 answered AND all read text out of a test PNG (real
+        # vision) -- gemini-2.0-flash returned 429 THEN, read as "free quota spent
+        # by probing, not broken". Superseded 2026-07-26 by a full sweep sending a
+        # REAL generation request: gemini-2.5-pro and gemini-2.0-flash both 429
+        # "You exceeded your current quota" on a fresh key with no prior probing
+        # this session -- i.e. a genuine no-free-tier limit:0, not exhaustion. This
+        # matches exclude_families below (added later, from the same evidence) --
+        # that list correctly EXCLUDED them from discovery, but nobody had gone
+        # back to scrub these two hand-pinned defaults, so routing/testing could
+        # still pick a model the SAME registry entry documents as dead.
         "default_free_models": [
             "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
-            "gemini-2.5-pro", "gemini-2.0-flash", "gemma-4-31b-it",
+            "gemma-4-31b-it",
         ],
         "vision_models": [
             "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
-            "gemini-2.5-pro", "gemini-2.0-flash", "gemma-4-31b-it",
+            "gemma-4-31b-it",
         ],
         # IMAGE GENERATION — PAID, "free": False so these never enter auto image
         # routing (see _image_candidates() in app.py's per-model "free" filter):
