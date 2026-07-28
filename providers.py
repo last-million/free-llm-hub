@@ -695,6 +695,29 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": [],
         "notes": "Not a free tier — a consumable trial: 1,000,000 tokens PER MODEL, expiring 90 days after activating Model Studio, International (Singapore) deployment only. 'After the quota expires or is exhausted, you will be charged for continued use' (then AllocationQuota.FreeTierOnly errors). No permanently-free model exists. NOTE: the qwen-code CLI's OAuth path IS a genuine renewing free tier (2,000/day, 60 RPM) — different auth, would need its own entry.",
     },
+    "agentrouter": {
+        "name": "AgentRouter",
+        "base_url": "https://agentrouter.org/v1",
+        "models_url": "https://agentrouter.org/v1/models",
+        "signup_url": "https://agentrouter.org/console/token",
+        "key_hint": "sk-...",
+        # RE-ADDED 2026-07-27 at explicit user request, in the SAME opt-in-only
+        # shape it had before being removed on 2026-07-15 (also at user
+        # request, same reasoning) -- nothing about the underlying facts
+        # changed: still a THIRD-PARTY RELAY (prompts transit their infra, not
+        # Anthropic/OpenAI directly) fronting a ONE-TIME consumable signup
+        # credit ($100 via GitHub auth, more via referral), not a renewing
+        # free tier. No published rate limits; /v1/models 401s without a key,
+        # so nothing here is independently verifiable as free. User explicitly
+        # declined highlighting this as "recommended/free" or publishing a
+        # referral link -- paid + opt-in-pin-only is the whole ask.
+        "paid": True,
+        "trial": True,
+        "free_filter": "pricing_zero",
+        "free_families": [],
+        "default_free_models": [],
+        "notes": "No free models -- a third-party API relay (30+ upstream providers incl. Claude/GPT/Gemini) running on a ONE-TIME consumable signup credit; every call burns it, nothing renews. Requires GitHub OAuth to claim the credit on their site (separate from this hub -- only the resulting sk-... key is pasted here). All prompts transit a third-party reseller, not the model vendor directly. Also speaks /v1/responses + /v1/messages.",
+    },
     "siliconflow": {
         "name": "SiliconFlow",
         "base_url": "https://api.siliconflow.cn/v1",
