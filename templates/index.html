@@ -621,10 +621,18 @@
     width:100%;font-size:12px;line-height:1.5;border-radius:var(--radius-sm);
     padding:8px 11px;display:none;align-items:flex-start;gap:7px;overflow-wrap:anywhere;
   }
-  .sub-install-result.ok,.sub-install-result.err{display:flex}
+  .sub-install-result.ok,.sub-install-result.err,.sub-install-result.multi{display:flex}
+  .sub-install-result.multi{flex-direction:column;gap:5px;padding:8px 0;background:none;border:none}
   .sub-install-result .tr-i{flex:none;font-weight:700;line-height:1.45}
   .sub-install-result.ok{background:var(--accent-soft);color:#86efac;border:1px solid rgba(34,197,94,.25)}
   .sub-install-result.err{background:var(--danger-soft);color:#fca5a5;border:1px solid rgba(239,68,68,.25)}
+  /* One row per model in a multi-model relay's test result (subTestResultHTML) */
+  .sub-test-row{display:flex;align-items:flex-start;gap:7px;font-size:12px;line-height:1.5;
+    padding:6px 9px;border-radius:var(--radius-sm);overflow-wrap:anywhere}
+  .sub-test-row code{flex:none;font-size:11px;opacity:.85}
+  .sub-test-row.ok{background:var(--accent-soft);color:#86efac;border:1px solid rgba(34,197,94,.25)}
+  .sub-test-row.err{background:var(--danger-soft);color:#fca5a5;border:1px solid rgba(239,68,68,.25)}
+  .sub-test-row.skip{background:var(--surface-3);color:var(--text-faint);border:1px solid var(--border-soft)}
   .sub-login-box{
     margin-top:2px;padding-top:11px;border-top:1px solid var(--border-soft);
     display:flex;flex-direction:column;gap:8px;
@@ -3878,12 +3886,7 @@
       ? '<button type="button" class="btn sm act-sub-test"' + (testing ? ' disabled' : '') + '>' +
         (testing ? (SPIN_SVG + ' Testing…') : 'Test') + '</button>'
       : '';
-    var lastResult = _subTestResult[r.id];
-    var resultHTML = lastResult
-      ? ('<div class="sub-install-result ' + (lastResult.ok ? 'ok' : 'err') + '">' +
-         '<span class="tr-i" aria-hidden="true">' + (lastResult.ok ? '&check;' : '&cross;') + '</span>' +
-         '<span>' + esc(lastResult.ok ? ('Replied: ' + (lastResult.response || '')) : (lastResult.error || 'Test failed')) + '</span></div>')
-      : '<div class="sub-install-result" role="status" aria-live="polite"></div>';
+    var resultHTML = subTestResultHTML(_subTestResult[r.id]);
     return '' +
       '<div class="cli-card-top">' +
         '<div class="cli-card-id">' +
@@ -4017,12 +4020,10 @@
     api('/api/subscriptions/' + encodeURIComponent(r.id) + '/test', { method: 'POST' })
       .then(function(resp){
         resp = resp || {};
-        _subTestResult[r.id] = resp.ok
-          ? { ok: true, response: resp.response }
-          : { ok: false, error: resp.error || 'Test failed' };
+        _subTestResult[r.id] = { ok: !!resp.ok, results: Array.isArray(resp.results) ? resp.results : [] };
       })
       .catch(function(e){
-        _subTestResult[r.id] = { ok: false, error: e.message };
+        _subTestResult[r.id] = { ok: false, results: [], error: e.message };
       })
       .then(function(){
         clearInterval(elapsedTimer);
@@ -4031,14 +4032,29 @@
         if (!liveCard) return;   /* card no longer rendered (provider disabled/removed mid-test) */
         var liveOut = liveCard.querySelector('.sub-install-result');
         var liveBtn = liveCard.querySelector('.act-sub-test');
-        var result = _subTestResult[r.id];
-        if (liveOut && result){
-          liveOut.className = 'sub-install-result ' + (result.ok ? 'ok' : 'err');
-          liveOut.innerHTML = '<span class="tr-i" aria-hidden="true">' + (result.ok ? '&check;' : '&cross;') + '</span>' +
-                              '<span>' + esc(result.ok ? ('Replied: ' + (result.response || '')) : result.error) + '</span>';
-        }
+        if (liveOut) liveOut.outerHTML = subTestResultHTML(_subTestResult[r.id]);
         if (liveBtn) resetBtn(liveBtn, 'Test');
       });
+  }
+
+  /* One line per model this relay exposes -- ok/error/skipped -- instead of
+     a single pass/fail for the whole provider. Shared between doTestSub's
+     own completion handler and subCardHTML() (so a poll-time rebuild still
+     shows the last real result instead of reverting to blank). */
+  function subTestResultHTML(result){
+    if (!result) return '<div class="sub-install-result" role="status" aria-live="polite"></div>';
+    if (result.error && !result.results.length){
+      return '<div class="sub-install-result err"><span class="tr-i" aria-hidden="true">&cross;</span>' +
+             '<span>' + esc(result.error) + '</span></div>';
+    }
+    var rows = result.results.map(function(m){
+      var icon = m.skipped ? '&#8226;' : (m.ok ? '&check;' : '&cross;');
+      var cls = m.skipped ? 'skip' : (m.ok ? 'ok' : 'err');
+      var text = m.ok ? ('Replied: ' + (m.response || '')) : (m.error || 'failed');
+      return '<div class="sub-test-row ' + cls + '"><span class="tr-i" aria-hidden="true">' + icon + '</span>' +
+             '<code>' + esc(m.model) + '</code><span>' + esc(text) + '</span></div>';
+    }).join('');
+    return '<div class="sub-install-result multi">' + rows + '</div>';
   }
 
   function initSubscriptions(){
