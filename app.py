@@ -2187,7 +2187,15 @@ def _read_text(path):
 _SUB_AUTH_ERR = ("not logged in", "not authenticated", "unauthorized", "401",
                  "please run /login", "please login", "run `codex login`",
                  "run codex login", "invalid api key", "no credentials",
-                 "authentication_error", "session expired", "oauth")
+                 "authentication_error", "session expired", "oauth",
+                 # AgentRouter's own small separate quota pool (distinct from the
+                 # main wallet) -- MEASURED 2026-07-29: real error is "Failed to
+                 # authenticate. API Error: 403 token quota is not enough,
+                 # token remain quota: $X, need quota: $Y". Same bucket as the
+                 # auth failures above on purpose: both mean "not usable right
+                 # now", so this reuses the existing dead-for-6h skip instead of
+                 # burning a hop retrying it every request.
+                 "quota is not enough", "insufficient quota")
 
 
 def _sub_run(pid, prompt):
