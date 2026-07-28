@@ -2876,9 +2876,30 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         _skey = _session_key(messages)
         _pinned = _session_pin_get(_skey)
         if _pinned:
+            # The pin can point at a FREE candidate (agentic) OR at AgentRouter
+            # (deliberately not part of `agentic` — see the AGENTROUTER FIRST
+            # block below), so both need checking here; otherwise an
+            # AgentRouter-pinned task would silently get re-picked onto a free
+            # model mid-task the moment its model dropped out of `agentic`.
             for _c in agentic:
                 if (_c[1], _c[2]) == _pinned:
                     return _pinned[0], _pinned[1], difficulty
+            if _pinned[0] == "sub-agentrouter" and not _is_model_dead(*_pinned):
+                return _pinned[0], _pinned[1], difficulty
+        # AGENTROUTER FIRST — explicit user choice 2026-07-29: for a FRESH
+        # coding/agentic task (no pin above), try AgentRouter's best model
+        # BEFORE the free tier, not after. This spends real (shared, fragile)
+        # quota on purpose, so it's scoped to require_tools only, and only
+        # runs once per task — an in-progress task never switches mid-task,
+        # same guarantee the free tier gets from the pin above. Tries models
+        # in _sub_models' order (gpt-5.5 first); fail-open: any dead/exhausted
+        # model here just falls through to the free-tier pick below,
+        # unchanged, exactly like today whenever AgentRouter is off/unusable.
+        if "sub-agentrouter" in _sub_available_providers():
+            for _m in _sub_models("sub-agentrouter"):
+                if not _is_model_dead("sub-agentrouter", _m):
+                    _session_pin_set(_skey, "sub-agentrouter", _m)
+                    return "sub-agentrouter", _m, difficulty
         # WEIGHTED pick, not strict argmax — see _weighted_pick. `agentic` has
         # ALREADY been filtered to models that are available, not throttled, not
         # exhausted, tool-capable and big enough for this request — so this picks
