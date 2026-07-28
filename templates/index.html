@@ -3863,6 +3863,7 @@
           '<span class="track" aria-hidden="true"></span><span class="lbl">Isolated profile</span>' +
         '</label>' +
         (r.isolated ? '<button type="button" class="btn sm act-install-iso">' + esc(installBtnLabel) + '</button>' : '') +
+        (r.usable ? '<button type="button" class="btn sm act-sub-test">Test</button>' : '') +
       '</div>' +
       '<div class="sub-install-result" role="status" aria-live="polite"></div>' +
       '<div class="sub-login-slot"></div>';
@@ -3879,6 +3880,8 @@
     });
     var installBtn = card.querySelector('.act-install-iso');
     if (installBtn) installBtn.addEventListener('click', function(){ doInstallIsolated(r, installBtn, card); });
+    var testBtn = card.querySelector('.act-sub-test');
+    if (testBtn) testBtn.addEventListener('click', function(){ doTestSub(r, testBtn, card); });
     var slot = card.querySelector('.sub-login-slot');
     if (slot && r.isolated){
       if (r.isolated_login_command){
@@ -3930,6 +3933,39 @@
         }
         toast('Install failed: ' + e.message, true);
         resetBtn(btn, r.isolated_installed ? 'Reinstall isolated copy' : 'Install isolated copy');
+      });
+  }
+
+  /* One real, minimal request through the CLI relay -- honest pass/fail, not
+     just "installed + authenticated". Runs synchronously server-side (the
+     CLI subprocess is guaranteed gone, one way or another, before this
+     resolves), so nothing is left running after the result comes back. */
+  function doTestSub(r, btn, card){
+    var out = card ? card.querySelector('.sub-install-result') : null;
+    if (out){ out.className = 'sub-install-result'; out.innerHTML = ''; }
+    busyBtn(btn, 'Testing…');
+    api('/api/subscriptions/' + encodeURIComponent(r.id) + '/test', { method: 'POST' })
+      .then(function(resp){
+        resp = resp || {};
+        if (out){
+          if (resp.ok){
+            out.className = 'sub-install-result ok';
+            out.innerHTML = '<span class="tr-i" aria-hidden="true">&check;</span><span>Replied: ' +
+                            esc(resp.response || '') + '</span>';
+          } else {
+            out.className = 'sub-install-result err';
+            out.innerHTML = '<span class="tr-i" aria-hidden="true">&cross;</span><span>' +
+                            esc(resp.error || 'Test failed') + '</span>';
+          }
+        }
+        resetBtn(btn, 'Test');
+      })
+      .catch(function(e){
+        if (out){
+          out.className = 'sub-install-result err';
+          out.innerHTML = '<span class="tr-i" aria-hidden="true">&cross;</span><span>' + esc(e.message) + '</span>';
+        }
+        resetBtn(btn, 'Test');
       });
   }
 
