@@ -4993,6 +4993,27 @@ def api_subscriptions_install_isolated(pid):
     return jsonify({"ok": True, "bin_path": _short(bin_path), "install_dir": _short(install_dir)})
 
 
+@app.route("/api/subscriptions/<pid>/test", methods=["POST"])
+def api_subscriptions_test(pid):
+    """Run ONE real, minimal generation through this sub-* hop and report the
+    honest result -- the same "one real call, no false green" discipline
+    api_test_provider already applies to regular HTTP providers, now
+    available for a CLI relay too (the AgentRouter provider card's own Test
+    button can't do this: it exercises the direct-HTTP path, which is
+    permanently blocked by AgentRouter's WAF regardless of this feature).
+
+    _sub_run() is synchronous (subprocess.run blocks until the child exits
+    or the timeout kills it) -- there is nothing left running in the
+    background after this returns, by construction, no extra cleanup needed."""
+    if pid not in _SUB_PROVIDERS:
+        return jsonify({"ok": False, "error": "Unknown subscription provider '%s'."
+                                              % _sanitize(str(pid), 40)}), 400
+    status, text, detail = _sub_run(pid, "Reply with just the word OK, nothing else.")
+    if status == 200:
+        return jsonify({"ok": True, "response": text})
+    return jsonify({"ok": False, "error": detail or ("HTTP %d" % status)}), 200
+
+
 # ---------------------------------------------------------------------------
 # Agentic chat -- opt-in, full-tool-access coding-agent mode (project-scoped).
 # ADDITIVE to the _SUB_PROVIDERS/_sub_run/_subscription_chat system above; that
