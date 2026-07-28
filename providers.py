@@ -699,7 +699,7 @@ PROVIDERS: Dict[str, dict] = {
         "name": "AgentRouter",
         "base_url": "https://agentrouter.org/v1",
         "models_url": "https://agentrouter.org/v1/models",
-        "signup_url": "https://agentrouter.org/console/token",
+        "signup_url": "https://agentrouter.org/register?aff=udWz",  # user's own referral link, added at their explicit request 2026-07-27
         "key_hint": "sk-...",
         # RE-ADDED 2026-07-27 at explicit user request, in the SAME opt-in-only
         # shape it had before being removed on 2026-07-15 (also at user
@@ -708,15 +708,28 @@ PROVIDERS: Dict[str, dict] = {
         # Anthropic/OpenAI directly) fronting a ONE-TIME consumable signup
         # credit ($100 via GitHub auth, more via referral), not a renewing
         # free tier. No published rate limits; /v1/models 401s without a key,
-        # so nothing here is independently verifiable as free. User explicitly
-        # declined highlighting this as "recommended/free" or publishing a
-        # referral link -- paid + opt-in-pin-only is the whole ask.
+        # so nothing here is independently verifiable as free.
+        #
+        # PROBED LIVE 2026-07-27 with the user's real post-signup key: EVERY
+        # endpoint (/v1/models, /v1/chat/completions) returns 401
+        # "unauthorized client detected" regardless of headers/User-Agent
+        # tried. Root cause confirmed via multiple independent GitHub issues
+        # (OmniRoute #1921, opencode #5060, agentrouter-org/docs #21):
+        # AgentRouter runs a WAF that ONLY accepts traffic matching the
+        # official Claude Code CLI's exact client fingerprint and rejects
+        # every generic API client, including this hub. NOT fixable here
+        # without impersonating that fingerprint -- the same TLS/client-
+        # spoofing pattern already rejected as grey-hat/ToS-risk when
+        # evaluating OmniRoute for this project. So: registered, opt-in,
+        # signup_url carries a referral link at the user's explicit request,
+        # but a key pasted here will not actually work through this hub
+        # until/unless AgentRouter changes that policy.
         "paid": True,
         "trial": True,
         "free_filter": "pricing_zero",
         "free_families": [],
         "default_free_models": [],
-        "notes": "No free models -- a third-party API relay (30+ upstream providers incl. Claude/GPT/Gemini) running on a ONE-TIME consumable signup credit; every call burns it, nothing renews. Requires GitHub OAuth to claim the credit on their site (separate from this hub -- only the resulting sk-... key is pasted here). All prompts transit a third-party reseller, not the model vendor directly. Also speaks /v1/responses + /v1/messages.",
+        "notes": "⚠ DOES NOT CURRENTLY WORK THROUGH THIS HUB: AgentRouter's WAF only accepts the official Claude Code CLI's client fingerprint and 401s ('unauthorized client detected') every other API client, verified live 2026-07-27. No free models either way -- a third-party relay (30+ upstream providers incl. Claude/GPT/Gemini) on a ONE-TIME consumable signup credit; every call burns it, nothing renews. Signup link is the maintainer's own referral link. Requires GitHub OAuth to claim the credit on their site (separate from this hub). All prompts transit a third-party reseller, not the model vendor directly.",
     },
     "siliconflow": {
         "name": "SiliconFlow",
