@@ -1086,6 +1086,15 @@
   .card.nokey .key-form, .card.nokey .key-warn{ display:none; }
   .nokey-note{ font-size:12.5px; color:var(--accent); background:var(--accent-soft);
     border:1px solid rgba(34,197,94,.25); border-radius:var(--radius-sm); padding:7px 10px; }
+  /* Cross-link from a provider card whose direct Test can never pass (WAF-blocked
+     etc.) to the local-subscription relay that actually works instead. */
+  .relay-callout{ display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+    font-size:12.5px; border-radius:var(--radius-sm); padding:7px 10px; }
+  .relay-callout.ok{ color:var(--accent); background:var(--accent-soft); border:1px solid rgba(34,197,94,.25); }
+  .relay-callout.off{ color:var(--text-faint); background:var(--surface-3); border:1px solid var(--border-soft); }
+  .relay-callout .tr-i{ flex:none; }
+  .relay-callout span:nth-child(2){ flex:1 1 auto; min-width:160px; }
+  .relay-jump-btn{ flex:none; }
   .prov-cat-h.open .pc-t{ color:var(--accent); }
   /* Auto provider mode: Free only / Mix / Paid only */
   .prov-mode{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:0 0 14px; }
@@ -1823,6 +1832,11 @@
   var _ebSig = '';            /* last structural signature of the exhaustion banner */
   var keyHealth = {};         /* pid -> {state:'ok'|'bad'|'unknown', detail} — cached per session, NOT re-run on the 15s poll */
   var _healthTesting = {};    /* pid -> true while an /api/test key-health check is in flight */
+  var _subTesting = {};       /* pid -> true while a /api/subscriptions/<pid>/test is in flight —
+                                  survives the 15s loadSubscriptions(true) poll rebuilding the card
+                                  mid-test (a real CLI relay call can easily outlast 15s), same
+                                  fix pattern as _healthTesting above. */
+  var _subTestResult = {};    /* pid -> {ok, response, error} for the last completed sub-* test */
   var testCache = {};         /* pid -> persisted /api/test-cache row (tested_at, sample_models, ...) */
   var TEST_STALE_MS = 12 * 3600 * 1000;   /* re-test automatically once a result is this old */
   var _testProgress = { total: 0, done: 0 };
@@ -2558,6 +2572,13 @@
         '</div>' +
       '</div>' +
       (p.notes ? notesCardHTML(p.notes) : '') +
+      (p.relay ?
+        '<div class="relay-callout ' + (p.relay.usable ? 'ok' : 'off') + '">' +
+          '<span class="tr-i" aria-hidden="true">' + (p.relay.usable ? '&check;' : '&#8226;') + '</span>' +
+          '<span>This card\'s direct Test always fails (blocked upstream). The working path is <b>' +
+          esc(p.relay.name) + '</b> — ' + (p.relay.usable ? 'usable right now' : esc(p.relay.detail || 'not set up yet')) + '.</span>' +
+          '<button type="button" class="btn sm relay-jump-btn" data-jump-view="sec-subs">Go to Subscriptions</button>' +
+        '</div>' : '') +
       (fm.length ? '<div class="models-preview"><b>' + fm.length + ' free model' + (fm.length > 1 ? 's' : '') + ':</b> ' + esc(fmPrev) + '</div>' : '') +
       (p.signup_url ?
         '<a class="keylink" href="' + esc(p.signup_url) + '" target="_blank" rel="noopener noreferrer">' +
@@ -2647,6 +2668,14 @@
     var toggle = $('.enable-toggle', card);
     var out = $('.testout', card);
     var baseTouched = false;
+    var relayJumpBtn = $('.relay-jump-btn', card);
+    if (relayJumpBtn) relayJumpBtn.addEventListener('click', function(){
+      /* Reuses the real nav button's own click handling (wired once, at init,
+         in a different scope than this card) instead of duplicating the
+         view-switch logic here. */
+      var navBtn = document.querySelector('.cx-nav-item[data-view="' + relayJumpBtn.dataset.jumpView + '"]');
+      if (navBtn) navBtn.click();
+    });
     $('.key-form', card).addEventListener('submit', function(e){
       e.preventDefault();
       $('.act-save', card).click();
@@ -3844,6 +3873,17 @@
       ? '<span class="sub-mode-pill iso">Isolated profile</span>'
       : '<span class="sub-mode-pill">Shared install</span>';
     var installBtnLabel = r.isolated_installed ? 'Reinstall isolated copy' : 'Install isolated copy';
+    var testing = !!_subTesting[r.id];
+    var testBtnHTML = r.usable
+      ? '<button type="button" class="btn sm act-sub-test"' + (testing ? ' disabled' : '') + '>' +
+        (testing ? (SPIN_SVG + ' Testing…') : 'Test') + '</button>'
+      : '';
+    var lastResult = _subTestResult[r.id];
+    var resultHTML = lastResult
+      ? ('<div class="sub-install-result ' + (lastResult.ok ? 'ok' : 'err') + '">' +
+         '<span class="tr-i" aria-hidden="true">' + (lastResult.ok ? '&check;' : '&cross;') + '</span>' +
+         '<span>' + esc(lastResult.ok ? ('Replied: ' + (lastResult.response || '')) : (lastResult.error || 'Test failed')) + '</span></div>')
+      : '<div class="sub-install-result" role="status" aria-live="polite"></div>';
     return '' +
       '<div class="cli-card-top">' +
         '<div class="cli-card-id">' +
@@ -3863,9 +3903,9 @@
           '<span class="track" aria-hidden="true"></span><span class="lbl">Isolated profile</span>' +
         '</label>' +
         (r.isolated ? '<button type="button" class="btn sm act-install-iso">' + esc(installBtnLabel) + '</button>' : '') +
-        (r.usable ? '<button type="button" class="btn sm act-sub-test">Test</button>' : '') +
+        testBtnHTML +
       '</div>' +
-      '<div class="sub-install-result" role="status" aria-live="polite"></div>' +
+      resultHTML +
       '<div class="sub-login-slot"></div>';
   }
 
@@ -3936,36 +3976,68 @@
       });
   }
 
+  function subCardForPid(pid){
+    return document.querySelector('.cli-card[data-pid="' + CSS.escape(pid) + '"]');
+  }
+
   /* One real, minimal request through the CLI relay -- honest pass/fail, not
      just "installed + authenticated". Runs synchronously server-side (the
      CLI subprocess is guaranteed gone, one way or another, before this
-     resolves), so nothing is left running after the result comes back. */
+     resolves), so nothing is left running after the result comes back.
+
+     A real CLI relay call can easily take longer than the 15s
+     loadSubscriptions(true) poll (MEASURED live: anywhere from ~4s to over
+     40s depending on the upstream queue), which was rebuilding this card
+     mid-test via subCardHTML() and orphaning the `btn`/`card` references
+     captured at click time -- the test would finish, but write its result
+     into DOM nodes no longer on screen, and the fresh rebuilt button would
+     just show idle "Test" again with no visible outcome ("stuck"/"not
+     working"). Same fix pattern as _healthTesting on the main Providers
+     grid: track in-flight state in a persistent object subCardHTML() reads
+     on every render (so a poll-time rebuild still shows "Testing…"
+     correctly), and look up the CURRENT live card by data-pid when the
+     result lands instead of trusting the closured `btn`/`card`. The elapsed
+     counter exists BECAUSE of that measured up-to-40s+ range -- a silent
+     spinner for that long reads as broken even when it's working. */
   function doTestSub(r, btn, card){
-    var out = card ? card.querySelector('.sub-install-result') : null;
-    if (out){ out.className = 'sub-install-result'; out.innerHTML = ''; }
-    busyBtn(btn, 'Testing…');
+    _subTesting[r.id] = true;
+    delete _subTestResult[r.id];
+    if (card){
+      var out = card.querySelector('.sub-install-result');
+      if (out){ out.className = 'sub-install-result'; out.innerHTML = ''; }
+    }
+    var elapsedStart = Date.now();
+    function paintBusy(){
+      var liveCard = subCardForPid(r.id);
+      var liveBtn = liveCard ? liveCard.querySelector('.act-sub-test') : btn;
+      if (liveBtn) busyBtn(liveBtn, 'Testing… (' + Math.round((Date.now() - elapsedStart) / 1000) + 's)');
+    }
+    paintBusy();
+    var elapsedTimer = setInterval(paintBusy, 1000);
     api('/api/subscriptions/' + encodeURIComponent(r.id) + '/test', { method: 'POST' })
       .then(function(resp){
         resp = resp || {};
-        if (out){
-          if (resp.ok){
-            out.className = 'sub-install-result ok';
-            out.innerHTML = '<span class="tr-i" aria-hidden="true">&check;</span><span>Replied: ' +
-                            esc(resp.response || '') + '</span>';
-          } else {
-            out.className = 'sub-install-result err';
-            out.innerHTML = '<span class="tr-i" aria-hidden="true">&cross;</span><span>' +
-                            esc(resp.error || 'Test failed') + '</span>';
-          }
-        }
-        resetBtn(btn, 'Test');
+        _subTestResult[r.id] = resp.ok
+          ? { ok: true, response: resp.response }
+          : { ok: false, error: resp.error || 'Test failed' };
       })
       .catch(function(e){
-        if (out){
-          out.className = 'sub-install-result err';
-          out.innerHTML = '<span class="tr-i" aria-hidden="true">&cross;</span><span>' + esc(e.message) + '</span>';
+        _subTestResult[r.id] = { ok: false, error: e.message };
+      })
+      .then(function(){
+        clearInterval(elapsedTimer);
+        delete _subTesting[r.id];
+        var liveCard = subCardForPid(r.id);
+        if (!liveCard) return;   /* card no longer rendered (provider disabled/removed mid-test) */
+        var liveOut = liveCard.querySelector('.sub-install-result');
+        var liveBtn = liveCard.querySelector('.act-sub-test');
+        var result = _subTestResult[r.id];
+        if (liveOut && result){
+          liveOut.className = 'sub-install-result ' + (result.ok ? 'ok' : 'err');
+          liveOut.innerHTML = '<span class="tr-i" aria-hidden="true">' + (result.ok ? '&check;' : '&cross;') + '</span>' +
+                              '<span>' + esc(result.ok ? ('Replied: ' + (result.response || '')) : result.error) + '</span>';
         }
-        resetBtn(btn, 'Test');
+        if (liveBtn) resetBtn(liveBtn, 'Test');
       });
   }
 

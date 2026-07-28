@@ -4119,10 +4119,27 @@ def _mask_key(k):
     return s[:4] + "…" + s[-4:]
 
 
+# Providers that ONLY actually work through a local-subscription CLI relay
+# (see _SUB_PROVIDERS' agentrouter_relay entries) rather than direct HTTP --
+# lets the provider card link to and show the live status of the thing that
+# actually works, instead of just failing its own Test button silently.
+_PROVIDER_RELAY_SUB_PID = {"agentrouter": "sub-agentrouter"}
+
+
 def _provider_row(pid, live_models=False):
     p = prov.get_provider(pid) or {}
     pcfg = config.get_provider_config(pid)
     keys = pcfg.get("api_keys") or []
+    relay_pid = _PROVIDER_RELAY_SUB_PID.get(pid)
+    relay = None
+    if relay_pid and relay_pid in _SUB_PROVIDERS:
+        r_enabled, r_installed, r_authed, r_detail = _sub_state(relay_pid)
+        relay = {
+            "sub_pid": relay_pid,
+            "name": _SUB_PROVIDERS[relay_pid]["name"],
+            "usable": bool(r_enabled and r_installed and r_authed),
+            "detail": r_detail,
+        }
     # Provider rows never trigger a network model-discovery call by default:
     # a save/list must be instant and can't fail on a provider's flaky /models
     # endpoint. The live model list is served separately by GET /api/models.
@@ -4142,6 +4159,7 @@ def _provider_row(pid, live_models=False):
         "free_models": provider_free_models(pid, live=live_models),
         "image_free_count": sum(1 for r in _image_model_rows(pid) if r.get("free", True)),
         "image_paid_count": sum(1 for r in _image_model_rows(pid) if not r.get("free", True)),
+        "relay": relay,
     }
 
 
