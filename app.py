@@ -1752,10 +1752,27 @@ _SUB_PROVIDERS = {
     # auth/argv/env branches below (_sub_isolated_on/_sub_state/_sub_env/
     # _sub_run) instead of the OAuth-subscription path sub-codex uses.
     "sub-agentrouter": {
-        "name": "AgentRouter relay (isolated Codex)",
+        "name": "AgentRouter relay (isolated Codex + Claude)",
         "bin": "codex",
-        "model": "gpt-5.5",          # cheapest/fastest verified-working id; Opus needs more balance than typically remains
         "cli_id": "codex-agentrouter",
+        "claude_bin": "claude",
+        "claude_cli_id": "claude-agentrouter",
+        # Every id here VERIFIED live 2026-07-29 as actually reachable (not
+        # just documented) -- everything else tried (glm-5.1, kimi-k3,
+        # kimi-k2.6, step3p5-code-alpha, gpt-5.6-sol, gpt-5, gpt-5.1,
+        # gpt-5.5-mini, guessed "-thinking" suffixes) hung indefinitely with
+        # zero response on AgentRouter's own backend -- not included, they
+        # don't work, retrying them would just burn a hop every time.
+        # gpt-5.5 has real headroom in its own balance. glm-5.2 and every
+        # claude-* id share AgentRouter's small SEPARATE quota pool (verified:
+        # same $-remaining figure across all of them, draining independent of
+        # my own success/failure) and may 403 "quota is not enough" until
+        # that refills -- _sub_run's dead-marking (_SUB_AUTH_ERR) skips
+        # whichever ones are currently out of quota automatically, so this
+        # hop just falls through to whichever model/provider is actually
+        # affordable right now.
+        "models": ["gpt-5.5", "glm-5.2", "claude-fable-5", "claude-opus-4-6",
+                   "claude-opus-4-8", "claude-opus-5"],
         "flag": "sub_agentrouter_enabled",
         "agentrouter_relay": True,
     },
@@ -1802,9 +1819,20 @@ _SUB_MAX_PROMPT_CHARS = 100000
 # cannot click through OAuth consent for them.
 # --------------------------------------------------------------------------- #
 _ISOLATED_ENV_VAR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME",
-                     "codex-agentrouter": "CODEX_HOME"}
+                     "codex-agentrouter": "CODEX_HOME", "claude-agentrouter": "CLAUDE_CONFIG_DIR"}
 _ISOLATED_NPM_PACKAGE = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex",
-                         "codex-agentrouter": "@openai/codex"}   # same package, separate install dir
+                         "codex-agentrouter": "@openai/codex",          # same package, separate install dir
+                         "claude-agentrouter": "@anthropic-ai/claude-code"}
+
+
+def _agentrouter_backend(model):
+    """Which underlying CLI+protocol an AgentRouter model needs. Every Claude
+    model id VERIFIED reachable on AgentRouter (2026-07-29) starts with
+    "claude-" (claude-opus-4-6, claude-opus-4-8, claude-opus-5, claude-fable-
+    5) and needs the Anthropic Messages protocol, which only the `claude`
+    binary speaks; every other verified model (gpt-5.5, glm-5.2) speaks the
+    OpenAI-compatible surface `codex` already handles."""
+    return "claude" if str(model or "").startswith("claude-") else "codex"
 _ISOLATED_INSTALL_TIMEOUT = 300   # npm install can be slow; this is an admin click, not a hop
 
 
@@ -1915,9 +1943,19 @@ def _is_sub(pid):
 
 
 def _sub_models(pid):
-    """The model id(s) a sub provider exposes (one each, by design)."""
+    """The model id(s) a sub provider exposes. sub-claude/sub-codex still use
+    the original single "model" key (one each, by design -- the whole point
+    is "your logged-in session", not model choice). agentrouter_relay
+    providers use a "models" list instead, since unlike a subscription this
+    is choosing among several real backend models -- each becomes its own
+    addressable 'sub-agentrouter/<model>' fallback hop (_build_chain already
+    iterates every entry this returns, so returning >1 here is all it takes)."""
     cfg = _SUB_PROVIDERS.get(pid)
-    return [cfg["model"]] if cfg else []
+    if not cfg:
+        return []
+    if "models" in cfg:
+        return list(cfg["models"])
+    return [cfg["model"]] if cfg.get("model") else []
 
 
 def _sub_master_on():
@@ -1925,21 +1963,27 @@ def _sub_master_on():
     return bool(config.get_flag(_SUB_MASTER_FLAG, False))
 
 
-def _sub_bin(pid):
+def _sub_bin(pid, model=None):
     """Absolute path to the CLI binary, or None. Never raises.
 
     When the isolated profile is ON for this provider, resolves ONLY inside its
     isolated install dir — it deliberately does NOT fall back to the shared
     PATH copy, since silently mixing the two would defeat the point of
     isolation (a "not installed" isolated provider must show as not installed,
-    even if the user's regular `claude`/`codex` is right there on PATH)."""
+    even if the user's regular `claude`/`codex` is right there on PATH).
+
+    `model` only matters for agentrouter_relay providers, which span TWO
+    backends (see _agentrouter_backend) -- everything else ignores it."""
     cfg = _SUB_PROVIDERS.get(pid)
     if not cfg:
         return None
+    bin_name, cli_id = cfg["bin"], cfg["cli_id"]
+    if cfg.get("agentrouter_relay") and _agentrouter_backend(model) == "claude":
+        bin_name, cli_id = cfg["claude_bin"], cfg["claude_cli_id"]
     try:
         if _sub_isolated_on(pid):
-            return _isolated_bin_path(cfg["cli_id"], cfg["bin"])
-        return shutil.which(cfg["bin"])
+            return _isolated_bin_path(cli_id, bin_name)
+        return shutil.which(bin_name)
     except Exception:
         return None
 
@@ -2015,13 +2059,29 @@ def _sub_state(pid):
         return False, False, False, "Unknown subscription provider."
     enabled = bool(config.get_flag(cfg["flag"], True))   # per-provider default ON
     isolated = _sub_isolated_on(pid)
-    path = _sub_bin(pid)
-    if not path:
-        if isolated:
-            return enabled, False, False, ("Isolated copy not installed yet (looked under %s). "
+    if cfg.get("agentrouter_relay"):
+        # Two independent backends (codex for gpt-5.5/glm-5.2, claude for
+        # every claude-* id) -- fail-open on "installed": usable if EITHER
+        # is present, same "don't block the whole relay over one missing
+        # piece" logic as everywhere else in this hub. _sub_run/_sub_bin
+        # separately resolve the right one per-model at call time.
+        codex_path = _isolated_bin_path(cfg["cli_id"], cfg["bin"]) if isolated else shutil.which(cfg["bin"])
+        claude_path = (_isolated_bin_path(cfg["claude_cli_id"], cfg["claude_bin"]) if isolated
+                      else shutil.which(cfg["claude_bin"]))
+        path = codex_path or claude_path
+        if not path:
+            return enabled, False, False, ("Neither backend installed yet (looked under %s and %s). "
                                            "Click \"Install isolated copy\"."
-                                           % _short(_isolated_install_dir(cfg["cli_id"])))
-        return enabled, False, False, "Not installed (no '%s' on PATH)." % cfg["bin"]
+                                           % (_short(_isolated_install_dir(cfg["cli_id"])),
+                                              _short(_isolated_install_dir(cfg["claude_cli_id"]))))
+    else:
+        path = _sub_bin(pid)
+        if not path:
+            if isolated:
+                return enabled, False, False, ("Isolated copy not installed yet (looked under %s). "
+                                               "Click \"Install isolated copy\"."
+                                               % _short(_isolated_install_dir(cfg["cli_id"])))
+            return enabled, False, False, "Not installed (no '%s' on PATH)." % cfg["bin"]
     if isolated:
         # An isolated install reads ONLY its own CODEX_HOME/CLAUDE_CONFIG_DIR — a
         # directory Auto-fix never writes to — so it can NEVER loop back into this
@@ -2041,9 +2101,10 @@ def _sub_state(pid):
         if not ar_keys:
             return enabled, True, False, ("No AgentRouter API key saved yet — "
                                           "paste one on the AgentRouter provider card first.")
-        return enabled, True, True, ("Ready — relays through a dedicated isolated Codex copy "
-                                     "(%s), never touches your real Claude Code/Codex session."
-                                     % _short(path))
+        backends_ready = [n for n, p in (("Codex", codex_path), ("Claude", claude_path)) if p]
+        return enabled, True, True, ("Ready (%s backend%s installed) — relays through dedicated "
+                                     "isolated copies, never touches your real Claude Code/Codex session."
+                                     % (" + ".join(backends_ready), "" if len(backends_ready) == 1 else "s"))
     if pid == "sub-codex":
         codex_home = _isolated_config_dir("codex") if isolated else None
         ok, detail = _codex_subscription_auth(codex_home)
@@ -2069,9 +2130,13 @@ def _sub_available_providers():
     if not _sub_master_on():
         return []
     out = []
-    for pid, cfg in _SUB_PROVIDERS.items():
+    for pid in _SUB_PROVIDERS:
         enabled, _installed, authed, _detail = _sub_state(pid)
-        if enabled and authed and not _is_model_dead(pid, cfg["model"]):
+        # Fail-open across a multi-model pid: available if AT LEAST ONE of its
+        # models isn't currently dead (e.g. one AgentRouter model 403'd out of
+        # quota doesn't have to take the whole relay down -- _build_chain
+        # still only offers the live ones, via _sub_models further down).
+        if enabled and authed and any(not _is_model_dead(pid, m) for m in _sub_models(pid)):
             out.append(pid)
     return out
 
@@ -2126,7 +2191,7 @@ def _sub_launcher(path):
     return [path]
 
 
-def _sub_env(pid=None):
+def _sub_env(pid=None, model=None):
     """Child env with every HUB-POINTING override stripped, so the CLI talks to
     its own subscription backend and can't be redirected back into this hub.
     Defense in depth — _sub_loops_back() already refuses a CLI configured to
@@ -2138,22 +2203,37 @@ def _sub_env(pid=None):
     CLI's own config-dir override env var (CODEX_HOME / CLAUDE_CONFIG_DIR) at
     its isolated config dir (creating it first — Codex refuses to use a
     CODEX_HOME that doesn't already exist), so the subprocess never touches
-    ~/.claude or ~/.codex at all."""
+    ~/.claude or ~/.codex at all.
+
+    `model` picks which of agentrouter_relay's two backends to configure
+    (see _agentrouter_backend) -- irrelevant for every other pid."""
     env = dict(os.environ)
     for k in list(env.keys()):
         if _points_at_hub(env.get(k)):
             env.pop(k, None)
     if pid and _sub_isolated_on(pid):
         cfg = _SUB_PROVIDERS.get(pid) or {}
-        cli_id = cfg.get("cli_id")
+        is_agentrouter = cfg.get("agentrouter_relay")
+        backend = _agentrouter_backend(model) if is_agentrouter else None
+        cli_id = cfg.get("claude_cli_id") if backend == "claude" else cfg.get("cli_id")
         var = _ISOLATED_ENV_VAR.get(cli_id)
         if var and cli_id:
             _ensure_isolated_dirs(cli_id)
             env[var] = _isolated_config_dir(cli_id)
-        if cfg.get("agentrouter_relay"):
+        if is_agentrouter:
             ar_key = ((config.get_provider_config("agentrouter") or {}).get("api_keys") or [None])[0]
             if ar_key:
-                env["AGENTROUTER_API_KEY"] = ar_key
+                if backend == "claude":
+                    # Real Claude Code convention (verified live 2026-07-28):
+                    # ANTHROPIC_AUTH_TOKEN is sent as a Bearer token, and
+                    # AgentRouter's docs are explicit the Anthropic surface's
+                    # base URL has NO /v1 -- the client appends that itself.
+                    env["ANTHROPIC_AUTH_TOKEN"] = ar_key
+                    env["ANTHROPIC_BASE_URL"] = "https://agentrouter.org"
+                    if model:
+                        env["ANTHROPIC_MODEL"] = model
+                else:
+                    env["AGENTROUTER_API_KEY"] = ar_key
     return env
 
 
@@ -2198,7 +2278,7 @@ _SUB_AUTH_ERR = ("not logged in", "not authenticated", "unauthorized", "401",
                  "quota is not enough", "insufficient quota")
 
 
-def _sub_run(pid, prompt):
+def _sub_run(pid, prompt, model=None):
     """Run the local CLI ONCE, non-interactively. NEVER raises.
 
     Returns (status, text, detail) where `status` mirrors an HTTP code the chain
@@ -2208,12 +2288,18 @@ def _sub_run(pid, prompt):
       413 -> prompt over _SUB_MAX_PROMPT_CHARS (request-specific, NOT dead)
       504 -> timed out       502 -> ran but failed / produced nothing
 
+    `model` selects WHICH model for a multi-model pid (currently only
+    sub-agentrouter -- see _agentrouter_backend); ignored otherwise, since
+    sub-claude/sub-codex only ever expose "your logged-in session".
+
     Invocation (flags verified against `claude --help` / `codex exec --help`):
       claude -> `claude -p --output-format text`, prompt on STDIN (print mode
         reads a piped stdin as the prompt). NO --dangerously-skip-permissions and
         no tool flags: a plain text completion, nothing else. NOT `--bare` either
         — that mode refuses to read the OAuth session and demands an API key,
-        i.e. the exact opposite of "use my subscription".
+        i.e. the exact opposite of "use my subscription". For the AgentRouter
+        Claude backend, ANTHROPIC_MODEL/_BASE_URL/_AUTH_TOKEN (set in _sub_env)
+        redirect this SAME plain invocation at AgentRouter instead.
       codex  -> `codex exec --skip-git-repo-check --color never --sandbox
         read-only -o <tmp> -`. The trailing '-' reads the prompt from STDIN, and
         -o writes ONLY the final assistant message to <tmp>, so Codex's banner /
@@ -2238,12 +2324,19 @@ def _sub_run(pid, prompt):
         return 413, "", ("Prompt is %d chars; the local %s CLI is capped at %d here "
                          "(a CLI hangs on very large prompts)."
                          % (len(prompt), cfg["bin"], _SUB_MAX_PROMPT_CHARS))
-    path = _sub_bin(pid)
+    backend = _agentrouter_backend(model) if cfg.get("agentrouter_relay") else None
+    bin_name = cfg["claude_bin"] if backend == "claude" else cfg["bin"]
+    path = _sub_bin(pid, model)
     if not path:
-        return 403, "", "'%s' is no longer on PATH." % cfg["bin"]
+        return 403, "", "'%s' is no longer on PATH." % bin_name
     tmp_out = None
     try:
-        if pid in ("sub-codex", "sub-agentrouter"):
+        if backend == "claude":
+            # Anthropic-protocol path -- plain `claude -p`, exactly like
+            # sub-claude's own invocation; the model/base-url/token swap
+            # happens entirely through env vars (_sub_env), not argv.
+            argv = _sub_launcher(path) + ["-p", "--output-format", "text"]
+        elif pid in ("sub-codex", "sub-agentrouter"):
             try:
                 fd, tmp_out = tempfile.mkstemp(prefix="hub-sub-", suffix=".txt")
                 os.close(fd)
@@ -2263,7 +2356,7 @@ def _sub_run(pid, prompt):
                     "-c", 'model_providers.agentrouter.env_key="AGENTROUTER_API_KEY"',
                     "-c", 'model_providers.agentrouter.wire_api="responses"',
                     "-c", 'model_provider="agentrouter"',
-                    "-c", 'model="%s"' % cfg["model"],
+                    "-c", 'model="%s"' % (model or (cfg.get("models") or [""])[0]),
                 ]
             argv += ["-o", tmp_out, "-"]
         else:
@@ -2271,24 +2364,34 @@ def _sub_run(pid, prompt):
         try:
             proc = subprocess.run(argv, input=prompt, capture_output=True, text=True,
                                   encoding="utf-8", errors="replace",
-                                  timeout=_SUB_TIMEOUT, env=_sub_env(pid),
+                                  timeout=_SUB_TIMEOUT, env=_sub_env(pid, model),
                                   cwd=tempfile.gettempdir())
         except subprocess.TimeoutExpired:
-            return 504, "", "%s timed out after %ds." % (cfg["bin"], _SUB_TIMEOUT)
+            return 504, "", "%s timed out after %ds." % (bin_name, _SUB_TIMEOUT)
         except (OSError, ValueError) as exc:
-            return 502, "", "%s failed to start: %s" % (cfg["bin"], exc.__class__.__name__)
+            return 502, "", "%s failed to start: %s" % (bin_name, exc.__class__.__name__)
         text = (proc.stdout or "").strip()
-        if pid in ("sub-codex", "sub-agentrouter"):
+        if pid in ("sub-codex", "sub-agentrouter") and backend != "claude":
             last = _read_text(tmp_out).strip()
             text = last or _codex_strip_noise(proc.stdout)
+        # Claude Code can print a hard failure straight to stdout with exit 0
+        # (MEASURED 2026-07-29: AgentRouter's quota-exhausted error --
+        # "Failed to authenticate. API Error: 403 token quota is not
+        # enough...") rather than stderr/non-zero exit, so a naive
+        # non-empty-stdout=success check would return that error text as if
+        # it were a real reply. Same classification list as the exit!=0 path
+        # below, just checked against stdout too when this is the claude
+        # backend.
+        if backend == "claude" and text and any(s in text.lower() for s in _SUB_AUTH_ERR):
+            return 403, "", _sanitize(text, 300)
         if not text:
             err = _sanitize((proc.stderr or "").strip(), 300)
             if proc.returncode != 0:
                 low = (err or "").lower()
                 status = 403 if any(s in low for s in _SUB_AUTH_ERR) else 502
                 return status, "", ("%s exited %d: %s"
-                                    % (cfg["bin"], proc.returncode, err or "no detail"))
-            return 502, "", "%s produced no output. %s" % (cfg["bin"], err or "")
+                                    % (bin_name, proc.returncode, err or "no detail"))
+            return 502, "", "%s produced no output. %s" % (bin_name, err or "")
         return 200, text, None
     finally:
         if tmp_out:
@@ -2332,9 +2435,10 @@ def _subscription_chat(pid, payload):
     streams. Shape matches _upstream_chat's contract so every downstream
     translator (_chat_to_responses / _openai_resp_to_anthropic) just works."""
     cfg = _SUB_PROVIDERS.get(pid) or {}
-    model = payload.get("model") or cfg.get("model") or "cli"
+    default_model = cfg.get("model") or ((cfg.get("models") or [None])[0])
+    model = payload.get("model") or default_model or "cli"
     prompt = _sub_flatten(payload.get("messages"))
-    status, text, detail = _sub_run(pid, prompt)
+    status, text, detail = _sub_run(pid, prompt, model=model)
     # Count usage like any other provider so the dashboard shows it. sub-* has no
     # researched row in quota.FREE_LIMITS, so it inherits DEFAULT_LIMIT
     # (limit: None) -> reported as UNKNOWN and NEVER as exhausted, which is right:
@@ -4916,10 +5020,12 @@ def _sub_provider_rows():
         isolated = _sub_isolated_on(pid)
         iso_bin = _isolated_bin_path(cli_id, cfg["bin"])
         login_cmd, login_note = _isolated_login_command(pid)
-        rows.append({
+        models = _sub_models(pid)
+        row = {
             "id": pid,
             "name": cfg["name"],
-            "model": pid + "/" + cfg["model"],
+            "model": pid + "/" + (models[0] if models else "cli"),   # primary, for legacy display
+            "models": [pid + "/" + m for m in models],   # every addressable model, for a multi-model relay
             "bin": cfg["bin"],
             "installed": installed,
             "authenticated": authed,
@@ -4937,7 +5043,15 @@ def _sub_provider_rows():
             "isolated_env_var": _ISOLATED_ENV_VAR.get(cli_id),
             "isolated_login_command": login_cmd,
             "isolated_login_note": login_note,
-        })
+        }
+        if cfg.get("agentrouter_relay"):
+            # Second, independent backend (Claude models need the Anthropic
+            # CLI, not Codex) -- surfaced separately so the dashboard can show
+            # (and install) both halves instead of just the primary one.
+            claude_cli_id = cfg["claude_cli_id"]
+            row["claude_isolated_installed"] = bool(_isolated_bin_path(claude_cli_id, cfg["claude_bin"]))
+            row["claude_isolated_install_dir"] = _short(_isolated_install_dir(claude_cli_id))
+        rows.append(row)
     return rows
 
 
@@ -5008,14 +5122,32 @@ def api_subscriptions_install_isolated(pid):
         return jsonify({"error": "Unknown subscription provider '%s'."
                                  % _sanitize(str(pid), 40)}), 400
     cfg = _SUB_PROVIDERS[pid]
-    cli_id = cfg["cli_id"]
+    ok, result = _install_isolated_cli(cfg["cli_id"], cfg["bin"])
+    if not ok:
+        return jsonify(result), result.pop("_status", 502)
+    if cfg.get("agentrouter_relay"):
+        # Second, independent backend -- Claude models need the Anthropic
+        # CLI, not Codex. Both installs run in the same click (an admin
+        # action, not a hop) so "Install isolated copy" sets up the WHOLE
+        # relay in one go instead of leaving the Claude half silently absent.
+        ok2, result2 = _install_isolated_cli(cfg["claude_cli_id"], cfg["claude_bin"])
+        result["claude_backend"] = result2 if ok2 else {"ok": False, "error": result2.get("error")}
+    return jsonify(result)
+
+
+def _install_isolated_cli(cli_id, bin_name):
+    """`npm install -g <pkg> --prefix <isolated dir>` for one isolated CLI
+    namespace. Returns (ok, result_dict) -- result_dict is always a plain
+    JSON-able dict; on failure it also carries "_status" (popped by the
+    caller before jsonify) so each failure mode keeps its own HTTP code."""
     pkg = _ISOLATED_NPM_PACKAGE.get(cli_id)
     if not pkg:
-        return jsonify({"ok": False, "error": "No known npm package for '%s'." % cli_id}), 400
+        return False, {"ok": False, "error": "No known npm package for '%s'." % cli_id, "_status": 400}
     npm = shutil.which("npm")
     if not npm:
-        return jsonify({"ok": False, "error":
-                        "npm is not on PATH. Install Node.js first (nodejs.org), then retry."}), 400
+        return False, {"ok": False, "error":
+                       "npm is not on PATH. Install Node.js first (nodejs.org), then retry.",
+                       "_status": 400}
     _ensure_isolated_dirs(cli_id)
     install_dir = _isolated_install_dir(cli_id)
     argv = _sub_launcher(npm) + ["install", "-g", pkg, "--prefix", install_dir]
@@ -5024,42 +5156,61 @@ def api_subscriptions_install_isolated(pid):
                               errors="replace", timeout=_ISOLATED_INSTALL_TIMEOUT,
                               cwd=tempfile.gettempdir())
     except subprocess.TimeoutExpired:
-        return jsonify({"ok": False, "error": "npm install timed out after %ds."
-                                              % _ISOLATED_INSTALL_TIMEOUT}), 504
+        return False, {"ok": False, "error": "npm install timed out after %ds."
+                                             % _ISOLATED_INSTALL_TIMEOUT, "_status": 504}
     except (OSError, ValueError) as exc:
-        return jsonify({"ok": False, "error": "npm failed to start: %s"
-                                              % exc.__class__.__name__}), 502
+        return False, {"ok": False, "error": "npm failed to start: %s"
+                                             % exc.__class__.__name__, "_status": 502}
     if proc.returncode != 0:
         err = _sanitize(((proc.stderr or "") + "\n" + (proc.stdout or "")).strip(), 2000)
-        return jsonify({"ok": False, "error": "npm install exited %d: %s"
-                                              % (proc.returncode, err or "no detail")}), 502
-    bin_path = _isolated_bin_path(cli_id, cfg["bin"])
+        return False, {"ok": False, "error": "npm install exited %d: %s"
+                                             % (proc.returncode, err or "no detail"), "_status": 502}
+    bin_path = _isolated_bin_path(cli_id, bin_name)
     if not bin_path:
-        return jsonify({"ok": False, "error":
-                        ("npm reported success but no '%s' binary was found under %s."
-                         % (cfg["bin"], _short(install_dir)))}), 502
-    return jsonify({"ok": True, "bin_path": _short(bin_path), "install_dir": _short(install_dir)})
+        return False, {"ok": False, "error":
+                       ("npm reported success but no '%s' binary was found under %s."
+                        % (bin_name, _short(install_dir))), "_status": 502}
+    return True, {"ok": True, "bin_path": _short(bin_path), "install_dir": _short(install_dir)}
 
 
 @app.route("/api/subscriptions/<pid>/test", methods=["POST"])
 def api_subscriptions_test(pid):
-    """Run ONE real, minimal generation through this sub-* hop and report the
-    honest result -- the same "one real call, no false green" discipline
-    api_test_provider already applies to regular HTTP providers, now
-    available for a CLI relay too (the AgentRouter provider card's own Test
-    button can't do this: it exercises the direct-HTTP path, which is
-    permanently blocked by AgentRouter's WAF regardless of this feature).
+    """Run ONE real, minimal generation PER MODEL this sub-* hop exposes, and
+    report per-model results -- same "one real call, no false green"
+    discipline api_test_provider already applies to regular HTTP providers,
+    extended to every model instead of just the first: the hub can fall back
+    across all of them (_build_chain iterates every _sub_models() entry), so
+    knowing which ones currently work is the actual point, not just whether
+    the first one does.
 
-    _sub_run() is synchronous (subprocess.run blocks until the child exits
-    or the timeout kills it) -- there is nothing left running in the
+    Skips a model already marked dead (_is_model_dead) -- no point spending a
+    real call (and, for AgentRouter, real shared quota) reconfirming a
+    failure the hub already knows about; it retries automatically once the
+    6h dead-TTL expires.
+
+    _sub_run() is synchronous per call (subprocess.run blocks until the
+    child exits or the timeout kills it) -- nothing is left running in the
     background after this returns, by construction, no extra cleanup needed."""
     if pid not in _SUB_PROVIDERS:
         return jsonify({"ok": False, "error": "Unknown subscription provider '%s'."
                                               % _sanitize(str(pid), 40)}), 400
-    status, text, detail = _sub_run(pid, "Reply with just the word OK, nothing else.")
-    if status == 200:
-        return jsonify({"ok": True, "response": text})
-    return jsonify({"ok": False, "error": detail or ("HTTP %d" % status)}), 200
+    models = _sub_models(pid)
+    if not models:
+        return jsonify({"ok": False, "error": "No models registered for this provider."}), 200
+    results = []
+    any_ok = False
+    for m in models:
+        if _is_model_dead(pid, m):
+            results.append({"model": m, "ok": False, "skipped": True,
+                            "error": "Skipped — already marked unavailable; retries automatically later."})
+            continue
+        status, text, detail = _sub_run(pid, "Reply with just the word OK, nothing else.", model=m)
+        ok = status == 200
+        any_ok = any_ok or ok
+        results.append({"model": m, "ok": ok,
+                        "response": text if ok else None,
+                        "error": None if ok else (detail or ("HTTP %d" % status))})
+    return jsonify({"ok": any_ok, "results": results})
 
 
 # ---------------------------------------------------------------------------
