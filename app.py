@@ -1732,6 +1732,26 @@ _SUB_PROVIDERS = {
         "flag": "sub_codex_enabled",
         "isolated_flag": "sub_codex_isolated",
     },
+    # AgentRouter relay: NOT the user's own subscription — a third-party key
+    # (agentrouter.org) whose API is blocked for generic HTTP clients (their
+    # WAF only accepts real compiled CLI clients, MEASURED live 2026-07-27:
+    # raw `requests` calls 401 "unauthorized client detected" on every
+    # endpoint/model/auth-header tried, while a real isolated `codex exec`
+    # succeeded). So instead of an HTTP call, this hop shells out to a
+    # DEDICATED isolated Codex install (own cli_id, own install dir, own
+    # CODEX_HOME -- never the shared one sub-codex or the user's real
+    # terminal uses) with `-c` overrides pointing it at AgentRouter instead
+    # of OpenAI. `agentrouter_relay: True` marks it for the special-cased
+    # auth/argv/env branches below (_sub_isolated_on/_sub_state/_sub_env/
+    # _sub_run) instead of the OAuth-subscription path sub-codex uses.
+    "sub-agentrouter": {
+        "name": "AgentRouter relay (isolated Codex)",
+        "bin": "codex",
+        "model": "gpt-5.5",          # cheapest/fastest verified-working id; Opus needs more balance than typically remains
+        "cli_id": "codex-agentrouter",
+        "flag": "sub_agentrouter_enabled",
+        "agentrouter_relay": True,
+    },
 }
 _SUB_TIMEOUT = 120        # seconds for one run (CLI cold start + generation)
 # `claude -p --output-format json` is known to HANG on very large prompts (~148KB
@@ -1774,8 +1794,10 @@ _SUB_MAX_PROMPT_CHARS = 100000
 # isolated binary, and hand the user the exact command to run themselves; it
 # cannot click through OAuth consent for them.
 # --------------------------------------------------------------------------- #
-_ISOLATED_ENV_VAR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
-_ISOLATED_NPM_PACKAGE = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex"}
+_ISOLATED_ENV_VAR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME",
+                     "codex-agentrouter": "CODEX_HOME"}
+_ISOLATED_NPM_PACKAGE = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex",
+                         "codex-agentrouter": "@openai/codex"}   # same package, separate install dir
 _ISOLATED_INSTALL_TIMEOUT = 300   # npm install can be slow; this is an admin click, not a hop
 
 
@@ -1839,8 +1861,15 @@ def _isolated_bin_path(cli_id, bin_name):
 def _sub_isolated_on(pid):
     """The per-provider isolated-profile opt-in. DEFAULT FALSE — with it off,
     _sub_bin/_sub_env/_sub_state behave EXACTLY as they did before this feature
-    (shared install, shared ~/.claude or ~/.codex)."""
+    (shared install, shared ~/.claude or ~/.codex).
+
+    agentrouter_relay providers are ALWAYS isolated, unconditionally — this
+    isn't the user's own subscription CLI, it's a repurposed Codex copy
+    relaying a third-party key, and must never share install/config with the
+    user's real Codex session or with sub-codex's own isolated profile."""
     cfg = _SUB_PROVIDERS.get(pid)
+    if cfg and cfg.get("agentrouter_relay"):
+        return True
     flag = cfg.get("isolated_flag") if cfg else None
     return bool(flag and config.get_flag(flag, False))
 
@@ -1998,6 +2027,16 @@ def _sub_state(pid):
         loops, loop_detail = _sub_loops_back(cfg["cli_id"])
     if loops:
         return enabled, True, False, loop_detail
+    if cfg.get("agentrouter_relay"):
+        # Not an OAuth subscription — "authenticated" here just means the
+        # agentrouter provider itself has a saved key for this relay to inject.
+        ar_keys = (config.get_provider_config("agentrouter") or {}).get("api_keys") or []
+        if not ar_keys:
+            return enabled, True, False, ("No AgentRouter API key saved yet — "
+                                          "paste one on the AgentRouter provider card first.")
+        return enabled, True, True, ("Ready — relays through a dedicated isolated Codex copy "
+                                     "(%s), never touches your real Claude Code/Codex session."
+                                     % _short(path))
     if pid == "sub-codex":
         codex_home = _isolated_config_dir("codex") if isolated else None
         ok, detail = _codex_subscription_auth(codex_home)
@@ -2104,6 +2143,10 @@ def _sub_env(pid=None):
         if var and cli_id:
             _ensure_isolated_dirs(cli_id)
             env[var] = _isolated_config_dir(cli_id)
+        if cfg.get("agentrouter_relay"):
+            ar_key = ((config.get_provider_config("agentrouter") or {}).get("api_keys") or [None])[0]
+            if ar_key:
+                env["AGENTROUTER_API_KEY"] = ar_key
     return env
 
 
@@ -2185,15 +2228,29 @@ def _sub_run(pid, prompt):
         return 403, "", "'%s' is no longer on PATH." % cfg["bin"]
     tmp_out = None
     try:
-        if pid == "sub-codex":
+        if pid in ("sub-codex", "sub-agentrouter"):
             try:
                 fd, tmp_out = tempfile.mkstemp(prefix="hub-sub-", suffix=".txt")
                 os.close(fd)
             except OSError as exc:
                 return 502, "", "Could not create a temp file: %s" % exc.__class__.__name__
             argv = _sub_launcher(path) + ["exec", "--skip-git-repo-check",
-                                          "--color", "never", "--sandbox", "read-only",
-                                          "-o", tmp_out, "-"]
+                                          "--color", "never", "--sandbox", "read-only"]
+            if pid == "sub-agentrouter":
+                # Route this isolated Codex copy at AgentRouter instead of
+                # OpenAI. wire_api MUST be "responses" -- "chat" was removed
+                # in this Codex version (verified live 2026-07-27: "chat" is
+                # no longer supported, "responses" is what actually works
+                # against AgentRouter's OpenAI-compatible surface).
+                argv += [
+                    "-c", 'model_providers.agentrouter.name="agentrouter"',
+                    "-c", 'model_providers.agentrouter.base_url="https://agentrouter.org/v1"',
+                    "-c", 'model_providers.agentrouter.env_key="AGENTROUTER_API_KEY"',
+                    "-c", 'model_providers.agentrouter.wire_api="responses"',
+                    "-c", 'model_provider="agentrouter"',
+                    "-c", 'model="%s"' % cfg["model"],
+                ]
+            argv += ["-o", tmp_out, "-"]
         else:
             argv = _sub_launcher(path) + ["-p", "--output-format", "text"]
         try:
@@ -2206,7 +2263,7 @@ def _sub_run(pid, prompt):
         except (OSError, ValueError) as exc:
             return 502, "", "%s failed to start: %s" % (cfg["bin"], exc.__class__.__name__)
         text = (proc.stdout or "").strip()
-        if pid == "sub-codex":
+        if pid in ("sub-codex", "sub-agentrouter"):
             last = _read_text(tmp_out).strip()
             text = last or _codex_strip_noise(proc.stdout)
         if not text:
