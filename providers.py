@@ -697,6 +697,11 @@ PROVIDERS: Dict[str, dict] = {
     },
     "agentrouter": {
         "name": "AgentRouter",
+        # Featured first in the dashboard: real referral signup credit (see
+        # signup_url below) and, unlike most "free credit" relays, VERIFIED
+        # actually working end-to-end through the hub's isolated-CLI relay
+        # (6 models confirmed live 2026-07-28 -- see sub-agentrouter in app.py).
+        "recommended": True,
         "base_url": "https://agentrouter.org/v1",
         "models_url": "https://agentrouter.org/v1/models",
         "signup_url": "https://agentrouter.org/register?aff=udWz",  # user's own referral link, added at their explicit request 2026-07-27

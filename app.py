@@ -1753,6 +1753,8 @@ _SUB_PROVIDERS = {
     # _sub_run) instead of the OAuth-subscription path sub-codex uses.
     "sub-agentrouter": {
         "name": "AgentRouter relay (isolated Codex + Claude)",
+        "recommended": True,  # mirrors providers.py's agentrouter -- real referral
+                              # signup credit + verified actually working (see below).
         "bin": "codex",
         "cli_id": "codex-agentrouter",
         "claude_bin": "claude",
@@ -2343,7 +2345,19 @@ def _sub_run(pid, prompt, model=None):
             except OSError as exc:
                 return 502, "", "Could not create a temp file: %s" % exc.__class__.__name__
             argv = _sub_launcher(path) + ["exec", "--skip-git-repo-check",
-                                          "--color", "never", "--sandbox", "read-only"]
+                                          "--color", "never", "--sandbox", "read-only",
+                                          # MEASURED 2026-07-28: a fresh/isolated CODEX_HOME
+                                          # tries to git-clone its plugin marketplace on
+                                          # every single `exec` call -- 3 stale
+                                          # plugins-clone-* dirs + a sync lock found sitting
+                                          # in this isolated profile, and turning both off
+                                          # cut a call that failed after ~110s down to
+                                          # near-instant. Plugins are a marketplace/extension
+                                          # system (`codex plugin`), unrelated to the core
+                                          # file/shell/patch tools this relay actually needs,
+                                          # and nothing is installed in a fresh isolated
+                                          # profile for either flag to remove.
+                                          "--disable", "plugins", "--disable", "remote_plugin"]
             if pid == "sub-agentrouter":
                 # Route this isolated Codex copy at AgentRouter instead of
                 # OpenAI. wire_api MUST be "responses" -- "chat" was removed
@@ -2385,13 +2399,25 @@ def _sub_run(pid, prompt, model=None):
         if backend == "claude" and text and any(s in text.lower() for s in _SUB_AUTH_ERR):
             return 403, "", _sanitize(text, 300)
         if not text:
-            err = _sanitize((proc.stderr or "").strip(), 300)
+            raw_err = (proc.stderr or "").strip()
             if proc.returncode != 0:
-                low = (err or "").lower()
+                # Classify against the FULL stderr, not a 300-char slice --
+                # codex's fixed banner (workdir/model/session id/prompt echo)
+                # alone regularly runs past 300 chars, so truncating BEFORE
+                # classifying cut the real error off every time (MEASURED
+                # 2026-07-29: a genuine AgentRouter "401 Unauthorized ...
+                # quota" failure was misclassified as a generic 502 because
+                # "quota"/"401" only showed up past character 300) -- silently
+                # bypassing the existing dead-for-6h skip and re-running a
+                # known-exhausted quota call every single time. The banner is
+                # fixed-size boilerplate and the real reason always comes
+                # after it, so the LAST 300 chars (not the first) is also
+                # what's actually worth showing on the dashboard.
+                low = raw_err.lower()
                 status = 403 if any(s in low for s in _SUB_AUTH_ERR) else 502
-                return status, "", ("%s exited %d: %s"
-                                    % (bin_name, proc.returncode, err or "no detail"))
-            return 502, "", "%s produced no output. %s" % (bin_name, err or "")
+                shown = _sanitize(raw_err[-300:] if len(raw_err) > 300 else raw_err, 300)
+                return status, "", "%s exited %d: %s" % (bin_name, proc.returncode, shown or "no detail")
+            return 502, "", "%s produced no output. %s" % (bin_name, _sanitize(raw_err, 300))
         return 200, text, None
     finally:
         if tmp_out:
@@ -4272,6 +4298,7 @@ def _provider_row(pid, live_models=False):
         "image_free_count": sum(1 for r in _image_model_rows(pid) if r.get("free", True)),
         "image_paid_count": sum(1 for r in _image_model_rows(pid) if not r.get("free", True)),
         "relay": relay,
+        "recommended": bool(p.get("recommended")),
     }
 
 
@@ -4388,6 +4415,51 @@ def api_provider_reveal_key(pid, idx):
     return jsonify({"api_key": keys[idx]})
 
 
+def _run_relay_model_test(pid):
+    """Run one real, minimal generation PER MODEL a sub-* relay exposes.
+    Shared by /api/subscriptions/<pid>/test and, for any regular provider
+    mapped in _PROVIDER_RELAY_SUB_PID, /api/test/<pid> -- same relay, same
+    one-real-call-per-model discipline, one implementation.
+
+    Runs every model on its OWN thread, concurrently -- measured live
+    tonight: 6 models run sequentially took several minutes (each real CLI
+    call runs up to ~45s), unusable behind a single click. Each call is a
+    genuinely separate subprocess with its own argv/env (isolated
+    CODEX_HOME/CLAUDE_CONFIG_DIR per backend, model passed as a plain
+    argument) -- nothing mutable is shared between them to race on, so this
+    turns the wall-clock cost into "as slow as the single slowest model"
+    instead of "the sum of all of them".
+
+    Skips a model already marked dead (_is_model_dead) -- no point spending a
+    real call (and, for AgentRouter, real shared quota) reconfirming a
+    failure the hub already knows about; it retries automatically once the
+    6h dead-TTL expires.
+
+    Returns (any_ok, results); results is [{model, ok, response/error,
+    skipped?}, ...], in the same order _sub_models(pid) returns."""
+    models = _sub_models(pid)
+    results = [None] * len(models)
+
+    def _one(i, m):
+        if _is_model_dead(pid, m):
+            results[i] = {"model": m, "ok": False, "skipped": True,
+                          "error": "Skipped -- already marked unavailable; retries automatically later."}
+            return
+        status, text, detail = _sub_run(pid, "Reply with just the word OK, nothing else.", model=m)
+        ok = status == 200
+        results[i] = {"model": m, "ok": ok,
+                      "response": text if ok else None,
+                      "error": None if ok else (detail or ("HTTP %d" % status))}
+
+    threads = [threading.Thread(target=_one, args=(i, m), daemon=True) for i, m in enumerate(models)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    any_ok = any(r["ok"] for r in results)
+    return any_ok, results
+
+
 @app.route("/api/test/<pid>", methods=["POST"])
 def api_test_provider(pid):
     """Test a saved key. ok=True means ONLY ONE THING: a real 1-token generation
@@ -4429,6 +4501,38 @@ def api_test_provider(pid):
                 payload["new_models"] = []
                 payload["stale_models"] = []
         return jsonify(payload)
+
+    # AgentRouter (and anything else mapped in _PROVIDER_RELAY_SUB_PID) only
+    # ever reaches its backend through the isolated CLI relay — a raw HTTP
+    # call from here always eats the WAF's generic-client block (HTTP 401
+    # "unauthorized client detected"), which is a false negative about the
+    # provider, not a real signal. Route the whole test through the SAME
+    # relay Subscriptions uses instead, one real call per model, then feed
+    # the result into the same _finish()/_record_test_result() cache path
+    # used below — "already tested" / staleness / new-model detection all
+    # keep working exactly like every other provider, for free.
+    relay_pid = _PROVIDER_RELAY_SUB_PID.get(pid)
+    if relay_pid and relay_pid in _SUB_PROVIDERS:
+        r_enabled, r_installed, r_authed, r_detail = _sub_state(relay_pid)
+        if not (r_enabled and r_installed and r_authed):
+            return _finish(False, "Only works through its isolated CLI relay, which isn't "
+                                  "ready yet: %s" % r_detail, [], cache=False)
+        any_ok, results = _run_relay_model_test(relay_pid)
+        ok_models = [r["model"] for r in results if r["ok"]]
+        bad = ["%s (%s)" % (r["model"], r.get("error") or "unavailable")
+              for r in results if not r["ok"] and not r.get("skipped")]
+        skipped = [r["model"] for r in results if r.get("skipped")]
+        if ok_models:
+            detail = "Relay OK — %d/%d models verified working right now via isolated CLI: %s." % (
+                len(ok_models), len(results), ", ".join(ok_models))
+        else:
+            detail = "Relay reachable but no model could generate right now."
+        if bad:
+            detail += " Not available right now: %s." % "; ".join(bad)
+        if skipped:
+            detail += " Skipped (already known unavailable): %s." % ", ".join(skipped)
+        attempted.extend((r["model"], r["ok"]) for r in results if not r.get("skipped"))
+        return _finish(any_ok, detail, ok_models)
 
     # Pollinations-style anonymous tiers need no key at all — the ORIGINAL test
     # required one unconditionally, so a genuinely-working keyless provider always
@@ -5043,6 +5147,7 @@ def _sub_provider_rows():
             "isolated_env_var": _ISOLATED_ENV_VAR.get(cli_id),
             "isolated_login_command": login_cmd,
             "isolated_login_note": login_note,
+            "recommended": bool(cfg.get("recommended")),
         }
         if cfg.get("agentrouter_relay"):
             # Second, independent backend (Claude models need the Anthropic
@@ -5194,22 +5299,9 @@ def api_subscriptions_test(pid):
     if pid not in _SUB_PROVIDERS:
         return jsonify({"ok": False, "error": "Unknown subscription provider '%s'."
                                               % _sanitize(str(pid), 40)}), 400
-    models = _sub_models(pid)
-    if not models:
+    if not _sub_models(pid):
         return jsonify({"ok": False, "error": "No models registered for this provider."}), 200
-    results = []
-    any_ok = False
-    for m in models:
-        if _is_model_dead(pid, m):
-            results.append({"model": m, "ok": False, "skipped": True,
-                            "error": "Skipped — already marked unavailable; retries automatically later."})
-            continue
-        status, text, detail = _sub_run(pid, "Reply with just the word OK, nothing else.", model=m)
-        ok = status == 200
-        any_ok = any_ok or ok
-        results.append({"model": m, "ok": ok,
-                        "response": text if ok else None,
-                        "error": None if ok else (detail or ("HTTP %d" % status))})
+    any_ok, results = _run_relay_model_test(pid)
     return jsonify({"ok": any_ok, "results": results})
 
 
