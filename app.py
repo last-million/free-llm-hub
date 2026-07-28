@@ -446,10 +446,17 @@ def _auto_models(pid):
 
 
 def aggregated_models():
-    """[{id:'<pid>/<model>', provider, model}] across enabled+keyed providers."""
+    """[{id:'<pid>/<model>', provider, model}] across enabled+keyed providers,
+    plus any usable local-subscription relay (sub-*) -- so e.g. the AgentRouter
+    isolated-Codex relay shows up as a pickable option in the dashboard's
+    Chat/Test playground, not just reachable via an explicit pin from an
+    external client."""
     out = []
     for pid in _enabled_keyed():
         for m in provider_free_models(pid):
+            out.append({"id": pid + "/" + m, "provider": pid, "model": m})
+    for pid in _sub_available_providers():
+        for m in _sub_models(pid):
             out.append({"id": pid + "/" + m, "provider": pid, "model": m})
     return out
 
