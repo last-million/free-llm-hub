@@ -2500,6 +2500,79 @@ def _dispatch_chat(pid, payload, stream):
     return _upstream_chat(pid, payload, stream)
 
 
+def _agentrouter_review_and_fix(hop_pid, hop_model, messages, data, est):
+    """User-approved 2026-07-29 "guarantee maximum perfection" pass, scoped
+    to AgentRouter responses only (see the AGENTROUTER FIRST block in
+    _route_by_difficulty) -- NOT every hop. Reviewing needs the COMPLETE
+    answer, so applying this broadly would mean buffering (losing real-time
+    streaming) on every coding request; AgentRouter responses are ALREADY
+    buffered by the fake-stream fix (a local CLI can't stream token-by-token
+    regardless), so a review pass here costs nothing in UX terms that isn't
+    already being paid. Free-tier hops -- which keep real-time streaming --
+    are deliberately untouched.
+
+    One lightweight review call (routed through the normal FAST free-tier
+    pick, require_tools=False -- this must not itself spend AgentRouter's
+    own fragile quota) asks a plain yes/no question. Only on a concrete
+    "no" does this spend a SECOND AgentRouter call asking the SAME model
+    that produced the original answer to fix the specific problem found --
+    capped at exactly one revision round, never a loop.
+
+    Fail-open at every step: any missing pid, empty answer, review-call
+    error, non-200, or exception returns `data` completely unchanged. A
+    review pass that can silently fail must never be able to make a working
+    response worse or block one from returning at all."""
+    cfg = _SUB_PROVIDERS.get(hop_pid)
+    if not cfg or not cfg.get("agentrouter_relay"):
+        return data
+    try:
+        msg = ((data.get("choices") or [{}])[0].get("message") or {})
+        answer = (msg.get("content") or "").strip()
+        if not answer:
+            return data
+        task_text = _sub_flatten(messages)[:4000]
+        # Route off the REAL task (a reasonable proxy for how substantial a
+        # review it deserves), not the review prompt itself -- require_tools
+        # is deliberately False here: reviewing is a plain judgment call,
+        # and False biases toward the FAST free tier instead of possibly
+        # picking AgentRouter again for the review step itself.
+        review_pid, review_model, _ = _route_by_difficulty(messages, require_tools=False)
+        if not review_pid:
+            return data
+        review_prompt = (
+            "Task given to a coding assistant:\n%s\n\n"
+            "The assistant's response:\n%s\n\n"
+            "Does this response fully and correctly address the task -- "
+            "complete, syntactically valid, nothing obviously broken or "
+            "missing? Reply with EXACTLY the single word LGTM if so. "
+            "Otherwise reply with ONE short sentence describing the "
+            "concrete problem, nothing else." % (task_text, answer[:6000]))
+        review_resp = _dispatch_chat(review_pid, {
+            "model": review_model,
+            "messages": [{"role": "user", "content": review_prompt}],
+            "max_tokens": 200}, False)
+        if review_resp.status_code != 200:
+            return data
+        verdict_msg = ((review_resp.json().get("choices") or [{}])[0].get("message") or {})
+        verdict = (verdict_msg.get("content") or "").strip()
+        if not verdict or "lgtm" in verdict.lower():
+            return data
+        fix_status, fix_text, _ = _sub_run(
+            hop_pid,
+            "%s\n\nYour previous response had this problem: %s\n"
+            "Please provide a corrected, complete response."
+            % (task_text, verdict[:300]),
+            model=hop_model)
+        if fix_status == 200 and fix_text.strip():
+            data = dict(data)
+            data["choices"] = [dict(data["choices"][0],
+                                    message={"role": "assistant", "content": fix_text})]
+        return data
+    except Exception:
+        _log.debug("[agentrouter-review] failed, returning original response", exc_info=True)
+        return data
+
+
 # Reasoning EFFORT the manager assigns per task difficulty. A simple question gets
 # minimal thinking (fast); a hard task gets more. Applied ONLY to reasoning models
 # (non-reasoning models ignore it). This is what makes "the manager decides the
@@ -8195,6 +8268,7 @@ def v1_chat_completions():
                     resp.close()
                     continue
                 _record_chat_usage(hop_pid, hop_model, data, est)
+                data = _agentrouter_review_and_fix(hop_pid, hop_model, body["messages"], data, est)
                 msg = ((data.get("choices") or [{}])[0].get("message") or {})
                 chunk = {"id": data.get("id", "chatcmpl-sub"), "object": "chat.completion.chunk",
                         "created": data.get("created", int(time.time())),
@@ -8235,6 +8309,7 @@ def v1_chat_completions():
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est)
+            data = _agentrouter_review_and_fix(hop_pid, hop_model, body["messages"], data, est)
             if isinstance(data, dict):
                 data["model"] = hop_pid + "/" + hop_model
             return jsonify(data), 200
@@ -8772,6 +8847,7 @@ def v1_responses():
                     resp.close()
                     continue
                 _record_chat_usage(hop_pid, hop_model, data, est)
+                data = _agentrouter_review_and_fix(hop_pid, hop_model, messages, data, est)
                 msg = ((data.get("choices") or [{}])[0].get("message") or {})
                 synth = json.dumps({"choices": [{"delta": {"content": msg.get("content") or ""}}]}).encode("utf-8")
                 line_iter = iter([b"data: " + synth, b"data: [DONE]"])
@@ -8805,6 +8881,7 @@ def v1_responses():
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est)
+            data = _agentrouter_review_and_fix(hop_pid, hop_model, messages, data, est)
             return jsonify(_chat_to_responses(data, model_label)), 200
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
