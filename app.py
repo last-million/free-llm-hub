@@ -8166,19 +8166,48 @@ def v1_chat_completions():
                                            messages=body.get("messages")):
         if not prov.is_model_allowed(hop_model):
             continue
-        if stream and _is_sub(hop_pid):
-            errors.append("%s: skipped (a local CLI cannot stream)" % hop_pid)
-            continue
+        # See the matching comment in /v1/responses -- same fix, same reason:
+        # dispatch a sub-* (local CLI relay) hop non-streaming even when the
+        # client wants a stream, instead of skipping it outright, then emit
+        # its complete answer as one synthetic SSE chunk below.
+        is_sub_hop = _is_sub(hop_pid)
         payload = dict(body)
         payload["model"] = hop_model
         _apply_reasoning_effort(payload, hop_model, diff)
+        dispatch_stream = stream and not is_sub_hop
+        payload["stream"] = dispatch_stream
         try:
             _act_pick(hop_pid, hop_model)
-            resp = _dispatch_chat(hop_pid, payload, stream)
+            resp = _dispatch_chat(hop_pid, payload, dispatch_stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             continue
         if resp.status_code == 200:
+            if stream and is_sub_hop:
+                try:
+                    data = resp.json()
+                except (ValueError, requests.RequestException):
+                    errors.append("%s: non-JSON 200 body" % hop_pid)
+                    resp.close()
+                    continue
+                if _chat_json_is_empty(data):
+                    errors.append("%s: empty (200 but no content)" % hop_pid)
+                    resp.close()
+                    continue
+                _record_chat_usage(hop_pid, hop_model, data, est)
+                msg = ((data.get("choices") or [{}])[0].get("message") or {})
+                chunk = {"id": data.get("id", "chatcmpl-sub"), "object": "chat.completion.chunk",
+                        "created": data.get("created", int(time.time())),
+                        "model": hop_pid + "/" + hop_model,
+                        "choices": [{"index": 0,
+                                    "delta": {"role": "assistant", "content": msg.get("content") or ""},
+                                    "finish_reason": None}]}
+                done = dict(chunk, choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}])
+                body_bytes = (b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n" +
+                             b"data: " + json.dumps(done).encode("utf-8") + b"\n\n" +
+                             b"data: [DONE]\n\n")
+                return Response(stream_with_context(_proxy_sse(resp, iter([body_bytes]))),
+                                mimetype="text/event-stream", headers=_SSE_HEADERS)
             if stream:
                 # #4: peek the first byte BEFORE committing the 200. A hung/slow
                 # stream (no first byte within STREAM_FIRST_BYTE_TIMEOUT) falls
@@ -8702,16 +8731,25 @@ def v1_responses():
         _tried.append(hop_pid + "/" + hop_model)
         if not prov.is_model_allowed(hop_model):
             continue
-        if stream and _is_sub(hop_pid):
-            errors.append("%s: skipped (a local CLI cannot stream)" % hop_pid)
-            continue
+        # A local-CLI relay hop (sub-*) is a subprocess that runs to completion —
+        # it cannot stream token-by-token. User-approved tradeoff 2026-07-29:
+        # rather than skip it outright whenever the client wants a stream
+        # (which silently defeated AgentRouter-first routing for every
+        # interactive/streaming codex session — its actual normal usage),
+        # dispatch it NON-streaming regardless of what the client asked for,
+        # then emit its complete answer as ONE synthetic chunk through the
+        # SAME _responses_stream() a real stream uses below. The client sees
+        # nothing for the call's duration, then the full answer arrives at
+        # once — not real streaming, but no longer silently skipped either.
+        is_sub_hop = _is_sub(hop_pid)
         payload = dict(base_payload)
         payload["model"] = hop_model
         _apply_reasoning_effort(payload, hop_model, diff)
-        payload["stream"] = stream
+        dispatch_stream = stream and not is_sub_hop
+        payload["stream"] = dispatch_stream
         try:
             _act_pick(hop_pid, hop_model)
-            resp = _dispatch_chat(hop_pid, payload, stream)
+            resp = _dispatch_chat(hop_pid, payload, dispatch_stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             continue
@@ -8722,6 +8760,24 @@ def v1_responses():
             # (issue #21070). The real model that answered is still shown on the hub
             # dashboard + activity feed, so no transparency is lost.
             model_label = (body.get("model") or "").strip() or (hop_pid + "/" + hop_model)
+            if stream and is_sub_hop:
+                try:
+                    data = resp.json()
+                except (ValueError, requests.RequestException):
+                    errors.append("%s: non-JSON 200 body" % hop_pid)
+                    resp.close()
+                    continue
+                if _chat_json_is_empty(data):
+                    errors.append("%s: empty (200 but no content)" % hop_pid)
+                    resp.close()
+                    continue
+                _record_chat_usage(hop_pid, hop_model, data, est)
+                msg = ((data.get("choices") or [{}])[0].get("message") or {})
+                synth = json.dumps({"choices": [{"delta": {"content": msg.get("content") or ""}}]}).encode("utf-8")
+                line_iter = iter([b"data: " + synth, b"data: [DONE]"])
+                return Response(stream_with_context(
+                    _responses_stream(resp, model_label, line_iter=line_iter, prompt_est=est)),
+                    mimetype="text/event-stream", headers=_SSE_HEADERS)
             if stream:
                 # #4: peek the first line BEFORE committing the 200 SSE stream so a
                 # hung/slow provider falls through to the next hop instead of stalling.
