@@ -4173,6 +4173,25 @@ def api_providers():
     return jsonify([_provider_row(p["id"]) for p in prov.list_providers()])
 
 
+def _sync_relay_enable(pid):
+    """When a provider that only actually works through a local-subscription
+    relay (see _PROVIDER_RELAY_SUB_PID -- currently just AgentRouter, WAF-
+    blocked for direct HTTP) gets enabled from its OWN card, also turn on the
+    master local-subscriptions switch and that relay's per-provider flag.
+    Without this, "Enabled" on the provider card silently does nothing --
+    the thing that actually works lives in a completely separate opt-in
+    system (off by default) the user would otherwise have to discover and
+    flip on themselves in a different section of the dashboard."""
+    relay_pid = _PROVIDER_RELAY_SUB_PID.get(pid)
+    if not relay_pid or relay_pid not in _SUB_PROVIDERS:
+        return
+    if not _sub_master_on():
+        config.set_flag(_SUB_MASTER_FLAG, True)
+    relay_flag = _SUB_PROVIDERS[relay_pid]["flag"]
+    if not config.get_flag(relay_flag, True):
+        config.set_flag(relay_flag, True)
+
+
 @app.route("/api/providers/<pid>", methods=["POST"])
 def api_provider_update(pid):
     if not prov.get_provider(pid):
@@ -4201,6 +4220,8 @@ def api_provider_update(pid):
             return jsonify({"error": str(exc)}), 400
     if kwargs:
         config.set_provider_config(pid, **kwargs)
+        if kwargs.get("enabled"):
+            _sync_relay_enable(pid)
         with _model_cache_lock:
             _model_cache.pop(pid, None)  # key/base changed -> rediscover
         _autoselect_default_if_unset()  # first keyed provider -> best default
@@ -4224,6 +4245,7 @@ def api_provider_add_key(pid):
     # user can still toggle it off). Idempotent: only flips a disabled row.
     if not config.get_provider_config(pid).get("enabled"):
         config.set_provider_config(pid, enabled=True)
+        _sync_relay_enable(pid)
     with _model_cache_lock:
         _model_cache.pop(pid, None)  # pool changed -> rediscover
     _autoselect_default_if_unset()  # first keyed provider -> pick a best default
