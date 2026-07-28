@@ -309,6 +309,13 @@
   .badge.trial svg{flex:none;opacity:.9}
   .badge.paid{background:var(--warn-soft);color:var(--warn)}
   .badge.keyed{background:var(--surface-3);color:var(--text-dim)}
+  /* Solid fill (not the soft tint every other badge uses) so this is always the
+     one the eye lands on first — reserved for a provider actually verified
+     working end to end, not just "has a free tier". */
+  .badge.recommended{background:var(--accent);color:#04140b;display:inline-flex;align-items:center;gap:4px}
+  .badge.recommended svg{flex:none}
+  .card.recommended{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-soft),0 1px 2px rgba(0,0,0,.25)}
+  .card.recommended:hover{box-shadow:0 0 0 1px var(--accent-soft),0 12px 32px rgba(0,0,0,.42)}
   .notes{font-size:12.5px;color:var(--text-dim);line-height:1.55}
   .keylink{font-size:12.5px;display:inline-flex;align-items:center;gap:5px}
   .keyrow{display:flex;gap:8px}
@@ -561,6 +568,7 @@
     transition:border-color .2s ease;
   }
   .cli-card.is-connected{border-color:rgba(34,197,94,.35)}
+  .cli-card.recommended{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-soft)}
   .cli-card-top{display:flex;align-items:flex-start;gap:10px}
   .cli-card-id{min-width:0;display:flex;flex-direction:column;gap:4px}
   .cli-card-name{font-weight:700;font-size:15px;letter-spacing:-.01em;display:flex;align-items:center;gap:8px;flex-wrap:wrap;overflow-wrap:anywhere}
@@ -1013,6 +1021,16 @@
     font-size:13.5px; text-align:left; border-radius:10px; position:relative;
     transition:background .18s, color .18s, box-shadow .18s; }
   .cx-nav-item svg{ width:17px; height:17px; flex:none; opacity:.85; }
+  /* "New updates" nav pill — dismisses itself (localStorage) the first time the
+     user actually opens that section, same one-time-notice pattern cxWelcome()
+     already uses elsewhere, so it never turns into permanent nag clutter. */
+  .nav-new-badge{ margin-left:auto; flex:none; font-size:9px; font-weight:800;
+    letter-spacing:.04em; text-transform:uppercase; color:#04140b;
+    background:var(--neon-grad); border-radius:999px; padding:2.5px 7px;
+    box-shadow:0 0 10px rgba(139,92,246,.4); animation:navnewpulse 2.2s ease-in-out infinite; }
+  @keyframes navnewpulse{ 0%,100%{opacity:1} 50%{opacity:.7} }
+  @media (prefers-reduced-motion: reduce){ .nav-new-badge{ animation:none; } }
+  .nav-new-badge[hidden]{ display:none; }
   .cx-nav-item:hover{ background:var(--surface-2); color:var(--text); }
   .cx-nav-item:focus-visible{ outline:2px solid var(--neon-cyan); outline-offset:2px; }
   .cx-nav-item.active{ color:#fff;
@@ -1134,7 +1152,7 @@
       <div class="cx-group-label">Connect</div>
       <button class="cx-nav-item" data-view="sec-connect" data-title="Connect your tools" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg><span>Connect tools</span></button>
       <button class="cx-nav-item" data-view="sec-clis" data-title="Connected tools" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><span>Connected tools</span></button>
-      <button class="cx-nav-item" data-view="sec-subs" data-title="Local subscriptions" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.5 12.5 20 3"/><path d="m16 6 3 3"/></svg><span>Subscriptions</span></button>
+      <button class="cx-nav-item" data-view="sec-subs" data-title="Local subscriptions" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.5 12.5 20 3"/><path d="m16 6 3 3"/></svg><span>Subscriptions</span><span class="nav-new-badge" data-new-key="subs_agentrouter_v1">New updates</span></button>
     </div>
     <div class="cx-group">
       <div class="cx-group-label">Chat</div>
@@ -1144,7 +1162,7 @@
     <div class="cx-group">
       <div class="cx-group-label">Models</div>
       <button class="cx-nav-item" data-view="sec-default" data-title="Orchestrator model" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg><span>Orchestrator</span></button>
-      <button class="cx-nav-item" data-view="sec-providers" data-title="Providers" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg><span>Providers</span></button>
+      <button class="cx-nav-item" data-view="sec-providers" data-title="Providers" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg><span>Providers</span><span class="nav-new-badge" data-new-key="providers_agentrouter_v1">New updates</span></button>
     </div>
     <div class="cx-group">
       <div class="cx-group-label">Media</div>
@@ -1753,10 +1771,26 @@
     try{ history.replaceState(null, '', '#'+view); }catch(e){}
     try{ window.scrollTo(0, 0); }catch(e){}
   }
+  function dismissNewBadge(badge){
+    if(!badge) return;
+    try{ localStorage.setItem('nav_new_seen_' + badge.dataset.newKey, '1'); }catch(e){}
+    badge.hidden = true;
+  }
+  function initNewBadges(){
+    document.querySelectorAll('.nav-new-badge').forEach(function(badge){
+      var seen = false;
+      try{ seen = !!localStorage.getItem('nav_new_seen_' + badge.dataset.newKey); }catch(e){}
+      if(seen) badge.hidden = true;
+    });
+  }
   function init(){
     if(!document.getElementById('cx-sidebar')) return;
     document.body.classList.add('cx-on');
-    items().forEach(function(b){ b.addEventListener('click', function(){ cxShow(b.dataset.view); }); });
+    initNewBadges();
+    items().forEach(function(b){ b.addEventListener('click', function(){
+      cxShow(b.dataset.view);
+      dismissNewBadge(b.querySelector('.nav-new-badge'));
+    }); });
     var burger = document.getElementById('cx-burger');
     if(burger){ burger.addEventListener('click', function(){ document.body.classList.toggle('cx-drawer-open'); }); }
     var start = (location.hash || '').replace('#','');
@@ -2509,6 +2543,8 @@
   // provider suddenly starts 402-ing.
   var HOURGLASS_SVG = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2h12M6 22h12"/><path d="M8 2v4.5c0 1.2 4 3.4 4 5.5s-4 4.3-4 5.5V22"/><path d="M16 2v4.5c0 1.2-4 3.4-4 5.5s4 4.3 4 5.5V22"/></svg>';
   var TRIAL_TIP = 'One-time credits — stops working when they run out (not a recurring free tier)';
+  var STAR_SVG = '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><path d="M12 2.5l2.9 6.6 7.1.6-5.4 4.7 1.7 7-6.3-3.9-6.3 3.9 1.7-7-5.4-4.7 7.1-.6 2.9-6.6z"/></svg>';
+  var REC_TIP = 'Recommended — real signup credit, verified actually working through the hub';
   var KEY_WARN = '⚠ Using several keys for the same provider to get around free limits may break their terms and can get your accounts banned. Use your own keys responsibly.';
 
   // ONLY these three have no free tier at all (pure paid). Every other provider
@@ -2544,6 +2580,7 @@
     var kc = (typeof p.key_count === 'number') ? p.key_count : keys.length;
     var badges = '';
     var fmCount = Array.isArray(p.free_models) ? p.free_models.length : 0;
+    if (p.recommended) badges += '<span class="badge recommended" title="' + esc(REC_TIP) + '">' + STAR_SVG + 'Recommended</span>';
     // Additive badges. Only PURE_PAID providers (OpenAI/Claude/Higgsfield) lack a
     // free tier; every other provider has one, so it shows BOTH free + paid.
     var hasFree = fmCount > 0 || (p.paid && !PURE_PAID[p.id]);
@@ -2634,7 +2671,7 @@
     }
     function renderCard(p, target){
       var card = document.createElement('div');
-      card.className = 'card' + (p.enabled ? ' enabled' : '') + (p.no_key ? ' nokey' : '');
+      card.className = 'card' + (p.enabled ? ' enabled' : '') + (p.no_key ? ' nokey' : '') + (p.recommended ? ' recommended' : '');
       card.dataset.pid = p.id;
       card.innerHTML = cardHTML(p);
       wireCard(card, p);
@@ -2660,6 +2697,12 @@
     // provider jumps to the top group on the next render.
     var connG = shown.filter(function(p){ return p.has_key || p.no_key; });
     var availG = shown.filter(function(p){ return !p.has_key && !p.no_key; });
+    // Recommended providers float to the top of whichever group they're
+    // already in (stable sort — Chrome/V8 guarantees equal elements keep
+    // their relative order, so this never reshuffles anything else).
+    function recFirst(a, b){ return (b.recommended ? 1 : 0) - (a.recommended ? 1 : 0); }
+    connG.sort(recFirst);
+    availG.sort(recFirst);
     if (connG.length){
       var g1 = catSection('connected', 'Connected providers', 'ready to use', connG.length, false);
       connG.forEach(function(p){ renderCard(p, g1); });
@@ -2826,7 +2869,7 @@
     updateProvider(row, pid);
     var p2 = findProvider((row && row.id) ? row.id : pid);
     if (!p2) return;
-    card.className = 'card' + (p2.enabled ? ' enabled' : '');
+    card.className = 'card' + (p2.enabled ? ' enabled' : '') + (p2.no_key ? ' nokey' : '') + (p2.recommended ? ' recommended' : '');
     card.innerHTML = cardHTML(p2);
     wireCard(card, p2);
     applyCardHealth(card, p2.id);   /* rebuild keeps whatever key-health we already know */
@@ -3855,6 +3898,7 @@
     if (warn) warn.textContent = data.warning || '';
     if (master) master.checked = !!data.enabled;
     var rows = Array.isArray(data.providers) ? data.providers : [];
+    rows.sort(function(a, b){ return (b.recommended ? 1 : 0) - (a.recommended ? 1 : 0); });
     var usable = rows.filter(function(r){ return r.usable; }).length;
     setSecChip('subs', rows.length ? (data.enabled ? (usable + ' / ' + rows.length + ' usable') : 'off') : '');
     if (!host) return;
@@ -3862,7 +3906,7 @@
     if (!rows.length){ host.innerHTML = '<div class="empty">No subscription providers known.</div>'; return; }
     rows.forEach(function(r){
       var card = document.createElement('div');
-      card.className = 'cli-card' + (r.usable ? ' is-connected' : '');
+      card.className = 'cli-card' + (r.usable ? ' is-connected' : '') + (r.recommended ? ' recommended' : '');
       card.dataset.pid = r.id;
       card.innerHTML = subCardHTML(r);
       wireSub(card, r);
@@ -3890,7 +3934,9 @@
     return '' +
       '<div class="cli-card-top">' +
         '<div class="cli-card-id">' +
-          '<div class="cli-card-name">' + esc(r.name || r.id) + '<span class="pid">' + esc(r.model || r.id) + '</span></div>' +
+          '<div class="cli-card-name">' + esc(r.name || r.id) +
+            (r.recommended ? '<span class="badge recommended" title="' + esc(REC_TIP) + '">' + STAR_SVG + 'Recommended</span>' : '') +
+            '<span class="pid">' + esc(r.model || r.id) + '</span></div>' +
           modePill +
         '</div>' +
         statusPill +
