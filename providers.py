@@ -1226,7 +1226,11 @@ PROVIDERS: Dict[str, dict] = {
     "g4f-gemini": {
         "name": "G4F Gemini (g4f.space)",
         "base_url": "https://g4f.space/api/gemini/v1",
-        "models_url": "https://g4f.space/api/gemini/v1/models",
+        # QUIRK (verified 2026-07-30): same relay family as g4f-groq/g4f-nvidia,
+        # which append /v1 THEMSELVES — the canonical models endpoint drops the
+        # /v1 (both forms answered 200 today, but this is the form the relay
+        # actually documents/serves long-term, matching its siblings):
+        "models_url": "https://g4f.space/api/gemini/models",
         "signup_url": "https://g4f.space",
         "key_hint": "(no key needed at all — no Authorization header is sent)",
         "no_key": True,   # keyless reverse proxy, no signup, no card
