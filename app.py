@@ -362,9 +362,12 @@ def provider_free_models(pid, live=True):
             resp = requests.get(
                 url,
                 # no_key providers have no key to send (and pcfg["api_key"] would
-                # KeyError); their /models is public.
+                # KeyError); their /models is public. One carrying a static_key
+                # (uncloseai, llm7) sends that placeholder bearer instead.
                 headers=({"Authorization": "Bearer " + pcfg["api_key"]}
-                         if pcfg.get("api_key") else {}),
+                         if pcfg.get("api_key") else
+                         ({"Authorization": "Bearer " + p["static_key"]}
+                          if p.get("static_key") else {})),
                 timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT),
             )
             if resp.status_code == 200:
@@ -1694,6 +1697,59 @@ def _dead_model_rows():
     now = time.time()
     with _dead_lock:
         return [(p, m, int(exp - now)) for (p, m), exp in _dead_models.items() if exp > now]
+
+
+# Bridge for quota.init_persistence(): the dead-model/provider maps ride along in
+# the same state file as the quota blob (the "app" key). Expired entries are
+# dropped on BOTH dump and load — a sideline that would already have lifted is
+# worse than none after a restart.
+
+def _dead_state_dump():
+    now = time.time()
+    with _dead_lock:
+        dead_models = {"%s|%s" % (p, m): exp
+                       for (p, m), exp in _dead_models.items() if exp > now}
+    with _provider_dead_lock:
+        return {
+            "dead_models": dead_models,
+            "dead_providers": {p: exp for p, exp in _dead_providers.items() if exp > now},
+            "provider_authfail": {p: sorted(ms) for p, ms in _provider_authfail.items()},
+            "provider_keyfail": sorted(_provider_keyfail),
+            "provider_consec_fail": dict(_provider_consec_fail),
+        }
+
+
+def _dead_state_load(blob):
+    now = time.time()
+    with _dead_lock:
+        for key, exp in (blob.get("dead_models") or {}).items():
+            if isinstance(key, str) and "|" in key and exp > now:
+                p, m = key.split("|", 1)
+                _dead_models[(p, m)] = exp
+    with _provider_dead_lock:
+        for p, exp in (blob.get("dead_providers") or {}).items():
+            if isinstance(p, str) and exp > now:
+                _dead_providers[p] = exp
+        for p, ms in (blob.get("provider_authfail") or {}).items():
+            if isinstance(p, str) and isinstance(ms, list):
+                _provider_authfail[p] = set(m for m in ms if isinstance(m, str))
+        for p in (blob.get("provider_keyfail") or []):
+            if isinstance(p, str):
+                _provider_keyfail.add(p)
+        for p, n in (blob.get("provider_consec_fail") or {}).items():
+            if isinstance(p, str) and isinstance(n, int):
+                _provider_consec_fail[p] = n
+
+
+def _init_quota_persistence():
+    """Persist quota + dead-model/provider state next to the config so a restart
+    doesn't wipe a provider's 429 sideline or daily spend. Best-effort: a bad
+    path or file must never block startup."""
+    try:
+        quota.init_persistence(os.path.join(config.state_dir(), "quota-state.json"),
+                               extra_load=_dead_state_load, extra_dump=_dead_state_dump)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -3459,7 +3515,9 @@ def _upstream_chat(pid, payload, stream):
             raise RuntimeError("no api key for provider " + pid)
         # No-key provider (e.g. Pollinations' anonymous tier): run exactly one
         # "key-less" pass. None is the sentinel -> no Authorization header below.
-        keys = [None]
+        # A no_key provider whose registry entry carries a static_key (uncloseai,
+        # llm7) sends that documented placeholder as its bearer instead.
+        keys = [(prov.get_provider(pid) or {}).get("static_key") or None]
     url = base.rstrip("/") + "/chat/completions"
     n = len(keys)
     start = _next_key_start(pid, n)
@@ -8191,6 +8249,30 @@ def _proxy_sse(resp, iterator=None, first=_MISSING):
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
+def _routing_headers(pid, model, attempts):
+    """Routing-transparency headers: which provider/model actually served the
+    response (or was last tried, on a chain-exhausted error) and how many
+    upstream hops the chain burned. Debugging aid only — bodies stay untouched."""
+    h = {"X-Free-LLM-Hub-Attempts": str(attempts)}
+    if pid:
+        h["X-Free-LLM-Hub-Provider"] = str(pid)
+    if model:
+        h["X-Free-LLM-Hub-Model"] = str(model)
+    return h
+
+
+def _with_headers(resp_tuple, headers):
+    """Attach extra headers to an (response, status) tuple. Best-effort; returns
+    the input untouched on error."""
+    try:
+        resp, status = resp_tuple
+        for k, v in headers.items():
+            resp.headers[k] = v
+        return resp, status
+    except Exception:
+        return resp_tuple
+
+
 @app.route("/v1/chat/completions", methods=["POST"])
 def v1_chat_completions():
     body = request.get_json(force=True, silent=True)
@@ -8233,6 +8315,8 @@ def v1_chat_completions():
 
     stream = bool(body.get("stream"))
     errors = _HopErrors()
+    attempts = 0          # upstream hops actually tried (transparency header)
+    last_hop = (None, None)
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools,
@@ -8251,6 +8335,8 @@ def v1_chat_completions():
         payload["stream"] = dispatch_stream
         try:
             _act_pick(hop_pid, hop_model)
+            attempts += 1
+            last_hop = (hop_pid, hop_model)
             resp = _dispatch_chat(hop_pid, payload, dispatch_stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
@@ -8281,7 +8367,9 @@ def v1_chat_completions():
                              b"data: " + json.dumps(done).encode("utf-8") + b"\n\n" +
                              b"data: [DONE]\n\n")
                 return Response(stream_with_context(_proxy_sse(resp, iter([body_bytes]))),
-                                mimetype="text/event-stream", headers=_SSE_HEADERS)
+                                mimetype="text/event-stream",
+                                headers=dict(_SSE_HEADERS, **_routing_headers(
+                                    hop_pid, hop_model, attempts)))
             if stream:
                 # #4: peek the first byte BEFORE committing the 200. A hung/slow
                 # stream (no first byte within STREAM_FIRST_BYTE_TIMEOUT) falls
@@ -8296,7 +8384,9 @@ def v1_chat_completions():
                     continue
                 chained = _chain_buffered(buffered, it)
                 return Response(stream_with_context(_proxy_sse(resp, chained)),
-                                mimetype="text/event-stream", headers=_SSE_HEADERS)
+                                mimetype="text/event-stream",
+                                headers=dict(_SSE_HEADERS, **_routing_headers(
+                                    hop_pid, hop_model, attempts)))
             try:
                 data = resp.json()
             except (ValueError, requests.RequestException):
@@ -8312,7 +8402,7 @@ def v1_chat_completions():
             data = _agentrouter_review_and_fix(hop_pid, hop_model, body["messages"], data, est)
             if isinstance(data, dict):
                 data["model"] = hop_pid + "/" + hop_model
-            return jsonify(data), 200
+            return jsonify(data), 200, _routing_headers(hop_pid, hop_model, attempts)
         # Non-2xx. Retryable (429/5xx) and HARD errors (404/400/model-not-found)
         # both advance to the NEXT provider — each chain hop is a DIFFERENT
         # provider, so a broken model/provider should fall through before we give
@@ -8348,15 +8438,16 @@ def v1_chat_completions():
                      (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none")
     except Exception:
         pass
+    hdrs = _routing_headers(last_hop[0], last_hop[1], attempts)
     if last_hard is not None:
         if last_hard["json"] is not None:
-            return _with_retry_after(
-                (jsonify(last_hard["json"]), _retryable_relay_status(last_hard["status"])), eta)
-        return _with_retry_after(_openai_error(
+            return _with_headers(_with_retry_after(
+                (jsonify(last_hard["json"]), _retryable_relay_status(last_hard["status"])), eta), hdrs)
+        return _with_headers(_with_retry_after(_openai_error(
             "Upstream returned non-JSON (%s, HTTP %d): %s"
-            % (last_hard["pid"], last_hard["status"], last_hard["text"]), 503, "upstream_error"), eta)
-    return _with_retry_after(_openai_error(
-        "All providers failed: " + ("; ".join(errors) or "none available"), 503, "upstream_error"), eta)
+            % (last_hard["pid"], last_hard["status"], last_hard["text"]), 503, "upstream_error"), eta), hdrs)
+    return _with_headers(_with_retry_after(_openai_error(
+        "All providers failed: " + ("; ".join(errors) or "none available"), 503, "upstream_error"), eta), hdrs)
 
 
 # ---------------------------------------------------------------------------
@@ -9379,6 +9470,8 @@ def v1_messages():
     input_est = _estimate_input_tokens(body)
 
     errors = _HopErrors()
+    attempts = 0          # upstream hops actually tried (transparency header)
+    last_hop = (None, None)
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools, messages=oai_messages):
@@ -9393,6 +9486,8 @@ def v1_messages():
         payload["stream"] = stream
         try:
             _act_pick(hop_pid, hop_model)
+            attempts += 1
+            last_hop = (hop_pid, hop_model)
             resp = _dispatch_chat(hop_pid, payload, stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
@@ -9414,7 +9509,9 @@ def v1_messages():
                 return Response(stream_with_context(
                     _anthropic_stream(resp, model_str, input_est, line_iter=chained,
                                      hop_pid=hop_pid, hop_model=hop_model)),
-                    mimetype="text/event-stream", headers=_SSE_HEADERS)
+                    mimetype="text/event-stream",
+                    headers=dict(_SSE_HEADERS, **_routing_headers(
+                        hop_pid, hop_model, attempts)))
             try:
                 data = resp.json()
             except (ValueError, requests.RequestException):
@@ -9426,7 +9523,8 @@ def v1_messages():
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est)
-            return jsonify(_openai_resp_to_anthropic(data, model_str))
+            return jsonify(_openai_resp_to_anthropic(data, model_str)), 200, \
+                _routing_headers(hop_pid, hop_model, attempts)
         # Non-2xx. Retryable (429/5xx) AND hard errors (404/400/model-not-found)
         # both advance to the NEXT provider (a different provider/model) before we
         # surface an error; within-provider key rotation already ran upstream. A
@@ -9455,14 +9553,15 @@ def v1_messages():
                      (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none")
     except Exception:
         pass
+    hdrs = _routing_headers(last_hop[0], last_hop[1], attempts)
     if last_hard is not None:
-        return _with_retry_after(_anthropic_error("api_error",
+        return _with_headers(_with_retry_after(_anthropic_error("api_error",
                                 "Upstream %s error (HTTP %d): %s"
                                 % (last_hard["pid"], last_hard["http"], last_hard["detail"]),
-                                last_hard["status"]), eta)
-    return _with_retry_after(_anthropic_error("api_error",
+                                last_hard["status"]), eta), hdrs)
+    return _with_headers(_with_retry_after(_anthropic_error("api_error",
                             "All providers failed: " + ("; ".join(errors) or "none available"),
-                            503), eta)
+                            503), eta), hdrs)
 
 
 @app.route("/v1/messages/count_tokens", methods=["POST"])
@@ -10486,6 +10585,7 @@ if __name__ == "__main__":
     _recover_interrupted_hub_transition()
     _mark_runtime_started()
     _bootstrap_no_key_providers()  # no-key providers have nothing to configure -> on
+    _init_quota_persistence()      # restore quota/dead-model state from the last run
     _print_banner()
     _start_auto_update()
     _start_aa_refresh()
