@@ -5612,6 +5612,24 @@ def api_auto_provider_mode_update():
     return jsonify({"mode": _auto_provider_mode()})
 
 
+@app.route("/api/web-search-policy", methods=["GET"])
+def api_web_search_policy():
+    """Read by the last30days agent skill before using X/social sources.
+    Control-token gated like every /api/* route (see _local_control_guard);
+    an agent without the token gets 401 and must treat that as OFF."""
+    return jsonify({"social_search": config.get_social_web_search()})
+
+
+@app.route("/api/web-search-policy", methods=["POST"])
+def api_web_search_policy_update():
+    body = request.get_json(force=True, silent=True)
+    value = body.get("social_search") if isinstance(body, dict) else None
+    if not isinstance(value, bool):
+        return jsonify({"error": "social_search must be a boolean."}), 400
+    config.set_social_web_search(value)
+    return jsonify({"social_search": config.get_social_web_search()})
+
+
 @app.route("/api/agent/vision-status", methods=["GET"])
 def api_agent_vision_status():
     """Read-only capability probe: is at least one enabled+keyed provider

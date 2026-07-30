@@ -42,6 +42,26 @@ routing heuristics.
   `GET /api/hub/stopped` returns `{stopped: bool}`.
 - Covered by `tests/test_hub_lifecycle.py`.
 
+## Agent skills (.agents/skills/)
+
+Kimi Code scans `.agents/skills/` (directory form `<name>/SKILL.md`). Two
+vendored skills live here:
+
+- `i-have-adhd/` (MIT, github.com/ayghri/i-have-adhd) — always-on output
+  style; `disable-model-invocation` was dropped on vendoring so it
+  auto-applies. Off switch: "stop adhd mode".
+- `last30days/` (MIT, github.com/mvanhorn/last30days-skill v3.18.4,
+  MODIFIED — see its `VENDORED.md`) — last-30-days web research, keyless by
+  default (web + YouTube + public Reddit). X/social/authenticated sources are
+  gated: the skill curls `GET /api/web-search-policy` (control-token gated
+  like every `/api/*`; POST `{social_search: bool}` to set) and only uses
+  social sources when the dashboard Settings switch "Social media web search"
+  is on. The switch persists as the `social_web_search` flag in config.py
+  (default false). Covered by `tests/test_skills_policy.py`.
+
+As noted above, graphify's `post-commit` hook must stay installed so the
+graph rebuilds after each commit.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

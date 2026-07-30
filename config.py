@@ -500,6 +500,16 @@ def set_flag(name: str, value: bool) -> None:
         save_config(cfg)
 
 
+def get_social_web_search() -> bool:
+    """Whether the agent may use X/social authenticated sources during web
+    research (last30days skill). Opt-in: default False."""
+    return get_flag("social_web_search", False)
+
+
+def set_social_web_search(value: bool) -> None:
+    set_flag("social_web_search", value)
+
+
 def get_setting(name: str, default=None):
     """Read a top-level non-boolean setting (e.g. a string mode) from the config."""
     with _LOCK:
