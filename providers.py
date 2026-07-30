@@ -1196,6 +1196,69 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": [],
         "notes": "BYOK router with a free tier on ':free'-suffixed ids (~5 RPM, ~200 req/day). The 5/min burst limit is handled by the 429 cooldown path; quota.py tracks the daily budget.",
     },
+    "g4f-groq": {
+        "name": "G4F Groq (g4f.space)",
+        "base_url": "https://g4f.space/api/groq/v1",
+        "models_url": "https://g4f.space/api/groq/v1/models",
+        "signup_url": "https://g4f.space",
+        "key_hint": "(no key needed at all — no Authorization header is sent)",
+        "no_key": True,   # keyless reverse proxy, no signup, no card
+        # Truly keyless: unlike uncloseai/llm7 there is not even a documented
+        # placeholder bearer, so NO static_key — the no-key path sends no
+        # Authorization header at all (pollinations precedent).
+        # Free-only relay of Groq's free catalog -> 'all' cannot leak a paid id.
+        "free_filter": "all",
+        "default_free_models": [],
+        "notes": "Keyless community reverse proxy of Groq's free models (OpenAI-compatible, ~5 req/min). Unstable volunteer-run gateway: quality varies, ids come and go with the upstream catalog, and the whole proxy can go down without warning — no SLA. Treat as opportunistic capacity, never the only link in a chain.",
+    },
+    "g4f-gemini": {
+        "name": "G4F Gemini (g4f.space)",
+        "base_url": "https://g4f.space/api/gemini/v1",
+        "models_url": "https://g4f.space/api/gemini/v1/models",
+        "signup_url": "https://g4f.space",
+        "key_hint": "(no key needed at all — no Authorization header is sent)",
+        "no_key": True,   # keyless reverse proxy, no signup, no card
+        # Truly keyless, same shape as g4f-groq: no static_key, no header sent.
+        # Free-only relay of Gemini's free catalog -> 'all' cannot leak a paid id.
+        "free_filter": "all",
+        "default_free_models": [],
+        "notes": "Keyless community reverse proxy of Gemini free models (OpenAI-compatible, ~5 req/min). Unstable volunteer-run gateway: quality varies, can go down without warning, no SLA — same caveat as g4f-groq; opportunistic capacity only.",
+    },
+    "g4f-nvidia": {
+        "name": "G4F NVIDIA (g4f.space)",
+        "base_url": "https://g4f.space/api/nvidia/v1",
+        "models_url": "https://g4f.space/api/nvidia/v1/models",
+        "signup_url": "https://g4f.space",
+        "key_hint": "(no key needed at all — no Authorization header is sent)",
+        "no_key": True,   # keyless reverse proxy, no signup, no card
+        # Truly keyless, same shape as g4f-groq: no static_key, no header sent.
+        # Free-only relay of NVIDIA's free catalog -> 'all' cannot leak a paid id.
+        "free_filter": "all",
+        "default_free_models": [],
+        "notes": "Keyless community reverse proxy of NVIDIA NIM free models (OpenAI-compatible, ~5 req/min). Unstable volunteer-run gateway: quality varies, can go down without warning, no SLA — same caveat as g4f-groq; opportunistic capacity only.",
+    },
+    "kilocode": {
+        "name": "Kilo Code (anonymous)",
+        # NOTE: base_url is the PREFIX only — app.py appends '/chat/completions'
+        # itself, so the real endpoint is the documented
+        # https://api.kilo.ai/api/openrouter/chat/completions.
+        "base_url": "https://api.kilo.ai/api/openrouter",
+        # No public /models discovery is documented for the anonymous tier ->
+        # None (the 'custom' precedent); live discovery is skipped and the
+        # provider serves pinned/configured ids only.
+        "models_url": None,
+        "signup_url": "https://kilo.ai",
+        "key_hint": "(no signup — the literal string 'anonymous' works)",
+        "no_key": True,   # anonymous free tier, no signup, no card
+        # The anonymous tier's documented credential is the literal bearer
+        # string "anonymous" — the no-key path sends it as
+        # `Authorization: Bearer anonymous` (same mechanism as uncloseai/llm7).
+        "static_key": "anonymous",
+        # OpenRouter-style ':free' suffix marks the free ids (routeway shape).
+        "free_filter": "suffix_free",
+        "default_free_models": [],
+        "notes": "Anonymous free tier of the Kilo Code OpenRouter relay: no signup, the literal bearer 'anonymous' authenticates. Free ids carry the ':free' suffix. Unstable community-run gateway: the anonymous tier is a courtesy, rate limits are unpublished (quota tracks it as UNKNOWN), quality varies and it can go down without warning — no SLA.",
+    },
     "custom": {
         "name": "Custom (OpenAI-compatible)",
         "base_url": None,  # user supplies via per-provider config base_url
