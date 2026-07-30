@@ -2,6 +2,10 @@
 github-models, uncloseai, llm7, api-airforce, navy, routeway — registry shape,
 is_free_model() behavior per free_filter, no_key flags, and the matching
 quota.py FREE_LIMITS rows. No Flask app involved (registry + quota only).
+
+Also covers the keyless gateways added 2026-07-30: g4f-groq, g4f-gemini,
+g4f-nvidia (g4f.space relays, no key at all) and kilocode (anonymous tier,
+literal bearer "anonymous").
 """
 import providers as prov
 import quota
@@ -100,3 +104,67 @@ def test_github_models_fixes_dangling_references():
     assert row["limit"] > 0
     assert prov.get_provider("github-models")["base_url"] == \
         "https://models.github.ai/inference"
+
+
+# --------------------------------------------------------------------------- #
+# Keyless public gateways added 2026-07-30:
+# g4f-groq / g4f-gemini / g4f-nvidia (g4f.space community reverse proxies, no
+# key at all) and kilocode (anonymous free tier, literal bearer "anonymous").
+# --------------------------------------------------------------------------- #
+
+KEYLESS_PROVIDERS = ("g4f-groq", "g4f-gemini", "g4f-nvidia", "kilocode")
+G4F_PROVIDERS = ("g4f-groq", "g4f-gemini", "g4f-nvidia")
+
+
+def test_keyless_gateways_registered_with_required_fields():
+    for pid in KEYLESS_PROVIDERS:
+        p = prov.get_provider(pid)
+        assert p is not None, pid + " missing from PROVIDERS"
+        assert p.get("name"), pid
+        assert isinstance(p.get("base_url"), str) and p["base_url"].startswith("https://"), pid
+        assert p.get("signup_url"), pid
+        assert p.get("free_filter") in prov.FREE_FILTERS, pid
+        assert isinstance(p.get("default_free_models"), list), pid
+        assert prov.is_known_provider(pid), pid
+
+
+def test_keyless_gateways_no_key_flags():
+    for pid in KEYLESS_PROVIDERS:
+        assert prov.get_provider(pid).get("no_key") is True, pid
+    # The g4f.space relays take NO credential at all: no static_key, so the
+    # no-key path sends no Authorization header (pollinations precedent).
+    for pid in G4F_PROVIDERS:
+        assert not prov.get_provider(pid).get("static_key"), pid
+    # kilocode's anonymous tier authenticates with the literal bearer string.
+    assert prov.get_provider("kilocode").get("static_key") == "anonymous"
+
+
+def test_keyless_gateways_free_filters():
+    # g4f-* relays are free-only -> 'all' accepts ordinary ids.
+    for pid in G4F_PROVIDERS:
+        assert prov.get_provider(pid)["free_filter"] == "all", pid
+        assert prov.is_free_model(pid, "llama-3.3-70b-versatile"), pid
+        assert prov.is_free_model(pid, "gemini-2.5-flash"), pid
+        assert not prov.is_free_model(pid, None), pid
+        assert not prov.is_free_model(pid, ""), pid
+        assert not prov.is_free_model(pid, "llama-3.3-70b", is_free_tier=False), pid
+    # kilocode uses the OpenRouter ':free' suffix convention (routeway shape).
+    assert prov.get_provider("kilocode")["free_filter"] == "suffix_free"
+    assert prov.is_free_model("kilocode", "openai/gpt-4.1:free")
+    assert not prov.is_free_model("kilocode", "openai/gpt-4.1")
+    assert not prov.is_free_model("kilocode", "free-model-x")  # suffix, not substring
+
+
+def test_keyless_gateways_quota_rows():
+    # g4f-*: community-observed ~5 req/min, tracked per-minute.
+    for pid in G4F_PROVIDERS:
+        row = quota.FREE_LIMITS.get(pid)
+        assert row is not None, pid + " missing from FREE_LIMITS"
+        assert row["limit"] == 5, pid
+        assert row["window"] == "minute", pid
+    # kilocode: no published figure -> deliberately ABSENT, tracks as UNKNOWN
+    # via DEFAULT_LIMIT (never a budget of 0, never a fabricated number).
+    assert "kilocode" not in quota.FREE_LIMITS
+    row = quota._limit_for("kilocode")
+    assert row is quota.DEFAULT_LIMIT
+    assert row["limit"] is None and row.get("unknown") is True
