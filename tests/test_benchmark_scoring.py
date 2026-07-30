@@ -87,3 +87,37 @@ def test_promoted_families_hit_the_top_bands():
         assert app._benchmark_score("testpid", tier_a) >= 84, tier_a
     for tier_s in ("glm-4.7", "gemini-2.5-pro", "qwen3-max"):
         assert app._benchmark_score("testpid", tier_s) >= 100, tier_s
+
+
+# --------------------------------------------------------------------------- #
+# puter preference floors (2026-07-30): the newest GPT flagship via puter is
+# the user-requested TOP priority — the gpt-5.6-sol(-pro) class floors at 136,
+# one above hy3 (135); gpt-5.6-terra / gpt-5.5-pro floor level with hy3.
+# Id-keyed like the other floors (no provider-id checks in routing).
+# --------------------------------------------------------------------------- #
+
+def test_puter_sol_floor_outranks_hy3_and_kimi_floors():
+    sol = app._benchmark_score("puter", "gpt-5.6-sol")
+    sol_pro = app._benchmark_score("puter", "gpt-5.6-sol-pro")
+    hy3 = app._benchmark_score("testpid", "hy3")
+    kimi = app._benchmark_score("testpid", "kimi-k3")
+    assert sol == app._PREF_FLOORS[2] == 136
+    assert sol_pro == app._PREF_FLOORS[2]
+    assert sol > hy3 > kimi
+
+
+def test_puter_terra_and_55_pro_floor_level_with_hy3():
+    hy3 = app._benchmark_score("testpid", "hy3")
+    for mid in ("gpt-5.6-terra", "gpt-5.6-terra-pro", "gpt-5.5-pro"):
+        assert app._benchmark_score("puter", mid) == app._PREF_FLOORS[3] == hy3, mid
+
+
+def test_plain_gpt_4o_does_not_get_the_puter_floor():
+    # The floor is pinned to the 5.6-sol / 5.6-terra / 5.5-pro ids only — a
+    # plain gpt-4o keeps its natural Tier A score, far below every floor.
+    gpt4o = app._benchmark_score("puter", "gpt-4o")
+    assert gpt4o < min(app._PREF_FLOORS)
+    assert gpt4o >= 84  # still Tier A, just not floored
+    # Other GPT ids outside the pinned classes are unfloored too.
+    assert app._benchmark_score("puter", "gpt-5.4") < min(app._PREF_FLOORS)
+    assert app._benchmark_score("puter", "gpt-5.6-luna") < min(app._PREF_FLOORS)
