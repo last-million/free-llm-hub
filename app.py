@@ -556,11 +556,12 @@ def _strong_new_version_score(low):
     return best
 
 
-# User-preference floors applied by _benchmark_score: (hy3, kimi-k3). They are
+# User-preference floors applied by _benchmark_score: (hy3, kimi-k3, puter
+# gpt-5.6-sol class, puter gpt-5.6-terra/gpt-5.5-pro class). They are
 # deliberate thumb-on-the-scale values, NOT measured strength, so any code that
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
-_PREF_FLOORS = (135, 134)
+_PREF_FLOORS = (135, 134, 136, 135)
 # 2026-07-30: the qwen -45 demotion (_PREF_QWEN_DEMOTION) is REMOVED — qwen3 is a
 # strong family again and ranks with the top tier via Tier A + _STRONG_ROOTS.
 
@@ -789,8 +790,8 @@ def _benchmark_score(pid, model_id):
     tier comes from a REAL Artificial Analysis Intelligence Index match when
     one exists (calibrated onto this same scale — see _aa_score_for), else the
     hand-typed _BENCH_FAMILY guess as before. Every adjustment below (size,
-    instruct bonus, provider bias, coding boost, hy3/kimi-k3 preference floors,
-    mistral penalty, speed cap) still applies on top either
+    instruct bonus, provider bias, coding boost, hy3/kimi-k3/puter preference
+    floors, mistral penalty, speed cap) still applies on top either
     way — those encode deliberate product decisions, not a capability
     estimate, so real data augments them rather than replacing them."""
     low = (model_id or "").lower()
@@ -837,7 +838,8 @@ def _benchmark_score(pid, model_id):
     # USER PREFERENCE: hy3 (Tencent HunYuan) is the #1 pick for coding + heavy tasks,
     # then latest kimi / qwen / deepseek (all already Tier S). Floor it above every
     # other model's realistic max (~133: tier 100 + coder 8 + size 20 + instruct 3 +
-    # provider 2) so hy3 wins the top slot whenever it's available/keyed. Only affects
+    # provider 2) so hy3 wins the top slot whenever it's available/keyed — second
+    # only to the puter gpt-5.6-sol floor below. Only affects
     # the max-based (hard/tools/agentic) routing — light tasks still pick cheapest.
     if "hy3" in low or "hunyuan-3" in low or "tencent-hy" in low:
         score = max(score, _PREF_FLOORS[0])
@@ -846,6 +848,16 @@ def _benchmark_score(pid, model_id):
     # kimi-k3 id (nothing lists it yet). Matches kimi-k3 / kimi-k3.x / .../kimi-k3.
     if "kimi-k3" in low or "kimik3" in low:
         score = max(score, _PREF_FLOORS[1])
+    # USER PREFERENCE: Puter's newest GPT flagship — the gpt-5.6-sol(-pro)
+    # class — ranks FIRST among equals (user-requested top priority for the
+    # puter provider, 2026-07-30): floored one point above hy3 so a keyed
+    # puter account wins the top slot whenever it serves the id. The
+    # gpt-5.6-terra / gpt-5.5-pro class sits level with hy3. Id-keyed like
+    # the other floors — any provider serving these ids gets the lift.
+    if "gpt-5.6-sol" in low:
+        score = max(score, _PREF_FLOORS[2])
+    if "gpt-5.6-terra" in low or "gpt-5.5-pro" in low:
+        score = max(score, _PREF_FLOORS[3])
     # 2026-07-30: the 2026-07-25 qwen -45 demotion is REMOVED — qwen3 is a strong
     # family per the user and ranks with the top tier (Tier A + _STRONG_ROOTS).
     if (("mistral" in low or "mixtral" in low or "ministral" in low)
@@ -2766,7 +2778,8 @@ _orch_lock = threading.Lock()
 
 def _spread_band(pool):
     """The top-tier band of `pool`, best first. The band top is computed from
-    NATURAL scores only: a preference floor (hy3 135 / kimi-k3 134) is a thumb on
+    NATURAL scores only: a preference floor (hy3 135 / kimi-k3 134 / puter
+    gpt-5.6-sol 136) is a thumb on
     the scale, not a measurement, and letting it define the top drags the cutoff up
     ~27 points and collapses the band to one or two ids — which is exactly how a
     single model ends up serving a whole project."""

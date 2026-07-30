@@ -5,7 +5,7 @@ quota.py FREE_LIMITS rows. No Flask app involved (registry + quota only).
 
 Also covers the keyless gateways added 2026-07-30: g4f-groq, g4f-gemini,
 g4f-nvidia (g4f.space relays, no key at all) and kilocode (anonymous tier,
-literal bearer "anonymous").
+literal bearer "anonymous"), plus puter (user-pays gateway, BYOK).
 """
 import providers as prov
 import quota
@@ -241,3 +241,61 @@ def test_kilocode_has_live_models_discovery():
     # OpenRouter-shaped catalog — no longer None (the old 'custom' precedent).
     assert prov.get_provider("kilocode")["models_url"] == \
         "https://api.kilo.ai/api/openrouter/models"
+
+
+# --------------------------------------------------------------------------- #
+# puter (added 2026-07-30): user-pays AI gateway — one free puter.com account
+# auth token unlocks the whole OpenAI-compatible catalog (500+ models incl.
+# the GPT-5.6 flagship family). BYOK (NOT no_key), free_filter 'all' (the one
+# account covers the entire catalog), no published fair-use numbers -> absent
+# from FREE_LIMITS (UNKNOWN via DEFAULT_LIMIT; uncloseai/api-airforce
+# precedent).
+# --------------------------------------------------------------------------- #
+
+
+def test_puter_registered_with_required_fields():
+    p = prov.get_provider("puter")
+    assert p is not None, "puter missing from PROVIDERS"
+    assert p.get("name")
+    assert p["base_url"] == "https://api.puter.com/puterai/openai/v1"
+    assert p["models_url"] == "https://api.puter.com/puterai/openai/v1/models"
+    assert p["signup_url"] == "https://puter.com"
+    assert p.get("key_hint")
+    assert p["free_filter"] in prov.FREE_FILTERS
+    assert isinstance(p["default_free_models"], list) and p["default_free_models"]
+    assert prov.is_known_provider("puter")
+
+
+def test_puter_is_byok_not_no_key():
+    # The free account still requires its auth token — keyless would 401.
+    assert not prov.get_provider("puter").get("no_key")
+    assert not prov.get_provider("puter").get("static_key")
+
+
+def test_puter_all_filter_accepts_ordinary_ids():
+    # 'all' is honest here: the single user-pays account covers the whole
+    # catalog, so there is no separately-billed tier to leak.
+    assert prov.get_provider("puter")["free_filter"] == "all"
+    for mid in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5-pro", "gpt-4.1",
+                "claude-opus-5", "gemini-3.1-pro", "deepseek-v4"):
+        assert prov.is_free_model("puter", mid), mid
+    assert not prov.is_free_model("puter", None)
+    assert not prov.is_free_model("puter", "")
+    assert not prov.is_free_model("puter", "gpt-5.6-sol", is_free_tier=False)
+
+
+def test_puter_pinned_defaults_pass_their_own_free_check():
+    # A pinned fallback that fails is_free_model() would be silently unroutable.
+    for mid in prov.get_provider("puter")["default_free_models"]:
+        assert prov.is_free_model("puter", mid), mid
+        assert prov.is_model_allowed(mid), mid
+        assert prov.is_chat_model(mid), mid
+
+
+def test_puter_quota_is_deliberately_unknown():
+    # Fair-use limits apply but Puter publishes NO numbers -> no fabricated
+    # budget; tracks as UNKNOWN via DEFAULT_LIMIT (real 429s still throttle).
+    assert "puter" not in quota.FREE_LIMITS
+    row = quota._limit_for("puter")
+    assert row is quota.DEFAULT_LIMIT
+    assert row["limit"] is None and row.get("unknown") is True

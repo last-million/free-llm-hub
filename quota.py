@@ -60,11 +60,13 @@ FREE_LIMITS = {
     "g4f-groq":      {"limit": 5,     "window": "minute"},  # low: community-observed ~5 req/min on the keyless g4f.space Groq relay — no official doc exists for a volunteer proxy, so treat as a soft hint; real 429s still sideline it (same shape as llm7).
     "g4f-gemini":    {"limit": 5,     "window": "minute"},  # low: same g4f.space relay, Gemini catalog — community-observed ~5 req/min, no official figure; real 429s sideline it.
     "g4f-nvidia":    {"limit": 5,     "window": "minute"},  # low: same g4f.space relay, NVIDIA catalog — community-observed ~5 req/min, no official figure; real 429s sideline it.
-    # uncloseai / api-airforce / kilocode: genuinely free but with NO published
-    # request figure — deliberately ABSENT here so they track as UNKNOWN via
-    # DEFAULT_LIMIT instead of inheriting a fabricated budget (same convention
-    # as pollinations/aihorde). kilocode's anonymous tier documents no rate
-    # limit at all. Real 429s still throttle them.
+    # uncloseai / api-airforce / kilocode / puter: genuinely free but with NO
+    # published request figure — deliberately ABSENT here so they track as
+    # UNKNOWN via DEFAULT_LIMIT instead of inheriting a fabricated budget (same
+    # convention as pollinations/aihorde). kilocode's anonymous tier documents
+    # no rate limit at all. puter is a "user-pays" gateway under a fair-use
+    # policy with no published numbers (verified 2026-07-30). Real 429s still
+    # throttle them.
 
     # ── NO FREE TIER — documented zeros. Every call costs money (or 402s). ───
     # Kept as explicit rows (not deleted) so they can never inherit DEFAULT_LIMIT.
