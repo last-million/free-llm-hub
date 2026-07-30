@@ -292,6 +292,9 @@
     background:var(--surface-3); border-radius:999px; padding:2px 9px }
   .prov-cat.connected{ border-left:3px solid var(--accent) }
   .prov-cat.connected .cat-count{ color:var(--accent) }
+  .prov-cat.rec{ border-left:3px solid var(--accent) }
+  .prov-cat.rec>summary span:first-of-type{ color:var(--accent) }
+  .rec-note{ font-size:12px; font-weight:600; color:var(--accent); margin:-4px 0 0 }
   .prov-subgrid{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr));
     gap:16px; padding:0 16px 16px }
   @media (max-width:1280px){ .prov-subgrid{grid-template-columns:repeat(2,minmax(0,1fr))} }
@@ -2816,6 +2819,9 @@
     try{ scrim.querySelector('.notes-modal-x').focus(); }catch(e){}
   }
 
+  /* One-line pitch shown on pinned recommended cards (only providers with a
+     genuinely distinctive free offer get a line — keep this map tiny). */
+  var REC_NOTES = { puter: 'Latest GPT-5.6 + 500 models with one free token' };
   function cardHTML(p){
     var keys = Array.isArray(p.keys) ? p.keys : [];
     var kc = (typeof p.key_count === 'number') ? p.key_count : keys.length;
@@ -2858,6 +2864,7 @@
           badges +
         '</div>' +
       '</div>' +
+      (p.recommended && REC_NOTES[p.id] ? '<div class="rec-note">' + esc(REC_NOTES[p.id]) + '</div>' : '') +
       (p.notes ? notesCardHTML(p.notes) : '') +
       (p.relay ?
         '<div class="relay-callout ' + (p.relay.usable ? 'ok' : 'off') + '">' +
@@ -2943,19 +2950,20 @@
     };
     function isKeyless(p){ return !!(KEYLESS_GATEWAYS[p.id] || p.no_key); }
     function isPurePaid(p){ return !!(p.paid && PURE_PAID[p.id]); }
-    var keylessG = shown.filter(isKeyless);
-    var rest = shown.filter(function(p){ return !isKeyless(p); });
+    // Recommended providers are pinned in their own zone ABOVE every group
+    // and are therefore excluded from the category groups below (no
+    // duplicate cards).
+    var recG = shown.filter(function(p){ return p.recommended; });
+    var unpinned = shown.filter(function(p){ return !p.recommended; });
+    var keylessG = unpinned.filter(isKeyless);
+    var rest = unpinned.filter(function(p){ return !isKeyless(p); });
     var trialG = rest.filter(function(p){ return p.trial; });
     var paidG = rest.filter(function(p){ return !p.trial && isPurePaid(p); });
     var freeKeyG = rest.filter(function(p){ return !p.trial && !isPurePaid(p); });
-    // Recommended providers float to the top of whichever group they're
-    // already in (stable sort — Chrome/V8 guarantees equal elements keep
-    // their relative order, so this never reshuffles anything else).
-    function recFirst(a, b){ return (b.recommended ? 1 : 0) - (a.recommended ? 1 : 0); }
-    keylessG.sort(recFirst);
-    freeKeyG.sort(recFirst);
-    trialG.sort(recFirst);
-    paidG.sort(recFirst);
+    if (recG.length){
+      var gr = catSection('rec', 'Recommended', 'connect these first — best free quality', recG.length, true);
+      recG.forEach(function(p){ renderCard(p, gr); });
+    }
     if (keylessG.length){
       var g0 = catSection('connected', 'Free public gateways — no API key', 'ready instantly, no signup', keylessG.length, true);
       keylessG.forEach(function(p){ renderCard(p, g0); });
@@ -5476,6 +5484,55 @@
     });
   }
 
+  /* ---------- "what's new" after an update ----------
+     The hub auto-updates via git pull + restart, so a new running commit is
+     the signal that the user just got new code. On boot we compare
+     /api/version against localStorage 'flh.seenVersion': first-ever run (no
+     welcome modal dismissed yet) stores silently so the popup never stacks
+     with the welcome modal; a changed version shows the one-time modal and
+     stores on dismiss. */
+  function checkWhatsNew(){
+    api('/api/version').then(function(r){
+      var v = r && r.version;
+      if (!v || v === 'unknown') return;
+      var seen = null, welcomed = null;
+      try {
+        seen = localStorage.getItem('flh.seenVersion');
+        welcomed = localStorage.getItem('cx_welcome_seen_v1');
+      } catch(e){}
+      if (!welcomed || seen === v){
+        try { localStorage.setItem('flh.seenVersion', v); } catch(e){}
+        return;
+      }
+      showWhatsNew(v);
+    }).catch(function(){});
+  }
+  function showWhatsNew(version){
+    var body = frag();
+    var box = document.createElement('div');
+    box.innerHTML =
+      '<p style="margin:0 0 10px">The hub just updated to <code>' + esc(version) + '</code>. Highlights:</p>' +
+      '<p style="margin:0 0 6px"><b>New models &amp; free providers — no API key needed, they work directly:</b></p>' +
+      '<ul style="margin:0 0 10px; padding-left:20px">' +
+        '<li>pollinations, aihorde, uncloseai, llm7</li>' +
+        '<li>g4f-groq / g4f-gemini / g4f-nvidia, kilocode</li>' +
+      '</ul>' +
+      '<p style="margin:0">For more usage and quality, connect the recommended providers first ' +
+      '(<b>Puter</b> — latest GPT-5.6 + 500 models with one free token), then any others from the Providers page.</p>';
+    body.appendChild(box);
+    var actions = document.createElement('div');
+    actions.className = 'sd-actions';
+    var ok = document.createElement('button');
+    ok.type = 'button'; ok.className = 'btn primary'; ok.textContent = 'Got it';
+    ok.addEventListener('click', function(){
+      try { localStorage.setItem('flh.seenVersion', version); } catch(e){}
+      closeModal();
+    });
+    actions.appendChild(ok);
+    body.appendChild(actions);
+    openModal('Hub updated — what\'s new', body);
+  }
+
   /* ---------- boot ---------- */
   initScrollTop();
   initModal();
@@ -5497,6 +5554,7 @@
   loadImages();
   loadUsage();
   loadStatus().then(function(){ updateChatAuthNote(); updateImageAuthNote(); });
+  checkWhatsNew();
   /* hydrate persisted test results FIRST so cards paint instantly with the last
      known status, THEN only live-test what's missing or stale — not everything. */
   Promise.all([loadProviders(), hydrateTestCache()]).then(function(){
