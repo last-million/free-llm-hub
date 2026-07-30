@@ -1285,6 +1285,31 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": ["stepfun/step-3.7-flash:free"],
         "notes": "Anonymous free tier of the Kilo Code OpenRouter relay: no signup, the literal bearer 'anonymous' authenticates. Free ids carry the ':free' suffix. Unstable community-run gateway: the anonymous tier is a courtesy, rate limits are unpublished (quota tracks it as UNKNOWN), quality varies and it can go down without warning — no SLA.",
     },
+    "puter": {
+        "name": "Puter",
+        "base_url": "https://api.puter.com/puterai/openai/v1",
+        "models_url": "https://api.puter.com/puterai/openai/v1/models",
+        "signup_url": "https://puter.com",
+        "key_hint": "Puter account auth token (puter.com, free)",
+        # BYOK (NOT no_key): one free puter.com account yields an auth token
+        # that unlocks the whole OpenAI-compatible catalog. Puter is a
+        # "user-pays" gateway — the free account IS the payment identity, so
+        # 'all' cannot leak a separately-billed id; the single token covers
+        # 500+ models incl. the latest GPT-5.6 family (sol/terra/luna + -pro),
+        # gpt-5.5-pro, gpt-5.4, gpt-5.3-codex, gpt-4.1, GPT Image and the
+        # Claude/Gemini/Grok/DeepSeek/Mistral/Llama catalogs. Fair-use limits
+        # apply but Puter publishes NO numbers -> quota.py deliberately leaves
+        # it out of FREE_LIMITS (UNKNOWN via DEFAULT_LIMIT; uncloseai/
+        # api-airforce precedent) and real 429s sideline it.
+        "free_filter": "all",
+        # Live probe 2026-07-30: /models 404s without a valid token (chat
+        # completions answers 'reauth_required' on a dummy bearer, so the
+        # gateway itself is up and auth-gated) — discovery runs with the saved
+        # key; the pins below keep the provider usable if discovery fails.
+        "default_free_models": ["gpt-5.6-sol", "gpt-5.6-terra",
+                                "gpt-5.5-pro", "gpt-4.1"],
+        "notes": "User-pays AI gateway: one free puter.com account auth token unlocks the whole OpenAI-compatible catalog (500+ models incl. the newest GPT-5.6 flagship family, GPT Image, and Claude/Gemini/Grok/DeepSeek/Mistral/Llama via the same account). Fair-use limits apply but are unpublished, so quota tracks it as UNKNOWN. Flagship ids carry a scoring preference floor (app.py _PREF_FLOORS) so puter ranks first among equals — user-requested top priority.",
+    },
     "custom": {
         "name": "Custom (OpenAI-compatible)",
         "base_url": None,  # user supplies via per-provider config base_url
