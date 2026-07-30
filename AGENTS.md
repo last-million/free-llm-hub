@@ -22,6 +22,26 @@ app.py:1213) and routes to the cheapest model that clears the tier floor
 `tests/test_difficulty_routing.py` — keep those tests green when touching the
 routing heuristics.
 
+## Hidden run & sticky stop (hub lifecycle)
+
+- `run-hidden.vbs` starts `run.bat` with no console window (WScript.Shell Run,
+  window style 0), so closing any terminal can never kill the hub. Both
+  autostart mechanisms (Startup-folder launcher and the 5-minute self-heal
+  Scheduled Task, installed by `autostart.bat`) call it as
+  `run-hidden.vbs supervised`.
+- Dashboard stop (`POST /api/runtime/stop`) writes the flag
+  `state_dir()/intentional-stop` (`config.set_intentional_stop`). A user stop
+  is STICKY: while the flag exists, `run.bat` under `HUB_SUPERVISED=1` refuses
+  to start — self-heal and logon launches become no-ops and never resurrect a
+  user-stopped hub. An explicit user action clears the flag and runs: the
+  desktop shortcut, plain `run.bat`, or `python app.py`
+  (`_mark_runtime_started` also clears it on boot).
+- `POST /api/hub/desktop-shortcut` (control-token gated like every `/api/*`)
+  creates a Desktop shortcut pointing at `run-hidden.vbs` (`.lnk` via
+  PowerShell WScript.Shell COM, `.bat` fallback); returns `{ok, path}`.
+  `GET /api/hub/stopped` returns `{stopped: bool}`.
+- Covered by `tests/test_hub_lifecycle.py`.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

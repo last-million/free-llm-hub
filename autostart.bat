@@ -10,9 +10,15 @@ rem   1. a silent launcher in the per-user Startup folder -> starts at logon,
 rem      immediately, with no console window flashing up.
 rem   2. a 5-minute Scheduled Task -> SELF-HEAL: if the hub ever dies mid-session
 rem      it comes back within 5 minutes instead of silently staying dead.
+rem Both go through run-hidden.vbs (supervised), so nothing ever shows a
+rem console window - and closing a terminal can never kill the hub.
 rem The 5-minute task is safe to fire while the hub is healthy because run.bat
 rem refuses to start a second copy on a served port - so it is a no-op then, and
-rem a restart only when actually needed.
+rem a restart only when actually needed. It ALSO stays a no-op after a
+rem dashboard stop: supervised runs refuse while the intentional-stop flag
+rem exists, so the self-heal never resurrects a hub the user stopped. Only an
+rem explicit user action (desktop shortcut, plain run.bat, python app.py)
+rem clears that flag.
 rem
 rem NOTE: `schtasks /SC ONLOGON` is NOT used - it requires elevation, while
 rem `/SC MINUTE` and the Startup folder do not. That is the whole reason for the
@@ -38,9 +44,9 @@ rem --- 1. logon launcher (silent, no admin) ---
 > "%LAUNCHER%" echo ' Calvoun Free LLM Hub - starts the local gateway at logon.
 >> "%LAUNCHER%" echo ' Delete this file (or run autostart.bat remove) to disable.
 >> "%LAUNCHER%" echo Set sh = CreateObject("WScript.Shell")
->> "%LAUNCHER%" echo sh.CurrentDirectory = "%HERE%"
->> "%LAUNCHER%" echo ' 0 = hidden window, False = do not wait
->> "%LAUNCHER%" echo sh.Run "cmd /c set HUB_SUPERVISED=1 && call run.bat", 0, False
+>> "%LAUNCHER%" echo ' run-hidden.vbs supervised: hidden window, no-op while the
+>> "%LAUNCHER%" echo ' intentional-stop flag exists (a dashboard stop stays stopped).
+>> "%LAUNCHER%" echo sh.Run "wscript.exe ""%HERE%\run-hidden.vbs"" supervised", 0, False
 if not exist "%LAUNCHER%" (
   echo [autostart] ERROR: could not write to the Startup folder:
   echo             %STARTUP%
@@ -48,10 +54,10 @@ if not exist "%LAUNCHER%" (
 )
 echo [autostart] Logon launcher installed.
 
-rem --- 2. self-heal every 5 minutes (no admin) ---
+rem --- 2. self-heal every 5 minutes (no admin, hidden) ---
 schtasks /Delete /TN "%TASK%" /F >nul 2>nul
 schtasks /Create /TN "%TASK%" /SC MINUTE /MO 5 /F ^
-  /TR "cmd /c cd /d \"%HERE%\" && set HUB_SUPERVISED=1 && call run.bat" >nul 2>nul
+  /TR "wscript.exe \"%HERE%\run-hidden.vbs\" supervised" >nul 2>nul
 if errorlevel 1 (
   echo [autostart] NOTE: the 5-minute self-heal task could not be created.
   echo             The hub will still start at logon - it just will not come

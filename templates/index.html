@@ -339,6 +339,7 @@
   .badge.trial svg{flex:none;opacity:.9}
   .badge.paid{background:var(--warn-soft);color:var(--warn-text)}
   .badge.keyed{background:var(--surface-3);color:var(--text-dim)}
+  .badge.nokey{background:var(--accent-soft);color:var(--ok-text)}
   .badge.recommended{background:var(--accent);color:var(--on-accent);display:inline-flex;align-items:center;gap:4px}
   .badge.recommended svg{flex:none}
   .card.recommended{border-color:var(--accent)}
@@ -651,6 +652,9 @@
   .cli-setup-body{margin-top:11px;padding-top:11px;border-top:1px solid var(--border-soft);display:flex;flex-direction:column;gap:12px}
   .cli-setup-body ol{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:6px;font-size:12.5px;color:var(--text-dim);line-height:1.5}
   .cli-setup-note{font-size:12px;color:var(--text-faint)}
+  /* multi-line setup notes (e.g. Kimi Code's embedded config.toml block) keep
+     their line breaks inside the Setup details list */
+  .cli-setup-body ol li{white-space:pre-wrap;overflow-wrap:anywhere}
   .cli-missing{margin-top:4px;display:flex;flex-direction:column;gap:8px}
   .cli-missing-h{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text-faint)}
   .cli-missing-list{display:flex;flex-wrap:wrap;gap:8px}
@@ -1320,7 +1324,7 @@
           <button class="btn sm" id="media-save" type="button">Save</button>
         </div>
         <button class="btn sm" id="hub-stop" type="button" title="Disconnect all CLIs and stop being the default LLM — the local server keeps running">Stop being default (disconnect CLIs)</button>
-        <button class="btn danger sm" id="hub-shutdown" type="button" title="Fully shut down the local hub server and free the port">Shut down server</button>
+        <button class="btn danger sm" id="hub-shutdown" type="button" title="Stop the hub server — it will NOT auto-restart until you relaunch it">Stop hub</button>
         <div id="lifecycle-detail" class="lifecycle-detail" role="status"><span class="skel skel-line"></span></div>
       </div>
     </div>
@@ -1928,6 +1932,8 @@
   var mediaState = null;
   var imagesState = null;
   var runtimeState = null;
+  var hubOffline = false;       /* set once the user stops the hub via "Stop hub" —
+                                   gates every poll so a dead API never toasts */
   var quotaState = {};        /* pid -> live quota model; resets_in ticks down locally */
   var _ebSig = '';            /* last structural signature of the exhaustion banner */
   var keyHealth = {};         /* pid -> {state:'ok'|'bad'|'unknown', detail} — cached per session, NOT re-run on the 15s poll */
@@ -2192,17 +2198,120 @@
           return Promise.all([loadLifecycle(), loadClis()]);
         }).catch(function(e){ btn.disabled = false; toast('Stop: ' + e.message, true); loadLifecycle(true); });
     });
-    // "Shut down server" = the real process stop (drains, writes the intentional-stop
-    // marker so nothing auto-restarts it, then frees the port).
-    $('#hub-shutdown').addEventListener('click', function(){
-      if (!runtimeState || !window.confirm('Fully shut down the local hub server and free the port?\n\nActive requests finish first. It will NOT auto-restart.')) return;
-      var btn = this; btn.disabled = true;
-      api('/api/runtime/stop', {method:'POST', body:{revision:runtimeState.revision}})
-        .then(function(){
-          $('#lifecycle-detail').textContent = 'Server shutdown accepted. Active inference requests are draining; start run.bat/run.sh manually to resume.';
-          toast('Hub server is stopping cleanly');
-        }).catch(function(e){ btn.disabled = false; toast('Shutdown: ' + e.message, true); loadLifecycle(true); });
+    // "Stop hub" = the real process stop (drains, writes the intentional-stop
+    // marker so nothing auto-restarts it, then frees the port). Goes through a
+    // modal (not window.confirm) because it bundles an optional desktop-shortcut
+    // step and must keep showing a final state after the API is already dead.
+    $('#hub-shutdown').addEventListener('click', openStopHubModal);
+  }
+
+  /* ---------- stop-hub modal ---------- */
+  function openStopHubModal(){
+    if (!runtimeState || runtimeState.revision == null){
+      toast('Runtime state not loaded yet — try again in a moment', true);
+      return;
+    }
+    var box = frag();
+    var warn = document.createElement('div');
+    warn.className = 'chat-note show';
+    warn.textContent = 'This stops the hub server process and frees the port. It will NOT auto-restart — the 5-minute self-heal task and the logon launcher stay disabled until you relaunch the hub yourself.';
+    box.appendChild(warn);
+    var scLabel = document.createElement('label');
+    scLabel.className = 'switch';
+    var scInput = document.createElement('input');
+    scInput.type = 'checkbox';
+    scInput.checked = true;
+    scInput.setAttribute('aria-label', 'Create a desktop shortcut to relaunch the hub');
+    var scTrack = document.createElement('span'); scTrack.className = 'track';
+    var scLbl = document.createElement('span'); scLbl.className = 'lbl';
+    scLbl.textContent = 'Create a desktop shortcut to relaunch the hub';
+    scLabel.appendChild(scInput); scLabel.appendChild(scTrack); scLabel.appendChild(scLbl);
+    box.appendChild(scLabel);
+    var status = document.createElement('div');
+    status.className = 'cli-setup-note';
+    status.setAttribute('role', 'status');
+    box.appendChild(status);
+    var act = document.createElement('div');
+    act.className = 'modal-block';
+    act.style.display = 'flex'; act.style.gap = '9px';
+    var confirmBtn = document.createElement('button');
+    confirmBtn.type = 'button'; confirmBtn.className = 'btn danger'; confirmBtn.textContent = 'Stop the hub';
+    var cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button'; cancelBtn.className = 'btn ghost'; cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', closeModal);
+    act.appendChild(confirmBtn); act.appendChild(cancelBtn);
+    box.appendChild(act);
+    confirmBtn.addEventListener('click', function(){
+      var wantShortcut = scInput.checked;
+      confirmBtn.disabled = true; cancelBtn.disabled = true; scInput.disabled = true;
+      busyBtn(confirmBtn, 'Stopping…');
+      var shortcutPath = null, shortcutErr = null;
+      /* Shortcut FIRST (it needs a live API) — a failure here never blocks the stop. */
+      var step = wantShortcut
+        ? api('/api/hub/desktop-shortcut', { method:'POST', body:{} }).then(function(r){
+            if (r && r.ok && r.path){
+              shortcutPath = r.path;
+              status.textContent = 'Desktop shortcut created: ' + r.path;
+            } else {
+              shortcutErr = (r && r.error) || 'unknown error';
+              status.textContent = 'Shortcut could not be created (' + shortcutErr + ') — stopping anyway.';
+            }
+          }).catch(function(e){
+            shortcutErr = e.message;
+            status.textContent = 'Shortcut could not be created (' + e.message + ') — stopping anyway.';
+          })
+        : Promise.resolve();
+      step.then(function(){
+        return api('/api/runtime/stop', { method:'POST', body:{ revision: runtimeState.revision } });
+      }).then(function(){
+        markHubOffline(shortcutPath, shortcutErr, wantShortcut);
+      }).catch(function(e){
+        resetBtn(confirmBtn, 'Stop the hub');
+        confirmBtn.disabled = false; cancelBtn.disabled = false; scInput.disabled = false;
+        status.textContent = 'Stop failed: ' + e.message;
+      });
     });
+    openModal('Stop the hub?', box);
+  }
+
+  /* The stop succeeded: the API this page talks to is gone. Flip hubOffline so
+     every poll/view-refresh becomes a no-op (no error-toast storm), paint the
+     one persistent "hub offline" indicator (header pill + lifecycle detail), and
+     swap the modal to its final static state. */
+  function markHubOffline(shortcutPath, shortcutErr, wantedShortcut){
+    hubOffline = true;
+    setPill('pill-hub', false, 'hub: stopped');
+    var detail = $('#lifecycle-detail');
+    if (detail){
+      detail.className = 'lifecycle-detail';
+      detail.textContent = 'Hub stopped. It will not auto-restart — relaunch it via the desktop shortcut or run.bat.';
+    }
+    var box = frag();
+    var done = document.createElement('div');
+    done.className = 'note';
+    done.textContent = 'Hub stopped. The dashboard can no longer reach the API — this page is now static.';
+    box.appendChild(done);
+    var rel = document.createElement('div');
+    rel.className = 'note';
+    if (shortcutPath){
+      rel.textContent = 'Relaunch anytime via the desktop shortcut:';
+      box.appendChild(rel);
+      box.appendChild(blockNode('Desktop shortcut', shortcutPath));
+    } else {
+      rel.textContent = wantedShortcut
+        ? 'Relaunch by running run.bat (the desktop shortcut could not be created: ' + (shortcutErr || 'unknown error') + ').'
+        : 'Relaunch anytime by running run.bat.';
+      box.appendChild(rel);
+    }
+    var act = document.createElement('div');
+    act.className = 'modal-block';
+    var got = document.createElement('button');
+    got.type = 'button'; got.className = 'btn primary'; got.textContent = 'Got it';
+    got.addEventListener('click', closeModal);
+    act.appendChild(got);
+    box.appendChild(act);
+    openModal('Hub stopped', box);
+    setTimeout(function(){ try { got.focus(); } catch(e){} }, 0);
   }
 
   /* ---------- free-quota model + exhaustion banner (A + B) ---------- */
@@ -2700,6 +2809,7 @@
     if (p.paid) badges += '<span class="badge paid">paid</span>';
     if (p.trial) badges += '<span class="badge trial" title="' + esc(TRIAL_TIP) + '">' + HOURGLASS_SVG + 'Trial credits</span>';
     if (!hasFree && !p.paid && !p.trial) badges += '<span class="badge free">free</span>';
+    if (p.no_key) badges += '<span class="badge nokey" title="Public gateway — works instantly, no API key to paste">no key needed</span>';
     if (p.has_key) badges += '<span class="badge keyed">' + kc + ' key' + (kc > 1 ? 's' : '') + ' saved</span>';
     if (p.image_free_count > 0){
       badges += '<span class="badge free" title="Also generates images, free">&#128444; +' + p.image_free_count + ' free image model' + (p.image_free_count > 1 ? 's' : '') + '</span>';
@@ -2803,25 +2913,44 @@
       grid.appendChild(d);
       return d.querySelector('.prov-subgrid');
     }
-    // TWO categories by CONNECTION status: providers ready to use now (a key
-    // saved, or an open gateway that needs none) collapse on top; everything that
-    // still needs a key expands below so it's easy to add one. Add a key and the
-    // provider jumps to the top group on the next render.
-    var connG = shown.filter(function(p){ return p.has_key || p.no_key; });
-    var availG = shown.filter(function(p){ return !p.has_key && !p.no_key; });
+    // CATEGORIES by cost/auth class. The keyless public gateways are factual
+    // registry knowledge (no API key exists for them at all) — everything else
+    // is derived from the payload's own trial / paid / free_models flags, so a
+    // registry change re-files a card automatically.
+    var KEYLESS_GATEWAYS = {
+      pollinations: 1, aihorde: 1, uncloseai: 1, llm7: 1,
+      'g4f-groq': 1, 'g4f-gemini': 1, 'g4f-nvidia': 1, kilocode: 1
+    };
+    function isKeyless(p){ return !!(KEYLESS_GATEWAYS[p.id] || p.no_key); }
+    function isPurePaid(p){ return !!(p.paid && PURE_PAID[p.id]); }
+    var keylessG = shown.filter(isKeyless);
+    var rest = shown.filter(function(p){ return !isKeyless(p); });
+    var trialG = rest.filter(function(p){ return p.trial; });
+    var paidG = rest.filter(function(p){ return !p.trial && isPurePaid(p); });
+    var freeKeyG = rest.filter(function(p){ return !p.trial && !isPurePaid(p); });
     // Recommended providers float to the top of whichever group they're
     // already in (stable sort — Chrome/V8 guarantees equal elements keep
     // their relative order, so this never reshuffles anything else).
     function recFirst(a, b){ return (b.recommended ? 1 : 0) - (a.recommended ? 1 : 0); }
-    connG.sort(recFirst);
-    availG.sort(recFirst);
-    if (connG.length){
-      var g1 = catSection('connected', 'Connected providers', 'ready to use', connG.length, false);
-      connG.forEach(function(p){ renderCard(p, g1); });
+    keylessG.sort(recFirst);
+    freeKeyG.sort(recFirst);
+    trialG.sort(recFirst);
+    paidG.sort(recFirst);
+    if (keylessG.length){
+      var g0 = catSection('connected', 'Free public gateways — no API key', 'ready instantly, no signup', keylessG.length, true);
+      keylessG.forEach(function(p){ renderCard(p, g0); });
     }
-    if (availG.length){
-      var g2 = catSection('', 'Available providers', 'add a free key to start', availG.length, true);
-      availG.forEach(function(p){ renderCard(p, g2); });
+    if (freeKeyG.length){
+      var g1 = catSection('', 'Free — API key', 'free tier once you add a key', freeKeyG.length, true);
+      freeKeyG.forEach(function(p){ renderCard(p, g1); });
+    }
+    if (trialG.length){
+      var g2 = catSection('', 'Trial credits', 'one-time credits — they run out', trialG.length, false);
+      trialG.forEach(function(p){ renderCard(p, g2); });
+    }
+    if (paidG.length){
+      var g3 = catSection('', 'Paid', 'no free tier — auto only spends here in Paid/Mix mode', paidG.length, false);
+      paidG.forEach(function(p){ renderCard(p, g3); });
     }
   }
 
@@ -3669,7 +3798,8 @@
     'gemini': 'https://github.com/google-gemini/gemini-cli',
     'qwen': 'https://github.com/QwenLM/qwen-code',
     'llm': 'https://llm.datasette.io',
-    'cursor-agent': 'https://cursor.com/cli'
+    'cursor-agent': 'https://cursor.com/cli',
+    'kimi': 'https://github.com/MoonshotAI/kimi-code'
   };
 
   function loadClis(){
@@ -5308,7 +5438,7 @@
      panel). Hidden views are refreshed on entry instead: cxShow() calls
      cxOnViewChange below, which re-pulls exactly that view's data. */
   function resync(){   /* the old 15s server re-sync, now guarded per panel */
-    if (document.hidden) return;
+    if (document.hidden || hubOffline) return;
     loadStatus(true);   /* header pills + exhaustion banner: always safe to paint */
     if (panelIdle($('#sec-lifecycle'))) loadLifecycle(true);
     if (panelIdle($('#sec-images'))) loadImages(true);
@@ -5316,8 +5446,8 @@
     if (panelIdle($('#sec-agent'))) loadAgentSettings(true);
     loadVisionStatus(true);
   }
-  function pollActivity(){ if (panelIdle($('#activity-list'))) loadActivity(); }
-  function pollTracking(){ if (panelIdle($('#track-list'))) loadTracking(); }
+  function pollActivity(){ if (hubOffline) return; if (panelIdle($('#activity-list'))) loadActivity(); }
+  function pollTracking(){ if (hubOffline) return; if (panelIdle($('#track-list'))) loadTracking(); }
   var VIEW_REFRESH = {
     'sec-lifecycle': function(){ loadStatus(true); loadLifecycle(true); },
     'sec-subs': function(){ loadSubscriptions(true); },
@@ -5328,6 +5458,7 @@
     'sec-tracking': loadTracking
   };
   window.cxOnViewChange = function(view){
+    if (hubOffline) return;
     var fn = VIEW_REFRESH[view];
     if (fn) fn();
   };
@@ -5337,7 +5468,7 @@
   setInterval(function(){ if (!document.hidden) tick(); }, 1000);         /* local 1s countdown */
   setInterval(function(){ if (!document.hidden) tickActivity(); }, 1000); /* local 1s in-flight duration */
   document.addEventListener('visibilitychange', function(){
-    if (document.hidden) return;
+    if (document.hidden || hubOffline) return;
     resync();           /* catch up on everything the hidden tab missed */
     pollActivity();
     pollTracking();

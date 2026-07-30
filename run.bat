@@ -13,6 +13,9 @@ if defined FREE_LLM_HUB_CONFIG (
 )
 if "%HUB_SUPERVISED%"=="1" if exist "%STOP_MARKER%" (
   echo [free-llm-hub] Intentionally stopped from the dashboard - supervisor restart skipped.
+  echo                This is sticky: the self-heal task and logon launcher stay no-ops.
+  echo                To start it again: run run.bat yourself, use the desktop shortcut,
+  echo                or run "python app.py" - any of these clears the stop flag.
   exit /b 0
 )
 if not "%HUB_SUPERVISED%"=="1" if exist "%STOP_MARKER%" del /f /q "%STOP_MARKER%" >nul 2>nul

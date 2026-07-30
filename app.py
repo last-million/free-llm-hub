@@ -5250,6 +5250,92 @@ def api_runtime_stop():
 
 
 # ---------------------------------------------------------------------------
+# Hub lifecycle extras: stopped-state query + desktop relaunch shortcut
+# ---------------------------------------------------------------------------
+
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+@app.route("/api/hub/stopped", methods=["GET"])
+def api_hub_stopped():
+    """Whether the hub was intentionally stopped from the dashboard. Sticky:
+    stays true until an explicit user relaunch (desktop shortcut, plain
+    run.bat, or `python app.py`) clears the intentional-stop flag."""
+    return jsonify({"stopped": config.is_intentionally_stopped()})
+
+
+def _desktop_dir():
+    """Current user's Desktop, OneDrive-redirect aware: ask Windows first,
+    fall back to ~/Desktop."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Environment]::GetFolderPath('Desktop')"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=_CREATE_NO_WINDOW)
+        path = (out.stdout or "").strip()
+        if out.returncode == 0 and path and os.path.isdir(path):
+            return path
+    except Exception:
+        pass
+    return os.path.join(os.path.expanduser("~"), "Desktop")
+
+
+def _run_hidden_powershell(command, timeout=20):
+    """Run a PowerShell command with no window; raises on non-zero exit."""
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+         "Bypass", "-Command", command],
+        capture_output=True, text=True, timeout=timeout,
+        creationflags=_CREATE_NO_WINDOW, check=True)
+
+
+def _create_desktop_shortcut():
+    """Create a Desktop shortcut that relaunches the hub HIDDEN.
+
+    Prefers a real .lnk via the WScript.Shell COM object; falls back to a
+    small .bat. Both point at run-hidden.vbs WITHOUT the 'supervised'
+    argument, so run.bat clears the intentional-stop flag before starting —
+    an explicit click always revives a dashboard-stopped hub.
+    Returns the created file path."""
+    desktop = _desktop_dir()
+    os.makedirs(desktop, exist_ok=True)
+    here = os.path.dirname(os.path.abspath(__file__))
+    vbs = os.path.join(here, "run-hidden.vbs")
+    lnk = os.path.join(desktop, "Calvoun Free LLM Hub.lnk")
+    ps = ("$ws = New-Object -ComObject WScript.Shell; "
+          "$sc = $ws.CreateShortcut('%s'); "
+          "$sc.TargetPath = 'wscript.exe'; "
+          "$sc.Arguments = '\"%s\"'; "
+          "$sc.WorkingDirectory = '%s'; "
+          "$sc.WindowStyle = 7; "
+          "$sc.Description = 'Relaunch the Calvoun Free LLM Hub (hidden, no console window)'; "
+          "$sc.Save()"
+          % tuple(s.replace("'", "''") for s in (lnk, vbs, here)))
+    try:
+        _run_hidden_powershell(ps)
+        if os.path.isfile(lnk):
+            return lnk
+    except Exception as exc:
+        _log.warning("Desktop .lnk creation failed, falling back to .bat: %s",
+                     _sanitize(str(exc)))
+    bat = os.path.join(desktop, "Calvoun Free LLM Hub.bat")
+    with open(bat, "w", encoding="utf-8", newline="") as f:
+        f.write("@echo off\r\nrem Relaunch the Calvoun Free LLM Hub, hidden.\r\n")
+        f.write('wscript.exe "%s"\r\n' % vbs)
+    return bat
+
+
+@app.route("/api/hub/desktop-shortcut", methods=["POST"])
+def api_hub_desktop_shortcut():
+    try:
+        path = _create_desktop_shortcut()
+    except OSError as exc:
+        return jsonify({"ok": False, "error": _sanitize(str(exc))}), 500
+    return jsonify({"ok": True, "path": path})
+
+
+# ---------------------------------------------------------------------------
 # Local subscription providers API (opt-in, default OFF)
 # ---------------------------------------------------------------------------
 # Localhost-open like the rest of /api/*. Read the state, flip the master switch,
@@ -6124,6 +6210,11 @@ def _p_hermes():
     return os.path.join(_home(), ".hermes", "config.yaml")
 
 
+def _p_kimi():
+    """Kimi Code's config.toml (~/.kimi/config.toml on every platform)."""
+    return os.path.join(_home(), ".kimi", "config.toml")
+
+
 # The CLI registry: known local AI CLIs and how each connects to a custom
 # OpenAI/Anthropic endpoint. `autofix` names a safe writer strategy (JSON/
 # YAML/dotenv merge) or is None for CLIs we won't touch automatically (TOML,
@@ -6327,6 +6418,44 @@ CLI_REGISTRY = [
             "and put OPENAI_BASE_URL + OPENAI_API_KEY in the sibling .env.)" % PORT
         ),
     },
+    {
+        "id": "kimi",
+        "name": "Kimi Code",
+        "kind": "openai",
+        "bins": ["kimi"],
+        "config_paths": [_p_kimi()],
+        # NO env_check: Kimi Code wires custom providers ONLY through
+        # ~/.kimi/config.toml ([providers.*] tables). Its documented credential
+        # priority is config api_key > [providers.*.env] sub-table — there is NO
+        # shell-env fallback, so checking OPENAI_BASE_URL/OPENAI_API_KEY here
+        # would false-positive exactly like it did for codex.
+        "autofix": None,  # TOML with a live default_model (the managed
+                          # 'kimi-code' OAuth service) — rewriting it additively
+                          # is risky; guide the edit instead (llm precedent).
+        "default_method": "manual",
+        "hint": ("Installed. Add a [providers.free-hub] openai block + an 'auto' model "
+                 "alias to ~/.kimi/config.toml (see instructions), then restart kimi."),
+        "manual_note": (
+            "Kimi Code is wired through ~/.kimi/config.toml ([providers.*] tables), NOT shell "
+            "environment variables. Per the official docs, api_key is a REQUIRED field — startup "
+            "fails without one — so give it a placeholder; the localhost hub accepts any bearer "
+            "when no local API key is set (if you DID set a hub key, paste that instead). Add:\n"
+            "  [providers.free-hub]\n"
+            "  type = \"openai\"\n"
+            "  base_url = \"http://127.0.0.1:%d/v1\"\n"
+            "  api_key = \"free-llm-hub\"\n"
+            "plus a model alias:\n"
+            "  [models.\"auto\"]\n"
+            "  provider = \"free-hub\"\n"
+            "  model = \"auto\"\n"
+            "  max_context_size = 128000\n"
+            "then set  default_model = \"auto\"  in the top section (or pick it via /model in the "
+            "TUI) and restart Kimi Code. The 'auto' model routes every request through the hub's "
+            "difficulty-aware orchestration. ALTERNATIVE: type = \"anthropic\" with "
+            "base_url = \"http://127.0.0.1:%d\" (no /v1 — the Anthropic SDK appends it) also "
+            "works; the hub serves /v1/messages." % (PORT, PORT)
+        ),
+    },
 ]
 
 _CLI_BY_ID = {e["id"]: e for e in CLI_REGISTRY}
@@ -6341,7 +6470,8 @@ def _get_cli_entry(cid):
 #   codex  -> Responses API via ~/.codex/config.toml (Auto-fix writes it; no auth)
 #   gemini -> Google-native wire format; this OpenAI/Anthropic hub can't serve it
 #   llm    -> extra-openai-models.yaml + `llm keys` (not env vars)
-_ENVLESS_CLIS = {"codex", "gemini", "llm"}
+#   kimi   -> [providers.*] tables in ~/.kimi/config.toml (no shell-env fallback)
+_ENVLESS_CLIS = {"codex", "gemini", "llm", "kimi"}
 
 
 def _hub_fragments():

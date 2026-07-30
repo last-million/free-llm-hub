@@ -1128,19 +1128,18 @@ PROVIDERS: Dict[str, dict] = {
         "signup_url": "https://hermes.ai.unturf.com",
         "key_hint": "(no key needed — any non-empty string is accepted)",
         "no_key": True,   # free forever, no signup, no card
-        # The server accepts ANY non-empty bearer (or none). `static_key` is
-        # the documented placeholder; TODAY app.py's no-key path sends no
-        # Authorization header at all, so this field is informational — if a
-        # live probe shows the server 401s a missing header, app.py's
-        # _upstream_chat/provider_free_models need a 2-line hook to send
-        # `Bearer <static_key>` for no_key providers that carry one.
+        # The server accepts ANY non-empty bearer (or none); app.py's no-key
+        # path sends `Authorization: Bearer uncloseai` via this static_key.
         "static_key": "uncloseai",
         # Free-only service (nothing is sold), so 'all' cannot leak a paid id.
         "free_filter": "all",
-        # Long-standing flagship id; the live /models list (Hermes / Qwen /
-        # Gemma family) is the real source and widens this automatically.
-        "default_free_models": ["hermes-3-llama-3.1-405b"],
-        "notes": "Free-forever community endpoint serving the Hermes/Qwen/Gemma family. Keyless: any non-empty string works as the API key. No published rate limit — quota tracks it as UNKNOWN (real 429s still throttle it). Volunteer-run: no SLA.",
+        # RE-VERIFIED 2026-07-30: the old flagship 'hermes-3-llama-3.1-405b' is
+        # GONE (404 "does not exist"); the live /models catalog is now a single
+        # id, solidrust/Hermes-3-Llama-3.1-8B-AWQ — chat-verified 200 with the
+        # static_key bearer. Discovery still widens this automatically if the
+        # catalog regrows.
+        "default_free_models": ["solidrust/Hermes-3-Llama-3.1-8B-AWQ"],
+        "notes": "Free-forever community endpoint (vLLM). Keyless: any non-empty string works as the API key. Catalog has shrunk to one 8B AWQ Hermes id (verified 2026-07-30). No published rate limit — quota tracks it as UNKNOWN (real 429s still throttle it). Volunteer-run: no SLA.",
     },
     "llm7": {
         "name": "LLM7.io",
@@ -1149,16 +1148,23 @@ PROVIDERS: Dict[str, dict] = {
         "signup_url": "https://llm7.io",
         "key_hint": "(no key needed — the literal string 'unused' works)",
         "no_key": True,   # free without signup, no card
-        # Documented credential is the literal string "unused" — any value is
-        # accepted. Same caveat as uncloseai: `static_key` is informational
-        # until app.py's no-key path learns to send it (today it sends NO
-        # Authorization header); the /models endpoint is public, so live
-        # discovery works regardless.
+        # Documented credential is the literal string "unused" — app.py's
+        # no-key path sends it as `Authorization: Bearer unused`.
         "static_key": "unused",
-        # Free-only gateway -> 'all' cannot leak a paid id.
-        "free_filter": "all",
-        "default_free_models": [],
-        "notes": "Free OpenAI-compatible gateway, no signup (the literal string 'unused' is the documented API key). Documented rate: ~20 req/min, 100 req/hour. No token billing anywhere on the service.",
+        # RE-VERIFIED 2026-07-30: llm7 is NO LONGER a free-only catalog. /models
+        # now lists a PAID 'pro' tier (token-priced, incl. image/video models)
+        # alongside a free anonymous 'turbo' tier — 'all' would leak paid ids
+        # into free routing (pro ids 401 "invalid_api_key" on the anonymous
+        # key, but only AFTER wasting a routed attempt). Pinned to 'family' +
+        # free_exact instead: the 4 live 'turbo' ids, each chat-verified 200
+        # with Bearer unused (gpt-oss:20b, codestral-latest probed directly).
+        "free_filter": "family",
+        "free_exact": True,
+        "free_families": ["codestral-latest", "gemini-3.1-flash-lite",
+                          "gpt-oss:20b", "minimax-m2.7"],
+        "default_free_models": ["codestral-latest", "gemini-3.1-flash-lite",
+                                "gpt-oss:20b", "minimax-m2.7"],
+        "notes": "Free OpenAI-compatible gateway, no signup (the literal string 'unused' is the documented API key). VERIFIED 2026-07-30: the anonymous key now serves ONLY the 4 'turbo' tier ids — the catalog's 'pro' tier is token-priced and 401s anonymously, so this row is pinned to the turbo set (family/exact) to keep paid ids out of free routing. Documented rate: ~20 req/min, 100 req/hour.",
     },
     "api-airforce": {
         "name": "API Airforce",
@@ -1199,7 +1205,12 @@ PROVIDERS: Dict[str, dict] = {
     "g4f-groq": {
         "name": "G4F Groq (g4f.space)",
         "base_url": "https://g4f.space/api/groq/v1",
-        "models_url": "https://g4f.space/api/groq/v1/models",
+        # QUIRK (verified 2026-07-30): the relay rewrites /api/groq/* ->
+        # upstream /openai/v1/* and appends /v1 ITSELF for chat, so
+        # /api/groq/v1/chat/completions works but /api/groq/v1/models is a
+        # doubled path -> 404 "GET /openai/v1/v1/models". The working models
+        # endpoint drops the /v1:
+        "models_url": "https://g4f.space/api/groq/models",
         "signup_url": "https://g4f.space",
         "key_hint": "(no key needed at all — no Authorization header is sent)",
         "no_key": True,   # keyless reverse proxy, no signup, no card
@@ -1208,7 +1219,8 @@ PROVIDERS: Dict[str, dict] = {
         # Authorization header at all (pollinations precedent).
         # Free-only relay of Groq's free catalog -> 'all' cannot leak a paid id.
         "free_filter": "all",
-        "default_free_models": [],
+        # Chat-verified 200 keyless on 2026-07-30 (fallback if discovery fails).
+        "default_free_models": ["llama-3.3-70b-versatile"],
         "notes": "Keyless community reverse proxy of Groq's free models (OpenAI-compatible, ~5 req/min). Unstable volunteer-run gateway: quality varies, ids come and go with the upstream catalog, and the whole proxy can go down without warning — no SLA. Treat as opportunistic capacity, never the only link in a chain.",
     },
     "g4f-gemini": {
@@ -1221,20 +1233,26 @@ PROVIDERS: Dict[str, dict] = {
         # Truly keyless, same shape as g4f-groq: no static_key, no header sent.
         # Free-only relay of Gemini's free catalog -> 'all' cannot leak a paid id.
         "free_filter": "all",
-        "default_free_models": [],
+        # Chat-verified 200 keyless on 2026-07-30, bare AND 'models/'-prefixed
+        # ids both accepted (live discovery returns the prefixed form).
+        "default_free_models": ["gemini-2.5-flash"],
         "notes": "Keyless community reverse proxy of Gemini free models (OpenAI-compatible, ~5 req/min). Unstable volunteer-run gateway: quality varies, can go down without warning, no SLA — same caveat as g4f-groq; opportunistic capacity only.",
     },
     "g4f-nvidia": {
         "name": "G4F NVIDIA (g4f.space)",
         "base_url": "https://g4f.space/api/nvidia/v1",
-        "models_url": "https://g4f.space/api/nvidia/v1/models",
+        # QUIRK (verified 2026-07-30): same rewrite as g4f-groq —
+        # /api/nvidia/v1/models is a plain "404 page not found"; the working
+        # models endpoint drops the /v1:
+        "models_url": "https://g4f.space/api/nvidia/models",
         "signup_url": "https://g4f.space",
         "key_hint": "(no key needed at all — no Authorization header is sent)",
         "no_key": True,   # keyless reverse proxy, no signup, no card
         # Truly keyless, same shape as g4f-groq: no static_key, no header sent.
         # Free-only relay of NVIDIA's free catalog -> 'all' cannot leak a paid id.
         "free_filter": "all",
-        "default_free_models": [],
+        # Chat-verified 200 keyless on 2026-07-30 (fallback if discovery fails).
+        "default_free_models": ["meta/llama-3.3-70b-instruct"],
         "notes": "Keyless community reverse proxy of NVIDIA NIM free models (OpenAI-compatible, ~5 req/min). Unstable volunteer-run gateway: quality varies, can go down without warning, no SLA — same caveat as g4f-groq; opportunistic capacity only.",
     },
     "kilocode": {
@@ -1243,10 +1261,11 @@ PROVIDERS: Dict[str, dict] = {
         # itself, so the real endpoint is the documented
         # https://api.kilo.ai/api/openrouter/chat/completions.
         "base_url": "https://api.kilo.ai/api/openrouter",
-        # No public /models discovery is documented for the anonymous tier ->
-        # None (the 'custom' precedent); live discovery is skipped and the
-        # provider serves pinned/configured ids only.
-        "models_url": None,
+        # VERIFIED 2026-07-30: /models IS reachable anonymously
+        # (Bearer anonymous, OpenRouter-shaped {"data": [...]}, 343 ids with an
+        # isFree flag) — live discovery works; the ':free' filter keeps the 9
+        # genuinely-free ids and drops the paid catalog.
+        "models_url": "https://api.kilo.ai/api/openrouter/models",
         "signup_url": "https://kilo.ai",
         "key_hint": "(no signup — the literal string 'anonymous' works)",
         "no_key": True,   # anonymous free tier, no signup, no card
@@ -1256,7 +1275,10 @@ PROVIDERS: Dict[str, dict] = {
         "static_key": "anonymous",
         # OpenRouter-style ':free' suffix marks the free ids (routeway shape).
         "free_filter": "suffix_free",
-        "default_free_models": [],
+        # Chat-verified 200 anonymously on 2026-07-30 (fallback if discovery
+        # fails). openai/gpt-4.1:free 404s "unavailable for free" — free slugs
+        # rotate with the upstream OpenRouter pool.
+        "default_free_models": ["stepfun/step-3.7-flash:free"],
         "notes": "Anonymous free tier of the Kilo Code OpenRouter relay: no signup, the literal bearer 'anonymous' authenticates. Free ids carry the ':free' suffix. Unstable community-run gateway: the anonymous tier is a courtesy, rate limits are unpublished (quota tracks it as UNKNOWN), quality varies and it can go down without warning — no SLA.",
     },
     "custom": {

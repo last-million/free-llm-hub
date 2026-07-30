@@ -48,7 +48,9 @@ def test_suffix_free_provider_accepts_only_suffixed_ids():
 
 def test_all_filter_providers_accept_ordinary_ids():
     # 'all' is only honest on providers with no paid catalog to leak.
-    for pid in ("github-models", "uncloseai", "llm7", "api-airforce", "navy"):
+    # (llm7 was here until 2026-07-30, when its catalog gained a PAID 'pro'
+    # tier — it is now family/exact-pinned; see the re-verification block.)
+    for pid in ("github-models", "uncloseai", "api-airforce", "navy"):
         assert prov.get_provider(pid)["free_filter"] == "all", pid
         assert prov.is_free_model(pid, "openai/gpt-4.1"), pid
         assert prov.is_free_model(pid, "deepseek/DeepSeek-R1"), pid
@@ -168,3 +170,74 @@ def test_keyless_gateways_quota_rows():
     row = quota._limit_for("kilocode")
     assert row is quota.DEFAULT_LIMIT
     assert row["limit"] is None and row.get("unknown") is True
+
+
+# --------------------------------------------------------------------------- #
+# Live re-verification fixes, 2026-07-30 (direct curl probes of each gateway):
+#   uncloseai — 405B flagship gone; catalog is now the single 8B AWQ id.
+#   llm7      — catalog gained a PAID token-priced 'pro' tier (+ image/video);
+#               anonymous key serves ONLY the 4 'turbo' ids (pro 401s), so the
+#               row is family/exact-pinned to keep paid ids out of free routing.
+#   g4f-groq / g4f-nvidia — /models 404s on the doubled /v1 path; the working
+#               models_url drops the /v1 (chat keeps base_url + /v1).
+#   kilocode  — anonymous /models discovery IS available; pinned fallback added.
+# --------------------------------------------------------------------------- #
+
+LLM7_TURBO = ("codestral-latest", "gemini-3.1-flash-lite",
+              "gpt-oss:20b", "minimax-m2.7")
+
+
+def test_llm7_is_family_exact_pinned_to_the_free_turbo_tier():
+    p = prov.get_provider("llm7")
+    assert p["free_filter"] == "family"
+    assert p.get("free_exact") is True
+    assert tuple(p["free_families"]) == LLM7_TURBO
+    assert tuple(p["default_free_models"]) == LLM7_TURBO
+    for mid in LLM7_TURBO:
+        assert prov.is_free_model("llm7", mid), mid
+    # The paid 'pro' catalog (and video/image ids) must NOT qualify as free.
+    for paid in ("gpt-5.4-mini", "claude-opus-5", "kimi-k3",
+                 "gemini-veo31", "seedance-2.0"):
+        assert not prov.is_free_model("llm7", paid), paid
+    # free_exact: a near-miss id that merely CONTAINS a free id fails closed.
+    assert not prov.is_free_model("llm7", "gpt-oss:20b-extended")
+    assert not prov.is_free_model("llm7", "codestral-latestx")
+
+
+def test_uncloseai_pinned_default_matches_live_catalog():
+    p = prov.get_provider("uncloseai")
+    assert p["default_free_models"] == ["solidrust/Hermes-3-Llama-3.1-8B-AWQ"]
+    assert prov.is_free_model("uncloseai", "solidrust/Hermes-3-Llama-3.1-8B-AWQ")
+
+
+def test_g4f_models_urls_avoid_the_doubled_v1_path():
+    # Live probe 2026-07-30: on the groq/nvidia relays /api/<up>/v1/models 404s
+    # (the relay appends /v1 itself); /api/<up>/models returns 200. Chat still
+    # uses base_url + /v1. g4f-gemini is the exception — its /v1/models URL
+    # genuinely works (200), so it keeps the uniform shape.
+    assert prov.get_provider("g4f-groq")["models_url"] == \
+        "https://g4f.space/api/groq/models"
+    assert prov.get_provider("g4f-nvidia")["models_url"] == \
+        "https://g4f.space/api/nvidia/models"
+    assert prov.get_provider("g4f-gemini")["models_url"] == \
+        "https://g4f.space/api/gemini/v1/models"
+    for pid in ("g4f-groq", "g4f-nvidia"):
+        mu = prov.get_provider(pid)["models_url"]
+        assert "/v1/models" not in mu, pid
+        assert prov.get_provider(pid)["base_url"].endswith("/v1"), pid
+
+
+def test_keyless_pinned_defaults_pass_their_own_free_check():
+    # A pinned fallback that fails is_free_model() would be silently unroutable.
+    for pid in KEYLESS_PROVIDERS:
+        for mid in prov.get_provider(pid)["default_free_models"]:
+            assert prov.is_free_model(pid, mid), (pid, mid)
+            assert prov.is_model_allowed(mid), (pid, mid)
+            assert prov.is_chat_model(mid), (pid, mid)
+
+
+def test_kilocode_has_live_models_discovery():
+    # Verified 2026-07-30: Bearer anonymous on /models returns 200 with an
+    # OpenRouter-shaped catalog — no longer None (the old 'custom' precedent).
+    assert prov.get_provider("kilocode")["models_url"] == \
+        "https://api.kilo.ai/api/openrouter/models"
