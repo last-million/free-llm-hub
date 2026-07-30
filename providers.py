@@ -1098,6 +1098,104 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": ["qwen/qwen3.6-27b"],
         "notes": "Prepaid only — NO free tier and no signup credits (docs.aiand.com/billing/credits). Exactly one model is free to call at a zero balance: qwen/qwen3.6-27b (probed live 2026-07-20). Every other id is either priced (402 insufficient_credits) or not served on this account (404). Add credit at console.aiand.com/settings/billing ($1 minimum) to unlock deepseek-v4/kimi/glm.",
     },
+    "github-models": {
+        "name": "GitHub Models",
+        "base_url": "https://models.github.ai/inference",
+        "models_url": "https://models.github.ai/inference/models",
+        "signup_url": "https://github.com/marketplace/models",
+        "key_hint": "github_pat_... or ghp_... (needs the models:read scope)",
+        # 'all' is correct here: the WHOLE catalog has a free tier (per-model
+        # rate limits, not per-model billing) — GitHub Models is a free
+        # evaluation playground, there is no paid catalog to leak. The real
+        # metering is per-TIER request caps (see quota.py FREE_LIMITS), and
+        # real 429s sideline an exhausted id via the per-model throttle.
+        "free_filter": "all",
+        # Publisher-prefixed ids. Live /models discovery widens this; the pins
+        # below are well-known free-tier ids so the provider is usable even
+        # when discovery fails. NOTE: a token WITHOUT the models:read scope
+        # 403s on EVERY call (app.py's probe-before-default path exists
+        # precisely because llama-4-maverick ranked best while 403ing).
+        "default_free_models": [
+            "openai/gpt-4.1", "openai/gpt-4.1-mini",
+            "deepseek/DeepSeek-R1", "xai/grok-3",
+        ],
+        "notes": "Free tier covers the whole catalog with a plain GitHub PAT (no card, no separate signup — enable Models on the token). Rate limits are per-model/per-tier: low-tier ids share ~150 req/day, high-tier ~50/day, deepseek-r1 ~8/day (see quota.py). Reasoning ids (DeepSeek-R1) are slow to first token.",
+    },
+    "uncloseai": {
+        "name": "UncloseAI (Hermes)",
+        "base_url": "https://hermes.ai.unturf.com/v1",
+        "models_url": "https://hermes.ai.unturf.com/v1/models",
+        "signup_url": "https://hermes.ai.unturf.com",
+        "key_hint": "(no key needed — any non-empty string is accepted)",
+        "no_key": True,   # free forever, no signup, no card
+        # The server accepts ANY non-empty bearer (or none). `static_key` is
+        # the documented placeholder; TODAY app.py's no-key path sends no
+        # Authorization header at all, so this field is informational — if a
+        # live probe shows the server 401s a missing header, app.py's
+        # _upstream_chat/provider_free_models need a 2-line hook to send
+        # `Bearer <static_key>` for no_key providers that carry one.
+        "static_key": "uncloseai",
+        # Free-only service (nothing is sold), so 'all' cannot leak a paid id.
+        "free_filter": "all",
+        # Long-standing flagship id; the live /models list (Hermes / Qwen /
+        # Gemma family) is the real source and widens this automatically.
+        "default_free_models": ["hermes-3-llama-3.1-405b"],
+        "notes": "Free-forever community endpoint serving the Hermes/Qwen/Gemma family. Keyless: any non-empty string works as the API key. No published rate limit — quota tracks it as UNKNOWN (real 429s still throttle it). Volunteer-run: no SLA.",
+    },
+    "llm7": {
+        "name": "LLM7.io",
+        "base_url": "https://api.llm7.io/v1",
+        "models_url": "https://api.llm7.io/v1/models",
+        "signup_url": "https://llm7.io",
+        "key_hint": "(no key needed — the literal string 'unused' works)",
+        "no_key": True,   # free without signup, no card
+        # Documented credential is the literal string "unused" — any value is
+        # accepted. Same caveat as uncloseai: `static_key` is informational
+        # until app.py's no-key path learns to send it (today it sends NO
+        # Authorization header); the /models endpoint is public, so live
+        # discovery works regardless.
+        "static_key": "unused",
+        # Free-only gateway -> 'all' cannot leak a paid id.
+        "free_filter": "all",
+        "default_free_models": [],
+        "notes": "Free OpenAI-compatible gateway, no signup (the literal string 'unused' is the documented API key). Documented rate: ~20 req/min, 100 req/hour. No token billing anywhere on the service.",
+    },
+    "api-airforce": {
+        "name": "API Airforce",
+        "base_url": "https://api.airforce/v1",
+        "models_url": "https://api.airforce/v1/models",
+        "signup_url": "https://api.airforce",
+        "key_hint": "free key from the api.airforce panel",
+        # BYOK but the key itself is free and the whole ~55-model catalog is
+        # served at $0 — nothing paid to leak, so 'all' is honest.
+        "free_filter": "all",
+        "default_free_models": [],
+        "notes": "Free BYOK gateway (~55 free models): grab a free key from the api.airforce panel, no card. No published daily request cap — quota tracks it as UNKNOWN (DEFAULT_LIMIT) rather than a fabricated budget; real 429s still sideline it.",
+    },
+    "navy": {
+        "name": "Navy",
+        "base_url": "https://api.navy/v1",
+        "models_url": "https://api.navy/v1/models",
+        "signup_url": "https://api.navy",
+        "key_hint": "free key from api.navy",
+        # Shared free pool behind a free key; nothing paid on the free tier to
+        # leak, so 'all' is honest.
+        "free_filter": "all",
+        "default_free_models": [],
+        "notes": "Free shared pool (~150K tokens/day at ~20 RPM) behind a free key from api.navy. The real budget is TOKENS/day, which a request counter can't express — quota tracks the documented ~20 RPM request rate and real 429s retire it when the pool is spent.",
+    },
+    "routeway": {
+        "name": "RouteWay",
+        "base_url": "https://api.routeway.ai/v1",
+        "models_url": "https://api.routeway.ai/v1/models",
+        "signup_url": "https://api.routeway.ai",
+        "key_hint": "free key from api.routeway.ai",
+        # OpenRouter-style ':free' suffix marks the free ids — live discovery
+        # picks up new/removed ':free' entries automatically.
+        "free_filter": "suffix_free",
+        "default_free_models": [],
+        "notes": "BYOK router with a free tier on ':free'-suffixed ids (~5 RPM, ~200 req/day). The 5/min burst limit is handled by the 429 cooldown path; quota.py tracks the daily budget.",
+    },
     "custom": {
         "name": "Custom (OpenAI-compatible)",
         "base_url": None,  # user supplies via per-provider config base_url

@@ -11,14 +11,21 @@ Not billing-accurate, but no longer guesswork: every figure below was researched
 against the provider's own docs / live catalog (July 2026) and carries the
 research confidence inline. A limit of 0 means "NO FREE TIER" — a documented
 zero, not an unknown. A provider we have no figure for is tracked as UNKNOWN
-(see DEFAULT_LIMIT) and is never assumed to have a free budget. In-memory only
-(resets when the hub restarts) — a single local user doesn't need more.
+(see DEFAULT_LIMIT) and is never assumed to have a free budget.
 
-Pure stdlib: calendar, threading, time.
+State persists to a small JSON file when init_persistence() is called (app.py
+wires it to a file next to the config on startup); without that call everything
+stays in-memory and nothing touches the disk.
+
+Pure stdlib: atexit, calendar, json, os, tempfile, threading, time.
 """
 from __future__ import annotations
 
+import atexit
 import calendar
+import json
+import os
+import tempfile
 import threading
 import time
 
@@ -47,6 +54,13 @@ FREE_LIMITS = {
     "nararouter":    {"limit": 10,    "window": "minute"},  # high: Free plan = 10 req/min (its own pricing page). The real budget is 6M TOKENS/day (resets 07:00 WIB) which a request counter can't express, so we track the documented REQUEST rate — the limit a caller actually trips first.
     "google":        {"limit": 200,   "window": "day"},     # UNVERIFIED (low): Google no longer publishes a free-tier RPD table; best third-party figure is ~250/day for 2.5-flash and sources conflict. 200 kept as the conservative legacy value.
     "mistral":       {"limit": 500,   "window": "day"},     # UNVERIFIED (low): Mistral deliberately publishes NO free-tier figure (per-org, Admin Console only). Real shape is req/SEC + tok/min + tok/month — there is no documented req/day cap. Legacy number; do not cite it as fact.
+    "llm7":          {"limit": 20,    "window": "minute"},  # medium: docs state ~20 req/min AND 100 req/HOUR — the hourly cap has no matching window here, so we track the documented per-minute rate (same convention as nararouter) and let real 429s sideline it once the hourly budget trips.
+    "navy":          {"limit": 20,    "window": "minute"},  # medium: free shared pool is ~150K TOKENS/day at ~20 RPM — a request counter can't express a token budget, so we track the documented request rate; real 429s retire it when the daily pool is spent.
+    "routeway":      {"limit": 200,   "window": "day"},     # medium: free tier = ~200 req/day at ~5 RPM on ':free' ids; the 5/min burst limit is handled by the 429 -> 60s cooldown path, not by this daily budget (same shape as cerebras).
+    # uncloseai / api-airforce: genuinely free but with NO published request
+    # figure — deliberately ABSENT here so they track as UNKNOWN via
+    # DEFAULT_LIMIT instead of inheriting a fabricated budget (same convention
+    # as pollinations/aihorde). Real 429s still throttle them.
 
     # ── NO FREE TIER — documented zeros. Every call costs money (or 402s). ───
     # Kept as explicit rows (not deleted) so they can never inherit DEFAULT_LIMIT.
@@ -224,6 +238,7 @@ def record(pid: str, model: str = None, n: int = 1) -> None:
                 ms = {"window_start": start, "models": {}}
             ms["models"][model] = ms["models"].get(model, 0) + n
             _MODEL_STATE[pid] = ms
+    _persist_maybe()
 
 
 def models(pid: str) -> dict:
@@ -301,6 +316,7 @@ def observe_headers(pid: str, headers) -> None:
     with _LOCK:
         _DYNAMIC[pid] = {"remaining": max(0, rem), "limit": lim,
                          "reset_at": reset_at, "seen": now}
+    _persist_maybe()
 
 
 def _dynamic(pid: str, now: float):
@@ -337,6 +353,7 @@ def mark_model_throttled(pid: str, model: str, seconds: float = 60) -> None:
         backoff = min((seconds or 60) * (2 ** (mt["strikes"] - 1)), _MAX_BACKOFF)
         mt["throttled_until"] = max(mt.get("throttled_until", 0), min(now + backoff, reset))
         _MODEL_THROTTLE[key] = mt
+    _persist_maybe()
 
 
 def note_model_success(pid: str, model: str) -> None:
@@ -350,6 +367,7 @@ def note_model_success(pid: str, model: str) -> None:
             mt["strikes"] = 0
             mt["last_strike"] = 0.0
             mt["throttled_until"] = 0
+    _persist_maybe()
 
 
 def is_model_throttled(pid: str, model: str) -> bool:
@@ -423,6 +441,7 @@ def mark_throttled(pid: str, seconds: float = None) -> None:
         st["window_start"] = start
         st["throttled_until"] = max(st.get("throttled_until", 0), until)
         _STATE[pid] = st
+    _persist_maybe()
 
 
 def note_success(pid: str) -> None:
@@ -438,6 +457,7 @@ def note_success(pid: str) -> None:
             # eligible again (a later 429 re-throttles from the 60s base). Does NOT
             # un-exhaust a KNOWN-limit provider whose count already hit its budget.
             st["throttled_until"] = 0
+    _persist_maybe()
 
 
 def status(pid: str) -> dict:
@@ -501,3 +521,134 @@ def status(pid: str) -> dict:
 
 def is_exhausted(pid: str) -> bool:
     return status(pid)["exhausted"]
+
+
+# ---------------------------------------------------------------------------
+# Persistence — survive hub restarts.
+#
+# Opt-in: nothing is read or written until init_persistence(path) is called
+# (app.py does that on startup with a file next to the config). One JSON file
+# holds the usage counters, both throttle maps and the learned dynamic limits;
+# an opaque "app" blob lets app.py piggyback its own dead-model/provider maps
+# through the same file via the extra_load/extra_dump callables. Saves are
+# debounced (_PERSIST_DEBOUNCE) from the mutators, crash-safe (tmp file +
+# os.replace), and fire once more at clean shutdown (atexit). A missing or
+# corrupt file fails OPEN to empty state — quota is a hint, never a gate, so a
+# bad file must never block startup. Entries past their TTL are dropped on
+# load (an expired throttle or a stale dynamic reading is worse than none).
+# ---------------------------------------------------------------------------
+_PERSIST_PATH = None
+_PERSIST_DEBOUNCE = 30.0     # seconds: save at most this often from mutators
+_persist_last = 0.0
+_extra_load = None           # callable(dict) — applies the "app" blob (app.py bridge)
+_extra_dump = None           # callable() -> dict — produces the "app" blob
+
+
+def init_persistence(path: str, extra_load=None, extra_dump=None) -> None:
+    """Load persisted state from `path`, then keep it saved from now on.
+    `extra_load`/`extra_dump` let the caller round-trip its own state blob
+    through the same file (app.py's dead-model/provider maps). Best-effort:
+    a missing/corrupt file just starts empty."""
+    global _PERSIST_PATH, _extra_load, _extra_dump
+    _PERSIST_PATH = path
+    _extra_load, _extra_dump = extra_load, extra_dump
+    _load_state(path)
+    atexit.register(save_state)
+
+
+def _throttle_key(pid: str, model: str) -> str:
+    # Flat string key for the JSON file; a pid never contains "|", a model id may.
+    return pid + "|" + model
+
+
+def save_state() -> None:
+    """Write the current state to _PERSIST_PATH (tmp file + os.replace).
+    No-op when persistence was never initialized. Never raises."""
+    path = _PERSIST_PATH
+    if not path:
+        return
+    global _persist_last
+    try:
+        with _LOCK:
+            blob = {
+                "state": _STATE,
+                "model_state": _MODEL_STATE,
+                "model_throttle": {_throttle_key(pid, m): mt
+                                   for (pid, m), mt in _MODEL_THROTTLE.items()},
+                "dynamic": _DYNAMIC,
+            }
+        if _extra_dump is not None:
+            try:
+                blob["app"] = _extra_dump()
+            except Exception:
+                pass  # a broken bridge must not lose the quota state
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or None,
+                                   prefix=".quota-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(blob, f)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        _persist_last = time.time()
+    except Exception:
+        pass  # persistence is a convenience, never a failure mode
+
+
+def _persist_maybe() -> None:
+    """Debounced save from the mutators — at most one write per _PERSIST_DEBOUNCE."""
+    if _PERSIST_PATH and time.time() - _persist_last >= _PERSIST_DEBOUNCE:
+        save_state()
+
+
+def _load_state(path: str) -> None:
+    """Apply a previously saved state file. Fails open: any problem -> empty
+    state. Entries past their TTL (expired throttles, stale dynamic readings)
+    are dropped rather than revived."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+    except Exception:
+        return  # missing or corrupt -> start empty
+    if not isinstance(blob, dict):
+        return
+    now = time.time()
+    with _LOCK:
+        state = blob.get("state")
+        if isinstance(state, dict):
+            for pid, st in state.items():
+                if isinstance(pid, str) and isinstance(st, dict):
+                    _STATE[pid] = st
+        model_state = blob.get("model_state")
+        if isinstance(model_state, dict):
+            for pid, ms in model_state.items():
+                if isinstance(pid, str) and isinstance(ms, dict):
+                    _MODEL_STATE[pid] = ms
+        throttle = blob.get("model_throttle")
+        if isinstance(throttle, dict):
+            for key, mt in throttle.items():
+                if not (isinstance(key, str) and "|" in key and isinstance(mt, dict)):
+                    continue
+                if mt.get("throttled_until", 0) <= now:
+                    continue  # expired sideline — the model gets a fresh chance
+                pid, model = key.split("|", 1)
+                _MODEL_THROTTLE[(pid, model)] = mt
+        dynamic = blob.get("dynamic")
+        if isinstance(dynamic, dict):
+            for pid, d in dynamic.items():
+                if isinstance(pid, str) and isinstance(d, dict):
+                    _DYNAMIC[pid] = d
+            # Reuse the normal freshness gate: TTL-expired or window-rolled
+            # readings are dropped, not trusted after a restart.
+            for pid in [pid for pid in _DYNAMIC if _dynamic(pid, now) is None]:
+                _DYNAMIC.pop(pid, None)
+    app_blob = blob.get("app")
+    if _extra_load is not None and isinstance(app_blob, dict):
+        try:
+            _extra_load(app_blob)
+        except Exception:
+            pass
