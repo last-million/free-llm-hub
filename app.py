@@ -5140,6 +5140,36 @@ def _connect_snippets():
     return {"claude_code": claude, "openai": openai}
 
 
+def _detect_hub_version():
+    """Running-version stamp for the dashboard's "what's new" popup: the short
+    git HEAD of this checkout, resolved once at startup (an update = a git
+    pull = a new commit = a new version string). Falls back to a stable
+    constant when the repo or git is unavailable."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        version = (out.stdout or "").strip()
+        if out.returncode == 0 and version:
+            return version
+    except Exception:
+        pass
+    return "unknown"
+
+
+_HUB_VERSION = _detect_hub_version()
+
+
+@app.route("/api/version", methods=["GET"])
+def api_version():
+    # Control-token gated like every other /api/* read; the dashboard always
+    # holds the token, so no _CONTROL_TOKEN_EXEMPT_GETS entry is needed.
+    return jsonify({"version": _HUB_VERSION})
+
+
 @app.route("/api/status", methods=["GET"])
 def api_status():
     default = config.get_default()
