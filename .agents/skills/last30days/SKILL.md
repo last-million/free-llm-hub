@@ -52,9 +52,7 @@ curl -s -m 3 http://127.0.0.1:8787/api/web-search-policy
 
 - Only use social/authenticated sources when the response is exactly
   `{"social_search": true}` (HTTP 200). Any other result — `false`,
-  non-200 (the endpoint is control-token protected; append `?token=<hub
-  control token>` if you have it), or an unreachable hub — means SOCIAL
-  SEARCH IS OFF. Fail closed.
+  non-200, or an unreachable hub — means SOCIAL SEARCH IS OFF. Fail closed.
 - When social search is OFF, research web + YouTube + public Reddit only:
   - Restrict the engine to its keyless sources, e.g.
     `--search reddit,youtube,hackernews,digg,arxiv,github,web` (the `web`

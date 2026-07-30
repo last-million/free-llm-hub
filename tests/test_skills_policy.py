@@ -92,12 +92,22 @@ def test_web_search_policy_rejects_non_boolean(isolated_config):
 def test_web_search_policy_post_requires_control_header(isolated_config, monkeypatch):
     monkeypatch.setattr(config, "get_control_token", lambda: "secret-token")
     client = _client()
+    # GET is control-token exempt: a single non-sensitive boolean that
+    # token-less local agents (last30days skill) must be able to read.
+    r = client.get("/api/web-search-policy")
+    assert r.status_code == 200
+    assert r.get_json() == {"social_search": False}
+    # POST keeps full protection: dashboard header AND control token.
     r = client.post("/api/web-search-policy", json={"social_search": True})
     assert r.status_code == 403
-    r = client.get("/api/web-search-policy")
-    assert r.status_code == 401  # token set but not supplied
-    r = client.get("/api/web-search-policy?token=secret-token")
+    r = client.post("/api/web-search-policy", json={"social_search": True},
+                    headers={"X-Free-LLM-Hub": "dashboard"})
+    assert r.status_code == 401
+    r = client.post("/api/web-search-policy", json={"social_search": True},
+                    headers={"X-Free-LLM-Hub": "dashboard",
+                             "X-Free-LLM-Hub-Token": "secret-token"})
     assert r.status_code == 200
+    assert r.get_json() == {"social_search": True}
 
 
 # ---------------------------------------------------------------- vendored skills
