@@ -1288,6 +1288,14 @@
       <p class="sd-help">Tells the Chat CLI agent that testing/debugging its own work with tools like Playwright is expected this session.</p>
     </div>
     <div class="sd-group">
+      <label class="switch" title="Allow the last30days skill to search X and other social sources during web research">
+        <input id="drawer-social-search-switch" type="checkbox" aria-label="Social media web search">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Social media web search (last30days skill)</span>
+      </label>
+      <p class="sd-help">Lets the agent search X/social sources (which need browser cookies/keys) during web research. Off = keyless web, YouTube and public Reddit only.</p>
+    </div>
+    <div class="sd-group">
       <div class="sd-label">Backup &amp; restore</div>
       <div class="sd-actions">
         <button class="btn sm" id="settings-export-open" type="button">Export settings&hellip;</button>
@@ -5224,6 +5232,33 @@
     });
   }
 
+  /* ---------- social media web search toggle (last30days skill) ----------
+     Same shape as the test-verification toggle: one DOM instance in the
+     header Settings drawer, GET on drawer open, POST on toggle. Backs the
+     /api/web-search-policy endpoint the agent checks before using X/social
+     sources. */
+  function loadSocialWebSearch(silent){
+    return api('/api/web-search-policy').then(function(r){
+      var sw = $('#drawer-social-search-switch');
+      if (sw) sw.checked = !!(r && r.social_search);
+    }).catch(function(e){ if (!silent) toast('Social web search: ' + e.message, true); });
+  }
+  function initSocialWebSearch(){
+    var sw = $('#drawer-social-search-switch');
+    if (!sw) return;
+    sw.addEventListener('change', function(){
+      var want = sw.checked;
+      sw.disabled = true;
+      api('/api/web-search-policy', { method: 'POST', body: { social_search: want } })
+        .then(function(r){
+          sw.checked = !!(r && r.social_search);
+          toast('Social media web search ' + (sw.checked ? 'on' : 'off'));
+        })
+        .catch(function(e){ toast('Social web search: ' + e.message, true); sw.checked = !want; })
+        .then(function(){ sw.disabled = false; });
+    });
+  }
+
   /* ---------- vision-gap badge (stage C) ----------
      Three choices, matched honestly to what the backend actually does (see
      vision_status.py): "report once available" is a REAL client-side action (poll +
@@ -5266,6 +5301,7 @@
     var c = $('#settings-drawer-close');
     if (c) c.focus();
     loadTestVerification(true);
+    loadSocialWebSearch(true);
   }
   function closeSettingsDrawer(){
     $('#settings-drawer').hidden = true;
@@ -5410,6 +5446,7 @@
   initArtifactPanel();
   initVisionGap();
   initTestVerification();
+  initSocialWebSearch();
   initSettingsDrawer();
   initSettingsExportImport();
   loadLifecycle();
