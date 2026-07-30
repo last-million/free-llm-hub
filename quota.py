@@ -57,10 +57,14 @@ FREE_LIMITS = {
     "llm7":          {"limit": 20,    "window": "minute"},  # medium: docs state ~20 req/min AND 100 req/HOUR — the hourly cap has no matching window here, so we track the documented per-minute rate (same convention as nararouter) and let real 429s sideline it once the hourly budget trips.
     "navy":          {"limit": 20,    "window": "minute"},  # medium: free shared pool is ~150K TOKENS/day at ~20 RPM — a request counter can't express a token budget, so we track the documented request rate; real 429s retire it when the daily pool is spent.
     "routeway":      {"limit": 200,   "window": "day"},     # medium: free tier = ~200 req/day at ~5 RPM on ':free' ids; the 5/min burst limit is handled by the 429 -> 60s cooldown path, not by this daily budget (same shape as cerebras).
-    # uncloseai / api-airforce: genuinely free but with NO published request
-    # figure — deliberately ABSENT here so they track as UNKNOWN via
+    "g4f-groq":      {"limit": 5,     "window": "minute"},  # low: community-observed ~5 req/min on the keyless g4f.space Groq relay — no official doc exists for a volunteer proxy, so treat as a soft hint; real 429s still sideline it (same shape as llm7).
+    "g4f-gemini":    {"limit": 5,     "window": "minute"},  # low: same g4f.space relay, Gemini catalog — community-observed ~5 req/min, no official figure; real 429s sideline it.
+    "g4f-nvidia":    {"limit": 5,     "window": "minute"},  # low: same g4f.space relay, NVIDIA catalog — community-observed ~5 req/min, no official figure; real 429s sideline it.
+    # uncloseai / api-airforce / kilocode: genuinely free but with NO published
+    # request figure — deliberately ABSENT here so they track as UNKNOWN via
     # DEFAULT_LIMIT instead of inheriting a fabricated budget (same convention
-    # as pollinations/aihorde). Real 429s still throttle them.
+    # as pollinations/aihorde). kilocode's anonymous tier documents no rate
+    # limit at all. Real 429s still throttle them.
 
     # ── NO FREE TIER — documented zeros. Every call costs money (or 402s). ───
     # Kept as explicit rows (not deleted) so they can never inherit DEFAULT_LIMIT.
