@@ -1287,6 +1287,9 @@ PROVIDERS: Dict[str, dict] = {
     },
     "puter": {
         "name": "Puter",
+        # Pinned in the dashboard's Recommended zone: one free puter.com
+        # account token unlocks the newest flagship catalog (GPT-5.6 family).
+        "recommended": True,
         "base_url": "https://api.puter.com/puterai/openai/v1",
         "models_url": "https://api.puter.com/puterai/openai/v1/models",
         "signup_url": "https://puter.com",
