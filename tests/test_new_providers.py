@@ -213,15 +213,15 @@ def test_uncloseai_pinned_default_matches_live_catalog():
 def test_g4f_models_urls_avoid_the_doubled_v1_path():
     # Live probe 2026-07-30: on the groq/nvidia relays /api/<up>/v1/models 404s
     # (the relay appends /v1 itself); /api/<up>/models returns 200. Chat still
-    # uses base_url + /v1. g4f-gemini is the exception — its /v1/models URL
-    # genuinely works (200), so it keeps the uniform shape.
+    # uses base_url + /v1. g4f-gemini answered 200 on BOTH forms today, but is
+    # aligned to the same /v1-less canonical form as its siblings.
     assert prov.get_provider("g4f-groq")["models_url"] == \
         "https://g4f.space/api/groq/models"
     assert prov.get_provider("g4f-nvidia")["models_url"] == \
         "https://g4f.space/api/nvidia/models"
     assert prov.get_provider("g4f-gemini")["models_url"] == \
-        "https://g4f.space/api/gemini/v1/models"
-    for pid in ("g4f-groq", "g4f-nvidia"):
+        "https://g4f.space/api/gemini/models"
+    for pid in G4F_PROVIDERS:
         mu = prov.get_provider(pid)["models_url"]
         assert "/v1/models" not in mu, pid
         assert prov.get_provider(pid)["base_url"].endswith("/v1"), pid

@@ -53,8 +53,8 @@ vendored skills live here:
 - `last30days/` (MIT, github.com/mvanhorn/last30days-skill v3.18.4,
   MODIFIED — see its `VENDORED.md`) — last-30-days web research, keyless by
   default (web + YouTube + public Reddit). X/social/authenticated sources are
-  gated: the skill curls `GET /api/web-search-policy` (control-token gated
-  like every `/api/*`; POST `{social_search: bool}` to set) and only uses
+  gated: the skill curls `GET /api/web-search-policy` (open read — token-exempt;
+  only the POST `{social_search: bool}` that sets it is control-token gated) and only uses
   social sources when the dashboard Settings switch "Social media web search"
   is on. The switch persists as the `social_web_search` flag in config.py
   (default false). Covered by `tests/test_skills_policy.py`.

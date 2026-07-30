@@ -481,31 +481,37 @@ def aggregated_models():
 # bare-"mini" scoring bugs).
 _BENCH_FAMILY = [
     # Tier S — frontier proprietary (pinned) + strongest free/open 2026 flagships.
+    # 2026-07-30: glm-4.7/4.6, gemini-2.5-pro and Xiaomi MiMo promoted in (user
+    # top-tier list); nemotron/gpt-oss/gemma DEMOTED out to Tier C below.
     (("grok-4", "gpt-5", "claude-opus", "claude-sonnet-5", "claude-fable",
       "gemini-3-pro", "gemini-3.5-pro", "gemini-3-ultra", "gemini-3.5-ultra",
-      "gemini-3.5-flash", "gemini-3-flash",
-      "deepseek-v4", "deepseek-r2", "glm-5", "glm5", "glm-6",
+      "gemini-3.5-flash", "gemini-3-flash", "gemini-2.5-pro",
+      "deepseek-v4", "deepseek-r2", "glm-5", "glm5", "glm-6", "glm-4.7", "glm-4.6",
       "kimi-k2.6", "kimi-k2.7", "kimi-k2-thinking",
       "hy3", "hunyuan-3", "tencent-hy",
-      "minimax-m3", "qwen3.5", "qwen3-max"), 100),
+      "minimax-m3", "qwen3.5", "qwen3-max", "mimo"), 100),
     # Tier A — strong open workhorses (production SEO + coding drivers).
+    # 2026-07-30: bare qwen3, llama-4 / llama-3.3-70b, mistral-large, gpt-4o and
+    # gemini-2.5-flash promoted (user top-tier list); nemotron-3/gpt-oss demoted out.
     (("deepseek-v3", "deepseek-r1", "deepseek-chat",
-      "qwen3-235b", "qwen3-next", "qwen3-coder", "qwen3-32b",
-      "glm-4.7", "glm-4.6", "kimi-k2", "minimax-m2",
-      "gpt-oss-120b", "nemotron-3-ultra", "nemotron-3-super",
+      "qwen3-235b", "qwen3-next", "qwen3-coder", "qwen3-32b", "qwen3",
+      "kimi-k2", "minimax-m2", "gemini-2.5-flash",
+      "llama-4", "llama4", "llama-3.3-70",
+      "mistral-large", "gpt-4o",
       "hunyuan-a13", "hunyuan-turbos", "command-a"), 84),  # hy3 promoted to Tier S above
     # Tier B — capable mid (routine content, not hard reasoning).
-    (("qwen3", "gemma-4", "gemma4", "mistral-medium", "mistral-large",
-      "nemotron-3-120b", "phi-4", "solar-pro", "nova-2-pro", "granite-4",
-      "command-r-plus", "gemini-2.5-pro"), 56),
+    (("mistral-medium", "phi-4", "solar-pro", "nova-2-pro", "granite-4",
+      "command-r-plus"), 56),
     # Tier C-hi — older mid / mid-small usable.
-    (("llama-4", "llama4", "gemma-3-27", "gemma3-27", "qwen2.5-72",
-      "llama-3.3-70", "mistral-small", "command-r", "gpt-4o", "gpt-oss-20b",
-      "nemotron-70"), 40),
+    (("qwen2.5-72", "mistral-small", "command-r"), 40),
     # Tier C — legacy / superseded / specialized (avoid for heavy).
-    (("qwen2.5", "qwen2", "llama-3", "llama-2", "gemma-3", "gemma3", "gemma-2",
+    # 2026-07-30: nemotron, gpt-oss and the whole gemma family land here — the
+    # user ranks them clearly BELOW the strong families, not above them.
+    (("qwen2.5", "qwen2", "llama-3", "llama-2",
+      "gemma-4", "gemma4", "gemma-3", "gemma3", "gemma-2",
+      "nemotron", "gpt-oss",
       "mixtral", "moonshot-v1", "qwq", "distill", "codestral", "devstral",
-      "mercury", "sonar", "ernie", "hermes", "gemini-2.0", "gemini-2.5-flash",
+      "mercury", "sonar", "ernie", "hermes", "gemini-2.0",
       "gpt-4o-mini"), 26),
     # Tier D — tiny / lite / mini / flash-lite / nano (the CAP also enforces this).
     (("flash-lite", "-lite", "-mini", "nano", "small", "mistral-nemo", "tiny",
@@ -516,8 +522,8 @@ _BENCH_FAMILY = [
 # CURRENT strong version scores in the TOP band, so a brand-new release
 # (deepseek-v5, glm-6, kimi-k3, qwen4, minimax-m4, gemini-4) auto-ranks strong the
 # moment a free provider lists it — no table edit needed. Numbered families only
-# (clean version parse); flat-named strong families (gpt-oss-120b, command-a,
-# hunyuan hy3, nemotron-3-ultra) are covered by _BENCH_FAMILY above.
+# (clean version parse); flat-named strong families (command-a, hunyuan hy3) are
+# covered by _BENCH_FAMILY above.
 _STRONG_ROOTS = (
     # (root_substring, pinned_version, top_score)
     ("deepseek-v", 3.1, 100),   # v3.1/v3.2/v4/v5…  (bare v3 orig -> 3.0 < 3.1)
@@ -555,9 +561,8 @@ def _strong_new_version_score(low):
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
 _PREF_FLOORS = (135, 134)
-# User preference (2026-07-25): rank the qwen family LAST. Points subtracted from the
-# NATURAL score (not a floor), so the band/spread maths stay valid. See _benchmark_score.
-_PREF_QWEN_DEMOTION = 45
+# 2026-07-30: the qwen -45 demotion (_PREF_QWEN_DEMOTION) is REMOVED — qwen3 is a
+# strong family again and ranks with the top tier via Tier A + _STRONG_ROOTS.
 
 
 # --------------------------------------------------------------------------- #
@@ -565,7 +570,7 @@ _PREF_QWEN_DEMOTION = 45
 # (artificialanalysis.ai), replacing the hand-typed _BENCH_FAMILY guess with
 # actual data WHEN a confident match exists. Everything else in _benchmark_score
 # (size nudge, instruct bonus, provider bias, coding boost, hy3/kimi-k3
-# PREFERENCE floors, qwen demotion, mistral penalty, speed cap) still applies
+# PREFERENCE floors, mistral penalty, speed cap) still applies
 # on top unchanged — those are deliberate user decisions, not attempts to
 # measure capability, so real benchmark data must not silently overrule them.
 # Free tier: 100 requests/day (resets 00:00 UTC) — refreshed on a long interval
@@ -785,7 +790,7 @@ def _benchmark_score(pid, model_id):
     one exists (calibrated onto this same scale — see _aa_score_for), else the
     hand-typed _BENCH_FAMILY guess as before. Every adjustment below (size,
     instruct bonus, provider bias, coding boost, hy3/kimi-k3 preference floors,
-    qwen demotion, mistral penalty, speed cap) still applies on top either
+    mistral penalty, speed cap) still applies on top either
     way — those encode deliberate product decisions, not a capability
     estimate, so real data augments them rather than replacing them."""
     low = (model_id or "").lower()
@@ -820,7 +825,7 @@ def _benchmark_score(pid, model_id):
     # (mistral-large/medium exempt — they are the capable big ones).
     if any(c in low for c in ("deepseek", "qwen3-coder", "qwen2.5-coder", "qwen3",
                               "kimi", "glm-5", "glm5", "glm-6", "glm-4.7", "glm-4.6",
-                              "gpt-oss", "claude", "gpt-5", "minimax-m", "hy3",
+                              "claude", "gpt-5", "minimax-m", "hy3",
                               "hunyuan", "starcoder")):
         score += 8
     # PREFERENCE FLOORS (not measured scores). These lift a favourite model above
@@ -841,16 +846,8 @@ def _benchmark_score(pid, model_id):
     # kimi-k3 id (nothing lists it yet). Matches kimi-k3 / kimi-k3.x / .../kimi-k3.
     if "kimi-k3" in low or "kimik3" in low:
         score = max(score, _PREF_FLOORS[1])
-    # USER PREFERENCE (2026-07-25): the qwen family goes LAST. Not a measured verdict —
-    # the user prefers hy3 / kimi-k3 first and everything else ahead of qwen, with qwen
-    # kept only as a late fallback. Unlike the floors above this is a DEMOTION applied
-    # to the natural score, so the spread band still computes normally; it just moves
-    # every qwen id below the other candidates (the strongest, qwen3.5-397b at ~125,
-    # lands near ~80 — under gemini/cerebras/deepseek and below _TOOLS_MIN_SCORE, so it
-    # drops out of the agentic PRIMARY pool while remaining available in the fallback
-    # chain). Relative order WITHIN the qwen family is preserved.
-    if "qwen" in low:
-        score -= _PREF_QWEN_DEMOTION
+    # 2026-07-30: the 2026-07-25 qwen -45 demotion is REMOVED — qwen3 is a strong
+    # family per the user and ranks with the top tier (Tier A + _STRONG_ROOTS).
     if (("mistral" in low or "mixtral" in low or "ministral" in low)
             and not any(k in low for k in ("mistral-large", "mistral-medium"))):
         score -= 14
@@ -4018,6 +4015,11 @@ def _anthropic_error(err_type, message, status):
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+# Harmless read-only GET endpoints exempt from the control token: they expose
+# a single non-sensitive value and exist so local agent tooling (which has no
+# token) can read them. Writes to the same paths keep full protection.
+_CONTROL_TOKEN_EXEMPT_GETS = ("/api/web-search-policy",)
+
 
 def _hostname(value, origin=False):
     try:
@@ -4048,6 +4050,8 @@ def _local_control_guard():
         # per-install token (0600 config file, printed once at startup, never
         # rendered into the HTML) is what actually gates control of the hub —
         # Host/Origin only stop a browser-borne cross-site request.
+        if request.method == "GET" and request.path in _CONTROL_TOKEN_EXEMPT_GETS:
+            return None
         token = config.get_control_token()
         supplied = request.headers.get("X-Free-LLM-Hub-Token") or request.args.get("token")
         if token and not (supplied and hmac.compare_digest(str(supplied), token)):
@@ -4612,10 +4616,71 @@ def _run_relay_model_test(pid):
     return any_ok, results
 
 
+def _image_only_provider_test(pid, pcfg):
+    """/api/test verdict for an IMAGE-ONLY provider (AI Horde today): it has no
+    chat endpoint at all, so the chat-completions probe in api_test_provider is
+    a guaranteed false negative ("no models_url and no default model"). Test the
+    provider's ACTUAL capability instead — cheaply: a real anonymous AI Horde
+    image generation queues ~24min (measured 2026-07-27), untestable behind a
+    dashboard click, so this probes the public /status/models?type=image feed.
+    ok=True therefore means "image gateway healthy, workers online right now"
+    and the detail says exactly that — never "generation verified". A saved
+    personal key is additionally verified against /find_user (the documented
+    whoami), because THAT is what real generations would authenticate with.
+    Returns (ok, detail, sample_models)."""
+    if pid != "aihorde":
+        # No known cheap health probe — fall through to the chat path's honest
+        # "nothing to test with" error rather than inventing a verdict.
+        return None
+    headers = {"Client-Agent": "free-llm-hub:1.0:https://github.com/last-million/free-llm-hub"}
+    keys = pcfg.get("api_keys") or []
+    if keys:
+        try:
+            ur = requests.get("https://aihorde.net/api/v2/find_user",
+                              headers=dict(headers, apikey=keys[0]),
+                              timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
+        except requests.RequestException as exc:
+            return False, _sanitize("Image-only provider: AI Horde key check failed — %s: %s"
+                                    % (exc.__class__.__name__, exc)), []
+        if ur.status_code in (401, 403):
+            return False, ("Image-only provider: the saved AI Horde key is INVALID "
+                           "(find_user HTTP %d) — generations would 403. Remove it to run "
+                           "on the anonymous key, or paste a valid one." % ur.status_code), []
+    try:
+        resp = requests.get("https://aihorde.net/api/v2/status/models?type=image",
+                            headers=headers,
+                            timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
+    except requests.RequestException as exc:
+        return False, _sanitize("Image-only provider: AI Horde status probe failed — %s: %s"
+                                % (exc.__class__.__name__, exc)), []
+    if resp.status_code != 200:
+        return False, ("Image-only provider: AI Horde status probe returned HTTP %d — "
+                       "gateway not healthy right now." % resp.status_code), []
+    try:
+        models = resp.json()
+    except ValueError:
+        models = []
+    online = [m for m in models if isinstance(m, dict) and (m.get("count") or 0) > 0]
+    if not online:
+        return False, ("Image-only provider: AI Horde reachable but NO workers online "
+                       "right now — a generation would queue indefinitely."), []
+    workers = sum(m.get("count") or 0 for m in online)
+    top = sorted(online, key=lambda m: -(m.get("count") or 0))
+    sample = [m["name"] for m in top[:5] if m.get("name")]
+    who = "saved key verified via find_user" if keys else "anonymous key"
+    return True, ("Image-only provider (no chat): AI Horde healthy — %d image models "
+                  "served by %d workers online right now (%s, status/models probe). Not a "
+                  "generation test: a real anonymous render queues ~24min, so this verifies "
+                  "live capacity, not one image." % (len(online), workers, who)), sample
+
+
 @app.route("/api/test/<pid>", methods=["POST"])
 def api_test_provider(pid):
     """Test a saved key. ok=True means ONLY ONE THING: a real 1-token generation
     just succeeded — this key can actually produce free output right now.
+    (Sole exception: IMAGE-ONLY providers like AI Horde, where no chat endpoint
+    exists — there ok=True means "image gateway healthy via status probe" and the
+    detail says so explicitly; see _image_only_provider_test.)
 
     Used to stop at a clean /models listing and call that "Key OK". That is a
     false positive for a spent trial/wallet: a $0-balance account still lists its
@@ -4685,6 +4750,17 @@ def api_test_provider(pid):
             detail += " Skipped (already known unavailable): %s." % ", ".join(skipped)
         attempted.extend((r["model"], r["ok"]) for r in results if not r.get("skipped"))
         return _finish(any_ok, detail, ok_models)
+
+    # IMAGE-ONLY provider (registry image_models, no chat surface: no models_url,
+    # no default chat model): the chat-completions probe below can NEVER succeed
+    # — there is no chat endpoint — so route the test at the provider's real
+    # capability instead (AI Horde: cheap status/models health probe, see the
+    # helper). ok=True means "image gateway healthy", truthfully labelled.
+    if p.get("image_models") and not p.get("default_free_models") \
+            and not _models_url_for(pid, pcfg):
+        verdict = _image_only_provider_test(pid, pcfg)
+        if verdict is not None:
+            return _finish(*verdict)
 
     # Pollinations-style anonymous tiers need no key at all — the ORIGINAL test
     # required one unconditionally, so a genuinely-working keyless provider always
@@ -5615,8 +5691,9 @@ def api_auto_provider_mode_update():
 @app.route("/api/web-search-policy", methods=["GET"])
 def api_web_search_policy():
     """Read by the last30days agent skill before using X/social sources.
-    Control-token gated like every /api/* route (see _local_control_guard);
-    an agent without the token gets 401 and must treat that as OFF."""
+    GET is exempt from the control token (see _CONTROL_TOKEN_EXEMPT_GETS in
+    _local_control_guard) so token-less local agents can read the single
+    non-sensitive boolean; POST below keeps full protection."""
     return jsonify({"social_search": config.get_social_web_search()})
 
 
