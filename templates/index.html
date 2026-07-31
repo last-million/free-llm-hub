@@ -567,6 +567,18 @@
     display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
     gap:10px;margin:2px 0 4px;
   }
+  /* "Prompt enhanced by X — Use my original": the rewrite is never silent. */
+  .enhanced-note{
+    display:none;align-items:center;gap:8px;flex-wrap:wrap;
+    font-size:12.5px;color:var(--text-dim);margin:-2px 0 2px;
+  }
+  .enhanced-note.show{display:flex}
+  .enhanced-note .linkbtn{
+    background:none;border:none;padding:0;cursor:pointer;font:inherit;
+    color:var(--accent-strong);text-decoration:underline;text-underline-offset:2px;
+  }
+  .enhanced-note .linkbtn:hover{color:var(--accent)}
+  .enhanced-note .linkbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   .model-card{
     position:relative;display:flex;flex-direction:column;gap:5px;
     min-height:44px;padding:11px 12px;text-align:left;cursor:pointer;
@@ -1358,6 +1370,14 @@
       <p class="sd-help">Lets the agent search X/social sources (which need browser cookies/keys) during web research. Off = keyless web, YouTube and public Reddit only.</p>
     </div>
     <div class="sd-group">
+      <label class="switch" title="Rewrite the opening prompt of a chat or image request into a sharper one before sending it">
+        <input id="drawer-enhance-switch" type="checkbox" aria-label="Enhance opening prompts">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Enhance opening prompts</span>
+      </label>
+      <p class="sd-help">Rewrites the <em>first</em> prompt of a dashboard chat, and every image prompt, into a sharper version before sending &mdash; so a two-word ask still gets the model&rsquo;s best work. Anti-slop by design: no &ldquo;masterpiece, 8k&rdquo; padding, no role-play framing. You always see the rewrite and can revert it. Requests from your CLIs are never touched.</p>
+    </div>
+    <div class="sd-group">
       <div class="sd-label">Backup &amp; restore</div>
       <div class="sd-actions">
         <button class="btn sm" id="settings-export-open" type="button">Export settings&hellip;</button>
@@ -1663,6 +1683,7 @@
         </select>
       </div>
       <div class="chat-note" id="image-note" role="status"></div>
+      <div class="enhanced-note" id="image-enhanced-note" role="status"></div>
       <div class="image-input-row">
         <textarea id="image-prompt" placeholder="Describe the image you want&hellip;  (e.g. a red fox in a forest)" aria-label="Image prompt" rows="2"></textarea>
         <button class="btn primary" id="image-generate" type="button">Generate</button>
@@ -3540,6 +3561,7 @@
     var imageInput = $('#chat-images');
     var imageNote = $('#chat-image-note');
     var history = [];       /* [{role, content, error?}] */
+    var openingEnhanced = false;   /* opening prompt already rewritten this conversation */
     var pendingImages = []; /* [{name,url,size}] data URLs, sent directly to the provider */
     var controller = null;
     var streaming = false;
@@ -3592,6 +3614,26 @@
       if (!content && !pendingImages.length) return;
       var model = modelSel.value;
       if (!model){ toast('Pick a model first', true); return; }
+      /* OPENING prompt only: enhance the first turn of a conversation, never a
+         later one — mid-conversation the user is steering and correcting, and
+         rewriting that would fight them. Text-only turns too: an enhanced
+         caption for an attached image would describe something we can't see. */
+      if (!history.length && content && !pendingImages.length && !openingEnhanced){
+        openingEnhanced = true;      /* set BEFORE the re-entry below, so the
+                                        second pass falls straight through
+                                        instead of enhancing again forever */
+        setStreaming(true);          /* lock the composer during the rewrite */
+        return enhanceOpening(content, 'chat').then(function(enh){
+          setStreaming(false);
+          if (enh){
+            textEl.value = enh.text; autoGrow();
+            showEnhancedNote($('#chat-enhanced-note'), enh, function(orig){
+              textEl.value = orig; autoGrow();
+            });
+          }
+          sendChat();
+        });
+      }
 
       if (!history.length) msgsEl.innerHTML = '';   /* drop empty state */
       var userContent = content;
@@ -3691,6 +3733,8 @@
     clearBtn.addEventListener('click', function(){
       if (controller) controller.abort();
       history = []; pendingImages = []; renderPendingImages(); renderEmpty();
+      openingEnhanced = false;                    /* next first turn enhances again */
+      var n = $('#chat-enhanced-note'); if (n){ n.classList.remove('show'); n.innerHTML = ''; }
     });
     textEl.addEventListener('input', autoGrow);
     textEl.addEventListener('keydown', function(e){
@@ -3698,6 +3742,44 @@
     });
     modelSel.addEventListener('focus', loadChatModels);  /* keep list fresh as providers change */
     updateChatAuthNote();
+  }
+
+  /* ---------- opening-prompt enhancement (dashboard only) ------------------
+     Rewrites the FIRST prompt of a conversation into a sharper one before it is
+     sent, so a two-word ask still gets the model's best work. Scoped on purpose:
+     only the opening turn (rewriting later turns fights the user while they are
+     correcting), and only what is typed here — /v1/* traffic is never touched.
+
+     Always fail-open: any error returns the original text and generation
+     proceeds. The rewrite is never hidden — the caller shows what was actually
+     sent, with one-click revert. */
+  function enhanceOpening(text, kind){
+    return api('/api/enhance-prompt', { method:'POST', body:{ prompt:text, kind:kind } })
+      .then(function(r){
+        if (!r || !r.changed || !r.enhanced) return null;
+        return { text:r.enhanced, original:r.original, model:r.model };
+      })
+      .catch(function(){ return null; });   /* never block a generation */
+  }
+
+  /* Renders "Enhanced by <model> — Revert" under a prompt box. */
+  function showEnhancedNote(host, result, onRevert){
+    if (!host) return;
+    host.innerHTML = '';
+    host.classList.add('show');
+    var txt = document.createElement('span');
+    txt.textContent = 'Prompt enhanced' + (result.model ? ' by ' + result.model : '') + '.';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'linkbtn';
+    btn.textContent = 'Use my original';
+    btn.addEventListener('click', function(){
+      onRevert(result.original);
+      host.classList.remove('show');
+      host.innerHTML = '';
+    });
+    host.appendChild(txt);
+    host.appendChild(btn);
   }
 
   /* ---------- model picker: selectable cards instead of a <select> ----------
@@ -3983,14 +4065,31 @@
       // already-mutated label. Mirrors the chat playground's `if (streaming)
       // return;` guard at the top of sendChat().
       if (genBtn.disabled) return;
-      var prompt = promptEl.value.trim();
-      if (!prompt){ toast('Describe an image first', true); return; }
+      var typed = promptEl.value.trim();
+      if (!typed){ toast('Describe an image first', true); return; }
+
+      genBtn.disabled = true;
+      var oldLabel = genBtn.textContent;
+      /* Every image prompt is an "opening" prompt — each generation is
+         independent, so unlike chat there is no later turn to leave alone. */
+      genBtn.textContent = 'Enhancing…';
+      setNote('Enhancing the prompt…');
+      enhanceOpening(typed, 'image').then(function(enh){
+        if (enh){
+          promptEl.value = enh.text;
+          showEnhancedNote($('#image-enhanced-note'), enh, function(orig){
+            promptEl.value = orig;
+          });
+        }
+        runGenerate(promptEl.value.trim() || typed, oldLabel);
+      });
+    }
+
+    function runGenerate(prompt, oldLabel){
       var model = modelSel.value || 'auto';
       var size = sizeSel.value || '1024x1024';
       var n = Number(countSel.value) || 1;
 
-      genBtn.disabled = true;
-      var oldLabel = genBtn.textContent;
       genBtn.textContent = 'Generating…';
       setNote('Generating…');
 
@@ -5442,6 +5541,29 @@
     apply();
   }
 
+  /* ---------- enhance-opening-prompts toggle (Settings drawer) ---------- */
+  function loadPromptEnhance(silent){
+    return api('/api/prompt-enhance').then(function(r){
+      var sw = $('#drawer-enhance-switch');
+      if (sw) sw.checked = !!(r && r.enabled);
+    }).catch(function(e){ if (!silent) toast('Prompt enhance: ' + e.message, true); });
+  }
+  function initPromptEnhance(){
+    var sw = $('#drawer-enhance-switch');
+    if (!sw) return;
+    sw.addEventListener('change', function(){
+      var want = sw.checked;
+      sw.disabled = true;
+      api('/api/prompt-enhance', { method: 'POST', body: { enabled: want } })
+        .then(function(r){
+          sw.checked = !!(r && r.enabled);
+          toast('Prompt enhancement ' + (sw.checked ? 'on' : 'off'));
+        })
+        .catch(function(e){ toast('Prompt enhance: ' + e.message, true); sw.checked = !want; })
+        .then(function(){ sw.disabled = false; });
+    });
+  }
+
   /* ---------- test-and-verification toggle (stage C) ----------
      Global (not per-session), and lives ONLY in the header Settings drawer — that IS
      its "header-level" placement per the spec, so there is exactly one DOM instance
@@ -5568,6 +5690,7 @@
     var c = $('#settings-drawer-close');
     if (c) c.focus();
     loadTestVerification(true);
+    loadPromptEnhance(true);
     loadSocialWebSearch(true);
   }
   function closeSettingsDrawer(){
@@ -5762,6 +5885,7 @@
   initArtifactPanel();
   initVisionGap();
   initTestVerification();
+  initPromptEnhance();
   initSocialWebSearch();
   initThemeToggle();
   initSettingsDrawer();

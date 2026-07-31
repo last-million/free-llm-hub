@@ -3083,13 +3083,20 @@ def _weighted_pick(pool, sustain_override=None):
     return pool[-1]  # float-rounding fallback
 
 
-def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=False):
+def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=False,
+                         force_difficulty=None):
     """Pick (pid, model) by task difficulty across AVAILABLE providers that can
     also HANDLE the request size (skip small-TPM providers for big requests).
-    - hard  -> strongest capable model.
-    - simple/medium -> cheapest capable model clearing the tier floor.
-    Returns (None, None, difficulty) if nothing is ready (caller falls back)."""
-    difficulty = _classify_difficulty(messages, max_tokens)
+    - hard/medium -> strongest capable model.
+    - simple      -> cheapest capable model clearing the tier floor.
+    Returns (None, None, difficulty) if nothing is ready (caller falls back).
+
+    `force_difficulty` overrides the classifier for callers who KNOW the tier
+    the text alone can't reveal — prompt enhancement is a short instruction-
+    following job that classifies `simple` yet needs a model strong enough to
+    obey "rewrite, don't answer" (a weak one replies to the prompt instead,
+    replacing the user's question with an answer)."""
+    difficulty = force_difficulty or _classify_difficulty(messages, max_tokens)
     if est is None:
         est = _est_tokens(messages)
     providers = [p for p in _available_providers() if _provider_capable(p, est)]
@@ -3201,8 +3208,18 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # while a stronger candidate is alive. Fail-open when they are all that
         # lives (nothing else keyed/fresh) so the request still gets served.
         pool = [c for c in pool if not _is_low_quality(c[2])] or pool
-    if difficulty == "hard":
-        # Non-tool HARD -> strongest fast model (spread keeps variety across turns).
+    if difficulty in ("hard", "medium"):
+        # BEST-EXCEPT-TRIVIAL (user choice 2026-07-31): medium joins hard on the
+        # strongest-model path instead of taking the old "cheapest model that
+        # clears _DIFFICULTY_FLOOR" route. Rationale: the floor bought quota
+        # savings by deliberately answering ordinary questions with a weaker
+        # model, which is the opposite of what this hub is for.
+        # `simple` deliberately KEEPS the cheap path: that tier is one-word
+        # replies, classification, and the hub's OWN internal probes
+        # (difficulty classification, prompt enhancement, health checks) —
+        # spending top-tier quota there buys no quality and drains the strong
+        # providers before real work reaches them.
+        # (spread keeps variety across turns.)
         picked = _spread_pick(pool) or max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
         _s, pid, model = picked
         return pid, model, difficulty
@@ -8340,6 +8357,173 @@ def _env_unset_commands(entry):
     win = "\n".join(win_lines)
     unix = "\n".join("unset %s" % n for n in names)
     return {"windows": win, "unix": unix}
+
+
+# --------------------------------------------------------------------------- #
+# Prompt enhancement (dashboard only).
+#
+# Rewrites the user's OPENING prompt into a sharper one before it is sent, so a
+# two-word ask still gets the model's best work. Deliberately scoped:
+#   * only the FIRST user turn of a conversation — rewriting every turn fights
+#     the user mid-conversation, where they are correcting and steering;
+#   * only prompts typed IN THE DASHBOARD. Traffic on /v1/* is never touched:
+#     rewriting a turn that carries tool_calls or a diff breaks the agent loop.
+# Fail-open at every step: any error, timeout, refusal or empty result returns
+# the ORIGINAL text. Enhancement must never block or corrupt a generation.
+#
+# ANTI-SLOP is the point, not a nicety. The failure mode of every naive prompt
+# enhancer is padding: image prompts become "masterpiece, 8k, ultra-detailed,
+# award-winning, trending on artstation", and chat prompts sprout "provide a
+# comprehensive overview". That is worse than the original, so both system
+# prompts below ban it explicitly and cap the output length.
+# --------------------------------------------------------------------------- #
+_ENHANCE_MAX_INPUT = 4000       # longer than this is already a considered prompt
+_ENHANCE_MAX_TOKENS = 400
+
+# MEASURED 2026-07-31: routed as `simple` (which the text alone classifies it
+# as), enhancement landed on groq/allam-2-7b, which ANSWERED the prompt instead
+# of rewriting it -- "fix my python bug" came back as "Please provide the
+# specific bug in your Python code...". That would have replaced the user's
+# question with an assistant reply. Rewriting is a short but real
+# instruction-following job, so it is routed as `medium` (= strongest model).
+_ENHANCE_DIFFICULTY = "medium"
+
+# Second line of defence for the same failure: a model that answers instead of
+# rewriting almost always opens with one of these. Cheap, and a false positive
+# only costs us the (optional) enhancement.
+_ENHANCE_ANSWERED_RE = re.compile(
+    r"^\s*(sure|certainly|of course|absolutely|okay|ok)\b"
+    r"|^\s*(please\s+(provide|share|paste|send)|could you (please )?(provide|share))"
+    r"|^\s*(i('| a)?m |i can |i'd be |i will |i'll |let me |as an ai|as a language model)"
+    r"|^\s*(here('s| is)|to (fix|solve|debug|answer)\b)"
+    r"|^\s*(great|good) (question|point)\b",
+    re.I)
+
+_ENHANCE_SYSTEM = {
+    "image": (
+        "You clarify a user's image prompt. Reply with the rewritten prompt ONLY — no "
+        "preamble, no quotes, no explanation, no options.\n"
+        "THE USER DIRECTS THE IMAGE, NOT YOU. Never invent a style, art movement, medium, "
+        "mood, lighting setup, colour palette, camera angle, lens, or setting that the "
+        "user did not state. If they wrote 'a fox', the image is a fox — do not decide it "
+        "is whimsical, golden-hour, or shot on 85mm. A prompt with no style stays a prompt "
+        "with no style; the model's own default is the correct look.\n"
+        "What you MAY do: fix grammar and ambiguity, resolve contradictions, make a "
+        "pronoun or vague reference concrete, and spell out detail the user already "
+        "implied. Keep every word of their direction that is already there, and sharpen it "
+        "if it is fuzzy.\n"
+        "BANNED — never emit these, they are noise that degrades modern image models: "
+        "'masterpiece', '8k', '4k', 'ultra-detailed', 'hyper-realistic', 'award-winning', "
+        "'trending on artstation', 'best quality', 'highly detailed', 'stunning', "
+        "'breathtaking', stacked style tags, or a trailing pile of comma-separated "
+        "adjectives.\n"
+        "Never invent a real person, brand, logo or trademark that the user did not name.\n"
+        "Stay under 60 words. Returning the prompt UNCHANGED is the right answer whenever "
+        "it is already clear — that is the common case, not a failure."
+    ),
+    "chat": (
+        "You rewrite a user's question into a sharper version of the SAME question. Reply "
+        "with the rewritten prompt ONLY — no preamble, no commentary, no answer to it.\n"
+        "Preserve the user's intent, language, and every concrete detail they gave. Make "
+        "implicit requirements explicit, and state the output shape they clearly want "
+        "(e.g. working code, a direct comparison, a short answer).\n"
+        "Add this constraint when it fits: answer directly, no restating the question, no "
+        "filler openings, no padded lists, no hedging.\n"
+        "BANNED — never add: 'act as a world-class expert', 'think step by step', 'provide "
+        "a comprehensive overview', role-play framing, flattery, or invented requirements "
+        "the user never asked for.\n"
+        "Never answer the question. Stay under 120 words. If the prompt is already precise, "
+        "return it unchanged."
+    ),
+}
+
+
+def _enhance_prompt(text, kind="chat"):
+    """(enhanced_text, model_label_or_None). Never raises; returns the ORIGINAL
+    text whenever anything at all goes wrong, so a failed enhancement is
+    invisible rather than destructive."""
+    original = (text or "").strip()
+    if not original or len(original) > _ENHANCE_MAX_INPUT:
+        return original, None
+    system = _ENHANCE_SYSTEM.get(kind) or _ENHANCE_SYSTEM["chat"]
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": original}]
+    try:
+        # require_tools=False and a tiny budget: this is a helper call, it must
+        # not consume a strong tool-capable hop that real work is waiting for.
+        pid, model, _diff = _route_by_difficulty(messages, _ENHANCE_MAX_TOKENS,
+                                                 require_tools=False,
+                                                 force_difficulty=_ENHANCE_DIFFICULTY)
+        if not pid:
+            return original, None
+        for hop_pid, hop_model in _build_chain(pid, model):
+            if _is_sub(hop_pid):
+                continue        # never spend the user's paid subscription on a rewrite
+            payload = {"model": hop_model, "stream": False,
+                       "max_tokens": _ENHANCE_MAX_TOKENS, "messages": messages}
+            try:
+                resp = _dispatch_chat(hop_pid, payload, False)
+            except (requests.RequestException, RuntimeError):
+                continue
+            try:
+                if resp.status_code != 200:
+                    continue
+                data = resp.json() or {}
+            except ValueError:
+                continue
+            finally:
+                try:
+                    resp.close()
+                except Exception:                                    # noqa: BLE001
+                    pass
+            out = (((data.get("choices") or [{}])[0].get("message") or {})
+                   .get("content") or "").strip()
+            # A model that ignored "prompt only" and answered the question
+            # instead would silently replace the user's ask with an answer.
+            # Guards: non-empty, not absurdly longer than the original, and not
+            # opening like a reply (see _ENHANCE_ANSWERED_RE). Any miss falls
+            # through to the next hop, and finally to the original text.
+            if not out or len(out) > max(600, len(original) * 6):
+                continue
+            out = out.strip().strip('"').strip()
+            if _ENHANCE_ANSWERED_RE.search(out):
+                _log.debug("[enhance] hop answered instead of rewriting; skipping")
+                continue
+            return (out or original), (hop_pid + "/" + hop_model)
+    except Exception:                                                # noqa: BLE001
+        _log.debug("[enhance] failed, returning the original prompt", exc_info=True)
+    return original, None
+
+
+@app.route("/api/prompt-enhance", methods=["GET", "POST"])
+def api_prompt_enhance_flag():
+    """The dashboard's Enhance-opening-prompts switch. Default ON: the feature
+    exists because the user asked for every prompt to get the model's best
+    work, so opting OUT is the deliberate act, not opting in."""
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        config.set_flag("prompt_enhance", bool(body.get("enabled")))
+    return jsonify({"enabled": config.get_flag("prompt_enhance", True)})
+
+
+@app.route("/api/enhance-prompt", methods=["POST"])
+def api_enhance_prompt():
+    """{prompt, kind:'chat'|'image'} -> {original, enhanced, changed, model}.
+    Dashboard-only helper; /v1/* traffic is never enhanced."""
+    body = request.get_json(silent=True) or {}
+    original = str(body.get("prompt") or "")
+    kind = str(body.get("kind") or "chat").lower()
+    if kind not in _ENHANCE_SYSTEM:
+        kind = "chat"
+    if not original.strip():
+        return jsonify({"error": "prompt is required"}), 400
+    if not config.get_flag("prompt_enhance", True):
+        return jsonify({"original": original, "enhanced": original,
+                        "changed": False, "model": None, "disabled": True})
+    enhanced, model = _enhance_prompt(original, kind)
+    return jsonify({"original": original, "enhanced": enhanced,
+                    "changed": enhanced.strip() != original.strip(),
+                    "model": model})
 
 
 def _hub_serves_now():
