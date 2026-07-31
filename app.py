@@ -459,10 +459,9 @@ def _auto_models(pid):
 
 def aggregated_models():
     """[{id:'<pid>/<model>', provider, model}] across enabled+keyed providers,
-    plus any usable local-subscription relay (sub-*) -- so e.g. the AgentRouter
-    isolated-Codex relay shows up as a pickable option in the dashboard's
-    Chat/Test playground, not just reachable via an explicit pin from an
-    external client."""
+    plus any usable local-subscription relay (sub-*) -- so a relay hop shows up
+    as a pickable option in the dashboard's Chat/Test playground, not just
+    reachable via an explicit pin from an external client."""
     out = []
     for pid in _enabled_keyed():
         for m in provider_free_models(pid):
@@ -1843,45 +1842,14 @@ _SUB_PROVIDERS = {
         "flag": "sub_codex_enabled",
         "isolated_flag": "sub_codex_isolated",
     },
-    # AgentRouter relay: NOT the user's own subscription — a third-party key
-    # (agentrouter.org) whose API is blocked for generic HTTP clients (their
-    # WAF only accepts real compiled CLI clients, MEASURED live 2026-07-27:
-    # raw `requests` calls 401 "unauthorized client detected" on every
-    # endpoint/model/auth-header tried, while a real isolated `codex exec`
-    # succeeded). So instead of an HTTP call, this hop shells out to a
-    # DEDICATED isolated Codex install (own cli_id, own install dir, own
-    # CODEX_HOME -- never the shared one sub-codex or the user's real
-    # terminal uses) with `-c` overrides pointing it at AgentRouter instead
-    # of OpenAI. `agentrouter_relay: True` marks it for the special-cased
-    # auth/argv/env branches below (_sub_isolated_on/_sub_state/_sub_env/
-    # _sub_run) instead of the OAuth-subscription path sub-codex uses.
-    "sub-agentrouter": {
-        "name": "AgentRouter relay (isolated Codex + Claude)",
-        "recommended": True,  # mirrors providers.py's agentrouter -- real referral
-                              # signup credit + verified actually working (see below).
-        "bin": "codex",
-        "cli_id": "codex-agentrouter",
-        "claude_bin": "claude",
-        "claude_cli_id": "claude-agentrouter",
-        # Every id here VERIFIED live 2026-07-29 as actually reachable (not
-        # just documented) -- everything else tried (glm-5.1, kimi-k3,
-        # kimi-k2.6, step3p5-code-alpha, gpt-5.6-sol, gpt-5, gpt-5.1,
-        # gpt-5.5-mini, guessed "-thinking" suffixes) hung indefinitely with
-        # zero response on AgentRouter's own backend -- not included, they
-        # don't work, retrying them would just burn a hop every time.
-        # gpt-5.5 has real headroom in its own balance. glm-5.2 and every
-        # claude-* id share AgentRouter's small SEPARATE quota pool (verified:
-        # same $-remaining figure across all of them, draining independent of
-        # my own success/failure) and may 403 "quota is not enough" until
-        # that refills -- _sub_run's dead-marking (_SUB_AUTH_ERR) skips
-        # whichever ones are currently out of quota automatically, so this
-        # hop just falls through to whichever model/provider is actually
-        # affordable right now.
-        "models": ["gpt-5.5", "glm-5.2", "claude-fable-5", "claude-opus-4-6",
-                   "claude-opus-4-8", "claude-opus-5"],
-        "flag": "sub_agentrouter_enabled",
-        "agentrouter_relay": True,
-    },
+    # NOTE: a third "sub-agentrouter" relay lived here until 2026-07-31 —
+    # removed at explicit user request together with the `agentrouter`
+    # provider entry (see providers.py). It shelled out to a DEDICATED
+    # isolated Codex/Claude install to get around agentrouter.org's WAF (which
+    # 401s "unauthorized client detected" at every generic HTTP client — still
+    # true when re-probed on removal day). Its own test probe hung for 240s.
+    # The `agentrouter_relay` flag it carried is gone with it, so no provider
+    # sets it any more.
 }
 _SUB_TIMEOUT = 120        # seconds for one run (CLI cold start + generation)
 # `claude -p --output-format json` is known to HANG on very large prompts (~148KB
@@ -1924,21 +1892,9 @@ _SUB_MAX_PROMPT_CHARS = 100000
 # isolated binary, and hand the user the exact command to run themselves; it
 # cannot click through OAuth consent for them.
 # --------------------------------------------------------------------------- #
-_ISOLATED_ENV_VAR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME",
-                     "codex-agentrouter": "CODEX_HOME", "claude-agentrouter": "CLAUDE_CONFIG_DIR"}
-_ISOLATED_NPM_PACKAGE = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex",
-                         "codex-agentrouter": "@openai/codex",          # same package, separate install dir
-                         "claude-agentrouter": "@anthropic-ai/claude-code"}
+_ISOLATED_ENV_VAR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
+_ISOLATED_NPM_PACKAGE = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex"}
 
-
-def _agentrouter_backend(model):
-    """Which underlying CLI+protocol an AgentRouter model needs. Every Claude
-    model id VERIFIED reachable on AgentRouter (2026-07-29) starts with
-    "claude-" (claude-opus-4-6, claude-opus-4-8, claude-opus-5, claude-fable-
-    5) and needs the Anthropic Messages protocol, which only the `claude`
-    binary speaks; every other verified model (gpt-5.5, glm-5.2) speaks the
-    OpenAI-compatible surface `codex` already handles."""
-    return "claude" if str(model or "").startswith("claude-") else "codex"
 _ISOLATED_INSTALL_TIMEOUT = 300   # npm install can be slow; this is an admin click, not a hop
 
 
@@ -2002,15 +1958,8 @@ def _isolated_bin_path(cli_id, bin_name):
 def _sub_isolated_on(pid):
     """The per-provider isolated-profile opt-in. DEFAULT FALSE — with it off,
     _sub_bin/_sub_env/_sub_state behave EXACTLY as they did before this feature
-    (shared install, shared ~/.claude or ~/.codex).
-
-    agentrouter_relay providers are ALWAYS isolated, unconditionally — this
-    isn't the user's own subscription CLI, it's a repurposed Codex copy
-    relaying a third-party key, and must never share install/config with the
-    user's real Codex session or with sub-codex's own isolated profile."""
+    (shared install, shared ~/.claude or ~/.codex)."""
     cfg = _SUB_PROVIDERS.get(pid)
-    if cfg and cfg.get("agentrouter_relay"):
-        return True
     flag = cfg.get("isolated_flag") if cfg else None
     return bool(flag and config.get_flag(flag, False))
 
@@ -2049,13 +1998,12 @@ def _is_sub(pid):
 
 
 def _sub_models(pid):
-    """The model id(s) a sub provider exposes. sub-claude/sub-codex still use
-    the original single "model" key (one each, by design -- the whole point
-    is "your logged-in session", not model choice). agentrouter_relay
-    providers use a "models" list instead, since unlike a subscription this
-    is choosing among several real backend models -- each becomes its own
-    addressable 'sub-agentrouter/<model>' fallback hop (_build_chain already
-    iterates every entry this returns, so returning >1 here is all it takes)."""
+    """The model id(s) a sub provider exposes. sub-claude/sub-codex use the
+    single "model" key (one each, by design -- the whole point is "your
+    logged-in session", not model choice). A provider may instead carry a
+    "models" list, in which case each entry becomes its own addressable
+    '<pid>/<model>' fallback hop (_build_chain already iterates every entry
+    this returns, so returning >1 here is all it takes)."""
     cfg = _SUB_PROVIDERS.get(pid)
     if not cfg:
         return []
@@ -2078,14 +2026,12 @@ def _sub_bin(pid, model=None):
     isolation (a "not installed" isolated provider must show as not installed,
     even if the user's regular `claude`/`codex` is right there on PATH).
 
-    `model` only matters for agentrouter_relay providers, which span TWO
-    backends (see _agentrouter_backend) -- everything else ignores it."""
+    `model` is accepted (and ignored) so callers that route per-model don't
+    have to special-case this."""
     cfg = _SUB_PROVIDERS.get(pid)
     if not cfg:
         return None
     bin_name, cli_id = cfg["bin"], cfg["cli_id"]
-    if cfg.get("agentrouter_relay") and _agentrouter_backend(model) == "claude":
-        bin_name, cli_id = cfg["claude_bin"], cfg["claude_cli_id"]
     try:
         if _sub_isolated_on(pid):
             return _isolated_bin_path(cli_id, bin_name)
@@ -2165,29 +2111,13 @@ def _sub_state(pid):
         return False, False, False, "Unknown subscription provider."
     enabled = bool(config.get_flag(cfg["flag"], True))   # per-provider default ON
     isolated = _sub_isolated_on(pid)
-    if cfg.get("agentrouter_relay"):
-        # Two independent backends (codex for gpt-5.5/glm-5.2, claude for
-        # every claude-* id) -- fail-open on "installed": usable if EITHER
-        # is present, same "don't block the whole relay over one missing
-        # piece" logic as everywhere else in this hub. _sub_run/_sub_bin
-        # separately resolve the right one per-model at call time.
-        codex_path = _isolated_bin_path(cfg["cli_id"], cfg["bin"]) if isolated else shutil.which(cfg["bin"])
-        claude_path = (_isolated_bin_path(cfg["claude_cli_id"], cfg["claude_bin"]) if isolated
-                      else shutil.which(cfg["claude_bin"]))
-        path = codex_path or claude_path
-        if not path:
-            return enabled, False, False, ("Neither backend installed yet (looked under %s and %s). "
+    path = _sub_bin(pid)
+    if not path:
+        if isolated:
+            return enabled, False, False, ("Isolated copy not installed yet (looked under %s). "
                                            "Click \"Install isolated copy\"."
-                                           % (_short(_isolated_install_dir(cfg["cli_id"])),
-                                              _short(_isolated_install_dir(cfg["claude_cli_id"]))))
-    else:
-        path = _sub_bin(pid)
-        if not path:
-            if isolated:
-                return enabled, False, False, ("Isolated copy not installed yet (looked under %s). "
-                                               "Click \"Install isolated copy\"."
-                                               % _short(_isolated_install_dir(cfg["cli_id"])))
-            return enabled, False, False, "Not installed (no '%s' on PATH)." % cfg["bin"]
+                                           % _short(_isolated_install_dir(cfg["cli_id"])))
+        return enabled, False, False, "Not installed (no '%s' on PATH)." % cfg["bin"]
     if isolated:
         # An isolated install reads ONLY its own CODEX_HOME/CLAUDE_CONFIG_DIR — a
         # directory Auto-fix never writes to — so it can NEVER loop back into this
@@ -2200,17 +2130,6 @@ def _sub_state(pid):
         loops, loop_detail = _sub_loops_back(cfg["cli_id"])
     if loops:
         return enabled, True, False, loop_detail
-    if cfg.get("agentrouter_relay"):
-        # Not an OAuth subscription — "authenticated" here just means the
-        # agentrouter provider itself has a saved key for this relay to inject.
-        ar_keys = (config.get_provider_config("agentrouter") or {}).get("api_keys") or []
-        if not ar_keys:
-            return enabled, True, False, ("No AgentRouter API key saved yet — "
-                                          "paste one on the AgentRouter provider card first.")
-        backends_ready = [n for n, p in (("Codex", codex_path), ("Claude", claude_path)) if p]
-        return enabled, True, True, ("Ready (%s backend%s installed) — relays through dedicated "
-                                     "isolated copies, never touches your real Claude Code/Codex session."
-                                     % (" + ".join(backends_ready), "" if len(backends_ready) == 1 else "s"))
     if pid == "sub-codex":
         codex_home = _isolated_config_dir("codex") if isolated else None
         ok, detail = _codex_subscription_auth(codex_home)
@@ -2239,9 +2158,9 @@ def _sub_available_providers():
     for pid in _SUB_PROVIDERS:
         enabled, _installed, authed, _detail = _sub_state(pid)
         # Fail-open across a multi-model pid: available if AT LEAST ONE of its
-        # models isn't currently dead (e.g. one AgentRouter model 403'd out of
-        # quota doesn't have to take the whole relay down -- _build_chain
-        # still only offers the live ones, via _sub_models further down).
+        # models isn't currently dead (one model 403'd out of quota doesn't
+        # have to take the whole relay down -- _build_chain still only offers
+        # the live ones, via _sub_models further down).
         if enabled and authed and any(not _is_model_dead(pid, m) for m in _sub_models(pid)):
             out.append(pid)
     return out
@@ -2311,35 +2230,19 @@ def _sub_env(pid=None, model=None):
     CODEX_HOME that doesn't already exist), so the subprocess never touches
     ~/.claude or ~/.codex at all.
 
-    `model` picks which of agentrouter_relay's two backends to configure
-    (see _agentrouter_backend) -- irrelevant for every other pid."""
+    `model` is accepted (and ignored) so per-model callers don't have to
+    special-case this."""
     env = dict(os.environ)
     for k in list(env.keys()):
         if _points_at_hub(env.get(k)):
             env.pop(k, None)
     if pid and _sub_isolated_on(pid):
         cfg = _SUB_PROVIDERS.get(pid) or {}
-        is_agentrouter = cfg.get("agentrouter_relay")
-        backend = _agentrouter_backend(model) if is_agentrouter else None
-        cli_id = cfg.get("claude_cli_id") if backend == "claude" else cfg.get("cli_id")
+        cli_id = cfg.get("cli_id")
         var = _ISOLATED_ENV_VAR.get(cli_id)
         if var and cli_id:
             _ensure_isolated_dirs(cli_id)
             env[var] = _isolated_config_dir(cli_id)
-        if is_agentrouter:
-            ar_key = ((config.get_provider_config("agentrouter") or {}).get("api_keys") or [None])[0]
-            if ar_key:
-                if backend == "claude":
-                    # Real Claude Code convention (verified live 2026-07-28):
-                    # ANTHROPIC_AUTH_TOKEN is sent as a Bearer token, and
-                    # AgentRouter's docs are explicit the Anthropic surface's
-                    # base URL has NO /v1 -- the client appends that itself.
-                    env["ANTHROPIC_AUTH_TOKEN"] = ar_key
-                    env["ANTHROPIC_BASE_URL"] = "https://agentrouter.org"
-                    if model:
-                        env["ANTHROPIC_MODEL"] = model
-                else:
-                    env["AGENTROUTER_API_KEY"] = ar_key
     return env
 
 
@@ -2374,8 +2277,8 @@ _SUB_AUTH_ERR = ("not logged in", "not authenticated", "unauthorized", "401",
                  "please run /login", "please login", "run `codex login`",
                  "run codex login", "invalid api key", "no credentials",
                  "authentication_error", "session expired", "oauth",
-                 # AgentRouter's own small separate quota pool (distinct from the
-                 # main wallet) -- MEASURED 2026-07-29: real error is "Failed to
+                 # A relay's own separate quota pool (distinct from the main
+                 # wallet) -- MEASURED 2026-07-29: real error is "Failed to
                  # authenticate. API Error: 403 token quota is not enough,
                  # token remain quota: $X, need quota: $Y". Same bucket as the
                  # auth failures above on purpose: both mean "not usable right
@@ -2394,18 +2297,15 @@ def _sub_run(pid, prompt, model=None):
       413 -> prompt over _SUB_MAX_PROMPT_CHARS (request-specific, NOT dead)
       504 -> timed out       502 -> ran but failed / produced nothing
 
-    `model` selects WHICH model for a multi-model pid (currently only
-    sub-agentrouter -- see _agentrouter_backend); ignored otherwise, since
-    sub-claude/sub-codex only ever expose "your logged-in session".
+    `model` selects WHICH model for a multi-model pid; ignored for
+    sub-claude/sub-codex, which only ever expose "your logged-in session".
 
     Invocation (flags verified against `claude --help` / `codex exec --help`):
       claude -> `claude -p --output-format text`, prompt on STDIN (print mode
         reads a piped stdin as the prompt). NO --dangerously-skip-permissions and
         no tool flags: a plain text completion, nothing else. NOT `--bare` either
         — that mode refuses to read the OAuth session and demands an API key,
-        i.e. the exact opposite of "use my subscription". For the AgentRouter
-        Claude backend, ANTHROPIC_MODEL/_BASE_URL/_AUTH_TOKEN (set in _sub_env)
-        redirect this SAME plain invocation at AgentRouter instead.
+        i.e. the exact opposite of "use my subscription".
       codex  -> `codex exec --skip-git-repo-check --color never --sandbox
         read-only -o <tmp> -`. The trailing '-' reads the prompt from STDIN, and
         -o writes ONLY the final assistant message to <tmp>, so Codex's banner /
@@ -2430,19 +2330,13 @@ def _sub_run(pid, prompt, model=None):
         return 413, "", ("Prompt is %d chars; the local %s CLI is capped at %d here "
                          "(a CLI hangs on very large prompts)."
                          % (len(prompt), cfg["bin"], _SUB_MAX_PROMPT_CHARS))
-    backend = _agentrouter_backend(model) if cfg.get("agentrouter_relay") else None
-    bin_name = cfg["claude_bin"] if backend == "claude" else cfg["bin"]
+    bin_name = cfg["bin"]
     path = _sub_bin(pid, model)
     if not path:
         return 403, "", "'%s' is no longer on PATH." % bin_name
     tmp_out = None
     try:
-        if backend == "claude":
-            # Anthropic-protocol path -- plain `claude -p`, exactly like
-            # sub-claude's own invocation; the model/base-url/token swap
-            # happens entirely through env vars (_sub_env), not argv.
-            argv = _sub_launcher(path) + ["-p", "--output-format", "text"]
-        elif pid in ("sub-codex", "sub-agentrouter"):
+        if pid == "sub-codex":
             try:
                 fd, tmp_out = tempfile.mkstemp(prefix="hub-sub-", suffix=".txt")
                 os.close(fd)
@@ -2462,20 +2356,6 @@ def _sub_run(pid, prompt, model=None):
                                           # and nothing is installed in a fresh isolated
                                           # profile for either flag to remove.
                                           "--disable", "plugins", "--disable", "remote_plugin"]
-            if pid == "sub-agentrouter":
-                # Route this isolated Codex copy at AgentRouter instead of
-                # OpenAI. wire_api MUST be "responses" -- "chat" was removed
-                # in this Codex version (verified live 2026-07-27: "chat" is
-                # no longer supported, "responses" is what actually works
-                # against AgentRouter's OpenAI-compatible surface).
-                argv += [
-                    "-c", 'model_providers.agentrouter.name="agentrouter"',
-                    "-c", 'model_providers.agentrouter.base_url="https://agentrouter.org/v1"',
-                    "-c", 'model_providers.agentrouter.env_key="AGENTROUTER_API_KEY"',
-                    "-c", 'model_providers.agentrouter.wire_api="responses"',
-                    "-c", 'model_provider="agentrouter"',
-                    "-c", 'model="%s"' % (model or (cfg.get("models") or [""])[0]),
-                ]
             argv += ["-o", tmp_out, "-"]
         else:
             argv = _sub_launcher(path) + ["-p", "--output-format", "text"]
@@ -2489,11 +2369,11 @@ def _sub_run(pid, prompt, model=None):
         except (OSError, ValueError) as exc:
             return 502, "", "%s failed to start: %s" % (bin_name, exc.__class__.__name__)
         text = (proc.stdout or "").strip()
-        if pid in ("sub-codex", "sub-agentrouter") and backend != "claude":
+        if pid == "sub-codex":
             last = _read_text(tmp_out).strip()
             text = last or _codex_strip_noise(proc.stdout)
         # Claude Code can print a hard failure straight to stdout with exit 0
-        # (MEASURED 2026-07-29: AgentRouter's quota-exhausted error --
+        # (MEASURED 2026-07-29: a relay's quota-exhausted error --
         # "Failed to authenticate. API Error: 403 token quota is not
         # enough...") rather than stderr/non-zero exit, so a naive
         # non-empty-stdout=success check would return that error text as if
@@ -2604,77 +2484,6 @@ def _dispatch_chat(pid, payload, stream):
     return _upstream_chat(pid, payload, stream)
 
 
-def _agentrouter_review_and_fix(hop_pid, hop_model, messages, data, est):
-    """User-approved 2026-07-29 "guarantee maximum perfection" pass, scoped
-    to AgentRouter responses only (see the AGENTROUTER FIRST block in
-    _route_by_difficulty) -- NOT every hop. Reviewing needs the COMPLETE
-    answer, so applying this broadly would mean buffering (losing real-time
-    streaming) on every coding request; AgentRouter responses are ALREADY
-    buffered by the fake-stream fix (a local CLI can't stream token-by-token
-    regardless), so a review pass here costs nothing in UX terms that isn't
-    already being paid. Free-tier hops -- which keep real-time streaming --
-    are deliberately untouched.
-
-    One lightweight review call (routed through the normal FAST free-tier
-    pick, require_tools=False -- this must not itself spend AgentRouter's
-    own fragile quota) asks a plain yes/no question. Only on a concrete
-    "no" does this spend a SECOND AgentRouter call asking the SAME model
-    that produced the original answer to fix the specific problem found --
-    capped at exactly one revision round, never a loop.
-
-    Fail-open at every step: any missing pid, empty answer, review-call
-    error, non-200, or exception returns `data` completely unchanged. A
-    review pass that can silently fail must never be able to make a working
-    response worse or block one from returning at all."""
-    cfg = _SUB_PROVIDERS.get(hop_pid)
-    if not cfg or not cfg.get("agentrouter_relay"):
-        return data
-    try:
-        msg = ((data.get("choices") or [{}])[0].get("message") or {})
-        answer = (msg.get("content") or "").strip()
-        if not answer:
-            return data
-        task_text = _sub_flatten(messages)[:4000]
-        # Route off the REAL task (a reasonable proxy for how substantial a
-        # review it deserves), not the review prompt itself -- require_tools
-        # is deliberately False here: reviewing is a plain judgment call,
-        # and False biases toward the FAST free tier instead of possibly
-        # picking AgentRouter again for the review step itself.
-        review_pid, review_model, _ = _route_by_difficulty(messages, require_tools=False)
-        if not review_pid:
-            return data
-        review_prompt = (
-            "Task given to a coding assistant:\n%s\n\n"
-            "The assistant's response:\n%s\n\n"
-            "Does this response fully and correctly address the task -- "
-            "complete, syntactically valid, nothing obviously broken or "
-            "missing? Reply with EXACTLY the single word LGTM if so. "
-            "Otherwise reply with ONE short sentence describing the "
-            "concrete problem, nothing else." % (task_text, answer[:6000]))
-        review_resp = _dispatch_chat(review_pid, {
-            "model": review_model,
-            "messages": [{"role": "user", "content": review_prompt}],
-            "max_tokens": 200}, False)
-        if review_resp.status_code != 200:
-            return data
-        verdict_msg = ((review_resp.json().get("choices") or [{}])[0].get("message") or {})
-        verdict = (verdict_msg.get("content") or "").strip()
-        if not verdict or "lgtm" in verdict.lower():
-            return data
-        fix_status, fix_text, _ = _sub_run(
-            hop_pid,
-            "%s\n\nYour previous response had this problem: %s\n"
-            "Please provide a corrected, complete response."
-            % (task_text, verdict[:300]),
-            model=hop_model)
-        if fix_status == 200 and fix_text.strip():
-            data = dict(data)
-            data["choices"] = [dict(data["choices"][0],
-                                    message={"role": "assistant", "content": fix_text})]
-        return data
-    except Exception:
-        _log.debug("[agentrouter-review] failed, returning original response", exc_info=True)
-        return data
 
 
 # Reasoning EFFORT the manager assigns per task difficulty. A simple question gets
@@ -3054,30 +2863,16 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         _skey = _session_key(messages)
         _pinned = _session_pin_get(_skey)
         if _pinned:
-            # The pin can point at a FREE candidate (agentic) OR at AgentRouter
-            # (deliberately not part of `agentic` — see the AGENTROUTER FIRST
-            # block below), so both need checking here; otherwise an
-            # AgentRouter-pinned task would silently get re-picked onto a free
-            # model mid-task the moment its model dropped out of `agentic`.
+            # Keep an in-progress task on the model it started on, as long as
+            # that model is still a live candidate.
             for _c in agentic:
                 if (_c[1], _c[2]) == _pinned:
                     return _pinned[0], _pinned[1], difficulty
-            if _pinned[0] == "sub-agentrouter" and not _is_model_dead(*_pinned):
-                return _pinned[0], _pinned[1], difficulty
-        # AGENTROUTER FIRST — explicit user choice 2026-07-29: for a FRESH
-        # coding/agentic task (no pin above), try AgentRouter's best model
-        # BEFORE the free tier, not after. This spends real (shared, fragile)
-        # quota on purpose, so it's scoped to require_tools only, and only
-        # runs once per task — an in-progress task never switches mid-task,
-        # same guarantee the free tier gets from the pin above. Tries models
-        # in _sub_models' order (gpt-5.5 first); fail-open: any dead/exhausted
-        # model here just falls through to the free-tier pick below,
-        # unchanged, exactly like today whenever AgentRouter is off/unusable.
-        if "sub-agentrouter" in _sub_available_providers():
-            for _m in _sub_models("sub-agentrouter"):
-                if not _is_model_dead("sub-agentrouter", _m):
-                    _session_pin_set(_skey, "sub-agentrouter", _m)
-                    return "sub-agentrouter", _m, difficulty
+        # NOTE: an "AGENTROUTER FIRST" block sat here until 2026-07-31 — it
+        # tried the AgentRouter relay's paid models BEFORE the free tier on
+        # every fresh coding task. It went with the relay itself (removed at
+        # user request); agentic tasks now go straight to the weighted
+        # free-tier pick below, as they did before that block existed.
         # WEIGHTED pick, not strict argmax — see _weighted_pick. `agentic` has
         # ALREADY been filtered to models that are available, not throttled, not
         # exhausted, tool-capable and big enough for this request — so this picks
@@ -4500,10 +4295,13 @@ def _mask_key(k):
 
 
 # Providers that ONLY actually work through a local-subscription CLI relay
-# (see _SUB_PROVIDERS' agentrouter_relay entries) rather than direct HTTP --
-# lets the provider card link to and show the live status of the thing that
-# actually works, instead of just failing its own Test button silently.
-_PROVIDER_RELAY_SUB_PID = {"agentrouter": "sub-agentrouter"}
+# (a _SUB_PROVIDERS pid) rather than direct HTTP -- lets the provider card link
+# to and show the live status of the thing that actually works, instead of just
+# failing its own Test button silently. EMPTY since 2026-07-31: its only entry
+# was {"agentrouter": "sub-agentrouter"}, and both halves were removed at user
+# request. The machinery below is generic and stays for the next such provider;
+# with an empty map every branch that consults it is simply skipped.
+_PROVIDER_RELAY_SUB_PID = {}
 
 
 def _provider_row(pid, live_models=False):
@@ -4556,8 +4354,8 @@ def api_providers():
 
 def _sync_relay_enable(pid):
     """When a provider that only actually works through a local-subscription
-    relay (see _PROVIDER_RELAY_SUB_PID -- currently just AgentRouter, WAF-
-    blocked for direct HTTP) gets enabled from its OWN card, also turn on the
+    relay (see _PROVIDER_RELAY_SUB_PID -- EMPTY since 2026-07-31, so this is a
+    no-op today) gets enabled from its OWN card, also turn on the
     master local-subscriptions switch and that relay's per-provider flag.
     Without this, "Enabled" on the provider card silently does nothing --
     the thing that actually works lives in a completely separate opt-in
@@ -4805,10 +4603,10 @@ def api_test_provider(pid):
                 payload["stale_models"] = []
         return jsonify(payload)
 
-    # AgentRouter (and anything else mapped in _PROVIDER_RELAY_SUB_PID) only
-    # ever reaches its backend through the isolated CLI relay — a raw HTTP
-    # call from here always eats the WAF's generic-client block (HTTP 401
-    # "unauthorized client detected"), which is a false negative about the
+    # A provider mapped in _PROVIDER_RELAY_SUB_PID (empty since 2026-07-31)
+    # only ever reaches its backend through the isolated CLI relay — a raw
+    # HTTP call from here would eat that gateway's generic-client block (e.g.
+    # HTTP 401 "unauthorized client detected"), a false negative about the
     # provider, not a real signal. Route the whole test through the SAME
     # relay Subscriptions uses instead, one real call per model, then feed
     # the result into the same _finish()/_record_test_result() cache path
@@ -5579,13 +5377,6 @@ def _sub_provider_rows():
             "isolated_login_note": login_note,
             "recommended": bool(cfg.get("recommended")),
         }
-        if cfg.get("agentrouter_relay"):
-            # Second, independent backend (Claude models need the Anthropic
-            # CLI, not Codex) -- surfaced separately so the dashboard can show
-            # (and install) both halves instead of just the primary one.
-            claude_cli_id = cfg["claude_cli_id"]
-            row["claude_isolated_installed"] = bool(_isolated_bin_path(claude_cli_id, cfg["claude_bin"]))
-            row["claude_isolated_install_dir"] = _short(_isolated_install_dir(claude_cli_id))
         rows.append(row)
     return rows
 
@@ -5660,13 +5451,6 @@ def api_subscriptions_install_isolated(pid):
     ok, result = _install_isolated_cli(cfg["cli_id"], cfg["bin"])
     if not ok:
         return jsonify(result), result.pop("_status", 502)
-    if cfg.get("agentrouter_relay"):
-        # Second, independent backend -- Claude models need the Anthropic
-        # CLI, not Codex. Both installs run in the same click (an admin
-        # action, not a hop) so "Install isolated copy" sets up the WHOLE
-        # relay in one go instead of leaving the Claude half silently absent.
-        ok2, result2 = _install_isolated_cli(cfg["claude_cli_id"], cfg["claude_bin"])
-        result["claude_backend"] = result2 if ok2 else {"ok": False, "error": result2.get("error")}
     return jsonify(result)
 
 
@@ -6640,13 +6424,21 @@ CLI_REGISTRY = [
         # priority is config api_key > [providers.*.env] sub-table — there is NO
         # shell-env fallback, so checking OPENAI_BASE_URL/OPENAI_API_KEY here
         # would false-positive exactly like it did for codex.
-        "autofix": None,  # TOML with a live default_model (the managed
-                          # 'kimi-code' OAuth service) — rewriting it additively
-                          # is risky; guide the edit instead (llm precedent).
-        "default_method": "manual",
-        "hint": ("Installed. Add a [providers.free-hub] openai block + an 'auto' model "
-                 "alias to ~/.kimi/config.toml (see instructions), then restart kimi."),
+        # ONE-CLICK since 2026-07-31 (was manual-only): the same additive TOML
+        # rewrite Codex already gets. The one risky part — clobbering the live
+        # default_model (normally Kimi's managed 'kimi-code' OAuth service) —
+        # is handled by remembering it in the `kimi_prev_default_model` setting
+        # and restoring it on Disconnect. Manual TOML below stays as a fallback.
+        "autofix": "kimi",
+        "write_path": _p_kimi(),
+        "default_method": "config",
+        "hint": ("Installed. Connect writes a [providers.free-hub] block + an 'auto' model "
+                 "alias into ~/.kimi/config.toml and switches default_model to it; "
+                 "Disconnect strips them and restores your previous default_model. "
+                 "Restart kimi afterwards."),
         "manual_note": (
+            "One click does all of this — Connect writes it for you (and Disconnect reverses it, "
+            "restoring your previous default_model); the manual steps below are only a fallback.\n\n"
             "Kimi Code is wired through ~/.kimi/config.toml ([providers.*] tables), NOT shell "
             "environment variables. Per the official docs, api_key is a REQUIRED field — startup "
             "fails without one — so give it a placeholder; the localhost hub accepts any bearer "
@@ -7292,6 +7084,104 @@ def _autofix_hermes(entry, key, base_root, base_v1, model):
     }
 
 
+_KIMI_DEFAULT_MODEL_RE = re.compile(r"""^\s*default_model\s*=\s*["']([^"']*)["']\s*$""")
+
+
+def _kimi_prev_default_model(text):
+    """The `default_model` currently declared in the TOP (pre-table) section of
+    ~/.kimi/config.toml, or None. Stops at the first '[table]' header — a bare
+    key is only valid TOML above it, so anything below belongs to a table."""
+    for ln in text.splitlines():
+        if _CODEX_TABLE_RE.match(ln):
+            break
+        m = _KIMI_DEFAULT_MODEL_RE.match(ln)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _kimi_apply_text(text, base_v1, key):
+    """Pure transform for ~/.kimi/config.toml (no IO). ADDITIVELY + REVERSIBLY:
+      1. drop any previous [providers.free-hub] / [models."auto"] tables so a
+         re-connect always rewrites them clean (new port, new hub key, ...);
+      2. in the TOP section set default_model = "auto" (replacing an existing
+         default_model line in place, else prepending it);
+      3. append the two tables that wire Kimi Code to this hub.
+    Every other line (other [providers.*], [models.*], MCP blocks, comments)
+    survives verbatim. Returns the new file text."""
+    body, _ = _remove_toml_table(text, "providers.free-hub")
+    body, _ = _remove_toml_table(body, 'models."auto"')
+    top, rest, in_rest = [], [], False
+    for ln in body.splitlines():
+        if not in_rest and _CODEX_TABLE_RE.match(ln):
+            in_rest = True
+        (rest if in_rest else top).append(ln)
+    pat = re.compile(r"^\s*default_model\s*=")
+    for i, ln in enumerate(top):
+        if pat.match(ln):
+            top[i] = 'default_model = "auto"'
+            break
+    else:
+        top.insert(0, 'default_model = "auto"')
+    block = [
+        "[providers.free-hub]",
+        'type = "openai"',
+        'base_url = "%s"' % base_v1,
+        # api_key is a REQUIRED field per Kimi's docs (startup fails without
+        # one). The localhost hub accepts any bearer when no local key is set.
+        'api_key = "%s"' % key,
+        "",
+        '[models."auto"]',
+        'provider = "free-hub"',
+        'model = "auto"',
+        "max_context_size = 128000",
+    ]
+    new_text = "\n".join(top + rest).rstrip("\n")
+    return (new_text + "\n\n" if new_text else "") + "\n".join(block) + "\n"
+
+
+def _autofix_kimi(entry, key, base_root, base_v1, model):
+    """Point Kimi Code at this hub in ONE click. Kimi is wired ONLY through
+    ~/.kimi/config.toml ([providers.*] tables) — it has no shell-env fallback —
+    so this writes that file additively/reversibly (a .freehub-bak backup is
+    taken first) instead of handing out manual TOML to paste. The previous
+    default_model (normally Kimi's managed 'kimi-code' OAuth service) is
+    remembered so Disconnect puts it back exactly."""
+    path = _p_kimi()
+    try:
+        if os.path.isfile(path):
+            # utf-8-sig: strip a leading BOM so it can't land mid-file after we
+            # prepend default_model (a mid-file BOM breaks TOML parsing).
+            with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+                text = f.read()
+        else:
+            text = ""
+    except OSError as exc:
+        return {"ok": False, "reason": _sanitize("could not read %s: %s" % (_short(path), exc))}
+    backup = _backup_once(path)
+    abort = _abort_if_backup_failed(path, backup)
+    if abort:
+        return abort
+    prev = _kimi_prev_default_model(text)
+    if prev and prev != "auto":
+        config.set_setting("kimi_prev_default_model", prev)  # remember for Disconnect
+    _cli_write_text(path, _kimi_apply_text(text, base_v1, key))
+    return {
+        "ok": True,
+        "wrote_path": path,
+        "backup_path": backup,
+        "applied": {"provider": "free-hub", "type": "openai", "base_url": base_v1,
+                    "api_key": _mask_key(key), "model_alias": "auto",
+                    "default_model": "auto"},
+        "note": ("Connected. Kimi Code now routes every request through the hub's "
+                 "difficulty-aware orchestration (the 'auto' model)."
+                 + (" Your previous default_model (%s) is remembered and restored "
+                    "on Disconnect." % prev if prev and prev != "auto" else "")),
+        "restart_hint": ("Restart Kimi Code — it reads ~/.kimi/config.toml on startup. "
+                         "In an already-open session, pick 'auto' via /model."),
+    }
+
+
 _AUTOFIXERS = {
     "claude": _autofix_claude,
     "aider": _autofix_aider,
@@ -7300,6 +7190,7 @@ _AUTOFIXERS = {
     "codex": _autofix_codex,
     "openclaw": _autofix_openclaw,
     "hermes": _autofix_hermes,
+    "kimi": _autofix_kimi,
 }
 
 
@@ -7710,6 +7601,61 @@ def _disconnect_hermes(entry):
             "changed": False, "restart_hint": hint}
 
 
+def _kimi_restore_default_model(text):
+    """Undo our `default_model = "auto"` in the TOP (pre-table) section only:
+    put back the value remembered at connect time, or drop the line entirely if
+    there was none. A default_model the user has since changed to something
+    else is left alone (the line no longer matches). Returns
+    (new_text, changed_bool)."""
+    prev = config.get_setting("kimi_prev_default_model")
+    ours = re.compile(r'^\s*default_model\s*=\s*"auto"\s*$')
+    out, changed, in_rest = [], False, False
+    for ln in text.splitlines():
+        if not in_rest and _CODEX_TABLE_RE.match(ln):
+            in_rest = True
+        if not in_rest and ours.match(ln):
+            changed = True
+            if isinstance(prev, str) and prev:
+                out.append('default_model = "%s"' % prev)
+            continue
+        out.append(ln)
+    if changed and isinstance(prev, str) and prev:
+        config.set_setting("kimi_prev_default_model", "")  # consumed
+    new_text = "\n".join(out).rstrip("\n")
+    return (new_text + "\n" if new_text else ""), changed
+
+
+def _disconnect_kimi(entry):
+    """Revert Kimi Code: strip ONLY the two tables we added plus our
+    default_model line (restoring the remembered one), so any provider / model
+    alias / setting added to config.toml after connecting survives. Restoring
+    the frozen first-connect backup is the last resort, for a file we can no
+    longer read at all."""
+    path = entry.get("write_path") or _p_kimi()
+    hint = ("Restart Kimi Code so it re-reads ~/.kimi/config.toml "
+            "(an open session keeps the old model until then).")
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+                text = f.read()
+        except OSError:
+            text = None
+        if text is not None:
+            text2, prov_removed = _remove_toml_table(text, "providers.free-hub")
+            text3, alias_removed = _remove_toml_table(text2, 'models."auto"')
+            text4, top_changed = _kimi_restore_default_model(text3)
+            changed = bool(prov_removed or alias_removed or top_changed)
+            if changed:
+                _cli_write_text(path, text4)
+            _discard_backup(path)  # strip succeeded -> stale backup no longer needed
+            return {"restored_from_backup": False, "wrote_path": path,
+                    "changed": changed, "restart_hint": hint}
+    if _restore_backup(path):
+        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
+    return {"restored_from_backup": False, "wrote_path": path,
+            "changed": False, "restart_hint": hint}
+
+
 _DISCONNECTERS = {
     "claude": _disconnect_claude,
     "aider": _disconnect_aider,
@@ -7719,6 +7665,7 @@ _DISCONNECTERS = {
     "llm": _disconnect_llm,   # id-keyed: `llm` has no autofix strategy string
     "openclaw": _disconnect_openclaw,
     "hermes": _disconnect_hermes,
+    "kimi": _disconnect_kimi,
 }
 
 
@@ -8736,7 +8683,6 @@ def v1_chat_completions():
                     resp.close()
                     continue
                 _record_chat_usage(hop_pid, hop_model, data, est)
-                data = _agentrouter_review_and_fix(hop_pid, hop_model, body["messages"], data, est)
                 msg = ((data.get("choices") or [{}])[0].get("message") or {})
                 chunk = {"id": data.get("id", "chatcmpl-sub"), "object": "chat.completion.chunk",
                         "created": data.get("created", int(time.time())),
@@ -8785,7 +8731,6 @@ def v1_chat_completions():
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est)
-            data = _agentrouter_review_and_fix(hop_pid, hop_model, body["messages"], data, est)
             if isinstance(data, dict):
                 data["model"] = hop_pid + "/" + hop_model
             return jsonify(data), 200, _routing_headers(hop_pid, hop_model, attempts, last_error)
@@ -9288,8 +9233,8 @@ def v1_responses():
         # A local-CLI relay hop (sub-*) is a subprocess that runs to completion —
         # it cannot stream token-by-token. User-approved tradeoff 2026-07-29:
         # rather than skip it outright whenever the client wants a stream
-        # (which silently defeated AgentRouter-first routing for every
-        # interactive/streaming codex session — its actual normal usage),
+        # (which silently skipped every relay hop for interactive/streaming
+        # codex sessions — their actual normal usage),
         # dispatch it NON-streaming regardless of what the client asked for,
         # then emit its complete answer as ONE synthetic chunk through the
         # SAME _responses_stream() a real stream uses below. The client sees
@@ -9329,7 +9274,6 @@ def v1_responses():
                     resp.close()
                     continue
                 _record_chat_usage(hop_pid, hop_model, data, est)
-                data = _agentrouter_review_and_fix(hop_pid, hop_model, messages, data, est)
                 msg = ((data.get("choices") or [{}])[0].get("message") or {})
                 synth = json.dumps({"choices": [{"delta": {"content": msg.get("content") or ""}}]}).encode("utf-8")
                 line_iter = iter([b"data: " + synth, b"data: [DONE]"])
@@ -9367,7 +9311,6 @@ def v1_responses():
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est)
-            data = _agentrouter_review_and_fix(hop_pid, hop_model, messages, data, est)
             return jsonify(_chat_to_responses(data, model_label)), 200
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))

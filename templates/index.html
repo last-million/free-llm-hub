@@ -1214,7 +1214,7 @@
       <div class="cx-group-label">Connect</div>
       <button class="cx-nav-item" data-view="sec-connect" data-title="Connect your tools" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg><span>Connect tools</span></button>
       <button class="cx-nav-item" data-view="sec-clis" data-title="Connected tools" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><span>Connected tools</span></button>
-      <button class="cx-nav-item" data-view="sec-subs" data-title="Local subscriptions" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.5 12.5 20 3"/><path d="m16 6 3 3"/></svg><span>Subscriptions</span><span class="nav-new-badge" data-new-key="subs_agentrouter_v1">New updates</span></button>
+      <button class="cx-nav-item" data-view="sec-subs" data-title="Local subscriptions" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.5 12.5 20 3"/><path d="m16 6 3 3"/></svg><span>Subscriptions</span></button>
     </div>
     <div class="cx-group">
       <div class="cx-group-label">Chat</div>
@@ -1224,7 +1224,7 @@
     <div class="cx-group">
       <div class="cx-group-label">Models</div>
       <button class="cx-nav-item" data-view="sec-default" data-title="Orchestrator model" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg><span>Orchestrator</span></button>
-      <button class="cx-nav-item" data-view="sec-providers" data-title="Providers" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg><span>Providers</span><span class="nav-new-badge" data-new-key="providers_agentrouter_v1">New updates</span></button>
+      <button class="cx-nav-item" data-view="sec-providers" data-title="Providers" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg><span>Providers</span><span class="nav-new-badge" data-new-key="providers_puter_connect_fix_v1">New updates</span></button>
     </div>
     <div class="cx-group">
       <div class="cx-group-label">Media</div>
@@ -3137,15 +3137,36 @@
 
   /* ---------- Puter zero-manual connect (browser-side) ----------
      This is puter.js v2's own sign-in contract, replicated instead of loading
-     the whole SDK (verified live 2026-07-31 against https://js.puter.com/v2/):
+     the whole SDK (verified live 2026-07-31 against https://js.puter.com/v2/
+     AND the GUI bundle it drives, https://gui-cdn.puter.com/bundle.min.js):
      open puter.com/action/sign-in?embedded_in_popup=true&msg_id=N in a popup;
      the Puter GUI then postMessages {msg:"puter.token", msg_id:N, token,
      success:true} back to the opener from origin https://puter.com. The user
      logs in on puter.com itself — credentials never touch this hub; we receive
      only the token and push it through the normal provider-keys endpoint
-     (same as a manual paste: dedupe + auto-enable + rediscover). */
+     (same as a manual paste: dedupe + auto-enable + rediscover).
+
+     LOAD-BEARING (the 2026-07-31 "blank popup" bug): before rendering anything,
+     the GUI's initgui() must learn the OPENER'S ORIGIN. It reads
+     document.referrer first — which is ALWAYS EMPTY here, because this hub
+     serves every page with `Referrer-Policy: no-referrer` (app.py:4160). The
+     GUI's documented fallback is to postMessage {msg:"requestOrigin"} to
+     window.opener and wait 5s for a reply whose event .origin it adopts; the
+     real puter.js answers it from a top-level listener with
+     {msg:"originResponse"}. With no reply the GUI throws "No referrer found"
+     and the popup stays BLANK — exactly the reported symptom. So we answer it
+     too, from a listener registered once at load (NOT per-click: the request
+     can arrive before/after any single connect attempt's own listener). */
   var PUTER_GUI_ORIGIN = 'https://puter.com';
   var _puterMsgSeq = 0;
+  /* Mirrors puter.js's own always-on top-level handler. Origin-checked; the
+     reply carries no data beyond the message name — its event .origin IS the
+     answer the GUI wants. */
+  window.addEventListener('message', function(e){
+    if (e.origin !== PUTER_GUI_ORIGIN) return;
+    if (!e.data || e.data.msg !== 'requestOrigin' || !e.source) return;
+    try{ e.source.postMessage({ msg:'originResponse' }, '*'); }catch(err){}
+  });
   function connectPuter(card, p, btn){
     var msgId = ++_puterMsgSeq;
     var popup = window.open(
