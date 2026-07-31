@@ -158,6 +158,35 @@ HTTP client (their WAF only accepts the official Claude Code CLI fingerprint),
 so the direct provider never worked; the relay that worked around it had a probe
 hang for 240s. Do not re-add without new evidence that policy changed.
 
+## Opening-prompt enhancement + "best except trivial" routing
+
+Both added 2026-07-31 at user request; covered by `tests/test_prompt_enhance.py`.
+
+- **Routing**: `medium` now joins `hard` on the strongest-model branch of
+  `_route_by_difficulty`; only `simple` still takes the cheap
+  `_DIFFICULTY_FLOOR` pick. `simple` is one-word replies, classification and the
+  hub's OWN probes, so leaving it cheap costs no quality and keeps strong
+  providers alive for real work.
+- **`_enhance_prompt(text, kind)`** rewrites the OPENING prompt only, and only
+  for prompts typed in the dashboard — `/v1/*` traffic is never touched
+  (rewriting a turn carrying `tool_calls` or a diff breaks the agent loop).
+  `POST /api/enhance-prompt`; switch at `POST /api/prompt-enhance`, flag
+  `prompt_enhance`, default ON.
+- **It routes with `force_difficulty="medium"`, and that is load-bearing.**
+  MEASURED: routed as the `simple` its text classifies as, the rewrite landed on
+  groq/allam-2-7b, which ANSWERED "fix my python bug" ("Please provide the
+  specific bug...") instead of rewriting it — silently replacing the user's
+  question with an assistant reply. `_ENHANCE_ANSWERED_RE` is the second line of
+  defence against the same failure; a hit skips that hop.
+- **The image enhancer clarifies, it does not art-direct.** An earlier version
+  turned "a fox" into "whimsical … warm orange tones, soft diffused lighting".
+  It must never invent style, medium, mood, lighting, palette, camera or
+  setting the user did not state — returning the prompt unchanged is the
+  expected common case. Both system prompts also ban the usual slop
+  ("masterpiece, 8k", "act as a world-class expert").
+- Fail-open everywhere: any error, non-200, empty or runaway output returns the
+  ORIGINAL text, and the UI always shows what was sent with a revert link.
+
 ## Agent skills (.agents/skills/)
 
 Kimi Code scans `.agents/skills/` (directory form `<name>/SKILL.md`). Two
