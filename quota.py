@@ -160,6 +160,19 @@ _RL_REMAINING = ("x-ratelimit-remaining-requests", "x-ratelimit-remaining", "rat
 _RL_LIMIT     = ("x-ratelimit-limit-requests", "x-ratelimit-limit", "ratelimit-limit")
 _RL_RESET     = ("x-ratelimit-reset-requests", "x-ratelimit-reset", "ratelimit-reset", "retry-after")
 
+# TOKEN buckets. A provider can have plenty of REQUESTS left and still refuse every
+# call because its token budget is spent — g4f.space does exactly this:
+#     x-ratelimit-remaining-requests: 94      <- looks perfectly healthy
+#     x-ratelimit-remaining-tokens: -65038    <- the real reason it 429s
+#     "Token limit (500,000 per day) exceeded. Used: 565,038 tokens."
+# Reading only the request bucket made status() report the provider as fine, so the
+# hub un-sidelined it after the ~60s throttle and re-picked it every single request
+# for the next 22 hours, burning a chain hop on a guaranteed 429 each time. Note the
+# remaining count goes NEGATIVE, so this must test `<= 0`, never `== 0`.
+_RL_REMAINING_TOK = ("x-ratelimit-remaining-tokens",)
+_RL_LIMIT_TOK     = ("x-ratelimit-limit-tokens",)
+_RL_RESET_TOK     = ("x-ratelimit-reset-tokens",)
+
 # Consecutive-429 backoff. Fixes "provider quota is spent but the hub keeps calling
 # it every 60s": each recurring 429 within _STRIKE_TTL of the last DOUBLES the short
 # cooldown, so a provider whose window budget is actually spent is retried
@@ -168,6 +181,7 @@ _RL_RESET     = ("x-ratelimit-reset-requests", "x-ratelimit-reset", "ratelimit-r
 # (note_success clears the streak).
 _STRIKE_TTL = 1800.0     # seconds: 429s farther apart than this restart the streak
 _MAX_BACKOFF = 3600.0    # seconds: cap one sideline at 1h (the window reset caps it too)
+_RETRY_AFTER_CAP = 86400.0  # seconds: ceiling on an explicit Retry-After we honour
 
 
 def _limit_for(pid: str) -> dict:
@@ -313,12 +327,32 @@ def observe_headers(pid: str, headers) -> None:
     stays in force). Never raises."""
     if not headers:
         return
-    rem = _parse_int(_hdr(headers, _RL_REMAINING))
-    if rem is None:
-        return
     now = time.time()
+    rem = _parse_int(_hdr(headers, _RL_REMAINING))
+    tok_rem = _parse_int(_hdr(headers, _RL_REMAINING_TOK))
+    if rem is None and tok_rem is None:
+        return
     lim = _parse_int(_hdr(headers, _RL_LIMIT))
     reset_at = _parse_reset(_hdr(headers, _RL_RESET), now)
+
+    # A spent TOKEN bucket means the provider is unusable even with requests left,
+    # so it must win over an optimistic request count. Take the token bucket's OWN
+    # reset when it gave one: a per-minute TPM blip then parks the provider for its
+    # own few seconds instead of for whatever far-off Retry-After the response
+    # carried — which is what keeps this from mis-parking groq/cerebras for hours
+    # on a momentary token spike.
+    if tok_rem is not None and tok_rem <= 0:
+        rem = 0
+        tok_reset = _parse_reset(_hdr(headers, _RL_RESET_TOK), now)
+        if tok_reset:
+            reset_at = tok_reset
+    elif rem is None:
+        # Only a token bucket was sent and it still has room: record the tokens as
+        # the remaining budget rather than dropping the reading entirely.
+        rem = tok_rem
+        lim = _parse_int(_hdr(headers, _RL_LIMIT_TOK)) if lim is None else lim
+        reset_at = reset_at or _parse_reset(_hdr(headers, _RL_RESET_TOK), now)
+
     with _LOCK:
         _DYNAMIC[pid] = {"remaining": max(0, rem), "limit": lim,
                          "reset_at": reset_at, "seen": now}
@@ -444,6 +478,16 @@ def mark_throttled(pid: str, seconds: float = None) -> None:
             st["last_strike"] = now
             backoff = min(seconds * (2 ** (st["strikes"] - 1)), _MAX_BACKOFF)
             until = min(now + backoff, reset)
+            # ...but never BELOW what the provider explicitly asked for. `reset`
+            # comes from our static FREE_LIMITS window, which is a guess and can be
+            # wildly wrong: g4f is listed as a per-MINUTE window while its real
+            # budget is 500k tokens per DAY, so a Retry-After of 81486s (22h38m)
+            # was being clamped to the next :00 boundary — the hub came back 60s
+            # later, 429'd, and repeated that ~1360 times. When upstream names a
+            # number it knows better than our table, so honour it as a FLOOR.
+            # Capped at _RETRY_AFTER_CAP so one absurd header cannot park a
+            # provider for a week.
+            until = max(until, now + min(seconds, _RETRY_AFTER_CAP))
         st["window_start"] = start
         st["throttled_until"] = max(st.get("throttled_until", 0), until)
         _STATE[pid] = st
