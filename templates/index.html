@@ -3023,6 +3023,13 @@
               ? 'Monthly allowance spent — resets next month'
               : esc(p.allowance.remaining_cents + '¢ of ' + p.allowance.allowance_cents +
                     '¢ left this month')) +
+            /* The allowance is per ACCOUNT (Puter's user-pays model), so a pooled
+               key list carries one allowance each — worth stating, since it is
+               the only thing that makes this provider usable for real work. */
+            (p.allowance.accounts > 1
+              ? esc(' · ' + p.allowance.accounts + ' accounts pooled' +
+                    (p.allowance.accounts_spent ? ', ' + p.allowance.accounts_spent + ' spent' : ''))
+              : '') +
           '</div>' +
         '</div>' : '') +
       (p.notes ? notesCardHTML(p.notes) : '') +
