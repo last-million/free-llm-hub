@@ -1801,13 +1801,22 @@ def _dead_state_dump():
         dead_models = {"%s|%s" % (p, m): exp
                        for (p, m), exp in _dead_models.items() if exp > now}
     with _provider_dead_lock:
-        return {
+        out = {
             "dead_models": dead_models,
             "dead_providers": {p: exp for p, exp in _dead_providers.items() if exp > now},
             "provider_authfail": {p: sorted(ms) for p, ms in _provider_authfail.items()},
             "provider_keyfail": sorted(_provider_keyfail),
             "provider_consec_fail": dict(_provider_consec_fail),
         }
+    # Learned context windows ride along. Without this they were in-memory only,
+    # so EVERY restart forgot them and had to re-learn each one by burning a real
+    # 400 -- which is exactly how a Codex session kept losing its best hop and
+    # falling through to a flash-lite. A model's context window is a fixed fact,
+    # so it is safe to remember indefinitely (no TTL).
+    with _model_max_input_lock:
+        out["model_max_input"] = {"%s|%s" % (p, m): v
+                                  for (p, m), v in _MODEL_MAX_INPUT.items()}
+    return out
 
 
 def _dead_state_load(blob):
@@ -1830,6 +1839,12 @@ def _dead_state_load(blob):
         for p, n in (blob.get("provider_consec_fail") or {}).items():
             if isinstance(p, str) and isinstance(n, int):
                 _provider_consec_fail[p] = n
+    with _model_max_input_lock:
+        for key, v in (blob.get("model_max_input") or {}).items():
+            if isinstance(key, str) and "|" in key and isinstance(v, int) and v >= 1000:
+                p, m = key.split("|", 1)
+                cur = _MODEL_MAX_INPUT.get((p, m))
+                _MODEL_MAX_INPUT[(p, m)] = min(cur, v) if cur else v
 
 
 def _init_quota_persistence():
@@ -3841,6 +3856,39 @@ def _sanitize_tool_messages(messages):
     return out
 
 
+def _refit_payload_to_learned_ctx(pid, payload):
+    """A payload recompacted to the window we JUST learned, or None when that
+    would change nothing.
+
+    Called after a 400/413 whose body revealed the model's real context. The
+    request that triggered it was built against an optimistic budget (the
+    provider-wide _PROVIDER_TPM), so it is usually several times too big; this
+    rebuilds it against the authoritative per-model limit. The caller retries
+    at most once, so a second failure falls through to the next hop."""
+    try:
+        msgs = payload.get("messages")
+        if not isinstance(msgs, list) or not msgs:
+            return None
+        budget = _model_ctx_budget(pid, payload.get("model"))
+        if not budget or budget <= 0:
+            return None
+        compacted, did = _compact_to_budget(msgs, payload.get("tools"), budget)
+        if not did:
+            return None                       # already fits; the 400 was something else
+        out = dict(payload)
+        out["messages"] = _sanitize_tool_messages(compacted)
+        # Output tokens count against the same window on most providers, so an
+        # oversized max_tokens can re-trigger the very error we just handled.
+        mt = out.get("max_tokens")
+        cap = max(256, int(budget * 0.12))
+        if isinstance(mt, int) and mt > cap:
+            out["max_tokens"] = cap
+        return out
+    except Exception:                                                # noqa: BLE001
+        _log.debug("[refit] could not recompact for %s", pid, exc_info=True)
+        return None
+
+
 def _model_ctx_budget(pid, model):
     """Best estimate of a model's usable INPUT context: the limit LEARNED from a real
     400 (authoritative) if we have one, else the provider's context-sized _PROVIDER_TPM."""
@@ -3942,6 +3990,7 @@ def _upstream_chat(pid, payload, stream):
     n = len(keys)
     start = _next_key_start(pid, n)
     last_exc = None
+    refit_done = False        # one context re-fit per request, never a loop
     for i in range(n):
         is_last = (i == n - 1)
         key = keys[(start + i) % n]
@@ -3971,6 +4020,39 @@ def _upstream_chat(pid, payload, stream):
             _maybe_mark_missing_model(pid, payload.get("model"), resp)  # gone/renamed id -> sideline
         if resp.status_code == 413:               # 'too large for this model's TPM' -> learn the cap
             _learn_tpm_limit(pid, payload.get("model"), resp)
+            # A 413 is not always about TPM. Cloudflare reports a CONTEXT
+            # overflow with this status too ('exceeded this model context window
+            # limit (32768)'), so the context learner gets a look as well —
+            # otherwise the real window is never recorded and the re-fit below
+            # has nothing smaller to compact to.
+            _learn_context_limit(pid, payload.get("model"), resp)
+        # RE-FIT AND RETRY. Learning the real window only helped the NEXT request;
+        # this one still died and fell through to a weaker model. MEASURED: a
+        # Codex session sent ~100k-token turns to cloudflare/@cf/qwen/qwen3-30b
+        # (real window 32768, but _PROVIDER_TPM claimed 120000), so every request
+        # 400'd on its best hop and was answered by llm7/gemini-3.1-flash-LITE.
+        # Now the freshly-learned limit is applied immediately: recompact to the
+        # REAL window and try the same hop once more, so a big conversation is
+        # served by the strong model instead of being handed to a weak one.
+        if resp.status_code in (400, 413) and not refit_done:
+            refit_done = True                 # at most one re-fit per key attempt
+            refit = _refit_payload_to_learned_ctx(pid, payload)
+            if refit is not None:
+                resp.close()
+                try:
+                    resp = requests.post(
+                        url, json=refit,
+                        headers=({"Content-Type": "application/json"} if key is None else
+                                 {"Authorization": "Bearer " + key,
+                                  "Content-Type": "application/json"}),
+                        stream=stream,
+                        timeout=(CONNECT_TIMEOUT,
+                                 STREAM_IDLE_TIMEOUT if stream else CHAT_READ_TIMEOUT))
+                except requests.RequestException as exc:
+                    last_exc = exc
+                    if is_last:
+                        raise
+                    continue
         if 200 <= resp.status_code < 300:
             quota.note_success(pid)  # provider answered -> clear its 429-backoff streak
             quota.note_model_success(pid, payload.get("model"))  # and THIS model's streak
@@ -4114,7 +4196,11 @@ _SOFT_400_CONTEXT_RE = re.compile(
     # smaller-context providers phrase it differently — all mean "route to a bigger
     # model": 'Max_len exceeded: Input is 16685 tokens but this model only supports 16384'
     r"max_?len exceeded|input is \d+ tokens|only supports \d+|"
-    r"too many (?:input )?tokens|exceeds? the (?:model'?s )?maximum", re.I)
+    r"too many (?:input )?tokens|exceeds? the (?:model'?s )?maximum|"
+    # Cloudflare Workers AI, MEASURED 2026-07-31 (arrives as 413, not 400):
+    # 'The estimated number of input and maximum output tokens (42532) exceeded
+    #  this model context window limit (32768).'
+    r"context window limit", re.I)
 _SOFT_400_TOOL_RE = re.compile(r"thought_signature", re.I)
 # Some providers return a VAGUE 400 ("we could not process your request / please
 # check your input / invalid_request_error") for a request THIS model can't serve
