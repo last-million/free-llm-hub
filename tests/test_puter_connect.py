@@ -217,3 +217,38 @@ def test_all_inline_script_blocks_pass_node_check(html):
         proc = subprocess.run(["node", "--check", str(f)],
                               capture_output=True, text=True, timeout=60)
         assert proc.returncode == 0, "script block %d failed node --check:\n%s" % (i, proc.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# Account identity: a re-connect must REFRESH, not stack a duplicate
+# --------------------------------------------------------------------------- #
+
+def test_same_account_reconnect_replaces_instead_of_stacking(isolated_config, monkeypatch):
+    """MEASURED 2026-07-31: clicking Connect twice with a live puter.com session
+    (a one-click "continue as ...") produced two DIFFERENT tokens for one
+    identical account — same uuid, both at 0c. It looked like a pool of two and
+    was one empty wallet with two cards. Puter mints a fresh token per sign-in,
+    so string-dedupe cannot catch this; identity has to be checked."""
+    import app
+    config.add_provider_key("puter", "token-A")
+    monkeypatch.setattr(app, "_puter_account_uuid", lambda k: "same-uuid")
+    assert app._puter_replace_same_account("token-B") is True
+    assert config.list_provider_keys("puter") == []      # A dropped; B added by the caller
+
+
+def test_a_different_account_is_kept_so_allowances_pool(isolated_config, monkeypatch):
+    import app
+    config.add_provider_key("puter", "token-A")
+    uuids = {"token-A": "uuid-1", "token-B": "uuid-2"}
+    monkeypatch.setattr(app, "_puter_account_uuid", lambda k: uuids.get(k))
+    assert app._puter_replace_same_account("token-B") is False
+    assert config.list_provider_keys("puter") == ["token-A"]
+
+
+def test_unreadable_identity_fails_open(isolated_config, monkeypatch):
+    """A failed whoami must never block a working key."""
+    import app
+    config.add_provider_key("puter", "token-A")
+    monkeypatch.setattr(app, "_puter_account_uuid", lambda k: None)
+    assert app._puter_replace_same_account("token-B") is False
+    assert config.list_provider_keys("puter") == ["token-A"]
