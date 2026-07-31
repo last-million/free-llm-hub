@@ -119,7 +119,10 @@ def test_user_ranking_kimi_k3_then_claude_then_gpt55_then_gemini():
     gpt = app._benchmark_score("puter", "gpt-5.6-sol")
     gemini = app._benchmark_score("puter", "gemini-3-pro")
     assert kimi > claude > gpt > gemini, (kimi, claude, gpt, gemini)
-    assert (kimi, claude, gpt) == (140, 138, 136)
+    # kimi-k3 and claude are flat floors; the GPT floor SCALES with the version
+    # (since 2026-07-31), so it is checked as a band rather than an exact value.
+    assert (kimi, claude) == (140, 138)
+    assert 135 <= gpt < 138
 
 
 def test_gemini_is_ranked_last_by_getting_no_floor_at_all():
@@ -137,17 +140,29 @@ def test_every_claude_id_shape_gets_the_claude_floor():
     assert not app._CLAUDE_FAMILY_RE.search("claude-agentrouter")
 
 
-def test_gpt_55_floor_starts_at_5_5_not_earlier():
-    for mid in ("gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5-pro", "gpt-6"):
-        assert app._benchmark_score("puter", mid) >= app._PREF_FLOORS[6], mid
-    # gpt-5.4 and older are explicitly BELOW the bar and must keep their natural score.
-    assert not app._GPT55_PLUS_RE.search("gpt-5.4")
-    assert app._benchmark_score("puter", "gpt-5.4") < app._PREF_FLOORS[6]
+def test_the_gpt_floor_scales_with_the_version():
+    """"All GPT-5 versions are good, and a higher version means it's better" —
+    two flat tiers could not express that (gpt-5.0 and gpt-5.4 tied), so the
+    floor is computed from the version number itself."""
+    scores = [app._benchmark_score("puter", "gpt-5.%d" % i) for i in range(7)]
+    assert scores == sorted(scores), scores
+    assert scores[0] < scores[-1], "a higher version must actually rank higher"
+    # every GPT-5 outranks GLM 5.2...
+    assert min(scores) > app._benchmark_score("puter", "glm-5.2")
+    # ...and gpt-6 outranks every gpt-5...
+    assert app._benchmark_score("puter", "gpt-6") > max(scores)
+    # ...but nothing in the family may overtake claude, a deliberate ranking.
+    assert app._benchmark_score("puter", "gpt-9.9") < app._benchmark_score("puter", "claude-opus-5")
+    # gpt-4.x is not in the family at all.
+    assert app._benchmark_score("puter", "gpt-4.1") < 100
 
 
 def test_puter_sol_keeps_its_own_floor():
-    assert app._benchmark_score("puter", "gpt-5.6-sol") == app._PREF_FLOORS[2] == 136
-    assert app._benchmark_score("puter", "gpt-5.6-sol-pro") == app._PREF_FLOORS[2]
+    """Its floor now comes from the version-scaled GPT rule, so it is >= the
+    old flat 136 rather than exactly equal to it."""
+    sol = app._benchmark_score("puter", "gpt-5.6-sol")
+    assert sol >= app._PREF_FLOORS[2] == 136
+    assert app._benchmark_score("puter", "gpt-5.6-sol-pro") == sol
 
 
 def test_plain_gpt_4o_does_not_get_the_puter_floor():
@@ -156,8 +171,10 @@ def test_plain_gpt_4o_does_not_get_the_puter_floor():
     gpt4o = app._benchmark_score("puter", "gpt-4o")
     assert gpt4o < min(app._PREF_FLOORS)
     assert gpt4o >= 84  # still Tier A, just not floored
-    # gpt-5.4 is below the user's "5.5 and up" bar, so it stays unfloored.
-    assert app._benchmark_score("puter", "gpt-5.4") < min(app._PREF_FLOORS)
+    # gpt-5.4 IS floored since 2026-07-31 ("all GPT-5 versions are good, and a
+    # higher version means better") — the bar moved from 5.5 down to the whole
+    # GPT-5 family. What must stay unfloored is gpt-4.x.
+    assert app._benchmark_score("puter", "gpt-5.4") > app._benchmark_score("puter", "glm-5.2")
     # gpt-5.6-luna, however, IS 5.5-and-up: since 2026-07-31 it takes the
     # gpt-5.5+ floor by rule rather than needing its own pinned entry.
-    assert app._benchmark_score("puter", "gpt-5.6-luna") == app._PREF_FLOORS[6]
+    assert app._benchmark_score("puter", "gpt-5.6-luna") >= app._PREF_FLOORS[6]

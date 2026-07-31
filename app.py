@@ -649,8 +649,14 @@ def _strong_new_version_score(low):
 # deliberate thumb-on-the-scale values, NOT measured strength, so any code that
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
-#                 hy3  k3   sol  terra k2.6  claude  gpt5.5+  glm5.x
-_PREF_FLOORS = (135, 140, 136, 135, 133,   138,    136,     135)
+#                 hy3  k3   sol  terra k2.6  claude  gpt5.5+  glm5.x  gpt5.x
+_PREF_FLOORS = (135, 140, 136, 135, 133,   138,    136,     134,    135)
+# Index 8 added 2026-07-31: "GPT-5 versions are better than GLM 5.2." Only
+# gpt-5.5-and-up was floored (136), so gpt-5.0 through 5.4 carried NO floor and
+# GLM 5.2 outranked them. The GPT-5 family now sits at 135 and glm-5.x drops to
+# 134, which puts every GPT-5 above it while keeping the rest of the stated
+# order intact: kimi-k3 140 > claude 138 > gpt-5.5+ 136 > gpt-5.0-5.4 / hy3 135
+# > glm-5.x 134 > kimi-k2.6/2.7 133 > gemini (unfloored).
 # Index 5/6 added 2026-07-31. USER RANKING, stated explicitly, best first:
 #   kimi-k3 (140)  >  claude (138)  >  gpt-5.5 and up (136)  >  gemini
 # Gemini deliberately gets NO floor: a floor only ever LIFTS a model, so the way
@@ -663,9 +669,11 @@ _PREF_FLOORS = (135, 140, 136, 135, 133,   138,    136,     135)
 # 'claude-code' style CLI-relay ids (subscription hops, scored elsewhere) and
 # stray substrings don't collect the floor.
 _CLAUDE_FAMILY_RE = re.compile(r"(?:^|[/:_-])claude[-.]?(?:opus|sonnet|haiku|fable|\d)")
-# "gpt-5.5 and up": 5.5-5.9, 6+, and any suffixed variant (-sol, -pro, -mini).
-# gpt-5.4 and older must NOT match, so the minor version is matched explicitly.
-_GPT55_PLUS_RE = re.compile(r"gpt-(?:5\.(?:[5-9])|[6-9]|\d{2,})")
+# Captures the GPT version so the floor can SCALE with it — "all GPT-5 versions
+# are good, and a higher version means it's better", which two flat tiers could
+# not express. gpt-5 -> (5, None), gpt-5.6-sol -> (5, 6), gpt-6.2-codex ->
+# (6, 2). gpt-4.1 matches as (4, 1) and is rejected by the major>=5 check.
+_GPT_VER_RE = re.compile(r"\bgpt-(\d+)(?:\.(\d+))?")
 # GLM 5.x (Zhipu) — glm-5, glm-5.2, zhipu/glm-5.2, THUDM/glm-5. Not glm-4.x.
 _GLM5_RE = re.compile(r"glm-?5(?:\.\d+)?\b")
 # 2026-07-30: the qwen -45 demotion (_PREF_QWEN_DEMOTION) is REMOVED — qwen3 is a
@@ -981,8 +989,20 @@ def _benchmark_score(pid, model_id):
         score = max(score, _PREF_FLOORS[5])
     # "gpt-5.5 and up": 5.5, 5.6 and any later 5.x/6+. Written as a regex so
     # gpt-5.4 and older do NOT qualify and no floor is handed to a weaker id.
-    if _GPT55_PLUS_RE.search(low):
-        score = max(score, _PREF_FLOORS[6])
+    # GPT-5+ scales WITH THE VERSION: "all GPT-5 versions are good, and a higher
+    # version means it's better." Two flat tiers could not express that (gpt-5.0
+    # and gpt-5.4 tied), so the floor is computed from the number itself:
+    #   5.0 -> 135.0   5.2 -> 135.4   5.4 -> 135.8   5.5 -> 136.0   5.6 -> 136.2
+    #   6.0 -> 137.0   6.2 -> 137.4
+    # Capped below claude's 138 so a future version bump can't silently overtake
+    # a ranking the user set deliberately. gpt-4.x never matches.
+    _gm = _GPT_VER_RE.search(low)
+    if _gm:
+        _major = int(_gm.group(1))
+        _minor = int(_gm.group(2) or 0)
+        if _major >= 5:
+            score = max(score, min(135.0 + (_major - 5) * 2 + _minor * 0.2,
+                                   _PREF_FLOORS[5] - 0.5))
     # USER PREFERENCE 2026-07-31: "GLM 5.2 is also good — if available it should
     # be used." Floored level with hy3, i.e. just under the named top three, so
     # a live glm-5.x is reached for ahead of the ordinary field. glm-4.x and the
