@@ -3526,8 +3526,20 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # (difficulty classification, prompt enhancement, health checks) —
         # spending top-tier quota there buys no quality and drains the strong
         # providers before real work reaches them.
-        # (spread keeps variety across turns.)
-        picked = _spread_pick(pool) or max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
+        # ALWAYS-BEST vs SPREAD (user choice 2026-07-31, default always-best).
+        # _spread_pick rotates across the top BAND so consecutive turns land on
+        # different strong providers — one project then draws on many good models
+        # instead of draining the single best one. That trades a little quality
+        # per turn for more total capacity, and it is why the strongest available
+        # model was often NOT the one that answered (measured: glm-5.2 at 135 sat
+        # in the pool while a 121 served the turn).
+        # The user asked repeatedly for the best model every time, so that is the
+        # default; the flag restores the spreading behaviour for anyone who would
+        # rather stretch their quota further.
+        if config.get_flag("route_always_best", True):
+            picked = max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
+        else:
+            picked = _spread_pick(pool) or max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
         _s, pid, model = picked
         return pid, model, difficulty
     floor = _DIFFICULTY_FLOOR[difficulty]
