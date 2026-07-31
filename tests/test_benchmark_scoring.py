@@ -96,20 +96,43 @@ def test_promoted_families_hit_the_top_bands():
 # Id-keyed like the other floors (no provider-id checks in routing).
 # --------------------------------------------------------------------------- #
 
-def test_puter_sol_floor_outranks_hy3_and_kimi_floors():
-    sol = app._benchmark_score("puter", "gpt-5.6-sol")
-    sol_pro = app._benchmark_score("puter", "gpt-5.6-sol-pro")
-    hy3 = app._benchmark_score("testpid", "hy3")
+def test_user_ranking_kimi_k3_then_claude_then_gpt55_then_gemini():
+    """USER RANKING, stated explicitly 2026-07-31 and replacing the earlier
+    puter-sol-first order: kimi-k3 > claude > gpt-5.5-and-up > gemini."""
     kimi = app._benchmark_score("testpid", "kimi-k3")
-    assert sol == app._PREF_FLOORS[2] == 136
-    assert sol_pro == app._PREF_FLOORS[2]
-    assert sol > hy3 > kimi
+    claude = app._benchmark_score("puter", "claude-opus-5")
+    gpt = app._benchmark_score("puter", "gpt-5.6-sol")
+    gemini = app._benchmark_score("puter", "gemini-3-pro")
+    assert kimi > claude > gpt > gemini, (kimi, claude, gpt, gemini)
+    assert (kimi, claude, gpt) == (140, 138, 136)
 
 
-def test_puter_terra_and_55_pro_floor_level_with_hy3():
-    hy3 = app._benchmark_score("testpid", "hy3")
-    for mid in ("gpt-5.6-terra", "gpt-5.6-terra-pro", "gpt-5.5-pro"):
-        assert app._benchmark_score("puter", mid) == app._PREF_FLOORS[3] == hy3, mid
+def test_gemini_is_ranked_last_by_getting_no_floor_at_all():
+    """A floor only ever LIFTS a model, so gemini is ranked last by being left
+    on its natural score — not by inventing a negative floor."""
+    gemini = app._benchmark_score("puter", "gemini-3-pro")
+    assert gemini < min(app._PREF_FLOORS)
+
+
+def test_every_claude_id_shape_gets_the_claude_floor():
+    for mid in ("claude-opus-5", "anthropic/claude-fable-5", "claude-3-7-sonnet",
+                "claude-opus-4-6"):
+        assert app._benchmark_score("puter", mid) == app._PREF_FLOORS[5], mid
+    # ...but a CLI-relay id is a subscription hop, scored elsewhere.
+    assert not app._CLAUDE_FAMILY_RE.search("claude-agentrouter")
+
+
+def test_gpt_55_floor_starts_at_5_5_not_earlier():
+    for mid in ("gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5-pro", "gpt-6"):
+        assert app._benchmark_score("puter", mid) >= app._PREF_FLOORS[6], mid
+    # gpt-5.4 and older are explicitly BELOW the bar and must keep their natural score.
+    assert not app._GPT55_PLUS_RE.search("gpt-5.4")
+    assert app._benchmark_score("puter", "gpt-5.4") < app._PREF_FLOORS[6]
+
+
+def test_puter_sol_keeps_its_own_floor():
+    assert app._benchmark_score("puter", "gpt-5.6-sol") == app._PREF_FLOORS[2] == 136
+    assert app._benchmark_score("puter", "gpt-5.6-sol-pro") == app._PREF_FLOORS[2]
 
 
 def test_plain_gpt_4o_does_not_get_the_puter_floor():
@@ -118,6 +141,8 @@ def test_plain_gpt_4o_does_not_get_the_puter_floor():
     gpt4o = app._benchmark_score("puter", "gpt-4o")
     assert gpt4o < min(app._PREF_FLOORS)
     assert gpt4o >= 84  # still Tier A, just not floored
-    # Other GPT ids outside the pinned classes are unfloored too.
+    # gpt-5.4 is below the user's "5.5 and up" bar, so it stays unfloored.
     assert app._benchmark_score("puter", "gpt-5.4") < min(app._PREF_FLOORS)
-    assert app._benchmark_score("puter", "gpt-5.6-luna") < min(app._PREF_FLOORS)
+    # gpt-5.6-luna, however, IS 5.5-and-up: since 2026-07-31 it takes the
+    # gpt-5.5+ floor by rule rather than needing its own pinned entry.
+    assert app._benchmark_score("puter", "gpt-5.6-luna") == app._PREF_FLOORS[6]

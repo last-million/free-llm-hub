@@ -27,6 +27,7 @@ import copy
 import ipaddress
 import json
 import math
+import mimetypes
 import os
 import random
 import re
@@ -63,6 +64,12 @@ import traceback as _traceback
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _log = logging.getLogger("free-llm-hub")
+
+# Windows' registry has no .webp entry, so Flask served the logo/favicon as
+# application/octet-stream -- and because we also send X-Content-Type-Options:
+# nosniff (see _security_headers), the browser REFUSES to render an image with
+# that type. Register it before the app is created.
+mimetypes.add_type("image/webp", ".webp")
 
 app = Flask(__name__)
 # Bound JSON/image requests before Flask buffers them. Eight 1 MiB images plus
@@ -570,7 +577,23 @@ def _strong_new_version_score(low):
 # deliberate thumb-on-the-scale values, NOT measured strength, so any code that
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
-_PREF_FLOORS = (135, 134, 136, 135, 133)
+#                 hy3  k3   sol  terra k2.6  claude  gpt5.5+
+_PREF_FLOORS = (135, 140, 136, 135, 133,   138,    136)
+# Index 5/6 added 2026-07-31. USER RANKING, stated explicitly, best first:
+#   kimi-k3 (140)  >  claude (138)  >  gpt-5.5 and up (136)  >  gemini
+# Gemini deliberately gets NO floor: a floor only ever LIFTS a model, so the way
+# to rank gemini last is to leave it on its natural score while the three above
+# it are floored. hy3 (135) keeps the floor the user gave it earlier, now
+# sitting just under the newly-named three rather than above them.
+
+# Any provider's id shape for a real Claude model: 'claude-opus-5',
+# 'anthropic/claude-fable-5', 'claude-3-7-sonnet'. Anchored on the word so
+# 'claude-code' style CLI-relay ids (subscription hops, scored elsewhere) and
+# stray substrings don't collect the floor.
+_CLAUDE_FAMILY_RE = re.compile(r"(?:^|[/:_-])claude[-.]?(?:opus|sonnet|haiku|fable|\d)")
+# "gpt-5.5 and up": 5.5-5.9, 6+, and any suffixed variant (-sol, -pro, -mini).
+# gpt-5.4 and older must NOT match, so the minor version is matched explicitly.
+_GPT55_PLUS_RE = re.compile(r"gpt-(?:5\.(?:[5-9])|[6-9]|\d{2,})")
 # 2026-07-30: the qwen -45 demotion (_PREF_QWEN_DEMOTION) is REMOVED — qwen3 is a
 # strong family again and ranks with the top tier via Tier A + _STRONG_ROOTS.
 
@@ -875,6 +898,17 @@ def _benchmark_score(pid, model_id):
         score = max(score, _PREF_FLOORS[2])
     if "gpt-5.6-terra" in low or "gpt-5.5-pro" in low:
         score = max(score, _PREF_FLOORS[3])
+    # USER RANKING 2026-07-31: claude > gpt-5.5+ > gemini, with kimi-k3 above all
+    # three (its floor is set above). Matches every provider id shape a Claude
+    # model arrives as -- 'claude-opus-5', 'anthropic/claude-fable-5',
+    # 'claude-3-7-sonnet' -- but NOT the hub's own 'claude' CLI relay ids, which
+    # are subscription hops scored elsewhere.
+    if _CLAUDE_FAMILY_RE.search(low):
+        score = max(score, _PREF_FLOORS[5])
+    # "gpt-5.5 and up": 5.5, 5.6 and any later 5.x/6+. Written as a regex so
+    # gpt-5.4 and older do NOT qualify and no floor is handed to a weaker id.
+    if _GPT55_PLUS_RE.search(low):
+        score = max(score, _PREF_FLOORS[6])
     # 2026-07-30: the 2026-07-25 qwen -45 demotion is REMOVED — qwen3 is a strong
     # family per the user and ranks with the top tier (Tier A + _STRONG_ROOTS).
     if (("mistral" in low or "mixtral" in low or "ministral" in low)

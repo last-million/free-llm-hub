@@ -4,6 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Calvoun Free LLM Hub — Local Gateway</title>
+<!-- Favicon: WebP for every current browser, PNG for Safari/iOS, which still
+     refuses a WebP icon. 32px is the tab, 180px the home-screen/bookmark tile. -->
+<link rel="icon" type="image/webp" sizes="32x32" href="/static/favicon-32.webp">
+<link rel="icon" type="image/webp" sizes="180x180" href="/static/favicon-180.webp">
+<link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
+<meta name="theme-color" content="#0C0F14">
 <script nonce="{{ csp_nonce }}">try{if(localStorage.getItem('flh.theme')==='dark')document.documentElement.removeAttribute('data-theme')}catch(e){}</script>
 <style nonce="{{ csp_nonce }}">
   /* ==========================================================================
@@ -1194,6 +1200,10 @@
     font-weight:700; letter-spacing:-.01em; color:var(--text);
     position:sticky; top:0; z-index:1;
     background:var(--surface); border-bottom:1px solid var(--border-soft); }
+  /* Real logo: fixed box + explicit width/height so it reserves its space and
+     can't shift the sidebar while loading (CLS). */
+  .cx-brand .cx-mark-img{ width:30px; height:30px; flex:none; border-radius:8px;
+    object-fit:contain; display:block; }
   .cx-brand .cx-mark{ width:30px; height:30px; border-radius:8px; display:grid; place-items:center;
     background:var(--accent); color:var(--on-accent); flex:none; }
   .cx-brand small{ display:block; font-size:10.5px; font-weight:500; color:var(--text-faint); letter-spacing:.02em; }
@@ -1313,7 +1323,8 @@
 </button>
 <aside class="cx-sidebar" id="cx-sidebar" aria-label="Dashboard navigation">
   <div class="cx-brand">
-    <span class="cx-mark" aria-hidden="true"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 11-13h-7l1-7z"/></svg></span>
+    <img class="cx-mark-img" src="/static/calvoun-logo.webp" width="30" height="30"
+         alt="Calvoun logo: a white owl whose outstretched wings are formed from the letters of the word CALVOUN, with a cyan beak, on a purple rounded square." decoding="async">
     <span>Calvoun Hub<small>local gateway &middot; 127.0.0.1</small></span>
   </div>
   <nav class="cx-nav" id="cx-nav">
@@ -1334,11 +1345,6 @@
       <button class="cx-nav-item" data-view="sec-image-providers" data-title="Image providers" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><circle cx="6" cy="17.5" r="1"/><path d="m14 15 4 4 4-4M18 19v-6"/></svg><span>Image providers</span></button>
       <button class="cx-nav-item" data-view="sec-subs" data-title="Local subscriptions" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.5 12.5 20 3"/><path d="m16 6 3 3"/></svg><span>Subscriptions</span></button>
       <button class="cx-nav-item" data-view="sec-default" data-title="Orchestrator model" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg><span>Routing</span></button>
-    </div>
-    <div class="cx-group">
-      <div class="cx-group-label">Your tools</div>
-      <button class="cx-nav-item" data-view="sec-connect" data-title="Connect your tools" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg><span>Add a tool</span></button>
-      <button class="cx-nav-item" data-view="sec-clis" data-title="Connected tools" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><span>My tools</span></button>
     </div>
     <div class="cx-group">
       <div class="cx-group-label">Insights</div>
@@ -1475,33 +1481,32 @@
            Fed by renderClis()'s existing /api/clis response - no second fetch,
            and no duplicated ids (this is a read-only summary; every action
            still lives on the full pages, one click away). -->
+      <!-- MERGED 2026-07-31: "Connect your tools" and "Connected tools" were
+           separate pages. Everything about the tools on this machine now lives
+           here, next to the hub switch that governs them - one page answers
+           "is the hub on, what is pointed at it, how do I point something new".
+           The markup is MOVED, not copied: the ids (#cli-list, #snippet-claude,
+           #snippet-openai) and every handler that drives them are unchanged, so
+           auto-detection, Connect/Disconnect, Test and Setup details all keep
+           working exactly as before. -->
       <div class="lc-tools" id="lifecycle-tools">
         <div class="lc-tools-h">
           <span class="lc-tools-t">Your tools</span>
           <span class="lc-tools-count" id="lc-tools-count"></span>
         </div>
-        <div class="lc-tool-pills" id="lc-tool-pills"><span class="skel skel-line"></span></div>
-        <div class="lc-endpoint">
-          <span class="lc-endpoint-lbl">Point any tool here</span>
-          <code id="lc-endpoint-url">loading&hellip;</code>
-          <button class="btn sm ghost" id="lc-endpoint-copy" type="button">Copy</button>
-        </div>
-        <div class="lc-tools-actions">
-          <button class="btn sm" type="button" data-jump="sec-clis">Manage my tools</button>
-          <button class="btn sm ghost" type="button" data-jump="sec-connect">Add a tool</button>
-        </div>
+        <p class="cli-help">Detected automatically on this machine. One-click <b>Connect</b> points a CLI at the hub (free models); <b>Disconnect</b> restores its normal setup. Expand <b>Setup details</b> for manual, cross-platform commands.</p>
+        <div class="cli-list" id="cli-list" aria-live="polite">
+        <div class="skel skel-row"></div>
+        <div class="skel skel-row"></div>
+        <div class="skel skel-row"></div>
       </div>
-    </div>
-  </section>
-
-  <!-- Connect -->
-  <section class="section" aria-labelledby="h-connect">
-    <div class="section-h">
-      <h2 id="h-connect" tabindex="-1">Connect your tools</h2>
-      <span class="sub">point any CLI at this gateway — it routes to your free providers</span>
-    </div>
-    <div class="section-body" id="sec-connect">
-    <div class="connect">
+      </div>
+      <div class="lc-tools" id="lifecycle-connect">
+        <div class="lc-tools-h">
+          <span class="lc-tools-t">Add a tool</span>
+          <span class="lc-tools-count">point any CLI at this gateway &mdash; it routes to your free providers</span>
+        </div>
+        <div class="connect">
       <div class="snippet">
         <div class="snippet-h">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
@@ -1521,25 +1526,15 @@
         <div class="hint">Works with aider, opencode, llm, continue &mdash; anything OpenAI-compatible.</div>
       </div>
     </div>
-    </div>
-  </section>
-
-  <!-- Connected tools — the primary surface: the only section expanded by default -->
-  <section class="section" aria-labelledby="h-clis">
-    <div class="section-h">
-      <h2 id="h-clis" tabindex="-1">Connected tools</h2>
-      <span class="sub">local AI CLIs detected on this machine &mdash; auto-fix or set them up by hand</span>
-      <span class="sec-chip" id="chip-clis" hidden></span>
-    </div>
-    <div class="section-body" id="sec-clis">
-      <p class="cli-help">One-click <b>Connect</b> points a CLI at the hub (free models); <b>Disconnect</b> restores its normal setup. Expand <b>Setup details</b> for manual, cross-platform commands.</p>
-      <div class="cli-list" id="cli-list" aria-live="polite">
-        <div class="skel skel-row"></div>
-        <div class="skel skel-row"></div>
-        <div class="skel skel-row"></div>
       </div>
     </div>
   </section>
+
+  <!-- Connect -->
+  
+
+  <!-- Connected tools — the primary surface: the only section expanded by default -->
+  
 
   <!-- Local subscription providers (paid, opt-in last-resort tier) -->
   <section class="section" aria-labelledby="h-subs">
@@ -4245,59 +4240,15 @@
     'kimi': 'https://github.com/MoonshotAI/kimi-code'
   };
 
-  /* Mirrors "My tools" + "Add a tool" into Hub controls as a read-only summary:
-     which CLIs are installed, which are actually pointed at this hub, and the
-     endpoint to point a new one at. Every ACTION stays on the full pages (one
-     click away via data-jump) so there is exactly one implementation of each
-     and no duplicated element ids to collide. */
+  /* The merged page shows the REAL cli cards, so this only maintains the
+     one-line count above them. The pills/endpoint/jump summary that lived here
+     is gone with the pages it used to link to. */
   function renderLifecycleTools(installed, missing, connectedCount){
-    var pills = $('#lc-tool-pills'); if (!pills) return;
-    var count = $('#lc-tools-count');
-    if (count){
-      count.textContent = installed.length
-        ? connectedCount + ' of ' + installed.length + ' connected to this hub'
-        : 'none detected on this machine';
-    }
-    pills.innerHTML = '';
-    if (!installed.length){
-      var none = document.createElement('span');
-      none.className = 'lc-pill off-list';
-      none.textContent = 'No supported AI CLIs detected';
-      pills.appendChild(none);
-    }
-    installed.forEach(function(c){
-      var el = document.createElement('span');
-      el.className = 'lc-pill' + (c.connected ? ' on' : '');
-      el.innerHTML = '<span class="dot" aria-hidden="true"></span>' +
-                     '<span>' + esc(c.name || c.id) + '</span>' +
-                     '<span class="st">' + (c.connected ? 'connected' : 'not connected') + '</span>';
-      pills.appendChild(el);
-    });
-    if (missing && missing.length){
-      var more = document.createElement('span');
-      more.className = 'lc-pill off-list';
-      more.textContent = '+' + missing.length + ' not installed';
-      more.title = missing.map(function(c){ return c.name || c.id; }).join(', ');
-      pills.appendChild(more);
-    }
-    var url = $('#lc-endpoint-url');
-    if (url) url.textContent = location.origin + '/v1';
-  }
-
-  function initLifecycleTools(){
-    var host = $('#lifecycle-tools'); if (!host) return;
-    host.addEventListener('click', function(e){
-      var jump = e.target.closest('[data-jump]');
-      if (jump){
-        var nav = document.querySelector('.cx-nav-item[data-view="' + jump.dataset.jump + '"]');
-        if (nav) nav.click();
-        return;
-      }
-      var copyBtn = e.target.closest('#lc-endpoint-copy');
-      if (copyBtn){
-        copyText((($('#lc-endpoint-url') || {}).textContent || ''), copyBtn);
-      }
-    });
+    var count = $('#lc-tools-count'); if (!count) return;
+    count.textContent = installed.length
+      ? connectedCount + ' of ' + installed.length + ' connected to this hub'
+        + (missing && missing.length ? ' · ' + missing.length + ' more not installed' : '')
+      : 'no supported AI CLIs detected on this machine';
   }
 
   function loadClis(){
@@ -6042,7 +5993,6 @@
   initVisionGap();
   initTestVerification();
   initPromptEnhance();
-  initLifecycleTools();
   initSocialWebSearch();
   initThemeToggle();
   initSettingsDrawer();
@@ -6085,7 +6035,9 @@
   function pollActivity(){ if (hubOffline) return; if (panelIdle($('#activity-list'))) loadActivity(); }
   function pollTracking(){ if (hubOffline) return; if (panelIdle($('#track-list'))) loadTracking(); }
   var VIEW_REFRESH = {
-    'sec-lifecycle': function(){ loadStatus(true); loadLifecycle(true); },
+    /* also refreshes what the merged 'Connect'/'Connected tools' pages
+       used to own: the CLI list and the connection snippets. */
+    'sec-lifecycle': function(){ loadStatus(true); loadLifecycle(true); loadClis(); },
     'sec-subs': function(){ loadSubscriptions(true); },
     'sec-agent': function(){ loadAgentSettings(true); },
     'sec-images': function(){ loadImages(true); },
