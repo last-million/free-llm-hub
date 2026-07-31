@@ -28,3 +28,6 @@ graphify-out/
 
 # Playwright MCP scratch output (screenshots, console logs)
 .playwright-mcp/
+
+# stray screenshots dropped in the repo root during debugging
+image*.png
