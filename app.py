@@ -56,6 +56,7 @@ import config
 import image_history
 import providers as prov
 import quota
+import swarm
 import usage_history
 import vision_status
 
@@ -577,8 +578,8 @@ def _strong_new_version_score(low):
 # deliberate thumb-on-the-scale values, NOT measured strength, so any code that
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
-#                 hy3  k3   sol  terra k2.6  claude  gpt5.5+
-_PREF_FLOORS = (135, 140, 136, 135, 133,   138,    136)
+#                 hy3  k3   sol  terra k2.6  claude  gpt5.5+  glm5.x
+_PREF_FLOORS = (135, 140, 136, 135, 133,   138,    136,     135)
 # Index 5/6 added 2026-07-31. USER RANKING, stated explicitly, best first:
 #   kimi-k3 (140)  >  claude (138)  >  gpt-5.5 and up (136)  >  gemini
 # Gemini deliberately gets NO floor: a floor only ever LIFTS a model, so the way
@@ -594,6 +595,8 @@ _CLAUDE_FAMILY_RE = re.compile(r"(?:^|[/:_-])claude[-.]?(?:opus|sonnet|haiku|fab
 # "gpt-5.5 and up": 5.5-5.9, 6+, and any suffixed variant (-sol, -pro, -mini).
 # gpt-5.4 and older must NOT match, so the minor version is matched explicitly.
 _GPT55_PLUS_RE = re.compile(r"gpt-(?:5\.(?:[5-9])|[6-9]|\d{2,})")
+# GLM 5.x (Zhipu) — glm-5, glm-5.2, zhipu/glm-5.2, THUDM/glm-5. Not glm-4.x.
+_GLM5_RE = re.compile(r"glm-?5(?:\.\d+)?\b")
 # 2026-07-30: the qwen -45 demotion (_PREF_QWEN_DEMOTION) is REMOVED — qwen3 is a
 # strong family again and ranks with the top tier via Tier A + _STRONG_ROOTS.
 
@@ -909,6 +912,12 @@ def _benchmark_score(pid, model_id):
     # gpt-5.4 and older do NOT qualify and no floor is handed to a weaker id.
     if _GPT55_PLUS_RE.search(low):
         score = max(score, _PREF_FLOORS[6])
+    # USER PREFERENCE 2026-07-31: "GLM 5.2 is also good — if available it should
+    # be used." Floored level with hy3, i.e. just under the named top three, so
+    # a live glm-5.x is reached for ahead of the ordinary field. glm-4.x and the
+    # -flash/-air variants are NOT included (the speed cap below still applies).
+    if _GLM5_RE.search(low):
+        score = max(score, _PREF_FLOORS[7])
     # 2026-07-30: the 2026-07-25 qwen -45 demotion is REMOVED — qwen3 is a strong
     # family per the user and ranks with the top tier (Tier A + _STRONG_ROOTS).
     if (("mistral" in low or "mixtral" in low or "ministral" in low)
@@ -9133,6 +9142,106 @@ def _with_headers(resp_tuple, headers):
         return resp_tuple
 
 
+# --------------------------------------------------------------------------- #
+# SWARM — the "several strong models build it together" virtual model.
+# Selected explicitly (model: "swarm"); see swarm.py for why it is not automatic.
+# --------------------------------------------------------------------------- #
+_SWARM_IDS = ("swarm", "team", "plan")
+
+
+def _is_swarm_model(model):
+    m = (model or "").strip().lower()
+    return m in _SWARM_IDS or m.startswith("swarm/")
+
+
+def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
+    """One stage of the pipeline, routed and executed through the SAME chain
+    every other request uses (so fallback, key rotation, quota accounting and
+    the activity trail all behave identically). Returns (text, 'pid/model');
+    never raises — an empty text tells swarm.py that stage failed."""
+    try:
+        est = _est_tokens(messages)
+        # force_difficulty="hard": every swarm stage is creation work and must
+        # take the strongest model, whatever the text alone would classify as.
+        pid, model, _d = _route_by_difficulty(messages, max_tokens, est,
+                                              require_tools=False,
+                                              force_difficulty="hard")
+        if not pid:
+            return "", None
+        for hop_pid, hop_model in _build_chain(pid, model, est):
+            if exclude_pids and hop_pid in exclude_pids:
+                continue     # reviewer must not be the provider that wrote it
+            payload = {"model": hop_model, "stream": False,
+                       "max_tokens": max_tokens, "messages": messages}
+            try:
+                resp = _dispatch_chat(hop_pid, payload, False)
+            except (requests.RequestException, RuntimeError):
+                continue
+            try:
+                if resp.status_code != 200:
+                    continue
+                data = resp.json() or {}
+            except ValueError:
+                continue
+            finally:
+                try:
+                    resp.close()
+                except Exception:                                # noqa: BLE001
+                    pass
+            text = (((data.get("choices") or [{}])[0].get("message") or {})
+                    .get("content") or "").strip()
+            if text:
+                _act_pick(hop_pid, hop_model)
+                return text, "%s/%s" % (hop_pid, hop_model)
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[swarm] stage failed", exc_info=True)
+    return "", None
+
+
+def _swarm_completion(body):
+    """Run the swarm and return ONE ordinary chat-completions response."""
+    if body.get("tools"):
+        return _openai_error(
+            "The 'swarm' model runs a multi-phase pipeline and cannot serve "
+            "tool-calling turns — your agent already has its own loop. Use "
+            "'auto' for tool calls, and 'swarm' for creation work.", 400)
+    messages = body.get("messages") or []
+    if not messages:
+        return _openai_error("messages is required.", 400)
+    result = swarm.run(messages, _swarm_dispatch)
+    text = swarm.format_answer(result)
+    if not text:
+        return _openai_error(
+            "Every model in the swarm failed — no provider answered. Check the "
+            "Providers page.", 503)
+    out = {
+        "id": "chatcmpl-swarm-" + uuid.uuid4().hex,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "swarm",
+        "choices": [{"index": 0, "finish_reason": "stop",
+                     "message": {"role": "assistant", "content": text}}],
+    }
+    if body.get("stream"):
+        # A pipeline cannot stream token-by-token; emit the finished answer as
+        # one chunk rather than refusing the request (same trade-off the sub-*
+        # relay hops already make).
+        def _one_shot():
+            chunk = {"id": out["id"], "object": "chat.completion.chunk",
+                     "created": out["created"], "model": "swarm",
+                     "choices": [{"index": 0, "delta": {"role": "assistant",
+                                                        "content": text},
+                                  "finish_reason": None}]}
+            yield "data: %s\n\n" % json.dumps(chunk)
+            done = {"id": out["id"], "object": "chat.completion.chunk",
+                    "created": out["created"], "model": "swarm",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            yield "data: %s\n\n" % json.dumps(done)
+            yield "data: [DONE]\n\n"
+        return Response(_one_shot(), mimetype="text/event-stream")
+    return jsonify(out)
+
+
 @app.route("/v1/chat/completions", methods=["POST"])
 def v1_chat_completions():
     body = request.get_json(force=True, silent=True)
@@ -9143,6 +9252,12 @@ def v1_chat_completions():
     except ValueError as exc:
         return _openai_error(str(exc), 400)
     has_images = image_count > 0
+    # SWARM: an explicitly-selected virtual model, never an automatic mode — a
+    # multi-pass pipeline applied behind a client's back would corrupt the agent
+    # loops Codex/Claude Code run (see swarm.py's header). Tool-carrying turns
+    # are refused outright for the same reason.
+    if _is_swarm_model(body.get("model")):
+        return _swarm_completion(body)
     # Orchestrate (Auto): route by task difficulty AND request size so weak/small
     # providers take easy work and big requests avoid small-TPM providers (413).
     # Explicit '<pid>/<model>' bypasses model choice (chain still size-filters).
