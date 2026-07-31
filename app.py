@@ -5226,6 +5226,21 @@ def api_test_provider(pid):
         if m and m not in seen and prov.is_model_allowed(m):
             seen.add(m)
             candidates.append(m)
+    # A provider with NO free models still has a key worth testing. Puter is the
+    # live case: it is metered (~25c/month per account), so it deliberately
+    # declares zero free models — which left Test with nothing to probe and made
+    # it report "Key authenticates (0 free models listed) but no allowed model to
+    # verify generation with" for a key that works perfectly. The question Test
+    # answers is "does this key work", not "is this model free", so fall back to
+    # the provider's own catalog. Capped at a few ids: on a metered provider each
+    # attempt spends real allowance.
+    metered_probe = False
+    if not candidates:
+        for m in (_provider_paid_models(pid) or [])[:3]:
+            if m and m not in seen and prov.is_model_allowed(m):
+                seen.add(m)
+                candidates.append(m)
+        metered_probe = bool(candidates)
     if not candidates:
         if models_list_note:
             return _finish(False, "Key authenticates (%s) but no allowed model to verify "
@@ -5252,9 +5267,16 @@ def api_test_provider(pid):
                 break
             if resp.status_code == 200:
                 attempted.append((model, True))
+                # Don't claim "FREE" when the probe ran on a metered catalog id —
+                # that would be the one thing a user reading this most needs to
+                # be true.
                 return _finish(True,
-                               "Key OK — verified FREE generation works "
-                               "(1-token chat succeeded on %s)." % model,
+                               ("Key OK — verified generation works (1-token chat "
+                                "succeeded on %s). This provider has no free tier, "
+                                "so the probe spent a little of its allowance."
+                                if metered_probe else
+                                "Key OK — verified FREE generation works "
+                                "(1-token chat succeeded on %s).") % model,
                                (sample_models[:5] or [model]))
             if resp.status_code in _TRANSIENT and attempt == 0:
                 time.sleep(2)
