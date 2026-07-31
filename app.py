@@ -3895,6 +3895,13 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
 # which is exactly the situation when several Puter accounts are pooled (each
 # account carries its own allowance; see _puter_allowance).
 _KEY_ROTATE_STATUSES = (401, 402, 403, 429)
+
+# A hop failure that is worth waiting out rather than giving up on. Used to
+# decide whether an exhausted chain should back off and retry once (see the
+# transient-storm retry in the responses path).
+_TRANSIENT_ERR_RE = re.compile(r"HTTP (?:429|500|502|503|504)|timeout|timed out", re.I)
+_CHAIN_RETRY_DELAY = 6.0   # seconds; the free relays meter per MINUTE
+
 _provider_key_cursor = {}          # pid -> next round-robin start offset
 _key_cursor_lock = threading.Lock()
 
@@ -10596,7 +10603,7 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
 
 
 @app.route("/v1/responses", methods=["POST"])
-def v1_responses():
+def v1_responses(_retry_pass=False):
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return _openai_error("Invalid JSON body.", 400)
@@ -10787,6 +10794,22 @@ def v1_responses():
     # SSE stream carrying an error.
     # Chain exhausted. Tell the client HOW LONG until a model frees (Retry-After) so
     # its SDK waits out a short throttle and auto-continues once capacity returns.
+    # TRANSIENT-STORM RETRY. An agentic CLI fires many requests in quick
+    # succession, and the free relays are metered PER MINUTE (g4f ~5/min,
+    # llm7 20/min). A burst therefore 429s every hop in the chain at once and
+    # Codex receives a hard 503 — which reads to the user as "it ignored me and
+    # stopped", when the window would have refilled seconds later. MEASURED:
+    # three Codex turns 503'd with every hop 429, while the same providers all
+    # read healthy moments afterwards.
+    # So when EVERY failure was transient, wait once and run the chain again.
+    # Bounded to a single retry, and only when nothing hard failed — a real 400
+    # or 404 still surfaces immediately, because retrying that just wastes time.
+    if (not last_hard and errors and not _retry_pass
+            and all(_TRANSIENT_ERR_RE.search(e or "") for e in errors)):
+        _log.info("[chain] all %d hops transient (429/5xx) — backing off %.1fs and retrying",
+                  len(errors), _CHAIN_RETRY_DELAY)
+        time.sleep(_CHAIN_RETRY_DELAY)
+        return v1_responses(_retry_pass=True)
     eta = _capacity_eta()
     # DIAG (temporary): the access log only shows "503" — record WHY the responses
     # chain (Codex's path) exhausted so the real root cause is visible, not guessed.
