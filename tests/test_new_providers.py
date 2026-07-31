@@ -267,7 +267,12 @@ def test_puter_registered_with_required_fields():
     assert p["signup_url"] == "https://puter.com"
     assert p.get("key_hint")
     assert p["free_filter"] in prov.FREE_FILTERS
-    assert isinstance(p["default_free_models"], list) and p["default_free_models"]
+    # NOT a free tier: ~25 US cents PER MONTH, measured from Puter's own
+    # /metering/usage. A populated default_free_models would be returned as
+    # "free models" regardless of free_filter and put puter back into free
+    # auto-rotation, where it runs dry in a few dozen calls and then 402s.
+    assert p["paid"] is True and p["trial"] is True
+    assert p["default_free_models"] == []
     assert prov.is_known_provider("puter")
 
 
@@ -277,16 +282,21 @@ def test_puter_is_byok_not_no_key():
     assert not prov.get_provider("puter").get("static_key")
 
 
-def test_puter_all_filter_accepts_ordinary_ids():
-    # 'all' is honest here: the single user-pays account covers the whole
-    # catalog, so there is no separately-billed tier to leak.
-    assert prov.get_provider("puter")["free_filter"] == "all"
-    for mid in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5-pro", "gpt-4.1",
-                "claude-opus-5", "gemini-3.1-pro", "deepseek-v4"):
-        assert prov.is_free_model("puter", mid), mid
-    assert not prov.is_free_model("puter", None)
-    assert not prov.is_free_model("puter", "")
-    assert not prov.is_free_model("puter", "gpt-5.6-sol", is_free_tier=False)
+def test_puter_models_are_paid_class_not_free():
+    """Puter is a metered account with a ~25c/month credit, so nothing it serves
+    counts as free — it is reachable by an explicit pin or by switching auto
+    routing to 'mix', never as part of the free fleet."""
+    for mid in ("gpt-5.6-sol", "gpt-4.1", "claude-opus-5", "gemini-3.1-pro"):
+        assert not prov.is_free_model("puter", mid), mid
+
+
+def test_puter_contributes_nothing_to_free_auto_routing():
+    """The invariant that matters, and the only one that holds without a
+    network call: puter adds NOTHING to the free fleet. (Its paid catalog is
+    discovered live, so counting it here would just test connectivity.)"""
+    import app
+    assert app._auto_models("puter") == []
+    assert prov.get_provider("puter")["paid"] is True
 
 
 def test_puter_pinned_defaults_pass_their_own_free_check():
