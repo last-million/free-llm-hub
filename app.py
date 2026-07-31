@@ -649,8 +649,20 @@ def _strong_new_version_score(low):
 # deliberate thumb-on-the-scale values, NOT measured strength, so any code that
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
-#                 hy3  k3   sol  terra k2.6  claude  gpt5.5+  glm5.x  gpt5.x
-_PREF_FLOORS = (135, 140, 136, 135, 133,   138,    136,     134,    135)
+#                 hy3    k3     sol  terra k2.6  claude gpt5.5+ glm5.x gpt5.x
+_PREF_FLOORS = (134.5, 134.8, 136, 135, 0,    138,   136,    134,   135)
+# kimi-k2.6/k2.7 are CAPPED, not floored: the user ranks them below qwen3.5/
+# 3.6 (108-109) and below mimo-2.5 (100), so the ceiling sits just under mimo.
+_KIMI_K2_CEILING = 98
+
+# REVISED 2026-07-31 (2nd pass, user correction):
+#   "kimi k3 is the best one AFTER gpt models from 5 up and claude models"
+#     -> k3 moves from 140 (above everything) to 134.8: under every gpt-5.x
+#        (135+) and under claude (138), but still above hy3/glm and the field.
+#   "kimi 2.7 is NOT better than qwen 3.5/3.6 or even mimo 2.5"
+#     -> the k2.6/k2.7 floor is REMOVED (index 4 = 0, i.e. no lift). It was
+#        133, which ranked it above qwen3.6 (109) and mimo (100). A demotion
+#        below mimo is applied at the bottom of _benchmark_score instead.
 # Index 8 added 2026-07-31: "GPT-5 versions are better than GLM 5.2." Only
 # gpt-5.5-and-up was floored (136), so gpt-5.0 through 5.4 carried NO floor and
 # GLM 5.2 outranked them. The GPT-5 family now sits at 135 and glm-5.x drops to
@@ -962,14 +974,17 @@ def _benchmark_score(pid, model_id):
     # kimi-k3 id (nothing lists it yet). Matches kimi-k3 / kimi-k3.x / .../kimi-k3.
     if "kimi-k3" in low or "kimik3" in low:
         score = max(score, _PREF_FLOORS[1])
-    # USER PREFERENCE: Kimi K2.6/K2.7 (Moonshot's CURRENTLY SERVED generation —
-    # kimi-k2.6, kimi-k2.7-code) — floored one point under K3 so the live kimi
-    # ids lead the top band the same way K3 will once a provider lists it.
+    # USER CORRECTION 2026-07-31: "kimi 2.7 is not better than qwen 3.5 or 3.6,
+    # or even mimo 2.5." It used to be FLOORED at 133, which ranked it above
+    # qwen3.6 (109) and mimo (100) and made it win turns it should not have.
+    # The floor is gone; a demotion puts it just under mimo instead, so it stays
+    # a usable fallback without ever outranking those three. K3 is unaffected —
+    # it is a different generation and keeps its own floor above.
     # Substring match covers every provider id shape: plain 'kimi-k2.6',
     # cloudflare '@cf/moonshotai/kimi-k2.7-code', g4f-nvidia 'moonshotai/kimi-k2.6'.
     if ("kimi-k2.6" in low or "kimi-k2.7" in low
             or "kimik2.6" in low or "kimik2.7" in low):
-        score = max(score, _PREF_FLOORS[4])
+        score = min(score, _KIMI_K2_CEILING)
     # USER PREFERENCE: Puter's newest GPT flagship — the gpt-5.6-sol(-pro)
     # class — ranks FIRST among equals (user-requested top priority for the
     # puter provider, 2026-07-30): floored one point above hy3 so a keyed
