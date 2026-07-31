@@ -9218,6 +9218,52 @@ def _chat_json_is_empty(data):
         return False
 
 
+# --------------------------------------------------------------------------- #
+# BUDGET STARVATION — a reasoning model that spent the whole max_tokens thinking
+# and had nothing left to answer with.
+#
+# MEASURED 2026-07-31 across cerebras / openrouter / opencode-zen / kilocode /
+# g4f-gemini, ~85 live calls at budgets 1..512:
+#   * empty content + finish_reason == "length" occurred 49/49 times when the
+#     model was starved. Never "stop", never null. That pair IS the signal.
+#   * the CONVERSE is false: finish_reason == "length" WITH real content is
+#     common (a plain truncation). So both halves must be checked -- gating on
+#     finish_reason alone would retry ordinary truncated answers forever.
+#   * the reasoning text is NOT a usable discriminator. It arrives under three
+#     different names (reasoning / reasoning_content / reasoning_details) and
+#     g4f-gemini starves with NO reasoning field at all -- its message is
+#     literally {"role":"assistant"} -- so keying on "has reasoning" would
+#     misclassify exactly the provider that most needs the retry.
+# Raising the budget fixed every case on a normal prompt; it is not a universal
+# cure (cerebras stayed empty at 512 on a hard word problem), so this retries
+# ONCE and then falls through to the next hop as before.
+# --------------------------------------------------------------------------- #
+_STARVED_RETRY_CAP = 2048        # never ask for more than this on the retry
+_STARVED_RETRY_FLOOR = 512       # ...and never less than this, or it starves again
+
+
+def _chat_json_starved(data):
+    """True when a 200 carried no content ONLY because the token budget ran out
+    mid-reasoning. Caller must already know the body is empty."""
+    try:
+        return (((data.get("choices") or [{}])[0] or {}).get("finish_reason") or "") == "length"
+    except Exception:                                                # noqa: BLE001
+        return False
+
+
+def _starved_retry_budget(requested):
+    """A budget likely to leave room for an answer after the thinking, or None
+    when the caller already asked for plenty (then starvation is the model's
+    problem, not the budget's, and a retry would just burn a second call)."""
+    try:
+        cur = int(requested) if requested else 0
+    except (TypeError, ValueError):
+        cur = 0
+    if cur >= _STARVED_RETRY_CAP:
+        return None
+    return max(_STARVED_RETRY_FLOOR, min(_STARVED_RETRY_CAP, cur * 4 or _STARVED_RETRY_FLOOR))
+
+
 def _proxy_sse(resp, iterator=None, first=_MISSING):
     """Pass upstream SSE bytes through unchanged. When `iterator`/`first` are
     supplied (the first-byte peek already pulled the first chunk from this exact
@@ -9542,6 +9588,29 @@ def v1_chat_completions():
                 resp.close()
                 continue
             if _chat_json_is_empty(data):
+                # Starved by the token budget rather than broken? Give this SAME
+                # hop one more go with room to answer, instead of throwing away a
+                # model that was about to work. See _chat_json_starved.
+                bigger = _starved_retry_budget(payload.get("max_tokens")) \
+                    if _chat_json_starved(data) else None
+                if bigger:
+                    resp.close()
+                    retry = dict(payload)
+                    retry["max_tokens"] = bigger
+                    try:
+                        resp2 = _dispatch_chat(hop_pid, retry, False)
+                        data2 = resp2.json() if resp2.status_code == 200 else None
+                        resp2.close()
+                    except (requests.RequestException, RuntimeError, ValueError):
+                        data2 = None
+                    if data2 and not _chat_json_is_empty(data2):
+                        _record_chat_usage(hop_pid, hop_model, data2, est)
+                        data2["model"] = hop_pid + "/" + hop_model
+                        return (jsonify(data2), 200,
+                                _routing_headers(hop_pid, hop_model, attempts, last_error))
+                    errors.append("%s: empty even at max_tokens=%d" % (hop_pid, bigger))
+                    last_error = "empty"
+                    continue
                 errors.append("%s: empty (200 but no content)" % hop_pid)
                 last_error = "empty"
                 resp.close()
