@@ -2589,6 +2589,51 @@ _puter_allowance_cache = {"at": 0.0, "data": None}
 _puter_allowance_lock = threading.Lock()
 
 
+_PUTER_WHOAMI_URL = "https://api.puter.com/whoami"
+
+
+def _puter_account_uuid(key):
+    """The Puter account a token belongs to, or None. Identity, not the token:
+    Puter mints a FRESH token on every sign-in, so string-dedupe cannot tell a
+    re-connect of the same account from a genuinely new one."""
+    try:
+        resp = requests.get(_PUTER_WHOAMI_URL,
+                            headers={"Authorization": "Bearer " + key},
+                            timeout=(CONNECT_TIMEOUT, 15))
+        if resp.status_code != 200:
+            return None
+        uuid_ = (resp.json() or {}).get("uuid")
+    except (requests.RequestException, ValueError, TypeError):
+        return None
+    return uuid_ if isinstance(uuid_, str) and uuid_ else None
+
+
+def _puter_replace_same_account(new_key):
+    """Drop any saved token belonging to the SAME account as `new_key`, so a
+    re-connect REFRESHES that account instead of stacking a duplicate.
+
+    MEASURED 2026-07-31: clicking Connect twice (with a live puter.com session,
+    which makes it a one-click "continue as ...") produced two DIFFERENT tokens
+    for one identical account — same uuid, both at 0¢. It looked like a pool of
+    two and was one empty wallet with two cards. Returns True if it replaced.
+
+    Fail-open: if identity can't be read, the token is simply appended — never
+    block a working key over a failed lookup."""
+    new_uuid = _puter_account_uuid(new_key)
+    if not new_uuid:
+        return False
+    existing = config.list_provider_keys("puter") or []
+    replaced = False
+    for idx in range(len(existing) - 1, -1, -1):    # reverse: indexes stay valid
+        old = existing[idx]
+        if old == new_key:
+            continue                                # plain dedupe already handles this
+        if _puter_account_uuid(old) == new_uuid:
+            config.remove_provider_key("puter", idx)
+            replaced = True
+    return replaced
+
+
 def _puter_allowance_one(key):
     """(remaining, allowance) for ONE account token, or None."""
     try:
@@ -4900,6 +4945,7 @@ def api_provider_add_key(pid):
     key = val.strip() if isinstance(val, str) else ""
     if not key:
         return jsonify({"error": "api_key is required"}), 400
+    replaced = _puter_replace_same_account(key) if _is_puter_driver(pid) else False
     config.add_provider_key(pid, key)
     # Adding a key signals intent to use this provider -> auto-enable it (the
     # user can still toggle it off). Idempotent: only flips a disabled row.
@@ -4909,7 +4955,13 @@ def api_provider_add_key(pid):
     with _model_cache_lock:
         _model_cache.pop(pid, None)  # pool changed -> rediscover
     _autoselect_default_if_unset()  # first keyed provider -> pick a best default
-    return jsonify(_provider_row(pid))
+    row = _provider_row(pid)
+    if replaced:
+        row["note"] = ("Refreshed the token for this Puter account — it was already "
+                       "connected, so this replaced the old one instead of adding a "
+                       "second. To pool a SECOND allowance, sign in with a different "
+                       "Puter account (each account has its own ~25¢/month).")
+    return jsonify(row)
 
 
 @app.route("/api/providers/<pid>/keys/<int:idx>", methods=["DELETE"])
