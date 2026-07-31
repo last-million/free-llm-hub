@@ -137,6 +137,39 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": ["gpt-oss-120b", "zai-glm-4.7", "gemma-4-31b"],
         "notes": "Fastest tokens/sec. Free: 5 req/min, 1M tok/day (no req/day cap is documented). Limits apply per ORG, not per user.",
     },
+    "dahl": {
+        "name": "Dahl Inference (Gonka)",
+        "base_url": "https://inference.dahl.global/v1",
+        # PUBLIC — 200 with no Authorization header. Returns only
+        # id/object/created/owned_by: NO context_length field at all, so
+        # _learn_ctx_from_catalog finds nothing here. Context is published on the
+        # marketing page only (MiniMax 200K, Kimi 256K).
+        "models_url": "https://inference.dahl.global/v1/models",
+        "signup_url": "https://inference.dahl.global/account",
+        "key_hint": "dahl_...",
+        # NOT no_key (inference 401s "Missing API token" without a Bearer) and NOT
+        # static_key either: every key owns its OWN private 100M-token pool, so a
+        # key shared in this repo would burn one allowance for all users. The key
+        # is free and instant — see KEY_MINT_URL below.
+        "key_mint_url": "https://inference.dahl.global/tokens",
+        "balance_url": "https://inference.dahl.global/tokens/current",
+        # 'all' is CORRECT and must stay: docs state "There is no payment UI yet",
+        # the entire 2-model catalog is served from the same free allowance, and
+        # /v1/models carries no pricing field (pricing_zero cannot work).
+        "free_filter": "all",
+        # Both chat-verified with real content. Kimi first: already Tier S in
+        # _BENCH_FAMILY and it returns clean content with thinking in a SEPARATE
+        # `reasoning` field, while MiniMax leaks a raw <think> block into
+        # `content` (harmless — _strip_thinking handles it — but noisier).
+        # zai-org/GLM-5.2 is advertised on the site as "Soon" but 400s
+        # 'unsupported model' today. Do NOT add it until it answers.
+        "default_free_models": ["moonshotai/Kimi-K2.6", "MiniMaxAI/MiniMax-M2.7"],
+        # NO vision_models on purpose: the catalog page badges both models
+        # "Vision", but a data-URI image is SILENTLY DROPPED — 200 OK,
+        # prompt_tokens counts the text only, and the model answers "I cannot see
+        # an image". It fails unsafely, so we must not route images here.
+        "notes": "Free 100,000,000 tokens PER KEY (not per month) on the decentralized Gonka network. OpenAI-compatible, streaming works. The key is instant and anonymous — no email, no card. When a key is spent it returns 402 'available tokens exhausted'; mint another. Sends NO rate-limit headers and publishes no per-minute/hour/day request cap (48 concurrent requests all returned 200), so the token pool is the only budget. Check the balance with GET /tokens/current. GLM-5.2 is listed as coming soon but 400s today. Kimi K2.6 256K ctx, MiniMax M2.7 200K ctx (marketing page figures — /v1/models exposes no context field).",
+    },
     "nvidia": {
         "name": "NVIDIA NIM",
         "base_url": "https://integrate.api.nvidia.com/v1",
