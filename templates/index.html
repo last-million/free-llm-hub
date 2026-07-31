@@ -573,6 +573,16 @@
     display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
     gap:10px;margin:2px 0 4px;
   }
+  /* Remaining provider allowance (puter). Bar + words, never colour alone. */
+  .allowance{margin:8px 0 2px}
+  .allowance-bar{
+    height:4px;border-radius:999px;background:var(--surface-3);overflow:hidden;
+  }
+  .allowance-bar span{display:block;height:100%;background:var(--accent-strong)}
+  .allowance.spent .allowance-bar span{background:var(--danger)}
+  .allowance-txt{margin-top:5px;font-size:11.5px;color:var(--text-dim)}
+  .allowance.spent .allowance-txt{color:var(--danger-text)}
+
   /* Saved prompt under each history thumb — clamped to 3 lines so a long
      prompt can't turn the gallery into a wall of text; the full text is in the
      tooltip and in the modal, with a copy button. */
@@ -3000,6 +3010,21 @@
         '</div>' +
       '</div>' +
       (p.recommended && REC_NOTES[p.id] ? '<div class="rec-note">' + esc(REC_NOTES[p.id]) + '</div>' : '') +
+      /* Real remaining allowance, read from the provider itself. Puter is the
+         only one that exposes it; everything else stays as it was. Shown
+         because it is TINY (~25c per MONTH, shared by chat AND images) and
+         discovering that via 402s mid-task is the worst way to learn it. */
+      (p.allowance ?
+        '<div class="allowance' + (p.allowance.remaining <= 0 ? ' spent' : '') + '">' +
+          '<div class="allowance-bar"><span style="width:' +
+            Math.max(0, Math.min(100, 100 - p.allowance.used_pct)) + '%"></span></div>' +
+          '<div class="allowance-txt">' +
+            (p.allowance.remaining <= 0
+              ? 'Monthly allowance spent — resets next month'
+              : esc(p.allowance.remaining_cents + '¢ of ' + p.allowance.allowance_cents +
+                    '¢ left this month')) +
+          '</div>' +
+        '</div>' : '') +
       (p.notes ? notesCardHTML(p.notes) : '') +
       (p.relay ?
         '<div class="relay-callout ' + (p.relay.usable ? 'ok' : 'off') + '">' +
