@@ -567,6 +567,25 @@
     display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
     gap:10px;margin:2px 0 4px;
   }
+  /* Saved prompt under each history thumb — clamped to 3 lines so a long
+     prompt can't turn the gallery into a wall of text; the full text is in the
+     tooltip and in the modal, with a copy button. */
+  .image-thumb .thumb-prompt{
+    padding:7px 8px 8px;font-size:11.5px;line-height:1.35;color:var(--text-dim);
+    border-top:1px solid var(--border-soft);background:var(--surface);
+    display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;
+    overflow:hidden;overflow-wrap:anywhere;
+  }
+  .modal-prompt{margin-top:12px}
+  .modal-prompt .modal-prompt-lbl{
+    font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;
+    color:var(--text-faint);margin-bottom:5px;
+  }
+  .modal-prompt p{
+    margin:0 0 9px;font-size:13px;line-height:1.5;color:var(--text);
+    white-space:pre-wrap;overflow-wrap:anywhere;
+  }
+
   /* ---- Hub controls: tools overview ------------------------------------- */
   .lc-tools{
     margin-top:14px;padding-top:14px;border-top:1px solid var(--border-soft);
@@ -4080,13 +4099,39 @@
           modelTag.textContent = modelLabel;
           thumb.appendChild(modelTag);
         }
+        /* The prompt was always SAVED (image_history stores it) but only ever
+           shown as a tooltip, so the gallery was a wall of unlabelled thumbs.
+           Show it: it is the one thing that makes a past image reusable. */
+        if (item.prompt){
+          var cap = document.createElement('div');
+          cap.className = 'thumb-prompt';
+          cap.textContent = item.prompt;
+          thumb.appendChild(cap);
+        }
         thumb.addEventListener('click', function(e){
-          if (e.target.closest('.thumb-delete')) return;
+          if (e.target.closest('.thumb-delete') || e.target.closest('.thumb-prompt-copy')) return;
           var big = document.createElement('img');
           big.src = src;
           big.alt = img.alt;
           big.className = 'modal-image';
-          openModal('Generated image' + (modelLabel ? ' — ' + modelLabel : ''), big);
+          var wrap = document.createElement('div');
+          wrap.appendChild(big);
+          if (item.prompt){
+            var pr = document.createElement('div');
+            pr.className = 'modal-prompt';
+            pr.innerHTML = '<div class="modal-prompt-lbl">Prompt</div>';
+            var ptxt = document.createElement('p');
+            ptxt.textContent = item.prompt;
+            pr.appendChild(ptxt);
+            var pcopy = document.createElement('button');
+            pcopy.type = 'button';
+            pcopy.className = 'btn sm ghost thumb-prompt-copy';
+            pcopy.textContent = 'Copy prompt';
+            pcopy.addEventListener('click', function(){ copyText(item.prompt, pcopy); });
+            pr.appendChild(pcopy);
+            wrap.appendChild(pr);
+          }
+          openModal('Generated image' + (modelLabel ? ' — ' + modelLabel : ''), wrap);
         });
         var delBtn = document.createElement('button');
         delBtn.type = 'button';
