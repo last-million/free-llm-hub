@@ -4782,10 +4782,12 @@
     var statusPill = r.usable
       ? '<span class="conn-pill on"><span class="d"></span>Usable</span>'
       : '<span class="conn-pill off"><span class="d"></span>Not usable</span>';
-    var modePill = r.isolated
-      ? '<span class="sub-mode-pill iso">Isolated profile</span>'
-      : '<span class="sub-mode-pill">Shared install</span>';
-    var installBtnLabel = r.isolated_installed ? 'Reinstall isolated copy' : 'Install isolated copy';
+    /* Isolated profiles were removed from this page 2026-07-31: they required a
+       separate one-time OAuth login per profile that neither vendor allows to be
+       scripted, which is a lot of friction for a last-resort fallback hop. The
+       hop now always uses your ALREADY signed-in CLI, so there is nothing to
+       re-authenticate and only one mode left to describe. */
+    var modePill = '<span class="sub-mode-pill">Uses your signed-in CLI</span>';
     var testing = !!_subTesting[r.id];
     var testBtnHTML = r.usable
       ? '<button type="button" class="btn sm act-sub-test"' + (testing ? ' disabled' : '') + '>' +
@@ -4808,15 +4810,9 @@
           '<input type="checkbox" class="act-sub-enable"' + (r.enabled ? ' checked' : '') + '>' +
           '<span class="track" aria-hidden="true"></span><span class="lbl">Enabled</span>' +
         '</label>' +
-        '<label class="switch" title="Run a completely separate install + login, never touching your regular ' + esc(r.bin || 'CLI') + ' setup">' +
-          '<input type="checkbox" class="act-sub-isolated"' + (r.isolated ? ' checked' : '') + '>' +
-          '<span class="track" aria-hidden="true"></span><span class="lbl">Isolated profile</span>' +
-        '</label>' +
-        (r.isolated ? '<button type="button" class="btn sm act-install-iso">' + esc(installBtnLabel) + '</button>' : '') +
         testBtnHTML +
       '</div>' +
-      resultHTML +
-      '<div class="sub-login-slot"></div>';
+      resultHTML;
   }
 
   function wireSub(card, r){
@@ -4824,29 +4820,8 @@
     if (enableToggle) enableToggle.addEventListener('change', function(){
       postSubFlag({ provider: r.id, enabled: enableToggle.checked }, enableToggle, enableToggle.checked);
     });
-    var isoToggle = card.querySelector('.act-sub-isolated');
-    if (isoToggle) isoToggle.addEventListener('change', function(){
-      postSubFlag({ provider: r.id, isolated: isoToggle.checked }, isoToggle, isoToggle.checked);
-    });
-    var installBtn = card.querySelector('.act-install-iso');
-    if (installBtn) installBtn.addEventListener('click', function(){ doInstallIsolated(r, installBtn, card); });
     var testBtn = card.querySelector('.act-sub-test');
     if (testBtn) testBtn.addEventListener('click', function(){ doTestSub(r, testBtn, card); });
-    var slot = card.querySelector('.sub-login-slot');
-    if (slot && r.isolated){
-      if (r.isolated_login_command){
-        var box = document.createElement('div'); box.className = 'sub-login-box';
-        var note = document.createElement('div'); note.className = 'cli-setup-note';
-        note.textContent = 'Neither CLI\'s subscription login can be scripted headlessly — run this yourself once, in your own terminal, to sign the isolated copy in:';
-        box.appendChild(note);
-        box.appendChild(blockNode('Run this to sign in', r.isolated_login_command));
-        slot.appendChild(box);
-      } else if (r.isolated_login_note){
-        var n2 = document.createElement('div'); n2.className = 'cli-setup-note';
-        n2.textContent = r.isolated_login_note;
-        slot.appendChild(n2);
-      }
-    }
   }
 
   /* enabled/isolated flag toggle -> POST, then re-render from the server's
@@ -4861,30 +4836,6 @@
     });
   }
 
-  function doInstallIsolated(r, btn, card){
-    var out = card ? card.querySelector('.sub-install-result') : null;
-    if (out){ out.className = 'sub-install-result'; out.innerHTML = ''; }
-    busyBtn(btn, 'Installing…');
-    api('/api/subscriptions/' + encodeURIComponent(r.id) + '/install-isolated', { method: 'POST' })
-      .then(function(resp){
-        resp = resp || {};
-        if (out){
-          out.className = 'sub-install-result ok';
-          out.innerHTML = '<span class="tr-i" aria-hidden="true">&check;</span><span>Installed at ' +
-                          esc(resp.bin_path || resp.install_dir || '') + '</span>';
-        }
-        toast((r.name || r.id) + ' isolated copy installed');
-        return loadSubscriptions();
-      })
-      .catch(function(e){
-        if (out){
-          out.className = 'sub-install-result err';
-          out.innerHTML = '<span class="tr-i" aria-hidden="true">&cross;</span><span>' + esc(e.message) + '</span>';
-        }
-        toast('Install failed: ' + e.message, true);
-        resetBtn(btn, r.isolated_installed ? 'Reinstall isolated copy' : 'Install isolated copy');
-      });
-  }
 
   function subCardForPid(pid){
     return document.querySelector('.cli-card[data-pid="' + CSS.escape(pid) + '"]');
