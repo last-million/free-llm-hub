@@ -25,3 +25,6 @@ hub.out.log
 hub.out.log*
 graphify-out/
 .opencode/
+
+# Playwright MCP scratch output (screenshots, console logs)
+.playwright-mcp/
