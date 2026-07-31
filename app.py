@@ -11571,15 +11571,38 @@ def _images_payload():
     for p in prov.list_providers():
         pid = p["id"]
         pcfg = config.get_provider_config(pid)
-        for row in _image_model_rows(pid):
+        rows = _image_model_rows(pid)
+        # Quota state per PROVIDER, resolved once and stamped on each of its
+        # model rows: picking an image model is pointless if the provider it
+        # belongs to has nothing left, and finding that out from a failed
+        # generation is the worst way to learn it.
+        q = _provider_quota_row(pid, p) if rows else None
+        allow = _puter_allowance() if (rows and _is_puter_driver(pid) and
+                                       pcfg.get("api_keys")) else None
+        if allow:
+            exhausted = allow["remaining"] <= 0
+            quota_label = ("no credit left" if exhausted
+                           else "%.2f¢ left" % allow["remaining_cents"])
+        elif q:
+            exhausted = bool(q.get("exhausted"))
+            quota_label = "out of free quota" if exhausted else None
+        else:
+            exhausted, quota_label = False, None
+        for row in rows:
             model = row["id"]
             models.append({
+                "exhausted": exhausted,
+                "quota_label": quota_label,
                 "id": pid + "/" + model,
                 "provider": pid,
                 "model": model,
                 "provider_name": p.get("name") or pid,
                 "label": row.get("label") or model,
                 "text_in_image": row.get("text_in_image"),
+                # Carries the per-image price for metered models, which is what
+                # the picker turns into its cost tag ("~0.5c per 1024x1024")
+                # instead of a vague "costs credit".
+                "notes": row.get("notes") or "",
                 "free": row.get("free", True),
                 "configured": bool(pcfg.get("enabled") and
                                    (pcfg.get("api_key") or not _needs_key(pid))),

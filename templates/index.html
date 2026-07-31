@@ -713,6 +713,10 @@
   .model-card .mc-tag.warn{background:var(--warn-soft);color:var(--warn-text);border-color:var(--warn-border)}
   .model-card.is-auto .mc-name{color:var(--accent-strong)}
   .model-card.not-configured{opacity:.62}
+  /* Provider has nothing left — still selectable (you may be about to top it
+     up or add a key), but it says so in red rather than failing on Generate. */
+  .model-card.out-of-quota{border-color:var(--danger-border);background:var(--danger-soft)}
+  .model-card.out-of-quota .mc-name{color:var(--danger-text)}
   @media (prefers-reduced-motion:reduce){
     .model-card,.model-card .mc-check{transition:none}
   }
@@ -4045,7 +4049,16 @@
         provider: m.provider_name || m.provider || '',
         text: m.text_in_image,
         configured: m.configured !== false,
-        dead: !!m.dead
+        dead: !!m.dead,
+        /* Metered models are offered but never auto-picked, so the card has to
+           say so — otherwise "why did that cost me money?" */
+        metered: m.free === false,
+        notes: m.notes || '',
+        /* Provider-level quota, stamped per model by _images_payload: a model
+           whose provider has nothing left cannot generate, and finding that
+           out from a failed generation is the worst way to learn it. */
+        exhausted: !!m.exhausted,
+        quotaLabel: m.quota_label || ''
       };
     });
     var check = '<svg class="mc-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
@@ -4059,10 +4072,23 @@
       var tags = '';
       if (r.text) tags += '<span class="mc-tag' + (r.text === 'excellent' ? ' good' : '') +
                           '">text: ' + esc(r.text) + '</span>';
+      /* Cost first when it costs: it is the thing you most need before clicking. */
+      if (r.metered){
+        /* Just the FIRST price, as a short tag — the notes hold the full
+           breakdown and ride along in the tooltip. Matching greedily produced
+           half-sentences like "~0.5¢ per 1024x1024 (low) / 1" because the
+           cheaper tiers are separated by periods. */
+        var cost = (r.notes.match(/~?([\d.]+)\s*c\b/i) || [])[1];
+        tags += '<span class="mc-tag warn" title="' + esc(r.notes) + '">' +
+                (cost ? '~' + esc(cost) + '¢ / image' : 'costs credit') + '</span>';
+      }
+      if (r.quotaLabel) tags += '<span class="mc-tag' + (r.exhausted ? ' warn' : ' good') +
+                                '">' + esc(r.quotaLabel) + '</span>';
       if (!r.configured) tags += '<span class="mc-tag warn">not configured</span>';
       if (r.dead) tags += '<span class="mc-tag warn">unavailable</span>';
       html += '<button type="button" role="radio" class="model-card' +
-              (r.configured ? '' : ' not-configured') + '" data-value="' + esc(r.id) + '" ' +
+              (r.configured ? '' : ' not-configured') +
+              (r.exhausted ? ' out-of-quota' : '') + '" data-value="' + esc(r.id) + '" ' +
               'aria-checked="false" tabindex="-1">' + check +
               '<span class="mc-name">' + esc(r.name) + '</span>' +
               '<span class="mc-provider">' + esc(r.provider) + '</span>' +
@@ -4079,13 +4105,21 @@
   function loadImages(silent){
     return api('/api/images').then(function(j){
       imagesState = (j && j.state) || {};
-      /* This picker only ever offers genuinely free image generation — paid
-         models (Google Nano Banana, OpenAI GPT Image, Higgsfield, ...) have no
-         free tier at all and would just fail then silently fall back to a free
-         provider, which is confusing ("I picked Gemini, why did I get a
-         Cloudflare image?"). Keeping them out of the list removes the dead-end
-         entirely instead of labeling it. */
-      var models = ((j && j.models) || []).filter(function(m){ return m.free !== false; });
+      /* Paid models are shown ONLY when their provider is actually configured.
+         The original rule hid every paid model outright, because an unkeyed one
+         is a dead end — you pick Gemini, it fails, you silently get a Cloudflare
+         image. That reasoning still holds for a provider with no key.
+
+         It does NOT hold for a keyed one. Puter's image models are metered but
+         they WORK (verified generating), and hiding them meant marking them
+         "paid" silently deleted Puter image generation from the UI — which is
+         not what excluding them from AUTO rotation was meant to do. Choosing a
+         model here is a deliberate act, so the honest design is to offer it and
+         label the cost, not to remove it. `free: false` still keeps it out of
+         Auto (see _image_candidates), so nothing spends your balance unasked. */
+      var models = ((j && j.models) || []).filter(function(m){
+        return m.free !== false || m.configured;
+      });
 
       /* persisted "Image priority" select — same convention as Vision priority (media-primary) */
       var prSel = $('#image-priority');
