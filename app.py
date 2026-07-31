@@ -3996,9 +3996,32 @@ def _compact_to_budget(messages, tools, budget):
             lead_sys.append(m)
         else:
             rest.append(m)
-    base = _est_tokens(lead_sys, tools)
+    # PIN THE ORIGINAL BRIEF. Keeping only the newest turns loses the message
+    # that says WHAT IS BEING BUILT, which is the one thing a follow-up depends
+    # on. Symptom: finish a project, say "make it better", and the model starts a
+    # NEW one because every turn describing the old one had been dropped. The
+    # first user turn is the task statement, so it is pinned (capped, so a huge
+    # opening paste can't eat the window it is meant to protect).
+    brief = None
+    # Only when there is a CONVERSATION to lose. With a single turn the "brief"
+    # IS the whole payload, and pinning it would cap it to its first 4000 chars —
+    # throwing away the end of a pasted file, which _trim_largest_message below
+    # keeps deliberately (head AND tail).
+    if len(rest) > 2:
+        for m in rest:
+            if isinstance(m, dict) and m.get("role") == "user":
+                brief = m
+                break
+    if brief is not None and isinstance(brief.get("content"), str) \
+            and len(brief["content"]) > _BRIEF_PIN_CHARS:
+        brief = dict(brief)
+        brief["content"] = (brief["content"][:_BRIEF_PIN_CHARS] +
+                            "\n[... original request truncated ...]")
+    base = _est_tokens(lead_sys + ([brief] if brief else []), tools)
     kept, running = [], base
     for m in reversed(rest):                       # keep newest-first until full
+        if brief is not None and m is rest[0]:
+            continue                               # already pinned above
         c = _est_tokens([m])
         if kept and running + c > target:
             break
@@ -4015,10 +4038,54 @@ def _compact_to_budget(messages, tools, budget):
         # reasoning over a truncated file.
         trimmed, did_trim = _trim_largest_message(lead_sys + rest, tools, target)
         return (trimmed, True) if did_trim else (messages, False)
-    notice = {"role": "system",
-              "content": "[Note: earlier conversation was truncated to fit this model's "
-                         "context window. Ask the user to re-share anything you need.]"}
-    return lead_sys + [notice] + kept, True
+    # Name the artefacts that were dropped. "Earlier conversation was truncated"
+    # tells the model nothing actionable; a list of the files already created
+    # tells it the project EXISTS and should be edited, not started again.
+    dropped = [m for m in rest if m not in kept and m is not brief]
+    files = _mentioned_paths(dropped)
+    note = ("[Note: earlier turns of THIS SAME conversation were dropped to fit this "
+            "model's context window. The work already exists — continue and EDIT it, "
+            "do not start a new project.")
+    if files:
+        note += " Files created/edited earlier: " + ", ".join(files) + "."
+    note += " Read a file before changing it, and ask the user for anything else you need.]"
+    notice = {"role": "system", "content": note}
+    head = lead_sys + [notice] + ([brief] if brief else [])
+    return head + kept, True
+
+
+# Longest opening request we will pin verbatim. Past this it is truncated: the
+# brief exists to say what is being built, not to carry a whole pasted codebase.
+_BRIEF_PIN_CHARS = 4000
+
+# Paths in prose/tool output: src/app.py, ./index.html, components/Cart.tsx.
+# Deliberately narrow — a real extension and no spaces — so ordinary sentences
+# don't get mined for junk.
+_PATH_RE = re.compile(
+    r"(?<![\w/.])(?:\./)?(?:[\w.-]+/){0,6}[\w.-]+\."
+    r"(?:py|js|jsx|ts|tsx|html|css|scss|json|md|yml|yaml|toml|sql|sh|rb|go|rs|java|php|vue|svelte)"
+    r"(?![\w/])")
+
+
+def _mentioned_paths(messages, limit=25):
+    """File paths mentioned across messages, most recent first, de-duplicated."""
+    seen, out = set(), []
+    for m in reversed(messages or []):
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, list):          # content-parts
+            c = " ".join(p.get("text") or "" for p in c if isinstance(p, dict))
+        if not isinstance(c, str):
+            continue
+        for p in _PATH_RE.findall(c):
+            p = p.lstrip("./")
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+                if len(out) >= limit:
+                    return out
+    return out
 
 
 def _trim_largest_message(messages, tools, target):

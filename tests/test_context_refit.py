@@ -216,3 +216,77 @@ def test_the_refit_budget_is_deliberately_conservative():
         "t", {"model": "m", "max_tokens": 100, "messages": _convo(400)})
     assert refit is not None
     assert app._est_tokens(refit["messages"]) <= 32768 * 0.55
+
+
+# --------------------------------------------------------------------------- #
+# 6. Continuity — "make it better" must EDIT the project, not restart it
+# --------------------------------------------------------------------------- #
+
+def _project_convo(turns=120):
+    """Build-a-project conversation: a brief, lots of work, then a follow-up."""
+    msgs = [{"role": "system", "content": "You are a coding agent."},
+            {"role": "user", "content": "Build me an online store called Solaris "
+                                        "selling solar panels."}]
+    for i in range(turns):
+        msgs.append({"role": "assistant",
+                     "content": "Created src/components/Product%d.tsx and updated "
+                                "src/App.tsx. " % i + "x" * 900})
+        msgs.append({"role": "user", "content": "ok continue " + str(i)})
+    msgs.append({"role": "user", "content": "now make it better"})
+    return msgs
+
+
+def _text_of(messages):
+    return " ".join(m["content"] for m in messages
+                    if isinstance(m, dict) and isinstance(m.get("content"), str))
+
+
+def test_the_original_brief_survives_compaction():
+    """Keeping only the NEWEST turns loses the message that says what is being
+    built — so a follow-up like "make it better" had nothing to refer to and the
+    model started a fresh project."""
+    out, did = app._compact_to_budget(_project_convo(), None, 8000)
+    assert did is True
+    assert "Solaris selling solar panels" in _text_of(out)
+
+
+def test_the_notice_tells_the_model_to_edit_not_restart():
+    out, _ = app._compact_to_budget(_project_convo(), None, 8000)
+    assert "do not start a new project" in _text_of(out)
+
+
+def test_files_from_dropped_turns_are_named():
+    """A bare "earlier conversation was truncated" is not actionable; the file
+    list is what tells the model the project already exists."""
+    out, _ = app._compact_to_budget(_project_convo(), None, 8000)
+    assert "src/App.tsx" in _text_of(out)
+
+
+def test_the_latest_turn_is_still_kept():
+    out, _ = app._compact_to_budget(_project_convo(), None, 8000)
+    assert "now make it better" in _text_of(out)
+
+
+def test_compaction_still_fits_the_budget_with_the_brief_pinned():
+    out, _ = app._compact_to_budget(_project_convo(), None, 8000)
+    assert app._est_tokens(out) <= 8000
+
+
+def test_a_giant_opening_brief_is_capped_not_pinned_whole():
+    """Otherwise pinning the brief would itself blow the window it protects."""
+    msgs = [{"role": "user", "content": "BRIEF " + ("z" * 200000)}]
+    msgs += [{"role": "user", "content": "turn %d" % i} for i in range(400)]
+    out, did = app._compact_to_budget(msgs, None, 8000)
+    assert did is True
+    assert app._est_tokens(out) <= 8000
+    assert "BRIEF" in _text_of(out)
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("edited src/App.tsx and lib/cart.ts", ["src/App.tsx", "lib/cart.ts"]),
+    ("see ./index.html", ["index.html"]),
+    ("no files here, just prose about a store.", []),
+    ("version 1.5 of the plan", []),          # not a path
+])
+def test_path_extraction_is_narrow(text, expected):
+    assert app._mentioned_paths([{"role": "assistant", "content": text}]) == expected
