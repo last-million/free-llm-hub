@@ -2719,15 +2719,35 @@ def _puter_chat(pid, payload, stream):
 
 
 def _puter_image_b64(result):
-    """Puter's image driver returns a `data:image/...;base64,<payload>` string
-    (sometimes wrapped in a dict). Return just the base64 payload."""
+    """Normalise Puter's image result to base64 payload bytes.
+
+    The driver answers in TWO shapes depending on which upstream served it
+    (MEASURED 2026-07-31): OpenAI/Gemini-backed models return a
+    `data:image/...;base64,<payload>` URI, while Replicate/Together-backed ones
+    return a bare https URL to the rendered file (e.g. replicate.delivery/...
+    /out-0.webp). Treating the second as base64 yielded 31 bytes of garbage, so
+    a URL is downloaded here — SSRF-checked exactly like _openai_generate_image.
+    Returns (b64, error) with exactly one of them set."""
     if isinstance(result, dict):
         result = result.get("url") or result.get("image") or result.get("data")
-    if not isinstance(result, str):
-        return None
+    if not isinstance(result, str) or not result.strip():
+        return None, "Puter returned no image data"
+    result = result.strip()
     if "base64," in result:
-        return result.split("base64,", 1)[1].strip() or None
-    return result.strip() or None
+        payload = result.split("base64,", 1)[1].strip()
+        return (payload or None), (None if payload else "Puter returned an empty data URI")
+    if result.startswith("http://") or result.startswith("https://"):
+        if not _is_safe_external_url(result):
+            return None, "Puter returned an image URL that failed the safety check"
+        try:
+            img = requests.get(result, timeout=(CONNECT_TIMEOUT, 60))
+        except requests.RequestException as exc:
+            return None, "could not download the image: %s" % exc.__class__.__name__
+        if img.status_code != 200 or not img.content:
+            return None, "image download failed (HTTP %d)" % img.status_code
+        return _b64_bytes(img.content), None
+    # Not a URI and not a URL -> assume it already IS base64.
+    return result, None
 
 
 def _puter_generate_image(pcfg, model, prompt, size="1024x1024", steps=4):
@@ -2760,9 +2780,9 @@ def _puter_generate_image(pcfg, model, prompt, size="1024x1024", steps=4):
     if not data.get("success"):
         detail = data.get("message") or data.get("error") or "image generation failed"
         return 502, None, _sanitize(str(detail))[:200]
-    b64 = _puter_image_b64(data.get("result"))
+    b64, err = _puter_image_b64(data.get("result"))
     if not b64:
-        return 502, None, "Puter returned no image data"
+        return 502, None, err or "Puter returned no image data"
     return 200, b64, None
 
 
@@ -10417,9 +10437,11 @@ def v1_count_tokens():
 # back a real fetchable `url`, and a `data:` URI in the `url` field would
 # break any client (including the real OpenAI SDK) that tries to GET it.
 # ---------------------------------------------------------------------------
-# puter first: GPT-Image quality (excellent in-image text) off the same free
-# account the chat side already uses, verified live 2026-07-31.
-_IMAGE_PROVIDER_ORDER = ("puter", "cloudflare", "modelscope", "pollinations")
+# Puter is deliberately ABSENT: every one of its 59 image models bills the
+# account (0.3-17c per image, verified against its own catalog 2026-07-31), so
+# none of them are free-rotation material. They stay one click away in the
+# picker as explicit pins — see providers.py's puter image_models.
+_IMAGE_PROVIDER_ORDER = ("cloudflare", "modelscope", "pollinations")
 MAX_IMAGE_HOPS = 4              # bound worst-case latency (ModelScope polls up to 60s/hop)
 _MODELSCOPE_POLL_DEADLINE = 60  # seconds
 
