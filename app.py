@@ -680,7 +680,7 @@ _KIMI_K2_CEILING = 98
 # 'anthropic/claude-fable-5', 'claude-3-7-sonnet'. Anchored on the word so
 # 'claude-code' style CLI-relay ids (subscription hops, scored elsewhere) and
 # stray substrings don't collect the floor.
-_CLAUDE_FAMILY_RE = re.compile(r"(?:^|[/:._-])claude[-.]?(?:opus|sonnet|haiku|fable|\d)")
+_CLAUDE_FAMILY_RE = re.compile(r"(?:^|[/:._-])claude[-.]?(?:opus|sonnet|haiku|fable|instant|v\d|\d)")
 # Captures the GPT version so the floor can SCALE with it — "all GPT-5 versions
 # are good, and a higher version means it's better", which two flat tiers could
 # not express. gpt-5 -> (5, None), gpt-5.6-sol -> (5, 6), gpt-6.2-codex ->
@@ -1045,6 +1045,13 @@ def _benchmark_score(pid, model_id):
         capped = True
     if params_b is not None and params_b < 14:
         capped = True
+    # USER DIRECTIVE 2026-07-31: "ALL available Claude models should be in top."
+    # The speed cap runs LAST and overrode the floor for the ids whose names
+    # happen to contain a capped word — claude-instant matched "instant" and
+    # landed at 30 despite being floored to 138. Claude is exempt so the floor
+    # is what actually decides, which is the whole point of setting one.
+    if capped and _CLAUDE_FAMILY_RE.search(low):
+        capped = False
     if capped:
         score = min(score, 30)
     score -= _shared_budget_penalty(pid, low)

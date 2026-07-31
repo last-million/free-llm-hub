@@ -202,11 +202,30 @@ def test_every_real_claude_id_shape_is_floored():
         assert app._benchmark_score("p", mid) >= app._PREF_FLOORS[5], mid
 
 
-def test_the_claude_floor_still_excludes_relay_and_legacy_ids():
-    """Two deliberate exclusions:
-    - 'claude' / 'claude-agentrouter' name the local CLI RELAY (a paid
-      subscription hop), not a model the free router should promote.
-    - claude-instant is a 2023 model; flooring it to 138 would rank it above
-      GPT-5.6, which is the opposite of "use the good models"."""
-    for mid in ("claude", "claude-agentrouter", "claude-instant-1.2"):
+def test_every_available_claude_model_is_top_including_legacy():
+    """USER DIRECTIVE, restated: "ALL available Claude models should be in top."
+    That now includes the legacy ids (claude-v2, claude-instant, claude-2.x) —
+    I had excluded them as 2023 models and the user overruled it."""
+    for mid in ("claude-opus-5", "claude-opus-4", "claude-sonnet-4-5",
+                "claude-fable-5", "claude-haiku-4-5", "claude-3-5-haiku",
+                "anthropic.claude-v2", "claude-instant-1.2", "claude-2.1",
+                "claude-3-opus", "us.anthropic.claude-opus-4-6-v1:0",
+                "anthropic/claude-sonnet-4", "Claude-Opus-5"):
+        assert app._benchmark_score("p", mid) >= app._PREF_FLOORS[5], mid
+
+
+def test_claude_is_exempt_from_the_speed_cap():
+    """The cap runs LAST and overrode the floor: claude-instant matched the
+    "instant" keyword and landed at 30 despite being floored to 138. A floor
+    that a later rule can silently undo is not a floor."""
+    assert app._benchmark_score("p", "claude-instant-1.2") == app._PREF_FLOORS[5]
+    # ...but the cap still bites everything else.
+    for mid in ("gpt-4o-mini", "gemini-3.1-flash-lite", "mistral-nemo"):
+        assert app._benchmark_score("p", mid) <= 30, mid
+
+
+def test_the_claude_floor_still_excludes_the_cli_relay_handles():
+    """'claude' / 'claude-agentrouter' name the local CLI RELAY, not a model.
+    Promoting them would push free routing onto a PAID subscription hop."""
+    for mid in ("claude", "claude-agentrouter"):
         assert app._benchmark_score("p", mid) < app._PREF_FLOORS[5], mid
