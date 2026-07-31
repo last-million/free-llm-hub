@@ -3977,7 +3977,128 @@ def _model_ctx_budget(pid, model):
     return _provider_tpm(pid)
 
 
-def _compact_to_budget(messages, tools, budget):
+_SUMMARY_SYSTEM = (
+    "You compress the dropped part of a coding conversation so the next model can "
+    "carry on without re-reading it. Reply with the RECAP ONLY — no preamble.\n"
+    "Cover, in this order, only what is present:\n"
+    "1. GOAL — what is being built, in one line.\n"
+    "2. STATE — what already exists: files created/edited and what each does.\n"
+    "3. DECISIONS — choices already made and why (stack, schema, naming, layout).\n"
+    "4. OPEN — what was still in progress or unresolved.\n"
+    "Be specific: real file paths, real names, real values. No filler, no advice, "
+    "no restating these instructions. Under 250 words. Facts only — never invent a "
+    "detail that was not in the text."
+)
+_SUMMARY_MAX_TOKENS = 500
+_SUMMARY_CACHE_MAX = 64
+_SUMMARY_MAX_INFLIGHT = 3              # background recaps must not swamp the free fleet
+_summary_cache = {}                    # sha256(dropped) -> recap
+_summary_inflight = set()
+_summary_lock = threading.Lock()
+
+
+# Reasoning models emit their scratchpad inline. MEASURED: a recap came back
+# starting "<think>Here's a thinking process: 1. Analyze User Input..." — feeding
+# that into the next model's context is pure noise, and worse, it reads as
+# instructions. An UNCLOSED opening tag means the reply was cut off mid-thought,
+# so everything after it is scratchpad too.
+_THINK_BLOCK_RE = re.compile(
+    r"<(think|thinking|reasoning|scratchpad)>.*?</\1>", re.S | re.I)
+_THINK_OPEN_RE = re.compile(r"<(think|thinking|reasoning|scratchpad)>.*", re.S | re.I)
+
+
+def _strip_thinking(text):
+    """Model output with any chain-of-thought block removed."""
+    if not isinstance(text, str):
+        return ""
+    out = _THINK_BLOCK_RE.sub("", text)
+    out = _THINK_OPEN_RE.sub("", out)
+    return out.strip()
+
+
+def _summary_key(dropped):
+    """(key, text) for the turns being dropped, or (None, None) if not worth it."""
+    text = "\n\n".join(
+        "%s: %s" % (m.get("role", "?"), m["content"][:4000])
+        for m in dropped
+        if isinstance(m, dict) and isinstance(m.get("content"), str) and m["content"].strip())
+    if len(text) < 800:                # too little dropped to be worth a call
+        return None, None
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest(), text
+
+
+def _summarize_worker(key, text):
+    """Compute one recap and cache it. Runs OFF the request path."""
+    try:
+        msgs = [{"role": "system", "content": _SUMMARY_SYSTEM},
+                {"role": "user", "content": text[-60000:]}]
+        # medium, not hard: compression is not the user's actual task and must
+        # not take the strongest hop the real request wants.
+        pid, model, _d = _route_by_difficulty(msgs, _SUMMARY_MAX_TOKENS,
+                                              require_tools=False,
+                                              force_difficulty="medium")
+        if not pid:
+            return
+        for hop_pid, hop_model in _build_chain(pid, model):
+            if _is_sub(hop_pid):
+                continue               # never spend a paid subscription on a recap
+            try:
+                resp = _dispatch_chat(hop_pid, {"model": hop_model, "stream": False,
+                                                "max_tokens": _SUMMARY_MAX_TOKENS,
+                                                "messages": msgs}, False)
+                data = resp.json() if resp.status_code == 200 else None
+                resp.close()
+            except (requests.RequestException, RuntimeError, ValueError):
+                continue
+            out = _strip_thinking(
+                (((data or {}).get("choices") or [{}])[0].get("message") or {})
+                .get("content") or "")
+            if not out:
+                continue
+            with _summary_lock:
+                if len(_summary_cache) >= _SUMMARY_CACHE_MAX:
+                    _summary_cache.clear()   # cheap bound; recaps are re-derivable
+                _summary_cache[key] = out
+            return
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[summary] worker failed", exc_info=True)
+    finally:
+        with _summary_lock:
+            _summary_inflight.discard(key)
+
+
+def _summarize_dropped(dropped):
+    """A recap of the discarded turns if one is READY, else None — and start
+    computing it in the background for next time.
+
+    Deliberately never blocks. Compaction runs on EVERY hop of every request, and
+    a recap call is a full model round-trip: MEASURED at over two minutes on the
+    free fleet, which would have made large requests unusable. So the first
+    compaction of a conversation ships the structural notice (brief + file list)
+    and the recap lands from the following turn onward — which is exactly when it
+    matters, since the continuity problem shows up on the FOLLOW-UP ("make it
+    better"), not on the turn that filled the window."""
+    if not dropped:
+        return None
+    try:
+        key, text = _summary_key(dropped)
+        if not key:
+            return None
+        with _summary_lock:
+            hit = _summary_cache.get(key)
+            if hit:
+                return hit
+            if key in _summary_inflight or len(_summary_inflight) >= _SUMMARY_MAX_INFLIGHT:
+                return None                # already being computed, or too many at once
+            _summary_inflight.add(key)
+        threading.Thread(target=_summarize_worker, args=(key, text),
+                         daemon=True, name="summarize").start()
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[summary] could not schedule", exc_info=True)
+    return None
+
+
+def _compact_to_budget(messages, tools, budget, summarizer=None):
     """AUTO-COMPACT: if a conversation is bigger than a model's context budget, drop
     the OLDEST turns (keeping ALL leading system messages + the most RECENT turns that
     fit + tool-call/result pairing, which _sanitize_tool_messages then repairs) and
@@ -4049,6 +4170,12 @@ def _compact_to_budget(messages, tools, budget):
     if files:
         note += " Files created/edited earlier: " + ", ".join(files) + "."
     note += " Read a file before changing it, and ask the user for anything else you need.]"
+    # A model-written recap of what was dropped, when a summarizer is wired in.
+    # Structural facts (brief + file list) survive either way; the recap adds the
+    # part they cannot carry — the DECISIONS and the reasoning behind them.
+    recap = summarizer(dropped) if summarizer else None
+    if recap:
+        note += "\n\n[Recap of the dropped turns]\n" + recap
     notice = {"role": "system", "content": note}
     head = lead_sys + [notice] + ([brief] if brief else [])
     return head + kept, True
@@ -4139,8 +4266,15 @@ def _upstream_chat(pid, payload, stream):
         # ('tool_call_ids did not have response messages') — compaction may itself
         # orphan a tool msg / dangle a tool_call, so sanitize runs AFTER compaction.
         msgs = payload["messages"]
+        # Summarised compaction: a model-written recap of the dropped turns, so
+        # the DECISIONS survive and not just the file names. Cached per content,
+        # fail-open to the structural notice, and skippable via the setting for
+        # anyone who would rather not spend a call on it.
+        _summarizer = (_summarize_dropped
+                       if config.get_flag("compact_summary", True) else None)
         compacted, did = _compact_to_budget(msgs, payload.get("tools"),
-                                            _model_ctx_budget(pid, payload.get("model")))
+                                            _model_ctx_budget(pid, payload.get("model")),
+                                            summarizer=_summarizer)
         fixed = _sanitize_tool_messages(compacted)
         if did or fixed is not msgs:
             payload = dict(payload)
