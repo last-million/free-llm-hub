@@ -332,6 +332,71 @@ def _models_url_for(pid, pcfg):
     return murl
 
 
+# Field names that state a model's INPUT context window, verified live against
+# real catalogs 2026-07-31: openrouter -> context_length (1048576), groq ->
+# context_window AND context_length (4000 on its smallest model), puter ->
+# context (131072). Deliberately EXCLUDES max_completion_tokens /
+# max_output_length / max_tokens: those bound the REPLY, and treating an output
+# cap as the input window would over-compact every conversation.
+_CTX_FIELDS = ("context_length", "context_window", "context",
+               "max_context_length", "max_input_tokens", "context_size")
+_CTX_SANE_MIN, _CTX_SANE_MAX = 1000, 5_000_000
+
+
+def _learn_ctx_from_catalog(payload_pid, payload):
+    """Record every context window a provider's /models catalog publishes.
+
+    This is the PROACTIVE half of context handling: _learn_context_limit only
+    fires after a request has already failed, which costs a real hop on the best
+    model in the chain (measured: a Codex session lost its top hop on every turn
+    to a 32k model the router believed was 120k). A catalog states the same fact
+    for free, before anything is sent. Never raises."""
+    try:
+        items = payload
+        if isinstance(payload, dict):
+            for k in ("data", "models", "result"):
+                v = payload.get(k)
+                if isinstance(v, dict):
+                    v = v.get("models")
+                if isinstance(v, list):
+                    items = v
+                    break
+        if not isinstance(items, list):
+            return
+        found = 0
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            mid = it.get("id") or it.get("name") or it.get("model")
+            if not isinstance(mid, str) or not mid:
+                continue
+            ctx = None
+            for f in _CTX_FIELDS:
+                v = it.get(f)
+                # openrouter nests a second copy under top_provider
+                if v is None and f == "context_length":
+                    v = (it.get("top_provider") or {}).get("context_length") \
+                        if isinstance(it.get("top_provider"), dict) else None
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, (int, float)) and _CTX_SANE_MIN <= v <= _CTX_SANE_MAX:
+                    ctx = int(v)
+                    break
+            if ctx is None:
+                continue
+            with _model_max_input_lock:
+                cur = _MODEL_MAX_INPUT.get((payload_pid, mid))
+                # Smaller wins: a limit learned from a real rejection is
+                # authoritative over an optimistic catalog number.
+                _MODEL_MAX_INPUT[(payload_pid, mid)] = min(cur, ctx) if cur else ctx
+            found += 1
+        if found:
+            _log.debug("[ctx] %s: learned %d context windows from its catalog",
+                       payload_pid, found)
+    except Exception:                                                # noqa: BLE001
+        _log.debug("[ctx] catalog harvest failed for %s", payload_pid, exc_info=True)
+
+
 def _parse_model_ids(payload):
     """Accept OpenAI ({'data':[{'id':..}]}) and common variants."""
     items = []
@@ -389,6 +454,10 @@ def provider_free_models(pid, live=True):
                 timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT),
             )
             if resp.status_code == 200:
+                # Harvest each model's PUBLISHED context window while we are
+                # already holding the catalog. Learning it from a failed request
+                # works but costs a real hop; the catalog states it for free.
+                _learn_ctx_from_catalog(pid, resp.json())
                 ids = _parse_model_ids(resp.json())
                 # filter_models drops blocked (uncensored) AND non-chat ids
                 # (whisper/tts/embed/guard) — per the providers.py contract.
@@ -3872,6 +3941,16 @@ def _refit_payload_to_learned_ctx(pid, payload):
         budget = _model_ctx_budget(pid, payload.get("model"))
         if not budget or budget <= 0:
             return None
+        # SAFETY FACTOR, and it is load-bearing. _est_tokens is a chars/4
+        # heuristic tuned for prose, but agentic traffic is CODE, which tokenizes
+        # at roughly 2.2 chars/token — so the estimate can be ~1.8x optimistic.
+        # MEASURED: a payload the estimator put at 27,780 tokens still overflowed
+        # a 32,768 window. Re-fitting to the estimator's idea of the full window
+        # therefore fails a second time and loses the hop anyway, which is the
+        # entire thing this function exists to prevent. Aim at ~55% instead: a
+        # slightly shorter context that ANSWERS beats a perfectly-sized one that
+        # 400s.
+        budget = int(budget * 0.55)
         compacted, did = _compact_to_budget(msgs, payload.get("tools"), budget)
         if not did:
             return None                       # already fits; the 400 was something else
@@ -3927,11 +4006,56 @@ def _compact_to_budget(messages, tools, budget):
         running += c
     kept.reverse()
     if len(kept) >= len(rest):
-        return messages, False                     # nothing actually dropped
+        # Dropping whole turns achieved nothing — the overflow is INSIDE a single
+        # message (a pasted file, a huge tool result). Previously this returned
+        # "no change" and the request went out oversized and was rejected, losing
+        # the hop entirely. Trim within that message instead: keep its head AND
+        # tail, which is where the question and the recent output live, and mark
+        # the cut so the model knows material is missing rather than silently
+        # reasoning over a truncated file.
+        trimmed, did_trim = _trim_largest_message(lead_sys + rest, tools, target)
+        return (trimmed, True) if did_trim else (messages, False)
     notice = {"role": "system",
               "content": "[Note: earlier conversation was truncated to fit this model's "
                          "context window. Ask the user to re-share anything you need.]"}
     return lead_sys + [notice] + kept, True
+
+
+def _trim_largest_message(messages, tools, target):
+    """Shrink the single biggest text message so the whole payload fits `target`.
+
+    Head+tail rather than a plain cut: the start of a pasted file (imports,
+    signatures) and its end (the part just being edited) both carry more signal
+    than the middle. Returns (messages, changed)."""
+    try:
+        over = _est_tokens(messages, tools) - target
+        if over <= 0:
+            return messages, False
+        idx, biggest = None, 0
+        for i, m in enumerate(messages):
+            if not isinstance(m, dict) or not isinstance(m.get("content"), str):
+                continue
+            n = len(m["content"])
+            if n > biggest:
+                idx, biggest = i, n
+        if idx is None:
+            return messages, False
+        # ~4 chars per token, plus slack for the marker itself.
+        cut = min(biggest - 400, int(over * 4) + 400)
+        if cut <= 0 or biggest - cut < 400:
+            return messages, False
+        text = messages[idx]["content"]
+        keep = biggest - cut
+        head = text[: int(keep * 0.6)]
+        tail = text[-int(keep * 0.4):] if int(keep * 0.4) else ""
+        out = list(messages)
+        out[idx] = dict(messages[idx])
+        out[idx]["content"] = (
+            head + "\n\n[... %d characters omitted to fit this model's context "
+                   "window; ask for the missing part if you need it ...]\n\n" % cut + tail)
+        return out, True
+    except Exception:                                                # noqa: BLE001
+        return messages, False
 
 
 def _upstream_chat(pid, payload, stream):

@@ -140,3 +140,79 @@ def test_garbage_in_the_saved_blob_is_ignored():
     assert ("p", "m4") not in app._MODEL_MAX_INPUT
     app._MODEL_MAX_INPUT.clear()
     app._MODEL_MAX_INPUT.update(before)
+
+
+# --------------------------------------------------------------------------- #
+# 4. Proactive: read the window from the catalog, before anything is sent
+# --------------------------------------------------------------------------- #
+
+def test_context_windows_are_harvested_from_a_catalog():
+    """Verified field names against live catalogs 2026-07-31: openrouter
+    context_length, groq context_window, puter context."""
+    app._MODEL_MAX_INPUT.clear()
+    app._learn_ctx_from_catalog("p", {"data": [
+        {"id": "a", "context_length": 1048576},
+        {"id": "b", "context_window": 4000},
+        {"id": "c", "context": 131072},
+        {"id": "d", "top_provider": {"context_length": 65536}},
+    ]})
+    got = {k[1]: v for k, v in app._MODEL_MAX_INPUT.items()}
+    assert got == {"a": 1048576, "b": 4000, "c": 131072, "d": 65536}
+
+
+def test_output_caps_are_never_mistaken_for_the_input_window():
+    """max_completion_tokens bounds the REPLY. Treating it as the input window
+    would over-compact every conversation on that provider."""
+    app._MODEL_MAX_INPUT.clear()
+    app._learn_ctx_from_catalog("p", {"data": [
+        {"id": "x", "max_completion_tokens": 50000, "max_output_length": 50000}]})
+    assert ("p", "x") not in app._MODEL_MAX_INPUT
+
+
+def test_a_real_rejection_outranks_an_optimistic_catalog_number():
+    app._MODEL_MAX_INPUT.clear()
+    app._MODEL_MAX_INPUT[("p", "m")] = 32768                 # learned from a 400
+    app._learn_ctx_from_catalog("p", {"data": [{"id": "m", "context_length": 128000}]})
+    assert app._MODEL_MAX_INPUT[("p", "m")] == 32768
+
+
+@pytest.mark.parametrize("junk", [None, {}, [], {"data": "nope"},
+                                  {"data": [None, 5, {"id": None}]}])
+def test_catalog_harvest_never_raises(junk):
+    app._learn_ctx_from_catalog("p", junk)
+
+
+# --------------------------------------------------------------------------- #
+# 5. A single oversized message — previously unrecoverable
+# --------------------------------------------------------------------------- #
+
+def test_one_giant_message_is_trimmed_instead_of_failing():
+    """Compaction drops whole TURNS, so a single huge message (a pasted file, a
+    big tool result) used to survive untouched and be rejected upstream, losing
+    the hop. It is now trimmed head+tail."""
+    msgs = [{"role": "system", "content": "sys"},
+            {"role": "user", "content": "A" * 400000}]
+    out, did = app._compact_to_budget(msgs, None, 8000)
+    assert did is True
+    assert app._est_tokens(out) <= 8000
+    body = out[1]["content"]
+    assert body.startswith("A") and body.endswith("A"), "head and tail must both survive"
+    assert "characters omitted" in body, "the cut must be visible to the model"
+
+
+def test_trimming_leaves_a_message_that_already_fits_alone():
+    msgs = [{"role": "user", "content": "short"}]
+    out, did = app._compact_to_budget(msgs, None, 8000)
+    assert (out, did) == (msgs, False)
+
+
+def test_the_refit_budget_is_deliberately_conservative():
+    """_est_tokens is chars/4, tuned for prose; code runs ~2.2 chars/token, so
+    the estimate can be ~1.8x optimistic. MEASURED: a payload estimated at
+    27,780 tokens still overflowed a 32,768 window. Re-fitting to the full
+    estimated window fails twice and loses the hop anyway."""
+    app._MODEL_MAX_INPUT[("t", "m")] = 32768
+    refit = app._refit_payload_to_learned_ctx(
+        "t", {"model": "m", "max_tokens": 100, "messages": _convo(400)})
+    assert refit is not None
+    assert app._est_tokens(refit["messages"]) <= 32768 * 0.55
