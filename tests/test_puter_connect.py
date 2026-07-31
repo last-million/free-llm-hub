@@ -160,6 +160,40 @@ def test_puter_connect_uses_puterjs_popup_contract(html):
     assert "d.token" in html
 
 
+def test_puter_connect_answers_the_guis_requestOrigin_handshake(html):
+    """REGRESSION (blank popup, 2026-07-31). The Puter GUI's initgui() needs
+    the opener's origin before it renders anything. It reads document.referrer
+    first — always EMPTY here, because the hub sends `Referrer-Policy:
+    no-referrer` on every page — then falls back to postMessaging
+    {msg:"requestOrigin"} to window.opener and waiting 5s for a reply; with no
+    reply it throws "No referrer found" and the popup stays blank. puter.js
+    answers that from an always-on top-level listener, so we must too."""
+    assert "requestOrigin" in html
+    assert "originResponse" in html
+    # Registered at load, NOT inside connectPuter() — the request can arrive
+    # before/after any single attempt's own listener.
+    connect_fn = html.split("function connectPuter", 1)[1]
+    assert "requestOrigin" not in connect_fn, \
+        "the requestOrigin reply must live in the top-level listener, not per-click"
+    # Origin-checked exactly like the token message, and it replies to the
+    # message's own source rather than to a remembered window.
+    assert re.search(
+        r"window\.addEventListener\('message', function\(e\)\{\s*"
+        r"if \(e\.origin !== PUTER_GUI_ORIGIN\) return;\s*"
+        r"if \(!e\.data \|\| e\.data\.msg !== 'requestOrigin' \|\| !e\.source\) return;\s*"
+        r"try\{ e\.source\.postMessage\(\{ msg:'originResponse' \}, '\*'\); \}",
+        html), "top-level requestOrigin handler missing or reshaped"
+
+
+def test_hub_still_sends_no_referrer_so_the_handshake_stays_load_bearing(isolated_config):
+    """The reply above is only needed while the hub strips the referrer. If
+    this header ever changes, revisit that comment rather than silently
+    keeping a workaround for a problem that no longer exists."""
+    client = app.app.test_client()
+    resp = client.get("/", headers=_DASH)
+    assert resp.headers.get("Referrer-Policy") == "no-referrer"
+
+
 def test_puter_connect_saves_via_existing_keys_endpoint(html):
     # The captured token goes through the same endpoint as a manual paste —
     # no bespoke backend route for this flow.

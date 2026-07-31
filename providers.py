@@ -695,47 +695,17 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": [],
         "notes": "Not a free tier — a consumable trial: 1,000,000 tokens PER MODEL, expiring 90 days after activating Model Studio, International (Singapore) deployment only. 'After the quota expires or is exhausted, you will be charged for continued use' (then AllocationQuota.FreeTierOnly errors). No permanently-free model exists. NOTE: the qwen-code CLI's OAuth path IS a genuine renewing free tier (2,000/day, 60 RPM) — different auth, would need its own entry.",
     },
-    "agentrouter": {
-        "name": "AgentRouter",
-        # Featured first in the dashboard: real referral signup credit (see
-        # signup_url below) and, unlike most "free credit" relays, VERIFIED
-        # actually working end-to-end through the hub's isolated-CLI relay
-        # (6 models confirmed live 2026-07-28 -- see sub-agentrouter in app.py).
-        "recommended": True,
-        "base_url": "https://agentrouter.org/v1",
-        "models_url": "https://agentrouter.org/v1/models",
-        "signup_url": "https://agentrouter.org/register?aff=udWz",  # user's own referral link, added at their explicit request 2026-07-27
-        "key_hint": "sk-...",
-        # RE-ADDED 2026-07-27 at explicit user request, in the SAME opt-in-only
-        # shape it had before being removed on 2026-07-15 (also at user
-        # request, same reasoning) -- nothing about the underlying facts
-        # changed: still a THIRD-PARTY RELAY (prompts transit their infra, not
-        # Anthropic/OpenAI directly) fronting a ONE-TIME consumable signup
-        # credit ($100 via GitHub auth, more via referral), not a renewing
-        # free tier. No published rate limits; /v1/models 401s without a key,
-        # so nothing here is independently verifiable as free.
-        #
-        # PROBED LIVE 2026-07-27 with the user's real post-signup key: EVERY
-        # endpoint (/v1/models, /v1/chat/completions) returns 401
-        # "unauthorized client detected" regardless of headers/User-Agent
-        # tried. Root cause confirmed via multiple independent GitHub issues
-        # (OmniRoute #1921, opencode #5060, agentrouter-org/docs #21):
-        # AgentRouter runs a WAF that ONLY accepts traffic matching the
-        # official Claude Code CLI's exact client fingerprint and rejects
-        # every generic API client, including this hub. NOT fixable here
-        # without impersonating that fingerprint -- the same TLS/client-
-        # spoofing pattern already rejected as grey-hat/ToS-risk when
-        # evaluating OmniRoute for this project. So: registered, opt-in,
-        # signup_url carries a referral link at the user's explicit request,
-        # but a key pasted here will not actually work through this hub
-        # until/unless AgentRouter changes that policy.
-        "paid": True,
-        "trial": True,
-        "free_filter": "pricing_zero",
-        "free_families": [],
-        "default_free_models": [],
-        "notes": "⚠ DOES NOT CURRENTLY WORK THROUGH THIS HUB: AgentRouter's WAF only accepts the official Claude Code CLI's client fingerprint and 401s ('unauthorized client detected') every other API client, verified live 2026-07-27. No free models either way -- a third-party relay (30+ upstream providers incl. Claude/GPT/Gemini) on a ONE-TIME consumable signup credit; every call burns it, nothing renews. Signup link is the maintainer's own referral link. Requires GitHub OAuth to claim the credit on their site (separate from this hub). All prompts transit a third-party reseller, not the model vendor directly.",
-    },
+    # REMOVED 2026-07-31 at explicit user request ("agentrouter.org doesn't
+    # work — remove it"), re-confirmed live the same day: agentrouter.org
+    # itself answers 200, but /v1/models still returns
+    # 401 "unauthorized client detected" to every generic HTTP client — the
+    # same WAF policy documented since 2026-07-27, unchanged. The isolated-CLI
+    # relay that worked around it (_SUB_PROVIDERS' "sub-agentrouter") is gone
+    # too; its probe hung for 240s. Kept as a comment, not code, so a future
+    # re-add starts from the measured facts instead of re-probing:
+    #   base_url    https://agentrouter.org/v1
+    #   signup_url  https://agentrouter.org/register?aff=udWz  (maintainer's referral)
+    #   nature      third-party relay, ONE-TIME consumable signup credit, no free tier
     "siliconflow": {
         "name": "SiliconFlow",
         "base_url": "https://api.siliconflow.cn/v1",
@@ -1291,7 +1261,17 @@ PROVIDERS: Dict[str, dict] = {
         # account token unlocks the newest flagship catalog (GPT-5.6 family).
         "recommended": True,
         "base_url": "https://api.puter.com/puterai/openai/v1",
-        "models_url": "https://api.puter.com/puterai/openai/v1/models",
+        # NOT <base_url>/models — that path does NOT EXIST on Puter's gateway
+        # (probed 2026-07-31: GET returns 404 "not_found" WITH a valid bearer
+        # too, so it is a missing route, not an auth gate). Pointing the key
+        # test at it made every Puter test fail "✗ HTTP 404: Not Found" before
+        # it ever reached the generation probe. Puter's real catalog route is
+        # the one its own puter.js SDK calls, /puterai/chat/models/details
+        # (200, public, 563 models, {"models":[{"id":..}]} — a shape
+        # _parse_model_ids already accepts). It needs no auth, so it can't
+        # certify a key on its own; that is fine, the key test ALWAYS follows
+        # the listing with a real generation call.
+        "models_url": "https://api.puter.com/puterai/chat/models/details",
         "signup_url": "https://puter.com",
         "key_hint": "manual fallback — prefer the Connect with Puter button above",
         # BYOK (NOT no_key): one free puter.com account yields an auth token
@@ -1305,12 +1285,15 @@ PROVIDERS: Dict[str, dict] = {
         # it out of FREE_LIMITS (UNKNOWN via DEFAULT_LIMIT; uncloseai/
         # api-airforce precedent) and real 429s sideline it.
         "free_filter": "all",
-        # Live probe 2026-07-30: /models 404s without a valid token (chat
-        # completions answers 'reauth_required' on a dummy bearer, so the
-        # gateway itself is up and auth-gated) — discovery runs with the saved
-        # key; the pins below keep the provider usable if discovery fails.
-        "default_free_models": ["gpt-5.6-sol", "gpt-5.6-terra",
-                                "gpt-5.5-pro", "gpt-4.1"],
+        # Live probe 2026-07-31 against the real catalog (563 models): the
+        # gateway is up and auth-gated (chat completions answers
+        # 'reauth_required' on a dummy bearer). Pins below are VERIFIED to
+        # exist in that catalog and keep the provider usable if discovery
+        # fails. 'gpt-5.5-pro' was a PHANTOM id — the served one is dated,
+        # gpt-5.5-pro-2026-04-23 (still matched by the app.py _PREF_FLOORS
+        # substring, so its scoring floor is unaffected).
+        "default_free_models": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+                                "gpt-5.5-pro-2026-04-23", "gpt-4.1"],
         "notes": "User-pays AI gateway: one free puter.com account auth token unlocks the whole OpenAI-compatible catalog (500+ models incl. the newest GPT-5.6 flagship family, GPT Image, and Claude/Gemini/Grok/DeepSeek/Mistral/Llama via the same account). Fair-use limits apply but are unpublished, so quota tracks it as UNKNOWN. Flagship ids carry a scoring preference floor (app.py _PREF_FLOORS) so puter ranks first among equals — user-requested top priority.",
     },
     "custom": {

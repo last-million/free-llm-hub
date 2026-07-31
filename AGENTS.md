@@ -79,6 +79,56 @@ server-side Puter login endpoint — `api.puter.com/login` and `/auth/login`
 404 (probed 2026-07-30); only `/auth/get-user-app-token` exists and needs a
 token already. Covered by `tests/test_puter_connect.py`.
 
+Two live-verified gotchas, both fixed 2026-07-31 — do not "simplify" either
+away:
+
+- **The popup renders BLANK without an origin handshake.** The Puter GUI's
+  `initgui()` needs the opener's origin before rendering. It reads
+  `document.referrer`, which is ALWAYS empty here because the hub sends
+  `Referrer-Policy: no-referrer` on every response (app.py:4160). Its fallback
+  is to postMessage `{msg:"requestOrigin"}` to `window.opener` and wait 5s for
+  a reply whose event `.origin` it adopts; with no reply it throws
+  `Error: No referrer found` and nothing ever renders. puter.js answers from an
+  always-on top-level listener — so index.html registers one too (at load, NOT
+  inside `connectPuter()`), replying `{msg:"originResponse"}` to `e.source`.
+- **`<base_url>/models` does not exist.** `models_url` is
+  `https://api.puter.com/puterai/chat/models/details` (the route puter.js
+  itself calls: public, 200, 563 models, `{"models":[{"id":..}]}` — a shape
+  `_parse_model_ids` already accepts). `/puterai/openai/v1/models` returns 404
+  `not_found` WITH a valid bearer too, and the key test aborts on any non-200
+  from `models_url` (app.py ~4884), so every Puter Test failed
+  "✗ HTTP 404: Not Found" before reaching the generation probe. The catalog
+  route needs no auth, which is fine: the test ALWAYS follows the listing with
+  a real generation call. `POST <base_url>/chat/completions` is real (401s a
+  dummy bearer), so `base_url` itself was always correct.
+
+## Kimi Code: one-click Connect / Disconnect
+
+`_autofix_kimi` / `_disconnect_kimi` (registered under the `"kimi"` strategy in
+`_AUTOFIXERS` / `_DISCONNECTERS`) replaced the manual-only TOML instructions on
+2026-07-31. Kimi has NO shell-env fallback, so the whole wiring is
+`~/.kimi/config.toml`: Connect writes `[providers.free-hub]` + `[models."auto"]`
+and sets top-level `default_model = "auto"`; Disconnect strips exactly those and
+restores the previous `default_model` (remembered in the `kimi_prev_default_model`
+setting — normally Kimi's managed `kimi-code` OAuth service). Both reuse the
+generic `_remove_toml_table` / `_backup_once` helpers, so unrelated tables the
+user added after connecting survive a revert. `manual_note` is kept as fallback.
+Covered by `tests/test_kimi_cli.py` (round-trip + idempotence + no-key-echo).
+
+## AgentRouter: removed (2026-07-31)
+
+Both halves are gone at user request: the `agentrouter` provider entry
+(providers.py) and the `sub-agentrouter` isolated-CLI relay (`_SUB_PROVIDERS`),
+plus `_agentrouter_backend`, `_agentrouter_review_and_fix` and its 4 call sites,
+the "AGENTROUTER FIRST" pre-free-tier routing block in `_route_by_difficulty`,
+and the `codex-agentrouter`/`claude-agentrouter` isolated-CLI ids.
+`_PROVIDER_RELAY_SUB_PID` is now `{}` — the machinery is generic and stays for a
+future relay. Re-probed on removal day: agentrouter.org answers 200 but
+`/v1/models` still returns 401 "unauthorized client detected" to any generic
+HTTP client (their WAF only accepts the official Claude Code CLI fingerprint),
+so the direct provider never worked; the relay that worked around it had a probe
+hang for 240s. Do not re-add without new evidence that policy changed.
+
 ## Agent skills (.agents/skills/)
 
 Kimi Code scans `.agents/skills/` (directory form `<name>/SKILL.md`). Two
