@@ -3041,7 +3041,12 @@
           '<button type="button" class="btn sm relay-jump-btn" data-jump-view="sec-subs">Go to Subscriptions</button>' +
         '</div>' : '') +
       (fm.length ? '<div class="models-preview"><b>' + fm.length + ' free model' + (fm.length > 1 ? 's' : '') + ':</b> ' + esc(fmPrev) + '</div>' : '') +
-      (p.signup_url ?
+      /* Puter is the one provider with no key to fetch: there is no API-key
+         page to send anyone to, and "Connect with Puter" below does the whole
+         thing (sign in on puter.com, token captured and saved automatically).
+         A "Get a free key" link next to it just sent people to the homepage to
+         hunt for something that does not exist. */
+      (p.signup_url && p.id !== 'puter' ?
         '<a class="keylink" href="' + esc(p.signup_url) + '" target="_blank" rel="noopener noreferrer">' +
           '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>' +
           'Get a free key</a>' : '') +
