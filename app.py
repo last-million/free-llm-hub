@@ -2564,6 +2564,75 @@ def _puter_post(api_key, body, stream=False, read_timeout=None):
     )
 
 
+# --------------------------------------------------------------------------- #
+# PUTER ALLOWANCE — the number the provider does not publish anywhere.
+#
+# MEASURED 2026-07-31 against GET https://api.puter.com/metering/usage, which
+# returns {"usage": {...per-model...}, "appTotals": {...},
+#          "allowanceInfo": {"remaining": N, "monthUsageAllowance": N}}.
+#
+# Unit calibration (this is the part no doc states): the catalog prices
+# gemini-2.5-flash-image at 3.9 US cents per 1024x1024 image, and metering
+# recorded exactly 3,870,000 units for one such image -> ~992,308 units per US
+# cent, i.e. the units are MICRO-CENTS.
+#
+# Which makes the free tier: 25,000,000 units = ~25 US cents PER MONTH, shared
+# across chat AND images. Not per day -- it does not come back tomorrow. For
+# scale, ONE gemini image is 15% of the entire month. This is why puter must
+# never be treated as an ordinary free provider: it is a trickle, and the hub
+# now shows exactly how much of it is left instead of discovering it via 402s.
+# --------------------------------------------------------------------------- #
+_PUTER_USAGE_URL = "https://api.puter.com/metering/usage"
+_PUTER_UNITS_PER_CENT = 992308.0
+_PUTER_ALLOWANCE_TTL = 600          # seconds; this is a dashboard number, not a hot path
+_puter_allowance_cache = {"at": 0.0, "data": None}
+_puter_allowance_lock = threading.Lock()
+
+
+def _puter_allowance(force=False):
+    """{'remaining', 'allowance', 'remaining_cents', 'allowance_cents', 'used_pct'}
+    or None when it can't be read. Cached; never raises."""
+    now = time.time()
+    with _puter_allowance_lock:
+        hit = _puter_allowance_cache
+        if not force and hit["data"] is not None and (now - hit["at"]) < _PUTER_ALLOWANCE_TTL:
+            return hit["data"]
+    keys = (config.get_provider_config("puter") or {}).get("api_keys") or []
+    if not keys:
+        return None
+    try:
+        resp = requests.get(_PUTER_USAGE_URL,
+                            headers={"Authorization": "Bearer " + keys[0]},
+                            timeout=(CONNECT_TIMEOUT, 15))
+        if resp.status_code != 200:
+            return None
+        info = (resp.json() or {}).get("allowanceInfo") or {}
+        allowance = float(info.get("monthUsageAllowance") or 0)
+        remaining = float(info.get("remaining") or 0)
+    except (requests.RequestException, ValueError, TypeError):
+        return None
+    if allowance <= 0:
+        return None
+    data = {
+        "remaining": remaining,
+        "allowance": allowance,
+        "remaining_cents": round(remaining / _PUTER_UNITS_PER_CENT, 2),
+        "allowance_cents": round(allowance / _PUTER_UNITS_PER_CENT, 2),
+        "used_pct": round(100.0 * (1.0 - remaining / allowance), 1),
+        "period": "month",
+    }
+    with _puter_allowance_lock:
+        _puter_allowance_cache["at"] = now
+        _puter_allowance_cache["data"] = data
+    # Spent -> sideline BEFORE the request rather than after a 402. Reuses the
+    # normal dead-provider path, so the chain (and the mid-request re-check)
+    # skip it exactly like any other sidelined provider.
+    if remaining <= 0:
+        with _provider_dead_lock:
+            _dead_providers["puter"] = time.time() + _PROVIDER_DEAD_TTL
+    return data
+
+
 def _puter_usage(u):
     """Driver usage -> OpenAI usage. The driver reports prompt/completion but no
     total_tokens (and adds usd_cents, which is metering, not token accounting)."""
@@ -4685,6 +4754,9 @@ def _provider_row(pid, live_models=False):
     p = prov.get_provider(pid) or {}
     pcfg = config.get_provider_config(pid)
     keys = pcfg.get("api_keys") or []
+    # Puter publishes no quota anywhere, so the hub reads its real remaining
+    # allowance instead of leaving the card blank (see _puter_allowance).
+    allowance = _puter_allowance() if pid == "puter" and keys else None
     relay_pid = _PROVIDER_RELAY_SUB_PID.get(pid)
     relay = None
     if relay_pid and relay_pid in _SUB_PROVIDERS:
@@ -4715,6 +4787,7 @@ def _provider_row(pid, live_models=False):
         "image_free_count": sum(1 for r in _image_model_rows(pid) if r.get("free", True)),
         "image_paid_count": sum(1 for r in _image_model_rows(pid) if not r.get("free", True)),
         "relay": relay,
+        "allowance": allowance,     # puter only; None everywhere else
         "recommended": bool(p.get("recommended")),
     }
 
