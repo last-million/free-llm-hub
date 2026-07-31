@@ -1293,7 +1293,7 @@ PROVIDERS: Dict[str, dict] = {
         "base_url": "https://api.puter.com/puterai/openai/v1",
         "models_url": "https://api.puter.com/puterai/openai/v1/models",
         "signup_url": "https://puter.com",
-        "key_hint": "Puter account auth token (puter.com, free)",
+        "key_hint": "manual fallback — prefer the Connect with Puter button above",
         # BYOK (NOT no_key): one free puter.com account yields an auth token
         # that unlocks the whole OpenAI-compatible catalog. Puter is a
         # "user-pays" gateway — the free account IS the payment identity, so

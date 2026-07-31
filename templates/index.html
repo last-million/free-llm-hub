@@ -350,6 +350,9 @@
   .card.recommended{border-color:var(--accent)}
   .notes{font-size:12.5px;color:var(--text-dim);line-height:1.55}
   .keylink{font-size:12.5px;display:inline-flex;align-items:center;gap:5px}
+  .puter-connect{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:8px 0}
+  .puter-connect .puter-connect-btn{display:inline-flex;align-items:center;gap:6px}
+  .puter-connect-note{font-size:12px;color:var(--text-dim);flex:1;min-width:180px;line-height:1.45}
   .keyrow{display:flex;gap:8px}
   .keyrow .kwrap{position:relative;flex:1;min-width:0}
   .keyrow input[type=password],.keyrow input[type=text]{
@@ -2880,6 +2883,13 @@
           'Get a free key</a>' : '') +
       savedKeysHTML +
       (p.no_key ? '<div class="nokey-note">&#10003; No API key needed — this gateway works instantly.</div>' : '') +
+      (p.id === 'puter' ?
+        '<div class="puter-connect">' +
+          '<button type="button" class="btn sm primary puter-connect-btn">' +
+            '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>' +
+            'Connect with Puter</button>' +
+          '<span class="puter-connect-note">Sign in on puter.com (free) — the token saves itself here. Your password never touches this hub.</span>' +
+        '</div>' : '') +
       '<form class="keyrow key-form">' +
         '<div class="kwrap">' +
           '<input type="password" class="key-input" placeholder="' + esc(p.key_hint || (keys.length ? 'paste another key to add' : 'paste API key')) + '" autocomplete="off" spellcheck="false" aria-label="Add an API key for ' + esc(p.name || p.id) + '">' +
@@ -2996,6 +3006,8 @@
       var navBtn = document.querySelector('.cx-nav-item[data-view="' + relayJumpBtn.dataset.jumpView + '"]');
       if (navBtn) navBtn.click();
     });
+    var puterBtn = $('.puter-connect-btn', card);
+    if (puterBtn) puterBtn.addEventListener('click', function(){ connectPuter(card, p, puterBtn); });
     $('.key-form', card).addEventListener('submit', function(e){
       e.preventDefault();
       $('.act-save', card).click();
@@ -3121,6 +3133,65 @@
           btn.disabled = false; btn.textContent = 'Test';
         });
     });
+  }
+
+  /* ---------- Puter zero-manual connect (browser-side) ----------
+     This is puter.js v2's own sign-in contract, replicated instead of loading
+     the whole SDK (verified live 2026-07-31 against https://js.puter.com/v2/):
+     open puter.com/action/sign-in?embedded_in_popup=true&msg_id=N in a popup;
+     the Puter GUI then postMessages {msg:"puter.token", msg_id:N, token,
+     success:true} back to the opener from origin https://puter.com. The user
+     logs in on puter.com itself — credentials never touch this hub; we receive
+     only the token and push it through the normal provider-keys endpoint
+     (same as a manual paste: dedupe + auto-enable + rediscover). */
+  var PUTER_GUI_ORIGIN = 'https://puter.com';
+  var _puterMsgSeq = 0;
+  function connectPuter(card, p, btn){
+    var msgId = ++_puterMsgSeq;
+    var popup = window.open(
+      PUTER_GUI_ORIGIN + '/action/sign-in?embedded_in_popup=true&msg_id=' + msgId,
+      'puter-signin', 'width=640,height=720');
+    if (!popup){
+      toast('Popup blocked — allow popups for this page, or paste the token manually below', true);
+      return;
+    }
+    var label = btn.innerHTML;
+    btn.disabled = true;
+    btn.textContent = 'Waiting for Puter…';
+    var settled = false, poll = null;
+    function finish(){
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('message', onMsg);
+      if (poll){ clearInterval(poll); poll = null; }
+      btn.disabled = false;
+      btn.innerHTML = label;
+    }
+    function onMsg(e){
+      if (e.origin !== PUTER_GUI_ORIGIN) return;
+      var d = e.data;
+      /* loose != on purpose: the GUI echoes the msg_id from the URL query,
+         so it may come back as a string */
+      if (!d || d.msg !== 'puter.token' || d.msg_id != msgId) return;
+      finish();
+      try{ popup.close(); }catch(err){}
+      if (!d.success || !d.token){
+        toast('Puter sign-in failed' + (d.error ? ': ' + d.error : ''), true);
+        return;
+      }
+      api('/api/providers/' + encodeURIComponent(p.id) + '/keys', { method:'POST', body:{ api_key: String(d.token) } })
+        .then(function(row){
+          applyRow(card, row, p.id);          /* fresh saved-keys list + badges */
+          delete keyHealth[p.id]; testKeyHealth(p.id);
+          toast('Puter connected — token saved');
+          return Promise.all([loadStatus(), loadModels()]);
+        })
+        .catch(function(err){ toast('Puter connect failed: ' + err.message, true); });
+    }
+    window.addEventListener('message', onMsg);
+    poll = setInterval(function(){
+      if (popup.closed){ finish(); toast('Puter sign-in cancelled'); }
+    }, 500);
   }
 
   function updateProvider(row, pid){
