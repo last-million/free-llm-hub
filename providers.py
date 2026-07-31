@@ -1295,6 +1295,20 @@ PROVIDERS: Dict[str, dict] = {
         # apply but Puter publishes NO numbers -> quota.py deliberately leaves
         # it out of FREE_LIMITS (UNKNOWN via DEFAULT_LIMIT; uncloseai/
         # api-airforce precedent) and real 429s sideline it.
+        #
+        # MEASURED 2026-07-31 from the live activity trail: 399 of the catalog's
+        # 563 ids are ROUTING-PREFIXED duplicates of a plain id
+        # ('openrouter:google/gemini-3-flash-preview', 'infron:anthropic/
+        # claude-opus-4.6-fast', 'alibaba:qwen/qvq-max'), plus ':batch' variants
+        # that are not interactive endpoints at all. The driver rejects every one
+        # with HTTP 400 — and because they score identically to the plain id, the
+        # router kept picking a prefixed variant FIRST, so every request burned
+        # its first hop on a guaranteed 400 and fell through to a weaker
+        # provider (observed: a real ask landing on llm7/gemini-3.1-flash-LITE
+        # after puter 400 + two g4f 429s). Excluding ':' keeps the 164 canonical
+        # ids and drops every prefixed twin. exclude_families is checked BEFORE
+        # every other filter rule, so a prefixed id can never be re-admitted.
+        "exclude_families": [":"],
         "free_filter": "all",
         # Live probe 2026-07-31 against the real catalog (563 models): the
         # gateway is up and auth-gated (chat completions answers
