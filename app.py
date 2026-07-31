@@ -55,6 +55,7 @@ import agentic_chat
 import agentic_history
 import config
 import image_history
+import craft
 import providers as prov
 import quota
 import swarm
@@ -4110,6 +4111,47 @@ def _summarize_dropped(dropped):
     return None
 
 
+def _apply_craft_brief(messages):
+    """Prepend a domain craft brief when the OPENING turn calls for one.
+
+    Deliberately opening-turn-only. By the second turn a tool loop may be in
+    flight, and injecting instructions into a running agent turn is the failure
+    mode that made the prompt enhancer dashboard-only. On the first turn there is
+    no loop yet, so this is additive and safe.
+
+    It never touches the user's own text — it adds ONE system message ahead of
+    the conversation. Returns the original list when nothing matches, so the
+    common case allocates nothing."""
+    try:
+        if not config.get_flag("craft_briefs", True):
+            return messages
+        if not isinstance(messages, list) or not messages:
+            return messages
+        users = [m for m in messages
+                 if isinstance(m, dict) and m.get("role") == "user"]
+        if len(users) != 1:
+            return messages            # not the opening turn
+        if any(isinstance(m, dict) and (m.get("role") == "tool" or m.get("tool_calls"))
+               for m in messages):
+            return messages            # a tool loop is already running
+        text = users[0].get("content")
+        if isinstance(text, list):     # multimodal turn -> its text parts
+            text = " ".join(p.get("text") or "" for p in text if isinstance(p, dict))
+        brief = craft.system_message(text or "")
+        if not brief:
+            return messages
+        # After any leading system messages, so the caller's own instructions
+        # (Codex's agent prompt) still come first and win on conflict.
+        i = 0
+        while i < len(messages) and isinstance(messages[i], dict) \
+                and messages[i].get("role") == "system":
+            i += 1
+        return messages[:i] + [brief] + messages[i:]
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[craft] brief injection skipped", exc_info=True)
+        return messages
+
+
 def _compact_to_budget(messages, tools, budget, summarizer=None):
     """AUTO-COMPACT: if a conversation is bigger than a model's context budget, drop
     the OLDEST turns (keeping ALL leading system messages + the most RECENT turns that
@@ -4277,7 +4319,9 @@ def _upstream_chat(pid, payload, stream):
         # (2) repair tool-pairing so a strict upstream can't 400 the agentic turn
         # ('tool_call_ids did not have response messages') — compaction may itself
         # orphan a tool msg / dangle a tool_call, so sanitize runs AFTER compaction.
-        msgs = payload["messages"]
+        msgs = _apply_craft_brief(payload["messages"])
+        payload = dict(payload)
+        payload["messages"] = msgs
         # Summarised compaction: a model-written recap of the dropped turns, so
         # the DECISIONS survive and not just the file names. Cached per content,
         # fail-open to the structural notice, and skippable via the setting for
