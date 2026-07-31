@@ -245,26 +245,25 @@ def test_hard_prefers_strong_even_when_low_quality_outscores(
 # FIX 2 — kimi-k2.6 / kimi-k2.7 preference floor across provider id shapes
 # --------------------------------------------------------------------------- #
 
-def test_kimi_k26_k27_floor_across_id_shapes(fresh_quota, monkeypatch):
+def test_kimi_k26_k27_are_capped_below_mimo_and_qwen(fresh_quota, monkeypatch):
+    """USER CORRECTION 2026-07-31: "kimi 2.7 is not better than qwen 3.5 or 3.6,
+    or even mimo 2.5." These ids used to be FLOORED at 133, which ranked them
+    above qwen3.6 (109) and mimo (100) and won them turns they should not have.
+    Now they are CAPPED just under mimo instead: still a usable fallback, never
+    a winner over those three. K3 is a different generation and is unaffected."""
     monkeypatch.setattr(app, "_aa_scores", {})
-    floor = app._PREF_FLOORS[4]
-    assert floor == 133
-    # g4f-nvidia 'moonshotai/<id>' shape and the bare id: full floor.
-    assert app._benchmark_score("g4f-nvidia", "moonshotai/kimi-k2.6") == floor
-    assert app._benchmark_score("cerebras", "kimi-k2.6") == floor
-    # cloudflare '@cf/moonshotai/<id>' shape: floor minus the cloudflare
-    # shared-budget penalty (its 10k neurons/day allowance) — still top-band.
-    cf = app._benchmark_score("cloudflare", "@cf/moonshotai/kimi-k2.6")
-    assert cf == floor - 12
-    assert app._benchmark_score("cloudflare", "@cf/moonshotai/kimi-k2.7-code") == floor - 12
-    # The floor sits just under kimi-k3 and above every natural strong score.
-    assert app._benchmark_score("morph", "morph-kimik3") == app._PREF_FLOORS[1] > floor
-    assert floor > app._benchmark_score("cerebras", "zai-glm-4.7")
-
-
-# --------------------------------------------------------------------------- #
-# FIX 3a — adaptive first-content peek timeout
-# --------------------------------------------------------------------------- #
+    ceiling = app._KIMI_K2_CEILING
+    mimo = app._benchmark_score("opencode-zen", "mimo-v2.5-free")
+    qwen = app._benchmark_score("g4f-nvidia", "qwen/qwen3.6-27b")
+    assert ceiling < mimo <= qwen, (ceiling, mimo, qwen)
+    # every provider id shape is capped, not just the bare one
+    for pid, mid in (("g4f-nvidia", "moonshotai/kimi-k2.6"),
+                     ("cerebras", "kimi-k2.6"),
+                     ("cloudflare", "@cf/moonshotai/kimi-k2.6"),
+                     ("cloudflare", "@cf/moonshotai/kimi-k2.7-code")):
+        assert app._benchmark_score(pid, mid) <= ceiling, (pid, mid)
+    # K3 keeps its own floor, well above the K2 generation
+    assert app._benchmark_score("morph", "morph-kimik3") == app._PREF_FLOORS[1] > ceiling
 
 def test_peek_timeout_fast_model_small_request_stays_short():
     assert app._stream_peek_timeout("llama-3.3-70b-versatile", 400) \

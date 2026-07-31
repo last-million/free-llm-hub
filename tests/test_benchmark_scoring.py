@@ -111,25 +111,31 @@ def test_promoted_families_hit_the_top_bands():
 # Id-keyed like the other floors (no provider-id checks in routing).
 # --------------------------------------------------------------------------- #
 
-def test_user_ranking_kimi_k3_then_claude_then_gpt55_then_gemini():
-    """USER RANKING, stated explicitly 2026-07-31 and replacing the earlier
-    puter-sol-first order: kimi-k3 > claude > gpt-5.5-and-up > gemini."""
+def test_user_ranking_claude_then_gpt5_then_kimi_k3_then_gemini():
+    """USER RANKING, 2nd revision 2026-07-31: claude > gpt-5.x > kimi-k3 >
+    gemini. K3 was briefly top; the user corrected it to sit AFTER the gpt-5
+    family and claude."""
     kimi = app._benchmark_score("testpid", "kimi-k3")
     claude = app._benchmark_score("puter", "claude-opus-5")
     gpt = app._benchmark_score("puter", "gpt-5.6-sol")
     gemini = app._benchmark_score("puter", "gemini-3-pro")
-    assert kimi > claude > gpt > gemini, (kimi, claude, gpt, gemini)
+    assert claude > gpt > kimi > gemini, (claude, gpt, kimi, gemini)
     # kimi-k3 and claude are flat floors; the GPT floor SCALES with the version
     # (since 2026-07-31), so it is checked as a band rather than an exact value.
-    assert (kimi, claude) == (140, 138)
+    # REVISED: kimi-k3 now ranks BELOW claude and every gpt-5.x, per
+    # "kimi k3 is the best one AFTER gpt models from 5 up and claude models".
+    assert claude == 138
     assert 135 <= gpt < 138
+    assert kimi < gpt, (kimi, gpt)
 
 
 def test_gemini_is_ranked_last_by_getting_no_floor_at_all():
     """A floor only ever LIFTS a model, so gemini is ranked last by being left
     on its natural score — not by inventing a negative floor."""
     gemini = app._benchmark_score("puter", "gemini-3-pro")
-    assert gemini < min(app._PREF_FLOORS)
+    # index 4 is 0 since the kimi-k2 floor was removed, so compare against the
+    # lowest ACTIVE floor rather than min() of the raw tuple.
+    assert gemini < min(f for f in app._PREF_FLOORS if f)
 
 
 def test_every_claude_id_shape_gets_the_claude_floor():
@@ -169,7 +175,7 @@ def test_plain_gpt_4o_does_not_get_the_puter_floor():
     # The floor is pinned to the 5.6-sol / 5.6-terra / 5.5-pro ids only — a
     # plain gpt-4o keeps its natural Tier A score, far below every floor.
     gpt4o = app._benchmark_score("puter", "gpt-4o")
-    assert gpt4o < min(app._PREF_FLOORS)
+    assert gpt4o < min(f for f in app._PREF_FLOORS if f)
     assert gpt4o >= 84  # still Tier A, just not floored
     # gpt-5.4 IS floored since 2026-07-31 ("all GPT-5 versions are good, and a
     # higher version means better") — the bar moved from 5.5 down to the whole
