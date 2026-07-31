@@ -9299,6 +9299,16 @@ def v1_chat_completions():
                                            messages=body.get("messages")):
         if not prov.is_model_allowed(hop_model):
             continue
+        # MID-REQUEST re-check. _build_chain is computed ONCE, up front, so a
+        # provider sidelined DURING this request (e.g. its 2nd distinct 402 ->
+        # _mark_provider_authfail decides the account is broke) still has all its
+        # remaining hops queued. MEASURED 2026-07-31: one Codex request burned
+        # SEVEN consecutive puter/402 hops for exactly this reason before
+        # reaching a model that could answer. Re-checking here drops the rest of
+        # a provider's hops the moment it is proven dead.
+        if _is_provider_dead(hop_pid):
+            errors.append("%s: sidelined mid-request" % hop_pid)
+            continue
         # See the matching comment in /v1/responses -- same fix, same reason:
         # dispatch a sub-* (local CLI relay) hop non-streaming even when the
         # client wants a stream, instead of skipping it outright, then emit
@@ -9879,6 +9889,12 @@ def v1_responses():
                                            require_tools=has_tools, messages=messages):
         _tried.append(hop_pid + "/" + hop_model)
         if not prov.is_model_allowed(hop_model):
+            continue
+        # MID-REQUEST re-check — see the twin in /v1/chat/completions. The chain
+        # is built once, so without this a provider proven dead on hop 2 keeps
+        # every one of its later hops (measured: 7 consecutive puter/402s).
+        if _is_provider_dead(hop_pid):
+            errors.append("%s: sidelined mid-request" % hop_pid)
             continue
         # A local-CLI relay hop (sub-*) is a subprocess that runs to completion —
         # it cannot stream token-by-token. User-approved tradeoff 2026-07-29:
