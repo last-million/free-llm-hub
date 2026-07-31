@@ -2589,20 +2589,11 @@ _puter_allowance_cache = {"at": 0.0, "data": None}
 _puter_allowance_lock = threading.Lock()
 
 
-def _puter_allowance(force=False):
-    """{'remaining', 'allowance', 'remaining_cents', 'allowance_cents', 'used_pct'}
-    or None when it can't be read. Cached; never raises."""
-    now = time.time()
-    with _puter_allowance_lock:
-        hit = _puter_allowance_cache
-        if not force and hit["data"] is not None and (now - hit["at"]) < _PUTER_ALLOWANCE_TTL:
-            return hit["data"]
-    keys = (config.get_provider_config("puter") or {}).get("api_keys") or []
-    if not keys:
-        return None
+def _puter_allowance_one(key):
+    """(remaining, allowance) for ONE account token, or None."""
     try:
         resp = requests.get(_PUTER_USAGE_URL,
-                            headers={"Authorization": "Bearer " + keys[0]},
+                            headers={"Authorization": "Bearer " + key},
                             timeout=(CONNECT_TIMEOUT, 15))
         if resp.status_code != 200:
             return None
@@ -2611,6 +2602,39 @@ def _puter_allowance(force=False):
         remaining = float(info.get("remaining") or 0)
     except (requests.RequestException, ValueError, TypeError):
         return None
+    return (remaining, allowance) if allowance > 0 else None
+
+
+def _puter_allowance(force=False):
+    """Pooled allowance across EVERY saved Puter account.
+
+    Puter's documented model is user-pays: "each user will cover their own usage
+    costs", so the ~25c monthly allowance belongs to the ACCOUNT, not the app.
+    Several accounts therefore carry several allowances, and the hub already
+    rotates a provider's key pool -- so this sums them and, critically, only
+    sidelines puter when EVERY account is empty. Reading just keys[0] (as the
+    first version did) would have parked a whole pool because its first token
+    happened to be spent.
+
+    Returns totals plus per-account rows, or None when nothing is readable."""
+    now = time.time()
+    with _puter_allowance_lock:
+        hit = _puter_allowance_cache
+        if not force and hit["data"] is not None and (now - hit["at"]) < _PUTER_ALLOWANCE_TTL:
+            return hit["data"]
+    keys = (config.get_provider_config("puter") or {}).get("api_keys") or []
+    if not keys:
+        return None
+    accounts, remaining, allowance = [], 0.0, 0.0
+    for idx, key in enumerate(keys):
+        one = _puter_allowance_one(key)
+        if one is None:
+            continue
+        r, a = one
+        remaining += r
+        allowance += a
+        accounts.append({"index": idx, "remaining_cents": round(r / _PUTER_UNITS_PER_CENT, 2),
+                         "spent": r <= 0})
     if allowance <= 0:
         return None
     data = {
@@ -2620,6 +2644,8 @@ def _puter_allowance(force=False):
         "allowance_cents": round(allowance / _PUTER_UNITS_PER_CENT, 2),
         "used_pct": round(100.0 * (1.0 - remaining / allowance), 1),
         "period": "month",
+        "accounts": len(accounts),
+        "accounts_spent": sum(1 for a in accounts if a["spent"]),
     }
     with _puter_allowance_lock:
         _puter_allowance_cache["at"] = now
@@ -3681,7 +3707,12 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
 
 # Key-pool rotation: statuses that mean "this key is bad/throttled, try the
 # next key for the SAME provider before falling back to another provider".
-_KEY_ROTATE_STATUSES = (401, 403, 429)
+# 402 added 2026-07-31: a key whose CREDIT is spent is the textbook case for
+# trying the next key in the pool. Without it, one exhausted account took the
+# whole provider down even when a second, funded key sat right behind it —
+# which is exactly the situation when several Puter accounts are pooled (each
+# account carries its own allowance; see _puter_allowance).
+_KEY_ROTATE_STATUSES = (401, 402, 403, 429)
 _provider_key_cursor = {}          # pid -> next round-robin start offset
 _key_cursor_lock = threading.Lock()
 
