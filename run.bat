@@ -59,8 +59,21 @@ if not exist ".venv\Scripts\python.exe" (
 
 call ".venv\Scripts\activate.bat"
 
-echo [free-llm-hub] Installing dependencies (flask, requests)...
-pip install -q -r requirements.txt
+rem --- dependencies: install ONLY when they are actually missing or changed ---
+rem This ran `pip install` on EVERY start, which is why a plain restart took
+rem 60-200s of network round-trips before the hub bound its port -- painful, and
+rem it makes the hub look hung. The stamp holds a hash of requirements.txt, so a
+rem pinned-version bump still triggers a real install; nothing else does.
+set "DEPS_OK="
+python -c "import hashlib,os,sys;h=hashlib.sha256(open('requirements.txt','rb').read()).hexdigest();p=os.path.join('.venv','.deps-stamp');ok=os.path.exists(p) and open(p).read().strip()==h;__import__('flask');__import__('requests');sys.exit(0 if ok else 1)" >nul 2>nul
+if not errorlevel 1 set "DEPS_OK=1"
+if defined DEPS_OK (
+  echo [free-llm-hub] Dependencies already installed - skipping pip.
+) else (
+  echo [free-llm-hub] Installing dependencies ^(flask, requests^)...
+  pip install -q -r requirements.txt
+  if not errorlevel 1 python -c "import hashlib,os;h=hashlib.sha256(open('requirements.txt','rb').read()).hexdigest();open(os.path.join('.venv','.deps-stamp'),'w').write(h)" >nul 2>nul
+)
 
 echo.
 echo ==========================================================
