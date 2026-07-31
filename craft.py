@@ -78,20 +78,20 @@ PROGRAMMING = """ENGINEERING BRIEF (apply unless the user says otherwise)
 - Security: validate input at the boundary, parameterise queries, never log a secret.
 ANTI: dumping a rewritten file when a small edit was asked for; try/except that swallows errors; claiming something works without running it."""
 
-SHIP = """FINISH THE JOB (applies to any build/deploy task)
-- "Done" means it RUNS. Install deps, start it, hit it, and say what you actually observed — never hand over code you did not execute.
-- If the user asked for it to be deployed, carry the deployment through. Do not stop at instructions for them to follow.
-- BLOCKED? Say so in one line, name the exact blocker, and give the exact command that clears it. Never trail off mid-task.
-  * tool missing -> "vercel CLI is not installed. Run: npm i -g vercel"
-  * needs login  -> "vercel needs a browser login I cannot do. Run: vercel login" (same for netlify/wrangler/gh)
-  * needs a secret -> name the variable and where it goes.
-- Prefer a deploy path that already works on this machine. Check what is installed before choosing one, and do not assume a CLI exists.
-- After deploying, print the live URL and confirm you fetched it successfully. An unverified deploy is not a deploy.
-ANTI: stopping at "you can now deploy this to Vercel"; claiming success without running anything; inventing a URL."""
+SHIP = """FINISH THE JOB — DEPLOY LOCALLY (applies to any build/run/deploy task)
+- "Deploy" here means RUNNING ON THIS MACHINE. Do not reach for Vercel/Netlify/cloud hosting, and do not tell the user to sign up for anything, unless they explicitly ask for a public URL.
+- "Done" means it RUNS and you SAW it run. Install deps, start it, fetch it, report the real status code. Never hand over code you did not execute.
+- Use what the project already has, in this order: its own script (npm run dev / npm start / pnpm dev), then the framework CLI (vite / next / astro), then a plain static server (npx serve . or python -m http.server PORT) for plain HTML/CSS/JS.
+- Start it in the BACKGROUND so the shell is not blocked, then verify with a real request (curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:PORT). A start command that returns is not proof the site works.
+- Print the exact local URL, plus how to stop it (the PID or the command). If the port is taken, pick a free one and say which.
+- BLOCKED? One line: the exact blocker and the exact command that clears it. Never trail off mid-task.
+ANTI: stopping at "you can now deploy this to Vercel" or "run npm start to see it"; claiming it works without fetching it; inventing a URL or a port you never opened; leaving a foreground server that hangs the session."""
 
 _SHIP_RE = re.compile(
     r"\bdeploy\w*\b|\bship it\b|\bgo live\b|\bpublish\b|\bhost(?:ing)?\b|"
-    r"\bvercel\b|\bnetlify\b|\bcloudflare pages\b|\bproduction\b", re.I)
+    r"\bvercel\b|\bnetlify\b|\bcloudflare pages\b|\bproduction\b|"
+    r"\brun (?:it|the (?:app|site|project|server))\b|\bserve (?:it|the)\b|"
+    r"\bpreview\b|\blocalhost\b|\bstart the (?:app|server|site)\b", re.I)
 
 _BRIEFS = [
     ("ship", _SHIP_RE, SHIP),

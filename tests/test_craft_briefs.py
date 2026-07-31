@@ -137,17 +137,39 @@ def test_ship_brief_stays_out_of_non_deploy_work(text):
     assert "ship" not in craft.names(text)
 
 
-def test_ship_brief_demands_a_named_blocker_not_a_trailing_off():
-    """The reported failure: Codex built a store, said to go to Vercel, and
-    stopped — while no deploy CLI was installed at all. The useful behaviour is
-    naming the blocker AND the command that clears it."""
+def test_ship_means_LOCAL_not_cloud():
+    """User: "I don't want Vercel, I just want local deployment." Cloud hosting
+    needs an account and a browser login no agent can complete; node/npm/python
+    are already on the machine."""
     body = craft.SHIP
-    assert "npm i -g vercel" in body, "must give the exact unblocking command"
-    assert "vercel login" in body, "must name the human-only login step"
-    assert "you can now deploy this to Vercel" in body, "must forbid trailing off"
+    assert "RUNNING ON THIS MACHINE" in body
+    assert "do not tell the user to sign up" in body.lower()
+    assert "unless they explicitly ask for a public URL" in body
 
 
-def test_ship_brief_requires_verifying_the_deploy():
+def test_ship_brief_names_the_local_run_paths():
+    body = craft.SHIP
+    for path in ("npm run dev", "npm start", "python -m http.server", "npx serve"):
+        assert path in body, path
+
+
+def test_ship_brief_requires_actually_fetching_the_running_site():
+    """A start command that returns is not proof the site works."""
+    body = craft.SHIP
+    assert "curl" in body and "127.0.0.1" in body
+    assert "not proof" in body
+
+
+def test_ship_brief_requires_background_start_and_a_stop_instruction():
+    """A foreground server hangs the agent's session for the rest of the task."""
     body = craft.SHIP.lower()
-    assert "url" in body and "verif" in body
-    assert "inventing a url" in body, "a fabricated URL is the worst failure here"
+    assert "background" in body
+    assert "how to stop it" in body
+    assert "foreground server" in body
+
+
+def test_ship_brief_forbids_the_observed_failures():
+    body = craft.SHIP
+    assert "you can now deploy this to Vercel" in body, "must forbid trailing off"
+    assert "run npm start to see it" in body, "handing back instructions is the same failure"
+    assert "inventing a URL" in body
