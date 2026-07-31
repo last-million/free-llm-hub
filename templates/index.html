@@ -567,6 +567,39 @@
     display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
     gap:10px;margin:2px 0 4px;
   }
+  /* ---- Hub controls: tools overview ------------------------------------- */
+  .lc-tools{
+    margin-top:14px;padding-top:14px;border-top:1px solid var(--border-soft);
+    display:flex;flex-direction:column;gap:10px;
+  }
+  .lc-tools-h{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+  .lc-tools-t{font-size:13px;font-weight:600;color:var(--text)}
+  .lc-tools-count{font-size:12px;color:var(--text-dim)}
+  .lc-tool-pills{display:flex;gap:7px;flex-wrap:wrap}
+  .lc-pill{
+    display:inline-flex;align-items:center;gap:6px;
+    padding:5px 10px;border-radius:999px;font-size:12px;line-height:1.3;
+    background:var(--surface-2);border:1px solid var(--border);color:var(--text);
+  }
+  /* Status is a dot AND a word — never colour alone (WCAG 1.4.1). */
+  .lc-pill .dot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--text-faint)}
+  .lc-pill.on{background:var(--accent-soft);border-color:var(--accent-border)}
+  .lc-pill.on .dot{background:var(--accent-strong)}
+  .lc-pill .st{color:var(--text-dim);font-size:11px}
+  .lc-pill.on .st{color:var(--accent-strong)}
+  .lc-pill.off-list{opacity:.6}
+  .lc-endpoint{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12.5px}
+  .lc-endpoint-lbl{color:var(--text-dim)}
+  .lc-endpoint code{
+    background:var(--bg-inset);border:1px solid var(--border-soft);
+    border-radius:var(--radius-sm);padding:3px 8px;font-size:12px;color:var(--text);
+    overflow-wrap:anywhere;
+  }
+  .lc-tools-actions{display:flex;gap:8px;flex-wrap:wrap}
+  @media (max-width:520px){
+    .lc-tools-actions .btn{flex:1 1 auto}
+  }
+
   /* "Prompt enhanced by X — Use my original": the rewrite is never silent. */
   .enhanced-note{
     display:none;align-items:center;gap:8px;flex-wrap:wrap;
@@ -1416,6 +1449,28 @@
         <button class="btn sm" id="hub-stop" type="button" title="Disconnect all CLIs and stop being the default LLM — the local server keeps running">Stop being default (disconnect CLIs)</button>
         <button class="btn danger sm" id="hub-shutdown" type="button" title="Stop the hub server — it will NOT auto-restart until you relaunch it">Stop hub</button>
         <div id="lifecycle-detail" class="lifecycle-detail" role="status"><span class="skel skel-line"></span></div>
+      </div>
+      <!-- Tools overview: the same state the "My tools" and "Add a tool" pages
+           show, summarised here so Hub controls answers "what is pointed at me
+           right now, and where do I point something new" without a detour.
+           Fed by renderClis()'s existing /api/clis response - no second fetch,
+           and no duplicated ids (this is a read-only summary; every action
+           still lives on the full pages, one click away). -->
+      <div class="lc-tools" id="lifecycle-tools">
+        <div class="lc-tools-h">
+          <span class="lc-tools-t">Your tools</span>
+          <span class="lc-tools-count" id="lc-tools-count"></span>
+        </div>
+        <div class="lc-tool-pills" id="lc-tool-pills"><span class="skel skel-line"></span></div>
+        <div class="lc-endpoint">
+          <span class="lc-endpoint-lbl">Point any tool here</span>
+          <code id="lc-endpoint-url">loading&hellip;</code>
+          <button class="btn sm ghost" id="lc-endpoint-copy" type="button">Copy</button>
+        </div>
+        <div class="lc-tools-actions">
+          <button class="btn sm" type="button" data-jump="sec-clis">Manage my tools</button>
+          <button class="btn sm ghost" type="button" data-jump="sec-connect">Add a tool</button>
+        </div>
       </div>
     </div>
   </section>
@@ -4145,6 +4200,61 @@
     'kimi': 'https://github.com/MoonshotAI/kimi-code'
   };
 
+  /* Mirrors "My tools" + "Add a tool" into Hub controls as a read-only summary:
+     which CLIs are installed, which are actually pointed at this hub, and the
+     endpoint to point a new one at. Every ACTION stays on the full pages (one
+     click away via data-jump) so there is exactly one implementation of each
+     and no duplicated element ids to collide. */
+  function renderLifecycleTools(installed, missing, connectedCount){
+    var pills = $('#lc-tool-pills'); if (!pills) return;
+    var count = $('#lc-tools-count');
+    if (count){
+      count.textContent = installed.length
+        ? connectedCount + ' of ' + installed.length + ' connected to this hub'
+        : 'none detected on this machine';
+    }
+    pills.innerHTML = '';
+    if (!installed.length){
+      var none = document.createElement('span');
+      none.className = 'lc-pill off-list';
+      none.textContent = 'No supported AI CLIs detected';
+      pills.appendChild(none);
+    }
+    installed.forEach(function(c){
+      var el = document.createElement('span');
+      el.className = 'lc-pill' + (c.connected ? ' on' : '');
+      el.innerHTML = '<span class="dot" aria-hidden="true"></span>' +
+                     '<span>' + esc(c.name || c.id) + '</span>' +
+                     '<span class="st">' + (c.connected ? 'connected' : 'not connected') + '</span>';
+      pills.appendChild(el);
+    });
+    if (missing && missing.length){
+      var more = document.createElement('span');
+      more.className = 'lc-pill off-list';
+      more.textContent = '+' + missing.length + ' not installed';
+      more.title = missing.map(function(c){ return c.name || c.id; }).join(', ');
+      pills.appendChild(more);
+    }
+    var url = $('#lc-endpoint-url');
+    if (url) url.textContent = location.origin + '/v1';
+  }
+
+  function initLifecycleTools(){
+    var host = $('#lifecycle-tools'); if (!host) return;
+    host.addEventListener('click', function(e){
+      var jump = e.target.closest('[data-jump]');
+      if (jump){
+        var nav = document.querySelector('.cx-nav-item[data-view="' + jump.dataset.jump + '"]');
+        if (nav) nav.click();
+        return;
+      }
+      var copyBtn = e.target.closest('#lc-endpoint-copy');
+      if (copyBtn){
+        copyText((($('#lc-endpoint-url') || {}).textContent || ''), copyBtn);
+      }
+    });
+  }
+
   function loadClis(){
     var host = $('#cli-list'); if (!host) return;
     return api('/api/clis').then(function(rows){
@@ -4168,6 +4278,7 @@
     var missing = rows.filter(function(c){ return !c.installed; });
     var connected = installed.filter(function(c){ return c.connected; }).length;
     setSecChip('clis', installed.length ? (connected + ' / ' + installed.length + ' connected') : '');
+    renderLifecycleTools(installed, missing, connected);
 
     if (!installed.length){
       var none = document.createElement('div');
@@ -5886,6 +5997,7 @@
   initVisionGap();
   initTestVerification();
   initPromptEnhance();
+  initLifecycleTools();
   initSocialWebSearch();
   initThemeToggle();
   initSettingsDrawer();
