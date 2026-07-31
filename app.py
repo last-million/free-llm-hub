@@ -668,7 +668,7 @@ _PREF_FLOORS = (135, 140, 136, 135, 133,   138,    136,     134,    135)
 # 'anthropic/claude-fable-5', 'claude-3-7-sonnet'. Anchored on the word so
 # 'claude-code' style CLI-relay ids (subscription hops, scored elsewhere) and
 # stray substrings don't collect the floor.
-_CLAUDE_FAMILY_RE = re.compile(r"(?:^|[/:_-])claude[-.]?(?:opus|sonnet|haiku|fable|\d)")
+_CLAUDE_FAMILY_RE = re.compile(r"(?:^|[/:._-])claude[-.]?(?:opus|sonnet|haiku|fable|\d)")
 # Captures the GPT version so the floor can SCALE with it — "all GPT-5 versions
 # are good, and a higher version means it's better", which two flat tiers could
 # not express. gpt-5 -> (5, None), gpt-5.6-sol -> (5, 6), gpt-6.2-codex ->
