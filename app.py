@@ -2475,6 +2475,297 @@ def _subscription_chat(pid, payload):
     })
 
 
+# --------------------------------------------------------------------------- #
+# Puter: DRIVER-based AI, not OpenAI-compatible for the tokens we can obtain.
+#
+# PROBED LIVE 2026-07-31 with a real popup token:
+#   POST https://api.puter.com/puterai/openai/v1/chat/completions
+#     -> 403 {"code":"forbidden","message":"This endpoint is only available to
+#        user sessions"}   <- that surface wants a browser SESSION, and the
+#        popup hands out an APP token, so it can never work from this hub.
+#   POST https://api.puter.com/drivers/call
+#     {"interface":"puter-chat-completion","method":"complete",
+#      "args":{"messages":[...],"model":"gpt-4.1"}}
+#     -> 200 {"success":true,"result":{index,message,finish_reason,usage}}
+# The driver path is what puter.js itself calls for every AI feature, so it is
+# the one this hub uses. With "stream":true the SAME endpoint answers
+# application/x-ndjson: one {"type":"text","text":"..."} object per delta, then
+# a final {"type":"usage",...}. Everything downstream in this hub speaks OpenAI
+# (SSE for streams), so both directions are translated here and nowhere else.
+# --------------------------------------------------------------------------- #
+_PUTER_DRIVERS_URL = "https://api.puter.com/drivers/call"
+_PUTER_CHAT_IFACE = "puter-chat-completion"
+_PUTER_IMAGE_IFACE = "puter-image-generation"
+_PUTER_IMAGE_DRIVER = "ai-image"      # the default puter.js's txt2img passes
+# Sentinel image "model": Puter's image driver picks the model server-side and
+# publishes no catalog, so the registry row carries the DRIVER name and this
+# means "send no model arg at all".
+_PUTER_IMAGE_DEFAULT_ID = "ai-image"
+
+
+def _is_puter_driver(pid):
+    return (prov.get_provider(pid) or {}).get("driver_api") == "puter"
+
+
+def _puter_post(api_key, body, stream=False, read_timeout=None):
+    """One POST to Puter's driver endpoint. Raises requests.RequestException
+    exactly like the plain-HTTP path, so callers need no special handling."""
+    return requests.post(
+        _PUTER_DRIVERS_URL,
+        json=body,
+        headers={"Authorization": "Bearer " + api_key,
+                 "Content-Type": "application/json"},
+        stream=stream,
+        timeout=(CONNECT_TIMEOUT,
+                 read_timeout or (STREAM_IDLE_TIMEOUT if stream else CHAT_READ_TIMEOUT)),
+    )
+
+
+def _puter_usage(u):
+    """Driver usage -> OpenAI usage. The driver reports prompt/completion but no
+    total_tokens (and adds usd_cents, which is metering, not token accounting)."""
+    if not isinstance(u, dict):
+        return None
+    try:
+        pt = int(u.get("prompt_tokens") or 0)
+        ct = int(u.get("completion_tokens") or 0)
+    except (TypeError, ValueError):
+        return None
+    return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+
+
+def _puter_err(status, detail):
+    return {"error": {"message": "Puter: %s" % (detail or "driver call failed"),
+                      "type": "upstream_error", "code": status}}
+
+
+class _PuterStreamResponse:
+    """Response look-alike whose iter_lines() yields OpenAI SSE lines built from
+    Puter's NDJSON driver stream. Same minimal surface as _SubResponse (which
+    the chain loops already accept), plus real streaming.
+
+    `deltas` is an iterable of OpenAI `delta` dicts; the buffered constructor
+    passes a one-element list so a tools request (whose streamed tool-call shape
+    on this driver is NOT verified) still reaches the client as one complete
+    chunk instead of risking silently-dropped tool_calls."""
+
+    def __init__(self, upstream, model, deltas, finish_reason="stop", usage=None):
+        self._upstream = upstream          # None for the buffered path
+        self.status_code = 200
+        self.headers = {"Content-Type": "text/event-stream"}
+        self.text = ""
+        self._model = model
+        self._deltas = deltas
+        self._finish = finish_reason
+        self._usage = usage
+
+    @classmethod
+    def buffered(cls, model, message, finish_reason="stop", usage=None):
+        delta = {"role": "assistant"}
+        if message.get("content"):
+            delta["content"] = message["content"]
+        if message.get("tool_calls"):
+            delta["tool_calls"] = message["tool_calls"]
+        return cls(None, model, [delta], finish_reason or "stop", usage)
+
+    @classmethod
+    def from_ndjson(cls, upstream, model):
+        return cls(upstream, model, None)
+
+    def _ndjson_deltas(self):
+        """Translate the live NDJSON stream. Unknown event types are skipped
+        rather than guessed at; a usage event is captured for the final chunk."""
+        first = True
+        for raw in self._upstream.iter_lines(decode_unicode=False):
+            if not raw:
+                continue
+            try:
+                ev = json.loads(raw.decode("utf-8", "replace"))
+            except (ValueError, AttributeError):
+                continue
+            if not isinstance(ev, dict):
+                continue
+            kind = ev.get("type")
+            if kind == "text":
+                delta = {"content": ev.get("text") or ""}
+                if first:
+                    delta["role"] = "assistant"
+                    first = False
+                yield delta
+            elif kind == "usage":
+                self._usage = _puter_usage(ev.get("usage"))
+            elif kind == "error":
+                self._finish = "stop"
+
+    def iter_lines(self, decode_unicode=False):
+        cid = "chatcmpl-puter-" + uuid.uuid4().hex
+        created = int(time.time())
+
+        def _chunk(delta, finish=None):
+            body = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                    "model": self._model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+            return b"data: " + json.dumps(body).encode("utf-8")
+
+        deltas = self._deltas if self._deltas is not None else self._ndjson_deltas()
+        for delta in deltas:
+            yield _chunk(delta)
+        final = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                 "model": self._model,
+                 "choices": [{"index": 0, "delta": {}, "finish_reason": self._finish}]}
+        if self._usage:
+            final["usage"] = self._usage
+        yield b"data: " + json.dumps(final).encode("utf-8")
+        yield b"data: [DONE]"
+
+    def iter_content(self, chunk_size=None):
+        return iter(())
+
+    def json(self):
+        return {}
+
+    def close(self):
+        try:
+            if self._upstream is not None:
+                self._upstream.close()
+        except Exception:                                    # noqa: BLE001
+            pass
+
+
+def _puter_chat(pid, payload, stream):
+    """_upstream_chat's Puter twin: same contract (returns a response-like with
+    .status_code/.json()/.text/.close(), raises RuntimeError with no key), but
+    speaking the driver protocol. Rotates the key pool on the same statuses as
+    the HTTP path. Never logs a token."""
+    pcfg = config.get_provider_config(pid)
+    keys = pcfg.get("api_keys") or []
+    if not keys:
+        raise RuntimeError("no api key for provider " + pid)
+    model = payload.get("model")
+    args = {"messages": payload.get("messages") or []}
+    if model:
+        args["model"] = model
+    # Forwarded as-is when present; the driver ignores what it doesn't know.
+    for k in ("tools", "tool_choice", "temperature", "max_tokens", "top_p"):
+        if payload.get(k) is not None:
+            args[k] = payload[k]
+    # Tool-calls are NOT streamed here: the driver's NDJSON tool-call event
+    # shape is unverified, and guessing it would silently drop tool_calls
+    # mid-agentic-turn. Buffer instead and replay as one chunk (the same
+    # tradeoff the sub-* hops already make).
+    live_stream = bool(stream) and not payload.get("tools")
+    if live_stream:
+        args["stream"] = True
+    body = {"interface": _PUTER_CHAT_IFACE, "method": "complete", "args": args}
+
+    n = len(keys)
+    start = _next_key_start(pid, n)
+    last = None
+    for i in range(n):
+        is_last = (i == n - 1)
+        key = keys[(start + i) % n]
+        try:
+            resp = _puter_post(key, body, stream=live_stream)
+        except requests.RequestException:
+            if is_last:
+                raise
+            continue
+        quota.record(pid, model)
+        if resp.status_code in _KEY_ROTATE_STATUSES and not is_last:
+            resp.close()
+            continue
+        if resp.status_code != 200:
+            detail = _upstream_error_detail(resp)
+            resp.close()
+            last = _SubResponse(resp.status_code, _puter_err(resp.status_code, detail))
+            if is_last:
+                return last
+            continue
+        if live_stream:
+            return _PuterStreamResponse.from_ndjson(resp, model or "puter")
+        try:
+            data = resp.json() or {}
+        except ValueError:
+            resp.close()
+            return _SubResponse(502, _puter_err(502, "non-JSON driver response"))
+        resp.close()
+        if not data.get("success"):
+            detail = data.get("message") or data.get("error") or "driver reported failure"
+            return _SubResponse(502, _puter_err(502, _sanitize(str(detail))[:300]))
+        result = data.get("result")
+        if not isinstance(result, dict):
+            return _SubResponse(502, _puter_err(502, "driver returned no result"))
+        # `result` IS an OpenAI choice (index/message/finish_reason) with usage
+        # nested inside it — lift usage to the top level where OpenAI puts it.
+        message = result.get("message") or {"role": "assistant", "content": ""}
+        openai = {
+            "id": "chatcmpl-puter-" + uuid.uuid4().hex,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model or "puter",
+            "choices": [{"index": 0, "message": message,
+                         "finish_reason": result.get("finish_reason") or "stop"}],
+        }
+        usage = _puter_usage(result.get("usage"))
+        if usage:
+            openai["usage"] = usage
+        if stream:
+            # Streaming was requested but buffered (tools present) — replay the
+            # complete answer as a single SSE chunk rather than skipping the hop.
+            return _PuterStreamResponse.buffered(
+                model or "puter", message, result.get("finish_reason"), usage)
+        return _SubResponse(200, openai)
+    return last or _SubResponse(502, _puter_err(502, "no usable key"))
+
+
+def _puter_image_b64(result):
+    """Puter's image driver returns a `data:image/...;base64,<payload>` string
+    (sometimes wrapped in a dict). Return just the base64 payload."""
+    if isinstance(result, dict):
+        result = result.get("url") or result.get("image") or result.get("data")
+    if not isinstance(result, str):
+        return None
+    if "base64," in result:
+        return result.split("base64,", 1)[1].strip() or None
+    return result.strip() or None
+
+
+def _puter_generate_image(pcfg, model, prompt, size="1024x1024", steps=4):
+    """Puter text-to-image through the same driver endpoint as chat.
+    `size`/`steps` are accepted for signature parity and ignored: the driver
+    takes neither (verified against puter.js's txt2img binding, whose only
+    positional arg is `prompt`), and it answers 1024x1024."""
+    keys = pcfg.get("api_keys") or []
+    if not keys:
+        return 400, None, "no api key for provider puter"
+    args = {"prompt": (prompt or "")[:32000]}
+    body = {"interface": _PUTER_IMAGE_IFACE, "method": "generate", "args": args}
+    if model and model != _PUTER_IMAGE_DEFAULT_ID:
+        # Naming a driver makes `model` MANDATORY (400 "Missing `model`"), and
+        # an unknown one is rejected with 400 "Model not found: X". Omitting
+        # BOTH — the sentinel path — is what actually returned a PNG when
+        # probed live, so the default route sends neither key.
+        args["model"] = model
+        body["driver"] = _PUTER_IMAGE_DRIVER
+    try:
+        resp = _puter_post(keys[0], body, read_timeout=CHAT_READ_TIMEOUT)
+    except requests.RequestException as exc:
+        return 502, None, exc.__class__.__name__
+    if resp.status_code != 200:
+        return resp.status_code, None, _upstream_error_detail(resp)
+    try:
+        data = resp.json() or {}
+    except ValueError:
+        return 502, None, "Puter returned a non-JSON image response"
+    if not data.get("success"):
+        detail = data.get("message") or data.get("error") or "image generation failed"
+        return 502, None, _sanitize(str(detail))[:200]
+    b64 = _puter_image_b64(data.get("result"))
+    if not b64:
+        return 502, None, "Puter returned no image data"
+    return 200, b64, None
+
+
 def _dispatch_chat(pid, payload, stream):
     """Single entry point for the chain loops: a local subscription CLI for a
     sub-* hop, the HTTP upstream for everything else. Keeps the loops
@@ -3377,6 +3668,12 @@ def _upstream_chat(pid, payload, stream):
         if isinstance(mt, int) and mt < 16:
             payload = dict(payload)
             payload["max_tokens"] = 16
+    # Puter speaks a DRIVER protocol, not OpenAI-over-HTTP — its
+    # /chat/completions surface 403s the app tokens this hub can obtain. The
+    # branch lives HERE, not only in _dispatch_chat, so every caller (the key
+    # test, the model probe, the chain loops) goes the working way.
+    if _is_puter_driver(pid):
+        return _puter_chat(pid, payload, stream)
     pcfg = config.get_provider_config(pid)
     # _resolve_base_url, not base_url_for: it also fills Cloudflare's
     # {account_id} from the token so the user only pastes a key.
@@ -9936,7 +10233,9 @@ def v1_count_tokens():
 # back a real fetchable `url`, and a `data:` URI in the `url` field would
 # break any client (including the real OpenAI SDK) that tries to GET it.
 # ---------------------------------------------------------------------------
-_IMAGE_PROVIDER_ORDER = ("cloudflare", "modelscope", "pollinations")
+# puter first: GPT-Image quality (excellent in-image text) off the same free
+# account the chat side already uses, verified live 2026-07-31.
+_IMAGE_PROVIDER_ORDER = ("puter", "cloudflare", "modelscope", "pollinations")
 MAX_IMAGE_HOPS = 4              # bound worst-case latency (ModelScope polls up to 60s/hop)
 _MODELSCOPE_POLL_DEADLINE = 60  # seconds
 
@@ -10468,6 +10767,8 @@ _IMAGE_GENERATORS = {
     "google": _google_generate_image,
     "openrouter": _openrouter_generate_image,
     "higgsfield": _higgsfield_generate_image,
+    # Driver-based, not an images REST endpoint — see _puter_generate_image.
+    "puter": _puter_generate_image,
 }
 
 

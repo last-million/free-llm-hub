@@ -91,6 +91,35 @@ away:
   `Error: No referrer found` and nothing ever renders. puter.js answers from an
   always-on top-level listener — so index.html registers one too (at load, NOT
   inside `connectPuter()`), replying `{msg:"originResponse"}` to `e.source`.
+- **Puter is NOT OpenAI-compatible for our tokens — it is driver-based.**
+  `POST <base_url>/chat/completions` with a real popup token answers
+  `403 "This endpoint is only available to user sessions"`: that surface wants a
+  browser SESSION, and the popup hands out an APP token. Everything therefore
+  goes through `POST https://api.puter.com/drivers/call`, which is what puter.js
+  itself calls. `driver_api: "puter"` on the registry entry selects the adapter
+  (`_puter_chat`, branched inside `_upstream_chat` so the key test and model
+  probe take the working path too). Verified live: chat 200, `stream:true`
+  returns `application/x-ndjson` (`{"type":"text","text":…}` per delta, final
+  `{"type":"usage",…}`) which `_PuterStreamResponse` translates to OpenAI SSE.
+  Tool requests are deliberately buffered, not live-streamed — the driver's
+  streamed tool-call event shape is unverified and guessing it would silently
+  drop `tool_calls`. `base_url` is kept for documentation only; nothing posts
+  to it.
+- **Text-to-image works; image-to-image does not.** Same driver endpoint,
+  `interface: "puter-image-generation"`, `method: "generate"`, args `{prompt}`
+  → `{"success":true,"result":"data:image/png;base64,…"}` (1024x1024, C2PA-
+  signed). Gotcha: naming `driver: "ai-image"` makes `model` MANDATORY
+  (400 "Missing `model`") and an unknown model is 400 "Model not found: X" —
+  omitting BOTH is the only combination verified to return a PNG, so the
+  registry row's id `ai-image` is a sentinel meaning "send neither". Puter
+  publishes no image catalog (the chat catalog has zero image-output models and
+  neither JS bundle names one). puter.js binds txt2img/txt2vid/img2txt/
+  txt2speech/speech2txt/speech2speech — there is **no img2img**.
+- **Text-to-video exists but is PAID.** `interface:
+  "puter-video-generation"` (driver `ai-video`, args `{prompt, seconds}`)
+  returns `402 {"code":"insufficient_funds"}` on a free account, even with
+  `test_mode: true`. No `img2vid` / `vid2vid` interface exists in either
+  bundle. Do not wire Puter video into a free-tier rotation.
 - **`<base_url>/models` does not exist.** `models_url` is
   `https://api.puter.com/puterai/chat/models/details` (the route puter.js
   itself calls: public, 200, 563 models, `{"models":[{"id":..}]}` — a shape
