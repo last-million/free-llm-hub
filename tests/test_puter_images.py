@@ -38,6 +38,10 @@ def test_https_result_is_downloaded_not_treated_as_base64(monkeypatch):
     def fake_get(url, **kw):
         seen["url"] = url
         return R()
+    # Pin the SSRF check: it does a REAL DNS lookup, so leaving it live made
+    # this test depend on resolving replicate.delivery — green alone, flaky in
+    # the full suite. Its own behaviour is covered by the next test.
+    monkeypatch.setattr(app, "_is_safe_external_url", lambda u: True)
     monkeypatch.setattr(app.requests, "get", fake_get)
     b64, err = app._puter_image_b64("https://replicate.delivery/x/out-0.webp")
     assert err is None
@@ -57,6 +61,7 @@ def test_a_failed_download_reports_instead_of_returning_junk(monkeypatch):
     class R:
         status_code = 503
         content = b""
+    monkeypatch.setattr(app, "_is_safe_external_url", lambda u: True)   # no live DNS
     monkeypatch.setattr(app.requests, "get", lambda *a, **k: R())
     b64, err = app._puter_image_b64("https://replicate.delivery/x/out-0.webp")
     assert b64 is None and "download failed" in err

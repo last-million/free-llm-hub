@@ -1309,7 +1309,20 @@ PROVIDERS: Dict[str, dict] = {
         # ids and drops every prefixed twin. exclude_families is checked BEFORE
         # every other filter rule, so a prefixed id can never be re-admitted.
         "exclude_families": [":"],
-        "free_filter": "all",
+        # NOT A FREE TIER — a metered account with a tiny monthly credit.
+        # MEASURED 2026-07-31 from Puter's own /metering/usage: the allowance is
+        # 25,000,000 micro-cents = ~25 US CENTS PER MONTH, shared across chat AND
+        # images. One Gemini image is 15% of the whole month; 98 ordinary calls
+        # spent it completely. Declaring `free_filter: "all"` (as this entry did)
+        # put all 164 canonical ids into FREE auto-rotation, so the router kept
+        # reaching for a pot that runs dry in a few dozen calls and then 402s.
+        # Same treatment as alibaba's consumable trial: no free models, so puter
+        # is reachable by an explicit '<pid>/<model>' pin or by switching auto
+        # routing to 'mix'/'paid' — never as part of the free fleet.
+        "paid": True,
+        "trial": True,
+        "free_filter": "pricing_zero",
+        "free_families": [],
         # Live probe 2026-07-31 against the real catalog (563 models): the
         # gateway is up and auth-gated (chat completions answers
         # 'reauth_required' on a dummy bearer). Pins below are VERIFIED to
@@ -1317,8 +1330,11 @@ PROVIDERS: Dict[str, dict] = {
         # fails. 'gpt-5.5-pro' was a PHANTOM id — the served one is dated,
         # gpt-5.5-pro-2026-04-23 (still matched by the app.py _PREF_FLOORS
         # substring, so its scoring floor is unaffected).
-        "default_free_models": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-                                "gpt-5.5-pro-2026-04-23", "gpt-4.1"],
+        # EMPTY on purpose: a populated list here is returned as "free models"
+        # regardless of free_filter, which would put puter straight back into
+        # free auto-rotation. These ids are still perfectly usable — pin them as
+        # 'puter/gpt-5.6-sol' etc., or set auto routing to 'mix'.
+        "default_free_models": [],
         # TEXT-TO-IMAGE via the same drivers/call endpoint as chat
         # (interface "puter-image-generation", method "generate").
         #
