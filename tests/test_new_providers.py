@@ -258,7 +258,12 @@ def test_puter_registered_with_required_fields():
     assert p is not None, "puter missing from PROVIDERS"
     assert p.get("name")
     assert p["base_url"] == "https://api.puter.com/puterai/openai/v1"
-    assert p["models_url"] == "https://api.puter.com/puterai/openai/v1/models"
+    # NOT <base_url>/models — that route does not exist on Puter's gateway
+    # (404 "not_found" with a valid bearer too, probed 2026-07-31), which made
+    # every key Test fail "✗ HTTP 404". The catalog route puter.js itself calls
+    # is /puterai/chat/models/details.
+    assert p["models_url"] == "https://api.puter.com/puterai/chat/models/details"
+    assert not p["models_url"].startswith(p["base_url"])
     assert p["signup_url"] == "https://puter.com"
     assert p.get("key_hint")
     assert p["free_filter"] in prov.FREE_FILTERS
