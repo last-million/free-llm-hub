@@ -1260,6 +1260,17 @@ PROVIDERS: Dict[str, dict] = {
         # Pinned in the dashboard's Recommended zone: one free puter.com
         # account token unlocks the newest flagship catalog (GPT-5.6 family).
         "recommended": True,
+        # DRIVER-BASED, not OpenAI-compatible for the tokens this hub can get.
+        # PROBED LIVE 2026-07-31 with a real popup token: POST
+        # <base_url>/chat/completions answers 403 "This endpoint is only
+        # available to user sessions" — that surface accepts a browser SESSION,
+        # not the app token puter.js hands out. The token DOES work on
+        # POST https://api.puter.com/drivers/call, which is what puter.js
+        # itself calls for every AI feature. app.py's `driver_api` adapter
+        # translates OpenAI chat-completions <-> that driver in both
+        # directions (streaming included: the driver answers NDJSON).
+        # base_url is kept for reference/documentation only; nothing posts to it.
+        "driver_api": "puter",
         "base_url": "https://api.puter.com/puterai/openai/v1",
         # NOT <base_url>/models — that path does NOT EXIST on Puter's gateway
         # (probed 2026-07-31: GET returns 404 "not_found" WITH a valid bearer
@@ -1294,6 +1305,25 @@ PROVIDERS: Dict[str, dict] = {
         # substring, so its scoring floor is unaffected).
         "default_free_models": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
                                 "gpt-5.5-pro-2026-04-23", "gpt-4.1"],
+        # TEXT-TO-IMAGE, verified live 2026-07-31: the same token that drives
+        # chat also drives `puter-image-generation`/`generate` on drivers/call
+        # (driver "ai-image", the default puter.js itself passes), which
+        # returned a real 1024x1024 C2PA-signed PNG as a data: URI.
+        # The id below is the DRIVER, not a model: Puter's image driver picks
+        # the model server-side and publishes no catalog for it (the chat
+        # catalog at /puterai/chat/models/details contains zero image-output
+        # models, and neither JS bundle names one). An unknown model arg is
+        # rejected with 400 "Model not found: X", so a specific id can be
+        # pinned here later if Puter ever documents one; the sentinel means
+        # "send no model arg and take Puter's default".
+        # IMAGE-TO-IMAGE is NOT available: puter.js binds txt2img, txt2vid,
+        # img2txt, txt2speech, speech2txt and speech2speech — there is no
+        # img2img interface to call.
+        "image_models": [
+            {"id": "ai-image", "label": "Puter (GPT Image)",
+             "text_in_image": "excellent",
+             "notes": "Puter picks the model server-side; 1024x1024 only (the driver takes no size arg). Metered against the free account's allowance like every other Puter call."},
+        ],
         "notes": "User-pays AI gateway: one free puter.com account auth token unlocks the whole OpenAI-compatible catalog (500+ models incl. the newest GPT-5.6 flagship family, GPT Image, and Claude/Gemini/Grok/DeepSeek/Mistral/Llama via the same account). Fair-use limits apply but are unpublished, so quota tracks it as UNKNOWN. Flagship ids carry a scoring preference floor (app.py _PREF_FLOORS) so puter ranks first among equals — user-requested top priority.",
     },
     "custom": {
