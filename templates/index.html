@@ -573,6 +573,38 @@
     display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
     gap:10px;margin:2px 0 4px;
   }
+  /* ---- EXHAUSTED provider card -----------------------------------------
+     When a provider has nothing left to give, the whole card says so: a red
+     border/tint, a cross badge on the title, and a countdown to the reset.
+     Colour is never the only signal — the cross mark and the words carry it
+     for anyone who can't rely on hue (WCAG 1.4.1). Adding a key stays fully
+     enabled: a spent allowance is exactly when you want to add another. */
+  .card.exhausted{
+    border-color:var(--danger-border);
+    background:linear-gradient(0deg,var(--danger-soft),var(--danger-soft)),var(--surface);
+  }
+  .card.exhausted .pname{color:var(--danger-text)}
+  .quota-cross{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:16px;height:16px;border-radius:50%;flex:none;margin-left:6px;
+    background:var(--danger);color:#fff;
+  }
+  .quota-cross svg{width:10px;height:10px}
+  .quota-line{
+    display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+    margin:8px 0 2px;font-size:12px;color:var(--text-dim);
+  }
+  .card.exhausted .quota-line{color:var(--danger-text);font-weight:600}
+  .quota-countdown{font-variant-numeric:tabular-nums}
+  /* Per-key exhaustion label, so a pooled provider says WHICH key is empty. */
+  .keyrow-tag{
+    font-size:10px;font-weight:600;letter-spacing:.02em;text-transform:uppercase;
+    padding:1px 6px;border-radius:999px;margin-left:6px;white-space:nowrap;
+    background:var(--danger-soft);color:var(--danger-text);
+    border:1px solid var(--danger-border);
+  }
+  .keyrow-tag.ok{background:var(--accent-soft);color:var(--accent-strong);border-color:var(--accent-border)}
+
   /* Remaining provider allowance (puter). Bar + words, never colour alone. */
   .allowance{margin:8px 0 2px}
   .allowance-bar{
@@ -2888,7 +2920,7 @@
     }
     function renderCard(p, target){
       var card = document.createElement('div');
-      card.className = 'card' + (p.enabled ? ' enabled' : '') + (p.no_key ? ' nokey' : '');
+      card.className = 'card' + (p.enabled ? ' enabled' : '') + (p.no_key ? ' nokey' : '') + (providerExhausted(p) ? ' exhausted' : '');
       card.dataset.pid = p.id;
       card.innerHTML = cardHTML(p);
       wireCard(card, p);
@@ -2967,6 +2999,23 @@
   /* One-line pitch shown on pinned recommended cards (only providers with a
      genuinely distinctive free offer get a line — keep this map tiny). */
   var REC_NOTES = { puter: 'Latest GPT-5.6 + 500 models with one free token' };
+  /* Exhausted = the free window is spent, OR every pooled account is empty.
+     Shared so the card class, the cross mark and the quota line never disagree. */
+  function providerExhausted(p){
+    if (!p) return false;
+    if (p.quota && p.quota.exhausted) return true;
+    return !!(p.allowance && p.allowance.remaining <= 0);
+  }
+  /* "3d 4h" / "7h 12m" / "45m" — short enough to sit inline on a card. */
+  function fmtCountdown(secs){
+    secs = Math.max(0, Math.floor(Number(secs) || 0));
+    var d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600),
+        m = Math.floor((secs % 3600) / 60);
+    if (d) return d + 'd ' + h + 'h';
+    if (h) return h + 'h ' + m + 'm';
+    return Math.max(1, m) + 'm';
+  }
+
   function cardHTML(p){
     var keys = Array.isArray(p.keys) ? p.keys : [];
     var kc = (typeof p.key_count === 'number') ? p.key_count : keys.length;
@@ -2988,11 +3037,25 @@
       badges += '<span class="badge paid" title="Generates images, paid only">&#128444; images (paid)</span>';
     }
 
+    /* Per-key allowance, when the provider reports it per account (puter).
+       A pooled provider that only says "some of it is gone" leaves you
+       guessing which key to replace. */
+    var perKey = {};
+    if (p.allowance && Array.isArray(p.allowance.per_key)){
+      p.allowance.per_key.forEach(function(a){ perKey[a.index] = a; });
+    }
     var savedKeysHTML = '';
     if (keys.length){
       savedKeysHTML = '<div class="saved-keys">' + keys.map(function(k){
+        var a = perKey[k.index];
+        var tag = '';
+        if (a){
+          tag = a.spent
+            ? '<span class="keyrow-tag">no quota left</span>'
+            : '<span class="keyrow-tag ok">' + esc(a.remaining_cents) + '¢ left</span>';
+        }
         return '<div class="saved-key" data-idx="' + esc(k.index) + '">' +
-          '<code class="sk-mask">' + esc(k.masked) + '</code>' +
+          '<code class="sk-mask">' + esc(k.masked) + '</code>' + tag +
           '<button type="button" class="sk-eye" title="Reveal key" aria-label="Reveal key">' + EYE_SVG + '</button>' +
           '<button type="button" class="sk-remove" title="Remove key" aria-label="Remove key">' + X_SVG + '</button>' +
         '</div>';
@@ -3001,14 +3064,39 @@
 
     var fm = Array.isArray(p.free_models) ? p.free_models : [];
     var fmPrev = fm.slice(0, 3).join(', ') + (fm.length > 3 ? ' +' + (fm.length - 3) + ' more' : '');
+    /* Exhausted = the free window is spent, OR every pooled account is empty.
+       Either way there is nothing left to serve until a reset. */
+    var q = p.quota || null;
+    var allowanceSpent = !!(p.allowance && p.allowance.remaining <= 0);
+    var isExhausted = !!(q && q.exhausted) || allowanceSpent;
+    var resetsIn = allowanceSpent ? (p.allowance && p.allowance.resets_in)
+                                  : (q && q.resets_in);
+    var estimated = allowanceSpent && p.allowance && p.allowance.resets_estimated;
+    var quotaLine = '';
+    if (isExhausted){
+      quotaLine = '<div class="quota-line">' +
+        '<span>Out of ' + (allowanceSpent ? 'allowance' : 'free quota') + '</span>' +
+        (resetsIn ? '<span class="quota-countdown" data-resets-in="' + esc(resetsIn) + '">' +
+                      '&middot; resets in ' + esc(fmtCountdown(resetsIn)) +
+                      (estimated ? ' (est.)' : '') + '</span>'
+                  : '') +
+        '</div>';
+    } else if (q && q.limit_known && typeof q.remaining === 'number'){
+      quotaLine = '<div class="quota-line"><span>' + esc(q.remaining) + ' of ' +
+        esc(q.limit) + ' left this ' + esc(q.window) + '</span></div>';
+    }
     return '' +
       '<div class="card-top">' +
-        '<div><div class="name">' + esc(p.name || p.id) + '</div><div class="pid">' + esc(p.id) + '</div></div>' +
+        '<div><div class="name">' + esc(p.name || p.id) +
+          (isExhausted ? '<span class="quota-cross" role="img" aria-label="out of quota">' +
+             '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></span>' : '') +
+          '</div><div class="pid">' + esc(p.id) + '</div></div>' +
         '<div class="badges">' +
           '<span class="key-health"><span class="kh-dot"></span><span class="kh-lbl"></span></span>' +
           badges +
         '</div>' +
       '</div>' +
+      quotaLine +
       (p.recommended && REC_NOTES[p.id] ? '<div class="rec-note">' + esc(REC_NOTES[p.id]) + '</div>' : '') +
       /* Real remaining allowance, read from the provider itself. Puter is the
          only one that exposes it; everything else stays as it was. Shown
@@ -3099,7 +3187,7 @@
     }
     function renderCard(p, target){
       var card = document.createElement('div');
-      card.className = 'card' + (p.enabled ? ' enabled' : '') + (p.no_key ? ' nokey' : '') + (p.recommended ? ' recommended' : '');
+      card.className = 'card' + (p.enabled ? ' enabled' : '') + (p.no_key ? ' nokey' : '') + (p.recommended ? ' recommended' : '') + (providerExhausted(p) ? ' exhausted' : '');
       card.dataset.pid = p.id;
       card.innerHTML = cardHTML(p);
       wireCard(card, p);
@@ -3399,7 +3487,7 @@
     updateProvider(row, pid);
     var p2 = findProvider((row && row.id) ? row.id : pid);
     if (!p2) return;
-    card.className = 'card' + (p2.enabled ? ' enabled' : '') + (p2.no_key ? ' nokey' : '') + (p2.recommended ? ' recommended' : '');
+    card.className = 'card' + (p2.enabled ? ' enabled' : '') + (p2.no_key ? ' nokey' : '') + (p2.recommended ? ' recommended' : '') + (providerExhausted(p2) ? ' exhausted' : '');
     card.innerHTML = cardHTML(p2);
     wireCard(card, p2);
     applyCardHealth(card, p2.id);   /* rebuild keeps whatever key-health we already know */
