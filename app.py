@@ -23,6 +23,7 @@ import hashlib
 import hmac
 import base64
 import binascii
+import calendar
 import copy
 import ipaddress
 import json
@@ -2592,6 +2593,15 @@ _puter_allowance_lock = threading.Lock()
 _PUTER_WHOAMI_URL = "https://api.puter.com/whoami"
 
 
+def _next_month_start_utc():
+    """Epoch seconds of 00:00 UTC on the 1st of next month."""
+    now = time.gmtime()
+    year, month = now.tm_year, now.tm_mon + 1
+    if month > 12:
+        year, month = year + 1, 1
+    return calendar.timegm((year, month, 1, 0, 0, 0, 0, 0, 0))
+
+
 def _puter_account_uuid(key):
     """The Puter account a token belongs to, or None. Identity, not the token:
     Puter mints a FRESH token on every sign-in, so string-dedupe cannot tell a
@@ -2691,6 +2701,16 @@ def _puter_allowance(force=False):
         "period": "month",
         "accounts": len(accounts),
         "accounts_spent": sum(1 for a in accounts if a["spent"]),
+        # Per-key rows so the card can mark WHICH saved account is empty --
+        # otherwise a pooled provider just says "some of it is gone".
+        "per_key": accounts,
+        # Puter reports monthUsageAllowance but no reset DATE anywhere, so this
+        # is the calendar-month boundary in UTC. Labelled an estimate in the UI
+        # for exactly that reason: it is an inference from "month", not a
+        # documented timestamp.
+        "resets_at": _next_month_start_utc(),
+        "resets_in": max(0, int(_next_month_start_utc() - time.time())),
+        "resets_estimated": True,
     }
     with _puter_allowance_lock:
         _puter_allowance_cache["at"] = now
@@ -4826,6 +4846,26 @@ def _mask_key(k):
 _PROVIDER_RELAY_SUB_PID = {}
 
 
+def _provider_quota_row(pid, p):
+    """{used, limit, remaining, window, exhausted, resets_in, resets_at,
+    limit_known} for the card, or None when there is no free budget to report.
+
+    A PAID provider has no free tier, so quota.status() reports it as exhausted
+    with limit 0 — surfacing that would paint a perfectly healthy paid card red
+    about an allowance it never had (the same reasoning the quota banner already
+    uses). Those cards report their real allowance separately (see
+    _puter_allowance) or nothing at all."""
+    if p.get("paid"):
+        return None
+    try:
+        s = quota.status(pid)
+    except Exception:                                                # noqa: BLE001
+        return None
+    return {k: s.get(k) for k in ("used", "limit", "remaining", "window",
+                                  "exhausted", "throttled", "resets_in",
+                                  "resets_at", "limit_known")}
+
+
 def _provider_row(pid, live_models=False):
     p = prov.get_provider(pid) or {}
     pcfg = config.get_provider_config(pid)
@@ -4864,6 +4904,10 @@ def _provider_row(pid, live_models=False):
         "image_paid_count": sum(1 for r in _image_model_rows(pid) if not r.get("free", True)),
         "relay": relay,
         "allowance": allowance,     # puter only; None everywhere else
+        # Free-quota state so the card can go red and count down to the reset
+        # instead of the user discovering exhaustion through failed requests.
+        # Cheap: quota.status reads local counters, no network.
+        "quota": _provider_quota_row(pid, p),
         "recommended": bool(p.get("recommended")),
     }
 
