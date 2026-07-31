@@ -1305,24 +1305,54 @@ PROVIDERS: Dict[str, dict] = {
         # substring, so its scoring floor is unaffected).
         "default_free_models": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
                                 "gpt-5.5-pro-2026-04-23", "gpt-4.1"],
-        # TEXT-TO-IMAGE, verified live 2026-07-31: the same token that drives
-        # chat also drives `puter-image-generation`/`generate` on drivers/call
-        # (driver "ai-image", the default puter.js itself passes), which
-        # returned a real 1024x1024 C2PA-signed PNG as a data: URI.
-        # The id below is the DRIVER, not a model: Puter's image driver picks
-        # the model server-side and publishes no catalog for it (the chat
-        # catalog at /puterai/chat/models/details contains zero image-output
-        # models, and neither JS bundle names one). An unknown model arg is
-        # rejected with 400 "Model not found: X", so a specific id can be
-        # pinned here later if Puter ever documents one; the sentinel means
-        # "send no model arg and take Puter's default".
+        # TEXT-TO-IMAGE via the same drivers/call endpoint as chat
+        # (interface "puter-image-generation", method "generate").
+        #
+        # THE CATALOG IS DISCOVERABLE, and is NOT the chat catalog: POST
+        # drivers/call {"interface":"puter-image-generation","method":"models"}
+        # returns 59 image models with per-model pricing (an earlier note here
+        # wrongly said no catalog existed — it was looked for in
+        # /puterai/chat/models/details, which holds zero image models).
+        #
+        # NONE OF THE 59 ARE FREE. Every one carries a cost and bills the
+        # account; there is no free image tier to filter for. So every row
+        # below is `free: False` — visible and one click away in the picker,
+        # but never auto-selected, so an Auto generation can't quietly spend
+        # the balance. (Puter CHAT stays in the free rotation: tokens cost
+        # fractions of a cent, while one image costs 0.3–17c.)
+        #
+        # A listed model is NOT necessarily a working one — togetherai:lykon/
+        # dreamshaper is in the catalog but 400s "Unable to access model" from
+        # Together upstream. Every id below was generated end-to-end on
+        # 2026-07-31; prices are the catalog's own figures for 1024x1024.
+        #
+        # Result shape differs by upstream (both handled in _puter_image_b64):
+        # OpenAI/Gemini return a data: URI, Replicate/Together return a bare
+        # https URL to a .webp/.jpg that must be downloaded.
+        #
         # IMAGE-TO-IMAGE is NOT available: puter.js binds txt2img, txt2vid,
-        # img2txt, txt2speech, speech2txt and speech2speech — there is no
-        # img2img interface to call.
+        # img2txt, txt2speech, speech2txt, speech2speech — no img2img.
+        # TEXT-TO-VIDEO exists ("puter-video-generation") but 402s
+        # "insufficient_funds" on a free account.
         "image_models": [
-            {"id": "ai-image", "label": "Puter (GPT Image)",
+            {"id": "gpt-image-1-mini", "label": "GPT Image 1 mini", "free": False,
              "text_in_image": "excellent",
-             "notes": "Puter picks the model server-side; 1024x1024 only (the driver takes no size arg). Metered against the free account's allowance like every other Puter call."},
+             "notes": "~0.5c per 1024x1024 (low) / 1.1c (medium). Cheapest of the strong text-rendering models — best default here."},
+            {"id": "gpt-image-1", "label": "GPT Image 1", "free": False,
+             "text_in_image": "excellent",
+             "notes": "~1.1c per 1024x1024 (low) / 4.2c (medium) / 16.7c (high)."},
+            {"id": "gemini-2.5-flash-image", "label": "Nano Banana (Gemini 2.5 Flash Image)",
+             "free": False, "text_in_image": "excellent",
+             "notes": "~3.9c per image. Strong at edits and photoreal scenes."},
+            {"id": "togetherai:black-forest-labs/flux.1-schnell", "label": "FLUX.1 Schnell (Together)",
+             "free": False, "text_in_image": "medium",
+             "notes": "~0.27c per image — the cheapest that actually works here. Returns a JPEG URL. Weak at text in the image."},
+            {"id": "black-forest-labs/flux-schnell", "label": "FLUX Schnell (Replicate)",
+             "free": False, "text_in_image": "medium",
+             "notes": "~0.3c per image. Returns a WEBP URL."},
+            {"id": "ai-image", "label": "Puter default", "free": False,
+             "text_in_image": "excellent",
+             "notes": "Sends no model at all and lets Puter choose (currently a GPT-Image-class model, C2PA-signed PNG). Use when you don't care which."},
         ],
         "notes": "User-pays AI gateway: one free puter.com account auth token unlocks the whole OpenAI-compatible catalog (500+ models incl. the newest GPT-5.6 flagship family, GPT Image, and Claude/Gemini/Grok/DeepSeek/Mistral/Llama via the same account). Fair-use limits apply but are unpublished, so quota tracks it as UNKNOWN. Flagship ids carry a scoring preference floor (app.py _PREF_FLOORS) so puter ranks first among equals — user-requested top priority.",
     },
