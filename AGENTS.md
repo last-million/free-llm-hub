@@ -42,6 +42,23 @@ routing heuristics.
   `GET /api/hub/stopped` returns `{stopped: bool}`.
 - Covered by `tests/test_hub_lifecycle.py`.
 
+## Puter zero-manual connect (dashboard)
+
+The `puter` card (Recommended zone) has a "Connect with Puter" button —
+browser-side, no backend endpoint and no credential handling. It replicates
+puter.js v2's own sign-in contract (verified live against
+https://js.puter.com/v2/ on 2026-07-31): popup to
+`https://puter.com/action/sign-in?embedded_in_popup=true&msg_id=N`, then the
+Puter GUI postMessages `{msg:"puter.token", msg_id:N, token, success:true}`
+to the opener from origin `https://puter.com`. `connectPuter()` in
+templates/index.html validates origin + msg_id, then saves the token via the
+existing `POST /api/providers/puter/keys` (dedupe + auto-enable). The raw
+key-paste field stays as manual fallback. An expired token self-heals via the
+existing 401 → `_provider_authfail` sideline (app.py:1570). There is NO
+server-side Puter login endpoint — `api.puter.com/login` and `/auth/login`
+404 (probed 2026-07-30); only `/auth/get-user-app-token` exists and needs a
+token already. Covered by `tests/test_puter_connect.py`.
+
 ## Agent skills (.agents/skills/)
 
 Kimi Code scans `.agents/skills/` (directory form `<name>/SKILL.md`). Two
