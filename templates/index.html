@@ -1342,6 +1342,9 @@
   .card.nokey .key-form, .card.nokey .key-warn{ display:none; }
   .nokey-note{ font-size:12.5px; color:var(--ok-text); background:var(--accent-soft);
     border:1px solid var(--accent-border); border-radius:var(--radius-sm); padding:7px 10px; }
+  /* One-click free key, for vendors that document anonymous instant minting. */
+  .mint-key{ display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+  .mint-key-note{ font-size:12px; color:var(--muted); }
   /* Cross-link from a provider card whose direct Test can never pass to the
      local-subscription relay that actually works instead. */
   .relay-callout{ display:flex; align-items:center; gap:8px; flex-wrap:wrap;
@@ -3138,10 +3141,18 @@
          thing (sign in on puter.com, token captured and saved automatically).
          A "Get a free key" link next to it just sent people to the homepage to
          hunt for something that does not exist. */
-      (p.signup_url && p.id !== 'puter' ?
+      (p.signup_url && p.id !== 'puter' && !p.can_mint_key ?
         '<a class="keylink" href="' + esc(p.signup_url) + '" target="_blank" rel="noopener noreferrer">' +
           '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>' +
           'Get a free key</a>' : '') +
+      /* Vendors whose docs say "keys are free, mint another when one is spent"
+         (Dahl) get a real button instead of a link to a signup page — one click
+         is the whole flow, no email and no card. */
+      (p.can_mint_key ?
+        '<div class="mint-key">' +
+          '<button type="button" class="btn sm primary mint-key-btn">Get a free key</button>' +
+          '<span class="mint-key-note">Instant, anonymous, 100M tokens.</span>' +
+        '</div>' : '') +
       savedKeysHTML +
       (p.no_key ? '<div class="nokey-note">&#10003; No API key needed — this gateway works instantly.</div>' : '') +
       (p.id === 'puter' ?
@@ -3269,6 +3280,19 @@
     });
     var puterBtn = $('.puter-connect-btn', card);
     if (puterBtn) puterBtn.addEventListener('click', function(){ connectPuter(card, p, puterBtn); });
+    var mintBtn = $('.mint-key-btn', card);
+    if (mintBtn) mintBtn.addEventListener('click', function(){
+      var was = mintBtn.textContent;
+      mintBtn.disabled = true;
+      mintBtn.textContent = 'Creating…';
+      api('/api/providers/' + encodeURIComponent(p.id) + '/mint-key', { method:'POST', body:{} })
+        .then(function(row){
+          updateProvider(row, p.id);
+          toast(row.note || 'Free key created.');
+        })
+        .catch(function(err){ toast(err.message || 'Could not create a key.', true); })
+        .finally(function(){ mintBtn.disabled = false; mintBtn.textContent = was; });
+    });
     $('.key-form', card).addEventListener('submit', function(e){
       e.preventDefault();
       $('.act-save', card).click();
