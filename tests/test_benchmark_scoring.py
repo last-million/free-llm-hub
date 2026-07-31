@@ -17,12 +17,27 @@ def test_gemini_flash_lite_does_not_outscore_flagship_models():
 
 
 def test_gemini_ids_do_not_collide_with_bare_mini_pattern():
-    """Regression: the weak-tier "mini" substring (meant for "gpt-4o-mini"
-    etc.) also matched "gemini" (ge-MINI-...), giving any un-tiered Gemini id
-    an unearned floor score. Fixed by requiring a leading hyphen ("-mini")."""
-    untiered_gemini = app._benchmark_score("google", "models/gemini-3-flash-preview")
+    """Regression: the weak-tier "mini" substring (meant for "gpt-4o-mini" etc.)
+    also matches "gemini" — ge-MINI — so a bare substring test dragged every
+    Gemini id into the tiny/speed tier. Fixed by requiring a leading hyphen.
+
+    ASSERTION CORRECTED 2026-07-31. It used to claim
+    `untiered_gemini < real_mini_model`, which contradicted its own docstring
+    and had been failing for some time: commit 9a48654 deliberately exempted
+    gemini-3-flash from the speed cap, so a Gemini flagship now scores ABOVE a
+    capped -mini model, which is the intended ordering. What the regression is
+    actually about is that Gemini must not be CAPPED by the -mini pattern, so
+    that is what is asserted now."""
+    gemini = app._benchmark_score("google", "models/gemini-3-flash-preview")
     real_mini_model = app._benchmark_score("openai", "gpt-4o-mini")
-    assert untiered_gemini < real_mini_model
+    # A real '-mini' id IS capped into the tiny tier...
+    assert real_mini_model <= 40, real_mini_model
+    # ...while 'gemini' escapes that pattern entirely. If the collision ever
+    # comes back, gemini lands at the same capped value and this fails.
+    assert gemini > real_mini_model
+    assert gemini > 40, "gemini got dragged into the tiny tier by the -mini pattern"
+    # The cap itself still works on Gemini ids that genuinely ARE small.
+    assert app._benchmark_score("google", "gemini-3.1-flash-lite") <= 40
 
 
 def test_true_flagship_gemini_still_scores_top_tier():

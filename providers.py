@@ -235,7 +235,18 @@ PROVIDERS: Dict[str, dict] = {
         # Never infer free-ness from an id here; re-probe with a key instead.
         "free_filter": "family",
         "free_exact": True,
-        "free_families": [
+        # ACCOUNT GATE RE-LOCKED, emptied 2026-07-31. Every endpoint (/v1/models,
+        # /v1/me, /v1/usage, and completions on all three ids below) now answers:
+        #   HTTP 403 {"type":"forbidden","message":"telegram_required: Join the
+        #     required Telegram group/channel and relink at /settings to continue."}
+        # The KEY IS STILL VALID — a bogus key returns 401 "A valid API key is
+        # required", this one returns 403 — so it is a per-account human step,
+        # not an outage and not a bad credential. Nothing the hub does can clear
+        # it, so these ids only burned one guaranteed 403 hop per request.
+        # TO RESTORE: rejoin the Telegram channel, relink at
+        # router.bynara.id/settings, then move these three ids back up.
+        "free_families": [],
+        "_free_families_pending_telegram_relink": [
             "agnes-2.0-flash",      # verified 200, 7.5s
             "mistral-large",        # verified 200, 2.1s
             "mistral-medium-3-5",   # verified 200, 1.8s
@@ -252,7 +263,11 @@ PROVIDERS: Dict[str, dict] = {
         # kimi-k2.7-code-free is advertised as free but is BROKEN upstream, not
         # merely slow: 3 probes, each ~126s, all Cloudflare 524 (origin timeout).
         # Re-probe before ever pinning it; a hang is not a free-ness verdict.
-        "default_free_models": [
+        # Emptied 2026-07-31 together with free_families above — the account's
+        # Telegram link has lapsed, so all three 403 "telegram_required" on every
+        # call. Restore both lists once relinked (see the comment above).
+        "default_free_models": [],
+        "_default_free_models_pending_telegram_relink": [
             "agnes-2.0-flash",
             "mistral-large",
             "mistral-medium-3-5",
@@ -1064,9 +1079,20 @@ PROVIDERS: Dict[str, dict] = {
         # PRICED id 402s forever, so routing to them only ever burns a chain hop.
         # Pinned to the probed-free id; widen this ONLY after re-probing with credit.
         "free_filter": "family",
-        "free_families": ["qwen/qwen3.6-27b"],
-        "default_free_models": ["qwen/qwen3.6-27b"],
-        "notes": "Prepaid only — NO free tier and no signup credits (docs.aiand.com/billing/credits). Exactly one model is free to call at a zero balance: qwen/qwen3.6-27b (probed live 2026-07-20). Every other id is either priced (402 insufficient_credits) or not served on this account (404). Add credit at console.aiand.com/settings/billing ($1 minimum) to unlock deepseek-v4/kimi/glm.",
+        # RE-PROBED 2026-07-31: nothing here is callable any more. The catalog
+        # still lists 8 ids and every one is now PRICED — qwen/qwen3.6-27b, the
+        # single model that was free at a zero balance on 2026-07-20, is now
+        # $0.32/$3.20 per 1M. With all accounts at zero credit, every catalog id
+        # answers 404 "does not exist or you do not have access to it", which is
+        # an entitlement wall, not a bad id: a genuinely unknown id returns a
+        # DIFFERENT error (400 invalid_value). Verified straight against the
+        # upstream, bypassing the hub, across all saved keys — not a hub bug.
+        # Emptied so aiand contributes ZERO routing hops instead of one
+        # guaranteed 404 per request. Add credit at console.aiand.com ($1 min)
+        # and re-probe to restore it.
+        "free_families": [],
+        "default_free_models": [],
+        "notes": "Prepaid only — NO free tier and no signup credits (docs.aiand.com/billing/credits). NOTHING is callable at a zero balance as of 2026-07-31: the last free id (qwen/qwen3.6-27b, free when probed 2026-07-20) is now priced, and every catalog id returns 404 'no access' until credit is added at console.aiand.com/settings/billing ($1 minimum).",
     },
     "github-models": {
         "name": "GitHub Models",
@@ -1085,11 +1111,23 @@ PROVIDERS: Dict[str, dict] = {
         # when discovery fails. NOTE: a token WITHOUT the models:read scope
         # 403s on EVERY call (app.py's probe-before-default path exists
         # precisely because llama-4-maverick ranked best while 403ing).
-        "default_free_models": [
-            "openai/gpt-4.1", "openai/gpt-4.1-mini",
-            "deepseek/DeepSeek-R1", "xai/grok-3",
-        ],
-        "notes": "Free tier covers the whole catalog with a plain GitHub PAT (no card, no separate signup — enable Models on the token). Rate limits are per-model/per-tier: low-tier ids share ~150 req/day, high-tier ~50/day, deepseek-r1 ~8/day (see quota.py). Reasoning ids (DeepSeek-R1) are slow to first token.",
+        # RETIRED BY GITHUB 2026-07-30 — emptied 2026-07-31 so it contributes
+        # ZERO routing hops. Every endpoint (/inference/models, /catalog/models,
+        # completions on every id) answers:
+        #   HTTP 410 Gone
+        #   {"error":{"code":"github_models_retirement_brownout",
+        #             "message":"GitHub Models is temporarily unavailable as
+        #                        part of a scheduled retirement brownout."}}
+        # The "brownout" wording is stale tooling text: the brownouts were
+        # 2026-07-16 and 07-23, the hard shutdown was 07-30, and GitHub's docs
+        # now state the playground, catalog, inference API and BYOK are gone for
+        # every customer. Confirmed NOT a local problem: the same PAT still
+        # returns 200 on api.github.com/user, and the 410 is returned
+        # unauthenticated too. 410 is permanent, not 503.
+        # Entry KEPT (not deleted) so the quota row, tests and any saved key
+        # stay coherent, and so a future revival is a one-line restore.
+        "default_free_models": [],
+        "notes": "RETIRED — GitHub fully shut down GitHub Models on 2026-07-30; every endpoint now returns HTTP 410 'github_models_retirement_brownout' for all customers, authenticated or not. Nothing here is callable and the provider contributes no routing hops. Kept registered only so a revival would be a one-line change.",
     },
     "uncloseai": {
         "name": "UncloseAI (Hermes)",
