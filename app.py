@@ -5415,6 +5415,8 @@ def _provider_row(pid, live_models=False):
         "paid": bool(p.get("paid")),
         "trial": bool(p.get("trial")),
         "no_key": bool(p.get("no_key")),   # open gateway: usable with NO api key
+        # vendor documents anonymous instant keys -> the card can offer one click
+        "can_mint_key": bool(p.get("key_mint_url")),
         "free_models": provider_free_models(pid, live=live_models),
         "image_free_count": sum(1 for r in _image_model_rows(pid) if r.get("free", True)),
         "image_paid_count": sum(1 for r in _image_model_rows(pid) if not r.get("free", True)),
@@ -5521,6 +5523,57 @@ def api_provider_add_key(pid):
                        "connected, so this replaced the old one instead of adding a "
                        "second. To pool a SECOND allowance, sign in with a different "
                        "Puter account (each account has its own ~25¢/month).")
+    return jsonify(row)
+
+
+@app.route("/api/providers/<pid>/mint-key", methods=["POST"])
+def api_provider_mint_key(pid):
+    """One-click free key, for providers whose vendor documents anonymous minting.
+
+    Only 'dahl' qualifies today: its docs say verbatim "Keys are free and each
+    includes 100 million tokens. There is no payment UI yet — create another key
+    when a key's allowance is spent." An unauthenticated POST to /tokens returns
+    201 with a fresh key. No email, no card, no captcha.
+
+    DELIBERATELY NOT AUTOMATIC. This fires only when the user clicks the button.
+    Minting on every 402 would turn a documented 100M-token allowance into an
+    unlimited one by rotating identities — which is the thing the vendor's cap
+    exists to prevent, and is not ours to route around. `key_mint_url` is read
+    from OUR registry, never from the request, so this cannot be pointed at an
+    arbitrary host."""
+    p = prov.get_provider(pid)
+    if not p:
+        return jsonify({"error": "unknown provider '%s'" % pid}), 404
+    url = p.get("key_mint_url")
+    if not url:
+        return jsonify({"error": "%s does not offer instant free keys" % pid}), 400
+    try:
+        r = requests.post(url, timeout=(CONNECT_TIMEOUT, 20))
+    except requests.RequestException as exc:
+        return jsonify({"error": "could not reach %s: %s" % (url, exc)}), 502
+    if r.status_code not in (200, 201):
+        return jsonify({"error": "HTTP %s from %s: %s"
+                        % (r.status_code, url, (r.text or "")[:200])}), 502
+    try:
+        data = r.json()
+    except ValueError:
+        return jsonify({"error": "%s did not return JSON" % url}), 502
+    key = (data.get("token") or data.get("api_key") or data.get("key") or "").strip()
+    if not key:
+        return jsonify({"error": "no key field in the response from %s" % url}), 502
+    config.add_provider_key(pid, key)
+    if not config.get_provider_config(pid).get("enabled"):
+        config.set_provider_config(pid, enabled=True)
+        _sync_relay_enable(pid)
+    with _model_cache_lock:
+        _model_cache.pop(pid, None)
+    _autoselect_default_if_unset()
+    row = _provider_row(pid)
+    allowance = data.get("available_tokens")
+    if isinstance(allowance, int):
+        row["note"] = "Free key created — %s tokens on it." % f"{allowance:,}"
+    else:
+        row["note"] = "Free key created."
     return jsonify(row)
 
 
