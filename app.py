@@ -114,6 +114,15 @@ STREAM_FIRST_BYTE_TIMEOUT = 25   # seconds
 # model emits content within a few seconds; this ceiling only bites a stream that
 # goes idle without ever producing content, which then falls through to the next model.
 STREAM_CONTENT_PEEK_TIMEOUT = 35  # seconds
+# ADAPTIVE first-content budget (see _stream_peek_timeout): the flat 35s peek
+# killed HEALTHY hops — a big reasoning model on a loaded free host can
+# legitimately think longer than 35s before its first SSE byte on a Codex-sized
+# prompt, and abandoning it degraded the chain onto the last-resort families.
+# Slow/reasoning models (_SLOW_MODEL_RE) and large requests get a longer budget;
+# fast models on small requests keep the snappy ceiling above.
+STREAM_SLOW_PEEK_TIMEOUT = 60       # seconds — slow model OR big request
+STREAM_SLOW_BIG_PEEK_TIMEOUT = 90   # seconds — slow model AND big request
+STREAM_BIG_REQUEST_TOKENS = 12000   # est tokens at which a request is "big"
 STREAM_IDLE_TIMEOUT = 280        # seconds
 MODELS_READ_TIMEOUT = 10      # seconds (model discovery / key tests)
 MODEL_CACHE_TTL = 60          # seconds
@@ -557,11 +566,12 @@ def _strong_new_version_score(low):
 
 
 # User-preference floors applied by _benchmark_score: (hy3, kimi-k3, puter
-# gpt-5.6-sol class, puter gpt-5.6-terra/gpt-5.5-pro class). They are
+# gpt-5.6-sol class, puter gpt-5.6-terra/gpt-5.5-pro class, kimi-k2.6/k2.7).
+# They are
 # deliberate thumb-on-the-scale values, NOT measured strength, so any code that
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
-_PREF_FLOORS = (135, 134, 136, 135)
+_PREF_FLOORS = (135, 134, 136, 135, 133)
 # 2026-07-30: the qwen -45 demotion (_PREF_QWEN_DEMOTION) is REMOVED — qwen3 is a
 # strong family again and ranks with the top tier via Tier A + _STRONG_ROOTS.
 
@@ -848,6 +858,14 @@ def _benchmark_score(pid, model_id):
     # kimi-k3 id (nothing lists it yet). Matches kimi-k3 / kimi-k3.x / .../kimi-k3.
     if "kimi-k3" in low or "kimik3" in low:
         score = max(score, _PREF_FLOORS[1])
+    # USER PREFERENCE: Kimi K2.6/K2.7 (Moonshot's CURRENTLY SERVED generation —
+    # kimi-k2.6, kimi-k2.7-code) — floored one point under K3 so the live kimi
+    # ids lead the top band the same way K3 will once a provider lists it.
+    # Substring match covers every provider id shape: plain 'kimi-k2.6',
+    # cloudflare '@cf/moonshotai/kimi-k2.7-code', g4f-nvidia 'moonshotai/kimi-k2.6'.
+    if ("kimi-k2.6" in low or "kimi-k2.7" in low
+            or "kimik2.6" in low or "kimik2.7" in low):
+        score = max(score, _PREF_FLOORS[4])
     # USER PREFERENCE: Puter's newest GPT flagship — the gpt-5.6-sol(-pro)
     # class — ranks FIRST among equals (user-requested top priority for the
     # puter provider, 2026-07-30): floored one point above hy3 so a keyed
@@ -1369,6 +1387,27 @@ _DEFAULT_SPEED = 55
 _SLOW_MODEL_RE = re.compile(
     r"(reasoning|thinking|\bqwq\b|deepseek[-_]?r\d|[-/]r1\b|\bo1\b|\bo3\b|magistral|"
     r"nemotron[-_](ultra|super)|gpt[-_]?oss|[-_]think\b|deepthink)", re.I)
+
+# LAST-RESORT families — nemotron (ANY variant), gpt-oss, gemma. Demoted to
+# Tier C in _BENCH_FAMILY, but a real Artificial Analysis score (_aa_score_for)
+# OVERRIDES the tier guess and re-inflates them (measured: nemotron-3-ultra
+# ~104, gpt-oss-120b ~99), and _TOOL_PROVEN still lists them from the
+# 2026-07-25 dialect evidence — so SCORES alone cannot keep them behind the
+# strong families, and the fallback chain kept landing on them while
+# glm-4.7 / kimi-k2.6 / kimi-k2.7-code sat alive (RESPONSES-503 logs
+# 2026-07-27: chain opened nvidia/nemotron-3-ultra -> cloudflare/gpt-oss-120b
+# -> openrouter/nemotron-3-super). This is the chain-ORDERING rule: candidates
+# matching it are partitioned to the TAIL of every fallback chain — after every
+# other alive candidate for the request's constraints (tools/context), and for
+# tool requests after every tool-proven normal candidate too. They may serve a
+# PRIMARY only for difficulty=='simple' or when nothing else is alive. Ordered
+# last, never deleted — they stay the final safety net.
+_LOW_QUALITY_RE = re.compile(r"nemotron|gpt[-_]?oss|gemma", re.I)
+
+
+def _is_low_quality(model_id):
+    """True for the demoted last-resort families (see _LOW_QUALITY_RE)."""
+    return bool(_LOW_QUALITY_RE.search(model_id or ""))
 
 
 def _speed_score(pid, model):
@@ -2779,7 +2818,7 @@ _orch_lock = threading.Lock()
 def _spread_band(pool):
     """The top-tier band of `pool`, best first. The band top is computed from
     NATURAL scores only: a preference floor (hy3 135 / kimi-k3 134 / puter
-    gpt-5.6-sol 136) is a thumb on
+    gpt-5.6-sol 136 / kimi-k2.6-k2.7 133) is a thumb on
     the scale, not a measurement, and letting it define the top drags the cutoff up
     ~27 points and collapses the band to one or two ids — which is exactly how a
     single model ends up serving a whole project."""
@@ -3054,10 +3093,28 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # fall back to the full agentic pool rather than refusing to answer.
         _proven = [c for c in agentic if _is_tool_proven(c[2])]
         _pool = _proven or agentic
+        # LOW-QUALITY TAIL (see _LOW_QUALITY_RE): the proven list still names
+        # nemotron/gpt-oss from the 2026-07-25 dialect evidence, so proven-first
+        # alone made a demoted family the agentic PRIMARY whenever it was alive —
+        # exactly the cascade the user reported. They may only serve a tool
+        # request once every stronger alive candidate has been tried: pick from
+        # the normal candidates only, widening back to the full agentic pool
+        # when the proven subset held nothing but last-resort families, and
+        # failing open to the low-quality pool only when nothing else lives.
+        _normal = [c for c in _pool if not _is_low_quality(c[2])]
+        if not _normal:
+            _normal = [c for c in agentic if not _is_low_quality(c[2])]
+        _pool = _normal or _pool
         picked = _weighted_pick(_pool, _model_identity_min_penalty(_pool))
         _s, pid, model = picked
         _session_pin_set(_skey, pid, model)
         return pid, model, difficulty
+    if difficulty != "simple":
+        # LOW-QUALITY TAIL (see _LOW_QUALITY_RE): nemotron/gpt-oss/gemma are the
+        # last resort for medium/hard too — only a SIMPLE ask may route to them
+        # while a stronger candidate is alive. Fail-open when they are all that
+        # lives (nothing else keyed/fresh) so the request still gets served.
+        pool = [c for c in pool if not _is_low_quality(c[2])] or pool
     if difficulty == "hard":
         # Non-tool HARD -> strongest fast model (spread keeps variety across turns).
         picked = _spread_pick(pool) or max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
@@ -3342,8 +3399,24 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         _proven_ordered = [e for e in ordered if _is_tool_proven(e[2])]
         if _proven_ordered:
             ordered = _proven_ordered + [e for e in ordered if not _is_tool_proven(e[2])]
+        # LOW-QUALITY TAIL, AFTER proven-first (see _LOW_QUALITY_RE): the proven
+        # allowlist still names nemotron/gpt-oss, so proven-first alone walked the
+        # chain straight onto the demoted families while glm-4.7/kimi-k2.6 sat
+        # alive — MEASURED in the 2026-07-27 RESPONSES-503 'tried=' logs. A
+        # tool request must exhaust every normal candidate (proven first, then
+        # unproven) before a last-resort family is even offered. Fail-open: when
+        # only last-resort families live, the order is unchanged.
+        _lq_tail = [e for e in ordered if _is_low_quality(e[2])]
+        if _lq_tail and len(_lq_tail) < len(ordered):
+            ordered = [e for e in ordered if not _is_low_quality(e[2])] + _lq_tail
     else:
         ordered = _interleave_by_provider(fast + slow)
+        # Same last-resort partition for a non-tool chain: a demoted family is
+        # only ever the TAIL, behind every other alive candidate that fits the
+        # request (fail-open when nothing else lives).
+        _lq_tail = [e for e in ordered if _is_low_quality(e[2])]
+        if _lq_tail and len(_lq_tail) < len(ordered):
+            ordered = [e for e in ordered if not _is_low_quality(e[2])] + _lq_tail
     # Agentic loops burn through the tool-capable pool in bursts, so give them a
     # deeper chain (reaches the still-fresh sibling models when the top providers are
     # momentarily throttled) than a one-shot chat needs.
@@ -8389,6 +8462,22 @@ def _peek_first_chunk(iterator, deadline_s):
     return True, box.get("v")
 
 
+def _stream_peek_timeout(model, est):
+    """Adaptive deadline for _peek_until_content: how long to wait for a stream's
+    first REAL content before falling through to the next hop. A fast model on a
+    small request answers in seconds, so a >35s silence means a hung provider —
+    but a slow/reasoning model (_SLOW_MODEL_RE) or a big agentic prompt (Codex's
+    15-40K tokens + tool schemas) legitimately needs longer before the first
+    byte, and killing that hop abandoned HEALTHY strong models mid-chain."""
+    slow = bool(_SLOW_MODEL_RE.search((model or "").lower()))
+    big = bool(est) and est >= STREAM_BIG_REQUEST_TOKENS
+    if slow and big:
+        return STREAM_SLOW_BIG_PEEK_TIMEOUT
+    if slow or big:
+        return STREAM_SLOW_PEEK_TIMEOUT
+    return STREAM_CONTENT_PEEK_TIMEOUT
+
+
 def _peek_until_content(iterator, deadline_s, max_lines=400):
     """Look ahead on a streaming 200 to tell a REAL answer from an EMPTY one before
     committing it to the client. Reads SSE items (bytes) until one carries actual
@@ -8517,11 +8606,32 @@ def _proxy_sse(resp, iterator=None, first=_MISSING):
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
-def _routing_headers(pid, model, attempts):
+def _classify_hop_error(exc=None, status=None, peek=None):
+    """One-token class of why a chain hop failed, for the X-Free-LLM-Hub-Last-Error
+    transparency header (timeout / conn / 413 / 429 / http-<n> / empty / error /
+    non-json) — so 'why did the chain degrade' is one curl -i away instead of a
+    log dig."""
+    if exc is not None:
+        if isinstance(exc, requests.Timeout):
+            return "timeout"
+        if isinstance(exc, requests.RequestException):
+            return "conn"
+        return "error"      # RuntimeError (no key/base_url, sub relay, ...)
+    if status is not None:
+        if status in (413, 429):
+            return str(status)
+        return "http-%d" % status
+    return peek or "error"
+
+
+def _routing_headers(pid, model, attempts, last_error=None):
     """Routing-transparency headers: which provider/model actually served the
-    response (or was last tried, on a chain-exhausted error) and how many
-    upstream hops the chain burned. Debugging aid only — bodies stay untouched."""
-    h = {"X-Free-LLM-Hub-Attempts": str(attempts)}
+    response (or was last tried, on a chain-exhausted error), how many
+    upstream hops the chain burned, and the class of the LAST hop failure seen
+    before this response ('none' when the first hop just worked — see
+    _classify_hop_error). Debugging aid only — bodies stay untouched."""
+    h = {"X-Free-LLM-Hub-Attempts": str(attempts),
+         "X-Free-LLM-Hub-Last-Error": last_error or "none"}
     if pid:
         h["X-Free-LLM-Hub-Provider"] = str(pid)
     if model:
@@ -8586,6 +8696,7 @@ def v1_chat_completions():
     attempts = 0          # upstream hops actually tried (transparency header)
     last_hop = (None, None)
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
+    last_error = None  # class of the LAST failed hop (transparency header)
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools,
                                            messages=body.get("messages")):
@@ -8608,6 +8719,7 @@ def v1_chat_completions():
             resp = _dispatch_chat(hop_pid, payload, dispatch_stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
+            last_error = _classify_hop_error(exc=exc)
             continue
         if resp.status_code == 200:
             if stream and is_sub_hop:
@@ -8615,10 +8727,12 @@ def v1_chat_completions():
                     data = resp.json()
                 except (ValueError, requests.RequestException):
                     errors.append("%s: non-JSON 200 body" % hop_pid)
+                    last_error = "non-json"
                     resp.close()
                     continue
                 if _chat_json_is_empty(data):
                     errors.append("%s: empty (200 but no content)" % hop_pid)
+                    last_error = "empty"
                     resp.close()
                     continue
                 _record_chat_usage(hop_pid, hop_model, data, est)
@@ -8637,7 +8751,7 @@ def v1_chat_completions():
                 return Response(stream_with_context(_proxy_sse(resp, iter([body_bytes]))),
                                 mimetype="text/event-stream",
                                 headers=dict(_SSE_HEADERS, **_routing_headers(
-                                    hop_pid, hop_model, attempts)))
+                                    hop_pid, hop_model, attempts, last_error)))
             if stream:
                 # #4: peek the first byte BEFORE committing the 200. A hung/slow
                 # stream (no first byte within STREAM_FIRST_BYTE_TIMEOUT) falls
@@ -8645,32 +8759,36 @@ def v1_chat_completions():
                 it = resp.iter_content(chunk_size=None)
                 # Peek until REAL content: a 200 that streams no content must fall
                 # through to the next model, not be handed to the client as empty.
-                status, buffered = _peek_until_content(it, STREAM_CONTENT_PEEK_TIMEOUT)
+                status, buffered = _peek_until_content(
+                    it, _stream_peek_timeout(hop_model, est))
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
+                    last_error = _classify_hop_error(peek=status)
                     resp.close()
                     continue
                 chained = _chain_buffered(buffered, it)
                 return Response(stream_with_context(_proxy_sse(resp, chained)),
                                 mimetype="text/event-stream",
                                 headers=dict(_SSE_HEADERS, **_routing_headers(
-                                    hop_pid, hop_model, attempts)))
+                                    hop_pid, hop_model, attempts, last_error)))
             try:
                 data = resp.json()
             except (ValueError, requests.RequestException):
                 # Non-JSON / broken 200 body -> don't dead-end, try the next model.
                 errors.append("%s: non-JSON 200 body" % hop_pid)
+                last_error = "non-json"
                 resp.close()
                 continue
             if _chat_json_is_empty(data):
                 errors.append("%s: empty (200 but no content)" % hop_pid)
+                last_error = "empty"
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est)
             data = _agentrouter_review_and_fix(hop_pid, hop_model, body["messages"], data, est)
             if isinstance(data, dict):
                 data["model"] = hop_pid + "/" + hop_model
-            return jsonify(data), 200, _routing_headers(hop_pid, hop_model, attempts)
+            return jsonify(data), 200, _routing_headers(hop_pid, hop_model, attempts, last_error)
         # Non-2xx. Retryable (429/5xx) and HARD errors (404/400/model-not-found)
         # both advance to the NEXT provider — each chain hop is a DIFFERENT
         # provider, so a broken model/provider should fall through before we give
@@ -8679,6 +8797,7 @@ def v1_chat_completions():
         # unread) must also just advance, never escape the loop into a 500.
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+            last_error = _classify_hop_error(status=resp.status_code)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
@@ -8706,7 +8825,7 @@ def v1_chat_completions():
                      (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none")
     except Exception:
         pass
-    hdrs = _routing_headers(last_hop[0], last_hop[1], attempts)
+    hdrs = _routing_headers(last_hop[0], last_hop[1], attempts, last_error)
     if last_hard is not None:
         if last_hard["json"] is not None:
             return _with_headers(_with_retry_after(
@@ -9158,6 +9277,7 @@ def v1_responses():
     stream = bool(body.get("stream"))
     errors = _HopErrors()
     last_hard = None  # last hard (non-retryable) upstream error, relayed if chain is exhausted
+    last_error = None  # class of the LAST failed hop (transparency header)
     _tried = []  # DIAG: every hop the chain actually offered (root-cause the 503s)
     _err_bodies = {}  # DIAG: first raw error body per (pid:status) — reveals soft-400 reasons
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
@@ -9186,6 +9306,7 @@ def v1_responses():
             resp = _dispatch_chat(hop_pid, payload, dispatch_stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
+            last_error = _classify_hop_error(exc=exc)
             continue
         if resp.status_code == 200:
             # Echo back the id the client ASKED for (codex sends "auto", which now has
@@ -9199,10 +9320,12 @@ def v1_responses():
                     data = resp.json()
                 except (ValueError, requests.RequestException):
                     errors.append("%s: non-JSON 200 body" % hop_pid)
+                    last_error = "non-json"
                     resp.close()
                     continue
                 if _chat_json_is_empty(data):
                     errors.append("%s: empty (200 but no content)" % hop_pid)
+                    last_error = "empty"
                     resp.close()
                     continue
                 _record_chat_usage(hop_pid, hop_model, data, est)
@@ -9220,9 +9343,11 @@ def v1_responses():
                 # Peek until REAL content (not just the first byte): an empty 200
                 # (role delta + [DONE], no content) must fall through to the next
                 # model instead of being streamed to codex as a dead-end answer.
-                status, buffered = _peek_until_content(line_it, STREAM_CONTENT_PEEK_TIMEOUT)
+                status, buffered = _peek_until_content(
+                    line_it, _stream_peek_timeout(hop_model, est))
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
+                    last_error = _classify_hop_error(peek=status)
                     resp.close()
                     continue
                 chained = _chain_buffered(buffered, line_it)
@@ -9233,10 +9358,12 @@ def v1_responses():
                 data = resp.json()
             except (ValueError, requests.RequestException):
                 errors.append("%s: non-JSON 200 body" % hop_pid)
+                last_error = "non-json"
                 resp.close()
                 continue
             if _chat_json_is_empty(data):
                 errors.append("%s: empty (200 but no content)" % hop_pid)
+                last_error = "empty"
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est)
@@ -9244,6 +9371,7 @@ def v1_responses():
             return jsonify(_chat_to_responses(data, model_label)), 200
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+            last_error = _classify_hop_error(status=resp.status_code)
             _ekey = "%s:%d" % (hop_pid, resp.status_code)  # DIAG: capture first raw body
             if _ekey not in _err_bodies:
                 try:
@@ -9292,15 +9420,18 @@ def v1_responses():
             _lh_body, json.dumps(_err_bodies)[:1400])
     except Exception:
         pass
+    # Codex's path carried no routing headers at all — surface at least the last
+    # hop-failure class so 'why did the chain degrade' is one curl -i away.
+    hdrs = {"X-Free-LLM-Hub-Last-Error": last_error or "none"}
     if last_hard is not None:
         if last_hard["json"] is not None:
-            return _with_retry_after(
-                (jsonify(last_hard["json"]), _retryable_relay_status(last_hard["status"])), eta)
-        return _with_retry_after(_openai_error(
+            return _with_headers(_with_retry_after(
+                (jsonify(last_hard["json"]), _retryable_relay_status(last_hard["status"])), eta), hdrs)
+        return _with_headers(_with_retry_after(_openai_error(
             "Upstream returned non-JSON (%s, HTTP %d): %s"
-            % (last_hard["pid"], last_hard["status"], last_hard["text"]), 503, "upstream_error"), eta)
-    return _with_retry_after(_openai_error(
-        "All providers failed: " + ("; ".join(errors) or "none available"), 503, "upstream_error"), eta)
+            % (last_hard["pid"], last_hard["status"], last_hard["text"]), 503, "upstream_error"), eta), hdrs)
+    return _with_headers(_with_retry_after(_openai_error(
+        "All providers failed: " + ("; ".join(errors) or "none available"), 503, "upstream_error"), eta), hdrs)
 
 
 # ---------------------------------------------------------------------------
@@ -9741,12 +9872,14 @@ def v1_messages():
     attempts = 0          # upstream hops actually tried (transparency header)
     last_hop = (None, None)
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
+    last_error = None  # class of the LAST failed hop (transparency header)
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools, messages=oai_messages):
         if not prov.is_model_allowed(hop_model):
             continue
         if stream and _is_sub(hop_pid):
             errors.append("%s: skipped (a local CLI cannot stream)" % hop_pid)
+            last_error = "skipped"
             continue
         payload = dict(base_payload)
         payload["model"] = hop_model
@@ -9759,6 +9892,7 @@ def v1_messages():
             resp = _dispatch_chat(hop_pid, payload, stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
+            last_error = _classify_hop_error(exc=exc)
             continue
         if resp.status_code == 200:
             model_str = requested_model or (hop_pid + "/" + hop_model)
@@ -9768,9 +9902,11 @@ def v1_messages():
                 line_it = resp.iter_lines(decode_unicode=False)
                 # Peek until REAL content so an empty 200 falls through to the next
                 # model instead of being handed to the client as a dead-end answer.
-                status, buffered = _peek_until_content(line_it, STREAM_CONTENT_PEEK_TIMEOUT)
+                status, buffered = _peek_until_content(
+                    line_it, _stream_peek_timeout(hop_model, est))
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
+                    last_error = _classify_hop_error(peek=status)
                     resp.close()
                     continue
                 chained = _chain_buffered(buffered, line_it)
@@ -9779,20 +9915,22 @@ def v1_messages():
                                      hop_pid=hop_pid, hop_model=hop_model)),
                     mimetype="text/event-stream",
                     headers=dict(_SSE_HEADERS, **_routing_headers(
-                        hop_pid, hop_model, attempts)))
+                        hop_pid, hop_model, attempts, last_error)))
             try:
                 data = resp.json()
             except (ValueError, requests.RequestException):
                 errors.append("%s: non-JSON 200 body" % hop_pid)
+                last_error = "non-json"
                 resp.close()
                 continue
             if _chat_json_is_empty(data):
                 errors.append("%s: empty (200 but no content)" % hop_pid)
+                last_error = "empty"
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est)
             return jsonify(_openai_resp_to_anthropic(data, model_str)), 200, \
-                _routing_headers(hop_pid, hop_model, attempts)
+                _routing_headers(hop_pid, hop_model, attempts, last_error)
         # Non-2xx. Retryable (429/5xx) AND hard errors (404/400/model-not-found)
         # both advance to the NEXT provider (a different provider/model) before we
         # surface an error; within-provider key rotation already ran upstream. A
@@ -9800,6 +9938,7 @@ def v1_messages():
         # advance, never escape the loop into a 500.
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
+            last_error = _classify_hop_error(status=resp.status_code)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
@@ -9821,7 +9960,7 @@ def v1_messages():
                      (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none")
     except Exception:
         pass
-    hdrs = _routing_headers(last_hop[0], last_hop[1], attempts)
+    hdrs = _routing_headers(last_hop[0], last_hop[1], attempts, last_error)
     if last_hard is not None:
         return _with_headers(_with_retry_after(_anthropic_error("api_error",
                                 "Upstream %s error (HTTP %d): %s"

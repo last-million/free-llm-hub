@@ -224,6 +224,8 @@ def test_transparency_headers_on_success(isolated_config, monkeypatch):
     assert resp.headers["X-Free-LLM-Hub-Provider"] == "groq"
     assert resp.headers["X-Free-LLM-Hub-Model"] == "llama-3.3-70b-versatile"
     assert resp.headers["X-Free-LLM-Hub-Attempts"] == "1"
+    # First hop just worked -> no hop failure to report.
+    assert resp.headers["X-Free-LLM-Hub-Last-Error"] == "none"
 
 
 def test_transparency_headers_on_chain_exhaustion(isolated_config, monkeypatch):
@@ -242,6 +244,48 @@ def test_transparency_headers_on_chain_exhaustion(isolated_config, monkeypatch):
     # The error relays the LAST hop the chain burned before giving up.
     assert resp.headers["X-Free-LLM-Hub-Provider"] == "cerebras"
     assert resp.headers["X-Free-LLM-Hub-Model"] == "gpt-oss-120b"
+    assert resp.headers["X-Free-LLM-Hub-Last-Error"] == "http-500"
+
+
+def test_last_error_header_surfaces_earlier_hop_failure(isolated_config, monkeypatch):
+    """A 413 on hop 1 then success on hop 2: the header names the class that
+    killed the earlier hop, so 'why did the chain degrade' is one curl away."""
+    _stub_chain(monkeypatch, [("groq", "llama-3.3-70b-versatile"),
+                              ("cerebras", "zai-glm-4.7")])
+    monkeypatch.setattr(app, "_dispatch_chat",
+                        lambda pid, payload, stream:
+                        FakeResponse(413, {"error": "too large"}) if pid == "groq"
+                        else _chat_ok())
+    client = app.app.test_client()
+    resp = client.post("/v1/chat/completions", json={
+        "model": "auto", "stream": False,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert resp.status_code == 200
+    assert resp.headers["X-Free-LLM-Hub-Provider"] == "cerebras"
+    assert resp.headers["X-Free-LLM-Hub-Last-Error"] == "413"
+
+
+def test_last_error_header_on_responses_exhaustion(isolated_config, monkeypatch):
+    """Codex's path (/v1/responses) carried no routing headers at all — the
+    last-error class is now surfaced on its chain-exhausted errors too."""
+    monkeypatch.setattr(app, "_route_by_difficulty",
+                        lambda messages, max_tokens=None, est=0, require_tools=False:
+                        ("groq", "llama-3.3-70b-versatile", "hard"))
+    monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
+    monkeypatch.setattr(app, "_build_chain",
+                        lambda pid, model, est=0, require_vision=False,
+                               require_tools=False, messages=None:
+                        [("groq", "llama-3.3-70b-versatile")])
+    monkeypatch.setattr(app, "_dispatch_chat",
+                        lambda pid, payload, stream:
+                        FakeResponse(429, {"error": "slow down"}))
+    client = app.app.test_client()
+    resp = client.post("/v1/responses", json={
+        "model": "auto", "stream": False, "input": "hi",
+    })
+    assert resp.status_code == 503
+    assert resp.headers["X-Free-LLM-Hub-Last-Error"] == "429"
 
 
 def test_transparency_headers_on_messages_success(isolated_config, monkeypatch):

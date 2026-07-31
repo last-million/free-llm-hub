@@ -22,6 +22,26 @@ app.py:1213) and routes to the cheapest model that clears the tier floor
 `tests/test_difficulty_routing.py` — keep those tests green when touching the
 routing heuristics.
 
+## Last-resort families & routing transparency
+
+- `_LOW_QUALITY_RE` (nemotron ANY variant, gpt-oss, gemma) is a chain-ORDERING
+  rule, not a score: AA scores (`_aa_score_for`) override the Tier-C demotion
+  and `_TOOL_PROVEN` still names nemotron/gpt-oss, so scores alone always
+  landed the chain on them. `_build_chain` and `_route_by_difficulty`
+  partition them to the TAIL — after every other alive candidate (and after
+  every tool-proven normal candidate for tool requests). Only `simple`
+  difficulty may route to them while something stronger lives. Ordered last,
+  never deleted. kimi-k2.6/k2.7 hold preference floor 133 (`_PREF_FLOORS[4]`,
+  just under k3's 134), matching all id shapes (`@cf/moonshotai/…`,
+  `moonshotai/…`, bare). Covered by `tests/test_last_resort_routing.py`.
+- First-content peek is adaptive (`_stream_peek_timeout`): slow/reasoning
+  models or >=12K-token requests get 60s (both: 90s) instead of the flat 35s —
+  the flat budget was killing HEALTHY slow hops on Codex-sized prompts.
+- `X-Free-LLM-Hub-Last-Error` response header (timeout/conn/413/429/http-N/
+  empty/none) names the last hop-failure class; on `/v1/responses` it appears
+  on chain-exhausted errors. Diagnosis is one `curl -i` away.
+
+
 ## Hidden run & sticky stop (hub lifecycle)
 
 - `run-hidden.vbs` starts `run.bat` with no console window (WScript.Shell Run,
