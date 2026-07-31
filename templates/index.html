@@ -556,7 +556,54 @@
   .image-priority-row select{min-width:240px;flex:1}
   .image-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
   .image-bar select{min-width:160px}
-  .image-bar select#image-model{min-width:240px;flex:2}
+  /* ---- model picker: cards, not a dropdown ------------------------------
+     A <select> hid every option behind a click and showed no capability
+     (who serves it, how good its in-image text is, whether it is even
+     configured). These cards surface all of that at a glance and stay a
+     real radiogroup for keyboard + screen-reader users. Grid is
+     auto-fill/minmax so it reflows from 1 column on a 375px phone up to 4+
+     on a wide desktop with no breakpoint of its own. */
+  .model-cards{
+    display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
+    gap:10px;margin:2px 0 4px;
+  }
+  .model-card{
+    position:relative;display:flex;flex-direction:column;gap:5px;
+    min-height:44px;padding:11px 12px;text-align:left;cursor:pointer;
+    background:var(--surface-2);border:1px solid var(--border);
+    border-radius:var(--radius-sm);color:var(--text);
+    transition:border-color .18s ease,background-color .18s ease,box-shadow .18s ease;
+  }
+  .model-card:hover{background:var(--surface-3);border-color:var(--border-strong)}
+  .model-card:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .model-card[aria-checked="true"]{
+    background:var(--accent-soft);border-color:var(--accent-border);
+    box-shadow:inset 0 0 0 1px var(--accent-border);
+  }
+  /* Selection is NOT signalled by colour alone — a check icon appears too. */
+  .model-card .mc-check{
+    position:absolute;top:9px;right:9px;width:15px;height:15px;
+    color:var(--accent-strong);opacity:0;transition:opacity .18s ease;
+  }
+  .model-card[aria-checked="true"] .mc-check{opacity:1}
+  .model-card .mc-name{
+    font-size:13px;font-weight:600;line-height:1.3;padding-right:20px;
+    overflow-wrap:anywhere;
+  }
+  .model-card .mc-provider{font-size:11.5px;color:var(--text-dim);line-height:1.3}
+  .model-card .mc-tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:1px}
+  .model-card .mc-tag{
+    font-size:10px;font-weight:600;letter-spacing:.02em;text-transform:uppercase;
+    padding:2px 6px;border-radius:999px;
+    background:var(--surface-3);color:var(--text-dim);border:1px solid var(--border-soft);
+  }
+  .model-card .mc-tag.good{background:var(--accent-soft);color:var(--accent-strong);border-color:var(--accent-border)}
+  .model-card .mc-tag.warn{background:var(--warn-soft);color:var(--warn-text);border-color:var(--warn-border)}
+  .model-card.is-auto .mc-name{color:var(--accent-strong)}
+  .model-card.not-configured{opacity:.62}
+  @media (prefers-reduced-motion:reduce){
+    .model-card,.model-card .mc-check{transition:none}
+  }
   .image-input-row{display:flex;gap:10px;align-items:stretch}
   .image-input-row textarea{
     flex:1;min-width:0;resize:vertical;min-height:56px;max-height:200px;
@@ -1207,33 +1254,30 @@
   </div>
   <nav class="cx-nav" id="cx-nav">
     <div class="cx-group">
-      <div class="cx-group-label">Control</div>
+      <div class="cx-group-label">Hub</div>
       <button class="cx-nav-item" data-view="sec-lifecycle" data-title="Hub controls" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="2" y1="14" x2="6" y2="14"/><line x1="10" y1="8" x2="14" y2="8"/><line x1="18" y1="16" x2="22" y2="16"/></svg><span>Hub controls</span></button>
+      <button class="cx-nav-item" data-view="sec-activity" data-title="Live activity" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span>Activity</span></button>
     </div>
     <div class="cx-group">
-      <div class="cx-group-label">Connect</div>
-      <button class="cx-nav-item" data-view="sec-connect" data-title="Connect your tools" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg><span>Connect tools</span></button>
-      <button class="cx-nav-item" data-view="sec-clis" data-title="Connected tools" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><span>Connected tools</span></button>
-      <button class="cx-nav-item" data-view="sec-subs" data-title="Local subscriptions" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.5 12.5 20 3"/><path d="m16 6 3 3"/></svg><span>Subscriptions</span></button>
-    </div>
-    <div class="cx-group">
-      <div class="cx-group-label">Chat</div>
-      <button class="cx-nav-item" data-view="sec-agent" data-title="Chat CLI (agentic)" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="m7 9 3 3-3 3"/><line x1="13" y1="15" x2="17" y2="15"/></svg><span>Chat CLI</span></button>
-      <button class="cx-nav-item" data-view="sec-chat" data-title="Chat / Test" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>Chat / Test</span></button>
-    </div>
-    <div class="cx-group">
-      <div class="cx-group-label">Models</div>
-      <button class="cx-nav-item" data-view="sec-default" data-title="Orchestrator model" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg><span>Orchestrator</span></button>
-      <button class="cx-nav-item" data-view="sec-providers" data-title="Providers" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg><span>Providers</span><span class="nav-new-badge" data-new-key="providers_puter_connect_fix_v1">New updates</span></button>
-    </div>
-    <div class="cx-group">
-      <div class="cx-group-label">Media</div>
+      <div class="cx-group-label">Generate</div>
+      <button class="cx-nav-item" data-view="sec-chat" data-title="Chat / Test" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>Quick chat</span></button>
+      <button class="cx-nav-item" data-view="sec-agent" data-title="Chat CLI (agentic)" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="m7 9 3 3-3 3"/><line x1="13" y1="15" x2="17" y2="15"/></svg><span>Agent chat</span></button>
       <button class="cx-nav-item" data-view="sec-images" data-title="Image generation" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg><span>Images</span></button>
+    </div>
+    <div class="cx-group">
+      <div class="cx-group-label">Models & keys</div>
+      <button class="cx-nav-item" data-view="sec-providers" data-title="Providers" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg><span>Providers</span><span class="nav-new-badge" data-new-key="providers_puter_connect_fix_v1">New updates</span></button>
       <button class="cx-nav-item" data-view="sec-image-providers" data-title="Image providers" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><circle cx="6" cy="17.5" r="1"/><path d="m14 15 4 4 4-4M18 19v-6"/></svg><span>Image providers</span></button>
+      <button class="cx-nav-item" data-view="sec-subs" data-title="Local subscriptions" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.5 12.5 20 3"/><path d="m16 6 3 3"/></svg><span>Subscriptions</span></button>
+      <button class="cx-nav-item" data-view="sec-default" data-title="Orchestrator model" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg><span>Routing</span></button>
+    </div>
+    <div class="cx-group">
+      <div class="cx-group-label">Your tools</div>
+      <button class="cx-nav-item" data-view="sec-connect" data-title="Connect your tools" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg><span>Add a tool</span></button>
+      <button class="cx-nav-item" data-view="sec-clis" data-title="Connected tools" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><span>My tools</span></button>
     </div>
     <div class="cx-group">
       <div class="cx-group-label">Insights</div>
-      <button class="cx-nav-item" data-view="sec-activity" data-title="Live activity" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span>Activity</span></button>
       <button class="cx-nav-item" data-view="sec-quota" data-title="Free quota" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg><span>Free quota</span></button>
       <button class="cx-nav-item" data-view="sec-usage" data-title="Daily usage" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg><span>Usage</span></button>
       <button class="cx-nav-item" data-view="sec-tracking" data-title="Model tracking" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.9 4.9l2.9 2.9M16.2 16.2l2.9 2.9M4.9 19.1l2.9-2.9M16.2 7.8l2.9-2.9"/></svg><span>Tracking</span></button>
@@ -1603,10 +1647,8 @@
         </select>
         <button class="btn sm" id="image-priority-save" type="button">Save</button>
       </div>
+      <div class="model-cards" id="image-model-cards" role="radiogroup" aria-label="Model to generate with"></div>
       <div class="image-bar">
-        <select id="image-model" aria-label="Model to generate with">
-          <option value="auto" selected>Auto &mdash; best free (orchestrated)</option>
-        </select>
         <select id="image-size" aria-label="Image size"
                 title="Cloudflare and ModelScope always generate a fixed-shape image regardless of this pick; only Pollinations honors a non-square size.">
           <option value="1024x1024" selected>1024 &times; 1024</option>
@@ -3658,6 +3700,105 @@
     updateChatAuthNote();
   }
 
+  /* ---------- model picker: selectable cards instead of a <select> ----------
+     A dropdown hid every option behind a click and could show only one line of
+     text, so "which provider is this, is it configured, how well does it render
+     text in the image" were all invisible until after you picked. These cards
+     show it up front.
+
+     Accessibility is NOT traded away for looks: the container is a real
+     `radiogroup`, each card a `radio` with aria-checked, roving tabindex (only
+     the selected card is tab-reachable), arrow keys to move, Space/Enter to
+     pick — the standard WAI-ARIA radio-group contract a native <select> gave
+     us for free. Selection shows as colour AND a check icon, never colour
+     alone.
+
+     `.value` is a real get/set property so call sites read exactly like the
+     <select> this replaced. Written generically (not image-specific) so a
+     second surface can reuse it as-is. */
+  function ModelPicker(container){
+    this.el = container;
+    this._value = 'auto';
+    this._rows = [];
+    var self = this;
+    if (!this.el) return;
+    this.el.addEventListener('click', function(e){
+      var card = e.target.closest('.model-card');
+      if (card) self.value = card.dataset.value;
+    });
+    this.el.addEventListener('keydown', function(e){
+      var cards = self._cards();
+      if (!cards.length) return;
+      var i = cards.indexOf(document.activeElement);
+      var next = null;
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = cards[(i + 1) % cards.length];
+      else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = cards[(i - 1 + cards.length) % cards.length];
+      else if (e.key === 'Home') next = cards[0];
+      else if (e.key === 'End') next = cards[cards.length - 1];
+      else if ((e.key === ' ' || e.key === 'Enter') && i >= 0){
+        e.preventDefault(); self.value = cards[i].dataset.value; return;
+      }
+      if (next){ e.preventDefault(); self.value = next.dataset.value; next.focus(); }
+    });
+  }
+  ModelPicker.prototype._cards = function(){
+    return this.el ? Array.prototype.slice.call(this.el.querySelectorAll('.model-card')) : [];
+  };
+  Object.defineProperty(ModelPicker.prototype, 'value', {
+    get: function(){ return this._value; },
+    set: function(v){
+      var known = v === 'auto' || this._rows.some(function(r){ return r.id === v; });
+      this._value = known ? v : 'auto';
+      this._paint();
+    }
+  });
+  ModelPicker.prototype._paint = function(){
+    var v = this._value;
+    this._cards().forEach(function(c){
+      var on = c.dataset.value === v;
+      c.setAttribute('aria-checked', on ? 'true' : 'false');
+      c.tabIndex = on ? 0 : -1;                 /* roving tabindex */
+    });
+  };
+  ModelPicker.prototype.render = function(models){
+    if (!this.el) return;
+    this._rows = (models || []).map(function(m){
+      return {
+        id: m.id,
+        name: m.label || m.model || m.id,
+        provider: m.provider_name || m.provider || '',
+        text: m.text_in_image,
+        configured: m.configured !== false,
+        dead: !!m.dead
+      };
+    });
+    var check = '<svg class="mc-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+                'stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+                '<path d="M20 6 9 17l-5-5"/></svg>';
+    var html = '<button type="button" role="radio" class="model-card is-auto" data-value="auto" ' +
+               'aria-checked="false" tabindex="-1">' + check +
+               '<span class="mc-name">Auto</span>' +
+               '<span class="mc-provider">Best free model, orchestrated</span></button>';
+    this._rows.forEach(function(r){
+      var tags = '';
+      if (r.text) tags += '<span class="mc-tag' + (r.text === 'excellent' ? ' good' : '') +
+                          '">text: ' + esc(r.text) + '</span>';
+      if (!r.configured) tags += '<span class="mc-tag warn">not configured</span>';
+      if (r.dead) tags += '<span class="mc-tag warn">unavailable</span>';
+      html += '<button type="button" role="radio" class="model-card' +
+              (r.configured ? '' : ' not-configured') + '" data-value="' + esc(r.id) + '" ' +
+              'aria-checked="false" tabindex="-1">' + check +
+              '<span class="mc-name">' + esc(r.name) + '</span>' +
+              '<span class="mc-provider">' + esc(r.provider) + '</span>' +
+              (tags ? '<span class="mc-tags">' + tags + '</span>' : '') +
+              '</button>';
+    });
+    this.el.innerHTML = html;
+    this.value = this._value;      /* re-validate: a model can disappear between loads */
+  };
+
+  var imagePicker = new ModelPicker($('#image-model-cards'));
+
   /* ---------- image generation ---------- */
   function loadImages(silent){
     return api('/api/images').then(function(j){
@@ -3685,25 +3826,8 @@
         prSel.value = chosen;
       }
 
-      /* per-generation model override select */
-      var modSel = $('#image-model');
-      if (modSel){
-        var curModel = modSel.value || 'auto';
-        modSel.innerHTML = '';
-        var autoOpt = document.createElement('option');
-        autoOpt.value = 'auto';
-        autoOpt.textContent = 'Auto — best free (orchestrated)';
-        modSel.appendChild(autoOpt);
-        models.forEach(function(m){
-          var o = document.createElement('option');
-          o.value = m.id;
-          o.textContent = (m.provider_name || m.provider) + ' — ' + (m.label || m.model || m.id) +
-                           (m.configured ? '' : ' (not configured)');
-          modSel.appendChild(o);
-        });
-        if (curModel && modSel.querySelector('option[value="' + CSS.escape(curModel) + '"]')) modSel.value = curModel;
-        else modSel.value = 'auto';
-      }
+      /* per-generation model override — CARDS, not a dropdown (see .model-cards) */
+      imagePicker.render(models);
     }).catch(function(e){ if (!silent) toast('Images: ' + e.message, true); });
   }
 
@@ -3742,7 +3866,7 @@
     });
 
     var promptEl = $('#image-prompt');
-    var modelSel = $('#image-model');
+    var modelSel = imagePicker;      /* card radiogroup; same .value contract */
     var sizeSel = $('#image-size');
     var countSel = $('#image-count');
     var genBtn = $('#image-generate');
