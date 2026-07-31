@@ -290,3 +290,82 @@ def test_a_giant_opening_brief_is_capped_not_pinned_whole():
 ])
 def test_path_extraction_is_narrow(text, expected):
     assert app._mentioned_paths([{"role": "assistant", "content": text}]) == expected
+
+
+# --------------------------------------------------------------------------- #
+# 7. Summarised compaction — the recap must never cost the request any latency
+# --------------------------------------------------------------------------- #
+
+def test_the_summarizer_never_blocks_the_request(monkeypatch):
+    """A recap is a full model round-trip — MEASURED at over two minutes on the
+    free fleet. Compaction runs on EVERY hop, so doing it inline would make large
+    requests unusable. First call schedules and returns None immediately."""
+    calls = []
+    monkeypatch.setattr(app.threading, "Thread",
+                        lambda **kw: type("T", (), {"start": lambda s: calls.append(kw)})())
+    app._summary_cache.clear()
+    app._summary_inflight.clear()
+    dropped = [{"role": "user", "content": "build the store " * 40},
+               {"role": "assistant", "content": "made src/App.tsx " * 40}]
+    assert app._summarize_dropped(dropped) is None
+    assert len(calls) == 1, "should have scheduled exactly one background worker"
+
+
+def test_a_ready_recap_is_returned_from_cache():
+    app._summary_cache.clear()
+    app._summary_inflight.clear()
+    dropped = [{"role": "user", "content": "build the store " * 40},
+               {"role": "assistant", "content": "made src/App.tsx " * 40}]
+    key, _ = app._summary_key(dropped)
+    app._summary_cache[key] = "GOAL: a store. STATE: src/App.tsx exists."
+    assert app._summarize_dropped(dropped).startswith("GOAL: a store")
+
+
+def test_a_second_request_does_not_start_a_second_worker(monkeypatch):
+    started = []
+    monkeypatch.setattr(app.threading, "Thread",
+                        lambda **kw: type("T", (), {"start": lambda s: started.append(1)})())
+    app._summary_cache.clear()
+    app._summary_inflight.clear()
+    dropped = [{"role": "user", "content": "x " * 500}]
+    app._summarize_dropped(dropped)
+    app._summarize_dropped(dropped)
+    assert len(started) == 1, "in-flight guard failed; duplicate work scheduled"
+
+
+def test_too_little_dropped_text_is_not_worth_a_call():
+    assert app._summary_key([{"role": "user", "content": "hi"}]) == (None, None)
+
+
+@pytest.mark.parametrize("raw,expect", [
+    ("<think>plan</think>GOAL: build a store", "GOAL: build a store"),
+    ("<thinking>x</thinking>\n\nGOAL: y", "GOAL: y"),
+    ("<think>truncated mid-thought, never closed", ""),
+    ("GOAL: plain answer", "GOAL: plain answer"),
+])
+def test_chain_of_thought_is_stripped_from_a_recap(raw, expect):
+    """MEASURED: a recap came back starting "<think>Here's a thinking process:".
+    Injecting a model's scratchpad into the next model's context is noise, and
+    worse, it reads as instructions."""
+    assert app._strip_thinking(raw) == expect
+
+
+def test_compaction_uses_a_recap_when_one_is_supplied():
+    out, did = app._compact_to_budget(
+        _project_convo(), None, 8000,
+        summarizer=lambda dropped: "GOAL: Solaris store. DECISIONS: Stripe over PayPal.")
+    assert did is True
+    text = _text_of(out)
+    assert "Recap of the dropped turns" in text
+    assert "Stripe over PayPal" in text, "decisions must survive, not just filenames"
+
+
+def test_a_failing_summarizer_falls_back_to_the_structural_notice():
+    def boom(dropped):
+        raise RuntimeError("summariser down")
+    with pytest.raises(RuntimeError):
+        app._compact_to_budget(_project_convo(), None, 8000, summarizer=boom)
+    # ...and with the real fail-open summarizer (returns None), the notice stands.
+    out, did = app._compact_to_budget(_project_convo(), None, 8000,
+                                      summarizer=lambda d: None)
+    assert did is True and "do not start a new project" in _text_of(out)
