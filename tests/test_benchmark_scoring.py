@@ -178,3 +178,29 @@ def test_plain_gpt_4o_does_not_get_the_puter_floor():
     # gpt-5.6-luna, however, IS 5.5-and-up: since 2026-07-31 it takes the
     # gpt-5.5+ floor by rule rather than needing its own pinned entry.
     assert app._benchmark_score("puter", "gpt-5.6-luna") >= app._PREF_FLOORS[6]
+
+
+def test_every_real_claude_id_shape_is_floored():
+    """"All Claude models are good — if available they should be used." Providers
+    ship the same model under very different id shapes, and a shape that misses
+    the floor is a Claude the router will not reach for."""
+    for mid in ("claude-opus-5", "claude-opus-4-6", "claude-sonnet-4-5",
+                "claude-haiku-4-5", "claude-fable-5", "claude-3-7-sonnet",
+                "claude-3-5-haiku", "claude-4.5-sonnet",
+                "anthropic/claude-opus-4.6-fast", "claude-opus-4-1-20250805",
+                # AWS Bedrock shapes — these were MISSED until 2026-07-31 because
+                # the boundary class had no '.', so a whole id family scored 18.
+                "us.anthropic.claude-sonnet-4-5-v1:0",
+                "eu.anthropic.claude-opus-4-6",
+                "bedrock/anthropic.claude-3-5-sonnet"):
+        assert app._benchmark_score("p", mid) >= app._PREF_FLOORS[5], mid
+
+
+def test_the_claude_floor_still_excludes_relay_and_legacy_ids():
+    """Two deliberate exclusions:
+    - 'claude' / 'claude-agentrouter' name the local CLI RELAY (a paid
+      subscription hop), not a model the free router should promote.
+    - claude-instant is a 2023 model; flooring it to 138 would rank it above
+      GPT-5.6, which is the opposite of "use the good models"."""
+    for mid in ("claude", "claude-agentrouter", "claude-instant-1.2"):
+        assert app._benchmark_score("p", mid) < app._PREF_FLOORS[5], mid
