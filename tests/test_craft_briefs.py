@@ -112,3 +112,42 @@ def test_multimodal_opening_turn_is_read_for_text():
 def test_injection_never_raises_on_junk():
     for bad in (None, [], "nope", [None], [{"role": "user"}]):
         app._apply_craft_brief(bad)
+
+
+# --------------------------------------------------------------------------- #
+# SHIP — finish the job instead of stopping at "you can now deploy this"
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("text", [
+    "build a store and deploy it to vercel",
+    "deploy this to production",
+    "publish the landing page",
+    "ship it",
+    "set up hosting for this",
+])
+def test_ship_brief_fires_on_deployment_work(text):
+    assert "ship" in craft.names(text)
+
+
+@pytest.mark.parametrize("text", [
+    "build me an online store",          # building is not deploying
+    "explain how a mutex works",
+])
+def test_ship_brief_stays_out_of_non_deploy_work(text):
+    assert "ship" not in craft.names(text)
+
+
+def test_ship_brief_demands_a_named_blocker_not_a_trailing_off():
+    """The reported failure: Codex built a store, said to go to Vercel, and
+    stopped — while no deploy CLI was installed at all. The useful behaviour is
+    naming the blocker AND the command that clears it."""
+    body = craft.SHIP
+    assert "npm i -g vercel" in body, "must give the exact unblocking command"
+    assert "vercel login" in body, "must name the human-only login step"
+    assert "you can now deploy this to Vercel" in body, "must forbid trailing off"
+
+
+def test_ship_brief_requires_verifying_the_deploy():
+    body = craft.SHIP.lower()
+    assert "url" in body and "verif" in body
+    assert "inventing a url" in body, "a fabricated URL is the worst failure here"

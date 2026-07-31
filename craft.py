@@ -78,7 +78,23 @@ PROGRAMMING = """ENGINEERING BRIEF (apply unless the user says otherwise)
 - Security: validate input at the boundary, parameterise queries, never log a secret.
 ANTI: dumping a rewritten file when a small edit was asked for; try/except that swallows errors; claiming something works without running it."""
 
+SHIP = """FINISH THE JOB (applies to any build/deploy task)
+- "Done" means it RUNS. Install deps, start it, hit it, and say what you actually observed — never hand over code you did not execute.
+- If the user asked for it to be deployed, carry the deployment through. Do not stop at instructions for them to follow.
+- BLOCKED? Say so in one line, name the exact blocker, and give the exact command that clears it. Never trail off mid-task.
+  * tool missing -> "vercel CLI is not installed. Run: npm i -g vercel"
+  * needs login  -> "vercel needs a browser login I cannot do. Run: vercel login" (same for netlify/wrangler/gh)
+  * needs a secret -> name the variable and where it goes.
+- Prefer a deploy path that already works on this machine. Check what is installed before choosing one, and do not assume a CLI exists.
+- After deploying, print the live URL and confirm you fetched it successfully. An unverified deploy is not a deploy.
+ANTI: stopping at "you can now deploy this to Vercel"; claiming success without running anything; inventing a URL."""
+
+_SHIP_RE = re.compile(
+    r"\bdeploy\w*\b|\bship it\b|\bgo live\b|\bpublish\b|\bhost(?:ing)?\b|"
+    r"\bvercel\b|\bnetlify\b|\bcloudflare pages\b|\bproduction\b", re.I)
+
 _BRIEFS = [
+    ("ship", _SHIP_RE, SHIP),
     ("landing", re.compile(
         r"\blanding page\b|\bsales page\b|\bfunnel\b|\bconversion rate\b|\bcta\b|\bopt[- ]?in page\b", re.I),
      LANDING),
