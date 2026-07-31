@@ -68,8 +68,26 @@ elif [ -f ".venv/Scripts/activate" ]; then
   . .venv/Scripts/activate
 fi
 
-echo "[free-llm-hub] Installing dependencies (flask, requests)..."
-pip install -q -r requirements.txt
+# --- dependencies: install ONLY when actually missing or changed -------------
+# This ran `pip install` on EVERY start, adding 60-200s of network round-trips
+# before the hub bound its port. The stamp holds a hash of requirements.txt, so
+# a pinned-version bump still triggers a real install; nothing else does.
+DEPS_STAMP=".venv/.deps-stamp"
+if python - <<'PYCHK' >/dev/null 2>&1
+import hashlib, os, sys
+h = hashlib.sha256(open("requirements.txt", "rb").read()).hexdigest()
+p = os.path.join(".venv", ".deps-stamp")
+ok = os.path.exists(p) and open(p).read().strip() == h
+import flask, requests          # noqa: F401 — must be importable, not just stamped
+sys.exit(0 if ok else 1)
+PYCHK
+then
+  echo "[free-llm-hub] Dependencies already installed - skipping pip."
+else
+  echo "[free-llm-hub] Installing dependencies (flask, requests)..."
+  pip install -q -r requirements.txt
+  python -c "import hashlib;open('$DEPS_STAMP','w').write(hashlib.sha256(open('requirements.txt','rb').read()).hexdigest())" 2>/dev/null || true
+fi
 
 echo ""
 echo "=========================================================="
