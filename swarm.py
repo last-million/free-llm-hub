@@ -16,20 +16,35 @@ construction.
 
 THE PIPELINE
 ------------
-    plan  ->  phases  ->  review  ->  synthesis
+    supervisor plan  ->  subagent waves  ->  supervisor check  ->  review  ->  synthesis
 
-1. PLAN     the strongest available model writes a phased plan + todolist as
-            JSON. This is also what satisfies "always make a plan first".
-2. PHASES   each phase is executed in order, every one seeing the outputs of the
-            phases before it. Phases are capped (MAX_PHASES) so a runaway plan
-            cannot spend an unbounded number of calls.
-3. REVIEW   a DIFFERENT provider than the one that executed criticises the draft.
-            Different-provider is the point: a model reviewing its own output
-            agrees with itself, so correlated blind spots survive.
-4. SYNTH    the strongest model folds the review into a final answer.
+1. PLAN       a SUPERVISOR model splits the work into phases and, crucially,
+              declares which phases need the OUTPUT of which others. This is
+              also what satisfies "always make a plan first".
+2. SUBAGENTS  each phase is one subagent with its OWN context: a fresh two-
+              message conversation, shown only the outputs of the phases it
+              declared it needs. Phases that need nothing from each other RUN
+              CONCURRENTLY, in dependency waves.
+3. SUPERVISE  the supervisor compares what came back against the plan it set.
+              Workers in a wave could not see each other, so this is where a
+              genuine gap or a contradiction between them is caught and filled.
+4. REVIEW     a DIFFERENT provider than the one that executed criticises the
+              draft. Different-provider is the point: a model reviewing its own
+              output agrees with itself, so correlated blind spots survive.
+5. SYNTH      the strongest model folds the review into a final answer.
+
+WHY THE OWN-CONTEXT PART IS THE WHOLE POINT
+-------------------------------------------
+This used to run phases sequentially, concatenating every earlier output into
+every later prompt. That made the swarm's ceiling the SMALLEST context window it
+routed to, and it ran out on exactly the large builds it existed for. Five
+subagents on 32K windows have ~160K of usable context between them, and a
+dependency handed to a worker is clipped (DEP_CONTEXT_CHARS) so no single worker
+can be handed the whole project again.
 
 Every stage degrades instead of failing: if the planner returns nothing usable
-the work becomes a single phase, if review fails the draft is returned as-is. A
+the work becomes a single phase carrying the WHOLE brief, if review fails the
+draft is returned as-is, and one subagent dying does not take down its wave. A
 swarm request must never end with an error the plain model would have answered.
 
 This module owns NO transport. `dispatch(messages, max_tokens, exclude_pids)`
@@ -38,28 +53,83 @@ identical to every other request.
 """
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 MAX_PHASES = 5           # bounds worst-case cost: 1 plan + 5 phases + 1 review + 1 synth
-PLAN_MAX_TOKENS = 1200
+# The planner is asked for 2..MAX_PHASES. A plan with ONE phase means it did not
+# follow the contract, and that is actively dangerous: observed live, a 3-part
+# brief ("hero headline, about paragraph, 6 menu descriptions") came back as a
+# single phase titled "Hero Headline", the one worker delivered exactly that,
+# and the other two thirds of the request were silently dropped. Falling back to
+# the whole brief as one phase answers ALL of it, so a bad plan costs a retry,
+# never content.
+MIN_PHASES = 2
+MAX_REPAIRS = 2          # supervisor gap-fills; each is a whole extra model call
+# Generous on purpose: the planner is routed to the STRONGEST model available,
+# and the strongest free models are reasoning models whose thinking is billed
+# against the same budget. At 1200 a real planner hit finish_reason=length after
+# ~220 visible characters — the JSON never closed, so every plan was unusable and
+# the swarm silently degraded to one model. Cheap insurance: this is one call.
+PLAN_MAX_TOKENS = 3000
 PHASE_MAX_TOKENS = 4000
-REVIEW_MAX_TOKENS = 1500
+REVIEW_MAX_TOKENS = 2500   # same reasoning-budget trap as PLAN_MAX_TOKENS
+SUPERVISE_MAX_TOKENS = 2000  # ditto: a truncated verdict reads as 'no gaps'
 SYNTH_MAX_TOKENS = 6000
+# How much of a dependency's output a worker is shown. The point of giving each
+# subagent its own context is that nobody carries the whole project; handing a
+# worker an unbounded teammate output would put the ceiling straight back.
+DEP_CONTEXT_CHARS = 6000
+
+
+def _clip(text, limit):
+    """Head + tail, so a truncated dependency keeps how it starts AND how it
+    ends — the middle of a document is the safest part to lose."""
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    head = int(limit * 0.6)
+    return text[:head] + "\n\n[... trimmed ...]\n\n" + text[-(limit - head):]
 
 _PLAN_SYSTEM = (
-    "You are the planner for a team of AI models that will build what the user asked for.\n"
+    "You are the SUPERVISOR of a team of AI models that will build what the user "
+    "asked for. You do not write the deliverable yourself — you decide how to "
+    "split it, and who needs whose output.\n"
     "Reply with JSON ONLY — no prose, no markdown fence:\n"
     '{"goal": "<one sentence>", "phases": [{"title": "<short>", "task": "<what to '
-    'produce, concretely>", "done_when": "<observable completion test>"}]}\n'
+    'produce, concretely>", "done_when": "<observable completion test>", '
+    '"needs": [<numbers of the phases this one needs the OUTPUT of>]}]}\n'
     "Rules:\n"
     "- Between 2 and %d phases. Fewer is better; do not invent work.\n"
     "- Each phase must produce a CONCRETE artefact (copy, code, a structure, a "
     "list) — never 'research', 'consider' or 'think about'.\n"
-    "- Order them so each phase can use the previous phases' output.\n"
+    "- Phases are numbered from 1 in the order you list them.\n"
+    "- 'needs' is the most important field. Each worker runs in its OWN context "
+    "and is shown ONLY the output of the phases it lists. List a phase ONLY if "
+    "the work genuinely cannot be done without reading its output — an empty "
+    "needs list means it can start immediately, and phases that need nothing "
+    "from each other RUN AT THE SAME TIME. Over-listing serialises the team and "
+    "wastes the context you were given.\n"
+    "- A phase may only need LOWER-numbered phases.\n"
+    "- Split so that parallel work is possible where it honestly is: separate "
+    "concerns (copy vs layout vs data) usually can start together; a phase that "
+    "assembles or depends on decisions made elsewhere cannot.\n"
     "- Phases must be about the user's actual request. Do not add scope they did "
     "not ask for.\n"
     "- No filler phases such as 'gather requirements' or 'final review' — review "
     "happens outside your plan."
 ) % MAX_PHASES
+
+_SUPERVISE_SYSTEM = (
+    "You are the supervisor checking your team's work against the plan you set. "
+    "You can see each phase's output but NOT the workers' reasoning.\n"
+    "Reply with JSON ONLY:\n"
+    '{"missing": [{"title": "<short>", "task": "<the specific gap to fill>"}]}\n'
+    "List ONLY work that was assigned and genuinely is not there, or that two "
+    "workers produced incompatibly (they could not see each other). At most 2 "
+    "items — this costs a whole extra round. If the phases together cover the "
+    "goal, return an empty list. Do not list style preferences, do not ask for "
+    "polish, and do not invent new scope: that is not what a supervisor is for."
+)
 
 _PHASE_SYSTEM = (
     "You are one specialist on a team. Do YOUR phase only, completely, and to the "
@@ -107,26 +177,76 @@ def _last_user_text(messages):
 
 
 def _parse_json(text):
-    """Models wrap JSON in prose or a fence no matter how firmly you ask.
-    Take the outermost {...} and parse that. Returns None on failure."""
+    """Models wrap JSON in prose or a fence no matter how firmly you ask, and a
+    weak or truncated one emits JSON that is nearly right. Returns None only
+    when there is genuinely nothing usable.
+
+    The repair pass exists because the plan is the linchpin: a single missing
+    brace used to collapse the whole swarm to one phase, which is the difference
+    between a team and one model. Observed for real from a small planner —
+    objects opened and never closed, one after another."""
     if not text:
         return None
     s = text.strip()
     if s.startswith("```"):
         s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
         s = re.sub(r"```\s*$", "", s).strip()
-    i, j = s.find("{"), s.rfind("}")
-    if i == -1 or j <= i:
+    i = s.find("{")
+    if i == -1:
         return None
+    s = s[i:]
+    j = s.rfind("}")
+    for candidate in ([s[:j + 1]] if j > 0 else []) + [s]:
+        try:
+            out = json.loads(candidate)
+        except ValueError:
+            out = _repair_json(candidate)
+        if isinstance(out, dict):
+            return out
+    return None
+
+
+def _repair_json(s):
+    """Best-effort fix for the two ways model JSON actually breaks: a trailing
+    comma before a closer, and objects/arrays left open (truncation, or a model
+    that simply forgot). Returns a dict or None — never raises."""
+    fixed = re.sub(r",\s*([}\]])", r"\1", s)
+    # Balance, ignoring braces inside strings.
+    stack, in_str, esc = [], False, False
+    for ch in fixed:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch in "}]" and stack:
+            stack.pop()
+    if in_str:
+        fixed += '"'
+    fixed += "".join("}" if c == "{" else "]" for c in reversed(stack))
+    fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
     try:
-        out = json.loads(s[i:j + 1])
+        out = json.loads(fixed)
     except ValueError:
         return None
     return out if isinstance(out, dict) else None
 
 
 def _clean_phases(plan):
-    """Validated phase list, or [] if the plan is unusable."""
+    """Validated phase list, or [] if the plan is unusable.
+
+    `needs` is sanitised hard because a bad dependency graph is worse than none:
+    a self-reference or a forward reference would deadlock the wave scheduler,
+    and a supervisor that lists every phase as a dependency silently turns the
+    swarm back into the sequential pipeline this replaced."""
     if not isinstance(plan, dict):
         return []
     out = []
@@ -136,11 +256,79 @@ def _clean_phases(plan):
         task = str(p.get("task") or "").strip()
         if not task:
             continue
+        idx = len(out) + 1
+        needs = []
+        raw = p.get("needs")
+        if isinstance(raw, list):
+            for n in raw:
+                try:
+                    n = int(n)
+                except (TypeError, ValueError):
+                    continue
+                # Only strictly-earlier phases: anything else is a cycle or a
+                # reference to work that does not exist yet.
+                if 1 <= n < idx and n not in needs:
+                    needs.append(n)
         out.append({
-            "title": str(p.get("title") or "Phase %d" % (len(out) + 1)).strip()[:80],
+            "title": str(p.get("title") or "Phase %d" % idx).strip()[:80],
             "task": task[:2000],
             "done_when": str(p.get("done_when") or "").strip()[:300],
+            "needs": needs,
         })
+    return out
+
+
+_PHASE_SCAN_RE = re.compile(
+    r'"title"\s*:\s*"([^"]{1,120})"\s*,\s*(?:\n\s*)?"task"\s*:\s*"([^"]{1,2000})"'
+    r'(?:\s*,\s*"done_when"\s*:\s*"([^"]{0,300})")?', re.S)
+
+
+def _phases_from_text(text):
+    """Pull phases out of JSON too broken to repair.
+
+    A planner that opens an object per phase and never closes any of them is not
+    fixable by balancing braces — the structure is wrong, not truncated — but
+    the CONTENT is all there and perfectly readable. Observed verbatim from a
+    small planner, and it used to cost the entire team: one unparseable reply
+    and the swarm silently became a single model.
+
+    Dependencies are deliberately not scanned: a plan recovered this way is
+    already suspect, and running every phase in one parallel wave is the safe
+    reading — worst case each worker gets less context, which they all handle."""
+    if not text:
+        return []
+    out = []
+    for title, task, done in _PHASE_SCAN_RE.findall(text):
+        if task.strip():
+            out.append({"title": title.strip(), "task": task.strip(),
+                        "done_when": (done or "").strip(), "needs": []})
+    return out[:MAX_PHASES]
+
+
+def _usable(phases):
+    """A plan is only worth running as a TEAM if it actually splits the work.
+    Fewer than MIN_PHASES means the planner ignored the contract, and a partial
+    plan silently drops the rest of the user's request — see MIN_PHASES."""
+    return phases if len(phases) >= MIN_PHASES else []
+
+
+def _waves(phases):
+    """Group phases into dependency waves. Everything in one wave is independent
+    of everything else in it, so a wave runs CONCURRENTLY.
+
+    Falls back to running the remainder as one wave if the graph is somehow
+    still unsatisfiable — a swarm must never hang, and phases whose inputs are
+    missing simply get less context, which every worker already tolerates."""
+    remaining = list(range(1, len(phases) + 1))
+    done = set()
+    out = []
+    while remaining:
+        wave = [i for i in remaining if set(phases[i - 1]["needs"]) <= done]
+        if not wave:
+            wave = list(remaining)
+        out.append(wave)
+        done.update(wave)
+        remaining = [i for i in remaining if i not in done]
     return out
 
 
@@ -169,35 +357,135 @@ def run(messages, dispatch, on_event=None):
     if plan_model:
         models_used.append(("plan", plan_model))
     plan = _parse_json(plan_text) or {}
-    phases = _clean_phases(plan)
+    phases = _usable(_clean_phases(plan) or _phases_from_text(plan_text))
+    if not phases:
+        # ONE retry before giving up on having a team at all. The plan is the
+        # linchpin — without it the swarm degrades to a single model, which is
+        # not what the user selected — and the usual cause is a planner that
+        # narrated instead of answering, or emitted JSON too broken to repair.
+        # The retry says so bluntly and shows the exact shape.
+        emit("plan", "plan unusable — retrying once")
+        plan_text, plan_model = dispatch(
+            [{"role": "system", "content": _PLAN_SYSTEM},
+             {"role": "user", "content":
+              brief + "\n\nOUTPUT JSON ONLY. Start your reply with { and end it "
+              'with }. No prose, no fence, no explanation. Shape:\n'
+              '{"goal":"...","phases":[{"title":"...","task":"...",'
+              '"done_when":"...","needs":[]}]}'}], PLAN_MAX_TOKENS)
+        if plan_model:
+            models_used.append(("plan:retry", plan_model))
+        plan = _parse_json(plan_text) or {}
+        phases = _usable(_clean_phases(plan) or _phases_from_text(plan_text))
     if not phases:
         # Planner failed or returned junk -> ONE phase that is the original ask.
         # Degrading to a normal answer beats erroring out.
-        phases = [{"title": "Deliver", "task": brief, "done_when": ""}]
+        phases = [{"title": "Deliver", "task": brief, "done_when": "", "needs": []}]
         emit("plan", "planner unusable — running as a single phase")
     else:
         emit("plan", "%d phases" % len(phases))
 
-    # ---- 2. PHASES --------------------------------------------------------
-    done = []
+    # ---- 2. PHASES — one subagent each, own context, waves run in parallel --
+    #
+    # Each worker is dispatched with a FRESH two-message conversation: the phase
+    # system prompt and its own brief. It never sees the user's conversation, the
+    # other workers' prompts, or any phase output it did not declare a need for.
+    # That is what makes the swarm bigger than one model: five workers on 32K
+    # windows have 160K of usable context between them, where the old sequential
+    # pipeline concatenated every previous output into every later phase and ran
+    # out on exactly the large builds it was meant for.
+    goal = plan.get("goal") or brief
+    outputs = {}                      # phase number -> output text
+    titles = {}
     exec_pids = set()
-    for idx, ph in enumerate(phases, 1):
-        emit("phase", "%d/%d %s" % (idx, len(phases), ph["title"]))
-        context = "".join(
-            "\n\n### Completed phase: %s\n%s" % (d["title"], d["output"]) for d in done)
+
+    def _run_phase(idx):
+        ph = phases[idx - 1]
+        ctx = "".join(
+            "\n\n### Output of phase %d (%s)\n%s"
+            % (n, phases[n - 1]["title"], _clip(outputs[n], DEP_CONTEXT_CHARS))
+            for n in ph["needs"] if outputs.get(n))
         user = ("OVERALL GOAL\n%s\n\nYOUR PHASE (%d of %d): %s\n%s%s%s"
-                % (plan.get("goal") or brief, idx, len(phases), ph["title"], ph["task"],
+                % (goal, idx, len(phases), ph["title"], ph["task"],
                    ("\n\nDone when: " + ph["done_when"]) if ph["done_when"] else "",
-                   ("\n\nWork already completed by the team — build on it, do not "
-                    "repeat it:" + context) if context else ""))
-        text, used = dispatch(
+                   ("\n\nYou were given these teammates' outputs to build on. Do "
+                    "not repeat them, do not rewrite them:" + ctx) if ctx else
+                   "\n\nYou are working in parallel with the rest of the team and "
+                   "cannot see their output. Produce your part only."))
+        return dispatch(
             [{"role": "system", "content": _PHASE_SYSTEM},
              {"role": "user", "content": user}], PHASE_MAX_TOKENS)
-        if used:
-            models_used.append(("phase:%s" % ph["title"], used))
-            exec_pids.add(used.split("/", 1)[0])
-        if text:
-            done.append({"title": ph["title"], "output": text})
+
+    for wave in _waves(phases):
+        names = ", ".join(phases[i - 1]["title"] for i in wave)
+        emit("phase", ("%d in parallel: %s" % (len(wave), names)) if len(wave) > 1
+             else "1/%d %s" % (len(phases), names))
+        if len(wave) == 1:
+            results = {wave[0]: _run_phase(wave[0])}
+        else:
+            with ThreadPoolExecutor(max_workers=len(wave)) as pool:
+                futures = {pool.submit(_run_phase, i): i for i in wave}
+                results = {}
+                for fut in as_completed(futures):
+                    i = futures[fut]
+                    try:
+                        results[i] = fut.result()
+                    except Exception:                            # noqa: BLE001
+                        results[i] = ("", None)                  # one worker dying
+                                                                 # must not kill the wave
+        # Applied in phase order, not completion order, so the assembled draft
+        # reads in the sequence the supervisor planned.
+        for i in sorted(results):
+            text, used = results[i]
+            if used:
+                models_used.append(("phase:%s" % phases[i - 1]["title"], used))
+                exec_pids.add(used.split("/", 1)[0])
+            if text:
+                outputs[i] = text
+                titles[i] = phases[i - 1]["title"]
+
+    done = [{"title": titles[i], "output": outputs[i]} for i in sorted(outputs)]
+
+    # ---- 2b. SUPERVISOR — did the team actually cover the plan? -------------
+    # Workers that ran in parallel could not see each other, so this is where a
+    # genuine gap or a contradiction between them gets caught. Skipped when only
+    # one phase produced anything: there is no team to reconcile.
+    if len(done) > 1:
+        emit("supervise", "checking coverage")
+        sup_text, sup_model = dispatch(
+            [{"role": "system", "content": _SUPERVISE_SYSTEM},
+             {"role": "user", "content": "GOAL\n%s\n\nPLAN\n%s\n\nWHAT THE TEAM PRODUCED\n%s"
+              % (goal,
+                 "\n".join("%d. %s — %s" % (i, p["title"], p["task"])
+                           for i, p in enumerate(phases, 1)),
+                 "\n\n".join("## %s\n%s" % (d["title"], _clip(d["output"], DEP_CONTEXT_CHARS))
+                             for d in done))}],
+            SUPERVISE_MAX_TOKENS)
+        if sup_model:
+            models_used.append(("supervisor", sup_model))
+        gaps = []
+        for g in ((_parse_json(sup_text) or {}).get("missing") or [])[:MAX_REPAIRS]:
+            if isinstance(g, dict) and str(g.get("task") or "").strip():
+                gaps.append({"title": str(g.get("title") or "Gap").strip()[:80],
+                             "task": str(g["task"]).strip()[:1200]})
+        if gaps:
+            emit("supervise", "%d gap%s to fill" % (len(gaps), "" if len(gaps) == 1 else "s"))
+            with ThreadPoolExecutor(max_workers=len(gaps)) as pool:
+                futures = {pool.submit(
+                    dispatch,
+                    [{"role": "system", "content": _PHASE_SYSTEM},
+                     {"role": "user", "content": "OVERALL GOAL\n%s\n\nYOUR TASK: %s\n%s"
+                      % (goal, g["title"], g["task"])}],
+                    PHASE_MAX_TOKENS): g for g in gaps}
+                for fut in as_completed(futures):
+                    g = futures[fut]
+                    try:
+                        text, used = fut.result()
+                    except Exception:                            # noqa: BLE001
+                        continue
+                    if used:
+                        models_used.append(("repair:%s" % g["title"], used))
+                    if text:
+                        done.append({"title": g["title"], "output": text})
 
     if not done:
         return {"text": "", "plan": plan, "phases": [], "review": None,
