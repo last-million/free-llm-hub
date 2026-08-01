@@ -231,16 +231,18 @@ def test_the_claude_floor_still_excludes_the_cli_relay_handles():
         assert app._benchmark_score("p", mid) < app._PREF_FLOORS[5], mid
 
 
-def test_deepseek_v4_and_minimax_m3_sit_just_under_glm5():
+def test_deepseek_v4_is_level_with_glm52_and_minimax_m3_sits_under_both():
     """USER 2026-08-01: "DeepSeek V4 should have priority almost as much as
-    GLM 5.2, and MiniMax M3 is also good, almost like DeepSeek 4."
+    GLM 5.2, and MiniMax M3 is also good, almost like DeepSeek 4." Then, later
+    the same day: "deepseek v4 seems good so it should be the SAME level as
+    glm 5.2" -- so this is equality now, not "just under".
 
     Order asserted, not raw numbers, so the tiers can be re-tuned without
     rewriting the test."""
     glm = app._benchmark_score("p", "glm-5.2")
     ds4 = app._benchmark_score("p", "deepseek-v4")
     mm3 = app._benchmark_score("p", "minimax-m3")
-    assert glm > ds4 > mm3
+    assert glm == ds4 > mm3
     # ...and both clear the whole ordinary field.
     for weaker in ("qwen3.6-27b", "qwen3.5", "mimo-2.5", "deepseek-v3.1",
                    "minimax-m2", "kimi-k2.7"):
@@ -274,7 +276,10 @@ def test_older_generations_keep_their_measured_score():
 
 def test_gemini_31_and_up_beat_deepseek_v4():
     """USER 2026-08-01: "gemini 3.1, 3.5, 3.6 and up versions are better than
-    deepseek 4 or v4."."""
+    deepseek 4 or v4."
+
+    Still true after deepseek-v4 drew level with glm-5.2 -- which is what
+    pushed gemini above glm as well. See test_gemini_now_outranks_glm52."""
     ds4 = app._benchmark_score("p", "deepseek-v4")
     for mid in ("gemini-3.1-pro", "models/gemini-3.5-flash",
                 "models/gemini-3.6-flash", "gemini-4"):
@@ -321,8 +326,38 @@ def test_gemini_pro_beats_gemini_flash():
             app._benchmark_score("p", "gemini-%s-flash" % v), v
 
 
-def test_gemini_stays_under_glm52():
-    """The user ranked glm-5.2 earlier and did not revisit it."""
+"""REPLACED by test_gemini_now_outranks_glm52_because_deepseek_drew_level_with_it.
+
+test_gemini_stays_under_glm52 asserted the opposite and was right at the time:
+gemini sat between glm-5.2 and deepseek-v4, so "under glm" and "over deepseek"
+were both satisfiable. When the user put deepseek level with glm-5.2 that gap
+closed, and the two things they actually SAID -- gemini beats deepseek-v4,
+deepseek-v4 equals glm-5.2 -- force gemini above glm. "Under glm" was never a
+stated preference, only an inference from a gap that no longer exists, so the
+test asserting it had to go rather than be quietly loosened.
+"""
+
+
+def test_gemini_now_outranks_glm52_because_deepseek_drew_level_with_it():
+    """Not a preference of its own -- a consequence of two the user did state.
+
+    "gemini 3.1+ beats deepseek-v4" and "deepseek-v4 is the same level as
+    glm-5.2" cannot both hold with gemini below glm. Gemini was only ever put
+    under glm by inference (it sat between glm and deepseek, and deepseek was
+    lower); that gap closed, so the inference went with it."""
     glm = app._benchmark_score("p", "glm-5.2")
-    for mid in ("gemini-3.6-flash", "gemini-4", "gemini-5"):
-        assert app._benchmark_score("p", mid) < glm, mid
+    for mid in ("gemini-3.1-pro", "models/gemini-3.5-flash", "gemini-4"):
+        assert app._benchmark_score("p", mid) > glm, mid
+
+
+def test_gemini_pro_still_beats_gemini_flash_of_any_version():
+    """The one thing the user was emphatic about ("gemini pro is better than
+    gemini flash, of course") must survive the band move."""
+    assert app._benchmark_score("p", "gemini-3.1-pro") >            app._benchmark_score("p", "gemini-5-flash")
+
+
+def test_the_named_top_four_still_outrank_gemini():
+    """Moving gemini up must not push it past the four the user ranked highest."""
+    top = app._benchmark_score("p", "hy3-large")
+    for mid in ("gemini-3.1-pro", "gemini-9-pro"):
+        assert app._benchmark_score("p", mid) < top, mid
