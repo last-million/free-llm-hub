@@ -57,6 +57,8 @@
     --radius:10px;
     --radius-sm:8px;
     --sidebar-w:248px;
+    --sidebar-rail:56px;   /* icons only */
+    --sidebar-strip:10px;  /* hidden: just a hover target */
   }
   :root[data-theme="light"]{
     color-scheme:light;
@@ -120,7 +122,7 @@
   :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
   ::selection{background:var(--accent-soft)}
 
-  .wrap{max-width:1180px;margin:0 auto;padding:0 24px 90px}
+  .wrap{max-width:none;margin:0;padding:0 28px 90px}
 
   /* ---------- header ---------- */
   header{
@@ -128,7 +130,7 @@
     background:var(--surface);
     border-bottom:1px solid var(--border-soft);
   }
-  .hd{max-width:1180px;margin:0 auto;padding:13px 24px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .hd{max-width:none;margin:0;padding:13px 28px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
   .logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:15.5px;letter-spacing:-.01em}
   .logo-mark{
     width:30px;height:30px;border-radius:8px;flex:none;
@@ -1113,7 +1115,7 @@
   #exhaust-banner.show{display:block}
   #exhaust-banner.red{background:var(--danger);color:#fff;border-bottom-color:rgba(0,0,0,.28)}
   #exhaust-banner.amber{background:var(--warn-soft);color:var(--warn-text);border-bottom-color:var(--warn-border)}
-  #exhaust-banner .eb-inner{max-width:1180px;margin:0 auto;display:flex;align-items:baseline;gap:6px 16px;flex-wrap:wrap}
+  #exhaust-banner .eb-inner{max-width:none;margin:0;display:flex;align-items:baseline;gap:6px 16px;flex-wrap:wrap}
   #exhaust-banner .eb-msg{font-weight:700}
   #exhaust-banner .eb-list{font-weight:500;opacity:.95}
   #exhaust-banner .eb-list b{font-family:var(--mono);font-weight:700}
@@ -1276,6 +1278,73 @@
     border-radius:3px; background:var(--accent); }
   .cx-nav-item.active svg{ opacity:1; color:var(--accent); }
   body.cx-on{ padding-left:var(--sidebar-w); }
+
+  /* ── Sidebar modes: full → rail (icons only) → hidden (hover strip) ────────
+     Driven by a class on <body> so the content offset and the sidebar width can
+     never disagree. In rail and hidden mode the sidebar EXPANDS OVER the content
+     on hover instead of pushing it, because reflowing the whole page on a mouse
+     move is both janky and disorienting. */
+  .cx-sidebar{ transition:width .18s ease, transform .18s ease; }
+  body.cx-rail{ padding-left:var(--sidebar-rail); }
+  body.cx-rail .cx-sidebar{ width:var(--sidebar-rail); }
+  body.cx-hidden{ padding-left:var(--sidebar-strip); }
+  body.cx-hidden .cx-sidebar{ width:var(--sidebar-strip); }
+  /* Collapsed: everything but the icons goes. visibility (not display) keeps the
+     labels in the a11y tree only while they are actually readable. */
+  body.cx-rail .cx-nav-item span,
+  body.cx-rail .cx-group-label .gl-text,
+  body.cx-rail .cx-brand-text,
+  body.cx-rail .nav-new-badge,
+  body.cx-hidden .cx-sidebar > *{ opacity:0; visibility:hidden; }
+  body.cx-rail .cx-nav-item{ justify-content:center; padding-left:0; padding-right:0; }
+  body.cx-rail .cx-group-label{ text-align:center; padding-left:0; padding-right:0; }
+  body.cx-rail .cx-side-foot{ flex-direction:column; align-items:center; padding:12px 6px; }
+  /* Hover (or keyboard focus) restores the full sidebar, floating above the page. */
+  body.cx-rail .cx-sidebar:hover, body.cx-rail .cx-sidebar:focus-within,
+  body.cx-hidden .cx-sidebar:hover, body.cx-hidden .cx-sidebar:focus-within{
+    width:var(--sidebar-w); box-shadow:14px 0 44px rgba(0,0,0,.34); }
+  body.cx-rail .cx-sidebar:hover .cx-nav-item span,
+  body.cx-rail .cx-sidebar:hover .cx-group-label .gl-text,
+  body.cx-rail .cx-sidebar:hover .cx-brand-text,
+  body.cx-rail .cx-sidebar:hover .nav-new-badge,
+  body.cx-rail .cx-sidebar:focus-within .cx-nav-item span,
+  body.cx-rail .cx-sidebar:focus-within .cx-group-label .gl-text,
+  body.cx-hidden .cx-sidebar:hover > *, body.cx-hidden .cx-sidebar:focus-within > *{
+    opacity:1; visibility:visible; }
+  body.cx-rail .cx-sidebar:hover .cx-nav-item,
+  body.cx-rail .cx-sidebar:focus-within .cx-nav-item{
+    justify-content:flex-start; padding-left:12px; padding-right:12px; }
+  /* In hidden mode the strip is the only affordance, so make it findable. */
+  body.cx-hidden .cx-sidebar{ border-right:2px solid var(--accent-border); }
+  body.cx-hidden .cx-sidebar:hover{ border-right-color:var(--border-soft); }
+
+  /* Collapsible nav GROUPS. The label is the control. */
+  .cx-group-label{ display:flex; align-items:center; gap:6px; width:100%;
+    border:0; background:none; cursor:pointer; font:inherit; font-size:10px;
+    text-transform:uppercase; letter-spacing:.12em; color:var(--text-faint);
+    font-weight:700; text-align:left; border-radius:6px;
+    transition:color .15s ease; }
+  .cx-group-label:hover{ color:var(--text-dim); }
+  .cx-group-label:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .cx-group-label .gl-caret{ margin-left:auto; flex:none; width:12px; height:12px;
+    transition:transform .18s ease; }
+  .cx-group.collapsed .gl-caret{ transform:rotate(-90deg); }
+  .cx-group.collapsed .cx-group-body{ display:none; }
+
+  .cx-sidebar-toggle{ display:inline-grid; place-items:center; width:28px; height:28px;
+    flex:none; border-radius:7px; border:1px solid var(--border-soft);
+    background:var(--surface-2); color:var(--text-dim); cursor:pointer; margin-left:auto;
+    transition:color .15s ease, border-color .15s ease; }
+  .cx-sidebar-toggle:hover{ color:var(--accent); border-color:var(--accent-border); }
+  .cx-sidebar-toggle:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  body.cx-rail .cx-sidebar-toggle, body.cx-hidden .cx-sidebar-toggle{ display:none; }
+  body.cx-rail .cx-sidebar:hover .cx-sidebar-toggle,
+  body.cx-hidden .cx-sidebar:hover .cx-sidebar-toggle{ display:inline-grid; }
+
+  @media (prefers-reduced-motion:reduce){
+    .cx-sidebar, .gl-caret, .cx-sidebar-toggle{ transition:none; }
+  }
+
   body.cx-on main.wrap > section.section{ display:none; }
   body.cx-on main.wrap > section.section.cx-active{ display:block; animation:cxFade .22s ease-out; }
   @keyframes cxFade{ from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:none;} }
@@ -1342,6 +1411,74 @@
   .card.nokey .key-form, .card.nokey .key-warn{ display:none; }
   .nokey-note{ font-size:12.5px; color:var(--ok-text); background:var(--accent-soft);
     border:1px solid var(--accent-border); border-radius:var(--radius-sm); padding:7px 10px; }
+  /* ── Agent workspace: chat on the left, the running project on the right ──
+     Split only where there is room for it. Below 1100px the preview would be
+     too narrow to judge a layout in, so it stacks under the chat instead of
+     shrinking into uselessness. */
+  .agent-split{ display:grid; grid-template-columns:1fr; gap:12px; }
+  @media (min-width:1100px){
+    .agent-split{ grid-template-columns:minmax(0,1fr) minmax(0,1.05fr); align-items:stretch; }
+  }
+  .agent-chat-col{ display:flex; flex-direction:column; gap:10px; min-width:0; }
+  .agent-preview-col{ display:flex; flex-direction:column; gap:8px; min-width:0;
+    border:1px solid var(--border); border-radius:var(--radius); overflow:hidden;
+    background:var(--card); }
+  .preview-bar{ display:flex; align-items:center; gap:8px; padding:8px 10px;
+    border-bottom:1px solid var(--border); flex-wrap:wrap; }
+  .preview-state{ font-size:12.5px; color:var(--muted); flex:1; min-width:0;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .preview-state.live{ color:var(--ok-text); }
+  .preview-state.bad{ color:var(--err-text); }
+  .preview-open{ font-size:12.5px; color:var(--accent); text-decoration:none; }
+  .preview-open:hover{ text-decoration:underline; }
+  .preview-frame-wrap{ position:relative; flex:1; min-height:340px; background:#fff; }
+  /* The preview is a real site: give it a white canvas regardless of the
+     dashboard theme, or every light-themed project looks broken in dark mode. */
+  @media (prefers-color-scheme:dark){ .preview-frame-wrap{ background:#fff; } }
+  .preview-frame{ width:100%; height:100%; border:0; display:block; }
+  .preview-placeholder{ position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:6px; text-align:center;
+    padding:22px; color:var(--muted); background:var(--card); }
+  .preview-placeholder p{ margin:0; font-size:13px; max-width:34ch; }
+  .preview-hint{ font-size:12px; opacity:.85; }
+  .preview-problems{ border-top:1px solid var(--border); max-height:210px;
+    display:flex; flex-direction:column; }
+  .preview-problems-head{ display:flex; align-items:center; justify-content:space-between;
+    gap:8px; padding:7px 10px; font-size:12.5px; font-weight:600; color:var(--err-text); }
+  .preview-problem-list{ list-style:none; margin:0; padding:0 0 6px; overflow:auto; }
+  .preview-problem-list li{ margin:0; }
+  /* Clicking a problem is the whole point — it becomes the next prompt. */
+  .preview-problem{ display:flex; gap:8px; width:100%; text-align:left; cursor:pointer;
+    background:none; border:0; border-top:1px solid var(--border-soft, var(--border));
+    padding:7px 10px; font:inherit; font-size:12.5px; color:var(--fg);
+    transition:background 160ms ease; }
+  .preview-problem:hover, .preview-problem:focus-visible{ background:var(--accent-soft); }
+  .preview-problem:focus-visible{ outline:2px solid var(--accent); outline-offset:-2px; }
+  .preview-problem .pk{ flex:none; font-size:11px; text-transform:uppercase;
+    letter-spacing:.03em; color:var(--muted); padding-top:1px; }
+  .preview-problem .pt{ min-width:0; overflow-wrap:anywhere; }
+  .preview-log{ margin:0; padding:8px 10px; max-height:150px; overflow:auto;
+    font-size:11.5px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere;
+    border-top:1px solid var(--border); color:var(--muted); }
+  @media (prefers-reduced-motion:reduce){
+    .preview-problem{ transition:none; }
+  }
+
+  /* Screenshots queued for the next agent message. */
+  .agent-attach-strip{ display:flex; flex-wrap:wrap; gap:6px; }
+  .attach-chip{ display:inline-flex; align-items:center; gap:6px; max-width:100%;
+    border:1px solid var(--border); border-radius:var(--radius-sm);
+    padding:3px 6px 3px 3px; background:var(--card); font-size:12px; }
+  .attach-chip img{ width:26px; height:26px; object-fit:cover; border-radius:4px;
+    display:block; flex:none; }
+  .attach-name{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    max-width:22ch; color:var(--muted); }
+  .attach-x{ border:0; background:none; cursor:pointer; color:var(--muted);
+    font-size:15px; line-height:1; padding:2px 3px; border-radius:4px;
+    transition:color 160ms ease, background 160ms ease; }
+  .attach-x:hover, .attach-x:focus-visible{ color:var(--err-text); background:var(--accent-soft); }
+  @media (prefers-reduced-motion:reduce){ .attach-x{ transition:none; } }
+
   /* One-click free key, for vendors that document anonymous instant minting. */
   .mint-key{ display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
   .mint-key-note{ font-size:12px; color:var(--muted); }
@@ -1374,32 +1511,40 @@
   <div class="cx-brand">
     <img class="cx-mark-img" src="/static/calvoun-logo.webp" width="30" height="30"
          alt="Calvoun logo: a white owl whose outstretched wings are formed from the letters of the word CALVOUN, with a cyan beak, on a purple rounded square." decoding="async">
-    <span>Calvoun Hub<small>local gateway &middot; 127.0.0.1</small></span>
+    <span class="cx-brand-text">Calvoun Hub<small>local gateway &middot; 127.0.0.1</small></span>
+    <button class="cx-sidebar-toggle" id="cx-sidebar-toggle" type="button"
+            aria-label="Collapse the sidebar" title="Collapse the sidebar (full → icons → hidden)">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+    </button>
   </div>
   <nav class="cx-nav" id="cx-nav">
-    <div class="cx-group">
-      <div class="cx-group-label">Hub</div>
+    <div class="cx-group" data-group="hub">
+      <button class="cx-group-label" type="button" aria-expanded="true" aria-controls="grp-hub"><span class="gl-text">Hub</span><svg class="gl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+      <div class="cx-group-body" id="grp-hub">
       <button class="cx-nav-item" data-view="sec-lifecycle" data-title="Hub controls" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="2" y1="14" x2="6" y2="14"/><line x1="10" y1="8" x2="14" y2="8"/><line x1="18" y1="16" x2="22" y2="16"/></svg><span>Hub controls</span></button>
-      <button class="cx-nav-item" data-view="sec-activity" data-title="Live activity" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span>Activity</span></button>
+      <button class="cx-nav-item" data-view="sec-activity" data-title="Live activity" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span>Activity</span></button></div>
     </div>
-    <div class="cx-group">
-      <div class="cx-group-label">Generate</div>
+    <div class="cx-group" data-group="generate">
+      <button class="cx-group-label" type="button" aria-expanded="true" aria-controls="grp-generate"><span class="gl-text">Generate</span><svg class="gl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+      <div class="cx-group-body" id="grp-generate">
       <button class="cx-nav-item" data-view="sec-chat" data-title="Chat / Test" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>Quick chat</span></button>
       <button class="cx-nav-item" data-view="sec-agent" data-title="Chat CLI (agentic)" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="m7 9 3 3-3 3"/><line x1="13" y1="15" x2="17" y2="15"/></svg><span>Agent chat</span></button>
-      <button class="cx-nav-item" data-view="sec-images" data-title="Image generation" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg><span>Images</span></button>
+      <button class="cx-nav-item" data-view="sec-images" data-title="Image generation" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg><span>Images</span></button></div>
     </div>
-    <div class="cx-group">
-      <div class="cx-group-label">Models & keys</div>
+    <div class="cx-group" data-group="models-keys">
+      <button class="cx-group-label" type="button" aria-expanded="true" aria-controls="grp-models-keys"><span class="gl-text">Models & keys</span><svg class="gl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+      <div class="cx-group-body" id="grp-models-keys">
       <button class="cx-nav-item" data-view="sec-providers" data-title="Providers" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg><span>Providers</span><span class="nav-new-badge" data-new-key="providers_puter_connect_fix_v1">New updates</span></button>
       <button class="cx-nav-item" data-view="sec-image-providers" data-title="Image providers" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><circle cx="6" cy="17.5" r="1"/><path d="m14 15 4 4 4-4M18 19v-6"/></svg><span>Image providers</span></button>
       <button class="cx-nav-item" data-view="sec-subs" data-title="Local subscriptions" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.5 12.5 20 3"/><path d="m16 6 3 3"/></svg><span>Subscriptions</span></button>
-      <button class="cx-nav-item" data-view="sec-default" data-title="Orchestrator model" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg><span>Routing</span></button>
+      <button class="cx-nav-item" data-view="sec-default" data-title="Orchestrator model" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg><span>Routing</span></button></div>
     </div>
-    <div class="cx-group">
-      <div class="cx-group-label">Insights</div>
+    <div class="cx-group" data-group="insights">
+      <button class="cx-group-label" type="button" aria-expanded="true" aria-controls="grp-insights"><span class="gl-text">Insights</span><svg class="gl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+      <div class="cx-group-body" id="grp-insights">
       <button class="cx-nav-item" data-view="sec-quota" data-title="Free quota" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg><span>Free quota</span></button>
       <button class="cx-nav-item" data-view="sec-usage" data-title="Daily usage" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg><span>Usage</span></button>
-      <button class="cx-nav-item" data-view="sec-tracking" data-title="Model tracking" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.9 4.9l2.9 2.9M16.2 16.2l2.9 2.9M4.9 19.1l2.9-2.9M16.2 7.8l2.9-2.9"/></svg><span>Tracking</span></button>
+      <button class="cx-nav-item" data-view="sec-tracking" data-title="Model tracking" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.9 4.9l2.9 2.9M16.2 16.2l2.9 2.9M4.9 19.1l2.9-2.9M16.2 7.8l2.9-2.9"/></svg><span>Tracking</span></button></div>
     </div>
   </nav>
   <div class="cx-side-foot">
@@ -1683,14 +1828,53 @@
             <button class="btn sm ghost" id="agent-checkpoint" type="button" title="Bookmark this point in the conversation — not a filesystem undo">Bookmark</button>
             <button class="btn sm ghost" id="agent-end" type="button">End session</button>
           </div>
-          <div class="chat-messages" id="agent-messages" aria-live="polite">
-            <div class="chat-empty">Send a message to start working with the agent in this folder.</div>
-          </div>
-          <div class="chat-input-row">
-            <textarea id="agent-text" placeholder="Tell the agent what to do&hellip;  (Enter to send, Shift+Enter for a new line)" aria-label="Message to agent" rows="2"></textarea>
-            <div class="chat-send-col">
-              <button class="btn primary" id="agent-send" type="button">Send</button>
-              <button class="btn" id="agent-stop" type="button" disabled>Stop</button>
+          <div class="agent-split" id="agent-split">
+            <div class="agent-chat-col">
+              <div class="chat-messages" id="agent-messages" aria-live="polite">
+                <div class="chat-empty">Send a message to start working with the agent in this folder.</div>
+              </div>
+              <div class="agent-attach-strip" id="agent-attach-strip" hidden></div>
+              <div class="chat-input-row">
+                <textarea id="agent-text" placeholder="Tell the agent what to do&hellip;  (Enter to send, Shift+Enter for a new line, paste or drop a screenshot)" aria-label="Message to agent" rows="2"></textarea>
+                <div class="chat-send-col">
+                  <button class="btn primary" id="agent-send" type="button">Send</button>
+                  <button class="btn" id="agent-stop" type="button" disabled>Stop</button>
+                  <button class="btn sm ghost" id="agent-attach" type="button" title="Attach a screenshot">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg>
+                    Image
+                  </button>
+                  <input id="agent-file" type="file" accept="image/*" multiple hidden>
+                </div>
+              </div>
+            </div>
+            <!-- Runs the project the agent is writing, on its own port, with its
+                 own dependencies. The point is that "done" means SEEN running. -->
+            <div class="agent-preview-col" id="agent-preview-col">
+              <div class="preview-bar">
+                <button class="btn sm primary" id="preview-run" type="button">Run</button>
+                <button class="btn sm ghost" id="preview-stop" type="button" hidden>Stop</button>
+                <span class="preview-state" id="preview-state">not running</span>
+                <a class="preview-open" id="preview-open" href="#" target="_blank" rel="noopener noreferrer" hidden>Open</a>
+                <button class="btn sm ghost preview-reload" id="preview-reload" type="button" hidden aria-label="Reload preview">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>
+                </button>
+              </div>
+              <div class="preview-frame-wrap">
+                <iframe id="preview-frame" class="preview-frame" title="Live preview of your project" hidden></iframe>
+                <div class="preview-placeholder" id="preview-placeholder">
+                  <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                  <p>Press <b>Run</b> to start this project and see it here.</p>
+                  <p class="preview-hint">Its dependencies install into this folder only — a <code>.venv</code> and its own <code>node_modules</code>.</p>
+                </div>
+              </div>
+              <div class="preview-problems" id="preview-problems" hidden>
+                <div class="preview-problems-head">
+                  <span id="preview-problems-count">Problems</span>
+                  <button class="btn sm ghost" id="preview-log-toggle" type="button">Output</button>
+                </div>
+                <ul class="preview-problem-list" id="preview-problem-list"></ul>
+                <pre class="preview-log" id="preview-log" hidden></pre>
+              </div>
             </div>
           </div>
         </div>
@@ -2063,9 +2247,89 @@
       var open = document.body.classList.toggle('cx-drawer-open');
       burger.setAttribute('aria-expanded', open ? 'true' : 'false');
     }); }
+    initSidebarModes();
+    initNavGroups();
     cxShow(viewFromHash() || 'sec-lifecycle', { focus: false });
     window.cxShow = cxShow;   // let other code deep-link a view (e.g. a wizard launcher)
     cxWelcome();
+  }
+
+  /* Sidebar width: full → rail (icons only) → hidden (a hover strip).
+     The choice is remembered, because a layout preference that resets on every
+     reload is worse than not having one. */
+  var CX_MODES = ['full', 'rail', 'hidden'];
+  var CX_MODE_LABEL = { full: 'Collapse to icons', rail: 'Hide the sidebar',
+                        hidden: 'Show the sidebar' };
+
+  function applySidebarMode(mode){
+    document.body.classList.toggle('cx-rail', mode === 'rail');
+    document.body.classList.toggle('cx-hidden', mode === 'hidden');
+    var btn = document.getElementById('cx-sidebar-toggle');
+    if (btn){
+      btn.setAttribute('aria-label', CX_MODE_LABEL[mode] || 'Collapse the sidebar');
+      btn.title = CX_MODE_LABEL[mode] || 'Collapse the sidebar';
+    }
+    try { localStorage.setItem('cx_sidebar_mode', mode); } catch(e){}
+  }
+
+  function initSidebarModes(){
+    var mode = 'full';
+    try { mode = localStorage.getItem('cx_sidebar_mode') || 'full'; } catch(e){}
+    if (CX_MODES.indexOf(mode) === -1) mode = 'full';
+    applySidebarMode(mode);
+    var btn = document.getElementById('cx-sidebar-toggle');
+    if (btn) btn.addEventListener('click', function(){
+      var cur = document.body.classList.contains('cx-hidden') ? 'hidden'
+              : document.body.classList.contains('cx-rail') ? 'rail' : 'full';
+      applySidebarMode(CX_MODES[(CX_MODES.indexOf(cur) + 1) % CX_MODES.length]);
+    });
+
+    /* AUTO-COLLAPSE: a full sidebar shrinks to icons after 2s without the mouse
+       on it, so the page gets its width back without anyone clicking anything.
+       Deliberately one-way — it never auto-EXPANDS, because a sidebar that
+       grows because the pointer drifted past it is the thing everyone hates
+       about auto-hiding chrome. Hovering the rail still reveals it (CSS), and
+       that reveal is temporary: it does not change the stored mode. */
+    var side = document.getElementById('cx-sidebar');
+    if (!side) return;
+    var timer = null;
+    function armCollapse(){
+      clearTimeout(timer);
+      timer = setTimeout(function(){
+        if (!document.body.classList.contains('cx-rail') &&
+            !document.body.classList.contains('cx-hidden') &&
+            !side.matches(':hover') && !side.contains(document.activeElement)){
+          applySidebarMode('rail');
+        }
+      }, 2000);
+    }
+    side.addEventListener('mouseleave', armCollapse);
+    side.addEventListener('mouseenter', function(){ clearTimeout(timer); });
+    /* Only start the clock once the pointer has actually been on the sidebar —
+       otherwise it collapses 2s after page load, before the user has seen it. */
+  }
+
+  /* Collapsible nav groups. */
+  function initNavGroups(){
+    var collapsed = {};
+    try { collapsed = JSON.parse(localStorage.getItem('cx_nav_collapsed') || '{}') || {}; }
+    catch(e){ collapsed = {}; }
+    Array.prototype.forEach.call(document.querySelectorAll('.cx-group'), function(g){
+      var key = g.dataset.group || '';
+      var btn = g.querySelector('.cx-group-label');
+      if (!btn) return;
+      function set(on){
+        g.classList.toggle('collapsed', on);
+        btn.setAttribute('aria-expanded', on ? 'false' : 'true');
+      }
+      set(!!collapsed[key]);
+      btn.addEventListener('click', function(){
+        var on = !g.classList.contains('collapsed');
+        set(on);
+        collapsed[key] = on;
+        try { localStorage.setItem('cx_nav_collapsed', JSON.stringify(collapsed)); } catch(e){}
+      });
+    });
   }
   function cxWelcome(){
     try { if (localStorage.getItem('cx_welcome_seen_v1')) return; } catch(e){}
@@ -5258,13 +5522,23 @@
 
     function showStartState(){
       sessionId = null;
+      curProjectDir = null;
       startRow.hidden = false;
       sessionBox.hidden = true;
       checkpointBtn.disabled = true;
       setSecChip('agent', agentState.enabled ? 'on' : '');
+      /* Stop polling a folder we are no longer attached to. The project itself
+         keeps running on its port on purpose — ending a chat is not a reason to
+         kill a server the user may still be looking at. */
+      if (typeof preview !== 'undefined' && preview) preview.detach();
+      if (typeof attachments !== 'undefined' && attachments) attachments.clear();
     }
 
+    var curProjectDir = null;
+    function currentProjectDir(){ return curProjectDir; }
+
     function showSessionState(cli, dir){
+      curProjectDir = dir;
       startRow.hidden = true;
       sessionBox.hidden = false;
       setStartResult(null);
@@ -5272,7 +5546,212 @@
       msgsEl.innerHTML = '<div class="chat-empty">Send a message to start working with the agent in this folder.</div>';
       checkpointBtn.disabled = true;
       setSecChip('agent', 'session active');
+      preview.attach(dir);
     }
+
+    /* ── Live preview ────────────────────────────────────────────────────────
+       Runs the project the agent is editing, on its own port, and turns what it
+       prints when it breaks into something clickable. Clicking a problem writes
+       it into the message box as the next instruction — that round trip is the
+       whole feature; everything else here is plumbing for it. */
+    var preview = (function(){
+      var dir = null, timer = null, lastUrl = null;
+      var runBtn = $('#preview-run'), stopBtn2 = $('#preview-stop');
+      var stateEl = $('#preview-state'), openEl = $('#preview-open');
+      var reloadBtn = $('#preview-reload'), frame = $('#preview-frame');
+      var placeholder = $('#preview-placeholder'), probBox = $('#preview-problems');
+      var probList = $('#preview-problem-list'), probCount = $('#preview-problems-count');
+      var logEl = $('#preview-log'), logToggle = $('#preview-log-toggle');
+
+      function setState(text, cls){
+        stateEl.textContent = text;
+        stateEl.className = 'preview-state' + (cls ? ' ' + cls : '');
+      }
+
+      function render(st){
+        var running = !!st.running;
+        runBtn.hidden = running;
+        stopBtn2.hidden = !running;
+        reloadBtn.hidden = !running;
+        openEl.hidden = !running;
+        if (running && st.url){
+          openEl.href = st.url;
+          /* Only reassign src on a URL CHANGE — writing the same src reloads the
+             iframe on every poll and the preview would flicker once a second. */
+          if (st.url !== lastUrl){ frame.src = st.url; lastUrl = st.url; }
+          frame.hidden = false;
+          placeholder.hidden = true;
+          setState((st.kind || 'running') + ' · ' + st.url.replace('http://', ''), 'live');
+        } else {
+          frame.hidden = true;
+          placeholder.hidden = false;
+          lastUrl = null;
+          if (st.state === 'installing') setState('installing dependencies…');
+          else if (st.state === 'starting') setState('starting…');
+          else if (st.state === 'failed') setState(st.error || 'failed to start', 'bad');
+          else setState('not running');
+        }
+        var probs = st.problems || [];
+        probBox.hidden = !probs.length && !(st.log || []).length;
+        probCount.textContent = probs.length
+          ? probs.length + ' problem' + (probs.length > 1 ? 's' : '') + ' — click one to fix it'
+          : 'No problems detected';
+        probList.innerHTML = '';
+        probs.forEach(function(p){
+          var li = document.createElement('li');
+          var b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'preview-problem';
+          b.innerHTML = '<span class="pk">' + esc(p.kind) + '</span>' +
+                        '<span class="pt">' + esc(p.text) + '</span>';
+          b.addEventListener('click', function(){ sendToChat(p); });
+          li.appendChild(b);
+          probList.appendChild(li);
+        });
+        logEl.textContent = (st.log || []).join('\n');
+      }
+
+      /* A problem becomes a real instruction, with the raw line attached — the
+         agent needs the exact text, not our summary of it. */
+      function sendToChat(p){
+        var msg = 'The preview is failing with this error. Find the cause and fix it:\n\n' +
+                  p.line + '\n\nAfter fixing, tell me what was wrong in one line.';
+        textEl.value = msg;
+        textEl.focus();
+        textEl.scrollIntoView({ block: 'nearest',
+          behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+      }
+
+      function poll(){
+        if (!dir) return;
+        api('/api/workspace/status?project_dir=' + encodeURIComponent(dir))
+          .then(render)
+          .catch(function(){ /* transient — the next tick retries */ });
+      }
+
+      function startPolling(){
+        stopPolling();
+        timer = setInterval(poll, 2000);
+      }
+      function stopPolling(){ if (timer){ clearInterval(timer); timer = null; } }
+
+      runBtn.addEventListener('click', function(){
+        if (!dir) return;
+        runBtn.disabled = true;
+        setState('starting…');
+        api('/api/workspace/start', { method: 'POST', body: { project_dir: dir } })
+          .then(function(st){ render(st); startPolling(); })
+          .catch(function(err){ setState(err.message || 'could not start', 'bad'); })
+          .finally(function(){ runBtn.disabled = false; });
+      });
+
+      stopBtn2.addEventListener('click', function(){
+        if (!dir) return;
+        api('/api/workspace/stop', { method: 'POST', body: { project_dir: dir } })
+          .then(function(st){ stopPolling(); render(st); })
+          .catch(function(){});
+      });
+
+      reloadBtn.addEventListener('click', function(){
+        if (lastUrl){ frame.src = lastUrl.split('#')[0] + '#r' + Date.now(); }
+      });
+
+      logToggle.addEventListener('click', function(){
+        logEl.hidden = !logEl.hidden;
+        logToggle.textContent = logEl.hidden ? 'Output' : 'Hide output';
+      });
+
+      return {
+        attach: function(d){ dir = d; lastUrl = null; poll(); startPolling(); },
+        detach: function(){ stopPolling(); dir = null; render({ running: false, state: 'idle' }); }
+      };
+    })();
+
+    function prefersReducedMotion(){
+      try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; }
+      catch (e) { return false; }
+    }
+
+    /* ── Screenshots into the agent chat ─────────────────────────────────────
+       Paste, drop or pick an image; it is written INTO the project folder and
+       the message carries its path. That is what a CLI can actually act on. */
+    var attachments = (function(){
+      var pending = [];              /* [{path, name, thumb}] */
+      var strip = $('#agent-attach-strip');
+      var btn = $('#agent-attach');
+      var fileInput = $('#agent-file');
+      var MAX = 6;
+
+      function render(){
+        strip.hidden = !pending.length;
+        strip.innerHTML = '';
+        pending.forEach(function(a, i){
+          var chip = document.createElement('span');
+          chip.className = 'attach-chip';
+          chip.innerHTML = '<img alt="" src="' + a.thumb + '">' +
+                           '<span class="attach-name">' + esc(a.path) + '</span>';
+          var x = document.createElement('button');
+          x.type = 'button';
+          x.className = 'attach-x';
+          x.setAttribute('aria-label', 'Remove ' + a.path);
+          x.textContent = '×';
+          x.addEventListener('click', function(){ pending.splice(i, 1); render(); });
+          chip.appendChild(x);
+          strip.appendChild(chip);
+        });
+      }
+
+      function upload(file){
+        if (pending.length >= MAX){ toast('At most ' + MAX + ' images per message', true); return; }
+        if (!/^image\//.test(file.type)){ toast('Only images can be attached', true); return; }
+        var dir = currentProjectDir();
+        if (!dir){ toast('Start a session first', true); return; }
+        var reader = new FileReader();
+        reader.onload = function(){
+          var url = String(reader.result || '');
+          api('/api/workspace/attach', { method: 'POST', body: {
+                project_dir: dir, data_url: url, name: file.name } })
+            .then(function(r){
+              pending.push({ path: r.path, name: file.name, thumb: url });
+              render();
+            })
+            .catch(function(err){ toast('Attach failed: ' + (err.message || ''), true); });
+        };
+        reader.readAsDataURL(file);
+      }
+
+      btn.addEventListener('click', function(){ fileInput.click(); });
+      fileInput.addEventListener('change', function(){
+        Array.prototype.forEach.call(fileInput.files || [], upload);
+        fileInput.value = '';
+      });
+      textEl.addEventListener('paste', function(e){
+        var items = (e.clipboardData || {}).items || [];
+        var got = false;
+        Array.prototype.forEach.call(items, function(it){
+          if (it.kind === 'file' && /^image\//.test(it.type)){
+            var f = it.getAsFile();
+            if (f){ upload(f); got = true; }
+          }
+        });
+        /* Only swallow the paste when it WAS an image — otherwise normal text
+           pasting into the box would stop working. */
+        if (got) e.preventDefault();
+      });
+      ['dragover', 'drop'].forEach(function(ev){
+        textEl.addEventListener(ev, function(e){
+          e.preventDefault();
+          if (ev === 'drop'){
+            Array.prototype.forEach.call((e.dataTransfer || {}).files || [], upload);
+          }
+        });
+      });
+
+      return {
+        take: function(){ var out = pending.slice(); pending = []; render(); return out; },
+        clear: function(){ pending = []; render(); }
+      };
+    })();
 
     function refreshSessionInfo(){
       if (!sessionId) return;
@@ -5348,6 +5827,16 @@
       if (sendBtn.disabled) return;
       if (!sessionId) return;
       var text = textEl.value.trim();
+      /* Attached screenshots are named as PATHS the CLI can open, not inlined:
+         Claude Code and Codex read images off disk, and a base64 blob in the
+         prompt would burn the context window on bytes they cannot decode. */
+      var shots = attachments.take();
+      if (shots.length){
+        text = (text || 'Look at the attached screenshot.') + '\n\nAttached image' +
+               (shots.length > 1 ? 's' : '') + ' in this project — open ' +
+               (shots.length > 1 ? 'them' : 'it') + ' to see what I mean:\n' +
+               shots.map(function(s){ return '  ' + s.path; }).join('\n');
+      }
       if (!text) return;
 
       appendAgentBubble('user', 'You', text);

@@ -76,9 +76,19 @@ def test_briefs_forbid_inventing_facts():
 
 
 def test_briefs_stay_small():
-    """Injected into a small free context window on every matching opening turn."""
+    """Injected into a small free context window on every matching opening turn.
+
+    web_design carries a larger allowance than the rest, and it earned it: it
+    absorbed the named anti-pattern list (specific fonts and structures that read
+    as AI-made, which a generic "avoid generic layouts" line never prevented) and
+    the hero-motion spec. Those are concrete bans and concrete recipes, not
+    style talk — the part a model cannot supply for itself. The real guard is
+    test_worst_case_brief_cost below, which measures what a request ACTUALLY
+    pays."""
+    budget = {"web_design": 3800}
     for name, _rx, body in craft._BRIEFS:
-        assert len(body) < 1400, "%s brief is too long (%d chars)" % (name, len(body))
+        limit = budget.get(name, 1400)
+        assert len(body) < limit, "%s brief is too long (%d chars)" % (name, len(body))
     # The orthogonal two are allowed to be larger: they carry runnable commands
     # and hard numbers (endpoint, WebP conversion, CWV thresholds, schema types
     # Google retired) rather than style guidance, and that is the part a model
@@ -326,3 +336,71 @@ def test_images_brief_protects_the_lcp_image():
     assert 'fetchpriority="high"' in body
     assert 'NEVER be loading="lazy"' in body
     assert 'loading="lazy" decoding="async"' in body
+
+
+# --------------------------------------------------------------------------- #
+# Design rules adapted from pbakaus/impeccable (Apache-2.0), plus the user's
+# motion and hero requirements.
+# --------------------------------------------------------------------------- #
+
+def test_the_overused_font_list_is_named():
+    """"One family" never stopped a model reaching for Inter. Naming the
+    training-data defaults is what makes the rule checkable."""
+    body = craft.WEB_DESIGN
+    for face in ("Inter", "Geist", "Space Grotesk", "Montserrat", "Playfair"):
+        assert face in body, face
+
+
+def test_the_font_ban_does_not_cause_broken_webfonts():
+    """A small model told "not Inter" will happily name a face it cannot load."""
+    assert "system stack" in craft.WEB_DESIGN
+    assert "@font-face" in craft.WEB_DESIGN
+
+
+def test_the_named_structural_tells_are_banned():
+    body = craft.WEB_DESIGN.lower()
+    for tell in ("icon tile above a heading", "eyebrow above a heading",
+                 "cards inside cards", "01/02/03"):
+        assert tell in body, tell
+
+
+def test_the_category_self_check_is_present():
+    """The sharpest rule in the source: it closes the loophole where an
+    anti-slop brief just produces a DIFFERENT predictable look."""
+    body = craft.WEB_DESIGN
+    assert "category-plus-the-obvious-avoidance" in body
+    assert "cream + serif" in body
+
+
+def test_motion_is_required_everywhere_but_varied():
+    """USER: "animations in almost each section and button". The counter-rule
+    matters as much: one identical entrance on every section is itself a tell."""
+    body = craft.WEB_DESIGN
+    assert "Motion everywhere, but not the SAME motion everywhere" in body
+    assert "hover/active/focus" in body
+
+
+def test_content_is_visible_without_javascript():
+    """The failure mode of animate-everything: a script error leaves a blank
+    page because the content was hidden at rest waiting for an entrance."""
+    assert "CONTENT MUST BE VISIBLE BY DEFAULT" in craft.WEB_DESIGN
+
+
+def test_hero_video_is_licence_checked_and_looped():
+    """USER: free footage in heroes, cut to a few seconds, looped."""
+    body = craft.WEB_DESIGN
+    assert "licence-free" in body and "seamless loop" in body
+    assert "autoplay muted loop playsinline" in body
+    assert "name the source" in body, "an unchecked 'free' clip is a licence risk"
+
+
+def test_hero_3d_has_a_fallback_and_does_not_block_paint():
+    body = craft.WEB_DESIGN
+    assert "IntersectionObserver" in body
+    assert "static fallback" in body
+    assert "never block first paint" in body
+
+
+def test_video_and_3d_are_exclusive():
+    """Both at once is a heavy hero and a slow one."""
+    assert "pick ONE, never both" in craft.WEB_DESIGN
