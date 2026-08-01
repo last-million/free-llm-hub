@@ -4205,16 +4205,28 @@ def _refit_payload_to_learned_ctx(pid, payload):
         budget = _model_ctx_budget(pid, payload.get("model"))
         if not budget or budget <= 0:
             return None
-        # SAFETY FACTOR, and it is load-bearing. _est_tokens is a chars/4
-        # heuristic tuned for prose, but agentic traffic is CODE, which tokenizes
-        # at roughly 2.2 chars/token — so the estimate can be ~1.8x optimistic.
-        # MEASURED: a payload the estimator put at 27,780 tokens still overflowed
-        # a 32,768 window. Re-fitting to the estimator's idea of the full window
-        # therefore fails a second time and loses the hop anyway, which is the
-        # entire thing this function exists to prevent. Aim at ~55% instead: a
-        # slightly shorter context that ANSWERS beats a perfectly-sized one that
-        # 400s.
-        budget = int(budget * 0.55)
+        # SAFETY FACTOR. This was 0.55, on the belief that _est_tokens (chars/4)
+        # is optimistic for code. RE-MEASURED 2026-08-01 against real
+        # `usage.prompt_tokens` from a live provider, and the belief was wrong —
+        # the estimator OVER-counts on every shape of traffic:
+        #
+        #     prose        est=886   real=402    est/real 2.20
+        #     code         est=1013  real=801    est/real 1.26
+        #     code+tools   est=1623  real=1423   est/real 1.14
+        #     tools only   est=1014  real=889    est/real 1.14
+        #
+        # (The earlier measurement that said otherwise was taken through the
+        # normal chat path, which had injected craft briefs into the payload —
+        # those tokens were real, but they were not the ones being counted.)
+        #
+        # So 0.55 on top of an estimator already 1.14x conservative meant an
+        # agentic request used under HALF of the window it was entitled to. At
+        # 0.80 the worst realistic case (tools-heavy, est/real 1.14) still lands
+        # near 70% of the true window, leaving genuine headroom for the response
+        # — output tokens share the window on most providers, which is what the
+        # max_tokens cap below handles — and for a model whose ADVERTISED window
+        # is simply a lie (cloudflare claimed 120,000 and delivered 32,768).
+        budget = int(budget * 0.80)
         compacted, did = _compact_to_budget(msgs, payload.get("tools"), budget)
         if not did:
             return None                       # already fits; the 400 was something else
@@ -4570,8 +4582,17 @@ def _upstream_chat(pid, payload, stream):
         # (2) repair tool-pairing so a strict upstream can't 400 the agentic turn
         # ('tool_call_ids did not have response messages') — compaction may itself
         # orphan a tool msg / dangle a tool_call, so sanitize runs AFTER compaction.
-        msgs = _apply_craft_brief(payload["messages"])
+        # SWARM-INTERNAL calls opt out. Every swarm stage already carries a
+        # precise system prompt, and a craft brief on top of one does real harm:
+        # the planner is told "reply with JSON ONLY", the WEB_DESIGN/SEO/IMAGES
+        # briefs told it to build a website, and it obeyed the brief — returning
+        # publication-ready copy instead of a plan, so the swarm fell back to a
+        # single model on every creation task, which is the one task it exists
+        # for. Skipping them is also ~1.8k tokens back per stage.
+        msgs = (payload["messages"] if payload.get("_no_craft")
+                else _apply_craft_brief(payload["messages"]))
         payload = dict(payload)
+        payload.pop("_no_craft", None)      # never goes upstream
         payload["messages"] = msgs
         # Summarised compaction: a model-written recap of the dropped turns, so
         # the DECISIONS survive and not just the file names. Cached per content,
@@ -10212,7 +10233,8 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
             if exclude_pids and hop_pid in exclude_pids:
                 continue     # reviewer must not be the provider that wrote it
             payload = {"model": hop_model, "stream": False,
-                       "max_tokens": max_tokens, "messages": messages}
+                       "max_tokens": max_tokens, "messages": messages,
+                       "_no_craft": True}   # stripped in _upstream_chat
             try:
                 resp = _dispatch_chat(hop_pid, payload, False)
             except (requests.RequestException, RuntimeError):
