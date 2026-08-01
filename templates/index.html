@@ -1623,6 +1623,9 @@
   .preview-state.live{ color:var(--ok-text); }
   .preview-state.bad{ color:var(--danger-text); }
   .preview-icon{ padding:4px 6px; line-height:0; }
+  .preview-auto{ display:inline-flex; align-items:center; gap:5px; flex:none;
+    font-size:11.5px; color:var(--text-dim); cursor:pointer; user-select:none; }
+  .preview-auto input{ margin:0; cursor:pointer; }
   /* What is currently open, and what it costs. */
   .runpanel{ position:fixed; inset:0; z-index:400; display:grid; place-items:center;
     background:var(--scrim, rgba(0,0,0,.55)); }
@@ -2159,6 +2162,10 @@
                 <button class="btn sm primary" id="preview-run" type="button">Run</button>
                 <button class="btn sm ghost" id="preview-stop" type="button" hidden>Stop</button>
                 <span class="preview-state" id="preview-state">not running</span>
+                <label class="preview-auto" title="After each turn: pick up whatever the agent started, run the project if it did not, and refresh this pane">
+                  <input type="checkbox" id="preview-auto" checked>
+                  <span>Auto</span>
+                </label>
                 <!-- Device widths. The frame is CONSTRAINED rather than zoomed, so
                      the page's own media queries fire exactly as they would on the
                      real device — a scaled-down desktop render would not. -->
@@ -6567,8 +6574,76 @@
              : (n / 1024 / 1024).toFixed(1) + ' MB';
       }
 
+      /* ── Picking up the server the AGENT started ──────────────────────────
+         The SHIP brief tells it to run what it builds, so the usual case is
+         that the site is ALREADY live on its own port by the time anyone looks.
+         The agent prints where: "Local: http://localhost:3000/". Parsing that
+         line is the authoritative signal — it is the agent saying where it put
+         the thing — so it beats any guess we could make. */
+      var URL_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::(\d+))?\b/gi;
+      var adoptTried = {};
+
+      function noticeUrlsIn(text){
+        if (!dir || !text) return;
+        var m, seen = {};
+        URL_RE.lastIndex = 0;
+        while ((m = URL_RE.exec(String(text))) !== null){
+          var port = m[1] || '80';
+          if (seen[port]) continue;
+          seen[port] = 1;
+          /* Try each port once per session: the dev server reprints its banner
+             on every reload, and a failed adopt (wrong port, nothing serving)
+             must not turn into a request loop. */
+          if (adoptTried[port]) continue;
+          adoptTried[port] = 1;
+          api('/api/workspace/adopt', { method: 'POST', body: {
+                project_dir: dir, url: 'http://127.0.0.1:' + port, source: 'agent' } })
+            .then(function(st){ render(st); startPolling(); })
+            .catch(function(){ /* not a server, or our own port — ignore */ });
+        }
+      }
+
+      /* Called when a turn ends. Three things the user asked for, in order:
+         pick up whatever the agent started, start it ourselves if it did not,
+         and refresh what is on screen so finished work is actually visible. */
+      function afterTurn(){
+        if (!dir || !autoOn()) return;
+        api('/api/workspace/status?project_dir=' + encodeURIComponent(dir) + '&discover=1')
+          .then(function(st){
+            if (st.running){ render(st); startPolling(); reloadFrame(); return; }
+            /* Nothing serving. If the project is runnable now, run it — "if the
+               home page is ready, always run it". A folder with nothing in it
+               yet just 400s, which is the correct no-op. */
+            return api('/api/workspace/start', { method: 'POST', body: { project_dir: dir } })
+              .then(function(s2){ render(s2); startPolling(); })
+              .catch(function(){});
+          })
+          .catch(function(){});
+      }
+
+      function reloadFrame(){
+        if (!lastUrl) return;
+        /* Cache-bust so a static server actually serves the new file. A dev
+           server with HMR does not need this, and an extra reload is harmless. */
+        frame.src = lastUrl.split('#')[0] + '#r' + Date.now();
+      }
+
+      function autoOn(){
+        var cb = document.getElementById('preview-auto');
+        return !cb || cb.checked;
+      }
+
       return {
-        attach: function(d){ dir = d; lastUrl = null; treeLoaded = false; poll(); startPolling(); },
+        attach: function(d){
+          dir = d; lastUrl = null; treeLoaded = false; adoptTried = {};
+          /* Ask for discovery once on attach: restoring a session from its URL
+             must find a server the agent left running before the reload. */
+          api('/api/workspace/status?project_dir=' + encodeURIComponent(d) + '&discover=1')
+            .then(render).catch(function(){});
+          poll(); startPolling();
+        },
+        noticeUrls: noticeUrlsIn,
+        afterTurn: afterTurn,
         refreshFiles: function(){ treeLoaded = false; if (!filesPane.hidden) { loadTree(''); treeLoaded = true; } },
         detach: function(){ stopPolling(); dir = null; render({ running: false, state: 'idle' }); }
       };
@@ -6773,6 +6848,12 @@
       }
       function handle(ev){
         if (!ev || !ev.event) return;
+        /* Watch every line the agent prints for a local URL. This is how the
+           preview finds the server the agent started itself, instead of showing
+           "not running" beside a site that is live. */
+        if (ev.text && typeof preview !== 'undefined' && preview.noticeUrls){
+          preview.noticeUrls(ev.text);
+        }
         if (ev.event === 'tool'){
           line('tool', '▸ ' + ev.text);
           /* Mirror the current step into the status line. A spinner says
@@ -6827,6 +6908,16 @@
             '<span>' + (failed ? 'Failed' : 'Finished') + '</span>' +
             '<span class="agent-elapsed">' + esc(took) + '</span>';
           if (!failed && finalText){ var art = extractArtifactHTML(finalText); if (art) addArtifactButton(asstEl, art); }
+          /* The turn is done, so the files on disk just changed: pick up a
+             server the agent started, start one if it did not, and refresh what
+             is on screen. Failure-safe — a folder with nothing runnable in it
+             is a no-op, not an error. */
+          if (!failed && typeof preview !== 'undefined' && preview.afterTurn){
+            try { preview.afterTurn(); } catch (e) {}
+          }
+          if (typeof preview !== 'undefined' && preview.refreshFiles){
+            try { preview.refreshFiles(); } catch (e) {}
+          }
           checkpointBtn.disabled = false;
           setBusy(false);
           msgsEl.scrollTop = msgsEl.scrollHeight;

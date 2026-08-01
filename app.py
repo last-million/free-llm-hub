@@ -7157,6 +7157,28 @@ def api_workspace_attach():
     return jsonify({"path": rel, "bytes": len(raw)})
 
 
+@app.route("/api/workspace/adopt", methods=["POST"])
+def api_workspace_adopt():
+    """Point the preview at a server the AGENT started.
+
+    The SHIP brief tells the agent to actually run what it builds, so by the time
+    the user looks the site is usually already live on its own port — while the
+    preview, which only knew about servers it spawned, said "not running" and
+    offered a Run button that would have started a SECOND copy elsewhere."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    body = request.get_json(force=True, silent=True) or {}
+    d, err = _workspace_dir_from(body)
+    if err:
+        return err
+    try:
+        return jsonify(workspace.adopt(d, body.get("url"),
+                                       source=body.get("source") or "agent"))
+    except workspace.WorkspaceError as exc:
+        return jsonify({"error": _sanitize(str(exc))}), 400
+
+
 @app.route("/api/workspace/tree", methods=["GET"])
 def api_workspace_tree():
     """One level of the project, for the file browser beside the preview."""
@@ -7234,6 +7256,15 @@ def api_workspace_status():
     d, err = _workspace_dir_from({"project_dir": request.args.get("project_dir")})
     if err:
         return err
+    # `discover=1` asks us to look for a server the agent started but that we
+    # never saw announced — needed because the URL is normally parsed from a LIVE
+    # stream, so reloading the dashboard loses it while the server stays up.
+    # Opt-in per request, never on the 2s poll: it probes a dozen ports.
+    if request.args.get("discover") == "1":
+        try:
+            workspace.discover(d)
+        except Exception:                                        # noqa: BLE001
+            _log.debug("[workspace] discovery failed for %s", d, exc_info=True)
     return jsonify(workspace.status(d))
 
 

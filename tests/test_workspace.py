@@ -423,3 +423,122 @@ def test_reaping_is_a_pause_not_a_ban(proj):
     workspace.reap_idle()
     workspace.start(proj)
     assert workspace.status(proj)["state"] in ("installing", "starting", "running")
+
+
+# --------------------------------------------------------------------------- #
+# Adopting a server the AGENT started.
+#
+# The SHIP brief tells the agent to run what it builds, so by the time the user
+# looks the site is usually already live on its own port — while the preview,
+# which only knew about servers it spawned, said "not running" and offered a Run
+# button that would have started a SECOND copy somewhere else.
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def no_adopted():
+    workspace._adopted.clear()
+    yield
+    workspace._adopted.clear()
+
+
+def test_adopt_points_the_preview_at_an_existing_server(proj, no_adopted, monkeypatch):
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    st = workspace.adopt(proj, "http://localhost:3000/")
+    assert st["running"] is True
+    assert st["url"] == "http://127.0.0.1:3000"
+    assert st["external"] is True
+    assert workspace.status(proj)["url"] == "http://127.0.0.1:3000"
+
+
+def test_adopt_refuses_the_hubs_own_port(proj, no_adopted, monkeypatch):
+    """Adopting it would make the preview show the dashboard inside itself."""
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    with pytest.raises(workspace.WorkspaceError):
+        workspace.adopt(proj, "http://127.0.0.1:%d/" % workspace._hub_port())
+
+
+def test_adopt_refuses_a_port_we_hand_out_ourselves(proj, no_adopted, monkeypatch):
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    with pytest.raises(workspace.WorkspaceError):
+        workspace.adopt(proj, "http://127.0.0.1:%d/" % workspace.PORT_RANGE[0])
+
+
+def test_adopt_refuses_a_port_nothing_answers_on(proj, no_adopted, monkeypatch):
+    """A stale banner scrolled past in the transcript must not point the pane at
+    nothing."""
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: False)
+    with pytest.raises(workspace.WorkspaceError):
+        workspace.adopt(proj, "http://127.0.0.1:3000/")
+
+
+def test_a_server_we_started_is_never_shadowed(proj, no_adopted, monkeypatch):
+    """Ours is the one whose logs and problems we can actually read."""
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    open(os.path.join(proj, "index.html"), "w").write("x")
+    workspace.start(proj)
+    workspace.adopt(proj, "http://127.0.0.1:3000/")
+    assert workspace.status(proj).get("external") is not True
+
+
+def test_a_dead_adopted_server_reports_idle_not_a_broken_link(proj, no_adopted, monkeypatch):
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    workspace.adopt(proj, "http://127.0.0.1:3000/")
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: False)
+    assert workspace.status(proj)["state"] == "idle"
+
+
+def test_stop_forgets_an_adopted_server_instead_of_killing_it(proj, no_adopted, monkeypatch):
+    """We did not start it, so its lifetime is not ours to end — killing a
+    process on a button labelled "Stop preview" is a bigger action than the
+    label promises."""
+    killed = []
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    monkeypatch.setattr(workspace.subprocess, "run",
+                        lambda *a, **k: killed.append(a) or None)
+    workspace.adopt(proj, "http://127.0.0.1:3000/")
+    assert workspace.stop(proj) is True
+    assert workspace.status(proj)["state"] == "idle"
+    assert killed == [], "stop() killed a process it did not start"
+
+
+def test_adopted_servers_are_never_reaped_for_being_idle(proj, no_adopted, monkeypatch):
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    workspace.adopt(proj, "http://127.0.0.1:3000/")
+    workspace._adopted[os.path.abspath(proj)]["touched_at"] = 0    # ancient
+    assert workspace.reap_idle() == []
+    rows = [r for r in workspace.running() if r["external"]]
+    assert rows and rows[0]["idle_stops_in"] is None
+
+
+def test_discovery_skips_a_project_that_already_has_a_preview(proj, no_adopted, monkeypatch):
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    workspace.adopt(proj, "http://127.0.0.1:3000/")
+    assert workspace.discover(proj) is None
+
+
+def test_discovery_finds_a_serving_dev_port(proj, no_adopted, monkeypatch):
+    monkeypatch.setattr(workspace, "_port_open", lambda p: p == 5173)
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: port == 5173)
+    assert workspace.discover(proj) == 5173
+    assert workspace.status(proj)["port"] == 5173
+    assert workspace.status(proj)["kind"] == "detected on this port"
+
+
+def test_discovery_ignores_a_port_that_is_open_but_not_serving(proj, no_adopted, monkeypatch):
+    """A socket connect alone would happily adopt a database or an SSH tunnel."""
+    monkeypatch.setattr(workspace, "_port_open", lambda p: True)
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: False)
+    assert workspace.discover(proj) is None
+
+
+def test_the_hub_port_is_not_in_the_scan_list():
+    assert workspace._hub_port() not in workspace._DEV_PORTS
+    assert not any(workspace.PORT_RANGE[0] <= p <= workspace.PORT_RANGE[1]
+                   for p in workspace._DEV_PORTS)
+
+
+def test_adopt_route_rejects_a_url_with_no_port(client, monkeypatch):
+    r = client.post("/api/workspace/adopt",
+                    json={"project_dir": tempfile.gettempdir(), "url": "not-a-url"},
+                    headers=_auth())
+    assert r.status_code in (400, 403)

@@ -397,7 +397,14 @@ def stop(project_dir):
     project_dir = os.path.abspath(project_dir)
     with _lock:
         proc = _procs.pop(project_dir, None)
-    if not proc or not proc.popen:
+    if not proc:
+        # Nothing of ours — but there may be an ADOPTED server showing. Stop
+        # displaying it rather than killing it: we did not start it, so its
+        # lifetime belongs to whoever did (the agent, or the user's terminal).
+        # Killing a process we do not own on a button labelled "Stop preview"
+        # would be a much bigger action than the label promises.
+        return forget(project_dir)
+    if not proc.popen:
         return False
     try:
         if os.name == "nt":
@@ -594,17 +601,162 @@ def read_file(project_dir, rel):
             "lang": os.path.splitext(target)[1].lstrip(".").lower()}
 
 
+# --------------------------------------------------------------------------- #
+# ADOPTING a server the AGENT started
+#
+# The whole point of this pane is "done means you SAW it run", and the SHIP brief
+# tells the agent to actually start what it builds. So the common case is that by
+# the time the user looks, the agent has ALREADY run `npm run dev` itself and the
+# site is live on :3000 — while this module, which only knew about servers it
+# spawned, reported "not running" and offered a Run button that would start a
+# SECOND copy on a different port.
+#
+# Adopting means: point the preview at the server that already exists.
+# --------------------------------------------------------------------------- #
+
+# Ports a dev server actually lands on. Deliberately excludes PORT_RANGE (ours)
+# and the hub's own port — adopting either would make the preview show the hub.
+_DEV_PORTS = (3000, 3001, 3002, 5173, 5174, 4321, 4200, 8080, 8000, 8081,
+              1420, 5000, 9000, 7777)
+
+_adopted = {}      # project_dir -> {"url", "port", "since", "touched_at", "source"}
+
+
+def _hub_port():
+    try:
+        return int(os.environ.get("PORT") or 8787)
+    except (TypeError, ValueError):
+        return 8787
+
+
+def _http_ok(port, timeout=1.2):
+    """Does something actually SERVE on this port, as opposed to merely holding
+    it open? A socket connect alone would happily adopt a database or an SSH
+    tunnel; a real response is the cheap way to tell them apart."""
+    import urllib.error
+    import urllib.request
+    url = "http://127.0.0.1:%d/" % port
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return 200 <= r.status < 500
+    except urllib.error.HTTPError as e:
+        return 200 <= e.code < 500          # 404 still means a server is there
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _port_of(url):
+    m = re.search(r"^https?://[^/:]+:(\d+)", str(url or ""))
+    return int(m.group(1)) if m else None
+
+
+def adopt(project_dir, url, source="agent"):
+    """Point the preview at a server we did NOT start.
+
+    `url` normally comes from the agent's own output ("Local:
+    http://localhost:3000/"), which is the authoritative signal — the agent said
+    where it put it. Refuses our own port range and the hub's port, and refuses a
+    URL nothing is answering on, so a stale line scrolled past in the transcript
+    cannot point the pane at nothing."""
+    project_dir = os.path.abspath(project_dir)
+    port = _port_of(url)
+    if not port:
+        raise WorkspaceError("no port in %r" % (url,))
+    if PORT_RANGE[0] <= port <= PORT_RANGE[1]:
+        raise WorkspaceError("that is a port this hub hands out itself")
+    if port == _hub_port():
+        raise WorkspaceError("that is the hub's own port")
+    if not _http_ok(port):
+        raise WorkspaceError("nothing is answering on port %d" % port)
+    now = time.time()
+    with _lock:
+        # A server WE started wins: it is the one whose logs and problems we can
+        # actually read, so never shadow it with an adopted guess.
+        if project_dir in _procs:
+            return status(project_dir)
+        _adopted[project_dir] = {"url": "http://127.0.0.1:%d" % port, "port": port,
+                                 "since": now, "touched_at": now, "source": source}
+    return status(project_dir)
+
+
+def discover(project_dir):
+    """Find a server the agent started, when we were not watching its output.
+
+    Needed because the URL is parsed from a live stream: reload the dashboard and
+    that knowledge is gone, while the server is still up. A scan cannot PROVE the
+    port belongs to this project — nothing local ties a listening socket to a
+    folder without extra dependencies — so it only fires when the user has no
+    preview of their own, and the result is labelled as detected rather than
+    presented as certain."""
+    project_dir = os.path.abspath(project_dir)
+    with _lock:
+        if project_dir in _procs or project_dir in _adopted:
+            return None
+    for port in _DEV_PORTS:
+        if not _port_open(port):
+            continue
+        if not _http_ok(port):
+            continue
+        try:
+            adopt(project_dir, "http://127.0.0.1:%d" % port, source="detected")
+            return port
+        except WorkspaceError:
+            continue
+    return None
+
+
+def forget(project_dir):
+    """Stop showing an adopted server. Deliberately does NOT kill it: we did not
+    start it, so we do not own its lifetime — the agent, or the user's own
+    terminal, does."""
+    with _lock:
+        return _adopted.pop(os.path.abspath(project_dir), None) is not None
+
+
+def _adopted_status(project_dir, now=None):
+    now = now or time.time()
+    with _lock:
+        a = _adopted.get(project_dir)
+        if not a:
+            return None
+        a["touched_at"] = now
+        port, url, since, source = a["port"], a["url"], a["since"], a["source"]
+    if not _http_ok(port):
+        with _lock:
+            _adopted.pop(project_dir, None)
+        return None                      # it died; report idle, not a dead link
+    return {
+        "running": True, "state": "running", "url": url, "port": port,
+        "kind": "started by the agent" if source == "agent" else "detected on this port",
+        "log": [], "problems": [], "error": None,
+        "uptime": int(now - since),
+        "external": True,
+    }
+
+
 def running():
     """Every live preview, for the "what is running" list."""
     now = time.time()
     with _lock:
         items = list(_procs.items())
-    return [{"project_dir": d, "port": p.port, "kind": p.kind, "state": p.state,
-             "url": "http://127.0.0.1:%d" % p.port if p.state == "running" else None,
-             "uptime": int(now - p.started_at),
-             "idle": int(now - p.touched_at),
-             "idle_stops_in": max(0, int(IDLE_TIMEOUT - (now - p.touched_at)))}
-            for d, p in items]
+        adopted = list(_adopted.items())
+    out = [{"project_dir": d, "port": p.port, "kind": p.kind, "state": p.state,
+            "url": "http://127.0.0.1:%d" % p.port if p.state == "running" else None,
+            "uptime": int(now - p.started_at),
+            "idle": int(now - p.touched_at),
+            "idle_stops_in": max(0, int(IDLE_TIMEOUT - (now - p.touched_at))),
+            "external": False}
+           for d, p in items]
+    # Adopted servers are listed so the user can SEE them, but never counted
+    # against the idle reaper: we did not start them, so we must not stop them.
+    out += [{"project_dir": d, "port": a["port"],
+             "kind": "started by the agent" if a["source"] == "agent"
+                     else "detected on this port",
+             "state": "running", "url": a["url"],
+             "uptime": int(now - a["since"]), "idle": int(now - a["touched_at"]),
+             "idle_stops_in": None, "external": True}
+            for d, a in adopted]
+    return out
 
 
 def reap_idle(now=None):
@@ -650,6 +802,11 @@ def status(project_dir):
         if proc:
             proc.touched_at = time.time()   # someone is watching
     if not proc:
+        # No server of ours — but the AGENT may have started one, which is the
+        # normal case once it follows the SHIP brief and runs what it built.
+        ext = _adopted_status(project_dir)
+        if ext:
+            return ext
         return {"running": False, "state": "idle", "url": None, "port": None,
                 "kind": None, "log": [], "problems": [], "error": None}
     return {
