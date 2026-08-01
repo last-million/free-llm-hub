@@ -237,3 +237,70 @@ def test_status_is_gated_when_the_master_switch_is_off(client, monkeypatch):
     r = client.get("/api/workspace/status?project_dir=" + tempfile.gettempdir(),
                    headers=_auth())
     assert r.status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+# Folder browsing.
+#
+# A browser cannot hand us an absolute local path — not from a drop, not from a
+# file input, by design. The hub runs on the same machine, so browsing happens
+# server-side and the user clicks down to the folder.
+# --------------------------------------------------------------------------- #
+
+def test_browse_lists_subfolders(proj):
+    os.makedirs(os.path.join(proj, "alpha"))
+    os.makedirs(os.path.join(proj, "beta"))
+    open(os.path.join(proj, "a-file.txt"), "w").write("x")
+    r = workspace.list_dirs(proj)
+    names = [d["name"] for d in r["dirs"]]
+    assert names == ["alpha", "beta"], "files must not be listed, and order is by name"
+    assert r["path"] == os.path.abspath(proj)
+    assert r["parent"]
+
+
+def test_browse_skips_hidden_and_system_entries(proj):
+    for name in (".git", ".venv", "$RECYCLE.BIN", "real"):
+        os.makedirs(os.path.join(proj, name))
+    names = [d["name"] for d in workspace.list_dirs(proj)["dirs"]]
+    assert names == ["real"]
+
+
+def test_browse_reports_whether_the_folder_is_runnable(proj):
+    assert workspace.list_dirs(proj)["runnable"] is False
+    open(os.path.join(proj, "index.html"), "w").write("<h1>x</h1>")
+    assert workspace.list_dirs(proj)["runnable"] is True
+
+
+def test_browse_is_capped(proj):
+    """node_modules alone can hold thousands of entries."""
+    for i in range(520):
+        os.makedirs(os.path.join(proj, "d%03d" % i))
+    assert len(workspace.list_dirs(proj)["dirs"]) <= 500
+
+
+def test_browse_rejects_a_non_directory(proj):
+    f = os.path.join(proj, "file.txt")
+    open(f, "w").write("x")
+    with pytest.raises(workspace.WorkspaceError):
+        workspace.list_dirs(f)
+
+
+def test_browse_defaults_to_home():
+    r = workspace.list_dirs(None)
+    assert r["path"] == os.path.abspath(os.path.expanduser("~"))
+
+
+def test_browse_route_is_gated(client, monkeypatch):
+    """It is a filesystem listing endpoint — it must not be reachable just
+    because the port is open."""
+    monkeypatch.setattr(app.agentic_chat, "master_enabled", lambda: False)
+    r = client.get("/api/workspace/browse", headers=_auth())
+    assert r.status_code == 403
+
+
+def test_browse_route_returns_a_listing(client):
+    r = client.get("/api/workspace/browse?path=" + tempfile.gettempdir(),
+                   headers=_auth())
+    assert r.status_code in (200, 403)
+    if r.status_code == 200:
+        assert "dirs" in r.get_json()

@@ -128,6 +128,14 @@ _TEST_VERIFICATION_FLAG = "agentic_test_verification_enabled"
 
 _CLI_BIN = {"claude": "claude", "codex": "codex"}
 
+# Which backend integrates BEST with this hub, as opposed to which is default.
+# Claude Code has --append-system-prompt (a real system channel) and a clean
+# --resume. Codex has neither, which is why its notice has to be inlined into
+# the prompt text -- the ordering bug that made the agent answer our notice
+# instead of the user's task. Both work; this only drives the "recommended"
+# label in the picker.
+_RECOMMENDED_CLI = "claude"
+
 # Codex is the default agentic backend (the user's explicit choice) -- verified
 # on codex-cli 0.144.5 that `codex exec --json` runs with full tool access and
 # that --dangerously-bypass-approvals-and-sandbox survives `codex exec resume`.
@@ -230,10 +238,16 @@ def cli_support() -> dict:
     out = {}
     for cid, (ok, reason) in _SUPPORT.items():
         try:
-            installed = bool(_resolve_bin(cid))
+            iso = _isolated_bin(cid)
+            installed = bool(iso or shutil.which(_CLI_BIN[cid]))
         except Exception:
-            installed = False
-        out[cid] = {"supported": ok, "reason": reason, "installed": installed}
+            iso, installed = None, False
+        out[cid] = {"supported": ok, "reason": reason, "installed": installed,
+                    # Whether the copy we would actually RUN is the hub's own,
+                    # so the picker can say so instead of leaving the user to
+                    # wonder which install a session is about to touch.
+                    "isolated": bool(iso),
+                    "recommended": cid == _RECOMMENDED_CLI}
     return out
 
 

@@ -7108,6 +7108,35 @@ def api_workspace_attach():
     return jsonify({"path": rel, "bytes": len(raw)})
 
 
+@app.route("/api/workspace/running", methods=["GET"])
+def api_workspace_running():
+    """Every live preview server, so the user can see and stop what is using the
+    machine. Not gated on the master switch, same reasoning as /stop: you must
+    be able to find and kill a process even after turning the feature off."""
+    return jsonify({"previews": workspace.running(),
+                    "idle_timeout": workspace.IDLE_TIMEOUT})
+
+
+@app.route("/api/workspace/browse", methods=["GET"])
+def api_workspace_browse():
+    """Directory listing for the folder picker.
+
+    A browser cannot hand us an absolute local path — not from a drop, not from
+    a file input — so browsing has to happen here. Read-only, one level, and
+    behind the same gate + control token as the rest: it is still a filesystem
+    listing endpoint, which is exactly the kind of thing that should not be
+    reachable just because the port is open."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    try:
+        return jsonify(workspace.list_dirs(request.args.get("path")))
+    except workspace.WorkspaceError as exc:
+        return jsonify({"error": _sanitize(str(exc))}), 400
+    except OSError as exc:
+        return jsonify({"error": _sanitize(str(exc))}), 400
+
+
 @app.route("/api/workspace/status", methods=["GET"])
 def api_workspace_status():
     # Gated, unlike stop: this one only READS, and its 400-on-missing-directory
@@ -12890,6 +12919,7 @@ if __name__ == "__main__":
     _print_banner()
     _start_auto_update()
     _start_aa_refresh()
+    workspace.start_reaper()   # stop previews nobody is watching
     vision_status.start_heartbeat()
     server = make_server(HOST, PORT, app, threaded=True)
     _runtime_server[0] = server
