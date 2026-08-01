@@ -44,7 +44,8 @@ import uuid
 from urllib.parse import quote, urlsplit
 
 import requests
-from flask import Flask, Response, g, jsonify, render_template, request, stream_with_context
+from flask import (Flask, Response, g, jsonify, make_response, render_template,
+                   request, stream_with_context)
 
 try:
     from jinja2 import TemplateNotFound
@@ -5226,6 +5227,13 @@ def _local_control_guard():
 
 @app.after_request
 def _security_headers(response):
+    # An artifact document sets its own CSP (see serve_artifact) — setdefault
+    # below would leave it alone anyway, but X-Frame-Options: DENY would not,
+    # and that would stop the preview panel embedding it at all.
+    if request.path.startswith("/artifact/"):
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        return response
     nonce = getattr(g, "csp_nonce", "")
     response.headers.setdefault(
         "Content-Security-Policy",
@@ -7155,6 +7163,63 @@ def api_workspace_attach():
     except (workspace.WorkspaceError, OSError) as exc:
         return jsonify({"error": _sanitize(str(exc))}), 400
     return jsonify({"path": rel, "bytes": len(raw)})
+
+
+_ARTIFACTS = {}                 # id -> html, newest last
+_ARTIFACT_KEEP = 8              # a preview panel, not a store
+
+
+@app.route("/api/artifact", methods=["POST"])
+def api_artifact_put():
+    """Stash agent-produced HTML so it can be served as its OWN document.
+
+    It used to go straight into a sandboxed iframe via `srcdoc`, which is safe
+    but has one consequence that made the dashboard console unusable: a srcdoc
+    iframe INHERITS the embedder's Content-Security-Policy. Ours is
+    `default-src 'none'`, so every webfont, stylesheet and image a generated
+    page references was refused, and one page produced dozens of CSP errors
+    plus hundreds of failed image requests in the parent's console.
+
+    Served from its own URL it is a separate document with its own policy, so a
+    generated page renders as the browser would really render it -- which is the
+    entire point of previewing it -- while the DASHBOARD keeps its strict CSP."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    body = request.get_json(force=True, silent=True) or {}
+    html = body.get("html")
+    if not isinstance(html, str) or not html.strip():
+        return jsonify({"error": "html is required."}), 400
+    if len(html) > 2 * 1024 * 1024:
+        return jsonify({"error": "artifact is too large to preview."}), 400
+    aid = uuid.uuid4().hex
+    _ARTIFACTS[aid] = html
+    for old in list(_ARTIFACTS)[:-_ARTIFACT_KEEP]:
+        _ARTIFACTS.pop(old, None)
+    return jsonify({"id": aid, "url": "/artifact/" + aid})
+
+
+@app.route("/artifact/<aid>", methods=["GET"])
+def serve_artifact(aid):
+    """The stashed page, with a policy of ITS own.
+
+    Deliberately permissive about what the page may LOAD (a preview that cannot
+    fetch its own fonts is not a preview) and deliberately strict about what it
+    may REACH: no framing of anything else, no form submission, and the iframe
+    that embeds it is still sandboxed without allow-same-origin, so it has an
+    opaque origin and cannot touch the dashboard or its storage."""
+    html = _ARTIFACTS.get(aid)
+    if html is None:
+        return "Not found", 404
+    resp = make_response(html)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self' data: blob: https:; "
+        "img-src * data: blob:; font-src * data:; "
+        "style-src * 'unsafe-inline'; script-src 'unsafe-inline' 'unsafe-eval' https:; "
+        "form-action 'none'; frame-ancestors 'self'")
+    resp.headers["X-Frame-Options"] = "SAMEORIGIN"
+    return resp
 
 
 @app.route("/api/workspace/adopt", methods=["POST"])
