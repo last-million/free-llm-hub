@@ -229,3 +229,44 @@ def test_the_claude_floor_still_excludes_the_cli_relay_handles():
     Promoting them would push free routing onto a PAID subscription hop."""
     for mid in ("claude", "claude-agentrouter"):
         assert app._benchmark_score("p", mid) < app._PREF_FLOORS[5], mid
+
+
+def test_deepseek_v4_and_minimax_m3_sit_just_under_glm5():
+    """USER 2026-08-01: "DeepSeek V4 should have priority almost as much as
+    GLM 5.2, and MiniMax M3 is also good, almost like DeepSeek 4."
+
+    Order asserted, not raw numbers, so the tiers can be re-tuned without
+    rewriting the test."""
+    glm = app._benchmark_score("p", "glm-5.2")
+    ds4 = app._benchmark_score("p", "deepseek-v4")
+    mm3 = app._benchmark_score("p", "minimax-m3")
+    assert glm > ds4 > mm3
+    # ...and both clear the whole ordinary field.
+    for weaker in ("qwen3.6-27b", "qwen3.5", "mimo-2.5", "deepseek-v3.1",
+                   "minimax-m2", "kimi-k2.7"):
+        assert mm3 > app._benchmark_score("p", weaker), weaker
+
+
+def test_the_named_top_four_still_outrank_them():
+    """The new floors must not displace the ranking the user set earlier."""
+    ds4 = app._benchmark_score("p", "deepseek-v4")
+    for stronger in ("claude-sonnet-4-5", "gpt-5.6", "kimi-k3", "hy3-large"):
+        assert app._benchmark_score("p", stronger) > ds4, stronger
+
+
+def test_the_floors_reach_every_id_spelling():
+    """Relays spell these several ways; a floor that only matches one is a floor
+    that silently does not apply."""
+    ds4 = app._PREF_FLOORS[9]
+    for mid in ("deepseek-v4", "deepseek-v4-flash", "deepseek/deepseek-v4-flash",
+                "morph-dsv4flash", "DeepSeek-V4"):
+        assert app._benchmark_score("p", mid) >= ds4, mid
+    mm3 = app._PREF_FLOORS[10]
+    for mid in ("minimax-m3", "MiniMaxAI/MiniMax-M3", "morph-minimax3-428b"):
+        assert app._benchmark_score("p", mid) >= mm3, mid
+
+
+def test_older_generations_keep_their_measured_score():
+    """Only v4+/m3+ are floored. v3/r1 and m2 must NOT be lifted."""
+    for mid in ("deepseek-v3.1", "deepseek-r1", "minimax-m2", "minimax-m2.7"):
+        assert app._benchmark_score("p", mid) < app._PREF_FLOORS[10], mid

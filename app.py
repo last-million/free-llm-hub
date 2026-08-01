@@ -695,13 +695,14 @@ def _strong_new_version_score(low):
 
 
 # User-preference floors applied by _benchmark_score: (hy3, kimi-k3, puter
-# gpt-5.6-sol class, puter gpt-5.6-terra/gpt-5.5-pro class, kimi-k2.6/k2.7).
+# gpt-5.6-sol class, puter gpt-5.6-terra/gpt-5.5-pro class, kimi-k2.6/k2.7,
+# claude, gpt-5.5+, glm-5.x, gpt-5.x, deepseek-v4, minimax-m3).
 # They are
 # deliberate thumb-on-the-scale values, NOT measured strength, so any code that
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
-#                 hy3    k3     sol  terra k2.6  claude gpt5.5+ glm5.x gpt5.x
-_PREF_FLOORS = (134.5, 134.8, 136, 135, 0,    138,   136,    134,   135)
+#                 hy3    k3     sol  terra k2.6  claude gpt5.5+ glm5.x gpt5.x  dsv4   mm3
+_PREF_FLOORS = (134.5, 134.8, 136, 135, 0,    138,   136,    134,   135,   133.5, 133)
 # kimi-k2.6/k2.7 are CAPPED, not floored: the user ranks them below qwen3.5/
 # 3.6 (108-109) and below mimo-2.5 (100), so the ceiling sits just under mimo.
 _KIMI_K2_CEILING = 98
@@ -739,6 +740,13 @@ _CLAUDE_FAMILY_RE = re.compile(r"(?:^|[/:._-])claude[-.]?(?:opus|sonnet|haiku|fa
 _GPT_VER_RE = re.compile(r"\bgpt-(\d+)(?:\.(\d+))?")
 # GLM 5.x (Zhipu) — glm-5, glm-5.2, zhipu/glm-5.2, THUDM/glm-5. Not glm-4.x.
 _GLM5_RE = re.compile(r"glm-?5(?:\.\d+)?\b")
+# DeepSeek V4 (and later) — deepseek-v4, deepseek-v4-flash, deepseek/deepseek-v4,
+# and morph's 'dsv4flash' once _canon_model_id has expanded it. V3 and R1 keep
+# their measured Tier A/S scores; only the v4+ generation gets the floor.
+_DSV4_RE = re.compile(r"deepseek[-_/]?v([4-9])(?:\.\d+)?")
+# MiniMax M3 (and later) — minimax-m3, MiniMaxAI/MiniMax-M3, and morph's
+# 'minimax3' after canonicalisation. M2/M2.7 stay on their measured score.
+_MINIMAX3_RE = re.compile(r"minimax-m([3-9])(?:\.\d+)?")
 # 2026-07-30: the qwen -45 demotion (_PREF_QWEN_DEMOTION) is REMOVED — qwen3 is a
 # strong family again and ranks with the top tier via Tier A + _STRONG_ROOTS.
 
@@ -1121,6 +1129,16 @@ def _benchmark_score(pid, model_id):
     # -flash/-air variants are NOT included (the speed cap below still applies).
     if _GLM5_RE.search(low):
         score = max(score, _PREF_FLOORS[7])
+    # USER PREFERENCE 2026-08-01: "DeepSeek V4 should have priority almost as
+    # much as GLM 5.2, and MiniMax M3 is also good, almost like DeepSeek 4."
+    # So they slot in immediately BELOW glm-5.x (134) and in that order, which
+    # puts both above the whole qwen/mimo field without displacing the named top
+    # four (claude 138 / gpt-5.x 135-137 / kimi-k3 134.8 / hy3 134.5).
+    # mimo-2.5 needs no rule: it sits at 100 and is already under all of them.
+    if _DSV4_RE.search(low):
+        score = max(score, _PREF_FLOORS[9])
+    if _MINIMAX3_RE.search(low):
+        score = max(score, _PREF_FLOORS[10])
     # 2026-07-30: the 2026-07-25 qwen -45 demotion is REMOVED — qwen3 is a strong
     # family per the user and ranks with the top tier (Tier A + _STRONG_ROOTS).
     if (("mistral" in low or "mixtral" in low or "ministral" in low)
