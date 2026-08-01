@@ -4219,7 +4219,11 @@
       var promptText = promptEl.value.trim();
       data.forEach(function(item, i){
         if (!item || !item.b64_json) return;
-        var src = 'data:image/png;base64,' + item.b64_json;
+        /* The hub re-encodes to WebP and reports the real type in `mime`.
+           This said image/png for every image, including the JPEGs the
+           generators have always returned — browsers sniff, so it rendered,
+           but a saved file carried the wrong type. */
+        var src = 'data:' + (item.mime || 'image/png') + ';base64,' + item.b64_json;
         var thumb = document.createElement('button');
         thumb.type = 'button';
         thumb.className = 'image-thumb';

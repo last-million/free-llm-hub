@@ -12,19 +12,26 @@ import app
 import craft
 
 
+_ORTHO = {n for n, _rx, _b in craft._ORTHOGONAL}
+
+
+def _domains(text):
+    """Just the DOMAIN briefs. seo/images are orthogonal — they ride along on
+    any request that ships a page, and are asserted on their own below."""
+    return [n for n in craft.names(text) if n not in _ORTHO]
+
+
 @pytest.mark.parametrize("text,expected", [
     ("Build me an online store landing page for solar panels", ["landing", "ecommerce"]),
     ("write the copy for our sales page", ["landing"]),
     ("add a shopping cart and stripe checkout", ["ecommerce"]),
-    ("write a blog post and optimise it for SEO", ["seo"]),
+    ("write a blog post and optimise it for SEO", []),
     ("redesign the hero section with tailwind", ["web_design"]),
     ("optimise the query in src/db.py", ["programming"]),
     ("refactor the auth module and write tests", ["programming"]),
 ])
 def test_briefs_fire_on_their_own_domain(text, expected):
-    # IMAGES is orthogonal and rides along on any request that will show
-    # pictures — it is asserted on its own below, not as a domain.
-    assert [n for n in craft.names(text) if n != "images"] == expected
+    assert _domains(text) == expected
 
 
 @pytest.mark.parametrize("text", [
@@ -48,8 +55,8 @@ def test_at_most_two_domain_briefs():
     own (a free local generator). Ranked against the domains it would lose on
     exactly the requests that need it, which is how a build ended up announcing
     it had no image tool and falling back to Unsplash."""
-    hits = craft.names("build an ecommerce landing page with SEO, refactor and write tests")
-    assert len([n for n in hits if n != "images"]) <= craft.MAX_BRIEFS
+    hits = _domains("build an ecommerce landing page with SEO, refactor and write tests")
+    assert len(hits) <= craft.MAX_BRIEFS
 
 
 def test_every_brief_names_what_NOT_to_do():
@@ -62,8 +69,9 @@ def test_every_brief_names_what_NOT_to_do():
 def test_briefs_forbid_inventing_facts():
     """The failure that matters most in this domain: fabricated testimonials,
     metrics, prices and reviews."""
+    allb = dict((n, b) for n, _r, b in craft._BRIEFS + craft._ORTHOGONAL)
     for name in ("landing", "ecommerce", "seo"):
-        body = dict((n, b) for n, _r, b in craft._BRIEFS)[name].lower()
+        body = allb[name].lower()
         assert "invent" in body or "fabricat" in body, name
 
 
@@ -71,6 +79,23 @@ def test_briefs_stay_small():
     """Injected into a small free context window on every matching opening turn."""
     for name, _rx, body in craft._BRIEFS:
         assert len(body) < 1400, "%s brief is too long (%d chars)" % (name, len(body))
+    # The orthogonal two are allowed to be larger: they carry runnable commands
+    # and hard numbers (endpoint, WebP conversion, CWV thresholds, schema types
+    # Google retired) rather than style guidance, and that is the part a model
+    # cannot supply for itself. Still bounded — see test_worst_case_brief_cost.
+    for name, _rx, body in craft._ORTHOGONAL:
+        assert len(body) < 3600, "%s brief is too long (%d chars)" % (name, len(body))
+
+
+def test_worst_case_brief_cost():
+    """The whole point of MAX_BRIEFS: this must stay a small slice of even the
+    smallest free context window the hub routes to (~32K)."""
+    worst = max(
+        len(craft.system_message(t)["content"])
+        for t in ("build an online store and deploy it",
+                  "create a landing page for my saas",
+                  "build me a restaurant website"))
+    assert worst / 4 < 32768 * 0.08, "briefs cost ~%d tokens" % (worst // 4)
 
 
 # --------------------------------------------------------------------------- #
@@ -213,9 +238,8 @@ def test_images_does_not_consume_a_domain_brief_slot():
     """Ranked as a domain it would lose every time — a website request already
     spends both MAX_BRIEFS slots on web_design/landing, which is exactly the
     request that needs it most."""
-    got = craft.names("create a landing page for my saas")
-    assert "images" in got
-    assert len([n for n in got if n != "images"]) == craft.MAX_BRIEFS
+    assert "images" in craft.names("create a landing page for my saas")
+    assert len(_domains("create a landing page for my saas")) == craft.MAX_BRIEFS
 
 
 def test_images_brief_names_the_real_local_endpoint():
@@ -235,3 +259,70 @@ def test_images_brief_does_not_hardcode_a_png_extension():
 def test_images_brief_offers_exactly_three_choices():
     for marker in ("1. FREE STOCK", "2. GENERATED", "3. BOTH"):
         assert marker in craft.IMAGES, marker
+
+
+# --------------------------------------------------------------------------- #
+# SEO — "websites should be optimised for SEO already", not only when asked.
+# Rules adapted from AgriciDaniel/claude-seo (MIT).
+# --------------------------------------------------------------------------- #
+
+def test_seo_applies_to_every_site_build_without_being_asked():
+    """USER 2026-08-01: websites must ship SEO-optimised already. Nobody says
+    the word "SEO" when they ask for a restaurant website."""
+    for text in ("build me a restaurant website", "create a landing page for my saas",
+                 "build an online store", "start a blog"):
+        assert "seo" in craft.names(text), text
+
+
+def test_seo_stays_off_non_web_work():
+    for text in ("refactor this auth middleware", "write a python script to parse csv",
+                 "explain how a mutex works"):
+        assert "seo" not in craft.names(text), text
+
+
+def test_seo_does_not_recommend_retired_rich_results():
+    """Google removed HowTo rich results in 2023 and retired FAQPage rich
+    results for ALL sites on 2026-05-07. The brief used to recommend FAQ."""
+    body = craft.SEO
+    assert "Never HowTo" in body
+    assert "QAPage" in body
+    assert "FAQPage no longer earns a rich result" in body
+
+
+def test_seo_carries_the_current_vitals_and_not_fid():
+    """INP replaced FID on 2024-03-12; citing FID dates the whole brief."""
+    body = craft.SEO
+    for marker in ("LCP <=2.5s", "INP <=200ms", "CLS <0.1"):
+        assert marker in body, marker
+    assert "never cite FID" in body
+
+
+def test_seo_requires_server_rendered_head_tags():
+    """AI crawlers do not execute JavaScript."""
+    assert "Server-render" in craft.SEO
+    assert "do not run JavaScript" in craft.SEO
+
+
+def test_seo_does_not_sell_llms_txt_as_a_ranking_lever():
+    """Google states it neither helps nor harms; presenting it as SEO is wrong."""
+    assert "llms.txt" in craft.SEO.lower()
+    assert "ANTI" in craft.SEO
+
+
+# --------------------------------------------------------------------------- #
+# WebP
+# --------------------------------------------------------------------------- #
+
+def test_images_brief_requires_webp_for_stock_too():
+    """Generated images arrive as WebP from the hub; downloaded ones do not."""
+    body = craft.IMAGES
+    assert "EVERY image ships as WebP" in body
+    assert "WEBP" in body and "quality=82" in body
+
+
+def test_images_brief_protects_the_lcp_image():
+    """Lazy-loading the hero directly harms LCP — the most common real mistake."""
+    body = craft.IMAGES
+    assert 'fetchpriority="high"' in body
+    assert 'NEVER be loading="lazy"' in body
+    assert 'loading="lazy" decoding="async"' in body
