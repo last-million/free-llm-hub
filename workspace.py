@@ -506,6 +506,94 @@ def _is_runnable(path):
         return False
 
 
+# --------------------------------------------------------------------------- #
+# Reading the project — the file tree and the code viewer
+# --------------------------------------------------------------------------- #
+
+MAX_FILE_BYTES = 512 * 1024      # a file bigger than this is not for reading
+MAX_TREE_ENTRIES = 800
+
+# Never worth showing, and node_modules/.git would drown everything else.
+_TREE_SKIP = {"node_modules", ".git", ".venv", "venv", "__pycache__", ".next",
+              "dist", "build", ".cache", ".idea", ".pytest_cache", ".mypy_cache",
+              ATTACH_DIR}
+
+
+def _inside(root, target):
+    """True when `target` really is inside `root`.
+
+    commonpath on the ABSOLUTE, symlink-resolved paths — a plain startswith is
+    defeated by '..' and by a symlink pointing out of the project, and this
+    decides which of the user's files a browser can read."""
+    try:
+        root = os.path.realpath(root)
+        target = os.path.realpath(target)
+        return os.path.commonpath([root, target]) == root
+    except (ValueError, OSError):
+        return False          # different drives on Windows -> ValueError
+
+
+def _resolve_in(project_dir, rel):
+    root = os.path.abspath(project_dir)
+    target = os.path.abspath(os.path.join(root, rel or ""))
+    if not _inside(root, target):
+        raise WorkspaceError("path is outside the project")
+    return root, target
+
+
+def tree(project_dir, rel=None):
+    """One level of the project: directories first, then files."""
+    root, target = _resolve_in(project_dir, rel)
+    if not os.path.isdir(target):
+        raise WorkspaceError("not a directory")
+    dirs, files = [], []
+    try:
+        with os.scandir(target) as it:
+            for e in it:
+                if len(dirs) + len(files) >= MAX_TREE_ENTRIES:
+                    break
+                if e.name in _TREE_SKIP or e.name.startswith("."):
+                    continue
+                r = os.path.relpath(os.path.join(target, e.name), root).replace("\\", "/")
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        dirs.append({"name": e.name, "rel": r, "dir": True})
+                    else:
+                        files.append({"name": e.name, "rel": r, "dir": False,
+                                      "size": e.stat().st_size})
+                except OSError:
+                    continue
+    except PermissionError:
+        raise WorkspaceError("permission denied")
+    dirs.sort(key=lambda d: d["name"].lower())
+    files.sort(key=lambda d: d["name"].lower())
+    return {"rel": os.path.relpath(target, root).replace("\\", "/") if target != root else "",
+            "entries": dirs + files}
+
+
+def read_file(project_dir, rel):
+    """A text file's contents, for the viewer. Binary and oversized files are
+    reported as such rather than dumped into the browser."""
+    _root, target = _resolve_in(project_dir, rel)
+    if not os.path.isfile(target):
+        raise WorkspaceError("not a file")
+    size = os.path.getsize(target)
+    if size > MAX_FILE_BYTES:
+        return {"rel": rel, "size": size, "too_big": True, "text": None}
+    with open(target, "rb") as fh:
+        raw = fh.read()
+    # bytes([0]), not a backslash-x-0-0 literal. Writing this file through
+    # tooling turned that escape into the RAW byte once, which made the module
+    # unimportable ("source code string cannot contain null bytes"). Spelling
+    # it as an int is immune to however many quoting layers an edit passes
+    # through.
+    if bytes([0]) in raw[:8000]:
+        return {"rel": rel, "size": size, "binary": True, "text": None}
+    return {"rel": rel, "size": size,
+            "text": raw.decode("utf-8", "replace"),
+            "lang": os.path.splitext(target)[1].lstrip(".").lower()}
+
+
 def running():
     """Every live preview, for the "what is running" list."""
     now = time.time()

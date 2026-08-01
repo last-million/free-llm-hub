@@ -304,3 +304,122 @@ def test_browse_route_returns_a_listing(client):
     assert r.status_code in (200, 403)
     if r.status_code == 200:
         assert "dirs" in r.get_json()
+
+
+# --------------------------------------------------------------------------- #
+# The file tree and code viewer.
+#
+# This decides which of the user's files a browser can read, so the containment
+# check is the part that matters.
+# --------------------------------------------------------------------------- #
+
+def test_tree_lists_dirs_before_files(proj):
+    os.makedirs(os.path.join(proj, "src"))
+    open(os.path.join(proj, "index.html"), "w").write("x")
+    names = [e["name"] for e in workspace.tree(proj)["entries"]]
+    assert names == ["src", "index.html"]
+
+
+def test_tree_skips_the_noise(proj):
+    for d in ("node_modules", ".git", "__pycache__", "dist", "keep"):
+        os.makedirs(os.path.join(proj, d))
+    names = [e["name"] for e in workspace.tree(proj)["entries"]]
+    assert names == ["keep"]
+
+
+def test_tree_descends(proj):
+    os.makedirs(os.path.join(proj, "src"))
+    open(os.path.join(proj, "src", "app.js"), "w").write("const x = 1;")
+    sub = workspace.tree(proj, "src")
+    assert [e["name"] for e in sub["entries"]] == ["app.js"]
+    assert sub["rel"] == "src"
+
+
+def test_read_file_returns_text(proj):
+    open(os.path.join(proj, "a.js"), "w").write("const x = 1;")
+    r = workspace.read_file(proj, "a.js")
+    assert r["text"] == "const x = 1;"
+    assert r["lang"] == "js"
+
+
+def test_binary_files_are_flagged_not_dumped(proj):
+    with open(os.path.join(proj, "b.dat"), "wb") as fh:
+        fh.write(bytes([0, 1, 2, 3]) * 100)
+    r = workspace.read_file(proj, "b.dat")
+    assert r["binary"] is True and r["text"] is None
+
+
+def test_oversized_files_are_refused(proj, monkeypatch):
+    monkeypatch.setattr(workspace, "MAX_FILE_BYTES", 10)
+    open(os.path.join(proj, "big.txt"), "w").write("x" * 100)
+    r = workspace.read_file(proj, "big.txt")
+    assert r["too_big"] is True and r["text"] is None
+
+
+@pytest.mark.parametrize("evil", [
+    "../../../etc/passwd",
+    os.path.join("..", "..", "secrets.txt"),
+    "sub/../../outside.txt",
+])
+def test_path_traversal_is_refused(proj, evil):
+    """The check compares realpaths — a prefix test is beaten by '..' and by a
+    symlink pointing out of the project."""
+    with pytest.raises(workspace.WorkspaceError):
+        workspace.read_file(proj, evil)
+
+
+def test_a_symlink_out_of_the_project_is_refused(proj):
+    outside = tempfile.mkdtemp(prefix="hubws-out-")
+    try:
+        open(os.path.join(outside, "secret.txt"), "w").write("nope")
+        link = os.path.join(proj, "escape")
+        try:
+            os.symlink(outside, link, target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            pytest.skip("symlinks not permitted on this machine")
+        with pytest.raises(workspace.WorkspaceError):
+            workspace.read_file(proj, "escape/secret.txt")
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# Idle previews
+# --------------------------------------------------------------------------- #
+
+def test_running_reports_idle_countdown(proj):
+    open(os.path.join(proj, "index.html"), "w").write("x")
+    workspace.start(proj)
+    rows = [r for r in workspace.running() if r["project_dir"] == os.path.abspath(proj)]
+    assert rows and rows[0]["idle_stops_in"] > 0
+
+
+def test_status_counts_as_watching(proj):
+    """The dashboard polls status while the pane is open, so that is what keeps
+    a preview alive — the reaper must only fire once the user has moved on."""
+    open(os.path.join(proj, "index.html"), "w").write("x")
+    workspace.start(proj)
+    key = os.path.abspath(proj)
+    workspace._procs[key].touched_at = time.time() - workspace.IDLE_TIMEOUT - 5
+    workspace.status(proj)                      # someone looked
+    assert workspace.reap_idle() == []
+
+
+def test_an_unwatched_preview_is_stopped(proj):
+    open(os.path.join(proj, "index.html"), "w").write("x")
+    workspace.start(proj)
+    key = os.path.abspath(proj)
+    workspace._procs[key].touched_at = time.time() - workspace.IDLE_TIMEOUT - 5
+    assert workspace.reap_idle() == [key]
+    assert workspace.status(proj)["state"] == "idle"
+
+
+def test_reaping_is_a_pause_not_a_ban(proj):
+    """Run must bring it straight back."""
+    open(os.path.join(proj, "index.html"), "w").write("x")
+    workspace.start(proj)
+    key = os.path.abspath(proj)
+    workspace._procs[key].touched_at = time.time() - workspace.IDLE_TIMEOUT - 5
+    workspace.reap_idle()
+    workspace.start(proj)
+    assert workspace.status(proj)["state"] in ("installing", "starting", "running")

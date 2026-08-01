@@ -1623,6 +1623,60 @@
   .preview-state.live{ color:var(--ok-text); }
   .preview-state.bad{ color:var(--danger-text); }
   .preview-icon{ padding:4px 6px; line-height:0; }
+  /* What is currently open, and what it costs. */
+  .runpanel{ position:fixed; inset:0; z-index:400; display:grid; place-items:center;
+    background:var(--scrim, rgba(0,0,0,.55)); }
+  .runpanel-box{ width:min(620px,94vw); max-height:76vh; display:flex; flex-direction:column;
+    background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+    overflow:hidden; }
+  .runpanel-h{ display:flex; align-items:center; gap:8px; padding:11px 13px;
+    border-bottom:1px solid var(--border-soft); font-weight:700; font-size:13.5px; }
+  .runpanel-body{ overflow:auto; padding:6px 0; }
+  .runpanel-sec{ font-size:10.5px; text-transform:uppercase; letter-spacing:.1em;
+    color:var(--text-faint); font-weight:700; padding:9px 13px 4px; }
+  .runrow{ display:flex; align-items:center; gap:10px; padding:8px 13px; }
+  .runrow:hover{ background:var(--surface-2); }
+  .runrow-main{ flex:1; min-width:0; }
+  .runrow-t{ font-size:12.5px; color:var(--text); overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  .runrow-s{ font-size:11.5px; color:var(--text-faint); }
+  .runpanel-note{ font-size:11.5px; color:var(--text-dim); padding:10px 13px;
+    border-top:1px solid var(--border-soft); line-height:1.5; }
+  .runpanel-empty{ padding:14px 13px; font-size:12.5px; color:var(--text-dim); }
+
+  /* Pane switcher */
+  .pane-tabs{ display:flex; gap:2px; padding:6px 8px 0; }
+  .pane-tab{ border:0; background:none; cursor:pointer; font:inherit; font-size:12.5px;
+    font-weight:600; color:var(--text-faint); padding:6px 12px; border-radius:7px 7px 0 0;
+    border-bottom:2px solid transparent; transition:color .15s ease; }
+  .pane-tab:hover{ color:var(--text-dim); }
+  .pane-tab.active{ color:var(--text); border-bottom-color:var(--accent); }
+  .pane-tab:focus-visible{ outline:2px solid var(--accent); outline-offset:-2px; }
+
+  /* Files pane: tree + source, side by side, each scrolling on its own. */
+  .files-pane{ flex:1; min-height:0; display:grid; grid-template-columns:200px minmax(0,1fr);
+    border-top:1px solid var(--border-soft); }
+  .files-tree{ overflow:auto; border-right:1px solid var(--border-soft); padding:6px 0;
+    background:var(--surface); }
+  .files-row{ display:flex; align-items:center; gap:6px; width:100%; border:0;
+    background:none; cursor:pointer; font:inherit; font-size:12.5px; color:var(--text-dim);
+    padding:4px 8px; text-align:left; }
+  .files-row:hover{ background:var(--surface-2); color:var(--text); }
+  .files-row.active{ background:var(--accent-soft); color:var(--text); }
+  .files-row svg{ width:13px; height:13px; flex:none; color:var(--text-faint); }
+  .files-row span{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .files-code{ display:flex; flex-direction:column; min-width:0; min-height:0;
+    background:var(--bg-inset); }
+  .files-code-h{ display:flex; align-items:baseline; gap:8px; padding:7px 10px;
+    border-bottom:1px solid var(--border-soft); font-size:12px; }
+  .files-code-name{ font-family:var(--mono); color:var(--text); overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  .files-code-meta{ color:var(--text-faint); flex:none; margin-left:auto; }
+  .files-code-body{ margin:0; flex:1; min-height:0; overflow:auto; padding:8px 10px;
+    font-family:var(--mono); font-size:11.5px; line-height:1.55; color:var(--text-dim);
+    white-space:pre; tab-size:2; }
+  .files-code-body .ln{ display:inline-block; width:3.2em; color:var(--text-faint);
+    user-select:none; text-align:right; padding-right:1em; }
   .preview-devices{ display:inline-flex; gap:2px; padding:2px; flex:none;
     background:var(--bg-inset); border:1px solid var(--border-soft);
     border-radius:var(--radius-sm); }
@@ -1825,6 +1879,16 @@
         <span class="lbl">Light theme</span>
       </label>
       <p class="sd-help">Light is the default. Your choice is remembered in this browser.</p>
+    </div>
+    <div class="sd-group">
+      <label class="sd-label" for="drawer-ui-scale">Interface size</label>
+      <select id="drawer-ui-scale" aria-label="Interface size">
+        <option value="1">100% — browser default</option>
+        <option value=".9">90%</option>
+        <option value=".8">80% — more on screen</option>
+        <option value=".7">70%</option>
+      </select>
+      <p class="sd-help">Scales the whole dashboard, like zooming out in the browser. 80% is the default because it fits more of the chat and preview on screen at once.</p>
     </div>
     <div class="sd-group">
       <label class="switch" title="Connect or disconnect all installed compatible CLIs as one transaction">
@@ -2059,7 +2123,9 @@
           <div class="agent-session-bar">
             <span class="agent-session-info" id="agent-session-info"></span>
             <button class="btn sm ghost" id="agent-checkpoint" type="button" title="Bookmark this point in the conversation — not a filesystem undo">Bookmark</button>
-            <button class="btn sm ghost" id="agent-end" type="button">End session</button>
+            <button class="btn sm ghost" id="agent-running" type="button"
+                  title="Conversations and previews currently open">Running <span id="agent-running-n">0</span></button>
+          <button class="btn sm ghost" id="agent-end" type="button">End session</button>
           </div>
           <div class="agent-split" id="agent-split">
             <div class="agent-chat-col">
@@ -2083,7 +2149,13 @@
             <!-- Runs the project the agent is writing, on its own port, with its
                  own dependencies. The point is that "done" means SEEN running. -->
             <div class="agent-preview-col" id="agent-preview-col">
-              <div class="preview-bar">
+              <!-- Preview vs Files. Both read the SAME project folder, so this
+                   is a view switch, not two features. -->
+              <div class="pane-tabs" id="pane-tabs" role="tablist" aria-label="Right pane">
+                <button type="button" class="pane-tab active" data-pane="preview" role="tab" aria-selected="true">Preview</button>
+                <button type="button" class="pane-tab" data-pane="files" role="tab" aria-selected="false">Files</button>
+              </div>
+              <div class="preview-bar" id="preview-bar">
                 <button class="btn sm primary" id="preview-run" type="button">Run</button>
                 <button class="btn sm ghost" id="preview-stop" type="button" hidden>Stop</button>
                 <span class="preview-state" id="preview-state">not running</span>
@@ -2120,6 +2192,17 @@
                   <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
                   <p>Press <b>Run</b> to start this project and see it here.</p>
                   <p class="preview-hint">Its dependencies install into this folder only — a <code>.venv</code> and its own <code>node_modules</code>.</p>
+                </div>
+              </div>
+              <!-- FILES pane: tree on the left, source on the right. -->
+              <div class="files-pane" id="files-pane" hidden>
+                <div class="files-tree" id="files-tree" aria-label="Project files"></div>
+                <div class="files-code">
+                  <div class="files-code-h">
+                    <span class="files-code-name" id="files-code-name">Pick a file</span>
+                    <span class="files-code-meta" id="files-code-meta"></span>
+                  </div>
+                  <pre class="files-code-body" id="files-code-body"><code>Select a file on the left to read it.</code></pre>
                 </div>
               </div>
               <div class="preview-problems" id="preview-problems" hidden>
@@ -2527,6 +2610,7 @@
     }); }
     initSidebarModes();
     initNavGroups();
+    initUiScale();
     initAgentLayout();
     var sideSettings = document.getElementById('cx-open-settings');
     if (sideSettings) sideSettings.addEventListener('click', function(){
@@ -2652,6 +2736,30 @@
     /* Re-measure when the view is switched to, since the split has no box while
        the section is display:none. */
     document.addEventListener('cx:view', measure);
+  }
+
+  /* Interface size. 80% is the shipped default because it fits more of the
+     chat/preview split on screen, which is what the user was already doing by
+     hand with browser zoom — but it is a preference, not a fact about their
+     monitor, so it is changeable and remembered. */
+  function initUiScale(){
+    var sel = document.getElementById('drawer-ui-scale');
+    var val = '.8';
+    try { val = localStorage.getItem('cx_ui_scale') || '.8'; } catch(e){}
+    apply(val);
+    if (sel){
+      sel.value = val;
+      sel.addEventListener('change', function(){
+        apply(sel.value);
+        try { localStorage.setItem('cx_ui_scale', sel.value); } catch(e){}
+      });
+    }
+    function apply(v){
+      document.documentElement.style.setProperty('--ui-scale', v);
+      /* The agent split sizes itself from measured pixels, so it has to be
+         recomputed after a scale change or it keeps the old height. */
+      try { window.dispatchEvent(new Event('resize')); } catch(e){}
+    }
   }
 
   /* Collapsible nav groups. */
@@ -5930,6 +6038,135 @@
       });
     }
 
+    /* What is currently open, and what it actually costs.
+       Worth being precise, because the two are not the same:
+         - a CONVERSATION between turns runs NOTHING. agentic_chat spawns one
+           subprocess per message and clears it when the turn ends.
+         - a PREVIEW holds a port, a process and usually a file watcher, until
+           it is stopped or reaped for being idle.
+       So the panel shows both but says which is which, rather than implying an
+       idle chat is burning the machine. */
+    function initRunningPanel(){
+      var btn = document.getElementById('agent-running');
+      if (!btn) return;
+      var badge = document.getElementById('agent-running-n');
+      function refreshCount(){
+        Promise.all([
+          api('/api/agent/sessions').catch(function(){ return { sessions: [] }; }),
+          api('/api/workspace/running').catch(function(){ return { previews: [] }; })
+        ]).then(function(r){
+          var n = ((r[0] || {}).sessions || []).length + ((r[1] || {}).previews || []).length;
+          if (badge) badge.textContent = String(n);
+        });
+      }
+      refreshCount();
+      setInterval(refreshCount, 15000);
+      btn.addEventListener('click', function(){ openRunning(refreshCount); });
+    }
+
+    function runMins(sec){
+      sec = Math.max(0, sec | 0);
+      return sec < 60 ? sec + 's' : Math.floor(sec / 60) + 'm';
+    }
+
+    function runRow(title, sub, actionLabel, onAction){
+      var d = document.createElement('div');
+      d.className = 'runrow';
+      var main = document.createElement('div');
+      main.className = 'runrow-main';
+      var t = document.createElement('div'); t.className = 'runrow-t'; t.textContent = title;
+      var s2 = document.createElement('div'); s2.className = 'runrow-s'; s2.textContent = sub;
+      main.appendChild(t); main.appendChild(s2);
+      d.appendChild(main);
+      if (actionLabel){
+        var b = document.createElement('button');
+        b.type = 'button'; b.className = 'btn sm ghost'; b.textContent = actionLabel;
+        b.addEventListener('click', function(){ b.disabled = true; onAction(); });
+        d.appendChild(b);
+      }
+      return d;
+    }
+
+    function openRunning(onChange){
+      var scrim = document.createElement('div');
+      scrim.className = 'runpanel';
+      scrim.innerHTML =
+        '<div class="runpanel-box" role="dialog" aria-modal="true" aria-label="Running now">' +
+          '<div class="runpanel-h"><span>Running now</span>' +
+            '<button class="btn sm ghost" data-close type="button" style="margin-left:auto">Close</button></div>' +
+          '<div class="runpanel-body"></div>' +
+          '<div class="runpanel-note"></div>' +
+        '</div>';
+      document.body.appendChild(scrim);
+      var body = scrim.querySelector('.runpanel-body');
+      var note = scrim.querySelector('.runpanel-note');
+      function close(){ scrim.remove(); document.removeEventListener('keydown', onKey); }
+      function onKey(e){ if (e.key === 'Escape') close(); }
+      document.addEventListener('keydown', onKey);
+      scrim.addEventListener('click', function(e){ if (e.target === scrim) close(); });
+      scrim.querySelector('[data-close]').addEventListener('click', close);
+
+      function load(){
+        body.textContent = 'Loading…';
+        Promise.all([
+          api('/api/agent/sessions').catch(function(){ return { sessions: [] }; }),
+          api('/api/workspace/running').catch(function(){ return { previews: [] }; })
+        ]).then(function(r){
+          var sessions = (r[0] || {}).sessions || [];
+          var previews = (r[1] || {}).previews || [];
+          var idleMin = Math.round((((r[1] || {}).idle_timeout) || 1800) / 60);
+          body.innerHTML = '';
+          var h1 = document.createElement('div');
+          h1.className = 'runpanel-sec';
+          h1.textContent = 'Conversations (' + sessions.length + ')';
+          body.appendChild(h1);
+          if (!sessions.length){
+            var e1 = document.createElement('div');
+            e1.className = 'runpanel-empty'; e1.textContent = 'None open.';
+            body.appendChild(e1);
+          }
+          sessions.forEach(function(x){
+            body.appendChild(runRow(
+              x.project_dir || x.session_id,
+              (x.cli || '?') + ' · ' + (x.turn_count || 0) + ' turns · ' +
+                (x.currently_running ? 'working now' : 'idle (nothing running)'),
+              'End',
+              function(){
+                api('/api/agent/sessions/' + encodeURIComponent(x.session_id), { method: 'DELETE' })
+                  .then(function(){ load(); if (onChange) onChange(); })
+                  .catch(function(){ load(); });
+              }));
+          });
+          var h2 = document.createElement('div');
+          h2.className = 'runpanel-sec';
+          h2.textContent = 'Previews (' + previews.length + ')';
+          body.appendChild(h2);
+          if (!previews.length){
+            var e2 = document.createElement('div');
+            e2.className = 'runpanel-empty'; e2.textContent = 'None running.';
+            body.appendChild(e2);
+          }
+          previews.forEach(function(x){
+            body.appendChild(runRow(
+              x.project_dir,
+              (x.kind || '') + ' · port ' + x.port + ' · up ' + runMins(x.uptime) +
+                ' · stops in ' + runMins(x.idle_stops_in) + ' if unused',
+              'Stop',
+              function(){
+                api('/api/workspace/stop', { method: 'POST', body: { project_dir: x.project_dir } })
+                  .then(function(){ load(); if (onChange) onChange(); })
+                  .catch(function(){ load(); });
+              }));
+          });
+          note.textContent =
+            'A conversation between turns runs nothing — the CLI starts for one message and exits. ' +
+            'A preview keeps a server alive, so it stops on its own after ' + idleMin +
+            ' minutes with nobody watching, and Run brings it straight back.';
+        });
+      }
+      load();
+    }
+
     /* Browse the LOCAL machine for a folder, and accept a dropped one.
        A browser cannot give an absolute path — not from a drop, not from a file
        input, by design — so the listing comes from the hub, which runs on this
@@ -6041,6 +6278,11 @@
       sessionId = r.session_id;
       if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
       showSessionState(r.cli, r.project_dir);
+      /* Only ask for history when there IS some. A brand-new session has no
+         record yet and the route 404s — harmless, caught below, but it put a
+         red error in the console on every fresh restore, which trains people to
+         ignore the console. */
+      if (!r.turn_count) return;
       api('/api/agent/history/' + encodeURIComponent(r.session_id))
         .then(function(full){
           mountTranscript(msgsEl, full || {});
@@ -6211,8 +6453,123 @@
         logToggle.textContent = logEl.hidden ? 'Output' : 'Hide output';
       });
 
+      /* ── Files pane ────────────────────────────────────────────────────
+         Same project folder as the preview, different view of it. Kept inside
+         this module so both share `dir` and neither can drift onto a folder
+         the other is not looking at. */
+      var tabs = $('#pane-tabs');
+      var filesPane = $('#files-pane'), treeEl = $('#files-tree');
+      var codeName = $('#files-code-name'), codeMeta = $('#files-code-meta');
+      var codeBody = $('#files-code-body');
+      var treeLoaded = false;
+
+      function showPane(which){
+        [].forEach.call(tabs.querySelectorAll('.pane-tab'), function(t){
+          var on = t.dataset.pane === which;
+          t.classList.toggle('active', on);
+          t.setAttribute('aria-selected', on ? 'true' : 'false');
+        });
+        var files = which === 'files';
+        filesPane.hidden = !files;
+        $('#preview-bar').hidden = files;
+        frame.parentElement.hidden = files;
+        probBox.hidden = files || (!probList.children.length && !logEl.textContent);
+        if (files && !treeLoaded){ loadTree(''); treeLoaded = true; }
+      }
+      tabs.addEventListener('click', function(e){
+        var t = e.target.closest('.pane-tab');
+        if (t) showPane(t.dataset.pane);
+      });
+
+      var FOLDER_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+      var FILE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
+
+      function loadTree(rel){
+        if (!dir) return;
+        treeEl.textContent = 'Loading…';
+        api('/api/workspace/tree?project_dir=' + encodeURIComponent(dir) +
+            (rel ? '&path=' + encodeURIComponent(rel) : ''))
+          .then(function(r){
+            treeEl.innerHTML = '';
+            if (r.rel){
+              var up = document.createElement('button');
+              up.type = 'button'; up.className = 'files-row';
+              up.innerHTML = FOLDER_SVG + '<span>..</span>';
+              var parent = r.rel.indexOf('/') === -1 ? '' :
+                r.rel.slice(0, r.rel.lastIndexOf('/'));
+              up.addEventListener('click', function(){ loadTree(parent); });
+              treeEl.appendChild(up);
+            }
+            if (!r.entries.length){
+              var empty = document.createElement('div');
+              empty.className = 'files-row';
+              empty.style.cursor = 'default';
+              empty.textContent = 'Empty folder';
+              treeEl.appendChild(empty);
+            }
+            r.entries.forEach(function(e){
+              var b = document.createElement('button');
+              b.type = 'button'; b.className = 'files-row';
+              b.innerHTML = (e.dir ? FOLDER_SVG : FILE_SVG) + '<span></span>';
+              b.querySelector('span').textContent = e.name;
+              b.addEventListener('click', function(){
+                if (e.dir) return loadTree(e.rel);
+                [].forEach.call(treeEl.querySelectorAll('.files-row'), function(x){
+                  x.classList.remove('active');
+                });
+                b.classList.add('active');
+                openFile(e.rel);
+              });
+              treeEl.appendChild(b);
+            });
+          })
+          .catch(function(err){ treeEl.textContent = (err && err.message) || 'Could not read the project.'; });
+      }
+
+      function openFile(rel){
+        codeName.textContent = rel;
+        codeMeta.textContent = '';
+        codeBody.textContent = 'Loading…';
+        api('/api/workspace/file?project_dir=' + encodeURIComponent(dir) +
+            '&path=' + encodeURIComponent(rel))
+          .then(function(r){
+            codeMeta.textContent = (r.size != null ? fmtBytes(r.size) : '');
+            if (r.too_big){ codeBody.textContent = 'Too large to display (' + fmtBytes(r.size) + ').'; return; }
+            if (r.binary){ codeBody.textContent = 'Binary file — not shown.'; return; }
+            /* Line numbers via textContent per line, never innerHTML on file
+               contents: this renders the user's own source, and a project
+               containing markup must not be able to inject it into the
+               dashboard. */
+            codeBody.innerHTML = '';
+            var code = document.createElement('code');
+            /* String.fromCharCode(10) rather than a backslash-n literal: this
+               file is edited through tooling that has twice turned an escape
+               sequence into the RAW character, which here split the string
+               across two lines and broke the whole script block. No backslash,
+               no way for that to happen. */
+            var NL = String.fromCharCode(10);
+            String(r.text || '').split(NL).forEach(function(line, i){
+              var ln = document.createElement('span');
+              ln.className = 'ln';
+              ln.textContent = String(i + 1);
+              code.appendChild(ln);
+              code.appendChild(document.createTextNode(line + NL));
+            });
+            codeBody.appendChild(code);
+          })
+          .catch(function(err){ codeBody.textContent = (err && err.message) || 'Could not read that file.'; });
+      }
+
+      function fmtBytes(n){
+        if (n == null) return '';
+        return n < 1024 ? n + ' B'
+             : n < 1024 * 1024 ? (n / 1024).toFixed(1) + ' KB'
+             : (n / 1024 / 1024).toFixed(1) + ' MB';
+      }
+
       return {
-        attach: function(d){ dir = d; lastUrl = null; poll(); startPolling(); },
+        attach: function(d){ dir = d; lastUrl = null; treeLoaded = false; poll(); startPolling(); },
+        refreshFiles: function(){ treeLoaded = false; if (!filesPane.hidden) { loadTree(''); treeLoaded = true; } },
         detach: function(){ stopPolling(); dir = null; render({ running: false, state: 'idle' }); }
       };
     })();
@@ -6658,6 +7015,7 @@
 
     startBtn.addEventListener('click', doStart);
     initFolderPicker();
+    initRunningPanel();
     endBtn.addEventListener('click', doEnd);
     sendBtn.addEventListener('click', doSend);
     stopBtn.addEventListener('click', doStop);
