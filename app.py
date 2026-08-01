@@ -747,6 +747,11 @@ _DSV4_RE = re.compile(r"deepseek[-_/]?v([4-9])(?:\.\d+)?")
 # MiniMax M3 (and later) — minimax-m3, MiniMaxAI/MiniMax-M3, and morph's
 # 'minimax3' after canonicalisation. M2/M2.7 stay on their measured score.
 _MINIMAX3_RE = re.compile(r"minimax-m([3-9])(?:\.\d+)?")
+# Gemini 3.1+ (Google) — gemini-3.1, gemini-3.5-flash, models/gemini-3.6-flash,
+# google/gemini-4. Version-scaled like gpt-5.x because the user's rule is the
+# same one: a higher version number means a better model. 3.0 and 2.x are NOT
+# included — the user named 3.1 as the floor of the good ones.
+_GEMINI_VER_RE = re.compile(r"gemini-(\d+)(?:\.(\d+))?")
 # 2026-07-30: the qwen -45 demotion (_PREF_QWEN_DEMOTION) is REMOVED — qwen3 is a
 # strong family again and ranks with the top tier via Tier A + _STRONG_ROOTS.
 
@@ -1139,6 +1144,29 @@ def _benchmark_score(pid, model_id):
         score = max(score, _PREF_FLOORS[9])
     if _MINIMAX3_RE.search(low):
         score = max(score, _PREF_FLOORS[10])
+    # USER PREFERENCE 2026-08-01: "gemini flash or pro 3.1, 3.5, 3.6 and up are
+    # better than deepseek 4 / v4 — but gemini pro is better than gemini flash,
+    # of course." Two bands between glm-5.x (134) and deepseek-v4 (133.5):
+    #   pro    133.750 .. 133.940
+    #   flash  133.550 .. 133.740
+    # Both scale off the FULL version number so a newer gemini always outranks
+    # an older one (scaling on the minor alone put gemini-4.0 below gemini-3.6),
+    # and the bands cannot overlap, so pro always beats flash of ANY version.
+    # The ceiling keeps the family under glm-5.2, which the user ranked earlier
+    # and did not revisit. The bands are narrow only because they must fit
+    # between two ranks that are already set — only the ORDER inside matters.
+    #
+    # NOT included: gemini-3.0 and 2.x (the user named 3.1 as the floor), and
+    # -flash-lite, which is Google's cheapest tier and neither "flash" nor
+    # "pro" — it stays in the capped small tier where it already was.
+    _gem = _GEMINI_VER_RE.search(low)
+    _gem_floored = False
+    if _gem and "flash-lite" not in low:
+        _gver = int(_gem.group(1)) + int(_gem.group(2) or 0) / 10.0
+        if _gver >= 3.1:
+            _gbase = 133.75 if "pro" in low else 133.55
+            score = max(score, _gbase + min(_gver - 3.1, 7.6) * 0.025)
+            _gem_floored = True
     # 2026-07-30: the 2026-07-25 qwen -45 demotion is REMOVED — qwen3 is a strong
     # family per the user and ranks with the top tier (Tier A + _STRONG_ROOTS).
     if (("mistral" in low or "mixtral" in low or "ministral" in low)
@@ -1174,6 +1202,13 @@ def _benchmark_score(pid, model_id):
     # landed at 30 despite being floored to 138. Claude is exempt so the floor
     # is what actually decides, which is the whole point of setting one.
     if capped and _CLAUDE_FAMILY_RE.search(low):
+        capped = False
+    # Same reasoning for gemini 3.1+: nearly every id in that family is a
+    # '-flash' or '-flash-lite', so the cap would undo the floor on all of them
+    # and the user's "gemini 3.1/3.5/3.6+ beat deepseek 4" would silently not
+    # hold. Only the versions that EARNED the floor are exempt — gemini-3.0 and
+    # 2.x flash variants stay capped.
+    if capped and _gem_floored:
         capped = False
     if capped:
         score = min(score, 30)
@@ -3484,6 +3519,37 @@ def _session_key(messages):
         return None
 
 
+_SAME_HOST_EPS = 0.02   # headroom fractions this close count as tied
+
+
+def _pick_same_model_host(pool, pinned):
+    """Which provider should serve the pinned MODEL on this turn.
+
+    `pinned` is the (pid, model) this conversation started on. Returns a
+    (pid, model) from `pool` serving the same underlying model — preferring the
+    host with the most free budget LEFT, and choosing at random among hosts that
+    are effectively tied so the load genuinely alternates instead of always
+    landing on whichever provider happens to sort first.
+
+    Returns None when the model is no longer a live candidate at all, which is
+    the caller's signal to re-pick and re-pin from scratch.
+
+    Only same-identity hosts are ever considered, so this can never change WHICH
+    model answers — the conversation stays on identical weights, and every
+    candidate here has already passed the availability, tool-capability and
+    context-size filters that built `pool`."""
+    ident = _normalize_model_identity(pinned[1])
+    hosts = [(c[1], c[2]) for c in pool
+             if _normalize_model_identity(c[2]) == ident]
+    if not hosts:
+        return None
+    if len(hosts) == 1:
+        return hosts[0]
+    best = max(_quota_headroom(p) for p, _m in hosts)
+    tied = [h for h in hosts if _quota_headroom(h[0]) >= best - _SAME_HOST_EPS]
+    return random.choice(tied) if len(tied) > 1 else tied[0]
+
+
 def _session_pin_get(key):
     """(pid, model) pinned to this conversation, or None. Expired pins are dropped."""
     if not key:
@@ -3634,11 +3700,23 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         _skey = _session_key(messages)
         _pinned = _session_pin_get(_skey)
         if _pinned:
-            # Keep an in-progress task on the model it started on, as long as
-            # that model is still a live candidate.
-            for _c in agentic:
-                if (_c[1], _c[2]) == _pinned:
-                    return _pinned[0], _pinned[1], difficulty
+            # Keep an in-progress task on the model it started on — but pin the
+            # MODEL, not the provider. Two providers serving the SAME model id
+            # (nvidia and g4f-nvidia both list z-ai/glm-5.2; groq, nvidia,
+            # g4f-groq and g4f-nvidia all list openai/gpt-oss-120b — 94 such
+            # models are live right now) return the same weights and the same
+            # behaviour, so hopping between them costs NOTHING in coherence,
+            # which is the only reason the pin exists. Pinning the pair instead
+            # meant one long conversation drained a single provider's daily
+            # quota while an identical copy sat unused: 18 of 23 turns went to
+            # nvidia/z-ai/glm-5.2 while g4f-nvidia served the same model.
+            # Now every same-model host shares the load, so the effective daily
+            # budget for that model is the SUM of their quotas, not one of them.
+            _host = _pick_same_model_host(agentic, _pinned)
+            if _host:
+                if _host != _pinned:
+                    _session_pin_set(_skey, _host[0], _host[1])
+                return _host[0], _host[1], difficulty
         # NOTE: an "AGENTROUTER FIRST" block sat here until 2026-07-31 — it
         # tried the AgentRouter relay's paid models BEFORE the free tier on
         # every fresh coding task. It went with the relay itself (removed at
