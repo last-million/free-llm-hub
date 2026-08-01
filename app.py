@@ -23,6 +23,7 @@ import hashlib
 import hmac
 import base64
 import binascii
+import io
 import calendar
 import copy
 import ipaddress
@@ -12260,6 +12261,45 @@ def _save_generated_image(b64, prompt, pid, model):
         pass
 
 
+_WEBP_QUALITY = 82      # visually lossless for photos, ~30% of the JPEG bytes
+
+
+def _to_webp_b64(b64):
+    """Re-encode a generated image to WebP. Returns (b64, mime).
+
+    WHY IN THE HUB AND NOT IN THE BRIEF: "convert the images to WebP" written
+    as an instruction is a step a model can forget, and every provider returns
+    something different (cloudflare/flux answers JPEG, pollinations PNG). Doing
+    it here means every client — every CLI, the dashboard, a raw curl — gets
+    WebP without knowing anything about it, and the page it builds is already
+    carrying the smaller file.
+
+    Falls back to the original bytes if Pillow is missing or the re-encode
+    fails: a slightly larger image is a much better outcome than a 500."""
+    try:
+        raw = base64.b64decode(b64)
+    except (binascii.Error, ValueError):
+        return b64, "image/png"
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+        # WebP has no palette mode and only keeps alpha in RGBA — normalise
+        # first or Pillow raises on P/CMYK images from some generators.
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="WEBP", quality=_WEBP_QUALITY, method=4)
+        return base64.b64encode(buf.getvalue()).decode("ascii"), "image/webp"
+    except Exception:
+        # Unknown/broken format, or Pillow built without WebP. Report the mime
+        # HONESTLY rather than claiming webp for bytes that are not.
+        if raw[:8] == b"\x89PNG\r\n\x1a\n":
+            return b64, "image/png"
+        if raw[:3] == b"\xff\xd8\xff":
+            return b64, "image/jpeg"
+        return b64, "image/png"
+
+
 @app.route("/v1/images/generations", methods=["POST"])
 def v1_images_generations():
     body = request.get_json(force=True, silent=True)
@@ -12345,10 +12385,15 @@ def v1_images_generations():
         else:
             break
 
+    # WebP on the way out, so every consumer gets the smaller file without
+    # having to ask for it. `mime` is an extra field the OpenAI shape does not
+    # define — clients that don't know it ignore it, and ours uses it instead of
+    # assuming image/png (which was wrong for every JPEG we have ever returned).
+    converted = [_to_webp_b64(b) for b in images_b64]
     return jsonify({
         "created": int(time.time()),
         "model": landed_pid + "/" + landed_model,
-        "data": [{"b64_json": b} for b in images_b64],
+        "data": [{"b64_json": b, "mime": m} for b, m in converted],
     }), 200
 
 

@@ -4,3 +4,7 @@
 # to an open lower bound.
 flask==3.0.3
 requests==2.34.2
+# WebP re-encoding of generated images (app.py _to_webp_b64). Optional at
+# runtime -- the hub falls back to the generator's own format if it is
+# missing -- but pinned here so every install actually gets WebP.
+Pillow==10.2.0
