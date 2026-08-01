@@ -10,11 +10,15 @@
 # from ~/.free-llm-hub. A system-wide unit would run as another user and could
 # not see them.
 #
-#   ./autostart.sh           install (or refresh)
-#   ./autostart.sh remove    uninstall
-#   ./autostart.sh status    show current state
+#   ./run.sh autostart           install (or refresh)
+#   ./run.sh autostart remove    uninstall
+#   ./run.sh autostart status    show current state
 set -e
-cd "$(dirname "$0")"
+# Lives in scripts/ so the project root holds exactly ONE runnable .sh
+# (run.sh). Every path it writes -- the unit file, the plist -- points at the
+# ROOT, so climb out of this folder first. Normally reached as
+# `./run.sh autostart`; running it directly still works.
+cd "$(dirname "$0")/.."
 HERE="$(pwd)"
 PORT="${PORT:-8787}"
 LABEL="com.calvoun.free-llm-hub"
@@ -23,7 +27,7 @@ ACTION="${1:-install}"
 case "$(uname -s)" in
   Darwin) PLATFORM=macos ;;
   Linux)  PLATFORM=linux ;;
-  *)      echo "ERROR: unsupported platform $(uname -s). On Windows use autostart.bat." >&2; exit 1 ;;
+  *)      echo "ERROR: unsupported platform $(uname -s). On Windows use run.bat autostart." >&2; exit 1 ;;
 esac
 
 # --------------------------------------------------------------------------- #
@@ -70,7 +74,7 @@ EOF
   echo
   echo "  Survive logout too:  sudo loginctl enable-linger $USER"
   echo "  Logs:                journalctl --user -u free-llm-hub -f"
-  echo "  Remove:              ./autostart.sh remove"
+  echo "  Remove:              ./run.sh autostart remove"
   exit 0
 fi
 
@@ -117,4 +121,4 @@ echo "  Installed (launchd agent). Starts at login, restarts on crash."
 echo "  Dashboard: http://127.0.0.1:$PORT"
 echo
 echo "  Logs:   /tmp/free-llm-hub.log  and  /tmp/free-llm-hub.err"
-echo "  Remove: ./autostart.sh remove"
+echo "  Remove: ./run.sh autostart remove"

@@ -25,14 +25,18 @@ rem `/SC MINUTE` and the Startup folder do not. That is the whole reason for the
 rem two-part design.
 rem
 rem Safe to re-run. Usage:
-rem   autostart.bat            install (or refresh)
-rem   autostart.bat remove     uninstall
-rem   autostart.bat status     show current state
+rem   run.bat autostart            install (or refresh)
+rem   run.bat autostart remove     uninstall
+rem   run.bat autostart status     show current state
 setlocal EnableDelayedExpansion
-cd /d "%~dp0"
+rem This lives in scripts\ so the project root holds exactly ONE clickable .bat
+rem (run.bat). Everything it writes -- the logon launcher, the scheduled task --
+rem points at the ROOT, so HERE has to climb out of this folder. Normally you
+rem reach it as `run.bat autostart`; running it directly still works.
+cd /d "%~dp0.."
 
 set "TASK=CalvounFreeLLMHub"
-set "HERE=%~dp0"
+set "HERE=%CD%"
 if "%HERE:~-1%"=="\" set "HERE=%HERE:~0,-1%"
 set "STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
 set "LAUNCHER=%STARTUP%\CalvounFreeLLMHub.vbs"
@@ -42,7 +46,7 @@ if /i "%~1"=="status" goto :status
 
 rem --- 1. logon launcher (silent, no admin) ---
 > "%LAUNCHER%" echo ' Calvoun Free LLM Hub - starts the local gateway at logon.
->> "%LAUNCHER%" echo ' Delete this file (or run autostart.bat remove) to disable.
+>> "%LAUNCHER%" echo ' Delete this file (or run run.bat autostart remove) to disable.
 >> "%LAUNCHER%" echo Set sh = CreateObject("WScript.Shell")
 >> "%LAUNCHER%" echo ' run-hidden.vbs supervised: hidden window, no-op while the
 >> "%LAUNCHER%" echo ' intentional-stop flag exists (a dashboard stop stays stopped).
@@ -71,7 +75,7 @@ echo   Installed. The hub starts at logon and recovers within 5 min if it dies.
 echo   Dashboard: http://127.0.0.1:8787
 echo.
 echo   Start it right now:  schtasks /Run /TN "%TASK%"
-echo   Remove everything:   autostart.bat remove
+echo   Remove everything:   run.bat autostart remove
 goto :eof
 
 :remove
