@@ -2154,6 +2154,7 @@
           <select id="agent-cli" aria-label="Agent CLI">
             <option value="claude">Claude Code &mdash; recommended</option>
             <option value="codex">ChatGPT Codex</option>
+            <option value="opencode">OpenCode</option>
           </select>
           <span class="agent-cli-note" id="agent-cli-note"></span>
         </div>
@@ -5777,16 +5778,22 @@
      outright, so the <option> itself is disabled (not just badged "experimental") and the Start
      button is guarded defensively too; see agentic_chat.py's _SUPPORT table for the real reason,
      shown verbatim via the option's title + the note line below the picker. */
+  /* One place naming the CLIs. It used to be a hardcoded ['claude','codex']
+     list plus two separate ternaries for the label, so adding a third CLI
+     meant finding all three -- and missing one leaves an <option> that never
+     gets its state (installed / isolated / unavailable) filled in. */
+  var CLI_LABEL = { claude: 'Claude Code', codex: 'ChatGPT Codex', opencode: 'OpenCode' };
+
   function renderCliPicker(){
     var sel = $('#agent-cli');
     var note = $('#agent-cli-note');
     if (!sel) return;
     var clis = agentState.clis || {};
-    ['claude', 'codex'].forEach(function(id){
+    Object.keys(CLI_LABEL).forEach(function(id){
       var opt = sel.querySelector('option[value="' + id + '"]');
       if (!opt) return;
       var info = clis[id] || {};
-      var base = id === 'claude' ? 'Claude Code' : 'ChatGPT Codex';
+      var base = CLI_LABEL[id];
       opt.disabled = info.supported === false;
       /* Say which copy a session would actually RUN. "isolated" means the hub's
          own install under ~/.free-llm-hub/isolated-clis, with its own config
@@ -5829,7 +5836,7 @@
     }
     if (startBtn) startBtn.disabled = false;
     if (info.installed === false){
-      var installLabel = sel.value === 'claude' ? 'Claude Code' : 'ChatGPT Codex';
+      var installLabel = CLI_LABEL[sel.value] || sel.value;
       note.className = 'agent-cli-note warn';
       note.innerHTML = esc(installLabel + ' isn’t installed yet.') +
         ' <button type="button" class="btn sm" id="agent-cli-install">Install ' + esc(installLabel) + '</button>';
@@ -5844,11 +5851,15 @@
   function doAgentCliInstall(cliId, btn, note){
     if (btn.disabled) return;
     var label = btn.textContent;
-    var installProvider = cliId === 'claude' ? 'sub-claude' : 'sub-codex';
     busyBtn(btn, 'Installing…');
-    api('/api/subscriptions/' + encodeURIComponent(installProvider) + '/install-isolated', { method: 'POST' })
+    /* Goes through the agent-CLI route, not /api/subscriptions/sub-*: that
+       one only covers CLIs which ARE subscription providers, so opencode --
+       which brings its own -- had no install button at all. This one installs
+       any CLI the agent chat can drive, on the machine AND as the hub's own
+       isolated copy. */
+    api('/api/agent/clis/' + encodeURIComponent(cliId) + '/install', { method: 'POST' })
       .then(function(){
-        toast((cliId === 'claude' ? 'Claude Code' : 'ChatGPT Codex') + ' isolated copy installed');
+        toast((CLI_LABEL[cliId] || cliId) + ' installed');
         return loadAgentSettings(true);
       })
       .catch(function(e){ toast('Install failed: ' + e.message, true); resetBtn(btn, label); });

@@ -33,6 +33,7 @@ returns a fixed argv list and never a shell string.
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -117,6 +118,107 @@ def detect(project_dir):
     raise WorkspaceError(
         "nothing runnable in this folder — no package.json, no app.py/main.py, "
         "no index.html")
+
+
+# --------------------------------------------------------------------------- #
+# What this project needs installed, and where to get it
+# --------------------------------------------------------------------------- #
+
+# A beginner asked to install "Node" has to know what that is and which of the
+# five buttons on the page to press. Naming the tool without a link is only
+# half an answer, so every entry carries one.
+TOOL_HINTS = {
+    "node": ("Node.js", "https://nodejs.org/en/download",
+             "runs JavaScript projects — Next.js, React, Vite, Express"),
+    "npm":  ("npm (comes with Node.js)", "https://nodejs.org/en/download",
+             "installs this project's packages"),
+    "git":  ("Git", "https://git-scm.com/downloads",
+             "clones repositories and tracks changes"),
+    "python": ("Python", "https://www.python.org/downloads/",
+               "runs Python projects"),
+}
+
+
+def missing_tools(project_dir):
+    """Which tools this project needs that this machine does not have.
+
+    Returns [{tool, name, url, why, needed_for}] -- empty when nothing is
+    missing. Read-only: looks at the project's own files and at PATH, runs
+    nothing, installs nothing.
+
+    The point is the message, not the check: a project that needs Node on a
+    machine without it fails with something like "[WinError 2] The system
+    cannot find the file specified", which tells a beginner nothing at all."""
+    project_dir = os.path.abspath(project_dir or "")
+    need = []                                   # [(tool, needed_for)]
+
+    pkg = _read_json(os.path.join(project_dir, "package.json"))
+    if isinstance(pkg, dict):
+        deps = {}
+        for key in ("dependencies", "devDependencies"):
+            if isinstance(pkg.get(key), dict):
+                deps.update(pkg[key])
+        # Name the framework, not just "a JavaScript project" -- someone who
+        # typed "build me a Next.js site" recognises Next.js.
+        for dep, label in (("next", "Next.js"), ("nuxt", "Nuxt"),
+                           ("vite", "Vite"), ("react", "React"),
+                           ("@angular/core", "Angular"), ("svelte", "Svelte")):
+            if dep in deps:
+                need.append(("node", label))
+                break
+        else:
+            need.append(("node", "this project"))
+        need.append(("npm", "installing its packages"))
+
+    if os.path.isdir(os.path.join(project_dir, ".git")):
+        need.append(("git", "this project's version history"))
+
+    for entry in ("requirements.txt", "app.py", "main.py", "manage.py"):
+        if os.path.isfile(os.path.join(project_dir, entry)):
+            need.append(("python", "this project"))
+            break
+
+    out, seen = [], set()
+    for tool, needed_for in need:
+        if tool in seen or tool not in TOOL_HINTS:
+            continue
+        seen.add(tool)
+        if _tool_present(tool):
+            continue
+        # npm ships INSIDE Node, so listing both sends someone to the same page
+        # twice and reads like two separate problems.
+        if tool == "npm" and any(m["tool"] == "node" for m in out):
+            continue
+        name, url, why = TOOL_HINTS[tool]
+        out.append({"tool": tool, "name": name, "url": url,
+                    "why": why, "needed_for": needed_for})
+    return out
+
+
+def _tool_present(tool):
+    if tool == "python":
+        # We ARE Python; a project's own venv is created from this interpreter.
+        return True
+    if tool == "npm":
+        return bool(shutil.which("npm") or shutil.which("npm.cmd"))
+    return bool(shutil.which(tool))
+
+
+def missing_tools_message(project_dir):
+    """The same thing as one plain-language block, or None.
+
+    Printed into the conversation, so it is written to be read by someone who
+    has never installed a toolchain: what is missing, what it is for, and the
+    exact page to download it from."""
+    missing = missing_tools(project_dir)
+    if not missing:
+        return None
+    lines = ["This project needs something that is not installed on this computer yet:"]
+    for m in missing:
+        lines.append("  • %s — %s (needed for %s)" % (m["name"], m["why"], m["needed_for"]))
+        lines.append("    Download: %s" % m["url"])
+    lines.append("Install it, then reopen this project — nothing else here changes.")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
