@@ -43,14 +43,18 @@ WEB_DESIGN = """WEB DESIGN BRIEF (apply unless the user says otherwise)
 - Responsive: mobile-first, no horizontal scroll, tap targets >=44px, images with width/height so nothing shifts.
 ANTI (these read as AI-made): centred hero + 3 identical feature cards + generic gradient blob; "Elevate/Unlock/Seamless/Empower" copy; stock-photo grids; emoji as icons; a testimonial or statistic you invented."""
 
-SEO = """SEO BRIEF (apply unless the user says otherwise)
+SEO = """SEO BRIEF (build every page this way — do not wait to be asked for SEO)
 - One page = one intent = one primary keyword. Do not write a page you cannot name the query for.
-- Title <=60 chars with the term near the front; meta description written to earn the click, not to repeat the title. One H1, headings in real order, no skipped levels.
-- Internal links with descriptive anchor text; the same anchor must not point to two different URLs.
-- Technical: canonical, indexable, real status codes, image alt text, sitemap, fast LCP, CLS<0.1.
-- Schema only for what is genuinely on the page (Article/Product/FAQ/LocalBusiness).
-- E-E-A-T: name the author, cite sources, show real specifics.
-ANTI: keyword stuffing, thin doorway pages, invented statistics, fabricated reviews or ratings, schema that does not match visible content, "in today's fast-paced world" openers."""
+- Title 30-60 chars, term near the front, unique per page. Meta description 120-160 chars, written to earn the click, not to repeat the title. One H1, headings in real order, no skipped levels.
+- Put the primary term in the title, H1, URL slug, meta description, first 100 words and at least one image alt — NOT in every H2/H3.
+- Internal links: descriptive anchors, 3-5 per 1000 words, no orphan pages, important pages within 3 clicks of home. The same anchor must not point to two different URLs.
+- Server-render title, meta description, canonical, robots and JSON-LD into the initial HTML. AI crawlers do not run JavaScript, and Google will not render JS on a non-200 response.
+- Vitals: LCP <=2.5s, INP <=200ms, CLS <0.1 (75th percentile field data). INP replaced FID — never cite FID.
+- Schema: JSON-LD only, absolute URLs, only for what is genuinely on the page (Article/Product/LocalBusiness/QAPage). Never HowTo (rich results removed 2023). FAQPage no longer earns a rich result (retired for all sites 2026-05-07) — use QAPage for genuine Q&A.
+- Sitemap: <=50,000 URLs and <=50MB; drop <priority> and <changefreq> (Google ignores both); honest <lastmod>; never list noindex, redirected or non-canonical URLs.
+- Written for AI answers as well as blue links: answer the question in the first 40-60 words of a section, keep self-contained ~150-word answer blocks near the top, question-based H2s, visible published + updated dates.
+- E-E-A-T: name the author, cite sources, show real specifics. Google's test is Who / How / Why.
+ANTI: keyword stuffing, thin doorway pages, invented statistics, fabricated reviews or ratings, schema that does not match visible content, selling llms.txt as a ranking lever (Google ignores it), "in today's fast-paced world" openers."""
 
 ECOMMERCE = """E-COMMERCE BRIEF (apply unless the user says otherwise)
 - Product page order: image, name, price, variant, add-to-cart above the fold; then trust (shipping, returns, stock), then detail.
@@ -93,12 +97,18 @@ IMAGES = """IMAGES — YOU HAVE A LOCAL GENERATOR, ASK FIRST (any task that will
   1. FREE STOCK — real photos, no copyright issue (Unsplash/Pexels source URLs). Best for real faces, food, places, anything that must look authentically photographed.
   2. GENERATED — made here from your prompt, unique to this project, no attribution and no licence question. Best for hero art, backgrounds, illustrations, icons, textures, anything abstract or brand-specific.
   3. BOTH — stock for photographic content, generated for hero/abstract/brand art. Usually the right answer for a real site.
-- Generate with a plain HTTP call, no API key:
+- Generate with a plain HTTP call, no API key. The hub returns WebP already and reports the type in `mime`:
   curl -s -X POST http://127.0.0.1:8787/v1/images/generations -H "Content-Type: application/json" -d '{"prompt":"YOUR PROMPT","n":1,"size":"1024x1024"}' > out.json
-  then write the file with the RIGHT extension (it is often JPEG, not PNG — do not hardcode .png):
-  python -c "import json,base64,urllib.request as u;d=json.load(open('out.json'))['data'][0];s=d.get('b64_json') or '';b=base64.b64decode(s) if s else u.urlopen(d['url']).read();e='png' if b[1:4]==bytes([80,78,71]) else 'webp' if b[8:12]==b'WEBP' else 'jpg';p='img/hero.'+e;open(p,'wb').write(b);print(p)"
-  (the response carries b64_json OR url depending on which model served it — the line above handles both and prints the path it wrote)
-- Omit "model" and the hub picks the best free one available. Write real files into the project (img/ or assets/), reference them with relative paths, and give every one width, height and honest alt text.
+  python -c "import json,base64,urllib.request as u;d=json.load(open('out.json'))['data'][0];s=d.get('b64_json') or '';b=base64.b64decode(s) if s else u.urlopen(d['url']).read();e=(d.get('mime') or '').split('/')[-1].replace('jpeg','jpg') or 'webp';p='img/hero.'+e;open(p,'wb').write(b);print(p)"
+  (handles the b64_json and url shapes, names the file from the real type, prints the path it wrote)
+- EVERY image ships as WebP, generated or stock. Generated ones already are. Convert anything you download (pip install Pillow if needed):
+  python -c "from PIL import Image;import sys;i=Image.open(sys.argv[1]);i.convert('RGBA' if 'A' in i.getbands() else 'RGB').save(sys.argv[2],'WEBP',quality=82)" in/photo.jpg img/photo.webp
+  A plain <img src="*.webp"> is correct — every current browser takes it. Add a <picture> fallback only if the project must support pre-2020 browsers.
+- Omit "model" and the hub picks the best free one available. Write real files into the project (img/ or assets/) and reference them with relative paths.
+- Ship every <img> correctly, this is where image SEO is actually won:
+  width + height on every one (or CSS aspect-ratio) so nothing shifts; alt 10-125 chars describing the content, alt="" for purely decorative; descriptive-hyphenated-lowercase filenames (blue-running-shoes.webp, never IMG_1234); srcset + sizes at 400w/800w/1200w when the image is large.
+  The hero/LCP image gets fetchpriority="high" and must NEVER be loading="lazy" — lazy-loading above the fold directly harms LCP. Everything below the fold gets loading="lazy" decoding="async".
+  Size budget: thumbnails <50KB, content images <100KB, hero <200KB.
 - Prompt like a photographer, not a keyword list: subject, setting, light, lens/mood. "warm rustic italian dining room, evening window light, shallow depth of field" beats "restaurant image nice".
 ANTI: hotlinking a stock URL you never checked resolves; source.unsplash.com/random (it is retired and returns nothing); the same generic gradient for every section; inventing a photographer credit; shipping a page whose images 404."""
 
@@ -127,9 +137,6 @@ _BRIEFS = [
     ("ecommerce", re.compile(
         r"\be-?commerce\b|\bonline store\b|\bstorefront\b|\bshopping cart\b|\bcheckout\b|"
         r"\bproduct page\b|\bshopify\b|\bstripe checkout\b", re.I), ECOMMERCE),
-    ("seo", re.compile(
-        r"\bseo\b|\bsearch engine optimi[sz]\w*\b|\bserp\b|\bmeta description\b|"
-        r"\bkeyword research\b|\bschema markup\b|\bbacklink\b", re.I), SEO),
     ("web_design", re.compile(
         r"\blanding page\b|\bweb ?site\b|\bwebpage\b|\bweb design\b|\bui design\b|"
         r"\bhero section\b|\bredesign\b|\bstyle the\b|\btailwind\b|\bfront[- ]?end\b", re.I),
@@ -145,7 +152,33 @@ _BRIEFS = [
         re.I), PROGRAMMING),
 ]
 
-MAX_BRIEFS = 2          # two is plenty; more is just context tax
+MAX_BRIEFS = 2          # two DOMAIN briefs is plenty; more is just context tax
+
+# ORTHOGONAL briefs. These are not competing views of the same task, so they do
+# not fight the domain briefs for a slot — they ride along whenever they apply.
+#
+# Both earned it the same way: ranked as domains they lose exactly when they are
+# needed most. "Build a restaurant website" spends both slots on
+# web_design/landing, and that is the request where the model announced it had
+# no image tool and reached for Unsplash, and where nobody said the word "SEO"
+# yet every page still has to rank. The user's instruction is explicit: images
+# always WebP, websites SEO-optimised already.
+#
+# Their triggers therefore include plain build nouns, not just topic words. Pure
+# code tasks ("refactor the auth module") still match neither and pay nothing.
+_SITE_NOUNS = (r"\bweb ?site\b|\bwebpage\b|\bhomepage\b|\blanding page\b|"
+               r"\bportfolio\b|\bonline store\b|\bstorefront\b|\be-?commerce\b|"
+               r"\bblog\b|\brestaurant\b")
+
+_SEO_RE = re.compile(
+    r"\bseo\b|\bsearch engine optimi[sz]\w*\b|\bserp\b|\bmeta description\b|"
+    r"\bkeyword research\b|\bschema markup\b|\bbacklink\b|"
+    r"\brank(?:ing)?\b|\bsitemap\b|\bcore web vitals\b|" + _SITE_NOUNS, re.I)
+
+_ORTHOGONAL = [
+    ("seo", _SEO_RE, SEO),
+    ("images", _IMAGES_RE, IMAGES),
+]
 
 
 def match(text):
@@ -161,14 +194,9 @@ def match(text):
             out.append((name, brief))
             if len(out) >= MAX_BRIEFS:
                 break
-    # IMAGES is ORTHOGONAL to the domain briefs and does not count against
-    # MAX_BRIEFS. Ranked as a domain it would lose every time — "build a
-    # restaurant website" already spends both slots on web_design/landing — and
-    # that is exactly the request where the model announced it had no image tool
-    # and silently fell back to Unsplash. It is also the one brief that carries a
-    # CAPABILITY the model cannot discover on its own: the local endpoint.
-    if _IMAGES_RE.search(text):
-        out.append(("images", IMAGES))
+    for name, rx, brief in _ORTHOGONAL:
+        if rx.search(text):
+            out.append((name, brief))
     return out
 
 
