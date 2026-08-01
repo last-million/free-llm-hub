@@ -17,6 +17,21 @@ import app
 import workspace
 
 
+@pytest.fixture(autouse=True)
+def _no_os_ownership(monkeypatch):
+    """Neutralise the OS ownership check by default.
+
+    workspace asks the operating system which folder the process on a port is
+    running in. That is the right answer in production and the wrong input for
+    a test: a dev server this machine happens to be running on :3000 would
+    decide the result. Tests that care about ownership patch it themselves --
+    this fixture only removes the machine from the equation. `_served_title`
+    goes with it: it makes a real HTTP call, so without this a dev server the
+    machine happens to be running decides whether adopt() accepts."""
+    monkeypatch.setattr(workspace, "_port_owner_dir", lambda port: None)
+    monkeypatch.setattr(workspace, "_served_title", lambda port, timeout=1.5: None)
+
+
 @pytest.fixture
 def proj():
     """Own temp dir, not pytest's `tmp_path`: the tmp_path factory raises
@@ -520,7 +535,8 @@ def test_discovery_finds_a_serving_dev_port(proj, no_adopted, monkeypatch):
     # The project must be RUNNABLE for discovery to act on its behalf: an empty
     # folder cannot be serving anything, so a scan for it could only ever find
     # someone else's server. See test_an_empty_project_never_adopts_anything.
-    open(os.path.join(proj, "index.html"), "w").write("<html><body>x</body></html>")
+    open(os.path.join(proj, "index.html"), "w").write("<title>Serving Dev Port</title>")
+    monkeypatch.setattr(workspace, "_serves_fingerprint", lambda p, w, timeout=1.5: True)
     monkeypatch.setattr(workspace, "_port_open", lambda p: p == 5173)
     monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: port == 5173)
     assert workspace.discover(proj) == 5173
@@ -570,7 +586,7 @@ def test_a_port_another_project_owns_is_left_alone(no_adopted, monkeypatch):
     b = tempfile.mkdtemp(prefix="hubws-b-")
     try:
         for d in (a, b):
-            open(os.path.join(d, "index.html"), "w").write("<html><body>x</body></html>")
+            open(os.path.join(d, "index.html"), "w").write("<title>Shared Title</title>")
         monkeypatch.setattr(workspace, "_port_open", lambda p: p == 3000)
         monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
         monkeypatch.setattr(workspace, "_serves_fingerprint", lambda p, w, timeout=1.5: True)
@@ -620,16 +636,148 @@ def test_fingerprint_looks_in_the_usual_build_folders(proj):
 
 
 def test_a_project_with_no_title_still_works(proj, no_adopted, monkeypatch):
-    """No fingerprint means we fall back to the old behaviour rather than
-    refusing to discover anything at all."""
-    open(os.path.join(proj, "index.html"), "w").write("<html><body>no title</body></html>")
-    assert workspace._fingerprint(proj) is None
-    monkeypatch.setattr(workspace, "_port_open", lambda p: p == 8080)
-    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: port == 8080)
-    assert workspace.discover(proj) == 8080
+    """Contract CHANGED, deliberately: with neither signal available -- the OS
+    cannot say who owns the port, and the project ships no title to compare --
+    a scan proves nothing, so it declines instead of adopting on a guess. That
+    guess is the reported bug: a project with no HTML of its own picked up the
+    previous project's server. Nothing is lost, because a project we cannot
+    identify a server for is one we can simply start ourselves."""
+    open(os.path.join(proj, "index.html"), "w").write("<h1>no title here</h1>")
+    monkeypatch.setattr(workspace, "_port_open", lambda p: p == 3000)
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: port == 3000)
+    assert workspace.discover(proj) is None
+
+    # ...unless the OS confirms the server really is running in this folder.
+    monkeypatch.setattr(workspace, "_port_owner_dir", lambda port: proj)
+    assert workspace.discover(proj) == 3000
 
 
 def test_an_unreadable_port_is_not_adopted(monkeypatch):
     """Fail CLOSED: an uncertain scan declines rather than showing the wrong
     project."""
     assert workspace._serves_fingerprint(59999, "anything") is False
+
+
+# --- adopt(): the agent NAMING a url is not proof the url is its own ---------
+
+def test_adopt_refuses_a_port_another_project_is_previewing(proj, no_adopted, monkeypatch):
+    """Reported: a finished session showed a PREVIOUS project's app (a pizza
+    site in an unrelated project's preview). The agent printed a localhost url
+    it had not started, and adopt took it at its word."""
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    owner = os.path.join(proj, "owner"); other = os.path.join(proj, "other")
+    os.makedirs(owner); os.makedirs(other)
+    workspace.adopt(owner, "http://127.0.0.1:3000", source="agent")
+    with pytest.raises(workspace.WorkspaceError) as e:
+        workspace.adopt(other, "http://127.0.0.1:3000", source="agent")
+    assert "already the preview" in str(e.value)
+
+
+def test_adopt_refuses_a_port_serving_a_different_projects_title(proj, no_adopted, monkeypatch):
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    monkeypatch.setattr(workspace, "_served_title", lambda port, timeout=1.5: "Pizza Napoli")
+    proj = os.path.join(proj, "resto"); os.makedirs(proj)
+    open(os.path.join(proj, "index.html"), "w").write("<title>Fez Restaurant</title>")
+    with pytest.raises(workspace.WorkspaceError) as e:
+        workspace.adopt(proj, "http://127.0.0.1:3000", source="agent")
+    assert "not this project" in str(e.value)
+
+
+def test_adopt_fails_OPEN_when_the_port_cannot_be_read(proj, no_adopted, monkeypatch):
+    """Opposite bias to discover(): the agent naming a url IS evidence, so
+    silence must not override it -- only a title that positively belongs to
+    someone else does."""
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    monkeypatch.setattr(workspace, "_served_title", lambda port, timeout=1.5: None)
+    proj = os.path.join(proj, "app"); os.makedirs(proj)
+    open(os.path.join(proj, "index.html"), "w").write("<title>My Site</title>")
+    assert workspace.adopt(proj, "http://127.0.0.1:3000", source="agent")["running"] is True
+
+
+def test_adopt_still_works_for_the_same_project_twice(proj, no_adopted, monkeypatch):
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    proj = os.path.join(proj, "same"); os.makedirs(proj)
+    workspace.adopt(proj, "http://127.0.0.1:3000", source="agent")
+    assert workspace.adopt(proj, "http://127.0.0.1:3000", source="agent")["port"] == 3000
+
+
+# --- shutdown(): ending a session ends the app it started -------------------
+
+def test_shutdown_kills_the_adopted_app_and_stop_does_not(proj, no_adopted, monkeypatch):
+    """stop() is a button labelled "Stop preview" -- it must not kill a process
+    it did not start. Ending the SESSION is a different promise."""
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    killed = []
+    monkeypatch.setattr(workspace, "_kill_listener", lambda port: killed.append(port) or True)
+    proj = os.path.join(proj, "app2"); os.makedirs(proj)
+
+    workspace.adopt(proj, "http://127.0.0.1:3000", source="agent")
+    workspace.stop(proj)
+    assert killed == [], "Stop preview killed a server it did not start"
+
+    workspace.adopt(proj, "http://127.0.0.1:3000", source="agent")
+    workspace.shutdown(proj)
+    assert killed == [3000], "ending the session left the app holding the port"
+
+
+def test_shutdown_never_kills_the_hub_or_our_own_port_range(proj, no_adopted, monkeypatch):
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    killed = []
+    monkeypatch.setattr(workspace, "_kill_listener", lambda port: killed.append(port) or True)
+    proj = os.path.join(proj, "app3"); os.makedirs(proj)
+    inside = workspace.PORT_RANGE[0]
+    workspace.adopt(proj, "http://127.0.0.1:%d" % inside, source="agent")         if False else None                      # adopt refuses that range outright
+    workspace._adopted[os.path.abspath(proj)] = {
+        "url": "http://127.0.0.1:%d" % inside, "port": inside,
+        "since": 0, "touched_at": 0, "source": "agent"}
+    workspace.shutdown(proj)
+    assert killed == [], "shutdown killed a port the hub hands out itself"
+
+
+def test_sweep_reclaims_ports_left_by_a_previous_hub(monkeypatch):
+    """99 of the 100 preview ports were held by orphaned servers on this
+    machine -- every preview that ever outlived the hub that spawned it. The
+    next start then fails with "no free port"."""
+    held = {workspace.PORT_RANGE[0], workspace.PORT_RANGE[0] + 3}
+    killed = []
+    monkeypatch.setattr(workspace, "_port_open", lambda p: p in held)
+    monkeypatch.setattr(workspace, "_kill_listener", lambda p: killed.append(p) or True)
+    assert workspace.sweep_own_range() == 2
+    assert set(killed) == held, "swept a port nothing was holding"
+
+
+def test_discovery_identifies_a_project_that_ships_no_html_at_all(proj, no_adopted, monkeypatch):
+    """The reported project was an Express app: no index.html, no <title> in
+    any file. Content checks are blind to it, so ownership has to come from the
+    OS -- the process on that port is running IN the project folder."""
+    open(os.path.join(proj, "package.json"), "w").write('{"scripts": {"dev": "node src/server.js"}}')
+    monkeypatch.setattr(workspace, "_port_open", lambda p: p == 3000)
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: port == 3000)
+    monkeypatch.setattr(workspace, "_port_owner_dir", lambda port: proj)
+    assert workspace.discover(proj) == 3000
+
+
+def test_discovery_skips_a_port_served_from_a_different_folder(proj, no_adopted, monkeypatch):
+    """The exact reported failure: a finished project showed the PREVIOUS
+    project's app because something was merely listening on :3000."""
+    open(os.path.join(proj, "package.json"), "w").write('{"scripts": {"dev": "node src/server.js"}}')
+    monkeypatch.setattr(workspace, "_port_open", lambda p: p == 3000)
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: port == 3000)
+    monkeypatch.setattr(workspace, "_port_owner_dir", lambda port: os.path.join(proj, "..", "other-project"))
+    assert workspace.discover(proj) is None
+
+
+def test_adopt_refuses_a_url_served_from_another_folder(proj, no_adopted, monkeypatch):
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    monkeypatch.setattr(workspace, "_port_owner_dir",
+                        lambda port: os.path.join(proj, "..", "pizza-app"))
+    mine = os.path.join(proj, "mine"); os.makedirs(mine)
+    with pytest.raises(workspace.WorkspaceError) as e:
+        workspace.adopt(mine, "http://127.0.0.1:3000", source="agent")
+    assert "not from this project" in str(e.value)
+
+
+def test_adopt_accepts_a_server_running_inside_the_project(proj, no_adopted, monkeypatch):
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    monkeypatch.setattr(workspace, "_port_owner_dir", lambda port: os.path.join(proj, "src"))
+    assert workspace.adopt(proj, "http://127.0.0.1:3000", source="agent")["port"] == 3000

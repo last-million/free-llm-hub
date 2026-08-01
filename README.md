@@ -17,15 +17,47 @@ Drop this folder anywhere, run one command, open the dashboard, paste a couple o
 
 ---
 
-## Get the code (one command)
+## Start here — download, then run one file
+
+**1. Download it**
+
+| How | What to do |
+| --- | --- |
+| **Download the ZIP** (no tools needed) | **[Download free-llm-hub (.zip)](https://github.com/last-million/free-llm-hub/archive/refs/heads/main.zip)** — then unzip it anywhere |
+| **Or clone with git** | `git clone https://github.com/last-million/free-llm-hub.git` |
+
+Repository: **<https://github.com/last-million/free-llm-hub>**
+
+**2. Run the file for your system** — open the folder you just unzipped and run:
+
+| Your system | Run this file | How |
+| --- | --- | --- |
+| **Windows** | **`run.bat`** | Double-click it, or type `run.bat` in cmd / PowerShell |
+| **Linux / macOS** | **`run.sh`** | `chmod +x run.sh` once, then `./run.sh` |
+
+That is the whole install. The script creates its own virtualenv on first run,
+installs the two dependencies (Flask + requests), and starts the gateway. You
+need Python 3.9+ on the machine; nothing else.
+
+**3. Open the dashboard**
+
+```
+http://127.0.0.1:8787
+```
+
+The terminal prints a **control token** on first start — paste it into the
+dashboard once, and add your free provider keys there (Step 1 below).
+
+<sub>Do not run `run.sh` on Windows or `run.bat` on Linux — each script only
+does the right thing on the system it belongs to.</sub>
+
+---
+
+## Quickstart (the same thing, as commands)
 
 ```bash
 git clone https://github.com/last-million/free-llm-hub.git && cd free-llm-hub
 ```
-
-## Quickstart (one command)
-
-Pick the command for your OS — it creates a virtualenv on first run, installs the two dependencies, and starts the gateway. Nothing to choose manually: `run.bat` is Windows, `run.sh` is Linux/macOS, and each only ever does the right thing for the machine it's run on.
 
 **Windows** (cmd or PowerShell)
 

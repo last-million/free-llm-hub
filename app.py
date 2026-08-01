@@ -5560,8 +5560,21 @@ def api_activity():
 @app.route("/")
 def index():
     try:
-        return render_template("index.html", csp_nonce=getattr(g, "csp_nonce", ""),
-                                control_token=config.ensure_control_token())
+        page = make_response(
+            render_template("index.html", csp_nonce=getattr(g, "csp_nonce", ""),
+                            control_token=config.ensure_control_token()))
+        # The dashboard is one file: markup, styles and ALL of its JavaScript.
+        # Flask sends it with no freshness headers, so a browser is free to keep
+        # serving the copy it already has -- and a kept copy keeps running the
+        # code that shipped with it. That produced console errors from code
+        # paths which no longer exist in the file on disk (a srcdoc fallback
+        # removed hours earlier still throwing CSP violations), which is a
+        # miserable thing to debug: the source says one thing, the browser does
+        # another. Restarting the hub must mean the next load runs the current
+        # build. It is a single local request, so there is nothing to save by
+        # caching it.
+        page.headers["Cache-Control"] = "no-store, must-revalidate"
+        return page
     except TemplateNotFound:
         return (
             "<h1>Calvoun Free LLM Hub</h1>"
@@ -7517,8 +7530,22 @@ def api_agent_stop_session(session_id):
 
 @app.route("/api/agent/sessions/<session_id>", methods=["DELETE"])
 def api_agent_end_session(session_id):
+    # Take the folder BEFORE ending: end_session drops the registry entry, and
+    # after that there is nothing left to say which project this session owned.
+    sess = agentic_chat.get_session(session_id)
+    project_dir = getattr(sess, "project_dir", None) if sess else None
     ended = agentic_chat.end_session(session_id)
-    return jsonify({"ended": ended})
+    # Ending a session ends the app it started. A dev server left holding :3000
+    # after its session is gone is a leak the user has to clear by hand -- and
+    # worse, the next project then finds that port busy or, until the ownership
+    # guards landed, showed its site in the new project's preview.
+    closed = False
+    if ended and project_dir:
+        try:
+            closed = workspace.shutdown(project_dir)
+        except Exception as exc:                                 # noqa: BLE001
+            log.warning("could not stop the preview for %s: %s", project_dir, exc)
+    return jsonify({"ended": ended, "app_closed": bool(closed)})
 
 
 @app.route("/api/agent/new-project", methods=["POST"])
@@ -13157,6 +13184,16 @@ if __name__ == "__main__":
     _print_banner()
     _start_auto_update()
     _start_aa_refresh()
+    # Previews that outlived the hub that started them (crash, kill, restart
+    # while a project was running) keep holding their ports forever. Found 99
+    # of the 100 held on this machine, which makes the next preview fail with
+    # "no free port". Only the hub's own range is swept.
+    try:
+        freed = workspace.sweep_own_range()
+        if freed:
+            log.info("reclaimed %d preview port(s) left by a previous run", freed)
+    except Exception as exc:                                     # noqa: BLE001
+        log.warning("could not sweep preview ports: %s", exc)
     workspace.start_reaper()   # stop previews nobody is watching
     _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()
