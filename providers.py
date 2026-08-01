@@ -232,13 +232,32 @@ PROVIDERS: Dict[str, dict] = {
         "trial": True,  # 250K tokens/month, token-metered; 402s when spent
         "free_filter": "all",
         "exclude_families": ["computer-use", "warp-grep", "embed", "rerank"],
+        # 2026-08-01 RE-PROBED on a fresh key: the catalog grew from 11 ids to 17
+        # and ALL TEN general-purpose ones answered 200. Ordered best-first by the
+        # hub's ranking, so a chain built from this list opens with Kimi K3.
+        # NOTE the quota is PER KEY and monthly: a spent key 402s "Monthly quota
+        # exceeded" on EVERY id at once (verified — key #0 402'd on all four
+        # probes while key #1 answered all four). 402 is in _KEY_ROTATE_STATUSES,
+        # so the hub rotates to the next key on its own.
+        # Left out on purpose: "auto" (a router alias, not a model),
+        # "morph-compactor" (context-compaction specialist), and the
+        # computer-use / warp-grep ids (already in exclude_families).
         "default_free_models": [
-            "morph-v3-large",
-            "morph-v3-fast",
-            "morph-minimax3-428b",
+            "morph-kimik3",           # Kimi K3 — top tier after gpt-5/claude
+            "morph-glm52-744b",       # GLM 5.2
+            "morph-kimik3-fast",
+            "morph-qwen36-27b",
+            "morph-qwen35-397b",
+            "morph-minimax3-428b",    # MiniMax 3
+            "morph-minimax27-230b",
             "morph-dsv4flash",
             "deepseek/deepseek-v4-flash",
             "morph-gemma4-31b",
+            # Morph's own FAST-APPLY edit models. They answer normal chat, but
+            # they are specialists for applying a diff to a file, so they sort
+            # last and should never be the opening hop for a general question.
+            "morph-v3-large",
+            "morph-v3-fast",
         ],
         "notes": "No free models — all 8 models bill per token. The '200 req free every month' headline actually meters TOKENS ($2.50 / 250K credits per month): a coding CLI's 20-50K-token turns make the real allowance ~5-12 requests/month.",
     },

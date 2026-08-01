@@ -398,6 +398,51 @@ def _learn_ctx_from_catalog(payload_pid, payload):
         _log.debug("[ctx] catalog harvest failed for %s", payload_pid, exc_info=True)
 
 
+_PRICE_FIELDS = ("prompt", "completion", "input", "output",
+                 "input_cost_per_token", "output_cost_per_token",
+                 "prompt_price", "completion_price")
+
+
+def _zero_priced_ids(payload):
+    """Ids in a catalog whose published price is ZERO, for 'pricing_zero' providers.
+
+    Without this, is_free_model() fails closed for that filter (it cannot prove
+    free-ness with no pricing to look at), live_free comes back empty on every
+    fetch, and those providers are pinned to their hand-written
+    default_free_models forever — so a newly launched free model never appears
+    until someone edits providers.py by hand.
+
+    Prices arrive as strings ("0", "0.0000001") or numbers, nested under
+    `pricing` (OpenRouter) or flat on the row. A row with NO recognisable price
+    field is left out: unknown must not read as free, or a paid model gets
+    routed as if it cost nothing."""
+    out = []
+    for item in (payload.get("data") or payload.get("models") or []) \
+            if isinstance(payload, dict) else (payload or []):
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id") or item.get("name") or item.get("model")
+        if not isinstance(mid, str) or not mid:
+            continue
+        src = item.get("pricing") if isinstance(item.get("pricing"), dict) else item
+        seen = False
+        for f in _PRICE_FIELDS:
+            v = src.get(f)
+            if v is None:
+                continue
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            seen = True
+            if v > 0:
+                break
+        else:
+            if seen:
+                out.append(mid)
+    return out
+
+
 def _parse_model_ids(payload):
     """Accept OpenAI ({'data':[{'id':..}]}) and common variants."""
     items = []
@@ -460,10 +505,16 @@ def provider_free_models(pid, live=True):
                 # works but costs a real hop; the catalog states it for free.
                 _learn_ctx_from_catalog(pid, resp.json())
                 ids = _parse_model_ids(resp.json())
+                # A 'pricing_zero' provider can only be judged against the prices
+                # in the payload we are already holding; hand it that list, or it
+                # fails closed on every id and stays frozen on its static list.
+                known_free = None
+                if (prov.get_provider(pid) or {}).get("free_filter") == "pricing_zero":
+                    known_free = _zero_priced_ids(resp.json())
                 # filter_models drops blocked (uncensored) AND non-chat ids
                 # (whisper/tts/embed/guard) — per the providers.py contract.
                 live_free = prov.filter_models(
-                    [m for m in ids if prov.is_free_model(pid, m)]
+                    [m for m in ids if prov.is_free_model(pid, m, known_free=known_free)]
                 )
                 if live_free:
                     models = live_free
@@ -911,6 +962,52 @@ def _start_aa_refresh():
     _aa_refresh_thread.start()
 
 
+# --------------------------------------------------------------------------- #
+# Compressed vendor ids -> canonical spelling.
+#
+# Family matching is substring-based ("glm-5" in the id), and every preference
+# floor is a regex written against the canonical name. Relays that squeeze the
+# separators out of an id therefore fall through BOTH and get ranked as unknown
+# models. Morph is the clearest case — its whole catalog is spelled this way:
+#
+#   morph-glm52-744b     -> matched 'glm5' but _GLM5_RE needs a word boundary
+#                           after the 5, so the 134 floor never applied  (128)
+#   morph-qwen35-397b    -> only reached 'qwen3' (Tier A), then out-ranked
+#                           qwen3.6 purely on parameter count             (123.9)
+#   morph-minimax3-428b  -> 'minimax-m3' never matched at all              (30)
+#   morph-dsv4flash      -> same model as deepseek/deepseek-v4-flash (108)  (10)
+#
+# So a strong model sat at the BOTTOM of the chain and was never picked first.
+#
+# These rules are deliberately narrow: each requires a known vendor prefix, and
+# the two-digit rule requires exactly two digits NOT followed by another digit or
+# a dot — so already-canonical ids ("qwen3-30b", "glm-4.6", "llama-3.3-70b") are
+# left untouched. Anything unrecognised passes through unchanged.
+# '-mini' as a real suffix ('gpt-4o-mini', 'gemini-3-mini'), NOT as the head of a
+# longer word ('-minimax', '-ministral', '-miniature').
+_MINI_SUFFIX_RE = re.compile(r"-mini(?![a-z])")
+
+_CANON_TWO_DIGIT = re.compile(
+    r"\b(glm|qwen|gemma|llama|mistral|hunyuan|ernie|granite|phi|yi)(\d)(\d)(?![\d.])")
+_CANON_MINIMAX = re.compile(r"\bminimax-?m?(\d)(?:\.?(\d))?(?![\d.])")
+_CANON_KIMI = re.compile(r"\bkimi-?k(\d)(?:\.?(\d))?(?![\d.])")
+_CANON_DEEPSEEK = re.compile(r"\bds-?v(\d)")
+
+
+def _canon_model_id(low):
+    """Canonical spelling of a compressed model id, for FAMILY MATCHING ONLY.
+
+    Never shown to a user and never sent upstream — the real id is always what
+    gets called. This only decides how strong we think the model is."""
+    out = _CANON_TWO_DIGIT.sub(lambda m: "%s%s.%s" % (m.group(1), m.group(2), m.group(3)), low)
+    out = _CANON_MINIMAX.sub(
+        lambda m: "minimax-m%s" % (m.group(1) + ("." + m.group(2) if m.group(2) else "")), out)
+    out = _CANON_KIMI.sub(
+        lambda m: "kimi-k%s" % (m.group(1) + ("." + m.group(2) if m.group(2) else "")), out)
+    out = _CANON_DEEPSEEK.sub(lambda m: "deepseek-v%s" % m.group(1), out)
+    return out
+
+
 def _benchmark_score(pid, model_id):
     """Strength score for a '<model>' on provider `pid` (higher=better). Base
     tier comes from a REAL Artificial Analysis Intelligence Index match when
@@ -920,7 +1017,7 @@ def _benchmark_score(pid, model_id):
     floors, mistral penalty, speed cap) still applies on top either
     way — those encode deliberate product decisions, not a capability
     estimate, so real data augments them rather than replacing them."""
-    low = (model_id or "").lower()
+    low = _canon_model_id((model_id or "").lower())
     aa = _aa_score_for(model_id)
     if aa is not None:
         score = aa
@@ -1034,10 +1131,18 @@ def _benchmark_score(pid, model_id):
     # their family root is a flagship (glm-4.7-FLASH, gemini-3.1-flash-lite,
     # deepseek-r1-DISTILL). gemini-3(.5)-flash / gemini-4 are the kept exceptions.
     flash_ok = ("gemini-3.5-flash", "gemini-3-flash", "gemini-4")
-    speed = ("flash-lite", "-lite", "-mini", "nano", "distill", "-air",
+    speed = ("flash-lite", "-lite", "nano", "distill", "-air",
              "instant", "-tiny", "-edge", "mixtral", "moonshot-v1",
              "ernie-speed", "ernie-lite", "mistral-nemo", "qwq")
     capped = any(s in low for s in speed)
+    # '-mini' needs a boundary, unlike the rest: as a bare substring it also hits
+    # '-minimax', so EVERY relay that prefixes the vendor ('morph-minimax3-428b',
+    # any 'x-minimax-m3') had a 428B flagship capped to the 30-point tiny tier and
+    # buried at the bottom of the chain, while the unprefixed 'minimax-m3' scored
+    # 108. '-ministral' is a genuinely small Mistral and stays capped via its own
+    # entry in the tuple above.
+    if _MINI_SUFFIX_RE.search(low):
+        capped = True
     # 'flash' is ambiguous: weak on gemini-3.1/glm-4.x, but STRONG on
     # deepseek-v4-flash / gemini-3.5-flash. Don't cap a model the version
     # heuristic already flagged as a strong new release (sv > 0).
@@ -4903,7 +5008,8 @@ def _context_ok(pid, model, est):
 
 _MISSING_MODEL_RE = re.compile(
     r"model_not_found|model not found|no such model|does not exist|"
-    r"unknown model|invalid model|model .* not (?:found|available)", re.I)
+    r"unknown model|invalid model|unsupported model|not supported|"
+    r"model .* not (?:found|available)", re.I)
 
 
 def _maybe_mark_missing_model(pid, model, resp):
