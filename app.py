@@ -7297,6 +7297,52 @@ def api_agent_start_session():
     return jsonify(agentic_chat.get_session(session_id))
 
 
+@app.route("/api/agent/sessions/<session_id>/resume", methods=["POST"])
+def api_agent_resume_session(session_id):
+    """Continue a conversation from the history list.
+
+    Sessions live in memory, so a hub restart drops them — but the CLI's own
+    thread does not: `codex exec resume <id>` / `claude --resume <id>` pick it
+    back up with the model's full context. The transcript on disk now carries
+    that id, so this rebuilds a live session pointed at the real thread instead
+    of quietly starting a fresh one that has forgotten everything.
+
+    Reuses the ORIGINAL session id, so the transcript keeps accumulating into
+    the same conversation rather than forking a second copy of it."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    conv = agentic_history.get_conversation(session_id)
+    if not conv:
+        return jsonify({"error": "No stored conversation with that id.",
+                        "code": "no_history"}), 404
+    # The id is written on the agent's turns, so take the most recent one that
+    # has it — earlier turns predate the thread existing.
+    native = conv.get("native_session_id")
+    for turn in reversed(conv.get("turns") or []):
+        if turn.get("native_session_id"):
+            native = turn["native_session_id"]
+            break
+    project_dir = conv.get("project_dir")
+    if not project_dir or not os.path.isdir(project_dir):
+        return jsonify({"error": "That project folder no longer exists: %s"
+                        % _sanitize(str(project_dir)), "code": "folder_gone"}), 400
+    try:
+        sid = agentic_chat.resume_session(conv.get("cli_id"), project_dir,
+                                          native, session_id=session_id)
+    except agentic_chat.AgenticError as exc:
+        payload = {"error": _sanitize(str(exc))}
+        if exc.code:
+            payload["code"] = exc.code
+        payload.update(exc.extra)
+        return jsonify(payload), exc.status
+    row = agentic_chat.get_session(sid) or {}
+    # Honest about which kind of continue this is: with a thread id the model
+    # still has the conversation; without one it only has the files on disk.
+    row["resumed_thread"] = bool(native)
+    return jsonify(row)
+
+
 @app.route("/api/agent/sessions", methods=["GET"])
 def api_agent_list_sessions():
     gate = _agent_gate()
@@ -7344,8 +7390,15 @@ def api_agent_send_message(session_id):
                                     "user", body["text"])
     status, text, detail = agentic_chat.send_message(session_id, body["text"])
     if sess_info and status == 200 and text:
+        # The CLI's OWN thread id, captured with the reply. Without it a
+        # conversation cannot be continued after a hub restart -- sessions are
+        # in memory, but `codex exec resume <id>` / `claude --resume <id>` pick
+        # the real thread back up with the model's full context. Read AFTER the
+        # turn: turn 1 is what creates it.
+        _after = agentic_chat.get_session(session_id) or {}
         agentic_history.record_turn(session_id, sess_info["cli"], sess_info["project_dir"],
-                                    "agent", text)
+                                    "agent", text,
+                                    native_session_id=_after.get("native_session_id"))
     return jsonify({"status": status, "text": text, "detail": detail}), status
 
 
@@ -7379,8 +7432,11 @@ def api_agent_send_message_stream(session_id):
         finally:
             if sess_info and final_reply:
                 try:
-                    agentic_history.record_turn(session_id, sess_info["cli"],
-                                                sess_info["project_dir"], "agent", final_reply)
+                    _after = agentic_chat.get_session(session_id) or {}
+                    agentic_history.record_turn(
+                        session_id, sess_info["cli"], sess_info["project_dir"],
+                        "agent", final_reply,
+                        native_session_id=_after.get("native_session_id"))
                 except Exception:
                     pass
             yield "event: end\ndata: {}\n\n"

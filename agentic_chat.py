@@ -103,6 +103,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -127,6 +128,11 @@ _MASTER_FLAG = "agentic_chat_enabled"          # config flag, default OFF
 _TEST_VERIFICATION_FLAG = "agentic_test_verification_enabled"
 
 _CLI_BIN = {"claude": "claude", "codex": "codex"}
+
+# A session id reaches agentic_history, which turns it into a FILENAME. Reusing
+# a caller-supplied id (resume_session) is therefore only safe against the same
+# whitelist that module applies -- anything else could write outside its folder.
+_SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 # Which backend integrates BEST with this hub, as opposed to which is default.
 # Claude Code has --append-system-prompt (a real system channel) and a clean
@@ -567,6 +573,29 @@ def start_session(cli_id, project_dir, create_new=False) -> str:
         _REGISTRY[sess.id] = sess
     _remember_recent_project(abs_dir)
     return sess.id
+
+
+def resume_session(cli_id, project_dir, native_session_id, session_id=None) -> str:
+    """Rebuild a session that continues an EXISTING CLI thread.
+
+    Sessions live in memory, so a hub restart drops them -- but the CLI's own
+    conversation does not: `codex exec resume <thread_id>` and
+    `claude --resume <id>` both pick it up with the model's full context intact.
+    All that was missing was somewhere to keep that id across a restart.
+
+    So this takes the native id recorded with the transcript and hands back a
+    live session already pointed at it, which is what makes "continue" in the
+    history list actually continue rather than start over. Reuses the ORIGINAL
+    session_id when given one, so the transcript on disk keeps accumulating into
+    the same conversation instead of forking a second one."""
+    sid = start_session(cli_id, project_dir)      # all the same validation
+    with _REGISTRY_LOCK:
+        sess = _REGISTRY.pop(sid)
+        if session_id and _SAFE_SESSION_ID_RE.match(str(session_id)):
+            sess.id = str(session_id)
+        sess.native_session_id = native_session_id or None
+        _REGISTRY[sess.id] = sess
+        return sess.id
 
 
 def new_project_dir():
@@ -1153,6 +1182,11 @@ def get_session(session_id):
         "currently_running": running,
         "created_at": sess.created_at,
         "has_native_session": bool(sess.native_session_id),
+        # The CLI's own thread id. Recorded with the transcript so a
+        # conversation can be CONTINUED after a hub restart -- sessions live in
+        # memory, but the CLI's thread does not, and this is the handle to it.
+        # Not a secret: a local id for a local process, meaningless elsewhere.
+        "native_session_id": sess.native_session_id,
     }
 
 
