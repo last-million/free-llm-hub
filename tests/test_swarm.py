@@ -6,24 +6,75 @@ are: (1) it only ever runs when explicitly selected, and (2) every stage
 degrades instead of failing. No network — dispatch is a stub.
 """
 import json
+import threading
 
 import pytest
 
 import app
+import craft
 import swarm
 
 
+def _stage_of(system_prompt):
+    """Which pipeline stage a call belongs to, from its system prompt.
+
+    Identified by stage rather than by call INDEX because phases now run
+    concurrently: within a wave, completion order is genuinely nondeterministic,
+    so any positional script would be flaky by construction."""
+    for name, prompt in (("plan", swarm._PLAN_SYSTEM),
+                         ("phase", swarm._PHASE_SYSTEM),
+                         ("supervise", swarm._SUPERVISE_SYSTEM),
+                         ("review", swarm._REVIEW_SYSTEM),
+                         ("synth", swarm._SYNTH_SYSTEM)):
+        if system_prompt == prompt:
+            return name
+    return "?"
+
+
+def _dispatch(plan="", phases=(), supervise="", review="", synth="", provider=None):
+    """A dispatch stub scripted BY STAGE. `phases` is consumed in call order for
+    the phase stage; a plain string answers every phase."""
+    calls = []
+    remaining = list(phases) if not isinstance(phases, str) else None
+    lock = threading.Lock()
+
+    def dispatch(messages, max_tokens, exclude_pids=()):
+        stage = _stage_of(messages[0]["content"])
+        with lock:
+            n = len(calls)
+            calls.append({"stage": stage, "system": messages[0]["content"],
+                          "user": messages[-1]["content"], "max_tokens": max_tokens,
+                          "exclude_pids": exclude_pids})
+            if stage == "phase":
+                if remaining is None:
+                    text = phases
+                else:
+                    text = remaining.pop(0) if remaining else ""
+            else:
+                text = {"plan": plan, "supervise": supervise,
+                        "review": review, "synth": synth}.get(stage, "")
+        pid = provider(stage, n) if provider else "prov%d/model%d" % (n, n)
+        return text, (pid if text else None)
+
+    dispatch.calls = calls
+    dispatch.of = lambda stage: [c for c in calls if c["stage"] == stage]
+    return dispatch
+
+
 def _dispatch_from(script):
-    """A dispatch stub returning scripted texts in order, recording each call."""
+    """Legacy positional stub, kept for the stages that are still strictly
+    sequential (plan -> single phase -> review)."""
     calls = []
 
     def dispatch(messages, max_tokens, exclude_pids=()):
-        calls.append({"system": messages[0]["content"], "user": messages[-1]["content"],
+        calls.append({"stage": _stage_of(messages[0]["content"]),
+                      "system": messages[0]["content"], "user": messages[-1]["content"],
                       "max_tokens": max_tokens, "exclude_pids": exclude_pids})
         i = len(calls) - 1
         text = script[i] if i < len(script) else ""
         return text, ("prov%d/model%d" % (i, i) if text else None)
     dispatch.calls = calls
+    dispatch.of = lambda stage: [c for c in calls if c["stage"] == stage]
     return dispatch
 
 
@@ -33,6 +84,12 @@ PLAN = json.dumps({"goal": "Build a landing page",
                               {"title": "Layout", "task": "structure the sections",
                                "done_when": "sections listed"}]})
 SHIP = json.dumps({"verdict": "ship", "problems": []})
+NO_GAPS = json.dumps({"missing": []})
+# Same two phases, but phase 2 DECLARES it needs phase 1 -> they serialise.
+CHAIN_PLAN = json.dumps({"goal": "Build a landing page",
+                         "phases": [{"title": "Copy", "task": "write the hero copy"},
+                                    {"title": "Layout", "task": "structure the sections",
+                                     "needs": [1]}]})
 REVISE = json.dumps({"verdict": "revise", "problems": ["hero is generic"]})
 
 
@@ -66,36 +123,56 @@ def test_tool_calling_turns_are_refused_not_silently_reshaped():
 # --------------------------------------------------------------------------- #
 
 def test_full_pipeline_runs_plan_phases_review_synthesis():
-    d = _dispatch_from([PLAN, "hero copy", "layout", REVISE, "final answer"])
+    d = _dispatch(plan=PLAN, phases=["hero copy", "layout"], supervise=NO_GAPS,
+                  review=REVISE, synth="final answer")
     out = swarm.run([{"role": "user", "content": "build me a landing page"}], d)
     assert out["text"] == "final answer"
     assert [p["title"] for p in out["phases"]] == ["Copy", "Layout"]
-    assert [s for s, _ in out["models"]] == [
-        "plan", "phase:Copy", "phase:Layout", "review", "synthesis"]
+    stages = [s for s, _ in out["models"]]
+    assert stages[0] == "plan" and stages[-1] == "synthesis"
+    assert {"phase:Copy", "phase:Layout", "supervisor", "review"} <= set(stages)
 
 
-def test_each_phase_sees_the_previous_phase_output():
-    d = _dispatch_from([PLAN, "HERO-TEXT", "layout", SHIP, "final"])
+def test_a_phase_receives_the_output_of_what_it_DECLARED_it_needs():
+    d = _dispatch(plan=CHAIN_PLAN, phases=["HERO-TEXT", "layout"],
+                  supervise=NO_GAPS, review=SHIP, synth="final")
     swarm.run([{"role": "user", "content": "go"}], d)
-    assert "HERO-TEXT" in d.calls[2]["user"], "phase 2 did not receive phase 1's work"
+    second = [c for c in d.of("phase") if "Layout" in c["user"]][0]
+    assert "HERO-TEXT" in second["user"], "phase 2 did not receive the work it needs"
 
 
 def test_the_reviewer_is_kept_off_the_provider_that_wrote_the_draft():
     """A model reviewing its own output agrees with itself."""
-    d = _dispatch_from([PLAN, "a", "b", SHIP, "final"])
+    d = _dispatch(plan=PLAN, phases=["a", "b"], supervise=NO_GAPS,
+                  review=SHIP, synth="final",
+                  provider=lambda stage, n: "writer/m" if stage == "phase" else "other/m")
     swarm.run([{"role": "user", "content": "go"}], d)
-    review_call = d.calls[3]
-    assert review_call["exclude_pids"], "review ran with no provider exclusion"
-    assert "prov1" in review_call["exclude_pids"]
+    review = d.of("review")[0]
+    assert review["exclude_pids"], "review ran with no provider exclusion"
+    assert "writer" in review["exclude_pids"]
 
 
 def test_a_single_phase_that_passes_review_is_returned_unchanged():
-    """Re-writing an approved one-phase answer can only make it worse."""
-    one = json.dumps({"goal": "g", "phases": [{"title": "Do", "task": "do it"}]})
-    d = _dispatch_from([one, "the answer", SHIP])
+    """Re-writing an approved one-phase answer can only make it worse.
+
+    Reached through the FALLBACK path now: a one-phase PLAN is refused (see
+    MIN_PHASES), so the single phase here is the whole-brief fallback."""
+    d = _dispatch(plan="not a plan", phases="the answer", review=SHIP)
     out = swarm.run([{"role": "user", "content": "go"}], d)
     assert out["text"] == "the answer"
-    assert len(d.calls) == 3, "a synthesis pass ran when it was not needed"
+    assert not d.of("synth"), "a synthesis pass ran when it was not needed"
+
+
+def test_a_one_phase_plan_is_refused_so_no_scope_is_dropped():
+    """Observed live: a 3-part brief came back as a single phase titled "Hero
+    Headline", the worker delivered exactly that, and two thirds of the request
+    vanished. The whole-brief fallback answers all of it."""
+    one = json.dumps({"goal": "g", "phases": [{"title": "Hero", "task": "the headline"}]})
+    d = _dispatch(plan=one, phases="the answer", review=SHIP)
+    out = swarm.run([{"role": "user", "content": "headline, about text and 6 items"}], d)
+    assert len(d.of("plan")) == 2, "a one-phase plan was accepted without a retry"
+    phase = d.of("phase")[0]["user"]
+    assert "6 items" in phase, "the fallback phase lost part of the request"
 
 
 # --------------------------------------------------------------------------- #
@@ -103,20 +180,22 @@ def test_a_single_phase_that_passes_review_is_returned_unchanged():
 # --------------------------------------------------------------------------- #
 
 def test_an_unusable_plan_degrades_to_one_phase():
-    d = _dispatch_from(["not json at all", "the answer", SHIP])
+    d = _dispatch(plan="not json at all", phases="the answer", review=SHIP)
     out = swarm.run([{"role": "user", "content": "do the thing"}], d)
     assert out["text"] == "the answer"
-    assert d.calls[1]["user"].count("do the thing"), "phase lost the original ask"
+    assert "do the thing" in d.of("phase")[0]["user"], "phase lost the original ask"
 
 
 def test_a_failed_review_still_returns_the_work():
-    d = _dispatch_from([PLAN, "a", "b", "", "final"])
+    d = _dispatch(plan=PLAN, phases=["a", "b"], supervise=NO_GAPS,
+                  review="", synth="final")
     out = swarm.run([{"role": "user", "content": "go"}], d)
     assert out["text"] == "final"
 
 
 def test_a_failed_synthesis_falls_back_to_the_draft():
-    d = _dispatch_from([PLAN, "phase one", "phase two", REVISE, ""])
+    d = _dispatch(plan=PLAN, phases=["phase one", "phase two"], supervise=NO_GAPS,
+                  review=REVISE, synth="")
     out = swarm.run([{"role": "user", "content": "go"}], d)
     assert "phase one" in out["text"] and "phase two" in out["text"]
 
@@ -171,3 +250,289 @@ def test_the_trailer_does_not_claim_reviewer_problems_were_fixed():
 
 def test_an_empty_result_formats_to_empty():
     assert swarm.format_answer({"text": "", "plan": {}, "phases": [], "models": []}) == ""
+
+
+# --------------------------------------------------------------------------- #
+# Supervisor + subagents: each worker in its OWN context, waves in parallel.
+#
+# The point is capacity. Five workers on 32K windows have ~160K of usable
+# context between them; the old pipeline concatenated every earlier phase into
+# every later one and ran out on exactly the large builds it existed for.
+# --------------------------------------------------------------------------- #
+
+def _plan(*phases):
+    return json.dumps({"goal": "g", "phases": list(phases)})
+
+
+def test_independent_phases_are_grouped_into_one_wave():
+    phases = [{"title": "a", "task": "t", "needs": []},
+              {"title": "b", "task": "t", "needs": []},
+              {"title": "c", "task": "t", "needs": [1, 2]}]
+    assert swarm._waves(phases) == [[1, 2], [3]]
+
+
+def test_a_dependency_chain_serialises():
+    phases = [{"title": "a", "task": "t", "needs": []},
+              {"title": "b", "task": "t", "needs": [1]},
+              {"title": "c", "task": "t", "needs": [2]}]
+    assert swarm._waves(phases) == [[1], [2], [3]]
+
+
+def test_waves_never_hang_on_an_unsatisfiable_graph():
+    """A swarm must never deadlock: run the remainder rather than spin."""
+    phases = [{"title": "a", "task": "t", "needs": [99]}]
+    assert swarm._waves(phases) == [[1]]
+
+
+def test_forward_and_self_references_are_stripped():
+    """A self-reference or a forward reference would deadlock the scheduler."""
+    plan = {"phases": [{"title": "a", "task": "t", "needs": [1, 2, 5]},
+                       {"title": "b", "task": "t", "needs": [1, 2]}]}
+    cleaned = swarm._clean_phases(plan)
+    assert cleaned[0]["needs"] == []      # phase 1 cannot need 1, 2 or 5
+    assert cleaned[1]["needs"] == [1]     # phase 2 may need 1, never itself
+
+
+def test_independent_workers_actually_run_concurrently():
+    """Not just grouped — genuinely overlapping in time."""
+    import threading
+    import time
+    inside = []
+    peak = [0]
+    lock = threading.Lock()
+
+    def dispatch(messages, max_tokens, exclude_pids=()):
+        stage = _stage_of(messages[0]["content"])
+        if stage != "phase":
+            return {"plan": _plan({"title": "a", "task": "t", "needs": []},
+                                  {"title": "b", "task": "t", "needs": []}),
+                    "supervise": NO_GAPS, "review": SHIP,
+                    "synth": "done"}.get(stage, ""), "p/m"
+        with lock:
+            inside.append(1)
+            peak[0] = max(peak[0], len(inside))
+        time.sleep(0.15)
+        with lock:
+            inside.pop()
+        return "out", "p/m"
+
+    swarm.run([{"role": "user", "content": "go"}], dispatch)
+    assert peak[0] == 2, "independent phases ran one after the other"
+
+
+def test_a_worker_never_sees_a_phase_it_did_not_ask_for():
+    """Context isolation is the whole design: an unrelated teammate's output
+    must not land in this worker's window."""
+    d = _dispatch(plan=_plan({"title": "Copy", "task": "t", "needs": []},
+                             {"title": "Data", "task": "t", "needs": []},
+                             {"title": "Assemble", "task": "t", "needs": [1]}),
+                  phases=["COPY-OUT", "DATA-OUT", "assembled"],
+                  supervise=NO_GAPS, review=SHIP, synth="final")
+    swarm.run([{"role": "user", "content": "go"}], d)
+    assemble = [c for c in d.of("phase") if "Assemble" in c["user"]][0]
+    assert "COPY-OUT" in assemble["user"], "declared dependency was not provided"
+    assert "DATA-OUT" not in assemble["user"], "worker was given work it never asked for"
+
+
+def test_a_parallel_worker_is_told_it_cannot_see_the_others():
+    """Otherwise it writes as if it can, and the outputs contradict."""
+    d = _dispatch(plan=_plan({"title": "a", "task": "t", "needs": []},
+                             {"title": "b", "task": "t", "needs": []}),
+                  phases="out", supervise=NO_GAPS, review=SHIP, synth="final")
+    swarm.run([{"role": "user", "content": "go"}], d)
+    assert all("cannot see their output" in c["user"] for c in d.of("phase"))
+
+
+def test_a_dependency_is_clipped_so_one_worker_cannot_blow_the_window():
+    """Handing over an unbounded teammate output puts the ceiling straight back."""
+    d = _dispatch(plan=_plan({"title": "Copy", "task": "t", "needs": []},
+                             {"title": "Use", "task": "t", "needs": [1]}),
+                  phases=["X" * 40000, "ok"], supervise=NO_GAPS, review=SHIP, synth="f")
+    swarm.run([{"role": "user", "content": "go"}], d)
+    use = [c for c in d.of("phase") if "Use" in c["user"]][0]
+    assert len(use["user"]) < swarm.DEP_CONTEXT_CHARS + 2000
+    assert "trimmed" in use["user"]
+
+
+def test_the_supervisor_fills_a_gap_it_finds():
+    gap = json.dumps({"missing": [{"title": "Pricing", "task": "the pricing table"}]})
+    d = _dispatch(plan=PLAN, phases=["a", "b", "PRICING-TABLE"],
+                  supervise=gap, review=SHIP, synth="final")
+    out = swarm.run([{"role": "user", "content": "go"}], d)
+    assert "repair:Pricing" in [s for s, _ in out["models"]]
+    assert any(p["title"] == "Pricing" for p in out["phases"])
+
+
+def test_the_supervisor_stays_quiet_when_nothing_is_missing():
+    """A supervisor that always finds work doubles the cost for nothing."""
+    d = _dispatch(plan=PLAN, phases=["a", "b"], supervise=NO_GAPS,
+                  review=SHIP, synth="final")
+    out = swarm.run([{"role": "user", "content": "go"}], d)
+    assert not [s for s, _ in out["models"] if s.startswith("repair:")]
+
+
+def test_no_supervisor_round_for_a_single_phase():
+    """There is no team to reconcile — it would be pure cost."""
+    d = _dispatch(plan=_plan({"title": "Do", "task": "do it", "needs": []}),
+                  phases="the answer", supervise=NO_GAPS, review=SHIP)
+    swarm.run([{"role": "user", "content": "go"}], d)
+    assert not d.of("supervise")
+
+
+def test_one_worker_dying_does_not_kill_the_wave():
+    def dispatch(messages, max_tokens, exclude_pids=()):
+        stage = _stage_of(messages[0]["content"])
+        if stage == "plan":
+            return _plan({"title": "a", "task": "t", "needs": []},
+                         {"title": "b", "task": "t", "needs": []}), "p/m"
+        if stage == "phase":
+            if "a" in messages[-1]["content"].split("YOUR PHASE (1")[-1][:40]:
+                raise RuntimeError("worker exploded")
+            return "survivor", "p/m"
+        return {"supervise": NO_GAPS, "review": SHIP, "synth": "final"}.get(stage, ""), "p/m"
+
+    out = swarm.run([{"role": "user", "content": "go"}], dispatch)
+    assert out["text"], "a single failed worker took down the whole swarm"
+
+
+# --------------------------------------------------------------------------- #
+# Plan robustness. The plan is the linchpin: no plan means no team, and the
+# swarm silently degrades to the single model the user did NOT select.
+# --------------------------------------------------------------------------- #
+
+# Captured verbatim from a real planner (groq/allam-2-7b): it opens an object
+# per phase and never closes any of them. Not truncation — the structure is
+# wrong — so balancing braces cannot fix it, but the content is all there.
+REAL_BROKEN_PLAN = '''{"goal": "Build a page", "phases": [
+{
+  "title": "Search Engine Landscape",
+  "task": "Discover images", "done_when": "Stable image URLs ready",
+{
+  "title": "Page structure",
+  "task": "Arrange content pages", "done_when": "Layout defined",
+{
+  "title": "Copy",
+  "task": "Write Hero Headline", "done_when": "Headline'''
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ('{"a":[1,2,],}', {"a": [1, 2]}),
+    ('```json\n{"goal":"g"}\n```', {"goal": "g"}),
+    ('Sure! {"goal":"g"} Hope that helps.', {"goal": "g"}),
+    ('{"goal":"g","phases":[{"title":"t","task":"do', {"goal": "g", "phases": [{"title": "t", "task": "do"}]}),
+    ('I cannot do that', None),
+    ('', None),
+])
+def test_parse_json_survives_how_models_actually_reply(raw, expected):
+    assert swarm._parse_json(raw) == expected
+
+
+def test_a_structurally_broken_plan_still_yields_a_team():
+    """The failure that made a live swarm run as one model."""
+    got = swarm._phases_from_text(REAL_BROKEN_PLAN)
+    assert [p["title"] for p in got] == [
+        "Search Engine Landscape", "Page structure", "Copy"]
+    assert all(p["needs"] == [] for p in got), "a salvaged plan must not invent deps"
+
+
+def test_recovered_phases_run_as_a_real_team():
+    d = _dispatch(plan=REAL_BROKEN_PLAN, phases="out", supervise=NO_GAPS,
+                  review=SHIP, synth="final")
+    out = swarm.run([{"role": "user", "content": "go"}], d)
+    assert len(d.of("phase")) == 3, "salvaged plan did not produce three workers"
+    assert out["text"] == "final"
+
+
+def test_the_planner_gets_one_retry_before_the_swarm_gives_up():
+    calls = {"n": 0}
+
+    def dispatch(messages, max_tokens, exclude_pids=()):
+        stage = _stage_of(messages[0]["content"])
+        if stage == "plan":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "I'd be happy to help you plan this!", "p/m"
+            return _plan({"title": "a", "task": "t", "needs": []},
+                         {"title": "b", "task": "t", "needs": []}), "p/m"
+        if stage == "phase":
+            return "work", "p/m"
+        return {"supervise": NO_GAPS, "review": SHIP, "synth": "final"}.get(stage, ""), "p/m"
+
+    out = swarm.run([{"role": "user", "content": "go"}], dispatch)
+    assert calls["n"] == 2, "planner was not retried"
+    assert len(out["phases"]) == 2, "retry did not produce a team"
+
+
+def test_a_hopeless_planner_still_answers_the_user():
+    """Two bad plans must degrade to one phase, never to an error."""
+    d = _dispatch(plan="no.", phases="the answer", review=SHIP)
+    out = swarm.run([{"role": "user", "content": "do the thing"}], d)
+    assert out["text"] == "the answer"
+    assert len(d.of("plan")) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Craft briefs must NOT reach swarm-internal stages.
+# --------------------------------------------------------------------------- #
+
+def test_swarm_stages_opt_out_of_craft_briefs():
+    """Observed live: the planner is told "reply with JSON ONLY", the injected
+    WEB_DESIGN/SEO/IMAGES briefs told it to build a website, and it obeyed the
+    brief — returning publication-ready copy instead of a plan. Every creation
+    task therefore fell back to a single model, which is the one task the swarm
+    exists for."""
+    payload = {"model": "m", "messages": [
+        {"role": "system", "content": swarm._PLAN_SYSTEM},
+        {"role": "user", "content": "build me a restaurant website"}], "_no_craft": True}
+    assert craft.names(payload["messages"][-1]["content"]), "test needs a matching brief"
+    seen = {}
+
+    def fake_post(pid, p, stream):
+        seen["messages"] = p["messages"]
+        seen["keys"] = set(p)
+        raise RuntimeError("stop here")
+
+    import app as _app
+    orig = _app._upstream_chat
+    try:
+        # exercise the real injection point
+        _app._upstream_chat = fake_post
+        try:
+            _app._dispatch_chat("groq", payload, False)
+        except RuntimeError:
+            pass
+    finally:
+        _app._upstream_chat = orig
+    assert len(seen["messages"]) == 2, "a craft brief was injected into a swarm stage"
+
+
+def test_the_internal_flag_never_reaches_a_provider():
+    """`_no_craft` is ours. A provider receiving an unknown top-level field can
+    reject the whole request."""
+    import app as _app
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        def close(self):
+            pass
+
+    def fake_post(url, **kw):
+        sent["body"] = kw.get("json") or {}
+        return _Resp()
+
+    orig = _app.requests.post
+    try:
+        _app.requests.post = fake_post
+        _app._upstream_chat("groq", {"model": "m", "messages": [
+            {"role": "user", "content": "hi"}], "_no_craft": True}, False)
+    except Exception:                                            # noqa: BLE001
+        pass                       # provider config may reject; we only need the body
+    finally:
+        _app.requests.post = orig
+    if sent.get("body") is not None:
+        assert "_no_craft" not in sent["body"], "internal flag leaked to the provider"
