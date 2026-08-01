@@ -270,3 +270,59 @@ def test_older_generations_keep_their_measured_score():
     """Only v4+/m3+ are floored. v3/r1 and m2 must NOT be lifted."""
     for mid in ("deepseek-v3.1", "deepseek-r1", "minimax-m2", "minimax-m2.7"):
         assert app._benchmark_score("p", mid) < app._PREF_FLOORS[10], mid
+
+
+def test_gemini_31_and_up_beat_deepseek_v4():
+    """USER 2026-08-01: "gemini 3.1, 3.5, 3.6 and up versions are better than
+    deepseek 4 or v4."."""
+    ds4 = app._benchmark_score("p", "deepseek-v4")
+    for mid in ("gemini-3.1-pro", "models/gemini-3.5-flash",
+                "models/gemini-3.6-flash", "gemini-4"):
+        assert app._benchmark_score("p", mid) > ds4, mid
+
+
+def test_gemini_versions_are_monotonic():
+    """A newer gemini must always outrank an older one — scaling on the minor
+    alone put gemini-4.0 BELOW gemini-3.6."""
+    ordered = ["gemini-3.1", "gemini-3.5", "gemini-3.6", "gemini-4", "gemini-4.2",
+               "gemini-5"]
+    scores = [app._benchmark_score("p", m) for m in ordered]
+    assert scores == sorted(scores), list(zip(ordered, scores))
+
+
+def test_gemini_30_and_older_get_no_floor():
+    """The user named 3.1 as the floor of the good ones."""
+    ds4 = app._benchmark_score("p", "deepseek-v4")
+    for mid in ("gemini-3.0-pro", "models/gemini-3-flash-preview",
+                "gemini-2.5-flash"):
+        assert app._benchmark_score("p", mid) < ds4, mid
+
+
+def test_floored_gemini_survives_the_speed_cap():
+    """Nearly every gemini id is a '-flash'. The cap runs LAST, so without an
+    exemption it would undo the floor on the whole family and the user's
+    ranking would silently not hold."""
+    assert app._benchmark_score("p", "models/gemini-3.6-flash") > \
+        app._benchmark_score("p", "deepseek-v4")
+    # ...but an OLD gemini flash is still capped.
+    assert app._benchmark_score("p", "gemini-2.5-flash") <= 30
+    # ...and flash-LITE is Google's cheapest tier, neither "flash" nor "pro":
+    # the user named "flash or pro", so it stays in the small tier it was in.
+    assert app._benchmark_score("p", "gemini-3.1-flash-lite-preview") <= 40
+
+
+def test_gemini_pro_beats_gemini_flash():
+    """USER 2026-08-01: "gemini pro is better than gemini flash, of course."
+    The two bands must not overlap, so pro of ANY version beats flash of any."""
+    assert app._benchmark_score("p", "gemini-3.1-pro") > \
+        app._benchmark_score("p", "gemini-5-flash")
+    for v in ("3.1", "3.5", "3.6", "4"):
+        assert app._benchmark_score("p", "gemini-%s-pro" % v) > \
+            app._benchmark_score("p", "gemini-%s-flash" % v), v
+
+
+def test_gemini_stays_under_glm52():
+    """The user ranked glm-5.2 earlier and did not revisit it."""
+    glm = app._benchmark_score("p", "glm-5.2")
+    for mid in ("gemini-3.6-flash", "gemini-4", "gemini-5"):
+        assert app._benchmark_score("p", mid) < glm, mid
