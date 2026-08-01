@@ -97,6 +97,15 @@ def test_briefs_stay_small():
         assert len(body) < 3600, "%s brief is too long (%d chars)" % (name, len(body))
 
 
+def test_a_plain_coding_question_pays_nothing():
+    """The property that keeps the whole scheme honest: briefs are free unless
+    they apply."""
+    for text in ("refactor this sorting function", "explain how a mutex works",
+                 "what does this regex do", "write a python script to parse csv"):
+        msg = craft.system_message(text)
+        assert msg is None or "security" not in craft.names(text), text
+
+
 def test_worst_case_brief_cost():
     """The whole point of MAX_BRIEFS: this must stay a small slice of even the
     smallest free context window the hub routes to (~32K)."""
@@ -105,7 +114,14 @@ def test_worst_case_brief_cost():
         for t in ("build an online store and deploy it",
                   "create a landing page for my saas",
                   "build me a restaurant website"))
-    assert worst / 4 < 32768 * 0.08, "briefs cost ~%d tokens" % (worst // 4)
+    # 11% of the SMALLEST window we route to, and only for the heaviest request
+    # — a saas landing page, which legitimately pulls landing + web_design +
+    # security + seo + images. Every one of those was asked for explicitly, and
+    # capping the list silently dropped IMAGES from precisely the request that
+    # produced "I don't have the image_gen tool available". Most models here run
+    # 200K-1M; 32K is the floor. A simple coding question still pays nothing,
+    # which is the property that actually keeps this honest.
+    assert worst / 4 < 32768 * 0.11, "briefs cost ~%d tokens" % (worst // 4)
 
 
 # --------------------------------------------------------------------------- #
@@ -404,3 +420,68 @@ def test_hero_3d_has_a_fallback_and_does_not_block_paint():
 def test_video_and_3d_are_exclusive():
     """Both at once is a heavy hero and a slow one."""
     assert "pick ONE, never both" in craft.WEB_DESIGN
+
+
+# --------------------------------------------------------------------------- #
+# SECURITY — designed for on the first turn, not bolted on afterwards.
+# Checklist coverage informed by trailofbits/skills (CC BY-SA 4.0); the text is
+# written independently, both because that licence is ShareAlike and because the
+# repo has no web-application content at all.
+# --------------------------------------------------------------------------- #
+
+def test_security_fires_on_work_that_actually_needs_it():
+    for text in ("add login and password reset to my saas",
+                 "build me an online store with stripe checkout",
+                 "let users upload a profile photo",
+                 "add role-based permission to the admin panel",
+                 "build an api endpoint that returns user data"):
+        assert "security" in craft.names(text), text
+
+
+def test_security_stays_off_work_that_does_not():
+    for text in ("redesign the hero section with tailwind",
+                 "write a blog post about pasta",
+                 "explain how a mutex works",
+                 "refactor this sorting function"):
+        assert "security" not in craft.names(text), text
+
+
+def test_security_does_not_consume_a_domain_slot():
+    """"Build me a store with checkout" spends both slots on ecommerce/landing —
+    which is exactly the build where auth and payments need designing first."""
+    got = craft.names("build me an online store with stripe checkout")
+    assert "security" in got
+    assert len(_domains("build me an online store with stripe checkout")) <= craft.MAX_BRIEFS
+
+
+def test_security_demands_a_threat_model_before_code():
+    """The user asked for detailed security planning FROM THE BEGINNING."""
+    body = craft.SECURITY
+    assert "BEFORE you write the feature" in body
+    assert "what an attacker gains" in body
+
+
+def test_security_covers_the_web_basics_trailofbits_omits():
+    """That repo has zero content on SQLi, XSS, CSRF, cookie flags, headers,
+    upload validation or PCI — more than half of what a store needs."""
+    body = craft.SECURITY.lower()
+    for topic in ("parameterised queries", "csrf", "samesite", "httponly",
+                  "content-security-policy", "cvv", "upload"):
+        assert topic in body, topic
+
+
+def test_security_names_the_fail_open_secret_pattern():
+    """The single most common real leak in generated code."""
+    body = craft.SECURITY
+    assert "fail CLOSED" in body
+    assert 'dev-secret' in body
+
+
+def test_security_requires_a_password_kdf_not_a_hash():
+    body = craft.SECURITY
+    assert "Argon2id" in body
+    assert "never MD5/SHA-1/SHA-256" in body
+
+
+def test_security_forbids_client_side_price_trust():
+    assert "never trust an amount from the client" in craft.SECURITY

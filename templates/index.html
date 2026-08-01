@@ -1287,6 +1287,14 @@
   .cx-sidebar{ transition:width .18s ease, transform .18s ease; }
   body.cx-rail{ padding-left:var(--sidebar-rail); }
   body.cx-rail .cx-sidebar{ width:var(--sidebar-rail); }
+  /* The nav's full-width content still exists while collapsed, so the aside
+     grew an internal horizontal scrollbar (measured: scrollWidth 117 vs
+     clientWidth 55). Clip it while narrow; the hover-expanded state restores
+     normal overflow so nothing is unreachable. */
+  body.cx-rail .cx-sidebar, body.cx-hidden .cx-sidebar{ overflow-x:hidden; }
+  body.cx-rail .cx-sidebar:hover, body.cx-hidden .cx-sidebar:hover,
+  body.cx-rail .cx-sidebar:focus-within, body.cx-hidden .cx-sidebar:focus-within{
+    overflow-x:visible; }
   body.cx-hidden{ padding-left:var(--sidebar-strip); }
   body.cx-hidden .cx-sidebar{ width:var(--sidebar-strip); }
   /* Collapsed: the LABELS go, the icons never do. An earlier version hid every
@@ -1840,7 +1848,7 @@
         </div>
 
         <div id="agent-session-tab" role="tabpanel">
-        <div class="agent-cli-row">
+        <div class="agent-cli-row" id="agent-cli-row">
           <select id="agent-cli" aria-label="Agent CLI">
             <option value="claude">Claude Code</option>
             <option value="codex">ChatGPT Codex</option>
@@ -2300,7 +2308,7 @@
   var CX_MODE_LABEL = { full: 'Collapse to icons', rail: 'Hide the sidebar',
                         hidden: 'Show the sidebar' };
 
-  function applySidebarMode(mode){
+  function applySidebarMode(mode, persist){
     document.body.classList.toggle('cx-rail', mode === 'rail');
     document.body.classList.toggle('cx-hidden', mode === 'hidden');
     var btn = document.getElementById('cx-sidebar-toggle');
@@ -2308,7 +2316,12 @@
       btn.setAttribute('aria-label', CX_MODE_LABEL[mode] || 'Collapse the sidebar');
       btn.title = CX_MODE_LABEL[mode] || 'Collapse the sidebar';
     }
-    try { localStorage.setItem('cx_sidebar_mode', mode); } catch(e){}
+    /* persist=false for the automatic collapse: it is a transient tidy-up, not
+       the user saying they want a narrow sidebar. Storing it meant simply
+       visiting a page overwrote an explicit "keep it open" choice. */
+    if (persist !== false){
+      try { localStorage.setItem('cx_sidebar_mode', mode); } catch(e){}
+    }
   }
 
   function initSidebarModes(){
@@ -2338,7 +2351,7 @@
         if (!document.body.classList.contains('cx-rail') &&
             !document.body.classList.contains('cx-hidden') &&
             !side.matches(':hover') && !side.contains(document.activeElement)){
-          applySidebarMode('rail');
+          applySidebarMode('rail', false);
         }
       }, 2000);
     }
@@ -5574,6 +5587,7 @@
     function showStartState(){
       sessionId = null;
       curProjectDir = null;
+      setSetupVisible(true);
       startRow.hidden = false;
       sessionBox.hidden = true;
       checkpointBtn.disabled = true;
@@ -5588,9 +5602,20 @@
     var curProjectDir = null;
     function currentProjectDir(){ return curProjectDir; }
 
+    /* The CLI picker and workspace-mode toggle choose what a session WILL be;
+       once one is running they are inert, and they were costing ~150px of
+       vertical space that pushed the chat/preview split below the fold. */
+    function setSetupVisible(on){
+      ['#agent-cli-row', '#agent-dir-mode'].forEach(function(sel){
+        var el = document.querySelector(sel);
+        if (el) el.hidden = !on;
+      });
+    }
+
     function showSessionState(cli, dir){
       curProjectDir = dir;
       startRow.hidden = true;
+      setSetupVisible(false);
       sessionBox.hidden = false;
       setStartResult(null);
       sessionInfo.textContent = cliLabel(cli) + ' — ' + dir;
