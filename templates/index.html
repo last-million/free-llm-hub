@@ -58,7 +58,7 @@
     --radius-sm:8px;
     --sidebar-w:248px;
     --sidebar-rail:56px;   /* icons only */
-    --sidebar-strip:10px;  /* hidden: just a hover target */
+    --sidebar-strip:46px;  /* hidden: dimmed icons, still a target */
   }
   :root[data-theme="light"]{
     color-scheme:light;
@@ -1289,16 +1289,34 @@
   body.cx-rail .cx-sidebar{ width:var(--sidebar-rail); }
   body.cx-hidden{ padding-left:var(--sidebar-strip); }
   body.cx-hidden .cx-sidebar{ width:var(--sidebar-strip); }
-  /* Collapsed: everything but the icons goes. visibility (not display) keeps the
-     labels in the a11y tree only while they are actually readable. */
+  /* Collapsed: the LABELS go, the icons never do. An earlier version hid every
+     child in hidden mode, which left a blank 10px strip — you could not see
+     where you were, could not see the sections, and the toggle that gets you
+     back was hidden too, so the only way out was guessing that the sliver was
+     hoverable. Hidden now means "dimmed icon rail": narrower and quieter than
+     rail, still legible, still clickable. visibility (not display) on the
+     labels keeps them out of the a11y tree only while they are unreadable. */
   body.cx-rail .cx-nav-item span,
   body.cx-rail .cx-group-label .gl-text,
   body.cx-rail .cx-brand-text,
   body.cx-rail .nav-new-badge,
-  body.cx-hidden .cx-sidebar > *{ opacity:0; visibility:hidden; }
-  body.cx-rail .cx-nav-item{ justify-content:center; padding-left:0; padding-right:0; }
-  body.cx-rail .cx-group-label{ text-align:center; padding-left:0; padding-right:0; }
-  body.cx-rail .cx-side-foot{ flex-direction:column; align-items:center; padding:12px 6px; }
+  body.cx-hidden .cx-nav-item span,
+  body.cx-hidden .cx-group-label .gl-text,
+  body.cx-hidden .cx-brand-text,
+  body.cx-hidden .nav-new-badge{ opacity:0; visibility:hidden; }
+  body.cx-rail .cx-nav-item, body.cx-hidden .cx-nav-item{
+    justify-content:center; padding-left:0; padding-right:0; }
+  body.cx-rail .cx-group-label, body.cx-hidden .cx-group-label{
+    text-align:center; padding-left:0; padding-right:0; }
+  body.cx-rail .cx-side-foot, body.cx-hidden .cx-side-foot{
+    flex-direction:column; align-items:center; padding:12px 6px; }
+  /* Quieter than rail so the two states are distinguishable at a glance, but
+     never invisible — the active item keeps full contrast so you can always
+     tell where you are. */
+  body.cx-hidden .cx-sidebar{ opacity:.62; }
+  body.cx-hidden .cx-sidebar:hover, body.cx-hidden .cx-sidebar:focus-within{ opacity:1; }
+  body.cx-hidden .cx-nav-item.active{ opacity:1; }
+  body.cx-hidden .cx-group-label .gl-caret{ display:none; }
   /* Hover (or keyboard focus) restores the full sidebar, floating above the page. */
   body.cx-rail .cx-sidebar:hover, body.cx-rail .cx-sidebar:focus-within,
   body.cx-hidden .cx-sidebar:hover, body.cx-hidden .cx-sidebar:focus-within{
@@ -1309,8 +1327,17 @@
   body.cx-rail .cx-sidebar:hover .nav-new-badge,
   body.cx-rail .cx-sidebar:focus-within .cx-nav-item span,
   body.cx-rail .cx-sidebar:focus-within .cx-group-label .gl-text,
-  body.cx-hidden .cx-sidebar:hover > *, body.cx-hidden .cx-sidebar:focus-within > *{
+  body.cx-hidden .cx-sidebar:hover .cx-nav-item span,
+  body.cx-hidden .cx-sidebar:hover .cx-group-label .gl-text,
+  body.cx-hidden .cx-sidebar:hover .cx-brand-text,
+  body.cx-hidden .cx-sidebar:hover .nav-new-badge,
+  body.cx-hidden .cx-sidebar:focus-within .cx-nav-item span,
+  body.cx-hidden .cx-sidebar:focus-within .cx-group-label .gl-text{
     opacity:1; visibility:visible; }
+  body.cx-hidden .cx-sidebar:hover .cx-nav-item,
+  body.cx-hidden .cx-sidebar:focus-within .cx-nav-item{
+    justify-content:flex-start; padding-left:12px; padding-right:12px; }
+  body.cx-hidden .cx-sidebar:hover .cx-group-label .gl-caret{ display:block; }
   body.cx-rail .cx-sidebar:hover .cx-nav-item,
   body.cx-rail .cx-sidebar:focus-within .cx-nav-item{
     justify-content:flex-start; padding-left:12px; padding-right:12px; }
@@ -1337,9 +1364,13 @@
     transition:color .15s ease, border-color .15s ease; }
   .cx-sidebar-toggle:hover{ color:var(--accent); border-color:var(--accent-border); }
   .cx-sidebar-toggle:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
-  body.cx-rail .cx-sidebar-toggle, body.cx-hidden .cx-sidebar-toggle{ display:none; }
-  body.cx-rail .cx-sidebar:hover .cx-sidebar-toggle,
-  body.cx-hidden .cx-sidebar:hover .cx-sidebar-toggle{ display:inline-grid; }
+  /* The toggle is how you get BACK, so it is never fully removed — only the
+     brand text beside it collapses. Hiding it was how "hidden" became a state
+     you could enter and not leave. */
+  body.cx-rail .cx-sidebar-toggle, body.cx-hidden .cx-sidebar-toggle{ margin-left:0; }
+  body.cx-rail .cx-brand, body.cx-hidden .cx-brand{ justify-content:center; padding:14px 6px; }
+  body.cx-rail .cx-sidebar:hover .cx-brand, body.cx-hidden .cx-sidebar:hover .cx-brand{
+    justify-content:flex-start; padding:18px 16px 14px; }
 
   @media (prefers-reduced-motion:reduce){
     .cx-sidebar, .gl-caret, .cx-sidebar-toggle{ transition:none; }
