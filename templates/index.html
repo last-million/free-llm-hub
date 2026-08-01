@@ -2417,8 +2417,10 @@
     /* push: user clicked a nav item -> new history entry. fromHash: browser
        back/forward already moved history -> touch nothing. Otherwise (initial
        load, programmatic deep-links) just replace so the hash stays truthful. */
-    if(opts.push){ try{ history.pushState(null, '', '#'+view); }catch(e){} }
-    else if(!opts.fromHash){ try{ history.replaceState(null, '', '#'+view); }catch(e){} }
+    var keepSid = (view === 'sec-agent') ? sessionFromHash() : null;
+    var frag = '#' + view + (keepSid ? '/' + encodeURIComponent(keepSid) : '');
+    if(opts.push){ try{ history.pushState(null, '', frag); }catch(e){} }
+    else if(!opts.fromHash){ try{ history.replaceState(null, '', frag); }catch(e){} }
     try{ window.scrollTo(0, 0); }catch(e){}
     if(opts.focus !== false){
       var h = sec.querySelector('.section-h h2');
@@ -2440,10 +2442,26 @@
       if(seen) badge.hidden = true;
     });
   }
+  /* The hash is "#view" or "#view/<session-id>". Carrying the session in the
+     URL is what makes a refresh land back in the SAME conversation, and what
+     lets two projects run in two tabs at once — each tab owns its own id, and
+     the server already keys sessions independently. */
   function viewFromHash(){
-    var v = (location.hash || '').replace('#','');
+    var v = (location.hash || '').replace('#','').split('/')[0];
     return (v && document.getElementById(v)) ? v : null;
   }
+  function sessionFromHash(){
+    var parts = (location.hash || '').replace('#','').split('/');
+    return parts.length > 1 && parts[1] ? decodeURIComponent(parts[1]) : null;
+  }
+  /* Only ever REPLACE, never push: the session id is where you already are, not
+     a new place, so it must not add a Back-button step per turn. */
+  window.cxSetHashSession = function(view, sid){
+    try {
+      history.replaceState(null, '', '#' + view + (sid ? '/' + encodeURIComponent(sid) : ''));
+    } catch(e){}
+  };
+  window.cxHashSession = sessionFromHash;
   function init(){
     if(!document.getElementById('cx-sidebar')) return;
     document.body.classList.add('cx-on');
@@ -5823,6 +5841,7 @@
     function showStartState(){
       sessionId = null;
       curProjectDir = null;
+      if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', null);
       setSetupVisible(true);
       startRow.hidden = false;
       sessionBox.hidden = true;
@@ -5847,6 +5866,20 @@
         if (el) el.hidden = !on;
       });
     }
+
+    /* Exposed so the URL restorer (which runs outside this closure) can drop
+       straight into an existing conversation, transcript and all. */
+    window.cxResumeAgentSession = function(r){
+      sessionId = r.session_id;
+      if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
+      showSessionState(r.cli, r.project_dir);
+      api('/api/agent/history/' + encodeURIComponent(r.session_id))
+        .then(function(full){
+          mountTranscript(msgsEl, full || {});
+          if (full && (full.turns || []).length) checkpointBtn.disabled = false;
+        })
+        .catch(function(){});
+    };
 
     function showSessionState(cli, dir){
       curProjectDir = dir;
@@ -6132,6 +6165,7 @@
         .then(function(r){
           r = r || {};
           sessionId = r.session_id;
+          if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
           showSessionState(r.cli || cli, r.project_dir || dir);
           toast('Agent session started');
           loadRecentProjects();
@@ -6436,6 +6470,7 @@
       // of pretending to resume something that no longer exists.
       api('/api/agent/sessions/' + encodeURIComponent(conv.session_id)).then(function(r){
         sessionId = conv.session_id;
+        if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
         showSessionState(r.cli || conv.cli_id, r.project_dir || conv.project_dir);
         api('/api/agent/history/' + encodeURIComponent(conv.session_id)).then(function(full){
           mountTranscript(msgsEl, full || {});
@@ -6978,6 +7013,25 @@
   initSubscriptions();
   initAgentSettings();
   initAgent();
+  /* Restore the conversation named in the URL. This is what makes a refresh land
+     back where you were, and what lets two projects run in two tabs at once —
+     each tab carries its own session id and the server already keys sessions
+     independently, so nothing is shared but the hub itself.
+     Sessions are in-memory, so a hub restart loses them; that is reported
+     honestly rather than silently starting a different conversation. */
+  (function restoreSessionFromUrl(){
+    var sid = window.cxHashSession && window.cxHashSession();
+    if (!sid) return;
+    api('/api/agent/sessions/' + encodeURIComponent(sid))
+      .then(function(r){
+        if (!r || !r.session_id) throw new Error('gone');
+        if (window.cxResumeAgentSession) window.cxResumeAgentSession(r);
+      })
+      .catch(function(){
+        if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', null);
+        toast('That conversation is no longer open on the hub — start a new one.', true);
+      });
+  })();
   initArtifactPanel();
   initVisionGap();
   initTestVerification();
