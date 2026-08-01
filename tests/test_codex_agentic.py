@@ -6,6 +6,7 @@ to the disabled state.
 """
 import os
 import sys
+import tempfile
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,7 +15,11 @@ import agentic_chat as ac
 
 
 def _sess(native=None):
-    return types.SimpleNamespace(cli_id="codex", native_session_id=native)
+    # project_dir is required now: the craft brief is written INTO the project
+    # (see agentic_chat.write_task_brief) rather than inlined into argv.
+    import tempfile
+    return types.SimpleNamespace(cli_id="codex", native_session_id=native,
+                                 project_dir=tempfile.gettempdir())
 
 
 # Real event shapes captured from a live `codex exec --json` run (2026-07-17).
@@ -52,7 +57,7 @@ def test_parse_codex_json_failure_when_no_agent_message():
 
 
 def test_build_argv_codex_fresh(monkeypatch):
-    monkeypatch.setattr(ac, "_system_prompt_addition", lambda: "")
+    monkeypatch.setattr(ac, "_system_prompt_addition", lambda *a, **k: "")
     monkeypatch.setattr(ac, "_launcher", lambda b: [b])
     argv = ac._build_argv_codex(_sess(None), "codex", "make a file")
     assert argv == ["codex", "exec", "--json",
@@ -61,7 +66,7 @@ def test_build_argv_codex_fresh(monkeypatch):
 
 
 def test_build_argv_codex_resume(monkeypatch):
-    monkeypatch.setattr(ac, "_system_prompt_addition", lambda: "")
+    monkeypatch.setattr(ac, "_system_prompt_addition", lambda *a, **k: "")
     monkeypatch.setattr(ac, "_launcher", lambda b: [b])
     argv = ac._build_argv_codex(_sess("TID-123"), "codex", "next step")
     assert argv == ["codex", "exec", "resume", "TID-123", "--json",
@@ -80,7 +85,7 @@ def test_build_argv_codex_puts_the_task_first(monkeypatch):
     I'll verify changes by actually running them... What would you like me to
     work on?". It was answering the NOTICE, because the notice was the opening
     line of every message and the real request read as trailing context."""
-    monkeypatch.setattr(ac, "_system_prompt_addition", lambda: "NOTE.")
+    monkeypatch.setattr(ac, "_system_prompt_addition", lambda *a, **k: "NOTE.")
     monkeypatch.setattr(ac, "_launcher", lambda b: [b])
     prompt = ac._build_argv_codex(_sess(None), "codex", "do it")[-1]
     assert prompt.startswith("do it"), "the user's task must lead the prompt"
@@ -93,7 +98,7 @@ def test_build_argv_codex_does_not_repeat_the_notice_on_later_turns(monkeypatch)
     noise — and it read as the user repeating themselves. The agent said so:
     "You've sent that instruction three times now... I won't be acting on
     anything until you give me the actual task"."""
-    monkeypatch.setattr(ac, "_system_prompt_addition", lambda: "NOTE.")
+    monkeypatch.setattr(ac, "_system_prompt_addition", lambda *a, **k: "NOTE.")
     monkeypatch.setattr(ac, "_launcher", lambda b: [b])
     prompt = ac._build_argv_codex(_sess("thread-1"), "codex", "do it")[-1]
     assert prompt == "do it"
@@ -131,9 +136,10 @@ def test_claude_stream_events_text_and_tool():
 
 
 def test_build_argv_claude_stream_uses_stream_json(monkeypatch):
-    monkeypatch.setattr(ac, "_system_prompt_addition", lambda: "")
+    monkeypatch.setattr(ac, "_system_prompt_addition", lambda *a, **k: "")
     monkeypatch.setattr(ac, "_launcher", lambda b: [b])
-    s = types.SimpleNamespace(cli_id="claude", native_session_id=None)
+    s = types.SimpleNamespace(cli_id="claude", native_session_id=None,
+                              project_dir=tempfile.gettempdir())
     argv = ac._build_argv(s, "claude", "hi", stream=True)
     assert "stream-json" in argv and "--verbose" in argv
     argv2 = ac._build_argv(s, "claude", "hi", stream=False)
@@ -141,9 +147,10 @@ def test_build_argv_claude_stream_uses_stream_json(monkeypatch):
 
 
 def test_build_argv_codex_stream_matches_nonstream(monkeypatch):
-    monkeypatch.setattr(ac, "_system_prompt_addition", lambda: "")
+    monkeypatch.setattr(ac, "_system_prompt_addition", lambda *a, **k: "")
     monkeypatch.setattr(ac, "_launcher", lambda b: [b])
-    s = types.SimpleNamespace(cli_id="codex", native_session_id=None)
+    s = types.SimpleNamespace(cli_id="codex", native_session_id=None,
+                              project_dir=tempfile.gettempdir())
     assert ac._build_argv(s, "codex", "hi", stream=True) == ac._build_argv(s, "codex", "hi", stream=False)
     assert "--json" in ac._build_argv(s, "codex", "hi", stream=True)
 
@@ -193,3 +200,91 @@ def test_isolated_path_matches_the_hubs_install_layout():
     expected_dir = app._isolated_install_dir("codex")
     if monkey:                      # only assert when a copy is actually present
         assert monkey.startswith(expected_dir)
+
+
+# --------------------------------------------------------------------------- #
+# Craft briefs reaching the AGENT CHAT.
+#
+# app.py injects them into requests that pass THROUGH the hub. An agent session
+# never does — _agentic_env() strips every hub-pointing variable so the CLI
+# cannot call back into us, and the hub log confirmed it: zero /v1/responses
+# hits while a full session ran. So for the main way people build things here,
+# the design/SEO/image/security rules were reaching nothing.
+#
+# Observed cost: asked for "a restaurant in Fez, Morocco", a session produced
+# "Calvoun Store - Premium Products / Discover Premium Quality / Elevate your
+# lifestyle", selling wireless headphones. "Discover", "Elevate" and the
+# generic-template shape are all named in the WEB_DESIGN ANTI list.
+# --------------------------------------------------------------------------- #
+
+RESTAURANT = ("crerat ebst store website web deisng you can do pleae for restaurant "
+              "in fez in morocco it shodul be very engaigng converison rate and many "
+              "secitons ad shoudl have images of course")
+
+
+def _sess_in(tmp, cli="codex", native=None):
+    return types.SimpleNamespace(cli_id=cli, native_session_id=native, project_dir=tmp)
+
+
+def test_the_brief_is_written_into_the_project(monkeypatch):
+    d = tempfile.mkdtemp(prefix="hubbrief-")
+    assert ac.write_task_brief(d, RESTAURANT) is True
+    body = open(os.path.join(d, ac.BRIEF_FILENAME), encoding="utf-8").read()
+    assert "WEB DESIGN BRIEF" in body
+    assert "Elevate" in body, "the ANTI list must reach the agent"
+
+
+def test_no_brief_file_for_a_task_that_needs_none():
+    d = tempfile.mkdtemp(prefix="hubbrief-")
+    assert ac.write_task_brief(d, "explain how a mutex works") is False
+    assert not os.path.exists(os.path.join(d, ac.BRIEF_FILENAME))
+
+
+def test_both_clis_point_at_the_brief(monkeypatch):
+    """It has to work for every CLI, not just the default one."""
+    monkeypatch.setattr(ac, "_launcher", lambda b: [b])
+    d = tempfile.mkdtemp(prefix="hubbrief-")
+    codex = ac._build_argv_codex(_sess_in(d), "codex", RESTAURANT)
+    claude = ac._build_argv(_sess_in(d, "claude"), "claude", RESTAURANT)
+    for name, argv in (("codex", codex), ("claude", claude)):
+        joined = " ".join(argv)
+        assert ac.BRIEF_FILENAME in joined, name
+        assert "restate in ONE line" in joined, name
+
+
+def test_the_command_line_stays_under_the_windows_ceiling(monkeypatch):
+    """The briefs are ~9,000 chars. Inlining them would have taken the worst
+    case to roughly 15,700 against cmd.exe's ~8191 limit and broken every turn
+    on Windows — which is why they go in a FILE and the prompt just points."""
+    monkeypatch.setattr(ac, "_launcher", lambda b: [b])
+    d = tempfile.mkdtemp(prefix="hubbrief-")
+    for build, cli in ((ac._build_argv_codex, "codex"),):
+        argv = build(_sess_in(d, cli), cli, RESTAURANT)
+        assert sum(len(a) for a in argv) < 8191, cli
+    argv = ac._build_argv(_sess_in(d, "claude"), "claude", RESTAURANT)
+    assert sum(len(a) for a in argv) < 8191
+
+
+def test_the_brief_is_not_resent_on_later_turns(monkeypatch):
+    """`resume` already carries the earlier turns."""
+    monkeypatch.setattr(ac, "_launcher", lambda b: [b])
+    d = tempfile.mkdtemp(prefix="hubbrief-")
+    prompt = ac._build_argv_codex(_sess_in(d, native="T1"), "codex", RESTAURANT)[-1]
+    assert prompt == RESTAURANT
+    assert not os.path.exists(os.path.join(d, ac.BRIEF_FILENAME))
+
+
+def test_the_agent_is_told_to_restate_the_subject(monkeypatch):
+    """The request mixed "store website" with "restaurant in fez" and the model
+    resolved that silently and wrongly. One restated line surfaces it in
+    seconds instead of after a full build."""
+    add = ac._system_prompt_addition(RESTAURANT)
+    assert "restate in ONE line" in add
+    assert "Never substitute a generic template" in add
+
+
+def test_a_brief_failure_never_costs_the_user_their_turn(monkeypatch):
+    """Standards are a bonus; a read-only folder must not break the session."""
+    monkeypatch.setattr(ac.craft, "system_message",
+                        lambda t: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert ac.write_task_brief(tempfile.mkdtemp(), RESTAURANT) is False

@@ -112,6 +112,7 @@ import time
 import uuid
 
 import config
+import craft
 import vision_status
 
 # --------------------------------------------------------------------------- #
@@ -189,6 +190,14 @@ _TURN_TIMEOUT = int(os.environ.get("AGENTIC_CHAT_TIMEOUT", "600") or "600")
 # chars -- a >1150-char buffer under the ~8191 ceiling. If either snippet's
 # text grows meaningfully, recheck this arithmetic rather than assume it still
 # fits.
+#
+# RECHECKED 2026-08-01, exactly as that last line asks. The craft briefs had to
+# start reaching agent sessions (app.py only injects them into requests that go
+# THROUGH the hub, and an agent session never does -- see write_task_brief).
+# They are ~9,000 chars: inlining them would have put the worst case near 15,700
+# and broken every turn on Windows. So they go in a FILE in the project and the
+# prompt spends ~200 chars pointing at it. Measured after the change: 931 argv
+# chars for codex, 896 for claude, both with a full brief in play.
 _MAX_MESSAGE_CHARS = 6000
 
 # SIGTERM (or the Windows "soft" taskkill attempt) -> SIGKILL/"hard" taskkill
@@ -664,10 +673,42 @@ _VISION_GAP_SNIPPET = (
 )
 
 
-def _system_prompt_addition() -> str:
-    """Extra --append-system-prompt text for this turn, or "" for none.
-    Two independently-gated, additive pieces -- never raises (a diagnostics
-    read failing must never block a turn from running)."""
+_BRIEF_POINTER = (
+    "This folder contains %s -- required standards for this task. "
+    "READ IT FIRST and follow it."
+)
+
+_RESTATE_SNIPPET = (
+    "Before you create anything, restate in ONE line what you are building and "
+    "for whom, naming the actual subject and place from the request. If the "
+    "request is unclear or contradicts itself, ask one short question instead "
+    "of guessing. Never substitute a generic template for the subject you were "
+    "given."
+)
+
+
+def _system_prompt_addition(text: str = "", has_brief: bool = False) -> str:
+    """Extra system-prompt text for this turn, or "" for none. Never raises --
+    a diagnostics read failing must not block a turn from running.
+
+    THE CRAFT BRIEFS HAVE TO BE INJECTED HERE, not on the gateway path.
+    app.py injects them into requests that pass THROUGH the hub, but an agent
+    session never does: _agentic_env() deliberately strips every hub-pointing
+    variable so the CLI cannot call back into us, and the hub log confirms it --
+    zero /v1/responses hits while a session ran a full turn. So for the main way
+    people actually build things here, the design/SEO/image/security rules were
+    reaching nothing.
+
+    That is not academic. Asked for "a restaurant in Fez, Morocco", a session
+    produced "Calvoun Store - Premium Products / Discover Premium Quality /
+    Elevate your lifestyle", selling wireless headphones. "Discover", "Elevate"
+    and the generic-template shape are all named in the WEB_DESIGN ANTI list --
+    the list simply never arrived.
+
+    _RESTATE_SNIPPET is the other half of that failure: the request mixed
+    "store website" with "restaurant in fez", and the model resolved the
+    ambiguity silently and wrongly. One restated line surfaces that in seconds
+    instead of after a full build."""
     parts = []
     if test_verification_enabled():
         parts.append(_TEST_VERIFICATION_SNIPPET)
@@ -677,7 +718,46 @@ def _system_prompt_addition() -> str:
         available = True  # fail closed on the NOTICE (stay silent), not on the turn
     if not available:
         parts.append(_VISION_GAP_SNIPPET)
-    return " ".join(parts)
+    if text:
+        parts.append(_RESTATE_SNIPPET)
+    if has_brief:
+        parts.append(_BRIEF_POINTER % BRIEF_FILENAME)
+    # chr(10) rather than a backslash-n literal: this file gets edited through
+    # tooling that has repeatedly turned that escape into a RAW newline, which
+    # splits the string across lines and makes the module unimportable.
+    sep = chr(10) + chr(10)
+    return sep.join(p for p in parts if p)
+
+
+BRIEF_FILENAME = ".calvoun-brief.md"
+
+
+def write_task_brief(project_dir, text):
+    """Write the craft brief for `text` into the project, return True if any.
+
+    WHY A FILE AND NOT MORE PROMPT: the prompt travels as a POSITIONAL argv
+    argument through `cmd.exe /c <shim.cmd> ...` on Windows, and that command
+    line dies at ~8191 chars -- which is exactly why _MAX_MESSAGE_CHARS exists.
+    The briefs are ~9,000 chars on their own; inlining them would have taken the
+    worst case to roughly 15,700 and broken every turn on this platform.
+
+    An agent has file tools. So the standards go in a file it reads, the prompt
+    spends ~200 characters telling it to, and the full brief arrives intact.
+
+    Rewritten each turn it applies, so the standards always match the CURRENT
+    request rather than whatever the first message happened to be about."""
+    try:
+        brief = craft.system_message(text or "")
+        if not brief:
+            return False
+        path = os.path.join(project_dir, BRIEF_FILENAME)
+        header = ("<!-- Written by Calvoun Free LLM Hub for THIS task. "
+                  "Safe to delete; it is regenerated whenever it applies. -->")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(header + chr(10) + chr(10) + brief["content"] + chr(10))
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False        # standards are a bonus; never cost the user a turn
 
 
 def _build_argv(sess: _Session, bin_path: str, text: str, stream=False):
@@ -693,7 +773,10 @@ def _build_argv(sess: _Session, bin_path: str, text: str, stream=False):
              "--dangerously-skip-permissions", "--model", _MODEL_ALIAS]
     if stream:
         args += ["--verbose"]  # claude -p requires --verbose alongside stream-json
-    addition = _system_prompt_addition()
+    first = not sess.native_session_id
+    addition = _system_prompt_addition(
+        text if first else "",
+        has_brief=first and write_task_brief(sess.project_dir, text))
     if addition:
         args += ["--append-system-prompt", addition]
     return _launcher(bin_path) + args
@@ -731,7 +814,11 @@ def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
     # So: task first, notice appended and clearly marked as ancillary, and only
     # while there is no thread to resume — `resume` already carries the earlier
     # turns, so re-sending it is pure noise.
-    addition = _system_prompt_addition() if not sess.native_session_id else ""
+    if sess.native_session_id:
+        addition = ""
+    else:
+        addition = _system_prompt_addition(
+            text, has_brief=write_task_brief(sess.project_dir, text))
     prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
         if addition else text
     base = ["exec"]
