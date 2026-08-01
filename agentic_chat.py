@@ -114,6 +114,7 @@ import uuid
 import config
 import craft
 import vision_status
+import workspace
 
 # --------------------------------------------------------------------------- #
 # Config / constants
@@ -128,7 +129,7 @@ _MASTER_FLAG = "agentic_chat_enabled"          # config flag, default OFF
 # the agent that testing/verifying its own work this session is expected.
 _TEST_VERIFICATION_FLAG = "agentic_test_verification_enabled"
 
-_CLI_BIN = {"claude": "claude", "codex": "codex"}
+_CLI_BIN = {"claude": "claude", "codex": "codex", "opencode": "opencode"}
 
 # A session id reaches agentic_history, which turns it into a FILENAME. Reusing
 # a caller-supplied id (resume_session) is therefore only safe against the same
@@ -171,6 +172,19 @@ _SUPPORT = {
     # which the earlier scoping could not confirm from docs. Writes go to the
     # subprocess cwd (we spawn with cwd=project_dir), so resume needs no -C.
     "codex": (True, None),
+    # OpenCode enabled after live verification on opencode-ai 1.18.11
+    # (2026-08-01): `opencode run --format json` emits one JSON event per line
+    # (step_start / tool_use / text / step_finish), every event carries
+    # sessionID, and `--session <id>` continues that session. Writes go to the
+    # subprocess cwd, same as codex.
+    #
+    # ONE HARD REQUIREMENT, found the slow way: it must be spawned with stdin
+    # CLOSED. With an open pipe it loads its config, logs "init", and then
+    # blocks forever -- measured at 0 bytes of output after 200s, twice, with
+    # no error. The same invocation with stdin at /dev/null answered in under
+    # a second. send_message/send_message_stream already pass
+    # stdin=subprocess.DEVNULL for every CLI, which is what makes this safe.
+    "opencode": (True, None),
 }
 
 # Each agentic turn can run real tool use (file edits, shell commands), so this
@@ -459,7 +473,8 @@ def _terminate(proc) -> None:
 
 class _Session:
     __slots__ = ("id", "cli_id", "project_dir", "native_session_id", "turn_count",
-                 "created_at", "proc", "proc_lock", "turn_lock", "last_interrupted")
+                 "created_at", "proc", "proc_lock", "turn_lock", "last_interrupted",
+                 "tools_notified")
 
     def __init__(self, cli_id, project_dir):
         self.id = uuid.uuid4().hex
@@ -472,6 +487,7 @@ class _Session:
         self.proc_lock = threading.Lock()  # guards .proc
         self.turn_lock = threading.Lock()  # only one turn may run at a time
         self.last_interrupted = False
+        self.tools_notified = False        # missing-toolchain notice, once per session
 
 
 _REGISTRY: dict[str, _Session] = {}
@@ -763,6 +779,8 @@ def write_task_brief(project_dir, text):
 def _build_argv(sess: _Session, bin_path: str, text: str, stream=False):
     if sess.cli_id == "codex":
         return _build_argv_codex(sess, bin_path, text)  # --json serves stream + non-stream
+    if sess.cli_id == "opencode":
+        return _build_argv_opencode(sess, bin_path, text)      # ditto
     if sess.cli_id != "claude":
         # Fail loudly rather than silently mis-running an unknown CLI.
         raise AgenticError("No known invocation for CLI '%s'." % sess.cli_id, 400)
@@ -829,6 +847,117 @@ def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
         base += ["--json", "--dangerously-bypass-approvals-and-sandbox",
                  "--skip-git-repo-check", prompt]
     return _launcher(bin_path) + base
+
+
+def _build_argv_opencode(sess: "_Session", bin_path: str, text: str):
+    """OpenCode agentic invocation (opencode-ai 1.18.11, live-verified).
+
+    Turn 1:  opencode run --format json <prompt>
+    Turn 2+: opencode run --format json --session <sessionID> <prompt>
+
+    The prompt is POSITIONAL, like codex. The project dir is the subprocess cwd
+    (set by send_message's Popen), which is also where opencode looks for a
+    project-local opencode.json -- so a project configured to talk to this hub
+    just works.
+
+    No --append-system-prompt equivalent exists, so the standing notice is
+    inlined into the prompt AFTER the task and only on the first turn, for
+    exactly the reason recorded in _build_argv_codex: leading with the notice
+    made the agent answer the notice instead of the user."""
+    if sess.native_session_id:
+        addition = ""
+    else:
+        addition = _system_prompt_addition(
+            text, has_brief=write_task_brief(sess.project_dir, text))
+    prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
+        if addition else text
+    args = ["run", "--format", "json"]
+    if sess.native_session_id:
+        args += ["--session", sess.native_session_id]
+    args += [prompt]
+    return _launcher(bin_path) + args
+
+
+def _parse_opencode_json(stdout, stderr, returncode):
+    """Parse `opencode run --format json` JSONL -> (text, session_id, detail).
+
+    Every event carries sessionID, so the id for `--session` comes from the
+    first one that has it. The reply is the LAST `text` part: a turn that used
+    tools emits step_start / tool_use / step_finish and then a fresh step whose
+    text part is the actual answer."""
+    text_parts, session_id = [], None
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue                       # log noise interleaved on stdout
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if not session_id and isinstance(ev.get("sessionID"), str):
+            session_id = ev["sessionID"]
+        part = ev.get("part") or {}
+        if ev.get("type") == "text" and isinstance(part.get("text"), str):
+            if part["text"].strip():
+                text_parts.append(part["text"])
+        elif ev.get("type") == "error":
+            err = ev.get("error") or {}
+            data = err.get("data") or {}
+            msg = data.get("message") or err.get("name") or "opencode reported an error"
+            return None, session_id, _sanitize(str(msg), 400)
+    if text_parts:
+        return text_parts[-1], session_id, None
+    if returncode != 0:
+        detail = _sanitize((stderr or stdout or "").strip()[-400:], 400)
+        return None, session_id, detail or ("opencode exited with %s" % returncode)
+    return None, session_id, "opencode produced no reply."
+
+
+def _opencode_stream_events(line):
+    """One `opencode run --format json` line -> normalized event dicts."""
+    line = (line or "").strip()
+    if not line.startswith("{"):
+        return []
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return []
+    if not isinstance(ev, dict):
+        return []
+    out = []
+    sid = ev.get("sessionID")
+    if isinstance(sid, str) and sid:
+        out.append({"_native": sid})       # idempotent; the session keeps the first
+    etype = ev.get("type")
+    part = ev.get("part") or {}
+    if etype == "tool_use":
+        tool = part.get("tool") or part.get("name")
+        if isinstance(tool, str) and tool:
+            detail = ""
+            state = part.get("state") or {}
+            inp = state.get("input") if isinstance(state, dict) else None
+            if isinstance(inp, dict):
+                # Whichever of these a tool carries is the useful bit: which
+                # file, or which command. A bare tool name says nothing.
+                for k in ("filePath", "path", "command", "pattern", "query"):
+                    if isinstance(inp.get(k), str) and inp[k]:
+                        detail = " " + inp[k][:160]
+                        break
+            out.append({"event": "tool", "text": tool + detail})
+    elif etype == "text":
+        txt = part.get("text")
+        if isinstance(txt, str) and txt.strip():
+            out.append({"event": "message", "text": txt})
+            out.append({"_final": txt})
+    elif etype == "error":
+        err = ev.get("error") or {}
+        data = err.get("data") or {}
+        msg = data.get("message") or err.get("name")
+        if isinstance(msg, str) and msg:
+            out.append({"event": "notice", "text": msg})
+    return out
 
 
 def _parse_codex_json(stdout, stderr, returncode):
@@ -1016,10 +1145,9 @@ def send_message(session_id, text):
             return 499, None, "Turn was stopped."
         if timed_out:
             return 504, None, "%s timed out after %ds." % (sess.cli_id, _TURN_TIMEOUT)
-        if sess.cli_id == "codex":
-            result_text, native_id, detail = _parse_codex_json(stdout, stderr, proc.returncode)
-        else:
-            result_text, native_id, detail = _parse_claude_json(stdout, stderr, proc.returncode)
+        parser = {"codex": _parse_codex_json,
+                  "opencode": _parse_opencode_json}.get(sess.cli_id, _parse_claude_json)
+        result_text, native_id, detail = parser(stdout, stderr, proc.returncode)
         if result_text is None:
             detail = detail or "%s produced no output." % sess.cli_id
             status = 403 if _looks_like_auth_error(detail) else 502
@@ -1148,6 +1276,20 @@ def send_message_stream(session_id, text):
     timed_out = [False]
     stderr_buf = []
     try:
+        # Say what this project needs BEFORE running anything, in the chat, in
+        # plain language and with the download page. Without it a machine
+        # missing Node fails somewhere inside npm with "[WinError 2] The system
+        # cannot find the file specified" -- true, and useless to someone who
+        # has never installed a toolchain. Once per session: it is a fact about
+        # the computer, not about the turn.
+        if not sess.tools_notified:
+            sess.tools_notified = True
+            try:
+                notice = workspace.missing_tools_message(sess.project_dir)
+            except Exception:                                    # noqa: BLE001
+                notice = None
+            if notice:
+                yield {"event": "notice", "text": notice}
         bin_path = _resolve_bin(sess.cli_id)
         if not bin_path:
             yield err(502, "'%s' is no longer on PATH." % _CLI_BIN[sess.cli_id]); return
@@ -1187,7 +1329,8 @@ def send_message_stream(session_id, text):
         timer.daemon = True
         timer.start()
 
-        parse = _codex_stream_events if sess.cli_id == "codex" else _claude_stream_events
+        parse = {"codex": _codex_stream_events,
+                 "opencode": _opencode_stream_events}.get(sess.cli_id, _claude_stream_events)
         native_id = None
         final_text = None
         try:

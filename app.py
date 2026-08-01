@@ -709,7 +709,7 @@ def _strong_new_version_score(low):
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
 #                 hy3    k3     sol  terra k2.6  claude gpt5.5+ glm5.x gpt5.x  dsv4   mm3
-_PREF_FLOORS = (134.5, 134.8, 136, 135, 0,    138,   136,    134,   135,   133.5, 133)
+_PREF_FLOORS = (134.5, 134.8, 136, 135, 0,    138,   136,    134,   135,   134,   133)
 # kimi-k2.6/k2.7 are CAPPED, not floored: the user ranks them below qwen3.5/
 # 3.6 (108-109) and below mimo-2.5 (100), so the ceiling sits just under mimo.
 _KIMI_K2_CEILING = 98
@@ -1143,7 +1143,10 @@ def _benchmark_score(pid, model_id):
         score = max(score, _PREF_FLOORS[7])
     # USER PREFERENCE 2026-08-01: "DeepSeek V4 should have priority almost as
     # much as GLM 5.2, and MiniMax M3 is also good, almost like DeepSeek 4."
-    # So they slot in immediately BELOW glm-5.x (134) and in that order, which
+    # UPDATED 2026-08-01, same day: "deepseek v4 seems good so it should be the
+    # SAME level as glm 5.2" — so deepseek-v4 is no longer just under glm-5.x,
+    # it is level with it at 134. MiniMax M3 keeps its "almost like DeepSeek 4"
+    # place immediately below. In that order, which
     # puts both above the whole qwen/mimo field without displacing the named top
     # four (claude 138 / gpt-5.x 135-137 / kimi-k3 134.8 / hy3 134.5).
     # mimo-2.5 needs no rule: it sits at 100 and is already under all of them.
@@ -1153,9 +1156,18 @@ def _benchmark_score(pid, model_id):
         score = max(score, _PREF_FLOORS[10])
     # USER PREFERENCE 2026-08-01: "gemini flash or pro 3.1, 3.5, 3.6 and up are
     # better than deepseek 4 / v4 — but gemini pro is better than gemini flash,
-    # of course." Two bands between glm-5.x (134) and deepseek-v4 (133.5):
-    #   pro    133.750 .. 133.940
-    #   flash  133.550 .. 133.740
+    # of course."
+    #
+    # These bands moved UP on 2026-08-01 (later the same day) and the move was
+    # forced, not chosen: the user then said DeepSeek V4 should sit at the SAME
+    # level as glm-5.2, which took deepseek-v4 from 133.5 to 134. Gemini had to
+    # stay above deepseek — that is the instruction above, unretracted — so it
+    # now sits above glm-5.2 too. Nobody ever said "glm beats gemini"; that was
+    # an inference from deepseek being below glm, and it stopped holding the
+    # moment deepseek drew level. Two bands between glm/deepseek (134) and
+    # hy3-large (134.5):
+    #   pro    134.250 .. 134.440
+    #   flash  134.050 .. 134.240
     # Both scale off the FULL version number so a newer gemini always outranks
     # an older one (scaling on the minor alone put gemini-4.0 below gemini-3.6),
     # and the bands cannot overlap, so pro always beats flash of ANY version.
@@ -1171,7 +1183,7 @@ def _benchmark_score(pid, model_id):
     if _gem and "flash-lite" not in low:
         _gver = int(_gem.group(1)) + int(_gem.group(2) or 0) / 10.0
         if _gver >= 3.1:
-            _gbase = 133.75 if "pro" in low else 133.55
+            _gbase = 134.25 if "pro" in low else 134.05
             score = max(score, _gbase + min(_gver - 3.1, 7.6) * 0.025)
             _gem_floored = True
     # 2026-07-30: the 2026-07-25 qwen -45 demotion is REMOVED — qwen3 is a strong
@@ -7720,6 +7732,34 @@ def api_agent_end_session(session_id):
         except Exception as exc:                                 # noqa: BLE001
             log.warning("could not stop the preview for %s: %s", project_dir, exc)
     return jsonify({"ended": ended, "app_closed": bool(closed)})
+
+
+@app.route("/api/agent/clis/<cli_id>/install", methods=["POST"])
+def api_agent_cli_install(cli_id):
+    """Install one agent CLI on demand, from the picker.
+
+    Exists because the old path went through /api/subscriptions/<sub-*>/
+    install-isolated, and that only covers CLIs that ARE subscription providers
+    -- claude and codex. opencode is not one (it brings its own provider), so
+    it had no install button at all. This works for every CLI the agent chat
+    can drive, and does both halves: the machine's own copy, and the hub's
+    isolated one."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    if cli_id not in _ISOLATED_NPM_PACKAGE:
+        return jsonify({"error": "Unknown CLI '%s'." % _sanitize(str(cli_id), 40)}), 400
+    bin_name = _CLI_BIN_NAME.get(cli_id, cli_id)
+    out = {"cli": cli_id}
+    if not shutil.which(bin_name):
+        ok, res = _install_global_cli(cli_id)
+        out["global"] = {"ok": ok, "error": res.get("error")}
+    ok, res = _install_isolated_cli(cli_id, bin_name)
+    res.pop("_status", None)
+    out["isolated"] = {"ok": ok, "error": res.get("error")}
+    if not ok and not out.get("global", {}).get("ok"):
+        return jsonify({"error": res.get("error") or "install failed", **out}), 502
+    return jsonify({"ok": True, **out})
 
 
 @app.route("/api/agent/new-project", methods=["POST"])
