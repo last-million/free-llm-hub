@@ -692,10 +692,29 @@ def discover(project_dir):
     with _lock:
         if project_dir in _procs or project_dir in _adopted:
             return None
+        # A port ANOTHER project already owns is not ours to take. Without this,
+        # starting a fresh project while the previous one was still serving on
+        # :3000 adopted that server and showed the OLD project's site in the new
+        # project's preview -- reported, and exactly the ambiguity a port scan
+        # invites.
+        taken = {a["port"] for a in _adopted.values()}
+        taken |= {p.port for p in _procs.values()}
+
+    # An EMPTY project cannot be serving anything, so scanning on its behalf can
+    # only ever find somebody else's server. Require something runnable first.
+    if not _is_runnable(project_dir):
+        return None
+
+    want = _fingerprint(project_dir)
     for port in _DEV_PORTS:
-        if not _port_open(port):
+        if port in taken:
             continue
-        if not _http_ok(port):
+        if not _port_open(port) or not _http_ok(port):
+            continue
+        # When the project has its own index.html we can do better than guess:
+        # ask the port what it is serving and require it to match. That turns
+        # "something is listening" into actual evidence of ownership.
+        if want and not _serves_fingerprint(port, want):
             continue
         try:
             adopt(project_dir, "http://127.0.0.1:%d" % port, source="detected")
@@ -703,6 +722,42 @@ def discover(project_dir):
         except WorkspaceError:
             continue
     return None
+
+
+def _fingerprint(project_dir):
+    """A distinctive string from the project's own index.html, or None.
+
+    The <title> is the cheapest thing that is both present and specific in
+    almost every generated page, and it is what tells one project's dev server
+    apart from another's."""
+    for rel in ("index.html", os.path.join("public", "index.html"),
+                os.path.join("dist", "index.html"), os.path.join("src", "index.html")):
+        path = os.path.join(project_dir, rel)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                head = fh.read(8000)
+        except OSError:
+            continue
+        m = re.search(r"<title[^>]*>([^<]{3,120})</title>", head, re.I)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _serves_fingerprint(port, want, timeout=1.5):
+    """Does this port serve a page carrying `want`?
+
+    Best-effort and FAIL-CLOSED: anything unreadable counts as "not a match", so
+    an uncertain scan declines to adopt rather than showing the wrong project."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/" % port, timeout=timeout) as r:
+            body = r.read(200000).decode("utf-8", "replace")
+    except Exception:                                            # noqa: BLE001
+        return False
+    return want.lower() in body.lower()
 
 
 def forget(project_dir):
