@@ -5890,8 +5890,17 @@
     var panel = $('#artifact-panel');
     var frame = $('#artifact-frame');
     if (!panel || !frame) return;
-    frame.srcdoc = html;               // sandboxed iframe only — never innerHTML into the page
     panel.hidden = false;
+    /* Served from its own URL rather than srcdoc. A srcdoc iframe INHERITS the
+       embedder's CSP, and ours is default-src 'none' — so every webfont,
+       stylesheet and image a generated page references was refused, filling the
+       dashboard console with CSP errors and failed requests for a page that was
+       never going to render properly anyway. Its own document gets its own
+       policy; the iframe stays sandboxed without allow-same-origin, so it still
+       has an opaque origin and cannot reach the dashboard. */
+    api('/api/artifact', { method: 'POST', body: { html: html } })
+      .then(function(r){ frame.removeAttribute('srcdoc'); frame.src = r.url; })
+      .catch(function(){ frame.srcdoc = html; });   // fall back rather than show nothing
   }
   function closeArtifactPanel(){
     var panel = $('#artifact-panel');
@@ -5899,7 +5908,7 @@
     panel.hidden = true;
     panel.classList.remove('is-fullscreen');
     var frame = $('#artifact-frame');
-    if (frame) frame.srcdoc = '';
+    if (frame){ frame.removeAttribute('srcdoc'); frame.src = 'about:blank'; }
   }
   function initArtifactPanel(){
     var panel = $('#artifact-panel');
@@ -7696,7 +7705,12 @@
   (function restoreSessionFromUrl(){
     var sid = window.cxHashSession && window.cxHashSession();
     if (!sid) return;
-    api('/api/agent/sessions/' + encodeURIComponent(sid))
+    /* A session that did not survive a hub restart is the NORMAL case here, not
+       an error — probing it first logged a red 404 on every such reload. Ask the
+       server to resume from the stored transcript instead: it succeeds whether
+       or not the in-memory session is still there. */
+    api('/api/agent/sessions/' + encodeURIComponent(sid) + '/resume',
+        { method: 'POST', body: {} })
       .then(function(r){
         if (!r || !r.session_id) throw new Error('gone');
         if (window.cxResumeAgentSession) window.cxResumeAgentSession(r);
