@@ -1417,10 +1417,18 @@
      shrinking into uselessness. */
   .agent-split{ display:grid; grid-template-columns:1fr; gap:12px; }
   @media (min-width:1100px){
-    .agent-split{ grid-template-columns:minmax(0,1fr) minmax(0,1.05fr); align-items:stretch; }
+    /* The artifact view is the thing being judged, so it gets the larger share.
+       Height tracks the viewport rather than the content: a preview box that
+       grows and shrinks with the chat transcript is unusable for looking at a
+       page. 190px is the shell above it (header + section bar + input row). */
+    .agent-split{ grid-template-columns:minmax(0,0.78fr) minmax(0,1.32fr);
+      align-items:stretch; min-height:calc(100vh - 190px); }
   }
-  .agent-chat-col{ display:flex; flex-direction:column; gap:10px; min-width:0; }
-  .agent-preview-col{ display:flex; flex-direction:column; gap:8px; min-width:0;
+  .agent-chat-col{ display:flex; flex-direction:column; gap:10px; min-width:0; min-height:0; }
+  /* Without min-height:0 a flex child refuses to shrink below its content, so
+     the transcript pushes the whole split taller instead of scrolling. */
+  .agent-chat-col .chat-messages{ flex:1; min-height:0; overflow:auto; }
+  .agent-preview-col{ display:flex; flex-direction:column; gap:8px; min-width:0; min-height:0;
     border:1px solid var(--border); border-radius:var(--radius); overflow:hidden;
     background:var(--card); }
   .preview-bar{ display:flex; align-items:center; gap:8px; padding:8px 10px;
@@ -2310,10 +2318,22 @@
   }
 
   /* Collapsible nav groups. */
+  /* Groups that start collapsed for a first-time visitor. Insights is
+     reference data you go looking for, not somewhere you navigate on the way to
+     doing something — so it costs nav height every session for nothing. A
+     stored preference always wins over this. */
+  var CX_COLLAPSED_BY_DEFAULT = { insights: true };
+
   function initNavGroups(){
-    var collapsed = {};
-    try { collapsed = JSON.parse(localStorage.getItem('cx_nav_collapsed') || '{}') || {}; }
-    catch(e){ collapsed = {}; }
+    var collapsed = null;
+    try {
+      var raw = localStorage.getItem('cx_nav_collapsed');
+      collapsed = raw ? JSON.parse(raw) : null;
+    } catch(e){ collapsed = null; }
+    if (!collapsed || typeof collapsed !== 'object'){
+      collapsed = {};
+      for (var k in CX_COLLAPSED_BY_DEFAULT) collapsed[k] = CX_COLLAPSED_BY_DEFAULT[k];
+    }
     Array.prototype.forEach.call(document.querySelectorAll('.cx-group'), function(g){
       var key = g.dataset.group || '';
       var btn = g.querySelector('.cx-group-label');
@@ -5622,11 +5642,21 @@
           behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
       }
 
+      /* Give up after a few consecutive failures instead of retrying every 2s
+         forever. Measured against a stale server: an unreachable status route
+         produced 197 console errors in a couple of minutes, which buries any
+         real error the user needs to see. */
+      var fails = 0, MAX_FAILS = 5;
       function poll(){
         if (!dir) return;
         api('/api/workspace/status?project_dir=' + encodeURIComponent(dir))
-          .then(render)
-          .catch(function(){ /* transient — the next tick retries */ });
+          .then(function(st){ fails = 0; render(st); })
+          .catch(function(){
+            if (++fails >= MAX_FAILS){
+              stopPolling();
+              setState('lost contact with the hub — press Run to retry', 'bad');
+            }
+          });
       }
 
       function startPolling(){
