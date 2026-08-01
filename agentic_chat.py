@@ -636,8 +636,27 @@ def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
     --append-system-prompt, so the optional test/vision notice is prepended into
     the prompt text. --skip-git-repo-check is only passed on the fresh turn (the
     `resume` subcommand doesn't accept it and the repo was already checked)."""
-    addition = _system_prompt_addition()
-    prompt = (addition + "\n\n" + text) if addition else text
+    # THE USER'S TASK GOES FIRST, and the standing notice only on the FIRST turn.
+    #
+    # Claude gets these through --append-system-prompt, a real system channel.
+    # Codex has no such flag, so they are inlined into the prompt — and inlining
+    # them AHEAD of the task, on EVERY turn, broke the agent outright. Observed
+    # verbatim: the user asked four times for a restaurant website and got back
+    # "That's noted as a standing instruction — I'll verify changes by actually
+    # running them... What would you like me to work on?" and then "You've sent
+    # that instruction three times now... I won't be acting on anything until you
+    # give me the actual task."
+    #
+    # It was answering the NOTICE, because the notice was the opening line of
+    # every message and the real request read as trailing context. Repeating it
+    # each turn made it look like the user kept sending the same instruction.
+    #
+    # So: task first, notice appended and clearly marked as ancillary, and only
+    # while there is no thread to resume — `resume` already carries the earlier
+    # turns, so re-sending it is pure noise.
+    addition = _system_prompt_addition() if not sess.native_session_id else ""
+    prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
+        if addition else text
     base = ["exec"]
     if sess.native_session_id:
         base += ["resume", sess.native_session_id, "--json",

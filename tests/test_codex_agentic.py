@@ -70,11 +70,33 @@ def test_build_argv_codex_resume(monkeypatch):
     assert "--skip-git-repo-check" not in argv
 
 
-def test_build_argv_codex_prepends_system_prompt(monkeypatch):
+def test_build_argv_codex_puts_the_task_first(monkeypatch):
+    """Codex has no --append-system-prompt, so the notice is inlined — but it
+    must come AFTER the task.
+
+    ASSERTION CORRECTED 2026-08-01. It used to require "NOTE.\\n\\ndo it", and
+    that ordering broke the agent in practice: the user asked four times for a
+    restaurant website and got back "That's noted as a standing instruction —
+    I'll verify changes by actually running them... What would you like me to
+    work on?". It was answering the NOTICE, because the notice was the opening
+    line of every message and the real request read as trailing context."""
     monkeypatch.setattr(ac, "_system_prompt_addition", lambda: "NOTE.")
     monkeypatch.setattr(ac, "_launcher", lambda b: [b])
-    argv = ac._build_argv_codex(_sess(None), "codex", "do it")
-    assert argv[-1] == "NOTE.\n\ndo it"  # codex has no --append-system-prompt
+    prompt = ac._build_argv_codex(_sess(None), "codex", "do it")[-1]
+    assert prompt.startswith("do it"), "the user's task must lead the prompt"
+    assert "NOTE." in prompt
+    assert "Standing instruction" in prompt, "the notice must be marked ancillary"
+
+
+def test_build_argv_codex_does_not_repeat_the_notice_on_later_turns(monkeypatch):
+    """`resume` already carries the earlier turns, so re-sending it every turn is
+    noise — and it read as the user repeating themselves. The agent said so:
+    "You've sent that instruction three times now... I won't be acting on
+    anything until you give me the actual task"."""
+    monkeypatch.setattr(ac, "_system_prompt_addition", lambda: "NOTE.")
+    monkeypatch.setattr(ac, "_launcher", lambda b: [b])
+    prompt = ac._build_argv_codex(_sess("thread-1"), "codex", "do it")[-1]
+    assert prompt == "do it"
 
 
 def test_codex_is_default_and_supported():
