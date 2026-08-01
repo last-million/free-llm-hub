@@ -47,7 +47,8 @@ routing heuristics.
 - `run-hidden.vbs` starts `run.bat` with no console window (WScript.Shell Run,
   window style 0), so closing any terminal can never kill the hub. Both
   autostart mechanisms (Startup-folder launcher and the 5-minute self-heal
-  Scheduled Task, installed by `autostart.bat`) call it as
+  Scheduled Task, installed by `run.bat autostart`, which forwards to
+  `scripts/autostart.bat`) call it as
   `run-hidden.vbs supervised`.
 - Dashboard stop (`POST /api/runtime/stop`) writes the flag
   `state_dir()/intentional-stop` (`config.set_intentional_stop`). A user stop

@@ -35,9 +35,16 @@ Repository: **<https://github.com/last-million/free-llm-hub>**
 | **Windows** | **`run.bat`** | Double-click it, or type `run.bat` in cmd / PowerShell |
 | **Linux / macOS** | **`run.sh`** | `chmod +x run.sh` once, then `./run.sh` |
 
-That is the whole install. The script creates its own virtualenv on first run,
-installs the two dependencies (Flask + requests), and starts the gateway. You
-need Python 3.9+ on the machine; nothing else.
+That is the whole install. One file, nothing to choose: the project root holds
+exactly **one** `.bat` and **one** `.sh` on purpose, so there is never a
+question of which to click.
+
+**No Python on the machine? It installs it for you.** The script checks first,
+and if Python is missing it installs it silently — winget or the official
+per-user installer on Windows, your package manager (apt / dnf / pacman /
+zypper / apk / brew) on Linux and macOS. No administrator rights needed on
+Windows. Then it creates its own virtualenv, installs the two dependencies
+(Flask + requests), and starts the gateway.
 
 **3. Open the dashboard**
 
@@ -90,13 +97,15 @@ and it's gone, and any tool pointed at it quietly loses the free fleet. To make
 it permanent:
 
 ```bat
-autostart.bat            REM Windows  — install (no admin needed)
-autostart.bat remove     REM          — uninstall
+run.bat autostart            REM Windows  — install (no admin needed)
+run.bat autostart remove     REM          — uninstall
+run.bat autostart status     REM          — show what is installed
 ```
 
 ```bash
-./autostart.sh           # Linux (systemd --user) / macOS (launchd)
-./autostart.sh remove
+./run.sh autostart           # Linux (systemd --user) / macOS (launchd)
+./run.sh autostart remove
+./run.sh autostart status
 ```
 
 It starts at logon **and** re-checks every 5 minutes, so a crash recovers by
