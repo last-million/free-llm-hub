@@ -1304,6 +1304,14 @@
      hoverable. Hidden now means "dimmed icon rail": narrower and quieter than
      rail, still legible, still clickable. visibility (not display) on the
      labels keeps them out of the a11y tree only while they are unreadable. */
+  /* display:none, NOT visibility:hidden. visibility keeps the element in the
+     LAYOUT, so the hidden label still occupied its full width inside a
+     centre-justified nav item — which pushed the icon to x=-15.8, right off the
+     46px strip and straight into overflow:hidden. Measured, not theorised: the
+     icons were invisible in collapsed mode for exactly this reason. The a11y
+     cost of display:none is the correct trade here, because a label nobody can
+     see is not navigation, and the accessible name still comes from the
+     button's title/aria-label. */
   body.cx-rail .cx-nav-item span,
   body.cx-rail .cx-group-label .gl-text,
   body.cx-rail .cx-brand-text,
@@ -1311,20 +1319,25 @@
   body.cx-hidden .cx-nav-item span,
   body.cx-hidden .cx-group-label .gl-text,
   body.cx-hidden .cx-brand-text,
-  body.cx-hidden .nav-new-badge{ opacity:0; visibility:hidden; }
+  body.cx-hidden .nav-new-badge{ display:none; }
   body.cx-rail .cx-nav-item, body.cx-hidden .cx-nav-item{
     justify-content:center; padding-left:0; padding-right:0; }
   body.cx-rail .cx-group-label, body.cx-hidden .cx-group-label{
     text-align:center; padding-left:0; padding-right:0; }
   body.cx-rail .cx-side-foot, body.cx-hidden .cx-side-foot{
     flex-direction:column; align-items:center; padding:12px 6px; }
-  /* Quieter than rail so the two states are distinguishable at a glance, but
-     never invisible — the active item keeps full contrast so you can always
-     tell where you are. */
-  body.cx-hidden .cx-sidebar{ opacity:.62; }
-  body.cx-hidden .cx-sidebar:hover, body.cx-hidden .cx-sidebar:focus-within{ opacity:1; }
-  body.cx-hidden .cx-nav-item.active{ opacity:1; }
+  /* NO dimming. A 0.62 on the aside multiplied with the icons' own 0.8 to about
+     0.5 effective, and on this dark surface that reads as "the icons are gone" —
+     which is exactly how it was reported. The two collapsed states are told
+     apart by WIDTH, which is free; contrast is not the thing to spend.
+     Icons go to full strength while collapsed, since the icon is now the only
+     label there is. */
+  body.cx-rail .cx-nav-item svg, body.cx-hidden .cx-nav-item svg{ opacity:1; }
   body.cx-hidden .cx-group-label .gl-caret{ display:none; }
+  /* Group labels are pure text, so while collapsed they are dead space between
+     icon clusters. The border keeps the grouping legible without them. */
+  body.cx-hidden .cx-group-label{ height:1px; padding:0; margin:8px 12px;
+    overflow:hidden; background:var(--border-soft); border-radius:1px; }
   /* Hover (or keyboard focus) restores the full sidebar, floating above the page. */
   body.cx-rail .cx-sidebar:hover, body.cx-rail .cx-sidebar:focus-within,
   body.cx-hidden .cx-sidebar:hover, body.cx-hidden .cx-sidebar:focus-within{
@@ -1340,8 +1353,14 @@
   body.cx-hidden .cx-sidebar:hover .cx-brand-text,
   body.cx-hidden .cx-sidebar:hover .nav-new-badge,
   body.cx-hidden .cx-sidebar:focus-within .cx-nav-item span,
+  body.cx-hidden .cx-sidebar:focus-within .cx-group-label .gl-text,
+  body.cx-hidden .cx-sidebar:hover .cx-nav-item span,
+  body.cx-hidden .cx-sidebar:hover .cx-group-label .gl-text,
+  body.cx-hidden .cx-sidebar:hover .cx-brand-text,
+  body.cx-hidden .cx-sidebar:hover .nav-new-badge,
+  body.cx-hidden .cx-sidebar:focus-within .cx-nav-item span,
   body.cx-hidden .cx-sidebar:focus-within .cx-group-label .gl-text{
-    opacity:1; visibility:visible; }
+    display:revert; }
   body.cx-hidden .cx-sidebar:hover .cx-nav-item,
   body.cx-hidden .cx-sidebar:focus-within .cx-nav-item{
     justify-content:flex-start; padding-left:12px; padding-right:12px; }
