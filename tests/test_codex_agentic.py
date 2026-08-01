@@ -146,3 +146,50 @@ def test_build_argv_codex_stream_matches_nonstream(monkeypatch):
     s = types.SimpleNamespace(cli_id="codex", native_session_id=None)
     assert ac._build_argv(s, "codex", "hi", stream=True) == ac._build_argv(s, "codex", "hi", stream=False)
     assert "--json" in ac._build_argv(s, "codex", "hi", stream=True)
+
+
+# --------------------------------------------------------------------------- #
+# Isolated CLI copies.
+#
+# The hub can install a CLI into ~/.free-llm-hub/isolated-clis/<cli> with its own
+# npm prefix and its own config dir, so driving it as an agent never disturbs the
+# user's interactive setup. That mechanism already existed — the agent chat just
+# was not using it: every session resolved the GLOBAL binary via shutil.which(),
+# the same install the user types into by hand.
+# --------------------------------------------------------------------------- #
+
+def test_the_isolated_copy_wins_over_the_global_one(monkeypatch):
+    monkeypatch.setattr(ac, "_isolated_bin", lambda cid: "/iso/" + cid)
+    monkeypatch.setattr(ac.shutil, "which", lambda *a, **k: "/usr/bin/" + a[0])
+    assert ac._resolve_bin("codex") == "/iso/codex"
+
+
+def test_it_falls_back_to_the_users_own_install(monkeypatch):
+    """Nobody should have to install anything twice for this to keep working."""
+    monkeypatch.setattr(ac, "_isolated_bin", lambda cid: None)
+    monkeypatch.setattr(ac.shutil, "which", lambda *a, **k: "/usr/bin/" + a[0])
+    assert ac._resolve_bin("codex") == "/usr/bin/codex"
+
+
+def test_missing_everywhere_reports_not_installed(monkeypatch):
+    monkeypatch.setattr(ac, "_isolated_bin", lambda cid: None)
+    monkeypatch.setattr(ac.shutil, "which", lambda *a, **k: None)
+    assert ac._resolve_bin("codex") is None
+
+
+def test_isolated_lookup_never_raises(monkeypatch):
+    """A broken HOME or an unreadable dir must not take down session start."""
+    def boom(*a, **k):
+        raise OSError("nope")
+    monkeypatch.setattr(ac.shutil, "which", boom)
+    assert ac._isolated_bin("codex") is None
+
+
+def test_isolated_path_matches_the_hubs_install_layout():
+    """Must agree with app.py's _isolated_install_dir, or the agent chat would
+    look in a folder the installer never writes to."""
+    import app
+    monkey = ac._isolated_bin("codex")
+    expected_dir = app._isolated_install_dir("codex")
+    if monkey:                      # only assert when a copy is actually present
+        assert monkey.startswith(expected_dir)

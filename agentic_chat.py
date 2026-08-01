@@ -230,11 +230,45 @@ def cli_support() -> dict:
     out = {}
     for cid, (ok, reason) in _SUPPORT.items():
         try:
-            installed = bool(shutil.which(_CLI_BIN[cid]))
+            installed = bool(_resolve_bin(cid))
         except Exception:
             installed = False
         out[cid] = {"supported": ok, "reason": reason, "installed": installed}
     return out
+
+
+def _isolated_bin(cli_id: str):
+    """The hub's OWN isolated copy of the CLI, or None.
+
+    The hub can install a CLI into ~/.free-llm-hub/isolated-clis/<cli> with its
+    own npm prefix and its own config dir (CODEX_HOME / CLAUDE_CONFIG_DIR), so
+    driving it as an agent never disturbs the user's interactive setup. That
+    mechanism already existed; the agent chat just was not using it — every
+    session resolved the GLOBAL binary through shutil.which(), which is the
+    same install the user types into by hand.
+
+    Path construction mirrors app.py's _isolated_bin_path: npm's --prefix layout
+    puts the launcher in <prefix>/bin on POSIX and directly in <prefix> on
+    Windows, and shutil.which(path=...) resolves PATHEXT for us.
+    """
+    try:
+        install_dir = os.path.join(os.path.expanduser("~"), ".free-llm-hub",
+                                   "isolated-clis", cli_id, "install")
+        search = os.pathsep.join([install_dir, os.path.join(install_dir, "bin")])
+        return shutil.which(_CLI_BIN[cli_id], path=search)
+    except Exception:
+        return None
+
+
+def _resolve_bin(cli_id: str):
+    """Isolated copy first, the user's own install second.
+
+    Preferring the isolated one is the point: it is the copy the hub controls,
+    with its own credentials and settings, so an agent session cannot pick up or
+    disturb whatever the user has configured for interactive use. Falling back
+    keeps every existing setup working — nobody has to install anything twice.
+    """
+    return _isolated_bin(cli_id) or shutil.which(_CLI_BIN[cli_id])
 
 
 def default_cli() -> str:
@@ -503,7 +537,7 @@ def start_session(cli_id, project_dir, create_new=False) -> str:
     # not-yet-installed codex should still surface as "installable" (users may
     # want it ready for when full agentic support lands), not get masked by the
     # "not currently supported" message below.
-    bin_path = shutil.which(_CLI_BIN[cli_id])
+    bin_path = _resolve_bin(cli_id)
     if not bin_path:
         raise AgenticError(
             "'%s' is not installed (not found on PATH). It can be installed "
@@ -817,7 +851,7 @@ def send_message(session_id, text):
     if not sess.turn_lock.acquire(blocking=False):
         return 409, None, "A turn is already running for this session."
     try:
-        bin_path = shutil.which(_CLI_BIN[sess.cli_id])
+        bin_path = _resolve_bin(sess.cli_id)
         if not bin_path:
             return 502, None, "'%s' is no longer on PATH." % _CLI_BIN[sess.cli_id]
         if _should_check_binary_identity(sess):
@@ -984,7 +1018,7 @@ def send_message_stream(session_id, text):
     timed_out = [False]
     stderr_buf = []
     try:
-        bin_path = shutil.which(_CLI_BIN[sess.cli_id])
+        bin_path = _resolve_bin(sess.cli_id)
         if not bin_path:
             yield err(502, "'%s' is no longer on PATH." % _CLI_BIN[sess.cli_id]); return
         if _should_check_binary_identity(sess):
