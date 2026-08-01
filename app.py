@@ -5232,6 +5232,12 @@ def _security_headers(response):
         "default-src 'none'; script-src 'nonce-%s'; "
         "style-src 'unsafe-inline'; img-src 'self' data:; "
         "connect-src 'self'; base-uri 'none'; form-action 'none'; "
+        # The workspace preview frames the user's OWN project, which runs on a
+        # loopback port we allocate at run time (PORT_RANGE). Without an explicit
+        # frame-src this falls back to default-src 'none' and the iframe is
+        # refused outright — measured: "Refused to frame 'http://127.0.0.1:5801/'".
+        # Scoped to loopback only, so this still cannot frame anything remote.
+        "frame-src http://127.0.0.1:* http://localhost:*; "
         "frame-ancestors 'none'; object-src 'none'" % nonce)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
@@ -7052,6 +7058,11 @@ def api_workspace_start():
 
 @app.route("/api/workspace/stop", methods=["POST"])
 def api_workspace_stop():
+    # DELIBERATELY NOT gated on _agent_gate(), following the rule that gate's own
+    # docstring sets for the agent stop/end routes: a kill switch must still be
+    # able to kill. Turning the master flag off while a preview server is running
+    # must not strand that process with no way to stop it from the UI. Transport
+    # auth still applies — every /api route needs the control token.
     d, err = _workspace_dir_from(request.get_json(force=True, silent=True))
     if err:
         return err
@@ -7099,6 +7110,12 @@ def api_workspace_attach():
 
 @app.route("/api/workspace/status", methods=["GET"])
 def api_workspace_status():
+    # Gated, unlike stop: this one only READS, and its 400-on-missing-directory
+    # is an existence oracle for arbitrary paths. It gets the same gate as start
+    # rather than remaining a filesystem probe that outlives the master switch.
+    gate = _agent_gate()
+    if gate:
+        return gate
     d, err = _workspace_dir_from({"project_dir": request.args.get("project_dir")})
     if err:
         return err

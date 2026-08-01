@@ -200,3 +200,40 @@ def test_a_missing_folder_is_rejected(client):
 def test_status_of_a_missing_folder_is_rejected(client):
     r = client.get("/api/workspace/status?project_dir=/nope/nope", headers=_auth())
     assert r.status_code == 400
+
+
+def test_the_preview_iframe_is_allowed_by_the_csp(client):
+    """The preview frames the user's own project on a loopback port we allocate
+    at run time. Without an explicit frame-src the policy falls back to
+    default-src 'none' and the browser refuses the frame outright — measured:
+    "Refused to frame 'http://127.0.0.1:5801/'"."""
+    csp = client.get("/health").headers.get("Content-Security-Policy", "")
+    assert "frame-src" in csp, "no frame-src: the preview iframe cannot render"
+    assert "http://127.0.0.1:*" in csp
+
+
+def test_the_csp_still_refuses_remote_frames():
+    """Loopback only — this must not become a general framing permission."""
+    import re as _re
+    with app.app.test_client() as c:
+        csp = c.get("/health").headers.get("Content-Security-Policy", "")
+    frame_src = _re.search(r"frame-src ([^;]+)", csp).group(1)
+    for token in frame_src.split():
+        assert token.startswith("http://127.0.0.1") or token.startswith("http://localhost"), token
+
+
+def test_stop_stays_reachable_when_the_master_switch_is_off(client, monkeypatch):
+    """A kill switch must still be able to kill: flipping the agentic-chat flag
+    off while a preview server runs must not strand that process."""
+    monkeypatch.setattr(app.agentic_chat, "master_enabled", lambda: False)
+    r = client.post("/api/workspace/stop",
+                    json={"project_dir": tempfile.gettempdir()}, headers=_auth())
+    assert r.status_code == 200
+
+
+def test_status_is_gated_when_the_master_switch_is_off(client, monkeypatch):
+    """It reads, and its 400-on-missing-directory is an existence oracle."""
+    monkeypatch.setattr(app.agentic_chat, "master_enabled", lambda: False)
+    r = client.get("/api/workspace/status?project_dir=" + tempfile.gettempdir(),
+                   headers=_auth())
+    assert r.status_code == 403
