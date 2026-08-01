@@ -1,8 +1,30 @@
 #!/usr/bin/env bash
-# Calvoun Free LLM Hub — one-command launcher (Linux / macOS / Git Bash)
-# Idempotent: creates a venv on first run, reuses it afterwards.
+# Calvoun Free LLM Hub — THE launcher (Linux / macOS / Git Bash).
+#
+# Deliberately the ONLY .sh in the project root. There used to be a second one
+# (autostart.sh) beside it, and two runnable scripts with no way to tell which
+# one starts the thing is a coin flip for anyone who did not write them.
+# Everything else is a subcommand of this file:
+#
+#   ./run.sh                    start the hub
+#   ./run.sh autostart          also start it at login, and self-heal
+#   ./run.sh autostart remove   undo that
+#   ./run.sh autostart status   show what is installed
+#
+# Idempotent: creates a venv on first run, reuses it afterwards. Installs
+# Python itself if the machine has none.
 set -e
 cd "$(dirname "$0")"
+
+case "${1:-}" in
+  autostart) shift; exec ./scripts/autostart.sh "$@" ;;
+  help|-h|--help)
+    echo "  ./run.sh                    start the hub"
+    echo "  ./run.sh autostart          also start it at login, and self-heal"
+    echo "  ./run.sh autostart remove   undo that"
+    echo "  ./run.sh autostart status   show what is installed"
+    exit 0 ;;
+esac
 
 PORT="${PORT:-8787}"
 
@@ -43,13 +65,68 @@ if [ -z "${HUB_FORCE:-}" ]; then
   fi
 fi
 
-# --- find python ---
-if command -v python3 >/dev/null 2>&1; then
-  PY=python3
-elif command -v python >/dev/null 2>&1; then
-  PY=python
-else
-  echo "ERROR: Python 3.9+ not found. Install it from https://www.python.org/downloads/" >&2
+# --- find python, and INSTALL it if this machine has none --------------------
+# "Download it, run one file" only holds if the one file also handles a machine
+# with no Python on it. Sending someone off to install Python first is exactly
+# the wall this script exists to remove.
+find_python() {
+  PY=""
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' >/dev/null 2>&1; then
+    PY=python3
+  elif command -v python >/dev/null 2>&1 && python -c 'import sys' >/dev/null 2>&1; then
+    PY=python
+  fi
+  # Debian and Ubuntu ship venv as a SEPARATE package, so python3 exists while
+  # `python3 -m venv` fails. Treat that as "not usable yet" rather than letting
+  # it blow up three lines later with a message nobody can act on.
+  if [ -n "$PY" ] && ! "$PY" -c 'import ensurepip, venv' >/dev/null 2>&1; then
+    NEEDS_VENV=1
+  fi
+}
+
+install_python() {
+  # sudo only if we are not already root and it exists; a machine without it
+  # gets a clear instruction instead of a permission error.
+  SUDO=""
+  if [ "$(id -u)" != "0" ]; then
+    command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    $SUDO apt-get update -qq || true
+    $SUDO apt-get install -y python3 python3-venv python3-pip
+  elif command -v dnf >/dev/null 2>&1; then
+    $SUDO dnf install -y python3 python3-pip
+  elif command -v yum >/dev/null 2>&1; then
+    $SUDO yum install -y python3 python3-pip
+  elif command -v pacman >/dev/null 2>&1; then
+    $SUDO pacman -Sy --noconfirm python python-pip
+  elif command -v zypper >/dev/null 2>&1; then
+    $SUDO zypper install -y python3 python3-pip
+  elif command -v apk >/dev/null 2>&1; then
+    $SUDO apk add --no-cache python3 py3-pip
+  elif command -v brew >/dev/null 2>&1; then
+    brew install python           # never with sudo: Homebrew refuses outright
+  else
+    return 1
+  fi
+}
+
+NEEDS_VENV=""
+find_python
+if [ -z "$PY" ] || [ -n "$NEEDS_VENV" ]; then
+  if [ -z "$PY" ]; then
+    echo "[free-llm-hub] Python was not found on this machine - installing it."
+  else
+    echo "[free-llm-hub] Python is missing its venv module - installing it."
+  fi
+  install_python || true
+  NEEDS_VENV=""
+  find_python
+fi
+if [ -z "$PY" ]; then
+  echo "ERROR: could not install Python automatically." >&2
+  echo "       Install Python 3.9+ with your package manager (or from" >&2
+  echo "       https://www.python.org/downloads/) and run this file again." >&2
   exit 1
 fi
 

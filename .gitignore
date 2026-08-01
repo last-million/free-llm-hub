@@ -35,3 +35,7 @@ image*.png
 # Playwright/verification screenshots must never land in the repo.
 *.png
 !static/*.png
+
+# transient test artifact from exercising run.bat
+runbat.test.log
+hub.start.err.log

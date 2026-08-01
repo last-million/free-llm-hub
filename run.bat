@@ -1,8 +1,29 @@
 @echo off
-rem Calvoun Free LLM Hub - one-command launcher (Windows)
-rem Idempotent: creates a venv on first run, reuses it afterwards.
+rem Calvoun Free LLM Hub - THE launcher (Windows). Double-click it.
+rem
+rem This is deliberately the ONLY .bat in the project root. There used to be a
+rem second one (autostart.bat) sitting next to it, and two clickable files with
+rem no way to tell which one starts the thing is a coin flip for anyone who did
+rem not write them. Everything else is a subcommand of this file:
+rem
+rem   run.bat                    start the hub  <- what a double-click does
+rem   run.bat autostart          also start it at logon, and self-heal
+rem   run.bat autostart remove   undo that
+rem   run.bat autostart status   show what is installed
+rem
+rem Idempotent: creates a venv on first run, reuses it afterwards. Installs
+rem Python itself if the machine has none.
 setlocal
 cd /d "%~dp0"
+
+if /i "%~1"=="autostart" (
+  call "%~dp0scripts\autostart.bat" %2 %3
+  exit /b %errorlevel%
+)
+if /i "%~1"=="help" goto :usage
+if /i "%~1"=="/?" goto :usage
+if /i "%~1"=="-h" goto :usage
+if /i "%~1"=="--help" goto :usage
 
 if "%PORT%"=="" set "PORT=8787"
 
@@ -36,14 +57,24 @@ if not defined HUB_FORCE (
   )
 )
 
-rem --- find python ---
-set "PY="
-where python >nul 2>nul && set "PY=python"
+rem --- find python, and INSTALL it if this machine has none -------------------
+rem "Download it, run one file" only holds if the one file can also handle a
+rem machine with no Python on it. Telling someone to go install Python first is
+rem exactly the wall this script exists to remove.
+call :find_python
 if not defined PY (
-  where py >nul 2>nul && set "PY=py -3"
+  echo [free-llm-hub] Python was not found on this machine - installing it.
+  echo                This is a one-time setup and needs no administrator rights.
+  echo.
+  call :install_python
+  call :find_python
 )
 if not defined PY (
-  echo ERROR: Python 3.9+ not found. Install it from https://www.python.org/downloads/
+  echo.
+  echo ERROR: could not install Python automatically.
+  echo        Install it once from https://www.python.org/downloads/
+  echo        ^(tick "Add python.exe to PATH"^), then run this file again.
+  pause
   exit /b 1
 )
 
@@ -82,3 +113,71 @@ echo   Dashboard:  http://127.0.0.1:%PORT%
 echo ==========================================================
 echo.
 python app.py
+exit /b %errorlevel%
+
+
+rem ===========================================================================
+rem  Helpers
+rem ===========================================================================
+
+:usage
+echo Calvoun Free LLM Hub
+echo.
+echo   run.bat                    start the hub ^(this is what a double-click does^)
+echo   run.bat autostart          also start it at logon, and self-heal
+echo   run.bat autostart remove   undo that
+echo   run.bat autostart status   show what is installed
+echo.
+exit /b 0
+
+:find_python
+rem Sets PY to a working launcher, or leaves it empty. Checks PATH first, then
+rem the per-user install location - a fresh install lands there but does not
+rem reach THIS already-running shell's PATH, so looking only at PATH would make
+rem a successful install look like a failed one.
+set "PY="
+where python >nul 2>nul && set "PY=python"
+if defined PY (
+  rem The Microsoft Store stub is named python.exe, answers `where`, and does
+  rem nothing but open the Store. Prove the interpreter actually runs.
+  python -c "import sys" >nul 2>nul || set "PY="
+)
+if not defined PY (
+  where py >nul 2>nul && set "PY=py -3"
+  if defined PY py -3 -c "import sys" >nul 2>nul || set "PY="
+)
+if not defined PY (
+  for /f "delims=" %%P in ('dir /b /o-n "%LOCALAPPDATA%\Programs\Python\Python3*" 2^>nul') do (
+    if not defined PY if exist "%LOCALAPPDATA%\Programs\Python\%%P\python.exe" (
+      set "PY=%LOCALAPPDATA%\Programs\Python\%%P\python.exe"
+    )
+  )
+)
+exit /b 0
+
+:install_python
+rem Two ways, cheapest first. winget ships with Windows 10 21H2+ and Windows 11
+rem and handles the download, the hash check and the PATH entry itself.
+where winget >nul 2>nul
+if not errorlevel 1 (
+  echo [free-llm-hub] Installing Python via winget...
+  winget install --id Python.Python.3.12 -e --scope user --silent ^
+        --accept-package-agreements --accept-source-agreements >nul 2>nul
+  call :find_python
+  if defined PY exit /b 0
+)
+
+rem Fallback: the official installer, per-user and unattended. InstallAllUsers=0
+rem is what keeps this from needing administrator rights.
+set "PYVER=3.12.8"
+set "PYARCH=amd64"
+if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "PYARCH=arm64"
+set "PYEXE=%TEMP%\python-%PYVER%-%PYARCH%.exe"
+echo [free-llm-hub] Downloading Python %PYVER% ^(%PYARCH%^)...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/%PYVER%/python-%PYVER%-%PYARCH%.exe' -OutFile '%PYEXE%' -UseBasicParsing" >nul 2>nul
+if not exist "%PYEXE%" exit /b 1
+echo [free-llm-hub] Installing Python %PYVER%...
+"%PYEXE%" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_launcher=1 >nul 2>nul
+del /f /q "%PYEXE%" >nul 2>nul
+exit /b 0
