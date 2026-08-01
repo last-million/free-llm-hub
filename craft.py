@@ -87,6 +87,32 @@ SHIP = """FINISH THE JOB — DEPLOY LOCALLY (applies to any build/run/deploy tas
 - BLOCKED? One line: the exact blocker and the exact command that clears it. Never trail off mid-task.
 ANTI: stopping at "you can now deploy this to Vercel" or "run npm start to see it"; claiming it works without fetching it; inventing a URL or a port you never opened; leaving a foreground server that hangs the session."""
 
+IMAGES = """IMAGES — YOU HAVE A LOCAL GENERATOR, ASK FIRST (any task that will show images)
+- Do NOT say you have no image tool and silently fall back to Unsplash. This gateway generates images locally, free, in ~3s. Never claim otherwise.
+- The moment you know the build needs pictures, STOP and offer exactly three options, then wait for the answer (skip the question only if the user already told you which they want):
+  1. FREE STOCK — real photos, no copyright issue (Unsplash/Pexels source URLs). Best for real faces, food, places, anything that must look authentically photographed.
+  2. GENERATED — made here from your prompt, unique to this project, no attribution and no licence question. Best for hero art, backgrounds, illustrations, icons, textures, anything abstract or brand-specific.
+  3. BOTH — stock for photographic content, generated for hero/abstract/brand art. Usually the right answer for a real site.
+- Generate with a plain HTTP call, no API key:
+  curl -s -X POST http://127.0.0.1:8787/v1/images/generations -H "Content-Type: application/json" -d '{"prompt":"YOUR PROMPT","n":1,"size":"1024x1024"}' > out.json
+  then write the file with the RIGHT extension (it is often JPEG, not PNG — do not hardcode .png):
+  python -c "import json,base64,urllib.request as u;d=json.load(open('out.json'))['data'][0];s=d.get('b64_json') or '';b=base64.b64decode(s) if s else u.urlopen(d['url']).read();e='png' if b[1:4]==bytes([80,78,71]) else 'webp' if b[8:12]==b'WEBP' else 'jpg';p='img/hero.'+e;open(p,'wb').write(b);print(p)"
+  (the response carries b64_json OR url depending on which model served it — the line above handles both and prints the path it wrote)
+- Omit "model" and the hub picks the best free one available. Write real files into the project (img/ or assets/), reference them with relative paths, and give every one width, height and honest alt text.
+- Prompt like a photographer, not a keyword list: subject, setting, light, lens/mood. "warm rustic italian dining room, evening window light, shallow depth of field" beats "restaurant image nice".
+ANTI: hotlinking a stock URL you never checked resolves; source.unsplash.com/random (it is retired and returns nothing); the same generic gradient for every section; inventing a photographer credit; shipping a page whose images 404."""
+
+_IMAGES_RE = re.compile(
+    r"\bimages?\b|\bphotos?\b|\bpictures?\b|\billustrations?\b|\blogos?\b|"
+    r"\bicons?\b|\bbanners?\b|\bthumbnails?\b|\bavatars?\b|\bartwork\b|"
+    r"\bvisuals?\b|\bgaller(?:y|ies)\b|\bhero (?:section|image|banner)\b|"
+    # Build tasks that always end up needing pictures — this is the case that
+    # actually bit: "build a restaurant website" names no image word at all, and
+    # the model announced it had no image tool and reached for Unsplash.
+    r"\bweb ?site\b|\bwebpage\b|\bhomepage\b|\blanding page\b|\bportfolio\b|"
+    r"\bonline store\b|\bstorefront\b|\be-?commerce\b|\bblog\b|\brestaurant\b",
+    re.I)
+
 _SHIP_RE = re.compile(
     r"\bdeploy\w*\b|\bship it\b|\bgo live\b|\bpublish\b|\bhost(?:ing)?\b|"
     r"\bvercel\b|\bnetlify\b|\bcloudflare pages\b|\bproduction\b|"
@@ -135,6 +161,14 @@ def match(text):
             out.append((name, brief))
             if len(out) >= MAX_BRIEFS:
                 break
+    # IMAGES is ORTHOGONAL to the domain briefs and does not count against
+    # MAX_BRIEFS. Ranked as a domain it would lose every time — "build a
+    # restaurant website" already spends both slots on web_design/landing — and
+    # that is exactly the request where the model announced it had no image tool
+    # and silently fell back to Unsplash. It is also the one brief that carries a
+    # CAPABILITY the model cannot discover on its own: the local endpoint.
+    if _IMAGES_RE.search(text):
+        out.append(("images", IMAGES))
     return out
 
 
