@@ -31,16 +31,20 @@ import json
 import math
 import mimetypes
 import os
+import platform
 import random
 import re
 import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
+import urllib.request
 import uuid
+import zipfile
 from urllib.parse import quote, urlsplit
 
 import requests
@@ -2225,7 +2229,8 @@ _SUB_MAX_PROMPT_CHARS = 100000
 # cannot click through OAuth consent for them.
 # --------------------------------------------------------------------------- #
 _ISOLATED_ENV_VAR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
-_ISOLATED_NPM_PACKAGE = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex"}
+_ISOLATED_NPM_PACKAGE = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex",
+                         "opencode": "opencode-ai"}
 
 _ISOLATED_INSTALL_TIMEOUT = 300   # npm install can be slow; this is an admin click, not a hop
 
@@ -2234,6 +2239,125 @@ def _isolated_root():
     """~/.free-llm-hub/isolated-clis — separate from wherever the user's own
     interactive install lives. Path only; no filesystem side effects."""
     return os.path.join(_home(), ".free-llm-hub", "isolated-clis")
+
+
+# --------------------------------------------------------------------------- #
+# Node bootstrap — the agent CLIs are npm packages, so no Node means no CLIs
+# --------------------------------------------------------------------------- #
+
+_NODE_FALLBACK_VERSION = "v22.14.0"     # used only if nodejs.org's index is unreachable
+_NODE_DOWNLOAD_TIMEOUT = 600            # ~50MB over a slow line
+
+
+def _hub_node_dir():
+    return os.path.join(_home(), ".free-llm-hub", "node")
+
+
+def _npm_in(node_dir):
+    """The npm entry point inside an extracted official Node build, or None."""
+    if not node_dir or not os.path.isdir(node_dir):
+        return None
+    for rel in ("npm.cmd", "npm", os.path.join("bin", "npm")):
+        cand = os.path.join(node_dir, rel)
+        if os.path.isfile(cand):
+            return cand
+    # The archive unpacks into node-vX.Y.Z-<platform>/ — accept one level down.
+    try:
+        for name in sorted(os.listdir(node_dir)):
+            inner = os.path.join(node_dir, name)
+            if os.path.isdir(inner) and name.startswith("node-"):
+                found = _npm_in(inner)
+                if found:
+                    return found
+    except OSError:
+        pass
+    return None
+
+
+def _node_archive_name(version):
+    """Official build name for THIS machine, or None if there is no build."""
+    machine = (platform.machine() or "").lower()
+    arm = machine in ("arm64", "aarch64")
+    if sys.platform.startswith("win"):
+        return "node-%s-win-%s.zip" % (version, "arm64" if arm else "x64")
+    if sys.platform == "darwin":
+        return "node-%s-darwin-%s.tar.gz" % (version, "arm64" if arm else "x64")
+    if sys.platform.startswith("linux"):
+        return "node-%s-linux-%s.tar.xz" % (version, "arm64" if arm else "x64")
+    return None
+
+
+def _latest_node_lts():
+    """Ask nodejs.org which LTS is current, so this does not rot into a pinned
+    version that stops existing. Falls back to a known-good one."""
+    try:
+        with urllib.request.urlopen("https://nodejs.org/dist/index.json", timeout=20) as r:
+            for entry in json.loads(r.read().decode("utf-8", "replace")):
+                if entry.get("lts"):
+                    return entry["version"]
+    except Exception:                                            # noqa: BLE001
+        pass
+    return _NODE_FALLBACK_VERSION
+
+
+def _install_hub_node():
+    """Download an official Node build into ~/.free-llm-hub/node and return its
+    npm path, or None.
+
+    Deliberately NOT a package-manager install. On Windows the Node MSI writes
+    to Program Files and raises a UAC prompt, and this runs in a background
+    thread at boot where nothing can answer it. On Linux `sudo apt-get` would
+    block on a password nobody is there to type. An official archive unpacked
+    into the hub's own folder needs no administrator, prompts nothing, changes
+    no system PATH, and is deleted with the hub's config directory."""
+    version = _latest_node_lts()
+    name = _node_archive_name(version)
+    if not name:
+        _log.info("[node] no official Node build for %s/%s",
+                  sys.platform, platform.machine())
+        return None
+    url = "https://nodejs.org/dist/%s/%s" % (version, name)
+    dest = _hub_node_dir()
+    os.makedirs(dest, exist_ok=True)
+    archive = os.path.join(dest, name)
+    _log.info("[node] downloading %s", url)
+    try:
+        with urllib.request.urlopen(url, timeout=_NODE_DOWNLOAD_TIMEOUT) as r, \
+                open(archive, "wb") as fh:
+            shutil.copyfileobj(r, fh)
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(dest)
+        else:
+            # tarfile handles .gz and .xz; filter="data" refuses absolute paths
+            # and traversal entries on Python 3.12+, and is ignored below it.
+            kwargs = {"filter": "data"} if sys.version_info >= (3, 12) else {}
+            with tarfile.open(archive) as tf:
+                tf.extractall(dest, **kwargs)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[node] could not install Node: %s", exc)
+        return None
+    finally:
+        try:
+            os.remove(archive)
+        except OSError:
+            pass
+    npm = _npm_in(dest)
+    if npm:
+        _log.info("[node] Node %s ready at %s", version, os.path.dirname(npm))
+    return npm
+
+
+def _ensure_npm(install=True):
+    """npm for the hub's own installs: the user's if they have one, otherwise a
+    private copy. Returns a path or None; never raises, never prompts."""
+    found = shutil.which("npm")
+    if found:
+        return found
+    found = _npm_in(_hub_node_dir())
+    if found or not install:
+        return found
+    return _install_hub_node()
 
 
 def _isolated_cli_dir(cli_id):
@@ -6894,11 +7018,29 @@ def _agent_cli_autoinstall_once():
     no npm, or offline, must not retry in a loop."""
     if not config.get_flag(_AGENT_AUTOINSTALL_FLAG, True):
         return
-    if not shutil.which("npm"):
-        _log.info("[agent-cli] npm not on PATH — skipping auto-install")
+    npm = _ensure_npm()
+    if not npm:
+        _log.info("[agent-cli] no npm and Node could not be installed — skipping")
         return
-    for cli_id, bin_name in (("codex", "codex"), ("claude", "claude")):
+    for cli_id, bin_name in (("codex", "codex"), ("opencode", "opencode"),
+                             ("claude", "claude")):
         try:
+            # 1. ON THE MACHINE. The isolated copy only ever serves the hub's
+            #    own agent chat; it is not on PATH, so the user's terminal
+            #    still has no `codex` and no `opencode`. Asked for explicitly:
+            #    install them properly too, not just in the private namespace.
+            #    npm's global prefix is per-user on Windows (%APPDATA%\npm) and
+            #    on any sane nvm/fnm/volta setup, so this needs no privileges.
+            #    Where it does (a root-owned /usr/lib/node_modules), npm fails
+            #    with EACCES, we log it, and the isolated copy below still
+            #    makes the feature work.
+            if not shutil.which(bin_name):
+                _log.info("[agent-cli] installing %s on this machine", cli_id)
+                ok, res = _install_global_cli(cli_id, npm=npm)
+                _log.info("[agent-cli] %s (global): %s", cli_id,
+                          "installed" if ok else _sanitize(str(res.get("error"))))
+            # 2. FOR THE HUB. Isolated so a version the hub drives can never
+            #    disturb the one the user's own terminal depends on.
             if agentic_chat._resolve_bin(cli_id):
                 continue                       # already usable; leave it alone
             _log.info("[agent-cli] installing %s into the hub's isolated namespace", cli_id)
@@ -6907,6 +7049,38 @@ def _agent_cli_autoinstall_once():
                       "installed" if ok else _sanitize(str(res.get("error"))))
         except Exception:                                        # noqa: BLE001
             _log.debug("[agent-cli] auto-install failed for %s", cli_id, exc_info=True)
+
+
+def _install_global_cli(cli_id, npm=None):
+    """`npm install -g <pkg>` into the machine's own global prefix.
+
+    The counterpart to _install_isolated_cli: that one gives the HUB a private
+    copy, this one gives the USER a `codex` / `opencode` they can type in their
+    own terminal. Both are wanted -- the private copy keeps the hub's driving
+    from disturbing the user's setup, and the global one is what makes the tool
+    actually present on the machine."""
+    pkg = _ISOLATED_NPM_PACKAGE.get(cli_id)
+    if not pkg:
+        return False, {"ok": False, "error": "No known npm package for '%s'." % cli_id}
+    npm = npm or _ensure_npm()
+    if not npm:
+        return False, {"ok": False, "error": "npm is not available and Node could not be installed."}
+    argv = _sub_launcher(npm) + ["install", "-g", pkg]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=_ISOLATED_INSTALL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, {"ok": False, "error": "npm install timed out after %ds."
+                                             % _ISOLATED_INSTALL_TIMEOUT}
+    except Exception as exc:                                     # noqa: BLE001
+        return False, {"ok": False, "error": "could not run npm: %s" % exc}
+    if proc.returncode != 0:
+        tail = _sanitize((proc.stderr or proc.stdout or "").strip()[-400:], 400)
+        return False, {"ok": False, "error": "npm install -g %s failed: %s" % (pkg, tail)}
+    return True, {"ok": True, "package": pkg, "bin": shutil.which(_CLI_BIN_NAME.get(cli_id, cli_id))}
+
+
+_CLI_BIN_NAME = {"claude": "claude", "codex": "codex", "opencode": "opencode"}
 
 
 _agent_autoinstall_thread = None

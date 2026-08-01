@@ -902,9 +902,36 @@
   .agent-start-result.ok{background:var(--accent-soft);color:var(--ok-text);border:1px solid var(--accent-border)}
   .agent-start-result.err{background:var(--danger-soft);color:var(--danger-text);border:1px solid var(--danger-border)}
   .agent-session{display:flex;flex-direction:column;gap:12px;margin-top:14px}
-  .agent-session-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-  .agent-session-info{font-size:12.5px;color:var(--text-dim);font-family:var(--mono);overflow-wrap:anywhere}
-  .agent-session-bar .btn{margin-left:auto}
+  .agent-session-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .agent-session-info{font-size:12.5px;color:var(--text-dim);font-family:var(--mono);
+    overflow-wrap:anywhere;margin-right:auto}
+  /* These read as plain words, not controls: `ghost` is a transparent fill and
+     a 1px hairline, and at this dashboard's zoom the hairline all but vanishes
+     -- so "Running" and "End session" looked like labels nobody could click.
+     In this bar they ARE the controls, so they get a real surface, a real
+     border and some weight. (The old rule here put margin-left:auto on EVERY
+     button in the bar, which is why they drifted apart; the info line pushes
+     them right instead.) */
+  .agent-session-bar .btn{
+    background:var(--surface-3);border:1px solid var(--border);color:var(--text);
+    font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.18);
+  }
+  .agent-session-bar .btn:hover{
+    background:var(--surface-2);border-color:var(--accent);color:var(--accent-strong);
+  }
+  .agent-session-bar .btn:active{transform:translateY(1px);box-shadow:none}
+  .agent-session-bar #agent-end{
+    border-color:var(--danger-border);color:var(--danger-text);
+  }
+  .agent-session-bar #agent-end:hover{
+    background:var(--danger-soft);border-color:var(--danger);color:var(--danger-text);
+  }
+  /* The count is data, so it gets its own chip instead of running into the word */
+  #agent-running-n{
+    display:inline-grid;place-items:center;min-width:18px;height:18px;padding:0 5px;
+    margin-left:5px;border-radius:999px;background:var(--accent);color:#fff;
+    font-size:11px;font-weight:700;line-height:1;
+  }
 
   /* ---------- segmented control ---------- */
   .seg-toggle{
