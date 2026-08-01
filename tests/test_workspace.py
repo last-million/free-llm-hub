@@ -517,6 +517,10 @@ def test_discovery_skips_a_project_that_already_has_a_preview(proj, no_adopted, 
 
 
 def test_discovery_finds_a_serving_dev_port(proj, no_adopted, monkeypatch):
+    # The project must be RUNNABLE for discovery to act on its behalf: an empty
+    # folder cannot be serving anything, so a scan for it could only ever find
+    # someone else's server. See test_an_empty_project_never_adopts_anything.
+    open(os.path.join(proj, "index.html"), "w").write("<html><body>x</body></html>")
     monkeypatch.setattr(workspace, "_port_open", lambda p: p == 5173)
     monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: port == 5173)
     assert workspace.discover(proj) == 5173
@@ -542,3 +546,90 @@ def test_adopt_route_rejects_a_url_with_no_port(client, monkeypatch):
                     json={"project_dir": tempfile.gettempdir(), "url": "not-a-url"},
                     headers=_auth())
     assert r.status_code in (400, 403)
+
+
+# --------------------------------------------------------------------------- #
+# Discovery must not hand one project ANOTHER project's server.
+#
+# Reported: starting a new project showed the PREVIOUS project's site in the
+# preview. The old project's dev server was still on :3000, the new (empty) one
+# had nothing running, so the port scan found :3000 and adopted it.
+# --------------------------------------------------------------------------- #
+
+def test_an_empty_project_never_adopts_anything(proj, no_adopted, monkeypatch):
+    """It cannot be serving anything, so a scan on its behalf can only ever
+    find somebody else's server."""
+    monkeypatch.setattr(workspace, "_port_open", lambda p: True)
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    assert workspace.discover(proj) is None
+    assert workspace.status(proj)["state"] == "idle"
+
+
+def test_a_port_another_project_owns_is_left_alone(no_adopted, monkeypatch):
+    a = tempfile.mkdtemp(prefix="hubws-a-")
+    b = tempfile.mkdtemp(prefix="hubws-b-")
+    try:
+        for d in (a, b):
+            open(os.path.join(d, "index.html"), "w").write("<html><body>x</body></html>")
+        monkeypatch.setattr(workspace, "_port_open", lambda p: p == 3000)
+        monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+        monkeypatch.setattr(workspace, "_serves_fingerprint", lambda p, w, timeout=1.5: True)
+        assert workspace.discover(a) == 3000
+        assert workspace.discover(b) is None, "b adopted the server a already owns"
+    finally:
+        workspace.forget(a)
+        workspace.forget(b)
+        shutil.rmtree(a, ignore_errors=True)
+        shutil.rmtree(b, ignore_errors=True)
+
+
+def test_a_port_serving_a_different_site_is_refused(proj, no_adopted, monkeypatch):
+    """With a title to match on, "something is listening" becomes real evidence
+    of ownership instead of a guess."""
+    open(os.path.join(proj, "index.html"), "w").write(
+        "<html><head><title>Fez Restaurant</title></head><body>x</body></html>")
+    monkeypatch.setattr(workspace, "_port_open", lambda p: True)
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
+    monkeypatch.setattr(workspace, "_serve_body", None, raising=False)
+    monkeypatch.setattr(workspace, "_serves_fingerprint",
+                        lambda p, want, timeout=1.5: want == "Calvoun Store")
+    assert workspace.discover(proj) is None
+
+
+def test_the_owning_project_is_still_found(proj, no_adopted, monkeypatch):
+    open(os.path.join(proj, "index.html"), "w").write(
+        "<html><head><title>Fez Restaurant</title></head><body>x</body></html>")
+    monkeypatch.setattr(workspace, "_port_open", lambda p: p == 5173)
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: port == 5173)
+    monkeypatch.setattr(workspace, "_serves_fingerprint",
+                        lambda p, want, timeout=1.5: want == "Fez Restaurant")
+    assert workspace.discover(proj) == 5173
+
+
+def test_fingerprint_reads_the_title(proj):
+    open(os.path.join(proj, "index.html"), "w").write(
+        "<html><head><title>  Fez Restaurant  </title></head></html>")
+    assert workspace._fingerprint(proj) == "Fez Restaurant"
+
+
+def test_fingerprint_looks_in_the_usual_build_folders(proj):
+    os.makedirs(os.path.join(proj, "public"))
+    open(os.path.join(proj, "public", "index.html"), "w").write(
+        "<html><head><title>From public</title></head></html>")
+    assert workspace._fingerprint(proj) == "From public"
+
+
+def test_a_project_with_no_title_still_works(proj, no_adopted, monkeypatch):
+    """No fingerprint means we fall back to the old behaviour rather than
+    refusing to discover anything at all."""
+    open(os.path.join(proj, "index.html"), "w").write("<html><body>no title</body></html>")
+    assert workspace._fingerprint(proj) is None
+    monkeypatch.setattr(workspace, "_port_open", lambda p: p == 8080)
+    monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: port == 8080)
+    assert workspace.discover(proj) == 8080
+
+
+def test_an_unreadable_port_is_not_adopted(monkeypatch):
+    """Fail CLOSED: an uncertain scan declines rather than showing the wrong
+    project."""
+    assert workspace._serves_fingerprint(59999, "anything") is False
