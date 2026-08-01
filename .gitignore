@@ -31,3 +31,7 @@ graphify-out/
 
 # stray screenshots dropped in the repo root during debugging
 image*.png
+
+# Playwright/verification screenshots must never land in the repo.
+*.png
+!static/*.png

@@ -134,6 +134,37 @@ _IMAGES_RE = re.compile(
     r"\bonline store\b|\bstorefront\b|\be-?commerce\b|\bblog\b|\brestaurant\b",
     re.I)
 
+SECURITY = """SECURITY BRIEF — decide this BEFORE you write the feature, not after
+- First, in one line each: what an attacker gains, which data is worth stealing, which input a hostile user controls. Then design against three people — one who turns security off via configuration, one who copies the first example they find, one who swaps two arguments and gets no type error. If the insecure path is the easy path, the design is wrong.
+- Secrets fail CLOSED: os.environ["KEY"], never .get("KEY", "dev-secret") or process.env.X || "fallback". Missing config stops the app at boot instead of running on a default everyone knows. Never in code, the repo, or a log line.
+- Passwords: Argon2id (or scrypt/bcrypt). A fast hash is NOT a password KDF — never MD5/SHA-1/SHA-256, never "encrypt and store". Reject over-long passwords rather than silently truncating them.
+- Sessions: regenerate the session id on every privilege change (login, logout, role change). Ids from a CSPRNG, never a timestamp or a counter. Never accept a session id from the request. Cookies: HttpOnly, Secure, SameSite=Lax (Strict for admin), a real expiry.
+- Tokens: hardcode ONE signing algorithm and verify against it — never let the token name its own (alg:none and RS256->HS256 confusion are both full auth bypasses). Reset/OTP tokens are single-use and short-lived.
+- Compare secrets in constant time (hmac.compare_digest / crypto.timingSafeEqual). Never == on a token, MAC, signature or password hash.
+- Authorization deny-by-default, in ONE place. Never read a record's owner from the request (?user_id=). Never match roles by substring. Check ownership on every read AND write — the classic hole is a locked-down list endpoint beside an unchecked detail endpoint.
+- Injection: parameterised queries only, never string-built SQL. Escape on OUTPUT by context (HTML/attr/JS/URL); prefer a template engine that escapes by default. Never eval, new Function, setTimeout(string), yaml.load, unserialize, shell=True, or unpickling untrusted data. Block __proto__/constructor/prototype in any object merge.
+- CSRF: a token or SameSite on every state-changing request. CORS: an explicit origin allowlist — never "*", and never "*" together with credentials.
+- Uploads: validate type by CONTENT not extension, cap size, store outside the webroot under a generated name, serve with Content-Disposition and nosniff.
+- Payments: never store a card number or CVV. Use hosted fields/tokens (Stripe Elements or equivalent) so card data never reaches your server. Recompute every price and total server-side — never trust an amount from the client.
+- Rate-limit auth, reset and payment endpoints. Uniform errors: one "invalid credentials" for both unknown user and wrong password. Never return a stack trace to a client; log it server-side and return a generic 500.
+- Ship the headers: Content-Security-Policy, HSTS, X-Content-Type-Options: nosniff, Referrer-Policy. Dependencies pinned with a committed lockfile.
+ANTI: "we will add auth later"; a TODO where a permission check belongs; logging passwords, tokens, card numbers or full session ids; disabling TLS verification to make something work; inventing your own crypto or your own token format; leaving debug mode, stack traces, GraphQL introspection or a seeded admin password enabled in production."""
+
+# Checklist coverage informed by trailofbits/skills (CC BY-SA 4.0). The text above
+# is written from scratch rather than adapted, deliberately: that repo is
+# ShareAlike, and it also has NO web-application content at all (no SQLi, XSS,
+# CSRF, cookie flags, security headers, upload validation or PCI), so more than
+# half of what a store or SaaS actually needs had to come from elsewhere anyway.
+_SECURITY_RE = re.compile(
+    r"\bauth(?:entication|orization|entify)?\b|\blog ?in\b|\bsign ?up\b|\bpassword\b|"
+    r"\bsession\b|\bjwt\b|\btoken\b|\boauth\b|\bsso\b|\bpermission\b|\brole-based\b|"
+    r"\bpayment\b|\bcheckout\b|\bstripe\b|\bbilling\b|\bsubscription\b|\bcredit card\b|"
+    r"\bupload\b|\buser data\b|\bpersonal data\b|\bgdpr\b|\bsecurity\b|\bsecure\b|"
+    r"\bvulnerab\w*\b|\bxss\b|\bcsrf\b|\bsql ?injection\b|\bencrypt\w*\b|"
+    r"\bapi (?:endpoint|key)\b|\badmin panel\b|\bdashboard for users\b|"
+    r"\bonline store\b|\bstorefront\b|\be-?commerce\b|\bsaas\b|\bmulti-?tenant\b",
+    re.I)
+
 _SHIP_RE = re.compile(
     r"\bdeploy\w*\b|\bship it\b|\bgo live\b|\bpublish\b|\bhost(?:ing)?\b|"
     r"\bvercel\b|\bnetlify\b|\bcloudflare pages\b|\bproduction\b|"
@@ -164,6 +195,15 @@ _BRIEFS = [
 ]
 
 MAX_BRIEFS = 2          # two DOMAIN briefs is plenty; more is just context tax
+# A CEILING on orthogonal briefs, currently a no-op at 3 (all of them), and that
+# is deliberate. "Build a landing page for my saas" matches all three and costs
+# ~3,200 tokens — 10% of the SMALLEST window we route to. Capping it at 2 was
+# tried and reverted: it silently dropped IMAGES from exactly the request that
+# produced "I don't have the image_gen tool available", and each of these three
+# was asked for explicitly. 10% is the worst case on the worst window, on the
+# most complex build; most models here have 200K-1M. The cap exists so a FOURTH
+# orthogonal brief cannot be added without someone re-deciding this tradeoff.
+MAX_ORTHOGONAL = 3
 
 # ORTHOGONAL briefs. These are not competing views of the same task, so they do
 # not fight the domain briefs for a slot — they ride along whenever they apply.
@@ -187,6 +227,12 @@ _SEO_RE = re.compile(
     r"\brank(?:ing)?\b|\bsitemap\b|\bcore web vitals\b|" + _SITE_NOUNS, re.I)
 
 _ORTHOGONAL = [
+    # Security rides along rather than competing for a domain slot, for the same
+    # reason images and seo do: "build me a store with checkout" spends both
+    # slots on ecommerce/landing, and that is precisely the build where auth,
+    # payments and user data need to be designed for on the FIRST turn. Bolting
+    # security on afterwards is the failure this exists to prevent.
+    ("security", _SECURITY_RE, SECURITY),
     ("seo", _SEO_RE, SEO),
     ("images", _IMAGES_RE, IMAGES),
 ]
@@ -205,9 +251,13 @@ def match(text):
             out.append((name, brief))
             if len(out) >= MAX_BRIEFS:
                 break
+    extra = 0
     for name, rx, brief in _ORTHOGONAL:
         if rx.search(text):
             out.append((name, brief))
+            extra += 1
+            if extra >= MAX_ORTHOGONAL:
+                break
     return out
 
 
