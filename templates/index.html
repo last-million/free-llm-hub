@@ -1610,6 +1610,32 @@
   body.cx-agent-view main.wrap{ padding-bottom:10px; }
   body.cx-agent-view #agent-off-note{ margin:0 0 8px; }
   .agent-chat-col{ display:flex; flex-direction:column; gap:10px; min-width:0; min-height:0; }
+  /* KEEP EVERYTHING INSIDE THE COLUMN.
+     Measured at a 1100px viewport: the chat column was 309px wide and a single
+     message bubble was 811px, dragging the transcript into a horizontal scroll.
+     Cause is the flex/grid default `min-width:auto` — a child never shrinks
+     below its own content, so one long command, path or URL sets the width for
+     the whole column and nothing wraps. min-width:0 at EVERY level of the chain
+     is what lets the wrapping rules that are already there actually apply;
+     setting it on the column alone is not enough, because each nested flex
+     child re-introduces it. */
+  .agent-chat-col .chat-messages,
+  .agent-chat-col .msg,
+  .agent-chat-col .msg .bubble,
+  .agent-chat-col .agent-term,
+  .agent-chat-col .agent-term-line,
+  .agent-chat-col .agent-term-line.run > *,
+  .agent-chat-col .agent-answer{ min-width:0; max-width:100%; }
+  .agent-chat-col .chat-messages{ overflow-x:hidden; }
+  .agent-chat-col .msg .bubble,
+  .agent-chat-col .agent-term-line,
+  .agent-chat-col .agent-answer{ overflow-wrap:anywhere; word-break:break-word; }
+  /* The terminal box scrolls VERTICALLY only. Its lines already wrap, so a
+     horizontal scrollbar there is just a second place to get lost in. */
+  .agent-chat-col .agent-term{ overflow-x:hidden; overflow-y:auto; }
+  /* The status line is flex: without this its label and timer refuse to give
+     way and push the whole row wide. */
+  .agent-chat-col .agent-term-line.run{ flex-wrap:wrap; }
   /* Without min-height:0 a flex child refuses to shrink below its content, so
      the transcript pushes the whole split taller instead of scrolling. */
   .agent-chat-col .chat-messages{ flex:1; min-height:0; overflow:auto; }
