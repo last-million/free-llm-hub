@@ -59,6 +59,7 @@ except Exception:  # pragma: no cover - jinja2 always ships with flask
 
 import agentic_chat
 import agentic_history
+import quick_history
 import config
 import image_history
 import craft
@@ -3937,6 +3938,26 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         _s, pid, model = picked
         _session_pin_set(_skey, pid, model)
         return pid, model, difficulty
+    # ════════════════════════════════════════════════════════════════════════
+    # CONVERSATION PIN FOR PLAIN CHAT. Agentic turns have had this since the
+    # coding agent produced incoherent work by answering each turn with a
+    # different model; a chat conversation has the same problem in a smaller
+    # way. The history is always forwarded, so nothing is FORGOTTEN when the
+    # model changes -- but the voice, the format and the opinions do change
+    # mid-conversation, which reads as the assistant contradicting itself.
+    #
+    # Pinned across every later turn regardless of tier: once a conversation is
+    # under way, a one-word follow-up is still part of THAT conversation, and
+    # dropping to a cheap model for it is exactly the switch this prevents. The
+    # pin is never forced -- a model that is throttled, dead or too small for
+    # the request is not in `pool`, so it simply re-picks and re-pins.
+    _ckey = _session_key(messages)
+    if not require_tools and _ckey:
+        _cpin = _session_pin_get(_ckey)
+        if _cpin:
+            _host = _pick_same_model_host(pool, _cpin)
+            if _host:
+                return _host[0], _host[1], difficulty
     if difficulty != "simple":
         # LOW-QUALITY TAIL (see _LOW_QUALITY_RE): nemotron/gpt-oss/gemma are the
         # last resort for medium/hard too — only a SIMPLE ask may route to them
@@ -3969,6 +3990,11 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         else:
             picked = _spread_pick(pool) or max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
         _s, pid, model = picked
+        # Remember it for the rest of THIS conversation (see the pin block
+        # above). Only real work pins: a conversation that opens with "hi"
+        # must not spend the rest of its life on whatever answered that.
+        if not require_tools:
+            _session_pin_set(_ckey, pid, model)
         return pid, model, difficulty
     floor = _DIFFICULTY_FLOOR[difficulty]
     qualified = [c for c in pool if c[0] >= floor]
@@ -4425,6 +4451,58 @@ def _refit_payload_to_learned_ctx(pid, payload):
     except Exception:                                                # noqa: BLE001
         _log.debug("[refit] could not recompact for %s", pid, exc_info=True)
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Output budget — a provider's OWN default can cut an answer in half
+# --------------------------------------------------------------------------- #
+
+# When a caller sends no max_tokens, each provider applies its own default, and
+# some are tiny. MEASURED 2026-08-01: cloudflare stops at exactly 256 completion
+# tokens with finish_reason "length" -- an answer listing twelve months died at
+# "10. October:". The same model and the same question with max_tokens=2048
+# finished cleanly in 432 tokens. Nothing in the hub was wrong except that it
+# forwarded no budget at all and let the provider pick one.
+#
+# Only providers whose low default has been MEASURED are listed. A blind global
+# default risks sending a value above some model's real ceiling, which comes
+# back as a 400 and costs a hop -- worse than the problem.
+_PROVIDER_OUTPUT_DEFAULT = {
+    "cloudflare": 2048,      # measured default 256
+    "g4f-cloudflare": 2048,  # same upstream
+}
+# Providers proven to truncate at run time (see _note_default_truncation) join
+# the table above for the rest of the process's life.
+_LEARNED_OUTPUT_DEFAULT = {}
+_LEARNED_OUTPUT_TOKENS = 2048
+
+
+def _apply_output_budget(payload, pid):
+    """Give the hop an explicit output budget when the CALLER gave none.
+
+    Never overrides a max_tokens the client asked for -- a caller that wants a
+    20-token answer still gets one."""
+    if payload.get("max_tokens") is not None:
+        return
+    budget = _PROVIDER_OUTPUT_DEFAULT.get(pid) or _LEARNED_OUTPUT_DEFAULT.get(pid)
+    if budget:
+        payload["max_tokens"] = budget
+
+
+def _note_default_truncation(pid, client_max_tokens, finish_reason):
+    """Remember a provider that truncated an answer we set no budget for.
+
+    This is the same self-healing shape as _learn_context_limit: rather than
+    guess every provider's default up front, notice the one case that proves it
+    (finish_reason "length" on a request where the client asked for no limit)
+    and send an explicit budget to that provider from then on."""
+    if client_max_tokens is not None or finish_reason != "length":
+        return
+    if pid in _PROVIDER_OUTPUT_DEFAULT or pid in _LEARNED_OUTPUT_DEFAULT:
+        return
+    _LEARNED_OUTPUT_DEFAULT[pid] = _LEARNED_OUTPUT_TOKENS
+    _log.info("[output] %s truncated an unbounded answer at its own default; "
+              "sending max_tokens=%d from now on", pid, _LEARNED_OUTPUT_TOKENS)
 
 
 def _model_ctx_budget(pid, model):
@@ -5737,6 +5815,29 @@ def api_activity():
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
+
+# Each dashboard view has its own real URL, so it can be opened in a new tab,
+# bookmarked or shared. The frontend holds the same map (VIEW_PATHS in
+# index.html) and decides WHICH view to show from the path; the server's only
+# job is to serve the app for these paths instead of 404ing on a hard refresh.
+# An explicit list, not a catch-all: a typo must still 404 rather than silently
+# render the dashboard, and /api, /v1 and /artifact keep their own handlers.
+_VIEW_SLUGS = ("hub", "activity", "chat", "agent", "images", "providers",
+               "image-providers", "subscriptions", "routing", "quota",
+               "usage", "tracking")
+
+
+@app.route("/<any(" + ", ".join("'%s'" % s for s in _VIEW_SLUGS) + "):slug>")
+@app.route("/<any(" + ", ".join("'%s'" % s for s in _VIEW_SLUGS) + "):slug>/<path:rest>")
+def view_page(slug, rest=None):
+    """Serve the dashboard for a view URL.
+
+    `rest` carries a session id (/agent/<id>) and is deliberately not validated
+    here -- the page reads it from the address bar itself and every API it then
+    calls validates it. Accepting it just means a refresh returns to the same
+    conversation instead of losing it."""
+    return index()
+
 
 @app.route("/")
 def index():
@@ -7777,6 +7878,52 @@ def api_agent_end_session(session_id):
         except Exception as exc:                                 # noqa: BLE001
             log.warning("could not stop the preview for %s: %s", project_dir, exc)
     return jsonify({"ended": ended, "app_closed": bool(closed)})
+
+
+# --------------------------------------------------------------------------- #
+# Quick-chat history — the plain chat kept nothing across a reload
+# --------------------------------------------------------------------------- #
+
+@app.route("/api/chat/history", methods=["GET"])
+def api_chat_history_list():
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+    except (TypeError, ValueError):
+        limit = 50
+    return jsonify({"conversations": quick_history.list_conversations(limit)})
+
+
+@app.route("/api/chat/history/<cid>", methods=["GET"])
+def api_chat_history_get(cid):
+    conv = quick_history.load_conversation(cid)
+    if not conv:
+        return jsonify({"error": "No such conversation."}), 404
+    return jsonify(conv)
+
+
+@app.route("/api/chat/history/<cid>", methods=["DELETE"])
+def api_chat_history_delete(cid):
+    return jsonify({"deleted": quick_history.delete_conversation(cid)})
+
+
+@app.route("/api/chat/history/<cid>/turn", methods=["POST"])
+def api_chat_history_save_turn(cid):
+    """Record one exchange.
+
+    Written by the browser AFTER a reply completes, rather than by the chat
+    endpoint itself: the quick chat calls /v1/chat/completions directly, the
+    same endpoint every external CLI uses, and that endpoint has no idea which
+    dashboard conversation a request belongs to. Teaching it would mean adding
+    a hub-specific field to a public OpenAI-compatible API. The browser already
+    knows, so it says."""
+    body = request.get_json(silent=True) or {}
+    user_text = body.get("user")
+    assistant_text = body.get("assistant")
+    if not isinstance(user_text, str) or not isinstance(assistant_text, str):
+        return jsonify({"error": "Pass {user: str, assistant: str}."}), 400
+    quick_history.save_turn(cid, user_text, assistant_text,
+                            model=body.get("model"), provider=body.get("provider"))
+    return jsonify({"ok": True})
 
 
 @app.route("/api/agent/clis/<cli_id>/install", methods=["POST"])
@@ -11042,6 +11189,7 @@ def v1_chat_completions():
         is_sub_hop = _is_sub(hop_pid)
         payload = dict(body)
         payload["model"] = hop_model
+        _apply_output_budget(payload, hop_pid)
         _apply_reasoning_effort(payload, hop_model, diff)
         dispatch_stream = stream and not is_sub_hop
         payload["stream"] = dispatch_stream
@@ -11142,6 +11290,15 @@ def v1_chat_completions():
             _record_chat_usage(hop_pid, hop_model, data, est)
             if isinstance(data, dict):
                 data["model"] = hop_pid + "/" + hop_model
+                # An answer cut off at the provider's OWN default budget is a
+                # bug the caller cannot see or fix -- learn from it so the next
+                # request to this provider carries an explicit budget.
+                try:
+                    _note_default_truncation(
+                        hop_pid, body.get("max_tokens"),
+                        ((data.get("choices") or [{}])[0] or {}).get("finish_reason"))
+                except Exception:                                # noqa: BLE001
+                    pass
             return jsonify(data), 200, _routing_headers(hop_pid, hop_model, attempts, last_error)
         # Non-2xx. Retryable (429/5xx) and HARD errors (404/400/model-not-found)
         # both advance to the NEXT provider — each chain hop is a DIFFERENT
