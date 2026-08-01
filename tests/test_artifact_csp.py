@@ -94,3 +94,13 @@ def test_only_a_few_artifacts_are_kept(client):
     for _ in range(app._ARTIFACT_KEEP + 6):
         client.post("/api/artifact", json={"html": "<p>x</p>"}, headers=_auth())
     assert len(app._ARTIFACTS) <= app._ARTIFACT_KEEP + 1
+
+
+def test_dashboard_is_never_served_from_the_browser_cache(client):
+    """The dashboard ships its own JavaScript inline, so a cached copy of the
+    page is a cached copy of the CODE. That produced console errors from a
+    code path deleted hours earlier -- the file on disk said one thing, the
+    running tab did another. Restarting the hub has to mean the next load runs
+    the current build."""
+    cc = client.get("/").headers.get("Cache-Control", "")
+    assert "no-store" in cc, "dashboard is cacheable: a stale tab runs stale JS"

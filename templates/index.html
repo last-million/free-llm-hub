@@ -5877,6 +5877,7 @@
       /<svg[\s>]/i.test(candidate) || (/^</.test(candidate) && /<\/[a-z][^>]*>/i.test(candidate));
     return looksLikeMarkup ? candidate : null;
   }
+  var artifactUrl = '';           /* url of whatever the panel is showing now */
   function addArtifactButton(container, html){
     if (!container || !html) return;
     var btn = document.createElement('button');
@@ -5902,6 +5903,7 @@
       .then(function(r){
         if (!r || !r.url) throw new Error('no url');
         frame.removeAttribute('srcdoc');
+        artifactUrl = r.url;
         frame.src = r.url;
       })
       .catch(function(err){
@@ -5912,6 +5914,7 @@
            errors in the parent console — for a render that was going to look
            broken anyway. A clear message beats a silent flood. */
         frame.removeAttribute('srcdoc');
+        artifactUrl = '';
         frame.src = 'about:blank';
         toast('Could not open that artifact: ' + ((err && err.message) || 'unknown error'), true);
         closeArtifactPanel();
@@ -5924,6 +5927,7 @@
     panel.classList.remove('is-fullscreen');
     var frame = $('#artifact-frame');
     if (frame){ frame.removeAttribute('srcdoc'); frame.src = 'about:blank'; }
+    artifactUrl = '';
   }
   function initArtifactPanel(){
     var panel = $('#artifact-panel');
@@ -5940,13 +5944,14 @@
     if (closeBtn) closeBtn.addEventListener('click', closeArtifactPanel);
     var newTabBtn = $('#artifact-newtab');
     if (newTabBtn) newTabBtn.addEventListener('click', function(){
-      var frame = $('#artifact-frame');
-      var html = frame && frame.srcdoc;
-      if (!html){ toast('Nothing to open yet', true); return; }
-      var blob = new Blob([html], { type: 'text/html' });
-      var url = URL.createObjectURL(blob);
-      window.open(url, '_blank', 'noopener');
-      setTimeout(function(){ URL.revokeObjectURL(url); }, 60000);
+      /* Opens the artifact's OWN url. This used to read frame.srcdoc and wrap
+         it in a blob, which stopped working the moment artifacts moved off
+         srcdoc onto a served url — srcdoc is never set now, so the button did
+         nothing but say "Nothing to open yet". The served url is also the
+         better thing to open: same document, same policy, and it survives
+         being bookmarked or reloaded, which a revoked blob url does not. */
+      if (!artifactUrl){ toast('Nothing to open yet', true); return; }
+      window.open(artifactUrl, '_blank', 'noopener');
     });
   }
 
