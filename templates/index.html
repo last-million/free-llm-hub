@@ -6686,6 +6686,22 @@
       return {
         attach: function(d){
           dir = d; lastUrl = null; treeLoaded = false; adoptTried = {};
+          /* Blank the pane IMMEDIATELY. Switching projects used to leave the
+             previous project's site on screen until the first poll came back,
+             so a brand-new project appeared to already be running someone
+             else's work. Clear the frame, the tree and the problems together —
+             none of it belongs to the folder we just moved to. */
+          frame.src = 'about:blank';
+          frame.hidden = true;
+          placeholder.hidden = false;
+          setState('not running');
+          probList.innerHTML = '';
+          logEl.textContent = '';
+          probBox.hidden = true;
+          treeEl.innerHTML = '';
+          codeName.textContent = 'Pick a file';
+          codeMeta.textContent = '';
+          codeBody.textContent = 'Select a file on the left to read it.';
           /* Ask for discovery once on attach: restoring a session from its URL
              must find a server the agent left running before the reload. */
           api('/api/workspace/status?project_dir=' + encodeURIComponent(d) + '&discover=1')
