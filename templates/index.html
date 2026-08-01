@@ -5899,8 +5899,23 @@
        policy; the iframe stays sandboxed without allow-same-origin, so it still
        has an opaque origin and cannot reach the dashboard. */
     api('/api/artifact', { method: 'POST', body: { html: html } })
-      .then(function(r){ frame.removeAttribute('srcdoc'); frame.src = r.url; })
-      .catch(function(){ frame.srcdoc = html; });   // fall back rather than show nothing
+      .then(function(r){
+        if (!r || !r.url) throw new Error('no url');
+        frame.removeAttribute('srcdoc');
+        frame.src = r.url;
+      })
+      .catch(function(err){
+        /* Deliberately NOT falling back to srcdoc. That was the fallback here,
+           and it is the exact thing this change exists to avoid: a srcdoc frame
+           inherits the dashboard's `default-src 'none'`, so a page that
+           references webfonts produced dozens of "Refused to load the font"
+           errors in the parent console — for a render that was going to look
+           broken anyway. A clear message beats a silent flood. */
+        frame.removeAttribute('srcdoc');
+        frame.src = 'about:blank';
+        toast('Could not open that artifact: ' + ((err && err.message) || 'unknown error'), true);
+        closeArtifactPanel();
+      });
   }
   function closeArtifactPanel(){
     var panel = $('#artifact-panel');
