@@ -56,6 +56,7 @@
     --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,'Helvetica Neue',Arial,sans-serif;
     --radius:10px;
     --radius-sm:8px;
+    --ui-scale:.8;   /* 80% — set from Settings, persisted */
     --sidebar-w:248px;
     --sidebar-rail:56px;   /* icons only */
     --sidebar-strip:46px;  /* hidden: dimmed icons, still a target */
@@ -122,6 +123,14 @@
   :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
   ::selection{background:var(--accent-soft)}
 
+  /* UI SCALE. The whole dashboard is authored in px, so there is no rem ladder
+     to retune — `zoom` on the root is what browser zoom-out does, and it is what
+     the user was already doing manually because it looked better. Unlike
+     transform:scale it RECALCULATES layout, so the fixed sidebar still pins to
+     the real viewport edges and media queries see the widened CSS viewport,
+     which is the behaviour we want. Measured at 0.8: sidebar 248->198, no
+     horizontal overflow, sidebar bottom still exactly the viewport height. */
+  html{ zoom:var(--ui-scale, .8); }
   .wrap{max-width:none;margin:0;padding:0 28px 90px}
 
   /* ---------- header ---------- */
@@ -1403,6 +1412,12 @@
     .cx-sidebar, .gl-caret, .cx-sidebar-toggle{ transition:none; }
   }
 
+  /* The agent view is a full-height working surface: chat beside a live
+     preview. The top bar is status, not navigation — every control on it is
+     reachable from the sidebar — so it costs ~64px of the very height the split
+     needs. Hidden only on that view. */
+  body.cx-agent-view > header{ display:none; }
+  body.cx-agent-view main.wrap{ padding-top:14px; }
   body.cx-on main.wrap > section.section{ display:none; }
   body.cx-on main.wrap > section.section.cx-active{ display:block; animation:cxFade .22s ease-out; }
   @keyframes cxFade{ from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:none;} }
@@ -1457,7 +1472,10 @@
   }
   .agent-answer{ white-space:pre-wrap; word-break:break-word; }
   /* sidebar social footer */
-  .cx-side-foot{ margin-top:auto; display:flex; gap:8px; padding:14px 16px 18px; border-top:1px solid var(--border-soft); }
+  /* Sits at the bottom of the nav, above the social links, so it is reachable
+     even when the top bar is hidden on the agent view. */
+  .cx-side-settings{ margin-top:auto; padding:8px 10px 0; }
+  .cx-side-foot{ margin-top:0; display:flex; gap:8px; padding:14px 16px 18px; border-top:1px solid var(--border-soft); }
   .cx-side-link{ width:34px; height:34px; border-radius:9px; display:grid; place-items:center;
     color:var(--text-dim); border:1px solid var(--border-soft); text-decoration:none;
     transition:color .15s ease, border-color .15s ease, background .15s ease; }
@@ -1499,12 +1517,56 @@
   .agent-split{ display:grid; grid-template-columns:1fr; gap:12px; }
   @media (min-width:1100px){
     /* The artifact view is the thing being judged, so it gets the larger share.
-       Height tracks the viewport rather than the content: a preview box that
-       grows and shrinks with the chat transcript is unusable for looking at a
-       page. 190px is the shell above it (header + section bar + input row). */
+       Height is PINNED to the viewport, not derived from content: a preview box
+       that grows and shrinks with the chat transcript is unusable for looking at
+       a page, and it also pushed the whole split below the fold. Each column
+       scrolls inside itself instead. --agent-chrome is measured live in JS,
+       because the strip above this varies (session bar, notices, banners). */
     .agent-split{ grid-template-columns:minmax(0,0.78fr) minmax(0,1.32fr);
-      align-items:stretch; min-height:calc(100vh - 190px); }
+      align-items:stretch;
+      /* Height is set from JS (see initAgentLayout), NOT from 100vh. Inside a
+         zoomed root `100vh` resolves to the viewport height as a NUMBER and then
+         gets scaled by the zoom, so calc(100vh - chrome) under-filled by ~300px
+         — measured: the split used 47% of the screen with a 304px gap below. */
+      min-height:420px; }
   }
+
+  /* ONE LINE of chrome on the agent view. The master switch, the Session/History
+     toggle and the session bar each had their own row; folded together they give
+     the split back ~90px of the height it is competing for. */
+  body.cx-agent-view #sec-agent .sub-master-row,
+  body.cx-agent-view #sec-agent .seg-toggle,
+  body.cx-agent-view #sec-agent .agent-session-bar{ margin:0; }
+  body.cx-agent-view #sec-agent .agent-topline{ display:flex; align-items:center;
+    gap:10px; flex-wrap:wrap; padding:0 0 8px; }
+  body.cx-agent-view #sec-agent .agent-topline > *{ margin:0 !important; }
+  body.cx-agent-view #sec-agent .agent-session-bar{ flex:1; min-width:0;
+    display:flex; align-items:center; gap:8px; }
+  body.cx-agent-view #sec-agent .agent-session-info{ overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+  /* The permissions disclosure STAYS — it is a deliberate safety notice and its
+     own comment says never to gate it. It is made compact here, not hidden:
+     smaller type, one line, still fully readable. */
+  body.cx-agent-view #agent-warning{ font-size:11.5px; padding:6px 10px;
+    margin:0 0 8px; line-height:1.4; }
+  /* The section's descriptive subtitle IS decoration once you are working, and
+     the title is already in the sidebar and the tab. Verified selectors: the
+     heading is h2#h-agent inside .section-h, the subtitle is .sub beside it. */
+  /* Reclaim every row that is duplicated elsewhere or is pure decoration once
+     you are working. Measured from a real screenshot: ~200px above the split
+     and ~200px below it were doing nothing, on the one view where height is
+     the whole point.
+       - .section-h    the "Chat CLI" title: already the sidebar item AND the
+                       browser tab title.
+       - #agent-recent-chips  the project path chip: the session bar on the
+                       topline already shows the same path.
+       - .confignote   the page footer, and .wrap's 90px bottom padding.
+     The permissions notice is NOT in this list — see below. */
+  body.cx-agent-view .section.cx-active .section-h{ display:none; }
+  body.cx-agent-view #agent-recent-chips{ display:none; }
+  body.cx-agent-view .confignote{ display:none; }
+  body.cx-agent-view main.wrap{ padding-bottom:10px; }
+  body.cx-agent-view #agent-off-note{ margin:0 0 8px; }
   .agent-chat-col{ display:flex; flex-direction:column; gap:10px; min-width:0; min-height:0; }
   /* Without min-height:0 a flex child refuses to shrink below its content, so
      the transcript pushes the whole split taller instead of scrolling. */
@@ -1518,8 +1580,28 @@
     overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .preview-state.live{ color:var(--ok-text); }
   .preview-state.bad{ color:var(--danger-text); }
-  .preview-open{ font-size:12.5px; color:var(--accent); text-decoration:none; }
-  .preview-open:hover{ text-decoration:underline; }
+  .preview-icon{ padding:4px 6px; line-height:0; }
+  .preview-devices{ display:inline-flex; gap:2px; padding:2px; flex:none;
+    background:var(--bg-inset); border:1px solid var(--border-soft);
+    border-radius:var(--radius-sm); }
+  .pv-dev{ width:26px; height:22px; display:grid; place-items:center; cursor:pointer;
+    border:0; background:none; color:var(--text-faint); border-radius:5px;
+    transition:color 160ms ease, background 160ms ease; }
+  .pv-dev svg{ width:14px; height:14px; }
+  .pv-dev:hover{ color:var(--text-dim); }
+  .pv-dev.active{ color:var(--accent); background:var(--accent-soft); }
+  .pv-dev:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  /* A constrained device width is centred on a neutral gutter so the page edges
+     are obvious — otherwise a 390px render inside a 900px pane just looks like a
+     broken layout. */
+  .preview-frame-wrap.constrained{ display:grid; place-items:start center;
+    background:var(--bg-inset); overflow:auto; }
+  .preview-frame-wrap.constrained .preview-frame{ height:100%;
+    box-shadow:0 0 0 1px var(--border), 0 10px 40px rgba(0,0,0,.35); }
+  /* Fullscreen uses the real Fullscreen API, so it escapes the split entirely. */
+  .preview-frame-wrap:fullscreen{ background:#fff; }
+  .preview-frame-wrap:fullscreen .preview-frame{ width:100%; height:100%; }
+  @media (prefers-reduced-motion:reduce){ .pv-dev{ transition:none; } }
   /* Themed while EMPTY — a white slab sitting in a dark dashboard with nothing
      running reads as a broken pane, and the placeholder text on it was unreadable.
      The white canvas belongs to the IFRAME, not the container: a real site still
@@ -1627,7 +1709,7 @@
       <button class="cx-group-label" type="button" aria-expanded="true" aria-controls="grp-generate"><span class="gl-text">Generate</span><svg class="gl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
       <div class="cx-group-body" id="grp-generate">
       <button class="cx-nav-item" data-view="sec-chat" data-title="Chat / Test" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>Quick chat</span></button>
-      <button class="cx-nav-item" data-view="sec-agent" data-title="Chat CLI (agentic)" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="m7 9 3 3-3 3"/><line x1="13" y1="15" x2="17" y2="15"/></svg><span>Agent chat</span></button>
+      <button class="cx-nav-item" data-view="sec-agent" data-title="Chat CLI (agentic)" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="m7 9 3 3-3 3"/><line x1="13" y1="15" x2="17" y2="15"/></svg><span>Agent chat</span><span class="nav-new-badge" data-new-key="agent_workspace_preview_v1">New</span></button>
       <button class="cx-nav-item" data-view="sec-images" data-title="Image generation" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg><span>Images</span></button></div>
     </div>
     <div class="cx-group" data-group="models-keys">
@@ -1646,6 +1728,12 @@
       <button class="cx-nav-item" data-view="sec-tracking" data-title="Model tracking" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.9 4.9l2.9 2.9M16.2 16.2l2.9 2.9M4.9 19.1l2.9-2.9M16.2 7.8l2.9-2.9"/></svg><span>Tracking</span></button></div>
     </div>
   </nav>
+  <div class="cx-side-settings">
+    <button class="cx-nav-item" id="cx-open-settings" type="button" title="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
+      <span>Settings</span>
+    </button>
+  </div>
   <div class="cx-side-foot">
     <a class="cx-side-link" href="https://www.youtube.com/@QuantumSEO-AR" target="_blank" rel="noopener noreferrer" aria-label="YouTube — QuantumSEO-AR" title="YouTube — QuantumSEO-AR">
       <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M21.6 7.2a2.5 2.5 0 0 0-1.76-1.77C18.25 5 12 5 12 5s-6.25 0-7.84.43A2.5 2.5 0 0 0 2.4 7.2 26 26 0 0 0 2 12a26 26 0 0 0 .4 4.8 2.5 2.5 0 0 0 1.76 1.77C5.75 19 12 19 12 19s6.25 0 7.84-.43a2.5 2.5 0 0 0 1.76-1.77A26 26 0 0 0 22 12a26 26 0 0 0-.4-4.8zM10 15V9l5 3-5 3z"/></svg>
@@ -1953,8 +2041,30 @@
                 <button class="btn sm primary" id="preview-run" type="button">Run</button>
                 <button class="btn sm ghost" id="preview-stop" type="button" hidden>Stop</button>
                 <span class="preview-state" id="preview-state">not running</span>
-                <a class="preview-open" id="preview-open" href="#" target="_blank" rel="noopener noreferrer" hidden>Open</a>
-                <button class="btn sm ghost preview-reload" id="preview-reload" type="button" hidden aria-label="Reload preview">
+                <!-- Device widths. The frame is CONSTRAINED rather than zoomed, so
+                     the page's own media queries fire exactly as they would on the
+                     real device — a scaled-down desktop render would not. -->
+                <div class="preview-devices" id="preview-devices" role="group" aria-label="Preview width" hidden>
+                  <button type="button" class="pv-dev active" data-w="0" title="Fill the pane" aria-pressed="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 20h8"/></svg>
+                  </button>
+                  <button type="button" class="pv-dev" data-w="1280" title="Desktop — 1280px" aria-pressed="false">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M2 20h20"/></svg>
+                  </button>
+                  <button type="button" class="pv-dev" data-w="820" title="Tablet — 820px" aria-pressed="false">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M11 18.5h2"/></svg>
+                  </button>
+                  <button type="button" class="pv-dev" data-w="390" title="Mobile — 390px" aria-pressed="false">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2.5"/><path d="M11 18.5h2"/></svg>
+                  </button>
+                </div>
+                <button class="btn sm ghost preview-icon" id="preview-full" type="button" hidden aria-label="Fullscreen preview" title="Fullscreen">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+                </button>
+                <a class="btn sm ghost preview-icon" id="preview-open" href="#" target="_blank" rel="noopener noreferrer" hidden aria-label="Open in a new tab" title="Open in a new tab">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
+                </a>
+                <button class="btn sm ghost preview-icon" id="preview-reload" type="button" hidden aria-label="Reload preview" title="Reload">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>
                 </button>
               </div>
@@ -2291,6 +2401,11 @@
     document.querySelectorAll('main.wrap > section.section').forEach(function(s){
       s.classList.toggle('cx-active', s === sec);
     });
+    /* The agent view is a full-height working surface, so the top bar (status,
+       not navigation — every control on it is also in the sidebar) is hidden
+       there to give the chat/preview split its ~64px back. */
+    document.body.classList.toggle('cx-agent-view', view === 'sec-agent');
+    try { document.dispatchEvent(new Event('cx:view')); } catch(e){}
     body.hidden = false;                                   // force the active view's body open
     items().forEach(function(b){
       var on = b.dataset.view === view;
@@ -2348,6 +2463,14 @@
     }); }
     initSidebarModes();
     initNavGroups();
+    initAgentLayout();
+    var sideSettings = document.getElementById('cx-open-settings');
+    if (sideSettings) sideSettings.addEventListener('click', function(){
+      /* Reuse the header button's own handler instead of duplicating the
+         drawer's open logic — one code path, no drift. */
+      var opener = document.getElementById('settings-drawer-open');
+      if (opener) opener.click();
+    });
     cxShow(viewFromHash() || 'sec-lifecycle', { focus: false });
     window.cxShow = cxShow;   // let other code deep-link a view (e.g. a wizard launcher)
     cxWelcome();
@@ -2411,6 +2534,60 @@
     side.addEventListener('mouseenter', function(){ clearTimeout(timer); });
     /* Only start the clock once the pointer has actually been on the sidebar —
        otherwise it collapses 2s after page load, before the user has seen it. */
+  }
+
+  /* The agent workspace claims the viewport: fold the three chrome rows into
+     one, then pin the split to whatever height is actually left.
+     --agent-chrome is MEASURED rather than hardcoded, because that strip
+     changes size — the session bar appears, the out-of-quota banner comes and
+     goes, the permissions notice wraps at narrow widths. A constant would be
+     wrong for most of those states. */
+  function initAgentLayout(){
+    var sec = document.getElementById('sec-agent');
+    if (!sec) return;
+    var topline = sec.querySelector('.agent-topline');
+    if (!topline){
+      topline = document.createElement('div');
+      topline.className = 'agent-topline';
+      var master = sec.querySelector('.sub-master-row');
+      var toggle = sec.querySelector('#agent-view-toggle');
+      var bar = sec.querySelector('.agent-session-bar');
+      if (master && master.parentNode){
+        master.parentNode.insertBefore(topline, master);
+        [master, toggle, bar].forEach(function(el){ if (el) topline.appendChild(el); });
+      }
+    }
+    var split = document.getElementById('agent-split');
+    if (!split) return;
+    function measure(){
+      if (!document.body.classList.contains('cx-agent-view')){
+        split.style.height = '';
+        return;
+      }
+      if (window.innerWidth < 1100){ split.style.height = ''; return; }  /* stacked */
+      /* MIXED UNITS, so derive the conversion instead of assuming it.
+         Under CSS zoom, getBoundingClientRect() reports REAL viewport pixels
+         while getComputedStyle().height reports the ZOOMED CSS value —
+         measured: computed 902px, rect 722px, at zoom .8. Reading a zoom
+         constant and dividing by it got the direction wrong and left ~300px
+         of dead space. Taking the ratio of the two is correct whatever the
+         zoom is, including 1, and survives the user changing it. */
+      var rect = split.getBoundingClientRect();
+      var cssH = parseFloat(getComputedStyle(split).height) || rect.height;
+      var cssPerRealPx = rect.height > 0 ? (cssH / rect.height) : 1;
+      var availReal = window.innerHeight - rect.top - 12;  /* breathing room */
+      split.style.height =
+        Math.max(420, Math.round(availReal * cssPerRealPx)) + 'px';
+    }
+    measure();
+    window.addEventListener('resize', measure);
+    if (window.ResizeObserver){
+      var ro = new ResizeObserver(measure);
+      ro.observe(sec);
+    }
+    /* Re-measure when the view is switched to, since the split has no box while
+       the section is display:none. */
+    document.addEventListener('cx:view', measure);
   }
 
   /* Collapsible nav groups. */
@@ -5709,6 +5886,8 @@
         stopBtn2.hidden = !running;
         reloadBtn.hidden = !running;
         openEl.hidden = !running;
+        devices.hidden = !running;
+        fullBtn.hidden = !running;
         if (running && st.url){
           openEl.href = st.url;
           /* Only reassign src on a URL CHANGE — writing the same src reloads the
@@ -5799,6 +5978,31 @@
 
       reloadBtn.addEventListener('click', function(){
         if (lastUrl){ frame.src = lastUrl.split('#')[0] + '#r' + Date.now(); }
+      });
+
+      /* Device widths CONSTRAIN the frame rather than scaling it, so the page's
+         own media queries fire exactly as they would on the real device. */
+      var devices = $('#preview-devices');
+      devices.addEventListener('click', function(e){
+        var b = e.target.closest('.pv-dev');
+        if (!b) return;
+        [].forEach.call(devices.querySelectorAll('.pv-dev'), function(x){
+          var on = x === b;
+          x.classList.toggle('active', on);
+          x.setAttribute('aria-pressed', on ? 'true' : 'false');
+        });
+        var w = parseInt(b.dataset.w, 10) || 0;
+        var wrap = frame.parentElement;
+        wrap.classList.toggle('constrained', w > 0);
+        frame.style.width = w ? w + 'px' : '';
+        frame.style.maxWidth = w ? '100%' : '';
+      });
+
+      var fullBtn = $('#preview-full');
+      fullBtn.addEventListener('click', function(){
+        var wrap = frame.parentElement;
+        if (document.fullscreenElement) document.exitFullscreen();
+        else if (wrap.requestFullscreen) wrap.requestFullscreen();
       });
 
       logToggle.addEventListener('click', function(){
