@@ -919,6 +919,48 @@
   .seg-btn:hover{color:var(--text-dim)}
   .seg-btn[aria-selected="true"]{background:var(--surface-3);color:var(--text)}
   .seg-toggle.sm .seg-btn{padding:5px 11px;font-size:12px;min-height:28px}
+  /* The workspace-mode choice is a real decision, not a view filter, so it gets
+     real buttons. The generic .seg-btn has background:none/border:0 and a
+     text-faint idle colour, which read as disabled labels in both themes —
+     reported as "make them visible and look like real buttons". */
+  #agent-dir-mode{ background:none; padding:0; gap:8px; border:0; }
+  #agent-dir-mode .seg-btn{ border:1px solid var(--border);
+    background:var(--surface-2); color:var(--text-dim); border-radius:var(--radius-sm);
+    padding:7px 14px; min-height:34px; font-weight:600; cursor:pointer; }
+  #agent-dir-mode .seg-btn:hover{ color:var(--text); border-color:var(--text-faint); }
+  #agent-dir-mode .seg-btn:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  #agent-dir-mode .seg-btn[aria-selected="true"]{ background:var(--accent);
+    color:var(--on-accent, #04110a); border-color:var(--accent); }
+
+  /* Folder row: a browse button beside the path, and the whole row is a drop
+     target. */
+  .agent-start-row{ display:flex; gap:8px; align-items:stretch; flex-wrap:wrap; }
+  .agent-start-row.dropping{ outline:2px dashed var(--accent); outline-offset:4px;
+    border-radius:var(--radius-sm); }
+  .dir-browse{ display:inline-grid; place-items:center; width:36px; flex:none;
+    border:1px solid var(--border); background:var(--surface-2); color:var(--text-dim);
+    border-radius:var(--radius-sm); cursor:pointer;
+    transition:color .15s ease, border-color .15s ease; }
+  .dir-browse:hover{ color:var(--accent); border-color:var(--accent-border); }
+  .dir-browse:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .dirpick{ position:fixed; inset:0; z-index:400; display:grid; place-items:center;
+    background:var(--scrim, rgba(0,0,0,.55)); }
+  .dirpick-box{ width:min(560px, 92vw); max-height:74vh; display:flex;
+    flex-direction:column; background:var(--surface); border:1px solid var(--border);
+    border-radius:var(--radius); overflow:hidden; }
+  .dirpick-h{ display:flex; align-items:center; gap:8px; padding:10px 12px;
+    border-bottom:1px solid var(--border-soft); }
+  .dirpick-path{ flex:1; min-width:0; font-family:var(--mono); font-size:11.5px;
+    color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .dirpick-list{ overflow:auto; padding:4px 0; }
+  .dirpick-item{ display:flex; align-items:center; gap:8px; width:100%; border:0;
+    background:none; color:var(--text); font:inherit; font-size:13px; cursor:pointer;
+    padding:7px 12px; text-align:left; }
+  .dirpick-item:hover{ background:var(--surface-2); }
+  .dirpick-item svg{ width:14px; height:14px; flex:none; color:var(--text-faint); }
+  .dirpick-f{ display:flex; gap:8px; padding:10px 12px;
+    border-top:1px solid var(--border-soft); }
+  @media (prefers-reduced-motion:reduce){ .dir-browse{ transition:none; } }
 
   /* ---------- CLI picker (Chat CLI) ---------- */
   .agent-cli-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
@@ -1990,7 +2032,7 @@
         <div id="agent-session-tab" role="tabpanel">
         <div class="agent-cli-row" id="agent-cli-row">
           <select id="agent-cli" aria-label="Agent CLI">
-            <option value="claude">Claude Code</option>
+            <option value="claude">Claude Code &mdash; recommended</option>
             <option value="codex">ChatGPT Codex</option>
           </select>
           <span class="agent-cli-note" id="agent-cli-note"></span>
@@ -2004,6 +2046,10 @@
           <input id="agent-dir" type="text" placeholder="Absolute project folder, e.g. C:\Users\you\project"
                  autocomplete="off" spellcheck="false" aria-label="Project folder" list="agent-dir-history">
           <datalist id="agent-dir-history"></datalist>
+          <button class="dir-browse" id="agent-dir-browse" type="button"
+                  aria-label="Browse for a folder on this machine" title="Browse this machine">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          </button>
           <button class="btn primary" id="agent-start" type="button">Start session</button>
         </div>
         <div class="agent-recent-chips" id="agent-recent-chips" hidden></div>
@@ -5574,8 +5620,25 @@
       var info = clis[id] || {};
       var base = id === 'claude' ? 'Claude Code' : 'ChatGPT Codex';
       opt.disabled = info.supported === false;
-      opt.textContent = base + (info.supported === false ? ' (not available)' : '');
-      if (info.reason) opt.title = info.reason;
+      /* Say which copy a session would actually RUN. "isolated" means the hub's
+         own install under ~/.free-llm-hub/isolated-clis, with its own config
+         dir — so driving it as an agent cannot disturb the CLI the user types
+         into by hand. Without this the picker gave no hint which install was
+         about to be touched. */
+      var tag = info.supported === false ? ' — not available'
+              : !info.installed ? ' — not installed'
+              : info.isolated ? ' — isolated copy'
+              : ' — your install';
+      opt.textContent = base + (info.recommended ? ' (recommended)' : '') + tag;
+      /* No apostrophes in these strings on purpose: this file goes through a
+         Python rewrite and a shell heredoc, and an escaped quote does not
+         survive all three layers intact. It silently became "the hub's own"
+         with the backslash gone, which is a JS syntax error — caught by
+         test_all_inline_script_blocks_pass_node_check. */
+      opt.title = info.reason ||
+        (info.isolated
+          ? 'Runs the copy owned by the hub, with separate settings and credentials. It cannot interfere with the CLI you use by hand.'
+          : 'Runs the copy already on your PATH. Install an isolated copy from Subscriptions to keep agent sessions fully separate.');
     });
     if (!agentState.cliPreselected && agentState.defaultCli){
       sel.value = agentState.defaultCli;
@@ -5865,6 +5928,111 @@
         var el = document.querySelector(sel);
         if (el) el.hidden = !on;
       });
+    }
+
+    /* Browse the LOCAL machine for a folder, and accept a dropped one.
+       A browser cannot give an absolute path — not from a drop, not from a file
+       input, by design — so the listing comes from the hub, which runs on this
+       same machine. Drag-and-drop therefore gets the folder NAME only; we take
+       the user to a listing rather than pretending we resolved a full path. */
+    function initFolderPicker(){
+      var browseBtn = document.getElementById('agent-dir-browse');
+      if (browseBtn) browseBtn.addEventListener('click', function(){ openPicker(); });
+
+      var row = document.getElementById('agent-start-row');
+      if (row){
+        ['dragenter', 'dragover'].forEach(function(ev){
+          row.addEventListener(ev, function(e){
+            e.preventDefault(); row.classList.add('dropping');
+          });
+        });
+        ['dragleave', 'drop'].forEach(function(ev){
+          row.addEventListener(ev, function(){ row.classList.remove('dropping'); });
+        });
+        row.addEventListener('drop', function(e){
+          e.preventDefault();
+          var items = (e.dataTransfer && e.dataTransfer.items) || [];
+          var name = null;
+          for (var i = 0; i < items.length; i++){
+            var entry = items[i].webkitGetAsEntry && items[i].webkitGetAsEntry();
+            if (entry && entry.isDirectory){ name = entry.name; break; }
+          }
+          if (!name){
+            toast('Drop a FOLDER, not a file.', true);
+            return;
+          }
+          /* Honest about the limit: we know the folder's NAME, never its path.
+             So open the picker and look for that name from the home directory —
+             one click instead of typing the whole path. */
+          openPicker(null, name);
+        });
+      }
+    }
+
+    function openPicker(startPath, highlight){
+      var scrim = document.createElement('div');
+      scrim.className = 'dirpick';
+      scrim.innerHTML =
+        '<div class="dirpick-box" role="dialog" aria-modal="true" aria-label="Choose a folder">' +
+          '<div class="dirpick-h">' +
+            '<button class="btn sm ghost" data-up type="button">Up</button>' +
+            '<span class="dirpick-path"></span>' +
+          '</div>' +
+          '<div class="dirpick-list"></div>' +
+          '<div class="dirpick-f">' +
+            '<button class="btn primary sm" data-use type="button">Use this folder</button>' +
+            '<button class="btn sm ghost" data-cancel type="button">Cancel</button>' +
+          '</div>' +
+        '</div>';
+      document.body.appendChild(scrim);
+      var pathEl = scrim.querySelector('.dirpick-path');
+      var listEl = scrim.querySelector('.dirpick-list');
+      var current = null, parent = null;
+
+      function close(){ scrim.remove(); document.removeEventListener('keydown', onKey); }
+      function onKey(e){ if (e.key === 'Escape') close(); }
+      document.addEventListener('keydown', onKey);
+      scrim.addEventListener('click', function(e){ if (e.target === scrim) close(); });
+      scrim.querySelector('[data-cancel]').addEventListener('click', close);
+      scrim.querySelector('[data-up]').addEventListener('click', function(){
+        if (parent) load(parent);
+      });
+      scrim.querySelector('[data-use]').addEventListener('click', function(){
+        if (current){ dirInput.value = current; dirInput.dispatchEvent(new Event('input')); }
+        close();
+      });
+
+      function load(path){
+        listEl.textContent = 'Loading…';
+        api('/api/workspace/browse' + (path ? '?path=' + encodeURIComponent(path) : ''))
+          .then(function(r){
+            current = r.path; parent = r.parent;
+            pathEl.textContent = r.path;
+            scrim.querySelector('[data-up]').disabled = !r.parent;
+            listEl.innerHTML = '';
+            if (!r.dirs.length){
+              listEl.innerHTML = '<div class="dirpick-item" style="cursor:default;opacity:.7">No sub-folders here.</div>';
+            }
+            r.dirs.forEach(function(d){
+              var b = document.createElement('button');
+              b.type = 'button';
+              b.className = 'dirpick-item';
+              b.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>' +
+                            '<span></span>';
+              b.querySelector('span').textContent = d.name;
+              if (highlight && d.name === highlight){
+                b.style.background = 'var(--accent-soft)';
+                setTimeout(function(){ b.scrollIntoView({ block: 'center' }); }, 0);
+              }
+              b.addEventListener('click', function(){ load(d.path); });
+              listEl.appendChild(b);
+            });
+          })
+          .catch(function(err){
+            listEl.textContent = (err && err.message) || 'Could not read that folder.';
+          });
+      }
+      load(startPath || null);
     }
 
     /* Exposed so the URL restorer (which runs outside this closure) can drop
@@ -6489,6 +6657,7 @@
     }
 
     startBtn.addEventListener('click', doStart);
+    initFolderPicker();
     endBtn.addEventListener('click', doEnd);
     sendBtn.addEventListener('click', doSend);
     stopBtn.addEventListener('click', doStop);

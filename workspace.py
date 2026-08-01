@@ -45,6 +45,14 @@ PORT_RANGE = (5800, 5899)
 START_TIMEOUT = 90.0        # seconds to wait for the port to answer
 LOG_LINES = 400             # per project ring buffer
 MAX_PROBLEMS = 20
+# Stop a preview nobody is watching. THIS is the process that actually costs
+# something while idle — a dev server holds a port, a node/python process and
+# often a file watcher, indefinitely. (The agent CLI does not: agentic_chat
+# spawns exactly one subprocess per message and clears it when the turn ends,
+# so between turns there is nothing running to close.)
+# Reaped, not killed forever: pressing Run starts it again in seconds.
+IDLE_TIMEOUT = 30 * 60      # seconds without anyone looking
+_REAP_EVERY = 60.0
 
 _procs = {}                 # project_dir -> _Proc
 _lock = threading.RLock()
@@ -263,6 +271,7 @@ class _Proc:
         self.state = "installing"
         self.error = None
         self.started_at = time.time()
+        self.touched_at = time.time()   # last time anyone asked about it
         self._lock = threading.Lock()
 
     def log(self, line):
@@ -447,10 +456,111 @@ def save_attachment(project_dir, raw, ext, name=None):
     return os.path.join(ATTACH_DIR, fname).replace("\\", "/")
 
 
+def list_dirs(path=None):
+    """Sub-directories of `path` (default: home), for the folder picker.
+
+    A browser CANNOT give an absolute local path — neither a drop nor a file
+    input exposes one, by design. Since the hub runs on the same machine, the
+    honest way to let someone "browse for a folder" is to list directories
+    server-side and let them click down.
+
+    Read-only, never recursive, hidden and system folders skipped, and capped —
+    node_modules alone can hold thousands of entries and would make the picker
+    useless as well as slow."""
+    root = os.path.abspath(os.path.expanduser(path or "~"))
+    if not os.path.isdir(root):
+        raise WorkspaceError("not a directory: %s" % root)
+    out = []
+    try:
+        with os.scandir(root) as it:
+            for e in it:
+                if len(out) >= 500:
+                    break
+                name = e.name
+                if name.startswith(".") or name.startswith("$"):
+                    continue
+                try:
+                    if not e.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                out.append({"name": name, "path": os.path.join(root, name)})
+    except PermissionError:
+        raise WorkspaceError("permission denied: %s" % root)
+    out.sort(key=lambda d: d["name"].lower())
+    parent = os.path.dirname(root)
+    return {"path": root,
+            "parent": parent if parent and parent != root else None,
+            "dirs": out,
+            "runnable": _is_runnable(root)}
+
+
+def _is_runnable(path):
+    """Whether this folder already holds something the preview could start —
+    shown in the picker so an empty folder is an informed choice, not a
+    surprise."""
+    try:
+        detect(path)
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def running():
+    """Every live preview, for the "what is running" list."""
+    now = time.time()
+    with _lock:
+        items = list(_procs.items())
+    return [{"project_dir": d, "port": p.port, "kind": p.kind, "state": p.state,
+             "url": "http://127.0.0.1:%d" % p.port if p.state == "running" else None,
+             "uptime": int(now - p.started_at),
+             "idle": int(now - p.touched_at),
+             "idle_stops_in": max(0, int(IDLE_TIMEOUT - (now - p.touched_at)))}
+            for d, p in items]
+
+
+def reap_idle(now=None):
+    """Stop previews nobody has looked at for IDLE_TIMEOUT. Returns what it
+    stopped.
+
+    "Looked at" means a status() call, which the dashboard makes every couple of
+    seconds while the preview pane is open — so this only ever fires once the
+    user has genuinely moved on."""
+    now = now or time.time()
+    with _lock:
+        stale = [d for d, p in _procs.items() if now - p.touched_at > IDLE_TIMEOUT]
+    for d in stale:
+        stop(d)
+    return stale
+
+
+def _reaper():
+    while True:
+        time.sleep(_REAP_EVERY)
+        try:
+            reap_idle()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+_reaper_thread = None
+
+
+def start_reaper():
+    """Idempotent — app.py calls this once at boot."""
+    global _reaper_thread
+    if _reaper_thread is not None:
+        return
+    _reaper_thread = threading.Thread(target=_reaper, daemon=True)
+    _reaper_thread.start()
+
+
 def status(project_dir):
     project_dir = os.path.abspath(project_dir)
     with _lock:
         proc = _procs.get(project_dir)
+        if proc:
+            proc.touched_at = time.time()   # someone is watching
     if not proc:
         return {"running": False, "state": "idle", "url": None, "port": None,
                 "kind": None, "log": [], "problems": [], "error": None}
