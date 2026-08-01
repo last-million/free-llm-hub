@@ -22,7 +22,9 @@ import craft
     ("refactor the auth module and write tests", ["programming"]),
 ])
 def test_briefs_fire_on_their_own_domain(text, expected):
-    assert craft.names(text) == expected
+    # IMAGES is orthogonal and rides along on any request that will show
+    # pictures — it is asserted on its own below, not as a domain.
+    assert [n for n in craft.names(text) if n != "images"] == expected
 
 
 @pytest.mark.parametrize("text", [
@@ -37,11 +39,17 @@ def test_nothing_fires_on_unrelated_requests(text):
     assert craft.names(text) == []
 
 
-def test_at_most_two_briefs():
+def test_at_most_two_domain_briefs():
     """'online store landing page with SEO and tests' could match five; more than
-    two is context tax, not help."""
+    two is context tax, not help.
+
+    IMAGES is excluded from the count on purpose: it is not a competing domain
+    view of the same task, it is a CAPABILITY the model cannot discover on its
+    own (a free local generator). Ranked against the domains it would lose on
+    exactly the requests that need it, which is how a build ended up announcing
+    it had no image tool and falling back to Unsplash."""
     hits = craft.names("build an ecommerce landing page with SEO, refactor and write tests")
-    assert len(hits) <= craft.MAX_BRIEFS
+    assert len([n for n in hits if n != "images"]) <= craft.MAX_BRIEFS
 
 
 def test_every_brief_names_what_NOT_to_do():
@@ -173,3 +181,57 @@ def test_ship_brief_forbids_the_observed_failures():
     assert "you can now deploy this to Vercel" in body, "must forbid trailing off"
     assert "run npm start to see it" in body, "handing back instructions is the same failure"
     assert "inventing a URL" in body
+
+
+# --------------------------------------------------------------------------- #
+# IMAGES — the model announced "I don't have the image_gen tool available" and
+# silently fell back to Unsplash, while a free local generator answered in ~3s.
+# --------------------------------------------------------------------------- #
+
+def test_images_brief_fires_for_a_build_with_no_image_word():
+    """The case that actually bit: "build a restaurant website" names no image
+    word at all, yet the whole page is pictures."""
+    assert "images" in craft.names("build me a restaurant website with a menu")
+    assert "images" in craft.names("create a landing page for my saas")
+    assert "images" in craft.names("build an online store")
+
+
+def test_images_brief_fires_on_explicit_image_words():
+    for text in ("design a logo for my brand", "I need a hero image",
+                 "generate some product photos", "make an icon set"):
+        assert "images" in craft.names(text), text
+
+
+def test_images_brief_stays_off_pure_code_tasks():
+    """An unwanted brief is pure token cost on a small free context window."""
+    for text in ("refactor this auth middleware", "write a python script to parse csv",
+                 "fix the bug in my sorting function", "write unit tests for the parser"):
+        assert "images" not in craft.names(text), text
+
+
+def test_images_does_not_consume_a_domain_brief_slot():
+    """Ranked as a domain it would lose every time — a website request already
+    spends both MAX_BRIEFS slots on web_design/landing, which is exactly the
+    request that needs it most."""
+    got = craft.names("create a landing page for my saas")
+    assert "images" in got
+    assert len([n for n in got if n != "images"]) == craft.MAX_BRIEFS
+
+
+def test_images_brief_names_the_real_local_endpoint():
+    """A brief that points at a URL the hub does not serve is worse than none."""
+    assert "127.0.0.1:8787/v1/images/generations" in craft.IMAGES
+
+
+def test_images_brief_does_not_hardcode_a_png_extension():
+    """The hub's default free model (flux-1-schnell via cloudflare) returns
+    JPEG. Saving those bytes as .png mislabels every generated file."""
+    line = [l for l in craft.IMAGES.splitlines() if l.strip().startswith("python -c")]
+    assert line, "the brief must carry a runnable save command"
+    assert "'img/hero.png'" not in line[0]
+    assert "b64_json" in line[0] and "url" in line[0], "must handle BOTH shapes"
+
+
+def test_images_brief_offers_exactly_three_choices():
+    for marker in ("1. FREE STOCK", "2. GENERATED", "3. BOTH"):
+        assert marker in craft.IMAGES, marker
