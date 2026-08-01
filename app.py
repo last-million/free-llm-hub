@@ -1529,7 +1529,33 @@ _HARD_HINTS = (
     "frontend", "endpoint", "database", "schema", "migration", "component", "feature",
     "the whole", "the full", "a full", "complete ", "integrate", "wire ", "add auth",
     "authentication", "payment", "deploy", "dockerfile", "test suite", "unit test",
+    "web design", "checkout", "cart", "mobile app", "script that", "scraper",
+    "crawler", "pipeline",
+    # Debugging asks are heavy even when phrased casually. "fix this bug in my
+    # code" measured SIMPLE -> a 7B model, because the list had "debug" but not
+    # "bug", and not a single word for "it is broken".
+    "bug", "not working", "doesn't work", "does not work", "broken", "crash",
+    "error", "exception", "fails", "failing", "stuck", "hangs",
 )
+
+# WHAT is being asked for, weighted double, because naming a whole deliverable
+# IS the heaviness -- and it is the part that survives typos.
+#
+# Measured 2026-08-01 in the dashboard chat: "crerat ebst store website web
+# deisng ... for restaurant in fez" classified SIMPLE and routed to a 7B model.
+# The verb was misspelled ("crerat"), so a list of verbs matched nothing, while
+# the thing being asked for ("store", "website") was spelled correctly. Typos
+# are normal in a chat box; the noun is the reliable signal.
+#
+# Word boundaries, not substrings: "app" inside "happen", "site" inside
+# "opposite", "game" inside "gamely". The rest of the hint lists can live with
+# substring matching because their terms are long enough not to collide.
+_ARTIFACT_RE = re.compile(
+    r"\b(?:web ?sites?|sites?|landing pages?|home ?pages?|stores?|shops?|"
+    r"e-?commerce|dashboards?|apps?|applications?|games?|blogs?|portfolios?|"
+    r"platforms?|saas|chat ?bots?|apis?|clones?)\b")
+_ARTIFACT_WEIGHT = 2
+_ARTIFACT_MAX_HITS = 2          # "a store website app" is one job, not three
 _SIMPLE_HINTS = (
     "translate", "summarize", "summarise", "tl;dr", "rephrase", "reword",
     "spell", "grammar", "fix typo", "capitalize", "lowercase", "uppercase",
@@ -1537,7 +1563,15 @@ _SIMPLE_HINTS = (
     "list ", "hello", "hi ", "thanks", "thank you",
 )
 # Minimum benchmark score a model needs to be trusted with each tier.
-_DIFFICULTY_FLOOR = {"simple": 20, "medium": 50, "hard": 78}
+#
+# `simple` was 20, which permits a 7B model. That is the right answer for "hi"
+# and the wrong answer for everything a classifier gets wrong -- and a free-text
+# chat box guarantees it will sometimes be wrong (typos, terse asks, a language
+# the hints are not written in). 45 keeps the tier cheap while putting a floor
+# under the damage: the worst case becomes a small-but-real model instead of a
+# 7B answering a request to build a website. Trivial asks still route here, so
+# quota on the strong models is still preserved for work that needs them.
+_DIFFICULTY_FLOOR = {"simple": 45, "medium": 50, "hard": 78}
 
 
 def _messages_text(messages):
@@ -1583,7 +1617,9 @@ def _classify_difficulty(messages, max_tokens=None):
     if "```" in recent or re.search(r"\bdef \w+\(|\bclass \w+|function \w+\(|;\s*$", recent):
         score += 2
     hard_hits = sum(1 for h in _HARD_HINTS if h in low)
-    score += hard_hits
+    artifacts = min(len(_ARTIFACT_RE.findall(low)), _ARTIFACT_MAX_HITS)
+    hard_hits += artifacts          # also suppresses the short-ask penalty below
+    score += hard_hits + artifacts * (_ARTIFACT_WEIGHT - 1)
     score -= sum(1 for h in _SIMPLE_HINTS if h in low)
     if length > 4000:
         score += 2
@@ -3814,7 +3850,16 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     # gpt-oss-120b) as "slow" — filtering them here removed them from the agentic
     # pool ENTIRELY, before the strength floor below ever saw them, which is a big
     # part of why one model ended up serving everything.
-    pool = cands if require_tools else ([c for c in cands if _is_fast(c[1], c[2])] or cands)
+    # ...and skipped for HARD chat turns too, for the same reason. Asked why the
+    # dashboard chat does not use the best models "as in CLI mode", this is the
+    # other half of the answer (the first half was classification): a CLI turn
+    # sets require_tools and sees every candidate, while a chat turn asking for
+    # a whole website saw only the ones the speed heuristic likes. Someone who
+    # just asked for an e-commerce site is waiting on the ANSWER, not on the
+    # first token. Simple and medium keep the fast preference, where the
+    # strength difference is small and latency is what you actually feel.
+    _fast_only = not require_tools and difficulty != "hard"
+    pool = ([c for c in cands if _is_fast(c[1], c[2])] or cands) if _fast_only else cands
     if require_tools:
         # CODING/AGENTIC: the primary is ALWAYS a STRONG model (>= _TOOLS_MIN_SCORE) —
         # a weak model plans then under-builds, and mistral (56) only ever appears
@@ -13362,6 +13407,17 @@ def _print_banner():
     print("  This gates /api/* (dashboard config, hub mode, shutdown). It is")
     print("  stored in config.json (0600) and never sent to any provider.")
     print(line)
+    # Say it out loud when routing is NOT picking the best model. This flag has
+    # no UI: it sat False in a real config with no way for anyone to have set it
+    # deliberately, and the only symptom was "why does chat not use the good
+    # models" -- a question that took a routing trace to answer. A line in the
+    # banner turns that into something visible.
+    if not config.get_flag("route_always_best", True):
+        print("  Routing:     SPREADING across the top band, not always-best.")
+        print("               Every medium/hard turn may land on a weaker model")
+        print("               to stretch quota. Undo: route_always_best=true in")
+        print("               ~/.free-llm-hub/config.json")
+        print("=" * 74)
     print("  Connect Claude Code:")
     for ln in snippets["claude_code"].splitlines():
         print("    " + ln)
