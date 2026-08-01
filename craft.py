@@ -39,9 +39,20 @@ WEB_DESIGN = """WEB DESIGN BRIEF (apply unless the user says otherwise)
 - Type: one family, 3-4 sizes max, headline 1.1-1.2 line-height, body 1.5-1.65, measure 60-75 chars. Real hierarchy comes from size+weight+space, not colour.
 - Space: one scale (4/8px). Section rhythm beats decoration. Whitespace is the design.
 - Colour: one accent, one neutral ramp, semantic tokens. Never convey meaning by colour alone.
-- Motion: 150-300ms, transform/opacity only, honour prefers-reduced-motion.
+- Motion everywhere, but not the SAME motion everywhere. Every section and every button should feel alive: hover/active/focus states on all controls, and an entrance for each section. Vary it — a section that slides, one that staggers its children, one that reveals on scroll — because one identical fade-and-rise on all of them is itself an AI tell. 150-300ms for state changes, up to 500ms for a section entrance, ease-out (cubic-bezier(0.16,1,0.3,1)), exit faster than entrance. Transform/opacity only (they run on the compositor; animating layout properties janks). Honour prefers-reduced-motion, and CONTENT MUST BE VISIBLE BY DEFAULT — JS enhances an entrance, it never gates whether the content exists, or a script error leaves a blank page.
+- Hero motion when the brief wants impact — pick ONE, never both:
+  * VIDEO: a genuinely licence-free clip (Pexels/Pixabay/Coverr; check the clip's own licence and name the source). Cut 4-6s, seamless loop, under ~2MB: <video autoplay muted loop playsinline poster="still.webp">. Overlay to hold text contrast; fall back to the poster on prefers-reduced-motion and narrow screens.
+  * 3D/CANVAS: a real generative scene in JS. One canvas, devicePixelRatio capped at 2, paused when hidden or scrolled out (IntersectionObserver), static fallback without WebGL, and it must never block first paint.
 - Responsive: mobile-first, no horizontal scroll, tap targets >=44px, images with width/height so nothing shifts.
-ANTI (these read as AI-made): centred hero + 3 identical feature cards + generic gradient blob; "Elevate/Unlock/Seamless/Empower" copy; stock-photo grids; emoji as icons; a testimonial or statistic you invented."""
+- Space above a heading must exceed the space below it — a heading binds to what follows.
+- Elevation once: border OR shadow, never both. Shadows have an offset and a soft blur; a zero-offset coloured halo is decoration, not depth.
+- Type scale must actually be a scale: largest at least 2x the smallest, ~1.25x between adjacent steps. Interactive text never below 11px.
+SELF-CHECK before you ship: if someone could guess your look from the product category alone — or from category-plus-the-obvious-avoidance — rework it. Landing on cream + serif display, or near-black + one neon glow, or broadsheet hairlines + italic serif, when the brief left the look open, means this check failed.
+ANTI (each of these is a specific, recognisable AI tell):
+- Fonts: Inter, Geist, Plus Jakarta Sans, Space Grotesk, Instrument Sans/Serif, Fraunces, Recoleta, Playfair, DM Sans/Serif, Outfit, Syne, Montserrat. Pick a face with a point of view — but if you cannot verify the webfont actually loads, use a system stack rather than ship a broken @font-face.
+- Structure: a rounded-square icon tile above a heading; a tiny tracked uppercase eyebrow above a heading; cards inside cards; 01/02/03 section numbers; a coloured border-left on cards or callouts; centred hero + 3 identical feature cards + gradient blob.
+- Copy: "Elevate/Unlock/Seamless/Empower/supercharge/world-class/next-generation"; manufactured-contrast aphorisms ("Not a feature. A platform.", "X. Just Y.") — once is fine, three sections doing it is the tell.
+- Also: gradient text, glassmorphism as decoration, emoji as icons, stock-photo grids, a testimonial or statistic you invented."""
 
 SEO = """SEO BRIEF (build every page this way — do not wait to be asked for SEO)
 - One page = one intent = one primary keyword. Do not write a page you cannot name the query for.
