@@ -668,6 +668,40 @@ def adopt(project_dir, url, source="agent"):
         raise WorkspaceError("that is the hub's own port")
     if not _http_ok(port):
         raise WorkspaceError("nothing is answering on port %d" % port)
+    # A port ANOTHER project is already previewing is not ours to take. The
+    # agent prints URLs it did not necessarily start -- it repeats a port from
+    # an earlier note, or the SHIP brief's example -- and adopting on the word
+    # alone showed a finished project the PREVIOUS project's app (reported: a
+    # pizza site appearing in an unrelated project's preview).
+    with _lock:
+        owner = next((d for d, a in _adopted.items()
+                      if a["port"] == port and d != project_dir), None)
+        if owner is None:
+            owner = next((d for d, p in _procs.items()
+                          if p.port == port and d != project_dir), None)
+    if owner is not None:
+        raise WorkspaceError("port %d is already the preview for %s"
+                             % (port, os.path.basename(owner)))
+    # Then ask the operating system WHO is on that port. A process running in
+    # another project's folder is not this project's server, whatever the agent
+    # printed. This is what caught the reported case: an Express app with no
+    # <title> anywhere in it could not be told apart from the previous
+    # project's site by content alone.
+    owner_dir = _port_owner_dir(port)
+    if owner_dir and not _dir_covers(owner_dir, project_dir):
+        raise WorkspaceError("port %d is served from %s, not from this project"
+                             % (port, owner_dir))
+    # And when we can READ what that port serves, a different project's title
+    # is decisive too. Unlike discover(), both checks fail OPEN -- the agent
+    # naming a url IS evidence, so silence (an unreadable cwd, a missing title)
+    # is not enough to override it; only positive contradiction is.
+    if owner_dir is None:
+        want = _fingerprint(project_dir)
+        if want:
+            served = _served_title(port)
+            if served and want.strip().lower() != served.strip().lower():
+                raise WorkspaceError(
+                    "port %d is serving %r, not this project (%r)" % (port, served, want))
     now = time.time()
     with _lock:
         # A server WE started wins: it is the one whose logs and problems we can
@@ -711,10 +745,20 @@ def discover(project_dir):
             continue
         if not _port_open(port) or not _http_ok(port):
             continue
-        # When the project has its own index.html we can do better than guess:
-        # ask the port what it is serving and require it to match. That turns
-        # "something is listening" into actual evidence of ownership.
-        if want and not _serves_fingerprint(port, want):
+        # Ask the OS who is on the port first: a process whose working
+        # directory IS this project is proof, and it is the only check that
+        # works for a project shipping no HTML of its own (an Express app with
+        # server-rendered views, an API). Content checks cannot see those.
+        owner_dir = _port_owner_dir(port)
+        if owner_dir is not None:
+            if not _dir_covers(owner_dir, project_dir):
+                continue
+        # No readable owner: fall back to content. When the project has its own
+        # index.html, ask the port what it is serving and require a match --
+        # that turns "something is listening" into evidence of ownership. With
+        # neither signal available a scan proves nothing, so it declines: the
+        # cost of guessing wrong is showing someone else's site as yours.
+        elif not want or not _serves_fingerprint(port, want):
             continue
         try:
             adopt(project_dir, "http://127.0.0.1:%d" % port, source="detected")
@@ -758,6 +802,155 @@ def _serves_fingerprint(port, want, timeout=1.5):
     except Exception:                                            # noqa: BLE001
         return False
     return want.lower() in body.lower()
+
+
+def _port_owner_dir(port):
+    """The folder the process listening on `port` is running IN, or None.
+
+    This is the strongest ownership signal available without adding a
+    dependency, and unlike a <title> it works for every stack: an Express app
+    with server-rendered views, an API with no HTML at all, a Vite dev server.
+    The project that hit this had no <title> in any file it shipped, so the
+    title check could not tell it apart from the previous project's server
+    still sitting on :3000.
+
+    Falls back to the listener's children: a shell or npm wrapper can hold the
+    socket while the real server runs underneath it."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        conns = psutil.net_connections(kind="inet")
+    except Exception:                                            # noqa: BLE001
+        return None                       # needs privileges on some systems
+    for c in conns:
+        if c.status != psutil.CONN_LISTEN or not c.laddr or c.laddr.port != port or not c.pid:
+            continue
+        try:
+            proc = psutil.Process(c.pid)
+        except Exception:                                        # noqa: BLE001
+            return None
+        try:
+            return os.path.abspath(proc.cwd())
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            for child in proc.children(recursive=True):
+                try:
+                    return os.path.abspath(child.cwd())
+                except Exception:                                # noqa: BLE001
+                    continue
+        except Exception:                                        # noqa: BLE001
+            pass
+        return None
+    return None
+
+
+def _dir_covers(owner_dir, project_dir):
+    """Is a server running in `owner_dir` plausibly serving `project_dir`?"""
+    if not owner_dir:
+        return False
+    a = os.path.normcase(os.path.abspath(owner_dir))
+    b = os.path.normcase(os.path.abspath(project_dir))
+    return a == b or a.startswith(b + os.sep)
+
+
+def _served_title(port, timeout=1.5):
+    """The <title> the port is actually serving, or None if it cannot be read."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/" % port, timeout=timeout) as r:
+            body = r.read(200000).decode("utf-8", "replace")
+    except Exception:                                            # noqa: BLE001
+        return None
+    m = re.search(r"<title[^>]*>([^<]{1,200})</title>", body, re.I)
+    return m.group(1).strip() if m else None
+
+
+def shutdown(project_dir):
+    """Stop the preview AND the app behind it, whoever started it.
+
+    stop() deliberately spares an adopted server: on a button labelled "Stop
+    preview", killing a process we did not start is a bigger action than the
+    label promises. Ending a SESSION is a different promise -- the session is
+    the thing that started the app, so leaving a dev server holding a port
+    after its session is gone is a leak the user has to clean up by hand.
+
+    Scoped to the port this project was previewing, and only when the server
+    was the agent's own (adopted from its output, or found serving this
+    project's pages). Ports the hub hands out and the hub's own port are never
+    touched by the by-port path -- those are handled by stop()."""
+    project_dir = os.path.abspath(project_dir)
+    with _lock:
+        adopted = _adopted.get(project_dir)
+        port = adopted["port"] if adopted else None
+        source = adopted["source"] if adopted else None
+    ours = stop(project_dir)                     # our own child, if any
+    forget(project_dir)
+    if not port or source not in ("agent", "detected"):
+        return ours
+    if PORT_RANGE[0] <= port <= PORT_RANGE[1] or port == _hub_port():
+        return ours
+    return _kill_listener(port) or ours
+
+
+def sweep_own_range():
+    """Reclaim preview ports left behind by a previous run of the hub.
+
+    Measured on this machine: 99 of the 100 ports in PORT_RANGE were held by
+    orphaned `python -m http.server` processes -- every preview ever started
+    that outlived the hub that spawned it (a crash, a kill, a restart while a
+    project was running). The next start then fails with "no free port", and
+    every one of those servers is still burning a port for a project nobody is
+    looking at.
+
+    Only PORT_RANGE is touched. That range exists solely for previews the hub
+    hands out -- adopt() refuses it precisely because it is ours -- so anything
+    listening there at startup is a leaked preview, not the user's own work.
+    Returns how many were reclaimed."""
+    freed = 0
+    for port in range(PORT_RANGE[0], PORT_RANGE[1] + 1):
+        if not _port_open(port):
+            continue
+        if _kill_listener(port):
+            freed += 1
+    return freed
+
+
+def _kill_listener(port):
+    """Kill whatever is listening on `port`, with its children.
+
+    A dev server is normally a tree (npm -> node, python -m http.server under a
+    shell), so killing the single listening PID leaves the port held. Returns
+    whether anything was killed."""
+    try:
+        import psutil
+    except ImportError:
+        return False
+    pids = set()
+    try:
+        for c in psutil.net_connections(kind="inet"):
+            if c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port == port and c.pid:
+                pids.add(c.pid)
+    except Exception:                                            # noqa: BLE001
+        return False
+    killed = False
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+            if proc.pid == os.getpid():
+                continue                          # never the hub itself
+            for child in proc.children(recursive=True):
+                try:
+                    child.kill()
+                except Exception:                                # noqa: BLE001
+                    pass
+            proc.kill()
+            killed = True
+        except Exception:                                        # noqa: BLE001
+            continue
+    return killed
 
 
 def forget(project_dir):
