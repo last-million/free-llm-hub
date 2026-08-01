@@ -6853,6 +6853,55 @@ def api_subscriptions_install_isolated(pid):
     return jsonify(result)
 
 
+_AGENT_AUTOINSTALL_FLAG = "agent_cli_autoinstall"      # config flag, default ON
+
+
+def _agent_cli_autoinstall_once():
+    """Install the agent CLIs into the hub's OWN isolated namespace if they are
+    not there yet, in the background, at boot.
+
+    WHY AT ALL: the agent chat is unusable without one, and asking someone to go
+    install a CLI by hand is exactly the friction this hub exists to remove.
+
+    WHY ISOLATED ONLY: this never touches a global install and never upgrades
+    anything the user already has. If a CLI is already resolvable — isolated or
+    on PATH — it is left completely alone. So the only case where this does
+    anything is "the hub needs a CLI and there is none", which is the case where
+    doing nothing leaves a broken feature.
+
+    Opt-out via the config flag, and it is one attempt per boot: a machine with
+    no npm, or offline, must not retry in a loop."""
+    if not config.get_flag(_AGENT_AUTOINSTALL_FLAG, True):
+        return
+    if not shutil.which("npm"):
+        _log.info("[agent-cli] npm not on PATH — skipping auto-install")
+        return
+    for cli_id, bin_name in (("codex", "codex"), ("claude", "claude")):
+        try:
+            if agentic_chat._resolve_bin(cli_id):
+                continue                       # already usable; leave it alone
+            _log.info("[agent-cli] installing %s into the hub's isolated namespace", cli_id)
+            ok, res = _install_isolated_cli(cli_id, bin_name)
+            _log.info("[agent-cli] %s: %s", cli_id,
+                      "installed" if ok else _sanitize(str(res.get("error"))))
+        except Exception:                                        # noqa: BLE001
+            _log.debug("[agent-cli] auto-install failed for %s", cli_id, exc_info=True)
+
+
+_agent_autoinstall_thread = None
+
+
+def _start_agent_cli_autoinstall():
+    """Idempotent, daemon, off the request path — an npm install takes tens of
+    seconds and must never delay the hub coming up."""
+    global _agent_autoinstall_thread
+    if _agent_autoinstall_thread is not None:
+        return
+    _agent_autoinstall_thread = threading.Thread(
+        target=_agent_cli_autoinstall_once, daemon=True)
+    _agent_autoinstall_thread.start()
+
+
 def _install_isolated_cli(cli_id, bin_name):
     """`npm install -g <pkg> --prefix <isolated dir>` for one isolated CLI
     namespace. Returns (ok, result_dict) -- result_dict is always a plain
@@ -7106,6 +7155,43 @@ def api_workspace_attach():
     except (workspace.WorkspaceError, OSError) as exc:
         return jsonify({"error": _sanitize(str(exc))}), 400
     return jsonify({"path": rel, "bytes": len(raw)})
+
+
+@app.route("/api/workspace/tree", methods=["GET"])
+def api_workspace_tree():
+    """One level of the project, for the file browser beside the preview."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    d, err = _workspace_dir_from({"project_dir": request.args.get("project_dir")})
+    if err:
+        return err
+    try:
+        return jsonify(workspace.tree(d, request.args.get("path")))
+    except (workspace.WorkspaceError, OSError) as exc:
+        return jsonify({"error": _sanitize(str(exc))}), 400
+
+
+@app.route("/api/workspace/file", methods=["GET"])
+def api_workspace_file():
+    """A file's text, for the code viewer.
+
+    Confined to the project by workspace._resolve_in, which compares realpaths —
+    a plain prefix check is beaten by '..' and by a symlink pointing out of the
+    tree, and this decides which of the user's files a browser can read."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    d, err = _workspace_dir_from({"project_dir": request.args.get("project_dir")})
+    if err:
+        return err
+    rel = request.args.get("path")
+    if not isinstance(rel, str) or not rel:
+        return jsonify({"error": "path is required."}), 400
+    try:
+        return jsonify(workspace.read_file(d, rel))
+    except (workspace.WorkspaceError, OSError) as exc:
+        return jsonify({"error": _sanitize(str(exc))}), 400
 
 
 @app.route("/api/workspace/running", methods=["GET"])
@@ -12920,6 +13006,7 @@ if __name__ == "__main__":
     _start_auto_update()
     _start_aa_refresh()
     workspace.start_reaper()   # stop previews nobody is watching
+    _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()
     server = make_server(HOST, PORT, app, threaded=True)
     _runtime_server[0] = server
