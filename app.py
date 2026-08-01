@@ -59,6 +59,7 @@ import image_history
 import craft
 import providers as prov
 import quota
+import workspace
 import swarm
 import usage_history
 import vision_status
@@ -7009,6 +7010,99 @@ def api_agent_vision_status():
     on, not an agentic-session-scoped resource -- same "informational, no
     live CLI subprocess touched" reasoning as the history routes below."""
     return jsonify(vision_status.status())
+
+
+# --------------------------------------------------------------------------- #
+# WORKSPACE — run the project the agent just wrote, next to the chat.
+#
+# The agent chat could already drive a CLI inside a project directory; what it
+# could not do was CLOSE THE LOOP. Files got written and nobody ever ran them.
+# These three routes start the project on its own port, report what it prints,
+# and turn a crash into something the user can click.
+#
+# The start command is DERIVED from the directory (a package.json script, a known
+# entry point, an index.html) — never taken from the request. There is no field
+# here that reaches a shell.
+# --------------------------------------------------------------------------- #
+
+def _workspace_dir_from(body):
+    """The validated project directory, or (None, error_response)."""
+    d = (body or {}).get("project_dir")
+    if not isinstance(d, str) or not d.strip():
+        return None, (jsonify({"error": "project_dir is required."}), 400)
+    d = os.path.abspath(os.path.expanduser(d.strip()))
+    if not os.path.isdir(d):
+        return None, (jsonify({"error": "not a directory: %s" % _sanitize(d)}), 400)
+    return d, None
+
+
+@app.route("/api/workspace/start", methods=["POST"])
+def api_workspace_start():
+    gate = _agent_gate()
+    if gate:
+        return gate
+    d, err = _workspace_dir_from(request.get_json(force=True, silent=True))
+    if err:
+        return err
+    try:
+        return jsonify(workspace.start(d))
+    except workspace.WorkspaceError as exc:
+        return jsonify({"error": _sanitize(str(exc)), "code": "not_runnable"}), 400
+
+
+@app.route("/api/workspace/stop", methods=["POST"])
+def api_workspace_stop():
+    d, err = _workspace_dir_from(request.get_json(force=True, silent=True))
+    if err:
+        return err
+    workspace.stop(d)
+    return jsonify(workspace.status(d))
+
+
+@app.route("/api/workspace/attach", methods=["POST"])
+def api_workspace_attach():
+    """Save a pasted/dropped screenshot into the project so the CLI can READ it.
+
+    The agent chat drives a real CLI, and Claude Code / Codex open images by path
+    from the working directory — an inline base64 blob in the prompt would just
+    burn context on something they cannot decode."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    body = request.get_json(force=True, silent=True) or {}
+    d, err = _workspace_dir_from(body)
+    if err:
+        return err
+    url = body.get("data_url")
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return jsonify({"error": "data_url must be a data: image URL."}), 400
+    m = re.match(r"^data:([^;,]+);base64,(.*)$", url, re.I | re.S)
+    if not m:
+        return jsonify({"error": "only base64 data URLs are accepted."}), 400
+    mime = m.group(1).lower()
+    if mime not in _IMAGE_MIMES:
+        return jsonify({"error": "unsupported image type '%s'" % _sanitize(mime)}), 400
+    try:
+        raw = base64.b64decode(re.sub(r"\s+", "", m.group(2)), validate=True)
+    except (binascii.Error, ValueError):
+        return jsonify({"error": "image data is not valid base64."}), 400
+    if len(raw) > MAX_IMAGE_BYTES:
+        return jsonify({"error": "image is larger than %d MB."
+                        % (MAX_IMAGE_BYTES // (1024 * 1024))}), 400
+    try:
+        rel = workspace.save_attachment(
+            d, raw, mime.split("/")[-1], body.get("name"))
+    except (workspace.WorkspaceError, OSError) as exc:
+        return jsonify({"error": _sanitize(str(exc))}), 400
+    return jsonify({"path": rel, "bytes": len(raw)})
+
+
+@app.route("/api/workspace/status", methods=["GET"])
+def api_workspace_status():
+    d, err = _workspace_dir_from({"project_dir": request.args.get("project_dir")})
+    if err:
+        return err
+    return jsonify(workspace.status(d))
 
 
 @app.route("/api/agent/sessions", methods=["POST"])
