@@ -369,3 +369,52 @@ def test_a_failing_summarizer_falls_back_to_the_structural_notice():
     out, did = app._compact_to_budget(_project_convo(), None, 8000,
                                       summarizer=lambda d: None)
     assert did is True and "do not start a new project" in _text_of(out)
+
+
+# --------------------------------------------------------------------------- #
+# How much of the window we actually use.
+#
+# USER 2026-08-01: "he should use maximum context window for each model".
+# The factor was 0.55, chosen on the belief that _est_tokens under-counts code.
+# Measured against real usage.prompt_tokens from a live provider, it OVER-counts
+# every shape of traffic (prose 2.20x, code 1.26x, code+tools 1.14x), so 0.55 on
+# top of that spent under half of each window.
+# --------------------------------------------------------------------------- #
+
+def test_the_estimator_is_conservative_not_optimistic():
+    """If this ever flips, the refit factor below is unsafe and must come down.
+    Ratios are char-shape based, so they hold without a network call."""
+    prose = [{"role": "user", "content": "the quiet morning air carried rain " * 60}]
+    code = [{"role": "user", "content": "def f(x):\n    return x + 1\n" * 60}]
+    # chars/4 + overhead must exceed a real tokenizer's count for both shapes;
+    # a real tokenizer lands near chars/4.3 for prose and chars/3.2 for this code.
+    assert app._est_tokens(prose) > len(prose[0]["content"]) / 4.3
+    assert app._est_tokens(code) > len(code[0]["content"]) / 4.3
+
+
+def test_refit_uses_most_of_the_window(monkeypatch):
+    """A request re-fitted to a fraction of the window wastes the capacity the
+    user is paying context for."""
+    monkeypatch.setattr(app, "_model_ctx_budget", lambda pid, model: 32768)
+    captured = {}
+
+    def fake_compact(msgs, tools, budget):
+        captured["budget"] = budget
+        return msgs, True
+
+    monkeypatch.setattr(app, "_compact_to_budget", fake_compact)
+    app._refit_payload_to_learned_ctx(
+        "p", {"model": "m", "messages": [{"role": "user", "content": "x"}]})
+    assert captured["budget"] >= 32768 * 0.75, "using too little of the window"
+    assert captured["budget"] <= 32768 * 0.9, "no headroom left for the response"
+
+
+def test_max_tokens_is_still_capped_against_the_same_window(monkeypatch):
+    """Output shares the window on most providers, so a huge max_tokens would
+    re-trigger the overflow this function exists to fix."""
+    monkeypatch.setattr(app, "_model_ctx_budget", lambda pid, model: 32768)
+    monkeypatch.setattr(app, "_compact_to_budget", lambda m, t, b: (m, True))
+    out = app._refit_payload_to_learned_ctx(
+        "p", {"model": "m", "max_tokens": 100000,
+              "messages": [{"role": "user", "content": "x"}]})
+    assert out["max_tokens"] < 32768
