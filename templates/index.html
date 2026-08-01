@@ -7095,12 +7095,42 @@
         switchTab('session');
         toast('Resumed — this session is still live, send a message to continue.');
       }).catch(function(){
-        toast('That session has ended (hub may have restarted) — starting a new one in the same folder instead.', true);
-        if (conv.cli_id) cliSel.value = conv.cli_id;
-        renderCliNote();
-        setDirMode('existing');
-        dirInput.value = conv.project_dir || '';
-        switchTab('session');
+        /* The in-memory session is gone (hub restarted). That used to be the end
+           of it — "start a new one instead", with the model having forgotten
+           everything. But the CLI's OWN thread survives a hub restart, and the
+           transcript now records its id, so ask the server to rebuild a session
+           pointed at that thread. The model keeps its full context; only our
+           bookkeeping was ever lost. */
+        return api('/api/agent/sessions/' + encodeURIComponent(conv.session_id) + '/resume',
+                   { method: 'POST', body: {} })
+          .then(function(r){
+            sessionId = r.session_id || conv.session_id;
+            if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
+            showSessionState(r.cli || conv.cli_id, r.project_dir || conv.project_dir);
+            api('/api/agent/history/' + encodeURIComponent(sessionId)).then(function(full){
+              mountTranscript(msgsEl, full || {});
+              if (full && (full.turns || []).length) checkpointBtn.disabled = false;
+            }).catch(function(){});
+            switchTab('session');
+            /* Say which kind of continue this is. With a thread id the model
+               still has the conversation; without one it only has the files. */
+            toast(r.resumed_thread
+              ? 'Continuing — the agent still has this conversation.'
+              : 'Reopened in the same folder. This conversation had no saved thread, so the agent starts from the files.');
+          })
+          .catch(function(e){
+            var body = (e && e.body) || {};
+            if (body.code === 'folder_gone'){
+              toast(e.message, true);
+              return;
+            }
+            toast('Could not continue that conversation — opening the same folder for a fresh one.', true);
+            if (conv.cli_id) cliSel.value = conv.cli_id;
+            renderCliNote();
+            setDirMode('existing');
+            dirInput.value = conv.project_dir || '';
+            switchTab('session');
+          });
       }).then(function(){ if (btn) btn.disabled = false; });
     }
 
