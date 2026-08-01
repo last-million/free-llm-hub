@@ -1432,6 +1432,29 @@
   .agent-term-line.notice{ color:var(--warn-text); }
   .agent-term-line.err{ color:var(--danger-text); }
   .agent-term-line.done{ color:var(--ok-text); }
+  /* WORKING: the spinner alone was easy to miss in a wall of tool output, so the
+     whole status line reads as active — a tinted bar with a slow pulse. */
+  .agent-term-line.run{ background:var(--accent-soft); border-radius:7px;
+    padding:5px 9px; margin:0 0 6px; font-weight:600;
+    animation:agentPulse 1.8s ease-in-out infinite; }
+  @keyframes agentPulse{ 0%,100%{ opacity:1 } 50%{ opacity:.72 } }
+  .agent-term-line.run .agent-doing{ color:var(--text-dim); font-weight:500;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+  .agent-elapsed{ margin-left:auto; flex:none; color:var(--text-faint);
+    font-weight:500; font-variant-numeric:tabular-nums; }
+  /* FINISHED: a real green check badge, not just green text. */
+  .agent-term-line.done, .agent-term-line.err{ display:flex; align-items:center;
+    gap:7px; border-radius:7px; padding:5px 9px; margin:0 0 6px; font-weight:600;
+    animation:none; }
+  .agent-term-line.done{ background:var(--accent-soft); }
+  .agent-term-line.err{ background:var(--danger-soft); }
+  .agent-check{ flex:none; width:16px; height:16px; border-radius:50%;
+    display:grid; place-items:center; background:var(--ok-text); color:#04110a; }
+  .agent-term-line.err .agent-check{ background:var(--danger-text); color:#150404; }
+  .agent-check svg{ width:11px; height:11px; }
+  @media (prefers-reduced-motion:reduce){
+    .agent-term-line.run{ animation:none; }
+  }
   .agent-answer{ white-space:pre-wrap; word-break:break-word; }
   /* sidebar social footer */
   .cx-side-foot{ margin-top:auto; display:flex; gap:8px; padding:14px 16px 18px; border-top:1px solid var(--border-soft); }
@@ -1488,44 +1511,54 @@
   .agent-chat-col .chat-messages{ flex:1; min-height:0; overflow:auto; }
   .agent-preview-col{ display:flex; flex-direction:column; gap:8px; min-width:0; min-height:0;
     border:1px solid var(--border); border-radius:var(--radius); overflow:hidden;
-    background:var(--card); }
+    background:var(--surface); }
   .preview-bar{ display:flex; align-items:center; gap:8px; padding:8px 10px;
     border-bottom:1px solid var(--border); flex-wrap:wrap; }
-  .preview-state{ font-size:12.5px; color:var(--muted); flex:1; min-width:0;
+  .preview-state{ font-size:12.5px; color:var(--text-dim); flex:1; min-width:0;
     overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .preview-state.live{ color:var(--ok-text); }
-  .preview-state.bad{ color:var(--err-text); }
+  .preview-state.bad{ color:var(--danger-text); }
   .preview-open{ font-size:12.5px; color:var(--accent); text-decoration:none; }
   .preview-open:hover{ text-decoration:underline; }
-  .preview-frame-wrap{ position:relative; flex:1; min-height:340px; background:#fff; }
-  /* The preview is a real site: give it a white canvas regardless of the
-     dashboard theme, or every light-themed project looks broken in dark mode. */
-  @media (prefers-color-scheme:dark){ .preview-frame-wrap{ background:#fff; } }
+  /* Themed while EMPTY — a white slab sitting in a dark dashboard with nothing
+     running reads as a broken pane, and the placeholder text on it was unreadable.
+     The white canvas belongs to the IFRAME, not the container: a real site still
+     renders on white regardless of the dashboard theme, which is what that rule
+     was for. */
+  .preview-frame-wrap{ position:relative; flex:1; min-height:340px;
+    background:var(--surface); }
+  .preview-frame{ background:#fff; }
   .preview-frame{ width:100%; height:100%; border:0; display:block; }
   .preview-placeholder{ position:absolute; inset:0; display:flex; flex-direction:column;
     align-items:center; justify-content:center; gap:6px; text-align:center;
-    padding:22px; color:var(--muted); background:var(--card); }
-  .preview-placeholder p{ margin:0; font-size:13px; max-width:34ch; }
-  .preview-hint{ font-size:12px; opacity:.85; }
+    padding:22px; color:var(--text-dim); background:var(--surface); }
+  .preview-placeholder p{ margin:0; font-size:13.5px; max-width:38ch;
+    color:var(--text); }
+  .preview-placeholder svg{ color:var(--text-faint); margin-bottom:2px; }
+  /* Matching specificity with .preview-placeholder p, or that rule wins and
+     the hint reads at the same weight as the line above it. */
+  .preview-placeholder p.preview-hint{ font-size:12px; color:var(--text-dim); }
+  .preview-hint code{ font-family:var(--mono); font-size:11.5px;
+    background:var(--bg-inset); padding:1px 4px; border-radius:4px; }
   .preview-problems{ border-top:1px solid var(--border); max-height:210px;
     display:flex; flex-direction:column; }
   .preview-problems-head{ display:flex; align-items:center; justify-content:space-between;
-    gap:8px; padding:7px 10px; font-size:12.5px; font-weight:600; color:var(--err-text); }
+    gap:8px; padding:7px 10px; font-size:12.5px; font-weight:600; color:var(--danger-text); }
   .preview-problem-list{ list-style:none; margin:0; padding:0 0 6px; overflow:auto; }
   .preview-problem-list li{ margin:0; }
   /* Clicking a problem is the whole point — it becomes the next prompt. */
   .preview-problem{ display:flex; gap:8px; width:100%; text-align:left; cursor:pointer;
-    background:none; border:0; border-top:1px solid var(--border-soft, var(--border));
-    padding:7px 10px; font:inherit; font-size:12.5px; color:var(--fg);
+    background:none; border:0; border-top:1px solid var(--border-soft);
+    padding:7px 10px; font:inherit; font-size:12.5px; color:var(--text);
     transition:background 160ms ease; }
   .preview-problem:hover, .preview-problem:focus-visible{ background:var(--accent-soft); }
   .preview-problem:focus-visible{ outline:2px solid var(--accent); outline-offset:-2px; }
   .preview-problem .pk{ flex:none; font-size:11px; text-transform:uppercase;
-    letter-spacing:.03em; color:var(--muted); padding-top:1px; }
+    letter-spacing:.03em; color:var(--text-dim); padding-top:1px; }
   .preview-problem .pt{ min-width:0; overflow-wrap:anywhere; }
   .preview-log{ margin:0; padding:8px 10px; max-height:150px; overflow:auto;
     font-size:11.5px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere;
-    border-top:1px solid var(--border); color:var(--muted); }
+    border-top:1px solid var(--border); color:var(--text-dim); }
   @media (prefers-reduced-motion:reduce){
     .preview-problem{ transition:none; }
   }
@@ -1534,20 +1567,20 @@
   .agent-attach-strip{ display:flex; flex-wrap:wrap; gap:6px; }
   .attach-chip{ display:inline-flex; align-items:center; gap:6px; max-width:100%;
     border:1px solid var(--border); border-radius:var(--radius-sm);
-    padding:3px 6px 3px 3px; background:var(--card); font-size:12px; }
+    padding:3px 6px 3px 3px; background:var(--surface); font-size:12px; }
   .attach-chip img{ width:26px; height:26px; object-fit:cover; border-radius:4px;
     display:block; flex:none; }
   .attach-name{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-    max-width:22ch; color:var(--muted); }
-  .attach-x{ border:0; background:none; cursor:pointer; color:var(--muted);
+    max-width:22ch; color:var(--text-dim); }
+  .attach-x{ border:0; background:none; cursor:pointer; color:var(--text-dim);
     font-size:15px; line-height:1; padding:2px 3px; border-radius:4px;
     transition:color 160ms ease, background 160ms ease; }
-  .attach-x:hover, .attach-x:focus-visible{ color:var(--err-text); background:var(--accent-soft); }
+  .attach-x:hover, .attach-x:focus-visible{ color:var(--danger-text); background:var(--accent-soft); }
   @media (prefers-reduced-motion:reduce){ .attach-x{ transition:none; } }
 
   /* One-click free key, for vendors that document anonymous instant minting. */
   .mint-key{ display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
-  .mint-key-note{ font-size:12px; color:var(--muted); }
+  .mint-key-note{ font-size:12px; color:var(--text-dim); }
   /* Cross-link from a provider card whose direct Test can never pass to the
      local-subscription relay that actually works instead. */
   .relay-callout{ display:flex; align-items:center; gap:8px; flex-wrap:wrap;
@@ -4952,6 +4985,13 @@
     body.appendChild(blockNode(c.kind === 'anthropic' ? 'Anthropic snippet' : 'OpenAI snippet', snip));
   }
 
+  var CHECK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 13 4 4L19 7"/></svg>';
+  var CROSS_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+  /* "(214s)" is not a duration anyone reads. */
+  function fmtElapsed(ms){
+    var s = Math.max(0, Math.round(ms / 1000));
+    return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  }
   var SPIN_SVG = '<svg class="spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg>';
   function busyBtn(btn, label){ if (btn){ btn.disabled = true; btn.innerHTML = SPIN_SVG + ' ' + esc(label); } }
   function resetBtn(btn, label){ if (btn){ btn.disabled = false; btn.textContent = label; } }
@@ -5954,12 +5994,14 @@
       var ans = document.createElement('div'); ans.className = 'agent-answer';
       bubble.appendChild(term); bubble.appendChild(ans);
       var head = document.createElement('div'); head.className = 'agent-term-line run';
-      head.innerHTML = SPIN_SVG + ' <span>running…</span> <span class="agent-elapsed">(0s)</span>';
+      head.innerHTML = SPIN_SVG + ' <span>Working…</span>' +
+        ' <span class="agent-doing"></span>' +
+        ' <span class="agent-elapsed">0s</span>';
       term.appendChild(head);
       var elapsedStart = Date.now();
       var elapsedTimer = setInterval(function(){
         var el = head.querySelector('.agent-elapsed');
-        if (el) el.textContent = '(' + Math.round((Date.now() - elapsedStart) / 1000) + 's)';
+        if (el) el.textContent = fmtElapsed(Date.now() - elapsedStart);
       }, 1000);
       function line(cls, txt){
         var d = document.createElement('div'); d.className = 'agent-term-line ' + (cls || '');
@@ -5968,7 +6010,14 @@
       }
       function handle(ev){
         if (!ev || !ev.event) return;
-        if (ev.event === 'tool') line('tool', '▸ ' + ev.text);
+        if (ev.event === 'tool'){
+          line('tool', '▸ ' + ev.text);
+          /* Mirror the current step into the status line. A spinner says
+             "something is happening"; this says WHAT, which is the difference
+             between waiting patiently and wondering if it has hung. */
+          var doing = head.querySelector('.agent-doing');
+          if (doing) doing.textContent = String(ev.text || '').slice(0, 90);
+        }
         else if (ev.event === 'output') line('out', ev.text);
         else if (ev.event === 'notice') line('notice', ev.text);
         else if (ev.event === 'message'){ finalText = ev.text; ans.textContent = ev.text; msgsEl.scrollTop = msgsEl.scrollHeight; }
@@ -6009,7 +6058,11 @@
           clearInterval(elapsedTimer);
           var failed = (' ' + asstEl.className + ' ').indexOf(' error ') >= 0;
           head.className = 'agent-term-line ' + (failed ? 'err' : 'done');
-          head.textContent = failed ? '✕ failed' : '✓ finished';
+          var took = fmtElapsed(Date.now() - elapsedStart);
+          head.innerHTML =
+            '<span class="agent-check">' + (failed ? CROSS_SVG : CHECK_SVG) + '</span>' +
+            '<span>' + (failed ? 'Failed' : 'Finished') + '</span>' +
+            '<span class="agent-elapsed">' + esc(took) + '</span>';
           if (!failed && finalText){ var art = extractArtifactHTML(finalText); if (art) addArtifactButton(asstEl, art); }
           checkpointBtn.disabled = false;
           setBusy(false);
