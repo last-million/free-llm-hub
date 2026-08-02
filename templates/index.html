@@ -6308,6 +6308,20 @@
         ' <button type="button" class="btn sm" id="agent-cli-install">Install ' + esc(installLabel) + '</button>';
       var btn = note.querySelector('#agent-cli-install');
       if (btn) btn.addEventListener('click', function(){ doAgentCliInstall(chosen, btn, note); });
+    } else if (info.isolated && info.signed_in === false){
+      /* NOT a blocker: an isolated copy with no subscription signed in runs
+         against the hub's OWN free models instead (same as opencode, see
+         _apply_claude_hub_fallback / _apply_codex_hub_fallback) -- asked for
+         directly: "/agent CLIs should work isolated and with our local hub
+         llm, of course". This note is informational, not a warning; Sign in
+         remains here for anyone who would rather use their own subscription's
+         stronger models instead of the free tier. */
+      var signLabel = CLI_LABEL[chosen] || chosen;
+      note.className = 'agent-cli-note';
+      note.innerHTML = esc('Using the hub’s free models — no ' + signLabel + ' subscription signed in.') +
+        ' <button type="button" class="btn sm ghost" id="agent-cli-signin">Sign in to use your own instead</button>';
+      var signBtn = note.querySelector('#agent-cli-signin');
+      if (signBtn) signBtn.addEventListener('click', function(){ doAgentCliLogin(chosen, signBtn, note); });
     } else {
       note.className = 'agent-cli-note';
       note.textContent = '';
@@ -6329,6 +6343,29 @@
         return loadAgentSettings(true);
       })
       .catch(function(e){ toast('Install failed: ' + e.message, true); resetBtn(btn, label); });
+  }
+
+  function doAgentCliLogin(cliId, btn, note){
+    if (btn.disabled) return;
+    var label = btn.textContent;
+    busyBtn(btn, 'Opening…');
+    /* Opens the CLI's OWN login flow in a real, visible window -- the hub
+       never sees the credentials being entered, on purpose. This call just
+       launches it and returns; there is no "done" signal to wait for (an
+       OAuth tab, a device code, however that CLI does it), so the note is
+       told in plain language to watch for the window instead of the button
+       spinning forever. */
+    api('/api/agent/clis/' + encodeURIComponent(cliId) + '/login', { method: 'POST' })
+      .then(function(){
+        toast((CLI_LABEL[cliId] || cliId) + ': a sign-in window just opened — finish it there');
+        resetBtn(btn, label);
+        note.innerHTML = esc('A sign-in window opened for ' + (CLI_LABEL[cliId] || cliId) +
+          '. Finish it there, then ') +
+          '<button type="button" class="btn sm ghost" id="agent-cli-recheck">I’m signed in — recheck</button>';
+        var recheck = note.querySelector('#agent-cli-recheck');
+        if (recheck) recheck.addEventListener('click', function(){ loadAgentSettings(true); });
+      })
+      .catch(function(e){ toast('Could not open sign-in: ' + e.message, true); resetBtn(btn, label); });
   }
 
   function renderAgentSettings(data){
@@ -7444,7 +7481,26 @@
         else if (ev.event === 'message'){ finalText = ev.text; ans.textContent = ev.text; msgsEl.scrollTop = msgsEl.scrollHeight; }
         else if (ev.event === 'done'){ finalText = ev.text || finalText; ans.textContent = finalText || '(done)'; }
         else if (ev.event === 'stopped') line('notice', 'Stopped.');
-        else if (ev.event === 'error'){ asstEl.className = 'msg assistant error'; line('err', ev.detail || 'error'); }
+        else if (ev.event === 'error'){
+          asstEl.className = 'msg assistant error';
+          line('err', ev.detail || 'error');
+          /* A structured signal from the backend (not text-sniffing the
+             message, which is meant for a human and free to change): offer
+             the SAME one-click Sign in here, right where the failure was
+             actually seen, not just in the picker above. */
+          if (ev.code === 'cli_not_signed_in' && ev.cli){
+            var signWrap = document.createElement('div');
+            signWrap.className = 'agent-term-line';
+            var signBtn = document.createElement('button');
+            signBtn.type = 'button';
+            signBtn.className = 'btn sm';
+            signBtn.textContent = 'Sign in ' + (CLI_LABEL[ev.cli] || ev.cli);
+            signWrap.appendChild(signBtn);
+            term.appendChild(signWrap);
+            signBtn.addEventListener('click', function(){ doAgentCliLogin(ev.cli, signBtn, signWrap); });
+            term.scrollTop = term.scrollHeight;
+          }
+        }
       }
 
       setBusy(true);
