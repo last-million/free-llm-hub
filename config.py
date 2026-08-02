@@ -500,6 +500,28 @@ def set_flag(name: str, value: bool) -> None:
         save_config(cfg)
 
 
+def get_value(name: str, default=None):
+    """Read a top-level STRING setting. The sibling of get_flag for choices
+    that are not yes/no -- which CLI the agent chat starts on, for instance."""
+    with _LOCK:
+        cfg = load_config()
+    v = cfg.get(name)
+    return v if isinstance(v, str) else default
+
+
+def set_value(name: str, value) -> None:
+    """Persist a top-level string setting. Storing None removes it, so a
+    setting can be returned to its built-in default rather than pinned to a
+    string that happens to mean 'unset'."""
+    with _LOCK:
+        cfg = load_config(strict=True)
+        if value is None:
+            cfg.pop(name, None)
+        else:
+            cfg[name] = str(value)
+        save_config(cfg)
+
+
 def get_social_web_search() -> bool:
     """Whether the agent may use X/social authenticated sources during web
     research (last30days skill). Opt-in: default False."""

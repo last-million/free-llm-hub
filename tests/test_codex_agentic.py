@@ -104,7 +104,10 @@ def test_build_argv_codex_does_not_repeat_the_notice_on_later_turns(monkeypatch)
     assert prompt == "do it"
 
 
-def test_codex_is_default_and_supported():
+def test_codex_is_default_and_supported(monkeypatch):
+    """The built-in default, i.e. what a fresh install starts on. A choice the
+    user has saved in the dashboard wins over it -- see test_agent_cli_cards."""
+    monkeypatch.setattr(ac.config, "get_value", lambda k, d=None: None)
     assert ac.default_cli() == "codex"
     assert ac.cli_support()["codex"]["supported"] is True
 
