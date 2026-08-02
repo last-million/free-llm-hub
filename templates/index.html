@@ -2039,6 +2039,10 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
       <span>Settings</span>
     </button>
+    <button class="cx-nav-item" id="cx-sidebar-update" type="button" title="Check for hub updates (git pull) — never interrupts a running task">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4-4.64 4.36A9 9 0 0 1 3.51 15"/></svg>
+      <span>Update</span>
+    </button>
   </div>
   <div class="cx-side-foot">
     <a class="cx-side-link" href="https://www.youtube.com/@QuantumSEO-AR" target="_blank" rel="noopener noreferrer" aria-label="YouTube — QuantumSEO-AR" title="YouTube — QuantumSEO-AR">
@@ -2140,6 +2144,13 @@
       </div>
       <input type="file" id="settings-import-file" accept="application/json" hidden>
       <p class="sd-help">A portable JSON backup of your provider keys and hub settings &mdash; stays on this machine.</p>
+    </div>
+    <div class="sd-group">
+      <div class="sd-label">Update</div>
+      <div class="sd-actions">
+        <button class="btn sm" id="settings-update-check" type="button">Check for updates</button>
+      </div>
+      <p class="sd-help" id="settings-update-status">Checking current version&hellip;</p>
     </div>
   </div>
 </aside>
@@ -8029,6 +8040,89 @@
     });
   }
 
+  /* ---------- hub self-update (git pull) ----------
+     One shared action for both entry points (Settings drawer + sidebar).
+     POST /api/auto-update {check:true} kicks off a pull in a background
+     thread and returns the OLD state immediately, not the result — so this
+     polls GET /api/auto-update afterward until last_check moves past its
+     pre-click value. The backend itself decides whether restarting right
+     now is safe (no agent session mid-turn, no in-flight /v1 request); if
+     not, it defers on its own and keeps last_result updated
+     ("restart deferred: N task(s) still running") instead of ever killing a
+     running task — this just keeps polling (slower) so the eventual
+     restart still reloads the page instead of leaving the status line
+     stuck on "deferred" forever. */
+  function loadUpdateStatus(silent){
+    return api('/api/auto-update').then(function(r){
+      var el = $('#settings-update-status');
+      if (el) el.textContent = (r && r.last_result) || 'unknown';
+      return r;
+    }).catch(function(e){ if (!silent) toast('Update status: ' + e.message, true); });
+  }
+  function waitForHubBackUp(){
+    var tries = 0;
+    (function poll(){
+      tries++;
+      fetch('/', { cache: 'no-store' }).then(function(r){
+        if (r.ok){ location.reload(); return; }
+        if (tries < 40) setTimeout(poll, 750);
+      }).catch(function(){ if (tries < 40) setTimeout(poll, 750); });
+    })();
+  }
+  function pollUpdateResult(sinceCheck){
+    var tries = 0;
+    function tick(){
+      tries++;
+      return api('/api/auto-update').then(function(st){
+        st = st || {};
+        var el = $('#settings-update-status');
+        if (el) el.textContent = st.last_result || 'unknown';
+        var moved = st.last_check && st.last_check !== sinceCheck;
+        if (/restarting/i.test(st.last_result || '')){
+          toast('Update found — hub is restarting…');
+          waitForHubBackUp();
+          return st;
+        }
+        if (/deferred/i.test(st.last_result || '')){
+          // Keep watching in the background (slow cadence) so a later,
+          // now-idle restart still reloads the page on its own.
+          if (tries < 200) setTimeout(tick, 3000);
+          return st;
+        }
+        if (!moved && tries < 15){ setTimeout(tick, 700); return; }
+        return st;
+      });
+    }
+    return tick();
+  }
+  var _updateChecking = false;
+  function runUpdateCheck(){
+    if (_updateChecking) return;
+    _updateChecking = true;
+    var el = $('#settings-update-status');
+    if (el) el.textContent = 'Checking for updates…';
+    api('/api/auto-update').then(function(before){
+      var sinceCheck = before && before.last_check;
+      return api('/api/auto-update', { method: 'POST', body: { check: true } })
+        .then(function(){ return pollUpdateResult(sinceCheck); });
+    }).then(function(final){
+      final = final || {};
+      if (/up to date/i.test(final.last_result || '')) toast('Already up to date.');
+      else if (/dirty|failed|untrusted|not a git repo/i.test(final.last_result || ''))
+        toast('Update: ' + final.last_result, true);
+      else if (/deferred/i.test(final.last_result || ''))
+        toast('Update pulled — restarting once your active task finishes.');
+    }).catch(function(e){
+      toast('Update check failed: ' + e.message, true);
+    }).then(function(){ _updateChecking = false; });
+  }
+  function initUpdateCheck(){
+    var btn = $('#settings-update-check');
+    if (btn) btn.addEventListener('click', runUpdateCheck);
+    var side = $('#cx-sidebar-update');
+    if (side) side.addEventListener('click', runUpdateCheck);
+  }
+
   /* ---------- vision-gap badge (stage C) ----------
      Three choices, matched honestly to what the backend actually does (see
      vision_status.py): "report once available" is a REAL client-side action (poll +
@@ -8104,6 +8198,7 @@
     loadTestVerification(true);
     loadPromptEnhance(true);
     loadSocialWebSearch(true);
+    loadUpdateStatus(true);
   }
   function closeSettingsDrawer(){
     $('#settings-drawer').hidden = true;
@@ -8329,6 +8424,7 @@
   initTestVerification();
   initPromptEnhance();
   initSocialWebSearch();
+  initUpdateCheck();
   initThemeToggle();
   initSettingsDrawer();
   initSettingsExportImport();
