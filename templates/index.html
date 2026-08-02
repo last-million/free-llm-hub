@@ -1476,6 +1476,15 @@
      on hover instead of pushing it, because reflowing the whole page on a mouse
      move is both janky and disorienting. */
   .cx-sidebar{ transition:width .18s ease, transform .18s ease; }
+  /* Rail/hidden are a DESKTOP idea: a mouse can hover a 56px strip to reveal
+     it, a finger cannot. Below the drawer breakpoint the mode a desktop
+     session left in localStorage was still being applied verbatim, so
+     opening the mobile drawer showed a 56px icon strip sliding in instead of
+     the full sidebar -- reported as "shows just icons, it's fucked". Wrapping
+     every narrowing rule here means the drawer always renders the sidebar's
+     plain, full-width, full-label form, and the STORED preference is left
+     untouched for when the same browser is back above the breakpoint. */
+  @media (min-width:1025px){
   body.cx-rail{ padding-left:var(--sidebar-rail); }
   body.cx-rail .cx-sidebar{ width:var(--sidebar-rail); }
   /* The nav's full-width content still exists while collapsed, so the aside
@@ -1562,8 +1571,11 @@
   /* In hidden mode the strip is the only affordance, so make it findable. */
   body.cx-hidden .cx-sidebar{ border-right:2px solid var(--accent-border); }
   body.cx-hidden .cx-sidebar:hover{ border-right-color:var(--border-soft); }
+  } /* /@media (min-width:1025px) -- end of rail/hidden collapse rules */
 
-  /* Collapsible nav GROUPS. The label is the control. */
+  /* Collapsible nav GROUPS. The label is the control -- distinct from
+     rail/hidden above, this just folds one section's own items, and stays
+     available at every width including inside the mobile drawer. */
   .cx-group-label{ display:flex; align-items:center; gap:6px; width:100%;
     border:0; background:none; cursor:pointer; font:inherit; font-size:10px;
     text-transform:uppercase; letter-spacing:.12em; color:var(--text-faint);
@@ -1585,10 +1597,12 @@
   /* The toggle is how you get BACK, so it is never fully removed — only the
      brand text beside it collapses. Hiding it was how "hidden" became a state
      you could enter and not leave. */
+  @media (min-width:1025px){
   body.cx-rail .cx-sidebar-toggle, body.cx-hidden .cx-sidebar-toggle{ margin-left:0; }
   body.cx-rail .cx-brand, body.cx-hidden .cx-brand{ justify-content:center; padding:14px 6px; }
   body.cx-rail .cx-sidebar:hover .cx-brand, body.cx-hidden .cx-sidebar:hover .cx-brand{
     justify-content:flex-start; padding:18px 16px 14px; }
+  }
 
   @media (prefers-reduced-motion:reduce){
     .cx-sidebar, .gl-caret, .cx-sidebar-toggle{ transition:none; }
@@ -1604,14 +1618,36 @@
   body.cx-on main.wrap > section.section.cx-active{ display:block; animation:cxFade .22s ease-out; }
   @keyframes cxFade{ from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:none;} }
   .cx-burger{ display:none; }
+  .cx-drawer-close{ display:none; }
   @media (max-width:1024px){
     body.cx-on{ padding-left:0; }
     .cx-sidebar{ transform:translateX(-100%); transition:transform .25s ease;
-      box-shadow:20px 0 60px rgba(0,0,0,.4); }
+      width:min(var(--sidebar-w), 84vw);      /* full sidebar, capped so a narrow
+                                                  phone still shows the scrim */
+      box-shadow:20px 0 60px rgba(0,0,0,.4); z-index:200; }
     body.cx-drawer-open .cx-sidebar{ transform:none; }
     .cx-burger{ display:inline-grid; place-items:center; position:fixed; top:12px; left:12px; z-index:210;
       width:42px; height:42px; border-radius:11px; border:1px solid var(--border);
       background:var(--surface); color:var(--text); cursor:pointer; box-shadow:0 4px 16px rgba(0,0,0,.35); }
+    /* One opener, alone, top-left, at rest. Once the drawer is open the
+       burger used to keep rendering right on top of the sidebar's own
+       header (both fixed, both at the top edge) -- two controls fighting for
+       the same corner. The X inside the sidebar is the only opener needed
+       once it is open, so the burger steps out of the way entirely. */
+    body.cx-drawer-open .cx-burger{ display:none; }
+    /* The X replaces the rail/icons-only cycle button here -- that control
+       answers "how narrow", which is not a question a full-screen drawer
+       has. One unambiguous way to close it instead. */
+    #cx-sidebar-toggle{ display:none; }
+    .cx-drawer-close{ display:inline-grid; place-items:center; width:30px; height:30px;
+      flex:none; margin-left:auto; border-radius:8px; border:1px solid var(--border-soft);
+      background:var(--surface-2); color:var(--text-dim); cursor:pointer;
+      transition:color .15s ease, border-color .15s ease, background .15s ease; }
+    .cx-drawer-close:hover{ color:var(--danger-text); border-color:var(--danger-border);
+      background:var(--danger-soft); }
+    .cx-drawer-close:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+    /* Scrim: dims the page AND is the click target for "tap outside to
+       close" (see the click listener in initSidebarModes). */
     body.cx-drawer-open::after{ content:""; position:fixed; inset:0; background:var(--scrim); z-index:199; }
   }
   @media (prefers-reduced-motion:reduce){
@@ -1961,6 +1997,12 @@
     <button class="cx-sidebar-toggle" id="cx-sidebar-toggle" type="button"
             aria-label="Collapse the sidebar" title="Collapse the sidebar (full → icons → hidden)">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+    </button>
+    <!-- Mobile/tablet drawer only (CSS swaps it in for #cx-sidebar-toggle
+         below the 1024px breakpoint): rail/icons-only means nothing in a
+         full-screen drawer, so this is a plain, unambiguous X instead. -->
+    <button class="cx-drawer-close" id="cx-drawer-close" type="button" aria-label="Close navigation menu">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" aria-hidden="true"><line x1="5" y1="5" x2="19" y2="19"/><line x1="19" y1="5" x2="5" y2="19"/></svg>
     </button>
   </div>
   <nav class="cx-nav" id="cx-nav">
@@ -2862,10 +2904,40 @@
                cxShow(old.view, { fromHash: true }); }
     });
     var burger = document.getElementById('cx-burger');
+    var sidebarEl = document.getElementById('cx-sidebar');
+    function setDrawerOpen(open){
+      document.body.classList.toggle('cx-drawer-open', open);
+      if(burger) burger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
     if(burger){ burger.addEventListener('click', function(){
-      var open = document.body.classList.toggle('cx-drawer-open');
-      burger.setAttribute('aria-expanded', open ? 'true' : 'false');
+      setDrawerOpen(!document.body.classList.contains('cx-drawer-open'));
     }); }
+    var drawerClose = document.getElementById('cx-drawer-close');
+    if(drawerClose) drawerClose.addEventListener('click', function(){ setDrawerOpen(false); });
+    /* Tap outside the open drawer (the dimmed page behind it) closes it — the
+       standard behaviour for any mobile drawer/sheet, reported missing here.
+       Checked on the way DOWN (mousedown/touchstart), not click: a click
+       handler alone still fires after a drag that started inside the sidebar
+       (e.g. scrolling the nav list) and ends outside it, closing the drawer
+       out from under a still-in-progress scroll. */
+    document.addEventListener('pointerdown', function(e){
+      if(!document.body.classList.contains('cx-drawer-open')) return;
+      if(sidebarEl && sidebarEl.contains(e.target)) return;
+      if(burger && burger.contains(e.target)) return;   // its own click already toggles
+      setDrawerOpen(false);
+    });
+    document.addEventListener('keydown', function(e){
+      if(e.key === 'Escape' && document.body.classList.contains('cx-drawer-open')){
+        setDrawerOpen(false);
+        if(burger) burger.focus();
+      }
+    });
+    /* Picking a destination closes the drawer too — without this, tapping a
+       sidebar link on mobile navigated correctly but left the drawer (and its
+       full-page scrim) sitting open over the new page. */
+    if(sidebarEl) sidebarEl.addEventListener('click', function(e){
+      if(e.target.closest('.cx-nav-item')) setDrawerOpen(false);
+    });
     initSidebarModes();
     initNavGroups();
     initUiScale();
