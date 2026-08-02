@@ -7980,6 +7980,26 @@ def api_agent_cli_install(cli_id):
     return jsonify({"ok": True, **out})
 
 
+@app.route("/api/agent/clis/<cli_id>/login", methods=["POST"])
+def api_agent_cli_login(cli_id):
+    """One-click sign-in for the hub's isolated copy of a CLI.
+
+    Isolation on purpose means a SEPARATE, initially-empty credential store
+    from the CLI the user already uses by hand -- asked for explicitly, and
+    the reason the auth error names it. That separation still needs signing
+    in once; this is what makes doing so one click in the dashboard rather
+    than "copy this PowerShell line into a terminal yourself". Opens a real,
+    visible window for the login flow itself and returns immediately -- the
+    hub does not, and should not, see credentials as they are typed."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    ok, detail = agentic_chat.launch_isolated_login(cli_id)
+    if not ok:
+        return jsonify({"error": detail}), 400
+    return jsonify({"ok": True})
+
+
 @app.route("/api/agent/new-project", methods=["POST"])
 def api_agent_new_project():
     """One-click 'Create new project': auto-create a fresh uniquely-named folder
