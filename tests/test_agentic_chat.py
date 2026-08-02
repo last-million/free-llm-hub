@@ -601,12 +601,24 @@ def test_api_agent_start_session_bad_cli_400(agent_config):
 # preselects). Claude Code remains supported and selectable.
 # --------------------------------------------------------------------------- #
 
-def test_default_cli_helper_returns_codex():
+def test_default_cli_helper_returns_codex(monkeypatch):
+    """codex is the BUILT-IN default -- what a fresh install starts on.
+
+    It stopped being the whole answer when the dashboard's CLI cards began
+    saving the user's pick: a stored choice wins (see
+    test_agent_cli_cards.py). This pins the fallback, with nothing stored."""
+    monkeypatch.setattr(agentic_chat.config, "get_value", lambda k, d=None: None)
     assert agentic_chat.default_cli() == "codex"
+
+
+def test_a_saved_choice_beats_the_builtin_default(monkeypatch):
+    monkeypatch.setattr(agentic_chat.config, "get_value", lambda k, d=None: "opencode")
+    assert agentic_chat.default_cli() == "opencode"
 
 
 def test_start_session_defaults_cli_to_codex_when_omitted(agent_config, monkeypatch):
     _enable()
+    monkeypatch.setattr(agentic_chat.config, "get_value", lambda k, d=None: None)
     monkeypatch.setattr(agentic_chat.shutil, "which", lambda name: "/usr/bin/" + name)
     sid = agentic_chat.start_session(None, str(agent_config))
     assert agentic_chat.get_session(sid)["cli"] == "codex"
