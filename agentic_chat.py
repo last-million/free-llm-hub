@@ -1144,10 +1144,25 @@ def _parse_codex_json(stdout, stderr, returncode):
     `text` is None on failure. Collects the LAST agent_message as the reply and
     the thread.started id for --resume. Non-JSON log noise interleaved on stdout
     (e.g. "Reading additional input from stdin...") is skipped. `item.type ==
-    "error"` events are notices (model-metadata / service-tier warnings) -- only
-    surfaced as the failure detail if no agent_message ever arrived."""
+    "error"` events are notices (model-metadata / service-tier warnings, often
+    repeated once per retry) -- kept only as a FALLBACK.
+
+    MEASURED (an unauthenticated isolated copy -- isolation is new the same day
+    this was found): the authoritative failure comes from a `turn.failed` event,
+    a single clean line --
+
+        {"type":"turn.failed","error":{"message":"unexpected status 401
+         Unauthorized: Missing bearer or basic authentication in header, ..."}}
+
+    -- which this did not read at all. The fallback WAS reached (raw stderr),
+    but stderr repeats the same "HTTP error: 401 Unauthorized" line once per
+    reconnect attempt (five of them) preceded by boilerplate, so truncating to
+    a fixed length for display cut the string apart mid-word ("HTTP error: 4")
+    before it ever completed "401" -- which is exactly the substring the
+    auth-error check looks for. turn.failed is one clean sentence; prefer it."""
     native_id = None
     final_text = None
+    turn_failed = None
     last_error = None
     for line in (stdout or "").splitlines():
         line = line.strip()
@@ -1164,6 +1179,10 @@ def _parse_codex_json(stdout, stderr, returncode):
             tid = ev.get("thread_id")
             if isinstance(tid, str) and tid:
                 native_id = tid
+        elif etype == "turn.failed":
+            msg = (ev.get("error") or {}).get("message")
+            if isinstance(msg, str) and msg:
+                turn_failed = msg
         elif etype in ("item.completed", "item.started"):
             item = ev.get("item") or {}
             itype = item.get("type")
@@ -1177,7 +1196,7 @@ def _parse_codex_json(stdout, stderr, returncode):
                     last_error = msg
     if final_text is not None:
         return _sanitize(final_text), native_id, None
-    detail = last_error or (stderr or "").strip() or (
+    detail = turn_failed or last_error or (stderr or "").strip() or (
         "codex exited %d with no agent message." % returncode)
     return None, native_id, _sanitize(str(detail), 500)
 
@@ -1438,6 +1457,16 @@ def _codex_stream_events(line):
             msg = item.get("message")
             if isinstance(msg, str) and msg:
                 out.append({"event": "notice", "text": msg})
+    elif etype == "turn.failed":
+        # The authoritative failure, one clean sentence -- see the matching
+        # comment on _parse_codex_json. Without this, a failed turn (e.g. the
+        # isolated copy not yet signed in) fell through to raw stderr, which
+        # repeats "HTTP error: 401 Unauthorized" once per reconnect attempt and
+        # got truncated mid-word before completing "401" -- the exact substring
+        # the auth-error check looks for.
+        msg = (ev.get("error") or {}).get("message")
+        if isinstance(msg, str) and msg:
+            out.append({"_final_error": msg})
     return out
 
 
