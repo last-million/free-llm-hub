@@ -228,13 +228,18 @@ def test_the_preview_iframe_is_allowed_by_the_csp(client):
 
 
 def test_the_csp_still_refuses_remote_frames():
-    """Loopback only — this must not become a general framing permission."""
+    """Loopback, plus the ONE named exception for the Tutorial AR page's
+    embedded YouTube video — this must not become a general framing
+    permission beyond exactly those two things."""
     import re as _re
     with app.app.test_client() as c:
         csp = c.get("/health").headers.get("Content-Security-Policy", "")
     frame_src = _re.search(r"frame-src ([^;]+)", csp).group(1)
+    allowed_remote = ("https://www.youtube.com",)
     for token in frame_src.split():
-        assert token.startswith("http://127.0.0.1") or token.startswith("http://localhost"), token
+        assert (token.startswith("http://127.0.0.1")
+                or token.startswith("http://localhost")
+                or token in allowed_remote), token
 
 
 def test_stop_stays_reachable_when_the_master_switch_is_off(client, monkeypatch):
