@@ -457,9 +457,25 @@ def _isolated_config_dir(cli_id: str) -> str:
                         "isolated-clis", cli_id, "config")
 
 
-def _agentic_env(cli_id: str = None) -> dict:
-    """Child env with every hub-pointing override stripped, and the CLI pointed
-    at the hub's OWN config directory.
+def _agentic_env(cli_id: str = None, project_dir: str = None) -> dict:
+    """Child env with every hub-pointing override stripped, PWD resynced to
+    match the subprocess cwd we are about to give it, and the CLI pointed at
+    the hub's OWN config directory.
+
+    THE PWD FIX, found live and confirmed with certainty (isolated
+    reproduction, one variable at a time -- config-home, data-home, a fresh
+    install, `--pure`, git-repo-ness, the machine's real global opencode state
+    moved out of the way entirely -- all ruled out before this): every child
+    here starts from `dict(os.environ)`, which carries PWD from whatever shell
+    launched the hub. run.bat/run.sh both `cd` into the HUB'S OWN directory
+    before starting Python, so PWD in the hub's own process is always the
+    hub's repo -- for every user, every time, not just a dev workstation
+    quirk. Popen's `cwd=` argument changes the OS-level working directory but
+    never touches PWD in the environment dict, and opencode reads PWD to
+    decide its project root rather than asking the OS for the real one.
+    Measured: with a stale PWD, opencode wrote into the HUB'S OWN SOURCE TREE
+    -- confirmed reproducible from a dozen different angles -- and setting
+    PWD to match cwd was the one change that fixed it outright, every time.
 
     Everything else (PATH, HOME, the user's own settings) passes through
     unchanged. The config redirect only happens when we are actually running
@@ -471,6 +487,8 @@ def _agentic_env(cli_id: str = None) -> dict:
     for k in list(env.keys()):
         if _points_at_hub(env.get(k)):
             env.pop(k, None)
+    if project_dir:
+        env["PWD"] = project_dir
     if cli_id and _isolated_bin(cli_id):
         var = _ISOLATED_CONFIG_ENV.get(cli_id)
         if var:
@@ -1322,7 +1340,7 @@ def send_message(session_id, text):
             argv = _build_argv(sess, bin_path, text)
             try:
                 proc = subprocess.Popen(
-                    argv, cwd=sess.project_dir, env=_agentic_env(sess.cli_id),
+                    argv, cwd=sess.project_dir, env=_agentic_env(sess.cli_id, sess.project_dir),
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, encoding="utf-8", errors="replace",
                     **_tree_popen_kwargs())
@@ -1537,7 +1555,7 @@ def send_message_stream(session_id, text):
             argv = _build_argv(sess, bin_path, text, stream=True)
             try:
                 proc = subprocess.Popen(
-                    argv, cwd=sess.project_dir, env=_agentic_env(sess.cli_id),
+                    argv, cwd=sess.project_dir, env=_agentic_env(sess.cli_id, sess.project_dir),
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, encoding="utf-8", errors="replace", bufsize=1,
                     **_tree_popen_kwargs())
