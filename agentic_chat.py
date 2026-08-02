@@ -234,6 +234,33 @@ def _looks_like_auth_error(detail) -> bool:
     return any(s in low for s in _AUTH_ERR_SUBSTRINGS)
 
 
+# How to sign in to the hub's OWN copy of each CLI. Isolation means the copy the
+# agent chat drives has its own config directory, so it starts out logged into
+# nothing -- and "not logged in" is a baffling message when the CLI in your own
+# terminal is clearly signed in. Say which copy, and give the exact command.
+_ISOLATED_LOGIN_CMD = {
+    "claude": "claude  (it walks you through login on first launch)",
+    "codex": "codex login",
+    "opencode": "opencode auth login",
+}
+
+
+def _auth_help(cli_id: str) -> str:
+    """One line telling the user how to authenticate the isolated copy."""
+    var = _ISOLATED_CONFIG_ENV.get(cli_id)
+    cmd = _ISOLATED_LOGIN_CMD.get(cli_id)
+    if not (var and cmd):
+        return ""
+    path = _isolated_config_dir(cli_id)
+    if os.name == "nt":
+        shell = "$env:%s = '%s'; %s" % (var, path, cmd)
+    else:
+        shell = "%s='%s' %s" % (var, path, cmd)
+    return (" This session runs the hub's OWN isolated copy of %s, which keeps "
+            "its settings in %s and is signed in separately from the %s you use "
+            "by hand. Sign it in once with:  %s" % (cli_id, path, cli_id, shell))
+
+
 def _master_on() -> bool:
     return bool(config.get_flag(_MASTER_FLAG, False))
 
@@ -364,14 +391,93 @@ def _points_at_hub(val) -> bool:
     return isinstance(val, str) and any(fr in val for fr in _hub_fragments())
 
 
-def _agentic_env() -> dict:
-    """Child env with every hub-pointing override stripped. Everything else
-    (PATH, HOME, the user's own settings) passes through unchanged."""
+# Where each CLI keeps its own settings and credentials, and the env var that
+# moves it. Isolation is only half done without this: running the hub's own
+# COPY of a binary while it reads ~/.claude means an agent session can still
+# pick up, change, or invalidate the login the user's own terminal depends on.
+#
+#   claude    CLAUDE_CONFIG_DIR   documented
+#   codex     CODEX_HOME          documented
+#   opencode  XDG_CONFIG_HOME     verified live: it logged
+#             "loading path=<XDG_CONFIG_HOME>\opencode\opencode.json"
+_ISOLATED_CONFIG_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME",
+                        "opencode": "XDG_CONFIG_HOME"}
+
+
+def _isolated_config_dir(cli_id: str) -> str:
+    """~/.free-llm-hub/isolated-clis/<cli>/config — mirrors app.py's own path
+    helper (duplicated for the same import-cycle reason as _launcher())."""
+    return os.path.join(os.path.expanduser("~"), ".free-llm-hub",
+                        "isolated-clis", cli_id, "config")
+
+
+def _agentic_env(cli_id: str = None) -> dict:
+    """Child env with every hub-pointing override stripped, and the CLI pointed
+    at the hub's OWN config directory.
+
+    Everything else (PATH, HOME, the user's own settings) passes through
+    unchanged. The config redirect only happens when we are actually running
+    the hub's isolated copy: if the session fell back to the user's global
+    install, moving its config dir would hide the login it already has and the
+    session would fail asking them to authenticate something that IS
+    authenticated."""
     env = dict(os.environ)
     for k in list(env.keys()):
         if _points_at_hub(env.get(k)):
             env.pop(k, None)
+    if cli_id and _isolated_bin(cli_id):
+        var = _ISOLATED_CONFIG_ENV.get(cli_id)
+        if var:
+            path = _isolated_config_dir(cli_id)
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError:
+                return env                      # unwritable: better shared than broken
+            env[var] = path
+            if cli_id == "opencode":
+                _seed_opencode_config(path)
     return env
+
+
+def _seed_opencode_config(config_home):
+    """Give the isolated opencode a provider: this hub.
+
+    claude and codex ARE subscriptions -- isolating them means signing the
+    hub's copy into the same account, and the hub must stay out of it. opencode
+    is different: it brings no provider of its own, so an isolated config with
+    nothing in it means every turn fails with ProviderAuthError before the
+    agent does any work at all.
+
+    So the hub's own copy is pointed at the hub, which is the one provider we
+    know exists and costs nothing. Written ONCE -- if the file is already there
+    it is left alone, including when the user has configured it themselves.
+    A project's own opencode.json still wins over this at run time, which is
+    how a project can pin a specific model."""
+    target = os.path.join(config_home, "opencode", "opencode.json")
+    if os.path.exists(target):
+        return
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        key = config.load_config().get("local_api_key") or "free-llm-hub"
+        payload = {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+                "free-llm-hub": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "Calvoun Free LLM Hub",
+                    "options": {"baseURL": "http://127.0.0.1:%d/v1" % _port(),
+                                "apiKey": key},
+                    "models": {"auto": {"name": "auto (best free, orchestrated)"}},
+                },
+            },
+            "model": "free-llm-hub/auto",
+        }
+        tmp = target + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp, target)
+    except Exception:                                            # noqa: BLE001
+        pass                    # a missing seed is a clear error later, not a crash
 
 
 def _launcher(path):
@@ -1063,7 +1169,11 @@ def _verify_claude_binary_identity(bin_path):
         proc = subprocess.run(
             _launcher(bin_path) + ["--version"], capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=_VERSION_CHECK_TIMEOUT,
-            env=_agentic_env())
+            # "claude" by name, not sess.cli_id: this check exists only for
+            # claude and runs before any session object is in scope. It also
+            # WANTS the isolated config -- the point is to identify the exact
+            # binary a turn will run, under the exact environment it will run in.
+            env=_agentic_env("claude"))
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         return False, ("could not run '%s --version' to verify it's really "
                        "Claude Code (%s)." % (bin_path, exc.__class__.__name__))
@@ -1120,7 +1230,7 @@ def send_message(session_id, text):
         argv = _build_argv(sess, bin_path, text)
         try:
             proc = subprocess.Popen(
-                argv, cwd=sess.project_dir, env=_agentic_env(),
+                argv, cwd=sess.project_dir, env=_agentic_env(sess.cli_id),
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="replace",
                 **_tree_popen_kwargs())
@@ -1150,8 +1260,12 @@ def send_message(session_id, text):
         result_text, native_id, detail = parser(stdout, stderr, proc.returncode)
         if result_text is None:
             detail = detail or "%s produced no output." % sess.cli_id
-            status = 403 if _looks_like_auth_error(detail) else 502
-            return status, None, detail
+            if _looks_like_auth_error(detail):
+                # Isolation means the copy we drive has its own login. Without
+                # this, the message is "not logged in" about a CLI the user can
+                # see is logged in -- true, and impossible to act on.
+                return 403, None, detail + _auth_help(sess.cli_id)
+            return 502, None, detail
         if native_id:
             sess.native_session_id = native_id
         sess.turn_count += 1
@@ -1300,7 +1414,7 @@ def send_message_stream(session_id, text):
         argv = _build_argv(sess, bin_path, text, stream=True)
         try:
             proc = subprocess.Popen(
-                argv, cwd=sess.project_dir, env=_agentic_env(),
+                argv, cwd=sess.project_dir, env=_agentic_env(sess.cli_id),
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="replace", bufsize=1,
                 **_tree_popen_kwargs())
@@ -1358,7 +1472,9 @@ def send_message_stream(session_id, text):
             sess.native_session_id = native_id
         if final_text is None:
             detail = _sanitize("".join(stderr_buf).strip(), 400) or ("%s produced no reply." % sess.cli_id)
-            yield err(403 if _looks_like_auth_error(detail) else 502, detail); return
+            if _looks_like_auth_error(detail):
+                yield err(403, detail + _auth_help(sess.cli_id)); return
+            yield err(502, detail); return
         sess.turn_count += 1
         yield {"event": "done", "text": _sanitize(final_text), "native": native_id}
     finally:

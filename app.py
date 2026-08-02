@@ -7199,8 +7199,15 @@ def _agent_cli_autoinstall_once():
                           "installed" if ok else _sanitize(str(res.get("error"))))
             # 2. FOR THE HUB. Isolated so a version the hub drives can never
             #    disturb the one the user's own terminal depends on.
-            if agentic_chat._resolve_bin(cli_id):
-                continue                       # already usable; leave it alone
+            #
+            #    This used to check _resolve_bin(), which answers "is there a
+            #    binary I could run" -- and it resolves the GLOBAL install too.
+            #    So on any machine that already had claude or opencode, the
+            #    isolated copy was never built, and every agent session ran the
+            #    user's own install against the user's own credentials. Exactly
+            #    what isolation is for. Check for the ISOLATED copy specifically.
+            if agentic_chat._isolated_bin(cli_id):
+                continue                       # already isolated; leave it alone
             _log.info("[agent-cli] installing %s into the hub's isolated namespace", cli_id)
             ok, res = _install_isolated_cli(cli_id, bin_name)
             _log.info("[agent-cli] %s: %s", cli_id,
