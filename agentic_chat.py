@@ -1023,6 +1023,22 @@ def start_session(cli_id, project_dir, create_new=False) -> str:
         raise AgenticError("cli must be 'claude' or 'codex' (got %r)." % (cli_id,), 400)
     if not project_dir or not isinstance(project_dir, str):
         raise AgenticError("project_dir is required.", 400)
+    if create_new and not os.path.isabs(os.path.expanduser(project_dir.strip())):
+        # A bare name the user typed (as opposed to an absolute path from
+        # Browse-for-folder or the ~/calvoun-projects suggestion new_project_dir()
+        # auto-fills) must NOT resolve against the HUB SERVER's own cwd -- that
+        # cwd is this repo's root when launched the normal way, which silently
+        # created new projects INSIDE the hub's own source tree (same bug class
+        # as the opencode PWD incident: server-process state leaking into a
+        # user-chosen path). Anchor it under the same ~/calvoun-projects
+        # convention new_project_dir() already uses instead.
+        calvoun_projects = os.path.join(os.path.expanduser("~"), "calvoun-projects")
+        # _prepare_new_project_dir below only requires the IMMEDIATE parent to
+        # already exist (by design -- it won't create missing grandparents for
+        # an arbitrary user path); this base folder is OURS to guarantee, the
+        # same way new_project_dir() already does for the auto-suggested path.
+        os.makedirs(calvoun_projects, exist_ok=True)
+        project_dir = os.path.join(calvoun_projects, project_dir.strip())
     abs_dir = os.path.abspath(os.path.expanduser(project_dir))
     if create_new:
         _prepare_new_project_dir(abs_dir, project_dir)

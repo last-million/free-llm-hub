@@ -25,6 +25,7 @@ import base64
 import binascii
 import io
 import calendar
+import concurrent.futures
 import copy
 import ipaddress
 import json
@@ -593,6 +594,28 @@ def _auto_models(pid):
         return paid
     seen = set(free)
     return free + [m for m in paid if m not in seen]
+
+
+def _prefetch_auto_models(providers):
+    """{pid: [models]} for every provider in `providers`, fetched CONCURRENTLY
+    instead of one at a time -- see the comment at the call site in
+    _route_by_difficulty for the measured cost this replaces. Each fetch is
+    independent (provider_free_models's 60s cache is keyed per-pid), so there
+    is nothing to race, only wall-clock time to save. Never raises: a
+    provider whose fetch fails contributes an empty list, exactly what
+    calling _auto_models(pid) directly would give on the same failure."""
+    if not providers:
+        return {}
+    out = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(providers), 16)) as ex:
+        futures = {ex.submit(_auto_models, pid): pid for pid in providers}
+        for fut in concurrent.futures.as_completed(futures):
+            pid = futures[fut]
+            try:
+                out[pid] = fut.result()
+            except Exception:                                    # noqa: BLE001
+                out[pid] = []
+    return out
 
 
 def aggregated_models():
@@ -3818,9 +3841,18 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     if not providers:  # request too big for every free tier -> try the biggest anyway
         providers = sorted(_available_providers(), key=_provider_tpm, reverse=True)
     providers = _exclude_google_for_foreign_tool_history(providers, require_tools, messages)
+    # Each _auto_models(pid) can be a live, network-bound provider /models
+    # fetch on a cold or expired cache entry. MEASURED, chasing a report of a
+    # 12-minute agentic turn that came back with nothing: 20 providers,
+    # sequential, ~1s each -- a genuine ~20-30s stall on the FIRST routing
+    # decision after a restart, or any call more than the 60s cache TTL after
+    # the last one. Independent per provider (provider_free_models's cache is
+    # keyed per-pid), so there is no shared state to race by fetching them
+    # concurrently instead of one at a time -- only wall-clock time to save.
+    models_by_pid = _prefetch_auto_models(providers)
     cands = []  # (score, pid, model)
     for pid in providers:
-        for m in _auto_models(pid):
+        for m in models_by_pid.get(pid, ()):
             # skip ids this key provably can't use (403/404 learned at runtime) and
             # ids individually rate-limited / over their per-model sub-cap.
             if (prov.is_model_allowed(m) and not _is_model_dead(pid, m)
@@ -4014,7 +4046,23 @@ def _is_orchestrate(model):
     if "/" in model:
         return False
     return (not model) or model in ("auto", "orchestrate", "default") \
-        or model.startswith("claude")
+        or model.startswith("claude") \
+        or model in _CLAUDE_MODEL_ALIASES
+
+
+# Claude Code's OWN short model names -- what `--model opus` on the real CLI
+# actually sends, and what "opus"/"sonnet"/"haiku" mean to any Anthropic-API
+# client, not just this hub's own isolated sessions. MEASURED, and the reason
+# this exists: with no special case, "opus" is neither "auto" nor
+# "claude"-prefixed, so _resolve_model("opus") fell through to a literal
+# passthrough lookup -- ('groq', 'opus') -- a model that does not exist on
+# Groq or anywhere else. The isolated claude fallback (agentic_chat.py) sends
+# this UNCONDITIONALLY on every turn (Anthropic's own CLI reference: --model
+# is not remembered across --resume, so it is resent every time), and the
+# request against a nonexistent literal model did not fail fast -- it hung,
+# with nothing ever coming back, for the full length of a 12-minute real
+# session before the caller gave up with no reply at all.
+_CLAUDE_MODEL_ALIASES = ("opus", "sonnet", "haiku", "opusplan")
 
 
 def _autoselect_default_if_unset():
