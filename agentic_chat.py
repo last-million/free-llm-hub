@@ -1255,7 +1255,23 @@ def _build_argv(sess: _Session, bin_path: str, text: str, stream=False):
     if sess.native_session_id:
         args += ["--resume", sess.native_session_id]
     args += ["--output-format", "stream-json" if stream else "json",
-             "--dangerously-skip-permissions", "--model", _MODEL_ALIAS]
+             # BOTH bypass flags, not just one: MEASURED live, a real turn hit
+             # "Claude requested permissions to write to <path>, but you
+             # haven't granted it yet" / toolDenialKind "user-rejected" on a
+             # Write tool call despite --dangerously-skip-permissions being
+             # present -- claude 2.1.220, stdin closed so nothing could ever
+             # answer the prompt it still raised. --permission-mode
+             # bypassPermissions is a DISTINCT, separately-implemented bypass
+             # mechanism (confirmed via `claude --help`, and confirmed safe to
+             # pass alongside the other flag with a fresh, uncontaminated
+             # config dir: exit 0, file written, permissionMode resolves to
+             # "bypassPermissions"). Belt-and-suspenders: if one mechanism has
+             # a gap the other doesn't, only one needs to hold. The turn is
+             # ALSO robust if a prompt gets raised anyway -- see
+             # send_message_stream's last_message_text fallback, which keeps
+             # whatever the model said instead of reporting "no reply".
+             "--dangerously-skip-permissions", "--permission-mode", "bypassPermissions",
+             "--model", _MODEL_ALIAS]
     if stream:
         args += ["--verbose"]  # claude -p requires --verbose alongside stream-json
     first = not sess.native_session_id
@@ -1944,6 +1960,7 @@ def send_message_stream(session_id, text):
             native_id = None
             final_text = None
             final_error = None
+            last_message_text = None
             try:
                 for line in proc.stdout:
                     for e in parse(line):
@@ -1953,6 +1970,8 @@ def send_message_stream(session_id, text):
                             final_text = e["_final"]
                         if "_final_error" in e:
                             final_error = e["_final_error"]
+                        if e.get("event") == "message" and e.get("text"):
+                            last_message_text = e["text"]
                         if e.get("event"):
                             yield e
             except Exception:
@@ -1971,6 +1990,19 @@ def send_message_stream(session_id, text):
             # short: this is a thread that is already almost certainly done,
             # not a process we are waiting on.
             drain_done.wait(timeout=0.5)
+            if final_text is None and final_error is None and last_message_text:
+                # The process ended (killed, crashed, or exited oddly) WITHOUT
+                # ever emitting a clean terminal result/summary event -- but
+                # real assistant text WAS already streamed first. MEASURED: a
+                # claude turn hit an unresolvable Write-permission gate
+                # (--dangerously-skip-permissions did not stop an interactive-
+                # style prompt this one time; stdin is closed so nothing could
+                # ever answer it), the model asked "Should I proceed and write
+                # the files?" as its last streamed line, and the underlying
+                # process then never produced a closing `type:"result"` event
+                # -- so final_text stayed None and a real, useful reply was
+                # reported as "produced no reply" and silently discarded.
+                final_text = last_message_text
             if sess.last_interrupted:
                 yield {"event": "stopped"}; return
             if timed_out[0]:
