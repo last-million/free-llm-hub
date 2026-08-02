@@ -41,7 +41,7 @@ def _dash(client, method, url, **kw):
 
 @pytest.mark.parametrize("slug", ["hub", "activity", "chat", "agent", "images",
                                   "providers", "image-providers", "subscriptions",
-                                  "routing", "quota", "usage", "tracking"])
+                                  "routing", "quota", "usage", "tracking", "tutorial-ar"])
 def test_every_view_has_a_url_that_serves_the_app(client, slug):
     """Opening one in a new tab has to work on a cold request -- the server,
     not just the running page, must answer for it."""

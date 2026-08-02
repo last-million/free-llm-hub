@@ -5551,8 +5551,11 @@ def _security_headers(response):
         # loopback port we allocate at run time (PORT_RANGE). Without an explicit
         # frame-src this falls back to default-src 'none' and the iframe is
         # refused outright — measured: "Refused to frame 'http://127.0.0.1:5801/'".
-        # Scoped to loopback only, so this still cannot frame anything remote.
-        "frame-src http://127.0.0.1:* http://localhost:*; "
+        # Scoped to loopback only, so this still cannot frame anything remote --
+        # plus the one named exception below for the Tutorial AR page's single
+        # embedded YouTube video.
+        "frame-src http://127.0.0.1:* http://localhost:* "
+        "https://www.youtube.com; "
         "frame-ancestors 'none'; object-src 'none'" % nonce)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
@@ -5872,7 +5875,7 @@ def api_activity():
 # render the dashboard, and /api, /v1 and /artifact keep their own handlers.
 _VIEW_SLUGS = ("hub", "activity", "chat", "agent", "images", "providers",
                "image-providers", "subscriptions", "routing", "quota",
-               "usage", "tracking")
+               "usage", "tracking", "tutorial-ar")
 
 
 @app.route("/<any(" + ", ".join("'%s'" % s for s in _VIEW_SLUGS) + "):slug>")
