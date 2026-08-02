@@ -86,8 +86,11 @@ def test_the_sidebar_items_are_links_not_buttons():
     view_buttons = re.findall(r'<button class="cx-nav-item" data-view=', html)
     assert not view_buttons, "a nav item that navigates is still a button"
     links = re.findall(r'<a class="cx-nav-item" href="(/[a-z-]+)"', html)
-    assert len(links) == len(app._VIEW_SLUGS), links
-    assert set(links) == {"/" + s for s in app._VIEW_SLUGS}
+    assert links, "the sidebar has no links at all"
+    # A SUBSET, not an equality: a view can keep its URL while being taken out
+    # of the menu. "Image providers" was removed from the sidebar on request,
+    # and /image-providers still works so existing links do not break.
+    assert set(links) <= {"/" + s for s in app._VIEW_SLUGS}, set(links)
 
 
 def test_modified_clicks_are_left_to_the_browser():

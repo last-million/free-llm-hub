@@ -982,6 +982,82 @@
      real buttons. The generic .seg-btn has background:none/border:0 and a
      text-faint idle colour, which read as disabled labels in both themes —
      reported as "make them visible and look like real buttons". */
+  /* Session / History is the same kind of choice, and had the same problem:
+     the generic pill reads as a label, so the pair looked like a caption
+     rather than two things you can press. Same treatment. */
+  #agent-view-toggle{ background:none; padding:0; gap:8px; border:0; }
+  #agent-view-toggle .seg-btn{ border:1px solid var(--border);
+    background:var(--surface-2); color:var(--text-dim); border-radius:var(--radius-sm);
+    padding:7px 16px; min-height:34px; font-weight:600; cursor:pointer; }
+  #agent-view-toggle .seg-btn:hover{ color:var(--text); border-color:var(--text-faint); }
+  #agent-view-toggle .seg-btn:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  #agent-view-toggle .seg-btn[aria-selected="true"]{ background:var(--accent);
+    color:var(--on-accent, #04110a); border-color:var(--accent); }
+
+  /* ---------- Starting a session: one centred column ----------
+     Reported as "it look like shiit man, it should be centred and bigger and
+     all organized": the cards, the mode toggle and the folder row each sat at
+     the far left of a very wide window, at three different widths, so nothing
+     read as belonging together. They are one decision, made once, so they get
+     one column with one measure and one rhythm. */
+  .agent-setup{ max-width:820px; margin:0 auto; padding:4px 0 8px;
+    display:flex; flex-direction:column; gap:18px; align-items:stretch; }
+  .agent-setup-label{ margin:0; text-align:center; font-size:12.5px; font-weight:700;
+    letter-spacing:.06em; text-transform:uppercase; color:var(--text-faint); }
+  .agent-setup .agent-cli-row{ display:flex; flex-direction:column; gap:12px; }
+  .agent-setup #agent-dir-mode{ justify-content:center; }
+  .agent-setup .agent-start-row{ justify-content:center; }
+  .agent-setup .agent-cli-note{ justify-content:center; text-align:center; }
+  .agent-setup .agent-recent-chips{ justify-content:center; }
+
+  /* ---------- CLI cards (replaced the dropdown) ----------
+     A <select> can only ever show the state of the ONE entry it has selected,
+     and every fact here matters before choosing: is it installed, is it the
+     hub's isolated copy or your own, which one is recommended.
+
+     Sized to be pressed, not squinted at -- equal columns so no CLI looks more
+     important than another for having a longer name, and they collapse to one
+     column on a narrow window rather than shrinking into slivers. */
+  .agent-cli-cards{ display:grid; gap:12px; width:100%;
+    grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); }
+  .agent-cli-card{
+    display:flex; flex-direction:column; align-items:center; gap:10px;
+    padding:18px 16px; min-height:118px; justify-content:center;
+    border:1px solid var(--border); background:var(--surface-2); color:var(--text);
+    border-radius:14px; cursor:pointer; font:inherit; text-align:center;
+    transition:border-color .16s ease, background .16s ease, transform .12s ease,
+               box-shadow .16s ease;
+  }
+  .agent-cli-card:hover:not(:disabled){ border-color:var(--accent);
+    background:var(--surface-3); transform:translateY(-2px); }
+  .agent-cli-card:focus-visible{ outline:2px solid var(--accent); outline-offset:3px; }
+  .agent-cli-card.selected{ border-color:var(--accent); background:var(--surface-3);
+    box-shadow:inset 0 0 0 1.5px var(--accent), 0 6px 18px rgba(0,0,0,.22); }
+  .agent-cli-card:disabled, .agent-cli-card.unavailable{ opacity:.5; cursor:not-allowed; }
+  .agent-cli-check{ width:17px; height:17px; flex:none; border-radius:50%;
+    border:1.5px solid var(--border); display:inline-block; position:relative; }
+  .agent-cli-card.selected .agent-cli-check{ border-color:var(--accent); background:var(--accent); }
+  .agent-cli-card.selected .agent-cli-check::after{ content:''; position:absolute; inset:4px;
+    border-radius:50%; background:var(--on-accent, #04110a); }
+  .agent-cli-name{ font-weight:700; font-size:15.5px; letter-spacing:-.01em; }
+  .agent-cli-tags{ display:flex; gap:6px; flex-wrap:wrap; justify-content:center; }
+  .agent-cli-tag{ font-size:10.5px; font-weight:700; letter-spacing:.02em; padding:3px 9px;
+    border-radius:999px; background:var(--surface-3); color:var(--text-dim);
+    border:1px solid var(--border-soft); white-space:nowrap; }
+  .agent-cli-tag.good{ color:var(--accent-strong); border-color:var(--accent); }
+  .agent-cli-tag.warn{ color:var(--warn-text); border-color:var(--warn-border);
+    background:var(--warn-soft); }
+  @media (prefers-reduced-motion:reduce){
+    .agent-cli-card{ transition:none; }
+    .agent-cli-card:hover:not(:disabled){ transform:none; }
+  }
+  /* The folder row is the widest thing in the column, so it sets the measure;
+     on a narrow window it stacks instead of squeezing the input to nothing. */
+  @media (max-width:620px){
+    .agent-setup .agent-start-row{ flex-direction:column; align-items:stretch; }
+    .agent-setup .agent-start-row .dir-browse{ width:100%; height:38px; }
+  }
+
   #agent-dir-mode{ background:none; padding:0; gap:8px; border:0; }
   #agent-dir-mode .seg-btn{ border:1px solid var(--border);
     background:var(--surface-2); color:var(--text-dim); border-radius:var(--radius-sm);
@@ -1881,7 +1957,7 @@
   <div class="cx-brand">
     <img class="cx-mark-img" src="/static/calvoun-logo.webp" width="30" height="30"
          alt="Calvoun logo: a white owl whose outstretched wings are formed from the letters of the word CALVOUN, with a cyan beak, on a purple rounded square." decoding="async">
-    <span class="cx-brand-text">Calvoun Hub<small>local gateway &middot; 127.0.0.1</small></span>
+    <span class="cx-brand-text">Calvoun Hub<small>LLM Calvoun V2.8 &middot; 127.0.0.1</small></span>
     <button class="cx-sidebar-toggle" id="cx-sidebar-toggle" type="button"
             aria-label="Collapse the sidebar" title="Collapse the sidebar (full → icons → hidden)">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
@@ -1905,7 +1981,6 @@
       <button class="cx-group-label" type="button" aria-expanded="true" aria-controls="grp-models-keys"><span class="gl-text">Models & keys</span><svg class="gl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
       <div class="cx-group-body" id="grp-models-keys">
       <a class="cx-nav-item" href="/providers" data-view="sec-providers" data-title="Providers"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg><span>Providers</span><span class="nav-new-badge" data-new-key="providers_puter_connect_fix_v1">New updates</span></a>
-      <a class="cx-nav-item" href="/image-providers" data-view="sec-image-providers" data-title="Image providers"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><circle cx="6" cy="17.5" r="1"/><path d="m14 15 4 4 4-4M18 19v-6"/></svg><span>Image providers</span></a>
       <a class="cx-nav-item" href="/subscriptions" data-view="sec-subs" data-title="Local subscriptions"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.5 12.5 20 3"/><path d="m16 6 3 3"/></svg><span>Subscriptions</span></a>
       <a class="cx-nav-item" href="/routing" data-view="sec-default" data-title="Orchestrator model"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg><span>Routing</span></a></div>
     </div>
@@ -2187,18 +2262,29 @@
         </div>
 
         <div id="agent-session-tab" role="tabpanel">
+        <!-- Everything up to "Start session" is ONE decision made once, so it
+             reads as one centred column instead of three rows shoved against
+             the left edge of a 1900px window. -->
+        <div class="agent-setup" id="agent-setup">
         <div class="agent-cli-row" id="agent-cli-row">
-          <select id="agent-cli" aria-label="Agent CLI">
-            <option value="claude">Claude Code &mdash; recommended</option>
-            <option value="codex">ChatGPT Codex</option>
-            <option value="opencode">OpenCode</option>
-          </select>
+          <p class="agent-setup-label">Which CLI should do the work?</p>
+          <!-- Cards, not a dropdown: each CLI carries state worth seeing before
+               you choose (installed, isolated, recommended), and a <select>
+               can show exactly one of those at a time -- whichever happens to
+               be selected. Picking one SAVES it, so the next session starts
+               where you left off with no Save button to remember. -->
+          <div class="agent-cli-cards" id="agent-cli-cards" role="radiogroup" aria-label="Agent CLI"></div>
           <span class="agent-cli-note" id="agent-cli-note"></span>
         </div>
 
+        <!-- "Create new project" leads, and is the default. Starting a fresh
+             project is the common case here; defaulting to a folder path the
+             user must go and find made the first thing on screen the harder
+             of the two. -->
+        <p class="agent-setup-label">Where should it work?</p>
         <div class="seg-toggle sm" id="agent-dir-mode" role="tablist" aria-label="Workspace mode">
-          <button type="button" class="seg-btn" id="agent-mode-existing" role="tab" aria-selected="true">Use existing folder</button>
-          <button type="button" class="seg-btn" id="agent-mode-new" role="tab" aria-selected="false">Create new project</button>
+          <button type="button" class="seg-btn" id="agent-mode-new" role="tab" aria-selected="true">Create new project</button>
+          <button type="button" class="seg-btn" id="agent-mode-existing" role="tab" aria-selected="false">Use existing folder</button>
         </div>
         <div class="agent-start-row" id="agent-start-row">
           <input id="agent-dir" type="text" placeholder="Absolute project folder, e.g. C:\Users\you\project"
@@ -2212,6 +2298,7 @@
         </div>
         <div class="agent-recent-chips" id="agent-recent-chips" hidden></div>
         <div class="agent-start-result" id="agent-start-result"></div>
+        </div><!-- /agent-setup -->
 
         <div class="agent-session" id="agent-session" hidden>
           <div class="agent-session-bar">
@@ -6066,50 +6153,75 @@
      gets its state (installed / isolated / unavailable) filled in. */
   var CLI_LABEL = { claude: 'Claude Code', codex: 'ChatGPT Codex', opencode: 'OpenCode' };
 
+  /* The selected CLI. Was a <select>.value; now a plain variable, because the
+     cards ARE the control. Seeded from the server so a reload starts on the
+     CLI last chosen, on any browser. */
+  var cliChoice = null;
+  function currentCli(){
+    return cliChoice || agentState.defaultCli || 'codex';
+  }
+
   function renderCliPicker(){
-    var sel = $('#agent-cli');
-    var note = $('#agent-cli-note');
-    if (!sel) return;
+    var host = $('#agent-cli-cards');
+    if (!host) return;
     var clis = agentState.clis || {};
+    if (!cliChoice && agentState.defaultCli) cliChoice = agentState.defaultCli;
+    var chosen = currentCli();
+    host.innerHTML = '';
     Object.keys(CLI_LABEL).forEach(function(id){
-      var opt = sel.querySelector('option[value="' + id + '"]');
-      if (!opt) return;
       var info = clis[id] || {};
-      var base = CLI_LABEL[id];
-      opt.disabled = info.supported === false;
-      /* Say which copy a session would actually RUN. "isolated" means the hub's
-         own install under ~/.free-llm-hub/isolated-clis, with its own config
-         dir — so driving it as an agent cannot disturb the CLI the user types
-         into by hand. Without this the picker gave no hint which install was
-         about to be touched. */
-      var tag = info.supported === false ? ' — not available'
-              : !info.installed ? ' — not installed'
-              : info.isolated ? ' — isolated copy'
-              : ' — your install';
-      opt.textContent = base + (info.recommended ? ' (recommended)' : '') + tag;
+      var card = document.createElement('button');
+      card.type = 'button';
+      card.className = 'agent-cli-card' + (id === chosen ? ' selected' : '') +
+                       (info.supported === false ? ' unavailable' : '') +
+                       (info.installed === false ? ' not-installed' : '');
+      card.setAttribute('role', 'radio');
+      card.setAttribute('aria-checked', id === chosen ? 'true' : 'false');
+      card.disabled = info.supported === false;
+      /* Every fact that used to be crammed into one <option> line, and that a
+         dropdown could only ever show for the selected entry. */
+      var tags = '';
+      if (info.recommended) tags += '<span class="agent-cli-tag good">recommended</span>';
+      if (info.supported === false) tags += '<span class="agent-cli-tag warn">not available</span>';
+      else if (info.installed === false) tags += '<span class="agent-cli-tag warn">not installed</span>';
+      else if (info.isolated) tags += '<span class="agent-cli-tag good">isolated copy</span>';
+      else tags += '<span class="agent-cli-tag">your install</span>';
+      card.innerHTML = '<span class="agent-cli-check" aria-hidden="true"></span>' +
+                       '<span class="agent-cli-name"></span>' +
+                       '<span class="agent-cli-tags">' + tags + '</span>';
+      card.querySelector('.agent-cli-name').textContent = CLI_LABEL[id];
       /* No apostrophes in these strings on purpose: this file goes through a
          Python rewrite and a shell heredoc, and an escaped quote does not
-         survive all three layers intact. It silently became "the hub's own"
+         survive all three layers intact. It silently became "the hub is own"
          with the backslash gone, which is a JS syntax error — caught by
          test_all_inline_script_blocks_pass_node_check. */
-      opt.title = info.reason ||
+      card.title = info.reason ||
         (info.isolated
           ? 'Runs the copy owned by the hub, with separate settings and credentials. It cannot interfere with the CLI you use by hand.'
-          : 'Runs the copy already on your PATH. Install an isolated copy from Subscriptions to keep agent sessions fully separate.');
+          : 'Runs the copy already on your PATH.');
+      card.addEventListener('click', function(){ chooseCli(id); });
+      host.appendChild(card);
     });
-    if (!agentState.cliPreselected && agentState.defaultCli){
-      sel.value = agentState.defaultCli;
-      agentState.cliPreselected = true;
-    }
     renderCliNote();
   }
 
+  /* Saved on the click. A picker that forgets by the next reload is a picker
+     that has to be set every time, and there is no Save button here to press. */
+  function chooseCli(id){
+    if (cliChoice === id) return;
+    cliChoice = id;
+    renderCliPicker();
+    api('/api/agent/settings', { method: 'POST', body: { default_cli: id } })
+      .then(function(r){ if (r && r.default_cli) agentState.defaultCli = r.default_cli; })
+      .catch(function(){ /* the choice still applies to THIS session */ });
+  }
+
   function renderCliNote(){
-    var sel = $('#agent-cli');
     var note = $('#agent-cli-note');
     var startBtn = $('#agent-start');
-    if (!sel || !note) return;
-    var info = (agentState.clis || {})[sel.value] || {};
+    if (!note) return;
+    var chosen = currentCli();
+    var info = (agentState.clis || {})[chosen] || {};
     if (info.supported === false){
       note.className = 'agent-cli-note warn';
       note.textContent = info.reason || 'This CLI is not available for Chat CLI yet.';
@@ -6118,12 +6230,12 @@
     }
     if (startBtn) startBtn.disabled = false;
     if (info.installed === false){
-      var installLabel = CLI_LABEL[sel.value] || sel.value;
+      var installLabel = CLI_LABEL[chosen] || chosen;
       note.className = 'agent-cli-note warn';
       note.innerHTML = esc(installLabel + ' isn’t installed yet.') +
         ' <button type="button" class="btn sm" id="agent-cli-install">Install ' + esc(installLabel) + '</button>';
       var btn = note.querySelector('#agent-cli-install');
-      if (btn) btn.addEventListener('click', function(){ doAgentCliInstall(sel.value, btn, note); });
+      if (btn) btn.addEventListener('click', function(){ doAgentCliInstall(chosen, btn, note); });
     } else {
       note.className = 'agent-cli-note';
       note.textContent = '';
@@ -6276,7 +6388,7 @@
   }
 
   function initAgent(){
-    var cliSel = $('#agent-cli');
+    var cliCards = $('#agent-cli-cards');
     var dirInput = $('#agent-dir');
     var dirHistoryList = $('#agent-dir-history');
     var recentChips = $('#agent-recent-chips');
@@ -6301,12 +6413,14 @@
     var historyViewer = $('#agent-history-viewer');
     var historyTranscript = $('#agent-history-transcript');
     var historyBackBtn = $('#agent-history-back');
-    if (!cliSel || !startBtn || !sendBtn) return;
+    if (!cliCards || !startBtn || !sendBtn) return;
 
     var sessionId = null;
-    var dirMode = 'existing';
+    /* Create-new is the default: starting a fresh project is the common case,
+       and defaulting to a folder path the user has to go and find made the
+       harder of the two the first thing on screen. */
+    var dirMode = 'new';
 
-    cliSel.addEventListener('change', renderCliNote);
 
     /* ---------- workspace mode: existing folder vs. create-new-project ---------- */
     function setDirMode(mode){
@@ -7143,7 +7257,7 @@
       // the image generator's `if (genBtn.disabled) return;` (this file has shipped
       // more than one button without this guard before; don't repeat that here).
       if (startBtn.disabled) return;
-      var cli = cliSel.value;
+      var cli = currentCli();
       var info = (agentState.clis || {})[cli] || {};
       if (info.supported === false){ toast(info.reason || (cliLabel(cli) + ' is not available yet.'), true); return; }
       var dir = dirInput.value.trim();
@@ -7516,8 +7630,8 @@
               return;
             }
             toast('Could not continue that conversation — opening the same folder for a fresh one.', true);
-            if (conv.cli_id) cliSel.value = conv.cli_id;
-            renderCliNote();
+            if (conv.cli_id){ cliChoice = conv.cli_id; renderCliPicker(); }
+            else renderCliNote();
             setDirMode('existing');
             dirInput.value = conv.project_dir || '';
             switchTab('session');
@@ -7537,7 +7651,7 @@
       if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); doSend(); }
     });
 
-    setDirMode('existing');
+    setDirMode('new');            /* create-new is the default choice */
     checkpointBtn.disabled = true;   // no active session yet — matches showStartState()'s invariant
     loadRecentProjects();
   }

@@ -341,10 +341,30 @@ def _resolve_bin(cli_id: str):
     return _isolated_bin(cli_id) or shutil.which(_CLI_BIN[cli_id])
 
 
+_DEFAULT_CLI_FLAG = "agent_default_cli"        # config key, holds the user's pick
+
+
 def default_cli() -> str:
     """The CLI id start_session() defaults to when the caller omits `cli`, and
-    the value the dashboard's CLI picker should preselect. See _DEFAULT_CLI."""
+    the value the dashboard's CLI picker preselects.
+
+    The USER'S choice wins over _DEFAULT_CLI: picking a CLI in the dashboard
+    saves it, so the next session (and the next day) starts on the one they
+    actually use, without a Save button to remember to press. A stored value
+    naming a CLI this build cannot drive is ignored rather than obeyed."""
+    chosen = config.get_value(_DEFAULT_CLI_FLAG)
+    if isinstance(chosen, str) and chosen in _SUPPORT:
+        return chosen
     return _DEFAULT_CLI
+
+
+def set_default_cli(cli_id: str) -> str:
+    """Remember which CLI the dashboard should start on. Returns what is now
+    stored, so the caller never has to guess whether it took."""
+    if cli_id not in _SUPPORT:
+        raise AgenticError("Unknown CLI '%s'." % cli_id, 400)
+    config.set_value(_DEFAULT_CLI_FLAG, cli_id)
+    return default_cli()
 
 
 class AgenticError(Exception):

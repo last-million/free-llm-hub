@@ -6713,6 +6713,12 @@ def _connect_snippets():
     return {"claude_code": claude, "openai": openai}
 
 
+# The RELEASE name, set by hand. _detect_hub_version() below is the git HEAD,
+# which changes on every commit and is what the "what's new" popup compares --
+# useful for that, useless as something to tell someone you are running.
+HUB_RELEASE = "LLM Calvoun V2.8"
+
+
 def _detect_hub_version():
     """Running-version stamp for the dashboard's "what's new" popup: the short
     git HEAD of this checkout, resolved once at startup (an update = a git
@@ -6740,7 +6746,7 @@ _HUB_VERSION = _detect_hub_version()
 def api_version():
     # Control-token gated like every other /api/* read; the dashboard always
     # holds the token, so no _CONTROL_TOKEN_EXEMPT_GETS entry is needed.
-    return jsonify({"version": _HUB_VERSION})
+    return jsonify({"version": _HUB_VERSION, "release": HUB_RELEASE})
 
 
 @app.route("/api/status", methods=["GET"])
@@ -7356,9 +7362,22 @@ def api_agent_settings():
 @app.route("/api/agent/settings", methods=["POST"])
 def api_agent_settings_update():
     body = request.get_json(force=True, silent=True)
-    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
-        return jsonify({"error": "Pass {\"enabled\": bool}."}), 400
-    agentic_chat.set_master_enabled(body["enabled"])
+    if not isinstance(body, dict):
+        return jsonify({"error": "Pass {\"enabled\": bool} and/or "
+                                 "{\"default_cli\": str}."}), 400
+    # Picking a CLI in the dashboard saves it here, on the click. There is no
+    # Save button to forget: a picker that quietly reverts on the next reload
+    # is worse than one that never remembered.
+    if "default_cli" in body:
+        try:
+            agentic_chat.set_default_cli(body["default_cli"])
+        except agentic_chat.AgenticError as exc:
+            return jsonify({"error": str(exc)}), 400
+    elif not isinstance(body.get("enabled"), bool):
+        return jsonify({"error": "Pass {\"enabled\": bool} and/or "
+                                 "{\"default_cli\": str}."}), 400
+    if isinstance(body.get("enabled"), bool):
+        agentic_chat.set_master_enabled(body["enabled"])
     return jsonify({"enabled": agentic_chat.master_enabled(), "clis": agentic_chat.cli_support(),
                     "default_cli": agentic_chat.default_cli()})
 
