@@ -329,8 +329,88 @@ def cli_support() -> dict:
                     # so the picker can say so instead of leaving the user to
                     # wonder which install a session is about to touch.
                     "isolated": bool(iso),
-                    "recommended": cid == _RECOMMENDED_CLI}
+                    "recommended": cid == _RECOMMENDED_CLI,
+                    # Isolation on purpose means a SEPARATE, initially-empty
+                    # credential store from the CLI the user already uses by
+                    # hand -- so "installed" is not "ready". Checked directly
+                    # against the isolated config dir, never the real one, so
+                    # this can never read the user's own login as a green
+                    # light for the hub's copy.
+                    "signed_in": (not bool(iso)) or _isolated_signed_in(cid)}
     return out
+
+
+# The file that appears in a CLI's config dir once login actually succeeds.
+# opencode has no entry: it is never a subscription for the hub's purposes --
+# its isolated copy is seeded with the hub's own free models and needs no
+# login (see _seed_opencode_config).
+_ISOLATED_CREDENTIAL_FILE = {"claude": ".credentials.json", "codex": "auth.json"}
+
+
+def _isolated_signed_in(cli_id: str) -> bool:
+    fname = _ISOLATED_CREDENTIAL_FILE.get(cli_id)
+    if not fname:
+        return True
+    return os.path.isfile(os.path.join(_isolated_config_dir(cli_id), fname))
+
+
+# The subcommand that signs the ISOLATED copy in, per CLI. claude has no
+# login-only flag (confirmed against --help) -- a bare launch is what already
+# walks a fresh profile through login on its own, per Anthropic's own CLI
+# design, so that is what gets opened.
+_LOGIN_ARGS = {"claude": [], "codex": ["login"], "opencode": ["auth", "login"]}
+
+
+def launch_isolated_login(cli_id: str):
+    """Open the isolated copy's OWN login flow in a real, visible window, so
+    signing in is one click from the dashboard instead of "copy this
+    PowerShell line into a terminal yourself" -- asked for directly: "it
+    should work in the browser".
+
+    Deliberately NOT captured/streamed back through the API: a login flow is
+    interactive (an OAuth browser tab, a device code, a paste-your-key
+    prompt) and the hub has no business intercepting credentials as they are
+    entered. It opens the CLI in ITS OWN window and gets out of the way.
+    Returns (ok, detail)."""
+    if cli_id not in _LOGIN_ARGS:
+        return False, "No known login flow for '%s'." % cli_id
+    bin_path = _isolated_bin(cli_id)
+    if not bin_path:
+        return False, "The isolated copy of %s is not installed yet." % cli_id
+    config_dir = _isolated_config_dir(cli_id)
+    try:
+        os.makedirs(config_dir, exist_ok=True)
+    except OSError as exc:
+        return False, "Could not prepare %s: %s" % (config_dir, exc)
+    env = _agentic_env(cli_id)                # sets the isolated config-dir var
+    argv = _launcher(bin_path) + _LOGIN_ARGS[cli_id]
+    try:
+        if os.name == "nt":
+            # A REAL console the user can see and type into -- CREATE_NO_WINDOW
+            # (used everywhere else this hub shells out) is the opposite of
+            # what a login prompt needs.
+            subprocess.Popen(argv, cwd=config_dir, env=env,
+                             creationflags=subprocess.CREATE_NEW_CONSOLE)
+        else:
+            # Best-effort: try common terminal emulators in turn. None of this
+            # machine's own testing runs on POSIX, so this is deliberately
+            # simple rather than guessed-at further; if none are found the
+            # caller's response says exactly that instead of silently doing
+            # nothing.
+            term_argv = None
+            for term, flag in (("x-terminal-emulator", "-e"), ("gnome-terminal", "--"),
+                               ("konsole", "-e"), ("xterm", "-e")):
+                if shutil.which(term):
+                    term_argv = [term, flag] + argv
+                    break
+            if term_argv is None:
+                return False, ("Could not find a terminal to open. Run this "
+                               "yourself: %s='%s' %s" % (_ISOLATED_CONFIG_ENV[cli_id],
+                                                         config_dir, " ".join(argv)))
+            subprocess.Popen(term_argv, cwd=config_dir, env=env)
+    except Exception as exc:                                     # noqa: BLE001
+        return False, "Could not open %s: %s" % (cli_id, exc)
+    return True, None
 
 
 def _isolated_bin(cli_id: str):
@@ -500,7 +580,174 @@ def _agentic_env(cli_id: str = None, project_dir: str = None) -> dict:
             env[var] = path
             if cli_id == "opencode":
                 _seed_opencode_config(path)
+            elif cli_id == "claude":
+                _apply_claude_hub_fallback(env, path)
+            elif cli_id == "codex":
+                _apply_codex_hub_fallback(path)
     return env
+
+
+def _hub_base_url() -> str:
+    return "http://127.0.0.1:%d" % _port()
+
+
+def _apply_claude_hub_fallback(env, config_home):
+    """No subscription, no problem: an isolated copy that has never been
+    signed in runs against THIS HUB'S OWN FREE MODELS instead, same as
+    opencode already does -- asked for directly: "/agent CLIs should work
+    isolated and with our local hub llm, of course".
+
+    Claude Code takes ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN/ANTHROPIC_MODEL
+    as env vars (the identical shape app.py's own _autofix_claude writes into
+    ~/.claude/settings.json for the user's REAL install to connect it to this
+    same hub) -- so this needs no config file, just the same three vars, set
+    directly on the isolated child's own environment.
+
+    Conditional on purpose: these vars OVERRIDE stored login credentials
+    whenever Claude Code sees them, so setting them unconditionally would make
+    a real sign-in silently useless forever. Once .credentials.json exists,
+    this stops touching the env at all and the real subscription -- generally
+    the stronger option -- takes over on its own."""
+    if _isolated_signed_in("claude"):
+        return
+    env["ANTHROPIC_BASE_URL"] = _hub_base_url()
+    env["ANTHROPIC_AUTH_TOKEN"] = config.get_local_api_key() or "free-llm-hub"
+    env["ANTHROPIC_MODEL"] = "auto"
+
+
+# Bare minimum codex needs to treat the hub as a provider -- the same shape
+# app.py's _codex_apply_text writes for a real, interactive install. Ported
+# rather than reused, for two reasons: agentic_chat.py cannot import app.py
+# (import cycle -- app.py imports this module), same as _launcher() and
+# _isolated_config_dir(); and this needs a REVERT path _codex_apply_text has
+# no reason to have, since a real install is never expected to un-connect
+# itself the moment a login appears.
+#
+# MEASURED, and the reason this is additive rather than "only write a fresh
+# file": codex writes its OWN config.toml on the very first invocation in ANY
+# directory, unprompted -- a [projects.'<path>'] trust-level entry, with no
+# provider config at all. So by the time this ever runs, the file essentially
+# always already exists, and treating "the file exists" as "do not touch it"
+# meant the fallback silently never activated after the first codex run on
+# the machine. The real question is narrower: does it carry an EXPLICIT
+# model_provider (someone, or an earlier real login, deliberately chose a
+# provider)? Only that is left alone.
+_CODEX_HUB_MARKER = "# free-llm-hub: isolated fallback -- removed automatically once signed in"
+_CODEX_TOP_TABLE_RE = re.compile(r"^\s*\[")
+_CODEX_MODEL_PROVIDER_RE = re.compile(r"^\s*model_provider\s*=", re.M)
+
+
+def _codex_toml_top_and_rest(text):
+    """Split config.toml into (top-level bare keys, everything from the first
+    [table] header on) -- TOML only allows bare keys before the first table,
+    which is what makes a plain string-insert safe here."""
+    top, rest, in_rest = [], [], False
+    for ln in (text or "").splitlines():
+        if not in_rest and _CODEX_TOP_TABLE_RE.match(ln):
+            in_rest = True
+        (rest if in_rest else top).append(ln)
+    return top, rest
+
+
+def _codex_hub_fallback_text(existing):
+    """Point config.toml at the hub, ADDITIVELY: only the model_provider/model
+    top keys and a [model_providers.freehub] table are touched. Everything
+    else -- notably codex's own [projects.*] trust entries -- passes through
+    verbatim, the same guarantee app.py's real-install version makes. Every
+    line this adds carries the marker, which is what lets a later sign-in
+    remove EXACTLY these lines and nothing codex or the user wrote."""
+    top, rest = _codex_toml_top_and_rest(existing)
+
+    def _set_top_key(name, value):
+        pat = re.compile(r"^\s*%s\s*=" % re.escape(name))
+        line = '%s = "%s"  %s' % (name, value, _CODEX_HUB_MARKER)
+        for i, ln in enumerate(top):
+            if pat.match(ln):
+                top[i] = line
+                return
+        top.insert(0, line)
+
+    _set_top_key("model_provider", "freehub")
+    _set_top_key("model", "auto")
+
+    cleaned, skip = [], False
+    for ln in rest:
+        if _CODEX_TOP_TABLE_RE.match(ln):
+            skip = (ln.strip() == "[model_providers.freehub]")
+        if not skip:
+            cleaned.append(ln)
+
+    # No standalone marker line ABOVE the table: the "drop the old
+    # [model_providers.freehub] table" scan below only recognizes the table
+    # header itself, so a comment line preceding it survived every re-apply
+    # and piled up one copy per turn -- measured, two applies back to back
+    # were not byte-identical. The table name is already unique and already
+    # matched on removal, so it needs no separate marker.
+    block = ["[model_providers.freehub]",
+            'name = "Calvoun Free LLM Hub"',
+            'base_url = "%s/v1"' % _hub_base_url(),
+            'wire_api = "responses"']
+    bearer = config.get_local_api_key()
+    if bearer:
+        block.append('experimental_bearer_token = "%s"' % bearer)
+
+    new_text = "\n".join(top + cleaned).rstrip("\n")
+    return (new_text + "\n\n" if new_text else "") + "\n".join(block) + "\n"
+
+
+def _revert_codex_hub_fallback_text(existing):
+    """Strip exactly what _codex_hub_fallback_text added -- every line is
+    marker-tagged, so this can never remove a REAL provider choice, only the
+    fallback's own. codex's [projects.*] entries and anything else survive."""
+    top, rest = _codex_toml_top_and_rest(existing)
+    top = [ln for ln in top if _CODEX_HUB_MARKER not in ln]
+    cleaned, skip = [], False
+    for ln in rest:
+        if ln.strip() == _CODEX_HUB_MARKER:
+            skip = True
+            continue
+        if _CODEX_TOP_TABLE_RE.match(ln):
+            skip = (ln.strip() == "[model_providers.freehub]")
+        if not skip:
+            cleaned.append(ln)
+    combined = (top + cleaned)
+    while combined and not combined[-1].strip():
+        combined.pop()
+    return "\n".join(combined) + ("\n" if combined else "")
+
+
+def _write_codex_toml(path, text):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        pass                          # a missing fallback surfaces as a clear auth error later
+
+
+def _apply_codex_hub_fallback(config_home):
+    """The file-based counterpart to _apply_claude_hub_fallback: codex reads
+    its provider from config.toml, not env vars, so an isolated copy that has
+    never been signed in gets a config.toml pointing at this hub -- same free
+    models opencode already falls back to, asked for directly."""
+    path = os.path.join(config_home, "config.toml")
+    try:
+        existing = open(path, encoding="utf-8", errors="replace").read() if os.path.isfile(path) else ""
+    except OSError:
+        return
+    if _isolated_signed_in("codex"):
+        # Signed in now: remove OUR OWN prior fallback (if any) so the real
+        # login takes over. codex's [projects.*] entries and anything else in
+        # the file are untouched -- only marker-tagged lines are ever removed.
+        if _CODEX_HUB_MARKER in existing:
+            _write_codex_toml(path, _revert_codex_hub_fallback_text(existing))
+        return
+    # Idempotent re-apply (already ours) is fine; a REAL, explicit provider
+    # choice already in the file (not ours, not empty) is never overwritten.
+    if existing and _CODEX_HUB_MARKER not in existing and _CODEX_MODEL_PROVIDER_RE.search(existing):
+        return
+    _write_codex_toml(path, _codex_hub_fallback_text(existing))
 
 
 def _seed_opencode_config(config_home):
@@ -1527,8 +1774,16 @@ def send_message_stream(session_id, text):
     Same validation / turn-lock / tree-kill model as send_message(). Always ends
     with exactly one {"event":"done",...}, {"event":"error",...}, or
     {"event":"stopped"}. Never raises."""
-    def err(status, detail):
-        return {"event": "error", "status": status, "detail": detail}
+    def err(status, detail, code=None):
+        ev = {"event": "error", "status": status, "detail": detail}
+        if code:
+            ev["code"] = code
+            # The picker's CURRENT selection can drift from the CLI this
+            # session actually runs (changed after Start, before the next
+            # message) -- send the session's own cli_id explicitly rather
+            # than let the frontend assume the two still match.
+            ev["cli"] = sess.cli_id
+        return ev
     if not _master_on():
         yield err(403, "Agentic chat is turned off (agentic_chat_enabled=False)."); return
     with _REGISTRY_LOCK:
@@ -1667,7 +1922,12 @@ def send_message_stream(session_id, text):
             if final_text is None:
                 detail = final_error or stderr_text or ("%s produced no reply." % sess.cli_id)
                 if _looks_like_auth_error(detail):
-                    yield err(403, detail + _auth_help(sess.cli_id)); return
+                    # A structured signal, not prose-sniffing: the frontend
+                    # offers a one-click Sign in button on this code+cli pair
+                    # instead of pattern-matching the message text (which is
+                    # meant for a human, and free to change).
+                    yield err(403, detail + _auth_help(sess.cli_id),
+                             code="cli_not_signed_in"); return
                 yield err(502, detail); return
             sess.turn_count += 1
             yield {"event": "done", "text": _sanitize(final_text), "native": native_id}
