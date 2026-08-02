@@ -57,12 +57,17 @@ def test_autoinstall_covers_codex_and_opencode(monkeypatch):
 
 def test_a_cli_already_on_the_machine_is_left_alone(monkeypatch):
     """Installing over someone's existing CLI is not ours to do -- it can move
-    them to a version their own work does not expect."""
+    them to a version their own work does not expect.
+
+    "Already there" means BOTH copies exist: the user's own, and the hub's
+    isolated one. This test used to pass with only the global install present,
+    which is precisely the hole that left claude and opencode running the
+    user's own credentials -- see test_cli_isolation.py."""
     installed = []
     monkeypatch.setattr(app.config, "get_flag", lambda *a, **k: True)
     monkeypatch.setattr(app, "_ensure_npm", lambda *a, **k: "npm")
     monkeypatch.setattr(app.shutil, "which", lambda name: "/usr/bin/" + str(name))
-    monkeypatch.setattr(app.agentic_chat, "_resolve_bin", lambda cli: "/usr/bin/" + cli)
+    monkeypatch.setattr(app.agentic_chat, "_isolated_bin", lambda cli: "/hub/copy/" + cli)
     monkeypatch.setattr(app, "_install_global_cli",
                         lambda cli, npm=None: (installed.append(cli), (True, {}))[1])
     monkeypatch.setattr(app, "_install_isolated_cli",
