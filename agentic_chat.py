@@ -190,7 +190,13 @@ _SUPPORT = {
 # Each agentic turn can run real tool use (file edits, shell commands), so this
 # is deliberately much longer than app.py's one-shot _SUB_TIMEOUT (120s).
 # Configurable, mirroring the PORT env-var convention already used in app.py.
-_TURN_TIMEOUT = int(os.environ.get("AGENTIC_CHAT_TIMEOUT", "600") or "600")
+# Was 600 (10 min). Measured live, on THIS hub, for a TRIVIAL one-file-write
+# turn on free-tier routing: codex took ~5 minutes. A real ask -- "build me a
+# site", many tool calls, many model round trips within one turn -- can need
+# far longer than that on a free model, and 10 minutes was routinely not
+# enough. Raised to something that actually matches observed latency; still
+# overridable via AGENTIC_CHAT_TIMEOUT for anyone who wants it tighter.
+_TURN_TIMEOUT = int(os.environ.get("AGENTIC_CHAT_TIMEOUT", "1800") or "1800")
 
 # Keep the prompt safely under cmd.exe's ~8191-char command-line ceiling once
 # wrapped in `cmd.exe /c <shim.cmd> ...` on Windows (this hub's ONLY launch path
@@ -714,6 +720,26 @@ def _revert_codex_hub_fallback_text(existing):
     while combined and not combined[-1].strip():
         combined.pop()
     return "\n".join(combined) + ("\n" if combined else "")
+
+
+def _best_effort_native_id(cli_id, stdout):
+    """Whatever thread/session id can be salvaged from the OUTPUT OF A KILLED
+    PROCESS, for the non-streaming path -- used only when a turn is killed for
+    exceeding _TURN_TIMEOUT, so a retry can RESUME instead of restarting from
+    zero. codex and opencode emit JSONL from the first line on regardless of
+    stream/non-stream mode, so an early, COMPLETE line (thread.started /
+    system init) survives even though the final line was cut off mid-write;
+    each parser already skips unparseable lines rather than raising. claude's
+    non-streaming --output-format json is a single blob written all at once
+    on completion -- a kill mid-turn leaves no complete JSON at all, so there
+    is nothing to recover and this correctly returns None for it."""
+    if cli_id == "codex":
+        _, native_id, _ = _parse_codex_json(stdout, "", 1)
+        return native_id
+    if cli_id == "opencode":
+        _, native_id, _ = _parse_opencode_json(stdout, "", 1)
+        return native_id
+    return None
 
 
 def _write_codex_toml(path, text):
@@ -1601,6 +1627,14 @@ def send_message(session_id, text):
         # "no conversation found" error is worse than quietly starting the
         # conversation over, so the retry is silent: same text, no resume.
         stale_retry_used = False
+        # See the matching comment in send_message_stream: a turn killed for
+        # exceeding _TURN_TIMEOUT used to just fail, no retry, the request
+        # silently discarded -- reported live. One bounded retry, and if a
+        # thread/session id can be salvaged from what the killed process DID
+        # produce (codex/opencode stream JSONL from the first line on; claude
+        # non-streaming JSON is all-or-nothing and has nothing to salvage),
+        # the retry RESUMES instead of starting the whole task over.
+        timeout_retry_used = False
         while True:
             was_resume = bool(sess.native_session_id)
             argv = _build_argv(sess, bin_path, text)
@@ -1630,7 +1664,14 @@ def send_message(session_id, text):
             if sess.last_interrupted:
                 return 499, None, "Turn was stopped."
             if timed_out:
-                return 504, None, "%s timed out after %ds." % (sess.cli_id, _TURN_TIMEOUT)
+                salvaged = _best_effort_native_id(sess.cli_id, stdout)
+                if salvaged:
+                    sess.native_session_id = salvaged
+                if not timeout_retry_used:
+                    timeout_retry_used = True
+                    continue
+                return 504, None, ("%s timed out after %ds (retried once)."
+                                   % (sess.cli_id, _TURN_TIMEOUT))
             parser = {"codex": _parse_codex_json,
                       "opencode": _parse_opencode_json}.get(sess.cli_id, _parse_claude_json)
             result_text, native_id, detail = parser(stdout, stderr, proc.returncode)
@@ -1834,6 +1875,16 @@ def send_message_stream(session_id, text):
         # num_turns=0, before any tool ran or any text streamed, so nothing
         # user-visible has to be un-shown.
         stale_retry_used = False
+        # A SEPARATE one-shot retry for hitting _TURN_TIMEOUT: reported live,
+        # a real turn was killed for exceeding it and just stopped -- no
+        # retry, no resume, the user's request silently discarded. Free-tier
+        # agentic turns are legitimately slow (measured: ~5 minutes for a
+        # TRIVIAL one-file write), so a kill on the first sign of a long turn
+        # is the wrong default. This one is NOT silent, unlike stale-resume:
+        # real tool calls and real text may already have streamed to the
+        # user by the time it fires, so staying quiet about starting over
+        # would be its own kind of confusing.
+        timeout_retry_used = False
         while True:
             was_resume = bool(sess.native_session_id)
             argv = _build_argv(sess, bin_path, text, stream=True)
@@ -1907,7 +1958,24 @@ def send_message_stream(session_id, text):
             if sess.last_interrupted:
                 yield {"event": "stopped"}; return
             if timed_out[0]:
-                yield err(504, "%s timed out after %ds." % (sess.cli_id, _TURN_TIMEOUT)); return
+                # Save whatever thread/session id was already captured from
+                # the stream BEFORE this decision -- without it, native_id sat
+                # in a local variable this whole time and the code below the
+                # loop (the only place that normally saves it) is never
+                # reached on a timeout, so a retry -- or even just the user's
+                # own next message -- restarted the whole task from zero
+                # instead of continuing the one already under way.
+                if native_id:
+                    sess.native_session_id = native_id
+                if not timeout_retry_used:
+                    timeout_retry_used = True
+                    yield {"event": "notice",
+                          "text": ("Still working after %ds — %s." %
+                                   (_TURN_TIMEOUT,
+                                    "resuming" if native_id else "trying again"))}
+                    continue
+                yield err(504, "%s timed out after %ds (retried once)."
+                         % (sess.cli_id, _TURN_TIMEOUT)); return
 
             stderr_text = _sanitize("".join(stderr_buf).strip(), 400)
             stale_source = final_error or stderr_text
