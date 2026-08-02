@@ -214,6 +214,13 @@
     padding:12px 14px;overflow-x:auto;white-space:pre;
   }
   .snippet .hint{font-size:12px;color:var(--text-faint)}
+  /* ---------- tutorial video ---------- */
+  .yt-embed{
+    position:relative;width:100%;max-width:960px;aspect-ratio:16/9;
+    background:var(--bg-inset);border:1px solid var(--border-soft);border-radius:var(--radius);
+    overflow:hidden;margin-bottom:12px;
+  }
+  .yt-embed iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
   .btn{
     display:inline-flex;align-items:center;gap:6px;justify-content:center;
     background:var(--surface-2);color:var(--text);border:1px solid var(--border);
@@ -2010,7 +2017,8 @@
       <button class="cx-group-label" type="button" aria-expanded="true" aria-controls="grp-hub"><span class="gl-text">Hub</span><svg class="gl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
       <div class="cx-group-body" id="grp-hub">
       <a class="cx-nav-item" href="/hub" data-view="sec-lifecycle" data-title="Hub controls"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="2" y1="14" x2="6" y2="14"/><line x1="10" y1="8" x2="14" y2="8"/><line x1="18" y1="16" x2="22" y2="16"/></svg><span>Hub controls</span></a>
-      <a class="cx-nav-item" href="/activity" data-view="sec-activity" data-title="Live activity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span>Activity</span></a></div>
+      <a class="cx-nav-item" href="/activity" data-view="sec-activity" data-title="Live activity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span>Activity</span></a>
+      <a class="cx-nav-item" href="/tutorial-ar" data-view="sec-tutorial" data-title="Tutorial AR"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg><span>Tutorial AR</span><span class="nav-new-badge" data-new-key="tutorial_ar_video_v1">New</span></a></div>
     </div>
     <div class="cx-group" data-group="generate">
       <button class="cx-group-label" type="button" aria-expanded="true" aria-controls="grp-generate"><span class="gl-text">Generate</span><svg class="gl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
@@ -2239,10 +2247,24 @@
   </section>
 
   <!-- Connect -->
-  
+
 
   <!-- Connected tools — the primary surface: the only section expanded by default -->
-  
+
+
+  <!-- Tutorial (Arabic) -->
+  <section class="section" aria-labelledby="h-tutorial">
+    <div class="section-h">
+      <h2 id="h-tutorial" tabindex="-1">Tutorial AR</h2>
+      <span class="sub">video walkthrough &mdash; in Arabic</span>
+    </div>
+    <div class="section-body" id="sec-tutorial">
+      <div class="yt-embed">
+        <iframe width="560" height="315" src="https://www.youtube.com/embed/T_HS_Yl77SA?si=WI3c-uaXRgzgL3sq" title="Calvoun Free LLM Hub tutorial (Arabic)" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+      </div>
+      <p class="cli-help">In Arabic. Also linked from the <a href="https://www.youtube.com/watch?v=T_HS_Yl77SA" target="_blank" rel="noopener noreferrer">README on GitHub</a>.</p>
+    </div>
+  </section>
 
   <!-- Local subscription providers (paid, opt-in last-resort tier) -->
   <section class="section" aria-labelledby="h-subs">
@@ -2794,7 +2816,8 @@
     'sec-default': 'routing',
     'sec-quota': 'quota',
     'sec-usage': 'usage',
-    'sec-tracking': 'tracking'
+    'sec-tracking': 'tracking',
+    'sec-tutorial': 'tutorial-ar'
   };
   var PATH_VIEWS = {};
   Object.keys(VIEW_PATHS).forEach(function(v){ PATH_VIEWS[VIEW_PATHS[v]] = v; });
