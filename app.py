@@ -7902,7 +7902,7 @@ def api_agent_end_session(session_id):
         try:
             closed = workspace.shutdown(project_dir)
         except Exception as exc:                                 # noqa: BLE001
-            log.warning("could not stop the preview for %s: %s", project_dir, exc)
+            _log.warning("could not stop the preview for %s: %s", project_dir, exc)
     return jsonify({"ended": ended, "app_closed": bool(closed)})
 
 
@@ -13644,9 +13644,9 @@ if __name__ == "__main__":
     try:
         freed = workspace.sweep_own_range()
         if freed:
-            log.info("reclaimed %d preview port(s) left by a previous run", freed)
+            _log.info("reclaimed %d preview port(s) left by a previous run", freed)
     except Exception as exc:                                     # noqa: BLE001
-        log.warning("could not sweep preview ports: %s", exc)
+        _log.warning("could not sweep preview ports: %s", exc)
     workspace.start_reaper()   # stop previews nobody is watching
     _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()

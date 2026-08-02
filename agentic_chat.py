@@ -234,6 +234,32 @@ def _looks_like_auth_error(detail) -> bool:
     return any(s in low for s in _AUTH_ERR_SUBSTRINGS)
 
 
+# A session's --resume/--session id is only good against the config directory
+# it was minted under. Isolation (added the same day as this table) gave every
+# CLI a FRESH config directory with no history in it -- so a session id from
+# before that change, or from an even earlier reset, is unknown to it. Each CLI
+# reports that with its own wording; measured directly, one command at a time:
+#
+#   claude    --resume <id>            "No conversation found with session ID: <id>"
+#   codex     exec resume <id>         "no rollout found for thread id <id> (code -32600)"
+#   opencode  --session <id>           "Session not found"
+#
+# Losing the user's message to a confusing error over something they did not
+# cause is worse than silently starting the conversation over, so this is a
+# regex table keyed by cli_id, used to trigger ONE transparent retry (see
+# send_message / send_message_stream) rather than surfacing the error at all.
+_STALE_RESUME_PATTERNS = {
+    "claude": re.compile(r"no conversation found with session id", re.I),
+    "codex": re.compile(r"no rollout found for thread id", re.I),
+    "opencode": re.compile(r"session not found", re.I),
+}
+
+
+def _is_stale_resume_error(cli_id, detail) -> bool:
+    pat = _STALE_RESUME_PATTERNS.get(cli_id)
+    return bool(pat and detail and pat.search(str(detail)))
+
+
 # How to sign in to the hub's OWN copy of each CLI. Isolation means the copy the
 # agent chat drives has its own config directory, so it starts out logged into
 # nothing -- and "not logged in" is a baffling message when the CLI in your own
@@ -535,11 +561,19 @@ def _secret_values():
     return vals
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def _sanitize(text, limit=None):
     """Never let a provider key (or the local key) leak into an error surfaced
     to the client. `limit=None` leaves successful result text un-truncated;
-    error/detail strings pass a small limit, mirroring app.py's _sanitize()."""
+    error/detail strings pass a small limit, mirroring app.py's _sanitize().
+
+    Also strips ANSI colour codes: opencode's CLI errors (`\\x1b[91m\\x1b[1mError:
+    \\x1b[0mSession not found`) come from raw stderr, and those escape bytes have
+    no business landing in a chat bubble."""
     s = str(text if text is not None else "")
+    s = _ANSI_RE.sub("", s)
     for secret in _secret_values():
         if secret and secret in s:
             s = s.replace(secret, "***")
@@ -1130,6 +1164,33 @@ def _parse_codex_json(stdout, stderr, returncode):
     return None, native_id, _sanitize(str(detail), 500)
 
 
+def _claude_result_text(ev):
+    """The text of a claude `result`-shaped event: normally the "result"
+    string, but an EXECUTION failure -- a --resume id the current profile has
+    never seen, for one -- comes back with NO "result" field at all, only an
+    "errors" list.
+
+    MEASURED (isolation gave every CLI a fresh, empty profile the same day
+    this was found): --resume <unknown-id> against the isolated config produces
+
+        {"type":"result","subtype":"error_during_execution","is_error":true,
+         "errors":["No conversation found with session ID: <id>"], ...}
+
+    -- no "result" key whatsoever. Reading only data.get("result") made that
+    shape invisible: result_text stayed None, detail stayed None, and the
+    fallback "claude produced no reply." replaced a perfectly good reason with
+    a useless one. Returns None if neither field has usable text."""
+    res = ev.get("result")
+    if isinstance(res, str) and res:
+        return res
+    errs = ev.get("errors")
+    if isinstance(errs, list):
+        joined = "; ".join(str(e) for e in errs if e)
+        if joined:
+            return joined
+    return None
+
+
 def _parse_claude_json(stdout, stderr, returncode):
     """-> (text, native_session_id, detail). `text` is None on any failure."""
     raw = (stdout or "").strip()
@@ -1147,13 +1208,13 @@ def _parse_claude_json(stdout, stderr, returncode):
     if not isinstance(data, dict):
         return None, None, "Unexpected JSON shape from claude."
     native_id = data.get("session_id") if isinstance(data.get("session_id"), str) else None
+    text = _claude_result_text(data)
     if data.get("is_error"):
-        msg = data.get("result") or data.get("error") or "unknown error"
+        msg = text or data.get("error") or "unknown error"
         return None, native_id, _sanitize(str(msg), 500)
-    result = data.get("result")
-    if not isinstance(result, str) or not result:
+    if not text:
         return None, native_id, "claude returned no result text."
-    return _sanitize(result), native_id, None
+    return _sanitize(text), native_id, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1247,49 +1308,66 @@ def send_message(session_id, text):
             ok, detail = _verify_claude_binary_identity(bin_path)
             if not ok:
                 return _BINARY_IDENTITY_FAIL_STATUS, None, detail
-        argv = _build_argv(sess, bin_path, text)
-        try:
-            proc = subprocess.Popen(
-                argv, cwd=sess.project_dir, env=_agentic_env(sess.cli_id),
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace",
-                **_tree_popen_kwargs())
-        except (OSError, ValueError) as exc:
-            return 502, None, "%s failed to start: %s" % (sess.cli_id, exc.__class__.__name__)
-        sess.last_interrupted = False
-        with sess.proc_lock:
-            sess.proc = proc
-        timed_out = False
-        try:
-            stdout, stderr = proc.communicate(timeout=_TURN_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate(proc)
+        # One retry, at most, and only for one specific cause: --resume/--session
+        # pointing at an id the CURRENT config directory has never heard of.
+        # Isolation gave every CLI a FRESH config the day this was found, so
+        # any session id captured before that (or from an even earlier reset)
+        # is stale against it. See _STALE_RESUME_PATTERNS for the measured
+        # per-CLI wording. Losing the user's actual message to a confusing
+        # "no conversation found" error is worse than quietly starting the
+        # conversation over, so the retry is silent: same text, no resume.
+        stale_retry_used = False
+        while True:
+            was_resume = bool(sess.native_session_id)
+            argv = _build_argv(sess, bin_path, text)
             try:
-                stdout, stderr = proc.communicate(timeout=_KILL_GRACE)
-            except Exception:
-                stdout, stderr = "", ""
-        with sess.proc_lock:
-            sess.proc = None
-        if sess.last_interrupted:
-            return 499, None, "Turn was stopped."
-        if timed_out:
-            return 504, None, "%s timed out after %ds." % (sess.cli_id, _TURN_TIMEOUT)
-        parser = {"codex": _parse_codex_json,
-                  "opencode": _parse_opencode_json}.get(sess.cli_id, _parse_claude_json)
-        result_text, native_id, detail = parser(stdout, stderr, proc.returncode)
-        if result_text is None:
-            detail = detail or "%s produced no output." % sess.cli_id
-            if _looks_like_auth_error(detail):
-                # Isolation means the copy we drive has its own login. Without
-                # this, the message is "not logged in" about a CLI the user can
-                # see is logged in -- true, and impossible to act on.
-                return 403, None, detail + _auth_help(sess.cli_id)
-            return 502, None, detail
-        if native_id:
-            sess.native_session_id = native_id
-        sess.turn_count += 1
-        return 200, result_text, None
+                proc = subprocess.Popen(
+                    argv, cwd=sess.project_dir, env=_agentic_env(sess.cli_id),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace",
+                    **_tree_popen_kwargs())
+            except (OSError, ValueError) as exc:
+                return 502, None, "%s failed to start: %s" % (sess.cli_id, exc.__class__.__name__)
+            sess.last_interrupted = False
+            with sess.proc_lock:
+                sess.proc = proc
+            timed_out = False
+            try:
+                stdout, stderr = proc.communicate(timeout=_TURN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _terminate(proc)
+                try:
+                    stdout, stderr = proc.communicate(timeout=_KILL_GRACE)
+                except Exception:
+                    stdout, stderr = "", ""
+            with sess.proc_lock:
+                sess.proc = None
+            if sess.last_interrupted:
+                return 499, None, "Turn was stopped."
+            if timed_out:
+                return 504, None, "%s timed out after %ds." % (sess.cli_id, _TURN_TIMEOUT)
+            parser = {"codex": _parse_codex_json,
+                      "opencode": _parse_opencode_json}.get(sess.cli_id, _parse_claude_json)
+            result_text, native_id, detail = parser(stdout, stderr, proc.returncode)
+            if (result_text is None and was_resume and not stale_retry_used
+                    and _is_stale_resume_error(sess.cli_id, detail)):
+                sess.native_session_id = None
+                stale_retry_used = True
+                continue
+            if result_text is None:
+                detail = detail or "%s produced no output." % sess.cli_id
+                if _looks_like_auth_error(detail):
+                    # Isolation means the copy we drive has its own login.
+                    # Without this, the message is "not logged in" about a CLI
+                    # the user can see is logged in -- true, and impossible to
+                    # act on.
+                    return 403, None, detail + _auth_help(sess.cli_id)
+                return 502, None, detail
+            if native_id:
+                sess.native_session_id = native_id
+            sess.turn_count += 1
+            return 200, result_text, None
     finally:
         sess.turn_lock.release()
 
@@ -1361,6 +1439,15 @@ def _claude_stream_events(line):
     if etype == "system" and isinstance(ev.get("session_id"), str):
         out.append({"_native": ev["session_id"]})
     elif etype == "assistant":
+        # MEASURED: an auth failure ("Not logged in · Please run /login")
+        # arrives as a normal-looking assistant event carrying that text as a
+        # content block, distinguished only by a SIBLING field on the outer
+        # event -- is_api_error_message: true, error: "authentication_failed".
+        # Not checking it meant the failure streamed to the chat exactly like
+        # a real (if useless) answer. The terminal "result" event below
+        # carries the authoritative text via _final_error; skip this one.
+        if ev.get("is_api_error_message"):
+            return out
         msg = ev.get("message") or {}
         for block in (msg.get("content") or []):
             if not isinstance(block, dict):
@@ -1375,11 +1462,16 @@ def _claude_stream_events(line):
     elif etype == "result":
         if isinstance(ev.get("session_id"), str):
             out.append({"_native": ev["session_id"]})
-        res = ev.get("result")
-        if isinstance(res, str) and res:
-            out.append({"_final": res})
-            if not ev.get("is_error"):
-                out.append({"event": "message", "text": res})
+        text = _claude_result_text(ev)
+        if text:
+            if ev.get("is_error"):
+                # A failure with real text (an execution error, an errors[]
+                # array) is not a reply -- send_message_stream treats
+                # _final_error as a terminal ERROR, distinct from _final.
+                out.append({"_final_error": text})
+            else:
+                out.append({"_final": text})
+                out.append({"event": "message", "text": text})
     return out
 
 
@@ -1431,72 +1523,108 @@ def send_message_stream(session_id, text):
             ok, detail = _verify_claude_binary_identity(bin_path)
             if not ok:
                 yield err(_BINARY_IDENTITY_FAIL_STATUS, detail); return
-        argv = _build_argv(sess, bin_path, text, stream=True)
-        try:
-            proc = subprocess.Popen(
-                argv, cwd=sess.project_dir, env=_agentic_env(sess.cli_id),
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", bufsize=1,
-                **_tree_popen_kwargs())
-        except (OSError, ValueError) as exc:
-            yield err(502, "%s failed to start: %s" % (sess.cli_id, exc.__class__.__name__)); return
-        sess.last_interrupted = False
-        with sess.proc_lock:
-            sess.proc = proc
-
-        # Drain stderr in a background thread so a full stderr pipe can never
-        # deadlock the stdout read loop (codex/claude both log a lot to stderr).
-        def _drain():
-            try:
-                for l in proc.stderr:
-                    stderr_buf.append(l)
-                    if len(stderr_buf) > 200:
-                        del stderr_buf[0]
-            except Exception:
-                pass
-        threading.Thread(target=_drain, daemon=True).start()
-
-        def _kill_on_timeout():
-            timed_out[0] = True
-            _terminate(proc)
-        timer = threading.Timer(_TURN_TIMEOUT, _kill_on_timeout)
-        timer.daemon = True
-        timer.start()
 
         parse = {"codex": _codex_stream_events,
                  "opencode": _opencode_stream_events}.get(sess.cli_id, _claude_stream_events)
-        native_id = None
-        final_text = None
-        try:
-            for line in proc.stdout:
-                for e in parse(line):
-                    if "_native" in e:
-                        native_id = e["_native"]
-                    if "_final" in e:
-                        final_text = e["_final"]
-                    if e.get("event"):
-                        yield e
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=_KILL_GRACE)
-        except Exception:
-            pass
-        if timer:
-            timer.cancel()
-        if sess.last_interrupted:
-            yield {"event": "stopped"}; return
-        if timed_out[0]:
-            yield err(504, "%s timed out after %ds." % (sess.cli_id, _TURN_TIMEOUT)); return
-        if native_id:
-            sess.native_session_id = native_id
-        if final_text is None:
-            detail = _sanitize("".join(stderr_buf).strip(), 400) or ("%s produced no reply." % sess.cli_id)
-            if _looks_like_auth_error(detail):
-                yield err(403, detail + _auth_help(sess.cli_id)); return
-            yield err(502, detail); return
-        sess.turn_count += 1
-        yield {"event": "done", "text": _sanitize(final_text), "native": native_id}
+        # Same one-retry, stale-resume-only recovery as send_message() -- see
+        # the comment there for the measured per-CLI error text this catches.
+        # The retry is safe to run silently here too: the failure happens at
+        # num_turns=0, before any tool ran or any text streamed, so nothing
+        # user-visible has to be un-shown.
+        stale_retry_used = False
+        while True:
+            was_resume = bool(sess.native_session_id)
+            argv = _build_argv(sess, bin_path, text, stream=True)
+            try:
+                proc = subprocess.Popen(
+                    argv, cwd=sess.project_dir, env=_agentic_env(sess.cli_id),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace", bufsize=1,
+                    **_tree_popen_kwargs())
+            except (OSError, ValueError) as exc:
+                yield err(502, "%s failed to start: %s" % (sess.cli_id, exc.__class__.__name__)); return
+            sess.last_interrupted = False
+            with sess.proc_lock:
+                sess.proc = proc
+
+            stderr_buf[:] = []
+            drain_done = threading.Event()
+            # Drain stderr in a background thread so a full stderr pipe can
+            # never deadlock the stdout read loop (codex/claude both log a lot
+            # to stderr).
+            def _drain():
+                try:
+                    for l in proc.stderr:
+                        stderr_buf.append(l)
+                        if len(stderr_buf) > 200:
+                            del stderr_buf[0]
+                except Exception:
+                    pass
+                finally:
+                    drain_done.set()
+            threading.Thread(target=_drain, daemon=True).start()
+
+            timed_out[0] = False
+            def _kill_on_timeout():
+                timed_out[0] = True
+                _terminate(proc)
+            timer = threading.Timer(_TURN_TIMEOUT, _kill_on_timeout)
+            timer.daemon = True
+            timer.start()
+
+            native_id = None
+            final_text = None
+            final_error = None
+            try:
+                for line in proc.stdout:
+                    for e in parse(line):
+                        if "_native" in e:
+                            native_id = e["_native"]
+                        if "_final" in e:
+                            final_text = e["_final"]
+                        if "_final_error" in e:
+                            final_error = e["_final_error"]
+                        if e.get("event"):
+                            yield e
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=_KILL_GRACE)
+            except Exception:
+                pass
+            if timer:
+                timer.cancel()
+            # The stdout loop above only returns once the process has closed
+            # stdout, which happens at or after it closes stderr too -- but
+            # the DRAIN THREAD reading stderr is a separate scheduling unit,
+            # so without this wait, reading stderr_buf next can race it and
+            # see an empty list even though the text WAS written. Bounded
+            # short: this is a thread that is already almost certainly done,
+            # not a process we are waiting on.
+            drain_done.wait(timeout=0.5)
+            if sess.last_interrupted:
+                yield {"event": "stopped"}; return
+            if timed_out[0]:
+                yield err(504, "%s timed out after %ds." % (sess.cli_id, _TURN_TIMEOUT)); return
+
+            stderr_text = _sanitize("".join(stderr_buf).strip(), 400)
+            stale_source = final_error or stderr_text
+            if (final_text is None and was_resume and not stale_retry_used
+                    and _is_stale_resume_error(sess.cli_id, stale_source)):
+                sess.native_session_id = None
+                stale_retry_used = True
+                continue
+
+            if native_id:
+                sess.native_session_id = native_id
+            if final_text is None:
+                detail = final_error or stderr_text or ("%s produced no reply." % sess.cli_id)
+                if _looks_like_auth_error(detail):
+                    yield err(403, detail + _auth_help(sess.cli_id)); return
+                yield err(502, detail); return
+            sess.turn_count += 1
+            yield {"event": "done", "text": _sanitize(final_text), "native": native_id}
+            return
     finally:
         if timer:
             timer.cancel()
