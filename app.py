@@ -13564,11 +13564,23 @@ def _do_update_check():
                 _log.info("Auto-update: pulled %s->%s but hub-mode is off; deferring re-exec.",
                          before[:7], after[:7])
                 return _auto_update_state["last_result"]
-            _auto_update_state["last_result"] = "updated %s->%s — restarting" % (before[:7], after[:7])
             _auto_update_state["updating"] = True
-            _log.info("Auto-update: new commits pulled (%s -> %s), re-executing.",
-                     before[:7], after[:7])
-            _reexec_soon()
+            busy = _agentic_busy_session_ids()
+            with _runtime_condition:
+                inflight = _runtime_active[0]
+            if not busy and not inflight:
+                _auto_update_state["last_result"] = "updated %s->%s — restarting" % (before[:7], after[:7])
+                _log.info("Auto-update: new commits pulled (%s -> %s), re-executing.",
+                         before[:7], after[:7])
+                _reexec_soon()
+            else:
+                _auto_update_state["last_result"] = (
+                    "updated %s->%s — restart deferred: %d task(s) still running"
+                    % (before[:7], after[:7], len(busy) + (1 if inflight else 0)))
+                _log.info("Auto-update: pulled %s->%s but %d session(s)/%d inflight request(s) "
+                         "busy; deferring restart until they finish.",
+                         before[:7], after[:7], len(busy), inflight)
+                _reexec_when_idle(busy)
             return _auto_update_state["last_result"]
         _auto_update_state["last_result"] = "up to date (%s)" % (after[:7] if after else "?")
         return _auto_update_state["last_result"]
@@ -13585,6 +13597,46 @@ def _reexec_soon():
             _log.error("Auto-update re-exec failed: %s", exc)
             _auto_update_state["updating"] = False
     threading.Thread(target=_go, daemon=True).start()
+
+
+def _agentic_busy_session_ids():
+    """Agent chat session ids currently mid-turn (turn_lock held), snapshotted
+    right now. A re-exec kills every in-flight connection outright (no HTTP
+    response, no SSE event) -- an active agentic turn can legitimately run up
+    to _TURN_TIMEOUT (1800s), so restarting out from under one is exactly the
+    "stopped my work" a user would notice and be annoyed by."""
+    ids = set()
+    for sid, sess in list(agentic_chat._REGISTRY.items()):
+        try:
+            if sess.turn_lock.locked():
+                ids.add(sid)
+        except Exception:                                          # noqa: BLE001
+            continue
+    return ids
+
+
+def _reexec_when_idle(busy_snapshot):
+    """Restart once every session busy AT UPDATE-CHECK TIME (plus any request
+    already in flight on /v1/*) has finished -- and not a moment later, even
+    if the hub stays continuously busy. Deliberately does NOT wait for
+    sessions that START after the snapshot: an always-on hub could otherwise
+    defer forever and the pulled code would never actually apply."""
+    def _go():
+        while True:
+            still_busy = {sid for sid in busy_snapshot
+                          if sid in agentic_chat._REGISTRY
+                          and agentic_chat._REGISTRY[sid].turn_lock.locked()}
+            with _runtime_condition:
+                inflight = _runtime_active[0]
+            if not still_busy and not inflight:
+                break
+            _auto_update_state["last_result"] = (
+                "update pulled — restart deferred: %d task(s) still running"
+                % (len(still_busy) + (1 if inflight else 0)))
+            time.sleep(3.0)
+        _log.info("Auto-update: deferred restart proceeding — snapshotted tasks are done.")
+        _reexec_soon()
+    threading.Thread(target=_go, daemon=True, name="freehub-update-wait").start()
 
 
 def _auto_update_loop():
