@@ -20,6 +20,10 @@ import agentic_history as ah
 import app
 
 
+HTML = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "templates", "index.html"), encoding="utf-8").read()
+
+
 @pytest.fixture
 def proj():
     d = tempfile.mkdtemp(prefix="hubres-")
@@ -139,6 +143,29 @@ def test_resume_route_rebuilds_from_stored_history(client, proj):
         ah.delete_conversation("resume-route-1")
 
 
+def test_resume_reports_the_real_persisted_turn_count_not_zero(client, proj):
+    """THE BUG (found live): resume_session() always hands back a fresh Session
+    object -- turn_count starts at 0 and only increments as turns play through
+    THAT object. The route reported this raw in-memory value, so every resume
+    (after a restart, or "Continue" from History) said turn_count: 0 even with
+    a real transcript on disk, and the frontend's `if (!r.turn_count) return`
+    gate never loaded it -- reopening a finished, multi-turn session showed
+    the same empty placeholder as one that had never run anything."""
+    ah.record_turn("resume-route-count", "codex", proj, "user", "build it")
+    ah.record_turn("resume-route-count", "codex", proj, "agent", "built",
+                   native_session_id="THREAD-COUNT")
+    try:
+        r = client.post("/api/agent/sessions/resume-route-count/resume",
+                        json={}, headers=_auth())
+        if r.status_code == 403:
+            pytest.skip("agentic chat master flag is off on this machine")
+        assert r.status_code == 200, r.get_data(as_text=True)
+        assert r.get_json()["turn_count"] == 2
+        ac.end_session("resume-route-count")
+    finally:
+        ah.delete_conversation("resume-route-count")
+
+
 def test_resume_is_honest_when_there_is_no_saved_thread(client, proj):
     """Conversations recorded before this fix have no id. Reopening them is
     still useful — the files are there — but the model does NOT have the
@@ -161,6 +188,63 @@ def test_resume_of_an_unknown_conversation_404s(client):
     r = client.post("/api/agent/sessions/definitely-not-here/resume",
                     json={}, headers=_auth())
     assert r.status_code in (403, 404)
+
+
+# --------------------------------------------------------------------------- #
+# The frontend half: reopening a session mid-turn must not look abandoned.
+#
+# THE BUG (reported live): a long first turn was still genuinely running
+# (real work, confirmed via the CLI's own on-disk rollout -- not stuck) but
+# reopening its /agent/<id> URL showed the plain "Send a message to start
+# working" placeholder, identical to a session that never ran anything.
+# get_session()/the /resume route already returned currently_running; the
+# frontend just never read it -- it only branched on turn_count, which stays
+# 0 until a turn actually FINISHES, so the turn most likely to look
+# abandoned (a long one, already many minutes in) was exactly the one this
+# hit hardest.
+# --------------------------------------------------------------------------- #
+
+def _fn_body(marker, end_marker):
+    start = HTML.index(marker)
+    return HTML[start:HTML.index(end_marker, start)]
+
+
+def test_resume_branches_on_currently_running_before_the_turn_count_check():
+    fn = _fn_body("window.cxResumeAgentSession = function(r){", "};")
+    running_idx = fn.index("r.currently_running")
+    turn_count_idx = fn.index("r.turn_count")
+    assert running_idx < turn_count_idx, \
+        "currently_running must be checked before the turn_count early-return"
+
+
+def test_reconnecting_mid_turn_does_not_show_the_empty_placeholder():
+    fn = _fn_body("function showReconnectedStillWorking(sid){", "\n    }")
+    assert "Still working" in fn
+    assert "SPIN_SVG" in fn
+
+
+def test_reconnecting_mid_turn_locks_the_ui_like_a_real_in_flight_turn():
+    """Send disabled, Stop enabled -- the same doStop() already works against
+    any session_id, so Stop must actually be clickable here, not just look
+    like it is."""
+    fn = _fn_body("function showReconnectedStillWorking(sid){", "\n    }")
+    assert "setBusy(true)" in fn
+
+
+def test_the_reconnect_poll_loads_real_history_once_the_turn_actually_ends():
+    fn = _fn_body("function showReconnectedStillWorking(sid){", "\n    }")
+    assert "currently_running" in fn
+    assert "loadFullHistory(sid)" in fn
+    assert "setBusy(false)" in fn
+
+
+def test_the_reconnect_poll_stops_if_the_user_moves_to_a_different_session():
+    """Without this, an abandoned poll from a session the user has since
+    navigated away from keeps firing forever and can stomp the NEW session's
+    UI state with a stale currently_running check."""
+    fn = _fn_body("function showReconnectedStillWorking(sid){", "\n    }")
+    assert "sessionId !== sid" in fn
+    assert "clearInterval(poll)" in fn
 
 
 def test_resume_refuses_a_folder_that_is_gone(client):

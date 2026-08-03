@@ -7824,6 +7824,10 @@ def api_agent_resume_session(session_id):
         payload.update(exc.extra)
         return jsonify(payload), exc.status
     row = agentic_chat.get_session(sid) or {}
+    # turn_count on a just-rebuilt session is always 0 -- it's a fresh Session
+    # object with no turns played through it yet. The real count is what's
+    # already sitting in the conversation this route just loaded from disk.
+    row["turn_count"] = len(conv.get("turns") or [])
     # Honest about which kind of continue this is: with a thread id the model
     # still has the conversation; without one it only has the files on disk.
     row["resumed_thread"] = bool(native)
