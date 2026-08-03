@@ -102,6 +102,7 @@ shutil, signal, subprocess, threading, time, uuid.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -115,6 +116,8 @@ import config
 import craft
 import vision_status
 import workspace
+
+_log = logging.getLogger("free-llm-hub")
 
 # --------------------------------------------------------------------------- #
 # Config / constants
@@ -1842,6 +1845,66 @@ def _claude_stream_events(line):
     return out
 
 
+def _last_assistant_text_from_transcript(path):
+    """The last real assistant text block in a claude session's OWN persisted
+    JSONL transcript (~/.claude-style projects/<encoded-path>/<session-id>.jsonl
+    -- a format DISTINCT from --output-format stream-json, written by the CLI
+    itself as it goes, independent of whatever it did or didn't flush to this
+    process's stdout pipe). Tolerant of a partial/truncated last line (a kill
+    mid-write) and of lines that aren't the shape expected at all -- this is
+    read-only forensics on a file this hub does not control the format of,
+    never allowed to raise."""
+    last_text = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict) or ev.get("type") != "assistant":
+                    continue
+                msg = ev.get("message")
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    continue
+                for block in (msg.get("content") or []):
+                    if (isinstance(block, dict) and block.get("type") == "text"
+                            and block.get("text")):
+                        last_text = block["text"]
+    except OSError:
+        return None
+    return last_text
+
+
+def _recover_text_from_claude_transcript(config_dir, native_id):
+    """LAST RESORT when the hub's own stdout capture came back with NOTHING
+    usable at all (no clean result event, no streamed message text either) --
+    MEASURED TWICE on real production turns that hit an unresolvable
+    permission gate: the reply the user needed was sitting in claude's own
+    on-disk session log the entire time. Matches by native_id (session_id),
+    the one stable identifier already captured from the stream's own init
+    event, via a filename search -- NOT by reconstructing Claude Code's
+    internal project-path encoding scheme, which is undocumented and not
+    this hub's to depend on. Never raises; returns None on anything short of
+    a clean recovery, same contract as every other fallback in this file."""
+    if not native_id or not config_dir:
+        return None
+    target = native_id + ".jsonl"
+    try:
+        base = os.path.join(config_dir, "projects")
+        if not os.path.isdir(base):
+            return None
+        for root, _dirs, files in os.walk(base):
+            if target in files:
+                return _last_assistant_text_from_transcript(os.path.join(root, target))
+    except OSError:
+        return None
+    return None
+
+
 def send_message_stream(session_id, text):
     """Generator: run ONE turn, yielding normalized progress events as they occur.
     Same validation / turn-lock / tree-kill model as send_message(). Always ends
@@ -1920,9 +1983,10 @@ def send_message_stream(session_id, text):
         while True:
             was_resume = bool(sess.native_session_id)
             argv = _build_argv(sess, bin_path, text, stream=True)
+            child_env = _agentic_env(sess.cli_id, sess.project_dir)
             try:
                 proc = subprocess.Popen(
-                    argv, cwd=sess.project_dir, env=_agentic_env(sess.cli_id, sess.project_dir),
+                    argv, cwd=sess.project_dir, env=child_env,
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, encoding="utf-8", errors="replace", bufsize=1,
                     **_tree_popen_kwargs())
@@ -1974,8 +2038,13 @@ def send_message_stream(session_id, text):
                             last_message_text = e["text"]
                         if e.get("event"):
                             yield e
-            except Exception:
-                pass
+            except Exception as exc:
+                # Was a silent `pass` -- a decode error or broken pipe here
+                # left zero trace, indistinguishable from "the process just
+                # legitimately produced nothing." Log it so the next "no
+                # reply" report can tell those two apart.
+                _log.warning("agentic stream read failed (session=%s cli=%s): %r",
+                             sess.id, sess.cli_id, exc)
             try:
                 proc.wait(timeout=_KILL_GRACE)
             except Exception:
@@ -2003,6 +2072,23 @@ def send_message_stream(session_id, text):
                 # -- so final_text stayed None and a real, useful reply was
                 # reported as "produced no reply" and silently discarded.
                 final_text = last_message_text
+            if final_text is None and final_error is None and native_id and sess.cli_id == "claude":
+                # LAST RESORT, one tier further: MEASURED TWICE on real
+                # production turns, the hub's OWN stdout capture came back
+                # with NOTHING usable at all (no _final, no last_message_text
+                # either -- the permission-denial recovery text never even
+                # reached this process's pipe, likely lost with whatever
+                # buffered-but-unflushed stdout the child held when it ended)
+                # while claude's OWN persisted session transcript on disk had
+                # the real reply the whole time. Recovered by native_id (the
+                # one stable id already captured from the stream's own init
+                # event) rather than by reconstructing Claude Code's internal
+                # project-path encoding, which is undocumented and not this
+                # hub's to depend on.
+                recovered = _recover_text_from_claude_transcript(
+                    child_env.get("CLAUDE_CONFIG_DIR"), native_id)
+                if recovered:
+                    final_text = recovered
             if sess.last_interrupted:
                 yield {"event": "stopped"}; return
             if timed_out[0]:
@@ -2026,6 +2112,25 @@ def send_message_stream(session_id, text):
                          % (sess.cli_id, _TURN_TIMEOUT)); return
 
             stderr_text = _sanitize("".join(stderr_buf).strip(), 400)
+            if final_text is None and final_error is None:
+                # Black-box recorder: every fallback tier (last-streamed-text,
+                # disk-transcript recovery) already ran above and STILL came
+                # up empty. Log the raw state so a real "no reply" report can
+                # be diagnosed from THIS run's own log lines instead of
+                # re-guessing from the CLI's on-disk transcript after the
+                # fact -- that transcript is a different artifact and has
+                # already been observed to show clean, complete replies on a
+                # turn the hub itself reported as empty.
+                try:
+                    _log.warning(
+                        "no-reply fallback exhausted (session=%s cli=%s): "
+                        "native_id=%r last_message_text=%r returncode=%r "
+                        "timed_out=%r stderr_buf=%r",
+                        getattr(sess, "id", "?"), sess.cli_id, native_id,
+                        (last_message_text[:200] if last_message_text else last_message_text),
+                        proc.returncode, timed_out[0], "".join(stderr_buf)[:2000])
+                except Exception:
+                    pass
             stale_source = final_error or stderr_text
             if (final_text is None and was_resume and not stale_retry_used
                     and _is_stale_resume_error(sess.cli_id, stale_source)):
