@@ -1837,20 +1837,30 @@ def _is_fast(pid, model):
 # back on its own.
 #
 # Deliberately NOT tracked here: 429 (quota — that's quota.mark_throttled's job,
-# the model is fine) and 5xx (transient upstream). 402/403/404 are treated as
+# the model is fine) and 5xx (transient upstream). 402/403/404/410 are treated as
 # "this exact model is unusable with this key", because they are unambiguous:
 #   404 = model doesn't exist on this provider (e.g. aiand/glm-5.2),
+#   410 = model existed and is now permanently gone (e.g. nvidia/qwen3-next-
+#         80b-a3b-instruct: still listed in /models, 410s on every generation) --
+#         a STRONGER signal than 404, not a lesser one,
 #   403 = this key has no access to it,
 #   402 = payment required / insufficient credits — a trial provider with no free
 #         balance (e.g. aiand/deepseek-v4) that would 402 EVERY turn otherwise.
 # 400 is NOT auto-sidelined: it is just as often a bad payload as a bad model,
 # and blocklisting a good model off one malformed request would be worse.
 # All self-heal: entries expire after the TTL, so a topped-up/restored model returns.
+#
+# THE BUG a missing 410 caused (found live): a dead model sitting in a hop chain
+# doesn't just waste that one hop -- _retryable() correctly refuses to retry a
+# 410, which sets last_hard for the WHOLE request, which defeats the bonus
+# whole-chain retry a few lines down (it only fires when NOTHING hard failed).
+# So one never-excluded dead model turned "every other hop was a survivable
+# 429" into a hard 503 on every single request that happened to draw it.
 # --------------------------------------------------------------------------- #
 _DEAD_MODEL_TTL = 6 * 3600         # 6h, then re-probe (token fixed? model back?)
 _dead_models = {}                  # (pid, model) -> expiry epoch
 _dead_lock = threading.Lock()
-_DEAD_STATUSES = (402, 403, 404)
+_DEAD_STATUSES = (402, 403, 404, 410)
 
 
 # --------------------------------------------------------------------------- #
