@@ -11315,6 +11315,18 @@ def v1_chat_completions():
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             last_error = _classify_hop_error(exc=exc)
+            if isinstance(exc, requests.exceptions.Timeout):
+                # A hop that TIMES OUT (unlike a fast-fail 429/400) can burn
+                # minutes doing it -- and an immediate retry of the same
+                # request (codex's own client-level retry on 503, or this
+                # chain's bonus whole-chain retry a bit further down) hits the
+                # SAME slow hop again, compounding into a long stall with zero
+                # progress. MEASURED 2026-08-03: nvidia/mistral-medium-3.5-128b
+                # ReadTimeout'd 4 times running, ~7 minutes each, while every
+                # other hop in the chain failed fast. Same short cooldown a
+                # 429 already gets, so the NEXT chain build skips it long
+                # enough for a retry to reach a hop that actually responds.
+                quota.mark_throttled(hop_pid, 60)
             continue
         if resp.status_code == 200:
             if stream and is_sub_hop:
@@ -11938,6 +11950,18 @@ def v1_responses(_retry_pass=False):
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             last_error = _classify_hop_error(exc=exc)
+            if isinstance(exc, requests.exceptions.Timeout):
+                # A hop that TIMES OUT (unlike a fast-fail 429/400) can burn
+                # minutes doing it -- and an immediate retry of the same
+                # request (codex's own client-level retry on 503, or this
+                # chain's bonus whole-chain retry a bit further down) hits the
+                # SAME slow hop again, compounding into a long stall with zero
+                # progress. MEASURED 2026-08-03: nvidia/mistral-medium-3.5-128b
+                # ReadTimeout'd 4 times running, ~7 minutes each, while every
+                # other hop in the chain failed fast. Same short cooldown a
+                # 429 already gets, so the NEXT chain build skips it long
+                # enough for a retry to reach a hop that actually responds.
+                quota.mark_throttled(hop_pid, 60)
             continue
         if resp.status_code == 200:
             # Echo back the id the client ASKED for (codex sends "auto", which now has
@@ -12538,6 +12562,18 @@ def v1_messages():
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             last_error = _classify_hop_error(exc=exc)
+            if isinstance(exc, requests.exceptions.Timeout):
+                # A hop that TIMES OUT (unlike a fast-fail 429/400) can burn
+                # minutes doing it -- and an immediate retry of the same
+                # request (codex's own client-level retry on 503, or this
+                # chain's bonus whole-chain retry a bit further down) hits the
+                # SAME slow hop again, compounding into a long stall with zero
+                # progress. MEASURED 2026-08-03: nvidia/mistral-medium-3.5-128b
+                # ReadTimeout'd 4 times running, ~7 minutes each, while every
+                # other hop in the chain failed fast. Same short cooldown a
+                # 429 already gets, so the NEXT chain build skips it long
+                # enough for a retry to reach a hop that actually responds.
+                quota.mark_throttled(hop_pid, 60)
             continue
         if resp.status_code == 200:
             model_str = requested_model or (hop_pid + "/" + hop_model)
