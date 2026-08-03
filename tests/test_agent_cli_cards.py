@@ -165,6 +165,46 @@ def test_image_providers_is_not_in_the_sidebar_but_its_page_still_works(client):
 
 
 # --------------------------------------------------------------------------- #
+# Claude Code pulled from the /agent picker on request -- kept failing with
+# "no reply" in real use. This is a FRONTEND-ONLY removal: the picker stops
+# offering it, but agentic_chat.py's actual claude support (and any already-
+# saved default_cli="claude" from before this) is untouched -- see
+# test_a_stored_choice_that_stops_being_drivable_is_ignored above for the
+# backend's own half of exactly this fallback contract.
+# --------------------------------------------------------------------------- #
+
+def test_claude_is_no_longer_offered_in_the_cli_picker():
+    picker_label_line = HTML[HTML.index("var CLI_LABEL = {"):]
+    picker_label_line = picker_label_line[:picker_label_line.index("}") + 1]
+    assert "claude" not in picker_label_line
+    assert "codex" in picker_label_line and "opencode" in picker_label_line
+
+def test_a_stale_saved_claude_default_falls_back_to_codex_not_a_dead_card():
+    """currentCli() must not hand back a CLI id that CLI_LABEL no longer has an
+    entry for -- that would select nothing (no card matches) instead of
+    falling back the way the backend's default_cli() already does."""
+    fn = HTML[HTML.index("function currentCli()"):]
+    fn = fn[:fn.index("\n  }") + 4]
+    assert "CLI_LABEL[cliChoice]" in fn
+    assert "CLI_LABEL[agentState.defaultCli]" in fn
+    assert "return 'codex'" in fn
+
+def test_the_permissions_disclaimer_no_longer_names_claude_code():
+    disclaimer = HTML[HTML.index('id="agent-warning"'):]
+    disclaimer = disclaimer[:disclaimer.index("</div>")]
+    assert "Claude Code" not in disclaimer
+    assert "Codex" in disclaimer
+
+def test_history_of_past_claude_sessions_still_shows_a_real_label():
+    """Removing claude from the PICKER must not make old sessions unreadable --
+    cliLabel() (history/session-info display) is a separate function on
+    purpose and must keep the mapping."""
+    fn = HTML[HTML.index("function cliLabel(id)"):]
+    fn = fn[:fn.index("\n    }") + 6]
+    assert "'Claude Code'" in fn
+
+
+# --------------------------------------------------------------------------- #
 # The release name
 # --------------------------------------------------------------------------- #
 

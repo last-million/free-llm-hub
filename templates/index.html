@@ -2321,7 +2321,7 @@
          child of it, so it is always on screen regardless of view-switching.
          Never gate this behind the master switch, a <details>, or JS visibility logic. -->
     <div class="agent-warning" id="agent-warning">
-      <strong>Full permissions.</strong> This runs your real Claude Code / Codex subscription with FULL file/command permissions in the folder you choose &mdash; it can create, edit, and delete files, and run shell commands, without asking first.
+      <strong>Full permissions.</strong> This runs your real Codex / OpenCode subscription with FULL file/command permissions in the folder you choose &mdash; it can create, edit, and delete files, and run shell commands, without asking first.
     </div>
     <div class="section-body" id="sec-agent">
       <div class="sub-master-row">
@@ -6260,15 +6260,25 @@
   /* One place naming the CLIs. It used to be a hardcoded ['claude','codex']
      list plus two separate ternaries for the label, so adding a third CLI
      meant finding all three -- and missing one leaves an <option> that never
-     gets its state (installed / isolated / unavailable) filled in. */
-  var CLI_LABEL = { claude: 'Claude Code', codex: 'ChatGPT Codex', opencode: 'OpenCode' };
+     gets its state (installed / isolated / unavailable) filled in.
+
+     Claude Code pulled from the /agent picker on request: it kept failing
+     with "no reply" in real use. cliLabel() below (used for HISTORY of
+     already-started sessions) deliberately still knows the name -- past
+     claude sessions must stay readable, only NEW ones stop being offered. */
+  var CLI_LABEL = { codex: 'ChatGPT Codex', opencode: 'OpenCode' };
 
   /* The selected CLI. Was a <select>.value; now a plain variable, because the
      cards ARE the control. Seeded from the server so a reload starts on the
-     CLI last chosen, on any browser. */
+     CLI last chosen, on any browser. Falls through to codex if the saved
+     choice or server default names a CLI no longer in CLI_LABEL (a stale
+     "claude" from before it was pulled) -- the picker must never end up
+     silently pointed at a card that no longer renders. */
   var cliChoice = null;
   function currentCli(){
-    return cliChoice || agentState.defaultCli || 'codex';
+    if (cliChoice && CLI_LABEL[cliChoice]) return cliChoice;
+    if (agentState.defaultCli && CLI_LABEL[agentState.defaultCli]) return agentState.defaultCli;
+    return 'codex';
   }
 
   function renderCliPicker(){
