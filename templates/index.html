@@ -1820,8 +1820,12 @@
      way and push the whole row wide. */
   .agent-chat-col .agent-term-line.run{ flex-wrap:wrap; }
   /* Without min-height:0 a flex child refuses to shrink below its content, so
-     the transcript pushes the whole split taller instead of scrolling. */
-  .agent-chat-col .chat-messages{ flex:1; min-height:0; overflow:auto; }
+     the transcript pushes the whole split taller instead of scrolling.
+     max-height:none overrides the base .chat-messages rule's 460px cap
+     (right for the plain /chat page, wrong here) -- uncapped, it left the
+     transcript box stuck short of the column's full height while the preview
+     box next to it filled the whole thing, so the two visibly mismatched. */
+  .agent-chat-col .chat-messages{ flex:1; min-height:0; max-height:none; overflow:auto; }
   .agent-preview-col{ display:flex; flex-direction:column; gap:8px; min-width:0; min-height:0;
     border:1px solid var(--border); border-radius:var(--radius); overflow:hidden;
     background:var(--surface); }

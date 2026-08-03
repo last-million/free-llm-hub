@@ -42,9 +42,16 @@ def test_pwd_is_left_alone_when_no_project_dir_is_given():
 def test_every_real_turn_spawn_passes_project_dir_to_agentic_env():
     """Two call sites actually spawn a turn (send_message, send_message_stream).
     Both must resync PWD -- fixing only one would leave the bug alive on
-    whichever path the fix missed."""
+    whichever path the fix missed.
+
+    send_message_stream later needed the same env dict again (to recover a
+    reply from claude's own on-disk transcript when its stdout capture comes
+    back empty -- see _recover_text_from_claude_transcript), so it now binds
+    the call to `child_env` first instead of inlining it straight into
+    Popen(); send_message's non-streaming path is unchanged. Matched without
+    the `env=` prefix so both shapes still count."""
     src = open(ac.__file__, encoding="utf-8", errors="replace").read()
-    assert src.count("env=_agentic_env(sess.cli_id, sess.project_dir)") == 2, (
+    assert src.count("_agentic_env(sess.cli_id, sess.project_dir)") == 2, (
         "expected both send_message() and send_message_stream() to resync PWD")
 
 
