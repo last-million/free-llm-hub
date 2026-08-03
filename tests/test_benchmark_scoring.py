@@ -249,6 +249,23 @@ def test_deepseek_v4_is_level_with_glm52_and_minimax_m3_sits_under_both():
         assert mm3 > app._benchmark_score("p", weaker), weaker
 
 
+def test_deepseek_v4_flash_beats_the_pro_variant():
+    """USER CORRECTION 2026-08-03: "deepseek v4 flash is better than the pro --
+    the pro is LESS than the flash." The opposite order from Gemini (where pro
+    beats flash) -- confirms the two families are judged independently, not
+    via one shared "pro always wins" rule.
+
+    Flash keeps the family's established level (equal to glm-5.2, per the
+    still-standing "same level" instruction); pro drops one notch below it but
+    must stay above minimax-m3, which sits "almost like deepseek 4"."""
+    glm = app._benchmark_score("p", "glm-5.2")
+    flash = app._benchmark_score("p", "deepseek-v4-flash")
+    pro = app._benchmark_score("p", "deepseek-v4-pro")
+    mm3 = app._benchmark_score("p", "minimax-m3")
+    assert flash == glm, "flash must keep the family's established level"
+    assert flash > pro > mm3, (flash, pro, mm3)
+
+
 def test_the_named_top_four_still_outrank_them():
     """The new floors must not displace the ranking the user set earlier."""
     ds4 = app._benchmark_score("p", "deepseek-v4")

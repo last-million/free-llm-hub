@@ -1174,8 +1174,15 @@ def _benchmark_score(pid, model_id):
     # puts both above the whole qwen/mimo field without displacing the named top
     # four (claude 138 / gpt-5.x 135-137 / kimi-k3 134.8 / hy3 134.5).
     # mimo-2.5 needs no rule: it sits at 100 and is already under all of them.
+    #
+    # USER CORRECTION 2026-08-03: "deepseek v4 flash is better than the pro --
+    # the pro is LESS than the flash." Unlike Gemini (pro > flash, see below),
+    # DeepSeek V4 is the other way round. Flash (and any unlabeled v4 id) keeps
+    # the family's established level -- same as glm-5.2, per the instruction
+    # above, unretracted -- and -pro drops one notch below it, still a hair
+    # above minimax-m3's "almost like deepseek 4" floor.
     if _DSV4_RE.search(low):
-        score = max(score, _PREF_FLOORS[9])
+        score = max(score, _PREF_FLOORS[9] - (0.5 if "pro" in low else 0))
     if _MINIMAX3_RE.search(low):
         score = max(score, _PREF_FLOORS[10])
     # USER PREFERENCE 2026-08-01: "gemini flash or pro 3.1, 3.5, 3.6 and up are
