@@ -27,6 +27,9 @@ Fix: track the last streamed message text; if the stream ends with no clean
 (native_id is still captured from the stream's own `system` init event
 either way).
 """
+import json
+import os
+import tempfile
 import threading
 
 import pytest
@@ -173,6 +176,116 @@ def test_no_text_at_all_still_reports_no_reply(registered_session, monkeypatch):
     monkeypatch.setattr(ac.subprocess, "Popen", lambda argv, **kw: _DiesAfterTextProc(lines))
 
     events = list(ac.send_message_stream(sid, "hello"))
+
+    errors = [e for e in events if e.get("event") == "error"]
+    assert errors and "no reply" in errors[0]["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# Third fallback tier: MEASURED TWICE live -- the hub's own stdout capture
+# came back with NOTHING at all (no clean result, no streamed message text
+# either), while claude's OWN on-disk session transcript had the real reply
+# the whole time. This is a DIFFERENT, worse failure than the one above: not
+# "text streamed then the process died before a clean summary", but "the
+# hub's pipe never received the text at all" -- yet the CLI's own persisted
+# log, a completely separate write path, still has it.
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def fake_claude_config_dir():
+    d = tempfile.mkdtemp(prefix="hub-pytest-claudecfg-")
+    try:
+        yield d
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _write_transcript(config_dir, native_id, assistant_texts):
+    proj_dir = os.path.join(config_dir, "projects", "some-encoded-project-path")
+    os.makedirs(proj_dir, exist_ok=True)
+    path = os.path.join(proj_dir, native_id + ".jsonl")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}) + "\n")
+        for t in assistant_texts:
+            fh.write(json.dumps({"type": "assistant",
+                                 "message": {"role": "assistant",
+                                            "content": [{"type": "text", "text": t}]}}) + "\n")
+    return path
+
+
+def test_last_assistant_text_from_transcript_returns_the_last_one(fake_claude_config_dir):
+    path = _write_transcript(fake_claude_config_dir, "thread-1", ["first note", "final answer"])
+    assert ac._last_assistant_text_from_transcript(path) == "final answer"
+
+
+def test_last_assistant_text_from_transcript_tolerates_a_truncated_last_line(fake_claude_config_dir):
+    path = _write_transcript(fake_claude_config_dir, "thread-2", ["good answer"])
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write('{"type":"assistant","message":{"role":"assistant","content":[{"typ')  # cut off, no \n
+    assert ac._last_assistant_text_from_transcript(path) == "good answer"
+
+
+def test_last_assistant_text_from_transcript_missing_file_returns_none():
+    assert ac._last_assistant_text_from_transcript("C:\\does\\not\\exist.jsonl") is None
+
+
+def test_recover_finds_the_file_by_native_id_not_by_guessing_the_path_encoding(fake_claude_config_dir):
+    _write_transcript(fake_claude_config_dir, "abc-123-real-thread", ["the real reply"])
+    got = ac._recover_text_from_claude_transcript(fake_claude_config_dir, "abc-123-real-thread")
+    assert got == "the real reply"
+
+
+def test_recover_returns_none_when_no_matching_transcript_exists(fake_claude_config_dir):
+    assert ac._recover_text_from_claude_transcript(fake_claude_config_dir, "never-written") is None
+
+
+def test_recover_returns_none_for_missing_native_id_or_config_dir(fake_claude_config_dir):
+    assert ac._recover_text_from_claude_transcript(fake_claude_config_dir, None) is None
+    assert ac._recover_text_from_claude_transcript(None, "some-id") is None
+
+
+def test_recover_never_raises_when_projects_dir_does_not_exist():
+    empty = tempfile.mkdtemp(prefix="hub-pytest-noproj-")
+    assert ac._recover_text_from_claude_transcript(empty, "any-id") is None
+
+
+def test_send_message_stream_recovers_from_disk_when_stdout_has_nothing_at_all(
+        registered_session, monkeypatch, fake_claude_config_dir):
+    """The worst case, measured live: stdout carried ONLY the init line (so
+    native_id IS known) -- no message text, no result, nothing else -- while
+    the CLI's own transcript on disk has the real reply. Full integration
+    through send_message_stream, not just the helper in isolation."""
+    sid, sess = registered_session(cli_id="claude", native_session_id=None)
+    _write_transcript(fake_claude_config_dir, "disk-only-thread",
+                      ["Write permission isn't granted yet. Should I proceed?"])
+    monkeypatch.setattr(ac, "_agentic_env",
+                        lambda cli_id, project_dir=None: {"CLAUDE_CONFIG_DIR": fake_claude_config_dir})
+    lines = ['{"type":"system","session_id":"disk-only-thread"}\n']
+    monkeypatch.setattr(ac.subprocess, "Popen", lambda argv, **kw: _DiesAfterTextProc(lines))
+
+    events = list(ac.send_message_stream(sid, "build me a store"))
+
+    errors = [e for e in events if e.get("event") == "error"]
+    done = [e for e in events if e.get("event") == "done"]
+    assert not errors, "a reply recoverable from disk must not be reported as an error: %r" % errors
+    assert done and "Should I proceed" in done[0]["text"]
+    assert sess.native_session_id == "disk-only-thread"
+
+
+def test_send_message_stream_disk_recovery_is_claude_only(registered_session, monkeypatch,
+                                                           fake_claude_config_dir):
+    """codex/opencode have their own transcript formats this hub does not
+    parse -- the disk-recovery tier must not fire for them and pretend to
+    find something in a file shape it never wrote."""
+    sid, sess = registered_session(cli_id="codex", native_session_id=None)
+    _write_transcript(fake_claude_config_dir, "codex-thread", ["should never be read"])
+    monkeypatch.setattr(ac, "_agentic_env",
+                        lambda cli_id, project_dir=None: {"CLAUDE_CONFIG_DIR": fake_claude_config_dir})
+    lines = ['{"type":"thread.started","thread_id":"codex-thread"}\n']
+    monkeypatch.setattr(ac.subprocess, "Popen", lambda argv, **kw: _DiesAfterTextProc(lines))
+
+    events = list(ac.send_message_stream(sid, "build me a store"))
 
     errors = [e for e in events if e.get("event") == "error"]
     assert errors and "no reply" in errors[0]["detail"]
