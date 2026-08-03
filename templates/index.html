@@ -6927,21 +6927,70 @@
 
     /* Exposed so the URL restorer (which runs outside this closure) can drop
        straight into an existing conversation, transcript and all. */
-    window.cxResumeAgentSession = function(r){
-      sessionId = r.session_id;
-      if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
-      showSessionState(r.cli, r.project_dir);
-      /* Only ask for history when there IS some. A brand-new session has no
-         record yet and the route 404s — harmless, caught below, but it put a
-         red error in the console on every fresh restore, which trains people to
-         ignore the console. */
-      if (!r.turn_count) return;
-      api('/api/agent/history/' + encodeURIComponent(r.session_id))
+    function loadFullHistory(sid){
+      api('/api/agent/history/' + encodeURIComponent(sid))
         .then(function(full){
           mountTranscript(msgsEl, full || {});
           if (full && (full.turns || []).length) checkpointBtn.disabled = false;
         })
         .catch(function(){});
+    }
+
+    /* MEASURED, reported live: a turn already running when the page loads (a
+       reload mid-turn, or opening the session URL fresh) left the chat panel
+       showing the plain "Send a message..." placeholder -- the SAME state as
+       a session that never ran anything. The only signal that distinguished
+       them, currently_running from the resume response, was never read.
+       "turn_count stays 0 until the turn actually finishes" made this worst
+       on exactly the turn most likely to look abandoned: a long first turn,
+       already 20+ minutes in on real free-tier routing, with nothing on
+       screen to say so. There is nothing to REPLAY -- the original stream's
+       events were never persisted mid-turn -- so this shows a clear "still
+       working" state instead and polls until it actually finishes, then
+       loads the real transcript the normal way. */
+    function showReconnectedStillWorking(sid){
+      msgsEl.innerHTML = '';
+      var wrap = document.createElement('div'); wrap.className = 'msg assistant';
+      var w = document.createElement('span'); w.className = 'who'; w.textContent = 'Agent';
+      var b = document.createElement('div'); b.className = 'bubble';
+      var term = document.createElement('div'); term.className = 'agent-term';
+      var head = document.createElement('div'); head.className = 'agent-term-line run';
+      head.innerHTML = SPIN_SVG + ' <span>Still working…</span>' +
+        ' <span class="agent-doing">reconnected — this turn was already running ' +
+        'before the page loaded. Free-tier routing can take several minutes; ' +
+        'this updates on its own once it finishes.</span>';
+      term.appendChild(head);
+      b.appendChild(term);
+      wrap.appendChild(w); wrap.appendChild(b);
+      msgsEl.appendChild(wrap);
+      setBusy(true);
+      var poll = setInterval(function(){
+        if (sessionId !== sid){ clearInterval(poll); return; }  // navigated away
+        api('/api/agent/sessions/' + encodeURIComponent(sid))
+          .then(function(s){
+            if (s && s.currently_running) return;
+            clearInterval(poll);
+            setBusy(false);
+            loadFullHistory(sid);
+          })
+          .catch(function(){ clearInterval(poll); setBusy(false); });
+      }, 4000);
+    }
+
+    window.cxResumeAgentSession = function(r){
+      sessionId = r.session_id;
+      if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
+      showSessionState(r.cli, r.project_dir);
+      if (r.currently_running){
+        showReconnectedStillWorking(r.session_id);
+        return;
+      }
+      /* Only ask for history when there IS some. A brand-new session has no
+         record yet and the route 404s — harmless, caught below, but it put a
+         red error in the console on every fresh restore, which trains people to
+         ignore the console. */
+      if (!r.turn_count) return;
+      loadFullHistory(r.session_id);
     };
 
     function showSessionState(cli, dir){
