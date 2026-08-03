@@ -104,6 +104,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import signal
@@ -112,6 +113,7 @@ import threading
 import time
 import uuid
 
+import agentic_history
 import config
 import craft
 import vision_status
@@ -2236,6 +2238,58 @@ def send_message_stream(session_id, text):
             if sess.proc is proc:
                 sess.proc = None
         sess.turn_lock.release()
+
+
+def send_message_stream_durable(session_id, text):
+    """Same external contract as send_message_stream (a generator yielding the
+    same normalized events, always ending the way that one does) but the real
+    turn runs on its own background thread instead of being driven by whoever
+    is reading this generator.
+
+    THE BUG THIS FIXES (found live): send_message_stream is a plain generator.
+    app.py's SSE route only calls next() on it -- and only reaches the code
+    that persists the agent's reply -- when Flask's WSGI layer is actively
+    writing to a connected client. If that client goes away mid-turn (tab
+    closed, laptop slept, network dropped) nothing ever pulls the generator
+    again: the underlying CLI process keeps running and genuinely finishes,
+    but the hub never notices, so a completed reply was silently thrown away.
+    Measured live: a real turn ran two full agent replies and exited clean,
+    with nothing in the wrong beyond the tab that started it going away --
+    and none of it was ever saved.
+
+    A background thread has no such dependency -- it keeps calling next() on
+    its own regardless of who, if anyone, is reading the queue it feeds. That
+    thread is what now persists the reply, so a turn survives being
+    unwatched. The queue itself still relays events live, so a client that
+    STAYS connected sees no difference at all."""
+    sess_info = get_session(session_id)
+    q = queue.Queue()
+
+    def _run():
+        final_reply = None
+        try:
+            for ev in send_message_stream(session_id, text):
+                q.put(ev)
+                if ev.get("event") == "done":
+                    final_reply = ev.get("text")
+        finally:
+            if sess_info and final_reply:
+                try:
+                    after = get_session(session_id) or {}
+                    agentic_history.record_turn(
+                        session_id, sess_info["cli"], sess_info["project_dir"],
+                        "agent", final_reply,
+                        native_session_id=after.get("native_session_id"))
+                except Exception:
+                    pass
+            q.put(None)          # sentinel: no more events, thread is done
+
+    threading.Thread(target=_run, daemon=True).start()
+    while True:
+        ev = q.get()
+        if ev is None:
+            return
+        yield ev
 
 
 def _tree_popen_kwargs():

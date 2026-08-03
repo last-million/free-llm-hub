@@ -7895,9 +7895,11 @@ def api_agent_send_message(session_id):
 
 @app.route("/api/agent/sessions/<session_id>/message/stream", methods=["POST"])
 def api_agent_send_message_stream(session_id):
-    """Live version of the message route: relays agentic_chat.send_message_stream's
-    normalized progress events over SSE so the dashboard shows the agent working in
-    real time. Records the user turn up front and the agent's final reply on done."""
+    """Live version of the message route: relays send_message_stream_durable's
+    normalized progress events over SSE so the dashboard shows the agent working
+    in real time. Records the user turn up front; the agent's reply is recorded
+    by the durable wrapper's own background thread once the turn actually ends,
+    whether or not this connection is still around to see it."""
     gate = _agent_gate()
     if gate:
         return gate
@@ -7911,25 +7913,19 @@ def api_agent_send_message_stream(session_id):
                                     "user", text)
 
     def gen():
-        final_reply = None
+        # The agent's reply is persisted from INSIDE send_message_stream_durable's
+        # own background thread now, not here -- this loop merely relays events
+        # to whoever is still connected. See its docstring: a plain generator
+        # driven only by this route would silently lose the reply if the client
+        # disconnected before the turn finished, even though the turn itself
+        # completed for real.
         try:
-            for ev in agentic_chat.send_message_stream(session_id, text):
-                if ev.get("event") == "done":
-                    final_reply = ev.get("text")
+            for ev in agentic_chat.send_message_stream_durable(session_id, text):
                 yield "data: " + json.dumps(ev) + "\n\n"
         except Exception as exc:  # never leak a traceback into the stream
             yield "data: " + json.dumps({"event": "error", "status": 500,
                                          "detail": _sanitize(str(exc), 300)}) + "\n\n"
         finally:
-            if sess_info and final_reply:
-                try:
-                    _after = agentic_chat.get_session(session_id) or {}
-                    agentic_history.record_turn(
-                        session_id, sess_info["cli"], sess_info["project_dir"],
-                        "agent", final_reply,
-                        native_session_id=_after.get("native_session_id"))
-                except Exception:
-                    pass
             yield "event: end\ndata: {}\n\n"
 
     return Response(stream_with_context(gen()), mimetype="text/event-stream", headers=_SSE_HEADERS)
