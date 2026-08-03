@@ -80,12 +80,15 @@ def test_briefs_stay_small():
 
     web_design carries a larger allowance than the rest, and it earned it: it
     absorbed the named anti-pattern list (specific fonts and structures that read
-    as AI-made, which a generic "avoid generic layouts" line never prevented) and
-    the hero-motion spec. Those are concrete bans and concrete recipes, not
+    as AI-made, which a generic "avoid generic layouts" line never prevented),
+    the hero-motion spec, and (on request) a numbered end-of-task self-check --
+    every clickable thing verified to actually work, each page of a multi-page
+    build confirmed distinct rather than reskinned, a real phone-width check.
+    Those are concrete bans, concrete recipes and concrete checks, not
     style talk — the part a model cannot supply for itself. The real guard is
     test_worst_case_brief_cost below, which measures what a request ACTUALLY
     pays."""
-    budget = {"web_design": 3800}
+    budget = {"web_design": 4500}
     for name, _rx, body in craft._BRIEFS:
         limit = budget.get(name, 1400)
         assert len(body) < limit, "%s brief is too long (%d chars)" % (name, len(body))
