@@ -47,7 +47,14 @@ WEB_DESIGN = """WEB DESIGN BRIEF (apply unless the user says otherwise)
 - Space above a heading must exceed the space below it — a heading binds to what follows.
 - Elevation once: border OR shadow, never both. Shadows have an offset and a soft blur; a zero-offset coloured halo is decoration, not depth.
 - Type scale must actually be a scale: largest at least 2x the smallest, ~1.25x between adjacent steps. Interactive text never below 11px.
-SELF-CHECK before you ship: if someone could guess your look from the product category alone — or from category-plus-the-obvious-avoidance — rework it. Landing on cream + serif display, or near-black + one neon glow, or broadsheet hairlines + italic serif, when the brief left the look open, means this check failed.
+- Multi-page: share the SYSTEM (type, colour, spacing, nav, footer), never the same hero/section layout with different words. Each page's composition reflects what makes THAT page different.
+- Every clickable thing works, before you report done: no href="#", no dead button, no CTA opening nothing. Real anchor, real page, real submit, or real toggle. Missing real content (phone, address, price) is [NEEDS INPUT], never a link to nowhere.
+SELF-CHECK before you report done — fix what fails, do not make the user catch it for you:
+1. Could someone guess your look from the product category alone — or from category-plus-the-obvious-avoidance? cream + serif display, near-black + one neon glow, broadsheet hairlines + italic serif, when the brief left the look open, all fail this. Rework.
+2. Click every link and button yourself. Anything dead or wrong?
+3. Multi-page: flip through each page — same system, but does it still look distinct, not reskinned?
+4. Phone-width viewport: anything overflow, overlap, clip, or fall under a 44px tap target?
+5. Every section its own entrance, not one fade-and-rise pasted everywhere? Hover/active/focus on everything interactive?
 ANTI (each of these is a specific, recognisable AI tell):
 - Fonts: Inter, Geist, Plus Jakarta Sans, Space Grotesk, Instrument Sans/Serif, Fraunces, Recoleta, Playfair, DM Sans/Serif, Outfit, Syne, Montserrat. Pick a face with a point of view — but if you cannot verify the webfont actually loads, use a system stack rather than ship a broken @font-face.
 - Structure: a rounded-square icon tile above a heading; a tiny tracked uppercase eyebrow above a heading; cards inside cards; 01/02/03 section numbers; a coloured border-left on cards or callouts; centred hero + 3 identical feature cards + gradient blob.
