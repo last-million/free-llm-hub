@@ -56,6 +56,65 @@ def test_parse_codex_json_failure_when_no_agent_message():
     assert "boom" in detail
 
 
+# --------------------------------------------------------------------------- #
+# The "Model metadata for `auto` not found" notice: routine on EVERY codex
+# turn (model="auto" is the hub's own routing sentinel, not a real model
+# name codex's local table knows), but reported live as the ONLY thing
+# visible in the transcript for long stretches -- read as an alarming error
+# by the user rather than the harmless noise it is. Suppressed at the
+# source so it never reaches a "notice" event or shadows a real error.
+# --------------------------------------------------------------------------- #
+
+def test_the_real_captured_metadata_notice_is_recognised_as_benign():
+    # item_1 in CODEX_EVENTS above -- captured live, 2026-07-17.
+    assert ac._is_benign_codex_notice("Model metadata for `auto` not found.")
+
+
+def test_the_longer_form_the_user_actually_saw_is_also_recognised():
+    assert ac._is_benign_codex_notice(
+        "Model metadata for `auto` not found. Defaulting to fallback "
+        "metadata; this can degrade performance and cause issues.")
+
+
+def test_an_unrelated_error_is_not_treated_as_benign():
+    assert not ac._is_benign_codex_notice("boom")
+    assert not ac._is_benign_codex_notice("unexpected status 401 Unauthorized")
+
+
+def test_the_streaming_parser_drops_the_benign_notice_entirely():
+    events = ac._codex_stream_events(
+        '{"type":"item.completed","item":{"id":"item_1","type":"error",'
+        '"message":"Model metadata for `auto` not found."}}')
+    assert events == []
+
+
+def test_the_streaming_parser_still_surfaces_a_real_error_notice():
+    events = ac._codex_stream_events(
+        '{"type":"item.completed","item":{"id":"item_9","type":"error",'
+        '"message":"boom"}}')
+    assert {"event": "notice", "text": "boom"} in events
+
+
+def test_the_benign_notice_never_becomes_the_non_streaming_failure_detail():
+    """A real failure with ONLY the benign notice as prior context must not
+    have that notice masquerade as the reason -- it would say nothing useful
+    about what actually went wrong."""
+    ev = ('{"type":"thread.started","thread_id":"abc"}\n'
+          '{"type":"item.completed","item":{"type":"error",'
+          '"message":"Model metadata for `auto` not found."}}')
+    text, native, detail = ac._parse_codex_json(ev, "", 1)
+    assert text is None
+    assert "Model metadata" not in (detail or "")
+
+
+def test_parse_codex_json_extracts_reply_even_with_the_benign_notice_first():
+    """CODEX_EVENTS' own item_1 IS this notice -- confirms the existing
+    happy-path fixture still resolves correctly now that it is filtered."""
+    text, native, detail = ac._parse_codex_json(CODEX_EVENTS, "", 0)
+    assert text == "Done: created hello.txt."
+    assert detail is None
+
+
 def test_build_argv_codex_fresh(monkeypatch):
     monkeypatch.setattr(ac, "_system_prompt_addition", lambda *a, **k: "")
     monkeypatch.setattr(ac, "_launcher", lambda b: [b])

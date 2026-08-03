@@ -81,16 +81,14 @@ def _read_json(path):
         return None
 
 
-def detect(project_dir):
-    """How to start what is in `project_dir`: {"argv", "kind", "needs_install"}.
+_RUN_DIR_SKIP = {"node_modules", ".git", "__pycache__", ".venv", "venv", ".calvoun"}
 
-    Ordered the same way the SHIP brief tells models to do it — the project's own
-    script first, because that is the one the author actually maintains, and a
-    plain static server last, because it always works."""
-    if not os.path.isdir(project_dir):
-        raise WorkspaceError("not a directory: %s" % project_dir)
 
-    pkg = _read_json(os.path.join(project_dir, "package.json"))
+def _detect_at(run_dir):
+    """The runnable shape directly inside `run_dir`, or None -- same markers
+    and priority order as detect(), factored out so it can be tried again one
+    level down without duplicating the checks."""
+    pkg = _read_json(os.path.join(run_dir, "package.json"))
     if isinstance(pkg, dict):
         scripts = pkg.get("scripts") if isinstance(pkg.get("scripts"), dict) else {}
         for script in ("dev", "start", "serve", "preview"):
@@ -98,26 +96,73 @@ def detect(project_dir):
                 return {"argv": [_npm("npm"), "run", script],
                         "kind": "npm:" + script,
                         "needs_install": not os.path.isdir(
-                            os.path.join(project_dir, "node_modules"))}
+                            os.path.join(run_dir, "node_modules"))}
         # A package.json with no runnable script is still a node project; vite
         # can serve it, and npx will fetch vite on demand.
         return {"argv": [_npm("npx"), "--yes", "vite", "--host", "127.0.0.1"],
                 "kind": "vite", "needs_install": False}
 
     for entry in ("app.py", "main.py", "server.py", "manage.py"):
-        if os.path.isfile(os.path.join(project_dir, entry)):
-            return {"argv": [_venv_python(project_dir), entry],
+        if os.path.isfile(os.path.join(run_dir, entry)):
+            return {"argv": [_venv_python(run_dir), entry],
                     "kind": "python:" + entry,
                     "needs_install": os.path.isfile(
-                        os.path.join(project_dir, "requirements.txt"))}
+                        os.path.join(run_dir, "requirements.txt"))}
 
-    if os.path.isfile(os.path.join(project_dir, "index.html")):
+    if os.path.isfile(os.path.join(run_dir, "index.html")):
         return {"argv": [sys.executable, "-m", "http.server", "--bind", "127.0.0.1"],
                 "kind": "static", "needs_install": False}
+    return None
+
+
+def detect(project_dir):
+    """How to start what is in `project_dir`: {"argv", "kind", "needs_install",
+    "run_dir"}. `run_dir` is the directory the process actually runs in --
+    normally `project_dir` itself, but see the one-level fallback below.
+
+    Ordered the same way the SHIP brief tells models to do it — the project's own
+    script first, because that is the one the author actually maintains, and a
+    plain static server last, because it always works."""
+    if not os.path.isdir(project_dir):
+        raise WorkspaceError("not a directory: %s" % project_dir)
+
+    spec = _detect_at(project_dir)
+    if spec:
+        spec["run_dir"] = project_dir
+        return spec
+
+    # MEASURED: agents routinely name and create their own subfolder for the
+    # actual deliverable ("mkdir bakery-rabat" then write index.html inside
+    # it) instead of writing straight into project_dir -- a reasonable thing
+    # to do, since project_dir is the whole session's workspace, not
+    # necessarily the site itself. Before this, that shape 400'd "nothing
+    # runnable" every time (project_dir/index.html does not exist even though
+    # project_dir/bakery-rabat/index.html does), which meant Run never
+    # started, "running" never became true, and the reload button -- gated on
+    # exactly that -- never even appeared. One level deep only, and only when
+    # the fallback is UNAMBIGUOUS (exactly one candidate): guessing between
+    # two sibling projects would silently run the wrong one.
+    try:
+        subdirs = [os.path.join(project_dir, name)
+                   for name in os.listdir(project_dir)
+                   if name not in _RUN_DIR_SKIP and not name.startswith(".")
+                   and os.path.isdir(os.path.join(project_dir, name))]
+    except OSError:
+        subdirs = []
+    candidates = []
+    for sub in subdirs:
+        found = _detect_at(sub)
+        if found:
+            found["run_dir"] = sub
+            candidates.append(found)
+    if len(candidates) == 1:
+        return candidates[0]
 
     raise WorkspaceError(
         "nothing runnable in this folder — no package.json, no app.py/main.py, "
-        "no index.html")
+        "no index.html" +
+        (" (found runnable projects in %d subfolders -- ambiguous, not guessing)"
+         % len(candidates) if len(candidates) > 1 else ""))
 
 
 # --------------------------------------------------------------------------- #
@@ -435,16 +480,18 @@ def start(project_dir, on_done=None):
         _procs[project_dir] = proc
     proc.log("[hub] %s on port %d" % (spec["kind"], port))
 
+    run_dir = spec["run_dir"]
+
     def worker():
         try:
             if spec["needs_install"]:
-                install(project_dir, proc.log)
+                install(run_dir, proc.log)
             proc.state = "starting"
             argv = _argv_with_port(spec["argv"], spec["kind"], port)
             proc.log("[hub] " + " ".join(argv))
             try:
                 proc.popen = subprocess.Popen(
-                    argv, cwd=project_dir, env=_env_for(project_dir, port),
+                    argv, cwd=run_dir, env=_env_for(run_dir, port),
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, encoding="utf-8", errors="replace",
                     # Own group so stop() takes the whole tree: npm spawns the

@@ -88,6 +88,109 @@ def test_detect_never_returns_a_shell_string(proj):
     assert isinstance(workspace.detect(proj)["argv"], list)
 
 
+def test_a_top_level_project_has_run_dir_equal_to_itself(proj):
+    """The common case must be unchanged: run_dir defaults to project_dir."""
+    open(os.path.join(proj, "index.html"), "w").write("<h1>hi</h1>")
+    assert workspace.detect(proj)["run_dir"] == proj
+
+
+# --------------------------------------------------------------------------- #
+# The one-level subfolder fallback -- reported live: an agent that names and
+# creates its own subfolder for the actual deliverable ("mkdir bakery-rabat",
+# index.html written inside it) made Run 400 "nothing runnable" every time,
+# which meant the preview never started, and the reload button -- gated on
+# running being true -- never even appeared.
+# --------------------------------------------------------------------------- #
+
+def test_a_static_site_one_level_down_is_found(proj):
+    sub = os.path.join(proj, "bakery-rabat")
+    os.mkdir(sub)
+    open(os.path.join(sub, "index.html"), "w").write("<h1>bakery</h1>")
+    spec = workspace.detect(proj)
+    assert spec["kind"] == "static"
+    assert spec["run_dir"] == sub, "must run FROM the subfolder, not project_dir"
+
+
+def test_an_npm_project_one_level_down_is_found(proj):
+    sub = os.path.join(proj, "site")
+    os.mkdir(sub)
+    open(os.path.join(sub, "package.json"), "w").write('{"scripts": {"dev": "vite"}}')
+    spec = workspace.detect(proj)
+    assert spec["kind"] == "npm:dev"
+    assert spec["run_dir"] == sub
+
+
+def test_a_root_level_project_wins_over_any_subfolder(proj):
+    """The subfolder fallback only fires when the ROOT has nothing runnable --
+    it must never override a real project sitting right at project_dir."""
+    open(os.path.join(proj, "index.html"), "w").write("<h1>root</h1>")
+    sub = os.path.join(proj, "old-draft")
+    os.mkdir(sub)
+    open(os.path.join(sub, "index.html"), "w").write("<h1>draft</h1>")
+    spec = workspace.detect(proj)
+    assert spec["run_dir"] == proj
+
+
+def test_two_runnable_subfolders_is_ambiguous_not_guessed(proj):
+    """Two sibling projects: guessing which one to run is worse than saying so."""
+    for name in ("site-a", "site-b"):
+        sub = os.path.join(proj, name)
+        os.mkdir(sub)
+        open(os.path.join(sub, "index.html"), "w").write("<h1>x</h1>")
+    with pytest.raises(workspace.WorkspaceError) as e:
+        workspace.detect(proj)
+    assert "ambiguous" in str(e.value)
+
+
+def test_dotfolders_and_dependency_dirs_are_never_treated_as_candidates(proj):
+    """node_modules/.git/.venv are real subfolders that often contain their
+    own index.html-shaped files (docs, fixtures) -- must never be mistaken
+    for the project itself."""
+    for name in ("node_modules", ".git", "__pycache__", ".venv", ".hidden"):
+        sub = os.path.join(proj, name)
+        os.mkdir(sub)
+        open(os.path.join(sub, "index.html"), "w").write("<h1>not the site</h1>")
+    with pytest.raises(workspace.WorkspaceError):
+        workspace.detect(proj)
+
+
+def test_the_subfolder_fallback_is_only_one_level_deep(proj):
+    """A project two levels down is not found -- unbounded recursion into an
+    agent's own working tree is a much bigger, slower, riskier search than
+    the one level that actually matches how agents nest a deliverable."""
+    deep = os.path.join(proj, "a", "b")
+    os.makedirs(deep)
+    open(os.path.join(deep, "index.html"), "w").write("<h1>too deep</h1>")
+    with pytest.raises(workspace.WorkspaceError):
+        workspace.detect(proj)
+
+
+def test_start_actually_runs_from_the_nested_run_dir(proj, monkeypatch):
+    """The fix is only real if start() honors run_dir as the subprocess cwd,
+    not just detect() computing it and nobody using it."""
+    sub = os.path.join(proj, "bakery-rabat")
+    os.mkdir(sub)
+    open(os.path.join(sub, "index.html"), "w").write("<h1>bakery</h1>")
+
+    seen_cwd = []
+    real_popen = workspace.subprocess.Popen
+
+    def fake_popen(argv, cwd=None, **kw):
+        seen_cwd.append(cwd)
+        # A real process so the rest of start()'s worker thread has something
+        # to poll/kill without actually serving anything on the port.
+        return real_popen([workspace.sys.executable, "-c",
+                           "import time; time.sleep(5)"], **kw)
+
+    monkeypatch.setattr(workspace.subprocess, "Popen", fake_popen)
+    workspace.start(proj)
+    for _ in range(50):
+        if seen_cwd:
+            break
+        time.sleep(0.05)
+    assert seen_cwd and seen_cwd[0] == sub
+
+
 # --------------------------------------------------------------------------- #
 # Problems — what the user actually clicks
 # --------------------------------------------------------------------------- #

@@ -104,6 +104,57 @@ def test_a_real_successful_answer_is_unaffected():
 
 
 # --------------------------------------------------------------------------- #
+# Tool RESULTS, not just tool calls -- reported live: "I just see Working,
+# never what the agent actually did." codex's parser already turns a
+# completed command_execution into an "output" event; claude's had no
+# equivalent, so a Bash call showed only its own command line, never what it
+# printed. Same event name as codex on purpose: zero frontend changes needed.
+# --------------------------------------------------------------------------- #
+
+def test_a_string_tool_result_becomes_an_output_event():
+    line = ('{"type":"user","message":{"role":"user","content":['
+            '{"tool_use_id":"t1","type":"tool_result","content":"total 3 files"}'
+            ']}}')
+    events = ac._claude_stream_events(line)
+    assert {"event": "output", "text": "total 3 files"} in events
+
+
+def test_a_block_list_tool_result_is_flattened_to_text():
+    line = ('{"type":"user","message":{"role":"user","content":['
+            '{"tool_use_id":"t1","type":"tool_result","content":'
+            '[{"type":"text","text":"line one"}]}'
+            ']}}')
+    events = ac._claude_stream_events(line)
+    assert {"event": "output", "text": "line one"} in events
+
+
+def test_a_blank_tool_result_produces_no_event():
+    line = ('{"type":"user","message":{"role":"user","content":['
+            '{"tool_use_id":"t1","type":"tool_result","content":"   "}'
+            ']}}')
+    assert ac._claude_stream_events(line) == []
+
+
+def test_a_long_tool_result_is_truncated_like_codex_output():
+    import json
+    long_text = "x" * 5000
+    line = json.dumps({"type": "user", "message": {"role": "user", "content": [
+        {"tool_use_id": "t1", "type": "tool_result", "content": long_text}]}})
+    events = ac._claude_stream_events(line)
+    out = next(e for e in events if e.get("event") == "output")
+    assert len(out["text"]) == 4000
+
+
+def test_the_initial_user_prompt_line_is_not_mistaken_for_a_tool_result():
+    """The very first line send_message_stream's own argv produces is never
+    fed back through this parser (it is argv, not stdout) -- but a plain
+    string `content` on a "user" event, with no tool_result block at all,
+    must still produce nothing rather than raise."""
+    line = '{"type":"user","message":{"role":"user","content":"plain text"}}'
+    assert ac._claude_stream_events(line) == []
+
+
+# --------------------------------------------------------------------------- #
 # Stale-resume detection, per CLI, against the exact measured wording
 # --------------------------------------------------------------------------- #
 

@@ -7062,9 +7062,7 @@
           .catch(function(){});
       });
 
-      reloadBtn.addEventListener('click', function(){
-        if (lastUrl){ frame.src = lastUrl.split('#')[0] + '#r' + Date.now(); }
-      });
+      reloadBtn.addEventListener('click', function(){ reloadFrame(); });
 
       /* Device widths CONSTRAIN the frame rather than scaling it, so the page's
          own media queries fire exactly as they would on the real device. */
@@ -7259,9 +7257,19 @@
 
       function reloadFrame(){
         if (!lastUrl) return;
-        /* Cache-bust so a static server actually serves the new file. A dev
+        /* Cache-bust with a QUERY param, not a hash. MEASURED, reported live:
+           a hash-only change to iframe.src is same-page navigation to the
+           browser -- no network fetch -- so the button visibly "clicked" and
+           the frame's readyState even flipped, but a static server's edited
+           file never actually reloaded; the iframe just kept showing its
+           existing DOM. A query param changes the URL the browser actually
+           fetches. lastUrl is the clean URL from the server's own status
+           poll (see render()) and never carries this param itself, so there
+           is nothing stale to strip before appending a fresh one. A dev
            server with HMR does not need this, and an extra reload is harmless. */
-        frame.src = lastUrl.split('#')[0] + '#r' + Date.now();
+        var base = lastUrl.split('#')[0];
+        var sep = base.indexOf('?') === -1 ? '?' : '&';
+        frame.src = base + sep + 'r=' + Date.now();
       }
 
       function autoOn(){
