@@ -1500,7 +1500,7 @@ def _parse_codex_json(stdout, stderr, returncode):
                     final_text = txt
             elif itype == "error":
                 msg = item.get("message")
-                if isinstance(msg, str) and msg:
+                if isinstance(msg, str) and msg and not _is_benign_codex_notice(msg):
                     last_error = msg
     if final_text is not None:
         return _sanitize(final_text), native_id, None
@@ -1741,6 +1741,28 @@ def send_message(session_id, text):
 # keys under "event" are forwarded to the client.
 # --------------------------------------------------------------------------- #
 
+def _is_benign_codex_notice(msg):
+    """True for codex's own routine per-turn noise, not a real problem.
+
+    MEASURED, reported live, and matches a real captured event already fixed
+    in this file's own tests (test_codex_agentic.CODEX_EVENTS, item_1):
+    'Model metadata for `auto` not found.' -- sometimes followed by
+    'Defaulting to fallback metadata; this can degrade performance and cause
+    issues.' as the user saw it live, but the captured fixture shows the
+    short form alone is a complete, separate event -- match on the stable
+    core, not the longer sentence, or the short form slips through. Fires on
+    EVERY codex turn: the hub deliberately writes model="auto" into codex's
+    config.toml (see _codex_hub_fallback_text) as the sentinel that tells the
+    HUB's own /v1 endpoint to auto-route; codex's own local model-metadata
+    table (compiled into its binary, unrelated to hub routing) just has no
+    entry literally named "auto". Harmless and not actionable by the user,
+    but it fires so early -- often before the first real tool call -- that it
+    was the ONLY thing visible in the transcript for long stretches, reading
+    as an alarming error instead of the routine noise it is."""
+    return isinstance(msg, str) and "model metadata for" in msg.lower() \
+        and "not found" in msg.lower()
+
+
 def _codex_stream_events(line):
     """One `codex exec --json` JSONL line -> list of normalized event dicts."""
     line = (line or "").strip()
@@ -1778,7 +1800,7 @@ def _codex_stream_events(line):
                 out.append({"event": "output", "text": ag[:4000]})
         elif it == "error":
             msg = item.get("message")
-            if isinstance(msg, str) and msg:
+            if isinstance(msg, str) and msg and not _is_benign_codex_notice(msg):
                 out.append({"event": "notice", "text": msg})
     elif etype == "turn.failed":
         # The authoritative failure, one clean sentence -- see the matching
@@ -1829,6 +1851,30 @@ def _claude_stream_events(line):
                 desc = (inp.get("command") or inp.get("file_path") or inp.get("path")
                         or (json.dumps(inp)[:200] if inp else ""))
                 out.append({"event": "tool", "text": "%s: %s" % (block.get("name") or "tool", desc)})
+    elif etype == "user":
+        # MEASURED gap, reported live: this parser only ever surfaced the
+        # TOOL CALL ("Bash: npm run build") and never what it actually did --
+        # a long-running or silent command left "Working..." as the only
+        # visible text for minutes. Claude Code sends a completed tool's
+        # result back as a synthetic user turn (the same shape the Anthropic
+        # Messages API uses for tool_result), not as an assistant event --
+        # codex's parser already has the equivalent (item.completed /
+        # command_execution -> "output"); this brings claude to parity with
+        # the SAME event name, so the frontend needs no changes.
+        msg = ev.get("message") or {}
+        for block in (msg.get("content") or []):
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            content = block.get("content")
+            if isinstance(content, list):
+                text = "".join(b.get("text", "") for b in content
+                               if isinstance(b, dict) and b.get("type") == "text")
+            elif isinstance(content, str):
+                text = content
+            else:
+                text = ""
+            if text.strip():
+                out.append({"event": "output", "text": text[:4000]})
     elif etype == "result":
         if isinstance(ev.get("session_id"), str):
             out.append({"_native": ev["session_id"]})
