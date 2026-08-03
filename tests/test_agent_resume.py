@@ -11,6 +11,8 @@ only ever offer to start over.
 """
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -93,6 +95,52 @@ def test_resume_session_reuses_the_original_id(proj):
     try:
         assert sid == "keep-this-id"
         assert ac.get_session("keep-this-id") is not None
+    finally:
+        ac.end_session(sid)
+
+
+def test_resuming_a_session_that_is_genuinely_still_running_does_not_clobber_it(proj):
+    """THE BUG (found live): every /agent/<id> page load calls resume_session()
+    unconditionally, including for a session that is genuinely still mid-turn.
+    Without this guard, the pop/rename/reinsert below silently replaces the
+    live Session -- proc handle and all -- with a fresh, proc-less stand-in
+    under the same id: currently_running then reads False for a task that is
+    still actually running, and sending a new message to that id starts a
+    SECOND process on top of the first, in the same project folder."""
+    sid = ac.start_session("codex", proj)
+    real_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+    try:
+        with ac._REGISTRY_LOCK:
+            live_sess = ac._REGISTRY[sid]
+            live_sess.proc = real_proc
+        got = ac.resume_session("codex", proj, "SOME-THREAD", session_id=sid)
+        assert got == sid
+        with ac._REGISTRY_LOCK:
+            assert ac._REGISTRY[sid] is live_sess, \
+                "a live session must be handed back as-is, not swapped for a decoy"
+            assert ac._REGISTRY[sid].proc is real_proc
+    finally:
+        real_proc.terminate()
+        real_proc.wait(timeout=5)
+        ac.end_session(sid)
+
+
+def test_resuming_a_session_that_has_actually_finished_still_gets_a_fresh_thread(proj):
+    """Contrast case: once the real process has exited, resume must go back to
+    building a normal stand-in pointed at the saved thread id -- the guard
+    above must not accidentally block the legitimate restart-recovery path."""
+    sid = ac.start_session("codex", proj)
+    real_proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    real_proc.wait(timeout=5)
+    try:
+        with ac._REGISTRY_LOCK:
+            live_sess = ac._REGISTRY[sid]
+            live_sess.proc = real_proc
+        got = ac.resume_session("codex", proj, "SOME-THREAD", session_id=sid)
+        assert got == sid
+        with ac._REGISTRY_LOCK:
+            assert ac._REGISTRY[sid] is not live_sess
+            assert ac._REGISTRY[sid].native_session_id == "SOME-THREAD"
     finally:
         ac.end_session(sid)
 

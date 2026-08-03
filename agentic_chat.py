@@ -1082,7 +1082,25 @@ def resume_session(cli_id, project_dir, native_session_id, session_id=None) -> s
     live session already pointed at it, which is what makes "continue" in the
     history list actually continue rather than start over. Reuses the ORIGINAL
     session_id when given one, so the transcript on disk keeps accumulating into
-    the same conversation instead of forking a second one."""
+    the same conversation instead of forking a second one.
+
+    THE BUG THIS GUARDS (found live): every /agent/<id> page load calls the
+    /resume route unconditionally, including for a session that is genuinely
+    still mid-turn. Without this check, the swap below would silently replace
+    the live Session -- proc handle and all -- with a fresh, proc-less stand-in
+    under the same id, orphaning the hub's only handle to the real process. The
+    real subprocess keeps running (nothing here can stop it -- send_message_
+    stream holds its own reference), but currently_running now reads False, so
+    sending a new message to that same id would start a SECOND process on top
+    of it, in the same project folder."""
+    if session_id and _SAFE_SESSION_ID_RE.match(str(session_id)):
+        with _REGISTRY_LOCK:
+            existing = _REGISTRY.get(str(session_id))
+            if existing is not None:
+                with existing.proc_lock:
+                    live_proc = existing.proc
+                if live_proc is not None and live_proc.poll() is None:
+                    return existing.id
     sid = start_session(cli_id, project_dir)      # all the same validation
     with _REGISTRY_LOCK:
         sess = _REGISTRY.pop(sid)
