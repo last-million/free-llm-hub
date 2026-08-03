@@ -1172,6 +1172,16 @@ _RESTATE_SNIPPET = (
     "given."
 )
 
+_PLANNING_SNIPPET = (
+    "For any non-trivial task: think it through step by step first, then break "
+    "it into phases with a visible todo list -- your own native planning/task "
+    "tool if you have one, otherwise a short checklist you keep updating in "
+    "your replies. Work through phases in order; independent steps within a "
+    "phase can run in parallel. Mark each item done as you actually finish it, "
+    "not all at once at the end -- the list is how the user tracks real "
+    "progress, not a formality to produce and then ignore."
+)
+
 
 def _system_prompt_addition(text: str = "", has_brief: bool = False) -> str:
     """Extra system-prompt text for this turn, or "" for none. Never raises --
@@ -1196,6 +1206,8 @@ def _system_prompt_addition(text: str = "", has_brief: bool = False) -> str:
     ambiguity silently and wrongly. One restated line surfaces that in seconds
     instead of after a full build."""
     parts = []
+    if text:
+        parts.append(_PLANNING_SNIPPET)
     if test_verification_enabled():
         parts.append(_TEST_VERIFICATION_SNIPPET)
     try:

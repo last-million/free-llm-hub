@@ -345,6 +345,22 @@ def test_the_agent_is_told_to_restate_the_subject(monkeypatch):
     assert "Never substitute a generic template" in add
 
 
+def test_the_agent_is_told_to_plan_with_a_todo_list(monkeypatch):
+    """"always in any CLI or any task... create phases and todo list, think
+    step by step, tasks in order or in parallel if ok" -- unconditional, not
+    gated on domain the way the craft briefs are."""
+    add = ac._system_prompt_addition(RESTAURANT)
+    assert "todo list" in add
+    assert "step by step" in add
+    assert "in order" in add and "parallel" in add
+
+
+def test_no_planning_instruction_when_there_is_no_real_text():
+    """Mirrors _RESTATE_SNIPPET's own gate: nothing to plan for an empty turn."""
+    add = ac._system_prompt_addition("")
+    assert "todo list" not in add
+
+
 def test_a_brief_failure_never_costs_the_user_their_turn(monkeypatch):
     """Standards are a bonus; a read-only folder must not break the session."""
     monkeypatch.setattr(ac.craft, "system_message",
