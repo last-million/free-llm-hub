@@ -2940,7 +2940,7 @@ def _sub_run(pid, prompt, model=None):
         # it were a real reply. Same classification list as the exit!=0 path
         # below, just checked against stdout too when this is the claude
         # backend.
-        if backend == "claude" and text and any(s in text.lower() for s in _SUB_AUTH_ERR):
+        if pid == "sub-claude" and text and any(s in text.lower() for s in _SUB_AUTH_ERR):
             return 403, "", _sanitize(text, 300)
         if not text:
             raw_err = (proc.stderr or "").strip()
