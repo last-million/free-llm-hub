@@ -145,6 +145,21 @@ STREAM_BIG_REQUEST_TOKENS = 12000   # est tokens at which a request is "big"
 STREAM_IDLE_TIMEOUT = 280        # seconds
 MODELS_READ_TIMEOUT = 10      # seconds (model discovery / key tests)
 MODEL_CACHE_TTL = 60          # seconds
+
+# Default cooldown for a 429/timeout with no provider-given Retry-After. USER-
+# REPORTED live 2026-08-03: the same just-429'd g4f-gemini model kept getting
+# retried attempt after attempt -- the previous 60s default was shorter than a
+# real full chain-exhaustion pass (measured 150-430s that same session, mostly
+# from OTHER slow/timing-out hops earlier in the same chain), so by the time
+# the next attempt's chain was built, the 60s memory of "this just failed" had
+# already expired and the model looked fresh again. A cooldown that expires
+# before the next real retry even happens is not a cooldown. 180s comfortably
+# outlasts the short end of what was measured and meaningfully cuts the
+# repeat-hit rate on the long end too; still short enough that a genuinely
+# recovered model isn't excluded for long. Reasoned from that one session's
+# measurements, not a vendor-confirmed number -- self-correcting either way,
+# since this only ever sidelines a model temporarily.
+_HOP_COOLDOWN_DEFAULT = 180    # seconds
 MAX_HOPS = 6                  # primary + up to 5 fallback models (across providers)
 # Agentic (tool-calling) requests — Codex / Claude Code / hermes / openclaw loops —
 # hammer the gateway far harder than a one-shot chat, so the small tool-capable pool
@@ -5039,9 +5054,9 @@ def _upstream_chat(pid, payload, stream):
         # A 429 on a SINGLE key just rotates to the next key below. Only when the
         # LAST key also 429s (every key for this provider is rate-limited) do we
         # sideline the whole provider. And when there's no numeric Retry-After,
-        # cool down for a SHORT 60s (assume a per-minute burst) instead of pegging
-        # it exhausted until the day/month window resets — `secs or 60` keeps the
-        # provider usable ~1 min later; a real Retry-After is honored as-is.
+        # cool down for _HOP_COOLDOWN_DEFAULT (assume a per-minute burst) instead
+        # of pegging it exhausted until the day/month window resets; a real
+        # Retry-After is honored as-is.
         if resp.status_code == 429 and is_last:
             retry_after = resp.headers.get("Retry-After")
             secs = None
@@ -5051,11 +5066,12 @@ def _upstream_chat(pid, payload, stream):
                 secs = None
             daily_secs = None
             if secs is None:
-                # A DAILY allowance that is spent will not come back in 60s, and
-                # retrying it every minute burns a chain hop on every request for the
-                # rest of the day (Cloudflare: "you have used up your daily free
-                # allocation of 10,000 neurons"). Park it until the window actually
-                # resets instead — the same self-healing path, just with an honest ETA.
+                # A DAILY allowance that is spent will not come back in a short
+                # cooldown, and retrying it every round burns a chain hop on every
+                # request for the rest of the day (Cloudflare: "you have used up
+                # your daily free allocation of 10,000 neurons"). Park it until
+                # the window actually resets instead — the same self-healing
+                # path, just with an honest ETA.
                 daily_secs = _daily_exhaustion_secs(pid, resp)
                 secs = daily_secs
             # Per-model-limited providers (Google: 15 RPM PER MODEL): a per-minute
@@ -5065,11 +5081,11 @@ def _upstream_chat(pid, payload, stream):
             # only bench the whole provider when the DAILY window is truly spent.
             per_model_only = pid in _PER_MODEL_RATE_LIMIT_PROVIDERS and daily_secs is None
             if not per_model_only:
-                quota.mark_throttled(pid, secs or 60)
+                quota.mark_throttled(pid, secs or _HOP_COOLDOWN_DEFAULT)
             # ALSO park just this model: it survives provider note_success(), so when
             # a sibling model revives the provider, the id that actually 429'd stays
             # sidelined instead of being re-picked and 429'ing again.
-            quota.mark_model_throttled(pid, payload.get("model"), secs or 60)
+            quota.mark_model_throttled(pid, payload.get("model"), secs or _HOP_COOLDOWN_DEFAULT)
         # 403 (no access to this model with this key) / 404 (model gone) are about
         # the MODEL, not the key or the quota: sideline just that id so routing
         # stops picking it. Only on the last key — an earlier key's 403 may just
@@ -11326,7 +11342,7 @@ def v1_chat_completions():
                 # other hop in the chain failed fast. Same short cooldown a
                 # 429 already gets, so the NEXT chain build skips it long
                 # enough for a retry to reach a hop that actually responds.
-                quota.mark_throttled(hop_pid, 60)
+                quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
             continue
         if resp.status_code == 200:
             if stream and is_sub_hop:
@@ -11961,7 +11977,7 @@ def v1_responses(_retry_pass=False):
                 # other hop in the chain failed fast. Same short cooldown a
                 # 429 already gets, so the NEXT chain build skips it long
                 # enough for a retry to reach a hop that actually responds.
-                quota.mark_throttled(hop_pid, 60)
+                quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
             continue
         if resp.status_code == 200:
             # Echo back the id the client ASKED for (codex sends "auto", which now has
@@ -12573,7 +12589,7 @@ def v1_messages():
                 # other hop in the chain failed fast. Same short cooldown a
                 # 429 already gets, so the NEXT chain build skips it long
                 # enough for a retry to reach a hop that actually responds.
-                quota.mark_throttled(hop_pid, 60)
+                quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
             continue
         if resp.status_code == 200:
             model_str = requested_model or (hop_pid + "/" + hop_model)
