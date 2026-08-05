@@ -1798,9 +1798,18 @@ _PROVIDER_SPEED = {
 }
 _DEFAULT_SPEED = 55
 # Reasoning / "thinking" model families — slow to first useful token.
+# USER 2026-08-04: "models that need reasoning maximum effort to be pushed
+# for that even if will take time it should just work... we want the hub to
+# output always best quality possible." deepseek-v4(+) is a real reasoning
+# model (catalog data confirms "capabilities":{"reasoning":true}) but was
+# invisible to this pattern -- deepseek[-_]?r\d only matches the R1/R2
+# reasoning-labeled line, not V4's own reasoning mode, so _apply_reasoning_
+# effort never set an effort for it at all and it never dropped into the
+# slow/last-resort tier where a reasoning model belongs. deepseek[-9] mirrors
+# the v4+ cutoff _DSV4_RE already uses elsewhere for the same family.
 _SLOW_MODEL_RE = re.compile(
-    r"(reasoning|thinking|\bqwq\b|deepseek[-_]?r\d|[-/]r1\b|\bo1\b|\bo3\b|magistral|"
-    r"nemotron[-_](ultra|super)|gpt[-_]?oss|[-_]think\b|deepthink)", re.I)
+    r"(reasoning|thinking|\bqwq\b|deepseek[-_]?r\d|deepseek[-_/]?v[4-9]|[-/]r1\b|\bo1\b|\bo3\b|"
+    r"magistral|nemotron[-_](ultra|super)|gpt[-_]?oss|[-_]think\b|deepthink)", re.I)
 
 # LAST-RESORT families — nemotron (ANY variant), gpt-oss, gemma. Demoted to
 # Tier C in _BENCH_FAMILY, but a real Artificial Analysis score (_aa_score_for)
