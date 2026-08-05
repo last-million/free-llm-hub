@@ -84,3 +84,19 @@ def test_missing_difficulty_is_noop():
     payload = {"max_tokens": 8000}
     out = app._apply_reasoning_effort(payload, "gpt-oss-120b", None)
     assert "reasoning_effort" not in out
+
+
+def test_deepseek_v4_is_recognised_as_a_reasoning_model():
+    """USER 2026-08-04: "models that need reasoning maximum effort... it
+    should just work." deepseek-v4(-flash/-pro) is a genuine reasoning model
+    (catalog: "capabilities":{"reasoning":true}) but deepseek[-_]?r\\d only
+    ever matched the R1/R2 line, not V4's own reasoning mode -- so it got NO
+    effort assignment at all, unlike every other recognised reasoning model."""
+    for mid in ("deepseek-v4-flash", "deepseek/deepseek-v4-flash",
+                "deepseek-ai/deepseek-v4-pro", "deepseek-v4"):
+        out = app._apply_reasoning_effort({"max_tokens": 8000}, mid, "hard")
+        assert out["reasoning_effort"] == "high", mid
+    # v3.x is a different, unverified case -- deliberately NOT included by
+    # this fix (only v4+, mirroring _DSV4_RE's own v4+ cutoff elsewhere).
+    out = app._apply_reasoning_effort({"max_tokens": 8000}, "deepseek-v3.1", "hard")
+    assert "reasoning_effort" not in out
