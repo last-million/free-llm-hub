@@ -11399,6 +11399,13 @@ def v1_chat_completions():
                 # other hop in the chain failed fast. Same short cooldown a
                 # 429 already gets, so the NEXT chain build skips it long
                 # enough for a retry to reach a hop that actually responds.
+                # A plain ConnectionError deliberately stays OUT of this branch
+                # (see test_a_fast_failing_hop_is_not_throttled_only_a_real_
+                # timeout_is): a real connection-refused fails just as fast on
+                # a retry, so there's nothing costly to protect against. The
+                # SLOW failure mode that error class was missing turned out to
+                # be a raw 5xx status (524 etc.) that never raises at all --
+                # handled separately below, in the non-2xx branch.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
             continue
         if resp.status_code == 200:
@@ -11508,6 +11515,16 @@ def v1_chat_completions():
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
             last_error = _classify_hop_error(status=resp.status_code)
+            if resp.status_code >= 500:
+                # 429 already gets throttled inside _upstream_chat once its key
+                # pool is exhausted; a raw 5xx (502/503/524...) reaching here
+                # never did -- so a hop that is actually down (not just rate
+                # limited) got retried on every single request with zero
+                # cooldown. MEASURED 2026-08-05: g4f-nvidia's mistral hop hit
+                # HTTP 524 (Cloudflare gateway timeout) right after a
+                # ConnectionError on the SAME hop moments earlier in a
+                # different request -- nothing had cooled it down between them.
+                quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
@@ -12034,6 +12051,13 @@ def v1_responses(_retry_pass=False):
                 # other hop in the chain failed fast. Same short cooldown a
                 # 429 already gets, so the NEXT chain build skips it long
                 # enough for a retry to reach a hop that actually responds.
+                # A plain ConnectionError deliberately stays OUT of this branch
+                # (see test_a_fast_failing_hop_is_not_throttled_only_a_real_
+                # timeout_is): a real connection-refused fails just as fast on
+                # a retry, so there's nothing costly to protect against. The
+                # SLOW failure mode that error class was missing turned out to
+                # be a raw 5xx status (524 etc.) that never raises at all --
+                # handled separately below, in the non-2xx branch.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
             continue
         if resp.status_code == 200:
@@ -12098,6 +12122,12 @@ def v1_responses(_retry_pass=False):
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
             last_error = _classify_hop_error(status=resp.status_code)
+            if resp.status_code >= 500:
+                # See the matching comment in /v1/chat/completions: a raw 5xx
+                # (unlike 429, already handled inside _upstream_chat) never got
+                # a cooldown here, so a genuinely down hop was retried on every
+                # request. MEASURED 2026-08-05: g4f-nvidia/mistral-medium-3.5.
+                quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
             _ekey = "%s:%d" % (hop_pid, resp.status_code)  # DIAG: capture first raw body
             if _ekey not in _err_bodies:
                 try:
@@ -12646,6 +12676,13 @@ def v1_messages():
                 # other hop in the chain failed fast. Same short cooldown a
                 # 429 already gets, so the NEXT chain build skips it long
                 # enough for a retry to reach a hop that actually responds.
+                # A plain ConnectionError deliberately stays OUT of this branch
+                # (see test_a_fast_failing_hop_is_not_throttled_only_a_real_
+                # timeout_is): a real connection-refused fails just as fast on
+                # a retry, so there's nothing costly to protect against. The
+                # SLOW failure mode that error class was missing turned out to
+                # be a raw 5xx status (524 etc.) that never raises at all --
+                # handled separately below, in the non-2xx branch.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
             continue
         if resp.status_code == 200:
@@ -12693,6 +12730,12 @@ def v1_messages():
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
             last_error = _classify_hop_error(status=resp.status_code)
+            if resp.status_code >= 500:
+                # See the matching comment in /v1/chat/completions: a raw 5xx
+                # (unlike 429, already handled inside _upstream_chat) never got
+                # a cooldown here, so a genuinely down hop was retried on every
+                # request. MEASURED 2026-08-05: g4f-nvidia/mistral-medium-3.5.
+                quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
