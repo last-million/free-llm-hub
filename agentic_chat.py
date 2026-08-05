@@ -1195,11 +1195,21 @@ _RESTATE_SNIPPET = (
 _PLANNING_SNIPPET = (
     "For any non-trivial task: think it through step by step first, then break "
     "it into phases with a visible todo list -- your own native planning/task "
-    "tool if you have one, otherwise a short checklist you keep updating in "
-    "your replies. Work through phases in order; independent steps within a "
-    "phase can run in parallel. Mark each item done as you actually finish it, "
-    "not all at once at the end -- the list is how the user tracks real "
-    "progress, not a formality to produce and then ignore."
+    "tool if you have one, and a real file in this project either way, "
+    "PROGRESS.md or similar. A reply-only checklist does not survive: your "
+    "OWN context can get compacted mid-task, and this conversation can be "
+    "resumed later, possibly as a fresh thread with none of your prior "
+    "reasoning -- a file on disk is the only copy of the plan that outlives "
+    "either. Before starting work each turn, check for that file and read it "
+    "first if it exists -- it may already have progress on this task from "
+    "before; do not redo completed work or re-derive decisions already made, "
+    "that wastes real time and tokens for nothing. Update the file as you go: "
+    "what's done, what's in progress, what's next, and any decision worth "
+    "remembering -- not just at the end. Work through phases in order; "
+    "independent steps within a phase can run in parallel. Mark each item "
+    "done as you actually finish it, not all at once at the end -- the list "
+    "is how the user tracks real progress, not a formality to produce and "
+    "then ignore."
 )
 
 
