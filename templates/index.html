@@ -49,6 +49,10 @@
     --info-soft:rgba(56,189,248,.12);
     --info-border:rgba(56,189,248,.30);
     --info-text:#7DD3FC;
+    --new:#A78BFA;
+    --new-soft:rgba(167,139,250,.14);
+    --new-border:rgba(167,139,250,.32);
+    --new-text:#C4B5FD;
     --ok-text:#86EFAC;
     --code-text:#CBD5E1;
     --scrim:rgba(3,6,10,.66);
@@ -92,6 +96,10 @@
     --info-soft:rgba(2,132,199,.10);
     --info-border:rgba(2,132,199,.30);
     --info-text:#0369A1;
+    --new:#7C3AED;
+    --new-soft:rgba(124,58,237,.10);
+    --new-border:rgba(124,58,237,.30);
+    --new-text:#6D28D9;
     --ok-text:#15803D;
     --code-text:#24292F;
     --scrim:rgba(23,28,36,.45);
@@ -372,6 +380,8 @@
   .badge.recommended{background:var(--accent);color:var(--on-accent);display:inline-flex;align-items:center;gap:4px}
   .badge.recommended svg{flex:none}
   .card.recommended{border-color:var(--accent)}
+  .badge.new-provider{background:var(--new-soft);color:var(--new-text);display:inline-flex;align-items:center;gap:4px}
+  .badge.new-provider svg{flex:none}
   .notes{font-size:12.5px;color:var(--text-dim);line-height:1.55}
   .keylink{font-size:12.5px;display:inline-flex;align-items:center;gap:5px}
   .puter-connect{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:8px 0}
@@ -4075,6 +4085,8 @@
   var TRIAL_TIP = 'One-time credits — stops working when they run out (not a recurring free tier)';
   var STAR_SVG = '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><path d="M12 2.5l2.9 6.6 7.1.6-5.4 4.7 1.7 7-6.3-3.9-6.3 3.9 1.7-7-5.4-4.7 7.1-.6 2.9-6.6z"/></svg>';
   var REC_TIP = 'Recommended — real signup credit, verified actually working through the hub';
+  var NEW_SVG = '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><path d="M12 2l1.8 6.2L20 10l-6.2 1.8L12 18l-1.8-6.2L4 10l6.2-1.8L12 2z"/></svg>';
+  var NEW_TIP = 'Added recently — worth a look';
   var KEY_WARN = 'Using several keys for the same provider to get around free limits may break their terms and can get your accounts banned. Use your own keys responsibly.';
 
   // ONLY these three have no free tier at all (pure paid). Every other provider
@@ -4136,6 +4148,7 @@
     var badges = '';
     var fmCount = Array.isArray(p.free_models) ? p.free_models.length : 0;
     if (p.recommended) badges += '<span class="badge recommended" title="' + esc(REC_TIP) + '">' + STAR_SVG + 'Recommended</span>';
+    if (p['new']) badges += '<span class="badge new-provider" title="' + esc(NEW_TIP) + '">' + NEW_SVG + 'New</span>';
     // Additive badges. Only PURE_PAID providers (OpenAI/Claude/Higgsfield) lack a
     // free tier; every other provider has one, so it shows BOTH free + paid.
     var hasFree = fmCount > 0 || (p.paid && !PURE_PAID[p.id]);
@@ -4339,16 +4352,26 @@
     };
     function isKeyless(p){ return !!(KEYLESS_GATEWAYS[p.id] || p.no_key); }
     function isPurePaid(p){ return !!(p.paid && PURE_PAID[p.id]); }
+    // USER 2026-08-04: "connected providers first... activated ones first
+    // in order... even not-connected ones ordered best-provider-first."
+    // Ready-to-use right now beats everything else; among equally-ready (or
+    // equally-not-ready) providers, the best real model quality leads.
+    function isConnected(p){ return !!(p.no_key || (p.enabled && p.has_key)); }
+    function byConnectedThenQuality(a, b){
+      var ca = isConnected(a) ? 1 : 0, cb = isConnected(b) ? 1 : 0;
+      if (ca !== cb) return cb - ca;
+      return (Number(b.quality_score) || 0) - (Number(a.quality_score) || 0);
+    }
     // Recommended providers are pinned in their own zone ABOVE every group
     // and are therefore excluded from the category groups below (no
     // duplicate cards).
-    var recG = shown.filter(function(p){ return p.recommended; });
+    var recG = shown.filter(function(p){ return p.recommended; }).sort(byConnectedThenQuality);
     var unpinned = shown.filter(function(p){ return !p.recommended; });
-    var keylessG = unpinned.filter(isKeyless);
+    var keylessG = unpinned.filter(isKeyless).sort(byConnectedThenQuality);
     var rest = unpinned.filter(function(p){ return !isKeyless(p); });
-    var trialG = rest.filter(function(p){ return p.trial; });
-    var paidG = rest.filter(function(p){ return !p.trial && isPurePaid(p); });
-    var freeKeyG = rest.filter(function(p){ return !p.trial && !isPurePaid(p); });
+    var trialG = rest.filter(function(p){ return p.trial; }).sort(byConnectedThenQuality);
+    var paidG = rest.filter(function(p){ return !p.trial && isPurePaid(p); }).sort(byConnectedThenQuality);
+    var freeKeyG = rest.filter(function(p){ return !p.trial && !isPurePaid(p); }).sort(byConnectedThenQuality);
     if (recG.length){
       var gr = catSection('rec', 'Recommended', 'connect these first — best free quality', recG.length, true);
       recG.forEach(function(p){ renderCard(p, gr); });

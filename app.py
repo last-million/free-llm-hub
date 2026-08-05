@@ -6009,6 +6009,48 @@ def _provider_quota_row(pid, p):
                                   "resets_at", "limit_known")}
 
 
+# USER 2026-08-04: "put recommended... for the best providers that give
+# best models llms in quality... and highlight new for new providers." The
+# 'recommended' flag was a single hand-curated provider (puter) -- everyone
+# else showed as an ordinary card no matter how strong its actual models
+# were. Reuses _benchmark_score (the same scorer that already ranks every
+# model for routing) instead of a second scoring system: a provider's
+# quality is the best score any of its own free models can reach. 95 sits
+# just above the _STRONG_ROOTS auto-detected "new flagship release" tier
+# (100 base -> ~95 after the small per-provider speed/coding adjustments
+# _benchmark_score applies), so a provider only needs ONE genuinely strong
+# free model to qualify -- weak/tiny-tier models top out far below this
+# (see the Tier D comment: 18).
+_RECOMMENDED_QUALITY_THRESHOLD = 95
+# Providers added in the last few days of work on this hub (git log
+# providers.py, 2026-08-04) -- not derived at request time (git isn't
+# available/fast enough to shell out to on every /api/providers call), so
+# this is a snapshot list, same tradeoff the static 'recommended' flag
+# already makes. Update when a real new batch lands.
+_NEW_PROVIDER_IDS = frozenset((
+    "tokenrouter",
+    "deepinfra", "together", "hyperbolic", "nebius", "cohere",
+    "scaleway", "stepfun", "aion", "sealion", "requesty",
+    "dahl",
+))
+
+
+def _provider_quality_score(pid, free_models):
+    """Best _benchmark_score any of this provider's own free models reaches.
+    0 if it has no free models to score (paid-only, or discovery came back
+    empty) -- never raises, a scoring quirk on one model must not break the
+    whole provider list."""
+    best = 0.0
+    for m in free_models or ():
+        try:
+            s = _benchmark_score(pid, m)
+        except Exception:
+            continue
+        if s > best:
+            best = s
+    return best
+
+
 def _provider_row(pid, live_models=False):
     p = prov.get_provider(pid) or {}
     pcfg = config.get_provider_config(pid)
@@ -6044,7 +6086,7 @@ def _provider_row(pid, live_models=False):
         "no_key": bool(p.get("no_key")),   # open gateway: usable with NO api key
         # vendor documents anonymous instant keys -> the card can offer one click
         "can_mint_key": bool(p.get("key_mint_url")),
-        "free_models": provider_free_models(pid, live=live_models),
+        "free_models": (lambda fm: fm)(provider_free_models(pid, live=live_models)),
         "image_free_count": sum(1 for r in _image_model_rows(pid) if r.get("free", True)),
         "image_paid_count": sum(1 for r in _image_model_rows(pid) if not r.get("free", True)),
         "relay": relay,
@@ -6053,7 +6095,13 @@ def _provider_row(pid, live_models=False):
         # instead of the user discovering exhaustion through failed requests.
         # Cheap: quota.status reads local counters, no network.
         "quota": _provider_quota_row(pid, p),
-        "recommended": bool(p.get("recommended")),
+        # Hand-curated OR earns it on real model quality -- see
+        # _RECOMMENDED_QUALITY_THRESHOLD's comment for why 95.
+        "recommended": bool(p.get("recommended")) or
+                       _provider_quality_score(pid, p.get("default_free_models")) >=
+                       _RECOMMENDED_QUALITY_THRESHOLD,
+        "quality_score": _provider_quality_score(pid, p.get("default_free_models")),
+        "new": pid in _NEW_PROVIDER_IDS,
     }
 
 
