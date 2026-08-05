@@ -7354,13 +7354,79 @@ def _agent_cli_autoinstall_once():
             #    user's own install against the user's own credentials. Exactly
             #    what isolation is for. Check for the ISOLATED copy specifically.
             if agentic_chat._isolated_bin(cli_id):
+                _ensure_hyperframes_skill(cli_id)
                 continue                       # already isolated; leave it alone
             _log.info("[agent-cli] installing %s into the hub's isolated namespace", cli_id)
             ok, res = _install_isolated_cli(cli_id, bin_name)
             _log.info("[agent-cli] %s: %s", cli_id,
                       "installed" if ok else _sanitize(str(res.get("error"))))
+            if ok:
+                _ensure_hyperframes_skill(cli_id)
         except Exception:                                        # noqa: BLE001
             _log.debug("[agent-cli] auto-install failed for %s", cli_id, exc_info=True)
+
+
+_HYPERFRAMES_SKILL_REPO = "heygen-com/hyperframes"
+_HYPERFRAMES_INSTALL_TIMEOUT = 300
+
+
+def _ensure_hyperframes_skill(cli_id):
+    """Best-effort, idempotent: give claude/codex's isolated copy the
+    hyperframes-animation (claude) / gsap (codex) skill so agentic web builds
+    get real GSAP/Three.js/CSS-keyframe technique reference by default (user
+    2026-08-05: "give him the hyperframe skills... use it by default in all
+    web page generation"). opencode is skipped -- not in hyperframes' own
+    agent list and its isolated config has no skills/ convention at all.
+
+    Claude Code's own package cleanly names and installs a single
+    "hyperframes-animation" skill. Codex's package is a "plugin" bundling
+    several skills (video composition, CLI, registry, GSAP) with no clean
+    animation-only equivalent -- MEASURED 2026-08-05: `npx skills add`
+    installed it into `<CODEX_HOME>/.tmp/plugins/...` without ever
+    registering it in codex's own flat skills/<name>/ convention, and the
+    closest clean fit is the bundle's own "gsap" skill (a pure technique
+    reference, not video-composition-flavored) -- so codex gets that one
+    specifically, promoted into place by hand since the installer never
+    finishes the job for it on its own.
+
+    Never raises, never blocks CLI availability: a failure here just leaves
+    the skill absent, exactly as if this had never been attempted."""
+    if cli_id not in ("claude", "codex"):
+        return
+    config_dir = _isolated_config_dir(cli_id)
+    marker = os.path.join(config_dir, "skills",
+                          "hyperframes-animation" if cli_id == "claude" else "gsap")
+    if os.path.isdir(marker):
+        return                              # already installed
+    npx = shutil.which("npx")
+    if not npx:
+        return
+    _ensure_isolated_dirs(cli_id)
+    env = dict(os.environ)
+    env[{"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}[cli_id]] = config_dir
+    argv = _sub_launcher(npx) + ["--yes", "skills", "add", _HYPERFRAMES_SKILL_REPO,
+                                 "--full-depth", "-s", "hyperframes-animation", "-y", "-g"]
+    try:
+        subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", env=env, timeout=_HYPERFRAMES_INSTALL_TIMEOUT)
+    except Exception:                                            # noqa: BLE001
+        return
+    if cli_id == "codex":
+        # The installer stages the whole plugin bundle under .tmp and never
+        # finishes registering it for codex -- finish it: promote just the
+        # gsap skill to codex's real flat skills/<name>/ layout (matches the
+        # .system skills already living there) and drop the staging clone.
+        staged = os.path.join(config_dir, ".tmp", "plugins", "plugins",
+                              "hyperframes", "skills", "gsap")
+        target = os.path.join(config_dir, "skills", "gsap")
+        try:
+            if os.path.isdir(staged) and not os.path.isdir(target):
+                shutil.copytree(staged, target)
+            tmp_plugins = os.path.join(config_dir, ".tmp", "plugins")
+            if os.path.isdir(tmp_plugins):
+                shutil.rmtree(tmp_plugins, ignore_errors=True)
+        except Exception:                                        # noqa: BLE001
+            pass
 
 
 def _install_global_cli(cli_id, npm=None):
@@ -13331,6 +13397,62 @@ _IMAGE_GENERATORS = {
 }
 
 
+_IMAGE_TEXT_QA_PROMPT = (
+    "Look closely at this image. Does it contain any text (words, letters, "
+    "numbers, a sign, a label, a logo wordmark) that is garbled, misspelled, "
+    "malformed, duplicated, or otherwise clearly wrong? AI image generators "
+    "frequently render text incorrectly even when everything else looks "
+    "right. Reply with exactly one word first, YES or NO. If YES, add one "
+    "short sentence naming what is wrong. If the image has no text at all, "
+    "reply NO."
+)
+
+
+def _image_text_qa_flagged(b64_raw):
+    """User 2026-08-05: "verify with vision each image to see if there is
+    TEXT issue... sometimes image generators do mistakes in text." Ask a
+    vision-capable model whether a just-generated image has a text-rendering
+    defect. `b64_raw` is whatever format the generator returned (png/jpeg/
+    webp vary by provider) -- re-encoded here via _to_webp_b64 so the data
+    URL always carries a mime type that actually matches its bytes. True if
+    flagged, False if clean, None if no vision model could be reached at all
+    -- the caller fails OPEN on None (keeps the image rather than blocking
+    generation on an unrelated vision-provider outage). Tries up to 2 vision
+    candidates; never raises."""
+    try:
+        candidates = _vision_candidates()[:2]
+    except Exception:                                              # noqa: BLE001
+        return None
+    if not candidates:
+        return None
+    b64, mime = _to_webp_b64(b64_raw)
+    for pid, model in candidates:
+        payload = {
+            "model": model, "max_tokens": 120, "stream": False,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _IMAGE_TEXT_QA_PROMPT},
+                    {"type": "image_url",
+                     "image_url": {"url": "data:%s;base64,%s" % (mime, b64)}},
+                ],
+            }],
+        }
+        try:
+            resp = _dispatch_chat(pid, payload, False)
+        except (requests.RequestException, RuntimeError):
+            continue
+        if resp.status_code != 200:
+            continue
+        try:
+            data = resp.json()
+            text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        except (ValueError, requests.RequestException):
+            continue
+        return text.strip().upper().startswith("YES")
+    return None
+
+
 def _call_image_generator(pid, generator, pcfg, model, prompt, size, steps):
     """Same key-pool-rotation policy as the chat path's _upstream_chat
     (_KEY_ROTATE_STATUSES / _next_key_start, app.py ~3012-3027) -- MEASURED
@@ -13445,6 +13567,9 @@ def v1_images_generations():
     errors = []
     images_b64 = []
     landed_pid = landed_model = None
+    # Fallback if EVERY hop's image gets text-flagged: a real (if imperfect)
+    # image beats a 502 over a soft quality heuristic -- see below.
+    text_flagged_fallback = None
     for hop_pid, hop_model in chain[:MAX_IMAGE_HOPS]:
         generator = _IMAGE_GENERATORS.get(hop_pid)
         if not generator:
@@ -13458,6 +13583,17 @@ def v1_images_generations():
             continue
         quota.record(hop_pid, hop_model)
         if status == 200 and b64:
+            # User 2026-08-05: "verify with vision each image... ask to
+            # regenerate it to fix the text." A flagged image is treated as a
+            # soft failure -- fall through to the NEXT hop (a different
+            # provider/model, a real chance at different output) rather than
+            # accepting it. None (no vision model reachable) fails OPEN and
+            # accepts immediately, same as a clean result.
+            if _image_text_qa_flagged(b64):
+                errors.append("%s: vision flagged text issue, retrying next hop" % hop_pid)
+                if text_flagged_fallback is None:
+                    text_flagged_fallback = (b64, hop_pid, hop_model)
+                continue
             images_b64.append(b64)
             landed_pid, landed_model = hop_pid, hop_model
             _save_generated_image(b64, prompt, hop_pid, hop_model)
@@ -13473,6 +13609,12 @@ def v1_images_generations():
         if status in _DEAD_STATUSES:
             _mark_model_dead(hop_pid, hop_model, status)
         errors.append("%s: HTTP %s %s" % (hop_pid, status, _sanitize(detail or "")))
+    if not images_b64 and text_flagged_fallback is not None:
+        # Every hop that produced an image got text-flagged -- a real image
+        # with a possible text defect still beats failing the whole request.
+        b64, landed_pid, landed_model = text_flagged_fallback
+        images_b64.append(b64)
+        _save_generated_image(b64, prompt, landed_pid, landed_model)
     if not images_b64:
         return _openai_error(
             "All image providers failed: " + ("; ".join(errors) or "none available"),
@@ -13489,7 +13631,7 @@ def v1_images_generations():
         except (requests.RequestException, RuntimeError):
             break
         quota.record(landed_pid, landed_model)
-        if status == 200 and b64:
+        if status == 200 and b64 and not _image_text_qa_flagged(b64):
             images_b64.append(b64)
         else:
             break

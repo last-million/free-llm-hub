@@ -87,8 +87,13 @@ def test_briefs_stay_small():
     Those are concrete bans, concrete recipes and concrete checks, not
     style talk — the part a model cannot supply for itself. The real guard is
     test_worst_case_brief_cost below, which measures what a request ACTUALLY
-    pays."""
-    budget = {"web_design": 4500}
+    pays.
+
+    2026-08-05: +230 chars for the installed hyperframes-animation/gsap skill
+    pointer, with an explicit warning not to copy its data-*/class="clip"
+    composition markup into a live page -- that markup is real and would
+    silently no-op without HyperFrames' own JS runtime present."""
+    budget = {"web_design": 4750}
     for name, _rx, body in craft._BRIEFS:
         limit = budget.get(name, 1400)
         assert len(body) < limit, "%s brief is too long (%d chars)" % (name, len(body))
