@@ -361,6 +361,25 @@ def test_no_planning_instruction_when_there_is_no_real_text():
     assert "todo list" not in add
 
 
+def test_the_plan_must_survive_as_a_real_file_not_just_a_reply():
+    """USER 2026-08-04: "even after compacting he should know the progress...
+    and if I want to continue a conversation he should have the memory of
+    what was done... to don't redo the same work and lose tokens for
+    nothing." A checklist that only lives in the conversation is exactly
+    what a context compaction (the CLI's own, mid-task) or a resumed-later
+    turn loses -- a file on disk is what survives either."""
+    add = ac._system_prompt_addition(RESTAURANT)
+    assert "file" in add
+    assert "compacted" in add
+    assert "resumed later" in add
+
+
+def test_the_agent_is_told_to_read_the_file_before_redoing_work():
+    add = ac._system_prompt_addition(RESTAURANT)
+    assert "read it first if it exists" in add
+    assert "do not redo completed work" in add
+
+
 def test_a_brief_failure_never_costs_the_user_their_turn(monkeypatch):
     """Standards are a bonus; a read-only folder must not break the session."""
     monkeypatch.setattr(ac.craft, "system_message",
