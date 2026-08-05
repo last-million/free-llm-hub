@@ -314,3 +314,54 @@ def test_puter_quota_is_deliberately_unknown():
     row = quota._limit_for("puter")
     assert row is quota.DEFAULT_LIMIT
     assert row["limit"] is None and row.get("unknown") is True
+
+
+# --------------------------------------------------------------------------- #
+# tokenrouter, added 2026-08-04. VERIFIED via a real generation per id, not
+# just /models listing: moonshotai/kimi-k3-free -> real 200 with content.
+# nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free -> 403 insufficient_user_
+# quota despite the ':free' in its own id -- this platform's own free-suffix
+# naming is not trustworthy without a real probe, so only the one CONFIRMED
+# id is pinned as a default.
+# --------------------------------------------------------------------------- #
+
+def test_tokenrouter_registered_with_required_fields():
+    p = prov.get_provider("tokenrouter")
+    assert p is not None
+    assert p.get("name")
+    assert p["base_url"] == "https://api.tokenrouter.com/v1"
+    assert p.get("signup_url")
+    assert p.get("free_filter") in prov.FREE_FILTERS
+    assert isinstance(p.get("default_free_models"), list)
+    assert prov.is_known_provider("tokenrouter")
+
+
+def test_tokenrouter_needs_a_real_key():
+    assert not prov.get_provider("tokenrouter").get("no_key")
+
+
+def test_tokenrouter_suffix_free_matches_only_the_confirmed_id():
+    assert prov.is_free_model("tokenrouter", "moonshotai/kimi-k3-free")
+    # The unconfirmed ':free' id from the same catalog uses a DIFFERENT
+    # suffix convention (':free' not '-free') so it correctly does NOT match
+    # this provider's filter -- it was never pinned as a default either way,
+    # since the real call 403'd despite the name.
+    assert not prov.is_free_model(
+        "tokenrouter", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
+    assert not prov.is_free_model("tokenrouter", "moonshotai/kimi-k3")
+
+
+def test_tokenrouter_pinned_default_passes_its_own_free_check():
+    for mid in prov.get_provider("tokenrouter")["default_free_models"]:
+        assert prov.is_free_model("tokenrouter", mid), mid
+        assert prov.is_model_allowed(mid), mid
+        assert prov.is_chat_model(mid), mid
+
+
+def test_tokenrouter_quota_is_deliberately_unknown():
+    # No rate-limit headers on a real response and the marketing site blocks
+    # WebFetch -- no real figure to research, so no fabricated budget.
+    assert "tokenrouter" not in quota.FREE_LIMITS
+    row = quota._limit_for("tokenrouter")
+    assert row is quota.DEFAULT_LIMIT
+    assert row["limit"] is None and row.get("unknown") is True
