@@ -1181,6 +1181,29 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": [],
         "notes": "RETIRED — GitHub fully shut down GitHub Models on 2026-07-30; every endpoint now returns HTTP 410 'github_models_retirement_brownout' for all customers, authenticated or not. Nothing here is callable and the provider contributes no routing hops. Kept registered only so a revival would be a one-line change.",
     },
+    "tokenrouter": {
+        "name": "TokenRouter",
+        "base_url": "https://api.tokenrouter.com/v1",
+        "models_url": "https://api.tokenrouter.com/v1/models",
+        "signup_url": "https://www.tokenrouter.com/console/token",
+        "key_hint": "sk-...",
+        # VERIFIED 2026-08-04 via a real generation per id, not just /models
+        # listing (that alone said nothing about what's actually callable):
+        #   moonshotai/kimi-k3-free  -> real 200, real content. Genuinely free.
+        #   nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free -> 403
+        #     insufficient_user_quota, "$0.00 remaining credit, please
+        #     recharge" -- the ':free' in the id does NOT mean free on this
+        #     platform; it still draws the paid balance. Do NOT trust a
+        #     provider's own '-free'/':free' naming here without a real probe.
+        "free_filter": "suffix_free",
+        "free_suffix": "-free",
+        "default_free_models": ["moonshotai/kimi-k3-free"],
+        # No rate-limit headers on a real response and the marketing site
+        # 403s WebFetch, so the real per-minute/day cap is UNKNOWN -- not
+        # guessed here (see quota.py: an unknown provider is never reported
+        # exhausted, but a real 429 still throttles it via the normal path).
+        "notes": "Keyless-style OpenAI-compatible aggregator (100+ models). Only moonshotai/kimi-k3-free confirmed genuinely free by a real call; other '-free'/':free'-tagged ids on this platform have been seen to still bill the account balance despite the name -- verify each with a real generation before trusting the suffix.",
+    },
     "uncloseai": {
         "name": "UncloseAI (Hermes)",
         "base_url": "https://hermes.ai.unturf.com/v1",
