@@ -39,3 +39,7 @@ image*.png
 # transient test artifact from exercising run.bat
 runbat.test.log
 hub.start.err.log
+
+# ad-hoc local debug scratch, not read by any app code
+free_models.txt
+list_keys.py
