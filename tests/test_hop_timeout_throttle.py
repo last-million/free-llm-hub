@@ -131,6 +131,68 @@ def test_a_429_with_no_retry_after_uses_the_full_cooldown_default(isolated_confi
     assert ("uncloseai", "open", app._HOP_COOLDOWN_DEFAULT) in model_calls, model_calls
 
 
+# --------------------------------------------------------------------------- #
+# A raw 5xx status (not a raised exception) never got a cooldown at all -- so a
+# hop that answers with an HTTP error, rather than failing to connect, was
+# retried on every single request with zero memory of the prior failure.
+#
+# MEASURED 2026-08-05 (live activity log): g4f-nvidia's mistral-medium-3.5-128b
+# hop returned ConnectionError in one request, then HTTP 524 (Cloudflare
+# gateway timeout -- the origin really did hang, just behind a proxy that
+# turned the hang into a response instead of a dropped socket) in the very
+# next request seconds later. Nothing had throttled it in between.
+# --------------------------------------------------------------------------- #
+
+def test_a_5xx_response_gets_throttled_so_a_retry_skips_it(monkeypatch):
+    throttled = []
+    monkeypatch.setattr(app.quota, "mark_throttled",
+                        lambda pid, secs=None: throttled.append((pid, secs)))
+
+    def fake_dispatch(pid, payload, stream):
+        if pid == "g4f-nvidia":
+            return _Resp(524, {})
+        return _Resp(200, {"choices": [{"finish_reason": "stop",
+                                        "message": {"role": "assistant", "content": "OK"}}]})
+    monkeypatch.setattr(app, "_dispatch_chat", fake_dispatch)
+    monkeypatch.setattr(app, "_build_chain",
+                        lambda *a, **k: [("g4f-nvidia", "mistralai/mistral-medium-3.5-128b"),
+                                        ("groq", "llama")])
+    monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
+    client = app.app.test_client()
+    r = client.post("/v1/chat/completions", json={
+        "model": "auto", "max_tokens": 24, "stream": False,
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    assert ("g4f-nvidia", app._HOP_COOLDOWN_DEFAULT) in throttled, \
+        "a raw 5xx response must get the same cooldown a Timeout already gets: %r" % throttled
+
+
+def test_a_429_response_is_not_double_throttled_by_the_5xx_branch(monkeypatch):
+    """429 is already handled inside _upstream_chat's own key-rotation/backoff
+    once its key pool is exhausted -- the outer non-2xx branch must not ALSO
+    fire a second, redundant mark_throttled for it (the new check is strictly
+    >= 500, so 429 never enters it)."""
+    throttled = []
+    monkeypatch.setattr(app.quota, "mark_throttled",
+                        lambda pid, secs=None: throttled.append((pid, secs)))
+
+    def fake_dispatch(pid, payload, stream):
+        if pid == "openrouter":
+            return _Resp(429, {})
+        return _Resp(200, {"choices": [{"finish_reason": "stop",
+                                        "message": {"role": "assistant", "content": "OK"}}]})
+    monkeypatch.setattr(app, "_dispatch_chat", fake_dispatch)
+    monkeypatch.setattr(app, "_build_chain",
+                        lambda *a, **k: [("openrouter", "some-model"), ("groq", "llama")])
+    monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
+    client = app.app.test_client()
+    r = client.post("/v1/chat/completions", json={
+        "model": "auto", "max_tokens": 24, "stream": False,
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    assert not throttled, "429 must stay owned by _upstream_chat, not double-throttled here: %r" % throttled
+
+
 def test_a_429_with_a_real_retry_after_still_honors_it_exactly(isolated_config, monkeypatch):
     """The reasoned default must only fill in when the provider gives nothing
     to go on -- an explicit Retry-After is real information and must win."""
