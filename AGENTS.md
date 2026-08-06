@@ -234,6 +234,42 @@ the five ids in a "crews (multi-agent)" optgroup (hardcoded in
 `templates/index.html` — virtual ids never appear in `/api/models`). Covered by
 `tests/test_crews.py`.
 
+Hardening learned live 2026-08-06 (all in `_swarm_dispatch`, app.py):
+
+- `_dispatch_chat_with_deadline` gives every stage hop an OVERALL deadline
+  (`_SWARM_HOP_DEADLINE = 150s`). Non-streaming hops had only requests'
+  per-recv timeout (CHAT_READ_TIMEOUT=300s), which a provider trickling
+  keepalive bytes resets forever — tokenrouter/kimi-k3-free held a stage
+  24+ min. Hung/failed hops feed `_record_outcome(..., False)`, so later
+  stages route around them; successful hops now record usage + reliability
+  via `_record_chat_usage` like every other endpoint.
+- A hop answering `finish_reason: "length"` (provider completion cap —
+  kilocode/hy3 cut a synthesis mid-attribute, shipping broken HTML) is
+  skipped for the next hop; the longest partial is the fallback if every
+  hop truncates.
+
+Escalation & agent self-delegation (user request 2026-08-06, covered by
+`tests/test_crew_auto_escalate.py` + `tests/test_chat_project_gate.py`):
+
+- **Dashboard project gate**: an opening-turn Auto message that
+  `looksLikeFullProject()` (index.html) flags gets an inline "🐝 Full crew /
+  ⚡ Just answer" chooser before sending — once per conversation, Auto only.
+- **API auto-escalation**: clients have no human to ask, so
+  `/v1/chat/completions` routes a tool-free, image-free, single-user-turn
+  `auto` request that `crews.looks_like_full_project()` flags straight to the
+  crew pipeline (flag `crew_auto_escalate`, default on). Tool-carrying turns
+  and explicit `<pid>/<model>` are never touched. The Python heuristic must
+  stay in sync with its JS twin.
+- **Agent hint**: `_apply_craft_brief(..., agentic=True)` (payload carries
+  tools) appends `_CREW_AGENT_HINT` on the opening turn — tells Codex/Claude
+  Code/hermes/openclaw that crews exist and to call them with a tool-free
+  `model: "crew*"` request, so the agent itself decides per task (flag
+  `crew_agent_hint`, default on).
+- The prompt enhancer's hops got the same overall-deadline treatment
+  (`_ENHANCE_HOP_DEADLINE = 45s`) plus a 20s client-side AbortController —
+  an "enhance" that pended 150s+ behind a locked composer was the
+  "clicked Just answer and nothing happened" bug.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
