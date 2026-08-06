@@ -536,3 +536,155 @@ def test_the_internal_flag_never_reaches_a_provider():
         _app.requests.post = orig
     if sent.get("body") is not None:
         assert "_no_craft" not in sent["body"], "internal flag leaked to the provider"
+
+
+# --------------------------------------------------------------------------- #
+# A hung non-streaming hop must die at the OVERALL deadline, not hold the
+# stage forever. Observed live 2026-08-06: tokenrouter/kimi-k3-free trickled
+# keepalive bytes (resetting requests' per-recv read timeout on every byte)
+# while never answering stream:false — one swarm stage was hostage 24+ min.
+# --------------------------------------------------------------------------- #
+
+def test_hung_hop_is_abandoned_at_the_deadline():
+    import app as _app
+    import time as _time
+
+    def hanging_dispatch(pid, payload, stream):
+        _time.sleep(30)            # the provider that never answers
+        raise AssertionError("the test must have moved on long before this")
+
+    orig = _app._dispatch_chat
+    orig_deadline = _app._SWARM_HOP_DEADLINE
+    try:
+        _app._dispatch_chat = hanging_dispatch
+        _app._SWARM_HOP_DEADLINE = 0.3
+        t0 = _time.time()
+        resp, exc = _app._dispatch_chat_with_deadline("pid", {"model": "m"},
+                                                      _app._SWARM_HOP_DEADLINE)
+        elapsed = _time.time() - t0
+    finally:
+        _app._dispatch_chat = orig
+        _app._SWARM_HOP_DEADLINE = orig_deadline
+    assert resp is None and exc is None
+    assert elapsed < 5, "a hung hop must be abandoned at the deadline, not 300s+"
+
+
+def test_healthy_hop_passes_through_the_deadline_wrapper():
+    import app as _app
+
+    class _Resp:
+        status_code = 200
+
+    def fast_dispatch(pid, payload, stream):
+        return _Resp()
+
+    orig = _app._dispatch_chat
+    try:
+        _app._dispatch_chat = fast_dispatch
+        resp, exc = _app._dispatch_chat_with_deadline("pid", {"model": "m"}, 5)
+    finally:
+        _app._dispatch_chat = orig
+    assert resp is not None and resp.status_code == 200 and exc is None
+
+
+def test_raising_hop_reports_its_exception_without_raising():
+    import app as _app
+
+    def broken_dispatch(pid, payload, stream):
+        raise RuntimeError("conn refused")
+
+    orig = _app._dispatch_chat
+    try:
+        _app._dispatch_chat = broken_dispatch
+        resp, exc = _app._dispatch_chat_with_deadline("pid", {"model": "m"}, 5)
+    finally:
+        _app._dispatch_chat = orig
+    assert resp is None and isinstance(exc, RuntimeError)
+
+
+def test_swarm_dispatch_walks_past_a_hung_hop_to_a_healthy_one():
+    """End to end through _swarm_dispatch: first hop hangs, second answers —
+    the stage must return the healthy hop's text, fast."""
+    import app as _app
+    import time as _time
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "stage answer"}}]}
+
+        def close(self):
+            pass
+
+    def dispatch(pid, payload, stream):
+        if pid == "hangpid":
+            _time.sleep(30)
+        return _Resp()
+
+    orig = (_app._dispatch_chat, _app._route_by_difficulty,
+            _app._build_chain, _app._SWARM_HOP_DEADLINE, _app._act_pick)
+    try:
+        _app._dispatch_chat = dispatch
+        _app._route_by_difficulty = lambda *a, **k: ("hangpid", "m1", None)
+        _app._build_chain = lambda pid, model, est: [("hangpid", "m1"),
+                                                     ("goodpid", "m2")]
+        _app._act_pick = lambda pid, model: None
+        _app._SWARM_HOP_DEADLINE = 0.3
+        t0 = _time.time()
+        text, who = _app._swarm_dispatch([{"role": "user", "content": "hi"}], 100)
+        elapsed = _time.time() - t0
+    finally:
+        (_app._dispatch_chat, _app._route_by_difficulty,
+         _app._build_chain, _app._SWARM_HOP_DEADLINE, _app._act_pick) = orig
+    assert text == "stage answer" and who == "goodpid/m2"
+    assert elapsed < 5, "the chain must walk past the hung hop, not wait for it"
+
+
+def test_truncated_hop_walks_the_chain_and_keeps_the_longest_partial():
+    """finish_reason=length means the PROVIDER capped the completion — observed
+    live: kilocode/hy3 cut a crew synthesis mid-attribute and shipped broken
+    HTML. The stage must try the next hop; if every hop truncates, the longest
+    partial is better than nothing."""
+    import app as _app
+
+    def make_resp(text, finish):
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"choices": [{"message": {"content": text},
+                                     "finish_reason": finish}]}
+
+            def close(self):
+                pass
+        return _Resp()
+
+    # Case 1: first hop truncates, second completes -> the COMPLETE one wins.
+    def dispatch_1(pid, payload, stream):
+        return make_resp("cut off mid-sen", "length") if pid == "cutpid" \
+            else make_resp("the full answer", "stop")
+
+    orig = (_app._dispatch_chat, _app._route_by_difficulty,
+            _app._build_chain, _app._act_pick, _app._record_chat_usage)
+    try:
+        _app._route_by_difficulty = lambda *a, **k: ("cutpid", "m1", None)
+        _app._build_chain = lambda pid, model, est: [("cutpid", "m1"),
+                                                     ("fullpid", "m2")]
+        _app._act_pick = lambda pid, model: None
+        _app._record_chat_usage = lambda *a, **k: None
+        _app._dispatch_chat = dispatch_1
+        text, who = _app._swarm_dispatch([{"role": "user", "content": "hi"}], 100)
+        assert text == "the full answer" and who == "fullpid/m2"
+
+        # Case 2: every hop truncates -> the LONGEST partial is returned.
+        _app._build_chain = lambda pid, model, est: [("cutpid", "m1"),
+                                                     ("fullpid", "m2")]
+        _app._dispatch_chat = lambda pid, payload, stream: (
+            make_resp("short", "length") if pid == "cutpid"
+            else make_resp("a somewhat longer partial answer", "length"))
+        text, who = _app._swarm_dispatch([{"role": "user", "content": "hi"}], 100)
+        assert text == "a somewhat longer partial answer" and who == "fullpid/m2"
+    finally:
+        (_app._dispatch_chat, _app._route_by_difficulty,
+         _app._build_chain, _app._act_pick, _app._record_chat_usage) = orig
