@@ -212,10 +212,11 @@ config, credentials, session state — with your everyday CLI install.
 This is a **separate feature from the "Local subscription providers" hop
 above** — that one is a one-shot, no-tool-access text completion used as a
 last resort inside normal chat routing. Agentic chat instead runs your own
-**Claude Code** subscription as a **real coding agent** directly against a
-project folder you pick: it can read/write/edit files and run shell commands
-in that folder, with **no per-action confirmation prompt**, exactly as if you
-had typed `claude --dangerously-skip-permissions` yourself in that folder.
+**Claude Code, Codex, or OpenCode** subscription as a **real coding agent**
+directly against a project folder you pick: it can read/write/edit files and
+run shell commands in that folder, with **no per-action confirmation
+prompt**, exactly as if you had typed `claude --dangerously-skip-permissions`
+(or the Codex/OpenCode equivalent) yourself in that folder.
 
 **Off by default.** Nothing under `/api/agent/*` will start a session until
 you flip it on with `POST /api/agent/settings {"enabled": true}` (or the
@@ -225,19 +226,24 @@ always work, even with the master switch off, so a kill switch can still
 kill a session that's already running.
 
 **What "full permissions" means, concretely:** every turn is invoked with
-`--dangerously-skip-permissions`, so the CLI will not ask before editing a
-file or running a command — it just does it, using **your own real Claude
-Code subscription** (the same login/billing as your everyday terminal use).
-Only enable this against a folder you're comfortable letting an AI modify
-unattended, and only after reading what that flag does in Claude Code's own
-docs.
+the chosen CLI's own no-confirmation flag (`--dangerously-skip-permissions`
+for Claude Code, `--dangerously-bypass-approvals-and-sandbox` for Codex, no
+extra flag needed for OpenCode's own `run` mode), so it will not ask before
+editing a file or running a command — it just does it, using **your own real
+subscription** for whichever CLI you picked (the same login/billing as your
+everyday terminal use). Only enable this against a folder you're comfortable
+letting an AI modify unattended, and only after reading what that flag does
+in the CLI's own docs.
 
 **Which CLI(s) this actually supports today:**
 
 | CLI | Supported | Why |
 |---|---|---|
-| **Claude Code** (`claude`) | ✅ Yes | `-p "<message>" --resume <id> --output-format json --dangerously-skip-permissions` is a documented, confirmed-working invocation shape. |
-| **Codex** (`codex`) | ❌ No — refuses cleanly with a 400 | Official docs list only `--last/--all/--image/PROMPT/SESSION_ID` as accepted `codex exec resume` flags (no approval/sandbox override), and open upstream reports (openai/codex #9144, #5322) describe `--dangerously-bypass-approvals-and-sandbox` being silently ignored after `codex exec resume`. Since this feature is fully non-interactive (no human available to click through a silently-reverted approval prompt) and every turn past the first needs resume+bypass together, Codex is scoped out rather than run on an unverified combination. `GET /api/agent/settings` reports this per-CLI so the dashboard can show it honestly instead of claiming both work. |
+| **Claude Code** (`claude`) | ✅ Yes (recommended) | `-p "<message>" --resume <id> --output-format json --dangerously-skip-permissions` is a documented, confirmed-working invocation shape. |
+| **Codex** (`codex`) | ✅ Yes (default) | Official docs only list `--last/--all/--image/PROMPT/SESSION_ID` as accepted `codex exec resume` flags, and open upstream reports (openai/codex #9144, #5322) once described `--dangerously-bypass-approvals-and-sandbox` being silently ignored after `codex exec resume` — so this was scoped out at first rather than run on an unverified combination. Live-verified working end to end on codex-cli 0.144.5 (2026-07-17): `codex exec --json` runs with full tool access under that flag, and it DOES survive `codex exec resume <thread_id>` for turn 2+ (a resumed turn executed a command with no approval hang). Codex is now the default CLI for a new session. |
+| **OpenCode** (`opencode`) | ✅ Yes | Live-verified on opencode-ai 1.18.11 (2026-08-01): `opencode run --format json` emits one JSON event per line (`step_start`/`tool_use`/`text`/`step_finish`), every event carries a `sessionID`, and `--session <id>` continues it. Must be spawned with stdin closed — left open, it loads config, logs "init", then blocks forever with zero output. |
+
+`GET /api/agent/settings` reports per-CLI support live so the dashboard never has to hardcode this table.
 
 **Session model:** one agentic session = one `(cli, project_dir)` pair you
 pick explicitly when starting it (there is no default folder). Each user
