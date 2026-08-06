@@ -6241,6 +6241,69 @@ def api_providers():
     return jsonify([_provider_row(p["id"]) for p in prov.list_providers()])
 
 
+# Providers whose signup needs a real human step no script should try to do for
+# you. Surfaced so the guided setup can WARN and let you skip, instead of
+# sending you to a page that dead-ends five minutes in. Sourced from each
+# provider's own `notes` in providers.py (kept here rather than there because
+# this is an onboarding-UI concern, not a protocol fact the router uses).
+#
+# The reason this list exists at all: the obvious "just automate the signups"
+# shortcut is a ToS violation on essentially every provider, risks the Google
+# account driving it, and breaks on CAPTCHA/phone/KYC anyway. So the honest
+# design is to make the HUMAN path fast, and be upfront about which ones cost
+# real effort.
+_SIGNUP_FRICTION = {
+    "nararouter":  "Needs a Telegram join and a credit card on file.",
+    "mistral":     "Needs phone verification (and a card for some regions).",
+    "glm":         "Needs phone verification.",
+    "siliconflow": "Needs Chinese real-name verification (实名认证) for the full quota.",
+    "modelscope":  "Needs KYC / a Chinese account to finish signup.",
+    "baidu":       "Needs KYC and phone verification.",
+    "tencent":     "Needs KYC to finish signup.",
+}
+
+
+@app.route("/api/onboarding", methods=["GET"])
+def api_onboarding():
+    """The guided key-setup list: the best providers NOT yet connected, in the
+    order worth doing them.
+
+    Deliberately just an ORDERED LIST OF LINKS. It opens each provider's own
+    signup/key page for YOU to click through; nothing here automates account
+    creation, and it never touches a provider's site itself. Automating the
+    signups was considered and rejected: it breaks nearly every provider's
+    terms, gets keys revoked, and endangers the email account used to do it.
+
+    Sorted friction-free first, then by real model quality (_provider_quality_
+    score, the same _benchmark_score that ranks models for routing) -- so the
+    quick wins come first and the phone/KYC ones are last and clearly labelled.
+    """
+    steps = []
+    for p in prov.list_providers():
+        pid = p["id"]
+        if p.get("no_key"):
+            continue                       # keyless: nothing to set up
+        if not p.get("signup_url"):
+            continue                       # nowhere to send them
+        cfg = config.get_provider_config(pid)
+        if cfg.get("api_keys"):
+            continue                       # already connected
+        friction = _SIGNUP_FRICTION.get(pid)
+        steps.append({
+            "id": pid,
+            "name": p.get("name") or pid,
+            "signup_url": p.get("signup_url"),
+            "key_hint": p.get("key_hint") or "",
+            "quality_score": _provider_quality_score(pid, p.get("default_free_models")),
+            "recommended": bool(p.get("recommended")),
+            "new": pid in _NEW_PROVIDER_IDS,
+            "friction": friction,
+            "free_models": (p.get("default_free_models") or [])[:3],
+        })
+    steps.sort(key=lambda s: (s["friction"] is not None, -s["quality_score"]))
+    return jsonify({"steps": steps, "remaining": len(steps)})
+
+
 def _sync_relay_enable(pid):
     """When a provider that only actually works through a local-subscription
     relay (see _PROVIDER_RELAY_SUB_PID -- EMPTY since 2026-07-31, so this is a

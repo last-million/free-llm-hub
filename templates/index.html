@@ -1733,6 +1733,30 @@
     color:var(--text-dim); white-space:pre-wrap; word-break:break-word; }
   .notes-modal-foot{ padding:14px 18px; border-top:1px solid var(--border-soft); display:flex; justify-content:flex-end; }
   .prov-warn{ margin:2px 0 14px; }
+  /* Guided key setup */
+  .guided{ border:1px solid var(--border); border-radius:var(--radius); background:var(--surface);
+    padding:14px 16px; margin:2px 0 14px; }
+  .guided-h{ display:flex; align-items:center; gap:10px; margin-bottom:6px; }
+  .guided-h strong{ font-size:14.5px; }
+  .guided-sub{ font-size:12.5px; color:var(--text-faint); flex:1; }
+  .guided-note{ font-size:12px; color:var(--text-faint); line-height:1.55; margin-bottom:12px; }
+  .gstep{ display:flex; align-items:flex-start; gap:12px; padding:11px 0;
+    border-top:1px solid var(--border-soft); }
+  .gstep-n{ flex:none; width:22px; height:22px; border-radius:50%; font-size:11.5px; font-weight:700;
+    display:inline-flex; align-items:center; justify-content:center;
+    background:var(--accent-soft); color:var(--ok-text); margin-top:2px; }
+  .gstep-main{ flex:1; min-width:0; }
+  .gstep-top{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .gstep-name{ font-weight:650; font-size:13.5px; }
+  .gstep-models{ font-size:11.5px; color:var(--text-faint); margin-top:3px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .gstep-friction{ font-size:11.5px; color:var(--warn-text); margin-top:4px; }
+  .gstep-row{ display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+  .gstep-row input{ flex:1; min-width:190px; font-family:var(--mono); font-size:12px;
+    padding:7px 10px; border-radius:var(--radius-sm); border:1px solid var(--border);
+    background:var(--surface-2); color:var(--text); }
+  .gstep.done{ opacity:.55; }
+  .gstep-ok{ font-size:12px; color:var(--ok-text); font-weight:600; }
   .cx-welcome-invite{ padding:2px 18px 0; font-size:12.5px; color:var(--text-faint); }
   .cx-welcome-social{ display:flex; gap:10px; padding:8px 18px 4px; }
   .cx-soc{ display:inline-flex; align-items:center; gap:8px; padding:9px 14px; border-radius:10px;
@@ -2658,10 +2682,31 @@
         <input type="search" id="search" placeholder="Search providers, models, notes&hellip;" aria-label="Search providers">
       </div>
       <span class="count-note" id="count-note"></span>
+      <button type="button" class="btn-test-all" id="guided-setup-btn" title="Walk through connecting the best providers you haven't set up yet, best first">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+        Guided setup
+      </button>
       <button type="button" class="btn-test-all" id="test-all-btn" title="Re-verify every connected provider with a real generation request">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg>
         Test all
       </button>
+    </div>
+    <!-- Guided key setup. Deliberately an ordered list of LINKS you click
+         through yourself: it opens each provider's own signup page and gives
+         you somewhere to paste the key. Nothing here automates account
+         creation -- that breaks nearly every provider's terms, gets keys
+         revoked, and risks the email account used to do it. -->
+    <div class="guided" id="guided" hidden>
+      <div class="guided-h">
+        <strong id="guided-title">Guided setup</strong>
+        <span class="guided-sub" id="guided-sub"></span>
+        <button type="button" class="btn sm" id="guided-close">Close</button>
+      </div>
+      <div class="guided-note">
+        Opens each provider's own signup page for you to click through. It never
+        creates accounts for you &mdash; automating that breaks their terms and gets keys revoked.
+      </div>
+      <div id="guided-body"></div>
     </div>
     <div class="test-progress" id="test-progress" hidden>
       <div class="test-progress-bar"><div class="test-progress-fill" id="test-progress-fill"></div></div>
@@ -4769,6 +4814,96 @@
     }
     if (pids.length) runHealthChecks(pids);
   }
+  /* ---------------------------------------------------------------------
+     GUIDED KEY SETUP
+     An ordered list of the best providers you have NOT connected yet: click
+     "Open signup", click through it YOURSELF on their site, paste the key
+     back here. Nothing automates account creation -- that violates nearly
+     every provider's terms, gets keys revoked, and endangers the email
+     account used to drive it. Friction-free providers come first; the ones
+     needing phone/KYC/Telegram are last and clearly labelled so nobody
+     burns five minutes discovering it the hard way.
+     --------------------------------------------------------------------- */
+  function guidedStepHTML(s, i){
+    var badges = '';
+    if (s.recommended) badges += '<span class="badge rec">Recommended</span>';
+    if (s['new']) badges += '<span class="badge new-provider">New</span>';
+    var models = (s.free_models || []).join(', ');
+    return '' +
+      '<div class="gstep" data-pid="' + esc(s.id) + '">' +
+        '<span class="gstep-n">' + (i + 1) + '</span>' +
+        '<div class="gstep-main">' +
+          '<div class="gstep-top"><span class="gstep-name">' + esc(s.name) + '</span>' + badges + '</div>' +
+          (models ? '<div class="gstep-models">' + esc(models) + '</div>' : '') +
+          (s.friction ? '<div class="gstep-friction">' + esc(s.friction) + '</div>' : '') +
+          '<div class="gstep-row">' +
+            '<a class="btn sm" href="' + esc(s.signup_url) + '" target="_blank" rel="noopener noreferrer">Open signup</a>' +
+            '<input type="password" autocomplete="off" spellcheck="false" placeholder="' +
+              esc(s.key_hint ? ('paste key (' + s.key_hint + ')') : 'paste key here') + '">' +
+            '<button type="button" class="btn sm primary gstep-save">Save</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+  }
+
+  function renderGuided(steps){
+    var body = $('#guided-body');
+    var sub = $('#guided-sub');
+    if (!body) return;
+    if (!steps.length){
+      body.innerHTML = '<div class="guided-note">Every provider with a signup page is already connected. Nothing left to do here.</div>';
+      if (sub) sub.textContent = '';
+      return;
+    }
+    if (sub) sub.textContent = steps.length + ' not connected yet — best first';
+    body.innerHTML = steps.map(guidedStepHTML).join('');
+  }
+
+  function initGuidedSetup(){
+    var btn = $('#guided-setup-btn');
+    var panel = $('#guided');
+    var closeBtn = $('#guided-close');
+    if (!btn || !panel) return;
+    btn.addEventListener('click', function(){
+      if (!panel.hidden){ panel.hidden = true; return; }
+      panel.hidden = false;
+      $('#guided-body').innerHTML = '<div class="guided-note">Loading&hellip;</div>';
+      api('/api/onboarding').then(function(d){
+        renderGuided((d && d.steps) || []);
+      }).catch(function(e){
+        $('#guided-body').innerHTML = '<div class="guided-note">Could not load: ' + esc(e.message) + '</div>';
+      });
+    });
+    if (closeBtn) closeBtn.addEventListener('click', function(){ panel.hidden = true; });
+    /* Delegated so it keeps working after every re-render. */
+    panel.addEventListener('click', function(ev){
+      var save = ev.target.closest && ev.target.closest('.gstep-save');
+      if (!save) return;
+      var step = save.closest('.gstep');
+      var input = step.querySelector('input');
+      var key = (input.value || '').trim();
+      if (!key){ input.focus(); return; }
+      save.disabled = true;
+      save.textContent = 'Saving…';
+      api('/api/providers/' + encodeURIComponent(step.dataset.pid) + '/keys',
+          { method:'POST', body:{ api_key: key } })
+        .then(function(){
+          step.classList.add('done');
+          step.querySelector('.gstep-row').innerHTML = '<span class="gstep-ok">Connected ✓</span>';
+          toast('Connected ' + step.querySelector('.gstep-name').textContent);
+          /* The provider cards below now have a key -- keep them truthful. */
+          loadProviders().then(function(){
+            providers.forEach(function(p){ applyCardHealth(cardForPid(p.id), p.id); });
+          });
+        })
+        .catch(function(e){
+          save.disabled = false;
+          save.textContent = 'Save';
+          toast(e.message, true);
+        });
+    });
+  }
+
   /* explicit "Test all" button: FORCE re-verification of every connected provider
      right now, ignoring cache freshness — for right after adding/rotating keys. */
   function testAllProviders(){
@@ -8558,6 +8693,7 @@
   });
   var testAllBtn = $('#test-all-btn');
   if (testAllBtn) testAllBtn.addEventListener('click', testAllProviders);
+  initGuidedSetup();
   loadProviderMode();
   loadModels().then(loadDefault).then(loadChatModels);
   loadClis();
