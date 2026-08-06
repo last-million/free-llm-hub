@@ -11472,6 +11472,40 @@ def _with_headers(resp_tuple, headers):
 # --------------------------------------------------------------------------- #
 _SWARM_IDS = ("swarm", "team", "plan")
 
+# Total deadline for ONE swarm/crew stage hop. Swarm stages dispatch
+# non-streaming, so they get neither the streaming first-byte peek (~25-90s)
+# nor the inter-chunk idle timeout — only requests' per-recv read timeout
+# (CHAT_READ_TIMEOUT). A provider that trickles keepalive bytes resets that on
+# every byte and can hold a hop forever: OBSERVED LIVE 2026-08-06,
+# tokenrouter/moonshotai/kimi-k3-free kept a stage hostage 24+ minutes (never
+# answering stream:false), so a whole crew run produced nothing. CHAT_READ_TIMEOUT
+# stays as the per-recv guard; this is the overall one. The abandoned thread
+# is a daemon and its socket dies with the provider's connection — bounded by
+# chain length, so the leak is small and self-cleaning.
+_SWARM_HOP_DEADLINE = 150
+
+
+def _dispatch_chat_with_deadline(pid, payload, deadline=None):
+    """_dispatch_chat(..., stream=False) bounded by an OVERALL deadline.
+    Returns (resp, exc): resp is None on deadline or failure, exc is the
+    raised exception (None on deadline). Never raises."""
+    if deadline is None:
+        deadline = _SWARM_HOP_DEADLINE
+    box = {}
+
+    def _call():
+        try:
+            box["resp"] = _dispatch_chat(pid, payload, False)
+        except (requests.RequestException, RuntimeError) as exc:
+            box["exc"] = exc
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    t.join(deadline)
+    if t.is_alive():
+        return None, None            # hung hop — abandon and walk the chain on
+    return box.get("resp"), box.get("exc")
+
 
 def _crew_name_for(model):
     """None for a plain swarm id; otherwise the crew the id selects —
@@ -11510,18 +11544,21 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
                                               force_difficulty="hard")
         if not pid:
             return "", None
+        best_partial, best_partial_who = "", None
         for hop_pid, hop_model in _build_chain(pid, model, est):
             if exclude_pids and hop_pid in exclude_pids:
                 continue     # reviewer must not be the provider that wrote it
             payload = {"model": hop_model, "stream": False,
                        "max_tokens": max_tokens, "messages": messages,
                        "_no_craft": True}   # stripped in _upstream_chat
-            try:
-                resp = _dispatch_chat(hop_pid, payload, False)
-            except (requests.RequestException, RuntimeError):
+            resp, hop_exc = _dispatch_chat_with_deadline(hop_pid, payload,
+                                                         _SWARM_HOP_DEADLINE)
+            if resp is None:         # hung hop (deadline) or a failed one
+                _record_outcome(hop_pid, hop_model, False)
                 continue
             try:
                 if resp.status_code != 200:
+                    _record_outcome(hop_pid, hop_model, False)
                     continue
                 data = resp.json() or {}
             except ValueError:
@@ -11531,11 +11568,27 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
                     resp.close()
                 except Exception:                                # noqa: BLE001
                     pass
-            text = (((data.get("choices") or [{}])[0].get("message") or {})
-                    .get("content") or "").strip()
+            choice = (data.get("choices") or [{}])[0]
+            text = ((choice.get("message") or {}).get("content") or "").strip()
+            if text and choice.get("finish_reason") == "length":
+                # Truncated by the PROVIDER's completion cap (observed live:
+                # kilocode/hy3 cut a synthesis mid-attribute, shipping broken
+                # HTML). Walking the chain costs one hop; a cut-off artefact is
+                # what the user receives otherwise. Keep the longest truncation
+                # as the stage result if EVERY hop truncates.
+                if len(text) > len(best_partial):
+                    best_partial = text
+                    best_partial_who = "%s/%s" % (hop_pid, hop_model)
+                continue
             if text:
+                # Same success hook as every other endpoint: usage accounting
+                # AND the reliability record, so a stage's healthy hop is what
+                # the next stage's chain prefers (and a hung hop sinks).
+                _record_chat_usage(hop_pid, hop_model, data, est)
                 _act_pick(hop_pid, hop_model)
                 return text, "%s/%s" % (hop_pid, hop_model)
+        if best_partial:
+            return best_partial, best_partial_who
     except Exception:                                            # noqa: BLE001
         _log.debug("[swarm] stage failed", exc_info=True)
     return "", None
