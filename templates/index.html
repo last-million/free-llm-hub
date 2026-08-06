@@ -5318,7 +5318,13 @@
                                         second pass falls straight through
                                         instead of enhancing again forever */
         setStreaming(true);          /* lock the composer during the rewrite */
+        /* Immediate visible feedback — the rewrite can take seconds, and a
+           locked composer with no on-screen sign of life reads as "the click
+           did nothing" (the exact 2026-08-06 report). Removed on completion. */
+        var enhEl = appendBubble('assistant', 'Hub',
+          '✨ Enhancing your opening prompt — a few seconds, then your message sends itself.');
         return enhanceOpening(content, 'chat').then(function(enh){
+          enhEl.remove();
           setStreaming(false);
           if (enh){
             textEl.value = enh.text; autoGrow();
@@ -5492,12 +5498,21 @@
      proceeds. The rewrite is never hidden — the caller shows what was actually
      sent, with one-click revert. */
   function enhanceOpening(text, kind){
-    return api('/api/enhance-prompt', { method:'POST', body:{ prompt:text, kind:kind } })
+    /* 20s outer guard: the server bounds each enhance hop (45s deadline), but
+       the user is staring at a locked composer — a rewrite is a nice-to-have,
+       never worth a dead-looking page. AbortError lands in the same catch as
+       every other failure: the ORIGINAL prompt is used. (Reported 2026-08-06:
+       "clicked Just answer and nothing happened" — the enhance call pended
+       150s+ before anything rendered.) */
+    var ctl = new AbortController();
+    var killer = setTimeout(function(){ ctl.abort(); }, 20000);
+    return api('/api/enhance-prompt', { method:'POST', body:{ prompt:text, kind:kind }, signal: ctl.signal })
       .then(function(r){
         if (!r || !r.changed || !r.enhanced) return null;
         return { text:r.enhanced, original:r.original, model:r.model };
       })
-      .catch(function(){ return null; });   /* never block a generation */
+      .catch(function(){ return null; })   /* never block a generation */
+      .finally(function(){ clearTimeout(killer); });
   }
 
   /* Renders "Enhanced by <model> — Revert" under a prompt box. */
