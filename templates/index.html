@@ -5067,6 +5067,27 @@
     var imageNote = $('#chat-image-note');
     var history = [];       /* [{role, content, error?}] */
     var openingEnhanced = false;   /* opening prompt already rewritten this conversation */
+    /* Crew/swarm virtual ids — a multi-model pipeline, never a single model. */
+    var PIPELINE_MODEL_RE = /^(crew|swarm|team|plan)([-/]|$)/;
+    /* The project gate: a FULL-PROJECT opening on Auto asks "crew or plain
+       answer?" before sending (user request 2026-08-06 — a crew run costs
+       5-20 silent minutes, so the choice must be the user's, not a regex's).
+       Asked ONCE per conversation; only on the opening turn; only when the
+       picker is on Auto (a deliberate model/crew choice is already a choice). */
+    var projectGateAnswered = false;
+    function looksLikeFullProject(t){
+      var s = (t || '').toLowerCase();
+      /* Strong signals: explicit project/completeness vocabulary — no length
+         floor ("Create a full-stack e-commerce app from scratch" is short but
+         unambiguous). */
+      if (/(full[- ]stack|full project|complete (website|web ?site|app|application|project|platform|store|shop)|multi[- ]page|entire (site|website|app|project)|e[- ]?commerce|from scratch)/.test(s)) return true;
+      if (s.length < 60) return false;          /* short asks are never projects */
+      /* Weaker: a build verb + an artefact noun + MULTIPLE parts listed. */
+      var build = /\b(build|create|make|develop|code|implement)\b/.test(s) &&
+                  /\b(website|web ?app|app|application|platform|shop|store|marketplace|dashboard|game|saas|blog|portfolio|crm|cms|api)\b/.test(s);
+      var parts = (s.match(/\band\b/g) || []).length + (s.match(/,/g) || []).length;
+      return build && parts >= 2 && s.length > 100;
+    }
 
     /* ---------- persistence ------------------------------------------------
        The quick chat lived entirely in this closure: reload the page and every
@@ -5245,12 +5266,49 @@
       });
     });
 
+    /* Inline crew-or-plain chooser shown by the project gate. Buttons pick the
+       model VISIBLY (the picker itself switches), remove the chooser, and
+       re-enter sendChat — which then falls through to the normal path. */
+    function askProjectGate(){
+      var el = appendBubble('assistant', 'Hub',
+        'This looks like a FULL PROJECT. How should I build it?');
+      var bubble = el.querySelector('.bubble');
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:8px;margin-top:10px;flex-wrap:wrap';
+      function mkBtn(label, title, fn){
+        var b = document.createElement('button');
+        b.className = 'btn'; b.textContent = label; b.title = title;
+        b.addEventListener('click', fn);
+        row.appendChild(b);
+        return b;
+      }
+      mkBtn('🐝 Full crew — thorough, 5-20 min',
+            'Planner + specialist workers + cross-provider reviewer + fix pass. ' +
+            'Answer arrives all at once.',
+            function(){ el.remove(); modelSel.value = 'crew'; sendChat(); });
+      mkBtn('⚡ Just answer — fast, single model',
+            'One strong model via Auto. Quick, but nobody checks the result.',
+            function(){ el.remove(); sendChat(); });
+      bubble.appendChild(row);
+      msgsEl.scrollTop = msgsEl.scrollHeight;
+    }
+
     function sendChat(){
       if (streaming) return;
       var content = textEl.value.trim();
       if (!content && !pendingImages.length) return;
       var model = modelSel.value;
       if (!model){ toast('Pick a model first', true); return; }
+      /* PROJECT GATE — opening turn on Auto that reads as a full project:
+         ask crew-vs-plain BEFORE anything else (before the enhancer too, so a
+         "no" answer takes the normal enhanced path and a "yes" goes straight
+         to the crew unenhanced — the pipeline plans, it does not need a
+         rewritten brief). Once per conversation, text turns only. */
+      if (!history.length && content && !pendingImages.length &&
+          !projectGateAnswered && model === 'auto' && looksLikeFullProject(content)){
+        projectGateAnswered = true;
+        return askProjectGate();
+      }
       /* OPENING prompt only: enhance the first turn of a conversation, never a
          later one — mid-conversation the user is steering and correcting, and
          rewriting that would fight them. Text-only turns too: an enhanced
@@ -5294,7 +5352,7 @@
          streams as one shot after several minutes of silence. Without this
          notice the chat looks dead (reported 2026-08-06: "nothing works").
          The first real content chunk overwrites it (bubble.textContent = acc). */
-      if (/^(crew|swarm|team|plan)([-/]|$)/.test(model)){
+      if (PIPELINE_MODEL_RE.test(model)){
         bubble.textContent = '⏳ "' + model + '" runs a multi-model pipeline ' +
           '(planner → specialist workers → reviewer → fix pass). Expect 5-20 ' +
           'minutes of silence, then the whole answer at once — it is working, ' +
@@ -5386,6 +5444,7 @@
       if (controller) controller.abort();
       history = []; pendingImages = []; renderPendingImages(); renderEmpty();
       openingEnhanced = false;                    /* next first turn enhances again */
+      projectGateAnswered = false;                /* and the project gate may ask again */
       var n = $('#chat-enhanced-note'); if (n){ n.classList.remove('show'); n.innerHTML = ''; }
     });
 
@@ -5400,6 +5459,7 @@
       chatConvId = null;                 /* minted again on the next saved turn */
       history = []; pendingImages = []; renderPendingImages(); renderEmpty();
       openingEnhanced = false;
+      projectGateAnswered = false;
       refreshChatHistoryCount();
     });
     var histBtn = $('#chat-history-btn');
