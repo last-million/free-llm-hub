@@ -133,6 +133,22 @@ Keys are stored locally in `~/.free-llm-hub/config.json` (created with `0600` pe
 
 The dashboard's **Connect** panel shows these snippets pre-filled with your live port and gateway key — with copy buttons. Here is the shape:
 
+**Every CLI the hub can wire up (`CLI_REGISTRY` in `app.py`) — the dashboard's per-CLI Auto-fix button does the "One-click" ones for you (merge-safe, and Disconnect reverses the edit):**
+
+| CLI | Connect | How |
+|---|---|---|
+| **Claude Code** | ✅ One-click | `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL` env, or Auto-fix writes `~/.claude/settings.json`'s `env` block. |
+| **OpenAI Codex CLI** | ✅ One-click | Config-only — Codex ignores `OPENAI_BASE_URL`/`OPENAI_API_BASE` entirely. Auto-fix adds a `[model_providers.freehub]` block (`wire_api = "responses"`) to `~/.codex/config.toml`. Default agentic-chat CLI (see below). |
+| **OpenCode** | ✅ One-click | Auto-fix adds a `free-llm-hub` openai-compatible provider to `~/.config/opencode/opencode.json`. |
+| **Aider** | ✅ One-click | `OPENAI_API_BASE`/`OPENAI_API_KEY` env, or Auto-fix writes `~/.aider.conf.yml`. |
+| **Qwen Code** | ✅ One-click | `OPENAI_API_BASE`/`OPENAI_API_KEY`/`OPENAI_MODEL` env, or Auto-fix writes `~/.qwen/.env`. The OpenAI-compatible fork of Gemini CLI — use this instead of Gemini CLI itself (see below). |
+| **Kimi Code** | ✅ One-click | Config-only (no env fallback) — Auto-fix writes a `[providers.free-hub]` block + an `auto` model alias into `~/.kimi/config.toml`, remembers your prior `default_model`, restores it on Disconnect. |
+| **OpenClaw** | ✅ One-click | Config-only — Auto-fix adds `models.providers.freehub` + allowlists it in `openclaw.json`. Hot-reloads, no restart needed. |
+| **Hermes Agent** (Nous Research) | ✅ One-click | Config-only — Auto-fix sets `model.provider: custom` + `base_url` in Hermes' `config.yaml`. Restart Hermes after. |
+| **llm** (Simon Willison) | ⚠️ Manual | No Auto-fix (needs a YAML *list* entry, not a merge) — add a model to `extra-openai-models.yaml`, then `llm keys set freehub`; dashboard shows the exact block. |
+| **Cursor Agent CLI** | ⚠️ Uncertain | Custom-endpoint support isn't officially documented — try the OpenAI/Anthropic env vars only if your version supports a base-URL override. |
+| **Gemini CLI** | ❌ Incompatible | Speaks Google's native API, not OpenAI-shaped — no env var or config edit makes this hub serve it. Use **Qwen Code** instead. |
+
 ### Claude Code (Anthropic Messages protocol)
 
 ```bash
