@@ -1748,6 +1748,84 @@ def _est_tokens(messages, tools=None):
     return chars // 4 + 400  # + overhead for roles/formatting
 
 
+# --------------------------------------------------------------------------- #
+# OUTCOME-LEARNED RELIABILITY
+#
+# Every other free-tier gateway routes on AVAILABILITY (is it up, does it have
+# quota left). None of them can route on "did this hop actually deliver",
+# because a pure proxy never sees the request through to a usable answer. This
+# hub does, so it can learn from what really happened instead of a hand-typed
+# list going stale (see _TOOL_PROVEN, four hardcoded strings).
+#
+# THE PROBLEM THIS FIXES, measured live: g4f-nvidia/mistral-medium-3.5-128b
+# ReadTimeout'd ~7 minutes per attempt, four attempts running (2026-08-03),
+# then hit ConnectionError + HTTP 524 on consecutive requests (2026-08-05).
+# Every cooldown we added is a SHORT-TERM sideline that expires; nothing
+# remembered "this hop has a bad track record" across the whole session, so it
+# kept winning chain slots on raw benchmark strength alone.
+#
+# DELIBERATELY PENALTY-ONLY. A perfect record earns NO bonus -- promoting a
+# mediocre-but-reliable model over a genuinely stronger one is a real
+# regression risk, and this is a reliability signal, not a quality one. An
+# unknown (pid, model) scores exactly as before, so this can only ever demote
+# something that has actually, repeatedly failed here.
+#
+# SCOPE LIMIT, stated honestly: "ok" means the hop returned a usable answer,
+# NOT that the coding CLI went on to complete its task. True task-completion
+# learning needs a signal the CLI itself does not report back. This is learned
+# RELIABILITY, which is still strictly better than the hardcoded guess it
+# supplements.
+# --------------------------------------------------------------------------- #
+_OUTCOME_TTL = 7 * 86400        # forget a record untouched for a week
+_OUTCOME_CAP = 40               # cap each counter; halving on overflow keeps the
+                                # RATIO but lets a fixed provider climb back out
+_OUTCOME_WEIGHT = 9.0           # max points an all-failure record can cost
+_outcomes = {}                  # (pid, model) -> {"ok": int, "fail": int, "last": float}
+_outcome_lock = threading.Lock()
+
+
+def _record_outcome(pid, model, ok):
+    """One real delivery result for this (pid, model). Never raises."""
+    if not (pid and model):
+        return
+    try:
+        now = time.time()
+        with _outcome_lock:
+            rec = _outcomes.get((pid, model))
+            if not rec or now - rec.get("last", 0) > _OUTCOME_TTL:
+                rec = {"ok": 0, "fail": 0, "last": now}
+            rec["ok" if ok else "fail"] += 1
+            rec["last"] = now
+            if rec["ok"] + rec["fail"] > _OUTCOME_CAP:
+                # Halve BOTH so the ratio survives while old evidence decays --
+                # a provider that was broken for an hour must be able to earn
+                # its slot back once it starts answering again.
+                rec["ok"] //= 2
+                rec["fail"] //= 2
+            _outcomes[(pid, model)] = rec
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _reliability(pid, model):
+    """Laplace-smoothed delivery rate in [0,1]. Exactly 0.5 (neutral) when
+    unknown or stale, so a model with no history is never judged -- and one
+    single failure cannot condemn a model outright ((0+1)/(1+2) = 0.33, not 0)."""
+    with _outcome_lock:
+        rec = _outcomes.get((pid, model))
+        if not rec or time.time() - rec.get("last", 0) > _OUTCOME_TTL:
+            return 0.5
+        ok, fail = rec.get("ok", 0), rec.get("fail", 0)
+    return (ok + 1.0) / (ok + fail + 2.0)
+
+
+def _reliability_penalty(pid, model):
+    """0 for an unknown or healthy hop; up to _OUTCOME_WEIGHT for one that has
+    really, repeatedly failed to deliver here. Never negative (see the
+    penalty-only note above)."""
+    return max(0.0, (0.5 - _reliability(pid, model))) * 2.0 * _OUTCOME_WEIGHT
+
+
 def _record_chat_usage(hop_pid, hop_model, data, prompt_est):
     """Record usage from a completed OpenAI-shaped chat response `data` (the
     raw upstream JSON -- all three protocol handlers dispatch through the
@@ -1755,7 +1833,14 @@ def _record_chat_usage(hop_pid, hop_model, data, prompt_est):
     Uses the REAL usage object when the provider returned one; otherwise
     falls back to the same char/4 estimate this file already uses elsewhere
     (_est_tokens). Never raises -- usage_history.record() already swallows
-    its own errors, but guard the data-parsing here too."""
+    its own errors, but guard the data-parsing here too.
+
+    ALSO the single success hook for outcome-learned reliability: this is
+    called from all six accepted-answer sites across the three endpoints
+    (chat/responses/messages, streaming and not), and only ever once a hop's
+    answer was actually accepted -- which is exactly the "it delivered"
+    signal _reliability_penalty needs."""
+    _record_outcome(hop_pid, hop_model, True)
     try:
         usage = data.get("usage") if isinstance(data, dict) else None
         if isinstance(usage, dict) and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
@@ -2206,6 +2291,15 @@ def _dead_state_dump():
     with _model_max_input_lock:
         out["model_max_input"] = {"%s|%s" % (p, m): v
                                   for (p, m), v in _MODEL_MAX_INPUT.items()}
+    # Learned delivery reliability rides along too (see _record_outcome). It is
+    # earned one real request at a time, so losing it on every restart would
+    # mean re-learning a bad hop by burning real chain slots on it again --
+    # the same argument that put model_max_input here. TTL-expired records are
+    # dropped rather than saved.
+    with _outcome_lock:
+        out["outcomes"] = {"%s|%s" % (p, m): [r.get("ok", 0), r.get("fail", 0), r.get("last", 0)]
+                           for (p, m), r in _outcomes.items()
+                           if now - r.get("last", 0) <= _OUTCOME_TTL}
     return out
 
 
@@ -2235,6 +2329,18 @@ def _dead_state_load(blob):
                 p, m = key.split("|", 1)
                 cur = _MODEL_MAX_INPUT.get((p, m))
                 _MODEL_MAX_INPUT[(p, m)] = min(cur, v) if cur else v
+    with _outcome_lock:
+        for key, row in (blob.get("outcomes") or {}).items():
+            if not (isinstance(key, str) and "|" in key
+                    and isinstance(row, list) and len(row) == 3):
+                continue
+            ok, fail, last = row
+            if not all(isinstance(v, (int, float)) for v in (ok, fail, last)):
+                continue
+            if now - last > _OUTCOME_TTL:
+                continue                  # stale evidence -- start that hop clean
+            p, m = key.split("|", 1)
+            _outcomes[(p, m)] = {"ok": int(ok), "fail": int(fail), "last": float(last)}
 
 
 def _init_quota_persistence():
@@ -5458,12 +5564,18 @@ def _agentic_score(entry, sustain_override=None):
     `sustain_override` (from _model_identity_min_penalty, computed once per pool by
     the caller) lets a scarce-quota copy of a model inherit a non-scarce sibling's
     penalty instead of its own — omit it (default None) to get the plain per-
-    provider penalty, exactly as before this parameter existed."""
+    provider penalty, exactly as before this parameter existed.
+
+    ...and minus the LEARNED reliability penalty (see _reliability_penalty): a
+    hop with a real track record of not delivering here gets demoted no matter
+    how well it benchmarks. Penalty-only and neutral-when-unknown, so a model
+    the hub has never routed to scores exactly as it always did."""
     penalty = (sustain_override.get((entry[1], entry[2])) if sustain_override is not None
                else None)
     if penalty is None:
         penalty = _sustain_penalty(entry[1])
-    return (entry[0] - penalty - _tool_dialect_penalty(entry[2]))
+    return (entry[0] - penalty - _tool_dialect_penalty(entry[2])
+            - _reliability_penalty(entry[1], entry[2]))
 
 
 def _context_ok(pid, model, est):
@@ -5902,7 +6014,21 @@ def api_activity():
         out.append({**a,
                     "duration_ms": int((end - a["started"]) * 1000),
                     "started_ms": int(a["started"] * 1000)})
-    return jsonify({"activity": out})
+    # What routing has LEARNED (see _record_outcome), alongside what it did --
+    # a demotion that cannot be inspected is indistinguishable from a bug, and
+    # the activity feed is already the routing-diagnostics surface. Only hops
+    # carrying a real penalty are listed, worst first.
+    with _outcome_lock:
+        ledger = [(p, m, r.get("ok", 0), r.get("fail", 0)) for (p, m), r in _outcomes.items()]
+    learned = []
+    for pid, model, ok, fail in ledger:
+        penalty = _reliability_penalty(pid, model)
+        if penalty > 0:
+            learned.append({"provider": pid, "model": model, "ok": ok, "failed": fail,
+                            "reliability": round(_reliability(pid, model), 3),
+                            "score_penalty": round(penalty, 2)})
+    learned.sort(key=lambda r: r["score_penalty"], reverse=True)
+    return jsonify({"activity": out, "learned_unreliable": learned[:15]})
 
 
 # ---------------------------------------------------------------------------
@@ -11473,6 +11599,7 @@ def v1_chat_completions():
                 # be a raw 5xx status (524 etc.) that never raises at all --
                 # handled separately below, in the non-2xx branch.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                _record_outcome(hop_pid, hop_model, False)
             continue
         if resp.status_code == 200:
             if stream and is_sub_hop:
@@ -11591,6 +11718,7 @@ def v1_chat_completions():
                 # ConnectionError on the SAME hop moments earlier in a
                 # different request -- nothing had cooled it down between them.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                _record_outcome(hop_pid, hop_model, False)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
@@ -12125,6 +12253,7 @@ def v1_responses(_retry_pass=False):
                 # be a raw 5xx status (524 etc.) that never raises at all --
                 # handled separately below, in the non-2xx branch.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                _record_outcome(hop_pid, hop_model, False)
             continue
         if resp.status_code == 200:
             # Echo back the id the client ASKED for (codex sends "auto", which now has
@@ -12194,6 +12323,7 @@ def v1_responses(_retry_pass=False):
                 # a cooldown here, so a genuinely down hop was retried on every
                 # request. MEASURED 2026-08-05: g4f-nvidia/mistral-medium-3.5.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                _record_outcome(hop_pid, hop_model, False)
             _ekey = "%s:%d" % (hop_pid, resp.status_code)  # DIAG: capture first raw body
             if _ekey not in _err_bodies:
                 try:
@@ -12750,6 +12880,7 @@ def v1_messages():
                 # be a raw 5xx status (524 etc.) that never raises at all --
                 # handled separately below, in the non-2xx branch.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                _record_outcome(hop_pid, hop_model, False)
             continue
         if resp.status_code == 200:
             model_str = requested_model or (hop_pid + "/" + hop_model)
@@ -12802,6 +12933,7 @@ def v1_messages():
                 # a cooldown here, so a genuinely down hop was retried on every
                 # request. MEASURED 2026-08-05: g4f-nvidia/mistral-medium-3.5.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                _record_outcome(hop_pid, hop_model, False)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
