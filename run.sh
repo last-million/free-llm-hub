@@ -7,6 +7,7 @@
 # Everything else is a subcommand of this file:
 #
 #   ./run.sh                    start the hub
+#   ./run.sh restart            stop whatever is on the port, then start fresh
 #   ./run.sh autostart          also start it at login, and self-heal
 #   ./run.sh autostart remove   undo that
 #   ./run.sh autostart status   show what is installed
@@ -16,10 +17,13 @@
 set -e
 cd "$(dirname "$0")"
 
+HUB_RESTART=""
 case "${1:-}" in
   autostart) shift; exec ./scripts/autostart.sh "$@" ;;
+  restart) HUB_RESTART=1; shift ;;
   help|-h|--help)
     echo "  ./run.sh                    start the hub"
+    echo "  ./run.sh restart            stop whatever is on the port, then start fresh"
     echo "  ./run.sh autostart          also start it at login, and self-heal"
     echo "  ./run.sh autostart remove   undo that"
     echo "  ./run.sh autostart status   show what is installed"
@@ -27,6 +31,69 @@ case "${1:-}" in
 esac
 
 PORT="${PORT:-8787}"
+
+# --- restart: stop whatever is serving PORT, then fall through to a normal start
+# Restarting by hand -- kill whichever pid you happened to find, start a new one
+# -- is exactly how you end up with several hubs alive at once. FOUND LIVE
+# 2026-08-06: four orphaned `python app.py` processes, only one actually owning
+# the port, so every check "passed" against whichever happened to answer. The
+# double-bind guard below only refuses a SECOND copy; it cannot clean up after a
+# manual kill that missed one. This asks the OS who owns the port instead of
+# guessing from a process name, so it can never kill an unrelated python.
+hub_pids_on_port() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -ti "tcp:${PORT}" -sTCP:LISTEN 2>/dev/null || true
+  elif command -v fuser >/dev/null 2>&1; then
+    fuser "${PORT}/tcp" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ano -p TCP 2>/dev/null | grep LISTENING | grep ":${PORT} " \
+      | awk '{print $NF}' | grep -E '^[0-9]+$' | sort -u || true
+  fi
+}
+
+# Git Bash on Windows: `kill` CANNOT reliably signal a native Windows process --
+# MSYS emulates signals for its own children only. MEASURED 2026-08-06: both
+# `kill` and `kill -9` reported success while the hub kept right on serving, so
+# the restart silently did nothing and the guard below then said "already
+# running - nothing to do", which reads exactly like success. taskkill is the
+# only thing Windows actually honours.
+hub_kill_pid() {
+  if [ -n "${WINDIR:-}${SYSTEMROOT:-}" ] && command -v taskkill >/dev/null 2>&1; then
+    # // is MSYS's escape for a leading / in a native-tool flag.
+    taskkill //F //PID "$1" >/dev/null 2>&1 || taskkill /F /PID "$1" >/dev/null 2>&1 || true
+  else
+    kill "$1" 2>/dev/null || true
+  fi
+}
+
+if [ -n "$HUB_RESTART" ]; then
+  for pid in $(hub_pids_on_port); do
+    echo "[free-llm-hub] Stopping the hub on port ${PORT} (pid ${pid})..."
+    hub_kill_pid "$pid"
+  done
+  # Let it drain, then insist. Windows/macOS can hold the socket briefly after
+  # the process is gone, so the start below would otherwise race the release.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -z "$(hub_pids_on_port)" ] && break
+    sleep 0.5
+  done
+  for pid in $(hub_pids_on_port); do
+    echo "[free-llm-hub] pid ${pid} did not exit - forcing."
+    if [ -n "${WINDIR:-}${SYSTEMROOT:-}" ]; then hub_kill_pid "$pid"; else kill -9 "$pid" 2>/dev/null || true; fi
+  done
+  sleep 1
+  # A restart that could not actually stop the old hub must FAIL LOUDLY. Falling
+  # through would hit the double-bind guard below, which reports "already running
+  # and healthy - nothing to do" and exits 0 -- indistinguishable from a
+  # successful restart, while the new code never loaded.
+  still="$(hub_pids_on_port)"
+  if [ -n "$still" ]; then
+    echo "ERROR: could not stop the hub serving port ${PORT} (pid(s): ${still})." >&2
+    echo "       Nothing was restarted - the OLD process is still running." >&2
+    echo "       Stop it yourself, then run this again." >&2
+    exit 1
+  fi
+fi
 
 # A dashboard Stop is intentional, not a crash. Supervisors set
 # HUB_SUPERVISED=1; in that mode the marker makes this launcher a clean no-op.

@@ -7,13 +7,14 @@ rem no way to tell which one starts the thing is a coin flip for anyone who did
 rem not write them. Everything else is a subcommand of this file:
 rem
 rem   run.bat                    start the hub  <- what a double-click does
+rem   run.bat restart            stop whatever is on the port, then start fresh
 rem   run.bat autostart          also start it at logon, and self-heal
 rem   run.bat autostart remove   undo that
 rem   run.bat autostart status   show what is installed
 rem
 rem Idempotent: creates a venv on first run, reuses it afterwards. Installs
 rem Python itself if the machine has none.
-setlocal
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 if /i "%~1"=="autostart" (
@@ -24,8 +25,28 @@ if /i "%~1"=="help" goto :usage
 if /i "%~1"=="/?" goto :usage
 if /i "%~1"=="-h" goto :usage
 if /i "%~1"=="--help" goto :usage
+set "HUB_RESTART="
+if /i "%~1"=="restart" set "HUB_RESTART=1"
 
 if "%PORT%"=="" set "PORT=8787"
+
+rem --- restart: stop whatever is serving PORT, then fall through to a normal start
+rem Restarting by hand - kill whichever pid you happened to find, start a new one
+rem - is exactly how you end up with several hubs alive at once. FOUND LIVE
+rem 2026-08-06: four orphaned `python app.py` processes, only one actually owning
+rem the port, so every check "passed" against whichever happened to answer. The
+rem double-bind guard below only refuses a SECOND copy; it cannot clean up after a
+rem manual kill that missed one. This asks the OS who owns the port rather than
+rem matching on a process name, so it can never kill an unrelated python.
+if defined HUB_RESTART (
+  for /f "tokens=5" %%P in ('netstat -ano -p TCP 2^>nul ^| findstr /R /C:"LISTENING" ^| findstr /C:":%PORT% "') do (
+    echo [free-llm-hub] Stopping the hub on port %PORT% ^(pid %%P^)...
+    taskkill /F /PID %%P >nul 2>nul
+  )
+  rem Windows can hold the socket briefly after the process is gone, so the
+  rem start below would otherwise race the release. ~2s, no extra dependency.
+  ping -n 3 127.0.0.1 >nul 2>nul
+)
 
 if defined FREE_LLM_HUB_CONFIG (
   for %%I in ("%FREE_LLM_HUB_CONFIG%") do set "STOP_MARKER=%%~dpIintentional-stop"
@@ -124,6 +145,7 @@ rem ===========================================================================
 echo Calvoun Free LLM Hub
 echo.
 echo   run.bat                    start the hub ^(this is what a double-click does^)
+echo   run.bat restart            stop whatever is on the port, then start fresh
 echo   run.bat autostart          also start it at logon, and self-heal
 echo   run.bat autostart remove   undo that
 echo   run.bat autostart status   show what is installed
