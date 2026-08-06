@@ -4831,15 +4831,36 @@ def _summarize_dropped(dropped):
     return None
 
 
-def _apply_craft_brief(messages):
-    """Prepend a domain craft brief when the OPENING turn calls for one.
+# Tells an agent CLI (Codex / Claude Code / hermes / openclaw — any tool-calling
+# client) that the hub's crew pipeline exists and how to call it, so the AGENT
+# itself can decide a big creation subtask is worth delegating (user request
+# 2026-08-06: "the agent should take the decision depending on the task").
+# Opening-turn-only like every injection here: mid-loop instructions corrupt
+# agent loops. ~110 tokens, injected only for tool-carrying requests.
+_CREW_AGENT_HINT = (
+    "HUB CREW DELEGATION (optional — judge per task): this endpoint is a "
+    "multi-model hub. For a LARGE, self-contained creation subtask (a whole "
+    "page, a full module, a research brief) you may delegate it instead of "
+    "writing it inline: an ordinary chat/completions POST to this same "
+    "endpoint with NO tools field and model \"crew\" (auto-picks the "
+    "specialist) or \"crew-code\" / \"crew-research\" / \"crew-write\" / "
+    "\"crew-design\". The pipeline (planner -> specialist workers -> "
+    "cross-provider reviewer -> fix pass) takes 5-20 minutes and returns the "
+    "finished artefact as one message. Use it for big deliverables only — "
+    "never for quick questions, never for a turn that needs YOUR tools."
+)
+
+
+def _apply_craft_brief(messages, agentic=False):
+    """Prepend a domain craft brief when the OPENING turn calls for one —
+    plus, for tool-carrying (agentic) requests, the crew-delegation hint.
 
     Deliberately opening-turn-only. By the second turn a tool loop may be in
     flight, and injecting instructions into a running agent turn is the failure
     mode that made the prompt enhancer dashboard-only. On the first turn there is
     no loop yet, so this is additive and safe.
 
-    It never touches the user's own text — it adds ONE system message ahead of
+    It never touches the user's own text — it adds system messages ahead of
     the conversation. Returns the original list when nothing matches, so the
     common case allocates nothing."""
     try:
@@ -4858,7 +4879,10 @@ def _apply_craft_brief(messages):
         if isinstance(text, list):     # multimodal turn -> its text parts
             text = " ".join(p.get("text") or "" for p in text if isinstance(p, dict))
         brief = craft.system_message(text or "")
-        if not brief:
+        extra = [brief] if brief else []
+        if agentic and config.get_flag("crew_agent_hint", True):
+            extra.append({"role": "system", "content": _CREW_AGENT_HINT})
+        if not extra:
             return messages
         # After any leading system messages, so the caller's own instructions
         # (Codex's agent prompt) still come first and win on conflict.
@@ -4866,7 +4890,7 @@ def _apply_craft_brief(messages):
         while i < len(messages) and isinstance(messages[i], dict) \
                 and messages[i].get("role") == "system":
             i += 1
-        return messages[:i] + [brief] + messages[i:]
+        return messages[:i] + extra + messages[i:]
     except Exception:                                            # noqa: BLE001
         _log.debug("[craft] brief injection skipped", exc_info=True)
         return messages
@@ -5047,7 +5071,8 @@ def _upstream_chat(pid, payload, stream):
         # single model on every creation task, which is the one task it exists
         # for. Skipping them is also ~1.8k tokens back per stage.
         msgs = (payload["messages"] if payload.get("_no_craft")
-                else _apply_craft_brief(payload["messages"]))
+                else _apply_craft_brief(payload["messages"],
+                                        agentic=bool(payload.get("tools"))))
         payload = dict(payload)
         payload.pop("_no_craft", None)      # never goes upstream
         payload["messages"] = msgs
@@ -10720,6 +10745,15 @@ _ENHANCE_MAX_TOKENS = 400
 # instruction-following job, so it is routed as `medium` (= strongest model).
 _ENHANCE_DIFFICULTY = "medium"
 
+# Overall deadline for ONE enhance hop. Enhancement is a nice-to-have rewrite
+# the user is WAITING on with a dead-looking composer (reported 2026-08-06:
+# "Just answer" click, then 150s+ of silence — the hop list was walking
+# degraded providers at CHAT_READ_TIMEOUT=300s apiece). 45s is generous for a
+# 400-token rewrite; past it the next hop tries, and the client-side timeout
+# (20s, enhanceOpening in index.html) is the outer guard that keeps the UI
+# alive even if every hop stalls.
+_ENHANCE_HOP_DEADLINE = 45
+
 # Second line of defence for the same failure: a model that answers instead of
 # rewriting almost always opens with one of these. Cheap, and a false positive
 # only costs us the (optional) enhancement.
@@ -10793,9 +10827,9 @@ def _enhance_prompt(text, kind="chat"):
                 continue        # never spend the user's paid subscription on a rewrite
             payload = {"model": hop_model, "stream": False,
                        "max_tokens": _ENHANCE_MAX_TOKENS, "messages": messages}
-            try:
-                resp = _dispatch_chat(hop_pid, payload, False)
-            except (requests.RequestException, RuntimeError):
+            resp, _hop_exc = _dispatch_chat_with_deadline(hop_pid, payload,
+                                                          _ENHANCE_HOP_DEADLINE)
+            if resp is None:         # hung or raised hop — try the next one
                 continue
             try:
                 if resp.status_code != 200:
@@ -11661,6 +11695,23 @@ def v1_chat_completions():
     # are refused outright for the same reason.
     if _is_swarm_model(body.get("model")):
         return _swarm_completion(body)
+    # AUTO-ESCALATION to the crew pipeline. The dashboard project gate asks a
+    # HUMAN "crew or plain?" before sending; an API client (hermes, openclaw,
+    # a script) has no human to ask, so the hub decides by the same heuristic:
+    # a tool-free, image-free, OPENING-turn 'auto' request that reads as a full
+    # project gets the crew pipeline instead of one model. Tool-carrying turns
+    # (agent loops) and explicit '<pid>/<model>' choices are never touched —
+    # both are already a decision. Flag: crew_auto_escalate (default on).
+    if (_is_orchestrate(body.get("model"))
+            and config.get_flag("crew_auto_escalate", True)
+            and not body.get("tools") and not has_images
+            and len([m for m in (body.get("messages") or [])
+                     if isinstance(m, dict) and m.get("role") == "user"]) == 1
+            and crews.looks_like_full_project(
+                swarm._last_user_text(body.get("messages")))):
+        esc = dict(body)
+        esc["model"] = "crew"
+        return _swarm_completion(esc)
     # Orchestrate (Auto): route by task difficulty AND request size so weak/small
     # providers take easy work and big requests avoid small-TPM providers (413).
     # Explicit '<pid>/<model>' bypasses model choice (chain still size-filters).

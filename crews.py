@@ -358,6 +358,45 @@ def detect_crew(messages):
     return ""
 
 
+# --------------------------------------------------------------------------- #
+# Full-project detection — used by the dashboard project gate (its JS twin in
+# templates/index.html) and by the server-side AUTO-ESCALATION in app.py: a
+# tool-free opening that reads as a full project gets the crew pipeline
+# instead of one model. Keep the two implementations in sync.
+# Conservative on purpose: a missed project just gets a normal (good) answer;
+# a false positive spends 5-20 minutes of pipeline on a casual ask.
+# --------------------------------------------------------------------------- #
+_PROJECT_STRONG_RE = re.compile(
+    r"full[- ]stack|full project|complete (website|web ?site|app|application|"
+    r"project|platform|store|shop)|multi[- ]page|"
+    r"entire (site|website|app|project)|e[- ]?commerce|from scratch", re.I)
+_PROJECT_BUILD_RE = re.compile(r"\b(build|create|make|develop|code|implement)\b", re.I)
+_PROJECT_ARTEFACT_RE = re.compile(
+    r"\b(website|web ?app|app|application|platform|shop|store|marketplace|"
+    r"dashboard|game|saas|blog|portfolio|crm|cms|api)\b", re.I)
+_PROJECT_AND_RE = re.compile(r"\band\b", re.I)
+
+
+def looks_like_full_project(text):
+    """True when `text` reads as a multi-part build, not a single artefact or
+    a question. Mirrors looksLikeFullProject() in templates/index.html."""
+    s = (text or "").strip().lower()
+    if not s:
+        return False
+    # Strong signals: explicit project/completeness vocabulary — no length
+    # floor ("Create a full-stack e-commerce app from scratch" is short but
+    # unambiguous).
+    if _PROJECT_STRONG_RE.search(s):
+        return True
+    if len(s) < 60:
+        return False
+    # Weaker: a build verb + an artefact noun + MULTIPLE parts listed.
+    if not (_PROJECT_BUILD_RE.search(s) and _PROJECT_ARTEFACT_RE.search(s)):
+        return False
+    parts = len(_PROJECT_AND_RE.findall(s)) + s.count(",")
+    return parts >= 2 and len(s) > 100
+
+
 def run(messages, dispatch, crew_name):
     """Run the swarm pipeline under a crew persona. Same dispatch contract and
     result-dict shape as swarm.run(); the result gains a "crew" key naming the
