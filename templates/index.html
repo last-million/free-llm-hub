@@ -5018,11 +5018,11 @@
          specialist profile, so they never appear in /api/models (that endpoint
          lists real provider models only). Listed here by hand, same as Auto. */
       var CREW_OPTIONS = [
-        ['crew',         'Crew: Auto — picks the specialist crew from your request'],
-        ['crew-code',    'Crew: Code — planner + specialist workers + reviewer + fix pass'],
-        ['crew-research','Crew: Research — sub-questions + fact-hunting reviewer + fix pass'],
-        ['crew-write',   'Crew: Write — structure + draft + polish'],
-        ['crew-design',  'Crew: Design — web/design workers briefed with the craft guide']
+        ['crew',         'Crew: Auto — picks the specialist crew · SLOW 5-20 min, answer arrives all at once'],
+        ['crew-code',    'Crew: Code — planner + workers + reviewer + fix pass · SLOW 5-20 min'],
+        ['crew-research','Crew: Research — sub-questions + fact-check + fix pass · SLOW 5-20 min'],
+        ['crew-write',   'Crew: Write — structure + draft + polish · SLOW 5-20 min'],
+        ['crew-design',  'Crew: Design — craft-briefed web workers · SLOW 5-20 min']
       ];
       var crewGroup = document.createElement('optgroup');
       crewGroup.label = 'crews (multi-agent)';
@@ -5290,6 +5290,17 @@
       var bubble = asstEl.querySelector('.bubble');
       var caret = document.createElement('span'); caret.className = 'caret';
       bubble.appendChild(caret);
+      /* Crew/swarm ids run a MULTI-MODEL pipeline server-side: the answer
+         streams as one shot after several minutes of silence. Without this
+         notice the chat looks dead (reported 2026-08-06: "nothing works").
+         The first real content chunk overwrites it (bubble.textContent = acc). */
+      if (/^(crew|swarm|team|plan)([-/]|$)/.test(model)){
+        bubble.textContent = '⏳ "' + model + '" runs a multi-model pipeline ' +
+          '(planner → specialist workers → reviewer → fix pass). Expect 5-20 ' +
+          'minutes of silence, then the whole answer at once — it is working, ' +
+          'not stuck. For quick questions, use Auto instead.';
+        bubble.appendChild(caret);
+      }
       var acc = '';
 
       setStreaming(true);
