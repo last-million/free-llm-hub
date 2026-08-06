@@ -68,6 +68,7 @@ import providers as prov
 import quota
 import workspace
 import swarm
+import crews
 import usage_history
 import vision_status
 
@@ -11150,10 +11151,17 @@ def v1_models():
     # pinned to one provider's model for every request.
     auto = {"id": "auto", "object": "model", "created": 0, "owned_by": "free-llm-hub",
             "display_name": "auto (orchestrated — best free model per task)"}
+    # Virtual pipeline models (the SWARM/CREWS section below): selectable ids that
+    # run the multi-phase pipeline instead of a single model.
+    virtual = [{"id": mid, "object": "model", "created": 0,
+                "owned_by": "free-llm-hub",
+                "display_name": mid + " (multi-model pipeline)"}
+               for mid in _SWARM_IDS + tuple(crews.CREW_IDS)]
     rows = [_codex_model_entry(m) for m in agg]
     return jsonify({"object": "list",
-                    "data": [auto] + rows,
+                    "data": [auto] + virtual + rows,
                     "models": [dict(auto, slug="auto")]
+                              + [dict(v, slug=v["id"]) for v in virtual]
                               + [dict(_codex_model_entry(m), slug=m["id"]) for m in agg]})
 
 
@@ -11459,13 +11467,33 @@ def _with_headers(resp_tuple, headers):
 # --------------------------------------------------------------------------- #
 # SWARM — the "several strong models build it together" virtual model.
 # Selected explicitly (model: "swarm"); see swarm.py for why it is not automatic.
+# CREWS — the same pipeline with specialised stage prompts (model: "crew-code",
+# "crew-research", ...; bare "crew" auto-detects); see crews.py.
 # --------------------------------------------------------------------------- #
 _SWARM_IDS = ("swarm", "team", "plan")
 
 
+def _crew_name_for(model):
+    """None for a plain swarm id; otherwise the crew the id selects —
+    bare "crew" -> "auto" (crews.detect_crew picks from the request text),
+    "crew-code" / "crew/code" -> "code"."""
+    m = (model or "").strip().lower()
+    if m == "crew":
+        return "auto"
+    if m.startswith("crew-"):
+        return m[len("crew-"):]
+    if m.startswith("crew/"):
+        return m[len("crew/"):]
+    return None
+
+
 def _is_swarm_model(model):
     m = (model or "").strip().lower()
-    return m in _SWARM_IDS or m.startswith("swarm/")
+    if m in _SWARM_IDS or m.startswith("swarm/"):
+        return True
+    if m in crews.CREW_IDS:
+        return True
+    return m.startswith("crew/") and ("crew-" + m[len("crew/"):]) in crews.CREW_IDS
 
 
 def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
@@ -11514,17 +11542,24 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
 
 
 def _swarm_completion(body):
-    """Run the swarm and return ONE ordinary chat-completions response."""
+    """Run the swarm (or a crew) and return ONE ordinary chat-completions response."""
     if body.get("tools"):
         return _openai_error(
-            "The 'swarm' model runs a multi-phase pipeline and cannot serve "
-            "tool-calling turns — your agent already has its own loop. Use "
-            "'auto' for tool calls, and 'swarm' for creation work.", 400)
+            "The 'swarm'/'crew' models run a multi-phase pipeline and cannot "
+            "serve tool-calling turns — your agent already has its own loop. "
+            "Use 'auto' for tool calls, and 'swarm'/'crew' for creation work.",
+            400)
     messages = body.get("messages") or []
     if not messages:
         return _openai_error("messages is required.", 400)
-    result = swarm.run(messages, _swarm_dispatch)
-    text = swarm.format_answer(result)
+    asked = (body.get("model") or "").strip()
+    crew = _crew_name_for(asked)
+    if crew is not None:
+        result = crews.run(messages, _swarm_dispatch, crew)
+        text = crews.format_answer(result)
+    else:
+        result = swarm.run(messages, _swarm_dispatch)
+        text = swarm.format_answer(result)
     if not text:
         return _openai_error(
             "Every model in the swarm failed — no provider answered. Check the "
@@ -11533,7 +11568,7 @@ def _swarm_completion(body):
         "id": "chatcmpl-swarm-" + uuid.uuid4().hex,
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": "swarm",
+        "model": asked,
         "choices": [{"index": 0, "finish_reason": "stop",
                      "message": {"role": "assistant", "content": text}}],
     }
@@ -11543,13 +11578,13 @@ def _swarm_completion(body):
         # relay hops already make).
         def _one_shot():
             chunk = {"id": out["id"], "object": "chat.completion.chunk",
-                     "created": out["created"], "model": "swarm",
+                     "created": out["created"], "model": out["model"],
                      "choices": [{"index": 0, "delta": {"role": "assistant",
                                                         "content": text},
                                   "finish_reason": None}]}
             yield "data: %s\n\n" % json.dumps(chunk)
             done = {"id": out["id"], "object": "chat.completion.chunk",
-                    "created": out["created"], "model": "swarm",
+                    "created": out["created"], "model": out["model"],
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
             yield "data: %s\n\n" % json.dumps(done)
             yield "data: [DONE]\n\n"
