@@ -208,6 +208,32 @@ vendored skills live here:
 As noted above, graphify's `post-commit` hook must stay installed so the
 graph rebuilds after each commit.
 
+## Crews (specialized swarm variants)
+
+`crews.py` exposes five VIRTUAL model ids (`crews.CREW_IDS`), usable anywhere
+`swarm` is usable (same one-shot stream behaviour, tool-carrying turns still
+refused with 400): `crew` (auto-detects which crew from the request text via
+`crews.detect_crew`), `crew-code` (planner splits by component, workers
+implement, a hard-to-please senior reviewer checks correctness/edge cases),
+`crew-research` (planner splits into sub-questions, workers answer from model
+knowledge only — no web access exists — and the reviewer hunts invented
+facts/figures), `crew-write` (structure/draft/polish split) and `crew-design`
+(web/design work; worker system prompts get `craft.WEB_DESIGN` appended).
+
+They reuse the swarm pipeline unchanged: `swarm.run(messages, dispatch,
+profile=None)` takes an optional profile dict of stage system-prompt overrides,
+extra worker system-prompt text and `max_revisions`. `max_revisions=1` runs ONE
+bounded revision pass on a "revise" verdict — a worker is shown the draft plus
+the reviewer's problems and fixes them, then synthesis runs (the Claude Code
+style plan→do→review→fix loop); `0` reproduces the old behaviour exactly
+(revise verdict only folded into synthesis), so `profile=None` is fully
+backward compatible and `tests/test_swarm.py` stays green untouched.
+`crews.run` returns the same result-dict shape as `swarm.run`;
+`crews.format_answer(result)` renders it. The dashboard quick-chat picker lists
+the five ids in a "crews (multi-agent)" optgroup (hardcoded in
+`templates/index.html` — virtual ids never appear in `/api/models`). Covered by
+`tests/test_crews.py`.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

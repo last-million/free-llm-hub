@@ -50,6 +50,16 @@ swarm request must never end with an error the plain model would have answered.
 This module owns NO transport. `dispatch(messages, max_tokens, exclude_pids)`
 is injected by app.py, which keeps chain/fallback/quota/activity behaviour
 identical to every other request.
+
+PROFILES
+--------
+`run()` takes an optional `profile` dict that swaps the stage system prompts
+and turns on ONE bounded revision pass (`max_revisions`). That is the whole
+mechanism behind the "crew-*" virtual models (see crews.py): a crew is not a
+second pipeline, it is this pipeline wearing a specialist persona — a code
+crew gets a senior-engineer reviewer, a research crew gets a fact-hunter, and
+so on. `profile=None` reproduces the generic behaviour byte-for-byte, so the
+plain "swarm" model and its tests are untouched by construction.
 """
 import json
 import re
@@ -332,13 +342,32 @@ def _waves(phases):
     return out
 
 
-def run(messages, dispatch, on_event=None):
+def run(messages, dispatch, profile=None, on_event=None):
     """Run the pipeline. `dispatch(msgs, max_tokens, exclude_pids=()) ->
     (text, pid_model)`; it must never raise — an empty text means that call
     failed, and every stage below treats that as "carry on with what we have".
 
+    `profile` (crews.py builds these) overrides the stage system prompts
+    ("plan_system"/"phase_system"/"review_system"/"synth_system"), appends
+    extra text to the worker system prompt ("worker_extra" — the design crew's
+    craft brief), and sets "max_revisions" (0 = a "revise" verdict is only
+    folded into synthesis; >=1 = run ONE bounded revision pass first). None
+    reproduces the generic pipeline exactly.
+
     Returns {"text", "plan", "phases", "review", "models"} — `text` is always a
     non-empty answer unless every single call failed."""
+    profile = profile or {}
+    plan_system = profile.get("plan_system") or _PLAN_SYSTEM
+    phase_system = profile.get("phase_system") or _PHASE_SYSTEM
+    review_system = profile.get("review_system") or _REVIEW_SYSTEM
+    synth_system = profile.get("synth_system") or _SYNTH_SYSTEM
+    worker_extra = str(profile.get("worker_extra") or "").strip()
+    if worker_extra:
+        phase_system = phase_system + "\n" + worker_extra
+    try:
+        max_revisions = max(0, int(profile.get("max_revisions") or 0))
+    except (TypeError, ValueError):
+        max_revisions = 0
     def emit(kind, detail):
         if on_event:
             try:
@@ -352,7 +381,7 @@ def run(messages, dispatch, on_event=None):
     # ---- 1. PLAN ----------------------------------------------------------
     emit("plan", "planning")
     plan_text, plan_model = dispatch(
-        [{"role": "system", "content": _PLAN_SYSTEM},
+        [{"role": "system", "content": plan_system},
          {"role": "user", "content": brief}], PLAN_MAX_TOKENS)
     if plan_model:
         models_used.append(("plan", plan_model))
@@ -366,7 +395,7 @@ def run(messages, dispatch, on_event=None):
         # The retry says so bluntly and shows the exact shape.
         emit("plan", "plan unusable — retrying once")
         plan_text, plan_model = dispatch(
-            [{"role": "system", "content": _PLAN_SYSTEM},
+            [{"role": "system", "content": plan_system},
              {"role": "user", "content":
               brief + "\n\nOUTPUT JSON ONLY. Start your reply with { and end it "
               'with }. No prose, no fence, no explanation. Shape:\n'
@@ -412,7 +441,7 @@ def run(messages, dispatch, on_event=None):
                    "\n\nYou are working in parallel with the rest of the team and "
                    "cannot see their output. Produce your part only."))
         return dispatch(
-            [{"role": "system", "content": _PHASE_SYSTEM},
+            [{"role": "system", "content": phase_system},
              {"role": "user", "content": user}], PHASE_MAX_TOKENS)
 
     for wave in _waves(phases):
@@ -472,7 +501,7 @@ def run(messages, dispatch, on_event=None):
             with ThreadPoolExecutor(max_workers=len(gaps)) as pool:
                 futures = {pool.submit(
                     dispatch,
-                    [{"role": "system", "content": _PHASE_SYSTEM},
+                    [{"role": "system", "content": phase_system},
                      {"role": "user", "content": "OVERALL GOAL\n%s\n\nYOUR TASK: %s\n%s"
                       % (goal, g["title"], g["task"])}],
                     PHASE_MAX_TOKENS): g for g in gaps}
@@ -497,7 +526,7 @@ def run(messages, dispatch, on_event=None):
     # ---- 3. REVIEW (different provider on purpose) ------------------------
     emit("review", "reviewing")
     review_text, review_model = dispatch(
-        [{"role": "system", "content": _REVIEW_SYSTEM},
+        [{"role": "system", "content": review_system},
          {"role": "user", "content": "BRIEF\n%s\n\nWORK\n%s" % (brief, draft)}],
         REVIEW_MAX_TOKENS, exclude_pids=tuple(exec_pids))
     if review_model:
@@ -505,6 +534,31 @@ def run(messages, dispatch, on_event=None):
     review = _parse_json(review_text) or {}
     problems = [str(p).strip() for p in (review.get("problems") or []) if str(p).strip()]
     needs_work = (str(review.get("verdict") or "").lower() == "revise") and problems
+
+    # ---- 3b. REVISION — one bounded pass, only when the profile asks --------
+    # max_revisions 0 (the default, and the plain "swarm" model) keeps today's
+    # behaviour: a "revise" verdict is only handed to synthesis. With >=1 a
+    # worker is shown the draft plus the reviewer's problems and returns the
+    # corrected work — the Claude Code style plan->do->review->fix loop. It is
+    # capped at ONE pass on purpose: each loop is a full extra model call, and
+    # a reviewer that will not say "ship" would otherwise loop forever.
+    revised = False
+    if needs_work and max_revisions >= 1:
+        emit("revise", "fixing %d problem%s" % (len(problems), "" if len(problems) == 1 else "s"))
+        rev_text, rev_model = dispatch(
+            [{"role": "system", "content": phase_system},
+             {"role": "user", "content":
+              "BRIEF\n%s\n\nDRAFT\n%s\n\nREVIEWER PROBLEMS TO FIX\n- %s\n\n"
+              "Return the COMPLETE corrected work — the full draft with every "
+              "problem fixed, not a diff, not a list of changes."
+              % (brief, _clip(draft, DEP_CONTEXT_CHARS),
+                 "\n- ".join(problems[:10]))}],
+            SYNTH_MAX_TOKENS)
+        if rev_model:
+            models_used.append(("revision", rev_model))
+        if rev_text:
+            draft = rev_text
+            revised = True
 
     # ---- 4. SYNTHESIS -----------------------------------------------------
     # Single phase that the reviewer passed -> the draft IS the answer; another
@@ -516,10 +570,12 @@ def run(messages, dispatch, on_event=None):
 
     emit("synthesis", "assembling")
     synth_user = "BRIEF\n%s\n\nPHASE OUTPUTS\n%s" % (brief, draft)
-    if problems:
+    if problems and not revised:
+        # A completed revision pass already fixed these; handing them to
+        # synthesis again would ask it to fix problems that no longer exist.
         synth_user += "\n\nREVIEWER PROBLEMS TO FIX\n- " + "\n- ".join(problems[:10])
     final_text, synth_model = dispatch(
-        [{"role": "system", "content": _SYNTH_SYSTEM},
+        [{"role": "system", "content": synth_system},
          {"role": "user", "content": synth_user}], SYNTH_MAX_TOKENS)
     if synth_model:
         models_used.append(("synthesis", synth_model))

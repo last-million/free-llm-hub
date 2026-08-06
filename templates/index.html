@@ -5014,6 +5014,24 @@
       autoOpt.value = 'auto';
       autoOpt.textContent = 'Auto — best free (orchestrated)';
       sel.appendChild(autoOpt);
+      /* Crews are VIRTUAL models — the gateway runs the swarm pipeline with a
+         specialist profile, so they never appear in /api/models (that endpoint
+         lists real provider models only). Listed here by hand, same as Auto. */
+      var CREW_OPTIONS = [
+        ['crew',         'Crew: Auto — picks the specialist crew from your request'],
+        ['crew-code',    'Crew: Code — planner + specialist workers + reviewer + fix pass'],
+        ['crew-research','Crew: Research — sub-questions + fact-hunting reviewer + fix pass'],
+        ['crew-write',   'Crew: Write — structure + draft + polish'],
+        ['crew-design',  'Crew: Design — web/design workers briefed with the craft guide']
+      ];
+      var crewGroup = document.createElement('optgroup');
+      crewGroup.label = 'crews (multi-agent)';
+      CREW_OPTIONS.forEach(function(pair){
+        var o = document.createElement('option');
+        o.value = pair[0]; o.textContent = pair[1];
+        crewGroup.appendChild(o);
+      });
+      sel.appendChild(crewGroup);
       models.forEach(function(m){
         var id = m.id || ((m.provider || '?') + '/' + (m.model || ''));
         var o = document.createElement('option');
