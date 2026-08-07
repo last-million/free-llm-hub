@@ -727,6 +727,31 @@
     .lc-tools-actions .btn{flex:1 1 auto}
   }
 
+  /* ---- MCP servers (per-CLI tool wiring) ---------------------------------- */
+  .mcp-cli{
+    border:1px solid var(--border-soft);border-radius:var(--radius-sm);
+    padding:12px 14px;display:flex;flex-direction:column;gap:8px;
+  }
+  .mcp-cli-h{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .mcp-cli-name{font-weight:600;font-size:13.5px}
+  .mcp-cli-hint{font-size:12px;color:var(--text-faint);line-height:1.5}
+  .mcp-server{
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    font-size:12.5px;padding:6px 0;border-top:1px dashed var(--border-soft);
+  }
+  .mcp-server .t{font-family:var(--mono);font-size:11px;color:var(--text-faint)}
+  .mcp-server .spec{flex:1;min-width:160px;color:var(--text-dim);overflow-wrap:anywhere}
+  .mcp-add{display:flex;gap:8px;flex-wrap:wrap}
+  .mcp-add input{
+    background:var(--surface-2);border:1px solid var(--border);
+    border-radius:var(--radius-sm);padding:7px 10px;
+    font-size:12.5px;color:var(--text);min-width:130px;flex:1;
+  }
+  .mcp-add input:focus{border-color:var(--accent);outline:none}
+  @media (max-width:520px){
+    .mcp-add input{flex:1 1 100%}
+  }
+
   /* "Prompt enhanced by X — Use my original": the rewrite is never silent. */
   .enhanced-note{
     display:none;align-items:center;gap:8px;flex-wrap:wrap;
@@ -2280,6 +2305,22 @@
         <div class="hint">Works with aider, opencode, llm, continue &mdash; anything OpenAI-compatible.</div>
       </div>
     </div>
+      </div>
+      <!-- MCP servers: per-CLI tool wiring. Lives with the rest of the CLI
+           management because "Enable hub crews" is the same one-click gesture
+           as Connect, one layer up (tools, not models): it points the CLI at
+           the hub's OWN MCP endpoint (POST /mcp), which exposes the crews as
+           native agent tools. -->
+      <div class="lc-tools" id="lifecycle-mcp">
+        <div class="lc-tools-h">
+          <span class="lc-tools-t">MCP servers</span>
+          <span class="lc-tools-count" id="mcp-count"></span>
+        </div>
+        <p class="cli-help">The hub is itself an MCP server (<code>POST /mcp</code>) exposing the crews as tools: <b>crew_run</b> (synchronous &mdash; a full crew run takes 5&ndash;20 min), <b>crew_start</b> + <b>crew_result</b> (the async pair, for clients with short request timeouts). <b>&#9889; Enable hub crews</b> adds that endpoint to a CLI in one click; each CLI's existing servers are listed underneath with a remove button, plus an inline form for your own servers.</p>
+        <div id="mcp-list" aria-live="polite">
+        <div class="skel skel-row"></div>
+        <div class="skel skel-row"></div>
+        </div>
       </div>
     </div>
   </section>
@@ -6136,6 +6177,140 @@
     body.appendChild(blockNode(c.kind === 'anthropic' ? 'Anthropic snippet' : 'OpenAI snippet', snip));
   }
 
+  /* ---------- MCP servers ----------
+     The hub is itself an MCP server (POST /mcp, JSON-RPC) exposing the crews
+     as tools. This panel manages each CLI's own MCP server list via /api/mcp*
+     (control-token gated, like every /api/* route): kimi/codex write
+     [mcp_servers.*] in their config.toml, claude writes ~/.claude.json
+     mcpServers, opencode writes opencode.json mcp. "Enable hub crews" is the
+     same gesture as Connect, one layer up (tools, not models). */
+  var MCP_CLIS = [
+    ['kimi', 'Kimi Code'],
+    ['codex', 'ChatGPT Codex'],
+    ['claude', 'Claude Code'],
+    ['opencode', 'OpenCode']
+  ];
+
+  function loadMcp(){
+    var host = $('#mcp-list'); if (!host) return;
+    return api('/api/mcp').then(function(j){
+      renderMcp(j || {});
+    }).catch(function(e){
+      panelError(host, 'Failed to load MCP servers: ' + e.message, loadMcp);
+    });
+  }
+
+  function mcpServerSpec(s){
+    if (s.url) return s.url;
+    var cmd = s.command || '';
+    if (Array.isArray(s.args) && s.args.length) cmd += ' ' + s.args.join(' ');
+    return cmd;
+  }
+
+  function renderMcp(j){
+    var host = $('#mcp-list'); host.innerHTML = '';
+    /* hub_mcp names the exact endpoint the install button writes — surfaced
+       so "what did that button just add" is answerable on screen. */
+    var hub = j.hub_mcp || {};
+    var count = $('#mcp-count');
+    if (count) count.textContent = hub.url ? ('hub endpoint: POST ' + hub.url) : '';
+    /* Per-CLI read errors are NON-fatal: one unreadable config must not hide
+       the other three CLIs. */
+    (Array.isArray(j.errors) ? j.errors : []).forEach(function(msg){
+      var e = document.createElement('div');
+      e.className = 'cli-setup-note';
+      e.textContent = '⚠ ' + msg;
+      host.appendChild(e);
+    });
+    MCP_CLIS.forEach(function(pair){
+      var cli = pair[0], label = pair[1];
+      var servers = Array.isArray(j[cli]) ? j[cli] : [];
+      var card = document.createElement('div');
+      card.className = 'mcp-cli';
+      card.dataset.cli = cli;
+      card.innerHTML = '' +
+        '<div class="mcp-cli-h">' +
+          '<span class="mcp-cli-name">' + esc(label) + '</span>' +
+          '<button type="button" class="btn sm primary act-hub" title="Add the hub\'s MCP endpoint to ' + esc(label) + '">⚡ Enable hub crews in this CLI</button>' +
+        '</div>' +
+        '<div class="mcp-cli-hint">Gives the agent the hub&rsquo;s <b>crew_run</b> / <b>crew_start</b> / <b>crew_result</b> tools (POST /mcp).</div>' +
+        '<div class="mcp-servers">' +
+          (servers.length ? servers.map(function(s){
+            return '<div class="mcp-server">' +
+              '<b>' + esc(s.name) + '</b>' +
+              '<span class="t">' + esc(s.transport || 'stdio') + '</span>' +
+              '<span class="spec">' + esc(mcpServerSpec(s)) + '</span>' +
+              '<button type="button" class="btn sm danger act-del" data-name="' + esc(s.name) + '">Remove</button>' +
+            '</div>';
+          }).join('') : '<div class="mcp-cli-hint">No MCP servers configured.</div>') +
+        '</div>' +
+        '<div class="mcp-add">' +
+          '<input type="text" class="mcp-in-name" placeholder="server name" aria-label="MCP server name for ' + esc(label) + '" autocomplete="off" spellcheck="false">' +
+          '<input type="text" class="mcp-in-cmd" placeholder="command, e.g. npx -y some-server" aria-label="MCP server command" autocomplete="off" spellcheck="false">' +
+          '<input type="text" class="mcp-in-url" placeholder="or URL, https://…/mcp" aria-label="MCP server URL" autocomplete="off" spellcheck="false">' +
+          '<button type="button" class="btn sm act-add">Add server</button>' +
+        '</div>';
+      wireMcp(card, cli, label);
+      host.appendChild(card);
+    });
+  }
+
+  /* Every mutation re-pulls the list (like doConnect re-pulls loadClis) so
+     what is on screen is what the config files actually contain; failures
+     reset the button in place and toast. */
+  function wireMcp(card, cli, label){
+    card.querySelector('.act-hub').addEventListener('click', function(){
+      var btn = this;
+      busyBtn(btn, 'Enabling…');
+      api('/api/mcp/install-hub', { method: 'POST', body: { cli: cli } }).then(function(r){
+        toast((r && r.message) || (label + ': hub crews enabled'));
+        return loadMcp();
+      }).catch(function(e){
+        resetBtn(btn, '⚡ Enable hub crews in this CLI');
+        toast('Enable hub crews: ' + e.message, true);
+      });
+    });
+    card.querySelectorAll('.act-del').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        var name = btn.dataset.name;
+        busyBtn(btn, 'Removing…');
+        api('/api/mcp/delete', { method: 'POST', body: { cli: cli, name: name } }).then(function(r){
+          toast((r && r.message) || (name + ' removed from ' + label));
+          return loadMcp();
+        }).catch(function(e){
+          resetBtn(btn, 'Remove');
+          toast('Remove ' + name + ': ' + e.message, true);
+        });
+      });
+    });
+    card.querySelector('.act-add').addEventListener('click', function(){
+      var btn = this;
+      var name = card.querySelector('.mcp-in-name').value.trim();
+      var cmd = card.querySelector('.mcp-in-cmd').value.trim();
+      var url = card.querySelector('.mcp-in-url').value.trim();
+      if (!name){ toast('MCP server needs a name', true); return; }
+      if (!cmd && !url){ toast('Give a command OR a URL for "' + name + '"', true); return; }
+      var spec;
+      if (url){
+        spec = { url: url };
+      } else {
+        /* one field keeps the form small: the first token is the command, the
+           rest become args — mcp_manager's {command, args} shape. */
+        var parts = cmd.split(/\s+/);
+        spec = { command: parts[0] };
+        if (parts.length > 1) spec.args = parts.slice(1);
+      }
+      busyBtn(btn, 'Adding…');
+      api('/api/mcp', { method: 'POST', body: { cli: cli, name: name, spec: spec } }).then(function(r){
+        toast((r && r.message) || (name + ' added to ' + label));
+        return loadMcp();
+      }).catch(function(e){
+        resetBtn(btn, 'Add server');
+        toast('Add ' + name + ': ' + e.message, true);
+      });
+    });
+  }
+
   var CHECK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 13 4 4L19 7"/></svg>';
   var CROSS_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>';
   /* "(214s)" is not a duration anyone reads. */
@@ -8801,6 +8976,7 @@
   loadProviderMode();
   loadModels().then(loadDefault).then(loadChatModels);
   loadClis();
+  loadMcp();
   loadSubscriptions();
   loadAgentSettings();
   loadVisionStatus();
@@ -8825,7 +9001,7 @@
   var VIEW_REFRESH = {
     /* also refreshes what the merged 'Connect'/'Connected tools' pages
        used to own: the CLI list and the connection snippets. */
-    'sec-lifecycle': function(){ loadStatus(true); loadLifecycle(true); loadClis(); },
+    'sec-lifecycle': function(){ loadStatus(true); loadLifecycle(true); loadClis(); loadMcp(); },
     'sec-subs': function(){ loadSubscriptions(true); },
     'sec-agent': function(){ loadAgentSettings(true); },
     'sec-images': function(){ loadImages(true); },
