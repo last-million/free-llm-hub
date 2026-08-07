@@ -63,8 +63,8 @@ G4F_429_HEADERS = {
 
 def test_blown_token_bucket_reads_as_exhausted(fresh_quota):
     """The headline case: requests left, tokens gone -> provider IS exhausted."""
-    quota.observe_headers("g4f-groq", G4F_429_HEADERS)
-    st = quota.status("g4f-groq")
+    quota.observe_headers("g4f", G4F_429_HEADERS)
+    st = quota.status("g4f")
     assert st["remaining"] == 0
     assert st["exhausted"] is True, (
         "94 requests remaining must NOT read as healthy when the token bucket is "
@@ -74,8 +74,8 @@ def test_blown_token_bucket_reads_as_exhausted(fresh_quota):
 
 def test_countdown_matches_the_real_block_not_the_static_window(fresh_quota):
     """The UI number and the real block must be the SAME number."""
-    quota.observe_headers("g4f-groq", G4F_429_HEADERS)
-    resets_in = quota.status("g4f-groq")["resets_in"]
+    quota.observe_headers("g4f", G4F_429_HEADERS)
+    resets_in = quota.status("g4f")["resets_in"]
     assert resets_in > 80000, (
         f"countdown is {resets_in}s but upstream said 81486s; showing ~60s here is "
         "the '1 minute remaining that never recovers' bug"
@@ -116,8 +116,8 @@ def test_tpm_blip_parks_for_seconds_not_for_the_retry_after(fresh_quota):
 
 def test_explicit_retry_after_survives_a_wrong_static_window(fresh_quota):
     """g4f is configured as a per-MINUTE window; upstream said 22h38m. Honour it."""
-    quota.mark_throttled("g4f-groq", 81486.0)
-    st = quota.status("g4f-groq")
+    quota.mark_throttled("g4f", 81486.0)
+    st = quota.status("g4f")
     assert st["exhausted"] is True
     assert st["resets_in"] > 80000, (
         f"parked for only {st['resets_in']}s — the static minute window must not "
@@ -127,23 +127,23 @@ def test_explicit_retry_after_survives_a_wrong_static_window(fresh_quota):
 
 def test_retry_after_is_capped(fresh_quota):
     """An absurd header must not park a provider for a week."""
-    quota.mark_throttled("g4f-groq", 999_999_999.0)
-    assert quota.status("g4f-groq")["resets_in"] <= quota._RETRY_AFTER_CAP
+    quota.mark_throttled("g4f", 999_999_999.0)
+    assert quota.status("g4f")["resets_in"] <= quota._RETRY_AFTER_CAP
 
 
 def test_short_burst_429_still_recovers_fast(fresh_quota):
     """No regression: the hub's default 60s cooldown stays a 60s cooldown."""
-    quota.mark_throttled("g4f-groq", 60.0)
-    assert quota.status("g4f-groq")["resets_in"] <= 120
+    quota.mark_throttled("g4f", 60.0)
+    assert quota.status("g4f")["resets_in"] <= 120
 
 
 def test_provider_is_reused_once_the_window_passes(fresh_quota):
     """The other half of the ask: come BACK when the window really has reset."""
-    quota.mark_throttled("g4f-groq", 81486.0)
-    assert quota.status("g4f-groq")["exhausted"] is True
-    quota._STATE["g4f-groq"]["throttled_until"] = time.time() - 1   # window elapsed
+    quota.mark_throttled("g4f", 81486.0)
+    assert quota.status("g4f")["exhausted"] is True
+    quota._STATE["g4f"]["throttled_until"] = time.time() - 1   # window elapsed
     quota._DYNAMIC.clear()
-    assert quota.status("g4f-groq")["exhausted"] is False
+    assert quota.status("g4f")["exhausted"] is False
 
 
 @pytest.mark.parametrize("window", ["minute", "hour", "day", "month"])
