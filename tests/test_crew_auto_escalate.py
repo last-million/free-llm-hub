@@ -44,8 +44,12 @@ def _post(client, body):
 def spy_crew(monkeypatch):
     """Capture crew invocations; the pipeline itself is stubbed out."""
     calls = []
+    # on_event is optional and forwarded to swarm.run (app.py feeds the
+    # activity feed's per-agent view through it) -- the spy must mirror the
+    # real signature or every crew request 500s on an unexpected kwarg.
     monkeypatch.setattr(crews, "run",
-                        lambda messages, dispatch, name: calls.append(name) or {"crew": name})
+                        lambda messages, dispatch, name, on_event=None:
+                            calls.append(name) or {"crew": name})
     monkeypatch.setattr(crews, "format_answer",
                         lambda result: "crew answer via " + result["crew"])
     # If escalation does NOT fire the request must not wander onto the real

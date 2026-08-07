@@ -1280,6 +1280,19 @@
   .af-panel{background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);padding:16px}
   .af-empty{font-size:13px;color:var(--text-faint);padding:6px 2px}
   .af-list{display:flex;flex-direction:column;gap:7px}
+  /* Swarm/crew pipeline detail: which AGENT ran on which MODEL, under its row. */
+  .af-pipe{ display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+    margin:-4px 0 8px; padding:7px 12px 8px 34px; font-size:11.5px;
+    border-left:2px solid var(--accent-border); }
+  .af-crew{ font-weight:700;color:var(--ok-text);text-transform:uppercase;
+    letter-spacing:.04em;font-size:10.5px; }
+  .af-pipe-n{ color:var(--text-faint); }
+  .af-stage{ color:var(--warn-text); }
+  .af-agent{ display:inline-flex;gap:5px;align-items:baseline;
+    background:var(--surface-2);border:1px solid var(--border-soft);
+    border-radius:999px;padding:2px 9px;font-family:var(--mono);font-size:10.5px;
+    color:var(--text-dim);max-width:100%; }
+  .af-agent b{ color:var(--text);font-family:inherit;font-weight:700; }
   .af-row{
     display:flex;align-items:center;gap:10px;flex-wrap:wrap;
     background:var(--surface-2);border:1px solid var(--border-soft);
@@ -8371,6 +8384,15 @@
       }
     });
   }
+  /* g4f ids look like "srv_mp3lmkuad07322459f47:gemini-3.5-flash" and provider
+     ids carry vendor prefixes — show the part a human recognises, full id on hover. */
+  function shortModel(m){
+    var s = String(m || '');
+    if (s.indexOf(':') > -1 && s.indexOf('srv_') === 0) s = s.slice(s.indexOf(':') + 1);
+    var slash = s.lastIndexOf('/');
+    if (slash > -1) s = s.slice(slash + 1);
+    return s.length > 26 ? s.slice(0, 25) + '…' : s;
+  }
   function renderActivity(){
     var host = $('#activity-list'); if (!host) return;
     setSecChip('activity', activityState.length ? (activityState.length + ' recent') : '');
@@ -8387,6 +8409,27 @@
       var hasResolved = a.provider && a.model;
       var modelTxt = hasResolved ? (a.provider + '/' + a.model) : (a.model_req || '—');
       var modelHTML = hasResolved ? esc(modelTxt) : '<span class="req">' + esc(modelTxt) + '</span>';
+      /* A swarm/crew request is ONE row whose stages all ran inside it. Show
+         WHICH agent used WHICH model instead of a single opaque line -- the
+         data was always in swarm.py (result["models"] + its emit() events),
+         it just never reached the feed. */
+      var pipe = Array.isArray(a.pipeline) ? a.pipeline : [];
+      var stages = Array.isArray(a.stages) ? a.stages : [];
+      var detail = '';
+      if (a.crew || pipe.length || stages.length){
+        var chips = pipe.map(function(p){
+          return '<span class="af-agent" title="' + esc(p.model) + '">' +
+                   '<b>' + esc(p.role) + '</b>' + esc(shortModel(p.model)) + '</span>';
+        }).join('');
+        var last = stages.length ? stages[stages.length - 1] : null;
+        detail =
+          '<div class="af-pipe">' +
+            (a.crew ? '<span class="af-crew">crew: ' + esc(a.crew) + '</span>' : '') +
+            (pipe.length ? '<span class="af-pipe-n">' + pipe.length + ' agents</span>' : '') +
+            (last && pending ? '<span class="af-stage">' + esc(last.kind) + ' — ' + esc(last.detail) + '</span>' : '') +
+            chips +
+          '</div>';
+      }
       return '' +
         '<div class="af-row">' +
           '<span class="af-time" title="request started">' + esc(fmtClock(a.started_ms, a.started)) + '</span>' +
@@ -8396,7 +8439,7 @@
           '<span class="af-dur js-af-dur" data-started="' + esc(a.started) + '" data-pending="' + (pending ? '1' : '0') +
             '" data-ms="' + esc(numOr(a.duration_ms, 0)) + '">' + esc(fmtDuration(a.duration_ms)) + '</span>' +
           '<span class="af-status ' + statusClass + '"><span class="d"></span>' + esc(statusLabel) + esc(httpTxt) + '</span>' +
-        '</div>';
+        '</div>' + detail;
     }).join('');
   }
   /* --- Model tracking ----------------------------------------------------- */
