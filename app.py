@@ -1921,6 +1921,13 @@ _SLOW_MODEL_RE = re.compile(
 # tool requests after every tool-proven normal candidate too. They may serve a
 # PRIMARY only for difficulty=='simple' or when nothing else is alive. Ordered
 # last, never deleted — they stay the final safety net.
+# Below this many DISTINCT providers, the agentic pool is treated as collapsed
+# rather than merely narrowed, and routing widens back out (see the funnel
+# measurement at the use site in _route_by_difficulty). 4 is deliberately low:
+# the point is to break a single-family monopoly, not to force diversity for
+# its own sake -- a genuinely small live fleet still routes normally.
+_MIN_AGENTIC_PROVIDERS = 4
+
 _LOW_QUALITY_RE = re.compile(r"nemotron|gpt[-_]?oss|gemma", re.I)
 
 
@@ -4123,6 +4130,30 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         _normal = [c for c in _pool if not _is_low_quality(c[2])]
         if not _normal:
             _normal = [c for c in agentic if not _is_low_quality(c[2])]
+        # ...but "not empty" was too weak a bar, and the pool COLLAPSED instead
+        # of narrowing. MEASURED 2026-08-07, one funnel over the live fleet:
+        #     alive + tool-capable        660 models / 21 providers
+        #     ∩ _TOOL_PROVEN              132 models / 13 providers
+        #     ∩ not low-quality            31 models /  3 providers
+        # _TOOL_PROVEN names gpt-oss and nemotron, _LOW_QUALITY_RE demotes
+        # exactly those, so the intersection is essentially "gemini-3" -- and
+        # 14 sampled routes across 14 DISTINCT conversations returned just two
+        # ids, both google/gemini-3.x. The fail-open above never fired because
+        # 31 models is not zero. A one-family monopoly is not what proven-first
+        # was for, and it wastes 20 other providers' quota.
+        #
+        # So widen on PROVIDER DIVERSITY, not just emptiness. Safe to widen now
+        # in a way it would not have been in July: _TOOL_PROVEN is a hand-typed
+        # allowlist that stood in for a feedback signal we did not have, and we
+        # now measure the real thing -- a model that fails here earns a lasting
+        # reliability penalty (see _record_outcome) and a 6h dead-model sideline
+        # on 402/403/404/410, both of which _agentic_score already folds in. So
+        # a listing a provider cannot actually serve costs ONE hop and then
+        # sinks itself, instead of being pre-banned by a stale list.
+        if len({c[1] for c in _normal}) < _MIN_AGENTIC_PROVIDERS:
+            _wider = [c for c in agentic if not _is_low_quality(c[2])]
+            if len({c[1] for c in _wider}) > len({c[1] for c in _normal}):
+                _normal = _wider
         _pool = _normal or _pool
         picked = _weighted_pick(_pool, _model_identity_min_penalty(_pool))
         _s, pid, model = picked
