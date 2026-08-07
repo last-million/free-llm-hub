@@ -4432,9 +4432,13 @@
     // registry knowledge (no API key exists for them at all) — everything else
     // is derived from the payload's own trial / paid / free_models flags, so a
     // registry change re-files a card automatically.
+    // g4f-groq / g4f-gemini / g4f-nvidia were here until 2026-08-06, when
+    // g4f.space ended anonymous access: a keyless chat call now 402s with
+    // "No cake credits ... or sign up at g4f.dev/members.html". They are
+    // ordinary keyed providers now, so leaving them here would file them
+    // under "no key needed" and hide the key field they actually require.
     var KEYLESS_GATEWAYS = {
-      pollinations: 1, aihorde: 1, uncloseai: 1, llm7: 1,
-      'g4f-groq': 1, 'g4f-gemini': 1, 'g4f-nvidia': 1, kilocode: 1
+      pollinations: 1, aihorde: 1, uncloseai: 1, llm7: 1, kilocode: 1
     };
     function isKeyless(p){ return !!(KEYLESS_GATEWAYS[p.id] || p.no_key); }
     function isPurePaid(p){ return !!(p.paid && PURE_PAID[p.id]); }
@@ -8889,11 +8893,15 @@
     var box = document.createElement('div');
     box.innerHTML =
       '<p style="margin:0 0 10px">The hub just updated to <code>' + esc(version) + '</code>. Highlights:</p>' +
-      '<p style="margin:0 0 6px"><b>New models &amp; free providers — no API key needed, they work directly:</b></p>' +
+      '<p style="margin:0 0 6px"><b>Free providers — no API key needed, they work directly:</b></p>' +
       '<ul style="margin:0 0 10px; padding-left:20px">' +
-        '<li>pollinations, aihorde, uncloseai, llm7</li>' +
-        '<li>g4f-groq / g4f-gemini / g4f-nvidia, kilocode</li>' +
+        '<li>pollinations, aihorde, uncloseai, llm7, kilocode</li>' +
       '</ul>' +
+      '<p style="margin:0 0 10px"><b>g4f (groq / gemini / nvidia) now needs a key.</b> ' +
+      'g4f.space ended anonymous access on 2026-08-06 — keyless calls return ' +
+      '<code>402 No cake credits</code>. Grab a free key at ' +
+      '<a href="https://g4f.dev/members.html" target="_blank" rel="noopener noreferrer">g4f.dev/members.html</a> ' +
+      'and paste it on their cards (or use <b>Guided setup</b> on the Providers page).</p>' +
       '<p style="margin:0">For more usage and quality, connect the recommended providers first ' +
       '(<b>Puter</b> — latest GPT-5.6 + 500 models with one free token), then any others from the Providers page.</p>';
     body.appendChild(box);

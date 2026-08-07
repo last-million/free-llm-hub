@@ -114,12 +114,18 @@ def test_github_models_fixes_dangling_references():
 # key at all) and kilocode (anonymous free tier, literal bearer "anonymous").
 # --------------------------------------------------------------------------- #
 
-KEYLESS_PROVIDERS = ("g4f-groq", "g4f-gemini", "g4f-nvidia", "kilocode")
+# g4f-groq / g4f-gemini / g4f-nvidia left this list on 2026-08-06: g4f.space
+# ended anonymous access and a keyless chat call now returns 402 "No cake
+# credits ... sign up at g4f.dev/members.html". They are ordinary keyed
+# providers now -- see tests/test_g4f_keyed.py, which pins that behaviour.
+# They are still exercised by the registry-shape test below, just not as
+# keyless ones.
+KEYLESS_PROVIDERS = ("kilocode",)
 G4F_PROVIDERS = ("g4f-groq", "g4f-gemini", "g4f-nvidia")
 
 
 def test_keyless_gateways_registered_with_required_fields():
-    for pid in KEYLESS_PROVIDERS:
+    for pid in KEYLESS_PROVIDERS + G4F_PROVIDERS:
         p = prov.get_provider(pid)
         assert p is not None, pid + " missing from PROVIDERS"
         assert p.get("name"), pid
@@ -133,8 +139,9 @@ def test_keyless_gateways_registered_with_required_fields():
 def test_keyless_gateways_no_key_flags():
     for pid in KEYLESS_PROVIDERS:
         assert prov.get_provider(pid).get("no_key") is True, pid
-    # The g4f.space relays take NO credential at all: no static_key, so the
-    # no-key path sends no Authorization header (pollinations precedent).
+    # The g4f.space relays never had a static_key, and must not gain one now
+    # that they are keyed: the user's OWN g4f.dev key goes in the normal key
+    # pool, so a hardcoded placeholder bearer would silently shadow it.
     for pid in G4F_PROVIDERS:
         assert not prov.get_provider(pid).get("static_key"), pid
     # kilocode's anonymous tier authenticates with the literal bearer string.
