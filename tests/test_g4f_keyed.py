@@ -79,17 +79,32 @@ def test_the_three_old_cards_are_fully_retired():
         assert pid not in app._NEW_PROVIDER_IDS, pid
 
 
-def test_pinned_fallback_ids_exist_in_the_KEYED_catalog():
-    """/v1/models serves two different catalogs (verified live 2026-08-06):
-    anonymous -> 549 volatile "srv_<server>:<model>" ids including "auto";
-    with a bearer -> 273 clean ids where "auto" DOES NOT EXIST ("default" is
-    the router alias there). The hub only discovers live once a key exists, so
-    a fallback pinned to "auto" would be an id the real catalog rejects."""
+def test_pinned_fallback_ids_are_the_ones_a_real_sweep_confirmed():
+    """The pins went through two corrections, both driven by live probes:
+
+    1. /v1/models serves TWO catalogs (2026-08-06). Anonymous -> 549 volatile
+       "srv_<server>:<model>" ids including "auto"; with a bearer -> 273 clean
+       ids where "auto" DOES NOT EXIST. The hub only discovers live once a key
+       exists, so an "auto" pin was an id the real catalog rejects.
+    2. A sweep of the top 24 by score with a real key (2026-08-07) then showed
+       "default" -- the keyed router alias, pinned after fix 1 -- 429s on every
+       attempt, and that only 7 of those 24 were FREE AND WORKING: the Gemini
+       3.x family. The 134-138 scorers (claude-opus-4-8, claude-haiku-4.5,
+       gpt-5.5, kimi-k3) return 402 PAYMENT_REQUIRED against g4f's "pollen"
+       balance, and the whole gpt-5.6-* family 500/502s.
+
+    So the pins must be sweep-verified ids, not catalog-plausible ones."""
     models = prov.get_provider("g4f")["default_free_models"]
     assert "auto" not in models, "'auto' is anonymous-catalog only"
-    assert "default" in models, "'default' is the keyed catalog's router alias"
+    assert "default" not in models, "'default' 429'd on every sweep attempt"
     assert not any(m.startswith("srv_") for m in models), \
         "srv_-prefixed ids are volatile community servers, unfit as a pin"
+    assert models, "a keyed provider still needs a discovery-failed fallback"
+    # Every pin came back FREE AND WORKING in the sweep.
+    assert set(models) <= {"gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.1-pro-low"}
+    # None of the confirmed-paid ids may be pinned as free.
+    for paid in ("gpt-5.5", "kimi-k3", "claude-opus-4-8", "claude-haiku-4.5"):
+        assert paid not in models, paid + " answers 402 PAYMENT_REQUIRED"
 
 
 def test_the_merged_card_keeps_one_per_minute_budget_not_three():

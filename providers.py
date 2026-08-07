@@ -1326,11 +1326,20 @@ PROVIDERS: Dict[str, dict] = {
         # runs live discovery once a key exists anyway (provider_free_models
         # returns defaults for a keyed provider with no key). So these pins are
         # purely the discovery-failed fallback, and they must be ids the KEYED
-        # catalog actually serves: "auto" is NOT one of them (it exists only in
-        # the anonymous listing) -- "default" is g4f's own router alias there,
-        # paired with one concrete strong model so a degraded fallback is not
-        # stuck at the unknown-model score floor.
-        "default_free_models": ["default", "gemini-3.5-flash"],
+        # catalog actually serves.
+        #
+        # PINNED FROM A REAL SWEEP (2026-08-07), not from the catalog listing:
+        # the top 24 ids by score were each sent a live 1-token request. Only
+        # 7 came back FREE AND WORKING, and they were the Gemini 3.x family.
+        # Everything scoring 134-138 -- claude-opus-4-8, claude-haiku-4.5,
+        # gpt-5.5, kimi-k3 -- answers 402 PAYMENT_REQUIRED ("this request costs
+        # ~0.0472 pollen, your available balance is 0.0000"), i.e. g4f has a
+        # paid currency and those models want it. The whole gpt-5.6-* family
+        # 500/502s. "auto" exists only in the anonymous listing, and "default"
+        # (the keyed router alias) 429'd on every attempt -- both were pinned
+        # here before this sweep and neither survives contact.
+        "default_free_models": ["gemini-3.5-flash", "gemini-3.6-flash",
+                                "gemini-3.1-pro-low"],
         "notes": "Community relay pooling ~550 models donated across many volunteer servers (OpenAI-compatible, ~5 req/min). ONE card since 2026-08-06: the old per-upstream g4f-groq / g4f-gemini / g4f-nvidia entries all authenticate with the same g4f.dev key and are superseded by the unified https://g4f.space/v1 endpoint. NO LONGER KEYLESS as of the same date: anonymous calls return 402 'No cake credits' and now need either browser proof-of-work or a free account key from g4f.dev/members.html. Unstable volunteer-run gateway: quality varies per donated server, ids come and go as servers join and leave, and the whole proxy can go down without warning — no SLA. Treat as opportunistic capacity, never the only link in a chain.",
     },
     "kilocode": {
