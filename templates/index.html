@@ -1288,10 +1288,13 @@
     letter-spacing:.04em;font-size:10.5px; }
   .af-pipe-n{ color:var(--text-faint); }
   .af-stage{ color:var(--warn-text); }
+  /* Full model names are long ("qwen3.5-40b-deckard-claude46:latest"), so the
+     chip wraps within the row instead of clipping the name the user came for. */
   .af-agent{ display:inline-flex;gap:5px;align-items:baseline;
     background:var(--surface-2);border:1px solid var(--border-soft);
     border-radius:999px;padding:2px 9px;font-family:var(--mono);font-size:10.5px;
-    color:var(--text-dim);max-width:100%; }
+    color:var(--text-dim);max-width:100%;
+    white-space:normal;overflow-wrap:anywhere; }
   .af-agent b{ color:var(--text);font-family:inherit;font-weight:700; }
   .af-row{
     display:flex;align-items:center;gap:10px;flex-wrap:wrap;
@@ -8384,14 +8387,22 @@
       }
     });
   }
-  /* g4f ids look like "srv_mp3lmkuad07322459f47:gemini-3.5-flash" and provider
-     ids carry vendor prefixes — show the part a human recognises, full id on hover. */
-  function shortModel(m){
+  /* "provider/model", where a g4f model is itself "srv_<serverhash>:<real id>".
+     Strip ONLY the noise (the donated-server hash) and keep the whole model
+     name — truncating it hid the actual model behind the meaningless hash, e.g.
+     "srv_msg68ooo8baffd1a6509:…" instead of "qwen3.5-40b-deckard-claude46".
+     Split on the FIRST slash: the provider prefix is one segment, but the model
+     may legitimately contain slashes ("nvidia/z-ai/glm-5.2"). */
+  function prettyModel(m){
     var s = String(m || '');
-    if (s.indexOf(':') > -1 && s.indexOf('srv_') === 0) s = s.slice(s.indexOf(':') + 1);
-    var slash = s.lastIndexOf('/');
-    if (slash > -1) s = s.slice(slash + 1);
-    return s.length > 26 ? s.slice(0, 25) + '…' : s;
+    var slash = s.indexOf('/');
+    var prov = slash > -1 ? s.slice(0, slash) : '';
+    var model = slash > -1 ? s.slice(slash + 1) : s;
+    if (model.indexOf('srv_') === 0){
+      var colon = model.indexOf(':');            // first colon: the rest is the id
+      if (colon > -1) model = model.slice(colon + 1);
+    }
+    return prov ? prov + ' · ' + model : model;
   }
   function renderActivity(){
     var host = $('#activity-list'); if (!host) return;
@@ -8419,7 +8430,7 @@
       if (a.crew || pipe.length || stages.length){
         var chips = pipe.map(function(p){
           return '<span class="af-agent" title="' + esc(p.model) + '">' +
-                   '<b>' + esc(p.role) + '</b>' + esc(shortModel(p.model)) + '</span>';
+                   '<b>' + esc(p.role) + '</b>' + esc(prettyModel(p.model)) + '</span>';
         }).join('');
         var last = stages.length ? stages[stages.length - 1] : null;
         detail =
