@@ -69,7 +69,17 @@ import quota
 import workspace
 import swarm
 import crews
+import hub_mcp
+import mcp_manager
 import usage_history
+
+# The hub is also an MCP server (POST /mcp, JSON-RPC 2.0) so any MCP-capable
+# agent CLI can call the crews as native tools. The runner goes through the
+# exact same pipeline as the /v1/* crew model ids. _swarm_dispatch is defined
+# far below in this file, which is fine -- the lambda only resolves it at CALL
+# time, not at import time.
+hub_mcp.init(lambda messages, crew_name: crews.format_answer(
+    crews.run(messages, _swarm_dispatch, crew_name)))
 import vision_status
 
 import logging
@@ -7387,6 +7397,79 @@ def api_hub_desktop_shortcut():
     except OSError as exc:
         return jsonify({"ok": False, "error": _sanitize(str(exc))}), 500
     return jsonify({"ok": True, "path": path})
+
+
+# ---------------------------------------------------------------------------
+# MCP server endpoint + per-CLI MCP server management
+# ---------------------------------------------------------------------------
+# POST /mcp speaks JSON-RPC 2.0 (tools crew_run / crew_start / crew_result) so
+# any MCP-capable agent CLI can call the hub's crews as native tools. It is NOT
+# control-token gated — CLI agents on localhost must reach it like /v1/* — but
+# the loopback Host/Origin guard in _local_control_guard applies to every path,
+# so it is exposed exactly like the rest of the hub. The /api/mcp* routes manage
+# MCP server entries in the kimi/codex/claude/opencode configs; they live under
+# /api/ so the dashboard header + control token gate them like every other
+# control-plane route.
+
+
+def _hub_mcp_url():
+    return "http://127.0.0.1:%d/mcp" % PORT
+
+
+@app.route("/mcp", methods=["POST"])
+def mcp_rpc():
+    body = request.get_json(force=True, silent=True)
+    result, status = hub_mcp.handle_rpc(body)
+    if result is None:
+        return "", 204   # JSON-RPC notification — no response body
+    # The client MAY send Accept: text/event-stream (MCP streamable HTTP), but
+    # a single JSON-RPC response is still legal as plain application/json.
+    return jsonify(result), status
+
+
+@app.route("/api/mcp", methods=["GET"])
+def api_mcp_list():
+    payload = mcp_manager.list_servers()
+    payload["hub_mcp"] = {"url": _hub_mcp_url(), "name": "free-llm-hub"}
+    return jsonify(payload)
+
+
+@app.route("/api/mcp", methods=["POST"])
+def api_mcp_add():
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "message": "invalid JSON body"}), 400
+    ok, msg = mcp_manager.add_server(body.get("cli"), body.get("name"),
+                                     body.get("spec"))
+    return jsonify({"ok": ok, "message": msg}), 200 if ok else 400
+
+
+@app.route("/api/mcp/delete", methods=["POST"])
+def api_mcp_delete():
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "message": "invalid JSON body"}), 400
+    ok, msg = mcp_manager.remove_server(body.get("cli"), body.get("name"))
+    return jsonify({"ok": ok, "message": msg}), 200 if ok else 400
+
+
+@app.route("/api/mcp/install-hub", methods=["POST"])
+def api_mcp_install_hub():
+    """One-click 'enable hub crews in this CLI': register the hub's own MCP
+    endpoint under the well-known name 'free-llm-hub'."""
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "message": "invalid JSON body"}), 400
+    cli = body.get("cli")
+    spec = {"url": _hub_mcp_url()}
+    ok, msg = mcp_manager.add_server(cli, "free-llm-hub", spec)
+    if not ok and str(msg).lower() == "exists":
+        # Already registered — retry once with force:true (consumed by the
+        # manager, never stored) so the button also REPAIRS a stale/wrong
+        # entry instead of failing.
+        ok, msg = mcp_manager.add_server(cli, "free-llm-hub",
+                                         dict(spec, force=True))
+    return jsonify({"ok": ok, "message": msg}), 200 if ok else 400
 
 
 # ---------------------------------------------------------------------------

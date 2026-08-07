@@ -270,6 +270,39 @@ Escalation & agent self-delegation (user request 2026-08-06, covered by
   an "enhance" that pended 150s+ behind a locked composer was the
   "clicked Just answer and nothing happened" bug.
 
+## MCP: the hub as a tool server (2026-08-06)
+
+The hub itself speaks MCP so any MCP-capable agent CLI (Kimi Code, Codex,
+Claude Code, OpenCode) can call the crews as NATIVE tools instead of
+hand-rolling a `model: "crew*"` chat request (which the `_CREW_AGENT_HINT`
+above only suggests).
+
+- **`POST /mcp`** is a JSON-RPC 2.0 endpoint with three tools:
+  - `crew_run` — SYNCHRONOUS: runs the whole crew pipeline and returns the
+    formatted answer. A full run takes 5-20 min, so this only suits clients
+    whose tool-call timeout is that generous.
+  - `crew_start` / `crew_result` — the ASYNC pair for short-timeout clients:
+    `crew_start` kicks the run off in the background and returns a job id
+    immediately; the client polls `crew_result` with that id until done.
+- **Per-CLI management routes** (control-token gated like every `/api/*`):
+  - `GET /api/mcp` → `{<cli_id>: [{name, transport, command?, args?, url?}],
+    errors: [...], hub_mcp: {url, name}}`. Per-CLI read errors land in
+    `errors` and are NON-fatal — one unreadable config never hides the rest.
+  - `POST /api/mcp` `{cli, name, spec:{command?,args?,env?} | {url}}` → add.
+  - `POST /api/mcp/delete` `{cli, name}` → remove.
+  - `POST /api/mcp/install-hub` `{cli}` → adds the hub's own `/mcp` endpoint
+    to that CLI (the dashboard's "⚡ Enable hub crews in this CLI" button).
+- **`mcp_manager` writes each CLI's native config**: kimi and codex get
+  `[mcp_servers.<name>]` tables in their `config.toml`, claude gets
+  `mcpServers` in `~/.claude.json`, opencode gets `mcp` in `opencode.json`.
+  The Kimi Connect/Disconnect wiring (`_autofix_kimi` / `_disconnect_kimi`)
+  strips only its own `[providers.free-hub]` / `[models."auto"]` tables, so
+  `[mcp_servers.*]` survives a disconnect — installed crews stay installed.
+- Dashboard: an "MCP servers" block lives in Hub controls
+  (`#lifecycle-mcp`, next to the CLI cards in `templates/index.html`) —
+  per-CLI server list with Remove, an inline add form (name + command OR
+  url), and the install-hub button. It refreshes after every mutation.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
