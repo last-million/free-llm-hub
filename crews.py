@@ -397,21 +397,25 @@ def looks_like_full_project(text):
     return parts >= 2 and len(s) > 100
 
 
-def run(messages, dispatch, crew_name):
+def run(messages, dispatch, crew_name, on_event=None):
     """Run the swarm pipeline under a crew persona. Same dispatch contract and
     result-dict shape as swarm.run(); the result gains a "crew" key naming the
     persona actually used ("" = generic pipeline).
 
     crew_name is the crew with or without the "crew-" prefix; "crew", "auto"
     and "" all mean auto-detect from the request text. An unknown crew name is
-    treated like a failed detection — generic pipeline, never an error."""
+    treated like a failed detection — generic pipeline, never an error.
+
+    `on_event(kind, detail)` is passed straight through to swarm.run so a
+    caller can watch stage progress live (app.py feeds it to the activity
+    row). Optional, and swarm.run already swallows anything it raises."""
     name = (crew_name or "").strip().lower()
     if name.startswith("crew-"):
         name = name[5:]
     if name in ("", "crew", "auto"):
         name = detect_crew(messages)
     profile = CREWS.get(name)          # unknown/undetected -> None -> generic
-    result = swarm.run(messages, dispatch, profile=profile)
+    result = swarm.run(messages, dispatch, profile=profile, on_event=on_event)
     result["crew"] = name if profile else ""
     return result
 

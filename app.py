@@ -5908,6 +5908,57 @@ def _act_pick(pid, model):
             act["routed"] = act.get("routed") or ("%s/%s" % (pid, model))
 
 
+def _act_pipeline_watcher():
+    """on_event sink for swarm.run/crews.run, so the activity feed can show WHAT
+    a multi-model pipeline is doing rather than one opaque row.
+
+    A swarm request is ONE Flask request, so every stage's _act_pick lands on
+    the SAME activity row: `hops` already accumulated all ~10 stage models, but
+    with no way to tell the planner from a worker from the reviewer. swarm.py
+    has emitted these events all along (12 emit() call sites) and app.py simply
+    never passed an on_event -- the plumbing existed unused.
+
+    Binds the activity dict directly instead of reading flask.g inside the
+    callback: swarm runs independent phases in concurrent waves, and `g` is not
+    shared with worker threads."""
+    act = getattr(g, "act", None)
+    if act is None:
+        return None
+
+    def _on_event(kind, detail):
+        try:
+            with _activity_lock:
+                stages = act.setdefault("stages", [])
+                if len(stages) < 40:          # a bounded trail, like `hops`
+                    stages.append({"kind": str(kind)[:24],
+                                   "detail": str(detail)[:80],
+                                   "at": time.time()})
+        except Exception:                                        # noqa: BLE001
+            pass
+    return _on_event
+
+
+def _act_pipeline_result(result):
+    """Stamp the finished pipeline's crew and its per-ROLE model list onto the
+    activity row. swarm.py already returns result["models"] as (role, model)
+    pairs -- 'plan', 'phase:<title>', 'supervisor', 'review', 'repair:<title>',
+    'synthesis' -- which is exactly the "which agent used which model" view the
+    feed was missing; it was only ever rendered into the answer's text trailer."""
+    act = getattr(g, "act", None)
+    if act is None or not isinstance(result, dict):
+        return
+    try:
+        pairs = [(str(r)[:48], str(m)[:64])
+                 for r, m in (result.get("models") or []) if m]
+        with _activity_lock:
+            if result.get("crew"):
+                act["crew"] = str(result["crew"])[:24]
+            if pairs:
+                act["pipeline"] = [{"role": r, "model": m} for r, m in pairs]
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _act_hop_failed(reason):
     """Annotate the hop currently being attempted with why it fell through, so the
     activity feed shows the REAL story ('router picked A, A refused, answered by B')
@@ -11843,12 +11894,15 @@ def _swarm_completion(body):
         return _openai_error("messages is required.", 400)
     asked = (body.get("model") or "").strip()
     crew = _crew_name_for(asked)
+    # Feed live stage progress + the per-role model list to the activity row.
+    _watch = _act_pipeline_watcher()
     if crew is not None:
-        result = crews.run(messages, _swarm_dispatch, crew)
+        result = crews.run(messages, _swarm_dispatch, crew, on_event=_watch)
         text = crews.format_answer(result)
     else:
-        result = swarm.run(messages, _swarm_dispatch)
+        result = swarm.run(messages, _swarm_dispatch, on_event=_watch)
         text = swarm.format_answer(result)
+    _act_pipeline_result(result)
     if not text:
         return _openai_error(
             "Every model in the swarm failed — no provider answered. Check the "
