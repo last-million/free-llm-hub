@@ -1285,67 +1285,42 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": [],
         "notes": "BYOK router with a free tier on ':free'-suffixed ids (~5 RPM, ~200 req/day). The 5/min burst limit is handled by the 429 cooldown path; quota.py tracks the daily budget.",
     },
-    "g4f-groq": {
-        "name": "G4F Groq (g4f.space)",
-        "base_url": "https://g4f.space/api/groq/v1",
-        # QUIRK (verified 2026-07-30): the relay rewrites /api/groq/* ->
-        # upstream /openai/v1/* and appends /v1 ITSELF for chat, so
-        # /api/groq/v1/chat/completions works but /api/groq/v1/models is a
-        # doubled path -> 404 "GET /openai/v1/v1/models". The working models
-        # endpoint drops the /v1:
-        "models_url": "https://g4f.space/api/groq/models",
+    # ONE CARD, not three. Until 2026-08-06 this was g4f-groq / g4f-gemini /
+    # g4f-nvidia: three keyless entries, one per upstream catalog, each on its
+    # own /api/<upstream>/v1 path. That split stopped making sense the moment
+    # g4f ended anonymous access -- all three now authenticate with the SAME
+    # g4f.dev account key, so three cards meant pasting one key three times.
+    #
+    # VERIFIED LIVE 2026-08-06, which is what makes the merge correct rather
+    # than cosmetic: https://g4f.space/v1 is a real unified endpoint (the one
+    # the member dashboard itself prints next to the key). GET /v1/models
+    # returns 200 with 550 models spanning every upstream at once -- gemini
+    # (38), llama (45), qwen (90), gpt (57), deepseek (39), nemotron (27),
+    # glm (27), mistral (16), kimi (10) -- so the single card is a superset of
+    # what the three separate ones covered.
+    "g4f": {
+        "name": "G4F (g4f.space)",
+        "base_url": "https://g4f.space/v1",
+        "models_url": "https://g4f.space/v1/models",
         "signup_url": "https://g4f.dev/members.html",
         "key_hint": "key from g4f.dev/members.html",
         # KEYLESS ACCESS ENDED (verified live 2026-08-06): a keyless chat call
-        # now returns HTTP 402 insufficient_credits — "No cake credits. Bake
+        # returns HTTP 402 insufficient_credits — "No cake credits. Bake
         # proof-of-work cakes at g4f.dev/chat to earn anonymous usage, or sign
         # up at g4f.dev/members.html." The /models catalog is still public
-        # (200), so ONLY the chat path broke. The hub cannot mine proof-of-work
-        # "cakes", so for our purposes this is now a keyed provider: sign up
-        # free at g4f.dev/members.html and paste the key. Without one it is
-        # correctly excluded from routing instead of burning a chain hop on a
-        # guaranteed 402.
-        # Free-only relay of Groq's free catalog -> 'all' cannot leak a paid id.
+        # (200), so ONLY the chat path broke. The hub cannot mine browser
+        # proof-of-work "cakes", so this is a keyed provider now: sign up free
+        # and paste the key. Without one it is cleanly excluded from routing
+        # instead of burning a chain hop on a guaranteed 402.
+        # Community-donated servers with no pricing field anywhere in the
+        # catalog -- nothing here can bill the user -> 'all' is safe.
         "free_filter": "all",
-        # Chat-verified 200 on 2026-07-30 (fallback if discovery fails).
-        "default_free_models": ["llama-3.3-70b-versatile"],
-        "notes": "Community reverse proxy of Groq's free models (OpenAI-compatible, ~5 req/min). NO LONGER KEYLESS as of 2026-08-06: anonymous calls return 402 'No cake credits' and now need either browser proof-of-work or a free account key from g4f.dev/members.html. Unstable volunteer-run gateway: quality varies, ids come and go with the upstream catalog, and the whole proxy can go down without warning — no SLA. Treat as opportunistic capacity, never the only link in a chain.",
-    },
-    "g4f-gemini": {
-        "name": "G4F Gemini (g4f.space)",
-        "base_url": "https://g4f.space/api/gemini/v1",
-        # QUIRK (verified 2026-07-30): same relay family as g4f-groq/g4f-nvidia,
-        # which append /v1 THEMSELVES — the canonical models endpoint drops the
-        # /v1 (both forms answered 200 today, but this is the form the relay
-        # actually documents/serves long-term, matching its siblings):
-        "models_url": "https://g4f.space/api/gemini/models",
-        "signup_url": "https://g4f.dev/members.html",
-        "key_hint": "key from g4f.dev/members.html",
-        # KEYLESS ACCESS ENDED 2026-08-06 — see the g4f-groq entry for the
-        # verified 402 "No cake credits" response and why this is now keyed.
-        # Free-only relay of Gemini's free catalog -> 'all' cannot leak a paid id.
-        "free_filter": "all",
-        # Chat-verified 200 on 2026-07-30, bare AND 'models/'-prefixed ids both
-        # accepted (live discovery returns the prefixed form).
-        "default_free_models": ["gemini-2.5-flash"],
-        "notes": "Community reverse proxy of Gemini free models (OpenAI-compatible, ~5 req/min). NO LONGER KEYLESS as of 2026-08-06: anonymous calls return 402 'No cake credits' and now need a free account key from g4f.dev/members.html. Unstable volunteer-run gateway: quality varies, can go down without warning, no SLA — same caveat as g4f-groq; opportunistic capacity only.",
-    },
-    "g4f-nvidia": {
-        "name": "G4F NVIDIA (g4f.space)",
-        "base_url": "https://g4f.space/api/nvidia/v1",
-        # QUIRK (verified 2026-07-30): same rewrite as g4f-groq —
-        # /api/nvidia/v1/models is a plain "404 page not found"; the working
-        # models endpoint drops the /v1:
-        "models_url": "https://g4f.space/api/nvidia/models",
-        "signup_url": "https://g4f.dev/members.html",
-        "key_hint": "key from g4f.dev/members.html",
-        # KEYLESS ACCESS ENDED 2026-08-06 — see the g4f-groq entry for the
-        # verified 402 "No cake credits" response and why this is now keyed.
-        # Free-only relay of NVIDIA's free catalog -> 'all' cannot leak a paid id.
-        "free_filter": "all",
-        # Chat-verified 200 on 2026-07-30 (fallback if discovery fails).
-        "default_free_models": ["meta/llama-3.3-70b-instruct"],
-        "notes": "Community reverse proxy of NVIDIA NIM free models (OpenAI-compatible, ~5 req/min). NO LONGER KEYLESS as of 2026-08-06: anonymous calls return 402 'No cake credits' and now need a free account key from g4f.dev/members.html. Unstable volunteer-run gateway: quality varies, can go down without warning, no SLA — same caveat as g4f-groq; opportunistic capacity only.",
+        # Live discovery returns ids shaped "srv_<server>:<model>" (the server
+        # is one community-donated box). Those are volatile by nature, so the
+        # pinned fallback is "auto" -- the relay's own documented "random
+        # public server" router, which cannot go stale.
+        "default_free_models": ["auto"],
+        "notes": "Community relay pooling ~550 models donated across many volunteer servers (OpenAI-compatible, ~5 req/min). ONE card since 2026-08-06: the old per-upstream g4f-groq / g4f-gemini / g4f-nvidia entries all authenticate with the same g4f.dev key and are superseded by the unified https://g4f.space/v1 endpoint. NO LONGER KEYLESS as of the same date: anonymous calls return 402 'No cake credits' and now need either browser proof-of-work or a free account key from g4f.dev/members.html. Unstable volunteer-run gateway: quality varies per donated server, ids come and go as servers join and leave, and the whole proxy can go down without warning — no SLA. Treat as opportunistic capacity, never the only link in a chain.",
     },
     "kilocode": {
         "name": "Kilo Code (anonymous)",

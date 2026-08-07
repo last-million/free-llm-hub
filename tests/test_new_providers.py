@@ -114,14 +114,17 @@ def test_github_models_fixes_dangling_references():
 # key at all) and kilocode (anonymous free tier, literal bearer "anonymous").
 # --------------------------------------------------------------------------- #
 
-# g4f-groq / g4f-gemini / g4f-nvidia left this list on 2026-08-06: g4f.space
-# ended anonymous access and a keyless chat call now returns 402 "No cake
-# credits ... sign up at g4f.dev/members.html". They are ordinary keyed
-# providers now -- see tests/test_g4f_keyed.py, which pins that behaviour.
-# They are still exercised by the registry-shape test below, just not as
-# keyless ones.
+# The three g4f entries left this list on 2026-08-06, for two reasons at once:
+#   1. g4f.space ended anonymous access -- a keyless chat call now returns 402
+#      "No cake credits ... sign up at g4f.dev/members.html", so they are
+#      ordinary KEYED providers now.
+#   2. They collapsed into ONE "g4f" card on the unified https://g4f.space/v1
+#      endpoint. All three always authenticated with the same g4f.dev account,
+#      so three cards meant pasting one key three times.
+# tests/test_g4f_keyed.py pins both. They are still exercised by the
+# registry-shape test below, just not as keyless ones.
 KEYLESS_PROVIDERS = ("kilocode",)
-G4F_PROVIDERS = ("g4f-groq", "g4f-gemini", "g4f-nvidia")
+G4F_PROVIDERS = ("g4f",)
 
 
 def test_keyless_gateways_registered_with_required_fields():
@@ -149,11 +152,14 @@ def test_keyless_gateways_no_key_flags():
 
 
 def test_keyless_gateways_free_filters():
-    # g4f-* relays are free-only -> 'all' accepts ordinary ids.
+    # g4f is a pool of community-donated servers with no pricing field anywhere
+    # in its catalog -> 'all' accepts ordinary ids and cannot leak a paid one.
     for pid in G4F_PROVIDERS:
         assert prov.get_provider(pid)["free_filter"] == "all", pid
         assert prov.is_free_model(pid, "llama-3.3-70b-versatile"), pid
         assert prov.is_free_model(pid, "gemini-2.5-flash"), pid
+        # The unified endpoint's real ids carry a "srv_<server>:" prefix.
+        assert prov.is_free_model(pid, "srv_mkom688d57c76d8a3542:llama-3.3-70b-versatile"), pid
         assert not prov.is_free_model(pid, None), pid
         assert not prov.is_free_model(pid, ""), pid
         assert not prov.is_free_model(pid, "llama-3.3-70b", is_free_tier=False), pid
@@ -217,21 +223,21 @@ def test_uncloseai_pinned_default_matches_live_catalog():
     assert prov.is_free_model("uncloseai", "solidrust/Hermes-3-Llama-3.1-8B-AWQ")
 
 
-def test_g4f_models_urls_avoid_the_doubled_v1_path():
-    # Live probe 2026-07-30: on the groq/nvidia relays /api/<up>/v1/models 404s
-    # (the relay appends /v1 itself); /api/<up>/models returns 200. Chat still
-    # uses base_url + /v1. g4f-gemini answered 200 on BOTH forms today, but is
-    # aligned to the same /v1-less canonical form as its siblings.
-    assert prov.get_provider("g4f-groq")["models_url"] == \
-        "https://g4f.space/api/groq/models"
-    assert prov.get_provider("g4f-nvidia")["models_url"] == \
-        "https://g4f.space/api/nvidia/models"
-    assert prov.get_provider("g4f-gemini")["models_url"] == \
-        "https://g4f.space/api/gemini/models"
-    for pid in G4F_PROVIDERS:
-        mu = prov.get_provider(pid)["models_url"]
-        assert "/v1/models" not in mu, pid
-        assert prov.get_provider(pid)["base_url"].endswith("/v1"), pid
+def test_g4f_uses_the_unified_endpoint():
+    """This test used to pin the old per-upstream paths and their doubled-/v1
+    quirk (/api/<up>/v1/models 404'd because the relay appended /v1 itself, so
+    the catalog lived at /api/<up>/models). That quirk is gone with the paths:
+    live probe 2026-08-06 confirmed https://g4f.space/v1 is a real unified
+    endpoint whose /v1/models returns 200 with 550 models spanning every
+    upstream at once -- and it is the base URL g4f's own member dashboard
+    prints next to the API key."""
+    p = prov.get_provider("g4f")
+    assert p["base_url"] == "https://g4f.space/v1"
+    assert p["models_url"] == "https://g4f.space/v1/models"
+    # The per-upstream split is retired -- one account, one key, one card.
+    for old in ("g4f-groq", "g4f-gemini", "g4f-nvidia"):
+        assert prov.get_provider(old) is None, \
+            old + " is superseded by the single 'g4f' card"
 
 
 def test_keyless_pinned_defaults_pass_their_own_free_check():

@@ -57,9 +57,7 @@ FREE_LIMITS = {
     "llm7":          {"limit": 20,    "window": "minute"},  # medium: docs state ~20 req/min AND 100 req/HOUR — the hourly cap has no matching window here, so we track the documented per-minute rate (same convention as nararouter) and let real 429s sideline it once the hourly budget trips.
     "navy":          {"limit": 20,    "window": "minute"},  # medium: free shared pool is ~150K TOKENS/day at ~20 RPM — a request counter can't express a token budget, so we track the documented request rate; real 429s retire it when the daily pool is spent.
     "routeway":      {"limit": 200,   "window": "day"},     # medium: free tier = ~200 req/day at ~5 RPM on ':free' ids; the 5/min burst limit is handled by the 429 -> 60s cooldown path, not by this daily budget (same shape as cerebras).
-    "g4f-groq":      {"limit": 5,     "window": "minute"},  # low: community-observed ~5 req/min on the keyless g4f.space Groq relay — no official doc exists for a volunteer proxy, so treat as a soft hint; real 429s still sideline it (same shape as llm7).
-    "g4f-gemini":    {"limit": 5,     "window": "minute"},  # low: same g4f.space relay, Gemini catalog — community-observed ~5 req/min, no official figure; real 429s sideline it.
-    "g4f-nvidia":    {"limit": 5,     "window": "minute"},  # low: same g4f.space relay, NVIDIA catalog — community-observed ~5 req/min, no official figure; real 429s sideline it.
+    "g4f":           {"limit": 5,     "window": "minute"},  # low: community-observed ~5 req/min on the g4f.space relay — no official doc exists for a volunteer proxy, so treat as a soft hint; real 429s still sideline it (same shape as llm7). ONE row since 2026-08-06: the old g4f-groq/g4f-gemini/g4f-nvidia split was three paths on ONE service sharing ONE account, so three separate 5/min budgets overstated the real allowance ~3x. They merged into the unified https://g4f.space/v1 endpoint.
     # uncloseai / api-airforce / kilocode / puter: genuinely free but with NO
     # published request figure — deliberately ABSENT here so they track as
     # UNKNOWN via DEFAULT_LIMIT instead of inheriting a fabricated budget (same
