@@ -6194,6 +6194,12 @@ _NEW_PROVIDER_IDS = frozenset((
     "deepinfra", "together", "hyperbolic", "nebius", "cohere",
     "scaleway", "stepfun", "aion", "sealion", "requesty",
     "dahl",
+    # Not new providers, but newly NEEDING SETUP: g4f.space ended anonymous
+    # access on 2026-08-06 (keyless chat now 402s "No cake credits"), so
+    # these three went from working-out-of-the-box to needing a free key
+    # from g4f.dev/members.html. Badged so the change is visible on the card
+    # instead of silently reading as "connected" until a request fails.
+    "g4f-groq", "g4f-gemini", "g4f-nvidia",
 ))
 
 

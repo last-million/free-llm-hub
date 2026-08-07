@@ -1294,17 +1294,22 @@ PROVIDERS: Dict[str, dict] = {
         # doubled path -> 404 "GET /openai/v1/v1/models". The working models
         # endpoint drops the /v1:
         "models_url": "https://g4f.space/api/groq/models",
-        "signup_url": "https://g4f.space",
-        "key_hint": "(no key needed at all — no Authorization header is sent)",
-        "no_key": True,   # keyless reverse proxy, no signup, no card
-        # Truly keyless: unlike uncloseai/llm7 there is not even a documented
-        # placeholder bearer, so NO static_key — the no-key path sends no
-        # Authorization header at all (pollinations precedent).
+        "signup_url": "https://g4f.dev/members.html",
+        "key_hint": "key from g4f.dev/members.html",
+        # KEYLESS ACCESS ENDED (verified live 2026-08-06): a keyless chat call
+        # now returns HTTP 402 insufficient_credits — "No cake credits. Bake
+        # proof-of-work cakes at g4f.dev/chat to earn anonymous usage, or sign
+        # up at g4f.dev/members.html." The /models catalog is still public
+        # (200), so ONLY the chat path broke. The hub cannot mine proof-of-work
+        # "cakes", so for our purposes this is now a keyed provider: sign up
+        # free at g4f.dev/members.html and paste the key. Without one it is
+        # correctly excluded from routing instead of burning a chain hop on a
+        # guaranteed 402.
         # Free-only relay of Groq's free catalog -> 'all' cannot leak a paid id.
         "free_filter": "all",
-        # Chat-verified 200 keyless on 2026-07-30 (fallback if discovery fails).
+        # Chat-verified 200 on 2026-07-30 (fallback if discovery fails).
         "default_free_models": ["llama-3.3-70b-versatile"],
-        "notes": "Keyless community reverse proxy of Groq's free models (OpenAI-compatible, ~5 req/min). Unstable volunteer-run gateway: quality varies, ids come and go with the upstream catalog, and the whole proxy can go down without warning — no SLA. Treat as opportunistic capacity, never the only link in a chain.",
+        "notes": "Community reverse proxy of Groq's free models (OpenAI-compatible, ~5 req/min). NO LONGER KEYLESS as of 2026-08-06: anonymous calls return 402 'No cake credits' and now need either browser proof-of-work or a free account key from g4f.dev/members.html. Unstable volunteer-run gateway: quality varies, ids come and go with the upstream catalog, and the whole proxy can go down without warning — no SLA. Treat as opportunistic capacity, never the only link in a chain.",
     },
     "g4f-gemini": {
         "name": "G4F Gemini (g4f.space)",
@@ -1314,16 +1319,16 @@ PROVIDERS: Dict[str, dict] = {
         # /v1 (both forms answered 200 today, but this is the form the relay
         # actually documents/serves long-term, matching its siblings):
         "models_url": "https://g4f.space/api/gemini/models",
-        "signup_url": "https://g4f.space",
-        "key_hint": "(no key needed at all — no Authorization header is sent)",
-        "no_key": True,   # keyless reverse proxy, no signup, no card
-        # Truly keyless, same shape as g4f-groq: no static_key, no header sent.
+        "signup_url": "https://g4f.dev/members.html",
+        "key_hint": "key from g4f.dev/members.html",
+        # KEYLESS ACCESS ENDED 2026-08-06 — see the g4f-groq entry for the
+        # verified 402 "No cake credits" response and why this is now keyed.
         # Free-only relay of Gemini's free catalog -> 'all' cannot leak a paid id.
         "free_filter": "all",
-        # Chat-verified 200 keyless on 2026-07-30, bare AND 'models/'-prefixed
-        # ids both accepted (live discovery returns the prefixed form).
+        # Chat-verified 200 on 2026-07-30, bare AND 'models/'-prefixed ids both
+        # accepted (live discovery returns the prefixed form).
         "default_free_models": ["gemini-2.5-flash"],
-        "notes": "Keyless community reverse proxy of Gemini free models (OpenAI-compatible, ~5 req/min). Unstable volunteer-run gateway: quality varies, can go down without warning, no SLA — same caveat as g4f-groq; opportunistic capacity only.",
+        "notes": "Community reverse proxy of Gemini free models (OpenAI-compatible, ~5 req/min). NO LONGER KEYLESS as of 2026-08-06: anonymous calls return 402 'No cake credits' and now need a free account key from g4f.dev/members.html. Unstable volunteer-run gateway: quality varies, can go down without warning, no SLA — same caveat as g4f-groq; opportunistic capacity only.",
     },
     "g4f-nvidia": {
         "name": "G4F NVIDIA (g4f.space)",
@@ -1332,15 +1337,15 @@ PROVIDERS: Dict[str, dict] = {
         # /api/nvidia/v1/models is a plain "404 page not found"; the working
         # models endpoint drops the /v1:
         "models_url": "https://g4f.space/api/nvidia/models",
-        "signup_url": "https://g4f.space",
-        "key_hint": "(no key needed at all — no Authorization header is sent)",
-        "no_key": True,   # keyless reverse proxy, no signup, no card
-        # Truly keyless, same shape as g4f-groq: no static_key, no header sent.
+        "signup_url": "https://g4f.dev/members.html",
+        "key_hint": "key from g4f.dev/members.html",
+        # KEYLESS ACCESS ENDED 2026-08-06 — see the g4f-groq entry for the
+        # verified 402 "No cake credits" response and why this is now keyed.
         # Free-only relay of NVIDIA's free catalog -> 'all' cannot leak a paid id.
         "free_filter": "all",
-        # Chat-verified 200 keyless on 2026-07-30 (fallback if discovery fails).
+        # Chat-verified 200 on 2026-07-30 (fallback if discovery fails).
         "default_free_models": ["meta/llama-3.3-70b-instruct"],
-        "notes": "Keyless community reverse proxy of NVIDIA NIM free models (OpenAI-compatible, ~5 req/min). Unstable volunteer-run gateway: quality varies, can go down without warning, no SLA — same caveat as g4f-groq; opportunistic capacity only.",
+        "notes": "Community reverse proxy of NVIDIA NIM free models (OpenAI-compatible, ~5 req/min). NO LONGER KEYLESS as of 2026-08-06: anonymous calls return 402 'No cake credits' and now need a free account key from g4f.dev/members.html. Unstable volunteer-run gateway: quality varies, can go down without warning, no SLA — same caveat as g4f-groq; opportunistic capacity only.",
     },
     "kilocode": {
         "name": "Kilo Code (anonymous)",

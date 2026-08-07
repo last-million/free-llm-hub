@@ -121,7 +121,13 @@ def test_aihorde_probe_network_error_is_truthful_failure(hub_config, monkeypatch
 def test_chat_providers_unaffected_by_image_only_branch(hub_config, monkeypatch):
     """A provider WITH a chat surface (models_url + default models) must still
     take the normal 1-token chat probe — the image-only branch is gated on
-    having NO chat surface at all."""
+    having NO chat surface at all.
+
+    Uses llm7 (keyless, has models_url + default models). This was g4f-gemini
+    until 2026-08-06, when g4f.space ended anonymous access and it became a
+    keyed provider — the probe then short-circuits on "no key" before ever
+    reaching the branch under test, which has nothing to do with this test's
+    subject."""
     monkeypatch.setattr(app.requests, "get", _fake_get([]))
     seen = {}
 
@@ -137,7 +143,7 @@ def test_chat_providers_unaffected_by_image_only_branch(hub_config, monkeypatch)
         return _ChatResp()
     monkeypatch.setattr(app, "_upstream_chat", _chat)
     client = app.app.test_client()
-    body = client.post("/api/test/g4f-gemini", headers=_DASH).get_json()
+    body = client.post("/api/test/llm7", headers=_DASH).get_json()
     assert seen.get("called") is True
     assert body["ok"] is True
     assert "chat succeeded" in body["detail"]
