@@ -1315,6 +1315,17 @@ PROVIDERS: Dict[str, dict] = {
         # Community-donated servers with no pricing field anywhere in the
         # catalog -- nothing here can bill the user -> 'all' is safe.
         "free_filter": "all",
+        # SECOND LAYER ONLY. All 7 api.airforce-owned rows in the keyed catalog
+        # sit on this ONE donated server and answer HTTP 200 with "The model
+        # does not exist in https://api.airforce / discord.gg/airforce" as the
+        # assistant MESSAGE (verified live 2026-08-07) -- a successful response
+        # by every status-based check in the hub, which is why it survived four
+        # rounds of fixes. Because claude-* scores a 138 floor, it was usually
+        # hop 1, so this saves a guaranteed-wasted top-priority hop.
+        # It must never be the only defence: these server ids rotate as
+        # volunteers join and leave, and this does nothing for the other 41
+        # backends. _chat_json_nonanswer in app.py is the real fix.
+        "exclude_families": ["srv_mp3lmkuad07322459f47"],
         # /v1/models SERVES TWO DIFFERENT CATALOGS depending on the request
         # (both verified live 2026-08-06):
         #   no Authorization -> 549 community-server ids shaped
