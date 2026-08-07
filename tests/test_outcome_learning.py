@@ -173,3 +173,60 @@ def test_activity_exposes_what_routing_learned():
     assert any(r["provider"] == "g4f-nvidia" and r["score_penalty"] > 0 for r in learned)
     assert not any(r["provider"] == "groq" for r in learned), \
         "a healthy hop carries no penalty, so it must not be listed as unreliable"
+
+
+# --------------------------------------------------------------------------- #
+# Every non-2xx counts, not just 5xx and timeouts.
+#
+# MEASURED 2026-08-07, chasing an api.airforce error reported THREE times: g4f
+# fronts ~42 backends, one being api.airforce, whose GLOBAL cap is 1 req/sec
+# shared across every g4f user -- so its 7 models answer 429 "Global rate limit
+# exceeded ... upgrade at api.airforce" (and 402 for the paid ones). 429 is
+# deliberately NOT in _DEAD_STATUSES because a burst limit really is temporary,
+# so those ids came back after every cooldown, for ever. Recording only
+# timeouts and 5xx meant a hop that ONLY ever 429s never accrued a penalty.
+# --------------------------------------------------------------------------- #
+
+def _run_hop(monkeypatch, status):
+    class R:
+        status_code = status
+        headers = {}
+        text = '{"error":{"message":"Global rate limit exceeded ... api.airforce"}}'
+        def json(self): return {"error": {"message": "rate limited"}}
+        def close(self): pass
+
+    def fake_dispatch(pid, payload, stream):
+        if pid == "g4f":
+            return R()
+        return type("Ok", (), {
+            "status_code": 200, "headers": {}, "text": "",
+            "json": lambda self: {"choices": [{"finish_reason": "stop",
+                "message": {"role": "assistant", "content": "OK"}}]},
+            "close": lambda self: None})()
+    monkeypatch.setattr(app, "_dispatch_chat", fake_dispatch)
+    monkeypatch.setattr(app, "_build_chain",
+                        lambda *a, **k: [("g4f", "srv_x:claude-opus-4-7"), ("groq", "llama")])
+    monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
+    app.app.test_client().post("/v1/chat/completions", json={
+        "model": "auto", "max_tokens": 24, "stream": False,
+        "messages": [{"role": "user", "content": "hi"}]})
+
+
+@pytest.mark.parametrize("status", [429, 402, 403, 404, 400])
+def test_any_non_2xx_hop_counts_as_a_delivery_failure(monkeypatch, status):
+    _run_hop(monkeypatch, status)
+    assert app._reliability("g4f", "srv_x:claude-opus-4-7") < 0.5, (
+        "HTTP %d did not reach the reliability ledger, so a hop that only ever "
+        "returns it can never sink" % status)
+
+
+def test_a_model_that_only_ever_429s_eventually_sinks_below_a_healthy_rival(monkeypatch):
+    """The user-visible bug: a 138-scoring id behind a 1-req/sec backend kept
+    out-ranking genuinely working 134-scoring models, for ever."""
+    for _ in range(10):
+        _run_hop(monkeypatch, 429)
+    bad = app._agentic_score((138.0, "g4f", "srv_x:claude-opus-4-7"))
+    good = app._agentic_score((134.0, "kilocode", "tencent/hy3:free"))
+    assert bad < good, (
+        "a permanently rate-limited hop (%.1f) must fall behind a working "
+        "model (%.1f)" % (bad, good))

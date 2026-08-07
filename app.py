@@ -11922,7 +11922,6 @@ def v1_chat_completions():
                 # be a raw 5xx status (524 etc.) that never raises at all --
                 # handled separately below, in the non-2xx branch.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
-                _record_outcome(hop_pid, hop_model, False)
             continue
         if resp.status_code == 200:
             if stream and is_sub_hop:
@@ -12031,6 +12030,20 @@ def v1_chat_completions():
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
             last_error = _classify_hop_error(status=resp.status_code)
+            # EVERY non-2xx hop is a delivery failure for the reliability
+            # ledger, not just 5xx. MEASURED 2026-08-07, chasing an
+            # api.airforce error the user reported THREE times: g4f fronts ~42
+            # backends, one of which is api.airforce with a GLOBAL 1 req/sec
+            # cap shared by every g4f user, so its models answer
+            #   429 "Global rate limit exceeded ... upgrade at api.airforce"
+            #   402 "requires an active subscription"
+            # 429 is deliberately NOT in _DEAD_STATUSES (a burst limit really
+            # is temporary), so those ids returned after every cooldown, for
+            # ever. Recording only timeouts and 5xx meant a hop that ONLY ever
+            # 429s never accrued a penalty and kept winning slots. Laplace
+            # smoothing keeps this fair: an occasional 429 among successes
+            # barely moves the ratio, while a model that never delivers sinks.
+            _record_outcome(hop_pid, hop_model, False)
             if resp.status_code >= 500:
                 # 429 already gets throttled inside _upstream_chat once its key
                 # pool is exhausted; a raw 5xx (502/503/524...) reaching here
@@ -12041,7 +12054,6 @@ def v1_chat_completions():
                 # ConnectionError on the SAME hop moments earlier in a
                 # different request -- nothing had cooled it down between them.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
-                _record_outcome(hop_pid, hop_model, False)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
@@ -12576,7 +12588,6 @@ def v1_responses(_retry_pass=False):
                 # be a raw 5xx status (524 etc.) that never raises at all --
                 # handled separately below, in the non-2xx branch.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
-                _record_outcome(hop_pid, hop_model, False)
             continue
         if resp.status_code == 200:
             # Echo back the id the client ASKED for (codex sends "auto", which now has
@@ -12640,13 +12651,26 @@ def v1_responses(_retry_pass=False):
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
             last_error = _classify_hop_error(status=resp.status_code)
+            # EVERY non-2xx hop is a delivery failure for the reliability
+            # ledger, not just 5xx. MEASURED 2026-08-07, chasing an
+            # api.airforce error the user reported THREE times: g4f fronts ~42
+            # backends, one of which is api.airforce with a GLOBAL 1 req/sec
+            # cap shared by every g4f user, so its models answer
+            #   429 "Global rate limit exceeded ... upgrade at api.airforce"
+            #   402 "requires an active subscription"
+            # 429 is deliberately NOT in _DEAD_STATUSES (a burst limit really
+            # is temporary), so those ids returned after every cooldown, for
+            # ever. Recording only timeouts and 5xx meant a hop that ONLY ever
+            # 429s never accrued a penalty and kept winning slots. Laplace
+            # smoothing keeps this fair: an occasional 429 among successes
+            # barely moves the ratio, while a model that never delivers sinks.
+            _record_outcome(hop_pid, hop_model, False)
             if resp.status_code >= 500:
                 # See the matching comment in /v1/chat/completions: a raw 5xx
                 # (unlike 429, already handled inside _upstream_chat) never got
                 # a cooldown here, so a genuinely down hop was retried on every
                 # request. MEASURED 2026-08-05: g4f-nvidia/mistral-medium-3.5.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
-                _record_outcome(hop_pid, hop_model, False)
             _ekey = "%s:%d" % (hop_pid, resp.status_code)  # DIAG: capture first raw body
             if _ekey not in _err_bodies:
                 try:
@@ -13203,7 +13227,6 @@ def v1_messages():
                 # be a raw 5xx status (524 etc.) that never raises at all --
                 # handled separately below, in the non-2xx branch.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
-                _record_outcome(hop_pid, hop_model, False)
             continue
         if resp.status_code == 200:
             model_str = requested_model or (hop_pid + "/" + hop_model)
@@ -13250,13 +13273,26 @@ def v1_messages():
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
             last_error = _classify_hop_error(status=resp.status_code)
+            # EVERY non-2xx hop is a delivery failure for the reliability
+            # ledger, not just 5xx. MEASURED 2026-08-07, chasing an
+            # api.airforce error the user reported THREE times: g4f fronts ~42
+            # backends, one of which is api.airforce with a GLOBAL 1 req/sec
+            # cap shared by every g4f user, so its models answer
+            #   429 "Global rate limit exceeded ... upgrade at api.airforce"
+            #   402 "requires an active subscription"
+            # 429 is deliberately NOT in _DEAD_STATUSES (a burst limit really
+            # is temporary), so those ids returned after every cooldown, for
+            # ever. Recording only timeouts and 5xx meant a hop that ONLY ever
+            # 429s never accrued a penalty and kept winning slots. Laplace
+            # smoothing keeps this fair: an occasional 429 among successes
+            # barely moves the ratio, while a model that never delivers sinks.
+            _record_outcome(hop_pid, hop_model, False)
             if resp.status_code >= 500:
                 # See the matching comment in /v1/chat/completions: a raw 5xx
                 # (unlike 429, already handled inside _upstream_chat) never got
                 # a cooldown here, so a genuinely down hop was retried on every
                 # request. MEASURED 2026-08-05: g4f-nvidia/mistral-medium-3.5.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
-                _record_outcome(hop_pid, hop_model, False)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
