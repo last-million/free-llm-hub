@@ -11429,6 +11429,16 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
                 b = item if isinstance(item, (bytes, bytearray)) \
                     else str(item).encode("utf-8", "ignore")
                 if _STREAM_CONTENT_RE.search(b):
+                    # LIVE-VERIFIED 2026-08-07: the api.airforce backend behind
+                    # g4f ships its ENTIRE error in ONE content delta, so a
+                    # per-frame check catches it before the stream is committed.
+                    # This is the path Codex and Claude Code actually use, and
+                    # the frame really is content -- _STREAM_ERROR_VALUE_RE below
+                    # never fires because there is no "error" key anywhere.
+                    if len(b) <= 1024 and _NONANSWER_RE.search(
+                            b.decode("utf-8", "ignore")):
+                        box["status"] = "nonanswer"
+                        return
                     box["status"] = "content"
                     return
                 # An error INSIDE a 200 stream (403/429/quota reported as an SSE
@@ -11491,6 +11501,70 @@ def _chat_json_is_empty(data):
         return not (has_text or has_tools)
     except Exception:
         return False
+
+
+# A 200 whose "answer" IS the relay backend's error page.
+#
+# MEASURED LIVE 2026-08-07, reproduced twice with the hub's own g4f key:
+#   model=srv_mp3lmkuad07322459f47:claude-opus-4-7  ->  HTTP 200,
+#   finish_reason "stop", usage {"total_tokens": 399}, content =
+#   "The model does not exist in https://api.airforce\ndiscord.gg/airforce"
+#   -- character for character what the user reported, four separate times.
+#
+# g4f fronts ~42 donated backends; api.airforce answers an unknown model id
+# with 200 + error-as-content instead of a 4xx. That is why FOUR previous
+# fixes changed nothing: _DEAD_STATUSES, _maybe_mark_missing_model, the
+# non-2xx _record_outcome(False) and the last_hard relay ALL live in the
+# non-2xx branch, and this request never enters it -- the chain does not
+# exhaust, it SUCCEEDS on hop 1 and returns. Worse, _record_chat_usage files
+# every delivery as _record_outcome(..., True), so the reliability signal was
+# PROMOTING the id while it kept its 138 claude-family score floor.
+#
+# Content is the only signal that exists here. Requiring the WHOLE message to
+# be short is what makes it safe: a real model quoting "model does not exist"
+# inside a genuine reply is never a <300-char complete answer, and a false
+# positive costs only a fall-through to the next hop -- exactly what an empty
+# 200 already pays.
+_NONANSWER_MAX_CHARS = 300
+_NONANSWER_RE = re.compile(
+    r"model (?:'[^']*' )?does\s?n[o']?t exist"
+    r"|requires an active subscription"
+    r"|rate limit exceeded"
+    r"|insufficient (?:credits|balance|quota)"
+    r"|no cake credits"
+    r"|discord\.gg/", re.I)
+
+
+def _is_upstream_nonanswer(text):
+    """True if `text` is a COMPLETE, SHORT message that is an upstream service's
+    error/branding rather than an answer."""
+    s = (text or "").strip()
+    return bool(s) and len(s) <= _NONANSWER_MAX_CHARS and bool(_NONANSWER_RE.search(s))
+
+
+def _chat_json_nonanswer(data):
+    """_chat_json_is_empty's sibling: a 200 carrying the relay's error as content."""
+    try:
+        msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+        if msg.get("tool_calls"):
+            return False                      # a real tool call is a real answer
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "".join((p.get("text") or "") for p in content
+                              if isinstance(p, dict))
+        return _is_upstream_nonanswer(content)
+    except Exception:
+        return False
+
+
+def _note_nonanswer(pid, model):
+    """Both consequences in one hook: file the delivery failure the 200 branch
+    never filed, and sideline this (pid, model) for _DEAD_MODEL_TTL. Dead-marking
+    is the ONLY mechanism here that actually REMOVES an id from the chain
+    (_build_chain checks _is_model_dead) rather than merely re-ordering it --
+    which is why a reliability penalty alone could never have stopped this."""
+    _record_outcome(pid, model, False)
+    _mark_model_dead(pid, model, 404)         # 404 is in _DEAD_STATUSES
 
 
 # --------------------------------------------------------------------------- #
@@ -11735,6 +11809,13 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
                     best_partial = text
                     best_partial_who = "%s/%s" % (hop_pid, hop_model)
                 continue
+            if text and _is_upstream_nonanswer(text):
+                # A relay's error page delivered as a 200 (see
+                # _chat_json_nonanswer). Without this a swarm stage happily
+                # synthesises on top of "The model does not exist in
+                # https://api.airforce" as if it were real stage output.
+                _note_nonanswer(hop_pid, hop_model)
+                continue
             if text:
                 # Same success hook as every other endpoint: usage accounting
                 # AND the reliability record, so a stage's healthy hop is what
@@ -11932,6 +12013,15 @@ def v1_chat_completions():
                     last_error = "non-json"
                     resp.close()
                     continue
+                if _chat_json_nonanswer(data):
+                    # A 200 whose content IS the relay backend's error page (see
+                    # _chat_json_nonanswer). Falls through to the next hop exactly
+                    # like an empty 200, and sidelines the id so it stops winning.
+                    errors.append("%s: upstream error returned as content" % hop_pid)
+                    last_error = "empty"
+                    _note_nonanswer(hop_pid, hop_model)
+                    resp.close()
+                    continue
                 if _chat_json_is_empty(data):
                     errors.append("%s: empty (200 but no content)" % hop_pid)
                     last_error = "empty"
@@ -11965,6 +12055,11 @@ def v1_chat_completions():
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
+                    if status == "nonanswer":
+                        # The relay streamed its own error page as the answer --
+                        # sideline the id so it stops winning hop 1 (see
+                        # _note_nonanswer; ranking alone never removed it).
+                        _note_nonanswer(hop_pid, hop_model)
                     resp.close()
                     continue
                 chained = _chain_buffered(buffered, it)
@@ -11978,6 +12073,15 @@ def v1_chat_completions():
                 # Non-JSON / broken 200 body -> don't dead-end, try the next model.
                 errors.append("%s: non-JSON 200 body" % hop_pid)
                 last_error = "non-json"
+                resp.close()
+                continue
+            if _chat_json_nonanswer(data):
+                # A 200 whose content IS the relay backend's error page (see
+                # _chat_json_nonanswer). Falls through to the next hop exactly
+                # like an empty 200, and sidelines the id so it stops winning.
+                errors.append("%s: upstream error returned as content" % hop_pid)
+                last_error = "empty"
+                _note_nonanswer(hop_pid, hop_model)
                 resp.close()
                 continue
             if _chat_json_is_empty(data):
@@ -11996,7 +12100,8 @@ def v1_chat_completions():
                         resp2.close()
                     except (requests.RequestException, RuntimeError, ValueError):
                         data2 = None
-                    if data2 and not _chat_json_is_empty(data2):
+                    if (data2 and not _chat_json_is_empty(data2)
+                            and not _chat_json_nonanswer(data2)):
                         _record_chat_usage(hop_pid, hop_model, data2, est)
                         data2["model"] = hop_pid + "/" + hop_model
                         return (jsonify(data2), 200,
@@ -12604,6 +12709,15 @@ def v1_responses(_retry_pass=False):
                     last_error = "non-json"
                     resp.close()
                     continue
+                if _chat_json_nonanswer(data):
+                    # A 200 whose content IS the relay backend's error page (see
+                    # _chat_json_nonanswer). Falls through to the next hop exactly
+                    # like an empty 200, and sidelines the id so it stops winning.
+                    errors.append("%s: upstream error returned as content" % hop_pid)
+                    last_error = "empty"
+                    _note_nonanswer(hop_pid, hop_model)
+                    resp.close()
+                    continue
                 if _chat_json_is_empty(data):
                     errors.append("%s: empty (200 but no content)" % hop_pid)
                     last_error = "empty"
@@ -12628,6 +12742,11 @@ def v1_responses(_retry_pass=False):
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
+                    if status == "nonanswer":
+                        # The relay streamed its own error page as the answer --
+                        # sideline the id so it stops winning hop 1 (see
+                        # _note_nonanswer; ranking alone never removed it).
+                        _note_nonanswer(hop_pid, hop_model)
                     resp.close()
                     continue
                 chained = _chain_buffered(buffered, line_it)
@@ -12639,6 +12758,15 @@ def v1_responses(_retry_pass=False):
             except (ValueError, requests.RequestException):
                 errors.append("%s: non-JSON 200 body" % hop_pid)
                 last_error = "non-json"
+                resp.close()
+                continue
+            if _chat_json_nonanswer(data):
+                # A 200 whose content IS the relay backend's error page (see
+                # _chat_json_nonanswer). Falls through to the next hop exactly
+                # like an empty 200, and sidelines the id so it stops winning.
+                errors.append("%s: upstream error returned as content" % hop_pid)
+                last_error = "empty"
+                _note_nonanswer(hop_pid, hop_model)
                 resp.close()
                 continue
             if _chat_json_is_empty(data):
@@ -13241,6 +13369,11 @@ def v1_messages():
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
+                    if status == "nonanswer":
+                        # The relay streamed its own error page as the answer --
+                        # sideline the id so it stops winning hop 1 (see
+                        # _note_nonanswer; ranking alone never removed it).
+                        _note_nonanswer(hop_pid, hop_model)
                     resp.close()
                     continue
                 chained = _chain_buffered(buffered, line_it)
@@ -13255,6 +13388,15 @@ def v1_messages():
             except (ValueError, requests.RequestException):
                 errors.append("%s: non-JSON 200 body" % hop_pid)
                 last_error = "non-json"
+                resp.close()
+                continue
+            if _chat_json_nonanswer(data):
+                # A 200 whose content IS the relay backend's error page (see
+                # _chat_json_nonanswer). Falls through to the next hop exactly
+                # like an empty 200, and sidelines the id so it stops winning.
+                errors.append("%s: upstream error returned as content" % hop_pid)
+                last_error = "empty"
+                _note_nonanswer(hop_pid, hop_model)
                 resp.close()
                 continue
             if _chat_json_is_empty(data):
