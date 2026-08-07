@@ -158,8 +158,11 @@ def test_keyless_gateways_free_filters():
         assert prov.get_provider(pid)["free_filter"] == "all", pid
         assert prov.is_free_model(pid, "llama-3.3-70b-versatile"), pid
         assert prov.is_free_model(pid, "gemini-2.5-flash"), pid
-        # The unified endpoint's real ids carry a "srv_<server>:" prefix.
+        # /v1/models serves two shapes and BOTH must pass: the anonymous
+        # listing's "srv_<server>:<model>" community-server ids, and the keyed
+        # listing's clean ids (the keyed one is what the hub actually uses).
         assert prov.is_free_model(pid, "srv_mkom688d57c76d8a3542:llama-3.3-70b-versatile"), pid
+        assert prov.is_free_model(pid, "gemini-3.5-flash"), pid
         assert not prov.is_free_model(pid, None), pid
         assert not prov.is_free_model(pid, ""), pid
         assert not prov.is_free_model(pid, "llama-3.3-70b", is_free_tier=False), pid

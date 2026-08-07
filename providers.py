@@ -1315,11 +1315,22 @@ PROVIDERS: Dict[str, dict] = {
         # Community-donated servers with no pricing field anywhere in the
         # catalog -- nothing here can bill the user -> 'all' is safe.
         "free_filter": "all",
-        # Live discovery returns ids shaped "srv_<server>:<model>" (the server
-        # is one community-donated box). Those are volatile by nature, so the
-        # pinned fallback is "auto" -- the relay's own documented "random
-        # public server" router, which cannot go stale.
-        "default_free_models": ["auto"],
+        # /v1/models SERVES TWO DIFFERENT CATALOGS depending on the request
+        # (both verified live 2026-08-06):
+        #   no Authorization -> 549 community-server ids shaped
+        #                       "srv_<server>:<model>", volatile as servers
+        #                       join and leave;
+        #   with a bearer    -> 273 CLEAN ids (gemini-3.5-flash, o3-mini,
+        #                       hy3, ...) plus per-model vision/image flags.
+        # The keyed catalog is the only one that matters now, and the hub only
+        # runs live discovery once a key exists anyway (provider_free_models
+        # returns defaults for a keyed provider with no key). So these pins are
+        # purely the discovery-failed fallback, and they must be ids the KEYED
+        # catalog actually serves: "auto" is NOT one of them (it exists only in
+        # the anonymous listing) -- "default" is g4f's own router alias there,
+        # paired with one concrete strong model so a degraded fallback is not
+        # stuck at the unknown-model score floor.
+        "default_free_models": ["default", "gemini-3.5-flash"],
         "notes": "Community relay pooling ~550 models donated across many volunteer servers (OpenAI-compatible, ~5 req/min). ONE card since 2026-08-06: the old per-upstream g4f-groq / g4f-gemini / g4f-nvidia entries all authenticate with the same g4f.dev key and are superseded by the unified https://g4f.space/v1 endpoint. NO LONGER KEYLESS as of the same date: anonymous calls return 402 'No cake credits' and now need either browser proof-of-work or a free account key from g4f.dev/members.html. Unstable volunteer-run gateway: quality varies per donated server, ids come and go as servers join and leave, and the whole proxy can go down without warning — no SLA. Treat as opportunistic capacity, never the only link in a chain.",
     },
     "kilocode": {
