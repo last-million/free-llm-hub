@@ -79,6 +79,19 @@ def test_the_three_old_cards_are_fully_retired():
         assert pid not in app._NEW_PROVIDER_IDS, pid
 
 
+def test_pinned_fallback_ids_exist_in_the_KEYED_catalog():
+    """/v1/models serves two different catalogs (verified live 2026-08-06):
+    anonymous -> 549 volatile "srv_<server>:<model>" ids including "auto";
+    with a bearer -> 273 clean ids where "auto" DOES NOT EXIST ("default" is
+    the router alias there). The hub only discovers live once a key exists, so
+    a fallback pinned to "auto" would be an id the real catalog rejects."""
+    models = prov.get_provider("g4f")["default_free_models"]
+    assert "auto" not in models, "'auto' is anonymous-catalog only"
+    assert "default" in models, "'default' is the keyed catalog's router alias"
+    assert not any(m.startswith("srv_") for m in models), \
+        "srv_-prefixed ids are volatile community servers, unfit as a pin"
+
+
 def test_the_merged_card_keeps_one_per_minute_budget_not_three():
     """Three rows of 5/min for a single shared 5/min allowance overstated the
     real budget ~3x, so the hub would keep calling a spent relay."""
