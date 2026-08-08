@@ -50,7 +50,13 @@ _BACKUP_SUFFIX = ".mcp-manager-bak"
 # {"type": "remote", ...}. stdio is the default type for both (claude accepts
 # an explicit "stdio"; opencode spells it "local" with a single command ARRAY
 # -- documented shapes, hence the per-CLI adapters below).
-_SUPPORTED = ("kimi", "codex", "claude", "opencode")
+_SUPPORTED = ("kimi", "codex", "claude", "opencode", "openclaw", "hermes")
+
+# Only these three are ALSO installed privately by the hub (agentic_chat.py
+# runs them with CODEX_HOME / CLAUDE_CONFIG_DIR / XDG_CONFIG_HOME redirected).
+# openclaw/hermes have no isolated copy, so isolated=True is a clean no-op for
+# them rather than a write to a path nothing reads.
+_ISOLATED_CLIS = ("kimi", "codex", "claude", "opencode")
 
 
 def _home():
@@ -84,6 +90,8 @@ def _config_path(cli, isolated=False):
     directory holding config.toml, so the isolated path is not simply the
     global one under a different home."""
     if isolated:
+        if cli not in _ISOLATED_CLIS:
+            return None
         d = _isolated_dir(cli)
         if cli in ("kimi", "codex"):
             return os.path.join(d, "config.toml")
@@ -103,6 +111,35 @@ def _config_path(cli, isolated=False):
         if os.path.isfile(local):
             return local
         return os.path.join(_xdg_config(), "opencode", "opencode.json")
+    if cli == "openclaw":
+        # Documented order (docs/help/environment.md). NOTE the real variable
+        # is OPENCLAW_CONFIG_PATH; app.py's provider-wiring helper also reads a
+        # legacy OPENCLAW_CONFIG, kept here as an alias only.
+        #
+        # DELIBERATELY NOT ~/openclaw-config/openclaw.json, which app.py's
+        # _p_openclaw() does resolve: on this machine that directory is a
+        # DEPLOY-STAGING dir whose deploy.py SSHes the file into a remote VPS
+        # container. Nothing local reads it, so writing there would return
+        # ok=True and change nothing -- the silent-success failure this module
+        # exists to prevent.
+        env = os.environ.get("OPENCLAW_CONFIG_PATH") or os.environ.get("OPENCLAW_CONFIG")
+        if env:
+            env = os.path.abspath(os.path.expanduser(env))
+            return env if env.lower().endswith(".json") else os.path.join(env, "openclaw.json")
+        state = os.environ.get("OPENCLAW_STATE_DIR")
+        if state:
+            return os.path.join(os.path.abspath(os.path.expanduser(state)), "openclaw.json")
+        base = os.environ.get("OPENCLAW_HOME") or _home()
+        return os.path.join(os.path.abspath(os.path.expanduser(base)), ".openclaw", "openclaw.json")
+    if cli == "hermes":
+        # Matches hermes_cli/config.py: get_hermes_home() / "config.yaml".
+        env = os.environ.get("HERMES_HOME")
+        if env:
+            return os.path.join(os.path.abspath(os.path.expanduser(env)), "config.yaml")
+        if os.name == "nt":
+            base = os.environ.get("LOCALAPPDATA") or os.path.join(_home(), "AppData", "Local")
+            return os.path.join(base, "hermes", "config.yaml")
+        return os.path.join(_home(), ".hermes", "config.yaml")
     return None
 
 
@@ -111,6 +148,8 @@ def _config_path(cli, isolated=False):
 def _format(cli):
     if cli in ("kimi", "codex"):
         return "toml"
+    if cli == "hermes":
+        return "yaml"
     return "json"
 
 
@@ -275,8 +314,102 @@ def _toml_servers(text):
 # construction preserves every unrelated key.
 
 
+# ---------------------------------------------------------------------------
+# YAML handling (hermes). There is no stdlib YAML parser and this module is
+# stdlib-only, so this deliberately handles ONLY the narrow shape it writes:
+# a top-level `mcp_servers:` mapping of name -> {url|command,...}. Anything
+# more exotic is reported as unparseable and REFUSED rather than rewritten --
+# the module's rule is to never risk a config it does not fully understand.
+#
+# Hermes reads it as: `url` present -> Streamable HTTP, `command` present ->
+# stdio (hermes_cli/mcp_config.py picks by field presence). There is no
+# "type" field, and the key is snake_case mcp_servers -- NOT Claude Desktop's
+# mcpServers.
+_YAML_KEY = "mcp_servers"
+_YAML_TOP_RE = re.compile(r"^(?P<key>[A-Za-z0-9_-]+)\s*:", re.M)
+_YAML_ENTRY_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_.\- ]+)\s*:\s*$", re.M)
+
+
+def _yaml_servers(text):
+    """-> (names_dict, error_or_None). Only the entry NAMES are parsed; that is
+    all add/remove need, and it avoids pretending to be a YAML parser."""
+    if not text or not text.strip():
+        return {}, None
+    block, _s, _e = _yaml_block(text)
+    if block is None:
+        return {}, None
+    return {m.group("name").strip(): True for m in _YAML_ENTRY_RE.finditer(block)}, None
+
+
+def _yaml_block(text):
+    """The `mcp_servers:` block -> (block_text, start, end) or (None, -1, -1).
+    The block ends at the next line that starts in column 0."""
+    m = re.search(r"^%s\s*:\s*$" % re.escape(_YAML_KEY), text or "", re.M)
+    if not m:
+        return None, -1, -1
+    start = m.end()
+    rest = text[start:]
+    nxt = re.search(r"^\S", rest, re.M)
+    end = start + (nxt.start() if nxt else len(rest))
+    return text[start:end], start, end
+
+
+def _yaml_entry_lines(name, spec):
+    """Two-space indent, spaces only -- the shape hermes_cli parses."""
+    lines = ["  %s:" % name]
+    if spec.get("url"):
+        lines.append('    url: "%s"' % spec["url"])
+    else:
+        lines.append('    command: "%s"' % spec["command"])
+        if spec.get("args"):
+            lines.append("    args:")
+            lines += ['      - "%s"' % a for a in spec["args"]]
+        if spec.get("env"):
+            lines.append("    env:")
+            lines += ['      %s: "%s"' % (k, v) for k, v in spec["env"].items()]
+    return "\n".join(lines)
+
+
+def _yaml_remove_entry(block, name):
+    """Drop one `  <name>:` entry and its indented body from a block."""
+    out, skipping = [], False
+    for line in block.split("\n"):
+        m = _YAML_ENTRY_RE.match(line + "\n")
+        if m and m.group("name").strip() == name:
+            skipping = True
+            continue
+        if skipping:
+            if line.strip() and not line.startswith("    "):
+                skipping = False
+            else:
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _yaml_add_server(text, name, spec):
+    """Additively insert/replace one entry, leaving every sibling key alone."""
+    entry = _yaml_entry_lines(name, spec)
+    block, start, end = _yaml_block(text or "")
+    if block is None:
+        base = (text or "").rstrip("\n")
+        return (base + "\n\n" if base else "") + "%s:\n%s\n" % (_YAML_KEY, entry)
+    # `block` begins with the newline that ended the "mcp_servers:" line, so
+    # strip the edges and rebuild them -- otherwise the entry lands after a
+    # stray blank line and the separator before the NEXT top-level key is lost.
+    cleaned = _yaml_remove_entry(block, name).strip("\n")
+    body = (cleaned + "\n" if cleaned.strip() else "") + entry
+    tail = text[end:]
+    sep = "\n\n" if tail.strip() else "\n"
+    return text[:start] + "\n" + body + sep + tail
+
+
 def _json_container_key(cli):
-    return "mcpServers" if cli == "claude" else "mcp"
+    if cli == "claude":
+        return "mcpServers"
+    if cli == "openclaw":
+        return "mcp.servers"        # NESTED: {"mcp": {"servers": {...}}}
+    return "mcp"
 
 
 def _json_servers(cli, text):
@@ -289,12 +422,42 @@ def _json_servers(cli, text):
         return None, None, "invalid JSON: %s" % exc
     if not isinstance(data, dict):
         return None, None, "top-level JSON is not an object"
-    servers = data.get(_json_container_key(cli))
+    key = _json_container_key(cli)
+    if "." in key:                       # nested container (openclaw: mcp.servers)
+        outer, inner = key.split(".", 1)
+        holder = data.get(outer)
+        if holder is None:
+            return data, {}, None
+        if not isinstance(holder, dict):
+            return None, None, "%s is not an object" % outer
+        servers = holder.get(inner)
+        if servers is None:
+            return data, {}, None
+        if not isinstance(servers, dict):
+            return None, None, "%s is not an object" % key
+        return data, servers, None
+    servers = data.get(key)
     if servers is None:
         return data, {}, None
     if not isinstance(servers, dict):
-        return None, None, "%s is not an object" % _json_container_key(cli)
+        return None, None, "%s is not an object" % key
     return data, servers, None
+
+
+def _json_set_servers(cli, data, servers):
+    """Write `servers` back into `data` under the CLI's container key,
+    creating a nested holder when needed. Sibling keys are never touched."""
+    key = _json_container_key(cli)
+    if "." in key:
+        outer, inner = key.split(".", 1)
+        holder = data.get(outer)
+        if not isinstance(holder, dict):
+            holder = {}
+        holder[inner] = servers
+        data[outer] = holder
+    else:
+        data[key] = servers
+    return data
 
 
 def _json_entry_shape(cli, spec):
@@ -302,6 +465,13 @@ def _json_entry_shape(cli, spec):
     if spec.get("url"):
         if cli == "claude":
             return {"type": "http", "url": spec["url"]}
+        if cli == "openclaw":
+            # OpenClaw spells the transport under "transport", NOT claude's
+            # "type" -- and omitting it makes OpenClaw silently fall back to
+            # sse, which the hub does not serve. The generous requestTimeoutMs
+            # is deliberate: crew_run legitimately takes 5-20 minutes.
+            return {"url": spec["url"], "transport": "streamable-http",
+                    "connectionTimeoutMs": 10000, "requestTimeoutMs": 1800000}
         return {"type": "remote", "url": spec["url"]}  # opencode
     if cli == "claude":
         entry = {"type": "stdio", "command": spec["command"]}
@@ -486,6 +656,16 @@ def add_server(cli, name, spec, isolated=False):
             new_text = body.rstrip("\n")
             new_text = (new_text + "\n\n" if new_text else "") + block + "\n"
             _write_text(path, new_text)
+        elif _format(cli) == "yaml":
+            servers, perr = _yaml_servers(text)
+            if perr:
+                return False, "refusing to edit unparseable config %s: %s" % (path, perr)
+            if name in servers and not force:
+                return False, "exists"
+            guard = _prepare_write(path)
+            if guard:
+                return False, guard
+            _write_text(path, _yaml_add_server(text, name, clean))
         else:
             doc, servers, perr = _json_servers(cli, text)
             if perr:
@@ -496,7 +676,7 @@ def add_server(cli, name, spec, isolated=False):
             if guard:
                 return False, guard
             servers[name] = _json_entry_shape(cli, clean)
-            doc[_json_container_key(cli)] = servers
+            doc = _json_set_servers(cli, doc, servers)
             _write_text(path, json.dumps(doc, indent=2) + "\n")
         return True, "added %r to %s (%s)" % (name, cli, path)
     except Exception as exc:  # never-raising contract
@@ -541,7 +721,7 @@ def remove_server(cli, name, isolated=False):
             if guard:
                 return False, guard
             del servers[name]
-            doc[_json_container_key(cli)] = servers
+            doc = _json_set_servers(cli, doc, servers)
             _write_text(path, json.dumps(doc, indent=2) + "\n")
         return True, "removed %r from %s (%s)" % (name, cli, path)
     except Exception as exc:  # never-raising contract
