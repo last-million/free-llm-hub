@@ -207,6 +207,11 @@ def _run_hop(monkeypatch, status):
     monkeypatch.setattr(app, "_build_chain",
                         lambda *a, **k: [("g4f", "srv_x:claude-opus-4-7"), ("groq", "llama")])
     monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
+    # "auto" resolves via _best_free_pair() -> real enabled+keyed providers,
+    # which an isolated test config has none of. _build_chain is already
+    # mocked and ignores whatever _resolve_model returns, so any well-shaped
+    # pair that doesn't itself error out is enough to clear the gate.
+    monkeypatch.setattr(app, "_resolve_model", lambda m: ("g4f", "srv_x:claude-opus-4-7"))
     app.app.test_client().post("/v1/chat/completions", json={
         "model": "auto", "max_tokens": 24, "stream": False,
         "messages": [{"role": "user", "content": "hi"}]})

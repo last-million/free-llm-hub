@@ -127,6 +127,11 @@ def test_a_hop_still_empty_after_the_retry_falls_through(monkeypatch):
     monkeypatch.setattr(app, "_build_chain",
                         lambda *a, **k: [("cerebras", "zai-glm-4.7"), ("groq", "llama")])
     monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
+    # "auto" resolves via _best_free_pair() -> real enabled+keyed providers,
+    # which an isolated test config has none of. _build_chain is already
+    # mocked and ignores whatever _resolve_model returns, so any well-shaped
+    # pair that doesn't itself error out is enough to clear the gate.
+    monkeypatch.setattr(app, "_resolve_model", lambda m: ("cerebras", "zai-glm-4.7"))
     client = app.app.test_client()
     r = client.post("/v1/chat/completions", json={
         "model": "auto", "max_tokens": 24, "stream": False,
