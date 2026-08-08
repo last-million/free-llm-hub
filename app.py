@@ -7869,6 +7869,61 @@ _CLI_BIN_NAME = {"claude": "claude", "codex": "codex", "opencode": "opencode"}
 _agent_autoinstall_thread = None
 
 
+# MCP servers every agent should always have, registered at boot.
+#
+#   free-llm-hub  the hub's own crews (crew_run / crew_start / crew_result),
+#                 so "use the crew agents" is a real tool in any CLI.
+#   context7      live library documentation + repository lookup, so an agent
+#                 works from CURRENT docs instead of its training cutoff.
+#
+# USER 2026-08-08: "give the local hub the mcp context7 ALWAYS so he can always
+# get last documentations and also repositories". Doing this only once by hand
+# would drift: a CLI installed later, a reset config, or a fresh machine would
+# silently lose it. Running it at every boot keeps it true instead.
+_ALWAYS_MCP = (
+    ("free-llm-hub", {"url": None}),           # url filled in at call time
+    ("context7", {"url": "https://mcp.context7.com/mcp"}),
+)
+
+
+def _ensure_mcp_servers_once():
+    """Register the always-on MCP servers in every supported CLI, and in the
+    hub's own isolated copies. Idempotent (an existing entry reports 'exists'
+    and is left alone) and entirely best-effort -- a CLI that is not installed,
+    or a config we refuse to touch, must never affect hub startup."""
+    for name, spec in _ALWAYS_MCP:
+        spec = dict(spec)
+        if spec.get("url") is None:
+            spec["url"] = _hub_mcp_url()
+        for cli in mcp_manager.supported_clis():
+            for isolated in (False, True):
+                try:
+                    ok, msg = mcp_manager.add_server(cli, name, dict(spec),
+                                                     isolated=isolated)
+                except Exception:                                # noqa: BLE001
+                    continue
+                if ok:
+                    _log.info("[mcp] registered %s in %s%s", name, cli,
+                              " (isolated)" if isolated else "")
+                elif str(msg).lower() not in ("exists",):
+                    _log.debug("[mcp] %s/%s%s: %s", name, cli,
+                               " (isolated)" if isolated else "", msg)
+
+
+def _boot_agent_setup():
+    """CLI install first, MCP registration second — in that order on purpose:
+    an isolated config dir does not exist until its CLI has been installed, so
+    registering first would silently skip the copies that matter most."""
+    try:
+        _agent_cli_autoinstall_once()
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[agent-cli] auto-install pass failed", exc_info=True)
+    try:
+        _ensure_mcp_servers_once()
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[mcp] bootstrap pass failed", exc_info=True)
+
+
 def _start_agent_cli_autoinstall():
     """Idempotent, daemon, off the request path — an npm install takes tens of
     seconds and must never delay the hub coming up."""
@@ -7876,7 +7931,7 @@ def _start_agent_cli_autoinstall():
     if _agent_autoinstall_thread is not None:
         return
     _agent_autoinstall_thread = threading.Thread(
-        target=_agent_cli_autoinstall_once, daemon=True)
+        target=_boot_agent_setup, daemon=True)
     _agent_autoinstall_thread.start()
 
 
