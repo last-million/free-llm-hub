@@ -579,6 +579,12 @@ def list_servers(isolated=False):
     errors = []
     for cli in _SUPPORTED:
         path = _config_path(cli, isolated)
+        if not path:
+            # isolated=True for a CLI the hub keeps no private copy of. Say so
+            # plainly -- falling through would _read_text(None) and surface a
+            # TypeError as "unexpected error", which reads like a real bug.
+            return False, ("%s has no isolated copy (the hub only installs "
+                           "private copies of %s)" % (cli, ", ".join(_ISOLATED_CLIS)))
         try:
             text = _read_text(path)
         except OSError as exc:
@@ -635,6 +641,12 @@ def add_server(cli, name, spec, isolated=False):
             return False, err
         force = bool(isinstance(spec, dict) and spec.get("force"))
         path = _config_path(cli, isolated)
+        if not path:
+            # isolated=True for a CLI the hub keeps no private copy of. Say so
+            # plainly -- falling through would _read_text(None) and surface a
+            # TypeError as "unexpected error", which reads like a real bug.
+            return False, ("%s has no isolated copy (the hub only installs "
+                           "private copies of %s)" % (cli, ", ".join(_ISOLATED_CLIS)))
         try:
             text = _read_text(path)
         except OSError as exc:
@@ -694,6 +706,12 @@ def remove_server(cli, name, isolated=False):
             return False, "name must be a non-empty string"
         name = name.strip()
         path = _config_path(cli, isolated)
+        if not path:
+            # isolated=True for a CLI the hub keeps no private copy of. Say so
+            # plainly -- falling through would _read_text(None) and surface a
+            # TypeError as "unexpected error", which reads like a real bug.
+            return False, ("%s has no isolated copy (the hub only installs "
+                           "private copies of %s)" % (cli, ", ".join(_ISOLATED_CLIS)))
         try:
             text = _read_text(path)
         except OSError as exc:
