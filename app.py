@@ -4919,7 +4919,10 @@ def _apply_craft_brief(messages, agentic=False):
         text = users[0].get("content")
         if isinstance(text, list):     # multimodal turn -> its text parts
             text = " ".join(p.get("text") or "" for p in text if isinstance(p, dict))
-        brief = craft.system_message(text or "")
+        # `agentic` is bool(payload["tools"]) -- the only honest signal for
+        # whether this caller can actually RUN a check. It picks which VERIFY
+        # block ships, so a tool-less client is never told to run anything.
+        brief = craft.system_message(text or "", tools=bool(agentic))
         extra = [brief] if brief else []
         if agentic and config.get_flag("crew_agent_hint", True):
             extra.append({"role": "system", "content": _CREW_AGENT_HINT})

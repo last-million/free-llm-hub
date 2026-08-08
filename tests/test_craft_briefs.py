@@ -129,7 +129,14 @@ def test_worst_case_brief_cost():
     # produced "I don't have the image_gen tool available". Most models here run
     # 200K-1M; 32K is the floor. A simple coding question still pays nothing,
     # which is the property that actually keeps this honest.
-    assert worst / 4 < 32768 * 0.11, "briefs cost ~%d tokens" % (worst // 4)
+    # 0.11 -> 0.115 on 2026-08-08, deliberately and once, to fund THE LOOP
+    # (craft.VERIFY_RUN / VERIFY_READ, ~470 chars = ~117 tokens on the heaviest
+    # request only). It was funded first by deleting a redundant IMAGES line
+    # and by tightening both blocks twice; the last 26 chars were not worth
+    # degrading the wording further. This is the ceiling moving for a feature,
+    # not creep: the heaviest request now pays 11.02% of the smallest window we
+    # route to, and a simple coding question still pays nothing.
+    assert worst / 4 < 32768 * 0.115, "briefs cost ~%d tokens" % (worst // 4)
 
 
 # --------------------------------------------------------------------------- #
@@ -493,3 +500,73 @@ def test_security_requires_a_password_kdf_not_a_hash():
 
 def test_security_forbids_client_side_price_trust():
     assert "never trust an amount from the client" in craft.SECURITY
+
+
+# --------------------------------------------------------------------------- #
+# THE LOOP (loop engineering, added 2026-08-08)
+#
+# Researched that day across 91 items / 6 platforms. The consensus definition:
+# "instead of manually telling an agent every move, you design a repeatable
+# loop where the agent plans, acts, CHECKS RESULTS, fixes errors, and keeps
+# going until the task is complete." The verifier is the whole idea, and stop
+# rules are first-class -- unbounded loops are the named failure mode.
+#
+# Measured before building: every brief already carried the spec, the structure
+# and an ANTI section, but NONE contained verifier / stop rule / retry /
+# iterate. The briefs were a one-shot spec. This is the missing quarter.
+# --------------------------------------------------------------------------- #
+
+def test_the_loop_ships_with_every_matched_brief():
+    msg = craft.system_message("build me a landing page website")
+    assert msg is not None
+    assert "VERIFY, FIX, STOP" in msg["content"]
+
+
+def test_the_loop_goes_last_so_its_backreferences_resolve():
+    """It says 'every brief above' and 'every ANTI line above' -- prepending it
+    would leave both dangling."""
+    for tools in (True, False):
+        body = craft.system_message("build me a landing page website", tools=tools)["content"]
+        block = craft.VERIFY_RUN if tools else craft.VERIFY_READ
+        assert body.endswith(block)
+
+
+def test_a_tool_less_client_is_never_told_to_run_anything():
+    """THE safety property. A model with no shell, told 'run it and paste the
+    output', invents a terminal transcript -- a fabricated verification is
+    strictly worse than no instruction at all."""
+    body = craft.system_message("build me a landing page website", tools=False)["content"]
+    tail = body[body.index("VERIFY, FIX, STOP"):]
+    assert "never say you ran" in tail
+    assert "Run it and paste the real output" not in tail
+    # and it still gives a REAL check that needs no tools
+    assert "ANTI line" in tail
+
+
+def test_a_tool_carrying_client_gets_the_executable_check():
+    body = craft.system_message("build me a landing page website", tools=True)["content"]
+    tail = body[body.index("VERIFY, FIX, STOP"):]
+    assert "Run it." in tail and "Paste the real output" in tail
+    assert "never write output you did not get back from a real run" in tail.lower()
+
+
+def test_both_variants_are_bounded():
+    """Unbounded 'keep going until it's right' is the named failure mode of
+    agent loops. Each variant must cap the retries AND say what to do at the
+    cap."""
+    for block in (craft.VERIFY_RUN, craft.VERIFY_READ):
+        assert "twice at most" in block or "Two rounds, max" in block
+        assert "stop" in block.lower()
+
+
+def test_the_loop_costs_its_characters_once_not_per_brief():
+    """It lives in system_message(), not in the eight brief bodies -- eight
+    copies would be ~5,000 chars against caps with 21-38 chars of headroom."""
+    for _name, _rx, body in craft._BRIEFS:
+        assert "VERIFY, FIX, STOP" not in body
+    assert max(len(craft.VERIFY_RUN), len(craft.VERIFY_READ)) < 750
+
+
+def test_nothing_fires_on_unrelated_requests_still():
+    """The loop must not turn every request into a brief-carrying one."""
+    assert craft.system_message("what is the capital of France") is None

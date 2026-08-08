@@ -118,7 +118,6 @@ IMAGES = """IMAGES — YOU HAVE A LOCAL GENERATOR, ASK FIRST (any task that will
 - Generate with a plain HTTP call, no API key. The hub returns WebP already and reports the type in `mime`:
   curl -s -X POST http://127.0.0.1:8787/v1/images/generations -H "Content-Type: application/json" -d '{"prompt":"YOUR PROMPT","n":1,"size":"1024x1024"}' > out.json
   python -c "import json,base64,urllib.request as u;d=json.load(open('out.json'))['data'][0];s=d.get('b64_json') or '';b=base64.b64decode(s) if s else u.urlopen(d['url']).read();e=(d.get('mime') or '').split('/')[-1].replace('jpeg','jpg') or 'webp';p='img/hero.'+e;open(p,'wb').write(b);print(p)"
-  (handles the b64_json and url shapes, names the file from the real type, prints the path it wrote)
 - EVERY image ships as WebP, generated or stock. Generated ones already are. Convert anything you download (pip install Pillow if needed):
   python -c "from PIL import Image;import sys;i=Image.open(sys.argv[1]);i.convert('RGBA' if 'A' in i.getbands() else 'RGB').save(sys.argv[2],'WEBP',quality=82)" in/photo.jpg img/photo.webp
   A plain <img src="*.webp"> is correct — every current browser takes it. Add a <picture> fallback only if the project must support pre-2020 browsers.
@@ -268,12 +267,52 @@ def match(text):
     return out
 
 
-def system_message(text):
-    """One system message for `text`, or None when nothing applies."""
+# --------------------------------------------------------------------------- #
+# THE LOOP. Every brief above is a one-shot SPEC: what to produce, and what not
+# to. None of them tells the model to CHECK its own output and go again, which
+# is the whole of loop engineering -- plan, act, check, fix, stop.
+#
+# It lives HERE rather than inside the eight brief bodies for three reasons:
+# eight copies would cost ~5,000 chars against caps with 21-38 chars of
+# headroom; it is generic, so duplicating it adds no information; and every
+# brief already carries an ANTI section, which the tool-less branch reuses as
+# its rubric. It borrows criteria instead of shipping its own -- that is why it
+# fits. Living in system_message() also leaves match()/names() byte-identical,
+# so no routing test is disturbed.
+#
+# TWO VARIANTS, chosen STRUCTURALLY on whether the caller sent tools -- never by
+# asking the model to self-assess. A model with no shell, told "run it and paste
+# the output", invents a terminal transcript, and a fabricated verification is
+# strictly worse than no instruction at all.
+#
+# Both are BOUNDED. Unbounded "keep going until it's right" is the named failure
+# mode of agent loops, so each caps the retries and says what to do when the cap
+# is hit: hand over the failure list, which IS the deliverable.
+VERIFY_RUN = """VERIFY, FIX, STOP (applies to every brief above)
+- Name the ONE check that catches you being wrong: a command, a URL and its expected status, or a file and the string it must contain.
+- Run it. Paste the real output. Never write output you did not get back from a real run; if you cannot run it, write "not run" and name the missing tool.
+- Failed? Fix and re-run THAT check, twice at most. Still failing: stop and list what is broken -- that list is the deliverable."""
+
+VERIFY_READ = """VERIFY, FIX, STOP (applies to every brief above)
+- No shell, browser or file access here: never say you ran, tested, opened or verified anything. A verification you did not perform is the worst answer possible.
+- Instead: re-read your output against every ANTI line above, name the 3 you came closest to breaking and the one-line fix for each. Two rounds, max.
+- Then list the checks you could NOT run, as commands with their pass condition, and say what is unresolved."""
+
+
+def system_message(text, tools=True):
+    """One system message for `text`, or None when nothing applies.
+
+    `tools` says whether the CALLER can actually execute a check. It selects
+    WHICH verify block ships -- never whether one ships: a tool-less client
+    still gets a real, tool-free verifier (re-read against the ANTI lines) plus
+    an explicit ban on claiming an execution it cannot perform."""
     hits = match(text)
     if not hits:
         return None
-    body = "\n\n".join(b for _n, b in hits)
+    # The loop goes LAST: it says "every brief above" and "every ANTI line
+    # above", and both references dangle if it is prepended.
+    body = "\n\n".join([b for _n, b in hits] +
+                       [VERIFY_RUN if tools else VERIFY_READ])
     return {"role": "system", "content": body}
 
 
