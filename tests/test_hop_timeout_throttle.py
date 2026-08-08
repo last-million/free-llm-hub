@@ -69,6 +69,7 @@ def test_a_hop_that_times_out_gets_throttled_so_a_retry_skips_it(monkeypatch):
                         lambda *a, **k: [("nvidia", "mistral-medium-3.5-128b"),
                                         ("groq", "llama")])
     monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
+    monkeypatch.setattr(app, "_resolve_model", lambda m: ("nvidia", "mistral-medium-3.5-128b"))
     client = app.app.test_client()
     r = client.post("/v1/chat/completions", json={
         "model": "auto", "max_tokens": 24, "stream": False,
@@ -96,6 +97,7 @@ def test_a_fast_failing_hop_is_not_throttled_only_a_real_timeout_is(monkeypatch)
     monkeypatch.setattr(app, "_build_chain",
                         lambda *a, **k: [("flaky", "some-model"), ("groq", "llama")])
     monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
+    monkeypatch.setattr(app, "_resolve_model", lambda m: ("flaky", "some-model"))
     client = app.app.test_client()
     r = client.post("/v1/chat/completions", json={
         "model": "auto", "max_tokens": 24, "stream": False,
@@ -158,6 +160,8 @@ def test_a_5xx_response_gets_throttled_so_a_retry_skips_it(monkeypatch):
                         lambda *a, **k: [("g4f-nvidia", "mistralai/mistral-medium-3.5-128b"),
                                         ("groq", "llama")])
     monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
+    monkeypatch.setattr(app, "_resolve_model",
+                        lambda m: ("g4f-nvidia", "mistralai/mistral-medium-3.5-128b"))
     client = app.app.test_client()
     r = client.post("/v1/chat/completions", json={
         "model": "auto", "max_tokens": 24, "stream": False,
@@ -185,6 +189,7 @@ def test_a_429_response_is_not_double_throttled_by_the_5xx_branch(monkeypatch):
     monkeypatch.setattr(app, "_build_chain",
                         lambda *a, **k: [("openrouter", "some-model"), ("groq", "llama")])
     monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
+    monkeypatch.setattr(app, "_resolve_model", lambda m: ("openrouter", "some-model"))
     client = app.app.test_client()
     r = client.post("/v1/chat/completions", json={
         "model": "auto", "max_tokens": 24, "stream": False,
