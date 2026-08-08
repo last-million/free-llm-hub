@@ -140,6 +140,12 @@ def test_the_hop_falls_through_and_the_next_model_answers(monkeypatch):
         ("g4f", "srv_mp3lmkuad07322459f47:claude-opus-4-7"),
         ("groq", "llama-3.3-70b-versatile")])
     monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
+    # "auto" resolves via _best_free_pair() -> real enabled+keyed providers,
+    # which an isolated test config has none of. _build_chain is already
+    # mocked and ignores whatever _resolve_model returns, so any well-shaped
+    # pair that doesn't itself error out is enough to clear the gate.
+    monkeypatch.setattr(app, "_resolve_model",
+                        lambda m: ("g4f", "srv_mp3lmkuad07322459f47:claude-opus-4-7"))
 
     r = app.app.test_client().post("/v1/chat/completions", json={
         "model": "auto", "max_tokens": 64, "stream": False,
