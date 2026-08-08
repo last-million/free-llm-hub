@@ -7904,6 +7904,16 @@ def _ensure_mcp_servers_once():
     or a config we refuse to touch, must never affect hub startup."""
     for name, spec in _ALWAYS_MCP:
         spec = dict(spec)
+        # A stdio server is a command we are asking every CLI to SPAWN. If it
+        # is not on PATH, registering it anyway writes an entry into six
+        # configs that then silently fails to start in each one -- the exact
+        # looks-like-success failure this module exists to avoid. Node is
+        # normally present because _agent_cli_autoinstall_once installs it for
+        # the CLIs themselves, but that can fail (offline, no npm).
+        cmd = spec.get("command")
+        if cmd and not shutil.which(cmd):
+            _log.info("[mcp] skipping %s: %r is not on PATH", name, cmd)
+            continue
         # Test the SENTINEL, not `is None`: a stdio spec has no "url" key at
         # all, so `spec.get("url") is None` was also true for playwright and
         # bolted the hub's URL onto it -- registering a browser subprocess as

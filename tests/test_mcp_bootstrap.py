@@ -198,3 +198,19 @@ def test_a_nested_yaml_key_is_not_parsed_as_a_server(home):
     names = {e["name"] for e in m.list_servers()["hermes"]}
     assert names == {"free-llm-hub", "context7", "playwright"}, names
     assert "args" not in names and "command" not in names
+
+
+def test_a_stdio_server_is_skipped_when_its_command_is_missing(home, monkeypatch):
+    """Registering a command that is not on PATH writes an entry into six
+    configs that then silently fails to start in each -- looks like success,
+    delivers nothing. Node is normally installed for the CLIs themselves, but
+    that can fail (offline, no npm)."""
+    real = app.shutil.which
+    monkeypatch.setattr(app.shutil, "which",
+                        lambda c, *a, **k: None if c == "npx" else real(c, *a, **k))
+    app._ensure_mcp_servers_once()
+    for cli in m.supported_clis():
+        names = {e["name"] for e in m.list_servers()[cli]}
+        assert "playwright" not in names, cli
+        assert {"free-llm-hub", "context7"} <= names, \
+            "the url-based servers must still be registered: %s" % cli
