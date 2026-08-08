@@ -74,6 +74,12 @@ if not defined HUB_FORCE (
     echo [free-llm-hub] Port %PORT% is already being served - not starting a second copy.
     echo                Dashboard: http://127.0.0.1:%PORT%
     echo                Restart it instead, or set HUB_FORCE=1 to override.
+    rem A live hub on the port IS proof setup already succeeded once -- this
+    rem branch skips the python/venv checks below entirely, so without this
+    rem call here the auto-persist step (see :maybe_autopersist) would never
+    rem run for the single most common case: re-running/double-clicking
+    rem run.bat while the hub is already up.
+    call :maybe_autopersist
     exit /b 0
   )
 )
@@ -127,6 +133,8 @@ if defined DEPS_OK (
   if not errorlevel 1 python -c "import hashlib,os;h=hashlib.sha256(open('requirements.txt','rb').read()).hexdigest();open(os.path.join('.venv','.deps-stamp'),'w').write(h)" >nul 2>nul
 )
 
+call :maybe_autopersist
+
 echo.
 echo ==========================================================
 echo   Calvoun Free LLM Hub is starting
@@ -140,6 +148,33 @@ exit /b %errorlevel%
 rem ===========================================================================
 rem  Helpers
 rem ===========================================================================
+
+:maybe_autopersist
+rem First successful setup ever: auto-persist, so a closed window or a reboot
+rem never silently drops the hub again for someone who has no reason to know
+rem "run.bat autostart" exists. Once only -- a marker in the state dir
+rem (survives a venv rebuild, matches the STOP_MARKER convention above), and
+rem fully best-effort: never blocks or slows the actual start, never touches
+rem ~/.free-llm-hub/'s config or history, and stays silent instead of adding
+rem noise to every single plain start. Called from TWO places: right before
+rem the final `python app.py` launch, and from the "port already served"
+rem branch (a live hub IS proof setup already succeeded, and that branch
+rem skips the python/venv checks entirely -- without this second call site,
+rem the single most common case, re-running run.bat while the hub is already
+rem up, would never trigger it).
+if defined FREE_LLM_HUB_CONFIG (
+  for %%I in ("%FREE_LLM_HUB_CONFIG%") do set "AUTOSTART_MARKER=%%~dpIautostart-auto-installed"
+) else (
+  set "AUTOSTART_MARKER=%USERPROFILE%\.free-llm-hub\autostart-auto-installed"
+)
+if not exist "%AUTOSTART_MARKER%" (
+  call "%~dp0scripts\autostart.bat" >nul 2>nul
+  if not errorlevel 1 (
+    for %%I in ("%AUTOSTART_MARKER%") do if not exist "%%~dpI" mkdir "%%~dpI" >nul 2>nul
+    >"%AUTOSTART_MARKER%" echo installed automatically on first successful start -- delete this file to let run.bat try again, or run "run.bat autostart remove" to fully uninstall it
+  )
+)
+exit /b 0
 
 :usage
 echo Calvoun Free LLM Hub
