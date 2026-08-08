@@ -65,8 +65,33 @@ def _xdg_config():
     return os.environ.get("XDG_CONFIG_HOME") or os.path.join(_home(), ".config")
 
 
-def _config_path(cli):
-    """Absolute path of `cli`'s MCP-bearing config file (None-safe)."""
+def _isolated_dir(cli):
+    """The hub's OWN private config dir for `cli` -- what agentic_chat.py hands
+    the subprocess as CODEX_HOME / CLAUDE_CONFIG_DIR / XDG_CONFIG_HOME."""
+    return os.path.join(_home(), ".free-llm-hub", "isolated-clis", cli, "config")
+
+
+def _config_path(cli, isolated=False):
+    """Absolute path of `cli`'s MCP-bearing config file (None-safe).
+
+    `isolated=True` targets the hub's OWN copy of the CLI instead of the user's
+    global install. This matters because the two are deliberately separate:
+    agentic_chat.py runs every /agent session with CODEX_HOME /
+    CLAUDE_CONFIG_DIR / XDG_CONFIG_HOME pointed at ~/.free-llm-hub/
+    isolated-clis/<cli>/config, so a server registered globally is INVISIBLE to
+    the hub's own agent chat -- which is exactly where the crew tools are most
+    useful. Note the layouts differ rather than nest: CODEX_HOME points AT the
+    directory holding config.toml, so the isolated path is not simply the
+    global one under a different home."""
+    if isolated:
+        d = _isolated_dir(cli)
+        if cli in ("kimi", "codex"):
+            return os.path.join(d, "config.toml")
+        if cli == "claude":
+            return os.path.join(d, ".claude.json")
+        if cli == "opencode":
+            return os.path.join(d, "opencode", "opencode.json")
+        return None
     if cli == "kimi":
         return os.path.join(_home(), ".kimi", "config.toml")
     if cli == "codex":
@@ -372,15 +397,18 @@ def supported_clis():
     return list(_SUPPORTED)
 
 
-def list_servers():
+def list_servers(isolated=False):
     """-> {cli_id: [normalised entries], "errors": [...]}. A config that is
     missing is simply an empty list; one that cannot be read or parsed is an
     "errors" entry ({cli, path, error}) so the dashboard can say WHY a CLI's
-    list is empty instead of silently showing nothing."""
+    list is empty instead of silently showing nothing.
+
+    `isolated=True` reports the hub's OWN copies of the CLIs (see
+    _config_path) instead of the user's global installs."""
     out = {}
     errors = []
     for cli in _SUPPORTED:
-        path = _config_path(cli)
+        path = _config_path(cli, isolated)
         try:
             text = _read_text(path)
         except OSError as exc:
@@ -415,8 +443,11 @@ def _prepare_write(path):
     return None
 
 
-def add_server(cli, name, spec):
+def add_server(cli, name, spec, isolated=False):
     """Add one MCP server entry to `cli`'s config. -> (ok, msg).
+
+    `isolated=True` writes to the hub's OWN copy of the CLI (see _config_path)
+    rather than the user's global install -- the /agent sessions run there.
 
     Adding an existing name is (False, 'exists') unless spec has force:true,
     in which case the old entry is replaced cleanly (same remove-then-append
@@ -433,7 +464,7 @@ def add_server(cli, name, spec):
         if err:
             return False, err
         force = bool(isinstance(spec, dict) and spec.get("force"))
-        path = _config_path(cli)
+        path = _config_path(cli, isolated)
         try:
             text = _read_text(path)
         except OSError as exc:
@@ -472,7 +503,7 @@ def add_server(cli, name, spec):
         return False, "unexpected error: %s" % exc
 
 
-def remove_server(cli, name):
+def remove_server(cli, name, isolated=False):
     """Remove one MCP server entry from `cli`'s config. -> (ok, msg).
     Removing a name that is not there is (False, 'not found')."""
     try:
@@ -482,7 +513,7 @@ def remove_server(cli, name):
         if not isinstance(name, str) or not name.strip():
             return False, "name must be a non-empty string"
         name = name.strip()
-        path = _config_path(cli)
+        path = _config_path(cli, isolated)
         try:
             text = _read_text(path)
         except OSError as exc:

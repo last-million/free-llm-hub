@@ -7551,14 +7551,32 @@ def api_mcp_install_hub():
         return jsonify({"ok": False, "message": "invalid JSON body"}), 400
     cli = body.get("cli")
     spec = {"url": _hub_mcp_url()}
-    ok, msg = mcp_manager.add_server(cli, "free-llm-hub", spec)
-    if not ok and str(msg).lower() == "exists":
-        # Already registered — retry once with force:true (consumed by the
-        # manager, never stored) so the button also REPAIRS a stale/wrong
-        # entry instead of failing.
-        ok, msg = mcp_manager.add_server(cli, "free-llm-hub",
-                                         dict(spec, force=True))
-    return jsonify({"ok": ok, "message": msg}), 200 if ok else 400
+
+    def _install(isolated):
+        ok, msg = mcp_manager.add_server(cli, "free-llm-hub", spec,
+                                         isolated=isolated)
+        if not ok and str(msg).lower() == "exists":
+            # Already registered — retry once with force:true (consumed by the
+            # manager, never stored) so the button also REPAIRS a stale/wrong
+            # entry instead of failing.
+            ok, msg = mcp_manager.add_server(cli, "free-llm-hub",
+                                             dict(spec, force=True),
+                                             isolated=isolated)
+        return ok, msg
+
+    ok, msg = _install(False)
+    # ALSO register in the hub's OWN isolated copy of the CLI. agentic_chat.py
+    # runs every /agent session with CODEX_HOME / CLAUDE_CONFIG_DIR /
+    # XDG_CONFIG_HOME pointed at ~/.free-llm-hub/isolated-clis/<cli>/config, so
+    # a global-only entry is invisible to the hub's own agent chat -- which is
+    # exactly where the crew tools matter most. Best-effort: the isolated copy
+    # may not be installed, and that must never fail the global install.
+    iso_ok, iso_msg = _install(True)
+    if ok and iso_ok:
+        msg = "%s (and the hub's own isolated copy)" % msg
+    elif ok:
+        msg = "%s — isolated copy skipped: %s" % (msg, iso_msg)
+    return jsonify({"ok": ok, "message": msg, "isolated_ok": iso_ok}), 200 if ok else 400
 
 
 # ---------------------------------------------------------------------------
