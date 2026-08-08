@@ -242,12 +242,15 @@ def test_local_control_guard_and_security_headers(isolated_config):
 def test_chat_image_route_preserves_payload_and_requires_vision(
         isolated_config, monkeypatch):
     captured = {}
+    # **kwargs on purpose: the router grew require_tools (and may grow more).
+    # A double pinned to yesterday's signature turns a routing change into a
+    # 500 from a test that is not even about routing.
     monkeypatch.setattr(app, "_route_for_vision",
-                        lambda messages, max_tokens=None, est=None:
+                        lambda messages, max_tokens=None, est=None, **kw:
                         ("google", "gemini-3.5-flash", "simple"))
     monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
 
-    def chain(pid, model, est=0, require_vision=False):
+    def chain(pid, model, est=0, require_vision=False, **kw):
         captured["require_vision"] = require_vision
         return [(pid, model)]
 

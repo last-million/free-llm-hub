@@ -1212,7 +1212,16 @@ def test_system_prompt_absent_when_verification_off_and_vision_available(agent_c
 
     monkeypatch.setattr(agentic_chat.subprocess, "Popen", fake_popen)
     agentic_chat.send_message(sid, "hello")
-    assert "--append-system-prompt" not in captured["argv"]
+    # --append-system-prompt is now UNCONDITIONAL for a non-empty turn: the
+    # planning snippet (PROGRESS.md / read-before-redoing) is always injected,
+    # so its mere presence no longer says anything. What this test is actually
+    # about is that the two CONDITIONAL notices stay out when they do not
+    # apply -- verification is off, and vision IS available.
+    argv = captured["argv"]
+    assert "--append-system-prompt" in argv
+    appended = argv[argv.index("--append-system-prompt") + 1]
+    assert "Testing/verification is expected" not in appended,         "test-verification notice injected while verification is OFF"
+    assert "no vision-capable model" not in appended,         "vision-gap notice injected while a vision model IS available"
 
 
 def test_system_prompt_carries_vision_gap_notice_when_unavailable(agent_config, monkeypatch):
