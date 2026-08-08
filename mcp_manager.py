@@ -327,7 +327,12 @@ def _toml_servers(text):
 # mcpServers.
 _YAML_KEY = "mcp_servers"
 _YAML_TOP_RE = re.compile(r"^(?P<key>[A-Za-z0-9_-]+)\s*:", re.M)
-_YAML_ENTRY_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_.\- ]+)\s*:\s*$", re.M)
+# NO space in the name class: with one, "^  " matched the first two spaces and
+# the class then swallowed the REST of a deeper indent, so a nested key like
+#     playwright:
+#       args:
+# parsed "args" as a second SERVER. Entry names live at exactly two spaces.
+_YAML_ENTRY_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_.\-]+)\s*:\s*$", re.M)
 
 
 def _yaml_servers(text):
@@ -460,6 +465,12 @@ def _json_set_servers(cli, data, servers):
     return data
 
 
+class UnsupportedShape(Exception):
+    """This CLI's dialect for this transport is not established. Raised rather
+    than guessed: a wrong MCP schema is written silently and then simply never
+    loads, which is indistinguishable from success at the call site."""
+
+
 def _json_entry_shape(cli, spec):
     """The CLI's documented config shape for one server."""
     if spec.get("url"):
@@ -475,6 +486,29 @@ def _json_entry_shape(cli, spec):
         return {"type": "remote", "url": spec["url"]}  # opencode
     if cli == "claude":
         entry = {"type": "stdio", "command": spec["command"]}
+        if spec.get("args"):
+            entry["args"] = list(spec["args"])
+        if spec.get("env"):
+            entry["env"] = dict(spec["env"])
+        return entry
+    if cli == "openclaw":
+        # Verified against OpenClaw's own zod schema (McpServerSchema in
+        # src/config/zod-schema.root-support.ts): command is a STRING (not
+        # opencode's array), args is a string array, env is spelled "env".
+        #
+        # "transport" is deliberately OMITTED. Stdio is detected by the
+        # PRESENCE OF command, and both official examples omit it; the
+        # "falls back to sse when transport is missing" rule that the remote
+        # branch above guards against is scoped to URL-bearing servers only.
+        # Omitting is also version-safe: the literal "stdio" was REJECTED by
+        # `openclaw config validate` before PR #95102 (2026-06-22), because the
+        # union was previously just sse | streamable-http.
+        #
+        # Spelling matters more than usual here: the schema ends in
+        # .catchall(z.unknown()), so an unknown key like "workingDirectory" or
+        # claude's "type" passes validation SILENTLY and yields a subtly wrong
+        # server rather than an error.
+        entry = {"command": spec["command"]}
         if spec.get("args"):
             entry["args"] = list(spec["args"])
         if spec.get("env"):
@@ -687,10 +721,16 @@ def add_server(cli, name, spec, isolated=False):
                 return False, "refusing to edit unparseable config %s: %s" % (path, perr)
             if name in servers and not force:
                 return False, "exists"
+            try:
+                entry = _json_entry_shape(cli, clean)
+            except UnsupportedShape as exc:
+                # Decide BEFORE _prepare_write so an unsupported shape never
+                # takes a backup or touches the file at all.
+                return False, str(exc)
             guard = _prepare_write(path)
             if guard:
                 return False, guard
-            servers[name] = _json_entry_shape(cli, clean)
+            servers[name] = entry
             doc = _json_set_servers(cli, doc, servers)
             _write_text(path, json.dumps(doc, indent=2) + "\n")
         return True, "added %r to %s (%s)" % (name, cli, path)

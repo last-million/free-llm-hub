@@ -146,3 +146,55 @@ def test_list_servers_isolated_returns_a_dict_for_every_cli(home):
         assert [e["name"] for e in listed[cli]], cli
     for cli in ("openclaw", "hermes"):
         assert listed[cli] == [], "no isolated copy -> empty list, not an error"
+
+
+# --------------------------------------------------------------------------- #
+# playwright: the always-on set's only STDIO server. Three real bugs came out
+# of adding it, each of which produced a config that looked fine.
+# --------------------------------------------------------------------------- #
+
+def test_playwright_is_registered_as_stdio_not_as_a_url(home):
+    """THE BUG: the hub-url sentinel was {"url": None}, and the fill-in tested
+    `spec.get("url") is None` -- which is ALSO true for a stdio spec that has
+    no "url" key at all. Playwright was getting the hub's URL bolted on and
+    registered in every CLI as an HTTP server pointing at the hub."""
+    app._ensure_mcp_servers_once()
+    for cli in m.supported_clis():
+        entry = next(e for e in m.list_servers()[cli] if e["name"] == "playwright")
+        assert entry.get("transport") != "http", \
+            "%s registered a browser subprocess as an HTTP server" % cli
+        assert not entry.get("url"), cli
+        text = open(m._config_path(cli), encoding="utf-8").read()
+        assert "npx" in text, cli
+        # The hub URL must appear ONLY for free-llm-hub, never on playwright.
+        assert text.count("127.0.0.1:8787") == 1, \
+            "%s: the hub url leaked onto another server" % cli
+
+
+def test_openclaw_stdio_omits_transport_and_uses_a_string_command(home):
+    """Verified against OpenClaw's zod schema: stdio is detected by the
+    presence of `command` (a STRING, not opencode's array), and `transport`
+    is omitted -- the sse fallback applies only to url-bearing servers. The
+    schema ends in .catchall(z.unknown()), so a wrong key would pass
+    validation silently instead of erroring."""
+    app._ensure_mcp_servers_once()
+    import json
+    doc = json.load(open(m._config_path("openclaw"), encoding="utf-8"))
+    entry = doc["mcp"]["servers"]["playwright"]
+    assert entry["command"] == "npx", "must be a string, not an array"
+    assert entry["args"] == ["-y", "@playwright/mcp@latest"]
+    assert "transport" not in entry, "stdio is detected by `command`; sse fallback is url-only"
+    assert "type" not in entry, "'type' is claude's dialect and would pass silently"
+    # the remote servers in the same file DO carry a transport
+    assert doc["mcp"]["servers"]["context7"]["transport"] == "streamable-http"
+
+
+def test_a_nested_yaml_key_is_not_parsed_as_a_server(home):
+    """THE BUG: the entry-name regex allowed a space in the name class, so
+    "^  " matched the first two spaces and the class swallowed the rest of a
+    deeper indent -- playwright's own `args:` line parsed as a SECOND server
+    called "args"."""
+    app._ensure_mcp_servers_once()
+    names = {e["name"] for e in m.list_servers()["hermes"]}
+    assert names == {"free-llm-hub", "context7", "playwright"}, names
+    assert "args" not in names and "command" not in names
