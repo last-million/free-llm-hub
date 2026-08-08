@@ -414,6 +414,13 @@ class _Proc:
         self.port = port
         self.kind = kind
         self.popen = None
+        # Set by stop() to cancel a start that has not spawned yet. start()
+        # does the Popen on a worker thread, so there is a window -- as long as
+        # `npm install` -- where the project is in _procs with popen still None.
+        # Without this flag stop() had nothing to kill, dropped the _Proc, and
+        # the worker then spawned a server nothing owned: a permanent orphan
+        # holding a preview port. See sweep_own_range().
+        self.stopping = False
         self.lines = []
         self.state = "installing"
         self.error = None
@@ -484,22 +491,34 @@ def start(project_dir, on_done=None):
 
     def worker():
         try:
+            if proc.stopping:
+                proc.state = "stopped"
+                return
             if spec["needs_install"]:
                 install(run_dir, proc.log)
             proc.state = "starting"
             argv = _argv_with_port(spec["argv"], spec["kind"], port)
             proc.log("[hub] " + " ".join(argv))
             try:
-                proc.popen = subprocess.Popen(
-                    argv, cwd=run_dir, env=_env_for(run_dir, port),
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, encoding="utf-8", errors="replace",
-                    # Own group so stop() takes the whole tree: npm spawns the
-                    # real server as a CHILD, and killing npm alone orphans it
-                    # holding the port.
-                    creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP
-                                   if os.name == "nt" else 0),
-                    start_new_session=(os.name != "nt"))
+                # Checking `stopping` and publishing `popen` under the SAME lock
+                # stop() uses makes the two mutually exclusive: either stop()
+                # gets there first and we never spawn, or we spawn and stop()
+                # is guaranteed to see a real popen to kill. Anything looser
+                # (check, then spawn, then assign) leaves the orphan window open.
+                with _lock:
+                    if proc.stopping:
+                        proc.state = "stopped"
+                        return
+                    proc.popen = subprocess.Popen(
+                        argv, cwd=run_dir, env=_env_for(run_dir, port),
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, encoding="utf-8", errors="replace",
+                        # Own group so stop() takes the whole tree: npm spawns
+                        # the real server as a CHILD, and killing npm alone
+                        # orphans it holding the port.
+                        creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP
+                                       if os.name == "nt" else 0),
+                        start_new_session=(os.name != "nt"))
             except (OSError, ValueError) as exc:
                 proc.state = "failed"
                 proc.error = "could not start %s: %s" % (spec["argv"][0], exc)
@@ -546,6 +565,12 @@ def stop(project_dir):
     project_dir = os.path.abspath(project_dir)
     with _lock:
         proc = _procs.pop(project_dir, None)
+        if proc:
+            # Claim it before releasing the lock. start()'s worker tests this
+            # under the same lock right before it spawns, so from here on it
+            # cannot spawn behind our back.
+            proc.stopping = True
+            popen = proc.popen
     if not proc:
         # Nothing of ours — but there may be an ADOPTED server showing. Stop
         # displaying it rather than killing it: we did not start it, so its
@@ -553,8 +578,13 @@ def stop(project_dir):
         # Killing a process we do not own on a button labelled "Stop preview"
         # would be a much bigger action than the label promises.
         return forget(project_dir)
-    if not proc.popen:
-        return False
+    if not popen:
+        # Still installing / not spawned yet. Cancelled above, so nothing will
+        # ever be spawned -- that IS a successful stop, not a no-op. Returning
+        # False here used to mean the caller believed nothing was running while
+        # the worker went on to spawn an untracked server on a reserved port.
+        proc.state = "stopped"
+        return True
     try:
         if os.name == "nt":
             # taskkill /T is what actually takes npm's grandchildren on Windows;

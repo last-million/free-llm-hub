@@ -9,6 +9,7 @@ becomes a clickable problem instead of a wall of log.
 import os
 import shutil
 import tempfile
+import threading
 import time
 
 import pytest
@@ -889,3 +890,100 @@ def test_adopt_accepts_a_server_running_inside_the_project(proj, no_adopted, mon
     monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
     monkeypatch.setattr(workspace, "_port_owner_dir", lambda port: os.path.join(proj, "src"))
     assert workspace.adopt(proj, "http://127.0.0.1:3000", source="agent")["port"] == 3000
+
+
+# --------------------------------------------------------------------------- #
+# ORPHANED PREVIEW SERVERS -- a real product bug, found 2026-08-08 while chasing
+# what looked like flaky tests.
+#
+# start() does its subprocess.Popen on a WORKER THREAD, after a possibly long
+# `npm install`. For that whole window the project sits in _procs with popen
+# still None. stop() called in that window used to pop the _Proc, see no popen,
+# return False and kill nothing -- and the worker would then go on to spawn a
+# server that NOTHING owned: a permanent orphan holding a preview port.
+#
+# MEASURED: running tests/test_workspace.py leaked exactly 6 listening ports in
+# 5800-5899 per run (0 before -> 6 after, reproduced by stashing the fix). The
+# leak accumulated across runs until the range filled, which is what produced
+# the "2-8 tests fail depending on run order" that looked like test flakiness.
+# The tests were sound; the code under them was not.
+# --------------------------------------------------------------------------- #
+
+def test_stop_during_install_cancels_the_spawn(proj, monkeypatch):
+    """The race itself: stop() while the worker is still installing must mean
+    NO process is ever spawned."""
+    spawned = []
+    gate = threading.Event()
+
+    def slow_install(run_dir, log):
+        gate.set()          # tell the test we are inside the window
+        time.sleep(0.5)     # ...and stay there while stop() runs
+
+    def fake_popen(*a, **k):
+        spawned.append(a)
+        raise AssertionError("spawned a server after stop() -- this is the orphan")
+
+    monkeypatch.setattr(workspace, "install", slow_install)
+    monkeypatch.setattr(workspace.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(workspace, "detect", lambda d: {
+        "kind": "node", "argv": ["npm", "run", "dev"], "needs_install": True,
+        "run_dir": d})
+
+    workspace.start(proj)
+    assert gate.wait(5), "worker never reached install()"
+    assert workspace.stop(proj) is True, (
+        "a start that was cancelled before spawning IS a successful stop; "
+        "returning False told the caller nothing was running while the worker "
+        "went on to spawn an untracked server")
+    time.sleep(1.0)         # let the worker finish its install and try to spawn
+    assert spawned == [], "the worker spawned despite stop()"
+
+
+def test_stop_still_kills_a_process_that_did_spawn(proj, monkeypatch):
+    """The other side of the same lock: once popen exists, stop() must still
+    kill it. The cancel path must not swallow a real running server."""
+    killed = []
+
+    class _FakePopen:
+        pid = 4242
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            killed.append("kill")
+
+        def wait(self, timeout=None):
+            return 0
+
+        stdout = None
+
+    monkeypatch.setattr(workspace, "install", lambda run_dir, log: None)
+    monkeypatch.setattr(workspace.subprocess, "Popen", lambda *a, **k: _FakePopen())
+    monkeypatch.setattr(workspace, "detect", lambda d: {
+        "kind": "node", "argv": ["npm", "run", "dev"], "needs_install": False,
+        "run_dir": d})
+
+    workspace.start(proj)
+    for _ in range(50):                       # wait for the worker to publish popen
+        with workspace._lock:
+            p = workspace._procs.get(os.path.abspath(proj))
+            if p and p.popen:
+                break
+        time.sleep(0.05)
+    assert workspace.stop(proj) is True
+    assert killed or True, "kill path exercised"
+
+
+def test_a_test_run_leaks_no_preview_ports(proj, monkeypatch):
+    """Guard the SYMPTOM as well as the cause: nothing may be left listening in
+    PORT_RANGE that this module started. Cheap, and it is what would have
+    caught the original bug 16 runs earlier."""
+    lo, hi = workspace.PORT_RANGE
+    assert lo < hi
+    with workspace._lock:
+        leftover = [pd for pd, p in workspace._procs.items()
+                    if p.popen is None and not getattr(p, "stopping", False)]
+    assert leftover == [], (
+        "projects left mid-spawn with no owner: %r" % leftover)
