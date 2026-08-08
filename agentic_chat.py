@@ -223,7 +223,16 @@ _TURN_TIMEOUT = int(os.environ.get("AGENTIC_CHAT_TIMEOUT", "1800") or "1800")
 # and broken every turn on Windows. So they go in a FILE in the project and the
 # prompt spends ~200 chars pointing at it. Measured after the change: 931 argv
 # chars for codex, 896 for claude, both with a full brief in play.
-_MAX_MESSAGE_CHARS = 6000
+# 6000 was 215 chars TOO HIGH, and it shipped. MEASURED 2026-08-08 on the
+# TURN-1 path (no native_session_id yet, so _system_prompt_addition really is
+# sent as argv) with every optional block live -- vision-gap notice firing,
+# test-verification on, a brief matched, message at the cap:
+#     claude 8406 / codex 8390 / opencode 8329   vs the ~8191 ceiling
+# The existing guard test never saw it: it sets native_session_id, so it only
+# ever measured the RESUME path (6273), where the addition is not sent at all.
+# 5600 restores real headroom on the worst case; the resume path, which is
+# every turn after the first, was never close.
+_MAX_MESSAGE_CHARS = 5600
 
 # SIGTERM (or the Windows "soft" taskkill attempt) -> SIGKILL/"hard" taskkill
 # escalation grace period, seconds.
