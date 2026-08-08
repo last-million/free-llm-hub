@@ -298,6 +298,20 @@ VERIFY_READ = """VERIFY, FIX, STOP (applies to every brief above)
 - Instead: re-read your output against every ANTI line above, name the 3 you came closest to breaking and the one-line fix for each. Two rounds, max.
 - Then list the checks you could NOT run, as commands with their pass condition, and say what is unresolved."""
 
+# ACT is the loop's OTHER end -- a break BEFORE verify even starts, not covered
+# by VERIFY_RUN. OBSERVED LIVE 2026-08-08: an agentic session's last message
+# was "Now run the full deep verification across all modules..." and the turn
+# ended right there -- no tool call, nothing run, just the announcement. User
+# confirmed this recurs across different models, not one model's quirk.
+# Narrow trigger on purpose: "you did something this turn AND your own last
+# line names the very next call" is the one pattern actually observed. A
+# broader "if nothing stops you, just do it" would also fire on a genuinely
+# open decision (which real option, anything destructive) where stopping to
+# state it and wait is the CORRECT behavior, not the bug.
+ACT_RUN = """ACT (applies to every brief above, comes before VERIFY/FIX/STOP)
+- If you already called a tool this turn and your own last sentence names the exact next call you now have everything needed to make, make it -- do not end the turn to announce it. Stating "next I'll..." about something already in reach is a stop dressed as a plan.
+- This does not cover a genuinely open decision (which real option, anything destructive/irreversible, anything you are missing information for) -- state those and wait, same as always."""
+
 
 def system_message(text, tools=True):
     """One system message for `text`, or None when nothing applies.
@@ -305,14 +319,16 @@ def system_message(text, tools=True):
     `tools` says whether the CALLER can actually execute a check. It selects
     WHICH verify block ships -- never whether one ships: a tool-less client
     still gets a real, tool-free verifier (re-read against the ANTI lines) plus
-    an explicit ban on claiming an execution it cannot perform."""
+    an explicit ban on claiming an execution it cannot perform. ACT ships only
+    for a tool-carrying caller -- a tool-less one has nothing to "just call"
+    instead of narrating."""
     hits = match(text)
     if not hits:
         return None
     # The loop goes LAST: it says "every brief above" and "every ANTI line
     # above", and both references dangle if it is prepended.
-    body = "\n\n".join([b for _n, b in hits] +
-                       [VERIFY_RUN if tools else VERIFY_READ])
+    tail = [ACT_RUN, VERIFY_RUN] if tools else [VERIFY_READ]
+    body = "\n\n".join([b for _n, b in hits] + tail)
     return {"role": "system", "content": body}
 
 

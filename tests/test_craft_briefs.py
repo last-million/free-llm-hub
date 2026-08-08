@@ -570,3 +570,42 @@ def test_the_loop_costs_its_characters_once_not_per_brief():
 def test_nothing_fires_on_unrelated_requests_still():
     """The loop must not turn every request into a brief-carrying one."""
     assert craft.system_message("what is the capital of France") is None
+
+
+# --------------------------------------------------------------------------- #
+# ACT (loop engineering, added 2026-08-08, same day -- the loop's other end)
+#
+# OBSERVED LIVE: a real agentic session's last message was "Now run the full
+# deep verification across all modules..." and the turn ended right there --
+# no tool call, nothing run, just the announcement. Confirmed to recur across
+# different models, not one model's quirk. VERIFY/FIX/STOP covers a break
+# AFTER work is claimed done; this covers a break BEFORE verify is ever
+# reached -- a different failure, so its own block, not folded into the other.
+# --------------------------------------------------------------------------- #
+
+def test_act_ships_for_a_tool_carrying_client_before_verify():
+    body = craft.system_message("build me a landing page website", tools=True)["content"]
+    assert "ACT (applies to every brief above" in body
+    assert body.index("ACT (applies") < body.index("VERIFY, FIX, STOP")
+
+
+def test_act_does_not_ship_for_a_tool_less_client():
+    """Nothing to 'just call instead of narrating' without tools -- shipping
+    this to a tool-less client would just be another thing it cannot do."""
+    body = craft.system_message("build me a landing page website", tools=False)["content"]
+    assert "ACT (applies" not in body
+
+
+def test_act_trigger_is_narrow_not_a_blanket_keep_going():
+    """Must anchor to the ONE observed pattern (already used a tool AND named
+    the exact next call) -- a broader 'if nothing stops you, do it' would also
+    fire on a genuinely open decision, where stopping to ask is correct."""
+    assert "already called a tool this turn" in craft.ACT_RUN
+    assert "genuinely open decision" in craft.ACT_RUN
+    assert "destructive" in craft.ACT_RUN
+
+
+def test_act_is_folded_into_the_same_cost_and_backreference_checks():
+    for _name, _rx, body in craft._BRIEFS:
+        assert "ACT (applies to every brief above" not in body
+    assert len(craft.ACT_RUN) < 750
