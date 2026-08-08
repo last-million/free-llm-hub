@@ -112,6 +112,31 @@ if [ "${HUB_SUPERVISED:-}" != "1" ]; then
   rm -f "$STOP_MARKER"
 fi
 
+# First successful setup ever: auto-persist, so a closed terminal or a reboot
+# never silently drops the hub again for someone who has no reason to know
+# "./run.sh autostart" exists. Once only -- a marker in the state dir (same
+# directory as STOP_MARKER above), fully best-effort: never blocks or slows
+# the actual start, never touches ~/.free-llm-hub/'s config or history, stays
+# silent instead of adding noise to every plain start. autostart.sh's
+# `set -e` must not take this whole script down if it fails (e.g. no systemd
+# on a minimal box) -- the `if ...; then` form is the standard set -e-safe
+# pattern. Called from TWO places: right before the final exec, and from the
+# "already running" branch below (a live hub IS proof setup already
+# succeeded, and that branch exits before the python/venv checks -- without
+# this second call site, the single most common case, re-running the script
+# while the hub is already up, would never trigger it).
+maybe_autopersist() {
+  local marker
+  marker="$(dirname "$CONFIG_FILE")/autostart-auto-installed"
+  if [ ! -f "$marker" ]; then
+    if ./scripts/autostart.sh >/dev/null 2>&1; then
+      mkdir -p "$(dirname "$marker")" 2>/dev/null || true
+      echo "installed automatically on first successful start -- delete this file to let run.sh try again, or run \"./run.sh autostart remove\" to fully uninstall it" \
+        > "$marker" 2>/dev/null || true
+    fi
+  fi
+}
+
 # --- refuse to double-bind -------------------------------------------------
 # Werkzeug sets SO_REUSEADDR, so on some platforms a SECOND process can bind a
 # port that is already served. You then get two hubs alive at once and requests
@@ -128,6 +153,7 @@ if [ -z "${HUB_FORCE:-}" ]; then
     echo "[free-llm-hub] Already running and healthy on port ${PORT} - nothing to do."
     echo "               Dashboard: http://127.0.0.1:${PORT}"
     echo "               (restart it instead of starting a second copy; HUB_FORCE=1 to override)"
+    maybe_autopersist
     exit 0
   fi
 fi
@@ -232,6 +258,8 @@ else
   pip install -q -r requirements.txt
   python -c "import hashlib;open('$DEPS_STAMP','w').write(hashlib.sha256(open('requirements.txt','rb').read()).hexdigest())" 2>/dev/null || true
 fi
+
+maybe_autopersist
 
 echo ""
 echo "=========================================================="

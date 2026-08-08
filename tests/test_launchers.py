@@ -85,3 +85,69 @@ def test_unix_installs_python_with_whatever_package_manager_is_present():
         "Debian ships venv separately: python3 exists while `python3 -m venv` fails")
     assert "brew install python" in sh and "$SUDO brew" not in sh, (
         "Homebrew refuses to run under sudo")
+
+
+# --------------------------------------------------------------------------- #
+# Auto-persist: a plain start survives closing the window, without the user
+# ever having to know "autostart" exists.
+#
+# MEASURED 2026-08-08: a real deployment kept a cmd window open at all times --
+# closing it silently killed the hub, and nobody watching it knew that was
+# even the cause. autostart already solved this, but only for someone who
+# already knew to run it. This makes a normal double-click self-heal too.
+# --------------------------------------------------------------------------- #
+
+def test_windows_auto_persists_on_first_successful_start():
+    bat = open(os.path.join(ROOT, "run.bat"), encoding="utf-8", errors="replace").read()
+    assert ":maybe_autopersist" in bat
+    assert "call :maybe_autopersist" in bat
+    assert r"scripts\autostart.bat" in bat.split(":maybe_autopersist", 1)[1]
+
+
+def test_windows_auto_persist_fires_from_both_the_fresh_start_and_the_already_running_branch():
+    """The most common case (re-run/double-click while the hub is already up)
+    exits at the double-bind guard, before the python/venv checks -- without a
+    call there too, that case would never auto-persist."""
+    bat = open(os.path.join(ROOT, "run.bat"), encoding="utf-8", errors="replace").read()
+    assert bat.count("call :maybe_autopersist") == 2
+
+
+def test_windows_auto_persist_is_marker_gated_not_every_start():
+    bat = open(os.path.join(ROOT, "run.bat"), encoding="utf-8", errors="replace").read()
+    body = bat[bat.index(":maybe_autopersist"):]
+    assert "AUTOSTART_MARKER" in body
+    assert 'if not exist "%AUTOSTART_MARKER%"' in body
+
+
+def test_unix_auto_persists_on_first_successful_start():
+    sh = open(os.path.join(ROOT, "run.sh"), encoding="utf-8", errors="replace").read()
+    assert "maybe_autopersist()" in sh
+    assert sh.count("maybe_autopersist") >= 3, (
+        "definition + two call sites (fresh start, already-running branch)")
+    assert "./scripts/autostart.sh" in sh.split("maybe_autopersist()", 1)[1]
+
+
+def test_unix_auto_persist_is_marker_gated_and_set_e_safe():
+    sh = open(os.path.join(ROOT, "run.sh"), encoding="utf-8", errors="replace").read()
+    body = sh[sh.index("maybe_autopersist()"):]
+    assert "autostart-auto-installed" in body
+    assert 'if [ ! -f "$marker" ]; then' in body
+    # set -e is at the top of this file; a bare `./scripts/autostart.sh` that
+    # fails (no systemd, unsupported platform) would take the WHOLE launcher
+    # down without the `if ...; then` guard around it.
+    assert "if ./scripts/autostart.sh" in body
+
+
+def test_auto_persist_never_touches_saved_state():
+    """The whole feature exists to protect a running hub -- it must never be
+    able to delete or overwrite ~/.free-llm-hub/'s config, usage or quota
+    data. Ban destructive commands from the subroutine bodies entirely."""
+    bat = open(os.path.join(ROOT, "run.bat"), encoding="utf-8", errors="replace").read()
+    bat_body = bat[bat.index(":maybe_autopersist"):bat.index(":usage")]
+    for banned in ("del ", "rmdir", "Remove-Item"):
+        assert banned not in bat_body
+
+    sh = open(os.path.join(ROOT, "run.sh"), encoding="utf-8", errors="replace").read()
+    sh_body = sh[sh.index("maybe_autopersist()"):sh.index("maybe_autopersist()") + 800]
+    for banned in ("rm -rf", "rm -f $CONFIG", ">$CONFIG_FILE"):
+        assert banned not in sh_body
