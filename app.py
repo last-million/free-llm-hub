@@ -5380,7 +5380,13 @@ _SOFT_400_CONTEXT_RE = re.compile(
     # Cloudflare Workers AI, MEASURED 2026-07-31 (arrives as 413, not 400):
     # 'The estimated number of input and maximum output tokens (42532) exceeded
     #  this model context window limit (32768).'
-    r"context window limit", re.I)
+    r"context window limit|"
+    # google/gemini-3.6-flash via g4f, MEASURED 2026-08-08: 'You have reached the
+    # maximum prompt length limit. Please consider shortening your prompt and try
+    # again. Thank you.' -- says PROMPT length, not context length, and carries no
+    # digit at all, so it teaches _learn_context_limit nothing, but it must still
+    # reroute silently instead of surfacing as a hard, un-retryable 400.
+    r"maximum prompt length", re.I)
 _SOFT_400_TOOL_RE = re.compile(r"thought_signature", re.I)
 # Some providers return a VAGUE 400 ("we could not process your request / please
 # check your input / invalid_request_error") for a request THIS model can't serve

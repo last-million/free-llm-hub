@@ -24,12 +24,19 @@ CF_400 = ('{"errors":[{"message":"AiError: {\\"error\\":{\\"message\\":\\"This '
 CF_413 = ('{"errors":[{"message":"AiError: Ai: The estimated number of input and '
           'maximum output tokens (42532) exceeded this model context window limit '
           '(32768)."}]}')
+GEMINI_400 = ('{"error":{"message":"You have reached the maximum prompt length '
+              'limit. Please consider shortening your prompt and try again. '
+              'Thank you."}}')
 
 
 class _R:
     def __init__(self, text, status=400):
         self.text = text
         self.status_code = status
+
+    def json(self):
+        import json as _json
+        return _json.loads(self.text)
 
     def close(self):
         pass
@@ -49,6 +56,24 @@ def test_the_real_window_is_extracted_not_the_requested_size(body):
     app._MODEL_MAX_INPUT.pop(("t", "m"), None)
     app._learn_context_limit("t", "m", _R(body))
     assert app._MODEL_MAX_INPUT.get(("t", "m")) == 32768
+
+
+def test_gemini_prompt_length_phrasing_is_recognised_as_a_soft_400():
+    """MEASURED 2026-08-08, google/gemini-3.6-flash via g4f: 'You have reached
+    the maximum prompt length limit. Please consider shortening your prompt and
+    try again. Thank you.' Says PROMPT length, not context length, so it missed
+    every existing pattern and surfaced to the CLI as a raw, un-retryable 400
+    instead of rerouting to the next hop."""
+    assert app._SOFT_400_CONTEXT_RE.search(GEMINI_400)
+    assert app._classify_soft_400(_R(GEMINI_400))
+
+
+def test_gemini_prompt_length_phrasing_carries_no_digit_so_teaches_nothing():
+    """No token count anywhere in the message -- must reroute without raising,
+    and must not learn a bogus limit from an unrelated number."""
+    app._MODEL_MAX_INPUT.pop(("g4f", "gemini-3.6-flash"), None)
+    app._learn_context_limit("g4f", "gemini-3.6-flash", _R(GEMINI_400))
+    assert app._MODEL_MAX_INPUT.get(("g4f", "gemini-3.6-flash")) is None
 
 
 def test_an_unrelated_400_teaches_nothing():
