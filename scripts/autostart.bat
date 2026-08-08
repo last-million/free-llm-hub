@@ -60,8 +60,12 @@ echo [autostart] Logon launcher installed.
 
 rem --- 2. self-heal every 5 minutes (no admin, hidden) ---
 schtasks /Delete /TN "%TASK%" /F >nul 2>nul
-schtasks /Create /TN "%TASK%" /SC MINUTE /MO 5 /F ^
-  /TR "wscript.exe \"%HERE%\run-hidden.vbs\" supervised" >nul 2>nul
+rem One line, deliberately -- not a caret continuation. cmd.exe's `^` line
+rem continuation formally requires the line to end CRLF; this repo's files are
+rem LF-only on disk, and a bare `^\n` is unreliable (MEASURED 2026-08-08: this
+rem exact command silently created NO task at all while still printing
+rem "installed", because the batch parser did not treat it as continued).
+schtasks /Create /TN "%TASK%" /SC MINUTE /MO 5 /F /TR "wscript.exe \"%HERE%\run-hidden.vbs\" supervised" >nul 2>nul
 if errorlevel 1 (
   echo [autostart] NOTE: the 5-minute self-heal task could not be created.
   echo             The hub will still start at logon - it just will not come

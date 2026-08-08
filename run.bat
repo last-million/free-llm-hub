@@ -183,8 +183,10 @@ rem and handles the download, the hash check and the PATH entry itself.
 where winget >nul 2>nul
 if not errorlevel 1 (
   echo [free-llm-hub] Installing Python via winget...
-  winget install --id Python.Python.3.12 -e --scope user --silent ^
-        --accept-package-agreements --accept-source-agreements >nul 2>nul
+  rem One line, deliberately -- see the autostart.bat comment on the same bug:
+  rem this file is LF-only on disk, and cmd.exe's `^` continuation formally
+  rem needs CRLF, so a caret split here is not reliable.
+  winget install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements >nul 2>nul
   call :find_python
   if defined PY exit /b 0
 )
@@ -196,8 +198,8 @@ set "PYARCH=amd64"
 if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "PYARCH=arm64"
 set "PYEXE=%TEMP%\python-%PYVER%-%PYARCH%.exe"
 echo [free-llm-hub] Downloading Python %PYVER% ^(%PYARCH%^)...
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/%PYVER%/python-%PYVER%-%PYARCH%.exe' -OutFile '%PYEXE%' -UseBasicParsing" >nul 2>nul
+rem One line, deliberately -- same LF-only/caret-continuation bug as above.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/%PYVER%/python-%PYVER%-%PYARCH%.exe' -OutFile '%PYEXE%' -UseBasicParsing" >nul 2>nul
 if not exist "%PYEXE%" exit /b 1
 echo [free-llm-hub] Installing Python %PYVER%...
 "%PYEXE%" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_launcher=1 >nul 2>nul
