@@ -580,11 +580,12 @@ def list_servers(isolated=False):
     for cli in _SUPPORTED:
         path = _config_path(cli, isolated)
         if not path:
-            # isolated=True for a CLI the hub keeps no private copy of. Say so
-            # plainly -- falling through would _read_text(None) and surface a
-            # TypeError as "unexpected error", which reads like a real bug.
-            return False, ("%s has no isolated copy (the hub only installs "
-                           "private copies of %s)" % (cli, ", ".join(_ISOLATED_CLIS)))
+            # isolated=True for a CLI the hub keeps no private copy of. Report
+            # it as an empty list and keep going: this function returns a DICT
+            # for EVERY cli, so returning here would both break the contract
+            # and truncate the listing at the first such cli.
+            out[cli] = []
+            continue
         try:
             text = _read_text(path)
         except OSError as exc:
@@ -593,6 +594,8 @@ def list_servers(isolated=False):
             continue
         if _format(cli) == "toml":
             servers, err = _toml_servers(text)
+        elif _format(cli) == "yaml":
+            servers, err = _yaml_servers(text)
         else:
             _doc, servers, err = _json_servers(cli, text)
         if err:

@@ -117,3 +117,32 @@ def test_boot_continues_to_mcp_even_if_cli_install_fails(monkeypatch):
                         lambda: order.append("mcp"))
     app._boot_agent_setup()
     assert order == ["mcp"], "a failed CLI install must not skip MCP setup"
+
+
+# --------------------------------------------------------------------------- #
+# list_servers must survive both new formats and the no-isolated-copy case.
+# Both of these were real bugs: the yaml branch was missing (hermes entries
+# were written but listed as empty), and a guard written for add/remove was
+# pasted into list_servers -- which returns a DICT, so it returned a tuple AND
+# truncated the listing at the first CLI without an isolated copy.
+# --------------------------------------------------------------------------- #
+
+def test_list_servers_reads_the_yaml_backend(home):
+    app._ensure_mcp_servers_once()
+    listed = m.list_servers()
+    assert isinstance(listed, dict)
+    names = [e["name"] for e in listed["hermes"]]
+    assert "context7" in names and "free-llm-hub" in names, \
+        "hermes entries are written but not listed -- the yaml branch is missing"
+
+
+def test_list_servers_isolated_returns_a_dict_for_every_cli(home):
+    app._ensure_mcp_servers_once()
+    listed = m.list_servers(isolated=True)
+    assert isinstance(listed, dict), "must never return add_server's (ok, msg) tuple"
+    for cli in m.supported_clis():
+        assert cli in listed, "%s missing -- the listing was truncated early" % cli
+    for cli in ("codex", "claude", "opencode", "kimi"):
+        assert [e["name"] for e in listed[cli]], cli
+    for cli in ("openclaw", "hermes"):
+        assert listed[cli] == [], "no isolated copy -> empty list, not an error"
