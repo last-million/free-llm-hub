@@ -11771,17 +11771,68 @@ def _starved_retry_budget(requested):
     return max(_STARVED_RETRY_FLOOR, min(_STARVED_RETRY_CAP, cur * 4 or _STARVED_RETRY_FLOOR))
 
 
-def _proxy_sse(resp, iterator=None, first=_MISSING):
+# A provider can dodge STREAM_IDLE_TIMEOUT forever by sending blank/keepalive
+# SSE lines without ever delivering real content -- observed LIVE, same
+# provider+model, twice: 2026-08-06 held a swarm hop hostage 24+ minutes (see
+# _SWARM_HOP_DEADLINE, the fix for that non-streaming case); 2026-08-08 held a
+# live Codex /v1/responses stream 600+s, ending only when the ACTIVITY-FEED
+# janitor relabelled the row 'stalled' for the dashboard (_ACTIVITY_STALL_SECS)
+# -- which never touches the real connection, so Codex just kept waiting the
+# whole time. Bounds time since the LAST real chunk, not total stream
+# duration, so a genuinely slow-but-progressing generation (a long tool-call
+# argument assembling, a reasoning model thinking) is never cut off -- only a
+# stream that has gone quiet except for keepalives is.
+# Same value and meaning as _SWARM_HOP_DEADLINE below ("this hop stopped
+# delivering") -- not a direct reference, since that constant is defined
+# later in the file and this one is used by _proxy_sse right below.
+_STREAM_PROGRESS_DEADLINE = 150
+_SSE_BLANK_DATA_RE = re.compile(rb"^data:\s*(?:\[DONE\])?\s*$")
+
+
+def _sse_chunk_is_progress(raw):
+    """True if `raw` -- one line from iter_lines(), or one arbitrary chunk from
+    iter_content() that may itself contain several newline-joined lines --
+    carries real upstream data, not just a blank/keepalive SSE line or a bare
+    [DONE]. See _STREAM_PROGRESS_DEADLINE."""
+    if not raw:
+        return False
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "ignore")
+    for line in raw.split(b"\n"):
+        line = line.strip()
+        if line.startswith(b"data:") and not _SSE_BLANK_DATA_RE.match(line):
+            return True
+    return False
+
+
+def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None):
     """Pass upstream SSE bytes through unchanged. When `iterator`/`first` are
     supplied (the first-byte peek already pulled the first chunk from this exact
     iterator), yield that chunk first, then continue the SAME iterator — so the
     fast-path byte stream is byte-for-byte identical to before. Empty chunks are
-    still filtered exactly as before."""
+    still filtered exactly as before.
+
+    Also enforces _STREAM_PROGRESS_DEADLINE: a provider that goes quiet except
+    for keepalives is cut off, recorded as a delivery failure (so it stops
+    winning top slot), and the client gets a clean [DONE] instead of an SSE
+    body that never ends."""
     saw_done = False
+    last_progress = time.time()
     try:
         if iterator is None:
             iterator = resp.iter_content(chunk_size=None)
         for chunk in _chain_first(first, iterator):
+            now = time.time()
+            if _sse_chunk_is_progress(chunk):
+                last_progress = now
+            elif now - last_progress > _STREAM_PROGRESS_DEADLINE:
+                _log.warning("[stream-stall] %s/%s: no real content for %ds, cutting off",
+                            hop_pid, hop_model, _STREAM_PROGRESS_DEADLINE)
+                _record_outcome(hop_pid, hop_model, False)
+                if not saw_done:
+                    yield b"data: [DONE]\n\n"
+                    saw_done = True
+                break
             if chunk:
                 if not saw_done and _STREAM_TERMINAL_RE.search(
                         chunk if isinstance(chunk, (bytes, bytearray))
@@ -12224,7 +12275,8 @@ def v1_chat_completions():
                     resp.close()
                     continue
                 chained = _chain_buffered(buffered, it)
-                return Response(stream_with_context(_proxy_sse(resp, chained)),
+                return Response(stream_with_context(
+                    _proxy_sse(resp, chained, hop_pid=hop_pid, hop_model=hop_model)),
                                 mimetype="text/event-stream",
                                 headers=dict(_SSE_HEADERS, **_routing_headers(
                                     hop_pid, hop_model, attempts, last_error)))
@@ -12516,12 +12568,14 @@ def _chat_to_responses(chat_json, model_label):
     }
 
 
-def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_est=0):
+def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_est=0,
+                      hop_pid=None, hop_model=None):
     """Consume an upstream OpenAI chat SSE stream and re-emit it as Responses API
     events for Codex. When `line_iter`/`first` are supplied (the first-byte peek
     already pulled the first line from this exact iterator) the pre-read line is
     processed first, then the rest of the SAME iterator — so fast-path output is
-    identical to before. Event order:
+    identical to before. `hop_pid`/`hop_model` are used only to record the
+    outcome if _STREAM_PROGRESS_DEADLINE fires. Event order:
       response.created
       [text]  output_item.added -> content_part.added -> output_text.delta* ->
               output_text.done -> content_part.done -> output_item.done
@@ -12597,11 +12651,20 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                 "output_index": st["out_index"], "item": item})
             done_items.append((st["out_index"], item))
 
+    last_progress = time.time()
     try:
         yield _sse_event("response.created",
                          {"type": "response.created", "response": _obj("in_progress", [])})
 
         for raw in _chain_first(first, line_iter):
+            now = time.time()
+            if _sse_chunk_is_progress(raw):
+                last_progress = now
+            elif now - last_progress > _STREAM_PROGRESS_DEADLINE:
+                _log.warning("[stream-stall] %s/%s: no real content for %ds, cutting off",
+                            hop_pid, hop_model, _STREAM_PROGRESS_DEADLINE)
+                _record_outcome(hop_pid, hop_model, False)
+                break
             if not raw or not raw.startswith(b"data:"):
                 continue
             data = raw[5:].strip()
@@ -12912,7 +12975,8 @@ def v1_responses(_retry_pass=False):
                     continue
                 chained = _chain_buffered(buffered, line_it)
                 return Response(stream_with_context(
-                    _responses_stream(resp, model_label, line_iter=chained, prompt_est=est)),
+                    _responses_stream(resp, model_label, line_iter=chained, prompt_est=est,
+                                      hop_pid=hop_pid, hop_model=hop_model)),
                     mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
@@ -13249,6 +13313,7 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
     msg_id = "msg_" + uuid.uuid4().hex
     if line_iter is None:
         line_iter = resp.iter_lines(decode_unicode=False)
+    last_progress = time.time()
     try:
         yield _sse_event("message_start", {"type": "message_start", "message": {
             "id": msg_id, "type": "message", "role": "assistant", "model": model_str,
@@ -13266,6 +13331,14 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
         text_chars = 0
 
         for raw in _chain_first(first, line_iter):
+            now = time.time()
+            if _sse_chunk_is_progress(raw):
+                last_progress = now
+            elif now - last_progress > _STREAM_PROGRESS_DEADLINE:
+                _log.warning("[stream-stall] %s/%s: no real content for %ds, cutting off",
+                            hop_pid, hop_model, _STREAM_PROGRESS_DEADLINE)
+                _record_outcome(hop_pid, hop_model, False)
+                break
             if not raw or not raw.startswith(b"data:"):
                 continue
             data = raw[5:].strip()
