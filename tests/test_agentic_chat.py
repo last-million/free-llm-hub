@@ -1298,3 +1298,32 @@ def test_api_agent_test_verification_toggle_flows_into_argv_via_http(agent_confi
     monkeypatch.setattr(agentic_chat.subprocess, "Popen", fake_popen)
     client.post("/api/agent/sessions/%s/message" % sid, json={"text": "hi"}, headers=_DASH)
     assert "--append-system-prompt" in captured["argv"]
+
+
+def test_build_argv_turn_one_worst_case_stays_under_windows_cmdline_limit(
+        agent_config, monkeypatch):
+    """The guard above sets native_session_id, so it measures the RESUME path --
+    where _system_prompt_addition is NOT sent. TURN 1 is the expensive one, and
+    it was 215 chars OVER the ceiling in shipped code (measured 2026-08-08:
+    claude 8406 / codex 8390 / opencode 8329 vs ~8191).
+
+    Worst case = no native session yet + every optional block live: the
+    vision-gap notice firing, test-verification on, a brief matched, and a
+    message at _MAX_MESSAGE_CHARS.
+    """
+    monkeypatch.setattr(agentic_chat.vision_status, "status",
+                        lambda: {"available": False, "providers": []})
+    monkeypatch.setattr(agentic_chat, "test_verification_enabled", lambda: True)
+    long_bin = r"C:\Users\somewhat-long-username\AppData\Roaming\npm\claude.cmd"
+    text = ("build me a landing page website "
+            + "x" * agentic_chat._MAX_MESSAGE_CHARS)[:agentic_chat._MAX_MESSAGE_CHARS]
+
+    for cli, build in (("claude", agentic_chat._build_argv),
+                       ("codex", agentic_chat._build_argv_codex),
+                       ("opencode", agentic_chat._build_argv_opencode)):
+        sess = agentic_chat._Session(cli, str(agent_config))
+        sess.native_session_id = None          # turn 1: the addition IS sent
+        argv = build(sess, long_bin, text)
+        cost = sum(len(a) + 3 for a in argv)   # +3 for quoting/separators
+        assert cost < 8191, (
+            "%s turn-1 argv is %d chars, over cmd.exe's ~8191 ceiling" % (cli, cost))
