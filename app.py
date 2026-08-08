@@ -7880,9 +7880,20 @@ _agent_autoinstall_thread = None
 # get last documentations and also repositories". Doing this only once by hand
 # would drift: a CLI installed later, a reset config, or a fresh machine would
 # silently lose it. Running it at every boot keeps it true instead.
+#   playwright    a real browser, so an agent can OPEN what it just built and
+#                 check it instead of declaring it done unseen.
+#
+# playwright is the odd one out and worth knowing about: it is STDIO, not a
+# URL. Each agent spawns its own `npx @playwright/mcp@latest` subprocess, which
+# needs Node on PATH and downloads browser binaries on first use. That makes it
+# heavier than the two HTTP servers -- but "verify the page you generated"
+# is exactly the step agents skip, so it earns the cost.
+_HUB_URL_SENTINEL = "<hub>"     # replaced with _hub_mcp_url() at call time
+
 _ALWAYS_MCP = (
-    ("free-llm-hub", {"url": None}),           # url filled in at call time
+    ("free-llm-hub", {"url": _HUB_URL_SENTINEL}),
     ("context7", {"url": "https://mcp.context7.com/mcp"}),
+    ("playwright", {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}),
 )
 
 
@@ -7893,7 +7904,11 @@ def _ensure_mcp_servers_once():
     or a config we refuse to touch, must never affect hub startup."""
     for name, spec in _ALWAYS_MCP:
         spec = dict(spec)
-        if spec.get("url") is None:
+        # Test the SENTINEL, not `is None`: a stdio spec has no "url" key at
+        # all, so `spec.get("url") is None` was also true for playwright and
+        # bolted the hub's URL onto it -- registering a browser subprocess as
+        # an HTTP server pointing at the hub, in every CLI.
+        if spec.get("url") == _HUB_URL_SENTINEL:
             spec["url"] = _hub_mcp_url()
         for cli in mcp_manager.supported_clis():
             for isolated in (False, True):
