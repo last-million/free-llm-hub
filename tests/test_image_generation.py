@@ -132,7 +132,7 @@ def test_images_generations_success(isolated_config, monkeypatch):
     })
     assert response.status_code == 200
     body = response.get_json()
-    assert body["data"] == [{"b64_json": "ZmFrZS1pbWFnZQ=="}]
+    assert body["data"] == [{"b64_json": "ZmFrZS1pbWFnZQ==", "mime": "image/png"}]
     assert body["model"] == "cloudflare/@cf/black-forest-labs/flux-1-schnell"
 
 
@@ -154,7 +154,7 @@ def test_images_generations_falls_back_to_next_provider(isolated_config, monkeyp
     })
     assert response.status_code == 200
     body = response.get_json()
-    assert body["data"] == [{"b64_json": "c2Vjb25kLWhvcA=="}]
+    assert body["data"] == [{"b64_json": "c2Vjb25kLWhvcA==", "mime": "image/png"}]
     assert body["model"] == "pollinations/flux"
 
 
@@ -554,7 +554,7 @@ def test_images_generations_explicit_paid_pin_succeeds(isolated_config, monkeypa
     assert response.status_code == 200
     body = response.get_json()
     assert body["model"] == "openai/gpt-image-1.5"
-    assert body["data"] == [{"b64_json": "cGFpZC1pbWFnZQ=="}]
+    assert body["data"] == [{"b64_json": "cGFpZC1pbWFnZQ==", "mime": "image/png"}]
 
 
 def test_images_generations_paid_pin_never_falls_back_to_other_paid_providers(isolated_config, monkeypatch):
