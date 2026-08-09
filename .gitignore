@@ -18,6 +18,9 @@ cm*.txt
 # local hub run logs - never commit (may contain the control token)
 .hublog.*
 
+# zip-install auto-update baseline (per-install runtime state, never shipped)
+.free-llm-hub-update-manifest.json
+
 # hub runtime logs (local only)
 hub.err.log
 hub.err.log*
