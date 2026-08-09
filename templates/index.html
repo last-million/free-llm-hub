@@ -7157,17 +7157,38 @@
            it is stopped or reaped for being idle.
        So the panel shows both but says which is which, rather than implying an
        idle chat is burning the machine. */
+    /* MEASURED LIVE 2026-08-09: a fresh install has agentic chat OFF by
+       default (on purpose — it runs the user's own CLI with full, unconfirmed
+       tool access, see agentic_chat.py's module docstring). /api/agent/sessions
+       403s in that state, and this button/panel silently swallowed that into
+       "0 running" — indistinguishable from "on, and genuinely idle". The user
+       saw raw 403s in the browser console and a badge/panel that just looked
+       broken, with zero on-page signal of WHY. isAgenticDisabledErr() names
+       that one specific, expected error so both the badge and the panel can
+       say the true thing instead of a misleading zero. */
+    function isAgenticDisabledErr(e){
+      return !!(e && e.status === 403 && e.body && e.body.code === 'agentic_chat_disabled');
+    }
+
     function initRunningPanel(){
       var btn = document.getElementById('agent-running');
       if (!btn) return;
       var badge = document.getElementById('agent-running-n');
+      var agenticOff = false;
       function refreshCount(){
         Promise.all([
-          api('/api/agent/sessions').catch(function(){ return { sessions: [] }; }),
+          api('/api/agent/sessions').catch(function(e){ agenticOff = isAgenticDisabledErr(e); return { sessions: [] }; }),
           api('/api/workspace/running').catch(function(){ return { previews: [] }; })
         ]).then(function(r){
-          var n = ((r[0] || {}).sessions || []).length + ((r[1] || {}).previews || []).length;
-          if (badge) badge.textContent = String(n);
+          if (!badge) return;
+          if (agenticOff){
+            badge.textContent = 'off';
+            btn.title = 'Agentic chat is turned off — click to enable it';
+          } else {
+            var n = ((r[0] || {}).sessions || []).length + ((r[1] || {}).previews || []).length;
+            badge.textContent = String(n);
+            btn.title = 'Conversations and previews currently open';
+          }
         });
       }
       refreshCount();
@@ -7219,19 +7240,43 @@
 
       function load(){
         body.textContent = 'Loading…';
+        var sessionsErr = null;
         Promise.all([
-          api('/api/agent/sessions').catch(function(){ return { sessions: [] }; }),
+          api('/api/agent/sessions').catch(function(e){ sessionsErr = e; return { sessions: [] }; }),
           api('/api/workspace/running').catch(function(){ return { previews: [] }; })
         ]).then(function(r){
           var sessions = (r[0] || {}).sessions || [];
           var previews = (r[1] || {}).previews || [];
           var idleMin = Math.round((((r[1] || {}).idle_timeout) || 1800) / 60);
           body.innerHTML = '';
+          if (isAgenticDisabledErr(sessionsErr)){
+            var off = document.createElement('div');
+            off.className = 'runpanel-sec';
+            off.textContent = 'Agentic chat is turned off';
+            body.appendChild(off);
+            var offMsg = document.createElement('div');
+            offMsg.className = 'runpanel-empty';
+            offMsg.textContent = 'Conversations need it enabled first. It runs your own Claude Code / Codex CLI with full, unconfirmed file + shell access — on by request only.';
+            body.appendChild(offMsg);
+            var enableBtn = document.createElement('button');
+            enableBtn.type = 'button'; enableBtn.className = 'btn sm';
+            enableBtn.style.marginTop = '8px';
+            enableBtn.textContent = 'Enable agentic chat';
+            enableBtn.addEventListener('click', function(){
+              enableBtn.disabled = true; enableBtn.textContent = 'Enabling…';
+              api('/api/agent/settings', { method: 'POST', body: { enabled: true } })
+                .then(function(r){ renderAgentSettings(r); load(); if (onChange) onChange(); })
+                .catch(function(e){ toast('Enable failed: ' + e.message, true); enableBtn.disabled = false; enableBtn.textContent = 'Enable agentic chat'; });
+            });
+            body.appendChild(enableBtn);
+            // Previews (workspace servers) are a SEPARATE feature from agentic
+            // chat and still work with it off — keep showing them below.
+          }
           var h1 = document.createElement('div');
           h1.className = 'runpanel-sec';
           h1.textContent = 'Conversations (' + sessions.length + ')';
-          body.appendChild(h1);
-          if (!sessions.length){
+          if (!isAgenticDisabledErr(sessionsErr)) body.appendChild(h1);
+          if (!sessions.length && !isAgenticDisabledErr(sessionsErr)){
             var e1 = document.createElement('div');
             e1.className = 'runpanel-empty'; e1.textContent = 'None open.';
             body.appendChild(e1);
