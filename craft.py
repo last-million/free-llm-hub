@@ -321,10 +321,18 @@ def system_message(text, tools=True):
     still gets a real, tool-free verifier (re-read against the ANTI lines) plus
     an explicit ban on claiming an execution it cannot perform. ACT ships only
     for a tool-carrying caller -- a tool-less one has nothing to "just call"
-    instead of narrating."""
+    instead of narrating.
+
+    For a tool-carrying caller, ACT+VERIFY_RUN ship even with no domain-brief
+    hit -- OBSERVED LIVE 2026-08-09: a real narrate-then-stop turn ("so
+    continue till the end" -> announced the next check, ran nothing) matched
+    ZERO domain briefs, so a hits-gated loop block never had a chance to fire.
+    VERIFY_RUN names its own check and does not reference "the ANTI lines
+    above", so it stands alone with no domain brief present. VERIFY_READ does
+    reference ANTI lines, so the tools=False path stays gated on a real hit."""
     hits = match(text)
     if not hits:
-        return None
+        return {"role": "system", "content": "\n\n".join([ACT_RUN, VERIFY_RUN])} if tools else None
     # The loop goes LAST: it says "every brief above" and "every ANTI line
     # above", and both references dangle if it is prepended.
     tail = [ACT_RUN, VERIFY_RUN] if tools else [VERIFY_READ]

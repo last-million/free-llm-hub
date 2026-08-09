@@ -296,10 +296,16 @@ def test_the_brief_is_written_into_the_project(monkeypatch):
     assert "Elevate" in body, "the ANTI list must reach the agent"
 
 
-def test_no_brief_file_for_a_task_that_needs_none():
+def test_no_domain_brief_content_for_a_task_that_needs_none():
+    """2026-08-09: craft.system_message ships a bare ACT+VERIFY_RUN loop for
+    every tool-carrying turn now (a real narrate-then-stop bug matched zero
+    domain briefs), so the file IS written -- just without any domain
+    brief's content bleeding into an unrelated task."""
     d = tempfile.mkdtemp(prefix="hubbrief-")
-    assert ac.write_task_brief(d, "explain how a mutex works") is False
-    assert not os.path.exists(os.path.join(d, ac.BRIEF_FILENAME))
+    assert ac.write_task_brief(d, "explain how a mutex works") is True
+    body = open(os.path.join(d, ac.BRIEF_FILENAME), encoding="utf-8").read()
+    assert "WEB DESIGN BRIEF" not in body
+    assert "ACT (applies to every brief above" in body
 
 
 def test_both_clis_point_at_the_brief(monkeypatch):
