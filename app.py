@@ -9439,28 +9439,75 @@ def _points_at_hub(val):
     return isinstance(val, str) and any(fr in val for fr in _hub_fragments())
 
 
-def _strip_hub_mcp_table(text):
-    """Drop the hub's OWN `[mcp_servers.free-llm-hub]` (+ sub-tables) from a
-    COPY of `text` before any "does this still point at the hub" scan.
+# Every JSON container key mcp_manager.py's CLIs write a hub MCP entry under.
+# Deliberately NOT keyed by CLI id here: _file_points_at_hub only has a path,
+# not which CLI it belongs to, and trying every known shape is both simpler
+# and safer than threading CLI identity through every caller — an unrelated
+# app coincidentally using the SAME container key name is not a realistic risk.
+_HUB_MCP_JSON_KEYS = ("mcpServers", "mcp")  # claude / opencode (+ generic default)
 
-    MEASURED LIVE 2026-08-09: a user disconnected Codex, the model-provider
-    wiring (_disconnect_codex) correctly stripped [model_providers.freehub]
-    and the top-level model/model_provider keys, yet the UI still reported
-    "disconnected in config — but it still reports as connected". Root cause:
-    the SAME config.toml also carries an MCP server registration for this hub
-    (a completely separate, INTENTIONALLY-persistent feature — see the
-    comment in _disconnect_codex: "[mcp_servers.*] ... the user added ...
-    survives"), and that table's url still contains 127.0.0.1:<PORT>. The
-    blind whole-file substring scan below has no way to tell "still wired as
-    the model provider" from "still registered as an MCP tool server" apart,
-    so it reported a false leftover connection. Best-effort/no-raise: on any
-    parse hiccup, fall back to the ORIGINAL text so a genuine leftover
-    connection is never hidden by a broken strip."""
+
+def _strip_hub_mcp_table(text):
+    """Drop the hub's OWN MCP server registration from a COPY of `text`
+    before any "does this still point at the hub" scan — format-agnostic:
+    tries JSON (claude's flat "mcpServers", opencode's flat "mcp", openclaw's
+    nested "mcp.servers"), then TOML ([mcp_servers.free-llm-hub]), then YAML
+    (hermes' "mcp_servers:" block). Whichever one actually matches wins;
+    the rest are silent no-ops.
+
+    MEASURED LIVE 2026-08-09, TWICE, in two different config formats: a user
+    disconnected Codex (TOML) and separately OpenCode (JSON) — in both cases
+    the model-provider wiring was correctly stripped, yet the UI still
+    reported "disconnected in config — but it still reports as connected".
+    Root cause: the SAME config file also carries an MCP server registration
+    for this hub (a completely separate, INTENTIONALLY-persistent feature —
+    see the comment in _disconnect_codex: "[mcp_servers.*] ... the user added
+    ... survives"), and that entry's url still contains 127.0.0.1:<PORT>. The
+    blind whole-file substring scan has no way to tell "still wired as the
+    model provider" from "still registered as an MCP tool server" apart, so
+    it reported a false leftover connection. An initial fix only stripped the
+    TOML shape, which fixed Codex but left OpenCode (JSON) broken — this
+    covers every format mcp_manager.py itself writes, not just one.
+
+    Best-effort/no-raise throughout: on any parse hiccup for a given format,
+    that format is skipped (not treated as a match) so a genuine leftover
+    connection in a DIFFERENT format is never hidden by a broken strip."""
+    # JSON (claude, opencode, openclaw).
     try:
-        stripped, _ = mcp_manager._remove_toml_server(text, "free-llm-hub")
-        return stripped
+        data = json.loads(text)
+        if isinstance(data, dict):
+            changed = False
+            for key in _HUB_MCP_JSON_KEYS:
+                holder = data.get(key)
+                if isinstance(holder, dict) and holder.pop("free-llm-hub", None) is not None:
+                    changed = True
+            mcp_holder = data.get("mcp")
+            if isinstance(mcp_holder, dict):
+                servers = mcp_holder.get("servers")
+                if isinstance(servers, dict) and servers.pop("free-llm-hub", None) is not None:
+                    changed = True
+            if changed:
+                return json.dumps(data)
+            return text  # valid JSON, nothing to strip -- do not fall through to TOML/YAML
+    except (ValueError, TypeError):
+        pass
+    # TOML (codex, kimi).
+    try:
+        stripped, removed = mcp_manager._remove_toml_server(text, "free-llm-hub")
+        if removed:
+            return stripped
     except Exception:
-        return text
+        pass
+    # YAML (hermes).
+    try:
+        block, start, end = mcp_manager._yaml_block(text)
+        if block is not None:
+            cleaned = mcp_manager._yaml_remove_entry(block, "free-llm-hub")
+            if cleaned != block:
+                return text[:start] + cleaned + text[end:]
+    except Exception:
+        pass
+    return text
 
 
 def _file_points_at_hub(path):
