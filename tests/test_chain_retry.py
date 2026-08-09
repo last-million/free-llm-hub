@@ -17,6 +17,20 @@ def test_rate_limits_and_timeouts_count_as_transient():
         assert app._TRANSIENT_ERR_RE.search(err), err
 
 
+def test_a_raw_connection_error_counts_as_transient():
+    """MEASURED LIVE 2026-08-09: every hop in a real chain failed with
+    errors.append(exc.__class__.__name__) recording the bare exception class
+    name "ConnectionError" (a brief local network blip -- the VERY NEXT
+    request seconds later succeeded normally on the same providers), yet the
+    storm-retry never fired because "ConnectionError" contains none of
+    timeout/timed out/HTTP 429/500/502/503/504. A pure connection failure is
+    arguably the MOST classic transient condition and was the one class this
+    regex missed."""
+    for err in ("nvidia/minimaxai/minimax-m3: ConnectionError",
+                "cloudflare/@cf/meta/llama-4-scout-17b-16e-instruct: ConnectionError"):
+        assert app._TRANSIENT_ERR_RE.search(err), err
+
+
 def test_hard_failures_are_not_transient():
     """A 400/404/401 will fail again in six seconds — retrying only wastes the
     user's time, so those still surface immediately."""

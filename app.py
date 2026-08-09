@@ -4569,7 +4569,18 @@ _KEY_ROTATE_STATUSES = (401, 402, 403, 429)
 # A hop failure that is worth waiting out rather than giving up on. Used to
 # decide whether an exhausted chain should back off and retry once (see the
 # transient-storm retry in the responses path).
-_TRANSIENT_ERR_RE = re.compile(r"HTTP (?:429|500|502|503|504)|timeout|timed out", re.I)
+#
+# MEASURED LIVE 2026-08-09: every hop in a real chain failed with a raw
+# requests.exceptions.ConnectionError (a brief local network blip -- the
+# VERY NEXT request seconds later succeeded normally on the same providers),
+# yet the storm-retry never fired and the chain surfaced a hard 503 instead.
+# Root cause: errors.append(exc.__class__.__name__) records the bare
+# exception class name ("ConnectionError"), which contains none of
+# "timeout"/"timed out"/HTTP 429/500/502/503/504 -- a pure connection
+# failure (no HTTP response at all) is arguably the MOST classic transient
+# condition and was the one class this regex did not cover.
+_TRANSIENT_ERR_RE = re.compile(
+    r"HTTP (?:429|500|502|503|504)|timeout|timed out|connectionerror", re.I)
 _CHAIN_RETRY_DELAY = 6.0   # seconds; the free relays meter per MINUTE
 
 _provider_key_cursor = {}          # pid -> next round-robin start offset
