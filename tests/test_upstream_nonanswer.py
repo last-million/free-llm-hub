@@ -54,6 +54,14 @@ def clean_state():
     "Model 'gpt-4o' requires an active subscription or a positive balance.",
     "No cake credits. Bake proof-of-work cakes at g4f.dev/chat",
     "Insufficient balance. This request costs ~0.0472 pollen.",
+    # google/gemini-3.6-flash via g4f, MEASURED LIVE 2026-08-09 through a real
+    # Codex session: HTTP 200, streamed AS the assistant's content (no 400
+    # status at all -- _SOFT_400_CONTEXT_RE's matching phrase is the 400-status
+    # twin of this exact same text). Reached the user as the final "answer"
+    # before this pattern was added, because _peek_until_content's nonanswer
+    # check is the ONLY gate that runs on a 200 stream.
+    "You have reached the maximum prompt length limit. Please consider "
+    "shortening your prompt and try again. Thank you.",
 ])
 def test_upstream_error_pages_are_detected(text):
     assert app._is_upstream_nonanswer(text) is True

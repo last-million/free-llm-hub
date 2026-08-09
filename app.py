@@ -9439,6 +9439,30 @@ def _points_at_hub(val):
     return isinstance(val, str) and any(fr in val for fr in _hub_fragments())
 
 
+def _strip_hub_mcp_table(text):
+    """Drop the hub's OWN `[mcp_servers.free-llm-hub]` (+ sub-tables) from a
+    COPY of `text` before any "does this still point at the hub" scan.
+
+    MEASURED LIVE 2026-08-09: a user disconnected Codex, the model-provider
+    wiring (_disconnect_codex) correctly stripped [model_providers.freehub]
+    and the top-level model/model_provider keys, yet the UI still reported
+    "disconnected in config — but it still reports as connected". Root cause:
+    the SAME config.toml also carries an MCP server registration for this hub
+    (a completely separate, INTENTIONALLY-persistent feature — see the
+    comment in _disconnect_codex: "[mcp_servers.*] ... the user added ...
+    survives"), and that table's url still contains 127.0.0.1:<PORT>. The
+    blind whole-file substring scan below has no way to tell "still wired as
+    the model provider" from "still registered as an MCP tool server" apart,
+    so it reported a false leftover connection. Best-effort/no-raise: on any
+    parse hiccup, fall back to the ORIGINAL text so a genuine leftover
+    connection is never hidden by a broken strip."""
+    try:
+        stripped, _ = mcp_manager._remove_toml_server(text, "free-llm-hub")
+        return stripped
+    except Exception:
+        return text
+
+
 def _file_points_at_hub(path):
     """True if the file's raw text contains a hub origin substring. Fail-open:
     an unreadable file reads as 'not pointing here' (never raises)."""
@@ -9447,7 +9471,7 @@ def _file_points_at_hub(path):
             txt = f.read()
     except OSError:
         return False
-    return any(fr in txt for fr in _hub_fragments())
+    return any(fr in _strip_hub_mcp_table(txt) for fr in _hub_fragments())
 
 
 def _cli_connected(entry):
@@ -9466,7 +9490,10 @@ def _cli_connected(entry):
                 txt = f.read()
         except OSError:
             continue  # fail open
-        if any(fr in txt for fr in frags):
+        # See _strip_hub_mcp_table: an MCP server registration for this hub is
+        # a separate, deliberately-persistent feature and must not count as
+        # "still wired as the model provider".
+        if any(fr in _strip_hub_mcp_table(txt) for fr in frags):
             return True, "config", "Connected via %s." % _short(path)
     return False, entry.get("default_method", "manual"), None
 
@@ -11690,7 +11717,15 @@ _NONANSWER_RE = re.compile(
     r"|rate limit exceeded"
     r"|insufficient (?:credits|balance|quota)"
     r"|no cake credits"
-    r"|discord\.gg/", re.I)
+    r"|discord\.gg/"
+    # google/gemini-3.6-flash via g4f, MEASURED 2026-08-09: a Codex session
+    # ships this AS THE STREAMED CONTENT (HTTP 200, no error status at all --
+    # see _SOFT_400_CONTEXT_RE for the 400-status twin of this same phrasing),
+    # so only the content-level nonanswer check (_peek_until_content) can
+    # catch it; the soft-400 regex never runs because there is no 400 here.
+    # Without this the hub committed the stream and relayed the provider's
+    # own error text to Codex as if it were the real answer.
+    r"|maximum prompt length", re.I)
 
 
 def _is_upstream_nonanswer(text):

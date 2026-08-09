@@ -568,8 +568,20 @@ def test_the_loop_costs_its_characters_once_not_per_brief():
 
 
 def test_nothing_fires_on_unrelated_requests_still():
-    """The loop must not turn every request into a brief-carrying one."""
-    assert craft.system_message("what is the capital of France") is None
+    """A tool-less caller stays silent on an unrelated request -- no ANTI
+    lines exist for VERIFY_READ to point at without a matched domain brief."""
+    assert craft.system_message("what is the capital of France", tools=False) is None
+
+
+def test_unrelated_request_still_gets_the_bare_loop_for_a_tool_caller():
+    """A tool-carrying caller gets ACT+VERIFY_RUN even with zero domain-brief
+    hits (2026-08-09: real narrate-then-stop turns matched no domain brief at
+    all) -- but never a domain brief's content it did not actually match."""
+    msg = craft.system_message("what is the capital of France")
+    assert msg is not None
+    assert "ACT (applies to every brief above" in msg["content"]
+    assert "VERIFY, FIX, STOP" in msg["content"]
+    assert craft.names("what is the capital of France") == []
 
 
 # --------------------------------------------------------------------------- #
