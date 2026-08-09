@@ -151,3 +151,57 @@ def test_auto_persist_never_touches_saved_state():
     sh_body = sh[sh.index("maybe_autopersist()"):sh.index("maybe_autopersist()") + 800]
     for banned in ("rm -rf", "rm -f $CONFIG", ">$CONFIG_FILE"):
         assert banned not in sh_body
+
+
+# --------------------------------------------------------------------------- #
+# Detached start: closing the launcher window must never kill the hub, not
+# even for the ~5 minutes self-heal takes to notice.
+#
+# MEASURED 2026-08-09: closing the visible window running `python app.py` in
+# the foreground killed the hub instantly. Fix: relaunch through
+# run-hidden.vbs (the same mechanism the logon launcher and self-heal already
+# use) and let the visible window exit.
+# --------------------------------------------------------------------------- #
+
+def test_windows_relaunches_detached_instead_of_running_in_the_foreground():
+    bat = open(os.path.join(ROOT, "run.bat"), encoding="utf-8", errors="replace").read()
+    assert 'if "%HUB_DETACHED%"=="1"' in bat, "no guard against re-detaching forever"
+    assert 'start "" wscript.exe "%~dp0run-hidden.vbs"' in bat
+
+
+def test_windows_detach_guard_is_set_before_relaunching():
+    """HUB_DETACHED must be set BEFORE the relaunch, not after -- it travels
+    to the child through Windows environment inheritance, so setting it too
+    late (or not at all) would recurse forever instead of running python."""
+    bat = open(os.path.join(ROOT, "run.bat"), encoding="utf-8", errors="replace").read()
+    set_idx = bat.index('set "HUB_DETACHED=1"')
+    relaunch_idx = bat.index('start "" wscript.exe "%~dp0run-hidden.vbs"')
+    assert set_idx < relaunch_idx
+
+
+def test_windows_the_detached_branch_actually_runs_python():
+    """The guard exists to short-circuit into the real launch, not just to
+    exist -- confirm `python app.py` sits inside the HUB_DETACHED=1 branch."""
+    bat = open(os.path.join(ROOT, "run.bat"), encoding="utf-8", errors="replace").read()
+    branch = bat[bat.index('if "%HUB_DETACHED%"=="1"'):bat.index('rem --- relaunch hidden')]
+    assert "python app.py" in branch
+
+
+def test_hidden_launcher_uses_a_full_path_not_a_bare_filename():
+    """MEASURED 2026-08-09: a bare `call run.bat` here silently found nothing
+    on a machine with NoDefaultCurrentDirectoryInExePath=1 set (a real
+    Windows hardening setting) -- that excludes the current directory from
+    cmd.exe's search for a bare executable name. wscript.exe's fire-and-forget
+    Run() still exited 0 regardless, so this failure was invisible everywhere:
+    not in the visible window (there isn't one), not in Task Scheduler's
+    LastTaskResult (reports the launcher's own exit code, not the inner
+    command's), not anywhere. A full path sidesteps cmd.exe's search
+    behaviour entirely rather than depending on getting it right."""
+    vbs = open(os.path.join(ROOT, "run-hidden.vbs"), encoding="utf-8", errors="replace").read()
+    assert 'batPath = here & "\\run.bat"' in vbs
+    run_lines = [ln for ln in vbs.splitlines()
+                if ln.strip().startswith("sh.Run")]
+    assert len(run_lines) == 2, "supervised and explicit-start branches, both"
+    for ln in run_lines:
+        assert "call run.bat" not in ln, "must never call it by bare name again: %r" % ln
+        assert "batPath" in ln
