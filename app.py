@@ -14745,75 +14745,255 @@ def _auto_update_enabled():
     return True
 
 
+# --------------------------------------------------------------------------- #
+# Zip-install auto-update: the same 5-hour self-heal as a git clone, for
+# someone who downloaded "Download ZIP" from GitHub instead of cloning.
+#
+# git's dirty-tree skip ("don't clobber local edits") has no free equivalent
+# without git, so this builds one: a manifest of {relpath: sha256} for every
+# file that was part of the LAST update this code itself applied. Before
+# applying a new one, every manifested file's CURRENT on-disk hash must still
+# match — any mismatch means the user (or something else) touched a file
+# since our last update, and the whole cycle is skipped, exactly like git
+# skipping a dirty tree rather than force-pulling over it.
+#
+# On the very first check for a given zip install (no manifest yet) there is
+# nothing to compare against — same trusted-baseline assumption a fresh git
+# clone gets on day one: presumed unmodified until proven otherwise.
+# --------------------------------------------------------------------------- #
+_ZIP_UPDATE_URL = "https://github.com/last-million/free-llm-hub/archive/refs/heads/main.zip"
+_ZIP_MANIFEST_PATH = os.path.join(_REPO_DIR, ".free-llm-hub-update-manifest.json")
+# Never let a runtime/user artifact block the dirty-check or get shipped into
+# the manifest — these are exactly what a git install's .gitignore also keeps
+# out of the tree that `git status --porcelain` watches.
+_ZIP_UPDATE_IGNORE_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules"}
+_ZIP_UPDATE_IGNORE_FILES = {".free-llm-hub-update-manifest.json", ".calvoun-brief.md"}
+
+
+def _zip_manifest_of(root_dir):
+    """{relpath (forward-slash, sorted) -> sha256} for every real file under
+    root_dir, skipping the runtime/ignore set above. Never raises — an
+    unreadable file is simply left out (worst case it re-downloads next time)."""
+    manifest = {}
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        dirnames[:] = [d for d in dirnames if d not in _ZIP_UPDATE_IGNORE_DIRS
+                       and not d.endswith(".pyc")]
+        for fn in filenames:
+            if fn in _ZIP_UPDATE_IGNORE_FILES or fn.endswith((".pyc", ".pyo")):
+                continue
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, root_dir).replace(os.sep, "/")
+            try:
+                with open(full, "rb") as f:
+                    manifest[rel] = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                continue
+    return manifest
+
+
+def _zip_apply_needed(new_manifest):
+    """True if copying new_manifest's files over _REPO_DIR would actually
+    change anything. Deliberately checks ONLY new_manifest's own keys against
+    disk (not a full-tree walk) — the live install also holds gitignored/
+    local-only files (config.json, .hublog.*, ...) that are never part of the
+    shipped zip and must never make this comparison look 'different' when the
+    tracked source files are already identical."""
+    for rel, expected_hash in new_manifest.items():
+        full = os.path.join(_REPO_DIR, *rel.split("/"))
+        try:
+            with open(full, "rb") as f:
+                actual_hash = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return True
+        if actual_hash != expected_hash:
+            return True
+    return False
+
+
+def _zip_tree_is_dirty(old_manifest):
+    """True if any file the LAST zip-update wrote has since changed on disk —
+    the zip-install equivalent of `git status --porcelain` reporting dirty."""
+    for rel, expected_hash in old_manifest.items():
+        full = os.path.join(_REPO_DIR, *rel.split("/"))
+        try:
+            with open(full, "rb") as f:
+                actual_hash = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return True  # a file our own last update wrote is now missing/unreadable
+        if actual_hash != expected_hash:
+            return True
+    return False
+
+
+def _load_zip_manifest():
+    try:
+        with open(_ZIP_MANIFEST_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _save_zip_manifest(manifest):
+    with open(_ZIP_MANIFEST_PATH, "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+
+
+def _manifest_fingerprint(manifest):
+    """Short, stable label for a manifest -- the zip-update analogue of a git
+    short SHA, used only for the human-readable status string/log lines."""
+    blob = json.dumps(sorted(manifest.items())).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:7]
+
+
+def _do_zip_update_check():
+    """One zip-update cycle: download the latest source zip, skip if the local
+    tree has diverged from what we last applied, otherwise overwrite and
+    re-exec via the same _finish_update_apply tail the git path uses. Caller
+    (_do_update_check) already holds _auto_update_lock."""
+    old_manifest = _load_zip_manifest()
+    if old_manifest and _zip_tree_is_dirty(old_manifest):
+        _auto_update_state["last_result"] = (
+            "skipped: local files differ from the last applied update")
+        _log.warning("Zip auto-update: local tree diverged from the last applied "
+                    "update — skipping, same as git's dirty-tree skip.")
+        return _auto_update_state["last_result"]
+    tmp_dir = None
+    try:
+        zip_path = os.path.join(tempfile.gettempdir(),
+                                "free-llm-hub-update-%d.zip" % os.getpid())
+        r = requests.get(_ZIP_UPDATE_URL, timeout=(10, 60))
+        r.raise_for_status()
+        with open(zip_path, "wb") as f:
+            f.write(r.content)
+        tmp_dir = tempfile.mkdtemp(prefix="free-llm-hub-update-")
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(tmp_dir)
+        os.remove(zip_path)
+        # GitHub's archive zip wraps everything in one '<repo>-<branch>/' folder.
+        entries = [d for d in os.listdir(tmp_dir) if os.path.isdir(os.path.join(tmp_dir, d))]
+        if len(entries) != 1:
+            raise RuntimeError("unexpected archive layout: %r" % entries)
+        src_root = os.path.join(tmp_dir, entries[0])
+        new_manifest = _zip_manifest_of(src_root)
+        if not new_manifest:
+            raise RuntimeError("downloaded archive had no files")
+        before_label = _manifest_fingerprint(old_manifest) if old_manifest else "initial"
+        after_label = _manifest_fingerprint(new_manifest)
+        # Checked against what's ACTUALLY on disk right now, not just the saved
+        # manifest — on a fresh zip install's very first check there IS no saved
+        # manifest yet, and treating that as "always different" would force an
+        # unnecessary restart even when the download is byte-identical to what
+        # is already installed.
+        if not _zip_apply_needed(new_manifest):
+            _save_zip_manifest(new_manifest)  # still record the baseline
+            _auto_update_state["last_result"] = "up to date (%s)" % after_label
+            return _auto_update_state["last_result"]
+        # New/changed code. Copy every file over the live install — additive/
+        # overwrite only, a file the new zip no longer ships is left in place
+        # rather than deleted, the safer side of the same "never destroy more
+        # than the update itself changed" principle git's ff-only pull already
+        # gives for free.
+        for rel in new_manifest:
+            src = os.path.join(src_root, *rel.split("/"))
+            dst = os.path.join(_REPO_DIR, *rel.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+        _save_zip_manifest(new_manifest)
+    except Exception as exc:
+        _auto_update_state["last_result"] = "zip update failed: " + _sanitize(str(exc))[:160]
+        _log.warning("Zip auto-update: failed: %s", exc)
+        return _auto_update_state["last_result"]
+    finally:
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    deps_ok = _sync_deps_after_pull()
+    return _finish_update_apply(before_label, after_label, deps_ok)
+
+
 def _do_update_check():
-    """One pull cycle: skip if dirty, pull --ff-only, re-exec if HEAD moved.
-    Returns a short human status string (also stored in _auto_update_state)."""
+    """One update cycle. Dispatches on install type — a git clone pulls via git,
+    a plain zip/folder download self-updates via _do_zip_update_check — so BOTH
+    install methods get the same 5-hour auto-heal, not just git users. Returns a
+    short human status string (also stored in _auto_update_state)."""
     with _auto_update_lock:
         _auto_update_state["last_check"] = int(time.time())
-        if not _is_git_repo():
-            _auto_update_state["last_result"] = "not a git repo — auto-update off"
-            return _auto_update_state["last_result"]
-        if not _origin_is_trusted():
-            _auto_update_state["last_result"] = (
-                "skipped: 'origin' is not the trusted last-million/free-llm-hub repo")
-            _log.warning("Auto-update: refusing to pull — origin remote is untrusted.")
-            return _auto_update_state["last_result"]
-        rc, dirty, _ = _git("status", "--porcelain")
-        if rc == 0 and dirty:
-            _auto_update_state["last_result"] = "skipped: local uncommitted changes"
-            return _auto_update_state["last_result"]
-        rc, before, _ = _git("rev-parse", "HEAD")
-        rc2, _out, err = _git("pull", "--ff-only")
-        if rc2 != 0:
-            _auto_update_state["last_result"] = "pull failed: " + _sanitize(err)[:160]
-            return _auto_update_state["last_result"]
-        _rc, after, _ = _git("rev-parse", "HEAD")
-        # Run every cycle, not only when before != after: a dependency install
-        # that failed on a PRIOR cycle must keep retrying even once HEAD stops
-        # moving (git pull is a no-op the moment it succeeded once), or a hub
-        # stuck on stale deps would silently stop trying forever. Cheap when
-        # nothing changed -- one hash compare against the stamp file.
-        deps_ok = _sync_deps_after_pull()
-        if before and after and before != after:
-            if not deps_ok:
-                _auto_update_state["last_result"] = (
-                    "updated %s->%s — restart deferred: dependency install failed, "
-                    "retrying next check" % (before[:7], after[:7]))
-                _log.warning("Auto-update: pulled %s->%s but dependency install failed; "
-                            "NOT re-executing into a broken environment.",
-                            before[:7], after[:7])
-                return _auto_update_state["last_result"]
-            # New commits pulled. Normally we re-exec to apply them — but if the user
-            # has deliberately switched the hub OFF as the default (hub-mode off), respect
-            # that "leave me stood down" intent and do NOT respawn the process; the update
-            # applies on the next manual restart instead.
-            if _hub_mode_is_off():
-                _auto_update_state["last_result"] = (
-                    "updated %s->%s — restart deferred (hub switched off as default)"
-                    % (before[:7], after[:7]))
-                _log.info("Auto-update: pulled %s->%s but hub-mode is off; deferring re-exec.",
-                         before[:7], after[:7])
-                return _auto_update_state["last_result"]
-            _auto_update_state["updating"] = True
-            busy = _agentic_busy_session_ids()
-            with _runtime_condition:
-                inflight = _runtime_active[0]
-            if not busy and not inflight:
-                _auto_update_state["last_result"] = "updated %s->%s — restarting" % (before[:7], after[:7])
-                _log.info("Auto-update: new commits pulled (%s -> %s), re-executing.",
-                         before[:7], after[:7])
-                _reexec_soon()
-            else:
-                _auto_update_state["last_result"] = (
-                    "updated %s->%s — restart deferred: %d task(s) still running"
-                    % (before[:7], after[:7], len(busy) + (1 if inflight else 0)))
-                _log.info("Auto-update: pulled %s->%s but %d session(s)/%d inflight request(s) "
-                         "busy; deferring restart until they finish.",
-                         before[:7], after[:7], len(busy), inflight)
-                _reexec_when_idle(busy)
-            return _auto_update_state["last_result"]
+        if _is_git_repo():
+            return _do_git_update_check()
+        return _do_zip_update_check()
+
+
+def _do_git_update_check():
+    """One pull cycle: skip if dirty, pull --ff-only, re-exec if HEAD moved.
+    Caller (_do_update_check) already holds _auto_update_lock."""
+    if not _origin_is_trusted():
+        _auto_update_state["last_result"] = (
+            "skipped: 'origin' is not the trusted last-million/free-llm-hub repo")
+        _log.warning("Auto-update: refusing to pull — origin remote is untrusted.")
+        return _auto_update_state["last_result"]
+    rc, dirty, _ = _git("status", "--porcelain")
+    if rc == 0 and dirty:
+        _auto_update_state["last_result"] = "skipped: local uncommitted changes"
+        return _auto_update_state["last_result"]
+    rc, before, _ = _git("rev-parse", "HEAD")
+    rc2, _out, err = _git("pull", "--ff-only")
+    if rc2 != 0:
+        _auto_update_state["last_result"] = "pull failed: " + _sanitize(err)[:160]
+        return _auto_update_state["last_result"]
+    _rc, after, _ = _git("rev-parse", "HEAD")
+    # Run every cycle, not only when before != after: a dependency install
+    # that failed on a PRIOR cycle must keep retrying even once HEAD stops
+    # moving (git pull is a no-op the moment it succeeded once), or a hub
+    # stuck on stale deps would silently stop trying forever. Cheap when
+    # nothing changed -- one hash compare against the stamp file.
+    deps_ok = _sync_deps_after_pull()
+    if not (before and after and before != after):
         _auto_update_state["last_result"] = "up to date (%s)" % (after[:7] if after else "?")
         return _auto_update_state["last_result"]
+    return _finish_update_apply(before[:7], after[:7], deps_ok)
+
+
+def _finish_update_apply(before_label, after_label, deps_ok):
+    """Shared tail for BOTH install types once new code has actually landed on
+    disk: handle a failed dependency sync, a user-stood-down hub, busy
+    sessions, or the clear-to-restart case. Caller already holds
+    _auto_update_lock."""
+    if not deps_ok:
+        _auto_update_state["last_result"] = (
+            "updated %s->%s — restart deferred: dependency install failed, "
+            "retrying next check" % (before_label, after_label))
+        _log.warning("Auto-update: updated %s->%s but dependency install failed; "
+                    "NOT re-executing into a broken environment.",
+                    before_label, after_label)
+        return _auto_update_state["last_result"]
+    # New code landed. Normally we re-exec to apply it — but if the user has
+    # deliberately switched the hub OFF as the default (hub-mode off), respect
+    # that "leave me stood down" intent and do NOT respawn the process; the
+    # update applies on the next manual restart instead.
+    if _hub_mode_is_off():
+        _auto_update_state["last_result"] = (
+            "updated %s->%s — restart deferred (hub switched off as default)"
+            % (before_label, after_label))
+        _log.info("Auto-update: updated %s->%s but hub-mode is off; deferring re-exec.",
+                 before_label, after_label)
+        return _auto_update_state["last_result"]
+    _auto_update_state["updating"] = True
+    busy = _agentic_busy_session_ids()
+    with _runtime_condition:
+        inflight = _runtime_active[0]
+    if not busy and not inflight:
+        _auto_update_state["last_result"] = "updated %s->%s — restarting" % (before_label, after_label)
+        _log.info("Auto-update: new code applied (%s -> %s), re-executing.",
+                 before_label, after_label)
+        _reexec_soon()
+    else:
+        _auto_update_state["last_result"] = (
+            "updated %s->%s — restart deferred: %d task(s) still running"
+            % (before_label, after_label, len(busy) + (1 if inflight else 0)))
+        _log.info("Auto-update: updated %s->%s but %d session(s)/%d inflight request(s) "
+                 "busy; deferring restart until they finish.",
+                 before_label, after_label, len(busy), inflight)
+        _reexec_when_idle(busy)
+    return _auto_update_state["last_result"]
 
 
 def _sync_deps_after_pull():
