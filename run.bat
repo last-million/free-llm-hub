@@ -135,14 +135,39 @@ if defined DEPS_OK (
 
 call :maybe_autopersist
 
-echo.
-echo ==========================================================
-echo   Calvoun Free LLM Hub is starting
-echo   Dashboard:  http://127.0.0.1:%PORT%
-echo ==========================================================
-echo.
-python app.py
-exit /b %errorlevel%
+if "%HUB_DETACHED%"=="1" (
+  echo.
+  echo ==========================================================
+  echo   Calvoun Free LLM Hub is starting
+  echo   Dashboard:  http://127.0.0.1:%PORT%
+  echo ==========================================================
+  echo.
+  python app.py
+  exit /b %errorlevel%
+)
+
+rem --- relaunch hidden/detached, then let THIS visible window exit -----------
+rem MEASURED 2026-08-09: closing the visible window running `python app.py`
+rem in the foreground killed the hub instantly. Autostart's self-heal task
+rem (see :maybe_autopersist) then revived it -- but only within its own
+rem 5-minute check interval, so closing the window still meant real downtime.
+rem Reuse run-hidden.vbs -- the SAME hidden/detached mechanism the logon
+rem launcher and self-heal already use, already tested -- in its NON-
+rem supervised mode (explicit start: clears the intentional-stop flag,
+rem what someone running this by hand wants, unlike the supervised mode
+rem schtasks itself calls). HUB_DETACHED=1 travels with it through normal
+rem Windows child-process environment inheritance (this run.bat -> wscript
+rem -> cmd -> the relaunched run.bat), so that copy takes the branch above
+rem instead of trying to detach a second time.
+set "HUB_DETACHED=1"
+echo [free-llm-hub] Starting in the background - this window is safe to close now.
+echo                Dashboard: http://127.0.0.1:%PORT%
+start "" wscript.exe "%~dp0run-hidden.vbs"
+rem Give it a moment to actually bind the port before this window vanishes,
+rem so someone watching does not see the dashboard fail to load for a beat
+rem and worry it did not actually start.
+ping -n 3 127.0.0.1 >nul 2>nul
+exit /b 0
 
 
 rem ===========================================================================
