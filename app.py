@@ -14733,7 +14733,21 @@ def _do_update_check():
             _auto_update_state["last_result"] = "pull failed: " + _sanitize(err)[:160]
             return _auto_update_state["last_result"]
         _rc, after, _ = _git("rev-parse", "HEAD")
+        # Run every cycle, not only when before != after: a dependency install
+        # that failed on a PRIOR cycle must keep retrying even once HEAD stops
+        # moving (git pull is a no-op the moment it succeeded once), or a hub
+        # stuck on stale deps would silently stop trying forever. Cheap when
+        # nothing changed -- one hash compare against the stamp file.
+        deps_ok = _sync_deps_after_pull()
         if before and after and before != after:
+            if not deps_ok:
+                _auto_update_state["last_result"] = (
+                    "updated %s->%s — restart deferred: dependency install failed, "
+                    "retrying next check" % (before[:7], after[:7]))
+                _log.warning("Auto-update: pulled %s->%s but dependency install failed; "
+                            "NOT re-executing into a broken environment.",
+                            before[:7], after[:7])
+                return _auto_update_state["last_result"]
             # New commits pulled. Normally we re-exec to apply them — but if the user
             # has deliberately switched the hub OFF as the default (hub-mode off), respect
             # that "leave me stood down" intent and do NOT respawn the process; the update
@@ -14765,6 +14779,47 @@ def _do_update_check():
             return _auto_update_state["last_result"]
         _auto_update_state["last_result"] = "up to date (%s)" % (after[:7] if after else "?")
         return _auto_update_state["last_result"]
+
+
+def _sync_deps_after_pull():
+    """Best-effort `pip install -r requirements.txt`, run ONLY when the pulled
+    tree's hash differs from the last install (same stamp file and hash
+    convention run.bat/run.sh already use for a fast plain start, so a normal
+    pull with no dependency change costs one hash compare, not a pip round
+    trip). Returns True if it is now safe to re-exec (deps match what HEAD
+    needs), False if a required install failed.
+
+    WHY THIS EXISTS: _do_update_check() pulls new code and os.execv's into it,
+    but execv keeps the SAME already-imported interpreter/site-packages --
+    nothing else in this file ever re-ran pip. A commit that adds a new
+    dependency would pull clean, then crash the very next line on import,
+    taking down an auto-updating hub that was working fine before the pull."""
+    try:
+        req_path = os.path.join(_REPO_DIR, "requirements.txt")
+        stamp_path = os.path.join(_REPO_DIR, ".venv", ".deps-stamp")
+        with open(req_path, "rb") as f:
+            h = hashlib.sha256(f.read()).hexdigest()
+        try:
+            with open(stamp_path, "r", encoding="utf-8") as f:
+                current = f.read().strip()
+        except OSError:
+            current = None
+        if current == h:
+            return True
+        _log.info("Auto-update: requirements.txt changed, installing before restarting.")
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", req_path],
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            _log.error("Auto-update: pip install failed, deferring restart: %s",
+                      _sanitize((r.stderr or "")[:300]))
+            return False
+        os.makedirs(os.path.dirname(stamp_path), exist_ok=True)
+        with open(stamp_path, "w", encoding="utf-8") as f:
+            f.write(h)
+        return True
+    except Exception as exc:
+        _log.error("Auto-update: dependency sync failed, deferring restart: %s", exc)
+        return False
 
 
 def _reexec_soon():
