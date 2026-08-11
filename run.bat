@@ -128,8 +128,16 @@ if not errorlevel 1 set "DEPS_OK=1"
 if defined DEPS_OK (
   echo [free-llm-hub] Dependencies already installed - skipping pip.
 ) else (
+  rem MEASURED: `-q` plus a slow/blocked network (corporate proxy, captive
+  rem wifi, VPN) looks IDENTICAL to a genuine hang -- zero output, no way to
+  rem tell "still working" from "stuck". Dropped -q so pip's own progress
+  rem prints; --timeout bounds each connection attempt instead of silently
+  rem trusting pip's default.
   echo [free-llm-hub] Installing dependencies ^(flask, requests^)...
-  pip install -q -r requirements.txt
+  echo                This can take a minute on a slow network - progress prints below.
+  echo                If nothing moves for several minutes, your network is likely
+  echo                blocking it - check a proxy/firewall or try a different network.
+  pip install --timeout 20 -r requirements.txt
   if not errorlevel 1 python -c "import hashlib,os;h=hashlib.sha256(open('requirements.txt','rb').read()).hexdigest();open(os.path.join('.venv','.deps-stamp'),'w').write(h)" >nul 2>nul
 )
 
@@ -243,12 +251,20 @@ rem and handles the download, the hash check and the PATH entry itself.
 where winget >nul 2>nul
 if not errorlevel 1 (
   echo [free-llm-hub] Installing Python via winget...
+  rem MEASURED: winget's first-ever run on a machine can pop an invisible
+  rem source-agreement/UAC prompt even with --silent --accept-*-agreements --
+  rem cmd.exe has no native way to bound how long a child process runs, so a
+  rem stuck prompt used to hang this whole script forever with zero output.
+  rem Start-Process + WaitForExit(ms) gives it a real 2-minute cap; -NoNewWindow
+  rem keeps winget's own progress visible in this console instead of hiding it.
+  rem Past the cap we kill it and fall through to the direct installer below.
   rem One line, deliberately -- see the autostart.bat comment on the same bug:
   rem this file is LF-only on disk, and cmd.exe's `^` continuation formally
   rem needs CRLF, so a caret split here is not reliable.
-  winget install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements >nul 2>nul
+  powershell -NoProfile -Command "$p = $null; try { $p = Start-Process winget -ArgumentList 'install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements' -PassThru -NoNewWindow } catch {}; if (-not $p -or -not $p.WaitForExit(120000)) { if ($p) { try { $p.Kill() } catch {} }; Write-Host '[free-llm-hub] winget did not finish - falling back to the direct installer.'; exit 1 } else { exit $p.ExitCode }"
   call :find_python
   if defined PY exit /b 0
+  echo [free-llm-hub] winget did not produce a working Python - trying the direct installer instead.
 )
 
 rem Fallback: the official installer, per-user and unattended. InstallAllUsers=0
@@ -258,9 +274,16 @@ set "PYARCH=amd64"
 if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "PYARCH=arm64"
 set "PYEXE=%TEMP%\python-%PYVER%-%PYARCH%.exe"
 echo [free-llm-hub] Downloading Python %PYVER% ^(%PYARCH%^)...
+rem MEASURED: Invoke-WebRequest has no timeout by default, so a blocked or
+rem very slow network (proxy, firewall, captive wifi) hung here indefinitely
+rem with nothing on screen. -TimeoutSec bounds it; the catch turns a real
+rem failure into a visible message instead of a silently-missing .exe.
 rem One line, deliberately -- same LF-only/caret-continuation bug as above.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/%PYVER%/python-%PYVER%-%PYARCH%.exe' -OutFile '%PYEXE%' -UseBasicParsing" >nul 2>nul
-if not exist "%PYEXE%" exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/%PYVER%/python-%PYVER%-%PYARCH%.exe' -OutFile '%PYEXE%' -UseBasicParsing -TimeoutSec 60 } catch { Write-Host ('[free-llm-hub] Download failed: ' + $_.Exception.Message); exit 1 }"
+if not exist "%PYEXE%" (
+  echo [free-llm-hub] Could not download Python - check your internet connection/firewall.
+  exit /b 1
+)
 echo [free-llm-hub] Installing Python %PYVER%...
 "%PYEXE%" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_launcher=1 >nul 2>nul
 del /f /q "%PYEXE%" >nul 2>nul
