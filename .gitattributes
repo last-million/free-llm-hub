@@ -1,1 +1,6 @@
 graphify-out/graph.json merge=graphify
+
+# Shebang-sensitive: a CRLF-corrupted #!/usr/bin/env bash fails on real Linux/
+# macOS with "bad interpreter". Force LF regardless of a contributor's local
+# core.autocrlf, instead of relying on everyone's git config being right.
+*.sh text eol=lf
