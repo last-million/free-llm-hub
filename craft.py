@@ -308,9 +308,22 @@ VERIFY_READ = """VERIFY, FIX, STOP (applies to every brief above)
 # broader "if nothing stops you, just do it" would also fire on a genuinely
 # open decision (which real option, anything destructive) where stopping to
 # state it and wait is the CORRECT behavior, not the bug.
+#
+# SECOND bullet added 2026-08-12, user-reported gap (not a captured transcript
+# like the one above, so flagged as such rather than dressed up as OBSERVED
+# LIVE): the first bullet only catches a stop dressed as an ANNOUNCEMENT
+# ("next I'll..."). A session stops just as easily dressed as a REPORT --
+# finish some items, recap them cleanly, end the turn with no announced next
+# step at all, so the first bullet's trigger never has anything to match.
+# Same fix shape, same guard against this file's own "unbounded keep going"
+# failure mode (see VERIFY_RUN's two-retry cap, MAX_BRIEFS above): it only
+# fires when a todo/multi-step list demonstrably has undone items AND nothing
+# written names a blocker -- not a bare "always keep going", which would also
+# fire on a genuinely finished task or a real open decision.
 ACT_RUN = """ACT (applies to every brief above, comes before VERIFY/FIX/STOP)
 - If you already called a tool this turn and your own last sentence names the exact next call you now have everything needed to make, make it -- do not end the turn to announce it. Stating "next I'll..." about something already in reach is a stop dressed as a plan.
-- This does not cover a genuinely open decision (which real option, anything destructive/irreversible, anything you are missing information for) -- state those and wait, same as always."""
+- Todo/multi-step items left, no blocker named? A recap is not the stop -- do the next item.
+- Neither covers a genuinely open decision (which real option, anything destructive/irreversible, anything you are missing information for) -- state those and wait, same as always."""
 
 
 def system_message(text, tools=True):
