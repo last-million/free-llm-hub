@@ -95,6 +95,17 @@ def test_unix_installs_python_with_whatever_package_manager_is_present():
     sh = open(os.path.join(ROOT, "run.sh"), encoding="utf-8", errors="replace").read()
     for mgr in ("apt-get", "dnf", "pacman", "zypper", "apk", "brew"):
         assert mgr in sh, "no install route for %s" % mgr
+
+
+def test_unix_install_steps_cannot_hang_silently_forever():
+    """Same class of bug as run.bat's (2026-08-12): a slow or blocked network
+    made a package-manager install or a quiet `pip install -q` look identical
+    to a frozen terminal, with no way to tell "still working" from "stuck"."""
+    sh = open(os.path.join(ROOT, "run.sh"), encoding="utf-8", errors="replace").read()
+    assert "command -v timeout" in sh, "package-manager installs must be bounded where possible"
+    assert re.search(r"BOUND=.*timeout \d+", sh), "the timeout wrapper needs a real bound"
+    assert "pip install -q" not in sh, "-q hides pip's progress, indistinguishable from a hang"
+    assert re.search(r"pip install .*--timeout \d+", sh), "pip needs a bounded connect timeout"
     assert "python3-venv" in sh, (
         "Debian ships venv separately: python3 exists while `python3 -m venv` fails")
     assert "brew install python" in sh and "$SUDO brew" not in sh, (

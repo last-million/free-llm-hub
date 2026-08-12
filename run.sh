@@ -184,21 +184,31 @@ install_python() {
   if [ "$(id -u)" != "0" ]; then
     command -v sudo >/dev/null 2>&1 && SUDO="sudo"
   fi
+  # MEASURED (run.bat's Windows equivalent, 2026-08-12): a slow or blocked
+  # network makes a package-manager install look IDENTICAL to a hang -- no
+  # output, no way to tell "still working" from "stuck". `timeout` bounds it
+  # where available -- every mainstream Linux distro ships GNU coreutils or
+  # busybox's own timeout; macOS's BSD userland does not, so this degrades to
+  # unbounded there (still correct, just not bounded) rather than failing on
+  # a missing command.
+  BOUND=""
+  command -v timeout >/dev/null 2>&1 && BOUND="timeout 300"
+  echo "[free-llm-hub] Installing Python - this can take a few minutes on a slow network."
   if command -v apt-get >/dev/null 2>&1; then
-    $SUDO apt-get update -qq || true
-    $SUDO apt-get install -y python3 python3-venv python3-pip
+    $SUDO $BOUND apt-get update -qq || true
+    $SUDO $BOUND apt-get install -y python3 python3-venv python3-pip
   elif command -v dnf >/dev/null 2>&1; then
-    $SUDO dnf install -y python3 python3-pip
+    $SUDO $BOUND dnf install -y python3 python3-pip
   elif command -v yum >/dev/null 2>&1; then
-    $SUDO yum install -y python3 python3-pip
+    $SUDO $BOUND yum install -y python3 python3-pip
   elif command -v pacman >/dev/null 2>&1; then
-    $SUDO pacman -Sy --noconfirm python python-pip
+    $SUDO $BOUND pacman -Sy --noconfirm python python-pip
   elif command -v zypper >/dev/null 2>&1; then
-    $SUDO zypper install -y python3 python3-pip
+    $SUDO $BOUND zypper install -y python3 python3-pip
   elif command -v apk >/dev/null 2>&1; then
-    $SUDO apk add --no-cache python3 py3-pip
+    $SUDO $BOUND apk add --no-cache python3 py3-pip
   elif command -v brew >/dev/null 2>&1; then
-    brew install python           # never with sudo: Homebrew refuses outright
+    $BOUND brew install python    # never with sudo: Homebrew refuses outright
   else
     return 1
   fi
@@ -255,7 +265,10 @@ then
   echo "[free-llm-hub] Dependencies already installed - skipping pip."
 else
   echo "[free-llm-hub] Installing dependencies (flask, requests)..."
-  pip install -q -r requirements.txt
+  echo "               This can take a minute on a slow network - progress prints below."
+  echo "               If nothing moves for several minutes, your network is likely"
+  echo "               blocking it - check a proxy/firewall or try a different network."
+  pip install --timeout 20 -r requirements.txt
   python -c "import hashlib;open('$DEPS_STAMP','w').write(hashlib.sha256(open('requirements.txt','rb').read()).hexdigest())" 2>/dev/null || true
 fi
 
