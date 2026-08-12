@@ -7476,15 +7476,31 @@ def _create_desktop_shortcut():
     here = os.path.dirname(os.path.abspath(__file__))
     vbs = os.path.join(here, "run-hidden.vbs")
     lnk = os.path.join(desktop, "Calvoun Free LLM Hub.lnk")
+    icon = os.path.join(here, "static", "calvoun.ico")
+    # IconLocation is a separate CreateShortcut property, never inferred from
+    # TargetPath -- without it, the shortcut just shows wscript.exe's generic
+    # scroll icon, indistinguishable from any other .vbs shortcut on the
+    # desktop. Only set it when the file is actually there (a shallow/partial
+    # checkout missing static/ should still produce A shortcut, just with
+    # Windows' default icon, not none at all).
+    icon_line = ("$sc.IconLocation = '%s,0'; " % icon.replace("'", "''")
+                 if os.path.isfile(icon) else "")
+    # icon_line is inserted via its OWN %s slot (not string-concatenated
+    # in) so it stays inside the single format() call below -- % binds
+    # tighter than +, so a bare `"..." + icon_line + "..." % tuple(...)`
+    # would only format the LAST literal and leave the earlier %s's (lnk/
+    # vbs/here) untouched, raising TypeError on every call.
     ps = ("$ws = New-Object -ComObject WScript.Shell; "
-          "$sc = $ws.CreateShortcut('%s'); "
+          "$sc = $ws.CreateShortcut('{lnk}'); "
           "$sc.TargetPath = 'wscript.exe'; "
-          "$sc.Arguments = '\"%s\"'; "
-          "$sc.WorkingDirectory = '%s'; "
+          "$sc.Arguments = '\"{vbs}\"'; "
+          "$sc.WorkingDirectory = '{here}'; "
           "$sc.WindowStyle = 7; "
+          "{icon_line}"
           "$sc.Description = 'Relaunch the Calvoun Free LLM Hub (hidden, no console window)'; "
-          "$sc.Save()"
-          % tuple(s.replace("'", "''") for s in (lnk, vbs, here)))
+          "$sc.Save()").format(
+              lnk=lnk.replace("'", "''"), vbs=vbs.replace("'", "''"),
+              here=here.replace("'", "''"), icon_line=icon_line)
     try:
         _run_hidden_powershell(ps)
         if os.path.isfile(lnk):
@@ -7497,6 +7513,39 @@ def _create_desktop_shortcut():
         f.write("@echo off\r\nrem Relaunch the Calvoun Free LLM Hub, hidden.\r\n")
         f.write('wscript.exe "%s"\r\n' % vbs)
     return bat
+
+
+_DESKTOP_SHORTCUT_MARKER_NAME = "desktop-shortcut-auto-created"
+
+
+def _maybe_auto_create_desktop_shortcut():
+    """First SUCCESSFUL boot: create the desktop shortcut automatically,
+    same "once, marker only on success" contract as run.bat's own
+    maybe_autopersist -- a user who never finds the Stop-hub modal's
+    shortcut checkbox still gets a one-click way back in, and a transient
+    failure (Desktop dir not ready, PowerShell hiccup) retries on the next
+    boot instead of being silently given up on forever. Windows only --
+    .lnk/.ico/wscript.exe are meaningless on run.sh platforms. Gated on a
+    marker file, not the shortcut's mere existence, so a user who deletes
+    the shortcut on purpose does not get it silently recreated under them."""
+    if os.name != "nt":
+        return
+    marker = os.path.join(config.state_dir(), _DESKTOP_SHORTCUT_MARKER_NAME)
+    if os.path.exists(marker):
+        return
+    try:
+        _create_desktop_shortcut()
+    except Exception as exc:
+        _log.warning("Auto desktop-shortcut creation failed, will retry next boot: %s",
+                     _sanitize(str(exc)))
+        return
+    try:
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("created automatically on first successful boot -- delete this "
+                    "file to let the hub try again, or just create your own shortcut\n")
+    except OSError:
+        pass
 
 
 @app.route("/api/hub/desktop-shortcut", methods=["POST"])
@@ -15277,6 +15326,7 @@ if __name__ == "__main__":
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("could not sweep preview ports: %s", exc)
     workspace.start_reaper()   # stop previews nobody is watching
+    _maybe_auto_create_desktop_shortcut()
     _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()
     server = make_server(HOST, PORT, app, threaded=True)
