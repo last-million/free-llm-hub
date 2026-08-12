@@ -57,10 +57,24 @@ def test_the_moved_scripts_climb_back_to_the_project_root():
 def test_windows_installs_python_when_the_machine_has_none():
     bat = open(os.path.join(ROOT, "run.bat"), encoding="utf-8", errors="replace").read()
     assert ":install_python" in bat, "no install path: a bare machine just gets an error"
-    assert "winget install" in bat, "winget is the cheapest route and ships with Windows"
+    assert "Start-Process winget" in bat, "winget is the cheapest route and ships with Windows"
+    assert "-ArgumentList 'install --id Python.Python" in bat, "winget must be TOLD to install Python"
+    assert "WaitForExit(120000)" in bat, "an unbounded winget call is the exact hang this guards against"
     assert "python.org/ftp/python/" in bat, "no fallback when winget is absent"
     assert "InstallAllUsers=0" in bat, "a per-user install is what keeps this admin-free"
     assert "PrependPath=1" in bat, "installed but not on PATH is the same as not installed"
+
+
+def test_windows_install_steps_cannot_hang_silently_forever():
+    """winget, the direct-download fallback, and pip all had zero timeout and
+    their output piped to nul -- a slow or blocked network (proxy, VPN,
+    captive wifi) looked identical to a frozen window, with no way to tell
+    "still working" from "stuck" (user-reported, 2026-08-12)."""
+    bat = open(os.path.join(ROOT, "run.bat"), encoding="utf-8", errors="replace").read()
+    assert "WaitForExit(120000)" in bat, "winget must give up instead of hanging forever"
+    assert "-TimeoutSec 60" in bat, "the direct python.org download must give up too"
+    assert "pip install -q" not in bat, "-q hides pip's progress, indistinguishable from a hang"
+    assert re.search(r"pip install .*--timeout \d+", bat), "pip needs a bounded connect timeout"
 
 
 def test_windows_looks_past_PATH_after_installing():

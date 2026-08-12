@@ -621,3 +621,18 @@ def test_act_is_folded_into_the_same_cost_and_backreference_checks():
     for _name, _rx, body in craft._BRIEFS:
         assert "ACT (applies to every brief above" not in body
     assert len(craft.ACT_RUN) < 750
+
+
+def test_act_also_catches_a_stop_dressed_as_a_report():
+    """The first bullet only catches a stop dressed as an ANNOUNCEMENT ("next
+    I'll..."). User-reported gap (2026-08-12): a session stops just as easily
+    dressed as a REPORT -- finish some todo items, recap cleanly, end the turn
+    with no announced next step at all, so the first bullet never has
+    anything to match. Second bullet, unconditional for a tool caller same as
+    the first, same shared exception for a genuinely open/blocked decision."""
+    assert "todo" in craft.ACT_RUN.lower()
+    assert "blocker" in craft.ACT_RUN.lower()
+    assert "recap" in craft.ACT_RUN.lower()
+    body = craft.system_message("so continue until it is fully done", tools=True)["content"]
+    assert "ACT (applies to every brief above" in body
+    assert "blocker" in body.lower()
