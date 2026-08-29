@@ -110,15 +110,23 @@ PROVIDERS: Dict[str, dict] = {
         # deliberately precise: bare 'llama' would match llama-prompt-guard,
         # bare 'qwen3' would match enterprise-only qwen3-vl-32b.
         # Groq rotates models aggressively — re-validate this list periodically.
+        # Re-validated 2026-08-29 against live /v1/models (14 ids). The llama-*
+        # and qwen3-32b pins below now match nothing upstream; they are kept as
+        # cheap insurance in case Groq restores them, since an unmatched
+        # substring costs nothing. qwen3.8-27b was the real miss: pinning the
+        # exact point version meant the 3.6 -> 3.8 refresh went invisible.
         "free_filter": "family",
         "free_families": ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama-4-scout",
-                          "gpt-oss", "qwen3-32b", "qwen3.6-27b", "compound", "allam-2-7b"],
+                          "gpt-oss", "qwen3-32b", "qwen3.6-27b", "qwen3.8-27b",
+                          "compound", "allam-2-7b"],
+        # Fallback when live discovery fails — must list models that ACTUALLY
+        # exist, or a network blip hands the router a set of guaranteed 404s.
         "default_free_models": [
-            "llama-3.3-70b-versatile", "openai/gpt-oss-120b",
-            "meta-llama/llama-4-scout-17b-16e-instruct", "openai/gpt-oss-20b",
-            "qwen/qwen3-32b", "llama-3.1-8b-instant",
+            "openai/gpt-oss-120b", "openai/gpt-oss-20b",
+            "qwen/qwen3.8-27b", "qwen/qwen3.6-27b",
+            "groq/compound", "groq/compound-mini", "allam-2-7b",
         ],
-        "notes": "Extremely fast. Free tier, no card. ~1,000 req/day per model (llama-3.1-8b-instant: 14,400/day).",
+        "notes": "Extremely fast. Free tier, no card. ~1,000 req/day per model.",
     },
     "cerebras": {
         "name": "Cerebras",
@@ -1234,20 +1242,26 @@ PROVIDERS: Dict[str, dict] = {
         # Documented credential is the literal string "unused" — app.py's
         # no-key path sends it as `Authorization: Bearer unused`.
         "static_key": "unused",
-        # RE-VERIFIED 2026-07-30: llm7 is NO LONGER a free-only catalog. /models
-        # now lists a PAID 'pro' tier (token-priced, incl. image/video models)
-        # alongside a free anonymous 'turbo' tier — 'all' would leak paid ids
-        # into free routing (pro ids 401 "invalid_api_key" on the anonymous
-        # key, but only AFTER wasting a routed attempt). Pinned to 'family' +
-        # free_exact instead: the 4 live 'turbo' ids, each chat-verified 200
-        # with Bearer unused (gpt-oss:20b, codestral-latest probed directly).
-        "free_filter": "family",
-        "free_exact": True,
-        "free_families": ["codestral-latest", "gemini-3.1-flash-lite",
-                          "gpt-oss:20b", "minimax-m2.7"],
-        "default_free_models": ["codestral-latest", "gemini-3.1-flash-lite",
-                                "gpt-oss:20b", "minimax-m2.7"],
-        "notes": "Free OpenAI-compatible gateway, no signup (the literal string 'unused' is the documented API key). VERIFIED 2026-07-30: the anonymous key now serves ONLY the 4 'turbo' tier ids — the catalog's 'pro' tier is token-priced and 401s anonymously, so this row is pinned to the turbo set (family/exact) to keep paid ids out of free routing. Documented rate: ~20 req/min, 100 req/hour.",
+        # llm7 is NOT a free-only catalog: /models mixes a PAID 'pro' tier
+        # (token-priced, incl. image/video) with the free anonymous 'turbo'
+        # tier, so 'all' would leak paid ids into free routing (pro ids 401
+        # "invalid_api_key", but only AFTER wasting a routed attempt).
+        #
+        # RE-VERIFIED 2026-08-29: the hand-pinned free_exact list this row used
+        # to carry had rotted in under a month — 'gpt-oss:20b' was renamed to
+        # 'gpt-oss' (400 model_unavailable) and 'gemini-3.1-flash-lite' moved to
+        # the paid tier (401), while three live free ids were invisible. The
+        # catalog now labels every row with `tier` and `usage_based_only`, so
+        # free-ness is machine-readable: read that instead of re-pinning a list
+        # that will rot again. New turbo models are picked up automatically.
+        "free_filter": "free_tier",
+        "free_tiers": ["turbo"],
+        # Fallback only (used when discovery fails). The 5 turbo ids live on
+        # 2026-08-29; the live filter above supersedes this whenever it works.
+        "default_free_models": ["gpt-oss", "codestral-latest", "minimax-m2.7",
+                                "meta-Llama-3.1-8B-Instruct-Turbo",
+                                "mistral-Nemo-Instruct-2407"],
+        "notes": "Free OpenAI-compatible gateway, no signup (the literal string 'unused' is the documented API key). The catalog's 'pro' tier is token-priced and 401s anonymously; this row filters on the catalog's own `tier` field ('turbo' = free) plus the `usage_based_only` paid flag, so new free models appear automatically and paid ids stay out of free routing. Documented rate: ~20 req/min, 100 req/hour.",
     },
     "api-airforce": {
         "name": "API Airforce",
@@ -1756,7 +1770,7 @@ PROVIDERS: Dict[str, dict] = {
     },
 }
 
-FREE_FILTERS = ("suffix_free", "pricing_zero", "all", "family")
+FREE_FILTERS = ("suffix_free", "pricing_zero", "all", "family", "free_tier")
 
 # --------------------------------------------------------------------------- #
 # SAFETY: block uncensored / abliterated / NSFW / jailbreak models
@@ -1890,6 +1904,15 @@ def is_free_model(provider_id: str, model_id: Optional[str],
         # known_free list to check against, don't claim a free-ness we can't
         # prove (fail closed — the caller falls back to its discovered list).
         return False
+    if free_filter == "free_tier":
+        # The tier label lives in the live catalog, so with no known_free list
+        # there is nothing here to read it from. Fall back to the row's own
+        # hand-verified defaults rather than to False: those ids were confirmed
+        # free by hand, and answering False for them would make a legitimately
+        # pinned default unroutable (is_free_model also guards dashboard pins,
+        # not just discovery). Anything NOT on that list still fails closed, so
+        # a paid 'pro' id can never sneak through on the static path.
+        return low in {str(m).lower() for m in (prov.get("default_free_models") or [])}
     return True  # 'all' -> the whole listed catalog is free
 
 

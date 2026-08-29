@@ -43,6 +43,34 @@ def test_both_hosts_of_the_same_model_get_used():
     assert seen == {"nvidia", "g4f-nvidia"}, seen
 
 
+def test_the_same_model_under_different_namespaces_is_one_identity():
+    """MEASURED 2026-08-29: hosts disagree about the NAMESPACE, not the model.
+    gpt-oss-120b ships as 'openai/gpt-oss-120b' (groq, nvidia), bare
+    'gpt-oss-120b' (cerebras, sambanova) and '@cf/openai/gpt-oss-120b'
+    (cloudflare). Comparing the whole string made those three unrelated models,
+    so none of the spreading in this file ever fired across them."""
+    ident = app._normalize_model_identity
+    assert ident("openai/gpt-oss-120b") == ident("gpt-oss-120b")
+    assert ident("@cf/openai/gpt-oss-120b") == ident("gpt-oss-120b")
+    assert ident("nvidia/nemotron-3-ultra-550b-a55b:free") == \
+        ident("nvidia/nemotron-3-ultra-550b-a55b")
+    # Genuinely different models must still compare different.
+    assert ident("openai/gpt-oss-120b") != ident("openai/gpt-oss-20b")
+    assert ident("google/gemma-4-31b-it") != ident("google/gemma-4-26b-it")
+
+
+def test_hosts_that_spell_a_model_differently_still_share_the_load():
+    """The bug this fixes: tencent/hy3 took 80 requests on openrouter (a 50/day
+    cap it blew straight past) while an identical copy sat on kilocode."""
+    pool = _pool(("groq", "openai/gpt-oss-120b"),
+                 ("cerebras", "gpt-oss-120b"),
+                 ("cloudflare", "@cf/openai/gpt-oss-120b"))
+    with mock.patch.object(app, "_quota_headroom", return_value=1.0):
+        seen = {app._pick_same_model_host(pool, ("groq", "openai/gpt-oss-120b"))[0]
+                for _ in range(300)}
+    assert seen == {"groq", "cerebras", "cloudflare"}, seen
+
+
 def test_the_model_never_changes():
     """Rotation is between HOSTS only — a different model would reintroduce the
     incoherence the pin exists to prevent."""

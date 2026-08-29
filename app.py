@@ -478,6 +478,39 @@ def _zero_priced_ids(payload):
     return out
 
 
+def _free_tier_ids(payload, free_tiers):
+    """Ids a catalog itself stamps with a FREE tier, for 'free_tier' providers.
+
+    Same job as _zero_priced_ids, different signal. Some gateways publish no
+    price at all but DO label every row with the tier it belongs to (llm7:
+    'turbo' = free on the anonymous key, 'pro' = token-priced). Reading that
+    label keeps such a provider genuinely LIVE: a newly launched free model
+    shows up on its own instead of waiting for someone to hand-edit
+    providers.py, which is exactly how llm7's pinned list went stale.
+
+    `usage_based_only` is an independent paid flag — a row can sit in the free
+    tier and still bill per token — so it is excluded whatever its tier says. A
+    row with no tier field is left out: unknown must not read as free."""
+    wanted = {str(t).lower() for t in (free_tiers or ())}
+    if not wanted:
+        return []
+    out = []
+    for item in (payload.get("data") or payload.get("models") or []) \
+            if isinstance(payload, dict) else (payload or []):
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id") or item.get("name") or item.get("model")
+        if not isinstance(mid, str) or not mid:
+            continue
+        tier = item.get("tier")
+        if not isinstance(tier, str) or tier.lower() not in wanted:
+            continue
+        if item.get("usage_based_only"):
+            continue
+        out.append(mid)
+    return out
+
+
 def _parse_model_ids(payload):
     """Accept OpenAI ({'data':[{'id':..}]}) and common variants."""
     items = []
@@ -544,8 +577,11 @@ def provider_free_models(pid, live=True):
                 # in the payload we are already holding; hand it that list, or it
                 # fails closed on every id and stays frozen on its static list.
                 known_free = None
-                if (prov.get_provider(pid) or {}).get("free_filter") == "pricing_zero":
+                if p.get("free_filter") == "pricing_zero":
                     known_free = _zero_priced_ids(resp.json())
+                # Same idea for a catalog that labels tiers instead of prices.
+                elif p.get("free_filter") == "free_tier":
+                    known_free = _free_tier_ids(resp.json(), p.get("free_tiers"))
                 # filter_models drops blocked (uncensored) AND non-chat ids
                 # (whisper/tts/embed/guard) — per the providers.py contract.
                 live_free = prov.filter_models(
@@ -5538,12 +5574,22 @@ _MODEL_ID_SUFFIX_RE = re.compile(r"(?::free|:beta|:extended|:nitro|:floor|:onlin
 
 
 def _normalize_model_identity(model_id):
-    """Strip provider-added suffixes (openrouter's ':free', ':beta', etc.) and
-    lowercase, so the SAME underlying model hosted by two different providers
-    compares equal — e.g. nvidia's 'nvidia/nemotron-3-ultra-550b-a55b' and
-    openrouter's 'nvidia/nemotron-3-ultra-550b-a55b:free' are recognized as
-    one model, not two unrelated ones."""
-    return _MODEL_ID_SUFFIX_RE.sub("", (model_id or "").strip().lower())
+    """Strip provider-added suffixes (openrouter's ':free', ':beta', etc.) AND
+    the vendor namespace, then lowercase, so the SAME underlying model hosted by
+    two different providers compares equal — e.g. nvidia's
+    'nvidia/nemotron-3-ultra-550b-a55b' and openrouter's
+    'nvidia/nemotron-3-ultra-550b-a55b:free' are one model, not two.
+
+    MEASURED 2026-08-29: suffix-stripping alone was not enough, because hosts
+    disagree about the NAMESPACE as well as the suffix. gpt-oss-120b ships as
+    'openai/gpt-oss-120b' (groq, nvidia), bare 'gpt-oss-120b' (cerebras,
+    sambanova) and '@cf/openai/gpt-oss-120b' (cloudflare) — three spellings of
+    identical weights, which compared as three unrelated models, so none of the
+    same-identity machinery below (penalty sharing, same-host alternation) ever
+    fired across them. Keeping only the leaf fixes that: hosts rename the
+    namespace, never the model itself."""
+    base = _MODEL_ID_SUFFIX_RE.sub("", (model_id or "").strip().lower())
+    return base.rsplit("/", 1)[-1]
 
 
 def _model_identity_min_penalty(pool):
