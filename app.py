@@ -64,6 +64,7 @@ import quick_history
 import config
 import image_history
 import craft
+import perfstats
 import providers as prov
 import quota
 import workspace
@@ -1828,7 +1829,41 @@ _OUTCOME_CAP = 40               # cap each counter; halving on overflow keeps th
                                 # RATIO but lets a fixed provider climb back out
 _OUTCOME_WEIGHT = 9.0           # max points an all-failure record can cost
 _outcomes = {}                  # (pid, model) -> {"ok": int, "fail": int, "last": float}
+_latencies = {}                 # (pid, model) -> {"ms": float, "n": int, "last": float}
 _outcome_lock = threading.Lock()
+
+
+def _load_perf_stats():
+    """Seed the learned dicts from disk at startup.
+
+    Both dicts used to be born empty on every boot, and this hub reboots on
+    every auto-update (5h) plus every machine restart -- so a signal designed
+    to accumulate over a week of real traffic never got past a few hours, and
+    ranking leaned on the hand-typed capability table almost exclusively.
+    Nothing else changes: an empty or unreadable file leaves both dicts empty,
+    which is the exact state this code has always started in."""
+    try:
+        outcomes, latency = perfstats.load()
+        with _outcome_lock:
+            _outcomes.update(outcomes)
+            _latencies.update(latency)
+        if outcomes or latency:
+            _log.info("[perf] restored %d outcome and %d latency records",
+                      len(outcomes), len(latency))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _save_perf_stats(force=False):
+    """Persist both learned dicts. perfstats.save throttles internally, so this
+    is cheap enough to call from the request path."""
+    try:
+        with _outcome_lock:
+            outcomes = {k: dict(v) for k, v in _outcomes.items()}
+            latency = {k: dict(v) for k, v in _latencies.items()}
+        perfstats.save(outcomes, latency, force=force)
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def _record_outcome(pid, model, ok):
@@ -1852,6 +1887,69 @@ def _record_outcome(pid, model, ok):
             _outcomes[(pid, model)] = rec
     except Exception:                                            # noqa: BLE001
         pass
+    _save_perf_stats()
+
+
+# Measured latency. Deliberately narrow: only NON-STREAMING hops are timed, so
+# every sample means the same thing (full answer produced). Timing a streaming
+# hop the same way would measure time-to-headers and quietly average two
+# different quantities into one number.
+_LATENCY_ALPHA = 0.3            # EWMA weight on the newest sample
+_LATENCY_FREE_MS = 20000.0      # at or under this, no penalty at all
+_LATENCY_MAX_MS = 90000.0       # at or over this, the full penalty
+_LATENCY_WEIGHT = 6.0           # max points a reliably-slow hop can lose
+_LATENCY_MIN_SAMPLES = 3        # never judge a hop on one unlucky request
+
+
+def _record_latency(pid, model, ms):
+    """One measured end-to-end duration (ms) for a hop that DELIVERED.
+
+    Exponentially weighted so a provider that gets faster (or slower) is
+    reflected within a few requests instead of being anchored to its first
+    ever sample. Failures are not timed: a hop that 429s in 200ms is not
+    'fast', and _reliability already covers not-delivering."""
+    if not (pid and model) or not ms or ms <= 0:
+        return
+    try:
+        now = time.time()
+        with _outcome_lock:
+            rec = _latencies.get((pid, model))
+            if not rec or now - rec.get("last", 0) > _OUTCOME_TTL:
+                rec = {"ms": float(ms), "n": 0, "last": now}
+            else:
+                rec["ms"] = (1 - _LATENCY_ALPHA) * rec["ms"] + _LATENCY_ALPHA * float(ms)
+            rec["n"] = min(rec.get("n", 0) + 1, _OUTCOME_CAP)
+            rec["last"] = now
+            _latencies[(pid, model)] = rec
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _measured_latency_ms(pid, model):
+    """The learned EWMA duration, or None while the evidence is too thin."""
+    with _outcome_lock:
+        rec = _latencies.get((pid, model))
+        if not rec or time.time() - rec.get("last", 0) > _OUTCOME_TTL:
+            return None
+        if rec.get("n", 0) < _LATENCY_MIN_SAMPLES:
+            return None
+        return rec.get("ms")
+
+
+def _latency_penalty(pid, model):
+    """0 for an unknown, thinly-measured or reasonably quick hop; up to
+    _LATENCY_WEIGHT for one measured as consistently slow.
+
+    Penalty-only and neutral-when-unknown, exactly like _reliability_penalty:
+    being fast earns nothing (speed is not quality, and a stronger model is
+    usually worth a wait), while a hop that really does take a minute and a
+    half every time stops outranking a comparable one that answers in five
+    seconds."""
+    ms = _measured_latency_ms(pid, model)
+    if ms is None or ms <= _LATENCY_FREE_MS:
+        return 0.0
+    span = _LATENCY_MAX_MS - _LATENCY_FREE_MS
+    return min(1.0, (ms - _LATENCY_FREE_MS) / span) * _LATENCY_WEIGHT
 
 
 def _reliability(pid, model):
@@ -3677,10 +3775,32 @@ def _puter_generate_image(pcfg, model, prompt, size="1024x1024", steps=4):
 def _dispatch_chat(pid, payload, stream):
     """Single entry point for the chain loops: a local subscription CLI for a
     sub-* hop, the HTTP upstream for everything else. Keeps the loops
-    provider-agnostic and the HTTP path byte-identical to before."""
+    provider-agnostic and the HTTP path byte-identical to before.
+
+    Also the one place every hop passes through, so it is where measured
+    latency is taken (see _record_latency). Only NON-STREAMING hops are timed:
+    for a stream this call returns once headers are in, which would measure
+    time-to-first-byte and average two different quantities into one number.
+    A non-2xx is not timed either -- failing fast is not being fast, and
+    _reliability already covers not delivering."""
     if _is_sub(pid):
         return _subscription_chat(pid, payload)
-    return _upstream_chat(pid, payload, stream)
+    if stream:
+        return _upstream_chat(pid, payload, stream)
+    # perf_counter, not time(): this is a DURATION, so it must be monotonic (an
+    # NTP step or DST jump mid-request must not record a negative or wildly
+    # inflated one) AND high-resolution. time.monotonic() ticks at ~15.6ms on
+    # Windows, which floors any faster hop to exactly 0.0 -- and _record_latency
+    # drops a 0, so those samples would vanish and bias the average slow.
+    started = time.perf_counter()
+    resp = _upstream_chat(pid, payload, stream)
+    try:
+        if resp is not None and getattr(resp, "status_code", None) == 200:
+            _record_latency(pid, (payload or {}).get("model"),
+                            (time.perf_counter() - started) * 1000.0)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return resp
 
 
 
@@ -5708,7 +5828,8 @@ def _agentic_score(entry, sustain_override=None):
     if penalty is None:
         penalty = _sustain_penalty(entry[1])
     return (entry[0] - penalty - _tool_dialect_penalty(entry[2])
-            - _reliability_penalty(entry[1], entry[2]))
+            - _reliability_penalty(entry[1], entry[2])
+            - _latency_penalty(entry[1], entry[2]))
 
 
 def _context_ok(pid, model, est):
@@ -15372,6 +15493,7 @@ if __name__ == "__main__":
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("could not sweep preview ports: %s", exc)
     workspace.start_reaper()   # stop previews nobody is watching
+    _load_perf_stats()         # measured reliability/latency from previous runs
     _maybe_auto_create_desktop_shortcut()
     _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()
@@ -15382,3 +15504,7 @@ if __name__ == "__main__":
     finally:
         _runtime_server[0] = None
         server.server_close()
+        # Flush what this run learned. The throttled saves during the run keep
+        # a crash cheap; this makes a clean stop (or an auto-update re-exec)
+        # lose nothing at all.
+        _save_perf_stats(force=True)
