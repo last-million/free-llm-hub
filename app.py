@@ -4742,6 +4742,10 @@ _CHAIN_RETRY_DELAY = 6.0   # seconds; the free relays meter per MINUTE
 _provider_key_cursor = {}          # pid -> next round-robin start offset
 _key_cursor_lock = threading.Lock()
 
+# Sentinel for "no key pinned" in _upstream_chat. Cannot be None: None is a
+# real, meaningful key value there (a keyless provider sends no auth header).
+_NO_KEY_PIN = object()
+
 
 def _next_key_start(pid, n):
     """Round-robin starting index for provider `pid`, advanced per request so
@@ -5261,13 +5265,17 @@ def _trim_largest_message(messages, tools, target):
         return messages, False
 
 
-def _upstream_chat(pid, payload, stream):
+def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
     """POST {base_url}/chat/completions for provider pid, rotating across the
     provider's api_keys pool. Tries a round-robin start key; on 401/403/429 it
     advances to the next key for the SAME provider. Returns the first non-
     rotatable response (or the last response/exception once keys are exhausted,
     so the caller's provider-level fallback still kicks in). May raise
-    requests.RequestException or RuntimeError. Never logs a key."""
+    requests.RequestException or RuntimeError. Never logs a key.
+
+    `only_key` pins the call to a single key instead of the pool (None means
+    "send no Authorization header"). _NO_KEY_PIN, not None, is the "not pinned"
+    default precisely because None is itself a meaningful key value here."""
     if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
         # (1) AUTO-COMPACT the history to THIS model's context window (per-model
         # memory management — a small-context model gets recent turns only), then
@@ -5324,7 +5332,16 @@ def _upstream_chat(pid, payload, stream):
             "could not resolve the Cloudflare account id from this token — paste your "
             "account-scoped base URL into 'Advanced: custom base URL' on the card")
     keys = pcfg.get("api_keys") or []
-    if not keys:
+    if only_key is not _NO_KEY_PIN:
+        # Pin the pool to ONE key. Used by the per-key Test button: rotation is
+        # exactly what makes "which of my keys is broken?" unanswerable, since a
+        # pool call can silently succeed on key 2 and report the provider green
+        # while key 1 is dead. Everything else in this function (base-URL
+        # resolution, Cloudflare account-id fill, the Puter driver branch,
+        # Perplexity's max_tokens floor, context re-fit) still applies, which is
+        # why the test pins this call instead of hand-rolling its own request.
+        keys = [only_key]
+    elif not keys:
         if _needs_key(pid):
             raise RuntimeError("no api key for provider " + pid)
         # No-key provider (e.g. Pollinations' anonymous tier): run exactly one
@@ -6904,15 +6921,20 @@ def api_test_provider(pid):
     key = pcfg.get("api_key")
     attempted = []  # (model, ok) for every REAL generation this call actually ran
 
-    def _finish(ok, detail, sample_models, cache=True):
+    def _finish(ok, detail, sample_models, cache=True, keys=None):
         """Single exit point for every REAL attempt (everything past the
         precondition checks below). Persists the outcome and folds in any
         newly-discovered or newly-broken free model ids so the dashboard can
         show '🆕 <model>' / '⚠ <model> no longer works' without a separate
         polling mechanism. cache=False is only for preconditions (unknown
         provider, no key at all) that say nothing new about the provider's
-        live state and would just churn tested_at."""
-        payload = {"ok": bool(ok), "detail": detail, "sample_models": sample_models or []}
+        live state and would just churn tested_at.
+
+        `keys` is the PER-KEY breakdown ([{index, masked, ok, detail}]) so a
+        provider holding several keys can show which individual ones work.
+        Absent (or empty) on the paths that never test a specific key."""
+        payload = {"ok": bool(ok), "detail": detail, "sample_models": sample_models or [],
+                   "keys": keys or []}
         if cache:
             try:
                 new_models, stale_models = _record_test_result(
@@ -6998,9 +7020,16 @@ def api_test_provider(pid):
                 [m for m in all_ids if prov.is_free_model(pid, m)])
             models_list_note = "%d free models listed (%d total in catalog)" % (
                 len(sample_models), len(all_ids))
+        elif len(pcfg.get("api_keys") or []) > 1:
+            # MULTI-KEY: this GET only ever used the PRIMARY key, so returning
+            # here declared the whole provider dead on the strength of one key
+            # and never tried the others -- the exact case that makes "which of
+            # my keys is broken?" unanswerable. Fall through to the per-key
+            # generation loop instead; candidates come from the registry pins.
+            models_list_note = "primary key cannot list models (HTTP %d)" % resp.status_code
         else:
-            # Can't even list models -> the key itself is bad. No point spending a
-            # generation attempt to learn the same thing twice.
+            # Single key: can't even list models -> that key is bad. No point
+            # spending a generation attempt to learn the same thing twice.
             return _finish(False, "HTTP %d: %s" % (resp.status_code, _upstream_error_detail(resp)), [])
 
     # ALWAYS verify with a REAL generation — see docstring. Try every registry-
@@ -7042,47 +7071,105 @@ def api_test_provider(pid):
     # 429/503 that a re-click a second later cleared on its own. 402/403/404 are
     # NOT retried: those mean "will never work", not "try again".
     _TRANSIENT = (429, 500, 502, 503, 504)
-    last_reason = None
-    for model in candidates[:5]:  # cap attempts — this call is user-interactive
-        resp = None
-        for attempt in range(2):
-            try:
-                resp = _upstream_chat(pid, {"model": model,
-                                            "messages": [{"role": "user", "content": "hi"}],
-                                            "max_tokens": 16}, stream=False)  # 16 = Perplexity's floor
-            except (requests.RequestException, RuntimeError) as exc:
-                last_reason = _sanitize("%s: %s" % (exc.__class__.__name__, exc))
-                resp = None
+
+    def _probe(key_pin):
+        """Real 1-token generation across the candidate models, optionally
+        PINNED to one key. Returns (ok, model_that_worked, failure_reason)."""
+        reason = None
+        for model in candidates[:5]:  # cap attempts — this call is user-interactive
+            resp = None
+            for attempt in range(2):
+                # Pass only_key ONLY when actually pinning, so the unpinned path
+                # keeps the exact call shape it always had (a test double, or any
+                # other stand-in for _upstream_chat, should not have to know about
+                # a parameter this path never uses).
+                pin = {} if key_pin is _NO_KEY_PIN else {"only_key": key_pin}
+                try:
+                    resp = _upstream_chat(pid, {"model": model,
+                                                "messages": [{"role": "user", "content": "hi"}],
+                                                "max_tokens": 16},  # 16 = Perplexity's floor
+                                          stream=False, **pin)
+                except (requests.RequestException, RuntimeError) as exc:
+                    reason = _sanitize("%s: %s" % (exc.__class__.__name__, exc))
+                    resp = None
+                    break
+                if resp.status_code == 200:
+                    attempted.append((model, True))
+                    return True, model, None
+                if resp.status_code in _TRANSIENT and attempt == 0:
+                    time.sleep(2)
+                    continue
+                reason = "HTTP %d: %s" % (resp.status_code, _upstream_error_detail(resp))
                 break
-            if resp.status_code == 200:
-                attempted.append((model, True))
-                # Don't claim "FREE" when the probe ran on a metered catalog id —
-                # that would be the one thing a user reading this most needs to
-                # be true.
-                return _finish(True,
-                               ("Key OK — verified generation works (1-token chat "
-                                "succeeded on %s). This provider has no free tier, "
-                                "so the probe spent a little of its allowance."
-                                if metered_probe else
-                                "Key OK — verified FREE generation works "
-                                "(1-token chat succeeded on %s).") % model,
-                               (sample_models[:5] or [model]))
-            if resp.status_code in _TRANSIENT and attempt == 0:
-                time.sleep(2)
-                continue
-            last_reason = "HTTP %d: %s" % (resp.status_code, _upstream_error_detail(resp))
-            break
-        attempted.append((model, False))  # this candidate did not pan out — try the next
-    # Every candidate authenticated but none could actually generate — the
-    # spent-wallet case this whole rewrite exists to catch. Plain language, not
-    # a bare HTTP status, so the verdict answers "will this work for free usage".
-    if models_list_note:
-        detail = ("Key authenticates and lists models (%s), but generation FAILS on "
-                  "every candidate tried — this will NOT work for free usage: %s"
-                  % (models_list_note, last_reason))
+            attempted.append((model, False))  # candidate didn't pan out — try the next
+            if resp is not None and resp.status_code == 401:
+                # 401 is about the CREDENTIAL, not the model, so no sibling
+                # model can rescue it -- walking the rest of the candidates just
+                # spends four more requests to be told the same thing. Matters
+                # more now that a pool is tested key-by-key: 3 dead keys x 5
+                # candidates was 15 pointless calls per click.
+                break
+        return False, None, reason
+
+    def _verdict(ok, model, reason):
+        """Same wording the single-key path has always produced."""
+        if ok:
+            # Don't claim "FREE" when the probe ran on a metered catalog id —
+            # that would be the one thing a user reading this most needs to
+            # be true.
+            return (("Key OK — verified generation works (1-token chat "
+                     "succeeded on %s). This provider has no free tier, "
+                     "so the probe spent a little of its allowance."
+                     if metered_probe else
+                     "Key OK — verified FREE generation works "
+                     "(1-token chat succeeded on %s).") % model)
+        # Every candidate authenticated but none could actually generate — the
+        # spent-wallet case this whole rewrite exists to catch. Plain language,
+        # not a bare HTTP status, so the verdict answers "will this work".
+        if models_list_note:
+            return ("Key authenticates and lists models (%s), but generation FAILS on "
+                    "every candidate tried — this will NOT work for free usage: %s"
+                    % (models_list_note, reason))
+        return reason or "generation failed"
+
+    pool = list(pcfg.get("api_keys") or [])
+    # ONE key (or none): leave the pool logic exactly as it was, so a keyless
+    # provider's static_key/no-auth pass is untouched.
+    if len(pool) <= 1:
+        ok, model, reason = _probe(_NO_KEY_PIN)
+        payload_extra = ([{"index": 0, "masked": _mask_key(pool[0]), "ok": ok,
+                           "detail": _verdict(ok, model, reason)}] if pool else [])
+        return _finish(ok, _verdict(ok, model, reason),
+                       (sample_models[:5] or ([model] if model else [])),
+                       keys=payload_extra)
+
+    # SEVERAL keys: test each one SEPARATELY. Without this the pool rotates, so
+    # one good key makes the provider look healthy while a dead one beside it
+    # keeps burning a routing hop on every request -- and nothing in the UI
+    # could tell you which was which.
+    per_key, first_ok_model = [], None
+    for i, k in enumerate(pool):
+        k_ok, k_model, k_reason = _probe(k)
+        per_key.append({"index": i, "masked": _mask_key(k), "ok": k_ok,
+                        "detail": _verdict(k_ok, k_model, k_reason)})
+        if k_ok and first_ok_model is None:
+            first_ok_model = k_model
+    good = [r["index"] + 1 for r in per_key if r["ok"]]
+    bad = [r["index"] + 1 for r in per_key if not r["ok"]]
+    if good and bad:
+        detail = ("%d of %d keys work. Working: #%s. NOT working: #%s — "
+                  "each dead key still costs a wasted attempt when routing "
+                  "rotates onto it, so remove them."
+                  % (len(good), len(pool), ", #".join(map(str, good)),
+                     ", #".join(map(str, bad))))
+    elif good:
+        detail = "All %d keys work." % len(pool)
     else:
-        detail = last_reason or "generation failed"
-    return _finish(False, detail, sample_models[:5])
+        detail = ("None of the %d keys work. %s"
+                  % (len(pool), per_key[0]["detail"] if per_key else ""))
+    return _finish(bool(good), detail,
+                   (sample_models[:5] or ([first_ok_model] if first_ok_model else [])),
+                   keys=per_key)
 
 
 @app.route("/api/test-cache", methods=["GET"])
