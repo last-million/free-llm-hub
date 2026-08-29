@@ -6998,6 +6998,7 @@ def api_test_provider(pid):
     models_url = _models_url_for(pid, pcfg)
     sample_models = []
     models_list_note = None
+    listing_failed = False   # multi-key only: the PRIMARY key could not list
     if models_url and key:  # an anonymous tier has nothing to authenticate the GET with
         try:
             resp = requests.get(models_url, headers={"Authorization": "Bearer " + key},
@@ -7026,7 +7027,9 @@ def api_test_provider(pid):
             # and never tried the others -- the exact case that makes "which of
             # my keys is broken?" unanswerable. Fall through to the per-key
             # generation loop instead; candidates come from the registry pins.
-            models_list_note = "primary key cannot list models (HTTP %d)" % resp.status_code
+            # Deliberately NOT models_list_note: that one reads "key
+            # authenticates and lists models", which would be a flat lie here.
+            listing_failed = True
         else:
             # Single key: can't even list models -> that key is bad. No point
             # spending a generation attempt to learn the same thing twice.
@@ -7130,6 +7133,10 @@ def api_test_provider(pid):
             return ("Key authenticates and lists models (%s), but generation FAILS on "
                     "every candidate tried — this will NOT work for free usage: %s"
                     % (models_list_note, reason))
+        if listing_failed:
+            # Never claim it "authenticates" here: the listing call is exactly
+            # what it failed.
+            return "This key is rejected by the provider: %s" % (reason or "generation failed")
         return reason or "generation failed"
 
     pool = list(pcfg.get("api_keys") or [])
