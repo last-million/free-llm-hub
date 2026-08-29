@@ -972,10 +972,20 @@ PROVIDERS: Dict[str, dict] = {
         "base_url": "https://api.inference.wandb.ai/v1",
         "models_url": "https://api.inference.wandb.ai/v1/models",
         "signup_url": "https://wandb.ai/authorize",
-        "key_hint": "any",
+        "key_hint": "wandb_... (from wandb.ai/authorize)",
+        # 'all' is CORRECT and confirmed live 2026-08-30: /v1/models returns 30
+        # open-weight chat ids and nothing else -- no paid catalog to leak, so
+        # new W&B models are adopted with no edit here.
         "free_filter": "all",
-        "default_free_models": ["meta-llama/Llama-3.3-70B-Instruct", "deepseek-ai/DeepSeek-V3"],
-        "notes": "W&B Inference free credits for open models. OpenAI-compatible.",
+        # Fallback only. Re-dated 2026-08-30 against the live catalog: the old
+        # 'deepseek-ai/DeepSeek-V3' pin is GONE upstream (it is V3.1 now), and a
+        # fallback list is used precisely when discovery fails, so a dead pin
+        # there hands the router a guaranteed 404 exactly when it has no better
+        # information. All three below were chat-verified 200 on the free tier.
+        "default_free_models": ["openai/gpt-oss-120b",
+                                "meta-llama/Llama-3.3-70B-Instruct",
+                                "deepseek-ai/DeepSeek-V3.1"],
+        "notes": "W&B Inference free credits for open models (30 in the live catalog: Qwen3.8, Kimi-K2.6, Nemotron-3-Ultra-550B, GLM-5.2, DeepSeek-V4, gpt-oss). OpenAI-compatible, Bearer auth with a wandb_... key. Credits are time-limited and the dollar amount is not published.",
     },
     "ollama-cloud": {
         "name": "Ollama Cloud",
