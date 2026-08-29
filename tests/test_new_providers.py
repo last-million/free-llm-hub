@@ -192,32 +192,60 @@ def test_keyless_gateways_quota_rows():
 # Live re-verification fixes, 2026-07-30 (direct curl probes of each gateway):
 #   uncloseai — 405B flagship gone; catalog is now the single 8B AWQ id.
 #   llm7      — catalog gained a PAID token-priced 'pro' tier (+ image/video);
-#               anonymous key serves ONLY the 4 'turbo' ids (pro 401s), so the
-#               row is family/exact-pinned to keep paid ids out of free routing.
+#               anonymous key serves only the 'turbo' ids (pro 401s). Pinned by
+#               hand at the time; switched 2026-08-29 to reading the catalog's
+#               own tier label instead, after the pins rotted (see below).
 #   g4f-groq / g4f-nvidia — /models 404s on the doubled /v1 path; the working
 #               models_url drops the /v1 (chat keeps base_url + /v1).
 #   kilocode  — anonymous /models discovery IS available; pinned fallback added.
 # --------------------------------------------------------------------------- #
 
-LLM7_TURBO = ("codestral-latest", "gemini-3.1-flash-lite",
-              "gpt-oss:20b", "minimax-m2.7")
+# Re-verified live 2026-08-29. The hand-pinned free_exact list this row used to
+# carry rotted in under a month: 'gpt-oss:20b' was renamed to 'gpt-oss' (400
+# model_unavailable) and 'gemini-3.1-flash-lite' moved to the paid tier (401),
+# while three live free ids sat invisible. llm7's catalog labels every row with
+# `tier` + `usage_based_only`, so the row now filters on those instead of on a
+# list that has to be re-pinned by hand every few weeks.
+LLM7_TURBO = ("gpt-oss", "codestral-latest", "minimax-m2.7",
+              "meta-Llama-3.1-8B-Instruct-Turbo", "mistral-Nemo-Instruct-2407")
 
 
-def test_llm7_is_family_exact_pinned_to_the_free_turbo_tier():
+def test_llm7_reads_the_catalogs_own_free_tier_label():
     p = prov.get_provider("llm7")
-    assert p["free_filter"] == "family"
-    assert p.get("free_exact") is True
-    assert tuple(p["free_families"]) == LLM7_TURBO
+    assert p["free_filter"] == "free_tier"
+    assert tuple(p["free_tiers"]) == ("turbo",)
     assert tuple(p["default_free_models"]) == LLM7_TURBO
+    # Statically (no live catalog in hand) the verified defaults still pass, so
+    # a pinned default stays routable.
     for mid in LLM7_TURBO:
         assert prov.is_free_model("llm7", mid), mid
     # The paid 'pro' catalog (and video/image ids) must NOT qualify as free.
     for paid in ("gpt-5.4-mini", "claude-opus-5", "kimi-k3",
                  "gemini-veo31", "seedance-2.0"):
         assert not prov.is_free_model("llm7", paid), paid
-    # free_exact: a near-miss id that merely CONTAINS a free id fails closed.
-    assert not prov.is_free_model("llm7", "gpt-oss:20b-extended")
+    # Fails closed on a near-miss that merely CONTAINS a free id.
+    assert not prov.is_free_model("llm7", "gpt-oss-extended")
     assert not prov.is_free_model("llm7", "codestral-latestx")
+    # The retired pins must no longer read as free.
+    assert not prov.is_free_model("llm7", "gpt-oss:20b")
+    assert not prov.is_free_model("llm7", "gemini-3.1-flash-lite")
+
+
+def test_llm7_free_tier_filter_reads_tier_and_usage_based_only():
+    """The live path: given a catalog payload, only 'turbo' rows that are not
+    usage_based_only qualify -- that is what keeps llm7 auto-adopting new free
+    models instead of rotting back into a hand-pinned list."""
+    import app
+    payload = {"data": [
+        {"id": "free-a", "tier": "turbo", "usage_based_only": False},
+        {"id": "free-b", "tier": "turbo"},
+        {"id": "paid-tier", "tier": "pro", "usage_based_only": False},
+        {"id": "metered", "tier": "turbo", "usage_based_only": True},
+        {"id": "unlabelled"},
+    ]}
+    assert app._free_tier_ids(payload, ["turbo"]) == ["free-a", "free-b"]
+    # No configured tiers -> nothing claimed free (fail closed).
+    assert app._free_tier_ids(payload, []) == []
 
 
 def test_uncloseai_pinned_default_matches_live_catalog():
