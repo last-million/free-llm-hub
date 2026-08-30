@@ -8404,6 +8404,48 @@ def api_agent_settings_update():
                     "default_cli": agentic_chat.default_cli()})
 
 
+_UNCENSORED_FLAG = "uncensored_only"
+
+
+def _uncensored_payload():
+    """Current mode plus the one number that decides whether it is usable at
+    all: how many models the inverted filter actually leaves to route to.
+    Counted from the SAME discovery the router uses, so the dashboard cannot
+    promise a pool that routing does not have."""
+    on = prov.uncensored_only()
+    pool = []
+    for pid in _enabled_keyed():
+        for m in provider_free_models(pid):
+            pool.append(pid + "/" + m)
+    return {"enabled": on, "available": len(pool), "models": sorted(pool)[:40]}
+
+
+@app.route("/api/uncensored-mode", methods=["GET"])
+def api_uncensored_mode():
+    return jsonify(_uncensored_payload())
+
+
+@app.route("/api/uncensored-mode", methods=["POST"])
+def api_uncensored_mode_update():
+    """Operator-only switch: route to uncensored/abliterated models INSTEAD of
+    the normal catalog (see providers._UNCENSORED_ONLY for why it inverts
+    rather than widens). Off by default, control-token gated like every other
+    /api/* mutation, and never flipped by anything but an explicit call here."""
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return jsonify({"error": "Pass {\"enabled\": bool}."}), 400
+    config.set_flag(_UNCENSORED_FLAG, body["enabled"])
+    prov.set_uncensored_only(body["enabled"])
+    # The discovery cache holds ALREADY-FILTERED lists, so without this the
+    # switch appears to do nothing for up to MODEL_CACHE_TTL seconds and then
+    # takes effect on its own — the worst possible feedback for a safety-
+    # relevant toggle.
+    with _model_cache_lock:
+        _model_cache.clear()
+    _log.warning("[uncensored-mode] set to %s by dashboard request", body["enabled"])
+    return jsonify(_uncensored_payload())
+
+
 @app.route("/api/agent/test-verification", methods=["GET"])
 def api_agent_test_verification():
     """Master, GLOBAL (not per-session) toggle for the test-verification
@@ -15597,6 +15639,11 @@ if __name__ == "__main__":
         _log.warning("could not sweep preview ports: %s", exc)
     workspace.start_reaper()   # stop previews nobody is watching
     _load_perf_stats()         # measured reliability/latency from previous runs
+    # Restore the operator's uncensored setting. providers.py holds it as a live
+    # module flag (no config import there), so it is empty on every boot until
+    # something puts it back — without this the mode would silently revert to
+    # OFF on each of the 5-hourly auto-update restarts.
+    prov.set_uncensored_only(config.get_flag(_UNCENSORED_FLAG, False))
     _maybe_auto_create_desktop_shortcut()
     _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()

@@ -1823,19 +1823,49 @@ _BLOCK_PATTERNS: List[str] = [
 ]
 _BLOCK_RE = re.compile("|".join(_BLOCK_PATTERNS), re.IGNORECASE)
 
+# OPT-IN uncensored mode. OFF by default and never flipped by discovery, an
+# update, or a provider — only by an explicit operator action in the dashboard
+# (see /api/uncensored-mode). Held module-level rather than passed through the
+# ~20 is_model_allowed() call sites, which keeps this file free of a config
+# import and its "pure stdlib" contract intact; app.py sets it from config at
+# boot and on every toggle.
+#
+# ON means ONLY: the filter INVERTS rather than switching off, so the pool
+# becomes the uncensored models alone instead of everything-plus-them. That is
+# a deliberate, visible state — a request either lands on one of those models
+# or fails — rather than a quiet widening where an uncensored fine-tune could
+# start answering ordinary traffic without anyone noticing.
+_UNCENSORED_ONLY = [False]
 
-def is_model_allowed(model_id: Optional[str]) -> bool:
-    """Return False for uncensored/abliterated/NSFW/jailbreak models.
+
+def set_uncensored_only(on: bool) -> None:
+    """Operator toggle. app.py owns persistence; this is just the live flag."""
+    _UNCENSORED_ONLY[0] = bool(on)
+
+
+def uncensored_only() -> bool:
+    return _UNCENSORED_ONLY[0]
+
+
+def is_model_allowed(model_id: Optional[str], uncensored_only_mode=None) -> bool:
+    """Default: False for uncensored/abliterated/NSFW/jailbreak models.
 
     Mainstream models (deepseek, llama, qwen, claude, gpt-*, ...) are never
     affected since none of the block patterns match their ids.
+
+    With uncensored mode ON the test INVERTS — only models matching the block
+    patterns qualify. `uncensored_only_mode` overrides the module flag for a
+    single call (tests, and any caller that must reason about one mode
+    explicitly rather than about whatever is currently switched on).
     """
     if not model_id:
         return False
     mid = str(model_id)
-    if _BLOCK_RE.search(mid):
-        return False  # block wins — never serve an uncensored fine-tune
-    return True
+    hit = bool(_BLOCK_RE.search(mid))
+    only = _UNCENSORED_ONLY[0] if uncensored_only_mode is None else bool(uncensored_only_mode)
+    if only:
+        return hit          # ONLY the uncensored ones
+    return not hit          # block wins — never serve an uncensored fine-tune
 
 
 # Non-chat models (audio / OCR / embeddings / moderation / image) — excluded from
