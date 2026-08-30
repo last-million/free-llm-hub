@@ -5184,7 +5184,10 @@
       var build = /\b(build|create|make|develop|code|implement)\b/.test(s) &&
                   /\b(website|web ?app|app|application|platform|shop|store|marketplace|dashboard|game|saas|blog|portfolio|crm|cms|api)\b/.test(s);
       var parts = (s.match(/\band\b/g) || []).length + (s.match(/,/g) || []).length;
-      return build && parts >= 2 && s.length > 100;
+      /* Mirrors crews.looks_like_full_project — the 100-char floor was
+         removed there (it made this branch nearly dead code); keep the two
+         in step or the gate the user is offered disagrees with the server. */
+      return build && parts >= 2;
     }
 
     /* ---------- persistence ------------------------------------------------

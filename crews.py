@@ -394,7 +394,14 @@ def looks_like_full_project(text):
     if not (_PROJECT_BUILD_RE.search(s) and _PROJECT_ARTEFACT_RE.search(s)):
         return False
     parts = len(_PROJECT_AND_RE.findall(s)) + s.count(",")
-    return parts >= 2 and len(s) > 100
+    # 100 was too high to ever fire on a real request. MEASURED 2026-08-30:
+    # 'build a portfolio website with a blog, a contact form and dark mode'
+    # is a genuine multi-part build and only 66 characters, so the swarm
+    # never saw it -- nor 'create a react dashboard with charts and auth'.
+    # The 60-char floor above is already the 'too short to be a project'
+    # guard; a SECOND, higher floor here just meant the multi-part branch
+    # was nearly dead code. parts >= 2 still carries the real weight.
+    return parts >= 2
 
 
 def run(messages, dispatch, crew_name, on_event=None):
