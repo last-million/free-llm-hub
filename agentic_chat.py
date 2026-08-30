@@ -558,7 +558,7 @@ def _isolated_config_dir(cli_id: str) -> str:
 
 
 def _agentic_env(cli_id: str = None, project_dir: str = None,
-                 quality: str = "normal") -> dict:
+                 quality: str = "normal", session_id: str = None) -> dict:
     """Child env with every hub-pointing override stripped, PWD resynced to
     match the subprocess cwd we are about to give it, and the CLI pointed at
     the hub's OWN config directory.
@@ -602,17 +602,25 @@ def _agentic_env(cli_id: str = None, project_dir: str = None,
             if cli_id == "opencode":
                 _seed_opencode_config(path)
             elif cli_id == "claude":
-                _apply_claude_hub_fallback(env, path, quality)
+                _apply_claude_hub_fallback(env, path, quality, session_id)
             elif cli_id == "codex":
-                _apply_codex_hub_fallback(path)
+                _apply_codex_hub_fallback(path, session_id)
     return env
 
 
-def _hub_base_url() -> str:
-    return "http://127.0.0.1:%d" % _port()
+def _hub_base_url(session_id: str = None) -> str:
+    """The hub's own URL, optionally tagged with the agent session it is for.
+
+    A hub-launched CLI is pointed at <hub>/build/<session_id>. app.py strips
+    that prefix in WSGI before routing, so nothing about the API changes -- it
+    exists purely so the activity view can say a call came from the dashboard's
+    /build page and WHICH project it belongs to. An agent CLI forwards none of
+    its environment, so the URL is the only channel that carries this."""
+    base = "http://127.0.0.1:%d" % _port()
+    return base + "/build/" + session_id if session_id else base
 
 
-def _apply_claude_hub_fallback(env, config_home, quality="normal"):
+def _apply_claude_hub_fallback(env, config_home, quality="normal", session_id=None):
     """No subscription, no problem: an isolated copy that has never been
     signed in runs against THIS HUB'S OWN FREE MODELS instead, same as
     opencode already does -- asked for directly: "/agent CLIs should work
@@ -631,7 +639,7 @@ def _apply_claude_hub_fallback(env, config_home, quality="normal"):
     the stronger option -- takes over on its own."""
     if _isolated_signed_in("claude"):
         return
-    env["ANTHROPIC_BASE_URL"] = _hub_base_url()
+    env["ANTHROPIC_BASE_URL"] = _hub_base_url(session_id)
     env["ANTHROPIC_AUTH_TOKEN"] = config.get_local_api_key() or "free-llm-hub"
     # "best" is `auto` that never drops to the cheap tier (app.py's
     # _is_orchestrate accepts it; _route_by_difficulty lifts `simple` when it
@@ -676,7 +684,7 @@ def _codex_toml_top_and_rest(text):
     return top, rest
 
 
-def _codex_hub_fallback_text(existing):
+def _codex_hub_fallback_text(existing, session_id=None):
     """Point config.toml at the hub, ADDITIVELY: only the model_provider/model
     top keys and a [model_providers.freehub] table are touched. Everything
     else -- notably codex's own [projects.*] trust entries -- passes through
@@ -712,7 +720,7 @@ def _codex_hub_fallback_text(existing):
     # matched on removal, so it needs no separate marker.
     block = ["[model_providers.freehub]",
             'name = "Calvoun Free LLM Hub"',
-            'base_url = "%s/v1"' % _hub_base_url(),
+            'base_url = "%s/v1"' % _hub_base_url(session_id),
             'wire_api = "responses"']
     bearer = config.get_local_api_key()
     if bearer:
@@ -773,7 +781,7 @@ def _write_codex_toml(path, text):
         pass                          # a missing fallback surfaces as a clear auth error later
 
 
-def _apply_codex_hub_fallback(config_home):
+def _apply_codex_hub_fallback(config_home, session_id=None):
     """The file-based counterpart to _apply_claude_hub_fallback: codex reads
     its provider from config.toml, not env vars, so an isolated copy that has
     never been signed in gets a config.toml pointing at this hub -- same free
@@ -794,7 +802,7 @@ def _apply_codex_hub_fallback(config_home):
     # choice already in the file (not ours, not empty) is never overwritten.
     if existing and _CODEX_HUB_MARKER not in existing and _CODEX_MODEL_PROVIDER_RE.search(existing):
         return
-    _write_codex_toml(path, _codex_hub_fallback_text(existing))
+    _write_codex_toml(path, _codex_hub_fallback_text(existing, session_id))
 
 
 def _seed_opencode_config(config_home):
@@ -1739,7 +1747,8 @@ def send_message(session_id, text):
                 proc = subprocess.Popen(
                     argv, cwd=sess.project_dir,
                     env=_agentic_env(sess.cli_id, sess.project_dir,
-                                      getattr(sess, "quality", "normal")),
+                                      getattr(sess, "quality", "normal"),
+                                      getattr(sess, "id", None)),
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, encoding="utf-8", errors="replace",
                     **_tree_popen_kwargs())
@@ -2094,7 +2103,8 @@ def send_message_stream(session_id, text):
             was_resume = bool(sess.native_session_id)
             argv = _build_argv(sess, bin_path, text, stream=True)
             child_env = _agentic_env(sess.cli_id, sess.project_dir,
-                                     getattr(sess, "quality", "normal"))
+                                     getattr(sess, "quality", "normal"),
+                                     getattr(sess, "id", None))
             try:
                 proc = subprocess.Popen(
                     argv, cwd=sess.project_dir, env=child_env,

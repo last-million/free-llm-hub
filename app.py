@@ -6353,6 +6353,34 @@ _INFERENCE_PATHS = {
     "/v1/messages": "anthropic",
     "/v1/images/generations": "images",
 }
+# WHERE A REQUEST CAME FROM. A hub-launched agent session is pointed at
+# <hub>/build/<session_id> (agentic_chat._hub_base_url), so that prefix rides
+# along on every call the CLI makes. The prefix is stripped in WSGI before
+# routing, so every endpoint gets this for free and not one route is
+# duplicated; the session id is left on the environ for the activity row.
+#
+# The path is the only channel available. An agent CLI is an ordinary API
+# client that forwards none of its environment, so nothing else on the request
+# distinguishes a session the dashboard started from one you started yourself
+# in a terminal -- both are just "Codex" with the same User-Agent.
+_BUILD_PREFIX_RE = re.compile(r"^/build/([A-Za-z0-9_-]{1,64})(/.*)$")
+
+
+class _BuildPrefix:
+    """Strip /build/<session_id> and remember it for the request."""
+
+    def __init__(self, wsgi):
+        self._wsgi = wsgi
+
+    def __call__(self, environ, start_response):
+        m = _BUILD_PREFIX_RE.match(environ.get("PATH_INFO") or "")
+        if m:
+            environ["flh.build_session"] = m.group(1)
+            environ["PATH_INFO"] = m.group(2)
+        return self._wsgi(environ, start_response)
+
+
+app.wsgi_app = _BuildPrefix(app.wsgi_app)
 # Map a client's User-Agent to a friendly CLI/tool label (best-effort).
 _UA_CLI = (
     ("codex", "Codex"), ("claude-cli", "Claude Code"), ("claude", "Claude Code"),
@@ -6471,6 +6499,32 @@ def _activity_done(act, status, http=None):
 
 
 @app.before_request
+def _build_sid():
+    """The agent session id this request arrived under, or None."""
+    try:
+        return request.environ.get("flh.build_session")
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _build_project():
+    """Folder name of the project a /build request belongs to, or None.
+
+    The basename, not the full path: the activity row is a narrow column and
+    'project-20260830-024030' identifies it, while
+    'C:/Users/.../calvoun-projects/project-20260830-024030' just pushes every
+    other field off the screen."""
+    sid = _build_sid()
+    if not sid:
+        return None
+    try:
+        sess = agentic_chat.get_session(sid) or {}
+        d = sess.get("project_dir")
+        return os.path.basename(str(d).rstrip("/\\")) if d else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def _activity_before():
     if request.method != "POST":
         return None
@@ -6483,6 +6537,15 @@ def _activity_before():
         _activity_seq[0] += 1
         act = {
             "id": _activity_seq[0], "protocol": proto, "cli": _guess_cli(),
+            # "build"  = a CLI session the dashboard's /build page started
+            # "cli"    = anything else pointed at the hub (your own terminal,
+            #            a script, another tool)
+            # "build" = a session the dashboard's /build page started (and we
+            # know WHICH project, because the session id came in on the path);
+            # "cli"   = anything else pointed at the hub -- your own terminal,
+            # a script, another tool.
+            "source": "build" if _build_sid() else "cli",
+            "project": _build_project(),
             "model_req": model_req if isinstance(model_req, str) else None,
             "provider": None, "model": None, "status": "in_progress",
             "http": None, "stream": False,
@@ -12865,6 +12928,33 @@ def _swarm_tool_turn(body):
         pool, key=lambda r: _benchmark_score(r[0], r[1]))
     _log.info("[swarm-tools] %d/%d models answered, %d used a tool -> %s/%s",
               len(results), len(picks), len(acted), hop_pid, hop_model)
+    # Show the whole race in the activity feed, not just the survivor. The
+    # existing pipeline chips already render (role, model) pairs for the prose
+    # swarm, so reuse them: every model that was asked appears, labelled with
+    # what it did, and the one that was actually served is marked. Without this
+    # a swarm turn looks identical to an ordinary single-model turn -- three
+    # models' worth of quota spent, one model's worth of evidence.
+    try:
+        answered = {(r[0], r[1]) for r in results}
+        acted_set = {(r[0], r[1]) for r in acted}
+        rows = []
+        for p_id, m_id in picks:
+            if (p_id, m_id) == (hop_pid, hop_model):
+                role = "winner"
+            elif (p_id, m_id) in acted_set:
+                role = "used a tool"
+            elif (p_id, m_id) in answered:
+                role = "answered"
+            else:
+                role = "no answer"
+            rows.append({"role": role, "model": p_id + "/" + m_id})
+        act = getattr(g, "act", None)
+        if act is not None:
+            with _activity_lock:
+                act["crew"] = "swarm (parallel)"
+                act["pipeline"] = rows
+    except Exception:                                            # noqa: BLE001
+        pass
     data["model"] = hop_pid + "/" + hop_model
     hdrs = _routing_headers(hop_pid, hop_model, len(picks), None)
     if not body.get("stream"):

@@ -476,6 +476,12 @@
   .agent-quality{font-size:11.5px;padding:4px 8px;border-radius:7px;
                  background:var(--surface-3);color:var(--text);
                  border:1px solid var(--border);flex:none}
+  /* Activity source badge: which surface a request came from. */
+  .af-src{font-size:10px;font-weight:700;letter-spacing:.04em;padding:1px 6px;
+          border-radius:999px;background:var(--surface-3);color:var(--text-faint);
+          border:1px solid var(--border-soft);white-space:nowrap}
+  .af-src.build{background:var(--accent-soft);color:var(--ok-text);
+                border-color:var(--accent-border)}
   .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
   .chip{font-family:var(--mono);font-size:10.5px;background:var(--surface-3);color:var(--text-dim);border-radius:5px;padding:2px 7px}
 
@@ -8786,6 +8792,15 @@
         '<div class="af-row">' +
           '<span class="af-time" title="request started">' + esc(fmtClock(a.started_ms, a.started)) + '</span>' +
           '<span class="af-cli">' + esc(a.cli || 'unknown') + '</span>' +
+          /* Where it came from. Both a dashboard session and your own
+             terminal report the same CLI and the same User-Agent, so the
+             label is the only way to tell them apart -- and for a /build
+             session the project it belongs to is worth more than the
+             session id. */
+          (a.source === 'build'
+            ? '<span class="af-src build" title="Started from the Build page in this dashboard">build'
+              + (a.project ? ' · ' + esc(a.project) : '') + '</span>'
+            : '<span class="af-src" title="An external client pointed at this hub">CLI</span>') +
           '<span class="af-proto">' + esc(protoLabel(a.protocol)) + (a.stream ? ' · stream' : '') + '</span>' +
           '<span class="af-model">' + modelHTML + '</span>' +
           '<span class="af-dur js-af-dur" data-started="' + esc(a.started) + '" data-pending="' + (pending ? '1' : '0') +
