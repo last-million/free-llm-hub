@@ -9191,6 +9191,27 @@ def api_agent_send_message_stream(session_id):
     return Response(stream_with_context(gen()), mimetype="text/event-stream", headers=_SSE_HEADERS)
 
 
+@app.route("/api/agent/sessions/<session_id>/quality", methods=["POST"])
+def api_agent_set_quality(session_id):
+    """Switch a live session between normal and max quality.
+
+    Works mid-conversation because the CLI subprocess is re-spawned per turn,
+    so its ANTHROPIC_MODEL is rebuilt each time. A turn already running keeps
+    the mode it started with -- its child is already launched."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    body = request.get_json(force=True, silent=True)
+    q = body.get("quality") if isinstance(body, dict) else None
+    if q not in ("normal", "max"):
+        return jsonify({"error": "Pass {\"quality\": \"normal\"|\"max\"}."}), 400
+    out = agentic_chat.set_quality(session_id, q)
+    if out is None:
+        return jsonify({"error": "No such agentic session."}), 404
+    _log.info("[agent] session quality -> %s", out)
+    return jsonify({"session_id": session_id, "quality": out})
+
+
 @app.route("/api/agent/sessions/<session_id>/stop", methods=["POST"])
 def api_agent_stop_session(session_id):
     stopped = agentic_chat.stop_session(session_id)

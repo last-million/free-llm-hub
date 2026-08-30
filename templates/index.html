@@ -470,6 +470,12 @@
   .chat-swarm-switch{margin-left:auto;display:flex;align-items:center;gap:6px;flex:none}
   .chat-swarm-switch .lbl{font-size:11.5px;font-weight:600;color:var(--text-dim)}
   .chat-swarm-switch.on .lbl{color:var(--accent)}
+  /* Session model-quality switch. Sits in the session bar because it is a
+     property OF the session, and is changeable mid-conversation: the CLI is
+     re-spawned per turn, so the next turn picks up whatever this says. */
+  .agent-quality{font-size:11.5px;padding:4px 8px;border-radius:7px;
+                 background:var(--surface-3);color:var(--text);
+                 border:1px solid var(--border);flex:none}
   .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
   .chip{font-family:var(--mono);font-size:10.5px;background:var(--surface-3);color:var(--text-dim);border-radius:5px;padding:2px 7px}
 
@@ -2510,6 +2516,10 @@
         <div class="agent-session" id="agent-session" hidden>
           <div class="agent-session-bar">
             <span class="agent-session-info" id="agent-session-info"></span>
+            <select id="agent-quality" class="agent-quality" title="Which models this session routes to. Changing it applies from the NEXT message.">
+              <option value="normal">Normal</option>
+              <option value="max">Max quality</option>
+            </select>
             <button class="btn sm ghost" id="agent-checkpoint" type="button" title="Bookmark this point in the conversation — not a filesystem undo">Bookmark</button>
             <button class="btn sm ghost" id="agent-running" type="button"
                   title="Conversations and previews currently open">Running <span id="agent-running-n">0</span></button>
@@ -7677,6 +7687,30 @@
       loadFullHistory(r.session_id);
     };
 
+    /* Model-quality switch for a LIVE session. Changeable mid-conversation:
+       the CLI subprocess is re-spawned per turn, so its ANTHROPIC_MODEL is
+       rebuilt each time and the NEXT turn obeys whatever this says. A turn
+       already running keeps the mode it started with -- its child is launched. */
+    function initAgentQuality(){
+      var sel = $('#agent-quality');
+      if (!sel) return;
+      sel.addEventListener('change', function(){
+        if (!sessionId){ return; }
+        var want = sel.value;
+        sel.disabled = true;
+        api('/api/agent/sessions/' + encodeURIComponent(sessionId) + '/quality',
+            { method: 'POST', body: { quality: want } })
+          .then(function(r){
+            sel.value = (r && r.quality) || want;
+            toast(sel.value === 'max'
+              ? 'Max quality — from the next message, every turn uses the strongest models'
+              : 'Normal — cheap models allowed for trivial steps again');
+          })
+          .catch(function(e){ toast('Quality: ' + e.message, true); })
+          .then(function(){ sel.disabled = false; });
+      });
+    }
+
     function showSessionState(cli, dir){
       curProjectDir = dir;
       startRow.hidden = true;
@@ -8149,6 +8183,8 @@
            into the child's env at launch), so it must be visible rather than
            something you have to remember answering. */
         if (r.quality === 'max') extra.push('max quality');
+        var qsel = $('#agent-quality');
+        if (qsel && !qsel.disabled && r.quality) qsel.value = r.quality;
         sessionInfo.textContent = cliLabel(r.cli) + ' — ' + (r.project_dir || '') +
                                    (extra.length ? ' · ' + extra.join(' · ') : '');
       }).catch(function(){ /* non-critical — the static label already set at start covers this */ });
@@ -8626,6 +8662,9 @@
     }
 
     startBtn.addEventListener('click', doStart);
+    initAgentQuality();   /* defined at this same indent, i.e. this scope --
+                             calling it from the top level is the exact bug
+                             that took the whole dashboard down earlier. */
     initFolderPicker();
     initRunningPanel();
     endBtn.addEventListener('click', doEnd);
