@@ -147,3 +147,21 @@ def test_first_party_hosts_a_point_apart_still_share():
         seen = {app._pick_same_model_host(pool, ("cerebras", "gpt-oss-120b"))[0]
                 for _ in range(300)}
     assert seen == {"cerebras", "groq", "nvidia"}, seen
+
+
+def test_a_relay_backend_prefix_does_not_hide_a_shared_model():
+    """FOUND 2026-08-30 while building the swarm fan-out. g4f puts its BACKEND
+    in front of the real id -- 'srv_mkom688d...:openai/gpt-oss-120b',
+    'pa:657cce02:auto', 'Nvidia:moonshotai/kimi-k3'. Splitting only on '/' left
+    those as distinct identities, so three g4f listings of ONE model read as
+    three different models: the load sharing never fired across them, the relay
+    discount never saw them as one model, and a best-of fan-out would have
+    bought the same opinion three times."""
+    ident = app._normalize_model_identity
+    assert ident("srv_mkom688d57c76d8a3542:openai/gpt-oss-120b") == ident("gpt-oss-120b")
+    assert ident("Nvidia:moonshotai/kimi-k3") == ident("moonshotai/kimi-k3")
+    assert ident("g4f/srv_x:moonshotai/kimi-k3") == ident("nvidia/moonshotai/kimi-k3")
+    # ...and a plain ':free' suffix is still handled, not mistaken for a prefix.
+    assert ident("z-ai/glm-5.2:free") == ident("z-ai/glm-5.2") == "glm-5.2"
+    # Genuinely different models stay different.
+    assert ident("srv_a:openai/gpt-oss-120b") != ident("srv_a:openai/gpt-oss-20b")

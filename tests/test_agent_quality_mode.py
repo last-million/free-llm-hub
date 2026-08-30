@@ -49,7 +49,8 @@ def test_a_session_records_its_quality():
 
 def test_an_unknown_quality_falls_back_to_normal():
     """An older dashboard, or a hand-rolled API call, must not break."""
-    for bad in ("swarm", "", None, "MAX", 7):
+    # "swarm" moved OUT of this list on 2026-08-30: it is a real mode now.
+    for bad in ("pipeline", "", None, "MAX", 7):
         assert agentic_chat._Session("claude", "/tmp/x", quality=bad).quality == "normal"
 
 

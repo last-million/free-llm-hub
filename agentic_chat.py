@@ -639,7 +639,7 @@ def _apply_claude_hub_fallback(env, config_home, quality="normal"):
     # makes, including the small intermediate ones -- there is no other channel
     # back to the hub, since the CLI subprocess is an ordinary API client and
     # carries no session identity of its own.
-    env["ANTHROPIC_MODEL"] = "best" if quality == "max" else "auto"
+    env["ANTHROPIC_MODEL"] = {"max": "best", "swarm": "swarm"}.get(quality, "auto")
 
 
 # Bare minimum codex needs to treat the hub as a provider -- the same shape
@@ -963,7 +963,7 @@ class _Session:
         # "normal" | "max". Chosen once, when the session starts. "max" launches
         # the CLI with ANTHROPIC_MODEL=best instead of auto, so every turn it
         # sends is routed at the top tier and never drops to the cheap one.
-        self.quality = quality if quality in ("normal", "max") else "normal"
+        self.quality = quality if quality in ("normal", "max", "swarm") else "normal"
 
 
 _REGISTRY: dict[str, _Session] = {}
@@ -2384,7 +2384,7 @@ def set_quality(session_id, quality):
     turn (see the two _agentic_env call sites) -- the child's environment, and
     therefore ANTHROPIC_MODEL, is built fresh each time. The turn already in
     flight keeps the mode it started with; the next one picks this up."""
-    if quality not in ("normal", "max"):
+    if quality not in ("normal", "max", "swarm"):
         return None
     with _REGISTRY_LOCK:
         sess = _REGISTRY.get(session_id)

@@ -5989,6 +5989,16 @@ def _normalize_model_identity(model_id):
     fired across them. Keeping only the leaf fixes that: hosts rename the
     namespace, never the model itself."""
     base = _MODEL_ID_SUFFIX_RE.sub("", (model_id or "").strip().lower())
+    # Relay BACKEND prefixes, which g4f puts in front of the real id:
+    # 'srv_mkom688d...:openai/gpt-oss-120b', 'pa:657cce02:auto',
+    # 'nvidia:moonshotai/kimi-k3'. FOUND 2026-08-30 while testing the swarm
+    # fan-out: without this, three g4f listings of ONE model read as three
+    # different models, so the same opinion was bought three times -- and the
+    # relay discount and same-model load sharing never saw them as one model
+    # either. Everything after the LAST colon is the real id; the ':free'-style
+    # suffixes were already removed above, so no genuine suffix is at risk.
+    if ":" in base:
+        base = base.rsplit(":", 1)[-1]
     return base.rsplit("/", 1)[-1]
 
 
@@ -9025,7 +9035,7 @@ def api_agent_start_session():
     # treated as "normal" rather than rejected: an older dashboard that does not
     # send the field must keep working exactly as it did.
     quality = body.get("quality")
-    quality = quality if quality in ("normal", "max") else "normal"
+    quality = quality if quality in ("normal", "max", "swarm") else "normal"
     try:
         session_id = agentic_chat.start_session(body.get("cli"), body.get("project_dir"),
                                                  create_new=create_new, quality=quality)
@@ -9203,8 +9213,8 @@ def api_agent_set_quality(session_id):
         return gate
     body = request.get_json(force=True, silent=True)
     q = body.get("quality") if isinstance(body, dict) else None
-    if q not in ("normal", "max"):
-        return jsonify({"error": "Pass {\"quality\": \"normal\"|\"max\"}."}), 400
+    if q not in ("normal", "max", "swarm"):
+        return jsonify({"error": "Pass {\"quality\": \"normal\"|\"max\"|\"swarm\"}."}), 400
     out = agentic_chat.set_quality(session_id, q)
     if out is None:
         return jsonify({"error": "No such agentic session."}), 404
@@ -12765,14 +12775,138 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
     return "", None
 
 
+# How many distinct models attempt a tool-carrying swarm turn in parallel.
+# Each one is a full model call, so this multiplies the cost of every turn --
+# 3 is enough for a real best-of, and small enough that a free tier survives a
+# long agent run.
+_SWARM_TOOL_FANOUT = 3
+
+
+def _swarm_tool_turn(body):
+    """Swarm for a TOOL-CALLING turn: run the same request on several strong
+    models AT ONCE and return the best single response.
+
+    The multi-phase pipeline (planner -> workers -> reviewer) cannot serve a CLI
+    agent: it emits finished prose, never tool calls, so a coding agent driven
+    by it would write no files at all. This is the shape of "several models work
+    on it together" that actually survives an agent loop -- every candidate
+    answers the real request with the real tools, so whatever wins is a normal,
+    complete response the CLI can execute.
+
+    Returns a Flask response, or None when nothing usable came back so the
+    caller can fall through to ordinary single-model routing. Never raises.
+    """
+    messages = body.get("messages") or []
+    est = _est_tokens(messages, body.get("tools"))
+    pid, resolved, _d = _route_by_difficulty(messages, body.get("max_tokens"), est,
+                                             require_tools=True,
+                                             force_difficulty="hard")
+    if not pid:
+        return None
+    # Distinct MODELS, not distinct listings: three copies of one model relayed
+    # by one provider is not a second opinion, it is the same opinion three
+    # times at three times the cost.
+    picks, seen = [], set()
+    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_tools=True,
+                                           messages=messages):
+        ident = _normalize_model_identity(hop_model)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        picks.append((hop_pid, hop_model))
+        if len(picks) >= _SWARM_TOOL_FANOUT:
+            break
+    if not picks:
+        return None
+
+    def _run(pair):
+        hop_pid, hop_model = pair
+        payload = dict(body)
+        payload["model"] = hop_model
+        payload["stream"] = False        # fan-out cannot stream; re-emitted below
+        resp, _exc = _dispatch_chat_with_deadline(hop_pid, payload, _SWARM_HOP_DEADLINE)
+        if resp is None:
+            _record_outcome(hop_pid, hop_model, False)
+            return None
+        try:
+            if resp.status_code != 200:
+                _record_outcome(hop_pid, hop_model, False)
+                return None
+            data = resp.json() or {}
+        except (ValueError, AttributeError):
+            return None
+        finally:
+            try:
+                resp.close()
+            except Exception:                                    # noqa: BLE001
+                pass
+        msg = ((data.get("choices") or [{}])[0].get("message") or {})
+        if not (msg.get("tool_calls") or (msg.get("content") or "").strip()):
+            _record_outcome(hop_pid, hop_model, False)
+            return None
+        _record_chat_usage(hop_pid, hop_model, data, est)
+        return (hop_pid, hop_model, data, msg)
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(picks)) as ex:
+        for r in ex.map(_run, picks):
+            if r:
+                results.append(r)
+    if not results:
+        return None
+
+    # WINNER. A turn that needs an action is served by a model that took one:
+    # prefer a response carrying tool_calls, because a model answering in prose
+    # where the others reached for a tool has done strictly less of the job.
+    # Within either group, the better-ranked model wins.
+    acted = [r for r in results if (r[3].get("tool_calls"))]
+    pool = acted or results
+    hop_pid, hop_model, data, _msg = max(
+        pool, key=lambda r: _benchmark_score(r[0], r[1]))
+    _log.info("[swarm-tools] %d/%d models answered, %d used a tool -> %s/%s",
+              len(results), len(picks), len(acted), hop_pid, hop_model)
+    data["model"] = hop_pid + "/" + hop_model
+    hdrs = _routing_headers(hop_pid, hop_model, len(picks), None)
+    if not body.get("stream"):
+        return (jsonify(data), 200, hdrs)
+    # Streaming: the fan-out already finished, so replay the winner as one
+    # synthetic chunk -- tool_calls included, or the CLI would get an empty turn.
+    out_msg = ((data.get("choices") or [{}])[0].get("message") or {})
+
+    def _one_shot():
+        delta = {"role": "assistant"}
+        if out_msg.get("content"):
+            delta["content"] = out_msg["content"]
+        if out_msg.get("tool_calls"):
+            delta["tool_calls"] = out_msg["tool_calls"]
+        base = {"id": data.get("id") or ("chatcmpl-swarm-" + uuid.uuid4().hex),
+                "object": "chat.completion.chunk",
+                "created": data.get("created") or int(time.time()),
+                "model": data["model"]}
+        yield "data: %s\n\n" % json.dumps(
+            dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": None}]))
+        fin = (data.get("choices") or [{}])[0].get("finish_reason") or "stop"
+        yield "data: %s\n\n" % json.dumps(
+            dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": fin}]))
+        yield "data: [DONE]\n\n"
+    return Response(_one_shot(), mimetype="text/event-stream", headers=hdrs)
+
+
 def _swarm_completion(body):
     """Run the swarm (or a crew) and return ONE ordinary chat-completions response."""
     if body.get("tools"):
+        # A tool-carrying turn cannot use the prose pipeline (it emits no tool
+        # calls, so an agent driven by it writes nothing). Run the parallel
+        # best-of-N form of "several models work on it together" instead, which
+        # every CLI can actually execute. Falling through to ordinary routing
+        # when nothing usable comes back is deliberate: a swarm that cannot
+        # answer must not take the turn down with it.
+        out = _swarm_tool_turn(body)
+        if out is not None:
+            return out
         return _openai_error(
-            "The 'swarm'/'crew' models run a multi-phase pipeline and cannot "
-            "serve tool-calling turns — your agent already has its own loop. "
-            "Use 'auto' for tool calls, and 'swarm'/'crew' for creation work.",
-            400)
+            "No model could serve this tool-calling turn right now.", 503,
+            "upstream_error")
     messages = body.get("messages") or []
     if not messages:
         return _openai_error("messages is required.", 400)

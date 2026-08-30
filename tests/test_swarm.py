@@ -10,6 +10,8 @@ import threading
 
 import pytest
 
+from unittest import mock
+
 import app
 import craft
 import swarm
@@ -107,15 +109,41 @@ def test_ordinary_models_never_trigger_the_swarm(mid):
     assert not app._is_swarm_model(mid)
 
 
-def test_tool_calling_turns_are_refused_not_silently_reshaped():
-    """The whole reason this is a model and not a mode: an agent's tool turn
-    must never be multi-passed."""
-    client = app.app.test_client()
-    r = client.post("/v1/chat/completions", json={
-        "model": "swarm", "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}]})
-    assert r.status_code == 400
-    assert "tool" in r.get_json()["error"]["message"].lower()
+def test_a_tool_turn_takes_the_parallel_path_not_the_prose_pipeline():
+    """CHANGED 2026-08-30. A tool turn used to be refused with a 400, because
+    the prose pipeline emits no tool calls and an agent driven by it writes
+    nothing. Refusing was correct but useless -- "swarm" then simply did not
+    work in any CLI.
+
+    A tool turn now goes to _swarm_tool_turn instead: the same request, with the
+    real tools, on several distinct strong models at once, best response wins.
+    The prose pipeline is still never used for a tool turn, which is what this
+    test really exists to guarantee."""
+    called = {}
+
+    def fake_tool_turn(body):
+        called["body"] = body
+        return (app.jsonify({"ok": True}), 200, {})
+
+    def boom(*a, **k):                      # the prose pipeline must NOT run
+        raise AssertionError("a tool turn must never reach swarm.run")
+
+    with mock.patch.object(app, "_swarm_tool_turn", side_effect=fake_tool_turn),             mock.patch.object(app.swarm, "run", side_effect=boom):
+        r = app.app.test_client().post("/v1/chat/completions", json={
+            "model": "swarm", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}]})
+    assert r.status_code == 200
+    assert called["body"]["tools"], "the tools must be passed through, not stripped"
+
+
+def test_a_tool_turn_that_nothing_can_serve_fails_loudly():
+    """Falling through to a single model would silently drop the mode the user
+    chose; answering with prose would leave the agent nothing to execute."""
+    with mock.patch.object(app, "_swarm_tool_turn", return_value=None):
+        r = app.app.test_client().post("/v1/chat/completions", json={
+            "model": "swarm", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}]})
+    assert r.status_code == 503
 
 
 # --------------------------------------------------------------------------- #
