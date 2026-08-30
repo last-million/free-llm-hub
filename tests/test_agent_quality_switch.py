@@ -47,7 +47,8 @@ def test_quality_can_be_changed_on_a_live_session():
 def test_an_invalid_value_changes_nothing():
     sess = _register("max")
     try:
-        for bad in ("swarm", "", None, "MAX", 1):
+        # "swarm" is a real mode now, so it is no longer an invalid value.
+        for bad in ("pipeline", "", None, "MAX", 1):
             assert agentic_chat.set_quality(sess.id, bad) is None
         assert sess.quality == "max", "a rejected value must not clear the mode"
     finally:
@@ -82,8 +83,11 @@ def test_endpoint_round_trips_and_validates():
                    json={"quality": "max"}, headers=_hdrs())
         assert r.status_code == 200 and r.get_json()["quality"] == "max"
         assert sess.quality == "max"
+        # swarm is accepted now; something genuinely unknown still is not.
         assert c.post("/api/agent/sessions/%s/quality" % sess.id,
-                      json={"quality": "swarm"}, headers=_hdrs()).status_code == 400
+                      json={"quality": "swarm"}, headers=_hdrs()).status_code == 200
+        assert c.post("/api/agent/sessions/%s/quality" % sess.id,
+                      json={"quality": "pipeline"}, headers=_hdrs()).status_code == 400
         assert c.post("/api/agent/sessions/nope/quality",
                       json={"quality": "max"}, headers=_hdrs()).status_code == 404
     finally:

@@ -15,6 +15,8 @@ import threading
 
 import pytest
 
+from unittest import mock
+
 import app
 import craft
 import crews
@@ -298,13 +300,26 @@ def test_a_crew_call_without_messages_is_a_400():
     assert r.status_code == 400
 
 
-def test_crew_tool_calling_turns_are_refused():
-    """Same rule as the swarm: an agent's tool turn must never be multi-passed."""
-    client = app.app.test_client()
-    r = client.post("/v1/chat/completions", json={
-        "model": "crew-code",
-        "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "function",
-                   "function": {"name": "x", "parameters": {}}}]})
-    assert r.status_code == 400
-    assert "tool" in r.get_json()["error"]["message"].lower()
+def test_crew_tool_turns_take_the_parallel_path_not_the_crew_pipeline():
+    """CHANGED 2026-08-30, same as the swarm. A crew's multi-phase pipeline
+    emits prose and no tool calls, so it can never drive an agent -- but
+    refusing the turn just meant crew ids did not work in any CLI at all.
+
+    A tool turn now goes to the parallel best-of-N path. What still must never
+    happen is the crew PIPELINE running on a tool turn, which is what this
+    asserts."""
+    def boom(*a, **k):
+        raise AssertionError("a tool turn must never reach crews.run")
+
+    # side_effect, not return_value: jsonify() needs a request context, and
+    # return_value is evaluated eagerly at patch time, outside one.
+    def fake_tool_turn(body):
+        return (app.jsonify({"ok": True}), 200, {})
+
+    with mock.patch.object(app, "_swarm_tool_turn", side_effect=fake_tool_turn),             mock.patch.object(app.crews, "run", side_effect=boom):
+        r = app.app.test_client().post("/v1/chat/completions", json={
+            "model": "crew-code",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function",
+                       "function": {"name": "x", "parameters": {}}}]})
+    assert r.status_code == 200

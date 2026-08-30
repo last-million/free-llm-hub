@@ -2519,6 +2519,7 @@
             <select id="agent-quality" class="agent-quality" title="Which models this session routes to. Changing it applies from the NEXT message.">
               <option value="normal">Normal</option>
               <option value="max">Max quality</option>
+              <option value="swarm">Max (swarm agents)</option>
             </select>
             <button class="btn sm ghost" id="agent-checkpoint" type="button" title="Bookmark this point in the conversation — not a filesystem undo">Bookmark</button>
             <button class="btn sm ghost" id="agent-running" type="button"
@@ -7702,9 +7703,11 @@
             { method: 'POST', body: { quality: want } })
           .then(function(r){
             sel.value = (r && r.quality) || want;
-            toast(sel.value === 'max'
-              ? 'Max quality — from the next message, every turn uses the strongest models'
-              : 'Normal — cheap models allowed for trivial steps again');
+            toast({
+              max: 'Max quality — from the next message, every turn uses the strongest models',
+              swarm: 'Swarm agents — from the next message, several models answer each turn and the best wins (~3x quota)',
+              normal: 'Normal — cheap models allowed for trivial steps again'
+            }[sel.value] || 'Mode updated');
           })
           .catch(function(e){ toast('Quality: ' + e.message, true); })
           .then(function(){ sel.disabled = false; });
@@ -8183,6 +8186,7 @@
            into the child's env at launch), so it must be visible rather than
            something you have to remember answering. */
         if (r.quality === 'max') extra.push('max quality');
+        if (r.quality === 'swarm') extra.push('swarm agents');
         var qsel = $('#agent-quality');
         if (qsel && !qsel.disabled && r.quality) qsel.value = r.quality;
         sessionInfo.textContent = cliLabel(r.cli) + ' — ' + (r.project_dir || '') +
@@ -8223,6 +8227,9 @@
         }
         mk('Max quality', 'Every turn on the strongest models, never the cheap tier. '
                         + 'Uses more of your daily free quota.', 'max', true);
+        mk('Max (swarm agents)', 'Several strong models answer EVERY turn at once and the '
+                               + 'best answer wins. Slowest, and burns roughly 3x the quota.',
+           'swarm', false);
         mk('Normal', 'Strong models for real work, cheap ones for trivial steps. '
                    + 'Stretches your quota further.', 'normal', false);
         box.appendChild(row);
