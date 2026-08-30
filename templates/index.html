@@ -1179,6 +1179,8 @@
   }
   .ah-top{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
   .ah-cli{font-weight:700;font-size:13px}
+  /* Title leads the row; the folder path drops to a supporting line under it. */
+  .ah-title{font-size:13px;font-weight:600;color:var(--text);line-height:1.4;margin-bottom:2px;overflow-wrap:anywhere}
   .ah-dir{font-family:var(--mono);font-size:11.5px;color:var(--text-faint);overflow-wrap:anywhere;word-break:break-all}
   .ah-meta{font-size:11.5px;color:var(--text-faint);margin-left:auto;white-space:nowrap}
   .ah-actions{display:flex;gap:8px;flex-wrap:wrap}
@@ -8312,10 +8314,17 @@
               '<span class="ah-meta">' + (c.turn_count || 0) + ' turn' + (c.turn_count === 1 ? '' : 's') +
                 ' &middot; ' + esc(fmtHistDate(c.last_active_at)) + '</span>' +
             '</div>' +
+            /* The TITLE leads now (taken from the first thing you asked). The
+               folder was the only label before, i.e. 'project-20260830-205446'
+               -- a timestamp, which says when you started and nothing about
+               what it was. The path stays underneath, smaller: it is still how
+               you tell two conversations in different checkouts apart. */
+            '<div class="ah-title">' + esc(c.title || 'New conversation') + '</div>' +
             '<div class="ah-dir">' + esc(c.project_dir || '') + '</div>' +
             '<div class="ah-actions">' +
               '<button type="button" class="btn sm ghost act-view">View</button>' +
               '<button type="button" class="btn sm ghost act-continue">Continue</button>' +
+              '<button type="button" class="btn sm ghost act-rename">Rename</button>' +
               '<button type="button" class="btn sm danger act-delete">Delete</button>' +
             '</div>' +
           '</div>';
@@ -8331,6 +8340,9 @@
             row.querySelector('.act-continue').addEventListener('click', function(){
               if (this.disabled) return; this.disabled = true; continueConversation(conv, this);
             });
+            row.querySelector('.act-rename').addEventListener('click', function(){
+              if (this.disabled) return; renameConversation(conv, this);
+            });
             row.querySelector('.act-delete').addEventListener('click', function(){
               if (this.disabled) return; this.disabled = true; deleteConversation(id, this);
             });
@@ -8345,6 +8357,19 @@
         historyViewer.hidden = false;
         mountTranscript(historyTranscript, conv || {});
       }).catch(function(e){ toast('History: ' + e.message, true); });
+    }
+
+    /* The auto-title is a guess from the first message, so correcting it has
+       to be possible. window.prompt, not an inline editor: this is a rare,
+       one-field edit and a custom editor would be more code than the feature. */
+    function renameConversation(conv, btn){
+      var next = window.prompt('Name this conversation:', conv.title || '');
+      if (next === null) return;                 /* cancelled */
+      btn.disabled = true;
+      api('/api/agent/history/' + encodeURIComponent(conv.session_id) + '/title',
+          { method: 'POST', body: { title: next } })
+        .then(function(r){ conv.title = r.title; toast('Renamed'); loadAgentHistory(); })
+        .catch(function(e){ toast('Rename: ' + e.message, true); btn.disabled = false; });
     }
 
     function deleteConversation(id, btn){
