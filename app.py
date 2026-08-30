@@ -1808,6 +1808,27 @@ _ARTIFACT_RE = re.compile(
     r"platforms?|saas|chat ?bots?|apis?|clones?)\b")
 _ARTIFACT_WEIGHT = 2
 _ARTIFACT_MAX_HITS = 2          # "a store website app" is one job, not three
+# CREATION INTENT. USER DIRECTIVE 2026-08-30: "when it's about website creation
+# or any creation thing, of course he should always use best models, no matter
+# our rules... even motion design creation, or anything that will be created
+# with our hub."
+#
+# The classifier judges SHAPE, not intent, so a creation ask phrased shortly
+# fell to the cheap tier: MEASURED, "Write a python function to reverse a
+# string" classified `simple` and routed 40/40 to deepinfra/Qwen2.5-72B, score
+# 45.9 out of a 358-model pool -- an old weak model writing code while kimi-k3
+# (134.8) sat idle. Building something is exactly when model quality shows, and
+# the cheap tier exists for one-word replies and the hub's own probes, not for
+# work the user will keep.
+#
+# Lifts to `hard` rather than `medium`: medium still applies the fast-only
+# prefilter, which drops several of the strongest sustainable builders.
+_CREATION_VERBS = ("build", "create", "make", "write", "implement",
+                   "design", "generate", "develop", "animate", "compose",
+                   "draft", "produce", "scaffold", "port", "refactor",
+                   "rewrite", "redesign", "rebuild", "code")
+_CREATION_INTENT_RE = re.compile(
+    r"\b(?:" + "|".join(_CREATION_VERBS) + r")\b", re.IGNORECASE)
 _SIMPLE_HINTS = (
     "translate", "summarize", "summarise", "tl;dr", "rephrase", "reword",
     "spell", "grammar", "fix typo", "capitalize", "lowercase", "uppercase",
@@ -4314,6 +4335,13 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     obey "rewrite, don't answer" (a weak one replies to the prompt instead,
     replacing the user's question with an answer)."""
     difficulty = force_difficulty or _classify_difficulty(messages, max_tokens)
+    # CREATION ALWAYS GETS THE BEST MODELS (see _CREATION_INTENT_RE). Skipped
+    # when force_difficulty is set: that caller already knows the tier it needs,
+    # and the hub's own internal probes use it precisely to stay off the strong
+    # providers -- lifting those would drain top-tier quota on housekeeping.
+    if not force_difficulty and difficulty != "hard":
+        if _CREATION_INTENT_RE.search(_latest_user_text(messages) or ""):
+            difficulty = "hard"
     if est is None:
         est = _est_tokens(messages)
     providers = [p for p in _available_providers() if _provider_capable(p, est)]
