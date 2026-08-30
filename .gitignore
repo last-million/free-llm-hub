@@ -46,4 +46,5 @@ hub.start.err.log
 # ad-hoc local debug scratch, not read by any app code
 free_models.txt
 list_keys.py
+.calvoun-brief.md
 .pytest-tmp/
