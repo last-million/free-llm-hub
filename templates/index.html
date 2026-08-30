@@ -482,6 +482,20 @@
           border:1px solid var(--border-soft);white-space:nowrap}
   .af-src.build{background:var(--accent-soft);color:var(--ok-text);
                 border-color:var(--accent-border)}
+  /* Image/video/audio preview: fit the pane, never stretch past it, and
+     show the checker ground so a transparent PNG is readable. */
+  .file-media{display:flex;align-items:center;justify-content:center;
+              padding:14px;min-height:120px}
+  .file-media img{max-width:100%;max-height:70vh;object-fit:contain;
+                  border-radius:8px;
+                  background-image:linear-gradient(45deg,#8883 25%,transparent 25%),
+                                   linear-gradient(-45deg,#8883 25%,transparent 25%),
+                                   linear-gradient(45deg,transparent 75%,#8883 75%),
+                                   linear-gradient(-45deg,transparent 75%,#8883 75%);
+                  background-size:16px 16px;
+                  background-position:0 0,0 8px,8px -8px,-8px 0}
+  .file-media video{max-width:100%;max-height:70vh;border-radius:8px}
+  .file-media audio{width:100%}
   .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
   .chip{font-family:var(--mono);font-size:10.5px;background:var(--surface-3);color:var(--text-dim);border-radius:5px;padding:2px 7px}
 
@@ -7953,10 +7967,64 @@
           .catch(function(err){ treeEl.textContent = (err && err.message) || 'Could not read the project.'; });
       }
 
+      /* Which files are worth SHOWING rather than printing as text. The
+         extension decides here, and the server decides again independently --
+         it will only attach a real media type to something on its own
+         allowlist, so a mismatch degrades to a download, never to markup
+         rendered inside the dashboard's origin. SVG is deliberately absent
+         from both: it is XML that can carry script, and this is same-origin. */
+      var MEDIA_EXT = {
+        img: /\.(png|jpe?g|gif|webp|bmp|ico|avif)$/i,
+        vid: /\.(mp4|webm|mov|m4v|ogv)$/i,
+        aud: /\.(mp3|wav|ogg|m4a|flac)$/i
+      };
+
+      function rawURL(rel){
+        /* The token rides as a query param because an <img src> cannot carry a
+           header; the endpoint accepts either. */
+        return '/api/workspace/raw?project_dir=' + encodeURIComponent(dir) +
+               '&path=' + encodeURIComponent(rel) +
+               '&token=' + encodeURIComponent(HUB_CONTROL_TOKEN || '');
+      }
+
+      function showMedia(rel){
+        var kind = MEDIA_EXT.img.test(rel) ? 'img'
+                 : MEDIA_EXT.vid.test(rel) ? 'vid'
+                 : MEDIA_EXT.aud.test(rel) ? 'aud' : null;
+        if (!kind) return false;
+        codeBody.innerHTML = '';
+        var wrap = document.createElement('div');
+        wrap.className = 'file-media';
+        var el;
+        if (kind === 'img'){
+          el = document.createElement('img');
+          el.alt = rel;
+          el.addEventListener('load', function(){
+            codeMeta.textContent = (codeMeta.textContent ? codeMeta.textContent + ' · ' : '')
+                                 + el.naturalWidth + '×' + el.naturalHeight;
+          });
+        } else {
+          el = document.createElement(kind === 'vid' ? 'video' : 'audio');
+          el.controls = true;
+          el.preload = 'metadata';
+        }
+        el.src = rawURL(rel);
+        el.addEventListener('error', function(){
+          codeBody.textContent = 'Could not display this file.';
+        });
+        wrap.appendChild(el);
+        codeBody.appendChild(wrap);
+        return true;
+      }
+
       function openFile(rel){
         codeName.textContent = rel;
         codeMeta.textContent = '';
         codeBody.textContent = 'Loading…';
+        /* Media is fetched by the element itself, so there is no JSON round
+           trip and no 512 KB text cap in the way -- that cap is why an image
+           previously came back as "Binary file - not shown". */
+        if (showMedia(rel)) return;
         api('/api/workspace/file?project_dir=' + encodeURIComponent(dir) +
             '&path=' + encodeURIComponent(rel))
           .then(function(r){
