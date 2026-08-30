@@ -32,9 +32,22 @@ def _capture(messages):
 
 
 def test_the_opening_turn_is_asked_to_plan():
+    """MOVED 2026-08-31. The swarm used to inject the plan itself, which is
+    exactly why it existed in swarm mode ALONE while Normal and Max got none
+    ("i dont see the todolists and phases in work"). It now ships from
+    craft.system_message() for every tool-carrying opening turn, and a swarm
+    tool turn reaches that same injector like any other -- so the assertion
+    moves to where the block is now produced. See test_plan_in_every_mode.py."""
+    body = craft.system_message("build me a landing page", tools=True)["content"]
+    assert "PLAN FIRST" in body
+
+
+def test_the_swarm_no_longer_adds_its_own_copy():
+    """It goes through the shared injector, so a second copy would be pure
+    duplication in the mode that pays for its context three times over."""
     out = _capture([{"role": "user", "content": "build me a landing page"}])
     joined = " ".join((m.get("content") or "") for m in out if m.get("role") == "system")
-    assert "PLAN FIRST" in joined
+    assert "PLAN FIRST" not in joined
 
 
 def test_the_plan_asks_for_phases_dependencies_and_parallelism():
