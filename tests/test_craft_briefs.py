@@ -93,7 +93,9 @@ def test_briefs_stay_small():
     pointer, with an explicit warning not to copy its data-*/class="clip"
     composition markup into a live page -- that markup is real and would
     silently no-op without HyperFrames' own JS runtime present."""
-    budget = {"web_design": 4750}
+    # web_design carries the most rules of any brief and grew again on
+    # 2026-08-31 for the component-set and design-skill lines.
+    budget = {"web_design": 5250}
     for name, _rx, body in craft._BRIEFS:
         limit = budget.get(name, 1400)
         assert len(body) < limit, "%s brief is too long (%d chars)" % (name, len(body))
@@ -129,6 +131,28 @@ def test_worst_case_brief_cost():
     # produced "I don't have the image_gen tool available". Most models here run
     # 200K-1M; 32K is the floor. A simple coding question still pays nothing,
     # which is the property that actually keeps this honest.
+    # 0.115 -> 0.125 on 2026-08-31, deliberately and once, for the two things
+    # asked for in the same message: "i dont see the todolists and phases in
+    # work ... inside cli's and also in our frontend /build", and "use skills
+    # web desing 0 sLOP ... he can even use free available componenents".
+    #   PLAN FIRST   (craft.PLAN_PHASES) existed but had a single call site
+    #                inside the swarm, so Normal and Max -- what most sessions
+    #                run -- got no planning instruction at all.
+    #   components   nothing told the agent that free accessible component sets
+    #                exist, or that an installed design skill is worth a look.
+    # Funded FIRST by rewriting: PLAN ~40% shorter, the motion bullet and both
+    # new lines tightened twice. What is left is the ceiling moving for two
+    # features that were each asked for twice -- and it is one move covering
+    # both, not a slice per feature, which is how this would turn into creep.
+    #
+    # Note what the 32K denominator actually is: the SMALLEST window in the
+    # whole pool. These briefs only ever fire together on a big creation
+    # request, which routes at `hard` difficulty to the top of the ranking --
+    # models with 128K to 1M. A 32K model never sees the heavy bundle, so the
+    # real worst case in production is a low single-digit percentage. The
+    # denominator stays conservative on purpose; it is a creep alarm, not a
+    # capacity model.
+    #
     # 0.11 -> 0.115 on 2026-08-08, deliberately and once, to fund THE LOOP
     # (craft.VERIFY_RUN / VERIFY_READ, ~470 chars = ~117 tokens on the heaviest
     # request only). It was funded first by deleting a redundant IMAGES line
@@ -136,7 +160,7 @@ def test_worst_case_brief_cost():
     # degrading the wording further. This is the ceiling moving for a feature,
     # not creep: the heaviest request now pays 11.02% of the smallest window we
     # route to, and a simple coding question still pays nothing.
-    assert worst / 4 < 32768 * 0.115, "briefs cost ~%d tokens" % (worst // 4)
+    assert worst / 4 < 32768 * 0.125, "briefs cost ~%d tokens" % (worst // 4)
 
 
 # --------------------------------------------------------------------------- #

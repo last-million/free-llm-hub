@@ -13233,13 +13233,12 @@ def _swarm_tool_result(body):
                 or any(isinstance(m, dict)
                        and (m.get("role") == "tool" or m.get("tool_calls"))
                        for m in messages))
-    if not mid_loop and config.get_flag("swarm_plan_phases", True):
-        i = 0
-        while i < len(messages) and isinstance(messages[i], dict)                 and messages[i].get("role") == "system":
-            i += 1
-        messages = messages[:i] + [craft.plan_message()] + messages[i:]
-        body = dict(body)
-        body["messages"] = messages
+    # The phased plan used to be injected HERE, and only here -- which meant it
+    # existed in swarm mode alone while Normal and Max got none. It now ships
+    # from craft.system_message() for every tool-carrying opening turn, and a
+    # swarm tool turn goes through that same injector (it carries `tools` and
+    # never sets _no_craft), so adding it again here would just buy a second
+    # copy in the one mode that pays for its context three times over.
     est = _est_tokens(messages, body.get("tools"))
     pid, resolved, _d = _route_by_difficulty(messages, body.get("max_tokens"), est,
                                              require_tools=True,

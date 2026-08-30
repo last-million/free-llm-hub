@@ -39,10 +39,12 @@ WEB_DESIGN = """WEB DESIGN BRIEF (apply unless the user says otherwise)
 - Type: one family, 3-4 sizes max, headline 1.1-1.2 line-height, body 1.5-1.65, measure 60-75 chars. Real hierarchy comes from size+weight+space, not colour.
 - Space: one scale (4/8px). Section rhythm beats decoration. Whitespace is the design.
 - Colour: one accent, one neutral ramp, semantic tokens. Never convey meaning by colour alone.
-- Motion everywhere, but not the SAME motion everywhere. Every section and every button should feel alive: hover/active/focus states on all controls, and an entrance for each section. Vary it — a section that slides, one that staggers its children, one that reveals on scroll, one with parallax — because one identical fade-and-rise on all of them is itself an AI tell. 150-300ms for state changes, up to 500ms for a section entrance, ease-out (cubic-bezier(0.16,1,0.3,1)), exit faster than entrance. Transform/opacity only (they run on the compositor; animating layout properties janks). Honour prefers-reduced-motion, and CONTENT MUST BE VISIBLE BY DEFAULT — JS enhances an entrance, it never gates whether the content exists, or a script error leaves a blank page. An installed GSAP/animation skill (hyperframes-animation, gsap) is a technique reference for eases/stagger/timelines/3D — never copy its data-*/class="clip" composition markup into a live page, that is for its own video renderer.
+- Motion everywhere, but not the SAME motion everywhere: hover/active/focus on every control, an entrance for every section, VARIED — slide, stagger, reveal on scroll, parallax — one identical fade-and-rise everywhere is itself an AI tell. 150-300ms for state changes, up to 500ms for an entrance, ease-out (cubic-bezier(0.16,1,0.3,1)), exit faster than entrance. Transform/opacity only (compositor; layout properties jank). Honour prefers-reduced-motion, and CONTENT MUST BE VISIBLE BY DEFAULT — JS enhances an entrance, it never gates whether the content exists. An installed animation skill (hyperframes-animation, gsap) is a technique reference for eases/stagger/timelines/3D — never copy its data-*/class="clip" markup into a live page, that is for its video renderer.
 - Hero motion when the brief wants impact — pick ONE, never both:
   * VIDEO: a genuinely licence-free clip (Pexels/Pixabay/Coverr; check the clip's own licence and name the source). Cut 4-6s, seamless loop, under ~2MB: <video autoplay muted loop playsinline poster="still.webp">. Overlay to hold text contrast; fall back to the poster on prefers-reduced-motion and narrow screens.
   * 3D/CANVAS: a real generative scene in JS. One canvas, devicePixelRatio capped at 2, paused when hidden or scrolled out (IntersectionObserver), static fallback without WebGL, and it must never block first paint.
+- Do not hand-roll what a free component set already solves. If the stack suits it, take the widgets with a keyboard contract — modal/dialog, combobox, tabs, date picker, menu — from shadcn/ui, Radix, Headless UI, DaisyUI or Flowbite, name which, and check its licence like a video clip: a hand-built modal is where the focus trap, aria and Esc key quietly go missing. A static one-pager needs none of this.
+- Look for an installed design skill first (ui-ux-pro-max and the like): a searchable engine of patterns, palettes and type pairings for this product type beats inventing a look from nothing.
 - Responsive: mobile-first, no horizontal scroll, tap targets >=44px, images with width/height so nothing shifts.
 - Space above a heading must exceed the space below it — a heading binds to what follows.
 - Elevation once: border OR shadow, never both. Shadows have an offset and a soft blur; a zero-offset coloured halo is decoration, not depth.
@@ -327,25 +329,24 @@ ACT_RUN = """ACT (applies to every brief above, comes before VERIFY/FIX/STOP)
 - Neither covers a genuinely open decision (which real option, anything destructive/irreversible, anything you are missing information for) -- state those and wait, same as always."""
 
 
-PLAN_PHASES = """PLAN FIRST (swarm mode is on)
-Before touching anything, write the todo list you will actually work from:
-- Phases, each producing a CONCRETE artefact, each with an observable "done when".
-- Mark for every phase what it NEEDS the output of. A phase that needs nothing
-  from another can run at the SAME TIME as it; say which ones those are and do
-  them together. Only a phase that genuinely cannot start without another's
-  output waits for it -- serialising work that could overlap wastes the team.
-- Then execute it, keeping the list updated as each phase lands. Do not stop
-  between phases to report; the list IS the report."""
+PLAN_PHASES = """PLAN FIRST (applies to every brief above)
+Before touching anything, write the todo list you will work from:
+- Phases, each with a CONCRETE artefact and an observable "done when".
+- Say what each phase NEEDS from another. Phases that need nothing from each other run at the SAME TIME -- name those and do them together; only a real dependency waits for it.
+- Then execute it, updating the list as each phase lands. Do not stop between phases to report; the list IS the report."""
 
 
 def plan_message():
-    """The phased-plan instruction, for swarm mode.
+    """The phased-plan instruction as a standalone system message.
 
     The prose pipeline plans this way already (swarm._waves runs independent
-    phases concurrently), but a CLI in swarm mode drives its OWN loop, so the
-    planning has to be asked for rather than imposed. Opening turn only: it is
-    about how to START, and re-sending it mid-task would invite replanning work
-    already done."""
+    phases concurrently), but a CLI drives its OWN loop, so the planning has to
+    be asked for rather than imposed. Opening turn only: it is about how to
+    START, and re-sending it mid-task would invite replanning work already done.
+
+    NOTE: system_message() already includes PLAN_PHASES for any tool-carrying
+    opening turn, which is how every protocol gets it. This helper is kept for
+    callers that want the block on its own."""
     return {"role": "system", "content": PLAN_PHASES}
 
 
@@ -387,11 +388,18 @@ def system_message(text, tools=True):
     above", so it stands alone with no domain brief present. VERIFY_READ does
     reference ANTI lines, so the tools=False path stays gated on a real hit."""
     hits = match(text)
+    # PLAN -> ACT -> VERIFY, in that reading order: plan the work, do the work,
+    # check the work. PLAN ships for any TOOL-CARRYING opening turn, in every
+    # quality mode -- it used to have a single call site inside the swarm, so
+    # Normal and Max (what most sessions run) got no planning instruction at
+    # all, which is the reported "i dont see the todolists and phases in work".
+    # Tool-less chat is excluded on purpose: a plan is a thing you EXECUTE.
     if not hits:
-        return {"role": "system", "content": "\n\n".join([ACT_RUN, VERIFY_RUN])} if tools else None
+        return {"role": "system",
+                "content": "\n\n".join([PLAN_PHASES, ACT_RUN, VERIFY_RUN])} if tools else None
     # The loop goes LAST: it says "every brief above" and "every ANTI line
     # above", and both references dangle if it is prepended.
-    tail = [ACT_RUN, VERIFY_RUN] if tools else [VERIFY_READ]
+    tail = [PLAN_PHASES, ACT_RUN, VERIFY_RUN] if tools else [VERIFY_READ]
     body = "\n\n".join([b for _n, b in hits] + tail)
     return {"role": "system", "content": body}
 
