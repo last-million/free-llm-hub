@@ -941,6 +941,64 @@ def _normalize_aa_slug(text):
     return _AA_SLUG_PUNCT_RE.sub("", t)
 
 
+_OPENROUTER_CATALOG_URL = "https://openrouter.ai/api/v1/models"
+
+
+def _fetch_aa_scores_keyless():
+    """Artificial Analysis's Intelligence Index WITHOUT an AA API key.
+
+    OpenRouter's public catalog carries AA's own numbers per model under
+    benchmarks.artificial_analysis, and that endpoint needs no key, no account
+    and no card. VERIFIED 2026-08-30: HTTP 200 unauthenticated, 396 models, 151
+    of them AA-scored, newest scored entry created four days earlier -- so this
+    is the same data the paid API sells, at the same freshness.
+
+    Returns {normalized_slug: raw_aa_index}, i.e. the SAME shape the keyed path
+    builds, so it feeds the existing _calibrate_aa_scores() fit and needs no
+    separate scale. {} on any failure -- fail-open, exactly like the keyed path:
+    callers fall back to the static tier table.
+
+    Coverage is partial and that is fine. Measured against the live routable
+    pool: 103 of 357 entries (29%). The models it does cover are the mainstream
+    ones that dominate routing; the private provider aliases it cannot know
+    (morph-kimik3, llama-3.3-70b-versatile) keep their static tier score. Real
+    measurement where it exists, an honest guess elsewhere."""
+    raw = {}
+    try:
+        resp = requests.get(_OPENROUTER_CATALOG_URL,
+                            timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
+        if resp.status_code != 200:
+            _log.warning("[aa] keyless catalog HTTP %d", resp.status_code)
+            return {}
+        for row in (resp.json().get("data") or []):
+            if not isinstance(row, dict):
+                continue
+            bench = row.get("benchmarks")
+            aa = (bench or {}).get("artificial_analysis") if isinstance(bench, dict) else None
+            idx = (aa or {}).get("intelligence_index") if isinstance(aa, dict) else None
+            if idx is None:
+                continue
+            # `id` FIRST, not canonical_slug: the canonical form carries a
+            # release DATE ('moonshotai/kimi-k3-20260715' -> 'kimik320260715')
+            # which can never match a hub id, so keying on it silently matched
+            # almost nothing -- kimi-k3, qwen3.8 and glm-5.2 all missed until
+            # this was fixed. Both forms are registered anyway: the extra key
+            # costs nothing and catches a provider that does carry the date.
+            for slug in (row.get("id"), row.get("canonical_slug")):
+                if not slug:
+                    continue
+                norm = _normalize_aa_slug(slug)
+                if norm:
+                    raw[norm] = max(raw.get(norm, 0.0), float(idx))
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        _log.debug("[aa] keyless fetch failed", exc_info=True)
+        return {}
+    if raw:
+        _log.info("[aa] %d model scores from OpenRouter's public catalog (no key)",
+                  len(raw))
+    return raw
+
+
 def _fetch_aa_scores():
     """One full paginated fetch of Artificial Analysis's LLM Intelligence Index,
     calibrated onto the hub's existing ~0-110 scoring scale. Returns
@@ -950,7 +1008,14 @@ def _fetch_aa_scores():
     succeeded)."""
     key = config.get_aa_api_key()
     if not key:
-        return {}
+        # NO KEY IS NO LONGER THE END. OpenRouter's public catalog embeds the
+        # very same Artificial Analysis numbers, keyless -- so the 6-hourly
+        # refresh below now does real work on an install that has never had an
+        # AA key, which until 2026-08-30 was every install: aa_scores.json had
+        # never been written here and 100% of ranking came from a hand-typed
+        # table nobody re-dates.
+        raw = _fetch_aa_scores_keyless()
+        return _calibrate_aa_scores(raw) if raw else {}
     raw = {}   # normalized_slug -> aa_intelligence_index
     page = 1
     try:
