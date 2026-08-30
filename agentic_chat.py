@@ -668,6 +668,43 @@ def _apply_claude_hub_fallback(env, config_home, quality="normal", session_id=No
 # model_provider (someone, or an earlier real login, deliberately chose a
 # provider)? Only that is left alone.
 _CODEX_HUB_MARKER = "# free-llm-hub: isolated fallback -- removed automatically once signed in"
+
+# What the hub tells codex about its own capacity.
+#
+# REPORTED 2026-08-30, printed on every hub-backed codex turn:
+#   "Model metadata for `swarm` not found. Defaulting to fallback metadata;
+#    this can degrade performance and cause issues."
+# Codex looks the model up in a built-in metadata table to learn the context
+# window and max output. The hub's ids ("auto", "best", "swarm") are ROUTING
+# VERBS, not real model names, so that lookup misses every time and codex falls
+# back to a built-in default -- i.e. it guesses how much context it may use.
+# Pre-existing rather than new: the same warning appeared for "auto" long
+# before the quality modes existed (captured in test_codex_agentic.py's live
+# fixture back in July).
+#
+# 128000 is the same context size the hub already states to other CLIs (see the
+# Kimi Code setup text in app.py) -- one assumption, written down once. Both
+# are marker-tagged like every other line the hub adds, so a later real sign-in
+# strips exactly these and never caps a genuine subscription.
+#
+# VERIFIED against the config reference and the installed binary, not guessed:
+# model_context_window and model_auto_compact_token_limit are documented keys;
+# `model_max_output_tokens` is NOT one (it was tried here first and removed --
+# an unrecognised key is also what --strict-config exists to reject).
+#
+# The WARNING LINE ITSELF is deliberately left alone. Silencing it needs
+# model_catalog_json, an undocumented internal schema: a probe against
+# codex 0.146.0 got a catalog accepted only after it named `slug`,
+# `display_name`, `context_window`, `max_output_tokens`,
+# `auto_compact_token_limit`, `supported_reasoning_levels`, `shell_type`, and
+# more still behind those (`visibility`, `service_tiers`, `availability_nux`,
+# ...). Codex REFUSES TO START when that file misses a field it wants, so
+# writing it would hand every user a codex that breaks the next time OpenAI
+# adds one. A cosmetic warning is the cheaper of the two.
+_CODEX_CONTEXT_WINDOW = 128000
+# When codex compacts history. It defaults this off the context window, so a
+# guessed window means a badly-timed compaction too; stated at 75% of ours.
+_CODEX_COMPACT_LIMIT = 96000
 _CODEX_TOP_TABLE_RE = re.compile(r"^\s*\[")
 _CODEX_MODEL_PROVIDER_RE = re.compile(r"^\s*model_provider\s*=", re.M)
 
@@ -693,17 +730,48 @@ def _codex_hub_fallback_text(existing, session_id=None):
     remove EXACTLY these lines and nothing codex or the user wrote."""
     top, rest = _codex_toml_top_and_rest(existing)
 
-    def _set_top_key(name, value):
+    def _set_top_key(name, value, quote=True, keep_existing=False):
+        """Write one marker-tagged top-level key.
+
+        `keep_existing` leaves a value the USER set alone. Found by this file's
+        own test: without it, a user's own `model_context_window = 999999` was
+        overwritten by ours and then DELETED outright by the revert path, since
+        revert strips marker-tagged lines and by then the only such line was
+        the one we had written over theirs. Used for the capacity hints, where
+        the user's number is as good as ours; deliberately NOT used for
+        model/model_provider, whose existing overwrite behaviour is what points
+        an unsigned-in copy at the hub in the first place."""
         pat = re.compile(r"^\s*%s\s*=" % re.escape(name))
-        line = '%s = "%s"  %s' % (name, value, _CODEX_HUB_MARKER)
+        rendered = '"%s"' % value if quote else str(value)
+        line = '%s = %s  %s' % (name, rendered, _CODEX_HUB_MARKER)
         for i, ln in enumerate(top):
             if pat.match(ln):
+                if keep_existing and _CODEX_HUB_MARKER not in ln:
+                    return                      # the user's own value; leave it
                 top[i] = line
                 return
         top.insert(0, line)
 
+    # Drop any top key WE wrote in an older version and no longer write. The
+    # marker means "the hub owns this line", so the hub has to clean up after
+    # itself when its own set of keys changes -- otherwise a key that turned
+    # out to be wrong (this happened: `model_max_output_tokens`, which is not a
+    # real codex key at all) sits in the user's config forever, and the very
+    # flag meant to catch that, --strict-config, rejects the whole file over it.
+    _ours = ("model_provider", "model", "model_context_window",
+             "model_auto_compact_token_limit")
+    top[:] = [ln for ln in top
+              if _CODEX_HUB_MARKER not in ln
+              or ln.split("=", 1)[0].strip() in _ours]
+
     _set_top_key("model_provider", "freehub")
     _set_top_key("model", "auto")
+    # Unquoted: TOML would read a quoted value as a string, and codex wants an
+    # integer here.
+    _set_top_key("model_context_window", _CODEX_CONTEXT_WINDOW,
+                 quote=False, keep_existing=True)
+    _set_top_key("model_auto_compact_token_limit", _CODEX_COMPACT_LIMIT,
+                 quote=False, keep_existing=True)
 
     cleaned, skip = [], False
     for ln in rest:
