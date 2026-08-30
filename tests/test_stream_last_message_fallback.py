@@ -260,7 +260,7 @@ def test_send_message_stream_recovers_from_disk_when_stdout_has_nothing_at_all(
     _write_transcript(fake_claude_config_dir, "disk-only-thread",
                       ["Write permission isn't granted yet. Should I proceed?"])
     monkeypatch.setattr(ac, "_agentic_env",
-                        lambda cli_id, project_dir=None, quality="normal": {"CLAUDE_CONFIG_DIR": fake_claude_config_dir})
+                        lambda cli_id, project_dir=None, quality="normal", session_id=None: {"CLAUDE_CONFIG_DIR": fake_claude_config_dir})
     lines = ['{"type":"system","session_id":"disk-only-thread"}\n']
     monkeypatch.setattr(ac.subprocess, "Popen", lambda argv, **kw: _DiesAfterTextProc(lines))
 
@@ -281,7 +281,7 @@ def test_send_message_stream_disk_recovery_is_claude_only(registered_session, mo
     sid, sess = registered_session(cli_id="codex", native_session_id=None)
     _write_transcript(fake_claude_config_dir, "codex-thread", ["should never be read"])
     monkeypatch.setattr(ac, "_agentic_env",
-                        lambda cli_id, project_dir=None, quality="normal": {"CLAUDE_CONFIG_DIR": fake_claude_config_dir})
+                        lambda cli_id, project_dir=None, quality="normal", session_id=None: {"CLAUDE_CONFIG_DIR": fake_claude_config_dir})
     lines = ['{"type":"thread.started","thread_id":"codex-thread"}\n']
     monkeypatch.setattr(ac.subprocess, "Popen", lambda argv, **kw: _DiesAfterTextProc(lines))
 

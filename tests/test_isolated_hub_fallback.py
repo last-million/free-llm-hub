@@ -86,7 +86,7 @@ def test_codex_activates_even_though_its_own_config_already_exists(cfg_home, mon
     fallback silently never activated after the very first codex invocation
     on the machine."""
     monkeypatch.setattr(ac, "_isolated_signed_in", lambda cli: False)
-    monkeypatch.setattr(ac, "_hub_base_url", lambda: "http://127.0.0.1:8787")
+    monkeypatch.setattr(ac, "_hub_base_url", lambda session_id=None: "http://127.0.0.1:8787")
     monkeypatch.setattr(ac.config, "get_local_api_key", lambda: None)
     path = os.path.join(cfg_home, "config.toml")
     open(path, "w").write(_REAL_CODEX_BOOKKEEPING)
@@ -117,7 +117,7 @@ def test_codex_fallback_is_idempotent(cfg_home, monkeypatch):
     application must not accumulate duplicate lines. Measured: it did, once,
     before the marker placement was fixed."""
     monkeypatch.setattr(ac, "_isolated_signed_in", lambda cli: False)
-    monkeypatch.setattr(ac, "_hub_base_url", lambda: "http://127.0.0.1:8787")
+    monkeypatch.setattr(ac, "_hub_base_url", lambda session_id=None: "http://127.0.0.1:8787")
     path = os.path.join(cfg_home, "config.toml")
     open(path, "w").write(_REAL_CODEX_BOOKKEEPING)
 
@@ -134,7 +134,7 @@ def test_codex_fallback_reverts_cleanly_once_signed_in(cfg_home, monkeypatch):
     """A real sign-in must take over -- and codex's own bookkeeping must
     survive the revert, not just the initial apply."""
     monkeypatch.setattr(ac, "_isolated_signed_in", lambda cli: False)
-    monkeypatch.setattr(ac, "_hub_base_url", lambda: "http://127.0.0.1:8787")
+    monkeypatch.setattr(ac, "_hub_base_url", lambda session_id=None: "http://127.0.0.1:8787")
     path = os.path.join(cfg_home, "config.toml")
     open(path, "w").write(_REAL_CODEX_BOOKKEEPING)
     ac._apply_codex_hub_fallback(cfg_home)
@@ -160,7 +160,7 @@ def test_reverting_when_we_never_applied_anything_is_a_no_op(cfg_home, monkeypat
 
 def test_bearer_token_is_embedded_when_the_hub_has_a_local_key(cfg_home, monkeypatch):
     monkeypatch.setattr(ac, "_isolated_signed_in", lambda cli: False)
-    monkeypatch.setattr(ac, "_hub_base_url", lambda: "http://127.0.0.1:8787")
+    monkeypatch.setattr(ac, "_hub_base_url", lambda session_id=None: "http://127.0.0.1:8787")
     monkeypatch.setattr(ac.config, "get_local_api_key", lambda: "shh-secret")
     ac._apply_codex_hub_fallback(cfg_home)
     text = open(os.path.join(cfg_home, "config.toml"), encoding="utf-8").read()
@@ -169,7 +169,7 @@ def test_bearer_token_is_embedded_when_the_hub_has_a_local_key(cfg_home, monkeyp
 
 def test_no_bearer_token_written_when_the_hub_is_open(cfg_home, monkeypatch):
     monkeypatch.setattr(ac, "_isolated_signed_in", lambda cli: False)
-    monkeypatch.setattr(ac, "_hub_base_url", lambda: "http://127.0.0.1:8787")
+    monkeypatch.setattr(ac, "_hub_base_url", lambda session_id=None: "http://127.0.0.1:8787")
     monkeypatch.setattr(ac.config, "get_local_api_key", lambda: None)
     ac._apply_codex_hub_fallback(cfg_home)
     text = open(os.path.join(cfg_home, "config.toml"), encoding="utf-8").read()
@@ -179,7 +179,7 @@ def test_no_bearer_token_written_when_the_hub_is_open(cfg_home, monkeypatch):
 def test_a_brand_new_empty_config_home_still_works(cfg_home, monkeypatch):
     """No config.toml at all yet (a truly fresh isolated install)."""
     monkeypatch.setattr(ac, "_isolated_signed_in", lambda cli: False)
-    monkeypatch.setattr(ac, "_hub_base_url", lambda: "http://127.0.0.1:8787")
+    monkeypatch.setattr(ac, "_hub_base_url", lambda session_id=None: "http://127.0.0.1:8787")
     ac._apply_codex_hub_fallback(cfg_home)
     text = open(os.path.join(cfg_home, "config.toml"), encoding="utf-8").read()
     assert 'model_provider = "freehub"' in text
@@ -192,7 +192,7 @@ def test_a_brand_new_empty_config_home_still_works(cfg_home, monkeypatch):
 def test_agentic_env_applies_the_claude_fallback(monkeypatch):
     monkeypatch.setattr(ac, "_isolated_bin", lambda cli: "/hub/copy/" + cli)
     monkeypatch.setattr(ac, "_isolated_signed_in", lambda cli: False)
-    monkeypatch.setattr(ac, "_hub_base_url", lambda: "http://127.0.0.1:8787")
+    monkeypatch.setattr(ac, "_hub_base_url", lambda session_id=None: "http://127.0.0.1:8787")
     env = ac._agentic_env("claude", project_dir="/some/project")
     assert env.get("ANTHROPIC_BASE_URL") == "http://127.0.0.1:8787"
 
@@ -201,7 +201,7 @@ def test_agentic_env_applies_the_codex_fallback(monkeypatch, cfg_home):
     monkeypatch.setattr(ac, "_isolated_bin", lambda cli: "/hub/copy/" + cli)
     monkeypatch.setattr(ac, "_isolated_config_dir", lambda cli: cfg_home)
     monkeypatch.setattr(ac, "_isolated_signed_in", lambda cli: False)
-    monkeypatch.setattr(ac, "_hub_base_url", lambda: "http://127.0.0.1:8787")
+    monkeypatch.setattr(ac, "_hub_base_url", lambda session_id=None: "http://127.0.0.1:8787")
     ac._agentic_env("codex", project_dir="/some/project")
     text = open(os.path.join(cfg_home, "config.toml"), encoding="utf-8").read()
     assert "freehub" in text
