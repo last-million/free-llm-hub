@@ -1579,16 +1579,30 @@ PROVIDERS: Dict[str, dict] = {
         "base_url": "https://api.together.xyz/v1",
         "models_url": "https://api.together.xyz/v1/models",
         "signup_url": "https://api.together.xyz/settings/api-keys",
-        "key_hint": "tgp_...",
+        "key_hint": "tgp_... (requires a funded account — see notes)",
+        # NO LONGER FREE, confirmed 2026-08-30 on a real account. Together now
+        # puts a new account in READ-ONLY mode until it takes a deposit — its
+        # own dashboard says "You're currently in read-only mode. Make an
+        # initial deposit to unlock full access." A key issued in that state is
+        # created fine but rejected on EVERY authenticated endpoint (/v1/models,
+        # /v1/completions, /v1/chat/completions, /v1/fine-tunes all 401 "Invalid
+        # API key provided"), which reads exactly like a mistyped key and cost a
+        # long debugging detour. Two freshly-generated keys, 20 minutes old,
+        # behaved identically.
+        #
+        # paid + empty default_free_models is the puter precedent: a populated
+        # free list is returned as "free models" REGARDLESS of free_filter and
+        # would put a deposit-gated provider back into free auto-rotation, where
+        # every pick is a wasted hop. It stays in the registry (not deleted) so
+        # anyone who does fund an account can still pin '<pid>/<model>'
+        # explicitly, and so this finding is not lost the next time someone
+        # wonders why Together is missing.
+        "paid": True,
         "free_filter": "family",
         "free_exact": False,
         "free_families": ["-free"],
-        "default_free_models": [
-            "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
-            "meta-llama/Llama-Vision-Free",
-            "deepseek-ai/DeepSeek-R1-Distill-Llama-70B-Free",
-        ],
-        "notes": "Free tier on the '-Free'/'-Turbo-Free' slugs (no card to start). Shared with OpenRouter/NVIDIA/sambanova on llama-3.3-70b and deepseek-r1 so the hub load-balances. Paid: the non-Free slugs and Qwen3-235B/Llama-4-Maverick (only reachable via an explicit '<pid>/<model>' pin).",
+        "default_free_models": [],
+        "notes": "NOT free as of 2026-08-30: a new account is held in read-only mode until you make an initial deposit, and keys issued before that 401 on every endpoint with a misleading 'Invalid API key provided'. Kept out of free routing entirely. The '-Free'/'-Turbo-Free' slugs still exist and become reachable via an explicit '<pid>/<model>' pin once the account is funded.",
     },
     "hyperbolic": {
         "name": "Hyperbolic",
