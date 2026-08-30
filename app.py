@@ -801,6 +801,13 @@ _PREF_FLOORS = (134.5, 134.8, 136, 135, 0,    138,   136,    134,   135,   134, 
 # 3.6 (108-109) and below mimo-2.5 (100), so the ceiling sits just under mimo.
 _KIMI_K2_CEILING = 98
 
+# Providers that RELAY someone else's models rather than hosting their own, so a
+# model id there is a claim, not a guarantee. Subtracted after the preference
+# floors (see the end of _benchmark_score) — a bias added earlier would be wiped
+# by max(score, floor), which is exactly why g4f's relayed 'claude-sonnet-4'
+# inherited claude's full 138 and owned the top slot.
+_RELAY_DISCOUNT = {"g4f": 4.0}
+
 # REVISED 2026-07-31 (2nd pass, user correction):
 #   "kimi k3 is the best one AFTER gpt models from 5 up and claude models"
 #     -> k3 moves from 140 (above everything) to 134.8: under every gpt-5.x
@@ -834,6 +841,11 @@ _CLAUDE_FAMILY_RE = re.compile(r"(?:^|[/:._-])claude[-.]?(?:opus|sonnet|haiku|fa
 _GPT_VER_RE = re.compile(r"\bgpt-(\d+)(?:\.(\d+))?")
 # GLM 5.x (Zhipu) — glm-5, glm-5.2, zhipu/glm-5.2, THUDM/glm-5. Not glm-4.x.
 _GLM5_RE = re.compile(r"glm-?5(?:\.\d+)?\b")
+# The LATEST qwen line only: qwen3.5 and up (3.5, 3.6, 3.8, 3.9...). Captures the
+# minor so a newer release outranks an older one instead of tying with it.
+# qwen3 / qwen2.5 deliberately do NOT match — the preference was about the
+# latest qwen, and floating the whole family would lift the small old ones too.
+_QWEN_LATEST_RE = re.compile(r"qwen-?3\.([5-9])\b")
 # DeepSeek V4 (and later) — deepseek-v4, deepseek-v4-flash, deepseek/deepseek-v4,
 # and morph's 'dsv4flash' once _canon_model_id has expanded it. V3 and R1 keep
 # their measured Tier A/S scores; only the v4+ generation gets the floor.
@@ -1246,6 +1258,21 @@ def _benchmark_score(pid, model_id):
     # above minimax-m3's "almost like deepseek 4" floor.
     if _DSV4_RE.search(low):
         score = max(score, _PREF_FLOORS[9] - (0.5 if "pro" in low else 0))
+    # USER PREFERENCE, stated as "latest kimi / qwen / deepseek" being the top
+    # picks together — but only kimi, glm and deepseek ever got a floor, so qwen
+    # was left on its natural score. MEASURED 2026-08-30: qwen3.8-27b scored
+    # 110.9 against glm-5.2's 134.0, i.e. 24 points below the peers it was named
+    # beside, and it never won a slot. Worse, qwen3.8 and qwen3.6 scored
+    # IDENTICALLY (110.9 each) — nothing in the table knew 3.8 was newer, so
+    # every future release would flatline the same way.
+    #
+    # Floored level with glm-5.x/deepseek-v4 and scaled by the minor version so a
+    # newer qwen always beats an older one (3.5 -> 134.05, 3.6 -> 134.06,
+    # 3.8 -> 134.08). Deliberately 3.5+: qwen3 and 2.5 stay on their natural
+    # scores, since the preference was about the LATEST qwen.
+    _qm = _QWEN_LATEST_RE.search(low)
+    if _qm:
+        score = max(score, _PREF_FLOORS[7] + min(int(_qm.group(1)), 9) * 0.01)
     if _MINIMAX3_RE.search(low):
         score = max(score, _PREF_FLOORS[10])
     # USER PREFERENCE 2026-08-01: "gemini flash or pro 3.1, 3.5, 3.6 and up are
@@ -1326,6 +1353,23 @@ def _benchmark_score(pid, model_id):
     if capped:
         score = min(score, 30)
     score -= _shared_budget_penalty(pid, low)
+    # RELAY DISCOUNT, applied LAST so it survives the preference floors above
+    # (those use max(score, floor), so a bias added earlier would be erased).
+    #
+    # MEASURED 2026-08-30: 15 of the top 20 eligible models were g4f entries,
+    # and the whole top 8 was. g4f is a pool of community-donated relays that
+    # advertise ids like 'srv_msjkstt...:claude-sonnet-4' — the NAME earns
+    # claude's 138 floor, but nothing verifies the relay serves the model it
+    # claims, and a live smoke test put the pool at 110 ok / 112 fail. So the
+    # least reliable provider owned every top slot while first-party hosts of
+    # genuinely strong models (nvidia's kimi-k3, opencode-zen's hy3, wandb's
+    # glm-5.2) sat just underneath, unused.
+    #
+    # A discount, not a ban: g4f stays in the chain and still answers when the
+    # first-party hosts are rate-limited — it just stops outranking them on a
+    # claimed name alone. Sized so a relayed frontier id lands beside the
+    # first-party field (138 -> 134) rather than below it.
+    score -= _RELAY_DISCOUNT.get(pid, 0.0)
     return score
 
 
