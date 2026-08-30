@@ -466,6 +466,10 @@
   .testout.show{display:block}
   .testout.ok{background:var(--accent-soft);color:var(--ok-text);border:1px solid var(--accent-border)}
   .testout.fail{background:var(--danger-soft);color:var(--danger-text);border:1px solid var(--danger-border)}
+  /* Swarm switch sits in the chat bar, sized down to match the buttons. */
+  .chat-swarm-switch{margin-left:auto;display:flex;align-items:center;gap:6px;flex:none}
+  .chat-swarm-switch .lbl{font-size:11.5px;font-weight:600;color:var(--text-dim)}
+  .chat-swarm-switch.on .lbl{color:var(--accent)}
   .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
   .chip{font-family:var(--mono);font-size:10.5px;background:var(--surface-3);color:var(--text-dim);border-radius:5px;padding:2px 7px}
 
@@ -2651,6 +2655,15 @@
         <button class="btn sm ghost" id="chat-new" type="button" title="Start a new conversation (the current one is kept in History)">New chat</button>
         <button class="btn sm ghost" id="chat-history-btn" type="button" title="Previous conversations">History <span id="chat-history-n"></span></button>
         <button class="btn sm ghost" id="chat-clear" type="button">Clear</button>
+        <!-- PER-CONVERSATION swarm switch. Flippable mid-conversation: the next
+             message obeys whatever it says now, and the history carries over
+             either way, so you can draft with one model and hand the hard part
+             to the pipeline without starting over. -->
+        <label class="switch chat-swarm-switch" title="Swarm: several strong models plan, build and review together. Much better on creation work, but takes minutes, not seconds.">
+          <input id="chat-swarm-switch" type="checkbox" aria-label="Swarm agents">
+          <span class="track" aria-hidden="true"></span>
+          <span class="lbl">Swarm</span>
+        </label>
       </div>
       <div class="chat-note" id="chat-note" role="status"></div>
       <!-- Previous conversations. Everything the quick chat said used to live
@@ -5372,6 +5385,37 @@
       asstEl.appendChild(row);
     }
 
+    /* Swarm switch: highlight when on, and say ONCE what it costs. The
+       pipeline takes minutes rather than seconds, and a switch that silently
+       makes the next reply 20x slower is a trap -- the notice is what makes it
+       an informed choice instead of a surprise. */
+    function initSwarmSwitch(){
+      var sw = $('#chat-swarm-switch');
+      if (!sw) return;
+      var told = false;
+      sw.addEventListener('change', function(){
+        var lab = sw.closest('.chat-swarm-switch');
+        if (lab) lab.classList.toggle('on', sw.checked);
+        if (sw.checked){
+          toast('Swarm on — several models plan, build and review together. Minutes, not seconds.');
+          if (!told){
+            told = true;
+            var n = $('#chat-note');
+            if (n){
+              n.textContent = 'Swarm is on for this conversation. Turn it off any time and '
+                + 'the next message goes back to a single model — the conversation '
+                + 'continues either way.';
+              n.classList.add('show');
+            }
+          }
+        } else {
+          toast('Swarm off — back to a single model');
+          var n2 = $('#chat-note');
+          if (n2){ n2.classList.remove('show'); n2.textContent = ''; }
+        }
+      });
+    }
+
     function renderPendingImages(){
       if (!pendingImages.length){
         imageNote.classList.remove('show'); imageNote.textContent = ''; return;
@@ -5445,13 +5489,22 @@
       if (!content && !pendingImages.length) return;
       var model = modelSel.value;
       if (!model){ toast('Pick a model first', true); return; }
+      /* PER-CONVERSATION SWARM SWITCH. Flippable mid-conversation: this is read
+         fresh on every send, so turning it on hands the NEXT message to the
+         pipeline and turning it off returns to the picked model, with the same
+         history either way. Overrides the picker rather than replacing it, so
+         the model you chose is still there when you switch back. */
+      var swarmSw = $('#chat-swarm-switch');
+      var swarmOn = !!(swarmSw && swarmSw.checked);
+      if (swarmOn && !retryOf) model = 'crew';
       /* PROJECT GATE — opening turn on Auto that reads as a full project:
          ask crew-vs-plain BEFORE anything else (before the enhancer too, so a
          "no" answer takes the normal enhanced path and a "yes" goes straight
          to the crew unenhanced — the pipeline plans, it does not need a
          rewritten brief). Once per conversation, text turns only. */
       if (!history.length && content && !pendingImages.length &&
-          !projectGateAnswered && model === 'auto' && looksLikeFullProject(content)){
+          !projectGateAnswered && !swarmOn && model === 'auto' &&
+          looksLikeFullProject(content)){
         projectGateAnswered = true;
         return askProjectGate();
       }
@@ -9199,6 +9252,7 @@
   initArtifactPanel();
   initVisionGap();
   initTestVerification();
+  initSwarmSwitch();
   initPromptEnhance();
   initSocialWebSearch();
   initUpdateCheck();
