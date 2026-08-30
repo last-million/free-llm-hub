@@ -327,6 +327,26 @@ ACT_RUN = """ACT (applies to every brief above, comes before VERIFY/FIX/STOP)
 - Neither covers a genuinely open decision (which real option, anything destructive/irreversible, anything you are missing information for) -- state those and wait, same as always."""
 
 
+def act_message():
+    """Just the ACT block, as a system message.
+
+    system_message() only ships on the OPENING turn, because the domain brief is
+    about the task and re-sending it mid-loop is noise. ACT is different: it is
+    about how to END a turn, so it is needed on exactly the turns the opening
+    brief never sees.
+
+    MEASURED 2026-08-30 on a real codex session: 13 of 14 agent turns ended with
+    "Let me <do the next thing>." and then stopped -- the precise shape ACT's
+    first bullet forbids -- because every one of those was turn 2 or later, and
+    the brief had only ever been injected on turn 1. The user had to type
+    "continue" 13 times.
+
+    Additive and small (~150 tokens): it adds a system message and never touches
+    the user's text or the tool history, which is the part the opening-turn-only
+    rule exists to protect."""
+    return {"role": "system", "content": ACT_RUN}
+
+
 def system_message(text, tools=True):
     """One system message for `text`, or None when nothing applies.
 
