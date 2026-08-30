@@ -12950,7 +12950,7 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
 _SWARM_TOOL_FANOUT = 3
 
 
-def _swarm_tool_turn(body):
+def _swarm_tool_result(body):
     """Swarm for a TOOL-CALLING turn: run the same request on several strong
     models AT ONCE and return the best single response.
 
@@ -12961,8 +12961,16 @@ def _swarm_tool_turn(body):
     answers the real request with the real tools, so whatever wins is a normal,
     complete response the CLI can execute.
 
-    Returns a Flask response, or None when nothing usable came back so the
-    caller can fall through to ordinary single-model routing. Never raises.
+    Returns (data, headers) -- `data` is an ordinary OpenAI chat completion --
+    or None when nothing usable came back, so the caller can fall through to
+    ordinary single-model routing. Never raises.
+
+    PROTOCOL-INDEPENDENT on purpose. This used to return a finished Flask
+    response, which welded the whole fan-out to /v1/chat/completions -- and
+    that is not the endpoint the CLIs use (codex speaks /v1/responses, claude
+    /v1/messages), so the mode 404'd on a model literally named "swarm" for two
+    of the three. Every protocol now runs this same race and translates the
+    winner into its own shape.
     """
     messages = body.get("messages") or []
     # OPENING turn of a swarm session: ask for the phased plan up front. The
@@ -13081,29 +13089,129 @@ def _swarm_tool_turn(body):
         pass
     data["model"] = hop_pid + "/" + hop_model
     hdrs = _routing_headers(hop_pid, hop_model, len(picks), None)
+    return data, hdrs
+
+
+def _swarm_stream_chunks(data):
+    """The finished answer as the chat.completion.chunk objects a stream would
+    have carried: one content/tool_calls delta, then the finish_reason. The
+    fan-out has already completed by the time anything streams, so there is
+    nothing to interleave -- but a CLI still expects stream shape, and a
+    tool_calls delta that goes missing here is a turn that writes no files."""
+    out_msg = ((data.get("choices") or [{}])[0].get("message") or {})
+    delta = {"role": "assistant"}
+    if out_msg.get("content"):
+        delta["content"] = out_msg["content"]
+    if out_msg.get("tool_calls"):
+        delta["tool_calls"] = out_msg["tool_calls"]
+    base = {"id": data.get("id") or ("chatcmpl-swarm-" + uuid.uuid4().hex),
+            "object": "chat.completion.chunk",
+            "created": data.get("created") or int(time.time()),
+            "model": data.get("model") or "swarm"}
+    yield dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": None}])
+    fin = (data.get("choices") or [{}])[0].get("finish_reason") or "stop"
+    yield dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": fin}])
+
+
+def _swarm_sse_lines(data):
+    """The same chunks as the RAW BYTE LINES an upstream OpenAI SSE stream would
+    have produced. _responses_stream and _anthropic_stream both already accept a
+    line_iter (it exists for the first-byte peek), and both use `resp` for
+    nothing else -- so replaying the swarm's answer through them gives codex and
+    claude a correctly-shaped stream without a second translator per protocol."""
+    for chunk in _swarm_stream_chunks(data):
+        yield b"data: " + json.dumps(chunk).encode("utf-8")
+        yield b""
+    yield b"data: [DONE]"
+
+
+def _swarm_tool_turn(body):
+    """The /v1/chat/completions wrapper around _swarm_tool_result."""
+    out = _swarm_tool_result(body)
+    if out is None:
+        return None
+    data, hdrs = out
     if not body.get("stream"):
         return (jsonify(data), 200, hdrs)
-    # Streaming: the fan-out already finished, so replay the winner as one
-    # synthetic chunk -- tool_calls included, or the CLI would get an empty turn.
-    out_msg = ((data.get("choices") or [{}])[0].get("message") or {})
 
     def _one_shot():
-        delta = {"role": "assistant"}
-        if out_msg.get("content"):
-            delta["content"] = out_msg["content"]
-        if out_msg.get("tool_calls"):
-            delta["tool_calls"] = out_msg["tool_calls"]
-        base = {"id": data.get("id") or ("chatcmpl-swarm-" + uuid.uuid4().hex),
-                "object": "chat.completion.chunk",
-                "created": data.get("created") or int(time.time()),
-                "model": data["model"]}
-        yield "data: %s\n\n" % json.dumps(
-            dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": None}]))
-        fin = (data.get("choices") or [{}])[0].get("finish_reason") or "stop"
-        yield "data: %s\n\n" % json.dumps(
-            dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": fin}]))
+        for chunk in _swarm_stream_chunks(data):
+            yield "data: %s\n\n" % json.dumps(chunk)
         yield "data: [DONE]\n\n"
     return Response(_one_shot(), mimetype="text/event-stream", headers=hdrs)
+
+
+class _ReplayUpstream:
+    """Stands in for the upstream HTTP response when replaying an ALREADY
+    FINISHED answer -- the swarm's -- through one of the per-protocol SSE
+    translators. They read raw byte lines and, at the very end, close() the
+    upstream; there is no connection here to close, and passing None instead
+    crashed the stream after every event had already been emitted."""
+
+    def __init__(self, lines):
+        self._lines = lines
+
+    def iter_lines(self, decode_unicode=False):
+        return iter(self._lines)
+
+    def close(self):
+        pass
+
+
+def _swarm_as_responses(body, messages, tools, est):
+    """The swarm's answer in the Responses shape codex speaks, or None.
+
+    Streaming replays the finished answer through _responses_stream, the same
+    translator a real upstream stream goes through -- it takes a line_iter (it
+    exists for the first-byte peek) and uses `resp` for nothing else, so there
+    is no second translator to keep in step."""
+    out = _swarm_for(body, messages, tools, body.get("max_output_tokens"))
+    if out is None:
+        return None
+    data, hdrs = out
+    label = (body.get("model") or "").strip() or data.get("model") or "swarm"
+    if not body.get("stream"):
+        return jsonify(_chat_to_responses(data, label)), 200, hdrs
+    return Response(stream_with_context(
+        _responses_stream(_ReplayUpstream(_swarm_sse_lines(data)), label)),
+        mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
+
+
+def _swarm_as_anthropic(body, oai_messages, tools):
+    """The swarm's answer in the Anthropic shape claude speaks, or None."""
+    out = _swarm_for(body, oai_messages, tools, body.get("max_tokens"))
+    if out is None:
+        return None
+    data, hdrs = out
+    label = (body.get("model") or "").strip() or data.get("model") or "swarm"
+    if not body.get("stream"):
+        return jsonify(_openai_resp_to_anthropic(data, label)), 200, hdrs
+    return Response(stream_with_context(
+        _anthropic_stream(_ReplayUpstream(_swarm_sse_lines(data)), label,
+                          _est_tokens(oai_messages, tools))),
+        mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
+
+
+def _swarm_for(body, messages, tools, max_tokens):
+    """Run the tool-turn fan-out for a NON-chat-completions endpoint.
+
+    Returns (data, headers) exactly as _swarm_tool_result does, or None when
+    nothing usable came back. The caller translates `data` into its own wire
+    shape -- for a stream, by feeding _swarm_sse_lines(data) to the SSE
+    translator it already has."""
+    return _swarm_tool_result({"messages": messages, "tools": tools,
+                               "model": body.get("model"),
+                               "max_tokens": max_tokens,
+                               "stream": bool(body.get("stream"))})
+
+
+def _quality_route_kwargs(model, has_images):
+    """quality_mode=True for the 'best' id, the same test /v1/chat/completions
+    makes. Vision routing has its own model pool and no quality tier, so it is
+    left alone there, matching the chat endpoint exactly."""
+    if not has_images and (model or "").strip().lower() == "best":
+        return {"quality_mode": True}
+    return {}
 
 
 def _swarm_completion(body):
@@ -13922,10 +14030,22 @@ def v1_responses(_retry_pass=False):
     # route across available, SIZE-CAPABLE providers; explicit '<pid>/<model>' bypasses.
     has_tools = bool(tools)
     diff = None
+    # SWARM on codex's own protocol. This dispatch used to exist only in
+    # /v1/chat/completions -- which codex never calls -- so "swarm" arrived here
+    # as an unknown bare id and _resolve_model turned it into a literal model on
+    # the default provider. Measured live: 'groq/swarm ! groq: HTTP 404'.
+    if _is_swarm_model(body.get("model")):
+        served = _swarm_as_responses(body, messages, tools, est)
+        if served is not None:
+            return served
+        # No model could serve the fan-out. Still a request for maximum effort,
+        # so continue as 'best' -- never as a model named "swarm".
+        body = dict(body, model="best")
     if _is_orchestrate(body.get("model")):
         router = _route_for_vision if has_images else _route_by_difficulty
         pid, resolved, diff = router(messages, body.get("max_output_tokens"), est,
-                                     require_tools=has_tools)
+                                     require_tools=has_tools,
+                                     **_quality_route_kwargs(body.get("model"), has_images))
         if pid is None:
             if has_images:
                 return _openai_error(
@@ -14599,10 +14719,17 @@ def v1_messages():
     est = _est_tokens(oai_messages, tools)
     has_tools = bool(tools)
     diff = None
+    # Same two modes, on claude's protocol. See the note in /v1/responses.
+    if _is_swarm_model(body.get("model")):
+        served = _swarm_as_anthropic(body, oai_messages, tools)
+        if served is not None:
+            return served
+        body = dict(body, model="best")
     if _is_orchestrate(body.get("model")):
         router = _route_for_vision if has_images else _route_by_difficulty
         pid, resolved, diff = router(oai_messages, body.get("max_tokens"), est,
-                                     require_tools=has_tools)
+                                     require_tools=has_tools,
+                                     **_quality_route_kwargs(body.get("model"), has_images))
         if pid is None:
             if has_images:
                 return _anthropic_error(

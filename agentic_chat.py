@@ -805,6 +805,40 @@ def _apply_codex_hub_fallback(config_home, session_id=None):
     _write_codex_toml(path, _codex_hub_fallback_text(existing, session_id))
 
 
+# The model ids the hub answers to, in the shape opencode wants. Keep in step
+# with _hub_model_for(): a mode whose id is missing here is a failed turn, not
+# a fallback.
+_OPENCODE_HUB_MODELS = {
+    "auto": {"name": "auto (best free, orchestrated)"},
+    "best": {"name": "best (max quality -- never the cheap tier)"},
+    "swarm": {"name": "swarm (several models per turn, best answer wins)"},
+}
+
+
+def _upgrade_opencode_seed(target):
+    """Add any missing hub model ids to a seed WE wrote. No-op for a config we
+    do not recognise, and no write at all when nothing is missing."""
+    try:
+        with open(target, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        prov = (cfg.get("provider") or {}).get("free-llm-hub")
+        if not isinstance(prov, dict):
+            return                          # not ours -- the user's own config
+        models = prov.get("models")
+        if not isinstance(models, dict):
+            return
+        missing = {k: v for k, v in _OPENCODE_HUB_MODELS.items() if k not in models}
+        if not missing:
+            return
+        models.update(missing)
+        tmp = target + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+        os.replace(tmp, target)
+    except Exception:                                            # noqa: BLE001
+        pass                    # a stale seed is a clear error later, not a crash
+
+
 def _seed_opencode_config(config_home):
     """Give the isolated opencode a provider: this hub.
 
@@ -818,9 +852,18 @@ def _seed_opencode_config(config_home):
     know exists and costs nothing. Written ONCE -- if the file is already there
     it is left alone, including when the user has configured it themselves.
     A project's own opencode.json still wins over this at run time, which is
-    how a project can pin a specific model."""
+    how a project can pin a specific model.
+
+    "Left alone" now has one narrow exception: a seed WE wrote that predates
+    the quality modes lists only `auto`, and an openai-compatible provider will
+    not serve a model it does not list -- so `--model free-llm-hub/swarm` would
+    fail on every install that ran opencode before this shipped, forever, since
+    the early return above meant our own file was never revisited. A file that
+    is recognisably ours and merely out of date is topped up in place; anything
+    the user wrote is still never touched."""
     target = os.path.join(config_home, "opencode", "opencode.json")
     if os.path.exists(target):
+        _upgrade_opencode_seed(target)
         return
     try:
         os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -833,7 +876,7 @@ def _seed_opencode_config(config_home):
                     "name": "Calvoun Free LLM Hub",
                     "options": {"baseURL": "http://127.0.0.1:%d/v1" % _port(),
                                 "apiKey": key},
-                    "models": {"auto": {"name": "auto (best free, orchestrated)"}},
+                    "models": _OPENCODE_HUB_MODELS,
                 },
             },
             "model": "free-llm-hub/auto",
@@ -1184,6 +1227,47 @@ _MODEL_ALIAS = "opus"
 
 
 # --------------------------------------------------------------------------- #
+# Carrying the session's model-quality mode to the hub.
+#
+# MEASURED 2026-08-30 on a live codex session whose stored quality was "swarm":
+# the hub's activity row for its turns read {"cli": "Codex", "model_req":
+# "auto"}. The mode was saved, displayed and persisted, and then lost at the
+# only boundary that matters -- the CLI subprocess, which is an ordinary API
+# client and carries no session identity of its own. The MODEL NAME is the one
+# channel that reaches the hub on every single turn, including the small
+# intermediate ones, so the mode travels as the model.
+#
+# Sent as a per-invocation --model flag rather than written into the CLI's
+# config file: the isolated config dir is shared by every session of that CLI,
+# so a second session turning at the same moment would race the first one's
+# mode. argv cannot be raced.
+#
+# Verified against the installed binaries (`codex exec --help`, `opencode run
+# --help`) rather than assumed -- both accept `-m, --model`.
+# --------------------------------------------------------------------------- #
+
+def _hub_model_for(quality: str = None) -> str:
+    """The hub-side model id that carries a session's mode.
+
+    "best" is app._is_orchestrate's quality_mode (auto that never drops to the
+    cheap tier); "swarm" is app._is_swarm_model's parallel best-of-N fan-out;
+    "auto" is ordinary routing. Anything unrecognised falls back to auto rather
+    than inventing a model name nothing serves."""
+    return {"max": "best", "swarm": "swarm"}.get(quality or "normal", "auto")
+
+
+def _hub_backs(cli_id: str) -> bool:
+    """True when this CLI's requests actually reach THIS hub.
+
+    Same condition _apply_claude_hub_fallback / _apply_codex_hub_fallback use to
+    decide whether to point the child here at all: an isolated copy that has
+    never been signed in. Once a real subscription exists the child talks to its
+    own vendor, where "swarm" is not a model -- sending it would fail the turn
+    outright, which is worse than not applying the mode."""
+    return bool(_isolated_bin(cli_id)) and not _isolated_signed_in(cli_id)
+
+
+# --------------------------------------------------------------------------- #
 # System-prompt injection -- CONFIRMED via a live doc fetch (code.claude.com/
 # docs/en/cli-reference, 2026-07) that `--append-system-prompt` is a real,
 # CLI-usable (not SDK-only) flag that works alongside `-p`. Like `--model`, it
@@ -1316,6 +1400,15 @@ def write_task_brief(project_dir, text):
         return False        # standards are a bonus; never cost the user a turn
 
 
+def _claude_model_for(sess) -> str:
+    """--model for one claude turn: the session's mode when the hub is serving
+    it, the long-stable "opus" alias otherwise."""
+    quality = getattr(sess, "quality", "normal")
+    if quality in ("max", "swarm") and _hub_backs("claude"):
+        return _hub_model_for(quality)
+    return _MODEL_ALIAS
+
+
 def _build_argv(sess: _Session, bin_path: str, text: str, stream=False):
     if sess.cli_id == "codex":
         return _build_argv_codex(sess, bin_path, text)  # --json serves stream + non-stream
@@ -1344,7 +1437,12 @@ def _build_argv(sess: _Session, bin_path: str, text: str, stream=False):
              # send_message_stream's last_message_text fallback, which keeps
              # whatever the model said instead of reporting "no reply".
              "--dangerously-skip-permissions", "--permission-mode", "bypassPermissions",
-             "--model", _MODEL_ALIAS]
+             # The mode rides on --model. An explicit CLI flag is not something
+             # the ANTHROPIC_MODEL env var _apply_claude_hub_fallback sets can
+             # win against, so setting only that env var left every turn asking
+             # for "opus" -- ordinary routing -- no matter which mode was picked.
+             # Normal keeps _MODEL_ALIAS exactly as before.
+             "--model", _claude_model_for(sess)]
     if stream:
         args += ["--verbose"]  # claude -p requires --verbose alongside stream-json
     first = not sess.native_session_id
@@ -1396,6 +1494,11 @@ def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
     prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
         if addition else text
     base = ["exec"]
+    # Only Max/Swarm touch argv; Normal keeps the shipped shape byte for byte
+    # and lets config.toml's model = "auto" decide, exactly as before.
+    quality = getattr(sess, "quality", "normal")
+    if quality in ("max", "swarm") and _hub_backs("codex"):
+        base += ["--model", _hub_model_for(quality)]
     if sess.native_session_id:
         base += ["resume", sess.native_session_id, "--json",
                  "--dangerously-bypass-approvals-and-sandbox", prompt]
@@ -1428,6 +1531,15 @@ def _build_argv_opencode(sess: "_Session", bin_path: str, text: str):
     prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
         if addition else text
     args = ["run", "--format", "json"]
+    # opencode wants provider/model. NOT gated on _hub_backs: unlike claude and
+    # codex, opencode is not a subscription -- it brings no provider of its own
+    # and is signed in to whatever the user configured, while the hub-seeded
+    # config is what points it here (see _seed_opencode_config). Normal still
+    # sends no flag at all, so a project's own opencode.json keeps winning by
+    # default; asking for Max or Swarm is an explicit override of it.
+    quality = getattr(sess, "quality", "normal")
+    if quality in ("max", "swarm"):
+        args += ["--model", "free-llm-hub/" + _hub_model_for(quality)]
     if sess.native_session_id:
         args += ["--session", sess.native_session_id]
     args += [prompt]
