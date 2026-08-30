@@ -611,6 +611,10 @@
   .msg.assistant{align-self:flex-start;align-items:flex-start}
   .msg.assistant .bubble{background:var(--surface-2);color:var(--text);border:1px solid var(--border-soft)}
   .msg.error .bubble{background:var(--danger-soft);color:var(--danger-text);border:1px solid var(--danger-border);font-family:var(--mono);font-size:12px}
+  /* Per-reply footer: which model answered + the re-ask button. Kept quiet
+     (faint, small) so it never competes with the answer itself. */
+  .msg-actions{display:flex;align-items:center;gap:8px;margin-top:5px;flex-wrap:wrap}
+  .msg-actions .answered-by{font-family:var(--mono);font-size:10.5px;color:var(--text-faint);overflow-wrap:anywhere}
   .caret{display:inline-block;width:7px;height:14px;vertical-align:text-bottom;margin-left:1px;background:var(--accent);animation:blink 1s step-start infinite}
   @keyframes blink{50%{opacity:0}}
   .chat-input-row{display:flex;gap:10px;align-items:stretch}
@@ -5331,6 +5335,40 @@
       return wrap;
     }
 
+    /* Per-reply footer: who answered, and a one-click re-ask on a DIFFERENT
+       model. Deliberately user-driven, one model at a time: the point is that
+       YOU judged this answer wrong and want a second opinion, not that the hub
+       shops a question around by itself until something agrees. Each press adds
+       the model that just answered to the veto list, so pressing it repeatedly
+       walks down the ranking instead of cycling the same two. */
+    function addRetryRow(asstEl, info){
+      if (!asstEl) return;
+      var row = document.createElement('div');
+      row.className = 'msg-actions';
+      if (info.answeredBy){
+        var who = document.createElement('span');
+        who.className = 'answered-by';
+        who.textContent = info.answeredBy;
+        who.title = 'The model that produced this answer';
+        row.appendChild(who);
+      }
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn sm ghost';
+      btn.textContent = 'Retry with a different model';
+      btn.title = info.tried.length
+        ? 'Already tried: ' + info.tried.join(', ')
+        : 'Re-ask the same question, routed to another model';
+      btn.addEventListener('click', function(){
+        if (streaming) return;
+        btn.disabled = true;
+        sendChat({ text: info.text, historyIndex: info.historyIndex,
+                   exclude: info.tried, asstEl: asstEl });
+      });
+      row.appendChild(btn);
+      asstEl.appendChild(row);
+    }
+
     function renderPendingImages(){
       if (!pendingImages.length){
         imageNote.classList.remove('show'); imageNote.textContent = ''; return;
@@ -5387,9 +5425,20 @@
       msgsEl.scrollTop = msgsEl.scrollHeight;
     }
 
-    function sendChat(){
+    /* `retryOf` drives "Retry with a different model": it carries the user turn
+       to re-ask and the models already tried. A retry re-sends the SAME question
+       with those vetoed, instead of appending a new turn -- the user is asking
+       the same thing of someone else, not continuing the conversation. */
+    function sendChat(retryOf){
       if (streaming) return;
-      var content = textEl.value.trim();
+      var retryExclude = (retryOf && retryOf.exclude) || null;
+      if (retryOf){
+        /* Drop the answer being replaced (and re-use its question) so history
+           does not accumulate a rejected reply the model would then see. */
+        history = history.slice(0, retryOf.historyIndex);
+        textEl.value = '';
+      }
+      var content = retryOf ? retryOf.text : textEl.value.trim();
       if (!content && !pendingImages.length) return;
       var model = modelSel.value;
       if (!model){ toast('Pick a model first', true); return; }
@@ -5438,9 +5487,16 @@
         }));
       }
       var imageCount = pendingImages.length;
-      history.push({ role: 'user', content: userContent });
-      appendBubble('user', 'You', (content || '(image only)') +
-                   (imageCount ? '\n\n[' + imageCount + ' image(s) attached]' : ''));
+      if (retryOf){
+        /* The question and its bubble are already on screen and already in
+           history (only the rejected ANSWER was sliced off above). Re-adding
+           them would show the user asking twice. Just drop the old reply. */
+        if (retryOf.asstEl && retryOf.asstEl.parentNode) retryOf.asstEl.remove();
+      } else {
+        history.push({ role: 'user', content: userContent });
+        appendBubble('user', 'You', (content || '(image only)') +
+                     (imageCount ? '\n\n[' + imageCount + ' image(s) attached]' : ''));
+      }
       pendingImages = []; renderPendingImages();
       textEl.value = ''; autoGrow();
 
@@ -5466,13 +5522,29 @@
       var payloadMsgs = history.filter(function(m){ return !m.error; })
                                .map(function(m){ return { role: m.role, content: m.content }; });
 
+      /* Which model actually answered. The gateway has always sent it
+         (_routing_headers -> X-Free-LLM-Hub-Provider/-Model); the UI just never
+         read it, so it could neither show who replied nor name a model to skip
+         on a retry. Both need it. */
+      var answeredBy = null;
+      var hdrs = { 'Content-Type': 'application/json' };
+      /* "Retry with a different model": name the ones already tried so the
+         router skips them. Matched by leaf name server-side, so this excludes
+         the same model on every host, not just the one that answered. */
+      if (retryExclude && retryExclude.length){
+        hdrs['X-Free-LLM-Hub-Exclude'] = retryExclude.join(',');
+      }
+
       fetch('/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: hdrs,
         body: JSON.stringify({ model: model, messages: payloadMsgs, stream: true }),
         signal: controller.signal
       }).then(function(resp){
         var ct = resp.headers.get('content-type') || '';
+        var hp = resp.headers.get('X-Free-LLM-Hub-Provider');
+        var hm = resp.headers.get('X-Free-LLM-Hub-Model');
+        if (hp && hm) answeredBy = hp + '/' + hm;
         if (!resp.ok){
           return resp.clone().json().catch(function(){ return resp.text().then(function(t){ return { error: { message: t } }; }); })
             .then(function(j){
@@ -5519,6 +5591,12 @@
         if (caret.parentNode) caret.remove();
         bubble.textContent = acc || '(empty response)';
         history.push({ role: 'assistant', content: acc });
+        addRetryRow(asstEl, {
+          text: content,
+          historyIndex: history.length - 1,
+          tried: (retryExclude || []).concat(answeredBy ? [answeredBy] : []),
+          answeredBy: answeredBy
+        });
         saveChatTurn(userContent, acc);
       }).catch(function(e){
         if (caret.parentNode) caret.remove();
