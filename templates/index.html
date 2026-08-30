@@ -1830,6 +1830,18 @@
   .cx-soc svg{ width:18px; height:18px; }
   .cx-soc.yt{ background:#FF0000; }
   .cx-soc.dc{ background:#5865F2; }
+  .cx-soc.gh{ background:#24292f; }
+  /* Star ask. Quiet by design: a bordered strip, not a banner -- it sits under
+     the real content and must never read as the point of the dialog. */
+  .star-ask{ display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+             margin:14px 0 0; padding:10px 12px; border-radius:10px;
+             background:var(--surface-3); border:1px solid var(--border-soft); }
+  .star-ask .star-txt{ font-size:12.5px; color:var(--text-dim); flex:1 1 220px; }
+  .star-ask a{ display:inline-flex; align-items:center; gap:7px; flex:none;
+               padding:7px 12px; border-radius:8px; background:#24292f; color:#fff;
+               font-size:12.5px; font-weight:600; text-decoration:none; }
+  .star-ask a:hover{ filter:brightness(1.15); }
+  .star-ask svg{ width:15px; height:15px; }
   .cx-soc:hover{ filter:brightness(1.12); }
   /* no-key (open gateway) providers */
   .card.nokey .key-form, .card.nokey .key-warn{ display:none; }
@@ -3334,6 +3346,7 @@
       '<div class="cx-welcome-social">' +
         '<a class="cx-soc yt" href="https://www.youtube.com/@QuantumSEO-AR" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M21.6 7.2a2.5 2.5 0 0 0-1.76-1.77C18.25 5 12 5 12 5s-6.25 0-7.84.43A2.5 2.5 0 0 0 2.4 7.2 26 26 0 0 0 2 12a26 26 0 0 0 .4 4.8 2.5 2.5 0 0 0 1.76 1.77C5.75 19 12 19 12 19s6.25 0 7.84-.43a2.5 2.5 0 0 0 1.76-1.77A26 26 0 0 0 22 12a26 26 0 0 0-.4-4.8zM10 15V9l5 3-5 3z"/></svg>YouTube</a>' +
         '<a class="cx-soc dc" href="https://discord.gg/HK9qKNKGY" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19.3 5.3A16 16 0 0 0 15.4 4l-.24.5a15 15 0 0 1 3.4 1.6 12.6 12.6 0 0 0-10.8 0A15 15 0 0 1 11.16 4.5L10.9 4A16 16 0 0 0 7 5.3C4.3 9.4 3.5 13.4 3.9 17.3a16 16 0 0 0 4.9 2.5l.78-1.35a10 10 0 0 1-1.6-.8l.4-.3a11 11 0 0 0 9.44 0l.4.3a10 10 0 0 1-1.6.8l.78 1.35a16 16 0 0 0 4.9-2.5c.5-4.6-.77-8.6-2.9-12zM9.3 14.7c-.9 0-1.7-.9-1.7-1.9s.78-1.9 1.7-1.9 1.72.9 1.7 1.9c0 1-.78 1.9-1.7 1.9zm5.4 0c-.9 0-1.7-.9-1.7-1.9s.78-1.9 1.7-1.9 1.72.9 1.7 1.9c0 1-.78 1.9-1.7 1.9z"/></svg>Discord</a>' +
+        '<a class="cx-soc gh" href="https://github.com/last-million/free-llm-hub" target="_blank" rel="noopener noreferrer" title="Star the repo on GitHub"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.42 7.42 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>Star on GitHub</a>' +
       '</div>' +
       '<div class="notes-modal-foot"><button type="button" class="btn primary" id="cx-welcome-ok">Got it</button></div>' +
       '</div>';
@@ -9242,7 +9255,13 @@
       '<a href="https://g4f.dev/members.html" target="_blank" rel="noopener noreferrer">g4f.dev/members.html</a> ' +
       'and paste it on their cards (or use <b>Guided setup</b> on the Providers page).</p>' +
       '<p style="margin:0">For more usage and quality, connect the recommended providers first ' +
-      '(<b>Puter</b> — latest GPT-5.6 + 500 models with one free token), then any others from the Providers page.</p>';
+      '(<b>Puter</b> — latest GPT-5.6 + 500 models with one free token), then any others from the Providers page.</p>' +
+      /* Star ask, LAST and quiet: the update notes are what the user opened this
+         for, so this sits underneath them and never above. */
+      '<div class="star-ask">' +
+        '<span class="star-txt">The hub is free and updates itself every 5 hours. A star helps other people find it.</span>' +
+        '<a href="https://github.com/last-million/free-llm-hub" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.42 7.42 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>Star on GitHub</a>' +
+      '</div>';
     body.appendChild(box);
     var actions = document.createElement('div');
     actions.className = 'sd-actions';
