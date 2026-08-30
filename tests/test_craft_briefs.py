@@ -636,3 +636,23 @@ def test_act_also_catches_a_stop_dressed_as_a_report():
     body = craft.system_message("so continue until it is fully done", tools=True)["content"]
     assert "ACT (applies to every brief above" in body
     assert "blocker" in body.lower()
+
+
+def test_act_also_catches_a_stop_dressed_as_a_pivot():
+    """The first two bullets catch a stop dressed as an ANNOUNCEMENT ("next
+    I'll...") and as a REPORT (recap, then end). User-reported gap (2026-08-30):
+    a codex session hit a misbehaving command, said
+
+        "Something is hijacking command output. Let me try a different
+         approach."
+
+    ...and then ended the turn having tried nothing. That is a stop dressed as a
+    PIVOT: an alternative is named, so there is no blocker, but neither earlier
+    bullet matches -- the first needs a named next CALL, the second needs
+    outstanding todo items. A tool failing is the most ordinary thing that
+    happens mid-task and must never end a turn on its own."""
+    low = craft.ACT_RUN.lower()
+    assert "failing tool" in low
+    assert "alternative" in low
+    body = craft.system_message("fix the 404s on every page", tools=True)["content"]
+    assert "failing tool is not a blocker" in body.lower()
