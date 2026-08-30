@@ -321,8 +321,9 @@ VERIFY_READ = """VERIFY, FIX, STOP (applies to every brief above)
 # written names a blocker -- not a bare "always keep going", which would also
 # fire on a genuinely finished task or a real open decision.
 ACT_RUN = """ACT (applies to every brief above, comes before VERIFY/FIX/STOP)
-- If you already called a tool this turn and your own last sentence names the exact next call you now have everything needed to make, make it -- do not end the turn to announce it. Stating "next I'll..." about something already in reach is a stop dressed as a plan.
+- If you already called a tool this turn and your own last sentence names the exact next call you now have everything needed to make, make it -- do not end the turn to announce it.
 - Todo/multi-step items left, no blocker named? A recap is not the stop -- do the next item.
+- A failing tool is not a blocker -- take the alternative you named.
 - Neither covers a genuinely open decision (which real option, anything destructive/irreversible, anything you are missing information for) -- state those and wait, same as always."""
 
 
