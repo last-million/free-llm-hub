@@ -4219,6 +4219,16 @@ def _session_key(messages):
 
 
 _SAME_HOST_EPS = 0.02   # headroom fractions this close count as tied
+# How far a host may score BELOW the best host of the same model and still take
+# an equal share of it. Sized deliberately between the two things that separate
+# hosts of identical weights:
+#   provider bias      0.0 .. 2.0  (cerebras 2.0, groq 1.8, nvidia 1.2, ...)
+#   _RELAY_DISCOUNT    4.0         (a scraped relay's claimed id)
+# So first-party hosts a point or two apart still SHARE -- which is the whole
+# point of this function, and what stopped one provider's daily cap being
+# drained while an identical copy sat idle -- while a relay four points down
+# stops taking an equal cut of a model a real host also serves.
+_SAME_HOST_BAND = 3.0
 
 
 def _pick_same_model_host(pool, pinned):
@@ -4246,6 +4256,23 @@ def _pick_same_model_host(pool, pinned):
         return hosts[0]
     best = max(_quota_headroom(p) for p, _m in hosts)
     tied = [h for h in hosts if _quota_headroom(h[0]) >= best - _SAME_HOST_EPS]
+    # Headroom alone treats every host of a model as interchangeable, and
+    # _quota_headroom returns 1.0 for every provider whose limit is unknown --
+    # which is most of them -- so nearly all hosts tie and the choice was a
+    # coin flip weighted by how many times a provider happens to LIST the
+    # model. MEASURED 2026-08-30: a creation ask sent 24 of 30 turns to g4f
+    # relays of kimi-k3 (130.8) rather than nvidia's first-party copy (134.8),
+    # purely because g4f lists it four times and nvidia once. That silently
+    # defeated the relay discount, whose entire job is to stop a scraped proxy
+    # outranking a real host of the same weights.
+    #
+    # So: among headroom-tied hosts, prefer the better-SCORING one, and only
+    # roll the dice between hosts tied on both. Spreading still happens where
+    # the hosts really are equivalent, which is what it was for.
+    if len(tied) > 1:
+        top = max(_benchmark_score(p, m) for p, m in tied)
+        tied = [h for h in tied
+                if _benchmark_score(h[0], h[1]) >= top - _SAME_HOST_BAND] or tied
     return random.choice(tied) if len(tied) > 1 else tied[0]
 
 

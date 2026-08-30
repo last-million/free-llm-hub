@@ -111,3 +111,39 @@ def test_near_equal_headroom_still_alternates():
                            side_effect=lambda p: 1.0 if p == "a" else 0.99):
         seen = {app._pick_same_model_host(pool, ("a", "m"))[0] for _ in range(200)}
     assert seen == {"a", "b"}, seen
+
+
+def test_a_relayed_host_does_not_take_an_equal_share_of_a_real_one():
+    """MEASURED 2026-08-30: a creation ask sent 24 of 30 turns to g4f relays of
+    kimi-k3 (130.8) rather than nvidia's first-party copy (134.8) -- purely
+    because g4f lists that model four times and nvidia once, and the host choice
+    looked only at quota headroom. Headroom is 1.0 for every provider with an
+    unknown limit, so nearly everything tied and the winner was decided by how
+    many times a provider happened to list the id. That silently defeated the
+    relay discount."""
+    pool = _pool(("nvidia", "moonshotai/kimi-k3"),
+                 ("g4f", "srv_a:moonshotai/kimi-k3"),
+                 ("g4f", "srv_b:moonshotai/kimi-k3"),
+                 ("g4f", "srv_c:moonshotai/kimi-k3"))
+    with mock.patch.object(app, "_quota_headroom", return_value=1.0), \
+            mock.patch.object(app, "_benchmark_score",
+                              side_effect=lambda p, m: 130.8 if p == "g4f" else 134.8):
+        seen = {app._pick_same_model_host(pool, ("nvidia", "moonshotai/kimi-k3"))[0]
+                for _ in range(200)}
+    assert seen == {"nvidia"}, seen
+
+
+def test_first_party_hosts_a_point_apart_still_share():
+    """The band is sized ABOVE the provider bias spread (0-2) on purpose: this
+    is the load-sharing that stopped one provider's daily cap being drained
+    while an identical copy sat idle, and it must survive."""
+    pool = _pool(("cerebras", "gpt-oss-120b"),
+                 ("groq", "openai/gpt-oss-120b"),
+                 ("nvidia", "openai/gpt-oss-120b"))
+    scores = {"cerebras": 100.0, "groq": 99.8, "nvidia": 98.2}   # bias-sized gaps
+    with mock.patch.object(app, "_quota_headroom", return_value=1.0), \
+            mock.patch.object(app, "_benchmark_score",
+                              side_effect=lambda p, m: scores[p]):
+        seen = {app._pick_same_model_host(pool, ("cerebras", "gpt-oss-120b"))[0]
+                for _ in range(300)}
+    assert seen == {"cerebras", "groq", "nvidia"}, seen
