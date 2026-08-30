@@ -4349,7 +4349,7 @@ def _weighted_pick(pool, sustain_override=None):
 
 
 def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=False,
-                         force_difficulty=None):
+                         force_difficulty=None, quality_mode=False):
     """Pick (pid, model) by task difficulty across AVAILABLE providers that can
     also HANDLE the request size (skip small-TPM providers for big requests).
     - hard/medium -> strongest capable model.
@@ -4362,6 +4362,19 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     obey "rewrite, don't answer" (a weak one replies to the prompt instead,
     replacing the user's question with an answer)."""
     difficulty = force_difficulty or _classify_difficulty(messages, max_tokens)
+    # MAX-QUALITY MODE. A CLI session started in "max quality" is launched with
+    # ANTHROPIC_MODEL=best (see agentic_chat._agentic_env), so every turn it
+    # sends carries model="best": route exactly like `auto`, but never drop to
+    # the cheap tier -- not even on the small steps an agent takes between the
+    # big ones, where a weak model quietly costs a retry.
+    #
+    # This is what the CLI question offers INSTEAD of a swarm choice. The swarm
+    # cannot serve a tool-calling loop at all: it emits finished prose, never
+    # tool calls, and _swarm_completion refuses those turns outright -- so a
+    # "swarm mode" CLI session would write no files and do nothing. Forcing the
+    # top tier is the working version of "use the best models".
+    if quality_mode and difficulty == "simple":
+        difficulty = "medium"
     # CREATION ALWAYS GETS THE BEST MODELS (see _CREATION_INTENT_RE). Skipped
     # when force_difficulty is set: that caller already knows the tier it needs,
     # and the hub's own internal probes use it precisely to stay off the strong
@@ -4603,7 +4616,7 @@ def _is_orchestrate(model):
     model = (model or "").strip().lower()
     if "/" in model:
         return False
-    return (not model) or model in ("auto", "orchestrate", "default") \
+    return (not model) or model in ("auto", "orchestrate", "default", "best") \
         or model.startswith("claude") \
         or model in _CLAUDE_MODEL_ALIASES
 
@@ -9008,9 +9021,14 @@ def api_agent_start_session():
     create_new = body.get("create_new", False)
     if not isinstance(create_new, bool):
         return jsonify({"error": "create_new must be a boolean."}), 400
+    # "normal" | "max" -- asked once, when the session starts. Anything else is
+    # treated as "normal" rather than rejected: an older dashboard that does not
+    # send the field must keep working exactly as it did.
+    quality = body.get("quality")
+    quality = quality if quality in ("normal", "max") else "normal"
     try:
         session_id = agentic_chat.start_session(body.get("cli"), body.get("project_dir"),
-                                                 create_new=create_new)
+                                                 create_new=create_new, quality=quality)
     except agentic_chat.AgenticError as exc:
         # exc.code/.extra carry the DISTINCT "not installed, but installable"
         # shape (code="cli_not_installed", extra={"install_provider": "sub-..."})
@@ -12826,8 +12844,11 @@ def v1_chat_completions():
     diff = None
     if _is_orchestrate(body.get("model")):
         router = _route_for_vision if has_images else _route_by_difficulty
+        _rkw = {}
+        if (body.get("model") or "").strip().lower() == "best" and not has_images:
+            _rkw["quality_mode"] = True
         pid, resolved, diff = router(body.get("messages"), body.get("max_tokens"), est,
-                                     require_tools=has_tools)
+                                     require_tools=has_tools, **_rkw)
         if veto and pid is not None and _normalize_model_identity(resolved) in veto:
             # Auto landed on exactly the model the user just rejected. Hand the
             # choice to _build_chain with an empty primary: it applies the same

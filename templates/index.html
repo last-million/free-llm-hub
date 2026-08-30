@@ -8130,9 +8130,53 @@
         var extra = [];
         if (r.turn_count != null) extra.push('turn ' + r.turn_count);
         if (r.currently_running) extra.push('running');
+        /* Show it: the choice is fixed for the life of the session (it is baked
+           into the child's env at launch), so it must be visible rather than
+           something you have to remember answering. */
+        if (r.quality === 'max') extra.push('max quality');
         sessionInfo.textContent = cliLabel(r.cli) + ' — ' + (r.project_dir || '') +
                                    (extra.length ? ' · ' + extra.join(' · ') : '');
       }).catch(function(){ /* non-critical — the static label already set at start covers this */ });
+    }
+
+    /* Asked ONCE, before the session starts, because the answer is baked into
+       the CLI subprocess's environment at launch (ANTHROPIC_MODEL=best vs auto)
+       and cannot be changed underneath a running child.
+
+       Deliberately NOT a swarm-vs-normal question, which is what was asked for:
+       the swarm emits finished prose, never tool calls, and the hub refuses
+       tool-carrying turns outright -- a "swarm mode" CLI session would write no
+       files at all. Max quality is the working version of "use the best
+       models": route every turn at the top tier, including the small steps
+       between the big ones. */
+    function askAgentQuality(){
+      return new Promise(function(resolve){
+        var box = frag();
+        var p = document.createElement('p');
+        p.className = 'sd-help';
+        p.style.marginTop = '0';
+        p.innerHTML = 'How should this session pick models? You can start a new '
+          + 'session later to change it.';
+        box.appendChild(p);
+        var row = document.createElement('div');
+        row.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:10px';
+        function mk(label, hint, val, primary){
+          var b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'btn' + (primary ? '' : ' ghost');
+          b.style.cssText = 'flex:1 1 200px;text-align:left;padding:10px 12px';
+          b.innerHTML = '<b>' + label + '</b><br><span style="font-size:11.5px;opacity:.75">'
+                      + hint + '</span>';
+          b.addEventListener('click', function(){ closeModal(); resolve(val); });
+          row.appendChild(b);
+        }
+        mk('Max quality', 'Every turn on the strongest models, never the cheap tier. '
+                        + 'Uses more of your daily free quota.', 'max', true);
+        mk('Normal', 'Strong models for real work, cheap ones for trivial steps. '
+                   + 'Stretches your quota further.', 'normal', false);
+        box.appendChild(row);
+        openModal('Model quality for this session', box);
+      });
     }
 
     function doStart(){
@@ -8149,7 +8193,8 @@
       var oldLabel = startBtn.textContent;
       startBtn.textContent = 'Starting…';
       setStartResult(null);
-      api('/api/agent/sessions', { method: 'POST', body: { cli: cli, project_dir: dir, create_new: dirMode === 'new' } })
+      askAgentQuality().then(function(quality){
+      return api('/api/agent/sessions', { method: 'POST', body: { cli: cli, project_dir: dir, create_new: dirMode === 'new', quality: quality } })
         .then(function(r){
           r = r || {};
           sessionId = r.session_id;
@@ -8171,6 +8216,7 @@
           startBtn.disabled = false;
           startBtn.textContent = oldLabel;
         });
+      });
     }
 
     function appendAgentBubble(role, who, text){

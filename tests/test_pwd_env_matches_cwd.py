@@ -51,7 +51,12 @@ def test_every_real_turn_spawn_passes_project_dir_to_agentic_env():
     Popen(); send_message's non-streaming path is unchanged. Matched without
     the `env=` prefix so both shapes still count."""
     src = open(ac.__file__, encoding="utf-8", errors="replace").read()
-    assert src.count("_agentic_env(sess.cli_id, sess.project_dir)") == 2, (
+    # 2026-08-30: both sites now also pass sess.quality, so the per-session
+    # model-quality choice reaches the child on BOTH paths. Matched on the
+    # prefix rather than the whole call, so adding another argument does not
+    # silently drop one spawn site from this guard again -- which is exactly
+    # what happened when quality was threaded through only the first one.
+    assert src.count("_agentic_env(sess.cli_id, sess.project_dir,") == 2, (
         "expected both send_message() and send_message_stream() to resync PWD")
 
 
