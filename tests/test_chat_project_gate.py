@@ -48,14 +48,21 @@ def test_gate_function_and_state_exist():
 
 def test_gate_only_fires_on_opening_turn_with_auto():
     """A deliberate picker choice (a crew id, or a specific provider/model) IS
-    already the user's answer — the gate must never nag then."""
+    already the user's answer — the gate must never nag then.
+
+    Matched on the CONDITION's parts rather than one contiguous source string:
+    the old exact-string assert broke the moment the condition was reformatted
+    across lines to add the swarm-switch guard, reporting "gate condition not
+    found" for a gate that was entirely intact."""
     html = _html()
-    i = html.find("model === 'auto' && looksLikeFullProject(content)")
+    i = html.find("looksLikeFullProject(content)")
     assert i != -1, "gate condition not found"
-    c = html[max(0, i - 300):i]
+    c = html[max(0, i - 400):i]
     assert "if (" in c
     assert "!history.length" in c          # opening turn only
     assert "!projectGateAnswered" in c     # once per conversation
+    assert "model === 'auto'" in c         # never over a deliberate pick
+    assert "!swarmOn" in c                 # nor when the switch already says yes
 
 
 def test_chooser_crew_button_selects_the_crew_model_visibly():
