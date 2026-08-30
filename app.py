@@ -15298,7 +15298,16 @@ def _do_git_update_check():
             "skipped: 'origin' is not the trusted last-million/free-llm-hub repo")
         _log.warning("Auto-update: refusing to pull — origin remote is untrusted.")
         return _auto_update_state["last_result"]
-    rc, dirty, _ = _git("status", "--porcelain")
+    # --untracked-files=no: only a modification to a TRACKED file can make
+    # `pull --ff-only` clobber real work. Counting untracked files as "dirty"
+    # meant one stray note, editor swapfile or stray log in the working tree
+    # silently disabled auto-update FOREVER -- found live on 2026-08-30, where a
+    # single untracked .md had been parking every 5-hourly check at
+    # "skipped: local uncommitted changes" with nothing surfacing that the hub
+    # had stopped updating itself. The narrow case this gives up (an incoming
+    # commit adding a path that already exists untracked) still fails safely:
+    # git refuses the merge and the rc2 != 0 branch below reports it.
+    rc, dirty, _ = _git("status", "--porcelain", "--untracked-files=no")
     if rc == 0 and dirty:
         _auto_update_state["last_result"] = "skipped: local uncommitted changes"
         return _auto_update_state["last_result"]
