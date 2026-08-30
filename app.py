@@ -12641,8 +12641,50 @@ def _is_upstream_nonanswer(text):
     return bool(s) and len(s) <= _NONANSWER_MAX_CHARS and bool(_NONANSWER_RE.search(s))
 
 
-def _chat_json_nonanswer(data):
-    """_chat_json_is_empty's sibling: a 200 carrying the relay's error as content."""
+# A tool call TYPED OUT as prose instead of emitted as a tool_calls array.
+# MEASURED 2026-08-30 from a reported build that "stopped and did not finish" --
+# the last two agent turns of that conversation both ended like this:
+#
+#     I'll now check all the generated pages...
+#     ```shell
+#     shell_command
+#     <arg_key>command</arg_key>
+#     <arg_value>Get-Content robots.txt -Raw</arg_value>
+#     </tool_call>
+#
+# No tool_calls array, so the CLI saw an ordinary prose message, had nothing to
+# execute and ended the turn. Nothing ran, nothing was written, and the hub
+# recorded a clean success -- so it learned nothing and picked the same model
+# again next turn.
+#
+# Detected from the RESPONSE rather than from a per-model blacklist on purpose:
+# _TOOL_DIALECT_MISMATCH's own comment already concedes a blacklist is
+# whack-a-mole ("three runs found three DIFFERENT model-specific ways to
+# fail"), and this catches models nobody has met yet.
+_TEXT_TOOL_CALL_RES = (
+    re.compile(r"</tool_call>", re.I),
+    re.compile(r"<arg_key>.*?</arg_key>", re.I | re.S),
+    re.compile(r"<arg_value>.*?</arg_value>", re.I | re.S),
+)
+
+
+def _looks_like_text_tool_call(text):
+    """True when `text` contains a tool call the model wrote out instead of
+    emitting. Requires a real closing/paired marker, not a passing mention, so
+    prose that merely talks about tools does not trip it."""
+    if not text or not isinstance(text, str):
+        return False
+    return any(rx.search(text) for rx in _TEXT_TOOL_CALL_RES)
+
+
+def _chat_json_nonanswer(data, has_tools=False):
+    """_chat_json_is_empty's sibling: a 200 that is not really an answer.
+
+    Two shapes. The original one is a relay returning its own error page as
+    content. The second is a tool call typed out as prose (see
+    _looks_like_text_tool_call) -- only ever checked when the request actually
+    offered tools, because in plain chat, explaining what a tool call looks
+    like is a perfectly good answer."""
     try:
         msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
         if msg.get("tool_calls"):
@@ -12651,6 +12693,8 @@ def _chat_json_nonanswer(data):
         if isinstance(content, list):
             content = "".join((p.get("text") or "") for p in content
                               if isinstance(p, dict))
+        if has_tools and _looks_like_text_tool_call(content):
+            return True
         return _is_upstream_nonanswer(content)
     except Exception:
         return False
@@ -13187,6 +13231,13 @@ def _swarm_tool_result(body):
         if not (msg.get("tool_calls") or (msg.get("content") or "").strip()):
             _record_outcome(hop_pid, hop_model, False)
             return None
+        # A member that TYPED its tool call instead of emitting one looks like
+        # ordinary prose, so without this it competes as a candidate answer --
+        # and if it wins, the CLI executes nothing and the build stops. That is
+        # exactly the reported failure; see _looks_like_text_tool_call.
+        if not msg.get("tool_calls") and _looks_like_text_tool_call(msg.get("content")):
+            _note_nonanswer(hop_pid, hop_model)
+            return None
         _record_chat_usage(hop_pid, hop_model, data, est)
         return (hop_pid, hop_model, data, msg)
 
@@ -13583,7 +13634,7 @@ def v1_chat_completions():
                     last_error = "non-json"
                     resp.close()
                     continue
-                if _chat_json_nonanswer(data):
+                if _chat_json_nonanswer(data, has_tools):
                     # A 200 whose content IS the relay backend's error page (see
                     # _chat_json_nonanswer). Falls through to the next hop exactly
                     # like an empty 200, and sidelines the id so it stops winning.
@@ -13646,7 +13697,7 @@ def v1_chat_completions():
                 last_error = "non-json"
                 resp.close()
                 continue
-            if _chat_json_nonanswer(data):
+            if _chat_json_nonanswer(data, has_tools):
                 # A 200 whose content IS the relay backend's error page (see
                 # _chat_json_nonanswer). Falls through to the next hop exactly
                 # like an empty 200, and sidelines the id so it stops winning.
@@ -13672,7 +13723,7 @@ def v1_chat_completions():
                     except (requests.RequestException, RuntimeError, ValueError):
                         data2 = None
                     if (data2 and not _chat_json_is_empty(data2)
-                            and not _chat_json_nonanswer(data2)):
+                            and not _chat_json_nonanswer(data2, has_tools)):
                         _record_chat_usage(hop_pid, hop_model, data2, est)
                         data2["model"] = hop_pid + "/" + hop_model
                         return (jsonify(data2), 200,
@@ -14303,7 +14354,7 @@ def v1_responses(_retry_pass=False):
                     last_error = "non-json"
                     resp.close()
                     continue
-                if _chat_json_nonanswer(data):
+                if _chat_json_nonanswer(data, has_tools):
                     # A 200 whose content IS the relay backend's error page (see
                     # _chat_json_nonanswer). Falls through to the next hop exactly
                     # like an empty 200, and sidelines the id so it stops winning.
@@ -14355,7 +14406,7 @@ def v1_responses(_retry_pass=False):
                 last_error = "non-json"
                 resp.close()
                 continue
-            if _chat_json_nonanswer(data):
+            if _chat_json_nonanswer(data, has_tools):
                 # A 200 whose content IS the relay backend's error page (see
                 # _chat_json_nonanswer). Falls through to the next hop exactly
                 # like an empty 200, and sidelines the id so it stops winning.
@@ -15001,7 +15052,7 @@ def v1_messages():
                 last_error = "non-json"
                 resp.close()
                 continue
-            if _chat_json_nonanswer(data):
+            if _chat_json_nonanswer(data, has_tools):
                 # A 200 whose content IS the relay backend's error page (see
                 # _chat_json_nonanswer). Falls through to the next hop exactly
                 # like an empty 200, and sidelines the id so it stops winning.
