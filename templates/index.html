@@ -2223,6 +2223,14 @@
       <p class="sd-help">Tells the Chat CLI agent that testing/debugging its own work with tools like Playwright is expected this session.</p>
     </div>
     <div class="sd-group">
+      <label class="switch" title="Route to uncensored / abliterated models INSTEAD of the normal catalog">
+        <input id="drawer-uncensored-switch" type="checkbox" aria-label="Uncensored models only">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Uncensored models only</span>
+      </label>
+      <p class="sd-help">Off by default. When on, the router uses <b>only</b> uncensored/abliterated models and the normal catalog is excluded &mdash; for agent chat and for every connected CLI. The pool is small, so expect slower answers and more failures. <span id="uncensored-count"></span></p>
+    </div>
+    <div class="sd-group">
       <label class="switch" title="Allow the last30days skill to search X and other social sources during web research">
         <input id="drawer-social-search-switch" type="checkbox" aria-label="Social media web search">
         <span class="track" aria-hidden="true"></span>
@@ -8678,6 +8686,49 @@
     });
   }
 
+  /* ---------- uncensored-models-only toggle ----------
+     Same drawer shape as the two toggles above, and one DOM instance for the
+     same reason. It is a ROUTER-level filter, so this single switch covers the
+     agent page and every connected CLI at once — there is nothing per-surface
+     to mirror. Shows the live pool size next to it: the mode is only as usable
+     as the number of models the inverted filter actually leaves, and that
+     number is small, so it must not be something you discover by having
+     requests start failing. */
+  function renderUncensoredCount(r){
+    var el = $('#uncensored-count');
+    if (!el) return;
+    if (!r || !r.enabled){ el.textContent = ''; return; }
+    var n = (r.available | 0);
+    el.innerHTML = n
+      ? '<b>' + n + ' uncensored model' + (n === 1 ? '' : 's') + ' available right now.</b>'
+      : '<b>No uncensored model is reachable right now &mdash; requests will fail while this is on.</b>';
+  }
+  function loadUncensored(silent){
+    return api('/api/uncensored-mode').then(function(r){
+      var sw = $('#drawer-uncensored-switch');
+      if (sw) sw.checked = !!(r && r.enabled);
+      renderUncensoredCount(r);
+    }).catch(function(e){ if (!silent) toast('Uncensored mode: ' + e.message, true); });
+  }
+  function initUncensored(){
+    var sw = $('#drawer-uncensored-switch');
+    if (!sw) return;
+    sw.addEventListener('change', function(){
+      var want = sw.checked;
+      sw.disabled = true;
+      api('/api/uncensored-mode', { method: 'POST', body: { enabled: want } })
+        .then(function(r){
+          sw.checked = !!(r && r.enabled);
+          renderUncensoredCount(r);
+          toast(sw.checked
+            ? 'Uncensored-only mode ON — ' + (r.available | 0) + ' model(s) in the pool'
+            : 'Uncensored-only mode off — normal catalog restored');
+        })
+        .catch(function(e){ toast('Uncensored mode: ' + e.message, true); sw.checked = !want; })
+        .then(function(){ sw.disabled = false; });
+    });
+  }
+
   /* ---------- social media web search toggle (last30days skill) ----------
      Same shape as the test-verification toggle: one DOM instance in the
      header Settings drawer, GET on drawer open, POST on toggle. Backs the
@@ -8863,6 +8914,7 @@
     loadTestVerification(true);
     loadPromptEnhance(true);
     loadSocialWebSearch(true);
+    loadUncensored(true);
     loadUpdateStatus(true);
   }
   function closeSettingsDrawer(){
@@ -9093,6 +9145,7 @@
   initArtifactPanel();
   initVisionGap();
   initTestVerification();
+  initUncensored();
   initPromptEnhance();
   initSocialWebSearch();
   initUpdateCheck();

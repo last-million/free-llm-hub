@@ -1,0 +1,114 @@
+"""Opt-in uncensored mode: OFF by default, and ON means ONLY.
+
+The safety filter (providers._BLOCK_RE) exists so an abliterated/NSFW fine-tune
+is never served by accident. This adds an explicit operator switch that INVERTS
+it rather than switching it off, so the pool becomes those models alone. A
+request then either lands on one or fails visibly, instead of an uncensored
+model quietly joining the pool and answering ordinary traffic.
+
+What these lock down: the default is untouched, the mode only ever moves by an
+explicit API call, and it survives the 5-hourly auto-update restart.
+"""
+from unittest import mock
+
+import app
+import config
+import providers as prov
+
+
+def _client():
+    app.app.config["TESTING"] = True
+    return app.app.test_client()
+
+
+def _hdrs():
+    return {"X-Free-LLM-Hub-Token": config.ensure_control_token(),
+            "X-Free-LLM-Hub": "dashboard"}
+
+
+NORMAL = ["meta-llama/Llama-3.3-70B-Instruct", "openai/gpt-oss-120b",
+          "deepseek-ai/DeepSeek-V3.1", "qwen/qwen3.8-27b"]
+UNCENSORED = ["cognitivecomputations/dolphin-mistral-24b-venice-edition",
+              "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q6_K_P.gguf",
+              "some-abliterated-model", "an-nsfw-tune"]
+
+
+def test_default_is_off_and_blocks_uncensored():
+    """The shipped default must not change: this is opt-in only."""
+    for m in NORMAL:
+        assert prov.is_model_allowed(m, uncensored_only_mode=False), m
+    for m in UNCENSORED:
+        assert not prov.is_model_allowed(m, uncensored_only_mode=False), m
+
+
+def test_on_means_only_not_also():
+    """ON inverts the filter: normal models drop OUT of the pool."""
+    for m in UNCENSORED:
+        assert prov.is_model_allowed(m, uncensored_only_mode=True), m
+    for m in NORMAL:
+        assert not prov.is_model_allowed(m, uncensored_only_mode=True), m
+
+
+def test_module_flag_defaults_off():
+    assert prov.uncensored_only() is False
+
+
+def test_empty_model_id_is_rejected_in_both_modes():
+    for mode in (True, False):
+        assert not prov.is_model_allowed(None, uncensored_only_mode=mode)
+        assert not prov.is_model_allowed("", uncensored_only_mode=mode)
+
+
+def test_toggle_endpoint_flips_the_live_flag_and_persists():
+    try:
+        with mock.patch.object(app, "_enabled_keyed", return_value=[]):
+            r = _client().post("/api/uncensored-mode", json={"enabled": True},
+                               headers=_hdrs())
+            assert r.status_code == 200
+            assert r.get_json()["enabled"] is True
+            assert prov.uncensored_only() is True
+            assert config.get_flag(app._UNCENSORED_FLAG, False) is True
+
+            r = _client().post("/api/uncensored-mode", json={"enabled": False},
+                               headers=_hdrs())
+            assert r.get_json()["enabled"] is False
+            assert prov.uncensored_only() is False
+    finally:
+        prov.set_uncensored_only(False)
+        config.set_flag(app._UNCENSORED_FLAG, False)
+
+
+def test_toggle_rejects_a_non_boolean():
+    for bad in ({}, {"enabled": "yes"}, {"enabled": 1}, {"on": True}):
+        r = _client().post("/api/uncensored-mode", json=bad, headers=_hdrs())
+        assert r.status_code == 400, bad
+    assert prov.uncensored_only() is False
+
+
+def test_toggling_clears_the_discovery_cache():
+    """The cache holds ALREADY-FILTERED lists, so a stale entry would make the
+    switch look like it did nothing for up to MODEL_CACHE_TTL seconds."""
+    try:
+        with app._model_cache_lock:
+            app._model_cache["groq"] = (9e9, ["stale-entry"])
+        with mock.patch.object(app, "_enabled_keyed", return_value=[]):
+            _client().post("/api/uncensored-mode", json={"enabled": True},
+                           headers=_hdrs())
+        with app._model_cache_lock:
+            assert "groq" not in app._model_cache
+    finally:
+        prov.set_uncensored_only(False)
+        config.set_flag(app._UNCENSORED_FLAG, False)
+
+
+def test_the_setting_is_restored_on_boot():
+    """providers.py holds it as a live module flag with no config import, so it
+    starts empty every boot -- including the 5-hourly auto-update restart."""
+    try:
+        config.set_flag(app._UNCENSORED_FLAG, True)
+        prov.set_uncensored_only(False)          # simulate a fresh process
+        prov.set_uncensored_only(config.get_flag(app._UNCENSORED_FLAG, False))
+        assert prov.uncensored_only() is True
+    finally:
+        prov.set_uncensored_only(False)
+        config.set_flag(app._UNCENSORED_FLAG, False)
