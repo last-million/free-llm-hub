@@ -4591,8 +4591,30 @@ def _exclude_google_for_foreign_tool_history(pids, require_tools, messages):
     return filtered or pids
 
 
+def _excluded_identities(header_value):
+    """Parse an X-Free-LLM-Hub-Exclude header into a set of model IDENTITIES.
+
+    Accepts a comma-separated list of either "<pid>/<model>" or a bare model id.
+    Matching is by _normalize_model_identity, i.e. the LEAF name, so excluding
+    "groq/openai/gpt-oss-120b" also excludes cerebras' bare "gpt-oss-120b" and
+    cloudflare's "@cf/openai/gpt-oss-120b" -- the same weights under three
+    spellings. Anyone asking for a different MODEL means a different model, not
+    the same one from another host."""
+    out = set()
+    for raw in str(header_value or "").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        # A "<pid>/<model>" prefix is stripped by the leaf rule anyway; this
+        # just means both spellings a caller might send are accepted.
+        ident = _normalize_model_identity(raw)
+        if ident:
+            out.add(ident)
+    return out
+
+
 def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_tools=False,
-                  messages=None):
+                  messages=None, exclude_identities=None):
     """Priority-ordered [(pid, model)] fallback chain. Primary first, then the
     next-best MODELS across every AVAILABLE, size-capable provider, INTERLEAVED
     across providers (best model of each provider, then each provider's 2nd, ...).
@@ -4601,8 +4623,21 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     like NVIDIA), while later rounds still try other models of the same provider
     (handles per-model limits like Groq). Size-incapable providers are skipped so
     a big request never falls onto one that will 413. Capped at MAX_HOPS."""
-    chain = [(primary_pid, model_id)]
-    seen = {(primary_pid, model_id)}
+    # Caller-vetoed models ("retry with a different model"): drop them before the
+    # primary is even seeded, or the one model the user just rejected would be
+    # tried FIRST on the retry. Never widened silently -- an empty result falls
+    # through to the normal "none available" path rather than quietly serving
+    # the excluded model anyway.
+    _veto = set(exclude_identities or ())
+    if (not primary_pid or not model_id
+            or (_veto and _normalize_model_identity(model_id) in _veto)):
+        # No primary to seed: either the caller has none to offer (it wants the
+        # chain to choose one), or the one it had is exactly what the user just
+        # rejected. Either way the ranked candidates below become the chain.
+        chain, seen = [], set()
+    else:
+        chain = [(primary_pid, model_id)]
+        seen = {(primary_pid, model_id)}
     # Split every available, size-capable candidate into FAST and SLOW tiers.
     # FAST models are tried first (best-first); SLOW reasoning models are the LAST
     # resort — only reached once the fast+good ones are exhausted/rate-limited.
@@ -4615,6 +4650,8 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         for m in _auto_models(pid):
             if (pid, m) in seen or not prov.is_model_allowed(m) or _is_model_dead(pid, m):
                 continue
+            if _veto and _normalize_model_identity(m) in _veto:
+                continue          # caller asked for a DIFFERENT model than this
             # skip a model that's individually rate-limited or over its per-model cap
             if quota.is_model_throttled(pid, m) or quota.model_status(pid, m)["exhausted"]:
                 continue
@@ -12568,11 +12605,31 @@ def v1_chat_completions():
     # Explicit '<pid>/<model>' bypasses model choice (chain still size-filters).
     est = _est_tokens(body.get("messages"), body.get("tools"))
     has_tools = bool(body.get("tools"))
+    # "Retry with a different model": the caller names the model(s) it does NOT
+    # want this time. Honoured for the Auto pick as well as the fallback chain --
+    # vetoing it only in the chain would let Auto re-pick the very model the user
+    # just rejected and answer from hop 1.
+    veto = _excluded_identities(request.headers.get("X-Free-LLM-Hub-Exclude"))
     diff = None
     if _is_orchestrate(body.get("model")):
         router = _route_for_vision if has_images else _route_by_difficulty
         pid, resolved, diff = router(body.get("messages"), body.get("max_tokens"), est,
                                      require_tools=has_tools)
+        if veto and pid is not None and _normalize_model_identity(resolved) in veto:
+            # Auto landed on exactly the model the user just rejected. Hand the
+            # choice to _build_chain with an empty primary: it applies the same
+            # veto, so its first entry is the best model that is NOT vetoed.
+            pid, resolved = None, None
+            for _p, _m in _build_chain("", "", est, require_vision=has_images,
+                                       require_tools=has_tools,
+                                       messages=body.get("messages"),
+                                       exclude_identities=veto):
+                pid, resolved = _p, _m
+                break
+            if pid is None:
+                return _openai_error(
+                    "No other model is available to retry with right now.", 503,
+                    "upstream_error")
         if pid is None:
             if has_images:
                 return _openai_error(
@@ -12599,9 +12656,14 @@ def v1_chat_completions():
     last_hop = (None, None)
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
     last_error = None  # class of the LAST failed hop (transparency header)
+    # Pass exclude_identities ONLY when something is actually vetoed, so the
+    # ordinary path keeps the exact call shape it always had (a stand-in for
+    # _build_chain should not have to know about a parameter it never sees).
+    _veto_kw = {"exclude_identities": veto} if veto else {}
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools,
-                                           messages=body.get("messages")):
+                                           messages=body.get("messages"),
+                                           **_veto_kw):
         if not prov.is_model_allowed(hop_model):
             continue
         # MID-REQUEST re-check. _build_chain is computed ONCE, up front, so a
