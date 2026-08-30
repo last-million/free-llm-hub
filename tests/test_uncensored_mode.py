@@ -135,6 +135,25 @@ def test_the_two_gates_no_longer_share_one_misleading_message():
     assert app._model_block_reason("groq", "openai/gpt-oss-120b") is None
 
 
+def test_an_exhausted_chain_names_the_mode_as_the_reason():
+    """REGRESSION. With the mode on, the pool is a handful of models on ONE
+    provider, so a single rate-limit empties it and the user got
+
+        503 All providers failed: none available
+
+    -- true, but it reads like the whole hub is down rather than like a setting
+    doing exactly what it was asked to."""
+    assert app._no_candidates_hint() == ""          # off -> normal wording
+    try:
+        prov.set_uncensored_only(True)
+        hint = app._no_candidates_hint()
+        assert "uncensored-only mode is ON" in hint, hint
+        assert "Settings" in hint, hint
+    finally:
+        prov.set_uncensored_only(False)
+    assert app._no_candidates_hint() == ""
+
+
 def test_the_setting_is_restored_on_boot():
     """providers.py holds it as a live module flag with no config import, so it
     starts empty every boot -- including the 5-hourly auto-update restart."""

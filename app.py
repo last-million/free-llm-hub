@@ -8408,6 +8408,22 @@ def api_agent_settings_update():
 _UNCENSORED_FLAG = "uncensored_only"
 
 
+def _no_candidates_hint():
+    """Extra sentence for an exhausted-chain 503, naming uncensored-only mode
+    when that is why the pool was tiny enough to run out.
+
+    "All providers failed: none available" is true but useless: with the mode on
+    the pool is a handful of models on ONE provider, so a single rate-limit
+    empties it and the message reads like the whole hub is down rather than like
+    a setting doing exactly what it was asked to. Empty string when the mode is
+    off, so the normal wording is untouched."""
+    if not prov.uncensored_only():
+        return ""
+    return (" — NOTE: uncensored-only mode is ON, so the normal catalog is "
+            "excluded and only a handful of uncensored models are eligible. "
+            "Turn it off in Settings to route to everything again.")
+
+
 def _model_block_reason(pid, model):
     """None when this model may run, else the reason it may not.
 
@@ -12894,7 +12910,7 @@ def v1_chat_completions():
             "Upstream returned non-JSON (%s, HTTP %d): %s"
             % (last_hard["pid"], last_hard["status"], last_hard["text"]), 503, "upstream_error"), eta), hdrs)
     return _with_headers(_with_retry_after(_openai_error(
-        "All providers failed: " + ("; ".join(errors) or "none available"), 503, "upstream_error"), eta), hdrs)
+        "All providers failed: " + ("; ".join(errors) or "none available") + _no_candidates_hint(), 503, "upstream_error"), eta), hdrs)
 
 
 # ---------------------------------------------------------------------------
@@ -13585,7 +13601,7 @@ def v1_responses(_retry_pass=False):
             "Upstream returned non-JSON (%s, HTTP %d): %s"
             % (last_hard["pid"], last_hard["status"], last_hard["text"]), 503, "upstream_error"), eta), hdrs)
     return _with_headers(_with_retry_after(_openai_error(
-        "All providers failed: " + ("; ".join(errors) or "none available"), 503, "upstream_error"), eta), hdrs)
+        "All providers failed: " + ("; ".join(errors) or "none available") + _no_candidates_hint(), 503, "upstream_error"), eta), hdrs)
 
 
 # ---------------------------------------------------------------------------
@@ -14183,7 +14199,7 @@ def v1_messages():
                                 % (last_hard["pid"], last_hard["http"], last_hard["detail"]),
                                 last_hard["status"]), eta), hdrs)
     return _with_headers(_with_retry_after(_anthropic_error("api_error",
-                            "All providers failed: " + ("; ".join(errors) or "none available"),
+                            "All providers failed: " + ("; ".join(errors) or "none available") + _no_candidates_hint(),
                             503), eta), hdrs)
 
 
