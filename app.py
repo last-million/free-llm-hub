@@ -50,7 +50,7 @@ from urllib.parse import quote, urlsplit
 
 import requests
 from flask import (Flask, Response, g, jsonify, make_response, render_template,
-                   request, stream_with_context)
+                   request, send_file, stream_with_context)
 
 try:
     from jinja2 import TemplateNotFound
@@ -6265,6 +6265,11 @@ def _security_headers(response):
         "Content-Security-Policy",
         "default-src 'none'; script-src 'nonce-%s'; "
         "style-src 'unsafe-inline'; img-src 'self' data:; "
+        # <video>/<audio> fall back to default-src 'none' without this, so a
+        # project's own video in the file preview is refused before it loads.
+        # Same-origin only: the bytes come from /api/workspace/raw, which is
+        # token-gated and path-confined to the project directory.
+        "media-src 'self'; "
         "connect-src 'self'; base-uri 'none'; form-action 'none'; "
         # The workspace preview frames the user's OWN project, which runs on a
         # loopback port we allocate at run time (PORT_RANGE). Without an explicit
@@ -9013,6 +9018,70 @@ def api_workspace_adopt():
                                        source=body.get("source") or "agent"))
     except workspace.WorkspaceError as exc:
         return jsonify({"error": _sanitize(str(exc))}), 400
+
+
+# What /api/workspace/raw will serve with a real media type. Everything else is
+# handed back as a download, never as something a browser will render: this is
+# same-origin, so letting a project's own .html or .svg be rendered here would
+# run it inside the dashboard's own origin. X-Content-Type-Options: nosniff is
+# set globally, and is what stops a browser second-guessing these.
+_RAW_MEDIA_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".ico": "image/x-icon", ".avif": "image/avif",
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+    ".m4v": "video/mp4", ".ogv": "video/ogg",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4", ".flac": "audio/flac",
+}
+# SVG is deliberately ABSENT: it is XML that can carry script, and serving it
+# inline from this origin would execute that script as the dashboard. It stays
+# a text file in the code view, where it is shown as source.
+_RAW_MAX_BYTES = 64 * 1024 * 1024
+
+
+@app.route("/api/workspace/raw", methods=["GET"])
+def api_workspace_raw():
+    """The RAW BYTES of one project file, for <img>/<video> in the preview.
+
+    /api/workspace/file returns JSON and cannot carry an image: it decodes
+    utf-8 and refuses anything with a NUL byte, so a .png came back as
+    {"binary": true} and the preview printed "Binary file — not shown."
+
+    Same guards as every other workspace route -- the agent gate, the control
+    token (accepted as ?token= so an <img src> can carry it), and
+    workspace._resolve_in, which resolves through symlinks and rejects anything
+    outside the project. Only known image/video/audio types get a real media
+    type; anything else is sent as an attachment so this can never become a way
+    to render a project's HTML inside the dashboard's origin."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    d, err = _workspace_dir_from({"project_dir": request.args.get("project_dir")})
+    if err:
+        return err
+    rel = request.args.get("path") or ""
+    try:
+        # _resolve_in returns (root, target), not just the path.
+        _root, target = workspace._resolve_in(d, rel)
+    except workspace.WorkspaceError as exc:
+        return jsonify({"error": _sanitize(str(exc))}), 400
+    if not os.path.isfile(target):
+        return jsonify({"error": "not a file"}), 404
+    try:
+        if os.path.getsize(target) > _RAW_MAX_BYTES:
+            return jsonify({"error": "file too large to preview"}), 413
+    except OSError as exc:
+        return jsonify({"error": _sanitize(str(exc))}), 400
+    ext = os.path.splitext(target)[1].lower()
+    mime = _RAW_MEDIA_TYPES.get(ext)
+    resp = send_file(target, mimetype=mime or "application/octet-stream",
+                     as_attachment=not mime,
+                     download_name=os.path.basename(target),
+                     conditional=True)      # Range requests, so video can seek
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/api/workspace/tree", methods=["GET"])
