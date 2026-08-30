@@ -8405,89 +8405,24 @@ def api_agent_settings_update():
                     "default_cli": agentic_chat.default_cli()})
 
 
-_UNCENSORED_FLAG = "uncensored_only"
-
-
 def _no_candidates_hint():
-    """Extra sentence for an exhausted-chain 503, naming uncensored-only mode
-    when that is why the pool was tiny enough to run out.
-
-    "All providers failed: none available" is true but useless: with the mode on
-    the pool is a handful of models on ONE provider, so a single rate-limit
-    empties it and the message reads like the whole hub is down rather than like
-    a setting doing exactly what it was asked to. Empty string when the mode is
-    off, so the normal wording is untouched."""
-    if not prov.uncensored_only():
-        return ""
-    return (" — NOTE: uncensored-only mode is ON, so the normal catalog is "
-            "excluded and only a handful of uncensored models are eligible. "
-            "Turn it off in Settings to route to everything again.")
+    """Reserved for extra context on an exhausted-chain 503. Empty today: the
+    uncensored-only mode that used to explain itself here is gone."""
+    return ""
 
 
 def _model_block_reason(pid, model):
     """None when this model may run, else the reason it may not.
 
-    TWO different gates used to share one message, which is how "you left
-    uncensored-only mode on" reached the user as "Model 'claude' is blocked by
-    the safety filter": a 403 accusing their model of being unsafe, with
-    nothing anywhere pointing at the toggle they had flipped. Each gate now
-    says what is actually true and how to undo it.
-
-    A sub-* hop is EXEMPT from uncensored-only mode. Those are the user's own
-    logged-in CLI subscriptions (Claude Code, Codex), not entries in the free
-    catalog this toggle is about, and no uncensored counterpart exists to route
-    them to. Applying the inverted filter there restricts nothing -- it just
-    makes the agent unusable, which is exactly what it did."""
-    if _is_sub(pid):
-        return None
-    if prov.uncensored_only():
-        if prov.is_model_allowed(model):
-            return None
-        return ("Uncensored-only mode is ON, so '%s' is excluded -- only "
-                "uncensored models can run while it is on. Turn it off in "
-                "Settings to use the normal catalog again." % model)
+    Kept as ONE helper rather than four inline copies of the same check, so a
+    future gate has a single place to add its own wording. The removed
+    uncensored-only mode is why that matters: it shared this message, so "you
+    left a toggle on" reached the user as "Model 'claude' is blocked by the
+    safety filter" -- a 403 accusing their own Claude Code subscription of
+    being unsafe, with nothing pointing at the setting responsible."""
     if not prov.is_model_allowed(model):
         return "Model '%s' is blocked by the safety filter." % model
     return None
-
-
-def _uncensored_payload():
-    """Current mode plus the one number that decides whether it is usable at
-    all: how many models the inverted filter actually leaves to route to.
-    Counted from the SAME discovery the router uses, so the dashboard cannot
-    promise a pool that routing does not have."""
-    on = prov.uncensored_only()
-    pool = []
-    for pid in _enabled_keyed():
-        for m in provider_free_models(pid):
-            pool.append(pid + "/" + m)
-    return {"enabled": on, "available": len(pool), "models": sorted(pool)[:40]}
-
-
-@app.route("/api/uncensored-mode", methods=["GET"])
-def api_uncensored_mode():
-    return jsonify(_uncensored_payload())
-
-
-@app.route("/api/uncensored-mode", methods=["POST"])
-def api_uncensored_mode_update():
-    """Operator-only switch: route to uncensored/abliterated models INSTEAD of
-    the normal catalog (see providers._UNCENSORED_ONLY for why it inverts
-    rather than widens). Off by default, control-token gated like every other
-    /api/* mutation, and never flipped by anything but an explicit call here."""
-    body = request.get_json(force=True, silent=True)
-    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
-        return jsonify({"error": "Pass {\"enabled\": bool}."}), 400
-    config.set_flag(_UNCENSORED_FLAG, body["enabled"])
-    prov.set_uncensored_only(body["enabled"])
-    # The discovery cache holds ALREADY-FILTERED lists, so without this the
-    # switch appears to do nothing for up to MODEL_CACHE_TTL seconds and then
-    # takes effect on its own — the worst possible feedback for a safety-
-    # relevant toggle.
-    with _model_cache_lock:
-        _model_cache.clear()
-    _log.warning("[uncensored-mode] set to %s by dashboard request", body["enabled"])
-    return jsonify(_uncensored_payload())
 
 
 @app.route("/api/agent/test-verification", methods=["GET"])
@@ -15696,19 +15631,6 @@ if __name__ == "__main__":
         _log.warning("could not sweep preview ports: %s", exc)
     workspace.start_reaper()   # stop previews nobody is watching
     _load_perf_stats()         # measured reliability/latency from previous runs
-    # Restore the operator's uncensored setting. providers.py holds it as a live
-    # module flag (no config import there), so it is empty on every boot until
-    # something puts it back — without this the mode would silently revert to
-    # OFF on each of the 5-hourly auto-update restarts.
-    prov.set_uncensored_only(config.get_flag(_UNCENSORED_FLAG, False))
-    if prov.uncensored_only():
-        # Loud on purpose. This mode excludes the ENTIRE normal catalog, and
-        # left on by accident it looks like the hub is broken rather than
-        # configured: every ordinary model comes back 403. It must never be a
-        # silent state you have to go digging in the dashboard to discover.
-        _log.warning("[uncensored-mode] ON — the normal catalog is EXCLUDED and "
-                     "only uncensored models will be routed to. Turn it off in "
-                     "Settings if that is not what you want.")
     _maybe_auto_create_desktop_shortcut()
     _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()
