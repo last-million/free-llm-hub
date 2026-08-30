@@ -18,6 +18,7 @@ import tempfile
 import pytest
 
 import app
+import craft
 import config
 import crews
 
@@ -158,7 +159,16 @@ def test_hint_never_injected_mid_loop(isolated_config):
                              "function": {"name": "f", "arguments": "{}"}}]},
             {"role": "tool", "tool_call_id": "1", "content": "ok"}]
     out = app._apply_craft_brief(msgs, agentic=True)
-    assert out is msgs
+    # CHANGED 2026-08-30: a mid-loop turn is no longer left completely
+    # untouched -- it now carries the small ACT block, because that is about how
+    # to END a turn and is needed on exactly the turns the opening brief never
+    # sees (13 of 14 real agent turns stopped mid-task without it). What this
+    # test guards is unchanged: the CREW HINT, and the domain brief, must still
+    # never be injected into a running loop.
+    injected = [m for m in out if m not in msgs]
+    assert all(m.get("content") == craft.ACT_RUN for m in injected), injected
+    assert all("CREW DELEGATION" not in (m.get("content") or "") for m in out)
+    assert [m for m in out if m in msgs] == msgs, "originals altered"
 
 
 def test_hint_flag_off(isolated_config):

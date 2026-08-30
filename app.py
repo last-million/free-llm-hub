@@ -5345,11 +5345,32 @@ def _apply_craft_brief(messages, agentic=False):
             return messages
         users = [m for m in messages
                  if isinstance(m, dict) and m.get("role") == "user"]
-        if len(users) != 1:
-            return messages            # not the opening turn
-        if any(isinstance(m, dict) and (m.get("role") == "tool" or m.get("tool_calls"))
-               for m in messages):
-            return messages            # a tool loop is already running
+        mid_loop = (len(users) != 1
+                    or any(isinstance(m, dict)
+                           and (m.get("role") == "tool" or m.get("tool_calls"))
+                           for m in messages))
+        if mid_loop:
+            # NOT the opening turn. The domain brief stays out -- it is about the
+            # TASK, and re-sending it into a running loop is the noise this
+            # opening-turn-only rule exists to prevent.
+            #
+            # ACT is different: it is about how to END a turn, so it is needed on
+            # exactly the turns the opening brief never sees. MEASURED 2026-08-30
+            # on a real codex session -- 13 of 14 agent turns ended with "Let me
+            # <do the next thing>." and then stopped, the precise shape ACT's
+            # first bullet forbids, and every one was turn 2 or later. The brief
+            # had only ever been injected on turn 1, so the instruction was never
+            # present when it was needed and the user typed "continue" 13 times.
+            #
+            # Additive and ~150 tokens: a system message, never a rewrite of the
+            # user's text or of the tool history.
+            if agentic and config.get_flag("act_every_turn", True):
+                act = craft.act_message()
+                i = 0
+                while i < len(messages) and isinstance(messages[i], dict)                         and messages[i].get("role") == "system":
+                    i += 1
+                return messages[:i] + [act] + messages[i:]
+            return messages
         text = users[0].get("content")
         if isinstance(text, list):     # multimodal turn -> its text parts
             text = " ".join(p.get("text") or "" for p in text if isinstance(p, dict))
