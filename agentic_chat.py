@@ -2376,6 +2376,24 @@ def get_session(session_id):
     }
 
 
+def set_quality(session_id, quality):
+    """Change a LIVE session's model quality. Returns the stored value, or None
+    for an unknown session.
+
+    Safe to change mid-conversation because the CLI is re-spawned for every
+    turn (see the two _agentic_env call sites) -- the child's environment, and
+    therefore ANTHROPIC_MODEL, is built fresh each time. The turn already in
+    flight keeps the mode it started with; the next one picks this up."""
+    if quality not in ("normal", "max"):
+        return None
+    with _REGISTRY_LOCK:
+        sess = _REGISTRY.get(session_id)
+        if sess is None:
+            return None
+        sess.quality = quality
+        return quality
+
+
 def list_sessions():
     """All active sessions (for the dashboard to restore UI state). Never raises."""
     with _REGISTRY_LOCK:
