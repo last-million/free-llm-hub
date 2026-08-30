@@ -4,6 +4,16 @@
 # to an open lower bound.
 flask==3.0.3
 requests==2.34.2
+# Reclaiming leaked preview servers (workspace.py _kill_listener /
+# sweep_own_range). NOT optional in practice: without psutil that code returns
+# False and reclaims NOTHING, so every preview that outlives its hub keeps its
+# port forever. Measured on this machine 2026-08-30: 18 orphaned
+# `python -m http.server` processes, 7 of them still holding ports 5800-5806
+# and refusing connections -- which is what a user sees as "all pages 404".
+# The import is guarded, so a missing psutil fails silently rather than loudly;
+# that is exactly why it has to be pinned here.
+psutil==7.2.1
+
 # WebP re-encoding of generated images (app.py _to_webp_b64). Optional at
 # runtime -- the hub falls back to the generator's own format if it is
 # missing -- but pinned here so every install actually gets WebP.
