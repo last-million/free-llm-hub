@@ -846,6 +846,11 @@ _CLAUDE_FAMILY_RE = re.compile(r"(?:^|[/:._-])claude[-.]?(?:opus|sonnet|haiku|fa
 _GPT_VER_RE = re.compile(r"\bgpt-(\d+)(?:\.(\d+))?")
 # GLM 5.x (Zhipu) — glm-5, glm-5.2, zhipu/glm-5.2, THUDM/glm-5. Not glm-4.x.
 _GLM5_RE = re.compile(r"glm-?5(?:\.\d+)?\b")
+# Same family, but with the version CAPTURED, so glm-5.3-and-up can be told
+# apart from 5.2. The trailing word boundary keeps glm-4.6v-flash out: its
+# "6" is followed by a word character, so the optional minor group
+# backtracks away and the match reads (4, 0).
+_GLM_VERSION_RE = re.compile(r"glm-?(\d+)(?:\.(\d+))?\b")
 # The LATEST qwen line only: qwen3.5 and up (3.5, 3.6, 3.8, 3.9...). Captures the
 # minor so a newer release outranks an older one instead of tying with it.
 # qwen3 / qwen2.5 deliberately do NOT match — the preference was about the
@@ -1354,6 +1359,28 @@ def _benchmark_score(pid, model_id):
     # -flash/-air variants are NOT included (the speed cap below still applies).
     if _GLM5_RE.search(low):
         score = max(score, _PREF_FLOORS[7])
+    # USER PREFERENCE 2026-08-30: "ox alpha ... it's the best one now" -- and
+    # "Ox Alpha" was the stealth name GLM-5.3-Flash shipped under (listed
+    # unnamed and free on OpenRouter 2026-08-20, revealed 2026-08-26). The
+    # coding numbers published under that name beat what already sits at the
+    # top of this table: DeepSWE 80% against Claude Fable 5's 65% and GPT-5.6
+    # Sol's 52%. So 5.3-and-up joins the top band instead of sharing 5.2's
+    # floor; 5.2 itself stays exactly where the 2026-07-31 preference put it
+    # ("GPT-5 versions are better than GLM 5.2"), which is why this is a
+    # separate version-gated floor rather than a bump to _PREF_FLOORS[7].
+    #
+    # VERIFIED REACHABLE FIRST. The only "ox-alpha" id in the entire catalog
+    # (g4f/...:pegalink/ox-alpha-agent) answered HTTP 400 on 6 of 6 attempts
+    # across three spellings; tokenrouter/z-ai/glm-5.3-free answered as itself.
+    # A floor on a model that cannot serve just puts a dead hop at the head of
+    # every chain -- which is the whole reason this was tested before promoted.
+    _glmv = _GLM_VERSION_RE.search(low)
+    if _glmv:
+        try:
+            if (int(_glmv.group(1)), int(_glmv.group(2) or 0)) >= (5, 3):
+                score = max(score, _PREF_FLOORS[5])
+        except ValueError:
+            pass
     # USER PREFERENCE 2026-08-01: "DeepSeek V4 should have priority almost as
     # much as GLM 5.2, and MiniMax M3 is also good, almost like DeepSeek 4."
     # UPDATED 2026-08-01, same day: "deepseek v4 seems good so it should be the
@@ -5994,6 +6021,9 @@ def _sustain_penalty(pid):
 _MODEL_ID_SUFFIX_RE = re.compile(r"(?::free|:beta|:extended|:nitro|:floor|:online)+$", re.IGNORECASE)
 
 
+_FREE_TIER_SUFFIX_RE = re.compile(r"-free$")
+
+
 def _normalize_model_identity(model_id):
     """Strip provider-added suffixes (openrouter's ':free', ':beta', etc.) AND
     the vendor namespace, then lowercase, so the SAME underlying model hosted by
@@ -6010,6 +6040,13 @@ def _normalize_model_identity(model_id):
     fired across them. Keeping only the leaf fixes that: hosts rename the
     namespace, never the model itself."""
     base = _MODEL_ID_SUFFIX_RE.sub("", (model_id or "").strip().lower())
+    # ...and the OTHER free-tier spelling. openrouter marks its free tier
+    # ':free' (handled above); tokenrouter appends '-free' instead, so
+    # 'z-ai/glm-5.3-free' and 'z-ai/glm-5.3' compared as two unrelated models
+    # and none of the same-identity machinery below fired across them. Anchored
+    # at the END so a model whose NAME contains the word ('free-willy-7b',
+    # 'freeform-2') is untouched.
+    base = _FREE_TIER_SUFFIX_RE.sub("", base)
     # Relay BACKEND prefixes, which g4f puts in front of the real id:
     # 'srv_mkom688d...:openai/gpt-oss-120b', 'pa:657cce02:auto',
     # 'nvidia:moonshotai/kimi-k3'. FOUND 2026-08-30 while testing the swarm
