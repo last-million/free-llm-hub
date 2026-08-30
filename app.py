@@ -6498,7 +6498,6 @@ def _activity_done(act, status, http=None):
             act["finished"] = time.time()
 
 
-@app.before_request
 def _build_sid():
     """The agent session id this request arrived under, or None."""
     try:
@@ -6525,6 +6524,7 @@ def _build_project():
         return None
 
 
+@app.before_request
 def _activity_before():
     if request.method != "POST":
         return None

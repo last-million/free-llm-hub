@@ -98,3 +98,39 @@ def test_the_feed_renders_the_source_and_the_swarm_race():
     assert "a.project" in html
     # the race is rendered by the pipeline chips the prose swarm already used
     assert "af-agent" in html
+
+
+def test_the_activity_hook_is_still_the_registered_before_request():
+    """CAUGHT IN PRODUCTION 2026-08-30: the two helpers above were inserted
+    BETWEEN @app.before_request and _activity_before, so the decorator bound to
+    _build_sid instead. The hub kept serving and every request still succeeded --
+    the activity feed simply recorded nothing, silently, forever.
+
+    Nothing about that is visible in a passing test suite or a 200 response,
+    which is why it is asserted here directly."""
+    import re, io, os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = io.open(os.path.join(root, "app.py"), encoding="utf-8").read()
+    m = re.search(r"@app\.before_request\s*\ndef (\w+)\(\):", src)
+    assert m, "no @app.before_request hook found at all"
+    names = re.findall(r"@app\.before_request\s*\ndef (\w+)\(", src)
+    assert "_activity_before" in names, \
+        "@app.before_request is bound to %s, not _activity_before" % names
+    # The helpers must be plain functions, never hooks.
+    assert not re.search(r"@app\.before_request\s*\ndef _build_sid\(", src)
+    assert not re.search(r"@app\.before_request\s*\ndef _build_project\(", src)
+
+
+def test_a_request_actually_produces_an_activity_row():
+    """The end-to-end guard: the decorator check above proves it is registered,
+    this proves it still populates a row."""
+    from unittest import mock as _m
+    before = len(app._activity)
+    with _m.patch.object(app, "_resolve_model", return_value=(None, "no models")):
+        app.app.test_client().post("/v1/chat/completions",
+                                   json={"model": "auto",
+                                         "messages": [{"role": "user", "content": "hi"}]})
+    assert len(app._activity) > before, "the request left no activity row"
+    row = app._activity[0]
+    assert row.get("source") == "cli"
+    assert row.get("project") is None
