@@ -15642,7 +15642,16 @@ def _do_git_update_check():
         _auto_update_state["last_result"] = "skipped: local uncommitted changes"
         return _auto_update_state["last_result"]
     rc, before, _ = _git("rev-parse", "HEAD")
-    rc2, _out, err = _git("pull", "--ff-only")
+    # Name the remote and branch explicitly rather than relying on the branch's
+    # upstream tracking. MEASURED 2026-08-30: a git-filter-repo run removes the
+    # 'origin' remote by design, and re-adding it does NOT restore tracking --
+    # so a bare `git pull --ff-only` died with "There is no tracking information
+    # for the current branch" and auto-update was silently off. Nothing about
+    # this repo's identity depends on that config: _origin_is_trusted() has
+    # already checked the remote, and the branch is the one we are on.
+    _rcb, _branch, _ = _git("rev-parse", "--abbrev-ref", "HEAD")
+    _branch = (_branch or "").strip() or "main"
+    rc2, _out, err = _git("pull", "--ff-only", "origin", _branch)
     if rc2 != 0:
         _auto_update_state["last_result"] = "pull failed: " + _sanitize(err)[:160]
         return _auto_update_state["last_result"]
