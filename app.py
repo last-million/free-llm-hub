@@ -9116,6 +9116,19 @@ def api_agent_history_get(session_id):
     return jsonify(conv)
 
 
+@app.route("/api/agent/history/<session_id>/title", methods=["POST"])
+def api_agent_history_set_title(session_id):
+    """Rename a conversation. The auto-title is a guess from the first message,
+    so correcting it has to be possible."""
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("title"), str):
+        return jsonify({"error": "Pass {\"title\": str}."}), 400
+    title = agentic_history.set_title(session_id, body["title"])
+    if title is None:
+        return jsonify({"error": "No such conversation."}), 404
+    return jsonify({"session_id": session_id, "title": title})
+
+
 @app.route("/api/agent/history/<session_id>", methods=["DELETE"])
 def api_agent_history_delete(session_id):
     deleted = agentic_history.delete_conversation(session_id)

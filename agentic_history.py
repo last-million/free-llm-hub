@@ -143,11 +143,32 @@ def _save_conversation(conv):
         raise
 
 
+MAX_TITLE_CHARS = 60
+DEFAULT_TITLE = "New conversation"
+
+
+def _title_from(text):
+    """A short, whitespace-collapsed label taken from the first USER message.
+
+    The conversation list used to show project_dir, i.e. 'project-20260830-
+    205446' -- a timestamp, which tells you when you started something and
+    nothing whatsoever about what it was. Quick chat already labels its rows
+    this way (quick_history._title_from); this is the same treatment for agent
+    conversations, so the two lists read alike."""
+    words = " ".join(str(text or "").split())
+    if not words:
+        return DEFAULT_TITLE
+    if len(words) <= MAX_TITLE_CHARS:
+        return words
+    return words[:MAX_TITLE_CHARS].rstrip() + "…"
+
+
 def _metadata_row(conv):
     return {
         "session_id": conv.get("session_id"),
         "cli_id": conv.get("cli_id"),
         "project_dir": conv.get("project_dir"),
+        "title": conv.get("title") or DEFAULT_TITLE,
         "started_at": conv.get("started_at"),
         "last_active_at": conv.get("last_active_at"),
         "turn_count": len(conv.get("turns") or []),
@@ -218,6 +239,15 @@ def record_turn(session_id, cli_id, project_dir, role, text, native_session_id=N
                 conv["cli_id"] = cli_id
             if project_dir:
                 conv["project_dir"] = project_dir
+            # Title from the first USER turn. Set once and never overwritten, so
+            # a long conversation keeps the name of what it was actually for --
+            # and so a user-chosen title (set_title) is never clobbered by a
+            # later turn. Assistant turns never name a conversation: the first
+            # thing said BY the agent is a reply, not the subject.
+            if role == "user" and not conv.get("title"):
+                title = _title_from(text)
+                if title != DEFAULT_TITLE:
+                    conv["title"] = title
             conv["last_active_at"] = now
             conv.setdefault("turns", []).append({
                 "role": role,
@@ -229,6 +259,27 @@ def record_turn(session_id, cli_id, project_dir, role, text, native_session_id=N
             _upsert_index_row(conv)
     except Exception:
         pass
+
+
+def set_title(session_id, title):
+    """Rename one conversation. Returns the stored title, or None if there is
+    no such conversation. An auto-title is a guess from the first message, so
+    there has to be a way to correct it; a blank title resets to the default
+    rather than leaving an unlabelled row."""
+    if not session_id:
+        return None
+    try:
+        with _LOCK:
+            conv = _load_conversation(session_id)
+            if conv is None:
+                return None
+            clean = " ".join(str(title or "").split())[:MAX_TITLE_CHARS]
+            conv["title"] = clean or DEFAULT_TITLE
+            _save_conversation(conv)
+            _upsert_index_row(conv)
+            return conv["title"]
+    except Exception:
+        return None
 
 
 def list_conversations(limit=50):
