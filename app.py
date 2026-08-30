@@ -846,6 +846,11 @@ _CLAUDE_FAMILY_RE = re.compile(r"(?:^|[/:._-])claude[-.]?(?:opus|sonnet|haiku|fa
 _GPT_VER_RE = re.compile(r"\bgpt-(\d+)(?:\.(\d+))?")
 # GLM 5.x (Zhipu) — glm-5, glm-5.2, zhipu/glm-5.2, THUDM/glm-5. Not glm-4.x.
 _GLM5_RE = re.compile(r"glm-?5(?:\.\d+)?\b")
+# Tencent HunYuan, with the version CAPTURED. hy3 was matched as a literal
+# substring, so a future hy4 matched nothing at all and scored 10.0 -- dead
+# last out of ~1300 listings. A version number is required immediately after
+# the family name, which keeps unrelated ids like "hypernova-3" out.
+_HY_VERSION_RE = re.compile(r"\b(?:hy|hunyuan)-?(\d+)\b")
 # Same family, but with the version CAPTURED, so glm-5.3-and-up can be told
 # apart from 5.2. The trailing word boundary keeps glm-4.6v-flash out: its
 # "6" is followed by a word character, so the optional minor group
@@ -1304,6 +1309,32 @@ def _benchmark_score(pid, model_id):
     # the max-based (hard/tools/agentic) routing — light tasks still pick cheapest.
     if "hy3" in low or "hunyuan-3" in low or "tencent-hy" in low:
         score = max(score, _PREF_FLOORS[0])
+    # USER PREFERENCE 2026-08-31: "check if hy4 available if yes he should be
+    # also used from top best models cause he is gooooooooooood".
+    #
+    # Tencent open-sourced Hy4 preview on 2026-08-28 (Apache 2.0, 770B MoE, 49B
+    # active, 1M context): Terminal Bench 2.1 85.4, past DeepSeek V4 Pro;
+    # DeepSWE 28.0 -> 64.3; and 2.99/4.00 in Tencent's own 163-expert blind
+    # eval, slightly ahead of GLM-5.3 (2.92) and Kimi K3 (2.94). So hy4-and-up
+    # joins the top band. hy3 keeps its own, lower floor above, exactly where
+    # the earlier preference put it.
+    #
+    # NOT AVAILABLE ANYWHERE YET, measured: all 416 discovered ids searched for
+    # tencent/hunyuan/hy-<n>/770b returned three entries, every one of them hy3.
+    # This is written now because of what the substring test above did to a
+    # version it had never heard of: hy4 scored 10.0, dead last, so the
+    # strongest model of the family would have been the worst-ranked thing in
+    # the hub on the day it arrived -- and silently, since a model that is never
+    # picked never fails either. A floor is only a preference among models that
+    # exist; if hy4 turns up dead, the measured machinery demotes it like
+    # anything else (_note_nonanswer, the reliability ledger, the swarm prior).
+    _hyv = _HY_VERSION_RE.search(low)
+    if _hyv:
+        try:
+            if int(_hyv.group(1)) >= 4:
+                score = max(score, _PREF_FLOORS[5])
+        except ValueError:
+            pass
     # USER PREFERENCE: Kimi K3 (Moonshot) — top pick for the heaviest tasks, right
     # behind hy3 and above every other model. Auto-applies when a provider serves a
     # kimi-k3 id (nothing lists it yet). Matches kimi-k3 / kimi-k3.x / .../kimi-k3.
