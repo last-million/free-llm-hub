@@ -846,6 +846,8 @@ _CLAUDE_FAMILY_RE = re.compile(r"(?:^|[/:._-])claude[-.]?(?:opus|sonnet|haiku|fa
 _GPT_VER_RE = re.compile(r"\bgpt-(\d+)(?:\.(\d+))?")
 # GLM 5.x (Zhipu) — glm-5, glm-5.2, zhipu/glm-5.2, THUDM/glm-5. Not glm-4.x.
 _GLM5_RE = re.compile(r"glm-?5(?:\.\d+)?\b")
+# Moonshot Kimi, version captured: kimi-k3, kimi-k3.5, kimik4, .../kimi-k5.
+_KIMI_VERSION_RE = re.compile(r"kimi-?k-?(\d+)")
 # Tencent HunYuan, with the version CAPTURED. hy3 was matched as a literal
 # substring, so a future hy4 matched nothing at all and scored 10.0 -- dead
 # last out of ~1300 listings. A version number is required immediately after
@@ -860,7 +862,11 @@ _GLM_VERSION_RE = re.compile(r"glm-?(\d+)(?:\.(\d+))?\b")
 # minor so a newer release outranks an older one instead of tying with it.
 # qwen3 / qwen2.5 deliberately do NOT match — the preference was about the
 # latest qwen, and floating the whole family would lift the small old ones too.
-_QWEN_LATEST_RE = re.compile(r"qwen-?3\.([5-9])\b")
+# Qwen, MAJOR and minor captured. The old pattern was r"qwen-?3\.([5-9])"
+# -- 3.5 through 3.9 and nothing else -- so qwen4 matched nothing and scored
+# 100 while qwen3.9 scored 134.09: the newer model ranked WORSE. See
+# tests/test_newer_never_ranks_lower.py, which now guards every family.
+_QWEN_LATEST_RE = re.compile(r"qwen-?(\d+)(?:\.(\d+))?\b")
 # DeepSeek V4 (and later) — deepseek-v4, deepseek-v4-flash, deepseek/deepseek-v4,
 # and morph's 'dsv4flash' once _canon_model_id has expanded it. V3 and R1 keep
 # their measured Tier A/S scores; only the v4+ generation gets the floor.
@@ -1338,8 +1344,18 @@ def _benchmark_score(pid, model_id):
     # USER PREFERENCE: Kimi K3 (Moonshot) — top pick for the heaviest tasks, right
     # behind hy3 and above every other model. Auto-applies when a provider serves a
     # kimi-k3 id (nothing lists it yet). Matches kimi-k3 / kimi-k3.x / .../kimi-k3.
-    if "kimi-k3" in low or "kimik3" in low:
-        score = max(score, _PREF_FLOORS[1])
+    # k3 AND UP. This was the literal string "kimi-k3", so kimi-k4 matched
+    # nothing and scored 108 against k3's 134.8 -- the newer model ranking below
+    # the one it replaces, the same defect found in glm, hunyuan and qwen. The
+    # k2.x ceiling below is unaffected: it is a separate, explicit demotion the
+    # user asked for, and 2 < 3 never reaches this floor.
+    _km = _KIMI_VERSION_RE.search(low)
+    if _km:
+        try:
+            if int(_km.group(1)) >= 3:
+                score = max(score, _PREF_FLOORS[1] + min(int(_km.group(1)) - 3, 9) * 0.1)
+        except ValueError:
+            pass
     # USER CORRECTION 2026-07-31: "kimi 2.7 is not better than qwen 3.5 or 3.6,
     # or even mimo 2.5." It used to be FLOORED at 133, which ranked it above
     # qwen3.6 (109) and mimo (100) and made it win turns it should not have.
@@ -1444,7 +1460,18 @@ def _benchmark_score(pid, model_id):
     # scores, since the preference was about the LATEST qwen.
     _qm = _QWEN_LATEST_RE.search(low)
     if _qm:
-        score = max(score, _PREF_FLOORS[7] + min(int(_qm.group(1)), 9) * 0.01)
+        try:
+            _qmaj = int(_qm.group(1))
+            _qmin = int(_qm.group(2) or 0)
+        except ValueError:
+            _qmaj = _qmin = 0
+        # 3.5+ is where the preference starts; 4+ has no minor to wait for.
+        if (_qmaj, _qmin) >= (3, 5):
+            # Scaled so a newer qwen always beats an older one, and a whole
+            # major version is worth more than a minor: 3.5 -> 134.05,
+            # 3.8 -> 134.08, 4.0 -> 134.10, 5.0 -> 134.20.
+            _bump = min(_qmaj - 3, 9) * 0.1 + min(_qmin, 9) * 0.01
+            score = max(score, _PREF_FLOORS[7] + _bump)
     if _MINIMAX3_RE.search(low):
         score = max(score, _PREF_FLOORS[10])
     # USER PREFERENCE 2026-08-01: "gemini flash or pro 3.1, 3.5, 3.6 and up are
