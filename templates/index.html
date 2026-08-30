@@ -5714,6 +5714,8 @@
     });
     modelSel.addEventListener('focus', loadChatModels);  /* keep list fresh as providers change */
     updateChatAuthNote();
+    initSwarmSwitch();   /* defined in THIS scope -- see the note on the call
+                            that used to sit at top level and threw */
   }
 
   /* ---------- opening-prompt enhancement (dashboard only) ------------------
@@ -9298,7 +9300,6 @@
   initArtifactPanel();
   initVisionGap();
   initTestVerification();
-  initSwarmSwitch();
   initPromptEnhance();
   initSocialWebSearch();
   initUpdateCheck();
