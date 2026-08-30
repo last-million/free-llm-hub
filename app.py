@@ -7411,8 +7411,9 @@ def api_default():
         return jsonify({"error": "both 'provider' and 'model' are required"}), 400
     if not prov.get_provider(provider):
         return jsonify({"error": "unknown provider '%s'" % provider}), 404
-    if not prov.is_model_allowed(model):
-        return jsonify({"error": "model '%s' is blocked by the safety filter" % model}), 403
+    blocked = _model_block_reason(provider, model)
+    if blocked:
+        return jsonify({"error": blocked}), 403
     config.set_default(provider, model)
     return jsonify({"ok": True, "default": config.get_default()})
 
@@ -8405,6 +8406,33 @@ def api_agent_settings_update():
 
 
 _UNCENSORED_FLAG = "uncensored_only"
+
+
+def _model_block_reason(pid, model):
+    """None when this model may run, else the reason it may not.
+
+    TWO different gates used to share one message, which is how "you left
+    uncensored-only mode on" reached the user as "Model 'claude' is blocked by
+    the safety filter": a 403 accusing their model of being unsafe, with
+    nothing anywhere pointing at the toggle they had flipped. Each gate now
+    says what is actually true and how to undo it.
+
+    A sub-* hop is EXEMPT from uncensored-only mode. Those are the user's own
+    logged-in CLI subscriptions (Claude Code, Codex), not entries in the free
+    catalog this toggle is about, and no uncensored counterpart exists to route
+    them to. Applying the inverted filter there restricts nothing -- it just
+    makes the agent unusable, which is exactly what it did."""
+    if _is_sub(pid):
+        return None
+    if prov.uncensored_only():
+        if prov.is_model_allowed(model):
+            return None
+        return ("Uncensored-only mode is ON, so '%s' is excluded -- only "
+                "uncensored models can run while it is on. Turn it off in "
+                "Settings to use the normal catalog again." % model)
+    if not prov.is_model_allowed(model):
+        return "Model '%s' is blocked by the safety filter." % model
+    return None
 
 
 def _uncensored_payload():
@@ -12604,9 +12632,9 @@ def v1_chat_completions():
         pid, resolved = _resolve_model(body.get("model"))
     if pid is None:
         return _openai_error(resolved, 400)
-    if not prov.is_model_allowed(resolved):
-        return _openai_error("Model '%s' is blocked by the safety filter." % resolved, 403,
-                             "permission_error")
+    _blocked = _model_block_reason(pid, resolved)
+    if _blocked:
+        return _openai_error(_blocked, 403, "permission_error")
     if has_images and not _is_vision_model(pid, resolved):
         return _openai_error(
             "Model '%s/%s' is not a verified vision model." % (pid, resolved), 400)
@@ -13292,9 +13320,9 @@ def v1_responses(_retry_pass=False):
         pid, resolved = _resolve_model(body.get("model"))
     if pid is None:
         return _openai_error(resolved, 400)
-    if not prov.is_model_allowed(resolved):
-        return _openai_error("Model '%s' is blocked by the safety filter." % resolved, 403,
-                             "permission_error")
+    _blocked = _model_block_reason(pid, resolved)
+    if _blocked:
+        return _openai_error(_blocked, 403, "permission_error")
     if has_images and not _is_vision_model(pid, resolved):
         return _openai_error(
             "Model '%s/%s' is not a verified vision model." % (pid, resolved), 400)
@@ -13970,9 +13998,9 @@ def v1_messages():
         pid, resolved = _resolve_model(body.get("model"))
     if pid is None:
         return _anthropic_error("invalid_request_error", resolved, 400)
-    if not prov.is_model_allowed(resolved):
-        return _anthropic_error("permission_error",
-                                "Model '%s' is blocked by the safety filter." % resolved, 403)
+    _blocked = _model_block_reason(pid, resolved)
+    if _blocked:
+        return _anthropic_error("permission_error", _blocked, 403)
     if has_images and not _is_vision_model(pid, resolved):
         return _anthropic_error(
             "invalid_request_error",
@@ -15657,6 +15685,14 @@ if __name__ == "__main__":
     # something puts it back — without this the mode would silently revert to
     # OFF on each of the 5-hourly auto-update restarts.
     prov.set_uncensored_only(config.get_flag(_UNCENSORED_FLAG, False))
+    if prov.uncensored_only():
+        # Loud on purpose. This mode excludes the ENTIRE normal catalog, and
+        # left on by accident it looks like the hub is broken rather than
+        # configured: every ordinary model comes back 403. It must never be a
+        # silent state you have to go digging in the dashboard to discover.
+        _log.warning("[uncensored-mode] ON — the normal catalog is EXCLUDED and "
+                     "only uncensored models will be routed to. Turn it off in "
+                     "Settings if that is not what you want.")
     _maybe_auto_create_desktop_shortcut()
     _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()

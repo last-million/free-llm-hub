@@ -101,6 +101,40 @@ def test_toggling_clears_the_discovery_cache():
         config.set_flag(app._UNCENSORED_FLAG, False)
 
 
+def test_a_cli_subscription_hop_is_never_blocked_by_the_mode():
+    """REGRESSION. Leaving the mode on made the agent fail with
+    "Model 'claude' is blocked by the safety filter" -- a 403 accusing the
+    user's own logged-in Claude Code subscription of being unsafe.
+
+    A sub-* hop is not an entry in the free catalog this toggle is about, and
+    there is no uncensored counterpart to route it to, so the inverted filter
+    restricts nothing there and only breaks the agent."""
+    try:
+        prov.set_uncensored_only(True)
+        assert app._model_block_reason("sub-claude", "claude") is None
+        assert app._model_block_reason("sub-codex", "gpt-5.2") is None
+    finally:
+        prov.set_uncensored_only(False)
+
+
+def test_the_two_gates_no_longer_share_one_misleading_message():
+    """Uncensored-only mode must not be reported as a safety block: the user
+    needs to be told which toggle to flip, not that their model is unsafe."""
+    try:
+        prov.set_uncensored_only(True)
+        why = app._model_block_reason("groq", "openai/gpt-oss-120b")
+        assert why and "Uncensored-only mode is ON" in why, why
+        assert "Settings" in why, why
+        # ...and an actually-uncensored model passes while the mode is on.
+        assert app._model_block_reason("g4f", "some-uncensored-thing") is None
+    finally:
+        prov.set_uncensored_only(False)
+    # With the mode OFF the safety wording is the one that applies.
+    why = app._model_block_reason("g4f", "some-uncensored-thing")
+    assert why and "safety filter" in why, why
+    assert app._model_block_reason("groq", "openai/gpt-oss-120b") is None
+
+
 def test_the_setting_is_restored_on_boot():
     """providers.py holds it as a live module flag with no config import, so it
     starts empty every boot -- including the 5-hourly auto-update restart."""
