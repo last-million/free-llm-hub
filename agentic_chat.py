@@ -557,7 +557,8 @@ def _isolated_config_dir(cli_id: str) -> str:
                         "isolated-clis", cli_id, "config")
 
 
-def _agentic_env(cli_id: str = None, project_dir: str = None) -> dict:
+def _agentic_env(cli_id: str = None, project_dir: str = None,
+                 quality: str = "normal") -> dict:
     """Child env with every hub-pointing override stripped, PWD resynced to
     match the subprocess cwd we are about to give it, and the CLI pointed at
     the hub's OWN config directory.
@@ -601,7 +602,7 @@ def _agentic_env(cli_id: str = None, project_dir: str = None) -> dict:
             if cli_id == "opencode":
                 _seed_opencode_config(path)
             elif cli_id == "claude":
-                _apply_claude_hub_fallback(env, path)
+                _apply_claude_hub_fallback(env, path, quality)
             elif cli_id == "codex":
                 _apply_codex_hub_fallback(path)
     return env
@@ -611,7 +612,7 @@ def _hub_base_url() -> str:
     return "http://127.0.0.1:%d" % _port()
 
 
-def _apply_claude_hub_fallback(env, config_home):
+def _apply_claude_hub_fallback(env, config_home, quality="normal"):
     """No subscription, no problem: an isolated copy that has never been
     signed in runs against THIS HUB'S OWN FREE MODELS instead, same as
     opencode already does -- asked for directly: "/agent CLIs should work
@@ -632,7 +633,13 @@ def _apply_claude_hub_fallback(env, config_home):
         return
     env["ANTHROPIC_BASE_URL"] = _hub_base_url()
     env["ANTHROPIC_AUTH_TOKEN"] = config.get_local_api_key() or "free-llm-hub"
-    env["ANTHROPIC_MODEL"] = "auto"
+    # "best" is `auto` that never drops to the cheap tier (app.py's
+    # _is_orchestrate accepts it; _route_by_difficulty lifts `simple` when it
+    # sees it). Sent as the MODEL so the choice travels with every turn the CLI
+    # makes, including the small intermediate ones -- there is no other channel
+    # back to the hub, since the CLI subprocess is an ordinary API client and
+    # carries no session identity of its own.
+    env["ANTHROPIC_MODEL"] = "best" if quality == "max" else "auto"
 
 
 # Bare minimum codex needs to treat the hub as a provider -- the same shape
@@ -939,9 +946,9 @@ def _terminate(proc) -> None:
 class _Session:
     __slots__ = ("id", "cli_id", "project_dir", "native_session_id", "turn_count",
                  "created_at", "proc", "proc_lock", "turn_lock", "last_interrupted",
-                 "tools_notified")
+                 "tools_notified", "quality")
 
-    def __init__(self, cli_id, project_dir):
+    def __init__(self, cli_id, project_dir, quality="normal"):
         self.id = uuid.uuid4().hex
         self.cli_id = cli_id
         self.project_dir = project_dir
@@ -953,6 +960,10 @@ class _Session:
         self.turn_lock = threading.Lock()  # only one turn may run at a time
         self.last_interrupted = False
         self.tools_notified = False        # missing-toolchain notice, once per session
+        # "normal" | "max". Chosen once, when the session starts. "max" launches
+        # the CLI with ANTHROPIC_MODEL=best instead of auto, so every turn it
+        # sends is routed at the top tier and never drops to the cheap one.
+        self.quality = quality if quality in ("normal", "max") else "normal"
 
 
 _REGISTRY: dict[str, _Session] = {}
@@ -1016,7 +1027,7 @@ def get_recent_projects():
         return list(_recent_projects)
 
 
-def start_session(cli_id, project_dir, create_new=False) -> str:
+def start_session(cli_id, project_dir, create_new=False, quality="normal") -> str:
     """Validate + register a new agentic session, return its session_id.
     Raises AgenticError (with a caller-friendly .status) on any invalid input.
     Never spawns a subprocess -- that only happens on the first send_message().
@@ -1074,7 +1085,7 @@ def start_session(cli_id, project_dir, create_new=False) -> str:
     if not supported:
         raise AgenticError("%s agentic mode is not currently supported: %s"
                            % (cli_id, reason), 400)
-    sess = _Session(cli_id, abs_dir)
+    sess = _Session(cli_id, abs_dir, quality=quality)
     with _REGISTRY_LOCK:
         _REGISTRY[sess.id] = sess
     _remember_recent_project(abs_dir)
@@ -1726,7 +1737,9 @@ def send_message(session_id, text):
             argv = _build_argv(sess, bin_path, text)
             try:
                 proc = subprocess.Popen(
-                    argv, cwd=sess.project_dir, env=_agentic_env(sess.cli_id, sess.project_dir),
+                    argv, cwd=sess.project_dir,
+                    env=_agentic_env(sess.cli_id, sess.project_dir,
+                                      getattr(sess, "quality", "normal")),
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, encoding="utf-8", errors="replace",
                     **_tree_popen_kwargs())
@@ -2080,7 +2093,8 @@ def send_message_stream(session_id, text):
         while True:
             was_resume = bool(sess.native_session_id)
             argv = _build_argv(sess, bin_path, text, stream=True)
-            child_env = _agentic_env(sess.cli_id, sess.project_dir)
+            child_env = _agentic_env(sess.cli_id, sess.project_dir,
+                                     getattr(sess, "quality", "normal"))
             try:
                 proc = subprocess.Popen(
                     argv, cwd=sess.project_dir, env=child_env,
@@ -2348,6 +2362,7 @@ def get_session(session_id):
     return {
         "session_id": sess.id,
         "cli": sess.cli_id,
+        "quality": getattr(sess, "quality", "normal"),
         "project_dir": sess.project_dir,
         "turn_count": sess.turn_count,
         "currently_running": running,
