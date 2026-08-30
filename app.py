@@ -12948,6 +12948,115 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
 # 3 is enough for a real best-of, and small enough that a free tier survives a
 # long agent run.
 _SWARM_TOOL_FANOUT = 3
+# How deep into the chain to look before ranking. Bigger than the fan-out on
+# purpose: with only three candidates there is nothing to choose BETWEEN, which
+# is exactly how the swarm ended up filling half its slots with models that
+# never answer (see _swarm_rank).
+_SWARM_TOOL_CANDIDATES = 12
+# Below this measured delivery rate a model is demoted out of a swarm slot.
+# _reliability is Laplace smoothed and returns a flat 0.5 when unknown, so this
+# only ever catches a REAL record: 0 of 3 answered is (0+1)/(3+2) = 0.2, while
+# a single unlucky failure is (0+1)/(1+2) = 0.33 -- deliberately above a lone
+# bad hop's reach once one success exists ((1+1)/(2+2) = 0.5).
+_SWARM_MIN_RELIABILITY = 0.4
+
+
+# A provider needs a real record before it says anything about a model nobody
+# has tried. Two failures is a bad afternoon; this many is a pattern.
+_PROVIDER_PRIOR_MIN_SAMPLES = 6
+
+
+def _provider_outcome_totals(pid):
+    """Every recorded outcome for one provider, summed. None when it has no
+    fresh record at all."""
+    ok = fail = 0
+    found = False
+    now = time.time()
+    with _outcome_lock:
+        for (p, _m), rec in _outcomes.items():
+            if p != pid or now - rec.get("last", 0) > _OUTCOME_TTL:
+                continue
+            found = True
+            ok += rec.get("ok", 0)
+            fail += rec.get("fail", 0)
+    return {"ok": ok, "fail": fail} if found else None
+
+
+def _swarm_reliability(pid, model):
+    """Delivery rate for a swarm slot, with a PROVIDER-level prior behind it.
+
+    MEASURED 2026-08-30, after ranking by _reliability alone shipped: a swarm
+    turn came back 2-of-3 dead anyway, and one dead member was
+    'g4f/RelayRouter:gemini-3.7-flash-free' -- an id the ledger had never seen,
+    on a provider it had already measured at 0 successes in 16 tries under four
+    OTHER ids. A relay fronts the same model once per backend
+    ('srv_msjk...:gemini-3.6-flash', 'AnyProvider:gemini-3.6-flash',
+    'RelayRouter:gemini-3.7-flash-free', ...), so every listing is a separate
+    key and the hub relearns the same lesson forever, one id at a time.
+
+    So: this exact model's own record when it has one, otherwise the provider's
+    -- and a flat neutral 0.5 when neither has enough evidence to say anything.
+    Deliberately SWARM-ONLY. Ordinary routing keeps judging a model purely on
+    its own history, because there a bad hop costs one retry, while here it
+    costs a whole slot in a fan-out that only has three."""
+    own = _reliability(pid, model)
+    if own != 0.5:
+        return own                      # it has its own record; use it
+    totals = _provider_outcome_totals(pid)
+    if not totals:
+        return 0.5
+    ok, fail = totals["ok"], totals["fail"]
+    if ok + fail < _PROVIDER_PRIOR_MIN_SAMPLES:
+        return 0.5
+    return (ok + 1.0) / (ok + fail + 2.0)
+
+
+def _swarm_rank(cands):
+    """Order swarm candidates by what actually DELIVERS, and push the ones with
+    a real record of not answering to the back.
+
+    _build_chain hands its entries back in raw-benchmark order. That is right
+    for a FALLBACK chain -- try the best, drop to the next when it fails -- and
+    wrong for a swarm, where every member runs at once and one that will not
+    answer is pure waste. Hops 2 and 3 of a fallback chain are, by construction,
+    the entries the hub already ranks lower and trusts less.
+
+    MEASURED 2026-08-30 over 24 real swarm slots: 12 came back "no answer", and
+    not evenly -- g4f went 0-for-3 and nvidia 4-for-11 while google and glm
+    answered 8 of 9. The hub was already recording that (_record_outcome on
+    every hop, read back by _reliability); the swarm just never asked.
+
+    Two orderings, in this order:
+      1. models with a real record of failing go last (never dropped outright --
+         a smaller swarm is worse than a member that might not answer, and the
+         fan-out is the whole point);
+      2. within that, _agentic_score decides -- the same key agentic routing
+         already uses, so strength still wins between two healthy models.
+    Then providers are spread across the slots, because one provider having a
+    bad minute must not take the entire swarm down with it."""
+    if not cands:
+        return []
+    ranked = sorted(cands, reverse=True,
+                    key=lambda pm: _agentic_score((_benchmark_score(pm[0], pm[1]),
+                                                   pm[0], pm[1])))
+    healthy = [pm for pm in ranked
+               if _swarm_reliability(pm[0], pm[1]) >= _SWARM_MIN_RELIABILITY]
+    weak = [pm for pm in ranked if pm not in healthy]
+    ordered = healthy + weak
+
+    picks, used = [], set()
+    for pm in ordered:                      # one pass preferring a fresh provider
+        if pm[0] not in used:
+            picks.append(pm)
+            used.add(pm[0])
+            if len(picks) >= _SWARM_TOOL_FANOUT:
+                return picks
+    for pm in ordered:                      # then top up, repeats allowed
+        if pm not in picks:
+            picks.append(pm)
+            if len(picks) >= _SWARM_TOOL_FANOUT:
+                break
+    return picks
 
 
 def _swarm_tool_result(body):
@@ -13001,16 +13110,18 @@ def _swarm_tool_result(body):
     # Distinct MODELS, not distinct listings: three copies of one model relayed
     # by one provider is not a second opinion, it is the same opinion three
     # times at three times the cost.
-    picks, seen = [], set()
+    cands, seen = [], set()
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_tools=True,
                                            messages=messages):
         ident = _normalize_model_identity(hop_model)
         if ident in seen:
             continue
         seen.add(ident)
-        picks.append((hop_pid, hop_model))
-        if len(picks) >= _SWARM_TOOL_FANOUT:
+        cands.append((hop_pid, hop_model))
+        if len(cands) >= _SWARM_TOOL_CANDIDATES:
             break
+    # Rank by delivery, don't just take the top of the chain -- see _swarm_rank.
+    picks = _swarm_rank(cands)
     if not picks:
         return None
 
