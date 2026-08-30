@@ -327,6 +327,28 @@ ACT_RUN = """ACT (applies to every brief above, comes before VERIFY/FIX/STOP)
 - Neither covers a genuinely open decision (which real option, anything destructive/irreversible, anything you are missing information for) -- state those and wait, same as always."""
 
 
+PLAN_PHASES = """PLAN FIRST (swarm mode is on)
+Before touching anything, write the todo list you will actually work from:
+- Phases, each producing a CONCRETE artefact, each with an observable "done when".
+- Mark for every phase what it NEEDS the output of. A phase that needs nothing
+  from another can run at the SAME TIME as it; say which ones those are and do
+  them together. Only a phase that genuinely cannot start without another's
+  output waits for it -- serialising work that could overlap wastes the team.
+- Then execute it, keeping the list updated as each phase lands. Do not stop
+  between phases to report; the list IS the report."""
+
+
+def plan_message():
+    """The phased-plan instruction, for swarm mode.
+
+    The prose pipeline plans this way already (swarm._waves runs independent
+    phases concurrently), but a CLI in swarm mode drives its OWN loop, so the
+    planning has to be asked for rather than imposed. Opening turn only: it is
+    about how to START, and re-sending it mid-task would invite replanning work
+    already done."""
+    return {"role": "system", "content": PLAN_PHASES}
+
+
 def act_message():
     """Just the ACT block, as a system message.
 

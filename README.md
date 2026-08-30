@@ -339,6 +339,49 @@ accordingly. Treat streamed-session numbers as an approximation, not a metered
 bill — this is a local convenience tracker, not a billing system, and it never
 talks to any provider's own usage/billing API.
 
+## Build mode — watch a project get built, live
+
+`http://127.0.0.1:8787/build` runs a real coding CLI (Claude Code, Codex,
+OpenCode) inside a folder you pick, and shows you the work as it happens:
+the conversation on the left, a **file browser and live preview** on the right.
+Files appear as they are written, and the preview reloads.
+
+The CLI is a normal subprocess with full permissions in that folder — it
+creates, edits and deletes files and runs commands. The models it thinks with
+come from this hub, so the whole thing runs on free providers.
+
+**Choosing how it picks models.** Asked once when a session starts, and
+changeable mid-conversation from the dropdown in the session bar — the CLI is
+re-spawned each turn, so the next message obeys whatever it says now:
+
+| Mode | What happens | Cost |
+|---|---|---|
+| **Normal** | Strong models for real work, cheap ones for trivial steps | Baseline |
+| **Max quality** | Every turn on the strongest models, never the cheap tier | More quota |
+| **Max (swarm agents)** | Several strong models answer *every* turn at once, best answer wins | ~3x quota, slower |
+
+Swarm mode also asks the agent to start with a phased plan that marks which
+phases can run at the same time and which have to wait for another's output.
+
+**Why swarm works here at all.** The multi-phase pipeline behind the `swarm`
+and `crew` chat models produces finished prose and never tool calls, so it
+cannot drive a coding agent — an agent fed by it would write no files. A tool
+turn instead runs the same request, with the real tools, on several distinct
+strong models in parallel and returns the best single response. A model that
+actually used a tool beats one that only described what it would do.
+
+**Previewing what it builds.** The file browser shows text with line numbers,
+and renders images, video and audio inline. The preview pane serves the project
+over a local HTTP server (ports 5800-5899), which is what makes root-absolute
+links like `/index.html` work — they 404 when a page is opened straight off
+disk.
+
+**Where a request came from.** The activity feed labels every call `build` (a
+session this page started, with the project name) or `CLI` (anything else
+pointed at the hub), so a dashboard session and your own terminal are no longer
+indistinguishable. A swarm turn also lists every model that raced and what each
+one did.
+
 ## Notable free providers
 
 A few of the providers in the built-in registry (the dashboard shows the full list with signup links and per-provider notes):

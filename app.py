@@ -12950,6 +12950,25 @@ def _swarm_tool_turn(body):
     caller can fall through to ordinary single-model routing. Never raises.
     """
     messages = body.get("messages") or []
+    # OPENING turn of a swarm session: ask for the phased plan up front. The
+    # prose pipeline plans this way on its own (swarm._waves runs independent
+    # phases concurrently), but a CLI drives its own loop, so it has to be
+    # asked. Opening turn only -- re-sending it mid-task invites replanning
+    # work that is already done. Done HERE because this is the last place the
+    # REQUESTED model is still "swarm"; by the time the brief injector runs,
+    # payload["model"] is the hop model and the mode is no longer visible.
+    users = [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
+    mid_loop = (len(users) != 1
+                or any(isinstance(m, dict)
+                       and (m.get("role") == "tool" or m.get("tool_calls"))
+                       for m in messages))
+    if not mid_loop and config.get_flag("swarm_plan_phases", True):
+        i = 0
+        while i < len(messages) and isinstance(messages[i], dict)                 and messages[i].get("role") == "system":
+            i += 1
+        messages = messages[:i] + [craft.plan_message()] + messages[i:]
+        body = dict(body)
+        body["messages"] = messages
     est = _est_tokens(messages, body.get("tools"))
     pid, resolved, _d = _route_by_difficulty(messages, body.get("max_tokens"), est,
                                              require_tools=True,
