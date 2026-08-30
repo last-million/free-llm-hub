@@ -244,8 +244,16 @@ def test_deepseek_v4_is_level_with_glm52_and_minimax_m3_sits_under_both():
     mm3 = app._benchmark_score("p", "minimax-m3")
     assert glm == ds4 > mm3
     # ...and both clear the whole ordinary field.
-    for weaker in ("qwen3.6-27b", "qwen3.5", "mimo-2.5", "deepseek-v3.1",
-                   "minimax-m2", "kimi-k2.7"):
+    #
+    # qwen3.5+ LEFT this list on 2026-08-30. The preference has always named
+    # "latest kimi / qwen / deepseek" as top picks together, but only kimi, glm
+    # and deepseek were ever floored, so qwen sat on its natural score (measured:
+    # qwen3.8-27b 110.9 vs glm-5.2 134.0) and never won a slot. Floating it to
+    # its named peers necessarily lifts it past minimax-m3, which was only ever
+    # "almost like deepseek 4" -- i.e. just under that top group, not inside it.
+    # The older qwen3 / qwen2.5 lines stay ordinary field and are still asserted.
+    for weaker in ("qwen3-32b", "qwen2.5-72b-instruct", "mimo-2.5",
+                   "deepseek-v3.1", "minimax-m2", "kimi-k2.7"):
         assert mm3 > app._benchmark_score("p", weaker), weaker
 
 
