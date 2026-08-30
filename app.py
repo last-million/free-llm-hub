@@ -590,6 +590,11 @@ def provider_free_models(pid, live=True):
                 )
                 if live_free:
                     models = live_free
+                    # Discovery is the FIRST place a brand-new model id is ever
+                    # seen. If nothing can score it, ask the benchmark source
+                    # now rather than leaving it dead last until the next
+                    # scheduled refresh (debounced + off-thread inside).
+                    _maybe_recheck_aa_for_unknown(live_free)
         except Exception:
             pass  # network/parse failure -> defaults
 
@@ -942,6 +947,50 @@ def _normalize_aa_slug(text):
 
 
 _OPENROUTER_CATALOG_URL = "https://openrouter.ai/api/v1/models"
+
+# On-demand AA re-check when discovery turns up a model nothing can score.
+_AA_UNKNOWN_MIN_GAP = 900        # 15 min between out-of-band re-checks
+_aa_unknown_last_check = [0.0]
+_aa_unknown_lock = threading.Lock()
+
+
+def _model_is_unscoreable(model_id):
+    """True when NOTHING can put a real number on this id: no Artificial
+    Analysis entry, and no known-strong family root to inherit a tier from."""
+    if _aa_score_for(model_id) is not None:
+        return False
+    norm = _normalize_aa_slug(model_id)
+    if _static_benchmark_score(norm) is not None:
+        return False
+    return not _strong_new_version_score((model_id or "").lower())
+
+
+def _maybe_recheck_aa_for_unknown(model_ids):
+    """A brand-new model id just showed up in a provider's catalog and nothing
+    here can score it -- go ask the benchmark source about it NOW instead of
+    waiting out the refresh interval.
+
+    MEASURED 2026-08-30: an unknown id scores ~11.8 against a 358-model pool,
+    i.e. dead last, so it is never routed to and never gets a chance to prove
+    itself. Discovery notices a new model within MODEL_CACHE_TTL (60s) but the
+    scores behind it only moved every AA_REFRESH_INTERVAL (6h) -- so a genuinely
+    new flagship could sit at the bottom of the chain for most of a day.
+
+    Debounced to _AA_UNKNOWN_MIN_GAP and run off-thread: this is reached from
+    the discovery path, and one unrecognised id must never add a network round
+    trip to a user's request. Cheap regardless -- the keyless catalog is a
+    single unauthenticated GET, and an unknown id is rare once the cache is
+    warm."""
+    now = time.time()
+    with _aa_unknown_lock:
+        if now - _aa_unknown_last_check[0] < _AA_UNKNOWN_MIN_GAP:
+            return False
+        if not any(_model_is_unscoreable(m) for m in (model_ids or ())):
+            return False
+        _aa_unknown_last_check[0] = now
+    _log.info("[aa] unrecognised model in a provider catalog -- re-checking benchmarks")
+    threading.Thread(target=_aa_refresh_once, daemon=True).start()
+    return True
 
 
 def _fetch_aa_scores_keyless():
