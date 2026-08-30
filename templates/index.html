@@ -7724,6 +7724,12 @@
       sessionId = r.session_id;
       if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
       showSessionState(r.cli, r.project_dir);
+      /* This is the load-time restore for /agent/<session_id> -- the page you
+         land on when you reopen a build. It had r.quality all along and threw
+         it away, so the switch painted its HTML default ("Normal") and stayed
+         wrong until a turn finished and refreshSessionInfo happened to run.
+         Measured: server said swarm, switch said Normal. */
+      setQuality(r.quality);
       if (r.currently_running){
         showReconnectedStillWorking(r.session_id);
         return;

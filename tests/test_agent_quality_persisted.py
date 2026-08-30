@@ -194,3 +194,13 @@ def test_the_session_start_answer_is_shown_on_the_switch():
 def test_continue_restores_the_saved_mode_in_the_ui():
     html = _template()
     assert html.count("setQuality(r.quality || conv.quality || 'normal')") == 2
+
+
+def test_reopening_a_build_page_shows_the_real_mode():
+    """MEASURED at /agent/<session_id>, the page you land on when you reopen a
+    build: the server said swarm, the switch said Normal, and stayed wrong
+    until a turn completed. cxResumeAgentSession is the load-time restore and
+    it had r.quality in hand the whole time."""
+    html = _template()
+    restore = html.split("window.cxResumeAgentSession = function(r){", 1)[1][:1200]
+    assert "setQuality(r.quality)" in restore
