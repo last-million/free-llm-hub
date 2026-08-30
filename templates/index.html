@@ -473,9 +473,21 @@
   /* Session model-quality switch. Sits in the session bar because it is a
      property OF the session, and is changeable mid-conversation: the CLI is
      re-spawned per turn, so the next turn picks up whatever this says. */
-  .agent-quality{font-size:11.5px;padding:4px 8px;border-radius:7px;
-                 background:var(--surface-3);color:var(--text);
-                 border:1px solid var(--border);flex:none}
+  /* Segmented model-quality control: three switches, one live. */
+  .agent-quality{display:inline-flex;gap:2px;padding:2px;border-radius:8px;
+                 background:var(--surface-3);border:1px solid var(--border);flex:none}
+  .agent-quality .q-opt{position:relative;display:inline-flex;align-items:center;
+                        cursor:pointer;user-select:none}
+  .agent-quality .q-opt input{position:absolute;opacity:0;width:0;height:0}
+  .agent-quality .q-opt span{display:inline-block;font-size:11px;font-weight:600;
+                             padding:4px 10px;border-radius:6px;color:var(--text-faint);
+                             white-space:nowrap;transition:background .12s,color .12s}
+  .agent-quality .q-opt:hover span{color:var(--text)}
+  .agent-quality .q-opt input:checked + span{background:var(--accent);color:#fff}
+  /* Keyboard focus must stay visible -- the real radio is off-screen. */
+  .agent-quality .q-opt input:focus-visible + span{outline:2px solid var(--accent);
+                                                   outline-offset:1px}
+  .agent-quality[aria-disabled="true"]{opacity:.55;pointer-events:none}
   /* Activity source badge: which surface a request came from. */
   .af-src{font-size:10px;font-weight:700;letter-spacing:.04em;padding:1px 6px;
           border-radius:999px;background:var(--surface-3);color:var(--text-faint);
@@ -2536,11 +2548,27 @@
         <div class="agent-session" id="agent-session" hidden>
           <div class="agent-session-bar">
             <span class="agent-session-info" id="agent-session-info"></span>
-            <select id="agent-quality" class="agent-quality" title="Which models this session routes to. Changing it applies from the NEXT message.">
-              <option value="normal">Normal</option>
-              <option value="max">Max quality</option>
-              <option value="swarm">Max (swarm agents)</option>
-            </select>
+            <!-- Three switches, exactly one on. Radios rather than checkboxes
+                 because the modes are mutually exclusive and the browser then
+                 enforces that for us -- and rather than a <select> because a
+                 collapsed dropdown hides which mode you are in, which is the
+                 one thing you want to see at a glance mid-build. -->
+            <div class="agent-quality" id="agent-quality" role="radiogroup"
+                 aria-label="Model quality for this session"
+                 title="Which models this session routes to. A change applies from the NEXT message.">
+              <label class="q-opt" title="Strong models for real work, cheap ones for trivial steps">
+                <input type="radio" name="agent-quality" value="normal" checked>
+                <span>Normal</span>
+              </label>
+              <label class="q-opt" title="Every turn on the strongest models, never the cheap tier">
+                <input type="radio" name="agent-quality" value="max">
+                <span>Max</span>
+              </label>
+              <label class="q-opt" title="Several strong models answer every turn at once, best answer wins (~3x quota, slower)">
+                <input type="radio" name="agent-quality" value="swarm">
+                <span>Swarm</span>
+              </label>
+            </div>
             <button class="btn sm ghost" id="agent-checkpoint" type="button" title="Bookmark this point in the conversation — not a filesystem undo">Bookmark</button>
             <button class="btn sm ghost" id="agent-running" type="button"
                   title="Conversations and previews currently open">Running <span id="agent-running-n">0</span></button>
@@ -7712,25 +7740,49 @@
        the CLI subprocess is re-spawned per turn, so its ANTHROPIC_MODEL is
        rebuilt each time and the NEXT turn obeys whatever this says. A turn
        already running keeps the mode it started with -- its child is launched. */
+    function qualityRadios(){
+      var box = $('#agent-quality');
+      return box ? box.querySelectorAll('input[name="agent-quality"]') : [];
+    }
+    function getQuality(){
+      var rs = qualityRadios();
+      for (var i = 0; i < rs.length; i++){ if (rs[i].checked) return rs[i].value; }
+      return 'normal';
+    }
+    /* Reflect what the SERVER says the session is. Called from every place that
+       learns it -- session start, the periodic refresh, and Continue -- because
+       the control defaulting to "Normal" while the session was actually running
+       in swarm was the reported bug: the mode was right, the switch lied. */
+    function setQuality(v){
+      if (!v) return;
+      var rs = qualityRadios();
+      for (var i = 0; i < rs.length; i++) rs[i].checked = (rs[i].value === v);
+    }
+    function lockQuality(on){
+      var box = $('#agent-quality');
+      if (box) box.setAttribute('aria-disabled', on ? 'true' : 'false');
+      var rs = qualityRadios();
+      for (var i = 0; i < rs.length; i++) rs[i].disabled = !!on;
+    }
     function initAgentQuality(){
-      var sel = $('#agent-quality');
-      if (!sel) return;
-      sel.addEventListener('change', function(){
-        if (!sessionId){ return; }
-        var want = sel.value;
-        sel.disabled = true;
+      var box = $('#agent-quality');
+      if (!box) return;
+      box.addEventListener('change', function(){
+        if (!sessionId) return;
+        var want = getQuality();
+        lockQuality(true);
         api('/api/agent/sessions/' + encodeURIComponent(sessionId) + '/quality',
             { method: 'POST', body: { quality: want } })
           .then(function(r){
-            sel.value = (r && r.quality) || want;
+            setQuality((r && r.quality) || want);
             toast({
               max: 'Max quality — from the next message, every turn uses the strongest models',
               swarm: 'Swarm agents — from the next message, several models answer each turn and the best wins (~3x quota)',
               normal: 'Normal — cheap models allowed for trivial steps again'
-            }[sel.value] || 'Mode updated');
+            }[getQuality()] || 'Mode updated');
           })
           .catch(function(e){ toast('Quality: ' + e.message, true); })
-          .then(function(){ sel.disabled = false; });
+          .then(function(){ lockQuality(false); });
       });
     }
 
@@ -8261,8 +8313,8 @@
            something you have to remember answering. */
         if (r.quality === 'max') extra.push('max quality');
         if (r.quality === 'swarm') extra.push('swarm agents');
-        var qsel = $('#agent-quality');
-        if (qsel && !qsel.disabled && r.quality) qsel.value = r.quality;
+        var qbox = $('#agent-quality');
+        if (qbox && qbox.getAttribute('aria-disabled') !== 'true') setQuality(r.quality);
         sessionInfo.textContent = cliLabel(r.cli) + ' — ' + (r.project_dir || '') +
                                    (extra.length ? ' · ' + extra.join(' · ') : '');
       }).catch(function(){ /* non-critical — the static label already set at start covers this */ });
@@ -8332,7 +8384,11 @@
           sessionId = r.session_id;
           if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
           showSessionState(r.cli || cli, r.project_dir || dir);
-          toast('Agent session started');
+          /* The reported bug: picking Swarm at the start left the control
+             showing Normal, because nothing ever fed the answer back into it. */
+          setQuality(r.quality || quality);
+          toast('Agent session started' +
+                (r.quality && r.quality !== 'normal' ? ' — ' + r.quality : ''));
           loadRecentProjects();
         })
         .catch(function(e){
@@ -8696,6 +8752,7 @@
         sessionId = conv.session_id;
         if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
         showSessionState(r.cli || conv.cli_id, r.project_dir || conv.project_dir);
+        setQuality(r.quality || conv.quality || 'normal');
         api('/api/agent/history/' + encodeURIComponent(conv.session_id)).then(function(full){
           mountTranscript(msgsEl, full || {});
           if (full && (full.turns || []).length) checkpointBtn.disabled = false;
@@ -8715,6 +8772,8 @@
             sessionId = r.session_id || conv.session_id;
             if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
             showSessionState(r.cli || conv.cli_id, r.project_dir || conv.project_dir);
+            /* The server put the rebuilt session back in the saved mode; show it. */
+            setQuality(r.quality || conv.quality || 'normal');
             api('/api/agent/history/' + encodeURIComponent(sessionId)).then(function(full){
               mountTranscript(msgsEl, full || {});
               if (full && (full.turns || []).length) checkpointBtn.disabled = false;

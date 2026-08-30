@@ -169,6 +169,10 @@ def _metadata_row(conv):
         "cli_id": conv.get("cli_id"),
         "project_dir": conv.get("project_dir"),
         "title": conv.get("title") or DEFAULT_TITLE,
+        # Which model-quality mode this conversation was running in, so
+        # Continue can put the session back the way you left it instead of
+        # silently dropping to Normal.
+        "quality": conv.get("quality") or "normal",
         "started_at": conv.get("started_at"),
         "last_active_at": conv.get("last_active_at"),
         "turn_count": len(conv.get("turns") or []),
@@ -234,6 +238,9 @@ def record_turn(session_id, cli_id, project_dir, role, text, native_session_id=N
                     "last_active_at": now,
                     "turns": [],
                     "checkpoints": [],
+                    # Explicit rather than inferred-when-absent, so a reader of
+                    # the file can see which mode a conversation ran in.
+                    "quality": "normal",
                 }
             if cli_id:
                 conv["cli_id"] = cli_id
@@ -259,6 +266,30 @@ def record_turn(session_id, cli_id, project_dir, role, text, native_session_id=N
             _upsert_index_row(conv)
     except Exception:
         pass
+
+
+def set_quality(session_id, quality):
+    """Remember the model-quality mode a conversation is running in.
+
+    The live session already holds this (agentic_chat._Session.quality), but a
+    live session does not survive a hub restart, and the hub restarts on every
+    5-hourly auto-update. Without this, choosing Swarm and coming back tomorrow
+    silently resumed on Normal."""
+    if quality not in ("normal", "max", "swarm") or not session_id:
+        return None
+    try:
+        with _LOCK:
+            conv = _load_conversation(session_id)
+            if conv is None:
+                return None
+            if conv.get("quality") == quality:
+                return quality          # no write: this runs on every turn
+            conv["quality"] = quality
+            _save_conversation(conv)
+            _upsert_index_row(conv)
+            return quality
+    except Exception:
+        return None
 
 
 def set_title(session_id, title):

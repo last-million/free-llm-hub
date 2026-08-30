@@ -9246,6 +9246,12 @@ def api_agent_resume_session(session_id):
             payload["code"] = exc.code
         payload.update(exc.extra)
         return jsonify(payload), exc.status
+    # Put the rebuilt session back in the mode this conversation was running in.
+    # Without this, resuming a Swarm build after a hub restart silently dropped
+    # it to Normal -- the live session is new, so it starts at the default.
+    saved_quality = conv.get("quality") or "normal"
+    if saved_quality != "normal":
+        agentic_chat.set_quality(sid, saved_quality)
     row = agentic_chat.get_session(sid) or {}
     # turn_count on a just-rebuilt session is always 0 -- it's a fresh Session
     # object with no turns played through it yet. The real count is what's
@@ -9302,6 +9308,11 @@ def api_agent_send_message(session_id):
     if sess_info:
         agentic_history.record_turn(session_id, sess_info["cli"], sess_info["project_dir"],
                                     "user", body["text"])
+        # Keep the saved conversation's mode in step with the live session. Done
+        # here rather than at session start because the conversation record does
+        # not exist until its first turn. set_quality returns without writing
+        # when it already matches, so this is a dict lookup on every later turn.
+        agentic_history.set_quality(session_id, sess_info.get("quality") or "normal")
     status, text, detail = agentic_chat.send_message(session_id, body["text"])
     if sess_info and status == 200 and text:
         # The CLI's OWN thread id, captured with the reply. Without it a
@@ -9371,6 +9382,10 @@ def api_agent_set_quality(session_id):
     out = agentic_chat.set_quality(session_id, q)
     if out is None:
         return jsonify({"error": "No such agentic session."}), 404
+    # Mirror it into the saved conversation. The live session holds the mode but
+    # does not survive a hub restart (and the hub restarts every 5h to update),
+    # so without this, Continue tomorrow silently resumes on Normal.
+    agentic_history.set_quality(session_id, out)
     _log.info("[agent] session quality -> %s", out)
     return jsonify({"session_id": session_id, "quality": out})
 
