@@ -1336,6 +1336,24 @@
     display:flex;align-items:center;gap:10px;padding:16px 18px;border-bottom:1px solid var(--border-soft);
     font-weight:700;font-size:15px;flex:none;
   }
+  .sd-models-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .sd-models-filter{width:100%;margin:8px 0 6px;padding:6px 9px;border-radius:8px;
+    border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:12px}
+  .sd-models{max-height:320px;overflow-y:auto;border:1px solid var(--border);
+    border-radius:10px;padding:4px}
+  .sd-model{display:flex;align-items:center;gap:8px;padding:5px 7px;border-radius:7px;
+    font-size:12px;line-height:1.3}
+  .sd-model:hover{background:var(--bg-soft,rgba(127,127,127,.08))}
+  .sd-model.off{opacity:.45}
+  .sd-model .sc{flex:0 0 46px;text-align:right;font-variant-numeric:tabular-nums;
+    font-weight:700;color:var(--accent)}
+  .sd-model.off .sc{color:var(--muted)}
+  .sd-model .nm{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap}
+  .sd-model .pv{color:var(--muted);font-size:11px}
+  .sd-model .st{flex:0 0 auto;font-size:10px;text-transform:uppercase;letter-spacing:.04em;
+    color:var(--muted)}
+  .sd-model input{flex:0 0 auto;cursor:pointer}
   .settings-drawer-body{padding:18px;display:flex;flex-direction:column;gap:20px;overflow-y:auto}
   .sd-group{display:flex;flex-direction:column;gap:7px;padding-bottom:18px;border-bottom:1px solid var(--border-soft)}
   .sd-group:last-child{border-bottom:0;padding-bottom:0}
@@ -2292,6 +2310,19 @@
       </label>
       <p class="sd-help">Tells the Chat CLI agent that testing/debugging its own work with tools like Playwright is expected this session.</p>
     </div>
+    <div class="sd-group">
+      <div class="sd-models-head">
+        <b>Models &amp; live benchmark</b>
+        <button class="btn sm ghost" id="sd-models-refresh" type="button">Refresh</button>
+      </div>
+      <p class="sd-help">Every model the hub can currently reach, strongest first, with the
+        score routing actually uses. Switch one off and it is skipped everywhere &mdash;
+        orchestration, the fallback chain and the swarm.</p>
+      <input class="sd-models-filter" id="sd-models-filter" type="search"
+             placeholder="Filter by model or provider&hellip;" aria-label="Filter models">
+      <div class="sd-models" id="sd-models"><div class="skel skel-row"></div></div>
+    </div>
+
     <div class="sd-group">
       <label class="switch" title="Allow the last30days skill to search X and other social sources during web research">
         <input id="drawer-social-search-switch" type="checkbox" aria-label="Social media web search">
@@ -9172,6 +9203,87 @@
       if (sw) sw.checked = !!(r && r.social_search);
     }).catch(function(e){ if (!silent) toast('Social web search: ' + e.message, true); });
   }
+    /* Live benchmark table + per-model on/off.
+       The scores come from /api/tracking, which is the SAME data routing reads,
+       so the table and the router can never disagree. The switches post to
+       /api/model-allowlist, which the router honours through _is_model_dead --
+       one seam, so a blocked model is skipped by orchestration, the fallback
+       chain and the swarm alike. */
+    var _sdModels = [], _sdBlocked = {};
+
+    function renderSdModels(){
+      var host = $('#sd-models');
+      if (!host) return;
+      var q = (($('#sd-models-filter') || {}).value || '').toLowerCase().trim();
+      var rows = _sdModels.filter(function(m){
+        return !q || (m.id || '').toLowerCase().indexOf(q) >= 0;
+      });
+      if (!rows.length){
+        host.innerHTML = '<div class="chat-empty">' +
+          (_sdModels.length ? 'Nothing matches that filter.' : 'No models available yet.') +
+          '</div>';
+        return;
+      }
+      host.innerHTML = rows.slice(0, 300).map(function(m){
+        var off = !!_sdBlocked[m.id];
+        /* A model the UPSTREAM has withdrawn is shown as such and left
+           switchable -- it comes back on its own, and hiding it would just look
+           like the hub had lost it. */
+        var state = (m.state && m.state !== 'ok') ? m.state : '';
+        return '<label class="sd-model' + (off ? ' off' : '') + '" title="' +
+                 esc(m.id) + (state ? ' — ' + esc(state) : '') + '">' +
+               '<input type="checkbox" data-id="' + esc(m.id) + '"' + (off ? '' : ' checked') + '>' +
+               '<span class="sc">' + (Math.round((m.score || 0) * 10) / 10) + '</span>' +
+               '<span class="nm">' + esc(m.model || '') +
+                 ' <span class="pv">' + esc(m.provider || '') + '</span></span>' +
+               (state ? '<span class="st">' + esc(state) + '</span>' : '') +
+               '</label>';
+      }).join('');
+      var boxes = host.querySelectorAll('input[type=checkbox]');
+      for (var i = 0; i < boxes.length; i++){
+        boxes[i].addEventListener('change', function(){
+          var id = this.getAttribute('data-id') || '';
+          var cut = id.indexOf('/');
+          var provider = id.slice(0, cut), model = id.slice(cut + 1);
+          var want = this.checked, box = this;
+          box.disabled = true;
+          api('/api/model-allowlist', { method: 'POST',
+              body: { provider: provider, model: model, enabled: want } })
+            .then(function(r){
+              _sdBlocked = {};
+              ((r && r.blocked) || []).forEach(function(x){ _sdBlocked[x] = true; });
+              renderSdModels();
+              toast(model + (want ? ' enabled' : ' switched off'));
+            })
+            .catch(function(e){ toast('Models: ' + e.message, true); box.checked = !want; })
+            .then(function(){ box.disabled = false; });
+        });
+      }
+    }
+
+    function loadSdModels(silent){
+      return Promise.all([api('/api/tracking'), api('/api/model-allowlist')])
+        .then(function(res){
+          _sdModels = ((res[0] && res[0].models) || []).slice();
+          _sdBlocked = {};
+          ((res[1] && res[1].blocked) || []).forEach(function(x){ _sdBlocked[x] = true; });
+          renderSdModels();
+        })
+        .catch(function(e){
+          if (!silent) toast('Models: ' + e.message, true);
+          var host = $('#sd-models');
+          if (host) host.innerHTML = '<div class="chat-empty">Could not load: ' +
+                                     esc(e.message) + '</div>';
+        });
+    }
+
+    function initSdModels(){
+      var f = $('#sd-models-filter');
+      if (f) f.addEventListener('input', renderSdModels);
+      var r = $('#sd-models-refresh');
+      if (r) r.addEventListener('click', function(){ loadSdModels(); });
+    }
+
   function initSocialWebSearch(){
     var sw = $('#drawer-social-search-switch');
     if (!sw) return;
@@ -9345,7 +9457,7 @@
     if (c) c.focus();
     loadTestVerification(true);
     loadPromptEnhance(true);
-    loadSocialWebSearch(true);
+    loadSocialWebSearch(true); loadSdModels(true);
     loadUpdateStatus(true);
   }
   function closeSettingsDrawer(){
@@ -9583,7 +9695,8 @@
   initVisionGap();
   initTestVerification();
   initPromptEnhance();
-  initSocialWebSearch();
+    initSocialWebSearch();
+    initSdModels();
   initUpdateCheck();
   initThemeToggle();
   initSettingsDrawer();

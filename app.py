@@ -2545,6 +2545,19 @@ def _mark_model_dead(pid, model, status):
 
 
 def _is_model_dead(pid, model):
+    # A model the USER switched off is treated exactly like one upstream has
+    # withdrawn: unavailable for routing. Done HERE rather than at each filter
+    # because all six of them -- the candidate pool, _build_chain, the model
+    # lists and the probes -- already call this with (pid, model), so one seam
+    # covers them all and none can be forgotten later. /api/dead-models reads
+    # _dead_model_rows() instead, so a user-blocked model never shows up there
+    # claiming the upstream killed it.
+    if _is_model_blocked_by_user(pid, model):
+        return True
+    return _is_model_dead_upstream(pid, model)
+
+
+def _is_model_dead_upstream(pid, model):
     key = (pid, str(model))
     with _dead_lock:
         exp = _dead_models.get(key)
@@ -5081,7 +5094,11 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
             if (pid, m) not in seen:
                 chain.append((pid, m))
                 seen.add((pid, m))
-    return chain
+    # Keep somewhere to go when a model DECLINES the task rather than failing.
+    # A refusal is now a non-answer (see _looks_like_refusal), so the chain moves
+    # on -- but only if it still holds a model that will take the work. Appended,
+    # never promoted: the ordinary ranking still decides who answers first.
+    return _ensure_permissive_hop(chain)
 
 
 # Key-pool rotation: statuses that mean "this key is bad/throttled, try the
@@ -7768,6 +7785,30 @@ def api_models():
     return jsonify(aggregated_models())
 
 
+@app.route("/api/model-allowlist", methods=["GET", "POST"])
+def api_model_allowlist():
+    """Which models the user has switched off.
+
+    GET  -> {"blocked": ["pid/model", ...]}
+    POST {"provider","model","enabled":bool} -> the same, after the change.
+
+    The benchmark figures the Settings table shows next to these come from
+    /api/tracking, which already returns every model with its score and state --
+    no second scorer, so the table and the router can never disagree."""
+    # No explicit gate: the global before_request control-token check already
+    # covers every /api/* route, which is what POST /api/providers/<pid> relies
+    # on too.
+    if request.method == "GET":
+        return jsonify({"blocked": sorted(_blocked_models())})
+    body = request.get_json(force=True, silent=True) or {}
+    pid = str(body.get("provider") or "").strip()
+    model = str(body.get("model") or "").strip()
+    if not pid or not model:
+        return jsonify({"error": "provider and model are required."}), 400
+    blocked = _set_model_blocked(pid, model, not bool(body.get("enabled", True)))
+    return jsonify({"blocked": sorted(blocked)})
+
+
 @app.route("/api/tracking", methods=["GET"])
 def api_tracking():
     """LIVE tracking of every EXISTING (provider, model) the hub knows: benchmark
@@ -8963,6 +9004,42 @@ def _no_candidates_hint():
     return ""
 
 
+# Models the USER has switched off, as "pid/model" ids, kept in config.json
+# through the generic setting helpers so they survive a restart.
+#
+# ASKED 2026-08-31: "i want in settings to see benchmark of available models live
+# and user can edit wich one to work with". Everything that could take a model out
+# of rotation before this was automatic and temporary -- _mark_model_dead on a
+# 402/403/404 with a 6h TTL, or providers.is_model_allowed's hardcoded safety
+# regex. Nothing let a person say "not this one".
+_BLOCKED_SETTING = "blocked_models"
+
+
+def _blocked_models():
+    """The user's off-list, as a set of 'pid/model' ids."""
+    try:
+        raw = config.get_setting(_BLOCKED_SETTING, []) or []
+        return {str(x) for x in raw if x}
+    except Exception:                                            # noqa: BLE001
+        return set()
+
+
+def _is_model_blocked_by_user(pid, model):
+    return ("%s/%s" % (pid, model)) in _blocked_models()
+
+
+def _set_model_blocked(pid, model, blocked):
+    """Switch one model off or back on. Returns the new blocked set."""
+    mid = "%s/%s" % (pid, model)
+    cur = _blocked_models()
+    cur.add(mid) if blocked else cur.discard(mid)
+    try:
+        config.set_setting(_BLOCKED_SETTING, sorted(cur))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return cur
+
+
 def _model_block_reason(pid, model):
     """None when this model may run, else the reason it may not.
 
@@ -8974,6 +9051,8 @@ def _model_block_reason(pid, model):
     being unsafe, with nothing pointing at the setting responsible."""
     if not prov.is_model_allowed(model):
         return "Model '%s' is blocked by the safety filter." % model
+    if _is_model_blocked_by_user(pid, model):
+        return "Model '%s/%s' is switched off in Settings." % (pid, model)
     return None
 
 
@@ -12698,6 +12777,57 @@ def _stream_peek_timeout(model, est):
     return STREAM_CONTENT_PEEK_TIMEOUT
 
 
+# How much of a streaming answer to collect before judging it. Small on
+# purpose: the failures being caught are short (an announcement is a sentence, a
+# refusal opens with one), and a turn that is really working emits a tool call,
+# which commits the stream immediately without waiting for any of this.
+_PEEK_JUDGE_CHARS = 600
+# A tool-call delta in an SSE frame, in any of the three protocols' shapes.
+_STREAM_TOOLCALL_RE = re.compile(
+    rb'"(?:tool_calls|function_call|tool_use|function_call_arguments)"', re.I)
+
+
+def _judge_peeked(chunks):
+    """"content" or "nonanswer" for the text collected during the peek.
+
+    Runs the same three detectors the non-streaming path has always had. They
+    were unreachable on a stream, which is the path Codex and Claude Code
+    actually use -- so a turn that typed its tool call, announced work it never
+    did, or declined outright was relayed to the CLI as a finished answer."""
+    try:
+        text = _peeked_text("".join(chunks))
+        if not text:
+            return "content"
+        if (_looks_like_text_tool_call(text)
+                or _looks_like_announced_not_acted(text)
+                or _looks_like_refusal(text)):
+            return "nonanswer"
+    except Exception:                                            # noqa: BLE001
+        pass
+    return "content"
+
+
+# A JSON string value for one of the keys an SSE delta puts visible text
+# under. Non-greedy up to the first unescaped quote.
+_PEEK_TEXT_RE = re.compile(r'"(?:content|text)"\s*:\s*"(.*?)(?<!\\)"', re.S)
+
+
+def _peeked_text(raw):
+    """The assistant's visible text, pulled out of raw SSE frames.
+
+    Deliberately regex rather than a JSON parse: these are partial frames from
+    three different protocols, and a strict parse would throw away the very
+    turns worth judging (the measured one was malformed JSON -- one '[' and no
+    ']')."""
+    out = []
+    for m in _PEEK_TEXT_RE.finditer(raw or ""):
+        try:
+            out.append(json.loads('"%s"' % m.group(1)))
+        except Exception:                                        # noqa: BLE001
+            out.append(m.group(1))
+    return "".join(out).strip()
+
+
 def _peek_until_content(iterator, deadline_s, max_lines=400):
     """Look ahead on a streaming 200 to tell a REAL answer from an EMPTY one before
     committing it to the client. Reads SSE items (bytes) until one carries actual
@@ -12718,6 +12848,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
     def _worker():
         buf = box["buf"]
         saw_reasoning = False
+        seen_content = []
         try:
             for _ in range(max_lines):
                 item = next(iterator)
@@ -12726,6 +12857,12 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
                     continue
                 b = item if isinstance(item, (bytes, bytearray)) \
                     else str(item).encode("utf-8", "ignore")
+                # A real tool call means the model is DOING the work. Commit at
+                # once: nothing below can improve on that, and every extra frame
+                # here is latency on the turns that are going well.
+                if _STREAM_TOOLCALL_RE.search(b):
+                    box["status"] = "content"
+                    return
                 if _STREAM_CONTENT_RE.search(b):
                     # LIVE-VERIFIED 2026-08-07: the api.airforce backend behind
                     # g4f ships its ENTIRE error in ONE content delta, so a
@@ -12737,7 +12874,26 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
                             b.decode("utf-8", "ignore")):
                         box["status"] = "nonanswer"
                         return
-                    box["status"] = "content"
+                    # KEEP READING instead of committing on the first delta.
+                    #
+                    # MEASURED 2026-08-31: every dead-turn detector the hub has
+                    # -- a tool call typed out as prose, a turn that only
+                    # announces work, a refusal -- hangs off _chat_json_nonanswer,
+                    # which runs ONLY on non-streaming bodies. Codex and Claude
+                    # Code both stream, so on the path that matters none of them
+                    # ever ran. Committing here on the first content delta is why:
+                    # at that moment there is no text to judge.
+                    #
+                    # So accumulate a little of the answer first. The failures
+                    # being caught are short by nature (an announcement is one
+                    # sentence; a refusal opens with one), while a turn that is
+                    # really working reaches for a tool -- and that exits above
+                    # without waiting at all. Bounded by _PEEK_JUDGE_CHARS and by
+                    # the deadline this whole peek already runs under.
+                    seen_content.append(b.decode("utf-8", "ignore"))
+                    if sum(len(x) for x in seen_content) < _PEEK_JUDGE_CHARS:
+                        continue
+                    box["status"] = _judge_peeked(seen_content)
                     return
                 # An error INSIDE a 200 stream (403/429/quota reported as an SSE
                 # error frame instead of an HTTP status) — the single most common
@@ -12756,9 +12912,15 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
             # stream if we saw the model THINKING (reasoning deltas) — otherwise it
             # was 400 lines of keepalives/role deltas and committing it hands the
             # CLI a stream that never answers.
-            box["status"] = "content" if saw_reasoning else "empty"
+            if seen_content:
+                box["status"] = _judge_peeked(seen_content)
+            else:
+                box["status"] = "content" if saw_reasoning else "empty"
         except StopIteration:
-            box["status"] = "empty"     # ended before any content
+            # The stream ENDED inside the peek window, so everything the model
+            # was ever going to say is in hand -- the best possible moment to
+            # judge it, and the shape a dead turn usually has.
+            box["status"] = _judge_peeked(seen_content) if seen_content else "empty"
         except Exception:
             box["status"] = "empty"     # read error/timeout -> unusable, fall through
 
@@ -12868,10 +13030,22 @@ def _is_upstream_nonanswer(text):
 # _TOOL_DIALECT_MISMATCH's own comment already concedes a blacklist is
 # whack-a-mole ("three runs found three DIFFERENT model-specific ways to
 # fail"), and this catches models nobody has met yet.
+# MEASURED 2026-08-31: the live failures had moved dialect. The last agent turn
+# of the most recent session typed a fenced ```json block containing
+# {"tool_calls": [{"name": "shell_command", "arguments": {...}}]} -- valid-
+# looking JSON (actually malformed: one [ and no ]) with no XML anywhere, so all
+# three XML patterns missed it. An earlier turn used an OPENING <tool_call> that
+# was never closed, which the closing-tag pattern also missed.
 _TEXT_TOOL_CALL_RES = (
     re.compile(r"</tool_call>", re.I),
+    re.compile(r"<tool_call\b", re.I),
     re.compile(r"<arg_key>.*?</arg_key>", re.I | re.S),
     re.compile(r"<arg_value>.*?</arg_value>", re.I | re.S),
+    # the JSON dialect, fenced or bare: a tool_calls / function_call structure
+    # written into the CONTENT instead of emitted as a tool call
+    re.compile(r'"tool_calls"\s*:\s*\[', re.I),
+    re.compile(r'"function_call"\s*:\s*\{', re.I),
+    re.compile(r'```(?:json|tool_code|python)?\s*\{\s*"(?:name|tool|command)"\s*:', re.I),
 )
 
 
@@ -12894,17 +13068,140 @@ _TEXT_TOOL_CALL_RES = (
 # a perfectly good short final answer with no tool calls, and "I'll now build
 # the 12 pages" is the same length and a dead turn. So: a statement of INTENT
 # to do work, with no question in it, on a turn that offered tools.
+# MEASURED 2026-08-31 across the three most recent sessions: this caught 2 of 13
+# agent turns. It was ^-anchored, so "Core helpers are ready. Now I'll write the
+# content generator." -- a turn that ended right there -- did not match, because
+# the intent phrase was not at position 0. It also only knew the ASCII
+# apostrophe, so "I'm locking the architecture" with a curly U+2019 missed, and
+# it had no gerund form, so "Now writing the complete landing page." (the whole
+# 38-character turn) missed.
+#
+# Now: the intent phrase may open ANY sentence in a short message, both
+# apostrophes count, and the bare gerund is included.
 _INTENT_RE = re.compile(
-    r"^\W*(?:i'?ll|i will|i am (?:now )?|i'?m (?:now )?going to|i'?m (?:now )?about to"
-    r"|let me|now i'?ll|next,? i'?ll|next,? i will)\b", re.I)
+    r"(?:^|(?<=[.!?])\s|(?<=\n))\W*"
+    r"(?:i\s*['’]?\s*(?:ll|m)\b|i will|i am (?:now )?|i\s*['’]?m (?:now )?going to"
+    r"|i\s*['’]?m (?:now )?about to|let me|now i\s*['’]?ll|next,? i\s*['’]?ll"
+    r"|next,? i will|now (?:writing|creating|building|generating|adding|updating)"
+    r"|proceeding to|moving (?:on )?to|starting (?:on|with))", re.I)
 _WORK_VERB_RE = re.compile(
-    r"\b(?:build|rebuild|creat\w*|writ\w*|add|updat\w*|fix\w*|redesign\w*|design\w*"
-    r"|implement\w*|generat\w*|craft\w*|hard-?cod\w*|refactor\w*|instal\w*|run|test"
-    r"|deploy\w*|styl\w*|check\w*|verif\w*|deliver\w*|produc\w*|set up|wire\w*)\b", re.I)
+    r"\b(?:build\w*|rebuild\w*|creat\w*|writ\w*|add\w*|updat\w*|fix\w*|redesign\w*|design\w*"
+    r"|implement\w*|generat\w*|craft\w*|hard-?cod\w*|refactor\w*|instal\w*|run|test\w*"
+    r"|deploy\w*|styl\w*|check\w*|verif\w*|deliver\w*|produc\w*|set up|wire\w*"
+    # measured misses: "I'm locking the architecture", "moving forward with"
+    r"|lock\w*|scaffold\w*|assembl\w*|final(?:is|iz)\w*|batch\w*|wrap\w*"
+    r"|mov\w+ forward|start\w*|continu\w*|proceed\w*)\b", re.I)
 # An announcement is SHORT by nature -- it is a sentence about what comes next,
 # not the work. A long answer that happens to open with "I'll walk through..."
 # is a real deliverable and must not be touched.
 _ANNOUNCE_MAX_CHARS = 400
+
+
+# A model DECLINING the task. The fourth way a clean 200 turns out not to be an
+# answer, after a relay's error page as content, a tool call typed out as prose,
+# and a turn that only announced work.
+#
+# ASKED 2026-08-31: "if task can't be done with a model then he try with other
+# model usually hy3 and deepseek v4 flash and qwen 3.8 flash they can do things
+# that other models dont accept to do". A refusal was invisible to the hub: real
+# text, HTTP 200, so the chain accepted it, the turn ended, and the ledger
+# recorded a SUCCESS -- which meant the next turn picked the same model and got
+# refused again.
+#
+# FALSE POSITIVES are the whole risk, so this is narrow by construction: a SHORT
+# reply, no tool calls, that is essentially nothing but the refusal. "I can't
+# find config.yml, so I created one" is a real answer and must survive.
+_REFUSAL_RE = re.compile(
+    r"\b(?:i\s*(?:'|’)?\s*(?:m\s+sorry[, ]*)?(?:can\s*(?:not|'?t)|cannot|will\s+not|won'?t|"
+    r"am\s+(?:not\s+able|unable)|(?:'|’)?m\s+(?:not\s+able|unable))"
+    r"\s+(?:be\s+able\s+)?(?:to\s+)?(?:help|assist|comply|creat\w*|provide|generat\w*"
+    r"|do|write|make|continue|fulfil\w*|support|engage|produce|proceed)"
+    r"|i\s+must\s+decline|i\s+have\s+to\s+decline"
+    r"|as\s+an\s+ai(?:\s+language)?\s+model[, ].{0,40}\b(?:cannot|can'?t|unable))",
+    re.I)
+# MEASURED 2026-08-31 against three real refusals in a live session: they were
+# 865, 4585 and 1404 characters. A refusal in practice is the refusal PLUS a
+# paragraph explaining why and offering alternatives, so a short-message cap
+# caught none of them. What is actually characteristic is WHERE it appears: a
+# model that declines says so immediately, in its opening sentence. So the test
+# is applied to the OPENING of the message, not the whole of it.
+_REFUSAL_HEAD_CHARS = 400
+
+
+def _looks_like_refusal(text):
+    """True when `text` OPENS by declining the task rather than doing it."""
+    if not text or not isinstance(text, str):
+        return False
+    head = text.strip()[:_REFUSAL_HEAD_CHARS]
+    if not head:
+        return False
+    # The FIRST SENTENCE only. Scanning the whole head was tried and produced a
+    # real false positive: "Built all 12 pages and wired the nav. I can't reach
+    # the CDN, so the fonts are self-hosted." is a turn that did the work and
+    # then named a limit, and the refusal phrase sat well inside 400 characters.
+    # A model that is declining says so before it says anything else.
+    first = re.split(r"(?<=[.!?])\s", head, 1)[0]
+    if "?" in first:
+        return False                  # asking is what it SHOULD do
+    return bool(_REFUSAL_RE.search(first))
+
+
+# The models the user named as accepting work others decline. Matched on the
+# normalised identity, so every provider's spelling of them counts.
+_PERMISSIVE_MODELS = ("hy3", "deepseek-v4-flash", "qwen3.8")
+
+
+def _is_permissive(model_id):
+    """True for a model known to take on work other models refuse."""
+    ident = _normalize_model_identity(model_id)
+    low = (model_id or "").lower()
+    return any(p in ident or p in low for p in _PERMISSIVE_MODELS)
+
+
+def _permissive_candidates():
+    """Live (pid, model) pairs for the permissive models, best first."""
+    out = []
+    for pid in _available_providers():
+        try:
+            for m in provider_free_models(pid) or []:
+                if _is_permissive(m) and not _is_model_dead(pid, m):
+                    out.append((_benchmark_score(pid, m), pid, m))
+        except Exception:                                        # noqa: BLE001
+            continue
+    out.sort(reverse=True)
+    return [(pid, m) for _s, pid, m in out]
+
+
+def _ensure_permissive_hop(chain):
+    """Guarantee the fallback chain contains a model that accepts work others
+    decline, so a refusal always has somewhere to go.
+
+    Appended, never promoted: the ordinary ranking still decides who answers
+    first, and this only matters once the models ahead of it have refused."""
+    if not chain:
+        return chain
+    if any(_is_permissive(m) for _p, m in chain):
+        return chain
+    try:
+        for pid, model in _permissive_candidates():
+            if (pid, model) in chain:
+                continue
+            out = list(chain)
+            # BEFORE the low-quality tail, not at the very end. _build_chain
+            # deliberately parks demoted families (kimi-k2.x, nemotron, gpt-oss)
+            # last as a last resort; appending past them would rank a normal
+            # model behind a demoted one, which test_last_resort_routing exists
+            # to prevent -- and it caught exactly that.
+            at = len(out)
+            for i, (_p, m) in enumerate(out):
+                if _is_low_quality(m):
+                    at = i
+                    break
+            out.insert(at, (pid, model))
+            return out
+    except Exception:                                            # noqa: BLE001
+        pass
+    return chain
 
 
 def _looks_like_announced_not_acted(text):
@@ -12947,6 +13244,10 @@ def _chat_json_nonanswer(data, has_tools=False):
                               if isinstance(p, dict))
         if has_tools and (_looks_like_text_tool_call(content)
                           or _looks_like_announced_not_acted(content)):
+            return True
+        # A refusal counts with or without tools: it is no more useful in plain
+        # chat, and the hub has other models that will answer.
+        if _looks_like_refusal(content):
             return True
         return _is_upstream_nonanswer(content)
     except Exception:
