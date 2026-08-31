@@ -5411,6 +5411,44 @@ _CREW_AGENT_HINT = (
 )
 
 
+def _awaiting_new_instruction(messages):
+    """True when the model is about to answer a FRESH user instruction rather
+    than continue a tool cycle -- i.e. the last non-system message is a user
+    message with actual text.
+
+    This is the distinction _apply_craft_brief used to miss. Its old `mid_loop`
+    test counted any conversation past the first user message as a running
+    loop, which is far too broad: a tool loop is the model MID-CYCLE (a call
+    issued, a result pending), while a user typing "now add the booking page"
+    after the previous turn finished is a new task that deserves a plan exactly
+    as much as the first one did. Reported as "i want also that work if i
+    continue eg projects".
+
+    A tool result is role "tool" in the OpenAI shape every caller is converted
+    to before this runs, so it can never be mistaken for an instruction; a
+    pending call shows as tool_calls on the assistant message."""
+    for m in reversed(messages or []):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "system":
+            continue
+        if role != "user":
+            return False                      # assistant / tool -> mid-cycle
+        return bool(_message_text(m).strip())
+    return False
+
+
+def _message_text(m):
+    """The text of a message whose content may be a string or a multimodal
+    list of parts."""
+    content = m.get("content")
+    if isinstance(content, list):
+        return " ".join(p.get("text") or "" for p in content
+                        if isinstance(p, dict))
+    return content or ""
+
+
 def _apply_craft_brief(messages, agentic=False):
     """Prepend a domain craft brief when the OPENING turn calls for one —
     plus, for tool-carrying (agentic) requests, the crew-delegation hint.
@@ -5430,11 +5468,9 @@ def _apply_craft_brief(messages, agentic=False):
             return messages
         users = [m for m in messages
                  if isinstance(m, dict) and m.get("role") == "user"]
-        mid_loop = (len(users) != 1
-                    or any(isinstance(m, dict)
-                           and (m.get("role") == "tool" or m.get("tool_calls"))
-                           for m in messages))
-        if mid_loop:
+        # A NEW instruction -- turn 1 or turn 50 -- gets the brief. Only a live
+        # tool cycle is refused it (see _awaiting_new_instruction).
+        if not users or not _awaiting_new_instruction(messages):
             # NOT the opening turn. The domain brief stays out -- it is about the
             # TASK, and re-sending it into a running loop is the noise this
             # opening-turn-only rule exists to prevent.
@@ -5456,9 +5492,23 @@ def _apply_craft_brief(messages, agentic=False):
                     i += 1
                 return messages[:i] + [act] + messages[i:]
             return messages
-        text = users[0].get("content")
-        if isinstance(text, list):     # multimodal turn -> its text parts
-            text = " ".join(p.get("text") or "" for p in text if isinstance(p, dict))
+        # The LATEST instruction, not the first. It used to read users[0], so a
+        # session that opened with "hi" and later asked for a landing page
+        # matched the brief against "hi". On turn 1 these are the same message.
+        text = _message_text(users[-1])
+        # ...falling back to the instruction that OPENED the project when the
+        # latest one names no domain of its own. A follow-up is usually short
+        # ("now add the booking page") and says nothing about what is being
+        # built, but the project has not changed underneath it: the design
+        # rules that applied to the homepage apply to the booking page. Without
+        # this, every step after the first is built with no brief at all --
+        # which is the slop the user is asking to be rid of. Costs a brief on
+        # some small follow-ups too; that trade is deliberate, and the cheaper
+        # side of it is the one that produces the bad output.
+        if len(users) > 1 and not craft.match(text or ""):
+            first = _message_text(users[0])
+            if craft.match(first):
+                text = first + "\n" + (text or "")
         # `agentic` is bool(payload["tools"]) -- the only honest signal for
         # whether this caller can actually RUN a check. It picks which VERIFY
         # block ships, so a tool-less client is never told to run anything.

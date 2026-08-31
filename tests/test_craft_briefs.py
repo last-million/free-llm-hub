@@ -182,11 +182,29 @@ def test_the_callers_own_system_prompt_still_comes_first():
     assert app._apply_craft_brief(msgs)[0]["content"] == "You are Codex."
 
 
-def test_never_injected_mid_conversation():
+def test_a_new_instruction_mid_conversation_IS_briefed():
+    """CHANGED 2026-08-31, deliberately. This asserted the opposite -- that a
+    follow-up turn never gets a brief -- and that was too blunt a reading of
+    "opening turn only".
+
+    Reported: "i want also that work if i continue eg projects". Building a
+    homepage, coming back tomorrow and saying "now add the booking page" got no
+    phased plan, no design brief and no anti-slop list, because ANY conversation
+    past the first user message counted as a running tool loop.
+
+    A tool loop is the model MID-CYCLE: a call issued, a result pending. That
+    case is still refused everything but ACT, and the test below still pins it.
+    A user typing a new instruction after the previous turn finished is not that
+    -- it is a fresh task, and it earns a brief exactly as the first one did.
+    See tests/test_brief_on_continued_projects.py."""
     msgs = [{"role": "user", "content": "build a landing page"},
             {"role": "assistant", "content": "done"},
             {"role": "user", "content": "make it better"}]
-    assert app._apply_craft_brief(msgs) is msgs
+    out = app._apply_craft_brief(msgs, agentic=True)
+    body = "\n".join(m.get("content") or "" for m in out
+                     if isinstance(m, dict) and m.get("role") == "system")
+    assert "PLAN FIRST" in body
+    assert "WEB DESIGN BRIEF" in body
 
 
 def test_never_injected_into_a_running_tool_loop():
