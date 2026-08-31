@@ -111,12 +111,12 @@ SHIP = """FINISH THE JOB — DEPLOY LOCALLY (applies to any build/run/deploy tas
 - BLOCKED? One line: the exact blocker and the exact command that clears it. Never trail off mid-task.
 ANTI: stopping at "you can now deploy this to Vercel" or "run npm start to see it"; claiming it works without fetching it; inventing a URL or a port you never opened; leaving a foreground server that hangs the session."""
 
-IMAGES = """IMAGES — YOU HAVE A LOCAL GENERATOR, ASK FIRST (any task that will show images)
+IMAGES = """IMAGES — YOU HAVE A LOCAL GENERATOR, USE IT (any task that will show images)
 - Do NOT say you have no image tool and silently fall back to Unsplash. This gateway generates images locally, free, in ~3s. Never claim otherwise.
-- The moment you know the build needs pictures, STOP and offer exactly three options, then wait for the answer (skip the question only if the user already told you which they want):
+- When the build needs pictures, DO NOT STOP TO ASK. Take BOTH (option 3), say in one line which source you used for what, and keep building. Use a different one only if the user already told you which they want. Asking here halted every single website build on turn one, because every website needs pictures:
   1. FREE STOCK — real photos, no copyright issue (Unsplash/Pexels source URLs). Best for real faces, food, places, anything that must look authentically photographed.
   2. GENERATED — made here from your prompt, unique to this project, no attribution and no licence question. Best for hero art, backgrounds, illustrations, icons, textures, anything abstract or brand-specific.
-  3. BOTH — stock for photographic content, generated for hero/abstract/brand art. Usually the right answer for a real site.
+  3. BOTH — stock for photographic content, generated for hero/abstract/brand art. The default: it is the right answer for a real site, which is why it is taken without asking.
 - Generate with a plain HTTP call, no API key. The hub returns WebP already and reports the type in `mime`:
   curl -s -X POST http://127.0.0.1:8787/v1/images/generations -H "Content-Type: application/json" -d '{"prompt":"YOUR PROMPT","n":1,"size":"1024x1024"}' > out.json
   python -c "import json,base64,urllib.request as u;d=json.load(open('out.json'))['data'][0];s=d.get('b64_json') or '';b=base64.b64decode(s) if s else u.urlopen(d['url']).read();e=(d.get('mime') or '').split('/')[-1].replace('jpeg','jpg') or 'webp';p='img/hero.'+e;open(p,'wb').write(b);print(p)"
