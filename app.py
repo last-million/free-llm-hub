@@ -807,6 +807,26 @@ _PREF_FLOORS = (134.5, 134.8, 136, 135, 0,    138,   136,    134,   135,   134, 
 # 3.6 (108-109) and below mimo-2.5 (100), so the ceiling sits just under mimo.
 _KIMI_K2_CEILING = 98
 
+# How much a newer version gains INSIDE the top band. Deliberately tiny: this
+# orders a family's releases against each other without lifting one family out
+# of the band and above everything else.
+#
+# ASKED 2026-08-31: "glm 5.3 is good man but of course if new verison of it
+# should be used more of ocurse and have higher priority". Below the band the
+# hub already did this (qwen 3.8 -> 134.08, 4.0 -> 134.10; kimi k3 -> 134.8, k4
+# -> 134.9); the band itself was flat, so glm-5.3, 5.4, 6 and 7 all scored
+# exactly 138.00 and a new release ranked no higher than the one it replaced.
+_BAND_MAJOR_STEP = 0.10
+_BAND_MINOR_STEP = 0.01
+_BAND_MAX_BUMP = 0.9            # stays strictly inside the band
+
+
+def _band_version_bump(major, minor, base_major, base_minor):
+    """Points above a top-band floor for a version newer than the one that
+    earned it. Never negative, never enough to leave the band."""
+    steps = (major - base_major) * _BAND_MAJOR_STEP + (minor - base_minor) * _BAND_MINOR_STEP
+    return max(0.0, min(steps, _BAND_MAX_BUMP))
+
 # Providers that RELAY someone else's models rather than hosting their own, so a
 # model id there is a claim, not a guarantee. Subtracted after the preference
 # floors (see the end of _benchmark_score) — a bias added earlier would be wiped
@@ -1338,8 +1358,9 @@ def _benchmark_score(pid, model_id):
     _hyv = _HY_VERSION_RE.search(low)
     if _hyv:
         try:
-            if int(_hyv.group(1)) >= 4:
-                score = max(score, _PREF_FLOORS[5])
+            _hmaj = int(_hyv.group(1))
+            if _hmaj >= 4:
+                score = max(score, _PREF_FLOORS[5] + _band_version_bump(_hmaj, 0, 4, 0))
         except ValueError:
             pass
     # USER PREFERENCE: Kimi K3 (Moonshot) — top pick for the heaviest tasks, right
@@ -1425,8 +1446,9 @@ def _benchmark_score(pid, model_id):
     _glmv = _GLM_VERSION_RE.search(low)
     if _glmv:
         try:
-            if (int(_glmv.group(1)), int(_glmv.group(2) or 0)) >= (5, 3):
-                score = max(score, _PREF_FLOORS[5])
+            _gmaj, _gmin = int(_glmv.group(1)), int(_glmv.group(2) or 0)
+            if (_gmaj, _gmin) >= (5, 3):
+                score = max(score, _PREF_FLOORS[5] + _band_version_bump(_gmaj, _gmin, 5, 3))
         except ValueError:
             pass
     # USER PREFERENCE 2026-08-01: "DeepSeek V4 should have priority almost as
@@ -4585,7 +4607,7 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # separate runs, three different silent failures, zero files each time).
         # Fail-OPEN: if none of the proven models can serve this request right now,
         # fall back to the full agentic pool rather than refusing to answer.
-        _proven = [c for c in agentic if _is_tool_proven(c[2])]
+        _proven = [c for c in agentic if _may_lead_agentic(c[0], c[2])]
         _pool = _proven or agentic
         # LOW-QUALITY TAIL (see _LOW_QUALITY_RE): the proven list still names
         # nemotron/gpt-oss from the 2026-07-25 dialect evidence, so proven-first
@@ -6249,6 +6271,28 @@ _TOOL_DIALECT_MISMATCH = ("deepseek-v4", "minimax-m2.7", "minimax-m3", "glm-4.7"
 #   mistral-medium   served turns in the first successful build.
 # Add to this list ONLY after a model completes a real multi-file build.
 _TOOL_PROVEN = ("gpt-oss", "nemotron", "gemini-3", "mistral-medium")
+
+
+def _may_lead_agentic(score, model_id):
+    """True when this model is allowed to LEAD an agentic build.
+
+    Was `_is_tool_proven` alone, i.e. the four families in _TOOL_PROVEN, and
+    since the pool is `_proven or agentic` that meant: whenever ANY allowlisted
+    model was available, nothing else could lead at all. MEASURED 2026-08-31, a
+    hard build routed to qwen3.8 at 134.1 while glm-5.3 at 138 -- the top of the
+    whole ranking, and the model the user had just asked for by name -- was not
+    in the chain.
+
+    The allowlist was right when it was written: three runs, three different
+    silent tool-dialect failures, zero files each time, and nothing downstream
+    to catch them. The hub has since learned to reject a tool call typed out as
+    prose, reject a turn that only announced work, mark a non-answering id dead,
+    and demote by measured delivery -- so that failure is now caught after the
+    fact instead of only being prevented beforehand.
+
+    So the gate is WIDENED, not removed: allowlisted, or in the top band. An
+    unproven mid-tier model still may not lead a build."""
+    return _is_tool_proven(model_id) or score >= _PREF_FLOORS[5]
 
 
 def _is_tool_proven(model_id):
@@ -13237,7 +13281,22 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
 # Each one is a full model call, so this multiplies the cost of every turn --
 # 3 is enough for a real best-of, and small enough that a free tier survives a
 # long agent run.
-_SWARM_TOOL_FANOUT = 3
+# ASKED 2026-08-31: "he can use more then 3 agents in the swarm". Five by
+# default, settable per install. What makes a bigger swarm safe rather than
+# reckless is the budget check in _swarm_rank -- more slots on a drained
+# provider would just finish it off faster.
+_SWARM_TOOL_FANOUT = 5
+_SWARM_FANOUT_MAX = 8           # past this the quota cost outruns the benefit
+
+
+def _swarm_fanout():
+    """How many models answer one swarm turn. Clamped: a nonsense setting must
+    not spend eight times the quota by accident, nor drop the swarm to zero."""
+    try:
+        n = int(config.get_setting("swarm_fanout", _SWARM_TOOL_FANOUT))
+    except (TypeError, ValueError):
+        n = _SWARM_TOOL_FANOUT
+    return max(1, min(n, _SWARM_FANOUT_MAX))
 # How deep into the chain to look before ranking. Bigger than the fan-out on
 # purpose: with only three candidates there is nothing to choose BETWEEN, which
 # is exactly how the swarm ended up filling half its slots with models that
@@ -13249,6 +13308,9 @@ _SWARM_TOOL_CANDIDATES = 12
 # a single unlucky failure is (0+1)/(1+2) = 0.33 -- deliberately above a lone
 # bad hop's reach once one success exists ((1+1)/(2+2) = 0.5).
 _SWARM_MIN_RELIABILITY = 0.4
+# Below this fraction of a provider's daily budget, it keeps its remaining calls
+# for the single-model path rather than spending them on one slot of a fan-out.
+_SWARM_MIN_HEADROOM = 0.10
 
 
 # A provider needs a real record before it says anything about a model nobody
@@ -13326,6 +13388,7 @@ def _swarm_rank(cands):
     bad minute must not take the entire swarm down with it."""
     if not cands:
         return []
+    fanout = _swarm_fanout()
     ranked = sorted(cands, reverse=True,
                     key=lambda pm: _agentic_score((_benchmark_score(pm[0], pm[1]),
                                                    pm[0], pm[1])))
@@ -13333,18 +13396,33 @@ def _swarm_rank(cands):
                if _swarm_reliability(pm[0], pm[1]) >= _SWARM_MIN_RELIABILITY]
     weak = [pm for pm in ranked if pm not in healthy]
     ordered = healthy + weak
+    # BUDGET. Asked for directly -- "always in the range of best models to dont
+    # exaust good ones quickly". A five-slot swarm aimed at one nearly-drained
+    # provider finishes it off in a single turn, and it is precisely the
+    # providers carrying the best models that are worth protecting. Same signal
+    # the single-model router already uses (_quota_headroom); applied only when
+    # there is somewhere else to go, because refusing to answer is worse than
+    # spending the last of a budget.
+    # DEMOTED, not dropped: a drained provider goes to the back of the queue and
+    # is used only if there are not enough others to fill the slots. An
+    # all-or-nothing filter was tried first and was worse -- with four healthy
+    # candidates and a fan-out of five it gave up and let the drained provider
+    # take TWO slots, which is the exact outcome this exists to prevent.
+    afford = [pm for pm in ordered if _quota_headroom(pm[0]) > _SWARM_MIN_HEADROOM]
+    drained = [pm for pm in ordered if pm not in afford]
+    ordered = afford + drained
 
     picks, used = [], set()
     for pm in ordered:                      # one pass preferring a fresh provider
         if pm[0] not in used:
             picks.append(pm)
             used.add(pm[0])
-            if len(picks) >= _SWARM_TOOL_FANOUT:
+            if len(picks) >= fanout:
                 return picks
     for pm in ordered:                      # then top up, repeats allowed
         if pm not in picks:
             picks.append(pm)
-            if len(picks) >= _SWARM_TOOL_FANOUT:
+            if len(picks) >= fanout:
                 break
     return picks
 

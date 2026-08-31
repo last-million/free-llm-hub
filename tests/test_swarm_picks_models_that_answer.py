@@ -76,10 +76,10 @@ def test_a_model_with_no_history_is_never_judged():
 def test_the_swarm_never_shrinks_below_its_fanout():
     """Better a member that probably fails than a smaller swarm: the fan-out is
     the whole point, and a demoted model still might answer."""
-    cands = [("g4f", "a"), ("g4f", "b"), ("g4f", "c"), ("g4f", "d")]
+    cands = [("g4f", chr(97 + i)) for i in range(app._SWARM_FANOUT_MAX + 2)]
     with _rel({}, default=0.15), _score({}):
         picks = app._swarm_rank(cands)
-    assert len(picks) == app._SWARM_TOOL_FANOUT
+    assert len(picks) == app._swarm_fanout()
 
 
 def test_strength_still_decides_between_two_healthy_models():
@@ -126,8 +126,8 @@ def test_fewer_candidates_than_the_fanout_are_all_used():
 # --------------------------------------------------------------------------- #
 
 def test_the_fanout_ranks_its_candidates_instead_of_taking_chain_order():
-    chain = [("g4f", "dead-1"), ("g4f", "dead-2"), ("g4f", "dead-3"),
-             ("google", "alive-1"), ("glm", "alive-2")]
+    chain = [("g4f", "dead-%d" % i) for i in range(6)] + [
+        ("google", "alive-1"), ("glm", "alive-2")]
     seen = {}
 
     def _rank(cands):
@@ -145,11 +145,11 @@ def test_the_fanout_ranks_its_candidates_instead_of_taking_chain_order():
                                 "tools": [{"type": "function"}]})
     # It must see MORE than the fan-out to have anything to choose between --
     # taking only the first three off the chain is the bug being fixed.
-    assert len(seen.get("cands") or []) > app._SWARM_TOOL_FANOUT, seen
+    assert len(seen.get("cands") or []) > app._swarm_fanout(), seen
 
 
 def test_the_candidate_pool_is_deeper_than_the_fanout():
-    assert app._SWARM_TOOL_CANDIDATES > app._SWARM_TOOL_FANOUT
+    assert app._SWARM_TOOL_CANDIDATES > app._swarm_fanout()
 
 
 # --------------------------------------------------------------------------- #
@@ -219,7 +219,8 @@ def test_provider_totals_add_up_every_model_on_that_provider():
 def test_the_ranking_uses_the_provider_aware_rate():
     """Wiring: _swarm_rank must consult _swarm_reliability, or none of the
     above changes which models actually get a slot."""
-    cands = [("g4f", "fresh-relay-id"), ("google", "g1"), ("glm", "z1"), ("nvidia", "n1")]
+    cands = [("g4f", "fresh-relay-id"), ("google", "g1"), ("glm", "z1"),
+             ("nvidia", "n1"), ("groq", "q1"), ("kilocode", "k1"), ("cloudflare", "c1")]
     with mock.patch.object(app, "_swarm_reliability",
                            side_effect=lambda pid, m: 0.1 if pid == "g4f" else 0.8), \
             _score({}):
