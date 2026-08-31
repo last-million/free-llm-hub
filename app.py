@@ -60,6 +60,7 @@ except Exception:  # pragma: no cover - jinja2 always ships with flask
 
 import agentic_chat
 import agentic_history
+import snapshots
 import quick_history
 import config
 import image_history
@@ -9451,8 +9452,16 @@ def api_agent_send_message(session_id):
     # produced one (status 200); a 4xx/409/499/5xx has no reply text to save.
     sess_info = agentic_chat.get_session(session_id)
     if sess_info:
+        # The files as they are RIGHT NOW, before this turn touches anything --
+        # so restoring this turn's snapshot puts the project back to how it
+        # looked when the message was sent. Fails open (returns None) rather
+        # than ever holding up the turn; see snapshots.py.
+        snap = None
+        if config.get_flag("turn_snapshots", True):
+            snap = snapshots.take(session_id, sess_info["project_dir"],
+                                  "before: " + (body["text"] or "")[:60])
         agentic_history.record_turn(session_id, sess_info["cli"], sess_info["project_dir"],
-                                    "user", body["text"])
+                                    "user", body["text"], snapshot=snap)
         # Keep the saved conversation's mode in step with the live session. Done
         # here rather than at session start because the conversation record does
         # not exist until its first turn. set_quality returns without writing
@@ -9726,6 +9735,52 @@ def api_agent_history_delete(session_id):
     if not deleted:
         return jsonify({"error": "No such conversation."}), 404
     return jsonify({"deleted": True})
+
+
+@app.route("/api/agent/history/<session_id>/rewind", methods=["POST"])
+def api_agent_history_rewind(session_id):
+    """Go back to how things were before turn `index`: FILES and transcript.
+
+    Asked for directly -- "checkpoints buttons for previous message to restaure
+    conversation and code and rerun it". Restoring only the conversation would
+    be worse than useless, because the transcript would then claim a state the
+    files no longer have; both halves move together or neither does.
+
+    DESTRUCTIVE, and deliberately not idempotent-by-accident: work done after
+    that point is discarded. The UI confirms first, and this refuses outright
+    unless the turn actually carries a snapshot."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        index = int(body.get("index"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "index is required."}), 400
+    conv = agentic_history.get_conversation(session_id)
+    if not conv:
+        return jsonify({"error": "No stored conversation with that id.",
+                        "code": "no_history"}), 404
+    turns = conv.get("turns") or []
+    if not 0 <= index < len(turns):
+        return jsonify({"error": "No such turn."}), 400
+    snap = (turns[index] or {}).get("snapshot")
+    if not snap:
+        return jsonify({"error": "That message has no file snapshot, so the code "
+                                 "cannot be restored to it.",
+                        "code": "no_snapshot"}), 400
+    project_dir = conv.get("project_dir")
+    if not project_dir or not os.path.isdir(project_dir):
+        return jsonify({"error": "That project folder no longer exists: %s"
+                        % _sanitize(str(project_dir)), "code": "folder_gone"}), 400
+    if not snapshots.restore(session_id, project_dir, snap):
+        return jsonify({"error": "Could not restore the files for that message.",
+                        "code": "restore_failed"}), 500
+    removed = agentic_history.truncate_to_turn(session_id, index)
+    return jsonify({"session_id": session_id, "index": index,
+                    "turns_removed": removed or 0,
+                    "text": (turns[index] or {}).get("text") or "",
+                    "project_dir": project_dir})
 
 
 @app.route("/api/agent/history/<session_id>/checkpoints", methods=["POST"])

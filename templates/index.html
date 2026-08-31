@@ -1237,6 +1237,16 @@
   }
   .ahv-bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
   .ahv-note{font-size:11.5px;color:var(--text-faint);line-height:1.5}
+  /* Sits under a user bubble, quiet until hovered -- it is destructive, so it
+     should not invite an idle click. */
+  .ah-rewind{display:inline-block;margin:4px 0 0 auto;padding:2px 8px;border-radius:6px;
+    border:1px solid var(--border);background:transparent;color:var(--muted);
+    font-size:11px;font-weight:600;cursor:pointer;opacity:.55;
+    transition:opacity .15s ease, color .15s ease, border-color .15s ease}
+  .msg:hover .ah-rewind{opacity:1}
+  .ah-rewind:hover{color:var(--accent);border-color:var(--accent)}
+  .ah-rewind:focus-visible{outline:2px solid var(--accent);outline-offset:2px;opacity:1}
+  .ah-rewind[disabled]{opacity:.4;cursor:default}
   .ah-checkpoint-marker{
     align-self:center;font-size:11px;font-weight:700;letter-spacing:.03em;color:var(--info-text);
     background:var(--info-soft);border:1px dashed var(--info-border);border-radius:999px;
@@ -2569,7 +2579,7 @@
                 <span>Swarm</span>
               </label>
             </div>
-            <button class="btn sm ghost" id="agent-checkpoint" type="button" title="Bookmark this point in the conversation — not a filesystem undo">Bookmark</button>
+            <button class="btn sm ghost" id="agent-checkpoint" type="button" title="Mark this point in the transcript. To put the FILES back too, use Restore &amp; rerun on one of your own messages.">Bookmark</button>
             <button class="btn sm ghost" id="agent-running" type="button"
                   title="Conversations and previews currently open">Running <span id="agent-running-n">0</span></button>
           <button class="btn sm ghost" id="agent-end" type="button">End session</button>
@@ -2677,7 +2687,7 @@
           <div class="agent-history-viewer" id="agent-history-viewer" hidden>
             <div class="ahv-bar">
               <button type="button" class="btn sm ghost" id="agent-history-back">&larr; Back to list</button>
-              <span class="ahv-note">Checkpoints are conversation bookmarks only &mdash; they do not undo or restore any files the agent edited.</span>
+              <span class="ahv-note">&#8630; <b>Restore &amp; rerun</b> on one of your messages puts the project FILES and the conversation back to how they were before it, then sends it again. Anything done after that point is discarded. <b>Bookmark</b> is still just a marker in the transcript. A message with no restore button predates file snapshots.</span>
             </div>
             <div class="chat-messages" id="agent-history-transcript" aria-live="polite"></div>
           </div>
@@ -8433,6 +8443,15 @@
       endBtn.disabled = on;
     }
 
+    /* Send a message the user did not just type -- currently the rerun half of
+       a rewind. Goes through doSend so the streaming, the bubbles and the
+       history recording are all the ordinary path, never a second copy of it. */
+    function sendAgentMessage(text){
+      if (!text || !sessionId || sendBtn.disabled) return;
+      textEl.value = text;
+      doSend();
+    }
+
     function doSend(){
       // Re-entrancy guard — same pattern as chat playground's sendChat().
       if (sendBtn.disabled) return;
@@ -8632,7 +8651,9 @@
       var out = [];
       for (var i = 0; i <= turns.length; i++){
         (byIndex[i] || []).forEach(function(cp){ out.push({ type: 'checkpoint', checkpoint: cp }); });
-        if (turns[i]) out.push({ type: 'turn', turn: turns[i] });
+        /* Carry the turn's own INDEX through: it is what /rewind names, and
+           the rendered order is not it (checkpoint markers sit between turns). */
+        if (turns[i]) out.push({ type: 'turn', turn: turns[i], index: i });
       }
       return out;
     }
@@ -8649,12 +8670,60 @@
         var t = item.turn;
         var role = t.role === 'user' ? 'user' : 'assistant';
         var who = t.role === 'user' ? 'You' : 'Agent';
-        return '<div class="msg ' + role + '"><span class="who">' + who + '</span><div class="bubble">' + esc(t.text) + '</div></div>';
+        /* Rewind lives on YOUR messages, not the agent's: a snapshot is taken
+           just before a turn runs, so "restore this point" means the files as
+           they were when you sent that message. A turn with no snapshot (taken
+           before this shipped, or a project too big to snapshot) shows no
+           button rather than one that would lie. */
+        var rewind = (t.role === 'user' && t.snapshot && typeof item.index === 'number')
+          ? '<button class="ah-rewind" type="button" data-index="' + item.index +
+            '" title="Put the code and the conversation back to how they were '
+            + 'before this message, then run it again">&#8630; Restore &amp; rerun</button>'
+          : '';
+        return '<div class="msg ' + role + '"><span class="who">' + who + '</span>' +
+               '<div class="bubble">' + esc(t.text) + '</div>' + rewind + '</div>';
       }).join('');
+    }
+
+    /* Restore the project to how it was before one of your messages, then send
+       that message again. Both halves move together -- restoring only the
+       conversation would leave the transcript claiming a state the files no
+       longer have. Destructive, so it asks first. */
+    function wireRewindButtons(container){
+      var btns = container.querySelectorAll('.ah-rewind');
+      for (var i = 0; i < btns.length; i++){
+        btns[i].addEventListener('click', function(){
+          var btn = this;
+          var idx = parseInt(btn.getAttribute('data-index'), 10);
+          if (isNaN(idx) || !sessionId) return;
+          if (!confirm('Restore the project files AND the conversation to how they '
+                     + 'were before this message?\n\nEverything done after it is '
+                     + 'discarded. This cannot be undone.')) return;
+          btn.disabled = true;
+          var old = btn.textContent;
+          btn.textContent = 'Restoring…';
+          api('/api/agent/history/' + encodeURIComponent(sessionId) + '/rewind',
+              { method: 'POST', body: { index: idx } })
+            .then(function(r){
+              toast('Restored — ' + (r.turns_removed || 0) + ' turn' +
+                    ((r.turns_removed === 1) ? '' : 's') + ' rolled back. Re-running…');
+              if (typeof preview !== 'undefined' && preview.refreshFiles){
+                try { preview.refreshFiles(); } catch (e) {}
+              }
+              loadFullHistory(sessionId);
+              if (r.text) sendAgentMessage(r.text);      /* rerun it */
+            })
+            .catch(function(e){
+              toast('Restore: ' + e.message, true);
+              btn.disabled = false; btn.textContent = old;
+            });
+        });
+      }
     }
 
     function mountTranscript(container, conv){
       container.innerHTML = renderTranscriptHTML(conv);
+      wireRewindButtons(container);
       var bubbleWraps = container.querySelectorAll('.msg.assistant');
       var agentTurns = ((conv && conv.turns) || []).filter(function(t){ return t.role === 'agent'; });
       for (var i = 0; i < bubbleWraps.length; i++){
