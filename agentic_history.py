@@ -217,7 +217,8 @@ def _upsert_index_row(conv):
 _VALID_ROLES = ("user", "agent")
 
 
-def record_turn(session_id, cli_id, project_dir, role, text, native_session_id=None):
+def record_turn(session_id, cli_id, project_dir, role, text, native_session_id=None,
+                snapshot=None):
     """Append one turn to session_id's persisted transcript, creating the
     conversation record on its first call. Never raises -- a history bug must
     never break a real agentic turn (the cost of a failure here is that one
@@ -225,6 +226,10 @@ def record_turn(session_id, cli_id, project_dir, role, text, native_session_id=N
     .save() make)."""
     if not session_id or role not in _VALID_ROLES:
         return
+    # `snapshot` is the shadow-git commit taken just BEFORE this turn ran (see
+    # snapshots.py), so restoring it puts the files back to how they were when
+    # the message was sent. Recorded on the turn because that is what the
+    # rewind UI hangs its button on.
     try:
         with _LOCK:
             now = time.time()
@@ -256,16 +261,48 @@ def record_turn(session_id, cli_id, project_dir, role, text, native_session_id=N
                 if title != DEFAULT_TITLE:
                     conv["title"] = title
             conv["last_active_at"] = now
-            conv.setdefault("turns", []).append({
+            turn = {
                 "role": role,
                 "text": text if isinstance(text, str) else str(text if text is not None else ""),
                 "native_session_id": native_session_id,
                 "ts": now,
-            })
+            }
+            if snapshot:
+                turn["snapshot"] = snapshot
+            conv.setdefault("turns", []).append(turn)
             _save_conversation(conv)
             _upsert_index_row(conv)
     except Exception:
         pass
+
+
+def truncate_to_turn(session_id, index):
+    """Drop every turn from `index` onward. Returns the number removed, or None.
+
+    The transcript half of a rewind: snapshots.restore() puts the FILES back to
+    the state before that turn, and this puts the conversation back to the same
+    point, so the two never disagree about what has happened. Checkpoints
+    pointing past the new end are dropped with it."""
+    if index is None or index < 0 or not session_id:
+        return None
+    try:
+        with _LOCK:
+            conv = _load_conversation(session_id)
+            if conv is None:
+                return None
+            turns = conv.get("turns") or []
+            if index >= len(turns):
+                return 0
+            removed = len(turns) - index
+            conv["turns"] = turns[:index]
+            conv["checkpoints"] = [c for c in (conv.get("checkpoints") or [])
+                                   if (c.get("turn_index") or 0) <= index]
+            conv["last_active_at"] = time.time()
+            _save_conversation(conv)
+            _upsert_index_row(conv)
+            return removed
+    except Exception:
+        return None
 
 
 def set_quality(session_id, quality):
