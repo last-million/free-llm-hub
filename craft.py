@@ -335,6 +335,7 @@ VERIFY_READ = """VERIFY, FIX, STOP (applies to every brief above)
 # fire on a genuinely finished task or a real open decision.
 ACT_RUN = """ACT (applies to every brief above, comes before VERIFY/FIX/STOP)
 - If you already called a tool this turn and your own last sentence names the exact next call you now have everything needed to make, make it -- do not end the turn to announce it.
+- Called no tool at all? A sentence about what you are ABOUT to build is the turn wasted -- make the first call, unless the last bullet applies.
 - Todo/multi-step items left, no blocker named? A recap is not the stop -- do the next item.
 - A failing tool is not a blocker -- take the alternative you named.
 - Neither covers a genuinely open decision (which real option, anything destructive/irreversible, anything you are missing information for) -- state those and wait, same as always."""
