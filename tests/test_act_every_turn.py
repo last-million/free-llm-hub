@@ -20,15 +20,28 @@ TOOLS = [{"type": "function", "function": {"name": "shell", "parameters": {}}}]
 
 
 def _mid_loop_messages():
-    """A turn deep in a tool loop: several user turns, and tool traffic."""
+    """A turn genuinely MID-CYCLE: a tool result is the last thing in the
+    conversation, so the model is answering the tool, not a person.
+
+    CORRECTED 2026-08-31. This used to end with a trailing {"role": "user",
+    "content": "continue"} -- which is not mid-loop at all. The tool cycle had
+    COMPLETED (call issued, result returned) and a human had typed a new
+    instruction. Treating that as "inside a running loop" is precisely the
+    over-broad reading that denied every continued project its brief; see
+    tests/test_brief_on_continued_projects.py. The trailing-user case now has
+    its own test below, asserting the behaviour it should always have had."""
     return [
         {"role": "user", "content": "build the site"},
         {"role": "assistant", "tool_calls": [
             {"id": "1", "type": "function",
              "function": {"name": "shell", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "1", "content": "ok"},
-        {"role": "user", "content": "continue"},
     ]
+
+
+def _user_said_continue():
+    """The completed-cycle case: the tool came back, then a person spoke."""
+    return _mid_loop_messages() + [{"role": "user", "content": "continue"}]
 
 
 def _inject(messages, agentic=True):
@@ -51,6 +64,18 @@ def test_the_domain_brief_is_still_opening_turn_only():
     # keyword: ACT's own header says "comes before VERIFY/FIX/STOP", so a naive
     # `"VERIFY" not in ...` matches ACT itself and passes for the wrong reason.)
     assert systems == [craft.ACT_RUN], systems
+
+
+def test_typing_continue_gets_the_brief_back():
+    """The turn this whole feature exists for. The cycle is finished and a
+    person has asked for more work -- so the plan, the brief and ACT all apply,
+    and "continue" inherits the project's own domain (see _apply_craft_brief)."""
+    out = _inject(_user_said_continue())
+    joined = " ".join((m.get("content") or "") for m in out
+                      if m.get("role") == "system")
+    assert "ACT " in joined
+    assert "PLAN FIRST" in joined
+    assert "WEB DESIGN BRIEF" in joined
 
 
 def test_the_user_text_and_tool_history_are_untouched():

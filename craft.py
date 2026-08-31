@@ -189,6 +189,10 @@ _BRIEFS = [
         r"\bproduct page\b|\bshopify\b|\bstripe checkout\b", re.I), ECOMMERCE),
     ("web_design", re.compile(
         r"\blanding page\b|\bweb ?site\b|\bwebpage\b|\bweb design\b|\bui design\b|"
+        # same "the site" / "my site" phrasing SEO already accepts, and for the
+        # same reason: people say it as often as "website". Bare \bsite\b stays
+        # out (site reliability / on-site / job site) -- see _SITE_NOUNS.
+        r"\b(?:the|my|our|this) site\b|"
         r"\bhero section\b|\bredesign\b|\bstyle the\b|\btailwind\b|\bfront[- ]?end\b", re.I),
      WEB_DESIGN),
     # NOTE: bare "optimi[sz]e" was here and misfired on "write a blog post and
@@ -225,7 +229,14 @@ MAX_ORTHOGONAL = 3
 #
 # Their triggers therefore include plain build nouns, not just topic words. Pure
 # code tasks ("refactor the auth module") still match neither and pay nothing.
+# "the site" / "my site" are included; BARE "site" deliberately is not. People
+# say "build the site" as often as "build the website" -- found when a resumed
+# project whose opening line was "build the site" matched no domain at all --
+# but a bare \bsite\b also matches "site reliability", "on-site" and "job
+# site", and a web-design brief on an SRE task is exactly the misfire these
+# narrow triggers exist to avoid.
 _SITE_NOUNS = (r"\bweb ?site\b|\bwebpage\b|\bhomepage\b|\blanding page\b|"
+               r"\b(?:the|my|our|this) site\b|"
                r"\bportfolio\b|\bonline store\b|\bstorefront\b|\be-?commerce\b|"
                r"\bblog\b|\brestaurant\b")
 
