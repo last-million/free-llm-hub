@@ -60,6 +60,7 @@ except Exception:  # pragma: no cover - jinja2 always ships with flask
 
 import agentic_chat
 import agentic_history
+import model_categories
 import snapshots
 import quick_history
 import config
@@ -7783,6 +7784,58 @@ def api_aa_benchmarks():
 @app.route("/api/models", methods=["GET"])
 def api_models():
     return jsonify(aggregated_models())
+
+
+@app.route("/api/model-categories", methods=["GET", "POST"])
+def api_model_categories():
+    """What each model is good at, and a one-click way to use only those.
+
+    GET  -> {"categories":[{"key","label","help","count","ids":[...]}], "blocked":[...]}
+    POST {"key": "swarm"}  -> switch ON every model in that category and OFF
+                              everything else, then return the same shape.
+    POST {"key": "all"}    -> switch everything back on.
+
+    The category table lives in model_categories.py precisely so this route and
+    the router cannot disagree about what a category means. The switch itself
+    reuses the per-model allowlist, which routing already honours at one seam --
+    so choosing a category takes effect in orchestration, the fallback chain and
+    the swarm at once, and "always the best, else the next best" still comes for
+    free from the ordinary ranking inside whatever set is enabled."""
+    live = []
+    for pid in _available_providers():
+        try:
+            for m in provider_free_models(pid) or []:
+                live.append((pid, m, "%s/%s" % (pid, m),
+                             _normalize_model_identity(m)))
+        except Exception:                                        # noqa: BLE001
+            continue
+
+    if request.method == "POST":
+        body = request.get_json(force=True, silent=True) or {}
+        key = str(body.get("key") or "").strip()
+        if key == "all":
+            config.set_setting(_BLOCKED_SETTING, [])
+        elif key in model_categories.CATEGORY_KEYS:
+            keep = {mid for _p, _m, mid, ident in live
+                    if model_categories.matches(key, _p, _m, ident)}
+            if not keep:
+                return jsonify({"error": "No available model is in that category "
+                                         "right now."}), 400
+            config.set_setting(_BLOCKED_SETTING,
+                               sorted({mid for _p, _m, mid, _i in live} - keep))
+        else:
+            return jsonify({"error": "Unknown category."}), 400
+
+    blocked = _blocked_models()
+    out = []
+    for key, label, helptext in model_categories.labels():
+        ids = sorted(mid for _p, _m, mid, ident in live
+                     if model_categories.matches(key, _p, _m, ident))
+        out.append({"key": key, "label": label, "help": helptext,
+                    "count": len(ids), "ids": ids,
+                    "enabled": sum(1 for i in ids if i not in blocked)})
+    return jsonify({"categories": out, "blocked": sorted(blocked),
+                    "total": len(live)})
 
 
 @app.route("/api/model-allowlist", methods=["GET", "POST"])

@@ -1336,6 +1336,15 @@
     display:flex;align-items:center;gap:10px;padding:16px 18px;border-bottom:1px solid var(--border-soft);
     font-weight:700;font-size:15px;flex:none;
   }
+  .sd-cats{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+  .sd-cat{padding:4px 10px;border-radius:999px;border:1px solid var(--border);
+    background:transparent;color:var(--text);font-size:11.5px;font-weight:600;
+    cursor:pointer;transition:background .15s ease,border-color .15s ease}
+  .sd-cat:hover{border-color:var(--accent);color:var(--accent)}
+  .sd-cat .n{opacity:.6;font-weight:500;margin-left:4px}
+  .sd-cat.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  .sd-cat.on .n{opacity:.85}
+  .sd-cat[disabled]{opacity:.4;cursor:default}
   .sd-models-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
   .sd-models-filter{width:100%;margin:8px 0 6px;padding:6px 9px;border-radius:8px;
     border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:12px}
@@ -2318,6 +2327,7 @@
       <p class="sd-help">Every model the hub can currently reach, strongest first, with the
         score routing actually uses. Switch one off and it is skipped everywhere &mdash;
         orchestration, the fallback chain and the swarm.</p>
+      <div class="sd-cats" id="sd-cats" role="group" aria-label="Use only models good at"></div>
       <input class="sd-models-filter" id="sd-models-filter" type="search"
              placeholder="Filter by model or provider&hellip;" aria-label="Filter models">
       <div class="sd-models" id="sd-models"><div class="skel skel-row"></div></div>
@@ -9252,7 +9262,7 @@
             .then(function(r){
               _sdBlocked = {};
               ((r && r.blocked) || []).forEach(function(x){ _sdBlocked[x] = true; });
-              renderSdModels();
+              renderSdCats(); renderSdModels();
               toast(model + (want ? ' enabled' : ' switched off'));
             })
             .catch(function(e){ toast('Models: ' + e.message, true); box.checked = !want; })
@@ -9261,12 +9271,67 @@
       }
     }
 
+    /* One-click "use only the models good at X".
+     The category table is server-side (model_categories.py) so these buttons
+     and the router cannot disagree about what a category means. Picking one
+     writes the per-model allowlist, which routing already honours at a single
+     seam -- so it applies to orchestration, the fallback chain and the swarm at
+     once. Ranking still decides WHICH of the enabled models answers, so "always
+     the best, else the next best" needs nothing extra. */
+  var _sdCats = [];
+
+  function renderSdCats(){
+    var host = $('#sd-cats');
+    if (!host) return;
+    var allOn = !(_sdBlocked && Object.keys(_sdBlocked).length);
+    host.innerHTML =
+      '<button class="sd-cat' + (allOn ? ' on' : '') + '" type="button" data-key="all">' +
+        'All models</button>' +
+      _sdCats.map(function(c){
+        /* "on" means every model in this category is enabled AND nothing
+           outside it is -- i.e. this button is what is currently in force. */
+        var exact = !allOn && c.enabled === c.count && c.count > 0 &&
+                    (_sdModels.length - Object.keys(_sdBlocked).length) === c.count;
+        return '<button class="sd-cat' + (exact ? ' on' : '') + '" type="button" data-key="' +
+               esc(c.key) + '" title="' + esc(c.help || '') + '"' +
+               (c.count ? '' : ' disabled') + '>' + esc(c.label) +
+               '<span class="n">' + c.count + '</span></button>';
+      }).join('');
+    var btns = host.querySelectorAll('.sd-cat');
+    for (var i = 0; i < btns.length; i++){
+      btns[i].addEventListener('click', function(){
+        if (this.disabled) return;
+        var key = this.getAttribute('data-key');
+        var all = host.querySelectorAll('.sd-cat');
+        for (var j = 0; j < all.length; j++) all[j].disabled = true;
+        api('/api/model-categories', { method: 'POST', body: { key: key } })
+          .then(function(r){
+            _sdCats = (r && r.categories) || [];
+            _sdBlocked = {};
+            ((r && r.blocked) || []).forEach(function(x){ _sdBlocked[x] = true; });
+            renderSdCats(); renderSdModels();
+            var n = _sdModels.length - Object.keys(_sdBlocked).length;
+            toast(key === 'all' ? 'All models enabled'
+                                : 'Using ' + n + ' model' + (n === 1 ? '' : 's') +
+                                  ' good at ' + key);
+          })
+          .catch(function(e){ toast('Categories: ' + e.message, true); })
+          .then(function(){
+            var all2 = host.querySelectorAll('.sd-cat');
+            for (var k = 0; k < all2.length; k++) all2[k].disabled = false;
+          });
+      });
+    }
+  }
+
     function loadSdModels(silent){
-      return Promise.all([api('/api/tracking'), api('/api/model-allowlist')])
+      return Promise.all([api('/api/tracking'), api('/api/model-categories')])
         .then(function(res){
           _sdModels = ((res[0] && res[0].models) || []).slice();
+          _sdCats = ((res[1] && res[1].categories) || []).slice();
           _sdBlocked = {};
           ((res[1] && res[1].blocked) || []).forEach(function(x){ _sdBlocked[x] = true; });
+          renderSdCats();
           renderSdModels();
         })
         .catch(function(e){
