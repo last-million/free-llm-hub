@@ -12776,6 +12776,51 @@ _TEXT_TOOL_CALL_RES = (
 )
 
 
+# A turn that ANNOUNCED work instead of doing it.
+#
+# REPORTED 2026-08-31 from a real /build conversation -- two turns in a row,
+# both straight after an explicit "continue", both ending as "Finished":
+#   "I'll now craft a premium editorial UI system..."      (177 chars)
+#   "I am now hard-coding the pillar architecture..."      (118 chars)
+# No tool calls at all. One burned 2m 27s to say it. Nothing was written, and
+# the hub scored both as clean successes -- so it learned nothing and picked
+# the same models again next turn.
+#
+# ACT's first bullet did not cover it: it opens "If you already called a tool
+# this turn", and these called nothing. That hole is closed in craft.ACT_RUN
+# too, but a prompt rule only works when the model reads it; this is the
+# structural half.
+#
+# TENSE is the discriminator, and it has to be. "Done -- all 12 pages built" is
+# a perfectly good short final answer with no tool calls, and "I'll now build
+# the 12 pages" is the same length and a dead turn. So: a statement of INTENT
+# to do work, with no question in it, on a turn that offered tools.
+_INTENT_RE = re.compile(
+    r"^\W*(?:i'?ll|i will|i am (?:now )?|i'?m (?:now )?going to|i'?m (?:now )?about to"
+    r"|let me|now i'?ll|next,? i'?ll|next,? i will)\b", re.I)
+_WORK_VERB_RE = re.compile(
+    r"\b(?:build|rebuild|creat\w*|writ\w*|add|updat\w*|fix\w*|redesign\w*|design\w*"
+    r"|implement\w*|generat\w*|craft\w*|hard-?cod\w*|refactor\w*|instal\w*|run|test"
+    r"|deploy\w*|styl\w*|check\w*|verif\w*|deliver\w*|produc\w*|set up|wire\w*)\b", re.I)
+# An announcement is SHORT by nature -- it is a sentence about what comes next,
+# not the work. A long answer that happens to open with "I'll walk through..."
+# is a real deliverable and must not be touched.
+_ANNOUNCE_MAX_CHARS = 400
+
+
+def _looks_like_announced_not_acted(text):
+    """True when `text` states an intention to do work rather than reporting
+    work done or asking a question. See the note above."""
+    if not text or not isinstance(text, str):
+        return False
+    body = text.strip()
+    if not body or len(body) > _ANNOUNCE_MAX_CHARS:
+        return False
+    if "?" in body:
+        return False                      # asking is what it SHOULD do
+    return bool(_INTENT_RE.search(body) and _WORK_VERB_RE.search(body))
+
+
 def _looks_like_text_tool_call(text):
     """True when `text` contains a tool call the model wrote out instead of
     emitting. Requires a real closing/paired marker, not a passing mention, so
@@ -12801,7 +12846,8 @@ def _chat_json_nonanswer(data, has_tools=False):
         if isinstance(content, list):
             content = "".join((p.get("text") or "") for p in content
                               if isinstance(p, dict))
-        if has_tools and _looks_like_text_tool_call(content):
+        if has_tools and (_looks_like_text_tool_call(content)
+                          or _looks_like_announced_not_acted(content)):
             return True
         return _is_upstream_nonanswer(content)
     except Exception:
@@ -13342,7 +13388,12 @@ def _swarm_tool_result(body):
         # ordinary prose, so without this it competes as a candidate answer --
         # and if it wins, the CLI executes nothing and the build stops. That is
         # exactly the reported failure; see _looks_like_text_tool_call.
-        if not msg.get("tool_calls") and _looks_like_text_tool_call(msg.get("content")):
+        if not msg.get("tool_calls") and (
+                _looks_like_text_tool_call(msg.get("content"))
+                or _looks_like_announced_not_acted(msg.get("content"))):
+            # MEASURED: the reported dead turn was swarm mode -- three models
+            # ran, none called a tool, and the best-ranked ANNOUNCEMENT won the
+            # slot, so the CLI executed nothing and the build said Finished.
             _note_nonanswer(hop_pid, hop_model)
             return None
         _record_chat_usage(hop_pid, hop_model, data, est)
