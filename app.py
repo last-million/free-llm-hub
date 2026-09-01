@@ -6935,7 +6935,7 @@ def api_activity():
 # render the dashboard, and /api, /v1 and /artifact keep their own handlers.
 _VIEW_SLUGS = ("hub", "activity", "chat", "agent", "images", "providers",
                "image-providers", "subscriptions", "routing", "quota",
-               "usage", "tracking", "tutorial-ar")
+               "usage", "tracking", "tutorial-ar", "settings")
 
 
 @app.route("/<any(" + ", ".join("'%s'" % s for s in _VIEW_SLUGS) + "):slug>")
