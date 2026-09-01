@@ -305,6 +305,39 @@ def truncate_to_turn(session_id, index):
         return None
 
 
+def set_native_session_id(session_id, native):
+    """Remember the CLI's OWN thread id for this conversation, on its own.
+
+    THE MODEL'S MEMORY LIVES BEHIND THIS ID. `codex exec resume <id>` and
+    `claude --resume <id>` bring back the full context of the conversation; the
+    transcript on disk only restores what is DISPLAYED.
+
+    It used to be saved as a side effect of recording the agent's reply, i.e.
+    only when a turn COMPLETED. MEASURED 2026-09-01 on a live conversation that
+    had lost its context: two turns, both role "user", native_session_id None --
+    the turns had been interrupted, so no reply was ever recorded, so the id was
+    never written, so /resume had nothing to resume and the model started over
+    knowing only the files. Exactly the reported "when i refresh page it's like
+    he will start from beginning".
+
+    Now it is written as soon as the id exists, independently of whether the
+    turn that produced it survives."""
+    if not session_id or not native:
+        return None
+    try:
+        with _LOCK:
+            conv = _load_conversation(session_id)
+            if conv is None:
+                return None
+            if conv.get("native_session_id") == native:
+                return native               # no write: this runs per event
+            conv["native_session_id"] = native
+            _save_conversation(conv)
+            return native
+    except Exception:
+        return None
+
+
 def set_quality(session_id, quality):
     """Remember the model-quality mode a conversation is running in.
 

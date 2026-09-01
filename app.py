@@ -9673,10 +9673,35 @@ def api_agent_send_message_stream(session_id):
     text = body["text"]
     sess_info = agentic_chat.get_session(session_id)
     if sess_info:
+        # Snapshot the files BEFORE the turn touches them, exactly as the
+        # non-streaming route does. It was missing here, which made the whole
+        # Restore & rerun feature inert on the path /build actually uses --
+        # every turn from the dashboard streams.
+        snap = None
+        if config.get_flag("turn_snapshots", True):
+            snap = snapshots.take(session_id, sess_info["project_dir"],
+                                  "before: " + (text or "")[:60])
         agentic_history.record_turn(session_id, sess_info["cli"], sess_info["project_dir"],
-                                    "user", text)
+                                    "user", text, snapshot=snap)
+        agentic_history.set_quality(session_id, sess_info.get("quality") or "normal")
 
     def gen():
+        # THE MODEL'S MEMORY. The CLI's own thread id is what `codex exec resume`
+        # / `claude --resume` need to bring back the full context, and it used to
+        # reach disk only when a turn COMPLETED -- so an interrupted turn lost it
+        # and the next one started from nothing but the files. Persist it the
+        # moment it exists instead. set_native_session_id does not write when it
+        # is already stored, so this costs a dict lookup per event.
+        saved_native = [False]
+
+        def _keep_context():
+            if saved_native[0]:
+                return
+            live = agentic_chat.get_session(session_id) or {}
+            native = live.get("native_session_id")
+            if native and agentic_history.set_native_session_id(session_id, native):
+                saved_native[0] = True
+
         # The agent's reply is persisted from INSIDE send_message_stream_durable's
         # own background thread now, not here -- this loop merely relays events
         # to whoever is still connected. See its docstring: a plain generator
@@ -9685,11 +9710,18 @@ def api_agent_send_message_stream(session_id):
         # completed for real.
         try:
             for ev in agentic_chat.send_message_stream_durable(session_id, text):
+                _keep_context()
                 yield "data: " + json.dumps(ev) + "\n\n"
         except Exception as exc:  # never leak a traceback into the stream
             yield "data: " + json.dumps({"event": "error", "status": 500,
                                          "detail": _sanitize(str(exc), 300)}) + "\n\n"
         finally:
+            # Last chance, and the one that matters when the turn ERRORED: the
+            # id may only have appeared on the way out.
+            try:
+                _keep_context()
+            except Exception:                                    # noqa: BLE001
+                pass
             yield "event: end\ndata: {}\n\n"
 
     return Response(stream_with_context(gen()), mimetype="text/event-stream", headers=_SSE_HEADERS)

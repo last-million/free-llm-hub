@@ -8605,7 +8605,16 @@
           }
           return pump();
         })
-        .catch(function(e){ asstEl.className = 'msg assistant error'; line('err', String((e && e.message) || e)); })
+        .catch(function(e){
+          /* A dropped STREAM is not a failed turn. The CLI subprocess is still
+             running on the server -- or the hub restarted and the session can be
+             rebuilt from the CLI's own thread -- so the work and its context are
+             both still there. Marking it Failed here threw that away and made
+             the next message start from nothing, which is what "Failed to fetch
+             ... and when i refresh he starts from beginning" actually was.
+             Reconnect instead, and only give up after really trying. */
+          return recoverStream(sessionId, asstEl, line, e, 1);
+        })
         .then(function(){
           clearInterval(elapsedTimer);
           var failed = (' ' + asstEl.className + ' ').indexOf(' error ') >= 0;
@@ -8630,6 +8639,60 @@
           setBusy(false);
           msgsEl.scrollTop = msgsEl.scrollHeight;
           refreshSessionInfo();
+        });
+    }
+
+    /* How long to keep trying to get back to a turn whose stream dropped.
+       Generous on purpose: a free-tier build turn can legitimately run for
+       minutes, and the whole point is not to throw the work away. */
+    var STREAM_RECOVER_TRIES = 45;      /* ~6 minutes at 8s */
+    var STREAM_RECOVER_WAIT = 8000;
+
+    function recoverStream(sid, asstEl, line, err, attempt){
+      if (!sid) return Promise.resolve();
+      if (attempt === 1){
+        line('run', 'Connection lost \u2014 reconnecting. Your work is still ' +
+                    'running on the hub, nothing is lost.');
+      }
+      if (attempt > STREAM_RECOVER_TRIES){
+        asstEl.className = 'msg assistant error';
+        line('err', 'Could not reconnect after several minutes: ' +
+                    String((err && err.message) || err) +
+                    '. The work may still have finished \u2014 reload the page to see it.');
+        return Promise.resolve();
+      }
+      return new Promise(function(res){ setTimeout(res, STREAM_RECOVER_WAIT); })
+        .then(function(){
+          return api('/api/agent/sessions/' + encodeURIComponent(sid))
+            .then(function(sess){
+              if (sess && sess.currently_running){
+                return recoverStream(sid, asstEl, line, err, attempt + 1);   /* still working */
+              }
+              /* It finished while we were disconnected. Show what it actually
+                 did rather than leaving a half-written bubble on screen. */
+              line('done', 'Reconnected \u2014 the turn finished while the connection was down.');
+              try { loadFullHistory(sid); } catch (e2) {}
+              return;
+            })
+            .catch(function(probeErr){
+              /* Session gone means the HUB restarted, not that the work
+                 vanished: the CLI keeps its own thread and the transcript is on
+                 disk, so /resume rebuilds a session pointed at both. Anything
+                 else (hub still down) just waits and tries again. */
+              var gone = probeErr && (probeErr.status === 404 ||
+                                      /no such|not found/i.test(probeErr.message || ''));
+              if (!gone) return recoverStream(sid, asstEl, line, err, attempt + 1);
+              return api('/api/agent/sessions/' + encodeURIComponent(sid) + '/resume',
+                         { method: 'POST', body: {} })
+                .then(function(r){
+                  line('done', 'The hub restarted \u2014 reconnected to the same ' +
+                               'conversation, nothing lost.');
+                  try { loadFullHistory(r.session_id || sid); } catch (e3) {}
+                })
+                .catch(function(){
+                  return recoverStream(sid, asstEl, line, err, attempt + 1);
+                });
+            });
         });
     }
 
@@ -9765,16 +9828,39 @@
        an error — probing it first logged a red 404 on every such reload. Ask the
        server to resume from the stored transcript instead: it succeeds whether
        or not the in-memory session is still there. */
-    api('/api/agent/sessions/' + encodeURIComponent(sid) + '/resume',
-        { method: 'POST', body: {} })
-      .then(function(r){
-        if (!r || !r.session_id) throw new Error('gone');
-        if (window.cxResumeAgentSession) window.cxResumeAgentSession(r);
-      })
-      .catch(function(){
-        if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', null);
-        toast('That conversation is no longer open on the hub — start a new one.', true);
-      });
+    /* KEEP TRYING when the hub itself is unreachable.
+       REPORTED 2026-09-01: "when i refresh page it's like he will start from
+       beginning man". Reloading DURING a hub restart -- which is exactly when
+       someone reloads, because the page had just said "Failed to fetch" -- made
+       this resume call fail on the network, and the catch below then WIPED the
+       session out of the URL. The conversation was never gone: the transcript
+       was on disk and the CLI still had its thread. Only the one call had
+       failed, at the worst possible moment.
+       A real answer from the server (no stored conversation, folder deleted) is
+       still reported honestly and still clears the session -- that IS gone. */
+    (function attemptResume(tries){
+      api('/api/agent/sessions/' + encodeURIComponent(sid) + '/resume',
+          { method: 'POST', body: {} })
+        .then(function(r){
+          if (!r || !r.session_id) throw new Error('gone');
+          if (window.cxResumeAgentSession) window.cxResumeAgentSession(r);
+        })
+        .catch(function(e){
+          var answered = e && e.status;          /* the hub replied: a real verdict */
+          if (!answered && tries < 20){
+            if (tries === 0) toast('Hub not reachable — reconnecting to your conversation…');
+            setTimeout(function(){ attemptResume(tries + 1); }, 6000);
+            return;                              /* the session id stays in the URL */
+          }
+          if (!answered){
+            toast('Still cannot reach the hub. Your conversation is safe — reload once it is back.',
+                  true);
+            return;                              /* still do NOT wipe it */
+          }
+          if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', null);
+          toast('That conversation is no longer open on the hub — start a new one.', true);
+        });
+    })(0);
   })();
   initArtifactPanel();
   initVisionGap();
