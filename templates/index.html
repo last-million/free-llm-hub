@@ -2208,6 +2208,7 @@
       <button class="cx-group-label" type="button" aria-expanded="true" aria-controls="grp-hub"><span class="gl-text">Hub</span><svg class="gl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
       <div class="cx-group-body" id="grp-hub">
       <a class="cx-nav-item" href="/hub" data-view="sec-lifecycle" data-title="Hub controls"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="2" y1="14" x2="6" y2="14"/><line x1="10" y1="8" x2="14" y2="8"/><line x1="18" y1="16" x2="22" y2="16"/></svg><span>Hub controls</span></a>
+      <a class="cx-nav-item" href="/settings" data-view="sec-settings" data-title="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.31.4.55.71.66H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span>Settings</span></a>
       <a class="cx-nav-item" href="/activity" data-view="sec-activity" data-title="Live activity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span>Activity</span></a>
       <a class="cx-nav-item" href="/tutorial-ar" data-view="sec-tutorial" data-title="Tutorial AR"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg><span>Tutorial AR</span><span class="nav-new-badge" data-new-key="tutorial_ar_video_v1">New</span></a></div>
     </div>
@@ -2277,97 +2278,6 @@
     </div>
   </div>
 </header>
-
-<div class="settings-drawer-scrim" id="settings-drawer-scrim" hidden></div>
-<aside class="settings-drawer" id="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="settings-drawer-title" hidden>
-  <div class="settings-drawer-h">
-    <span id="settings-drawer-title">Settings</span>
-    <button class="modal-close" id="settings-drawer-close" type="button" aria-label="Close settings">&times;</button>
-  </div>
-  <div class="settings-drawer-body">
-    <div class="sd-group">
-      <label class="switch" title="Switch between the dark and light dashboard theme (stored on this machine only)">
-        <input id="drawer-theme-switch" type="checkbox" aria-label="Use light theme">
-        <span class="track" aria-hidden="true"></span>
-        <span class="lbl">Light theme</span>
-      </label>
-      <p class="sd-help">Light is the default. Your choice is remembered in this browser.</p>
-    </div>
-    <div class="sd-group">
-      <label class="sd-label" for="drawer-ui-scale">Interface size</label>
-      <select id="drawer-ui-scale" aria-label="Interface size">
-        <option value="1">100% — browser default</option>
-        <option value=".9">90%</option>
-        <option value=".8">80% — more on screen</option>
-        <option value=".7">70%</option>
-      </select>
-      <p class="sd-help">Scales the whole dashboard, like zooming out in the browser. 80% is the default because it fits more of the chat and preview on screen at once.</p>
-    </div>
-    <div class="sd-group">
-      <label class="switch" title="Connect or disconnect all installed compatible CLIs as one transaction">
-        <input id="drawer-hub-mode-switch" type="checkbox" aria-label="Enable all CLI's">
-        <span class="track" aria-hidden="true"></span>
-        <span class="lbl">Enable all CLI&rsquo;s</span>
-      </label>
-      <p class="sd-help">Connects every compatible installed CLI to this hub together, in one step.</p>
-    </div>
-    <div class="sd-group">
-      <label class="switch" title="Let the agent use its own tool access (e.g. Playwright) to test and verify its work this session">
-        <input id="drawer-test-verification-switch" type="checkbox" aria-label="Test-and-verification mode">
-        <span class="track" aria-hidden="true"></span>
-        <span class="lbl">Test-and-verification mode</span>
-      </label>
-      <p class="sd-help">Tells the Chat CLI agent that testing/debugging its own work with tools like Playwright is expected this session.</p>
-    </div>
-    <div class="sd-group">
-      <div class="sd-models-head">
-        <b>Models &amp; live benchmark</b>
-        <button class="btn sm ghost" id="sd-models-refresh" type="button">Refresh</button>
-      </div>
-      <p class="sd-help">Every model the hub can currently reach, strongest first, with the
-        score routing actually uses. Switch one off and it is skipped everywhere &mdash;
-        orchestration, the fallback chain and the swarm.</p>
-      <div class="sd-cats" id="sd-cats" role="group" aria-label="Use only models good at"></div>
-      <input class="sd-models-filter" id="sd-models-filter" type="search"
-             placeholder="Filter by model or provider&hellip;" aria-label="Filter models">
-      <div class="sd-models" id="sd-models"><div class="skel skel-row"></div></div>
-    </div>
-
-    <div class="sd-group">
-      <label class="switch" title="Allow the last30days skill to search X and other social sources during web research">
-        <input id="drawer-social-search-switch" type="checkbox" aria-label="Social media web search">
-        <span class="track" aria-hidden="true"></span>
-        <span class="lbl">Social media web search (last30days skill)</span>
-      </label>
-      <p class="sd-help">Lets the agent search X/social sources (which need browser cookies/keys) during web research. Off = keyless web, YouTube and public Reddit only.</p>
-    </div>
-    <div class="sd-group">
-      <label class="switch" title="Rewrite the opening prompt of a chat or image request into a sharper one before sending it">
-        <input id="drawer-enhance-switch" type="checkbox" aria-label="Enhance opening prompts">
-        <span class="track" aria-hidden="true"></span>
-        <span class="lbl">Enhance opening prompts</span>
-      </label>
-      <p class="sd-help">Rewrites the <em>first</em> prompt of a dashboard chat, and every image prompt, into a sharper version before sending &mdash; so a two-word ask still gets the model&rsquo;s best work. Anti-slop by design: no &ldquo;masterpiece, 8k&rdquo; padding, no role-play framing. You always see the rewrite and can revert it. Requests from your CLIs are never touched.</p>
-    </div>
-    <div class="sd-group">
-      <div class="sd-label">Backup &amp; restore</div>
-      <div class="sd-actions">
-        <button class="btn sm" id="settings-export-open" type="button">Export settings&hellip;</button>
-        <button class="btn sm ghost" id="settings-import-open" type="button">Import settings&hellip;</button>
-      </div>
-      <input type="file" id="settings-import-file" accept="application/json" hidden>
-      <p class="sd-help">A portable JSON backup of your provider keys and hub settings &mdash; stays on this machine.</p>
-    </div>
-    <div class="sd-group">
-      <div class="sd-label">Update</div>
-      <div class="sd-actions">
-        <button class="btn sm" id="settings-update-check" type="button">Check for updates</button>
-      </div>
-      <p class="sd-help" id="settings-update-status">Checking current version&hellip;</p>
-    </div>
-  </div>
-</aside>
-
 <main class="wrap">
 
   <!-- Lifecycle and multimodal routing -->
@@ -3006,7 +2916,97 @@
   </section>
 
   <!-- Model tracking -->
-  <section class="section" aria-labelledby="h-tracking">
+    <section class="section" aria-labelledby="h-settings">
+    <div class="section-h">
+      <h2 id="h-settings" tabindex="-1">Settings</h2>
+      <span class="sub">everything the hub lets you change &mdash; models, behaviour, backup</span>
+    </div>
+    <div class="section-body" id="sec-settings">
+
+    <div class="sd-group">
+      <label class="switch" title="Switch between the dark and light dashboard theme (stored on this machine only)">
+        <input id="drawer-theme-switch" type="checkbox" aria-label="Use light theme">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Light theme</span>
+      </label>
+      <p class="sd-help">Light is the default. Your choice is remembered in this browser.</p>
+    </div>
+    <div class="sd-group">
+      <label class="sd-label" for="drawer-ui-scale">Interface size</label>
+      <select id="drawer-ui-scale" aria-label="Interface size">
+        <option value="1">100% — browser default</option>
+        <option value=".9">90%</option>
+        <option value=".8">80% — more on screen</option>
+        <option value=".7">70%</option>
+      </select>
+      <p class="sd-help">Scales the whole dashboard, like zooming out in the browser. 80% is the default because it fits more of the chat and preview on screen at once.</p>
+    </div>
+    <div class="sd-group">
+      <label class="switch" title="Connect or disconnect all installed compatible CLIs as one transaction">
+        <input id="drawer-hub-mode-switch" type="checkbox" aria-label="Enable all CLI's">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Enable all CLI&rsquo;s</span>
+      </label>
+      <p class="sd-help">Connects every compatible installed CLI to this hub together, in one step.</p>
+    </div>
+    <div class="sd-group">
+      <label class="switch" title="Let the agent use its own tool access (e.g. Playwright) to test and verify its work this session">
+        <input id="drawer-test-verification-switch" type="checkbox" aria-label="Test-and-verification mode">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Test-and-verification mode</span>
+      </label>
+      <p class="sd-help">Tells the Chat CLI agent that testing/debugging its own work with tools like Playwright is expected this session.</p>
+    </div>
+    <div class="sd-group">
+      <div class="sd-models-head">
+        <b>Models &amp; live benchmark</b>
+        <button class="btn sm ghost" id="sd-models-refresh" type="button">Refresh</button>
+      </div>
+      <p class="sd-help">Every model the hub can currently reach, strongest first, with the
+        score routing actually uses. Switch one off and it is skipped everywhere &mdash;
+        orchestration, the fallback chain and the swarm.</p>
+      <div class="sd-cats" id="sd-cats" role="group" aria-label="Use only models good at"></div>
+      <input class="sd-models-filter" id="sd-models-filter" type="search"
+             placeholder="Filter by model or provider&hellip;" aria-label="Filter models">
+      <div class="sd-models" id="sd-models"><div class="skel skel-row"></div></div>
+    </div>
+
+    <div class="sd-group">
+      <label class="switch" title="Allow the last30days skill to search X and other social sources during web research">
+        <input id="drawer-social-search-switch" type="checkbox" aria-label="Social media web search">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Social media web search (last30days skill)</span>
+      </label>
+      <p class="sd-help">Lets the agent search X/social sources (which need browser cookies/keys) during web research. Off = keyless web, YouTube and public Reddit only.</p>
+    </div>
+    <div class="sd-group">
+      <label class="switch" title="Rewrite the opening prompt of a chat or image request into a sharper one before sending it">
+        <input id="drawer-enhance-switch" type="checkbox" aria-label="Enhance opening prompts">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Enhance opening prompts</span>
+      </label>
+      <p class="sd-help">Rewrites the <em>first</em> prompt of a dashboard chat, and every image prompt, into a sharper version before sending &mdash; so a two-word ask still gets the model&rsquo;s best work. Anti-slop by design: no &ldquo;masterpiece, 8k&rdquo; padding, no role-play framing. You always see the rewrite and can revert it. Requests from your CLIs are never touched.</p>
+    </div>
+    <div class="sd-group">
+      <div class="sd-label">Backup &amp; restore</div>
+      <div class="sd-actions">
+        <button class="btn sm" id="settings-export-open" type="button">Export settings&hellip;</button>
+        <button class="btn sm ghost" id="settings-import-open" type="button">Import settings&hellip;</button>
+      </div>
+      <input type="file" id="settings-import-file" accept="application/json" hidden>
+      <p class="sd-help">A portable JSON backup of your provider keys and hub settings &mdash; stays on this machine.</p>
+    </div>
+    <div class="sd-group">
+      <div class="sd-label">Update</div>
+      <div class="sd-actions">
+        <button class="btn sm" id="settings-update-check" type="button">Check for updates</button>
+      </div>
+      <p class="sd-help" id="settings-update-status">Checking current version&hellip;</p>
+    </div>
+    </div>
+</section>
+
+<section class="section" aria-labelledby="h-tracking">
     <div class="section-h">
       <h2 id="h-tracking" tabindex="-1">Model tracking</h2>
       <span class="sub">every provider &amp; model the hub sees, with live state &mdash; score, tools, quota, dead/throttled/context</span>
@@ -3089,7 +3089,8 @@
     'sec-quota': 'quota',
     'sec-usage': 'usage',
     'sec-tracking': 'tracking',
-    'sec-tutorial': 'tutorial-ar'
+    'sec-tutorial': 'tutorial-ar',
+    'sec-settings': 'settings'
   };
   var PATH_VIEWS = {};
   Object.keys(VIEW_PATHS).forEach(function(v){ PATH_VIEWS[VIEW_PATHS[v]] = v; });
@@ -9514,7 +9515,26 @@
 
   /* ---------- header Settings drawer ---------- */
   var _drawerReturnFocus = null;
+  /* Settings is a real view now, so the two openers navigate to it. Kept as
+     functions with their original names: initSettingsDrawer() and several
+     other call sites use them, and renaming would be churn for no gain. */
   function openSettingsDrawer(){
+    /* cxShow lives inside the SPA closure, so navigate the way a person does:
+       click the sidebar entry. One code path, and history/URL come free. */
+    var nav = document.querySelector('.cx-nav-item[data-view="sec-settings"]');
+    if (nav) nav.click();
+    loadSettingsView(true);
+  }
+
+  function loadSettingsView(silent){
+    try { loadTestVerification(silent); } catch (e) {}
+    try { loadPromptEnhance(silent); } catch (e) {}
+    try { loadSocialWebSearch(silent); } catch (e) {}
+    try { loadUpdateStatus(silent); } catch (e) {}
+    try { loadSdModels(silent); } catch (e) {}
+  }
+
+  function _legacyOpenSettingsDrawer(){
     _drawerReturnFocus = document.activeElement;
     $('#settings-drawer').hidden = false;
     $('#settings-drawer-scrim').hidden = false;
@@ -9814,7 +9834,12 @@
     'sec-images': function(){ loadImages(true); },
     'sec-activity': loadActivity,
     'sec-quota': function(){ loadStatus(true); },
-    'sec-tracking': loadTracking
+    'sec-tracking': loadTracking,
+    /* Settings is a real view now, so landing on /settings directly -- a
+       bookmark, a new tab, a reload -- has to load its data the same way
+       clicking the sidebar entry does. Without this the page rendered with an
+       empty model table, which is exactly how it was first caught. */
+    'sec-settings': function(){ loadSettingsView(true); }
   };
   window.cxOnViewChange = function(view){
     if (hubOffline) return;
