@@ -935,6 +935,31 @@
   }
   .cli-card.is-connected{border-color:var(--accent-border)}
   .cli-card.recommended{border-color:var(--accent)}
+  /* ---- Antigravity card ---- */
+  .ag-card{
+    background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
+    padding:15px;margin-top:12px;display:flex;flex-direction:column;gap:12px;min-width:0;
+  }
+  .ag-card.is-ready{border-color:var(--accent-border)}
+  .ag-top{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .ag-name{font-weight:600;font-size:13.5px;display:flex;align-items:center;gap:7px}
+  .ag-note{font-size:12px;color:var(--text-faint);line-height:1.55;overflow-wrap:anywhere}
+  .ag-note b{color:var(--text-dim);font-weight:600}
+  .ag-steps{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:9px;
+    font-size:12.5px;color:var(--text-dim);line-height:1.55}
+  .ag-steps li::marker{color:var(--text-faint);font-variant-numeric:tabular-nums}
+  .ag-kv{display:flex;flex-direction:column;gap:6px;margin-top:7px}
+  .ag-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .ag-k{font-size:11px;color:var(--text-faint);min-width:72px;letter-spacing:.02em}
+  .ag-v{
+    font-family:var(--mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11.5px;
+    background:var(--surface-2,rgba(127,127,127,.09));border:1px solid var(--border-soft);
+    border-radius:6px;padding:3px 8px;overflow-wrap:anywhere;flex:1 1 200px;min-width:0;
+  }
+  .ag-exts{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .ag-msg{font-size:12px;line-height:1.5;overflow-wrap:anywhere}
+  .ag-msg.ok{color:var(--accent)}
+  .ag-msg.err{color:var(--danger,#e5534b)}
   .cli-card-top{display:flex;align-items:flex-start;gap:10px}
   .cli-card-id{min-width:0;display:flex;flex-direction:column;gap:4px}
   .cli-card-name{font-weight:700;font-size:15px;letter-spacing:-.01em;display:flex;align-items:center;gap:8px;flex-wrap:wrap;overflow-wrap:anywhere}
@@ -2335,6 +2360,11 @@
         <div class="skel skel-row"></div>
         <div class="skel skel-row"></div>
       </div>
+        <!-- Antigravity is an IDE, not a CLI, so it gets its own card rather
+             than a row in the grid above: it has no headless mode to Test
+             through and no provider setting the hub can write, and a Connect
+             button that silently did nothing would be worse than none. -->
+        <div id="antigravity-card" aria-live="polite"></div>
       </div>
       <div class="lc-tools" id="lifecycle-connect">
         <div class="lc-tools-h">
@@ -6334,6 +6364,112 @@
     });
   }
 
+  /* ---------- Antigravity ----------
+     ASKED: "i want my hub to be able with simple connect button to do it -- or
+     if really need kilocode so should write it in the card of what should be
+     done". It is the second one, and the card says so, because the first is not
+     possible rather than merely unimplemented:
+
+       * `antigravity-ide --help` lists only the VS Code launcher flags. There
+         is no headless exec mode, so Antigravity can never be an /agent backend.
+       * Its built-in agent extension declares five settings, none of them a
+         provider/baseUrl/apiKey, and its bundle has no endpoint override. It is
+         Codeium-derived and Google-authenticated: there is no seam to point at
+         this hub.
+
+     What IS real: `--install-extension` works, and the IDE's gallery is Open
+     VSX, where the OpenAI-compatible agent extensions live. So the card offers
+     the genuine one-click install, hands over the three values, and names the
+     one step that has to happen inside the extension's own UI -- because that
+     provider config lives in state.vscdb, not settings.json, and writing to a
+     running IDE's state database to fake a button is not worth the risk. */
+  function loadAntigravity(){
+    var host = $('#antigravity-card'); if (!host) return;
+    return api('/api/antigravity').then(function(d){
+      renderAntigravity(d);
+    }).catch(function(){ host.innerHTML = ''; });   /* silent: it is optional */
+  }
+
+  function renderAntigravity(d){
+    var host = $('#antigravity-card'); if (!host) return;
+    if (!d || !d.installed){ host.innerHTML = ''; return; }   /* not on this machine */
+
+    var agents = d.agents || [];
+    var ready = agents.filter(function(a){ return a.installed; });
+    var rec = agents.filter(function(a){ return a.recommended; })[0] || agents[0] || {};
+    var target = ready[0] || rec;
+    var c = d.connect || {};
+
+    var pill = ready.length
+      ? '<span class="conn-pill on"><span class="d"></span>' + esc(target.name) + ' ready</span>'
+      : '<span class="conn-pill off"><span class="d"></span>Extension needed</span>';
+
+    var vals = [['Base URL', c.base_url], ['API key', c.api_key], ['Model', c.model]]
+      .map(function(kv){
+        return '<div class="ag-row"><span class="ag-k">' + esc(kv[0]) + '</span>' +
+               '<code class="ag-v">' + esc(kv[1] || '') + '</code>' +
+               '<button type="button" class="btn sm ghost ag-copy" data-copy="' +
+               esc(kv[1] || '') + '">Copy</button></div>';
+      }).join('');
+
+    var step1 = ready.length
+      ? '<b>' + esc(target.name) + '</b> is installed. '
+      : 'Install an OpenAI-compatible agent extension \u2014 one click, from Antigravity\u2019s own Open VSX gallery.';
+    var installBtns = ready.length ? '' :
+      '<div class="ag-exts">' + agents.map(function(a){
+        return '<button type="button" class="btn sm ' + (a.recommended ? 'primary' : 'ghost') +
+               ' ag-install" data-ext="' + esc(a.id) + '">Install ' + esc(a.name) +
+               (a.recommended ? ' (recommended)' : '') + '</button>';
+      }).join('') + '</div>';
+
+    host.innerHTML = '' +
+      '<div class="ag-card' + (ready.length ? ' is-ready' : '') + '">' +
+        '<div class="ag-top">' +
+          '<div class="ag-name">Antigravity IDE<span class="pid">antigravity</span>' +
+            '<span class="cli-inst-badge">' + CHECK_SVG + 'detected</span></div>' +
+          pill +
+        '</div>' +
+        '<div class="ag-note">Antigravity\u2019s <b>built-in agent cannot be routed through the hub</b> \u2014 ' +
+          'it is Google-authenticated and exposes no provider setting. An agent extension inside it can, ' +
+          'and uses the same free models as everything else here.</div>' +
+        '<ol class="ag-steps">' +
+          '<li>' + step1 + installBtns + '</li>' +
+          '<li>Open its settings in Antigravity (<b>' + esc(target.settings_path || '') + '</b>) ' +
+            'and paste these:' +
+            '<div class="ag-kv">' + vals + '</div>' +
+            '<span class="ag-note">Model also accepts <b>best</b> or <b>swarm</b>. ' +
+            'This last step happens inside the extension because it stores its provider ' +
+            'config in the IDE\u2019s state database, which nothing outside can safely write.</span>' +
+          '</li>' +
+        '</ol>' +
+        '<div class="ag-msg" role="status"></div>' +
+      '</div>';
+
+    var card = host.querySelector('.ag-card');
+    card.querySelectorAll('.ag-copy').forEach(function(b){
+      b.addEventListener('click', function(){ copyText(b.dataset.copy, b); });
+    });
+    var msg = card.querySelector('.ag-msg');
+    card.querySelectorAll('.ag-install').forEach(function(b){
+      b.addEventListener('click', function(){
+        var was = b.textContent;
+        b.disabled = true; b.textContent = 'Installing\u2026';
+        msg.className = 'ag-msg'; msg.textContent = 'Downloading from Open VSX \u2014 up to a minute.';
+        api('/api/antigravity/install', { method: 'POST', body: { extension: b.dataset.ext } })
+          .then(function(r){
+            msg.className = 'ag-msg ok';
+            msg.textContent = (r && r.message) || 'Installed. Restart Antigravity to see it.';
+            renderAntigravity(r);          /* the response carries a fresh detect() */
+          })
+          .catch(function(e){
+            b.disabled = false; b.textContent = was;
+            msg.className = 'ag-msg err';
+            msg.textContent = (e && e.message) || 'Install failed.';
+          });
+      });
+    });
+  }
+
   var CHECK_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>';
   var CHEV_SVG = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>';
 
@@ -9890,6 +10026,7 @@
   loadProviderMode();
   loadModels().then(loadDefault).then(loadChatModels);
   loadClis();
+  loadAntigravity();
   loadMcp();
   loadSubscriptions();
   loadAgentSettings();
@@ -9915,7 +10052,7 @@
   var VIEW_REFRESH = {
     /* also refreshes what the merged 'Connect'/'Connected tools' pages
        used to own: the CLI list and the connection snippets. */
-    'sec-lifecycle': function(){ loadStatus(true); loadLifecycle(true); loadClis(); loadMcp(); },
+    'sec-lifecycle': function(){ loadStatus(true); loadLifecycle(true); loadClis(); loadAntigravity(); loadMcp(); },
     'sec-subs': function(){ loadSubscriptions(true); },
     'sec-agent': function(){ loadAgentSettings(true); },
     'sec-images': function(){ loadImages(true); },

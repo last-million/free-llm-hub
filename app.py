@@ -60,6 +60,7 @@ except Exception:  # pragma: no cover - jinja2 always ships with flask
 
 import agentic_chat
 import agentic_history
+import antigravity
 import model_categories
 import snapshots
 import quick_history
@@ -12548,6 +12549,38 @@ def api_cli_test(cid):
 @app.route("/api/clis", methods=["GET"])
 def api_clis():
     return jsonify([_cli_row(e) for e in CLI_REGISTRY])
+
+
+@app.route("/api/antigravity", methods=["GET"])
+def api_antigravity():
+    """Antigravity is NOT in CLI_REGISTRY on purpose.
+
+    Every card there offers Connect / Disconnect / Test, which all assume the
+    hub can write the tool's config and then prove the round trip. For
+    Antigravity that would be a lie in both directions: its launcher has no
+    headless exec mode to test through, and its built-in agent has no provider
+    setting to write (see antigravity.py for what was actually measured). So it
+    gets its own card that offers the two things that ARE real -- detection and
+    a genuine one-click extension install -- and states the manual step instead
+    of pretending it away."""
+    info = antigravity.detect()
+    key = config.get_local_api_key() or "free-llm-hub"
+    info["connect"] = {
+        "base_url": "http://127.0.0.1:%d/v1" % PORT,
+        "api_key": key,
+        "model": "auto",
+        "models": ["auto", "best", "swarm"],
+    }
+    return jsonify(info)
+
+
+@app.route("/api/antigravity/install", methods=["POST"])
+def api_antigravity_install():
+    body = request.get_json(force=True, silent=True) or {}
+    ok, message = antigravity.install_extension(body.get("extension"))
+    payload = {"ok": ok, "message": message}
+    payload.update(antigravity.detect())
+    return jsonify(payload), (200 if ok else 400)
 
 
 @app.route("/api/hub-mode", methods=["GET", "POST"])
