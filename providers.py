@@ -1947,11 +1947,47 @@ def is_free_model(provider_id: str, model_id: Optional[str],
     return True  # 'all' -> the whole listed catalog is free
 
 
-def is_chat_model(model_id: Optional[str]) -> bool:
-    """False for non-chat models (audio/embeddings/moderation/image generators)."""
+_EMBEDDING_RE = re.compile(r"embed|bge-|gte-|e5-|nomic|minilm|jina-clip", re.I)
+
+# ...and "rerank" models match "embed"-adjacent names but are NOT embeddings:
+# they score a (query, document) pair and return no vector at all, so a client
+# that sent them to /v1/embeddings would get a shape it cannot use.
+_RERANK_RE = re.compile(r"rerank|reranker", re.I)
+
+
+def is_embedding_model(model_id: Optional[str]) -> bool:
+    """True for a text-embedding model.
+
+    These are dropped from the CHAT catalog by is_chat_model (routing must never
+    pick one for text generation), which also meant the hub had no idea they
+    existed. They are a different API surface, not junk: /v1/embeddings is what
+    codebase indexing, RAG and semantic search actually call."""
     if not model_id:
         return False
-    return not _NONCHAT_RE.search(str(model_id))
+    mid = str(model_id)
+    if _RERANK_RE.search(mid):
+        return False
+    return bool(_EMBEDDING_RE.search(mid))
+
+
+def is_chat_model(model_id: Optional[str]) -> bool:
+    """False for non-chat models (audio/embeddings/moderation/image generators).
+
+    _NON_CHAT_PATTERNS matches the literal token "embed", which catches
+    text-embedding-3-small and misses every embedding model NAMED after its
+    family instead: bge-m3, gte-large, e5-mistral-7b, all-minilm-l6-v2,
+    nomic-embed aside. Those were reaching the chat catalog and could be picked
+    to generate text, which fails the same hard way the second _NON_CHAT_PATTERNS
+    block was added for ("11 of mistral's 13 failures").
+
+    MEASURED before adding this: across the live 492-model catalog of 2026-09-01,
+    the extra check excludes ZERO ids that are currently served for chat, so it
+    closes the hole without withdrawing anything in use."""
+    if not model_id:
+        return False
+    if _NONCHAT_RE.search(str(model_id)):
+        return False
+    return not is_embedding_model(model_id)
 
 
 def filter_models(model_ids: List[str]) -> List[str]:

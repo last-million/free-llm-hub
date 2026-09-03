@@ -591,9 +591,17 @@ def provider_free_models(pid, live=True):
                     known_free = _free_tier_ids(resp.json(), p.get("free_tiers"))
                 # filter_models drops blocked (uncensored) AND non-chat ids
                 # (whisper/tts/embed/guard) — per the providers.py contract.
-                live_free = prov.filter_models(
-                    [m for m in ids if prov.is_free_model(pid, m, known_free=known_free)]
-                )
+                _free_ids = [m for m in ids
+                             if prov.is_free_model(pid, m, known_free=known_free)]
+                # Embeddings are dropped by that filter and were therefore
+                # invisible to the whole hub. They are a different SURFACE, not
+                # junk -- /v1/embeddings is what codebase indexing and RAG call
+                # -- so keep them here, where the catalog is already in hand and
+                # a second discovery pass would cost another round trip.
+                _remember_embedding_models(
+                    pid, [m for m in _free_ids
+                          if prov.is_embedding_model(m) and prov.is_model_allowed(m)])
+                live_free = prov.filter_models(_free_ids)
                 if live_free:
                     models = live_free
                     # Discovery is the FIRST place a brand-new model id is ever
@@ -689,6 +697,42 @@ def _prefetch_auto_models(providers):
                 out[pid] = fut.result()
             except Exception:                                    # noqa: BLE001
                 out[pid] = []
+    return out
+
+
+# Embedding models, harvested during the ordinary chat discovery pass (see
+# provider_free_models) because they are filtered out of the chat catalog and
+# would otherwise be invisible. Same TTL as that cache; no separate refresh.
+_embed_cache = {}
+
+
+def _remember_embedding_models(pid, models):
+    with _model_cache_lock:
+        _embed_cache[pid] = (time.time(), list(models or []))
+
+
+def provider_embedding_models(pid):
+    """Cached embedding ids for one provider, or the registry's static list.
+
+    Never triggers discovery of its own: if the chat catalog has not been
+    fetched yet this is empty, and the next chat listing fills it."""
+    with _model_cache_lock:
+        hit = _embed_cache.get(pid)
+    if hit and (time.time() - hit[0]) < MODEL_CACHE_TTL:
+        return list(hit[1])
+    p = prov.get_provider(pid) or {}
+    return [m for m in (p.get("default_free_models") or [])
+            if prov.is_embedding_model(m) and prov.is_model_allowed(m)]
+
+
+def embedding_models():
+    """[{id:'<pid>/<model>', provider, model}] across enabled+keyed providers."""
+    out = []
+    for pid in _enabled_keyed():
+        for m in provider_embedding_models(pid):
+            if _is_model_dead(pid, m):
+                continue
+            out.append({"id": pid + "/" + m, "provider": pid, "model": m})
     return out
 
 
@@ -5729,6 +5773,67 @@ def _trim_largest_message(messages, tools, target):
         return messages, False
 
 
+# How many providers an embedding request is allowed to fall through before
+# giving up. Lower than the chat chain on purpose: embeddings are called in
+# tight loops while indexing a corpus, so a long per-call fallback turns one bad
+# provider into a stall of thousands of slow requests rather than a fast error.
+_EMBED_MAX_HOPS = 4
+
+
+def _upstream_post(pid, path, payload):
+    """POST {base_url}/{path} for provider pid, rotating across its key pool.
+
+    _upstream_chat's small sibling for the NON-chat surfaces. It deliberately
+    shares the parts that are about the provider -- base-URL resolution
+    (including Cloudflare's {account_id} fill), the no-key/static-key rule, key
+    rotation on 401/403/429, and quota accounting -- and none of the parts that
+    are about chat, since context compaction, output budgets, craft briefs and
+    the 400-refit-retry are all meaningless for an embedding request.
+
+    Returns the first non-rotatable response, or raises like _upstream_chat."""
+    pcfg = config.get_provider_config(pid)
+    base = _resolve_base_url(pid, pcfg)
+    if not base:
+        raise RuntimeError("no base_url for provider " + pid)
+    if "{account_id}" in base:
+        raise RuntimeError("could not resolve the Cloudflare account id from this token")
+    keys = pcfg.get("api_keys") or []
+    if not keys:
+        if _needs_key(pid):
+            raise RuntimeError("no api key for provider " + pid)
+        keys = [(prov.get_provider(pid) or {}).get("static_key") or None]
+
+    url = base.rstrip("/") + "/" + path.lstrip("/")
+    n = len(keys)
+    start = _next_key_start(pid, n)
+    for i in range(n):
+        is_last = (i == n - 1)
+        key = keys[(start + i) % n]
+        try:
+            resp = requests.post(
+                url, json=payload,
+                headers=({"Content-Type": "application/json"} if key is None else
+                         {"Authorization": "Bearer " + key,
+                          "Content-Type": "application/json"}),
+                timeout=(CONNECT_TIMEOUT, CHAT_READ_TIMEOUT),
+            )
+        except requests.RequestException:
+            if is_last:
+                raise
+            continue
+        quota.record(pid, payload.get("model"))
+        quota.observe_headers(pid, resp.headers)
+        # Same rotation rule as chat: these three statuses are about THIS KEY,
+        # so the next key in the pool deserves a turn before the provider is
+        # written off. Anything else is about the request or the provider and
+        # rotating would just burn the whole pool on it.
+        if resp.status_code in (401, 403, 429) and not is_last:
+            resp.close()
+            continue
+        return resp
+    raise RuntimeError("no keys tried for provider " + pid)
+
+
 def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
     """POST {base_url}/chat/completions for provider pid, rotating across the
     provider's api_keys pool. Tries a round-robin start key; on 401/403/429 it
@@ -6570,6 +6675,7 @@ def _runtime_after(response):
 # token it has never heard of and cannot send.
 _OLLAMA_ONLY_PATHS = frozenset({
     "/api/tags", "/api/chat", "/api/generate", "/api/show", "/api/ps",
+    "/api/embed", "/api/embeddings",
 })
 
 # /api/version is SHARED: it was already the hub's own version endpoint long
@@ -14404,6 +14510,147 @@ def v1_completions():
                      "logprobs": None}],
         "usage": data.get("usage") or {},
     })
+
+
+# --------------------------------------------------------------------------- #
+# Embeddings
+#
+# The chat catalog deliberately drops these (routing must never pick an
+# embedding model to generate text), which also left the hub unable to serve
+# them at all. They are a different SURFACE, not junk: /v1/embeddings is what
+# codebase indexing, RAG and semantic search call, and it is the one endpoint
+# Continue, Open WebUI and every vector-store integration need before they can
+# use this hub for anything but chat.
+#
+# Routing is deliberately simpler than the chat chain: there is no difficulty to
+# assess and no swarm to escalate to, just "try the best available provider,
+# fall through on failure". Vectors from DIFFERENT models are not comparable, so
+# a silent fallback mid-corpus would poison an index -- which is why the model
+# that actually served is always reported back in the response.
+# --------------------------------------------------------------------------- #
+
+def _embedding_chain(requested):
+    """(pid, model) hops to try, best-first.
+
+    An explicit '<pid>/<model>' pins to that one provider; anything else (or
+    'auto') fans out across every provider that has an embedding model."""
+    rows = embedding_models()
+    if requested and requested not in ("auto", "best"):
+        want = str(requested)
+        exact = [(r["provider"], r["model"]) for r in rows if r["id"] == want]
+        if exact:
+            return exact
+        # a bare model name, served by however many providers carry it
+        by_name = [(r["provider"], r["model"]) for r in rows if r["model"] == want]
+        if by_name:
+            return by_name
+        return []
+    return [(r["provider"], r["model"]) for r in rows]
+
+
+def _embed_upstream(pid, model, inputs, extra=None):
+    """POST {base_url}/embeddings for one provider, rotating its key pool.
+
+    Reuses the chat path's key rotation and quota accounting rather than opening
+    a second, differently-behaved way of talking to a provider."""
+    payload = {"model": model, "input": inputs}
+    if isinstance(extra, dict):
+        for k in ("encoding_format", "dimensions", "user"):
+            if extra.get(k) is not None:
+                payload[k] = extra[k]
+    return _upstream_post(pid, "embeddings", payload)
+
+
+@app.route("/v1/embeddings", methods=["POST"])
+def v1_embeddings():
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return _openai_error("Invalid JSON body.", 400)
+    raw = body.get("input")
+    if raw is None or raw == "" or raw == []:
+        return _openai_error("'input' is required.", 400)
+    inputs = raw if isinstance(raw, list) else [raw]
+    if not all(isinstance(x, (str, int, list)) for x in inputs):
+        return _openai_error("'input' must be a string or an array of strings.", 400)
+
+    chain = _embedding_chain(body.get("model"))
+    if not chain:
+        return _openai_error(
+            "No embedding model is available. Enable a provider that serves one, "
+            "or open the dashboard once so the model catalog is discovered.", 503)
+
+    errors = []
+    for pid, model in chain[:_EMBED_MAX_HOPS]:
+        try:
+            resp = _embed_upstream(pid, model, inputs, body)
+        except (requests.RequestException, RuntimeError) as exc:
+            errors.append("%s: %s" % (pid, _sanitize(exc.__class__.__name__)))
+            _record_outcome(pid, model, False)
+            continue
+        if resp.status_code != 200:
+            errors.append("%s: HTTP %d" % (pid, resp.status_code))
+            _record_outcome(pid, model, False)
+            if resp.status_code in _DEAD_STATUSES:
+                _mark_model_dead(pid, model, resp.status_code)
+            continue
+        try:
+            data = resp.json()
+        except ValueError:
+            errors.append("%s: bad JSON" % pid)
+            _record_outcome(pid, model, False)
+            continue
+        if not isinstance(data, dict) or not data.get("data"):
+            errors.append("%s: empty" % pid)
+            _record_outcome(pid, model, False)
+            continue
+        _record_outcome(pid, model, True)
+        # Say which model actually produced these. Vectors from two models are
+        # not comparable, so a caller indexing a corpus must be able to tell
+        # that a hop changed underneath it rather than discovering it later as
+        # unexplained retrieval nonsense.
+        data["model"] = pid + "/" + model
+        return jsonify(data), 200, {"X-Free-LLM-Hub-Model": pid + "/" + model}
+
+    return _openai_error("All embedding providers failed: " + "; ".join(errors[:5]), 502)
+
+
+@app.route("/api/embed", methods=["POST"])
+@app.route("/api/embeddings", methods=["POST"])
+def ollama_embed():
+    """Ollama has TWO embedding endpoints with different shapes: the current
+    /api/embed (input, embeddings[][]) and the deprecated /api/embeddings
+    (prompt, embedding[]). Clients in the wild still use both."""
+    if not _is_ollama_path(request.path):
+        return _ollama_off()
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify(wire_ollama.error_payload("Invalid JSON body.")), 400
+    legacy = request.path == "/api/embeddings"
+    raw = body.get("prompt") if legacy else body.get("input")
+    if raw is None or raw == "":
+        return jsonify(wire_ollama.error_payload(
+            "'%s' is required." % ("prompt" if legacy else "input"))), 400
+    inputs = raw if isinstance(raw, list) else [raw]
+
+    chain = _embedding_chain(body.get("model"))
+    if not chain:
+        return jsonify(wire_ollama.error_payload(
+            "No embedding model is available on this hub.")), 503
+    pid, model = chain[0]
+    try:
+        resp = _embed_upstream(pid, model, inputs)
+        data = resp.json() if resp.status_code == 200 else None
+    except (requests.RequestException, RuntimeError, ValueError):
+        data = None
+    if not isinstance(data, dict) or not data.get("data"):
+        _record_outcome(pid, model, False)
+        return jsonify(wire_ollama.error_payload("Embedding provider failed.")), 502
+    _record_outcome(pid, model, True)
+    vectors = [row.get("embedding") or [] for row in data["data"]]
+    if legacy:
+        return jsonify({"embedding": vectors[0] if vectors else []})
+    return jsonify({"model": wire_ollama.tag_name(pid + "/" + model),
+                    "embeddings": vectors})
 
 
 # --------------------------------------------------------------------------- #
