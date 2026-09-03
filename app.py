@@ -2272,6 +2272,94 @@ def _record_latency(pid, model, ms):
             _latencies[(pid, model)] = rec
     except Exception:                                            # noqa: BLE001
         pass
+    # ...and keep the raw sample, so the same measurement can also be reported
+    # as a distribution rather than only as a mean.
+    _record_speed_sample(_speed, pid, model, ms)
+
+
+# RAW SAMPLES, alongside the EWMA above.
+#
+# The EWMA is what ROUTING uses, and it is the right shape for that: one number,
+# cheap, and it forgets old behaviour. It is the wrong shape for a person asking
+# "is this model actually fast", because a mean hides the thing that makes a
+# model painful to use -- a p50 of four seconds with a p95 of ninety is a very
+# different model from a steady twenty, and both average out the same.
+#
+# So the last _SPEED_SAMPLES durations are kept per (pid, model) and reported as
+# percentiles. In memory only: unlike the EWMA these are not routing inputs, and
+# a distribution that rebuilds within a few requests is not worth a file format.
+_SPEED_SAMPLES = 64
+_speed = {}          # (pid, model) -> [ms, ...]   total duration, non-streaming
+_ttft = {}           # (pid, model) -> [ms, ...]   time to FIRST CONTENT, streaming
+
+
+def _record_speed_sample(bucket, pid, model, ms):
+    if not (pid and model) or not ms or ms <= 0:
+        return
+    try:
+        with _outcome_lock:
+            row = bucket.setdefault((pid, model), [])
+            row.append(float(ms))
+            if len(row) > _SPEED_SAMPLES:
+                del row[:-_SPEED_SAMPLES]
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _record_ttft(pid, model, ms):
+    """Time to the first CONTENT token of a streamed answer.
+
+    Not time to first byte: providers send a role delta, keep-alives and
+    sometimes a whole reasoning block before any content, so first-byte says
+    nothing about when the user sees words appear. _peek_until_content already
+    reads exactly that far to tell a real answer from an empty 200, so the
+    measurement is free -- it is the moment that check succeeds.
+
+    This is the number the old code explicitly refused to record, because
+    folding it into the same average as a non-streaming total would have mixed
+    two different quantities. Kept apart, both are worth having."""
+    _record_speed_sample(_ttft, pid, model, ms)
+
+
+def _note_ttft(resp, pid, model):
+    """Record TTFT for a streaming hop that just produced its first content.
+
+    The clock started in _dispatch_chat, before the request went out, and is
+    carried on the response so the peek sites do not each have to thread a
+    start time through."""
+    started = getattr(resp, "_hub_started", None)
+    if started is None:
+        return
+    try:
+        _record_ttft(pid, model, (time.perf_counter() - started) * 1000.0)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _percentile(values, pct):
+    """Nearest-rank percentile. No numpy, and no interpolation: with at most 64
+    samples, interpolating between two real measurements invents a number that
+    was never observed."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    k = int(round((pct / 100.0) * len(ordered) + 0.5)) - 1
+    return ordered[max(0, min(k, len(ordered) - 1))]
+
+
+def _speed_profile(pid, model):
+    """p50/p95 of total duration and of time-to-first-token, or Nones."""
+    with _outcome_lock:
+        durations = list(_speed.get((pid, model)) or [])
+        ttfts = list(_ttft.get((pid, model)) or [])
+    return {
+        "p50_ms": _percentile(durations, 50),
+        "p95_ms": _percentile(durations, 95),
+        "ttft_p50_ms": _percentile(ttfts, 50),
+        "ttft_p95_ms": _percentile(ttfts, 95),
+        "samples": len(durations),
+        "ttft_samples": len(ttfts),
+    }
 
 
 def _measured_latency_ms(pid, model):
@@ -4148,7 +4236,17 @@ def _dispatch_chat(pid, payload, stream):
     if _is_sub(pid):
         return _subscription_chat(pid, payload)
     if stream:
-        return _upstream_chat(pid, payload, stream)
+        # A streaming call returns once headers are in, so there is no total
+        # duration to record here -- but the clock is still worth starting:
+        # _note_ttft reads it back off the response when the first real content
+        # arrives, which is the number that actually describes a stream.
+        started = time.perf_counter()
+        resp = _upstream_chat(pid, payload, stream)
+        try:
+            resp._hub_started = started
+        except Exception:                                        # noqa: BLE001
+            pass
+        return resp
     # perf_counter, not time(): this is a DURATION, so it must be monotonic (an
     # NTP step or DST jump mid-request must not record a negative or wildly
     # inflated one) AND high-resolution. time.monotonic() ticks at ~15.6ms on
@@ -12743,6 +12841,31 @@ def api_clis():
     return jsonify([_cli_row(e) for e in CLI_REGISTRY])
 
 
+@app.route("/api/model-speed", methods=["GET"])
+def api_model_speed():
+    """Measured speed per model: p50/p95 total, and p50/p95 time-to-first-token.
+
+    Separate from /api/models because it answers a different question. The
+    catalog says what exists and how it is ranked; this says how it has actually
+    behaved on this machine, which is the only place that evidence lives.
+
+    Models with no samples yet are omitted rather than reported as zero -- an
+    unmeasured model is not a fast one."""
+    rows = []
+    with _outcome_lock:
+        keys = set(_speed) | set(_ttft)
+    for pid, model in sorted(keys):
+        prof = _speed_profile(pid, model)
+        if not prof["samples"] and not prof["ttft_samples"]:
+            continue
+        prof.update({"id": pid + "/" + model, "provider": pid, "model": model})
+        rows.append(prof)
+    # Slowest first: the reason to look at this page is to find what is hurting.
+    rows.sort(key=lambda r: (r["p95_ms"] or r["ttft_p95_ms"] or 0), reverse=True)
+    return jsonify({"models": rows, "sample_cap": _SPEED_SAMPLES,
+                    "note": "measured since the hub last started"})
+
+
 @app.route("/api/response-cache", methods=["GET", "POST"])
 def api_response_cache():
     """The response cache's switch and its counters.
@@ -15288,6 +15411,7 @@ def _chat_completions_uncached(body):
                         _note_nonanswer(hop_pid, hop_model)
                     resp.close()
                     continue
+                _note_ttft(resp, hop_pid, hop_model)
                 chained = _chain_buffered(buffered, it)
                 return Response(stream_with_context(
                     _proxy_sse(resp, chained, hop_pid=hop_pid, hop_model=hop_model)),
@@ -15999,6 +16123,7 @@ def v1_responses(_retry_pass=False):
                         _note_nonanswer(hop_pid, hop_model)
                     resp.close()
                     continue
+                _note_ttft(resp, hop_pid, hop_model)
                 chained = _chain_buffered(buffered, line_it)
                 return Response(stream_with_context(
                     _responses_stream(resp, model_label, line_iter=chained, prompt_est=est,
@@ -16643,6 +16768,7 @@ def v1_messages():
                         _note_nonanswer(hop_pid, hop_model)
                     resp.close()
                     continue
+                _note_ttft(resp, hop_pid, hop_model)
                 chained = _chain_buffered(buffered, line_it)
                 return Response(stream_with_context(
                     _anthropic_stream(resp, model_str, input_est, line_iter=chained,
