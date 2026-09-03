@@ -260,7 +260,10 @@ def test_the_card_is_rendered_and_refreshed():
     html = _template()
     assert 'id="antigravity-card"' in html
     assert "function loadAntigravity()" in html
-    assert "loadClis(); loadAntigravity(); loadMcp();" in html
+    # the refresh line for the Connect view, matched by its PARTS: a later card
+    # added to the same line must not fail this test, only a dropped loader
+    refresh = [l for l in html.splitlines() if "'sec-lifecycle': function()" in l][0]
+    assert "loadAntigravity()" in refresh and "loadClis()" in refresh
 
 
 def test_the_card_hides_itself_when_antigravity_is_absent():

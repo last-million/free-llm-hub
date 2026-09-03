@@ -2365,6 +2365,10 @@
              through and no provider setting the hub can write, and a Connect
              button that silently did nothing would be worse than none. -->
         <div id="antigravity-card" aria-live="polite"></div>
+        <!-- Ollama-compatible apps. A switch, not a config flag: the surface is
+             off by default for a real reason, but "off by default" and "hidden
+             in a JSON file" are not the same thing. -->
+        <div id="ollama-card" aria-live="polite"></div>
       </div>
       <div class="lc-tools" id="lifecycle-connect">
         <div class="lc-tools-h">
@@ -6364,6 +6368,76 @@
     });
   }
 
+  /* ---------- Ollama-compatible apps ----------
+     Open WebUI, Enchanted, Continue's ollama provider, Raycast and most "local
+     AI" mobile apps speak Ollama and only Ollama: they ask for a HOST and then
+     call /api/tags themselves. The hub serves that surface now, but it starts
+     off, because it lives under /api/ where the dashboard's control API also
+     lives and no Ollama client can send the control token.
+     Off by default is right. Making someone edit a config file to change it
+     was not, which is what this card fixes. */
+  function loadOllama(){
+    var host = $('#ollama-card'); if (!host) return;
+    return api('/api/ollama').then(renderOllama).catch(function(){ host.innerHTML = ''; });
+  }
+
+  function setOllama(on, card){
+    return api('/api/ollama', { method: 'POST', body: { enabled: !!on } })
+      .then(function(d){
+        renderOllama(d);
+        toast(d.enabled ? 'Ollama surface is on — point your app at the URL below.'
+                        : 'Ollama surface is off.');
+      })
+      .catch(function(e){
+        toast((e && e.message) || 'Could not change that.', true);
+        loadOllama();
+      });
+  }
+
+  function renderOllama(d){
+    var host = $('#ollama-card'); if (!host || !d) return;
+    var on = !!d.enabled;
+    var vals = [['Host URL', d.base_url]];
+    if (d.key_required) vals.push(['API key', d.api_key]);
+    vals.push(['Model', 'auto']);
+
+    host.innerHTML = '' +
+      '<div class="ag-card' + (on ? ' is-ready' : '') + '">' +
+        '<div class="ag-top">' +
+          '<div class="ag-name">Ollama-compatible apps<span class="pid">ollama</span></div>' +
+          '<label class="switch" title="Serve the Ollama API so apps that only speak Ollama can use this hub">' +
+            '<input type="checkbox" id="ollama-on"' + (on ? ' checked' : '') + '>' +
+            '<span class="track"></span>' +
+            '<span class="lbl">' + (on ? 'On' : 'Off') + '</span>' +
+          '</label>' +
+        '</div>' +
+        '<div class="ag-note">Open WebUI, Enchanted, Continue\u2019s ollama provider and most \u201clocal AI\u201d ' +
+          'apps ask for an <b>Ollama host</b> and cannot be pointed at an OpenAI URL. Turning this on ' +
+          'serves them the same free models, through the same routing.</div>' +
+        (on
+          ? '<div class="ag-kv">' + vals.map(function(kv){
+              return '<div class="ag-row"><span class="ag-k">' + esc(kv[0]) + '</span>' +
+                     '<code class="ag-v">' + esc(kv[1] || '') + '</code>' +
+                     '<button type="button" class="btn sm ghost ag-copy" data-copy="' +
+                     esc(kv[1] || '') + '">Copy</button></div>';
+            }).join('') +
+            '<span class="ag-note">Paste the <b>host URL</b>, not a /v1 address \u2014 these apps append ' +
+            '<code>/api/\u2026</code> themselves, and the /v1 URL is the usual cause of ' +
+            '\u201cconnection refused\u201d on an otherwise correct setup. Model also accepts ' +
+            '<b>best</b> or <b>swarm</b>.</span></div>'
+          : '<div class="ag-note">Off: <code>/api/tags</code> and the rest answer 404. It stays off until ' +
+            'you ask for it because it is an extra surface on the control port that these apps ' +
+            'cannot authenticate to.</div>') +
+      '</div>';
+
+    var card = host.querySelector('.ag-card');
+    card.querySelectorAll('.ag-copy').forEach(function(b){
+      b.addEventListener('click', function(){ copyText(b.dataset.copy, b); });
+    });
+    var sw = card.querySelector('#ollama-on');
+    if (sw) sw.addEventListener('change', function(){ setOllama(sw.checked, card); });
+  }
+
   /* ---------- Antigravity ----------
      ASKED: "i want my hub to be able with simple connect button to do it -- or
      if really need kilocode so should write it in the card of what should be
@@ -10027,6 +10101,7 @@
   loadModels().then(loadDefault).then(loadChatModels);
   loadClis();
   loadAntigravity();
+  loadOllama();
   loadMcp();
   loadSubscriptions();
   loadAgentSettings();
@@ -10052,7 +10127,7 @@
   var VIEW_REFRESH = {
     /* also refreshes what the merged 'Connect'/'Connected tools' pages
        used to own: the CLI list and the connection snippets. */
-    'sec-lifecycle': function(){ loadStatus(true); loadLifecycle(true); loadClis(); loadAntigravity(); loadMcp(); },
+    'sec-lifecycle': function(){ loadStatus(true); loadLifecycle(true); loadClis(); loadAntigravity(); loadOllama(); loadMcp(); },
     'sec-subs': function(){ loadSubscriptions(true); },
     'sec-agent': function(){ loadAgentSettings(true); },
     'sec-images': function(){ loadImages(true); },
