@@ -61,6 +61,7 @@ except Exception:  # pragma: no cover - jinja2 always ships with flask
 import agentic_chat
 import agentic_history
 import antigravity
+import respcache
 import tool_rescue
 import wire_gemini
 import wire_ollama
@@ -12742,6 +12743,33 @@ def api_clis():
     return jsonify([_cli_row(e) for e in CLI_REGISTRY])
 
 
+@app.route("/api/response-cache", methods=["GET", "POST"])
+def api_response_cache():
+    """The response cache's switch and its counters.
+
+    Same reasoning as /api/ollama: off by default is a real decision, but
+    reaching it should not mean editing a JSON file."""
+    if request.method == "POST":
+        body = request.get_json(force=True, silent=True) or {}
+        if body.get("clear"):
+            respcache.clear()
+        want = body.get("enabled")
+        if want is not None:
+            if not isinstance(want, bool):
+                return jsonify({"error": "'enabled' must be true or false."}), 400
+            config.set_flag("response_cache", want)
+        ttl = body.get("ttl")
+        if ttl is not None:
+            try:
+                config.set_value("response_cache_ttl", str(max(30, int(ttl))))
+            except (TypeError, ValueError):
+                return jsonify({"error": "'ttl' must be a number of seconds."}), 400
+    st = respcache.stats()
+    st["enabled"] = config.get_flag("response_cache", False)
+    st["ttl"] = _cache_ttl()
+    return jsonify(st)
+
+
 @app.route("/api/ollama", methods=["GET", "POST"])
 def api_ollama():
     """The Ollama surface's on/off switch, as a control endpoint.
@@ -14909,6 +14937,138 @@ def v1_chat_completions():
 
 
 def _chat_completions(body):
+    """The router, with the response cache in front of it.
+
+    Wrapping the seam rather than each route means every surface -- OpenAI,
+    Gemini, Ollama, /v1/completions -- is cached by the same rules, and a
+    surface added later cannot forget to be.
+
+    Off unless the `response_cache` flag is on. The scarce resource here is
+    other people's free tiers, not latency: a hit is a request that never comes
+    off a daily allowance. But a cache also turns "ask again" into "the same
+    answer", which is right for a retry after a dropped stream and wrong for
+    someone pressing regenerate hoping for better -- and nothing in the request
+    distinguishes those, so the choice belongs to whoever runs the hub.
+
+    A client can bypass it for one request with `X-Free-LLM-Hub-Cache: bypass`,
+    which still STORES the fresh answer."""
+    if not config.get_flag("response_cache", False):
+        return _chat_completions_uncached(body)
+
+    bypass = (request.headers.get("X-Free-LLM-Hub-Cache") or "").lower() == "bypass"
+    if not bypass:
+        hit = respcache.get(body, ttl=_cache_ttl())
+        if hit is not None:
+            return _cached_response(body, hit)
+    return _remember_completion(body, _chat_completions_uncached(body))
+
+
+def _cache_ttl():
+    try:
+        return max(30, int(config.get_value("response_cache_ttl", "")
+                           or respcache.DEFAULT_TTL))
+    except (TypeError, ValueError):
+        return respcache.DEFAULT_TTL
+
+
+def _cached_response(body, data):
+    """Serve a stored completion in whichever shape THIS request asked for.
+
+    A cached answer has to be able to come back as a stream: the commonest hit
+    by far is the re-run of a turn whose stream dropped, and that client is
+    still a streaming client. It arrives as a single chunk, which is honest --
+    the tokens were not generated now."""
+    headers = {"X-Free-LLM-Hub-Cache": "hit"}
+    if not body.get("stream"):
+        return jsonify(data), 200, headers
+    text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    model = data.get("model") or body.get("model") or "auto"
+    cid = data.get("id") or ("chatcmpl-" + uuid.uuid4().hex)
+
+    def gen():
+        yield "data: " + json.dumps({
+            "id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": text},
+                         "finish_reason": None}]}) + "\n\n"
+        yield "data: " + json.dumps({
+            "id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": data.get("usage") or {}}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    return Response(stream_with_context(gen()), mimetype="text/event-stream",
+                    headers=dict(_SSE_HEADERS, **headers))
+
+
+def _remember_completion(body, rv):
+    """Store a fresh answer on its way out, buffered or streamed."""
+    try:
+        resp = app.make_response(rv)
+    except Exception:                                            # noqa: BLE001
+        return rv
+    if resp.status_code != 200:
+        return resp
+    if resp.mimetype != "text/event-stream":
+        try:
+            respcache.put(body, resp.get_json())
+        except Exception:                                        # noqa: BLE001
+            pass
+        return resp
+    if not respcache.cacheable(body):
+        return resp
+    # A streamed answer is reassembled AS IT PASSES THROUGH, because the turns
+    # worth caching are the expensive ones and those stream. Buffering the whole
+    # thing first would hold the answer back from the client to serve a cache
+    # that only helps the NEXT request.
+    return Response(stream_with_context(_tee_and_store(resp.response, body)),
+                    mimetype="text/event-stream", headers=dict(resp.headers))
+
+
+def _tee_and_store(upstream, body):
+    """Forward an SSE stream untouched while reassembling it for the cache."""
+    parts, usage, model, cid = [], None, None, None
+    buf = ""
+    for raw in upstream:
+        yield raw                                  # the client sees it unchanged
+        buf += raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        while "\n\n" in buf:
+            frame, buf = buf.split("\n\n", 1)
+            for line in frame.splitlines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                try:
+                    obj = json.loads(payload)
+                except ValueError:
+                    continue
+                cid = cid or obj.get("id")
+                model = model or obj.get("model")
+                if obj.get("usage"):
+                    usage = obj["usage"]
+                delta = ((obj.get("choices") or [{}])[0] or {}).get("delta") or {}
+                if delta.get("content"):
+                    parts.append(delta["content"])
+    text = "".join(parts)
+    if not text.strip():
+        return                       # a stream that produced nothing is not an answer
+    try:
+        respcache.put(body, {
+            "id": cid or ("chatcmpl-" + uuid.uuid4().hex),
+            "object": "chat.completion", "created": int(time.time()),
+            "model": model or body.get("model") or "auto",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": text}}],
+            "usage": usage or {}})
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _chat_completions_uncached(body):
     """The whole router, reachable WITHOUT an HTTP request of its own.
 
     Every wire format this hub speaks -- OpenAI, Anthropic, Gemini, Ollama, the
