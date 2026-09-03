@@ -234,6 +234,40 @@ def test_count_tokens_needs_no_upstream_call(client):
     assert not router.called
 
 
+def test_count_tokens_does_not_report_the_routing_margin():
+    """_est_tokens adds a fixed +400 so requests stay UNDER provider TPM and
+    context limits -- over-estimating there is free, under-estimating costs a
+    413. Reporting it to a CLIENT is a different matter: countTokens said 406
+    tokens for a 24-character message, which is the margin, not the text, and
+    would make a client think it was near a limit it is nowhere near."""
+    msgs = [{"role": "user", "content": "hello world from the hub"}]
+    assert A._est_tokens(msgs, None) > 400            # routing keeps its margin
+    assert A._est_tokens(msgs, None, overhead=0) < 20  # the caller sees the text
+
+
+def test_count_tokens_reflects_the_actual_text(client):
+    short = client.post("/v1beta/models/auto:countTokens", json={
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}]}).get_json()
+    long = client.post("/v1beta/models/auto:countTokens", json={
+        "contents": [{"role": "user", "parts": [{"text": "hi " * 500}]}]}).get_json()
+    assert short["totalTokens"] < 20
+    assert long["totalTokens"] > short["totalTokens"] * 10
+
+
+def test_count_tokens_counts_the_tools_too(client):
+    """Tools dominate an agentic request's size; ignoring them makes the number
+    useless for exactly the clients that ask."""
+    contents = [{"role": "user", "parts": [{"text": "hi"}]}]
+    bare = client.post("/v1beta/models/auto:countTokens",
+                       json={"contents": contents}).get_json()
+    withtools = client.post("/v1beta/models/auto:countTokens", json={
+        "contents": contents,
+        "tools": [{"functionDeclarations": [
+            {"name": "read_file", "description": "x" * 400,
+             "parameters": {"type": "object"}}]}]}).get_json()
+    assert withtools["totalTokens"] > bare["totalTokens"]
+
+
 def test_stream_generate_content_defaults_to_a_json_array(client):
     """The documented shape without ?alt=sse. A client expecting it cannot parse
     SSE frames at all."""
