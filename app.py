@@ -12742,6 +12742,37 @@ def api_clis():
     return jsonify([_cli_row(e) for e in CLI_REGISTRY])
 
 
+@app.route("/api/ollama", methods=["GET", "POST"])
+def api_ollama():
+    """The Ollama surface's on/off switch, as a control endpoint.
+
+    It exists because "set the ollama_api flag" is not an answer anyone should
+    have to act on. The surface is off by default for a real reason -- it is an
+    extra, auth-less-by-default shape on the control port -- but "off by
+    default" and "hidden behind a config file" are different things, and only
+    the first one was intended."""
+    if request.method == "POST":
+        body = request.get_json(force=True, silent=True) or {}
+        want = body.get("enabled")
+        if not isinstance(want, bool):
+            return jsonify({"error": "'enabled' must be true or false."}), 400
+        config.set_flag("ollama_api", want)
+    enabled = _ollama_enabled()
+    key = config.get_local_api_key()
+    return jsonify({
+        "enabled": enabled,
+        # Ollama clients ask for a HOST, not a /v1 base: they append /api/... on
+        # their own. Handing them the /v1 URL is the single most common way to
+        # get "connection refused" out of an otherwise correct setup.
+        "base_url": "http://127.0.0.1:%d" % PORT,
+        "openai_base_url": "http://127.0.0.1:%d/v1" % PORT,
+        "api_key": key or "",
+        "key_required": bool(key),
+        "paths": sorted(_OLLAMA_ONLY_PATHS | _OLLAMA_SHARED_PATHS),
+        "models": ["auto", "best", "swarm"],
+    })
+
+
 @app.route("/api/antigravity", methods=["GET"])
 def api_antigravity():
     """Antigravity is NOT in CLI_REGISTRY on purpose.
