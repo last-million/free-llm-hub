@@ -616,6 +616,30 @@ def get_value(name: str, default=None):
     return v if isinstance(v, str) else default
 
 
+def get_json(name: str, default=None):
+    """Read a top-level JSON setting (dict/list).
+
+    get_value's sibling for structured settings -- named chains, and whatever
+    comes after them. Returns `default` for anything of the wrong shape rather
+    than raising, so a hand-edited config cannot stop the hub from starting."""
+    with _LOCK:
+        cfg = load_config()
+    v = cfg.get(name)
+    return v if isinstance(v, (dict, list)) else default
+
+
+def set_json(name: str, value) -> None:
+    """Write a top-level JSON setting. None removes the key, so a caller does
+    not have to know whether it exists."""
+    with _LOCK:
+        cfg = load_config(strict=True)
+        if value is None:
+            cfg.pop(name, None)
+        else:
+            cfg[name] = value
+        save_config(cfg)
+
+
 def set_value(name: str, value) -> None:
     """Persist a top-level string setting. Storing None removes it, so a
     setting can be returned to its built-in default rather than pinned to a
