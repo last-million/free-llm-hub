@@ -61,6 +61,7 @@ except Exception:  # pragma: no cover - jinja2 always ships with flask
 import agentic_chat
 import agentic_history
 import antigravity
+import secretstore
 import respcache
 import tool_rescue
 import wire_gemini
@@ -8454,6 +8455,10 @@ def api_status():
         "free_providers": free_count,
         "has_default": bool(default and default.get("provider") and default.get("model")),
         "local_api_key_set": bool(config.get_local_api_key()),
+        # So the dashboard can state how keys are stored rather than leaving it
+        # to be assumed either way.
+        "keys_encrypted": config.secrets_encrypted(),
+        "encryption_available": secretstore.available(),
         "connect_snippets": _connect_snippets(),
         "quota": q,
         "all_exhausted": free_count > 0 and exhausted == free_count,
@@ -18347,6 +18352,14 @@ if __name__ == "__main__":
     _mark_runtime_started()
     _bootstrap_no_key_providers()  # no-key providers have nothing to configure -> on
     _init_quota_persistence()      # restore quota/dead-model state from the last run
+    # Encrypt any provider keys still stored in plaintext. A no-op once done, so
+    # an ordinary start does not rewrite the config file for nothing.
+    try:
+        _migrated = config.encrypt_existing_secrets()
+        if _migrated:
+            _log.info("encrypted %d provider key(s) at rest", _migrated)
+    except Exception as _exc:                                    # noqa: BLE001
+        _log.warning("could not encrypt stored keys: %s", _exc)
     _print_banner()
     _start_auto_update()
     _start_aa_refresh()

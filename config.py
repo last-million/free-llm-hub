@@ -39,6 +39,8 @@ import hashlib
 import uuid
 from typing import Optional
 
+import secretstore
+
 
 def _default_config_path() -> str:
     env = os.environ.get("FREE_LLM_HUB_CONFIG")
@@ -209,6 +211,107 @@ def _normalize_provider_row(row):
     return row
 
 
+def _decrypt_secrets(cfg: dict) -> dict:
+    """Turn stored ciphertext back into usable keys, in place.
+
+    Every caller above this line -- routing, the dashboard, the export -- gets
+    plaintext exactly as it always did. Encryption is a property of the FILE,
+    not of the config object, which is what keeps the change to two functions
+    instead of every reader in the hub.
+
+    A key that cannot be decrypted (lost or replaced secret.key) is DROPPED
+    rather than passed along. Handing "enc.v1:..." to a provider as if it were
+    an API key produces an authentication failure that re-entering the correct
+    key would never fix, because the broken value is still sitting in the file.
+    """
+    path = _config_path()
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        return cfg
+    for pid, prov in providers.items():
+        if not isinstance(prov, dict):
+            continue
+        keys = prov.get("api_keys")
+        if not isinstance(keys, list):
+            continue
+        out = []
+        for k in keys:
+            if not secretstore.is_encrypted(k):
+                out.append(k)
+                continue
+            plain = secretstore.decrypt(k, path)
+            if plain:
+                out.append(plain)
+        prov["api_keys"] = out
+    return cfg
+
+
+def _encrypt_secrets(cfg: dict) -> dict:
+    """Encrypt provider keys on the way to disk, on a COPY.
+
+    A copy because the caller usually holds the same dict it is still using;
+    encrypting in place would leave live code holding ciphertext where it
+    expects a key."""
+    if not secretstore.available():
+        return cfg
+    path = _config_path()
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        return cfg
+    out = dict(cfg)
+    out["providers"] = {}
+    for pid, prov in providers.items():
+        if not isinstance(prov, dict):
+            out["providers"][pid] = prov
+            continue
+        copied = dict(prov)
+        keys = copied.get("api_keys")
+        if isinstance(keys, list):
+            copied["api_keys"] = [secretstore.encrypt(k, path) if isinstance(k, str)
+                                  else k for k in keys]
+        out["providers"][pid] = copied
+    return out
+
+
+def secrets_encrypted() -> bool:
+    """Whether the keys ON DISK are currently stored encrypted."""
+    try:
+        with open(_config_path(), "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return False
+    return secretstore.PREFIX in raw
+
+
+def encrypt_existing_secrets() -> int:
+    """Re-save so plaintext keys already on disk become ciphertext.
+
+    Called once at startup. Returns how many keys were migrated. Deliberately a
+    no-op when there is nothing to do, so an ordinary start does not rewrite the
+    config file for no reason."""
+    if not secretstore.available():
+        return 0
+    with _LOCK:
+        # Count what is ON DISK, not what load_config returns: load_config
+        # DECRYPTS, so counting there makes every key look like plaintext and
+        # rewrites the file on every start forever.
+        try:
+            with open(_config_path(), "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            return 0
+        if not isinstance(raw, dict):
+            return 0
+        n = 0
+        for prov in (raw.get("providers") or {}).values():
+            if isinstance(prov, dict):
+                n += sum(1 for k in (prov.get("api_keys") or [])
+                         if isinstance(k, str) and k and not secretstore.is_encrypted(k))
+        if n:
+            save_config(load_config())
+    return n
+
+
 def load_config(strict: bool = False) -> dict:
     """Load and normalize config.
 
@@ -272,7 +375,9 @@ def load_config(strict: bool = False) -> dict:
         cfg["images"]["priority_mode"] = "auto"
     if not isinstance(cfg["images"].get("manual_priority"), list):
         cfg["images"]["manual_priority"] = []
-    return cfg
+    # ...and decrypted on the way OUT, at the single point where config is read,
+    # so every caller keeps seeing plaintext keys exactly as before.
+    return _decrypt_secrets(cfg)
 
 
 def save_config(cfg: dict) -> None:
@@ -281,7 +386,9 @@ def save_config(cfg: dict) -> None:
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    data = json.dumps(cfg, indent=2, ensure_ascii=False)
+    # Provider keys are encrypted HERE, at the single point where config
+    # reaches disk, so no caller has to remember to do it.
+    data = json.dumps(_encrypt_secrets(cfg), indent=2, ensure_ascii=False)
     # Atomic write: temp file in the same dir, then replace.
     fd, tmp_path = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=parent or ".")
     try:
