@@ -2137,7 +2137,11 @@ def _est_tokens(messages, tools=None, overhead=400):
             chars += len(json.dumps(tools))
         except Exception:
             pass
-    return chars // 4 + overhead
+    est = chars // 4 + overhead
+    # Text shorter than one whole token still costs one. Only matters once the
+    # routing margin is dropped (countTokens), where "hi" floored to 0 -- and a
+    # client reading 0 tokens for real text concludes the message was empty.
+    return 1 if (chars and not est) else est
 
 
 # --------------------------------------------------------------------------- #

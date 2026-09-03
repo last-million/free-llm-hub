@@ -245,6 +245,20 @@ def test_count_tokens_does_not_report_the_routing_margin():
     assert A._est_tokens(msgs, None, overhead=0) < 20  # the caller sees the text
 
 
+def test_text_shorter_than_a_token_still_counts_as_one(client):
+    """chars//4 floors, so "hi" counted as 0 -- and a client reading 0 tokens
+    for real text concludes the message was empty."""
+    body = client.post("/v1beta/models/auto:countTokens", json={
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}]}).get_json()
+    assert body["totalTokens"] >= 1
+
+
+def test_genuinely_empty_input_still_counts_as_nothing(client):
+    body = client.post("/v1beta/models/auto:countTokens",
+                       json={"contents": []}).get_json()
+    assert body["totalTokens"] == 0
+
+
 def test_count_tokens_reflects_the_actual_text(client):
     short = client.post("/v1beta/models/auto:countTokens", json={
         "contents": [{"role": "user", "parts": [{"text": "hi"}]}]}).get_json()
