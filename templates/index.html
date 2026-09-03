@@ -935,6 +935,13 @@
   }
   .cli-card.is-connected{border-color:var(--accent-border)}
   .cli-card.recommended{border-color:var(--accent)}
+  /* measured speed, shown next to the benchmark score */
+  .sd-speed{
+    margin-left:auto;font-size:10.5px;font-variant-numeric:tabular-nums;
+    color:var(--text-faint);background:var(--surface-2,rgba(127,127,127,.09));
+    border:1px solid var(--border-soft);border-radius:5px;padding:1px 6px;flex:none;
+  }
+  .sd-speed.slow{color:var(--danger,#e5534b);border-color:var(--danger-border,currentColor)}
   /* ---- Antigravity card ---- */
   .ag-card{
     background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
@@ -9496,6 +9503,48 @@
        chain and the swarm alike. */
     var _sdModels = [], _sdBlocked = {};
 
+    /* MEASURED speed, next to the benchmark score.
+       The score says how good a model is thought to be; this says how it has
+       actually behaved here. They disagree often enough to be worth showing
+       side by side -- a top-scoring model with a 90-second p95 is not the one
+       you want on an agent turn.
+       p95 rather than the mean, because the mean is what the hub already had
+       and it hides exactly the thing that makes a model painful: the tail. */
+    var _sdSpeed = {};
+
+    function loadSdSpeed(){
+      return api('/api/model-speed').then(function(d){
+        _sdSpeed = {};
+        (d.models || []).forEach(function(r){ _sdSpeed[r.id] = r; });
+        renderSdModels();
+      }).catch(function(){ /* optional: never block the model list */ });
+    }
+
+    function fmtMs(ms){
+      if (ms == null) return '';
+      return ms < 1000 ? Math.round(ms) + 'ms' : (ms / 1000).toFixed(1) + 's';
+    }
+
+    function sdSpeedBadge(id){
+      var r = _sdSpeed[id];
+      if (!r) return '';
+      /* Prefer time-to-first-token: agent traffic streams, and TTFT is what a
+         person actually experiences as "slow". Fall back to total duration for
+         models only ever called non-streaming. */
+      var ttft = r.ttft_p50_ms, p95 = r.p95_ms || r.ttft_p95_ms;
+      var parts = [];
+      if (ttft != null) parts.push(fmtMs(ttft) + ' first token');
+      if (r.p50_ms != null) parts.push(fmtMs(r.p50_ms) + ' median');
+      if (p95 != null) parts.push(fmtMs(p95) + ' p95');
+      if (!parts.length) return '';
+      var n = (r.samples || 0) + (r.ttft_samples || 0);
+      var slow = p95 != null && p95 > 30000;
+      return '<span class="sd-speed' + (slow ? ' slow' : '') + '" title="' +
+             esc(parts.join(' · ') + ' — from ' + n + ' request' + (n === 1 ? '' : 's') +
+                 ' since the hub started') + '">' +
+             esc(fmtMs(ttft != null ? ttft : r.p50_ms)) + '</span>';
+    }
+
     function renderSdModels(){
       var host = $('#sd-models');
       if (!host) return;
@@ -9522,6 +9571,7 @@
                '<span class="nm">' + esc(m.model || '') +
                  ' <span class="pv">' + esc(m.provider || '') + '</span></span>' +
                (state ? '<span class="st">' + esc(state) + '</span>' : '') +
+               sdSpeedBadge(m.id) +
                '</label>';
       }).join('');
       var boxes = host.querySelectorAll('input[type=checkbox]');
@@ -9608,6 +9658,7 @@
           ((res[1] && res[1].blocked) || []).forEach(function(x){ _sdBlocked[x] = true; });
           renderSdCats();
           renderSdModels();
+          loadSdSpeed();
         })
         .catch(function(e){
           if (!silent) toast('Models: ' + e.message, true);
