@@ -61,6 +61,8 @@ except Exception:  # pragma: no cover - jinja2 always ships with flask
 import agentic_chat
 import agentic_history
 import antigravity
+import wire_gemini
+import wire_ollama
 import model_categories
 import snapshots
 import quick_history
@@ -6421,6 +6423,17 @@ _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _CONTROL_TOKEN_EXEMPT_GETS = ("/api/web-search-policy",)
 
 
+def _has_control_token():
+    """Whether THIS request carries the per-install control token, i.e. whether
+    it came from the dashboard. Same comparison the gate makes."""
+    token = config.get_control_token()
+    if not token:
+        return True                    # no token configured: everything is local
+    supplied = (request.headers.get("X-Free-LLM-Hub-Token")
+                or request.args.get("token"))
+    return bool(supplied and hmac.compare_digest(str(supplied), str(token)))
+
+
 def _hostname(value, origin=False):
     try:
         parsed = urlsplit(value if origin else "//" + value)
@@ -6438,7 +6451,7 @@ def _local_control_guard():
     origin = request.headers.get("Origin")
     if origin and _hostname(origin, origin=True) not in _LOOPBACK_HOSTS:
         return jsonify({"error": "cross-origin requests are not allowed"}), 403
-    if request.path.startswith("/api/"):
+    if request.path.startswith("/api/") and not _skips_control_gate(request.path):
         if (request.method in ("POST", "PUT", "PATCH", "DELETE") and
                 request.headers.get("X-Free-LLM-Hub") != "dashboard"):
             # A custom header forces a browser CORS preflight. This app emits no
@@ -6514,7 +6527,7 @@ def _runtime_error():
 
 @app.before_request
 def _runtime_before():
-    if not request.path.startswith("/v1"):
+    if not (request.path.startswith("/v1") or _is_ollama_path(request.path)):
         return None
     state = config.get_runtime_state()
     if state.get("desired") == "stopped" or state.get("phase") in ("draining", "stopped"):
@@ -6543,9 +6556,50 @@ def _runtime_after(response):
         _runtime_request_done()
     return response
 
+# The Ollama surface lives under /api/, which is otherwise the DASHBOARD control
+# API and is gated by the per-install control token plus an anti-CSRF header. No
+# Ollama client can send either -- the protocol has no auth at all -- so these
+# exact paths are carved out of that gate and put behind the gateway key instead,
+# exactly like /v1. Exact paths, never a prefix: "/api/chat" must not drag
+# "/api/chat/history" (a real control endpoint) out of the token gate with it.
+# Paths that exist ONLY to serve Ollama. Nothing else answers them, so they are
+# carved out of the control gate unconditionally and the views themselves refuse
+# while the emulation is off -- which turns "enable the ollama_api flag" into the
+# answer an Ollama client actually receives, instead of a 401 about a dashboard
+# token it has never heard of and cannot send.
+_OLLAMA_ONLY_PATHS = frozenset({
+    "/api/tags", "/api/chat", "/api/generate", "/api/show", "/api/ps",
+})
+
+# /api/version is SHARED: it was already the hub's own version endpoint long
+# before Ollama emulation existed, and Ollama clients probe the same path to
+# decide whether they are talking to an Ollama server at all. It therefore stays
+# token-gated as before and only opens up while the emulation is on -- see
+# api_version, which answers whichever caller asked.
+_OLLAMA_SHARED_PATHS = frozenset({"/api/version"})
+
+_OLLAMA_PATHS = _OLLAMA_ONLY_PATHS | _OLLAMA_SHARED_PATHS
+
+
+def _ollama_enabled():
+    """Off by default: an extra unauthenticated-by-default shape on the control
+    port should exist because someone asked for it, not because the hub shipped
+    it switched on."""
+    return config.get_flag("ollama_api", False)
+
+
+def _is_ollama_path(path):
+    return path in _OLLAMA_PATHS and _ollama_enabled()
+
+
+def _skips_control_gate(path):
+    return path in _OLLAMA_ONLY_PATHS or (path in _OLLAMA_SHARED_PATHS
+                                          and _ollama_enabled())
+
+
 @app.before_request
 def _guard_v1():
-    if not request.path.startswith("/v1"):
+    if not (request.path.startswith("/v1") or _is_ollama_path(request.path)):
         return None
     local_key = config.get_local_api_key()
     if not local_key:
@@ -6556,12 +6610,21 @@ def _guard_v1():
         supplied = auth[7:].strip()
     if not supplied:
         supplied = request.headers.get("x-api-key")
+    if not supplied:
+        # Gemini clients authenticate with Google's own header or ?key=, never
+        # a bearer token -- google-genai and Gemini CLI have no way to send one.
+        supplied = (request.headers.get("x-goog-api-key")
+                    or request.args.get("key"))
     if supplied and hmac.compare_digest(str(supplied), str(local_key)):
         return None
     msg = ("Missing or invalid local API key. Send it as "
            "'Authorization: Bearer <key>' or 'x-api-key: <key>'.")
     if request.path.startswith("/v1/messages"):
         return _anthropic_error("authentication_error", msg, 401)
+    if request.path.startswith("/v1beta"):
+        return jsonify(wire_gemini.error_payload(msg, 401, "UNAUTHENTICATED")), 401
+    if _is_ollama_path(request.path):
+        return jsonify(wire_ollama.error_payload(msg)), 401
     return _openai_error(msg, 401, "authentication_error")
 
 
@@ -8130,6 +8193,15 @@ _HUB_VERSION = _detect_hub_version()
 def api_version():
     # Control-token gated like every other /api/* read; the dashboard always
     # holds the token, so no _CONTROL_TOKEN_EXEMPT_GETS entry is needed.
+    #
+    # ...except that Ollama clients probe this exact path to decide whether they
+    # are talking to an Ollama server, and they cannot send the token. While the
+    # emulation is on the gate lets them through, so the caller is identified by
+    # what it presented: the dashboard always holds a valid token, an Ollama
+    # client never does. Both then get the payload they can actually parse --
+    # they disagree about what `version` means, so there is no single answer.
+    if _ollama_enabled() and not _has_control_token():
+        return jsonify({"version": wire_ollama.OLLAMA_VERSION})
     return jsonify({"version": _HUB_VERSION, "release": HUB_RELEASE})
 
 
@@ -14184,11 +14256,359 @@ def _swarm_completion(body):
     return jsonify(out)
 
 
+# ---------------------------------------------------------------------------
+# Foreign wire formats.
+#
+# Gemini CLI, the google-genai SDKs, Open WebUI, Enchanted, Continue's ollama
+# provider, editor ghost-text autocomplete -- none of them can be pointed at an
+# OpenAI endpoint, so without these the hub simply does not exist for any of
+# them. Each one translates its request into an OpenAI body, calls the shared
+# _chat_completions seam, and translates the answer back, so all of them inherit
+# difficulty routing, the fallback chain, swarm/crew escalation, quota
+# accounting and auto-compaction for free -- and keep inheriting improvements
+# made after they were written.
+# ---------------------------------------------------------------------------
+
+def _call_router(openai_body):
+    """Run a translated request through the real router.
+
+    Returns (response, data, status). `data` is the parsed JSON for a buffered
+    answer and None for a streamed one, in which case the caller iterates
+    `response` itself."""
+    rv = _chat_completions(openai_body)
+    resp = app.make_response(rv)
+    if resp.mimetype == "text/event-stream":
+        return resp, None, resp.status_code
+    try:
+        return resp, resp.get_json(), resp.status_code
+    except Exception:                                            # noqa: BLE001
+        return resp, None, resp.status_code
+
+
+def _sse_deltas(resp):
+    """Yield (text, tool_calls, finish_reason, usage) from an OpenAI SSE stream.
+
+    Every foreign streaming surface needs exactly this and nothing more, so the
+    frame parsing lives here once rather than three times."""
+    buf = ""
+    for raw in resp.response:
+        buf += raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        while "\n\n" in buf:
+            frame, buf = buf.split("\n\n", 1)
+            for line in frame.splitlines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                try:
+                    obj = json.loads(payload)
+                except ValueError:
+                    continue
+                choice = (obj.get("choices") or [{}])[0]
+                delta = choice.get("delta") or {}
+                yield (delta.get("content") or "", delta.get("tool_calls"),
+                       choice.get("finish_reason"), obj.get("usage"))
+
+
+def _error_text(data, fallback):
+    """Pull a human message out of whatever error envelope came back."""
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        if isinstance(err, str):
+            return err
+    return fallback
+
+
+# --------------------------------------------------------------------------- #
+# Legacy text completions -- what editor ghost-text autocomplete still speaks
+# --------------------------------------------------------------------------- #
+
+@app.route("/v1/completions", methods=["POST"])
+def v1_completions():
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return _openai_error("Invalid JSON body.", 400)
+    prompt = body.get("prompt")
+    if isinstance(prompt, list):
+        # The spec allows an array (and token arrays, which no free provider
+        # accepts); join the string case and refuse the rest rather than
+        # silently completing the wrong text.
+        if not all(isinstance(x, str) for x in prompt):
+            return _openai_error("Only string prompts are supported.", 400)
+        prompt = "".join(prompt)
+    if not isinstance(prompt, str) or not prompt:
+        return _openai_error("'prompt' is required.", 400)
+
+    openai_body = {"model": body.get("model") or "auto",
+                   "messages": [{"role": "user", "content": prompt}]}
+    for k in ("temperature", "top_p", "max_tokens", "stop", "seed", "stream", "user"):
+        if body.get(k) is not None:
+            openai_body[k] = body[k]
+
+    if body.get("stream"):
+        resp, _data, _status = _call_router(openai_body)
+        if resp.mimetype != "text/event-stream":
+            return resp                                   # an error, already shaped
+        model = body.get("model") or "auto"
+        cid = "cmpl-" + uuid.uuid4().hex
+
+        def gen():
+            for text, _tc, finish, _u in _sse_deltas(resp):
+                if not text and not finish:
+                    continue
+                yield "data: " + json.dumps({
+                    "id": cid, "object": "text_completion",
+                    "created": int(time.time()), "model": model,
+                    "choices": [{"text": text, "index": 0,
+                                 "finish_reason": finish, "logprobs": None}],
+                }) + "\n\n"
+            yield "data: [DONE]\n\n"
+        return Response(stream_with_context(gen()), mimetype="text/event-stream",
+                        headers=_SSE_HEADERS)
+
+    resp, data, status = _call_router(openai_body)
+    if status != 200 or not isinstance(data, dict):
+        return resp
+    choice = (data.get("choices") or [{}])[0]
+    return jsonify({
+        "id": "cmpl-" + uuid.uuid4().hex, "object": "text_completion",
+        "created": int(time.time()), "model": data.get("model") or openai_body["model"],
+        "choices": [{"text": (choice.get("message") or {}).get("content") or "",
+                     "index": 0, "finish_reason": choice.get("finish_reason"),
+                     "logprobs": None}],
+        "usage": data.get("usage") or {},
+    })
+
+
+# --------------------------------------------------------------------------- #
+# Ollama emulation
+# --------------------------------------------------------------------------- #
+
+def _ollama_off():
+    return jsonify(wire_ollama.error_payload(
+        "Ollama emulation is off. Enable the 'ollama_api' flag on the hub.")), 404
+
+
+@app.route("/api/tags", methods=["GET"])
+def ollama_tags():
+    if not _is_ollama_path("/api/tags"):
+        return _ollama_off()
+    # 'auto' first: it is the id that actually routes, and Ollama clients pick
+    # whatever is at the top of the list by default.
+    rows = [{"id": "auto", "provider": "free-llm-hub"}]
+    rows += [{"id": m, "provider": "free-llm-hub"} for m in (_SWARM_IDS + tuple(crews.CREW_IDS))]
+    rows += [{"id": m["id"], "provider": m.get("provider")} for m in aggregated_models()]
+    return jsonify(wire_ollama.tags_payload(rows))
+
+
+@app.route("/api/ps", methods=["GET"])
+def ollama_ps():
+    if not _is_ollama_path("/api/ps"):
+        return _ollama_off()
+    return jsonify({"models": []})       # nothing is resident: every model is remote
+
+
+@app.route("/api/show", methods=["POST"])
+def ollama_show():
+    if not _is_ollama_path("/api/show"):
+        return _ollama_off()
+    body = request.get_json(force=True, silent=True) or {}
+    name = body.get("model") or body.get("name") or "auto"
+    return jsonify(wire_ollama.show_payload(name))
+
+
+def _ollama_chat_like(kind):
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify(wire_ollama.error_payload("Invalid JSON body.")), 400
+    model = body.get("model") or "auto"
+    openai_body = (wire_ollama.chat_to_openai(body) if kind == "chat"
+                   else wire_ollama.generate_to_openai(body))
+    # Ollama streams by DEFAULT -- an absent "stream" means true, the opposite
+    # of OpenAI. Getting this backwards makes every client hang on first use.
+    streaming = body.get("stream", True) is not False
+    openai_body["stream"] = streaming
+    started = time.time()
+
+    if not streaming:
+        resp, data, status = _call_router(openai_body)
+        if status != 200 or not isinstance(data, dict):
+            return jsonify(wire_ollama.error_payload(
+                _error_text(data, "Upstream error."))), status
+        ns = int((time.time() - started) * 1_000_000_000)
+        out = (wire_ollama.chat_response(data, model, ns) if kind == "chat"
+               else wire_ollama.generate_response(data, model, ns))
+        return jsonify(out)
+
+    resp, _data, status = _call_router(openai_body)
+    if resp.mimetype != "text/event-stream":
+        try:
+            payload = resp.get_json()
+        except Exception:                                        # noqa: BLE001
+            payload = None
+        return jsonify(wire_ollama.error_payload(
+            _error_text(payload, "Upstream error."))), status
+
+    def gen():
+        usage, calls = None, None
+        for text, tool_calls, _finish, u in _sse_deltas(resp):
+            if u:
+                usage = u
+            if tool_calls:
+                calls = tool_calls
+            if not text:
+                continue
+            yield wire_ollama.ndjson(
+                wire_ollama.chat_chunk(model, text) if kind == "chat"
+                else wire_ollama.generate_chunk(model, text))
+        if calls and kind == "chat":
+            yield wire_ollama.ndjson(wire_ollama.chat_chunk(model, "", calls))
+        ns = int((time.time() - started) * 1_000_000_000)
+        # The done:true line is what stops the client spinning. Without it the
+        # text all arrives and the UI still looks stuck forever.
+        yield wire_ollama.ndjson(wire_ollama.final_chunk(model, kind, ns, usage))
+
+    return Response(stream_with_context(gen()),
+                    mimetype="application/x-ndjson",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/chat", methods=["POST"])
+def ollama_chat():
+    if not _is_ollama_path("/api/chat"):
+        return _ollama_off()
+    return _ollama_chat_like("chat")
+
+
+@app.route("/api/generate", methods=["POST"])
+def ollama_generate():
+    if not _is_ollama_path("/api/generate"):
+        return _ollama_off()
+    return _ollama_chat_like("generate")
+
+
+# --------------------------------------------------------------------------- #
+# Gemini (generateContent)
+# --------------------------------------------------------------------------- #
+
+def _gemini_models():
+    rows = [{"id": "auto", "context_window": None}]
+    rows += [{"id": m, "context_window": None} for m in (_SWARM_IDS + tuple(crews.CREW_IDS))]
+    rows += [{"id": m["id"], "context_window": m.get("context_window")}
+             for m in aggregated_models()]
+    return rows
+
+
+@app.route("/v1beta/models", methods=["GET"])
+@app.route("/v1beta/openai/models", methods=["GET"])
+def gemini_models():
+    return jsonify(wire_gemini.models_payload(_gemini_models()))
+
+
+@app.route("/v1beta/models/<path:spec>", methods=["GET", "POST"])
+def gemini_generate(spec):
+    """One route for every method, because a model id here can contain slashes
+    ("openrouter/glm-5.3") and the method is a ":suffix" on the last segment --
+    neither of which Flask can express as separate rules."""
+    method = None
+    if ":" in spec:
+        spec, method = spec.rsplit(":", 1)
+    model = wire_gemini.strip_model_prefix(spec)
+
+    if request.method == "GET" and not method:
+        return jsonify(wire_gemini.model_entry(model))
+
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify(wire_gemini.error_payload("Invalid JSON body.", 400)), 400
+
+    if method == "countTokens":
+        msgs = wire_gemini.contents_to_messages(body)
+        return jsonify(wire_gemini.count_tokens_payload(_est_tokens(msgs, None)))
+
+    if method not in ("generateContent", "streamGenerateContent"):
+        return jsonify(wire_gemini.error_payload(
+            "Unsupported method '%s'." % (method or ""), 400)), 400
+
+    openai_body = wire_gemini.to_openai(body, model)
+    streaming = method == "streamGenerateContent"
+    openai_body["stream"] = streaming
+
+    if not streaming:
+        resp, data, status = _call_router(openai_body)
+        if status != 200 or not isinstance(data, dict):
+            return jsonify(wire_gemini.error_payload(
+                _error_text(data, "Upstream error."), status)), status
+        return jsonify(wire_gemini.from_openai(data, model))
+
+    resp, _data, status = _call_router(openai_body)
+    if resp.mimetype != "text/event-stream":
+        try:
+            payload = resp.get_json()
+        except Exception:                                        # noqa: BLE001
+            payload = None
+        return jsonify(wire_gemini.error_payload(
+            _error_text(payload, "Upstream error."), status)), status
+
+    # ?alt=sse is what Gemini CLI and the SDKs send. Without it the documented
+    # shape is a JSON ARRAY delivered incrementally, and a client expecting that
+    # cannot parse SSE frames at all -- so both are emitted properly.
+    as_sse = (request.args.get("alt") or "").lower() == "sse"
+
+    def gen():
+        usage, first = None, True
+        for text, tool_calls, finish, u in _sse_deltas(resp):
+            if u:
+                usage = u
+            if not text and not tool_calls and not finish:
+                continue
+            chunk = wire_gemini.stream_chunk(text, model, finish, tool_calls)
+            if as_sse:
+                yield "data: " + json.dumps(chunk) + "\n\n"
+            else:
+                yield ("[" if first else ",") + json.dumps(chunk)
+                first = False
+        tail = wire_gemini.stream_chunk("", model, "stop", None, usage)
+        if as_sse:
+            yield "data: " + json.dumps(tail) + "\n\n"
+        else:
+            yield ("[" if first else ",") + json.dumps(tail) + "]"
+
+    if as_sse:
+        return Response(stream_with_context(gen()), mimetype="text/event-stream",
+                        headers=_SSE_HEADERS)
+    return Response(stream_with_context(gen()), mimetype="application/json",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.route("/v1/chat/completions", methods=["POST"])
 def v1_chat_completions():
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return _openai_error("Invalid JSON body.", 400)
+    return _chat_completions(body)
+
+
+def _chat_completions(body):
+    """The whole router, reachable WITHOUT an HTTP request of its own.
+
+    Every wire format this hub speaks -- OpenAI, Anthropic, Gemini, Ollama, the
+    legacy /v1/completions -- wants the same thing behind it: difficulty
+    routing, the fallback chain, swarm/crew escalation, quota and reliability
+    accounting, auto-compaction. /v1/messages predates this seam and duplicates
+    that loop; doing the same for two more formats would have meant four copies
+    of the one piece of logic where a divergence is silent and expensive.
+
+    So the foreign surfaces translate their request into an OpenAI body, call
+    this, and translate the answer back. They inherit every routing improvement
+    automatically, including ones added after they were written.
+
+    Still runs inside a real request context (it reads request.headers for
+    X-Free-LLM-Hub-Exclude), it just no longer re-reads the JSON body."""
     try:
         body["messages"], image_count = _normalize_openai_messages(body.get("messages"))
     except ValueError as exc:
