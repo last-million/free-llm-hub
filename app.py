@@ -5121,8 +5121,58 @@ def _excluded_identities(header_value):
     return out
 
 
+# NAMED CHAINS -- an ordered list of models saved under a name and selected as a
+# model id ("coding", "cheap", "uncensored").
+#
+# The hub already had category BUTTONS, which are a different thing: a category
+# is a SET used to filter what routing may consider, and the order inside it is
+# still the benchmark's. A chain is an ORDER the user asserts -- try this exact
+# model, then that one -- which is the only way to express "I know this pairing
+# works for my project" or "this one first, but never leave me stuck".
+#
+# It is a preference, not a cage: the ordinary chain is appended after the named
+# entries, so a chain whose models are all rate-limited degrades to normal
+# routing instead of failing. A chain that could dead-end would be worse than no
+# chain, because it fails exactly when everything is busiest.
+_CHAINS_KEY = "chains"
+
+
+def _named_chains():
+    raw = config.get_json(_CHAINS_KEY, {}) or {}
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for name, ids in raw.items():
+        if isinstance(name, str) and name and isinstance(ids, list):
+            out[name] = [str(i) for i in ids if isinstance(i, str) and i]
+    return out
+
+
+def _is_chain_name(model):
+    return bool(model) and str(model).strip().lower() in _named_chains()
+
+
+def _chain_entries(name):
+    """[(pid, model)] for a named chain, dropping ids that are not available.
+
+    Filtered against the live catalog rather than trusted: a chain saved months
+    ago naming a model a provider has since withdrawn must not put a dead hop at
+    the front of every request."""
+    ids = _named_chains().get(str(name).strip().lower()) or []
+    live = {m["id"] for m in aggregated_models()}
+    out = []
+    for ident in ids:
+        if ident not in live or "/" not in ident:
+            continue
+        pid, model = ident.split("/", 1)
+        if _is_model_dead(pid, model):
+            continue
+        out.append((pid, model))
+    return out
+
+
 def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_tools=False,
-                  messages=None, exclude_identities=None):
+                  messages=None, exclude_identities=None, prefer=None):
     """Priority-ordered [(pid, model)] fallback chain. Primary first, then the
     next-best MODELS across every AVAILABLE, size-capable provider, INTERLEAVED
     across providers (best model of each provider, then each provider's 2nd, ...).
@@ -5131,6 +5181,12 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     like NVIDIA), while later rounds still try other models of the same provider
     (handles per-model limits like Groq). Size-incapable providers are skipped so
     a big request never falls onto one that will 413. Capped at MAX_HOPS."""
+    # A NAMED CHAIN's entries go in front of everything, in the order the user
+    # wrote them -- that order IS the feature. They still pass through the same
+    # veto and de-duplication below, so "retry with a different model" keeps
+    # working against a named chain, and the ordinary chain still follows so the
+    # request cannot dead-end.
+    _preferred = [tuple(x) for x in (prefer or []) if x]
     # Caller-vetoed models ("retry with a different model"): drop them before the
     # primary is even seeded, or the one model the user just rejected would be
     # tried FIRST on the retry. Never widened silently -- an empty result falls
@@ -5259,6 +5315,20 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # A refusal is now a non-answer (see _looks_like_refusal), so the chain moves
     # on -- but only if it still holds a model that will take the work. Appended,
     # never promoted: the ordinary ranking still decides who answers first.
+    # The named chain's entries, in the user's order, ahead of everything the
+    # builder produced -- minus anything vetoed or already present, so a chain
+    # can neither introduce a duplicate hop nor resurrect a model the caller
+    # just rejected.
+    if _preferred:
+        head = []
+        for entry in _preferred:
+            pid, m = entry[0], entry[1]
+            if exclude_identities and _normalize_model_identity(m) in exclude_identities:
+                continue
+            if (pid, m) in head:
+                continue
+            head.append((pid, m))
+        chain = head + [e for e in chain if e not in head]
     return _ensure_permissive_hop(chain)
 
 
@@ -5892,6 +5962,29 @@ def _trim_largest_message(messages, tools, target):
 _EMBED_MAX_HOPS = 4
 
 
+# OUTBOUND PROXY.
+#
+# requests already honours HTTP_PROXY/HTTPS_PROXY through the environment, but
+# only because `trust_env` defaults to True -- which also means it silently
+# picks up whatever a corporate machine, a VPN client or a leftover shell export
+# happens to have set. The failure that produces is miserable to diagnose: every
+# provider times out at once, with no indication the traffic is being sent
+# somewhere else entirely.
+#
+# So it is stated explicitly instead: a proxy configured here is used, nothing
+# is inherited by accident, and /api/status can report which it is. Empty means
+# direct.
+_PROXY_KEY = "outbound_proxy"
+
+
+def _proxies():
+    """{'http': url, 'https': url} for upstream calls, or None for direct."""
+    url = (config.get_value(_PROXY_KEY, "") or "").strip()
+    if not url:
+        return None
+    return {"http": url, "https": url}
+
+
 def _upstream_post(pid, path, payload):
     """POST {base_url}/{path} for provider pid, rotating across its key pool.
 
@@ -5928,12 +6021,15 @@ def _upstream_post(pid, path, payload):
                          {"Authorization": "Bearer " + key,
                           "Content-Type": "application/json"}),
                 timeout=(CONNECT_TIMEOUT, CHAT_READ_TIMEOUT),
+                proxies=_proxies(),
             )
         except requests.RequestException:
             if is_last:
                 raise
             continue
         quota.record(pid, payload.get("model"))
+        quota.record_key(pid, key, payload.get("model"))
+        quota.note_key_outcome(pid, key, resp.status_code not in (401, 403, 429))
         quota.observe_headers(pid, resp.headers)
         # Same rotation rule as chat: these three statuses are about THIS KEY,
         # so the next key in the pool deserves a turn before the provider is
@@ -6046,6 +6142,7 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                          {"Authorization": "Bearer " + key,
                           "Content-Type": "application/json"}),
                 stream=stream,
+                proxies=_proxies(),          # explicit; never inherited by accident
                 # Streaming: bound the inter-chunk (idle) read at STREAM_IDLE_TIMEOUT
                 # so a stalled stream fails in ~90s not 300s (the handler's first-byte
                 # peek falls through even sooner, at ~25s). Non-streaming keeps the
@@ -6058,6 +6155,11 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                 raise
             continue
         quota.record(pid, payload.get("model"))  # counts against free quota (per provider + model)
+        # ...and against THIS key. The pool exists so a provider survives one key
+        # running out, which worked -- and made "which of my keys is dead?"
+        # unanswerable, because every counter was per provider.
+        quota.record_key(pid, key, payload.get("model"))
+        quota.note_key_outcome(pid, key, resp.status_code not in (401, 403, 429))
         quota.observe_headers(pid, resp.headers)  # ADAPT to the provider's real quota
         if resp.status_code == 400:               # learn a small context window from the error
             _learn_context_limit(pid, payload.get("model"), resp)
@@ -7271,6 +7373,28 @@ def favicon():
 # Config API
 # ---------------------------------------------------------------------------
 
+def _key_rows(pid, keys):
+    """One row per key: how to display it, and how it has actually behaved.
+
+    Usage is per key rather than per provider because that is the only level at
+    which "this one is exhausted" is a statement you can act on -- with a pool,
+    the provider total says nothing about which member is carrying it or which
+    is being rotated onto and rejected every time."""
+    used = quota.keys(pid)
+    rows = []
+    for i, k in enumerate(keys):
+        stat = used.get(quota.key_fingerprint(k)) or {}
+        rows.append({
+            "masked": _mask_key(k),
+            "index": i,
+            "requests": stat.get("count", 0),
+            "ok": stat.get("ok", 0),
+            "failed": stat.get("fail", 0),
+            "last_used": stat.get("last", 0) or None,
+        })
+    return rows
+
+
 def _mask_key(k):
     """Safe display form of a key: first4 + '…' + last4 (or '••••' if <9 chars).
     NEVER returns the full key — the reveal route is the only full-key surface."""
@@ -7385,7 +7509,7 @@ def _provider_row(pid, live_models=False):
         "enabled": bool(pcfg.get("enabled")),
         "has_key": bool(keys),
         "key_count": len(keys),
-        "keys": [{"masked": _mask_key(k), "index": i} for i, k in enumerate(keys)],
+        "keys": _key_rows(pid, keys),
         "signup_url": prov.signup_url(pid),
         "key_hint": p.get("key_hint") or "",
         "notes": p.get("notes") or "",
@@ -8458,6 +8582,7 @@ def api_status():
         # So the dashboard can state how keys are stored rather than leaving it
         # to be assumed either way.
         "keys_encrypted": config.secrets_encrypted(),
+        "outbound_proxy": (config.get_value(_PROXY_KEY, "") or "") or None,
         "encryption_available": secretstore.available(),
         "connect_snippets": _connect_snippets(),
         "quota": q,
@@ -12846,6 +12971,54 @@ def api_clis():
     return jsonify([_cli_row(e) for e in CLI_REGISTRY])
 
 
+@app.route("/api/chains", methods=["GET", "POST", "DELETE"])
+def api_chains():
+    """Named fallback chains: an ORDER the user asserts.
+
+    Distinct from the category buttons, which are a SET used to filter what
+    routing may consider while leaving the benchmark to order it. A chain says
+    "try this exact model, then that one", which is the only way to express "I
+    know this pairing works for my project".
+
+    It is a preference, not a cage: the ordinary chain still follows, so a chain
+    whose models are all rate-limited degrades to normal routing instead of
+    failing. One that could dead-end would be worse than none, because it would
+    fail exactly when everything is busiest."""
+    if request.method == "GET":
+        chains = _named_chains()
+        return jsonify({"chains": [
+            {"name": n,
+             "models": ids,
+             # Which entries are actually usable right now: a chain saved months
+             # ago can name models a provider has since withdrawn.
+             "live": [p + "/" + m for p, m in _chain_entries(n)]}
+            for n, ids in sorted(chains.items())]})
+
+    body = request.get_json(force=True, silent=True) or {}
+    name = str(body.get("name") or "").strip().lower()
+    if not name:
+        return jsonify({"error": "'name' is required."}), 400
+    if "/" in name or name in ("auto", "best", "swarm", "crew", "team", "plan"):
+        # Those already mean something as a model id; a chain shadowing one
+        # would silently change what an existing client asks for.
+        return jsonify({"error": "'%s' is already a model id." % name}), 400
+    chains = _named_chains()
+    if request.method == "DELETE":
+        chains.pop(name, None)
+        config.set_json(_CHAINS_KEY, chains)
+        return jsonify({"ok": True, "removed": name})
+    models = body.get("models")
+    if not isinstance(models, list) or not models:
+        return jsonify({"error": "'models' must be a non-empty list of '<provider>/<model>' ids."}), 400
+    ids = [str(m).strip() for m in models if isinstance(m, str) and m.strip()]
+    if not ids:
+        return jsonify({"error": "'models' held no usable ids."}), 400
+    chains[name] = ids
+    config.set_json(_CHAINS_KEY, chains)
+    return jsonify({"ok": True, "name": name, "models": ids,
+                    "live": [p + "/" + m for p, m in _chain_entries(name)]})
+
+
 @app.route("/api/model-speed", methods=["GET"])
 def api_model_speed():
     """Measured speed per model: p50/p95 total, and p50/p95 time-to-first-token.
@@ -15080,15 +15253,80 @@ def _chat_completions(body):
 
     A client can bypass it for one request with `X-Free-LLM-Hub-Cache: bypass`,
     which still STORES the fresh answer."""
+    # IDEMPOTENCY. A client that retries a POST it never saw the answer to --
+    # a dropped connection, a proxy timeout, an SDK's own retry -- spends the
+    # free quota twice for one question. `Idempotency-Key` says "this is that
+    # same request", so the first answer is returned instead of a second one
+    # being generated. Independent of the response cache: this is about a
+    # RETRY of one request, not about two people asking the same thing, so it
+    # applies even to tool-carrying turns the cache refuses.
+    idem = (request.headers.get("Idempotency-Key") or "").strip()[:200]
+    if idem:
+        held = _idem_get(idem)
+        if held is not None:
+            return jsonify(held), 200, {"X-Free-LLM-Hub-Idempotent": "replayed"}
+
     if not config.get_flag("response_cache", False):
-        return _chat_completions_uncached(body)
+        return _idem_store(idem, _chat_completions_uncached(body))
 
     bypass = (request.headers.get("X-Free-LLM-Hub-Cache") or "").lower() == "bypass"
     if not bypass:
         hit = respcache.get(body, ttl=_cache_ttl())
         if hit is not None:
             return _cached_response(body, hit)
-    return _remember_completion(body, _chat_completions_uncached(body))
+    return _idem_store(idem, _remember_completion(body, _chat_completions_uncached(body)))
+
+
+# Answers held against an Idempotency-Key. Small and short-lived: this exists to
+# cover a retry of a request in flight, not to remember yesterday.
+_IDEM_TTL = 600
+_IDEM_MAX = 128
+_idem = {}                      # key -> (stored_at, data)
+_idem_lock = threading.Lock()
+
+
+def _idem_get(key):
+    if not key:
+        return None
+    now = time.time()
+    with _idem_lock:
+        hit = _idem.get(key)
+        if not hit:
+            return None
+        stored_at, data = hit
+        if now - stored_at > _IDEM_TTL:
+            _idem.pop(key, None)
+            return None
+        return data
+
+
+def _idem_store(key, rv):
+    """Remember a successful answer under its idempotency key.
+
+    Streamed answers are deliberately NOT held: replaying one would mean
+    buffering it here, and a client streaming a turn is watching it arrive --
+    the retry case this covers is a client that got no answer at all."""
+    if not key:
+        return rv
+    try:
+        resp = app.make_response(rv)
+    except Exception:                                            # noqa: BLE001
+        return rv
+    if resp.status_code != 200 or resp.mimetype == "text/event-stream":
+        return resp
+    try:
+        data = resp.get_json()
+    except Exception:                                            # noqa: BLE001
+        return resp
+    if not isinstance(data, dict):
+        return resp
+    with _idem_lock:
+        if len(_idem) >= _IDEM_MAX:
+            oldest = next(iter(_idem), None)
+            if oldest is not None:
+                _idem.pop(oldest, None)
+        _idem[key] = (time.time(), data)
+    return resp
 
 
 def _cache_ttl():
@@ -15243,6 +15481,23 @@ def _chat_completions_uncached(body):
     # Orchestrate (Auto): route by task difficulty AND request size so weak/small
     # providers take easy work and big requests avoid small-TPM providers (413).
     # Explicit '<pid>/<model>' bypasses model choice (chain still size-filters).
+    # A NAMED CHAIN used as the model: resolve it to its first live entry and
+    # keep the rest as the preferred head of the fallback chain, so the order
+    # the user wrote is the order that runs. Resolved here rather than inside
+    # the router because everything below reads body["model"], and a name that
+    # reached _route_by_difficulty would simply score as an unknown id.
+    chain_prefer = None
+    if _is_chain_name(body.get("model")):
+        chain_prefer = _chain_entries(body.get("model"))
+        if chain_prefer:
+            body = dict(body)
+            body["model"] = chain_prefer[0][0] + "/" + chain_prefer[0][1]
+        else:
+            # Every model in the chain is gone or dead. Fall back to Auto rather
+            # than failing: a saved preference must never be able to break a
+            # request outright.
+            body = dict(body)
+            body["model"] = "auto"
     est = _est_tokens(body.get("messages"), body.get("tools"))
     has_tools = bool(body.get("tools"))
     # "Retry with a different model": the caller names the model(s) it does NOT
@@ -15304,6 +15559,7 @@ def _chat_completions_uncached(body):
     # _build_chain should not have to know about a parameter it never sees).
     _veto_kw = {"exclude_identities": veto} if veto else {}
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
+                                          prefer=chain_prefer,
                                            require_tools=has_tools,
                                            messages=body.get("messages"),
                                            **_veto_kw):

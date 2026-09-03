@@ -92,7 +92,7 @@ def _chat_ok():
 def test_static_key_sent_for_uncloseai_shaped_provider(isolated_config, monkeypatch):
     captured = {}
 
-    def post(url, json=None, headers=None, stream=None, timeout=None):
+    def post(url, json=None, headers=None, stream=None, timeout=None, **kw):
         captured["headers"] = headers
         return _chat_ok()
 
@@ -104,7 +104,7 @@ def test_static_key_sent_for_uncloseai_shaped_provider(isolated_config, monkeypa
 def test_no_authorization_for_pollinations_shaped_provider(isolated_config, monkeypatch):
     captured = {}
 
-    def post(url, json=None, headers=None, stream=None, timeout=None):
+    def post(url, json=None, headers=None, stream=None, timeout=None, **kw):
         captured["headers"] = headers
         return _chat_ok()
 
@@ -206,9 +206,12 @@ def _stub_chain(monkeypatch, hops):
                         lambda messages, max_tokens=None, est=0, require_tools=False:
                         (hops[0][0], hops[0][1], "simple"))
     monkeypatch.setattr(app, "_check_provider_ready", lambda pid: None)
+    # **kw, not a fixed signature: this stub stands in for the real builder, and
+    # pinning every parameter means any new routing option (exclude_identities,
+    # prefer, whatever comes next) breaks five tests that are about response
+    # headers rather than about the chain builder's arguments.
     monkeypatch.setattr(app, "_build_chain",
-                        lambda pid, model, est=0, require_vision=False,
-                               require_tools=False, messages=None: list(hops))
+                        lambda pid, model, est=0, **kw: list(hops))
 
 
 def test_transparency_headers_on_success(isolated_config, monkeypatch):

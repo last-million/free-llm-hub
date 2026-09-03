@@ -935,6 +935,12 @@
   }
   .cli-card.is-connected{border-color:var(--accent-border)}
   .cli-card.recommended{border-color:var(--accent)}
+  .keyrow-use{
+    font-size:10px;font-variant-numeric:tabular-nums;color:var(--text-faint);
+    border:1px solid var(--border-soft);border-radius:4px;padding:0 5px;flex:none;
+  }
+  .keyrow-use.idle{opacity:.6}
+  .keyrow-use.bad{color:var(--danger,#e5534b);border-color:currentColor}
   /* measured speed, shown next to the benchmark score */
   .sd-speed{
     margin-left:auto;font-size:10.5px;font-variant-numeric:tabular-nums;
@@ -4484,11 +4490,26 @@
             : '<span class="keyrow-tag ok">' + esc(a.remaining_cents) + '¢ left</span>';
         }
         return '<div class="saved-key" data-idx="' + esc(k.index) + '">' +
-          '<code class="sk-mask">' + esc(k.masked) + '</code>' + tag +
+          '<code class="sk-mask">' + esc(k.masked) + '</code>' + tag + keyUsageTag(k) +
           '<button type="button" class="sk-eye" title="Reveal key" aria-label="Reveal key">' + EYE_SVG + '</button>' +
           '<button type="button" class="sk-remove" title="Remove key" aria-label="Remove key">' + X_SVG + '</button>' +
         '</div>';
       }).join('') + '</div>';
+    }
+
+    /* Per-key usage. The pool exists so a provider survives one key running
+       out; rotation makes that work and hides WHICH key is the problem, because
+       every other counter here is per provider. A key that is being rotated
+       onto and rejected every time looks identical to an unused one until this
+       is shown. */
+    function keyUsageTag(k){
+      var n = k.requests || 0, bad = k.failed || 0;
+      if (!n) return '<span class="keyrow-use idle" title="Not used in the current quota window">unused</span>';
+      var dead = bad >= n;   /* every attempt rejected: exhausted or revoked */
+      return '<span class="keyrow-use' + (dead ? ' bad' : '') + '" title="' +
+             esc(n + ' request' + (n === 1 ? '' : 's') + ' this window, ' +
+                 (k.ok || 0) + ' ok, ' + bad + ' rejected (401/403/429)') + '">' +
+             esc(n + (bad ? ' · ' + bad + ' rejected' : '')) + '</span>';
     }
 
     var fm = Array.isArray(p.free_models) ? p.free_models : [];

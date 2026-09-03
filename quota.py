@@ -27,6 +27,7 @@ import json
 import os
 import tempfile
 import threading
+import hashlib
 import time
 
 # provider id -> {"limit": int, "window": "minute"|"day"|"month"}
@@ -136,6 +137,10 @@ _LOCK = threading.RLock()
 _STATE: dict = {}
 # pid -> {"window_start": float, "models": {model_id: count}}  (per-model usage)
 _MODEL_STATE: dict = {}
+# Per-KEY counters, same shape and same window as _MODEL_STATE. Keys are
+# identified by a truncated SHA-256 -- never the credential itself, which
+# must not end up in a state file that is not encrypted.
+_KEY_STATE = {}
 # (pid, model) -> {"throttled_until": float, "strikes": int, "last_strike": float}
 # Per-MODEL 429 sideline: when ONE model rate-limits (not the whole provider), only
 # that id is parked, so the provider's other models keep serving. Independent of the
@@ -257,6 +262,78 @@ def record(pid: str, model: str = None, n: int = 1) -> None:
             ms["models"][model] = ms["models"].get(model, 0) + n
             _MODEL_STATE[pid] = ms
     _persist_maybe()
+
+
+def key_fingerprint(key) -> str:
+    """A stable, non-reversible id for one API key.
+
+    The key itself is never stored here. A fingerprint is enough to say "this
+    one is the exhausted one" and cannot leak a credential into a state file
+    that, unlike config.json, is not encrypted."""
+    if not isinstance(key, str) or not key:
+        return ""
+    return hashlib.sha256(key.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def record_key(pid: str, key, model: str = None, n: int = 1) -> None:
+    """Count requests against ONE key of pid's pool.
+
+    The pool exists so a provider survives one key running out, and rotation
+    made that work -- while making "which of my keys is dead?" unanswerable,
+    because every counter was per provider. With dozens of keys across dozens
+    of providers that is the difference between "something is throttled" and
+    "this key is".
+
+    Shares the provider's window, so the numbers add up to the provider total
+    rather than drifting against it."""
+    fp = key_fingerprint(key)
+    if not fp:
+        return                     # a no-key/static-key provider has none to track
+    lim = _limit_for(pid)
+    now = time.time()
+    start, _reset = _window_bounds(lim["window"], now, pid)
+    with _LOCK:
+        ks = _KEY_STATE.get(pid)
+        if not ks or ks.get("window_start") != start:
+            ks = {"window_start": start, "keys": {}}
+        row = ks["keys"].get(fp) or {"count": 0, "ok": 0, "fail": 0, "last": 0}
+        row["count"] = row.get("count", 0) + n
+        row["last"] = now
+        ks["keys"][fp] = row
+        _KEY_STATE[pid] = ks
+    _persist_maybe()
+
+
+def note_key_outcome(pid: str, key, ok: bool) -> None:
+    """Whether a key's request actually worked.
+
+    A count alone cannot distinguish a key doing all the work from one being
+    rotated onto and rejected every time -- which is exactly the state a pool
+    is supposed to make survivable and therefore invisible."""
+    fp = key_fingerprint(key)
+    if not fp:
+        return
+    with _LOCK:
+        ks = _KEY_STATE.get(pid)
+        if not ks:
+            return
+        row = ks["keys"].get(fp)
+        if not row:
+            return
+        row["ok" if ok else "fail"] = row.get("ok" if ok else "fail", 0) + 1
+
+
+def keys(pid: str) -> dict:
+    """{fingerprint: {count, ok, fail, last}} for pid's current window."""
+    with _LOCK:
+        ks = _KEY_STATE.get(pid)
+        if not ks:
+            return {}
+        lim = _limit_for(pid)
+        start, _reset = _window_bounds(lim["window"], time.time(), pid)
+        if ks.get("window_start") != start:
+            return {}                        # the window rolled: last one is stale
+        return {k: dict(v) for k, v in (ks.get("keys") or {}).items()}
 
 
 def models(pid: str) -> dict:
