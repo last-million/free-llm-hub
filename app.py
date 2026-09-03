@@ -2103,9 +2103,17 @@ def _provider_tpm(pid):
     return _PROVIDER_TPM.get(pid, _DEFAULT_TPM)
 
 
-def _est_tokens(messages, tools=None):
+def _est_tokens(messages, tools=None, overhead=400):
     """Rough token estimate of a request (~4 chars/token). Counts message text,
-    tool-call arguments, AND tool schemas — tools dominate an agentic CLI's size."""
+    tool-call arguments, AND tool schemas — tools dominate an agentic CLI's size.
+
+    `overhead` is a deliberate safety margin for roles and wire formatting, and
+    exists because this number is used to keep requests UNDER provider TPM and
+    context limits: over-estimating there costs nothing, under-estimating costs
+    a 413. It has to be dropped for anything the CLIENT reads as a token count,
+    though -- Gemini's countTokens reported 406 tokens for a 24-character
+    message, which is the margin, not the text, and would make a client believe
+    it was near a limit it is nowhere near."""
     chars = 0
     for m in messages or []:
         if not isinstance(m, dict):
@@ -2129,7 +2137,7 @@ def _est_tokens(messages, tools=None):
             chars += len(json.dumps(tools))
         except Exception:
             pass
-    return chars // 4 + 400  # + overhead for roles/formatting
+    return chars // 4 + overhead
 
 
 # --------------------------------------------------------------------------- #
@@ -14797,7 +14805,10 @@ def gemini_generate(spec):
 
     if method == "countTokens":
         msgs = wire_gemini.contents_to_messages(body)
-        return jsonify(wire_gemini.count_tokens_payload(_est_tokens(msgs, None)))
+        # No routing margin: this number is shown to the caller, not used to
+        # keep a request under a provider limit.
+        return jsonify(wire_gemini.count_tokens_payload(
+            _est_tokens(msgs, body.get("tools"), overhead=0)))
 
     if method not in ("generateContent", "streamGenerateContent"):
         return jsonify(wire_gemini.error_payload(
