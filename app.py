@@ -11278,6 +11278,72 @@ def _cli_connected(entry):
     return False, entry.get("default_method", "manual"), None
 
 
+# WHERE GLOBAL CLI INSTALLS ACTUALLY LIVE.
+#
+# shutil.which() searches the PATH of THIS process, and the hub's PATH is not
+# the user's. A hub started from a shortcut, a scheduled task, a service, or
+# simply a different shell than the one npm configured does not inherit the
+# directories a package manager added to the interactive profile.
+#
+# REPORTED 2026-09-04: "i opened opencode now in terminal and he is connected
+# but he dont work with our hub". opencode was installed at
+# %APPDATA%\npm\opencode.cmd -- present, working, on the user's PATH, and
+# invisible to the hub, which therefore showed "Not installed (looked for:
+# opencode)" and never offered the Connect button that would have written the
+# provider block it was missing.
+#
+# So: PATH first, then the standard global-install roots. Ordered by how
+# authoritative they are, and every one of them is a per-user or system package
+# root -- nothing is guessed from a project directory.
+def _bin_search_dirs():
+    home = _home()
+    dirs = []
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+        local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        dirs += [
+            os.path.join(appdata, "npm"),                       # npm -g
+            os.path.join(local, "npm"),
+            os.path.join(home, ".bun", "bin"),                  # bun
+            os.path.join(home, ".deno", "bin"),
+            os.path.join(home, "scoop", "shims"),               # scoop
+            os.path.join(local, "Microsoft", "WinGet", "Links"),  # winget
+            os.path.join(home, ".local", "bin"),                # pipx / uv
+            os.path.join(local, "Programs", "Python", "Scripts"),
+        ]
+    else:
+        dirs += [
+            "/usr/local/bin", "/opt/homebrew/bin",              # brew
+            os.path.join(home, ".local", "bin"),                # pipx / uv / pip --user
+            os.path.join(home, ".bun", "bin"),
+            os.path.join(home, ".deno", "bin"),
+            os.path.join(home, ".npm-global", "bin"),
+            os.path.join(home, "n", "bin"),
+            "/snap/bin",
+        ]
+    return [d for d in dirs if os.path.isdir(d)]
+
+
+# On Windows an npm-installed CLI is a .cmd shim, not an .exe. Ordered by what
+# subprocess can actually launch: a .ps1 alone is not executable without a shell,
+# so it is last and only ever proves the tool is INSTALLED.
+_BIN_EXTS = ("", ".cmd", ".exe", ".bat", ".ps1") if os.name == "nt" else ("",)
+
+
+def _which_cli(name):
+    """shutil.which, plus the global-install roots this process's PATH may not
+    carry. Returns an absolute path or None."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in _bin_search_dirs():
+        for ext in _BIN_EXTS:
+            cand = os.path.join(d, name + ext)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
 def _cli_installed(entry):
     # Some tools are not a binary on PATH at all. Agent Zero is a Python web app
     # run from a checkout or a container, so "is it installed" is a question only
@@ -11287,7 +11353,7 @@ def _cli_installed(entry):
     if detector:
         return detector()
     for b in entry.get("bins", []):
-        p = shutil.which(b)
+        p = _which_cli(b)
         if p:
             return True, p
     # Some tools (e.g. OpenClaw) run as a daemon / via npx and aren't on the
@@ -11657,7 +11723,12 @@ def _autofix_opencode(entry, key, base_root, base_v1, model):
         "npm": "@ai-sdk/openai-compatible",
         "name": "Calvoun Free LLM Hub",
         "options": {"baseURL": base_v1, "apiKey": key},
-        "models": {model: {"name": model}},
+        # All three routing modes, not just the one being connected. The
+        # isolated /agent copy has always seeded auto/best/swarm, so a terminal
+        # opencode connected from the dashboard used to end up with strictly
+        # fewer choices than the same binary driven by /build -- and no way to
+        # ask for Swarm at all.
+        "models": {mid: {"name": mid} for mid in ("auto", "best", "swarm")},
     }
     data["provider"] = providers
     data["model"] = "free-llm-hub/" + model

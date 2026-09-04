@@ -253,6 +253,11 @@ def test_kimi_autofix_never_echoes_the_key(monkeypatch):
 
 def test_kimi_installed_detection(monkeypatch):
     entry = app._get_cli_entry("kimi")
+    # Detection falls back to the global-install roots when PATH misses (see
+    # test_cli_detection_is_portable.py), so simulating "not installed" now
+    # means suppressing BOTH lookups -- kimi really is installed under the npm
+    # global directory on this machine, and the fallback correctly finds it.
+    monkeypatch.setattr(app, "_bin_search_dirs", lambda: [])
     monkeypatch.setattr(shutil, "which", lambda b: "/usr/local/bin/kimi" if b == "kimi" else None)
     installed, path = app._cli_installed(entry)
     assert installed is True
