@@ -14164,6 +14164,22 @@ _SWARM_HOP_DEADLINE = 150
 # longer fails the turn -- it falls through to single-model routing.
 _SWARM_TOOL_HOP_DEADLINE = 300
 
+# ...and how long to keep waiting for stragglers AFTER a member has produced a
+# usable tool call.
+#
+# The fan-out used to wait for every member, so one that never answers cost the
+# full deadline even when the turn was already answerable. MEASURED 2026-09-04
+# on a real tool turn: three of five answered, at 5s, 78s and 111s -- and the
+# request took 297 SECONDS, because the two that never answered burned the whole
+# budget. The user waited three extra minutes for an answer that had been
+# sitting there since 111s.
+#
+# The grace only starts once something has actually CALLED A TOOL, which is what
+# an agent turn needs. A prose-only answer does not start it: waiting longer is
+# exactly right while the only thing on the table is an answer the CLI cannot
+# execute. Best-of-N still gets its N whenever N models are willing to be quick.
+_SWARM_STRAGGLER_GRACE = 25
+
 
 def _dispatch_chat_with_deadline(pid, payload, deadline=None):
     """_dispatch_chat(..., stream=False) bounded by an OVERALL deadline.
@@ -14558,11 +14574,42 @@ def _swarm_tool_result(body):
         _record_chat_usage(hop_pid, hop_model, data, est)
         return (hop_pid, hop_model, data, msg)
 
+    # `ex.map` waited for EVERY member, which is why a turn cost the slowest one
+    # even after the answer was in hand. Collect as they finish instead, and
+    # once a tool call has arrived give the rest a short grace before moving on.
+    #
+    # NOT a `with` block: ThreadPoolExecutor.__exit__ calls shutdown(wait=True),
+    # which would join the very threads this is trying to stop waiting for and
+    # undo the whole change. Abandoned members are bounded by their own hop
+    # deadline and their sockets die with the provider's connection -- the same
+    # trade-off _dispatch_chat_with_deadline already documents.
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(picks)) as ex:
-        for r in ex.map(_run, picks):
-            if r:
-                results.append(r)
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(picks))
+    try:
+        pending = {ex.submit(_run, pm) for pm in picks}
+        deadline = time.monotonic() + _SWARM_TOOL_HOP_DEADLINE
+        cutoff = deadline
+        while pending:
+            remaining = cutoff - time.monotonic()
+            if remaining <= 0:
+                break
+            done, pending = concurrent.futures.wait(
+                pending, timeout=remaining,
+                return_when=concurrent.futures.FIRST_COMPLETED)
+            if not done:
+                break                      # nothing landed before the cutoff
+            for fut in done:
+                try:
+                    r = fut.result()
+                except Exception:                                # noqa: BLE001
+                    r = None
+                if r:
+                    results.append(r)
+            if cutoff == deadline and any((r[3] or {}).get("tool_calls")
+                                          for r in results):
+                cutoff = min(deadline, time.monotonic() + _SWARM_STRAGGLER_GRACE)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
     if not results:
         # LOG IT. The success line below sits after this early return, so a run
         # where NOTHING answered used to leave no trace at all -- five failing
