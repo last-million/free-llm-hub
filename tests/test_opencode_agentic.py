@@ -44,7 +44,9 @@ def test_opencode_is_offered_as_a_drivable_cli():
 def test_first_turn_runs_the_prompt_positionally(monkeypatch):
     monkeypatch.setattr(agentic_chat, "_system_prompt_addition", lambda *a, **k: "")
     argv = agentic_chat._build_argv(_Sess(), "/bin/opencode", "build me a page")
-    assert argv[-4:] == ["run", "--format", "json", "build me a page"]
+    # --auto since 2026-09-04: opencode denies every tool without it (see
+    # test_all_clis_get_tools.py), so the verified shape now carries it.
+    assert argv[-5:] == ["run", "--auto", "--format", "json", "build me a page"]
     assert "--session" not in argv
 
 

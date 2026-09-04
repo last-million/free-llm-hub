@@ -167,7 +167,7 @@ def test_opencode_max_and_swarm_name_the_hub_provider():
 
 def test_opencode_keeps_its_verified_argv_shape():
     argv = _argv("opencode", "swarm", native="s-3")
-    assert argv[:4] == ["BIN", "run", "--format", "json"]
+    assert argv[:5] == ["BIN", "run", "--auto", "--format", "json"]
     assert argv[argv.index("--session") + 1] == "s-3"
     assert argv[-1] == "do the thing"
 
