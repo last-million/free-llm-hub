@@ -10765,6 +10765,46 @@ def _p_opencode():
     return os.path.join(_xdg_config(), "opencode", "opencode.json")
 
 
+def _p_pi_models():
+    """Pi's model/provider overrides.
+
+    NOT ~/.pi/settings.json: that is the agent's own settings. Providers and
+    models live in ~/.pi/agent/models.json, which is the file Pi documents for
+    pointing at Ollama, vLLM, LM Studio or any other OpenAI-compatible
+    endpoint -- exactly our case."""
+    return os.path.join(_home(), ".pi", "agent", "models.json")
+
+
+def _p_agent_zero_roots():
+    """Where an Agent Zero checkout might live.
+
+    It is not a CLI on PATH: it is a Python web app, normally run from a git
+    checkout or a Docker image, so the only honest detection is finding the
+    checkout itself. models.py AND agent.py together are its root -- either
+    name alone is far too common to prove anything."""
+    home = _home()
+    cands = [os.path.join(home, "agent-zero"), os.path.join(home, "agent0"),
+             os.path.join(home, "git", "agent-zero"),
+             os.path.join(home, "projects", "agent-zero"),
+             os.path.join(home, "Documents", "agent-zero")]
+    if os.name == "nt":
+        cands += [r"C:\agent-zero", os.path.join(home, "Desktop", "agent-zero")]
+    return cands
+
+
+def _detect_agent_zero():
+    root = _agent_zero_root()
+    return (True, root) if root else (False, None)
+
+
+def _agent_zero_root():
+    for d in _p_agent_zero_roots():
+        if os.path.isfile(os.path.join(d, "models.py")) and \
+           os.path.isfile(os.path.join(d, "agent.py")):
+            return d
+    return None
+
+
 def _p_aider():
     return os.path.join(_home(), ".aider.conf.yml")
 
@@ -10830,6 +10870,48 @@ CLI_REGISTRY = [
         "default_method": "config",
         "hint": ("Installed. Set ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN/ANTHROPIC_MODEL, "
                  "or run Auto-fix to write the 'env' block of ~/.claude/settings.json."),
+    },
+    {
+        # Pi (pi.dev, earendil-works/pi): a coding-agent CLI with its own
+        # multi-provider LLM layer. It documents ~/.pi/agent/models.json as the
+        # place to add an OpenAI-compatible endpoint, which makes this a real
+        # one-click connect rather than a copy-paste card.
+        "id": "pi",
+        "name": "Pi",
+        "kind": "openai",
+        "bins": ["pi"],
+        "config_paths": [_p_pi_models()],
+        "config_means_installed": True,
+        "env_check": [],
+        "autofix": "pi",
+        "write_path": _p_pi_models(),
+        "default_method": "config",
+        "hint": ("Installed. Connect writes a 'free-llm-hub' provider into "
+                 "~/.pi/agent/models.json (api: openai-completions), then pick "
+                 "one of its models with /model."),
+    },
+    {
+        # Agent Zero (agent0ai/agent-zero): a Python web app, not a CLI, and it
+        # talks to providers through LiteLLM -- so it speaks our OpenAI surface
+        # natively. What it does NOT have is a config file we can safely write:
+        # the endpoint is chosen in its own Settings UI, and a Docker install
+        # keeps that inside the container. So this card detects and instructs;
+        # autofix is None on purpose rather than a button that does nothing.
+        "id": "agent-zero",
+        "name": "Agent Zero",
+        "kind": "openai",
+        "bins": [],
+        "detect": _detect_agent_zero,
+        "missing_hint": ("No Agent Zero checkout found. It is a web app, not a "
+                         "CLI -- clone agent0ai/agent-zero or run its Docker "
+                         "image, then reload this page."),
+        "config_paths": [],
+        "env_check": [],
+        "autofix": None,
+        "default_method": "manual",
+        "hint": ("Settings -> Chat Model: set provider to an OpenAI-compatible "
+                 "one, Base URL to this hub's /v1, and paste the key. It routes "
+                 "through LiteLLM, so the hub's OpenAI surface works as-is."),
     },
     {
         "id": "aider",
@@ -11197,6 +11279,13 @@ def _cli_connected(entry):
 
 
 def _cli_installed(entry):
+    # Some tools are not a binary on PATH at all. Agent Zero is a Python web app
+    # run from a checkout or a container, so "is it installed" is a question only
+    # its own detector can answer -- and answering it with shutil.which would be
+    # a permanent, confident "no".
+    detector = entry.get("detect")
+    if detector:
+        return detector()
     for b in entry.get("bins", []):
         p = shutil.which(b)
         if p:
@@ -11215,7 +11304,9 @@ def _cli_row(entry):
     connected, method, cdetail = _cli_connected(entry)
     if not installed:
         connected = False  # can't be "connected" if the binary isn't on PATH
-        detail = "Not installed (looked for: %s)." % ", ".join(entry.get("bins", []))
+        looked = ", ".join(entry.get("bins", []))
+        detail = ("Not installed (looked for: %s)." % looked if looked
+                  else entry.get("missing_hint") or "Not detected on this machine.")
     elif connected:
         detail = cdetail
     else:
@@ -11447,6 +11538,80 @@ def _autofix_claude(entry, key, base_root, base_v1, model):
         "applied": {"file_key": "env", "ANTHROPIC_BASE_URL": base_root,
                     "ANTHROPIC_AUTH_TOKEN": _mask_key(key), "ANTHROPIC_MODEL": "auto"},
         "restart_hint": "Restart Claude Code (open a new terminal) so it re-reads ~/.claude/settings.json.",
+    }
+
+
+# Pi wants a FULL model definition, not just an id: it has no catalog of its own
+# for a provider it has never heard of, and a model missing contextWindow or
+# maxTokens either fails to load or is treated as tiny. These three virtual ids
+# are the hub's own routing modes, so their window is whatever the model that
+# wins the route has -- the figure below is a conservative floor that every
+# model the hub will pick clears.
+_PI_MODELS = [
+    ("auto", "Auto (hub picks the best free model)"),
+    ("best", "Best (strongest models only)"),
+    ("swarm", "Swarm (several models, best answer wins)"),
+]
+_PI_CTX = 128000
+_PI_MAX_TOKENS = 8192
+
+
+def _pi_provider_block(key, base_v1):
+    return {
+        "name": "Calvoun Free LLM Hub",
+        "baseUrl": base_v1,
+        "apiKey": key,
+        "api": "openai-completions",
+        # NO authHeader. Pi documents it for a provider that "expects
+        # Authorization: Bearer but doesn't use a standard API" -- we ARE the
+        # standard API, so the openai-completions client already sends the
+        # bearer from apiKey, and setting it here would send the header twice.
+        "models": [{
+            "id": mid,
+            "name": label,
+            "contextWindow": _PI_CTX,
+            "maxTokens": _PI_MAX_TOKENS,
+            "input": ["text"],
+            # Free, and Pi shows a running cost -- reporting anything else would
+            # invent a bill that does not exist.
+            "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+            "reasoning": False,
+        } for mid, label in _PI_MODELS],
+    }
+
+
+def _autofix_pi(entry, key, base_root, base_v1, model):
+    path = _p_pi_models()
+    data = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:   # tolerate a BOM
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            data = {}                      # unparseable: the backup below is the safety net
+    backup = _backup_once(path)
+    abort = _abort_if_backup_failed(path, backup)
+    if abort:
+        return abort
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    # ADDITIVE: only our own key is touched, so any provider the user added
+    # stays exactly as it was.
+    providers["free-llm-hub"] = _pi_provider_block(key, base_v1)
+    data["providers"] = providers
+    _cli_write_text(path, json.dumps(data, indent=2) + "\n")
+    return {
+        "ok": True,
+        "wrote_path": path,
+        "backup_path": backup,
+        "applied": {"provider": "free-llm-hub", "baseUrl": base_v1,
+                    "api": "openai-completions", "apiKey": _mask_key(key),
+                    "models": [m[0] for m in _PI_MODELS]},
+        "restart_hint": ("Start pi and run /model, then pick free-llm-hub/auto "
+                         "(or best / swarm)."),
     }
 
 
@@ -11859,6 +12024,7 @@ def _autofix_kimi(entry, key, base_root, base_v1, model):
 
 _AUTOFIXERS = {
     "claude": _autofix_claude,
+    "pi": _autofix_pi,
     "aider": _autofix_aider,
     "opencode": _autofix_opencode,
     "qwen": _autofix_qwen,
@@ -11956,6 +12122,43 @@ def _disconnect_aider(entry):
             changed = True
     return {"restored_from_backup": False, "wrote_path": path,
             "changed": changed, "restart_hint": hint}
+
+
+def _disconnect_pi(entry):
+    """Strip ONLY our provider, never a blind restore of the first-connect
+    backup -- the same rule _disconnect_opencode follows, and for the same
+    reason: anything the user added afterwards must survive."""
+    path = entry["write_path"]
+    hint = "Restart pi so it re-reads ~/.pi/agent/models.json."
+    changed = False
+    deleted = False
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            providers = data.get("providers")
+            if isinstance(providers, dict) and providers.pop("free-llm-hub", None) is not None:
+                changed = True
+                if not providers:
+                    data.pop("providers", None)
+            if changed:
+                if data:
+                    _cli_write_text(path, json.dumps(data, indent=2) + "\n")
+                else:
+                    # The file existed only for us; leaving an empty object
+                    # behind is litter Pi would still parse on every start.
+                    try:
+                        os.remove(path)
+                        deleted = True
+                    except OSError:
+                        _cli_write_text(path, "{}\n")
+    return {"ok": True, "reverted_path": path if (changed or deleted) else None,
+            "detail": ("removed the free-llm-hub provider" if changed
+                       else "nothing of ours was in the file"),
+            "restart_hint": hint}
 
 
 def _disconnect_opencode(entry):
@@ -12333,6 +12536,7 @@ def _disconnect_kimi(entry):
 
 _DISCONNECTERS = {
     "claude": _disconnect_claude,
+    "pi": _disconnect_pi,
     "aider": _disconnect_aider,
     "opencode": _disconnect_opencode,
     "qwen": _disconnect_qwen,
