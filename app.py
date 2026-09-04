@@ -14145,6 +14145,25 @@ _SWARM_IDS = ("swarm", "team", "plan")
 # chain length, so the leak is small and self-cleaning.
 _SWARM_HOP_DEADLINE = 150
 
+# The TOOL fan-out gets its own, longer deadline. The 150s above was measured
+# against prose pipeline STAGES -- short, self-contained, and many per run, so a
+# tight per-stage bound is what keeps a whole crew from stalling. A CLI agent
+# turn is a different workload wearing the same clothes: the full system prompt,
+# every tool schema the CLI declares, and the whole conversation so far, all
+# dispatched NON-STREAMING so the model must finish generating before a single
+# byte comes back. On free-tier models that routinely passes 150s.
+#
+# MEASURED 2026-09-04: five consecutive opencode build turns, 152/156/157/162/
+# 168 seconds, every one of them 0-of-5 members answering -- durations clustered
+# just above the deadline, which is what a deadline looks like when it is the
+# thing doing the killing.
+#
+# Raised, not removed: an unbounded fan-out can hold a turn open for as long as
+# the slowest provider feels like trickling keepalives (the 24-minute hostage in
+# the note above). And it is now safe to be generous, because missing it no
+# longer fails the turn -- it falls through to single-model routing.
+_SWARM_TOOL_HOP_DEADLINE = 300
+
 
 def _dispatch_chat_with_deadline(pid, payload, deadline=None):
     """_dispatch_chat(..., stream=False) bounded by an OVERALL deadline.
@@ -14482,7 +14501,8 @@ def _swarm_tool_result(body):
         payload = dict(body)
         payload["model"] = hop_model
         payload["stream"] = False        # fan-out cannot stream; re-emitted below
-        resp, _exc = _dispatch_chat_with_deadline(hop_pid, payload, _SWARM_HOP_DEADLINE)
+        resp, _exc = _dispatch_chat_with_deadline(hop_pid, payload,
+                                                  _SWARM_TOOL_HOP_DEADLINE)
         if resp is None:
             _record_outcome(hop_pid, hop_model, False)
             return None
@@ -14512,6 +14532,21 @@ def _swarm_tool_result(body):
         if not msg.get("tool_calls") and body.get("tools"):
             if tool_rescue.rescue(data, body.get("tools")):
                 msg = ((data.get("choices") or [{}])[0].get("message") or {})
+        # A REFUSAL is not an answer either, and this is how the reported build
+        # actually died. MEASURED 2026-09-04, 02:51:34: "1/5 models answered, 0
+        # used a tool" -- the one member that replied wrote "Blocked. Every tool
+        # call needs approval ... run `/permissions` and allow Write, Edit,
+        # Bash(python:*)". The session was OPENCODE, which has no /permissions
+        # command, no Edit tool and no Bash(...) syntax: the model invented a
+        # Claude Code refusal wholesale. Nothing rejected it, so it won the slot
+        # and became the whole turn's answer, and the user read it as the hub
+        # denying permissions.
+        #
+        # _chat_json_nonanswer has treated a refusal as a non-answer on the
+        # single-model path for a while; the fan-out simply never asked.
+        if not msg.get("tool_calls") and _looks_like_refusal(msg.get("content")):
+            _note_nonanswer(hop_pid, hop_model)
+            return None
         if not msg.get("tool_calls") and (
                 _looks_like_text_tool_call(msg.get("content"))
                 or _looks_like_announced_not_acted(msg.get("content"))):
@@ -14529,6 +14564,14 @@ def _swarm_tool_result(body):
             if r:
                 results.append(r)
     if not results:
+        # LOG IT. The success line below sits after this early return, so a run
+        # where NOTHING answered used to leave no trace at all -- five failing
+        # turns in a row produced an empty log and a 503 with no model recorded,
+        # which is the hardest possible shape to diagnose. The failing case is
+        # the one worth a line.
+        _log.warning("[swarm-tools] 0/%d models answered in %ds -> %s",
+                     len(picks), _SWARM_TOOL_HOP_DEADLINE,
+                     ", ".join(p + "/" + m for p, m in picks))
         return None
 
     # WINNER. A turn that needs an action is served by a model that took one:
@@ -14707,9 +14750,24 @@ def _swarm_completion(body):
         out = _swarm_tool_turn(body)
         if out is not None:
             return out
-        return _openai_error(
-            "No model could serve this tool-calling turn right now.", 503,
-            "upstream_error")
+        # ...and this is what "falling through" has to mean, because it did not.
+        #
+        # REPORTED 2026-09-04: five consecutive /agent build turns from opencode
+        # came back 503, each after ~155s, with no model recorded. The comment
+        # directly above already promised the fall-through, and
+        # _swarm_tool_result's docstring promises it twice ("so the caller can
+        # fall through to ordinary single-model routing") -- but the code
+        # returned a hard 503 instead, so choosing Swarm made a turn STRICTLY
+        # more likely to die than choosing Normal. The better mode was the
+        # riskier one.
+        #
+        # 'best', not 'auto': asking for Swarm is asking for the strongest
+        # models available, and that intent should survive the fan-out failing.
+        _log.info("[swarm-tools] nothing usable from the fan-out -> "
+                  "falling back to single-model routing")
+        fallback = dict(body)
+        fallback["model"] = "best"
+        return _chat_completions_uncached(fallback)
     messages = body.get("messages") or []
     if not messages:
         return _openai_error("messages is required.", 400)
@@ -14725,9 +14783,15 @@ def _swarm_completion(body):
         text = swarm.format_answer(result)
     _act_pipeline_result(result)
     if not text:
-        return _openai_error(
-            "Every model in the swarm failed — no provider answered. Check the "
-            "Providers page.", 503)
+        # Same reasoning as the tool path above: a pipeline that produced
+        # nothing must not be the reason the user gets no answer at all. One
+        # more single-model attempt costs far less than the fan-out that just
+        # failed, and it is the difference between a reply and a 503.
+        _log.info("[swarm] pipeline produced no text -> falling back to "
+                  "single-model routing")
+        fallback = dict(body)
+        fallback["model"] = "best"
+        return _chat_completions_uncached(fallback)
     out = {
         "id": "chatcmpl-swarm-" + uuid.uuid4().hex,
         "object": "chat.completion",
