@@ -5039,6 +5039,46 @@ def _rotate_band(ordered):
     return band[off:] + band[:off] + rest
 
 
+# RELIABILITY BANDS for ordering the fallback chain.
+#
+# The chain already carried a reliability PENALTY, which is a nudge inside a
+# score that is dominated by benchmark strength. That is the right shape when a
+# bad hop costs one quick retry -- the assumption the penalty was designed
+# around, and _swarm_reliability's docstring states it outright: "there a bad
+# hop costs one retry".
+#
+# It is the wrong shape when the failure is a HANG. MEASURED 2026-09-04 on a
+# real opencode turn: three requests sat in_progress for 230, 281 and 282
+# seconds against nvidia/deepseek-v4-flash-0731, a model measured at 0.05 -- one
+# delivery in twenty. And the chain for a tool turn led with four g4f hops at
+# 0.50/0.33/0.33/0.33 while groq/qwen3.8-27b at 0.72 waited at hop FIVE. Four
+# stalls before a model that answers.
+#
+# So: coarse BANDS, not a continuous sort. A continuous sort by reliability
+# would hand the chain to whatever happens to have answered twice, throwing away
+# the benchmark ordering entirely; bands keep strength deciding WITHIN a band
+# and only stop a measured-bad model from outranking a measured-good one.
+#
+# Untried sits in the middle band on purpose: unknown deserves a slot before the
+# demonstrably broken, and behind the demonstrably working. Nothing is dropped
+# -- a model has to be tried to ever earn a record.
+_CHAIN_RELIABLE = 0.60      # measured: it delivers
+_CHAIN_UNRELIABLE = 0.35    # measured: it mostly does not
+
+
+def _chain_reliability_band(pid, model):
+    """0 = delivers, 1 = unknown or middling, 2 = measured to fail."""
+    rel = _reliability(pid, model)
+    known = _swarm_has_record(pid, model)
+    if not known:
+        return 1
+    if rel >= _CHAIN_RELIABLE:
+        return 0
+    if rel < _CHAIN_UNRELIABLE:
+        return 2
+    return 1
+
+
 def _interleave_by_provider(ordered):
     """Re-arrange a strength-sorted [(score, pid, model), ...] list so
     consecutive entries favor DIFFERENT providers: round 1 = each provider's
@@ -5199,6 +5239,18 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # chain to choose one), or the one it had is exactly what the user just
         # rejected. Either way the ranked candidates below become the chain.
         chain, seen = [], set()
+    elif _chain_reliability_band(primary_pid, model_id) >= 2:
+        # A MEASURED-TO-FAIL primary is not seeded at hop 1. It stays a
+        # candidate below -- it is never dropped, and if nothing healthier is
+        # available the ranked list puts it back -- but it does not get to open
+        # the turn.
+        #
+        # MEASURED 2026-09-04: the primary pick lands on a band-2 model roughly
+        # one turn in twenty-five, and one of those cost 280 seconds of
+        # in_progress before failing. Leading with a model that answers one time
+        # in twenty is not a retry, it is a stall, and on a long build that is a
+        # five-minute hole every twenty-odd turns.
+        chain, seen = [], set()
     else:
         chain = [(primary_pid, model_id)]
         seen = {(primary_pid, model_id)}
@@ -5266,9 +5318,27 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # because nothing here ever checked _is_tool_proven. Unproven models are
         # NOT dropped — only demoted to a last-resort tail — so a request still
         # gets served if every proven option is exhausted/throttled.
-        _proven_ordered = [e for e in ordered if _is_tool_proven(e[2])]
+        # Reliability bands, applied BEFORE the tool-proven split so that split
+        # stays the dominant grouping (for a tool turn, "can it call a tool at
+        # all" outranks "does it usually answer") while this decides the order
+        # within each group. A STABLE sort, so the interleaving above and the
+        # strength ordering behind it both survive inside a band.
+        ordered.sort(key=lambda e: _chain_reliability_band(e[1], e[2]))
+        # MEASURED-TO-FAIL goes behind everything, proven or not.
+        #
+        # _is_tool_proven is an allowlist -- a coarse statement about a model
+        # FAMILY. A band-2 reliability is evidence about this exact listing, and
+        # evidence beats an allowlist: a proven-family model that answers one
+        # time in three, taking four minutes to not answer, is worse than an
+        # unproven one that replies. Without this the split below regrouped the
+        # 0.33 hops ahead of every healthy non-proven model again, which is the
+        # ordering that produced the reported stall.
+        _sick = [e for e in ordered if _chain_reliability_band(e[1], e[2]) >= 2]
+        _fit = [e for e in ordered if _chain_reliability_band(e[1], e[2]) < 2]
+        _proven_ordered = [e for e in _fit if _is_tool_proven(e[2])]
         if _proven_ordered:
-            ordered = _proven_ordered + [e for e in ordered if not _is_tool_proven(e[2])]
+            _fit = _proven_ordered + [e for e in _fit if not _is_tool_proven(e[2])]
+        ordered = _fit + _sick
         # LOW-QUALITY TAIL, AFTER proven-first (see _LOW_QUALITY_RE): the proven
         # allowlist still names nemotron/gpt-oss, so proven-first alone walked the
         # chain straight onto the demoted families while glm-4.7/kimi-k2.6 sat
