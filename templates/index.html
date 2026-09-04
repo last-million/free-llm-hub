@@ -941,6 +941,42 @@
   }
   .keyrow-use.idle{opacity:.6}
   .keyrow-use.bad{color:var(--danger,#e5534b);border-color:currentColor}
+  /* ---- rendered Markdown in agent replies ---- */
+  .bubble.md{line-height:1.62}
+  .md .md-p{margin:0 0 10px}
+  .md > .md-p:last-child{margin-bottom:0}
+  .md .md-h{margin:16px 0 8px;line-height:1.3;font-weight:650}
+  .md > .md-h:first-child{margin-top:0}
+  .md h1.md-h{font-size:1.35em} .md h2.md-h{font-size:1.2em}
+  .md h3.md-h{font-size:1.08em} .md h4.md-h,.md h5.md-h,.md h6.md-h{font-size:1em}
+  .md .md-list{margin:0 0 10px;padding-left:22px;display:flex;flex-direction:column;gap:4px}
+  .md .md-list li{line-height:1.55}
+  .md code{
+    font-family:var(--mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:.9em;
+    background:var(--surface-2,rgba(127,127,127,.12));border-radius:4px;padding:1px 5px;
+  }
+  .md .md-code{
+    margin:0 0 12px;padding:11px 13px;border-radius:var(--radius-sm,7px);
+    background:var(--surface-2,rgba(127,127,127,.1));border:1px solid var(--border-soft);
+    overflow-x:auto;position:relative;
+  }
+  .md .md-code code{background:none;padding:0;font-size:12px;line-height:1.55;white-space:pre}
+  .md .md-code[data-lang]::before{
+    content:attr(data-lang);position:absolute;top:5px;right:9px;
+    font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-faint);
+  }
+  .md .md-quote{
+    margin:0 0 12px;padding:2px 0 2px 12px;border-left:2px solid var(--border);
+    color:var(--text-dim);
+  }
+  .md .md-hr{border:0;border-top:1px solid var(--border-soft);margin:14px 0}
+  .md .md-tablewrap{overflow-x:auto;margin:0 0 12px}
+  .md .md-table{border-collapse:collapse;font-size:12.5px;min-width:100%}
+  .md .md-table th,.md .md-table td{
+    border:1px solid var(--border-soft);padding:5px 9px;text-align:left;vertical-align:top;
+  }
+  .md .md-table th{background:var(--surface-2,rgba(127,127,127,.08));font-weight:600}
+  .md a{color:var(--accent);text-decoration:underline;text-underline-offset:2px}
   /* measured speed, shown next to the benchmark score */
   .sd-speed{
     margin-left:auto;font-size:10.5px;font-variant-numeric:tabular-nums;
@@ -3687,6 +3723,169 @@
     }
     return [];
   }
+  /* ---------- Markdown ----------
+     Agents answer in Markdown -- headings, fenced code, tables, lists -- and
+     /agent was printing it as literal text, so a reply arrived as a wall of
+     asterisks and backticks. This renders it.
+
+     SECURITY, and the reason this is written out rather than pulled from a CDN:
+     the text comes from a model, which means it is untrusted. Every character
+     is HTML-ESCAPED FIRST and the Markdown transforms then run over the escaped
+     text, so there is no path by which model output can inject markup. A
+     library that accepts raw HTML by default (most of them) would have handed
+     that capability to whatever the agent happened to echo back -- including
+     the contents of a file it just read.
+
+     Link hrefs are additionally checked against a scheme allowlist, because an
+     escaped [x](javascript:...) is still a working link once it becomes an
+     <a>. */
+  function mdEsc(t){
+    return String(t == null ? '' : t)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function mdSafeHref(url){
+    var u = String(url || '').trim();
+    /* http(s), anchors and root-relative only. Anything else -- javascript:,
+       data:, vbscript: -- renders as plain text instead of a link. */
+    return /^(https?:\/\/|#|\/)[^\s]*$/i.test(u) ? u : null;
+  }
+
+  function mdInline(t){
+    /* Runs on ALREADY-ESCAPED text. Order matters: code spans first, so their
+       contents are not treated as emphasis. */
+    var codes = [];
+    t = t.replace(/`([^`\n]+)`/g, function(_m, c){
+      codes.push(c); return '\u0000CODE' + (codes.length - 1) + '\u0000';
+    });
+    t = t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function(m, label, url){
+      var href = mdSafeHref(url);
+      return href ? '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' +
+                    label + '</a>' : m;
+    });
+    t = t.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>');
+    t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    t = t.replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    t = t.replace(/(^|[\s(])_([^_\n]+)_/g, '$1<em>$2</em>');
+    t = t.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+    return t.replace(/\u0000CODE(\d+)\u0000/g, function(_m, i){
+      return '<code>' + codes[+i] + '</code>';
+    });
+  }
+
+  function mdTableRow(line){
+    var cells = line.trim().replace(/^\||\|$/g, '').split('|');
+    return cells.map(function(c){ return c.trim(); });
+  }
+
+  function mdToHtml(src){
+    var text = mdEsc(src).replace(/\r\n?/g, '\n');
+    var lines = text.split('\n'), out = [], i = 0;
+
+    function closeList(stack){
+      while (stack.length) out.push('</' + stack.pop() + '>');
+    }
+    var listStack = [];
+
+    while (i < lines.length){
+      var line = lines[i];
+
+      /* fenced code. An UNCLOSED fence runs to the end on purpose: while a
+         reply is still streaming the fence has not arrived yet, and showing the
+         partial block as code is what it is going to become. */
+      var fence = line.match(/^\s*```+\s*([A-Za-z0-9_+-]*)\s*$/);
+      if (fence){
+        closeList(listStack);
+        var body = [];
+        i++;
+        while (i < lines.length && !/^\s*```+\s*$/.test(lines[i])) body.push(lines[i++]);
+        i++;                                   /* skip the closing fence if present */
+        out.push('<pre class="md-code"' + (fence[1] ? ' data-lang="' + fence[1] + '"' : '') +
+                 '><code>' + body.join('\n') + '</code></pre>');
+        continue;
+      }
+
+      /* table: a header row followed by a |---|---| separator */
+      if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length &&
+          /^\s*\|?[\s:-]*-[\s:|-]*\|?\s*$/.test(lines[i + 1]) && lines[i + 1].indexOf('-') >= 0){
+        closeList(listStack);
+        var head = mdTableRow(line);
+        i += 2;
+        var rows = [];
+        while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) rows.push(mdTableRow(lines[i++]));
+        out.push('<div class="md-tablewrap"><table class="md-table"><thead><tr>' +
+          head.map(function(c){ return '<th>' + mdInline(c) + '</th>'; }).join('') +
+          '</tr></thead><tbody>' +
+          rows.map(function(r){
+            return '<tr>' + r.map(function(c){ return '<td>' + mdInline(c) + '</td>'; }).join('') + '</tr>';
+          }).join('') + '</tbody></table></div>');
+        continue;
+      }
+
+      var h = line.match(/^\s*(#{1,6})\s+(.*)$/);
+      if (h){
+        closeList(listStack);
+        var lvl = Math.min(6, h[1].length);
+        out.push('<h' + lvl + ' class="md-h">' + mdInline(h[2].trim()) + '</h' + lvl + '>');
+        i++; continue;
+      }
+
+      if (/^\s*(---+|\*\*\*+|___+)\s*$/.test(line)){
+        closeList(listStack);
+        out.push('<hr class="md-hr">'); i++; continue;
+      }
+
+      var qm = line.match(/^\s*&gt;\s?(.*)$/);      /* '>' is already escaped */
+      if (qm){
+        closeList(listStack);
+        var quote = [qm[1]];
+        i++;
+        while (i < lines.length && /^\s*&gt;\s?/.test(lines[i])){
+          quote.push(lines[i].replace(/^\s*&gt;\s?/, '')); i++;
+        }
+        out.push('<blockquote class="md-quote">' + mdInline(quote.join(' ')) + '</blockquote>');
+        continue;
+      }
+
+      var ul = line.match(/^(\s*)[-*+]\s+(.*)$/);
+      var ol = line.match(/^(\s*)\d+[.)]\s+(.*)$/);
+      if (ul || ol){
+        var want = ul ? 'ul' : 'ol';
+        if (!listStack.length || listStack[listStack.length - 1] !== want){
+          closeList(listStack);
+          listStack.push(want);
+          out.push('<' + want + ' class="md-list">');
+        }
+        out.push('<li>' + mdInline((ul || ol)[2]) + '</li>');
+        i++; continue;
+      }
+
+      if (!line.trim()){ closeList(listStack); i++; continue; }
+
+      /* paragraph: consecutive non-blank, non-special lines */
+      closeList(listStack);
+      var para = [line];
+      i++;
+      while (i < lines.length && lines[i].trim() &&
+             !/^\s*(```|#{1,6}\s|&gt;|[-*+]\s|\d+[.)]\s|\|)/.test(lines[i]) &&
+             !/^\s*(---+|\*\*\*+|___+)\s*$/.test(lines[i])){
+        para.push(lines[i++]);
+      }
+      out.push('<p class="md-p">' + mdInline(para.join('\n')).replace(/\n/g, '<br>') + '</p>');
+    }
+    closeList(listStack);
+    return out.join('');
+  }
+
+  /* Set a bubble's content from Markdown, falling back to plain text if the
+     renderer ever throws -- a formatting bug must never lose the answer. */
+  function setMd(el, text){
+    if (!el) return;
+    try { el.innerHTML = mdToHtml(text); el.classList.add('md'); }
+    catch (e){ el.textContent = String(text == null ? '' : text); }
+  }
+
   function copyText(txt, btn){
     function done(ok){
       if (!btn) return;
@@ -5531,7 +5730,9 @@
     function appendBubble(role, who, text){
       var wrap = document.createElement('div'); wrap.className = 'msg ' + role;
       var w = document.createElement('span'); w.className = 'who'; w.textContent = who;
-      var b = document.createElement('div'); b.className = 'bubble'; b.textContent = text;
+      var b = document.createElement('div'); b.className = 'bubble';
+      if (role === 'agent' || role === 'assistant') setMd(b, text);
+      else b.textContent = text;
       wrap.appendChild(w); wrap.appendChild(b);
       msgsEl.appendChild(wrap);
       msgsEl.scrollTop = msgsEl.scrollHeight;
@@ -8707,7 +8908,9 @@
     function appendAgentBubble(role, who, text){
       var wrap = document.createElement('div'); wrap.className = 'msg ' + role;
       var w = document.createElement('span'); w.className = 'who'; w.textContent = who;
-      var b = document.createElement('div'); b.className = 'bubble'; b.textContent = text;
+      var b = document.createElement('div'); b.className = 'bubble';
+      if (role === 'agent' || role === 'assistant') setMd(b, text);
+      else b.textContent = text;
       wrap.appendChild(w); wrap.appendChild(b);
       msgsEl.appendChild(wrap);
       msgsEl.scrollTop = msgsEl.scrollHeight;
@@ -8792,7 +8995,7 @@
         }
         else if (ev.event === 'output') line('out', ev.text);
         else if (ev.event === 'notice') line('notice', ev.text);
-        else if (ev.event === 'message'){ finalText = ev.text; ans.textContent = ev.text; msgsEl.scrollTop = msgsEl.scrollHeight; }
+        else if (ev.event === 'message'){ finalText = ev.text; setMd(ans, ev.text); msgsEl.scrollTop = msgsEl.scrollHeight; }
         else if (ev.event === 'done'){ finalText = ev.text || finalText; ans.textContent = finalText || '(done)'; }
         else if (ev.event === 'stopped') line('notice', 'Stopped.');
         else if (ev.event === 'error'){

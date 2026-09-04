@@ -1598,7 +1598,21 @@ def _build_argv_opencode(sess: "_Session", bin_path: str, text: str):
             text, has_brief=write_task_brief(sess.project_dir, text))
     prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
         if addition else text
-    args = ["run", "--format", "json"]
+    # --auto: "auto-approve permissions that are not explicitly denied".
+    #
+    # It defaults to FALSE, which in non-interactive `run` mode means every tool
+    # is denied and there is no prompt to answer -- so the agent can read
+    # nothing and write nothing. MEASURED on a real build turn (session
+    # b513710b..., 2026-09-04): four and a half minutes spent, and the entire
+    # answer was "Blocked: no tool permissions granted in this session. Read,
+    # Write, Bash, PowerShell all denied -- cannot create files yet."
+    #
+    # claude has carried --dangerously-skip-permissions and codex
+    # --dangerously-bypass-approvals-and-sandbox since this module was written;
+    # opencode was simply missed, which made it the one backend that could not
+    # do the job this module exists for. This module's contract, stated in its
+    # first paragraph, is full tool access against a folder the user picked.
+    args = ["run", "--auto", "--format", "json"]
     # opencode wants provider/model. NOT gated on _hub_backs: unlike claude and
     # codex, opencode is not a subscription -- it brings no provider of its own
     # and is signed in to whatever the user configured, while the hub-seeded
