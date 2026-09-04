@@ -274,7 +274,13 @@ def test_the_grace_can_never_exceed_the_deadline():
 
 
 def test_the_grace_is_long_enough_for_a_close_second():
-    assert 10 <= A._SWARM_STRAGGLER_GRACE <= 60
+    """Widened from 25 to 90 on request once the trade was visible: the 25s
+    version answered 1-of-5, because members measured at 78s and 111s were cut
+    off by a first answer at 5s. The upper bound is the hop deadline, which
+    bounds it for real -- a fixed ceiling here was just this test's own
+    assumption about the value at the time."""
+    assert A._SWARM_STRAGGLER_GRACE >= 10
+    assert A._SWARM_STRAGGLER_GRACE < A._SWARM_TOOL_HOP_DEADLINE
 
 
 def test_the_executor_is_not_joined_on_the_way_out():
