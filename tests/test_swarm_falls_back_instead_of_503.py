@@ -240,3 +240,56 @@ def test_a_refusing_member_is_recorded_as_a_non_answer():
     src = open("app.py", encoding="utf-8").read()
     i = src.index('if not msg.get("tool_calls") and _looks_like_refusal')
     assert "_note_nonanswer" in src[i:i + 200]
+
+
+# --------------------------------------------------------------------------- #
+# It stops waiting once the turn is answerable
+# --------------------------------------------------------------------------- #
+
+def test_it_no_longer_waits_for_every_member():
+    """MEASURED 2026-09-04 on a real tool turn: three of five answered, at 5s,
+    78s and 111s -- and the request took 297 SECONDS, because the two that never
+    answered burned the whole budget. Three extra minutes for an answer that had
+    been sitting there since 111s."""
+    src = open("app.py", encoding="utf-8").read()
+    body = src.split("def _swarm_tool_result(", 1)[1]
+    body = body[:body.index("\ndef ")]
+    assert "ex.map(_run" not in body, "ex.map waits for the slowest member"
+    assert "FIRST_COMPLETED" in body
+
+
+def test_the_grace_starts_only_once_a_tool_was_called():
+    """A prose-only answer must NOT start it: waiting longer is exactly right
+    while the only thing on the table is something the CLI cannot execute."""
+    src = open("app.py", encoding="utf-8").read()
+    i = src.index("_SWARM_STRAGGLER_GRACE)")
+    window = src[max(0, i - 400):i]
+    assert 'get("tool_calls")' in window
+
+
+def test_the_grace_can_never_exceed_the_deadline():
+    src = open("app.py", encoding="utf-8").read()
+    i = src.index("_SWARM_STRAGGLER_GRACE)")
+    assert "min(deadline" in src[max(0, i - 200):i + 60]
+
+
+def test_the_grace_is_long_enough_for_a_close_second():
+    assert 10 <= A._SWARM_STRAGGLER_GRACE <= 60
+
+
+def test_the_executor_is_not_joined_on_the_way_out():
+    """ThreadPoolExecutor.__exit__ calls shutdown(wait=True), which would join
+    the very threads this stopped waiting for and undo the whole change."""
+    src = open("app.py", encoding="utf-8").read()
+    body = src.split("def _swarm_tool_result(", 1)[1]
+    body = body[:body.index("\ndef ")]
+    assert "shutdown(wait=False, cancel_futures=True)" in body
+    assert "with concurrent.futures.ThreadPoolExecutor" not in body
+
+
+def test_a_member_that_raises_does_not_lose_the_others():
+    src = open("app.py", encoding="utf-8").read()
+    body = src.split("def _swarm_tool_result(", 1)[1]
+    body = body[:body.index("\ndef ")]
+    i = body.index("fut.result()")
+    assert "except Exception" in body[i:i + 200]
