@@ -13695,19 +13695,17 @@ def v1_models():
     # is listed FIRST so a CLI that validates its configured model — or just takes
     # the first row as its default — lands on the orchestrator instead of being
     # pinned to one provider's model for every request.
-    auto = {"id": "auto", "object": "model", "created": 0, "owned_by": "free-llm-hub",
-            "display_name": "auto (orchestrated — best free model per task)"}
-    # Virtual pipeline models (the SWARM/CREWS section below): selectable ids that
-    # run the multi-phase pipeline instead of a single model.
+    # Every mode the hub serves as a model, from the one shared list -- 'auto'
+    # first so a CLI that takes row 1 as its default lands on the orchestrator
+    # rather than being pinned to one provider for every request.
     virtual = [{"id": mid, "object": "model", "created": 0,
                 "owned_by": "free-llm-hub",
-                "display_name": mid + " (multi-model pipeline)"}
-               for mid in _SWARM_IDS + tuple(crews.CREW_IDS)]
+                "display_name": _virtual_model_label(mid)}
+               for mid in _virtual_model_ids()]
     rows = [_codex_model_entry(m) for m in agg]
     return jsonify({"object": "list",
-                    "data": [auto] + virtual + rows,
-                    "models": [dict(auto, slug="auto")]
-                              + [dict(v, slug=v["id"]) for v in virtual]
+                    "data": virtual + rows,
+                    "models": [dict(v, slug=v["id"]) for v in virtual]
                               + [dict(_codex_model_entry(m), slug=m["id"]) for m in agg]})
 
 
@@ -14477,6 +14475,30 @@ def _with_headers(resp_tuple, headers):
 # "crew-research", ...; bare "crew" auto-detects); see crews.py.
 # --------------------------------------------------------------------------- #
 _SWARM_IDS = ("swarm", "team", "plan")
+
+# Every VIRTUAL model id the hub serves, in the order a picker should show them:
+# the two routing modes first, then the pipelines.
+#
+# This exists because "best" -- the dashboard's MAX mode -- was missing from all
+# three model listings while working perfectly when typed. Each listing had
+# built its own `[auto] + _SWARM_IDS + CREW_IDS`, and none of them included it,
+# so every CLI's /model picker offered Normal and Swarm and silently dropped
+# Max. One list, used by all three, so the next mode cannot be forgotten in two
+# places out of three.
+_VIRTUAL_MODEL_LABELS = {
+    "auto": "auto (orchestrated — best free model per task)",
+    "best": "best (Max — strongest free models only)",
+}
+
+
+def _virtual_model_label(mid):
+    """What a picker shows next to the id. The two routing MODES say what they
+    do; everything else is a pipeline."""
+    return _VIRTUAL_MODEL_LABELS.get(mid, mid + " (multi-model pipeline)")
+
+
+def _virtual_model_ids():
+    return ("auto", "best") + _SWARM_IDS + tuple(crews.CREW_IDS)
 
 # Total deadline for ONE swarm/crew stage hop. Swarm stages dispatch
 # non-streaming, so they get neither the streaming first-byte peek (~25-90s)
@@ -15540,8 +15562,7 @@ def ollama_tags():
         return _ollama_off()
     # 'auto' first: it is the id that actually routes, and Ollama clients pick
     # whatever is at the top of the list by default.
-    rows = [{"id": "auto", "provider": "free-llm-hub"}]
-    rows += [{"id": m, "provider": "free-llm-hub"} for m in (_SWARM_IDS + tuple(crews.CREW_IDS))]
+    rows = [{"id": m, "provider": "free-llm-hub"} for m in _virtual_model_ids()]
     rows += [{"id": m["id"], "provider": m.get("provider")} for m in aggregated_models()]
     return jsonify(wire_ollama.tags_payload(rows))
 
@@ -15637,8 +15658,7 @@ def ollama_generate():
 # --------------------------------------------------------------------------- #
 
 def _gemini_models():
-    rows = [{"id": "auto", "context_window": None}]
-    rows += [{"id": m, "context_window": None} for m in (_SWARM_IDS + tuple(crews.CREW_IDS))]
+    rows = [{"id": m, "context_window": None} for m in _virtual_model_ids()]
     rows += [{"id": m["id"], "context_window": m.get("context_window")}
              for m in aggregated_models()]
     return rows
