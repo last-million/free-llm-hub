@@ -14177,8 +14177,15 @@ _SWARM_TOOL_HOP_DEADLINE = 300
 # The grace only starts once something has actually CALLED A TOOL, which is what
 # an agent turn needs. A prose-only answer does not start it: waiting longer is
 # exactly right while the only thing on the table is an answer the CLI cannot
-# execute. Best-of-N still gets its N whenever N models are willing to be quick.
-_SWARM_STRAGGLER_GRACE = 25
+# execute.
+#
+# 25s first, then 90s -- asked for directly ("fewest no-answer, slowest turns")
+# once the trade was visible. 25 bought the 297s -> 97s win and then showed its
+# cost: the run that produced it answered 1-of-5, because the members measured
+# at 78s and 111s were cut off by a first answer at 5s. 90 covers that spread
+# while still ending a turn in roughly the time the 25s version took, since the
+# clock starts at the FIRST answer and not at the request.
+_SWARM_STRAGGLER_GRACE = 90
 
 
 def _dispatch_chat_with_deadline(pid, payload, deadline=None):
@@ -14383,6 +14390,24 @@ def _swarm_reliability(pid, model):
     return (ok + 1.0) / (ok + fail + 2.0)
 
 
+def _swarm_has_record(pid, model):
+    """Whether there is real evidence about this (pid, model), either its own or
+    its provider's.
+
+    _swarm_reliability returns a flat 0.5 for "no idea", which is the right
+    NUMBER -- an unmeasured model must not be judged -- but it makes an untried
+    model indistinguishable from a measured, mediocre one at ranking time. For
+    a fallback chain that hardly matters: an unknown that fails costs one retry.
+    For a swarm it costs a whole slot out of five, and the slot is the scarce
+    thing."""
+    if _reliability(pid, model) != 0.5:
+        return True
+    totals = _provider_outcome_totals(pid)
+    if not totals:
+        return False
+    return (totals["ok"] + totals["fail"]) >= _PROVIDER_PRIOR_MIN_SAMPLES
+
+
 def _swarm_rank(cands):
     """Order swarm candidates by what actually DELIVERS, and push the ones with
     a real record of not answering to the back.
@@ -14412,10 +14437,29 @@ def _swarm_rank(cands):
     ranked = sorted(cands, reverse=True,
                     key=lambda pm: _agentic_score((_benchmark_score(pm[0], pm[1]),
                                                    pm[0], pm[1])))
-    healthy = [pm for pm in ranked
-               if _swarm_reliability(pm[0], pm[1]) >= _SWARM_MIN_RELIABILITY]
-    weak = [pm for pm in ranked if pm not in healthy]
-    ordered = healthy + weak
+    # THREE tiers, not two. Splitting on the reliability number alone put
+    # "measured, delivers" and "never tried" in the same bucket, because an
+    # unknown scores a neutral 0.5 and 0.5 >= the health bar. So an untried
+    # model could take a slot ahead of one with a measured record of answering,
+    # and untried models are where "no answer" comes from.
+    #
+    # ASKED 2026-09-04: "why some models have no answer in swarm ... can this be
+    # fixed". This is the half that can: the hub was already recording who
+    # delivers (_record_outcome on every hop), and the swarm was reading the
+    # score without asking whether there was any evidence behind it.
+    #
+    # Unknowns are demoted, never dropped -- a model has to get its first slot
+    # somewhere, or nothing new is ever measured and the ranking freezes around
+    # whatever happened to be tried first.
+    proven, unknown, weak = [], [], []
+    for pm in ranked:
+        if _swarm_reliability(pm[0], pm[1]) < _SWARM_MIN_RELIABILITY:
+            weak.append(pm)
+        elif _swarm_has_record(pm[0], pm[1]):
+            proven.append(pm)
+        else:
+            unknown.append(pm)
+    ordered = proven + unknown + weak
     # BUDGET. Asked for directly -- "always in the range of best models to dont
     # exaust good ones quickly". A five-slot swarm aimed at one nearly-drained
     # provider finishes it off in a single turn, and it is precisely the
