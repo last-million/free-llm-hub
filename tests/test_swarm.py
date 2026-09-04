@@ -136,14 +136,29 @@ def test_a_tool_turn_takes_the_parallel_path_not_the_prose_pipeline():
     assert called["body"]["tools"], "the tools must be passed through, not stripped"
 
 
-def test_a_tool_turn_that_nothing_can_serve_fails_loudly():
-    """Falling through to a single model would silently drop the mode the user
-    chose; answering with prose would leave the agent nothing to execute."""
-    with mock.patch.object(app, "_swarm_tool_turn", return_value=None):
+def test_a_tool_turn_that_nothing_can_serve_falls_back_rather_than_failing():
+    """REVERSED 2026-09-04, and the old reasoning is worth keeping because it
+    was wrong in an instructive way.
+
+    It read: "Falling through to a single model would silently drop the mode the
+    user chose; answering with prose would leave the agent nothing to execute."
+
+    The first half treats the mode as a demand rather than a preference. Swarm
+    means "use the strongest models you have"; it does not mean "fail if you
+    cannot use five of them at once". Falling back to `best` -- the strongest
+    SINGLE model -- honours that intent far better than a 503 that ends the
+    build. The second half does not apply: the fallback carries the same
+    `tools`, so the model can still call them.
+
+    MEASURED: five consecutive opencode build turns 503'd on this exact branch,
+    each after ~155s, and the user saw every one as a dead turn. See
+    test_swarm_falls_back_instead_of_503.py."""
+    with mock.patch.object(app, "_swarm_tool_turn", return_value=None),          mock.patch.object(app, "_chat_completions_uncached",
+                           side_effect=lambda b: (app.jsonify({"ok": True}), 200)) as single:
         r = app.app.test_client().post("/v1/chat/completions", json={
             "model": "swarm", "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}]})
-    assert r.status_code == 503
+    assert r.status_code != 503
 
 
 # --------------------------------------------------------------------------- #
