@@ -4721,8 +4721,19 @@
     var resetsIn = allowanceSpent ? (p.allowance && p.allowance.resets_in)
                                   : (q && q.resets_in);
     var estimated = allowanceSpent && p.allowance && p.allowance.resets_estimated;
+    /* A RESEARCHED ZERO is not a spent allowance. limit:0 means the provider
+       has no free tier at all -- morph, for instance, meters tokens and bills
+       every one of its models -- so "Out of free quota - resets in 25d 21h"
+       reads as "you used it up, wait a month", when nothing was used and
+       waiting changes nothing. ASKED 2026-09-05: "why i see this in morph and
+       all api keys tests was ok". The keys ARE ok; there was never a free
+       allowance for them to spend. */
+    var neverFree = !!(q && q.limit_known && q.limit === 0 && !allowanceSpent);
     var quotaLine = '';
-    if (isExhausted){
+    if (neverFree){
+      quotaLine = '<div class="quota-line"><span>No free tier</span>' +
+        '<span class="quota-countdown">&middot; keys work, but every model bills</span></div>';
+    } else if (isExhausted){
       quotaLine = '<div class="quota-line">' +
         '<span>Out of ' + (allowanceSpent ? 'allowance' : 'free quota') + '</span>' +
         (resetsIn ? '<span class="quota-countdown" data-resets-in="' + esc(resetsIn) + '">' +
