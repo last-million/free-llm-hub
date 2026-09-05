@@ -6434,8 +6434,8 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         is_last = (i == n - 1)
         key = keys[(start + i) % n]
         try:
-            resp = requests.post(
-                url,
+            _post_kw = dict(
+                url=url,
                 json=payload,
                 headers=({"Content-Type": "application/json"} if key is None else
                          {"Authorization": "Bearer " + key,
@@ -6448,6 +6448,15 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                 # long CHAT_READ_TIMEOUT for slow one-shot generations.
                 timeout=(CONNECT_TIMEOUT, STREAM_IDLE_TIMEOUT if stream else CHAT_READ_TIMEOUT),
             )
+            # ...and for STREAMING, bound the wait for HEADERS separately, which
+            # the timeout above cannot express: requests uses one value for both,
+            # and at 280s it exceeded the chain's whole 240s budget, so one quiet
+            # provider ended the chain after a single hop. See _STREAM_HEADER_WAIT.
+            # Only streaming: a non-streaming caller is waiting on a BODY, and a
+            # one-shot generation legitimately takes minutes.
+            resp = (_post_with_header_deadline(_STREAM_HEADER_WAIT,
+                                               requests.post, **_post_kw)
+                    if stream else requests.post(**_post_kw))
         except requests.RequestException as exc:
             last_exc = exc
             if is_last:
@@ -14090,6 +14099,65 @@ def _peek_first_chunk(iterator, deadline_s):
 # Only for STREAMING requests: a buffered one has already sent nothing and its
 # caller is waiting on a body, not on headers.
 _STREAM_HEADER_BUDGET = 240      # seconds
+
+
+# HOW LONG ONE HOP MAY WAIT FOR RESPONSE HEADERS.
+#
+# requests applies its read timeout to the wait for HEADERS as well as to the
+# gaps between chunks, so STREAM_IDLE_TIMEOUT was doing both jobs -- and at 280s
+# it was LONGER THAN THE WHOLE CHAIN'S BUDGET of 240s below. A provider that
+# accepts the connection and then goes quiet therefore burned the entire budget
+# in hop one, and the chain stopped having tried exactly one model.
+#
+# MEASURED 2026-09-05 against nvidia directly, bypassing the hub:
+#     996 bytes      ReadTimeout at 300.6s
+#     840,676 bytes  ReadTimeout at 301.4s
+# Nothing came back at any size -- it was not the 200K-token payloads, the
+# provider was simply not answering. The hub kept electing it primary (it
+# benchmarks 134) and waiting, which is the "stopped after 240s" half of the
+# reported 503s.
+#
+# The control says the cap is safe. Time-to-headers where the provider works:
+#     groq @ 6K 1.11s   openrouter @ 60K 2.73s   tokenrouter @ 60K 10.83s
+# Worst healthy case 10.8s, so 60s leaves five times the margin while cutting a
+# dead hop from 280s to 60 -- four hops inside the budget instead of one.
+#
+# STREAM_IDLE_TIMEOUT is deliberately NOT lowered: it governs the gaps between
+# chunks, and once content is flowing the client has its headers and this budget
+# no longer applies. A slow reasoning model keeps its long leash mid-answer.
+_STREAM_HEADER_WAIT = 60         # seconds
+
+
+def _post_with_header_deadline(deadline, post, **kw):
+    """`post(**kw)` bounded by a wall-clock deadline for the RESPONSE HEADERS.
+
+    Same daemon-worker discipline as _dispatch_chat_with_deadline and
+    _peek_until_content: the call keeps running against its own socket timeout
+    and is simply not waited on any longer. It is abandoned, not cancelled --
+    Python cannot cancel a blocking socket read -- so the connection is released
+    when that timeout expires rather than immediately. That costs a socket for a
+    while; waiting for it costs the whole turn.
+
+    Raises ReadTimeout when the deadline passes, so the caller's existing
+    `except requests.RequestException` rotates the key and walks on exactly as
+    it does for any other dead hop."""
+    box = {}
+
+    def _call():
+        try:
+            box["resp"] = post(**kw)
+        except BaseException as exc:                             # noqa: BLE001
+            box["exc"] = exc
+
+    t = threading.Thread(target=_call, daemon=True)
+    t.start()
+    t.join(deadline)
+    if t.is_alive():
+        raise requests.exceptions.ReadTimeout(
+            "no response headers in %ss" % deadline)
+    if "exc" in box:
+        raise box["exc"]
+    return box.get("resp")
 
 
 def _header_budget_spent(started):
