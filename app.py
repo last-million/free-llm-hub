@@ -469,6 +469,40 @@ def _zero_priced_ids(payload):
         if not isinstance(mid, str) or not mid:
             continue
         src = item.get("pricing") if isinstance(item.get("pricing"), dict) else item
+        # TIERED pricing, published as `pricings` (plural) where every field is
+        # a LIST of {value, unit} entries -- one per volume band.
+        #
+        # MEASURED 2026-09-05 on zenmux, whose catalog is entirely this shape:
+        #     free : completion [{value: 0}]        prompt [{value: 0}]
+        #     paid : completion [{value: 50}, {value: 75}]
+        # The singular-`pricing` reader below found no recognisable price field
+        # at all, so it reported ZERO free models out of 169 -- and the probe
+        # then fell back to two registry pins that the provider had withdrawn,
+        # which answered 403 "no permission (api_key_source: payg)". A working
+        # key looked broken because the hub could not read the price list.
+        tiered = item.get("pricings")
+        if isinstance(tiered, dict):
+            seen = False
+            free = True
+            for f in _PRICE_FIELDS:
+                band = tiered.get(f)
+                if not isinstance(band, list):
+                    continue
+                for entry in band:
+                    v = entry.get("value") if isinstance(entry, dict) else entry
+                    try:
+                        v = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    seen = True
+                    if v > 0:
+                        free = False        # any band that charges makes it paid
+                        break
+                if not free:
+                    break
+            if seen and free:
+                out.append(mid)
+            continue
         seen = False
         for f in _PRICE_FIELDS:
             v = src.get(f)
@@ -8122,8 +8156,21 @@ def api_test_provider(pid):
             # provider_free_models() already filters correctly elsewhere; this path
             # never did). "% listed" and sample_models must both reflect only what
             # is_free_model() actually confirms is free for this provider.
+            # known_free, exactly as provider_free_models does it. Without it a
+            # 'pricing_zero' provider fails CLOSED -- is_free_model cannot prove
+            # free-ness with no prices to look at -- so the test reported "0 free
+            # models listed (169 total)" for zenmux while routing saw five, and
+            # then probed two withdrawn registry pins that answered 403. The
+            # test must ask the same question routing asks, or it is testing a
+            # hub that does not exist.
+            _known_free = None
+            if p.get("free_filter") == "pricing_zero":
+                _known_free = _zero_priced_ids(resp.json())
+            elif p.get("free_filter") == "free_tier":
+                _known_free = _free_tier_ids(resp.json(), p.get("free_tiers"))
             sample_models = prov.filter_models(
-                [m for m in all_ids if prov.is_free_model(pid, m)])
+                [m for m in all_ids if prov.is_free_model(pid, m,
+                                                          known_free=_known_free)])
             models_list_note = "%d free models listed (%d total in catalog)" % (
                 len(sample_models), len(all_ids))
         elif len(pcfg.get("api_keys") or []) > 1:
