@@ -1422,6 +1422,19 @@
   .sd-models-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
   .sd-models-filter{width:100%;margin:8px 0 6px;padding:6px 9px;border-radius:8px;
     border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:12px}
+  .sd-block-add{display:flex;gap:6px;margin:8px 0 6px}
+  .sd-block-add input{flex:1;padding:6px 9px;border-radius:8px;
+    border:1px solid var(--border);background:var(--bg);color:var(--fg)}
+  .sd-blocked{max-height:220px;overflow-y:auto;border:1px solid var(--border);
+    border-radius:8px}
+  .sd-blocked .row{display:flex;align-items:center;gap:8px;padding:5px 9px;
+    border-bottom:1px solid var(--border);font-size:.92em}
+  .sd-blocked .row:last-child{border-bottom:0}
+  .sd-blocked .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap}
+  .sd-blocked .pv{opacity:.6;font-size:.9em}
+  .sd-blocked .gone{opacity:.55;font-style:italic}
+  .sd-blocked .empty{padding:10px;opacity:.7}
   .sd-models{max-height:320px;overflow-y:auto;border:1px solid var(--border);
     border-radius:10px;padding:4px}
   .sd-model{display:flex;align-items:center;gap:8px;padding:5px 7px;border-radius:7px;
@@ -3056,6 +3069,23 @@
       <input class="sd-models-filter" id="sd-models-filter" type="search"
              placeholder="Filter by model or provider&hellip;" aria-label="Filter models">
       <div class="sd-models" id="sd-models"><div class="skel skel-row"></div></div>
+    </div>
+
+    <div class="sd-group">
+      <div class="sd-models-head">
+        <b>Blocked models</b>
+        <button class="btn sm ghost" id="sd-block-refresh" type="button">Refresh</button>
+      </div>
+      <p class="sd-help">Models switched off everywhere &mdash; orchestration, the fallback
+        chain and the swarm. The list above switches them one at a time; this blocks a whole
+        <em>family</em> by name, which is what you want when the same model is served by
+        several providers under slightly different spellings.</p>
+      <div class="sd-block-add">
+        <input id="sd-block-pattern" type="search" placeholder="Block by name, e.g. gpt-oss"
+               aria-label="Block models whose name contains">
+        <button class="btn sm" id="sd-block-apply" type="button">Block</button>
+      </div>
+      <div class="sd-blocked" id="sd-blocked"><div class="skel skel-row"></div></div>
     </div>
 
     <div class="sd-group">
@@ -9833,6 +9863,81 @@
       }
     }
 
+    /* BLOCKED MODELS.
+       The per-model switches above write the same list one model at a time,
+       which is unusable for retiring a FAMILY: "gpt-oss" is served by groq,
+       nvidia, llm7, cerebras and several g4f relays under slightly different
+       spellings, so switching it off means hunting the same name through a
+       table of hundreds. This blocks every match in one go, and lists what is
+       currently off so it can be undone.
+
+       An entry whose model is not currently live is shown greyed rather than
+       dropped: providers withdraw and restore models constantly, and hiding it
+       would quietly re-enable something the user had switched off the moment it
+       came back -- and it is exactly the entry the per-model table cannot
+       reach, because that table only lists what is live. */
+    function renderBlocked(rows){
+      var host = $('#sd-blocked');
+      if (!host) return;
+      if (!rows || !rows.length){
+        host.innerHTML = '<div class="empty">Nothing blocked. Every model the hub can reach is in use.</div>';
+        return;
+      }
+      host.innerHTML = rows.map(function(r){
+        return '<div class="row' + (r.live ? '' : ' gone') + '">' +
+               '<span class="nm">' + esc(r.model || '') +
+                 ' <span class="pv">' + esc(r.provider || '') + '</span></span>' +
+               (r.live ? '' : '<span class="pv">not listed now</span>') +
+               '<button class="btn sm ghost" data-unblock="' + esc(r.id) + '" type="button">Unblock</button>' +
+               '</div>';
+      }).join('');
+      var btns = host.querySelectorAll('button[data-unblock]');
+      for (var i = 0; i < btns.length; i++){
+        btns[i].addEventListener('click', function(){
+          var id = this.getAttribute('data-unblock') || '';
+          this.disabled = true;
+          api('/api/model-blocklist', { method: 'DELETE', body: { id: id } })
+            .then(function(r){
+              renderBlocked((r && r.blocked) || []);
+              loadSdModels();
+              toast(id + ' unblocked');
+            })
+            .catch(function(e){ toast('Blocked models: ' + e.message, true); });
+        });
+      }
+    }
+
+    function loadBlocked(){
+      return api('/api/model-blocklist').then(function(r){
+        renderBlocked((r && r.blocked) || []);
+      }).catch(function(e){ toast('Blocked models: ' + e.message, true); });
+    }
+
+    (function wireBlocked(){
+      var apply = $('#sd-block-apply'), input = $('#sd-block-pattern'),
+          refresh = $('#sd-block-refresh');
+      function doBlock(){
+        var pattern = (input && input.value || '').trim();
+        if (!pattern){ toast('Type a name to block, e.g. gpt-oss', true); return; }
+        if (apply) apply.disabled = true;
+        api('/api/model-blocklist', { method: 'POST', body: { pattern: pattern } })
+          .then(function(r){
+            var rows = (r && r.blocked) || [];
+            renderBlocked(rows);
+            loadSdModels();
+            if (input) input.value = '';
+            toast(rows.length + ' model' + (rows.length === 1 ? '' : 's') + ' blocked');
+          })
+          .catch(function(e){ toast('Blocked models: ' + e.message, true); })
+          .then(function(){ if (apply) apply.disabled = false; });
+      }
+      if (apply) apply.addEventListener('click', doBlock);
+      if (input) input.addEventListener('keydown', function(e){
+        if (e.key === 'Enter'){ e.preventDefault(); doBlock(); }
+      });
+      if (refresh) refresh.addEventListener('click', loadBlocked);
+    })();
+
     /* One-click "use only the models good at X".
      The category table is server-side (model_categories.py) so these buttons
      and the router cannot disagree about what a category means. Picking one
@@ -10094,6 +10199,7 @@
     try { loadSocialWebSearch(silent); } catch (e) {}
     try { loadUpdateStatus(silent); } catch (e) {}
     try { loadSdModels(silent); } catch (e) {}
+    try { loadBlocked(); } catch (e) {}
   }
 
   function _legacyOpenSettingsDrawer(){

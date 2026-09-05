@@ -5824,6 +5824,39 @@ def _note_default_truncation(pid, client_max_tokens, finish_reason):
               "sending max_tokens=%d from now on", pid, _LEARNED_OUTPUT_TOKENS)
 
 
+def _tools_exceed_budget(payload, budget):
+    """True when the TOOL SCHEMA ALONE cannot fit this model's window.
+
+    _compact_to_budget drops old turns and trims long messages. The tools array
+    is neither: it is a fixed floor under every payload, and the CLI needs those
+    exact tools for the model to be able to call them. So when the floor is
+    already over the window, no amount of compaction reaches it and the request
+    is a guaranteed 413 -- worth knowing before paying for the round trip.
+
+    MEASURED 2026-09-05 against groq's 8000-token window, which is what put
+    `groq: HTTP 413` in a chain the same day compaction was verified working:
+
+        tools=6    tools_alone=3883   fits
+        tools=12   tools_alone=7366   does NOT fit   <- a coding CLI's toolset
+        tools=20   tools_alone=12012  does NOT fit
+
+    Deliberately conservative: tools alone against the FULL budget, not against
+    compaction's 0.85 target, so a model is only refused when it could not serve
+    the request with zero conversation attached. _est_tokens runs about 1.14x
+    conservative and that margin is left in on purpose -- a hop wrongly skipped
+    loses a working model, a hop wrongly attempted costs one 413. Fails OPEN on
+    anything unknown or malformed."""
+    try:
+        if not budget or budget <= 0 or not isinstance(payload, dict):
+            return False
+        tools = payload.get("tools")
+        if not isinstance(tools, list) or not tools:
+            return False
+        return _est_tokens([], tools) > budget
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _model_ctx_budget(pid, model):
     """Best estimate of a model's usable INPUT context: the limit LEARNED from a real
     400 (authoritative) if we have one, else the provider's context-sized _PROVIDER_TPM."""
@@ -6454,6 +6487,16 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         # A no_key provider whose registry entry carries a static_key (uncloseai,
         # llm7) sends that documented placeholder as its bearer instead.
         keys = [(prov.get_provider(pid) or {}).get("static_key") or None]
+    # A TOOL SCHEMA THAT CANNOT FIT is a 413 no matter what else is sent, and
+    # compaction cannot help because the tools are the one part of the payload it
+    # may not touch. Raising here costs nothing and lets the chain move to a hop
+    # that can actually serve the turn; the callers already walk on from a
+    # RequestException exactly as they would from the 413 itself.
+    if _tools_exceed_budget(payload, _model_ctx_budget(pid, payload.get("model"))):
+        raise requests.exceptions.RequestException(
+            "tool schema alone (%d tokens) exceeds this model's %d-token window"
+            % (_est_tokens([], payload.get("tools")),
+               _model_ctx_budget(pid, payload.get("model"))))
     url = base.rstrip("/") + "/chat/completions"
     # Keys with quota first. A key that 429'd is skipped until its window
     # resets, instead of being retried on every request and failing the same way
@@ -8640,6 +8683,65 @@ def api_model_categories():
                     "enabled": sum(1 for i in ids if i not in blocked)})
     return jsonify({"categories": out, "blocked": sorted(blocked),
                     "total": len(live)})
+
+
+@app.route("/api/model-blocklist", methods=["GET", "POST", "DELETE"])
+def api_model_blocklist():
+    """The blocked-model list, and blocking a whole FAMILY by name.
+
+    GET    -> {"blocked":[{"id","provider","model","live":bool}], "count":N}
+    POST   {"pattern":"gpt-oss"}   -> block every live model whose id contains it
+    DELETE {"pattern":"gpt-oss"}   -> unblock the same, by substring
+    DELETE {"id":"groq/gpt-oss"}   -> unblock exactly one
+
+    The per-model switches in Settings already write the same list, one model at
+    a time. That is unusable for retiring a FAMILY: "gpt-oss" is served by groq,
+    nvidia, llm7, cerebras and several g4f relays under slightly different
+    spellings, so switching it off means hunting the same name through a table
+    of hundreds. One substring, every spelling.
+
+    An id is kept on the list even when it is not currently live -- providers
+    withdraw and restore models constantly, and dropping the entry would quietly
+    re-enable a model the user had switched off the moment it came back. `live`
+    says which ones the hub can see right now so the UI can mark the rest.
+    """
+    live = {}
+    for pid in _available_providers():
+        try:
+            for m in provider_free_models(pid) or []:
+                live["%s/%s" % (pid, m)] = (pid, m)
+        except Exception:                                        # noqa: BLE001
+            continue
+
+    if request.method in ("POST", "DELETE"):
+        body = request.get_json(force=True, silent=True) or {}
+        pattern = str(body.get("pattern") or "").strip().lower()
+        one = str(body.get("id") or "").strip()
+        cur = _blocked_models()
+        if one:
+            if request.method == "DELETE":
+                cur.discard(one)
+            else:
+                cur.add(one)
+        elif pattern:
+            if request.method == "POST":
+                cur |= {mid for mid in live if pattern in mid.lower()}
+            else:
+                # Unblock by substring across the WHOLE list, not just what is
+                # live: an entry for a withdrawn model is exactly the one a user
+                # cannot reach through the per-model switches.
+                cur -= {mid for mid in cur if pattern in mid.lower()}
+        else:
+            return jsonify({"error": "pattern or id is required."}), 400
+        config.set_setting(_BLOCKED_SETTING, sorted(cur))
+
+    blocked = sorted(_blocked_models())
+    rows = []
+    for mid in blocked:
+        pid, _, model = mid.partition("/")
+        rows.append({"id": mid, "provider": pid, "model": model,
+                     "live": mid in live})
+    return jsonify({"blocked": rows, "count": len(rows)})
 
 
 @app.route("/api/model-allowlist", methods=["GET", "POST"])
