@@ -187,8 +187,66 @@ _MAX_BACKOFF = 3600.0    # seconds: cap one sideline at 1h (the window reset cap
 _RETRY_AFTER_CAP = 86400.0  # seconds: ceiling on an explicit Retry-After we honour
 
 
+# HOW MANY KEYS a provider has, supplied by app.py at startup.
+#
+# quota.py deliberately does not import config -- it is the accounting layer and
+# knows nothing about where credentials live -- so the count arrives through a
+# hook instead.
+_key_counter = None
+
+
+def set_key_counter(fn) -> None:
+    """Register `fn(pid) -> int`, the size of pid's key pool."""
+    global _key_counter
+    _key_counter = fn
+
+
+def key_count(pid: str) -> int:
+    """Keys in pid's pool; 1 when unknown, so nothing changes without a hook."""
+    if _key_counter is None:
+        return 1
+    try:
+        return max(1, int(_key_counter(pid) or 1))
+    except Exception:                                            # noqa: BLE001
+        return 1
+
+
 def _limit_for(pid: str) -> dict:
-    return FREE_LIMITS.get(pid, DEFAULT_LIMIT)
+    """The provider's free-tier budget, SCALED BY THE SIZE OF ITS KEY POOL.
+
+    REPORTED 2026-09-05: "for example for openrouter he say no more quota and
+    will be available in 1 hour but i have multi api keys". He does -- four of
+    them -- and the hub was counting all four against ONE key's allowance:
+
+        openrouter   4 keys, limit 50/day   -> stopped at 50 of a real 200
+        sambanova    4 keys, limit 20/day   -> stopped at 20 of a real 80
+        groq         3 keys, limit 1000/day -> stopped at 1000 of a real 3000
+
+    Three quarters of the budget unusable, and the provider then dropped out of
+    routing entirely because is_exhausted gates on this number.
+
+    Key ROTATION already worked -- _upstream_chat advances to the next key on
+    401/403/429 -- so the pool was being used; only the accounting stopped early.
+
+    THE ASSUMPTION, stated because it can be wrong: this treats each key as
+    carrying its own upstream allowance, which holds when the keys are separate
+    accounts (the reason anyone collects several) and not when they share one.
+    If they do share, the provider answers 429, and that path is already handled
+    -- observe_headers revises the limit downward from the provider's own
+    figures, and the 429 cooldown sidelines it. So the cost of being wrong is a
+    few wasted 429s that self-correct, against a certainty of leaving three
+    quarters of the budget unspent. A documented `limit: 0` stays 0 -- no free
+    tier times any number of keys is still no free tier."""
+    lim = FREE_LIMITS.get(pid, DEFAULT_LIMIT)
+    n = key_count(pid)
+    limit = lim.get("limit")
+    if n <= 1 or not isinstance(limit, int) or limit <= 0:
+        return lim
+    scaled = dict(lim)
+    scaled["limit"] = limit * n
+    scaled["keys"] = n
+    scaled["per_key_limit"] = limit
+    return scaled
 
 
 # Providers whose DAILY quota does not roll over at UTC midnight. Google states it
@@ -321,6 +379,74 @@ def note_key_outcome(pid: str, key, ok: bool) -> None:
         if not row:
             return
         row["ok" if ok else "fail"] = row.get("ok" if ok else "fail", 0) + 1
+
+
+# KEYS THAT ARE OUT OF QUOTA, so rotation can skip them instead of rediscovering
+# the same 429 on every request.
+#
+# ASKED 2026-09-05: "should work for all providers the multi api keys rotation
+# when one dont have quota left". Rotation itself already worked -- _upstream_chat
+# advances to the next key on 401/403/429 -- but it had no MEMORY. A key that ran
+# out at 09:00 was still tried first on every request after it, burning one
+# guaranteed-failed round trip each time, and on a pool of four that is a quarter
+# of all attempts spent on a key already known to be spent.
+_KEY_COOLDOWN = {}          # (pid, fingerprint) -> epoch when it may be used again
+_KEY_COOLDOWN_DEFAULT = 900
+
+
+def mark_key_exhausted(pid: str, key, seconds: float = None) -> None:
+    """This key has no quota left. Skip it until `seconds` have passed.
+
+    Defaults to the provider's own window reset when it has one, so a daily key
+    comes back when the day does rather than on an arbitrary timer."""
+    fp = key_fingerprint(key)
+    if not fp:
+        return
+    if seconds is None:
+        try:
+            _start, reset = _window_bounds(_limit_for(pid)["window"], time.time(), pid)
+            seconds = max(60, reset - time.time())
+        except Exception:                                        # noqa: BLE001
+            seconds = _KEY_COOLDOWN_DEFAULT
+    with _LOCK:
+        _KEY_COOLDOWN[(pid, fp)] = time.time() + float(seconds)
+    _persist_maybe()
+
+
+def key_available(pid: str, key) -> bool:
+    """False only while a key is in its post-429 cooldown."""
+    fp = key_fingerprint(key)
+    if not fp:
+        return True
+    with _LOCK:
+        until = _KEY_COOLDOWN.get((pid, fp), 0)
+    if until and until > time.time():
+        return False
+    if until:
+        with _LOCK:
+            _KEY_COOLDOWN.pop((pid, fp), None)     # expired: let it back in
+    return True
+
+
+def usable_keys(pid: str, key_list):
+    """`key_list` reordered so keys with quota come first.
+
+    FAIL-OPEN: when every key is cooling down the original list is returned
+    unchanged. Refusing to try is worse than trying -- a cooldown is an estimate,
+    and the provider is the only real authority on whether a key still works."""
+    if not key_list or len(key_list) == 1:
+        return list(key_list or [])
+    fresh = [k for k in key_list if key_available(pid, k)]
+    return fresh if fresh else list(key_list)
+
+
+def key_cooldowns(pid: str) -> dict:
+    """{fingerprint: seconds remaining} — for the dashboard."""
+    now = time.time()
+    with _LOCK:
+        items = list(_KEY_COOLDOWN.items())
+    return {fp: round(until - now) for (p, fp), until in items
+            if p == pid and until > now}
 
 
 def keys(pid: str) -> dict:
@@ -600,6 +726,8 @@ def status(pid: str) -> dict:
     lim = _limit_for(pid)
     limit = lim.get("limit")
     limit_known = isinstance(limit, int)
+    keys_n = lim.get("keys", 1)
+    per_key = lim.get("per_key_limit")
     now = time.time()
     start, reset = _window_bounds(lim["window"], now, pid)
     with _LOCK:

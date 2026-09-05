@@ -2946,6 +2946,36 @@ def _dead_state_load(blob):
             _outcomes[(p, m)] = {"ok": int(ok), "fail": int(fail), "last": float(last)}
 
 
+def _retry_after_seconds(resp):
+    """The provider's own Retry-After in seconds, or None.
+
+    None means "we do not know", and quota.mark_key_exhausted then falls back to
+    the provider's window reset -- which is the right guess for a DAILY key, and
+    far better than inventing a number the provider never gave."""
+    try:
+        raw = resp.headers.get("Retry-After")
+    except Exception:                                            # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        return None                    # an HTTP-date form; the window reset is closer
+
+
+def _provider_key_count(pid):
+    """Keys configured for pid. Handed to quota so a pool of N keys is budgeted
+    as N allowances rather than one -- see quota._limit_for."""
+    try:
+        return len(config.get_provider_config(pid).get("api_keys") or [])
+    except Exception:                                            # noqa: BLE001
+        return 1
+
+
+quota.set_key_counter(_provider_key_count)
+
+
 def _init_quota_persistence():
     """Persist quota + dead-model/provider state next to the config so a restart
     doesn't wipe a provider's 429 sideline or daily spend. Best-effort: a bad
@@ -6079,6 +6109,7 @@ def _upstream_post(pid, path, payload):
         keys = [(prov.get_provider(pid) or {}).get("static_key") or None]
 
     url = base.rstrip("/") + "/" + path.lstrip("/")
+    keys = quota.usable_keys(pid, keys)
     n = len(keys)
     start = _next_key_start(pid, n)
     for i in range(n):
@@ -6100,6 +6131,9 @@ def _upstream_post(pid, path, payload):
         quota.record(pid, payload.get("model"))
         quota.record_key(pid, key, payload.get("model"))
         quota.note_key_outcome(pid, key, resp.status_code not in (401, 403, 429))
+        if resp.status_code == 429:
+            # THIS key is out, not the provider -- same rule as the chat path.
+            quota.mark_key_exhausted(pid, key, _retry_after_seconds(resp))
         quota.observe_headers(pid, resp.headers)
         # Same rotation rule as chat: these three statuses are about THIS KEY,
         # so the next key in the pool deserves a turn before the provider is
@@ -6197,6 +6231,10 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         # llm7) sends that documented placeholder as its bearer instead.
         keys = [(prov.get_provider(pid) or {}).get("static_key") or None]
     url = base.rstrip("/") + "/chat/completions"
+    # Keys with quota first. A key that 429'd is skipped until its window
+    # resets, instead of being retried on every request and failing the same way
+    # -- see quota.usable_keys, which fails OPEN when they are all cooling down.
+    keys = quota.usable_keys(pid, keys)
     n = len(keys)
     start = _next_key_start(pid, n)
     last_exc = None
@@ -6230,6 +6268,10 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         # unanswerable, because every counter was per provider.
         quota.record_key(pid, key, payload.get("model"))
         quota.note_key_outcome(pid, key, resp.status_code not in (401, 403, 429))
+        if resp.status_code == 429:
+            # THIS key is out, not the provider. Remember it so the next request
+            # starts on one that still has budget.
+            quota.mark_key_exhausted(pid, key, _retry_after_seconds(resp))
         quota.observe_headers(pid, resp.headers)  # ADAPT to the provider's real quota
         if resp.status_code == 400:               # learn a small context window from the error
             _learn_context_limit(pid, payload.get("model"), resp)
@@ -9543,9 +9585,26 @@ def api_agent_settings_update():
 
 
 def _no_candidates_hint():
-    """Reserved for extra context on an exhausted-chain 503. Empty today: the
-    uncensored-only mode that used to explain itself here is gone."""
-    return ""
+    """Extra context on an exhausted-chain 503, when the hub knows the reason.
+
+    REPORTED 2026-09-05: "why now he say all providers failed". It was not the
+    providers. A category button in Settings had switched most of the catalog
+    off -- 396 ids blocked, 69 models left usable out of 325 -- and the error
+    said "All providers failed: none available", which points at the upstreams
+    and never mentions the one thing that actually caused it and that only the
+    user can undo.
+
+    An error naming a cause the reader cannot act on, while hiding the cause
+    they CAN, is worse than a short one."""
+    try:
+        blocked = len(_blocked_models())
+    except Exception:                                            # noqa: BLE001
+        return ""
+    if not blocked:
+        return ""
+    return (" — note: %d model(s) are switched OFF in Settings, which is what "
+            "leaves the chain this short. Turn some back on there (the category "
+            "buttons replace the selection rather than adding to it)." % blocked)
 
 
 # Models the USER has switched off, as "pid/model" ids, kept in config.json

@@ -36,9 +36,17 @@ def isolated_config(monkeypatch):
     # unrelated to anything under test here).
     d = tempfile.mkdtemp(prefix="hub-pytest-keyrot-")
     monkeypatch.setenv("FREE_LLM_HUB_CONFIG", os.path.join(d, "state", "config.json"))
+    # Per-key cooldowns are module-global and now REAL: the 429 tests in this
+    # file leave one behind, which changed the starting key for the tests after
+    # them. Isolating the config was enough before that mechanism existed.
+    import quota
+    with quota._LOCK:
+        quota._KEY_COOLDOWN.clear()
     try:
         yield d
     finally:
+        with quota._LOCK:
+            quota._KEY_COOLDOWN.clear()
         shutil.rmtree(d, ignore_errors=True)
 
 
