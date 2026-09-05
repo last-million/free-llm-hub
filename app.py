@@ -13881,6 +13881,38 @@ def _peek_first_chunk(iterator, deadline_s):
     return True, box.get("v")
 
 
+# HOW LONG THE CHAIN MAY WALK BEFORE THE CLIENT GIVES UP ON HEADERS.
+#
+# A streaming request deliberately withholds its 200 until a hop produces real
+# content, so a hop that turns out to be dead can still be replaced by the next
+# one. That is right, and it makes time-to-first-HEADER unbounded: MAX_HOPS(6) x
+# STREAM_SLOW_BIG_PEEK_TIMEOUT(90) is 540 seconds of silence on the socket.
+#
+# REPORTED 2026-09-05 from opencode: "Provider response headers timed out after
+# 300000ms" -- and it does not retry, it ends the turn. Every OpenAI-shaped
+# client has such a timeout; opencode's is 5 minutes, which the chain can
+# legitimately exceed while doing exactly what it was designed to do.
+#
+# So the walk gets a budget UNDER that. Once it is spent the chain stops trying
+# new hops and returns its error properly, as an HTTP status the client can see
+# and retry -- instead of holding a socket open past the point where anyone is
+# still listening. A 503 that arrives is worth more than a better answer that
+# does not.
+#
+# Only for STREAMING requests: a buffered one has already sent nothing and its
+# caller is waiting on a body, not on headers.
+_STREAM_HEADER_BUDGET = 240      # seconds
+
+
+def _header_budget_spent(started):
+    """True once a streaming chain walk has run long enough to risk the
+    client's header timeout."""
+    try:
+        return (time.monotonic() - started) >= _STREAM_HEADER_BUDGET
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _stream_peek_timeout(model, est):
     """Adaptive deadline for _peek_until_content: how long to wait for a stream's
     first REAL content before falling through to the next hop. A fast model on a
@@ -16203,11 +16235,19 @@ def _chat_completions_uncached(body):
     # ordinary path keeps the exact call shape it always had (a stand-in for
     # _build_chain should not have to know about a parameter it never sees).
     _veto_kw = {"exclude_identities": veto} if veto else {}
+    _walk_started = time.monotonic()
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                           prefer=chain_prefer,
                                            require_tools=has_tools,
                                            messages=body.get("messages"),
                                            **_veto_kw):
+        if stream and _header_budget_spent(_walk_started):
+            # See _STREAM_HEADER_BUDGET: past this the client has stopped
+            # listening for headers, so a further hop cannot be delivered even
+            # if it succeeds.
+            errors.append("stopped after %ds: the client's header timeout was "
+                          "about to expire" % _STREAM_HEADER_BUDGET)
+            break
         if not prov.is_model_allowed(hop_model):
             continue
         # MID-REQUEST re-check. _build_chain is computed ONCE, up front, so a
@@ -16921,9 +16961,17 @@ def v1_responses(_retry_pass=False):
     last_error = None  # class of the LAST failed hop (transparency header)
     _tried = []  # DIAG: every hop the chain actually offered (root-cause the 503s)
     _err_bodies = {}  # DIAG: first raw error body per (pid:status) — reveals soft-400 reasons
+    _walk_started = time.monotonic()
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools, messages=messages):
         _tried.append(hop_pid + "/" + hop_model)
+        if stream and _header_budget_spent(_walk_started):
+            # See _STREAM_HEADER_BUDGET: past this the client has stopped
+            # listening for headers, so a further hop cannot be delivered even
+            # if it succeeds.
+            errors.append("stopped after %ds: the client's header timeout was "
+                          "about to expire" % _STREAM_HEADER_BUDGET)
+            break
         if not prov.is_model_allowed(hop_model):
             continue
         # MID-REQUEST re-check — see the twin in /v1/chat/completions. The chain
@@ -17614,8 +17662,16 @@ def v1_messages():
     last_hop = (None, None)
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
     last_error = None  # class of the LAST failed hop (transparency header)
+    _walk_started = time.monotonic()
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools, messages=oai_messages):
+        if stream and _header_budget_spent(_walk_started):
+            # See _STREAM_HEADER_BUDGET: past this the client has stopped
+            # listening for headers, so a further hop cannot be delivered even
+            # if it succeeds.
+            errors.append("stopped after %ds: the client's header timeout was "
+                          "about to expire" % _STREAM_HEADER_BUDGET)
+            break
         if not prov.is_model_allowed(hop_model):
             continue
         if stream and _is_sub(hop_pid):
