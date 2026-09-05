@@ -403,12 +403,110 @@ def load_config(strict: bool = False) -> dict:
     return _decrypt_secrets(cfg)
 
 
+# ROLLING BACKUPS of the config, kept because losing it once was enough.
+#
+# 2026-09-05: every provider key on this install was wiped and there was nothing
+# to restore from. The keys inside these copies are the SAME ciphertext the live
+# file holds, so a backup is no more sensitive than the original -- and useless
+# to anyone without secret.key, which is the point.
+#
+# Written only when the KEYS change, not on every flag toggle: a backup taken on
+# each of the hundreds of ordinary saves would push the last good copy out of
+# the window exactly when it is needed most.
+_BACKUP_DIR = "backups"
+_BACKUP_KEEP = 15
+
+
+def _backup_dir() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(_config_path())), _BACKUP_DIR)
+
+
+def _key_signature(cfg: dict) -> str:
+    """A cheap fingerprint of WHICH keys are stored, ignoring everything else."""
+    try:
+        provs = cfg.get("providers") or {}
+        parts = []
+        for pid in sorted(provs):
+            row = provs[pid]
+            if isinstance(row, dict):
+                parts.append(pid + ":" + str(len(row.get("api_keys") or [])))
+        return "|".join(parts)
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _rotate_backups() -> None:
+    try:
+        d = _backup_dir()
+        files = sorted((f for f in os.listdir(d) if f.startswith("config-")),
+                       reverse=True)
+        for stale in files[_BACKUP_KEEP:]:
+            try:
+                os.remove(os.path.join(d, stale))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def backup_config_now(reason: str = "manual") -> Optional[str]:
+    """Copy the CURRENT config file aside. Returns the path, or None."""
+    src = _config_path()
+    if not os.path.isfile(src):
+        return None
+    d = _backup_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        dest = os.path.join(d, "config-%s-%s.json" % (stamp, reason[:20]))
+        with open(src, "rb") as a, open(dest, "wb") as b:
+            b.write(a.read())
+    except OSError:
+        return None
+    _rotate_backups()
+    return dest
+
+
+def list_backups() -> list:
+    """Newest first: [{path, when, keys}] for the restore UI."""
+    out = []
+    try:
+        d = _backup_dir()
+        for name in sorted(os.listdir(d), reverse=True):
+            if not name.startswith("config-"):
+                continue
+            p = os.path.join(d, name)
+            n = 0
+            try:
+                with open(p, encoding="utf-8") as f:
+                    raw = json.load(f)
+                n = sum(len(v.get("api_keys") or [])
+                        for v in (raw.get("providers") or {}).values()
+                        if isinstance(v, dict))
+            except (OSError, ValueError):
+                continue
+            out.append({"path": p, "when": os.path.getmtime(p), "keys": n})
+    except OSError:
+        pass
+    return out
+
+
 def save_config(cfg: dict) -> None:
     """Persist atomically; never fall back to truncating the live file."""
     path = _config_path()
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+    # A key set about to CHANGE is the moment worth a copy -- including the
+    # change from "64 keys" to "none", which is the one that went unnoticed.
+    try:
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as _f:
+                _before = json.load(_f)
+            if _key_signature(_before) != _key_signature(cfg):
+                backup_config_now("keys")
+    except (OSError, ValueError):
+        pass
     # Provider keys are encrypted HERE, at the single point where config
     # reaches disk, so no caller has to remember to do it.
     data = json.dumps(_encrypt_secrets(cfg), indent=2, ensure_ascii=False)
