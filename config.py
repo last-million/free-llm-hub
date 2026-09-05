@@ -439,6 +439,7 @@ def _rotate_backups() -> None:
     try:
         d = _backup_dir()
         files = sorted((f for f in os.listdir(d) if f.startswith("config-")),
+                       key=lambda n: os.path.getmtime(os.path.join(d, n)),
                        reverse=True)
         for stale in files[_BACKUP_KEEP:]:
             try:
@@ -472,7 +473,13 @@ def list_backups() -> list:
     out = []
     try:
         d = _backup_dir()
-        for name in sorted(os.listdir(d), reverse=True):
+        # By MTIME, not by filename. Two copies can now land in the same second
+        # -- the pre-save one and the post-save one taken when a key is added --
+        # and the name only carries second resolution, so sorting by it put them
+        # in whichever order the reason suffix happened to fall.
+        for name in sorted(os.listdir(d),
+                           key=lambda n: os.path.getmtime(os.path.join(d, n)),
+                           reverse=True):
             if not name.startswith("config-"):
                 continue
             p = os.path.join(d, name)
@@ -497,14 +504,28 @@ def save_config(cfg: dict) -> None:
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+    _backup_after = False
     # A key set about to CHANGE is the moment worth a copy -- including the
     # change from "64 keys" to "none", which is the one that went unnoticed.
     try:
         if os.path.isfile(path):
             with open(path, encoding="utf-8") as _f:
                 _before = json.load(_f)
+            _before_n = sum(len(v.get("api_keys") or [])
+                            for v in (_before.get("providers") or {}).values()
+                            if isinstance(v, dict))
+            _after_n = sum(len(v.get("api_keys") or [])
+                           for v in (cfg.get("providers") or {}).values()
+                           if isinstance(v, dict))
             if _key_signature(_before) != _key_signature(cfg):
                 backup_config_now("keys")
+                # A GAIN is also worth a copy of the NEW state, taken after the
+                # write below. The pre-save copy protects against a wipe -- it
+                # is the one that restored 27 keys today -- but it always lags
+                # the live file by one change, so the key just added sat in no
+                # backup at all until the next edit. Measured right after the
+                # user added keys: live 41, newest backup 40.
+                _backup_after = _after_n > _before_n
                 # A save that DROPS EVERY KEY is the shape that cost 64 of them
                 # on 2026-09-05, twice, and neither the hub's startup nor the
                 # provider test reproduces it. So the next one names itself:
@@ -512,12 +533,6 @@ def save_config(cfg: dict) -> None:
                 # with it. Loud on purpose -- this is not a condition any normal
                 # flow should reach, and a silent wipe is what made the first one
                 # take a day to notice.
-                _before_n = sum(len(v.get("api_keys") or [])
-                                for v in (_before.get("providers") or {}).values()
-                                if isinstance(v, dict))
-                _after_n = sum(len(v.get("api_keys") or [])
-                               for v in (cfg.get("providers") or {}).values()
-                               if isinstance(v, dict))
                 if _before_n and not _after_n:
                     import logging as _lg
                     import traceback as _tb
@@ -556,6 +571,10 @@ def save_config(cfg: dict) -> None:
                 break
         if not replaced:
             raise OSError("could not atomically replace config after retries")
+        if _backup_after:
+            # The new file is on disk now, so this copy contains the key that
+            # was just added -- no longer a change behind.
+            backup_config_now("added")
     except BaseException:
         try:
             os.unlink(tmp_path)
