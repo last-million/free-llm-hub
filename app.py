@@ -6140,7 +6140,39 @@ def _compact_to_budget(messages, tools, budget, summarizer=None):
         note += "\n\n[Recap of the dropped turns]\n" + recap
     notice = {"role": "system", "content": note}
     head = lead_sys + [notice] + ([brief] if brief else [])
-    return head + kept, True
+    out = head + kept
+    # DROPPING TURNS IS NOT ENOUGH ON ITS OWN.
+    #
+    # The loop above admits the NEWEST message whatever its size, so that at
+    # least one turn always survives -- a turn answered with none of the message
+    # that asked it is worse than a trimmed one. That guarantee is right. What
+    # was missing is the step after it: nothing then trimmed the survivor.
+    #
+    # And because turns HAD been dropped, len(kept) < len(rest), so the branch
+    # above -- _trim_largest_message, written for exactly this, an overflow
+    # living inside a single message -- was never reached. It ran only when no
+    # turn could be dropped at all.
+    #
+    # MEASURED 2026-09-05 on the shape opencode actually sends (a few turns, then
+    # the whole repo pasted into the latest one), against groq's 8000-token
+    # budget:
+    #     before=150431   after=150493   did=True
+    # It came back BIGGER than it went in -- the notice was added and nothing was
+    # removed -- and reported success. _upstream_chat sends what it is given
+    # without re-checking, so 150K tokens went to a model with an 8K window and
+    # the answer was `groq: HTTP 413`, one hop of a six-provider 503 cascade.
+    #
+    # A loop, not a single pass: _trim_largest_message shrinks the biggest
+    # message per call and sizes the cut from a chars-per-token estimate, so a
+    # payload with several large survivors converges over a few passes rather
+    # than in one. Bounded, and it stops as soon as it fits.
+    for _ in range(4):
+        if _est_tokens(out, tools) <= target:
+            break
+        out, did_trim = _trim_largest_message(out, tools, target)
+        if not did_trim:
+            break              # nothing left that can usefully be cut
+    return out, True
 
 
 # Longest opening request we will pin verbatim. Past this it is truncated: the
