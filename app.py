@@ -2484,7 +2484,32 @@ def _provider_capable(pid, est):
         # only size guard that applies is _SUB_MAX_PROMPT_CHARS, enforced at run
         # time in _sub_run(). Never let the free-tier filter drop it.
         return True
-    return est <= 0 or _provider_tpm(pid) >= int(est * 1.15) + 512
+    if est <= 0:
+        return True
+    # AN UNKNOWN CEILING IS NOT A SMALL ONE.
+    #
+    # _PROVIDER_TPM is a hand-maintained table and most providers are not in it,
+    # so they were measured against _DEFAULT_TPM -- a GUESS of 100,000 that this
+    # filter then treated as a hard fact. MEASURED 2026-09-05 on a real opencode
+    # turn of 162,710 tokens: 14 of 16 live providers were excluded here, 11 of
+    # them purely on that default, leaving a 4-hop chain out of a 348-model
+    # fleet and a 503 when those four failed for four unrelated reasons.
+    #
+    # The providers on the default are exactly the ones nobody has measured --
+    # tokenrouter, dahl, g4f, opencode-zen and friends, several serving models
+    # with million-token windows. Excluding them is failing CLOSED on no
+    # evidence, and it is the opposite of what _context_ok does two hundred
+    # lines up, which returns True when the limit is unknown precisely so a
+    # guess can never block a model.
+    #
+    # A provider with a REAL entry is still filtered: groq's 8000 is a measured
+    # fact and a 30K request genuinely 413s on it. An unmeasured one is admitted
+    # and the truth arrives the honest way -- _upstream_chat compacts to the
+    # model's own window before sending, a real 413 teaches _MODEL_MAX_INPUT the
+    # actual ceiling, and _context_ok enforces it from then on.
+    if pid not in _PROVIDER_TPM:
+        return True
+    return _provider_tpm(pid) >= int(est * 1.15) + 512
 
 
 # --------------------------------------------------------------------------- #
