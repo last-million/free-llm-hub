@@ -154,3 +154,40 @@ def test_a_member_that_raises_does_not_take_the_others_with_it(fanout, monkeypat
     monkeypatch.setattr(A, "_dispatch_chat_with_deadline", go)
     out = A._swarm_tool_result(dict(BODY))
     assert out is not None
+
+
+# --------------------------------------------------------------------------- #
+# The ledger must measure the model, not our patience
+# --------------------------------------------------------------------------- #
+
+def test_an_abandoned_member_is_not_recorded_as_a_failure(fanout, monkeypatch):
+    """REPORTED 2026-09-05: "glm 5.3 and qwen 3.8 dont work anymore". Neither was
+    blocked or dead -- groq/qwen3.8-27b had fallen 0.72 -> 0.41 across the
+    session, which demoted it in the chain. Much of that drop was self-inflicted:
+    every member the grace cut off was filed as not delivering, so the more
+    impatient the swarm got, the worse its own best models looked."""
+    recorded = []
+    monkeypatch.setattr(A, "_record_outcome",
+                        lambda p, m, ok: recorded.append((p, m, ok)))
+    monkeypatch.setattr(A, "_dispatch_chat_with_deadline", _dispatcher({
+        "fast": (0.0, _with_tool_call()),
+        "slow": (5.0, None),        # still running when the grace expires
+        "never": (5.0, None),
+    }))
+    A._swarm_tool_result(dict(BODY))
+    time.sleep(6)                   # let the abandoned members finish their work
+    failures = [r for r in recorded if r[2] is False]
+    assert not failures, "abandoned members were filed as failures: %r" % failures
+
+
+def test_a_real_failure_is_still_recorded(fanout, monkeypatch):
+    """The flag must only cover members we walked away from -- a member that
+    genuinely fails before the fan-out moves on still counts."""
+    recorded = []
+    monkeypatch.setattr(A, "_record_outcome",
+                        lambda p, m, ok: recorded.append((p, m, ok)))
+    monkeypatch.setattr(A, "_dispatch_chat_with_deadline", _dispatcher({
+        "fast": (0.0, None), "slow": (0.0, None), "never": (0.0, None),
+    }))
+    A._swarm_tool_result(dict(BODY))
+    assert [r for r in recorded if r[2] is False], "real failures stopped being recorded"
