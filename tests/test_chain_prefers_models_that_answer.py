@@ -19,10 +19,12 @@ costs one quick retry -- the assumption it was built on, stated outright in
 _swarm_reliability's docstring: "there a bad hop costs one retry". It is the
 wrong shape when the failure is a HANG.
 
-So the chain now orders by coarse reliability BANDS. Coarse on purpose: a
-continuous sort by reliability would hand the chain to whatever happened to
-answer twice and throw the benchmark ordering away. Bands keep strength deciding
-within a band, and only stop a measured-bad model outranking a measured-good one.
+So the chain demotes the measured-to-fail and leaves everything else in the
+order strength gave it. ONE line, not a ladder: a first attempt split "delivers"
+(>=0.60) from "middling" and that was worse in the other direction -- it put
+glm-5.3 and qwen3.8 behind weaker models that merely cleared the line, which is
+the opposite of what a best-first chain is for. See
+test_a_middling_model_is_not_demoted.
 
 Nothing is ever dropped. A model has to be tried to earn a record, and if
 nothing healthier exists the measured-bad ones are still served.
@@ -63,18 +65,40 @@ def test_a_model_measured_to_fail_is_band_two(graded):
     assert A._chain_reliability_band(*BAD) == 2
 
 
-def test_a_middling_model_sits_between(graded):
-    assert A._chain_reliability_band(*MID) == 1
+def test_a_middling_model_is_not_demoted(graded):
+    """CORRECTED 2026-09-05. This asserted a middle band, and the middle band was
+    the bug: "glm 5.3 and qwen 3.8 dont work anymore, why he dont use best models
+    available first, they are checked now".
+
+    Neither was blocked or dead. groq/qwen3.8-27b had fallen to 0.41 -- above the
+    failure line, below the old 0.60 "delivers" line -- so the three-way split
+    put one of the strongest models in the catalog behind anything sitting at
+    0.60, however weak.
+
+    Worse, that 0.41 was largely self-inflicted: the swarm deadline kills and the
+    503 storm of that same session were all filed as failures against whatever
+    got caught in them. A number the hub's own timeouts can push around does not
+    get to outrank benchmark strength -- it only gets to spot the unambiguous
+    case."""
+    assert A._chain_reliability_band(*MID) == 0
 
 
-def test_an_untried_model_sits_in_the_middle_too(graded):
-    """Unknown deserves a slot ahead of the demonstrably broken and behind the
-    demonstrably working -- it has to be tried to ever earn a record."""
-    assert A._chain_reliability_band(*UNTRIED) == 1
+def test_an_untried_model_is_not_demoted(graded):
+    """It has to be tried to ever earn a record."""
+    assert A._chain_reliability_band(*UNTRIED) == 0
 
 
-def test_the_thresholds_are_ordered():
-    assert 0 < A._CHAIN_UNRELIABLE < A._CHAIN_RELIABLE < 1
+def test_there_is_one_line_not_a_ladder():
+    """A ladder demotes on thin evidence; one line demotes only on clear
+    evidence. _CHAIN_RELIABLE is gone with the middle band it created."""
+    assert 0 < A._CHAIN_UNRELIABLE < 1
+    assert not hasattr(A, "_CHAIN_RELIABLE")
+
+
+def test_strength_still_orders_everything_above_the_line(graded):
+    """The point of collapsing the bands: a strong model with an ordinary record
+    must not sit behind a weak one with a flattering record."""
+    assert A._chain_reliability_band(*GOOD) == A._chain_reliability_band(*MID) == 0
 
 
 # --------------------------------------------------------------------------- #

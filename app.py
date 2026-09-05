@@ -5084,29 +5084,45 @@ def _rotate_band(ordered):
 # 0.50/0.33/0.33/0.33 while groq/qwen3.8-27b at 0.72 waited at hop FIVE. Four
 # stalls before a model that answers.
 #
-# So: coarse BANDS, not a continuous sort. A continuous sort by reliability
-# would hand the chain to whatever happens to have answered twice, throwing away
-# the benchmark ordering entirely; bands keep strength deciding WITHIN a band
-# and only stop a measured-bad model from outranking a measured-good one.
+# So: ONE line, not a continuous sort and not a ladder. A continuous sort by
+# reliability would hand the chain to whatever happened to answer twice, throwing
+# away the benchmark ordering entirely -- and a three-band ladder was tried and
+# was worse in the other direction: it put glm-5.3 and qwen3.8 behind weaker
+# models that merely sat above a "delivers" line, which is the opposite of what
+# a best-first chain is for.
 #
-# Untried sits in the middle band on purpose: unknown deserves a slot before the
-# demonstrably broken, and behind the demonstrably working. Nothing is dropped
-# -- a model has to be tried to ever earn a record.
-_CHAIN_RELIABLE = 0.60      # measured: it delivers
-_CHAIN_UNRELIABLE = 0.35    # measured: it mostly does not
+# The line is drawn only where the evidence is unambiguous. Above it, strength
+# decides exactly as it always did; below it a model has demonstrated that it
+# mostly does not answer, and that is worth more than its benchmark score.
+# Untried counts as usable -- a model has to be tried to ever earn a record --
+# and nothing is ever dropped.
+_CHAIN_UNRELIABLE = 0.35    # measured: it mostly does not answer
 
 
 def _chain_reliability_band(pid, model):
-    """0 = delivers, 1 = unknown or middling, 2 = measured to fail."""
-    rel = _reliability(pid, model)
-    known = _swarm_has_record(pid, model)
-    if not known:
-        return 1
-    if rel >= _CHAIN_RELIABLE:
-        return 0
-    if rel < _CHAIN_UNRELIABLE:
-        return 2
-    return 1
+    """0 = usable, 2 = measured to fail. There is deliberately no middle.
+
+    It HAD three bands, splitting "delivers" (>=0.60) from "middling", and that
+    was too much. REPORTED 2026-09-05: "glm 5.3 and qwen 3.8 dont work anymore,
+    why he dont use best models available first, they are checked now".
+
+    They were not blocked and not dead. groq/qwen3.8-27b had simply fallen to
+    0.41 -- above the failure line, below the delivers line -- so a three-way
+    split put one of the strongest models in the catalog behind anything that
+    happened to sit at 0.60, however weak. That is the opposite of what the
+    chain is for.
+
+    And the 0.41 was largely OUR doing: this session's swarm deadline kills and
+    the 503 storm were all filed as failures against the models that got caught
+    in them. Reliability that a hub's own timeouts can push around is not solid
+    enough to outrank benchmark strength by itself -- but it is more than solid
+    enough to spot the 0.05-and-hangs case this exists for.
+
+    So: only the measured-to-fail are demoted, and everything else keeps the
+    order strength gave it."""
+    if not _swarm_has_record(pid, model):
+        return 0                       # untried is not a reason to demote
+    return 2 if _reliability(pid, model) < _CHAIN_UNRELIABLE else 0
 
 
 def _interleave_by_provider(ordered):
@@ -14982,6 +14998,19 @@ def _swarm_tool_result(body):
     if not picks:
         return None
 
+    # Set once the fan-out has an answer and has stopped waiting. Members still
+    # in flight after that are ABANDONED, and an abandoned member must not be
+    # filed as a failure.
+    #
+    # REPORTED 2026-09-05: "glm 5.3 and qwen 3.8 dont work anymore, why he dont
+    # use best models available first". groq/qwen3.8-27b had fallen from 0.72 to
+    # 0.41 across this session, which then demoted it in the chain. A good part
+    # of that drop was self-inflicted: every member the grace cut off was
+    # recorded as not delivering, so the more impatient the swarm got, the worse
+    # its own best models looked -- a ledger measuring the hub's patience and
+    # calling it the model's reliability.
+    moved_on = [False]
+
     def _run(pair):
         hop_pid, hop_model = pair
         payload = dict(body)
@@ -14990,7 +15019,8 @@ def _swarm_tool_result(body):
         resp, _exc = _dispatch_chat_with_deadline(hop_pid, payload,
                                                   _SWARM_TOOL_HOP_DEADLINE)
         if resp is None:
-            _record_outcome(hop_pid, hop_model, False)
+            if not moved_on[0]:
+                _record_outcome(hop_pid, hop_model, False)
             return None
         try:
             if resp.status_code != 200:
@@ -15079,6 +15109,9 @@ def _swarm_tool_result(body):
                                           for r in results):
                 cutoff = min(deadline, time.monotonic() + _SWARM_STRAGGLER_GRACE)
     finally:
+        # Anything still running from here on was abandoned by US, not failed by
+        # the provider -- stop counting it against the model.
+        moved_on[0] = True
         ex.shutdown(wait=False, cancel_futures=True)
     if not results:
         # LOG IT. The success line below sits after this early return, so a run
