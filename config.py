@@ -234,7 +234,7 @@ def _decrypt_secrets(cfg: dict) -> dict:
         keys = prov.get("api_keys")
         if not isinstance(keys, list):
             continue
-        out = []
+        out, unreadable = [], []
         for k in keys:
             if not secretstore.is_encrypted(k):
                 out.append(k)
@@ -242,7 +242,25 @@ def _decrypt_secrets(cfg: dict) -> dict:
             plain = secretstore.decrypt(k, path)
             if plain:
                 out.append(plain)
+            else:
+                unreadable.append(k)          # keep the CIPHERTEXT, see below
         prov["api_keys"] = out
+        # A key we cannot read is hidden from callers -- handing "enc.v1:..." to
+        # a provider produces an auth failure no amount of re-entering the right
+        # key would fix -- but it is NOT thrown away.
+        #
+        # DATA LOSS, 2026-09-05: every provider key on this install was wiped.
+        # Dropping the value here meant load_config returned a SHORTER list, and
+        # the very next save_config -- triggered by anything at all, a flag
+        # toggle, a runtime-state write -- persisted that shorter list over the
+        # ciphertext. One unreadable decrypt turned into permanent, silent
+        # deletion of 64 keys.
+        #
+        # Encryption must never be able to destroy the thing it protects. The
+        # ciphertext rides along here and _encrypt_secrets puts it back on save,
+        # so a wrong or missing secret.key costs a restart, not the keys.
+        if unreadable:
+            prov["_unreadable_api_keys"] = unreadable
     return cfg
 
 
@@ -269,6 +287,11 @@ def _encrypt_secrets(cfg: dict) -> dict:
         if isinstance(keys, list):
             copied["api_keys"] = [secretstore.encrypt(k, path) if isinstance(k, str)
                                   else k for k in keys]
+        # Put back anything that could not be decrypted on load, exactly as it
+        # was stored. This is what stops a bad read from becoming a deletion.
+        carried = copied.pop("_unreadable_api_keys", None)
+        if carried:
+            copied["api_keys"] = list(copied.get("api_keys") or []) + list(carried)
         out["providers"][pid] = copied
     return out
 
