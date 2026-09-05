@@ -15703,6 +15703,16 @@ def _swarm_tool_result(body):
 
     def _run(pair):
         hop_pid, hop_model = pair
+        # WHY a member did not answer. Six different outcomes reached the same
+        # `return None`, and the summary line only ever counted them -- "0/5
+        # models answered" with nothing to say which five or what went wrong.
+        # Asked to explain a run of empty fan-outs, the log could not, and the
+        # answer took an instrumented re-run against live providers to recover.
+        # Recording the reason costs one dict entry and makes the same question
+        # answerable from the log next time.
+        def _why(reason):
+            _member_why[(hop_pid, hop_model)] = reason
+            return None
         payload = dict(body)
         payload["model"] = hop_model
         payload["stream"] = False        # fan-out cannot stream; re-emitted below
@@ -15711,14 +15721,16 @@ def _swarm_tool_result(body):
         if resp is None:
             if not moved_on[0]:
                 _record_outcome(hop_pid, hop_model, False)
-            return None
+                return _why("no response before the %ds deadline"
+                            % _SWARM_TOOL_HOP_DEADLINE)
+            return _why("abandoned: another member had already answered")
         try:
             if resp.status_code != 200:
                 _record_outcome(hop_pid, hop_model, False)
-                return None
+                return _why("HTTP %d" % resp.status_code)
             data = resp.json() or {}
         except (ValueError, AttributeError):
-            return None
+            return _why("200 but the body was not usable JSON")
         finally:
             try:
                 resp.close()
@@ -15727,7 +15739,7 @@ def _swarm_tool_result(body):
         msg = ((data.get("choices") or [{}])[0].get("message") or {})
         if not (msg.get("tool_calls") or (msg.get("content") or "").strip()):
             _record_outcome(hop_pid, hop_model, False)
-            return None
+            return _why("200 with an empty message")
         # A member that TYPED its tool call instead of emitting one looks like
         # ordinary prose, so without this it competes as a candidate answer --
         # and if it wins, the CLI executes nothing and the build stops. That is
@@ -15752,7 +15764,8 @@ def _swarm_tool_result(body):
         # single-model path for a while; the fan-out simply never asked.
         if not msg.get("tool_calls") and _looks_like_refusal(msg.get("content")):
             _note_nonanswer(hop_pid, hop_model)
-            return None
+            return _why("refused: %s"
+                        % " ".join((msg.get("content") or "")[:60].split()))
         if not msg.get("tool_calls") and (
                 _looks_like_text_tool_call(msg.get("content"))
                 or _looks_like_announced_not_acted(msg.get("content"))):
@@ -15760,7 +15773,7 @@ def _swarm_tool_result(body):
             # ran, none called a tool, and the best-ranked ANNOUNCEMENT won the
             # slot, so the CLI executed nothing and the build said Finished.
             _note_nonanswer(hop_pid, hop_model)
-            return None
+            return _why("answered in prose without calling a tool")
         _record_chat_usage(hop_pid, hop_model, data, est)
         return (hop_pid, hop_model, data, msg)
 
@@ -15774,6 +15787,8 @@ def _swarm_tool_result(body):
     # deadline and their sockets die with the provider's connection -- the same
     # trade-off _dispatch_chat_with_deadline already documents.
     results = []
+    _member_why = {}
+    _started = time.monotonic()
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(picks))
     try:
         pending = {ex.submit(_run, pm) for pm in picks}
@@ -15809,9 +15824,14 @@ def _swarm_tool_result(body):
         # turns in a row produced an empty log and a 503 with no model recorded,
         # which is the hardest possible shape to diagnose. The failing case is
         # the one worth a line.
-        _log.warning("[swarm-tools] 0/%d models answered in %ds -> %s",
-                     len(picks), _SWARM_TOOL_HOP_DEADLINE,
-                     ", ".join(p + "/" + m for p, m in picks))
+        # The REASONS, not just the count. Also the elapsed time rather than
+        # the deadline constant: the old line printed _SWARM_TOOL_HOP_DEADLINE
+        # whatever had happened, so a fan-out that collapsed in two seconds was
+        # reported as "in 300s" and read as five models hanging.
+        _log.warning("[swarm-tools] 0/%d models answered in %.0fs -> %s",
+                     len(picks), time.monotonic() - _started,
+                     "; ".join("%s/%s: %s" % (p, m, _member_why.get((p, m), "no answer"))
+                               for p, m in picks))
         return None
 
     # WINNER. A turn that needs an action is served by a model that took one:

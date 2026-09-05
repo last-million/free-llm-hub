@@ -156,7 +156,7 @@ def test_a_zero_of_n_fan_out_is_logged():
     possible shape to diagnose."""
     src = open("app.py", encoding="utf-8").read()
     i = src.index("if not results:")
-    window = src[i:i + 700]
+    window = src[i:src.index("# WINNER.", i)]
     assert "_log.warning" in window
     assert "0/%d models answered" in window
 
@@ -165,6 +165,35 @@ def test_the_zero_log_names_the_models_that_were_asked():
     src = open("app.py", encoding="utf-8").read()
     i = src.index("0/%d models answered")
     assert "for p, m in picks" in src[i:i + 400]
+
+
+def test_the_zero_log_says_WHY_each_model_did_not_answer():
+    """Counting them is not diagnosing them. Six different outcomes reach the
+    same `return None` -- no response before the deadline, a non-200, an
+    unusable body, an empty message, a refusal, prose instead of a tool call --
+    and the line reported all six identically as "did not answer".
+
+    ASKED 2026-09-05 why so many swarm members come back empty, the log could
+    not say, and the answer took an instrumented re-run against live providers:
+    11 of 15 members called a tool, one relay 404'd, one returned an empty 200,
+    and sub-claude refused three times out of three with "write permission not
+    granted". Every one of those is a different problem with a different fix."""
+    src = open("app.py", encoding="utf-8").read()
+    i = src.index("0/%d models answered")
+    window = src[i:i + 400]
+    assert "_member_why" in window
+
+
+def test_the_zero_log_reports_elapsed_time_not_the_deadline_constant():
+    """It printed _SWARM_TOOL_HOP_DEADLINE whatever had happened, so a fan-out
+    that collapsed in two seconds was logged as "in 300s" and read as five
+    models hanging. It sent this investigation looking for a timeout that was
+    not there."""
+    src = open("app.py", encoding="utf-8").read()
+    i = src.index("0/%d models answered")
+    window = src[i:i + 400]
+    assert "time.monotonic() - _started" in window
+    assert "_SWARM_TOOL_HOP_DEADLINE" not in window
 
 
 def test_the_fallback_itself_is_logged():
