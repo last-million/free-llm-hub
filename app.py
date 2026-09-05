@@ -2131,6 +2131,15 @@ _PROVIDER_TPM = {
     "openrouter": 128000, "cohere": 100000, "nvidia": 250000, "google": 900000,
     "cloudflare": 120000, "nararouter": 120000, "kimi": 128000, "glm": 128000,
     "aiand": 120000, "xiaomi": 60000, "minimax": 120000,
+    # READ LIVE 2026-09-05 from their public catalog: every one of the five free
+    # promotion models reports a context_window of 1,000,000 or more
+    # (gpt-6-astra and gpt-5.6-luna 1,050,000; deepseek-v4-flash 1,048,576;
+    # claude-fable-5.1 and qwen3.8-27b 1,000,000). Left at the 100000 default it
+    # was filtered OFF exactly the requests it is best at -- _provider_capable
+    # said False for the 160K opencode turns that started this whole
+    # investigation. Set below the smallest real window, not at it: the number
+    # is a routing budget, not a promise, and compaction still trims per model.
+    "experientiallabs": 900000,
 }
 _DEFAULT_TPM = 100000
 
@@ -2814,6 +2823,39 @@ def _daily_exhaustion_secs(pid, resp, cap=6 * 3600):
     if not secs or secs <= 0:
         return None
     return min(float(secs), cap)
+
+
+# A 429 THAT IS NOT A RATE LIMIT.
+#
+# Some gateways answer a BILLING PRECONDITION with 429 rather than 402. Verified
+# live 2026-09-05 on experientiallabs, whose own catalog advertises five models
+# as free and three of those as "requires_payment_method": false -- every one of
+# them answers:
+#
+#   HTTP 429: Requires a card on file to spend platform credits. Add one (no
+#   charge) at https://platform.experientiallabs.ai/credits?add-card=1
+#
+# Read as a rate limit that is exactly wrong in both directions: the key gets
+# benched for a Retry-After that never helps, and the provider is re-tried
+# forever because "rate limited" is a condition that clears on its own. This one
+# does not clear until the account is changed, so it belongs with the 402
+# "account is broke" family -- sidelined after two distinct models, then
+# re-probed on the normal 30-minute cycle so adding the card revives it with no
+# restart.
+_BILLING_PRECONDITION_RE = re.compile(
+    r"card on file|add a card|payment method|billing details|"
+    r"requires? a card|add a payment", re.I)
+
+
+def _is_billing_precondition(resp):
+    """True for a response whose body says the ACCOUNT needs a payment method.
+
+    Only consulted for statuses the hub would otherwise read as transient; a
+    real rate limit never carries this text."""
+    try:
+        return bool(_BILLING_PRECONDITION_RE.search(_upstream_error_detail(resp) or ""))
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def _mark_provider_authfail(pid, model, status):
@@ -6468,7 +6510,13 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         # unanswerable, because every counter was per provider.
         quota.record_key(pid, key, payload.get("model"))
         quota.note_key_outcome(pid, key, resp.status_code not in (401, 403, 429))
-        if resp.status_code == 429:
+        if resp.status_code == 429 and _is_billing_precondition(resp):
+            # NOT a rate limit -- the account needs a payment method (see
+            # _is_billing_precondition). Benching the key for a Retry-After would
+            # never help, and "rate limited" would have the provider re-tried
+            # forever, so it is graded as the account-level fact it is.
+            _mark_provider_authfail(pid, payload.get("model"), 402)
+        elif resp.status_code == 429:
             # THIS key is out, not the provider. Remember it so the next request
             # starts on one that still has budget.
             quota.mark_key_exhausted(pid, key, _retry_after_seconds(resp))

@@ -897,6 +897,70 @@ PROVIDERS: Dict[str, dict] = {
         "default_free_models": ["meta-llama/llama-3.1-8b-instruct"],
         "notes": "Small one-time free credit. Then pay-as-you-go.",
     },
+    "experientiallabs": {
+        "name": "Experiential Labs",
+        # Pinned in the dashboard's Recommended zone: the free promotions list
+        # carries GPT-6 Astra and Claude Fable 5.1, which almost nothing else
+        # gives away, and three more that need no card at all.
+        "recommended": True,
+        # VERIFIED LIVE 2026-09-05 against their own API, not from docs alone.
+        # OpenAI-compatible: their llms.txt says "Point any OpenAI client at this
+        # gateway and change nothing else". Also serves /v1/responses and
+        # /v1/messages, so codex- and Anthropic-shaped clients work too.
+        "base_url": "https://api.experientiallabs.ai/v1",
+        "models_url": "https://api.experientiallabs.ai/v1/models",
+        "signup_url": "https://platform.experientiallabs.ai/settings/api-keys",
+        "key_hint": "xpl_...",
+        # The free set is a PROMOTIONS list the provider curates -- it is not
+        # inferable from the id (no ':free' suffix) and not from pricing (these
+        # models ARE priced; the promotion grants a free daily allowance on top).
+        # So it is a fixed named list, matched EXACTLY: free_exact stops a
+        # substring match from leaking one of the other 758 paid ids in the same
+        # catalog ("qwen3.8-27b" as a substring would match plenty).
+        "free_filter": "family",
+        "free_exact": True,
+        # READ LIVE 2026-09-05 from the keyless public catalog at
+        # https://api.experientiallabs.ai/api/models -> "promotions", all five
+        # carrying "free": true. Kept here rather than fetched because the list
+        # is a business decision that changes rarely and a wrong guess routes
+        # real money; re-read that endpoint when it looks stale.
+        "free_families": [
+            "qwen3.8-27b", "deepseek-v4-flash", "gpt-5.6-luna",
+            "gpt-6-astra", "claude-fable-5.1",
+        ],
+        # CORRECTED 2026-09-05 by a real key, against their own metadata.
+        #
+        # The catalog advertises three of these as "requires_payment_method":
+        # false. That is not what the gateway does. With a valid key and no card,
+        # EVERY ONE of the five answers:
+        #
+        #   HTTP 429: Requires a card on file to spend platform credits. Add one
+        #   (no charge) at platform.experientiallabs.ai/credits?add-card=1
+        #
+        # The card is free and the gate is on spending platform credits at all,
+        # not on the individual model -- so the per-model flag describes which
+        # promotion applies, not whether the call will be served. Ordered by
+        # STRENGTH now, since ordering by "needs no card" sorted on a distinction
+        # that does not exist in practice.
+        "default_free_models": [
+            "claude-fable-5.1",       # 480K in / 240K out per day
+            "gpt-6-astra",            # 1M in / 800K out per day
+            "gpt-5.6-luna",           # $5/day
+            "deepseek-v4-flash",      # $25/day
+            "qwen3.8-27b",            # $5/day
+        ],
+        # Every one of the five reports supported_params.tools = true and
+        # streaming, so they are usable from a coding CLI, not just chat.
+        #
+        # NOT verified (no key here): their docs say these models reject
+        # temperature/top_p, while the same docs describe an
+        # x-experiential-ignored-parameters response field that DISCLOSES
+        # dropped params -- which reads more like "ignored" than "rejected".
+        # Left alone deliberately rather than special-casing the payload on an
+        # unconfirmed claim; if real generations 400 on sampling params, that is
+        # the first thing to strip.
+        "notes": "OpenAI-compatible gateway over 763 models, incl. GPT-6 Astra and Claude Fable 5.1. REQUIRES A CARD ON FILE (no charge) at platform.experientiallabs.ai/credits?add-card=1 - verified live: without one every free model answers 429 'Requires a card on file to spend platform credits', including the three the catalog marks as needing no payment method. With a card: claude-fable-5.1 480K in/240K out per day, gpt-6-astra 1M in/800K out per day, deepseek-v4-flash $25/day, qwen3.8-27b and gpt-5.6-luna $5/day, plus 500 credits/month. Key from platform.experientiallabs.ai/settings/api-keys, shown once.",
+    },
     "opencode-zen": {
         "name": "OpenCode Zen",
         "base_url": "https://opencode.ai/zen/v1",
