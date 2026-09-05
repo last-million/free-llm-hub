@@ -8147,8 +8147,21 @@ def api_test_provider(pid):
     # exactly what happened testing this rewrite: openrouter's FIRST pinned id
     # 404'd "unavailable for free, use this slug instead: ..." while its other
     # 6 pinned ids were fine. /models results are tried too, deduped, in order.
+    # LIVE CATALOG FIRST, registry pins second.
+    #
+    # It was the other way round, and the pins go stale. MEASURED 2026-09-05 on
+    # opencode-zen: its three pinned ids are deepseek-v4-flash-free (the
+    # provider now answers 400 "Model is unavailable"), north-mini-code-free
+    # (withdrawn -- 401 "Model ... is not supported") and mimo-v2.5-free. The
+    # probe hit the withdrawn one second, treated its 401 as a dead credential,
+    # and reported "None of the 2 keys work" for a provider whose live catalog
+    # had FIVE working free models, mimo-v2.5-free among them.
+    #
+    # The live list is what the hub actually routes to, so it is what the test
+    # should ask about. The pins stay as the fallback they were meant to be, for
+    # a provider with no /models endpoint to discover.
     candidates, seen = [], set()
-    for m in (p.get("default_free_models") or []) + sample_models:
+    for m in sample_models + (p.get("default_free_models") or []):
         if m and m not in seen and prov.is_model_allowed(m):
             seen.add(m)
             candidates.append(m)
@@ -8172,6 +8185,19 @@ def api_test_provider(pid):
             return _finish(False, "Key authenticates (%s) but no allowed model to verify "
                                   "generation with." % models_list_note, sample_models[:5])
         return _finish(False, "Provider has no models_url and no default model to test with.", [])
+
+    def _looks_like_model_scoped(detail):
+        """True when an auth-shaped failure is really about the MODEL.
+
+        A credential problem cannot be fixed by trying a sibling model; a
+        withdrawn model can. Providers disagree about which status to use for
+        the second case, so the message is the only reliable signal."""
+        text = (detail or "").lower()
+        if "model" not in text:
+            return False
+        return any(w in text for w in ("not supported", "not found", "unavailable",
+                                       "does not exist", "no longer", "unknown model",
+                                       "invalid model", "decommissioned"))
 
     # Transient statuses (a live rate-limit blip, momentary overload) get ONE
     # retry after a short pause before moving to the next candidate — without
@@ -8210,12 +8236,19 @@ def api_test_provider(pid):
                 reason = "HTTP %d: %s" % (resp.status_code, _upstream_error_detail(resp))
                 break
             attempted.append((model, False))  # candidate didn't pan out — try the next
-            if resp is not None and resp.status_code == 401:
-                # 401 is about the CREDENTIAL, not the model, so no sibling
-                # model can rescue it -- walking the rest of the candidates just
-                # spends four more requests to be told the same thing. Matters
-                # more now that a pool is tested key-by-key: 3 dead keys x 5
-                # candidates was 15 pointless calls per click.
+            if (resp is not None and resp.status_code == 401
+                    and not _looks_like_model_scoped(reason)):
+                # 401 is USUALLY about the CREDENTIAL, not the model, so no
+                # sibling model can rescue it -- walking the rest of the
+                # candidates just spends four more requests to be told the same
+                # thing. Matters more now that a pool is tested key-by-key: 3
+                # dead keys x 5 candidates was 15 pointless calls per click.
+                #
+                # USUALLY. Some providers answer 401 for a model they no longer
+                # serve: opencode-zen returns "Model north-mini-code-free is not
+                # supported" with that status, and providers.py has carried a
+                # note about this exact wording since 2026-07-27. Breaking there
+                # condemned two perfectly good keys and hid five working models.
                 break
         return False, None, reason
 
