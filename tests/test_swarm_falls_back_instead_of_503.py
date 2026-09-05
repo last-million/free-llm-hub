@@ -258,17 +258,22 @@ def test_the_fan_out_rejects_a_member_that_refuses():
 
 def test_the_refusal_check_only_applies_without_tool_calls():
     """A model that refuses in prose AND calls a tool has still done the work;
-    only the prose-only refusal is a dead slot."""
+    only the prose-only refusal is a dead slot.
+
+    Anchored on the guard rather than on one exact line: the condition grew a
+    second detector (_looks_like_permission_block) and an exact-string match
+    broke on the reformatting while the guard itself was untouched."""
     src = open("app.py", encoding="utf-8").read()
-    i = src.index('if not msg.get("tool_calls") and _looks_like_refusal')
-    assert i > 0
+    i = src.index("_looks_like_refusal(msg.get(\"content\"))")
+    before = src[max(0, i - 200):i]
+    assert 'not msg.get("tool_calls")' in before
 
 
 def test_a_refusing_member_is_recorded_as_a_non_answer():
     """So the ledger learns it, and _swarm_rank stops handing it slots."""
     src = open("app.py", encoding="utf-8").read()
-    i = src.index('if not msg.get("tool_calls") and _looks_like_refusal')
-    assert "_note_nonanswer" in src[i:i + 200]
+    i = src.index("_looks_like_refusal(msg.get(\"content\"))")
+    assert "_note_nonanswer" in src[i:i + 400]
 
 
 # --------------------------------------------------------------------------- #

@@ -14893,6 +14893,53 @@ _REFUSAL_RE = re.compile(
 _REFUSAL_HEAD_CHARS = 400
 
 
+# A DECLINE THAT NEVER SAYS "I".
+#
+# _REFUSAL_RE above requires a first-person verb -- "I cannot help", "I must
+# decline". A sandboxed CLI does not talk like that. It reports the obstacle
+# flatly:
+#
+#     "Blocked: write permission not granted for <an AppData path>"
+#     "Blocked. Every tool call needs approval -- run /permissions and allow Write"
+#
+# Neither matches, so neither was treated as a non-answer. MEASURED: that first
+# string came back from sub-claude on three fan-outs out of three, was accepted
+# as a delivered answer, and -- because the winner is picked as
+# `acted or results` -- can WIN a turn on which no member emitted a tool call.
+# The user then reads the hub telling them it lacks permissions, about a
+# temp-directory path they never chose. That is the shape of the very first bug
+# reported against the swarm.
+#
+# Deliberately narrow: the words have to be about PERMISSION or a BLOCK, in the
+# opening sentence, with no tool call alongside. "Blocked the main thread" and
+# "the request was denied by the API" are prose about the work, not a refusal to
+# do it, and must keep passing.
+_PERMISSION_DENIED_RE = re.compile(
+    r"^\W*(?:blocked\s*(?=[:.]|$)|permission\s+(?:denied|not\s+granted|required)"
+    r"|not\s+permitted\b|no\s+(?:write\s+)?permission\b"
+    r"|needs?\s+(?:approval|permission)\b)"
+    r"|(?:write|read|file|tool)\s+permissions?\s+(?:is\s+|are\s+|was\s+|were\s+)?"
+    r"(?:not\s+granted|denied|required|needed)",
+    re.I)
+
+
+def _looks_like_permission_block(text):
+    """True when a turn reports being BLOCKED rather than doing the work.
+
+    Separate from _looks_like_refusal because the grammar is different: a model
+    declines in the first person, a sandboxed CLI states an obstacle. Both are
+    non-answers to a request that asked for an action."""
+    if not text or not isinstance(text, str):
+        return False
+    head = text.strip()[:_REFUSAL_HEAD_CHARS]
+    if not head:
+        return False
+    first = re.split(r"(?<=[.!?])\s", head, 1)[0]
+    if "?" in first:
+        return False                  # asking is what it SHOULD do
+    return bool(_PERMISSION_DENIED_RE.search(first))
+
+
 def _looks_like_refusal(text):
     """True when `text` OPENS by declining the task rather than doing it."""
     if not text or not isinstance(text, str):
@@ -15676,6 +15723,26 @@ def _swarm_tool_result(body):
     cands, seen = [], set()
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_tools=True,
                                            messages=messages):
+        # A LOCAL SUBSCRIPTION CANNOT EMIT A TOOL CALL, so it can never win a
+        # fan-out whose whole purpose is to produce one. _subscription_chat
+        # reads only payload["messages"] and never payload["tools"], and its
+        # response shim is a two-key {"role","content"} literal with no
+        # tool_calls key at all -- structural, not a model failing today.
+        #
+        # MEASURED over three live fan-outs: sub-claude took a member slot every
+        # time and returned the same prose every time -- "Blocked: write
+        # permission not granted for <an AppData path>" -- at ~21s against 3-7s
+        # for the models that answered. One slot in five, spent on a certainty.
+        #
+        # Skipped HERE rather than in _build_chain: `require_tools` is
+        # bool(body["tools"]), which is true for every Claude Code, opencode and
+        # codex turn INCLUDING read-only questions the CLI attaches its schema
+        # to. Gating the chain own sub append on it would turn those into 503s
+        # exactly when the free fleet is empty and the paid subscription is the
+        # only thing left. The chain keeps its last resort; the swarm, which
+        # needs a tool call specifically, stops spending a slot on one.
+        if _is_sub(hop_pid):
+            continue
         ident = _normalize_model_identity(hop_model)
         if ident in seen:
             continue
@@ -15762,7 +15829,8 @@ def _swarm_tool_result(body):
         #
         # _chat_json_nonanswer has treated a refusal as a non-answer on the
         # single-model path for a while; the fan-out simply never asked.
-        if not msg.get("tool_calls") and _looks_like_refusal(msg.get("content")):
+        if not msg.get("tool_calls") and (_looks_like_refusal(msg.get("content"))
+                                          or _looks_like_permission_block(msg.get("content"))):
             _note_nonanswer(hop_pid, hop_model)
             return _why("refused: %s"
                         % " ".join((msg.get("content") or "")[:60].split()))
