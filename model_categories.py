@@ -87,8 +87,15 @@ CATEGORIES = [
         "Uncensored / steerable",
         "Follows a system prompt without lecturing, and takes on work other "
         "models decline. The hub's own safety filter still applies on top.",
+        # USER-REPORTED 2026-09-05, from their own use of these models: glm
+        # belongs here. It was the only one of the three they named that was
+        # missing -- qwen3.8 (7 live ids) and deepseek-v4-flash (12) already
+        # matched, and grok-4-fast simply happened to win the pick they saw.
+        # "glm-5" rather than "glm": 5.2 and 5.3 are the steerable generation,
+        # and a bare "glm" would also sweep in glm-4.6-thinking, which belongs
+        # to `reasoning` and is a different claim about behaviour.
         ("hermes-3", "cydonia", "grok-", "qwen3.8", "hy3", "deepseek-v4-flash",
-         "gpt-oss", "dolphin", "openhermes"),
+         "gpt-oss", "dolphin", "openhermes", "glm-5"),
     ),
     (
         "fast",
