@@ -88,10 +88,17 @@ def test_no_listing_builds_its_own_copy():
     Exactly one occurrence: the definition inside _virtual_model_ids. A second
     means some surface is assembling the ids itself again, which is the shape
     that loses the next mode."""
+    import re
     src = open("app.py", encoding="utf-8").read()
     assert src.count("_SWARM_IDS + tuple(crews.CREW_IDS)") == 1
     i = src.index("_SWARM_IDS + tuple(crews.CREW_IDS)")
-    assert "def _virtual_model_ids" in src[max(0, i - 300):i]
+    # The ENCLOSING function must be _virtual_model_ids. This used to look back
+    # a fixed 300 characters, which is a proxy for "enclosing" that breaks the
+    # moment the function grows a comment -- and the comment that broke it was
+    # documenting the modes, i.e. exactly the kind of change this guards.
+    before = src[:i]
+    enclosing = re.findall(r"^def (\w+)", before, re.M)
+    assert enclosing and enclosing[-1] == "_virtual_model_ids", enclosing[-1:]
 
 
 def test_max_is_labelled_so_a_picker_explains_itself(client):

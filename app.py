@@ -4816,6 +4816,10 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     _floor = _TOOLS_MIN_SCORE if require_tools else _DIFFICULTY_FLOOR.get(difficulty, 0)
     if _compactable and not any(c[0] >= _floor for c in cands):
         cands += _compactable
+    # MODE: "use the coding models on this project" and the like. A filter, not
+    # a rewrite of the blocked list -- see _MODE_SETTING. Fail-open, so a mode
+    # whose models are all busy degrades to answering rather than to refusing.
+    cands = _apply_mode(cands)
     if require_tools:
         # A tools request must never land on a completion-only model. FAIL-OPEN:
         # keep the unfiltered list if NO candidate is known tool-capable.
@@ -5026,6 +5030,7 @@ def _is_orchestrate(model):
     if "/" in model:
         return False
     return (not model) or model in ("auto", "orchestrate", "default", "best") \
+        or model in _mode_keys() \
         or model.startswith("claude") \
         or model in _CLAUDE_MODEL_ALIASES
 
@@ -5447,6 +5452,12 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     if _needs_compaction and not any(e[0] >= _floor for e in fast + slow):
         for entry in _needs_compaction:
             (fast if _is_fast(entry[1], entry[2]) else slow).append(entry)
+    # MODE, the same filter the primary pick applies -- otherwise a mode chose
+    # the first model and the chain behind it quietly left the mode again on the
+    # first retry. Fail-open per tier, so a mode with nothing available still
+    # falls back to the full chain rather than to no chain.
+    fast = _apply_mode(fast)
+    slow = _apply_mode(slow)
     # best model first; tie among equal-score models -> most free quota left, so
     # the fallback chain keeps using providers that still have budget.
     fast.sort(key=lambda t: (t[0], _quota_headroom(t[1])), reverse=True)
@@ -8685,6 +8696,66 @@ def api_model_categories():
                     "total": len(live)})
 
 
+@app.route("/api/model-mode", methods=["GET", "POST"])
+def api_model_mode():
+    """Which KIND of model to use, globally or for one agent session.
+
+    GET  -> {"mode","modes":[{"key","label","help","count"}],"session":{...}}
+    POST {"mode":"coding"}                  -> set the global default
+    POST {"mode":"coding","session_id":...} -> set it for ONE agent session
+
+    A mode is a filter applied while routing, NOT a rewrite of the blocked list.
+    The two used to be the same thing -- choosing a category wrote
+    blocked_models = everything outside it -- which meant a mode could only ever
+    be global, and one click on "All models" silently deleted the user's own
+    off-list. Kept apart, "blocked" means never and "mode" means not for this
+    request, and a project can pick a mode without touching either.
+
+    Three places select one, most specific winning: a model id sent by a CLI
+    (`model: "coding"`), an agent session's own mode, then this global default.
+    """
+    if request.method == "POST":
+        body = request.get_json(force=True, silent=True) or {}
+        mode = _valid_mode(body.get("mode"))
+        if mode is None:
+            return jsonify({"error": "Unknown mode. Use one of: %s"
+                            % ", ".join(("all",) + _mode_keys())}), 400
+        sid = str(body.get("session_id") or "").strip()
+        if sid:
+            # PER PROJECT. The session carries it to its CLI as the model id on
+            # every turn -- see agentic_chat._session_model_id -- so a running
+            # session picks it up on its next turn without a restart.
+            if not agentic_chat.set_session_mode(sid, None if mode == MODE_ALL else mode):
+                return jsonify({"error": "No such agent session."}), 404
+        else:
+            config.set_setting(_MODE_SETTING, mode)
+
+    live = []
+    for pid in _available_providers():
+        try:
+            for m in provider_free_models(pid) or []:
+                live.append((pid, m, _normalize_model_identity(m)))
+        except Exception:                                        # noqa: BLE001
+            continue
+    modes = [{"key": MODE_ALL, "label": "All models",
+              "help": "No restriction: every model the hub can reach.",
+              "count": len(live)}]
+    for key, label, helptext in model_categories.labels():
+        if key not in _mode_keys():
+            continue          # a pipeline id, not a mode -- see _mode_keys
+        modes.append({"key": key, "label": label, "help": helptext,
+                      "count": sum(1 for p, m, i in live
+                                   if model_categories.matches(key, p, m, i))})
+    out = {"mode": _global_mode(), "modes": modes}
+    sid = str(request.args.get("session_id") or "").strip()
+    if sid:
+        sess = agentic_chat.get_session(sid) or {}
+        out["session"] = {"session_id": sid,
+                          "mode": sess.get("mode") or MODE_ALL,
+                          "exists": bool(sess)}
+    return jsonify(out)
+
+
 @app.route("/api/model-blocklist", methods=["GET", "POST", "DELETE"])
 def api_model_blocklist():
     """The blocked-model list, and blocking a whole FAMILY by name.
@@ -10002,6 +10073,121 @@ def _no_candidates_hint():
 # of rotation before this was automatic and temporary -- _mark_model_dead on a
 # 402/403/404 with a 6h TTL, or providers.is_model_allowed's hardcoded safety
 # regex. Nothing let a person say "not this one".
+# MODE: which KIND of model this request may use.
+#
+# A mode is a model_categories key ("coding", "reasoning", "vision",
+# "uncensored", ...) or "all". It is a FILTER applied while routing, and
+# deliberately NOT a rewrite of the blocked list.
+#
+# It used to be exactly that rewrite: choosing a category wrote
+# blocked_models = every model outside it, and "All models" wrote []. Two
+# things wrong with it. The blocked list is the user's own off-switch -- 300
+# entries on this install, including a gpt-oss family blacklist -- and one
+# click on "All models" silently deleted every one of them. And a rewrite is
+# global by construction, so "use the coding models on THIS project" could not
+# be expressed at all.
+#
+# As a filter the two are orthogonal: blocked means "never", mode means "not
+# for this request", and they compose without either destroying the other.
+#
+# Precedence, most specific first:
+#   1. the request's own model id -- `model: "coding"` from any CLI
+#   2. the agent session's mode   -- per project, set on the Agent page
+#   3. the global setting         -- the Settings buttons
+#   4. "all"
+_MODE_SETTING = "model_mode"
+MODE_ALL = "all"
+
+
+def _mode_keys():
+    """Category keys usable as a MODE, i.e. as a model id a CLI can send.
+
+    "swarm" is both a model_categories key and the swarm PIPELINE's id, and the
+    pipeline meaning has to win: reading `model: "swarm"` as a mode would route
+    it through ordinary single-model orchestration and the fan-out would never
+    run at all. Excluded here rather than special-cased at each use, so a future
+    category that happens to share a pipeline name cannot silently shadow it.
+
+    Still selectable as a mode from Settings and the Agent page -- those send a
+    category key, not a model id, so there is nothing to collide with."""
+    taken = set(_SWARM_IDS) | set(crews.CREW_IDS) | {"auto", "best", MODE_ALL}
+    return tuple(k for k in model_categories.CATEGORY_KEYS if k not in taken)
+
+
+def _valid_mode(mode):
+    """The mode, or None when it names no category the hub knows."""
+    m = str(mode or "").strip().lower()
+    if not m or m == MODE_ALL:
+        return MODE_ALL
+    return m if m in model_categories.CATEGORY_KEYS else None
+
+
+def _global_mode():
+    try:
+        return _valid_mode(config.get_setting(_MODE_SETTING, MODE_ALL)) or MODE_ALL
+    except Exception:                                            # noqa: BLE001
+        return MODE_ALL
+
+
+def _active_mode():
+    """The mode in force for the request being served right now.
+
+    Falls back to the global setting outside a request context, so routing
+    called from a probe or a test behaves the same as routing called from a
+    handler."""
+    try:
+        m = getattr(g, "model_mode", None)
+        if m:
+            return _valid_mode(m) or MODE_ALL
+    except Exception:                                            # noqa: BLE001
+        pass
+    # THE SESSION'S OWN MODE, for a request that arrived under an agent session.
+    # Normally redundant: the mode reaches the CLI as its model id, so the id
+    # above has already set it. This covers the case where it did not -- a CLI
+    # that ignores --model, or one whose config pins a model of its own -- so
+    # "this project uses the coding models" holds even when the id is lost.
+    try:
+        sid = _build_sid()
+        if sid:
+            sm = _valid_mode((agentic_chat.get_session(sid) or {}).get("mode"))
+            if sm and sm != MODE_ALL:
+                return sm
+    except Exception:                                            # noqa: BLE001
+        pass
+    return _global_mode()
+
+
+def _mode_allows(mode, pid, model):
+    """True when this model belongs to the mode in force.
+
+    Never consulted for MODE_ALL, and always fails OPEN on anything it cannot
+    evaluate: a mode is a preference about which models to prefer, and refusing
+    to answer because a category list is unrecognised would be a worse outcome
+    than answering with the wrong kind of model."""
+    try:
+        if not mode or mode == MODE_ALL:
+            return True
+        return model_categories.matches(mode, pid, model,
+                                        _normalize_model_identity(model))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _apply_mode(cands, mode=None, key=lambda c: (c[1], c[2])):
+    """Keep only the candidates the mode allows -- unless that empties the list.
+
+    FAIL-OPEN is the whole contract. A category is a hand-written list of model
+    families, and the fleet it is matched against changes every day: a mode
+    whose models are all rate-limited, withdrawn or switched off must degrade to
+    "answer with something" rather than to "cannot answer". The caller keeps its
+    own ordering; this only removes."""
+    m = _valid_mode(mode if mode is not None else _active_mode())
+    if not m or m == MODE_ALL or not cands:
+        return cands
+    kept = [c for c in cands if _mode_allows(m, *key(c))]
+    return kept or cands
+
+
 _BLOCKED_SETTING = "blocked_models"
 
 
@@ -15029,13 +15215,25 @@ _VIRTUAL_MODEL_LABELS = {
 
 
 def _virtual_model_label(mid):
-    """What a picker shows next to the id. The two routing MODES say what they
-    do; everything else is a pipeline."""
-    return _VIRTUAL_MODEL_LABELS.get(mid, mid + " (multi-model pipeline)")
+    """What a picker shows next to the id. The routing MODES say what they do;
+    everything else is a pipeline."""
+    if mid in _VIRTUAL_MODEL_LABELS:
+        return _VIRTUAL_MODEL_LABELS[mid]
+    if mid in _mode_keys():
+        for key, label, _help in model_categories.labels():
+            if key == mid:
+                return "%s (mode - %s only)" % (mid, label.lower())
+    return mid + " (multi-model pipeline)"
 
 
 def _virtual_model_ids():
-    return ("auto", "best") + _SWARM_IDS + tuple(crews.CREW_IDS)
+    # The MODES are listed too. Selecting one inside a CLI has no other handle:
+    # a coding agent has no settings screen and no notion of this hub's
+    # projects, but every one of them can set a model id. `model: "coding"`
+    # routes exactly like `auto` while restricting the pool to that category, so
+    # "use the coding models here" is expressible from opencode, codex, Claude
+    # Code and the rest without any per-CLI plumbing.
+    return ("auto", "best") + _mode_keys() + _SWARM_IDS + tuple(crews.CREW_IDS)
 
 # Total deadline for ONE swarm/crew stage hop. Swarm stages dispatch
 # non-streaming, so they get neither the streaming first-byte peek (~25-90s)
@@ -16585,6 +16783,14 @@ def _chat_completions_uncached(body):
         _rkw = {}
         if (body.get("model") or "").strip().lower() == "best" and not has_images:
             _rkw["quality_mode"] = True
+        # A MODE id ("coding", "vision", ...) routes exactly like `auto` and
+        # restricts the pool to that category for THIS request only -- the one
+        # handle a CLI has for choosing a mode. Set on `g` rather than passed
+        # down: the chain, the swarm and the retries all consult _active_mode(),
+        # so one assignment covers every path this request takes.
+        _req_mode = _valid_mode((body.get("model") or "").strip().lower())
+        if _req_mode and _req_mode != MODE_ALL:
+            g.model_mode = _req_mode
         pid, resolved, diff = router(body.get("messages"), body.get("max_tokens"), est,
                                      require_tools=has_tools, **_rkw)
         if veto and pid is not None and _normalize_model_identity(resolved) in veto:

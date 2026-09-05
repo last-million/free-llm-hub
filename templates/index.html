@@ -1410,6 +1410,9 @@
     display:flex;align-items:center;gap:10px;padding:16px 18px;border-bottom:1px solid var(--border-soft);
     font-weight:700;font-size:15px;flex:none;
   }
+  .agent-mode{padding:3px 8px;border-radius:8px;border:1px solid var(--border);
+    background:var(--bg);color:var(--fg);font-size:.9em;max-width:190px}
+  .agent-mode.set{border-color:var(--accent);color:var(--accent)}
   .sd-cats{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
   .sd-cat{padding:4px 10px;border-radius:999px;border:1px solid var(--border);
     background:transparent;color:var(--text);font-size:11.5px;font-weight:600;
@@ -2630,6 +2633,15 @@
                 <span>Swarm</span>
               </label>
             </div>
+            <!-- MODE, per project. Quality says how HARD to try; mode says which
+                 KIND of model. A select rather than radios because there are
+                 eight of them and the row is already full -- and unlike quality,
+                 the common case is leaving it alone. -->
+            <select class="agent-mode" id="agent-mode"
+                    aria-label="Which kind of model this project uses"
+                    title="Restrict this project to one kind of model. Applies from the NEXT message.">
+              <option value="all">All models</option>
+            </select>
             <button class="btn sm ghost" id="agent-checkpoint" type="button" title="Mark this point in the transcript. To put the FILES back too, use Restore &amp; rerun on one of your own messages.">Bookmark</button>
             <button class="btn sm ghost" id="agent-running" type="button"
                   title="Conversations and previews currently open">Running <span id="agent-running-n">0</span></button>
@@ -8257,6 +8269,7 @@
 
     window.cxResumeAgentSession = function(r){
       sessionId = r.session_id;
+      try { loadAgentMode(); } catch (e) {}
       if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
       showSessionState(r.cli, r.project_dir);
       /* This is the load-time restore for /agent/<session_id> -- the page you
@@ -8324,6 +8337,66 @@
           })
           .catch(function(e){ toast('Quality: ' + e.message, true); })
           .then(function(){ lockQuality(false); });
+      });
+    }
+
+    /* PER-PROJECT MODE.
+       Same discipline as setQuality: the control reflects what the SERVER says
+       this session is, never what was last clicked -- a switch that lies about
+       the mode is the bug that was reported for quality.
+       The list is fetched once; the counts come from the same category table
+       the router uses, so the number beside a mode is the number of models it
+       will actually be allowed to pick from. */
+    var _agentModes = null;
+
+    function renderAgentMode(sel, cur){
+      if (!sel || !_agentModes) return;
+      sel.innerHTML = _agentModes.map(function(m){
+        return '<option value="' + esc(m.key) + '"' +
+               (m.key === cur ? ' selected' : '') + '>' +
+               esc(m.label) + (m.key === 'all' ? '' : ' (' + m.count + ')') +
+               '</option>';
+      }).join('');
+      sel.title = (_agentModes.filter(function(m){ return m.key === cur; })[0] || {}).help ||
+                  'Restrict this project to one kind of model.';
+      if (cur && cur !== 'all') sel.classList.add('set');
+      else sel.classList.remove('set');
+    }
+
+    function loadAgentMode(){
+      var sel = $('#agent-mode');
+      if (!sel) return Promise.resolve();
+      var url = '/api/model-mode' +
+                (sessionId ? '?session_id=' + encodeURIComponent(sessionId) : '');
+      return api(url).then(function(r){
+        _agentModes = (r && r.modes) || [];
+        /* No session yet -> show the global default, which is what a new
+           session will inherit. */
+        var cur = (r && r.session && r.session.mode) || (r && r.mode) || 'all';
+        renderAgentMode(sel, cur);
+      }).catch(function(){ /* optional control: never block the agent page */ });
+    }
+
+    function initAgentMode(){
+      var sel = $('#agent-mode');
+      if (!sel) return;
+      sel.addEventListener('change', function(){
+        var want = sel.value || 'all';
+        sel.disabled = true;
+        var body = { mode: want };
+        if (sessionId) body.session_id = sessionId;
+        api('/api/model-mode', { method: 'POST', body: body })
+          .then(function(r){
+            _agentModes = (r && r.modes) || _agentModes;
+            var cur = (r && r.session && r.session.mode) || want;
+            renderAgentMode(sel, cur);
+            toast(want === 'all'
+                    ? 'Mode: all models' + (sessionId ? ' for this project' : '')
+                    : 'Mode: ' + want + (sessionId ? ' for this project' : ' (global)') +
+                      ' — from the next message');
+          })
+          .catch(function(e){ toast('Mode: ' + e.message, true); loadAgentMode(); })
+          .then(function(){ sel.disabled = false; });
       });
     }
 
@@ -8923,6 +8996,7 @@
         .then(function(r){
           r = r || {};
           sessionId = r.session_id;
+          try { loadAgentMode(); } catch (e) {}
           if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
           showSessionState(r.cli || cli, r.project_dir || dir);
           /* The reported bug: picking Swarm at the start left the control
@@ -9415,6 +9489,7 @@
       // of pretending to resume something that no longer exists.
       api('/api/agent/sessions/' + encodeURIComponent(conv.session_id)).then(function(r){
         sessionId = conv.session_id;
+        try { loadAgentMode(); } catch (e) {}
         if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
         showSessionState(r.cli || conv.cli_id, r.project_dir || conv.project_dir);
         setQuality(r.quality || conv.quality || 'normal');
@@ -9435,6 +9510,7 @@
                    { method: 'POST', body: {} })
           .then(function(r){
             sessionId = r.session_id || conv.session_id;
+            try { loadAgentMode(); } catch (e) {}
             if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
             showSessionState(r.cli || conv.cli_id, r.project_dir || conv.project_dir);
             /* The server put the rebuilt session back in the saved mode; show it. */
@@ -9470,6 +9546,8 @@
     initAgentQuality();   /* defined at this same indent, i.e. this scope --
                              calling it from the top level is the exact bug
                              that took the whole dashboard down earlier. */
+    initAgentMode();
+    loadAgentMode();
     initFolderPicker();
     initRunningPanel();
     endBtn.addEventListener('click', doEnd);
@@ -9947,19 +10025,26 @@
      the best, else the next best" needs nothing extra. */
   var _sdCats = [];
 
+  /* THE ACTIVE MODE IS REMEMBERED, NOT INFERRED.
+     This used to decide which button was lit by comparing counts -- "every
+     model in this category is enabled and nothing outside it is". That only
+     holds while the category is the ONLY thing touching the model list, and it
+     stops being true the moment anything is switched off by hand. With 300
+     models blocked on this install no button could ever light up, so the
+     dashboard showed no mode at all while one was plainly in force.
+     The server stores the choice now (see /api/model-mode) and this reads it. */
+  var _sdMode = 'all';
+
   function renderSdCats(){
     var host = $('#sd-cats');
     if (!host) return;
-    var allOn = !(_sdBlocked && Object.keys(_sdBlocked).length);
     host.innerHTML =
-      '<button class="sd-cat' + (allOn ? ' on' : '') + '" type="button" data-key="all">' +
+      '<button class="sd-cat' + (_sdMode === 'all' ? ' on' : '') +
+        '" type="button" data-key="all" title="No restriction: every model the hub can reach.">' +
         'All models</button>' +
       _sdCats.map(function(c){
-        /* "on" means every model in this category is enabled AND nothing
-           outside it is -- i.e. this button is what is currently in force. */
-        var exact = !allOn && c.enabled === c.count && c.count > 0 &&
-                    (_sdModels.length - Object.keys(_sdBlocked).length) === c.count;
-        return '<button class="sd-cat' + (exact ? ' on' : '') + '" type="button" data-key="' +
+        return '<button class="sd-cat' + (_sdMode === c.key ? ' on' : '') +
+               '" type="button" data-key="' +
                esc(c.key) + '" title="' + esc(c.help || '') + '"' +
                (c.count ? '' : ' disabled') + '>' + esc(c.label) +
                '<span class="n">' + c.count + '</span></button>';
@@ -9971,16 +10056,17 @@
         var key = this.getAttribute('data-key');
         var all = host.querySelectorAll('.sd-cat');
         for (var j = 0; j < all.length; j++) all[j].disabled = true;
-        api('/api/model-categories', { method: 'POST', body: { key: key } })
+        /* Sets the MODE. It no longer rewrites the blocked list, which is why
+           choosing a mode can no longer wipe a hand-made blacklist -- and why
+           "All models" means "no mode filter", not "unblock everything". */
+        api('/api/model-mode', { method: 'POST', body: { mode: key } })
           .then(function(r){
-            _sdCats = (r && r.categories) || [];
-            _sdBlocked = {};
-            ((r && r.blocked) || []).forEach(function(x){ _sdBlocked[x] = true; });
+            _sdMode = (r && r.mode) || 'all';
+            var hit = ((r && r.modes) || []).filter(function(m){ return m.key === key; })[0];
             renderSdCats(); renderSdModels();
-            var n = _sdModels.length - Object.keys(_sdBlocked).length;
-            toast(key === 'all' ? 'All models enabled'
-                                : 'Using ' + n + ' model' + (n === 1 ? '' : 's') +
-                                  ' good at ' + key);
+            toast(key === 'all'
+                    ? 'Mode: all models'
+                    : 'Mode: ' + key + (hit ? ' (' + hit.count + ' models)' : ''));
           })
           .catch(function(e){ toast('Categories: ' + e.message, true); })
           .then(function(){
@@ -9992,12 +10078,14 @@
   }
 
     function loadSdModels(silent){
-      return Promise.all([api('/api/tracking'), api('/api/model-categories')])
+      return Promise.all([api('/api/tracking'), api('/api/model-categories'),
+                          api('/api/model-mode')])
         .then(function(res){
           _sdModels = ((res[0] && res[0].models) || []).slice();
           _sdCats = ((res[1] && res[1].categories) || []).slice();
           _sdBlocked = {};
           ((res[1] && res[1].blocked) || []).forEach(function(x){ _sdBlocked[x] = true; });
+          _sdMode = (res[2] && res[2].mode) || 'all';
           renderSdCats();
           renderSdModels();
           loadSdSpeed();

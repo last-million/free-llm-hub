@@ -558,7 +558,8 @@ def _isolated_config_dir(cli_id: str) -> str:
 
 
 def _agentic_env(cli_id: str = None, project_dir: str = None,
-                 quality: str = "normal", session_id: str = None) -> dict:
+                 quality: str = "normal", session_id: str = None,
+                 mode: str = None) -> dict:
     """Child env with every hub-pointing override stripped, PWD resynced to
     match the subprocess cwd we are about to give it, and the CLI pointed at
     the hub's OWN config directory.
@@ -602,7 +603,7 @@ def _agentic_env(cli_id: str = None, project_dir: str = None,
             if cli_id == "opencode":
                 _seed_opencode_config(path)
             elif cli_id == "claude":
-                _apply_claude_hub_fallback(env, path, quality, session_id)
+                _apply_claude_hub_fallback(env, path, quality, session_id, mode)
             elif cli_id == "codex":
                 _apply_codex_hub_fallback(path, session_id)
     return env
@@ -620,7 +621,8 @@ def _hub_base_url(session_id: str = None) -> str:
     return base + "/build/" + session_id if session_id else base
 
 
-def _apply_claude_hub_fallback(env, config_home, quality="normal", session_id=None):
+def _apply_claude_hub_fallback(env, config_home, quality="normal", session_id=None,
+                               mode=None):
     """No subscription, no problem: an isolated copy that has never been
     signed in runs against THIS HUB'S OWN FREE MODELS instead, same as
     opencode already does -- asked for directly: "/agent CLIs should work
@@ -647,7 +649,9 @@ def _apply_claude_hub_fallback(env, config_home, quality="normal", session_id=No
     # makes, including the small intermediate ones -- there is no other channel
     # back to the hub, since the CLI subprocess is an ordinary API client and
     # carries no session identity of its own.
-    env["ANTHROPIC_MODEL"] = {"max": "best", "swarm": "swarm"}.get(quality, "auto")
+    # One mapping, not a second copy of it: a mode id missing here would be a
+    # turn routed as plain `auto` while the UI said otherwise.
+    env["ANTHROPIC_MODEL"] = _hub_model_for(quality, mode)
 
 
 # Bare minimum codex needs to treat the hub as a provider -- the same shape
@@ -1065,9 +1069,9 @@ def _terminate(proc) -> None:
 class _Session:
     __slots__ = ("id", "cli_id", "project_dir", "native_session_id", "turn_count",
                  "created_at", "proc", "proc_lock", "turn_lock", "last_interrupted",
-                 "tools_notified", "quality")
+                 "tools_notified", "quality", "mode")
 
-    def __init__(self, cli_id, project_dir, quality="normal"):
+    def __init__(self, cli_id, project_dir, quality="normal", mode=None):
         self.id = uuid.uuid4().hex
         self.cli_id = cli_id
         self.project_dir = project_dir
@@ -1083,6 +1087,13 @@ class _Session:
         # the CLI with ANTHROPIC_MODEL=best instead of auto, so every turn it
         # sends is routed at the top tier and never drops to the cheap one.
         self.quality = quality if quality in ("normal", "max", "swarm") else "normal"
+        # PER-PROJECT MODE. A model_categories key ("coding", "reasoning",
+        # "vision", ...) restricting this session to that kind of model, or None
+        # for whatever the hub's global setting says. Carried to the hub as the
+        # session's model id, exactly as `quality` is -- see _hub_model_for --
+        # so one project can run on the coding models while another runs on the
+        # reasoning ones, with no global setting to remember to change back.
+        self.mode = mode or None
 
 
 _REGISTRY: dict[str, _Session] = {}
@@ -1146,7 +1157,8 @@ def get_recent_projects():
         return list(_recent_projects)
 
 
-def start_session(cli_id, project_dir, create_new=False, quality="normal") -> str:
+def start_session(cli_id, project_dir, create_new=False, quality="normal",
+                  mode=None) -> str:
     """Validate + register a new agentic session, return its session_id.
     Raises AgenticError (with a caller-friendly .status) on any invalid input.
     Never spawns a subprocess -- that only happens on the first send_message().
@@ -1204,7 +1216,7 @@ def start_session(cli_id, project_dir, create_new=False, quality="normal") -> st
     if not supported:
         raise AgenticError("%s agentic mode is not currently supported: %s"
                            % (cli_id, reason), 400)
-    sess = _Session(cli_id, abs_dir, quality=quality)
+    sess = _Session(cli_id, abs_dir, quality=quality, mode=mode)
     with _REGISTRY_LOCK:
         _REGISTRY[sess.id] = sess
     _remember_recent_project(abs_dir)
@@ -1314,13 +1326,38 @@ _MODEL_ALIAS = "opus"
 # --help`) rather than assumed -- both accept `-m, --model`.
 # --------------------------------------------------------------------------- #
 
-def _hub_model_for(quality: str = None) -> str:
+def _session_model_id(sess) -> str:
+    """The hub model id one session's turns must carry, or None to send none.
+
+    Three launchers repeated `if quality in ("max","swarm")` and then built the
+    id, which was fine while a quality tier was the only thing that could
+    override the model. A per-project MODE is a second one, and adding it to
+    three copies of the same condition is how the fourth launcher gets
+    forgotten. Normal-quality, no-mode sessions still get None, so the CLI's own
+    config keeps deciding exactly as before."""
+    quality = getattr(sess, "quality", "normal")
+    mode = getattr(sess, "mode", None)
+    if quality not in ("max", "swarm") and not mode:
+        return None
+    return _hub_model_for(quality, mode)
+
+
+def _hub_model_for(quality: str = None, mode: str = None) -> str:
     """The hub-side model id that carries a session's mode.
 
     "best" is app._is_orchestrate's quality_mode (auto that never drops to the
     cheap tier); "swarm" is app._is_swarm_model's parallel best-of-N fan-out;
     "auto" is ordinary routing. Anything unrecognised falls back to auto rather
     than inventing a model name nothing serves."""
+    if mode:
+        # A MODE is more specific than a quality tier: "max" only says never the
+        # cheap models, while "coding" says which KIND. A user who picked a mode
+        # for this project asked for that kind, so it wins. "swarm" is not a
+        # mode but a PIPELINE, and keeps precedence over both -- routing a
+        # fan-out as a single model would silently turn the feature off.
+        if (quality or "normal") == "swarm":
+            return "swarm"
+        return mode
     return {"max": "best", "swarm": "swarm"}.get(quality or "normal", "auto")
 
 
@@ -1471,9 +1508,9 @@ def write_task_brief(project_dir, text):
 def _claude_model_for(sess) -> str:
     """--model for one claude turn: the session's mode when the hub is serving
     it, the long-stable "opus" alias otherwise."""
-    quality = getattr(sess, "quality", "normal")
-    if quality in ("max", "swarm") and _hub_backs("claude"):
-        return _hub_model_for(quality)
+    _mid = _session_model_id(sess)
+    if _mid and _hub_backs("claude"):
+        return _mid
     return _MODEL_ALIAS
 
 
@@ -1564,9 +1601,9 @@ def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
     base = ["exec"]
     # Only Max/Swarm touch argv; Normal keeps the shipped shape byte for byte
     # and lets config.toml's model = "auto" decide, exactly as before.
-    quality = getattr(sess, "quality", "normal")
-    if quality in ("max", "swarm") and _hub_backs("codex"):
-        base += ["--model", _hub_model_for(quality)]
+    _mid = _session_model_id(sess)
+    if _mid and _hub_backs("codex"):
+        base += ["--model", _mid]
     if sess.native_session_id:
         base += ["resume", sess.native_session_id, "--json",
                  "--dangerously-bypass-approvals-and-sandbox", prompt]
@@ -1619,9 +1656,9 @@ def _build_argv_opencode(sess: "_Session", bin_path: str, text: str):
     # config is what points it here (see _seed_opencode_config). Normal still
     # sends no flag at all, so a project's own opencode.json keeps winning by
     # default; asking for Max or Swarm is an explicit override of it.
-    quality = getattr(sess, "quality", "normal")
-    if quality in ("max", "swarm"):
-        args += ["--model", "free-llm-hub/" + _hub_model_for(quality)]
+    _mid = _session_model_id(sess)
+    if _mid:
+        args += ["--model", "free-llm-hub/" + _mid]
     if sess.native_session_id:
         args += ["--session", sess.native_session_id]
     args += [prompt]
@@ -1942,7 +1979,8 @@ def send_message(session_id, text):
                     argv, cwd=sess.project_dir,
                     env=_agentic_env(sess.cli_id, sess.project_dir,
                                       getattr(sess, "quality", "normal"),
-                                      getattr(sess, "id", None)),
+                                      getattr(sess, "id", None),
+                                      getattr(sess, "mode", None)),
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, encoding="utf-8", errors="replace",
                     **_tree_popen_kwargs())
@@ -2298,7 +2336,8 @@ def send_message_stream(session_id, text):
             argv = _build_argv(sess, bin_path, text, stream=True)
             child_env = _agentic_env(sess.cli_id, sess.project_dir,
                                      getattr(sess, "quality", "normal"),
-                                     getattr(sess, "id", None))
+                                     getattr(sess, "id", None),
+                                     getattr(sess, "mode", None))
             try:
                 proc = subprocess.Popen(
                     argv, cwd=sess.project_dir, env=child_env,
@@ -2554,6 +2593,22 @@ def stop_session(session_id) -> bool:
     return True
 
 
+def set_session_mode(session_id, mode):
+    """Set one session's model MODE. False when the session does not exist.
+
+    Takes effect on the session's NEXT turn: the mode leaves here as the model
+    id its CLI is launched with, and the CLI process for a turn already running
+    was started with the old one. No restart is needed beyond that -- which is
+    the point of carrying it as a model id rather than as launch configuration.
+    """
+    with _REGISTRY_LOCK:
+        sess = _REGISTRY.get(session_id)
+        if sess is None:
+            return False
+        sess.mode = mode or None
+        return True
+
+
 def get_session(session_id):
     """Status dict for one session, or None if it doesn't exist. Never raises."""
     with _REGISTRY_LOCK:
@@ -2567,6 +2622,7 @@ def get_session(session_id):
         "session_id": sess.id,
         "cli": sess.cli_id,
         "quality": getattr(sess, "quality", "normal"),
+        "mode": getattr(sess, "mode", None),
         "project_dir": sess.project_dir,
         "turn_count": sess.turn_count,
         "currently_running": running,
