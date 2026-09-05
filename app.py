@@ -5340,8 +5340,10 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     fast, slow = [], []
     _cand_pids = _exclude_google_for_foreign_tool_history(
         _available_providers(), require_tools, messages)
+    _too_small = []          # skipped for SIZE ALONE -- see the tail at the end
     for pid in _cand_pids:
         if not _provider_capable(pid, est):
+            _too_small.append(pid)
             continue
         for m in _auto_models(pid):
             if (pid, m) in seen or not prov.is_model_allowed(m) or _is_model_dead(pid, m):
@@ -5479,6 +5481,37 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
                 continue
             head.append((pid, m))
         chain = head + [e for e in chain if e not in head]
+    # LAST RESORT FOR AN ENORMOUS REQUEST: providers that cannot take it WHOLE.
+    #
+    # The size filter above asks "can this provider swallow `est` tokens", and
+    # answers for the request as SENT. But _upstream_chat compacts to each
+    # model's own window before sending (see _compact_to_budget), so a provider
+    # that cannot take the full conversation can very often serve a trimmed one.
+    # Filtering on the raw size hides every one of them.
+    #
+    # MEASURED 2026-09-05 from a real opencode turn: est=111875 tokens left a
+    # chain of THREE hops -- nvidia twice and a local relay -- and when they
+    # came back ConnectionError, 413, 413 the answer was a 503, while eighty-odd
+    # other models sat unused that would have served a compacted version.
+    #
+    # Appended, never promoted: a model that gets the whole conversation is
+    # always better than one that gets part of it, so these are reached only
+    # once every full-size option is gone. Fewer old turns is a worse answer;
+    # no answer at all is not an answer.
+    if _too_small and len(chain) < MAX_HOPS:
+        for pid in _too_small:
+            for m in _auto_models(pid):
+                if (pid, m) in seen or not prov.is_model_allowed(m) or _is_model_dead(pid, m):
+                    continue
+                if _veto and _normalize_model_identity(m) in _veto:
+                    continue
+                if quota.is_model_throttled(pid, m) or quota.model_status(pid, m)["exhausted"]:
+                    continue
+                chain.append((pid, m))
+                seen.add((pid, m))
+                break            # ONE model per provider: this is a fallback, not a fan-out
+            if len(chain) >= MAX_HOPS:
+                break
     return _ensure_permissive_hop(chain)
 
 
