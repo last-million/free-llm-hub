@@ -5371,6 +5371,7 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     _cand_pids = _exclude_google_for_foreign_tool_history(
         _available_providers(), require_tools, messages)
     _too_small = []          # skipped for SIZE ALONE -- see the tail at the end
+    _needs_compaction = []   # ...and the per-MODEL version of the same thing
     for pid in _cand_pids:
         if not _provider_capable(pid, est):
             _too_small.append(pid)
@@ -5383,12 +5384,36 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
             # skip a model that's individually rate-limited or over its per-model cap
             if quota.is_model_throttled(pid, m) or quota.model_status(pid, m)["exhausted"]:
                 continue
-            if not _context_ok(pid, m, est):   # learned too-small context for this request
-                continue
             if require_vision and not _is_vision_model(pid, m):
                 continue
             entry = (_benchmark_score(pid, m), pid, m)
+            if not _context_ok(pid, m, est):   # learned too-small context for this request
+                _needs_compaction.append(entry)
+                continue
             (fast if _is_fast(pid, m) else slow).append(entry)
+    # A STRONG MODEL ON A TRIMMED CONTEXT BEATS A WEAK ONE ON THE WHOLE THING --
+    # the same rule _route_by_difficulty applies to the PRIMARY pick, applied
+    # here to the retry list behind it.
+    #
+    # _context_ok is learned from real 413s, so only a model the hub has USED can
+    # acquire a limit, and the strong models are the ones it uses. On a big turn
+    # this loop therefore drops exactly them and keeps the never-tried weak tail.
+    #
+    # MEASURED 2026-09-05, a real opencode turn through the live hub:
+    #     tokenrouter/z-ai/glm-5.3-free ! timeout (200 but no content)
+    #     openrouter/poolside/laguna-s-2.1:free                    <- hop 2
+    # The primary was right. The chain behind it had nothing left but score-10
+    # models, because everything stronger had learned a limit -- REPORTED as
+    # "why i see he use laguna WTF ... this model i think is bad man".
+    #
+    # Re-admitted only when nothing that FITS clears the floor, so an ordinary
+    # chain never trades a model that fits for one that must be compacted; and
+    # ranked in with the rest afterwards, so this changes which models are
+    # AVAILABLE to the chain, never the order it prefers them in.
+    _floor = _TOOLS_MIN_SCORE if require_tools else 0
+    if _needs_compaction and not any(e[0] >= _floor for e in fast + slow):
+        for entry in _needs_compaction:
+            (fast if _is_fast(entry[1], entry[2]) else slow).append(entry)
     # best model first; tie among equal-score models -> most free quota left, so
     # the fallback chain keeps using providers that still have budget.
     fast.sort(key=lambda t: (t[0], _quota_headroom(t[1])), reverse=True)

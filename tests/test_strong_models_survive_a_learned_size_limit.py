@@ -175,3 +175,80 @@ def test_no_candidates_at_all_still_returns_nothing(monkeypatch):
     monkeypatch.setattr(A, "_sub_available_providers", lambda *a, **k: [])
     pid, model, _d = _route(BIG, require_tools=True)
     assert pid is None and model is None
+
+
+# --------------------------------------------------------------------------- #
+# The same rule in the RETRY LIST behind the primary
+#
+# MEASURED 2026-09-05, a real opencode turn through the live hub:
+#     tokenrouter/z-ai/glm-5.3-free ! timeout (200 but no content)
+#     openrouter/poolside/laguna-s-2.1:free                    <- hop 2
+# The primary was right. The chain behind it had collapsed to score-10 models
+# because everything stronger had learned a 413 limit.
+# --------------------------------------------------------------------------- #
+
+def _chain(est, **kw):
+    return A._build_chain("pa", "pa-strong", est, require_tools=True,
+                          messages=MSGS, **kw)
+
+
+def test_the_chain_does_not_collapse_to_the_weak_tail(monkeypatch):
+    _learn_limits_on_the_strong_ones(monkeypatch)
+    chain = _chain(BIG)
+    assert chain, "no chain at all"
+    assert any(m.endswith("-strong") for _p, m in chain), chain
+
+
+def test_the_weak_tail_does_not_own_the_first_retry(monkeypatch):
+    """Hop 1 is the primary; hop 2 is the one that answered as laguna."""
+    _learn_limits_on_the_strong_ones(monkeypatch)
+    chain = _chain(BIG)
+    assert len(chain) > 1
+    assert chain[1][1].endswith("-strong"), chain
+
+
+def test_a_fitting_chain_is_untouched(monkeypatch):
+    """Nothing learned a limit, so there is nothing to re-admit."""
+    monkeypatch.setattr(A, "_context_ok", lambda pid, m, est: True)
+    before = _chain(BIG)
+    assert before and all(m.endswith(("-strong", "-weak")) for _p, m in before)
+    assert before[0] == ("pa", "pa-strong")
+
+
+def test_the_chain_keeps_a_fitting_strong_model_over_a_compacted_one(monkeypatch):
+    """pa-strong learned a limit, pb-strong still fits and is a real ALTERNATIVE
+    in the chain body, so the floor is cleared and nothing is re-admitted."""
+    monkeypatch.setattr(A, "_context_ok",
+                        lambda pid, m, est: not (pid == "pa" and m.endswith("-strong")
+                                                 and est > 1000))
+    chain = A._build_chain("pa", "pa-weak", BIG, require_tools=True, messages=MSGS)
+    assert ("pb", "pb-strong") in chain
+    assert ("pa", "pa-strong") not in chain, chain
+
+
+def test_the_primary_does_not_count_towards_the_floor(monkeypatch):
+    """The load-bearing subtlety, and exactly the reported turn: the primary WAS
+    a strong model that fits -- tokenrouter/z-ai/glm-5.3-free -- and it timed
+    out. A chain is a RETRY list, so what decides whether the tier has collapsed
+    is whether a strong ALTERNATIVE exists, not whether the hop that already
+    failed was strong. Counting the primary here would leave the retry list as
+    the score-10 tail that was reported."""
+    monkeypatch.setattr(A, "_context_ok",
+                        lambda pid, m, est: not (m.endswith("-strong")
+                                                 and pid == "pb" and est > 1000))
+    # pa-strong is the primary and fits; pb-strong is the only other strong
+    # model and has learned a limit.
+    chain = A._build_chain("pa", "pa-strong", BIG, require_tools=True, messages=MSGS)
+    assert ("pb", "pb-strong") in chain, chain
+    assert chain[1][1].endswith("-strong"), chain
+
+
+def test_re_admitted_models_are_ranked_not_appended(monkeypatch):
+    """They go through the same sort as everything else -- this changes WHICH
+    models the chain may use, never the order it prefers them in."""
+    _learn_limits_on_the_strong_ones(monkeypatch)
+    chain = _chain(BIG)
+    strong_at = [i for i, (_p, m) in enumerate(chain) if m.endswith("-strong")]
+    weak_at = [i for i, (_p, m) in enumerate(chain) if m.endswith("-weak")]
+    assert strong_at and weak_at
+    assert max(strong_at) < min(weak_at), chain
