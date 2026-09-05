@@ -102,3 +102,30 @@ def test_a_broken_backup_dir_never_blocks_a_save(store, monkeypatch):
     monkeypatch.setattr(config, "_backup_dir", lambda: "\0not-a-path")
     _set_keys(["sk-still-saved"])
     assert config.get_provider_config("groq")["api_keys"] == ["sk-still-saved"]
+
+
+def test_the_newest_backup_is_never_behind_the_live_config(store):
+    """Backups are taken BEFORE a change, so the key just added sat in no backup
+    at all until the next edit -- measured right after the user added keys: live
+    41, newest backup 40. A wipe in that window would have lost the newest key.
+    Adding a key now also copies the file afterwards."""
+    _set_keys(["sk-1"])
+    _set_keys(["sk-1", "sk-2"])
+    assert config.list_backups()[0]["keys"] == 2
+
+
+def test_removing_a_key_still_keeps_the_richer_copy(store):
+    """The pre-save copy is the one that matters for a loss; a shrink must not
+    add a post-save copy that pushes it down the list."""
+    _set_keys(["sk-1", "sk-2", "sk-3"])
+    _set_keys(["sk-1"])
+    assert max(b["keys"] for b in config.list_backups()) == 3
+
+
+def test_same_second_copies_stay_in_order(store):
+    """A pre- and post-save copy can share a filename timestamp."""
+    _set_keys(["sk-1"])
+    _set_keys(["sk-1", "sk-2"])
+    _set_keys(["sk-1", "sk-2", "sk-3"])
+    whens = [b["when"] for b in config.list_backups()]
+    assert whens == sorted(whens, reverse=True)
