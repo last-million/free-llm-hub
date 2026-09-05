@@ -5500,16 +5500,37 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # no answer at all is not an answer.
     if _too_small and len(chain) < MAX_HOPS:
         for pid in _too_small:
-            for m in _auto_models(pid):
-                if (pid, m) in seen or not prov.is_model_allowed(m) or _is_model_dead(pid, m):
-                    continue
-                if _veto and _normalize_model_identity(m) in _veto:
-                    continue
-                if quota.is_model_throttled(pid, m) or quota.model_status(pid, m)["exhausted"]:
-                    continue
-                chain.append((pid, m))
-                seen.add((pid, m))
-                break            # ONE model per provider: this is a fallback, not a fan-out
+            _pool = [m for m in _auto_models(pid)
+                     if (pid, m) not in seen
+                     and prov.is_model_allowed(m)
+                     and not _is_model_dead(pid, m)
+                     and not (_veto and _normalize_model_identity(m) in _veto)
+                     and not quota.is_model_throttled(pid, m)
+                     and not quota.model_status(pid, m)["exhausted"]
+                     and not (require_vision and not _is_vision_model(pid, m))]
+            # A tool turn needs a model that can actually call one. FAIL-OPEN PER
+            # PROVIDER: a provider with nothing tool-capable is skipped, rather
+            # than the filter being dropped wholesale, because the other
+            # providers in this tail can still supply one.
+            if require_tools:
+                _pool = [m for m in _pool if _supports_tools(pid, m)]
+            if not _pool:
+                continue
+            # _context_ok is deliberately NOT applied here. It is the LEARNED
+            # "this model cannot hold est tokens" signal -- true of everything in
+            # this tail by construction, since that is what put it here.
+            # Compaction is the answer to it, not exclusion.
+            #
+            # The provider's BEST model, not its FIRST. _auto_models returns
+            # CATALOG order, which has nothing to do with quality: openrouter's
+            # opens with inclusionai/ling-3.0-flash (score 10) and carries
+            # z-ai/glm-5.2 (134) ten entries further down. Walking it raw made
+            # this fallback serve the weakest model of every provider it reached
+            # -- REPORTED 2026-09-05, "why i see he use laguna ... this model is
+            # bad": poolside/laguna-s-2.1, score 10, sitting in that same cluster.
+            m = max(_pool, key=lambda x: _benchmark_score(pid, x))
+            chain.append((pid, m))
+            seen.add((pid, m))   # ONE per provider: a fallback, not a fan-out
             if len(chain) >= MAX_HOPS:
                 break
     return _ensure_permissive_hop(chain)

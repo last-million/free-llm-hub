@@ -36,12 +36,25 @@ HUGE = 111875          # the est from the reported 503
 ORDINARY = 50
 
 
+# Each provider lists its models WORST-FIRST, the way a real catalog does --
+# openrouter's opens with score-10 ids and carries glm-5.2 ten entries down. A
+# tail that walks the list raw picks "-a"; one that ranks picks "-c".
+SCORES = {"-a": 10.0, "-b": 30.0, "-c": 134.0}
+
+
 @pytest.fixture(autouse=True)
 def world(monkeypatch):
     monkeypatch.setattr(A, "_available_providers", lambda *a, **k: BIG + SMALL)
-    monkeypatch.setattr(A, "_auto_models", lambda pid: [pid + "-a", pid + "-b"])
+    # BIG lists two models, SMALL three -- so four full-size hops leave exactly
+    # two of MAX_HOPS' six for the tail, and the ranking has something to rank.
+    monkeypatch.setattr(A, "_auto_models",
+                        lambda pid: [pid + s for s in
+                                     (("-a", "-b") if pid in BIG
+                                      else ("-a", "-b", "-c"))])
     monkeypatch.setattr(A, "_provider_capable",
                         lambda pid, est: pid in BIG or est <= 1000)
+    monkeypatch.setattr(A, "_benchmark_score",
+                        lambda pid, m: SCORES.get(m[-2:], 0.0))
     yield
 
 
@@ -168,16 +181,79 @@ def test_a_vetoed_model_is_not_reintroduced():
     assert ("small1", "small1-a") not in chain
 
 
-def test_a_veto_falls_through_to_the_providers_next_model():
-    """One model per provider, but not necessarily the FIRST one -- the loop
-    keeps looking after a rejected candidate."""
-    vetoed = A._normalize_model_identity("small1-a")
-    chain = A._build_chain("big1", "big1-a", HUGE, require_tools=True,
-                           messages=[{"role": "user", "content": "go"}],
-                           exclude_identities={vetoed})
-    assert ("small1", "small1-b") in chain
-
-
 def test_nothing_is_duplicated_between_the_chain_and_its_tail():
     chain = _chain(HUGE)
     assert len(chain) == len(set(chain))
+
+
+# --------------------------------------------------------------------------- #
+# The tail takes each provider's BEST model, not its first
+#
+# REPORTED 2026-09-05: "why i see he use laguna WTF ... this model i think is bad
+# man". poolside/laguna-s-2.1 scores 10. It was not chosen on merit -- the first
+# version of this tail walked _auto_models in CATALOG order and took whatever
+# came first, so it served the weakest model of every provider it reached while
+# z-ai/glm-5.2 (134) sat ten entries further down the same list.
+# --------------------------------------------------------------------------- #
+
+def test_the_tail_picks_the_best_model_of_each_provider():
+    picked = {p: m for p, m in _chain(HUGE) if p in SMALL}
+    assert picked, "the tail did not fire"
+    assert all(m.endswith("-c") for m in picked.values()), picked
+
+
+def test_catalog_order_does_not_decide():
+    """"-a" is first in every provider's list and worst in every provider's
+    list. If it appears, the tail is reading position instead of quality."""
+    assert not [m for p, m in _chain(HUGE) if p in SMALL and m.endswith("-a")]
+
+
+def test_the_next_best_is_taken_when_the_best_is_unavailable():
+    """Ranking must not become a second way to dead-end: knock out "-c" and the
+    provider should fall to "-b", not to nothing and not back to "-a"."""
+    vetoed = {A._normalize_model_identity(p + "-c") for p in SMALL}
+    chain = A._build_chain("big1", "big1-a", HUGE, require_tools=True,
+                           messages=[{"role": "user", "content": "go"}],
+                           exclude_identities=vetoed)
+    picked = {p: m for p, m in chain if p in SMALL}
+    assert picked and all(m.endswith("-b") for m in picked.values()), picked
+
+
+def test_a_tool_turn_only_falls_back_onto_a_tool_capable_model(monkeypatch):
+    """A hop that cannot call a tool is a wasted hop on an agentic turn."""
+    monkeypatch.setattr(A, "_supports_tools",
+                        lambda pid, m: not m.endswith("-c"))
+    picked = {p: m for p, m in _chain(HUGE) if p in SMALL}
+    assert picked and all(m.endswith("-b") for m in picked.values()), picked
+
+
+def test_a_provider_with_no_tool_capable_model_is_skipped_not_forced(monkeypatch):
+    """Fail-open PER PROVIDER: small1 drops out, the others still serve."""
+    monkeypatch.setattr(A, "_supports_tools",
+                        lambda pid, m: pid != "small1")
+    picked = [p for p, _m in _chain(HUGE) if p in SMALL]
+    assert "small1" not in picked and picked
+
+
+def test_tools_are_not_required_of_a_plain_turn(monkeypatch):
+    """The filter is conditional -- a non-tool request must not lose the tail."""
+    monkeypatch.setattr(A, "_supports_tools", lambda pid, m: False)
+    chain = A._build_chain("big1", "big1-a", HUGE, require_tools=False,
+                           messages=[{"role": "user", "content": "go"}])
+    assert [p for p, _m in chain if p in SMALL]
+
+
+def test_a_vision_turn_only_falls_back_onto_a_vision_model(monkeypatch):
+    monkeypatch.setattr(A, "_is_vision_model", lambda pid, m: m.endswith("-b"))
+    chain = A._build_chain("big1", "big1-a", HUGE, require_vision=True,
+                           messages=[{"role": "user", "content": "go"}])
+    picked = {p: m for p, m in chain if p in SMALL}
+    assert picked and all(m.endswith("-b") for m in picked.values()), picked
+
+
+def test_the_learned_context_limit_is_not_applied_to_the_tail(monkeypatch):
+    """_context_ok is the learned "cannot hold est tokens" signal, which is true
+    of EVERYTHING in this tail by construction -- that is what put it here.
+    Applying it would filter the fallback down to nothing and restore the 503."""
+    monkeypatch.setattr(A, "_context_ok", lambda pid, m, est: est <= 1000)
+    assert [p for p, _m in _chain(HUGE) if p in SMALL]
