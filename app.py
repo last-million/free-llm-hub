@@ -4744,15 +4744,45 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     # concurrently instead of one at a time -- only wall-clock time to save.
     models_by_pid = _prefetch_auto_models(providers)
     cands = []  # (score, pid, model)
+    _compactable = []      # everything EXCEPT the size check -- see below
     for pid in providers:
         for m in models_by_pid.get(pid, ()):
             # skip ids this key provably can't use (403/404 learned at runtime) and
             # ids individually rate-limited / over their per-model sub-cap.
             if (prov.is_model_allowed(m) and not _is_model_dead(pid, m)
                     and not quota.is_model_throttled(pid, m)
-                    and not quota.model_status(pid, m)["exhausted"]
-                    and _context_ok(pid, m, est)):
-                cands.append((_benchmark_score(pid, m), pid, m))
+                    and not quota.model_status(pid, m)["exhausted"]):
+                entry = (_benchmark_score(pid, m), pid, m)
+                (cands if _context_ok(pid, m, est) else _compactable).append(entry)
+    # A STRONG MODEL ON A TRIMMED CONTEXT BEATS A WEAK ONE ON THE WHOLE THING.
+    #
+    # _context_ok is LEARNED from real 413s, so only a model the hub has actually
+    # USED can ever acquire a limit -- and the strong models are the ones it
+    # uses. On a big turn they are therefore exactly the ones it drops, and what
+    # survives the filter is the never-tried weak tail. The evidence punishes the
+    # models it has evidence about.
+    #
+    # MEASURED 2026-09-05 against the live fleet at est=60000: 43 of 70
+    # candidates cleared the tools floor; once the strong ones had learned their
+    # limits, ZERO did. `agentic` then failed open to whatever was left and a
+    # score-10 model led an agentic build -- REPORTED as "why i see he use
+    # laguna WTF ... this model i think is bad man" (poolside/laguna-s-2.1,
+    # score 10, while glm-5.3 at 138 sat excluded).
+    #
+    # A learned limit is not a refusal, though: _upstream_chat compacts to each
+    # model's own window before sending (see _compact_to_budget), so it is a
+    # TRIM. Re-admit the strong ones instead of dropping the whole tier -- and
+    # ONLY when nothing that fits clears the floor, so an ordinary request never
+    # trades a model that fits for one that has to be compacted.
+    # Everything excluded for size comes back, not just the models above the
+    # floor: the tier filters downstream (_TOOLS_MIN_SCORE for an agentic turn,
+    # _DIFFICULTY_FLOOR for a chat one) already rank them, and re-applying a
+    # floor HERE only mattered in the one case where it did harm -- a fleet
+    # whose every model is both weak and oversized would re-admit nothing, leave
+    # `cands` empty, and return no model at all rather than a compacted answer.
+    _floor = _TOOLS_MIN_SCORE if require_tools else _DIFFICULTY_FLOOR.get(difficulty, 0)
+    if _compactable and not any(c[0] >= _floor for c in cands):
+        cands += _compactable
     if require_tools:
         # A tools request must never land on a completion-only model. FAIL-OPEN:
         # keep the unfiltered list if NO candidate is known tool-capable.
