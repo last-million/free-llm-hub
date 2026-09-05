@@ -2131,15 +2131,6 @@ _PROVIDER_TPM = {
     "openrouter": 128000, "cohere": 100000, "nvidia": 250000, "google": 900000,
     "cloudflare": 120000, "nararouter": 120000, "kimi": 128000, "glm": 128000,
     "aiand": 120000, "xiaomi": 60000, "minimax": 120000,
-    # READ LIVE 2026-09-05 from their public catalog: every one of the five free
-    # promotion models reports a context_window of 1,000,000 or more
-    # (gpt-6-astra and gpt-5.6-luna 1,050,000; deepseek-v4-flash 1,048,576;
-    # claude-fable-5.1 and qwen3.8-27b 1,000,000). Left at the 100000 default it
-    # was filtered OFF exactly the requests it is best at -- _provider_capable
-    # said False for the 160K opencode turns that started this whole
-    # investigation. Set below the smallest real window, not at it: the number
-    # is a routing budget, not a promise, and compaction still trims per model.
-    "experientiallabs": 900000,
 }
 _DEFAULT_TPM = 100000
 
