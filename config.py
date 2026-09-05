@@ -234,6 +234,19 @@ def _decrypt_secrets(cfg: dict) -> dict:
         keys = prov.get("api_keys")
         if not isinstance(keys, list):
             continue
+        # RE-TRY WHAT A PREVIOUS LOAD COULD NOT READ. Ciphertext parked in
+        # _unreadable_api_keys is usually there because secret.key was
+        # momentarily unreadable, not because it is lost -- and nothing else in
+        # the hub ever looks at that field, so without this the keys stay
+        # invisible forever after one bad read even though the file is intact.
+        #
+        # MEASURED 2026-09-05: 41 keys sat in _unreadable_api_keys through
+        # every subsequent load and every restart, and all 41 decrypted on the
+        # first try once they were fed back through this function.
+        parked = prov.get("_unreadable_api_keys")
+        if isinstance(parked, list) and parked:
+            keys = list(keys) + list(parked)
+            prov.pop("_unreadable_api_keys", None)
         out, unreadable = [], []
         for k in keys:
             if not secretstore.is_encrypted(k):
@@ -264,6 +277,29 @@ def _decrypt_secrets(cfg: dict) -> dict:
     return cfg
 
 
+def _carry_unreadable_back(cfg: dict) -> dict:
+    """Fold _unreadable_api_keys back into api_keys, on a copy.
+
+    The ciphertext parked by _decrypt_secrets has to reach the file again or the
+    save deletes it. Used both on the normal encrypting path and when
+    encryption is unavailable -- the merge itself needs no crypto."""
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        return cfg
+    out = dict(cfg)
+    out["providers"] = {}
+    for pid, prov in providers.items():
+        if not isinstance(prov, dict):
+            out["providers"][pid] = prov
+            continue
+        copied = dict(prov)
+        carried = copied.pop("_unreadable_api_keys", None)
+        if carried:
+            copied["api_keys"] = list(copied.get("api_keys") or []) + list(carried)
+        out["providers"][pid] = copied
+    return out
+
+
 def _encrypt_secrets(cfg: dict) -> dict:
     """Encrypt provider keys on the way to disk, on a COPY.
 
@@ -271,7 +307,17 @@ def _encrypt_secrets(cfg: dict) -> dict:
     encrypting in place would leave live code holding ciphertext where it
     expects a key."""
     if not secretstore.available():
-        return cfg
+        # ...but the CARRY-BACK still has to happen. It is a list concatenation,
+        # not a cryptographic operation, and returning early skipped it: the
+        # config went to disk with api_keys EMPTY and every key stranded in
+        # _unreadable_api_keys, which nothing reads.
+        #
+        # DATA LOSS, 2026-09-05: this is how all 41 provider keys on this
+        # install went missing while the ciphertext was sitting in the file the
+        # whole time. Encryption being unavailable is exactly when the keys are
+        # most at risk, so it is the last moment to skip the code that saves
+        # them.
+        return _carry_unreadable_back(cfg)
     path = _config_path()
     providers = cfg.get("providers")
     if not isinstance(providers, dict):

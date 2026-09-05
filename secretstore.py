@@ -30,6 +30,7 @@ total outage.
 """
 import base64
 import os
+import time
 import stat
 
 try:                                            # optional, by design
@@ -74,19 +75,37 @@ def load_or_create_key(config_path):
     if _cached_key[0] is not None:
         return _cached_key[0]
     path = key_path(config_path)
-    try:
-        with open(path, "rb") as f:
-            raw = f.read()
-        if len(raw) == _KEY_BYTES:
-            _cached_key[0] = raw
-            return raw
-        # A truncated or padded key file cannot decrypt anything that was
-        # written with the real one. Refuse rather than generate a new key over
-        # the top of it, which would silently destroy every stored secret.
-        raise ValueError("secret.key is %d bytes, expected %d" % (len(raw), _KEY_BYTES))
-    except FileNotFoundError:
-        pass
-    except OSError:
+    # RETRY A FAILED READ. An OSError here is almost never "the key is gone" --
+    # on Windows it is a sharing violation from another hub process holding the
+    # file, an antivirus scan, or a sync client, and it clears in milliseconds.
+    # Returning None on the first failure told every caller the master key was
+    # unavailable, which made decrypt() return None for EVERY stored secret at
+    # once.
+    #
+    # DATA LOSS, 2026-09-05 (the second time this file has caused one): all 41
+    # provider keys on this install went unreadable in a single load while the
+    # key file itself was intact and unchanged, with three app.py processes
+    # running. A momentary read failure must not look like a lost key.
+    _last = None
+    for _attempt in range(4):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            if len(raw) == _KEY_BYTES:
+                _cached_key[0] = raw
+                return raw
+            # A truncated or padded key file cannot decrypt anything that was
+            # written with the real one. Refuse rather than generate a new key
+            # over the top of it, which would silently destroy every stored
+            # secret.
+            raise ValueError("secret.key is %d bytes, expected %d" % (len(raw), _KEY_BYTES))
+        except FileNotFoundError:
+            _last = None
+            break                      # genuinely absent -- fall through and create
+        except OSError as exc:
+            _last = exc
+            time.sleep(0.05 * (_attempt + 1))
+    if _last is not None:
         return None
     raw = os.urandom(_KEY_BYTES)
     parent = os.path.dirname(path)
