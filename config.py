@@ -505,6 +505,26 @@ def save_config(cfg: dict) -> None:
                 _before = json.load(_f)
             if _key_signature(_before) != _key_signature(cfg):
                 backup_config_now("keys")
+                # A save that DROPS EVERY KEY is the shape that cost 64 of them
+                # on 2026-09-05, twice, and neither the hub's startup nor the
+                # provider test reproduces it. So the next one names itself:
+                # whoever is on the stack when the count goes N -> 0 gets logged
+                # with it. Loud on purpose -- this is not a condition any normal
+                # flow should reach, and a silent wipe is what made the first one
+                # take a day to notice.
+                _before_n = sum(len(v.get("api_keys") or [])
+                                for v in (_before.get("providers") or {}).values()
+                                if isinstance(v, dict))
+                _after_n = sum(len(v.get("api_keys") or [])
+                               for v in (cfg.get("providers") or {}).values()
+                               if isinstance(v, dict))
+                if _before_n and not _after_n:
+                    import logging as _lg
+                    import traceback as _tb
+                    _lg.getLogger("config").error(
+                        "RECORDING A KEY WIPE: a save is dropping all %d "
+                        "provider key(s) to zero. Backup kept. Caller:\n%s",
+                        _before_n, "".join(_tb.format_stack()[-12:-1]))
     except (OSError, ValueError):
         pass
     # Provider keys are encrypted HERE, at the single point where config
