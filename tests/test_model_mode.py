@@ -327,3 +327,48 @@ def test_routing_still_answers_when_the_mode_matches_nothing(fleet, monkeypatch)
     monkeypatch.setattr(A.model_categories, "matches", lambda key, p, m, i=None: False)
     pid, model, _d = _route(monkeypatch, "coding")
     assert pid and model
+
+
+# --------------------------------------------------------------------------- #
+# The endpoint that created the mess can no longer create it
+#
+# 287 blocked entries were sitting in this install's config, none of them asked
+# for. They came from POST /api/model-categories, which wrote
+# blocked_models = every model OUTSIDE the chosen category -- so one click
+# switched off hundreds of models permanently, indistinguishably from the ones
+# the user had switched off on purpose, and "All models" then deleted the lot.
+# --------------------------------------------------------------------------- #
+
+def test_choosing_a_category_no_longer_rewrites_the_blocked_list(client):
+    """The exact click that produced the 287."""
+    r = client.post("/api/model-categories", json={"key": "coding"},
+                    headers=client._hdrs)
+    assert r.status_code == 200
+    assert config.get_setting(A._BLOCKED_SETTING, None) is None
+
+
+def test_all_models_no_longer_deletes_a_blacklist(client):
+    """It used to write [] -- taking a hand-made gpt-oss blacklist with it."""
+    config.set_setting(A._BLOCKED_SETTING, ["groq/openai/gpt-oss-120b"])
+    client.post("/api/model-categories", json={"key": "all"}, headers=client._hdrs)
+    assert config.get_setting(A._BLOCKED_SETTING, []) == ["groq/openai/gpt-oss-120b"]
+
+
+def test_choosing_a_category_sets_the_mode_instead(client):
+    client.post("/api/model-categories", json={"key": "coding"}, headers=client._hdrs)
+    assert config.get_setting(A._MODE_SETTING, "all") == "coding"
+
+
+def test_the_old_endpoint_still_rejects_a_bad_key(client):
+    r = client.post("/api/model-categories", json={"key": "nonsense"},
+                    headers=client._hdrs)
+    assert r.status_code == 400
+
+
+def test_no_route_writes_the_blocked_list_from_a_category():
+    """Structural: the rewrite is gone, not merely unreachable. Dead code that
+    still names the setting is one edit away from being live again."""
+    src = open("app.py", encoding="utf-8").read()
+    i = src.index("def api_model_categories(")
+    body = src[i:src.index("@app.route", i + 10)]
+    assert "_BLOCKED_SETTING" not in body

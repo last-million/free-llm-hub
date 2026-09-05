@@ -8694,20 +8694,25 @@ def api_model_categories():
             continue
 
     if request.method == "POST":
+        # THIS NO LONGER TOUCHES THE BLOCKED LIST.
+        #
+        # It used to write blocked_models = every model outside the chosen
+        # category, and [] for "all". That is where 287 blocked entries on this
+        # install came from: one click, months of models switched off, and no
+        # way to tell them apart afterwards from the ones the user meant. The
+        # same click also deleted any hand-made blacklist.
+        #
+        # Choosing a category is choosing a MODE, so it sets the mode -- a
+        # filter applied while routing, which composes with the blocked list
+        # instead of overwriting it. Kept as an endpoint rather than removed
+        # because older clients still POST here; they now get the behaviour
+        # they always wanted, and nothing they can do here is destructive.
         body = request.get_json(force=True, silent=True) or {}
         key = str(body.get("key") or "").strip()
-        if key == "all":
-            config.set_setting(_BLOCKED_SETTING, [])
-        elif key in model_categories.CATEGORY_KEYS:
-            keep = {mid for _p, _m, mid, ident in live
-                    if model_categories.matches(key, _p, _m, ident)}
-            if not keep:
-                return jsonify({"error": "No available model is in that category "
-                                         "right now."}), 400
-            config.set_setting(_BLOCKED_SETTING,
-                               sorted({mid for _p, _m, mid, _i in live} - keep))
-        else:
+        _m = _valid_mode(key)
+        if _m is None:
             return jsonify({"error": "Unknown category."}), 400
+        config.set_setting(_MODE_SETTING, _m)
 
     blocked = _blocked_models()
     out = []
