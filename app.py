@@ -31,6 +31,7 @@ import ipaddress
 import json
 import math
 import mimetypes
+import errno
 import os
 import platform
 import random
@@ -2920,6 +2921,12 @@ def _note_provider_result(pid, ok, hard_fail=False):
     Neither flag set (429/5xx) leaves the streak untouched."""
     if not pid:
         return
+    if ok:
+        # Any real answer is evidence about TWO things: this provider is alive,
+        # and so is the network. The second is what lets the timeout breaker tell
+        # "that provider went quiet" apart from "this laptop lost its wifi".
+        _note_fleet_alive()
+        _clear_provider_timeouts(pid)
     with _provider_dead_lock:
         if ok:
             _provider_consec_fail.pop(pid, None)
@@ -2931,6 +2938,94 @@ def _note_provider_result(pid, ok, hard_fail=False):
         if n >= _PROVIDER_CONSEC_FAIL_THRESHOLD:
             _dead_providers[pid] = time.time() + _PROVIDER_DEAD_TTL
             _provider_consec_fail.pop(pid, None)
+
+
+# TIMEOUT BREAKER -- the one failure mode the two breakers above cannot see.
+#
+# Both of them run only AFTER a response object exists. A read timeout raises at
+# requests.post and is caught by _upstream_chat's sole except branch, which
+# records nothing at all: no quota, no outcome, no provider result. So a provider
+# that answers NOTHING is invisible to every learned signal. Its reliability
+# stays at the neutral 0.5, _chain_reliability_band returns 0, and the band-2
+# "do not seed as primary" rule never fires.
+#
+# MEASURED against nvidia directly, bypassing the hub: a 996-byte request timed
+# out at 25.4s and again at 300.6s; an 840,676-byte one at 301.4s. It answers
+# nothing at any size, yet it benchmarks 134, carries a provider bias, and kept
+# winning the primary slot on every large request.
+#
+# THREE GATES, and each closes a way this could park a HEALTHY provider. They
+# matter more than the breaker: an over-eager version of this is worse than the
+# defect it fixes.
+#
+#  1. READ timeouts only. requests.ConnectTimeout is a subclass of Timeout but a
+#     SIBLING of ReadTimeout, so testing for ReadTimeout excludes it by the
+#     hierarchy. That distinction is the whole point: a ConnectTimeout means the
+#     host could not be REACHED, which is a fact about the local machine -- a
+#     wifi drop, a VPN reconnect, a laptop waking, a dead proxy. Counting those
+#     would park the entire fleet on a thirty-second outage, and the "a success
+#     resets it" gate cannot save it, because during an outage nothing succeeds.
+#     A ReadTimeout means the connection was ACCEPTED and then went quiet, which
+#     is a fact about the provider.
+#
+#  2. One strike per REQUEST, not per hop. A single turn can call the same
+#     provider several times -- several of its models in one chain, plus the
+#     whole-chain retry -- and would otherwise supply the entire quorum by
+#     itself. Strikes are deduplicated per provider per request.
+#
+#  3. FLEET LIVENESS. Nothing is parked unless some OTHER provider has returned
+#     a 2xx recently. If nothing anywhere is answering, the problem is here, not
+#     there. This is the gate that makes the whole mechanism safe on a laptop
+#     that loses its network, and it is why the breaker cannot fire during the
+#     exact conditions that would make it wrong.
+#
+# A single 2xx from the provider clears its streak, and a parked provider is
+# re-probed on the same 30-minute cycle as every other sideline.
+_PROVIDER_TIMEOUT_THRESHOLD = 3        # distinct REQUESTS that only ever timed out
+_provider_timeout_fail = {}            # pid -> consecutive such requests
+_last_fleet_2xx = [0.0]                # when ANY provider last answered
+
+
+def _note_fleet_alive():
+    _last_fleet_2xx[0] = time.time()
+
+
+def _fleet_is_alive():
+    """True when something answered recently enough to believe the network works."""
+    return (time.time() - _last_fleet_2xx[0]) < _PROVIDER_DEAD_TTL
+
+
+def _note_provider_timeout(pid, exc):
+    """Count a provider that accepted the connection and then said nothing.
+
+    Returns without doing anything for every case that is not provably the
+    provider's fault -- see the three gates above."""
+    if not isinstance(exc, requests.exceptions.ReadTimeout):
+        return                              # gate 1: not a provider fact
+    if not _fleet_is_alive():
+        return                              # gate 3: the network, not the provider
+    try:
+        struck = getattr(g, "_timeout_struck", None)
+        if struck is None:
+            struck = set()
+            g._timeout_struck = struck
+        if pid in struck:
+            return                          # gate 2: already counted this request
+        struck.add(pid)
+    except Exception:                                            # noqa: BLE001
+        pass            # outside a request context: count it, there is no turn to dedupe
+    with _provider_dead_lock:
+        n = _provider_timeout_fail.get(pid, 0) + 1
+        _provider_timeout_fail[pid] = n
+        if n >= _PROVIDER_TIMEOUT_THRESHOLD:
+            _dead_providers[pid] = time.time() + _PROVIDER_DEAD_TTL
+            _provider_timeout_fail.pop(pid, None)
+
+
+def _clear_provider_timeouts(pid):
+    """One real answer means it is alive; the streak starts again from zero."""
+    with _provider_dead_lock:
+        _provider_timeout_fail.pop(pid, None)
 
 
 def _is_provider_dead(pid):
@@ -5385,7 +5480,7 @@ def _chain_entries(name):
 
 
 def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_tools=False,
-                  messages=None, exclude_identities=None, prefer=None):
+                  messages=None, exclude_identities=None, prefer=None, pinned=False):
     """Priority-ordered [(pid, model)] fallback chain. Primary first, then the
     next-best MODELS across every AVAILABLE, size-capable provider, INTERLEAVED
     across providers (best model of each provider, then each provider's 2nd, ...).
@@ -5412,6 +5507,23 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # chain to choose one), or the one it had is exactly what the user just
         # rejected. Either way the ranked candidates below become the chain.
         chain, seen = [], set()
+    elif pinned:
+        # THE USER NAMED THIS MODEL. An explicit "provider/model" is a request,
+        # not a suggestion, so it opens the turn whatever its record says.
+        #
+        # The demotion below exists for a model the ROUTER picked: leading with
+        # one measured to fail is a stall the user did not ask for. It was
+        # applied to every primary, including a pinned one, and the two are not
+        # the same thing at all.
+        #
+        # MEASURED: a request pinned to groq/qwen/qwen3.8-27b (reliability 0.207,
+        # band 2) was served by tokenrouter/z-ai/glm-5.3-free instead -- hop 1
+        # was a model the caller had not asked for, and the pinned one sat at
+        # hop 2. Silently substituting a different model is worse than serving a
+        # slow one: the caller cannot tell, and the fallback chain behind it is
+        # still there if the pin really does fail.
+        chain = [(primary_pid, model_id)]
+        seen = {(primary_pid, model_id)}
     elif _chain_reliability_band(primary_pid, model_id) >= 2:
         # A MEASURED-TO-FAIL primary is not seeded at hop 1. It stays a
         # candidate below -- it is never dropped, and if nothing healthier is
@@ -15241,6 +15353,34 @@ def _classify_hop_error(exc=None, status=None, peek=None):
     return peek or "error"
 
 
+def _mode_status(pid, model):
+    """(the mode in force, True when `model` is NOT in it). Reporting only.
+
+    _apply_mode is fail-open BY DESIGN: a mode whose models are all busy,
+    withdrawn or rate-limited must degrade to answering rather than to refusing.
+    What was missing is any record that it happened. MEASURED: a request sent
+    with model "reasoning" was answered by groq/qwen/qwen3.8-27b, which is in
+    `uncensored` and not in `reasoning`, with nothing anywhere saying so -- and
+    from outside, a mode that quietly did not apply is indistinguishable from a
+    routing bug.
+
+    Asks the question the caller actually cares about -- "did I get the kind of
+    model I asked for" -- by comparing the ANSWERING model against the mode,
+    rather than tracking which _apply_mode call fell open. _build_chain filters
+    its two tiers separately and the vision router does not filter at all, so
+    that is the only version of the question with one honest answer.
+
+    Never consulted while routing, and fails silent on anything it cannot
+    evaluate: it must not be able to claim a mismatch it cannot prove."""
+    try:
+        m = _active_mode()
+        if not m or m == MODE_ALL or not pid or not model:
+            return None, False
+        return m, not _mode_allows(m, pid, model)
+    except Exception:                                            # noqa: BLE001
+        return None, False
+
+
 def _routing_headers(pid, model, attempts, last_error=None):
     """Routing-transparency headers: which provider/model actually served the
     response (or was last tried, on a chain-exhausted error), how many
@@ -15253,6 +15393,14 @@ def _routing_headers(pid, model, attempts, last_error=None):
         h["X-Free-LLM-Hub-Provider"] = str(pid)
     if model:
         h["X-Free-LLM-Hub-Model"] = str(model)
+    # The MODE, and whether it was actually honoured. A mode that fell open is
+    # still a correct answer -- it just is not the KIND of answer that was
+    # asked for, and the caller has no other way to find that out.
+    _mode, _missed = _mode_status(pid, model)
+    if _mode:
+        h["X-Free-LLM-Hub-Mode"] = str(_mode)
+        if _missed:
+            h["X-Free-LLM-Hub-Mode-Applied"] = "no"
     return h
 
 
@@ -16896,7 +17044,14 @@ def _chat_completions_uncached(body):
     # just rejected and answer from hop 1.
     veto = _excluded_identities(request.headers.get("X-Free-LLM-Hub-Exclude"))
     diff = None
-    if _is_orchestrate(body.get("model")):
+    # Did the CALLER name a model, or is the router choosing? A pinned model
+    # opens the turn whatever its record says -- see _build_chain(pinned=).
+    # Passed as a kwarg dict for the same reason exclude_identities is: an
+    # ordinary orchestrated request keeps the exact call shape it always had, so
+    # a stand-in for _build_chain never has to know about a parameter it does
+    # not see.
+    _pin_kw = {"pinned": True} if not _is_orchestrate(body.get("model")) else {}
+    if not _pin_kw:
         router = _route_for_vision if has_images else _route_by_difficulty
         _rkw = {}
         if (body.get("model") or "").strip().lower() == "best" and not has_images:
@@ -16960,6 +17115,7 @@ def _chat_completions_uncached(body):
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                           prefer=chain_prefer,
                                            require_tools=has_tools,
+                                           **_pin_kw,
                                            messages=body.get("messages"),
                                            **_veto_kw):
         if stream and _header_budget_spent(_walk_started):
@@ -17019,6 +17175,11 @@ def _chat_completions_uncached(body):
                 # be a raw 5xx status (524 etc.) that never raises at all --
                 # handled separately below, in the non-2xx branch.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                # ...and count it, so a provider that ONLY ever times out is eventually
+                # parked rather than re-tried forever. Heavily gated -- see
+                # _note_provider_timeout, which ignores everything that is not
+                # provably the provider's own fault.
+                _note_provider_timeout(hop_pid, exc)
             continue
         if resp.status_code == 200:
             if stream and is_sub_hop:
@@ -17636,7 +17797,14 @@ def v1_responses(_retry_pass=False):
         # No model could serve the fan-out. Still a request for maximum effort,
         # so continue as 'best' -- never as a model named "swarm".
         body = dict(body, model="best")
-    if _is_orchestrate(body.get("model")):
+    # Did the CALLER name a model, or is the router choosing? A pinned model
+    # opens the turn whatever its record says -- see _build_chain(pinned=).
+    # Passed as a kwarg dict for the same reason exclude_identities is: an
+    # ordinary orchestrated request keeps the exact call shape it always had, so
+    # a stand-in for _build_chain never has to know about a parameter it does
+    # not see.
+    _pin_kw = {"pinned": True} if not _is_orchestrate(body.get("model")) else {}
+    if not _pin_kw:
         router = _route_for_vision if has_images else _route_by_difficulty
         pid, resolved, diff = router(messages, body.get("max_output_tokens"), est,
                                      require_tools=has_tools,
@@ -17684,7 +17852,8 @@ def v1_responses(_retry_pass=False):
     _err_bodies = {}  # DIAG: first raw error body per (pid:status) — reveals soft-400 reasons
     _walk_started = time.monotonic()
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
-                                           require_tools=has_tools, messages=messages):
+                                           require_tools=has_tools, messages=messages,
+                                           **_pin_kw):
         _tried.append(hop_pid + "/" + hop_model)
         if stream and _header_budget_spent(_walk_started):
             # See _STREAM_HEADER_BUDGET: past this the client has stopped
@@ -17742,6 +17911,11 @@ def v1_responses(_retry_pass=False):
                 # be a raw 5xx status (524 etc.) that never raises at all --
                 # handled separately below, in the non-2xx branch.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                # ...and count it, so a provider that ONLY ever times out is eventually
+                # parked rather than re-tried forever. Heavily gated -- see
+                # _note_provider_timeout, which ignores everything that is not
+                # provably the provider's own fault.
+                _note_provider_timeout(hop_pid, exc)
             continue
         if resp.status_code == 200:
             # Echo back the id the client ASKED for (codex sends "auto", which now has
@@ -18329,7 +18503,14 @@ def v1_messages():
         if served is not None:
             return served
         body = dict(body, model="best")
-    if _is_orchestrate(body.get("model")):
+    # Did the CALLER name a model, or is the router choosing? A pinned model
+    # opens the turn whatever its record says -- see _build_chain(pinned=).
+    # Passed as a kwarg dict for the same reason exclude_identities is: an
+    # ordinary orchestrated request keeps the exact call shape it always had, so
+    # a stand-in for _build_chain never has to know about a parameter it does
+    # not see.
+    _pin_kw = {"pinned": True} if not _is_orchestrate(body.get("model")) else {}
+    if not _pin_kw:
         router = _route_for_vision if has_images else _route_by_difficulty
         pid, resolved, diff = router(oai_messages, body.get("max_tokens"), est,
                                      require_tools=has_tools,
@@ -18385,7 +18566,8 @@ def v1_messages():
     last_error = None  # class of the LAST failed hop (transparency header)
     _walk_started = time.monotonic()
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
-                                           require_tools=has_tools, messages=oai_messages):
+                                           require_tools=has_tools, messages=oai_messages,
+                                           **_pin_kw):
         if stream and _header_budget_spent(_walk_started):
             # See _STREAM_HEADER_BUDGET: past this the client has stopped
             # listening for headers, so a further hop cannot be delivered even
@@ -18430,6 +18612,11 @@ def v1_messages():
                 # be a raw 5xx status (524 etc.) that never raises at all --
                 # handled separately below, in the non-2xx branch.
                 quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                # ...and count it, so a provider that ONLY ever times out is eventually
+                # parked rather than re-tried forever. Heavily gated -- see
+                # _note_provider_timeout, which ignores everything that is not
+                # provably the provider's own fault.
+                _note_provider_timeout(hop_pid, exc)
             continue
         if resp.status_code == 200:
             model_str = requested_model or (hop_pid + "/" + hop_model)
@@ -20023,6 +20210,69 @@ def _mark_runtime_started():
             continue
 
 
+def _claim_single_instance():
+    """Take an exclusive OS lock so a second hub cannot run against one config.
+
+    TWO COPIES OF THIS HUB SHARE ~/.free-llm-hub, and that is how every API key
+    on this install was lost: both processes read and write config.json and
+    secret.key, one of them could not read the key for a moment, and the config
+    was then saved without the secrets it could not decrypt. The launchers
+    already refuse a second start, but nothing stopped `python app.py` directly,
+    and a scheduled task starting one at logon races anything started by hand --
+    three live processes were found at once.
+
+    An OS byte-range lock, not a pidfile: it is released by the kernel when the
+    process dies, so it cannot go stale after a crash or a taskkill.
+
+    FAILS OPEN on anything that is not real contention. Refusing to start is a
+    serious failure -- it locks the user out of their own hub -- so the only
+    errno values that count as "someone else has it" are the ones that mean
+    exactly that. A filesystem that cannot lock at all (NFS without lockd, some
+    SMB and FUSE mounts) reports ENOLCK/ENOTSUP/EINVAL, and inability to CHECK
+    must never be read as proof of contention: that is the same mistake that
+    cost the keys, applied to the start path instead.
+
+    HUB_FORCE=1 overrides, because both launchers already document it as the way
+    past their own version of this check."""
+    if os.environ.get("HUB_FORCE"):
+        _log.info("HUB_FORCE set -- skipping the single-instance check")
+        return True
+    path = os.path.join(os.path.dirname(config._config_path()), "instance.lock")
+    # A dedicated file, NOT config.json.lock: config.py takes a blocking
+    # cross-process lock on byte 0 of that one for every write, and holding it
+    # here would deadlock the hub against its own first save.
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fh = open(path, "a+b")
+    except OSError as exc:
+        _log.warning("single-instance check unavailable (%s) -- starting anyway", exc)
+        return True
+    busy = {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLK, 36}
+    try:
+        try:
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except ImportError:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in busy:
+            fh.close()
+            return False                      # genuinely held by another hub
+        _log.warning("single-instance check unavailable (%s) -- starting anyway", exc)
+        fh.close()
+        return True
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("single-instance check unavailable (%s) -- starting anyway", exc)
+        fh.close()
+        return True
+    _INSTANCE_LOCK.append(fh)     # held for the life of the process, never closed
+    return True
+
+
+_INSTANCE_LOCK = []
+
+
 if __name__ == "__main__":
     from werkzeug.serving import make_server
 
@@ -20056,6 +20306,11 @@ if __name__ == "__main__":
     _maybe_auto_create_desktop_shortcut()
     _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()
+    if not _claim_single_instance():
+        _log.error("another Calvoun hub is already running against %s -- "
+                   "stop it first, or set HUB_FORCE=1 to start anyway.",
+                   os.path.dirname(config._config_path()))
+        raise SystemExit(1)
     server = make_server(HOST, PORT, app, threaded=True)
     _runtime_server[0] = server
     try:
