@@ -258,13 +258,17 @@ import hashlib, os, sys
 h = hashlib.sha256(open("requirements.txt", "rb").read()).hexdigest()
 p = os.path.join(".venv", ".deps-stamp")
 ok = os.path.exists(p) and open(p).read().strip() == h
-import flask, requests          # noqa: F401 — must be importable, not just stamped
+import flask, requests, cryptography   # noqa: F401 - must be IMPORTABLE, not
+# just stamped. cryptography is the reason this list is checked at all: it is
+# imported behind a try/except in secretstore.py, so a missing copy does not
+# crash the hub -- it silently makes every stored API key undecryptable. A
+# stamp that matches while the package is gone would start exactly that hub.
 sys.exit(0 if ok else 1)
 PYCHK
 then
   echo "[free-llm-hub] Dependencies already installed - skipping pip."
 else
-  echo "[free-llm-hub] Installing dependencies (flask, requests)..."
+  echo "[free-llm-hub] Installing dependencies from requirements.txt..."
   echo "               This can take a minute on a slow network - progress prints below."
   echo "               If nothing moves for several minutes, your network is likely"
   echo "               blocking it - check a proxy/firewall or try a different network."
