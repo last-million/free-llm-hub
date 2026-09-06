@@ -25,6 +25,7 @@ Pure stdlib: json, os, secrets, stat, tempfile, threading, typing.
 """
 from __future__ import annotations
 
+import logging as _lg
 import json
 import os
 import secrets
@@ -211,6 +212,45 @@ def _normalize_provider_row(row):
     return row
 
 
+_warned_unreadable = [False]
+
+
+def _warn_unreadable_keys(n):
+    """Say it out loud, once, when stored keys cannot be read.
+
+    The hub carries the ciphertext through and keeps running, which is right --
+    it must never delete what it cannot decrypt. But it then runs with NO usable
+    keys and said nothing at all about why, and "every provider is suddenly
+    unavailable" is a very long way from "the crypto library is missing".
+
+    DIAGNOSED 2026-09-06, after a whole session of looking elsewhere: this
+    install's run.bat creates a venv and installs requirements.txt into it, and
+    cryptography was not in that file. Started through the launcher the hub had
+    no AESGCM, every key was undecryptable at once, and -- before the carry-back
+    existed -- the next save wrote the shorter list. All 41 keys, gone together.
+    That all-or-nothing shape is the signature of a missing MODULE; a lost or
+    replaced secret.key looks the same, so both are named here.
+
+    Once per process: load_config is called on nearly every request."""
+    if _warned_unreadable[0]:
+        return
+    _warned_unreadable[0] = True
+    try:
+        if not secretstore.available():
+            _lg.getLogger("config").error(
+                "%d stored API key(s) cannot be decrypted: the 'cryptography' "
+                "package is not installed in the interpreter running this hub. "
+                "The keys are NOT lost -- install it (pip install -r "
+                "requirements.txt) and restart, and they come back.", n)
+        else:
+            _lg.getLogger("config").error(
+                "%d stored API key(s) cannot be decrypted with the current "
+                "secret.key. They are kept as-is, not deleted. Restore the "
+                "original ~/.free-llm-hub/secret.key to recover them.", n)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _decrypt_secrets(cfg: dict) -> dict:
     """Turn stored ciphertext back into usable keys, in place.
 
@@ -274,6 +314,7 @@ def _decrypt_secrets(cfg: dict) -> dict:
         # so a wrong or missing secret.key costs a restart, not the keys.
         if unreadable:
             prov["_unreadable_api_keys"] = unreadable
+            _warn_unreadable_keys(len(unreadable))
     return cfg
 
 

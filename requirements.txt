@@ -18,3 +18,19 @@ psutil==7.2.1
 # runtime -- the hub falls back to the generator's own format if it is
 # missing -- but pinned here so every install actually gets WebP.
 Pillow==10.2.0
+
+# AES-256-GCM for the provider API keys stored in config.json (secretstore.py).
+# NOT optional, despite the guarded import that makes it look that way.
+#
+# THIS LINE'S ABSENCE COST AN INSTALL EVERY API KEY IT HAD. run.bat creates a
+# venv and installs THIS FILE into it; cryptography was not here, so a hub
+# started through the launcher had no AESGCM, could not decrypt a single stored
+# key, and -- before the ciphertext carry-back existed -- the next save wrote
+# the shorter list. All 41 keys at once. The all-or-nothing shape is the
+# signature: a missing MODULE fails every key simultaneously, which is why it
+# looked nothing like a file race and took a whole session to find.
+#
+# Same reasoning as psutil above, and more severe: the import is guarded so a
+# missing package fails SILENTLY, which is exactly why it has to be pinned
+# here. config.py now also says so out loud when it cannot read a key.
+cryptography==50.0.1
