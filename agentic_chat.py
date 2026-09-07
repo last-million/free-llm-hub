@@ -114,6 +114,7 @@ import time
 import uuid
 
 import agentic_history
+import model_categories
 import config
 import craft
 import vision_status
@@ -880,11 +881,30 @@ def _apply_codex_hub_fallback(config_home, session_id=None):
 # The model ids the hub answers to, in the shape opencode wants. Keep in step
 # with _hub_model_for(): a mode whose id is missing here is a failed turn, not
 # a fallback.
+#
+# opencode's own `/model` picker reads THIS list, not the hub's /v1/models. So
+# an id absent here is invisible inside the CLI however well the hub serves it
+# -- REPORTED 2026-09-07: "inside CLI i dont see the modes but just max or
+# swarm when i do /model". The modes were listed by /v1/models the whole time
+# and never reached the picker, because the seed was three hand-written
+# entries.
+#
+# The MODES are appended from model_categories, which is the same table the
+# router filters on, so the two cannot drift. Imported rather than hardcoded
+# for exactly that reason -- a category added there now shows up in the picker
+# on the next start. model_categories is a leaf module with no imports of its
+# own, so this does not create the app.py cycle the rest of this file avoids.
+#
+# A key already present wins: "swarm" is both a category name and the swarm
+# PIPELINE's id, and the pipeline meaning is the one opencode must send.
 _OPENCODE_HUB_MODELS = {
     "auto": {"name": "auto (best free, orchestrated)"},
     "best": {"name": "best (max quality -- never the cheap tier)"},
     "swarm": {"name": "swarm (several models per turn, best answer wins)"},
 }
+for _k, _label, _help in model_categories.labels():
+    _OPENCODE_HUB_MODELS.setdefault(_k, {"name": "%s (mode -- %s only)"
+                                         % (_k, _label.lower())})
 
 
 def _upgrade_opencode_seed(target):

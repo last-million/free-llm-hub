@@ -70,9 +70,17 @@ def test_the_registry_detector_uses_it():
 
 
 def test_opencode_connect_offers_every_routing_mode():
-    """The isolated /agent copy has always seeded auto/best/swarm; a terminal
-    opencode connected from the dashboard used to get only one."""
+    """The isolated /agent copy has always seeded the routing modes; a terminal
+    opencode connected from the dashboard used to get only one.
+
+    Asserts the SOURCE now, not a literal tuple. It pinned
+    ("auto","best","swarm") -- and that list then fell behind again when the
+    category modes arrived, because opencode's /model picker reads its own
+    config file and never /v1/models, so an id missing there is invisible
+    however well the hub serves it. Deriving from _virtual_model_ids() is what
+    stops the next addition going missing the same way."""
     src = open("app.py", encoding="utf-8").read()
     body = src.split("def _autofix_opencode(", 1)[1]
     body = body[:body.index("\ndef ")]
-    assert '("auto", "best", "swarm")' in body
+    assert "_virtual_model_ids()" in body
+    assert '("auto", "best", "swarm")' not in body, "back to a hand-written list"

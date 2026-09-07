@@ -715,6 +715,38 @@ def _auto_models(pid):
     return free + [m for m in paid if m not in seen]
 
 
+def _prefetch_free_models(providers):
+    """{pid: [free models]} for every provider, fetched CONCURRENTLY.
+
+    The free-only sibling of _prefetch_auto_models. Kept separate rather than
+    routed through it because they are NOT the same list: _auto_models honours
+    _auto_provider_mode() and can include PAID ids, which is exactly why its own
+    docstring says display code calls provider_free_models directly. Sharing one
+    helper here would quietly put paid models into the Settings tables.
+
+    MEASURED 2026-09-07: the three endpoints the Settings page loads did this
+    sweep one provider at a time, and /api/model-mode took 15.5 SECONDS. The
+    dashboard fetches all three together, so the mode buttons never got their
+    answer in time and none of them lit up -- the setting was saved correctly
+    and simply never displayed. Same shape as the 23s /v1/models that had
+    opencode reporting "Unable to connect".
+
+    Never raises: a provider whose fetch fails contributes an empty list, which
+    is what calling it directly would have given anyway."""
+    if not providers:
+        return {}
+    out = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(providers), 16)) as ex:
+        futures = {ex.submit(provider_free_models, pid): pid for pid in providers}
+        for fut in concurrent.futures.as_completed(futures):
+            pid = futures[fut]
+            try:
+                out[pid] = fut.result() or []
+            except Exception:                                    # noqa: BLE001
+                out[pid] = []
+    return out
+
+
 def _prefetch_auto_models(providers):
     """{pid: [models]} for every provider in `providers`, fetched CONCURRENTLY
     instead of one at a time -- see the comment at the call site in
@@ -8797,13 +8829,9 @@ def api_model_categories():
     the swarm at once, and "always the best, else the next best" still comes for
     free from the ordinary ranking inside whatever set is enabled."""
     live = []
-    for pid in _available_providers():
-        try:
-            for m in provider_free_models(pid) or []:
-                live.append((pid, m, "%s/%s" % (pid, m),
-                             _normalize_model_identity(m)))
-        except Exception:                                        # noqa: BLE001
-            continue
+    for pid, models in _prefetch_free_models(_available_providers()).items():
+        for m in models:
+            live.append((pid, m, "%s/%s" % (pid, m), _normalize_model_identity(m)))
 
     if request.method == "POST":
         # THIS NO LONGER TOUCHES THE BLOCKED LIST.
@@ -8873,12 +8901,9 @@ def api_model_mode():
             config.set_setting(_MODE_SETTING, mode)
 
     live = []
-    for pid in _available_providers():
-        try:
-            for m in provider_free_models(pid) or []:
-                live.append((pid, m, _normalize_model_identity(m)))
-        except Exception:                                        # noqa: BLE001
-            continue
+    for pid, models in _prefetch_free_models(_available_providers()).items():
+        for m in models:
+            live.append((pid, m, _normalize_model_identity(m)))
     modes = [{"key": MODE_ALL, "label": "All models",
               "help": "No restriction: every model the hub can reach.",
               "count": len(live)}]
@@ -8919,12 +8944,9 @@ def api_model_blocklist():
     says which ones the hub can see right now so the UI can mark the rest.
     """
     live = {}
-    for pid in _available_providers():
-        try:
-            for m in provider_free_models(pid) or []:
-                live["%s/%s" % (pid, m)] = (pid, m)
-        except Exception:                                        # noqa: BLE001
-            continue
+    for pid, models in _prefetch_free_models(_available_providers()).items():
+        for m in models:
+            live["%s/%s" % (pid, m)] = (pid, m)
 
     if request.method in ("POST", "DELETE"):
         body = request.get_json(force=True, silent=True) or {}
@@ -9079,8 +9101,8 @@ def _ranked_free_pairs(limit=6):
     """[(score, pid, model)] best-first across available providers, skipping
     safety-blocked and known-dead ids."""
     cands = []
-    for pid in _available_providers():
-        for m in _auto_models(pid):
+    for pid, models in _prefetch_auto_models(_available_providers()).items():
+        for m in models:
             if not prov.is_model_allowed(m) or _is_model_dead(pid, m):
                 continue
             cands.append((_benchmark_score(pid, m), pid, m))
@@ -12567,12 +12589,22 @@ def _autofix_opencode(entry, key, base_root, base_v1, model):
         "npm": "@ai-sdk/openai-compatible",
         "name": "Calvoun Free LLM Hub",
         "options": {"baseURL": base_v1, "apiKey": key},
-        # All three routing modes, not just the one being connected. The
-        # isolated /agent copy has always seeded auto/best/swarm, so a terminal
-        # opencode connected from the dashboard used to end up with strictly
-        # fewer choices than the same binary driven by /build -- and no way to
-        # ask for Swarm at all.
-        "models": {mid: {"name": mid} for mid in ("auto", "best", "swarm")},
+        # EVERY id the hub answers to, not a hand-written subset. opencode's
+        # `/model` picker reads THIS list and never asks /v1/models, so an id
+        # missing here is invisible inside the CLI however well the hub serves
+        # it.
+        #
+        # It was ("auto","best","swarm"), written out twice -- here and in
+        # agentic_chat's seed -- and the comment this replaces was already about
+        # the same drift one round earlier: a terminal opencode ending up with
+        # strictly fewer choices than the isolated copy. The MODES then arrived
+        # and were missing from both. REPORTED 2026-09-07: "inside CLI i dont
+        # see the modes but just max or swarm when i do /model".
+        #
+        # Derived from _virtual_model_ids() now, which is the same list /v1/models
+        # is built from, so the picker cannot fall behind the hub again.
+        "models": {mid: {"name": _virtual_model_label(mid)}
+                   for mid in _virtual_model_ids()},
     }
     data["provider"] = providers
     data["model"] = "free-llm-hub/" + model
