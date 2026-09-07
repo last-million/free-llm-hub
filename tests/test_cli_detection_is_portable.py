@@ -77,10 +77,12 @@ def test_opencode_connect_offers_every_routing_mode():
     ("auto","best","swarm") -- and that list then fell behind again when the
     category modes arrived, because opencode's /model picker reads its own
     config file and never /v1/models, so an id missing there is invisible
-    however well the hub serves it. Deriving from _virtual_model_ids() is what
-    stops the next addition going missing the same way."""
+    however well the hub serves it. There are TWO writers of that list -- this
+    one and agentic_chat's seed -- and they were separate hardcoded copies.
+    app imports agentic_chat and not the reverse, so the list lives there and
+    this takes it from there: one direction, one definition."""
     src = open("app.py", encoding="utf-8").read()
     body = src.split("def _autofix_opencode(", 1)[1]
     body = body[:body.index("\ndef ")]
-    assert "_virtual_model_ids()" in body
+    assert "agentic_chat._opencode_hub_models()" in body
     assert '("auto", "best", "swarm")' not in body, "back to a hand-written list"

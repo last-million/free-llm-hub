@@ -12593,22 +12593,17 @@ def _autofix_opencode(entry, key, base_root, base_v1, model):
         "npm": "@ai-sdk/openai-compatible",
         "name": "Calvoun Free LLM Hub",
         "options": {"baseURL": base_v1, "apiKey": key},
-        # EVERY id the hub answers to, not a hand-written subset. opencode's
-        # `/model` picker reads THIS list and never asks /v1/models, so an id
-        # missing here is invisible inside the CLI however well the hub serves
-        # it.
+        # THE SAME LIST the isolated /agent copy seeds -- imported, not
+        # rewritten. It was ("auto","best","swarm") here and again in
+        # agentic_chat, and two hardcoded copies fell behind twice: once when
+        # swarm was added, once when the category modes were. Both times the ids
+        # worked perfectly while being invisible in the picker, because opencode
+        # reads its own config and never /v1/models.
         #
-        # It was ("auto","best","swarm"), written out twice -- here and in
-        # agentic_chat's seed -- and the comment this replaces was already about
-        # the same drift one round earlier: a terminal opencode ending up with
-        # strictly fewer choices than the isolated copy. The MODES then arrived
-        # and were missing from both. REPORTED 2026-09-07: "inside CLI i dont
-        # see the modes but just max or swarm when i do /model".
-        #
-        # Derived from _virtual_model_ids() now, which is the same list /v1/models
-        # is built from, so the picker cannot fall behind the hub again.
-        "models": {mid: {"name": _virtual_model_label(mid)}
-                   for mid in _virtual_model_ids()},
+        # agentic_chat does not import app (that is the cycle it avoids), so the
+        # list lives there and app takes it from there -- one direction, one
+        # definition. See _opencode_hub_models for the effort/mode split.
+        "models": agentic_chat._opencode_hub_models(),
     }
     data["provider"] = providers
     data["model"] = "free-llm-hub/" + model

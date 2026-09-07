@@ -101,21 +101,62 @@ def test_every_seed_entry_has_a_label():
 
 
 def test_the_seed_is_derived_not_hand_written():
-    """A hand-written list is how the modes went missing. It must come from the
-    same table the router filters on, so the two cannot drift."""
+    """A hand-written list is how the modes went missing -- twice. The modes
+    must come from the same table the router filters on, so the two cannot
+    drift."""
     src = open("agentic_chat.py", encoding="utf-8").read()
-    i = src.index("_OPENCODE_HUB_MODELS = {")
-    assert "model_categories.labels()" in src[i:i + 900]
+    i = src.index("def _opencode_hub_models(")
+    assert "model_categories.labels()" in src[i:i + 1200]
 
 
-def test_a_connected_opencode_gets_every_hub_id():
-    """The OTHER copy of the same list -- _autofix_opencode writes the user's
-    own ~/.config/opencode/opencode.json. It had its own hardcoded three."""
+def test_both_opencode_writers_share_one_list():
+    """There are TWO writers of an opencode model list -- this seed, and
+    _autofix_opencode for a terminal opencode connected from the dashboard.
+    They were separate hardcoded copies and fell behind twice. app imports
+    agentic_chat and not the reverse, so the list lives there and app takes it
+    from there."""
     src = open("app.py", encoding="utf-8").read()
     i = src.index("def _autofix_opencode(")
     body = src[i:i + 2500]
-    assert "_virtual_model_ids()" in body
+    assert "agentic_chat._opencode_hub_models()" in body
     assert '("auto", "best", "swarm")' not in body
+
+
+# --------------------------------------------------------------------------- #
+# Effort and mode read as two groups in one picker
+# --------------------------------------------------------------------------- #
+
+def test_the_effort_tiers_are_labelled_as_effort():
+    """Asked for as "/model to select which mode, and /effort for auto, best,
+    swarm". opencode has no /effort command and the hub cannot add one -- the
+    model list is the only channel it has -- so the split is made in the names,
+    which is where it CAN be made."""
+    m = AC._opencode_hub_models()
+    for k in ("auto", "best", "swarm"):
+        assert m[k]["name"].startswith("effort:"), k
+
+
+def test_the_modes_are_labelled_as_modes():
+    m = AC._opencode_hub_models()
+    for k in MC.CATEGORY_KEYS:
+        if k in ("auto", "best", "swarm"):
+            continue
+        assert m[k]["name"].startswith("mode:"), k
+
+
+def test_the_pipelines_are_left_out_of_the_picker():
+    """crew/team/plan are dashboard pipelines. Seven of them in a picker of ten
+    is noise in front of the choices a CLI actually makes. The hub still answers
+    to them, so typing one by hand still works."""
+    m = AC._opencode_hub_models()
+    for k in ("crew", "crew-code", "crew-research", "crew-write", "crew-design",
+              "team", "plan"):
+        assert k not in m, k
+    assert k in A._virtual_model_ids(), "the hub must still SERVE them"
+
+
+def test_the_picker_stays_small():
+    assert len(AC._opencode_hub_models()) <= 12
 
 
 def test_both_writers_cover_the_modes():

@@ -878,33 +878,53 @@ def _apply_codex_hub_fallback(config_home, session_id=None):
     _write_codex_toml(path, _codex_hub_fallback_text(existing, session_id))
 
 
-# The model ids the hub answers to, in the shape opencode wants. Keep in step
-# with _hub_model_for(): a mode whose id is missing here is a failed turn, not
-# a fallback.
+# WHAT A CLI'S MODEL PICKER OFFERS. One list, used by BOTH writers -- this
+# seed for the isolated /agent copy, and app._autofix_opencode for a terminal
+# opencode connected from the dashboard. It lived in two hardcoded copies and
+# fell behind twice: first when swarm was added, then when the category modes
+# were, and each time the ids worked perfectly while being invisible in the
+# picker, because opencode reads THIS list and never /v1/models.
 #
-# opencode's own `/model` picker reads THIS list, not the hub's /v1/models. So
-# an id absent here is invisible inside the CLI however well the hub serves it
-# -- REPORTED 2026-09-07: "inside CLI i dont see the modes but just max or
-# swarm when i do /model". The modes were listed by /v1/models the whole time
-# and never reached the picker, because the seed was three hand-written
-# entries.
+# TWO FAMILIES, and the labels say which. Asked for as "in cli's i want /model
+# to select which mode, and /effort for auto, best, swarm". opencode has no
+# /effort command and the hub cannot add one -- slash commands are the CLI's
+# own UI, and the model list is the only channel the hub has. So the split is
+# made where it CAN be made: in the names, so one picker still reads as two
+# groups whichever order opencode sorts them in.
 #
-# The MODES are appended from model_categories, which is the same table the
-# router filters on, so the two cannot drift. Imported rather than hardcoded
-# for exactly that reason -- a category added there now shows up in the picker
-# on the next start. model_categories is a leaf module with no imports of its
-# own, so this does not create the app.py cycle the rest of this file avoids.
+#   EFFORT  how hard to try      auto / best / swarm
+#   MODE    which kind of model  coding, reasoning, uncensored, ...
 #
-# A key already present wins: "swarm" is both a category name and the swarm
-# PIPELINE's id, and the pipeline meaning is the one opencode must send.
-_OPENCODE_HUB_MODELS = {
-    "auto": {"name": "auto (best free, orchestrated)"},
-    "best": {"name": "best (max quality -- never the cheap tier)"},
-    "swarm": {"name": "swarm (several models per turn, best answer wins)"},
+# crew, crew-code, crew-research, crew-write, crew-design, team and plan are
+# deliberately NOT here. They are multi-stage pipelines aimed at the dashboard,
+# and seven of them in a picker of ten is noise in front of the choices a CLI
+# actually makes. The hub still answers to them, so typing one by hand still
+# works -- they are only absent from the list.
+_OPENCODE_EFFORT = {
+    "auto":  "effort: auto -- orchestrated, best free model per task",
+    "best":  "effort: max -- strongest free models only, never the cheap tier",
+    "swarm": "effort: swarm -- several models per turn, best answer wins",
 }
-for _k, _label, _help in model_categories.labels():
-    _OPENCODE_HUB_MODELS.setdefault(_k, {"name": "%s (mode -- %s only)"
-                                         % (_k, _label.lower())})
+
+
+def _opencode_hub_models():
+    """{id: {"name": label}} for a CLI picker: the effort tiers, then the modes.
+
+    Modes come from model_categories, the same table the router filters on, so
+    a category added there appears in the picker on the next start instead of
+    going missing. model_categories is a leaf module with no imports of its own,
+    which is what lets this file use it without the app.py cycle the rest of it
+    avoids.
+
+    An effort id always wins: "swarm" is both a category name and the swarm
+    PIPELINE's id, and the pipeline is the one a CLI has to send."""
+    out = {k: {"name": v} for k, v in _OPENCODE_EFFORT.items()}
+    for key, label, _help in model_categories.labels():
+        out.setdefault(key, {"name": "mode: %s -- %s only" % (key, label.lower())})
+    return out
+
+
+_OPENCODE_HUB_MODELS = _opencode_hub_models()
 
 
 def _upgrade_opencode_seed(target):
