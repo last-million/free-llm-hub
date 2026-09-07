@@ -9016,6 +9016,13 @@ def api_tracking():
     with _model_max_input_lock:
         learned = dict(_MODEL_MAX_INPUT)
     prov_status, out = {}, []
+    # Catalogs CONCURRENTLY. This is the endpoint the Settings page waits on
+    # longest, and it fetched one provider at a time: MEASURED 13.1s cold, with
+    # the mode buttons unable to render until it returned. _prefetch_auto_models
+    # is the same call (_auto_models per pid, so paid ids still appear here
+    # exactly as before -- this table deliberately shows what ROUTING sees),
+    # only not serialised.
+    _catalogs = _prefetch_auto_models(list(_enabled_keyed()))
     for pid in _enabled_keyed():
         if pid not in prov_status:
             try:
@@ -9023,10 +9030,7 @@ def api_tracking():
             except Exception:
                 prov_status[pid] = {}
         qs = prov_status[pid]
-        try:
-            models = _auto_models(pid)
-        except Exception:
-            models = []
+        models = _catalogs.get(pid) or []
         for m in models:
             key = (pid, str(m))
             dexp = dead.get(key)
