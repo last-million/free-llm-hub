@@ -143,7 +143,10 @@
 
   /* ---------- header ---------- */
   header{
-    position:sticky;top:var(--exhaust-h,0px);z-index:40;
+    /* top:0, not an offset under the quota banner: that banner no longer
+       sticks, so reserving space for it would leave a gap the width of the
+       page whenever it was showing. */
+    position:sticky;top:0;z-index:40;
     background:var(--surface);
     border-bottom:1px solid var(--border-soft);
   }
@@ -1425,9 +1428,66 @@
   .sd-models-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
   .sd-models-filter{width:100%;margin:8px 0 6px;padding:6px 9px;border-radius:8px;
     border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:12px}
-  .sd-block-add{display:flex;gap:6px;margin:8px 0 6px}
-  .sd-block-add input{flex:1;padding:6px 9px;border-radius:8px;
-    border:1px solid var(--border);background:var(--bg);color:var(--fg)}
+  .sd-models-filter:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .sd-count{margin:0 0 6px;min-height:1.2em;font-variant-numeric:tabular-nums}
+
+  /* Whitelist strip. Only shown when a whitelist is actually in force -- an
+     always-present "0 models allowed" line would be noise on every install
+     that never touches this. */
+  .sd-wl{display:flex;align-items:center;gap:8px;margin-top:10px;padding:7px 10px;
+    border:1px solid var(--warn-border,var(--border));background:var(--warn-soft);
+    border-radius:8px;font-size:12px}
+  .sd-wl-dot{width:7px;height:7px;border-radius:50%;background:var(--warn-text,var(--accent));flex:none}
+  .sd-wl-txt{flex:1;min-width:0;color:var(--warn-text,inherit)}
+
+  /* One row per MODEL. Three states, and the row says which it is in text as
+     well as in colour -- colour alone is not a state. */
+  .sd-ident{display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:8px;
+    font-size:12px;line-height:1.35;border-bottom:1px solid var(--border-soft)}
+  .sd-ident:last-child{border-bottom:0}
+  .sd-ident:hover{background:var(--bg-soft,rgba(127,127,127,.06))}
+  .sd-ident-main{flex:1;min-width:0}
+  .sd-ident-name{font-family:var(--mono);font-weight:600;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .sd-ident-meta{opacity:.65;font-size:11px;margin-top:1px;
+    font-variant-numeric:tabular-nums}
+  .sd-ident-modes{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+  .sd-chip{padding:1px 7px;border-radius:999px;font-size:10.5px;font-weight:600;
+    border:1px solid var(--border);background:transparent;color:var(--text);
+    cursor:pointer;opacity:.5;transition:opacity .15s ease,border-color .15s ease}
+  .sd-chip:hover{border-color:var(--accent);opacity:.9}
+  .sd-chip.on{opacity:1;border-color:var(--accent);color:var(--accent)}
+  .sd-chip:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .sd-ident-acts{display:flex;gap:5px;flex:none}
+  .sd-pill{padding:4px 10px;border-radius:7px;font-size:11px;font-weight:600;
+    border:1px solid var(--border);background:transparent;color:var(--text);
+    cursor:pointer;transition:background .15s ease,border-color .15s ease,color .15s ease}
+  .sd-pill:hover{border-color:var(--accent);color:var(--accent)}
+  .sd-pill:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .sd-pill[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#fff}
+  .sd-pill.danger:hover{border-color:var(--danger);color:var(--danger)}
+  .sd-pill.danger[aria-pressed="true"]{background:var(--danger);border-color:var(--danger);color:#fff}
+  .sd-ident.is-blocked .sd-ident-name{text-decoration:line-through;opacity:.6}
+  .sd-state{flex:none;font-size:10.5px;font-weight:700;padding:1px 6px;border-radius:5px;
+    background:var(--bg-soft,rgba(127,127,127,.12));opacity:.8}
+  .sd-state.ok{color:var(--accent)}
+  .sd-state.down{color:var(--danger)}
+  .sd-empty{padding:14px 10px;opacity:.7;font-size:12px;text-align:center}
+
+  .sd-sessions{border:1px solid var(--border);border-radius:10px;overflow:hidden}
+  .sd-sess{display:flex;align-items:center;gap:10px;padding:8px 10px;font-size:12px;
+    border-bottom:1px solid var(--border-soft)}
+  .sd-sess:last-child{border-bottom:0}
+  .sd-sess-main{flex:1;min-width:0}
+  .sd-sess-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sd-sess-meta{opacity:.65;font-size:11px;font-family:var(--mono)}
+  .sd-sess select{padding:4px 7px;border-radius:7px;border:1px solid var(--border);
+    background:var(--bg);color:var(--text);font-size:11.5px}
+  .sd-sess-live{width:7px;height:7px;border-radius:50%;background:var(--accent);flex:none}
+  .sd-sess-idle{width:7px;height:7px;border-radius:50%;background:var(--border);flex:none}
+  @media (prefers-reduced-motion:reduce){
+    .sd-chip,.sd-pill,.sd-models-filter{transition:none}
+  }
   .sd-blocked{max-height:220px;overflow-y:auto;border:1px solid var(--border);
     border-radius:8px}
   .sd-blocked .row{display:flex;align-items:center;gap:8px;padding:5px 9px;
@@ -1540,8 +1600,14 @@
   }
 
   /* ---------- exhaustion banner ---------- */
+  /* NOT sticky. It used to ride the top of every page on every scroll, which
+     is a permanent strip of screen height spent on a message the reader has
+     already read -- and it looked wrong pinned over content it had nothing to
+     do with. It says "a provider ran out of free quota": worth seeing on
+     arrival, not worth following you down the page. The header stays sticky;
+     this scrolls away with the content. */
   #exhaust-banner{
-    position:sticky;top:0;z-index:50;display:none;width:100%;
+    position:static;z-index:50;display:none;width:100%;
     font-size:13px;line-height:1.5;padding:10px 20px;
     border-bottom:1px solid transparent;
     transition:background .2s ease,color .2s ease;
@@ -1862,6 +1928,14 @@
      needs. Hidden only on that view. */
   body.cx-agent-view > header{ display:none; }
   body.cx-agent-view main.wrap{ padding-top:14px; }
+  /* The agent view is a full-height working surface -- a terminal above a
+     preview -- so every strip of chrome comes straight out of the space the
+     user is actually working in. The quota banner and the site footer are both
+     read-once information with a permanent cost here, and both are one click
+     away on any other view. */
+  body.cx-agent-view #exhaust-banner{ display:none !important; }
+  body.cx-agent-view .site-footer{ display:none; }
+  body.cx-agent-view main.wrap{ padding-bottom:14px; }
   body.cx-on main.wrap > section.section{ display:none; }
   body.cx-on main.wrap > section.section.cx-active{ display:block; animation:cxFade .22s ease-out; }
   @keyframes cxFade{ from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:none;} }
@@ -3071,33 +3145,42 @@
     </div>
     <div class="sd-group">
       <div class="sd-models-head">
-        <b>Models &amp; live benchmark</b>
+        <b>Models</b>
         <button class="btn sm ghost" id="sd-models-refresh" type="button">Refresh</button>
       </div>
-      <p class="sd-help">Every model the hub can currently reach, strongest first, with the
-        score routing actually uses. Switch one off and it is skipped everywhere &mdash;
-        orchestration, the fallback chain and the swarm.</p>
-      <div class="sd-cats" id="sd-cats" role="group" aria-label="Use only models good at"></div>
-      <input class="sd-models-filter" id="sd-models-filter" type="search"
-             placeholder="Filter by model or provider&hellip;" aria-label="Filter models">
+      <p class="sd-help">One row per <em>model</em>, not per provider: the same model served by
+        four providers is one row, so you choose it once. Blocking or allowing here applies
+        everywhere &mdash; orchestration, the fallback chain and the swarm &mdash; including
+        providers that start serving it later.</p>
+
+      <div class="sd-cats" id="sd-cats" role="group" aria-label="Restrict routing to a category"></div>
+
+      <div class="sd-wl" id="sd-wl" hidden>
+        <span class="sd-wl-dot" aria-hidden="true"></span>
+        <span class="sd-wl-txt" id="sd-wl-txt"></span>
+        <button class="btn sm ghost" id="sd-wl-clear" type="button">Use every model again</button>
+      </div>
+
+      <label class="sd-label" for="sd-models-filter">Find a model</label>
+      <input class="sd-models-filter" id="sd-models-filter" type="search" autocomplete="off"
+             placeholder="Start typing &mdash; gpt-oss, glm, qwen&hellip;"
+             aria-describedby="sd-models-count">
+      <p class="sd-help sd-count" id="sd-models-count" role="status" aria-live="polite"></p>
+
       <div class="sd-models" id="sd-models"><div class="skel skel-row"></div></div>
+      <p class="sd-help"><b>Only this</b> builds a whitelist: when at least one model is
+        marked, the hub uses <em>nothing else</em>. <b>Block</b> switches a model off across
+        every provider. A model can be neither, which is the default.</p>
     </div>
 
     <div class="sd-group">
       <div class="sd-models-head">
-        <b>Blocked models</b>
-        <button class="btn sm ghost" id="sd-block-refresh" type="button">Refresh</button>
+        <b>Running sessions</b>
+        <button class="btn sm ghost" id="sd-sessions-refresh" type="button">Refresh</button>
       </div>
-      <p class="sd-help">Models switched off everywhere &mdash; orchestration, the fallback
-        chain and the swarm. The list above switches them one at a time; this blocks a whole
-        <em>family</em> by name, which is what you want when the same model is served by
-        several providers under slightly different spellings.</p>
-      <div class="sd-block-add">
-        <input id="sd-block-pattern" type="search" placeholder="Block by name, e.g. gpt-oss"
-               aria-label="Block models whose name contains">
-        <button class="btn sm" id="sd-block-apply" type="button">Block</button>
-      </div>
-      <div class="sd-blocked" id="sd-blocked"><div class="skel skel-row"></div></div>
+      <p class="sd-help">Every agent session the hub is holding. The mode set here applies to
+        that conversation only, and overrides the category chosen above.</p>
+      <div class="sd-sessions" id="sd-sessions"><div class="skel skel-row"></div></div>
     </div>
 
     <div class="sd-group">
@@ -9899,7 +9982,10 @@
        /api/model-allowlist, which the router honours through _is_model_dead --
        one seam, so a blocked model is skipped by orchestration, the fallback
        chain and the swarm alike. */
-    var _sdModels = [], _sdBlocked = {};
+    var _sdModels = [];        /* one entry per MODEL identity */
+    var _sdWorking = 0;        /* how many are answering right now */
+    var _sdWhitelist = [];     /* identities the user restricted routing to */
+    var _sdModeList = [];      /* [{key,label}] for the per-row category chips */
 
     /* MEASURED speed, next to the benchmark score.
        The score says how good a model is thought to be; this says how it has
@@ -9923,6 +10009,19 @@
       return ms < 1000 ? Math.round(ms) + 'ms' : (ms / 1000).toFixed(1) + 's';
     }
 
+    /* An identity is several provider ids; show the speed of whichever one has
+       actually been measured. Losing the badge entirely when the list stopped
+       being provider-qualified would have thrown away the one column that says
+       how a model behaves HERE rather than how it scores in the abstract. */
+    function sdSpeedForIdent(m){
+      var ids = (m && m.ids) || [];
+      for (var i = 0; i < ids.length; i++){
+        var badge = sdSpeedBadge(ids[i]);
+        if (badge) return badge;
+      }
+      return '';
+    }
+
     function sdSpeedBadge(id){
       var r = _sdSpeed[id];
       if (!r) return '';
@@ -9943,131 +10042,129 @@
              esc(fmtMs(ttft != null ? ttft : r.p50_ms)) + '</span>';
     }
 
+    /* ONE ROW PER MODEL, not per provider+model.
+       The list used to be provider-qualified, so the same model served by four
+       providers was four rows and switching it off meant finding and ticking
+       all four -- and a fifth provider adding it tomorrow served it again.
+       Rows are grouped by /api/model-identities, which groups on the SAME
+       identity function routing already uses, so the table and the router
+       cannot disagree about what "the same model" means. */
     function renderSdModels(){
       var host = $('#sd-models');
       if (!host) return;
       var q = (($('#sd-models-filter') || {}).value || '').toLowerCase().trim();
       var rows = _sdModels.filter(function(m){
-        return !q || (m.id || '').toLowerCase().indexOf(q) >= 0;
+        return !q || (m.identity || '').toLowerCase().indexOf(q) >= 0
+                  || (m.providers || []).join(' ').toLowerCase().indexOf(q) >= 0;
       });
+      var count = $('#sd-models-count');
+      if (count){
+        count.textContent = !_sdModels.length ? ''
+          : q ? (rows.length + ' of ' + _sdModels.length + ' models match')
+              : (_sdModels.length + ' models, ' + _sdWorking + ' answering now');
+      }
       if (!rows.length){
-        host.innerHTML = '<div class="chat-empty">' +
-          (_sdModels.length ? 'Nothing matches that filter.' : 'No models available yet.') +
-          '</div>';
+        host.innerHTML = '<div class="sd-empty">' +
+          (_sdModels.length
+            ? 'No model matches &ldquo;' + esc(q) + '&rdquo;.'
+            : 'No models yet &mdash; add a provider key first.') + '</div>';
         return;
       }
-      host.innerHTML = rows.slice(0, 300).map(function(m){
-        var off = !!_sdBlocked[m.id];
-        /* A model the UPSTREAM has withdrawn is shown as such and left
-           switchable -- it comes back on its own, and hiding it would just look
-           like the hub had lost it. */
-        var state = (m.state && m.state !== 'ok') ? m.state : '';
-        return '<label class="sd-model' + (off ? ' off' : '') + '" title="' +
-                 esc(m.id) + (state ? ' — ' + esc(state) : '') + '">' +
-               '<input type="checkbox" data-id="' + esc(m.id) + '"' + (off ? '' : ' checked') + '>' +
-               '<span class="sc">' + (Math.round((m.score || 0) * 10) / 10) + '</span>' +
-               '<span class="nm">' + esc(m.model || '') +
-                 ' <span class="pv">' + esc(m.provider || '') + '</span></span>' +
-               (state ? '<span class="st">' + esc(state) + '</span>' : '') +
-               sdSpeedBadge(m.id) +
-               '</label>';
-      }).join('');
-      var boxes = host.querySelectorAll('input[type=checkbox]');
-      for (var i = 0; i < boxes.length; i++){
-        boxes[i].addEventListener('change', function(){
-          var id = this.getAttribute('data-id') || '';
-          var cut = id.indexOf('/');
-          var provider = id.slice(0, cut), model = id.slice(cut + 1);
-          var want = this.checked, box = this;
-          box.disabled = true;
-          api('/api/model-allowlist', { method: 'POST',
-              body: { provider: provider, model: model, enabled: want } })
-            .then(function(r){
-              _sdBlocked = {};
-              ((r && r.blocked) || []).forEach(function(x){ _sdBlocked[x] = true; });
-              renderSdCats(); renderSdModels();
-              toast(model + (want ? ' enabled' : ' switched off'));
-            })
-            .catch(function(e){ toast('Models: ' + e.message, true); box.checked = !want; })
-            .then(function(){ box.disabled = false; });
-        });
-      }
-    }
-
-    /* BLOCKED MODELS.
-       The per-model switches above write the same list one model at a time,
-       which is unusable for retiring a FAMILY: "gpt-oss" is served by groq,
-       nvidia, llm7, cerebras and several g4f relays under slightly different
-       spellings, so switching it off means hunting the same name through a
-       table of hundreds. This blocks every match in one go, and lists what is
-       currently off so it can be undone.
-
-       An entry whose model is not currently live is shown greyed rather than
-       dropped: providers withdraw and restore models constantly, and hiding it
-       would quietly re-enable something the user had switched off the moment it
-       came back -- and it is exactly the entry the per-model table cannot
-       reach, because that table only lists what is live. */
-    function renderBlocked(rows){
-      var host = $('#sd-blocked');
-      if (!host) return;
-      if (!rows || !rows.length){
-        host.innerHTML = '<div class="empty">Nothing blocked. Every model the hub can reach is in use.</div>';
-        return;
-      }
-      host.innerHTML = rows.map(function(r){
-        return '<div class="row' + (r.live ? '' : ' gone') + '">' +
-               '<span class="nm">' + esc(r.model || '') +
-                 ' <span class="pv">' + esc(r.provider || '') + '</span></span>' +
-               (r.live ? '' : '<span class="pv">not listed now</span>') +
-               '<button class="btn sm ghost" data-unblock="' + esc(r.id) + '" type="button">Unblock</button>' +
+      /* Capped, because the fleet is ~280 models and a settings panel is not a
+         place to render every one of them into the DOM. The search box is the
+         way to reach the rest, which is why it is directly above this. */
+      host.innerHTML = rows.slice(0, 120).map(function(m){
+        var providers = (m.providers || []).join(', ');
+        var meta = m.count + (m.count === 1 ? ' provider' : ' providers') +
+                   ' · ' + m.working + ' working' +
+                   (m.score ? ' · score ' + (Math.round(m.score * 10) / 10) : '');
+        var chips = (_sdModeList || []).map(function(c){
+          var on = (m.categories || []).indexOf(c.key) >= 0;
+          return '<button class="sd-chip' + (on ? ' on' : '') + '" type="button"' +
+                 ' data-mode="' + esc(c.key) + '" data-ident="' + esc(m.identity) + '"' +
+                 ' aria-pressed="' + (on ? 'true' : 'false') + '"' +
+                 ' title="' + (on ? 'In' : 'Not in') + ' the ' + esc(c.label) +
+                 ' category &mdash; click to change">' + esc(c.label) + '</button>';
+        }).join('');
+        return '<div class="sd-ident' + (m.blocked ? ' is-blocked' : '') + '">' +
+                 '<div class="sd-ident-main">' +
+                   '<div class="sd-ident-name" title="' + esc(providers) + '">' +
+                      esc(m.identity) + '</div>' +
+                   '<div class="sd-ident-meta">' + esc(meta) +
+                      sdSpeedForIdent(m) + '</div>' +
+                   '<div class="sd-ident-modes">' + chips + '</div>' +
+                 '</div>' +
+                 '<span class="sd-state ' + (m.working ? 'ok' : 'down') + '">' +
+                   (m.working ? 'live' : 'down') + '</span>' +
+                 '<div class="sd-ident-acts">' +
+                   '<button class="sd-pill" type="button" data-act="allow"' +
+                     ' data-ident="' + esc(m.identity) + '"' +
+                     ' aria-pressed="' + (m.allowed ? 'true' : 'false') + '"' +
+                     ' title="Use only the models marked this way">Only this</button>' +
+                   '<button class="sd-pill danger" type="button" data-act="block"' +
+                     ' data-ident="' + esc(m.identity) + '"' +
+                     ' aria-pressed="' + (m.blocked ? 'true' : 'false') + '"' +
+                     ' title="Switch this model off across every provider">Block</button>' +
+                 '</div>' +
                '</div>';
       }).join('');
-      var btns = host.querySelectorAll('button[data-unblock]');
-      for (var i = 0; i < btns.length; i++){
-        btns[i].addEventListener('click', function(){
-          var id = this.getAttribute('data-unblock') || '';
-          this.disabled = true;
-          api('/api/model-blocklist', { method: 'DELETE', body: { id: id } })
-            .then(function(r){
-              renderBlocked((r && r.blocked) || []);
-              loadSdModels();
-              toast(id + ' unblocked');
+
+      host.querySelectorAll('.sd-pill').forEach(function(btn){
+        btn.addEventListener('click', function(){
+          var ident = btn.getAttribute('data-ident');
+          var act = btn.getAttribute('data-act');
+          var on = btn.getAttribute('aria-pressed') === 'true';
+          var action = act === 'allow' ? (on ? 'disallow' : 'allow')
+                                       : (on ? 'unblock' : 'block');
+          host.querySelectorAll('.sd-pill').forEach(function(b){ b.disabled = true; });
+          api('/api/model-identities', { method: 'POST',
+              body: { identity: ident, action: action } })
+            .then(function(){ return loadSdModels(true); })
+            .then(function(){
+              toast(ident + ' — ' + (
+                action === 'allow'    ? 'whitelisted' :
+                action === 'disallow' ? 'removed from the whitelist' :
+                action === 'block'    ? 'blocked everywhere' : 'unblocked'));
             })
-            .catch(function(e){ toast('Blocked models: ' + e.message, true); });
+            .catch(function(e){
+              toast(e.message, true);
+              host.querySelectorAll('.sd-pill').forEach(function(b){ b.disabled = false; });
+            });
         });
-      }
-    }
-
-    function loadBlocked(){
-      return api('/api/model-blocklist').then(function(r){
-        renderBlocked((r && r.blocked) || []);
-      }).catch(function(e){ toast('Blocked models: ' + e.message, true); });
-    }
-
-    (function wireBlocked(){
-      var apply = $('#sd-block-apply'), input = $('#sd-block-pattern'),
-          refresh = $('#sd-block-refresh');
-      function doBlock(){
-        var pattern = (input && input.value || '').trim();
-        if (!pattern){ toast('Type a name to block, e.g. gpt-oss', true); return; }
-        if (apply) apply.disabled = true;
-        api('/api/model-blocklist', { method: 'POST', body: { pattern: pattern } })
-          .then(function(r){
-            var rows = (r && r.blocked) || [];
-            renderBlocked(rows);
-            loadSdModels();
-            if (input) input.value = '';
-            toast(rows.length + ' model' + (rows.length === 1 ? '' : 's') + ' blocked');
-          })
-          .catch(function(e){ toast('Blocked models: ' + e.message, true); })
-          .then(function(){ if (apply) apply.disabled = false; });
-      }
-      if (apply) apply.addEventListener('click', doBlock);
-      if (input) input.addEventListener('keydown', function(e){
-        if (e.key === 'Enter'){ e.preventDefault(); doBlock(); }
       });
-      if (refresh) refresh.addEventListener('click', loadBlocked);
-    })();
+
+      host.querySelectorAll('.sd-chip').forEach(function(chip){
+        chip.addEventListener('click', function(){
+          var on = chip.getAttribute('aria-pressed') === 'true';
+          chip.disabled = true;
+          api('/api/model-category', { method: 'POST', body: {
+                key: chip.getAttribute('data-mode'),
+                identity: chip.getAttribute('data-ident'),
+                member: !on } })
+            .then(function(){ return loadSdModels(true); })
+            .catch(function(e){ toast(e.message, true); chip.disabled = false; });
+        });
+      });
+    }
+
+    function renderWhitelistStrip(){
+      var strip = $('#sd-wl'), txt = $('#sd-wl-txt');
+      if (!strip) return;
+      strip.hidden = !_sdWhitelist.length;
+      if (txt){
+        txt.textContent = 'Whitelist on — the hub is using only ' +
+          _sdWhitelist.length + ' model' + (_sdWhitelist.length === 1 ? '' : 's') +
+          ': ' + _sdWhitelist.join(', ');
+      }
+    }
+
+    /* The old "Blocked models" panel lived here. It was a second list with a
+       second mental model -- a blind substring box that blocked a FAMILY,
+       because the per-model table below it was provider-qualified and made
+       switching one model off a hunt through four separate rows. Grouping the
+       table by identity removed the reason for both: one row IS the model
+       everywhere, so Block on that row does what the pattern box approximated,
+       and shows you exactly which models it covers first. */
 
     /* One-click "use only the models good at X".
      The category table is server-side (model_categories.py) so these buttons
@@ -10131,31 +10228,105 @@
   }
 
     function loadSdModels(silent){
-      return Promise.all([api('/api/tracking'), api('/api/model-categories'),
+      return Promise.all([api('/api/model-identities'), api('/api/model-categories'),
                           api('/api/model-mode')])
         .then(function(res){
-          _sdModels = ((res[0] && res[0].models) || []).slice();
-          _sdCats = ((res[1] && res[1].categories) || []).slice();
-          _sdBlocked = {};
-          ((res[1] && res[1].blocked) || []).forEach(function(x){ _sdBlocked[x] = true; });
-          _sdMode = (res[2] && res[2].mode) || 'all';
+          var d = res[0] || {};
+          _sdModels    = (d.models || []).slice();
+          _sdWorking   = d.working || 0;
+          _sdWhitelist = (d.allowed || []).slice();
+          _sdModeList  = (d.modes || []).slice();
+          _sdCats      = ((res[1] && res[1].categories) || []).slice();
+          _sdMode      = (res[2] && res[2].mode) || 'all';
           renderSdCats();
+          renderWhitelistStrip();
           renderSdModels();
           loadSdSpeed();
         })
         .catch(function(e){
           if (!silent) toast('Models: ' + e.message, true);
           var host = $('#sd-models');
-          if (host) host.innerHTML = '<div class="chat-empty">Could not load: ' +
+          if (host) host.innerHTML = '<div class="sd-empty">Could not load: ' +
                                      esc(e.message) + '</div>';
         });
     }
 
     function initSdModels(){
       var f = $('#sd-models-filter');
-      if (f) f.addEventListener('input', renderSdModels);
+      /* Debounced: the rows come from memory, but re-rendering a 280-model list
+         on every keystroke is visible jank on a slow machine. */
+      if (f){
+        var t = null;
+        f.addEventListener('input', function(){
+          clearTimeout(t);
+          t = setTimeout(renderSdModels, 120);
+        });
+      }
       var r = $('#sd-models-refresh');
       if (r) r.addEventListener('click', function(){ loadSdModels(); });
+      var wl = $('#sd-wl-clear');
+      if (wl) wl.addEventListener('click', function(){
+        wl.disabled = true;
+        api('/api/model-identities/whitelist', { method: 'DELETE' })
+          .then(function(){ return loadSdModels(true); })
+          .then(function(){ toast('Whitelist cleared — every model is available again'); })
+          .catch(function(e){ toast(e.message, true); })
+          .then(function(){ wl.disabled = false; });
+      });
+      var sr = $('#sd-sessions-refresh');
+      if (sr) sr.addEventListener('click', function(){ loadSdSessions(); });
+      loadSdSessions();
+    }
+
+    /* RUNNING SESSIONS. Each row carries its own mode, which is what makes
+       "this conversation uses the coding models" possible without changing the
+       global setting every other session reads. */
+    function loadSdSessions(){
+      var host = $('#sd-sessions');
+      if (!host) return Promise.resolve();
+      return api('/api/agent/sessions').then(function(d){
+        var rows = (d && d.sessions) || [];
+        if (!rows.length){
+          host.innerHTML = '<div class="sd-empty">No sessions running. ' +
+                           'Start one from the Agent page.</div>';
+          return;
+        }
+        host.innerHTML = rows.map(function(row){
+          var name = row.project_dir
+            ? String(row.project_dir).split(/[\/]/).pop() : (row.cli || 'session');
+          var opts = ['<option value="all">All models</option>'].concat(
+            (_sdModeList || []).map(function(c){
+              return '<option value="' + esc(c.key) + '"' +
+                     (row.mode === c.key ? ' selected' : '') + '>' +
+                     esc(c.label) + '</option>';
+            })).join('');
+          return '<div class="sd-sess">' +
+                 '<span class="' + (row.currently_running ? 'sd-sess-live' : 'sd-sess-idle') +
+                   '" title="' + (row.currently_running ? 'A turn is running' : 'Idle') +
+                   '" aria-hidden="true"></span>' +
+                 '<div class="sd-sess-main">' +
+                   '<div class="sd-sess-name">' + esc(name) + '</div>' +
+                   '<div class="sd-sess-meta">' + esc(row.cli || '') + ' · ' +
+                     (row.turn_count || 0) + ' turns · ' +
+                     esc(String(row.session_id || '').slice(0, 8)) + '</div>' +
+                 '</div>' +
+                 '<select data-sid="' + esc(row.session_id) + '" ' +
+                   'aria-label="Mode for this session">' + opts + '</select>' +
+                 '</div>';
+        }).join('');
+        host.querySelectorAll('select[data-sid]').forEach(function(sel){
+          sel.addEventListener('change', function(){
+            sel.disabled = true;
+            api('/api/model-mode', { method: 'POST', body: {
+                  mode: sel.value, session_id: sel.getAttribute('data-sid') } })
+              .then(function(){ toast('Session mode: ' + sel.value); })
+              .catch(function(e){ toast(e.message, true); })
+              .then(function(){ sel.disabled = false; });
+          });
+        });
+      }).catch(function(){
+        host.innerHTML = '<div class="sd-empty">Sessions unavailable.</div>';
+      });
     }
 
   function initSocialWebSearch(){
@@ -10340,7 +10511,6 @@
     try { loadSocialWebSearch(silent); } catch (e) {}
     try { loadUpdateStatus(silent); } catch (e) {}
     try { loadSdModels(silent); } catch (e) {}
-    try { loadBlocked(); } catch (e) {}
   }
 
   function _legacyOpenSettingsDrawer(){

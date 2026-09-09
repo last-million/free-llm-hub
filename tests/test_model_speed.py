@@ -218,9 +218,17 @@ def _template():
 
 
 def test_the_settings_model_table_shows_it():
+    """The badge is keyed by 'pid/model', and a settings row is now a GROUP of
+    those (one row per model, not per provider), so the row asks
+    sdSpeedForIdent for whichever of its provider ids has actually been
+    measured. What matters is that the measured speed still reaches the row --
+    not which helper spells it."""
     html = _template()
     assert "function loadSdSpeed()" in html
-    assert "sdSpeedBadge(m.id)" in html
+    assert "function sdSpeedForIdent(" in html
+    assert "sdSpeedForIdent(m)" in html
+    i = html.index("function sdSpeedForIdent(")
+    assert "sdSpeedBadge(ids[i])" in html[i:i + 600]
 
 
 def test_it_loads_alongside_the_model_list():
