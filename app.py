@@ -20766,7 +20766,7 @@ def _is_git_repo():
 # setup step) would otherwise run arbitrary code as this user. This does not
 # defend against the upstream repo itself being compromised — only against
 # a wrong/hostile remote — the accepted residual risk is documented in
-# security_best_practices_report.md (SEC-002).
+# docs/security_best_practices_report.md (SEC-002).
 _TRUSTED_REMOTE_RE = re.compile(
     r"^(?:https://github\.com/|git@github\.com:)last-million/free-llm-hub(?:\.git)?/?$",
     re.IGNORECASE)

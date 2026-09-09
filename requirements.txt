@@ -1,5 +1,5 @@
 # Pinned to the exact versions this hub is tested against (see
-# security_best_practices_report.md, SEC-003). Bump deliberately, re-run
+# docs/security_best_practices_report.md, SEC-003). Bump deliberately, re-run
 # `python -m pytest -q`, and update these lines together — do not widen back
 # to an open lower bound.
 flask==3.0.3

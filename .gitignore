@@ -49,3 +49,14 @@ list_keys.py
 .calvoun-brief.md
 .pytest-tmp/
 hub-start.log
+
+# Editor / OS / tool leftovers that have no business in a public repo.
+.pytest_cache/
+.claude/
+node_modules/
+*.bak
+*.orig
+*.rej
+*~
+.DS_Store
+Thumbs.db

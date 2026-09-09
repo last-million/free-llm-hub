@@ -1,0 +1,21 @@
+# This project is run, not installed: `python app.py`, or run.bat / run.sh.
+# There is deliberately no [build-system] and no packaging metadata for
+# distribution -- the auto-updater is a `git pull`, and a moved app.py would
+# leave a stale copy behind (the updater never deletes), so the flat layout is
+# load-bearing rather than accidental.
+#
+# What this file IS for: telling pytest where the tests live, so `pytest` with
+# no arguments does the right thing from anywhere in the repo, and giving the
+# usual tools one place to look instead of guessing.
+[project]
+name = "calvoun-free-llm-hub"
+version = "0.5.7"
+description = "Local gateway that serves free LLM providers to any tool, over four wire protocols."
+requires-python = ">=3.10"
+license = { text = "PolyForm Noncommercial 1.0.0" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The repo root has to be importable: every test does `import app`, and there is
+# no installed package to import instead.
+pythonpath = ["."]
