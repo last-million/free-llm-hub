@@ -64,15 +64,26 @@ CREW_NAMES = ("auto", "code", "research", "write", "design")
 MAX_JOBS = 50
 
 _RUNNER = None  # set by init(); None = tools/call fails cleanly
+# The multi-agent orchestrator, wired the same way and kept in its OWN slot.
+# One global runner was enough while there was one tool family; a second family
+# with a completely different contract (start/poll/stop over a run id, not one
+# blocking call) would have had to pretend to be a crew to reuse that slot.
+_SWARM = None  # {"start", "status", "stop"} callables, or None
 _JOBS = {}  # job_id -> {"status", "text", "error", "created"}
 _JOBS_LOCK = threading.Lock()
 
 
-def init(runner, version=None):
+def init(runner, version=None, swarm=None):
     """Wire the crew execution contract: runner(messages, crew_name) -> str,
-    blocking. Called once by app.py after crews.run/format_answer exist."""
-    global _RUNNER, SERVER_VERSION
+    blocking. Called once by app.py after crews.run/format_answer exist.
+
+    `swarm` optionally wires the multi-agent orchestrator: a dict of
+    start/status/stop callables. Absent, those tools are not advertised at all
+    -- a client must never be shown a tool that cannot run."""
+    global _RUNNER, SERVER_VERSION, _SWARM
     _RUNNER = runner
+    if swarm:
+        _SWARM = swarm
     if version:
         SERVER_VERSION = version
 
@@ -140,7 +151,55 @@ def _tools():
                 "required": ["job_id"],
             },
         },
-    ]
+    ] + ([] if _SWARM is None else [
+        {
+            "name": "swarm_windows_start",
+            "description": (
+                "Run SEVERAL real agent sessions in parallel, in the background, "
+                "on one goal. Each agent gets its own CLI session, its own "
+                "context window and its own tools; the work is split into "
+                "phases, and a phase waits for the phases it depends on. "
+                "Returns a run_id immediately -- poll swarm_windows_status. Use "
+                "this for work that splits into independent pieces; use "
+                "crew_run for a single answer written by several models."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string",
+                             "description": "The whole job, in plain words."},
+                    "project_dir": {"type": "string",
+                                    "description": "Existing folder the agents work in."},
+                    "cli": {"type": "string",
+                            "description": "Which CLI each agent runs (default opencode)."}
+                },
+                "required": ["goal", "project_dir"]
+            }
+        },
+        {
+            "name": "swarm_windows_status",
+            "description": ("How a run is going: every phase, its state and its "
+                            "summary. Add events=true to read what an agent "
+                            "actually did."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"},
+                    "events": {"type": "boolean"}
+                },
+                "required": ["run_id"]
+            }
+        },
+        {
+            "name": "swarm_windows_stop",
+            "description": "Stop a run and every agent still working in it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"run_id": {"type": "string"}},
+                "required": ["run_id"]
+            }
+        }
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +282,41 @@ def _text_result(obj, is_error=False):
     return result
 
 
+def _call_swarm_tool(name, arguments):
+    """The multi-agent tools.
+
+    A bad ARGUMENT is a JSON-RPC error (the client built the call wrong); a bad
+    WORLD -- no such folder, no such run -- comes back as tool text, because
+    that is something the model can read and act on."""
+    if name == "swarm_windows_start":
+        goal = arguments.get("goal")
+        project_dir = arguments.get("project_dir")
+        if not isinstance(goal, str) or not goal.strip():
+            return _error(-32602, "'goal' must be a non-empty string")
+        if not isinstance(project_dir, str) or not project_dir.strip():
+            return _error(-32602, "'project_dir' must be a non-empty string")
+        cli = arguments.get("cli") or "opencode"
+        try:
+            run_id = _SWARM["start"](goal.strip(), project_dir.strip(), str(cli))
+        except Exception as exc:                                 # noqa: BLE001
+            return _text_result("could not start: %s" % exc, is_error=True)
+        return _text_result(
+            "Swarm run %s started. Poll swarm_windows_status with that run_id."
+            % run_id)
+
+    run_id = arguments.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        return _error(-32602, "'run_id' must be a non-empty string")
+    if name == "swarm_windows_stop":
+        ok = _SWARM["stop"](run_id)
+        return _text_result("stopped %s" % run_id if ok
+                            else "unknown run_id: %s" % run_id, is_error=not ok)
+    st = _SWARM["status"](run_id, bool(arguments.get("events")))
+    if st is None:
+        return _text_result("unknown run_id: %s" % run_id, is_error=True)
+    return _text_result(json.dumps(st, ensure_ascii=False, indent=1))
+
+
 def _call_tool(params):
     """Returns a JSON-RPC error dict OR a tools/call result dict."""
     if not isinstance(params, dict):
@@ -231,6 +325,10 @@ def _call_tool(params):
     arguments = params.get("arguments") or {}
     if not isinstance(arguments, dict):
         return _error(-32602, "'arguments' must be an object")
+    if name in ("swarm_windows_start", "swarm_windows_status", "swarm_windows_stop"):
+        if _SWARM is None:
+            return _error(-32603, "swarm orchestrator not wired")
+        return _call_swarm_tool(name, arguments)
     if name not in ("crew_run", "crew_start", "crew_result"):
         return _error(-32602, "Unknown tool: %r" % (name,))
     if _RUNNER is None:

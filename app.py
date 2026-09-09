@@ -88,9 +88,26 @@ import usage_history
 # exact same pipeline as the /v1/* crew model ids. _swarm_dispatch is defined
 # far below in this file, which is fine -- the lambda only resolves it at CALL
 # time, not at import time.
-hub_mcp.init(lambda messages, crew_name: crews.format_answer(
-    crews.run(messages, _swarm_dispatch, crew_name)))
 import vision_status
+import swarm_windows
+
+# Both tool families are wired here, and for the same reason: every name below
+# is resolved at CALL time, not at import time, so they can live far lower in
+# this file.
+hub_mcp.init(
+    lambda messages, crew_name: crews.format_answer(
+        crews.run(messages, _swarm_dispatch, crew_name)),
+    swarm={
+        # The MCP surface is how a CLI drives the orchestrator -- opencode,
+        # codex, claude and the rest all speak it, so one wiring reaches every
+        # one of them rather than needing a per-CLI integration.
+        "start": lambda goal, project_dir, cli: swarm_windows.start(
+            goal, project_dir, cli,
+            _swarm_windows_spawn, _swarm_windows_turn,
+            planner=_swarm_windows_planner),
+        "status": lambda run_id, events=False: swarm_windows.status(run_id, events),
+        "stop": swarm_windows.stop,
+    })
 
 import logging
 import traceback as _traceback
@@ -9781,6 +9798,78 @@ def api_version():
 
 _RELEASE_NOTES_CACHE = {"at": 0.0, "rows": None}
 _RELEASE_NOTES_TTL = 900          # 15 min; the hub pulls every 5 hours
+
+
+def _swarm_windows_planner(system, goal):
+    """Plan a swarm through the hub's OWN routing, so the plan is written by
+    whichever model the router currently thinks is strongest -- and so quota,
+    fallback and the activity trail behave exactly as they do for anything
+    else."""
+    text, _model = _swarm_dispatch(
+        [{"role": "system", "content": system}, {"role": "user", "content": goal}],
+        1500)
+    return text or ""
+
+
+def _swarm_windows_spawn(cli_id, project_dir):
+    return agentic_chat.start_session(cli_id, project_dir)
+
+
+def _swarm_windows_turn(session_id, text):
+    """One worker's turn. `send_message_stream_durable` runs the real turn on
+    its own thread and survives its reader going away -- which is exactly what
+    a background worker needs, and why nothing here has to re-implement it."""
+    return agentic_chat.send_message_stream_durable(session_id, text)
+
+
+@app.route("/api/swarm-windows", methods=["GET"])
+def api_swarm_windows_list():
+    return jsonify({"runs": swarm_windows.list_runs(),
+                    "max_concurrent": swarm_windows.MAX_CONCURRENT,
+                    "max_agents": swarm_windows.MAX_AGENTS})
+
+
+@app.route("/api/swarm-windows", methods=["POST"])
+def api_swarm_windows_start():
+    """Start a multi-agent run: N real CLI sessions, in the background, phased.
+
+    The project directory is required and must already exist -- these workers
+    write files, and inventing a folder for them is not this endpoint's call."""
+    body = request.get_json(force=True, silent=True) or {}
+    goal = str(body.get("goal") or "").strip()
+    project_dir = str(body.get("project_dir") or "").strip()
+    cli_id = str(body.get("cli") or "opencode").strip()
+    if not goal:
+        return _openai_error("goal is required", 400)
+    if not project_dir or not os.path.isdir(project_dir):
+        return _openai_error("project_dir must be an existing folder", 400)
+    try:
+        run_id = swarm_windows.start(
+            goal, project_dir, cli_id,
+            _swarm_windows_spawn, _swarm_windows_turn,
+            phases=body.get("phases") or None,
+            planner=_swarm_windows_planner)
+    except swarm_windows.SwarmWindowsError as exc:
+        return _openai_error(str(exc), 400)
+    except Exception as exc:                                     # noqa: BLE001
+        return _openai_error("could not start: " + _sanitize(str(exc)), 500)
+    return jsonify(swarm_windows.status(run_id) or {"run_id": run_id})
+
+
+@app.route("/api/swarm-windows/<run_id>", methods=["GET"])
+def api_swarm_windows_status(run_id):
+    with_events = request.args.get("events") in ("1", "true", "yes")
+    st = swarm_windows.status(run_id, with_events=with_events)
+    if st is None:
+        return _openai_error("unknown run", 404)
+    return jsonify(st)
+
+
+@app.route("/api/swarm-windows/<run_id>", methods=["DELETE"])
+def api_swarm_windows_stop(run_id):
+    if not swarm_windows.stop(run_id):
+        return _openai_error("unknown run", 404)
+    return jsonify(swarm_windows.status(run_id) or {})
 
 
 @app.route("/api/release-notes", methods=["GET"])

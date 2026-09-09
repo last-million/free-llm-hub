@@ -69,11 +69,19 @@ def test_bad_payloads_are_jsonrpc_errors_never_raises():
 
 
 def test_tools_list_exposes_the_three_crew_tools():
+    """A SUPERSET check, not an equality one: there is a second tool family now
+    (swarm_windows_*), advertised only when app.py has wired the orchestrator.
+    Pinning the exact set made adding any second capability a failure here,
+    which says nothing about whether the crew tools still work."""
     out, _ = hub_mcp.handle_rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
     tools = {t["name"]: t for t in out["result"]["tools"]}
-    assert set(tools) == {"crew_run", "crew_start", "crew_result"}
+    assert {"crew_run", "crew_start", "crew_result"} <= set(tools)
     # the sync tool must warn about its runtime — agents route around it
     assert "minute" in tools["crew_run"]["description"].lower()
+    # ...and nothing unexpected has crept in.
+    assert set(tools) <= {"crew_run", "crew_start", "crew_result",
+                          "swarm_windows_start", "swarm_windows_status",
+                          "swarm_windows_stop"}
 
 
 def test_crew_run_sync(fake_runner):
