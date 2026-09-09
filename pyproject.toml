@@ -11,7 +11,7 @@
 name = "calvoun-free-llm-hub"
 version = "0.5.7"
 description = "Local gateway that serves free LLM providers to any tool, over four wire protocols."
-requires-python = ">=3.10"
+requires-python = ">=3.9"   # what run.sh itself tells the user to install
 license = { text = "PolyForm Noncommercial 1.0.0" }
 
 [tool.pytest.ini_options]
