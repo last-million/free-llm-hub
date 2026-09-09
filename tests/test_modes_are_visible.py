@@ -105,8 +105,12 @@ def test_the_seed_is_derived_not_hand_written():
     must come from the same table the router filters on, so the two cannot
     drift."""
     src = open("agentic_chat.py", encoding="utf-8").read()
-    i = src.index("def _opencode_hub_models(")
-    assert "model_categories.labels()" in src[i:i + 1200]
+    # The WHOLE function, not a fixed number of characters: a window measured in
+    # bytes fails the moment someone writes a longer docstring, which says
+    # nothing about whether the list is still derived.
+    body = src.split("def _opencode_hub_models(", 1)[1]
+    body = body[:body.index("\ndef ")]
+    assert "model_categories.labels()" in body
 
 
 def test_both_opencode_writers_share_one_list():

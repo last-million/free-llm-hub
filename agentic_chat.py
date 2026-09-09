@@ -101,6 +101,7 @@ shutil, signal, subprocess, threading, time, uuid.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -907,8 +908,28 @@ _OPENCODE_EFFORT = {
 }
 
 
+# How much output to reserve out of the window above. opencode computes its
+# compaction threshold as `context - output`, so this is the headroom a reply is
+# allowed before history has to be summarised. Small enough that a session uses
+# most of its window, large enough that a long answer is not cut in half.
+_HUB_MAX_OUTPUT = 16384
+
+
 def _opencode_hub_models():
-    """{id: {"name": label}} for a CLI picker: the effort tiers, then the modes.
+    """{id: {...}} for a CLI picker: the effort tiers, then the modes.
+
+    EVERY ENTRY MUST DECLARE `limit`. It is optional in opencode's schema and
+    the hub used to omit it, which reads back as limit.context == 0 -- and the
+    auto-compaction check is, verbatim from the shipped binary:
+
+        if(e.model.limit.context===0) return !1;
+
+    i.e. a model with no declared window never compacts. History then grows
+    until the turn stops working and the only way out is to quit the session
+    and open a new one. REPORTED exactly that way ("the session gets full and I
+    should go out from conversation and reopen it again"). The hub itself
+    answers an 858K-token session fine -- this was never the gateway refusing,
+    it was the CLI never being told when to summarise.
 
     Modes come from model_categories, the same table the router filters on, so
     a category added there appears in the picker on the next start instead of
@@ -918,9 +939,24 @@ def _opencode_hub_models():
 
     An effort id always wins: "swarm" is both a category name and the swarm
     PIPELINE's id, and the pipeline is the one a CLI has to send."""
-    out = {k: {"name": v} for k, v in _OPENCODE_EFFORT.items()}
+    def spec(name, attachment=False):
+        # A FRESH limit dict per entry: one shared object means a later edit to
+        # any single model silently rewrites all ten, and json.dump would not
+        # show the aliasing.
+        return {"name": name,
+                "limit": {"context": _CODEX_CONTEXT_WINDOW,
+                          "output": _HUB_MAX_OUTPUT},
+                "tool_call": True,
+                "temperature": True,
+                "attachment": attachment}
+
+    out = {k: spec(v) for k, v in _OPENCODE_EFFORT.items()}
     for key, label, _help in model_categories.labels():
-        out.setdefault(key, {"name": "mode: %s -- %s only" % (key, label.lower())})
+        # Only the vision mode routes to models that can take an image. Saying
+        # so on every mode would invite the CLI to send one into a chain that
+        # cannot serve it.
+        out.setdefault(key, spec("mode: %s -- %s only" % (key, label.lower()),
+                                 attachment=(key == "vision")))
     return out
 
 
@@ -928,8 +964,18 @@ _OPENCODE_HUB_MODELS = _opencode_hub_models()
 
 
 def _upgrade_opencode_seed(target):
-    """Add any missing hub model ids to a seed WE wrote. No-op for a config we
-    do not recognise, and no write at all when nothing is missing."""
+    """Top up a config WE wrote. No-op for one we do not recognise, and no
+    write at all when nothing is missing.
+
+    Two levels, because one of them was not enough. Adding MISSING IDS is what
+    this did first, for a seed that predated the quality modes. But every
+    install that ran before `limit` was declared has all ten ids present and
+    all ten of them limitless -- so an id-level check finds nothing to do and
+    the session-never-compacts bug survives the upgrade forever. Missing FIELDS
+    are filled in too.
+
+    Only absent fields. A label the user renamed, or a window they raised
+    because they know their own fleet, is theirs and stays."""
     try:
         with open(target, encoding="utf-8") as fh:
             cfg = json.load(fh)
@@ -939,10 +985,19 @@ def _upgrade_opencode_seed(target):
         models = prov.get("models")
         if not isinstance(models, dict):
             return
-        missing = {k: v for k, v in _OPENCODE_HUB_MODELS.items() if k not in models}
-        if not missing:
+        changed = False
+        for mid, spec in _OPENCODE_HUB_MODELS.items():
+            cur = models.get(mid)
+            if not isinstance(cur, dict):
+                models[mid] = copy.deepcopy(spec)
+                changed = True
+                continue
+            for field, value in spec.items():
+                if field not in cur:
+                    cur[field] = copy.deepcopy(value)
+                    changed = True
+        if not changed:
             return
-        models.update(missing)
         tmp = target + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(cfg, fh, indent=2)

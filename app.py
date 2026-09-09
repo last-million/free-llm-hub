@@ -742,6 +742,201 @@ def _auto_models(pid):
 _CATALOG_FETCH_WORKERS = 48
 
 
+# codex asks for a MODEL on one screen and a REASONING LEVEL on the next
+# ("Select Model and Effort" / "Select Reasoning Level for <model>"). That is
+# already the two choices this hub wants a CLI to make, so the level is read as
+# the effort tier rather than passed upstream as a reasoning knob.
+_CODEX_EFFORT_MODEL = {"minimal": "auto", "low": "auto", "medium": "auto",
+                       "high": "best",
+                       "xhigh": "swarm", "max": "swarm", "ultra": "swarm"}
+
+# The three levels the hub's catalog entries advertise, in picker order. Fewer
+# than codex's full enum on purpose: three tiers for three efforts, each
+# described as what it actually does to routing.
+_CODEX_LEVELS = [
+    {"effort": "medium",
+     "description": "Normal - orchestrated, best free model for the task"},
+    {"effort": "high",
+     "description": "Max - strongest free models only, never the cheap tier"},
+    {"effort": "xhigh",
+     "description": "Swarm - several models per turn, best answer wins"},
+]
+
+
+def _mode_and_effort(body):
+    """Split codex's (model, reasoning level) pair into (mode, effort).
+
+    Returns a body to route with; the caller's dict is never mutated, because a
+    retry pass must see the same request the first attempt did.
+
+    The mode is set on `g` rather than passed down, exactly as
+    /v1/chat/completions does it -- the chain, the swarm and the retries all
+    consult _active_mode(), so one assignment covers every path.
+
+    NOT _valid_mode() for the test. It answers 'swarm' for "swarm", which is
+    both a category name AND the fan-out pipeline's id, while _mode_keys()
+    deliberately does not offer it. Reading it as a mode here would turn every
+    swarm request into a plain one."""
+    model = (body.get("model") or "").strip().lower()
+    if model not in _mode_keys() and model != MODE_ALL:
+        return body                       # an effort id, a pin, or nothing
+    if model != MODE_ALL:
+        try:
+            g.model_mode = model
+        except Exception:                                        # noqa: BLE001
+            pass
+    reasoning = body.get("reasoning")
+    effort = ""
+    if isinstance(reasoning, dict):
+        effort = str(reasoning.get("effort") or "").strip().lower()
+    return dict(body, model=_CODEX_EFFORT_MODEL.get(effort, "auto"))
+
+
+def _codex_catalog_models(dump):
+    """Hub entries + the built-ins, from a `codex debug models --bundled` dump.
+
+    Returns None when there is nothing to clone -- fail-open: no catalog is
+    written and codex keeps behaving exactly as it does today, which is far
+    better than handing it a file it may refuse to start on.
+
+    THE TEMPLATE IS THE POINT. An entry carries 34-36 fields, a ~13KB
+    `base_instructions` among them, and the set changes between codex releases;
+    codex refuses to start when one it wants is missing. So the shape is taken
+    from the binary that is about to read it, never hand-written -- and taken
+    again on the next hub start, so a codex upgrade rewrites the catalog in the
+    new schema instead of freezing it in the old one."""
+    models = (dump or {}).get("models") if isinstance(dump, dict) else None
+    if not isinstance(models, list) or not models:
+        return None
+    visible = [m for m in models
+               if isinstance(m, dict) and m.get("visibility") == "list"]
+    pool = visible or [m for m in models if isinstance(m, dict)]
+    if not pool:
+        return None
+    template = min(pool, key=lambda m: m.get("priority", 0))
+    # Below every built-in, so the hub's own ids open the picker.
+    floor = min([m.get("priority", 0) for m in models
+                 if isinstance(m, dict)] or [0]) - 1
+    out = []
+    for offset, mid in enumerate((MODE_ALL,) + tuple(_mode_keys())):
+        entry = copy.deepcopy(template)
+        entry.update({
+            "slug": mid,
+            "display_name": _codex_catalog_label(mid),
+            "description": _virtual_model_label(mid),
+            "priority": floor - (len(_mode_keys()) - offset),
+            "visibility": "list",
+            "supported_reasoning_levels": copy.deepcopy(_CODEX_LEVELS),
+            "default_reasoning_level": _CODEX_LEVELS[0]["effort"],
+            "context_window": agentic_chat._CODEX_CONTEXT_WINDOW,
+            "max_context_window": agentic_chat._CODEX_CONTEXT_WINDOW,
+        })
+        if "auto_compact_token_limit" in entry:
+            entry["auto_compact_token_limit"] = agentic_chat._CODEX_COMPACT_LIMIT
+        out.append(entry)
+    return out + [copy.deepcopy(m) for m in models if isinstance(m, dict)]
+
+
+def _codex_catalog_label(mid):
+    """What the picker's first screen shows. A label, never the bare id."""
+    if mid == MODE_ALL:
+        return "All free models (Calvoun hub)"
+    for key, label, _help in model_categories.labels():
+        if key == mid:
+            return "%s only (Calvoun hub)" % label
+    return "%s (Calvoun hub)" % mid
+
+
+def _refresh_codex_catalog():
+    """Rewrite ~/.codex/model_catalog.json so /model offers the hub's modes.
+
+    Silent no-op when codex is not installed, when its dump cannot be read, or
+    when the file already says what we would write."""
+    try:
+        binary = _which_cli("codex")
+        if not binary:
+            return
+        proc = subprocess.run([binary, "debug", "models", "--bundled"],
+                              capture_output=True, timeout=90)
+        if proc.returncode != 0:
+            return
+        entries = _codex_catalog_models(json.loads(proc.stdout.decode("utf-8", "ignore")))
+        if not entries:
+            return
+        payload = json.dumps({"models": entries}, indent=2) + "\n"
+        path = os.path.join(_home(), ".codex", "model_catalog.json")
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as fh:
+                if fh.read() == payload:
+                    return                # nothing changed; leave the mtime alone
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        # PROVE IT BEFORE INSTALLING IT. Codex refuses to start when a catalog
+        # misses a field it wants, and that failure would take the user's whole
+        # codex down, not just this feature. `debug models` with the file forced
+        # in is the same read the real start does, so a file it accepts here is
+        # one it will accept there -- and a file it rejects is deleted, leaving
+        # codex exactly as it was.
+        if not _codex_accepts_catalog(binary, tmp):
+            os.remove(tmp)
+            _log.warning("[codex] catalog rejected by the installed binary; left alone")
+            return
+        if os.path.isfile(path):
+            _backup_once(path)
+        os.replace(tmp, path)
+        _log.info("[codex] model catalog refreshed (%d entries)", len(entries))
+    except Exception as exc:                                     # noqa: BLE001
+        _log.debug("codex catalog refresh skipped: %s", exc)
+
+
+def _codex_accepts_catalog(binary, path):
+    """Does the INSTALLED codex read this catalog without complaint?
+
+    `-c model_catalog_json=<path>` forces the file in without touching
+    config.toml, and `debug models` performs the same catalog load a real start
+    does. Both the exit code and the presence of our own slugs are checked: a
+    codex that silently fell back to its bundled catalog has not accepted the
+    file, it has ignored it."""
+    try:
+        probe = subprocess.run(
+            [binary, "debug", "models", "-c",
+             "model_catalog_json=" + json.dumps(path)],
+            capture_output=True, timeout=90)
+        if probe.returncode != 0:
+            return False
+        out = probe.stdout.decode("utf-8", "ignore")
+        return all(('"%s"' % mid) in out for mid in (MODE_ALL,) + tuple(_mode_keys()))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _repair_opencode_config():
+    """Top up the opencode config the USER actually runs against.
+
+    The isolated /agent copy has always self-healed (_upgrade_opencode_seed).
+    The config a terminal opencode reads is only ever written by Connect, so
+    every install that ran before model entries declared a `limit` keeps ten
+    limitless entries -- and a limitless entry means opencode never compacts,
+    which is the session that fills up and can only be escaped by quitting.
+    Without this, fixing the generator would fix nobody until they happened to
+    click Connect again.
+
+    Narrow on purpose: the helper only edits a provider block named
+    free-llm-hub, only fills in ABSENT fields, and writes nothing when there is
+    nothing to add. Backed up first anyway, because this is the user's file and
+    not ours."""
+    try:
+        path = _p_opencode()
+        if not os.path.isfile(path):
+            return
+        _backup_once(path)
+        agentic_chat._upgrade_opencode_seed(path)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.debug("opencode config repair skipped: %s", exc)
+
+
 def _warm_catalogs_async():
     """Fetch every provider's catalog in the background, once, at startup.
 
@@ -15438,6 +15633,163 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
 
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
+# Beyond this many bytes with no frame boundary, stop trying to frame and just
+# forward. An upstream that ignores `stream: true` and returns one JSON body has
+# no "\n\n" in it at all; buffering that to the end would turn a slow answer into
+# a silent one.
+_SSE_FRAME_CAP = 1 << 20
+
+
+def _repair_tool_call_deltas(delta, state):
+    """Make one streaming delta's tool_calls act-on-able. Returns True if it
+    changed anything -- an unchanged frame is forwarded as its original bytes.
+
+    Three repairs, each for a shape measured in the wild:
+
+    * index -- google/models/gemini-flash-latest omits it entirely. The AI SDK
+      build opencode currently binds tolerates that (`F.index ?? X.length`); the
+      sibling build in the same binary does `let s=T.index` with no fallback,
+      and the Python openai SDK accumulates by index too.
+    * id -- absent on a delta that STARTS a call is a hard throw client-side:
+      "Expected 'id' to be a string." Only synthesised where a call begins (a
+      `function.name`); continuation fragments legitimately carry neither.
+    * arguments -- must be a string. Some relays send the object.
+
+    Grouping rule, which is how a conforming stream already behaves: an `id`
+    starts a new call, a delta without one continues the current call. Getting
+    this wrong would either concatenate two commands into one or split one
+    command into two."""
+    calls = delta.get("tool_calls")
+    if not isinstance(calls, list):
+        return False
+    changed = False
+    for tc in calls:
+        if not isinstance(tc, dict):
+            continue
+        state["seen"] = True
+        tid = tc.get("id")
+        if tid:
+            if tid not in state["ids"]:
+                state["ids"][tid] = state["next"]
+                state["next"] += 1
+            state["cur"] = state["ids"][tid]
+        idx = tc.get("index")
+        if isinstance(idx, int) and not isinstance(idx, bool):
+            state["cur"] = idx
+            state["next"] = max(state["next"], idx + 1)
+        else:
+            if state["cur"] is None:
+                state["cur"] = state["next"]
+                state["next"] += 1
+            tc["index"] = state["cur"]
+            changed = True
+        fn = tc.get("function")
+        if isinstance(fn, dict):
+            args = fn.get("arguments")
+            if args is not None and not isinstance(args, str):
+                fn["arguments"] = json.dumps(args)
+                changed = True
+            if not tid and fn.get("name"):
+                tc["id"] = "call_" + uuid.uuid4().hex[:16]
+                changed = True
+    return changed
+
+
+def _repair_sse_frame(frame, state):
+    """One SSE frame in, one out. Anything unparseable comes back verbatim."""
+    stripped = frame.strip()
+    if not stripped.startswith(b"data: "):
+        return frame
+    body = stripped[6:].strip()
+    if not body.startswith(b"{"):          # [DONE], comments, event: lines
+        return frame
+    try:
+        ev = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return frame
+    if not isinstance(ev, dict):
+        return frame
+    changed = False
+    for ch in (ev.get("choices") or []):
+        if not isinstance(ch, dict):
+            continue
+        delta = ch.get("delta")
+        if isinstance(delta, dict) and _repair_tool_call_deltas(delta, state):
+            changed = True
+        # THE MEASURED BUG. gemini-flash-latest ends a turn that called a tool
+        # with finish_reason "stop", and the AI SDK's mapping is a plain switch:
+        # "stop" -> "stop" ends the turn, and the already-parsed tool call is
+        # dropped. No error, no log -- the agent just stops with a command it
+        # never ran. Only "stop" is rewritten: "length" means a TRUNCATED call
+        # and the CLI has to see that as truncation, not as something to run.
+        if state["seen"] and ch.get("finish_reason") == "stop":
+            ch["finish_reason"] = "tool_calls"
+            changed = True
+    if not changed:
+        return frame
+    return b"data: " + json.dumps(ev).encode("utf-8") + b"\n\n"
+
+
+def _sub_stream_message(data):
+    """The delta + finish_reason a `sub-*` hop's non-streaming answer becomes.
+
+    Both streaming sub branches (chat and responses) used to build this inline
+    from `msg.get("content") or ""` with a hardcoded finish_reason "stop", which
+    threw away two different things:
+
+      * a genuine tool_calls list -- a subscription CLI can absolutely emit one;
+      * and the repair made two lines earlier. _chat_json_nonanswer calls
+        tool_rescue.rescue(data, tools), which MUTATES `data` in place to
+        promote a prose-typed call into real tool_calls and sets content to
+        None, then reports "that was an answer, carry on". So on exactly the
+        turns where the rescue worked, the branch sent an EMPTY assistant
+        message and told the CLI the turn was over.
+
+    One helper for both, because they had already drifted -- the chat one
+    carried `role`, the responses one did not."""
+    choice = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
+    msg = choice.get("message") or {}
+    delta = {"role": "assistant", "content": msg.get("content") or ""}
+    fin = choice.get("finish_reason") or "stop"
+    calls = msg.get("tool_calls")
+    if calls:
+        delta["tool_calls"] = [dict(tc, index=tc.get("index", i))
+                               if isinstance(tc, dict) else tc
+                               for i, tc in enumerate(calls)]
+        if fin == "stop":
+            fin = "tool_calls"
+    return delta, fin
+
+
+def _repair_tool_sse(chunks):
+    """Wrap a relayed SSE byte stream and fix the tool-call frames in it.
+
+    Deliberately a WRAPPER around _proxy_sse rather than an edit to it:
+    _proxy_sse is a byte passthrough that also enforces the progress deadline
+    and the terminator guarantee, and a JSON parser has no business in the path
+    of every stream the hub serves. This runs only when the request carries
+    tools -- so a plain chat stream keeps the zero-copy path exactly as it was,
+    and a frame that needs no repair is re-emitted as its ORIGINAL bytes."""
+    buf = b""
+    state = {"seen": False, "next": 0, "cur": None, "ids": {}}
+    for chunk in chunks:
+        if not chunk:
+            continue
+        if not isinstance(chunk, (bytes, bytearray)):
+            chunk = str(chunk).encode("utf-8", "ignore")
+        buf += chunk
+        while True:
+            cut = buf.find(b"\n\n")
+            if cut < 0:
+                break
+            frame, buf = buf[:cut + 2], buf[cut + 2:]
+            yield _repair_sse_frame(frame, state)
+        if len(buf) > _SSE_FRAME_CAP:      # not framed SSE -- stop pretending
+            yield buf
+            buf = b""
+    if buf:
+        yield _repair_sse_frame(buf, state)
+
 
 def _classify_hop_error(exc=None, status=None, peek=None):
     """One-token class of why a chain hop failed, for the X-Free-LLM-Hub-Last-Error
@@ -16206,14 +16558,27 @@ def _swarm_stream_chunks(data):
     delta = {"role": "assistant"}
     if out_msg.get("content"):
         delta["content"] = out_msg["content"]
-    if out_msg.get("tool_calls"):
-        delta["tool_calls"] = out_msg["tool_calls"]
+    calls = out_msg.get("tool_calls")
+    if calls:
+        # The fan-out's winner is a NON-streaming message, and that shape has no
+        # `index`. Copying it into a delta verbatim shipped tool calls with the
+        # field missing -- measured through the live hub as
+        # "tool_call index is None (NoneType), must be int". One AI SDK build
+        # defaults it, its sibling in the same binary does not.
+        delta["tool_calls"] = [dict(tc, index=tc.get("index", i))
+                               if isinstance(tc, dict) else tc
+                               for i, tc in enumerate(calls)]
     base = {"id": data.get("id") or ("chatcmpl-swarm-" + uuid.uuid4().hex),
             "object": "chat.completion.chunk",
             "created": data.get("created") or int(time.time()),
             "model": data.get("model") or "swarm"}
     yield dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": None}])
     fin = (data.get("choices") or [{}])[0].get("finish_reason") or "stop"
+    # ...and a winner that called a tool must not report the turn as finished:
+    # "stop" tells the CLI to stop, and the tool call it already parsed is
+    # discarded silently. Same defect the relay repairs for upstreams.
+    if calls and fin == "stop":
+        fin = "tool_calls"
     yield dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": fin}])
 
 
@@ -17309,14 +17674,13 @@ def _chat_completions_uncached(body):
                     resp.close()
                     continue
                 _record_chat_usage(hop_pid, hop_model, data, est)
-                msg = ((data.get("choices") or [{}])[0].get("message") or {})
+                delta, fin = _sub_stream_message(data)
                 chunk = {"id": data.get("id", "chatcmpl-sub"), "object": "chat.completion.chunk",
                         "created": data.get("created", int(time.time())),
                         "model": hop_pid + "/" + hop_model,
-                        "choices": [{"index": 0,
-                                    "delta": {"role": "assistant", "content": msg.get("content") or ""},
+                        "choices": [{"index": 0, "delta": delta,
                                     "finish_reason": None}]}
-                done = dict(chunk, choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}])
+                done = dict(chunk, choices=[{"index": 0, "delta": {}, "finish_reason": fin}])
                 body_bytes = (b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n" +
                              b"data: " + json.dumps(done).encode("utf-8") + b"\n\n" +
                              b"data: [DONE]\n\n")
@@ -17345,8 +17709,12 @@ def _chat_completions_uncached(body):
                     continue
                 _note_ttft(resp, hop_pid, hop_model)
                 chained = _chain_buffered(buffered, it)
-                return Response(stream_with_context(
-                    _proxy_sse(resp, chained, hop_pid=hop_pid, hop_model=hop_model)),
+                relay = _proxy_sse(resp, chained, hop_pid=hop_pid, hop_model=hop_model)
+                # A tools turn gets its frames checked; a plain chat stream keeps
+                # the zero-copy byte passthrough exactly as it was.
+                if has_tools:
+                    relay = _repair_tool_sse(relay)
+                return Response(stream_with_context(relay),
                                 mimetype="text/event-stream",
                                 headers=dict(_SSE_HEADERS, **_routing_headers(
                                     hop_pid, hop_model, attempts, last_error)))
@@ -17879,6 +18247,12 @@ def v1_responses(_retry_pass=False):
         return _openai_error("Could not translate request: " + _sanitize(str(exc)), 400)
     if not messages:
         return _openai_error("No input to send.", 400)
+    # Codex picks a MODE on one screen and a REASONING LEVEL on the next; the
+    # pair is the hub's (mode, effort). Must happen before the swarm dispatch
+    # below, which keys off the model id. /v1/chat/completions has always read
+    # a mode id; this protocol -- the one codex actually speaks -- never did,
+    # so `model: "coding"` restricted nothing here even before the picker.
+    body = _mode_and_effort(body)
     has_images = image_count > 0
 
     # Tools + size estimate up front (Codex sends huge tool schemas — they must
@@ -18051,8 +18425,8 @@ def v1_responses(_retry_pass=False):
                     resp.close()
                     continue
                 _record_chat_usage(hop_pid, hop_model, data, est)
-                msg = ((data.get("choices") or [{}])[0].get("message") or {})
-                synth = json.dumps({"choices": [{"delta": {"content": msg.get("content") or ""}}]}).encode("utf-8")
+                delta, _fin = _sub_stream_message(data)
+                synth = json.dumps({"choices": [{"delta": delta}]}).encode("utf-8")
                 line_iter = iter([b"data: " + synth, b"data: [DONE]"])
                 return Response(stream_with_context(
                     _responses_stream(resp, model_label, line_iter=line_iter, prompt_est=est)),
@@ -20411,6 +20785,9 @@ if __name__ == "__main__":
     _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()
     _warm_catalogs_async()     # so the first CLI to ask does not pay the sweep
+    _repair_opencode_config()  # a limitless model entry is a session that never compacts
+    threading.Thread(target=_refresh_codex_catalog, daemon=True,
+                     name="codex-catalog").start()   # /model offers the hub's modes
     if not _claim_single_instance():
         _log.error("another Calvoun hub is already running against %s -- "
                    "stop it first, or set HUB_FORCE=1 to start anyway.",
