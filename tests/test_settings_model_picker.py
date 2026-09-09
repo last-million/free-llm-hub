@@ -190,9 +190,44 @@ def test_the_row_actions_report_their_state():
     assert "aria-pressed" in SRC
 
 
-def test_the_whitelist_strip_can_be_undone():
-    assert 'id="sd-wl-clear"' in SRC
-    assert "Use every model again" in SRC
+def test_the_whitelist_has_a_visible_home():
+    """REPORTED: "i dont see place for whitelist models". It existed, but the
+    only sign of it was a one-line strip that appeared once it was already in
+    force -- so "what have I whitelisted" had no answer on screen. Both lists
+    are panels now, always visible, each with a Clear."""
+    assert 'id="sd-wl-body"' in SRC and 'id="sd-bl-body"' in SRC
+    assert 'id="sd-wl-clear"' in SRC and 'id="sd-bl-clear"' in SRC
+    assert "function renderTagList(" in SRC
+
+
+def test_an_empty_list_says_what_it_would_do():
+    """An empty panel with no explanation is worse than no panel."""
+    i = SRC.index("function renderWhitelistStrip(")
+    body = SRC[i:i + 900]
+    assert "use every model" in body.lower()
+    assert "nothing is switched off" in body.lower()
+
+
+def test_the_button_says_what_it_does():
+    """"Only this" described the EFFECT of a whitelist, not the action -- and
+    the model it added had nowhere visible to land. REPORTED: "not saying only
+    this but add to whitelist"."""
+    assert "Add to whitelist" in SRC
+    assert "In whitelist" in SRC
+    assert "Only this</button>" not in SRC
+
+
+def test_an_entry_can_be_removed_from_either_list():
+    i = SRC.index("function renderTagList(")
+    body = SRC[i:i + 1800]
+    assert "removeAction" in body and "data-act" in body
+
+
+def test_both_lists_follow_the_scope():
+    """A session's lists are its own, so the panels must send session_id."""
+    i = SRC.index("function renderTagList(")
+    body = SRC[i:i + 1800]
+    assert "payload.session_id = _sdScope" in body
 
 
 def test_the_sessions_panel_exists_with_a_per_session_mode():

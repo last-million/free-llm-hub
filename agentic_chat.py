@@ -1120,7 +1120,8 @@ def _signal_tree(pid, hard):
     try:
         if os.name == "nt":
             argv = ["taskkill", "/PID", str(pid), "/T"] + (["/F"] if hard else [])
-            subprocess.run(argv, capture_output=True, timeout=10)
+            subprocess.run(argv, capture_output=True, timeout=10,
+                           creationflags=_NO_WINDOW)
         else:
             pgid = os.getpgid(pid)
             os.killpg(pgid, signal.SIGKILL if hard else signal.SIGTERM)
@@ -1350,11 +1351,32 @@ def resume_session(cli_id, project_dir, native_session_id, session_id=None) -> s
                 if live_proc is not None and live_proc.poll() is None:
                     return existing.id
     sid = start_session(cli_id, project_dir)      # all the same validation
+    # WHAT THE CONVERSATION WAS RUNNING AS. start_session builds a default
+    # session (normal / no mode), so resuming used to hand back a conversation
+    # that had lost its own configuration: pick Swarm and the uncensored models
+    # today, come back after the 5-hourly auto-update restart, and the same
+    # thread quietly continued on Normal with every model. The project folder
+    # was already remembered; this is the rest of "continue where I left off".
+    #
+    # Read OUTSIDE the registry lock: it touches the history file, and
+    # _REGISTRY_LOCK is held on the hot path of every turn.
+    restored = {}
+    if session_id:
+        try:
+            restored = agentic_history.get_conversation(str(session_id)) or {}
+        except Exception:                                        # noqa: BLE001
+            restored = {}
     with _REGISTRY_LOCK:
         sess = _REGISTRY.pop(sid)
         if session_id and _SAFE_SESSION_ID_RE.match(str(session_id)):
             sess.id = str(session_id)
         sess.native_session_id = native_session_id or None
+        quality = restored.get("quality")
+        if quality in ("normal", "max", "swarm"):
+            sess.quality = quality
+        mode = restored.get("mode")
+        if mode:
+            sess.mode = mode
         _REGISTRY[sess.id] = sess
         return sess.id
 
@@ -1991,6 +2013,7 @@ def _verify_claude_binary_identity(bin_path):
         proc = subprocess.run(
             _launcher(bin_path) + ["--version"], capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=_VERSION_CHECK_TIMEOUT,
+            creationflags=_NO_WINDOW,
             # "claude" by name, not sess.cli_id: this check exists only for
             # claude and runs before any session object is in scope. It also
             # WANTS the isolated config -- the point is to identify the exact
@@ -2663,11 +2686,25 @@ def send_message_stream_durable(session_id, text):
         yield ev
 
 
+# Windows opens a console window for every child process unless told not to.
+# The hub spawns a lot of them -- a CLI per agent turn, a dev server per
+# preview, git, pip, taskkill -- and each one flashed a black cmd window over
+# whatever the user was doing. REPORTED as "le hub open each time a window
+# terminal CMD ... ca derange bcp".
+#
+# CREATE_NO_WINDOW is safe to OR into CREATE_NEW_PROCESS_GROUP (they control
+# different things) but is MUTUALLY EXCLUSIVE with CREATE_NEW_CONSOLE, which is
+# why the one deliberately visible window -- the interactive CLI login -- does
+# not get it.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _tree_popen_kwargs():
     """Extra Popen kwargs so a subsequent stop_session() can kill the WHOLE
-    process tree (see _signal_tree) instead of only the immediate child."""
+    process tree (see _signal_tree) instead of only the immediate child -- and
+    so it does that without a console window (see _NO_WINDOW)."""
     if os.name == "nt":
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | _NO_WINDOW}
     return {"preexec_fn": os.setsid}
 
 
@@ -2701,7 +2738,11 @@ def set_session_mode(session_id, mode):
         if sess is None:
             return False
         sess.mode = mode or None
-        return True
+    # Persisted for the same reason quality is: a live session does not survive
+    # the 5-hourly auto-update restart, and "this conversation uses the coding
+    # models" has to still be true tomorrow.
+    agentic_history.set_mode(session_id, mode)
+    return True
 
 
 def get_session(session_id):
@@ -2746,7 +2787,9 @@ def set_quality(session_id, quality):
         if sess is None:
             return None
         sess.quality = quality
-        return quality
+    # Outside the registry lock: this touches the history file.
+    agentic_history.set_quality(session_id, quality)
+    return quality
 
 
 def list_sessions():

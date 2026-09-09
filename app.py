@@ -98,6 +98,19 @@ import traceback as _traceback
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _log = logging.getLogger("free-llm-hub")
 
+# Windows opens a console window for every child process unless told not to,
+# and the hub spawns a lot of them -- a CLI per agent turn, a dev server per
+# preview, git, pip, npm, taskkill, codex. Each one flashed a black cmd window
+# over whatever the user was doing. REPORTED as "le hub open each time a window
+# terminal CMD ... ca derange bcp".
+#
+# Defined HERE, above every use, rather than beside the one feature that
+# happened to need it first. Safe to OR into CREATE_NEW_PROCESS_GROUP (they
+# control different things); mutually exclusive with CREATE_NEW_CONSOLE, which
+# is why the one deliberately visible window -- the interactive CLI login in
+# agentic_chat.launch_isolated_login -- does not get it.
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # Windows' registry has no .webp entry, so Flask served the logo/favicon as
 # application/octet-stream -- and because we also send X-Content-Type-Options:
 # nosniff (see _security_headers), the browser REFUSES to render an image with
@@ -857,7 +870,8 @@ def _refresh_codex_catalog():
         if not binary:
             return
         proc = subprocess.run([binary, "debug", "models", "--bundled"],
-                              capture_output=True, timeout=90)
+                              capture_output=True, timeout=90,
+                              creationflags=_CREATE_NO_WINDOW)
         if proc.returncode != 0:
             return
         entries = _codex_catalog_models(json.loads(proc.stdout.decode("utf-8", "ignore")))
@@ -903,7 +917,7 @@ def _codex_accepts_catalog(binary, path):
         probe = subprocess.run(
             [binary, "debug", "models", "-c",
              "model_catalog_json=" + json.dumps(path)],
-            capture_output=True, timeout=90)
+            capture_output=True, timeout=90, creationflags=_CREATE_NO_WINDOW)
         if probe.returncode != 0:
             return False
         out = probe.stdout.decode("utf-8", "ignore")
@@ -4142,7 +4156,8 @@ def _sub_run(pid, prompt, model=None):
             proc = subprocess.run(argv, input=prompt, capture_output=True, text=True,
                                   encoding="utf-8", errors="replace",
                                   timeout=_SUB_TIMEOUT, env=_sub_env(pid, model),
-                                  cwd=tempfile.gettempdir())
+                                  cwd=tempfile.gettempdir(),
+                                  creationflags=_CREATE_NO_WINDOW)
         except subprocess.TimeoutExpired:
             return 504, "", "%s timed out after %ds." % (bin_name, _SUB_TIMEOUT)
         except (OSError, ValueError) as exc:
@@ -10011,8 +10026,6 @@ def api_runtime_stop():
 # Hub lifecycle extras: stopped-state query + desktop relaunch shortcut
 # ---------------------------------------------------------------------------
 
-_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
 
 @app.route("/api/hub/stopped", methods=["GET"])
 def api_hub_stopped():
@@ -10467,7 +10480,8 @@ def _ensure_hyperframes_skill(cli_id):
                                  "--full-depth", "-s", "hyperframes-animation", "-y", "-g"]
     try:
         subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", env=env, timeout=_HYPERFRAMES_INSTALL_TIMEOUT)
+                       errors="replace", env=env, timeout=_HYPERFRAMES_INSTALL_TIMEOUT,
+                       creationflags=_CREATE_NO_WINDOW)
     except Exception:                                            # noqa: BLE001
         return
     if cli_id == "codex":
@@ -10505,7 +10519,8 @@ def _install_global_cli(cli_id, npm=None):
     argv = _sub_launcher(npm) + ["install", "-g", pkg]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True,
-                              timeout=_ISOLATED_INSTALL_TIMEOUT)
+                              timeout=_ISOLATED_INSTALL_TIMEOUT,
+                              creationflags=_CREATE_NO_WINDOW)
     except subprocess.TimeoutExpired:
         return False, {"ok": False, "error": "npm install timed out after %ds."
                                              % _ISOLATED_INSTALL_TIMEOUT}
@@ -10633,7 +10648,8 @@ def _install_isolated_cli(cli_id, bin_name):
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
                               errors="replace", timeout=_ISOLATED_INSTALL_TIMEOUT,
-                              cwd=tempfile.gettempdir())
+                              cwd=tempfile.gettempdir(),
+                              creationflags=_CREATE_NO_WINDOW)
     except subprocess.TimeoutExpired:
         return False, {"ok": False, "error": "npm install timed out after %ds."
                                              % _ISOLATED_INSTALL_TIMEOUT, "_status": 504}
@@ -20644,7 +20660,8 @@ def _git(*args, timeout=120):
     """Run a git command in the repo dir; return (rc, stdout, stderr). Never raises."""
     try:
         r = subprocess.run(["git", "-C", _REPO_DIR, *args],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout,
+                           creationflags=_CREATE_NO_WINDOW)
         return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
     except Exception as exc:
         return 1, "", "%s: %s" % (exc.__class__.__name__, exc)
@@ -20999,7 +21016,8 @@ def _sync_deps_after_pull():
             return True
         _log.info("Auto-update: requirements.txt changed, installing before restarting.")
         r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", req_path],
-                           capture_output=True, text=True, timeout=300)
+                           capture_output=True, text=True, timeout=300,
+                           creationflags=_CREATE_NO_WINDOW)
         if r.returncode != 0:
             _log.error("Auto-update: pip install failed, deferring restart: %s",
                       _sanitize((r.stderr or "")[:300]))

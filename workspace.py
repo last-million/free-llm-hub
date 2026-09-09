@@ -45,6 +45,19 @@ import time
 # that hardcodes 3000/5173 does not collide with one we assigned.
 _log = logging.getLogger("free-llm-hub")   # same logger as app.py / agentic_chat
 
+# Windows opens a console window for every child process unless told not to.
+# The hub spawns a lot of them -- a CLI per agent turn, a dev server per
+# preview, git, pip, taskkill -- and each one flashed a black cmd window over
+# whatever the user was doing. REPORTED as "le hub open each time a window
+# terminal CMD ... ca derange bcp".
+#
+# CREATE_NO_WINDOW is safe to OR into CREATE_NEW_PROCESS_GROUP (they control
+# different things) but is MUTUALLY EXCLUSIVE with CREATE_NEW_CONSOLE, which is
+# why the one deliberately visible window -- the interactive CLI login -- does
+# not get it.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 PORT_RANGE = (5800, 5899)
 START_TIMEOUT = 90.0        # seconds to wait for the port to answer
 LOG_LINES = 400             # per project ring buffer
@@ -311,7 +324,8 @@ def _run_blocking(argv, cwd, log):
     try:
         p = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True,
-                             encoding="utf-8", errors="replace")
+                             encoding="utf-8", errors="replace",
+                             creationflags=_NO_WINDOW)
     except (OSError, ValueError) as exc:
         log("[hub] could not run %s: %s" % (argv[0], exc))
         return
@@ -575,7 +589,7 @@ def start(project_dir, on_done=None):
                         # Own group so stop() takes the whole tree: npm spawns
                         # the real server as a CHILD, and killing npm alone
                         # orphans it holding the port.
-                        creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP
+                        creationflags=((subprocess.CREATE_NEW_PROCESS_GROUP | _NO_WINDOW)
                                        if os.name == "nt" else 0),
                         start_new_session=(os.name != "nt"))
             except (OSError, ValueError) as exc:
@@ -667,7 +681,8 @@ def stop(project_dir):
             # taskkill /T is what actually takes npm's grandchildren on Windows;
             # terminate() alone leaves the real server holding the port.
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.popen.pid)],
-                           capture_output=True, timeout=15)
+                           capture_output=True, timeout=15,
+                           creationflags=_NO_WINDOW)
         else:
             os.killpg(os.getpgid(proc.popen.pid), 15)
     except Exception:                                            # noqa: BLE001

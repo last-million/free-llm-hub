@@ -173,6 +173,7 @@ def _metadata_row(conv):
         # Continue can put the session back the way you left it instead of
         # silently dropping to Normal.
         "quality": conv.get("quality") or "normal",
+        "mode": conv.get("mode"),
         "started_at": conv.get("started_at"),
         "last_active_at": conv.get("last_active_at"),
         "turn_count": len(conv.get("turns") or []),
@@ -246,6 +247,7 @@ def record_turn(session_id, cli_id, project_dir, role, text, native_session_id=N
                     # Explicit rather than inferred-when-absent, so a reader of
                     # the file can see which mode a conversation ran in.
                     "quality": "normal",
+                    "mode": None,
                 }
             if cli_id:
                 conv["cli_id"] = cli_id
@@ -358,6 +360,36 @@ def set_quality(session_id, quality):
             _save_conversation(conv)
             _upsert_index_row(conv)
             return quality
+    except Exception:
+        return None
+
+
+def set_mode(session_id, mode):
+    """Remember the model MODE a conversation is running in.
+
+    Same reasoning as set_quality directly above, and the same gap it was
+    written to close: the live session holds this (agentic_chat._Session.mode)
+    and a live session does not survive the 5-hourly auto-update restart. The
+    two settings are the pair that makes a conversation "this project, these
+    models" -- persisting one and not the other meant coming back tomorrow
+    restored the effort and silently lost the category.
+
+    A blank mode is stored as None, i.e. "no restriction", rather than skipped,
+    so clearing a mode is remembered as clearly as setting one."""
+    if not session_id:
+        return None
+    mode = (mode or "").strip() or None
+    try:
+        with _LOCK:
+            conv = _load_conversation(session_id)
+            if conv is None:
+                return None
+            if conv.get("mode") == mode:
+                return mode             # no write: this runs on every turn
+            conv["mode"] = mode
+            _save_conversation(conv)
+            _upsert_index_row(conv)
+            return mode
     except Exception:
         return None
 

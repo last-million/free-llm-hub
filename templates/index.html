@@ -1439,11 +1439,26 @@
   /* Whitelist strip. Only shown when a whitelist is actually in force -- an
      always-present "0 models allowed" line would be noise on every install
      that never touches this. */
-  .sd-wl{display:flex;align-items:center;gap:8px;margin-top:10px;padding:7px 10px;
-    border:1px solid var(--warn-border,var(--border));background:var(--warn-soft);
-    border-radius:8px;font-size:12px}
-  .sd-wl-dot{width:7px;height:7px;border-radius:50%;background:var(--warn-text,var(--accent));flex:none}
-  .sd-wl-txt{flex:1;min-width:0;color:var(--warn-text,inherit)}
+  /* The whitelist had nowhere to live: it existed, but the only sign of it was
+     a one-line strip that appeared once it was already in force, so "what have
+     I whitelisted" had no answer on screen. Both lists are visible now, always,
+     with an empty state that says what they do. */
+  .sd-lists{display:grid;gap:8px;margin-top:10px;grid-template-columns:1fr}
+  @media (min-width:760px){ .sd-lists{grid-template-columns:1fr 1fr} }
+  .sd-list{border:1px solid var(--border);border-radius:10px;padding:8px 10px}
+  .sd-list.on{border-color:var(--accent)}
+  .sd-list-h{display:flex;align-items:center;gap:8px;font-size:12px}
+  .sd-list-h b{flex:none}
+  .sd-list-n{flex:1;opacity:.6;font-size:11px;font-variant-numeric:tabular-nums}
+  .sd-list-body{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
+  .sd-list-empty{font-size:11.5px;color:var(--text-faint);line-height:1.45}
+  .sd-tag{display:inline-flex;align-items:center;gap:5px;padding:2px 6px 2px 9px;
+    border-radius:999px;border:1px solid var(--border);font-size:11px;
+    font-family:var(--mono)}
+  .sd-tag button{border:0;background:transparent;color:inherit;cursor:pointer;
+    font-size:13px;line-height:1;padding:0 2px;opacity:.6}
+  .sd-tag button:hover{opacity:1;color:var(--danger)}
+  .sd-tag button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 
   /* One row per MODEL. Three states, and the row says which it is in text as
      well as in colour -- colour alone is not a state. */
@@ -3212,10 +3227,23 @@
 
       <div class="sd-cats" id="sd-cats" role="group" aria-label="Restrict routing to a category"></div>
 
-      <div class="sd-wl" id="sd-wl" hidden>
-        <span class="sd-wl-dot" aria-hidden="true"></span>
-        <span class="sd-wl-txt" id="sd-wl-txt"></span>
-        <button class="btn sm ghost" id="sd-wl-clear" type="button">Use every model again</button>
+      <div class="sd-lists">
+        <div class="sd-list" id="sd-wl">
+          <div class="sd-list-h">
+            <b>Whitelist</b>
+            <span class="sd-list-n" id="sd-wl-n"></span>
+            <button class="btn sm ghost" id="sd-wl-clear" type="button">Clear</button>
+          </div>
+          <div class="sd-list-body" id="sd-wl-body"></div>
+        </div>
+        <div class="sd-list" id="sd-bl">
+          <div class="sd-list-h">
+            <b>Blocked</b>
+            <span class="sd-list-n" id="sd-bl-n"></span>
+            <button class="btn sm ghost" id="sd-bl-clear" type="button">Clear</button>
+          </div>
+          <div class="sd-list-body" id="sd-bl-body"></div>
+        </div>
       </div>
 
       <label class="sd-label" for="sd-models-filter">Find a model</label>
@@ -10044,6 +10072,7 @@
     var _sdModels = [];        /* one entry per MODEL identity */
     var _sdWorking = 0;        /* how many are answering right now */
     var _sdWhitelist = [];     /* identities the user restricted routing to */
+    var _sdBlocked = [];       /* identities switched off */
     var _sdModeList = [];      /* [{key,label}] for the per-row category chips */
     var _sdScope = '';         /* '' = global default, else a session id */
 
@@ -10160,7 +10189,8 @@
                    '<button class="sd-pill" type="button" data-act="allow"' +
                      ' data-ident="' + esc(m.identity) + '"' +
                      ' aria-pressed="' + (m.allowed ? 'true' : 'false') + '"' +
-                     ' title="Use only the models marked this way">Only this</button>' +
+                     ' title="Add this model to the whitelist. While the whitelist has anything on it, the hub uses nothing else.">' +
+                     (m.allowed ? 'In whitelist' : 'Add to whitelist') + '</button>' +
                    '<button class="sd-pill danger" type="button" data-act="block"' +
                      ' data-ident="' + esc(m.identity) + '"' +
                      ' aria-pressed="' + (m.blocked ? 'true' : 'false') + '"' +
@@ -10209,84 +10239,46 @@
     }
 
     function renderWhitelistStrip(){
-      var strip = $('#sd-wl'), txt = $('#sd-wl-txt');
-      if (!strip) return;
-      strip.hidden = !_sdWhitelist.length;
-      if (txt){
-        txt.textContent = (_sdScope ? 'This conversation is using only ' : 'Whitelist on — the hub is using only ') +
-          _sdWhitelist.length + ' model' + (_sdWhitelist.length === 1 ? '' : 's') +
-          ': ' + _sdWhitelist.join(', ');
-      }
+      renderTagList('wl', _sdWhitelist,
+        'Empty \u2014 the hub can use every model. Add one and it will use nothing else.',
+        'disallow');
+      renderTagList('bl', _sdBlocked,
+        'Empty \u2014 nothing is switched off.', 'unblock');
     }
 
-    /* The old "Blocked models" panel lived here. It was a second list with a
-       second mental model -- a blind substring box that blocked a FAMILY,
-       because the per-model table below it was provider-qualified and made
-       switching one model off a hunt through four separate rows. Grouping the
-       table by identity removed the reason for both: one row IS the model
-       everywhere, so Block on that row does what the pattern box approximated,
-       and shows you exactly which models it covers first. */
-
-    /* One-click "use only the models good at X".
-     The category table is server-side (model_categories.py) so these buttons
-     and the router cannot disagree about what a category means. Picking one
-     writes the per-model allowlist, which routing already honours at a single
-     seam -- so it applies to orchestration, the fallback chain and the swarm at
-     once. Ranking still decides WHICH of the enabled models answers, so "always
-     the best, else the next best" needs nothing extra. */
-  var _sdCats = [];
-
-  /* THE ACTIVE MODE IS REMEMBERED, NOT INFERRED.
-     This used to decide which button was lit by comparing counts -- "every
-     model in this category is enabled and nothing outside it is". That only
-     holds while the category is the ONLY thing touching the model list, and it
-     stops being true the moment anything is switched off by hand. With 300
-     models blocked on this install no button could ever light up, so the
-     dashboard showed no mode at all while one was plainly in force.
-     The server stores the choice now (see /api/model-mode) and this reads it. */
-  var _sdMode = 'all';
-
-  function renderSdCats(){
-    var host = $('#sd-cats');
-    if (!host) return;
-    host.innerHTML =
-      '<button class="sd-cat' + (_sdMode === 'all' ? ' on' : '') +
-        '" type="button" data-key="all" title="No restriction: every model the hub can reach.">' +
-        'All models</button>' +
-      _sdCats.map(function(c){
-        return '<button class="sd-cat' + (_sdMode === c.key ? ' on' : '') +
-               '" type="button" data-key="' +
-               esc(c.key) + '" title="' + esc(c.help || '') + '"' +
-               (c.count ? '' : ' disabled') + '>' + esc(c.label) +
-               '<span class="n">' + c.count + '</span></button>';
+    /* One renderer for both lists: they differ only in which action removes an
+       entry, and in what an empty one means. */
+    function renderTagList(which, items, emptyText, removeAction){
+      var box = $('#sd-' + which), body = $('#sd-' + which + '-body'),
+          n = $('#sd-' + which + '-n'), clear = $('#sd-' + which + '-clear');
+      if (!box || !body) return;
+      items = items || [];
+      box.classList.toggle('on', !!items.length);
+      if (n) n.textContent = items.length
+        ? (items.length + (_sdScope ? ' in this conversation' : ' global'))
+        : '';
+      if (clear) clear.disabled = !items.length;
+      if (!items.length){
+        body.innerHTML = '<span class="sd-list-empty">' + esc(emptyText) + '</span>';
+        return;
+      }
+      body.innerHTML = items.map(function(id){
+        return '<span class="sd-tag">' + esc(id) +
+               '<button type="button" data-id="' + esc(id) + '" data-act="' + removeAction +
+               '" aria-label="Remove ' + esc(id) + '">&times;</button></span>';
       }).join('');
-    var btns = host.querySelectorAll('.sd-cat');
-    for (var i = 0; i < btns.length; i++){
-      btns[i].addEventListener('click', function(){
-        if (this.disabled) return;
-        var key = this.getAttribute('data-key');
-        var all = host.querySelectorAll('.sd-cat');
-        for (var j = 0; j < all.length; j++) all[j].disabled = true;
-        /* Sets the MODE. It no longer rewrites the blocked list, which is why
-           choosing a mode can no longer wipe a hand-made blacklist -- and why
-           "All models" means "no mode filter", not "unblock everything". */
-        api('/api/model-mode', { method: 'POST', body: { mode: key } })
-          .then(function(r){
-            _sdMode = (r && r.mode) || 'all';
-            var hit = ((r && r.modes) || []).filter(function(m){ return m.key === key; })[0];
-            renderSdCats(); renderSdModels();
-            toast(key === 'all'
-                    ? 'Mode: all models'
-                    : 'Mode: ' + key + (hit ? ' (' + hit.count + ' models)' : ''));
-          })
-          .catch(function(e){ toast('Categories: ' + e.message, true); })
-          .then(function(){
-            var all2 = host.querySelectorAll('.sd-cat');
-            for (var k = 0; k < all2.length; k++) all2[k].disabled = false;
-          });
+      body.querySelectorAll('button[data-id]').forEach(function(btn){
+        btn.addEventListener('click', function(){
+          btn.disabled = true;
+          var payload = { identity: btn.getAttribute('data-id'),
+                          action: btn.getAttribute('data-act') };
+          if (_sdScope) payload.session_id = _sdScope;
+          api('/api/model-identities', { method: 'POST', body: payload })
+            .then(function(){ return loadSdModels(true); })
+            .catch(function(e){ toast(e.message, true); btn.disabled = false; });
+        });
       });
     }
-  }
 
     function loadSdModels(silent){
       var q = _sdScope ? ('?session_id=' + encodeURIComponent(_sdScope)) : '';
@@ -10297,6 +10289,7 @@
           _sdModels    = (d.models || []).slice();
           _sdWorking   = d.working || 0;
           _sdWhitelist = (d.allowed || []).slice();
+          _sdBlocked   = (d.blocked || []).slice();
           _sdModeList  = (d.modes || []).slice();
           _sdCats      = ((res[1] && res[1].categories) || []).slice();
           _sdMode      = (res[2] && res[2].mode) || 'all';
@@ -10329,11 +10322,18 @@
       var wl = $('#sd-wl-clear');
       if (wl) wl.addEventListener('click', function(){
         wl.disabled = true;
-        api('/api/model-identities/whitelist', { method: 'DELETE' })
-          .then(function(){ return loadSdModels(true); })
-          .then(function(){ toast('Whitelist cleared — every model is available again'); })
+        clearList(_sdWhitelist, 'disallow')
+          .then(function(){ toast('Whitelist cleared'); })
           .catch(function(e){ toast(e.message, true); })
           .then(function(){ wl.disabled = false; });
+      });
+      var bl = $('#sd-bl-clear');
+      if (bl) bl.addEventListener('click', function(){
+        bl.disabled = true;
+        clearList(_sdBlocked, 'unblock')
+          .then(function(){ toast('Nothing is switched off any more'); })
+          .catch(function(e){ toast(e.message, true); })
+          .then(function(){ bl.disabled = false; });
       });
       var sr = $('#sd-sessions-refresh');
       if (sr) sr.addEventListener('click', function(){ loadSdSessions(); });
@@ -10345,6 +10345,25 @@
         loadSdModels(true);
       });
       loadSdSessions();
+    }
+
+    /* The GLOBAL whitelist has a one-shot endpoint; everything else -- a
+       blocked list, or either list on a session -- is cleared entry by entry,
+       which is the same write the row buttons make. */
+    function clearList(items, action){
+      if (!_sdScope && action === 'disallow'){
+        return api('/api/model-identities/whitelist', { method: 'DELETE' })
+          .then(function(){ return loadSdModels(true); });
+      }
+      var chain = Promise.resolve();
+      (items || []).forEach(function(id){
+        chain = chain.then(function(){
+          var payload = { identity: id, action: action };
+          if (_sdScope) payload.session_id = _sdScope;
+          return api('/api/model-identities', { method: 'POST', body: payload });
+        });
+      });
+      return chain.then(function(){ return loadSdModels(true); });
     }
 
     /* RUNNING SESSIONS. Each row carries its own mode, which is what makes
