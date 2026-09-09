@@ -165,7 +165,21 @@ STREAM_SLOW_BIG_PEEK_TIMEOUT = 90   # seconds — slow model AND big request
 STREAM_BIG_REQUEST_TOKENS = 12000   # est tokens at which a request is "big"
 STREAM_IDLE_TIMEOUT = 280        # seconds
 MODELS_READ_TIMEOUT = 10      # seconds (model discovery / key tests)
-MODEL_CACHE_TTL = 60          # seconds
+# How long a provider's discovered catalog stays warm.
+#
+# WAS 60s, which is a strange price to pay for something that changes rarely:
+# each provider's /models call takes about seven seconds, seventeen of them run
+# concurrently, so a minute after every sweep the next caller paid ~7s again --
+# and that caller is usually a CLI checking whether the hub is up.
+#
+# 60s was never what makes a CONFIG change responsive. Adding, removing or
+# editing a key clears this cache explicitly (four sites, "pool changed ->
+# rediscover"), so a new provider still appears at once. The TTL only bounds
+# how long it takes to notice a provider quietly adding a model upstream --
+# which does not happen minute to minute. Ten minutes there, paired with the
+# startup warm-up, is the difference between a CLI connecting instantly and one
+# reporting that it cannot reach the hub.
+MODEL_CACHE_TTL = 600         # seconds
 
 # Default cooldown for a 429/timeout with no provider-given Retry-After. USER-
 # REPORTED live 2026-08-03: the same just-429'd g4f-gemini model kept getting
