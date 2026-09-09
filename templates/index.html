@@ -1430,6 +1430,11 @@
     border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:12px}
   .sd-models-filter:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
   .sd-count{margin:0 0 6px;min-height:1.2em;font-variant-numeric:tabular-nums}
+  .sd-scope{display:flex;flex-direction:column;gap:5px;margin-top:4px}
+  .sd-scope select{padding:6px 9px;border-radius:8px;border:1px solid var(--border);
+    background:var(--bg);color:var(--text);font-size:12px}
+  .sd-scope select:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .sd-scope.is-session select{border-color:var(--accent)}
 
   /* Whitelist strip. Only shown when a whitelist is actually in force -- an
      always-present "0 models allowed" line would be noise on every install
@@ -1514,11 +1519,51 @@
     color:var(--muted)}
   .sd-model input{flex:0 0 auto;cursor:pointer}
   .settings-drawer-body{padding:18px;display:flex;flex-direction:column;gap:20px;overflow-y:auto}
-  .sd-group{display:flex;flex-direction:column;gap:7px;padding-bottom:18px;border-bottom:1px solid var(--border-soft)}
-  .sd-group:last-child{border-bottom:0;padding-bottom:0}
+  /* CARDS, not a stack of hairlines. The settings page was one column of
+     groups separated by 1px rules, so at a glance nothing was grouped -- a
+     toggle, a table of 280 models and a backup button all carried the same
+     visual weight. Each group is a surface now, with its own padding, so the
+     eye can find the edge of a section without reading it. */
+  .sd-group{display:flex;flex-direction:column;gap:8px;
+    padding:14px 16px;border:1px solid var(--border-soft);border-radius:12px;
+    background:var(--surface)}
+  .sd-group:last-child{padding:14px 16px}
+  /* Two columns once there is room for two. The short groups (a switch and a
+     line of help) waste most of a wide screen on their own row, while the
+     model list and the session list want the full width -- so those opt back
+     out with .sd-wide. */
+  .sd-grid{display:grid;gap:12px;grid-template-columns:1fr}
+  @media (min-width:900px){
+    .sd-grid{grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}
+    .sd-grid > .sd-wide{grid-column:1 / -1}
+  }
+  @media (max-width:600px){
+    .sd-group{padding:12px}
+    .sd-ident{flex-wrap:wrap}
+    .sd-ident-acts{width:100%;justify-content:flex-end}
+    .sd-sess{flex-wrap:wrap}
+    .sd-sess select{width:100%}
+  }
   .sd-label{font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--text-dim)}
   .sd-help{font-size:12px;color:var(--text-faint);line-height:1.5}
   .sd-actions{display:flex;gap:8px;flex-wrap:wrap}
+
+  /* ---------- "what changed" ---------- */
+  .wn{display:flex;flex-direction:column;gap:12px}
+  .wn-head{display:flex;align-items:baseline;gap:8px}
+  .wn-ver{font-weight:700;font-size:14px}
+  .wn-hash{font-family:var(--mono);font-size:11.5px;opacity:.7;
+    padding:1px 6px;border-radius:5px;background:var(--bg-soft,rgba(127,127,127,.12))}
+  .wn-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
+    max-height:46vh;overflow-y:auto}
+  .wn-list li{display:flex;gap:10px;padding:8px 0;font-size:12.5px;line-height:1.45;
+    border-bottom:1px solid var(--border-soft)}
+  .wn-list li:last-child{border-bottom:0}
+  .wn-date{flex:none;width:76px;font-family:var(--mono);font-size:11px;opacity:.55;
+    font-variant-numeric:tabular-nums}
+  .wn-sub{flex:1;min-width:0}
+  .wn-empty{margin:0;font-size:12.5px;color:var(--text-faint);line-height:1.5}
+  .wn-actions{justify-content:flex-end;align-items:center}
 
   /* ---------- export/import modal contents ---------- */
   .export-opts{display:flex;flex-direction:column;gap:9px}
@@ -3108,6 +3153,7 @@
       <span class="sub">everything the hub lets you change &mdash; models, behaviour, backup</span>
     </div>
     <div class="section-body" id="sec-settings">
+    <div class="sd-grid">
 
     <div class="sd-group">
       <label class="switch" title="Switch between the dark and light dashboard theme (stored on this machine only)">
@@ -3143,7 +3189,7 @@
       </label>
       <p class="sd-help">Tells the Chat CLI agent that testing/debugging its own work with tools like Playwright is expected this session.</p>
     </div>
-    <div class="sd-group">
+    <div class="sd-group sd-wide">
       <div class="sd-models-head">
         <b>Models</b>
         <button class="btn sm ghost" id="sd-models-refresh" type="button">Refresh</button>
@@ -3152,6 +3198,17 @@
         four providers is one row, so you choose it once. Blocking or allowing here applies
         everywhere &mdash; orchestration, the fallback chain and the swarm &mdash; including
         providers that start serving it later.</p>
+
+      <div class="sd-scope">
+        <label class="sd-label" for="sd-scope">These choices apply to</label>
+        <select id="sd-scope" aria-describedby="sd-scope-help">
+          <option value="">Everything (global default)</option>
+        </select>
+        <p class="sd-help" id="sd-scope-help">Pick a running conversation to give it its
+          own models without changing the default. <b>A session appears here only once you
+          have started one</b> &mdash; open the Agent page, or run any connected CLI in a
+          project, and it will show up.</p>
+      </div>
 
       <div class="sd-cats" id="sd-cats" role="group" aria-label="Restrict routing to a category"></div>
 
@@ -3173,7 +3230,7 @@
         every provider. A model can be neither, which is the default.</p>
     </div>
 
-    <div class="sd-group">
+    <div class="sd-group sd-wide">
       <div class="sd-models-head">
         <b>Running sessions</b>
         <button class="btn sm ghost" id="sd-sessions-refresh" type="button">Refresh</button>
@@ -3214,6 +3271,8 @@
         <button class="btn sm" id="settings-update-check" type="button">Check for updates</button>
       </div>
       <p class="sd-help" id="settings-update-status">Checking current version&hellip;</p>
+    </div>
+
     </div>
     </div>
 </section>
@@ -9986,6 +10045,7 @@
     var _sdWorking = 0;        /* how many are answering right now */
     var _sdWhitelist = [];     /* identities the user restricted routing to */
     var _sdModeList = [];      /* [{key,label}] for the per-row category chips */
+    var _sdScope = '';         /* '' = global default, else a session id */
 
     /* MEASURED speed, next to the benchmark score.
        The score says how good a model is thought to be; this says how it has
@@ -10117,8 +10177,9 @@
           var action = act === 'allow' ? (on ? 'disallow' : 'allow')
                                        : (on ? 'unblock' : 'block');
           host.querySelectorAll('.sd-pill').forEach(function(b){ b.disabled = true; });
-          api('/api/model-identities', { method: 'POST',
-              body: { identity: ident, action: action } })
+          var payload = { identity: ident, action: action };
+          if (_sdScope) payload.session_id = _sdScope;
+          api('/api/model-identities', { method: 'POST', body: payload })
             .then(function(){ return loadSdModels(true); })
             .then(function(){
               toast(ident + ' — ' + (
@@ -10152,7 +10213,7 @@
       if (!strip) return;
       strip.hidden = !_sdWhitelist.length;
       if (txt){
-        txt.textContent = 'Whitelist on — the hub is using only ' +
+        txt.textContent = (_sdScope ? 'This conversation is using only ' : 'Whitelist on — the hub is using only ') +
           _sdWhitelist.length + ' model' + (_sdWhitelist.length === 1 ? '' : 's') +
           ': ' + _sdWhitelist.join(', ');
       }
@@ -10228,7 +10289,8 @@
   }
 
     function loadSdModels(silent){
-      return Promise.all([api('/api/model-identities'), api('/api/model-categories'),
+      var q = _sdScope ? ('?session_id=' + encodeURIComponent(_sdScope)) : '';
+      return Promise.all([api('/api/model-identities' + q), api('/api/model-categories'),
                           api('/api/model-mode')])
         .then(function(res){
           var d = res[0] || {};
@@ -10275,6 +10337,13 @@
       });
       var sr = $('#sd-sessions-refresh');
       if (sr) sr.addEventListener('click', function(){ loadSdSessions(); });
+      var sc = $('#sd-scope');
+      if (sc) sc.addEventListener('change', function(){
+        _sdScope = sc.value || '';
+        var wrap = sc.closest('.sd-scope');
+        if (wrap) wrap.classList.toggle('is-session', !!_sdScope);
+        loadSdModels(true);
+      });
       loadSdSessions();
     }
 
@@ -10286,6 +10355,24 @@
       if (!host) return Promise.resolve();
       return api('/api/agent/sessions').then(function(d){
         var rows = (d && d.sessions) || [];
+        var sc = $('#sd-scope');
+        if (sc){
+          var keep = _sdScope;
+          sc.innerHTML = '<option value="">Everything (global default)</option>' +
+            rows.map(function(r){
+              var nm = r.project_dir
+                ? String(r.project_dir).split(/[\/]/).pop() : (r.cli || 'session');
+              return '<option value="' + esc(r.session_id) + '">' + esc(nm) +
+                     ' · ' + esc(r.cli || '') + '</option>';
+            }).join('');
+          /* A session that ended while the panel was open must not leave the
+             editor silently writing to a conversation that no longer exists. */
+          var still = rows.some(function(r){ return r.session_id === keep; });
+          sc.value = still ? keep : '';
+          if (!still && keep){ _sdScope = ''; loadSdModels(true); }
+          var wrap = sc.closest('.sd-scope');
+          if (wrap) wrap.classList.toggle('is-session', !!_sdScope);
+        }
         if (!rows.length){
           host.innerHTML = '<div class="sd-empty">No sessions running. ' +
                            'Start one from the Agent page.</div>';
@@ -10655,64 +10742,89 @@
   }
 
   /* ---------- "what's new" after an update ----------
-     The hub auto-updates via git pull + restart, so a new running commit is
-     the signal that the user just got new code. On boot we compare
-     /api/version against localStorage 'flh.seenVersion': first-ever run (no
-     welcome modal dismissed yet) stores silently so the popup never stacks
-     with the welcome modal; a changed version shows the one-time modal and
-     stores on dismiss. */
+     Two things were wrong with this.
+
+     IT SAID THE SAME THING FOREVER. The notes were a hardcoded paragraph in
+     this template, so months after the fact it was still announcing an August
+     provider change as news. The hub updates itself by `git pull`, so the
+     commit log is the release note; /api/release-notes returns it.
+
+     IT INTERRUPTED. It fired on every version change, and the hub pulls every
+     five hours, so it reappeared on a schedule the reader never asked for --
+     reported as "ca derange". It is now rate-limited to once per four hours on
+     top of the version check, so an update that lands while you are working
+     waits until you are not mid-thought. */
+  var WHATS_NEW_MIN_GAP_MS = 4 * 60 * 60 * 1000;
+
   function checkWhatsNew(){
-    api('/api/version').then(function(r){
+    var seen = null, welcomed = null, lastAt = 0;
+    try {
+      seen     = localStorage.getItem('flh.seenVersion');
+      welcomed = localStorage.getItem('cx_welcome_seen_v1');
+      lastAt   = parseInt(localStorage.getItem('flh.whatsNewAt') || '0', 10) || 0;
+    } catch(e){}
+    /* First-ever run: record the version silently so this never stacks on top
+       of the welcome modal. */
+    if (!welcomed){
+      api('/api/version').then(function(r){
+        if (r && r.version) { try { localStorage.setItem('flh.seenVersion', r.version); } catch(e){} }
+      }).catch(function(){});
+      return;
+    }
+    if (Date.now() - lastAt < WHATS_NEW_MIN_GAP_MS) return;
+    api('/api/release-notes').then(function(r){
       var v = r && r.version;
-      if (!v || v === 'unknown') return;
-      var seen = null, welcomed = null;
-      try {
-        seen = localStorage.getItem('flh.seenVersion');
-        welcomed = localStorage.getItem('cx_welcome_seen_v1');
-      } catch(e){}
-      if (!welcomed || seen === v){
-        try { localStorage.setItem('flh.seenVersion', v); } catch(e){}
-        return;
-      }
-      showWhatsNew(v);
+      if (!v || v === 'unknown' || seen === v) return;
+      showWhatsNew(v, (r && r.notes) || [], r && r.release);
     }).catch(function(){});
   }
-  function showWhatsNew(version){
+
+  function showWhatsNew(version, notes, release){
     var body = frag();
     var box = document.createElement('div');
-    box.innerHTML =
-      '<p style="margin:0 0 10px">The hub just updated to <code>' + esc(version) + '</code>. Highlights:</p>' +
-      '<p style="margin:0 0 6px"><b>Free providers — no API key needed, they work directly:</b></p>' +
-      '<ul style="margin:0 0 10px; padding-left:20px">' +
-        '<li>pollinations, aihorde, uncloseai, llm7, kilocode</li>' +
-      '</ul>' +
-      '<p style="margin:0 0 10px"><b>g4f is now ONE card, and it needs a key.</b> ' +
-      'The three g4f cards (groq / gemini / nvidia) merged into one on the unified ' +
-      'endpoint — same account, same key, and its catalog now covers all ~550 models at once. ' +
-      'g4f.space also ended anonymous access on 2026-08-06 — keyless calls return ' +
-      '<code>402 No cake credits</code>. Grab a free key at ' +
-      '<a href="https://g4f.dev/members.html" target="_blank" rel="noopener noreferrer">g4f.dev/members.html</a> ' +
-      'and paste it on their cards (or use <b>Guided setup</b> on the Providers page).</p>' +
-      '<p style="margin:0">For more usage and quality, connect the recommended providers first ' +
-      '(<b>Puter</b> — latest GPT-5.6 + 500 models with one free token), then any others from the Providers page.</p>' +
-      /* Star ask, LAST and quiet: the update notes are what the user opened this
-         for, so this sits underneath them and never above. */
+    box.className = 'wn';
+    var head = '<div class="wn-head">' +
+                 '<span class="wn-ver">' + esc(release || 'Hub') + '</span>' +
+                 '<code class="wn-hash">' + esc(version) + '</code>' +
+               '</div>';
+    var list = notes.length
+      ? '<ul class="wn-list">' + notes.map(function(n){
+          return '<li><span class="wn-date">' + esc(n.date) + '</span>' +
+                 '<span class="wn-sub">' + esc(n.subject) + '</span></li>';
+        }).join('') + '</ul>'
+      : '<p class="wn-empty">Updated. This install has no commit log to read ' +
+        'notes from, so there is nothing more to show here.</p>';
+    /* The ask goes LAST, inside the box and under the notes: what the reader
+       opened this for is what changed, so this sits beneath it and never above.
+       It says why rather than just asking. */
+    var STAR_ASK =
       '<div class="star-ask">' +
-        '<span class="star-txt">The hub is free and updates itself every 5 hours. A star helps other people find it.</span>' +
-        '<a href="https://github.com/last-million/free-llm-hub" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.42 7.42 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>Star on GitHub</a>' +
+        '<span class="star-txt">The hub is free and updates itself every 5 hours. ' +
+        'A star helps other people find it.</span>' +
+        '<a href="https://github.com/last-million/free-llm-hub" target="_blank" rel="noopener noreferrer">' +
+        '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.42 7.42 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>' +
+        'Star on GitHub</a>' +
       '</div>';
+    box.innerHTML = head + list + STAR_ASK;
     body.appendChild(box);
+
     var actions = document.createElement('div');
-    actions.className = 'sd-actions';
+    actions.className = 'sd-actions wn-actions';
     var ok = document.createElement('button');
     ok.type = 'button'; ok.className = 'btn primary'; ok.textContent = 'Got it';
     ok.addEventListener('click', function(){
-      try { localStorage.setItem('flh.seenVersion', version); } catch(e){}
+      try {
+        localStorage.setItem('flh.seenVersion', version);
+        localStorage.setItem('flh.whatsNewAt', String(Date.now()));
+      } catch(e){}
       closeModal();
     });
     actions.appendChild(ok);
     body.appendChild(actions);
-    openModal('Hub updated — what\'s new', body);
+    /* Stamped on OPEN as well as on dismiss: a modal closed with Escape or the
+       X must still count as "shown", or it comes straight back. */
+    try { localStorage.setItem('flh.whatsNewAt', String(Date.now())); } catch(e){}
+    openModal('What changed', body);
   }
 
   /* ---------- boot ---------- */

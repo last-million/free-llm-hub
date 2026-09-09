@@ -54,7 +54,7 @@ def _post(client, path, body):
 # --------------------------------------------------------------------------- #
 
 def test_the_rows_carry_what_the_picker_needs(client, monkeypatch):
-    monkeypatch.setattr(A, "_identity_rows", lambda: [{
+    monkeypatch.setattr(A, "_identity_rows", lambda scope_sid=None: [{
         "identity": "gpt-oss-120b", "providers": ["groq", "cerebras"],
         "ids": ["groq/openai/gpt-oss-120b", "cerebras/gpt-oss-120b"],
         "count": 2, "working": 2, "score": 71.0, "tool_capable": True,
@@ -105,7 +105,7 @@ def test_a_whitelist_cannot_be_narrowed_to_nothing_working(client, monkeypatch):
     hub that answers nothing. The refusal belongs where it can be explained."""
     _post(client, "/api/model-identities", {"identity": "a", "action": "allow"})
     _post(client, "/api/model-identities", {"identity": "b", "action": "allow"})
-    monkeypatch.setattr(A, "_identity_rows", lambda: [
+    monkeypatch.setattr(A, "_identity_rows", lambda scope_sid=None: [
         {"identity": "a", "working": 1}, {"identity": "b", "working": 0}])
     r = _post(client, "/api/model-identities", {"identity": "a", "action": "disallow"})
     assert r.status_code == 400
@@ -116,7 +116,7 @@ def test_a_whitelist_cannot_be_narrowed_to_nothing_working(client, monkeypatch):
 def test_removing_the_last_entry_is_still_allowed_when_others_work(client, monkeypatch):
     _post(client, "/api/model-identities", {"identity": "a", "action": "allow"})
     _post(client, "/api/model-identities", {"identity": "b", "action": "allow"})
-    monkeypatch.setattr(A, "_identity_rows", lambda: [
+    monkeypatch.setattr(A, "_identity_rows", lambda scope_sid=None: [
         {"identity": "a", "working": 1}, {"identity": "b", "working": 1}])
     assert _post(client, "/api/model-identities",
                  {"identity": "b", "action": "disallow"}).status_code == 200
@@ -202,7 +202,9 @@ def test_the_sessions_panel_exists_with_a_per_session_mode():
 
 
 def test_the_list_is_fetched_from_the_grouped_endpoint():
-    assert "api('/api/model-identities')" in SRC
+    """The URL now carries an optional ?session_id=, so match the call rather
+    than a literal path."""
+    assert "api('/api/model-identities' + q)" in SRC
 
 
 def test_reduced_motion_is_respected():
@@ -216,3 +218,105 @@ def test_no_emoji_are_used_as_controls():
         i = SRC.index(frag)
         window = SRC[i:i + 400]
         assert not any(ord(ch) > 0x2500 for ch in window), window[:120]
+
+
+# --------------------------------------------------------------------------- #
+# Per-conversation lists
+# --------------------------------------------------------------------------- #
+
+def test_a_session_gets_its_own_lists(client):
+    """"have global config if we want but we can also customize them for each
+    working session"."""
+    _post(client, "/api/model-identities",
+          {"identity": "x-model", "action": "block", "session_id": "s1"})
+    assert A._session_model_rules("s1")["block"] == {"x-model"}
+    assert A._blocked_identities() == set(), "a session edit must not touch the global list"
+
+
+def test_a_session_blocklist_adds_to_the_global_one(client, monkeypatch):
+    """Blocking is additive: a model switched off everywhere stays off inside a
+    conversation, and the conversation can switch off more."""
+    _post(client, "/api/model-identities", {"identity": "global-off", "action": "block"})
+    _post(client, "/api/model-identities",
+          {"identity": "session-off", "action": "block", "session_id": "s1"})
+    monkeypatch.setattr(A, "_build_sid", lambda: "s1")
+    with A.app.test_request_context("/"):
+        assert A._is_model_blocked_by_user("groq", "global-off")
+        assert A._is_model_blocked_by_user("groq", "session-off")
+        assert not A._is_model_blocked_by_user("groq", "something-else")
+
+
+def test_a_session_whitelist_replaces_the_global_one(client, monkeypatch):
+    """"Only these models, in this conversation" is meaningless if the global
+    list keeps admitting others."""
+    _post(client, "/api/model-identities", {"identity": "global-only", "action": "allow"})
+    _post(client, "/api/model-identities",
+          {"identity": "session-only", "action": "allow", "session_id": "s1"})
+    monkeypatch.setattr(A, "_build_sid", lambda: "s1")
+    with A.app.test_request_context("/"):
+        assert not A._is_model_blocked_by_user("groq", "session-only")
+        assert A._is_model_blocked_by_user("groq", "global-only")
+
+
+def test_a_session_without_a_whitelist_falls_back_to_the_global_one(client, monkeypatch):
+    _post(client, "/api/model-identities", {"identity": "global-only", "action": "allow"})
+    monkeypatch.setattr(A, "_build_sid", lambda: "s-none")
+    with A.app.test_request_context("/"):
+        assert not A._is_model_blocked_by_user("groq", "global-only")
+        assert A._is_model_blocked_by_user("groq", "other")
+
+
+def test_other_sessions_are_unaffected(client, monkeypatch):
+    _post(client, "/api/model-identities",
+          {"identity": "x-model", "action": "block", "session_id": "s1"})
+    monkeypatch.setattr(A, "_build_sid", lambda: "s2")
+    with A.app.test_request_context("/"):
+        assert not A._is_model_blocked_by_user("groq", "x-model")
+
+
+def test_emptying_a_session_stops_storing_it(client):
+    """Sessions are transient; a config that grows one row per conversation
+    forever is a leak."""
+    _post(client, "/api/model-identities",
+          {"identity": "x", "action": "block", "session_id": "s1"})
+    _post(client, "/api/model-identities",
+          {"identity": "x", "action": "unblock", "session_id": "s1"})
+    assert "s1" not in (config.get_setting(A._SESSION_MODELS_SETTING, {}) or {})
+
+
+def test_the_rules_are_resolved_once_per_request(client, monkeypatch):
+    """_is_model_blocked_by_user runs for every candidate model -- 484 times in
+    a measured chain build -- so this must not re-read the setting per call."""
+    calls = {"n": 0}
+    real = A._session_model_rules
+    monkeypatch.setattr(A, "_session_model_rules",
+                        lambda sid=None: (calls.__setitem__("n", calls["n"] + 1), real(sid))[1])
+    with A.app.test_request_context("/"):
+        for _ in range(50):
+            A._is_model_blocked_by_user("groq", "anything")
+    assert calls["n"] <= 1, "resolved %d times for 50 checks" % calls["n"]
+
+
+def test_the_scoped_read_reports_the_session_lists(client):
+    _post(client, "/api/model-identities",
+          {"identity": "x-model", "action": "block", "session_id": "s1"})
+    d = client.get("/api/model-identities?session_id=s1", headers=H).get_json()
+    assert d["scope"] == "s1" and d["blocked"] == ["x-model"]
+    d = client.get("/api/model-identities", headers=H).get_json()
+    assert d["scope"] == "global" and d["blocked"] == []
+
+
+def test_the_panel_explains_that_a_session_must_exist_first():
+    """"explain for user that he should start first a session in a cli or in
+    /agent page to be able to see it"."""
+    assert 'id="sd-scope"' in SRC
+    i = SRC.index('id="sd-scope-help"')
+    help_text = SRC[i:i + 400]
+    assert "started one" in help_text or "start" in help_text.lower()
+    assert "Agent page" in help_text and "CLI" in help_text
+
+
+def test_a_session_that_ended_does_not_keep_receiving_edits():
+    """The selector is rebuilt from the live session list; a stale selection
+    must fall back to global rather than write to a conversation that is gone."""
+    assert "still ? keep : ''" in SRC

@@ -9397,7 +9397,7 @@ def api_tracking():
                     "keyed_no_free": keyed_no_free})
 
 
-def _identity_rows():
+def _identity_rows(scope_sid=None):
     """Every model the hub knows, GROUPED BY IDENTITY instead of by provider.
 
     The Settings list showed one row per (provider, model), so switching off
@@ -9408,7 +9408,11 @@ def _identity_rows():
     sameness; it only had to be offered to the user.
 
     Reuses api_tracking's own rows, so "working" here means exactly what it
-    means there rather than drifting into a second opinion."""
+    means there rather than drifting into a second opinion.
+
+    `scope_sid` reports the blocked/allowed flags for ONE session instead of
+    the global lists, so the same panel can edit either without a second
+    table."""
     data = api_tracking().get_json()
     groups = {}
     for row in data.get("models") or []:
@@ -9429,7 +9433,11 @@ def _identity_rows():
         # says nothing about it when four others still serve it.
         if row["state"] == "ok" or g["state"] == "dead":
             g["state"] = row["state"] if row["state"] == "ok" else g["state"]
-    blocked, allowed = _blocked_identities(), _allowed_identities()
+    if scope_sid:
+        rules = _session_model_rules(scope_sid)
+        blocked, allowed = rules["block"], rules["allow"]
+    else:
+        blocked, allowed = _blocked_identities(), _allowed_identities()
     out = []
     for ident, g in groups.items():
         g["state"] = "ok" if g["working"] else g["state"]
@@ -9446,15 +9454,23 @@ def _identity_rows():
 @app.route("/api/model-identities", methods=["GET"])
 def api_model_identities():
     """One row per MODEL, not per provider+model. Feeds the Settings search
-    box, the whitelist, the identity blocklist and the mode editor."""
-    rows = _identity_rows()
+    box, the whitelist, the identity blocklist and the mode editor.
+
+    ?session_id= scopes the flags to one conversation, so the same list edits
+    either the global default or a single session."""
+    sid = (request.args.get("session_id") or "").strip() or None
+    rows = _identity_rows(sid)
+    rules = _session_model_rules(sid) if sid else None
+    blocked = sorted(rules["block"]) if rules else sorted(_blocked_identities())
+    allowed = sorted(rules["allow"]) if rules else sorted(_allowed_identities())
     return jsonify({
         "models": rows,
         "total": len(rows),
         "working": sum(1 for r in rows if r["working"]),
-        "blocked": sorted(_blocked_identities()),
-        "allowed": sorted(_allowed_identities()),
-        "whitelist_active": bool(_allowed_identities()),
+        "scope": sid or "global",
+        "blocked": blocked,
+        "allowed": allowed,
+        "whitelist_active": bool(allowed),
         "modes": [{"key": k, "label": lbl} for k, lbl, _h in model_categories.labels()
                   if k in _mode_keys()],
     })
@@ -9472,10 +9488,23 @@ def api_model_identities_set():
     body = request.get_json(force=True, silent=True) or {}
     ident = str(body.get("identity") or "").strip().lower()
     action = str(body.get("action") or "").strip().lower()
+    sid = str(body.get("session_id") or "").strip() or None
     if not ident:
         return _openai_error("identity is required", 400)
     if action not in ("block", "unblock", "allow", "disallow"):
         return _openai_error("action must be block, unblock, allow or disallow", 400)
+    if sid:
+        # One conversation only. No empty-whitelist guard here: a session
+        # whitelist that empties falls back to the global list rather than to
+        # nothing, so it cannot black the hub out the way the global one can.
+        if action in ("block", "unblock"):
+            rules = _set_session_model(sid, ident, block=(action == "block"))
+        else:
+            rules = _set_session_model(sid, ident, allow=(action == "allow"))
+        return jsonify({"scope": sid,
+                        "blocked": sorted(rules["block"]),
+                        "allowed": sorted(rules["allow"]),
+                        "whitelist_active": bool(rules["allow"])})
     if action in ("block", "unblock"):
         _set_identity_blocked(ident, action == "block")
     else:
@@ -9733,6 +9762,46 @@ def api_version():
     if _ollama_enabled() and not _has_control_token():
         return jsonify({"version": wire_ollama.OLLAMA_VERSION})
     return jsonify({"version": _HUB_VERSION, "release": HUB_RELEASE})
+
+
+_RELEASE_NOTES_CACHE = {"at": 0.0, "rows": None}
+_RELEASE_NOTES_TTL = 900          # 15 min; the hub pulls every 5 hours
+
+
+@app.route("/api/release-notes", methods=["GET"])
+def api_release_notes():
+    """What actually changed, taken from the commit log.
+
+    The "what's new" popup used to carry a hardcoded paragraph, which meant it
+    described whatever was new on the day someone last edited the template --
+    it was still announcing an August provider change months later. The hub
+    updates itself by `git pull`, so the log IS the release note, and the
+    subjects in this repo are written as sentences rather than "fix stuff".
+
+    Returns [] rather than an error when this is not a git checkout (a zip
+    install), so the popup degrades to just the version instead of breaking."""
+    now = time.time()
+    if (_RELEASE_NOTES_CACHE["rows"] is not None
+            and now - _RELEASE_NOTES_CACHE["at"] < _RELEASE_NOTES_TTL):
+        rows = _RELEASE_NOTES_CACHE["rows"]
+    else:
+        rows = []
+        if _is_git_repo():
+            # %x1f/%x1e are the ASCII unit/record separators: a commit subject
+            # can contain anything a person can type, including whatever
+            # delimiter looked safe.
+            rc, out, _err = _git("log", "-12", "--no-merges",
+                                 "--pretty=format:%h%x1f%cs%x1f%s%x1e", timeout=20)
+            if rc == 0:
+                for rec in out.split("\x1e"):
+                    parts = rec.strip().split("\x1f")
+                    if len(parts) == 3 and parts[2]:
+                        rows.append({"hash": parts[0], "date": parts[1],
+                                     "subject": parts[2]})
+        _RELEASE_NOTES_CACHE["rows"] = rows
+        _RELEASE_NOTES_CACHE["at"] = now
+    return jsonify({"version": _HUB_VERSION, "release": HUB_RELEASE,
+                    "notes": rows})
 
 
 @app.route("/api/status", methods=["GET"])
@@ -10855,12 +10924,99 @@ def _allowed_identities():
     return _identity_set(_ALLOWED_IDENTITY_SETTING)
 
 
-def _is_model_blocked_by_user(pid, model):
-    """All three lists, at the one seam every filter already goes through.
+# Per-conversation overrides: {session_id: {"allow": [ident], "block": [ident]}}.
+# The global lists above are the default; a session can narrow them without
+# touching what every other session sees.
+_SESSION_MODELS_SETTING = "session_models"
 
-    Order matters: the blocklist wins. Naming a model on both lists is a
+
+def _session_model_rules(sid=None):
+    """The allow/block lists in force for ONE session, as sets.
+
+    Resolved the same way _active_mode resolves a session's mode, so a request
+    arriving under an agent session is governed by that session's choice
+    wherever it is made -- the dashboard, a CLI, or a /build sub-request."""
+    if sid is None:
+        try:
+            sid = _build_sid()
+        except Exception:                                        # noqa: BLE001
+            sid = None
+    if not sid:
+        return {"allow": set(), "block": set()}
+    try:
+        raw = config.get_setting(_SESSION_MODELS_SETTING, {}) or {}
+        row = raw.get(str(sid)) if isinstance(raw, dict) else None
+        if not isinstance(row, dict):
+            return {"allow": set(), "block": set()}
+        return {
+            "allow": {str(x).strip().lower() for x in (row.get("allow") or []) if str(x).strip()},
+            "block": {str(x).strip().lower() for x in (row.get("block") or []) if str(x).strip()},
+        }
+    except Exception:                                            # noqa: BLE001
+        return {"allow": set(), "block": set()}
+
+
+def _request_model_rules():
+    """The session rules for the request being served, computed ONCE.
+
+    _is_model_blocked_by_user runs for every candidate model in every chain
+    build -- 484 times in a measured one -- so resolving the session and
+    reading the setting per call would put that work in the hottest loop the
+    router has."""
+    try:
+        cached = getattr(g, "_model_rules", None)
+        if cached is not None:
+            return cached
+        rules = _session_model_rules()
+        g._model_rules = rules
+        return rules
+    except Exception:                                            # noqa: BLE001
+        return _session_model_rules()
+
+
+def _set_session_model(sid, identity, allow=None, block=None):
+    """Add/remove one model on one session's list. Returns the session's rules."""
+    ident = str(identity or "").strip().lower()
+    sid = str(sid or "").strip()
+    if not sid or not ident:
+        return _session_model_rules(sid)
+    try:
+        raw = config.get_setting(_SESSION_MODELS_SETTING, {}) or {}
+        raw = dict(raw) if isinstance(raw, dict) else {}
+        row = dict(raw.get(sid) or {})
+        for field, want in (("allow", allow), ("block", block)):
+            if want is None:
+                continue
+            cur = [str(x) for x in (row.get(field) or [])]
+            if want and ident not in cur:
+                cur.append(ident)
+            elif not want:
+                cur = [x for x in cur if x != ident]
+            row[field] = sorted(cur)
+        if not (row.get("allow") or row.get("block")):
+            raw.pop(sid, None)          # nothing left: stop storing the session
+        else:
+            raw[sid] = row
+        config.set_setting(_SESSION_MODELS_SETTING, raw)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return _session_model_rules(sid)
+
+
+def _is_model_blocked_by_user(pid, model):
+    """Every list, at the one seam every filter already goes through.
+
+    Order matters: blocking wins. Naming a model on both lists is a
     contradiction, and the safe reading of a contradiction is the restrictive
     one.
+
+    SESSION RULES LAYER OVER GLOBAL ONES, and the two combine differently on
+    purpose:
+      * blocklists ADD. A model the user switched off globally stays off inside
+        a session; a session can switch off more.
+      * a session whitelist REPLACES the global one. "Only these models, in
+        this conversation" is meaningless if the global list keeps admitting
+        others -- and a session that names none falls back to the global list.
 
     The whitelist is ENFORCED rather than fail-open, unlike a mode -- see
     _apply_mode, which returns `kept or cands` because a category is a
@@ -10871,9 +11027,10 @@ def _is_model_blocked_by_user(pid, model):
     if ("%s/%s" % (pid, model)) in _blocked_models():
         return True
     ident = _normalize_model_identity(model)
-    if ident in _blocked_identities():
+    rules = _request_model_rules()
+    if ident in rules["block"] or ident in _blocked_identities():
         return True
-    allowed = _allowed_identities()
+    allowed = rules["allow"] or _allowed_identities()
     return bool(allowed) and ident not in allowed
 
 

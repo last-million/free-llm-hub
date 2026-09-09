@@ -41,7 +41,11 @@ def test_the_whats_new_dialog_ends_with_the_star_ask():
     body_append = block.find('body.appendChild(box)')
     assert star != -1, "no star ask in the what's-new dialog"
     assert star < body_append, "the star ask must be inside the notes box"
-    notes = block.find('For more usage and quality')
+    # Anchored on the notes LIST, not on a sentence. It used to point at
+    # 'For more usage and quality', a line from the hardcoded paragraph that
+    # was the reason the dialog went stale -- pinning the test to that prose
+    # made deleting it a test failure.
+    notes = block.find('wn-list')
     assert notes != -1 and notes < star, "the star ask must come AFTER the notes"
 
 
