@@ -227,3 +227,53 @@ def test_overrides_survive_a_bad_value():
     config.set_setting(A._CATEGORY_OVERRIDE_SETTING, "not a dict")
     assert A._category_overrides() == {}
     assert A._mode_allows("coding", "llm7", "codestral-latest")
+
+
+# --------------------------------------------------------------------------- #
+# Vision, and the whitelist that hid it
+# --------------------------------------------------------------------------- #
+
+def test_a_vision_model_is_recognised_by_its_category_too():
+    """MEASURED on this install: the hand-curated per-provider `vision_models`
+    list is exact-match and had gone stale -- it recognised ONE model out of
+    526 live ones. Every Gemini Flash was invisible, so an image request could
+    only ever route to that single model, and when it was unavailable
+    _build_chain(require_vision=True) came back EMPTY and the request 503'd
+    with 32 perfectly capable models sitting there."""
+    assert A._is_vision_model("google", "models/gemini-3.5-flash")
+
+
+def test_the_curated_list_still_wins():
+    """A provider naming a model has said something exact, and that is
+    believed even if no pattern matches it."""
+    import providers
+    for pid, spec in providers.PROVIDERS.items():
+        for model in (spec.get("vision_models") or []):
+            assert A._is_vision_model(pid, model), "%s/%s" % (pid, model)
+            return
+    pytest.skip("no provider curates a vision list any more")
+
+
+def test_a_text_model_is_still_not_a_vision_model():
+    assert not A._is_vision_model("groq", "qwen/qwen3.8-27b")
+    assert not A._is_vision_model("groq", "openai/gpt-oss-120b")
+
+
+def test_a_broken_category_table_does_not_claim_vision(monkeypatch):
+    """Fail CLOSED here, unlike _mode_allows: guessing that a model can see
+    sends an image to something that cannot read it."""
+    import model_categories
+    monkeypatch.setattr(model_categories, "matches",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert not A._is_vision_model("google", "models/gemini-3.5-flash")
+
+
+def test_a_whitelist_that_narrows_to_nothing_says_so(client=None):
+    """The exact accident that hid every vision model on this install: one
+    whitelist entry, added while testing, switched off 500+ models and the only
+    symptom was "no vision model available"."""
+    src = open("app.py", encoding="utf-8").read()
+    i = src.index('if action == "allow":')
+    body = src[i:i + 1400]
+    assert '"warning"' in body
+    assert "uses NOTHING else" in body

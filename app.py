@@ -2055,8 +2055,30 @@ def _vision_model_ids(pid):
 
 
 def _is_vision_model(pid, model):
+    """Can this model actually read an image?
+
+    The hand-curated `vision_models` list per provider is EXACT-MATCH and had
+    gone stale, which is not a small thing: MEASURED across this install's 526
+    live models, it recognised exactly ONE (glm/glm-4.6v-flash). Every Gemini
+    Flash, every vision-capable relay listing, all invisible. So an image
+    request could route to one model on the whole fleet, and when that one was
+    down, _build_chain(require_vision=True) came back EMPTY and the request
+    503'd -- with 32 models sitting there that can see perfectly well.
+
+    The curated list stays authoritative: a provider that names a model has
+    said something exact and it is believed. What is added is the model
+    CATEGORY, which is pattern-based and maintained in one place alongside the
+    other capability categories, so a new vision model is recognised the day
+    its family is listed rather than the day someone remembers to add it to a
+    per-provider array."""
     needle = str(model or "").lower()
-    return any(needle == m.lower() for m in _vision_model_ids(pid))
+    if any(needle == m.lower() for m in _vision_model_ids(pid)):
+        return True
+    try:
+        return model_categories.matches(
+            "vision", pid, model, _normalize_model_identity(model))
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def _data_image_bytes(url):
@@ -9542,6 +9564,24 @@ def api_model_identities_set():
     else:
         if action == "allow":
             _set_identity_allowed(ident, True)
+            # A whitelist is ENFORCED, so adding the first entry silently
+            # switches off every other model on the fleet. That is what it is
+            # for -- but it happened to this install by accident during
+            # testing, took 500+ models down including every vision model, and
+            # the only symptom was "no vision model available". Say it.
+            allowed_now = _allowed_identities()
+            live = sum(1 for r in _identity_rows()
+                       if r["identity"] in allowed_now and r["working"])
+            if live <= 2:
+                return jsonify({
+                    "blocked": sorted(_blocked_identities()),
+                    "allowed": sorted(allowed_now),
+                    "whitelist_active": True,
+                    "warning": ("The whitelist now allows %d model(s). While it has "
+                                "anything on it the hub uses NOTHING else, so every "
+                                "other model is switched off until you add more or "
+                                "clear it." % len(allowed_now)),
+                })
         else:
             after = set(_allowed_identities())
             after.discard(ident)

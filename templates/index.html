@@ -10371,7 +10371,13 @@
           var payload = { identity: ident, action: action };
           if (_sdScope) payload.session_id = _sdScope;
           api('/api/model-identities', { method: 'POST', body: payload })
-            .then(function(){ return loadSdModels(true); })
+            .then(function(r){
+              /* The server warns when a whitelist has narrowed to almost
+                 nothing -- it is enforced, so that switches every other model
+                 off, and it should never be a silent outcome. */
+              if (r && r.warning) toast(r.warning, true);
+              return loadSdModels(true);
+            })
             .then(function(){
               toast(ident + ' — ' + (
                 action === 'allow'    ? 'whitelisted' :
