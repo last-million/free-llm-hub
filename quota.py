@@ -521,7 +521,7 @@ def _parse_reset(v, now):
     return now + n                                     # seconds-from-now
 
 
-def observe_headers(pid: str, headers) -> None:
+def observe_headers(pid: str, headers, key=None) -> None:
     """Learn a provider's REAL request quota from its rate-limit response headers,
     so the hub adapts to any quota change (raised by a top-up, or lowered) with no
     probe waste. Best-effort: no usable 'remaining' header -> no-op (static budget
@@ -554,15 +554,35 @@ def observe_headers(pid: str, headers) -> None:
         lim = _parse_int(_hdr(headers, _RL_LIMIT_TOK)) if lim is None else lim
         reset_at = reset_at or _parse_reset(_hdr(headers, _RL_RESET_TOK), now)
 
+    # PER KEY, not per provider. A rate-limit header describes the ACCOUNT that
+    # just answered, and a provider's keys are usually separate accounts -- that
+    # is the reason anyone collects several.
+    #
+    # MEASURED 2026-09-09, the four g4f keys hit one at a time:
+    #     key 1  200  limit=500 remaining=432
+    #     key 2  429  "Token limit (1,000,000 per day) exceeded"
+    #     key 3  429  same
+    #     key 4  429  same
+    # Stored provider-wide, whichever key answered last decided the whole
+    # provider's fate: three spent keys marked g4f exhausted while the fourth
+    # still had 432 requests, and is_exhausted gates _available_providers, so
+    # g4f left routing entirely and the rotation that would have found the good
+    # key never ran.
+    #
+    # The provider-wide slot is kept for a caller with no key to attribute the
+    # reading to (a keyless provider), so nothing regresses when key is None.
+    # A FLAT string key, the same convention _throttle_key uses and for the same
+    # reason: this dict is written to JSON, whose object keys must be strings. A
+    # pid never contains "|".
+    slot = (pid + "|" + key_fingerprint(key)) if key else pid
     with _LOCK:
-        _DYNAMIC[pid] = {"remaining": max(0, rem), "limit": lim,
-                         "reset_at": reset_at, "seen": now}
+        _DYNAMIC[slot] = {"remaining": max(0, rem), "limit": lim,
+                          "reset_at": reset_at, "seen": now}
     _persist_maybe()
 
 
-def _dynamic(pid: str, now: float):
-    """Fresh dynamic reading for pid, or None if absent/stale/window-rolled."""
-    d = _DYNAMIC.get(pid)
+def _fresh(d, now):
+    """A reading still worth believing, or None."""
     if not d:
         return None
     if now - d.get("seen", 0) > _DYNAMIC_TTL:
@@ -570,6 +590,33 @@ def _dynamic(pid: str, now: float):
     if d.get("reset_at") and d["reset_at"] <= now:     # its window already reset
         return None
     return d
+
+
+def _dynamic(pid: str, now: float):
+    """Fresh reading for pid: the per-key readings SUMMED, else the shared one.
+
+    Summed because each key is its own account with its own allowance (see
+    observe_headers). One key reading zero says that key is spent, never that
+    the provider is -- so the pool is only out of budget when every key we have
+    heard from is, AND we have heard from as many keys as the pool holds. A key
+    we know nothing about is assumed to have budget: refusing to try is worse
+    than trying, which is the same fail-open rule usable_keys follows."""
+    prefix = pid + "|"
+    per = [v for k, v in _DYNAMIC.items()
+           if isinstance(k, str) and k.startswith(prefix) and _fresh(v, now)]
+    if not per:
+        return _fresh(_DYNAMIC.get(pid), now)
+    remaining = sum(int(d.get("remaining") or 0) for d in per)
+    limits = [d["limit"] for d in per if isinstance(d.get("limit"), int)]
+    # Unheard-from keys are not counted as spent -- see the docstring.
+    if remaining <= 0 and len(per) < key_count(pid):
+        remaining = 1
+    resets = [d["reset_at"] for d in per if d.get("reset_at")]
+    return {"remaining": remaining,
+            "limit": sum(limits) if len(limits) == len(per) else None,
+            # the SOONEST key back is when the provider is usable again
+            "reset_at": min(resets) if resets else None,
+            "seen": max(d.get("seen", 0) for d in per)}
 
 
 def mark_model_throttled(pid: str, model: str, seconds: float = 60) -> None:
@@ -897,8 +944,8 @@ def _load_state(path: str) -> None:
                     _DYNAMIC[pid] = d
             # Reuse the normal freshness gate: TTL-expired or window-rolled
             # readings are dropped, not trusted after a restart.
-            for pid in [pid for pid in _DYNAMIC if _dynamic(pid, now) is None]:
-                _DYNAMIC.pop(pid, None)
+            for slot in [k for k, v in list(_DYNAMIC.items()) if _fresh(v, now) is None]:
+                _DYNAMIC.pop(slot, None)
     app_blob = blob.get("app")
     if _extra_load is not None and isinstance(app_blob, dict):
         try:
