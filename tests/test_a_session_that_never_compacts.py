@@ -222,3 +222,27 @@ def test_the_users_own_config_is_repaired_too():
     assert "_backup_once(" in body, "this is the user's own file"
     # ...and it has to actually run at startup, or it repairs nobody.
     assert "_repair_opencode_config()" in src.split("def _repair_opencode_config(", 1)[1]
+
+
+# --------------------------------------------------------------------------- #
+# ...and every OTHER CLI is told the same number
+# --------------------------------------------------------------------------- #
+
+def test_one_context_window_for_every_cli():
+    """A CLI compacts, or refuses, against whatever it was told. openclaw was
+    handed a hand-written 200000 that agreed with nothing else here -- so it
+    would let a session grow half again past the size the hub states everywhere
+    else before summarising it."""
+    import app as A
+    assert A.HUB_CONTEXT_WINDOW == AC._CODEX_CONTEXT_WINDOW
+    assert A._PI_CTX == A.HUB_CONTEXT_WINDOW
+    src = open("app.py", encoding="utf-8").read()
+    body = src.split("def _autofix_openclaw(", 1)[1]
+    body = body[:body.index("\ndef ")]
+    assert "HUB_CONTEXT_WINDOW" in body
+    assert "200000" not in body
+
+
+def test_the_reply_reserve_agrees_too():
+    import app as A
+    assert A.HUB_MAX_TOKENS == A._PI_MAX_TOKENS

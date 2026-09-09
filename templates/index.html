@@ -8569,6 +8569,20 @@
       var codeName = $('#files-code-name'), codeMeta = $('#files-code-meta');
       var codeBody = $('#files-code-body');
       var treeLoaded = false;
+      /* The file list used to appear only when the whole turn ENDED: the only
+         callers of refreshFiles() were the stream's terminal handler and the
+         history rewind, and the 2s poll asks /api/workspace/status and nothing
+         else. So an agent could write twenty files over four minutes and the
+         panel showed none of them until it stopped.
+         These keep a live view instead: which folder the user is in (so a
+         refresh does not yank them back to the root), a signature of what was
+         last drawn (so an unchanged folder is not re-rendered, which would
+         drop the selection and the scroll position), and the ticker itself,
+         which only does anything while the Files tab is actually open. */
+      var treeRel = '';
+      var treeSig = '';
+      var treeSel = '';
+      var treeTimer = null;
 
       function showPane(which){
         [].forEach.call(tabs.querySelectorAll('.pane-tab'), function(t){
@@ -8581,7 +8595,8 @@
         $('#preview-bar').hidden = files;
         frame.parentElement.hidden = files;
         probBox.hidden = files || (!probList.children.length && !logEl.textContent);
-        if (files && !treeLoaded){ loadTree(''); treeLoaded = true; }
+        if (files && !treeLoaded){ loadTree(treeRel); treeLoaded = true; }
+        if (files) startTreeWatch();
       }
       tabs.addEventListener('click', function(e){
         var t = e.target.closest('.pane-tab');
@@ -8591,12 +8606,20 @@
       var FOLDER_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
       var FILE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
 
-      function loadTree(rel){
+      function loadTree(rel, quiet){
         if (!dir) return;
-        treeEl.textContent = 'Loading…';
+        treeRel = rel || '';
+        /* A quiet load is the 4s refresh: no "Loading…" flash, and below, no
+           re-render at all unless the folder's contents actually changed. */
+        if (!quiet) { treeEl.textContent = 'Loading…'; treeSig = ''; }
         api('/api/workspace/tree?project_dir=' + encodeURIComponent(dir) +
             (rel ? '&path=' + encodeURIComponent(rel) : ''))
           .then(function(r){
+            var sig = (r.rel || '') + '|' + (r.entries || []).map(function(e){
+              return (e.dir ? 'd:' : 'f:') + e.name;
+            }).join(',');
+            if (quiet && sig === treeSig) return;   // nothing new was written
+            treeSig = sig;
             treeEl.innerHTML = '';
             if (r.rel){
               var up = document.createElement('button');
@@ -8619,18 +8642,34 @@
               b.type = 'button'; b.className = 'files-row';
               b.innerHTML = (e.dir ? FOLDER_SVG : FILE_SVG) + '<span></span>';
               b.querySelector('span').textContent = e.name;
+              if (!e.dir && e.rel === treeSel) b.classList.add('active');
               b.addEventListener('click', function(){
                 if (e.dir) return loadTree(e.rel);
                 [].forEach.call(treeEl.querySelectorAll('.files-row'), function(x){
                   x.classList.remove('active');
                 });
                 b.classList.add('active');
+                treeSel = e.rel;      // survive the next refresh
                 openFile(e.rel);
               });
               treeEl.appendChild(b);
             });
           })
-          .catch(function(err){ treeEl.textContent = (err && err.message) || 'Could not read the project.'; });
+          .catch(function(err){
+            /* A quiet refresh must never replace a good listing with an error:
+               one blip mid-run would wipe the panel the user is reading. */
+            if (!quiet) treeEl.textContent = (err && err.message) || 'Could not read the project.';
+          });
+      }
+
+      /* Show files AS THEY ARE WRITTEN. Only ticks while the Files tab is open,
+         and a tick that finds the same names does not touch the DOM. */
+      function startTreeWatch(){
+        if (treeTimer) return;
+        treeTimer = setInterval(function(){
+          if (!dir || filesPane.hidden) return;
+          loadTree(treeRel, true);
+        }, 4000);
       }
 
       /* Which files are worth SHOWING rather than printing as text. The
@@ -8820,12 +8859,26 @@
              must find a server the agent left running before the reload. */
           api('/api/workspace/status?project_dir=' + encodeURIComponent(d) + '&discover=1')
             .then(render).catch(function(){});
-          poll(); startPolling();
+          poll(); startPolling(); startTreeWatch();
         },
         noticeUrls: noticeUrlsIn,
         afterTurn: afterTurn,
-        refreshFiles: function(){ treeLoaded = false; if (!filesPane.hidden) { loadTree(''); treeLoaded = true; } },
-        detach: function(){ stopPolling(); dir = null; render({ running: false, state: 'idle' }); }
+        /* Called when a turn ends. Reloads the folder the user is ACTUALLY in
+           (it used to snap back to the project root), and starts the live
+           watcher so the next turn's files appear as they are written rather
+           than all at once when it finishes. */
+        refreshFiles: function(){
+          treeLoaded = false;
+          startTreeWatch();
+          if (!filesPane.hidden){ loadTree(treeRel); treeLoaded = true; }
+        },
+        detach: function(){
+          stopPolling();
+          if (treeTimer){ clearInterval(treeTimer); treeTimer = null; }
+          treeRel = ''; treeSig = ''; treeSel = '';
+          dir = null;
+          render({ running: false, state: 'idle' });
+        }
       };
     })();
 

@@ -814,11 +814,17 @@ def test_adopt_still_works_for_the_same_project_twice(proj, no_adopted, monkeypa
 
 def test_shutdown_kills_the_adopted_app_and_stop_does_not(proj, no_adopted, monkeypatch):
     """stop() is a button labelled "Stop preview" -- it must not kill a process
-    it did not start. Ending the SESSION is a different promise."""
+    it did not start. Ending the SESSION is a different promise.
+
+    Ownership is stubbed as PROVEN here (the OS reports the listener running in
+    this project's folder). shutdown() now requires that: adoption still
+    accepts silence, but killing on silence is what ended a user's own dev
+    server on :3000 -- see test_a_port_we_did_not_start."""
     monkeypatch.setattr(workspace, "_http_ok", lambda port, timeout=1.2: True)
     killed = []
     monkeypatch.setattr(workspace, "_kill_listener", lambda port: killed.append(port) or True)
     proj = os.path.join(proj, "app2"); os.makedirs(proj)
+    monkeypatch.setattr(workspace, "_port_owner_dir", lambda port: proj)
 
     workspace.adopt(proj, "http://127.0.0.1:3000", source="agent")
     workspace.stop(proj)
@@ -846,10 +852,16 @@ def test_shutdown_never_kills_the_hub_or_our_own_port_range(proj, no_adopted, mo
 def test_sweep_reclaims_ports_left_by_a_previous_hub(monkeypatch):
     """99 of the 100 preview ports were held by orphaned servers on this
     machine -- every preview that ever outlived the hub that spawned it. The
-    next start then fails with "no free port"."""
+    next start then fails with "no free port".
+
+    The listeners are stubbed as RECOGNISABLY ours. Being inside PORT_RANGE
+    used to be the whole test; it no longer is, because the one time that
+    assumption is wrong it kills somebody's running server -- see
+    test_a_port_we_did_not_start."""
     held = {workspace.PORT_RANGE[0], workspace.PORT_RANGE[0] + 3}
     killed = []
     monkeypatch.setattr(workspace, "_port_open", lambda p: p in held)
+    monkeypatch.setattr(workspace, "_is_hub_preview", lambda p: True)
     monkeypatch.setattr(workspace, "_kill_listener", lambda p: killed.append(p) or True)
     assert workspace.sweep_own_range() == 2
     assert set(killed) == held, "swept a port nothing was holding"

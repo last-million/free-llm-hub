@@ -12756,8 +12756,16 @@ _PI_MODELS = [
     ("best", "Best (strongest models only)"),
     ("swarm", "Swarm (several models, best answer wins)"),
 ]
-_PI_CTX = 128000
-_PI_MAX_TOKENS = 8192
+# How much context the hub tells a CLI it has, and how much of that to keep
+# free for the reply. ONE number, because a CLI compacts (or refuses) against
+# whatever it was told: codex has had it since July (model_context_window),
+# opencode needs it or it never compacts at all, and openclaw used to be handed
+# a hand-written 200000 that agreed with nothing else here.
+HUB_CONTEXT_WINDOW = agentic_chat._CODEX_CONTEXT_WINDOW
+HUB_MAX_TOKENS = 8192
+
+_PI_CTX = HUB_CONTEXT_WINDOW
+_PI_MAX_TOKENS = HUB_MAX_TOKENS
 
 
 def _pi_provider_block(key, base_v1):
@@ -13055,8 +13063,8 @@ def _autofix_openclaw(entry, key, base_root, base_v1, model):
             "reasoning": False,
             "input": ["text"],
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-            "contextWindow": 200000,
-            "maxTokens": 8192,
+            "contextWindow": HUB_CONTEXT_WINDOW,
+            "maxTokens": HUB_MAX_TOKENS,
         }],
     }
     models["providers"] = providers

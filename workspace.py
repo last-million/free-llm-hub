@@ -31,6 +31,7 @@ anywhere that feeds a string to a shell. That is the whole reason `detect()`
 returns a fixed argv list and never a shell string.
 """
 import json
+import logging
 import os
 import re
 import shutil
@@ -42,6 +43,8 @@ import time
 
 # Ports we hand out to previews. Above the usual dev-server range so a project
 # that hardcodes 3000/5173 does not collide with one we assigned.
+_log = logging.getLogger("free-llm-hub")   # same logger as app.py / agentic_chat
+
 PORT_RANGE = (5800, 5899)
 START_TIMEOUT = 90.0        # seconds to wait for the port to answer
 LOG_LINES = 400             # per project ring buffer
@@ -443,8 +446,18 @@ class _Proc:
             return list(self.lines)
 
 
+# Stamped into every preview the hub spawns, so a leaked one can be RECOGNISED
+# at the next start instead of assumed. Before this, the boot sweep killed
+# everything listening in PORT_RANGE on the reasoning that the range is ours --
+# true nearly always, and the one time it is not, it is somebody's running
+# server. Value is the project the preview belongs to, which also makes an
+# orphan readable in a process list.
+_PREVIEW_MARKER = "CALVOUN_PREVIEW"
+
+
 def _env_for(project_dir, port):
     env = dict(os.environ)
+    env[_PREVIEW_MARKER] = os.path.abspath(project_dir)
     # Every common dev server reads one of these. Setting all of them is how one
     # code path serves vite, next, CRA, flask and http.server without knowing
     # which one it is about to start.
@@ -463,6 +476,42 @@ def _env_for(project_dir, port):
         env["VIRTUAL_ENV"] = vd
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
     return env
+
+
+def _child_listen_port(pid):
+    """A port the process we launched (or one of its children) is LISTENING on.
+
+    The hub cannot make every stack honour the port it was handed -- a plain
+    `app.run()` or `uvicorn.run(...)` ignores PORT and FLASK_RUN_PORT alike --
+    so rather than guess harder, follow what the process actually bound.
+
+    Children matter: npm and a shell wrapper both hold the socket one level
+    down. The hub's own port and its preview range are excluded: the first is
+    never the project's, and the second would let a stale preview elsewhere in
+    the range be mistaken for this one."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        proc = psutil.Process(pid)
+        procs = [proc] + proc.children(recursive=True)
+    except Exception:                                            # noqa: BLE001
+        return None
+    hub = _hub_port()
+    for p in procs:
+        try:
+            conns = p.net_connections(kind="inet")
+        except Exception:                                        # noqa: BLE001
+            continue
+        for c in conns:
+            if c.status != psutil.CONN_LISTEN or not c.laddr:
+                continue
+            found = c.laddr.port
+            if found == hub or PORT_RANGE[0] <= found <= PORT_RANGE[1]:
+                continue
+            return found
+    return None
 
 
 def _argv_with_port(argv, kind, port):
@@ -498,6 +547,16 @@ def start(project_dir, on_done=None):
                 install(run_dir, proc.log)
             proc.state = "starting"
             argv = _argv_with_port(spec["argv"], spec["kind"], port)
+            if spec["kind"].startswith("python:"):
+                # RE-RESOLVE THE INTERPRETER. detect() froze argv before
+                # install() existed to run, and _venv_python falls back to the
+                # hub's own python when there is no .venv yet -- which on a
+                # FIRST run is always, because install() creates it three lines
+                # up. So the very first Run of any project with a
+                # requirements.txt launched with the hub's interpreter and died
+                # with ModuleNotFoundError, then worked on the second Run.
+                # (Flask projects hid this, because the hub itself has Flask.)
+                argv = [_venv_python(run_dir)] + list(argv[1:])
             proc.log("[hub] " + " ".join(argv))
             try:
                 # Checking `stopping` and publishing `popen` under the SAME lock
@@ -530,6 +589,24 @@ def start(project_dir, on_done=None):
                 if _port_open(port):
                     proc.state = "running"
                     proc.log("[hub] ready on http://127.0.0.1:%d" % port)
+                    return
+                # THE PORT WE ASKED FOR IS NOT ALWAYS THE PORT IT TAKES.
+                # _argv_with_port can put the port on the command line for
+                # static/vite/npm, but a python entry point gets it only in the
+                # environment -- and `app.run()` binds 5000, `uvicorn.run(...)`
+                # binds 8000, and neither reads PORT or FLASK_RUN_PORT
+                # (FLASK_RUN_PORT is `flask run`, not app.run). So the hub sat
+                # on its own port for the full 90s and reported "no response"
+                # about an app that was up and serving the whole time -- a
+                # blank preview and a red error for a project that works.
+                # Ask the process we started what it ACTUALLY bound.
+                found = _child_listen_port(proc.popen.pid)
+                if found and found != port:
+                    proc.port = found
+                    proc.state = "running"
+                    proc.log("[hub] it bound port %d instead of %d; following it"
+                             % (found, port))
+                    proc.log("[hub] ready on http://127.0.0.1:%d" % found)
                     return
                 if proc.popen.poll() is not None:
                     proc.state = "failed"
@@ -870,6 +947,13 @@ def adopt(project_dir, url, source="agent"):
     if owner_dir and not _dir_covers(owner_dir, project_dir):
         raise WorkspaceError("port %d is served from %s, not from this project"
                              % (port, owner_dir))
+    # PROVEN means something positively said this port is this project's, as
+    # opposed to nothing having contradicted it. Adoption is happy with the
+    # weaker standard -- see the note below, it is deliberate. shutdown() is
+    # not: it KILLS, and the difference between showing the wrong preview and
+    # ending someone's dev server is the difference between a cosmetic slip and
+    # destroyed work.
+    proven = bool(owner_dir)
     # And when we can READ what that port serves, a different project's title
     # is decisive too. Unlike discover(), both checks fail OPEN -- the agent
     # naming a url IS evidence, so silence (an unreadable cwd, a missing title)
@@ -881,6 +965,8 @@ def adopt(project_dir, url, source="agent"):
             if served and want.strip().lower() != served.strip().lower():
                 raise WorkspaceError(
                     "port %d is serving %r, not this project (%r)" % (port, served, want))
+            if served and want.strip().lower() == served.strip().lower():
+                proven = True         # it is serving this project's own pages
     now = time.time()
     with _lock:
         # A server WE started wins: it is the one whose logs and problems we can
@@ -888,7 +974,8 @@ def adopt(project_dir, url, source="agent"):
         if project_dir in _procs:
             return status(project_dir)
         _adopted[project_dir] = {"url": "http://127.0.0.1:%d" % port, "port": port,
-                                 "since": now, "touched_at": now, "source": source}
+                                 "since": now, "touched_at": now, "source": source,
+                                 "proven": proven}
     return status(project_dir)
 
 
@@ -1065,9 +1152,22 @@ def shutdown(project_dir):
         adopted = _adopted.get(project_dir)
         port = adopted["port"] if adopted else None
         source = adopted["source"] if adopted else None
+        # .get, and no default: a record written before `proven` existed is
+        # exactly the unproven case, and defaulting it True would reintroduce
+        # the bug for one session after every upgrade.
+        proven = bool(adopted.get("proven")) if adopted else False
     ours = stop(project_dir)                     # our own child, if any
     forget(project_dir)
     if not port or source not in ("agent", "detected"):
+        return ours
+    if not proven:
+        # Adoption accepts silence as consent; killing must not. Both ownership
+        # checks go quiet in ordinary conditions -- an unreadable cwd (routine
+        # on Windows), a project with no <title> -- and the URL itself may have
+        # been scraped out of the agent's PROSE rather than started by it. So
+        # this is somebody's dev server until something says otherwise.
+        _log.info("not stopping port %d: nothing proved it belongs to %s",
+                  port, os.path.basename(project_dir))
         return ours
     if PORT_RANGE[0] <= port <= PORT_RANGE[1] or port == _hub_port():
         return ours
@@ -1084,17 +1184,67 @@ def sweep_own_range():
     every one of those servers is still burning a port for a project nobody is
     looking at.
 
-    Only PORT_RANGE is touched. That range exists solely for previews the hub
-    hands out -- adopt() refuses it precisely because it is ours -- so anything
-    listening there at startup is a leaked preview, not the user's own work.
-    Returns how many were reclaimed."""
+    Only PORT_RANGE is touched, and within it only a listener RECOGNISED as one
+    of ours. "It is in our range" used to be the whole test -- true nearly
+    always, since adopt() refuses that range precisely because it is ours, but
+    the one time it is not, the cost is somebody's running server. Which is
+    what the user reported. A process we cannot recognise is left where it is;
+    _free_port already skips a busy port, so the worst case is one port we do
+    not reuse. Returns how many were reclaimed."""
     freed = 0
     for port in range(PORT_RANGE[0], PORT_RANGE[1] + 1):
         if not _port_open(port):
             continue
+        if not _is_hub_preview(port):
+            _log.info("port %d is in use by something this hub did not start; "
+                      "leaving it alone", port)
+            continue
         if _kill_listener(port):
             freed += 1
     return freed
+
+
+# What a preview the hub spawned looks like from the outside, for a leak left by
+# a PREVIOUS hub that predates the marker. Deliberately the launcher shapes
+# _detect_at produces and nothing wider.
+_PREVIEW_CMDLINE_HINTS = ("http.server", "vite", "npm", "npx",
+                          ".venv", "manage.py", "uvicorn")
+
+
+def _is_hub_preview(port):
+    """Did this hub (or a previous run of it) start what is on `port`?
+
+    Marker first -- that is definitive. Command line second, for an orphan from
+    before the marker existed. Anything else, including every error, is "no",
+    because the only thing this answer is used for is whether to kill."""
+    try:
+        import psutil
+    except ImportError:
+        return False
+    try:
+        conns = psutil.net_connections(kind="inet")
+    except Exception:                                            # noqa: BLE001
+        return False
+    for c in conns:
+        if (c.status != psutil.CONN_LISTEN or not c.laddr
+                or c.laddr.port != port or not c.pid):
+            continue
+        try:
+            proc = psutil.Process(c.pid)
+        except Exception:                                        # noqa: BLE001
+            continue
+        try:
+            if proc.environ().get(_PREVIEW_MARKER):
+                return True
+        except Exception:                                        # noqa: BLE001
+            pass                      # AccessDenied is routine; fall through
+        try:
+            cmd = " ".join(proc.cmdline()).lower()
+        except Exception:                                        # noqa: BLE001
+            continue
+        if any(h in cmd for h in _PREVIEW_CMDLINE_HINTS):
+            return True
+    return False
 
 
 def _kill_listener(port):
