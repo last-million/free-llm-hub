@@ -715,6 +715,43 @@ def _auto_models(pid):
     return free + [m for m in paid if m not in seen]
 
 
+# How many provider catalogs to fetch at once.
+#
+# It was 16, and there are 17 enabled providers here -- so one of them waited a
+# whole round. MEASURED 2026-09-09: each provider's /models call takes about
+# seven seconds (their servers, not ours, and remarkably uniform), so that one
+# straggler turned a 7-second sweep into 13.58s, and /v1/models with it.
+#
+# These threads are network-bound and spend their whole life blocked on a
+# socket, so the count wants to track the fleet rather than the CPU. Capped
+# well above any plausible provider list purely as a runaway guard.
+_CATALOG_FETCH_WORKERS = 48
+
+
+def _warm_catalogs_async():
+    """Fetch every provider's catalog in the background, once, at startup.
+
+    Each provider's /models call takes about seven seconds (their servers), and
+    the cache that hides this has a 60-second TTL -- so the FIRST caller after a
+    restart pays the whole sweep. That caller is almost always a CLI checking
+    /v1/models to see whether the hub is up, and opencode gives up first:
+    "Cannot connect to API: Unable to connect. Is the computer able to access
+    the url... retrying in 22s". The hub was healthy every time; it just had not
+    answered yet.
+
+    A daemon thread, started after the port is bound, so it costs the startup
+    path nothing and dies with the process. Failures are ignored on purpose --
+    this is a cache warm-up, and every caller still fetches for itself if it
+    finds nothing warm."""
+    def _go():
+        try:
+            _prefetch_free_models(list(_enabled_keyed()))
+            _log.info("[warm] provider catalogs ready")
+        except Exception as exc:                                 # noqa: BLE001
+            _log.debug("[warm] catalog warm-up skipped: %s", exc)
+    threading.Thread(target=_go, name="warm-catalogs", daemon=True).start()
+
+
 def _prefetch_free_models(providers):
     """{pid: [free models]} for every provider, fetched CONCURRENTLY.
 
@@ -736,7 +773,7 @@ def _prefetch_free_models(providers):
     if not providers:
         return {}
     out = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(providers), 16)) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(providers), _CATALOG_FETCH_WORKERS)) as ex:
         futures = {ex.submit(provider_free_models, pid): pid for pid in providers}
         for fut in concurrent.futures.as_completed(futures):
             pid = futures[fut]
@@ -758,7 +795,7 @@ def _prefetch_auto_models(providers):
     if not providers:
         return {}
     out = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(providers), 16)) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(providers), _CATALOG_FETCH_WORKERS)) as ex:
         futures = {ex.submit(_auto_models, pid): pid for pid in providers}
         for fut in concurrent.futures.as_completed(futures):
             pid = futures[fut]
@@ -20359,6 +20396,7 @@ if __name__ == "__main__":
     _maybe_auto_create_desktop_shortcut()
     _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()
+    _warm_catalogs_async()     # so the first CLI to ask does not pay the sweep
     if not _claim_single_instance():
         _log.error("another Calvoun hub is already running against %s -- "
                    "stop it first, or set HUB_FORCE=1 to start anyway.",
