@@ -1,0 +1,229 @@
+r"""Pick a model once, not once per provider -- and be able to say "only these".
+
+REQUESTED 2026-09-09: "i want also use whitelist models that i want to use only
+either by inputing there names or checkmark them, and even in blocklist ... he
+should be smart to detect the same model in all providers so no need to select
+same model in each provider".
+
+WHAT EXISTED. Only a blocklist, and it stored provider-qualified ids:
+
+    _BLOCKED_SETTING = "blocked_models"   ->  ["groq/openai/gpt-oss-120b", ...]
+
+so switching off gpt-oss meant finding and ticking it under every provider that
+serves it -- five entries for one model, and a sixth provider added tomorrow
+serves it again. There was no whitelist at all.
+
+WHAT THE HUB ALREADY HAD. _normalize_model_identity() is the hub's canonical
+"same model" key and is already load-bearing in routing (penalty sharing,
+same-host alternation, retry vetoes). It strips provider suffixes (':free',
+'-free', ':beta'), g4f relay prefixes ('srv_xxx:'), and the vendor namespace,
+because hosts rename the namespace and never the model:
+
+    groq/openai/gpt-oss-120b   ->  gpt-oss-120b
+    cerebras/gpt-oss-120b      ->  gpt-oss-120b
+    tokenrouter/z-ai/glm-5.3-free -> glm-5.3
+
+So the grouping key for "the same model everywhere" was already written,
+measured and trusted. It simply had never been offered to the user.
+
+ONE SEAM. _is_model_dead() is where a user-blocked model is already made
+invisible to the pool, the chain, the model lists and the probes -- its comment
+says so and says why. All three lists are enforced there, so none of those six
+callers can forget one.
+
+WHY THE WHITELIST IS STRICT WHILE A MODE IS NOT. _apply_mode returns
+`kept or cands`: a mode is a preference, and a category whose models are all
+rate-limited must degrade to "answer with something". A whitelist is not a
+preference, it is an instruction with a list attached, and silently ignoring it
+would route to exactly the models the user just excluded. It is enforced. The
+protection against locking the hub out lives at the WRITE side instead, where
+it can be explained.
+"""
+import app as A
+import config
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolated(tmp_path, monkeypatch):
+    p = tmp_path / "config.json"
+    p.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_PATH", str(p))
+    monkeypatch.setattr(config, "_config_path", lambda: str(p))
+    config.invalidate_settings_cache()
+    yield
+    config.invalidate_settings_cache()
+
+
+# --------------------------------------------------------------------------- #
+# One model, every provider
+# --------------------------------------------------------------------------- #
+
+SIBLINGS = [
+    ("groq", "openai/gpt-oss-120b"),
+    ("cerebras", "gpt-oss-120b"),
+    ("nvidia", "openai/gpt-oss-120b"),
+    ("openrouter", "openai/gpt-oss-120b:free"),
+]
+
+
+def test_the_siblings_really_are_one_identity():
+    """The premise. If this ever stops holding, everything below is wrong."""
+    idents = {A._normalize_model_identity(m) for _pid, m in SIBLINGS}
+    assert len(idents) == 1, idents
+
+
+def test_blocking_an_identity_blocks_it_everywhere():
+    A._set_identity_blocked("gpt-oss-120b", True)
+    for pid, model in SIBLINGS:
+        assert A._is_model_blocked_by_user(pid, model), (pid, model)
+
+
+def test_unblocking_an_identity_releases_every_provider():
+    A._set_identity_blocked("gpt-oss-120b", True)
+    A._set_identity_blocked("gpt-oss-120b", False)
+    for pid, model in SIBLINGS:
+        assert not A._is_model_blocked_by_user(pid, model)
+
+
+def test_an_unrelated_model_is_untouched():
+    A._set_identity_blocked("gpt-oss-120b", True)
+    assert not A._is_model_blocked_by_user("groq", "qwen/qwen3.8-27b")
+
+
+def test_a_provider_added_tomorrow_is_covered_too():
+    """The reason to store the identity rather than five ids: the sixth host
+    is blocked before anyone has heard of it."""
+    A._set_identity_blocked("gpt-oss-120b", True)
+    assert A._is_model_blocked_by_user("somenewhost", "openai/gpt-oss-120b")
+
+
+# --------------------------------------------------------------------------- #
+# The old provider-qualified list still works
+# --------------------------------------------------------------------------- #
+
+def test_the_legacy_blocklist_is_still_honoured():
+    """Every existing install has one. Dropping it would silently re-enable
+    every model the user had already switched off."""
+    A._set_model_blocked("groq", "openai/gpt-oss-120b", True)
+    assert A._is_model_blocked_by_user("groq", "openai/gpt-oss-120b")
+
+
+def test_the_legacy_list_blocks_only_that_provider():
+    A._set_model_blocked("groq", "openai/gpt-oss-120b", True)
+    assert not A._is_model_blocked_by_user("cerebras", "gpt-oss-120b")
+
+
+# --------------------------------------------------------------------------- #
+# The whitelist
+# --------------------------------------------------------------------------- #
+
+def test_an_empty_whitelist_restricts_nothing():
+    """Off is the default and must stay the default -- a whitelist that starts
+    life empty and enforcing would take the hub down on first upgrade."""
+    assert A._allowed_identities() == set()
+    assert not A._is_model_blocked_by_user("groq", "qwen/qwen3.8-27b")
+
+
+def test_a_whitelist_admits_what_is_on_it():
+    A._set_identity_allowed("qwen3.8-27b", True)
+    assert not A._is_model_blocked_by_user("groq", "qwen/qwen3.8-27b")
+
+
+def test_a_whitelist_excludes_everything_else():
+    A._set_identity_allowed("qwen3.8-27b", True)
+    assert A._is_model_blocked_by_user("groq", "openai/gpt-oss-120b")
+
+
+def test_a_whitelisted_identity_covers_every_provider():
+    A._set_identity_allowed("gpt-oss-120b", True)
+    for pid, model in SIBLINGS:
+        assert not A._is_model_blocked_by_user(pid, model)
+
+
+def test_the_blocklist_beats_the_whitelist():
+    """Both lists naming the same model is a contradiction, and the safe
+    reading of a contradiction is the restrictive one."""
+    A._set_identity_allowed("gpt-oss-120b", True)
+    A._set_identity_blocked("gpt-oss-120b", True)
+    assert A._is_model_blocked_by_user("groq", "openai/gpt-oss-120b")
+
+
+def test_emptying_the_whitelist_turns_it_off_again():
+    A._set_identity_allowed("qwen3.8-27b", True)
+    A._set_identity_allowed("qwen3.8-27b", False)
+    assert not A._is_model_blocked_by_user("groq", "openai/gpt-oss-120b")
+
+
+# --------------------------------------------------------------------------- #
+# Enforcement reaches routing, not just the API
+# --------------------------------------------------------------------------- #
+
+def test_the_one_seam_carries_all_three_lists():
+    """_is_model_dead is what the pool, the chain, the model lists and the
+    probes all call. A list enforced anywhere else would be forgotten by five
+    of them."""
+    A._set_identity_blocked("gpt-oss-120b", True)
+    assert A._is_model_dead("cerebras", "gpt-oss-120b")
+
+
+def test_the_block_reason_names_the_whitelist():
+    """"Model X is switched off in Settings" would be a lie, and a confusing
+    one, when what actually happened is that X is not on a list."""
+    A._set_identity_allowed("qwen3.8-27b", True)
+    reason = A._model_block_reason("groq", "openai/gpt-oss-120b")
+    assert reason and "whitelist" in reason.lower()
+
+
+def test_the_block_reason_is_none_when_it_may_run():
+    assert A._model_block_reason("groq", "qwen/qwen3.8-27b") is None
+
+
+# --------------------------------------------------------------------------- #
+# Editing what belongs to a mode
+# --------------------------------------------------------------------------- #
+
+def test_a_model_can_be_added_to_a_category():
+    """CATEGORIES is a hardcoded tuple of substring patterns -- until now the
+    only way to fix a miscategorised model was to edit the source and
+    restart."""
+    assert not A._mode_allows("coding", "groq", "some-obscure-model")
+    A._set_category_member("coding", "some-obscure-model", True)
+    assert A._mode_allows("coding", "groq", "some-obscure-model")
+
+
+def test_a_model_can_be_removed_from_a_category():
+    """codestral matches the built-in 'codestral' pattern, so this proves the
+    override beats the source list rather than just adding to it."""
+    assert A._mode_allows("coding", "llm7", "codestral-latest")
+    A._set_category_member("coding", "codestral-latest", False)
+    assert not A._mode_allows("coding", "llm7", "codestral-latest")
+
+
+def test_an_override_follows_the_identity_across_providers():
+    A._set_category_member("coding", "gpt-oss-120b", True)
+    for pid, model in SIBLINGS:
+        assert A._mode_allows("coding", pid, model), (pid, model)
+
+
+def test_removal_beats_addition():
+    A._set_category_member("coding", "x-model", True)
+    A._set_category_member("coding", "x-model", False)
+    assert not A._mode_allows("coding", "groq", "x-model")
+
+
+def test_an_override_does_not_leak_into_another_category():
+    A._set_category_member("coding", "some-obscure-model", True)
+    assert not A._mode_allows("vision", "groq", "some-obscure-model")
+
+
+def test_the_all_mode_still_allows_everything():
+    A._set_category_member("coding", "codestral-latest", False)
+    assert A._mode_allows(A.MODE_ALL, "llm7", "codestral-latest")
+
+
+def test_overrides_survive_a_bad_value():
+    """A hand-edited config must not take routing down."""
+    config.set_setting(A._CATEGORY_OVERRIDE_SETTING, "not a dict")
+    assert A._category_overrides() == {}
+    assert A._mode_allows("coding", "llm7", "codestral-latest")

@@ -587,6 +587,7 @@ def list_backups() -> list:
 
 def save_config(cfg: dict) -> None:
     """Persist atomically; never fall back to truncating the live file."""
+    invalidate_settings_cache()   # the cached view is now a lie; see get_setting
     path = _config_path()
     parent = os.path.dirname(path)
     if parent:
@@ -910,11 +911,57 @@ def set_social_web_search(value: bool) -> None:
     set_flag("social_web_search", value)
 
 
+# A settings read used to be a disk read and a JSON parse. Every time.
+#
+# MEASURED building one ordinary tool-capable chain: _build_chain took 4.41s,
+# and 0.42s of that was _blocked_models() alone -- 484 calls at 0.86ms, because
+# _is_model_dead asks the user's blocklist for EVERY candidate model and each
+# ask reopened and reparsed a 15KB file. That is the seam every filter goes
+# through (the pool, the chain, the model lists, the probes), which is exactly
+# why it is one call and exactly why it is hot.
+#
+# Keyed on the file's (mtime_ns, size) so an edit from another process is
+# noticed, and invalidated explicitly by every write in this process so a click
+# in Settings is visible to the very next read -- mtime resolution is too coarse
+# to rely on for back-to-back writes. Values are deep-copied out, because a
+# caller that mutates what it got back would otherwise poison every later
+# reader.
+_settings_cache: dict = {"key": None, "cfg": None}
+
+
+def invalidate_settings_cache() -> None:
+    """Forget the cached settings view. Called by every write path here, and
+    available to anything that edits config.json behind this module's back."""
+    with _LOCK:
+        _settings_cache["key"] = None
+        _settings_cache["cfg"] = None
+
+
+def _settings_stat():
+    """(mtime_ns, size) for the config file, or None when it cannot be read --
+    in which case the cache is bypassed and the file is parsed, as before."""
+    try:
+        st = os.stat(_config_path())
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
 def get_setting(name: str, default=None):
     """Read a top-level non-boolean setting (e.g. a string mode) from the config."""
     with _LOCK:
-        cfg = load_config()
-    return cfg.get(name, default)
+        key = _settings_stat()
+        if key is not None and _settings_cache["key"] == key:
+            cfg = _settings_cache["cfg"]
+        else:
+            cfg = load_config()
+            if key is not None:
+                _settings_cache["key"] = key
+                _settings_cache["cfg"] = cfg
+        value = cfg.get(name, default)
+    # Only containers can be mutated by a caller; copying a str/int/bool would
+    # be pure overhead on the hot path this cache exists to speed up.
+    return copy.deepcopy(value) if isinstance(value, (dict, list, set)) else value
 
 
 def set_setting(name: str, value) -> None:

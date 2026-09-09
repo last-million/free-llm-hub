@@ -7337,6 +7337,29 @@ _MODEL_ID_SUFFIX_RE = re.compile(r"(?::free|:beta|:extended|:nitro|:floor|:onlin
 
 _FREE_TIER_SUFFIX_RE = re.compile(r"-free$")
 
+# A colon in a model id means one of TWO opposite things, and telling them
+# apart is the whole job:
+#
+#   'Airforce:claude-opus-5'    <- HOST prefix; the model is on the RIGHT
+#   'codestral:latest'          <- Ollama TAG;  the model is on the LEFT
+#
+# Getting it wrong merges unrelated models under one identity, which matters
+# because this function drives penalty sharing, same-host alternation and the
+# retry veto. Both mistakes were measured on this machine's own fleet: taking
+# the last segment put 34 models under "latest" and 7 under "8b"; taking the
+# first put 17 under "githubcopilot" and 14 under "airforce".
+#
+# A TAG comes from a small, recognisable vocabulary (a version, a size, a
+# quantisation); a HOST is an arbitrary word. So tags are matched by shape and
+# removed from the right, and whatever colons remain are hosts and are removed
+# from the left.
+_OLLAMA_TAG_RE = re.compile(
+    r"^(?:latest|instruct|chat|code|text|base|"
+    r"v?\d+(?:\.\d+)*|"                     # v1, 3, 1.5
+    r"\d+(?:\.\d+)?[bkm](?:-[a-z0-9._\-]+)?|"   # 8b, 1.5b, 70b-instruct-q4
+    r"[qf]p?\d+(?:_[a-z0-9]+)*|bf16|fp16)$",    # q4_K_M, f16, fp16, bf16
+    re.IGNORECASE)
+
 
 def _normalize_model_identity(model_id):
     """Strip provider-added suffixes (openrouter's ':free', ':beta', etc.) AND
@@ -7367,10 +7390,39 @@ def _normalize_model_identity(model_id):
     # fan-out: without this, three g4f listings of ONE model read as three
     # different models, so the same opinion was bought three times -- and the
     # relay discount and same-model load sharing never saw them as one model
-    # either. Everything after the LAST colon is the real id; the ':free'-style
-    # suffixes were already removed above, so no genuine suffix is at risk.
-    if ":" in base:
-        base = base.rsplit(":", 1)[-1]
+    # either.
+    #
+    # "Everything after the LAST colon is the real id" was how this used to be
+    # done, and it is wrong for an OLLAMA-STYLE TAG. MEASURED on this machine:
+    # 34 unrelated models collapsed into the single identity "latest" --
+    #
+    #   srv_mqjxnj9i:codestral:latest      -> latest
+    #   srv_mqjxnj9i:gemma4:latest         -> latest
+    #   srv_msg68ooo:gpt-oss:latest        -> latest
+    #
+    # -- and another seven into "8b". That is not cosmetic: this function is
+    # load-bearing in ROUTING (_model_identity_min_penalty shares a scarcity
+    # penalty across "the same model", same-host alternation, and the retry
+    # veto), so one failing model was sharing its penalty with 33 strangers and
+    # vetoing all of them on retry.
+    #
+    # A relay prefix is therefore STRIPPED FROM THE FRONT, and only when what
+    # remains still looks like a real id (it has a '/', or the prefix is one of
+    # the recognisable relay shapes). Whatever colon survives after that is a
+    # TAG, so the NAME is what comes before it -- the opposite of before.
+    # Tags first, from the RIGHT: 'codestral:latest' -> 'codestral'.
+    while ":" in base:
+        head, tail = base.rsplit(":", 1)
+        if not head or not _OLLAMA_TAG_RE.match(tail):
+            break
+        base = head
+    # Then hosts, from the LEFT: 'Airforce:claude-opus-5' -> 'claude-opus-5',
+    # 'G4FSpace:srv_x:z-ai/glm-5.3' -> 'z-ai/glm-5.3'.
+    while ":" in base:
+        head, tail = base.split(":", 1)
+        if not tail:
+            break
+        base = tail
     return base.rsplit("/", 1)[-1]
 
 
@@ -9345,6 +9397,135 @@ def api_tracking():
                     "keyed_no_free": keyed_no_free})
 
 
+def _identity_rows():
+    """Every model the hub knows, GROUPED BY IDENTITY instead of by provider.
+
+    The Settings list showed one row per (provider, model), so switching off
+    gpt-oss meant finding it under groq, cerebras, nvidia and openrouter and
+    ticking it four times -- and a fifth host adding it tomorrow served it
+    again. _normalize_model_identity is the hub's canonical "same model" key and
+    is already load-bearing in routing, so grouping on it needs no new notion of
+    sameness; it only had to be offered to the user.
+
+    Reuses api_tracking's own rows, so "working" here means exactly what it
+    means there rather than drifting into a second opinion."""
+    data = api_tracking().get_json()
+    groups = {}
+    for row in data.get("models") or []:
+        ident = _normalize_model_identity(row["model"])
+        g = groups.setdefault(ident, {
+            "identity": ident, "providers": [], "ids": [], "count": 0,
+            "working": 0, "score": 0.0, "tool_capable": False, "state": "dead",
+        })
+        g["count"] += 1
+        if row["provider"] not in g["providers"]:
+            g["providers"].append(row["provider"])
+        g["ids"].append(row["id"])
+        if row["state"] == "ok":
+            g["working"] += 1
+        g["score"] = max(g["score"], row.get("score") or 0.0)
+        g["tool_capable"] = g["tool_capable"] or bool(row.get("tool_capable"))
+        # The BEST state across providers: one host having withdrawn a model
+        # says nothing about it when four others still serve it.
+        if row["state"] == "ok" or g["state"] == "dead":
+            g["state"] = row["state"] if row["state"] == "ok" else g["state"]
+    blocked, allowed = _blocked_identities(), _allowed_identities()
+    out = []
+    for ident, g in groups.items():
+        g["state"] = "ok" if g["working"] else g["state"]
+        g["blocked"] = ident in blocked
+        g["allowed"] = ident in allowed
+        g["categories"] = sorted(
+            k for k in _mode_keys()
+            if _mode_allows(k, g["providers"][0], g["ids"][0].split("/", 1)[1]))
+        out.append(g)
+    out.sort(key=lambda r: (-r["working"], -r["score"], r["identity"]))
+    return out
+
+
+@app.route("/api/model-identities", methods=["GET"])
+def api_model_identities():
+    """One row per MODEL, not per provider+model. Feeds the Settings search
+    box, the whitelist, the identity blocklist and the mode editor."""
+    rows = _identity_rows()
+    return jsonify({
+        "models": rows,
+        "total": len(rows),
+        "working": sum(1 for r in rows if r["working"]),
+        "blocked": sorted(_blocked_identities()),
+        "allowed": sorted(_allowed_identities()),
+        "whitelist_active": bool(_allowed_identities()),
+        "modes": [{"key": k, "label": lbl} for k, lbl, _h in model_categories.labels()
+                  if k in _mode_keys()],
+    })
+
+
+@app.route("/api/model-identities", methods=["POST"])
+def api_model_identities_set():
+    """Block / unblock / allow / disallow one model across every provider.
+
+    The whitelist is refused when it would leave nothing working. It is
+    enforced rather than fail-open (see _is_model_blocked_by_user), so an empty
+    one is not a harmless preference -- it is a hub that answers nothing. The
+    check belongs here, where the reason can be said out loud, rather than in
+    routing where it could only be guessed at."""
+    body = request.get_json(force=True, silent=True) or {}
+    ident = str(body.get("identity") or "").strip().lower()
+    action = str(body.get("action") or "").strip().lower()
+    if not ident:
+        return _openai_error("identity is required", 400)
+    if action not in ("block", "unblock", "allow", "disallow"):
+        return _openai_error("action must be block, unblock, allow or disallow", 400)
+    if action in ("block", "unblock"):
+        _set_identity_blocked(ident, action == "block")
+    else:
+        if action == "allow":
+            _set_identity_allowed(ident, True)
+        else:
+            after = set(_allowed_identities())
+            after.discard(ident)
+            if after and not any(r["working"] for r in _identity_rows()
+                                 if r["identity"] in after):
+                return _openai_error(
+                    "That would leave a whitelist with no working model on it, so "
+                    "every request would fail. Clear the whitelist entirely to allow "
+                    "every model, or add a working one first.", 400)
+            _set_identity_allowed(ident, False)
+    return jsonify({"blocked": sorted(_blocked_identities()),
+                    "allowed": sorted(_allowed_identities()),
+                    "whitelist_active": bool(_allowed_identities())})
+
+
+@app.route("/api/model-identities/whitelist", methods=["DELETE"])
+def api_model_whitelist_clear():
+    """Turn the whitelist off in one action -- the way back from a list that
+    has become too narrow to serve anything."""
+    try:
+        config.set_setting(_ALLOWED_IDENTITY_SETTING, [])
+    except Exception as exc:                                     # noqa: BLE001
+        return _openai_error("could not clear the whitelist: %s" % _sanitize(str(exc)), 500)
+    return jsonify({"allowed": [], "whitelist_active": False})
+
+
+@app.route("/api/model-category", methods=["POST"])
+def api_model_category_set():
+    """Put a model in a mode, or take it out.
+
+    model_categories ships hardcoded substring patterns, so a miscategorised
+    model previously needed a source edit and a restart. Stored by identity, so
+    the correction holds for every provider serving that model."""
+    body = request.get_json(force=True, silent=True) or {}
+    key = str(body.get("key") or "").strip().lower()
+    ident = str(body.get("identity") or "").strip().lower()
+    if key not in _mode_keys():
+        return _openai_error("unknown mode %r" % key, 400)
+    if not ident:
+        return _openai_error("identity is required", 400)
+    _set_category_member(key, ident, bool(body.get("member")))
+    return jsonify({"overrides": {k: {"add": sorted(v["add"]), "remove": sorted(v["remove"])}
+                                  for k, v in _category_overrides().items()}})
+
+
 @app.route("/api/probe-all", methods=["POST"])
 def api_probe_all():
     """ACTIVE health check: send ONE tiny real request to each enabled+keyed
@@ -10603,8 +10784,18 @@ def _mode_allows(mode, pid, model):
     try:
         if not mode or mode == MODE_ALL:
             return True
-        return model_categories.matches(mode, pid, model,
-                                        _normalize_model_identity(model))
+        ident = _normalize_model_identity(model)
+        # The user's own edits to this category win over the built-in patterns.
+        # CATEGORIES is a hardcoded tuple of substring patterns, so before this
+        # the only way to fix a miscategorised model was to edit the source and
+        # restart. Removal beats addition: naming a model on both lists is a
+        # contradiction, and the restrictive reading is the safe one.
+        ov = _category_overrides().get(mode) or {}
+        if ident in ov.get("remove", ()):
+            return False
+        if ident in ov.get("add", ()):
+            return True
+        return model_categories.matches(mode, pid, model, ident)
     except Exception:                                            # noqa: BLE001
         return True
 
@@ -10625,6 +10816,15 @@ def _apply_mode(cands, mode=None, key=lambda c: (c[1], c[2])):
 
 
 _BLOCKED_SETTING = "blocked_models"
+# ...and the same choice made ONCE for a model however many providers serve it.
+# The old list stores 'pid/model', so switching off gpt-oss meant ticking it
+# under groq AND cerebras AND nvidia AND openrouter -- and the fifth host that
+# picks it up tomorrow serves it again. These two store the IDENTITY instead,
+# which _normalize_model_identity already computes and routing already trusts.
+_BLOCKED_IDENTITY_SETTING = "blocked_identities"
+_ALLOWED_IDENTITY_SETTING = "allowed_identities"
+# {category key: {"add": [identity], "remove": [identity]}} -- see _mode_allows.
+_CATEGORY_OVERRIDE_SETTING = "model_category_overrides"
 
 
 def _blocked_models():
@@ -10636,8 +10836,119 @@ def _blocked_models():
         return set()
 
 
+def _identity_set(setting):
+    try:
+        raw = config.get_setting(setting, []) or []
+        return {str(x).strip().lower() for x in raw if str(x).strip()}
+    except Exception:                                            # noqa: BLE001
+        return set()
+
+
+def _blocked_identities():
+    return _identity_set(_BLOCKED_IDENTITY_SETTING)
+
+
+def _allowed_identities():
+    """The whitelist. EMPTY MEANS OFF, and that has to stay true: a whitelist
+    that started life empty and enforcing would black out every install on the
+    upgrade that introduced it."""
+    return _identity_set(_ALLOWED_IDENTITY_SETTING)
+
+
 def _is_model_blocked_by_user(pid, model):
-    return ("%s/%s" % (pid, model)) in _blocked_models()
+    """All three lists, at the one seam every filter already goes through.
+
+    Order matters: the blocklist wins. Naming a model on both lists is a
+    contradiction, and the safe reading of a contradiction is the restrictive
+    one.
+
+    The whitelist is ENFORCED rather than fail-open, unlike a mode -- see
+    _apply_mode, which returns `kept or cands` because a category is a
+    preference. A whitelist is an instruction with a list attached, and
+    degrading it to "answer with something" would route to exactly the models
+    the user just excluded. The guard against locking the hub out lives at the
+    write side, where it can be explained."""
+    if ("%s/%s" % (pid, model)) in _blocked_models():
+        return True
+    ident = _normalize_model_identity(model)
+    if ident in _blocked_identities():
+        return True
+    allowed = _allowed_identities()
+    return bool(allowed) and ident not in allowed
+
+
+def _set_identity_blocked(identity, blocked):
+    """Switch one model off (or back on) across every provider that serves it."""
+    return _toggle_identity(_BLOCKED_IDENTITY_SETTING, identity, blocked)
+
+
+def _set_identity_allowed(identity, allowed):
+    """Add/remove one model from the whitelist. Emptying it turns it off."""
+    return _toggle_identity(_ALLOWED_IDENTITY_SETTING, identity, allowed)
+
+
+def _toggle_identity(setting, identity, on):
+    ident = str(identity or "").strip().lower()
+    cur = _identity_set(setting)
+    if not ident:
+        return cur
+    cur.add(ident) if on else cur.discard(ident)
+    try:
+        config.set_setting(setting, sorted(cur))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return cur
+
+
+def _category_overrides():
+    """User edits to what belongs in a mode. Shape:
+        {"coding": {"add": ["some-model"], "remove": ["qwen3.8-coder"]}}
+
+    model_categories stays a LEAF MODULE with no imports of its own -- that is
+    what lets agentic_chat use it without the app.py cycle -- so the override
+    layer lives here, on top of it, rather than inside it."""
+    try:
+        raw = config.get_setting(_CATEGORY_OVERRIDE_SETTING, {}) or {}
+        if not isinstance(raw, dict):
+            return {}
+        out = {}
+        for key, val in raw.items():
+            if not isinstance(val, dict):
+                continue
+            out[str(key)] = {
+                "add": {str(x).strip().lower() for x in (val.get("add") or []) if str(x).strip()},
+                "remove": {str(x).strip().lower() for x in (val.get("remove") or []) if str(x).strip()},
+            }
+        return out
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def _set_category_member(key, identity, member):
+    """Put a model in a mode, or take it out. Stored by identity, so the choice
+    holds for every provider serving that model."""
+    ident = str(identity or "").strip().lower()
+    if not ident:
+        return {}
+    try:
+        raw = config.get_setting(_CATEGORY_OVERRIDE_SETTING, {}) or {}
+        raw = dict(raw) if isinstance(raw, dict) else {}
+        cur = dict(raw.get(key) or {})
+        add = [str(x) for x in (cur.get("add") or [])]
+        rem = [str(x) for x in (cur.get("remove") or [])]
+        if member:
+            if ident not in add:
+                add.append(ident)
+            rem = [x for x in rem if x != ident]
+        else:
+            if ident not in rem:
+                rem.append(ident)
+            add = [x for x in add if x != ident]
+        raw[key] = {"add": sorted(add), "remove": sorted(rem)}
+        config.set_setting(_CATEGORY_OVERRIDE_SETTING, raw)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return _category_overrides()
 
 
 def _set_model_blocked(pid, model, blocked):
@@ -10663,9 +10974,19 @@ def _model_block_reason(pid, model):
     being unsafe, with nothing pointing at the setting responsible."""
     if not prov.is_model_allowed(model):
         return "Model '%s' is blocked by the safety filter." % model
-    if _is_model_blocked_by_user(pid, model):
-        return "Model '%s/%s' is switched off in Settings." % (pid, model)
-    return None
+    if not _is_model_blocked_by_user(pid, model):
+        return None
+    # Say WHICH list, because "switched off in Settings" sends someone to the
+    # blocklist to look for an entry that was never there -- the model is
+    # simply not on a whitelist they turned on somewhere else.
+    ident = _normalize_model_identity(model)
+    allowed = _allowed_identities()
+    if allowed and ident not in allowed and ident not in _blocked_identities() \
+            and ("%s/%s" % (pid, model)) not in _blocked_models():
+        return ("Model '%s' is not on your model whitelist (%d model(s) allowed). "
+                "Add it in Settings, or clear the whitelist to allow every model."
+                % (ident, len(allowed)))
+    return "Model '%s/%s' is switched off in Settings." % (pid, model)
 
 
 @app.route("/api/agent/test-verification", methods=["GET"])
