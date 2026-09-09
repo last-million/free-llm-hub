@@ -2054,6 +2054,104 @@ def _vision_model_ids(pid):
     return [m for m in (p.get("vision_models") or []) if isinstance(m, str) and m]
 
 
+# How many images one turn may have described for it, and how much of each
+# description to keep. A screenshot is worth a paragraph, not an essay, and a
+# turn carrying twenty images is not a turn that wants twenty paragraphs.
+_VISION_ASSIST_MAX_IMAGES = 4
+_VISION_ASSIST_CHARS = 1200
+_VISION_ASSIST_PROMPT = (
+    "Describe this image for someone who cannot see it. Be concrete and "
+    "specific. If it is a screenshot or a UI, transcribe the visible text and "
+    "say what state the interface is in (errors, dialogs, what is selected). "
+    "No preamble."
+)
+
+
+def _message_images(messages):
+    """[(message_index, content_index, url)] for every image part in a turn."""
+    found = []
+    for mi, msg in enumerate(messages or []):
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for ci, part in enumerate(content):
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            url = (part.get("image_url") or {}).get("url")
+            if url:
+                found.append((mi, ci, url))
+    return found
+
+
+def _describe_image(url, est=0):
+    """One image, described by whatever model on the fleet can actually see.
+
+    Routed through the ordinary chain, so it gets the same fallback, key
+    rotation and quota accounting as anything else. Returns "" when nothing can
+    see -- the caller then leaves the turn alone rather than inventing a
+    description of an image nobody looked at."""
+    msgs = [{"role": "user", "content": [
+        {"type": "text", "text": _VISION_ASSIST_PROMPT},
+        {"type": "image_url", "image_url": {"url": url}}]}]
+    for hop_pid, hop_model in _build_chain(None, None, est, require_vision=True,
+                                           messages=msgs)[:3]:
+        try:
+            payload = {"model": hop_model, "messages": msgs,
+                       "max_tokens": 400, "stream": False}
+            resp = _dispatch_chat(hop_pid, payload, False)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+            if isinstance(text, str) and text.strip():
+                return text.strip()[:_VISION_ASSIST_CHARS]
+        except Exception:                                        # noqa: BLE001
+            continue
+    return ""
+
+
+def _vision_assist(messages, est=0):
+    """Replace images with descriptions, so a model that cannot see can still
+    work with what is on the screen.
+
+    WHY THIS EXISTS. An agent driving a browser takes a screenshot and hands it
+    back to itself. If that agent is pinned to a model with no vision -- which
+    is the normal case, because a CLI pins the model it was told to use -- the
+    image is either dropped or sent to something that cannot read it, and the
+    agent proceeds blind while believing it looked.
+
+    Routing already sends an UNPINNED image request to a vision model. This is
+    the pinned case, and the answer is not to override the pin: it is to let a
+    model that can see do the looking, and give the pinned model words.
+
+    Returns (messages, n) and NEVER raises: if nothing on the fleet can see, the
+    turn goes through untouched rather than failing."""
+    shots = _message_images(messages)
+    if not shots:
+        return messages, 0
+    out = [dict(m) if isinstance(m, dict) else m for m in messages]
+    done = 0
+    for mi, ci, url in shots[:_VISION_ASSIST_MAX_IMAGES]:
+        try:
+            described = _describe_image(url, est)
+        except Exception:                                        # noqa: BLE001
+            described = ""
+        if not described:
+            continue
+        # Clipped HERE as well as in _describe_image. The bound belongs at the
+        # point of use: this is what goes into someone's context window, and it
+        # should hold however the text arrived.
+        described = described.strip()[:_VISION_ASSIST_CHARS]
+        content = list(out[mi].get("content") or [])
+        content[ci] = {"type": "text",
+                       "text": "[image, described by a vision model because the "
+                               "model answering this turn cannot see images]\n"
+                               + described}
+        out[mi]["content"] = content
+        done += 1
+    return (out, done) if done else (messages, 0)
+
+
 def _is_vision_model(pid, model):
     """Can this model actually read an image?
 
@@ -18166,6 +18264,26 @@ def _chat_completions_uncached(body):
     # a stand-in for _build_chain never has to know about a parameter it does
     # not see.
     _pin_kw = {"pinned": True} if not _is_orchestrate(body.get("model")) else {}
+    # A PINNED model that cannot see, handed an image. Routing sends an
+    # unpinned image request to a vision model already; a pin is the caller
+    # saying which model answers, and overriding it would be answering a
+    # different question. So the image is described by something that CAN see
+    # and the pinned model is given words. See _vision_assist.
+    if has_images and _pin_kw:
+        # _resolve_model, not a hand-rolled split: it is what the rest of the
+        # handler uses, it knows sub-* providers, and it returns
+        # (None, message) for anything it cannot resolve.
+        _pin_pid, _pin_model = _resolve_model(body.get("model"))
+        if _pin_pid and prov.get_provider(_pin_pid)                 and not _is_vision_model(_pin_pid, _pin_model):
+            # This handler carries the turn in body["messages"], not a local.
+            _msgs, _described = _vision_assist(body.get("messages"), est)
+            if _described:
+                body["messages"] = _msgs
+                has_images = bool(_message_images(_msgs))
+                # An image is worth thousands of tokens and a paragraph a few
+                # hundred: routing the rewritten turn on the old estimate would
+                # size it for a request that no longer exists.
+                est = _est_tokens(_msgs, body.get("tools"))
     if not _pin_kw:
         router = _route_for_vision if has_images else _route_by_difficulty
         _rkw = {}
