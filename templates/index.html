@@ -1580,6 +1580,55 @@
   .wn-empty{margin:0;font-size:12.5px;color:var(--text-faint);line-height:1.5}
   .wn-actions{justify-content:flex-end;align-items:center}
 
+  /* ---------- Getting started ----------
+     Centred, and narrow on purpose: this is the one page read as prose rather
+     than scanned as a dashboard, and a 1600px-wide line of explanation is not
+     read by anyone. */
+  .tut{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:26px}
+  .tut-block{display:flex;flex-direction:column;gap:8px}
+  .tut-h{margin:0;font-size:16px;font-weight:700;letter-spacing:-.01em}
+  .tut-p{margin:0;font-size:13px;color:var(--text-faint);line-height:1.55}
+  .tut-video{position:relative;width:100%;aspect-ratio:16/9;border-radius:12px;
+    overflow:hidden;border:1px solid var(--border-soft);background:#000;margin-top:4px}
+  .tut-video iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+  .tut-steps{margin:6px 0 0;padding:0;list-style:none;counter-reset:tut;
+    display:flex;flex-direction:column;gap:12px}
+  .tut-steps li{counter-increment:tut;display:grid;
+    grid-template-columns:28px 1fr;gap:12px;align-items:start;
+    font-size:13px;line-height:1.55}
+  .tut-steps li::before{content:counter(tut);grid-row:span 2;
+    width:26px;height:26px;border-radius:50%;display:grid;place-items:center;
+    background:var(--accent);color:#fff;font-size:12px;font-weight:700}
+  .tut-steps li b{display:block}
+  .tut-steps li span{color:var(--text-faint)}
+  .tut-list{margin:4px 0 0;padding-left:18px;font-size:13px;line-height:1.65;
+    color:var(--text-faint)}
+  .tut-list b{color:var(--text)}
+
+  .tut-deck{border:1px solid var(--border-soft);border-radius:12px;
+    background:var(--surface);padding:16px;margin-top:4px}
+  .tut-slides{min-height:132px;display:grid}
+  .tut-slide{grid-area:1/1;display:flex;flex-direction:column;gap:7px;
+    opacity:0;visibility:hidden;transition:opacity .18s ease}
+  .tut-slide.on{opacity:1;visibility:visible}
+  .tut-slide h4{margin:0;font-size:15px;font-weight:700}
+  .tut-slide p{margin:0;font-size:13px;line-height:1.6;color:var(--text-faint)}
+  .tut-slide .tut-when{font-size:12px;color:var(--text-dim)}
+  .tut-controls{display:flex;align-items:center;gap:10px;margin-top:14px}
+  .tut-dots{flex:1;display:flex;flex-wrap:wrap;gap:6px;justify-content:center}
+  .tut-dot{width:8px;height:8px;border-radius:50%;border:0;padding:0;cursor:pointer;
+    background:var(--border);transition:background .15s ease,transform .15s ease}
+  .tut-dot:hover{background:var(--text-faint)}
+  .tut-dot[aria-selected="true"]{background:var(--accent);transform:scale(1.25)}
+  .tut-dot:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  @media (prefers-reduced-motion:reduce){
+    .tut-slide,.tut-dot{transition:none}
+  }
+  @media (max-width:600px){
+    .tut{gap:20px}
+    .tut-deck{padding:12px}
+  }
+
   /* ---------- export/import modal contents ---------- */
   .export-opts{display:flex;flex-direction:column;gap:9px}
   .export-opts label{display:flex;align-items:center;gap:9px;font-size:13px;color:var(--text);cursor:pointer}
@@ -2432,8 +2481,7 @@
       <button class="cx-group-label" type="button" aria-expanded="true" aria-controls="grp-hub"><span class="gl-text">Hub</span><svg class="gl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
       <div class="cx-group-body" id="grp-hub">
       <a class="cx-nav-item" href="/hub" data-view="sec-lifecycle" data-title="Hub controls"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="2" y1="14" x2="6" y2="14"/><line x1="10" y1="8" x2="14" y2="8"/><line x1="18" y1="16" x2="22" y2="16"/></svg><span>Hub controls</span></a>
-      <a class="cx-nav-item" href="/activity" data-view="sec-activity" data-title="Live activity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span>Activity</span></a>
-      <a class="cx-nav-item" href="/tutorial-ar" data-view="sec-tutorial" data-title="Tutorial AR"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg><span>Tutorial AR</span><span class="nav-new-badge" data-new-key="tutorial_ar_video_v1">New</span></a></div>
+      <a class="cx-nav-item" href="/activity" data-view="sec-activity" data-title="Live activity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg><span>Activity</span></a></div>
     </div>
     <div class="cx-group" data-group="generate">
       <button class="cx-group-label" type="button" aria-expanded="true" aria-controls="grp-generate"><span class="gl-text">Generate</span><svg class="gl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
@@ -2455,6 +2503,11 @@
       <a class="cx-nav-item" href="/quota" data-view="sec-quota" data-title="Free quota"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg><span>Free quota</span></a>
       <a class="cx-nav-item" href="/usage" data-view="sec-usage" data-title="Daily usage"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg><span>Usage</span></a>
       <a class="cx-nav-item" href="/tracking" data-view="sec-tracking" data-title="Model tracking"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.9 4.9l2.9 2.9M16.2 16.2l2.9 2.9M4.9 19.1l2.9-2.9M16.2 7.8l2.9-2.9"/></svg><span>Tracking</span></a></div>
+    </div>
+    <div class="cx-group" data-group="learn">
+      <button class="cx-group-label" type="button" aria-expanded="true" aria-controls="grp-learn"><span class="gl-text">Learn</span><svg class="gl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+      <div class="cx-group-body" id="grp-learn">
+      <a class="cx-nav-item" href="/tutorial-ar" data-view="sec-tutorial" data-title="Getting started"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><span>Getting started</span></a></div>
     </div>
   </nav>
   <div class="cx-side-settings">
@@ -2620,17 +2673,89 @@
   <!-- Connected tools — the primary surface: the only section expanded by default -->
 
 
-  <!-- Tutorial (Arabic) -->
+  <!-- Getting started: the one page that assumes you know nothing. -->
   <section class="section" aria-labelledby="h-tutorial">
     <div class="section-h">
-      <h2 id="h-tutorial" tabindex="-1">Tutorial AR</h2>
-      <span class="sub">video walkthrough &mdash; in Arabic</span>
+      <h2 id="h-tutorial" tabindex="-1">Getting started</h2>
+      <span class="sub">what to do first, and what every page here is for</span>
     </div>
     <div class="section-body" id="sec-tutorial">
-      <div class="yt-embed">
-        <iframe width="560" height="315" src="https://www.youtube.com/embed/T_HS_Yl77SA?si=WI3c-uaXRgzgL3sq" title="Calvoun Free LLM Hub tutorial (Arabic)" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+      <div class="tut">
+
+        <div class="tut-block">
+          <h3 class="tut-h">Watch it once</h3>
+          <p class="tut-p">A full walkthrough. Spoken in Arabic; the dashboard
+            itself is in English, so it is followable either way.</p>
+          <div class="tut-video">
+            <iframe src="https://www.youtube.com/embed/T_HS_Yl77SA?si=WI3c-uaXRgzgL3sq"
+                    title="Calvoun Free LLM Hub tutorial (Arabic)" loading="lazy"
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                    referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+          </div>
+        </div>
+
+        <div class="tut-block">
+          <h3 class="tut-h">Four steps to a working hub</h3>
+          <p class="tut-p">In order. Nothing else matters until these are done.</p>
+          <ol class="tut-steps">
+            <li>
+              <b>Add a provider key.</b>
+              <span>Open <a href="/providers" data-tut-nav="sec-providers">Providers</a>
+              and paste a key into any card. Several providers need no signup at
+              all &mdash; those cards say so and work immediately.</span>
+            </li>
+            <li>
+              <b>Check it answers.</b>
+              <span>Press <b>Test</b> on that card. It sends one real request, so
+              a key that is wrong or a model that is gone says so now rather than
+              in the middle of your work.</span>
+            </li>
+            <li>
+              <b>Connect a tool.</b>
+              <span>On the same page, press <b>Connect</b> next to a CLI you have
+              installed. It edits that tool's own config file and keeps a backup
+              you can restore with <b>Disconnect</b>.</span>
+            </li>
+            <li>
+              <b>Ask it something.</b>
+              <span>Use your CLI as normal, or try
+              <a href="/chat" data-tut-nav="sec-chat">Quick chat</a> here first.
+              Watch it land in <a href="/activity" data-tut-nav="sec-activity">Activity</a>.</span>
+            </li>
+          </ol>
+        </div>
+
+        <div class="tut-block">
+          <h3 class="tut-h">What each page is for</h3>
+          <p class="tut-p">Twelve pages, one at a time.</p>
+          <div class="tut-deck" id="tut-deck" role="group" aria-roledescription="carousel"
+               aria-label="What each page does">
+            <div class="tut-slides" id="tut-slides"></div>
+            <div class="tut-controls">
+              <button class="btn sm ghost" id="tut-prev" type="button" aria-label="Previous">&larr;</button>
+              <div class="tut-dots" id="tut-dots" role="tablist" aria-label="Choose a page"></div>
+              <button class="btn sm ghost" id="tut-next" type="button" aria-label="Next">&rarr;</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="tut-block">
+          <h3 class="tut-h">If something is wrong</h3>
+          <ul class="tut-list">
+            <li><b>A CLI says it cannot connect.</b> The hub has to be running &mdash;
+              check <a href="/hub" data-tut-nav="sec-lifecycle">Hub controls</a>.</li>
+            <li><b>Answers stopped.</b> Look at
+              <a href="/quota" data-tut-nav="sec-quota">Free quota</a>: a provider
+              may simply be out for today. Adding a second key to the same provider
+              doubles the allowance.</li>
+            <li><b>A model keeps failing.</b>
+              <a href="/tracking" data-tut-nav="sec-tracking">Tracking</a> shows what
+              the router currently believes about every model, including what it has
+              sidelined and why.</li>
+          </ul>
+        </div>
+
       </div>
-      <p class="cli-help">In Arabic. Also linked from the <a href="https://www.youtube.com/watch?v=T_HS_Yl77SA" target="_blank" rel="noopener noreferrer">README on GitHub</a>.</p>
     </div>
   </section>
 
@@ -10846,8 +10971,116 @@
     openModal('What changed', body);
   }
 
+  /* ---------- Getting started: the page deck ----------
+     One card at a time, because a wall of twelve descriptions is the thing the
+     reader was trying to avoid by coming here. Keyboard and dots both work,
+     and every card links to the page it describes. */
+  var TUT_PAGES = [
+    ["Hub controls", "sec-lifecycle",
+     "Start, stop and update the hub, and connect every installed CLI at once.",
+     "Come here when a tool says it cannot reach the hub."],
+    ["Activity", "sec-activity",
+     "Every request as it happens: which model answered, how long it took, and what failed before it.",
+     "The first place to look when something behaved oddly."],
+    ["Quick chat", "sec-chat",
+     "A chat window straight onto the hub, so you can try a model without wiring anything up.",
+     "Good for checking a provider actually works."],
+    ["Build", "sec-agent",
+     "A real coding agent in a project folder, with a file tree and a live preview of what it builds.",
+     "For work you want done rather than answered."],
+    ["Images", "sec-images",
+     "Image generation across the free image providers, with the same failover as text.",
+     "Needs at least one image-capable provider enabled."],
+    ["Providers", "sec-providers",
+     "Every provider and every CLI. Paste keys, press Test, press Connect.",
+     "This is where you start, and where you come back."],
+    ["Subscriptions", "sec-subs",
+     "Use a PAID Claude or Codex plan you already have as a last resort, after the free tiers.",
+     "Off by default. Nothing here runs unless you switch it on."],
+    ["Routing", "sec-default",
+     "Which model the orchestrator reaches for first, and the named chains behind it.",
+     "Change this only once the defaults annoy you."],
+    ["Free quota", "sec-quota",
+     "What is left today, per provider and per key, with the reset countdown.",
+     "Check here first when answers stop."],
+    ["Usage", "sec-usage",
+     "What you have actually spent of the free allowances, day by day.",
+     "Useful for spotting which tool is eating a provider."],
+    ["Tracking", "sec-tracking",
+     "Every model the router knows: score, speed, context limit, and whether it has been sidelined.",
+     "The router's own view, not a marketing list."],
+    ["Settings", "sec-settings",
+     "Theme, models, whitelist and blocklist, running sessions, backup and restore.",
+     "The models panel is the one worth learning."]
+  ];
+
+  function initTutorial(){
+    var slides = document.getElementById('tut-slides');
+    var dots = document.getElementById('tut-dots');
+    if (!slides || !dots || slides.dataset.ready) return;
+    slides.dataset.ready = '1';
+    var at = 0;
+
+    slides.innerHTML = TUT_PAGES.map(function(p, i){
+      return '<article class="tut-slide' + (i === 0 ? ' on' : '') + '" role="tabpanel"' +
+             ' aria-hidden="' + (i === 0 ? 'false' : 'true') + '">' +
+               '<h4>' + esc(p[0]) + '</h4>' +
+               '<p>' + esc(p[2]) + '</p>' +
+               '<p class="tut-when">' + esc(p[3]) + '</p>' +
+               '<p><a href="#" data-tut-nav="' + esc(p[1]) + '">Open ' + esc(p[0]) + ' &rarr;</a></p>' +
+             '</article>';
+    }).join('');
+    dots.innerHTML = TUT_PAGES.map(function(p, i){
+      return '<button class="tut-dot" type="button" role="tab" data-i="' + i + '"' +
+             ' aria-selected="' + (i === 0 ? 'true' : 'false') + '"' +
+             ' aria-label="' + esc(p[0]) + '"></button>';
+    }).join('');
+
+    function show(i){
+      at = (i + TUT_PAGES.length) % TUT_PAGES.length;
+      var cards = slides.querySelectorAll('.tut-slide');
+      for (var j = 0; j < cards.length; j++){
+        cards[j].classList.toggle('on', j === at);
+        cards[j].setAttribute('aria-hidden', j === at ? 'false' : 'true');
+      }
+      var ds = dots.querySelectorAll('.tut-dot');
+      for (var k = 0; k < ds.length; k++){
+        ds[k].setAttribute('aria-selected', k === at ? 'true' : 'false');
+      }
+    }
+    dots.addEventListener('click', function(e){
+      var b = e.target.closest('.tut-dot');
+      if (b) show(parseInt(b.dataset.i, 10));
+    });
+    var prev = document.getElementById('tut-prev'), next = document.getElementById('tut-next');
+    if (prev) prev.addEventListener('click', function(){ show(at - 1); });
+    if (next) next.addEventListener('click', function(){ show(at + 1); });
+    var deck = document.getElementById('tut-deck');
+    if (deck) deck.addEventListener('keydown', function(e){
+      if (e.key === 'ArrowLeft'){ e.preventDefault(); show(at - 1); }
+      if (e.key === 'ArrowRight'){ e.preventDefault(); show(at + 1); }
+    });
+  }
+
+  /* Every "open that page" link inside the tutorial changes the view instead
+     of reloading the whole app -- by clicking the matching SIDEBAR item rather
+     than calling the switcher directly. cxShowView is a closure inside the SPA
+     IIFE and is not exported; reaching for it would have been a link that
+     silently did nothing. This reuses the one path that is already wired,
+     already handles history, and is already tested. */
+  document.addEventListener('click', function(e){
+    var link = e.target.closest('[data-tut-nav]');
+    if (!link) return;
+    var view = link.getAttribute('data-tut-nav');
+    var item = document.querySelector('.cx-nav-item[data-view="' + view + '"]');
+    if (!item) return;               // unknown view: let the href do its job
+    e.preventDefault();
+    item.click();
+  });
+
   /* ---------- boot ---------- */
   initScrollTop();
+  initTutorial();
   initModal();
   initLifecycle();
   initChat();
