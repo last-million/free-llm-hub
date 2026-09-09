@@ -160,20 +160,33 @@ def test_an_unpinned_request_is_left_to_routing():
     assert "_pin_kw" in src[i:i + 60]
 
 
-def test_the_pin_is_never_overridden():
-    """A pin is the caller saying which model answers this turn."""
+def _assist_block():
+    """The vision-assist branch of the chat handler, scoped to the BRANCH
+    rather than to a byte count -- a window measured in characters fails the
+    moment someone writes a longer comment inside it, which says nothing about
+    whether the behaviour is still there."""
     src = open("app.py", encoding="utf-8").read()
     i = src.index("if has_images and _pin_kw:")
-    block = src[i:i + 700]
-    assert 'body = dict(body, messages=messages)' in block
-    assert '"model"' not in block.split("_vision_assist")[1][:200], \
-        "the pinned model must not be rewritten"
+    return src[i:src.index("\n    if not _pin_kw:", i)]
+
+
+def test_the_pin_is_never_overridden():
+    """A pin is the caller saying which model answers this turn. Only the
+    MESSAGES are rewritten."""
+    block = _assist_block()
+    assert 'body["messages"]' in block
+    after = block.split("_vision_assist")[1]
+    assert 'body["model"]' not in after, "the pinned model must not be rewritten"
 
 
 def test_the_size_estimate_is_recomputed():
-    """An image is worth thousands of tokens and a paragraph is worth a few
-    hundred; routing the compacted turn on the old estimate would send it to a
-    model chosen for a request that no longer exists."""
-    src = open("app.py", encoding="utf-8").read()
-    i = src.index("if has_images and _pin_kw:")
-    assert "_est_tokens(" in src[i:i + 700]
+    """An image is worth thousands of tokens and a paragraph a few hundred;
+    routing the rewritten turn on the old estimate would size it for a request
+    that no longer exists."""
+    assert "est = _est_tokens(" in _assist_block()
+
+
+def test_the_image_flag_is_recomputed_too():
+    """Once the images are gone the turn is no longer an image turn, and every
+    later decision reads that flag."""
+    assert "has_images = bool(_message_images(" in _assist_block()
