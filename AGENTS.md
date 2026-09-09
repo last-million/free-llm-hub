@@ -190,12 +190,9 @@ Both added 2026-07-31 at user request; covered by `tests/test_prompt_enhance.py`
 
 ## Agent skills (.agents/skills/)
 
-Kimi Code scans `.agents/skills/` (directory form `<name>/SKILL.md`). Two
-vendored skills live here:
+Kimi Code scans `.agents/skills/` (directory form `<name>/SKILL.md`). One
+vendored skill lives here:
 
-- `i-have-adhd/` (MIT, github.com/ayghri/i-have-adhd) — always-on output
-  style; `disable-model-invocation` was dropped on vendoring so it
-  auto-applies. Off switch: "stop adhd mode".
 - `last30days/` (MIT, github.com/mvanhorn/last30days-skill v3.18.4,
   MODIFIED — see its `VENDORED.md`) — last-30-days web research, keyless by
   default (web + YouTube + public Reddit). X/social/authenticated sources are

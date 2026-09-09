@@ -4,7 +4,6 @@ Covers:
   - GET/POST /api/web-search-policy reflects and toggles the persisted
     `social_web_search` flag (isolated config, no network).
   - .agents/skills/ vendors exist with valid frontmatter (name+description).
-  - i-have-adhd keeps model auto-invocation ENABLED (always-on output style).
   - last30days SKILL.md documents the hub policy endpoint and the
     keyless-by-default rule.
 
@@ -113,20 +112,12 @@ def test_web_search_policy_post_requires_control_header(isolated_config, monkeyp
 # ---------------------------------------------------------------- vendored skills
 
 def test_vendored_skills_exist_with_valid_frontmatter():
-    for name in ("i-have-adhd", "last30days"):
+    for name in ("last30days",):
         path = os.path.join(SKILLS_DIR, name, "SKILL.md")
         assert os.path.isfile(path), path
         fm = _frontmatter(path)
         assert _fm_value(fm, "name") == name
         assert _fm_value(fm, "description")
-
-
-def test_i_have_adhd_auto_invocation_not_disabled():
-    fm = _frontmatter(os.path.join(SKILLS_DIR, "i-have-adhd", "SKILL.md"))
-    assert "disable-model-invocation" not in fm
-    assert "disableModelInvocation" not in fm
-    # Attribution kept
-    assert os.path.isfile(os.path.join(SKILLS_DIR, "i-have-adhd", "LICENSE"))
 
 
 def test_last30days_keyless_gating_documented():
