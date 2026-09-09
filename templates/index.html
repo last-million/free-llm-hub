@@ -1580,6 +1580,32 @@
   .wn-empty{margin:0;font-size:12.5px;color:var(--text-faint);line-height:1.5}
   .wn-actions{justify-content:flex-end;align-items:center}
 
+  /* ---------- today's free quota, shown where it is needed ----------
+     It had one page of its own. But "answers stopped" is noticed on Activity,
+     and "what have I spent" is the question Usage is open for -- so the answer
+     belongs on both, not one click away. Same numbers, same source
+     (/api/status), rendered small. */
+  .qt{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;
+    margin-bottom:12px;padding:10px 12px;border:1px solid var(--border-soft);
+    border-radius:10px;background:var(--surface);font-size:12px}
+  .qt[hidden]{display:none!important}
+  .qt-big{font-weight:700;font-variant-numeric:tabular-nums}
+  .qt-lbl{opacity:.65}
+  .qt-sep{width:1px;align-self:stretch;background:var(--border-soft)}
+  .qt-provs{display:flex;flex-wrap:wrap;gap:6px;flex:1;min-width:0}
+  .qt-prov{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;
+    border-radius:999px;border:1px solid var(--border);font-size:11px;
+    font-variant-numeric:tabular-nums}
+  .qt-prov.low{border-color:var(--warn-border,var(--border))}
+  .qt-prov.out{border-color:var(--danger);color:var(--danger)}
+  .qt-bar{width:34px;height:4px;border-radius:2px;background:var(--border);
+    overflow:hidden;flex:none}
+  .qt-bar i{display:block;height:100%;background:var(--accent)}
+  .qt-prov.low .qt-bar i{background:var(--warn-text,var(--accent))}
+  .qt-prov.out .qt-bar i{background:var(--danger)}
+  .qt-note{opacity:.6;font-size:11px}
+  @media (max-width:600px){ .qt{font-size:11.5px} }
+
   /* ---------- Getting started ----------
      Centred, and narrow on purpose: this is the one page read as prose rather
      than scanned as a dashboard, and a 1600px-wide line of explanation is not
@@ -3237,6 +3263,7 @@
       <span class="sec-chip" id="chip-activity" hidden></span>
     </div>
     <div class="section-body" id="sec-activity">
+      <div class="qt" id="qt-activity"></div>
       <div class="af-panel">
         <div class="af-list" id="activity-list" aria-live="polite">
           <div class="skel skel-row"></div>
@@ -3271,6 +3298,7 @@
       <span class="sec-chip" id="chip-usage" hidden></span>
     </div>
     <div class="section-body" id="sec-usage">
+      <div class="qt" id="qt-usage"></div>
       <div class="usage-panel">
         <div class="usage-bar">
           <label for="usage-day">Day</label>
@@ -4497,6 +4525,9 @@
 
   /* rebuild the local quota model from a /api/status payload, then render both pieces */
   function ingestStatus(s){
+    /* The quota strip on Activity and Usage rides the poll that already
+       happens, rather than adding a request of its own. */
+    try { renderQuotaToday(s && s.quota); } catch (e) {}
     var q = (s && s.quota && typeof s.quota === 'object') ? s.quota : {};
     quotaState = {};
     Object.keys(q).forEach(function(pid){
@@ -10969,6 +11000,110 @@
        X must still count as "shown", or it comes straight back. */
     try { localStorage.setItem('flh.whatsNewAt', String(Date.now())); } catch(e){}
     openModal('What changed', body);
+  }
+
+  /* ---------- today's free quota ----------
+     Reads /api/status, which the dashboard already polls: the per-provider
+     quota rows there carry used / limit / remaining / resets_in, and are the
+     same numbers routing itself decides on.
+
+     HONEST ABOUT WHAT IS NOT KNOWN. Most free tiers do not publish a limit, so
+     `limit_known` is false for them and `remaining` is null. Summing those as
+     zero would invent a number; they are counted separately and said out loud
+     instead. */
+  function _qtNum(n){
+    n = Number(n);
+    if (!isFinite(n)) return '0';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k';
+    return String(Math.round(n));
+  }
+
+  function renderQuotaToday(quota){
+    var hosts = [document.getElementById('qt-activity'),
+                 document.getElementById('qt-usage')].filter(Boolean);
+    if (!hosts.length) return;
+    var rows = [];
+    if (quota && typeof quota === 'object'){
+      Object.keys(quota).forEach(function(pid){
+        var q = quota[pid];
+        if (q && typeof q === 'object') rows.push([pid, q]);
+      });
+    }
+    if (!rows.length){
+      hosts.forEach(function(h){ h.hidden = true; });
+      return;
+    }
+    var used = 0, limit = 0, remaining = 0, metered = 0, unmetered = 0, out = 0;
+    rows.forEach(function(pair){
+      var q = pair[1];
+      used += Number(q.used) || 0;
+      if (q.limit_known && Number(q.limit) > 0){
+        metered++;
+        limit += Number(q.limit) || 0;
+        remaining += Math.max(0, Number(q.remaining) || 0);
+      } else {
+        unmetered++;
+      }
+      if (q.exhausted) out++;
+    });
+
+    /* Worth showing first: what is nearly gone, then what is most used. A list
+       of forty providers helps nobody. */
+    var interesting = rows.filter(function(pair){
+      var q = pair[1];
+      return q.exhausted || (q.limit_known && Number(q.limit) > 0) || Number(q.used) > 0;
+    }).sort(function(a, b){
+      var qa = a[1], qb = b[1];
+      var fa = (qa.limit_known && qa.limit) ? (Number(qa.remaining) || 0) / qa.limit : 2;
+      var fb = (qb.limit_known && qb.limit) ? (Number(qb.remaining) || 0) / qb.limit : 2;
+      if (qa.exhausted !== qb.exhausted) return qa.exhausted ? -1 : 1;
+      if (fa !== fb) return fa - fb;
+      return (Number(qb.used) || 0) - (Number(qa.used) || 0);
+    }).slice(0, 8);
+
+    var chips = interesting.map(function(pair){
+      var pid = pair[0], q = pair[1];
+      var known = q.limit_known && Number(q.limit) > 0;
+      var frac = known ? Math.max(0, Math.min(1, (Number(q.remaining) || 0) / q.limit)) : null;
+      var cls = q.exhausted ? ' out' : (frac !== null && frac < 0.2 ? ' low' : '');
+      var bar = known
+        ? '<span class="qt-bar" aria-hidden="true"><i style="width:' +
+          Math.round(frac * 100) + '%"></i></span>'
+        : '';
+      var text = q.exhausted ? 'out'
+        : known ? (_qtNum(q.remaining) + ' left')
+        : (_qtNum(q.used) + ' used');
+      var reset = (q.resets_in != null && q.resets_in > 0)
+        ? (' \u00b7 resets in ' + fmtCountdown(q.resets_in)) : '';
+      return '<span class="qt-prov' + cls + '" title="' +
+             esc((q.name || pid) + ' \u2014 ' + _qtNum(q.used) + ' used' +
+                 (known ? (' of ' + _qtNum(q.limit)) : ' (no published limit)') + reset) +
+             '">' + esc(q.name || pid) + ' ' + bar + ' ' + esc(text) + '</span>';
+    }).join('');
+
+    var head =
+      '<span class="qt-lbl">Today</span>' +
+      '<span class="qt-big">' + _qtNum(used) + '</span><span class="qt-lbl">used</span>' +
+      (metered
+        ? ('<span class="qt-sep" aria-hidden="true"></span>' +
+           '<span class="qt-big">' + _qtNum(remaining) + '</span>' +
+           '<span class="qt-lbl">left across ' + metered +
+           ' metered provider' + (metered === 1 ? '' : 's') + '</span>')
+        : '') +
+      (out ? ('<span class="qt-sep" aria-hidden="true"></span>' +
+              '<span class="qt-big" style="color:var(--danger)">' + out + '</span>' +
+              '<span class="qt-lbl">out of quota</span>') : '');
+    var note = unmetered
+      ? '<span class="qt-note">' + unmetered +
+        ' provider' + (unmetered === 1 ? '' : 's') +
+        ' publish no limit, so only what you used is known for them.</span>'
+      : '';
+
+    hosts.forEach(function(h){
+      h.hidden = false;
+      h.innerHTML = head + '<div class="qt-provs">' + chips + '</div>' + note;
+    });
   }
 
   /* ---------- Getting started: the page deck ----------
