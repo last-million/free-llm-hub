@@ -811,8 +811,14 @@ def aggregated_models():
     as a pickable option in the dashboard's Chat/Test playground, not just
     reachable via an explicit pin from an external client."""
     out = []
-    for pid in _enabled_keyed():
-        for m in provider_free_models(pid):
+    # Catalogs CONCURRENTLY. This is what /v1/models is built from, and it is
+    # the FIRST thing a CLI calls -- MEASURED 2026-09-09 at 16.9s cold, fetched
+    # one provider at a time, which is long enough that opencode gives up and
+    # reports "Unable to connect. Is the computer able to access the url".
+    # Free-only, deliberately: this list is shown to a user and _auto_models
+    # would fold in paid ids depending on _auto_provider_mode.
+    for pid, models in _prefetch_free_models(list(_enabled_keyed())).items():
+        for m in models:
             out.append({"id": pid + "/" + m, "provider": pid, "model": m})
     for pid in _sub_available_providers():
         for m in _sub_models(pid):
