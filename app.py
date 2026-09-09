@@ -5579,11 +5579,27 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         _available_providers(), require_tools, messages)
     _too_small = []          # skipped for SIZE ALONE -- see the tail at the end
     _needs_compaction = []   # ...and the per-MODEL version of the same thing
+    # CATALOGS CONCURRENTLY, once, for every provider this call will look at --
+    # including the too-small ones, which the compaction tail at the end walks
+    # again. _auto_models is a live, network-bound /models fetch on a cold or
+    # expired cache entry, and it was being called one provider at a time inside
+    # the loop below.
+    #
+    # MEASURED 2026-09-09: 16 providers, _build_chain COLD 14.26s and WARM
+    # 0.55s. Every request pays that before its FIRST hop is dispatched, which
+    # is most of what a CLI sees as the hub being slow to answer.
+    # _route_by_difficulty already prefetched this way for exactly this reason;
+    # the chain never did.
+    #
+    # Same data, same order, same filters -- only the fetching is parallel. The
+    # cache is keyed per-pid so there is nothing to race, only wall-clock to
+    # save.
+    _catalogs = _prefetch_auto_models(list(_cand_pids))
     for pid in _cand_pids:
         if not _provider_capable(pid, est):
             _too_small.append(pid)
             continue
-        for m in _auto_models(pid):
+        for m in _catalogs.get(pid) or []:
             if (pid, m) in seen or not prov.is_model_allowed(m) or _is_model_dead(pid, m):
                 continue
             if _veto and _normalize_model_identity(m) in _veto:
@@ -5768,7 +5784,7 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # no answer at all is not an answer.
     if _too_small and len(chain) < MAX_HOPS:
         for pid in _too_small:
-            _pool = [m for m in _auto_models(pid)
+            _pool = [m for m in (_catalogs.get(pid) or [])
                      if (pid, m) not in seen
                      and prov.is_model_allowed(m)
                      and not _is_model_dead(pid, m)
