@@ -9926,6 +9926,21 @@ def api_status():
         s = quota.status(pid)
         s["name"] = p.get("name", pid)
         s["models"] = quota.models(pid)  # {model_id: used_count} this window
+        # HOW MANY KEYS THIS ALLOWANCE IS BUILT FROM. quota.status already
+        # scales `limit` by the key count (see _limit_for: n = key_count(pid)),
+        # so a provider with four keys correctly reports four times the daily
+        # limit -- but nothing said so, which made a big number look like a
+        # mistake rather than the point of adding a second account.
+        # `no_key` marks an open gateway: no signup, still a real allowance,
+        # and it belongs in the same list rather than looking absent. (The flag
+        # is `no_key` -- checked against providers.py rather than guessed;
+        # `needs_key` does not exist and read as False for everything, which
+        # silently labelled every provider as keyed.)
+        try:
+            s["keys"] = quota.key_count(pid)
+        except Exception:                                        # noqa: BLE001
+            s["keys"] = 1
+        s["keyless"] = bool(p.get("no_key"))
         q[pid] = s
         if s["exhausted"]:
             exhausted += 1

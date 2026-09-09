@@ -73,7 +73,7 @@ def test_a_provider_with_no_published_limit_is_not_counted_as_zero():
     body = SRC[i:i + 5000]
     assert "limit_known" in body
     assert "unmetered" in body
-    assert "publish no limit" in body
+    assert "publish no daily limit" in body
 
 
 def test_exhausted_providers_are_called_out():
@@ -87,12 +87,46 @@ def test_the_reset_countdown_is_shown():
     assert "resets_in" in SRC[i:i + 5000]
 
 
-def test_the_list_is_capped_and_ordered_by_what_matters():
-    """Forty provider chips help nobody; what is nearly gone comes first."""
+def test_every_provider_is_listed():
+    """The first cut showed a top-8 and the report was immediate: "i connected
+    many providers and i dont see all of them there, i see only 7". A quota
+    panel that hides providers is one you cannot trust."""
     i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 5000]
-    assert ".slice(0, 8)" in body
-    assert "sort(" in body
+    body = SRC[i:i + 6000]
+    assert ".slice(0," not in body, "still truncating the provider list"
+    assert "sort(" in body, "what is nearly gone should still come first"
+
+
+def test_the_list_scrolls_instead_of_truncating():
+    rule = _rule(".qt-provs")
+    assert "overflow-y:auto" in rule and "max-height" in rule
+
+
+def test_pooled_keys_are_shown():
+    """quota.status already multiplies the daily limit by the key count, so a
+    provider with four keys reports four times the allowance -- and nothing
+    said so, which made a big number look like a bug instead of the reason to
+    add a second account."""
+    i = SRC.index("function renderQuotaToday(")
+    body = SRC[i:i + 6000]
+    assert "q.keys" in body
+    assert "keys pooled" in body
+
+
+def test_open_gateways_are_labelled_not_hidden():
+    i = SRC.index("function renderQuotaToday(")
+    body = SRC[i:i + 6000]
+    assert "keyless" in body and "no API key needed" in body
+
+
+def test_the_daily_total_names_both_halves():
+    """"how much used" and "how much remaining" were the ask, and a total with
+    no denominator answers neither."""
+    i = SRC.index("function renderQuotaToday(")
+    body = SRC[i:i + 6000]
+    assert "requests used" in body
+    assert "of ' + _qtNum(limit)" in body
+    assert "providers, " in body
 
 
 def test_nothing_is_shown_when_there_is_nothing_to_show():
@@ -132,4 +166,36 @@ def test_the_bars_are_hidden_from_screen_readers():
 def test_each_chip_carries_the_full_numbers_in_its_title():
     i = SRC.index("function renderQuotaToday(")
     body = SRC[i:i + 5000]
-    assert "title=" in body and "no published limit" in body
+    assert "title=" in body and "publishes no daily limit" in body
+
+
+def test_the_key_count_reaches_the_dashboard():
+    """The strip cannot show what /api/status does not send."""
+    src = io.open("app.py", encoding="utf-8").read()
+    # Scoped to the loop body rather than a byte count: a window measured in
+    # characters fails the moment someone writes a longer comment inside it,
+    # which says nothing about whether the field is still sent.
+    i = src.index('s["models"] = quota.models(pid)')
+    block = src[i:src.index("q[pid] = s", i)]
+    assert 's["keys"] = quota.key_count(pid)' in block
+    assert 's["keyless"] = bool(p.get("no_key"))' in block
+
+
+def test_a_missing_key_counter_does_not_break_status():
+    src = io.open("app.py", encoding="utf-8").read()
+    i = src.index('s["keys"] = quota.key_count(pid)')
+    assert "except Exception" in src[i:i + 300]
+
+
+def test_open_gateways_are_detected_by_the_flag_that_exists():
+    """`no_key` is what providers.py actually sets. An earlier pass guessed
+    `needs_key`, which does not exist -- so it read False for every provider
+    and quietly labelled the keyless ones as keyed."""
+    import providers
+    src = io.open("app.py", encoding="utf-8").read()
+    assert 's["keyless"] = bool(p.get("no_key"))' in src
+    keyless = [pid for pid, v in providers.PROVIDERS.items()
+               if isinstance(v, dict) and v.get("no_key")]
+    assert keyless, "providers.py no longer marks any open gateway"
+    for pid in ("pollinations", "llm7", "kilocode"):
+        assert pid in keyless, pid

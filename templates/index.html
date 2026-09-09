@@ -1592,7 +1592,12 @@
   .qt-big{font-weight:700;font-variant-numeric:tabular-nums}
   .qt-lbl{opacity:.65}
   .qt-sep{width:1px;align-self:stretch;background:var(--border-soft)}
-  .qt-provs{display:flex;flex-wrap:wrap;gap:6px;flex:1;min-width:0}
+  .qt-provs{display:flex;flex-wrap:wrap;gap:6px;width:100%;
+    max-height:112px;overflow-y:auto}
+  .qt-keys{font-size:9.5px;font-weight:800;letter-spacing:.02em;
+    padding:0 4px;border-radius:4px;background:var(--accent);color:#fff}
+  .qt-keys.qt-open{background:var(--border);color:var(--text-dim)}
+  .qt-danger{color:var(--danger)}
   .qt-prov{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;
     border-radius:999px;border:1px solid var(--border);font-size:11px;
     font-variant-numeric:tabular-nums}
@@ -11034,10 +11039,12 @@
       hosts.forEach(function(h){ h.hidden = true; });
       return;
     }
-    var used = 0, limit = 0, remaining = 0, metered = 0, unmetered = 0, out = 0;
+    var used = 0, limit = 0, remaining = 0, metered = 0, unmetered = 0,
+        out = 0, keys = 0;
     rows.forEach(function(pair){
       var q = pair[1];
       used += Number(q.used) || 0;
+      keys += Math.max(1, Number(q.keys) || 1);
       if (q.limit_known && Number(q.limit) > 0){
         metered++;
         limit += Number(q.limit) || 0;
@@ -11048,21 +11055,22 @@
       if (q.exhausted) out++;
     });
 
-    /* Worth showing first: what is nearly gone, then what is most used. A list
-       of forty providers helps nobody. */
-    var interesting = rows.filter(function(pair){
-      var q = pair[1];
-      return q.exhausted || (q.limit_known && Number(q.limit) > 0) || Number(q.used) > 0;
-    }).sort(function(a, b){
+    /* EVERY provider, not a top-N. The first cut showed eight chips and the
+       report was immediate: "i connected many providers and i dont see all of
+       them there, i see only 7". A quota panel that hides providers is a quota
+       panel you cannot trust, so the list wraps and scrolls instead of being
+       truncated. Ordered by what is nearly gone, because that is what changes
+       what you do next. */
+    rows.sort(function(a, b){
       var qa = a[1], qb = b[1];
+      if (!!qa.exhausted !== !!qb.exhausted) return qa.exhausted ? -1 : 1;
       var fa = (qa.limit_known && qa.limit) ? (Number(qa.remaining) || 0) / qa.limit : 2;
       var fb = (qb.limit_known && qb.limit) ? (Number(qb.remaining) || 0) / qb.limit : 2;
-      if (qa.exhausted !== qb.exhausted) return qa.exhausted ? -1 : 1;
       if (fa !== fb) return fa - fb;
       return (Number(qb.used) || 0) - (Number(qa.used) || 0);
-    }).slice(0, 8);
+    });
 
-    var chips = interesting.map(function(pair){
+    var chips = rows.map(function(pair){
       var pid = pair[0], q = pair[1];
       var known = q.limit_known && Number(q.limit) > 0;
       var frac = known ? Math.max(0, Math.min(1, (Number(q.remaining) || 0) / q.limit)) : null;
@@ -11072,32 +11080,45 @@
           Math.round(frac * 100) + '%"></i></span>'
         : '';
       var text = q.exhausted ? 'out'
-        : known ? (_qtNum(q.remaining) + ' left')
+        : known ? (_qtNum(q.remaining) + ' / ' + _qtNum(q.limit))
         : (_qtNum(q.used) + ' used');
+      var nkeys = Math.max(1, Number(q.keys) || 1);
+      /* The key count is the whole reason a limit can be 4000 rather than
+         1000, so it is shown rather than left to look like a mistake. */
+      var keyTag = nkeys > 1
+        ? '<b class="qt-keys" title="' + nkeys + ' API keys pooled for this provider">x'
+          + nkeys + '</b>'
+        : (q.keyless ? '<b class="qt-keys qt-open" title="Open gateway: no API key needed">open</b>' : '');
       var reset = (q.resets_in != null && q.resets_in > 0)
         ? (' \u00b7 resets in ' + fmtCountdown(q.resets_in)) : '';
       return '<span class="qt-prov' + cls + '" title="' +
              esc((q.name || pid) + ' \u2014 ' + _qtNum(q.used) + ' used' +
-                 (known ? (' of ' + _qtNum(q.limit)) : ' (no published limit)') + reset) +
-             '">' + esc(q.name || pid) + ' ' + bar + ' ' + esc(text) + '</span>';
+                 (known ? (' of ' + _qtNum(q.limit) +
+                           (nkeys > 1 ? (' across ' + nkeys + ' keys') : ''))
+                        : ' (this provider publishes no daily limit)') + reset) +
+             '">' + esc(q.name || pid) + keyTag + ' ' + bar + ' ' + esc(text) + '</span>';
     }).join('');
 
     var head =
       '<span class="qt-lbl">Today</span>' +
-      '<span class="qt-big">' + _qtNum(used) + '</span><span class="qt-lbl">used</span>' +
+      '<span class="qt-big">' + _qtNum(used) + '</span>' +
+      '<span class="qt-lbl">requests used' +
+      (limit ? (' of ' + _qtNum(limit) + ' known') : '') + '</span>' +
       (metered
         ? ('<span class="qt-sep" aria-hidden="true"></span>' +
            '<span class="qt-big">' + _qtNum(remaining) + '</span>' +
-           '<span class="qt-lbl">left across ' + metered +
-           ' metered provider' + (metered === 1 ? '' : 's') + '</span>')
+           '<span class="qt-lbl">left</span>')
         : '') +
+      '<span class="qt-sep" aria-hidden="true"></span>' +
+      '<span class="qt-big">' + rows.length + '</span>' +
+      '<span class="qt-lbl">providers, ' + keys + ' key' + (keys === 1 ? '' : 's') +
+      '</span>' +
       (out ? ('<span class="qt-sep" aria-hidden="true"></span>' +
-              '<span class="qt-big" style="color:var(--danger)">' + out + '</span>' +
+              '<span class="qt-big qt-danger">' + out + '</span>' +
               '<span class="qt-lbl">out of quota</span>') : '');
     var note = unmetered
-      ? '<span class="qt-note">' + unmetered +
-        ' provider' + (unmetered === 1 ? '' : 's') +
-        ' publish no limit, so only what you used is known for them.</span>'
+      ? '<span class="qt-note">' + unmetered + ' of them publish no daily limit, ' +
+        'so only what you used is known for those.</span>'
       : '';
 
     hosts.forEach(function(h){
