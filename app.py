@@ -104,7 +104,9 @@ hub_mcp.init(
         "start": lambda goal, project_dir, cli: swarm_windows.start(
             goal, project_dir, cli,
             _swarm_windows_spawn, _swarm_windows_turn,
-            planner=_swarm_windows_planner),
+            planner=_swarm_windows_planner,
+            configure=_swarm_windows_configure,
+            modes=_mode_keys()),
         "status": lambda run_id, events=False: swarm_windows.status(run_id, events),
         "stop": swarm_windows.stop,
     })
@@ -9953,6 +9955,19 @@ def _swarm_windows_spawn(cli_id, project_dir):
     return agentic_chat.start_session(cli_id, project_dir)
 
 
+def _swarm_windows_configure(session_id, mode):
+    """Give one worker its own KIND of model.
+
+    "can also use different best models for the task" -- the planner says what
+    each phase is (code, long files, images), and this turns that into the mode
+    its session runs under, so a coding phase gets a coding model and a phase
+    that has to read a screenshot gets one that can see. The mode is already
+    per-session state (set_session_mode), so nothing new has to be invented to
+    carry it; it takes effect on that session's first turn, which is the only
+    turn it has."""
+    return agentic_chat.set_session_mode(session_id, mode)
+
+
 def _swarm_windows_turn(session_id, text):
     """One worker's turn. `send_message_stream_durable` runs the real turn on
     its own thread and survives its reader going away -- which is exactly what
@@ -9986,7 +10001,9 @@ def api_swarm_windows_start():
             goal, project_dir, cli_id,
             _swarm_windows_spawn, _swarm_windows_turn,
             phases=body.get("phases") or None,
-            planner=_swarm_windows_planner)
+            planner=_swarm_windows_planner,
+            configure=_swarm_windows_configure,
+            modes=_mode_keys())
     except swarm_windows.SwarmWindowsError as exc:
         return _openai_error(str(exc), 400)
     except Exception as exc:                                     # noqa: BLE001
@@ -10801,11 +10818,102 @@ _agent_autoinstall_thread = None
 # is exactly the step agents skip, so it earns the cost.
 _HUB_URL_SENTINEL = "<hub>"     # replaced with _hub_mcp_url() at call time
 
-_ALWAYS_MCP = (
-    ("free-llm-hub", {"url": _HUB_URL_SENTINEL}),
-    ("context7", {"url": "https://mcp.context7.com/mcp"}),
-    ("playwright", {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}),
-)
+# ONE BROWSER, KEPT BETWEEN TURNS.
+#
+# Registered as STDIO, `npx @playwright/mcp` is spawned by the CLI -- and this
+# hub spawns a fresh CLI process for EVERY turn (see agentic_chat: "the CLI is
+# re-spawned for every turn"). So the MCP child died with it, and with it the
+# browser: every turn opened a brand-new browser, logged out, on a blank page.
+# An agent could not click something on turn two that it had navigated to on
+# turn one, which is most of what driving a browser is.
+#
+# @playwright/mcp also runs as a long-lived SSE server (`--port`). One of those,
+# started here and shared by every agent and every turn, is a browser that
+# stays where it was left -- and `--user-data-dir` keeps the profile (logins,
+# cookies) across hub restarts too.
+#
+# Fails OPEN: if node is missing or the server does not come up, the STDIO spec
+# is registered exactly as before, so this is never worse than it was.
+_PLAYWRIGHT_PORT = int(os.environ.get("FREE_LLM_HUB_PLAYWRIGHT_PORT", "8931"))
+_PLAYWRIGHT_STDIO = {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}
+_playwright_url = [None]        # set by _start_playwright_mcp when it is up
+
+
+def _playwright_profile_dir():
+    path = os.path.join(_home(), ".free-llm-hub", "playwright-profile")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return None
+    return path
+
+
+def _playwright_probe(port):
+    """The URL this build of @playwright/mcp actually serves, or None.
+
+    The transport path moved between releases (/sse, then /mcp), and guessing
+    wrong registers an endpoint that every agent fails to reach. Ask."""
+    for path in ("/mcp", "/sse"):
+        try:
+            r = requests.get("http://127.0.0.1:%d%s" % (port, path), timeout=2,
+                             stream=True)
+            r.close()
+            if r.status_code < 500:
+                return "http://127.0.0.1:%d%s" % (port, path)
+        except requests.RequestException:
+            continue
+    return None
+
+
+def _start_playwright_mcp():
+    """Start (or adopt) the shared browser server. Never raises."""
+    try:
+        found = _playwright_probe(_PLAYWRIGHT_PORT)
+        if found:
+            _playwright_url[0] = found          # already running: adopt it
+            _log.info("[playwright] reusing the browser server on %s", found)
+            return
+        if not _which_cli("npx") and not shutil.which("npx"):
+            return                               # no node: stay on STDIO
+        argv = ["npx", "-y", "@playwright/mcp@latest",
+                "--port", str(_PLAYWRIGHT_PORT), "--host", "127.0.0.1"]
+        profile = _playwright_profile_dir()
+        if profile:
+            argv += ["--user-data-dir", profile]
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, creationflags=_CREATE_NO_WINDOW,
+                         shell=(os.name == "nt"))
+        # First run downloads the package, so this waits rather than probing once.
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            found = _playwright_probe(_PLAYWRIGHT_PORT)
+            if found:
+                # Re-probe once it has settled. During start-up /sse can answer
+                # a second before /mcp does, and latching the older transport
+                # on that timing would be luck rather than a choice -- the
+                # probe prefers /mcp, so give it the chance to say so.
+                time.sleep(1.5)
+                found = _playwright_probe(_PLAYWRIGHT_PORT) or found
+                _playwright_url[0] = found
+                _log.info("[playwright] shared browser server ready on %s", found)
+                return
+            time.sleep(1.0)
+        _log.info("[playwright] server did not come up; agents keep the "
+                  "per-turn browser")
+    except Exception as exc:                                     # noqa: BLE001
+        _log.debug("playwright server not started: %s", exc)
+
+
+def _always_mcp():
+    """The servers every agent gets. A function, not a constant, because the
+    playwright entry depends on whether the shared server came up."""
+    playwright = ({"url": _playwright_url[0]} if _playwright_url[0]
+                  else dict(_PLAYWRIGHT_STDIO))
+    return (
+        ("free-llm-hub", {"url": _HUB_URL_SENTINEL}),
+        ("context7", {"url": "https://mcp.context7.com/mcp"}),
+        ("playwright", playwright),
+    )
 
 
 def _ensure_mcp_servers_once():
@@ -10813,7 +10921,7 @@ def _ensure_mcp_servers_once():
     hub's own isolated copies. Idempotent (an existing entry reports 'exists'
     and is left alone) and entirely best-effort -- a CLI that is not installed,
     or a config we refuse to touch, must never affect hub startup."""
-    for name, spec in _ALWAYS_MCP:
+    for name, spec in _always_mcp():
         spec = dict(spec)
         # A stdio server is a command we are asking every CLI to SPAWN. If it
         # is not on PATH, registering it anyway writes an entry into six
@@ -21552,6 +21660,8 @@ if __name__ == "__main__":
     vision_status.start_heartbeat()
     _warm_catalogs_async()     # so the first CLI to ask does not pay the sweep
     _repair_opencode_config()  # a limitless model entry is a session that never compacts
+    threading.Thread(target=_start_playwright_mcp, daemon=True,
+                     name="playwright-mcp").start()   # one browser, kept between turns
     threading.Thread(target=_refresh_codex_catalog, daemon=True,
                      name="codex-catalog").start()   # /model offers the hub's modes
     if not _claim_single_instance():

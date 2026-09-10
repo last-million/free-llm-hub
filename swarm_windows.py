@@ -95,9 +95,13 @@ Rules:
 - "needs" lists earlier phase numbers only (1-based). No self-references.
 - Between 2 and %d phases. Fewer, larger phases beat many tiny ones.
 - Each "task" must be self-contained: an agent cannot ask you a question.
+- "mode" picks the KIND of model that phase gets. Choose from: {modes}.
+  Pick the one that fits the work (writing code, long files, reading images,
+  quick mechanical edits). Leave it out when nothing fits; do not guess.
 
 Reply with JSON only:
-{"goal": "...", "phases": [{"title": "...", "task": "...", "done_when": "...", "needs": []}]}
+{"goal": "...", "phases": [{"title": "...", "task": "...", "done_when": "...",
+                            "needs": [], "mode": "coding"}]}
 """ % MAX_AGENTS
 
 
@@ -121,7 +125,7 @@ def _extract_json(text):
     return None
 
 
-def clean_phases(plan, max_phases=MAX_AGENTS):
+def clean_phases(plan, max_phases=MAX_AGENTS, modes=()):
     """Validated phases, or [] when the plan is unusable.
 
     `needs` is sanitised hard for the same reason swarm._clean_phases does it: a
@@ -148,11 +152,19 @@ def clean_phases(plan, max_phases=MAX_AGENTS):
                     continue
                 if 1 <= n < idx and n not in needs:
                     needs.append(n)
+        # WHICH KIND OF MODEL THIS PHASE GETS. Validated against the modes the
+        # caller actually serves rather than trusted: a planner inventing
+        # "mode": "genius" would otherwise reach set_session_mode and either
+        # fail or, worse, silently restrict a phase to nothing.
+        mode = str(p.get("mode") or "").strip().lower() or None
+        if mode and modes and mode not in modes:
+            mode = None
         out.append({
             "title": str(p.get("title") or ("Phase %d" % idx)).strip()[:80],
             "task": task[:4000],
             "done_when": str(p.get("done_when") or "").strip()[:400],
             "needs": needs,
+            "mode": mode,
         })
     return out if len(out) >= 1 else []
 
@@ -181,8 +193,9 @@ def waves(phases):
 # --------------------------------------------------------------------------- #
 
 class _Agent:
-    __slots__ = ("index", "title", "task", "done_when", "needs", "session_id",
-                 "state", "summary", "error", "started_at", "ended_at", "events")
+    __slots__ = ("index", "title", "task", "done_when", "needs", "mode",
+                 "session_id", "state", "summary", "error", "started_at",
+                 "ended_at", "events")
 
     def __init__(self, index, phase):
         self.index = index
@@ -190,6 +203,7 @@ class _Agent:
         self.task = phase["task"]
         self.done_when = phase.get("done_when") or ""
         self.needs = list(phase.get("needs") or ())
+        self.mode = phase.get("mode") or None
         self.session_id = None
         self.state = PENDING
         self.summary = ""
@@ -202,6 +216,7 @@ class _Agent:
         out = {
             "index": self.index, "title": self.title, "task": self.task,
             "done_when": self.done_when, "needs": list(self.needs),
+            "mode": self.mode,
             "session_id": self.session_id, "state": self.state,
             "summary": self.summary, "error": self.error,
             "started_at": self.started_at, "ended_at": self.ended_at,
@@ -357,7 +372,7 @@ def _drain(agent, events):
     return last_text
 
 
-def _run_agent(run, agent, spawn, run_turn):
+def _run_agent(run, agent, spawn, run_turn, configure=None):
     if run.stop_flag.is_set():
         agent.state = STOPPED
         return
@@ -365,6 +380,16 @@ def _run_agent(run, agent, spawn, run_turn):
     agent.started_at = time.time()
     try:
         agent.session_id = spawn(run.cli_id, run.project_dir)
+        # DIFFERENT MODELS FOR DIFFERENT PHASES. The planner says what kind of
+        # work each phase is; this turns that into the mode its session runs
+        # under, so a code phase gets a coding model and a phase that has to
+        # read a screenshot gets one that can see. Best-effort: a session that
+        # will not take a mode still does its work under the default.
+        if configure and agent.mode:
+            try:
+                configure(agent.session_id, agent.mode)
+            except Exception:                                    # noqa: BLE001
+                pass
         summary = _drain(agent, run_turn(agent.session_id, _agent_prompt(run, agent)))
         agent.summary = (summary or "").strip()
         if run.stop_flag.is_set():
@@ -384,11 +409,12 @@ def _run_agent(run, agent, spawn, run_turn):
         agent.ended_at = time.time()
 
 
-def _run_wave(run, indexes, spawn, run_turn):
+def _run_wave(run, indexes, spawn, run_turn, configure=None):
     threads = []
     for i in indexes[:MAX_CONCURRENT] if len(indexes) > MAX_CONCURRENT else indexes:
         agent = run.agents[i - 1]
-        t = threading.Thread(target=_run_agent, args=(run, agent, spawn, run_turn),
+        t = threading.Thread(target=_run_agent,
+                             args=(run, agent, spawn, run_turn, configure),
                              daemon=True, name="swarm-%s-%d" % (run.id, i))
         t.start()
         threads.append((t, agent))
@@ -421,13 +447,13 @@ def _run_wave(run, indexes, spawn, run_turn):
         time.sleep(0.02)
 
 
-def _walk(run, spawn, run_turn, on_done=None):
+def _walk(run, spawn, run_turn, on_done=None, configure=None):
     try:
         run.state = RUNNING
         for wave in run.waves:
             if run.stop_flag.is_set():
                 break
-            _run_wave(run, wave, spawn, run_turn)
+            _run_wave(run, wave, spawn, run_turn, configure)
         if run.stop_flag.is_set():
             run.state = STOPPED
         elif all(a.state == FAILED for a in run.agents):
@@ -447,20 +473,21 @@ def _walk(run, spawn, run_turn, on_done=None):
                 pass
 
 
-def plan(goal, planner, max_phases=MAX_AGENTS):
+def plan(goal, planner, max_phases=MAX_AGENTS, modes=()):
     """Ask a model to break `goal` into phases. Returns [] when it cannot.
 
     `planner(system, user) -> str` is injected so this can be tested, and so the
     hub's own routing decides which model plans."""
     try:
-        raw = planner(_PLAN_SYSTEM, goal)
+        raw = planner(_PLAN_SYSTEM.replace(
+            "{modes}", ", ".join(modes) if modes else "coding"), goal)
     except Exception:                                            # noqa: BLE001
         return []
-    return clean_phases(_extract_json(raw), max_phases)
+    return clean_phases(_extract_json(raw), max_phases, modes)
 
 
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
-          on_done=None):
+          on_done=None, configure=None, modes=()):
     """Begin a run. Returns the run id immediately; the work happens on a
     background thread.
 
@@ -471,13 +498,13 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     if phases is None:
         if planner is None:
             raise SwarmWindowsError("give either phases or a planner")
-        phases = plan(goal, planner)
-    phases = clean_phases({"phases": phases}) if phases else []
+        phases = plan(goal, planner, modes=modes)
+    phases = clean_phases({"phases": phases}, modes=modes) if phases else []
     if not phases:
         raise SwarmWindowsError("could not turn that into phases")
     run = _Run(goal, project_dir, cli_id, phases)
     _remember(run)
-    threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done),
+    threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure),
                      daemon=True, name="swarm-walk-" + run.id).start()
     return run.id
 
@@ -495,7 +522,7 @@ def result(run_id):
     return {
         "run_id": run.id, "goal": run.goal, "state": run.state,
         "phases": [{"index": a.index, "title": a.title, "state": a.state,
-                    "summary": a.summary, "error": a.error,
+                    "summary": a.summary, "error": a.error, "mode": a.mode,
                     "session_id": a.session_id}
                    for a in run.agents],
         "done": sum(1 for a in run.agents if a.state == DONE),

@@ -586,3 +586,85 @@ def test_the_worker_is_told_there_is_nobody_to_ask():
                    phases=[{"title": "a", "task": "t", "needs": []}])
     _wait(rid)
     assert "nobody to ask" in list(seen.values())[0]
+
+
+# --------------------------------------------------------------------------- #
+# A different kind of model per phase
+# --------------------------------------------------------------------------- #
+
+def test_a_phase_can_name_the_kind_of_model_it_needs():
+    """"can also use different best models for the task"."""
+    ph = SW.clean_phases({"phases": [{"title": "a", "task": "t", "mode": "coding"}]},
+                         modes=("coding", "vision"))
+    assert ph[0]["mode"] == "coding"
+
+
+def test_an_invented_mode_is_dropped():
+    """A planner answering "mode": "genius" would otherwise reach
+    set_session_mode and either fail or silently restrict a phase to nothing."""
+    ph = SW.clean_phases({"phases": [{"title": "a", "task": "t", "mode": "genius"}]},
+                         modes=("coding", "vision"))
+    assert ph[0]["mode"] is None
+
+
+def test_a_phase_may_name_no_mode_at_all():
+    ph = SW.clean_phases({"phases": [{"title": "a", "task": "t"}]}, modes=("coding",))
+    assert ph[0]["mode"] is None
+
+
+def test_the_planner_is_told_which_modes_exist():
+    seen = {}
+
+    def planner(sysmsg, goal):
+        seen["sys"] = sysmsg
+        return '{"phases":[{"title":"A","task":"x"}]}'
+
+    SW.plan("g", planner, modes=("coding", "uncensored"))
+    assert "coding, uncensored" in seen["sys"]
+
+
+def test_the_mode_is_applied_to_that_agents_session():
+    applied = {}
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("ok"),
+                   phases=[{"title": "a", "task": "t", "mode": "coding"}],
+                   configure=lambda sid, mode: applied.update(sid=sid, mode=mode),
+                   modes=("coding",))
+    st = _wait(rid)
+    assert applied.get("mode") == "coding"
+    assert applied.get("sid") == st["agents"][0]["session_id"]
+
+
+def test_a_phase_with_no_mode_configures_nothing():
+    calls = []
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("ok"),
+                   phases=[{"title": "a", "task": "t"}],
+                   configure=lambda sid, mode: calls.append(mode))
+    _wait(rid)
+    assert calls == []
+
+
+def test_a_session_that_refuses_a_mode_still_does_its_work():
+    def boom(sid, mode):
+        raise RuntimeError("no such session")
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("ok"),
+                   phases=[{"title": "a", "task": "t", "mode": "coding"}],
+                   configure=boom, modes=("coding",))
+    assert _wait(rid)["agents"][0]["state"] == SW.DONE
+
+
+def test_the_mode_is_reported():
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("ok"),
+                   phases=[{"title": "a", "task": "t", "mode": "coding"}],
+                   modes=("coding",))
+    st = _wait(rid)
+    assert st["agents"][0]["mode"] == "coding"
+    assert SW.result(rid)["phases"][0]["mode"] == "coding"
+
+
+def test_the_hub_passes_its_real_modes_and_a_configurer():
+    src = open("app.py", encoding="utf-8").read()
+    assert "configure=_swarm_windows_configure" in src
+    assert "modes=_mode_keys()" in src
+    body = src[src.index("def _swarm_windows_configure("):]
+    body = body[:body.index("\ndef ")]
+    assert "set_session_mode" in body

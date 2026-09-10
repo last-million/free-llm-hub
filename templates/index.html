@@ -1580,6 +1580,36 @@
   .wn-empty{margin:0;font-size:12.5px;color:var(--text-faint);line-height:1.5}
   .wn-actions{justify-content:flex-end;align-items:center}
 
+  /* ---------- multi swarm windows, on the agent page ---------- */
+  .agent-swarm{display:flex;flex-direction:column;gap:10px;padding:12px 0}
+  .sw-start{display:flex;gap:8px;flex-wrap:wrap}
+  .sw-start input{flex:1;min-width:220px;padding:8px 11px;border-radius:9px;
+    border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px}
+  .sw-start input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .sw-runs{display:flex;flex-direction:column;gap:10px}
+  .sw-run{border:1px solid var(--border-soft);border-radius:11px;
+    background:var(--surface);padding:11px 13px}
+  .sw-run-h{display:flex;align-items:center;gap:9px;flex-wrap:wrap;font-size:12.5px}
+  .sw-goal{flex:1;min-width:0;font-weight:600;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .sw-state{font-size:10.5px;font-weight:800;padding:1px 7px;border-radius:5px;
+    background:var(--bg-soft,rgba(127,127,127,.12))}
+  .sw-state.done{color:var(--accent)}
+  .sw-state.failed{color:var(--danger)}
+  .sw-state.running{color:var(--warn-text,inherit)}
+  .sw-phases{display:flex;flex-direction:column;gap:5px;margin-top:9px}
+  .sw-phase{display:grid;grid-template-columns:18px 1fr auto;gap:9px;
+    align-items:start;font-size:12px;line-height:1.45}
+  .sw-dot{width:9px;height:9px;border-radius:50%;margin-top:4px;background:var(--border)}
+  .sw-phase.done .sw-dot{background:var(--accent)}
+  .sw-phase.failed .sw-dot{background:var(--danger)}
+  .sw-phase.running .sw-dot{background:var(--warn-text,var(--accent))}
+  .sw-title{font-weight:600}
+  .sw-sum{display:block;opacity:.7;font-size:11.5px}
+  .sw-mode{font-size:10px;font-weight:700;padding:0 5px;border-radius:4px;
+    border:1px solid var(--border);opacity:.75}
+  @media (prefers-reduced-motion:reduce){ .sw-dot{transition:none} }
+
   /* ---------- today's free quota, shown where it is needed ----------
      It had one page of its own. But "answers stopped" is noticed on Activity,
      and "what have I spent" is the question Usage is open for -- so the answer
@@ -2858,6 +2888,22 @@
         <div class="seg-toggle" id="agent-view-toggle" role="tablist" aria-label="Chat CLI view">
           <button type="button" class="seg-btn" id="agent-view-session" role="tab" aria-selected="true">Session</button>
           <button type="button" class="seg-btn" id="agent-view-history" role="tab" aria-selected="false">History</button>
+          <button type="button" class="seg-btn" id="agent-view-swarm" role="tab" aria-selected="false">Swarm</button>
+        </div>
+
+        <!-- Multi swarm windows: several real agent sessions at once. -->
+        <div class="agent-swarm" id="agent-swarm" hidden>
+          <p class="cli-help">Several agents at once, each in its own session and
+            its own context window, in the background. The work is split into
+            phases and a phase waits for whatever it depends on.</p>
+          <div class="sw-start">
+            <input id="sw-goal" type="text" autocomplete="off"
+                   placeholder="What should the swarm build? e.g. a landing page with a contact form"
+                   aria-label="Swarm goal">
+            <button class="btn primary" id="sw-go" type="button">Start swarm</button>
+          </div>
+          <p class="sd-help" id="sw-where">Uses the folder of the session you have open.</p>
+          <div class="sw-runs" id="sw-runs"></div>
         </div>
 
         <div id="agent-session-tab" role="tabpanel">
@@ -8227,16 +8273,26 @@
       return id === 'claude' ? 'Claude Code' : id === 'codex' ? 'ChatGPT Codex' : (id || '?');
     }
 
+    var viewSwarmBtn = $('#agent-view-swarm');
+    var swarmTab = $('#agent-swarm');
+
+    /* Three tabs now, so this is a switch on WHICH rather than a boolean. The
+       two-way version read `!toSession` for history, which would have made the
+       swarm tab and the history tab the same thing. */
     function switchTab(which){
-      var toSession = which === 'session';
-      viewSessionBtn.setAttribute('aria-selected', String(toSession));
-      viewHistoryBtn.setAttribute('aria-selected', String(!toSession));
-      sessionTab.hidden = !toSession;
-      historyTab.hidden = toSession;
-      if (!toSession) loadAgentHistory();
+      var tabs = {session: sessionTab, history: historyTab, swarm: swarmTab};
+      var btns = {session: viewSessionBtn, history: viewHistoryBtn, swarm: viewSwarmBtn};
+      Object.keys(tabs).forEach(function(k){
+        if (tabs[k]) tabs[k].hidden = (k !== which);
+        if (btns[k]) btns[k].setAttribute('aria-selected', String(k === which));
+      });
+      if (which === 'history') loadAgentHistory();
+      if (which === 'swarm' && window.pollSwarm) window.pollSwarm();
+      else if (window.stopSwarmPoll) window.stopSwarmPoll();
     }
     viewSessionBtn.addEventListener('click', function(){ switchTab('session'); });
     viewHistoryBtn.addEventListener('click', function(){ switchTab('history'); });
+    if (viewSwarmBtn) viewSwarmBtn.addEventListener('click', function(){ switchTab('swarm'); });
 
     function showStartState(){
       sessionId = null;
@@ -8256,6 +8312,10 @@
 
     var curProjectDir = null;
     function currentProjectDir(){ return curProjectDir; }
+    /* Exported for the Swarm panel, which lives outside this IIFE: a swarm
+       works in the folder of the session you already have open, so the path
+       does not have to be typed a second time. */
+    window.cxAgentProjectDir = currentProjectDir;
 
     /* The CLI picker and workspace-mode toggle choose what a session WILL be;
        once one is running they are inert, and they were costing ~150px of
@@ -11013,6 +11073,107 @@
     openModal('What changed', body);
   }
 
+  /* ---------- multi swarm windows ----------
+     The orchestrator is driven from any CLI over MCP and from scripts/swarm.py
+     in a shell; this is the same thing on the page where the project already
+     is, so the folder does not have to be typed again. Polls only while the
+     tab is open and something is still running. */
+  var _swTimer = null;
+
+  function initAgentSwarm(){
+    var go = document.getElementById('sw-go');
+    var goal = document.getElementById('sw-goal');
+    if (!go || !goal || go.dataset.ready) return;
+    go.dataset.ready = '1';
+
+    function start(){
+      var text = (goal.value || '').trim();
+      if (!text){ toast('Say what the swarm should build', true); return; }
+      var dir = (window.cxAgentProjectDir && window.cxAgentProjectDir()) || '';
+      if (!dir){ toast('Open or create a session first \u2014 the swarm works in its folder', true); return; }
+      go.disabled = true;
+      api('/api/swarm-windows', { method: 'POST',
+          body: { goal: text, project_dir: dir, cli: 'opencode' } })
+        .then(function(run){
+          goal.value = '';
+          toast('Swarm started \u2014 ' + (run.total || 0) + ' phases');
+          renderSwarmRuns([run]);
+          pollSwarm();
+        })
+        .catch(function(e){ toast(e.message, true); })
+        .then(function(){ go.disabled = false; });
+    }
+    go.addEventListener('click', start);
+    goal.addEventListener('keydown', function(e){
+      if (e.key === 'Enter'){ e.preventDefault(); start(); }
+    });
+  }
+
+  function renderSwarmRuns(runs){
+    var host = document.getElementById('sw-runs');
+    if (!host) return;
+    if (!runs || !runs.length){
+      host.innerHTML = '<div class="sd-empty">No swarm has run in this hub yet.</div>';
+      return;
+    }
+    host.innerHTML = runs.map(function(r){
+      var phases = (r.agents || []).map(function(a){
+        var sum = a.summary
+          ? '<span class="sw-sum">' + esc(String(a.summary).split(/\r?\n/)[0].slice(0, 160)) + '</span>'
+          : (a.error ? '<span class="sw-sum">' + esc(String(a.error).slice(0, 160)) + '</span>' : '');
+        var needs = (a.needs && a.needs.length)
+          ? ' <span class="sw-sum">after ' + a.needs.join(', ') + '</span>' : '';
+        return '<div class="sw-phase ' + esc(a.state) + '">' +
+                 '<span class="sw-dot" aria-hidden="true"></span>' +
+                 '<span><span class="sw-title">' + esc(a.title) + '</span>' + needs + sum + '</span>' +
+                 (a.mode ? '<span class="sw-mode">' + esc(a.mode) + '</span>' : '<span></span>') +
+               '</div>';
+      }).join('');
+      var stopBtn = (r.state === 'running' || r.state === 'pending')
+        ? '<button class="btn sm ghost" data-sw-stop="' + esc(r.run_id) + '">Stop</button>' : '';
+      return '<div class="sw-run">' +
+               '<div class="sw-run-h">' +
+                 '<span class="sw-goal" title="' + esc(r.goal || '') + '">' + esc(r.goal || '') + '</span>' +
+                 '<span class="sw-state ' + esc(r.state) + '">' + esc(r.state) + '</span>' +
+                 '<span class="sw-sum">' + (r.done || 0) + '/' + (r.total || 0) + '</span>' +
+                 stopBtn +
+               '</div>' +
+               '<div class="sw-phases">' + phases + '</div>' +
+             '</div>';
+    }).join('');
+    host.querySelectorAll('[data-sw-stop]').forEach(function(b){
+      b.addEventListener('click', function(){
+        b.disabled = true;
+        api('/api/swarm-windows/' + encodeURIComponent(b.getAttribute('data-sw-stop')),
+            { method: 'DELETE' })
+          .then(function(){ pollSwarm(); })
+          .catch(function(e){ toast(e.message, true); b.disabled = false; });
+      });
+    });
+  }
+
+  function pollSwarm(){
+    var pane = document.getElementById('agent-swarm');
+    if (!pane || pane.hidden){ stopSwarmPoll(); return; }
+    api('/api/swarm-windows').then(function(d){
+      var runs = (d && d.runs) || [];
+      renderSwarmRuns(runs);
+      var live = runs.some(function(r){ return r.state === 'running' || r.state === 'pending'; });
+      /* Only while something is actually working: a finished board does not
+         need to be re-fetched every three seconds forever. */
+      if (live && !_swTimer) _swTimer = setInterval(pollSwarm, 3000);
+      if (!live) stopSwarmPoll();
+    }).catch(function(){ stopSwarmPoll(); });
+  }
+
+  function stopSwarmPoll(){
+    if (_swTimer){ clearInterval(_swTimer); _swTimer = null; }
+  }
+  /* The agent tab switcher lives in its own IIFE and has to start and stop
+     this; these two are the whole contract between them. */
+  window.pollSwarm = pollSwarm;
+  window.stopSwarmPoll = stopSwarmPoll;
+
   /* ---------- today's free quota ----------
      Reads /api/status, which the dashboard already polls: the per-provider
      quota rows there carry used / limit / remaining / resets_in, and are the
@@ -11243,6 +11404,7 @@
   /* ---------- boot ---------- */
   initScrollTop();
   initTutorial();
+  initAgentSwarm();
   initModal();
   initLifecycle();
   initChat();
