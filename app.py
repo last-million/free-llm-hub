@@ -21754,6 +21754,16 @@ if __name__ == "__main__":
         _log.warning("could not sweep preview ports: %s", exc)
     workspace.start_reaper()   # stop previews nobody is watching
     _load_perf_stats()         # measured reliability/latency from previous runs
+    try:
+        # Swarm runs outlive the process that started them. The hub restarts
+        # itself every five hours to git pull, and before this a swarm that
+        # finished at hour four left nothing behind at hour five: no result to
+        # read back, and any run still going became a thread nobody could find.
+        back = swarm_windows.load()
+        if back:
+            _log.info("restored %d swarm run(s) from disk", back)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("could not restore swarm runs: %s", exc)
     _maybe_auto_create_desktop_shortcut()
     _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()

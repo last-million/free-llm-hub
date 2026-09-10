@@ -26,6 +26,7 @@ app.py passes agentic_chat.start_session and send_message_stream_durable, these
 tests pass fakes. That is also why this module imports neither app nor
 agentic_chat: the same cycle-avoidance the rest of the codebase uses.
 """
+import os
 import threading
 import time
 
@@ -35,7 +36,11 @@ import swarm_windows as SW
 
 
 @pytest.fixture(autouse=True)
-def _clean():
+def _clean(tmp_path, monkeypatch):
+    # Runs are written to disk now, so every test gets its own directory --
+    # otherwise the suite would file two hundred swarm runs into the user's own
+    # hub state and then evict the real ones past MAX_RUNS.
+    monkeypatch.setenv(SW._STORE_ENV, str(tmp_path / "runs"))
     SW._RUNS.clear()
     yield
     for run in list(SW._RUNS.values()):
@@ -745,3 +750,165 @@ def test_it_is_on_by_default():
     rid = SW.start("g", ".", "opencode", _spawn, _turn("ok"), phases=PHASES)
     st = _wait(rid, timeout=20)
     assert [a for a in st["agents"] if a["title"] == SW.REVIEW_TITLE]
+
+
+# --------------------------------------------------------------------------- #
+# A run outlives the process that started it
+# --------------------------------------------------------------------------- #
+
+def test_a_finished_run_is_on_disk():
+    """REQUESTED: "memory management ... and also persistence ... nothing can
+    escape". The hub restarts itself every five hours to git pull; before this,
+    a swarm that finished at hour four was gone at hour five."""
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("the summary"),
+                   phases=PHASES, review=False)
+    _wait(rid)
+    assert os.path.isfile(SW._run_path(rid))
+
+
+def test_it_reads_back_after_a_restart():
+    rid = SW.start("build the thing", ".", "opencode", _spawn, _turn("the summary"),
+                   phases=PHASES, review=False)
+    _wait(rid)
+    SW._RUNS.clear()                      # the restart
+    assert SW.status(rid) is None
+    assert SW.load() == 1
+    st = SW.status(rid)
+    assert st["state"] == SW.DONE
+    assert st["goal"] == "build the thing"
+    assert [a["summary"] for a in st["agents"]] == ["the summary"] * 3
+
+
+def test_the_result_still_reads_back():
+    """What the orchestrator actually pastes into its own context."""
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("did it"), phases=PHASES,
+                   review=False)
+    _wait(rid)
+    SW._RUNS.clear()
+    SW.load()
+    assert "did it" in SW.format_result(rid)
+
+
+def test_a_restored_run_says_so():
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("x"), phases=PHASES,
+                   review=False)
+    _wait(rid)
+    SW._RUNS.clear()
+    SW.load()
+    assert SW.status(rid)["restored"] is True
+
+
+def test_a_worker_s_log_survives_too():
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("x"), phases=PHASES,
+                   review=False)
+    _wait(rid)
+    SW._RUNS.clear()
+    SW.load()
+    st = SW.status(rid, with_events=True)
+    assert any(e.get("text") == "working" for e in st["agents"][0]["log"])
+
+
+def test_only_a_tail_of_the_log_is_written():
+    """The ring holds 400 raw CLI events per agent; writing all of them to disk
+    on every phase boundary is a build transcript per swarm."""
+    def chatty(session_id, prompt):
+        for i in range(SW.PERSIST_EVENTS + 40):
+            yield {"event": "message", "text": "line %d" % i}
+
+    rid = SW.start("g", ".", "opencode", _spawn, chatty,
+                   phases=[{"title": "a", "task": "t", "needs": []}], review=False)
+    _wait(rid)
+    SW._RUNS.clear()
+    SW.load()
+    log = SW.status(rid, with_events=True)["agents"][0]["log"]
+    assert len(log) <= SW.PERSIST_EVENTS
+
+
+def test_a_run_interrupted_by_the_restart_is_not_still_running():
+    """Nothing is walking it any more. Left alone it would display as live for
+    the rest of the hub's life."""
+    row = {"run_id": "swarm-abc123", "goal": "g", "state": SW.RUNNING,
+           "project_dir": ".", "cli": "opencode", "created_at": time.time(),
+           "agents": [{"index": 1, "title": "a", "task": "t", "needs": [],
+                       "state": SW.RUNNING}]}
+    run = SW._Run.from_row(row)
+    assert run.state == SW.FAILED
+    assert run.agents[0].state == SW.FAILED
+    assert "restart" in run.agents[0].error
+
+
+def test_a_live_run_outranks_its_own_file():
+    """load() runs at startup, but a run started since must never be clobbered
+    by the snapshot of it written a moment earlier."""
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("live"), phases=PHASES,
+                   review=False)
+    _wait(rid)
+    SW.load()
+    assert SW.status(rid)["restored"] is False
+
+
+def test_evicting_a_run_removes_its_file_too():
+    """Or the directory becomes the unbounded thing MAX_RUNS exists to stop."""
+    ids = []
+    for _ in range(SW.MAX_RUNS + 6):
+        rid = SW.start("g", ".", "opencode", _spawn, _turn("x"),
+                       phases=[{"title": "a", "task": "t", "needs": []}],
+                       review=False)
+        _wait(rid, timeout=5)
+        ids.append(rid)
+    files = [n for n in os.listdir(SW._store_root()) if n.endswith(".json")]
+    assert len(files) <= SW.MAX_RUNS + 1
+
+
+def test_a_corrupt_run_file_is_skipped_not_fatal():
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("good"), phases=PHASES,
+                   review=False)
+    _wait(rid)
+    with open(os.path.join(SW._store_root(), "swarm-broken.json"), "w",
+              encoding="utf-8") as fh:
+        fh.write("{ not json")
+    SW._RUNS.clear()
+    assert SW.load() == 1
+    assert SW.status(rid) is not None
+
+
+def test_loading_from_nothing_is_not_an_error():
+    assert SW.load() == 0
+
+
+def test_a_run_that_cannot_be_written_still_runs(monkeypatch, tmp_path):
+    """Best-effort, like every other memory in this hub: a swarm never fails
+    because the record of it could not be written. A file where the directory
+    should be: makedirs cannot win."""
+    blocker = tmp_path / "blocked"
+    blocker.write_text("i am a file, not a directory", encoding="utf-8")
+    monkeypatch.setenv(SW._STORE_ENV, str(blocker / "inside"))
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("still works"),
+                   phases=PHASES, review=False)
+    st = _wait(rid)
+    assert st["state"] == SW.DONE
+
+
+def test_a_run_id_can_never_name_a_file_outside_the_store():
+    assert SW._run_path("../../etc/passwd") is None
+    assert SW._run_path("") is None
+
+
+# --------------------------------------------------------------------------- #
+# Every phase gets the model its mode asked for -- including past the cap
+# --------------------------------------------------------------------------- #
+
+def test_the_fifth_phase_is_configured_too():
+    """MAX_CONCURRENT is 4, so phases 5+ start from the queue -- and the queue
+    was starting them without `configure`, which is how the fifth phase, and
+    only ever the fifth, ran under the default model instead of its own."""
+    seen = {}
+    flat = [{"title": str(i), "task": "t", "needs": [], "mode": "coding"}
+            for i in range(SW.MAX_CONCURRENT + 2)]
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("ok"), phases=flat,
+                   review=False,
+                   configure=lambda sid, mode: seen.__setitem__(sid, mode))
+    st = _wait(rid, timeout=20)
+    assert st["done"] == len(flat)
+    assert len(seen) == len(flat), "only %d of %d phases were configured" % (
+        len(seen), len(flat))

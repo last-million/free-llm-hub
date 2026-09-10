@@ -44,7 +44,9 @@ member must never take the run with it. A phase whose dependencies failed still
 runs -- it simply gets less context, which every agent prompt already tolerates.
 """
 import json
+import os
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -98,6 +100,110 @@ _LOCK = threading.RLock()
 # Runs are kept so their transcripts stay readable after they finish; without a
 # cap a long-lived hub accumulates every swarm it ever ran.
 MAX_RUNS = 20
+
+# WHERE A RUN LIVES BETWEEN RESTARTS.
+#
+# `_RUNS` is RAM, and the hub restarts itself every five hours to `git pull`.
+# A swarm that took twenty minutes and finished at hour four vanished with it:
+# no result to read back, no record it ever happened, and any run still going
+# became a thread nobody could find. One JSON file per run fixes all three.
+#
+# REQUESTED: "memory management, and also context window, and also persistence,
+# and also the orchestrator ... nothing can escape".
+_STORE_ENV = "FREE_LLM_HUB_SWARM_DIR"
+# How much of each worker's log is kept on disk. The full ring is EVENT_BUFFER
+# (400) entries of raw CLI output per agent; persisting all of it would write a
+# build transcript to disk on every phase. The tail is what a human reads when
+# a phase failed -- the summaries, which are what the ORCHESTRATOR reads, are
+# kept whole.
+PERSIST_EVENTS = 60
+
+
+def _store_root():
+    env = os.environ.get(_STORE_ENV)
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    return os.path.join(os.path.expanduser("~"), ".free-llm-hub", "swarm-runs")
+
+
+def _run_path(run_id):
+    rid = str(run_id or "")
+    # Run ids are generated here (`swarm-` + hex) and never come from a user,
+    # but this builds a filename, so it is checked like one anyway.
+    if not re.match(r"^[A-Za-z0-9_-]{1,64}$", rid):
+        return None
+    return os.path.join(_store_root(), rid + ".json")
+
+
+def _persist(run):
+    """Write one run to disk. Best-effort: a swarm never fails because the
+    record of it could not be written."""
+    path = _run_path(getattr(run, "id", None))
+    if not path:
+        return False
+    try:
+        row = run.row(with_events=True)
+        for a in row.get("agents") or ():
+            log = a.get("log") or []
+            a["log"] = log[-PERSIST_EVENTS:]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(row, fh, ensure_ascii=False)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _forget_file(run_id):
+    path = _run_path(run_id)
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def load():
+    """Read persisted runs back into memory. Called once at hub startup.
+
+    A run that was still RUNNING when the process died has no thread walking it
+    any more, and nothing will ever move it on -- so it is marked failed here
+    rather than left displaying as live forever. Not resumable: its workers were
+    CLI sessions belonging to a process that no longer exists."""
+    root = _store_root()
+    try:
+        names = sorted(n for n in os.listdir(root) if n.endswith(".json"))
+    except OSError:
+        return 0
+    loaded = 0
+    for name in names:
+        try:
+            with open(os.path.join(root, name), encoding="utf-8") as fh:
+                row = json.load(fh)
+            run = _Run.from_row(row)
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+        if not run:
+            continue
+        with _LOCK:
+            if run.id in _RUNS:
+                continue                       # a live run outranks its file
+            _RUNS[run.id] = run
+        loaded += 1
+        if run.interrupted:
+            _persist(run)
+    _evict()
+    return loaded
 
 
 class SwarmWindowsError(Exception):
@@ -274,7 +380,8 @@ class _Agent:
 
 class _Run:
     __slots__ = ("id", "goal", "project_dir", "cli_id", "agents", "state",
-                 "error", "created_at", "ended_at", "stop_flag", "lock", "waves")
+                 "error", "created_at", "ended_at", "stop_flag", "lock", "waves",
+                 "restored", "interrupted")
 
     def __init__(self, goal, project_dir, cli_id, phases):
         self.id = "swarm-" + uuid.uuid4().hex[:12]
@@ -289,6 +396,10 @@ class _Run:
         self.ended_at = None
         self.stop_flag = threading.Event()
         self.lock = threading.RLock()
+        # True for a run read back from disk: it has no thread behind it, so it
+        # can be read but never advances.
+        self.restored = False
+        self.interrupted = False
 
     def row(self, with_events=False):
         return {
@@ -301,16 +412,84 @@ class _Run:
             "done": sum(1 for a in self.agents if a.state == DONE),
             "failed": sum(1 for a in self.agents if a.state == FAILED),
             "total": len(self.agents),
+            "restored": self.restored,
         }
+
+    @classmethod
+    def from_row(cls, row):
+        """Rebuild a run from what row() wrote, so every reader -- status,
+        result, format_result, the settings page -- works on a restored run
+        without knowing it is one."""
+        if not isinstance(row, dict) or not row.get("run_id"):
+            return None
+        phases = [{"title": a.get("title") or "?", "task": a.get("task") or "",
+                   "done_when": a.get("done_when") or "",
+                   "needs": list(a.get("needs") or ()), "mode": a.get("mode")}
+                  for a in (row.get("agents") or ())
+                  if isinstance(a, dict)]
+        if not phases:
+            return None
+        run = cls(row.get("goal") or "", row.get("project_dir") or "",
+                  row.get("cli") or "", phases)
+        run.id = str(row["run_id"])
+        run.state = row.get("state") or DONE
+        run.error = row.get("error")
+        run.created_at = float(row.get("created_at") or time.time())
+        run.ended_at = row.get("ended_at")
+        run.waves = [list(w) for w in (row.get("waves") or ())] or run.waves
+        run.restored = True
+        for agent, a in zip(run.agents, row.get("agents") or ()):
+            agent.session_id = a.get("session_id")
+            agent.state = a.get("state") or PENDING
+            agent.summary = a.get("summary") or ""
+            agent.error = a.get("error")
+            agent.started_at = a.get("started_at")
+            agent.ended_at = a.get("ended_at")
+            for e in (a.get("log") or ()):
+                agent.events.append(e)
+        # Nothing is walking this run any more. Leaving a worker RUNNING would
+        # show a swarm as live for the rest of the hub's life.
+        for agent in run.agents:
+            if agent.state in (PENDING, RUNNING):
+                agent.state = FAILED
+                agent.error = agent.error or "interrupted by a hub restart"
+                agent.ended_at = agent.ended_at or time.time()
+                run.interrupted = True
+        if run.state in (PENDING, RUNNING):
+            run.state = FAILED
+            run.error = run.error or "interrupted by a hub restart"
+            run.ended_at = run.ended_at or time.time()
+            run.interrupted = True
+        if run.interrupted:
+            run.stop_flag.set()
+        return run
+
+
+def _evict():
+    """Drop the oldest finished runs past the cap, from memory AND from disk.
+
+    Both, or the directory becomes the unbounded thing the cap exists to
+    prevent -- a hub that has run a thousand swarms keeping a thousand files."""
+    dropped = []
+    with _LOCK:
+        if len(_RUNS) <= MAX_RUNS:
+            return []
+        for rid, r in sorted(_RUNS.items(), key=lambda kv: kv[1].created_at):
+            if len(_RUNS) <= MAX_RUNS:
+                break
+            if r.state in (DONE, FAILED, STOPPED):
+                _RUNS.pop(rid, None)
+                dropped.append(rid)
+    for rid in dropped:
+        _forget_file(rid)
+    return dropped
 
 
 def _remember(run):
     with _LOCK:
         _RUNS[run.id] = run
-        if len(_RUNS) > MAX_RUNS:
-            for rid, r in sorted(_RUNS.items(), key=lambda kv: kv[1].created_at):
-                if r.state in (DONE, FAILED, STOPPED) and len(_RUNS) > MAX_RUNS:
-                    _RUNS.pop(rid, None)
+    _persist(run)
+    _evict()
 
 
 def get(run_id):
@@ -341,6 +520,7 @@ def stop(run_id):
         if run.state in (PENDING, RUNNING):
             run.state = STOPPED
             run.ended_at = time.time()
+    _persist(run)
     return True
 
 
@@ -452,6 +632,10 @@ def _run_agent(run, agent, spawn, run_turn, configure=None):
         agent.error = "%s: %s" % (exc.__class__.__name__, exc)
     finally:
         agent.ended_at = time.time()
+        # Every phase boundary, not every event: a phase is the unit of work
+        # worth surviving a restart, and its summary is what the orchestrator
+        # reads back.
+        _persist(run)
 
 
 def _run_wave(run, indexes, spawn, run_turn, configure=None):
@@ -483,7 +667,14 @@ def _run_wave(run, indexes, spawn, run_turn, configure=None):
         while queued and len(threads) < MAX_CONCURRENT:
             i = queued.pop(0)
             agent = run.agents[i - 1]
-            t = threading.Thread(target=_run_agent, args=(run, agent, spawn, run_turn),
+            # `configure` HAS to be passed here too. Without it, every phase
+            # past the concurrency cap silently ran under the default model
+            # instead of the one its mode asked for -- so a plan with five
+            # phases gave the fifth the wrong model, and only ever the fifth,
+            # which is exactly the kind of bug that never shows up in a
+            # three-phase test.
+            t = threading.Thread(target=_run_agent,
+                                 args=(run, agent, spawn, run_turn, configure),
                                  daemon=True, name="swarm-%s-%d" % (run.id, i))
             t.start()
             threads.append((t, agent))
@@ -511,6 +702,7 @@ def _walk(run, spawn, run_turn, on_done=None, configure=None):
         run.error = "%s: %s" % (exc.__class__.__name__, exc)
     finally:
         run.ended_at = time.time()
+        _persist(run)
         if on_done:
             try:
                 on_done(run)
