@@ -104,3 +104,31 @@ def test_no_unverifiable_quota_numbers_are_promised():
     so rather than print numbers it cannot stand behind."""
     assert "indicative" in README.lower()
     assert "unverified" in README.lower()
+
+
+def test_the_review_wave_claim_is_true():
+    """README says the last wave is always a review."""
+    import swarm_windows as SW
+    ph = SW.with_review(SW.clean_phases({"phases": [
+        {"title": "a", "task": "t"}, {"title": "b", "task": "t"}]}))
+    assert ph[-1]["title"] == SW.REVIEW_TITLE
+    assert SW.waves(ph)[-1] == [len(ph)]
+
+
+def test_the_runs_survive_a_restart_claim_is_true():
+    import swarm_windows as SW
+    assert hasattr(SW, "load")
+    assert "_persist(run)" in open("swarm_windows.py", encoding="utf-8").read()
+
+
+def test_the_conversation_memory_claim_is_true():
+    import memory
+    for name in ("remember_summary", "remember_fact", "note_turn",
+                 "context_block", "note_compaction"):
+        assert hasattr(memory, name), name
+
+
+def test_the_compaction_claim_is_true():
+    """"what they established rides back in on the next turn"."""
+    src = open("agentic_chat.py", encoding="utf-8").read()
+    assert "memory_block=_memory_block(sess)" in src

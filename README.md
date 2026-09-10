@@ -151,6 +151,17 @@ what it depends on. Drive it from any CLI over MCP, or from a shell:
 python scripts/swarm.py start "build the landing page" --dir ./site --watch
 ```
 
+The last wave is always a review: one agent that reads what every other phase
+produced, opens the actual files, and fixes what does not line up between them.
+Runs are written to disk as they go, so a swarm that finished while the hub was
+restarting is still there afterwards.
+
+**Conversations that remember.** A running summary, the decisions worth not
+re-deciding, and a durable turn count, one small JSON file per conversation.
+It survives the restart the context window does not: when compaction drops old
+turns, what they established rides back in on the next turn instead of being
+gone.
+
 **Local-first with a real threat model.** AES-256-GCM at rest, a control token
 on every `/api/*`, bound to `127.0.0.1`, and no telemetry of any kind.
 
