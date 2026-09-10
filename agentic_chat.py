@@ -2634,6 +2634,80 @@ def send_message_stream(session_id, text):
         sess.turn_lock.release()
 
 
+
+# --------------------------------------------------------------------------- #
+# Keeping an agent going to the end of the job
+# --------------------------------------------------------------------------- #
+#
+# REPORTED 2026-09-10: "pourquoi les agents ne continuent pas et ils s'arretent
+# et ils continuent pas jusqu'au bout".
+#
+# A CLI agent ends its turn when IT decides it is done, and the common failure
+# is that it decides that in the middle: it writes a todo list, does the first
+# item, describes the next one, and stops. Nothing was broken -- the process
+# exited zero, the reply was recorded, and the work is half finished. Until now
+# the only fix was a human typing "continue".
+#
+# The hub already knows a turn ended and already has the machinery to send
+# another. So it reads the reply, and when the reply itself says the work is
+# not finished, it sends the nudge instead of waiting for someone to notice.
+#
+# Deliberately narrow, because the failure mode of the opposite mistake is a
+# CLI running forever on a job that IS done:
+#   * it stops at _MAX_AUTO_CONTINUE, always;
+#   * a reply that asks a QUESTION is never continued -- being asked something
+#     is the agent doing its job, and answering it is not the hub's to do;
+#   * a reply with no sign of unfinished work is left alone;
+#   * an interrupted turn is never continued.
+_MAX_AUTO_CONTINUE = 4
+_CONTINUE_NUDGE = (
+    "Continue. Work through the remaining items yourself and do not stop to "
+    "report progress -- the todo list is the report. If something genuinely "
+    "blocks you, say what it is; otherwise keep going until the job is done."
+)
+
+# An unchecked markdown checkbox is the strongest possible signal: the agent
+# wrote the list itself and left items on it.
+_UNCHECKED_RE = re.compile(r"^\s*[-*]\s*\[\s\]", re.M)
+# "next I will", "now I'll", "let me now" -- an intention, stated at the end.
+_NEXT_STEP_RE = re.compile(
+    r"\b(next|then|now|after that|remaining|still need|todo|to do)\b[^.\n]{0,80}"
+    r"\b(i(?:'|\u2019)?ll|i will|let me|we(?:'|\u2019)?ll|we will|going to)\b",
+    re.I)
+_ALT_NEXT_RE = re.compile(
+    r"\b(i(?:'|\u2019)?ll|i will|let me|going to|we(?:'|\u2019)?ll)\b[^.\n]{0,60}"
+    r"\b(next|now|then|continue|proceed)\b", re.I)
+# Said plainly enough that continuing would be wrong.
+_FINISHED_RE = re.compile(
+    r"\b(all done|everything (is )?done|finished|complete[d]?|"
+    r"nothing (else|more) (to do|left)|ready to use|that(?:'|\u2019)?s everything)\b",
+    re.I)
+
+
+def looks_unfinished(text):
+    """Does this reply say, in its own words, that the work is not done?
+
+    Read from the AGENT's own output rather than guessed from tool counts: an
+    agent that stops after one tool call may be finished, and one that made
+    thirty may not be. What it wrote is the only evidence of what it thinks is
+    left."""
+    if not text or not isinstance(text, str):
+        return False
+    body = text.strip()
+    if not body:
+        return False
+    # Being asked a question is the agent doing its job. Answering it is the
+    # user's, and a nudge would talk over them.
+    tail = body[-400:]
+    if "?" in tail:
+        return False
+    if _UNCHECKED_RE.search(body):
+        return True
+    if _FINISHED_RE.search(tail):
+        return False
+    return bool(_NEXT_STEP_RE.search(tail) or _ALT_NEXT_RE.search(tail))
+
+
 def send_message_stream_durable(session_id, text):
     """Same external contract as send_message_stream (a generator yielding the
     same normalized events, always ending the way that one does) but the real
@@ -2662,10 +2736,28 @@ def send_message_stream_durable(session_id, text):
     def _run():
         final_reply = None
         try:
-            for ev in send_message_stream(session_id, text):
-                q.put(ev)
-                if ev.get("event") == "done":
-                    final_reply = ev.get("text")
+            prompt, rounds = text, 0
+            while True:
+                final_reply = None
+                interrupted = False
+                for ev in send_message_stream(session_id, prompt):
+                    # The nudge itself is not shown as a user turn: the reader
+                    # asked for one thing and should see one conversation.
+                    q.put(ev)
+                    kind = ev.get("event")
+                    if kind == "done":
+                        final_reply = ev.get("text")
+                    elif kind in ("error", "stopped"):
+                        interrupted = True
+                if interrupted or rounds >= _MAX_AUTO_CONTINUE:
+                    break
+                if not looks_unfinished(final_reply):
+                    break
+                rounds += 1
+                prompt = _CONTINUE_NUDGE
+                q.put({"event": "notice",
+                       "text": "The agent stopped with work left on its own list "
+                               "-- continuing (%d of %d)." % (rounds, _MAX_AUTO_CONTINUE)})
         finally:
             if sess_info and final_reply:
                 try:

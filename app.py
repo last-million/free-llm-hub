@@ -10853,13 +10853,17 @@ def _playwright_probe(port):
 
     The transport path moved between releases (/sse, then /mcp), and guessing
     wrong registers an endpoint that every agent fails to reach. Ask."""
+    # LOCALHOST, not 127.0.0.1. @playwright/mcp enforces its own host check and
+    # answers "Access is only allowed at localhost:<port>" to anything else --
+    # so a URL spelled 127.0.0.1 registers cleanly and then 403s for every
+    # agent that uses it. Found by connecting to it rather than by reading it.
+    base = "http://localhost:%d" % port
     for path in ("/mcp", "/sse"):
         try:
-            r = requests.get("http://127.0.0.1:%d%s" % (port, path), timeout=2,
-                             stream=True)
+            r = requests.get(base + path, timeout=2, stream=True)
             r.close()
             if r.status_code < 500:
-                return "http://127.0.0.1:%d%s" % (port, path)
+                return base + path
         except requests.RequestException:
             continue
     return None

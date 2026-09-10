@@ -147,3 +147,15 @@ def test_it_is_started_at_boot_off_the_main_thread():
     assert "target=_start_playwright_mcp" in SRC
     i = SRC.index("target=_start_playwright_mcp")
     assert "daemon=True" in SRC[i - 200:i + 200]
+
+
+def test_the_registered_url_uses_localhost_not_the_loopback_ip():
+    """@playwright/mcp enforces its own host check: anything but
+    localhost:<port> gets "Access is only allowed at localhost:8931". A URL
+    spelled 127.0.0.1 registers cleanly and then 403s for every agent that
+    tries to use it. Found by connecting to the running server, not by reading
+    the code."""
+    body = SRC[SRC.index("def _playwright_probe("):]
+    body = body[:body.index("\ndef ")]
+    assert 'http://localhost:%d' in body
+    assert "127.0.0.1:%d%s" not in body
