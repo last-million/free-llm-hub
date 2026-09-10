@@ -5230,6 +5230,53 @@ def _session_pin_get(key):
         return (pid, model)
 
 
+def _pinned_elsewhere(exclude_key=None):
+    """The model IDENTITIES other live conversations are pinned to.
+
+    WHY THIS EXISTS. A session pin keeps ONE conversation on ONE model, which
+    is right -- an agent that changes model mid-job produces incoherent work.
+    But every session picks its pin from the same ranked pool, so five agents
+    started together all pin the SAME top model: one model doing five jobs in
+    series while the rest of the fleet idles, and no second opinion anywhere.
+
+    REPORTED: "why do they only ever use the same model? he should use at
+    least 2 or 3 of the best different models available".
+
+    Identities, not (pid, model) pairs: the same model served by four providers
+    is one model, and spreading across four providers serving it is not
+    spreading at all."""
+    now = time.time()
+    out = set()
+    with _session_pin_lock:
+        rows = list(_session_pins.items())
+    for key, row in rows:
+        if key == exclude_key:
+            continue
+        try:
+            pid, model, exp = row
+        except (TypeError, ValueError):
+            continue
+        if exp > now and model:
+            out.add(_normalize_model_identity(model))
+    return out
+
+
+def _spread_pool(pool, exclude_key=None):
+    """`pool` with models other live conversations already hold, dropped.
+
+    FAIL-OPEN, and that matters more than the spreading: when every candidate
+    is taken -- one strong model and six agents -- the original pool comes back
+    untouched. Sharing a model is slower; refusing to route is broken."""
+    try:
+        taken = _pinned_elsewhere(exclude_key)
+        if not taken:
+            return pool
+        free = [c for c in pool if _normalize_model_identity(c[2]) not in taken]
+        return free or pool
+    except Exception:                                            # noqa: BLE001
+        return pool
+
+
 def _session_pin_set(key, pid, model):
     """Pin this conversation to (pid, model). Also opportunistically evicts
     expired rows so the dict cannot grow without bound in a long-lived process."""
@@ -5509,6 +5556,12 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
             if len({c[1] for c in _wider}) > len({c[1] for c in _normal}):
                 _normal = _wider
         _pool = _normal or _pool
+        # SPREAD ACROSS CONCURRENT SESSIONS. This is the moment a session
+        # decides the model it will keep, so it is the one place where knowing
+        # what its siblings are already using changes anything -- afterwards the
+        # pin holds and the choice is made. Only the FIRST turn of a session
+        # reaches here; every later turn takes the pin above.
+        _pool = _spread_pool(_pool, _skey)
         picked = _weighted_pick(_pool, _model_identity_min_penalty(_pool))
         _s, pid, model = picked
         _session_pin_set(_skey, pid, model)
@@ -9663,6 +9716,12 @@ def api_model_identities():
     })
 
 
+# How many models one call may move at once. The Settings list renders 120
+# rows, so this covers "tick everything you can see" and still refuses a body
+# that is trying to be a denial of service.
+_MAX_BULK_IDENTITIES = 200
+
+
 @app.route("/api/model-identities", methods=["POST"])
 def api_model_identities_set():
     """Block / unblock / allow / disallow one model across every provider.
@@ -9673,30 +9732,55 @@ def api_model_identities_set():
     check belongs here, where the reason can be said out loud, rather than in
     routing where it could only be guessed at."""
     body = request.get_json(force=True, silent=True) or {}
-    ident = str(body.get("identity") or "").strip().lower()
     action = str(body.get("action") or "").strip().lower()
     sid = str(body.get("session_id") or "").strip() or None
-    if not ident:
+    # ONE MODEL OR MANY, same route.
+    #
+    # REQUESTED: "in blacklist and whitelist I want to be able to select which
+    # ones I want to add there or remove from there". Ticking twelve models and
+    # sending twelve requests works, but each one re-reads and rewrites the
+    # setting file and re-runs the whitelist guard, so a dozen boxes was a
+    # dozen round trips and twelve chances to end up half-applied. A list is
+    # applied as one action instead.
+    idents = body.get("identities")
+    if isinstance(idents, list):
+        wanted = []
+        for x in idents:
+            one = str(x or "").strip().lower()
+            if one and one not in wanted:
+                wanted.append(one)
+    else:
+        wanted = [str(body.get("identity") or "").strip().lower()]
+        wanted = [w for w in wanted if w]
+    if not wanted:
         return _openai_error("identity is required", 400)
+    if len(wanted) > _MAX_BULK_IDENTITIES:
+        return _openai_error("at most %d models at a time" % _MAX_BULK_IDENTITIES, 400)
     if action not in ("block", "unblock", "allow", "disallow"):
         return _openai_error("action must be block, unblock, allow or disallow", 400)
+    ident = wanted[0]
     if sid:
         # One conversation only. No empty-whitelist guard here: a session
         # whitelist that empties falls back to the global list rather than to
         # nothing, so it cannot black the hub out the way the global one can.
-        if action in ("block", "unblock"):
-            rules = _set_session_model(sid, ident, block=(action == "block"))
-        else:
-            rules = _set_session_model(sid, ident, allow=(action == "allow"))
+        rules = None
+        for one in wanted:
+            if action in ("block", "unblock"):
+                rules = _set_session_model(sid, one, block=(action == "block"))
+            else:
+                rules = _set_session_model(sid, one, allow=(action == "allow"))
+        rules = rules or _session_model_rules(sid)
         return jsonify({"scope": sid,
                         "blocked": sorted(rules["block"]),
                         "allowed": sorted(rules["allow"]),
                         "whitelist_active": bool(rules["allow"])})
     if action in ("block", "unblock"):
-        _set_identity_blocked(ident, action == "block")
+        for one in wanted:
+            _set_identity_blocked(one, action == "block")
     else:
         if action == "allow":
-            _set_identity_allowed(ident, True)
+            for one in wanted:
+                _set_identity_allowed(one, True)
             # A whitelist is ENFORCED, so adding the first entry silently
             # switches off every other model on the fleet. That is what it is
             # for -- but it happened to this install by accident during
@@ -9716,15 +9800,19 @@ def api_model_identities_set():
                                 "clear it." % len(allowed_now)),
                 })
         else:
+            # Checked against the state AFTER removing all of them, not one at a
+            # time: removing two models where either alone would be fine can
+            # still leave a whitelist that serves nothing.
             after = set(_allowed_identities())
-            after.discard(ident)
+            after.difference_update(wanted)
             if after and not any(r["working"] for r in _identity_rows()
                                  if r["identity"] in after):
                 return _openai_error(
                     "That would leave a whitelist with no working model on it, so "
                     "every request would fail. Clear the whitelist entirely to allow "
                     "every model, or add a working one first.", 400)
-            _set_identity_allowed(ident, False)
+            for one in wanted:
+                _set_identity_allowed(one, False)
     return jsonify({"blocked": sorted(_blocked_identities()),
                     "allowed": sorted(_allowed_identities()),
                     "whitelist_active": bool(_allowed_identities())})
@@ -10103,6 +10191,33 @@ def api_status():
     # Per-provider free-quota snapshot (used, remaining, reset countdown, throttled).
     q = {}
     exhausted = 0
+    # TOKENS ACTUALLY SPENT TODAY, per provider. Read ONCE and aggregated here
+    # rather than per provider inside the loop: reading one day of usage
+    # and parses the whole day file, and doing that sixteen times to answer one
+    # question is sixteen times the work for the same answer.
+    #
+    # REPORTED: "the bar on top for usage and how much remaining, they show
+    # requests and not how much tokens ... I want tokens used and remaining and
+    # total, not just requests." Requests were all the strip had because
+    # requests are all quota.py counts; what a free tier actually meters is
+    # usually tokens.
+    tokens_today = {}
+    tokens_today_total = 0
+    try:
+        _day = usage_history.get_day() or {}
+        # The DAY's real total, not the sum of the rows below. The strip only
+        # lists free providers (paid ones are skipped above), so summing its
+        # chips would quietly under-report a day where a paid provider did the
+        # work -- and "tokens used today" has to mean today, not today-among-
+        # the-ones-we-happen-to-draw.
+        tokens_today_total = int(_day.get("total_tokens") or 0)
+        for row in _day.get("models") or ():
+            pid_row = row.get("provider")
+            if pid_row:
+                tokens_today[pid_row] = (tokens_today.get(pid_row, 0)
+                                         + int(row.get("total_tokens") or 0))
+    except Exception:                                            # noqa: BLE001
+        tokens_today = {}
     for pid in keyed:
         p = prov.get_provider(pid) or {}
         # A PAID provider has no free tier, so it has no free quota to report.
@@ -10129,6 +10244,10 @@ def api_status():
         except Exception:                                        # noqa: BLE001
             s["keys"] = 1
         s["keyless"] = bool(p.get("no_key"))
+        # What this provider has actually cost in tokens today. Always real --
+        # it is what was spent, not an allowance -- so it is the one token
+        # figure that can be shown for every provider.
+        s["tokens_used"] = int(tokens_today.get(pid, 0))
         q[pid] = s
         if s["exhausted"]:
             exhausted += 1
@@ -10151,6 +10270,7 @@ def api_status():
         "quota": q,
         "all_exhausted": free_count > 0 and exhausted == free_count,
         "any_exhausted": exhausted > 0,
+        "tokens_today": tokens_today_total,
     })
 
 
@@ -11489,6 +11609,33 @@ def _set_session_model(sid, identity, allow=None, block=None):
     return _session_model_rules(sid)
 
 
+def _forget_session_models(sid):
+    """Drop one conversation's allow/block lists. Returns True if it had any.
+
+    The lists are keyed by session id in the config and nothing ever removed
+    them, so every conversation that ever picked its own models left its rules
+    behind forever -- a config that grows for the life of the install and a
+    settings file describing conversations that no longer exist.
+
+    Called when a conversation is ENDED, which is the one moment we know the id
+    is finished with. Never on a restart: a session id survives a restart (the
+    resume route reuses it), and that is exactly what makes "continue with the
+    same models" work."""
+    sid = str(sid or "").strip()
+    if not sid:
+        return False
+    try:
+        raw = config.get_setting(_SESSION_MODELS_SETTING, {}) or {}
+        if not isinstance(raw, dict) or sid not in raw:
+            return False
+        raw = dict(raw)
+        raw.pop(sid, None)
+        config.set_setting(_SESSION_MODELS_SETTING, raw)
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _is_model_blocked_by_user(pid, model):
     """Every list, at the one seam every filter already goes through.
 
@@ -12166,6 +12313,13 @@ def api_agent_send_message(session_id):
         # not exist until its first turn. set_quality returns without writing
         # when it already matches, so this is a dict lookup on every later turn.
         agentic_history.set_quality(session_id, sess_info.get("quality") or "normal")
+        # AND THE MODE. The comment above says "mode" and the line above it
+        # writes only the quality -- so a conversation given its own kind of
+        # model kept it until the next hub restart and then came back with
+        # none, which is the half of "per-conversation models, saved" that was
+        # silently missing. Same shape: set_mode returns without writing when
+        # it already matches.
+        agentic_history.set_mode(session_id, sess_info.get("mode"))
     status, text, detail = agentic_chat.send_message(session_id, body["text"])
     if sess_info and status == 200 and text:
         # The CLI's OWN thread id, captured with the reply. Without it a
@@ -12207,6 +12361,13 @@ def api_agent_send_message_stream(session_id):
         agentic_history.record_turn(session_id, sess_info["cli"], sess_info["project_dir"],
                                     "user", text, snapshot=snap)
         agentic_history.set_quality(session_id, sess_info.get("quality") or "normal")
+        # AND THE MODE. The comment above says "mode" and the line above it
+        # writes only the quality -- so a conversation given its own kind of
+        # model kept it until the next hub restart and then came back with
+        # none, which is the half of "per-conversation models, saved" that was
+        # silently missing. Same shape: set_mode returns without writing when
+        # it already matches.
+        agentic_history.set_mode(session_id, sess_info.get("mode"))
 
     def gen():
         # THE MODEL'S MEMORY. The CLI's own thread id is what `codex exec resume`
@@ -12288,6 +12449,10 @@ def api_agent_end_session(session_id):
     sess = agentic_chat.get_session(session_id)
     project_dir = getattr(sess, "project_dir", None) if sess else None
     ended = agentic_chat.end_session(session_id)
+    # And its model rules. Nothing else ever removed them, so a hub that had
+    # run a few hundred conversations carried a few hundred dead entries.
+    if ended:
+        _forget_session_models(session_id)
     # Ending a session ends the app it started. A dev server left holding :3000
     # after its session is gone is a leak the user has to clear by hand -- and
     # worse, the next project then finds that port busy or, until the ownership
@@ -21319,7 +21484,12 @@ def _zip_manifest_of(root_dir):
         dirnames[:] = [d for d in dirnames if d not in _ZIP_UPDATE_IGNORE_DIRS
                        and not d.endswith(".pyc")]
         for fn in filenames:
-            if fn in _ZIP_UPDATE_IGNORE_FILES or fn.endswith((".pyc", ".pyo")):
+            # ".calvoun-brief-<session>.md" as well as the shared name: the
+            # brief became per-session so swarm workers stop overwriting each
+            # other's, and a per-session name is no more part of the install
+            # than the shared one was.
+            if (fn in _ZIP_UPDATE_IGNORE_FILES or fn.endswith((".pyc", ".pyo"))
+                    or fn.startswith(".calvoun-brief-")):
                 continue
             full = os.path.join(dirpath, fn)
             rel = os.path.relpath(full, root_dir).replace(os.sep, "/")
@@ -21536,9 +21706,10 @@ def _finish_update_apply(before_label, after_label, deps_ok):
         return _auto_update_state["last_result"]
     _auto_update_state["updating"] = True
     busy = _agentic_busy_session_ids()
+    runs = _swarm_busy_run_ids()
     with _runtime_condition:
         inflight = _runtime_active[0]
-    if not busy and not inflight:
+    if not busy and not runs and not inflight:
         _auto_update_state["last_result"] = "updated %s->%s — restarting" % (before_label, after_label)
         _log.info("Auto-update: new code applied (%s -> %s), re-executing.",
                  before_label, after_label)
@@ -21546,11 +21717,12 @@ def _finish_update_apply(before_label, after_label, deps_ok):
     else:
         _auto_update_state["last_result"] = (
             "updated %s->%s — restart deferred: %d task(s) still running"
-            % (before_label, after_label, len(busy) + (1 if inflight else 0)))
-        _log.info("Auto-update: updated %s->%s but %d session(s)/%d inflight request(s) "
-                 "busy; deferring restart until they finish.",
-                 before_label, after_label, len(busy), inflight)
-        _reexec_when_idle(busy)
+            % (before_label, after_label,
+               len(busy) + len(runs) + (1 if inflight else 0)))
+        _log.info("Auto-update: updated %s->%s but %d session(s)/%d swarm run(s)/"
+                 "%d inflight request(s) busy; deferring restart until they finish.",
+                 before_label, after_label, len(busy), len(runs), inflight)
+        _reexec_when_idle(busy, runs)
     return _auto_update_state["last_result"]
 
 
@@ -21609,6 +21781,13 @@ def _reexec_soon():
     threading.Thread(target=_go, daemon=True).start()
 
 
+# Longest an update will wait for work to finish before restarting anyway.
+# swarm_windows.AGENT_TIMEOUT is 900s per worker and a run is several waves of
+# them, so this covers a real run and still guarantees the pulled code applies
+# on the same day it was pulled.
+_DEFER_RESTART_MAX = 3 * 3600.0
+
+
 def _agentic_busy_session_ids():
     """Agent chat session ids currently mid-turn (turn_lock held), snapshotted
     right now. A re-exec kills every in-flight connection outright (no HTTP
@@ -21625,24 +21804,60 @@ def _agentic_busy_session_ids():
     return ids
 
 
-def _reexec_when_idle(busy_snapshot):
+def _swarm_busy_run_ids():
+    """Swarm runs that are still going, snapshotted right now.
+
+    A SWARM IS WORK THE TURN LOCK CANNOT SEE. _agentic_busy_session_ids finds a
+    worker while its turn is running, but a run spends real time between
+    phases -- a wave finishing, the next one being scheduled, a worker being
+    spawned -- and in those gaps no lock is held anywhere. Restarting in one of
+    those gaps kills the whole run: the workers are children of this process
+    and the walk thread goes with it, so a twenty-minute five-phase job dies
+    two phases in and comes back marked "interrupted by a hub restart".
+
+    REQUESTED: "make sure people who installed it get the git pull and restart
+    without interrupting the work."
+    """
+    try:
+        return {r["run_id"] for r in swarm_windows.list_runs()
+                if r.get("state") in (swarm_windows.PENDING, swarm_windows.RUNNING)}
+    except Exception:                                            # noqa: BLE001
+        return set()
+
+
+def _still_running(busy_sessions, busy_runs):
+    """How many of the snapshotted tasks are still going. 0 means restart."""
+    live = {sid for sid in busy_sessions
+            if sid in agentic_chat._REGISTRY
+            and agentic_chat._REGISTRY[sid].turn_lock.locked()}
+    runs = _swarm_busy_run_ids() & set(busy_runs or ())
+    with _runtime_condition:
+        inflight = _runtime_active[0]
+    return len(live) + len(runs) + (1 if inflight else 0)
+
+
+def _reexec_when_idle(busy_snapshot, busy_runs=()):
     """Restart once every session busy AT UPDATE-CHECK TIME (plus any request
     already in flight on /v1/*) has finished -- and not a moment later, even
     if the hub stays continuously busy. Deliberately does NOT wait for
     sessions that START after the snapshot: an always-on hub could otherwise
     defer forever and the pulled code would never actually apply."""
     def _go():
+        # A ceiling, because a swarm that hangs must not defer the update
+        # forever. Generous on purpose: swarm_windows.AGENT_TIMEOUT is 900s per
+        # worker and a run is several waves of them, so anything under this is
+        # a run that is still legitimately working.
+        deadline = time.time() + _DEFER_RESTART_MAX
         while True:
-            still_busy = {sid for sid in busy_snapshot
-                          if sid in agentic_chat._REGISTRY
-                          and agentic_chat._REGISTRY[sid].turn_lock.locked()}
-            with _runtime_condition:
-                inflight = _runtime_active[0]
-            if not still_busy and not inflight:
+            busy = _still_running(busy_snapshot, busy_runs)
+            if not busy:
+                break
+            if time.time() > deadline:
+                _log.warning("Auto-update: %d task(s) still running after %.0f min; "
+                             "restarting anyway.", busy, _DEFER_RESTART_MAX / 60.0)
                 break
             _auto_update_state["last_result"] = (
-                "update pulled — restart deferred: %d task(s) still running"
-                % (len(still_busy) + (1 if inflight else 0)))
+                "update pulled — restart deferred: %d task(s) still running" % busy)
             time.sleep(3.0)
         _log.info("Auto-update: deferred restart proceeding — snapshotted tasks are done.")
         _reexec_soon()

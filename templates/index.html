@@ -9,8 +9,13 @@
 <link rel="icon" type="image/webp" sizes="32x32" href="/static/favicon-32.webp">
 <link rel="icon" type="image/webp" sizes="180x180" href="/static/favicon-180.webp">
 <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
-<meta name="theme-color" content="#0C0F14">
-<script nonce="{{ csp_nonce }}">try{if(localStorage.getItem('flh.theme')==='dark')document.documentElement.removeAttribute('data-theme')}catch(e){}</script>
+<!-- LIGHT is the default (see data-theme on <html> above): a first visit, a
+     new browser and a private window all open light, and the pre-paint script
+     below switches to dark only for someone who chose it. theme-color has to
+     follow that, or the phone paints its browser chrome near-black around a
+     white page. -->
+<meta name="theme-color" content="#F5F6F8">
+<script nonce="{{ csp_nonce }}">try{var _t=localStorage.getItem('flh.theme');if(_t==='dark'){document.documentElement.removeAttribute('data-theme');var _m=document.querySelector('meta[name="theme-color"]');if(_m)_m.setAttribute('content','#0C0F14');}}catch(e){}</script>
 <style nonce="{{ csp_nonce }}">
   /* ==========================================================================
      Calvoun Free LLM Hub — dashboard theme
@@ -490,6 +495,14 @@
   /* Keyboard focus must stay visible -- the real radio is off-screen. */
   .agent-quality .q-opt input:focus-visible + span{outline:2px solid var(--accent);
                                                    outline-offset:1px}
+  /* The one that navigates rather than selects: same shape as its siblings so
+     the row still reads as one control, outlined so it does not look like the
+     option currently in force. */
+  .agent-quality .q-go{border:0;background:none;padding:0;cursor:pointer;font:inherit}
+  .agent-quality .q-go span{border:1px dashed var(--border-strong,var(--border))}
+  .agent-quality .q-go:hover span{color:var(--text);border-color:var(--accent)}
+  .agent-quality .q-go:focus-visible span{outline:2px solid var(--accent);
+                                          outline-offset:1px}
   .agent-quality[aria-disabled="true"]{opacity:.55;pointer-events:none}
   /* Activity source badge: which surface a request came from. */
   .af-src{font-size:10px;font-weight:700;letter-spacing:.04em;padding:1px 6px;
@@ -1462,6 +1475,12 @@
 
   /* One row per MODEL. Three states, and the row says which it is in text as
      well as in colour -- colour alone is not a state. */
+  .sd-bulk{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:8px 0;
+    padding:7px 9px;border-radius:9px;border:1px solid var(--accent);
+    background:var(--surface-2,var(--surface))}
+  .sd-bulk-n{font-size:11.5px;font-weight:700;margin-right:2px}
+  .sd-pick{flex:none;margin:0;cursor:pointer;width:15px;height:15px}
+  .sd-ident.is-picked{background:var(--surface-3,rgba(127,127,127,.10))}
   .sd-ident{display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:8px;
     font-size:12px;line-height:1.35;border-bottom:1px solid var(--border-soft)}
   .sd-ident:last-child{border-bottom:0}
@@ -2964,10 +2983,25 @@
                 <input type="radio" name="agent-quality" value="max">
                 <span>Max</span>
               </label>
-              <label class="q-opt" title="Several strong models answer every turn at once, best answer wins (~3x quota, slower)">
+              <label class="q-opt" title="Several strong models answer every turn at once, best answer wins (~3x quota, slower). ONE agent, several opinions.">
                 <input type="radio" name="agent-quality" value="swarm">
-                <span>Swarm</span>
+                <span>Swarm best-of-N</span>
               </label>
+              <!-- THE OTHER SWARM, and the reason this button exists.
+                   "Swarm" above fans ONE turn across several models and keeps
+                   the best answer. Multi sessions is the different thing: several
+                   real agent sessions, each its own CLI process and context
+                   window, working phases of one job in parallel. Both were
+                   called "swarm", one of them lived in a tab nobody opened, and
+                   the report was exactly that -- "I do not see the new mode
+                   swarm multi real sessions as a choice". So it is a choice, in
+                   the row where you choose how to work.
+                   Not a radio: it is not a routing tier the server stores per
+                   session, it is a different way of running the job. -->
+              <button type="button" class="q-opt q-go" id="agent-quality-multi"
+                      title="Several REAL agent sessions in parallel, each with its own context window, split into phases. Opens the Swarm tab.">
+                <span>Multi sessions &rarr;</span>
+              </button>
             </div>
             <!-- MODE, per project. Quality says how HARD to try; mode says which
                  KIND of model. A select rather than radios because there are
@@ -3462,6 +3496,20 @@
              aria-describedby="sd-models-count">
       <p class="sd-help sd-count" id="sd-models-count" role="status" aria-live="polite"></p>
 
+      <!-- SELECT SEVERAL, THEN ACT ONCE.
+           REQUESTED: "in blacklist and whitelist I want to be able to select
+           which ones I want to add there or remove from there, and also for
+           each session and globally". Ticking rows and pressing one button
+           beats twelve separate clicks, and it is the same write either way --
+           so it follows the scope selector above like everything else here. -->
+      <div class="sd-bulk" id="sd-bulk" hidden>
+        <span class="sd-bulk-n" id="sd-bulk-n"></span>
+        <button class="btn sm" id="sd-bulk-allow" type="button">Add to whitelist</button>
+        <button class="btn sm ghost" id="sd-bulk-disallow" type="button">Remove from whitelist</button>
+        <button class="btn sm danger" id="sd-bulk-block" type="button">Block</button>
+        <button class="btn sm ghost" id="sd-bulk-unblock" type="button">Unblock</button>
+        <button class="btn sm ghost" id="sd-bulk-none" type="button">Clear selection</button>
+      </div>
       <div class="sd-models" id="sd-models"><div class="skel skel-row"></div></div>
       <p class="sd-help"><b>Only this</b> builds a whitelist: when at least one model is
         marked, the hub uses <em>nothing else</em>. <b>Block</b> switches a model off across
@@ -3647,6 +3695,7 @@
     }
     /* let the main script refresh the data of the view we just entered
        (polls skip hidden views, so this is what catches them up) */
+    window.cxCurrentView = view;
     if(window.cxOnViewChange){ try{ window.cxOnViewChange(view); }catch(e){} }
   }
   function dismissNewBadge(badge){
@@ -4584,7 +4633,7 @@
   function ingestStatus(s){
     /* The quota strip on Activity and Usage rides the poll that already
        happens, rather than adding a request of its own. */
-    try { renderQuotaToday(s && s.quota); } catch (e) {}
+    try { renderQuotaToday(s && s.quota, s && s.tokens_today); } catch (e) {}
     var q = (s && s.quota && typeof s.quota === 'object') ? s.quota : {};
     quotaState = {};
     Object.keys(q).forEach(function(pid){
@@ -8296,6 +8345,22 @@
       if (which === 'swarm' && window.pollSwarm) window.pollSwarm();
       else if (window.stopSwarmPoll) window.stopSwarmPoll();
     }
+    /* Carries whatever is already typed in the chat box over to the swarm's
+       goal field: having to retype the thing you just wrote is how a feature
+       gets used once and then not again. */
+    var multiBtn = document.getElementById('agent-quality-multi');
+    if (multiBtn) multiBtn.addEventListener('click', function(){
+      switchTab('swarm');
+      var goal = document.getElementById('sw-goal');
+      var box = document.getElementById('agent-text');
+      if (goal){
+        if (!goal.value && box && box.value.trim()){
+          goal.value = box.value.trim();
+          box.value = '';
+        }
+        try { goal.focus(); } catch (e) {}
+      }
+    });
     viewSessionBtn.addEventListener('click', function(){ switchTab('session'); });
     viewHistoryBtn.addEventListener('click', function(){ switchTab('history'); });
     if (viewSwarmBtn) viewSwarmBtn.addEventListener('click', function(){ switchTab('swarm'); });
@@ -10309,6 +10374,18 @@
     var _sdBlocked = [];       /* identities switched off */
     var _sdModeList = [];      /* [{key,label}] for the per-row category chips */
     var _sdScope = '';         /* '' = global default, else a session id */
+    /* DECLARED. Both of these were assigned in loadSdModels and declared
+       nowhere, and this script block is 'use strict' -- so the assignment threw
+       ReferenceError on every single load, the promise rejected, and NOTHING on
+       the Settings page rendered: no models, no modes, no whitelist, no
+       blocklist, no sessions. The catch wrote "Could not load: _sdCats is not
+       defined" into the model list, which is only visible if you were already
+       looking at that box.
+       REPORTED: "je ne vois pas les models et modes et blacklist et whitelist
+       ... rien n'est affiche". */
+    var _sdPicked = {};        /* identity -> true, the rows ticked right now */
+    var _sdCats = [];          /* [{key,label,help,count,enabled,ids}] */
+    var _sdMode = 'all';       /* the mode in force for the current scope */
 
     /* MEASURED speed, next to the benchmark score.
        The score says how good a model is thought to be; this says how it has
@@ -10409,7 +10486,12 @@
                  ' title="' + (on ? 'In' : 'Not in') + ' the ' + esc(c.label) +
                  ' category &mdash; click to change">' + esc(c.label) + '</button>';
         }).join('');
-        return '<div class="sd-ident' + (m.blocked ? ' is-blocked' : '') + '">' +
+        var picked = !!_sdPicked[m.identity];
+        return '<div class="sd-ident' + (m.blocked ? ' is-blocked' : '') +
+                 (picked ? ' is-picked' : '') + '">' +
+                 '<input class="sd-pick" type="checkbox" data-pick="' +
+                    esc(m.identity) + '"' + (picked ? ' checked' : '') +
+                    ' aria-label="Select ' + esc(m.identity) + '">' +
                  '<div class="sd-ident-main">' +
                    '<div class="sd-ident-name" title="' + esc(providers) + '">' +
                       esc(m.identity) + '</div>' +
@@ -10432,6 +10514,16 @@
                  '</div>' +
                '</div>';
       }).join('');
+
+      host.querySelectorAll('.sd-pick').forEach(function(box){
+        box.addEventListener('change', function(){
+          var id = box.getAttribute('data-pick');
+          if (box.checked) _sdPicked[id] = true; else delete _sdPicked[id];
+          var row = box.closest('.sd-ident');
+          if (row) row.classList.toggle('is-picked', box.checked);
+          renderSdBulk();
+        });
+      });
 
       host.querySelectorAll('.sd-pill').forEach(function(btn){
         btn.addEventListener('click', function(){
@@ -10474,6 +10566,116 @@
                 member: !on } })
             .then(function(){ return loadSdModels(true); })
             .catch(function(e){ toast(e.message, true); chip.disabled = false; });
+        });
+      });
+    }
+
+    /* WHAT IS TICKED, AND WHAT TO DO WITH IT. Hidden until something is
+       selected: an action bar for zero rows is a permanent strip of disabled
+       buttons. */
+    function sdPickedList(){
+      return Object.keys(_sdPicked).filter(function(k){ return _sdPicked[k]; });
+    }
+
+    function renderSdBulk(){
+      var bar = $('#sd-bulk'), n = $('#sd-bulk-n');
+      if (!bar) return;
+      var picked = sdPickedList();
+      bar.hidden = !picked.length;
+      if (n) n.textContent = picked.length + ' selected' +
+        (_sdScope ? ' \u00b7 this conversation only' : ' \u00b7 global default');
+    }
+
+    function sdBulkApply(action){
+      var picked = sdPickedList();
+      if (!picked.length) return;
+      var bar = $('#sd-bulk');
+      if (bar) bar.querySelectorAll('button').forEach(function(b){ b.disabled = true; });
+      var payload = { identities: picked, action: action };
+      if (_sdScope) payload.session_id = _sdScope;
+      api('/api/model-identities', { method: 'POST', body: payload })
+        .then(function(r){
+          /* The server refuses a whitelist that would serve nothing and says
+             why; it also warns when one has narrowed to almost nothing. Both
+             are worth reading out rather than swallowing. */
+          if (r && r.warning) toast(r.warning, true);
+          else toast(picked.length + ' model' + (picked.length === 1 ? '' : 's') +
+                     ' \u2014 ' + action);
+          _sdPicked = {};
+          return loadSdModels(true);
+        })
+        .catch(function(e){ toast(e.message, true); })
+        .then(function(){
+          if (bar) bar.querySelectorAll('button').forEach(function(b){ b.disabled = false; });
+          renderSdBulk();
+        });
+    }
+
+    function initSdBulk(){
+      var acts = { 'sd-bulk-allow': 'allow', 'sd-bulk-disallow': 'disallow',
+                   'sd-bulk-block': 'block', 'sd-bulk-unblock': 'unblock' };
+      Object.keys(acts).forEach(function(id){
+        var b = $('#' + id);
+        if (b) b.addEventListener('click', function(){ sdBulkApply(acts[id]); });
+      });
+      var none = $('#sd-bulk-none');
+      if (none) none.addEventListener('click', function(){
+        _sdPicked = {};
+        renderSdModels();
+        renderSdBulk();
+      });
+    }
+
+    /* THE MODE ROW. loadSdModels has always called renderSdCats() and no such
+       function was ever written -- so even with the two variables above
+       declared, the load still threw one line later. #sd-cats has been sitting
+       empty in the markup since the Settings rebuild.
+
+       One chip per mode, the one in force pressed. Clicking a chip is the same
+       write the per-session dropdown makes, so it follows the scope selector:
+       with a conversation picked it changes THAT conversation, otherwise it
+       changes the global default. */
+    function renderSdCats(){
+      var host = $('#sd-cats');
+      if (!host) return;
+      var modes = (_sdModeList || []).slice();
+      if (!modes.length){ host.innerHTML = ''; return; }
+      /* "All models" is the no-restriction option and is not in the mode list
+         the API returns for the row chips, so it is added here as the way back
+         out of a restriction. */
+      if (!modes.some(function(m){ return m.key === 'all'; })){
+        modes.unshift({ key: 'all', label: 'All models',
+                        help: 'No restriction: every model the hub can reach.' });
+      }
+      var byKey = {};
+      (_sdCats || []).forEach(function(c){ byKey[c.key] = c; });
+      host.innerHTML = modes.map(function(m){
+        var cat = byKey[m.key] || {};
+        var n = (m.key === 'all') ? (cat.count || _sdModels.length)
+                                  : (cat.enabled != null ? cat.enabled : cat.count);
+        return '<button class="sd-pill" type="button" data-mode="' + esc(m.key) + '"' +
+               ' aria-pressed="' + (m.key === _sdMode ? 'true' : 'false') + '"' +
+               ' title="' + esc(m.help || m.label || '') + '">' +
+               esc(m.label || m.key) +
+               (n != null ? ' <span class="sd-tag">' + n + '</span>' : '') +
+               '</button>';
+      }).join('');
+      host.querySelectorAll('.sd-pill').forEach(function(btn){
+        btn.addEventListener('click', function(){
+          var want = btn.getAttribute('data-mode');
+          host.querySelectorAll('.sd-pill').forEach(function(b){ b.disabled = true; });
+          var payload = { mode: want };
+          if (_sdScope) payload.session_id = _sdScope;
+          api('/api/model-mode', { method: 'POST', body: payload })
+            .then(function(){
+              _sdMode = want;
+              toast(_sdScope ? 'This conversation: ' + want : 'Default models: ' + want);
+              return loadSdModels(true);
+            })
+            .catch(function(e){ toast(e.message, true); })
+            .then(function(){
+              host.querySelectorAll('.sd-pill').forEach(function(b){ b.disabled = false; });
+            });
         });
       });
     }
@@ -10522,8 +10724,11 @@
 
     function loadSdModels(silent){
       var q = _sdScope ? ('?session_id=' + encodeURIComponent(_sdScope)) : '';
+      /* The mode is asked for in the SAME scope as everything else, or a
+         conversation with its own mode showed the global one next to its own
+         model list. */
       return Promise.all([api('/api/model-identities' + q), api('/api/model-categories'),
-                          api('/api/model-mode')])
+                          api('/api/model-mode' + q)])
         .then(function(res){
           var d = res[0] || {};
           _sdModels    = (d.models || []).slice();
@@ -10532,10 +10737,16 @@
           _sdBlocked   = (d.blocked || []).slice();
           _sdModeList  = (d.modes || []).slice();
           _sdCats      = ((res[1] && res[1].categories) || []).slice();
-          _sdMode      = (res[2] && res[2].mode) || 'all';
+          /* With a session in scope the endpoint returns the GLOBAL mode in
+             `mode` and that conversation's own under `session.mode`, so reading
+             `mode` showed the wrong one for exactly the case the scope selector
+             exists for. */
+          _sdMode      = (res[2] && ((res[2].session && res[2].session.mode)
+                                     || res[2].mode)) || 'all';
           renderSdCats();
           renderWhitelistStrip();
           renderSdModels();
+          renderSdBulk();
           loadSdSpeed();
           /* THE SESSIONS PANEL HAS TO WAIT FOR THIS. Each running session's
              row carries a mode dropdown built from _sdModeList, which is
@@ -10587,10 +10798,15 @@
       var sc = $('#sd-scope');
       if (sc) sc.addEventListener('change', function(){
         _sdScope = sc.value || '';
+        /* A tick made against the global list is not a tick against a
+           conversation's: dropping the selection is what stops "add these
+           twelve" landing somewhere the user was no longer looking. */
+        _sdPicked = {};
         var wrap = sc.closest('.sd-scope');
         if (wrap) wrap.classList.toggle('is-session', !!_sdScope);
         loadSdModels(true);
       });
+      initSdBulk();
       /* Nothing is FETCHED here any more: loadSdModels pulls the sessions in
          once the modes it needs are known, and it runs when the Settings page
          is actually shown rather than on every page load. */
@@ -10828,6 +11044,9 @@
     if (theme === 'dark') document.documentElement.removeAttribute('data-theme');
     else document.documentElement.setAttribute('data-theme', 'light');
     try{ localStorage.setItem('flh.theme', theme); }catch(e){}
+    /* The phone's browser chrome, kept in step with the page it frames. */
+    var meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', theme === 'dark' ? '#0C0F14' : '#F5F6F8');
     var sw = $('#drawer-theme-switch');
     if (sw) sw.checked = (theme !== 'dark');
     var tt = $('#theme-toggle');
@@ -11221,7 +11440,7 @@
     return String(Math.round(n));
   }
 
-  function renderQuotaToday(quota){
+  function renderQuotaToday(quota, dayTotal){
     var hosts = [document.getElementById('qt-activity'),
                  document.getElementById('qt-usage')].filter(Boolean);
     if (!hosts.length) return;
@@ -11238,9 +11457,23 @@
     }
     var used = 0, limit = 0, remaining = 0, metered = 0, unmetered = 0,
         out = 0, keys = 0;
+    /* TOKENS, not only requests. A free tier almost always meters tokens; the
+       request count was the only thing quota.py tracked, so the strip could
+       only ever say "23 requests used" about a budget measured in millions of
+       tokens. `tokens_used` is real spend for every provider; the allowance is
+       only known for the ones that send a token rate-limit header, so the two
+       are counted separately and the unknown half is said out loud rather than
+       summed as zero. */
+    var tokUsed = 0, tokLimit = 0, tokLeft = 0, tokMetered = 0;
     rows.forEach(function(pair){
       var q = pair[1];
       used += Number(q.used) || 0;
+      tokUsed += Number(q.tokens_used) || 0;
+      if (q.tokens_known && Number(q.tokens_limit) > 0){
+        tokMetered++;
+        tokLimit += Number(q.tokens_limit) || 0;
+        tokLeft += Math.max(0, Number(q.tokens_remaining) || 0);
+      }
       keys += Math.max(1, Number(q.keys) || 1);
       if (q.limit_known && Number(q.limit) > 0){
         metered++;
@@ -11292,14 +11525,30 @@
              esc((q.name || pid) + ' \u2014 ' + _qtNum(q.used) + ' used' +
                  (known ? (' of ' + _qtNum(q.limit) +
                            (nkeys > 1 ? (' across ' + nkeys + ' keys') : ''))
-                        : ' (this provider publishes no daily limit)') + reset) +
+                        : ' (this provider publishes no daily limit)') +
+                 ' · ' + _qtNum(q.tokens_used || 0) + ' tokens today' +
+                 (q.tokens_known && q.tokens_limit
+                    ? (', ' + _qtNum(q.tokens_remaining) + ' of ' +
+                       _qtNum(q.tokens_limit) + ' left')
+                    : '') + reset) +
              '">' + esc(q.name || pid) + keyTag + ' ' + bar + ' ' + esc(text) + '</span>';
     }).join('');
 
     var head =
       '<span class="qt-lbl">Today</span>' +
+      '<span class="qt-big">' + _qtNum(
+          (typeof dayTotal === 'number' && dayTotal > tokUsed) ? dayTotal : tokUsed
+        ) + '</span>' +
+      '<span class="qt-lbl">tokens used' +
+      (tokMetered ? (' of ' + _qtNum(tokLimit) + ' published') : '') + '</span>' +
+      (tokMetered
+        ? ('<span class="qt-sep" aria-hidden="true"></span>' +
+           '<span class="qt-big">' + _qtNum(tokLeft) + '</span>' +
+           '<span class="qt-lbl">tokens left</span>')
+        : '') +
+      '<span class="qt-sep" aria-hidden="true"></span>' +
       '<span class="qt-big">' + _qtNum(used) + '</span>' +
-      '<span class="qt-lbl">requests used' +
+      '<span class="qt-lbl">requests' +
       (limit ? (' of ' + _qtNum(limit) + ' known') : '') + '</span>' +
       (metered
         ? ('<span class="qt-sep" aria-hidden="true"></span>' +
@@ -11313,10 +11562,21 @@
       (out ? ('<span class="qt-sep" aria-hidden="true"></span>' +
               '<span class="qt-big qt-danger">' + out + '</span>' +
               '<span class="qt-lbl">out of quota</span>') : '');
-    var note = unmetered
-      ? '<span class="qt-note">' + unmetered + ' of them publish no daily limit, ' +
-        'so only what you used is known for those.</span>'
-      : '';
+    var noteBits = [];
+    if (unmetered){
+      noteBits.push(unmetered + ' of them publish no daily request limit, ' +
+                    'so only what you used is known for those.');
+    }
+    if (!tokMetered){
+      noteBits.push('No provider here publishes a token allowance, so the token ' +
+                    'figure is what you have actually spent today; there is no ' +
+                    'honest remaining to show against it.');
+    } else if (tokMetered < rows.length){
+      noteBits.push('A token allowance is published by ' + tokMetered + ' of ' +
+                    rows.length + '; the rest report only what they spent.');
+    }
+    var note = noteBits.length
+      ? '<span class="qt-note">' + esc(noteBits.join(' ')) + '</span>' : '';
 
     hosts.forEach(function(h){
       h.hidden = false;
@@ -11568,6 +11828,19 @@
     var fn = VIEW_REFRESH[view];
     if (fn) fn();
   };
+  /* THE VIEW YOU LANDED ON NEVER GOT ITS DATA.
+     The router lives in an earlier <script> block and routes to the current
+     view (cxShow at load) BEFORE this block runs -- so at that moment
+     window.cxOnViewChange is undefined, the guard inside cxShow skips it, and
+     nothing fetches. Clicking a sidebar entry worked, because by then this
+     line had run; opening http://127.0.0.1:8787/settings directly, or
+     reloading on it, gave a page with no models, no modes and no lists.
+     REPORTED: "je ne vois pas les models et modes et blacklist et whitelist,
+     rien n'est affiche". Catch the landed-on view up now that the handler
+     exists. */
+  try {
+    if (window.cxCurrentView) window.cxOnViewChange(window.cxCurrentView);
+  } catch (e) {}
   setInterval(resync, 15000);                            /* server re-sync */
   setInterval(pollActivity, 3000);                       /* live activity feed poll */
   setInterval(pollTracking, 8000);                       /* model tracking poll */

@@ -72,3 +72,37 @@ def test_no_string_literal_holds_a_raw_newline():
             if stripped.count("'") % 2 and re.search(r"=\s*'[^']*$", stripped):
                 bad.append((n, line.strip()[:90]))
     assert not bad, bad
+
+
+# --------------------------------------------------------------------------- #
+# Light is the default, and everything that paints has to agree
+# --------------------------------------------------------------------------- #
+
+def test_the_page_opens_light():
+    """REQUESTED: "make the app default run in light mode theme not in dark
+    mode, but he can always switch to dark mode of course". A first visit, a new
+    browser and a private window all open light; the pre-paint script switches
+    to dark only for someone who chose it."""
+    assert '<html lang="en" data-theme="light">' in HTML
+    i = HTML.index("localStorage.getItem('flh.theme')")
+    boot = HTML[i:i + 260]
+    assert "==='dark'" in boot, "the boot script no longer opts IN to dark"
+
+
+def test_the_browser_chrome_matches_the_page():
+    """theme-color was hardcoded near-black, so a phone painted a dark frame
+    around a white page."""
+    i = HTML.index('name="theme-color"')
+    assert "#F5F6F8" in HTML[i:i + 80]
+
+
+def test_switching_moves_the_chrome_too():
+    body = HTML[HTML.index("function applyTheme("):]
+    body = body[:body.index(chr(10) + "  function initThemeToggle(")]
+    assert 'meta[name="theme-color"]' in body
+    assert "#0C0F14" in body and "#F5F6F8" in body
+
+
+def test_dark_is_still_one_click_away():
+    assert "Switch to dark theme" in HTML
+    assert "id=\"theme-toggle\"" in HTML

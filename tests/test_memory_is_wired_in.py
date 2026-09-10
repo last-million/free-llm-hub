@@ -203,7 +203,7 @@ def test_memory_alone_is_enough_to_write_the_file(tmp_path, monkeypatch):
     sess = AC._Session("claude", str(tmp_path))
     memory.remember_fact(sess.id, "MUST stay on Postgres")
     assert AC.write_task_brief(str(tmp_path), "zzzz",
-                               memory_block=AC._memory_block(sess)) is True
+                               memory_block=AC._memory_block(sess))
     assert "Postgres" in (tmp_path / AC.BRIEF_FILENAME).read_text(encoding="utf-8")
 
 

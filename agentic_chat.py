@@ -1057,10 +1057,95 @@ def _seed_opencode_config(config_home):
         pass                    # a missing seed is a clear error later, not a crash
 
 
+# CMD.EXE EATS EVERYTHING AFTER THE FIRST LINE.
+#
+# An npm-installed CLI on Windows is a .cmd shim, and a batch file cannot be
+# run by CreateProcess -- so the launcher went through `cmd.exe /c shim.cmd
+# <args>`. cmd.exe treats a newline as a COMMAND SEPARATOR, quoted or not, so
+# every multi-line argument was silently truncated at its first line break.
+#
+# MEASURED through this exact path: 111 characters of prompt in, 59 out --
+# "It must define exactly two public functions:" arrived and the two function
+# signatures on the following lines did not. Two swarm workers reported it in
+# their own words ("your message got cut off after 'two public functions:'"),
+# which is what sent me looking.
+#
+# The blast radius was everything this module sends positionally:
+#   * a swarm phase task, which the planner writes as a numbered list;
+#   * any message with a line break typed on the /agent page;
+#   * opencode's standing instruction, appended after "\n\n---\n", so it
+#     never arrived at all;
+#   * claude's --append-system-prompt, whose parts are joined with blank lines,
+#     so only the first of them was ever delivered.
+#
+# The shim is a two-line batch file whose only job is to run a real program, so
+# the fix is to run that program directly and never involve a shell. Verified
+# on the same prompt through the same code: 111 in, 111 out.
+_SHIM_TARGET_CACHE = {}
+
+
+def _resolve_shim(path):
+    r"""The real argv behind a Windows .cmd shim, or None to keep using cmd.exe.
+
+    npm writes two shapes, both ending in a line that forwards %*:
+        "%dp0%\node_modules\opencode-ai\bin\opencode.exe"   %*
+        "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %*
+    so this takes the quoted tokens off that line and expands the two variables
+    npm uses. Anything it does not recognise, or that does not exist on disk,
+    returns None -- an unreadable shim must fall back to what worked before
+    rather than fail the turn."""
+    key = os.path.abspath(path)
+    if key in _SHIM_TARGET_CACHE:
+        return _SHIM_TARGET_CACHE[key]
+    argv = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        forward = [ln for ln in text.splitlines() if "%*" in ln]
+        if forward:
+            tokens = re.findall(r'"([^"]+)"', forward[-1])
+            here = os.path.dirname(key)
+            out = []
+            for tok in tokens:
+                tok = tok.replace("%dp0%", here + os.sep).replace("%~dp0", here + os.sep)
+                if "%_prog%" in tok or tok.strip().lower() in ("%_prog%", "node"):
+                    node = shutil.which("node")
+                    if not node:
+                        out = []
+                        break
+                    tok = node
+                elif "%" in tok:
+                    out = []          # a variable we do not know how to expand
+                    break
+                else:
+                    tok = os.path.normpath(tok)
+                    if not os.path.isfile(tok):
+                        out = []
+                        break
+                out.append(tok)
+            # No further check on out[0]: every branch above already proved its
+            # own token -- an interpreter by resolving it on PATH, a path by
+            # finding the file. Re-testing the first one with isfile() only
+            # rejects a perfectly good interpreter that lives somewhere
+            # os.path cannot stat the way we expect.
+            if out:
+                argv = out
+    except (OSError, ValueError):
+        argv = None
+    _SHIM_TARGET_CACHE[key] = argv
+    return argv
+
+
 def _launcher(path):
-    """argv prefix that can actually execute `path` (see _sub_launcher() in
-    app.py -- identical logic, duplicated to avoid a circular import)."""
+    """argv prefix that can actually execute `path`.
+
+    Unlike _sub_launcher() in app.py, which hands its prompt over on STDIN and
+    so never cared, this module passes the prompt POSITIONALLY -- which is why
+    the shell in the middle mattered here and not there."""
     if os.name == "nt" and os.path.splitext(path)[1].lower() in (".cmd", ".bat"):
+        direct = _resolve_shim(path)
+        if direct:
+            return list(direct)
         return [os.environ.get("COMSPEC") or "cmd.exe", "/c", path]
     return [path]
 
@@ -1584,7 +1669,11 @@ def _system_prompt_addition(text: str = "", has_brief: bool = False) -> str:
     if text:
         parts.append(_RESTATE_SNIPPET)
     if has_brief:
-        parts.append(_BRIEF_POINTER % BRIEF_FILENAME)
+        # has_brief is the FILENAME when one was written (a per-session name in
+        # a shared folder), and True from older callers -- both mean "there is
+        # one", and only the first knows what it is called.
+        parts.append(_BRIEF_POINTER
+                     % (has_brief if isinstance(has_brief, str) else BRIEF_FILENAME))
     # chr(10) rather than a backslash-n literal: this file gets edited through
     # tooling that has repeatedly turned that escape into a RAW newline, which
     # splits the string across lines and makes the module unimportable.
@@ -1593,6 +1682,49 @@ def _system_prompt_addition(text: str = "", has_brief: bool = False) -> str:
 
 
 BRIEF_FILENAME = ".calvoun-brief.md"
+# How long a brief written for a session that is gone is left lying in the
+# project. Long enough that a session paused overnight still finds its own,
+# short enough that a folder does not collect them.
+_BRIEF_STALE_AFTER = 48 * 3600
+
+
+def brief_filename(session_id=None):
+    """The brief file for one session, or the shared one when there is no id.
+
+    ONE FILE PER PROJECT WAS WRONG FOR A SWARM. Workers share a project
+    directory, so four of them rewrote the same .calvoun-brief.md within
+    seconds of each other -- harmless while it held only craft standards, which
+    are generic, and not harmless at all now that it carries what a
+    CONVERSATION has established. Worker B could read worker A's decisions as
+    its own.
+
+    The pointer in the prompt already interpolates this name, so a per-session
+    file costs nothing but the id's characters (worst-case turn-1 argv measured
+    at 8058 of the ~8191 ceiling, and a session id is 32)."""
+    sid = str(session_id or "").strip()
+    if not sid or not _SAFE_SESSION_ID_RE.match(sid):
+        return BRIEF_FILENAME
+    # A PREFIX, not the whole id. The pointer to this file rides in argv, and
+    # the worst-case turn-1 command line is already within ~150 characters of
+    # cmd.exe's ceiling -- 32 hex characters of session id in a filename is
+    # real budget spent on nothing. Twelve is 48 bits: the collision it guards
+    # against is two workers in ONE folder at ONE time, not a global namespace.
+    # MEASURED after this change: claude 8071, codex 8055, opencode 8003.
+    return ".calvoun-brief-%s.md" % sid[:12]
+
+
+def _sweep_stale_briefs(project_dir, keep):
+    """Delete per-session briefs nobody is coming back for. Best-effort."""
+    try:
+        cutoff = time.time() - _BRIEF_STALE_AFTER
+        for name in os.listdir(project_dir):
+            if (name.startswith(".calvoun-brief-") and name.endswith(".md")
+                    and name != keep):
+                path = os.path.join(project_dir, name)
+                if os.path.getmtime(path) < cutoff:
+                    os.unlink(path)
+    except (OSError, ValueError):
+        pass
 
 # How much remembered context rides along with the brief. It goes in the FILE,
 # never in argv: the worst-case turn-1 command line already measures 8006 chars
@@ -1617,7 +1749,7 @@ def _memory_block(sess):
         return ""
 
 
-def write_task_brief(project_dir, text, memory_block=""):
+def write_task_brief(project_dir, text, memory_block="", session_id=None):
     """Write the craft brief for `text` into the project, return True if any.
 
     WHY A FILE AND NOT MORE PROMPT: the prompt travels as a POSITIONAL argv
@@ -1646,7 +1778,8 @@ def write_task_brief(project_dir, text, memory_block=""):
         memory_block = (memory_block or "").strip()
         if not brief and not memory_block:
             return False
-        path = os.path.join(project_dir, BRIEF_FILENAME)
+        name = brief_filename(session_id)
+        path = os.path.join(project_dir, name)
         header = ("<!-- Written by Calvoun Free LLM Hub for THIS task. "
                   "Safe to delete; it is regenerated whenever it applies. -->")
         parts = [header]
@@ -1658,7 +1791,8 @@ def write_task_brief(project_dir, text, memory_block=""):
         sep = chr(10) + chr(10)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(sep.join(parts) + chr(10))
-        return True
+        _sweep_stale_briefs(project_dir, name)
+        return name
     except Exception:                                            # noqa: BLE001
         return False        # standards are a bonus; never cost the user a turn
 
@@ -1717,7 +1851,8 @@ def _build_argv(sess: _Session, bin_path: str, text: str, stream=False):
     addition = _system_prompt_addition(
         text if fresh else "",
         has_brief=fresh and write_task_brief(sess.project_dir, text,
-                                             memory_block=_memory_block(sess)))
+                                             memory_block=_memory_block(sess),
+                                             session_id=getattr(sess, "id", None)))
     if addition:
         args += ["--append-system-prompt", addition]
     return _launcher(bin_path) + args
@@ -1760,7 +1895,8 @@ def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
     else:
         addition = _system_prompt_addition(
             text, has_brief=write_task_brief(sess.project_dir, text,
-                                             memory_block=_memory_block(sess)))
+                                             memory_block=_memory_block(sess),
+                                             session_id=getattr(sess, "id", None)))
     prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
         if addition else text
     base = ["exec"]
@@ -1824,7 +1960,8 @@ def _build_argv_opencode(sess: "_Session", bin_path: str, text: str):
     else:
         addition = _system_prompt_addition(
             text, has_brief=write_task_brief(sess.project_dir, text,
-                                             memory_block=_memory_block(sess)))
+                                             memory_block=_memory_block(sess),
+                                             session_id=getattr(sess, "id", None)))
     prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
         if addition else text
     # --auto: "auto-approve permissions that are not explicitly denied".

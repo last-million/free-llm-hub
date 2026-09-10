@@ -772,7 +772,11 @@ def test_it_reads_back_after_a_restart():
     _wait(rid)
     SW._RUNS.clear()                      # the restart
     assert SW.status(rid) is None
-    assert SW.load() == 1
+    # `>= 1`, not `== 1`: a swarm from another test file can still be walking on
+    # its own thread and persisting into whatever directory it pinned at birth,
+    # so the count of files here is not this test's business. What it claims is
+    # that THIS run comes back, which is what the lines below check.
+    assert SW.load() >= 1
     st = SW.status(rid)
     assert st["state"] == SW.DONE
     assert st["goal"] == "build the thing"
@@ -912,3 +916,149 @@ def test_the_fifth_phase_is_configured_too():
     assert st["done"] == len(flat)
     assert len(seen) == len(flat), "only %d of %d phases were configured" % (
         len(seen), len(flat))
+
+
+# --------------------------------------------------------------------------- #
+# A failure that is not the agent's fault
+# --------------------------------------------------------------------------- #
+
+def test_the_reason_a_phase_failed_is_kept():
+    """MEASURED on the first real run against a live hub: two phases died on
+    "database is locked" and the error recorded for both was, literally, the
+    word "error" -- _drain read `error`/`text`, and agentic_chat puts the reason
+    in `detail`. A run that cannot say why it failed cannot be debugged."""
+    class _A:
+        def __init__(self):
+            self.events, self.error = [], None
+    a = _A()
+    SW._drain(a, iter([{"event": "error", "status": 502,
+                        "detail": "Error: Unexpected error\n\ndatabase is locked"}]))
+    assert "database is locked" in a.error
+
+
+def test_a_locked_database_is_retried():
+    """opencode keeps ONE SQLite database for the whole machine, so three
+    workers starting together is three writers on one file and the losers get
+    502 "database is locked" before doing any work at all. That is not a model
+    failing; it is a phase that never started."""
+    tries = [0]
+
+    def flaky(session_id, prompt):
+        tries[0] += 1
+        if tries[0] < 2:
+            yield {"event": "error", "status": 502, "detail": "database is locked"}
+        else:
+            yield {"event": "message", "text": "built it"}
+
+    rid = SW.start("g", ".", "opencode", _spawn, flaky,
+                   phases=[{"title": "a", "task": "t", "needs": []}], review=False)
+    st = _wait(rid, timeout=30)
+    assert st["state"] == SW.DONE
+    assert st["agents"][0]["summary"] == "built it"
+    assert tries[0] == 2
+
+
+def test_a_real_failure_is_not_retried():
+    """Retrying a phase whose model refused, or whose prompt is wrong, just
+    spends the same tokens again and delays the answer."""
+    tries = [0]
+
+    def broken(session_id, prompt):
+        tries[0] += 1
+        yield {"event": "error", "detail": "no API key for this provider"}
+
+    rid = SW.start("g", ".", "opencode", _spawn, broken,
+                   phases=[{"title": "a", "task": "t", "needs": []}], review=False)
+    st = _wait(rid, timeout=20)
+    assert st["state"] == SW.FAILED
+    assert tries[0] == 1
+
+
+def test_it_gives_up_rather_than_retrying_forever():
+    tries = [0]
+
+    def always_locked(session_id, prompt):
+        tries[0] += 1
+        yield {"event": "error", "detail": "database is locked"}
+
+    rid = SW.start("g", ".", "opencode", _spawn, always_locked,
+                   phases=[{"title": "a", "task": "t", "needs": []}], review=False)
+    st = _wait(rid, timeout=60)
+    assert st["state"] == SW.FAILED
+    assert tries[0] == SW.AGENT_ATTEMPTS
+
+
+def test_a_retry_gets_a_fresh_session():
+    """The session we were handed may not have survived whatever went wrong
+    while it was being created."""
+    seen = []
+
+    def flaky(session_id, prompt):
+        seen.append(session_id)
+        if len(seen) < 2:
+            yield {"event": "error", "detail": "database is locked"}
+        else:
+            yield {"event": "message", "text": "ok"}
+
+    rid = SW.start("g", ".", "opencode", _spawn, flaky,
+                   phases=[{"title": "a", "task": "t", "needs": []}], review=False)
+    _wait(rid, timeout=30)
+    assert len(set(seen)) == 2, seen
+
+
+def test_stopping_a_run_beats_a_pending_retry():
+    started = threading.Event()
+
+    def locked(session_id, prompt):
+        started.set()
+        yield {"event": "error", "detail": "database is locked"}
+
+    rid = SW.start("g", ".", "opencode", _spawn, locked,
+                   phases=[{"title": "a", "task": "t", "needs": []}], review=False)
+    started.wait(5)
+    assert SW.stop(rid) is True
+    assert SW.status(rid)["state"] == SW.STOPPED
+
+
+def test_workers_in_a_wave_do_not_all_start_at_once():
+    """The collision is concentrated in the first moments, when every worker is
+    opening the same store."""
+    starts = []
+
+    def note(session_id, prompt):
+        starts.append(time.time())
+        yield {"event": "message", "text": "ok"}
+
+    rid = SW.start("g", ".", "opencode", _spawn, note, phases=PHASES, review=False)
+    _wait(rid, timeout=40)
+    assert len(starts) == 3
+    assert max(starts) - min(starts) >= SW.SPAWN_STAGGER, \
+        "workers started within %.2fs of each other" % (max(starts) - min(starts))
+
+
+def test_the_stagger_is_seconds_not_minutes():
+    """It is paid on every wave of every run; a phase runs for minutes."""
+    assert 0 < SW.SPAWN_STAGGER <= 5
+
+
+def test_a_run_keeps_writing_where_it_started():
+    """A run outlives the call that started it by minutes. Re-reading the
+    store directory on every write means a run begun under one setting
+    finishes under another -- its later phases land somewhere its earlier ones
+    did not, and the file is left describing half a run.
+
+    It showed up as a flaky suite: a worker thread from a finished test wrote
+    its last phase into the NEXT test's directory, and that test then loaded a
+    run it had never started."""
+    started_at = SW._store_root()
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("ok"), phases=PHASES,
+                   review=False)
+    run = SW.get(rid)
+    assert run.store_root == started_at
+    os.environ[SW._STORE_ENV] = started_at + "-moved"
+    try:
+        _wait(rid)
+        assert SW._run_path(rid, root=run.store_root).startswith(started_at)
+        assert os.path.isfile(SW._run_path(rid, root=run.store_root))
+    finally:
+        os.environ[SW._STORE_ENV] = started_at

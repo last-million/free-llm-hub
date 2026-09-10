@@ -232,9 +232,13 @@ def test_the_settings_model_table_shows_it():
 
 
 def test_it_loads_alongside_the_model_list():
+    """Anchored to the FUNCTION BODY, not a fixed character window: a 900-char
+    slice measures how many comments happen to sit above the line, and it broke
+    the moment the loader gained any."""
     html = _template()
-    i = html.index("function loadSdModels(")
-    assert "loadSdSpeed();" in html[i:i + 900]
+    body = html[html.index("function loadSdModels("):]
+    body = body[:body.index(chr(10) + "    function initSdModels(")]
+    assert "loadSdSpeed();" in body
 
 
 def test_the_badge_prefers_time_to_first_token():

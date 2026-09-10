@@ -433,3 +433,130 @@ def test_every_element_the_page_asks_for_exists():
     js_ids = set(re.findall(r"\$\('#([A-Za-z0-9_-]+)'\)", SRC))
     known = {"settings-drawer", "settings-drawer-close", "settings-drawer-scrim"}
     assert (js_ids - html_ids) <= known, sorted(js_ids - html_ids - known)
+
+
+# --------------------------------------------------------------------------- #
+# The whole page rendered nothing, and one undeclared name was why
+# --------------------------------------------------------------------------- #
+
+def test_every_name_the_settings_loader_assigns_is_declared():
+    """REPORTED: "je ne vois pas les models et modes et blacklist et whitelist
+    ... rien n'est affiche".
+
+    MEASURED in a real browser on the live hub: `Could not load: _sdCats is not
+    defined`. This script block is 'use strict', so assigning to an undeclared
+    name throws ReferenceError -- loadSdModels threw on its FIRST assignment,
+    the promise rejected, and nothing on the page rendered: no models, no modes,
+    no lists, no sessions. Zero console errors, because the rejection was
+    caught. The one visible trace was written into a box that was empty anyway.
+    """
+    body = SRC[SRC.index("function loadSdModels("):]
+    body = body[:body.index(chr(10) + "    function initSdModels(")]
+    import re
+    assigned = set(re.findall(r"^\s*(_sd[A-Za-z]+)\s*=", body, re.M))
+    assert assigned, "the loader stopped assigning state"
+    for name in sorted(assigned):
+        assert ("var " + name) in SRC, "%s is assigned but never declared" % name
+
+
+def test_the_mode_row_has_a_renderer():
+    """loadSdModels has always called renderSdCats() and no such function was
+    ever written, so even with the variables declared the load threw one line
+    later. #sd-cats sat empty in the markup since the Settings rebuild."""
+    assert "function renderSdCats(" in SRC
+    assert 'id="sd-cats"' in SRC
+
+
+def test_every_function_the_settings_loader_calls_exists():
+    """The check that found it. A call to a name nobody defined is a page that
+    renders nothing, and no text assertion about markup would ever see it."""
+    import re
+    body = SRC[SRC.index("function loadSdModels("):]
+    body = body[:body.index(chr(10) + "    function initSdModels(")]
+    called = set(re.findall(r"\b(render[A-Z]\w*|load[A-Z]\w*)\(", body))
+    for name in sorted(called):
+        assert ("function " + name + "(") in SRC, "%s() is called but never defined" % name
+
+
+def test_a_mode_chip_writes_the_same_setting_the_dropdown_does():
+    body = SRC[SRC.index("function renderSdCats("):]
+    body = body[:body.index(chr(10) + "    function renderWhitelistStrip(")]
+    assert "'/api/model-mode'" in body
+    assert "payload.session_id = _sdScope" in body
+
+
+def test_a_scoped_read_shows_the_conversations_own_mode():
+    """With a session in scope the endpoint returns the GLOBAL mode in `mode`
+    and that conversation's under `session.mode`, so reading `mode` showed the
+    wrong one for exactly the case the scope selector exists for."""
+    assert "res[2].session && res[2].session.mode" in SRC
+    assert "api('/api/model-mode' + q)" in SRC
+
+
+def test_the_view_you_land_on_loads_its_data():
+    """The router lives in an earlier <script> block and routes to the current
+    view before the later block defines cxOnViewChange, so the guard inside
+    cxShow skipped it and a direct /settings load fetched nothing."""
+    assert "window.cxCurrentView = view;" in SRC
+    assert "window.cxOnViewChange(window.cxCurrentView)" in SRC
+
+
+# --------------------------------------------------------------------------- #
+# Picking several, then acting once
+# --------------------------------------------------------------------------- #
+
+def test_every_row_can_be_ticked():
+    assert 'class="sd-pick"' in SRC
+    assert 'data-pick="' in SRC
+
+
+def test_the_action_bar_exists_and_covers_both_lists():
+    for id_ in ("sd-bulk-allow", "sd-bulk-disallow",
+                "sd-bulk-block", "sd-bulk-unblock", "sd-bulk-none"):
+        assert 'id="%s"' % id_ in SRC, id_
+
+
+def test_the_bar_is_hidden_until_something_is_picked():
+    """An action bar for zero rows is a permanent strip of disabled buttons."""
+    assert '<div class="sd-bulk" id="sd-bulk" hidden>' in SRC
+    body = SRC[SRC.index("function renderSdBulk("):]
+    body = body[:body.index(chr(10) + "    function sdBulkApply(")]
+    assert "bar.hidden = !picked.length" in body
+
+
+def test_a_bulk_action_sends_one_request_for_all_of_them():
+    body = SRC[SRC.index("function sdBulkApply("):]
+    body = body[:body.index(chr(10) + "    function initSdBulk(")]
+    assert "identities: picked" in body
+    assert "'/api/model-identities'" in body
+
+
+def test_it_follows_the_scope_selector():
+    """"for each session and globally but we can customize for each session
+    conversation"."""
+    body = SRC[SRC.index("function sdBulkApply("):]
+    body = body[:body.index(chr(10) + "    function initSdBulk(")]
+    assert "payload.session_id = _sdScope" in body
+
+
+def test_changing_scope_drops_the_selection():
+    """A tick made against the global list is not a tick against a
+    conversation's."""
+    body = SRC[SRC.index("if (sc) sc.addEventListener('change'"):]
+    body = body[:body.index("loadSdModels(true);") + 20]
+    assert "_sdPicked = {}" in body
+
+
+def test_the_bar_says_which_scope_it_will_write_to():
+    body = SRC[SRC.index("function renderSdBulk("):]
+    body = body[:body.index(chr(10) + "    function sdBulkApply(")]
+    assert "this conversation only" in body and "global default" in body
+
+
+def test_the_refusal_is_read_out_rather_than_swallowed():
+    """The server refuses a whitelist that would serve nothing, and warns when
+    one has narrowed to almost nothing."""
+    body = SRC[SRC.index("function sdBulkApply("):]
+    body = body[:body.index(chr(10) + "    function initSdBulk(")]
+    assert "r.warning" in body
+    assert ".catch(function(e){ toast(e.message, true); })" in body

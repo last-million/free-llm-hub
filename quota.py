@@ -154,6 +154,11 @@ _MODEL_THROTTLE: dict = {}
 # probe waste: status() trusts a fresh header reading over the static table. Absent
 # for providers that send no such headers (they keep using the static budget).
 _DYNAMIC: dict = {}
+# The TOKEN allowance a provider last reported, same slot convention as
+# _DYNAMIC (pid, or pid|key-fingerprint). Separate because it answers a
+# different question: _DYNAMIC decides whether to CALL a provider, this one
+# reports how much of its token budget is left.
+_TOKENS: dict = {}
 _DYNAMIC_TTL = 3600.0   # a reading older than this is ignored (window likely rolled)
 
 # Rate-limit header conventions, widest-support first. "-requests" variants are the
@@ -578,6 +583,28 @@ def observe_headers(pid: str, headers, key=None) -> None:
     with _LOCK:
         _DYNAMIC[slot] = {"remaining": max(0, rem), "limit": lim,
                           "reset_at": reset_at, "seen": now}
+        # THE TOKEN BUCKET, KEPT AS ITSELF.
+        #
+        # Above, a spent token bucket is folded into the REQUEST count, because
+        # that is what routing needs to know: a provider with tokens left but no
+        # requests, or the reverse, is unusable either way. But folding it away
+        # also threw the only real token budget the hub ever sees, and "how many
+        # tokens do I have left today" then had no answer but a guess.
+        #
+        # REPORTED: "the bar on top for usage and how much remaining, they show
+        # requests and not how much tokens ... I want to show tokens used and
+        # remaining and total".
+        #
+        # Only what the provider actually said. A provider that sends no token
+        # header gets no token row, rather than an invented one.
+        if tok_rem is not None:
+            _TOKENS[slot] = {
+                "remaining": tok_rem,
+                "limit": _parse_int(_hdr(headers, _RL_LIMIT_TOK)),
+                "reset_at": _parse_reset(_hdr(headers, _RL_RESET_TOK), now)
+                            or reset_at,
+                "seen": now,
+            }
     _persist_maybe()
 
 
@@ -590,6 +617,29 @@ def _fresh(d, now):
     if d.get("reset_at") and d["reset_at"] <= now:     # its window already reset
         return None
     return d
+
+
+def _token_budget(pid: str, now: float):
+    """What this provider last said about its TOKEN allowance, or None.
+
+    Summed across keys for the same reason _dynamic sums: each key is its own
+    account with its own token pool. Unlike _dynamic this never invents a
+    floor -- it answers "what is left", not "may we try", so an honest zero is
+    the right answer and routing does not read it."""
+    prefix = pid + "|"
+    per = [v for k, v in _TOKENS.items()
+           if isinstance(k, str) and k.startswith(prefix) and _fresh(v, now)]
+    if not per:
+        one = _fresh(_TOKENS.get(pid), now)
+        per = [one] if one else []
+    if not per:
+        return None
+    limits = [d["limit"] for d in per if isinstance(d.get("limit"), int)]
+    resets = [d["reset_at"] for d in per if d.get("reset_at")]
+    return {"remaining": sum(int(d.get("remaining") or 0) for d in per),
+            "limit": sum(limits) if len(limits) == len(per) else None,
+            "reset_at": min(resets) if resets else None,
+            "keys_heard": len(per)}
 
 
 def _dynamic(pid: str, now: float):
@@ -788,6 +838,7 @@ def status(pid: str) -> dict:
     # static guess (both ways — a raised limit un-exhausts, a lowered one exhausts),
     # so quota changes are tracked with zero probe waste. `reset` moves to the header's
     # own reset when it gave one, so the countdown is the provider's real one.
+    tok = _token_budget(pid, now)
     dyn = _dynamic(pid, now)
     if dyn is not None:
         remaining = dyn["remaining"]
@@ -811,12 +862,25 @@ def status(pid: str) -> dict:
         reset_at = throttled_until
     else:
         reset_at = reset
-    return {
+    out = {
         "used": used, "limit": limit, "limit_known": limit_known,
         "remaining": remaining,
         "window": lim["window"], "resets_in": max(0, int(reset_at - now)),
         "resets_at": int(reset_at), "throttled": throttled, "exhausted": exhausted,
     }
+    # The token allowance, only when the provider itself reported one. Most free
+    # tiers meter tokens and publish nothing, so `tokens_known` false is the
+    # common and honest answer -- the dashboard says "no published token
+    # budget" rather than showing a number nobody stands behind.
+    if tok:
+        out["tokens_remaining"] = tok["remaining"]
+        out["tokens_limit"] = tok["limit"]
+        out["tokens_known"] = tok["limit"] is not None
+    else:
+        out["tokens_remaining"] = None
+        out["tokens_limit"] = None
+        out["tokens_known"] = False
+    return out
 
 
 def is_exhausted(pid: str) -> bool:
@@ -876,6 +940,7 @@ def save_state() -> None:
                 "model_throttle": {_throttle_key(pid, m): mt
                                    for (pid, m), mt in _MODEL_THROTTLE.items()},
                 "dynamic": _DYNAMIC,
+                "tokens": _TOKENS,
             }
         if _extra_dump is not None:
             try:
@@ -937,6 +1002,13 @@ def _load_state(path: str) -> None:
                     continue  # expired sideline — the model gets a fresh chance
                 pid, model = key.split("|", 1)
                 _MODEL_THROTTLE[(pid, model)] = mt
+        tokens = blob.get("tokens")
+        if isinstance(tokens, dict):
+            for slot, d in tokens.items():
+                if isinstance(slot, str) and isinstance(d, dict):
+                    _TOKENS[slot] = d
+            for slot in [k for k, v in list(_TOKENS.items()) if _fresh(v, now) is None]:
+                _TOKENS.pop(slot, None)
         dynamic = blob.get("dynamic")
         if isinstance(dynamic, dict):
             for pid, d in dynamic.items():

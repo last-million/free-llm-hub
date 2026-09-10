@@ -55,6 +55,18 @@ def _isolated(tmp_path, monkeypatch):
     config.invalidate_settings_cache()
 
 
+# The control gate wants this header on every /api/* write; the token is only
+# demanded once one is configured, and the isolated config above has none.
+_DASH = {"X-Free-LLM-Hub": "dashboard"}
+
+
+@pytest.fixture
+def client():
+    A.app.config["TESTING"] = True
+    with A.app.test_client() as c:
+        yield c
+
+
 # --------------------------------------------------------------------------- #
 # One model, every provider
 # --------------------------------------------------------------------------- #
@@ -277,3 +289,83 @@ def test_a_whitelist_that_narrows_to_nothing_says_so(client=None):
     body = src[i:i + 1400]
     assert '"warning"' in body
     assert "uses NOTHING else" in body
+
+
+# --------------------------------------------------------------------------- #
+# Several at once
+# --------------------------------------------------------------------------- #
+
+def test_a_list_of_models_is_one_action(client, monkeypatch):
+    """REQUESTED: "in blacklist and whitelist I want to be able to select which
+    ones I want to add there or remove from there". Twelve ticked boxes as
+    twelve requests means twelve rewrites of the same setting file and twelve
+    chances to end up half-applied."""
+    r = client.post("/api/model-identities",
+                    json={"identities": ["aaa-one", "bbb-two", "ccc-three"],
+                          "action": "block"}, headers=_DASH)
+    assert r.status_code == 200
+    blocked = r.get_json()["blocked"]
+    for ident in ("aaa-one", "bbb-two", "ccc-three"):
+        assert ident in blocked
+
+
+def test_one_model_still_works_the_old_way(client):
+    r = client.post("/api/model-identities",
+                    json={"identity": "solo-model", "action": "block"},
+                    headers=_DASH)
+    assert r.status_code == 200
+    assert "solo-model" in r.get_json()["blocked"]
+
+
+def test_duplicates_in_the_list_are_harmless(client):
+    r = client.post("/api/model-identities",
+                    json={"identities": ["dup", "dup", "DUP"], "action": "block"},
+                    headers=_DASH)
+    assert r.status_code == 200
+    assert r.get_json()["blocked"].count("dup") == 1
+
+
+def test_an_empty_list_is_refused(client):
+    r = client.post("/api/model-identities",
+                    json={"identities": [], "action": "block"}, headers=_DASH)
+    assert r.status_code == 400
+
+
+def test_a_body_that_is_trying_to_be_an_attack_is_refused(client):
+    import app as A
+    r = client.post("/api/model-identities",
+                    json={"identities": ["m%d" % i for i in range(A._MAX_BULK_IDENTITIES + 1)],
+                          "action": "block"}, headers=_DASH)
+    assert r.status_code == 400
+
+
+def test_a_bulk_edit_can_target_one_conversation(client, monkeypatch):
+    """"and also for each session and globally but we can customize for each
+    session conversation"."""
+    import agentic_chat
+    monkeypatch.setattr(agentic_chat, "get_session",
+                        lambda sid: {"session_id": sid, "mode": None})
+    r = client.post("/api/model-identities",
+                    json={"identities": ["x-one", "x-two"], "action": "block",
+                          "session_id": "sess-bulk"}, headers=_DASH)
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["scope"] == "sess-bulk"
+    assert "x-one" in body["blocked"] and "x-two" in body["blocked"]
+
+
+def test_removing_several_is_checked_against_what_would_be_left(client, monkeypatch):
+    """Removing two models where either alone would be fine can still leave a
+    whitelist that serves nothing -- so the guard runs against the state after
+    ALL of them are gone, not one at a time."""
+    import app as A
+    monkeypatch.setattr(A, "_identity_rows",
+                        lambda sid=None: [{"identity": "keep-me", "working": False},
+                                          {"identity": "live-a", "working": True},
+                                          {"identity": "live-b", "working": True}])
+    for ident in ("keep-me", "live-a", "live-b"):
+        A._set_identity_allowed(ident, True)
+    r = client.post("/api/model-identities",
+                    json={"identities": ["live-a", "live-b"], "action": "disallow"},
+                    headers=_DASH)
+    assert r.status_code == 400, "a whitelist with nothing working was allowed"

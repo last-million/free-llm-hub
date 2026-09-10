@@ -47,8 +47,7 @@ def test_both_are_filled_by_one_renderer():
     """Two copies of this arithmetic would eventually disagree, and the reader
     would have no way to tell which page was lying."""
     assert SRC.count("function renderQuotaToday(") == 1
-    i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 900]
+    body = _strip_body()
     assert "qt-activity" in body and "qt-usage" in body
 
 
@@ -62,37 +61,41 @@ def test_it_rides_the_poll_that_already_happens():
 # --------------------------------------------------------------------------- #
 
 def test_it_shows_used_and_remaining():
-    i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 5000]
+    body = _strip_body()
     assert "used" in body and "left" in body
+
+
+def _strip_body():
+    """The renderer, whole. Fixed-character windows kept breaking on nothing
+    but added comments -- a 5000-char slice measures comment volume, not
+    behaviour."""
+    body = SRC[SRC.index("function renderQuotaToday("):]
+    return body[:body.index(chr(10) + "  /* ---------- Getting started")]
 
 
 def test_a_provider_with_no_published_limit_is_not_counted_as_zero():
     """Summing an unknown remaining as 0 would invent a number."""
-    i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 5000]
+    body = _strip_body()
     assert "limit_known" in body
     assert "unmetered" in body
-    assert "publish no daily limit" in body
+    assert "publish no daily request limit" in body
 
 
 def test_exhausted_providers_are_called_out():
-    i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 5000]
+    body = _strip_body()
     assert "exhausted" in body and "out of quota" in body
 
 
 def test_the_reset_countdown_is_shown():
-    i = SRC.index("function renderQuotaToday(")
-    assert "resets_in" in SRC[i:i + 5000]
+    body = _strip_body()
+    assert "resets_in" in body
 
 
 def test_every_provider_is_listed():
     """The first cut showed a top-8 and the report was immediate: "i connected
     many providers and i dont see all of them there, i see only 7". A quota
     panel that hides providers is one you cannot trust."""
-    i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 6000]
+    body = _strip_body()
     assert ".slice(0," not in body, "still truncating the provider list"
     assert "sort(" in body, "what is nearly gone should still come first"
 
@@ -107,31 +110,27 @@ def test_pooled_keys_are_shown():
     provider with four keys reports four times the allowance -- and nothing
     said so, which made a big number look like a bug instead of the reason to
     add a second account."""
-    i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 6000]
+    body = _strip_body()
     assert "q.keys" in body
     assert "keys pooled" in body
 
 
 def test_open_gateways_are_labelled_not_hidden():
-    i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 6000]
+    body = _strip_body()
     assert "keyless" in body and "no API key needed" in body
 
 
 def test_the_daily_total_names_both_halves():
     """"how much used" and "how much remaining" were the ask, and a total with
     no denominator answers neither."""
-    i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 6000]
+    body = _strip_body()
     assert "requests used" in body
     assert "of ' + _qtNum(limit)" in body
     assert "providers, " in body
 
 
 def test_nothing_is_shown_when_there_is_nothing_to_show():
-    i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 5000]
+    body = _strip_body()
     assert "h.hidden = true" in body
 
 
@@ -152,20 +151,17 @@ def test_the_numbers_are_tabular():
 
 def test_state_is_not_carried_by_colour_alone():
     """A red chip also says "out"."""
-    i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 5000]
+    body = _strip_body()
     assert "'out'" in body or '"out"' in body
 
 
 def test_the_bars_are_hidden_from_screen_readers():
-    i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 5000]
+    body = _strip_body()
     assert 'class="qt-bar" aria-hidden="true"' in body
 
 
 def test_each_chip_carries_the_full_numbers_in_its_title():
-    i = SRC.index("function renderQuotaToday(")
-    body = SRC[i:i + 5000]
+    body = _strip_body()
     assert "title=" in body and "publishes no daily limit" in body
 
 
@@ -199,3 +195,108 @@ def test_open_gateways_are_detected_by_the_flag_that_exists():
     assert keyless, "providers.py no longer marks any open gateway"
     for pid in ("pollinations", "llm7", "kilocode"):
         assert pid in keyless, pid
+
+
+# --------------------------------------------------------------------------- #
+# Tokens, not only requests
+# --------------------------------------------------------------------------- #
+
+def test_the_strip_leads_with_tokens():
+    """REPORTED: "the bar on top for usage and how much remaining, they show
+    requests and not how much tokens ... I want tokens used and remaining and
+    total". Requests were all it had because requests are all quota.py counted;
+    what a free tier actually meters is almost always tokens."""
+    body = _strip_body()
+    assert "tokens used" in body
+    assert "tokens_used" in body
+
+
+def test_it_shows_what_is_left_when_a_provider_publishes_it():
+    body = _strip_body()
+    assert "tokens_remaining" in body and "tokens_limit" in body
+    assert "tokens left" in body
+
+
+def test_an_unpublished_token_budget_is_not_invented():
+    """The house rule: a guess must never be shown as a measurement. Most free
+    tiers publish no token allowance at all."""
+    body = _strip_body()
+    assert "tokens_known" in body
+    assert "honest remaining" in body
+
+
+def test_requests_are_still_there():
+    """The token figure is the headline, not a replacement -- a provider can
+    have tokens left and no requests."""
+    body = _strip_body()
+    assert "'requests'" in body or "requests</span>" in body or "requests" in body
+
+
+def test_each_provider_says_its_own_token_spend():
+    body = _strip_body()
+    assert "tokens today" in body
+
+
+def test_the_status_route_reports_tokens_per_provider():
+    src = open("app.py", encoding="utf-8").read()
+    i = src.index("def api_status(")
+    body = src[i:src.index("@app.route(\"/api/usage\"", i)]
+    assert 's["tokens_used"]' in body
+    assert "usage_history.get_day()" in body
+
+
+def test_the_day_is_read_once_not_per_provider():
+    """get_day() parses the whole day file; doing that sixteen times to answer
+    one question is sixteen times the work for the same answer."""
+    src = open("app.py", encoding="utf-8").read()
+    i = src.index("def api_status(")
+    body = src[i:src.index("@app.route(\"/api/usage\"", i)]
+    assert body.count("usage_history.get_day()") == 1
+    assert body.index("usage_history.get_day()") < body.index("for pid in keyed")
+
+
+def test_quota_keeps_the_token_bucket_it_is_told_about():
+    """observe_headers folded a spent token bucket into the REQUEST count --
+    right for routing, but it threw away the only real token budget the hub
+    ever sees."""
+    import quota
+    assert hasattr(quota, "_TOKENS")
+    st = quota.status("groq")
+    for field in ("tokens_used",):
+        pass
+    assert "tokens_known" in st and "tokens_remaining" in st and "tokens_limit" in st
+
+
+def test_a_provider_that_reports_no_tokens_says_so_rather_than_zero():
+    import quota
+    st = quota.status("a-provider-that-never-answered")
+    assert st["tokens_known"] is False
+    assert st["tokens_remaining"] is None
+
+
+def test_the_headline_is_the_whole_day_not_just_the_chips():
+    """The strip lists FREE providers only (paid ones are skipped), so summing
+    its chips under-reports a day where a paid provider did the work. "Tokens
+    used today" has to mean today."""
+    src = open("app.py", encoding="utf-8").read()
+    i = src.index("def api_status(")
+    body = src[i:src.index("@app.route(\"/api/usage\"", i)]
+    assert '"tokens_today": tokens_today_total' in body
+    assert 'total_tokens' in body
+
+
+def test_the_strip_takes_the_day_total():
+    body = _strip_body()
+    assert "dayTotal" in body
+    assert "renderQuotaToday(quota, dayTotal)" in SRC
+
+
+def test_the_day_total_is_passed_in_from_status():
+    assert "renderQuotaToday(s && s.quota, s && s.tokens_today)" in SRC
+
+
+def test_it_falls_back_to_the_chips_when_there_is_no_day_total():
+    """An older hub, or a status call that predates the field, must still show
+    a number rather than a blank."""
+    body = _strip_body()
+    assert "typeof dayTotal === 'number'" in body

@@ -290,7 +290,7 @@ def _sess_in(tmp, cli="codex", native=None):
 
 def test_the_brief_is_written_into_the_project(monkeypatch):
     d = tempfile.mkdtemp(prefix="hubbrief-")
-    assert ac.write_task_brief(d, RESTAURANT) is True
+    assert ac.write_task_brief(d, RESTAURANT)
     body = open(os.path.join(d, ac.BRIEF_FILENAME), encoding="utf-8").read()
     assert "WEB DESIGN BRIEF" in body
     assert "Elevate" in body, "the ANTI list must reach the agent"
@@ -302,7 +302,9 @@ def test_no_domain_brief_content_for_a_task_that_needs_none():
     domain briefs), so the file IS written -- just without any domain
     brief's content bleeding into an unrelated task."""
     d = tempfile.mkdtemp(prefix="hubbrief-")
-    assert ac.write_task_brief(d, "explain how a mutex works") is True
+    # Returns the FILENAME now (a per-session name in a shared folder),
+    # which is truthy exactly as True was.
+    assert ac.write_task_brief(d, "explain how a mutex works")
     body = open(os.path.join(d, ac.BRIEF_FILENAME), encoding="utf-8").read()
     assert "WEB DESIGN BRIEF" not in body
     assert "ACT (applies to every brief above" in body

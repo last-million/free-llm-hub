@@ -126,19 +126,20 @@ def _store_root():
     return os.path.join(os.path.expanduser("~"), ".free-llm-hub", "swarm-runs")
 
 
-def _run_path(run_id):
+def _run_path(run_id, root=None):
     rid = str(run_id or "")
     # Run ids are generated here (`swarm-` + hex) and never come from a user,
     # but this builds a filename, so it is checked like one anyway.
     if not re.match(r"^[A-Za-z0-9_-]{1,64}$", rid):
         return None
-    return os.path.join(_store_root(), rid + ".json")
+    return os.path.join(root or _store_root(), rid + ".json")
 
 
 def _persist(run):
     """Write one run to disk. Best-effort: a swarm never fails because the
     record of it could not be written."""
-    path = _run_path(getattr(run, "id", None))
+    path = _run_path(getattr(run, "id", None),
+                     root=getattr(run, "store_root", None))
     if not path:
         return False
     try:
@@ -381,7 +382,7 @@ class _Agent:
 class _Run:
     __slots__ = ("id", "goal", "project_dir", "cli_id", "agents", "state",
                  "error", "created_at", "ended_at", "stop_flag", "lock", "waves",
-                 "restored", "interrupted")
+                 "restored", "interrupted", "store_root")
 
     def __init__(self, goal, project_dir, cli_id, phases):
         self.id = "swarm-" + uuid.uuid4().hex[:12]
@@ -400,6 +401,12 @@ class _Run:
         # can be read but never advances.
         self.restored = False
         self.interrupted = False
+        # WHERE THIS RUN'S FILE LIVES, decided once. A run outlives the call
+        # that started it by minutes, and re-reading the directory on every
+        # write means a run that started under one setting finishes under
+        # another -- so its later phases land somewhere its earlier ones did
+        # not, and the file is left describing half a run.
+        self.store_root = _store_root()
 
     def row(self, with_events=False):
         return {
@@ -593,8 +600,56 @@ def _drain(agent, events):
             if isinstance(text, str) and text.strip():
                 last_text = text
         elif kind in ("error", "stopped"):
-            agent.error = str(ev.get("error") or ev.get("text") or kind)[:400]
+            # `detail` is where agentic_chat actually puts the reason -- the
+            # other two keys are usually absent, so every failure was recorded
+            # as the word "error" and the run told you nothing about why. The
+            # first live run failed two phases on "database is locked" and the
+            # stored error for both was, literally, "error".
+            agent.error = str(ev.get("detail") or ev.get("error")
+                              or ev.get("text") or kind)[:400]
     return last_text
+
+
+# A FAILURE THAT IS NOT THE AGENT'S FAULT.
+#
+# MEASURED on the first real run of this module against a live hub: a plan with
+# three independent phases started three opencode workers at the same instant,
+# and two died immediately with
+#
+#     502  Error: Unexpected error / database is locked
+#
+# opencode keeps ONE SQLite database for the whole machine
+# (~/.local/share/opencode/opencode.db). Three processes opening it together is
+# three writers on one file, and the two that lose the race get that. Nothing
+# was wrong with the model, the prompt or the work -- the phase simply never
+# started, which is exactly what "beaucoup de models dans les swarm no answer"
+# looks like from the outside.
+#
+# Two answers, both here. The wave staggers its spawns so the collision mostly
+# does not happen, and a worker that dies on a transient error like this gets
+# another go rather than being written off.
+_TRANSIENT_ERRORS = (
+    "database is locked",       # opencode's shared SQLite store
+    "database table is locked",
+    "resource temporarily unavailable",
+    "sqlite_busy",
+    "ebusy",
+    "eagain",
+    "being used by another process",
+)
+# Attempts per worker, total. Two is enough for a lock that clears in seconds
+# and short enough that a genuinely broken phase still fails quickly.
+AGENT_ATTEMPTS = 3
+RETRY_BACKOFF = 4.0
+# Seconds between starting one worker and the next in the same wave. Cheap
+# insurance: the collision above is concentrated in the first moments, when
+# every worker is opening the same database.
+SPAWN_STAGGER = 2.0
+
+
+def _is_transient(text):
+    low = str(text or "").lower()
+    return any(marker in low for marker in _TRANSIENT_ERRORS)
 
 
 def _run_agent(run, agent, spawn, run_turn, configure=None):
@@ -603,6 +658,27 @@ def _run_agent(run, agent, spawn, run_turn, configure=None):
         return
     agent.state = RUNNING
     agent.started_at = time.time()
+    for attempt in range(1, AGENT_ATTEMPTS + 1):
+        if run.stop_flag.is_set():
+            agent.state = STOPPED
+            break
+        _run_agent_once(run, agent, spawn, run_turn, configure)
+        if agent.state != FAILED or not _is_transient(agent.error):
+            break
+        if attempt < AGENT_ATTEMPTS:
+            # A fresh session too: the one we got may not have survived
+            # whatever went wrong while it was being created.
+            agent.session_id = None
+            agent.error = None
+            agent.state = RUNNING
+            time.sleep(RETRY_BACKOFF * attempt)
+    agent.ended_at = time.time()
+    # Every phase boundary, not every event: a phase is the unit of work worth
+    # surviving a restart, and its summary is what the orchestrator reads back.
+    _persist(run)
+
+
+def _run_agent_once(run, agent, spawn, run_turn, configure=None):
     try:
         agent.session_id = spawn(run.cli_id, run.project_dir)
         # DIFFERENT MODELS FOR DIFFERENT PHASES. The planner says what kind of
@@ -630,23 +706,24 @@ def _run_agent(run, agent, spawn, run_turn, configure=None):
         # A worker that dies must not take the wave with it.
         agent.state = FAILED
         agent.error = "%s: %s" % (exc.__class__.__name__, exc)
-    finally:
-        agent.ended_at = time.time()
-        # Every phase boundary, not every event: a phase is the unit of work
-        # worth surviving a restart, and its summary is what the orchestrator
-        # reads back.
-        _persist(run)
 
 
 def _run_wave(run, indexes, spawn, run_turn, configure=None):
     threads = []
-    for i in indexes[:MAX_CONCURRENT] if len(indexes) > MAX_CONCURRENT else indexes:
+    first = indexes[:MAX_CONCURRENT] if len(indexes) > MAX_CONCURRENT else indexes
+    for n, i in enumerate(first):
         agent = run.agents[i - 1]
         t = threading.Thread(target=_run_agent,
                              args=(run, agent, spawn, run_turn, configure),
                              daemon=True, name="swarm-%s-%d" % (run.id, i))
         t.start()
         threads.append((t, agent))
+        # Staggered, not simultaneous. Every worker opens the same CLI state
+        # store in its first moments, and starting three at the same instant is
+        # what put two of them on "database is locked" (see _TRANSIENT_ERRORS).
+        # Seconds against a phase that runs for minutes.
+        if SPAWN_STAGGER and n + 1 < len(first) and not run.stop_flag.is_set():
+            time.sleep(SPAWN_STAGGER)
     # Anything past the concurrency cap runs as soon as a slot frees, which is
     # what the cap is FOR -- a plan with eight independent phases must not spawn
     # eight CLI processes at once.

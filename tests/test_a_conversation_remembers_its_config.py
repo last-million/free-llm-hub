@@ -154,3 +154,56 @@ def test_it_does_not_rewrite_the_file_on_every_turn():
     body = src[src.index("def set_mode("):]
     body = body[:body.index("\ndef ")]
     assert 'if conv.get("mode") == mode:' in body
+
+
+# --------------------------------------------------------------------------- #
+# ...but only if there was somewhere to write it
+# --------------------------------------------------------------------------- #
+
+def test_a_mode_set_before_the_first_turn_is_not_lost(tmp_path, monkeypatch):
+    """MEASURED against a live hub: a swarm worker configured with mode
+    "coding" had it on the live session and NOTHING in its saved conversation.
+
+    agentic_history.set_mode starts with `conv = _load_conversation(...)` and
+    returns when there is no row -- and the row is only created by the first
+    recorded turn. So picking a mode in Settings and then sending the first
+    message wrote the mode into memory only: it survived until the next hub
+    restart and came back as none, which is the half of "per-conversation
+    models, saved" that was quietly missing."""
+    monkeypatch.setenv(AH._ROOT_ENV if hasattr(AH, "_ROOT_ENV")
+                       else "FREE_LLM_HUB_CONFIG", str(tmp_path / "cfg.json"))
+    assert AH.set_mode("never-recorded", "coding") is None
+
+
+def test_the_turn_route_writes_the_mode_as_well_as_the_quality():
+    """The comment at that call site says "keep the saved conversation's MODE in
+    step with the live session" and the line under it wrote only the quality."""
+    src = open("app.py", encoding="utf-8").read()
+    for anchor in ('agentic_history.set_quality(session_id, sess_info.get("quality") or "normal")',):
+        assert src.count(anchor) == 2, "call sites moved"
+    assert src.count('agentic_history.set_mode(session_id, sess_info.get("mode"))') == 2
+
+
+def test_both_the_streaming_and_the_plain_route_do_it():
+    """The dashboard streams every turn; a fix on the non-streaming route only
+    would have been invisible to the people who reported it."""
+    src = open("app.py", encoding="utf-8").read()
+    i = src.index('@app.route("/api/agent/sessions/<session_id>/message", methods=["POST"])')
+    j = src.index('@app.route("/api/agent/sessions/<session_id>/message/stream"')
+    k = src.index('@app.route("/api/agent/sessions/<session_id>/quality"')
+    assert 'agentic_history.set_mode(session_id' in src[i:j]
+    assert 'agentic_history.set_mode(session_id' in src[j:k]
+
+
+def test_the_lists_need_nothing_on_resume():
+    """REQUESTED: "he should auto remember what was the settings for the
+    conversation, to continue in future with the same models selection".
+
+    The allow/block lists are keyed by SESSION ID in the config, and the resume
+    route hands resume_session the ORIGINAL id -- so they are in force the
+    moment the conversation is back, with nothing to restore. That only holds
+    while the id is reused, which is what this pins.""" 
+    src = open("app.py", encoding="utf-8").read()
+    i = src.index("def api_agent_resume_session(")
+    body = src[i:i + 4000]
+    assert "session_id=session_id" in body

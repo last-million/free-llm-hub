@@ -127,7 +127,7 @@ def test_restarts_immediately_when_nothing_is_busy(isolated_config, clean_regist
     _stub_successful_pull(monkeypatch)
     calls = []
     monkeypatch.setattr(app, "_reexec_soon", lambda: calls.append("reexec_soon"))
-    monkeypatch.setattr(app, "_reexec_when_idle", lambda busy: calls.append(("deferred", busy)))
+    monkeypatch.setattr(app, "_reexec_when_idle", lambda busy, runs=(): calls.append(("deferred", busy)))
 
     result = app._do_update_check()
 
@@ -142,7 +142,7 @@ def test_defers_when_an_agent_session_is_mid_turn(isolated_config, clean_registr
     _register(clean_registry, "busy-sess", busy=True)
     calls = []
     monkeypatch.setattr(app, "_reexec_soon", lambda: calls.append("reexec_soon"))
-    monkeypatch.setattr(app, "_reexec_when_idle", lambda busy: calls.append(("deferred", busy)))
+    monkeypatch.setattr(app, "_reexec_when_idle", lambda busy, runs=(): calls.append(("deferred", busy)))
 
     result = app._do_update_check()
 
@@ -158,7 +158,7 @@ def test_defers_when_a_v1_request_is_in_flight(isolated_config, clean_registry,
     app._runtime_active[0] = 1
     calls = []
     monkeypatch.setattr(app, "_reexec_soon", lambda: calls.append("reexec_soon"))
-    monkeypatch.setattr(app, "_reexec_when_idle", lambda busy: calls.append(("deferred", busy)))
+    monkeypatch.setattr(app, "_reexec_when_idle", lambda busy, runs=(): calls.append(("deferred", busy)))
 
     result = app._do_update_check()
 
@@ -174,7 +174,7 @@ def test_no_new_commits_never_touches_restart_logic_at_all(isolated_config, clea
     _stub_successful_pull(monkeypatch, before="same7890", after="same7890")
     calls = []
     monkeypatch.setattr(app, "_reexec_soon", lambda: calls.append("reexec_soon"))
-    monkeypatch.setattr(app, "_reexec_when_idle", lambda busy: calls.append("deferred"))
+    monkeypatch.setattr(app, "_reexec_when_idle", lambda busy, runs=(): calls.append("deferred"))
 
     result = app._do_update_check()
 
@@ -288,7 +288,7 @@ def test_update_check_defers_restart_when_dependency_install_fails(
     _stub_successful_pull(monkeypatch, deps_ok=False)
     calls = []
     monkeypatch.setattr(app, "_reexec_soon", lambda: calls.append("reexec_soon"))
-    monkeypatch.setattr(app, "_reexec_when_idle", lambda busy: calls.append(("deferred", busy)))
+    monkeypatch.setattr(app, "_reexec_when_idle", lambda busy, runs=(): calls.append(("deferred", busy)))
 
     result = app._do_update_check()
 
