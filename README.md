@@ -24,8 +24,8 @@ http://127.0.0.1:8787
   port — plus an MCP server. A tool that speaks any of them just works.
 - **Free tiers, pooled and rotated.** 61 providers in the registry; 8 are marked
   paid so orchestrated routing can never pick them. Several need no signup at
-  all. Multiple keys per provider are rotated, and a spent key is put on
-  cooldown rather than retried.
+  all. A provider whose allowance is spent goes on cooldown rather than being
+  retried into the same refusal.
 - **It learns which models actually answer.** A reliability and latency ledger
   survives restarts, so routing stops choosing the free model that keeps timing
   out on you.
@@ -108,9 +108,9 @@ The hub exposes its routing as **model ids**, so any CLI can pick one with
 | Family | Ids | What it changes |
 | --- | --- | --- |
 | **Effort** | `auto`, `best`, `swarm` | how hard to try |
-| **Mode** | `coding`, `reasoning`, `context`, `vision`, `uncensored`, `fast`, `specialist` | which kind of model |
+| **Mode** | `coding`, `reasoning`, `context`, `vision`, `fast`, `specialist` … | which kind of model |
 
-Codex gets both as its native two-screen picker (model, then reasoning level).
+Codex gets both as its native two-screen picker (model, then reasoning level). The full, live list of modes — with how many models each one currently has — is on the **Settings** page, and at `GET /api/model-mode`.
 
 ---
 
