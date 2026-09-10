@@ -3159,6 +3159,12 @@
       <div class="chat-messages" id="chat-messages" aria-live="polite">
         <div class="chat-empty">Pick a model &mdash; or leave it on Auto, which works once at least one provider is enabled + keyed &mdash; and start chatting.</div>
       </div>
+      <!-- The chat's "Prompt enhanced by X - Revert" line. showEnhancedNote
+           starts with `if (!host) return;`, and this element did not exist: the
+           enhancer ran, rewrote the box, and told the user nothing, with no way
+           back to what they had typed. The image tab has had its copy all
+           along (#image-enhanced-note). -->
+      <div class="enhanced-note" id="chat-enhanced-note" role="status"></div>
       <div class="chat-input-row">
         <textarea id="chat-text" placeholder="Type a message&hellip;  (Enter to send, Shift+Enter for a new line)" aria-label="Message" rows="2"></textarea>
         <div class="chat-send-col">
@@ -8297,6 +8303,7 @@
     function showStartState(){
       sessionId = null;
       curProjectDir = null;
+      curSessionCli = null;
       if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', null);
       setSetupVisible(true);
       startRow.hidden = false;
@@ -8311,11 +8318,16 @@
     }
 
     var curProjectDir = null;
+    var curSessionCli = null;
     function currentProjectDir(){ return curProjectDir; }
     /* Exported for the Swarm panel, which lives outside this IIFE: a swarm
        works in the folder of the session you already have open, so the path
        does not have to be typed a second time. */
     window.cxAgentProjectDir = currentProjectDir;
+    /* And which CLI it is running. The Swarm panel hard-coded 'opencode', so a
+       session opened with codex or claude quietly spawned its workers under a
+       different agent than the one the user chose. */
+    window.cxAgentCli = function(){ return curSessionCli || currentCli(); };
 
     /* The CLI picker and workspace-mode toggle choose what a session WILL be;
        once one is running they are inert, and they were costing ~150px of
@@ -8793,6 +8805,7 @@
 
     function showSessionState(cli, dir){
       curProjectDir = dir;
+      curSessionCli = cli || null;
       startRow.hidden = true;
       setSetupVisible(false);
       sessionBox.hidden = false;
@@ -10866,9 +10879,15 @@
     loadSocialWebSearch(true); loadSdModels(true);
     loadUpdateStatus(true);
   }
+  /* The drawer markup is GONE -- Settings is a page now. These stayed behind
+     for the legacy entry point, and closeSettingsDrawer dereferenced elements
+     that no longer exist, so the Escape handler below threw a TypeError on
+     every Escape press anywhere on the site. */
   function closeSettingsDrawer(){
-    $('#settings-drawer').hidden = true;
-    $('#settings-drawer-scrim').hidden = true;
+    var d = $('#settings-drawer'), scrim = $('#settings-drawer-scrim');
+    if (!d) return;
+    d.hidden = true;
+    if (scrim) scrim.hidden = true;
     if (_drawerReturnFocus && _drawerReturnFocus.focus){
       try{ _drawerReturnFocus.focus(); }catch(e){}
       _drawerReturnFocus = null;
@@ -10882,7 +10901,8 @@
     if (closeBtn) closeBtn.addEventListener('click', closeSettingsDrawer);
     if (scrim) scrim.addEventListener('click', closeSettingsDrawer);
     document.addEventListener('keydown', function(e){
-      if (e.key === 'Escape' && !$('#settings-drawer').hidden) closeSettingsDrawer();
+      var d = $('#settings-drawer');
+      if (e.key === 'Escape' && d && !d.hidden) closeSettingsDrawer();
     });
   }
 
@@ -11102,7 +11122,8 @@
       if (!dir){ toast('Open or create a session first \u2014 the swarm works in its folder', true); return; }
       go.disabled = true;
       api('/api/swarm-windows', { method: 'POST',
-          body: { goal: text, project_dir: dir, cli: 'opencode' } })
+          body: { goal: text, project_dir: dir,
+                  cli: (window.cxAgentCli && window.cxAgentCli()) || 'opencode' } })
         .then(function(run){
           goal.value = '';
           toast('Swarm started \u2014 ' + (run.total || 0) + ' phases');

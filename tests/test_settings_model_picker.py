@@ -393,3 +393,43 @@ def test_the_modes_come_from_the_same_call_that_renders_them():
 def test_refreshing_the_sessions_panel_still_works_on_its_own():
     """The button must not have been made to depend on a model reload."""
     assert "sr.addEventListener('click', function(){ loadSdSessions(); })" in SRC
+
+
+# --------------------------------------------------------------------------- #
+# Two controls that had quietly lost the elements they act on
+# --------------------------------------------------------------------------- #
+
+def test_escape_does_not_throw_now_that_the_drawer_is_a_page():
+    """Settings became a PAGE, and the drawer markup went with it -- but the
+    global keydown handler still read `$('#settings-drawer').hidden`. That is a
+    TypeError on every Escape press anywhere on the site, from an element that
+    has not existed since the rebuild."""
+    body = SRC[SRC.index("function initSettingsDrawer("):]
+    line = body[:body.index(chr(10) + "  }")]
+    assert "$('#settings-drawer').hidden" not in line
+    assert "d &&" in line
+
+
+def test_closing_a_drawer_that_is_not_there_is_a_no_op():
+    body = SRC[SRC.index("function closeSettingsDrawer("):]
+    body = body[:body.index("\n  function initSettingsDrawer(")]
+    assert "if (!d) return;" in body
+
+
+def test_the_chat_says_when_it_rewrote_your_prompt():
+    """showEnhancedNote opens with `if (!host) return;` and #chat-enhanced-note
+    did not exist: the enhancer ran, replaced what the user had typed, and told
+    them nothing -- with no Revert. The image tab has had its copy all along."""
+    assert 'id="chat-enhanced-note"' in SRC
+    assert SRC.index('id="chat-enhanced-note"') < SRC.index('id="chat-text"')
+
+
+def test_every_element_the_page_asks_for_exists():
+    """The check that found both of the above. The three settings-drawer ids
+    are the legacy entry point and are all guarded now; anything NEW here is a
+    control acting on nothing."""
+    import re
+    html_ids = set(re.findall(r'\bid="([A-Za-z0-9_-]+)"', SRC))
+    js_ids = set(re.findall(r"\$\('#([A-Za-z0-9_-]+)'\)", SRC))
+    known = {"settings-drawer", "settings-drawer-close", "settings-drawer-scrim"}
+    assert (js_ids - html_ids) <= known, sorted(js_ids - html_ids - known)

@@ -10881,6 +10881,63 @@ def _playwright_profile_dir():
     return path
 
 
+def _playwright_marker_path():
+    """Where the hub records HOW it started the browser server.
+
+    The server outlives the hub -- that is the point of it -- so the next start
+    adopts whatever is already on the port. Without a record of the flags it was
+    started with, a server launched before --shared-browser-context existed
+    would be adopted forever and every turn would keep getting its own fresh
+    browser. This is the only way to tell "the server I started, with these
+    flags" from "a server someone else is running", and the second must never
+    be killed."""
+    return os.path.join(_home(), ".free-llm-hub", "playwright-server.json")
+
+
+def _playwright_marker():
+    try:
+        with open(_playwright_marker_path(), encoding="utf-8") as fh:
+            got = json.load(fh)
+        return got if isinstance(got, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_playwright_marker(pid, shared=True):
+    try:
+        path = _playwright_marker_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"port": _PLAYWRIGHT_PORT, "pid": pid,
+                       "shared": bool(shared), "at": time.time()}, fh)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _retire_stale_playwright(marker):
+    """Stop a browser server THIS hub started without the shared context.
+
+    Only ever a pid we wrote down ourselves. A server we did not start has no
+    marker, so it is adopted exactly as before -- killing someone else's browser
+    because it does not carry a flag we happen to want is not a trade this hub
+    gets to make."""
+    pid = marker.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10, creationflags=_CREATE_NO_WINDOW)
+        else:
+            os.kill(pid, 15)
+        _log.info("[playwright] retired the pre-shared-context server (pid %d)", pid)
+        time.sleep(1.5)
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _playwright_probe(port):
     """The URL this build of @playwright/mcp actually serves, or None.
 
@@ -10907,19 +10964,45 @@ def _start_playwright_mcp():
     try:
         found = _playwright_probe(_PLAYWRIGHT_PORT)
         if found:
-            _playwright_url[0] = found          # already running: adopt it
-            _log.info("[playwright] reusing the browser server on %s", found)
-            return
+            marker = _playwright_marker()
+            # Ours, but started before the shared context was asked for: adopting
+            # it would keep handing every turn its own fresh browser forever.
+            if marker.get("pid") and not marker.get("shared"):
+                if _retire_stale_playwright(marker):
+                    found = _playwright_probe(_PLAYWRIGHT_PORT)
+            if found:
+                _playwright_url[0] = found      # already running: adopt it
+                _log.info("[playwright] reusing the browser server on %s", found)
+                return
         if not _which_cli("npx") and not shutil.which("npx"):
             return                               # no node: stay on STDIO
+        # --shared-browser-context IS THE "KEEP SAME SESSION" PART.
+        #
+        # A long-lived server was only half of it. Without this flag every
+        # connected HTTP client gets its OWN browser context -- and this hub
+        # re-spawns the CLI for every turn, so every turn is a new client and
+        # therefore a new context: a fresh browser, logged out, on a blank page,
+        # which is the exact failure the shared server was started to fix.
+        # From the tool's own help: "reuse the same browser context between all
+        # connected HTTP clients."
+        #
+        # The cost is that parallel swarm workers share one browser rather than
+        # getting one each. That is the right trade: keeping a session between
+        # turns is what was asked for and what browser work actually depends on,
+        # while two agents driving a browser at the same instant is rare and
+        # degrades to them taking turns rather than to anything breaking.
         argv = ["npx", "-y", "@playwright/mcp@latest",
-                "--port", str(_PLAYWRIGHT_PORT), "--host", "127.0.0.1"]
+                "--port", str(_PLAYWRIGHT_PORT), "--host", "127.0.0.1",
+                "--shared-browser-context"]
         profile = _playwright_profile_dir()
         if profile:
             argv += ["--user-data-dir", profile]
-        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL, creationflags=_CREATE_NO_WINDOW,
-                         shell=(os.name == "nt"))
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                stdin=subprocess.DEVNULL,
+                                creationflags=_CREATE_NO_WINDOW,
+                                shell=(os.name == "nt"))
+        _write_playwright_marker(proc.pid, shared=True)
         # First run downloads the package, so this waits rather than probing once.
         deadline = time.time() + 90
         while time.time() < deadline:

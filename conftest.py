@@ -114,3 +114,25 @@ def pytest_configure(config):
                 _ac.set_master_enabled(True)
             except Exception:
                 pass                 # best-effort; those 6 files fail loudly on their own if this didn't take
+
+    # THE SAME PROBLEM, TWO MORE DIRECTORIES. memory.py and swarm_windows.py do
+    # NOT resolve their path through FREE_LLM_HUB_CONFIG -- they each have their
+    # own env var and default to ~/.free-llm-hub/, so the isolation above did
+    # not cover them. Found 2026-09-10 by reading the REAL memory directory: 65
+    # conversation files, every single one named "test-claude-..." or
+    # "durable-test-...", written by tests that drive the real send_message
+    # path. Exactly the usage_history sighting recorded above, one directory
+    # over. Same shape of fix, same "explicit wins" guard, so a new test file
+    # gets this without having to remember it.
+    for var, name in (("FREE_LLM_HUB_MEMORY_DIR", "memory"),
+                      ("FREE_LLM_HUB_SWARM_DIR", "swarm-runs")):
+        if os.environ.get(var):
+            continue
+        path = os.path.join(tempfile.gettempdir(), "hub-pytest-hub-state", name)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            pass                     # best-effort: both modules already treat
+                                     # an unwritable directory as "no memory"
+        else:
+            os.environ[var] = path

@@ -159,3 +159,103 @@ def test_the_registered_url_uses_localhost_not_the_loopback_ip():
     body = body[:body.index("\ndef ")]
     assert 'http://localhost:%d' in body
     assert "127.0.0.1:%d%s" not in body
+
+
+def test_the_context_is_shared_between_clients():
+    """A long-lived server was only half of "keep same session".
+
+    Without --shared-browser-context every connected HTTP client gets its OWN
+    browser context, and this hub re-spawns the CLI for every turn -- so every
+    turn is a new client and therefore a new context: a fresh browser, logged
+    out, on a blank page. Which is the exact failure the shared server exists to
+    fix. From @playwright/mcp --help: "reuse the same browser context between
+    all connected HTTP clients"."""
+    body = SRC[SRC.index("def _start_playwright_mcp("):]
+    body = body[:body.index("\ndef _always_mcp(")]
+    assert "--shared-browser-context" in body
+
+
+def test_it_is_on_the_server_not_on_the_stdio_fallback():
+    """The stdio spec is one browser per CLI process by construction; the flag
+    would be meaningless there and is a real cost on the server."""
+    assert "--shared-browser-context" not in str(A._PLAYWRIGHT_STDIO)
+
+
+def test_the_profile_is_still_kept_on_disk():
+    """The context is shared between clients; the PROFILE -- logins, cookies --
+    is what survives a hub restart, and that is --user-data-dir."""
+    body = SRC[SRC.index("def _start_playwright_mcp("):]
+    body = body[:body.index("\ndef _always_mcp(")]
+    assert "--user-data-dir" in body
+
+
+# --------------------------------------------------------------------------- #
+# A server started before the flag existed must not be adopted forever
+# --------------------------------------------------------------------------- #
+
+def test_a_server_we_started_without_it_is_retired(monkeypatch, tmp_path):
+    """The server outlives the hub -- that is the point of it -- so the next
+    start adopts whatever is on the port. Adopting one launched before
+    --shared-browser-context would keep handing every turn its own fresh
+    browser forever, and nothing over HTTP can tell the difference."""
+    monkeypatch.setattr(A, "_playwright_marker_path",
+                        lambda: str(tmp_path / "marker.json"))
+    A._write_playwright_marker(4321, shared=False)
+    killed = []
+    monkeypatch.setattr(A, "_retire_stale_playwright",
+                        lambda m: killed.append(m.get("pid")) or True)
+    probes = ["http://localhost:8931/mcp", None]
+    monkeypatch.setattr(A, "_playwright_probe", lambda port: probes.pop(0))
+    monkeypatch.setattr(A, "_which_cli", lambda name: None)
+    monkeypatch.setattr(A.shutil, "which", lambda name: None)
+    A._playwright_url[0] = None
+    A._start_playwright_mcp()
+    assert killed == [4321]
+
+
+def test_a_server_someone_else_runs_is_never_killed(monkeypatch, tmp_path):
+    """No marker means we did not start it. Killing someone's browser because
+    it lacks a flag we happen to want is not a trade this hub gets to make."""
+    monkeypatch.setattr(A, "_playwright_marker_path",
+                        lambda: str(tmp_path / "none.json"))
+    killed = []
+    monkeypatch.setattr(A, "_retire_stale_playwright",
+                        lambda m: killed.append(m) or True)
+    monkeypatch.setattr(A, "_playwright_probe",
+                        lambda port: "http://localhost:8931/mcp")
+    A._playwright_url[0] = None
+    A._start_playwright_mcp()
+    assert killed == []
+    assert A._playwright_url[0] == "http://localhost:8931/mcp"
+
+
+def test_our_own_shared_server_is_adopted_not_restarted(monkeypatch, tmp_path):
+    monkeypatch.setattr(A, "_playwright_marker_path",
+                        lambda: str(tmp_path / "marker.json"))
+    A._write_playwright_marker(999, shared=True)
+    killed = []
+    monkeypatch.setattr(A, "_retire_stale_playwright",
+                        lambda m: killed.append(m) or True)
+    monkeypatch.setattr(A, "_playwright_probe",
+                        lambda port: "http://localhost:8931/mcp")
+    A._playwright_url[0] = None
+    A._start_playwright_mcp()
+    assert killed == []
+
+
+def test_a_missing_marker_reads_as_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr(A, "_playwright_marker_path",
+                        lambda: str(tmp_path / "nope.json"))
+    assert A._playwright_marker() == {}
+
+
+def test_a_corrupt_marker_reads_as_empty(monkeypatch, tmp_path):
+    path = tmp_path / "marker.json"
+    path.write_text("{ not json", encoding="utf-8")
+    monkeypatch.setattr(A, "_playwright_marker_path", lambda: str(path))
+    assert A._playwright_marker() == {}
+
+
+def test_retiring_without_a_pid_does_nothing():
+    assert A._retire_stale_playwright({}) is False
+    assert A._retire_stale_playwright({"pid": "not a pid"}) is False

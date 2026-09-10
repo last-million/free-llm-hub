@@ -260,3 +260,28 @@ def test_it_survives_a_restart_like_everything_else():
 def test_a_bad_id_still_writes_nothing(tmp_path):
     memory.note_compaction("../escape")
     assert not [p for p in tmp_path.rglob("*") if p.is_file()]
+
+
+# --------------------------------------------------------------------------- #
+# The suite must not write into the user's own hub
+# --------------------------------------------------------------------------- #
+
+def test_the_memory_directory_is_isolated_for_the_whole_suite(monkeypatch):
+    """FOUND 2026-09-10 by reading the REAL ~/.free-llm-hub/memory: 65
+    conversation files, every one of them named "test-claude-..." or
+    "durable-test-...", written by tests that drive the real send_message path.
+
+    memory.py does not resolve its path through FREE_LLM_HUB_CONFIG -- it has
+    its own env var -- so conftest's isolation did not cover it. Same sighting
+    as the usage-dashboard one recorded in conftest, one directory over."""
+    monkeypatch.delenv(memory._ROOT_ENV, raising=False)
+    monkeypatch.setenv(memory._ROOT_ENV, os.environ.get(memory._ROOT_ENV, ""))
+    import conftest                                  # noqa: F401  (import check)
+    src = open("conftest.py", encoding="utf-8").read()
+    assert memory._ROOT_ENV in src
+    assert "FREE_LLM_HUB_SWARM_DIR" in src
+
+
+def test_a_test_never_lands_in_the_home_directory():
+    home = os.path.join(os.path.expanduser("~"), ".free-llm-hub", "memory")
+    assert os.path.abspath(memory._root()) != os.path.abspath(home)

@@ -132,3 +132,30 @@ def test_there_is_an_empty_state():
 def test_reduced_motion_is_respected():
     i = SRC.index(".agent-swarm{")
     assert "@media (prefers-reduced-motion:reduce)" in SRC[i:i + 2200]
+
+
+def test_the_swarm_runs_the_cli_the_session_is_running():
+    """It posted cli: 'opencode' as a literal, so a session opened with codex
+    or claude quietly spawned its workers under a different agent than the one
+    the user picked -- and every worker then had the wrong tool access, the
+    wrong auth and the wrong model."""
+    i = SRC.index("api('/api/swarm-windows', { method: 'POST'")
+    call = SRC[i:i + 300]
+    assert "cli: 'opencode' }" not in call
+    assert "window.cxAgentCli" in call
+
+
+def test_the_page_exports_which_cli_that_is():
+    assert "window.cxAgentCli = function()" in SRC
+
+
+def test_it_follows_the_session_not_the_picker():
+    """The picker says what the NEXT session would be; the swarm has to use the
+    one that is actually open."""
+    body = SRC[SRC.index("function showSessionState(cli, dir){"):]
+    body = body[:body.index(chr(10) + "    }")]
+    assert "curSessionCli = cli || null;" in body
+
+
+def test_it_falls_back_when_no_session_is_open():
+    assert "curSessionCli || currentCli()" in SRC
