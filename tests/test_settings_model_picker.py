@@ -355,3 +355,41 @@ def test_a_session_that_ended_does_not_keep_receiving_edits():
     """The selector is rebuilt from the live session list; a stale selection
     must fall back to global rather than write to a conversation that is gone."""
     assert "still ? keep : ''" in SRC
+
+
+# --------------------------------------------------------------------------- #
+# The per-conversation mode picker was empty on first sight
+# --------------------------------------------------------------------------- #
+
+def test_the_sessions_panel_waits_for_the_modes():
+    """REPORTED: "dans settings certaines choses ne marchent pas".
+
+    Each running session's row carries a mode dropdown built from _sdModeList,
+    and _sdModeList is filled by loadSdModels. initSdModels called
+    loadSdSessions at BOOT -- before loadSdModels had ever run, and loadSdModels
+    only runs when the Settings page is shown. So every row rendered with "All
+    models" as its only option and stayed that way until the user pressed
+    Refresh: the per-conversation mode picker, which is the whole feature,
+    looked broken."""
+    body = SRC[SRC.index("function loadSdModels("):]
+    body = body[:body.index("\n    function initSdModels(")]
+    assert "loadSdSessions()" in body
+
+
+def test_boot_no_longer_renders_sessions_before_the_modes():
+    body = SRC[SRC.index("function initSdModels("):]
+    body = body[:body.index("\n    /* The GLOBAL whitelist")]
+    # The Refresh button still calls it; what must be gone is the bare call
+    # at the end of the function -- the one that ran at page load.
+    assert ("loadSdSessions();" + chr(10) + "    }") not in body
+
+
+def test_the_modes_come_from_the_same_call_that_renders_them():
+    body = SRC[SRC.index("function loadSdModels("):]
+    body = body[:body.index("\n    function initSdModels(")]
+    assert body.index("_sdModeList") < body.index("loadSdSessions()")
+
+
+def test_refreshing_the_sessions_panel_still_works_on_its_own():
+    """The button must not have been made to depend on a model reload."""
+    assert "sr.addEventListener('click', function(){ loadSdSessions(); })" in SRC

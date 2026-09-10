@@ -92,7 +92,8 @@ def _blank(session_id):
     # file. Keeping it unusable is what makes _save refuse.
     return {"session_id": session_id if isinstance(session_id, str) else None,
             "summary": "", "facts": [],
-            "turns": 0, "rules_restated_turn": 0, "updated_at": 0.0}
+            "turns": 0, "rules_restated_turn": 0, "updated_at": 0.0,
+            "compactions": 0, "restate_due": False}
 
 
 def get(session_id):
@@ -187,6 +188,27 @@ def note_turn(session_id):
         return mem["turns"]
 
 
+def note_compaction(session_id):
+    """Record that this conversation just lost turns to compaction.
+
+    COMPACTION WAS SILENT. _compact_to_budget returns whether it dropped
+    anything and both call sites threw that away, so nothing in the hub knew a
+    conversation had just had its history cut -- including the part of the hub
+    whose whole job is deciding when to say the standing rules again.
+
+    That is the worst possible moment to stay quiet: the message carrying the
+    instructions is exactly the kind of old turn compaction drops first. So a
+    compaction makes the next turn due, whatever the schedule says.
+
+    REPORTED as: "sometimes it's like the session gets full and I should go out
+    from conversation and reopen it again to continue"."""
+    with _LOCK:
+        mem = get(session_id)
+        mem["compactions"] = int(mem.get("compactions") or 0) + 1
+        mem["restate_due"] = True
+        return _save(mem)
+
+
 def should_restate_rules(session_id, every=RESTATE_EVERY):
     """Is it time to remind this session of its standing instructions?
 
@@ -199,6 +221,8 @@ def should_restate_rules(session_id, every=RESTATE_EVERY):
     except (TypeError, ValueError):
         every = RESTATE_EVERY
     mem = get(session_id)
+    if mem.get("restate_due"):
+        return True                    # compaction just ate them; do not wait
     turns = int(mem.get("turns") or 0)
     last = int(mem.get("rules_restated_turn") or 0)
     return turns > 0 and (turns - last) >= every
@@ -208,6 +232,7 @@ def mark_rules_restated(session_id):
     with _LOCK:
         mem = get(session_id)
         mem["rules_restated_turn"] = int(mem.get("turns") or 0)
+        mem["restate_due"] = False
         return _save(mem)
 
 

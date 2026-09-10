@@ -7064,6 +7064,19 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         compacted, did = _compact_to_budget(msgs, payload.get("tools"),
                                             _model_ctx_budget(pid, payload.get("model")),
                                             summarizer=_summarizer)
+        if did:
+            # A conversation that just lost turns is a conversation that just
+            # lost whatever those turns were carrying -- very often the standing
+            # instructions, which ship early and are the first thing dropped.
+            # Recorded so the next turn says them again instead of waiting for
+            # the schedule. Best-effort, and never on the summariser's thread:
+            # _build_sid reads the request context.
+            try:
+                _sid = _build_sid()
+                if _sid:
+                    memory.note_compaction(_sid)
+            except Exception:                                    # noqa: BLE001
+                pass
         fixed = _sanitize_tool_messages(compacted)
         if did or fixed is not msgs:
             payload = dict(payload)

@@ -2928,6 +2928,15 @@ def set_session_mode(session_id, mode):
     return True
 
 
+def _durable_turns(sess):
+    """How many turns this conversation has really had. Never raises."""
+    try:
+        return max(int(sess.turn_count or 0),
+                   int(memory.get(sess.id).get("turns") or 0))
+    except Exception:                                            # noqa: BLE001
+        return int(getattr(sess, "turn_count", 0) or 0)
+
+
 def get_session(session_id):
     """Status dict for one session, or None if it doesn't exist. Never raises."""
     with _REGISTRY_LOCK:
@@ -2943,7 +2952,11 @@ def get_session(session_id):
         "quality": getattr(sess, "quality", "normal"),
         "mode": getattr(sess, "mode", None),
         "project_dir": sess.project_dir,
-        "turn_count": sess.turn_count,
+        # The DURABLE count when there is one. _Session.turn_count resets to 0
+        # on resume, and the 5-hourly auto-update restart resumes everything --
+        # so the settings panel showed "0 turns" for a conversation forty turns
+        # deep, which is precisely the question that panel exists to answer.
+        "turn_count": _durable_turns(sess),
         "currently_running": running,
         "created_at": sess.created_at,
         "has_native_session": bool(sess.native_session_id),

@@ -247,3 +247,16 @@ def test_claude_restates_too():
     body = AGENT[AGENT.index("def _build_argv(sess: _Session"):]
     body = body[:body.index("\ndef _build_argv_codex")]
     assert "_due_for_restate(sess)" in body
+
+
+def test_the_gateway_tells_memory_when_it_compacts():
+    i = APP.index("compacted, did = _compact_to_budget(msgs, payload.get(\"tools\"),\n"
+                  "                                            _model_ctx_budget(")
+    window = APP[i:i + 1400]
+    assert "memory.note_compaction(" in window
+    assert "_build_sid()" in window
+
+
+def test_it_cannot_fail_the_request():
+    i = APP.index("memory.note_compaction(")
+    assert "except Exception" in APP[i:i + 300]

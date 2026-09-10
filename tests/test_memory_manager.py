@@ -221,3 +221,42 @@ def test_this_module_is_a_leaf():
     src = open("memory.py", encoding="utf-8").read()
     assert "import app" not in src
     assert "import agentic_chat" not in src
+
+
+# --------------------------------------------------------------------------- #
+# Compaction is no longer silent
+# --------------------------------------------------------------------------- #
+
+def test_a_compaction_makes_the_rules_due_immediately():
+    """_compact_to_budget returns whether it dropped anything and both call
+    sites threw that away, so nothing knew a conversation had just had its
+    history cut -- including the part whose job is deciding when to say the
+    standing rules again. That is the worst moment to stay quiet: the message
+    carrying them is exactly the kind of old turn compaction drops first."""
+    memory.note_turn("s1")
+    assert not memory.should_restate_rules("s1")
+    memory.note_compaction("s1")
+    assert memory.should_restate_rules("s1")
+
+
+def test_restating_clears_it():
+    memory.note_compaction("s1")
+    memory.mark_rules_restated("s1")
+    assert not memory.should_restate_rules("s1")
+
+
+def test_compactions_are_counted():
+    memory.note_compaction("s1")
+    memory.note_compaction("s1")
+    assert memory.get("s1")["compactions"] == 2
+
+
+def test_it_survives_a_restart_like_everything_else():
+    memory.note_compaction("s1")
+    assert json.load(open(os.path.join(memory._root(), "s1.json"),
+                          encoding="utf-8"))["restate_due"] is True
+
+
+def test_a_bad_id_still_writes_nothing(tmp_path):
+    memory.note_compaction("../escape")
+    assert not [p for p in tmp_path.rglob("*") if p.is_file()]

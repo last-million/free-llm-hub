@@ -10524,6 +10524,13 @@
           renderWhitelistStrip();
           renderSdModels();
           loadSdSpeed();
+          /* THE SESSIONS PANEL HAS TO WAIT FOR THIS. Each running session's
+             row carries a mode dropdown built from _sdModeList, which is
+             filled right here -- and initSdModels used to call loadSdSessions
+             at boot, long before this ever ran. Every row therefore rendered
+             with "All models" as its only option, so the per-conversation mode
+             picker looked broken until you hit Refresh. */
+          loadSdSessions();
         })
         .catch(function(e){
           if (!silent) toast('Models: ' + e.message, true);
@@ -10571,7 +10578,9 @@
         if (wrap) wrap.classList.toggle('is-session', !!_sdScope);
         loadSdModels(true);
       });
-      loadSdSessions();
+      /* Nothing is FETCHED here any more: loadSdModels pulls the sessions in
+         once the modes it needs are known, and it runs when the Settings page
+         is actually shown rather than on every page load. */
     }
 
     /* The GLOBAL whitelist has a one-shot endpoint; everything else -- a
