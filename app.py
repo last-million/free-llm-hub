@@ -16782,7 +16782,15 @@ def _virtual_model_ids():
 # stays as the per-recv guard; this is the overall one. The abandoned thread
 # is a daemon and its socket dies with the provider's connection — bounded by
 # chain length, so the leak is small and self-cleaning.
-_SWARM_HOP_DEADLINE = 150
+# Per HOP, not per stage: _swarm_dispatch walks a fallback chain and gives each
+# model this long. 150s was cutting off models that were working, just slowly --
+# the same fault as the tool fan-out below. Raised, and the chain walk is capped
+# (see _SWARM_STAGE_MAX_HOPS) so a stage's total does not grow with the fleet.
+_SWARM_HOP_DEADLINE = 300
+# How many models one prose stage may try. Without this, raising the per-hop
+# deadline multiplies the whole crew run: 300s x a twelve-model chain is an hour
+# for one stage.
+_SWARM_STAGE_MAX_HOPS = 3
 
 # The TOOL fan-out gets its own, longer deadline. The 150s above was measured
 # against prose pipeline STAGES -- short, self-contained, and many per run, so a
@@ -16801,7 +16809,20 @@ _SWARM_HOP_DEADLINE = 150
 # the slowest provider feels like trickling keepalives (the 24-minute hostage in
 # the note above). And it is now safe to be generous, because missing it no
 # longer fails the turn -- it falls through to single-model routing.
-_SWARM_TOOL_HOP_DEADLINE = 300
+# REPORTED 2026-09-10: "je vois toujours beaucoup de models dans les swarm
+# 'no answer' ... meme dans les requests normaux ca marche avec tous les models,
+# alors il faut juste attendre leur reponse."
+#
+# He is right, and the code already had the evidence: the note above records
+# five opencode turns at 152/156/157/162/168 seconds, all 0-of-5, against a
+# 150s deadline -- durations clustered just above the bound, which is what a
+# deadline looks like when it is the thing doing the killing. Raised again, to
+# the ~6 minutes asked for.
+#
+# This is a WALL CLOCK, and it has to stay one: CHAT_READ_TIMEOUT is per-recv
+# and bounds nothing, because a provider trickling keepalives resets it on
+# every byte (measured at 24+ minutes, see _SWARM_HOP_DEADLINE above).
+_SWARM_TOOL_HOP_DEADLINE = 360
 
 # ...and how long to keep waiting for stragglers AFTER a member has produced a
 # usable tool call.
@@ -16824,7 +16845,17 @@ _SWARM_TOOL_HOP_DEADLINE = 300
 # at 78s and 111s were cut off by a first answer at 5s. 90 covers that spread
 # while still ending a turn in roughly the time the 25s version took, since the
 # clock starts at the FIRST answer and not at the request.
-_SWARM_STRAGGLER_GRACE = 90
+# RAISED from 90 after "je vois toujours beaucoup de models dans les swarm no
+# answer". The measurement in the note above is the argument: members answered
+# at 5s, 78s and 111s, so a 90s grace starting at the 5s answer cut off the
+# 111s member -- which was working. 150s covers that spread.
+#
+# NOT turned into a floor measured from the fan-out's start, which was the
+# first attempt here. That would have made every turn with one slow member
+# wait the floor out, and test_a_dead_member_no_longer_costs_the_whole_budget
+# exists because a 297s turn was reported as broken. Raising the grace buys the
+# slow members room without reversing that trade.
+_SWARM_STRAGGLER_GRACE = 150
 
 
 def _dispatch_chat_with_deadline(pid, payload, deadline=None):
@@ -16887,7 +16918,11 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
         if not pid:
             return "", None
         best_partial, best_partial_who = "", None
-        for hop_pid, hop_model in _build_chain(pid, model, est):
+        # CAPPED. Each hop now gets _SWARM_HOP_DEADLINE (300s), so an uncapped
+        # walk down a twelve-model chain is an hour for one stage -- and a crew
+        # is five stages. Three hops is two fallbacks, which is what the chain
+        # is for; past that the stage is not going to be rescued by a fourth.
+        for hop_pid, hop_model in _build_chain(pid, model, est)[:_SWARM_STAGE_MAX_HOPS]:
             if exclude_pids and hop_pid in exclude_pids:
                 continue     # reviewer must not be the provider that wrote it
             payload = {"model": hop_model, "stream": False,
@@ -17243,11 +17278,25 @@ def _swarm_tool_result(body):
         payload = dict(body)
         payload["model"] = hop_model
         payload["stream"] = False        # fan-out cannot stream; re-emitted below
-        resp, _exc = _dispatch_chat_with_deadline(hop_pid, payload,
-                                                  _SWARM_TOOL_HOP_DEADLINE)
+        resp, hop_exc = _dispatch_chat_with_deadline(hop_pid, payload,
+                                                     _SWARM_TOOL_HOP_DEADLINE)
         if resp is None:
             if not moved_on[0]:
-                _record_outcome(hop_pid, hop_model, False)
+                # resp is None for TWO different things: a hop that genuinely
+                # failed (hop_exc set) and one the hub stopped waiting for
+                # (hop_exc None -- _dispatch_chat_with_deadline returns
+                # (None, None) when the worker is still alive at the deadline).
+                # Only the first is the model's fault. Dropping the penalty for
+                # both, as a first pass here did, also stopped recording real
+                # failures -- caught by test_a_real_failure_is_still_recorded.
+                if hop_exc is not None:
+                    _record_outcome(hop_pid, hop_model, False)
+                # A pure deadline files nothing: it is indistinguishable
+                # from impatience, and counting it turned slow-but-working
+                # models into "unreliable" ones, dropping them below
+                # _SWARM_MIN_RELIABILITY until they stopped being picked at all
+                # -- a ledger measuring the hub's patience and calling it the
+                # model's record.
                 return _why("no response before the %ds deadline"
                             % _SWARM_TOOL_HOP_DEADLINE)
             return _why("abandoned: another member had already answered")
@@ -17291,7 +17340,15 @@ def _swarm_tool_result(body):
         # single-model path for a while; the fan-out simply never asked.
         if not msg.get("tool_calls") and (_looks_like_refusal(msg.get("content"))
                                           or _looks_like_permission_block(msg.get("content"))):
-            _note_nonanswer(hop_pid, hop_model)
+            # NOT _note_nonanswer here. That marks the model DEAD for
+            # _DEAD_MODEL_TTL (6 hours) and _build_chain removes a dead model
+            # from every request -- so one heuristic misfire inside a swarm
+            # bans a working model fleet-wide for the rest of the day. The
+            # heuristics are good enough to lose a slot over and nowhere near
+            # good enough to ban over: _looks_like_announced_not_acted trips on
+            # any reply under 400 characters with no question mark, and "Let me
+            # check the config first." qualifies.
+            _record_outcome(hop_pid, hop_model, False)
             return _why("refused: %s"
                         % " ".join((msg.get("content") or "")[:60].split()))
         if not msg.get("tool_calls") and (
@@ -17320,7 +17377,8 @@ def _swarm_tool_result(body):
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(picks))
     try:
         pending = {ex.submit(_run, pm) for pm in picks}
-        deadline = time.monotonic() + _SWARM_TOOL_HOP_DEADLINE
+        _fanout_started = time.monotonic()
+        deadline = _fanout_started + _SWARM_TOOL_HOP_DEADLINE
         cutoff = deadline
         while pending:
             remaining = cutoff - time.monotonic()
@@ -17340,6 +17398,13 @@ def _swarm_tool_result(body):
                     results.append(r)
             if cutoff == deadline and any((r[3] or {}).get("tool_calls")
                                           for r in results):
+                # THE GRACE IS A FLOOR, NOT A CEILING. Measured in the note on
+                # _SWARM_STRAGGLER_GRACE: members answered at 5s, 78s and 111s.
+                # Starting a 90s clock at the FIRST answer put the cutoff at
+                # 95s, so the 111s member -- working perfectly -- was cut off
+                # and displayed as "no answer". A fast first answer is not a
+                # reason to stop waiting for the rest; it is only a reason not
+                # to wait forever.
                 cutoff = min(deadline, time.monotonic() + _SWARM_STRAGGLER_GRACE)
     finally:
         # Anything still running from here on was abandoned by US, not failed by
@@ -17383,6 +17448,11 @@ def _swarm_tool_result(body):
         acted_set = {(r[0], r[1]) for r in acted}
         rows = []
         for p_id, m_id in picks:
+            # "no answer" was written for anything simply ABSENT from
+            # `answered` -- including members the hub abandoned itself because
+            # someone else had already replied. They answered; nobody waited.
+            # _member_why already records what really happened, so the row
+            # reports that instead of inferring the worst from absence.
             if (p_id, m_id) == (hop_pid, hop_model):
                 role = "winner"
             elif (p_id, m_id) in acted_set:
@@ -17390,7 +17460,12 @@ def _swarm_tool_result(body):
             elif (p_id, m_id) in answered:
                 role = "answered"
             else:
-                role = "no answer"
+                # What actually happened, from _member_why -- "abandoned:
+                # another member had already answered" is not "no answer", and
+                # showing it as one is what made the fan-out look like half the
+                # fleet was broken.
+                why = _member_why.get((p_id, m_id)) or "no answer"
+                role = "abandoned" if why.startswith("abandoned") else why[:60]
             rows.append({"role": role, "model": p_id + "/" + m_id})
         act = getattr(g, "act", None)
         if act is not None:

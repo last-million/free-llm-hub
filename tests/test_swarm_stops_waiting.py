@@ -10,6 +10,8 @@ burned the whole 300s budget while the winning answer had been in hand since
 build turn spent waiting for models that were never going to reply.
 """
 import time
+
+import requests
 from unittest import mock
 
 import pytest
@@ -69,12 +71,26 @@ def fanout(monkeypatch):
     yield
 
 
-def _dispatcher(timings):
-    """timings: {provider: (seconds, payload_or_None)}."""
+def _dispatcher(timings, failed=()):
+    """timings: {provider: (seconds, payload_or_None)}.
+
+    The real _dispatch_chat_with_deadline returns (None, None) ONLY for a hop
+    still running at the deadline, and (None, exc) for one that genuinely
+    failed. The fan-out now tells those apart, because penalising a model for
+    the hub's own impatience is what dropped slow-but-working models below
+    _SWARM_MIN_RELIABILITY until they stopped being picked at all.
+
+    This fake returned (None, None) for both, so it could not express the
+    difference the code now depends on: `failed` names the providers that
+    should look like a real failure rather than an abandonment.
+    """
     def go(pid, payload, deadline):
         delay, out = timings[pid]
         time.sleep(delay)
-        return (_Resp(out) if out is not None else None), None
+        if out is not None:
+            return _Resp(out), None
+        return None, (requests.RequestException("upstream refused")
+                      if pid in failed else None)
     return go
 
 
@@ -188,6 +204,22 @@ def test_a_real_failure_is_still_recorded(fanout, monkeypatch):
                         lambda p, m, ok: recorded.append((p, m, ok)))
     monkeypatch.setattr(A, "_dispatch_chat_with_deadline", _dispatcher({
         "fast": (0.0, None), "slow": (0.0, None), "never": (0.0, None),
-    }))
+    }, failed=("fast", "slow", "never")))
     A._swarm_tool_result(dict(BODY))
     assert [r for r in recorded if r[2] is False], "real failures stopped being recorded"
+
+
+def test_the_hubs_own_deadline_is_not_the_models_fault(fanout, monkeypatch):
+    """The other half of the same rule. A hop still running when the hub stops
+    waiting returns (None, None), and filing that against the model is how a
+    slow-but-working model became an 'unreliable' one: the penalty dropped it
+    below _SWARM_MIN_RELIABILITY and it stopped being picked at all."""
+    recorded = []
+    monkeypatch.setattr(A, "_record_outcome",
+                        lambda p, m, ok: recorded.append((p, m, ok)))
+    monkeypatch.setattr(A, "_dispatch_chat_with_deadline", _dispatcher({
+        "fast": (0.0, None), "slow": (0.0, None), "never": (0.0, None),
+    }))                                   # no `failed`: pure deadlines
+    A._swarm_tool_result(dict(BODY))
+    assert not [r for r in recorded if r[2] is False], \
+        "a deadline was counted against the model"

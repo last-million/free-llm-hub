@@ -296,15 +296,18 @@ def test_the_grace_starts_only_once_a_tool_was_called():
     """A prose-only answer must NOT start it: waiting longer is exactly right
     while the only thing on the table is something the CLI cannot execute."""
     src = open("app.py", encoding="utf-8").read()
-    i = src.index("_SWARM_STRAGGLER_GRACE)")
-    window = src[max(0, i - 400):i]
-    assert 'get("tool_calls")' in window
+    # Scoped to the `if` that guards the grace, not to a fixed number of
+    # characters before it: a window measured in bytes fails the moment
+    # somebody writes a longer comment inside the branch, which says nothing
+    # about whether the guard is still there.
+    i = src.index("cutoff = min(deadline, time.monotonic() + _SWARM_STRAGGLER_GRACE)")
+    guard = src.rindex("if cutoff == deadline", 0, i)
+    assert 'get("tool_calls")' in src[guard:i]
 
 
 def test_the_grace_can_never_exceed_the_deadline():
     src = open("app.py", encoding="utf-8").read()
-    i = src.index("_SWARM_STRAGGLER_GRACE)")
-    assert "min(deadline" in src[max(0, i - 200):i + 60]
+    assert "cutoff = min(deadline, time.monotonic() + _SWARM_STRAGGLER_GRACE)" in src
 
 
 def test_the_grace_is_long_enough_for_a_close_second():
