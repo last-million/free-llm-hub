@@ -66,6 +66,30 @@ EVENT_BUFFER = 400
 # What a parent's summary is clipped to when it is fed to a child. Same
 # reasoning as swarm.DEP_CONTEXT_CHARS: dependencies are context, not the task.
 DEP_CONTEXT_CHARS = 4000
+# The last wave is a REVIEW: one agent that reads what every other agent did and
+# finishes the job rather than reporting on it.
+#
+# REQUESTED: "pour le swarm les models doivent travailler ensemble pour trouver
+# la plus meilleure solution pertinente". Phases alone are division of labour,
+# not collaboration -- five agents each doing their own piece and nobody ever
+# looking at the whole. swarm.py already ends its CHAT pipeline with review and
+# synth for exactly this reason; this is the same idea where the workers are
+# real sessions that can still fix what they find.
+REVIEW_TITLE = "Review and finish"
+_REVIEW_TASK = """Every other phase of this job is done. You are the last agent.
+
+Read what the others produced (below), then CHECK THE ACTUAL PROJECT -- open the
+files, run what can be run. Your job is not to summarise them; it is to find
+what is missing, broken or inconsistent BETWEEN their pieces and to fix it
+yourself.
+
+Look for: files that reference something nobody created, two phases that solved
+the same thing differently, anything a phase said it would do and did not, and
+anything that plainly does not work.
+
+Fix what you find. Change nothing that is already correct. Finish with a short
+list of what you changed and anything still genuinely open."""
+
 
 PENDING, RUNNING, DONE, FAILED, STOPPED = "pending", "running", "done", "failed", "stopped"
 
@@ -167,6 +191,27 @@ def clean_phases(plan, max_phases=MAX_AGENTS, modes=()):
             "mode": mode,
         })
     return out if len(out) >= 1 else []
+
+
+def with_review(phases):
+    """Append the review phase, depending on everything before it.
+
+    Not added when the planner produced a single phase: there is nothing to
+    reconcile between one piece of work, and a second agent re-reading it is a
+    whole extra model call to say "looks fine"."""
+    phases = list(phases or [])
+    if len(phases) < 2:
+        return phases
+    if phases and phases[-1].get("title") == REVIEW_TITLE:
+        return phases                     # already has one
+    phases.append({
+        "title": REVIEW_TITLE,
+        "task": _REVIEW_TASK,
+        "done_when": "Everything the other phases produced works together.",
+        "needs": list(range(1, len(phases) + 1)),
+        "mode": None,
+    })
+    return phases
 
 
 def waves(phases):
@@ -487,7 +532,7 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=()):
 
 
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
-          on_done=None, configure=None, modes=()):
+          on_done=None, configure=None, modes=(), review=True):
     """Begin a run. Returns the run id immediately; the work happens on a
     background thread.
 
@@ -502,6 +547,8 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     phases = clean_phases({"phases": phases}, modes=modes) if phases else []
     if not phases:
         raise SwarmWindowsError("could not turn that into phases")
+    if review:
+        phases = with_review(phases)
     run = _Run(goal, project_dir, cli_id, phases)
     _remember(run)
     threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure),

@@ -168,7 +168,11 @@ def test_an_unsatisfiable_graph_runs_rather_than_hangs():
 # --------------------------------------------------------------------------- #
 
 def test_a_run_finishes_and_every_phase_reports():
-    rid = SW.start("goal", ".", "opencode", _spawn, _turn("done it"), phases=PHASES)
+    # review=False here and below: these cover the RUN mechanics, and the extra
+    # reviewer would only make every count in them one larger. The review phase
+    # has its own tests at the bottom of this file.
+    rid = SW.start("goal", ".", "opencode", _spawn, _turn("done it"),
+                   phases=PHASES, review=False)
     st = _wait(rid)
     assert st["state"] == SW.DONE
     assert st["done"] == 3 and st["failed"] == 0
@@ -338,7 +342,8 @@ def test_no_more_than_the_cap_run_at_once():
         yield {"type": "message", "text": "ok"}
 
     flat = [{"title": str(i), "task": "t", "needs": []} for i in range(8)]
-    rid = SW.start("g", ".", "opencode", _spawn, run_turn, phases=flat)
+    rid = SW.start("g", ".", "opencode", _spawn, run_turn, phases=flat,
+                   review=False)
     st = _wait(rid, timeout=20)
     assert peak[0] <= SW.MAX_CONCURRENT, "peak concurrency was %d" % peak[0]
     assert st["done"] == 8, "everything past the cap must still run"
@@ -386,7 +391,8 @@ def test_the_orchestrator_can_read_every_agents_log():
 
 def test_the_result_is_summaries_not_transcripts():
     """This is what the parent conversation pastes into its own context."""
-    rid = SW.start("g", ".", "opencode", _spawn, _turn("the summary"), phases=PHASES)
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("the summary"),
+                   phases=PHASES, review=False)
     _wait(rid)
     res = SW.result(rid)
     assert [p["summary"] for p in res["phases"]] == ["the summary"] * 3
@@ -668,3 +674,74 @@ def test_the_hub_passes_its_real_modes_and_a_configurer():
     body = src[src.index("def _swarm_windows_configure("):]
     body = body[:body.index("\ndef ")]
     assert "set_session_mode" in body
+
+
+# --------------------------------------------------------------------------- #
+# The agents work together, not just in parallel
+# --------------------------------------------------------------------------- #
+
+def test_a_review_phase_is_appended():
+    """REQUESTED: "pour le swarm les models doivent travailler ensemble pour
+    trouver la plus meilleure solution pertinente". Phases alone are division
+    of labour -- five agents each doing their own piece and nobody ever looking
+    at the whole. swarm.py already ends its chat pipeline with review and synth
+    for exactly this reason."""
+    ph = SW.with_review(SW.clean_phases({"phases": PHASES}))
+    assert ph[-1]["title"] == SW.REVIEW_TITLE
+    assert ph[-1]["needs"] == [1, 2, 3]
+
+
+def test_the_review_runs_last_and_alone():
+    ph = SW.with_review(SW.clean_phases({"phases": PHASES}))
+    assert SW.waves(ph)[-1] == [len(ph)]
+
+
+def test_it_sees_every_other_phase_s_result():
+    """It depends on all of them, so _agent_prompt hands it all their
+    summaries -- that is what makes it a review rather than a fourth worker."""
+    seen = {}
+
+    def run_turn(session_id, prompt):
+        seen[session_id] = prompt
+        yield {"event": "message", "text": "SUM-" + session_id}
+
+    rid = SW.start("g", ".", "opencode", _spawn, run_turn, phases=PHASES)
+    _wait(rid, timeout=20)
+    st = SW.status(rid)
+    reviewer = [a for a in st["agents"] if a["title"] == SW.REVIEW_TITLE][0]
+    others = [a for a in st["agents"] if a["title"] != SW.REVIEW_TITLE]
+    prompt = seen[reviewer["session_id"]]
+    for a in others:
+        assert "SUM-" + a["session_id"] in prompt
+
+
+def test_it_is_told_to_fix_rather_than_report():
+    ph = SW.with_review(SW.clean_phases({"phases": PHASES}))
+    task = ph[-1]["task"].lower()
+    assert "fix" in task
+    assert "not to summarise" in task or "not a summar" in task
+
+
+def test_a_single_phase_gets_no_reviewer():
+    """Nothing to reconcile between one piece of work, and a second agent
+    re-reading it is a whole extra model call to say "looks fine"."""
+    one = SW.with_review(SW.clean_phases({"phases": [{"title": "a", "task": "x"}]}))
+    assert len(one) == 1
+
+
+def test_adding_it_twice_does_not_stack():
+    ph = SW.with_review(SW.clean_phases({"phases": PHASES}))
+    assert len(SW.with_review(ph)) == len(ph)
+
+
+def test_it_can_be_turned_off():
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("ok"),
+                   phases=PHASES, review=False)
+    st = _wait(rid)
+    assert not [a for a in st["agents"] if a["title"] == SW.REVIEW_TITLE]
+
+
+def test_it_is_on_by_default():
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("ok"), phases=PHASES)
+    st = _wait(rid, timeout=20)
+    assert [a for a in st["agents"] if a["title"] == SW.REVIEW_TITLE]
