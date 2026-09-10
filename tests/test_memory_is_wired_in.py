@@ -135,3 +135,115 @@ def test_the_counter_survives_a_resumed_session():
     memory.note_turn("sess-abc")
     memory.note_turn("sess-abc")
     assert memory.get("sess-abc")["turns"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# The memory is READ BACK, not only written
+# --------------------------------------------------------------------------- #
+
+def test_the_memory_reaches_the_agent(tmp_path):
+    """It was write-only. remember_summary had been filing the compaction recap
+    since the memory manager landed and NOTHING ever read it back into a turn,
+    so a conversation that had been compacted still forgot everything it had
+    done -- the whole complaint the module exists for."""
+    sess = AC._Session("claude", str(tmp_path))
+    memory.remember_fact(sess.id, "the database is Postgres")
+    memory.remember_summary(sess.id, "the schema and the API are done")
+    AC.write_task_brief(str(tmp_path), "build a thing",
+                        memory_block=AC._memory_block(sess))
+    written = (tmp_path / AC.BRIEF_FILENAME).read_text(encoding="utf-8")
+    assert "the database is Postgres" in written
+    assert "the schema and the API are done" in written
+
+
+def test_the_agent_is_told_the_file_carries_it():
+    """A file nothing points at is a file nothing reads."""
+    add = AC._system_prompt_addition("build a landing page", has_brief=True)
+    assert AC.BRIEF_FILENAME in add
+    assert "established" in add
+
+
+def test_it_rides_in_the_file_not_the_command_line(tmp_path, monkeypatch):
+    """The worst-case turn-1 argv already measures ~8006 chars against cmd.exe's
+    ~8191 ceiling, so there is no room in the prompt for two thousand
+    characters of recap. The pointer to the file is already being sent."""
+    monkeypatch.setattr(AC.vision_status, "status",
+                        lambda: {"available": False, "providers": []})
+    monkeypatch.setattr(AC, "test_verification_enabled", lambda: True)
+    long_bin = r"C:\Users\somewhat-long-username\AppData\Roaming\npm\claude.cmd"
+    text = ("build me a landing page website " + "x" * AC._MAX_MESSAGE_CHARS
+            )[:AC._MAX_MESSAGE_CHARS]
+    for cli, build in (("claude", AC._build_argv),
+                       ("codex", AC._build_argv_codex),
+                       ("opencode", AC._build_argv_opencode)):
+        sess = AC._Session(cli, str(tmp_path))
+        sess.native_session_id = None
+        memory.remember_summary(sess.id, "y" * memory.MAX_SUMMARY_CHARS)
+        for i in range(memory.MAX_FACTS):
+            memory.remember_fact(sess.id, "decision %d " % i + "z" * 200)
+        argv = build(sess, long_bin, text)
+        cost = sum(len(a) + 3 for a in argv)
+        assert cost < 8191, "%s turn-1 argv with a full memory is %d chars" % (cli, cost)
+
+
+def test_a_session_with_nothing_remembered_writes_no_memory_section(tmp_path):
+    sess = AC._Session("claude", str(tmp_path))
+    assert AC._memory_block(sess) == ""
+    AC.write_task_brief(str(tmp_path), "build a landing page website",
+                        memory_block="")
+    written = (tmp_path / AC.BRIEF_FILENAME).read_text(encoding="utf-8")
+    assert "already established" not in written
+
+
+def test_memory_alone_is_enough_to_write_the_file(tmp_path, monkeypatch):
+    """A task with no craft brief still has a conversation to remember. The
+    brief is stubbed out because craft matches on every string today -- that is
+    a craft decision, not one this path may assume."""
+    monkeypatch.setattr(AC.craft, "system_message", lambda text: None)
+    sess = AC._Session("claude", str(tmp_path))
+    memory.remember_fact(sess.id, "MUST stay on Postgres")
+    assert AC.write_task_brief(str(tmp_path), "zzzz",
+                               memory_block=AC._memory_block(sess)) is True
+    assert "Postgres" in (tmp_path / AC.BRIEF_FILENAME).read_text(encoding="utf-8")
+
+
+def test_nothing_at_all_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(AC.craft, "system_message", lambda text: None)
+    assert AC.write_task_brief(str(tmp_path), "zzzz", memory_block="") is False
+    assert not (tmp_path / AC.BRIEF_FILENAME).exists()
+
+
+def test_a_broken_memory_never_fails_a_build(monkeypatch, tmp_path):
+    monkeypatch.setattr(memory, "context_block",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk gone")))
+    assert AC._memory_block(AC._Session("claude", str(tmp_path))) == ""
+
+
+# --------------------------------------------------------------------------- #
+# There is something worth remembering in the first place
+# --------------------------------------------------------------------------- #
+
+def test_the_first_message_is_remembered_as_the_job():
+    body = AGENT[AGENT.index("def send_message_stream(session_id, text):"):]
+    body = body[:body.index("\n    def err(")]
+    assert "memory.note_turn(session_id) == 1" in body
+    assert "The original request" in body
+
+
+def test_the_job_is_a_fact_so_it_is_never_trimmed():
+    """context_block trims the summary and keeps the facts: a half-remembered
+    goal is worse than a half-remembered narrative."""
+    memory.note_turn("sess-abc")
+    memory.remember_fact("sess-abc", "The original request: build a shop in Fez")
+    memory.remember_summary("sess-abc", "x" * memory.MAX_SUMMARY_CHARS)
+    block = memory.context_block("sess-abc", budget_chars=300)
+    assert "build a shop in Fez" in block
+
+
+def test_claude_restates_too():
+    """claude blanks `text` after turn 1, which collapsed its addition to almost
+    nothing -- the same "told once" failure codex and opencode had, by a
+    different route."""
+    body = AGENT[AGENT.index("def _build_argv(sess: _Session"):]
+    body = body[:body.index("\ndef _build_argv_codex")]
+    assert "_due_for_restate(sess)" in body

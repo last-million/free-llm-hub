@@ -61,7 +61,7 @@ def test_the_task_comes_before_the_standing_notice(monkeypatch):
     """The codex bug, which cost several turns: leading with the notice made
     the agent answer the NOTICE instead of the user's request."""
     monkeypatch.setattr(agentic_chat, "_system_prompt_addition", lambda *a, **k: "VERIFY YOUR WORK")
-    monkeypatch.setattr(agentic_chat, "write_task_brief", lambda d, t: False)
+    monkeypatch.setattr(agentic_chat, "write_task_brief", lambda d, t, **k: False)
     prompt = agentic_chat._build_argv(_Sess(), "/bin/opencode", "restaurant site in Fez")[-1]
     assert prompt.index("restaurant site in Fez") < prompt.index("VERIFY YOUR WORK")
 

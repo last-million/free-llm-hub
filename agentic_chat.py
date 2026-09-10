@@ -1515,8 +1515,8 @@ _VISION_GAP_SNIPPET = (
 
 
 _BRIEF_POINTER = (
-    "This folder contains %s -- required standards for this task. "
-    "READ IT FIRST and follow it."
+    "This folder contains %s -- required standards for this task, and what "
+    "this conversation has already established. READ IT FIRST and follow it."
 )
 
 _RESTATE_SNIPPET = (
@@ -1594,8 +1594,30 @@ def _system_prompt_addition(text: str = "", has_brief: bool = False) -> str:
 
 BRIEF_FILENAME = ".calvoun-brief.md"
 
+# How much remembered context rides along with the brief. It goes in the FILE,
+# never in argv: the worst-case turn-1 command line already measures 8006 chars
+# against cmd.exe's ~8191 ceiling, so there is not room in the prompt for two
+# hundred characters, let alone two thousand.
+_MEMORY_BUDGET = 2000
 
-def write_task_brief(project_dir, text):
+
+def _memory_block(sess):
+    """What this conversation already established, or "".
+
+    THE MEMORY WAS WRITE-ONLY UNTIL NOW. memory.remember_summary has been
+    filing the compaction recap since the memory manager landed, and nothing
+    ever read it back into a turn -- so a conversation that had been compacted
+    still forgot everything it had done, which is the whole complaint the
+    module was built for ("les agents ne continuent pas jusqu'au bout ...
+    utilise le memory manager")."""
+    try:
+        return memory.context_block(getattr(sess, "id", None),
+                                    budget_chars=_MEMORY_BUDGET)
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def write_task_brief(project_dir, text, memory_block=""):
     """Write the craft brief for `text` into the project, return True if any.
 
     WHY A FILE AND NOT MORE PROMPT: the prompt travels as a POSITIONAL argv
@@ -1608,16 +1630,34 @@ def write_task_brief(project_dir, text):
     spends ~200 characters telling it to, and the full brief arrives intact.
 
     Rewritten each turn it applies, so the standards always match the CURRENT
-    request rather than whatever the first message happened to be about."""
+    request rather than whatever the first message happened to be about.
+
+    IT CARRIES THE CONVERSATION'S MEMORY TOO, for the same reason and at no
+    extra cost: the pointer to this file is already in the prompt, so what the
+    session already established rides in for free instead of competing with the
+    user's own message for the ~185 characters of argv headroom that are left.
+
+    One file per PROJECT, not per session. Swarm workers share a project
+    directory and will overwrite each other's copy; that is tolerable here
+    because they are phases of one job whose summaries the review phase shares
+    deliberately anyway. It would not be tolerable for anything private."""
     try:
         brief = craft.system_message(text or "")
-        if not brief:
+        memory_block = (memory_block or "").strip()
+        if not brief and not memory_block:
             return False
         path = os.path.join(project_dir, BRIEF_FILENAME)
         header = ("<!-- Written by Calvoun Free LLM Hub for THIS task. "
                   "Safe to delete; it is regenerated whenever it applies. -->")
+        parts = [header]
+        if memory_block:
+            parts.append("## What this conversation already established"
+                         + chr(10) + chr(10) + memory_block)
+        if brief:
+            parts.append(brief["content"])
+        sep = chr(10) + chr(10)
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write(header + chr(10) + chr(10) + brief["content"] + chr(10))
+            fh.write(sep.join(parts) + chr(10))
         return True
     except Exception:                                            # noqa: BLE001
         return False        # standards are a bonus; never cost the user a turn
@@ -1668,10 +1708,16 @@ def _build_argv(sess: _Session, bin_path: str, text: str, stream=False):
              "--model", _claude_model_for(sess)]
     if stream:
         args += ["--verbose"]  # claude -p requires --verbose alongside stream-json
+    # claude gets --append-system-prompt on every turn, but with `text` blanked
+    # after turn 1 the addition collapses to almost nothing -- so it had the
+    # same "told once, before compaction ate it" problem codex and opencode had,
+    # just by a different route.
     first = not sess.native_session_id
+    fresh = first or _due_for_restate(sess)
     addition = _system_prompt_addition(
-        text if first else "",
-        has_brief=first and write_task_brief(sess.project_dir, text))
+        text if fresh else "",
+        has_brief=fresh and write_task_brief(sess.project_dir, text,
+                                             memory_block=_memory_block(sess)))
     if addition:
         args += ["--append-system-prompt", addition]
     return _launcher(bin_path) + args
@@ -1713,7 +1759,8 @@ def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
         addition = ""
     else:
         addition = _system_prompt_addition(
-            text, has_brief=write_task_brief(sess.project_dir, text))
+            text, has_brief=write_task_brief(sess.project_dir, text,
+                                             memory_block=_memory_block(sess)))
     prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
         if addition else text
     base = ["exec"]
@@ -1776,7 +1823,8 @@ def _build_argv_opencode(sess: "_Session", bin_path: str, text: str):
         addition = ""
     else:
         addition = _system_prompt_addition(
-            text, has_brief=write_task_brief(sess.project_dir, text))
+            text, has_brief=write_task_brief(sess.project_dir, text,
+                                             memory_block=_memory_block(sess)))
     prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
         if addition else text
     # --auto: "auto-approve permissions that are not explicitly denied".
@@ -2412,7 +2460,14 @@ def send_message_stream(session_id, text):
     # _due_for_restate depends on. Counted here, at the one place every turn
     # goes through, and never allowed to fail a turn.
     try:
-        memory.note_turn(session_id)
+        # The FIRST message is the job. Everything else in memory is derived
+        # (a recap of turns that have scrolled away); this is the one thing a
+        # session must not lose, and losing it is what "the agent stopped
+        # before the end" looks like from the inside -- it no longer knows what
+        # the end was. Recorded as a fact, so context_block never trims it.
+        if memory.note_turn(session_id) == 1:
+            memory.remember_fact(session_id, "The original request: "
+                                 + " ".join((text or "").split())[:240])
     except Exception:                                            # noqa: BLE001
         pass
     def err(status, detail, code=None):
