@@ -90,6 +90,7 @@ import usage_history
 # time, not at import time.
 import vision_status
 import swarm_windows
+import memory
 
 # Both tool families are wired here, and for the same reason: every name below
 # is resolved at CALL time, not at import time, so they can live far lower in
@@ -6518,8 +6519,12 @@ def _summary_key(dropped):
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest(), text
 
 
-def _summarize_worker(key, text):
-    """Compute one recap and cache it. Runs OFF the request path."""
+def _summarize_worker(key, text, sid=None):
+    """Compute one recap and cache it. Runs OFF the request path.
+
+    `sid` names the conversation so the recap can also be written where it
+    survives a restart; None (a gateway request with no session) just uses the
+    in-memory cache as before."""
     try:
         msgs = [{"role": "system", "content": _SUMMARY_SYSTEM},
                 {"role": "user", "content": text[-60000:]}]
@@ -6550,6 +6555,14 @@ def _summarize_worker(key, text):
                 if len(_summary_cache) >= _SUMMARY_CACHE_MAX:
                     _summary_cache.clear()   # cheap bound; recaps are re-derivable
                 _summary_cache[key] = out
+            # ...and durably, for the conversation this recap belongs to. The
+            # cache above is 64 entries of RAM: the hub auto-updates every five
+            # hours, so a long conversation's recap was reliably lost before
+            # anything could use it twice. memory.remember_summary is
+            # best-effort and never raises -- a recap that cannot be filed is
+            # still a recap that got used on this turn.
+            if sid:
+                memory.remember_summary(sid, out)
             return
     except Exception:                                            # noqa: BLE001
         _log.debug("[summary] worker failed", exc_info=True)
@@ -6582,7 +6595,14 @@ def _summarize_dropped(dropped):
             if key in _summary_inflight or len(_summary_inflight) >= _SUMMARY_MAX_INFLIGHT:
                 return None                # already being computed, or too many at once
             _summary_inflight.add(key)
-        threading.Thread(target=_summarize_worker, args=(key, text),
+        # The conversation is resolved HERE, on the request thread: _build_sid
+        # reads the request context, and the worker runs on a thread that does
+        # not have one.
+        try:
+            sid = _build_sid()
+        except Exception:                                        # noqa: BLE001
+            sid = None
+        threading.Thread(target=_summarize_worker, args=(key, text, sid),
                          daemon=True, name="summarize").start()
     except Exception:                                            # noqa: BLE001
         _log.debug("[summary] could not schedule", exc_info=True)

@@ -115,6 +115,7 @@ import time
 import uuid
 
 import agentic_history
+import memory
 import model_categories
 import config
 import craft
@@ -1708,7 +1709,7 @@ def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
     # So: task first, notice appended and clearly marked as ancillary, and only
     # while there is no thread to resume — `resume` already carries the earlier
     # turns, so re-sending it is pure noise.
-    if sess.native_session_id:
+    if sess.native_session_id and not _due_for_restate(sess):
         addition = ""
     else:
         addition = _system_prompt_addition(
@@ -1730,6 +1731,32 @@ def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
     return _launcher(bin_path) + base
 
 
+
+def _due_for_restate(sess):
+    """Should this turn carry the standing instructions again?
+
+    They shipped on turn 1 and never again -- for codex and opencode literally
+    `addition = ""` from turn 2 -- so a forty-turn session was following rules
+    it was told about once, before compaction had eaten the message carrying
+    them. That is the "les agents ne continuent pas jusqu'au bout" complaint
+    from the other side: an agent that has forgotten it was told to finish.
+
+    Every RESTATE_EVERY turns, not every turn: a repeated notice reads as a
+    repeated user instruction (the codex failure recorded in _build_argv_codex),
+    and it costs tokens on requests that did not need it. The counter is the
+    durable one, because _Session.turn_count resets to 0 on resume and the
+    5-hourly auto-update restart resumes everything."""
+    try:
+        sid = getattr(sess, "id", None)
+        if not sid:
+            return False
+        if memory.should_restate_rules(sid):
+            memory.mark_rules_restated(sid)
+            return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return False
+
 def _build_argv_opencode(sess: "_Session", bin_path: str, text: str):
     """OpenCode agentic invocation (opencode-ai 1.18.11, live-verified).
 
@@ -1745,7 +1772,7 @@ def _build_argv_opencode(sess: "_Session", bin_path: str, text: str):
     inlined into the prompt AFTER the task and only on the first turn, for
     exactly the reason recorded in _build_argv_codex: leading with the notice
     made the agent answer the notice instead of the user."""
-    if sess.native_session_id:
+    if sess.native_session_id and not _due_for_restate(sess):
         addition = ""
     else:
         addition = _system_prompt_addition(
@@ -2379,6 +2406,15 @@ def send_message_stream(session_id, text):
     Same validation / turn-lock / tree-kill model as send_message(). Always ends
     with exactly one {"event":"done",...}, {"event":"error",...}, or
     {"event":"stopped"}. Never raises."""
+    # A DURABLE turn count. _Session.turn_count resets to 0 when a session is
+    # resumed, and the 5-hourly auto-update restart resumes everything -- so it
+    # cannot answer "how long has this conversation been going", which is what
+    # _due_for_restate depends on. Counted here, at the one place every turn
+    # goes through, and never allowed to fail a turn.
+    try:
+        memory.note_turn(session_id)
+    except Exception:                                            # noqa: BLE001
+        pass
     def err(status, detail, code=None):
         ev = {"event": "error", "status": status, "detail": detail}
         if code:
