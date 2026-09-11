@@ -35,6 +35,7 @@ may ever fail because remembering failed.
 Pure stdlib, and no imports from app.py or agentic_chat: this is a leaf, for the
 same reason model_categories is one.
 """
+import hashlib
 import json
 import os
 import re
@@ -50,6 +51,33 @@ _ROOT_ENV = "FREE_LLM_HUB_MEMORY_DIR"
 MAX_SUMMARY_CHARS = 4000
 MAX_FACTS = 40
 MAX_FACT_CHARS = 300
+
+# THREE HORIZONS, NOT ONE.
+#
+# REQUESTED: "long, short, medium memory for each project and session, and for
+# long and short and medium context window".
+#
+# The three are different kinds of thing, and collapsing them is why a long
+# conversation both forgets what matters and pays for what does not:
+#
+#   SHORT   the last few exchanges, verbatim. The model already has these in
+#           its window; what it loses is the ones compaction just dropped, so
+#           this keeps a one-line trace of each recent turn to hand back.
+#   MEDIUM  the running summary of everything older. One paragraph standing in
+#           for a hundred turns.
+#   LONG    the decisions and constraints that outlive the conversation
+#           entirely -- and, for the first time, that can belong to the PROJECT
+#           rather than the session, so tomorrow's conversation in the same
+#           folder starts knowing what yesterday's established.
+MAX_RECENT = 12               # short: how many turn traces are kept
+MAX_RECENT_CHARS = 200        # ...and how much of each
+
+# What each horizon may spend of the context budget when they compete. Short
+# memory is cheapest and most perishable; long memory is the expensive thing to
+# re-derive, so it is served first and trimmed last.
+SHARE_LONG = 0.45
+SHARE_MEDIUM = 0.35
+SHARE_SHORT = 0.20
 # How often an agent session is reminded of its standing instructions. Every
 # turn would be nagging and would cost tokens on every request; never is what
 # the hub did before.
@@ -66,6 +94,72 @@ def _root():
 
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+# WHO OWNS A MEMORY.
+#
+# REQUESTED: "each task working should have his memory alone, and each agent
+# have his memory, and some can have shared memory in swarm, and global memory
+# ... to not consume much tokens with useless tokens from context window and
+# memory".
+#
+# Five scopes, narrowest first. A memory is written to exactly ONE of them, and
+# a turn reads the ones that apply to it:
+#
+#   task     one unit of work inside a conversation. Dies with the task; this
+#            is where "the file is at src/api/v2.ts" belongs, and exactly what
+#            should NOT follow the conversation into the next job.
+#   agent    one session. What this worker has established for itself.
+#   run      SHARED between the agents of one swarm. The reason a swarm is a
+#            crew and not five strangers: what agent 2 discovered about the
+#            build, agent 4 does not have to discover again.
+#   project  the folder. Outlives every conversation in it.
+#   global   the install. Facts true of this machine and this user.
+#
+# A narrower scope wins a contradiction, because it is the more specific
+# claim: a task that decided on Vite overrides a project note preferring
+# webpack, for the length of that task.
+GLOBAL_KEY = "global-memory"
+SCOPE_ORDER = ("task", "agent", "run", "project", "global")
+
+
+def global_key():
+    return GLOBAL_KEY
+
+
+def run_key(run_id):
+    """The scope SHARED by every agent in one swarm run."""
+    rid = str(run_id or "").strip()
+    if not rid or not _SAFE_ID_RE.match(rid):
+        return None
+    return "run-" + rid[:48]
+
+
+def task_key(session_id, task):
+    """One unit of work inside a conversation.
+
+    Hashed on the session AND the task text, so the same task description in
+    two different conversations is two memories -- a task is work, not a
+    topic, and two people doing "add auth" are not doing the same work."""
+    sid = str(session_id or "").strip()
+    txt = " ".join(str(task or "").split()).lower()
+    if not sid or not txt:
+        return None
+    raw = (sid + "|" + txt).encode("utf-8", "replace")
+    return "task-" + hashlib.sha256(raw).hexdigest()[:20]
+
+
+def project_key(project_dir):
+    """A stable, filesystem-safe id for one project folder, or None.
+
+    A project is identified by its PATH, which is neither safe nor short as a
+    filename, so it is hashed. Case- and separator-normalised first: the same
+    folder reached as C:\\work\\site and c:/work/site is one project, and on
+    Windows it routinely is both within a single session."""
+    if not isinstance(project_dir, str) or not project_dir.strip():
+        return None
+    norm = os.path.normcase(os.path.abspath(project_dir.strip()))
+    return "proj-" + hashlib.sha256(norm.encode("utf-8", "replace")).hexdigest()[:20]
 
 
 def _path(session_id):
@@ -91,7 +185,7 @@ def _blank(session_id):
     # caller that had lost its session id wrote to, and read from, one shared
     # file. Keeping it unusable is what makes _save refuse.
     return {"session_id": session_id if isinstance(session_id, str) else None,
-            "summary": "", "facts": [],
+            "summary": "", "facts": [], "recent": [],
             "turns": 0, "rules_restated_turn": 0, "updated_at": 0.0,
             "compactions": 0, "restate_due": False}
 
@@ -108,8 +202,9 @@ def get(session_id):
             return _blank(session_id)
         base = _blank(session_id)
         base.update({k: v for k, v in got.items() if k in base})
-        if not isinstance(base.get("facts"), list):
-            base["facts"] = []
+        for field in ("facts", "recent"):
+            if not isinstance(base.get(field), list):
+                base[field] = []
         return base
     except (OSError, ValueError):
         return _blank(session_id)
@@ -171,6 +266,24 @@ def remember_fact(session_id, text):
             return True                        # already known; not an error
         facts.append(text)
         mem["facts"] = facts[-MAX_FACTS:]
+        return _save(mem)
+
+
+def remember_recent(session_id, text, role="user"):
+    """SHORT memory: a one-line trace of a turn that just happened.
+
+    Not a transcript -- the model still has the real turns in its window. This
+    is what survives the moment compaction drops them, so a conversation that
+    was just truncated can still say what it was doing thirty seconds ago."""
+    text = " ".join((text or "").split())[:MAX_RECENT_CHARS]
+    if not text:
+        return False
+    with _LOCK:
+        mem = get(session_id)
+        recent = [r for r in (mem.get("recent") or []) if isinstance(r, dict)]
+        recent.append({"role": str(role or "user")[:16], "text": text,
+                       "at": time.time()})
+        mem["recent"] = recent[-MAX_RECENT:]
         return _save(mem)
 
 
@@ -236,37 +349,232 @@ def mark_rules_restated(session_id):
         return _save(mem)
 
 
-def context_block(session_id, budget_chars=2000):
-    """What this conversation should carry into its next turn, or "".
+def remember_project_fact(project_dir, text):
+    """LONG memory, one level up: something true of the PROJECT.
 
-    Ordered so that truncation loses the least: the decisions first, because
-    they are short and expensive to re-derive, then as much of the summary as
-    fits. Returns plain text -- the caller decides whether that becomes a
-    system message, a prompt prefix or a file."""
-    mem = get(session_id)
-    facts = [f for f in (mem.get("facts") or []) if isinstance(f, str) and f.strip()]
-    summary = (mem.get("summary") or "").strip()
-    if not facts and not summary:
+    A session's facts die with the session. "This repo uses pnpm, not npm" is
+    true tomorrow too, and re-learning it every conversation is the cost this
+    removes. Stored under a hash of the folder, so it follows the project and
+    not the chat."""
+    return remember_fact(project_key(project_dir), text)
+
+
+def project_facts(project_dir):
+    return get(project_key(project_dir)).get("facts") or []
+
+
+def forget_project(project_dir):
+    return forget(project_key(project_dir))
+
+
+# WHEN A LONG MEMORY IS WORTH ITS TOKENS.
+#
+# "long memory or context can be used only when really needed." Injecting
+# every remembered fact into every turn is how a memory system becomes the
+# context problem it was built to solve -- forty facts at 300 characters is
+# 12,000 characters spent on a turn that asked one question.
+#
+# So a fact earns its place by OVERLAPPING WITH THE TURN. No embeddings and no
+# index: term overlap against the current message, which is stdlib, instant,
+# deterministic, and explains itself when it is wrong. The two exceptions are
+# deliberate -- the job itself is always in scope, and so is anything the user
+# marked as a rule.
+_STOP = frozenset("""
+the a an and or but if then else for of to in on at by with from as is are was
+were be been being do does did doing have has had having this that these those
+it its i you he she we they me him her them my your our their what which who
+whom how why when where all any both each few more most other some such no nor
+not only own same so than too very can will just should now please make use
+using used need needs want file files code line lines
+""".split())
+
+# A fact is pinned into every turn when it looks like a standing rule or the
+# job itself. These are the two things a conversation must never be without.
+_ALWAYS = ("the original request:", "must ", "must:", "never ", "always ",
+           "do not ", "don't ")
+
+# How much of a fact's own vocabulary has to appear in the turn before it is
+# worth sending. Low on purpose: a false positive costs a line, a false
+# negative costs the model the one thing it needed.
+RELEVANCE_MIN = 0.15
+
+
+def _terms(text):
+    out = set()
+    for word in re.split(r"[^A-Za-z0-9_.+-]+", (text or "").lower()):
+        word = word.strip("._+-")
+        if len(word) >= 3 and word not in _STOP:
+            out.add(word)
+    return out
+
+
+def _is_always(fact):
+    low = (fact or "").lower()
+    return any(low.startswith(m) or m in low[:40] for m in _ALWAYS)
+
+
+def _relevant(facts, query, keep_always=True):
+    """`facts` narrowed to what this turn is actually about.
+
+    Returns them in their original order -- a memory is a list of decisions and
+    reordering it by score would make the oldest and newest read the same."""
+    if not query:
+        return list(facts)
+    qt = _terms(query)
+    if not qt:
+        return list(facts)
+    out = []
+    for f in facts:
+        if keep_always and _is_always(f):
+            out.append(f)
+            continue
+        ft = _terms(f)
+        if not ft:
+            continue
+        if len(ft & qt) / float(len(ft)) >= RELEVANCE_MIN:
+            out.append(f)
+    return out
+
+
+def _clip(parts, budget, heading_lines=1):
+    """As many of `parts` as fit in `budget`, as whole lines where possible.
+
+    TWO RULES, both learned from getting it wrong:
+
+      * trimming back to the last newline threw the whole content line away.
+        A summary is ONE long line, so "cut at 800 then trim to the newline"
+        left the heading and nothing else. The last line is truncated instead,
+        because half a sentence of recap beats none of it.
+      * a section title with nothing under it spends characters to say less
+        than silence would, so a block whose only survivor is its heading
+        comes back empty.
+    """
+    lines = [x for x in parts if x]
+    out, used = [], 0
+    for line in lines:
+        sep = 1 if out else 0
+        if used + sep + len(line) <= budget:
+            out.append(line)
+            used += sep + len(line)
+            continue
+        room = budget - used - sep
+        # Below this a fragment is noise rather than information.
+        if room >= 40:
+            out.append(line[:room])
+        break
+    if len([x for x in out if x.strip()]) <= heading_lines:
         return ""
-    parts = []
-    if facts:
-        parts.append("Decisions already made in this conversation "
-                     "(do not re-litigate these):")
-        parts.extend("- " + f for f in facts)
-    if summary:
-        parts.append("")
-        parts.append("What has happened so far:")
-        parts.append(summary)
-    text = "\n".join(parts)
-    if len(text) <= budget_chars:
-        return text
-    # Trim the SUMMARY, never the decisions: a half-remembered decision is
-    # worse than a half-remembered narrative.
-    head = "\n".join(parts[:len(facts) + 1]) if facts else ""
-    room = max(0, budget_chars - len(head) - 40)
-    if room <= 0:
-        return head[:budget_chars]
-    return head + "\n\nWhat has happened so far:\n" + summary[:room]
+    return "\n".join(out)
+
+
+def remember_in(scope, text):
+    """Write one fact into a named scope. `scope` is any *_key() result."""
+    return remember_fact(scope, text)
+
+
+def facts_in(scope):
+    return [f for f in (get(scope).get("facts") or []) if isinstance(f, str)]
+
+
+def recall(scopes, query="", budget_chars=1200):
+    """The decisions from `scopes` that this turn is actually about.
+
+    `scopes` is an ordered list of scope ids, NARROWEST FIRST -- task, agent,
+    run, project, global. A fact seen in a narrower scope suppresses the same
+    fact in a wider one, so a task-level decision overrides the project note it
+    contradicts for as long as the task lasts.
+
+    Narrowed by relevance to `query` (the turn being sent), because a memory
+    that ships everything it has on every turn is the context problem it was
+    meant to solve. Pass query="" to get everything, which is what a restate
+    turn wants."""
+    picked, seen = [], set()
+    for scope in scopes:
+        if not scope:
+            continue
+        for f in _relevant(facts_in(scope), query):
+            k = " ".join(f.lower().split())
+            if k in seen:
+                continue        # the narrower scope already said it
+            seen.add(k)
+            picked.append(f)
+    if not picked:
+        return ""
+    return _clip(["Decisions already made (do not re-litigate these):"]
+                 + ["- " + f for f in picked], budget_chars)
+
+
+def context_block(session_id, budget_chars=2000, project_dir=None,
+                  short=True, medium=True, long=True, query="",
+                  run_id=None, task=None):
+    """What this conversation carries into its next turn, or "".
+
+    THREE HORIZONS, SPENT IN ORDER OF WHAT IS EXPENSIVE TO LOSE:
+
+      long    project facts, then session facts. Short, and the costliest to
+              re-derive -- a decision re-litigated is a whole exchange spent
+              arriving back where the conversation already was.
+      medium  the running summary. One paragraph standing in for the turns
+              that compaction dropped.
+      short   the last few turn traces. Cheapest, most perishable, and the
+              first thing cut when the budget is tight.
+
+    Each horizon gets a share of the budget (SHARE_LONG / MEDIUM / SHORT), and
+    whatever a horizon does not spend is handed to the next one down -- so a
+    conversation with no facts yet gives its whole budget to the summary
+    instead of padding.
+
+    The three can be switched off individually: a first turn has no history
+    worth restating, and a caller that only wants the standing decisions can
+    ask for long alone."""
+    mem = get(session_id)
+    # Narrowest first: task, agent, run, project, global. recall() de-duplicates
+    # across them and drops whatever this turn is not about.
+    scopes = [task_key(session_id, task), session_id, run_key(run_id),
+              project_key(project_dir) if project_dir else None, GLOBAL_KEY]
+    summary = (mem.get("summary") or "").strip()
+    recent = [r for r in (mem.get("recent") or []) if isinstance(r, dict)]
+
+    budget = max(0, int(budget_chars or 0))
+    out, spent = [], 0
+
+    if long:
+        # Served FIRST and trimmed LAST, so the share is a ceiling against
+        # starving the others -- not a cap when there is nothing to starve.
+        block = recall(scopes, query, budget)
+        if block:
+            room = min(budget, max(int(budget * SHARE_LONG),
+                                   block.find(chr(10), block.find(chr(10)) + 1) + 1
+                                   if chr(10) in block else len(block)))
+            block = recall(scopes, query, room)
+        if block:
+            out.append(block)
+            spent += len(block)
+
+    # MEDIUM IS NOT FREE EITHER. The running summary is worth its ~4000
+    # characters when the conversation has actually lost turns to compaction,
+    # or when the caller asked for everything (a restate turn). On an ordinary
+    # turn in a conversation that has never been compacted, the model still
+    # has the real history in its window and the summary is a duplicate.
+    if medium and summary and (not query or int(mem.get("compactions") or 0) > 0):
+        room = int(budget * SHARE_MEDIUM) + (int(budget * SHARE_LONG) - spent
+                                             if spent < int(budget * SHARE_LONG) else 0)
+        block = _clip(["", "What has happened so far:", summary], max(0, room))
+        if block:
+            out.append(block)
+            spent += len(block)
+
+    if short and recent:
+        room = budget - spent
+        if room > 80:
+            lines = ["", "The last few turns:"]
+            lines += ["- %s: %s" % (r.get("role", "?"), r.get("text", ""))
+                      for r in recent]
+            block = _clip(lines, room)
+            if block:
+                out.append(block)
+
+    return "\n".join(out).strip()
 
 
 def forget(session_id):

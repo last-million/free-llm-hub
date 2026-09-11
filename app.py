@@ -17468,14 +17468,42 @@ def _swarm_rank(cands):
     drained = [pm for pm in ordered if pm not in afford]
     ordered = afford + drained
 
-    picks, used = [], set()
-    for pm in ordered:                      # one pass preferring a fresh provider
-        if pm[0] not in used:
-            picks.append(pm)
-            used.add(pm[0])
-            if len(picks) >= fanout:
-                return picks
-    for pm in ordered:                      # then top up, repeats allowed
+    # SPREAD BY MODEL, NOT ONLY BY PROVIDER.
+    #
+    # This de-duplicated on pm[0], the provider id -- so groq/gpt-oss-120b and
+    # cerebras/gpt-oss-120b, which are two providers serving ONE model, both
+    # took a slot. A best-of-five that runs the same model twice is a
+    # best-of-four with a wasted slot and two answers that agree because they
+    # came from the same weights.
+    #
+    # REPORTED: "why in swarm he use same model 2 times". Exactly that.
+    #
+    # Three passes, each looser than the last, so the fan-out still fills:
+    #   1. a provider AND a model neither seen yet -- the real spread;
+    #   2. a model not seen yet, whatever provider serves it;
+    #   3. anything left, repeats allowed -- a short swarm is worse than a
+    #      duplicate, which is why this pass exists at all.
+    picks, used_providers, used_models = [], set(), set()
+
+    def _take(pm):
+        picks.append(pm)
+        used_providers.add(pm[0])
+        used_models.add(_normalize_model_identity(pm[1]))
+        return len(picks) >= fanout
+
+    for pm in ordered:
+        if pm[0] in used_providers:
+            continue
+        if _normalize_model_identity(pm[1]) in used_models:
+            continue
+        if _take(pm):
+            return picks
+    for pm in ordered:
+        if pm in picks or _normalize_model_identity(pm[1]) in used_models:
+            continue
+        if _take(pm):
+            return picks
+    for pm in ordered:
         if pm not in picks:
             picks.append(pm)
             if len(picks) >= fanout:

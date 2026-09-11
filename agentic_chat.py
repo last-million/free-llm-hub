@@ -206,6 +206,28 @@ _SUPPORT = {
 # overridable via AGENTIC_CHAT_TIMEOUT for anyone who wants it tighter.
 _TURN_TIMEOUT = int(os.environ.get("AGENTIC_CHAT_TIMEOUT", "1800") or "1800")
 
+# A FROZEN TURN IS NOT A SLOW ONE.
+#
+# _TURN_TIMEOUT is a WALL CLOCK on the whole turn, and a turn that legitimately
+# builds something can run for twenty minutes. But a CLI wedged on a bash call
+# that never returns produces NOTHING, and the wall clock cannot tell those two
+# apart -- so a freeze cost the full thirty minutes of silence before anything
+# happened, and the user watched a spinner for half an hour.
+#
+# REPORTED: "persistence even if he use bash etc, if he freeze etc, he should
+# have python think and continue, and always work should be finished till the
+# end."
+#
+# Silence is the signal. A working agent emits events continuously -- a tool
+# call, a message, a token. Nothing at all for this long means wedged, not
+# thinking, and the recovery already exists: the same resume path a timeout
+# takes, which hands the CLI its own thread id back and continues the work
+# rather than restarting it.
+#
+# Generous on purpose: the swarm's own per-hop deadline is 360s, and a single
+# model call inside a turn can legitimately be quiet for minutes.
+_STALL_TIMEOUT = int(os.environ.get("AGENTIC_CHAT_STALL", "420") or "420")
+
 # Keep the prompt safely under cmd.exe's ~8191-char command-line ceiling once
 # wrapped in `cmd.exe /c <shim.cmd> ...` on Windows (this hub's ONLY launch path
 # for an npm-installed CLI there) -- see module docstring. One flat constant,
@@ -1733,7 +1755,7 @@ def _sweep_stale_briefs(project_dir, keep):
 _MEMORY_BUDGET = 2000
 
 
-def _memory_block(sess):
+def _memory_block(sess, turn_text=""):
     """What this conversation already established, or "".
 
     THE MEMORY WAS WRITE-ONLY UNTIL NOW. memory.remember_summary has been
@@ -1743,8 +1765,18 @@ def _memory_block(sess):
     module was built for ("les agents ne continuent pas jusqu'au bout ...
     utilise le memory manager")."""
     try:
+        # project_dir is what makes the LONG horizon outlive the conversation:
+        # "this repo uses pnpm, not npm" is true tomorrow too, and re-learning
+        # it in every new session is the cost this removes.
+        # THE TURN IS THE QUERY. Without it every remembered fact ships on
+        # every message -- forty facts at 300 characters is 12,000 characters
+        # spent on a turn that asked one question. With it, a fact travels when
+        # the turn is actually about it; the job itself and anything phrased as
+        # a rule travel always.
         return memory.context_block(getattr(sess, "id", None),
-                                    budget_chars=_MEMORY_BUDGET)
+                                    budget_chars=_MEMORY_BUDGET,
+                                    project_dir=getattr(sess, "project_dir", None),
+                                    query=turn_text or "")
     except Exception:                                            # noqa: BLE001
         return ""
 
@@ -1851,7 +1883,7 @@ def _build_argv(sess: _Session, bin_path: str, text: str, stream=False):
     addition = _system_prompt_addition(
         text if fresh else "",
         has_brief=fresh and write_task_brief(sess.project_dir, text,
-                                             memory_block=_memory_block(sess),
+                                             memory_block=_memory_block(sess, text),
                                              session_id=getattr(sess, "id", None)))
     if addition:
         args += ["--append-system-prompt", addition]
@@ -1895,7 +1927,7 @@ def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
     else:
         addition = _system_prompt_addition(
             text, has_brief=write_task_brief(sess.project_dir, text,
-                                             memory_block=_memory_block(sess),
+                                             memory_block=_memory_block(sess, text),
                                              session_id=getattr(sess, "id", None)))
     prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
         if addition else text
@@ -1960,7 +1992,7 @@ def _build_argv_opencode(sess: "_Session", bin_path: str, text: str):
     else:
         addition = _system_prompt_addition(
             text, has_brief=write_task_brief(sess.project_dir, text,
-                                             memory_block=_memory_block(sess),
+                                             memory_block=_memory_block(sess, text),
                                              session_id=getattr(sess, "id", None)))
     prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
         if addition else text
@@ -2605,6 +2637,9 @@ def send_message_stream(session_id, text):
         if memory.note_turn(session_id) == 1:
             memory.remember_fact(session_id, "The original request: "
                                  + " ".join((text or "").split())[:240])
+        # SHORT horizon: a one-line trace of the turn, kept for the moment
+        # compaction drops the real thing out of the window.
+        memory.remember_recent(session_id, text, "user")
     except Exception:                                            # noqa: BLE001
         pass
     def err(status, detail, code=None):
@@ -2714,11 +2749,43 @@ def send_message_stream(session_id, text):
             threading.Thread(target=_drain, daemon=True).start()
 
             timed_out[0] = False
-            def _kill_on_timeout():
-                timed_out[0] = True
-                _terminate(proc)
-            timer = threading.Timer(_TURN_TIMEOUT, _kill_on_timeout)
-            timer.daemon = True
+            stalled = [False]
+            last_event = [time.monotonic()]
+            watchdog_stop = threading.Event()
+
+            def _watch():
+                """Kill on EITHER the wall clock or a silence, whichever first.
+
+                Both end in the same place -- timed_out[0], which the code
+                below already knows how to resume from -- because the right
+                response to a wedged turn and an over-long one is the same:
+                hand the CLI its thread id back and carry on."""
+                started = time.monotonic()
+                # Poll fast enough to honour whichever deadline is SHORTER.
+                # A hub configured with a 30-second turn timeout must not wait
+                # five seconds to notice it passed, and a test that sets one
+                # of these to a fraction of a second is asking the same thing.
+                tick = min(5.0, max(0.02, min(_TURN_TIMEOUT,
+                                              _STALL_TIMEOUT or _TURN_TIMEOUT) / 4.0))
+                while not watchdog_stop.wait(tick):
+                    now = time.monotonic()
+                    if now - started > _TURN_TIMEOUT:
+                        timed_out[0] = True
+                        _terminate(proc)
+                        return
+                    if _STALL_TIMEOUT and now - last_event[0] > _STALL_TIMEOUT:
+                        stalled[0] = True
+                        timed_out[0] = True
+                        _log.warning("agentic turn produced nothing for %ds "
+                                     "(session=%s cli=%s) -- treating as wedged",
+                                     _STALL_TIMEOUT, getattr(sess, "id", "?"),
+                                     getattr(sess, "cli_id", "?"))
+                        _terminate(proc)
+                        return
+
+            timer = threading.Thread(target=_watch, daemon=True,
+                                     name="agentic-watchdog-%s"
+                                          % getattr(sess, "id", "?"))
             timer.start()
 
             native_id = None
@@ -2727,6 +2794,9 @@ def send_message_stream(session_id, text):
             last_message_text = None
             try:
                 for line in proc.stdout:
+                    # Any line at all is proof of life -- including one that
+                    # parses to nothing we act on.
+                    last_event[0] = time.monotonic()
                     for e in parse(line):
                         if "_native" in e:
                             native_id = e["_native"]
@@ -2750,7 +2820,7 @@ def send_message_stream(session_id, text):
             except Exception:
                 pass
             if timer:
-                timer.cancel()
+                watchdog_stop.set()
             # The stdout loop above only returns once the process has closed
             # stdout, which happens at or after it closes stderr too -- but
             # the DRAIN THREAD reading stderr is a separate scheduling unit,
@@ -2804,12 +2874,19 @@ def send_message_stream(session_id, text):
                 if not timeout_retry_used:
                     timeout_retry_used = True
                     yield {"event": "notice",
-                          "text": ("Still working after %ds — %s." %
-                                   (_TURN_TIMEOUT,
-                                    "resuming" if native_id else "trying again"))}
+                          "text": (("Nothing for %ds — looks wedged, %s."
+                                    % (_STALL_TIMEOUT,
+                                       "resuming" if native_id else "trying again"))
+                                   if stalled[0] else
+                                   ("Still working after %ds — %s."
+                                    % (_TURN_TIMEOUT,
+                                       "resuming" if native_id else "trying again")))}
                     continue
-                yield err(504, "%s timed out after %ds (retried once)."
-                         % (sess.cli_id, _TURN_TIMEOUT)); return
+                yield err(504, "%s %s (retried once)."
+                         % (sess.cli_id,
+                            ("produced nothing for %ds twice" % _STALL_TIMEOUT)
+                            if stalled[0] else
+                            ("timed out after %ds" % _TURN_TIMEOUT))); return
 
             stderr_text = _sanitize("".join(stderr_buf).strip(), 400)
             if final_text is None and final_error is None:
@@ -2855,7 +2932,7 @@ def send_message_stream(session_id, text):
             return
     finally:
         if timer:
-            timer.cancel()
+            watchdog_stop.set()
         with sess.proc_lock:
             if sess.proc is proc:
                 sess.proc = None

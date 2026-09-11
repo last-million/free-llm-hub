@@ -131,4 +131,6 @@ def test_the_conversation_memory_claim_is_true():
 def test_the_compaction_claim_is_true():
     """"what they established rides back in on the next turn"."""
     src = open("agentic_chat.py", encoding="utf-8").read()
-    assert "memory_block=_memory_block(sess)" in src
+    # `sess, text`: the turn is passed in as the relevance query, so a fact
+    # travels when the turn is actually about it rather than on every message.
+    assert "memory_block=_memory_block(sess, text)" in src
