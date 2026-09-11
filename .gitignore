@@ -24,6 +24,7 @@ cm*.txt
 # hub runtime logs (local only)
 hub.err.log
 hub.err.log*
+hub.out
 hub.out.log
 hub.out.log*
 graphify-out/
