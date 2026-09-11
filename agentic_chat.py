@@ -228,6 +228,45 @@ _TURN_TIMEOUT = int(os.environ.get("AGENTIC_CHAT_TIMEOUT", "1800") or "1800")
 # model call inside a turn can legitimately be quiet for minutes.
 _STALL_TIMEOUT = int(os.environ.get("AGENTIC_CHAT_STALL", "420") or "420")
 
+# A FAILURE THAT IS NOT THE TURN'S FAULT.
+#
+# MEASURED live: opencode keeps ONE SQLite database for the whole machine
+# (~/.local/share/opencode/opencode.db). Two of its processes writing at once
+# and the loser gets
+#
+#     502  Error: Unexpected error / database is locked
+#
+# and the turn is over before it began. swarm_windows already retries this for
+# its workers, but a NORMAL turn had no such protection -- so sending a message
+# on /agent while a swarm was running was a 502 for the ordinary path and a
+# retry for the orchestrated one, which is backwards: the person watching is
+# the one who notices.
+#
+# REPORTED as: "http 502".
+#
+# One retry, and only for a failure that says it is temporary. A model that
+# refused, a CLI that is not signed in, a prompt that is wrong -- those fail
+# the same way twice and retrying spends the tokens again to learn nothing.
+_TRANSIENT_FAILURES = (
+    "database is locked",           # opencode's shared SQLite store
+    "database table is locked",
+    "sqlite_busy",
+    "resource temporarily unavailable",
+    "being used by another process",
+    "ebusy",
+    "eagain",
+)
+
+
+# Long enough for the other writer to finish its transaction, short enough
+# that a person does not read it as a hang.
+_TRANSIENT_RETRY_WAIT = 3.0
+
+
+def _looks_transient(detail):
+    low = str(detail or "").lower()
+    return any(marker in low for marker in _TRANSIENT_FAILURES)
+
 # Keep the prompt safely under cmd.exe's ~8191-char command-line ceiling once
 # wrapped in `cmd.exe /c <shim.cmd> ...` on Windows (this hub's ONLY launch path
 # for an npm-installed CLI there) -- see module docstring. One flat constant,
@@ -2368,6 +2407,7 @@ def send_message(session_id, text):
         # non-streaming JSON is all-or-nothing and has nothing to salvage),
         # the retry RESUMES instead of starting the whole task over.
         timeout_retry_used = False
+        transient_retry_used = False
         while True:
             was_resume = bool(sess.native_session_id)
             argv = _build_argv(sess, bin_path, text)
@@ -2425,6 +2465,10 @@ def send_message(session_id, text):
                     # the user can see is logged in -- true, and impossible to
                     # act on.
                     return 403, None, detail + _auth_help(sess.cli_id)
+                if _looks_transient(detail) and not transient_retry_used:
+                    transient_retry_used = True
+                    time.sleep(_TRANSIENT_RETRY_WAIT)
+                    continue
                 return 502, None, detail
             if native_id:
                 sess.native_session_id = native_id
@@ -2749,6 +2793,7 @@ def send_message_stream(session_id, text):
         # user by the time it fires, so staying quiet about starting over
         # would be its own kind of confusing.
         timeout_retry_used = False
+        transient_retry_used = False
         while True:
             was_resume = bool(sess.native_session_id)
             argv = _build_argv(sess, bin_path, text, stream=True)
@@ -2963,6 +3008,20 @@ def send_message_stream(session_id, text):
                     # meant for a human, and free to change).
                     yield err(403, detail + _auth_help(sess.cli_id),
                              code="cli_not_signed_in"); return
+                if _looks_transient(detail) and not transient_retry_used:
+                    # The CLI said itself that this was temporary. Resuming is
+                    # free when there is a thread id -- the work already done
+                    # is still there -- so the only thing spent is the wait.
+                    transient_retry_used = True
+                    if native_id:
+                        sess.native_session_id = native_id
+                    yield {"event": "notice",
+                          "text": "%s was busy (%s) -- %s."
+                                  % (sess.cli_id,
+                                     _sanitize(detail, 60).strip(),
+                                     "resuming" if native_id else "trying again")}
+                    time.sleep(_TRANSIENT_RETRY_WAIT)
+                    continue
                 yield err(502, detail); return
             sess.turn_count += 1
             yield {"event": "done", "text": _sanitize(final_text), "native": native_id}
