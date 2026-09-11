@@ -88,8 +88,8 @@ CATEGORIES = [
         # qwen3.6 carries the longest context in the open-weight class
         # (1M tokens) and llama-4-maverick is the other very-long-context
         # family the fleet actually serves.
-        ("gemini-3", "kimi-k3", "kimi-k2.6", "minimax-m3", "qwen3.6",
-         "llama-4-maverick", "glm-5.3", "hy4"),
+        ("gemini-", "kimi-k3", "kimi-k2.6", "minimax-m3", "qwen3.6",
+         "llama-4-maverick", "glm-5.3", "hy3", "hy4"),
     ),
     (
         "vision",
@@ -99,7 +99,9 @@ CATEGORIES = [
         # "-vl" already caught the Qwen-VL/InternVL spellings; the families
         # below are multimodal without carrying "vl" in the name, which is how
         # a live vision model ended up outside the vision mode.
-        ("vl-plus", "-vl", "vision", "veo-", "vila", "gemini-3", "llava",
+        # "gemini-" not "gemini-3": every Gemini generation is multimodal, and
+        # naming one of them left gemini-2.5-pro outside the vision mode.
+        ("vl-plus", "-vl", "vision", "veo-", "vila", "gemini-", "llava",
          "internvl", "qwen3-vl", "llama-4-maverick", "llama-4-scout",
          "gemma-4", "pixtral", "molmo"),
     ),
@@ -154,7 +156,7 @@ CATEGORIES = [
         "exactly, and thinks before it writes.",
         ("claude-sonnet", "claude-opus", "claude-fable", "gpt-5.6", "gpt-5.2",
          "gpt-4o", "thinking", "reasoner", "deepseek-v4-pro", "kimi-k3",
-         "kimi-k2.6", "qwen3.6", "glm-5.3", "gemini-3", "magistral",
+         "kimi-k2.6", "qwen3.6", "glm-5.3", "gemini-", "magistral", "hy3",
          # ...but never the cheap tier: "max thinking" is the whole request,
          # and a flash/lite/mini variant is the one thing it rules out.
          # "!-mini" for the same reason "-mini" is spelled that way above:

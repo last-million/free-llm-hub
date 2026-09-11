@@ -17308,14 +17308,69 @@ _SWARM_TOOL_FANOUT = 5
 _SWARM_FANOUT_MAX = 8           # past this the quota cost outruns the benefit
 
 
-def _swarm_fanout():
-    """How many models answer one swarm turn. Clamped: a nonsense setting must
-    not spend eight times the quota by accident, nor drop the swarm to zero."""
-    try:
-        n = int(config.get_setting("swarm_fanout", _SWARM_TOOL_FANOUT))
-    except (TypeError, ValueError):
-        n = _SWARM_TOOL_FANOUT
-    return max(1, min(n, _SWARM_FANOUT_MAX))
+# THE ORCHESTRATOR DECIDES HOW MANY, between these.
+#
+# REQUESTED: "in swarm agents I want 4 different best models, or 5 maximum at
+# the same time, or 3, or just 2 -- depending on the orchestrator."
+#
+# A fixed five was wrong in both directions. On a one-line question it spends
+# five models' quota to agree with itself; on a hard build with only three
+# genuinely different models alive it asks for five and fills the last two with
+# whatever is left, which is how a fan-out ends up running the same weights
+# twice (see _swarm_rank's identity spread).
+_SWARM_FANOUT_MIN = 2           # below this it is not a swarm, it is a model
+_SWARM_FANOUT_SOFT_MAX = 5      # what the orchestrator may choose on its own
+
+
+def _swarm_fanout(candidates=None, difficulty=None):
+    """How many models answer one swarm turn: 2 to 5, chosen per turn.
+
+    An explicit `swarm_fanout` setting still wins outright -- someone who typed
+    a number meant it. Left unset, two things decide:
+
+      * HOW MANY DISTINCT MODELS ARE ACTUALLY THERE. `candidates` has already
+        been de-duplicated by identity, so four entries means four different
+        models and asking for five would pad the swarm with a repeat.
+      * HOW HARD THE TURN IS. "hard" earns the full width -- that is what the
+        extra opinions are for. "simple" does not: a second opinion on a
+        one-line answer is quota spent to agree with itself.
+    Spending is NOT decided here -- _swarm_rank already demotes a drained
+    provider out of its slot, and testing the budget twice bought nothing but
+    bugs.
+
+    Never below 2: one model is not a swarm, and a fan-out that quietly becomes
+    a single call is worse than one that says it narrowed."""
+    explicit = config.get_setting("swarm_fanout", None)
+    if explicit is not None:
+        try:
+            return max(1, min(int(explicit), _SWARM_FANOUT_MAX))
+        except (TypeError, ValueError):
+            pass
+
+    want = _SWARM_TOOL_FANOUT
+    if difficulty == "simple":
+        want = _SWARM_FANOUT_MIN
+    elif difficulty == "medium":
+        want = 3
+
+    # NO AFFORDABILITY CHECK HERE, deliberately. _swarm_rank already splits its
+    # candidates into afford/drained on _SWARM_MIN_HEADROOM and puts a drained
+    # provider at the back, so a second budget test in the sizer protects
+    # nothing the ranker was not already protecting -- and it cost two rounds
+    # of real bugs to learn that: counting PROVIDERS punished a single strong
+    # provider serving four models, and _quota_headroom answering 0 for an id
+    # it has never heard of let any unrecognised provider halve the swarm.
+    # Size is a question about the WORK; spending is the ranker's job.
+    if candidates is not None:
+        # Distinct MODELS, not rows: two providers serving one model is one
+        # opinion, and the slot spent on the second is spent on nothing.
+        try:
+            distinct = len({_normalize_model_identity(m) for _p, m in candidates})
+        except Exception:                                        # noqa: BLE001
+            distinct = len(candidates)
+        want = min(want, max(_SWARM_FANOUT_MIN, distinct))
+
+    return max(1, min(want, _SWARM_FANOUT_SOFT_MAX))
 # How deep into the chain to look before ranking. Bigger than the fan-out on
 # purpose: with only three candidates there is nothing to choose BETWEEN, which
 # is exactly how the swarm ended up filling half its slots with models that
@@ -17400,7 +17455,7 @@ def _swarm_has_record(pid, model):
     return (totals["ok"] + totals["fail"]) >= _PROVIDER_PRIOR_MIN_SAMPLES
 
 
-def _swarm_rank(cands):
+def _swarm_rank(cands, difficulty=None):
     """Order swarm candidates by what actually DELIVERS, and push the ones with
     a real record of not answering to the back.
 
@@ -17425,7 +17480,8 @@ def _swarm_rank(cands):
     bad minute must not take the entire swarm down with it."""
     if not cands:
         return []
-    fanout = _swarm_fanout()
+    # Sized from THIS turn's candidates and difficulty, not a constant.
+    fanout = _swarm_fanout(cands, difficulty)
     ranked = sorted(cands, reverse=True,
                     key=lambda pm: _agentic_score((_benchmark_score(pm[0], pm[1]),
                                                    pm[0], pm[1])))
@@ -17592,7 +17648,17 @@ def _swarm_tool_result(body):
         if len(cands) >= _SWARM_TOOL_CANDIDATES:
             break
     # Rank by delivery, don't just take the top of the chain -- see _swarm_rank.
-    picks = _swarm_rank(cands)
+    #
+    # The ROUTER above forces "hard" on purpose: a tool turn needs a model that
+    # can actually drive tools, whatever the text looks like. How many opinions
+    # to buy is a different question, so the fan-out is sized from the turn's
+    # REAL difficulty -- a one-line ask that happens to carry a tools array is
+    # not worth five models agreeing with each other.
+    try:
+        _real = _classify_difficulty(messages, body.get("max_tokens"))
+    except Exception:                                            # noqa: BLE001
+        _real = None
+    picks = _swarm_rank(cands, _real)
     if not picks:
         return None
 

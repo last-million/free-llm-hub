@@ -34,7 +34,8 @@ def _rank(monkeypatch, records, cands):
     monkeypatch.setattr(A, "_quota_headroom", lambda p: 1.0)
     monkeypatch.setattr(A, "_agentic_score", lambda t: 0.0)
     monkeypatch.setattr(A, "_benchmark_score", lambda p, m: 0.0)
-    monkeypatch.setattr(A, "_swarm_fanout", lambda: 3)
+    monkeypatch.setattr(A, "_swarm_fanout",
+                        lambda candidates=None, difficulty=None: 3)
     return A._swarm_rank(cands)
 
 

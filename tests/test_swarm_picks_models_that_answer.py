@@ -130,7 +130,7 @@ def test_the_fanout_ranks_its_candidates_instead_of_taking_chain_order():
         ("google", "alive-1"), ("glm", "alive-2")]
     seen = {}
 
-    def _rank(cands):
+    def _rank(cands, difficulty=None):
         seen["cands"] = list(cands)
         return [("google", "alive-1")]
 

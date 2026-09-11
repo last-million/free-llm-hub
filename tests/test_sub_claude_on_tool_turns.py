@@ -91,7 +91,9 @@ def test_rejecting_subs_in_supports_tools_would_not_remove_them(monkeypatch):
 def test_the_swarm_skips_sub_providers():
     src = open("app.py", encoding="utf-8").read()
     i = src.index("def _swarm_tool_result(")
-    loop = src[i:src.index("picks = _swarm_rank(cands)", i)]
+    # The ranker now takes the turn's difficulty as well, so anchor on the
+    # call NAME rather than its exact arguments.
+    loop = src[i:src.index("picks = _swarm_rank(", i)]
     assert "if _is_sub(hop_pid):" in loop
     assert "continue" in loop
 

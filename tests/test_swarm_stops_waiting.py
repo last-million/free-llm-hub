@@ -58,7 +58,8 @@ def fanout(monkeypatch):
     monkeypatch.setattr(A, "_route_by_difficulty",
                         lambda *a, **k: ("fast", "m1", "hard"))
     monkeypatch.setattr(A, "_build_chain", lambda *a, **k: list(PICKS))
-    monkeypatch.setattr(A, "_swarm_rank", lambda cands: list(PICKS))
+    monkeypatch.setattr(A, "_swarm_rank",
+                        lambda cands, difficulty=None: list(PICKS))
     monkeypatch.setattr(A, "_record_outcome", lambda *a, **k: None)
     monkeypatch.setattr(A, "_record_chat_usage", lambda *a, **k: None)
     monkeypatch.setattr(A, "_note_nonanswer", lambda *a, **k: None)

@@ -167,3 +167,32 @@ def test_no_category_is_only_exclusions():
     is a silently empty mode rather than an error."""
     for key, _label, _help, pats in MC.CATEGORIES:
         assert any(not p.startswith("!") for p in pats), key
+
+
+# --------------------------------------------------------------------------- #
+# Every generation of a family, not just the one that was current
+# --------------------------------------------------------------------------- #
+
+def test_an_older_gemini_pro_is_not_left_out():
+    """The patterns named "gemini-3", so gemini-2.5-pro -- multimodal, long
+    context, and live on this fleet -- matched nothing at all."""
+    got = cats("gemini-2.5-pro")
+    for key in ("context", "vision", "seo"):
+        assert key in got, key
+    assert "fast" not in got
+
+
+def test_hy3_is_used_where_it_belongs():
+    """REQUESTED: "make sure using hy3 too if available". It is live and
+    scores 130, and it was in coding/uncensored but not in the long-context or
+    SEO modes it also qualifies for."""
+    got = cats("hy3")
+    for key in ("coding", "uncensored", "context", "seo"):
+        assert key in got, key
+
+
+def test_widening_gemini_did_not_make_a_flash_slow_down_seo():
+    """"gemini-" now matches every generation, so the SEO subtraction is what
+    keeps the cheap tier out of a mode that asked for maximum thinking."""
+    assert "seo" not in cats("gemini-3.6-flash")
+    assert "vision" in cats("gemini-3.6-flash")
