@@ -3528,11 +3528,48 @@ def _dead_state_dump():
         out["outcomes"] = {"%s|%s" % (p, m): [r.get("ok", 0), r.get("fail", 0), r.get("last", 0)]
                            for (p, m), r in _outcomes.items()
                            if now - r.get("last", 0) <= _OUTCOME_TTL}
+    # THE ACTIVITY FEED, which was in memory only -- so the one page that
+    # answers "is anything actually working" was blank after every restart,
+    # including the 5-hourly automatic one. REPORTED as "I did not see models
+    # working in /activity", on a hub that had just restarted.
+    #
+    # Safe to write down: a row is request METADATA -- cli, protocol, provider,
+    # model, status, timings, the project's folder name -- and carries no
+    # prompt, no response and no key. Checked against a live row before this
+    # was added rather than assumed.
+    with _activity_lock:
+        out["activity"] = list(_activity)
+        out["activity_seq"] = _activity_seq[0]
     return out
 
 
 def _dead_state_load(blob):
     now = time.time()
+    rows = blob.get("activity")
+    if isinstance(rows, list):
+        with _activity_lock:
+            _activity.clear()
+            for row in rows[:_ACTIVITY_MAX]:
+                if not isinstance(row, dict):
+                    continue
+                # A request that was still running when the process died is
+                # never going to finish, and leaving it "in_progress" shows a
+                # spinner that climbs forever. The feed already has a word for
+                # this, so use it rather than invent one.
+                if row.get("status") == "in_progress":
+                    row = dict(row)
+                    row["status"] = "stalled"
+                    row["finished"] = row.get("finished") or now
+                _activity.append(row)
+            try:
+                # Ids must keep climbing: the frontend uses them to tell a row
+                # it has already drawn from a new one, and restarting the
+                # counter makes fresh requests look like old ones.
+                _activity_seq[0] = max(
+                    [int(blob.get("activity_seq") or 0)]
+                    + [int(r.get("id") or 0) for r in _activity])
+            except (TypeError, ValueError):
+                pass
     with _dead_lock:
         for key, exp in (blob.get("dead_models") or {}).items():
             if isinstance(key, str) and "|" in key and exp > now:
