@@ -259,6 +259,40 @@ _STALL_TIMEOUT = int(os.environ.get("AGENTIC_CHAT_STALL", "420") or "420")
 # every turn after the first, was never close.
 _MAX_MESSAGE_CHARS = 5600
 
+# ...BUT ONLY ON THE SHELL PATH. Every number above is arithmetic against
+# cmd.exe's ~8191-character command line, and cmd.exe is no longer in the way:
+# _launcher resolves the .cmd shim to the real program and runs it directly
+# (see _resolve_shim). CreateProcess allows 32,767 characters, four times what
+# the shim did.
+#
+# REPORTED: "some requests got http 400, it's like no answer". A message over
+# the cap is refused with a 400 and the turn never runs -- which is exactly
+# what pasting a long prompt, a stack trace or a file into the agent looks
+# like from the outside.
+#
+# Measured worst case on the direct path: 8071 characters of argv with a
+# 5600-char message, so roughly 2,500 of overhead. 24,000 + 2,500 leaves ~6,000
+# characters of headroom under the real limit.
+#
+# The shell number stays for the fallback: a shim this hub cannot read still
+# goes through cmd.exe, and the old cap is still the true one there.
+_MAX_MESSAGE_CHARS_DIRECT = 24000
+
+
+def max_message_chars(cli_id=None):
+    """The cap for THIS cli, which depends on how its binary is launched."""
+    if os.name != "nt":
+        return _MAX_MESSAGE_CHARS_DIRECT
+    try:
+        path = _resolve_bin(cli_id) if cli_id else None
+        if not path:
+            return _MAX_MESSAGE_CHARS
+        argv = _launcher(path)
+        shell = os.path.basename(argv[0]).lower() in ("cmd.exe", "cmd")
+        return _MAX_MESSAGE_CHARS if shell else _MAX_MESSAGE_CHARS_DIRECT
+    except Exception:                                            # noqa: BLE001
+        return _MAX_MESSAGE_CHARS       # unknown: keep the safe number
+
 # SIGTERM (or the Windows "soft" taskkill attempt) -> SIGKILL/"hard" taskkill
 # escalation grace period, seconds.
 _KILL_GRACE = 5
@@ -2299,10 +2333,11 @@ def send_message(session_id, text):
         return 404, None, "No such agentic session."
     if not isinstance(text, str) or not text.strip():
         return 400, None, "Message text is required."
-    if len(text) > _MAX_MESSAGE_CHARS:
+    _cap = max_message_chars(sess.cli_id)
+    if len(text) > _cap:
         return 400, None, ("Message is %d chars; capped at %d per turn here (keeps the "
-                           "command line safely under Windows' ~8191-char limit)."
-                           % (len(text), _MAX_MESSAGE_CHARS))
+                           "command line under the Windows limit for how this CLI is "
+                           "launched)." % (len(text), _cap))
     supported, reason = _SUPPORT.get(sess.cli_id, (False, "unknown CLI"))
     if not supported:
         return 403, None, "%s agentic mode is not currently supported: %s" % (sess.cli_id, reason)
@@ -2660,8 +2695,10 @@ def send_message_stream(session_id, text):
         yield err(404, "No such agentic session."); return
     if not isinstance(text, str) or not text.strip():
         yield err(400, "Message text is required."); return
-    if len(text) > _MAX_MESSAGE_CHARS:
-        yield err(400, "Message is %d chars; capped at %d per turn." % (len(text), _MAX_MESSAGE_CHARS)); return
+    _cap = max_message_chars(getattr(sess, "cli_id", None))
+    if len(text) > _cap:
+        yield err(400, "Message is %d chars; capped at %d per turn."
+                  % (len(text), _cap)); return
     supported, reason = _SUPPORT.get(sess.cli_id, (False, "unknown CLI"))
     if not supported:
         yield err(403, "%s agentic mode is not supported: %s" % (sess.cli_id, reason)); return

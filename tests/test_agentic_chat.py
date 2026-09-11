@@ -263,9 +263,15 @@ def test_send_message_rejects_empty_text(agent_config, monkeypatch):
 
 def test_send_message_rejects_oversized_text(agent_config, monkeypatch):
     sid = _start(agent_config, monkeypatch)
-    status, text, detail = agentic_chat.send_message(sid, "x" * (agentic_chat._MAX_MESSAGE_CHARS + 1))
+    # The cap depends on how THIS cli is launched: 5600 through cmd.exe, four
+    # times that when the shim resolves to a real program. Ask for the one that
+    # actually applies rather than pinning the shell number.
+    sess = agentic_chat._REGISTRY[sid]
+    cap = agentic_chat.max_message_chars(sess.cli_id)
+    status, text, detail = agentic_chat.send_message(sid, "x" * (cap + 1))
     assert status == 400
     assert "capped" in detail
+    assert str(cap) in detail, "the refusal must name the number it used"
 
 
 def test_send_message_busy_when_turn_already_running(agent_config, monkeypatch):

@@ -48,7 +48,13 @@ def _clean(tmp_path, monkeypatch):
     SW._RUNS.clear()
 
 
-def _wait(run_id, timeout=10):
+def _wait(run_id, timeout=30):
+    """Long enough for a staggered wave.
+
+    SPAWN_STAGGER puts two seconds between workers so they do not all open the
+    same CLI state store at once, so a three-phase run spends ~4s before the
+    last worker has even started. Ten seconds was fine when every worker
+    launched at the same instant; under a loaded suite it was not."""
     end = time.time() + timeout
     while time.time() < end:
         st = SW.status(run_id)
