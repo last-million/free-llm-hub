@@ -185,3 +185,11 @@ def test_the_card_says_it_is_not_a_routed_provider():
     around = SRC[i - 400:i + 700]
     assert "not proxied through the hub" in around or "not a routed" in around
     assert "ads stay in" in around
+
+
+def test_the_card_points_to_the_models_already_routable():
+    i = SRC.index('id="freebuff-card"')
+    around = SRC[i:i + 1600]
+    assert "already routable in the hub" in around
+    for m in ("GLM 5.3 Flash", "DeepSeek V4 Flash", "MiMo 2.5"):
+        assert m in around
