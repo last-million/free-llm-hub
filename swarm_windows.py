@@ -44,12 +44,15 @@ member must never take the run with it. A phase whose dependencies failed still
 runs -- it simply gets less context, which every agent prompt already tolerates.
 """
 import json
+import logging
 import os
 import re
 import tempfile
 import threading
 import time
 import uuid
+
+_log = logging.getLogger("free-llm-hub")
 from collections import deque
 
 # How many workers may run at once, whatever the plan says. Each one is a real
@@ -571,6 +574,17 @@ def _agent_prompt(run, agent):
                   "NOTE: phase(s) %s did not produce a result. Do your own phase "
                   "anyway and state what you had to assume."
                   % ", ".join(str(a.index) for a in missing)]
+    # WHERE THE FILES GO, spelled out. MEASURED 2026-09-12: workers on Windows
+    # ran `pwd` in the bash tool, got a POSIX spelling of the folder
+    # (/tmp/claude/...), and passed THAT to the write tool -- which resolved
+    # it to C:\\tmp\\..., so the files landed outside the project and the
+    # review phase found nothing. The folder is known; say it, in the form
+    # the write tool understands, and say not to trust the other one.
+    parts += ["", "THE PROJECT FOLDER IS: " + run.project_dir,
+              "Every file you create or edit must be inside that folder. Use "
+              "paths relative to it, or that exact absolute spelling. Do not "
+              "reuse a path printed by a shell (`pwd` may print it in another "
+              "form) and never write to /, /tmp or /workspace."]
     parts += ["", "Work only on YOUR phase, and do it now -- do not ask for "
                   "confirmation. Finish with a short summary of what you "
                   "changed and anything the other agents need to know."]
@@ -787,17 +801,38 @@ def _walk(run, spawn, run_turn, on_done=None, configure=None):
                 pass
 
 
+# A second ask when the first answer was not a plan. MEASURED 2026-09-12: a
+# multi-session turn died at "could not turn that into phases" eight seconds
+# in, on a goal the same planner had turned into two clean phases three times
+# that hour -- one model's one bad answer (prose, a truncated object, an empty
+# reply) ended the whole turn. The router's weighted pick rarely lands on the
+# same model twice in a row, and the nudge tells the next one what went wrong.
+PLAN_ATTEMPTS = 2
+_PLAN_NUDGE = ("\n\n(Your previous reply could not be read as the JSON object "
+               "described. Reply with that JSON object only -- no prose, no "
+               "fences, nothing before the opening brace.)")
+
+
 def plan(goal, planner, max_phases=MAX_AGENTS, modes=()):
     """Ask a model to break `goal` into phases. Returns [] when it cannot.
 
     `planner(system, user) -> str` is injected so this can be tested, and so the
     hub's own routing decides which model plans."""
-    try:
-        raw = planner(_PLAN_SYSTEM.replace(
-            "{modes}", ", ".join(modes) if modes else "coding"), goal)
-    except Exception:                                            # noqa: BLE001
-        return []
-    return clean_phases(_extract_json(raw), max_phases, modes)
+    system = _PLAN_SYSTEM.replace("{modes}", ", ".join(modes) if modes else "coding")
+    ask = goal
+    for attempt in range(1, PLAN_ATTEMPTS + 1):
+        try:
+            raw = planner(system, ask)
+        except Exception as exc:                                 # noqa: BLE001
+            _log.warning("[swarm] planner raised on attempt %d: %s", attempt, exc)
+            return []
+        phases = clean_phases(_extract_json(raw), max_phases, modes)
+        if phases:
+            return phases
+        _log.warning("[swarm] planner attempt %d was not a plan (%d chars): %r",
+                     attempt, len(raw or ""), (raw or "")[:200])
+        ask = goal + _PLAN_NUDGE
+    return []
 
 
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,

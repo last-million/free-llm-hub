@@ -340,6 +340,20 @@ def set_native_session_id(session_id, native):
         return None
 
 
+# The effort tiers a conversation can run in. ONE list, read by everything
+# that validates the value -- agentic_chat, the session routes, this file --
+# because the fourth tier arrived after three copies of the tuple had been
+# written, and a tier that one copy rejects is a tier that silently comes back
+# as "normal" after the next restart.
+#
+#   normal  strong models for real work, cheap ones for trivial steps
+#   max     never the cheap tier
+#   swarm   several models answer each turn at once, best answer wins
+#   multi   each message becomes a job split into phases across several REAL
+#           agent sessions, in this conversation (swarm_windows)
+QUALITIES = ("normal", "max", "swarm", "multi")
+
+
 def set_quality(session_id, quality):
     """Remember the model-quality mode a conversation is running in.
 
@@ -347,7 +361,7 @@ def set_quality(session_id, quality):
     live session does not survive a hub restart, and the hub restarts on every
     5-hourly auto-update. Without this, choosing Swarm and coming back tomorrow
     silently resumed on Normal."""
-    if quality not in ("normal", "max", "swarm") or not session_id:
+    if quality not in QUALITIES or not session_id:
         return None
     try:
         with _LOCK:

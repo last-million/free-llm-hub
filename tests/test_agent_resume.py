@@ -265,34 +265,44 @@ def test_resume_branches_on_currently_running_before_the_turn_count_check():
         "currently_running must be checked before the turn_count early-return"
 
 
+# The reconnect used to show a spinner and POLL until the turn ended; it now
+# attaches to the running turn's live event stream (attachLiveTurn), so the
+# page shows what the agent is doing, from the beginning -- see
+# test_a_reload_picks_the_turn_back_up.py for that half. What stays true here:
+# it is not the empty placeholder, the UI is locked like a real turn, the
+# real transcript is loaded once the turn ends, and a session the user has
+# navigated away from is left alone.
+
+def _attach_body():
+    return _fn_body("function attachLiveTurn(sid){", "\n    }")
+
+
 def test_reconnecting_mid_turn_does_not_show_the_empty_placeholder():
-    fn = _fn_body("function showReconnectedStillWorking(sid){", "\n    }")
-    assert "Still working" in fn
-    assert "SPIN_SVG" in fn
+    fn = _fn_body("function showReconnectedStillWorking(sid, turnCount){", "\n    }")
+    assert "attachLiveTurn(sid)" in fn
+    assert "openTurnView('Still working\u2026')" in _attach_body()
+    assert "SPIN_SVG" in _fn_body("function openTurnView(label){", "\n    }")
 
 
 def test_reconnecting_mid_turn_locks_the_ui_like_a_real_in_flight_turn():
     """Send disabled, Stop enabled -- the same doStop() already works against
     any session_id, so Stop must actually be clickable here, not just look
     like it is."""
-    fn = _fn_body("function showReconnectedStillWorking(sid){", "\n    }")
-    assert "setBusy(true)" in fn
+    assert "setBusy(true)" in _attach_body()
 
 
-def test_the_reconnect_poll_loads_real_history_once_the_turn_actually_ends():
-    fn = _fn_body("function showReconnectedStillWorking(sid){", "\n    }")
-    assert "currently_running" in fn
+def test_the_reconnect_loads_real_history_once_the_turn_actually_ends():
+    fn = _attach_body()
     assert "loadFullHistory(sid)" in fn
-    assert "setBusy(false)" in fn
+    assert "view.finish()" in fn
 
 
-def test_the_reconnect_poll_stops_if_the_user_moves_to_a_different_session():
-    """Without this, an abandoned poll from a session the user has since
-    navigated away from keeps firing forever and can stomp the NEW session's
-    UI state with a stale currently_running check."""
-    fn = _fn_body("function showReconnectedStillWorking(sid){", "\n    }")
-    assert "sessionId !== sid" in fn
-    assert "clearInterval(poll)" in fn
+def test_the_reconnect_leaves_a_session_the_user_moved_away_from_alone():
+    """Without this, a reattach from a session the user has since navigated
+    away from could stomp the NEW session's UI state."""
+    assert "sessionId !== sid" in _attach_body()
+    assert "sessionId !== sid" in _fn_body(
+        "function showReconnectedStillWorking(sid, turnCount){", "\n    }")
 
 
 def test_resume_refuses_a_folder_that_is_gone(client):

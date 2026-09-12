@@ -136,3 +136,80 @@ def test_ordinary_chat_is_untouched():
     has its own pin and no siblings to spread against."""
     src = open("app.py", encoding="utf-8").read()
     assert src.count("_spread_pool(") == 2      # the definition, and one use
+
+
+# --------------------------------------------------------------------------- #
+# A finished conversation holds nothing; spreading stays in class
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-09-12: the workers of two earlier multi-session runs still
+# counted as "holding" the four strongest models an hour later (the pin TTL is
+# 4h), so a new run's workers were spread AWAY from them onto the weakest of
+# the fleet -- one 7B model invented the files it claimed to have written.
+
+def test_a_pin_can_be_released():
+    A._session_pin_set("sess-a", "groq", "qwen/qwen3.8-27b")
+    assert A._session_pin_drop("sess-a") is True
+    assert A._pinned_elsewhere() == set()
+    assert A._session_pin_drop("sess-a") is False
+    assert A._session_pin_drop(None) is False
+
+
+def test_ending_a_conversation_releases_its_model():
+    src = open("app.py", encoding="utf-8").read()
+    body = src[src.index("def api_agent_end_session("):]
+    body = body[:body.index("\n@app.route")]
+    assert "_session_pin_drop(session_id)" in body
+
+
+def test_a_finished_worker_releases_its_model():
+    src = open("app.py", encoding="utf-8").read()
+    body = src[src.index("def _swarm_windows_turn("):]
+    body = body[:body.index("\ndef ", 10)]
+    assert "finally:" in body and "_session_pin_drop(session_id)" in body
+
+
+def test_the_pin_is_keyed_by_the_session_when_there_is_one():
+    """The hub's own id survives the CLI compacting its history (which changed
+    the hashed key, and the model, mid-job) and can be released."""
+    src = open("app.py", encoding="utf-8").read()
+    assert "_skey = _build_sid() or _session_key(messages)" in src
+
+
+def test_spreading_does_not_reach_down_to_junk():
+    """The strong model is held by a sibling; the only free ones are far
+    weaker. Sharing the strong one beats a second opinion from a 7B."""
+    A._session_pin_set("sess-a", "tokenrouter", "z-ai/glm-5.3-free")
+    A._session_pin_set("sess-b", "groq", "qwen/qwen3.8-27b")
+    A._session_pin_set("sess-c", "cerebras", "gpt-oss-120b")
+    pool = POOL + [(90.0, "kilocode", "thinkingmachines/inkling-small:free")]
+    assert A._spread_pool(pool, "sess-new") == pool
+
+
+def test_spreading_still_takes_a_close_competitor():
+    A._session_pin_set("sess-a", "tokenrouter", "z-ai/glm-5.3-free")
+    left = A._spread_pool(POOL, "sess-new")
+    assert [c[2] for c in left] == ["qwen/qwen3.8-27b", "gpt-oss-120b"]
+
+
+def test_the_band_is_a_few_points_not_twenty():
+    assert 5.0 <= A._SPREAD_MAX_DROP <= 15.0
+
+
+def test_a_chat_pin_holds_nothing():
+    """The swarm planner's own request pinned the strongest model for four
+    hours, so the workers it had just planned for were spread away from it
+    (MEASURED 2026-09-12: "held elsewhere 3" with one worker running). A chat
+    pin keeps that conversation coherent; it does not hold the model."""
+    A._session_pin_set("chat-1", "groq", "qwen/qwen3.8-27b", agentic=False)
+    assert A._session_pin_get("chat-1") == ("groq", "qwen/qwen3.8-27b"), "still pinned for itself"
+    assert A._pinned_elsewhere() == set()
+
+
+def test_a_working_session_does():
+    A._session_pin_set("work-1", "groq", "qwen/qwen3.8-27b")
+    assert A._normalize_model_identity("qwen/qwen3.8-27b") in A._pinned_elsewhere()
+
+
+def test_the_plain_chat_path_pins_as_a_chat():
+    src = open("app.py", encoding="utf-8").read()
+    assert "_session_pin_set(_ckey, pid, model, agentic=False)" in src

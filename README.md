@@ -142,10 +142,13 @@ backup and a checksummed snapshot, and refuses to clobber a file you edited
 after connecting. Disconnect puts it back.
 
 **Multi-agent work, two ways.** `swarm` and the crews fan one prompt across
-several models and synthesise an answer. **Multi swarm windows** is the other
+several models and synthesise an answer. **Multi sessions** is the other
 thing: several *real* agent sessions in parallel, each with its own CLI process
 and context window, dispatched as a phased todo list where a phase waits for
-what it depends on. Drive it from any CLI over MCP, or from a shell:
+what it depends on. On the Build page it is a quality tier next to Normal, Max
+and Swarm: pick it and every message you send is split into phases across real
+sessions in the project folder, with the report coming back as the reply, in
+the same conversation. Drive it from any CLI over MCP, or from a shell:
 
 ```bash
 python scripts/swarm.py start "build the landing page" --dir ./site --watch
@@ -158,6 +161,10 @@ restarting is still there afterwards.
 
 **Conversations that remember.** A running summary, the decisions worth not
 re-deciding, and a durable turn count, one small JSON file per conversation.
+Reloading the Build page mid-turn shows the running turn from its beginning and
+follows it live; a conversation keeps its own effort tier, its own mode, and
+its own edits to which models belong to a mode (Settings, scoped to that
+conversation, or the *Models...* button beside its mode).
 It survives the restart the context window does not: when compaction drops old
 turns, what they established rides back in on the next turn instead of being
 gone.
@@ -236,7 +243,7 @@ keys can actually reach right now, which is the only number that matters.
 | **MCP** | `/mcp` — `crew_run`, `crew_start`, `crew_result`, `swarm_windows_*` |
 | **Dashboard** | `/api/*` (control-token gated) |
 
-138 routes in total; the dashboard is the documentation for the rest.
+139 routes in total; the dashboard is the documentation for the rest.
 
 ---
 
@@ -264,7 +271,7 @@ the most out of free tiers on your own machine.
 python -m pytest -q
 ```
 
-**3008 tests, 190 files.** They are written as evidence: most carry a docstring
+**3330 tests, 216 files.** They are written as evidence: most carry a docstring
 recording the measurement or the live failure that produced them.
 
 ---

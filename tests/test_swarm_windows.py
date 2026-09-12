@@ -681,7 +681,7 @@ def test_the_mode_is_reported():
 def test_the_hub_passes_its_real_modes_and_a_configurer():
     src = open("app.py", encoding="utf-8").read()
     assert "configure=_swarm_windows_configure" in src
-    assert "modes=_mode_keys()" in src
+    assert "modes=_worker_mode_keys()" in src
     body = src[src.index("def _swarm_windows_configure("):]
     body = body[:body.index("\ndef ")]
     assert "set_session_mode" in body
@@ -784,7 +784,8 @@ def test_it_reads_back_after_a_restart():
     # that THIS run comes back, which is what the lines below check.
     assert SW.load() >= 1
     st = SW.status(rid)
-    assert st["state"] == SW.DONE
+    assert st["state"] == SW.DONE, (st.get("error"),
+                                    [(a.get("state"), a.get("error")) for a in st["agents"]])
     assert st["goal"] == "build the thing"
     assert [a["summary"] for a in st["agents"]] == ["the summary"] * 3
 
@@ -1068,3 +1069,72 @@ def test_a_run_keeps_writing_where_it_started():
         assert os.path.isfile(SW._run_path(rid, root=run.store_root))
     finally:
         os.environ[SW._STORE_ENV] = started_at
+
+
+def test_the_worker_is_told_where_the_project_folder_is():
+    """MEASURED 2026-09-12: workers on Windows ran `pwd` in the bash tool, got
+    the POSIX spelling of the folder, passed it to the write tool -- and the
+    files landed in C:\tmp\... while the review phase found nothing."""
+    seen = {}
+
+    def run_turn(session_id, prompt):
+        seen[session_id] = prompt
+        yield {"event": "message", "text": "ok"}
+
+    rid = SW.start("g", r"C:\work\proj", "opencode", _spawn, run_turn,
+                   phases=[{"title": "T", "task": "WRITE THE FILE", "needs": []}],
+                   review=False)
+    _wait(rid)
+    prompt = list(seen.values())[0]
+    assert "THE PROJECT FOLDER IS: C:\work\proj" in prompt
+    assert "never write to /, /tmp or /workspace" in prompt
+    assert prompt.index("WRITE THE FILE") < prompt.index("THE PROJECT FOLDER IS")
+
+
+# --------------------------------------------------------------------------- #
+# One bad answer is not the end of the turn
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-09-12: a multi-session turn died at "could not turn that into
+# phases" eight seconds in, on a goal the same planner had turned into two
+# clean phases three times that hour.
+
+def test_a_planner_is_asked_again_when_its_first_answer_is_not_a_plan():
+    asks = []
+
+    def flaky(sysmsg, goal):
+        asks.append(goal)
+        if len(asks) == 1:
+            return "I would split this into two phases: first the file, then..."
+        return '{"phases":[{"title":"A","task":"do a","needs":[]}]}'
+    phases = SW.plan("build a thing", flaky)
+    assert [p["title"] for p in phases] == ["A"]
+    assert len(asks) == 2
+    assert asks[0] == "build a thing"
+    assert asks[1].startswith("build a thing") and "JSON object only" in asks[1]
+
+
+def test_a_good_first_answer_is_not_asked_twice():
+    asks = []
+
+    def fine(sysmsg, goal):
+        asks.append(goal)
+        return '{"phases":[{"title":"A","task":"do a","needs":[]}]}'
+    SW.plan("g", fine)
+    assert len(asks) == 1
+
+
+def test_two_bad_answers_are_still_a_refusal_not_a_loop():
+    asks = []
+
+    def prose(sysmsg, goal):
+        asks.append(goal)
+        return "no"
+    assert SW.plan("g", prose) == []
+    assert len(asks) == SW.PLAN_ATTEMPTS == 2
+
+
+def test_the_hub_gives_the_planner_room_for_five_phases():
+    src = open("app.py", encoding="utf-8").read()
+    body = src[src.index("def _swarm_windows_planner("):]
+    body = body[:body.index("\ndef ")]
+    assert "3000)" in body and "1500)" not in body

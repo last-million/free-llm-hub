@@ -542,9 +542,12 @@ def test_it_follows_the_scope_selector():
 def test_changing_scope_drops_the_selection():
     """A tick made against the global list is not a tick against a
     conversation's."""
-    body = SRC[SRC.index("if (sc) sc.addEventListener('change'"):]
+    # The change handler delegates to setScope, which is also what the Agent
+    # page's "Models..." button calls -- so the drop happens on both paths.
+    body = SRC[SRC.index("function setScope(sid){"):]
     body = body[:body.index("loadSdModels(true);") + 20]
     assert "_sdPicked = {}" in body
+    assert "sc.addEventListener('change', function(){ setScope(sc.value); })" in SRC
 
 
 def test_the_bar_says_which_scope_it_will_write_to():

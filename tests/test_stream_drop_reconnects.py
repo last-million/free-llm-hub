@@ -49,7 +49,7 @@ def _recover():
 
 def test_the_stream_catch_recovers_instead_of_failing():
     html = _template()
-    assert "return recoverStream(sessionId, asstEl, line, e, 1);" in html
+    assert "return recoverStream(sessionId, view.asstEl, view.line, e, 1);" in html
 
 
 def test_it_no_longer_marks_the_turn_failed_immediately():

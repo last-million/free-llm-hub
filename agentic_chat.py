@@ -102,6 +102,8 @@ shutil, signal, subprocess, threading, time, uuid.
 from __future__ import annotations
 
 import copy
+import collections
+import contextlib
 import json
 import logging
 import os
@@ -116,6 +118,10 @@ import uuid
 
 import agentic_history
 import memory
+
+# The effort tiers a session can run in; the list itself lives with the
+# conversation store, which is where a tier has to survive a restart.
+QUALITIES = agentic_history.QUALITIES
 import model_categories
 import config
 import craft
@@ -700,6 +706,25 @@ def _agentic_env(cli_id: str = None, project_dir: str = None,
             env[var] = path
             if cli_id == "opencode":
                 _seed_opencode_config(path)
+                # THE SESSION ID, PER PROCESS. claude and codex are pointed at
+                # <hub>/build/<session_id> through an env var and a per-session
+                # config file; opencode's provider lives in ONE seeded file
+                # shared by every session, so its turns reached the hub with no
+                # session on them at all. MEASURED 2026-09-12 on a multi-session
+                # run: every worker request was "source: cli, project: None",
+                # which also meant a conversation's own model rules -- its
+                # allow/block lists, its category edits, its mode fallback --
+                # never applied to an opencode session, the one CLI that runs
+                # against this hub by default.
+                #
+                # OPENCODE_CONFIG_CONTENT is a local-scope config opencode deep-
+                # merges over the files, so ONE option can be overridden per
+                # process without touching the shared seed. Verified live: a
+                # run with this set showed up as "source: build".
+                if session_id:
+                    env["OPENCODE_CONFIG_CONTENT"] = json.dumps({
+                        "provider": {_OPENCODE_PROVIDER_ID: {"options": {
+                            "baseURL": _hub_base_url(session_id) + "/v1"}}}})
             elif cli_id == "claude":
                 _apply_claude_hub_fallback(env, path, quality, session_id, mode)
             elif cli_id == "codex":
@@ -1102,6 +1127,11 @@ def _upgrade_opencode_seed(target):
         pass                    # a stale seed is a clear error later, not a crash
 
 
+# The provider id the seed registers this hub under -- also what the per-
+# session OPENCODE_CONFIG_CONTENT override (see _agentic_env) has to name.
+_OPENCODE_PROVIDER_ID = "free-llm-hub"
+
+
 def _seed_opencode_config(config_home):
     """Give the isolated opencode a provider: this hub.
 
@@ -1134,7 +1164,7 @@ def _seed_opencode_config(config_home):
         payload = {
             "$schema": "https://opencode.ai/config.json",
             "provider": {
-                "free-llm-hub": {
+                _OPENCODE_PROVIDER_ID: {
                     "npm": "@ai-sdk/openai-compatible",
                     "name": "Calvoun Free LLM Hub",
                     "options": {"baseURL": "http://127.0.0.1:%d/v1" % _port(),
@@ -1363,7 +1393,7 @@ class _Session:
         # "normal" | "max". Chosen once, when the session starts. "max" launches
         # the CLI with ANTHROPIC_MODEL=best instead of auto, so every turn it
         # sends is routed at the top tier and never drops to the cheap one.
-        self.quality = quality if quality in ("normal", "max", "swarm") else "normal"
+        self.quality = quality if quality in QUALITIES else "normal"
         # PER-PROJECT MODE. A model_categories key ("coding", "reasoning",
         # "vision", ...) restricting this session to that kind of model, or None
         # for whatever the hub's global setting says. Carried to the hub as the
@@ -1531,6 +1561,13 @@ def resume_session(cli_id, project_dir, native_session_id, session_id=None) -> s
                     live_proc = existing.proc
                 if live_proc is not None and live_proc.poll() is None:
                     return existing.id
+                # ...and between processes: a turn is one CLI process per
+                # round, with nothing running for a few seconds during a
+                # transient retry or an auto-continue, and a multi-session
+                # turn is no process of this session's at all. The live
+                # buffer knows a turn is on either way.
+                if turn_is_live(str(session_id)):
+                    return existing.id
     sid = start_session(cli_id, project_dir)      # all the same validation
     # WHAT THE CONVERSATION WAS RUNNING AS. start_session builds a default
     # session (normal / no mode), so resuming used to hand back a conversation
@@ -1553,7 +1590,7 @@ def resume_session(cli_id, project_dir, native_session_id, session_id=None) -> s
             sess.id = str(session_id)
         sess.native_session_id = native_session_id or None
         quality = restored.get("quality")
-        if quality in ("normal", "max", "swarm"):
+        if quality in QUALITIES:
             sess.quality = quality
         mode = restored.get("mode")
         if mode:
@@ -1635,7 +1672,7 @@ def _session_model_id(sess) -> str:
     config keeps deciding exactly as before."""
     quality = getattr(sess, "quality", "normal")
     mode = getattr(sess, "mode", None)
-    if quality not in ("max", "swarm") and not mode:
+    if quality not in ("max", "swarm", "multi") and not mode:
         return None
     return _hub_model_for(quality, mode)
 
@@ -1656,7 +1693,10 @@ def _hub_model_for(quality: str = None, mode: str = None) -> str:
         if (quality or "normal") == "swarm":
             return "swarm"
         return mode
-    return {"max": "best", "swarm": "swarm"}.get(quality or "normal", "auto")
+    # "multi" is not a model either: the message becomes a swarm_windows run
+    # and the workers carry their own modes. The parent session itself rarely
+    # runs a turn in that tier, and when it does it deserves the best tier.
+    return {"max": "best", "swarm": "swarm", "multi": "best"}.get(quality or "normal", "auto")
 
 
 def _hub_backs(cli_id: str) -> bool:
@@ -3109,6 +3149,155 @@ def looks_unfinished(text):
     return bool(_NEXT_STEP_RE.search(tail) or _ALT_NEXT_RE.search(tail))
 
 
+# THE TURN YOU CAN COME BACK TO.
+#
+# REPORTED: "in /agent when I refresh the page I don't see running what he
+# was doing". A turn's events went from the CLI to whoever was reading the
+# SSE response and nowhere else, so a reload mid-turn -- the most natural
+# thing to do when a page looks stuck -- got a spinner that said "still
+# working" over an empty panel, and nothing of what the agent was actually
+# doing until the turn ended.
+#
+# Every turn now mirrors its events into a per-session ring buffer for as long
+# as it runs, and follow_turn() replays that buffer and then stays attached
+# until the turn ends. The page that reloads gets the same lines it would have
+# had, from the beginning, live. Bounded (the last _LIVE_KEEP events), because
+# a long build turn emits thousands of tool lines and the reply itself is
+# recorded to history by the turn, not by this.
+_LIVE_KEEP = 600
+_LIVE = {}                      # session_id -> _LiveTurn
+_LIVE_LOCK = threading.Lock()
+
+
+class _LiveTurn:
+    __slots__ = ("events", "dropped", "done", "cond", "started_at")
+
+    def __init__(self):
+        self.events = collections.deque(maxlen=_LIVE_KEEP)
+        self.dropped = 0            # events that fell off the front
+        self.done = False
+        self.cond = threading.Condition()
+        self.started_at = time.time()
+
+
+def _live_begin(session_id):
+    turn = _LiveTurn()
+    with _LIVE_LOCK:
+        _LIVE[session_id] = turn
+    return turn
+
+
+def _live_put(session_id, ev):
+    with _LIVE_LOCK:
+        turn = _LIVE.get(session_id)
+    if turn is None:
+        return
+    with turn.cond:
+        if len(turn.events) == turn.events.maxlen:
+            turn.dropped += 1
+        turn.events.append(ev)
+        turn.cond.notify_all()
+
+
+def _live_end(session_id):
+    with _LIVE_LOCK:
+        turn = _LIVE.get(session_id)
+    if turn is None:
+        return
+    with turn.cond:
+        turn.done = True
+        turn.cond.notify_all()
+    # Kept a short while after the end so a page that reloads just as the
+    # turn finishes still sees it ended rather than "nothing running"; the
+    # next turn on this session replaces it anyway.
+    def _forget():
+        with _LIVE_LOCK:
+            if _LIVE.get(session_id) is turn:
+                _LIVE.pop(session_id, None)
+    threading.Timer(120, _forget).start()
+
+
+def turn_is_live(session_id):
+    """True while a turn on this session is still producing events."""
+    with _LIVE_LOCK:
+        turn = _LIVE.get(session_id)
+    return bool(turn is not None and not turn.done)
+
+
+def follow_turn(session_id, wait=0.5):
+    """Replay what the running turn has emitted so far, then keep yielding
+    until it ends. Yields nothing at all when no turn is live; a page that
+    gets nothing knows to load the transcript instead."""
+    with _LIVE_LOCK:
+        turn = _LIVE.get(session_id)
+    if turn is None:
+        return
+    sent = 0                    # index into the buffer as it stood when read
+    base = turn.dropped
+    if turn.dropped:
+        yield {"event": "notice",
+               "text": "%d earlier lines of this turn are not shown." % turn.dropped}
+    while True:
+        with turn.cond:
+            # Re-base: the deque drops from the front, so an index is only
+            # meaningful relative to how many have been dropped.
+            offset = sent - (turn.dropped - base)
+            if offset < 0:
+                offset = 0
+            fresh = list(turn.events)[offset:]
+            if not fresh and not turn.done:
+                turn.cond.wait(wait)
+                continue
+            sent += len(fresh)
+            base = turn.dropped
+            done = turn.done
+        for ev in fresh:
+            yield ev
+        if done and not fresh:
+            return
+        if done:
+            # One more look: events appended between the read and `done`
+            # being set are still in the buffer.
+            continue
+
+
+def live_run(session_id, producer, context=None):
+    """Run `producer` (any generator of turn events) on its own thread,
+    mirror every event into the live buffer, and relay to whoever reads this.
+    The generic half of what send_message_stream_durable does for a CLI
+    turn, for turns that are not one CLI process -- the multi-session run.
+
+    `context` is a context manager entered ON THE THREAD around the producer.
+    MEASURED 2026-09-12: the multi-session planner routes through the hub's
+    own chain, which reads the request (`g`, headers) -- moved onto a thread
+    it answered "" twice in seven seconds and the turn died at "could not
+    turn that into phases". The route hands over a copy of its request
+    context, and the producer runs inside it as it did before."""
+    q = queue.Queue()
+
+    def _run():
+        _live_begin(session_id)
+        try:
+            with (context if context is not None else contextlib.nullcontext()):
+                for ev in producer:
+                    q.put(ev)
+                    _live_put(session_id, ev)
+        except Exception as exc:                                 # noqa: BLE001
+            ev = {"event": "error", "status": 500, "detail": _sanitize(str(exc), 300)}
+            q.put(ev)
+            _live_put(session_id, ev)
+        finally:
+            _live_end(session_id)
+            q.put(None)
+
+    threading.Thread(target=_run, daemon=True).start()
+    while True:
+        ev = q.get()
+        if ev is None:
+            return
+        yield ev
+
+
 def send_message_stream_durable(session_id, text):
     """Same external contract as send_message_stream (a generator yielding the
     same normalized events, always ending the way that one does) but the real
@@ -3136,6 +3325,7 @@ def send_message_stream_durable(session_id, text):
 
     def _run():
         final_reply = None
+        _live_begin(session_id)
         try:
             prompt, rounds = text, 0
             while True:
@@ -3145,6 +3335,7 @@ def send_message_stream_durable(session_id, text):
                     # The nudge itself is not shown as a user turn: the reader
                     # asked for one thing and should see one conversation.
                     q.put(ev)
+                    _live_put(session_id, ev)       # for a page that reloads
                     kind = ev.get("event")
                     if kind == "done":
                         final_reply = ev.get("text")
@@ -3156,10 +3347,13 @@ def send_message_stream_durable(session_id, text):
                     break
                 rounds += 1
                 prompt = _CONTINUE_NUDGE
-                q.put({"event": "notice",
-                       "text": "The agent stopped with work left on its own list "
-                               "-- continuing (%d of %d)." % (rounds, _MAX_AUTO_CONTINUE)})
+                nudge = {"event": "notice",
+                         "text": "The agent stopped with work left on its own list "
+                                 "-- continuing (%d of %d)." % (rounds, _MAX_AUTO_CONTINUE)}
+                q.put(nudge)
+                _live_put(session_id, nudge)
         finally:
+            _live_end(session_id)
             if sess_info and final_reply:
                 try:
                     after = get_session(session_id) or {}
@@ -3286,7 +3480,7 @@ def set_quality(session_id, quality):
     turn (see the two _agentic_env call sites) -- the child's environment, and
     therefore ANTHROPIC_MODEL, is built fresh each time. The turn already in
     flight keeps the mode it started with; the next one picks this up."""
-    if quality not in ("normal", "max", "swarm"):
+    if quality not in QUALITIES:
         return None
     with _REGISTRY_LOCK:
         sess = _REGISTRY.get(session_id)

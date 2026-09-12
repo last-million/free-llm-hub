@@ -162,3 +162,21 @@ def test_the_tool_path_passes_the_real_difficulty():
 def test_the_bounds_are_what_was_asked_for():
     assert A._SWARM_FANOUT_MIN == 2
     assert A._SWARM_FANOUT_SOFT_MAX == 5
+
+
+# --------------------------------------------------------------------------- #
+# What a worker may run on
+# --------------------------------------------------------------------------- #
+
+def test_a_worker_is_never_planned_onto_the_cheap_tier(monkeypatch):
+    """Offered the whole list, the planner filed "create hello.txt" under
+    `fast`, and the small model invented the file it claimed to have written
+    (MEASURED 2026-09-12). A worker's output is files on disk."""
+    monkeypatch.setattr(A, "_mode_keys", lambda: ("coding", "reasoning", "fast", "vision"))
+    assert A._worker_mode_keys() == ("coding", "reasoning", "vision")
+
+
+def test_every_swarm_start_offers_the_worker_list():
+    src = open("app.py", encoding="utf-8").read()
+    assert "modes=_mode_keys()" not in src
+    assert src.count("modes=_worker_mode_keys()") == 3

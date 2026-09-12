@@ -495,14 +495,6 @@
   /* Keyboard focus must stay visible -- the real radio is off-screen. */
   .agent-quality .q-opt input:focus-visible + span{outline:2px solid var(--accent);
                                                    outline-offset:1px}
-  /* The one that navigates rather than selects: same shape as its siblings so
-     the row still reads as one control, outlined so it does not look like the
-     option currently in force. */
-  .agent-quality .q-go{border:0;background:none;padding:0;cursor:pointer;font:inherit}
-  .agent-quality .q-go span{border:1px dashed var(--border-strong,var(--border))}
-  .agent-quality .q-go:hover span{color:var(--text);border-color:var(--accent)}
-  .agent-quality .q-go:focus-visible span{outline:2px solid var(--accent);
-                                          outline-offset:1px}
   .agent-quality[aria-disabled="true"]{opacity:.55;pointer-events:none}
   /* Activity source badge: which surface a request came from. */
   .af-src{font-size:10px;font-weight:700;letter-spacing:.04em;padding:1px 6px;
@@ -1496,6 +1488,9 @@
     cursor:pointer;opacity:.5;transition:opacity .15s ease,border-color .15s ease}
   .sd-chip:hover{border-color:var(--accent);opacity:.9}
   .sd-chip.on{opacity:1;border-color:var(--accent);color:var(--accent)}
+  /* This conversation's own edit, on or off: a solid ring, so the default and
+     the change can be told apart at a glance. */
+  .sd-chip.own{box-shadow:0 0 0 2px var(--accent);opacity:1}
   .sd-chip:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
   .sd-ident-acts{display:flex;gap:5px;flex:none}
   .sd-pill{padding:4px 10px;border-radius:7px;font-size:11px;font-weight:600;
@@ -1892,6 +1887,8 @@
   .tk-throttled{color:var(--warn)}
   .tk-provider-exhausted{color:var(--warn-text)}
   .tk-blocked{color:var(--text-faint)}
+  /* Zen's free tier answers only OpenCode: usable, just not from here. */
+  .tk-opencode-only{color:var(--text-dim)}
   .tk-model{flex:1;min-width:180px;font-family:var(--mono);color:var(--text-dim);overflow-wrap:anywhere}
   .tk-tags{display:flex;gap:5px;flex-wrap:wrap}
   .tk-tag{font-size:.68rem;padding:1px 6px;border-radius:6px;background:var(--surface-3);color:var(--text-dim)}
@@ -2987,21 +2984,24 @@
                 <input type="radio" name="agent-quality" value="swarm">
                 <span>Swarm best-of-N</span>
               </label>
-              <!-- THE OTHER SWARM, and the reason this button exists.
-                   "Swarm" above fans ONE turn across several models and keeps
-                   the best answer. Multi sessions is the different thing: several
-                   real agent sessions, each its own CLI process and context
-                   window, working phases of one job in parallel. Both were
-                   called "swarm", one of them lived in a tab nobody opened, and
-                   the report was exactly that -- "I do not see the new mode
-                   swarm multi real sessions as a choice". So it is a choice, in
-                   the row where you choose how to work.
-                   Not a radio: it is not a routing tier the server stores per
-                   session, it is a different way of running the job. -->
-              <button type="button" class="q-opt q-go" id="agent-quality-multi"
-                      title="Several REAL agent sessions in parallel, each with its own context window, split into phases. Opens the Swarm tab.">
-                <span>Multi sessions &rarr;</span>
-              </button>
+              <!-- THE OTHER SWARM. "Swarm" above fans ONE turn across several
+                   models and keeps the best answer. Multi sessions is the
+                   different thing: several REAL agent sessions, each its own
+                   CLI process and own context window, working phases of one
+                   job in parallel. Both were called "swarm", one of them lived
+                   in a tab nobody opened -- "I do not see the new mode swarm
+                   multi real sessions as a choice" -- and once it was a button
+                   here it SWITCHED to that tab: "it shows a new window and does
+                   not stay in the conversation". So it is a tier like the
+                   others now: pick it, and every message you send from here is
+                   split into phases across real sessions, in this folder, with
+                   the report coming back as the reply, in this conversation.
+                   The Swarm tab still lists the runs for stopping and reading
+                   each worker's log. -->
+              <label class="q-opt" title="Every message becomes a job split into phases across several REAL agent sessions, each with its own context window, working in this folder. The combined report comes back here as the reply. Runs also appear on the Swarm tab.">
+                <input type="radio" name="agent-quality" value="multi">
+                <span>Multi sessions</span>
+              </label>
             </div>
             <!-- MODE, per project. Quality says how HARD to try; mode says which
                  KIND of model. A select rather than radios because there are
@@ -3012,6 +3012,8 @@
                     title="Restrict this project to one kind of model. Applies from the NEXT message.">
               <option value="all">All models</option>
             </select>
+            <button class="btn sm ghost" id="agent-models" type="button"
+                    title="Choose which models THIS conversation may use, and which belong to its modes (coding, vision, ...). Opens Settings with this conversation selected.">Models&hellip;</button>
             <button class="btn sm ghost" id="agent-checkpoint" type="button" title="Mark this point in the transcript. To put the FILES back too, use Restore &amp; rerun on one of your own messages.">Bookmark</button>
             <button class="btn sm ghost" id="agent-running" type="button"
                   title="Conversations and previews currently open">Running <span id="agent-running-n">0</span></button>
@@ -8345,22 +8347,11 @@
       if (which === 'swarm' && window.pollSwarm) window.pollSwarm();
       else if (window.stopSwarmPoll) window.stopSwarmPoll();
     }
-    /* Carries whatever is already typed in the chat box over to the swarm's
-       goal field: having to retype the thing you just wrote is how a feature
-       gets used once and then not again. */
-    var multiBtn = document.getElementById('agent-quality-multi');
-    if (multiBtn) multiBtn.addEventListener('click', function(){
-      switchTab('swarm');
-      var goal = document.getElementById('sw-goal');
-      var box = document.getElementById('agent-text');
-      if (goal){
-        if (!goal.value && box && box.value.trim()){
-          goal.value = box.value.trim();
-          box.value = '';
-        }
-        try { goal.focus(); } catch (e) {}
-      }
-    });
+    /* Multi sessions used to be a button here that switched to the Swarm
+       tab. It is a quality radio now (see the markup): the message you send
+       from the conversation IS the swarm's goal, and the report comes back as
+       the reply, so nothing leaves the conversation. The Swarm tab is reached
+       by its own tab button only. */
     viewSessionBtn.addEventListener('click', function(){ switchTab('session'); });
     viewHistoryBtn.addEventListener('click', function(){ switchTab('history'); });
     if (viewSwarmBtn) viewSwarmBtn.addEventListener('click', function(){ switchTab('swarm'); });
@@ -8706,33 +8697,21 @@
        events were never persisted mid-turn -- so this shows a clear "still
        working" state instead and polls until it actually finishes, then
        loads the real transcript the normal way. */
-    function showReconnectedStillWorking(sid){
+    function showReconnectedStillWorking(sid, turnCount){
+      /* What came BEFORE this turn first, so the running one lands under
+         the conversation it belongs to rather than on an empty panel. The
+         transcript already holds this turn's user message (recorded before
+         the turn started); the running turn's own lines follow live. */
       msgsEl.innerHTML = '';
-      var wrap = document.createElement('div'); wrap.className = 'msg assistant';
-      var w = document.createElement('span'); w.className = 'who'; w.textContent = 'Agent';
-      var b = document.createElement('div'); b.className = 'bubble';
-      var term = document.createElement('div'); term.className = 'agent-term';
-      var head = document.createElement('div'); head.className = 'agent-term-line run';
-      head.innerHTML = SPIN_SVG + ' <span>Still working…</span>' +
-        ' <span class="agent-doing">reconnected — this turn was already running ' +
-        'before the page loaded. Free-tier routing can take several minutes; ' +
-        'this updates on its own once it finishes.</span>';
-      term.appendChild(head);
-      b.appendChild(term);
-      wrap.appendChild(w); wrap.appendChild(b);
-      msgsEl.appendChild(wrap);
-      setBusy(true);
-      var poll = setInterval(function(){
-        if (sessionId !== sid){ clearInterval(poll); return; }  // navigated away
-        api('/api/agent/sessions/' + encodeURIComponent(sid))
-          .then(function(s){
-            if (s && s.currently_running) return;
-            clearInterval(poll);
-            setBusy(false);
-            loadFullHistory(sid);
-          })
-          .catch(function(){ clearInterval(poll); setBusy(false); });
-      }, 4000);
+      var ready = turnCount
+        ? api('/api/agent/history/' + encodeURIComponent(sid))
+            .then(function(full){ mountTranscript(msgsEl, full || {}); })
+            .catch(function(){})
+        : Promise.resolve();
+      ready.then(function(){
+        if (sessionId !== sid) return;
+        attachLiveTurn(sid);
+      });
     }
 
     window.cxResumeAgentSession = function(r){
@@ -8747,7 +8726,7 @@
          Measured: server said swarm, switch said Normal. */
       setQuality(r.quality);
       if (r.currently_running){
-        showReconnectedStillWorking(r.session_id);
+        showReconnectedStillWorking(r.session_id, r.turn_count);
         return;
       }
       /* Only ask for history when there IS some. A brand-new session has no
@@ -8800,6 +8779,7 @@
             toast({
               max: 'Max quality — from the next message, every turn uses the strongest models',
               swarm: 'Swarm agents — from the next message, several models answer each turn and the best wins (~3x quota)',
+              multi: 'Multi sessions — from the next message, each message is split into phases across several real agent sessions, here in this conversation',
               normal: 'Normal — cheap models allowed for trivial steps again'
             }[getQuality()] || 'Mode updated');
           })
@@ -8843,6 +8823,27 @@
         var cur = (r && r.session && r.session.mode) || (r && r.mode) || 'all';
         renderAgentMode(sel, cur);
       }).catch(function(){ /* optional control: never block the agent page */ });
+    }
+
+    /* "Models..." beside the mode: Settings, with THIS conversation already
+       selected in its scope box, so the list it shows is this conversation's
+       and every tick lands here rather than on the global default. */
+    function initAgentModelsLink(){
+      var btn = $('#agent-models');
+      if (!btn) return;
+      btn.addEventListener('click', function(){
+        if (!sessionId){ toast('Start a session first', true); return; }
+        /* A NEW TAB. The first version switched this page to Settings, and
+           the report was immediate: "he opened settings in the same page
+           where I was working". The conversation is the work; nothing that
+           starts from it may replace it. The scope rides in the URL so the
+           tab opens on this conversation's list. */
+        var url = '/settings?scope=' + encodeURIComponent(sessionId);
+        var w = window.open(url, '_blank', 'noopener');
+        if (!w){                       /* popup blocked: stay honest, stay here */
+          toast('Open ' + url + ' in a new tab (the browser blocked opening it)', true);
+        }
+      });
     }
 
     function initAgentMode(){
@@ -9449,6 +9450,7 @@
            something you have to remember answering. */
         if (r.quality === 'max') extra.push('max quality');
         if (r.quality === 'swarm') extra.push('swarm agents');
+        if (r.quality === 'multi') extra.push('multi sessions');
         var qbox = $('#agent-quality');
         if (qbox && qbox.getAttribute('aria-disabled') !== 'true') setQuality(r.quality);
         sessionInfo.textContent = cliLabel(r.cli) + ' — ' + (r.project_dir || '') +
@@ -9595,6 +9597,56 @@
       appendAgentBubble('user', 'You', text);
       textEl.value = '';
 
+      var view = openTurnView('Working…');
+      setBusy(true);
+      var headers = { 'Content-Type': 'application/json', 'X-Free-LLM-Hub': 'dashboard' };
+      if (typeof HUB_CONTROL_TOKEN !== 'undefined' && HUB_CONTROL_TOKEN) headers['X-Free-LLM-Hub-Token'] = HUB_CONTROL_TOKEN;
+
+      fetch('/api/agent/sessions/' + encodeURIComponent(sessionId) + '/message/stream',
+            { method: 'POST', headers: headers, body: JSON.stringify({ text: text }) })
+        .then(function(resp){ return pumpSse(resp, view.handle); })
+        .catch(function(e){
+          /* A dropped STREAM is not a failed turn. The CLI subprocess is still
+             running on the server -- or the hub restarted and the session can be
+             rebuilt from the CLI's own thread -- so the work and its context are
+             both still there. Marking it Failed here threw that away and made
+             the next message start from nothing, which is what "Failed to fetch
+             ... and when i refresh he starts from beginning" actually was.
+             Reconnect instead, and only give up after really trying. */
+          return recoverStream(sessionId, view.asstEl, view.line, e, 1);
+        })
+        .then(function(){ view.finish(); });
+    }
+
+    /* Read an SSE body and hand each JSON event to `handle`. */
+    function pumpSse(resp, handle){
+      if (!resp.ok || !resp.body) throw new Error('stream failed (HTTP ' + resp.status + ')');
+      var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '';
+      function pump(){
+        return reader.read().then(function(res){
+          if (res.done) return;
+          buf += dec.decode(res.value, { stream: true });
+          var parts = buf.split('\n\n'); buf = parts.pop();
+          parts.forEach(function(block){
+            block.split('\n').forEach(function(ln){
+              ln = ln.replace(/^data:\s?/, '');
+              if (!ln || ln === '{}' || ln.indexOf('event:') === 0) return;
+              try { handle(JSON.parse(ln)); } catch (e) {}
+            });
+          });
+          return pump();
+        });
+      }
+      return pump();
+    }
+
+    /* ONE TURN ON SCREEN: the assistant bubble with its terminal strip and
+       its answer, the handler that feeds it events, and the finish that
+       closes it. Used by a message sent from here AND by a page that reloads
+       mid-turn and picks the running one back up (attachLiveTurn) -- the
+       report was that a reload showed nothing of what the agent was doing,
+       and two copies of this is how the two paths drift apart. */
+    function openTurnView(label){
       var asstEl = appendAgentBubble('assistant', 'Agent', '');
       var bubble = asstEl.querySelector('.bubble');
       bubble.textContent = '';
@@ -9602,7 +9654,7 @@
       var ans = document.createElement('div'); ans.className = 'agent-answer';
       bubble.appendChild(term); bubble.appendChild(ans);
       var head = document.createElement('div'); head.className = 'agent-term-line run';
-      head.innerHTML = SPIN_SVG + ' <span>Working…</span>' +
+      head.innerHTML = SPIN_SVG + ' <span>' + esc(label || 'Working…') + '</span>' +
         ' <span class="agent-doing"></span>' +
         ' <span class="agent-elapsed">0s</span>';
       term.appendChild(head);
@@ -9611,6 +9663,8 @@
         var el = head.querySelector('.agent-elapsed');
         if (el) el.textContent = fmtElapsed(Date.now() - elapsedStart);
       }, 1000);
+      var finalText = '';
+      var view = { asstEl: asstEl, idle: false };
       function line(cls, txt){
         var d = document.createElement('div'); d.className = 'agent-term-line ' + (cls || '');
         d.textContent = txt; term.appendChild(d);
@@ -9618,6 +9672,7 @@
       }
       function handle(ev){
         if (!ev || !ev.event) return;
+        if (ev.event === 'idle'){ view.idle = true; return; }
         /* Watch every line the agent prints for a local URL. This is how the
            preview finds the server the agent started itself, instead of showing
            "not running" beside a site that is live. */
@@ -9658,68 +9713,63 @@
           }
         }
       }
+      function finish(){
+        clearInterval(elapsedTimer);
+        var failed = (' ' + asstEl.className + ' ').indexOf(' error ') >= 0;
+        head.className = 'agent-term-line ' + (failed ? 'err' : 'done');
+        var took = fmtElapsed(Date.now() - elapsedStart);
+        head.innerHTML =
+          '<span class="agent-check">' + (failed ? CROSS_SVG : CHECK_SVG) + '</span>' +
+          '<span>' + (failed ? 'Failed' : 'Finished') + '</span>' +
+          '<span class="agent-elapsed">' + esc(took) + '</span>';
+        if (!failed && finalText){ var art = extractArtifactHTML(finalText); if (art) addArtifactButton(asstEl, art); }
+        /* The turn is done, so the files on disk just changed: pick up a
+           server the agent started, start one if it did not, and refresh what
+           is on screen. Failure-safe — a folder with nothing runnable in it
+           is a no-op, not an error. */
+        if (!failed && typeof preview !== 'undefined' && preview.afterTurn){
+          try { preview.afterTurn(); } catch (e) {}
+        }
+        if (typeof preview !== 'undefined' && preview.refreshFiles){
+          try { preview.refreshFiles(); } catch (e) {}
+        }
+        checkpointBtn.disabled = false;
+        setBusy(false);
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+        refreshSessionInfo();
+        return failed;
+      }
+      view.line = line; view.handle = handle; view.finish = finish;
+      return view;
+    }
 
+    /* A turn that was already running when this page loaded: show what it has
+       done so far and follow it to the end. The server replays the turn's
+       events from its beginning, so this looks exactly like having watched
+       it from the start. */
+    function attachLiveTurn(sid){
+      var view = openTurnView('Still working…');
       setBusy(true);
-      var finalText = '';
-      var headers = { 'Content-Type': 'application/json', 'X-Free-LLM-Hub': 'dashboard' };
+      var headers = { 'X-Free-LLM-Hub': 'dashboard' };
       if (typeof HUB_CONTROL_TOKEN !== 'undefined' && HUB_CONTROL_TOKEN) headers['X-Free-LLM-Hub-Token'] = HUB_CONTROL_TOKEN;
-
-      fetch('/api/agent/sessions/' + encodeURIComponent(sessionId) + '/message/stream',
-            { method: 'POST', headers: headers, body: JSON.stringify({ text: text }) })
-        .then(function(resp){
-          if (!resp.ok || !resp.body) throw new Error('stream failed (HTTP ' + resp.status + ')');
-          var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '';
-          function pump(){
-            return reader.read().then(function(res){
-              if (res.done) return;
-              buf += dec.decode(res.value, { stream: true });
-              var parts = buf.split('\n\n'); buf = parts.pop();
-              parts.forEach(function(block){
-                block.split('\n').forEach(function(ln){
-                  ln = ln.replace(/^data:\s?/, '');
-                  if (!ln || ln === '{}' || ln.indexOf('event:') === 0) return;
-                  try { handle(JSON.parse(ln)); } catch (e) {}
-                });
-              });
-              return pump();
-            });
-          }
-          return pump();
-        })
-        .catch(function(e){
-          /* A dropped STREAM is not a failed turn. The CLI subprocess is still
-             running on the server -- or the hub restarted and the session can be
-             rebuilt from the CLI's own thread -- so the work and its context are
-             both still there. Marking it Failed here threw that away and made
-             the next message start from nothing, which is what "Failed to fetch
-             ... and when i refresh he starts from beginning" actually was.
-             Reconnect instead, and only give up after really trying. */
-          return recoverStream(sessionId, asstEl, line, e, 1);
-        })
+      fetch('/api/agent/sessions/' + encodeURIComponent(sid) + '/live', { headers: headers })
+        .then(function(resp){ return pumpSse(resp, view.handle); })
+        .catch(function(e){ return recoverStream(sid, view.asstEl, view.line, e, 1); })
         .then(function(){
-          clearInterval(elapsedTimer);
-          var failed = (' ' + asstEl.className + ' ').indexOf(' error ') >= 0;
-          head.className = 'agent-term-line ' + (failed ? 'err' : 'done');
-          var took = fmtElapsed(Date.now() - elapsedStart);
-          head.innerHTML =
-            '<span class="agent-check">' + (failed ? CROSS_SVG : CHECK_SVG) + '</span>' +
-            '<span>' + (failed ? 'Failed' : 'Finished') + '</span>' +
-            '<span class="agent-elapsed">' + esc(took) + '</span>';
-          if (!failed && finalText){ var art = extractArtifactHTML(finalText); if (art) addArtifactButton(asstEl, art); }
-          /* The turn is done, so the files on disk just changed: pick up a
-             server the agent started, start one if it did not, and refresh what
-             is on screen. Failure-safe — a folder with nothing runnable in it
-             is a no-op, not an error. */
-          if (!failed && typeof preview !== 'undefined' && preview.afterTurn){
-            try { preview.afterTurn(); } catch (e) {}
+          if (sessionId !== sid) return;              /* navigated away meanwhile */
+          if (view.idle){
+            /* It finished between the resume and this attach: nothing to
+               follow, the transcript on disk has the reply. */
+            try { view.asstEl.remove(); } catch (e) {}
+            setBusy(false);
+            loadFullHistory(sid);
+            return;
           }
-          if (typeof preview !== 'undefined' && preview.refreshFiles){
-            try { preview.refreshFiles(); } catch (e) {}
-          }
-          checkpointBtn.disabled = false;
-          setBusy(false);
-          msgsEl.scrollTop = msgsEl.scrollHeight;
-          refreshSessionInfo();
+          var failed = view.finish();
+          /* The recorded transcript is the durable copy of what was just
+             watched; a failed turn keeps its error on screen instead, since
+             the transcript has no reply for it. */
+          if (!failed) loadFullHistory(sid);
         });
     }
 
@@ -10069,6 +10119,7 @@
                              calling it from the top level is the exact bug
                              that took the whole dashboard down earlier. */
     initAgentMode();
+    initAgentModelsLink();
     loadAgentMode();
     initFolderPicker();
     initRunningPanel();
@@ -10480,11 +10531,17 @@
                    (m.score ? ' · score ' + (Math.round(m.score * 10) / 10) : '');
         var chips = (_sdModeList || []).map(function(c){
           var on = (m.categories || []).indexOf(c.key) >= 0;
-          return '<button class="sd-chip' + (on ? ' on' : '') + '" type="button"' +
+          /* A conversation's own edit looks different from the default it
+             sits on, or there is no way to see what you changed. */
+          var own = _sdScope && (m.custom_categories || []).indexOf(c.key) >= 0;
+          return '<button class="sd-chip' + (on ? ' on' : '') + (own ? ' own' : '') +
+                 '" type="button"' +
                  ' data-mode="' + esc(c.key) + '" data-ident="' + esc(m.identity) + '"' +
                  ' aria-pressed="' + (on ? 'true' : 'false') + '"' +
                  ' title="' + (on ? 'In' : 'Not in') + ' the ' + esc(c.label) +
-                 ' category &mdash; click to change">' + esc(c.label) + '</button>';
+                 ' category' + (own ? ' (this conversation\u2019s own choice)' : '') +
+                 (_sdScope ? ' for this conversation' : '') +
+                 ' &mdash; click to change">' + esc(c.label) + '</button>';
         }).join('');
         var picked = !!_sdPicked[m.identity];
         return '<div class="sd-ident' + (m.blocked ? ' is-blocked' : '') +
@@ -10560,10 +10617,16 @@
         chip.addEventListener('click', function(){
           var on = chip.getAttribute('aria-pressed') === 'true';
           chip.disabled = true;
-          api('/api/model-category', { method: 'POST', body: {
-                key: chip.getAttribute('data-mode'),
-                identity: chip.getAttribute('data-ident'),
-                member: !on } })
+          /* Same scope as everything else on this panel: with a conversation
+             selected, the edit is that conversation's alone. The chips used
+             to ignore the selector and write the global list, so "customize
+             the mode's models for this session" quietly changed every
+             project's mode. */
+          var payload = { key: chip.getAttribute('data-mode'),
+                          identity: chip.getAttribute('data-ident'),
+                          member: !on };
+          if (_sdScope) payload.session_id = _sdScope;
+          api('/api/model-category', { method: 'POST', body: payload })
             .then(function(){ return loadSdModels(true); })
             .catch(function(e){ toast(e.message, true); chip.disabled = false; });
         });
@@ -10796,16 +10859,49 @@
       var sr = $('#sd-sessions-refresh');
       if (sr) sr.addEventListener('click', function(){ loadSdSessions(); });
       var sc = $('#sd-scope');
-      if (sc) sc.addEventListener('change', function(){
-        _sdScope = sc.value || '';
+      function setScope(sid){
+        _sdScope = sid || '';
         /* A tick made against the global list is not a tick against a
            conversation's: dropping the selection is what stops "add these
            twelve" landing somewhere the user was no longer looking. */
         _sdPicked = {};
-        var wrap = sc.closest('.sd-scope');
+        var wrap = sc && sc.closest('.sd-scope');
         if (wrap) wrap.classList.toggle('is-session', !!_sdScope);
         loadSdModels(true);
-      });
+      }
+      if (sc) sc.addEventListener('change', function(){ setScope(sc.value); });
+      /* /settings?scope=<session id> -- the Agent page's "Models..." opens
+         this page in a new tab on that conversation. Read once, before the
+         first load; loadSdSessions keeps it while the session is running. */
+      try {
+        var want = new URLSearchParams(location.search).get('scope');
+        if (want && sc){
+          if (!sc.querySelector('option[value="' + want + '"]')){
+            var o0 = document.createElement('option');
+            o0.value = want; o0.textContent = 'this conversation';
+            sc.appendChild(o0);
+          }
+          sc.value = want;
+          _sdScope = want;
+          var wrap0 = sc.closest('.sd-scope');
+          if (wrap0) wrap0.classList.add('is-session');
+        }
+      } catch (e) {}
+      /* For the Agent page's "Models..." button: land on Settings with that
+         conversation in scope. The option list is rebuilt by loadSdSessions
+         (called from loadSdModels), which keeps a scope that is still running
+         and drops one that is not. */
+      window.cxSdScope = function(sid){
+        if (sc){
+          if (!sc.querySelector('option[value="' + sid + '"]')){
+            var o = document.createElement('option');
+            o.value = sid; o.textContent = 'this conversation';
+            sc.appendChild(o);
+          }
+          sc.value = sid;
+        }
+        setScope(sid);
+      };
       initSdBulk();
       /* Nothing is FETCHED here any more: loadSdModels pulls the sessions in
          once the modes it needs are known, and it runs when the Settings page

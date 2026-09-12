@@ -12,6 +12,12 @@ expect: "I do not see the new mode swarm multi real sessions as a choice".
 So it is a choice now, in that row, next to the others -- and the two stopped
 sharing a name.
 
+(It was first a BUTTON in that row that switched to the Swarm tab. That drew
+the next report -- "it shows a new window and does not stay in the
+conversation" -- and it is a radio tier now, run in the conversation; see
+test_multi_sessions_stay_in_the_conversation.py. The tests here that named
+the button are gone with it.)
+
 Also here, because they landed together and are the same kind of tidying:
   * a conversation's allow/block lists are dropped when the session ends,
     instead of accumulating in the config for the life of the install;
@@ -36,15 +42,14 @@ SRC = open("templates/index.html", encoding="utf-8").read()
 # --------------------------------------------------------------------------- #
 
 def test_the_multi_session_swarm_is_in_the_quality_row():
-    assert 'id="agent-quality-multi"' in SRC
     row = SRC[SRC.index('id="agent-quality"'):]
     row = row[:row.index("</div>") + 6]
-    assert "agent-quality-multi" in row, "it is not in the row people choose from"
+    assert 'value="multi"' in row, "it is not in the row people choose from"
 
 
 def test_it_says_what_it_is():
-    i = SRC.index('id="agent-quality-multi"')
-    around = SRC[i - 400:i + 200]
+    i = SRC.index('value="multi"')
+    around = SRC[i - 900:i + 200]
     assert "REAL agent sessions" in around
     assert "own context window" in around
 
@@ -54,30 +59,14 @@ def test_the_two_swarms_no_longer_share_a_name():
     assert "<span>Swarm</span>" not in SRC
 
 
-def test_it_opens_the_swarm_tab():
-    body = SRC[SRC.index("var multiBtn = document.getElementById('agent-quality-multi');"):]
-    body = body[:body.index("viewSessionBtn.addEventListener")]
-    assert "switchTab('swarm')" in body
-
-
-def test_it_carries_over_what_you_already_typed():
-    """Retyping the thing you just wrote is how a feature gets used once."""
-    body = SRC[SRC.index("var multiBtn = document.getElementById('agent-quality-multi');"):]
-    body = body[:body.index("viewSessionBtn.addEventListener")]
-    assert "sw-goal" in body and "agent-text" in body
-
-
-def test_it_is_not_a_radio():
-    """It does not set a routing tier the server stores per session; it is a
-    different way of running the job. A radio would claim otherwise, and the
-    server would reject the value."""
-    i = SRC.index('id="agent-quality-multi"')
-    assert 'type="radio"' not in SRC[i - 200:i + 120]
-
-
-def test_the_server_still_only_takes_the_three_tiers():
-    src = open("app.py", encoding="utf-8").read()
-    assert '("normal", "max", "swarm")' in src
+def test_it_is_a_radio_the_server_stores_per_session():
+    """The first version was a button that switched tabs, on the grounds that
+    it was "not a routing tier the server stores". It is one now: the tier
+    is what makes the next message run as a swarm IN the conversation, and
+    what brings the conversation back in that tier after a restart."""
+    i = SRC.index('value="multi"')
+    assert 'type="radio"' in SRC[i - 60:i + 10]
+    assert "multi" in AC.QUALITIES
 
 
 # --------------------------------------------------------------------------- #

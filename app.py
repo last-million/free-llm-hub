@@ -50,6 +50,7 @@ import zipfile
 from urllib.parse import quote, urlsplit
 
 import requests
+from flask.globals import request_ctx
 from flask import (Flask, Response, g, jsonify, make_response, render_template,
                    request, send_file, stream_with_context)
 
@@ -107,7 +108,7 @@ hub_mcp.init(
             _swarm_windows_spawn, _swarm_windows_turn,
             planner=_swarm_windows_planner,
             configure=_swarm_windows_configure,
-            modes=_mode_keys()),
+            modes=_worker_mode_keys()),
         "status": lambda run_id, events=False: swarm_windows.status(run_id, events),
         "stop": swarm_windows.stop,
     })
@@ -117,6 +118,40 @@ import traceback as _traceback
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 _log = logging.getLogger("free-llm-hub")
+
+
+def _attach_file_log():
+    """A log on disk, because the hub normally has no console.
+
+    run-hidden.vbs (the desktop shortcut, autostart, self-heal) starts the hub
+    with no window, so everything logged went nowhere: the first question
+    about any failure -- "what did the hub say" -- had no answer unless the hub
+    had been started by hand in a terminal. MEASURED 2026-09-12 chasing a 503
+    that turned out to be three consecutive upstream 400s: the activity feed
+    kept the hop list, the log that named the bodies did not exist.
+
+    Rotating and small (two 5 MB files), under the hub's own state directory
+    next to config.json. Never fatal: a log that cannot be opened is a
+    warning, not a hub that does not start."""
+    try:
+        from logging.handlers import RotatingFileHandler
+        path = os.path.join(config.state_dir(), "hub.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        handler = RotatingFileHandler(path, maxBytes=5 * 1024 * 1024, backupCount=2,
+                                      encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        handler.setLevel(logging.INFO)
+        # Not the access log: one line per request would fill the file with
+        # what /activity already keeps, and bury the lines this exists for.
+        handler.addFilter(lambda rec: not rec.name.startswith("werkzeug"))
+        logging.getLogger().addHandler(handler)
+        return path
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[log] no file log: %s", exc)
+        return None
+
+
+HUB_LOG_PATH = _attach_file_log()
 
 # Windows opens a console window for every child process unless told not to,
 # and the hub spawns a lot of them -- a CLI per agent turn, a dev server per
@@ -3203,6 +3238,10 @@ def _is_model_dead(pid, model):
     # claiming the upstream killed it.
     if _is_model_blocked_by_user(pid, model):
         return True
+    # Zen's free tier from anything but OpenCode is a guaranteed 400 -- see
+    # _zen_client_only. Not dead, not blocked: unusable for THIS request.
+    if _zen_client_only(pid, model):
+        return True
     return _is_model_dead_upstream(pid, model)
 
 
@@ -5158,6 +5197,10 @@ def _spread_pick_cheap(pool):
 _SESSION_PIN_TTL = 4 * 3600     # a coding session comfortably outlives this
 _session_pins = {}
 _session_pin_lock = threading.Lock()
+# Serialises "look at what the siblings hold, pick, pin" -- see the first-turn
+# pick in _pick_agentic_model. Separate from _session_pin_lock, which the pin
+# helpers take themselves.
+_spread_pick_lock = threading.Lock()
 
 
 def _session_key(messages):
@@ -5260,7 +5303,7 @@ def _session_pin_get(key):
         row = _session_pins.get(key)
         if not row:
             return None
-        pid, model, exp = row
+        pid, model, exp = row[:3]
         if exp <= now:
             _session_pins.pop(key, None)
             return None
@@ -5290,42 +5333,81 @@ def _pinned_elsewhere(exclude_key=None):
         if key == exclude_key:
             continue
         try:
-            pid, model, exp = row
-        except (TypeError, ValueError):
+            pid, model, exp = row[:3]
+            agentic = row[3] if len(row) > 3 else True
+        except (TypeError, ValueError, IndexError):
+            continue
+        # Only a WORKING session holds a model. A chat pin is one request's
+        # worth of attention -- and the swarm planner's own request pinned
+        # the strongest model for four hours, so the workers it had just
+        # planned for were spread away from it (MEASURED 2026-09-12: "held
+        # elsewhere 3" with one worker running).
+        if not agentic:
             continue
         if exp > now and model:
             out.add(_normalize_model_identity(model))
     return out
 
 
+# How far below the pool's best a model may score and still be worth
+# spreading onto. The pick's own softmax treats a few points as "a close
+# competitor" and 20 as "rarely"; a sibling holding the best model is a reason
+# to take the close competitor, never the one 20 points back.
+_SPREAD_MAX_DROP = 10.0
+
+
 def _spread_pool(pool, exclude_key=None):
-    """`pool` with models other live conversations already hold, dropped.
+    """`pool` with models other live conversations already hold, dropped --
+    as long as what is left is comparable.
 
     FAIL-OPEN, and that matters more than the spreading: when every candidate
     is taken -- one strong model and six agents -- the original pool comes back
-    untouched. Sharing a model is slower; refusing to route is broken."""
+    untouched. Sharing a model is slower; refusing to route is broken.
+
+    AND NOT ONTO JUNK. MEASURED 2026-09-12: with the strong models held by
+    siblings, a worker was spread onto a 7B "small" model that then invented
+    the files it claimed to have written. A second opinion is worth having
+    from a model of the same class; sharing the strong one beats that."""
     try:
         taken = _pinned_elsewhere(exclude_key)
         if not taken:
             return pool
-        free = [c for c in pool if _normalize_model_identity(c[2]) not in taken]
+        best = max((c[0] for c in pool), default=0.0)
+        free = [c for c in pool
+                if _normalize_model_identity(c[2]) not in taken
+                and c[0] >= best - _SPREAD_MAX_DROP]
         return free or pool
     except Exception:                                            # noqa: BLE001
         return pool
 
 
-def _session_pin_set(key, pid, model):
+def _session_pin_drop(key):
+    """A finished conversation holds no model. MEASURED 2026-09-12: the
+    workers of two earlier multi-session runs still counted as "holding" the
+    four strongest models an hour later (the pin TTL is 4h), so a new run's
+    workers were spread AWAY from them onto the weakest of the fleet -- the
+    exact opposite of what spreading is for."""
+    if not key:
+        return False
+    with _session_pin_lock:
+        return _session_pins.pop(key, None) is not None
+
+
+def _session_pin_set(key, pid, model, agentic=True):
     """Pin this conversation to (pid, model). Also opportunistically evicts
-    expired rows so the dict cannot grow without bound in a long-lived process."""
+    expired rows so the dict cannot grow without bound in a long-lived process.
+
+    `agentic` says whether this pin counts as HOLDING the model for the
+    purpose of spreading concurrent sessions -- see _pinned_elsewhere."""
     if not (key and pid and model):
         return
     now = time.time()
     with _session_pin_lock:
         if len(_session_pins) > 512:
-            for k, (_p, _m, exp) in list(_session_pins.items()):
-                if exp <= now:
+            for k, row in list(_session_pins.items()):
+                if row[2] <= now:
                     _session_pins.pop(k, None)
-        _session_pins[key] = (pid, model, now + _SESSION_PIN_TTL)
+        _session_pins[key] = (pid, model, now + _SESSION_PIN_TTL, bool(agentic))
 
 
 _AGENTIC_PICK_TEMPERATURE = 5.0  # score points at which weight roughly e-folds
@@ -5517,7 +5599,12 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # unavailable (throttled/dead/too small) it simply is not in `agentic`
         # any more and we re-pick + re-pin. Nothing is ever forced.
         # ════════════════════════════════════════════════════════════════════
-        _skey = _session_key(messages)
+        # THE SESSION ID WHEN THERE IS ONE. Hashing the system prompt and the
+        # first user turn was the only handle before every CLI carried its
+        # session on the URL; it changes when the CLI compacts its history
+        # (a new "first" turn, a new key, a new model mid-job) and it cannot
+        # be released when the session ends. The hub's own id does both.
+        _skey = _build_sid() or _session_key(messages)
         _pinned = _session_pin_get(_skey)
         if _pinned:
             # Keep an in-progress task on the model it started on — but pin the
@@ -5598,10 +5685,20 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # what its siblings are already using changes anything -- afterwards the
         # pin holds and the choice is made. Only the FIRST turn of a session
         # reaches here; every later turn takes the pin above.
-        _pool = _spread_pool(_pool, _skey)
-        picked = _weighted_pick(_pool, _model_identity_min_penalty(_pool))
-        _s, pid, model = picked
-        _session_pin_set(_skey, pid, model)
+        # ...AND ATOMICALLY. Two workers of one swarm send their first turn
+        # within seconds of each other, and each read "nothing pinned yet"
+        # before either had pinned -- so the spread saw no sibling to spread
+        # away from. MEASURED 2026-09-12: 11 of 15 requests of a two-worker run
+        # on one model while a sibling model idled. Picking is microseconds;
+        # holding a lock across it costs nothing.
+        with _spread_pick_lock:
+            _pool = _spread_pool(_pool, _skey)
+            picked = _weighted_pick(_pool, _model_identity_min_penalty(_pool))
+            _s, pid, model = picked
+            _session_pin_set(_skey, pid, model)
+            _log.info("[spread] %s -> %s/%s (pool %d, held elsewhere %d)",
+                      (_skey or "-")[:8], pid, model, len(_pool),
+                      len(_pinned_elsewhere(_skey)))
         return pid, model, difficulty
     # ════════════════════════════════════════════════════════════════════════
     # CONVERSATION PIN FOR PLAIN CHAT. Agentic turns have had this since the
@@ -5659,7 +5756,7 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # above). Only real work pins: a conversation that opens with "hi"
         # must not spend the rest of its life on whatever answered that.
         if not require_tools:
-            _session_pin_set(_ckey, pid, model)
+            _session_pin_set(_ckey, pid, model, agentic=False)
         return pid, model, difficulty
     floor = _DIFFICULTY_FLOOR[difficulty]
     qualified = [c for c in pool if c[0] >= floor]
@@ -7238,9 +7335,10 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             _post_kw = dict(
                 url=url,
                 json=payload,
-                headers=({"Content-Type": "application/json"} if key is None else
-                         {"Authorization": "Bearer " + key,
-                          "Content-Type": "application/json"}),
+                headers=dict(({"Content-Type": "application/json"} if key is None else
+                              {"Authorization": "Bearer " + key,
+                               "Content-Type": "application/json"}),
+                             **_zen_headers(pid)),
                 stream=stream,
                 proxies=_proxies(),          # explicit; never inherited by accident
                 # Streaming: bound the inter-chunk (idle) read at STREAM_IDLE_TIMEOUT
@@ -7307,9 +7405,10 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                 try:
                     resp = requests.post(
                         url, json=refit,
-                        headers=({"Content-Type": "application/json"} if key is None else
-                                 {"Authorization": "Bearer " + key,
-                                  "Content-Type": "application/json"}),
+                        headers=dict(({"Content-Type": "application/json"} if key is None else
+                                      {"Authorization": "Bearer " + key,
+                                       "Content-Type": "application/json"}),
+                                     **_zen_headers(pid)),
                         stream=stream,
                         timeout=(CONNECT_TIMEOUT,
                                  STREAM_IDLE_TIMEOUT if stream else CHAT_READ_TIMEOUT))
@@ -7857,6 +7956,10 @@ def _context_ok(pid, model, est):
 _MISSING_MODEL_RE = re.compile(
     r"model_not_found|model not found|no such model|does not exist|"
     r"unknown model|invalid model|unsupported model|not supported|"
+    # opencode-zen, MEASURED 2026-09-12: 400 "Upstream request failed: Model is
+    # unavailable." on every request shape, for hours -- and "unavailable" is
+    # not "not available", so it was a wasted hop on every turn.
+    r"model is (?:currently )?unavailable|model unavailable|"
     r"model .* not (?:found|available)", re.I)
 
 
@@ -8187,6 +8290,61 @@ def _guess_cli():
         if sub in ua:
             return name
     return (ua.split("/")[0][:24] or "unknown") if ua else "unknown"
+
+
+# OPENCODE ZEN'S FREE TIER IS FOR OPENCODE, AND SAYS SO.
+#
+# MEASURED 2026-09-12, chasing why two swarm workers took 400 seconds to write
+# a two-line file: every one of their tool turns went
+#
+#     opencode-zen/mimo-v2.5-free          400 MissingSessionID
+#                                          "OpenCode's free tier can only be
+#                                           used in OpenCode"
+#     opencode-zen/deepseek-v4-flash-free  400 "Model is unavailable"
+#     groq/qwen3.8-27b                     RequestException
+#     -> 503 to the CLI, which retried, and drew the same three again.
+#
+# The gate is a header. OpenCode itself sends `x-opencode-session` (its own
+# session id) to any provider whose id starts with "opencode", and to every
+# other provider -- this hub included -- the same id as `X-Session-Id` and
+# `x-session-affinity`. So a request that arrives here FROM OpenCode carries
+# exactly what Zen asks for, under another name: forward it, and the free tier
+# is used by OpenCode, through its configured provider, which is what the rule
+# says. A request from anything else does not carry it, and nothing is
+# invented for it: those hops are skipped instead of being spent on a 400.
+_OPENCODE_SESSION_HEADERS = ("X-Session-Id", "x-session-affinity")
+_ZEN_PID = "opencode-zen"
+
+
+def _opencode_session_id():
+    """The OpenCode session this request belongs to, or None when the caller is
+    not OpenCode (or there is no request at all)."""
+    try:
+        if _guess_cli() != "OpenCode":
+            return None
+        for name in _OPENCODE_SESSION_HEADERS:
+            val = (request.headers.get(name) or "").strip()
+            if val:
+                return val[:120]
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def _zen_client_only(pid, model):
+    """True when this id is Zen's free tier and the request did not come from
+    OpenCode -- it would answer 400 MissingSessionID, so routing skips it."""
+    if pid != _ZEN_PID or not str(model or "").endswith("-free"):
+        return False
+    return not _opencode_session_id()
+
+
+def _zen_headers(pid):
+    """The extra headers Zen's free tier needs, when this request may use it."""
+    if pid != _ZEN_PID:
+        return {}
+    sid = _opencode_session_id()
+    return {"x-opencode-session": sid} if sid else {}
 
 
 def _act_pick(pid, model):
@@ -9647,6 +9805,9 @@ def api_tracking():
             state = ("provider-dead" if _is_provider_dead(pid) else
                      "dead" if is_dead else
                      "blocked" if not allowed else
+                     # Zen's free tier answers only OpenCode; from the dashboard
+                     # there is no OpenCode session, so say that, not "dead".
+                     "opencode-only" if _zen_client_only(pid, m) else
                      "provider-exhausted" if qs.get("exhausted") else
                      "throttled" if thr else "ok")
             out.append({
@@ -9713,16 +9874,24 @@ def _identity_rows(scope_sid=None):
     if scope_sid:
         rules = _session_model_rules(scope_sid)
         blocked, allowed = rules["block"], rules["allow"]
+        sov = _session_category_overrides(scope_sid)
     else:
         blocked, allowed = _blocked_identities(), _allowed_identities()
+        sov = {}          # the GLOBAL view: no conversation's edits on top
     out = []
     for ident, g in groups.items():
         g["state"] = "ok" if g["working"] else g["state"]
         g["blocked"] = ident in blocked
         g["allowed"] = ident in allowed
+        model = g["ids"][0].split("/", 1)[1]
         g["categories"] = sorted(
             k for k in _mode_keys()
-            if _mode_allows(k, g["providers"][0], g["ids"][0].split("/", 1)[1]))
+            if _mode_allows(k, g["providers"][0], model, session_overrides=sov))
+        # Which of those are THIS conversation's own doing, so the panel can
+        # show an edit as an edit rather than as the default.
+        g["custom_categories"] = sorted(
+            k for k, v in sov.items()
+            if ident in v.get("add", ()) or ident in v.get("remove", ()))
         out.append(g)
     out.sort(key=lambda r: (-r["working"], -r["score"], r["identity"]))
     return out
@@ -9740,6 +9909,7 @@ def api_model_identities():
     rules = _session_model_rules(sid) if sid else None
     blocked = sorted(rules["block"]) if rules else sorted(_blocked_identities())
     allowed = sorted(rules["allow"]) if rules else sorted(_allowed_identities())
+    overrides = _session_category_overrides(sid) if sid else _category_overrides()
     return jsonify({
         "models": rows,
         "total": len(rows),
@@ -9748,6 +9918,10 @@ def api_model_identities():
         "blocked": blocked,
         "allowed": allowed,
         "whitelist_active": bool(allowed),
+        # The edits in force for this scope, so the panel can offer "back to
+        # the default" per mode.
+        "category_overrides": {k: {"add": sorted(v["add"]), "remove": sorted(v["remove"])}
+                               for k, v in overrides.items()},
         "modes": [{"key": k, "label": lbl} for k, lbl, _h in model_categories.labels()
                   if k in _mode_keys()],
     })
@@ -9868,20 +10042,39 @@ def api_model_whitelist_clear():
 
 @app.route("/api/model-category", methods=["POST"])
 def api_model_category_set():
-    """Put a model in a mode, or take it out.
+    """Put a model in a mode, or take it out -- globally, or for ONE conversation.
 
     model_categories ships hardcoded substring patterns, so a miscategorised
     model previously needed a source edit and a restart. Stored by identity, so
-    the correction holds for every provider serving that model."""
+    the correction holds for every provider serving that model.
+
+    {"key","identity","member"}                  -> the global default
+    {"key","identity","member","session_id"}     -> this conversation only
+    {"key","session_id","reset":true}            -> this conversation back to
+                                                    the default for that mode
+    A conversation's edit sits on top of the global one and wins; ending the
+    conversation drops it with the rest of its rules."""
     body = request.get_json(force=True, silent=True) or {}
     key = str(body.get("key") or "").strip().lower()
     ident = str(body.get("identity") or "").strip().lower()
+    sid = str(body.get("session_id") or "").strip()
     if key not in _mode_keys():
         return _openai_error("unknown mode %r" % key, 400)
+    if sid and body.get("reset"):
+        ov = _reset_session_category(sid, key)
+        return jsonify({"scope": sid, "overrides": {
+            k: {"add": sorted(v["add"]), "remove": sorted(v["remove"])} for k, v in ov.items()}})
     if not ident:
         return _openai_error("identity is required", 400)
+    if sid:
+        if agentic_chat.get_session(sid) is None:
+            return _openai_error("no such agent session", 404)
+        ov = _set_session_category(sid, key, ident, bool(body.get("member")))
+        return jsonify({"scope": sid, "overrides": {
+            k: {"add": sorted(v["add"]), "remove": sorted(v["remove"])} for k, v in ov.items()}})
     _set_category_member(key, ident, bool(body.get("member")))
-    return jsonify({"overrides": {k: {"add": sorted(v["add"]), "remove": sorted(v["remove"])}
+    return jsonify({"scope": "global",
+                    "overrides": {k: {"add": sorted(v["add"]), "remove": sorted(v["remove"])}
                                   for k, v in _category_overrides().items()}})
 
 
@@ -10103,9 +10296,12 @@ def _swarm_windows_planner(system, goal):
     whichever model the router currently thinks is strongest -- and so quota,
     fallback and the activity trail behave exactly as they do for anything
     else."""
+    # 3000, not 1500: a five-phase plan with self-contained tasks runs past
+    # 1500 tokens, and a reasoning model spends part of the budget thinking
+    # before the first brace -- a truncated object is not a plan.
     text, _model = _swarm_dispatch(
         [{"role": "system", "content": system}, {"role": "user", "content": goal}],
-        1500)
+        3000)
     return text or ""
 
 
@@ -10129,8 +10325,194 @@ def _swarm_windows_configure(session_id, mode):
 def _swarm_windows_turn(session_id, text):
     """One worker's turn. `send_message_stream_durable` runs the real turn on
     its own thread and survives its reader going away -- which is exactly what
-    a background worker needs, and why nothing here has to re-implement it."""
-    return agentic_chat.send_message_stream_durable(session_id, text)
+    a background worker needs, and why nothing here has to re-implement it.
+
+    A worker has ONE turn: when it ends, the model it was pinned to is free
+    for the next wave. The session itself stays, so its log can be read."""
+    try:
+        for ev in agentic_chat.send_message_stream_durable(session_id, text):
+            yield ev
+    finally:
+        _session_pin_drop(session_id)
+
+
+# MULTI SESSIONS, IN THE CONVERSATION.
+#
+# REPORTED: "when I click Multi sessions in /agent it shows a new window and
+# does not stay in the same place, the conversation". It was a button that
+# switched to the Swarm tab, with its own goal box and its own list of runs --
+# so choosing it meant leaving the conversation you were in, retyping the
+# message, and reading the result somewhere the conversation would never see.
+#
+# Now it is a quality tier like the other three. In "multi", a message IS the
+# goal of a swarm_windows run: several real agent sessions, each its own CLI
+# process and context window, working phases of that message in the project
+# folder -- and the turn stays where it was sent. Progress arrives as the same
+# events an ordinary turn emits (the dashboard already renders them), the
+# combined report is the agent's reply, and it is recorded in this
+# conversation's history exactly like any other reply, from the run's OWN
+# thread, so a tab that closes mid-run loses nothing.
+_MULTI_RUNS = {}                # session_id -> run_id of the turn in flight
+_MULTI_LOCK = threading.Lock()
+_MULTI_POLL = 2.0               # seconds between looks at the run
+# What the reply is when the run is cut short: enough for the reader to see
+# which phases got somewhere, never the transcripts.
+_MULTI_STOPPED_NOTE = "Stopped before every phase finished."
+
+
+def _multi_run_for(session_id):
+    """The live multi-session run behind a conversation, or None."""
+    with _MULTI_LOCK:
+        rid = _MULTI_RUNS.get(session_id)
+    if not rid:
+        return None
+    st = swarm_windows.status(rid)
+    if not st or st.get("state") not in (swarm_windows.PENDING, swarm_windows.RUNNING):
+        with _MULTI_LOCK:
+            if _MULTI_RUNS.get(session_id) == rid:
+                _MULTI_RUNS.pop(session_id, None)
+        return None
+    return st
+
+
+def _multi_phase_line(agent, total):
+    """One line about one phase, for the terminal strip under the reply."""
+    head = "Phase %s/%s %s" % (agent.get("index"), total, agent.get("title") or "")
+    mode = agent.get("mode")
+    if mode:
+        head += " (%s)" % mode
+    return head
+
+
+def _multi_turn_events(session_id, sess_info, text):
+    """A turn in the "multi" tier: `text` is the goal of a swarm_windows run in
+    this conversation's folder, under this conversation's CLI.
+
+    Yields the normalized events send_message_stream yields, so the route and
+    the page treat it as an ordinary turn:
+      notice   the plan (how many phases) and stop/restart news
+      tool     a phase starting  -- lands in the "doing" line
+      output   a phase finishing -- its first line of summary
+      message  the combined report, once
+      done     the same text, the reply
+      error    it could not start, or nothing finished
+      stopped  Stop was pressed
+    The reply is recorded from the run's own on_done, not from here: the
+    reader of this generator may be gone by then."""
+    project_dir = sess_info.get("project_dir") or ""
+    cli_id = sess_info.get("cli") or "opencode"
+    if _multi_run_for(session_id):
+        yield {"event": "error", "status": 409,
+               "detail": "A multi-session run is already working on this "
+                         "conversation. Wait for it, or press Stop."}
+        return
+    try:
+        # SHORT memory and the durable turn count, exactly as an ordinary turn
+        # keeps them (see send_message_stream): the next turn in this
+        # conversation, in any tier, should know this one happened.
+        if memory.note_turn(session_id) == 1:
+            memory.remember_fact(session_id, "The original request: "
+                                 + " ".join((text or "").split())[:240])
+        memory.remember_recent(session_id, text, "user")
+    except Exception:                                            # noqa: BLE001
+        pass
+
+    def _record(run):
+        report = swarm_windows.format_result(run.id) or ""
+        if run.state == swarm_windows.STOPPED:
+            report = (_MULTI_STOPPED_NOTE + "\n\n" + report).strip()
+        try:
+            live = agentic_chat.get_session(session_id) or {}
+            agentic_history.record_turn(session_id, cli_id, project_dir, "agent",
+                                        report or "(the run produced nothing)",
+                                        native_session_id=live.get("native_session_id"))
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            # MEDIUM memory: the phases' one-line summaries, not their transcripts.
+            memory.remember_recent(session_id, report[:600], "agent")
+        except Exception:                                        # noqa: BLE001
+            pass
+        with _MULTI_LOCK:
+            if _MULTI_RUNS.get(session_id) == run.id:
+                _MULTI_RUNS.pop(session_id, None)
+
+    try:
+        run_id = swarm_windows.start(
+            text, project_dir, cli_id,
+            _swarm_windows_spawn, _swarm_windows_turn,
+            planner=_swarm_windows_planner,
+            configure=_swarm_windows_configure,
+            modes=_worker_mode_keys(),
+            on_done=_record)
+    except swarm_windows.SwarmWindowsError as exc:
+        yield {"event": "error", "status": 400, "detail": str(exc)}
+        return
+    except Exception as exc:                                     # noqa: BLE001
+        yield {"event": "error", "status": 500,
+               "detail": "could not start: " + _sanitize(str(exc))}
+        return
+    with _MULTI_LOCK:
+        _MULTI_RUNS[session_id] = run_id
+    seen = {}
+    total = 0
+    while True:
+        st = swarm_windows.status(run_id)
+        if not st:
+            yield {"event": "error", "status": 500, "detail": "the run vanished"}
+            return
+        if not total:
+            total = int(st.get("total") or 0)
+            yield {"event": "notice",
+                   "text": "Multi sessions: %d phase%s across real %s sessions, in "
+                           "this folder (run %s -- also on the Swarm tab)."
+                           % (total, "" if total == 1 else "s", cli_id, run_id)}
+        for a in st.get("agents") or []:
+            key = a.get("index")
+            state = a.get("state")
+            if seen.get(key) == state:
+                continue
+            seen[key] = state
+            if state == swarm_windows.RUNNING:
+                yield {"event": "tool", "text": _multi_phase_line(a, total)}
+            elif state == swarm_windows.DONE:
+                first = (str(a.get("summary") or "").strip().splitlines() or [""])[0]
+                yield {"event": "output",
+                       "text": _multi_phase_line(a, total) + " -- done" +
+                               (": " + first[:200] if first else "")}
+            elif state == swarm_windows.FAILED:
+                yield {"event": "output",
+                       "text": _multi_phase_line(a, total) + " -- failed: " +
+                               _sanitize(str(a.get("error") or "unknown"), 200)}
+        if st.get("state") in (swarm_windows.DONE, swarm_windows.FAILED,
+                               swarm_windows.STOPPED):
+            break
+        time.sleep(_MULTI_POLL)
+    report = swarm_windows.format_result(run_id) or ""
+    if st.get("state") == swarm_windows.STOPPED:
+        yield {"event": "stopped"}
+        yield {"event": "message", "text": (_MULTI_STOPPED_NOTE + "\n\n" + report).strip()}
+        return
+    if st.get("state") == swarm_windows.FAILED and not st.get("done"):
+        yield {"event": "error", "status": 502,
+               "detail": _sanitize(str(st.get("error") or "every phase failed"), 300)}
+        return
+    yield {"event": "message", "text": report}
+    yield {"event": "done", "text": report}
+
+
+def _multi_turn_blocking(session_id, sess_info, text):
+    """The non-streaming shape of the same turn: (status, reply, detail)."""
+    reply, detail, status = None, None, 200
+    for ev in _multi_turn_events(session_id, sess_info, text):
+        kind = ev.get("event")
+        if kind == "error":
+            return int(ev.get("status") or 500), None, ev.get("detail")
+        if kind in ("message", "done"):
+            reply = ev.get("text") or reply
+        if kind == "stopped":
+            status = 499
+    return status, reply, detail
 
 
 @app.route("/api/swarm-windows", methods=["GET"])
@@ -10161,7 +10543,7 @@ def api_swarm_windows_start():
             phases=body.get("phases") or None,
             planner=_swarm_windows_planner,
             configure=_swarm_windows_configure,
-            modes=_mode_keys())
+            modes=_worker_mode_keys())
     except swarm_windows.SwarmWindowsError as exc:
         return _openai_error(str(exc), 400)
     except Exception as exc:                                     # noqa: BLE001
@@ -11443,6 +11825,19 @@ def _mode_keys():
     return tuple(k for k in model_categories.CATEGORY_KEYS if k not in taken)
 
 
+# The modes a swarm PLANNER may give a worker. Every worker runs with tools
+# in a real folder, and the planner, offered the whole list, filed "create
+# hello.txt" under `fast` -- so the phase ran on a small model that invented
+# the file it claimed to have written (MEASURED 2026-09-12; the review phase
+# then had to do the work again). Cheap is a tier for a trivial CHAT turn,
+# never for a worker whose output is files on disk.
+_WORKER_MODE_EXCLUDED = ("fast",)
+
+
+def _worker_mode_keys():
+    return tuple(k for k in _mode_keys() if k not in _WORKER_MODE_EXCLUDED)
+
+
 def _valid_mode(mode):
     """The mode, or None when it names no category the hub knows."""
     m = str(mode or "").strip().lower()
@@ -11486,17 +11881,33 @@ def _active_mode():
     return _global_mode()
 
 
-def _mode_allows(mode, pid, model):
+def _mode_allows(mode, pid, model, session_overrides=None):
     """True when this model belongs to the mode in force.
 
     Never consulted for MODE_ALL, and always fails OPEN on anything it cannot
     evaluate: a mode is a preference about which models to prefer, and refusing
     to answer because a category list is unrecognised would be a worse outcome
-    than answering with the wrong kind of model."""
+    than answering with the wrong kind of model.
+
+    `session_overrides` is ONE conversation's own edits to the categories
+    ({mode: {"add", "remove"}}); None means "the conversation this request is
+    running under", {} means none at all. Narrowest wins: the conversation's
+    edit beats the global edit beats the built-in pattern."""
     try:
         if not mode or mode == MODE_ALL:
             return True
         ident = _normalize_model_identity(model)
+        # THIS CONVERSATION'S edits first. "customize the mode's models for
+        # each session" -- a project that wants its coding mode to include one
+        # more model, or to leave one out, without changing what every other
+        # project's coding mode means.
+        sov = (_request_category_overrides() if session_overrides is None
+               else session_overrides)
+        sv = sov.get(mode) or {}
+        if ident in sv.get("remove", ()):
+            return False
+        if ident in sv.get("add", ()):
+            return True
         # The user's own edits to this category win over the built-in patterns.
         # CATEGORIES is a hardcoded tuple of substring patterns, so before this
         # the only way to fix a miscategorised model was to edit the source and
@@ -11567,10 +11978,133 @@ def _allowed_identities():
     return _identity_set(_ALLOWED_IDENTITY_SETTING)
 
 
-# Per-conversation overrides: {session_id: {"allow": [ident], "block": [ident]}}.
+# Per-conversation overrides:
+#   {session_id: {"allow": [ident], "block": [ident],
+#                 "categories": {mode: {"add": [ident], "remove": [ident]}}}}
 # The global lists above are the default; a session can narrow them without
-# touching what every other session sees.
+# touching what every other session sees. "categories" is the same shape as
+# the global _CATEGORY_OVERRIDE_SETTING, for one conversation: which models
+# ITS coding (vision, seo, ...) mode may use.
 _SESSION_MODELS_SETTING = "session_models"
+
+
+def _clean_category_overrides(raw):
+    """{mode: {"add": set, "remove": set}} from whatever was stored."""
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, val in raw.items():
+        if not isinstance(val, dict):
+            continue
+        out[str(key)] = {
+            "add": {str(x).strip().lower() for x in (val.get("add") or []) if str(x).strip()},
+            "remove": {str(x).strip().lower() for x in (val.get("remove") or []) if str(x).strip()},
+        }
+    return out
+
+
+def _session_category_overrides(sid=None):
+    """ONE conversation's edits to the categories, as sets. Resolved like
+    _session_model_rules: no id means the session this request runs under."""
+    if sid is None:
+        try:
+            sid = _build_sid()
+        except Exception:                                        # noqa: BLE001
+            sid = None
+    if not sid:
+        return {}
+    try:
+        raw = config.get_setting(_SESSION_MODELS_SETTING, {}) or {}
+        row = raw.get(str(sid)) if isinstance(raw, dict) else None
+        if not isinstance(row, dict):
+            return {}
+        return _clean_category_overrides(row.get("categories"))
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def _request_category_overrides():
+    """The session's category edits for the request being served, computed
+    ONCE -- _mode_allows runs per candidate in every chain build."""
+    try:
+        cached = getattr(g, "_category_rules", None)
+        if cached is not None:
+            return cached
+        rules = _session_category_overrides()
+        g._category_rules = rules
+        return rules
+    except Exception:                                            # noqa: BLE001
+        return _session_category_overrides()
+
+
+def _set_session_category(sid, key, identity, member):
+    """Put a model in one conversation's mode, or take it out. Returns that
+    conversation's category edits. Same discipline as _set_session_model: a
+    row with nothing left in it is dropped rather than stored empty."""
+    ident = str(identity or "").strip().lower()
+    sid = str(sid or "").strip()
+    key = str(key or "").strip().lower()
+    if not sid or not ident or not key:
+        return _session_category_overrides(sid)
+    try:
+        raw = config.get_setting(_SESSION_MODELS_SETTING, {}) or {}
+        raw = dict(raw) if isinstance(raw, dict) else {}
+        row = dict(raw.get(sid) or {})
+        cats = dict(row.get("categories") or {})
+        cur = dict(cats.get(key) or {})
+        add = [str(x) for x in (cur.get("add") or [])]
+        rem = [str(x) for x in (cur.get("remove") or [])]
+        if member:
+            if ident not in add:
+                add.append(ident)
+            rem = [x for x in rem if x != ident]
+        else:
+            if ident not in rem:
+                rem.append(ident)
+            add = [x for x in add if x != ident]
+        if add or rem:
+            cats[key] = {"add": sorted(add), "remove": sorted(rem)}
+        else:
+            cats.pop(key, None)
+        if cats:
+            row["categories"] = cats
+        else:
+            row.pop("categories", None)
+        if not (row.get("allow") or row.get("block") or row.get("categories")):
+            raw.pop(sid, None)
+        else:
+            raw[sid] = row
+        config.set_setting(_SESSION_MODELS_SETTING, raw)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return _session_category_overrides(sid)
+
+
+def _reset_session_category(sid, key):
+    """Forget one conversation's edits to ONE mode -- back to the default."""
+    sid = str(sid or "").strip()
+    key = str(key or "").strip().lower()
+    if not sid or not key:
+        return _session_category_overrides(sid)
+    try:
+        raw = config.get_setting(_SESSION_MODELS_SETTING, {}) or {}
+        raw = dict(raw) if isinstance(raw, dict) else {}
+        row = dict(raw.get(sid) or {})
+        cats = dict(row.get("categories") or {})
+        if key in cats:
+            cats.pop(key, None)
+            if cats:
+                row["categories"] = cats
+            else:
+                row.pop("categories", None)
+            if not (row.get("allow") or row.get("block") or row.get("categories")):
+                raw.pop(sid, None)
+            else:
+                raw[sid] = row
+            config.set_setting(_SESSION_MODELS_SETTING, raw)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return _session_category_overrides(sid)
 
 
 def _session_model_rules(sid=None):
@@ -11636,7 +12170,7 @@ def _set_session_model(sid, identity, allow=None, block=None):
             elif not want:
                 cur = [x for x in cur if x != ident]
             row[field] = sorted(cur)
-        if not (row.get("allow") or row.get("block")):
+        if not (row.get("allow") or row.get("block") or row.get("categories")):
             raw.pop(sid, None)          # nothing left: stop storing the session
         else:
             raw[sid] = row
@@ -12217,7 +12751,7 @@ def api_agent_start_session():
     # treated as "normal" rather than rejected: an older dashboard that does not
     # send the field must keep working exactly as it did.
     quality = body.get("quality")
-    quality = quality if quality in ("normal", "max", "swarm") else "normal"
+    quality = quality if quality in agentic_chat.QUALITIES else "normal"
     try:
         session_id = agentic_chat.start_session(body.get("cli"), body.get("project_dir"),
                                                  create_new=create_new, quality=quality)
@@ -12286,6 +12820,11 @@ def api_agent_resume_session(session_id):
     # object with no turns played through it yet. The real count is what's
     # already sitting in the conversation this route just loaded from disk.
     row["turn_count"] = len(conv.get("turns") or [])
+    # A running turn is what the page reattaches to after a reload; a multi-
+    # session turn is not this session's own process, so ask both.
+    if not row.get("currently_running") and (_multi_run_for(sid)
+                                              or agentic_chat.turn_is_live(sid)):
+        row["currently_running"] = True
     # Honest about which kind of continue this is: with a thread id the model
     # still has the conversation; without one it only has the files on disk.
     row["resumed_thread"] = bool(native)
@@ -12318,6 +12857,11 @@ def api_agent_get_session(session_id):
     sess = agentic_chat.get_session(session_id)
     if sess is None:
         return jsonify({"error": "No such agentic session."}), 404
+    # A "multi" turn runs as a swarm_windows run, not as this session's child
+    # process, so the session itself looks idle. The page's reconnect logic
+    # reads this flag to know whether to keep waiting.
+    if not sess.get("currently_running") and _multi_run_for(session_id):
+        sess["currently_running"] = True
     return jsonify(sess)
 
 
@@ -12357,6 +12901,12 @@ def api_agent_send_message(session_id):
         # silently missing. Same shape: set_mode returns without writing when
         # it already matches.
         agentic_history.set_mode(session_id, sess_info.get("mode"))
+    if sess_info and sess_info.get("quality") == "multi":
+        # The reply is recorded by the run's own on_done (see
+        # _multi_turn_events), never here: recording it twice would show the
+        # same report as two turns.
+        status, text, detail = _multi_turn_blocking(session_id, sess_info, body["text"])
+        return jsonify({"status": status, "text": text, "detail": detail}), status
     status, text, detail = agentic_chat.send_message(session_id, body["text"])
     if sess_info and status == 200 and text:
         # The CLI's OWN thread id, captured with the reply. Without it a
@@ -12430,7 +12980,19 @@ def api_agent_send_message_stream(session_id):
         # disconnected before the turn finished, even though the turn itself
         # completed for real.
         try:
-            for ev in agentic_chat.send_message_stream_durable(session_id, text):
+            if sess_info and sess_info.get("quality") == "multi":
+                # Several real sessions, in THIS conversation -- see
+                # _multi_turn_events. The run keeps going and records its own
+                # reply if this connection goes away; live_run mirrors the
+                # events so a page that reloads can pick the turn back up.
+                # A COPY OF THIS REQUEST'S CONTEXT goes with it: the planner
+                # routes through the hub's own chain, which reads the request.
+                events = agentic_chat.live_run(
+                    session_id, _multi_turn_events(session_id, sess_info, text),
+                    context=request_ctx._get_current_object().copy())
+            else:
+                events = agentic_chat.send_message_stream_durable(session_id, text)
+            for ev in events:
                 _keep_context()
                 yield "data: " + json.dumps(ev) + "\n\n"
         except Exception as exc:  # never leak a traceback into the stream
@@ -12448,6 +13010,36 @@ def api_agent_send_message_stream(session_id):
     return Response(stream_with_context(gen()), mimetype="text/event-stream", headers=_SSE_HEADERS)
 
 
+@app.route("/api/agent/sessions/<session_id>/live", methods=["GET"])
+def api_agent_follow_turn(session_id):
+    """The turn that is running on this session, from its beginning, live.
+
+    REPORTED: "when I refresh the page I don't see running what he was
+    doing". This is what the page attaches to after a reload: the events the
+    turn has emitted so far are replayed, then it stays attached until the
+    turn ends. When nothing is running it says so at once ("idle"), so the
+    page loads the transcript instead of waiting on nothing."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+
+    def gen():
+        try:
+            got = False
+            for ev in agentic_chat.follow_turn(session_id):
+                got = True
+                yield "data: " + json.dumps(ev) + "\n\n"
+            if not got:
+                yield "data: " + json.dumps({"event": "idle"}) + "\n\n"
+        except Exception as exc:                                 # noqa: BLE001
+            yield "data: " + json.dumps({"event": "error", "status": 500,
+                                         "detail": _sanitize(str(exc), 300)}) + "\n\n"
+        finally:
+            yield "event: end\ndata: {}\n\n"
+
+    return Response(stream_with_context(gen()), mimetype="text/event-stream", headers=_SSE_HEADERS)
+
+
 @app.route("/api/agent/sessions/<session_id>/quality", methods=["POST"])
 def api_agent_set_quality(session_id):
     """Switch a live session between normal and max quality.
@@ -12460,8 +13052,9 @@ def api_agent_set_quality(session_id):
         return gate
     body = request.get_json(force=True, silent=True)
     q = body.get("quality") if isinstance(body, dict) else None
-    if q not in ("normal", "max", "swarm"):
-        return jsonify({"error": "Pass {\"quality\": \"normal\"|\"max\"|\"swarm\"}."}), 400
+    if q not in agentic_chat.QUALITIES:
+        return jsonify({"error": "Pass {\"quality\": one of %s}."
+                        % "|".join(agentic_chat.QUALITIES)}), 400
     out = agentic_chat.set_quality(session_id, q)
     if out is None:
         return jsonify({"error": "No such agentic session."}), 404
@@ -12476,6 +13069,12 @@ def api_agent_set_quality(session_id):
 @app.route("/api/agent/sessions/<session_id>/stop", methods=["POST"])
 def api_agent_stop_session(session_id):
     stopped = agentic_chat.stop_session(session_id)
+    # A "multi" turn is a swarm_windows run, not a child of this session:
+    # Stop has to reach it too, or the button does nothing for that tier.
+    with _MULTI_LOCK:
+        rid = _MULTI_RUNS.get(session_id)
+    if rid and swarm_windows.stop(rid):
+        stopped = True
     return jsonify({"stopped": stopped})
 
 
@@ -12490,6 +13089,7 @@ def api_agent_end_session(session_id):
     # run a few hundred conversations carried a few hundred dead entries.
     if ended:
         _forget_session_models(session_id)
+        _session_pin_drop(session_id)       # it holds no model any more
     # Ending a session ends the app it started. A dev server left holding :3000
     # after its session is gone is a leak the user has to clear by hand -- and
     # worse, the next project then finds that port busy or, until the ownership
