@@ -623,7 +623,11 @@ def _agent_prompt(run, agent):
               "Every file you create or edit must be inside that folder. Use "
               "paths relative to it, or that exact absolute spelling. Do not "
               "reuse a path printed by a shell (`pwd` may print it in another "
-              "form) and never write to /, /tmp or /workspace."]
+              "form) and never write to /, /tmp or /workspace.",
+              "Do not start a server or any long-running process from the shell "
+              "(no `&`, `nohup`, `start`, or a watch mode): the shell tool waits "
+              "for it and the turn hangs. To check a server, run a one-shot "
+              "command with a short timeout, or leave it to the hub's preview."]
     parts += ["", "Work only on YOUR phase, and do it now -- do not ask for "
                   "confirmation. Finish with a short summary of what you "
                   "changed and anything the other agents need to know."]

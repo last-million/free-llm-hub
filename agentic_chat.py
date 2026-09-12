@@ -1327,12 +1327,39 @@ def _sanitize(text, limit=None):
 # running). Best-effort, never raises.
 # --------------------------------------------------------------------------- #
 
+def _tree_pids(pid):
+    """The process and every descendant, deepest first, or [] without psutil.
+    Deepest first: killing the parent before its children detaches them from
+    the tree, and on Windows a detached console child lives on."""
+    try:
+        import psutil
+        root = psutil.Process(pid)
+        kids = root.children(recursive=True)
+        return [k.pid for k in reversed(kids)] + [pid]
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
 def _signal_tree(pid, hard):
+    """Signal the WHOLE tree under `pid`, children first.
+
+    MEASURED 2026-09-12: a wedged worker was restarted by the stall watchdog
+    and its two bash.exe children -- a `python app.py &` the model had
+    started -- were still running twelve minutes later. `taskkill /T` was
+    asked AFTER proc.terminate() had already killed the CLI itself, so the
+    tree it was told to walk had no root, and a soft taskkill never reaches
+    a console process anyway. Children first, by pid, then the parent; the
+    taskkill sweep stays as the fallback for a psutil that is missing."""
     try:
         if os.name == "nt":
-            argv = ["taskkill", "/PID", str(pid), "/T"] + (["/F"] if hard else [])
-            subprocess.run(argv, capture_output=True, timeout=10,
-                           creationflags=_NO_WINDOW)
+            pids = _tree_pids(pid)
+            for child in pids:
+                subprocess.run(["taskkill", "/PID", str(child), "/T", "/F"],
+                               capture_output=True, timeout=10, creationflags=_NO_WINDOW)
+            if not pids:
+                argv = ["taskkill", "/PID", str(pid), "/T", "/F"]
+                subprocess.run(argv, capture_output=True, timeout=10,
+                               creationflags=_NO_WINDOW)
         else:
             pgid = os.getpgid(pid)
             os.killpg(pgid, signal.SIGKILL if hard else signal.SIGTERM)
@@ -1348,11 +1375,15 @@ def _terminate(proc) -> None:
     the immediate child) AND _signal_tree() (taskkill /T / killpg, which
     additionally reaches grandchildren -- e.g. a Bash-tool child process --
     that terminate()/kill() alone would leave orphaned)."""
+    # THE TREE FIRST, while the CLI is still alive to be its root: once
+    # proc.terminate() has run, the grandchildren (a Bash-tool child, the
+    # server the model started with `&`) are nobody's children and a tree
+    # walk from the dead pid finds nothing.
+    _signal_tree(proc.pid, hard=False)
     try:
         proc.terminate()
     except Exception:
         pass
-    _signal_tree(proc.pid, hard=False)
     try:
         proc.wait(timeout=_KILL_GRACE)
         return
@@ -1953,7 +1984,11 @@ def write_task_brief(project_dir, text, memory_block="", session_id=None):
                   + "Every file you create or edit must be inside it. Use paths "
                   "relative to it, or that exact absolute spelling. Do not reuse a "
                   "path printed by a shell (`pwd` may print it in another form) and "
-                  "never write to /, /tmp or /workspace.")
+                  "never write to /, /tmp or /workspace." + chr(10)
+                  + "Do not start a server or any long-running process from the shell "
+                  "(no `&`, `nohup`, `start`, or a watch mode): the shell tool waits "
+                  "for it and your turn hangs. To check a server, run a one-shot "
+                  "command with a short timeout, or leave it to the hub's preview.")
         parts = [header, folder]
         if memory_block:
             parts.append("## What this conversation already established"
