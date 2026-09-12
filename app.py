@@ -10417,26 +10417,6 @@ def _multi_turn_events(session_id, sess_info, text):
     except Exception:                                            # noqa: BLE001
         pass
 
-    def _record(run):
-        report = swarm_windows.format_result(run.id) or ""
-        if run.state == swarm_windows.STOPPED:
-            report = (_MULTI_STOPPED_NOTE + "\n\n" + report).strip()
-        try:
-            live = agentic_chat.get_session(session_id) or {}
-            agentic_history.record_turn(session_id, cli_id, project_dir, "agent",
-                                        report or "(the run produced nothing)",
-                                        native_session_id=live.get("native_session_id"))
-        except Exception:                                        # noqa: BLE001
-            pass
-        try:
-            # MEDIUM memory: the phases' one-line summaries, not their transcripts.
-            memory.remember_recent(session_id, report[:600], "agent")
-        except Exception:                                        # noqa: BLE001
-            pass
-        with _MULTI_LOCK:
-            if _MULTI_RUNS.get(session_id) == run.id:
-                _MULTI_RUNS.pop(session_id, None)
-
     try:
         run_id = swarm_windows.start(
             text, project_dir, cli_id,
@@ -10444,7 +10424,8 @@ def _multi_turn_events(session_id, sess_info, text):
             planner=_swarm_windows_planner,
             configure=_swarm_windows_configure,
             modes=_worker_mode_keys(),
-            on_done=_record)
+            on_done=_multi_owner_record,
+            owner=session_id)
     except swarm_windows.SwarmWindowsError as exc:
         yield {"event": "error", "status": 400, "detail": str(exc)}
         return
@@ -10454,6 +10435,44 @@ def _multi_turn_events(session_id, sess_info, text):
         return
     with _MULTI_LOCK:
         _MULTI_RUNS[session_id] = run_id
+    for ev in _multi_follow_events(run_id, cli_id):
+        yield ev
+
+
+def _multi_record(session_id, run):
+    """The run's report becomes the conversation's reply. Called from the
+    run's own thread when it ends -- and, after a restart, from the resumed
+    run's thread, which is why this is not a closure inside the turn."""
+    report = swarm_windows.format_result(run.id) or ""
+    if run.state == swarm_windows.STOPPED:
+        report = (_MULTI_STOPPED_NOTE + "\n\n" + report).strip()
+    try:
+        live = agentic_chat.get_session(session_id) or {}
+        agentic_history.record_turn(session_id, run.cli_id, run.project_dir, "agent",
+                                    report or "(the run produced nothing)",
+                                    native_session_id=live.get("native_session_id"))
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        # MEDIUM memory: the phases' one-line summaries, not their transcripts.
+        memory.remember_recent(session_id, report[:600], "agent")
+    except Exception:                                            # noqa: BLE001
+        pass
+    with _MULTI_LOCK:
+        if _MULTI_RUNS.get(session_id) == run.id:
+            _MULTI_RUNS.pop(session_id, None)
+
+
+def _multi_owner_record(run):
+    """on_done for a run that is a conversation's turn: the run knows whose."""
+    if getattr(run, "owner", None):
+        _multi_record(run.owner, run)
+
+
+def _multi_follow_events(run_id, cli_id):
+    """The turn's events from a run already started: phases starting and
+    finishing, then the report. Shared by a turn sent now and a run picked
+    back up after a restart."""
     seen = {}
     total = 0
     while True:
@@ -10499,6 +10518,40 @@ def _multi_turn_events(session_id, sess_info, text):
         return
     yield {"event": "message", "text": report}
     yield {"event": "done", "text": report}
+
+
+def _resume_interrupted_swarms():
+    """At boot: finish the runs the last process left mid-way (see
+    swarm_windows.resume_interrupted), and put each one that is a
+    conversation's turn back where the page can see it -- registered as that
+    conversation's run, and its events fed into the live buffer so a reload
+    attaches to it as if nothing had happened."""
+    try:
+        resumed = swarm_windows.resume_interrupted(
+            _swarm_windows_spawn, _swarm_windows_turn,
+            configure=_swarm_windows_configure, on_done=_multi_owner_record)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[swarm] could not resume interrupted runs: %s", exc)
+        return []
+    for rid in resumed:
+        run = swarm_windows.get(rid)
+        owner = getattr(run, "owner", None) if run else None
+        _log.info("[swarm] resumed %s after a restart%s", rid,
+                  (" (conversation %s)" % owner[:12]) if owner else "")
+        if not owner:
+            continue
+        with _MULTI_LOCK:
+            _MULTI_RUNS[owner] = rid
+
+        def _feed(owner=owner, rid=rid, cli=run.cli_id):
+            # Drained for its side effect: live_run mirrors every event into
+            # the conversation's live buffer, which is what a reloaded page
+            # follows.
+            for _ in agentic_chat.live_run(owner, _multi_follow_events(rid, cli)):
+                pass
+        threading.Thread(target=_feed, daemon=True,
+                         name="swarm-feed-" + rid).start()
+    return resumed
 
 
 def _multi_turn_blocking(session_id, sess_info, text):
@@ -12787,6 +12840,16 @@ def api_agent_resume_session(session_id):
         return gate
     conv = agentic_history.get_conversation(session_id)
     if not conv:
+        # A session that has not had its first turn yet has no stored
+        # conversation -- but it may well be LIVE. Reloading the page right
+        # after starting one answered "that conversation is no longer open"
+        # for a session that was sitting right there in memory (MEASURED
+        # 2026-09-12: the page then wiped the id from the URL).
+        live = agentic_chat.get_session(session_id)
+        if live:
+            live["turn_count"] = 0
+            live["resumed_thread"] = False
+            return jsonify(live)
         return jsonify({"error": "No stored conversation with that id.",
                         "code": "no_history"}), 404
     # The id is written on the agent's turns, so take the most recent one that
@@ -22804,6 +22867,11 @@ if __name__ == "__main__":
         back = swarm_windows.load()
         if back:
             _log.info("restored %d swarm run(s) from disk", back)
+        # ...and the ones that were still going get finished, not filed as
+        # failed. Workers spawn CLI processes, so this waits for the catalogs
+        # and the agent setup below to have started: a short delay, on a
+        # thread, rather than blocking the bind.
+        threading.Timer(20, _resume_interrupted_swarms).start()
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("could not restore swarm runs: %s", exc)
     _maybe_auto_create_desktop_shortcut()

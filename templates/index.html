@@ -2508,6 +2508,19 @@
     transition:color 160ms ease, background 160ms ease; }
   .attach-x:hover, .attach-x:focus-visible{ color:var(--danger-text); background:var(--accent-soft); }
   @media (prefers-reduced-motion:reduce){ .attach-x{ transition:none; } }
+  /* The queue: one chip per waiting message, in order, each removable and
+     click-to-edit. Same family as the attachment chips above it. */
+  .agent-queue{ display:flex; flex-wrap:wrap; align-items:center; gap:6px;
+    font-size:12px; color:var(--text-dim); }
+  .agent-queue .queue-n{ font-weight:600; }
+  .queue-item{ display:inline-flex; align-items:center; gap:4px; max-width:100%;
+    border:1px solid var(--border); border-radius:var(--radius-sm);
+    padding:3px 3px 3px 8px; background:var(--surface); }
+  .queue-item .queue-text{ border:0; background:none; padding:0; cursor:pointer;
+    color:var(--text); font:inherit; max-width:38ch; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; text-align:left; }
+  .queue-item .queue-text:hover, .queue-item .queue-text:focus-visible{ text-decoration:underline; }
+  .agent-queue .queue-paused{ color:var(--warn-text, var(--text-dim)); }
 
   /* One-click free key, for vendors that document anonymous instant minting. */
   .mint-key{ display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
@@ -3025,6 +3038,12 @@
                 <div class="chat-empty">Send a message to start working with the agent in this folder.</div>
               </div>
               <div class="agent-attach-strip" id="agent-attach-strip" hidden></div>
+              <!-- MESSAGES SENT WHILE THE AGENT IS WORKING wait here and go
+                   out one by one as each turn finishes. Asked for directly:
+                   "in /agent input messages and send them to the queue while
+                   he works". Kept per conversation in this browser, so a
+                   reload does not lose them. -->
+              <div class="agent-queue" id="agent-queue" hidden aria-live="polite"></div>
               <div class="chat-input-row">
                 <textarea id="agent-text" placeholder="Tell the agent what to do&hellip;  (Enter to send, Shift+Enter for a new line, paste or drop a screenshot)" aria-label="Message to agent" rows="2"></textarea>
                 <div class="chat-send-col">
@@ -8357,6 +8376,7 @@
     if (viewSwarmBtn) viewSwarmBtn.addEventListener('click', function(){ switchTab('swarm'); });
 
     function showStartState(){
+      queueForget(sessionId);         /* nothing to send to a conversation that ended */
       sessionId = null;
       curProjectDir = null;
       curSessionCli = null;
@@ -8872,6 +8892,7 @@
     function showSessionState(cli, dir){
       curProjectDir = dir;
       curSessionCli = cli || null;
+      queueLoad();                    /* this conversation's waiting messages */
       startRow.hidden = true;
       setSetupVisible(false);
       sessionBox.hidden = false;
@@ -9558,28 +9579,153 @@
       return wrap;
     }
 
+    /* THE QUEUE. While a turn is running, Send does not refuse: the message
+       waits and goes out on its own when the turn finishes, then the next
+       one, in order. Asked for directly -- "input messages and send them to
+       the queue while he works".
+         * Send stays enabled and reads "Queue" while busy; Enter queues too.
+         * A queued message can be edited (click it: back into the box) or
+           removed (x).
+         * After a turn that FINISHED the next one goes out by itself. After
+           Stop or an error the queue waits, with a Send next button: the
+           person stopped the agent for a reason, and firing the next
+           message at it would be answering a question nobody asked.
+         * Kept in this browser per conversation, so a reload mid-turn --
+           which reattaches to the running turn -- keeps what was queued and
+           sends it when that turn ends. */
+    var turnBusy = false;
+    var _queue = [];
+    var _queuePaused = false;
+
+    function queueKey(){ return sessionId ? 'flh.queue.' + sessionId : null; }
+    function queueSave(){
+      var k = queueKey();
+      if (!k) return;
+      try {
+        if (_queue.length) localStorage.setItem(k, JSON.stringify(_queue));
+        else localStorage.removeItem(k);
+      } catch (e) {}
+    }
+    function queueLoad(){
+      _queue = [];
+      _queuePaused = false;
+      var k = queueKey();
+      if (k){
+        try {
+          var raw = localStorage.getItem(k);
+          var arr = raw ? JSON.parse(raw) : [];
+          if (Array.isArray(arr)) _queue = arr.filter(function(t){ return typeof t === 'string' && t.trim(); });
+        } catch (e) { _queue = []; }
+      }
+      queueRender();
+    }
+    function queueForget(sid){
+      try { if (sid) localStorage.removeItem('flh.queue.' + sid); } catch (e) {}
+      _queue = []; _queuePaused = false;
+      queueRender();
+    }
+    function queueAdd(text){
+      _queue.push(text);
+      queueSave();
+      queueRender();
+      toast('Queued — goes out when the agent finishes this turn (' + _queue.length + ' waiting)');
+    }
+    function queueRender(){
+      var host = $('#agent-queue');
+      if (!host) return;
+      host.innerHTML = '';
+      host.hidden = !_queue.length;
+      if (!_queue.length) return;
+      var n = document.createElement('span');
+      n.className = 'queue-n';
+      n.textContent = 'Queued · ' + _queue.length;
+      host.appendChild(n);
+      _queue.forEach(function(text, i){
+        var chip = document.createElement('span');
+        chip.className = 'queue-item';
+        var t = document.createElement('button');
+        t.type = 'button'; t.className = 'queue-text';
+        t.textContent = (i + 1) + '. ' + text;
+        t.title = 'Click to edit: ' + text;
+        t.addEventListener('click', function(){
+          /* Back into the box to change it; it leaves the queue so it is
+             not sent twice. */
+          _queue.splice(i, 1);
+          queueSave();
+          textEl.value = text;
+          try { textEl.focus(); } catch (e) {}
+          queueRender();
+        });
+        var x = document.createElement('button');
+        x.type = 'button'; x.className = 'attach-x';
+        x.setAttribute('aria-label', 'Remove from queue');
+        x.textContent = '\u00d7';
+        x.addEventListener('click', function(){
+          _queue.splice(i, 1);
+          queueSave();
+          queueRender();
+        });
+        chip.appendChild(t); chip.appendChild(x);
+        host.appendChild(chip);
+      });
+      if (_queuePaused && !turnBusy){
+        var note = document.createElement('span');
+        note.className = 'queue-paused';
+        note.textContent = 'paused after the last turn stopped —';
+        host.appendChild(note);
+        var go = document.createElement('button');
+        go.type = 'button'; go.className = 'btn sm';
+        go.textContent = 'Send next';
+        go.addEventListener('click', function(){ _queuePaused = false; queueDrain(); });
+        host.appendChild(go);
+      }
+    }
+    /* Send the next waiting message, if the agent is free and nothing paused
+       the queue. Called after every finished turn. */
+    function queueDrain(){
+      if (turnBusy || _queuePaused || !sessionId || !_queue.length) return;
+      var next = _queue.shift();
+      queueSave();
+      queueRender();
+      textEl.value = next;
+      doSend();
+    }
+    function queueAfterTurn(failed, stopped){
+      if (failed || stopped){
+        _queuePaused = !!_queue.length;
+        queueRender();
+        return;
+      }
+      _queuePaused = false;
+      queueDrain();
+    }
+
     function setBusy(on){
-      // Send disabled while a turn is in flight, Stop only enabled while in flight —
-      // End session is disabled too, so a session can't be torn down mid-turn without
-      // stopping it first (avoids a confusing race between DELETE and the in-flight
-      // /message call).
-      sendBtn.disabled = on;
+      // Stop only enabled while in flight; End session disabled too, so a
+      // session can't be torn down mid-turn without stopping it first (avoids
+      // a confusing race between DELETE and the in-flight /message call).
+      // Send STAYS enabled: while a turn runs it queues (see the block above)
+      // and says so on its face.
+      turnBusy = !!on;
+      sendBtn.disabled = false;
+      sendBtn.textContent = on ? 'Queue' : 'Send';
+      sendBtn.title = on ? 'The agent is working — this message waits and goes out when the turn finishes'
+                         : '';
       stopBtn.disabled = !on;
       endBtn.disabled = on;
+      queueRender();
     }
 
     /* Send a message the user did not just type -- currently the rerun half of
        a rewind. Goes through doSend so the streaming, the bubbles and the
        history recording are all the ordinary path, never a second copy of it. */
     function sendAgentMessage(text){
-      if (!text || !sessionId || sendBtn.disabled) return;
+      if (!text || !sessionId || turnBusy) return;
       textEl.value = text;
       doSend();
     }
 
     function doSend(){
-      // Re-entrancy guard — same pattern as chat playground's sendChat().
-      if (sendBtn.disabled) return;
       if (!sessionId) return;
       var text = textEl.value.trim();
       /* Attached screenshots are named as PATHS the CLI can open, not inlined:
@@ -9593,6 +9739,12 @@
                shots.map(function(s){ return '  ' + s.path; }).join('\n');
       }
       if (!text) return;
+      if (turnBusy){
+        /* The agent is on a turn: this one waits its turn. */
+        queueAdd(text);
+        textEl.value = '';
+        return;
+      }
 
       appendAgentBubble('user', 'You', text);
       textEl.value = '';
@@ -9615,7 +9767,10 @@
              Reconnect instead, and only give up after really trying. */
           return recoverStream(sessionId, view.asstEl, view.line, e, 1);
         })
-        .then(function(){ view.finish(); });
+        .then(function(){
+          var failed = view.finish();
+          queueAfterTurn(failed, view.stopped);
+        });
     }
 
     /* Read an SSE body and hand each JSON event to `handle`. */
@@ -9664,7 +9819,7 @@
         if (el) el.textContent = fmtElapsed(Date.now() - elapsedStart);
       }, 1000);
       var finalText = '';
-      var view = { asstEl: asstEl, idle: false };
+      var view = { asstEl: asstEl, idle: false, stopped: false };
       function line(cls, txt){
         var d = document.createElement('div'); d.className = 'agent-term-line ' + (cls || '');
         d.textContent = txt; term.appendChild(d);
@@ -9691,7 +9846,7 @@
         else if (ev.event === 'notice') line('notice', ev.text);
         else if (ev.event === 'message'){ finalText = ev.text; setMd(ans, ev.text); msgsEl.scrollTop = msgsEl.scrollHeight; }
         else if (ev.event === 'done'){ finalText = ev.text || finalText; ans.textContent = finalText || '(done)'; }
-        else if (ev.event === 'stopped') line('notice', 'Stopped.');
+        else if (ev.event === 'stopped'){ view.stopped = true; line('notice', 'Stopped.'); }
         else if (ev.event === 'error'){
           asstEl.className = 'msg assistant error';
           line('err', ev.detail || 'error');
@@ -9770,6 +9925,8 @@
              watched; a failed turn keeps its error on screen instead, since
              the transcript has no reply for it. */
           if (!failed) loadFullHistory(sid);
+          /* And what was queued before the reload goes out now. */
+          queueAfterTurn(failed, view.stopped);
         });
     }
 

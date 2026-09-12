@@ -98,11 +98,15 @@ def test_the_swarm_tab_is_still_there_for_stopping_and_logs():
 # --------------------------------------------------------------------------- #
 
 class _FakeRun:
-    def __init__(self, run_id, state, agents, error=None):
+    def __init__(self, run_id, state, agents, error=None, owner="s1",
+                 cli_id="codex", project_dir="C:/proj"):
         self.id = run_id
         self.state = state
         self.agents = agents
         self.error = error
+        self.owner = owner
+        self.cli_id = cli_id
+        self.project_dir = project_dir
 
 
 @pytest.fixture
@@ -112,9 +116,9 @@ def swarm(monkeypatch):
     calls = {"start": [], "stop": [], "frames": [], "on_done": None}
 
     def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
-              on_done=None, configure=None, modes=(), review=True):
+              on_done=None, configure=None, modes=(), review=True, owner=None):
         calls["start"].append({"goal": goal, "project_dir": project_dir,
-                               "cli": cli_id, "modes": tuple(modes)})
+                               "cli": cli_id, "modes": tuple(modes), "owner": owner})
         calls["on_done"] = on_done
         return "swarm-test"
 
@@ -162,7 +166,7 @@ def test_the_message_is_the_goal_in_this_folder_under_this_cli(swarm):
     list(A._multi_turn_events("s1", SESS, "make a landing page"))
     # "fast" is offered to the planner nowhere: a worker's output is files.
     assert swarm["start"] == [{"goal": "make a landing page", "project_dir": "C:/proj",
-                               "cli": "codex", "modes": ("coding",)}]
+                               "cli": "codex", "modes": ("coding",), "owner": "s1"}]
 
 
 def test_progress_arrives_as_ordinary_turn_events(swarm):

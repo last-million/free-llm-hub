@@ -382,12 +382,18 @@ class _Agent:
         return out
 
 
+# What a worker that was mid-phase when the hub died is marked with. ONE
+# string, because resume_interrupted() reads it back to know which phases to
+# run again.
+INTERRUPTED_ERROR = "interrupted by a hub restart"
+
+
 class _Run:
     __slots__ = ("id", "goal", "project_dir", "cli_id", "agents", "state",
                  "error", "created_at", "ended_at", "stop_flag", "lock", "waves",
-                 "restored", "interrupted", "store_root")
+                 "restored", "interrupted", "store_root", "owner")
 
-    def __init__(self, goal, project_dir, cli_id, phases):
+    def __init__(self, goal, project_dir, cli_id, phases, owner=None):
         self.id = "swarm-" + uuid.uuid4().hex[:12]
         self.goal = goal
         self.project_dir = project_dir
@@ -410,11 +416,16 @@ class _Run:
         # another -- so its later phases land somewhere its earlier ones did
         # not, and the file is left describing half a run.
         self.store_root = _store_root()
+        # The CONVERSATION this run is a turn of (the "multi" tier), or None
+        # for a run started from the Swarm tab, MCP or a shell. Persisted, so
+        # a run resumed after a restart still answers into the right one.
+        self.owner = owner or None
 
     def row(self, with_events=False):
         return {
             "run_id": self.id, "goal": self.goal, "state": self.state,
             "project_dir": self.project_dir, "cli": self.cli_id,
+            "owner": self.owner,
             "error": self.error, "created_at": self.created_at,
             "ended_at": self.ended_at,
             "waves": [list(w) for w in self.waves],
@@ -442,6 +453,7 @@ class _Run:
         run = cls(row.get("goal") or "", row.get("project_dir") or "",
                   row.get("cli") or "", phases)
         run.id = str(row["run_id"])
+        run.owner = row.get("owner") or None
         run.state = row.get("state") or DONE
         run.error = row.get("error")
         run.created_at = float(row.get("created_at") or time.time())
@@ -462,7 +474,7 @@ class _Run:
         for agent in run.agents:
             if agent.state in (PENDING, RUNNING):
                 agent.state = FAILED
-                agent.error = agent.error or "interrupted by a hub restart"
+                agent.error = agent.error or INTERRUPTED_ERROR
                 agent.ended_at = agent.ended_at or time.time()
                 run.interrupted = True
         if run.state in (PENDING, RUNNING):
@@ -723,6 +735,12 @@ def _run_agent_once(run, agent, spawn, run_turn, configure=None):
 
 
 def _run_wave(run, indexes, spawn, run_turn, configure=None):
+    # A resumed run (resume_interrupted) walks its waves again; the phases
+    # that finished before the interruption keep their summaries and are not
+    # run twice.
+    indexes = [i for i in indexes if run.agents[i - 1].state != DONE]
+    if not indexes:
+        return
     threads = []
     first = indexes[:MAX_CONCURRENT] if len(indexes) > MAX_CONCURRENT else indexes
     for n, i in enumerate(first):
@@ -835,8 +853,61 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=()):
     return []
 
 
+# How old an interrupted run may be and still be picked back up. The hub
+# restarts itself every five hours; a run interrupted yesterday is one the
+# person has long since redone or given up on.
+RESUME_MAX_AGE = 6 * 3600
+
+
+def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
+                       max_age=RESUME_MAX_AGE):
+    """Pick up every run the last process left mid-way. Returns their ids.
+
+    THE WORK GETS FINISHED. A run whose process died was marked failed and
+    left there: "interrupted by a hub restart" on every phase that had not
+    finished, no review, and -- for a run that was a conversation's turn --
+    no reply ever. MEASURED 2026-09-12, twice in one night: a four-phase build
+    killed at 00:49 and another at 02:27 by hub restarts, each the person's
+    real work, each shown as failed. Asked for in as many words: "work should
+    always be finished till the end".
+
+    Phases that were DONE keep their summaries; the ones that were running or
+    waiting run again, in fresh sessions, in the same folder -- so a worker
+    that had written half its files continues from what is on disk. Then the
+    review, then on_done, exactly as if nothing had happened."""
+    resumed = []
+    now = time.time()
+    with _LOCK:
+        candidates = [r for r in _RUNS.values() if r.restored and r.interrupted]
+    for run in candidates:
+        if now - run.created_at > max_age:
+            continue
+        with run.lock:
+            todo = [a for a in run.agents
+                    if a.state == FAILED and a.error == INTERRUPTED_ERROR]
+            if not todo:
+                continue
+            for agent in todo:
+                agent.state = PENDING
+                agent.error = None
+                agent.session_id = None
+                agent.started_at = None
+                agent.ended_at = None
+            run.state = PENDING
+            run.error = None
+            run.ended_at = None
+            run.restored = False
+            run.interrupted = False
+            run.stop_flag.clear()
+        _persist(run)
+        threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure),
+                         daemon=True, name="swarm-resume-" + run.id).start()
+        resumed.append(run.id)
+    return resumed
+
+
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
-          on_done=None, configure=None, modes=(), review=True):
+          on_done=None, configure=None, modes=(), review=True, owner=None):
     """Begin a run. Returns the run id immediately; the work happens on a
     background thread.
 
@@ -853,7 +924,7 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
         raise SwarmWindowsError("could not turn that into phases")
     if review:
         phases = with_review(phases)
-    run = _Run(goal, project_dir, cli_id, phases)
+    run = _Run(goal, project_dir, cli_id, phases, owner=owner)
     _remember(run)
     threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure),
                      daemon=True, name="swarm-walk-" + run.id).start()

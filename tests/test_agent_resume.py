@@ -317,3 +317,19 @@ def test_resume_refuses_a_folder_that_is_gone(client):
         assert r.get_json()["code"] == "folder_gone"
     finally:
         ah.delete_conversation("resume-route-3")
+
+
+def test_a_live_session_with_no_turns_yet_can_still_be_resumed(client, monkeypatch):
+    """Reloading right after starting a session answered "no longer open" for
+    a session sitting right there in memory (MEASURED 2026-09-12), and the
+    page then wiped the id from the URL."""
+    import agentic_chat as ac
+    monkeypatch.setattr(ac, "get_session", lambda sid: {
+        "session_id": sid, "cli": "opencode", "project_dir": "C:/p", "quality": "normal",
+        "mode": None, "currently_running": False, "turn_count": 0} if sid == "fresh-1" else None)
+    r = client.post("/api/agent/sessions/fresh-1/resume", json={}, headers=_auth())
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()["session_id"] == "fresh-1"
+    assert r.get_json()["turn_count"] == 0
+    r = client.post("/api/agent/sessions/never-existed/resume", json={}, headers=_auth())
+    assert r.status_code == 404
