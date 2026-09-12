@@ -8349,6 +8349,46 @@ def _zen_headers(pid):
     return {"x-opencode-session": sid} if sid else {}
 
 
+def _act_begin(source, model_req, protocol="swarm", project=None):
+    """An activity row for a request the hub makes ON ITS OWN BEHALF -- the
+    swarm planner, for one. Those ran inside a page request that is not an
+    inference path, so nothing appeared on /activity while a plan was being
+    written: MEASURED 2026-09-12, four minutes of "Working..." on the Build
+    page and an empty feed, on a planner whose first attempt came back as
+    garbage and was retried. Same row shape as _activity_before, so the
+    picks and the hop failures land on it through g.act like any other."""
+    with _activity_lock:
+        _activity_seq[0] += 1
+        act = {
+            "id": _activity_seq[0], "protocol": protocol, "cli": "hub",
+            "source": source, "project": project,
+            "model_req": model_req, "provider": None, "model": None,
+            "status": "in_progress", "http": None, "stream": False,
+            "started": time.time(), "finished": None,
+        }
+        _activity.appendleft(act)
+    try:
+        g.act = act
+    except Exception:                                            # noqa: BLE001
+        pass
+    return act
+
+
+def _act_end(act, ok, http=None):
+    if act is None:
+        return
+    with _activity_lock:
+        act["status"] = "ok" if ok else "error"
+        act["http"] = http if http is not None else (200 if ok else 502)
+        act["finished"] = time.time()
+        act["duration_ms"] = int((act["finished"] - act["started"]) * 1000)
+    try:
+        if getattr(g, "act", None) is act:
+            g.act = None
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _act_pick(pid, model):
     """Record the provider/model the orchestrator actually landed on."""
     act = getattr(g, "act", None)
@@ -10298,12 +10338,22 @@ def _swarm_windows_planner(system, goal):
     whichever model the router currently thinks is strongest -- and so quota,
     fallback and the activity trail behave exactly as they do for anything
     else."""
+    # Visible while it runs: the plan is the first minutes of a multi-session
+    # turn, and it used to be the one request on the hub that /activity did
+    # not show.
+    act = _act_begin("build" if _build_sid() else "hub", "plan",
+                     project=_build_project())
     # 3000, not 1500: a five-phase plan with self-contained tasks runs past
     # 1500 tokens, and a reasoning model spends part of the budget thinking
     # before the first brace -- a truncated object is not a plan.
-    text, _model = _swarm_dispatch(
-        [{"role": "system", "content": system}, {"role": "user", "content": goal}],
-        3000)
+    try:
+        text, _model = _swarm_dispatch(
+            [{"role": "system", "content": system}, {"role": "user", "content": goal}],
+            3000)
+    except Exception:                                            # noqa: BLE001
+        _act_end(act, False)
+        raise
+    _act_end(act, bool(text))
     return text or ""
 
 
@@ -10386,9 +10436,49 @@ def _multi_phase_line(agent, total):
     return head
 
 
+# WHAT IS NOT A JOB. "so all ok ?" in a conversation set to Multi sessions
+# became a three-phase swarm -- "Run the test suite", "Verify build and static
+# checks", "Review and finish" -- four minutes of planning and two workers
+# for a three-word question (MEASURED 2026-09-12). The tier says how to do
+# WORK; a question, a thanks, a one-line follow-up is answered by the
+# conversation itself, in one ordinary turn, and the reply says so.
+_MULTI_DIRECT_MAX_CHARS = 160
+_MULTI_WORK_WORDS = ("build", "create", "make", "implement", "fix", "add", "write",
+                     "refactor", "migrate", "deploy", "redo", "rewrite", "continue",
+                     "finish", "test", "run", "install", "update", "change", "improve")
+
+
+def _multi_wants_a_swarm(text):
+    """True when a message in the multi tier is work worth splitting."""
+    t = " ".join((text or "").split())
+    if not t:
+        return False
+    if len(t) > _MULTI_DIRECT_MAX_CHARS:
+        return True
+    try:
+        difficulty = _classify_difficulty([{"role": "user", "content": t}])
+    except Exception:                                            # noqa: BLE001
+        difficulty = "hard"
+    if difficulty != "simple":
+        return True
+    low = t.lower()
+    # A question is answered, not planned -- "what did you change?" names
+    # "change" and is still a question. The ordinary turn that answers it
+    # has the same tools, so a "can you fix the zoom?" still gets fixed.
+    if low.endswith("?") and re.match(r"^(what|why|how|is|are|was|were|did|does|do|can|could|"
+                                       r"should|would|where|which|when|who)(?:\s|$)", low):
+        return False
+    # A short message that names work still is work: "fix the zoom",
+    # "continue", "make it blue".
+    words = set(re.findall(r"[a-z]+", low))
+    return bool(words & set(_MULTI_WORK_WORDS))
+
+
 def _multi_turn_events(session_id, sess_info, text):
     """A turn in the "multi" tier: `text` is the goal of a swarm_windows run in
-    this conversation's folder, under this conversation's CLI.
+    this conversation's folder, under this conversation's CLI. Whether a
+    message is work at all is decided by the routes (_multi_wants_a_swarm);
+    a question is answered by the conversation itself.
 
     Yields the normalized events send_message_stream yields, so the route and
     the page treat it as an ordinary turn:
@@ -12983,10 +13073,11 @@ def api_agent_send_message(session_id):
         # silently missing. Same shape: set_mode returns without writing when
         # it already matches.
         agentic_history.set_mode(session_id, sess_info.get("mode"))
-    if sess_info and sess_info.get("quality") == "multi":
+    if sess_info and sess_info.get("quality") == "multi" and _multi_wants_a_swarm(body["text"]):
         # The reply is recorded by the run's own on_done (see
         # _multi_turn_events), never here: recording it twice would show the
-        # same report as two turns.
+        # same report as two turns. A question rather than a job falls
+        # through to the ordinary turn below (see _multi_wants_a_swarm).
         status, text, detail = _multi_turn_blocking(session_id, sess_info, body["text"])
         return jsonify({"status": status, "text": text, "detail": detail}), status
     status, text, detail = agentic_chat.send_message(session_id, body["text"])
@@ -13062,7 +13153,7 @@ def api_agent_send_message_stream(session_id):
         # disconnected before the turn finished, even though the turn itself
         # completed for real.
         try:
-            if sess_info and sess_info.get("quality") == "multi":
+            if sess_info and sess_info.get("quality") == "multi" and _multi_wants_a_swarm(text):
                 # Several real sessions, in THIS conversation -- see
                 # _multi_turn_events. The run keeps going and records its own
                 # reply if this connection goes away; live_run mirrors the
@@ -13072,6 +13163,17 @@ def api_agent_send_message_stream(session_id):
                 events = agentic_chat.live_run(
                     session_id, _multi_turn_events(session_id, sess_info, text),
                     context=request_ctx._get_current_object().copy())
+            elif sess_info and sess_info.get("quality") == "multi":
+                # A question, not a job: the conversation answers it itself,
+                # and says why no run started (see _multi_wants_a_swarm).
+                def _direct():
+                    yield {"event": "notice",
+                           "text": "Answered directly -- a short question is not a job "
+                                   "to split across sessions. Send the work itself to "
+                                   "start a multi-session run."}
+                    for ev in agentic_chat.send_message_stream_durable(session_id, text):
+                        yield ev
+                events = _direct()
             else:
                 events = agentic_chat.send_message_stream_durable(session_id, text)
             for ev in events:
