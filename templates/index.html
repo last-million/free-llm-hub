@@ -9580,6 +9580,10 @@
     function initPlanStrip(){
       var t = $('#agent-plan-toggle');
       if (!t) return;
+      /* While a turn runs the agent is editing PROGRESS.md; the strip follows
+         it every 10s so "tracks it while working" is true on screen, not
+         only at the end of the turn. Idle sessions cost nothing. */
+      setInterval(function(){ if (sessionId && turnBusy) loadPlan(); }, 10000);
       t.addEventListener('click', function(){
         _planCollapsed = !_planCollapsed;
         var box = $('#agent-plan');

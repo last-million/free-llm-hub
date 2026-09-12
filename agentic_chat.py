@@ -1935,13 +1935,26 @@ def write_task_brief(project_dir, text, memory_block="", session_id=None):
     try:
         brief = craft.system_message(text or "")
         memory_block = (memory_block or "").strip()
-        if not brief and not memory_block:
-            return False
         name = brief_filename(session_id)
         path = os.path.join(project_dir, name)
         header = ("<!-- Written by Calvoun Free LLM Hub for THIS task. "
                   "Safe to delete; it is regenerated whenever it applies. -->")
-        parts = [header]
+        # WHERE THE FILES GO -- first, before any standard. MEASURED 2026-09-12
+        # in a normal session on Windows: the model ran `pwd` in the bash tool,
+        # got a POSIX spelling, and wrote index.html, style.css and
+        # PROGRESS.md under /workspace -- C:\workspace -- while the project
+        # folder stayed empty and the review found nothing. The swarm workers
+        # already had this line in their prompt; a normal turn's own
+        # instruction rides in argv, which on the shell path has ~60
+        # characters to spare, so it goes in this file instead, which the
+        # agent is told to read first.
+        folder = ("## The project folder" + chr(10) + chr(10) + "THE PROJECT FOLDER IS: "
+                  + os.path.abspath(project_dir) + chr(10)
+                  + "Every file you create or edit must be inside it. Use paths "
+                  "relative to it, or that exact absolute spelling. Do not reuse a "
+                  "path printed by a shell (`pwd` may print it in another form) and "
+                  "never write to /, /tmp or /workspace.")
+        parts = [header, folder]
         if memory_block:
             parts.append("## What this conversation already established"
                          + chr(10) + chr(10) + memory_block)

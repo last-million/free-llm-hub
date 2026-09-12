@@ -199,3 +199,36 @@ def test_the_page_shows_it_and_offers_continue():
     assert "Continue exactly where you stopped" in body
     assert "doSend();" in body
     assert "loadPlan();" in SRC[SRC.index("function refreshSessionInfo(){"):][:200]
+
+
+# --------------------------------------------------------------------------- #
+# The brief says where the files go
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-09-12 in a normal session on Windows: the model ran `pwd` in
+# the bash tool, got a POSIX spelling, and wrote index.html, style.css and
+# PROGRESS.md under /workspace -- C:\workspace -- while the project stayed
+# empty. A normal turn's own instruction rides in argv, which on the shell
+# path has ~60 characters to spare, so the line lives in the brief the agent
+# is told to read first.
+
+def test_the_brief_opens_with_the_project_folder(tmp_path):
+    name = AC.write_task_brief(str(tmp_path), "hello there", session_id="abcdef123456")
+    assert name, "the brief is written even when no standard matches -- the folder always applies"
+    body = (tmp_path / name).read_text(encoding="utf-8")
+    assert "THE PROJECT FOLDER IS: " + os.path.abspath(str(tmp_path)) in body
+    assert "never write to /, /tmp or /workspace" in body
+    assert body.index("THE PROJECT FOLDER IS") < len(body) // 3, "first, before any standard"
+
+
+def test_it_costs_the_command_line_nothing():
+    """The folder rides in the file, not in argv: the shell path's turn-1
+    command line stays where it was measured."""
+    src = open("agentic_chat.py", encoding="utf-8").read()
+    assert "THE PROJECT FOLDER IS" not in AC._PLANNING_SNIPPET
+    assert "THE PROJECT FOLDER IS" in src[src.index("def write_task_brief("):src.index("def _claude_model_for(")]
+
+
+def test_the_strip_follows_the_file_while_the_turn_runs():
+    body = SRC[SRC.index("function initPlanStrip(){"):]
+    body = body[:body.index("function refreshSessionInfo(){")]
+    assert "if (sessionId && turnBusy) loadPlan();" in body
