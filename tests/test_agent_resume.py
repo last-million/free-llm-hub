@@ -333,3 +333,33 @@ def test_a_live_session_with_no_turns_yet_can_still_be_resumed(client, monkeypat
     assert r.get_json()["turn_count"] == 0
     r = client.post("/api/agent/sessions/never-existed/resume", json={}, headers=_auth())
     assert r.status_code == 404
+
+
+def test_two_resumes_of_one_conversation_keep_one_session(monkeypatch, tmp_path):
+    """Found in review: two tabs reloading the same conversation both passed
+    the live-check and both built a session; the second overwrote the first
+    in the registry, orphaning a session a turn may have been running on."""
+    import threading
+    import agentic_chat as ac
+    monkeypatch.setattr(ac, "_resolve_bin", lambda cli: "C:/fake/opencode.cmd")
+    monkeypatch.setattr(ac, "master_enabled", lambda: True)
+    monkeypatch.setattr(ac, "_isolated_bin", lambda cli: None)
+    monkeypatch.setattr(ac.agentic_history, "get_conversation", lambda sid: {})
+    ids, errs = [], []
+
+    def go():
+        try:
+            ids.append(ac.resume_session("opencode", str(tmp_path), None, session_id="same-conv"))
+        except Exception as exc:                                 # noqa: BLE001
+            errs.append(exc)
+    ts = [threading.Thread(target=go) for _ in range(6)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10)
+    assert not errs, errs
+    assert ids == ["same-conv"] * 6
+    with ac._REGISTRY_LOCK:
+        live = [s for s in ac._REGISTRY.values() if s.id == "same-conv"]
+        assert len(live) == 1, "one registry entry, not one per tab"
+        ac._REGISTRY.pop("same-conv", None)

@@ -1138,3 +1138,64 @@ def test_the_hub_gives_the_planner_room_for_five_phases():
     body = src[src.index("def _swarm_windows_planner("):]
     body = body[:body.index("\ndef ")]
     assert "3000)" in body and "1500)" not in body
+
+
+# --------------------------------------------------------------------------- #
+# A phase that is working is not "timed out"; one that is abandoned stays so
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-09-12 on a real four-phase build: two phases ran 35 and 44
+# minutes, a third was still working when the old 900s cap "timed it out",
+# the review started on files still being written, and forty minutes later
+# the worker finished and flipped its phase back to done -- "done" with
+# "timed out after 900s" as its error.
+
+def test_a_worker_that_keeps_producing_output_is_not_timed_out(monkeypatch):
+    monkeypatch.setattr(SW, "AGENT_TIMEOUT", 3600.0)
+    monkeypatch.setattr(SW, "AGENT_IDLE_TIMEOUT", 1.5)
+
+    def slow_but_alive(session_id, prompt):
+        for i in range(10):                     # 2s total, an event every 0.2s
+            time.sleep(0.2)
+            yield {"event": "tool", "text": "step %d" % i}
+        yield {"event": "message", "text": "finished"}
+    rid = SW.start("g", ".", "opencode", _spawn, slow_but_alive,
+                   phases=[{"title": "T", "task": "t", "needs": []}], review=False)
+    st = _wait(rid)
+    assert st["state"] == SW.DONE
+    assert st["agents"][0]["error"] is None
+
+
+def test_a_worker_that_goes_silent_is_given_up_on_and_stopped(monkeypatch):
+    monkeypatch.setattr(SW, "AGENT_TIMEOUT", 3600.0)
+    monkeypatch.setattr(SW, "AGENT_IDLE_TIMEOUT", 0.4)
+    stopped = []
+    release = threading.Event()
+
+    def silent(session_id, prompt):
+        yield {"event": "tool", "text": "one"}
+        release.wait(5)                          # then nothing, for a long time
+        yield {"event": "message", "text": "too late"}
+    rid = SW.start("g", ".", "opencode", _spawn, silent,
+                   phases=[{"title": "T", "task": "t", "needs": []}], review=False,
+                   stop=lambda sid: stopped.append(sid))
+    st = _wait(rid)
+    assert st["state"] == SW.FAILED
+    assert st["agents"][0]["error"].startswith("no output for")
+    assert len(stopped) == 1, "the hub was asked to stop the worker's CLI"
+    release.set()
+    time.sleep(0.3)
+    # the late result does not flip the phase the run already moved past
+    st = SW.status(rid)
+    assert st["agents"][0]["state"] == SW.FAILED
+    assert st["agents"][0]["summary"] == "too late", "...but what it said is kept"
+
+
+def test_the_hard_cap_is_hours_and_the_idle_limit_beats_the_stall_watchdog():
+    import agentic_chat as AC
+    assert SW.AGENT_TIMEOUT >= 3600
+    assert SW.AGENT_IDLE_TIMEOUT > AC._STALL_TIMEOUT
+
+
+def test_every_hub_start_passes_the_stop_hook():
+    src = open("app.py", encoding="utf-8").read()
+    assert src.count("stop=agentic_chat.stop_session") == 4

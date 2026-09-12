@@ -108,6 +108,7 @@ hub_mcp.init(
             _swarm_windows_spawn, _swarm_windows_turn,
             planner=_swarm_windows_planner,
             configure=_swarm_windows_configure,
+            stop=agentic_chat.stop_session,
             modes=_worker_mode_keys()),
         "status": lambda run_id, events=False: swarm_windows.status(run_id, events),
         "stop": swarm_windows.stop,
@@ -10423,6 +10424,7 @@ def _multi_turn_events(session_id, sess_info, text):
             _swarm_windows_spawn, _swarm_windows_turn,
             planner=_swarm_windows_planner,
             configure=_swarm_windows_configure,
+            stop=agentic_chat.stop_session,
             modes=_worker_mode_keys(),
             on_done=_multi_owner_record,
             owner=session_id)
@@ -10542,7 +10544,8 @@ def _resume_interrupted_swarms():
     try:
         resumed = swarm_windows.resume_interrupted(
             _swarm_windows_spawn, _swarm_windows_turn,
-            configure=_swarm_windows_configure, on_done=_multi_owner_record)
+            configure=_swarm_windows_configure,
+            stop=agentic_chat.stop_session, on_done=_multi_owner_record)
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("[swarm] could not resume interrupted runs: %s", exc)
         return []
@@ -10609,6 +10612,7 @@ def api_swarm_windows_start():
             phases=body.get("phases") or None,
             planner=_swarm_windows_planner,
             configure=_swarm_windows_configure,
+            stop=agentic_chat.stop_session,
             modes=_worker_mode_keys())
     except swarm_windows.SwarmWindowsError as exc:
         return _openai_error(str(exc), 400)
@@ -22617,10 +22621,12 @@ def _reexec_soon():
 
 
 # Longest an update will wait for work to finish before restarting anyway.
-# swarm_windows.AGENT_TIMEOUT is 900s per worker and a run is several waves of
-# them, so this covers a real run and still guarantees the pulled code applies
-# on the same day it was pulled.
-_DEFER_RESTART_MAX = 3 * 3600.0
+# A run is several waves of workers, each allowed up to
+# swarm_windows.AGENT_TIMEOUT (two hours) when it is visibly working -- and a
+# restart mid-run is what this deferral exists to avoid (the next hub resumes
+# an interrupted run, but the phases it was on start over). Four hours still
+# guarantees the pulled code applies on the same day it was pulled.
+_DEFER_RESTART_MAX = 4 * 3600.0
 
 
 def _agentic_busy_session_ids():
@@ -22679,9 +22685,10 @@ def _reexec_when_idle(busy_snapshot, busy_runs=()):
     defer forever and the pulled code would never actually apply."""
     def _go():
         # A ceiling, because a swarm that hangs must not defer the update
-        # forever. Generous on purpose: swarm_windows.AGENT_TIMEOUT is 900s per
-        # worker and a run is several waves of them, so anything under this is
-        # a run that is still legitimately working.
+        # forever. Generous on purpose: a worker may run up to
+        # swarm_windows.AGENT_TIMEOUT while it is producing output, and a run
+        # is several waves of them, so anything under this is a run that is
+        # still legitimately working.
         deadline = time.time() + _DEFER_RESTART_MAX
         while True:
             busy = _still_running(busy_snapshot, busy_runs)

@@ -1553,9 +1553,11 @@ def resume_session(cli_id, project_dir, native_session_id, session_id=None) -> s
     stream holds its own reference), but currently_running now reads False, so
     sending a new message to that same id would start a SECOND process on top
     of it, in the same project folder."""
+    seen_before = None          # what sat under this id when we looked
     if session_id and _SAFE_SESSION_ID_RE.match(str(session_id)):
         with _REGISTRY_LOCK:
             existing = _REGISTRY.get(str(session_id))
+            seen_before = existing
             if existing is not None:
                 with existing.proc_lock:
                     live_proc = existing.proc
@@ -1587,6 +1589,17 @@ def resume_session(cli_id, project_dir, native_session_id, session_id=None) -> s
     with _REGISTRY_LOCK:
         sess = _REGISTRY.pop(sid)
         if session_id and _SAFE_SESSION_ID_RE.match(str(session_id)):
+            # TWO RESUMES AT ONCE -- two tabs reloading the same conversation
+            # -- both passed the live-check above and both built a session.
+            # The second to get here used to overwrite the first in the
+            # registry, orphaning a session a turn may already be running on.
+            # If what sits under the id now is not what was there when we
+            # looked, another resume got here first: it wins, ours is dropped.
+            # (An entry that WAS there -- a finished session being re-pointed
+            # at its saved thread -- is replaced, as before.)
+            now_there = _REGISTRY.get(str(session_id))
+            if now_there is not None and now_there is not seen_before:
+                return now_there.id
             sess.id = str(session_id)
         sess.native_session_id = native_session_id or None
         quality = restored.get("quality")

@@ -62,9 +62,21 @@ MAX_CONCURRENT = 4
 # Hard ceiling on workers in a run. The planner is asked for fewer; this is the
 # guard against a plan that ignores the ask.
 MAX_AGENTS = 8
-# One worker's wall clock. A CLI turn that builds something can legitimately
-# take minutes; past this it is hung rather than slow.
-AGENT_TIMEOUT = 900.0
+# One worker's wall clock -- the HARD cap. MEASURED 2026-09-12 on a real
+# four-phase build: two phases legitimately ran 35 and 44 minutes and a third
+# was still working when the old 900s cap "timed it out". The cap did not stop
+# anything: the worker thread kept draining its CLI, so the phase was marked
+# failed, the review started on files that were still being written, and
+# forty minutes later the worker finished and flipped its own phase back to
+# done -- "done" with "timed out after 900s" as its error. Two hours is a
+# ceiling for a phase that is visibly working; a phase that is NOT is caught
+# far sooner by the idle limit below.
+AGENT_TIMEOUT = 2 * 3600.0
+# No output at all for this long and the worker is stuck, whatever the clock
+# says. Larger than agentic_chat's own stall watchdog (420s), which restarts
+# a wedged CLI turn and produces events while doing it -- so a worker that
+# goes this quiet has defeated that too.
+AGENT_IDLE_TIMEOUT = 900.0
 # Per-agent event ring. Enough to read what a worker did without holding a
 # whole build's output in memory for every worker at once.
 EVENT_BUFFER = 400
@@ -350,7 +362,7 @@ def waves(phases):
 class _Agent:
     __slots__ = ("index", "title", "task", "done_when", "needs", "mode",
                  "session_id", "state", "summary", "error", "started_at",
-                 "ended_at", "events")
+                 "ended_at", "events", "last_event_at", "abandoned")
 
     def __init__(self, index, phase):
         self.index = index
@@ -366,6 +378,11 @@ class _Agent:
         self.started_at = None
         self.ended_at = None
         self.events = deque(maxlen=EVENT_BUFFER)
+        self.last_event_at = None       # the idle limit is measured from this
+        # Set by the wave when it gives up on this worker: the worker thread
+        # may still be draining a CLI that has not noticed, and its late
+        # result must not flip a phase the run has already moved past.
+        self.abandoned = False
 
     def row(self, with_events=False):
         out = {
@@ -477,7 +494,17 @@ class _Run:
                 agent.error = agent.error or INTERRUPTED_ERROR
                 agent.ended_at = agent.ended_at or time.time()
                 run.interrupted = True
-        if run.state in (PENDING, RUNNING):
+        if run.state in (PENDING, RUNNING) and not run.interrupted:
+            # Every phase had ended; only the run's own final write was
+            # missing -- the process died (or the file was read) between the
+            # last phase landing and _walk's closing _persist. The phases say
+            # what happened; file that, not "interrupted". MEASURED as a flaky
+            # test before it was a bug: a run read back with three done
+            # phases and the state "failed / interrupted by a hub restart".
+            run.state = FAILED if all(a.state == FAILED for a in run.agents) else DONE
+            run.error = run.error or ("every phase failed" if run.state == FAILED else None)
+            run.ended_at = run.ended_at or time.time()
+        elif run.state in (PENDING, RUNNING):
             run.state = FAILED
             run.error = run.error or "interrupted by a hub restart"
             run.ended_at = run.ended_at or time.time()
@@ -615,6 +642,7 @@ def _drain(agent, events):
         if not isinstance(ev, dict):
             continue
         agent.events.append(ev)
+        agent.last_event_at = time.time()
         # "event" is what agentic_chat actually emits; "type" is the OpenAI
         # streaming spelling. MEASURED on the first live run: reading only
         # "type" meant every event fell through, every worker looked like it
@@ -684,6 +712,7 @@ def _run_agent(run, agent, spawn, run_turn, configure=None):
         return
     agent.state = RUNNING
     agent.started_at = time.time()
+    agent.last_event_at = agent.started_at
     for attempt in range(1, AGENT_ATTEMPTS + 1):
         if run.stop_flag.is_set():
             agent.state = STOPPED
@@ -718,6 +747,13 @@ def _run_agent_once(run, agent, spawn, run_turn, configure=None):
             except Exception:                                    # noqa: BLE001
                 pass
         summary = _drain(agent, run_turn(agent.session_id, _agent_prompt(run, agent)))
+        if agent.abandoned:
+            # The wave gave up on this worker and went on without it (and, when
+            # the hub could, stopped it). Its result is kept for reading but
+            # the phase stays what the run recorded: flipping it to done now
+            # would claim the review saw work it never did.
+            agent.summary = agent.summary or (summary or "").strip()
+            return
         agent.summary = (summary or "").strip()
         if run.stop_flag.is_set():
             agent.state = STOPPED
@@ -734,7 +770,22 @@ def _run_agent_once(run, agent, spawn, run_turn, configure=None):
         agent.error = "%s: %s" % (exc.__class__.__name__, exc)
 
 
-def _run_wave(run, indexes, spawn, run_turn, configure=None):
+def _give_up(agent, why, stop=None):
+    """The wave stops waiting for this worker: mark it, and stop its CLI when
+    the hub gave us a way to, so it does not keep writing into the folder
+    the review phase is about to read."""
+    agent.abandoned = True
+    agent.state = FAILED
+    agent.error = why
+    agent.ended_at = time.time()
+    if stop and agent.session_id:
+        try:
+            stop(agent.session_id)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+def _run_wave(run, indexes, spawn, run_turn, configure=None, stop=None):
     # A resumed run (resume_interrupted) walks its waves again; the phases
     # that finished before the interruption keep their summaries and are not
     # run twice.
@@ -760,18 +811,20 @@ def _run_wave(run, indexes, spawn, run_turn, configure=None):
     # what the cap is FOR -- a plan with eight independent phases must not spawn
     # eight CLI processes at once.
     queued = list(indexes[MAX_CONCURRENT:]) if len(indexes) > MAX_CONCURRENT else []
-    deadline = time.time() + AGENT_TIMEOUT
     while threads or queued:
+        now = time.time()
         for t, agent in list(threads):
             t.join(timeout=0.05)
             if not t.is_alive():
                 threads.remove((t, agent))
-            elif time.time() > deadline:
-                # Not killed: the thread is a daemon draining a subprocess that
-                # has its own timeout. Recorded as failed and left behind.
-                agent.state = FAILED
-                agent.error = "timed out after %ds" % int(AGENT_TIMEOUT)
-                agent.ended_at = time.time()
+                continue
+            began = agent.started_at or now
+            quiet = now - (agent.last_event_at or began)
+            if now - began > AGENT_TIMEOUT:
+                _give_up(agent, "timed out after %ds" % int(AGENT_TIMEOUT), stop)
+                threads.remove((t, agent))
+            elif quiet > AGENT_IDLE_TIMEOUT:
+                _give_up(agent, "no output for %ds" % int(quiet), stop)
                 threads.remove((t, agent))
         while queued and len(threads) < MAX_CONCURRENT:
             i = queued.pop(0)
@@ -792,13 +845,13 @@ def _run_wave(run, indexes, spawn, run_turn, configure=None):
         time.sleep(0.02)
 
 
-def _walk(run, spawn, run_turn, on_done=None, configure=None):
+def _walk(run, spawn, run_turn, on_done=None, configure=None, stop=None):
     try:
         run.state = RUNNING
         for wave in run.waves:
             if run.stop_flag.is_set():
                 break
-            _run_wave(run, wave, spawn, run_turn, configure)
+            _run_wave(run, wave, spawn, run_turn, configure, stop)
         if run.stop_flag.is_set():
             run.state = STOPPED
         elif all(a.state == FAILED for a in run.agents):
@@ -860,7 +913,7 @@ RESUME_MAX_AGE = 6 * 3600
 
 
 def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
-                       max_age=RESUME_MAX_AGE):
+                       max_age=RESUME_MAX_AGE, stop=None):
     """Pick up every run the last process left mid-way. Returns their ids.
 
     THE WORK GETS FINISHED. A run whose process died was marked failed and
@@ -900,14 +953,14 @@ def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
             run.interrupted = False
             run.stop_flag.clear()
         _persist(run)
-        threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure),
+        threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure, stop),
                          daemon=True, name="swarm-resume-" + run.id).start()
         resumed.append(run.id)
     return resumed
 
 
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
-          on_done=None, configure=None, modes=(), review=True, owner=None):
+          on_done=None, configure=None, modes=(), review=True, owner=None, stop=None):
     """Begin a run. Returns the run id immediately; the work happens on a
     background thread.
 
@@ -926,7 +979,7 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
         phases = with_review(phases)
     run = _Run(goal, project_dir, cli_id, phases, owner=owner)
     _remember(run)
-    threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure),
+    threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure, stop),
                      daemon=True, name="swarm-walk-" + run.id).start()
     return run.id
 

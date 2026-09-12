@@ -224,3 +224,23 @@ def test_it_is_wired_into_boot():
     src = open("app.py", encoding="utf-8").read()
     i = src.index("back = swarm_windows.load()")
     assert "_resume_interrupted_swarms" in src[i:i + 800]
+
+
+def test_a_run_whose_phases_all_ended_is_not_called_interrupted():
+    """The file can lag the memory by one write: every phase landed, the
+    run's own closing write did not. The phases say what happened."""
+    run = SW._Run("g", ".", "opencode", PHASES)
+    for a in run.agents:
+        a.state = SW.DONE
+        a.summary = "ok"
+    run.state = SW.RUNNING                 # the closing write never happened
+    back = SW._Run.from_row(run.row())
+    assert back.state == SW.DONE and not back.interrupted and back.error is None
+    run.agents[1].state = SW.FAILED
+    run.agents[1].error = "the model refused"
+    back = SW._Run.from_row(run.row())
+    assert back.state == SW.DONE, "one failed phase among done ones is a done run"
+    for a in run.agents:
+        a.state = SW.FAILED
+    back = SW._Run.from_row(run.row())
+    assert back.state == SW.FAILED and back.error == "every phase failed" and not back.interrupted
