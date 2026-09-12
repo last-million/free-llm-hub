@@ -39,7 +39,7 @@ def _isolated(tmp_path, monkeypatch):
 def test_the_compaction_recap_is_persisted():
     body = APP[APP.index("def _summarize_worker("):]
     body = body[:body.index("\ndef ")]
-    assert "memory.remember_summary(sid, out)" in body
+    assert "memory.remember_summary(sid, out," in body
 
 
 def test_the_conversation_is_resolved_on_the_request_thread():

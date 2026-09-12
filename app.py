@@ -6750,7 +6750,8 @@ def _summarize_worker(key, text, sid=None):
             # best-effort and never raises -- a recap that cannot be filed is
             # still a recap that got used on this turn.
             if sid:
-                memory.remember_summary(sid, out)
+                memory.remember_summary(sid, out,
+                                        project_dir=(agentic_chat.get_session(sid) or {}).get("project_dir"))
             return
     except Exception:                                            # noqa: BLE001
         _log.debug("[summary] worker failed", exc_info=True)
@@ -10413,7 +10414,8 @@ def _multi_turn_events(session_id, sess_info, text):
         # conversation, in any tier, should know this one happened.
         if memory.note_turn(session_id) == 1:
             memory.remember_fact(session_id, "The original request: "
-                                 + " ".join((text or "").split())[:240])
+                                 + " ".join((text or "").split())[:240],
+                                 project_dir=project_dir)
         memory.remember_recent(session_id, text, "user")
     except Exception:                                            # noqa: BLE001
         pass
@@ -10465,7 +10467,7 @@ def _multi_record(session_id, run):
         else:
             doing = ["phase %d %s: %s" % (a.index, a.title, a.state) for a in run.agents]
             memory.note_interrupted(session_id, request=run.goal, doing=doing,
-                                    partial="", why=run.state)
+                                    partial="", why=run.state, project_dir=run.project_dir)
     except Exception:                                            # noqa: BLE001
         pass
     try:

@@ -164,7 +164,10 @@ re-deciding, and a durable turn count, one small JSON file per conversation.
 Reloading the Build page mid-turn shows the running turn from its beginning and
 follows it live; a conversation keeps its own effort tier, its own mode, and
 its own edits to which models belong to a mode (Settings, scoped to that
-conversation, or the *Models...* button beside its mode).
+conversation, or the *Models...* button beside its mode). It is continuity
+memory, not a truth store: a remembered fact is stamped with the project files
+it names, and recall marks the ones that have since moved ("gone since",
+"changed since", "now on disk") rather than stating the fact as if nothing had.
 It survives the restart the context window does not: when compaction drops old
 turns, what they established rides back in on the next turn instead of being
 gone.

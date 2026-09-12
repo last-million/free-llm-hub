@@ -32,6 +32,14 @@ Everything here is best-effort. A conversation whose memory file cannot be
 written is a conversation that works exactly as it did before -- no call site
 may ever fail because remembering failed.
 
+Nor is it a truth store. Reviewed from outside (2026-09-12): "useful
+continuity memory, not semantic truth ... it does not know whether a code
+claim is still true at the current revision". What it does since is the cheap
+half of that: a fact is stamped with the project paths it names and the
+project's revision, and recall marks references that have moved ("gone since",
+"changed since", "now on disk") -- a freshness signal about what a fact refers
+to, never a verdict on whether the claim itself holds. See REF_MAX_PER_FACT.
+
 Pure stdlib, and no imports from app.py or agentic_chat: this is a leaf, for the
 same reason model_categories is one.
 """
@@ -106,6 +114,26 @@ TASK_FILE_MAX_BYTES = 64 * 1024
 _CHECK_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s*\[([ xX~/>])\]\s*(.+?)\s*$")
 INTERRUPT_DOING = 8           # how many of the last tool calls are kept
 INTERRUPT_PARTIAL_CHARS = 700
+
+# IS IT STILL TRUE? A fact is remembered as text; the files it NAMES are what
+# change under it. Reviewed from outside (2026-09-12): "this project's memory
+# is useful continuity memory, not semantic truth ... it does not know whether
+# a code claim is still true at the current revision". Right, and this is the
+# cheap layer on top: each fact is stamped with the project paths it mentions
+# (existence, size, mtime, a content hash for small files) and the project's
+# git HEAD when it was learned; at recall the same paths are stat'd again and
+# a fact whose references moved is marked -- "[gone since: src/pen.js]",
+# "[changed since: app.py]", "[now on disk: hello.txt]" -- never dropped,
+# never re-ordered, and never called "still true": an unchanged file is a
+# freshness signal about the fact's references, not a proof of the claim.
+# No LLM call, no subprocess, no tree walk: a few os.stat per recalled fact.
+REF_MAX_PER_FACT = 3
+REF_MAX_PER_INTERRUPT = 6
+REF_HASH_MAX_BYTES = 512 * 1024
+REF_SUFFIX_MAX_CHARS = 80
+REF_PATH_SHOW_CHARS = 28
+_REF_SPLIT_RE = re.compile(r"[\s\"'()\[\]{}<>,;`]+")
+_REF_FILE_RE = re.compile(r"^[\w.-]+\.[A-Za-z][A-Za-z0-9]{0,4}$")
 
 _LOCK = threading.RLock()
 
@@ -212,7 +240,8 @@ def _blank(session_id):
             "summary": "", "facts": [], "recent": [],
             "turns": 0, "rules_restated_turn": 0, "updated_at": 0.0,
             "compactions": 0, "restate_due": False,
-            "tasks": [], "tasks_source": "", "interrupted": None}
+            "tasks": [], "tasks_source": "", "interrupted": None,
+            "fact_meta": {}, "summary_rev": None, "summary_turn": 0}
 
 
 def get(session_id):
@@ -232,6 +261,8 @@ def get(session_id):
                 base[field] = []
         if not isinstance(base.get("interrupted"), dict):
             base["interrupted"] = None
+        if not isinstance(base.get("fact_meta"), dict):
+            base["fact_meta"] = {}
         return base
     except (OSError, ValueError):
         return _blank(session_id)
@@ -262,7 +293,356 @@ def _save(mem):
         return False
 
 
-def remember_summary(session_id, text):
+# --------------------------------------------------------------------------- #
+# What a fact refers to, and whether that is still there
+# --------------------------------------------------------------------------- #
+
+def _fact_key(text):
+    return hashlib.sha1((text or "").encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _project_rev(project_dir):
+    """The project's git HEAD, short, read from the .git files -- or None.
+
+    No subprocess: a project without git on PATH still answers, and a hung
+    git can never stall a turn. Walks up at most eight levels for .git,
+    follows a worktree's "gitdir:" file, reads HEAD and its ref (or
+    packed-refs). Two to four tiny reads."""
+    try:
+        here = os.path.abspath(str(project_dir or ""))
+        if not here or not os.path.isdir(here):
+            return None
+        git = None
+        for _ in range(8):
+            cand = os.path.join(here, ".git")
+            if os.path.isdir(cand):
+                git = cand
+                break
+            if os.path.isfile(cand):
+                with open(cand, encoding="utf-8", errors="replace") as fh:
+                    first = fh.read(400).strip()
+                if first.startswith("gitdir:"):
+                    git = os.path.normpath(os.path.join(here, first[7:].strip()))
+                break
+            up = os.path.dirname(here)
+            if up == here:
+                break
+            here = up
+        if not git or not os.path.isdir(git):
+            return None
+        with open(os.path.join(git, "HEAD"), encoding="utf-8", errors="replace") as fh:
+            head = fh.read(200).strip()
+        if re.match(r"^[0-9a-f]{40}$", head):
+            return head[:7]
+        if not head.startswith("ref:"):
+            return None
+        ref = head[4:].strip()
+        common = git
+        cd = os.path.join(git, "commondir")
+        if os.path.isfile(cd):
+            with open(cd, encoding="utf-8", errors="replace") as fh:
+                common = os.path.normpath(os.path.join(git, fh.read(400).strip()))
+        for base in (git, common):
+            path = os.path.join(base, *ref.split("/"))
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    sha = fh.read(80).strip()
+                if re.match(r"^[0-9a-f]{40}$", sha):
+                    return sha[:7]
+        packed = os.path.join(common, "packed-refs")
+        if os.path.isfile(packed):
+            with open(packed, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    parts = line.strip().split()
+                    if len(parts) == 2 and parts[1] == ref and re.match(r"^[0-9a-f]{40}$", parts[0]):
+                        return parts[0][:7]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _fingerprint(project_dir, rel):
+    """What one referenced path looks like right now."""
+    ref = {"p": rel, "ex": False, "sz": None, "mt": None, "h": None}
+    try:
+        full = os.path.join(project_dir, rel)
+        st = os.stat(full)
+        ref["ex"] = True
+        if os.path.isdir(full):
+            return ref
+        ref["sz"] = int(st.st_size)
+        ref["mt"] = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+        if st.st_size <= REF_HASH_MAX_BYTES:
+            ref["h"] = _content_hash(full)
+    except (OSError, ValueError, TypeError):
+        pass
+    return ref
+
+
+def _content_hash(path):
+    try:
+        h = hashlib.sha1()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()[:12]
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+# Prose that looks like a file name and is not one.
+_REF_NOT_FILES = {"e.g", "i.e", "etc", "vs", "u.s", "node.js", "next.js", "vue.js",
+                  "nuxt.js", "react.js", "express.js", "three.js", "d3.js"}
+# How many trailing words to peel off a spelled-out absolute path before giving
+# up on it: "Edit C:\proj\my file.py now" -> "my file.py".
+_REF_PEEL = 4
+
+
+def _inside(root, tok):
+    """(full, rel) for a token that names something INSIDE root, else None.
+    Lexically first, then by realpath, so a link the project contains cannot
+    point the stat outside it."""
+    try:
+        if "\x00" in tok:
+            return None
+        full = os.path.abspath(tok) if os.path.isabs(tok) \
+            else os.path.normpath(os.path.join(root, tok))
+        root_nc = os.path.normcase(root)
+        root_sep = root_nc if root_nc.endswith(os.sep) else root_nc + os.sep
+        full_nc = os.path.normcase(full)
+        if not full_nc.startswith(root_sep):
+            return None
+        rel = os.path.relpath(full, root).replace("\\", "/")
+        if not rel or rel == "." or rel.startswith(".."):
+            return None
+        if os.path.lexists(full):
+            real_root = os.path.normcase(os.path.realpath(root))
+            real_root_sep = real_root if real_root.endswith(os.sep) else real_root + os.sep
+            if not os.path.normcase(os.path.realpath(full)).startswith(real_root_sep):
+                return None                              # a link pointing outside
+        return full, rel
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _spelled_out_paths(text, root):
+    r"""Absolute paths under the project written out in full -- with spaces,
+    which tokenising would shred. This repo lives under "bureau 2024\ALL\python
+    perso", and the tool lines a stopped turn is filed with are exactly such
+    paths ("Edit C:\...\python perso\proj\src\pen.js")."""
+    out = []
+    low = text.lower()
+    for spelling in {root.lower(), root.lower().replace("\\", "/")}:
+        start = 0
+        while True:
+            i = low.find(spelling, start)
+            if i < 0:
+                break
+            j = i + len(spelling)
+            end = j
+            while end < len(text) and text[end] not in "\"'\n\r<>()[]{},;`":
+                end += 1
+            cand = text[j:end].strip()
+            cand = re.sub(r"(:\d+)+$", "", cand).rstrip(".,:!? ")
+            cand = cand.lstrip("\\/")
+            for _ in range(_REF_PEEL + 1):
+                if cand and os.path.exists(os.path.join(root, cand)):
+                    out.append((cand, i, j + len(cand)))
+                    break
+                if " " not in cand:
+                    break
+                cand = cand.rsplit(" ", 1)[0].rstrip(".,:!?")
+            start = j
+    return out
+
+
+def _harvest_refs(text, project_dir, cap):
+    """The project paths a piece of text names, fingerprinted. Only paths
+    inside the project are kept -- nothing outside it is ever stat'd, and a
+    link the project contains that points outside is refused too.
+
+    Paths that exist come first: a fact that says "e.g. 12/09/2026 and
+    src/a.py" must stamp src/a.py, not the date."""
+    if not project_dir or not text:
+        return []
+    try:
+        root = os.path.abspath(str(project_dir))
+        text = str(text)
+    except (OSError, ValueError, TypeError):
+        return []
+    cands = []
+    spelled = _spelled_out_paths(text, root)
+    for cand, _i, _j in spelled:
+        cands.append(cand)
+    # ...and blanked out, so the fragments after a space are not read as
+    # relative paths of their own ("proj/src/pen.js" from "my proj\src\pen.js").
+    for _cand, i, j in sorted(spelled, key=lambda t: -t[1]):
+        text = text[:i] + " " + text[j:]
+    for tok in _REF_SPLIT_RE.split(text):
+        tok = tok.strip().rstrip(".,:!?")
+        tok = re.sub(r"(:\d+)+$", "", tok)          # path:12 / path:12:5
+        if not tok or "://" in tok or "\x00" in tok:
+            continue
+        segs = re.split(r"[\\/]+", tok)
+        pathy = ("/" in tok or "\\" in tok) and len(segs) >= 2 \
+            and not all(re.match(r"^\d*$", x) for x in segs)      # 12/09/2026, 24/7
+        stem, _dot, ext = tok.rpartition(".")
+        filey = bool(_REF_FILE_RE.match(tok)) and tok.lower() not in _REF_NOT_FILES \
+            and (len(stem) >= 2 or len(ext) >= 2)                  # e.g / i.e, not a.py
+        pathy = pathy and not (len(segs) == 2 and all(len(x) <= 3 for x in segs)
+                               and "." not in tok)                 # and/or, a/b
+        if pathy or filey:
+            cands.append(tok)
+    found, seen = [], set()
+    for tok in cands:
+        got = _inside(root, tok)
+        if not got:
+            continue
+        full, rel = got
+        key = rel.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append((rel, os.path.lexists(full)))
+        if len(found) >= cap * 4:
+            break
+    # existing first, text order within each half
+    found.sort(key=lambda t: 0 if t[1] else 1)
+    return [_fingerprint(root, rel) for rel, _ex in found[:cap]]
+
+
+def _ref_status(ref, project_dir, cache=None):
+    """"" when the reference looks as it did, else what happened to it.
+    `cache` (rel -> status) makes a second look in the same turn free."""
+    try:
+        rel = ref.get("p")
+        if not isinstance(rel, str) or not rel:
+            return ""
+        if cache is not None and rel in cache:
+            return cache[rel]
+        status = _ref_status_now(ref, project_dir, rel)
+        if cache is not None:
+            cache[rel] = status
+        return status
+    except (OSError, ValueError, TypeError, AttributeError):
+        return ""
+
+
+def _ref_status_now(ref, project_dir, rel):
+    full = os.path.join(project_dir, rel)
+    exists = os.path.lexists(full)
+    was = bool(ref.get("ex"))
+    if was and not exists:
+        return "gone since"
+    if not was and exists:
+        return "now on disk"
+    if not exists:
+        return ""
+    if os.path.isdir(full):
+        # A file replaced by a folder of its name is not the file any more.
+        return "" if ref.get("sz") is None else "changed since"
+    st = os.stat(full)
+    if ref.get("sz") is None:
+        return "changed since"                     # was a folder, is a file
+    if ref.get("sz") != int(st.st_size):
+        return "changed since"
+    mt = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+    if ref.get("mt") == mt:
+        return ""
+    if ref.get("h") and st.st_size <= REF_HASH_MAX_BYTES:
+        return "" if _content_hash(full) == ref.get("h") else "changed since"
+    return "changed since"
+
+
+def _shown(path):
+    """A path short enough to show, cut at a folder boundary so the file's own
+    name is always whole."""
+    path = str(path or "")
+    if len(path) <= REF_PATH_SHOW_CHARS:
+        return path
+    parts = path.split("/")
+    tail = parts[-1]
+    for i in range(len(parts) - 2, -1, -1):
+        cand = "/".join(parts[i:])
+        if len(cand) + 4 > REF_PATH_SHOW_CHARS:
+            break
+        tail = cand
+    return ".../" + tail
+
+
+def _marks(refs, project_dir, cache=None):
+    marks = []
+    if not isinstance(refs, (list, tuple)):
+        return marks
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        status = _ref_status(ref, project_dir, cache)
+        if status:
+            marks.append("%s: %s" % (status, _shown(ref.get("p"))))
+    return marks
+
+
+def _join_marks(marks, limit):
+    """Whole marks only: a mark cut in the middle of a path is a file that
+    does not exist, and a mark silently dropped is a file reported as
+    unchanged. What does not fit is counted."""
+    out = []
+    for i, m in enumerate(marks):
+        cand = "; ".join(out + [m])
+        rest = len(marks) - i - 1
+        if len(cand) + (len("; +%d more" % rest) if rest else 0) > limit and out:
+            return "; ".join(out) + "; +%d more" % (len(marks) - i)
+        if len(cand) > limit and not out:
+            return m[:limit - 8].rstrip() + "...; +%d more" % rest if rest else m[:limit - 3].rstrip() + "..."
+        out.append(m)
+    return "; ".join(out)
+
+
+def _annotate(text, meta, project_dir, cache=None):
+    """The fact, plus a status suffix for references that moved. A suffix,
+    never a prefix: _is_always reads the first characters, and a status is
+    worded as what happened, not as an instruction."""
+    try:
+        if not meta or not project_dir or not isinstance(meta, dict):
+            return text
+        marks = _marks(meta.get("refs"), project_dir, cache)
+        if not marks:
+            return text
+        return text + " [" + _join_marks(marks, REF_SUFFIX_MAX_CHARS - 3) + "]"
+    except Exception:                                            # noqa: BLE001
+        return text
+
+
+# What the reader is told once, when any mark fired. Zero cost on a clean turn.
+_MARKS_LEGEND = ("(a [gone since / changed since / now on disk: path] mark means that "
+                 "file moved after the fact was learned -- check it before relying on the fact)")
+
+
+def _refs_line(refs, project_dir, lead, cache=None):
+    try:
+        if not refs or not project_dir:
+            return ""
+        marks = _marks(refs, project_dir, cache)
+        if not marks:
+            return ""
+        return "%s: %s. Re-check these before continuing." % (
+            lead, _join_marks(marks, REF_SUFFIX_MAX_CHARS * 2))
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _stamp(text, project_dir, cap=REF_MAX_PER_FACT):
+    """Never raises: a stamp that cannot be taken is an empty stamp, and the
+    fact is still remembered."""
+    try:
+        return {"at": time.time(), "rev": _project_rev(project_dir),
+                "refs": _harvest_refs(text, project_dir, cap)}
+    except Exception:                                            # noqa: BLE001
+        return {"at": time.time(), "rev": None, "refs": []}
+
+
+def remember_summary(session_id, text, project_dir=None):
     """Keep the running recap of what has already happened.
 
     This is what _compact_to_budget produces when it drops old turns, and until
@@ -271,28 +651,53 @@ def remember_summary(session_id, text):
     text = (text or "").strip()
     if not text:
         return False
+    rev = _project_rev(project_dir) if project_dir else None     # outside the lock
     with _LOCK:
         mem = get(session_id)
         mem["summary"] = text[:MAX_SUMMARY_CHARS]
+        # The project's revision the recap describes, so a later turn can be
+        # told "as of rev X; now Y" when the tree has moved under it -- and
+        # the turn it was written on, so that is only said once the recap is
+        # actually old (an agent that commits every turn moves HEAD every turn).
+        mem["summary_rev"] = rev
+        mem["summary_turn"] = int(mem.get("turns") or 0)
         return _save(mem)
 
 
-def remember_fact(session_id, text):
+def remember_fact(session_id, text, project_dir=None):
     """A decision or constraint worth not re-deciding.
 
     Deduplicated and bounded: the failure mode of a fact store is that it fills
     with restatements of the same thing until it is the context problem it was
-    meant to solve. Oldest out first."""
-    text = " ".join((text or "").split())[:MAX_FACT_CHARS]
+    meant to solve. Oldest out first.
+
+    With `project_dir`, the fact is stamped with the project paths it names
+    and the project's revision (see REF_MAX_PER_FACT), so recall can say
+    whether those references still look the same. Facts stay plain strings;
+    the stamps live beside them in fact_meta, keyed by the text."""
+    text = " ".join((text or "").replace("\x00", " ").split())[:MAX_FACT_CHARS]
     if not text:
         return False
+    # The stamp stats files; taken before the lock, so a slow folder (a
+    # cloud-synced one) cannot hold every other conversation's memory up.
+    stamp = _stamp(text, project_dir) if project_dir else None
     with _LOCK:
         mem = get(session_id)
         facts = [f for f in mem.get("facts") or [] if isinstance(f, str)]
+        meta = mem.get("fact_meta") if isinstance(mem.get("fact_meta"), dict) else {}
         if text in facts:
+            if stamp:
+                # A restatement is a re-assertion at the current state.
+                meta[_fact_key(text)] = stamp
+                mem["fact_meta"] = meta
+                _save(mem)
             return True                        # already known; not an error
         facts.append(text)
         mem["facts"] = facts[-MAX_FACTS:]
+        if stamp:
+            meta[_fact_key(text)] = stamp
+        keep = {_fact_key(f) for f in mem["facts"]}
+        mem["fact_meta"] = {k: v for k, v in meta.items() if k in keep}
         return _save(mem)
 
 
@@ -399,10 +804,14 @@ def update_tasks(session_id, reply_text="", project_dir=None):
 # Where the work stopped
 # --------------------------------------------------------------------------- #
 
-def note_interrupted(session_id, request="", doing=(), partial="", why="stopped"):
+def note_interrupted(session_id, request="", doing=(), partial="", why="stopped",
+                     project_dir=None):
     """A turn ended before it finished: keep what it was doing, for the next
     one. `doing` is the turn's last tool calls in order; `partial` the text it
     had written."""
+    # Stat'd before the lock, like a fact's stamp.
+    refs = _stamp(" ".join(str(d) for d in list(doing or [])) + " " + (request or ""),
+                  project_dir, REF_MAX_PER_INTERRUPT) if project_dir else {"rev": None, "refs": []}
     with _LOCK:
         mem = get(session_id)
         mem["interrupted"] = {
@@ -412,6 +821,10 @@ def note_interrupted(session_id, request="", doing=(), partial="", why="stopped"
             "request": " ".join((request or "").split())[:300],
             "doing": [" ".join(str(d).split())[:MAX_TASK_CHARS] for d in list(doing or [])[-INTERRUPT_DOING:]],
             "partial": " ".join((partial or "").split())[-INTERRUPT_PARTIAL_CHARS:],
+            # The files it was touching, as they were: the next turn is told
+            # which of them moved since (see _refs_line in resume_block).
+            "rev": refs.get("rev"),
+            "refs": refs.get("refs") or [],
         }
         return _save(mem)
 
@@ -430,7 +843,7 @@ def interrupted(session_id):
     return mem.get("interrupted") if isinstance(mem.get("interrupted"), dict) else None
 
 
-def resume_block(session_id, budget_chars=900):
+def resume_block(session_id, budget_chars=900, project_dir=None, _cache=None):
     """What the next turn is told about a stopped one, and about the list.
 
     Pinned ahead of everything else the memory hands over: a turn that starts
@@ -445,21 +858,29 @@ def resume_block(session_id, budget_chars=900):
                   % ("STOPPED BY THE USER" if why == "stopped" else "CUT SHORT (%s)" % why)]
         if cut.get("request"):
             lines.append("It was working on: " + cut["request"])
+        # Early, before the tool lines and the partial text: _clip trims from
+        # the end, and this line matters most on exactly the long interrupts
+        # that get trimmed.
+        moved = _refs_line(cut.get("refs"), project_dir, "Since it stopped", _cache)
+        if moved:
+            lines.append(moved)
+        lines.append("Continue from exactly there: check what is already on disk, "
+                     "do not start over, and do not redo what is done.")
         if cut.get("doing"):
             lines.append("Its last actions, in order:")
             lines += ["  - " + d for d in cut["doing"]]
         if cut.get("partial"):
             lines.append("What it had written so far: " + cut["partial"])
-        lines.append("Continue from exactly there: check what is already on disk, "
-                     "do not start over, and do not redo what is done.")
     items = [t for t in (mem.get("tasks") or []) if isinstance(t, dict) and t.get("text")]
     if items:
         done = sum(1 for t in items if t.get("done"))
         if lines:
             lines.append("")
+        src = mem.get("tasks_source") or ""
+        if src in TASK_FILES and project_dir and not os.path.isfile(os.path.join(str(project_dir), src)):
+            src += " (file now missing)"
         lines.append("Task list (%d/%d done%s):"
-                     % (done, len(items),
-                        (", from " + mem["tasks_source"]) if mem.get("tasks_source") else ""))
+                     % (done, len(items), (", from " + src) if src else ""))
         for t in items:
             mark = "x" if t.get("done") else ("~" if t.get("doing") else " ")
             lines.append("- [%s] %s" % (mark, t["text"]))
@@ -538,7 +959,7 @@ def remember_project_fact(project_dir, text):
     true tomorrow too, and re-learning it every conversation is the cost this
     removes. Stored under a hash of the folder, so it follows the project and
     not the chat."""
-    return remember_fact(project_key(project_dir), text)
+    return remember_fact(project_key(project_dir), text, project_dir=project_dir)
 
 
 def project_facts(project_dir):
@@ -649,16 +1070,16 @@ def _clip(parts, budget, heading_lines=1):
     return "\n".join(out)
 
 
-def remember_in(scope, text):
+def remember_in(scope, text, project_dir=None):
     """Write one fact into a named scope. `scope` is any *_key() result."""
-    return remember_fact(scope, text)
+    return remember_fact(scope, text, project_dir=project_dir)
 
 
 def facts_in(scope):
     return [f for f in (get(scope).get("facts") or []) if isinstance(f, str)]
 
 
-def recall(scopes, query="", budget_chars=1200):
+def recall(scopes, query="", budget_chars=1200, project_dir=None, _cache=None):
     """The decisions from `scopes` that this turn is actually about.
 
     `scopes` is an ordered list of scope ids, NARROWEST FIRST -- task, agent,
@@ -674,16 +1095,23 @@ def recall(scopes, query="", budget_chars=1200):
     for scope in scopes:
         if not scope:
             continue
-        for f in _relevant(facts_in(scope), query):
+        mem_s = get(scope)
+        metas = mem_s.get("fact_meta") if isinstance(mem_s.get("fact_meta"), dict) else {}
+        facts = [f for f in (mem_s.get("facts") or []) if isinstance(f, str)]
+        for f in _relevant(facts, query):
             k = " ".join(f.lower().split())
             if k in seen:
                 continue        # the narrower scope already said it
             seen.add(k)
-            picked.append(f)
+            picked.append((f, metas.get(_fact_key(f))))
     if not picked:
         return ""
-    return _clip(["Decisions already made (do not re-litigate these):"]
-                 + ["- " + f for f in picked], budget_chars)
+    # Annotated BEFORE clipping, so the budget handed in still holds exactly.
+    lines = ["- " + _annotate(f, m, project_dir, _cache) for f, m in picked]
+    head = ["Decisions already made (do not re-litigate these):"]
+    if any(ln != "- " + f for ln, (f, _m) in zip(lines, picked)):
+        head.append(_MARKS_LEGEND)          # only when a mark fired
+    return _clip(head + lines, budget_chars, heading_lines=len(head))
 
 
 def context_block(session_id, budget_chars=2000, project_dir=None,
@@ -725,7 +1153,9 @@ def context_block(session_id, budget_chars=2000, project_dir=None,
     # memory could hand over, so this is spent first and never trimmed for
     # the others' sake. Up to half the budget; a list that long is itself
     # the plan.
-    lead = resume_block(session_id, budget_chars=max(300, int(budget * 0.5)))
+    cache = {}                # rel -> status, so nothing is stat'd twice per turn
+    lead = resume_block(session_id, budget_chars=max(300, int(budget * 0.5)),
+                        project_dir=project_dir, _cache=cache)
     if lead:
         out.append(lead)
         spent += len(lead)
@@ -735,12 +1165,12 @@ def context_block(session_id, budget_chars=2000, project_dir=None,
     if long:
         # Served FIRST and trimmed LAST, so the share is a ceiling against
         # starving the others -- not a cap when there is nothing to starve.
-        block = recall(scopes, query, budget)
+        block = recall(scopes, query, budget, project_dir=project_dir, _cache=cache)
         if block:
             room = min(budget, max(int(budget * SHARE_LONG),
                                    block.find(chr(10), block.find(chr(10)) + 1) + 1
                                    if chr(10) in block else len(block)))
-            block = recall(scopes, query, room)
+            block = recall(scopes, query, room, project_dir=project_dir, _cache=cache)
         if block:
             out.append(block)
             spent += len(block)
@@ -753,7 +1183,15 @@ def context_block(session_id, budget_chars=2000, project_dir=None,
     if medium and summary and (not query or int(mem.get("compactions") or 0) > 0):
         room = int(budget * SHARE_MEDIUM) + (int(budget * SHARE_LONG) - spent
                                              if spent < int(budget * SHARE_LONG) else 0)
-        block = _clip(["", "What has happened so far:", summary], max(0, room))
+        heading = "What has happened so far:"
+        # Said only once the recap is actually old: an agent that commits
+        # every turn moves HEAD on the very turn the recap was written.
+        old_enough = int(mem.get("turns") or 0) - int(mem.get("summary_turn") or 0) >= 2
+        if project_dir and mem.get("summary_rev") and old_enough:
+            now_rev = _project_rev(project_dir)
+            if now_rev and now_rev != mem["summary_rev"]:
+                heading = "What has happened so far (as of rev %s; now %s):" % (mem["summary_rev"], now_rev)
+        block = _clip(["", heading, summary], max(0, room))
         if block:
             out.append(block)
             spent += len(block)

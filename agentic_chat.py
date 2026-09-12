@@ -2782,7 +2782,8 @@ def send_message_stream(session_id, text):
         # the end was. Recorded as a fact, so context_block never trims it.
         if memory.note_turn(session_id) == 1:
             memory.remember_fact(session_id, "The original request: "
-                                 + " ".join((text or "").split())[:240])
+                                 + " ".join((text or "").split())[:240],
+                                 project_dir=(get_session(session_id) or {}).get("project_dir"))
         # SHORT horizon: a one-line trace of the turn, kept for the moment
         # compaction drops the real thing out of the window.
         memory.remember_recent(session_id, text, "user")
@@ -3424,7 +3425,8 @@ def send_message_stream_durable(session_id, text):
                     memory.update_tasks(session_id, partial[0],
                                         (sess_info or {}).get("project_dir"))
                     memory.note_interrupted(session_id, request=text, doing=list(doing),
-                                            partial=partial[0], why=why[0] or "error")
+                                            partial=partial[0], why=why[0] or "error",
+                                            project_dir=(sess_info or {}).get("project_dir"))
             except Exception:                                    # noqa: BLE001
                 pass
             q.put(None)          # sentinel: no more events, thread is done
