@@ -258,7 +258,7 @@ import hashlib, os, sys
 h = hashlib.sha256(open("requirements.txt", "rb").read()).hexdigest()
 p = os.path.join(".venv", ".deps-stamp")
 ok = os.path.exists(p) and open(p).read().strip() == h
-import flask, requests, cryptography   # noqa: F401 - must be IMPORTABLE, not
+import flask, requests, cryptography, psutil, PIL   # noqa: F401 - must be IMPORTABLE, not
 # just stamped. cryptography is the reason this list is checked at all: it is
 # imported behind a try/except in secretstore.py, so a missing copy does not
 # crash the hub -- it silently makes every stored API key undecryptable. A
@@ -272,7 +272,8 @@ else
   echo "               This can take a minute on a slow network - progress prints below."
   echo "               If nothing moves for several minutes, your network is likely"
   echo "               blocking it - check a proxy/firewall or try a different network."
-  pip install --timeout 20 -r requirements.txt
+  # python -m pip, never bare pip: the same interpreter that runs the hub.
+  python -m pip install --timeout 20 -r requirements.txt
   python -c "import hashlib;open('$DEPS_STAMP','w').write(hashlib.sha256(open('requirements.txt','rb').read()).hexdigest())" 2>/dev/null || true
 fi
 

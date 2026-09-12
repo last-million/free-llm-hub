@@ -1751,7 +1751,8 @@ _PLANNING_SNIPPET = (
     "For any non-trivial task: think it through step by step first, then break "
     "it into phases with a visible todo list -- your own native planning/task "
     "tool if you have one, and a real file in this project either way, "
-    "PROGRESS.md or similar. A reply-only checklist does not survive: your "
+    "PROGRESS.md, as a markdown checklist (- [ ] todo, - [x] done, - [~] in "
+    "progress). A reply-only checklist does not survive: your "
     "OWN context can get compacted mid-task, and this conversation can be "
     "resumed later, possibly as a fresh thread with none of your prior "
     "reasoning -- a file on disk is the only copy of the plan that outlives "
@@ -3232,24 +3233,31 @@ def follow_turn(session_id, wait=0.5):
         turn = _LIVE.get(session_id)
     if turn is None:
         return
-    sent = 0                    # index into the buffer as it stood when read
-    base = turn.dropped
-    if turn.dropped:
+    # ABSOLUTE positions. Event number n of the turn sits at buffer index
+    # n - dropped, and `sent` is the number of the next event this reader
+    # owes. (The first version re-based `sent` on every read against the
+    # drops since the LAST read, which is only right when nothing dropped
+    # across two reads -- a follower slower than the turn skipped events.)
+    with turn.cond:
+        sent = turn.dropped
+    if sent:
         yield {"event": "notice",
-               "text": "%d earlier lines of this turn are not shown." % turn.dropped}
+               "text": "%d earlier lines of this turn are not shown." % sent}
     while True:
         with turn.cond:
-            # Re-base: the deque drops from the front, so an index is only
-            # meaningful relative to how many have been dropped.
-            offset = sent - (turn.dropped - base)
-            if offset < 0:
-                offset = 0
-            fresh = list(turn.events)[offset:]
+            if sent < turn.dropped:
+                # Fell behind by more than the buffer holds: say so, catch up.
+                lost = turn.dropped - sent
+                sent = turn.dropped
+                fresh = [{"event": "notice",
+                          "text": "%d lines of this turn were not shown." % lost}]
+                fresh += list(turn.events)
+            else:
+                fresh = list(turn.events)[sent - turn.dropped:]
             if not fresh and not turn.done:
                 turn.cond.wait(wait)
                 continue
-            sent += len(fresh)
-            base = turn.dropped
+            sent = turn.dropped + len(turn.events)
             done = turn.done
         for ev in fresh:
             yield ev
@@ -3326,6 +3334,13 @@ def send_message_stream_durable(session_id, text):
     def _run():
         final_reply = None
         _live_begin(session_id)
+        # What the turn was doing, for the moment it does not finish: its
+        # last tool calls and the text it had written. Filed by
+        # memory.note_interrupted and handed to the next turn, so "continue"
+        # continues (see memory.resume_block).
+        doing = collections.deque(maxlen=memory.INTERRUPT_DOING)
+        partial = [""]
+        why = [None]
         try:
             prompt, rounds = text, 0
             while True:
@@ -3337,10 +3352,16 @@ def send_message_stream_durable(session_id, text):
                     q.put(ev)
                     _live_put(session_id, ev)       # for a page that reloads
                     kind = ev.get("event")
+                    if kind == "tool" and ev.get("text"):
+                        doing.append(ev["text"])
+                    elif kind == "message" and ev.get("text"):
+                        partial[0] = ev["text"]
                     if kind == "done":
                         final_reply = ev.get("text")
                     elif kind in ("error", "stopped"):
                         interrupted = True
+                        why[0] = ("stopped" if kind == "stopped"
+                                  else _sanitize(str(ev.get("detail") or "error"), 60))
                 if interrupted or rounds >= _MAX_AUTO_CONTINUE:
                     break
                 if not looks_unfinished(final_reply):
@@ -3363,6 +3384,23 @@ def send_message_stream_durable(session_id, text):
                         native_session_id=after.get("native_session_id"))
                 except Exception:
                     pass
+            # THE LIST AND THE STOPPING PLACE. A finished turn refreshes the
+            # task list (the project's PROGRESS.md first, the reply's own
+            # checklist second) and clears any earlier stopping place; a turn
+            # that did not finish files where it got to.
+            try:
+                if final_reply and not interrupted:
+                    memory.clear_interrupted(session_id)
+                    memory.remember_recent(session_id, final_reply, "agent")
+                    memory.update_tasks(session_id, final_reply,
+                                        (sess_info or {}).get("project_dir"))
+                elif interrupted:
+                    memory.update_tasks(session_id, partial[0],
+                                        (sess_info or {}).get("project_dir"))
+                    memory.note_interrupted(session_id, request=text, doing=list(doing),
+                                            partial=partial[0], why=why[0] or "error")
+            except Exception:                                    # noqa: BLE001
+                pass
             q.put(None)          # sentinel: no more events, thread is done
 
     threading.Thread(target=_run, daemon=True).start()

@@ -243,7 +243,7 @@ keys can actually reach right now, which is the only number that matters.
 | **MCP** | `/mcp` — `crew_run`, `crew_start`, `crew_result`, `swarm_windows_*` |
 | **Dashboard** | `/api/*` (control-token gated) |
 
-139 routes in total; the dashboard is the documentation for the rest.
+140 routes in total; the dashboard is the documentation for the rest.
 
 ---
 

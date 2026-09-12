@@ -204,3 +204,82 @@ def test_no_venv_still_falls_back_to_the_hubs_interpreter(tmp_path):
     """Deliberate: a project with no dependencies starts instantly instead of
     paying for a venv it does not need."""
     assert W._venv_python(str(tmp_path)) == sys.executable
+
+
+# --------------------------------------------------------------------------- #
+# Without psutil: the server's own word
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-09-12: the hub's venv had no psutil (run.bat's bare `pip` had
+# put the requirements into the system Python), _child_listen_port answered
+# None for every project, and a Flask app that printed "Running on
+# http://127.0.0.1:5000" in its second line was reported "no response on port
+# 5800 after 90s". The line is authoritative; the port only has to answer.
+
+class _P:
+    def __init__(self, lines, port=5800):
+        self.lines = list(lines)
+        self.port = port
+
+    def tail(self, n=80):
+        return self.lines[-n:]
+
+
+def test_the_port_the_app_prints_is_followed(monkeypatch):
+    monkeypatch.setattr(W, "_port_open", lambda port: port == 5000)
+    p = _P(["[hub] python:app.py on port 5800",
+            " * Serving Flask app 'app'",
+            " * Running on http://127.0.0.1:5000",
+            "Press CTRL+C to quit"])
+    assert W._logged_listen_port(p) == 5000
+
+
+@pytest.mark.parametrize("line,port", [
+    ("  Local:   http://localhost:3000/", 3000),
+    ("INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)", 8000),
+    ("Server listening at http://[::1]:4321", 4321),
+])
+def test_the_common_spellings_are_read(monkeypatch, line, port):
+    monkeypatch.setattr(W, "_port_open", lambda p: p == port)
+    assert W._logged_listen_port(_P([line])) == port
+
+
+def test_a_port_nothing_answers_on_is_not_taken(monkeypatch):
+    """A stale line, or a server that printed and died."""
+    monkeypatch.setattr(W, "_port_open", lambda port: False)
+    assert W._logged_listen_port(_P([" * Running on http://127.0.0.1:5000"])) is None
+
+
+def test_the_hubs_own_lines_and_port_are_ignored(monkeypatch):
+    monkeypatch.setattr(W, "_port_open", lambda port: True)
+    monkeypatch.setattr(W, "_hub_port", lambda: 8787)
+    p = _P(["[hub] ready on http://127.0.0.1:5800",
+            "proxying to http://127.0.0.1:8787/v1"])
+    assert W._logged_listen_port(p) is None
+
+
+def test_the_launcher_falls_back_to_the_printed_port_when_psutil_is_silent(monkeypatch):
+    src = open("workspace.py", encoding="utf-8").read()
+    assert "_child_listen_port(proc.popen.pid) or _logged_listen_port(proc)" in src
+
+
+def test_the_launchers_install_into_the_interpreter_that_runs_the_hub():
+    """Bare `pip` is whichever pip is first on PATH; `python -m pip` is the
+    one that runs the hub. The stamp then means what it says."""
+    bat = open("run.bat", encoding="utf-8", errors="replace").read()
+    sh = open("run.sh", encoding="utf-8", errors="replace").read()
+    assert "python -m pip install --timeout 20 -r requirements.txt" in bat
+    assert "python -m pip install --timeout 20 -r requirements.txt" in sh
+    assert "\n  pip install" not in bat and "\n  pip install" not in sh
+    assert "__import__('psutil')" in bat and "psutil" in sh
+
+
+def test_the_preview_poll_recovers_instead_of_giving_up():
+    """Five failed polls used to stop polling for good and say "press Run to
+    retry" -- what a hub restart (every five hours, for updates) looked like
+    from the Build page, about a preview that was still up."""
+    html = open("templates/index.html", encoding="utf-8").read()
+    body = html[html.index("var fails = 0, MAX_FAILS = 5"):]
+    body = body[:body.index("function stopPolling()")]
+    assert "press Run to retry" not in body
+    assert "timer = setInterval(poll, 10000);" in body
+    assert "if (slow){ slow = false; startPolling(); }" in body

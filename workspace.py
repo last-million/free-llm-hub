@@ -528,6 +528,39 @@ def _child_listen_port(pid):
     return None
 
 
+# What a dev server prints when it binds: "Running on http://127.0.0.1:5000",
+# "Local: http://localhost:3000/", "Uvicorn running on http://0.0.0.0:8000".
+_LISTEN_LINE_RE = re.compile(
+    r"https?://(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1?\]):(\d{2,5})", re.I)
+
+
+def _logged_listen_port(proc):
+    """The port the project SAYS it bound, read off its own output, or None.
+
+    The psutil path (_child_listen_port) is the precise one, but psutil is an
+    import guarded with `return None` -- and MEASURED 2026-09-12 the hub's own
+    venv did not have it (run.bat's bare `pip` had installed the requirements
+    into the system Python instead), so for every project whose entry point
+    ignores PORT -- `app.run()` binds 5000 -- the hub sat on its own port for
+    90s and answered "no response on port 5800" about a server that had
+    printed "Running on http://127.0.0.1:5000" in its second line. The line
+    is the server's own word; only a port that actually answers is taken."""
+    hub = _hub_port()
+    for line in reversed(proc.tail(200)):
+        if line.startswith("[hub]"):
+            continue
+        for m in _LISTEN_LINE_RE.finditer(line):
+            try:
+                found = int(m.group(1))
+            except ValueError:
+                continue
+            if found == hub or found == proc.port:
+                continue
+            if _port_open(found):
+                return found
+    return None
+
+
 def _argv_with_port(argv, kind, port):
     """Ports that must be on the command line rather than in the environment."""
     if kind == "static":
@@ -614,7 +647,7 @@ def start(project_dir, on_done=None):
                 # about an app that was up and serving the whole time -- a
                 # blank preview and a red error for a project that works.
                 # Ask the process we started what it ACTUALLY bound.
-                found = _child_listen_port(proc.popen.pid)
+                found = _child_listen_port(proc.popen.pid) or _logged_listen_port(proc)
                 if found and found != port:
                     proc.port = found
                     proc.state = "running"

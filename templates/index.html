@@ -2347,6 +2347,33 @@
   .agent-chat-col .agent-term-line.run > *,
   .agent-chat-col .agent-answer{ min-width:0; max-width:100%; }
   .agent-chat-col .chat-messages{ overflow-x:hidden; }
+  /* The plan strip: compact, collapsible, never taller than a third of the
+     column so the conversation stays the thing on screen. */
+  .agent-plan{ border:1px solid var(--border); border-radius:var(--radius-sm);
+    background:var(--surface); margin-bottom:6px; font-size:12.5px; flex:none;
+    max-height:34%; display:flex; flex-direction:column; min-height:0; }
+  .agent-plan-h{ display:flex; align-items:center; gap:8px; width:100%; border:0;
+    background:none; padding:6px 10px; cursor:pointer; font:inherit; color:var(--text);
+    text-align:left; }
+  .agent-plan-title{ font-weight:700; font-size:11px; letter-spacing:.06em; text-transform:uppercase; }
+  .agent-plan-n{ color:var(--text-dim); }
+  .agent-plan-src{ margin-left:auto; color:var(--text-faint); font-size:11px; }
+  .agent-plan-body{ padding:0 10px 8px; overflow:auto; min-height:0; }
+  .agent-plan[data-collapsed="1"] .agent-plan-body{ display:none; }
+  .agent-plan-list{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:3px; }
+  .agent-plan-list li{ display:flex; gap:7px; align-items:flex-start; line-height:1.35; }
+  .agent-plan-list .pl-box{ flex:none; width:14px; height:14px; border:1.5px solid var(--border-strong,var(--border));
+    border-radius:4px; margin-top:2px; display:inline-flex; align-items:center; justify-content:center;
+    font-size:10px; line-height:1; }
+  .agent-plan-list li.done .pl-box{ background:var(--accent); border-color:var(--accent); color:#fff; }
+  .agent-plan-list li.done .pl-text{ color:var(--text-dim); text-decoration:line-through; }
+  .agent-plan-list li.doing .pl-box{ border-color:var(--accent); color:var(--accent); }
+  .agent-plan-cut{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:2px 0 8px;
+    padding:7px 9px; border-radius:var(--radius-sm); background:var(--accent-soft);
+    color:var(--text); }
+  .agent-plan-cut .pc-what{ flex:1 1 240px; min-width:0; }
+  .agent-plan-cut .pc-what b{ font-weight:700; }
+  .agent-plan-cut .pc-doing{ color:var(--text-dim); font-size:11.5px; }
   .agent-chat-col .msg .bubble,
   .agent-chat-col .agent-term-line,
   .agent-chat-col .agent-answer{ overflow-wrap:anywhere; word-break:break-word; }
@@ -3034,6 +3061,24 @@
           </div>
           <div class="agent-split" id="agent-split">
             <div class="agent-chat-col">
+              <!-- THE PLAN. The hub's copy of the agent's task list (read off the
+                   project's PROGRESS.md and the replies' checklists) and, when
+                   the last turn was stopped, where it stopped -- with one
+                   button that says "continue from there". Asked for: "make
+                   sure he always creates a todo list and tracks it and updates
+                   it while working, and if I stop the agent ... continue from
+                   where he was working exactly". -->
+              <div class="agent-plan" id="agent-plan" hidden>
+                <button type="button" class="agent-plan-h" id="agent-plan-toggle" aria-expanded="true">
+                  <span class="agent-plan-title">Plan</span>
+                  <span class="agent-plan-n" id="agent-plan-n"></span>
+                  <span class="agent-plan-src" id="agent-plan-src"></span>
+                </button>
+                <div class="agent-plan-body" id="agent-plan-body">
+                  <div class="agent-plan-cut" id="agent-plan-cut" hidden></div>
+                  <ul class="agent-plan-list" id="agent-plan-list"></ul>
+                </div>
+              </div>
               <div class="chat-messages" id="agent-messages" aria-live="polite">
                 <div class="chat-empty">Send a message to start working with the agent in this folder.</div>
               </div>
@@ -8377,6 +8422,8 @@
 
     function showStartState(){
       queueForget(sessionId);         /* nothing to send to a conversation that ended */
+      var planBox = $('#agent-plan');
+      if (planBox) planBox.hidden = true;
       sessionId = null;
       curProjectDir = null;
       curSessionCli = null;
@@ -8697,7 +8744,10 @@
     /* Exposed so the URL restorer (which runs outside this closure) can drop
        straight into an existing conversation, transcript and all. */
     function loadFullHistory(sid){
-      api('/api/agent/history/' + encodeURIComponent(sid))
+      /* Returns the promise: a caller that appends to the transcript right
+         after (the queue sending its next message) has to wait for the mount,
+         or the mount wipes what it just appended. */
+      return api('/api/agent/history/' + encodeURIComponent(sid))
         .then(function(full){
           mountTranscript(msgsEl, full || {});
           if (full && (full.turns || []).length) checkpointBtn.disabled = false;
@@ -8893,6 +8943,7 @@
       curProjectDir = dir;
       curSessionCli = cli || null;
       queueLoad();                    /* this conversation's waiting messages */
+      loadPlan();                     /* ...and its task list */
       startRow.hidden = true;
       setSetupVisible(false);
       sessionBox.hidden = false;
@@ -8983,21 +9034,32 @@
          forever. Measured against a stale server: an unreachable status route
          produced 197 console errors in a couple of minutes, which buries any
          real error the user needs to see. */
-      var fails = 0, MAX_FAILS = 5;
+      var fails = 0, MAX_FAILS = 5, slow = false;
       function poll(){
         if (!dir) return;
         api('/api/workspace/status?project_dir=' + encodeURIComponent(dir))
-          .then(function(st){ fails = 0; render(st); })
+          .then(function(st){
+            fails = 0;
+            /* Back in touch: the hub restarts itself every five hours to
+               update, and a preview that was fine before is fine after. It
+               used to stop polling for good and tell the user to press Run --
+               reported as the preview not running a project that was up. */
+            if (slow){ slow = false; startPolling(); }
+            render(st);
+          })
           .catch(function(){
-            if (++fails >= MAX_FAILS){
+            if (++fails >= MAX_FAILS && !slow){
+              slow = true;
               stopPolling();
-              setState('lost contact with the hub — press Run to retry', 'bad');
+              timer = setInterval(poll, 10000);
+              setState('lost contact with the hub — retrying every 10s', 'bad');
             }
           });
       }
 
       function startPolling(){
         stopPolling();
+        slow = false;
         timer = setInterval(poll, 2000);
       }
       function stopPolling(){ if (timer){ clearInterval(timer); timer = null; } }
@@ -9459,8 +9521,76 @@
       };
     })();
 
+    /* THE PLAN STRIP. Fetched after every turn and on load; rendered
+       read-only -- the agent owns the list (it edits PROGRESS.md), the page
+       shows it. When the last turn was stopped, the strip says what it was
+       doing and offers Continue, which sends the one message the memory
+       block is built to answer. */
+    var _planCollapsed = false;
+    function loadPlan(){
+      if (!sessionId) return Promise.resolve();
+      var sid = sessionId;
+      return api('/api/agent/sessions/' + encodeURIComponent(sid) + '/plan')
+        .then(function(p){ if (sessionId === sid) renderPlan(p || {}); })
+        .catch(function(){});
+    }
+    function renderPlan(p){
+      var box = $('#agent-plan'), list = $('#agent-plan-list'), cut = $('#agent-plan-cut');
+      if (!box || !list || !cut) return;
+      var items = p.tasks || [];
+      var stopped = p.interrupted || null;
+      box.hidden = !items.length && !stopped;
+      if (box.hidden) return;
+      $('#agent-plan-n').textContent = items.length ? (p.done || 0) + '/' + items.length + ' done' : '';
+      $('#agent-plan-src').textContent = p.source ? 'from ' + p.source : '';
+      box.setAttribute('data-collapsed', _planCollapsed ? '1' : '0');
+      $('#agent-plan-toggle').setAttribute('aria-expanded', _planCollapsed ? 'false' : 'true');
+      list.innerHTML = '';
+      items.forEach(function(t){
+        var li = document.createElement('li');
+        li.className = t.done ? 'done' : (t.doing ? 'doing' : '');
+        var b = document.createElement('span'); b.className = 'pl-box';
+        b.textContent = t.done ? '\u2713' : (t.doing ? '\u2022' : '');
+        var x = document.createElement('span'); x.className = 'pl-text';
+        x.textContent = t.text;
+        li.appendChild(b); li.appendChild(x);
+        list.appendChild(li);
+      });
+      cut.innerHTML = '';
+      cut.hidden = !stopped;
+      if (stopped){
+        var what = document.createElement('div'); what.className = 'pc-what';
+        var why = stopped.why === 'stopped' ? 'Stopped by you' : 'Cut short (' + (stopped.why || 'error') + ')';
+        what.innerHTML = '<b>' + esc(why) + '</b>' +
+          (stopped.request ? ' while working on: ' + esc(stopped.request) : '') +
+          ((stopped.doing || []).length
+            ? '<div class="pc-doing">last: ' + esc((stopped.doing || []).slice(-3).join(' \u2192 ')) + '</div>' : '');
+        cut.appendChild(what);
+        var go = document.createElement('button');
+        go.type = 'button'; go.className = 'btn sm primary';
+        go.textContent = 'Continue from there';
+        go.addEventListener('click', function(){
+          if (turnBusy){ toast('The agent is already working', true); return; }
+          textEl.value = 'Continue exactly where you stopped. Do not start over; check what is already done on disk and carry on from there.';
+          doSend();
+        });
+        cut.appendChild(go);
+      }
+    }
+    function initPlanStrip(){
+      var t = $('#agent-plan-toggle');
+      if (!t) return;
+      t.addEventListener('click', function(){
+        _planCollapsed = !_planCollapsed;
+        var box = $('#agent-plan');
+        if (box) box.setAttribute('data-collapsed', _planCollapsed ? '1' : '0');
+        t.setAttribute('aria-expanded', _planCollapsed ? 'false' : 'true');
+      });
+    }
+
     function refreshSessionInfo(){
       if (!sessionId) return;
+      loadPlan();
       api('/api/agent/sessions/' + encodeURIComponent(sessionId)).then(function(r){
         r = r || {};
         var extra = [];
@@ -9923,10 +10053,13 @@
           var failed = view.finish();
           /* The recorded transcript is the durable copy of what was just
              watched; a failed turn keeps its error on screen instead, since
-             the transcript has no reply for it. */
-          if (!failed) loadFullHistory(sid);
-          /* And what was queued before the reload goes out now. */
-          queueAfterTurn(failed, view.stopped);
+             the transcript has no reply for it. Then -- AFTER the mount, or
+             the mount would wipe the bubbles it appends -- what was queued
+             before the reload goes out. */
+          var mounted = failed ? Promise.resolve() : loadFullHistory(sid);
+          mounted.then(function(){
+            if (sessionId === sid) queueAfterTurn(failed, view.stopped);
+          });
         });
     }
 
@@ -10277,6 +10410,7 @@
                              that took the whole dashboard down earlier. */
     initAgentMode();
     initAgentModelsLink();
+    initPlanStrip();
     loadAgentMode();
     initFolderPicker();
     initRunningPanel();

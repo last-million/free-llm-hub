@@ -83,6 +83,30 @@ SHARE_SHORT = 0.20
 # the hub did before.
 RESTATE_EVERY = 8
 
+# THE TASK LIST AND THE PLACE THE WORK STOPPED.
+#
+# REQUESTED: "make sure he always creates a todo list and tracks it and
+# updates it while working, and if I stop the agent he should keep what the
+# LLM was working on, and when I come back and ask it to continue he should
+# continue from where he was working exactly".
+#
+# The agent is TOLD to keep a checklist (agentic_chat._PLANNING_SNIPPET and
+# craft.PLAN_PHASES ask for PROGRESS.md); this is the hub's own copy of it,
+# read off the project's PROGRESS.md / TODO.md and off the checklists in the
+# agent's replies, so the page can show it and the next turn can be handed it
+# even when the CLI's own thread has forgotten. And when a turn is stopped or
+# dies, what it was doing -- the request, its last tool calls, the text it had
+# written -- is filed here and put in front of the next turn, so "continue"
+# means continue and not start over.
+MAX_TASKS = 40
+MAX_TASK_CHARS = 160
+TASK_FILES = ("PROGRESS.md", "TODO.md", "PLAN.md", "TASKS.md")
+TASK_FILE_MAX_BYTES = 64 * 1024
+# "- [ ] text", "* [x] text", "1. [~] text"; ~ and / and > mark in progress.
+_CHECK_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s*\[([ xX~/>])\]\s*(.+?)\s*$")
+INTERRUPT_DOING = 8           # how many of the last tool calls are kept
+INTERRUPT_PARTIAL_CHARS = 700
+
 _LOCK = threading.RLock()
 
 
@@ -187,7 +211,8 @@ def _blank(session_id):
     return {"session_id": session_id if isinstance(session_id, str) else None,
             "summary": "", "facts": [], "recent": [],
             "turns": 0, "rules_restated_turn": 0, "updated_at": 0.0,
-            "compactions": 0, "restate_due": False}
+            "compactions": 0, "restate_due": False,
+            "tasks": [], "tasks_source": "", "interrupted": None}
 
 
 def get(session_id):
@@ -202,9 +227,11 @@ def get(session_id):
             return _blank(session_id)
         base = _blank(session_id)
         base.update({k: v for k, v in got.items() if k in base})
-        for field in ("facts", "recent"):
+        for field in ("facts", "recent", "tasks"):
             if not isinstance(base.get(field), list):
                 base[field] = []
+        if not isinstance(base.get("interrupted"), dict):
+            base["interrupted"] = None
         return base
     except (OSError, ValueError):
         return _blank(session_id)
@@ -285,6 +312,161 @@ def remember_recent(session_id, text, role="user"):
                        "at": time.time()})
         mem["recent"] = recent[-MAX_RECENT:]
         return _save(mem)
+
+
+# --------------------------------------------------------------------------- #
+# The task list
+# --------------------------------------------------------------------------- #
+
+def parse_checklist(text):
+    """The markdown checklist in `text`, as [{"text", "done", "doing"}].
+
+    Only checkbox lines count: a plain bullet list is prose, and turning every
+    bullet in a reply into a task would make the list say things nobody
+    decided. In order, capped, de-duplicated on the text."""
+    out, seen = [], set()
+    for line in (text or "").splitlines():
+        m = _CHECK_RE.match(line)
+        if not m:
+            continue
+        mark, body = m.group(1), " ".join(m.group(2).split())[:MAX_TASK_CHARS]
+        key = body.lower()
+        if not body or key in seen:
+            continue
+        seen.add(key)
+        out.append({"text": body, "done": mark.lower() == "x",
+                    "doing": mark in "~/>"})
+        if len(out) >= MAX_TASKS:
+            break
+    return out
+
+
+def tasks(session_id):
+    """This conversation's task list, as last read. Never raises."""
+    mem = get(session_id)
+    return [t for t in (mem.get("tasks") or []) if isinstance(t, dict) and t.get("text")]
+
+
+def set_tasks(session_id, items, source=""):
+    with _LOCK:
+        mem = get(session_id)
+        mem["tasks"] = [{"text": str(t.get("text", ""))[:MAX_TASK_CHARS],
+                         "done": bool(t.get("done")), "doing": bool(t.get("doing"))}
+                        for t in (items or []) if isinstance(t, dict) and t.get("text")][:MAX_TASKS]
+        mem["tasks_source"] = str(source or "")[:80]
+        return _save(mem)
+
+
+def update_tasks_from_text(session_id, text, source="reply"):
+    """A checklist in the agent's reply replaces the list -- when it IS a
+    list. One checkbox line is a sentence with a box in it, not a plan."""
+    items = parse_checklist(text)
+    if len(items) < 2:
+        return False
+    return set_tasks(session_id, items, source)
+
+
+def update_tasks_from_project(session_id, project_dir):
+    """The project's own PROGRESS.md (or TODO/PLAN/TASKS.md) wins over the
+    reply: it is the copy the agent was told to keep, and it outlives the
+    reply. Reads the first one that holds a checklist."""
+    if not project_dir:
+        return False
+    for name in TASK_FILES:
+        path = os.path.join(str(project_dir), name)
+        try:
+            if not os.path.isfile(path) or os.path.getsize(path) > TASK_FILE_MAX_BYTES:
+                continue
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                items = parse_checklist(fh.read())
+        except OSError:
+            continue
+        if items:
+            return set_tasks(session_id, items, name)
+    return False
+
+
+def update_tasks(session_id, reply_text="", project_dir=None):
+    """Both sources, file first. Returns which one was used, or ""."""
+    if update_tasks_from_project(session_id, project_dir):
+        return "file"
+    if update_tasks_from_text(session_id, reply_text):
+        return "reply"
+    return ""
+
+
+# --------------------------------------------------------------------------- #
+# Where the work stopped
+# --------------------------------------------------------------------------- #
+
+def note_interrupted(session_id, request="", doing=(), partial="", why="stopped"):
+    """A turn ended before it finished: keep what it was doing, for the next
+    one. `doing` is the turn's last tool calls in order; `partial` the text it
+    had written."""
+    with _LOCK:
+        mem = get(session_id)
+        mem["interrupted"] = {
+            "turn": int(mem.get("turns") or 0),
+            "at": time.time(),
+            "why": str(why or "stopped")[:40],
+            "request": " ".join((request or "").split())[:300],
+            "doing": [" ".join(str(d).split())[:MAX_TASK_CHARS] for d in list(doing or [])[-INTERRUPT_DOING:]],
+            "partial": " ".join((partial or "").split())[-INTERRUPT_PARTIAL_CHARS:],
+        }
+        return _save(mem)
+
+
+def clear_interrupted(session_id):
+    with _LOCK:
+        mem = get(session_id)
+        if not mem.get("interrupted"):
+            return False
+        mem["interrupted"] = None
+        return _save(mem)
+
+
+def interrupted(session_id):
+    mem = get(session_id)
+    return mem.get("interrupted") if isinstance(mem.get("interrupted"), dict) else None
+
+
+def resume_block(session_id, budget_chars=900):
+    """What the next turn is told about a stopped one, and about the list.
+
+    Pinned ahead of everything else the memory hands over: a turn that starts
+    over is the failure this exists to prevent, and it costs more than any
+    fact it might displace. "" when there is nothing to say."""
+    mem = get(session_id)
+    lines = []
+    cut = mem.get("interrupted") if isinstance(mem.get("interrupted"), dict) else None
+    if cut:
+        why = cut.get("why") or "stopped"
+        lines += ["YOUR PREVIOUS TURN WAS %s BEFORE IT FINISHED."
+                  % ("STOPPED BY THE USER" if why == "stopped" else "CUT SHORT (%s)" % why)]
+        if cut.get("request"):
+            lines.append("It was working on: " + cut["request"])
+        if cut.get("doing"):
+            lines.append("Its last actions, in order:")
+            lines += ["  - " + d for d in cut["doing"]]
+        if cut.get("partial"):
+            lines.append("What it had written so far: " + cut["partial"])
+        lines.append("Continue from exactly there: check what is already on disk, "
+                     "do not start over, and do not redo what is done.")
+    items = [t for t in (mem.get("tasks") or []) if isinstance(t, dict) and t.get("text")]
+    if items:
+        done = sum(1 for t in items if t.get("done"))
+        if lines:
+            lines.append("")
+        lines.append("Task list (%d/%d done%s):"
+                     % (done, len(items),
+                        (", from " + mem["tasks_source"]) if mem.get("tasks_source") else ""))
+        for t in items:
+            mark = "x" if t.get("done") else ("~" if t.get("doing") else " ")
+            lines.append("- [%s] %s" % (mark, t["text"]))
+        lines.append("Keep this list updated as you work; mark each item as you finish it.")
+    if not lines:
+        return ""
+    return _clip(lines, max(0, int(budget_chars or 0)), heading_lines=1)
 
 
 def note_turn(session_id):
@@ -537,6 +719,18 @@ def context_block(session_id, budget_chars=2000, project_dir=None,
 
     budget = max(0, int(budget_chars or 0))
     out, spent = [], 0
+
+    # WHERE THE WORK STOPPED, AND THE LIST -- before any fact. See
+    # resume_block: a turn that starts over costs more than anything else the
+    # memory could hand over, so this is spent first and never trimmed for
+    # the others' sake. Up to half the budget; a list that long is itself
+    # the plan.
+    lead = resume_block(session_id, budget_chars=max(300, int(budget * 0.5)))
+    if lead:
+        out.append(lead)
+        spent += len(lead)
+        budget = max(0, budget - spent)
+        spent = 0
 
     if long:
         # Served FIRST and trimmed LAST, so the share is a ceiling against

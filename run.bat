@@ -123,7 +123,7 @@ rem 60-200s of network round-trips before the hub bound its port -- painful, and
 rem it makes the hub look hung. The stamp holds a hash of requirements.txt, so a
 rem pinned-version bump still triggers a real install; nothing else does.
 set "DEPS_OK="
-python -c "import hashlib,os,sys;h=hashlib.sha256(open('requirements.txt','rb').read()).hexdigest();p=os.path.join('.venv','.deps-stamp');ok=os.path.exists(p) and open(p).read().strip()==h;__import__('flask');__import__('requests');__import__('cryptography');sys.exit(0 if ok else 1)" >nul 2>nul
+python -c "import hashlib,os,sys;h=hashlib.sha256(open('requirements.txt','rb').read()).hexdigest();p=os.path.join('.venv','.deps-stamp');ok=os.path.exists(p) and open(p).read().strip()==h;__import__('flask');__import__('requests');__import__('cryptography');__import__('psutil');__import__('PIL');sys.exit(0 if ok else 1)" >nul 2>nul
 if not errorlevel 1 set "DEPS_OK=1"
 if defined DEPS_OK (
   echo [free-llm-hub] Dependencies already installed - skipping pip.
@@ -137,7 +137,12 @@ if defined DEPS_OK (
   echo                This can take a minute on a slow network - progress prints below.
   echo                If nothing moves for several minutes, your network is likely
   echo                blocking it - check a proxy/firewall or try a different network.
-  pip install --timeout 20 -r requirements.txt
+  rem `python -m pip`, never bare `pip`: MEASURED 2026-09-12, bare pip resolved
+  rem to the SYSTEM interpreter's pip on a machine where python was the venv's,
+  rem so the requirements landed outside the venv, the stamp said "installed",
+  rem and the hub ran for weeks without psutil -- every preview of a project
+  rem that ignores PORT failed with "no response" (see workspace.py).
+  python -m pip install --timeout 20 -r requirements.txt
   if not errorlevel 1 python -c "import hashlib,os;h=hashlib.sha256(open('requirements.txt','rb').read()).hexdigest();open(os.path.join('.venv','.deps-stamp'),'w').write(h)" >nul 2>nul
 )
 

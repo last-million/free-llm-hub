@@ -272,3 +272,28 @@ def test_the_planner_can_route_from_that_thread():
         ctx = A.request_ctx._get_current_object().copy()
         list(AC.live_run("s1", producer(), context=ctx))
     assert out == ["/api/agent/sessions/s1/message/stream"]
+
+
+def test_a_slow_follower_misses_nothing_when_the_buffer_wraps_twice(monkeypatch):
+    """Found in review: the offset was re-based against the drops since the
+    LAST read, which is only right when nothing dropped across two reads. A
+    follower slower than the turn skipped events silently."""
+    monkeypatch.setattr(AC, "_LIVE_KEEP", 5)
+    turn = AC._live_begin("s1")
+    for i in range(3):
+        AC._live_put("s1", {"event": "tool", "text": "e%d" % i})
+    gen = AC.follow_turn("s1", wait=0.01)
+    got = [next(gen)["text"] for _ in range(3)]          # e0 e1 e2
+    for i in range(3, 9):                                # six more: e3..e8, e0..e3 drop
+        AC._live_put("s1", {"event": "tool", "text": "e%d" % i})
+    got.append(next(gen)["text"])                         # first of the fresh batch
+    for i in range(9, 13):                                # four more, another wrap
+        AC._live_put("s1", {"event": "tool", "text": "e%d" % i})
+    AC._live_end("s1")
+    got += [e["text"] for e in gen]
+    # e3 fell off before the reader got to it: it is reported, not skipped silently
+    assert "1 lines of this turn were not shown." in got or "e3" in got
+    seen = [g for g in got if g.startswith("e")]
+    assert seen == sorted(seen, key=lambda t: int(t[1:])), "in order"
+    assert seen[-1] == "e12" and "e8" in seen and "e9" in seen
+    assert len(seen) == len(set(seen)), "nothing twice"

@@ -10454,6 +10454,19 @@ def _multi_record(session_id, run):
     except Exception:                                            # noqa: BLE001
         pass
     try:
+        # The list from the project, and the stopping place if it stopped:
+        # which phases finished and which did not is exactly what the next
+        # turn needs to not redo.
+        memory.update_tasks(session_id, report, run.project_dir)
+        if run.state == swarm_windows.DONE:
+            memory.clear_interrupted(session_id)
+        else:
+            doing = ["phase %d %s: %s" % (a.index, a.title, a.state) for a in run.agents]
+            memory.note_interrupted(session_id, request=run.goal, doing=doing,
+                                    partial="", why=run.state)
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
         # MEDIUM memory: the phases' one-line summaries, not their transcripts.
         memory.remember_recent(session_id, report[:600], "agent")
     except Exception:                                            # noqa: BLE001
@@ -13071,6 +13084,34 @@ def api_agent_send_message_stream(session_id):
             yield "event: end\ndata: {}\n\n"
 
     return Response(stream_with_context(gen()), mimetype="text/event-stream", headers=_SSE_HEADERS)
+
+
+@app.route("/api/agent/sessions/<session_id>/plan", methods=["GET"])
+def api_agent_plan(session_id):
+    """The conversation's task list and, if its last turn did not finish,
+    where it stopped -- what the Build page shows above the transcript.
+    Read from the hub's memory, which is refreshed at the end of every turn
+    from the project's PROGRESS.md and the reply's checklist."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    sess = agentic_chat.get_session(session_id) or {}
+    if sess.get("project_dir"):
+        # Fresh: the agent may have edited PROGRESS.md mid-turn, and a page
+        # asking now wants what is on disk now.
+        try:
+            memory.update_tasks_from_project(session_id, sess["project_dir"])
+        except Exception:                                        # noqa: BLE001
+            pass
+    mem = memory.get(session_id)
+    items = [t for t in (mem.get("tasks") or []) if isinstance(t, dict) and t.get("text")]
+    return jsonify({
+        "session_id": session_id,
+        "tasks": items,
+        "done": sum(1 for t in items if t.get("done")),
+        "source": mem.get("tasks_source") or "",
+        "interrupted": mem.get("interrupted") if isinstance(mem.get("interrupted"), dict) else None,
+    })
 
 
 @app.route("/api/agent/sessions/<session_id>/live", methods=["GET"])
