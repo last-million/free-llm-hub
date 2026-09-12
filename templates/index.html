@@ -936,6 +936,18 @@
   .cli-help{font-size:12.5px;line-height:1.5;color:var(--text-faint);margin-bottom:12px}
 
   .cli-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+  .freebuff-card{border:1px solid var(--border);border-radius:var(--radius-sm);
+    background:var(--surface);padding:12px 14px;margin-bottom:12px;display:flex;
+    flex-direction:column;gap:8px}
+  .freebuff-card .fb-top{display:flex;align-items:center;gap:10px;justify-content:space-between}
+  .freebuff-card .fb-name{font-weight:700}
+  .freebuff-card .fb-tag{color:var(--text-dim);font-size:12px;margin-left:8px}
+  .freebuff-card .fb-note{color:var(--text-dim);font-size:12.5px;line-height:1.4}
+  .freebuff-card .fb-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .freebuff-card .fb-msg{color:var(--text-dim);font-size:12px}
+  .freebuff-card .fb-pill{font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;
+    border:1px solid var(--border);color:var(--text-dim);white-space:nowrap}
+  .freebuff-card .fb-pill.on{color:var(--accent);border-color:var(--accent)}
   .cli-card{
     background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);
     padding:15px;display:flex;flex-direction:column;gap:12px;min-width:0;
@@ -3401,6 +3413,26 @@
       <span class="prov-mode-help" id="prov-mode-help"></span>
     </div>
     <div class="key-warn prov-warn">Using several keys for the same provider to get around free limits may break their terms and can get your accounts banned. Use your own keys responsibly.</div>
+    <!-- Freebuff: NOT a routed provider (it has no API and its free models
+         answer only its own CLI). The hub installs it and opens it beside the
+         hub, in its own window; the ads stay in that window. Shown here so it
+         is findable without opening a Build session. -->
+    <div class="freebuff-card" id="freebuff-card" hidden>
+      <div class="fb-top">
+        <div class="fb-id">
+          <span class="fb-name">Freebuff</span>
+          <span class="fb-tag">Codebuff&rsquo;s free coding agent &mdash; runs beside the hub</span>
+        </div>
+        <span class="fb-pill" id="fb-pill">&hellip;</span>
+      </div>
+      <div class="fb-note">A terminal agent, not a routed model: the hub opens it in its own window,
+        signed in with your account, in a project folder. It is not proxied through the hub and its ads stay in its window.</div>
+      <div class="fb-actions">
+        <button type="button" class="btn sm" id="fb-install" hidden>Install Freebuff</button>
+        <button type="button" class="btn sm primary" id="fb-open" hidden>Open Freebuff&hellip;</button>
+        <span class="fb-msg" id="fb-msg"></span>
+      </div>
+    </div>
     <div class="grid" id="grid" aria-live="polite">
       <div class="skel-grid">
         <div class="skel skel-card"></div>
@@ -5061,6 +5093,50 @@
         });
       })(btns[i]);
     }
+  }
+
+  /* Freebuff card on the Providers page. Install + open, and honest about
+     what it is: not a provider routed through the hub. Open makes a fresh
+     project folder (or reuses the one you name) and launches Freebuff there
+     in its own window. */
+  function initFreebuffCard(){
+    var card = $('#freebuff-card');
+    if (!card || card.dataset.ready) return;
+    card.dataset.ready = '1';
+    var pill = $('#fb-pill'), install = $('#fb-install'), open = $('#fb-open'), msg = $('#fb-msg');
+    function refresh(){
+      return api('/api/freebuff/status').then(function(st){
+        card.hidden = false;
+        var ok = st && st.installed;
+        if (pill){ pill.textContent = ok ? 'Installed' : (st && st.npm ? 'Not installed' : 'Needs Node.js'); pill.classList.toggle('on', !!ok); }
+        if (install) install.hidden = ok || !(st && st.npm);
+        if (open) open.hidden = !ok;
+        if (msg && st && !st.npm) msg.textContent = 'Install Node.js/npm first (nodejs.org).';
+      }).catch(function(){ /* leave the card hidden if the route is unavailable */ });
+    }
+    if (install) install.addEventListener('click', function(){
+      install.disabled = true; if (msg) msg.textContent = 'Installing once — this can take a minute…';
+      api('/api/freebuff/install', { method: 'POST', body: {} })
+        .then(function(){ if (msg) msg.textContent = 'Installed.'; return refresh(); })
+        .catch(function(e){ if (msg) msg.textContent = 'Install failed: ' + (e.message || e); })
+        .then(function(){ install.disabled = false; });
+    });
+    if (open) open.addEventListener('click', function(){
+      open.disabled = true; if (msg) msg.textContent = 'Preparing a project folder…';
+      /* A fresh project folder to run in, so Freebuff always has somewhere to
+         work even from this page (no open session here). */
+      api('/api/agent/new-project', { method: 'POST' })
+        .then(function(r){
+          var dir = r && r.path;
+          if (!dir) throw new Error('could not make a project folder');
+          if (msg) msg.textContent = 'Opening in ' + dir;
+          return api('/api/freebuff/open', { method: 'POST', body: { project_dir: dir } });
+        })
+        .then(function(){ if (msg) msg.textContent = 'Freebuff opened in its own window — sign in there the first time.'; })
+        .catch(function(e){ if (msg) msg.textContent = 'Could not open: ' + (e.message || e); })
+        .then(function(){ open.disabled = false; });
+    });
+    refresh();
   }
 
   function loadProviders(){
@@ -12187,6 +12263,7 @@
   initPromptEnhance();
     initSocialWebSearch();
     initSdModels();
+    try { initFreebuffCard(); } catch (e) {}
   initUpdateCheck();
   initThemeToggle();
   initSettingsDrawer();

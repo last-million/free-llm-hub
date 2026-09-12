@@ -162,3 +162,26 @@ def test_the_build_page_has_the_button():
     assert "/api/freebuff/open" in body
     assert "cxAgentProjectDir" in body
     assert "initAgentFreebuff();" in SRC
+
+
+# --------------------------------------------------------------------------- #
+# The Providers page card
+# --------------------------------------------------------------------------- #
+
+def test_the_providers_page_has_a_freebuff_card():
+    assert 'id="freebuff-card"' in SRC
+    assert 'id="fb-install"' in SRC and 'id="fb-open"' in SRC
+    body = SRC[SRC.index("function initFreebuffCard()"):]
+    body = body[:body.index("function loadProviders()")]
+    assert "/api/freebuff/status" in body
+    assert "/api/freebuff/install" in body
+    assert "/api/freebuff/open" in body
+    assert "/api/agent/new-project" in body, "the card makes a folder to run in"
+    assert "initFreebuffCard();" in SRC
+
+
+def test_the_card_says_it_is_not_a_routed_provider():
+    i = SRC.index('id="freebuff-card"')
+    around = SRC[i - 400:i + 700]
+    assert "not proxied through the hub" in around or "not a routed" in around
+    assert "ads stay in" in around
