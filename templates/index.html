@@ -3054,6 +3054,8 @@
             </select>
             <button class="btn sm ghost" id="agent-models" type="button"
                     title="Choose which models THIS conversation may use, and which belong to its modes (coding, vision, ...). Opens Settings with this conversation selected.">Models&hellip;</button>
+            <button class="btn sm ghost" id="agent-freebuff" type="button"
+                    title="Open Freebuff (Codebuff's free coding agent) in its own window, in this project folder. It runs beside the hub, signed in with your account; it is not routed through the hub.">Freebuff&hellip;</button>
             <button class="btn sm ghost" id="agent-checkpoint" type="button" title="Mark this point in the transcript. To put the FILES back too, use Restore &amp; rerun on one of your own messages.">Bookmark</button>
             <button class="btn sm ghost" id="agent-running" type="button"
                   title="Conversations and previews currently open">Running <span id="agent-running-n">0</span></button>
@@ -8916,6 +8918,37 @@
       });
     }
 
+    /* Freebuff runs BESIDE the hub, in its own window, in this project folder.
+       Not a provider routed through the hub -- see /api/freebuff/open. First
+       click installs it (a one-off npm install + a ~48MB binary download in
+       its own window), later clicks just open it. */
+    function initAgentFreebuff(){
+      var btn = $('#agent-freebuff');
+      if (!btn) return;
+      btn.addEventListener('click', function(){
+        var dir = (window.cxAgentProjectDir && window.cxAgentProjectDir()) || curProjectDir;
+        if (!dir){ toast('Open or create a session first — Freebuff works in its folder', true); return; }
+        btn.disabled = true;
+        function open(){
+          return api('/api/freebuff/open', { method: 'POST', body: { project_dir: dir } })
+            .then(function(){ toast('Freebuff opened in its own window — sign in there the first time'); })
+            .catch(function(e){
+              if (e && /not_installed/.test(e.message || '')) throw e;   // handled by caller
+              toast('Freebuff: ' + (e.message || e), true);
+            });
+        }
+        api('/api/freebuff/status').then(function(st){
+          if (st && st.installed) return open();
+          if (st && !st.npm){ toast('Freebuff needs Node.js/npm installed first', true); return; }
+          toast('Installing Freebuff once — this can take a minute…');
+          return api('/api/freebuff/install', { method: 'POST', body: {} })
+            .then(function(){ return open(); })
+            .catch(function(e){ toast('Freebuff install: ' + (e.message || e), true); });
+        }).catch(function(e){ toast('Freebuff: ' + (e.message || e), true); })
+          .then(function(){ btn.disabled = false; });
+      });
+    }
+
     function initAgentMode(){
       var sel = $('#agent-mode');
       if (!sel) return;
@@ -10414,6 +10447,7 @@
                              that took the whole dashboard down earlier. */
     initAgentMode();
     initAgentModelsLink();
+    initAgentFreebuff();
     initPlanStrip();
     loadAgentMode();
     initFolderPicker();

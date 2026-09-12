@@ -11345,6 +11345,169 @@ def api_subscriptions_update():
     return jsonify(_sub_payload())
 
 
+# --------------------------------------------------------------------------- #
+# Freebuff -- the free Codebuff coding agent, launched BESIDE the hub.
+#
+# Asked for: "connect freebuff from the hub ... run in background ... use their
+# CLI." Freebuff is a real terminal agent (a TUI), NOT an OpenAI-compatible
+# endpoint: its free models answer only requests that look byte-for-byte like
+# its own CLI (system prompt, publisher, one-model session -- see
+# common/src/constants/free-agents.ts), and the upstream 403s a direct call
+# with "may get your account banned". So the hub does NOT proxy it, strip its
+# ads, or rotate accounts against its gate -- that is circumventing its access
+# control, the one line this hub holds (the same reason the Zen fix forwarded
+# OpenCode's real header instead of faking one).
+#
+# What the hub CAN do, and does here: install Freebuff into its own isolated
+# npm prefix + HOME (so its login never touches anything else), and OPEN it in
+# its own window, signed in with your account, in the project folder a Build
+# session is already using. It runs alongside the hub -- the hub does not block
+# on it and keeps serving -- but it needs its own console: measured, the TUI
+# exits 139 without a real terminal, so "fully headless" is not possible and is
+# not pretended. The ads stay in Freebuff's own window.
+# --------------------------------------------------------------------------- #
+_FREEBUFF_PKG = "freebuff"
+_FREEBUFF_BIN = "freebuff"
+
+
+def _freebuff_root():
+    return os.path.join(_isolated_root(), "freebuff")
+
+
+def _freebuff_install_dir():
+    return os.path.join(_freebuff_root(), "install")
+
+
+def _freebuff_home():
+    """A HOME of its own, so Freebuff's login/config (~/.config/manicode, its
+    downloaded binary) is separate from the user's real profile."""
+    return os.path.join(_freebuff_root(), "home")
+
+
+def _freebuff_bin():
+    return _isolated_bin_path("freebuff", _FREEBUFF_BIN)
+
+
+def _freebuff_env():
+    """Child env: an isolated HOME, and every hub-pointing override stripped so
+    Freebuff can never be redirected into this hub."""
+    env = dict(os.environ)
+    for k in list(env.keys()):
+        if _points_at_hub(env.get(k)):
+            env.pop(k, None)
+    home = _freebuff_home()
+    try:
+        os.makedirs(home, exist_ok=True)
+    except OSError:
+        pass
+    env["HOME"] = home
+    env["USERPROFILE"] = home
+    env["XDG_CONFIG_HOME"] = os.path.join(home, ".config")
+    return env
+
+
+@app.route("/api/freebuff/status", methods=["GET"])
+def api_freebuff_status():
+    """Whether Freebuff is installed, and where. Pure read; never raises."""
+    try:
+        bin_path = _freebuff_bin()
+    except Exception:                                            # noqa: BLE001
+        bin_path = None
+    have_npm = bool(shutil.which("npm"))
+    return jsonify({
+        "installed": bool(bin_path),
+        "bin_path": _short(bin_path) if bin_path else None,
+        "npm": have_npm,
+        # Said plainly on the card, not buried: this is a separate tool run
+        # beside the hub, not a provider routed through it.
+        "note": ("Freebuff is Codebuff's free coding agent. The hub installs it "
+                 "and opens it in its own window (signed in with your account, "
+                 "in the project folder); it is not routed through the hub and "
+                 "its ads stay in its own window."),
+    })
+
+
+@app.route("/api/freebuff/install", methods=["POST"])
+def api_freebuff_install():
+    """`npm install -g freebuff --prefix <isolated>` -- an admin click, a real
+    subprocess the user authorized. Every failure is surfaced, never swallowed.
+    Requires the control token like every other write (the before-request guard
+    already enforces it)."""
+    npm = shutil.which("npm")
+    if not npm:
+        return jsonify({"ok": False, "error":
+                        "npm is not on PATH. Install Node.js first (nodejs.org), then retry."}), 400
+    install_dir = _freebuff_install_dir()
+    try:
+        os.makedirs(install_dir, exist_ok=True)
+        os.makedirs(_freebuff_home(), exist_ok=True)
+    except OSError as exc:
+        return jsonify({"ok": False, "error": "could not prepare the install dir: %s"
+                                              % exc.__class__.__name__}), 500
+    argv = _sub_launcher(npm) + ["install", "-g", _FREEBUFF_PKG, "--prefix", install_dir]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=_ISOLATED_INSTALL_TIMEOUT,
+                              cwd=tempfile.gettempdir(), creationflags=_CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "npm install timed out after %ds."
+                                              % _ISOLATED_INSTALL_TIMEOUT}), 504
+    except (OSError, ValueError) as exc:
+        return jsonify({"ok": False, "error": "npm failed to start: %s" % exc.__class__.__name__}), 502
+    if proc.returncode != 0:
+        err = _sanitize(((proc.stderr or "") + "\n" + (proc.stdout or "")).strip(), 2000)
+        return jsonify({"ok": False, "error": "npm install exited %d: %s"
+                                              % (proc.returncode, err or "no detail")}), 502
+    bin_path = _freebuff_bin()
+    if not bin_path:
+        return jsonify({"ok": False, "error":
+                        "npm reported success but no 'freebuff' binary was found."}), 502
+    return jsonify({"ok": True, "bin_path": _short(bin_path)})
+
+
+@app.route("/api/freebuff/open", methods=["POST"])
+def api_freebuff_open():
+    """Open Freebuff in its OWN window, in a project folder. Returns at once --
+    the hub does not wait on it (that is the "runs in the background beside the
+    hub" the request asked for; a TUI cannot run with no window at all).
+
+    On first launch Freebuff downloads its ~48MB binary and, if not signed in,
+    walks its own login -- both happen in that window, where the user can see
+    and answer them. The hub never sees the credentials."""
+    body = request.get_json(force=True, silent=True) or {}
+    project_dir = str(body.get("project_dir") or "").strip()
+    if not project_dir or not os.path.isdir(project_dir):
+        return jsonify({"ok": False, "error": "project_dir must be an existing folder"}), 400
+    bin_path = _freebuff_bin()
+    if not bin_path:
+        return jsonify({"ok": False, "error": "Freebuff is not installed yet.",
+                        "code": "not_installed"}), 400
+    argv = _sub_launcher(bin_path) + ["--cwd", project_dir]
+    try:
+        if os.name == "nt":
+            # A real, visible console: the TUI owns the terminal, and login is
+            # interactive. CREATE_NEW_CONSOLE, exactly as the CLI-login flow
+            # does (launch_isolated_login) -- never CREATE_NO_WINDOW, which is
+            # what makes the TUI crash.
+            subprocess.Popen(argv, cwd=project_dir, env=_freebuff_env(),
+                             creationflags=subprocess.CREATE_NEW_CONSOLE)
+        else:
+            term_argv = None
+            for term, flag in (("x-terminal-emulator", "-e"), ("gnome-terminal", "--"),
+                               ("konsole", "-e"), ("xterm", "-e")):
+                if shutil.which(term):
+                    term_argv = [term, flag] + argv
+                    break
+            if term_argv is None:
+                return jsonify({"ok": False, "error":
+                                "Could not find a terminal to open Freebuff in."}), 500
+            subprocess.Popen(term_argv, cwd=project_dir, env=_freebuff_env())
+    except Exception as exc:                                     # noqa: BLE001
+        return jsonify({"ok": False, "error": "could not open Freebuff: %s"
+                                              % _sanitize(str(exc), 200)}), 500
+    return jsonify({"ok": True})
+
+
 @app.route("/api/subscriptions/<pid>/install-isolated", methods=["POST"])
 def api_subscriptions_install_isolated(pid):
     """Install an ISOLATED copy of a sub provider's CLI via `npm install -g

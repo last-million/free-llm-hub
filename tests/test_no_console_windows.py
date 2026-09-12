@@ -84,26 +84,33 @@ def test_the_flag_degrades_to_zero_off_windows():
 # Every launch site carries it
 # --------------------------------------------------------------------------- #
 
-def _login_span(src):
-    """launch_isolated_login is the one deliberately VISIBLE launcher, on both
-    platforms: CREATE_NEW_CONSOLE on Windows, a real terminal emulator on
-    POSIX. Exempting it by function rather than by 'mentions CREATE_NEW_CONSOLE'
-    is what covers the POSIX branch too."""
-    i = src.find("def launch_isolated_login(")
-    if i == -1:
-        return (-1, -1)
-    j = src.find("\ndef ", i + 1)
-    return (i, j if j != -1 else len(src))
+# The deliberately VISIBLE launchers, on both platforms (CREATE_NEW_CONSOLE on
+# Windows, a real terminal emulator on POSIX): a login flow the user types into
+# (launch_isolated_login) and Freebuff, a TUI that OWNS its terminal and
+# crashes without one (api_freebuff_open). Exempting them by function name
+# covers the POSIX branch too.
+_VISIBLE_LAUNCHERS = ("def launch_isolated_login(", "def api_freebuff_open(")
+
+
+def _visible_spans(src):
+    spans = []
+    for marker in _VISIBLE_LAUNCHERS:
+        i = src.find(marker)
+        if i == -1:
+            continue
+        j = src.find("\ndef ", i + 1)
+        spans.append((i, j if j != -1 else len(src)))
+    return spans
 
 
 @pytest.mark.parametrize("name", sorted(SOURCES))
 def test_every_subprocess_call_suppresses_its_console(name):
     src = SOURCES[name]
-    lo, hi = _login_span(src)
+    spans = _visible_spans(src)
     missing = []
     for pos, call in _launch_calls(src):
-        if lo <= pos < hi:
-            continue                      # the deliberate visible window
+        if any(lo <= pos < hi for lo, hi in spans):
+            continue                      # a deliberate visible window
         if "_NO_WINDOW" in call or "_tree_popen_kwargs()" in call:
             continue
         line = src.count("\n", 0, pos) + 1
