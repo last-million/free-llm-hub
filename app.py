@@ -842,6 +842,48 @@ _CODEX_LEVELS = [
 ]
 
 
+# The effort tiers a category id can be COMBINED with in a single selection.
+# Codex has a two-screen picker (model, then reasoning level) so it makes the
+# two choices separately -- but opencode, and any plain openai-compatible
+# client, has only a flat model list and no /effort command. The only way such
+# a CLI can express "this KIND of model AND this much effort" in one pick is to
+# fold both into one id: "<category>-<effort>" (also "<category>/<effort>"),
+# e.g. "coding-swarm" = the coding pool, run as a swarm.
+_EFFORT_SUFFIXES = ("auto", "best", "max", "swarm", "multi")
+
+
+def _split_category_effort(model):
+    """('coding', 'swarm') for 'coding-swarm'/'coding/swarm'; (None, <model>) else.
+
+    The head must be a real CATEGORY (in _mode_keys(), which deliberately omits
+    'swarm' and the crew ids) and the tail a real effort tier -- so the crew
+    pipeline ids 'crew-code'/'crew-research' are never mistaken for a compound,
+    because 'crew' is not a category. rpartition on the LAST separator, so a
+    hyphenated category name would still split on its trailing effort only."""
+    m = (model or "").strip().lower()
+    for sep in ("-", "/"):
+        head, found, tail = m.rpartition(sep)
+        if found and head in _mode_keys() and tail in _EFFORT_SUFFIXES:
+            return head, tail
+    return None, m
+
+
+def _apply_category_effort(body):
+    """If body's model is a '<category>-<effort>' compound, set the mode on `g`
+    and rewrite the model to the bare effort tier -- so the rest of routing sees
+    exactly what it sees for a plain 'swarm'/'multi'/'best' with an active mode.
+    Returns a body to route with; the caller's dict is never mutated (a retry
+    pass must see the same request the first attempt did)."""
+    cat, eff = _split_category_effort(body.get("model"))
+    if not cat:
+        return body
+    try:
+        g.model_mode = cat
+    except Exception:                                            # noqa: BLE001
+        pass
+    return dict(body, model=eff)
+
+
 def _mode_and_effort(body):
     """Split codex's (model, reasoning level) pair into (mode, effort).
 
@@ -856,6 +898,11 @@ def _mode_and_effort(body):
     both a category name AND the fan-out pipeline's id, while _mode_keys()
     deliberately does not offer it. Reading it as a mode here would turn every
     swarm request into a plain one."""
+    # A compound "<category>-<effort>" typed as the model wins first: it sets the
+    # mode and rewrites the model to the effort tier, and the code below then
+    # sees a plain effort id (nothing more to do). Lets codex users type the same
+    # combined ids an opencode picker offers.
+    body = _apply_category_effort(body)
     model = (body.get("model") or "").strip().lower()
     if model not in _mode_keys() and model != MODE_ALL:
         return body                       # an effort id, a pin, or nothing
@@ -19664,6 +19711,12 @@ def _chat_completions_uncached(body):
     except ValueError as exc:
         return _openai_error(str(exc), 400)
     has_images = image_count > 0
+    # A "<category>-<effort>" compound id (e.g. "coding-swarm") sets the mode and
+    # becomes a plain effort tier. This is the one channel a flat-list CLI has
+    # for choosing BOTH axes at once; done here, before the swarm dispatch, so
+    # "coding-swarm"/"coding-multi" reach the pipeline exactly as bare
+    # "swarm"/"multi" do, but with the pool cut to the category.
+    body = _apply_category_effort(body)
     # SWARM: an explicitly-selected virtual model, never an automatic mode — a
     # multi-pass pipeline applied behind a client's back would corrupt the agent
     # loops Codex/Claude Code run (see swarm.py's header). Tool-carrying turns
@@ -21191,6 +21244,10 @@ def v1_messages():
     if not oai_messages:
         return _anthropic_error("invalid_request_error", "No messages to send.", 400)
     has_images = image_count > 0
+    # A "<category>-<effort>" compound (e.g. from ANTHROPIC_MODEL=coding-swarm)
+    # sets the mode and becomes a plain effort tier, before the swarm dispatch
+    # below reads the id -- same as the other two protocols.
+    body = _apply_category_effort(body)
     # Claude Code sends model 'claude-*' + a big system/tools payload -> orchestrate
     # by difficulty AND request size (skip small-TPM providers for large requests).
     tools = _anthropic_tools_to_openai(body.get("tools"))

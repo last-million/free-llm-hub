@@ -107,11 +107,14 @@ def test_the_models_advertise_that_they_can_call_tools():
 
 
 def test_the_vision_mode_accepts_attachments():
-    """Every other mode routes text. Declaring attachment on all of them would
-    invite opencode to send an image into a chain that cannot take one."""
+    """Only the vision mode -- the bare "vision" id and its "vision-<effort>"
+    compounds -- routes to models that can take an image. Declaring attachment
+    on any other mode would invite opencode to send an image into a chain that
+    cannot take one."""
     if "vision" in MODELS:
-        assert MODELS["vision"].get("attachment") is True
-        others = [m for m in MODELS if m != "vision"]
+        vision = [m for m in MODELS if m == "vision" or m.startswith("vision-")]
+        assert all(MODELS[m].get("attachment") is True for m in vision)
+        others = [m for m in MODELS if m not in vision]
         assert all(MODELS[m].get("attachment") is False for m in others)
 
 

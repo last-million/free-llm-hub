@@ -1011,22 +1011,41 @@ def _apply_codex_hub_fallback(config_home, session_id=None):
 # to select which mode, and /effort for auto, best, swarm". opencode has no
 # /effort command and the hub cannot add one -- slash commands are the CLI's
 # own UI, and the model list is the only channel the hub has. So the split is
-# made where it CAN be made: in the names, so one picker still reads as two
-# groups whichever order opencode sorts them in.
+# made where it CAN be made: in the names, so one picker still reads as groups
+# whichever order opencode sorts them in.
 #
-#   EFFORT  how hard to try      auto / best / swarm
-#   MODE    which kind of model  coding, reasoning, uncensored, ...
+#   EFFORT    how hard to try      auto / best / max / swarm / multi
+#   MODE      which kind of model  coding, reasoning, uncensored, ...
+#   MODE+EFF  both at once         coding-max, coding-swarm, coding-multi, ...
+#
+# The third group is why the picker is no longer tiny. codex makes the two
+# choices on two screens; opencode has one flat list and can pick only ONE id,
+# so "the coding models AND run them as a swarm" has to BE one id --
+# "coding-swarm". _split_category_effort in app.py routes it. opencode's model
+# picker is a fuzzy finder, so a longer list stays usable: typing "coding swarm"
+# filters straight to it. REQUESTED 2026-09-13: "in opencode I want to select
+# both the category of models and also the effort mode".
 #
 # crew, crew-code, crew-research, crew-write, crew-design, team and plan are
 # deliberately NOT here. They are multi-stage pipelines aimed at the dashboard,
-# and seven of them in a picker of ten is noise in front of the choices a CLI
-# actually makes. The hub still answers to them, so typing one by hand still
-# works -- they are only absent from the list.
+# and putting all seven in front of the choices a CLI actually makes is noise.
+# The hub still answers to them, so typing one by hand still works -- they are
+# only absent from the list.
 _OPENCODE_EFFORT = {
     "auto":  "effort: auto -- orchestrated, best free model per task",
     "best":  "effort: max -- strongest free models only, never the cheap tier",
+    "max":   "effort: max -- strongest free models only, never the cheap tier",
     "swarm": "effort: swarm -- several models per turn, best answer wins",
+    "multi": "effort: multi sessions -- several agents work the task in phases",
 }
+
+# The heavier tiers a category can be paired with (auto is the bare category
+# id, so it makes no compound). The value is the tail of the picker label.
+_OPENCODE_COMPOUND_TIERS = (
+    ("max", "strongest only"),
+    ("swarm", "several per turn"),
+    ("multi", "worked in phases"),
+)
 
 
 # How much output to reserve out of the window above. opencode computes its
@@ -1078,6 +1097,18 @@ def _opencode_hub_models():
         # cannot serve it.
         out.setdefault(key, spec("mode: %s -- %s only" % (key, label.lower()),
                                  attachment=(key == "vision")))
+        # ...and the same category combined with each heavier effort, so the one
+        # pick a flat-list CLI makes can carry BOTH axes ("coding + swarm").
+        # Skip any label that is itself an effort id (model_categories lists
+        # "swarm" as a category, but routing's category set does not, so a
+        # "swarm-swarm" compound would not route -- it must not be offered).
+        if key in _OPENCODE_EFFORT:
+            continue
+        for tier, tail in _OPENCODE_COMPOUND_TIERS:
+            out.setdefault("%s-%s" % (key, tier),
+                           spec("%s + %s -- %s models, %s" % (
+                               key, tier, label.lower(), tail),
+                                attachment=(key == "vision")))
     return out
 
 

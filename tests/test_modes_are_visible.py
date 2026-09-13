@@ -136,7 +136,7 @@ def test_the_effort_tiers_are_labelled_as_effort():
     model list is the only channel it has -- so the split is made in the names,
     which is where it CAN be made."""
     m = AC._opencode_hub_models()
-    for k in ("auto", "best", "swarm"):
+    for k in ("auto", "best", "max", "swarm", "multi"):
         assert m[k]["name"].startswith("effort:"), k
 
 
@@ -159,8 +159,32 @@ def test_the_pipelines_are_left_out_of_the_picker():
     assert k in A._virtual_model_ids(), "the hub must still SERVE them"
 
 
-def test_the_picker_stays_small():
-    assert len(AC._opencode_hub_models()) <= 12
+def test_the_picker_offers_both_axes_and_every_id_routes():
+    """opencode has one flat list and no /effort command, so "pick the coding
+    models AND run them as a swarm" has to be ONE id -- "coding-swarm". The
+    picker is bigger than the old effort-only list on purpose (REQUESTED
+    2026-09-13: "in opencode I want to select both the category and the effort
+    mode"), but it stays bounded and every id it lists must actually route."""
+    m = AC._opencode_hub_models()
+    # A compound per routable category x heavier tier is present...
+    assert "coding-swarm" in m and "coding-multi" in m and "seo-max" in m
+    assert m["coding-swarm"]["name"].startswith("coding + swarm")
+    # ...and it splits back to (category, effort) in the router.
+    assert A._split_category_effort("coding-swarm") == ("coding", "swarm")
+    # No id that would fail to route: swarm is not a routable category, so no
+    # "swarm-*" compound; the crew pipelines are not offered at all.
+    assert not any(k.startswith("swarm-") for k in m), "swarm-* would not route"
+    for k in ("crew-code", "team", "plan"):
+        assert k not in m
+    # Every listed id resolves to something routable: a bare effort, a category,
+    # or a compound that splits into both.
+    routable = set(AC._OPENCODE_EFFORT)
+    for k in m:
+        cat, _eff = A._split_category_effort(k)
+        assert cat is not None or k in routable or A._valid_mode(k), k
+    # Bounded: efforts + categories + 3 compounds per non-effort category, no
+    # combinatorial blow-up.
+    assert len(m) <= 64
 
 
 def test_both_writers_cover_the_modes():

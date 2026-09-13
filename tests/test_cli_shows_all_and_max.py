@@ -71,6 +71,51 @@ def test_the_openai_surface_lists_multi(client):
     assert "multi" in ids
 
 
+# --------------------------------------------------------------------------- #
+# Both axes in one id -- "<category>-<effort>" -- for a flat-list CLI (opencode)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("mid,cat,eff", [
+    ("coding-swarm", "coding", "swarm"),
+    ("coding/multi", "coding", "multi"),
+    ("seo-max", "seo", "max"),
+    ("uncensored-swarm", "uncensored", "swarm"),
+])
+def test_a_compound_id_splits_into_category_and_effort(mid, cat, eff):
+    assert A._split_category_effort(mid) == (cat, eff)
+
+
+@pytest.mark.parametrize("mid", ["crew-code", "crew-research", "swarm-swarm",
+                                 "coding", "auto", "groq/qwen-3"])
+def test_a_non_compound_id_is_left_whole(mid):
+    """A crew pipeline id, a bare category, an effort, or a pinned '<pid>/<model>'
+    must never be mistaken for a category+effort compound."""
+    assert A._split_category_effort(mid)[0] is None
+
+
+def test_applying_a_compound_sets_the_mode_and_rewrites_the_model():
+    with A.app.test_request_context("/v1/chat/completions"):
+        out = A._apply_category_effort({"model": "coding-swarm"})
+        assert out["model"] == "swarm"          # the effort routing keys off
+        assert A._active_mode() == "coding"     # the pool is cut to the category
+
+
+def test_a_compound_becomes_a_swarm_turn_restricted_to_the_category():
+    """coding-swarm must reach the swarm dispatch (via the rewritten 'swarm'
+    id) with coding as the active mode -- the whole point of the compound."""
+    with A.app.test_request_context("/v1/chat/completions"):
+        out = A._apply_category_effort({"model": "coding-swarm"})
+        assert A._is_swarm_model(out["model"])
+        assert A._active_mode() == "coding"
+
+
+def test_the_original_body_is_not_mutated_by_the_compound_split():
+    with A.app.test_request_context("/v1/chat/completions"):
+        body = {"model": "seo-max", "messages": []}
+        A._apply_category_effort(body)
+        assert body["model"] == "seo-max"
+
+
 def test_all_and_max_are_the_words_people_type():
     assert "all" in A._virtual_model_ids() and "max" in A._virtual_model_ids()
 
