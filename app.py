@@ -12170,6 +12170,53 @@ _ALLOWED_IDENTITY_SETTING = "allowed_identities"
 # {category key: {"add": [identity], "remove": [identity]}} -- see _mode_allows.
 _CATEGORY_OVERRIDE_SETTING = "model_category_overrides"
 
+# The blocklist this hub SHIPS, so a fresh install is not stuck routing to
+# families the owner already found broken across every provider before anyone
+# edits a thing. REQUESTED 2026-09-13: "blacklist them even in the repo so all
+# users will have them in blacklist too".
+#
+# By IDENTITY, never by 'pid/model': the owner's own list also held ephemeral
+# per-provider ids ("g4f/srv_..." that a g4f relay minted for one session) that
+# mean nothing on another machine, so those are deliberately left out. An
+# identity ("gpt-oss", "nemotron-3-super") is what routing already matches on
+# and it holds for every provider that serves that model.
+#
+# Delivered by SEEDING each install's blocked_identities setting once (see
+# _seed_default_blocks), NOT by unioning at read time: seeding keeps every
+# entry editable, so a user who wants one back can untick it in the blacklist
+# UI and it stays off. A read-time union would silently re-add it and the
+# untick would look broken.
+_DEFAULT_BLOCKED_IDENTITIES = frozenset({
+    "dots-3-note-preview", "dots3-note-prev",
+    "gpt-oss", "gpt-oss-20b", "gpt-oss-120b",
+    "inkling", "inkling-small",
+    "kilocode-laguna-s-2.1", "laguna-s-2.1", "laguna-xs-2.1",
+    "ling-3.0-flash-fin", "ling-3.0-flash-sante", "ling-3.0-flash-vl",
+    "ling-3.0-tiny",
+    "llama-3.1-nemotron-51b-instruct", "llama-3.1-nemotron-70b-instruct",
+    "llama-3.1-nemotron-ultra-253b-v1",
+    "mimo-v2.5",
+    "mistral-nemo-12b-instruct", "mistral-nemo-instruct-2407",
+    "mistral-nemo-minitron-8b-8k-instruct", "mistral-nemotron",
+    "nemotron-3-nano", "nemotron-3-nano-omni-30b-a3b-reasoning",
+    "nemotron-3-super", "nemotron-3-ultra",
+    "nemotron-3.5-content-safety",
+    "nemotron-3.5-lightning-30b", "nemotron-3.5-lightning-30b-a3b",
+    "nemotron-4-340b-instruct", "nemotron-4-340b-reward",
+    "nemotron-nano-3-30b-a3b", "nemotron-parse", "nemotron-parse-2.0",
+    "nex-n2.5-mini", "nex-n2.5-pro",
+    "north-mini-code",
+    "sauerkrautlm-nemo-12b-instruct",
+})
+# Which shipped identities this install has ALREADY been offered. Seeding adds
+# only entries NOT in this snapshot, then records the whole shipped set here --
+# so a family the user later unticks is never re-added (it is already in the
+# snapshot), while a family ADDED to the shipped set in a later release is still
+# delivered on the next boot (it is not yet in the snapshot). Tracking the set,
+# not a version number, is what lets "deliver new defaults" and "respect an
+# untick" both hold at once.
+_DEFAULT_BLOCKS_SEEDED_SETTING = "default_blocks_seeded_ids"
+
 
 def _blocked_models():
     """The user's off-list, as a set of 'pid/model' ids."""
@@ -12480,6 +12527,40 @@ def _toggle_identity(setting, identity, on):
     except Exception:                                            # noqa: BLE001
         pass
     return cur
+
+
+def _seed_default_blocks():
+    """Add any shipped default identity this install has not been offered yet to
+    its blocked_identities setting, then record the whole shipped set as offered.
+
+    Adds ONLY families not already in the seeded snapshot, so:
+      * a fresh install gets every shipped default;
+      * a family the user later unticks is NOT re-added on the next boot (it is
+        in the snapshot already);
+      * a family ADDED to the shipped set in a later release IS delivered (it is
+        not in the snapshot yet).
+    The defaults land in the editable setting, so the blacklist UI can untick
+    any of them. Returns how many were newly added. Never raises -- a blocklist
+    seed must not stop the hub booting."""
+    try:
+        already = {str(x).strip().lower()
+                   for x in (config.get_setting(_DEFAULT_BLOCKS_SEEDED_SETTING, []) or [])
+                   if str(x).strip()}
+    except Exception:                                            # noqa: BLE001
+        already = set()
+    fresh = {i for i in _DEFAULT_BLOCKED_IDENTITIES if i not in already}
+    if not fresh:
+        return 0
+    cur = _identity_set(_BLOCKED_IDENTITY_SETTING)
+    to_add = {i for i in fresh if i not in cur}
+    try:
+        if to_add:
+            config.set_setting(_BLOCKED_IDENTITY_SETTING, sorted(cur | to_add))
+        config.set_setting(_DEFAULT_BLOCKS_SEEDED_SETTING,
+                           sorted(already | set(_DEFAULT_BLOCKED_IDENTITIES)))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return len(to_add)
 
 
 def _category_overrides():
@@ -23092,6 +23173,7 @@ if __name__ == "__main__":
     _mark_runtime_started()
     _bootstrap_no_key_providers()  # no-key providers have nothing to configure -> on
     _init_quota_persistence()      # restore quota/dead-model state from the last run
+    _seed_default_blocks()         # ship the owner's blocklist to every install
     # Encrypt any provider keys still stored in plaintext. A no-op once done, so
     # an ordinary start does not rewrite the config file for nothing.
     try:
