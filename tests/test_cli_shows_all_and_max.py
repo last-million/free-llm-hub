@@ -35,11 +35,40 @@ def _auth():
 
 def test_the_tiers_the_categories_and_the_pipelines_are_all_there():
     ids = set(A._virtual_model_ids())
-    assert {"auto", "all", "best", "max"} <= ids, "the tiers, by name"
+    assert {"auto", "all", "best", "max", "multi"} <= ids, "the four tiers, by name"
     assert set(A._mode_keys()) <= ids, "every category the hub has"
     assert {"swarm", "crew"} <= ids, "the pipelines"
     for cat in ("seo", "uncensored", "coding", "vision"):
         assert cat in ids, cat
+
+
+# --------------------------------------------------------------------------- #
+# The fourth tier -- "multi" -- reaches every CLI as a tier, not a pipeline
+# --------------------------------------------------------------------------- #
+
+def test_multi_is_listed_once_as_a_tier():
+    """Not folded into _SWARM_IDS, so it appears once and is labelled a tier."""
+    ids = A._virtual_model_ids()
+    assert ids.count("multi") == 1
+    assert A._virtual_model_label("multi").startswith("Multi sessions")
+
+
+def test_multi_dispatches_through_the_pipeline_path():
+    """A stateless CLI turn can't spawn real agent windows; it maps to the crew
+    phase pipeline instead (the same "work it in phases" shape, run per turn)."""
+    assert A._is_swarm_model("multi")
+    assert A._crew_name_for("multi") == "auto"
+    assert not A._is_orchestrate("multi"), "multi is the heavy tier, not orchestrate"
+
+
+def test_multi_is_the_top_of_the_codex_effort_ladder():
+    assert A._CODEX_EFFORT_MODEL["xhigh"] == "multi"
+    assert [lvl["effort"] for lvl in A._CODEX_LEVELS] == ["low", "medium", "high", "xhigh"]
+
+
+def test_the_openai_surface_lists_multi(client):
+    ids = [m["id"] for m in client.get("/v1/models").get_json()["data"]]
+    assert "multi" in ids
 
 
 def test_all_and_max_are_the_words_people_type():

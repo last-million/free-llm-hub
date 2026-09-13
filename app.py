@@ -815,20 +815,30 @@ _CATALOG_FETCH_WORKERS = 48
 # ("Select Model and Effort" / "Select Reasoning Level for <model>"). That is
 # already the two choices this hub wants a CLI to make, so the level is read as
 # the effort tier rather than passed upstream as a reasoning knob.
-_CODEX_EFFORT_MODEL = {"minimal": "auto", "low": "auto", "medium": "auto",
-                       "high": "best",
-                       "xhigh": "swarm", "max": "swarm", "ultra": "swarm"}
+#
+# FOUR tiers now, mapped onto codex's effort ladder in ascending intensity so
+# "more effort" always means "heavier tier": low=Normal, medium=Max,
+# high=Swarm, xhigh=Multi sessions. This is what surfaces the hub's fourth
+# quality tier (multi) inside a CLI that only offers an effort knob -- the user
+# asked to see Multi sessions as an effort, and xhigh is the top of codex's
+# ladder, so the top tier sits there. minimal falls back to Normal.
+_CODEX_EFFORT_MODEL = {"minimal": "auto", "low": "auto", "medium": "best",
+                       "high": "swarm",
+                       "xhigh": "multi", "max": "multi", "ultra": "multi"}
 
-# The three levels the hub's catalog entries advertise, in picker order. Fewer
-# than codex's full enum on purpose: three tiers for three efforts, each
-# described as what it actually does to routing.
+# The four levels the hub's catalog entries advertise, in picker order -- one
+# per quality tier, each described as what it actually does to routing. Fewer
+# than codex's full enum on purpose, and ordered low->xhigh so the picker reads
+# Normal, Max, Swarm, Multi from lightest to heaviest.
 _CODEX_LEVELS = [
-    {"effort": "medium",
+    {"effort": "low",
      "description": "Normal - orchestrated, best free model for the task"},
-    {"effort": "high",
+    {"effort": "medium",
      "description": "Max - strongest free models only, never the cheap tier"},
-    {"effort": "xhigh",
+    {"effort": "high",
      "description": "Swarm - several models per turn, best answer wins"},
+    {"effort": "xhigh",
+     "description": "Multi sessions - several agents work the task in phases"},
 ]
 
 
@@ -17886,6 +17896,7 @@ _VIRTUAL_MODEL_LABELS = {
     "all": "All models · every category, orchestrated",
     "best": "Max · strongest free models only",
     "max": "Max · strongest free models only",
+    "multi": "Multi sessions · several agents work the task in phases",
 }
 
 
@@ -17925,7 +17936,7 @@ def _virtual_model_ids():
     # from _mode_keys, no hardcoding), then the pipelines. "all" and "max"
     # are aliases -- "all" == auto with no category limit, "max" == best --
     # added because they are the words people reach for.
-    return ("auto", "all", "best", "max") + _mode_keys() + _SWARM_IDS + tuple(crews.CREW_IDS)
+    return ("auto", "all", "best", "max", "multi") + _mode_keys() + _SWARM_IDS + tuple(crews.CREW_IDS)
 
 # Total deadline for ONE swarm/crew stage hop. Swarm stages dispatch
 # non-streaming, so they get neither the streaming first-byte peek (~25-90s)
@@ -18040,7 +18051,13 @@ def _crew_name_for(model):
     bare "crew" -> "auto" (crews.detect_crew picks from the request text),
     "crew-code" / "crew/code" -> "code"."""
     m = (model or "").strip().lower()
-    if m == "crew":
+    if m in ("crew", "multi"):
+        # "multi" is the fourth quality tier. In the /agent page it spawns real
+        # agent sessions that work the message in phases; a stateless CLI turn
+        # cannot do that (the CLI IS the agent, and a /v1 call carries no
+        # project folder to run in), so from a CLI it maps to the crew phase
+        # pipeline -- plan, execute, review across several models -- which is
+        # the same "work it in phases" shape and is safe to run per turn.
         return "auto"
     if m.startswith("crew-"):
         return m[len("crew-"):]
@@ -18052,6 +18069,11 @@ def _crew_name_for(model):
 def _is_swarm_model(model):
     m = (model or "").strip().lower()
     if m in _SWARM_IDS or m.startswith("swarm/"):
+        return True
+    # "multi" (the fourth tier) runs through the same pipeline path; _crew_name_for
+    # maps it to the crew phase pipeline. Kept out of _SWARM_IDS on purpose so it
+    # is listed once as a TIER, not twice (and not labelled a Pipeline).
+    if m == "multi":
         return True
     if m in crews.CREW_IDS:
         return True

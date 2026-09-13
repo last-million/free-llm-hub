@@ -54,17 +54,21 @@ import app as A
 def test_a_mode_plus_a_reasoning_level_becomes_mode_plus_effort():
     with A.app.test_request_context("/v1/responses"):
         body = A._mode_and_effort({"model": "uncensored",
-                                   "reasoning": {"effort": "high"}})
+                                   "reasoning": {"effort": "medium"}})
         assert body["model"] == "best"          # the EFFORT the hub routes on
         assert A._active_mode() == "uncensored"  # the MODE the pool is cut to
 
 
 @pytest.mark.parametrize("effort,expected", [
-    ("minimal", "auto"), ("low", "auto"), ("medium", "auto"),
-    ("high", "best"),
-    ("xhigh", "swarm"), ("max", "swarm"), ("ultra", "swarm"),
+    ("minimal", "auto"), ("low", "auto"),
+    ("medium", "best"),
+    ("high", "swarm"),
+    ("xhigh", "multi"), ("max", "multi"), ("ultra", "multi"),
 ])
 def test_every_reasoning_level_maps_to_an_effort(effort, expected):
+    """Four tiers up codex's ladder: low=Normal, medium=Max, high=Swarm,
+    xhigh=Multi sessions. This is how the fourth tier reaches a CLI that only
+    offers an effort knob."""
     with A.app.test_request_context("/v1/responses"):
         assert A._mode_and_effort({"model": "coding",
                                    "reasoning": {"effort": effort}})["model"] == expected
@@ -85,7 +89,7 @@ def test_an_unknown_level_is_not_an_error():
 def test_the_all_mode_restricts_nothing():
     with A.app.test_request_context("/v1/responses"):
         body = A._mode_and_effort({"model": "all", "reasoning": {"effort": "xhigh"}})
-        assert body["model"] == "swarm"
+        assert body["model"] == "multi"
         assert A._active_mode() == A.MODE_ALL
 
 
@@ -93,7 +97,7 @@ def test_the_all_mode_restricts_nothing():
 # ...without touching anything that is not a mode
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("mid", ["auto", "best", "swarm"])
+@pytest.mark.parametrize("mid", ["auto", "best", "swarm", "multi"])
 def test_an_explicit_effort_id_is_left_alone(mid):
     """`swarm` is BOTH a category name and the fan-out pipeline's id, and
     _valid_mode() answers 'swarm' for it while _mode_keys() deliberately does
@@ -173,14 +177,14 @@ def test_every_hub_entry_keeps_every_template_field():
 def test_the_effort_axis_is_the_second_screen():
     hub = [m for m in _entries() if m["slug"] == "coding"][0]
     efforts = [lvl["effort"] for lvl in hub["supported_reasoning_levels"]]
-    assert efforts == ["medium", "high", "xhigh"]
+    assert efforts == ["low", "medium", "high", "xhigh"]
 
 
 def test_the_levels_say_what_they_actually_do():
     hub = [m for m in _entries() if m["slug"] == "coding"][0]
     text = " ".join(lvl["description"].lower()
                     for lvl in hub["supported_reasoning_levels"])
-    assert "swarm" in text and "max" in text
+    assert "swarm" in text and "max" in text and "multi" in text
 
 
 def test_the_default_level_is_one_of_the_offered_ones():
@@ -238,7 +242,7 @@ def test_the_entries_are_deep_copies():
     a = [m for m in ents if m["slug"] == "coding"][0]
     b = [m for m in ents if m["slug"] == "reasoning"][0]
     a["supported_reasoning_levels"][0]["effort"] = "MUTATED"
-    assert b["supported_reasoning_levels"][0]["effort"] == "medium"
+    assert b["supported_reasoning_levels"][0]["effort"] == "low"
 
 
 def test_the_result_is_serialisable():
