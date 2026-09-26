@@ -1,11 +1,18 @@
-"""Suite-wide isolation for app.py's module-level JUNK BENCH.
+"""Suite-wide isolation for app.py's module-level, in-memory ledgers.
 
-The bench (app._junk_bench_note) is fed from every junk outcome -- the answer
-gate, the stream gate and the canary -- so tests that record a couple of junk
-answers each for the same pair would otherwise add up ACROSS tests and bench
-it three tests later, changing that test's scores. Cleared around every test,
-and only when app is already imported: a test that never touches app must not
-pay its import.
+JUNK BENCH: the bench (app._junk_bench_note) is fed from every junk outcome --
+the answer gate, the stream gate and the canary -- so tests that record a
+couple of junk answers each for the same pair would otherwise add up ACROSS
+tests and bench it three tests later, changing that test's scores.
+
+RECENT HOP FAILURES: app._recent_hop_fail is a process-wide ledger (a
+(provider, model) that 429'd or ran out its time is ordered last for ten
+minutes). Chain-loop tests drive fake providers into exactly those failures,
+so without a reset a later test that builds a real chain over the same fake
+ids would inherit another test's demotions.
+
+Both are cleared around every test, and only when app is already imported: a
+test that never touches app must not pay its import.
 """
 import sys
 
@@ -21,8 +28,21 @@ def _clear_bench():
         app._junk_bench.clear()
 
 
+def _clear_recent_hop_failures():
+    mod = sys.modules.get("app")
+    ledger = getattr(mod, "_recent_hop_fail", None) if mod else None
+    if isinstance(ledger, dict):
+        ledger.clear()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_junk_bench():
     _clear_bench()
     yield
     _clear_bench()
+
+
+@pytest.fixture(autouse=True)
+def _reset_recent_hop_failures():
+    _clear_recent_hop_failures()
+    yield

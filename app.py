@@ -3839,6 +3839,66 @@ def _throttle_failed_hop(pid, model, exc=None, secs=None):
         pass
 
 
+# RECENT HOP FAILURES: a (provider, model) that answered 429, or that the hub
+# stopped waiting for (hop budget / deadline / read timeout), in the last
+# _RECENT_FAIL_TTL seconds goes to the TAIL of every chain and out of the
+# primary pick -- tried only once everything else was. Last resort, never
+# removed.
+#
+# MEASURED 2026-09-26, "What is N plus 1?" live after the deadline work: auto
+# 36.7s, best 64.7s, max 56.9s, coding 31.9s -- X-Free-LLM-Hub-Last-Error 429
+# or deadline every time, while fast/uncensored/context answered in 1-8s. The
+# earlier hops were the SAME rate-limited or slow pairs on request after
+# request: a 429 only cools a model once _upstream_chat has exhausted its key
+# pool, and a hop-budget cut deliberately cools nothing (our impatience is not
+# evidence the provider is broken -- see _HopBudgetExceeded). That is right for
+# quota and for parking a provider, and wrong for ORDERING: the next turn walked
+# straight back into the hop that had just cost it 25 seconds.
+# In memory only: ten minutes of evidence is not worth a file format, and a
+# restart that forgets it costs at most one slow hop per pair.
+_RECENT_FAIL_TTL = 600
+_RECENT_FAIL_TAIL = 2                  # recent failures kept past the hop cap
+_recent_hop_fail = {}                # (pid, model) -> (epoch, kind)
+_recent_fail_lock = threading.Lock()
+
+
+def _note_recent_hop_failure(pid, model, kind):
+    """Remember that this hop 429'd or ran out its time. Never raises."""
+    if not (pid and model):
+        return
+    try:
+        with _recent_fail_lock:
+            _recent_hop_fail[(pid, model)] = (time.time(), str(kind or "fail"))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _clear_recent_hop_failure(pid, model):
+    """A real answer from this hop: it is back in the running. Never raises."""
+    try:
+        with _recent_fail_lock:
+            _recent_hop_fail.pop((pid, model), None)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _recent_hop_failure(pid, model):
+    """The kind ("429" / "deadline" / "timeout") of this hop's failure inside
+    _RECENT_FAIL_TTL, else None. Fail-open: an error is None, so the ledger can
+    only ever reorder a chain, never empty one."""
+    try:
+        with _recent_fail_lock:
+            rec = _recent_hop_fail.get((pid, model))
+            if not rec:
+                return None
+            if time.time() - rec[0] > _RECENT_FAIL_TTL:
+                _recent_hop_fail.pop((pid, model), None)
+                return None
+            return rec[1]
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def _dead_provider_rows():
     now = time.time()
     with _provider_dead_lock:
@@ -6779,6 +6839,12 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     # `cands`), while the same model on another provider stays in. Fail-open.
     cands = _unbenched(cands)
     _compactable = [c for c in _compactable if not _is_pair_benched(c[1], c[2])]
+    # A pair that 429'd or ran out its time in the last ten minutes does not
+    # get to OPEN the turn (see _RECENT_FAIL_TTL); _build_chain keeps it as a
+    # last resort. Fail-open: when every candidate failed recently, all stay.
+    cands = [c for c in cands if not _recent_hop_failure(c[1], c[2])] or cands
+    _compactable = ([c for c in _compactable if not _recent_hop_failure(c[1], c[2])]
+                    or _compactable)
     # A STRONG MODEL ON A TRIMMED CONTEXT BEATS A WEAK ONE ON THE WHOLE THING.
     #
     # _context_ok is LEARNED from real 413s, so only a model the hub has actually
@@ -7074,7 +7140,12 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # cheapest fast model that still clears the bar -> saves strong quota;
         # tie among equal-cheap models -> the one with the MOST free quota left
         # (-headroom so min() picks lowest score THEN highest remaining budget).
-        _s, pid, model = min(qualified, key=lambda t: (t[0], -_quota_headroom(t[1])))
+        # ...but SPEED FIRST among them (_simple_speed_rank): "cheapest" alone
+        # re-picked a model measured to fail or measured slow on every trivial
+        # turn, because nothing in this key could see either. Neutral when
+        # unmeasured, so an unknown fleet still gets the cheapest pick.
+        _s, pid, model = min(qualified, key=lambda t: (_simple_speed_rank(t[1], t[2]),
+                                                       t[0], -_quota_headroom(t[1])))
     else:
         _s, pid, model = max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
     return pid, model, difficulty
@@ -7460,7 +7531,11 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # still there if the pin really does fail.
         chain = [(primary_pid, model_id)]
         seen = {(primary_pid, model_id)}
-    elif _chain_reliability_band(primary_pid, model_id) >= 2:
+    elif (_chain_reliability_band(primary_pid, model_id) >= 2
+          or _recent_hop_failure(primary_pid, model_id)):
+        # ...and neither does one that 429'd or ran out its time in the last
+        # ten minutes (see _RECENT_FAIL_TTL): the ranked list below puts it in
+        # the recent-failure tail instead.
         # A MEASURED-TO-FAIL primary is not seeded at hop 1. It stays a
         # candidate below -- it is never dropped, and if nothing healthier is
         # available the ranked list puts it back -- but it does not get to open
@@ -7663,8 +7738,24 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # deeper chain (reaches the still-fresh sibling models when the top providers are
     # momentarily throttled) than a one-shot chat needs.
     hop_cap = TOOLS_MAX_HOPS if require_tools else MAX_HOPS
+    # RECENT FAILURES LAST (see _RECENT_FAIL_TTL), whatever tier or ordering
+    # rule put them where they were: a stable partition, so every rule above
+    # still decides the order inside each half. They keep a place past the hop
+    # cap (_RECENT_FAIL_TAIL) because they are the last resort, not dropped --
+    # when nothing else answers, a pair that 429'd nine minutes ago may well
+    # have its quota back.
+    _recent = [e for e in ordered if _recent_hop_failure(e[1], e[2])]
+    if _recent:
+        ordered = [e for e in ordered if not _recent_hop_failure(e[1], e[2])]
     for _score, pid, m in ordered:
         if len(chain) >= hop_cap:
+            break
+        if (pid, m) not in seen:
+            chain.append((pid, m))
+            seen.add((pid, m))
+    _tail_cap = hop_cap + _RECENT_FAIL_TAIL
+    for _score, pid, m in _recent:
+        if len(chain) >= _tail_cap:
             break
         if (pid, m) not in seen:
             chain.append((pid, m))
@@ -19020,6 +19111,88 @@ _POST_DEADLINE_MAX = 600         # absolute ceiling past the deadline
 # Headers AND first content for the hop must arrive inside this budget.
 _TRIVIAL_HOP_BUDGET = 25         # fast model
 _TRIVIAL_SLOW_HOP_BUDGET = 45    # slow / reasoning model (_SLOW_MODEL_RE)
+# ...and those two are now CEILINGS, not the budget. MEASURED 2026-09-26: with
+# a flat 25s, "What is N plus 1?" still took 32-65s on auto/best/max/coding --
+# a hop that normally answers in 2s was given 25s to not answer, and then the
+# next one was. A hop with a MEASURED history gets max(_ADAPTIVE_HOP_FLOOR,
+# _ADAPTIVE_HOP_MULT x its p90) for its first content; an unmeasured one keeps
+# the ceiling, because there is no evidence to be tighter on.
+_ADAPTIVE_HOP_FLOOR = 6.0        # seconds: never tighter than this
+_ADAPTIVE_HOP_MULT = 3.0         # x the measured p90 time to first content
+_ADAPTIVE_MIN_SAMPLES = 3        # never judge a hop on one or two requests
+# HEDGING a trivial, tool-free, small turn: when the hop has produced nothing
+# after _HEDGE_DELAY_MULT x its p50 (min _HEDGE_DELAY_MIN; _HEDGE_DELAY_UNKNOWN
+# with no history), the next candidate starts IN PARALLEL and the first valid
+# answer wins. At most ONE extra call per request, and only before a byte has
+# reached the client. The tail latency of a free fleet is one slow hop in
+# five; waiting it out serially is most of the 30-65s.
+_HEDGE_DELAY_MIN = 3.0
+_HEDGE_DELAY_MULT = 1.5
+_HEDGE_DELAY_UNKNOWN = 4.0
+_HEDGE_MAX_EST = 4000            # "small": a one-liner and its system prompt
+# A simple-turn candidate MEASURED slower than this is not "speed first".
+_SIMPLE_SLOW_MS = 10000.0
+# How long a peek keeps waiting on a hop whose visible text has STARTED but
+# not yet reached the judge threshold (see _peek_until_content).
+_PEEK_CONTENT_GRACE = 30.0
+
+
+def _hop_samples(pid, model, stream=None):
+    """The measured timing samples (ms) that describe this hop's first useful
+    output: time-to-first-content for a stream, total duration for a
+    non-streamed call, each falling back to the other. None while too thin."""
+    try:
+        with _outcome_lock:
+            ttft = list(_ttft.get((pid, model)) or [])
+            dur = list(_speed.get((pid, model)) or [])
+        for s in ((dur, ttft) if stream is False else (ttft, dur)):
+            if len(s) >= _ADAPTIVE_MIN_SAMPLES:
+                return s
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def _adaptive_hop_budget(pid, model, ceiling, stream=None):
+    """First-content budget for a trivial turn's hop: max(_ADAPTIVE_HOP_FLOOR,
+    _ADAPTIVE_HOP_MULT x measured p90), never above `ceiling` (the old fixed
+    budget). Unmeasured -> `ceiling`. Never raises."""
+    try:
+        s = _hop_samples(pid, model, stream)
+        if not s:
+            return ceiling
+        p90 = _percentile(s, 90) / 1000.0
+        return min(float(ceiling), max(_ADAPTIVE_HOP_FLOOR, _ADAPTIVE_HOP_MULT * p90))
+    except Exception:                                            # noqa: BLE001
+        return ceiling
+
+
+def _hedge_delay(pid, model, stream=None):
+    """Seconds of silence from this hop before a hedge starts the next one."""
+    try:
+        s = _hop_samples(pid, model, stream)
+        if not s:
+            return _HEDGE_DELAY_UNKNOWN
+        return max(_HEDGE_DELAY_MIN, _HEDGE_DELAY_MULT * _percentile(s, 50) / 1000.0)
+    except Exception:                                            # noqa: BLE001
+        return _HEDGE_DELAY_UNKNOWN
+
+
+def _simple_speed_rank(pid, model):
+    """Sort key for the SIMPLE-turn primary, lower first: (measured to fail,
+    measured slow). Both False while unmeasured, so this only ever moves a
+    candidate the hub has real evidence about. Never raises."""
+    try:
+        sick = _chain_reliability_band(pid, model) >= 2
+        ms = _measured_latency_ms(pid, model)
+        if ms is None:
+            with _outcome_lock:
+                t = list(_ttft.get((pid, model)) or [])
+            if len(t) >= _ADAPTIVE_MIN_SAMPLES:
+                ms = _percentile(t, 50)
+        return (sick, ms is not None and ms > _SIMPLE_SLOW_MS)
+    except Exception:                                            # noqa: BLE001
+        return (False, False)
 
 
 def _request_deadline_seconds():
@@ -19163,6 +19336,117 @@ def _deadline_error_text(clock, errors):
             % (int(clock.limit or 0), "; ".join(errors) or "none"))
 
 
+class _PrePeekedResponse:
+    """A streamed hop whose first content a hedge leg already read: the loop's
+    iter_content()/iter_lines() replays what was read, then continues the SAME
+    upstream iterator. Everything else is the real response."""
+
+    def __init__(self, resp, buffered, iterator):
+        self._resp = resp
+        self._buffered = list(buffered or ())
+        self._it = iterator
+        self.status_code = getattr(resp, "status_code", 200)
+
+    def iter_content(self, chunk_size=None):
+        return _chain_buffered(self._buffered, self._it)
+
+    def iter_lines(self, decode_unicode=False):
+        return _chain_buffered(self._buffered, self._it)
+
+    def close(self):
+        try:
+            self._resp.close()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._resp, name)
+
+
+def _close_hedge_item(item):
+    try:
+        if item[1] in ("resp", "json", "peek"):
+            item[2].close()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _run_hedge_leg(idx, pid, payload, stream, lines, budget, q, lock, abandoned,
+                   grace, streaming=None):
+    """One leg of a hedged hop, on its own thread. Puts (idx, kind, obj, extra)
+    on `q`: kind "exc" (obj = the exception), "resp" (a non-200), "json" (a
+    non-streamed 200) or "peek" (a streamed 200 already peeked to its first
+    content: extra = (status, buffered, iterator)). A leg the caller stopped
+    waiting for closes its own response instead."""
+    started = time.monotonic()
+    try:
+        resp = _dispatch_chat(pid, payload, stream)
+    except BaseException as exc:                                 # noqa: BLE001
+        item = (idx, "exc", exc, None)
+    else:
+        item = (idx, "resp", resp, None)
+        if getattr(resp, "status_code", None) == 200:
+            if not stream:
+                item = (idx, "json", resp, None)
+            else:
+                try:
+                    it = (resp.iter_lines(decode_unicode=False) if lines
+                          else resp.iter_content(chunk_size=None))
+                    status, buffered = _peek_until_content(
+                        it, max(0.0, budget - (time.monotonic() - started)),
+                        content_grace=grace,
+                        on_content=(lambda: streaming.add(idx))
+                        if streaming is not None else None)
+                    item = (idx, "peek", resp, (status, buffered, it))
+                except Exception as exc:                         # noqa: BLE001
+                    _close_hedge_item(item)
+                    item = (idx, "exc", exc, None)
+    with lock:
+        drop = idx in abandoned
+        if not drop:
+            q.put(item)
+    if drop:
+        _close_hedge_item(item)
+
+
+def _hedge_leg_verdict(item, payload):
+    """'ok' | 'salvaged' | a failure class, for one finished hedge leg. 'ok'
+    is what may win the race: a real answer answer_check.inspect passes."""
+    try:
+        _idx, kind, obj, extra = item
+        if kind == "exc":
+            return "error"
+        if kind == "resp":
+            return "http"
+        if kind == "json":
+            try:
+                data = obj.json()
+            except (ValueError, requests.RequestException):
+                return "non-json"
+            if not isinstance(data, dict):
+                return "non-json"
+            if _chat_json_nonanswer(data, False, None):
+                return "nonanswer"
+            if _chat_json_is_empty(data):
+                return "empty"
+            return _answer_gate(data, payload, False)
+        if kind == "peek":
+            status, buffered, _it = extra
+            if status != "content":
+                return status
+            raw = "".join(b.decode("utf-8", "ignore") if isinstance(b, (bytes, bytearray))
+                          else str(b) for b in buffered if b)
+            text = _peeked_text(raw)
+            if text and not answer_check.inspect(
+                    text, prompt_text=_prompt_text_for_check(payload),
+                    last_prompt=_last_user_text_for_check(payload)).get("ok", True):
+                return "salvaged"
+            return "ok"
+    except Exception:                                            # noqa: BLE001
+        return "ok" if item and item[1] in ("json", "peek") else "error"
+    return "error"
+
+
 class _ChainClock:
     """The request deadline plus the current hop's budget, for one chain walk.
 
@@ -19178,6 +19462,11 @@ class _ChainClock:
         self.trivial = bool(trivial)
         self._hop_started = None
         self._hop_budget = None
+        self._last_peek = None
+        self._hedge_plan = None      # set by plan_hedge() for an eligible turn
+        self._hedge_fired = False    # at most ONE extra call per request
+        self._consumed = set()       # chain entries a hedge already ran
+        self._served = None          # (pid, model, payload) a hedge served
 
     def left(self):
         if self.deadline_at is None:
@@ -19188,32 +19477,327 @@ class _ChainClock:
         left = self.left()
         return left is not None and left <= 0
 
-    def _budget_for(self, pid, model):
+    def _budget_for(self, pid, model, stream=None):
         budget = None
         # A local subscription CLI is a subprocess that cold-starts in tens of
         # seconds whatever the question; a first-content budget sized for an
         # HTTP API would cut every one of them off. The deadline still applies.
         if self.trivial and not _is_sub(pid):
-            budget = (_TRIVIAL_SLOW_HOP_BUDGET
-                      if _SLOW_MODEL_RE.search((model or "").lower())
-                      else _TRIVIAL_HOP_BUDGET)
+            ceiling = (_TRIVIAL_SLOW_HOP_BUDGET
+                       if _SLOW_MODEL_RE.search((model or "").lower())
+                       else _TRIVIAL_HOP_BUDGET)
+            budget = _adaptive_hop_budget(pid, model, ceiling, stream)
         left = self.left()
         if left is not None:
             budget = left if budget is None else min(budget, left)
         return None if budget is None else max(0.0, budget)
 
-    def dispatch(self, pid, payload, stream):
+    def content_grace(self):
+        """How long a peek may keep waiting once visible text has started."""
+        left = self.left()
+        if left is None:
+            return _PEEK_CONTENT_GRACE
+        return max(0.0, min(_PEEK_CONTENT_GRACE, left))
+
+    # -- hedging ------------------------------------------------------------ #
+
+    def plan_hedge(self, chain, base_payload, difficulty, est=0, tools=False,
+                   images=False, lines=False, output_budget=False):
+        """Arm hedging for this chain walk when the turn qualifies: trivial,
+        tool-free, image-free and small (_HEDGE_MAX_EST). `base_payload` and
+        `difficulty` rebuild the partner hop's payload exactly as the loop
+        builds its own; `lines` says the loop reads streams with iter_lines
+        (/v1/responses, /v1/messages) rather than iter_content. Never raises;
+        flag `hedge_simple_turns` (default on)."""
+        self._hedge_plan = None
+        try:
+            if (not self.trivial or tools or images or not est
+                    or est > _HEDGE_MAX_EST
+                    or not config.get_flag("hedge_simple_turns", True)):
+                return
+            self._hedge_plan = {"chain": [tuple(e) for e in (chain or ())],
+                                "base": dict(base_payload or {}),
+                                "diff": difficulty, "lines": bool(lines),
+                                "output_budget": bool(output_budget)}
+        except Exception:                                        # noqa: BLE001
+            self._hedge_plan = None
+
+    def consumed(self, pid, model):
+        """True for a chain entry a hedge already ran -- the loop skips it."""
+        return (pid, model) in self._consumed
+
+    def served(self, pid, model, payload):
+        """(pid, model, payload) that actually produced the response the last
+        dispatch() returned: the loop's own hop, or the hedge partner that won.
+        The loop rebinds its hop variables to this, so recording, headers and
+        the answer check all name the model that answered."""
+        s, self._served = self._served, None
+        if not s or (s[0], s[1]) == (pid, model):
+            return pid, model, payload
+        try:
+            _act_pick(s[0], s[1])
+        except Exception:                                        # noqa: BLE001
+            pass
+        return s
+
+    def _hedge_partner(self, pid, model):
+        plan = self._hedge_plan
+        if not plan or self._hedge_fired or _is_sub(pid):
+            return None
+        try:
+            chain = plan["chain"]
+            i = chain.index((pid, model)) if (pid, model) in chain else -1
+            rest = [e for e in chain[i + 1:]
+                    if e != (pid, model) and e not in self._consumed
+                    and not _is_sub(e[0]) and prov.is_model_allowed(e[1])
+                    and not _is_provider_dead(e[0])
+                    and not _recent_hop_failure(e[0], e[1])]
+            # A different PROVIDER first: a sibling model behind the same
+            # rate limit or the same slow gateway is the likeliest to be slow
+            # for the same reason.
+            other = [e for e in rest if e[0] != pid]
+            return (other or rest or [None])[0]
+        except Exception:                                        # noqa: BLE001
+            return None
+
+    def _hedge_payload(self, pid, model, stream):
+        plan = self._hedge_plan
+        pl = dict(plan["base"])
+        pl["model"] = model
+        if plan["output_budget"]:
+            _apply_output_budget(pl, pid)
+        _apply_reasoning_effort(pl, model, plan["diff"])
+        pl["stream"] = stream
+        return pl
+
+    def _dispatch_hedged(self, pid, payload, stream, delay, partner):
+        """Hop `pid` with `partner` started in parallel after `delay` seconds
+        of silence. Returns what the loop would have got from a plain dispatch
+        (a response, or the exception raised): the first VALID answer when the
+        hedge fired, else leg 0's own result untouched."""
+        lines = self._hedge_plan["lines"]
+        q = queue.Queue()
+        lock = threading.Lock()
+        abandoned = set()
+        streaming = set()            # legs whose visible text has started
+        grace = self.content_grace()
+        graced = False
+        legs = {0: (pid, (payload or {}).get("model"), payload, time.monotonic())}
+
+        def _start(idx, p, pl, budget):
+            ctx = contextvars.copy_context()
+
+            def _run():
+                ctx.run(_run_hedge_leg, idx, p, pl, stream, lines, budget, q, lock,
+                        abandoned, grace, streaming)
+            threading.Thread(target=_carry_usage_source(_run), daemon=True).start()
+
+        budget0 = self._hop_budget
+        t0 = legs[0][3]
+        end = t0 + budget0
+        _start(0, pid, payload, budget0)
+        fired = False
+        pending = {0}
+        fallback = None
+        failed = {}
+        while pending:
+            wait_to = end if fired else min(t0 + delay, end)
+            try:
+                item = q.get(timeout=max(0.0, wait_to - time.monotonic()))
+            except queue.Empty:
+                now = time.monotonic()
+                if not fired and now < end:
+                    p1, m1 = partner
+                    pl1 = self._hedge_payload(p1, m1, stream)
+                    budget1 = self._budget_for(p1, m1, stream) or budget0
+                    end = max(end, now + budget1)
+                    left = self.left()
+                    if left is not None:
+                        end = min(end, now + max(0.0, left))
+                    fired = self._hedge_fired = True
+                    self._consumed.add((p1, m1))
+                    legs[1] = (p1, m1, pl1, now)
+                    pending.add(1)
+                    _log.info("[hedge] %s/%s silent %.1fs -> also starting %s/%s",
+                              pid, legs[0][1], now - t0, p1, m1)
+                    _start(1, p1, pl1, budget1)
+                    continue
+                if not graced and pending & streaming:
+                    # A leg is already writing visible text: never cut it
+                    # (its own peek holds on for the same grace).
+                    graced = True
+                    end = now + grace
+                    continue
+                break
+            idx = item[0]
+            pending.discard(idx)
+            if not fired:
+                # Leg 0 came back before the hedge was needed: hand it to the
+                # loop EXACTLY as a plain dispatch would have, so its whole
+                # error handling (starved retry, soft 400, junk gate) applies.
+                self._settle(lock, abandoned, q, legs, keep=None)
+                return self._loop_result(item, legs)
+            verdict = _hedge_leg_verdict(item, legs[idx][2])
+            if verdict == "ok":
+                self._settle(lock, abandoned, q, legs, keep=idx)
+                if fallback is not None:
+                    _close_hedge_item(fallback)
+                self._record_losers(failed, legs)
+                if idx:
+                    _log.info("[hedge] %s/%s won the race", legs[1][0], legs[1][1])
+                return self._loop_result(item, legs)
+            if verdict == "salvaged" and fallback is None:
+                fallback = item
+                continue
+            failed[idx] = item
+        # Nobody produced a valid answer in time.
+        self._settle(lock, abandoned, q, legs, keep=None)
+        now = time.monotonic()
+        for idx in pending:
+            if now - legs[idx][3] >= _ADAPTIVE_HOP_FLOOR:
+                _note_recent_hop_failure(legs[idx][0], legs[idx][1], "deadline")
+        if fallback is not None:
+            self._record_losers(failed, legs)
+            return self._loop_result(fallback, legs)
+        if 0 in failed:
+            # Leg 0's own failure goes to the loop as if unhedged; leg 1's is
+            # recorded here, since the loop never sees it.
+            self._record_losers({k: v for k, v in failed.items() if k}, legs)
+            return self._loop_result(failed[0], legs)
+        self._record_losers(failed, legs)
+        raise _HopBudgetExceeded("no answer within %.0fs (hedged)" % (now - t0))
+
+    def _settle(self, lock, abandoned, q, legs, keep):
+        """Stop waiting on every leg but `keep`: a leg still running closes its
+        own response when it finishes; one already queued is closed here."""
+        with lock:
+            abandoned.update(i for i in legs if i != keep)
+        while True:
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
+                break
+            if item[0] != keep:
+                _close_hedge_item(item)
+
+    def _record_losers(self, failed, legs):
+        """File the failures of legs whose result the loop will never see."""
+        for idx, item in failed.items():
+            p, m = legs[idx][0], legs[idx][1]
+            try:
+                kind, obj = item[1], item[2]
+                if kind == "exc":
+                    if isinstance(obj, requests.exceptions.Timeout):
+                        _note_recent_hop_failure(p, m, "timeout")
+                        _throttle_failed_hop(p, m, exc=obj)
+                elif kind == "resp":
+                    _record_outcome(p, m, False)
+                    code = getattr(obj, "status_code", 0) or 0
+                    if code == 429:
+                        _note_recent_hop_failure(p, m, "429")
+                    elif code >= 500:
+                        _throttle_failed_hop(p, m)
+                else:
+                    verdict = _hedge_leg_verdict(item, legs[idx][2])
+                    if verdict == "junk":
+                        _record_outcome(p, m, False)
+                    elif verdict == "nonanswer":
+                        _note_nonanswer(p, m)
+                    elif verdict == "timeout":
+                        _note_recent_hop_failure(p, m, "deadline")
+            except Exception:                                    # noqa: BLE001
+                pass
+            _close_hedge_item(item)
+
+    def _loop_result(self, item, legs):
+        idx, kind, obj, extra = item
+        p, m, pl, _t = legs[idx]
+        self._served = (p, m, pl)
+        if idx:
+            # The winner's replay is already in hand; the loop's own peek must
+            # not be cut by leg 0's budget.
+            self._hop_budget = None
+        if kind == "exc":
+            if isinstance(obj, requests.exceptions.Timeout):
+                _note_recent_hop_failure(p, m, "timeout")     # as _plain() does
+            raise obj
+        if kind == "peek":
+            status, buffered, it = extra
+            if status == "timeout":
+                _close_hedge_item(item)
+                raise _HopBudgetExceeded("no first content within the hop budget")
+            self._hop_budget = None
+            return _PrePeekedResponse(obj, buffered, it)
+        return obj
+
+    def dispatch(self, pid, payload, stream, hedge=True):
         """_dispatch_chat under this hop's budget. A non-streaming hop gets the
         whole budget for its answer; a streaming one for its headers, and
-        peek_timeout() hands the rest to the first-content peek."""
+        peek_timeout() hands the rest to the first-content peek.
+
+        On a hedge-eligible turn (plan_hedge) the hop may race the next
+        candidate; call served() afterwards for the one that answered.
+        `hedge=False` for a same-hop retry, which must stay on its hop."""
+        self._served = None
+        model = (payload or {}).get("model")
         self._hop_started = time.monotonic()
-        self._hop_budget = self._budget_for(pid, (payload or {}).get("model"))
+        self._hop_budget = self._budget_for(pid, model, stream)
         if self._hop_budget is None:
-            return _dispatch_chat(pid, payload, stream)
+            return self._plain(pid, model, payload, stream)
         if self._hop_budget <= 0:
             raise _HopBudgetExceeded("request deadline reached")
-        return _call_with_wall_clock(self._hop_budget, _dispatch_chat,
-                                     pid, payload, stream)
+        partner = self._hedge_partner(pid, model) if hedge else None
+        if partner is not None:
+            delay = _hedge_delay(pid, model, stream)
+            if delay < self._hop_budget:
+                resp = self._dispatch_hedged(pid, payload, stream, delay, partner)
+                s = self._served or (pid, model, payload)
+                self._note_status(s[0], s[1], resp, stream)
+                return resp
+        return self._plain(pid, model, payload, stream)
+
+    def _plain(self, pid, model, payload, stream):
+        try:
+            if self._hop_budget is None:
+                resp = _dispatch_chat(pid, payload, stream)
+            else:
+                resp = _call_with_wall_clock(self._hop_budget, _dispatch_chat,
+                                             pid, payload, stream)
+        except _HopBudgetExceeded:
+            # Only a budget big enough to be a fair wait is evidence: a hop
+            # squeezed into the last second of the request deadline is not.
+            if (self._hop_budget or 0) >= _ADAPTIVE_HOP_FLOOR:
+                _note_recent_hop_failure(pid, model, "deadline")
+            raise
+        except requests.exceptions.Timeout:
+            _note_recent_hop_failure(pid, model, "timeout")
+            raise
+        self._note_status(pid, model, resp, stream)
+        return resp
+
+    @staticmethod
+    def _note_status(pid, model, resp, stream):
+        try:
+            code = getattr(resp, "status_code", None)
+            if code == 429:
+                _note_recent_hop_failure(pid, model, "429")
+            elif code == 200 and not stream:
+                _clear_recent_hop_failure(pid, model)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def note_peek(self, pid, model, status):
+        """Feed a streamed hop's first-content verdict to the recent-failure
+        ledger: content clears it, a silent hop that used a fair budget is
+        remembered (see _RECENT_FAIL_TTL)."""
+        try:
+            if status == "content":
+                _clear_recent_hop_failure(pid, model)
+            elif status == "timeout" and max(self._hop_budget or 0,
+                                             self._last_peek or 0) >= _ADAPTIVE_HOP_FLOOR:
+                _note_recent_hop_failure(pid, model, "deadline")
+        except Exception:                                        # noqa: BLE001
+            pass
 
     def peek_timeout(self, model, est):
         t = _stream_peek_timeout(model, est)
@@ -19222,7 +19806,8 @@ class _ChainClock:
         left = self.left()
         if left is not None:
             t = min(t, left)
-        return max(0.0, t)
+        self._last_peek = max(0.0, t)
+        return self._last_peek
 
     def guard(self, iterator, terminator=None, label=""):
         return _deadline_guard(iterator, self.deadline_at, terminator, label)
@@ -19415,7 +20000,8 @@ def _peeked_text(raw):
     return "".join(out).strip()
 
 
-def _peek_until_content(iterator, deadline_s, max_lines=400):
+def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
+                        on_content=None):
     """Look ahead on a streaming 200 to tell a REAL answer from an EMPTY one before
     committing it to the client. Reads SSE items (bytes) until one carries actual
     content / a tool call (the provider is really answering), or the stream
@@ -19478,6 +20064,12 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
                     # without waiting at all. Bounded by _PEEK_JUDGE_CHARS and by
                     # the deadline this whole peek already runs under.
                     seen_content.append(b.decode("utf-8", "ignore"))
+                    if not box.get("saw_content") and on_content is not None:
+                        try:
+                            on_content()
+                        except Exception:                        # noqa: BLE001
+                            pass
+                    box["saw_content"] = True
                     if sum(len(x) for x in seen_content) < _PEEK_JUDGE_CHARS:
                         continue
                     box["status"] = _judge_peeked(seen_content)
@@ -19491,7 +20083,15 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
                     box["status"] = "error"
                     return
                 if _STREAM_TERMINAL_RE.search(b):
-                    box["status"] = "empty"
+                    # The stream ENDED. With content already read that is a
+                    # SHORT, COMPLETE answer -- judge it, exactly like the
+                    # StopIteration branch below. Calling it "empty" threw away
+                    # every answer under _PEEK_JUDGE_CHARS whose [DONE] arrived
+                    # as its own read ("5768" then finish then [DONE], which is
+                    # every iter_lines stream and many iter_content ones): the
+                    # trivial answers this chain most needs to keep.
+                    box["status"] = (_judge_peeked(seen_content) if seen_content
+                                     else "empty")
                     return
                 if _STREAM_REASONING_RE.search(b):
                     saw_reasoning = True
@@ -19514,6 +20114,14 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
     t.join(deadline_s)
+    if t.is_alive() and content_grace and box.get("saw_content"):
+        # VISIBLE TEXT IS ALREADY ARRIVING -- it just has not reached
+        # _PEEK_JUDGE_CHARS (or the end of the stream) yet. With the tight
+        # trivial-turn budgets (see _adaptive_hop_budget) the deadline could
+        # land mid-sentence and throw away a model that was answering; a hop
+        # that is streaming words is never cut here, only one that is silent.
+        # `content_grace` bounds the wait (the request deadline's remainder).
+        t.join(content_grace)
     if t.is_alive():
         return "timeout", []
     return box.get("status") or "empty", list(box["buf"])
@@ -22632,12 +23240,19 @@ def _chat_completions_uncached(body):
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
         body.get("messages"), body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)))
-    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
-                                          prefer=chain_prefer,
-                                           require_tools=has_tools,
-                                           **_pin_kw,
-                                           messages=body.get("messages"),
-                                           **_veto_kw):
+    _chain = _build_chain(pid, resolved, est, require_vision=has_images,
+                          prefer=chain_prefer,
+                          require_tools=has_tools,
+                          **_pin_kw,
+                          messages=body.get("messages"),
+                          **_veto_kw)
+    # A trivial, tool-free, small turn may race its hop against the next one
+    # (see _HEDGE_DELAY_MIN); the partner's payload is built like the loop's.
+    _clock.plan_hedge(_chain, body, diff, est=est, tools=has_tools, images=has_images,
+                      output_budget=True)
+    for hop_pid, hop_model in _chain:
+        if _clock.consumed(hop_pid, hop_model):
+            continue              # a hedge already ran this hop
         if _clock.spent():
             errors.append("stopped: request deadline reached")
             last_error = "deadline"
@@ -22677,6 +23292,9 @@ def _chat_completions_uncached(body):
             attempts += 1
             last_hop = (hop_pid, hop_model)
             resp = _clock.dispatch(hop_pid, payload, dispatch_stream)
+            # A hedge may have been won by the NEXT candidate (see served()).
+            hop_pid, hop_model, payload = _clock.served(hop_pid, hop_model, payload)
+            last_hop = (hop_pid, hop_model)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             last_error = _classify_hop_error(exc=exc)
@@ -22760,7 +23378,9 @@ def _chat_completions_uncached(body):
                 # Peek until REAL content: a 200 that streams no content must fall
                 # through to the next model, not be handed to the client as empty.
                 status, buffered = _peek_until_content(
-                    it, _clock.peek_timeout(hop_model, est))
+                    it, _clock.peek_timeout(hop_model, est),
+                    content_grace=_clock.content_grace())
+                _clock.note_peek(hop_pid, hop_model, status)
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -22816,7 +23436,7 @@ def _chat_completions_uncached(body):
                     retry = dict(payload)
                     retry["max_tokens"] = bigger
                     try:
-                        resp2 = _clock.dispatch(hop_pid, retry, False)
+                        resp2 = _clock.dispatch(hop_pid, retry, False, hedge=False)
                         data2 = resp2.json() if resp2.status_code == 200 else None
                         resp2.close()
                     except (requests.RequestException, RuntimeError, ValueError):
@@ -23461,9 +24081,15 @@ def v1_responses(_retry_pass=False):
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
         messages, body.get("max_output_tokens"), diff, est, pinned=bool(_pin_kw)))
-    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
-                                           require_tools=has_tools, messages=messages,
-                                           **_pin_kw):
+    _chain = _build_chain(pid, resolved, est, require_vision=has_images,
+                          require_tools=has_tools, messages=messages,
+                          **_pin_kw)
+    # See the twin in /v1/chat/completions (hedging a trivial turn).
+    _clock.plan_hedge(_chain, base_payload, diff, est=est, tools=has_tools,
+                      images=has_images, lines=True)
+    for hop_pid, hop_model in _chain:
+        if _clock.consumed(hop_pid, hop_model):
+            continue              # a hedge already ran this hop
         _tried.append(hop_pid + "/" + hop_model)
         if _clock.spent():
             errors.append("stopped: request deadline reached")
@@ -23503,6 +24129,7 @@ def v1_responses(_retry_pass=False):
         try:
             _act_pick(hop_pid, hop_model)
             resp = _clock.dispatch(hop_pid, payload, dispatch_stream)
+            hop_pid, hop_model, payload = _clock.served(hop_pid, hop_model, payload)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             last_error = _classify_hop_error(exc=exc)
@@ -23584,7 +24211,9 @@ def v1_responses(_retry_pass=False):
                 # (role delta + [DONE], no content) must fall through to the next
                 # model instead of being streamed to codex as a dead-end answer.
                 status, buffered = _peek_until_content(
-                    line_it, _clock.peek_timeout(hop_model, est))
+                    line_it, _clock.peek_timeout(hop_model, est),
+                    content_grace=_clock.content_grace())
+                _clock.note_peek(hop_pid, hop_model, status)
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -24248,9 +24877,15 @@ def v1_messages():
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
         oai_messages, body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)))
-    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
-                                           require_tools=has_tools, messages=oai_messages,
-                                           **_pin_kw):
+    _chain = _build_chain(pid, resolved, est, require_vision=has_images,
+                          require_tools=has_tools, messages=oai_messages,
+                          **_pin_kw)
+    # See the twin in /v1/chat/completions (hedging a trivial turn).
+    _clock.plan_hedge(_chain, base_payload, diff, est=est, tools=has_tools,
+                      images=has_images, lines=True)
+    for hop_pid, hop_model in _chain:
+        if _clock.consumed(hop_pid, hop_model):
+            continue              # a hedge already ran this hop
         if _clock.spent():
             errors.append("stopped: request deadline reached")
             last_error = "deadline"
@@ -24277,6 +24912,8 @@ def v1_messages():
             attempts += 1
             last_hop = (hop_pid, hop_model)
             resp = _clock.dispatch(hop_pid, payload, stream)
+            hop_pid, hop_model, payload = _clock.served(hop_pid, hop_model, payload)
+            last_hop = (hop_pid, hop_model)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             last_error = _classify_hop_error(exc=exc)
@@ -24316,7 +24953,9 @@ def v1_messages():
                 # Peek until REAL content so an empty 200 falls through to the next
                 # model instead of being handed to the client as a dead-end answer.
                 status, buffered = _peek_until_content(
-                    line_it, _clock.peek_timeout(hop_model, est))
+                    line_it, _clock.peek_timeout(hop_model, est),
+                    content_grace=_clock.content_grace())
+                _clock.note_peek(hop_pid, hop_model, status)
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
