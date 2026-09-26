@@ -45,11 +45,14 @@ same reason model_categories is one.
 """
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
 import threading
 import time
+
+_log = logging.getLogger("free-llm-hub")
 
 # One file per conversation, beside the rest of the hub's state.
 _ROOT_ENV = "FREE_LLM_HUB_MEMORY_DIR"
@@ -241,7 +244,48 @@ def _blank(session_id):
             "turns": 0, "rules_restated_turn": 0, "updated_at": 0.0,
             "compactions": 0, "restate_due": False,
             "tasks": [], "tasks_source": "", "interrupted": None,
-            "fact_meta": {}, "summary_rev": None, "summary_turn": 0}
+            "fact_meta": {}, "summary_rev": None, "summary_turn": 0,
+            # WHEN each derived thing was last changed, so a rewind can tell
+            # what describes work that has since been undone (see rewind()).
+            "summary_at": 0.0, "tasks_at": 0.0,
+            # The task list's fingerprint, and the fingerprint the AGENT last
+            # saw -- a list that changed behind its back (the user edited
+            # PROGRESS.md, a rewind restored an older one) is handed over again
+            # on the next turn (see should_restate_rules).
+            "tasks_sig": "", "tasks_seen_sig": "",
+            # Set by a rewind: the next turn is told that the work after that
+            # point is gone from disk even if its own CLI thread remembers it.
+            "rewound": None}
+
+
+# Transient Windows sharing violations: os.replace onto a file another handle
+# holds open (a reader in another thread, an antivirus scan, a sync client)
+# fails with PermissionError for a few milliseconds. Retried, then logged --
+# never silently dropped, which is what a bare `return False` did.
+_IO_RETRY_SLEEPS = (0.02, 0.05, 0.1, 0.2, 0.4)
+
+
+def quarantine_corrupt(path, what="memory"):
+    """Move a file that no longer parses out of the way, keeping it.
+
+    Starting fresh over an unreadable file used to OVERWRITE it on the very
+    next write -- a silent, total loss of whatever it held. Renamed instead to
+    `<name>.corrupt-<ts>`, so the data can still be recovered by hand, and
+    logged, so the loss is loud. Returns the backup path, or None."""
+    try:
+        backup = "%s.corrupt-%d" % (path, int(time.time()))
+        n = 0
+        while os.path.exists(backup):
+            n += 1
+            backup = "%s.corrupt-%d-%d" % (path, int(time.time()), n)
+        os.replace(path, backup)
+        _log.warning("%s file %s was unreadable; kept it as %s and started fresh",
+                     what, path, backup)
+        return backup
+    except OSError as exc:
+        _log.warning("%s file %s is unreadable and could not be set aside: %s",
+                     what, path, exc)
+        return None
 
 
 def get(session_id):
@@ -249,23 +293,66 @@ def get(session_id):
     path = _path(session_id)
     if not path:
         return _blank(session_id)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            got = json.load(fh)
-        if not isinstance(got, dict):
+    got, read = None, False
+    for pause in (0.0,) + _IO_RETRY_SLEEPS[:3]:
+        if pause:
+            time.sleep(pause)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                got = json.load(fh)
+            read = True
+            break
+        except FileNotFoundError:
             return _blank(session_id)
-        base = _blank(session_id)
-        base.update({k: v for k, v in got.items() if k in base})
-        for field in ("facts", "recent", "tasks"):
-            if not isinstance(base.get(field), list):
-                base[field] = []
-        if not isinstance(base.get("interrupted"), dict):
-            base["interrupted"] = None
-        if not isinstance(base.get("fact_meta"), dict):
-            base["fact_meta"] = {}
-        return base
-    except (OSError, ValueError):
+        except PermissionError:
+            continue                    # a writer's replace in flight; retry
+        except ValueError:
+            break                       # unparseable: handled below
+        except OSError:
+            return _blank(session_id)
+    else:
+        _log.warning("memory file %s stayed locked; reading it as blank", path)
         return _blank(session_id)
+    if not read or not isinstance(got, dict):
+        # Set it aside rather than let the next write bury it -- under the
+        # lock, so a write racing this read is not the thing quarantined.
+        with _LOCK:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    again = json.load(fh)
+                if isinstance(again, dict):
+                    got = again
+                else:
+                    quarantine_corrupt(path)
+                    return _blank(session_id)
+            except OSError:
+                return _blank(session_id)       # gone or locked: not corrupt
+            except ValueError:
+                quarantine_corrupt(path)
+                return _blank(session_id)
+    base = _blank(session_id)
+    base.update({k: v for k, v in got.items() if k in base})
+    for field in ("facts", "recent", "tasks"):
+        if not isinstance(base.get(field), list):
+            base[field] = []
+    for field in ("interrupted", "rewound"):
+        if not isinstance(base.get(field), dict):
+            base[field] = None
+    if not isinstance(base.get("fact_meta"), dict):
+        base["fact_meta"] = {}
+    return base
+
+
+def _replace_with_retry(tmp, path):
+    """os.replace, retried over transient sharing violations. Raises the last
+    error when every attempt failed."""
+    for pause in _IO_RETRY_SLEEPS:
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(pause)
+    os.replace(tmp, path)
 
 
 def _save(mem):
@@ -281,7 +368,7 @@ def _save(mem):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(mem, fh, ensure_ascii=False, indent=1)
-            os.replace(tmp, path)
+            _replace_with_retry(tmp, path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -289,7 +376,8 @@ def _save(mem):
                 pass
             raise
         return True
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError) as exc:
+        _log.warning("memory for %s was NOT saved: %s", mem.get("session_id"), exc)
         return False
 
 
@@ -661,6 +749,7 @@ def remember_summary(session_id, text, project_dir=None):
         # actually old (an agent that commits every turn moves HEAD every turn).
         mem["summary_rev"] = rev
         mem["summary_turn"] = int(mem.get("turns") or 0)
+        mem["summary_at"] = time.time()
         return _save(mem)
 
 
@@ -752,26 +841,44 @@ def tasks(session_id):
     return [t for t in (mem.get("tasks") or []) if isinstance(t, dict) and t.get("text")]
 
 
-def set_tasks(session_id, items, source=""):
+def _tasks_sig(items):
+    """A fingerprint of the list as the agent would read it."""
+    raw = "\n".join("%s%s%s" % ("x" if t.get("done") else ("~" if t.get("doing") else " "),
+                                "|", t.get("text", "")) for t in items or [])
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16] if raw else ""
+
+
+def set_tasks(session_id, items, source="", seen=False):
+    """Replace the task list. `seen` says the agent itself produced this list
+    (its own reply, or the PROGRESS.md it just wrote), so it need not be handed
+    the same list back; a list that changed any other way is (see
+    should_restate_rules)."""
     with _LOCK:
         mem = get(session_id)
-        mem["tasks"] = [{"text": str(t.get("text", ""))[:MAX_TASK_CHARS],
-                         "done": bool(t.get("done")), "doing": bool(t.get("doing"))}
-                        for t in (items or []) if isinstance(t, dict) and t.get("text")][:MAX_TASKS]
+        new = [{"text": str(t.get("text", ""))[:MAX_TASK_CHARS],
+                "done": bool(t.get("done")), "doing": bool(t.get("doing"))}
+               for t in (items or []) if isinstance(t, dict) and t.get("text")][:MAX_TASKS]
+        sig = _tasks_sig(new)
+        if sig != (mem.get("tasks_sig") or _tasks_sig(mem.get("tasks") or [])):
+            mem["tasks_at"] = time.time()
+        mem["tasks"] = new
+        mem["tasks_sig"] = sig
+        if seen:
+            mem["tasks_seen_sig"] = sig
         mem["tasks_source"] = str(source or "")[:80]
         return _save(mem)
 
 
-def update_tasks_from_text(session_id, text, source="reply"):
+def update_tasks_from_text(session_id, text, source="reply", seen=False):
     """A checklist in the agent's reply replaces the list -- when it IS a
     list. One checkbox line is a sentence with a box in it, not a plan."""
     items = parse_checklist(text)
     if len(items) < 2:
         return False
-    return set_tasks(session_id, items, source)
+    return set_tasks(session_id, items, source, seen=seen)
 
 
-def update_tasks_from_project(session_id, project_dir):
+def update_tasks_from_project(session_id, project_dir, seen=False):
     """The project's own PROGRESS.md (or TODO/PLAN/TASKS.md) wins over the
     reply: it is the copy the agent was told to keep, and it outlives the
     reply. Reads the first one that holds a checklist."""
@@ -787,15 +894,15 @@ def update_tasks_from_project(session_id, project_dir):
         except OSError:
             continue
         if items:
-            return set_tasks(session_id, items, name)
+            return set_tasks(session_id, items, name, seen=seen)
     return False
 
 
-def update_tasks(session_id, reply_text="", project_dir=None):
+def update_tasks(session_id, reply_text="", project_dir=None, seen=False):
     """Both sources, file first. Returns which one was used, or ""."""
-    if update_tasks_from_project(session_id, project_dir):
+    if update_tasks_from_project(session_id, project_dir, seen=seen):
         return "file"
-    if update_tasks_from_text(session_id, reply_text):
+    if update_tasks_from_text(session_id, reply_text, seen=seen):
         return "reply"
     return ""
 
@@ -826,16 +933,60 @@ def note_interrupted(session_id, request="", doing=(), partial="", why="stopped"
             "rev": refs.get("rev"),
             "refs": refs.get("refs") or [],
         }
+        # THE NOTE HAS TO REACH THE AGENT. The memory block (and this record,
+        # first in it) is only handed over on a turn that restates -- the first
+        # one, every RESTATE_EVERY-th, one after a compaction. A stop on turn 5
+        # followed by "continue" is an ordinary turn 6, so the record sat on
+        # disk and the agent started over. The next turn is due, whatever the
+        # schedule says.
+        mem["restate_due"] = True
         return _save(mem)
 
 
 def clear_interrupted(session_id):
     with _LOCK:
         mem = get(session_id)
-        if not mem.get("interrupted"):
+        if not mem.get("interrupted") and not mem.get("rewound"):
             return False
         mem["interrupted"] = None
+        # A turn that finished after a rewind has been told about it.
+        mem["rewound"] = None
         return _save(mem)
+
+
+# "continue", "resume", "keep going", "reprends", "vas-y", "termine" ... --
+# the user asking for the work to pick up where it was. Anchored at the start
+# and short: "continue the header in blue" is new work that happens to start
+# with the word, and is still a resume of the same job, which is fine.
+_RESUME_RE = re.compile(
+    r"^\s*(?:please\s+|ok(?:ay)?[,.!\s]+|s'il te pla[iî]t\s+)?"
+    r"(?:continue|continuer|continuez|continues|resume|keep going|go on|carry on|"
+    r"proceed|finish|reprends?|reprenez|poursuis|poursuivez|vas[- ]y|allez[- ]y|"
+    r"termine|terminer|finis|pick up where)\b", re.I)
+
+
+def asks_to_resume(text):
+    """Does this message ask for the unfinished work to carry on?"""
+    return bool(_RESUME_RE.match(text or ""))
+
+
+def request_restate(session_id):
+    """Make the next turn carry the memory block, whatever the schedule says."""
+    with _LOCK:
+        mem = get(session_id)
+        if mem.get("restate_due"):
+            return True
+        mem["restate_due"] = True
+        return _save(mem)
+
+
+def has_unfinished_work(session_id):
+    """A stopping place, a rewind, or an open item on the task list."""
+    mem = get(session_id)
+    if isinstance(mem.get("interrupted"), dict) or isinstance(mem.get("rewound"), dict):
+        return True
+    return any(isinstance(t, dict) and t.get("text") and not t.get("done")
+               for t in (mem.get("tasks") or []))
 
 
 def interrupted(session_id):
@@ -851,8 +1002,19 @@ def resume_block(session_id, budget_chars=900, project_dir=None, _cache=None):
     fact it might displace. "" when there is nothing to say."""
     mem = get(session_id)
     lines = []
+    back = mem.get("rewound") if isinstance(mem.get("rewound"), dict) else None
+    if back:
+        # The CLI's own thread still holds the undone turns; this is the only
+        # thing that tells it they are gone from disk.
+        lines += ["THIS CONVERSATION WAS REWOUND.",
+                  "The project files were restored to how they were before the "
+                  "message \"%s\"; anything done after that point is gone from "
+                  "disk." % (back.get("request") or "?"),
+                  "Check the files; do not assume that work exists."]
     cut = mem.get("interrupted") if isinstance(mem.get("interrupted"), dict) else None
     if cut:
+        if lines:
+            lines.append("")
         why = cut.get("why") or "stopped"
         lines += ["YOUR PREVIOUS TURN WAS %s BEFORE IT FINISHED."
                   % ("STOPPED BY THE USER" if why == "stopped" else "CUT SHORT (%s)" % why)]
@@ -939,6 +1101,12 @@ def should_restate_rules(session_id, every=RESTATE_EVERY):
     mem = get(session_id)
     if mem.get("restate_due"):
         return True                    # compaction just ate them; do not wait
+    # A task list the agent has not seen: edited in PROGRESS.md between turns,
+    # or put back by a rewind. Only lists fingerprinted by this code count, so
+    # an older memory file does not trigger on its first read.
+    sig = mem.get("tasks_sig") or ""
+    if sig and sig != (mem.get("tasks_seen_sig") or ""):
+        return True
     turns = int(mem.get("turns") or 0)
     last = int(mem.get("rules_restated_turn") or 0)
     return turns > 0 and (turns - last) >= every
@@ -949,6 +1117,22 @@ def mark_rules_restated(session_id):
         mem = get(session_id)
         mem["rules_restated_turn"] = int(mem.get("turns") or 0)
         mem["restate_due"] = False
+        # The block that is about to ship carries the current list.
+        mem["tasks_seen_sig"] = mem.get("tasks_sig") or ""
+        return _save(mem)
+
+
+def mark_memory_delivered(session_id):
+    """The memory block just went out with a turn: nothing is pending any
+    more. Unlike mark_rules_restated this leaves the restate SCHEDULE alone --
+    a first turn delivers the block without being a scheduled restate."""
+    with _LOCK:
+        mem = get(session_id)
+        sig = mem.get("tasks_sig") or ""
+        if not mem.get("restate_due") and (mem.get("tasks_seen_sig") or "") == sig:
+            return True
+        mem["restate_due"] = False
+        mem["tasks_seen_sig"] = sig
         return _save(mem)
 
 
@@ -1210,15 +1394,319 @@ def context_block(session_id, budget_chars=2000, project_dir=None,
 
 
 def forget(session_id):
-    """Drop one conversation's memory. Used when a conversation is deleted."""
+    """Drop one conversation's memory. Used when a conversation is deleted
+    (and when history retention prunes it), together with any in-flight
+    marker, so a deleted conversation cannot come back as an interrupt."""
     path = _path(session_id)
     if not path:
         return False
+    end_inflight(session_id)
     try:
         os.unlink(path)
         return True
     except OSError:
         return False
+
+
+# --------------------------------------------------------------------------- #
+# How much memory a turn can carry
+# --------------------------------------------------------------------------- #
+#
+# The memory block rode at a flat 2000 characters whatever the model's window:
+# a 200K-token session got the same 2000 as a 8K one. Scaled modestly with the
+# declared window -- 2000 by default, up to 6000 -- and never more than ~5% of
+# that window (at ~4 characters a token), so a small model is never flooded.
+MEMORY_BUDGET_DEFAULT = 2000
+MEMORY_BUDGET_MAX = 6000
+MEMORY_WINDOW_SHARE = 0.05
+_CHARS_PER_TOKEN = 4
+
+
+def budget_for_window(window_tokens):
+    """Characters of memory for a session whose model window is
+    `window_tokens` (None / 0 = unknown -> the default)."""
+    try:
+        w = int(window_tokens or 0)
+    except (TypeError, ValueError):
+        w = 0
+    if w <= 0:
+        return MEMORY_BUDGET_DEFAULT
+    scaled = max(MEMORY_BUDGET_DEFAULT, min(MEMORY_BUDGET_MAX, w // 32))
+    ceiling = int(w * MEMORY_WINDOW_SHARE * _CHARS_PER_TOKEN)
+    return max(0, min(scaled, ceiling))
+
+
+# --------------------------------------------------------------------------- #
+# A turn the process did not live to finish
+# --------------------------------------------------------------------------- #
+#
+# The stopping place is filed from the turn's own `finally` -- which never runs
+# when the PROCESS dies: an auto-update re-exec, a crash, a kill. The
+# auto-updater waits up to four hours for turns to end and the graceful stop
+# thirty seconds, then the turn is simply gone, and "continue" started over.
+#
+# So a turn leaves a small marker when it starts, refreshed (throttled) with
+# what it is doing, and removes it when it ends by any route. A marker still
+# there at boot is a turn that died with the process: recover_inflight turns it
+# into the same note_interrupted record a Stop leaves, so the next turn resumes
+# from exactly there.
+INFLIGHT_TOUCH_EVERY = 5.0
+_INFLIGHT_TOUCHED = {}
+
+
+def _inflight_dir():
+    return os.path.join(_root(), "inflight")
+
+
+def _inflight_path(session_id):
+    if not _path(session_id):
+        return None
+    return os.path.join(_inflight_dir(), session_id.strip() + ".json")
+
+
+def _write_json(path, obj):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(obj, fh, ensure_ascii=False)
+            _replace_with_retry(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return True
+    except (OSError, ValueError, TypeError) as exc:
+        _log.warning("could not write %s: %s", path, exc)
+        return False
+
+
+def inflight(session_id):
+    """The marker of a turn in progress, or None."""
+    path = _inflight_path(session_id)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            got = json.load(fh)
+        return got if isinstance(got, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def begin_inflight(session_id, request="", project_dir=None):
+    """A turn started: leave the marker a dead process would leave behind."""
+    path = _inflight_path(session_id)
+    if not path:
+        return False
+    now = time.time()
+    with _LOCK:
+        _INFLIGHT_TOUCHED[session_id] = time.monotonic()
+        return _write_json(path, {
+            "session_id": session_id.strip(), "started_at": now, "at": now,
+            "pid": os.getpid(),
+            "request": " ".join((request or "").split())[:300],
+            "project_dir": str(project_dir or ""),
+            "doing": [], "partial": ""})
+
+
+def touch_inflight(session_id, doing=None, partial=None, force=False):
+    """Refresh the marker with what the turn is doing. Throttled: a turn emits
+    many events and this is a disk write. Never raises: it runs inside the
+    turn's event loop."""
+    try:
+        return _touch_inflight(session_id, doing, partial, force)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _touch_inflight(session_id, doing, partial, force):
+    path = _inflight_path(session_id)
+    if not path:
+        return False
+    with _LOCK:
+        last = _INFLIGHT_TOUCHED.get(session_id)
+        if last is None:
+            return False                # no marker: nothing to refresh
+        if not force and time.monotonic() - last < INFLIGHT_TOUCH_EVERY:
+            return False
+        rec = inflight(session_id)
+        if rec is None:
+            return False
+        _INFLIGHT_TOUCHED[session_id] = time.monotonic()
+        rec["at"] = time.time()
+        if doing is not None:
+            rec["doing"] = [" ".join(str(d).split())[:MAX_TASK_CHARS]
+                            for d in list(doing)[-INTERRUPT_DOING:]]
+        if partial is not None:
+            rec["partial"] = " ".join(str(partial).split())[-INTERRUPT_PARTIAL_CHARS:]
+        return _write_json(path, rec)
+
+
+def end_inflight(session_id):
+    """The turn ended (finished, stopped, failed): no marker left behind."""
+    path = _inflight_path(session_id)
+    if not path:
+        return False
+    with _LOCK:
+        _INFLIGHT_TOUCHED.pop(session_id, None)
+        try:
+            os.unlink(path)
+            return True
+        except OSError:
+            return False
+
+
+def recover_inflight():
+    """At boot: every marker left by a process that died mid-turn becomes a
+    stopping place (why "hub restarted"). Returns the session ids recovered.
+
+    Markers of THIS process are left alone (a turn running now), and a marker
+    that does not parse is removed -- there is nothing in it to resume."""
+    d = _inflight_dir()
+    try:
+        names = [n for n in os.listdir(d) if n.endswith(".json")]
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        sid = name[:-5]
+        path = os.path.join(d, name)
+        rec = None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            rec = None
+        if isinstance(rec, dict) and rec.get("pid") == os.getpid():
+            continue
+        if isinstance(rec, dict) and _path(sid):
+            try:
+                note_interrupted(sid, request=rec.get("request") or "",
+                                 doing=rec.get("doing") or [],
+                                 partial=rec.get("partial") or "",
+                                 why="hub restarted",
+                                 project_dir=rec.get("project_dir") or None)
+                out.append(sid)
+            except Exception as exc:                             # noqa: BLE001
+                _log.warning("could not recover the turn of %s: %s", sid, exc)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Rewind, and memory nobody owns any more
+# --------------------------------------------------------------------------- #
+
+def rewind(session_id, cutoff=None, request="", kept_turns=None, project_dir=None):
+    """The memory half of a rewind to before a message.
+
+    The files and the transcript went back; the memory kept describing the
+    undone work -- its recent traces, a recap written after the point, a task
+    list and a stopping place from turns that no longer happened. `cutoff` is
+    the time the rewound-to message was sent: everything the memory learned at
+    or after it is dropped, the task list is re-read from the restored
+    PROGRESS.md, and the next turn is told the conversation was rewound (its
+    CLI thread still remembers the undone turns)."""
+    if not _path(session_id):
+        return False
+    try:
+        cut = float(cutoff) if cutoff is not None else None
+    except (TypeError, ValueError):
+        cut = None
+    with _LOCK:
+        mem = get(session_id)
+
+        def _after(stamp):
+            try:
+                return cut is None or float(stamp or 0) >= cut
+            except (TypeError, ValueError):
+                return True
+
+        mem["recent"] = [r for r in (mem.get("recent") or [])
+                         if isinstance(r, dict) and not _after(r.get("at"))]
+        stale_summary = _after(mem.get("summary_at")) if mem.get("summary_at") else (
+            kept_turns is None or int(mem.get("summary_turn") or 0) > int(kept_turns))
+        if mem.get("summary") and stale_summary:
+            mem.update({"summary": "", "summary_rev": None, "summary_turn": 0,
+                        "summary_at": 0.0})
+        if cut is not None:
+            meta = mem.get("fact_meta") if isinstance(mem.get("fact_meta"), dict) else {}
+            keep = []
+            for f in mem.get("facts") or []:
+                m = meta.get(_fact_key(f)) if isinstance(f, str) else None
+                if isinstance(m, dict) and m.get("at") and _after(m.get("at")):
+                    continue
+                keep.append(f)
+            mem["facts"] = keep
+            live = {_fact_key(f) for f in keep if isinstance(f, str)}
+            mem["fact_meta"] = {k: v for k, v in meta.items() if k in live}
+        if _after(mem.get("tasks_at")):
+            mem["tasks"], mem["tasks_source"] = [], ""
+            mem["tasks_sig"], mem["tasks_at"] = "", time.time()
+        cut_rec = mem.get("interrupted") if isinstance(mem.get("interrupted"), dict) else None
+        if cut_rec and _after(cut_rec.get("at")):
+            mem["interrupted"] = None
+        if kept_turns is not None:
+            kept = max(0, int(kept_turns))
+            mem["turns"] = min(int(mem.get("turns") or 0), kept)
+            mem["rules_restated_turn"] = min(int(mem.get("rules_restated_turn") or 0),
+                                             mem["turns"])
+        mem["rewound"] = {"at": time.time(),
+                          "request": " ".join((request or "").split())[:200]}
+        mem["restate_due"] = True
+        ok = _save(mem)
+    if project_dir:
+        update_tasks_from_project(session_id, project_dir)      # the restored list
+    return ok
+
+
+def prune_orphans(keep_ids=(), max_age_days=30):
+    """Delete memory nothing refers to any more. Returns the ids removed.
+
+    A conversation's memory used to outlive it forever: deleting it, history
+    retention pruning it, a multi-session run's workers finishing -- all left
+    `<id>.json` behind. At boot, a file older than `max_age_days` whose id is
+    not in `keep_ids` (the conversations history still has) goes. Project and
+    global memory are never touched: they outlive every conversation on
+    purpose. Leftover temp files and old corrupt-file backups go with the
+    same age rule."""
+    root = _root()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    keep = {str(k) for k in (keep_ids or ()) if k}
+    cutoff = time.time() - max(0.0, float(max_age_days)) * 86400
+    removed = []
+    for name in names:
+        path = os.path.join(root, name)
+        try:
+            if not os.path.isfile(path) or os.path.getmtime(path) >= cutoff:
+                continue
+        except OSError:
+            continue
+        if name.endswith(".json"):
+            sid = name[:-5]
+            if sid == GLOBAL_KEY or sid.startswith("proj-") or sid in keep:
+                continue
+            if inflight(sid) is not None:
+                continue
+        elif not (name.endswith(".tmp") or ".json.corrupt-" in name):
+            continue
+        try:
+            os.unlink(path)
+            if name.endswith(".json"):
+                removed.append(name[:-5])
+        except OSError:
+            pass
+    return removed
 
 
 def stats():
