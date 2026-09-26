@@ -56,6 +56,19 @@ routing heuristics.
   all-slow category for fast models. Pipelines keep `swarm_max_seconds` inside
   an outer bound (`_pipeline_outer_bound`). Covered by
   `tests/test_request_deadline.py`.
+- Trivial-turn speed (`tests/test_trivial_speed.py`): a (pid, model) that
+  429'd or ran out its time in the last 10 min (`_recent_hop_fail`,
+  `_RECENT_FAIL_TTL`) is out of the primary pick and at the TAIL of every
+  chain (kept, never dropped; not for a pinned model). The 25s/45s budgets are
+  now ceilings: a measured hop gets max(6s, 3x p90) (`_adaptive_hop_budget`).
+  Trivial tool-free small turns HEDGE (`_ChainClock.plan_hedge`, flag
+  `hedge_simple_turns`): after 1.5x p50 (min 3s) of silence the next candidate
+  starts in parallel, first answer that passes answer_check wins, at most one
+  extra call, nothing sent to the client before; the loops rebind their hop
+  to `_clock.served(...)`. A short streamed answer whose `[DONE]` arrives as
+  its own read is content, not "empty" (`_peek_until_content`), and a peek
+  never cuts a hop already writing visible text (`content_grace`).
+  `tests/conftest.py` clears the ledger between tests.
 - `X-Free-LLM-Hub-Last-Error` response header (timeout/conn/413/429/http-N/
   empty/none) names the last hop-failure class; on `/v1/responses` it appears
   on chain-exhausted errors. Diagnosis is one `curl -i` away.
