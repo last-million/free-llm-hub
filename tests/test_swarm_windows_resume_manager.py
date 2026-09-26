@@ -54,14 +54,16 @@ def _wait(rid, timeout=30):
     raise AssertionError("run did not finish")
 
 
-def _interrupted_run():
-    run = SW._Run("build it", ".", "opencode", PHASES)
+def _interrupted_run(managed=True):
+    run = SW._Run("build it", ".", "opencode", PHASES,
+                  manager=_Manager() if managed else None)
     run.agents[0].state = SW.DONE
     run.agents[0].summary = "a was done before"
     run.agents[1].state = SW.RUNNING
     run.agents[2].state = SW.PENDING
     run.state = SW.RUNNING
-    run.manager_tokens, run.manager_calls = 500, 3     # spent before the restart
+    if managed:
+        run.manager_tokens, run.manager_calls = 500, 3     # spent before the restart
     SW._persist(run)
     with SW._LOCK:
         SW._RUNS.clear()
@@ -120,3 +122,20 @@ def test_the_hub_passes_its_manager_on_resume_only_when_enabled(monkeypatch):
     assert seen[0]["manager"] is A._swarm_windows_manager
     assert "manager" not in seen[1]
     assert isinstance(seen[0]["modes"], tuple)
+
+
+def test_resume_never_attaches_a_manager_to_a_run_started_without_one():
+    run = _interrupted_run(managed=False)
+    mgr = _Manager()
+    assert SW.resume_interrupted(_spawn, _turn, manager=mgr) == [run.id]
+    st = _wait(run.id)
+    assert st["state"] == SW.DONE
+    assert SW.get(run.id).manager is None and mgr.calls == []
+    assert st["manager_tokens"] == 0 and st["managed"] is False
+
+
+def test_a_row_from_before_managed_existed_reads_it_from_the_cost():
+    row = SW._Run("g", ".", "opencode", PHASES).row()
+    row.pop("managed")
+    assert SW._Run.from_row(dict(row, manager_calls=2)).managed is True
+    assert SW._Run.from_row(dict(row, manager_calls=0)).managed is False

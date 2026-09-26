@@ -249,3 +249,17 @@ def test_apply_tokens_scale_with_the_work_within_bounds():
     assert swarm._apply_tokens("x" * 100, 4000) == 4000
     assert swarm._apply_tokens("x" * 21000, 4000) == 21000 // 3 + 500
     assert swarm._apply_tokens("x" * 10 ** 6, 4000) == swarm.APPLY_MAX_TOKENS
+
+
+def test_a_draft_too_long_for_any_apply_pays_for_no_instructions():
+    """No apply can return enough of a ~58K-char draft (8000-token ceiling vs
+    the 70% keep check), so the manager is not paid to instruct and no free
+    apply runs; synthesis still gets the reviewer's problems."""
+    big = {"Hero": "Start free. " + _long("hero", 3200),
+           "Pricing": "Pricing tiers. " + _long("price", 3200)}
+    d = _free(phase=lambda user, st: big["Hero"] if "Hero" in user else big["Pricing"])
+    m = _manager(GOOD)
+    swarm.run(ASK, d, profile=REV, manager=m)
+    assert m.of("instruct") == [] and d.of("apply") == []
+    assert "fix" not in [c["purpose"] for c in m.calls]
+    assert "REVIEWER PROBLEMS TO FIX" in d.of("synth")[0]["user"]

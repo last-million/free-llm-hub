@@ -64,12 +64,21 @@ def _blank(m):
     return "\n".join(" " * len(part) for part in m.group(0).split("\n"))
 
 
-def _mask_code(text):
+def _mask_code(text, partial=False):
     """Same-length copy of `text` with code blanked to spaces (newlines kept),
-    so every index found on the mask is valid on the original."""
+    so every index found on the mask is valid on the original.
+
+    `partial`: the text is a stream still in progress, so an inline span whose
+    closing backtick has not arrived yet ("wrapped in `<think") is code too --
+    the fence rule's end-of-text fallback, for inline code."""
     if "`" not in text:
         return text
-    return _INLINE_CODE_RE.sub(_blank, _FENCE_RE.sub(_blank, text))
+    out = _INLINE_CODE_RE.sub(_blank, _FENCE_RE.sub(_blank, text))
+    if partial:
+        i = out.find("`", out.rfind("\n") + 1)
+        if i != -1 and len(out) - i <= 300:
+            out = out[:i] + " " * (len(out) - i)
+    return out
 
 
 # Loop checks need a DIFFERENT mask: blanking made "- `app.py` updated" and
@@ -202,6 +211,10 @@ _LINE_MIN_LEN = 12
 _LINE_MIN_RUN = 3
 _END_MIN_RUN = 5
 _MID_MIN_RUN = 8
+# finish_reason for text of a stream still in progress: its current end is not
+# the answer's end (every mid-text repeat is briefly "at the end"), so a loop
+# reaching it needs the MID-text copy count.
+PARTIAL = "__partial__"
 # A looping unit is 8..160 chars: shorter is "ha ha ha" / "0x00, 0x00" land,
 # longer is a paragraph (caught per line by _line_loop).
 _UNIT_MIN = 8
@@ -225,6 +238,8 @@ def _line_is_meaningful(norm):
 
 
 def _end_min_run(finish_reason):
+    if finish_reason == PARTIAL:
+        return _MID_MIN_RUN
     return _LINE_MIN_RUN if finish_reason == "length" else _END_MIN_RUN
 
 
@@ -320,6 +335,9 @@ def _tail_loop(masked, prompt_text, finish_reason=None):
 _GLUE_MIN, _GLUE_MAX = 2, 16
 _GLUE_MIN_RUN_CAP = 4
 _GLUE_MIN_RUN = 8
+# ...and 32 on a stream still going: "1010101010101010" (8 copies) mid-sentence
+# is a number the next delta continues past.
+_GLUE_MIN_RUN_PARTIAL = 32
 _NUMBER_PREFIX_RE = re.compile(r"(?:\d[.,]|0[xXbBoO])$")
 _REPEAT_ASK_RE = re.compile(r"repeat|times|répét|fois", re.I)
 
@@ -343,7 +361,8 @@ def _glued_loop(masked, prompt_text, finish_reason):
     s = masked.rstrip()
     n = len(s)
     capped = finish_reason == "length"
-    need = _GLUE_MIN_RUN_CAP if capped else _GLUE_MIN_RUN
+    need = _GLUE_MIN_RUN_CAP if capped else (
+        _GLUE_MIN_RUN_PARTIAL if finish_reason == PARTIAL else _GLUE_MIN_RUN)
     for p in range(_GLUE_MIN, _GLUE_MAX + 1):
         if 4 * p > n:
             break
@@ -645,7 +664,7 @@ def _clip(text):
 
 
 def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
-            last_prompt=None):
+            last_prompt=None, partial=False):
     """Judge one answer's text.
 
     Returns {"ok": bool, "reasons": [...], "salvage": str|None}. `reasons` may
@@ -656,7 +675,9 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
     it alone, since an earlier turn's format request does not bind a later
     "now explain why"; it defaults to `prompt_text`. Never raises: any
     internal error reports ok=True -- the gate must never be the thing that
-    loses an answer."""
+    loses an answer. `partial`: `text` is a stream still in progress (no
+    finish yet), so loops reaching its current end need the mid-text copy
+    count and an inline code span still open at the end is masked."""
     result = {"ok": True, "reasons": [], "salvage": None}
     try:
         if not isinstance(text, str) or not text.strip():
@@ -673,15 +694,16 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
         # is AT the tail, and indices below are shifted back onto `text`.
         offset = max(0, len(text) - _MAX_SCAN)
         body = _clip(text)
-        masked = _mask_code(body)
+        masked = _mask_code(body, partial)
         loop_masked = _mask_fences_distinct(body)
+        loop_fin = PARTIAL if partial and not finish_reason else finish_reason
         cuts = []
         checks = (
             ("runaway_script", lambda: _script_switch(body, masked, prompt_text,
                                                       finish_reason, at_start=offset == 0)),
-            ("repetition", lambda: _line_loop(loop_masked, prompt_text, finish_reason)),
-            ("repetition", lambda: _tail_loop(loop_masked, prompt_text, finish_reason)),
-            ("repetition", lambda: _glued_loop(loop_masked, prompt_text, finish_reason)),
+            ("repetition", lambda: _line_loop(loop_masked, prompt_text, loop_fin)),
+            ("repetition", lambda: _tail_loop(loop_masked, prompt_text, loop_fin)),
+            ("repetition", lambda: _glued_loop(loop_masked, prompt_text, loop_fin)),
             ("separator_run", lambda: _separator_run(masked, finish_reason)),
             ("tool_markup", lambda: _markup_leak(masked, prompt_text, tools_offered)),
             ("reasoning_leak", lambda: _reasoning_leak(masked, prompt_text)),
@@ -712,10 +734,12 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
 # --------------------------------------------------------------------------- #
 # Rolling tail check for a stream still in progress
 # --------------------------------------------------------------------------- #
-TAIL_WINDOW = 300
+# 8 copies (the mid-text count) of a 160-char unit must fit.
+TAIL_WINDOW = 1300
 
 
-def inspect_tail(text, *, window=TAIL_WINDOW, prompt_text=None, tools_offered=False):
+def inspect_tail(text, *, window=TAIL_WINDOW, prompt_text=None, tools_offered=False,
+                 state=None):
     """Offset in `text` where junk starts, judged on its last `window` chars
     only, or None. For a STREAM already released to the client: run on every
     visible delta, so it must stay O(window), and it never judges the head
@@ -724,10 +748,14 @@ def inspect_tail(text, *, window=TAIL_WINDOW, prompt_text=None, tools_offered=Fa
     Only the tail-shaped failures: a loop running to the current end, a
     separator run, a script switch, leaked tool/reasoning markup. The brevity
     trim is not here -- a streamed answer past the hold window already is not
-    short. No finish_reason: the stream has not finished, so every loop needs
-    its natural-stop copy count. Fence state comes from the FULL text, so a
-    window opening inside a code block still has that code masked. Never
-    raises (None)."""
+    short. No finish_reason: the stream has not finished, so its current end
+    is not the answer's end and a loop reaching it needs the MID-text copy
+    count (a line printed five times mid-answer is content until it keeps
+    going). Fence state comes from the FULL text, so a window opening inside
+    a code block still has that code masked. `state` (a dict the caller keeps
+    per stream) caches the foreign-script scan of the text before the window,
+    so repeated calls on a growing text stay O(new text). Never raises
+    (None)."""
     try:
         if not isinstance(text, str) or not text.strip():
             return None
@@ -740,15 +768,22 @@ def inspect_tail(text, *, window=TAIL_WINDOW, prompt_text=None, tools_offered=Fa
             line = text.rfind("\n", 0, start) + 1
             if start - line <= window:
                 start = line
-        before = text[:start]
-        pad = "```\n" if before.count("```") % 2 else ""
+        pad = "```\n" if text.count("```", 0, start) % 2 else ""
         body = pad + text[start:]
-        masked = _mask_code(body)
+        masked = _mask_code(body, True)
         loop_masked = _mask_fences_distinct(body)
         # A reply ALREADY in a foreign script is not switching now; whole-reply
         # script judgement was inspect()'s job on the head.
+        if state is None:
+            state = {}
+        pos = state.get("fpos", 0)
+        if pos > start:
+            pos, state["foreign"] = 0, False
+        if not state.get("foreign") and pos < start:
+            state["foreign"] = _ANY_FOREIGN_RE.search(text, pos, start) is not None
+        state["fpos"] = start
         script = None
-        if not (start and _ANY_FOREIGN_RE.search(before)):
+        if not (start and state.get("foreign")):
             script = _script_switch(body, masked, prompt_text, None, at_start=start == 0)
         # A stray </think> only counts closing a SHORT head (inspect's rule); a
         # window's own head is not the reply's, so mid-stream it never counts.
@@ -756,9 +791,9 @@ def inspect_tail(text, *, window=TAIL_WINDOW, prompt_text=None, tools_offered=Fa
             if start else masked
         found = [c for c in (
             script,
-            _line_loop(loop_masked, prompt_text),
-            _tail_loop(loop_masked, prompt_text),
-            _glued_loop(loop_masked, prompt_text, None),
+            _line_loop(loop_masked, prompt_text, PARTIAL),
+            _tail_loop(loop_masked, prompt_text, PARTIAL),
+            _glued_loop(loop_masked, prompt_text, PARTIAL),
             _separator_run(masked, None),
             _markup_leak(masked, prompt_text, tools_offered),
             _reasoning_leak(lead, prompt_text),

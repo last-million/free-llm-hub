@@ -129,6 +129,9 @@ APPLY_MAX_TOKENS = 8000          # a free apply's output ceiling (big drafts)
 # A free apply that returns less than this share of the work dropped content
 # (output cap, or it "summarised"): rejected before any verdict is paid for.
 APPLY_MIN_KEEP = 0.7
+# Output chars one token buys, generously: a work longer than
+# apply-ceiling * this / APPLY_MIN_KEEP cannot come back whole from one apply.
+APPLY_CHARS_PER_TOKEN = 4
 
 
 def _clip(text, limit):
@@ -897,6 +900,12 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         problems are applied as-is -- unless `need_instructions`."""
         trail = []
         if _spent():
+            return "", None, trail
+        if len(work or "") * APPLY_MIN_KEEP > _apply_tokens(work, floor) * APPLY_CHARS_PER_TOKEN:
+            # No apply can return enough of this work to pass the keep check
+            # (its output ceiling is too small), so do not pay the manager for
+            # instructions -- or two free applies -- that can never be accepted.
+            emit("fix", "%s: too long for one apply — kept as is" % label[:30])
             return "", None, trail
         probs = [str(p) for p in problems if str(p).strip()][:10]
         instr, iwho = _mgr(

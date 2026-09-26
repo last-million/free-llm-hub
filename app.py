@@ -19377,12 +19377,14 @@ def _close_hedge_item(item):
 
 
 def _run_hedge_leg(idx, pid, payload, stream, lines, budget, q, lock, abandoned,
-                   grace, streaming=None):
+                   grace, streaming=None, live=None):
     """One leg of a hedged hop, on its own thread. Puts (idx, kind, obj, extra)
     on `q`: kind "exc" (obj = the exception), "resp" (a non-200), "json" (a
     non-streamed 200) or "peek" (a streamed 200 already peeked to its first
     content: extra = (status, buffered, iterator)). A leg the caller stopped
-    waiting for closes its own response instead."""
+    waiting for closes its own response instead. `live` (idx -> response,
+    under `lock`) lets the caller close a leg's response while the leg is
+    still peeking it, so a loser stops reading upstream at once."""
     started = time.monotonic()
     try:
         resp = _dispatch_chat(pid, payload, stream)
@@ -19390,6 +19392,14 @@ def _run_hedge_leg(idx, pid, payload, stream, lines, budget, q, lock, abandoned,
         item = (idx, "exc", exc, None)
     else:
         item = (idx, "resp", resp, None)
+        if live is not None:
+            with lock:
+                gone = idx in abandoned
+                if not gone:
+                    live[idx] = resp
+            if gone:
+                _close_hedge_item(item)
+                return
         if getattr(resp, "status_code", None) == 200:
             if not stream:
                 item = (idx, "json", resp, None)
@@ -19407,6 +19417,8 @@ def _run_hedge_leg(idx, pid, payload, stream, lines, budget, q, lock, abandoned,
                     _close_hedge_item(item)
                     item = (idx, "exc", exc, None)
     with lock:
+        if live is not None:
+            live.pop(idx, None)
         drop = idx in abandoned
         if not drop:
             q.put(item)
@@ -19584,6 +19596,7 @@ class _ChainClock:
         q = queue.Queue()
         lock = threading.Lock()
         abandoned = set()
+        live = {}                    # idx -> response of a leg still peeking
         streaming = set()            # legs whose visible text has started
         grace = self.content_grace()
         graced = False
@@ -19594,7 +19607,7 @@ class _ChainClock:
 
             def _run():
                 ctx.run(_run_hedge_leg, idx, p, pl, stream, lines, budget, q, lock,
-                        abandoned, grace, streaming)
+                        abandoned, grace, streaming, live)
             threading.Thread(target=_carry_usage_source(_run), daemon=True).start()
 
         budget0 = self._hop_budget
@@ -19605,13 +19618,21 @@ class _ChainClock:
         pending = {0}
         fallback = None
         failed = {}
+        # Each leg's verdict as judged in the race: _answer_gate salvages a
+        # junk JSON answer IN PLACE, so re-judging it later reads "ok".
+        verdicts = {}
         while pending:
-            wait_to = end if fired else min(t0 + delay, end)
+            wait_to = end if fired or 0 in streaming else min(t0 + delay, end)
             try:
                 item = q.get(timeout=max(0.0, wait_to - time.monotonic()))
             except queue.Empty:
                 now = time.monotonic()
                 if not fired and now < end:
+                    if 0 in streaming:
+                        # Leg 0 is answering (slowly, under the judge
+                        # threshold): it has not "produced nothing", so there
+                        # is nothing to hedge -- wait out its budget instead.
+                        continue
                     p1, m1 = partner
                     pl1 = self._hedge_payload(p1, m1, stream)
                     budget1 = self._budget_for(p1, m1, stream) or budget0
@@ -19640,14 +19661,15 @@ class _ChainClock:
                 # Leg 0 came back before the hedge was needed: hand it to the
                 # loop EXACTLY as a plain dispatch would have, so its whole
                 # error handling (starved retry, soft 400, junk gate) applies.
-                self._settle(lock, abandoned, q, legs, keep=None)
+                self._settle(lock, abandoned, q, legs, keep=None, live=live)
                 return self._loop_result(item, legs)
-            verdict = _hedge_leg_verdict(item, legs[idx][2])
+            verdict = verdicts[idx] = _hedge_leg_verdict(item, legs[idx][2])
             if verdict == "ok":
-                self._settle(lock, abandoned, q, legs, keep=idx)
+                self._settle(lock, abandoned, q, legs, keep=idx, live=live)
                 if fallback is not None:
-                    _close_hedge_item(fallback)
-                self._record_losers(failed, legs)
+                    # A junk answer that lost the race is still junk.
+                    failed[fallback[0]] = fallback
+                self._record_losers(failed, legs, verdicts)
                 if idx:
                     _log.info("[hedge] %s/%s won the race", legs[1][0], legs[1][1])
                 return self._loop_result(item, legs)
@@ -19656,27 +19678,36 @@ class _ChainClock:
                 continue
             failed[idx] = item
         # Nobody produced a valid answer in time.
-        self._settle(lock, abandoned, q, legs, keep=None)
+        self._settle(lock, abandoned, q, legs, keep=None, live=live)
         now = time.monotonic()
         for idx in pending:
             if now - legs[idx][3] >= _ADAPTIVE_HOP_FLOOR:
                 _note_recent_hop_failure(legs[idx][0], legs[idx][1], "deadline")
         if fallback is not None:
-            self._record_losers(failed, legs)
+            self._record_losers(failed, legs, verdicts)
             return self._loop_result(fallback, legs)
         if 0 in failed:
             # Leg 0's own failure goes to the loop as if unhedged; leg 1's is
             # recorded here, since the loop never sees it.
-            self._record_losers({k: v for k, v in failed.items() if k}, legs)
+            self._record_losers({k: v for k, v in failed.items() if k}, legs,
+                                verdicts)
             return self._loop_result(failed[0], legs)
-        self._record_losers(failed, legs)
+        self._record_losers(failed, legs, verdicts)
         raise _HopBudgetExceeded("no answer within %.0fs (hedged)" % (now - t0))
 
-    def _settle(self, lock, abandoned, q, legs, keep):
-        """Stop waiting on every leg but `keep`: a leg still running closes its
-        own response when it finishes; one already queued is closed here."""
+    def _settle(self, lock, abandoned, q, legs, keep, live=None):
+        """Stop waiting on every leg but `keep`: a leg still peeking has its
+        response closed here (its blocked read then fails and the leg exits,
+        instead of reading upstream until its own budget and grace run out);
+        one already queued is closed here too."""
         with lock:
             abandoned.update(i for i in legs if i != keep)
+            running = [r for i, r in (live or {}).items() if i != keep]
+        for r in running:
+            try:
+                r.close()
+            except Exception:                                    # noqa: BLE001
+                pass
         while True:
             try:
                 item = q.get_nowait()
@@ -19685,7 +19716,7 @@ class _ChainClock:
             if item[0] != keep:
                 _close_hedge_item(item)
 
-    def _record_losers(self, failed, legs):
+    def _record_losers(self, failed, legs, verdicts=None):
         """File the failures of legs whose result the loop will never see."""
         for idx, item in failed.items():
             p, m = legs[idx][0], legs[idx][1]
@@ -19703,9 +19734,12 @@ class _ChainClock:
                     elif code >= 500:
                         _throttle_failed_hop(p, m)
                 else:
-                    verdict = _hedge_leg_verdict(item, legs[idx][2])
-                    if verdict == "junk":
-                        _record_outcome(p, m, False)
+                    verdict = (verdicts or {}).get(idx) \
+                        or _hedge_leg_verdict(item, legs[idx][2])
+                    if verdict in ("junk", "salvaged"):
+                        # As the loop files a junk answer (_JUNK_FAIL_WEIGHT +
+                        # the junk bench): losing the race is no excuse.
+                        _record_outcome(p, m, False, junk=True)
                     elif verdict == "nonanswer":
                         _note_nonanswer(p, m)
                     elif verdict == "timeout":
@@ -19960,8 +19994,12 @@ _DEADLINE_CUT_LINE = (
 # which commits the stream immediately without waiting for any of this.
 _PEEK_JUDGE_CHARS = 600
 # A tool-call delta in an SSE frame, in any of the three protocols' shapes.
+# An EMPTY key is not a tool call: LiteLLM-style relays serialize every content
+# delta with "tool_calls":null,"function_call":null, which used to disarm the
+# stream gate (and commit the peek) on the first frame of a plain answer.
 _STREAM_TOOLCALL_RE = re.compile(
-    rb'"(?:tool_calls|function_call|tool_use|function_call_arguments)"', re.I)
+    rb'"(?:tool_calls|function_call|tool_use|function_call_arguments)"'
+    rb'(?!\s*:\s*(?:null\b|\[\s*\]|\{\s*\}|""))', re.I)
 
 
 def _judge_peeked(chunks, check=None, raw_items=None):
@@ -20746,6 +20784,15 @@ def _sse_answer_digest(raw_frames):
 # --------------------------------------------------------------------------- #
 _HOLD_CHARS = 400
 _HOLD_SECONDS = 2.5
+# The rolling tail check costs O(window) per call, so after release it runs
+# once per _TAIL_EVERY new chars rather than on every delta -- MEASURED before:
+# a 60 KB answer in 4-char deltas spent 13.9 s of CPU in tail checks. A delta
+# carrying a leak-marker char (<think>, <tool_call>, <|im_end|>, "Thought:")
+# is still judged at once, so leaked markup never reaches the client; a loop
+# or script switch is cut at most _TAIL_EVERY chars late (the cut point
+# itself is unchanged).
+_TAIL_EVERY = 64
+_TAIL_TRIGGER_CHARS = frozenset("<>:|")
 _SSE_FRAME_END_RE = re.compile(rb"\r?\n\r?\n")
 
 
@@ -20767,7 +20814,10 @@ class _StreamAnswerGate:
         self._hold_chars = _HOLD_CHARS if hold_chars is None else hold_chars
         self._hold_seconds = _HOLD_SECONDS if hold_seconds is None else hold_seconds
         self._rest = b""
-        self._text = ""
+        self._parts = []             # visible text so far (joined lazily)
+        self._len = 0
+        self._judged = 0             # self._len at the last tail check
+        self._tail_state = {}        # answer_check.inspect_tail's scan cache
         self._emitted = 0            # chars of self._text already sent
         self._meta = {}              # id / created / model of the upstream chunks
         self.cut = False
@@ -20775,6 +20825,18 @@ class _StreamAnswerGate:
 
     def __iter__(self):
         return self._run()
+
+    @property
+    def _text(self):
+        # str += on an attribute copies the whole answer on every delta; the
+        # parts are joined only when something reads the text.
+        if len(self._parts) > 1:
+            self._parts = ["".join(self._parts)]
+        return self._parts[0] if self._parts else ""
+
+    def _add(self, t):
+        self._parts.append(t)
+        self._len += len(t)
 
     # -- framing ----------------------------------------------------------- #
     def _frames(self, item):
@@ -20869,12 +20931,15 @@ class _StreamAnswerGate:
                 pass
         return out
 
-    def _judge_held(self, fin):
-        """None when the held text is clean, else the frames ending the stream."""
+    def _judge_held(self, fin, partial=False):
+        """None when the held text is clean, else the frames ending the stream.
+        `partial`: the model is still going (the hold window ran out), so the
+        held text's end is not the answer's end."""
         try:
             v = answer_check.inspect(
                 self._text, prompt_text=self._prompt, tools_offered=self._tools,
-                finish_reason=fin, last_prompt=self._last_prompt)
+                finish_reason=fin, last_prompt=self._last_prompt,
+                partial=partial and not fin)
         except Exception:                                        # noqa: BLE001
             return None
         if v.get("ok", True):
@@ -20883,10 +20948,15 @@ class _StreamAnswerGate:
         end = len(salvage) if salvage and self._text.startswith(salvage) else 0
         return self._cut_at(end, v.get("reasons"))
 
-    def _judge_tail(self):
+    def _judge_tail(self, t=""):
+        if self._len - self._judged < _TAIL_EVERY \
+                and not _TAIL_TRIGGER_CHARS.intersection(t):
+            return None
+        self._judged = self._len
         try:
             c = answer_check.inspect_tail(self._text, prompt_text=self._prompt,
-                                          tools_offered=self._tools)
+                                          tools_offered=self._tools,
+                                          state=self._tail_state)
         except Exception:                                        # noqa: BLE001
             return None
         if c is None:
@@ -20929,13 +20999,13 @@ class _StreamAnswerGate:
                     kind, val = q.get(timeout=wait)
                 except queue.Empty:
                     # The hold window ran out with the model still going.
-                    stop_frames = self._judge_held(None)
+                    stop_frames = self._judge_held(None, partial=True)
                     if stop_frames:
                         yield from stop_frames
                         return
                     yield from held
                     held, holding = [], False
-                    self._emitted = len(self._text)
+                    self._emitted = self._judged = self._len
                     continue
                 if kind == "end":
                     break
@@ -20971,27 +21041,27 @@ class _StreamAnswerGate:
                         yield fr
                         continue
                     if k == "text":
-                        self._text += t
+                        self._add(t)
                         if holding:
                             held.append(fr)
                             if first_at is None:
                                 first_at = time.monotonic()
-                            if not fin and len(self._text) < self._hold_chars \
+                            if not fin and self._len < self._hold_chars \
                                     and time.monotonic() - first_at < self._hold_seconds:
                                 continue
-                            stop_frames = self._judge_held(fin)
+                            stop_frames = self._judge_held(fin, partial=True)
                             if stop_frames:
                                 yield from stop_frames
                                 return
                             yield from held
                             held, holding = [], False
-                            self._emitted = len(self._text)
+                            self._emitted = self._judged = self._len
                             continue
-                        stop_frames = self._judge_tail()
+                        stop_frames = self._judge_tail(t)
                         if stop_frames:
                             yield from stop_frames
                             return
-                        self._emitted = len(self._text)
+                        self._emitted = self._len
                         yield fr
                         continue
                     # 'finish' / 'done': the model is done talking.
@@ -21002,7 +21072,7 @@ class _StreamAnswerGate:
                             return
                         yield from held
                         held = []
-                        self._emitted = len(self._text)
+                        self._emitted = self._len
                     holding = False
                     yield fr
                 if armed and len(self._rest) > _SSE_FRAME_CAP:
@@ -24359,7 +24429,7 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
 
 
 @app.route("/v1/responses", methods=["POST"])
-def v1_responses(_retry_pass=False):
+def v1_responses(_retry_pass=False, _hedged=False):
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return _openai_error("Invalid JSON body.", 400)
@@ -24462,9 +24532,12 @@ def v1_responses(_retry_pass=False):
     _chain = _build_chain(pid, resolved, est, require_vision=has_images,
                           require_tools=has_tools, messages=messages,
                           **_pin_kw)
-    # See the twin in /v1/chat/completions (hedging a trivial turn).
-    _clock.plan_hedge(_chain, base_payload, diff, est=est, tools=has_tools,
-                      images=has_images, lines=True)
+    # See the twin in /v1/chat/completions (hedging a trivial turn). A retry
+    # pass after a walk that already hedged may not hedge again: one extra
+    # upstream call per client request, not per walk.
+    if not _hedged:
+        _clock.plan_hedge(_chain, base_payload, diff, est=est, tools=has_tools,
+                          images=has_images, lines=True)
     for hop_pid, hop_model in _chain:
         if _clock.consumed(hop_pid, hop_model):
             continue              # a hedge already ran this hop
@@ -24722,7 +24795,7 @@ def v1_responses(_retry_pass=False):
         _log.info("[chain] all %d hops transient (429/5xx) — backing off %.1fs and retrying",
                   len(errors), _CHAIN_RETRY_DELAY)
         time.sleep(_CHAIN_RETRY_DELAY)
-        return v1_responses(_retry_pass=True)
+        return v1_responses(_retry_pass=True, _hedged=_clock._hedge_fired)
     eta = _capacity_eta()
     # DIAG (temporary): the access log only shows "503" — record WHY the responses
     # chain (Codex's path) exhausted so the real root cause is visible, not guessed.

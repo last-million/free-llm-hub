@@ -528,3 +528,103 @@ def test_every_chain_loop_can_hedge():
     assert src.count("_clock.served(hop_pid, hop_model, payload)") == 3
     assert src.count("if _clock.consumed(hop_pid, hop_model):") == 3
     assert src.count("_clock.note_peek(hop_pid, hop_model, status)") == 3
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes (hedge losers, streaming leg 0, cancellation, retry pass)
+# --------------------------------------------------------------------------- #
+
+def _outcomes(monkeypatch):
+    got = []
+    monkeypatch.setattr(A, "_record_outcome",
+                        lambda pid, m, ok, junk=False: got.append((pid, m, ok, junk)))
+    return got
+
+
+@pytest.mark.parametrize("junk_reply", ["<|im_end|>" * 60,
+                                        "5768<|im_end|>" + "<|im_end|>" * 40])
+def test_a_junk_hedge_loser_is_a_junk_strike(quiet, hedge_fast, monkeypatch, junk_reply):
+    got = _outcomes(monkeypatch)
+    _route_to(monkeypatch, "slowp", "slow-model")
+    _chain(monkeypatch, ("slowp", "slow-model"), ("fastp", "quick-model"))
+    calls = []
+    monkeypatch.setattr(A, "_dispatch_chat", _slow_then_fast(
+        calls, slow_s=0.5, slow_reply=lambda: _Resp(200, _answer("5768")),
+        fast_reply=lambda: _Resp(200, _answer(junk_reply))))
+    r = A.app.test_client().post("/v1/chat/completions", json={
+        "model": "auto", "stream": False,
+        "messages": [{"role": "user", "content": QUESTION}]})
+    assert r.get_json()["model"] == "slowp/slow-model"
+    assert ("fastp", "quick-model", False, True) in got, got
+
+
+def test_no_hedge_while_leg_zero_is_already_writing(quiet, hedge_fast, monkeypatch):
+    _route_to(monkeypatch, "slowp", "slow-model")
+    _chain(monkeypatch, ("slowp", "slow-model"), ("fastp", "quick-model"))
+
+    def writing():
+        yield b'data: {"choices":[{"delta":{"content":"57"}}]}\n\n'
+        time.sleep(0.6)                # past the 0.2s hedge delay
+        yield b'data: {"choices":[{"delta":{"content":"68"}}]}\n\n'
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+    calls = []
+    monkeypatch.setattr(A, "_dispatch_chat", _slow_then_fast(
+        calls, slow_s=0, slow_reply=lambda: _Resp(200, chunks=writing()),
+        fast_reply=lambda: _Resp(200, chunks=[SSE_ANSWER])))
+    r = A.app.test_client().post("/v1/chat/completions", json={
+        "model": "auto", "stream": True,
+        "messages": [{"role": "user", "content": QUESTION}]})
+    body = r.get_data()
+    assert r.status_code == 200 and b"57" in body
+    assert [c[0] for c in calls] == ["slowp"], calls
+
+
+def test_a_losing_stream_leg_is_closed_when_the_race_is_decided(quiet, hedge_fast, monkeypatch):
+    _route_to(monkeypatch, "slowp", "slow-model")
+    _chain(monkeypatch, ("slowp", "slow-model"), ("fastp", "quick-model"))
+
+    def silent():
+        time.sleep(3)
+        yield b'data: {"choices":[{"delta":{"content":"slow answer"}}]}\n\n'
+    loser = _Resp(200, chunks=silent())
+    calls = []
+    monkeypatch.setattr(A, "_dispatch_chat", _slow_then_fast(
+        calls, slow_s=0, slow_reply=lambda: loser,
+        fast_reply=lambda: _Resp(200, chunks=[SSE_ANSWER])))
+    r = A.app.test_client().post("/v1/chat/completions", json={
+        "model": "auto", "stream": True,
+        "messages": [{"role": "user", "content": QUESTION}]})
+    assert b"5768" in r.get_data()
+    assert loser.closed, "the loser's upstream must be closed at once, not after 3s"
+
+
+def test_the_responses_retry_pass_does_not_hedge_again(quiet, hedge_fast, monkeypatch):
+    monkeypatch.setattr(A, "_CHAIN_RETRY_DELAY", 0)
+    _route_to(monkeypatch, "p1", "m1")
+    _chain(monkeypatch, ("p1", "m1"), ("p2", "m2"))
+    planned = []
+    real_plan = A._ChainClock.plan_hedge
+
+    def spy(self, *a, **k):
+        planned.append(1)
+        return real_plan(self, *a, **k)
+    monkeypatch.setattr(A._ChainClock, "plan_hedge", spy)
+    fired = []
+    real_fire = A._ChainClock._hedge_payload
+
+    def fire_spy(self, *a, **k):
+        fired.append(1)
+        return real_fire(self, *a, **k)
+    monkeypatch.setattr(A._ChainClock, "_hedge_payload", fire_spy)
+    monkeypatch.setattr(A, "_recent_hop_failure", lambda pid, m: None)
+
+    def dispatch(pid, payload, stream):
+        if pid == "p1":
+            time.sleep(0.4)
+        return _Resp(503)
+    monkeypatch.setattr(A, "_dispatch_chat", dispatch)
+    A.app.test_client().post("/v1/responses", json={
+        "model": "auto", "stream": False, "input": QUESTION})
+    assert fired == [1], "one extra upstream call per client request"
+    assert len(planned) == 1

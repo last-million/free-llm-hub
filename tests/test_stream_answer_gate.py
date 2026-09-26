@@ -388,3 +388,116 @@ def test_messages_route_streams_the_salvage(wire):
                    if e.get("type") == "content_block_delta")
     assert text == "3324"
     assert ev[-1]["type"] == "message_stop"
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: a stream's current end is not the answer's end
+# --------------------------------------------------------------------------- #
+
+_PREAMBLE = ("To print a greeting in Python you call the built-in print function "
+             "with a string literal. The interpreter evaluates the argument, "
+             "converts it to text and writes it to standard output followed by a "
+             "newline. Running the loop below five times therefore shows the "
+             "same greeting on five separate lines, one per iteration, which is "
+             "a quick way to check that a loop body really executes the number "
+             "of times you expect before you move on to the real program logic "
+             "that follows in the next section of this short tutorial.\n\n")
+_LOOP_OK = (_PREAMBLE + "It prints:\n\n" + "Hello, World!\n" * 5
+            + "\nEach iteration calls print once, so the output has exactly five "
+              "lines and the program then exits normally with status zero.")
+
+
+def test_five_repeated_lines_mid_stream_are_not_cut():
+    assert answer_check.inspect(_LOOP_OK, prompt_text="explain loops")["ok"]
+    cut_at = _LOOP_OK.index("\nEach iteration")
+    assert answer_check.inspect_tail(_LOOP_OK[:cut_at],
+                                     prompt_text="explain loops") is None
+    g = _gate(_frames(_LOOP_OK, fin="stop", size=4), "explain loops")
+    text, fins, done = _parse_chat(b"".join(g))
+    assert text == _LOOP_OK and fins == ["stop"] and done and not g.cut
+
+
+def test_glued_bits_mid_sentence_are_not_cut():
+    ans = (_PREAMBLE + "Alternating bits look like 1010101010101010 in binary, "
+           "which is 43690 in decimal and 0xAAAA in hexadecimal notation.")
+    end = ans.index("1010101010101010") + 16
+    assert answer_check.inspect_tail(ans[:end], prompt_text="explain binary") is None
+    g =_gate(_frames(ans, fin="stop", size=4), "explain binary")
+    text, fins, _done = _parse_chat(b"".join(g))
+    assert text == ans and fins == ["stop"] and not g.cut
+
+
+def test_held_text_released_mid_stream_uses_the_mid_text_count():
+    # The 400-char hold releases while five copies sit at its end.
+    head = "Here is the output of the program when you run it:\n\n"
+    ans = head + "Hello, World from the loop!\n" * 5 + "Done. " + "x" * 400
+    n = len(head) + 28 * 5
+    assert not answer_check.inspect(ans[:n])["ok"]        # as if finished there
+    assert answer_check.inspect(ans[:n], partial=True)["ok"]
+    g = _gate(_frames(ans, fin="stop", size=1), "run it", hold_chars=n)
+    text, _fins, _done = _parse_chat(b"".join(g))
+    assert text == ans and not g.cut
+
+
+def test_real_runaway_line_loop_is_still_cut_mid_stream():
+    ans = _PREAMBLE + "Checking the config file again now.\n" * 60
+    g = _gate(_frames(ans, fin="length", size=4), "fix it")
+    text, fins, done = _parse_chat(b"".join(g))
+    assert g.cut and fins == ["stop"] and done
+    assert text.count("Checking the config file again now.") < 12
+
+
+def test_open_inline_code_span_mid_stream_is_not_a_leak():
+    full = ("DeepSeek R1 streams its chain of thought before the answer. The "
+            "reasoning is wrapped in `<think>` tags, and the final answer "
+            "follows the closing tag. Most clients hide that block. " * 3)
+    assert answer_check.inspect(full, prompt_text="how does r1 output look")["ok"]
+    idx = full.index("`<think>") + len("`<think>")
+    assert answer_check.inspect_tail(full[:idx], prompt_text="how does r1 output look") is None
+    idx = full.index("`<think") + len("`<think")
+    assert answer_check.inspect(full[:idx], prompt_text="r1 output",
+                                partial=True)["ok"]
+    g = _gate(_frames(full, fin="stop", size=4), "how does r1 output look")
+    text, _fins, _done = _parse_chat(b"".join(g))
+    assert text == full and not g.cut
+
+
+def test_leaked_think_tag_mid_stream_is_still_cut_at_once():
+    ans = _PREAMBLE + "The answer is 42.<think>let me reconsider the question"
+    g = _gate(_frames(ans, fin="stop", size=4), "what is the answer")
+    text, _fins, _done = _parse_chat(b"".join(g))
+    assert g.cut and "<think" not in text
+
+
+def test_null_tool_calls_key_does_not_disarm_the_gate():
+    frame = (b'data: {"id":"x","object":"chat.completion.chunk","created":1,'
+             b'"model":"m","choices":[{"index":0,"delta":{"content":"319231923192",'
+             b'"tool_calls":null,"function_call":null},"finish_reason":null}]}\n\n')
+    g0 = _gate([], P_CODING)
+    assert g0._classify(frame)[0] == "text"
+    items = [frame, b'data: {"id":"x","object":"chat.completion.chunk","created":1,'
+                    b'"model":"m","choices":[{"index":0,"delta":{"tool_calls":null},'
+                    b'"finish_reason":"stop"}]}\n\n', b"data: [DONE]\n\n"]
+    g = _gate(items, P_CODING)
+    text, _fins, done = _parse_chat(b"".join(g))
+    assert text == "3192" and done and g.cut
+    real = b'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0}]}}]}\n\n'
+    assert g0._classify(real)[0] == "disarm"
+    assert app._STREAM_TOOLCALL_RE.search(b'{"type":"tool_use","id":"t"}')
+
+
+def test_tail_check_is_throttled_and_uses_the_scan_cache(monkeypatch):
+    calls = []
+    real = answer_check.inspect_tail
+
+    def spy(text, **kw):
+        calls.append(len(text))
+        return real(text, **kw)
+    monkeypatch.setattr(answer_check, "inspect_tail", spy)
+    ans = _PREAMBLE * 20
+    g = _gate(_frames(ans, fin="stop", size=4), "write a long tutorial")
+    text, _fins, _done = _parse_chat(b"".join(g))
+    assert text == ans and not g.cut
+    after_hold = len(ans) - app._HOLD_CHARS
+    assert 0 < len(calls) <= after_hold // app._TAIL_EVERY + 2
+    assert g._tail_state.get("fpos", 0) > 0

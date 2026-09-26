@@ -1197,7 +1197,7 @@ _ACCOUNT_RE = _re_429.compile(
 _RETRY_TEXT_RE = _re_429.compile(
     r"(?:try again|retry)(?:\s+(?:after|in))?\s+"
     r"((?:\d+(?:\.\d+)?\s*(?:ms|milliseconds?|seconds?|secs?|minutes?|mins?|hours?|"
-    r"hrs?|h|m|s)\b\s*)+)", _re_429.I)
+    r"hrs?|h|m|s)(?![a-z])\s*)+)", _re_429.I)   # not \b: "1m26.4s" has none after "m"
 
 
 def _duration_secs(text):

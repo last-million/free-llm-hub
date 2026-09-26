@@ -172,6 +172,18 @@ def test_groq_rolling_day_bucket_trusts_its_try_again_in():
     assert info["seconds"] == pytest.approx(87, abs=1)
 
 
+@pytest.mark.parametrize("text,secs", [("1m26.4s", 86.4), ("7m12.864s", 432.864),
+                                       ("1h2m3s", 3723.0), ("37.47s", 37.47)])
+def test_compound_try_again_in_is_read_without_a_retry_after_header(text, secs):
+    now = time.time()
+    body = {"error": {"message": "Rate limit reached for model "
+                                 "`llama-3.1-8b-instant` on tokens per day (TPD): "
+                                 "Limit 500000. Please try again in %s." % text}}
+    info = quota.classify_429("g4f-groq", {}, json.dumps(body), now=now)
+    assert info["window"] == "day"
+    assert info["seconds"] == pytest.approx(secs, abs=1)
+
+
 def test_a_per_minute_limit_is_never_benched_for_long_whatever_the_header():
     now = time.time()
     body = {"error": {"message": "Too many requests: limit 30 requests per minute"}}

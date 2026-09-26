@@ -44,7 +44,9 @@ def test_the_retry_is_wired_and_bounded():
     src = inspect.getsource(app.v1_responses)
     # exactly one retry, never a loop
     assert "not _retry_pass" in src
-    assert "v1_responses(_retry_pass=True)" in src
+    assert "v1_responses(_retry_pass=True, _hedged=_clock._hedge_fired)" in src
+    # ...and a walk that already hedged may not hedge again on the retry
+    assert "if not _hedged:" in src
     # and only when NOTHING failed hard
     assert "not last_hard and errors" in src
     assert "all(_TRANSIENT_ERR_RE.search" in src
@@ -60,5 +62,6 @@ def test_the_handler_still_works_as_a_plain_route():
     """Flask calls it with no arguments; the retry flag must stay optional."""
     import inspect
     sig = inspect.signature(app.v1_responses)
-    assert list(sig.parameters) == ["_retry_pass"]
+    assert list(sig.parameters) == ["_retry_pass", "_hedged"]
     assert sig.parameters["_retry_pass"].default is False
+    assert sig.parameters["_hedged"].default is False

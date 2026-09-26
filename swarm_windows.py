@@ -477,7 +477,7 @@ class _Run:
     __slots__ = ("id", "goal", "project_dir", "cli_id", "agents", "state",
                  "error", "created_at", "ended_at", "stop_flag", "lock", "waves",
                  "restored", "interrupted", "store_root", "owner",
-                 "manager", "modes", "manager_tokens", "manager_calls")
+                 "manager", "managed", "modes", "manager_tokens", "manager_calls")
 
     def __init__(self, goal, project_dir, cli_id, phases, owner=None,
                  manager=None, modes=()):
@@ -514,6 +514,11 @@ class _Run:
         # callable does not survive a restart -- resume_interrupted(manager=)
         # re-attaches the hub's current one.
         self.manager = manager
+        # Whether the person started this run WITH a manager -- persisted, so
+        # a resume re-attaches one only to runs that had one, never to a run
+        # started while the manager was off (that would spend subscription
+        # tokens nobody opted into).
+        self.managed = manager is not None
         self.modes = tuple(modes or ())
         # What the manager cost THIS run, planning included -- the hub's daily
         # budget is global, and "what did this job cost me" is per job.
@@ -530,6 +535,7 @@ class _Run:
             "run_id": self.id, "goal": self.goal, "state": self.state,
             "project_dir": self.project_dir, "cli": self.cli_id,
             "owner": self.owner,
+            "managed": bool(self.managed or self.manager is not None),
             "manager_tokens": self.manager_tokens,
             "manager_calls": self.manager_calls,
             "error": self.error, "created_at": self.created_at,
@@ -572,6 +578,10 @@ class _Run:
             run.manager_calls = max(0, int(row.get("manager_calls") or 0))
         except (TypeError, ValueError):
             pass
+        # Rows written before "managed" existed: a managed run has paid for at
+        # least its planning call.
+        run.managed = bool(row["managed"]) if "managed" in row \
+            else run.manager_calls > 0
         for agent, a in zip(run.agents, row.get("agents") or ()):
             agent.verified = a.get("verified")
             agent.problems = [str(p) for p in (a.get("problems") or ())][:10]
@@ -1370,7 +1380,7 @@ def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
             run.restored = False
             run.interrupted = False
             run.stop_flag.clear()
-            if manager is not None:
+            if manager is not None and run.managed:
                 run.manager = manager
             if modes and not run.modes:
                 run.modes = tuple(modes)
