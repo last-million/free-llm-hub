@@ -829,8 +829,11 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                  {"role": "user", "content":
                   "OVERALL GOAL\n%s\n\nPHASE: %s\n%s%s%s\n\nPROBLEMS TO FIX\n- %s"
                   "\n\nLAST ATTEMPT (excerpt)\n%s"
-                  % (_clip(goal, 1500), title, ph["task"],
-                     ("\n\nDone when: " + ph["done_when"]) if ph.get("done_when") else "",
+                  # Clipped like every other manager input: when the planner
+                  # falls back to one phase, its task IS the user's whole brief.
+                  % (_clip(goal, 1500), title, _clip(ph["task"], MANAGER_BRIEF_CHARS),
+                     ("\n\nDone when: " + _clip(ph["done_when"], MANAGER_PHASE_CHARS))
+                     if ph.get("done_when") else "",
                      _render_brief(ph), "\n- ".join(problems),
                      _clip(fallback, VERDICT_OUTPUT_CHARS) or "(empty)")}],
                 MANAGER_FIX_TOKENS, "fix")

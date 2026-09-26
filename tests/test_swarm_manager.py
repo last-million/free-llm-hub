@@ -185,6 +185,23 @@ def test_two_failures_hand_the_phase_to_the_manager():
     assert ("fix:Hero", "sub-claude/sonnet") in out["models"]
 
 
+def test_the_fix_prompt_is_clipped_even_when_the_task_is_the_whole_brief():
+    """When the planner falls back to one phase, that phase's task IS the
+    user's whole brief -- and the manager's fix prompt used to carry it
+    unclipped, the one manager input that bypassed MANAGER_BRIEF_CHARS."""
+    huge_task = " ".join("req%d" % i for i in range(8000))          # ~60K chars
+    plan = json.dumps({"goal": "g", "phases": [
+        {"title": "Hero", "task": huge_task, "needs": [],
+         "acceptance": ['includes "Start free"'], "done_when": huge_task},
+        {"title": "Pricing", "task": "write the pricing table", "needs": []}]})
+    d = _free(plan=plan, phase=_phase_by_attempt("no cta here", "still no cta"))
+    m = _manager(dict(GOOD_MGR, plan=plan, fix="Start free - by the manager."))
+    swarm.run(ASK, d, manager=m)
+    fix = [c for c in m.calls if c["purpose"] == "fix"]
+    assert fix, m.purposes()
+    assert fix[0]["chars"] < swarm.MANAGER_BRIEF_CHARS + 6000, fix[0]["chars"]
+
+
 def test_manager_verdict_rejection_retries_then_passes():
     d = _free()
     answers = dict(GOOD_MGR, verify=['{"ok": false, "problems": ["tone is wrong"]}',
