@@ -360,6 +360,23 @@ above only suggests).
   `/v1/chat/completions` AND `/v1/messages` (`ANTHROPIC_MODEL=coding`) —
   covered by `tests/test_messages_category_mode.py`.
 
+## Disconnect leaves no hub trace (2026-09-26)
+
+- The codex `/model` catalog (`~/.codex/model_catalog.json`) is written by
+  `_refresh_codex_catalog` ONLY while `_codex_wired_to_hub()`; a disconnected
+  codex gets nothing written and a hub-written catalog removed
+  (`_codex_disconnect_catalog`: user's own backup restored, else file + a
+  `model_catalog_json` key naming it deleted; a non-hub catalog is never touched).
+- Every `_disconnect_*` also drops hub-only model ids the CLI's own picker saved
+  (`_is_hub_virtual_model`: codex `model`, claude `model`/settings.local.json,
+  opencode `model`/`small_model`/`agent.*.model`, qwen settings.json, pi
+  settings.json defaults) and restores the pre-hub default from the
+  Connect-time `.freehub-bak` (never from a hub-wired backup).
+- `_repair_opencode_config` is a no-op without a `free-llm-hub` provider block.
+- The hub MCP server entry (crews) is KEPT by design and reported as
+  `mcp_kept` in the disconnect response. Covered by
+  `tests/test_cli_disconnect_leaves_no_trace.py`.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
