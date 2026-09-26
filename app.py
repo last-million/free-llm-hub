@@ -18996,13 +18996,19 @@ _STREAM_TOOLCALL_RE = re.compile(
     rb'"(?:tool_calls|function_call|tool_use|function_call_arguments)"', re.I)
 
 
-def _judge_peeked(chunks):
-    """"content" or "nonanswer" for the text collected during the peek.
+def _judge_peeked(chunks, check=None, raw_items=None):
+    """"content", "nonanswer" or "junk" for the text collected during the peek.
 
     Runs the same three detectors the non-streaming path has always had. They
     were unreachable on a stream, which is the path Codex and Claude Code
     actually use -- so a turn that typed its tool call, announced work it never
-    did, or declined outright was relayed to the CLI as a finished answer."""
+    did, or declined outright was relayed to the CLI as a finished answer.
+
+    With `check` ({prompt_text, last_prompt, tools_offered}) it also runs
+    answer_check.inspect -- the _answer_gate verdict -- on the peeked answer:
+    junk with NOTHING salvageable is "junk", and the chain moves to the next
+    hop while it still can (nothing is committed yet). Junk WITH a salvage is
+    "content": the committed stream's _StreamAnswerGate serves the clean part."""
     try:
         text = _peeked_text("".join(chunks))
         if not text:
@@ -19011,6 +19017,20 @@ def _judge_peeked(chunks):
                 or _looks_like_announced_not_acted(text)
                 or _looks_like_refusal(text)):
             return "nonanswer"
+        if check and raw_items:
+            items = [x if isinstance(x, (bytes, bytearray))
+                     else str(x).encode("utf-8", "ignore") for x in raw_items if x]
+            # iter_lines items carry no newline; iter_content chunks do.
+            sep = b"" if any(b"\n" in x for x in items) else b"\n"
+            full, saw_tools, fin = _sse_answer_digest([sep.join(items)])
+            if full.strip() and not saw_tools:
+                v = answer_check.inspect(
+                    full, prompt_text=check.get("prompt_text"),
+                    tools_offered=bool(check.get("tools_offered")),
+                    finish_reason=fin,
+                    last_prompt=check.get("last_prompt"))
+                if not v.get("ok", True) and not v.get("salvage"):
+                    return "junk"
     except Exception:                                            # noqa: BLE001
         pass
     return "content"
@@ -19037,7 +19057,7 @@ def _peeked_text(raw):
     return "".join(out).strip()
 
 
-def _peek_until_content(iterator, deadline_s, max_lines=400):
+def _peek_until_content(iterator, deadline_s, max_lines=400, check=None):
     """Look ahead on a streaming 200 to tell a REAL answer from an EMPTY one before
     committing it to the client. Reads SSE items (bytes) until one carries actual
     content / a tool call (the provider is really answering), or the stream
@@ -19050,6 +19070,8 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
       'error'   -> the 200 body carries an upstream error frame (a 403/quota refusal
                    delivered inside the stream); caller falls through to next model.
       'timeout' -> nothing usable arrived in time; caller falls through.
+      'junk'    -> only with `check` (see _judge_peeked): the peeked answer is
+                   degenerate with nothing salvageable; caller falls through.
     Same daemon-worker discipline as _peek_first_chunk: the buffer/iterator are only
     used when the worker FINISHED (status set) so there's never concurrent iteration."""
     box = {"buf": [], "status": None}
@@ -19102,7 +19124,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
                     seen_content.append(b.decode("utf-8", "ignore"))
                     if sum(len(x) for x in seen_content) < _PEEK_JUDGE_CHARS:
                         continue
-                    box["status"] = _judge_peeked(seen_content)
+                    box["status"] = _judge_peeked(seen_content, check, buf)
                     return
                 # An error INSIDE a 200 stream (403/429/quota reported as an SSE
                 # error frame instead of an HTTP status) — the single most common
@@ -19113,7 +19135,12 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
                     box["status"] = "error"
                     return
                 if _STREAM_TERMINAL_RE.search(b):
-                    box["status"] = "empty"
+                    # [DONE] in its own frame AFTER the content (every
+                    # iter_lines stream, and any chunked read that splits
+                    # there): a short answer that ended -- judge it, never
+                    # call it empty. MEASURED: _sse("OK") peeked 'empty'.
+                    box["status"] = (_judge_peeked(seen_content, check, buf)
+                                     if seen_content else "empty")
                     return
                 if _STREAM_REASONING_RE.search(b):
                     saw_reasoning = True
@@ -19122,14 +19149,15 @@ def _peek_until_content(iterator, deadline_s, max_lines=400):
             # was 400 lines of keepalives/role deltas and committing it hands the
             # CLI a stream that never answers.
             if seen_content:
-                box["status"] = _judge_peeked(seen_content)
+                box["status"] = _judge_peeked(seen_content, check, buf)
             else:
                 box["status"] = "content" if saw_reasoning else "empty"
         except StopIteration:
             # The stream ENDED inside the peek window, so everything the model
             # was ever going to say is in hand -- the best possible moment to
             # judge it, and the shape a dead turn usually has.
-            box["status"] = _judge_peeked(seen_content) if seen_content else "empty"
+            box["status"] = (_judge_peeked(seen_content, check, buf)
+                             if seen_content else "empty")
         except Exception:
             box["status"] = "empty"     # read error/timeout -> unusable, fall through
 
@@ -19696,6 +19724,347 @@ def _sse_answer_digest(raw_frames):
 
 
 # --------------------------------------------------------------------------- #
+# STREAM HOLD-BACK GATE -- _answer_gate for the path the CLIs actually use.
+#
+# MEASURED LIVE after _answer_gate shipped (streaming /v1/chat/completions,
+# "What is N plus 1? Answer with only the number.", max_tokens 40,
+# llm7/GLM-5.3-Flash):
+#   best   -> "3324TouchableOpacity_FP$.\n\nActually, the answer is"
+#   coding -> "319231923192"
+# opencode, Codex and Claude Code all stream, and on a stream the gate only
+# ran once the bytes were already with the client (to file an outcome).
+#
+# So visible text is HELD -- until the model finishes, the held text reaches
+# _HOLD_CHARS, or _HOLD_SECONDS pass since its first delta -- and judged by
+# answer_check.inspect before any of it is released:
+#   * clean -> released unchanged, then every later delta passes a rolling
+#     answer_check.inspect_tail first (a loop / separator run / script switch /
+#     leaked markup starting mid-stream stops the stream there);
+#   * junk with a salvage -> only the salvage goes out, the stream ends with a
+#     proper finish "stop" + [DONE], and the hop is filed as a failure.
+# Junk with NOTHING salvageable is caught one step earlier, by the pre-commit
+# peek (_judge_peeked), where the chain can still move to the next hop.
+#
+# Deliberately never held or altered: tool-call deltas (one disarms the gate
+# for the rest of the turn, flushing held text first so order is kept),
+# reasoning deltas, keepalives, usage and error frames -- they pass at once.
+# The cost is bounded by the hold window: a clean answer's first 400 chars
+# arrive together instead of token by token, at most 2.5 s late.
+#
+# Works on OpenAI chat SSE in both shapes the hub relays: raw iter_content
+# chunks ("bytes", re-framed on blank lines) for /v1/chat/completions, and
+# iter_lines items ("lines") that /v1/responses and /v1/messages translate --
+# so all three protocols get their own terminator from the translator.
+# --------------------------------------------------------------------------- #
+_HOLD_CHARS = 400
+_HOLD_SECONDS = 2.5
+_SSE_FRAME_END_RE = re.compile(rb"\r?\n\r?\n")
+
+
+class _StreamAnswerGate:
+    """Iterable wrapper over an upstream OpenAI chat SSE iterator. `cut` is True
+    once the gate ended the stream on junk -- it has then already filed the
+    hop's failed outcome, so the relay's end-of-stream judgement must not file
+    a second (see _proxy_sse / _responses_stream / _anthropic_stream)."""
+
+    def __init__(self, iterator, *, mode="bytes", hop_pid=None, hop_model=None,
+                 prompt_text=None, last_prompt=None, tools_offered=False,
+                 hold_chars=None, hold_seconds=None):
+        self._it = iterator
+        self._lines = mode == "lines"
+        self._pid, self._model_id = hop_pid, hop_model
+        self._prompt = prompt_text
+        self._last_prompt = last_prompt
+        self._tools = bool(tools_offered)
+        self._hold_chars = _HOLD_CHARS if hold_chars is None else hold_chars
+        self._hold_seconds = _HOLD_SECONDS if hold_seconds is None else hold_seconds
+        self._rest = b""
+        self._text = ""
+        self._emitted = 0            # chars of self._text already sent
+        self._meta = {}              # id / created / model of the upstream chunks
+        self.cut = False
+        self.reasons = []
+
+    def __iter__(self):
+        return self._run()
+
+    # -- framing ----------------------------------------------------------- #
+    def _frames(self, item):
+        if self._lines:
+            return [item]
+        raw = item if isinstance(item, (bytes, bytearray)) \
+            else str(item).encode("utf-8", "ignore")
+        buf = self._rest + bytes(raw)
+        out, pos = [], 0
+        for m in _SSE_FRAME_END_RE.finditer(buf):
+            out.append(buf[pos:m.end()])
+            pos = m.end()
+        self._rest = buf[pos:]
+        return out
+
+    def _classify(self, frame):
+        """(kind, text, finish_reason): kind is 'text' (visible content, maybe
+        with a finish), 'finish', 'done', 'disarm' (tool call / anything the
+        gate must not reorder) or 'other' (passes untouched)."""
+        b = frame if isinstance(frame, (bytes, bytearray)) \
+            else str(frame).encode("utf-8", "ignore")
+        if b"data:" not in b:
+            return "other", "", None
+        if _STREAM_TOOLCALL_RE.search(b):
+            return "disarm", "", None
+        if re.search(rb"data:\s*\[DONE\]", b):
+            return "done", "", None
+        if b'"content"' not in b and b'"finish_reason"' not in b:
+            return "other", "", None
+        payload = b"".join(ln.strip()[5:].strip() for ln in b.split(b"\n")
+                           if ln.strip().startswith(b"data:"))
+        try:
+            chunk = json.loads(payload.decode("utf-8", "ignore"))
+        except ValueError:
+            return "other", "", None
+        if not isinstance(chunk, dict) or chunk.get("error"):
+            return "other", "", None
+        choices = chunk.get("choices") or []
+        if not choices:
+            return "other", "", None
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        if len(choices) > 1 or (choice.get("index") or 0) != 0:
+            return "disarm", "", None      # n>1: not one answer to judge
+        for k in ("id", "created", "model"):
+            if chunk.get(k) is not None and k not in self._meta:
+                self._meta[k] = chunk[k]
+        delta = choice.get("delta") or {}
+        c = delta.get("content")
+        if isinstance(c, list):
+            c = "".join((p.get("text") or "") for p in c if isinstance(p, dict))
+        elif c is not None and not isinstance(c, str):
+            c = str(c)
+        fin = choice.get("finish_reason")
+        if c:
+            return "text", c, fin
+        if fin:
+            return "finish", "", fin
+        return "other", "", None
+
+    def _synth(self, delta, fin):
+        chunk = {"id": self._meta.get("id") or "chatcmpl-gate",
+                 "object": "chat.completion.chunk",
+                 "created": self._meta.get("created") or int(time.time()),
+                 "model": self._meta.get("model") or "",
+                 "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+        line = b"data: " + json.dumps(chunk).encode("utf-8")
+        return line if self._lines else line + b"\n\n"
+
+    def _done(self):
+        return b"data: [DONE]" if self._lines else b"data: [DONE]\n\n"
+
+    # -- verdicts ---------------------------------------------------------- #
+    def _cut_at(self, clean_end, reasons):
+        """Frames that end the stream after self._text[:clean_end], and file the
+        hop as a failed delivery (it burned the budget on junk)."""
+        self.cut = True
+        self.reasons = list(reasons or ())
+        out = []
+        piece = self._text[self._emitted:max(self._emitted, clean_end)].rstrip()
+        if piece.strip():
+            out.append(self._synth({"content": piece}, None))
+        out.append(self._synth({}, "stop"))
+        out.append(self._done())
+        _log.warning("[stream-gate] %s/%s: junk in stream (%s), %s",
+                     self._pid, self._model_id, ",".join(self.reasons) or "?",
+                     "served the clean part" if piece.strip() or self._emitted
+                     else "nothing salvageable")
+        if self._pid and self._model_id:
+            try:
+                _record_outcome(self._pid, self._model_id, False)
+            except Exception:                                    # noqa: BLE001
+                pass
+        return out
+
+    def _judge_held(self, fin):
+        """None when the held text is clean, else the frames ending the stream."""
+        try:
+            v = answer_check.inspect(
+                self._text, prompt_text=self._prompt, tools_offered=self._tools,
+                finish_reason=fin, last_prompt=self._last_prompt)
+        except Exception:                                        # noqa: BLE001
+            return None
+        if v.get("ok", True):
+            return None
+        salvage = v.get("salvage") or ""
+        end = len(salvage) if salvage and self._text.startswith(salvage) else 0
+        return self._cut_at(end, v.get("reasons"))
+
+    def _judge_tail(self):
+        try:
+            c = answer_check.inspect_tail(self._text, prompt_text=self._prompt,
+                                          tools_offered=self._tools)
+        except Exception:                                        # noqa: BLE001
+            return None
+        if c is None:
+            return None
+        return self._cut_at(c, ["tail"])
+
+    # -- the relay --------------------------------------------------------- #
+    def _run(self):
+        q = queue.Queue(maxsize=256)
+        stop = threading.Event()
+
+        def _put(entry):
+            while not stop.is_set():
+                try:
+                    q.put(entry, timeout=1.0)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def _pump():
+            try:
+                for item in self._it:
+                    if not _put(("item", item)):
+                        return
+                _put(("end", None))
+            except BaseException as exc:                         # noqa: BLE001
+                _put(("exc", exc))
+
+        threading.Thread(target=_pump, daemon=True).start()
+        armed, holding = True, True
+        held = []                    # the held visible-text frames, in order
+        first_at = None
+        try:
+            while True:
+                wait = None
+                if armed and holding and first_at is not None:
+                    wait = max(0.0, first_at + self._hold_seconds - time.monotonic())
+                try:
+                    kind, val = q.get(timeout=wait)
+                except queue.Empty:
+                    # The hold window ran out with the model still going.
+                    stop_frames = self._judge_held(None)
+                    if stop_frames:
+                        yield from stop_frames
+                        return
+                    yield from held
+                    held, holding = [], False
+                    self._emitted = len(self._text)
+                    continue
+                if kind == "end":
+                    break
+                if kind == "exc":
+                    # Upstream died mid-hold: the relay's own error handling
+                    # ends the stream, but the text already received is still
+                    # owed to the client (judged, as always) -- as it was
+                    # before anything was held.
+                    if held:
+                        stop_frames = self._judge_held(None)
+                        if stop_frames:
+                            yield from stop_frames
+                            return
+                        yield from held
+                        held = []
+                    raise val
+                if not armed:
+                    yield val
+                    continue
+                for fr in self._frames(val):
+                    if not armed:
+                        yield fr
+                        continue
+                    k, t, fin = self._classify(fr)
+                    if k == "other":
+                        yield fr
+                        continue
+                    if k == "disarm":
+                        # A tool call: the turn is doing work, and its deltas
+                        # are never held. Held text goes first, order kept.
+                        yield from held
+                        held, armed = [], False
+                        yield fr
+                        continue
+                    if k == "text":
+                        self._text += t
+                        if holding:
+                            held.append(fr)
+                            if first_at is None:
+                                first_at = time.monotonic()
+                            if not fin and len(self._text) < self._hold_chars \
+                                    and time.monotonic() - first_at < self._hold_seconds:
+                                continue
+                            stop_frames = self._judge_held(fin)
+                            if stop_frames:
+                                yield from stop_frames
+                                return
+                            yield from held
+                            held, holding = [], False
+                            self._emitted = len(self._text)
+                            continue
+                        stop_frames = self._judge_tail()
+                        if stop_frames:
+                            yield from stop_frames
+                            return
+                        self._emitted = len(self._text)
+                        yield fr
+                        continue
+                    # 'finish' / 'done': the model is done talking.
+                    if holding and held:
+                        stop_frames = self._judge_held(fin)
+                        if stop_frames:
+                            yield from stop_frames
+                            return
+                        yield from held
+                        held = []
+                        self._emitted = len(self._text)
+                    holding = False
+                    yield fr
+                if armed and len(self._rest) > _SSE_FRAME_CAP:
+                    # No frame boundary in sight (an upstream ignoring
+                    # stream:true): nothing here is judgeable, so forward
+                    # rather than turn a slow answer into a silent one.
+                    yield from held
+                    held, armed = [], False
+                if not armed and self._rest:
+                    yield self._rest
+                    self._rest = b""
+            # Upstream ended without a finish frame / [DONE].
+            if held:
+                stop_frames = self._judge_held(None)
+                if stop_frames:
+                    yield from stop_frames
+                    return
+                yield from held
+            if self._rest:
+                yield self._rest
+        finally:
+            stop.set()
+
+
+def _gate_stream(iterator, mode, hop_pid, hop_model, payload, has_tools):
+    """_StreamAnswerGate for one committed hop. Fail-open: on any setup error
+    the upstream iterator is relayed untouched (the gate is never the thing
+    that loses an answer)."""
+    try:
+        return _StreamAnswerGate(
+            iterator, mode=mode, hop_pid=hop_pid, hop_model=hop_model,
+            prompt_text=_prompt_text_for_check(payload),
+            last_prompt=_last_user_text_for_check(payload),
+            tools_offered=bool(has_tools))
+    except Exception:                                            # noqa: BLE001
+        return iterator
+
+
+def _peek_check(payload, has_tools):
+    """The answer_check context _peek_until_content judges a peeked answer
+    with. None on error: the peek then runs only its older detectors."""
+    try:
+        return {"prompt_text": _prompt_text_for_check(payload),
+                "last_prompt": _last_user_text_for_check(payload),
+                "tools_offered": bool(has_tools)}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # BUDGET STARVATION — a reasoning model that spent the whole max_tokens thinking
 # and had nothing left to answer with.
 #
@@ -19779,7 +20148,7 @@ _STREAM_DIGEST_CAP = 2 << 20     # bytes of a relayed stream kept for the end ch
 
 
 def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None,
-               prompt_text=None, tools_offered=False, last_prompt=None):
+               prompt_text=None, tools_offered=False, last_prompt=None, answer_gate=None):
     """Pass upstream SSE bytes through unchanged. When `iterator`/`first` are
     supplied (the first-byte peek already pulled the first chunk from this exact
     iterator), yield that chunk first, then continue the SAME iterator — so the
@@ -19793,7 +20162,9 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
 
     With `hop_pid`, a stream that ENDS normally is judged once (answer_check,
     via _record_stream_outcome) and its outcome recorded -- the bytes are
-    kept (capped) and parsed only then, so the relay stays a passthrough."""
+    kept (capped) and parsed only then, so the relay stays a passthrough.
+    `answer_gate` (the _StreamAnswerGate feeding `iterator`) skips that when
+    the gate already cut the stream and filed the failure itself."""
     saw_done = False
     stalled = False
     kept, kept_len = [], 0
@@ -19823,7 +20194,7 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
                     kept.append(bytes(raw))
                     kept_len += len(raw)
                 yield chunk
-        if hop_pid and not stalled:
+        if hop_pid and not stalled and not getattr(answer_gate, "cut", False):
             text, saw_tools, fin = _sse_answer_digest(kept)
             _record_stream_outcome(hop_pid, hop_model, text, tool_calls=saw_tools,
                                    finish_reason=fin, prompt_text=prompt_text,
@@ -22325,7 +22696,8 @@ def _chat_completions_uncached(body):
                 # Peek until REAL content: a 200 that streams no content must fall
                 # through to the next model, not be handed to the client as empty.
                 status, buffered = _peek_until_content(
-                    it, _clock.peek_timeout(hop_model, est))
+                    it, _clock.peek_timeout(hop_model, est),
+                    check=_peek_check(payload, has_tools))
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -22334,16 +22706,21 @@ def _chat_completions_uncached(body):
                         # sideline the id so it stops winning hop 1 (see
                         # _note_nonanswer; ranking alone never removed it).
                         _note_nonanswer(hop_pid, hop_model)
+                    elif status == "junk":
+                        _record_outcome(hop_pid, hop_model, False)
                     resp.close()
                     continue
                 _note_ttft(resp, hop_pid, hop_model)
                 chained = _clock.guard(_chain_buffered(buffered, it),
                                        _CHAT_DEADLINE_TERMINATOR,
                                        "%s/%s" % (hop_pid, hop_model))
-                relay = _proxy_sse(resp, chained, hop_pid=hop_pid, hop_model=hop_model,
+                # Visible text is held and judged before release (see
+                # _StreamAnswerGate); tool-call deltas are never held.
+                gated = _gate_stream(chained, "bytes", hop_pid, hop_model, payload, has_tools)
+                relay = _proxy_sse(resp, gated, hop_pid=hop_pid, hop_model=hop_model,
                                    prompt_text=_prompt_text_for_check(payload),
                                    last_prompt=_last_user_text_for_check(payload),
-                                   tools_offered=has_tools)
+                                   tools_offered=has_tools, answer_gate=gated)
                 # A tools turn gets its frames checked; a plain chat stream keeps
                 # the zero-copy byte passthrough exactly as it was.
                 if has_tools:
@@ -22664,7 +23041,7 @@ def _chat_to_responses(chat_json, model_label):
 
 def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_est=0,
                       hop_pid=None, hop_model=None, prompt_text=None, tools_offered=False,
-                      last_prompt=None):
+                      last_prompt=None, answer_gate=None):
     """Consume an upstream OpenAI chat SSE stream and re-emit it as Responses API
     events for Codex. When `line_iter`/`first` are supplied (the first-byte peek
     already pulled the first line from this exact iterator) the pre-read line is
@@ -22865,7 +23242,7 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                         "item_id": st["item_id"], "output_index": st["out_index"],
                         "delta": args})
 
-        if not judged:
+        if not judged and not getattr(answer_gate, "cut", False):
             # The stream ENDED: file the outcome it never used to (see
             # _record_stream_outcome). The client already has the bytes.
             _record_stream_outcome(hop_pid, hop_model, "".join(text_buf),
@@ -23141,7 +23518,8 @@ def v1_responses(_retry_pass=False):
                 # (role delta + [DONE], no content) must fall through to the next
                 # model instead of being streamed to codex as a dead-end answer.
                 status, buffered = _peek_until_content(
-                    line_it, _clock.peek_timeout(hop_model, est))
+                    line_it, _clock.peek_timeout(hop_model, est),
+                    check=_peek_check(payload, has_tools))
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -23150,17 +23528,20 @@ def v1_responses(_retry_pass=False):
                         # sideline the id so it stops winning hop 1 (see
                         # _note_nonanswer; ranking alone never removed it).
                         _note_nonanswer(hop_pid, hop_model)
+                    elif status == "junk":
+                        _record_outcome(hop_pid, hop_model, False)
                     resp.close()
                     continue
                 _note_ttft(resp, hop_pid, hop_model)
                 chained = _clock.guard(_chain_buffered(buffered, line_it),
                                        _DEADLINE_CUT_LINE, "%s/%s" % (hop_pid, hop_model))
+                gated = _gate_stream(chained, "lines", hop_pid, hop_model, payload, has_tools)
                 return Response(stream_with_context(
-                    _responses_stream(resp, model_label, line_iter=chained, prompt_est=est,
+                    _responses_stream(resp, model_label, line_iter=gated, prompt_est=est,
                                       hop_pid=hop_pid, hop_model=hop_model,
                                       prompt_text=_prompt_text_for_check(payload),
                                       last_prompt=_last_user_text_for_check(payload),
-                                      tools_offered=has_tools)),
+                                      tools_offered=has_tools, answer_gate=gated)),
                     mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
@@ -23501,7 +23882,7 @@ def _sse_event(name, obj):
 
 def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISSING,
                       hop_pid=None, hop_model=None, prompt_text=None, tools_offered=False,
-                      last_prompt=None):
+                      last_prompt=None, answer_gate=None):
     """Translate an upstream OpenAI SSE stream into the Anthropic event
     sequence: message_start -> content_block_start -> content_block_delta* ->
     content_block_stop -> message_delta -> message_stop. When `line_iter`/`first`
@@ -23631,7 +24012,7 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
                         "type": "content_block_delta", "index": tool_blocks[oai_idx],
                         "delta": {"type": "input_json_delta", "partial_json": args}})
 
-        if not judged:
+        if not judged and not getattr(answer_gate, "cut", False):
             # The stream ENDED: file the outcome it never used to (see
             # _record_stream_outcome). The client already has the bytes.
             _record_stream_outcome(hop_pid, hop_model, "".join(text_parts),
@@ -23873,7 +24254,8 @@ def v1_messages():
                 # Peek until REAL content so an empty 200 falls through to the next
                 # model instead of being handed to the client as a dead-end answer.
                 status, buffered = _peek_until_content(
-                    line_it, _clock.peek_timeout(hop_model, est))
+                    line_it, _clock.peek_timeout(hop_model, est),
+                    check=_peek_check(payload, has_tools))
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -23882,17 +24264,20 @@ def v1_messages():
                         # sideline the id so it stops winning hop 1 (see
                         # _note_nonanswer; ranking alone never removed it).
                         _note_nonanswer(hop_pid, hop_model)
+                    elif status == "junk":
+                        _record_outcome(hop_pid, hop_model, False)
                     resp.close()
                     continue
                 _note_ttft(resp, hop_pid, hop_model)
                 chained = _clock.guard(_chain_buffered(buffered, line_it),
                                        _DEADLINE_CUT_LINE, "%s/%s" % (hop_pid, hop_model))
+                gated = _gate_stream(chained, "lines", hop_pid, hop_model, payload, has_tools)
                 return Response(stream_with_context(
-                    _anthropic_stream(resp, model_str, input_est, line_iter=chained,
+                    _anthropic_stream(resp, model_str, input_est, line_iter=gated,
                                      hop_pid=hop_pid, hop_model=hop_model,
                                      prompt_text=_prompt_text_for_check(payload),
                                      last_prompt=_last_user_text_for_check(payload),
-                                     tools_offered=has_tools)),
+                                     tools_offered=has_tools, answer_gate=gated)),
                     mimetype="text/event-stream",
                     headers=dict(_SSE_HEADERS, **_routing_headers(
                         hop_pid, hop_model, attempts, last_error)))
