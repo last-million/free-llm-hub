@@ -1715,6 +1715,28 @@ def new_project_dir():
 # treated the same way defensively.
 _MODEL_ALIAS = "opus"
 
+# The dashboard's subscription model picker (app._sub_selected_model) stores
+# the user's choice under these settings; the agent turn reads the SAME key so
+# a pick applies to one-shot hops and /agent turns alike. Unset keeps the
+# defaults above (claude: _MODEL_ALIAS; codex: no --model, config.toml decides).
+_SUB_MODEL_SETTING = {"claude": "sub_claude_model", "codex": "sub_codex_model"}
+_SUB_MODEL_SAFE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\[\]/-]{0,79}$")
+
+
+def _sub_model_setting(cli_id: str) -> str:
+    """The picked subscription model for this CLI, or "" when unset/invalid.
+    Validated because it travels in argv: a value that could read as a flag
+    is ignored, never passed. Never raises."""
+    key = _SUB_MODEL_SETTING.get(cli_id)
+    if not key:
+        return ""
+    try:
+        v = config.get_setting(key, None)
+    except Exception:                                            # noqa: BLE001
+        return ""
+    v = v.strip() if isinstance(v, str) else ""
+    return v if _SUB_MODEL_SAFE_RE.match(v) else ""
+
 
 # --------------------------------------------------------------------------- #
 # Carrying the session's model-quality mode to the hub.
@@ -2037,11 +2059,12 @@ def write_task_brief(project_dir, text, memory_block="", session_id=None):
 
 def _claude_model_for(sess) -> str:
     """--model for one claude turn: the session's mode when the hub is serving
-    it, the long-stable "opus" alias otherwise."""
+    it, the subscription's picked model otherwise (default: the long-stable
+    "opus" alias)."""
     _mid = _session_model_id(sess)
     if _mid and _hub_backs("claude"):
         return _mid
-    return _MODEL_ALIAS
+    return _sub_model_setting("claude") or _MODEL_ALIAS
 
 
 def _build_argv(sess: _Session, bin_path: str, text: str, stream=False):
@@ -2143,6 +2166,10 @@ def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
     _mid = _session_model_id(sess)
     if _mid and _hub_backs("codex"):
         base += ["--model", _mid]
+    elif not _hub_backs("codex") and _sub_model_setting("codex"):
+        # A real ChatGPT subscription serves this turn: honour the model the
+        # user picked for it. Unset (the default) adds nothing, as before.
+        base += ["--model", _sub_model_setting("codex")]
     if sess.native_session_id:
         base += ["resume", sess.native_session_id, "--json",
                  "--dangerously-bypass-approvals-and-sandbox", prompt]
