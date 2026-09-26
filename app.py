@@ -66,6 +66,7 @@ import antigravity
 import secretstore
 import respcache
 import tool_rescue
+import answer_check
 import wire_gemini
 import wire_ollama
 import model_categories
@@ -2977,7 +2978,7 @@ def _reliability_penalty(pid, model):
     return max(0.0, (0.5 - _reliability(pid, model))) * 2.0 * _OUTCOME_WEIGHT
 
 
-def _record_chat_usage(hop_pid, hop_model, data, prompt_est):
+def _record_chat_usage(hop_pid, hop_model, data, prompt_est, ok=True):
     """Record usage from a completed OpenAI-shaped chat response `data` (the
     raw upstream JSON -- all three protocol handlers dispatch through the
     same OpenAI-shaped upstream call, so this is one shared hook point).
@@ -2986,12 +2987,14 @@ def _record_chat_usage(hop_pid, hop_model, data, prompt_est):
     (_est_tokens). Never raises -- usage_history.record() already swallows
     its own errors, but guard the data-parsing here too.
 
-    ALSO the single success hook for outcome-learned reliability: this is
-    called from all six accepted-answer sites across the three endpoints
-    (chat/responses/messages, streaming and not), and only ever once a hop's
-    answer was actually accepted -- which is exactly the "it delivered"
-    signal _reliability_penalty needs."""
-    _record_outcome(hop_pid, hop_model, True)
+    ALSO the success hook for outcome-learned reliability on every NON-streamed
+    accepted answer, and only ever once a hop's answer was actually accepted --
+    which is exactly the "it delivered" signal _reliability_penalty needs.
+    `ok=False` is for an answer the hub served only after trimming junk off it
+    (_answer_gate "salvaged"): usage still happened, but the hop burned the
+    budget degenerating and must not be promoted for it. STREAMED answers are
+    recorded once the stream ends, by _record_stream_outcome."""
+    _record_outcome(hop_pid, hop_model, bool(ok))
     try:
         usage = data.get("usage") if isinstance(data, dict) else None
         if isinstance(usage, dict) and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
@@ -17629,6 +17632,146 @@ def _note_nonanswer(pid, model):
 
 
 # --------------------------------------------------------------------------- #
+# ANSWER-QUALITY GATE -- a correct answer with junk glued on is not a success.
+#
+# MEASURED LIVE: llm7/GLM-5.3-Flash answered, then generated until max_tokens:
+#   "OK出具证明的，原试题解析 做题如有雷同，纯属巧合…"
+#   "6510</arg_value></tool_call>6510</arg_value></tool_call>The user asked"
+# and both went out as clean 200s AND were filed as _record_outcome(True) --
+# every earlier check hunted a BAD answer, none a GOOD answer plus garbage.
+# answer_check.inspect judges the text; this is the hub-side policy:
+#   * junk only after a real answer -> serve the clean part ("salvaged"), and
+#     record the hop as a FAILED delivery (it burned the budget looping);
+#   * nothing salvageable -> the hop is a non-answer: next hop + failure.
+# Deliberately NOT _note_nonanswer (6h dead-mark): like the fan-out refusal
+# check, a heuristic is good enough to lose a turn over, not to ban a model
+# fleet-wide over.
+# --------------------------------------------------------------------------- #
+_PROMPT_CHECK_CAP = 40000
+
+
+def _prompt_text_for_check(payload):
+    """Every USER turn's text in an OpenAI-shaped payload, joined -- the
+    reference for "did the prompt use this script / mention this markup".
+    All user turns, not just the last: a conversation that was in Chinese two
+    turns ago may legitimately be answered in Chinese now. Never raises."""
+    try:
+        parts = []
+        for m in (payload or {}).get("messages") or ():
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            c = m.get("content")
+            if isinstance(c, str):
+                parts.append(c)
+            elif isinstance(c, list):
+                parts.extend(p.get("text") or "" for p in c
+                             if isinstance(p, dict) and isinstance(p.get("text"), str))
+        text = "\n".join(parts)
+        if len(text) > _PROMPT_CHECK_CAP:
+            half = _PROMPT_CHECK_CAP // 2
+            text = text[:half] + "\n" + text[-half:]
+        return text
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _answer_gate(data, payload, has_tools):
+    """'ok' | 'salvaged' | 'junk' for a non-streamed OpenAI chat JSON.
+
+    'salvaged' REWRITES `data` in place: content becomes the clean answer and a
+    "length" finish becomes "stop" (the served text is complete). A message
+    with real tool_calls is always 'ok' -- its content is not the answer.
+    Fail-open: any error is 'ok', so the gate can never lose an answer."""
+    try:
+        choice = ((data.get("choices") or [{}])[0]) or {}
+        msg = choice.get("message") or {}
+        if msg.get("tool_calls"):
+            return "ok"
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "".join((p.get("text") or "") for p in content
+                              if isinstance(p, dict))
+        if not isinstance(content, str) or not content.strip():
+            return "ok"
+        verdict = answer_check.inspect(
+            content, prompt_text=_prompt_text_for_check(payload),
+            tools_offered=bool(has_tools), finish_reason=choice.get("finish_reason"))
+        if verdict.get("ok"):
+            return "ok"
+        _log.warning("[answer-gate] junk in answer (%s), salvage=%s",
+                     ",".join(verdict.get("reasons") or ()),
+                     "yes" if verdict.get("salvage") else "no")
+        if verdict.get("salvage"):
+            msg["content"] = verdict["salvage"]
+            if choice.get("finish_reason") == "length":
+                choice["finish_reason"] = "stop"
+            return "salvaged"
+        return "junk"
+    except Exception:                                            # noqa: BLE001
+        return "ok"
+
+
+def _record_stream_outcome(pid, model, text, *, tool_calls=False,
+                           finish_reason=None, prompt_text=None, tools_offered=False):
+    """The outcome a STREAMED answer never used to file: every stream commit
+    point returned the Response without any _record_outcome, so a streaming
+    model that delivered was never credited and one that degenerated was never
+    penalised. Called once, when the stream has ENDED; the bytes are already
+    with the client, so this only teaches routing. A turn that produced tool
+    calls is judged a delivery. No text and no tool calls files NOTHING: the
+    first-content peek already proved content arrived, so an empty digest means
+    frames this parser could not read (reasoning-only, odd framing) -- unknown,
+    and a guess either way would teach routing something false. Never raises."""
+    if not (pid and model):
+        return
+    try:
+        ok = True
+        if not tool_calls:
+            if not (text or "").strip():
+                return
+            ok = answer_check.inspect(
+                text, prompt_text=prompt_text, tools_offered=tools_offered,
+                finish_reason=finish_reason).get("ok", True)
+        _record_outcome(pid, model, ok)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _sse_answer_digest(raw_frames):
+    """(text, saw_tool_calls, finish_reason) from raw OpenAI chat SSE bytes --
+    parsed ONCE after a passthrough stream ends, so the zero-copy relay itself
+    does no per-chunk JSON work. Never raises."""
+    text, tools, fin = [], False, None
+    try:
+        blob = b"".join(raw_frames)
+        for line in blob.split(b"\n"):
+            line = line.strip()
+            if not line.startswith(b"data:"):
+                continue
+            body = line[5:].strip()
+            if not body.startswith(b"{"):
+                continue
+            try:
+                chunk = json.loads(body.decode("utf-8", "ignore"))
+            except ValueError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            choice = ((chunk.get("choices") or [{}])[0]) or {}
+            delta = choice.get("delta") or {}
+            c = delta.get("content")
+            if isinstance(c, str):
+                text.append(c)
+            if delta.get("tool_calls"):
+                tools = True
+            if choice.get("finish_reason"):
+                fin = choice["finish_reason"]
+    except Exception:                                            # noqa: BLE001
+        pass
+    return "".join(text), tools, fin
+
+
+# --------------------------------------------------------------------------- #
 # BUDGET STARVATION — a reasoning model that spent the whole max_tokens thinking
 # and had nothing left to answer with.
 #
@@ -17708,7 +17851,11 @@ def _sse_chunk_is_progress(raw):
     return False
 
 
-def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None):
+_STREAM_DIGEST_CAP = 2 << 20     # bytes of a relayed stream kept for the end check
+
+
+def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None,
+               prompt_text=None, tools_offered=False):
     """Pass upstream SSE bytes through unchanged. When `iterator`/`first` are
     supplied (the first-byte peek already pulled the first chunk from this exact
     iterator), yield that chunk first, then continue the SAME iterator — so the
@@ -17718,8 +17865,14 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
     Also enforces _STREAM_PROGRESS_DEADLINE: a provider that goes quiet except
     for keepalives is cut off, recorded as a delivery failure (so it stops
     winning top slot), and the client gets a clean [DONE] instead of an SSE
-    body that never ends."""
+    body that never ends.
+
+    With `hop_pid`, a stream that ENDS normally is judged once (answer_check,
+    via _record_stream_outcome) and its outcome recorded -- the bytes are
+    kept (capped) and parsed only then, so the relay stays a passthrough."""
     saw_done = False
+    stalled = False
+    kept, kept_len = [], 0
     last_progress = time.time()
     try:
         if iterator is None:
@@ -17732,16 +17885,25 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
                 _log.warning("[stream-stall] %s/%s: no real content for %ds, cutting off",
                             hop_pid, hop_model, _STREAM_PROGRESS_DEADLINE)
                 _record_outcome(hop_pid, hop_model, False)
+                stalled = True
                 if not saw_done:
                     yield b"data: [DONE]\n\n"
                     saw_done = True
                 break
             if chunk:
-                if not saw_done and _STREAM_TERMINAL_RE.search(
-                        chunk if isinstance(chunk, (bytes, bytearray))
-                        else str(chunk).encode("utf-8", "ignore")):
+                raw = (chunk if isinstance(chunk, (bytes, bytearray))
+                       else str(chunk).encode("utf-8", "ignore"))
+                if not saw_done and _STREAM_TERMINAL_RE.search(raw):
                     saw_done = True
+                if hop_pid and kept_len < _STREAM_DIGEST_CAP:
+                    kept.append(bytes(raw))
+                    kept_len += len(raw)
                 yield chunk
+        if hop_pid and not stalled:
+            text, saw_tools, fin = _sse_answer_digest(kept)
+            _record_stream_outcome(hop_pid, hop_model, text, tool_calls=saw_tools,
+                                   finish_reason=fin, prompt_text=prompt_text,
+                                   tools_offered=tools_offered)
     except Exception as exc:
         # Upstream died mid-stream (reset / ChunkedEncodingError / read timeout).
         # Without a terminator the client sits on a half-open SSE body waiting for
@@ -18250,6 +18412,13 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
                     resp.close()
                 except Exception:                                # noqa: BLE001
                     pass
+            # Degeneration check FIRST: a junk loop usually runs to the cap, so
+            # left alone it would be filed as a mere truncation below. Salvage
+            # rewrites the message (and its "length" finish) in place.
+            gate = _answer_gate(data, payload, False)
+            if gate == "junk":
+                _record_outcome(hop_pid, hop_model, False)
+                continue
             choice = (data.get("choices") or [{}])[0]
             text = ((choice.get("message") or {}).get("content") or "").strip()
             if text and choice.get("finish_reason") == "length":
@@ -18273,7 +18442,7 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
                 # Same success hook as every other endpoint: usage accounting
                 # AND the reliability record, so a stage's healthy hop is what
                 # the next stage's chain prefers (and a hung hop sinks).
-                _record_chat_usage(hop_pid, hop_model, data, est)
+                _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
                 _act_pick(hop_pid, hop_model)
                 return text, "%s/%s" % (hop_pid, hop_model)
         if best_partial:
@@ -18758,7 +18927,14 @@ def _swarm_tool_result(body):
             # slot, so the CLI executed nothing and the build said Finished.
             _note_nonanswer(hop_pid, hop_model)
             return _why("answered in prose without calling a tool")
-        _record_chat_usage(hop_pid, hop_model, data, est)
+        # Degenerate text (see _answer_gate): salvage keeps the member in the
+        # race with its clean answer; pure junk loses the slot, never a ban.
+        gate = _answer_gate(data, payload, bool(body.get("tools")))
+        if gate == "junk":
+            _record_outcome(hop_pid, hop_model, False)
+            return _why("degenerate answer (nothing salvageable)")
+        msg = ((data.get("choices") or [{}])[0].get("message") or {})
+        _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
         return (hop_pid, hop_model, data, msg)
 
     # `ex.map` waited for EVERY member, which is why a turn cost the slowest one
@@ -20029,7 +20205,14 @@ def _chat_completions_uncached(body):
                     last_error = "empty"
                     resp.close()
                     continue
-                _record_chat_usage(hop_pid, hop_model, data, est)
+                gate = _answer_gate(data, payload, has_tools)
+                if gate == "junk":
+                    errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
+                    last_error = "junk"
+                    _record_outcome(hop_pid, hop_model, False)
+                    resp.close()
+                    continue
+                _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
                 delta, fin = _sub_stream_message(data)
                 chunk = {"id": data.get("id", "chatcmpl-sub"), "object": "chat.completion.chunk",
                         "created": data.get("created", int(time.time())),
@@ -20065,7 +20248,9 @@ def _chat_completions_uncached(body):
                     continue
                 _note_ttft(resp, hop_pid, hop_model)
                 chained = _chain_buffered(buffered, it)
-                relay = _proxy_sse(resp, chained, hop_pid=hop_pid, hop_model=hop_model)
+                relay = _proxy_sse(resp, chained, hop_pid=hop_pid, hop_model=hop_model,
+                                   prompt_text=_prompt_text_for_check(payload),
+                                   tools_offered=has_tools)
                 # A tools turn gets its frames checked; a plain chat stream keeps
                 # the zero-copy byte passthrough exactly as it was.
                 if has_tools:
@@ -20107,9 +20292,12 @@ def _chat_completions_uncached(body):
                         resp2.close()
                     except (requests.RequestException, RuntimeError, ValueError):
                         data2 = None
+                    gate2 = "junk"
                     if (data2 and not _chat_json_is_empty(data2)
                             and not _chat_json_nonanswer(data2, has_tools, body.get("tools"))):
-                        _record_chat_usage(hop_pid, hop_model, data2, est)
+                        gate2 = _answer_gate(data2, payload, has_tools)
+                    if gate2 != "junk":
+                        _record_chat_usage(hop_pid, hop_model, data2, est, ok=gate2 == "ok")
                         data2["model"] = hop_pid + "/" + hop_model
                         return (jsonify(data2), 200,
                                 _routing_headers(hop_pid, hop_model, attempts, last_error))
@@ -20120,7 +20308,15 @@ def _chat_completions_uncached(body):
                 last_error = "empty"
                 resp.close()
                 continue
-            _record_chat_usage(hop_pid, hop_model, data, est)
+            gate = _answer_gate(data, payload, has_tools)
+            if gate == "junk":
+                # A 200 that is ONLY degeneration (see _answer_gate): next hop.
+                errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
+                last_error = "junk"
+                _record_outcome(hop_pid, hop_model, False)
+                resp.close()
+                continue
+            _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             if isinstance(data, dict):
                 data["model"] = hop_pid + "/" + hop_model
                 # An answer cut off at the provider's OWN default budget is a
@@ -20363,7 +20559,7 @@ def _chat_to_responses(chat_json, model_label):
 
 
 def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_est=0,
-                      hop_pid=None, hop_model=None):
+                      hop_pid=None, hop_model=None, prompt_text=None, tools_offered=False):
     """Consume an upstream OpenAI chat SSE stream and re-emit it as Responses API
     events for Codex. When `line_iter`/`first` are supplied (the first-byte peek
     already pulled the first line from this exact iterator) the pre-read line is
@@ -20396,6 +20592,7 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
     text_buf = []
     tools = {}               # oai tool index -> {out_index,item_id,call_id,name,args[]}
     usage = None
+    stream_fin = None        # last finish_reason seen, for the end-of-stream judgement
     if line_iter is None:
         line_iter = resp.iter_lines(decode_unicode=False)
 
@@ -20446,6 +20643,7 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
             done_items.append((st["out_index"], item))
 
     last_progress = time.time()
+    judged = False           # outcome already filed (stall / error / end check)
     try:
         yield _sse_event("response.created",
                          {"type": "response.created", "response": _obj("in_progress", [])})
@@ -20458,6 +20656,7 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                 _log.warning("[stream-stall] %s/%s: no real content for %ds, cutting off",
                             hop_pid, hop_model, _STREAM_PROGRESS_DEADLINE)
                 _record_outcome(hop_pid, hop_model, False)
+                judged = True
                 break
             if not raw or not raw.startswith(b"data:"):
                 continue
@@ -20469,8 +20668,11 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
             except (ValueError, UnicodeDecodeError):
                 continue
             if isinstance(chunk, dict) and chunk.get("error"):
-                break  # provider streamed an error object on a 200 -> stop cleanly,
-                       # emit the terminal below (never relay the error as content)
+                # provider streamed an error object on a 200 -> stop cleanly,
+                # emit the terminal below (never relay the error as content)
+                _record_outcome(hop_pid, hop_model, False)
+                judged = True
+                break
             u = chunk.get("usage")
             if isinstance(u, dict) and (u.get("prompt_tokens") is not None
                                         or u.get("completion_tokens") is not None):
@@ -20478,6 +20680,8 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
             choices = chunk.get("choices") or []
             if not choices:
                 continue
+            if (choices[0] or {}).get("finish_reason"):
+                stream_fin = choices[0]["finish_reason"]
             delta = (choices[0] or {}).get("delta") or {}
 
             # Reasoning-phase keepalive: a thinking model sends reasoning deltas for
@@ -20552,6 +20756,12 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                         "item_id": st["item_id"], "output_index": st["out_index"],
                         "delta": args})
 
+        if not judged:
+            # The stream ENDED: file the outcome it never used to (see
+            # _record_stream_outcome). The client already has the bytes.
+            _record_stream_outcome(hop_pid, hop_model, "".join(text_buf),
+                                   tool_calls=bool(tools), finish_reason=stream_fin,
+                                   prompt_text=prompt_text, tools_offered=tools_offered)
         yield from _finalize_open_items()
 
         final_usage = None
@@ -20780,7 +20990,14 @@ def v1_responses(_retry_pass=False):
                     last_error = "empty"
                     resp.close()
                     continue
-                _record_chat_usage(hop_pid, hop_model, data, est)
+                gate = _answer_gate(data, payload, has_tools)
+                if gate == "junk":
+                    errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
+                    last_error = "junk"
+                    _record_outcome(hop_pid, hop_model, False)
+                    resp.close()
+                    continue
+                _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
                 delta, _fin = _sub_stream_message(data)
                 synth = json.dumps({"choices": [{"delta": delta}]}).encode("utf-8")
                 line_iter = iter([b"data: " + synth, b"data: [DONE]"])
@@ -20810,7 +21027,9 @@ def v1_responses(_retry_pass=False):
                 chained = _chain_buffered(buffered, line_it)
                 return Response(stream_with_context(
                     _responses_stream(resp, model_label, line_iter=chained, prompt_est=est,
-                                      hop_pid=hop_pid, hop_model=hop_model)),
+                                      hop_pid=hop_pid, hop_model=hop_model,
+                                      prompt_text=_prompt_text_for_check(payload),
+                                      tools_offered=has_tools)),
                     mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
                 data = resp.json()
@@ -20833,7 +21052,15 @@ def v1_responses(_retry_pass=False):
                 last_error = "empty"
                 resp.close()
                 continue
-            _record_chat_usage(hop_pid, hop_model, data, est)
+            gate = _answer_gate(data, payload, has_tools)
+            if gate == "junk":
+                # A 200 that is ONLY degeneration (see _answer_gate): next hop.
+                errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
+                last_error = "junk"
+                _record_outcome(hop_pid, hop_model, False)
+                resp.close()
+                continue
+            _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             return jsonify(_chat_to_responses(data, model_label)), 200
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
@@ -21133,7 +21360,7 @@ def _sse_event(name, obj):
 
 
 def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISSING,
-                      hop_pid=None, hop_model=None):
+                      hop_pid=None, hop_model=None, prompt_text=None, tools_offered=False):
     """Translate an upstream OpenAI SSE stream into the Anthropic event
     sequence: message_start -> content_block_start -> content_block_delta* ->
     content_block_stop -> message_delta -> message_stop. When `line_iter`/`first`
@@ -21163,6 +21390,8 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
         real_out_tokens = None   # usage_history: only set from a REAL upstream usage object
         real_in_tokens = None
         text_chars = 0
+        text_parts = []          # for the end-of-stream judgement only
+        judged = False           # outcome already filed (stall / error)
 
         for raw in _chain_first(first, line_iter):
             now = time.time()
@@ -21172,6 +21401,7 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
                 _log.warning("[stream-stall] %s/%s: no real content for %ds, cutting off",
                             hop_pid, hop_model, _STREAM_PROGRESS_DEADLINE)
                 _record_outcome(hop_pid, hop_model, False)
+                judged = True
                 break
             if not raw or not raw.startswith(b"data:"):
                 continue
@@ -21183,7 +21413,10 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
             except (ValueError, UnicodeDecodeError):
                 continue
             if isinstance(chunk, dict) and chunk.get("error"):
-                break  # error object on a 200 stream -> stop cleanly, emit terminal below
+                # error object on a 200 stream -> stop cleanly, emit terminal below
+                _record_outcome(hop_pid, hop_model, False)
+                judged = True
+                break
             usage = chunk.get("usage")
             if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
                 out_tokens = usage.get("completion_tokens")
@@ -21224,6 +21457,8 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
                         "type": "content_block_start", "index": block_index,
                         "content_block": {"type": "text", "text": ""}})
                 text_chars += len(dtext)
+                if hop_pid and text_chars <= _STREAM_DIGEST_CAP:
+                    text_parts.append(dtext)
                 yield _sse_event("content_block_delta", {
                     "type": "content_block_delta", "index": block_index,
                     "delta": {"type": "text_delta", "text": dtext}})
@@ -21255,6 +21490,12 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
                         "type": "content_block_delta", "index": tool_blocks[oai_idx],
                         "delta": {"type": "input_json_delta", "partial_json": args}})
 
+        if not judged:
+            # The stream ENDED: file the outcome it never used to (see
+            # _record_stream_outcome). The client already has the bytes.
+            _record_stream_outcome(hop_pid, hop_model, "".join(text_parts),
+                                   tool_calls=bool(tool_blocks), finish_reason=finish_reason,
+                                   prompt_text=prompt_text, tools_offered=tools_offered)
         if block_index < 0:  # upstream produced nothing: still emit a valid shape
             block_index = 0
             yield _sse_event("content_block_start", {
@@ -21480,7 +21721,9 @@ def v1_messages():
                 chained = _chain_buffered(buffered, line_it)
                 return Response(stream_with_context(
                     _anthropic_stream(resp, model_str, input_est, line_iter=chained,
-                                     hop_pid=hop_pid, hop_model=hop_model)),
+                                     hop_pid=hop_pid, hop_model=hop_model,
+                                     prompt_text=_prompt_text_for_check(payload),
+                                     tools_offered=has_tools)),
                     mimetype="text/event-stream",
                     headers=dict(_SSE_HEADERS, **_routing_headers(
                         hop_pid, hop_model, attempts, last_error)))
@@ -21505,7 +21748,15 @@ def v1_messages():
                 last_error = "empty"
                 resp.close()
                 continue
-            _record_chat_usage(hop_pid, hop_model, data, est)
+            gate = _answer_gate(data, payload, has_tools)
+            if gate == "junk":
+                # A 200 that is ONLY degeneration (see _answer_gate): next hop.
+                errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
+                last_error = "junk"
+                _record_outcome(hop_pid, hop_model, False)
+                resp.close()
+                continue
+            _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             return jsonify(_openai_resp_to_anthropic(data, model_str)), 200, \
                 _routing_headers(hop_pid, hop_model, attempts, last_error)
         # Non-2xx. Retryable (429/5xx) AND hard errors (404/400/model-not-found)
