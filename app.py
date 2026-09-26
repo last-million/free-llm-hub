@@ -1094,7 +1094,8 @@ def _warm_catalogs_async():
             _log.info("[warm] provider catalogs ready")
         except Exception as exc:                                 # noqa: BLE001
             _log.debug("[warm] catalog warm-up skipped: %s", exc)
-    threading.Thread(target=_go, name="warm-catalogs", daemon=True).start()
+    threading.Thread(target=_usage_source_as("warm-up")(_go), name="warm-catalogs",
+                     daemon=True).start()
 
 
 def _prefetch_free_models(providers):
@@ -3417,6 +3418,10 @@ _PROVIDER_FORBIDDEN_THRESHOLD = 8      # 403-only: usually per-model, not a bad 
 _PROVIDER_NOCREDIT_THRESHOLD = 2       # 402 on 2 distinct models = the ACCOUNT is broke
 _AUTH_FAIL_STATUSES = (401, 402, 403)
 _dead_providers = {}                   # pid -> expiry epoch
+# pid -> short human reason the provider was parked, for the Providers card.
+# REPORTED 2026-09-26: cards said "parked" with no why and no until, so a
+# correct sideline read as a bug. Written next to every _dead_providers set.
+_dead_provider_why = {}
 _provider_authfail = {}                # pid -> {model: last auth-fail epoch} (sliding window)
 _provider_keyfail = {}                 # pid -> epoch of the last real 401/402 (sliding window)
 _provider_dead_lock = threading.Lock()
@@ -3560,6 +3565,7 @@ def _mark_provider_authfail(pid, model, status):
             # distinct model before sidelining the whole provider — one 402 only kills
             # that model (_mark_model_dead already did), never its working siblings.
             _dead_providers[pid] = time.time() + _PROVIDER_DEAD_TTL
+            _dead_provider_why[pid] = "no credit: HTTP 402 on %d models" % len(s)
             return
         # A key-level failure anywhere in the window keeps the strict threshold; a
         # 403-only window needs far more distinct models before we blame the key
@@ -3568,6 +3574,7 @@ def _mark_provider_authfail(pid, model, status):
                      else _PROVIDER_FORBIDDEN_THRESHOLD)
         if len(s) >= threshold:
             _dead_providers[pid] = time.time() + _PROVIDER_DEAD_TTL
+            _dead_provider_why[pid] = "key rejected (401/403) on %d models" % len(s)
 
 
 def _note_provider_result(pid, ok, hard_fail=False):
@@ -3594,6 +3601,7 @@ def _note_provider_result(pid, ok, hard_fail=False):
         _provider_consec_fail[pid] = n
         if n >= _PROVIDER_CONSEC_FAIL_THRESHOLD:
             _dead_providers[pid] = time.time() + _PROVIDER_DEAD_TTL
+            _dead_provider_why[pid] = "%d consecutive failures (4xx)" % n
             _provider_consec_fail.pop(pid, None)
 
 
@@ -3676,6 +3684,7 @@ def _note_provider_timeout(pid, exc):
         _provider_timeout_fail[pid] = n
         if n >= _PROVIDER_TIMEOUT_THRESHOLD:
             _dead_providers[pid] = time.time() + _PROVIDER_DEAD_TTL
+            _dead_provider_why[pid] = "%d requests in a row timed out" % n
             _provider_timeout_fail.pop(pid, None)
 
 
@@ -3692,6 +3701,7 @@ def _is_provider_dead(pid):
             return False
         if exp <= time.time():
             _dead_providers.pop(pid, None)
+            _dead_provider_why.pop(pid, None)
             _provider_authfail.pop(pid, None)   # reset counter -> a clean re-probe
             _provider_keyfail.pop(pid, None)
             _provider_consec_fail.pop(pid, None)
@@ -3892,6 +3902,8 @@ def _dead_state_dump():
         out = {
             "dead_models": dead_models,
             "dead_providers": {p: exp for p, exp in _dead_providers.items() if exp > now},
+            "dead_provider_why": {p: w for p, w in _dead_provider_why.items()
+                                  if _dead_providers.get(p, 0) > now},
             # Legacy shape (pid -> [models], [pids]) kept so an older build
             # reading this file still understands it; the *_ts keys carry the
             # timestamps the sliding window needs and win on load.
@@ -3996,6 +4008,9 @@ def _dead_state_load(blob):
                 if (isinstance(p, str) and isinstance(ts, (int, float))
                         and cutoff < ts <= now + 60):
                     _provider_keyfail[p] = float(ts)
+        for p, w in (blob.get("dead_provider_why") or {}).items():
+            if isinstance(p, str) and isinstance(w, str) and p in _dead_providers:
+                _dead_provider_why[p] = w[:160]
         for p, n in (blob.get("provider_consec_fail") or {}).items():
             if isinstance(p, str) and isinstance(n, int):
                 _provider_consec_fail[p] = n
@@ -5063,6 +5078,7 @@ def _puter_allowance(force=False):
     if remaining <= 0:
         with _provider_dead_lock:
             _dead_providers["puter"] = time.time() + _PROVIDER_DEAD_TTL
+            _dead_provider_why["puter"] = "monthly allowance spent"
     return data
 
 
@@ -8943,6 +8959,74 @@ def _build_project():
         return None
 
 
+# WHO IS SPENDING A PROVIDER'S QUOTA (quota.sources -> the card's "used by").
+#
+# REPORTED 2026-09-26: "those providers are out but I have not used them for
+# two days". The hub spends quota on its own behalf -- swarm and crew stages,
+# /build agent sessions, probes, key tests -- and none of that was visible, so
+# a correct throttle looked like a bug. quota.record() asks this resolver who
+# is calling, per upstream request:
+#
+#   1. a thread-local label set by _usage_source_as() ("swarm", "probe", ...)
+#      -- hub-internal work, which wins over whatever request it runs inside;
+#   2. a request under /build/<sid>  -> "agent" (a session the dashboard began);
+#   3. an inference path (/v1, /v1beta, ollama) -> the CLI label from the
+#      User-Agent (_guess_cli), e.g. "Codex", "OpenCode";
+#   4. any other page request (/api/...) -> "dashboard";
+#   5. no request at all (a daemon thread) -> "background".
+#
+# Swarm stages and probes hop threads (_dispatch_chat_with_deadline, the
+# fan-out pool), and a thread-local does not follow a thread; _carry_usage_
+# source() captures the label in the caller and re-applies it in the worker.
+import contextlib  # noqa: E402  (local, stdlib)
+from flask import has_request_context  # noqa: E402
+
+_usage_src_tls = threading.local()
+
+
+def _usage_source():
+    label = getattr(_usage_src_tls, "name", None)
+    if label:
+        return label
+    try:
+        if not has_request_context():
+            return "background"
+        if _build_sid():
+            return "agent"
+        path = request.path or ""
+        if (path.startswith("/v1") or _INFERENCE_PATHS.get(path)
+                or _is_ollama_path(path)):
+            return _guess_cli()
+        return "dashboard"
+    except Exception:                                            # noqa: BLE001
+        return "other"
+
+
+@contextlib.contextmanager
+def _usage_source_as(label):
+    """Attribute every upstream request made inside to `label`. Nests: the
+    previous label is restored on exit. Usable as a decorator too."""
+    prev = getattr(_usage_src_tls, "name", None)
+    _usage_src_tls.name = label
+    try:
+        yield
+    finally:
+        _usage_src_tls.name = prev
+
+
+def _carry_usage_source(fn):
+    """Wrap fn so it runs, in whatever thread, under the label resolved NOW."""
+    label = _usage_source()
+
+    def _run(*a, **kw):
+        with _usage_source_as(label):
+            return fn(*a, **kw)
+    return _run
+
+
+quota.set_source_resolver(_usage_source)
+
+
 @app.before_request
 def _activity_before():
     if request.method != "POST":
@@ -9283,6 +9367,125 @@ def _provider_quality_score(pid, free_models):
     return best
 
 
+def _sized(v):
+    """len() of a counter that may be a set, dict, list OR a bare int. The
+    breaker maps change shape over time (set of models today, maybe a dict of
+    model -> count tomorrow); the card only ever needs "how many"."""
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, float)):
+        return int(v)
+    try:
+        return len(v)
+    except TypeError:
+        return 0
+
+
+def _provider_out_status(pid, p, free_models=None):
+    """Why a provider card is out, and until when:
+    {status_reason, until, detail}.
+
+    status_reason: ok | throttled | parked | exhausted | no_free_tier |
+    models_dead. `until` is an epoch (None when there is nothing to wait
+    for). `detail` is one short human line.
+
+    REPORTED 2026-09-26: the Providers page showed six providers out with no
+    why and no when, and the user took it as a bug. Every signal here was
+    already tracked -- quota throttles, the dead-provider sideline, dead
+    models -- it just never reached the card. Priority follows what actually
+    keeps it out of routing longest: no free tier > parked > quota > models.
+    Reads local state only (no network) and never raises."""
+    out = {"status_reason": "ok", "until": None, "detail": ""}
+    try:
+        now = time.time()
+        q = {}
+        if not p.get("paid"):
+            try:
+                q = quota.status(pid) or {}
+            except Exception:                                    # noqa: BLE001
+                q = {}
+        # A documented limit of 0 is a researched fact, not a throttle: the
+        # provider has no free tier at all (morph meters $ from token one).
+        if q.get("limit_known") and q.get("limit") == 0:
+            out.update(status_reason="no_free_tier",
+                       detail="no free tier (documented free limit is 0)")
+            return out
+        with _provider_dead_lock:
+            exp = _dead_providers.get(pid) or 0
+            why = _dead_provider_why.get(pid)
+            consec = _sized(_provider_consec_fail.get(pid, 0))
+            touts = _sized(_provider_timeout_fail.get(pid, 0))
+            authf = _sized(_provider_authfail.get(pid, ()))
+        if exp > now:
+            ttl_min = int(round(_PROVIDER_DEAD_TTL / 60.0))
+            out.update(status_reason="parked", until=int(exp),
+                       detail="parked %d min after %s" % (
+                           ttl_min, why or "repeated hard failures"))
+            return out
+        if q.get("throttled") or q.get("exhausted"):
+            until = q.get("resets_at") or None
+            if q.get("throttled"):
+                out.update(status_reason="throttled", until=until,
+                           detail="rate-limited by the provider (HTTP 429)")
+            else:
+                used, lim = q.get("used"), q.get("limit")
+                span = q.get("window") or "window"
+                out.update(status_reason="exhausted", until=until,
+                           detail=("used %s of %s this %s" % (used, lim, span)
+                                   if lim is not None else
+                                   "free allowance spent this %s" % span))
+            return out
+        # Models: only "out" when EVERY listed free model is sidelined; a few
+        # dead ones is a note on an otherwise healthy card.
+        ids = [m for m in (free_models or []) if isinstance(m, str)]
+        dead_exp = []
+        with _dead_lock:
+            for (dp, dm), dexp in _dead_models.items():
+                if dp == pid and dexp > now and (not ids or dm in ids):
+                    dead_exp.append(dexp)
+        throttled_models = 0
+        for m in ids:
+            try:
+                if quota.is_model_throttled(pid, m):
+                    throttled_models += 1
+            except Exception:                                    # noqa: BLE001
+                break
+        notes = []
+        if ids and len(dead_exp) >= len(ids):
+            out.update(status_reason="models_dead", until=int(min(dead_exp)),
+                       detail="all %d models dead (re-probed after %d h)" % (
+                           len(ids), _DEAD_MODEL_TTL // 3600))
+            return out
+        if dead_exp:
+            notes.append("%d of %d models dead" % (len(dead_exp), len(ids))
+                         if ids else "%d models dead" % len(dead_exp))
+        if throttled_models:
+            notes.append("%d model%s rate-limited" % (
+                throttled_models, "" if throttled_models == 1 else "s"))
+        if consec:
+            notes.append("%d consecutive failure%s (parks at %d)" % (
+                consec, "" if consec == 1 else "s", _PROVIDER_CONSEC_FAIL_THRESHOLD))
+        if touts:
+            notes.append("%d timeout%s in a row" % (touts, "" if touts == 1 else "s"))
+        if authf:
+            notes.append("auth failed on %d model%s" % (authf, "" if authf == 1 else "s"))
+        out["detail"] = "; ".join(notes)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
+
+def _provider_used_by(pid):
+    """[{source, count}] for the current quota window, busiest first."""
+    try:
+        rows = quota.sources(pid)
+    except Exception:                                            # noqa: BLE001
+        return []
+    return [{"source": k, "count": int(v)}
+            for k, v in sorted(rows.items(), key=lambda kv: (-kv[1], kv[0]))
+            if isinstance(v, (int, float)) and v > 0]
+
+
 def _provider_row(pid, live_models=False):
     p = prov.get_provider(pid) or {}
     pcfg = config.get_provider_config(pid)
@@ -9303,7 +9506,15 @@ def _provider_row(pid, live_models=False):
     # Provider rows never trigger a network model-discovery call by default:
     # a save/list must be instant and can't fail on a provider's flaky /models
     # endpoint. The live model list is served separately by GET /api/models.
+    free_models = provider_free_models(pid, live=live_models)
+    out_status = _provider_out_status(pid, p, free_models)
     return {
+        # Why the card is out and until when, plus who spent this window's
+        # quota -- see _provider_out_status / quota.sources.
+        "status_reason": out_status["status_reason"],
+        "until": out_status["until"],
+        "detail": out_status["detail"],
+        "used_by": _provider_used_by(pid),
         "id": pid,
         "name": p.get("name") or pid,
         "enabled": bool(pcfg.get("enabled")),
@@ -9318,7 +9529,7 @@ def _provider_row(pid, live_models=False):
         "no_key": bool(p.get("no_key")),   # open gateway: usable with NO api key
         # vendor documents anonymous instant keys -> the card can offer one click
         "can_mint_key": bool(p.get("key_mint_url")),
-        "free_models": (lambda fm: fm)(provider_free_models(pid, live=live_models)),
+        "free_models": free_models,
         "image_free_count": sum(1 for r in _image_model_rows(pid) if r.get("free", True)),
         "image_paid_count": sum(1 for r in _image_model_rows(pid) if not r.get("free", True)),
         "relay": relay,
@@ -10686,6 +10897,7 @@ def _canary_summary(verdict, answer):
     return verdict or "no verdict"
 
 
+@_usage_source_as("probe")
 def _probe_pair_verdict(pid, model, timeout_s=25):
     """Send ONE tiny real canary request to (pid, model) and JUDGE the text.
 
@@ -17099,6 +17311,7 @@ def api_enhance_prompt():
                     "model": model})
 
 
+@_usage_source_as("probe")
 def _hub_serves_now():
     """In-process: route + call one free provider with a 1-token prompt. Returns
     (served_label, reply_snippet) or (None, None). Proves the hub pipeline works."""
@@ -18993,7 +19206,10 @@ def _dispatch_chat_with_deadline(pid, payload, deadline=None):
         except (requests.RequestException, RuntimeError) as exc:
             box["exc"] = exc
 
-    t = threading.Thread(target=_call, daemon=True)
+    # _carry_usage_source: the worker thread has neither the caller's
+    # thread-local label nor its request, so its quota hit would otherwise be
+    # filed as "background" instead of "swarm" / the calling CLI.
+    t = threading.Thread(target=_carry_usage_source(_call), daemon=True)
     t.start()
     t.join(deadline)
     if t.is_alive():
@@ -19035,6 +19251,7 @@ def _is_swarm_model(model):
     return m.startswith("crew/") and ("crew-" + m[len("crew/"):]) in crews.CREW_IDS
 
 
+@_usage_source_as("swarm")
 def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
     """One stage of the pipeline, routed and executed through the SAME chain
     every other request uses (so fallback, key rotation, quota accounting and
@@ -19388,6 +19605,7 @@ def _swarm_rank(cands, difficulty=None):
     return picks
 
 
+@_usage_source_as("swarm")
 def _swarm_tool_result(body):
     """Swarm for a TOOL-CALLING turn: run the same request on several strong
     models AT ONCE and return the best single response.
@@ -19619,7 +19837,7 @@ def _swarm_tool_result(body):
         # _pipeline_bound: members run on pool threads, where `g` -- and so the
         # category a "coding-swarm" id set -- does not exist. Captured here, at
         # fan-out start, and carried into every member.
-        _member = _pipeline_bound(_run)
+        _member = _pipeline_bound(_carry_usage_source(_run))
         pending = {ex.submit(_member, pm) for pm in picks}
         _fanout_started = time.monotonic()
         deadline = _fanout_started + _SWARM_TOOL_HOP_DEADLINE

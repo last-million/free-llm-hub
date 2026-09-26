@@ -725,6 +725,12 @@
   }
   .card.exhausted .quota-line{color:var(--danger-text);font-weight:600}
   .quota-countdown{font-variant-numeric:tabular-nums}
+  /* WHY a card is out (parked / rate-limited / models down) and who spent the
+     window. The reason stays in the danger colour via .card.exhausted; the
+     detail and the "used by" tally are supporting text, so they stay quiet. */
+  .quota-line .out-detail{color:var(--text-faint);font-weight:400}
+  .quota-line.used-by{margin-top:2px;color:var(--text-faint);font-weight:400}
+  .card.exhausted .quota-line.used-by{color:var(--text-faint);font-weight:400}
   /* Per-key exhaustion label, so a pooled provider says WHICH key is empty. */
   .keyrow-tag{
     font-size:10px;font-weight:600;letter-spacing:.02em;text-transform:uppercase;
@@ -5177,8 +5183,52 @@
   function providerExhausted(p){
     if (!p) return false;
     if (p.quota && p.quota.exhausted) return true;
+    /* Parked / every model down: out of routing just as surely as a spent
+       quota, so the card says so (status_reason comes from /api/providers). */
+    if (OUT_REASONS[p.status_reason]) return true;
     return !!(p.allowance && p.allowance.remaining <= 0);
   }
+  /* status_reason -> the words on the card. no_free_tier is absent on purpose:
+     the quota line already says "No free tier", and it is not an outage. */
+  var OUT_REASONS = {
+    parked: 'Parked', throttled: 'Rate-limited',
+    exhausted: 'Out of free quota', models_dead: 'All models down'
+  };
+  function backInText(until){
+    var left = Math.floor(Number(until) - Date.now() / 1000);
+    return left > 0 ? '· back in ' + fmtCountdown(left) : '· re-checking now';
+  }
+  /* REPORTED 2026-09-26: six providers showed "out" with no why and no when,
+     and the user read that as a bug ("I did not use them for 2 days") -- but
+     the hub's own swarm stages, agent sessions and probes spend quota too.
+     One line for the reason + countdown + detail, one for who used it. */
+  function outReasonLine(p){
+    var label = OUT_REASONS[p.status_reason];
+    if (!label){
+      return p.detail ? '<div class="quota-line"><span class="out-detail">' +
+                        esc(p.detail) + '</span></div>' : '';
+    }
+    return '<div class="quota-line"><span>' + esc(label) + '</span>' +
+      (p.until ? '<span class="quota-countdown" data-until="' + esc(p.until) + '">' +
+                 esc(backInText(p.until)) + '</span>' : '') +
+      (p.detail ? '<span class="out-detail">&middot; ' + esc(p.detail) + '</span>' : '') +
+      '</div>';
+  }
+  function usedByLine(p){
+    var rows = Array.isArray(p.used_by) ? p.used_by : [];
+    if (!rows.length) return '';
+    var txt = rows.slice(0, 5).map(function(r){ return r.source + ' ' + r.count; }).join(', ') +
+              (rows.length > 5 ? ' +' + (rows.length - 5) + ' more' : '');
+    return '<div class="quota-line used-by" title="Upstream requests this quota window, by who made them">' +
+           '<span>used by: ' + esc(txt) + '</span></div>';
+  }
+  /* Countdowns on the cards tick without a re-fetch. */
+  setInterval(function(){
+    var els = document.querySelectorAll('.quota-countdown[data-until]');
+    for (var i = 0; i < els.length; i++){
+      els[i].textContent = backInText(els[i].getAttribute('data-until'));
+    }
+  }, 30000);
   /* "3d 4h" / "7h 12m" / "45m" — short enough to sit inline on a card. */
   function fmtCountdown(secs){
     secs = Math.max(0, Math.floor(Number(secs) || 0));
@@ -5285,6 +5335,16 @@
       quotaLine = '<div class="quota-line"><span>' + esc(q.remaining) + ' of ' +
         esc(q.limit) + ' left this ' + esc(q.window) + '</span></div>';
     }
+    /* A known reason (parked / rate-limited / ...) replaces the generic
+       "Out of free quota" line: it says why AND when. neverFree keeps its own
+       line -- that is a fact about the provider, not an outage. */
+    if (!neverFree){
+      var reasonLine = outReasonLine(p);
+      if (OUT_REASONS[p.status_reason]) quotaLine = reasonLine;
+      else quotaLine += reasonLine;
+    }
+    quotaLine += usedByLine(p);
+    isExhausted = isExhausted || !!OUT_REASONS[p.status_reason];
     return '' +
       '<div class="card-top">' +
         '<div><div class="name">' + esc(p.name || p.id) +
