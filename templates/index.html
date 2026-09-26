@@ -6522,7 +6522,11 @@
          read it, so it could neither show who replied nor name a model to skip
          on a retry. Both need it. */
       var answeredBy = null;
-      var hdrs = { 'Content-Type': 'application/json' };
+      /* X-Free-LLM-Hub: dashboard -- swarm/crew answers carry their
+         "Plan followed / Models used / Reviewer raised" trailer ONLY for this
+         chat; CLI and API callers get the deliverable alone
+         (_wants_pipeline_trailer in app.py). */
+      var hdrs = { 'Content-Type': 'application/json', 'X-Free-LLM-Hub': 'dashboard' };
       /* "Retry with a different model": name the ones already tried so the
          router skips them. Matched by leaf name server-side, so this excludes
          the same model on every host, not just the one that answered. */

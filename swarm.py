@@ -63,7 +63,8 @@ plain "swarm" model and its tests are untouched by construction.
 """
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 MAX_PHASES = 5           # bounds worst-case cost: 1 plan + 5 phases + 1 review + 1 synth
 # The planner is asked for 2..MAX_PHASES. A plan with ONE phase means it did not
@@ -342,10 +343,57 @@ def _waves(phases):
     return out
 
 
-def run(messages, dispatch, profile=None, on_event=None):
+def _gather(fn, items, timeout, need_one=False):
+    """Run fn(item) for every item concurrently; {item: (text, who)} for the
+    ones that finished within `timeout` seconds (None = wait for all).
+
+    `need_one`: past the timeout, keep waiting until at least one result
+    carries text -- used while the run has nothing at all to deliver yet.
+
+    NOT a `with` block: ThreadPoolExecutor.__exit__ joins every worker, which
+    would make the wall-clock cap in run() wait for the very stragglers it
+    exists to stop waiting for. Abandoned workers are bounded by the
+    dispatcher's own per-hop deadline. One worker raising must not kill the
+    others."""
+    out = {}
+
+    def _have_text():
+        return any(isinstance(r, tuple) and r and r[0] for r in out.values())
+
+    pool = ThreadPoolExecutor(max_workers=max(1, len(items)))
+    try:
+        pending = {pool.submit(fn, it): it for it in items}
+        end = None if timeout is None else time.monotonic() + timeout
+        while pending:
+            left = None if end is None else end - time.monotonic()
+            if left is not None and left <= 0:
+                if not need_one or _have_text():
+                    break
+                left = None          # past the cap, still owed a first answer
+            done, _rest = wait(pending, timeout=left, return_when=FIRST_COMPLETED)
+            for fut in done:
+                item = pending.pop(fut)
+                try:
+                    out[item] = fut.result()
+                except Exception:                                # noqa: BLE001
+                    out[item] = ("", None)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
+def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
     """Run the pipeline. `dispatch(msgs, max_tokens, exclude_pids=()) ->
     (text, pid_model)`; it must never raise — an empty text means that call
     failed, and every stage below treats that as "carry on with what we have".
+
+    `max_seconds` is an OVERALL wall clock for the run (None/0 = unbounded).
+    MEASURED live: "coding-swarm" took 231 s to answer "What is 5767 plus 1" --
+    thirteen sequential-and-parallel calls, each allowed its own hop deadline,
+    add up with nothing bounding the sum. Past the cap no NEW stage starts
+    (remaining waves, supervisor, review, revision are skipped) and a parallel
+    wave stops waiting; the run then synthesises from whatever phases DID
+    finish, and the result carries "timed_out": True.
 
     `profile` (crews.py builds these) overrides the stage system prompts
     ("plan_system"/"phase_system"/"review_system"/"synth_system"), appends
@@ -374,6 +422,29 @@ def run(messages, dispatch, profile=None, on_event=None):
                 on_event(kind, detail)
             except Exception:                                   # noqa: BLE001
                 pass
+
+    try:
+        cap = float(max_seconds or 0)
+    except (TypeError, ValueError):
+        cap = 0.0
+    stop_at = (time.monotonic() + cap) if cap > 0 else None
+    timed_out = [False]
+
+    def _left():
+        """Seconds left on the wall clock (None = unbounded, 0 = spent)."""
+        if stop_at is None:
+            return None
+        return max(0.0, stop_at - time.monotonic())
+
+    def _over(stage):
+        """True once the cap is spent; says so ONCE in the event trail."""
+        if stop_at is None or time.monotonic() < stop_at:
+            return False
+        if not timed_out[0]:
+            timed_out[0] = True
+            emit("budget", "wall-clock cap (%ds) reached before %s — "
+                           "synthesising from what finished" % (int(cap), stage))
+        return True
 
     brief = _last_user_text(messages)
     models_used = []
@@ -445,22 +516,23 @@ def run(messages, dispatch, profile=None, on_event=None):
              {"role": "user", "content": user}], PHASE_MAX_TOKENS)
 
     for wave in _waves(phases):
+        if outputs and _over("the next wave"):
+            break            # at least one phase is in hand -- stop adding more
         names = ", ".join(phases[i - 1]["title"] for i in wave)
         emit("phase", ("%d in parallel: %s" % (len(wave), names)) if len(wave) > 1
              else "1/%d %s" % (len(phases), names))
-        if len(wave) == 1:
+        if len(wave) == 1 and stop_at is None:
             results = {wave[0]: _run_phase(wave[0])}
         else:
-            with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-                futures = {pool.submit(_run_phase, i): i for i in wave}
-                results = {}
-                for fut in as_completed(futures):
-                    i = futures[fut]
-                    try:
-                        results[i] = fut.result()
-                    except Exception:                            # noqa: BLE001
-                        results[i] = ("", None)                  # one worker dying
-                                                                 # must not kill the wave
+            # One worker dying must not kill the wave (_gather maps it to an
+            # empty result). Under a cap, a wave stops waiting once the clock is
+            # spent -- but, while nothing at all is in hand, not before one
+            # phase has answered: a slow planner must not leave nothing to
+            # deliver.
+            results = _gather(_run_phase, list(wave), _left(),
+                              need_one=not outputs)
+            if len(results) < len(wave):
+                _over("the rest of the wave")
         # Applied in phase order, not completion order, so the assembled draft
         # reads in the sequence the supervisor planned.
         for i in sorted(results):
@@ -478,7 +550,7 @@ def run(messages, dispatch, profile=None, on_event=None):
     # Workers that ran in parallel could not see each other, so this is where a
     # genuine gap or a contradiction between them gets caught. Skipped when only
     # one phase produced anything: there is no team to reconcile.
-    if len(done) > 1:
+    if len(done) > 1 and not _over("the supervisor"):
         emit("supervise", "checking coverage")
         sup_text, sup_model = dispatch(
             [{"role": "system", "content": _SUPERVISE_SYSTEM},
@@ -496,39 +568,44 @@ def run(messages, dispatch, profile=None, on_event=None):
             if isinstance(g, dict) and str(g.get("task") or "").strip():
                 gaps.append({"title": str(g.get("title") or "Gap").strip()[:80],
                              "task": str(g["task"]).strip()[:1200]})
-        if gaps:
+        if gaps and not _over("the gap repairs"):
             emit("supervise", "%d gap%s to fill" % (len(gaps), "" if len(gaps) == 1 else "s"))
-            with ThreadPoolExecutor(max_workers=len(gaps)) as pool:
-                futures = {pool.submit(
-                    dispatch,
+
+            def _repair(k):
+                g = gaps[k]
+                return dispatch(
                     [{"role": "system", "content": phase_system},
                      {"role": "user", "content": "OVERALL GOAL\n%s\n\nYOUR TASK: %s\n%s"
                       % (goal, g["title"], g["task"])}],
-                    PHASE_MAX_TOKENS): g for g in gaps}
-                for fut in as_completed(futures):
-                    g = futures[fut]
-                    try:
-                        text, used = fut.result()
-                    except Exception:                            # noqa: BLE001
-                        continue
-                    if used:
-                        models_used.append(("repair:%s" % g["title"], used))
-                    if text:
-                        done.append({"title": g["title"], "output": text})
+                    PHASE_MAX_TOKENS)
+            fixed = _gather(_repair, list(range(len(gaps))), _left())
+            if len(fixed) < len(gaps):
+                _over("the rest of the gap repairs")
+            for k in sorted(fixed):
+                text, used = fixed[k]
+                if used:
+                    models_used.append(("repair:%s" % gaps[k]["title"], used))
+                if text:
+                    done.append({"title": gaps[k]["title"], "output": text})
 
     if not done:
         return {"text": "", "plan": plan, "phases": [], "review": None,
-                "models": models_used}
+                "models": models_used, "timed_out": timed_out[0]}
 
     draft = "\n\n".join("## %s\n%s" % (d["title"], d["output"]) for d in done) \
         if len(done) > 1 else done[0]["output"]
 
     # ---- 3. REVIEW (different provider on purpose) ------------------------
-    emit("review", "reviewing")
-    review_text, review_model = dispatch(
-        [{"role": "system", "content": review_system},
-         {"role": "user", "content": "BRIEF\n%s\n\nWORK\n%s" % (brief, draft)}],
-        REVIEW_MAX_TOKENS, exclude_pids=tuple(exec_pids))
+    # Skipped past the wall clock: an unreviewed answer now beats a reviewed
+    # one after the client has given up.
+    if _over("the review"):
+        review_text, review_model = "", None
+    else:
+        emit("review", "reviewing")
+        review_text, review_model = dispatch(
+            [{"role": "system", "content": review_system},
+             {"role": "user", "content": "BRIEF\n%s\n\nWORK\n%s" % (brief, draft)}],
+            REVIEW_MAX_TOKENS, exclude_pids=tuple(exec_pids))
     if review_model:
         models_used.append(("review", review_model))
     review = _parse_json(review_text) or {}
@@ -543,7 +620,7 @@ def run(messages, dispatch, profile=None, on_event=None):
     # capped at ONE pass on purpose: each loop is a full extra model call, and
     # a reviewer that will not say "ship" would otherwise loop forever.
     revised = False
-    if needs_work and max_revisions >= 1:
+    if needs_work and max_revisions >= 1 and not _over("the revision"):
         emit("revise", "fixing %d problem%s" % (len(problems), "" if len(problems) == 1 else "s"))
         rev_text, rev_model = dispatch(
             [{"role": "system", "content": phase_system},
@@ -566,7 +643,7 @@ def run(messages, dispatch, profile=None, on_event=None):
     if len(done) == 1 and not needs_work:
         emit("done", "single phase, review passed")
         return {"text": draft, "plan": plan, "phases": done, "review": review,
-                "models": models_used}
+                "models": models_used, "timed_out": timed_out[0]}
 
     emit("synthesis", "assembling")
     synth_user = "BRIEF\n%s\n\nPHASE OUTPUTS\n%s" % (brief, draft)
@@ -581,7 +658,36 @@ def run(messages, dispatch, profile=None, on_event=None):
         models_used.append(("synthesis", synth_model))
     emit("done", "complete")
     return {"text": final_text or draft, "plan": plan, "phases": done,
-            "review": review, "models": models_used}
+            "review": review, "models": models_used, "timed_out": timed_out[0]}
+
+
+def trailer_summary(result):
+    """The format_answer trailer as ONE header-safe line, for callers that must
+    receive only the deliverable (a CLI writes the answer into a file or its
+    own transcript, where "**Models used**" is noise it then has to delete).
+    Same facts: crew, plan steps, per-stage models, reviewer problem count,
+    and whether the wall clock cut the run short. ASCII only -- HTTP header
+    values are latin-1 and a phase title can be anything -- and bounded."""
+    result = result or {}
+    parts = []
+    if result.get("crew"):
+        parts.append("crew=%s" % result["crew"])
+    phases = result.get("phases") or []
+    if phases:
+        parts.append("plan=" + " | ".join(str(p.get("title") or "") for p in phases))
+    models = result.get("models") or []
+    if models:
+        parts.append("models=" + ", ".join("%s:%s" % (s, m) for s, m in models))
+    review = result.get("review") or {}
+    problems = [p for p in (review.get("problems") or []) if str(p).strip()]
+    if problems:
+        parts.append("reviewer_raised=%d" % len(problems))
+    if result.get("timed_out"):
+        parts.append("timed_out=1")
+    line = "; ".join(parts)
+    line = line.encode("ascii", "replace").decode("ascii")
+    line = re.sub(r"[\r\n\t]+", " ", line)
+    return line[:1500]
 
 
 def format_answer(result):
