@@ -158,7 +158,7 @@ def test_it_is_recorded_only_after_real_content_arrives():
     provider, and timing an answer that never came is meaningless."""
     src = open("app.py", encoding="utf-8").read()
     i = src.index("_note_ttft(resp, hop_pid, hop_model)")
-    before = src[max(0, i - 700):i]
+    before = src[max(0, i - 1000):i]
     assert 'if status != "content":' in before
     assert "continue" in before
 

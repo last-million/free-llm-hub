@@ -48,7 +48,7 @@ or costs a hop, so every detector demands a strong, specific signal:
 """
 import re
 
-__all__ = ["inspect"]
+__all__ = ["inspect", "inspect_tail"]
 
 # Anything longer is judged on its head (script switch) and tail (loops and
 # leaks live at the END of a runaway generation); keeps the check O(cap).
@@ -551,6 +551,29 @@ def _brief_kinds(prompt):
     return kinds, literal
 
 
+_GLUED_NUM_MIN_UNIT = 3          # "121212" / "111" can be real answers
+_GLUED_NUM_MIN_COPIES = 3
+
+
+def _glued_number_period(num):
+    """Unit length when an all-digit `num` is one 3+ digit unit glued to
+    itself 3+ times (a trailing partial copy allowed: the cap cut it), else
+    None. MEASURED LIVE (stream, llm7/GLM-5.3-Flash, "What is 3191 plus 1?
+    Answer with only the number.", max_tokens 40): "319231923192". A number
+    with a shorter period ("111111", "121212") is left alone -- those are
+    plausible real answers, and a false cut here trims one."""
+    if not num.isdigit():
+        return None
+    n = len(num)
+    for short in (1, 2):
+        if n > short and num == (num[:short] * n)[:n]:
+            return None
+    for p in range(_GLUED_NUM_MIN_UNIT, n // _GLUED_NUM_MIN_COPIES + 1):
+        if num == (num[:p] * (n // p + 1))[:n]:
+            return p
+    return None
+
+
 def _constrained_extra(text, prompt, tools_offered):
     if tools_offered or not prompt or len(prompt) > _BRIEF_PROMPT_MAX:
         return None
@@ -571,9 +594,16 @@ def _constrained_extra(text, prompt, tools_offered):
         m = _LEAD_NUM_RE.match(head)
         if m and not _NUM_CONT_RE.match(head, m.end()):
             num = m.group(0).strip()
-            echo = re.search(r"(?<![\d.,])" + re.escape(num) + r"(?![\d.,]*\d)", prompt)
-            if not (echo and re.search(r"\d", head[m.end():])):
-                cut = m.end()
+            p = _glued_number_period(num)
+            if p and num not in prompt:
+                # "319231923192": the answer glued to copies of itself. Every
+                # copy is inside ONE numeric token, so the checks above see a
+                # single long number that "ends where the number ends".
+                cut = m.end() - len(num) + p
+            else:
+                echo = re.search(r"(?<![\d.,])" + re.escape(num) + r"(?![\d.,]*\d)", prompt)
+                if not (echo and re.search(r"\d", head[m.end():])):
+                    cut = m.end()
     if cut is None and "yn" in kinds:
         m = _LEAD_YN_RE.match(head)
         if m:
@@ -677,3 +707,64 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
         return result
     except Exception:                                            # noqa: BLE001
         return {"ok": True, "reasons": [], "salvage": None}
+
+
+# --------------------------------------------------------------------------- #
+# Rolling tail check for a stream still in progress
+# --------------------------------------------------------------------------- #
+TAIL_WINDOW = 300
+
+
+def inspect_tail(text, *, window=TAIL_WINDOW, prompt_text=None, tools_offered=False):
+    """Offset in `text` where junk starts, judged on its last `window` chars
+    only, or None. For a STREAM already released to the client: run on every
+    visible delta, so it must stay O(window), and it never judges the head
+    (inspect() did that once, on the hold-back window).
+
+    Only the tail-shaped failures: a loop running to the current end, a
+    separator run, a script switch, leaked tool/reasoning markup. The brevity
+    trim is not here -- a streamed answer past the hold window already is not
+    short. No finish_reason: the stream has not finished, so every loop needs
+    its natural-stop copy count. Fence state comes from the FULL text, so a
+    window opening inside a code block still has that code masked. Never
+    raises (None)."""
+    try:
+        if not isinstance(text, str) or not text.strip():
+            return None
+        if prompt_text is not None and not isinstance(prompt_text, str):
+            prompt_text = str(prompt_text)
+        start = max(0, len(text) - int(window))
+        if start:
+            # Open the window on a line start: a window beginning mid-"```"
+            # would read the fence as prose and its code as a loop.
+            line = text.rfind("\n", 0, start) + 1
+            if start - line <= window:
+                start = line
+        before = text[:start]
+        pad = "```\n" if before.count("```") % 2 else ""
+        body = pad + text[start:]
+        masked = _mask_code(body)
+        loop_masked = _mask_fences_distinct(body)
+        # A reply ALREADY in a foreign script is not switching now; whole-reply
+        # script judgement was inspect()'s job on the head.
+        script = None
+        if not (start and _ANY_FOREIGN_RE.search(before)):
+            script = _script_switch(body, masked, prompt_text, None, at_start=start == 0)
+        # A stray </think> only counts closing a SHORT head (inspect's rule); a
+        # window's own head is not the reply's, so mid-stream it never counts.
+        lead = _THINK_CLOSE_RE.sub(lambda m: " " * len(m.group(0)), masked) \
+            if start else masked
+        found = [c for c in (
+            script,
+            _line_loop(loop_masked, prompt_text),
+            _tail_loop(loop_masked, prompt_text),
+            _glued_loop(loop_masked, prompt_text, None),
+            _separator_run(masked, None),
+            _markup_leak(masked, prompt_text, tools_offered),
+            _reasoning_leak(lead, prompt_text),
+        ) if c is not None]
+        if not found:
+            return None
+        return max(0, start + min(found) - len(pad))
+    except Exception:                                            # noqa: BLE001
+        return None

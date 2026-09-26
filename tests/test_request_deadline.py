@@ -230,6 +230,11 @@ def test_past_the_deadline_a_trailing_usage_frame_is_not_a_cut():
         == [fin, REASONING, DONE]
 
 
+# Distinct sentences: one sentence x80 is itself a runaway loop, which the
+# stream answer gate (_StreamAnswerGate) now trims before the deadline matters.
+_PROSE = b"".join(b"More text %d here. " % i for i in range(80))
+
+
 def _trickle_lines(first):
     def gen():
         yield first
@@ -245,7 +250,7 @@ def test_a_deadline_cut_responses_stream_ends_incomplete(quiet, monkeypatch):
     _route_to(monkeypatch, "p1", "m1", "hard")
     monkeypatch.setattr(A, "_build_chain", lambda *a, **k: [("p1", "m1")])
     first = (b'data: {"choices":[{"delta":{"content":"The answer is forty-two. '
-             + b'More text here. ' * 80 + b'"}}]}')
+             + _PROSE + b'"}}]}')
     monkeypatch.setattr(A, "_dispatch_chat",
                         lambda pid, payload, stream: _Resp(200, chunks=_trickle_lines(first)()))
     r = A.app.test_client().post("/v1/responses", json={
@@ -262,7 +267,7 @@ def test_a_deadline_cut_messages_stream_ends_max_tokens(quiet, monkeypatch):
     _route_to(monkeypatch, "p1", "m1", "hard")
     monkeypatch.setattr(A, "_build_chain", lambda *a, **k: [("p1", "m1")])
     first = (b'data: {"choices":[{"delta":{"content":"The answer is forty-two. '
-             + b'More text here. ' * 80 + b'"}}]}')
+             + _PROSE + b'"}}]}')
     monkeypatch.setattr(A, "_dispatch_chat",
                         lambda pid, payload, stream: _Resp(200, chunks=_trickle_lines(first)()))
     r = A.app.test_client().post("/v1/messages", json={
@@ -410,8 +415,11 @@ def test_a_committed_stream_that_only_trickles_is_cut_at_the_deadline(quiet, mon
     monkeypatch.setattr(A, "_is_trivial_turn", lambda *a, **k: False)
     _route_to(monkeypatch, "p1", "m1", "hard")
     monkeypatch.setattr(A, "_build_chain", lambda *a, **k: [("p1", "m1")])
+    # Distinct sentences: 30 copies of ONE sentence is itself a runaway loop,
+    # which the stream answer gate (_StreamAnswerGate) now trims.
     first = (b'data: {"choices":[{"delta":{"content":"'
-             + b"The answer is forty-two. " * 30 + b'"}}]}\n\n')
+             + b"".join(b"Point %d of the design holds. " % i for i in range(30))
+             + b'"}}]}\n\n')
 
     def trickle():
         yield first
