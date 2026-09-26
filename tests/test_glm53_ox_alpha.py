@@ -40,12 +40,16 @@ def test_glm_5_3_joins_the_top_band():
     assert app._benchmark_score("tokenrouter", "z-ai/glm-5.3") >= top
 
 
-def test_the_flash_variant_is_the_one_that_was_ox_alpha():
-    """Ox Alpha WAS glm-5.3-flash specifically, so the -flash spelling must not
-    be the one that misses the promotion."""
-    top = app._PREF_FLOORS[5]
-    assert app._benchmark_score("tokenrouter", "z-ai/glm-5.3-flash") >= top
-    assert app._benchmark_score("glm", "glm-5.3-flash") >= top
+def test_the_flash_variant_is_strong_but_below_the_full_model():
+    """Ox Alpha WAS glm-5.3-flash, and it did get the top floor -- until
+    MEASURED 2026-09 auto/best/max all picked llm7/GLM-5.3-Flash over every
+    full frontier model. The fast cut now sits under the full models
+    (_STRONG_SPEED_CAP) but stays a usable agentic fallback."""
+    for pid, mid in (("tokenrouter", "z-ai/glm-5.3-flash"), ("glm", "glm-5.3-flash")):
+        s = app._benchmark_score(pid, mid)
+        assert s < app._benchmark_score("tokenrouter", "z-ai/glm-5.3"), s
+        assert s < app._PREF_FLOORS[7], s
+        assert s >= app._TOOLS_MIN_SCORE, s
 
 
 def test_glm_5_2_is_left_exactly_where_the_user_put_it():

@@ -1293,6 +1293,25 @@ def _strong_new_version_score(low):
     return best
 
 
+def _strong_root_version_excess(low):
+    """How far past its pin the matched strong root's version is (0..9), so a
+    CAPPED speed variant still orders newer-above-older (glm-5.4-flash over
+    glm-5.3-flash) instead of flatlining at the cap. Fail-safe 0."""
+    best = 0.0
+    for root, pin, _pts in _STRONG_ROOTS:
+        idx = low.find(root)
+        if idx < 0:
+            continue
+        m = _VER_AFTER_RE.search(low[idx + len(root):])
+        if not m:
+            continue
+        try:
+            best = max(best, min(float(m.group(1)) - pin, 9.0))
+        except ValueError:
+            pass
+    return best
+
+
 # User-preference floors applied by _benchmark_score: (hy3, kimi-k3, puter
 # gpt-5.6-sol class, puter gpt-5.6-terra/gpt-5.5-pro class, kimi-k2.6/k2.7,
 # claude, gpt-5.5+, glm-5.x, gpt-5.x, deepseek-v4, minimax-m3).
@@ -1756,6 +1775,50 @@ def _start_aa_refresh():
 # longer word ('-minimax', '-ministral', '-miniature').
 _MINI_SUFFIX_RE = re.compile(r"-mini(?![a-z])")
 
+# SPEED-TIER VARIANTS of a family (…-flash, -lite, -mini, -nano, -small, -air,
+# -tiny, -edge, -instant), as a whole name segment -- '-minimax', '-ministral'
+# and 'flashback' do not match. The vendor ships these as the CHEAP/FAST cut of
+# the flagship, so they must not share the flagship's rank.
+#
+# MEASURED 2026-09: auto, best and max all picked llm7/GLM-5.3-Flash. The flash
+# speed cap is skipped for any id the new-version heuristic flags (glm >= 5 ->
+# sv = 100), and the GLM >= 5.3 floor then handed it Claude's 138 -- so the
+# fast cut of GLM outranked every full frontier model the hub could reach.
+_SPEED_VARIANT_RE = re.compile(
+    r"(?:^|[-_/.:])(?:flash|lite|mini|nano|small|air|tiny|edge|instant)(?![a-z])")
+# A strong-root speed variant lands here: under every full strong-root model
+# (qwen3 / deepseek-v3.1+ / glm-5 naturally reach ~108, the preference floors
+# 133+), above the mid field, and still over _TOOLS_MIN_SCORE (90) so it stays
+# a usable agentic fallback. Deliberately NOT the 30-point tiny cap: GLM-5.3-
+# Flash is a genuinely capable model ("Ox Alpha") -- it just is not the best.
+_STRONG_SPEED_CAP = 99.0
+
+
+def _speed_variant_exempt(low):
+    """Families whose speed-named ids the USER ranked on purpose, so the
+    speed-tier demotion must leave them alone: every Claude (2026-07-31 "ALL
+    Claude models in top"), deepseek-v4 (2026-08-03 "v4 flash is better than
+    the pro"), and floored gemini 3.1+ flash (2026-08-01, its own band)."""
+    if _CLAUDE_FAMILY_RE.search(low) or _DSV4_RE.search(low):
+        return True
+    g = _GEMINI_VER_RE.search(low)
+    if g and "flash-lite" not in low:
+        try:
+            return int(g.group(1)) + int(g.group(2) or 0) / 10.0 >= 3.1
+        except ValueError:
+            return False
+    return False
+
+
+def _is_speed_variant(model_id):
+    """True for a speed-tier cut (see _SPEED_VARIANT_RE) outside the user-ranked
+    exemptions. Fail-open: any error answers False (treated as a full model)."""
+    try:
+        low = _canon_model_id((model_id or "").lower())
+        return bool(_SPEED_VARIANT_RE.search(low)) and not _speed_variant_exempt(low)
+    except Exception:
+        return False
+
 _CANON_TWO_DIGIT = re.compile(
     r"\b(glm|qwen|gemma|llama|mistral|hunyuan|ernie|granite|phi|yi)(\d)(\d)(?![\d.])")
 _CANON_MINIMAX = re.compile(r"\bminimax-?m?(\d)(?:\.?(\d))?(?![\d.])")
@@ -1925,7 +1988,7 @@ def _benchmark_score(pid, model_id):
     # be used." Floored level with hy3, i.e. just under the named top three, so
     # a live glm-5.x is reached for ahead of the ordinary field. glm-4.x and the
     # -flash/-air variants are NOT included (the speed cap below still applies).
-    if _GLM5_RE.search(low):
+    if _GLM5_RE.search(low) and not _SPEED_VARIANT_RE.search(low):
         score = max(score, _PREF_FLOORS[7])
     # USER PREFERENCE 2026-08-30: "ox alpha ... it's the best one now" -- and
     # "Ox Alpha" was the stealth name GLM-5.3-Flash shipped under (listed
@@ -1942,8 +2005,13 @@ def _benchmark_score(pid, model_id):
     # across three spellings; tokenrouter/z-ai/glm-5.3-free answered as itself.
     # A floor on a model that cannot serve just puts a dead hop at the head of
     # every chain -- which is the whole reason this was tested before promoted.
+    #
+    # SPEED VARIANTS EXCLUDED (2026-09): the floor went to GLM-5.3-FLASH too,
+    # tying the fast cut with Claude and making it the auto/best/max pick over
+    # every full frontier model. The top band is for full models; -flash/-air/
+    # -lite/-mini land under _STRONG_SPEED_CAP instead (see the cap below).
     _glmv = _GLM_VERSION_RE.search(low)
-    if _glmv:
+    if _glmv and not _SPEED_VARIANT_RE.search(low):
         try:
             _gmaj, _gmin = int(_glmv.group(1)), int(_glmv.group(2) or 0)
             if (_gmaj, _gmin) >= (5, 3):
@@ -2053,8 +2121,15 @@ def _benchmark_score(pid, model_id):
     # 'flash' is ambiguous: weak on gemini-3.1/glm-4.x, but STRONG on
     # deepseek-v4-flash / gemini-3.5-flash. Don't cap a model the version
     # heuristic already flagged as a strong new release (sv > 0).
-    if "flash" in low and not any(ok in low for ok in flash_ok) and not sv:
-        capped = True
+    # ...but "strong family" must not mean "ranks with the flagship": a strong
+    # root's speed cut keeps a (softer) cap, _STRONG_SPEED_CAP, unless the user
+    # ranked that family's flash on purpose (_speed_variant_exempt).
+    strong_speed = False
+    if "flash" in low and not any(ok in low for ok in flash_ok):
+        if not sv:
+            capped = True
+        elif not _speed_variant_exempt(low):
+            strong_speed = True
     if params_b is not None and params_b < 14:
         capped = True
     # USER DIRECTIVE 2026-07-31: "ALL available Claude models should be in top."
@@ -2073,6 +2148,10 @@ def _benchmark_score(pid, model_id):
         capped = False
     if capped:
         score = min(score, 30)
+    elif strong_speed:
+        # +0.1 per version step past the pin (max +0.9): newer stays above
+        # older, and the whole group stays under the full models at ~100+.
+        score = min(score, _STRONG_SPEED_CAP) + _strong_root_version_excess(low) * 0.1
     score -= _shared_budget_penalty(pid, low)
     # RELAY DISCOUNT, applied LAST so it survives the preference floors above
     # (those use max(score, floor), so a bias added earlier would be erased).
@@ -5512,6 +5591,25 @@ def _weighted_pick(pool, sustain_override=None):
     return pool[-1]  # float-rounding fallback
 
 
+def _chat_pick_key(entry):
+    """Ordering key for the plain-chat hard/medium pick: benchmark strength
+    minus the LEARNED reliability and latency penalties -- the same two the
+    agentic path has always folded in via _agentic_score -- then quota
+    headroom as the tie-break.
+
+    Before this the chat pick was max(score, headroom) with no reliability
+    term at all, so a model with a measured string of failures kept the
+    primary slot on name alone and every turn paid a dead hop before the
+    chain reached something that answers. Both penalties are neutral when
+    unknown, so a never-routed model scores exactly as before. Fail-open."""
+    score, pid, model = entry
+    try:
+        score = score - _reliability_penalty(pid, model) - _latency_penalty(pid, model)
+    except Exception:
+        pass
+    return (score, _quota_headroom(pid))
+
+
 def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=False,
                          force_difficulty=None, quality_mode=False):
     """Pick (pid, model) by task difficulty across AVAILABLE providers that can
@@ -5636,7 +5734,10 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     # just asked for an e-commerce site is waiting on the ANSWER, not on the
     # first token. Simple and medium keep the fast preference, where the
     # strength difference is small and latency is what you actually feel.
-    _fast_only = not require_tools and difficulty != "hard"
+    # quality_mode (best/max) skips the fast preference: it asked for the
+    # strongest model, and _is_fast would otherwise hand a forced-medium turn
+    # to whichever fast host is alive, which is exactly the flash tier.
+    _fast_only = not require_tools and difficulty != "hard" and not quality_mode
     pool = ([c for c in cands if _is_fast(c[1], c[2])] or cands) if _fast_only else cands
     if require_tools:
         # CODING/AGENTIC: the primary is ALWAYS a STRONG model (>= _TOOLS_MIN_SCORE) —
@@ -5807,10 +5908,21 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # The user asked repeatedly for the best model every time, so that is the
         # default; the flag restores the spreading behaviour for anyone who would
         # rather stretch their quota further.
+        # MAX-QUALITY prefers the strongest FULL tier: speed-tier cuts
+        # (_is_speed_variant) only lead once no full model is alive. Fail-open.
+        if quality_mode:
+            pool = [c for c in pool if not _is_speed_variant(c[2])] or pool
         if config.get_flag("route_always_best", True):
-            picked = max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
+            picked = max(pool, key=_chat_pick_key)
         else:
-            picked = _spread_pick(pool) or max(pool, key=lambda t: (t[0], _quota_headroom(t[1])))
+            # The spread band already SORTS by _agentic_score (penalties
+            # included), but its rotation still hands every band member a turn
+            # -- a hop with a proven failure record kept serving one turn in N.
+            # Rotate among the ones below _CHAIN_UNRELIABLE only when nothing
+            # healthier is in the pool (fail-open).
+            _healthy = [c for c in pool
+                        if _reliability(c[1], c[2]) >= _CHAIN_UNRELIABLE] or pool
+            picked = _spread_pick(_healthy) or max(pool, key=_chat_pick_key)
         _s, pid, model = picked
         # Remember it for the rest of THIS conversation (see the pin block
         # above). Only real work pins: a conversation that opens with "hi"
