@@ -16499,7 +16499,14 @@ def _autofix_opencode(entry, key, base_root, base_v1, model):
         "models": agentic_chat._opencode_hub_models(),
     }
     data["provider"] = providers
-    data["model"] = "free-llm-hub/" + model
+    # "auto", never the `model` argument. That argument is one concrete free
+    # model ("groq/qwen/..."), which the provider block above does NOT list --
+    # and an openai-compatible provider in opencode will not serve a model it
+    # does not list, so the terminal opencode started on a default it could not
+    # use. MEASURED 2026-09-26: Connect wrote "free-llm-hub/groq/qwen/qwen3.8-27b"
+    # next to a 37-id list without it. "auto" is listed, orchestrated, and what
+    # the isolated /agent copy already defaults to (_seed_opencode_config).
+    data["model"] = "free-llm-hub/auto"
     _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     return {
         "ok": True,

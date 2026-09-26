@@ -187,6 +187,16 @@ def test_the_picker_offers_both_axes_and_every_id_routes():
     assert len(m) <= 64
 
 
+def test_the_terminal_default_model_is_one_the_provider_lists():
+    """opencode's openai-compatible provider only serves ids it lists. Connect
+    used to set the default to one concrete free model that the 37-id list did
+    not contain, so the terminal opencode started on a model it could not use."""
+    src = open("app.py", encoding="utf-8").read()
+    body = src.split("def _autofix_opencode(", 1)[1].split("\ndef ", 1)[0]
+    assert 'data["model"] = "free-llm-hub/auto"' in body
+    assert "auto" in AC._opencode_hub_models()
+
+
 def test_both_writers_cover_the_modes():
     """Two files write an opencode model list. A mode present in one and absent
     from the other is the bug in half of the installs."""
