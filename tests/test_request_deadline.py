@@ -217,6 +217,62 @@ def test_past_the_deadline_the_finish_still_arrives():
         == [CONTENT, fin, DONE]
 
 
+def test_past_the_deadline_a_trailing_usage_frame_is_not_a_cut():
+    """include_usage sends usage as its own frame AFTER the real finish; it
+    must pass, and no fake finish_reason "length" may follow the real one."""
+    past = time.monotonic() - 1
+    fin = b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+    usage = b'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}\n\n'
+    assert list(A._deadline_guard(iter([CONTENT, fin, usage, DONE]), past, b"T")) \
+        == [CONTENT, fin, usage, DONE]
+    # ...and even a keepalive after the finish is never answered with a terminator
+    assert list(A._deadline_guard(iter([fin, REASONING, DONE]), past, b"T")) \
+        == [fin, REASONING, DONE]
+
+
+def _trickle_lines(first):
+    def gen():
+        yield first
+        for _ in range(2000):            # ~100s if nothing cut it
+            time.sleep(0.05)
+            yield REASONING.strip()
+    return gen
+
+
+def test_a_deadline_cut_responses_stream_ends_incomplete(quiet, monkeypatch):
+    monkeypatch.setattr(A, "_request_deadline_seconds", lambda: 0.5)
+    monkeypatch.setattr(A, "_is_trivial_turn", lambda *a, **k: False)
+    _route_to(monkeypatch, "p1", "m1", "hard")
+    monkeypatch.setattr(A, "_build_chain", lambda *a, **k: [("p1", "m1")])
+    first = (b'data: {"choices":[{"delta":{"content":"The answer is forty-two. '
+             + b'More text here. ' * 80 + b'"}}]}')
+    monkeypatch.setattr(A, "_dispatch_chat",
+                        lambda pid, payload, stream: _Resp(200, chunks=_trickle_lines(first)()))
+    r = A.app.test_client().post("/v1/responses", json={
+        "model": "auto", "stream": True, "input": "explain the design"})
+    body = r.get_data()
+    assert b"response.incomplete" in body
+    assert b'"max_output_tokens"' in body
+    assert b"response.completed" not in body
+
+
+def test_a_deadline_cut_messages_stream_ends_max_tokens(quiet, monkeypatch):
+    monkeypatch.setattr(A, "_request_deadline_seconds", lambda: 0.5)
+    monkeypatch.setattr(A, "_is_trivial_turn", lambda *a, **k: False)
+    _route_to(monkeypatch, "p1", "m1", "hard")
+    monkeypatch.setattr(A, "_build_chain", lambda *a, **k: [("p1", "m1")])
+    first = (b'data: {"choices":[{"delta":{"content":"The answer is forty-two. '
+             + b'More text here. ' * 80 + b'"}}]}')
+    monkeypatch.setattr(A, "_dispatch_chat",
+                        lambda pid, payload, stream: _Resp(200, chunks=_trickle_lines(first)()))
+    r = A.app.test_client().post("/v1/messages", json={
+        "model": "claude-sonnet-4", "max_tokens": 64, "stream": True,
+        "messages": [{"role": "user", "content": "explain the design"}]})
+    body = r.get_data()
+    assert b'"stop_reason": "max_tokens"' in body or b'"stop_reason":"max_tokens"' in body
+    assert b"end_turn" not in body
+
+
 def test_past_the_deadline_silence_is_cut(monkeypatch):
     monkeypatch.setattr(A, "_POST_DEADLINE_IDLE", 0.2)
 

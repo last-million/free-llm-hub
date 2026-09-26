@@ -160,6 +160,41 @@ LEGIT = [
 ]
 
 
+STAR_HTML = (
+    "<!doctype html>\n<html>\n<body>\n<div class=\"rating\">\n"
+    + "<span class=\"star\">&#9733;</span>\n" * 4
+    + "</div>\n<section class=\"pricing\">Plans from 9 EUR</section>\n"
+    "<footer>Contact us</footer>\n</body>\n</html>\n")
+
+LEGIT += [
+    ("build a landing page with a 4-star rating", STAR_HTML, "stop"),
+    ("summarise the change",
+     "Summary of changes:\n- `app.py` updated imports\n- `cli.py` updated imports\n"
+     "- `api.py` updated imports\nAll done, tests pass.", "stop"),
+    ("run the tests",
+     "- `test_add` passed OK\n- `test_sub` passed OK\n- `test_mul` passed OK", "stop"),
+    ("show three examples",
+     "```py\nprint(1)\n```\nThis prints the result.\n```py\nprint(2)\n```\n"
+     "This prints the result.\n```py\nprint(3)\n```\nThis prints the result.\n"
+     "Done.", "stop"),
+    ("write a short song",
+     "Verse one goes here\nCome along with me tonight\nCome along with me tonight\n"
+     "Come along with me tonight", "stop"),
+]
+
+
+def test_code_separated_prose_is_not_cut_after_the_first_block():
+    text = LEGIT[-2][1]
+    r = answer_check.inspect(text, prompt_text="show three examples", finish_reason="stop")
+    assert r["ok"] is True and r["salvage"] is None
+
+
+def test_mid_text_runaway_line_loop_is_still_caught():
+    text = "Answer: 7\n" + "I will now repeat myself again.\n" * 9 + "Bye then, all done."
+    r = answer_check.inspect(text, prompt_text="add 3 and 4", finish_reason="stop")
+    assert r["ok"] is False and r["salvage"] == "Answer: 7\nI will now repeat myself again."
+
+
 @pytest.mark.parametrize("prompt,text,fin", LEGIT)
 def test_legit_answers_pass(prompt, text, fin):
     r = answer_check.inspect(text, prompt_text=prompt, finish_reason=fin)

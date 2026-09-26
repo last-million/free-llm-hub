@@ -204,3 +204,45 @@ def test_stale_model_reading_is_not_revived_on_load(fresh_quota):
             os.unlink(path)
         except OSError:
             pass
+
+
+def test_per_model_headers_override_the_static_provider_floor(fresh_quota):
+    """groq's static 1000/day floor counts EVERY model's calls; with fresh
+    per-model headers reporting plenty left, the provider must stay usable."""
+    floor = quota._limit_for("groq").get("limit")
+    assert isinstance(floor, int)
+    quota.record("groq", "m1", n=floor)
+    assert quota.is_exhausted("groq") is True          # no header yet: static floor
+    quota.observe_headers("groq", {"x-ratelimit-remaining-requests": "13000",
+                                   "x-ratelimit-limit-requests": "14400",
+                                   "x-ratelimit-reset-requests": "1h"},
+                          key="k1", model="m1")
+    assert quota.model_status("groq", "m1")["exhausted"] is False
+    assert quota.is_exhausted("groq") is False
+    # A spent model is gated on its own; its unheard siblings keep the provider up.
+    quota.observe_headers("groq", _spent("1h"), key="k1", model="m1")
+    assert quota.model_status("groq", "m1")["exhausted"] is True
+    assert quota.is_exhausted("groq") is False
+
+
+def test_a_malformed_model_reading_does_not_abort_the_load(fresh_quota):
+    fd, path = tempfile.mkstemp(prefix="quota-test-", suffix=".json")
+    os.close(fd)
+    seen_app = []
+    saved_extra = quota._extra_load
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"model_dynamic": {"groq": {"m": {
+                "": {"remaining": 5, "seen": None},
+                "x": {"remaining": 5, "seen": time.time(), "reset_at": "soon"}}}},
+                "app": {"manager_tokens": 42}}, f)
+        quota._extra_load = seen_app.append
+        quota._load_state(path)
+        assert quota._MODEL_DYNAMIC == {}
+        assert seen_app == [{"manager_tokens": 42}]
+    finally:
+        quota._extra_load = saved_extra
+        try:
+            os.unlink(path)
+        except OSError:
+            pass

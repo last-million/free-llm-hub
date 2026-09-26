@@ -17,8 +17,12 @@ end of every stream.
 
 CONSERVATIVE by design. A false positive either trims a real answer (salvage)
 or costs a hop, so every detector demands a strong, specific signal:
-  * code (fenced blocks, inline `spans`) is masked out before any check --
-    repeated lines and odd markup are normal inside code;
+  * code (fenced blocks, inline `spans`) is masked out before the script and
+    markup checks; the loop checks see inline code verbatim and each fenced
+    block as a distinct run-breaker (see _mask_fences_distinct);
+  * a repetition loop must run to the END of the answer (or repeat
+    _MID_MIN_RUN times mid-text): repeated lines inside raw HTML/CSS/CSV or
+    a chorus are content, not a runaway;
   * the script-switch check only fires when the PROMPT never used that script
     and never names its language / asks for a translation, AND the switch is
     either glued straight onto the answer ("OK出具…") or the reply ran to the
@@ -54,6 +58,28 @@ def _mask_code(text):
     if "`" not in text:
         return text
     return _INLINE_CODE_RE.sub(_blank, _FENCE_RE.sub(_blank, text))
+
+
+# Loop checks need a DIFFERENT mask: blanking made "- `app.py` updated" and
+# "- `cli.py` updated" identical, and turned fenced blocks into skipped blank
+# lines, so prose after each of three code blocks read as three copies. Inline
+# code stays verbatim here; each fenced block becomes a same-length run of its
+# OWN private-use char, which breaks a line run and never equals another block.
+_PUA_BASE = 0xE000
+_PUA_SPAN = 0x1800
+_PUA_RE = re.compile("[-]")
+
+
+def _mask_fences_distinct(text):
+    if "`" not in text:
+        return text
+    counter = [0]
+
+    def sub(m):
+        ch = chr(_PUA_BASE + counter[0] % _PUA_SPAN)
+        counter[0] += 1
+        return "\n".join(ch * len(part) for part in m.group(0).split("\n"))
+    return _FENCE_RE.sub(sub, text)
 
 
 # --------------------------------------------------------------------------- #
@@ -122,7 +148,14 @@ def _script_switch(text, masked, prompt_text, finish_reason):
 # (b) repetition loops
 # --------------------------------------------------------------------------- #
 _LINE_MIN_LEN = 12
+# A loop only counts when it runs to the END of the answer (a runaway loops
+# until the cap): 3 copies there if the reply hit the token cap, 5 otherwise
+# (a song may legitimately end on a line sung three times). Mid-text repeats
+# -- four identical `<span class="star">` lines in an HTML page, a chorus --
+# are content, and need _MID_MIN_RUN copies before they count.
 _LINE_MIN_RUN = 3
+_END_MIN_RUN = 5
+_MID_MIN_RUN = 8
 # A looping unit is 8..160 chars: shorter is "ha ha ha" / "0x00, 0x00" land,
 # longer is a paragraph (caught per line by _line_loop).
 _UNIT_MIN = 8
@@ -145,32 +178,52 @@ def _line_is_meaningful(norm):
             and any(c.isalnum() for c in norm))
 
 
-def _line_loop(masked, prompt_text):
-    """Offset just past the first copy of a line repeated >=3x in a row."""
+def _end_min_run(finish_reason):
+    return _LINE_MIN_RUN if finish_reason == "length" else _END_MIN_RUN
+
+
+def _line_loop(masked, prompt_text, finish_reason=None):
+    """Offset just past the first copy of a line repeated in a row: at least
+    _MID_MIN_RUN copies anywhere, or _end_min_run copies running to the end."""
     prev = None
     run = 0
     first_end = 0
     pos = 0
+
+    def hit(norm):
+        if not _line_is_meaningful(norm):
+            return None
+        if prompt_text and (norm + "\n" + norm) in prompt_text:
+            return None
+        return first_end
+
     for line in masked.split("\n"):
         start = pos
         pos += len(line) + 1
         norm = line.strip()
         if not norm:
             continue            # blank lines between copies do not break a run
+        if _PUA_RE.search(norm):
+            prev, run = None, 0     # a fenced code block breaks any run
+            continue
         if norm == prev:
             run += 1
-            if run >= _LINE_MIN_RUN and _line_is_meaningful(norm):
-                if prompt_text and (norm + "\n" + norm) in prompt_text:
-                    return None
-                return first_end
+            if run >= _MID_MIN_RUN:
+                cut = hit(norm)
+                if cut is not None:
+                    return cut
+        elif prev is not None and prev.startswith(norm) and not masked[pos:].strip():
+            pass                # partial last copy of a loop cut by the cap
         else:
             prev = norm
             run = 1
             first_end = start + len(line)
+    if prev is not None and run >= _end_min_run(finish_reason):
+        return hit(prev)
     return None
 
 
-def _tail_loop(masked, prompt_text):
+def _tail_loop(masked, prompt_text, finish_reason=None):
     """Offset just past the FIRST copy of a unit that repeats, back to back and
     at least 3 times, up to the very END of the answer.
 
@@ -199,6 +252,8 @@ def _tail_loop(masked, prompt_text):
         unit = s[start:start + p]
         if not _unit_is_meaningful(unit):
             continue
+        if (n - start) // p < _end_min_run(finish_reason):
+            continue            # 3-4 copies at the end of a finished reply: content
         if prompt_text and unit * 2 in prompt_text:
             continue            # the user asked for this repetition
         return start + p
@@ -248,12 +303,13 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None):
         offset = max(0, len(text) - _MAX_SCAN)
         body = _clip(text)
         masked = _mask_code(body)
+        loop_masked = _mask_fences_distinct(body)
         cuts = []
         checks = (
             ("runaway_script", lambda: _script_switch(body, masked, prompt_text,
                                                       finish_reason)),
-            ("repetition", lambda: _line_loop(masked, prompt_text)),
-            ("repetition", lambda: _tail_loop(masked, prompt_text)),
+            ("repetition", lambda: _line_loop(loop_masked, prompt_text, finish_reason)),
+            ("repetition", lambda: _tail_loop(loop_masked, prompt_text, finish_reason)),
             ("tool_markup", lambda: _markup_leak(masked, prompt_text, tools_offered)),
         )
         for reason, fn in checks:

@@ -3910,6 +3910,10 @@ def _canary_state_load(rows):
 _MANAGER_LOCK = threading.Lock()
 _MANAGER_TOKENS = {"day": "", "spent": 0, "calls": 0, "by_purpose": {}}
 _MANAGER_CALL = threading.local()         # .tokens: this thread's spend (see _manager_charge)
+# Tokens held by manager calls still RUNNING (not persisted: a restart has none
+# in flight). _manager_dispatch reserves before the run and releases after it
+# is charged, so concurrent verify/fix calls cannot all pass one stale check.
+_MANAGER_RESERVED = [0]
 
 
 def _manager_today():
@@ -4955,6 +4959,10 @@ def _sub_run(pid, prompt, model=None):
     The prompt always travels on STDIN, never in argv: a Windows command line
     caps around 8k chars, and this can carry a whole conversation.
     cwd is a temp dir so neither CLI picks up THIS repo as project context."""
+    # Reset FIRST: an early return below must not leave the previous run's
+    # token count on this thread for _manager_dispatch to charge again.
+    _SUB_USAGE.total = None
+    _SUB_USAGE.ran = False        # True once the CLI actually ran (or timed out)
     cfg = _SUB_PROVIDERS.get(pid)
     if not cfg:
         return 403, "", "Unknown subscription provider '%s'." % pid
@@ -5013,9 +5021,11 @@ def _sub_run(pid, prompt, model=None):
                                   cwd=tempfile.gettempdir(),
                                   creationflags=_CREATE_NO_WINDOW)
         except subprocess.TimeoutExpired:
+            _SUB_USAGE.ran = True
             return 504, "", "%s timed out after %ds." % (bin_name, _SUB_TIMEOUT)
         except (OSError, ValueError) as exc:
             return 502, "", "%s failed to start: %s" % (bin_name, exc.__class__.__name__)
+        _SUB_USAGE.ran = True
         text = (proc.stdout or "").strip()
         # stderr only: stdout carries the model's own words, and a reply that
         # happens to say "tokens used: 5" must not become the accounting.
@@ -5253,30 +5263,57 @@ def _manager_dispatch(messages, max_tokens=None, purpose="other"):
             return "", None
         budget = _manager_budget()
         est_prompt = max(1, len(prompt) // 4)
-        if budget and _manager_spent_today() + est_prompt > budget:
-            _log.info("[manager] %s skipped: daily budget %d reached", purpose, budget)
-            return "", None
-        status, text, detail = _sub_run(pid, prompt, model=model)
-        reported = getattr(_SUB_USAGE, "total", None)
-        quota.record(pid, cfg["model"])
-        if status in _DEAD_STATUSES:
-            _mark_model_dead(pid, cfg["model"], status)
-        if status != 200 or not text:
-            if reported:
-                _manager_charge(reported, purpose)
-                _MANAGER_LAST.tokens = int(reported)
-            _log.info("[manager] %s via %s/%s failed: %s", purpose, pid, model,
-                      _sanitize(str(detail or status), 200))
-            return "", None
-        if max_tokens and int(max_tokens) > 0 and len(text) > int(max_tokens) * 4:
-            text = text[:int(max_tokens) * 4]
-        used = reported or (est_prompt + max(1, len(text) // 4))
-        _manager_charge(used, purpose)
-        _MANAGER_LAST.tokens = int(used)
-        return text, "%s/%s" % (pid, model)
+        cap_out = int(max_tokens) if max_tokens and int(max_tokens) > 0 else 0
+        reserve = est_prompt + cap_out
+        today = _manager_today()
+        with _MANAGER_LOCK:
+            spent = (int(_MANAGER_TOKENS.get("spent") or 0)
+                     if _MANAGER_TOKENS.get("day") == today else 0)
+            if budget and spent + _MANAGER_RESERVED[0] + reserve > budget:
+                _log.info("[manager] %s skipped: daily budget %d reached "
+                          "(spent %d, in flight %d)", purpose, budget, spent,
+                          _MANAGER_RESERVED[0])
+                return "", None
+            _MANAGER_RESERVED[0] += reserve
+        try:
+            return _manager_run(pid, model, cfg, prompt, est_prompt, cap_out, purpose)
+        finally:
+            with _MANAGER_LOCK:
+                _MANAGER_RESERVED[0] = max(0, _MANAGER_RESERVED[0] - reserve)
     except Exception as exc:                                     # noqa: BLE001
         _log.debug("manager dispatch skipped: %s", exc)
         return "", None
+
+
+def _manager_run(pid, model, cfg, prompt, est_prompt, cap_out, purpose):
+    """The paid half of _manager_dispatch, run while its reservation is held."""
+    _SUB_USAGE.total = None
+    _SUB_USAGE.ran = False
+    status, text, detail = _sub_run(pid, prompt, model=model)
+    reported = getattr(_SUB_USAGE, "total", None)
+    ran = bool(getattr(_SUB_USAGE, "ran", False))
+    quota.record(pid, cfg["model"])
+    if status in _DEAD_STATUSES:
+        _mark_model_dead(pid, cfg["model"], status)
+    if status != 200 or not text:
+        # A CLI that ran and failed (or timed out) still spent subscription
+        # tokens; with no reported total, charge the prompt -- plus the output
+        # cap for a timeout, which was generating until it was killed.
+        charge = reported
+        if not charge and ran:
+            charge = est_prompt + (cap_out if status == 504 else 0)
+        if charge:
+            _manager_charge(charge, purpose)
+            _MANAGER_LAST.tokens = int(charge)
+        _log.info("[manager] %s via %s/%s failed: %s", purpose, pid, model,
+                  _sanitize(str(detail or status), 200))
+        return "", None
+    if cap_out and len(text) > cap_out * 4:
+        text = text[:cap_out * 4]
+    used = reported or (est_prompt + max(1, len(text) // 4))
+    _manager_charge(used, purpose)
+    _MANAGER_LAST.tokens = int(used)
+    return text, "%s/%s" % (pid, model)
 
 
 def _swarm_manager(messages, max_tokens, purpose):
@@ -18805,7 +18842,14 @@ def _stream_item_delivers(b):
     past its deadline consists of."""
     return bool(_STREAM_CONTENT_RE.search(b) or _STREAM_TOOLCALL_RE.search(b)
                 or _STREAM_TERMINAL_RE.search(b)
-                or re.search(rb'"finish_reason"\s*:\s*"', b))
+                or _STREAM_FINISH_RE.search(b)
+                or _STREAM_USAGE_RE.search(b))
+
+
+_STREAM_FINISH_RE = re.compile(rb'"finish_reason"\s*:\s*"')
+# stream_options.include_usage sends usage as its own `choices: []` frame
+# AFTER the finish_reason one; it is part of a completed answer, not a stall.
+_STREAM_USAGE_RE = re.compile(rb'"usage"\s*:\s*\{')
 
 
 def _deadline_guard(iterator, deadline_at, terminator=None, label=""):
@@ -18853,6 +18897,7 @@ def _deadline_guard(iterator, deadline_at, terminator=None, label=""):
     _started = time.monotonic()
     last_delivery = None       # set when the deadline is first crossed
     cut = None
+    finished = False           # a finish_reason frame has already passed
     try:
         while True:
             now = time.monotonic()
@@ -18875,8 +18920,8 @@ def _deadline_guard(iterator, deadline_at, terminator=None, label=""):
             if kind == "exc":
                 raise val
             now = time.monotonic()
-            if now >= deadline_at:
-                b = _stream_item_bytes(val)
+            b = _stream_item_bytes(val)
+            if now >= deadline_at and not finished:
                 if b.strip():
                     if not _stream_item_delivers(b):
                         cut = "keepalive/reasoning only past the deadline"
@@ -18885,10 +18930,17 @@ def _deadline_guard(iterator, deadline_at, terminator=None, label=""):
                 if now >= hard_stop:
                     cut = "hard ceiling past the deadline"
                     break
+            elif now >= deadline_at and b.strip():
+                last_delivery = now
+            if not finished and _STREAM_FINISH_RE.search(b):
+                # The answer is complete: whatever trails it (a usage frame,
+                # [DONE]) passes untouched, and a cut never appends a second,
+                # fake finish_reason after the real one.
+                finished = True
             yield val
         _log.warning("[deadline] %s: cutting the committed stream (%s)",
                      label or "stream", cut)
-        if terminator:
+        if terminator and not finished:
             yield terminator
     finally:
         stop.set()
@@ -18901,6 +18953,16 @@ _CHAT_DEADLINE_TERMINATOR = (
     b'data: {"id":"chatcmpl-deadline","object":"chat.completion.chunk",'
     b'"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n'
     b"data: [DONE]\n\n")
+
+# /v1/responses and /v1/messages translate the upstream chat stream LINE by
+# line (resp.iter_lines), so their cut sentinel is one chat line. Its id tells
+# _responses_stream to report the turn "incomplete"; _anthropic_stream maps its
+# finish_reason "length" to stop_reason "max_tokens". Without it the iterator
+# just ended and both reported a cut turn (even a half-built tool call) as done.
+_DEADLINE_CUT_ID = "chatcmpl-deadline"
+_DEADLINE_CUT_LINE = (
+    b'data: {"id":"chatcmpl-deadline","object":"chat.completion.chunk",'
+    b'"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}')
 
 
 # How much of a streaming answer to collect before judging it. Small on
@@ -22593,6 +22655,7 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
     tools = {}               # oai tool index -> {out_index,item_id,call_id,name,args[]}
     usage = None
     stream_fin = None        # last finish_reason seen, for the end-of-stream judgement
+    cut_short = [False]      # the request deadline cut this stream (_DEADLINE_CUT_LINE)
     if line_iter is None:
         line_iter = resp.iter_lines(decode_unicode=False)
 
@@ -22636,7 +22699,8 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                 "arguments": full_args})
             item = {"type": "function_call", "id": st["item_id"],
                     "call_id": st["call_id"], "name": st["name"],
-                    "arguments": full_args, "status": "completed"}
+                    "arguments": full_args,
+                    "status": "incomplete" if cut_short[0] else "completed"}
             yield _sse_event("response.output_item.done", {
                 "type": "response.output_item.done",
                 "output_index": st["out_index"], "item": item})
@@ -22682,6 +22746,8 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                 continue
             if (choices[0] or {}).get("finish_reason"):
                 stream_fin = choices[0]["finish_reason"]
+                if chunk.get("id") == _DEADLINE_CUT_ID:
+                    cut_short[0] = True
             delta = (choices[0] or {}).get("delta") or {}
 
             # Reasoning-phase keepalive: a thinking model sends reasoning deltas for
@@ -22770,9 +22836,15 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
             ct = int(usage.get("completion_tokens") or 0)
             final_usage = {"input_tokens": pt, "output_tokens": ct, "total_tokens": pt + ct}
         final_output = [it for _i, it in sorted(done_items, key=lambda t: t[0])]
-        yield _sse_event("response.completed", {
-            "type": "response.completed",
-            "response": _obj("completed", final_output, final_usage)})
+        if cut_short[0]:
+            final = _obj("incomplete", final_output, final_usage)
+            final["incomplete_details"] = {"reason": "max_output_tokens"}
+            yield _sse_event("response.incomplete", {
+                "type": "response.incomplete", "response": final})
+        else:
+            yield _sse_event("response.completed", {
+                "type": "response.completed",
+                "response": _obj("completed", final_output, final_usage)})
     except Exception as exc:  # never leave Codex hanging on a mid-stream failure
         _log.error("Responses stream error: %s", _sanitize(str(exc)))
         try:
@@ -23038,7 +23110,7 @@ def v1_responses(_retry_pass=False):
                     continue
                 _note_ttft(resp, hop_pid, hop_model)
                 chained = _clock.guard(_chain_buffered(buffered, line_it),
-                                       None, "%s/%s" % (hop_pid, hop_model))
+                                       _DEADLINE_CUT_LINE, "%s/%s" % (hop_pid, hop_model))
                 return Response(stream_with_context(
                     _responses_stream(resp, model_label, line_iter=chained, prompt_est=est,
                                       hop_pid=hop_pid, hop_model=hop_model,
@@ -23767,7 +23839,7 @@ def v1_messages():
                     continue
                 _note_ttft(resp, hop_pid, hop_model)
                 chained = _clock.guard(_chain_buffered(buffered, line_it),
-                                       None, "%s/%s" % (hop_pid, hop_model))
+                                       _DEADLINE_CUT_LINE, "%s/%s" % (hop_pid, hop_model))
                 return Response(stream_with_context(
                     _anthropic_stream(resp, model_str, input_est, line_iter=chained,
                                      hop_pid=hop_pid, hop_model=hop_model,

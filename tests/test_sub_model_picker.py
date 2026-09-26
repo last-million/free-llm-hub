@@ -264,3 +264,62 @@ def test_api_post_rejects_bad_values_without_writing(cfg, payload):
     assert r.status_code == 400
     assert app._manager_model() == ""
     assert app._sub_selected_model("sub-claude") == "opus"
+
+
+def test_manager_does_not_charge_a_previous_runs_tokens(cfg, monkeypatch):
+    """An early return inside _sub_run (here: not signed in) must not leave
+    the last run's total on the thread for the manager to charge again."""
+    config.set_value("manager_model", "sub-claude/sonnet")
+    monkeypatch.setattr(app, "_sub_master_on", lambda: True)
+    monkeypatch.setattr(app, "_is_model_dead", lambda p, m: False)
+    monkeypatch.setattr(app, "_mark_model_dead", lambda *a, **k: None)
+    monkeypatch.setattr(app.quota, "record", lambda *a, **k: None)
+    monkeypatch.setattr(app, "_sub_state", lambda pid: (True, True, False, "not signed in"))
+    app._SUB_USAGE.total = 12345
+    assert app._manager_dispatch(MSGS, None, "verify") == ("", None)
+    assert app._manager_status()["spent_today"] == 0
+
+
+def test_manager_charges_a_cli_that_ran_and_timed_out(cfg, monkeypatch):
+    config.set_value("manager_model", "sub-claude/sonnet")
+    monkeypatch.setattr(app, "_sub_master_on", lambda: True)
+    monkeypatch.setattr(app, "_is_model_dead", lambda p, m: False)
+    monkeypatch.setattr(app.quota, "record", lambda *a, **k: None)
+
+    def timed_out(pid, prompt, model=None):
+        app._SUB_USAGE.total = None
+        app._SUB_USAGE.ran = True
+        return 504, "", "timed out"
+    monkeypatch.setattr(app, "_sub_run", timed_out)
+    assert app._manager_dispatch(MSGS, 500, "fix") == ("", None)
+    assert app._manager_status()["spent_today"] >= 500 + 100
+
+
+def test_concurrent_manager_calls_cannot_overrun_the_budget(cfg, monkeypatch):
+    import threading
+    import time as _t
+    config.set_value("manager_model", "sub-claude/sonnet")
+    config.set_setting("manager_daily_token_budget", 1000)
+    monkeypatch.setattr(app, "_sub_master_on", lambda: True)
+    monkeypatch.setattr(app, "_is_model_dead", lambda p, m: False)
+    monkeypatch.setattr(app.quota, "record", lambda *a, **k: None)
+
+    def slow(pid, prompt, model=None):
+        _t.sleep(0.3)
+        app._SUB_USAGE.total = 400
+        app._SUB_USAGE.ran = True
+        return 200, "ok", None
+    monkeypatch.setattr(app, "_sub_run", slow)
+    answered = []
+    threads = [threading.Thread(
+        target=lambda: answered.append(app._manager_dispatch(MSGS, 300, "verify")[1]))
+        for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    ok = [w for w in answered if w]
+    # each reserves ~100 prompt + 300 output: at most 2 fit in 1000 at once
+    assert 1 <= len(ok) <= 2
+    assert app._manager_status()["spent_today"] <= 1000
+    assert app._MANAGER_RESERVED[0] == 0

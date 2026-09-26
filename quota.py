@@ -747,11 +747,21 @@ def observe_headers(pid: str, headers, key=None, model=None) -> None:
 
 def _fresh(d, now):
     """A reading still worth believing, or None."""
-    if not d:
+    if not d or not isinstance(d, dict):
         return None
-    if now - d.get("seen", 0) > _DYNAMIC_TTL:
+    # A hand-edited / corrupt state file can carry {"seen": null} or a string
+    # reset_at; that must read as "not fresh", never raise -- _load_state calls
+    # this before it loads the app blob (manager spend, parked providers).
+    seen = d.get("seen", 0)
+    reset_at = d.get("reset_at")
+    if isinstance(seen, bool) or not isinstance(seen, (int, float)):
         return None
-    if d.get("reset_at") and d["reset_at"] <= now:     # its window already reset
+    if reset_at is not None and (isinstance(reset_at, bool)
+                                 or not isinstance(reset_at, (int, float))):
+        return None
+    if now - seen > _DYNAMIC_TTL:
+        return None
+    if reset_at and reset_at <= now:                   # its window already reset
         return None
     return d
 
@@ -1062,6 +1072,19 @@ def status(pid: str) -> dict:
         quota_exhausted = remaining <= 0
         if dyn.get("reset_at"):
             reset = dyn["reset_at"]
+    elif pid in PER_MODEL_HEADER_PROVIDERS:
+        # groq/cerebras headers are stored per MODEL (observe_headers), so
+        # _DYNAMIC stays empty and the static provider-wide count above --
+        # every model's calls summed -- would exhaust the WHOLE provider at its
+        # floor while each model's own headers still report plenty left. When
+        # any model has a fresh reading, the headers are the authority: a
+        # spent model is gated by model_status, and a sibling never heard from
+        # is assumed to have its own budget (fail open), so the provider as a
+        # whole is not exhausted by quota.
+        with _LOCK:
+            models = list((_MODEL_DYNAMIC.get(pid) or {}).keys())
+        if any(_model_dynamic(pid, m, now) for m in models):
+            quota_exhausted = False
     exhausted = throttled or quota_exhausted
     # Countdown = when the provider becomes usable AGAIN:
     #   - budget genuinely spent -> wait for the window reset (or a later throttle);
@@ -1226,6 +1249,19 @@ def _load_state(path: str) -> None:
     if not isinstance(blob, dict):
         return
     now = time.time()
+    try:
+        _load_sections(blob, now)
+    except Exception:                                   # noqa: BLE001
+        pass  # one bad section must never stop the app blob below from loading
+    app_blob = blob.get("app")
+    if _extra_load is not None and isinstance(app_blob, dict):
+        try:
+            _extra_load(app_blob)
+        except Exception:
+            pass
+
+
+def _load_sections(blob, now):
     with _LOCK:
         state = blob.get("state")
         if isinstance(state, dict):
@@ -1283,9 +1319,3 @@ def _load_state(path: str) -> None:
             # readings are dropped, not trusted after a restart.
             for slot in [k for k, v in list(_DYNAMIC.items()) if _fresh(v, now) is None]:
                 _DYNAMIC.pop(slot, None)
-    app_blob = blob.get("app")
-    if _extra_load is not None and isinstance(app_blob, dict):
-        try:
-            _extra_load(app_blob)
-        except Exception:
-            pass
