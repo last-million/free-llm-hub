@@ -100,7 +100,8 @@ import memory
 # this file.
 hub_mcp.init(
     lambda messages, crew_name: crews.format_answer(
-        crews.run(messages, _pipeline_bound(_swarm_dispatch), crew_name)),
+        crews.run(messages, _pipeline_bound(_swarm_dispatch), crew_name,
+                  **_swarm_manager_kwargs())),
     swarm={
         # The MCP surface is how a CLI drives the orchestrator -- opencode,
         # codex, claude and the rest all speak it, so one wiring reaches every
@@ -5135,6 +5136,10 @@ def _subscription_chat(pid, payload):
 # else chars/4 like the rest of the hub) and persisted with the quota state.
 # --------------------------------------------------------------------------- #
 _MANAGER_DEFAULT_BUDGET = 200000
+# Tokens the LAST _manager_dispatch on this thread charged (0 = none). The swarm
+# totals a run's manager spend from it; a thread-local because pipeline stages
+# call the manager concurrently from worker threads.
+_MANAGER_LAST = threading.local()
 
 
 def _manager_parse(value):
@@ -5227,6 +5232,7 @@ def _manager_dispatch(messages, max_tokens=None, purpose="other"):
     a call that would certainly overrun is refused instead of being paid for.
     `max_tokens` has no CLI flag; it caps the returned text (chars/4) so a
     manager answer cannot balloon the caller's next prompt."""
+    _MANAGER_LAST.tokens = 0
     try:
         if not _manager_enabled():
             return "", None
@@ -5250,6 +5256,7 @@ def _manager_dispatch(messages, max_tokens=None, purpose="other"):
         if status != 200 or not text:
             if reported:
                 _manager_charge(reported, purpose)
+                _MANAGER_LAST.tokens = int(reported)
             _log.info("[manager] %s via %s/%s failed: %s", purpose, pid, model,
                       _sanitize(str(detail or status), 200))
             return "", None
@@ -5257,10 +5264,38 @@ def _manager_dispatch(messages, max_tokens=None, purpose="other"):
             text = text[:int(max_tokens) * 4]
         used = reported or (est_prompt + max(1, len(text) // 4))
         _manager_charge(used, purpose)
+        _MANAGER_LAST.tokens = int(used)
         return text, "%s/%s" % (pid, model)
     except Exception as exc:                                     # noqa: BLE001
         _log.debug("manager dispatch skipped: %s", exc)
         return "", None
+
+
+def _swarm_manager(messages, max_tokens, purpose):
+    """swarm.run's `manager` contract over _manager_dispatch: (text, who,
+    tokens charged). The purpose is namespaced ("swarm:plan", "swarm:verify"
+    ...) so the dashboard's by-purpose spend shows what the pipeline paid for.
+    Never raises; ("", None, 0) sends that stage back to the free models."""
+    try:
+        text, who = _manager_dispatch(messages, max_tokens,
+                                      purpose="swarm:%s" % (purpose or "other"))
+        return text, who, int(getattr(_MANAGER_LAST, "tokens", 0) or 0)
+    except Exception:                                            # noqa: BLE001
+        return "", None, 0
+
+
+def _swarm_manager_kwargs():
+    """{"manager": ...} for swarm.run/crews.run when a manager is configured
+    and allowed to run, else {} -- so without one the pipelines are called
+    exactly as before (and test doubles that predate the kwarg still fit).
+    Bound like the dispatch so a manager call on a worker thread still sees
+    the request's context."""
+    try:
+        if _manager_enabled():
+            return {"manager": _pipeline_bound(_swarm_manager)}
+    except Exception:                                            # noqa: BLE001
+        pass
+    return {}
 
 
 # --------------------------------------------------------------------------- #
@@ -9282,6 +9317,12 @@ def _act_pipeline_result(result):
                 act["review_problems"] = problems
             if result.get("timed_out"):
                 act["pipeline_timed_out"] = True
+            # What the subscription manager cost this run (it is the only
+            # paid part of the pipeline), and a review it could not read.
+            if result.get("manager_tokens"):
+                act["manager_tokens"] = int(result["manager_tokens"])
+            if result.get("review_warning"):
+                act["review_warning"] = str(result["review_warning"])[:160]
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -20598,6 +20639,9 @@ def _swarm_completion(body):
     dispatch = _pipeline_bound(_swarm_dispatch)
     cap = _swarm_max_seconds()
     extra = {"max_seconds": cap} if cap else {}
+    # A configured subscription manager plans/checks/fixes; free models still
+    # do the work. Absent -> no kwarg, the pipeline exactly as before.
+    extra.update(_swarm_manager_kwargs())
     if crew is not None:
         result = crews.run(messages, dispatch, crew, on_event=_watch, **extra)
     else:

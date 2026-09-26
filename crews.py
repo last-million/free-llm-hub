@@ -404,7 +404,8 @@ def looks_like_full_project(text):
     return parts >= 2
 
 
-def run(messages, dispatch, crew_name, on_event=None, max_seconds=None):
+def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
+        manager=None):
     """Run the swarm pipeline under a crew persona. Same dispatch contract and
     result-dict shape as swarm.run(); the result gains a "crew" key naming the
     persona actually used ("" = generic pipeline).
@@ -418,7 +419,10 @@ def run(messages, dispatch, crew_name, on_event=None, max_seconds=None):
     row). Optional, and swarm.run already swallows anything it raises.
 
     `max_seconds` is swarm.run's overall wall clock. Forwarded only when set,
-    so a caller (or a test double of swarm.run) that predates it is untouched."""
+    so a caller (or a test double of swarm.run) that predates it is untouched.
+
+    `manager` is swarm.run's optional plan/check/fix model (see its docstring);
+    forwarded only when given, for the same reason."""
     name = (crew_name or "").strip().lower()
     if name.startswith("crew-"):
         name = name[5:]
@@ -426,6 +430,8 @@ def run(messages, dispatch, crew_name, on_event=None, max_seconds=None):
         name = detect_crew(messages)
     profile = CREWS.get(name)          # unknown/undetected -> None -> generic
     extra = {"max_seconds": max_seconds} if max_seconds else {}
+    if manager is not None:
+        extra["manager"] = manager
     result = swarm.run(messages, dispatch, profile=profile, on_event=on_event,
                        **extra)
     result["crew"] = name if profile else ""

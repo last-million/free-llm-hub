@@ -63,8 +63,16 @@ plain "swarm" model and its tests are untouched by construction.
 """
 import json
 import re
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+try:
+    # A leaf module (no app imports), so the no-app-imports rule for this file
+    # holds. Optional: without it the per-phase check just skips that test.
+    import answer_check
+except ImportError:                                             # pragma: no cover
+    answer_check = None
 
 MAX_PHASES = 5           # bounds worst-case cost: 1 plan + 5 phases + 1 review + 1 synth
 # The planner is asked for 2..MAX_PHASES. A plan with ONE phase means it did not
@@ -91,6 +99,21 @@ SYNTH_MAX_TOKENS = 6000
 # worker an unbounded teammate output would put the ceiling straight back.
 DEP_CONTEXT_CHARS = 6000
 
+# ---- The optional MANAGER (a paid subscription model, see run(manager=)) ----
+# The manager plans, checks and fixes; the free models do the work. Every cap
+# below exists to keep its bill small: it is only ever shown CLIPPED summaries
+# (never a full transcript) and asked for short answers. The one place it may
+# write at length is fixing a phase two free models could not get right.
+MANAGER_PLAN_TOKENS = 1500
+MANAGER_SUPERVISE_TOKENS = 600
+MANAGER_REVIEW_TOKENS = 800
+MANAGER_VERDICT_TOKENS = 300
+MANAGER_FIX_TOKENS = PHASE_MAX_TOKENS
+MANAGER_BRIEF_CHARS = 6000       # the user's brief as the manager sees it
+MANAGER_PHASE_CHARS = 1500       # per phase, in the supervise/review summaries
+MANAGER_DRAFT_CHARS = 8000       # whole draft, in the review summary
+VERDICT_OUTPUT_CHARS = 3000      # one worker's output, in a per-phase verdict
+
 
 def _clip(text, limit):
     """Head + tail, so a truncated dependency keeps how it starts AND how it
@@ -108,8 +131,17 @@ _PLAN_SYSTEM = (
     "Reply with JSON ONLY — no prose, no markdown fence:\n"
     '{"goal": "<one sentence>", "phases": [{"title": "<short>", "task": "<what to '
     'produce, concretely>", "done_when": "<observable completion test>", '
-    '"needs": [<numbers of the phases this one needs the OUTPUT of>]}]}\n'
+    '"needs": [<numbers of the phases this one needs the OUTPUT of>], '
+    '"inputs": "<facts/material from the brief this worker must use>", '
+    '"constraints": ["<hard rule the output must respect>"], '
+    '"output_format": "<exact shape: e.g. HTML file, JSON object, markdown list>", '
+    '"acceptance": ["<checkable criterion, e.g. includes \\"Pricing\\" section>"]}]}\n'
     "Rules:\n"
+    "- Each worker sees ONLY its own phase, never the user's message. Put "
+    "everything it needs in task/inputs/constraints — names, numbers, tone, "
+    "audience, language — so the brief is complete on its own.\n"
+    "- 'acceptance' is how the work is checked: 1-4 short criteria anyone can "
+    "verify by reading the output. Quote exact text that must appear.\n"
     "- Between 2 and %d phases. Fewer is better; do not invent work.\n"
     "- Each phase must produce a CONCRETE artefact (copy, code, a structure, a "
     "list) — never 'research', 'consider' or 'think about'.\n"
@@ -172,6 +204,28 @@ _SYNTH_SYSTEM = (
     "Keep every concrete detail the phases produced; preserve [NEEDS INPUT: ...] "
     "markers verbatim so the user can see what still needs their input.\n"
     "Cut anything that reads as generic AI filler."
+)
+
+# Per-phase verdict, asked of the MANAGER only (never a free model: a free
+# checker is as likely wrong as the worker it judges, and the cheap mechanical
+# checks run first anyway). Deliberately tiny in and out.
+_VERDICT_SYSTEM = (
+    "You check ONE team member's output against its task and acceptance "
+    "criteria. You see a clipped excerpt; do not fault what may sit in the "
+    "trimmed middle.\n"
+    "Reply with JSON ONLY:\n"
+    '{"ok": true | false, "problems": ["<concrete, fixable>"]}\n'
+    "Fail it only for a missed criterion, a wrong or invented fact, missing "
+    "required content, or the wrong format. Style is not a problem. At most 4 "
+    "problems."
+)
+
+# The manager writing a phase itself, after two free attempts failed.
+_FIX_SYSTEM = (
+    "Two team members failed this phase. Write the phase's output yourself, "
+    "complete and correct, meeting every acceptance criterion and fixing every "
+    "listed problem. Output only the artefact — no preamble, no notes. Never "
+    "invent facts; mark missing real-world data as [NEEDS INPUT: what]."
 )
 
 
@@ -280,13 +334,118 @@ def _clean_phases(plan):
                 # reference to work that does not exist yet.
                 if 1 <= n < idx and n not in needs:
                     needs.append(n)
-        out.append({
+        cleaned = {
             "title": str(p.get("title") or "Phase %d" % idx).strip()[:80],
             "task": task[:2000],
             "done_when": str(p.get("done_when") or "").strip()[:300],
             "needs": needs,
-        })
+        }
+        cleaned.update(_brief_fields(p))
+        out.append(cleaned)
     return out
+
+
+def _str_list(value, n, width):
+    """A list of short non-empty strings from a list OR a single string (a
+    planner asked for a list often writes one sentence instead)."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    out = []
+    for v in value:
+        s = str(v or "").strip() if not isinstance(v, (dict, list)) else ""
+        if s:
+            out.append(s[:width])
+    return out[:n]
+
+
+def _brief_fields(p):
+    """The optional worker-brief fields (inputs, constraints, output_format,
+    acceptance). Only keys that carry something are returned, so a plan
+    without them yields exactly the phase dicts it always did."""
+    out = {}
+    inputs = str(p.get("inputs") or "").strip() if isinstance(
+        p.get("inputs"), (str, int, float)) else ""
+    if inputs:
+        out["inputs"] = inputs[:1200]
+    fmt = str(p.get("output_format") or "").strip() if isinstance(
+        p.get("output_format"), str) else ""
+    if fmt:
+        out["output_format"] = fmt[:300]
+    for key in ("constraints", "acceptance"):
+        items = _str_list(p.get(key), 6, 240)
+        if items:
+            out[key] = items
+    return out
+
+
+def _render_brief(ph):
+    """The optional brief fields, rendered for the worker. "" when the phase
+    has none, so the worker prompt is byte-identical to the plain pipeline's."""
+    parts = []
+    if ph.get("inputs"):
+        parts.append("\n\nInputs to use:\n%s" % ph["inputs"])
+    if ph.get("constraints"):
+        parts.append("\n\nConstraints:\n- " + "\n- ".join(ph["constraints"]))
+    if ph.get("output_format"):
+        parts.append("\n\nOutput format: %s" % ph["output_format"])
+    if ph.get("acceptance"):
+        parts.append("\n\nAcceptance criteria (your output is checked against "
+                     "each one):\n- " + "\n- ".join(ph["acceptance"]))
+    return "".join(parts)
+
+
+# ---- cheap, mechanical per-phase checks (no model call) -------------------
+_QUOTED_RE = re.compile(r'["“]([^"”]{2,80})["”]')
+_MUST_HAVE_RE = re.compile(r"\b(include|includes|including|contain|contains|"
+                           r"mention|mentions|name|names|use|uses|show|shows|"
+                           r"titled|heading)\b", re.I)
+_MIN_WORDS_RE = re.compile(r"\bat\s+least\s+(\d{1,5})\s+words?\b", re.I)
+_MAX_WORDS_RE = re.compile(r"\b(?:at\s+most|under|no\s+more\s+than|maximum(?:\s+of)?|"
+                           r"max\.?|fewer\s+than)\s+(\d{1,5})\s+words?\b", re.I)
+
+
+def _looks_like_json(text):
+    s = (text or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = re.sub(r"```\s*$", "", s).strip()
+    try:
+        json.loads(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _mechanical_problems(ph, text):
+    """Problems a string test can prove, most conservative reading only: a
+    quoted literal an acceptance criterion says must appear, word-count bounds,
+    and a JSON/HTML output format. A criterion this cannot read mechanically is
+    left to the manager's verdict — never guessed at here."""
+    problems = []
+    low = (text or "").lower()
+    for crit in ph.get("acceptance") or []:
+        if _MUST_HAVE_RE.search(crit):
+            for lit in _QUOTED_RE.findall(crit):
+                if lit.strip().lower() not in low:
+                    problems.append('missing required text "%s" (criterion: %s)'
+                                    % (lit.strip(), crit))
+        words = len(re.findall(r"\w+", text or ""))
+        m = _MIN_WORDS_RE.search(crit)
+        if m and words < int(m.group(1)):
+            problems.append("only %d words; criterion: %s" % (words, crit))
+        m = _MAX_WORDS_RE.search(crit)
+        # 1.5x slack: a model's word count and ours differ (hyphens, markup).
+        if m and words > int(int(m.group(1)) * 1.5):
+            problems.append("%d words; criterion: %s" % (words, crit))
+    fmt = (ph.get("output_format") or "").lower()
+    if re.search(r"\bjson\b", fmt) and not re.search(r"\b(or|and)\b", fmt) \
+            and not _looks_like_json(text):
+        problems.append("output_format is JSON but the output is not valid JSON")
+    if re.search(r"\bhtml\b", fmt) and not re.search(r"<[a-zA-Z][^>]*>", text or ""):
+        problems.append("output_format is HTML but the output contains no HTML tags")
+    return problems[:6]
 
 
 _PHASE_SCAN_RE = re.compile(
@@ -382,7 +541,8 @@ def _gather(fn, items, timeout, need_one=False):
     return out
 
 
-def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
+def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
+        manager=None):
     """Run the pipeline. `dispatch(msgs, max_tokens, exclude_pids=()) ->
     (text, pid_model)`; it must never raise — an empty text means that call
     failed, and every stage below treats that as "carry on with what we have".
@@ -401,6 +561,16 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
     craft brief), and sets "max_revisions" (0 = a "revise" verdict is only
     folded into synthesis; >=1 = run ONE bounded revision pass first). None
     reproduces the generic pipeline exactly.
+
+    `manager(msgs, max_tokens, purpose) -> (text, who[, tokens])` is an
+    optional paid model that plans, supervises, reviews and fixes while the
+    free models do the work (purpose is "plan"/"supervise"/"review"/"verify"/
+    "fix"). It is only ever shown clipped summaries and asked for short
+    replies; "" from it makes that stage use `dispatch` instead. With it, each
+    worker's output is checked (cheap tests, then a short manager verdict),
+    retried once on another free model, and written by the manager after two
+    failures; the result gains "manager_tokens" (and "review_warning" when the
+    reviewer's reply stayed unreadable). None = the pipeline exactly as before.
 
     Returns {"text", "plan", "phases", "review", "models"} — `text` is always a
     non-empty answer unless every single call failed."""
@@ -449,11 +619,71 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
     brief = _last_user_text(messages)
     models_used = []
 
+    # ---- the optional manager ---------------------------------------------
+    # manager(msgs, max_tokens, purpose) -> (text, who[, tokens]). It PLANS,
+    # SUPERVISES, REVIEWS, judges each worker's output and fixes what two free
+    # attempts could not; the free models still do the work (phases, gap
+    # repairs, synthesis). "" from it (off, over budget, failed) makes that one
+    # stage fall back to `dispatch`, so a manager can only ever add quality.
+    mgr_spent = [0]
+    mgr_lock = threading.Lock()
+    extras = {}
+
+    def _mgr(msgs, max_tokens, purpose):
+        if manager is None:
+            return "", None
+        try:
+            out = manager(msgs, max_tokens, purpose)
+        except Exception:                                       # noqa: BLE001
+            return "", None
+        if not isinstance(out, (tuple, list)) or len(out) < 2:
+            return "", None
+        text = out[0] if isinstance(out[0], str) else ""
+        tokens = out[2] if len(out) > 2 else None
+        if tokens is None:
+            # The caller did not report real usage: chars/4, like the hub.
+            tokens = ((sum(len(str(m.get("content") or "")) for m in msgs)
+                       + len(text)) // 4) if text else 0
+        try:
+            with mgr_lock:
+                mgr_spent[0] += max(0, int(tokens))
+        except (TypeError, ValueError):
+            pass
+        return (text, out[1] or "manager") if text.strip() else ("", None)
+
+    def _staged(free_msgs, free_tokens, purpose, mgr_msgs=None, mgr_tokens=None,
+                exclude=None):
+        """One manager-eligible stage: the manager on a clipped view first,
+        else the free dispatch with EXACTLY the call it always made."""
+        if manager is not None:
+            text, who = _mgr(mgr_msgs or free_msgs, mgr_tokens or free_tokens, purpose)
+            if text:
+                return text, who
+            emit(purpose, "manager unavailable — free models")
+        if exclude is None:
+            return dispatch(free_msgs, free_tokens)
+        return dispatch(free_msgs, free_tokens, exclude_pids=exclude)
+
+    def _finish(result):
+        if manager is not None:
+            result["manager_tokens"] = mgr_spent[0]
+            result.update(extras)
+        return result
+
+    def _spent():
+        """Wall clock spent — checked from worker threads, so it never emits."""
+        return stop_at is not None and time.monotonic() >= stop_at
+
+    mgr_brief = _clip(brief, MANAGER_BRIEF_CHARS)
+
     # ---- 1. PLAN ----------------------------------------------------------
     emit("plan", "planning")
-    plan_text, plan_model = dispatch(
+    plan_text, plan_model = _staged(
         [{"role": "system", "content": plan_system},
-         {"role": "user", "content": brief}], PLAN_MAX_TOKENS)
+         {"role": "user", "content": brief}], PLAN_MAX_TOKENS, "plan",
+        mgr_msgs=[{"role": "system", "content": plan_system},
+                  {"role": "user", "content": mgr_brief}],
+        mgr_tokens=MANAGER_PLAN_TOKENS)
     if plan_model:
         models_used.append(("plan", plan_model))
     plan = _parse_json(plan_text) or {}
@@ -465,13 +695,16 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
         # narrated instead of answering, or emitted JSON too broken to repair.
         # The retry says so bluntly and shows the exact shape.
         emit("plan", "plan unusable — retrying once")
-        plan_text, plan_model = dispatch(
+        strict = ("\n\nOUTPUT JSON ONLY. Start your reply with { and end it "
+                  'with }. No prose, no fence, no explanation. Shape:\n'
+                  '{"goal":"...","phases":[{"title":"...","task":"...",'
+                  '"done_when":"...","needs":[]}]}')
+        plan_text, plan_model = _staged(
             [{"role": "system", "content": plan_system},
-             {"role": "user", "content":
-              brief + "\n\nOUTPUT JSON ONLY. Start your reply with { and end it "
-              'with }. No prose, no fence, no explanation. Shape:\n'
-              '{"goal":"...","phases":[{"title":"...","task":"...",'
-              '"done_when":"...","needs":[]}]}'}], PLAN_MAX_TOKENS)
+             {"role": "user", "content": brief + strict}], PLAN_MAX_TOKENS, "plan",
+            mgr_msgs=[{"role": "system", "content": plan_system},
+                      {"role": "user", "content": mgr_brief + strict}],
+            mgr_tokens=MANAGER_PLAN_TOKENS)
         if plan_model:
             models_used.append(("plan:retry", plan_model))
         plan = _parse_json(plan_text) or {}
@@ -511,9 +744,102 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
                     "not repeat them, do not rewrite them:" + ctx) if ctx else
                    "\n\nYou are working in parallel with the rest of the team and "
                    "cannot see their output. Produce your part only."))
-        return dispatch(
-            [{"role": "system", "content": phase_system},
-             {"role": "user", "content": user}], PHASE_MAX_TOKENS)
+        # Appended AFTER the context so a phase without brief fields sends the
+        # exact prompt the plain pipeline always sent.
+        user += _render_brief(ph)
+        msgs = [{"role": "system", "content": phase_system},
+                {"role": "user", "content": user}]
+        first = dispatch(msgs, PHASE_MAX_TOKENS)
+        if manager is None:
+            return first
+        return _verified(idx, ph, msgs, first)
+
+    def _phase_problems(ph, text, trail):
+        """[] when the output passes, else concrete problems. Cheap checks
+        first (they cost nothing); the manager is asked only about an output
+        that already passed them, and only on a clipped excerpt. An unreadable
+        verdict passes — a checker must never be what loses a phase."""
+        if not (text or "").strip():
+            return ["the output was empty"]
+        if answer_check is not None:
+            try:
+                v = answer_check.inspect(text, prompt_text=brief + "\n" + ph["task"])
+            except Exception:                                   # noqa: BLE001
+                v = {"ok": True}
+            if not v.get("ok", True):
+                return ["the output degenerated (%s) — produce clean, complete "
+                        "output only" % ", ".join(v.get("reasons") or ["junk"])]
+        mech = _mechanical_problems(ph, text)
+        if mech:
+            return mech
+        crit = ph.get("acceptance") or ([ph["done_when"]] if ph.get("done_when") else [])
+        v_text, v_who = _mgr(
+            [{"role": "system", "content": _VERDICT_SYSTEM},
+             {"role": "user", "content":
+              "TASK: %s\n%s\n\nACCEPTANCE\n- %s%s\n\nOUTPUT (excerpt)\n%s"
+              % (ph["title"], _clip(ph["task"], 1200),
+                 "\n- ".join(crit) if crit else "(none stated — judge against the task)",
+                 ("\n\nOUTPUT FORMAT: " + ph["output_format"]) if ph.get("output_format") else "",
+                 _clip(text, VERDICT_OUTPUT_CHARS))}],
+            MANAGER_VERDICT_TOKENS, "verify")
+        if v_who:
+            trail.append(("verify:%s" % ph["title"], v_who))
+        verdict = _parse_json(v_text)
+        if not isinstance(verdict, dict) or "ok" not in verdict:
+            return []
+        if verdict.get("ok") is True or str(verdict.get("ok")).lower() == "true":
+            return []
+        return _str_list(verdict.get("problems"), 4, 300) or \
+            ["the manager rejected the output without detail — re-check every criterion"]
+
+    def _verified(idx, ph, msgs, first):
+        """Check one worker's output; on failure retry ONCE on a different free
+        model with the problems as instructions; after two failures the manager
+        writes the phase itself (the only call where it spends many tokens).
+        Returns (text, who, trail) — trail is every (role, model) it used."""
+        title = ph["title"]
+        trail = []
+        text, used = first
+        if used:
+            trail.append(("phase:%s" % title, used))
+        failed = set()
+        fallback = text or ""
+        problems = []
+        for attempt in (1, 2):
+            problems = _phase_problems(ph, text, trail)
+            if not problems:
+                return text, used, trail
+            emit("verify", "%s: %s" % (title[:30], problems[0][:44]))
+            if used:
+                failed.add(used.split("/", 1)[0])
+            if (text or "").strip():
+                fallback = text
+            if attempt == 2 or _spent():
+                break
+            retry = [msgs[0], {"role": "user", "content":
+                               msgs[1]["content"] + "\n\nA PREVIOUS ATTEMPT AT THIS "
+                               "PHASE WAS REJECTED. Fix every one of these problems:\n- "
+                               + "\n- ".join(problems)}]
+            text, used = dispatch(retry, PHASE_MAX_TOKENS, exclude_pids=tuple(failed))
+            if used:
+                trail.append(("phase-retry:%s" % title, used))
+        if not _spent():
+            fix_text, fix_who = _mgr(
+                [{"role": "system", "content": _FIX_SYSTEM},
+                 {"role": "user", "content":
+                  "OVERALL GOAL\n%s\n\nPHASE: %s\n%s%s%s\n\nPROBLEMS TO FIX\n- %s"
+                  "\n\nLAST ATTEMPT (excerpt)\n%s"
+                  % (_clip(goal, 1500), title, ph["task"],
+                     ("\n\nDone when: " + ph["done_when"]) if ph.get("done_when") else "",
+                     _render_brief(ph), "\n- ".join(problems),
+                     _clip(fallback, VERDICT_OUTPUT_CHARS) or "(empty)")}],
+                MANAGER_FIX_TOKENS, "fix")
+            if fix_text:
+                emit("verify", "%s: fixed by the manager" % title[:30])
+                trail.append(("fix:%s" % title, fix_who))
+                return fix_text, fix_who, trail
+        # Nothing better: ship the last real attempt rather than drop the phase.
+        return fallback, (used if fallback == text else None), trail
 
     for wave in _waves(phases):
         if outputs and _over("the next wave"):
@@ -536,8 +862,16 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
         # Applied in phase order, not completion order, so the assembled draft
         # reads in the sequence the supervisor planned.
         for i in sorted(results):
-            text, used = results[i]
-            if used:
+            text, used = results[i][0], results[i][1]
+            if len(results[i]) > 2:
+                # Verified phase: its trail names every worker, retry, verdict
+                # and fix. Only FREE workers count as executors -- the reviewer
+                # must differ from them, not from the manager.
+                for role, who in results[i][2]:
+                    models_used.append((role, who))
+                    if role.startswith("phase"):
+                        exec_pids.add(who.split("/", 1)[0])
+            elif used:
                 models_used.append(("phase:%s" % phases[i - 1]["title"], used))
                 exec_pids.add(used.split("/", 1)[0])
             if text:
@@ -552,15 +886,23 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
     # one phase produced anything: there is no team to reconcile.
     if len(done) > 1 and not _over("the supervisor"):
         emit("supervise", "checking coverage")
-        sup_text, sup_model = dispatch(
+        plan_lines = "\n".join("%d. %s — %s" % (i, p["title"], p["task"])
+                               for i, p in enumerate(phases, 1))
+        sup_text, sup_model = _staged(
             [{"role": "system", "content": _SUPERVISE_SYSTEM},
              {"role": "user", "content": "GOAL\n%s\n\nPLAN\n%s\n\nWHAT THE TEAM PRODUCED\n%s"
-              % (goal,
-                 "\n".join("%d. %s — %s" % (i, p["title"], p["task"])
-                           for i, p in enumerate(phases, 1)),
+              % (goal, plan_lines,
                  "\n\n".join("## %s\n%s" % (d["title"], _clip(d["output"], DEP_CONTEXT_CHARS))
                              for d in done))}],
-            SUPERVISE_MAX_TOKENS)
+            SUPERVISE_MAX_TOKENS, "supervise",
+            mgr_msgs=[{"role": "system", "content": _SUPERVISE_SYSTEM},
+                      {"role": "user", "content":
+                       "GOAL\n%s\n\nPLAN\n%s\n\nWHAT THE TEAM PRODUCED (excerpts)\n%s"
+                       % (_clip(goal, 1500), _clip(plan_lines, 4000),
+                          "\n\n".join("## %s\n%s" % (d["title"],
+                                                     _clip(d["output"], MANAGER_PHASE_CHARS))
+                                      for d in done))}],
+            mgr_tokens=MANAGER_SUPERVISE_TOKENS)
         if sup_model:
             models_used.append(("supervisor", sup_model))
         gaps = []
@@ -589,8 +931,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
                     done.append({"title": gaps[k]["title"], "output": text})
 
     if not done:
-        return {"text": "", "plan": plan, "phases": [], "review": None,
-                "models": models_used, "timed_out": timed_out[0]}
+        return _finish({"text": "", "plan": plan, "phases": [], "review": None,
+                        "models": models_used, "timed_out": timed_out[0]})
 
     draft = "\n\n".join("## %s\n%s" % (d["title"], d["output"]) for d in done) \
         if len(done) > 1 else done[0]["output"]
@@ -598,17 +940,46 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
     # ---- 3. REVIEW (different provider on purpose) ------------------------
     # Skipped past the wall clock: an unreviewed answer now beats a reviewed
     # one after the client has given up.
-    if _over("the review"):
+    def _review(suffix=""):
+        # The manager reviews excerpts; the full draft goes only to a free
+        # reviewer, exactly as before.
+        mgr_work = _clip("\n\n".join(
+            "## %s\n%s" % (d["title"], _clip(d["output"], MANAGER_PHASE_CHARS))
+            for d in done) if len(done) > 1 else done[0]["output"], MANAGER_DRAFT_CHARS)
+        return _staged(
+            [{"role": "system", "content": review_system},
+             {"role": "user", "content": "BRIEF\n%s\n\nWORK\n%s%s" % (brief, draft, suffix)}],
+            REVIEW_MAX_TOKENS, "review",
+            mgr_msgs=[{"role": "system", "content": review_system},
+                      {"role": "user", "content": "BRIEF\n%s\n\nWORK (excerpts)\n%s%s"
+                       % (mgr_brief, mgr_work, suffix)}],
+            mgr_tokens=MANAGER_REVIEW_TOKENS, exclude=tuple(exec_pids))
+
+    reviewed = not _over("the review")
+    if not reviewed:
         review_text, review_model = "", None
     else:
         emit("review", "reviewing")
-        review_text, review_model = dispatch(
-            [{"role": "system", "content": review_system},
-             {"role": "user", "content": "BRIEF\n%s\n\nWORK\n%s" % (brief, draft)}],
-            REVIEW_MAX_TOKENS, exclude_pids=tuple(exec_pids))
+        review_text, review_model = _review()
     if review_model:
         models_used.append(("review", review_model))
     review = _parse_json(review_text) or {}
+    if manager is not None and reviewed and \
+            str(review.get("verdict") or "").lower() not in ("ship", "revise"):
+        # Without a manager an unreadable review silently counts as "ship" (the
+        # plain pipeline's long-standing behaviour). With one, ask ONCE more,
+        # then ship with a visible warning instead of pretending it passed.
+        emit("review", "review unreadable — asking once more")
+        review_text, review_model = _review(
+            "\n\nREPLY WITH JSON ONLY: {\"verdict\": \"ship\" | \"revise\", "
+            "\"problems\": [...]}")
+        if review_model:
+            models_used.append(("review:retry", review_model))
+        review = _parse_json(review_text) or {}
+        if str(review.get("verdict") or "").lower() not in ("ship", "revise"):
+            extras["review_warning"] = ("the reviewer's reply was unreadable twice "
+                                        "— shipped without a review")
+            emit("review", "unreadable twice — shipping unreviewed")
     problems = [str(p).strip() for p in (review.get("problems") or []) if str(p).strip()]
     needs_work = (str(review.get("verdict") or "").lower() == "revise") and problems
 
@@ -622,15 +993,20 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
     revised = False
     if needs_work and max_revisions >= 1 and not _over("the revision"):
         emit("revise", "fixing %d problem%s" % (len(problems), "" if len(problems) == 1 else "s"))
-        rev_text, rev_model = dispatch(
+        def _rev_user(b):
+            return ("BRIEF\n%s\n\nDRAFT\n%s\n\nREVIEWER PROBLEMS TO FIX\n- %s\n\n"
+                    "Return the COMPLETE corrected work — the full draft with every "
+                    "problem fixed, not a diff, not a list of changes."
+                    % (b, _clip(draft, DEP_CONTEXT_CHARS), "\n- ".join(problems[:10])))
+        # The final FIX is the manager's when there is one, capped at one
+        # phase's worth of output -- the draft it is shown is already clipped.
+        rev_text, rev_model = _staged(
             [{"role": "system", "content": phase_system},
-             {"role": "user", "content":
-              "BRIEF\n%s\n\nDRAFT\n%s\n\nREVIEWER PROBLEMS TO FIX\n- %s\n\n"
-              "Return the COMPLETE corrected work — the full draft with every "
-              "problem fixed, not a diff, not a list of changes."
-              % (brief, _clip(draft, DEP_CONTEXT_CHARS),
-                 "\n- ".join(problems[:10]))}],
-            SYNTH_MAX_TOKENS)
+             {"role": "user", "content": _rev_user(brief)}],
+            SYNTH_MAX_TOKENS, "fix",
+            mgr_msgs=[{"role": "system", "content": phase_system},
+                      {"role": "user", "content": _rev_user(mgr_brief)}],
+            mgr_tokens=MANAGER_FIX_TOKENS)
         if rev_model:
             models_used.append(("revision", rev_model))
         if rev_text:
@@ -642,8 +1018,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
     # rewrite would only risk making it worse.
     if len(done) == 1 and not needs_work:
         emit("done", "single phase, review passed")
-        return {"text": draft, "plan": plan, "phases": done, "review": review,
-                "models": models_used, "timed_out": timed_out[0]}
+        return _finish({"text": draft, "plan": plan, "phases": done, "review": review,
+                        "models": models_used, "timed_out": timed_out[0]})
 
     emit("synthesis", "assembling")
     synth_user = "BRIEF\n%s\n\nPHASE OUTPUTS\n%s" % (brief, draft)
@@ -657,8 +1033,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None):
     if synth_model:
         models_used.append(("synthesis", synth_model))
     emit("done", "complete")
-    return {"text": final_text or draft, "plan": plan, "phases": done,
-            "review": review, "models": models_used, "timed_out": timed_out[0]}
+    return _finish({"text": final_text or draft, "plan": plan, "phases": done,
+                    "review": review, "models": models_used, "timed_out": timed_out[0]})
 
 
 def trailer_summary(result):
@@ -684,6 +1060,10 @@ def trailer_summary(result):
         parts.append("reviewer_raised=%d" % len(problems))
     if result.get("timed_out"):
         parts.append("timed_out=1")
+    if result.get("manager_tokens"):
+        parts.append("manager_tokens=%d" % int(result["manager_tokens"]))
+    if result.get("review_warning"):
+        parts.append("review_unreadable=1")
     line = "; ".join(parts)
     line = line.encode("ascii", "replace").decode("ascii")
     line = re.sub(r"[\r\n\t]+", " ", line)
@@ -720,4 +1100,8 @@ def format_answer(result):
         # assertion the reviewer exists to catch. Show them and let the user judge.
         lines.append("\n**Reviewer raised** (passed to the final pass — check them)")
         lines.extend("- %s" % p for p in problems[:5])
+    if result.get("review_warning"):
+        lines.append("\n**Warning:** %s" % result["review_warning"])
+    if result.get("manager_tokens"):
+        lines.append("\n*Manager tokens: %d*" % int(result["manager_tokens"]))
     return text + "\n".join(lines)
