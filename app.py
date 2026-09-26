@@ -3329,9 +3329,17 @@ _PROVIDER_FORBIDDEN_THRESHOLD = 8      # 403-only: usually per-model, not a bad 
 _PROVIDER_NOCREDIT_THRESHOLD = 2       # 402 on 2 distinct models = the ACCOUNT is broke
 _AUTH_FAIL_STATUSES = (401, 402, 403)
 _dead_providers = {}                   # pid -> expiry epoch
-_provider_authfail = {}                # pid -> set(models that auth-failed this window)
-_provider_keyfail = set()              # pids that saw a real 401/402 this window
+_provider_authfail = {}                # pid -> {model: last auth-fail epoch} (sliding window)
+_provider_keyfail = {}                 # pid -> epoch of the last real 401/402 (sliding window)
 _provider_dead_lock = threading.Lock()
+# The evidence above is a SLIDING window, not an ever-growing tally. It used to
+# reset only when the provider's own dead marker expired -- and it was persisted
+# across restarts -- so a provider that was never parked never forgot anything.
+# MEASURED 2026-09-26: aimlapi had 7 distinct models on record (threshold 8)
+# and cloudflare 2, built up from sporadic per-model 403s spread over WEEKS;
+# one more stray 403 would have parked every model of a working key. Evidence
+# older than a day says nothing about whether the key works right now.
+_PROVIDER_AUTHFAIL_WINDOW = 24 * 3600
 
 # CONSECUTIVE-HARD-FAILURE breaker — a status-agnostic safety net ON TOP OF
 # _mark_provider_authfail. The distinct-model rule above misses two real cases
@@ -3412,6 +3420,28 @@ def _is_billing_precondition(resp):
         return False
 
 
+def _prune_provider_authfail_locked(pid, now=None):
+    """Drop pid's auth-fail evidence older than _PROVIDER_AUTHFAIL_WINDOW.
+    Caller holds _provider_dead_lock. Tolerates a legacy set() value (no
+    timestamps -> age unknown -> dropped), so an old shape can never crash it."""
+    now = time.time() if now is None else now
+    cutoff = now - _PROVIDER_AUTHFAIL_WINDOW
+    s = _provider_authfail.get(pid)
+    if s is not None:
+        if isinstance(s, dict):
+            fresh = {m: ts for m, ts in s.items()
+                     if isinstance(ts, (int, float)) and ts > cutoff}
+        else:
+            fresh = {}
+        if fresh:
+            _provider_authfail[pid] = fresh
+        else:
+            _provider_authfail.pop(pid, None)
+    ts = _provider_keyfail.get(pid)
+    if ts is not None and not (isinstance(ts, (int, float)) and ts > cutoff):
+        _provider_keyfail.pop(pid, None)
+
+
 def _mark_provider_authfail(pid, model, status):
     """Record an auth/credit failure; once enough DISTINCT models of a provider fail
     this way, the key is bad — sideline the whole provider (not just each model).
@@ -3425,12 +3455,14 @@ def _mark_provider_authfail(pid, model, status):
     to fall through to. Per-model 403s are already handled by _mark_model_dead."""
     if status not in _AUTH_FAIL_STATUSES:
         return
+    now = time.time()
     with _provider_dead_lock:
-        s = _provider_authfail.setdefault(pid, set())
+        _prune_provider_authfail_locked(pid, now)
+        s = _provider_authfail.setdefault(pid, {})
         if model:
-            s.add(str(model))
+            s[str(model)] = now
         if status in (401, 402):
-            _provider_keyfail.add(pid)      # this window saw a KEY-level failure
+            _provider_keyfail[pid] = now    # this window saw a KEY-level failure
         if status == 402 and len(s) >= _PROVIDER_NOCREDIT_THRESHOLD:
             # 402 is USUALLY an account fact ("balance is 0, top up to continue") and a
             # broke provider that keeps winning the primary slot burns a hop on every
@@ -3573,10 +3605,69 @@ def _is_provider_dead(pid):
         if exp <= time.time():
             _dead_providers.pop(pid, None)
             _provider_authfail.pop(pid, None)   # reset counter -> a clean re-probe
-            _provider_keyfail.discard(pid)
+            _provider_keyfail.pop(pid, None)
             _provider_consec_fail.pop(pid, None)
             return False
         return True
+
+
+# HOP COOLDOWN SCOPE. A timed-out or 5xx hop used to call quota.mark_throttled
+# on the WHOLE provider, and that path doubles per strike up to _MAX_BACKOFF
+# (1h). MEASURED 2026-09-26: dahl sat at 6 strikes -- every model of it parked
+# for an hour because individual models were slow, while its siblings were
+# fine. A slow/5xx hop is evidence about THAT model, so the cooldown now lands
+# on (provider, model) via quota.mark_model_throttled. The provider as a whole
+# is benched only on evidence that is provider-wide: two or more DISTINCT models
+# failing inside _HOP_ESCALATE_WINDOW, or a failure that never reached a model
+# at all (connect timeout / DNS / TLS / connection refused).
+_HOP_ESCALATE_WINDOW = 600             # seconds: distinct-model failures inside this
+_HOP_ESCALATE_MODELS = 2               # ...this many distinct models -> whole provider
+_hop_model_fail = {}                   # pid -> {model: last timeout/5xx epoch}
+_PROVIDER_WIDE_ERR_RE = re.compile(
+    r"connection refused|actively refused|name or service not known|"
+    r"getaddrinfo|nodename nor servname|failed to resolve|name resolution|"
+    r"no address associated|certificate verify", re.I)
+
+
+def _is_provider_wide_failure(exc):
+    """True when exc says the HOST was unreachable, not that one model was slow:
+    the connection never completed, so every model behind that base URL fails
+    the same way. A ReadTimeout (connected, model then went quiet) is NOT."""
+    if exc is None:
+        return False
+    try:
+        if isinstance(exc, (requests.exceptions.ConnectTimeout,
+                            requests.exceptions.SSLError)):
+            return True
+        if isinstance(exc, requests.exceptions.ConnectionError):
+            return bool(_PROVIDER_WIDE_ERR_RE.search(str(exc) or ""))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return False
+
+
+def _throttle_failed_hop(pid, model, exc=None, secs=None):
+    """Cool down a hop that timed out or answered 5xx. Per-model by default,
+    provider-wide only on provider-wide evidence (see _HOP_ESCALATE_WINDOW).
+    Fail-open: never raises into the hop loop. 429 does NOT come through here --
+    it stays owned by _upstream_chat's own key-rotation/backoff."""
+    secs = secs or _HOP_COOLDOWN_DEFAULT
+    try:
+        if not model or _is_provider_wide_failure(exc):
+            quota.mark_throttled(pid, secs)
+            return
+        quota.mark_model_throttled(pid, model, secs)
+        now = time.time()
+        with _provider_dead_lock:
+            recent = {m: ts for m, ts in (_hop_model_fail.get(pid) or {}).items()
+                      if now - ts <= _HOP_ESCALATE_WINDOW}
+            recent[str(model)] = now
+            _hop_model_fail[pid] = recent
+            escalate = len(recent) >= _HOP_ESCALATE_MODELS
+        if escalate:
+            quota.mark_throttled(pid, secs)
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def _dead_provider_rows():
@@ -3603,11 +3694,18 @@ def _dead_state_dump():
         dead_models = {"%s|%s" % (p, m): exp
                        for (p, m), exp in _dead_models.items() if exp > now}
     with _provider_dead_lock:
+        for p in list(_provider_authfail) + list(_provider_keyfail):
+            _prune_provider_authfail_locked(p, now)
         out = {
             "dead_models": dead_models,
             "dead_providers": {p: exp for p, exp in _dead_providers.items() if exp > now},
+            # Legacy shape (pid -> [models], [pids]) kept so an older build
+            # reading this file still understands it; the *_ts keys carry the
+            # timestamps the sliding window needs and win on load.
             "provider_authfail": {p: sorted(ms) for p, ms in _provider_authfail.items()},
             "provider_keyfail": sorted(_provider_keyfail),
+            "provider_authfail_ts": {p: dict(ms) for p, ms in _provider_authfail.items()},
+            "provider_keyfail_ts": dict(_provider_keyfail),
             "provider_consec_fail": dict(_provider_consec_fail),
         }
     # Learned context windows ride along. Without this they were in-memory only,
@@ -3678,12 +3776,28 @@ def _dead_state_load(blob):
         for p, exp in (blob.get("dead_providers") or {}).items():
             if isinstance(p, str) and exp > now:
                 _dead_providers[p] = exp
-        for p, ms in (blob.get("provider_authfail") or {}).items():
-            if isinstance(p, str) and isinstance(ms, list):
-                _provider_authfail[p] = set(m for m in ms if isinstance(m, str))
-        for p in (blob.get("provider_keyfail") or []):
-            if isinstance(p, str):
-                _provider_keyfail.add(p)
+        # Only TIMESTAMPED evidence is restored, and only inside the window. A
+        # legacy file carries bare lists (pid -> [models], [pids]) with no age
+        # at all -- exactly the weeks-old accumulation that was parking working
+        # providers -- so it is read without error and deliberately dropped: a
+        # genuinely bad key re-proves itself in three requests.
+        cutoff = now - _PROVIDER_AUTHFAIL_WINDOW
+        authfail_ts = blob.get("provider_authfail_ts")
+        if isinstance(authfail_ts, dict):
+            for p, ms in authfail_ts.items():
+                if not (isinstance(p, str) and isinstance(ms, dict)):
+                    continue
+                fresh = {m: float(ts) for m, ts in ms.items()
+                         if isinstance(m, str) and isinstance(ts, (int, float))
+                         and cutoff < ts <= now + 60}
+                if fresh:
+                    _provider_authfail[p] = fresh
+        keyfail_ts = blob.get("provider_keyfail_ts")
+        if isinstance(keyfail_ts, dict):
+            for p, ts in keyfail_ts.items():
+                if (isinstance(p, str) and isinstance(ts, (int, float))
+                        and cutoff < ts <= now + 60):
+                    _provider_keyfail[p] = float(ts)
         for p, n in (blob.get("provider_consec_fail") or {}).items():
             if isinstance(p, str) and isinstance(n, int):
                 _provider_consec_fail[p] = n
@@ -19999,7 +20113,9 @@ def _chat_completions_uncached(body):
                 # SLOW failure mode that error class was missing turned out to
                 # be a raw 5xx status (524 etc.) that never raises at all --
                 # handled separately below, in the non-2xx branch.
-                quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                # Scoped to THIS model unless the evidence is provider-wide
+                # (see _throttle_failed_hop).
+                _throttle_failed_hop(hop_pid, hop_model, exc=exc)
                 # ...and count it, so a provider that ONLY ever times out is eventually
                 # parked rather than re-tried forever. Heavily gated -- see
                 # _note_provider_timeout, which ignores everything that is not
@@ -20165,7 +20281,9 @@ def _chat_completions_uncached(body):
                 # HTTP 524 (Cloudflare gateway timeout) right after a
                 # ConnectionError on the SAME hop moments earlier in a
                 # different request -- nothing had cooled it down between them.
-                quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                # Scoped to THIS model; two distinct models failing within
+                # _HOP_ESCALATE_WINDOW escalate to the whole provider.
+                _throttle_failed_hop(hop_pid, hop_model)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
@@ -20744,7 +20862,9 @@ def v1_responses(_retry_pass=False):
                 # SLOW failure mode that error class was missing turned out to
                 # be a raw 5xx status (524 etc.) that never raises at all --
                 # handled separately below, in the non-2xx branch.
-                quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                # Scoped to THIS model unless the evidence is provider-wide
+                # (see _throttle_failed_hop).
+                _throttle_failed_hop(hop_pid, hop_model, exc=exc)
                 # ...and count it, so a provider that ONLY ever times out is eventually
                 # parked rather than re-tried forever. Heavily gated -- see
                 # _note_provider_timeout, which ignores everything that is not
@@ -20857,7 +20977,7 @@ def v1_responses(_retry_pass=False):
                 # (unlike 429, already handled inside _upstream_chat) never got
                 # a cooldown here, so a genuinely down hop was retried on every
                 # request. MEASURED 2026-08-05: g4f-nvidia/mistral-medium-3.5.
-                quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                _throttle_failed_hop(hop_pid, hop_model)
             _ekey = "%s:%d" % (hop_pid, resp.status_code)  # DIAG: capture first raw body
             if _ekey not in _err_bodies:
                 try:
@@ -21449,7 +21569,9 @@ def v1_messages():
                 # SLOW failure mode that error class was missing turned out to
                 # be a raw 5xx status (524 etc.) that never raises at all --
                 # handled separately below, in the non-2xx branch.
-                quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                # Scoped to THIS model unless the evidence is provider-wide
+                # (see _throttle_failed_hop).
+                _throttle_failed_hop(hop_pid, hop_model, exc=exc)
                 # ...and count it, so a provider that ONLY ever times out is eventually
                 # parked rather than re-tried forever. Heavily gated -- see
                 # _note_provider_timeout, which ignores everything that is not
@@ -21535,7 +21657,7 @@ def v1_messages():
                 # (unlike 429, already handled inside _upstream_chat) never got
                 # a cooldown here, so a genuinely down hop was retried on every
                 # request. MEASURED 2026-08-05: g4f-nvidia/mistral-medium-3.5.
-                quota.mark_throttled(hop_pid, _HOP_COOLDOWN_DEFAULT)
+                _throttle_failed_hop(hop_pid, hop_model)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
