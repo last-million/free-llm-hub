@@ -86,6 +86,7 @@ import crews
 import hub_mcp
 import mcp_manager
 import usage_history
+import ctxwin
 
 # The hub is also an MCP server (POST /mcp, JSON-RPC 2.0) so any MCP-capable
 # agent CLI can call the crews as native tools. The runner goes through the
@@ -522,7 +523,15 @@ def _learn_ctx_from_catalog(payload_pid, payload):
             if ctx is None:
                 continue
             with _model_max_input_lock:
+                # The catalog's own statement is kept apart too: a window
+                # LEARNED from an error expires (see _ctx_limit), and when it
+                # does the model falls back to what its catalog says, not to
+                # the provider-wide guess.
+                prev_cat = _MODEL_CATALOG_CTX.get((payload_pid, mid))
+                _MODEL_CATALOG_CTX[(payload_pid, mid)] = ctx
                 cur = _MODEL_MAX_INPUT.get((payload_pid, mid))
+                if cur and prev_cat == cur and (payload_pid, mid) not in _MODEL_LEARNED_AT:
+                    cur = None        # it WAS the catalog's number: take the new one
                 # Smaller wins: a limit learned from a real rejection is
                 # authoritative over an optimistic catalog number.
                 _MODEL_MAX_INPUT[(payload_pid, mid)] = min(cur, ctx) if cur else ctx
@@ -2791,20 +2800,27 @@ def _est_tokens(messages, tools=None, overhead=400):
     message, which is the margin, not the text, and would make a client believe
     it was near a limit it is nowhere near."""
     chars = 0
+    # Tokens BEYOND chars/4: non-Latin scripts (a CJK character is ~1 token,
+    # not 0.25 -- chars/4 is calibrated on English only) and images, which are
+    # sized from their own header bytes when the payload carries them.
+    extra = 0.0
     for m in messages or []:
         if not isinstance(m, dict):
             continue
         c = m.get("content")
         if isinstance(c, str):
             chars += len(c)
+            extra += ctxwin.nonlatin_extra_tokens(c)
         elif isinstance(c, list):
             for b in c:
                 if isinstance(b, dict) and isinstance(b.get("text"), str):
                     chars += len(b["text"])
+                    extra += ctxwin.nonlatin_extra_tokens(b["text"])
                 elif isinstance(b, dict) and b.get("type") in ("image_url", "input_image"):
-                    # Provider tokenization varies with resolution/detail. A
-                    # conservative fixed allowance is enough for TPM routing.
-                    chars += 4000
+                    iu = b.get("image_url")
+                    url = iu.get("url") if isinstance(iu, dict) else iu
+                    detail = iu.get("detail") if isinstance(iu, dict) else b.get("detail")
+                    extra += ctxwin.image_tokens(url=url, detail=detail)
         for tc in m.get("tool_calls") or []:
             fn = tc.get("function") or {}
             chars += len(str(fn.get("arguments") or "")) + len(str(fn.get("name") or ""))
@@ -2813,7 +2829,7 @@ def _est_tokens(messages, tools=None, overhead=400):
             chars += len(json.dumps(tools))
         except Exception:
             pass
-    est = chars // 4 + overhead
+    est = chars // 4 + int(extra) + overhead
     # Text shorter than one whole token still costs one. Only matters once the
     # routing margin is dropped (countTokens), where "hi" floored to 0 -- and a
     # client reading 0 tokens for real text concludes the message was empty.
@@ -3953,9 +3969,18 @@ def _dead_state_dump():
     # 400 -- which is exactly how a Codex session kept losing its best hop and
     # falling through to a flash-lite. A model's context window is a fixed fact,
     # so it is safe to remember indefinitely (no TTL).
+    # ...with their provenance: a LEARNED limit carries the time it was learned
+    # (it expires, see _ctx_limit), the catalog's own figure rides separately so
+    # an expired limit falls back to it, and output caps never mix with windows.
     with _model_max_input_lock:
         out["model_max_input"] = {"%s|%s" % (p, m): v
                                   for (p, m), v in _MODEL_MAX_INPUT.items()}
+        out["model_max_input_ts"] = {"%s|%s" % (p, m): ts
+                                     for (p, m), ts in _MODEL_LEARNED_AT.items()}
+        out["model_ctx_catalog"] = {"%s|%s" % (p, m): v
+                                    for (p, m), v in _MODEL_CATALOG_CTX.items()}
+        out["model_max_output"] = {"%s|%s" % (p, m): v
+                                   for (p, m), v in _MODEL_MAX_OUTPUT.items()}
     # Learned delivery reliability rides along too (see _record_outcome). It is
     # earned one real request at a time, so losing it on every restart would
     # mean re-learning a bad hop by burning real chain slots on it again --
@@ -4069,11 +4094,36 @@ def _dead_state_load(blob):
             if isinstance(p, str) and isinstance(n, int):
                 _provider_consec_fail[p] = n
     with _model_max_input_lock:
+        _ts_map = blob.get("model_max_input_ts")
+        _ts_map = _ts_map if isinstance(_ts_map, dict) else {}
+        _cat_map = blob.get("model_ctx_catalog")
+        _cat_map = _cat_map if isinstance(_cat_map, dict) else {}
+        for key, v in _cat_map.items():
+            if isinstance(key, str) and "|" in key and isinstance(v, int) and v >= 1000:
+                p, m = key.split("|", 1)
+                _MODEL_CATALOG_CTX.setdefault((p, m), v)
         for key, v in (blob.get("model_max_input") or {}).items():
             if isinstance(key, str) and "|" in key and isinstance(v, int) and v >= 1000:
                 p, m = key.split("|", 1)
+                ts = _ts_map.get(key)
+                if isinstance(ts, (int, float)):
+                    if now - ts > _LEARNED_CTX_TTL:
+                        continue          # an expired lesson is not restored
+                elif _cat_map.get(key) == v:
+                    ts = None             # the catalog's own number: never expires
+                else:
+                    # A file from before provenance was saved: treat it as learned
+                    # NOW, so it gets one full TTL rather than living forever.
+                    ts = now
                 cur = _MODEL_MAX_INPUT.get((p, m))
                 _MODEL_MAX_INPUT[(p, m)] = min(cur, v) if cur else v
+                if ts is not None:
+                    _MODEL_LEARNED_AT[(p, m)] = max(float(ts), _MODEL_LEARNED_AT.get((p, m), 0.0))
+        for key, v in (blob.get("model_max_output") or {}).items():
+            if isinstance(key, str) and "|" in key and isinstance(v, int) and v >= 16:
+                p, m = key.split("|", 1)
+                cur = _MODEL_MAX_OUTPUT.get((p, m))
+                _MODEL_MAX_OUTPUT[(p, m)] = min(cur, v) if cur else v
     with _outcome_lock:
         for key, row in (blob.get("outcomes") or {}).items():
             if not (isinstance(key, str) and "|" in key
@@ -6380,9 +6430,21 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
             difficulty = "hard"
     if est is None:
         est = _est_tokens(messages)
-    providers = [p for p in _available_providers() if _provider_capable(p, est)]
+    # A provider row too small for this request can still carry models whose
+    # OWN known window holds it (a 1M-context model behind a 128K row): those
+    # models come through, the rest of that provider does not.
+    _bigwin = _big_window_models(est)
+    _only_big = set()
+    providers = []
+    for p in _available_providers():
+        if _provider_capable(p, est):
+            providers.append(p)
+        elif _bigwin.get(p):
+            providers.append(p)
+            _only_big.add(p)
     if not providers:  # request too big for every free tier -> try the biggest anyway
         providers = sorted(_available_providers(), key=_provider_tpm, reverse=True)
+        _only_big = set()
     providers = _exclude_google_for_foreign_tool_history(providers, require_tools, messages)
     # Each _auto_models(pid) can be a live, network-bound provider /models
     # fetch on a cold or expired cache entry. MEASURED, chasing a report of a
@@ -6397,6 +6459,8 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     _compactable = []      # everything EXCEPT the size check -- see below
     for pid in providers:
         for m in models_by_pid.get(pid, ()):
+            if pid in _only_big and m not in _bigwin.get(pid, ()):
+                continue          # this provider is here only for its big-window models
             # skip ids this key provably can't use (403/404 learned at runtime) and
             # ids individually rate-limited / over their per-model sub-cap.
             if (prov.is_model_allowed(m) and not _is_model_dead(pid, m)
@@ -6431,6 +6495,14 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     # whose every model is both weak and oversized would re-admit nothing, leave
     # `cands` empty, and return no model at all rather than a compacted answer.
     _floor = _TOOLS_MIN_SCORE if require_tools else _DIFFICULTY_FLOOR.get(difficulty, 0)
+    # MODE FIRST, THEN SIZE. The re-admission below used to look at the whole
+    # pool: on a big context, fitting out-of-category models cleared the floor,
+    # so the category's own (compactable) models were never re-admitted, and
+    # _apply_mode then found nothing in the category and failed open -- a
+    # "coding" CLI turn silently left coding on exactly the turns that matter.
+    # Now the size split is judged INSIDE the mode, and the category is left
+    # only when it has no model at all, fitting or compactable.
+    cands, _compactable = _mode_first_size_split(cands, _compactable, _floor)
     if _compactable and not any(c[0] >= _floor for c in cands):
         cands += _compactable
     # MODE: "use the coding models on this project" and the like. A filter, not
@@ -7124,11 +7196,20 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # cache is keyed per-pid so there is nothing to race, only wall-clock to
     # save.
     _catalogs = _prefetch_auto_models(list(_cand_pids))
+    # A per-model window known to hold the request beats a provider row that
+    # does not (see _big_window_models): those models stay in the full-size
+    # part of the chain, the provider's other models go to the tail as before.
+    _bigwin = _big_window_models(est)
     for pid in _cand_pids:
+        _only = None
         if not _provider_capable(pid, est):
             _too_small.append(pid)
-            continue
+            _only = _bigwin.get(pid)
+            if not _only:
+                continue
         for m in _catalogs.get(pid) or []:
+            if _only is not None and m not in _only:
+                continue
             if (pid, m) in seen or not prov.is_model_allowed(m) or _is_model_dead(pid, m):
                 continue
             if _veto and _normalize_model_identity(m) in _veto:
@@ -7163,6 +7244,15 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # ranked in with the rest afterwards, so this changes which models are
     # AVAILABLE to the chain, never the order it prefers them in.
     _floor = _TOOLS_MIN_SCORE if require_tools else 0
+    # Mode first, then size -- see _mode_first_size_split. Re-admitted
+    # in-category models join the fits so the per-tier _apply_mode below keeps
+    # them instead of failing open to the rest of the fleet.
+    _fits, _needs_compaction = _mode_first_size_split(fast + slow, _needs_compaction,
+                                                      _floor)
+    _have = set(fast) | set(slow)
+    for entry in _fits:
+        if entry not in _have:
+            (fast if _is_fast(entry[1], entry[2]) else slow).append(entry)
     if _needs_compaction and not any(e[0] >= _floor for e in fast + slow):
         for entry in _needs_compaction:
             (fast if _is_fast(entry[1], entry[2]) else slow).append(entry)
@@ -7203,6 +7293,16 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # the dice) plus _weighted_pick on the primary — removed here, not narrowed,
         # since a narrower band would still fight interleaving's ordering somewhat.
         ordered = _interleave_by_provider(ordered)
+        # THE WINDOW THE CLI WAS TOLD. Every connected CLI is configured with
+        # HUB_CONTEXT_WINDOW (codex model_context_window, opencode
+        # limit.context, Pi/openclaw) and only compacts its own history as it
+        # nears THAT. A model KNOWN to hold much less forces the hub to drop
+        # turns the CLI believes are still in context, so it goes behind the
+        # models that hold the declared window (or whose window is unknown).
+        # A stable sort, applied before the reliability and proven-first
+        # groupings below, so those still dominate -- this only orders within
+        # them.
+        ordered.sort(key=lambda e: _below_declared_window(e[1], e[2]))
         # PROVEN-first, same fail-open allowlist _route_by_difficulty already
         # applies to the primary pick — but until now ONLY to the primary. The
         # fallback chain built above ranks by raw strength alone, so an unproven
@@ -7408,6 +7508,24 @@ _key_cursor_lock = threading.Lock()
 # real, meaningful key value there (a keyless provider sends no auth header).
 _NO_KEY_PIN = object()
 
+# USAGE ON TRANSLATED STREAMS. /v1/responses and /v1/messages rebuild their
+# answer from an OpenAI chat stream, and an OpenAI stream carries usage ONLY
+# when asked (stream_options.include_usage). The hub never asked, so Codex and
+# Claude Code got no usage at all on most hops, or a guess -- and a CLI that
+# cannot see its context filling never compacts. Asked on every translated
+# stream; a provider that rejects the option is retried without it once and
+# remembered in _NO_STREAM_OPTIONS.
+_STREAM_USAGE_OPTIONS = {"include_usage": True}
+_NO_STREAM_OPTIONS = set()
+_STREAM_OPTIONS_ERR_RE = re.compile(r"stream_options|include_usage", re.I)
+
+
+def _resp_text_safe(resp):
+    try:
+        return resp.text or ""
+    except Exception:                                            # noqa: BLE001
+        return ""
+
 
 def _next_key_start(pid, n):
     """Round-robin starting index for provider `pid`, advanced per request so
@@ -7506,17 +7624,39 @@ def _refit_payload_to_learned_ctx(pid, payload):
         # max_tokens cap below handles — and for a model whose ADVERTISED window
         # is simply a lie (cloudflare claimed 120,000 and delivered 32,768).
         budget = int(budget * 0.80)
-        compacted, did = _compact_to_budget(msgs, payload.get("tools"), budget)
-        if not did:
+        # An OUTPUT cap learned from this very error ("max_tokens must be <=
+        # 8192") is fixed by lowering max_tokens, not by dropping history.
+        out_cap = _model_output_cap(pid, payload.get("model"))
+        mt = payload.get("max_tokens")
+        over_cap = bool(isinstance(mt, int) and out_cap and mt > out_cap)
+        if _ctx_g("_ctx_signal") and not ctxwin.is_compaction_request(msgs):
+            # The overflow signal is on for this /v1 request: a refit that would
+            # drop most of the history is refused like the first pass would
+            # have been, so the chain moves on (and, if nothing holds the
+            # request, the CLI is told to compact) instead of serving a gutted
+            # conversation.
+            _st = {}
+            compacted, did = _compact_to_budget(msgs, payload.get("tools"), budget,
+                                                stats=_st,
+                                                abort_frac=_CTX_OVERFLOW_DROP_FRAC)
+            if _st.get("overflow"):
+                _ctx_note_overflow(_model_ctx_budget(pid, payload.get("model")))
+                return None
+        else:
+            compacted, did = _compact_to_budget(msgs, payload.get("tools"), budget)
+        if not did and not over_cap:
             return None                       # already fits; the 400 was something else
         out = dict(payload)
-        out["messages"] = _sanitize_tool_messages(compacted)
-        # Output tokens count against the same window on most providers, so an
-        # oversized max_tokens can re-trigger the very error we just handled.
-        mt = out.get("max_tokens")
-        cap = max(256, int(budget * 0.12))
-        if isinstance(mt, int) and mt > cap:
-            out["max_tokens"] = cap
+        if over_cap:
+            out["max_tokens"] = out_cap
+        if did:
+            out["messages"] = _sanitize_tool_messages(compacted)
+            # Output tokens count against the same window on most providers, so an
+            # oversized max_tokens can re-trigger the very error we just handled.
+            mt = out.get("max_tokens")
+            cap = max(256, int(budget * 0.12))
+            if isinstance(mt, int) and mt > cap:
+                out["max_tokens"] = cap
         return out
     except Exception:                                                # noqa: BLE001
         _log.debug("[refit] could not recompact for %s", pid, exc_info=True)
@@ -7609,12 +7749,315 @@ def _tools_exceed_budget(payload, budget):
 
 
 def _model_ctx_budget(pid, model):
-    """Best estimate of a model's usable INPUT context: the limit LEARNED from a real
-    400 (authoritative) if we have one, else the provider's context-sized _PROVIDER_TPM."""
-    lim = _MODEL_MAX_INPUT.get((pid, model))
+    """Best estimate of a model's usable INPUT context. See _model_ctx_info."""
+    return _model_ctx_info(pid, model)[0]
+
+
+# Providers whose _PROVIDER_TPM figure is a MEASURED per-request token cap
+# (a per-minute budget no single request can exceed), not a stand-in for the
+# context window. For these the table caps even a model whose own window is
+# known to be larger; for every other provider a known per-model window wins
+# over the provider-wide figure. groq free: 8000 TPM on models whose catalog
+# says 131072 -- a 30K request 413s every time.
+_PROVIDER_HARD_REQUEST_CAP = frozenset({"groq"})
+
+
+def _model_ctx_info(pid, model):
+    """(budget, source) for a model's INPUT window, most specific first:
+      "learned"  -- from a real 400/413 (authoritative, expires after
+                    _LEARNED_CTX_TTL so one transient error cannot shrink a
+                    model forever), or the catalog's own per-model number;
+      "table"    -- the provider row in _PROVIDER_TPM;
+      "default"  -- _DEFAULT_TPM, a GUESS: nothing is known about this model.
+    A known per-model window is never capped by the provider figure, except
+    on the providers whose figure is a hard per-request cap (see above)."""
+    lim = _ctx_limit(pid, model)
     if isinstance(lim, int) and lim > 0:
-        return lim
-    return _provider_tpm(pid)
+        if pid in _PROVIDER_HARD_REQUEST_CAP and pid in _PROVIDER_TPM:
+            return min(lim, _PROVIDER_TPM[pid]), "learned"
+        return lim, "learned"
+    if pid in _PROVIDER_TPM:
+        return _PROVIDER_TPM[pid], "table"
+    return _provider_tpm(pid), "default"
+
+
+def _ctx_limit(pid, model):
+    """The per-model window (learned or catalog), or None when unknown.
+
+    Expires a LEARNED limit past _LEARNED_CTX_TTL: the model falls back to its
+    catalog figure, or to unknown. A value with no learned-at stamp (catalog,
+    or set directly) never expires."""
+    key = (pid, model)
+    lim = _MODEL_MAX_INPUT.get(key)
+    ts = _MODEL_LEARNED_AT.get(key)
+    if ts is not None and time.time() - ts > _LEARNED_CTX_TTL:
+        with _model_max_input_lock:
+            _MODEL_LEARNED_AT.pop(key, None)
+            cat = _MODEL_CATALOG_CTX.get(key)
+            if cat:
+                _MODEL_MAX_INPUT[key] = cat
+            else:
+                _MODEL_MAX_INPUT.pop(key, None)
+            lim = cat
+    return lim if isinstance(lim, int) and lim > 0 else None
+
+
+def _model_output_cap(pid, model):
+    """A model's OUTPUT-token ceiling learned from an error, or None."""
+    v = _MODEL_MAX_OUTPUT.get((pid, model))
+    return v if isinstance(v, int) and v > 0 else None
+
+
+def _output_reserve(budget, max_tokens):
+    """Room kept free in the window for the reply: the caller's max_tokens, but
+    never more than a quarter of the window (a 32000 max_tokens must not eat a
+    32K model whole). 0 when nothing was asked -- compaction's own 15%
+    headroom already covers an unbounded reply."""
+    try:
+        mt = int(max_tokens or 0)
+        b = int(budget or 0)
+    except (TypeError, ValueError):
+        return 0
+    if mt <= 0 or b <= 0:
+        return 0
+    return min(mt, b // 4)
+
+
+def _big_window_models(est):
+    """{pid: {model}} of models whose OWN known window holds `est` tokens (same
+    margin as _provider_capable), for providers whose table figure is only a
+    stand-in. Lets a 1M-window model through a provider row sized for its
+    128K siblings."""
+    need = int((est or 0) * 1.15) + 512
+    out = {}
+    # Below the smallest stand-in row every provider is capable already, and
+    # this is called on every routing decision: skip the scan.
+    rows = [v for p, v in _PROVIDER_TPM.items() if p not in _PROVIDER_HARD_REQUEST_CAP]
+    if rows and need <= min(rows):
+        return out
+    try:
+        items = list(_MODEL_MAX_INPUT.items())
+    except RuntimeError:
+        return out
+    for (p, m), lim in items:
+        if p in _PROVIDER_HARD_REQUEST_CAP or not isinstance(lim, int):
+            continue
+        if lim >= need and _ctx_limit(p, m):
+            out.setdefault(p, set()).add(m)
+    return out
+
+
+def _below_declared_window(pid, model):
+    """True when this model is KNOWN to hold clearly less than the window every
+    CLI is told the hub has (HUB_CONTEXT_WINDOW). Unknown is not small."""
+    try:
+        lim = _ctx_limit(pid, model)
+        if pid in _PROVIDER_HARD_REQUEST_CAP and pid in _PROVIDER_TPM:
+            lim = min(lim or _PROVIDER_TPM[pid], _PROVIDER_TPM[pid])
+        return bool(lim) and lim < int(HUB_CONTEXT_WINDOW * 0.9)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Per-request context state (flask `g`) -- what the /v1 handlers need to tell
+# the CLI the truth about its context: the ORIGINAL request size, how much the
+# serving hop compacted, and whether every hop had to drop too much.
+# --------------------------------------------------------------------------- #
+
+class _ContextOverflow(requests.exceptions.RequestException):
+    """This hop would have had to drop more than _CTX_OVERFLOW_DROP_FRAC of the
+    conversation to fit its window. Raised instead of silently serving a
+    gutted history; the chain walks on (a bigger model may hold it), and when
+    nothing does, the CLI gets its protocol's native "context too long" error
+    and compacts its OWN history -- which it does far better than the hub."""
+
+
+# A hop that would drop more than this share of the HISTORY (whole turns, not
+# the trimming of one oversized message) is skipped when the overflow signal is
+# on. Below it the hub compacts silently and reports the pre-compaction size,
+# so the CLI's own threshold still fires soon.
+_CTX_OVERFLOW_DROP_FRAC = 0.30
+
+
+def _ctx_g(name, default=None):
+    """g.<name>, or `default` outside an app context (worker threads, tests)."""
+    try:
+        return g.get(name, default)
+    except Exception:                                            # noqa: BLE001
+        return default
+
+
+def _ctx_set(name, value):
+    try:
+        setattr(g, name, value)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _request_path_endswith(suffix):
+    try:
+        return (request.path or "").rstrip("/").endswith(suffix)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _ctx_begin(body, messages, est, signal=True):
+    """Called by each /v1 handler right before its chain walk: turns the
+    overflow signal on for this request (setting context_overflow_signal,
+    default on), remembers the ORIGINAL request size and the conversation id."""
+    _ctx_set("_ctx_signal", bool(signal) and bool(
+        config.get_flag("context_overflow_signal", True)))
+    _ctx_set("_ctx_orig_est", int(est or 0))
+    _ctx_set("_ctx_overflow", None)
+    _ctx_set("_ctx_hops", {})
+    try:
+        conv = ctxwin.conversation_key(request.headers, body, _build_sid(), messages)
+    except Exception:                                            # noqa: BLE001
+        conv = None
+    _ctx_set("_ctx_conv", conv)
+
+
+def _ctx_note_hop(pid, model, before, after):
+    """Remember how much THIS hop's payload was compacted (sizes are estimates)."""
+    hops = _ctx_g("_ctx_hops")
+    if hops is None:
+        hops = {}
+        _ctx_set("_ctx_hops", hops)
+    try:
+        hops[(pid, model)] = (int(before or 0), int(after or 0))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _ctx_hop_ratio(pid, model):
+    """before/after estimate for the hop that served, 1.0 when it was not
+    compacted (or is unknown)."""
+    hops = _ctx_g("_ctx_hops") or {}
+    before, after = hops.get((pid, model), (0, 0))
+    if before > 0 and 0 < after < before:
+        return before / float(after)
+    return 1.0
+
+
+def _reported_prompt_tokens(upstream_pt, orig_est, pid=None, model=None):
+    """Prompt tokens to REPORT to the client: the size of the request IT sent.
+
+    The upstream's own count is exact for what was forwarded -- and that is
+    the COMPACTED payload, which is exactly the number that kept every CLI's
+    own compaction (codex ~96K, opencode ~112K, Claude Code) from ever firing:
+    the hub quietly dropped history underneath a CLI that believed it had room.
+    So an upstream count is scaled back up by how much this hop compacted, and
+    when the upstream reports nothing, the estimate of the original request
+    (tools and images included) stands in."""
+    try:
+        pt = int(upstream_pt or 0)
+    except (TypeError, ValueError):
+        pt = 0
+    if pt > 0:
+        ratio = _ctx_hop_ratio(pid, model)
+        return int(round(pt * ratio)) if ratio > 1.0 else pt
+    try:
+        return max(0, int(orig_est or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _ctx_note_overflow(window=None):
+    ov = _ctx_g("_ctx_overflow") or {"hops": 0, "window": 0}
+    ov["hops"] = int(ov.get("hops") or 0) + 1
+    try:
+        ov["window"] = max(int(ov.get("window") or 0), int(window or 0))
+    except (TypeError, ValueError):
+        pass
+    _ctx_set("_ctx_overflow", ov)
+
+
+def _ctx_note_overflow_resp(resp, pid, model):
+    """A hop answered 400/413 "context too long": count it towards the native
+    overflow signal. An OUTPUT-cap error is not a context overflow."""
+    try:
+        text = resp.text or ""
+    except Exception:                                            # noqa: BLE001
+        return
+    if not _SOFT_400_CONTEXT_RE.search(text):
+        return
+    if ctxwin.output_cap_from_error(text) and not re.search(
+            r"context|prompt|input", text, re.I):
+        return
+    _ctx_note_overflow(_ctx_limit(pid, model) or _model_ctx_budget(pid, model))
+
+
+def _ctx_overflow_reply(kind, stream=False, model_label="auto"):
+    """The protocol's native "context too long" reply when this request
+    overflowed every hop it tried, else None. kind: openai | responses |
+    anthropic."""
+    if not _ctx_g("_ctx_signal"):
+        return None
+    ov = _ctx_g("_ctx_overflow")
+    if not ov or not ov.get("hops"):
+        return None
+    orig = int(_ctx_g("_ctx_orig_est") or 0)
+    window = int(ov.get("window") or 0)
+    hdrs = {"X-Free-LLM-Hub-Last-Error": "context"}
+    _log.info("[ctx] %s request of ~%d tokens overflowed every hop (largest window "
+              "tried %d): answering with the native context-length error", kind,
+              orig, window)
+    if kind == "anthropic":
+        return jsonify(ctxwin.anthropic_overflow_body(orig, window)), 400, hdrs
+    if kind == "responses" and stream:
+        created, failed = ctxwin.responses_overflow_events(orig, window, model_label)
+
+        def _gen():
+            yield _sse_event("response.created",
+                             {"type": "response.created", "response": created})
+            yield _sse_event("response.failed",
+                             {"type": "response.failed", "response": failed})
+
+        return Response(stream_with_context(_gen()), mimetype="text/event-stream",
+                        headers=dict(_SSE_HEADERS, **hdrs))
+    return jsonify(ctxwin.openai_overflow_body(orig, window)), 400, hdrs
+
+
+def _ctx_fix_chat_usage(data, orig_est, pid=None, model=None):
+    """Rewrite (or fill in) an OpenAI chat JSON's usage to the ORIGINAL request
+    size. Mutates `data`; never raises."""
+    try:
+        if not isinstance(data, dict):
+            return data
+        u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        ct = u.get("completion_tokens")
+        if ct is None:
+            msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+            chars = len(ctxwin.message_text(msg))
+            for tc in msg.get("tool_calls") or []:
+                chars += len(str(((tc or {}).get("function") or {}).get("arguments") or ""))
+            ct = max(1, chars // 4) if chars else 0
+        pt = _reported_prompt_tokens(u.get("prompt_tokens"), orig_est, pid, model)
+        u = dict(u)
+        u["prompt_tokens"] = pt
+        u["completion_tokens"] = int(ct or 0)
+        u["total_tokens"] = pt + int(ct or 0)
+        data["usage"] = u
+    except Exception:                                            # noqa: BLE001
+        pass
+    return data
+
+
+def _ctx_usage_sse(relay, body, orig_est, pid, model):
+    """The chat SSE relay with usage frames reporting the ORIGINAL request
+    size, and a usage frame added when the client asked for one
+    (stream_options.include_usage) but upstream sent none. The untouched relay
+    when neither applies."""
+    try:
+        want = bool(((body or {}).get("stream_options") or {}).get("include_usage"))
+    except AttributeError:
+        want = False
+    if not want and _ctx_hop_ratio(pid, model) <= 1.0:
+        return relay
+    return ctxwin.fix_chat_sse_usage(
+        relay, lambda upt: _reported_prompt_tokens(upt, orig_est, pid, model),
+        inject_if_missing=want, model="%s/%s" % (pid, model))
 
 
 _SUMMARY_SYSTEM = (
@@ -7656,26 +8099,115 @@ def _strip_thinking(text):
     return out.strip()
 
 
+def _recap_text(dropped):
+    """The dropped turns as recap input. Tool-call-only turns are one line each
+    ("called read_file(...)"): they carry no prose, so they used to vanish from
+    the recap entirely -- and on an agent session they are most of the turns."""
+    parts = []
+    for m in dropped or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "?")
+        text = ctxwin.message_text(m)
+        if text.strip():
+            parts.append("%s: %s" % (role, text[:4000]))
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                parts.append("%s: [called %s(%s)]" % (
+                    role, str(fn.get("name") or "tool")[:60],
+                    re.sub(r"\s+", " ", str(fn.get("arguments") or ""))[:300]))
+    return "\n\n".join(parts)
+
+
 def _summary_key(dropped):
     """(key, text) for the turns being dropped, or (None, None) if not worth it."""
-    text = "\n\n".join(
-        "%s: %s" % (m.get("role", "?"), m["content"][:4000])
-        for m in dropped
-        if isinstance(m, dict) and isinstance(m.get("content"), str) and m["content"].strip())
+    text = _recap_text(dropped)
     if len(text) < 800:                # too little dropped to be worth a call
         return None, None
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest(), text
 
 
-def _summarize_worker(key, text, sid=None):
+# ROLLING RECAP, one per conversation. The old cache was keyed by a hash of the
+# EXACT dropped set, which changes on every turn of a growing conversation --
+# so the recap computed for turn N was never looked up again and "almost never
+# arrived". Now a conversation (keyed by the CLI's own session id where it
+# sends one -- see ctxwin.conversation_key) owns ONE recap, extended
+# incrementally as more turns fall off, and it is persisted so a /v1 client
+# keeps it across the hub's restarts.
+_RECAP_STORE_PATH = None               # tests point this elsewhere
+
+
+def _recap_store_path():
+    return _RECAP_STORE_PATH or os.path.join(config.state_dir(), "compaction-recaps.json")
+
+
+_recap_store = ctxwin.RecapStore(_recap_store_path)
+_RECAP_MIN_NEW_CHARS = 1200            # newly-dropped text worth an incremental update
+
+
+def _rolling_recap(conv, dropped):
+    """This conversation's recap, when one exists and matches this history;
+    schedules an incremental update when enough NEW turns have dropped off
+    since it was written. Never blocks, never raises."""
+    try:
+        entry = _recap_store.get(conv)
+        if not entry or entry.get("head") != ctxwin.head_hash(dropped):
+            return None
+        hashes = [ctxwin.message_hash(m) for m in dropped]
+        last = entry.get("last")
+        idx = -1
+        if last in hashes:
+            idx = len(hashes) - 1 - hashes[::-1].index(last)
+        else:
+            idx = min(int(entry.get("n") or 0), len(hashes)) - 1
+        new = dropped[idx + 1:]
+        if new:
+            new_text = _recap_text(new)
+            if len(new_text) >= _RECAP_MIN_NEW_CHARS:
+                ikey = "roll:" + conv
+                with _summary_lock:
+                    busy = (ikey in _summary_inflight
+                            or len(_summary_inflight) >= _SUMMARY_MAX_INFLIGHT)
+                    if not busy:
+                        _summary_inflight.add(ikey)
+                if not busy:
+                    try:
+                        sid = _build_sid()
+                    except Exception:                            # noqa: BLE001
+                        sid = None
+                    threading.Thread(
+                        target=_summarize_worker, args=(ikey, new_text, sid),
+                        kwargs={"conv": conv, "prev": entry.get("recap"),
+                                "head": entry.get("head"), "last": hashes[-1],
+                                "n": len(hashes)},
+                        daemon=True, name="summarize-roll").start()
+        return entry.get("recap")
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[summary] rolling recap lookup failed", exc_info=True)
+        return None
+
+
+def _summarize_worker(key, text, sid=None, conv=None, prev=None, head=None,
+                      last=None, n=0):
     """Compute one recap and cache it. Runs OFF the request path.
 
     `sid` names the conversation so the recap can also be written where it
     survives a restart; None (a gateway request with no session) just uses the
-    in-memory cache as before."""
+    in-memory cache as before. `conv` files it as that conversation's rolling
+    recap; `prev` makes it an INCREMENTAL update -- the existing recap plus the
+    turns dropped since, merged into one."""
     try:
-        msgs = [{"role": "system", "content": _SUMMARY_SYSTEM},
-                {"role": "user", "content": text[-60000:]}]
+        if prev:
+            system = (_SUMMARY_SYSTEM + "\nYou are UPDATING an existing recap: merge "
+                      "the newly dropped turns into it and return ONE recap of the "
+                      "whole dropped part.")
+            content = ("EXISTING RECAP:\n" + prev[:6000] + "\n\nNEWLY DROPPED TURNS:\n"
+                       + text[-50000:])
+        else:
+            system, content = _SUMMARY_SYSTEM, text[-60000:]
+        msgs = [{"role": "system", "content": system},
+                {"role": "user", "content": content}]
         # medium, not hard: compression is not the user's actual task and must
         # not take the strongest hop the real request wants.
         pid, model, _d = _route_by_difficulty(msgs, _SUMMARY_MAX_TOKENS,
@@ -7703,6 +8235,10 @@ def _summarize_worker(key, text, sid=None):
                 if len(_summary_cache) >= _SUMMARY_CACHE_MAX:
                     _summary_cache.clear()   # cheap bound; recaps are re-derivable
                 _summary_cache[key] = out
+            # The conversation's ROLLING recap, persisted (see _rolling_recap).
+            if conv:
+                _recap_store.put(conv, {"recap": out, "head": head, "last": last,
+                                        "n": int(n or 0)})
             # ...and durably, for the conversation this recap belongs to. The
             # cache above is 64 entries of RAM: the hub auto-updates every five
             # hours, so a long conversation's recap was reliably lost before
@@ -7734,6 +8270,13 @@ def _summarize_dropped(dropped):
     if not dropped:
         return None
     try:
+        # The conversation this history belongs to: the CLI's own session id
+        # when the request carries one (set by the /v1 handler), else a hash of
+        # the dropped part's opening -- stable while the history only grows.
+        conv = _ctx_g("_ctx_conv") or ("h:" + ctxwin.head_hash(dropped))
+        rolled = _rolling_recap(conv, dropped)
+        if rolled:
+            return rolled
         key, text = _summary_key(dropped)
         if not key:
             return None
@@ -7752,6 +8295,9 @@ def _summarize_dropped(dropped):
         except Exception:                                        # noqa: BLE001
             sid = None
         threading.Thread(target=_summarize_worker, args=(key, text, sid),
+                         kwargs={"conv": conv, "head": ctxwin.head_hash(dropped),
+                                 "last": ctxwin.message_hash(dropped[-1]),
+                                 "n": len(dropped)},
                          daemon=True, name="summarize").start()
     except Exception:                                            # noqa: BLE001
         _log.debug("[summary] could not schedule", exc_info=True)
@@ -7897,18 +8443,49 @@ def _apply_craft_brief(messages, agentic=False):
         return messages
 
 
-def _compact_to_budget(messages, tools, budget, summarizer=None):
+def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stats=None,
+                       abort_frac=None):
     """AUTO-COMPACT: if a conversation is bigger than a model's context budget, drop
     the OLDEST turns (keeping ALL leading system messages + the most RECENT turns that
-    fit + tool-call/result pairing, which _sanitize_tool_messages then repairs) and
-    insert a truncation marker. This is what lets a SMALL-context model still serve a
-    long agentic conversation (recent context only) instead of 400ing — per-model
-    memory management. Returns (messages, compacted_bool). No-op when it already fits
-    or the budget is unknown/zero."""
+    fit) and insert a truncation marker. This is what lets a SMALL-context model still
+    serve a long agentic conversation (recent context only) instead of 400ing --
+    per-model memory management. Returns (messages, compacted_bool). No-op when it
+    already fits or the budget is unknown/zero.
+
+    Three rules the old version broke, each of which cost a real session:
+
+      * A TOOL CALL AND ITS RESULTS ARE ONE UNIT. They are kept or dropped
+        together. Keeping a result whose call was dropped made
+        _sanitize_tool_messages delete it as an orphan -- so a Codex turn that
+        read a 150 KB file on a 32K model reached the model with NO result, and
+        the agent read the file again, forever. An oversized result is
+        TRUNCATED (head + tail, marked) instead, never separated from its call.
+      * THE LATEST INSTRUCTION IS PINNED, IN FULL. The old pin was the FIRST
+        user message, capped at 4000 chars -- which for Codex is AGENTS.md or
+        <environment_context> and for Claude Code a <system-reminder>, while
+        the instruction the model is answering could be dropped in a long tool
+        loop. The original request is still pinned, as a short excerpt.
+      * ROOM FOR THE REPLY. `reserve` (the caller's max_tokens, at most a
+        quarter of the window -- see _output_reserve) comes off the target, so
+        a compacted request still leaves the model room to answer.
+
+    `stats`, when a dict, receives before/after sizes and the fraction of the
+    HISTORY that was dropped whole (what the overflow signal keys on). With
+    `abort_frac`, a compaction that would drop more than that share returns
+    the messages UNCHANGED with stats["overflow"] = True -- before any recap is
+    scheduled -- so the caller can signal overflow instead."""
     if not isinstance(messages, list) or not messages or not budget or budget <= 0:
         return messages, False
     target = int(budget * 0.85)   # leave ~15% headroom for the model's own reply
-    if _est_tokens(messages, tools) <= target:
+    try:
+        if reserve and int(reserve) > 0:
+            target = min(target, int(budget) - int(reserve))
+    except (TypeError, ValueError):
+        pass
+    total = _est_tokens(messages, tools)
+    if isinstance(stats, dict):
+        stats.update(before=total, after=total, dropped_frac=0.0, target=target)
+    if total <= target:
         return messages, False
     lead_sys, rest = [], []
     for m in messages:
@@ -7916,39 +8493,56 @@ def _compact_to_budget(messages, tools, budget, summarizer=None):
             lead_sys.append(m)
         else:
             rest.append(m)
-    # PIN THE ORIGINAL BRIEF. Keeping only the newest turns loses the message
-    # that says WHAT IS BEING BUILT, which is the one thing a follow-up depends
-    # on. Symptom: finish a project, say "make it better", and the model starts a
-    # NEW one because every turn describing the old one had been dropped. The
-    # first user turn is the task statement, so it is pinned (capped, so a huge
-    # opening paste can't eat the window it is meant to protect).
-    brief = None
-    # Only when there is a CONVERSATION to lose. With a single turn the "brief"
-    # IS the whole payload, and pinning it would cap it to its first 4000 chars —
-    # throwing away the end of a pasted file, which _trim_largest_message below
-    # keeps deliberately (head AND tail).
+    # PINS. Only when there is a CONVERSATION to lose: with one or two turns the
+    # "brief" IS the whole payload, and pinning it would cap a pasted file that
+    # _trim_largest_message below keeps deliberately (head AND tail).
+    latest = first = None
     if len(rest) > 2:
-        for m in rest:
-            if isinstance(m, dict) and m.get("role") == "user":
-                brief = m
+        for m in reversed(rest):
+            if ctxwin.is_real_instruction(m):
+                latest = m
                 break
-    if brief is not None and isinstance(brief.get("content"), str) \
-            and len(brief["content"]) > _BRIEF_PIN_CHARS:
-        brief = dict(brief)
-        brief["content"] = (brief["content"][:_BRIEF_PIN_CHARS] +
-                            "\n[... original request truncated ...]")
-    base = _est_tokens(lead_sys + ([brief] if brief else []), tools)
-    kept, running = [], base
-    for m in reversed(rest):                       # keep newest-first until full
-        if brief is not None and m is rest[0]:
-            continue                               # already pinned above
-        c = _est_tokens([m])
-        if kept and running + c > target:
+        for m in rest:
+            if ctxwin.is_real_instruction(m):
+                first = m
+                break
+    if first is latest:
+        first = None
+    # A tool call and the results that answer it are ONE unit.
+    units = _message_units(rest)
+    # THE CURRENT TURN IS ALWAYS KEPT, whatever its size (the trim loop below
+    # cuts it down to fit): from the latest instruction when the user just
+    # spoke, or from the last assistant unit when a tool loop is mid-cycle --
+    # which is where Claude Code's newest message is a <system-reminder> and the
+    # 150 KB tool result sits one unit further back.
+    forced_from = len(units) - 1
+    last_asst = latest_unit = -1
+    for u, unit in enumerate(units):
+        for m in unit:
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                last_asst = u
+            if latest is not None and m is latest:
+                latest_unit = u
+    if last_asst >= 0 or latest_unit >= 0:
+        forced_from = min(forced_from, max(last_asst, latest_unit))
+    pinned_ids = {id(latest)} if latest is not None else set()
+    brief = _brief_excerpt(first) if first is not None else None
+    base = _est_tokens(lead_sys + [x for x in (brief, latest) if x is not None], tools)
+    keep_ids, running = set(), base
+    for u in range(len(units) - 1, -1, -1):        # keep newest-first until full
+        body = [m for m in units[u] if id(m) not in pinned_ids]
+        if not body:
+            continue
+        c = sum(_est_tokens([m]) for m in body)
+        if u < forced_from and running + c > target:
             break
-        kept.append(m)
+        keep_ids.update(id(m) for m in body)
         running += c
-    kept.reverse()
-    if len(kept) >= len(rest):
+    if latest is not None:
+        keep_ids.add(id(latest))
+    brief_needed = first is not None and id(first) not in keep_ids
+    dropped = [m for m in rest if id(m) not in keep_ids]
+    if not dropped:
         # Dropping whole turns achieved nothing — the overflow is INSIDE a single
         # message (a pasted file, a huge tool result). Previously this returned
         # "no change" and the request went out oversized and was rejected, losing
@@ -7956,12 +8550,31 @@ def _compact_to_budget(messages, tools, budget, summarizer=None):
         # tail, which is where the question and the recent output live, and mark
         # the cut so the model knows material is missing rather than silently
         # reasoning over a truncated file.
-        trimmed, did_trim = _trim_largest_message(lead_sys + rest, tools, target)
-        return (trimmed, True) if did_trim else (messages, False)
+        out = lead_sys + rest
+        did = False
+        for _ in range(4):
+            if _est_tokens(out, tools) <= target:
+                break
+            out, did_trim = _trim_largest_message(out, tools, target)
+            if not did_trim:
+                break
+            did = True
+        if not did:
+            return messages, False
+        if isinstance(stats, dict):
+            stats.update(after=_est_tokens(out, tools))
+        return out, True
+    hist = _est_tokens(rest, overhead=0) or 1
+    frac = min(1.0, _est_tokens(dropped, overhead=0) / float(hist))
+    if isinstance(stats, dict):
+        stats.update(dropped_frac=frac, dropped_msgs=len(dropped))
+    if abort_frac is not None and frac > abort_frac:
+        if isinstance(stats, dict):
+            stats["overflow"] = True
+        return messages, False
     # Name the artefacts that were dropped. "Earlier conversation was truncated"
     # tells the model nothing actionable; a list of the files already created
     # tells it the project EXISTS and should be edited, not started again.
-    dropped = [m for m in rest if m not in kept and m is not brief]
     files = _mentioned_paths(dropped)
     note = ("[Note: earlier turns of THIS SAME conversation were dropped to fit this "
             "model's context window. The work already exists — continue and EDIT it, "
@@ -7969,6 +8582,11 @@ def _compact_to_budget(messages, tools, budget, summarizer=None):
     if files:
         note += " Files created/edited earlier: " + ", ".join(files) + "."
     note += " Read a file before changing it, and ask the user for anything else you need.]"
+    # Tool-call-only turns carry no prose, so they vanished from every notice
+    # and recap; a one-line digest keeps "what was already run" visible.
+    digest = _tool_call_digest(dropped)
+    if digest:
+        note += "\n\n[Earlier tool calls, oldest first]\n" + digest
     # A model-written recap of what was dropped, when a summarizer is wired in.
     # Structural facts (brief + file list) survive either way; the recap adds the
     # part they cannot carry — the DECISIONS and the reasoning behind them.
@@ -7976,28 +8594,20 @@ def _compact_to_budget(messages, tools, budget, summarizer=None):
     if recap:
         note += "\n\n[Recap of the dropped turns]\n" + recap
     notice = {"role": "system", "content": note}
-    head = lead_sys + [notice] + ([brief] if brief else [])
-    out = head + kept
+    out = (lead_sys + [notice] + ([brief] if brief_needed else [])
+           + [m for m in rest if id(m) in keep_ids])
     # DROPPING TURNS IS NOT ENOUGH ON ITS OWN.
     #
-    # The loop above admits the NEWEST message whatever its size, so that at
-    # least one turn always survives -- a turn answered with none of the message
-    # that asked it is worse than a trimmed one. That guarantee is right. What
-    # was missing is the step after it: nothing then trimmed the survivor.
-    #
-    # And because turns HAD been dropped, len(kept) < len(rest), so the branch
-    # above -- _trim_largest_message, written for exactly this, an overflow
-    # living inside a single message -- was never reached. It ran only when no
-    # turn could be dropped at all.
+    # The loop above admits the NEWEST unit whatever its size, so that at least
+    # one turn always survives -- a turn answered with none of the message that
+    # asked it is worse than a trimmed one -- and the latest instruction is
+    # pinned on top of that. What must follow is trimming the survivors.
     #
     # MEASURED 2026-09-05 on the shape opencode actually sends (a few turns, then
     # the whole repo pasted into the latest one), against groq's 8000-token
-    # budget:
-    #     before=150431   after=150493   did=True
-    # It came back BIGGER than it went in -- the notice was added and nothing was
-    # removed -- and reported success. _upstream_chat sends what it is given
-    # without re-checking, so 150K tokens went to a model with an 8K window and
-    # the answer was `groq: HTTP 413`, one hop of a six-provider 503 cascade.
+    # budget: before=150431 after=150493 did=True. It came back BIGGER than it
+    # went in and reported success; _upstream_chat sends what it is given, so
+    # 150K tokens went to an 8K window and the answer was `groq: HTTP 413`.
     #
     # A loop, not a single pass: _trim_largest_message shrinks the biggest
     # message per call and sizes the cut from a chars-per-token estimate, so a
@@ -8009,7 +8619,61 @@ def _compact_to_budget(messages, tools, budget, summarizer=None):
         out, did_trim = _trim_largest_message(out, tools, target)
         if not did_trim:
             break              # nothing left that can usefully be cut
+    if isinstance(stats, dict):
+        stats.update(after=_est_tokens(out, tools))
     return out, True
+
+
+def _message_units(rest):
+    """The history as UNITS: an assistant message with tool_calls together with
+    the tool results that immediately answer it, or a single other message.
+    Compaction keeps or drops a unit whole, so a call is never separated from
+    its result (which _sanitize_tool_messages would then delete as an orphan)."""
+    units, i, n = [], 0, len(rest)
+    while i < n:
+        m = rest[i]
+        if (isinstance(m, dict) and m.get("role") == "assistant"
+                and isinstance(m.get("tool_calls"), list)):
+            ids = {tc.get("id") for tc in m["tool_calls"]
+                   if isinstance(tc, dict) and tc.get("id")}
+            unit, j = [m], i + 1
+            while (j < n and isinstance(rest[j], dict) and rest[j].get("role") == "tool"
+                   and (not ids or rest[j].get("tool_call_id") in ids)):
+                unit.append(rest[j])
+                j += 1
+            units.append(unit)
+            i = j
+        else:
+            units.append([m])
+            i += 1
+    return units
+
+
+def _brief_excerpt(msg):
+    """The original request as a short pinned copy: its user text (CLI wrapper
+    blocks stripped), capped at _BRIEF_PIN_CHARS."""
+    text = ctxwin.instruction_text(ctxwin.message_text(msg)) or ctxwin.message_text(msg)
+    if len(text) > _BRIEF_PIN_CHARS:
+        text = text[:_BRIEF_PIN_CHARS] + "\n[... original request truncated ...]"
+    return {"role": "user", "content": "[Original request of this conversation]\n" + text}
+
+
+def _tool_call_digest(dropped, limit=15, max_chars=1500):
+    """One line per tool call in the dropped turns, oldest first, newest kept."""
+    lines = []
+    for m in dropped or []:
+        if not (isinstance(m, dict) and m.get("role") == "assistant"):
+            continue
+        for tc in m.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            name = str(fn.get("name") or "tool")[:60]
+            args = re.sub(r"\s+", " ", str(fn.get("arguments") or ""))[:140]
+            lines.append("- %s(%s)" % (name, args))
+    lines = lines[-limit:]
+    out = "\n".join(lines)
+    return out[-max_chars:] if len(out) > max_chars else out
 
 
 # Longest opening request we will pin verbatim. Past this it is truncated: the
@@ -8075,9 +8739,19 @@ def _trim_largest_message(messages, tools, target):
         tail = text[-int(keep * 0.4):] if int(keep * 0.4) else ""
         out = list(messages)
         out[idx] = dict(messages[idx])
-        out[idx]["content"] = (
-            head + "\n\n[... %d characters omitted to fit this model's context "
-                   "window; ask for the missing part if you need it ...]\n\n" % cut + tail)
+        if messages[idx].get("role") == "tool":
+            # A tool result is truncated, never dropped: dropping it (or its
+            # call) left the agent with no result at all, and it re-ran the
+            # same read forever.
+            marker = ("\n\n[... %d characters omitted by the hub to fit the model's "
+                      "context window; this tool output is truncated -- re-run the "
+                      "tool on a narrower range if you need the missing part ...]\n\n"
+                      % cut)
+        else:
+            marker = ("\n\n[... %d characters omitted by the hub to fit the model's "
+                      "context window; ask for the missing part if you need it ...]\n\n"
+                      % cut)
+        out[idx]["content"] = head + marker + tail
         return out, True
     except Exception:                                                # noqa: BLE001
         return messages, False
@@ -8210,9 +8884,28 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         # anyone who would rather not spend a call on it.
         _summarizer = (_summarize_dropped
                        if config.get_flag("compact_summary", True) else None)
+        # ROOM FOR THE REPLY, and the OUTPUT cap this model is known to have.
+        _budget, _ctx_src = _model_ctx_info(pid, payload.get("model"))
+        _mt_key = ("max_tokens" if isinstance(payload.get("max_tokens"), int)
+                   else "max_completion_tokens"
+                   if isinstance(payload.get("max_completion_tokens"), int) else None)
+        _mt = payload.get(_mt_key) if _mt_key else None
+        _out_cap = _model_output_cap(pid, payload.get("model"))
+        if _mt and _out_cap and _mt > _out_cap:
+            _mt = _out_cap
+        # A GUESSED window (nothing known about this model) keeps the plain
+        # 15% headroom and never signals overflow: the truth arrives the honest
+        # way, as a real 400 that teaches the real window.
+        _reserve = _output_reserve(_budget, _mt) if _ctx_src != "default" else 0
+        _signal = (_ctx_g("_ctx_signal") and _ctx_src != "default"
+                   and not ctxwin.is_compaction_request(msgs))
+        _cstats = {}
         compacted, did = _compact_to_budget(msgs, payload.get("tools"),
                                             _model_ctx_budget(pid, payload.get("model")),
-                                            summarizer=_summarizer)
+                                            summarizer=_summarizer,
+                                            reserve=_reserve, stats=_cstats,
+                                            abort_frac=(_CTX_OVERFLOW_DROP_FRAC
+                                                        if _signal else None))
         if did:
             # A conversation that just lost turns is a conversation that just
             # lost whatever those turns were carrying -- very often the standing
@@ -8226,10 +8919,46 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                     memory.note_compaction(_sid)
             except Exception:                                    # noqa: BLE001
                 pass
+        if _cstats.get("overflow"):
+            # Serving this hop would silently drop over _CTX_OVERFLOW_DROP_FRAC
+            # of the conversation. Skip it; if no hop can hold the request the
+            # handler answers with the protocol's native context-length error.
+            _ctx_note_overflow(_budget)
+            raise _ContextOverflow(
+                "request of ~%d tokens would lose %.0f%% of its history to fit "
+                "%s/%s's %d-token window" % (_cstats.get("before") or 0,
+                                             100 * (_cstats.get("dropped_frac") or 0),
+                                             pid, payload.get("model"), _budget))
+        if did:
+            _ctx_note_hop(pid, payload.get("model"), _cstats.get("before"),
+                          _cstats.get("after"))
         fixed = _sanitize_tool_messages(compacted)
         if did or fixed is not msgs:
             payload = dict(payload)
             payload["messages"] = fixed
+        # CLAMP THE REPLY BUDGET to what is left of the window (output shares
+        # it on most providers) and to the model's learned output cap. Only
+        # against a KNOWN window: clamping against a guess would cut answers
+        # on models that have room to spare.
+        if _mt_key:
+            _new_mt = _mt
+            if _ctx_src != "default" and _budget and _new_mt:
+                _sent = _cstats.get("after") if did else _cstats.get("before")
+                if not isinstance(_sent, int):
+                    _sent = _est_tokens(payload["messages"], payload.get("tools"))
+                _room = int(_budget) - int(_sent)
+                if _new_mt > _room:
+                    _new_mt = max(256, _room)
+            if _new_mt and _new_mt != payload.get(_mt_key):
+                payload = dict(payload)
+                payload[_mt_key] = int(_new_mt)
+    # A client can ask for usage on its stream (stream_options.include_usage);
+    # that option is meaningless -- and rejected -- on a non-streaming call,
+    # which is what a sub/buffered hop of a streaming request becomes.
+    if isinstance(payload, dict) and "stream_options" in payload and (
+            not stream or pid in _NO_STREAM_OPTIONS):
+        payload = dict(payload)
+        payload.pop("stream_options", None)
     # Perplexity rejects max_tokens < 16 ("max_tokens must be at least 16"). Clamp up
     # harmlessly so a small-output request (classification, a probe) doesn't 400.
     if pid == "perplexity" and isinstance(payload, dict):
@@ -8318,6 +9047,20 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             resp = (_post_with_header_deadline(_STREAM_HEADER_WAIT,
                                                requests.post, **_post_kw)
                     if stream else requests.post(**_post_kw))
+            # A provider that rejects stream_options (the hub asks for usage on
+            # every translated stream, see _STREAM_USAGE_OPTIONS) is retried
+            # once without it and remembered, instead of losing the hop.
+            if (resp.status_code in (400, 422) and isinstance(payload, dict)
+                    and "stream_options" in payload
+                    and _STREAM_OPTIONS_ERR_RE.search(_resp_text_safe(resp))):
+                _NO_STREAM_OPTIONS.add(pid)
+                resp.close()
+                payload = dict(payload)
+                payload.pop("stream_options", None)
+                _post_kw["json"] = payload
+                resp = (_post_with_header_deadline(_STREAM_HEADER_WAIT,
+                                                   requests.post, **_post_kw)
+                        if stream else requests.post(**_post_kw))
         except requests.RequestException as exc:
             last_exc = exc
             if is_last:
@@ -8363,6 +9106,19 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             refit_done = True                 # at most one re-fit per key attempt
             refit = _refit_payload_to_learned_ctx(pid, payload)
             if refit is not None:
+                # The reported usage must scale by the TOTAL compaction this
+                # hop's payload went through, the first pass and the refit.
+                try:
+                    if refit.get("messages") is not payload.get("messages"):
+                        _prev = (_ctx_g("_ctx_hops") or {}).get(
+                            (pid, payload.get("model")), (0, 0))[0]
+                        _ctx_note_hop(pid, payload.get("model"),
+                                      _prev or _est_tokens(payload.get("messages"),
+                                                           payload.get("tools")),
+                                      _est_tokens(refit.get("messages"),
+                                                  payload.get("tools")))
+                except Exception:                                # noqa: BLE001
+                    pass
                 resp.close()
                 try:
                     resp = requests.post(
@@ -8572,7 +9328,19 @@ def _classify_soft_400(resp):
 # routing STOP sending a growing agentic context to a small-context model instead of
 # 400ing + falling through on every single turn.
 _MODEL_MAX_INPUT = {}
-_model_max_input_lock = threading.Lock()
+_model_max_input_lock = threading.RLock()
+# ...its sources, kept apart so a learned limit can EXPIRE without losing what
+# the catalog says: (pid, model) -> the catalog's own window, and -> when a
+# limit was learned from an error. A learned limit is authoritative but not
+# eternal: a transient 400 (a relay's momentary fallback backend, a provider
+# mid-migration) used to shrink a model for good.
+_MODEL_CATALOG_CTX = {}
+_MODEL_LEARNED_AT = {}
+_LEARNED_CTX_TTL = 7 * 86400
+# OUTPUT-token ceilings learned from errors ("max_tokens must be <= 8192"),
+# kept apart from the INPUT windows above: learning an output cap as the input
+# window over-compacts every later conversation on that model.
+_MODEL_MAX_OUTPUT = {}
 # Priority-ordered: match the phrasing that names the LIMIT, never the request size.
 # 'Max_len exceeded: Input is 16685 tokens but this model only supports 16384' must
 # learn 16384 (the cap), NOT 16685 (the input) — so 'only supports N' wins first and
@@ -8587,31 +9355,58 @@ _CTX_LIMIT_PATS = (
     # Anchored on 'limit is' so it takes the CAP (8192), never the length (23633).
     re.compile(r"limit is (\d{3,7})", re.I),
     re.compile(r"context (?:window|length)[^0-9]{0,20}?(\d{4,7})", re.I),
-    re.compile(r"maximum(?: context)?(?: length| window)?[^0-9]{0,20}?(\d{4,7})", re.I),
 )
+# The catch-all, last and separately named: it also matches an OUTPUT cap
+# ("max_tokens ... exceeds the maximum allowed 8192"), so _learn_context_limit
+# skips it whenever the error has been recognised as one.
+_CTX_GENERIC_MAX_PAT = re.compile(
+    r"maximum(?: context)?(?: length| window)?[^0-9]{0,20}?(\d{4,7})", re.I)
+_CTX_LIMIT_PATS = _CTX_LIMIT_PATS + (_CTX_GENERIC_MAX_PAT,)
 
 
 def _learn_context_limit(pid, model, resp):
-    """Remember a model's real max input when a 400 reveals it. Best-effort, no raise."""
+    """Remember a model's real max input when a 400 reveals it. Best-effort, no raise.
+
+    An OUTPUT cap is recognised first and filed separately (_MODEL_MAX_OUTPUT):
+    "max_tokens must be less than or equal to 8192" names the REPLY ceiling,
+    and the generic `maximum ... N` pattern below would otherwise learn 8192 as
+    the model's input window and over-compact every later request to it."""
     if not model:
         return
     try:
         text = resp.text or ""
     except Exception:
         return
+    out_cap = ctxwin.output_cap_from_error(text)
+    if out_cap:
+        with _model_max_input_lock:
+            cur = _MODEL_MAX_OUTPUT.get((pid, model))
+            _MODEL_MAX_OUTPUT[(pid, model)] = min(cur, out_cap) if cur else out_cap
     if not _SOFT_400_CONTEXT_RE.search(text):
         return
     limit = None
     for pat in _CTX_LIMIT_PATS:
+        if out_cap and pat is _CTX_GENERIC_MAX_PAT:
+            continue                 # that is exactly the pattern that grabs the output cap
         m = pat.search(text)
         if m:
-            limit = int(m.group(1))
+            v = int(m.group(1))
+            if out_cap and v == out_cap:
+                continue             # the same number the output-cap parse claimed
+            limit = v
             break
     if not limit or limit < 1000:
         return
+    _set_learned_ctx(pid, model, limit)
+
+
+def _set_learned_ctx(pid, model, limit):
+    """File a window learned from a real rejection: smaller wins, stamped so it
+    expires after _LEARNED_CTX_TTL."""
     with _model_max_input_lock:
-        cur = _MODEL_MAX_INPUT.get((pid, model))
+        cur = _ctx_limit(pid, model)
         _MODEL_MAX_INPUT[(pid, model)] = min(cur, limit) if cur else limit
+        _MODEL_LEARNED_AT[(pid, model)] = time.time()
 
 
 # A per-MINUTE token cap phrased as a size rejection: groq free is
@@ -8639,9 +9434,7 @@ def _learn_tpm_limit(pid, model, resp):
     limit = int(m.group(1))
     if limit < 1000:
         return
-    with _model_max_input_lock:
-        cur = _MODEL_MAX_INPUT.get((pid, model))
-        _MODEL_MAX_INPUT[(pid, model)] = min(cur, limit) if cur else limit
+    _set_learned_ctx(pid, model, limit)
 
 
 def _sustain_penalty(pid):
@@ -8912,7 +9705,7 @@ def _context_ok(pid, model, est):
     (5% headroom for estimate error). True when unknown — never blocks on a guess."""
     if not est:
         return True
-    lim = _MODEL_MAX_INPUT.get((pid, model))
+    lim = _ctx_limit(pid, model)
     return lim is None or est <= lim * 0.95
 
 
@@ -13655,6 +14448,32 @@ def _mode_allows(mode, pid, model, session_overrides=None):
         return model_categories.matches(mode, pid, model, ident)
     except Exception:                                            # noqa: BLE001
         return True
+
+
+def _mode_first_size_split(fits, compactable, floor):
+    """(fits, compactable) with the MODE applied BEFORE the size re-admission.
+
+    `fits` are candidates whose window holds the request, `compactable` the
+    ones that would need compaction. With a category mode in force, the
+    category's compactable models are re-admitted when nothing IN the category
+    that fits clears `floor` -- judged against the category, not against the
+    whole fleet. Returns the lists untouched when no mode is set or the
+    category has no model at all (the usual fail-open then applies)."""
+    try:
+        mode = _valid_mode(_active_mode())
+        if not mode or mode == MODE_ALL or not compactable:
+            return fits, compactable
+        in_fit = [c for c in fits if _mode_allows(mode, c[1], c[2])]
+        in_cmp = [c for c in compactable if _mode_allows(mode, c[1], c[2])]
+    except Exception:                                            # noqa: BLE001
+        return fits, compactable
+    if not in_cmp or (not in_fit and not in_cmp):
+        return fits, compactable
+    if not any(c[0] >= floor for c in in_fit):
+        fits = list(fits) + in_cmp
+        taken = set(in_cmp)
+        compactable = [c for c in compactable if c not in taken]
+    return fits, compactable
 
 
 def _apply_mode(cands, mode=None, key=lambda c: (c[1], c[2])):
@@ -20011,6 +20830,8 @@ def _classify_hop_error(exc=None, status=None, peek=None):
     if exc is not None:
         if isinstance(exc, _HopBudgetExceeded):
             return "deadline"      # the hub stopped waiting -- not a provider timeout
+        if isinstance(exc, _ContextOverflow):
+            return "context"       # skipped: this window would drop too much history
         if isinstance(exc, requests.Timeout):
             return "timeout"
         if isinstance(exc, requests.RequestException):
@@ -22197,6 +23018,12 @@ def _chat_completions_uncached(body):
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
         body.get("messages"), body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)))
+    # Context bookkeeping for this request (original size, conversation id).
+    # The native overflow error is an OpenAI-client contract, so it is only
+    # armed on the real /v1/chat/completions route -- not on the foreign
+    # surfaces (Gemini, Ollama, /v1/completions) that reuse this router.
+    _ctx_begin(body, body.get("messages"), est,
+               signal=_request_path_endswith("/v1/chat/completions"))
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                           prefer=chain_prefer,
                                            require_tools=has_tools,
@@ -22348,6 +23175,10 @@ def _chat_completions_uncached(body):
                 # the zero-copy byte passthrough exactly as it was.
                 if has_tools:
                     relay = _repair_tool_sse(relay)
+                # Usage frames report the ORIGINAL request size (see
+                # _reported_prompt_tokens); one is added when the client asked
+                # for usage and the upstream sent none.
+                relay = _ctx_usage_sse(relay, body, est, hop_pid, hop_model)
                 return Response(stream_with_context(relay),
                                 mimetype="text/event-stream",
                                 headers=dict(_SSE_HEADERS, **_routing_headers(
@@ -22391,6 +23222,7 @@ def _chat_completions_uncached(body):
                         gate2 = _answer_gate(data2, payload, has_tools)
                     if gate2 != "junk":
                         _record_chat_usage(hop_pid, hop_model, data2, est, ok=gate2 == "ok")
+                        _ctx_fix_chat_usage(data2, est, hop_pid, hop_model)
                         data2["model"] = hop_pid + "/" + hop_model
                         return (jsonify(data2), 200,
                                 _routing_headers(hop_pid, hop_model, attempts, last_error))
@@ -22410,6 +23242,9 @@ def _chat_completions_uncached(body):
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
+            # The CLIENT sees the size of the request it sent, not of the
+            # compacted one (usage_history above keeps the real upstream count).
+            _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
             if isinstance(data, dict):
                 data["model"] = hop_pid + "/" + hop_model
                 # An answer cut off at the provider's OWN default budget is a
@@ -22457,6 +23292,10 @@ def _chat_completions_uncached(body):
                 # Scoped to THIS model; two distinct models failing within
                 # _HOP_ESCALATE_WINDOW escalate to the whole provider.
                 _throttle_failed_hop(hop_pid, hop_model)
+            if resp.status_code in (400, 413):
+                # A context-length rejection counts towards the native
+                # overflow signal (see _ctx_overflow_reply).
+                _ctx_note_overflow_resp(resp, hop_pid, hop_model)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
@@ -22484,6 +23323,13 @@ def _chat_completions_uncached(body):
         return _with_headers(_openai_error(_deadline_error_text(_clock, errors), 504,
                                            "timeout_error"),
                              _routing_headers(last_hop[0], last_hop[1], attempts, "deadline"))
+    # CONTEXT OVERFLOW. Every hop that could have served this either refused it
+    # as too long or would have had to drop most of the history: tell the CLI
+    # in its own protocol's words, so it compacts its OWN history instead of
+    # retrying the same oversized turn into another 503.
+    _ov = _ctx_overflow_reply("openai")
+    if _ov is not None:
+        return _ov
     # Chain exhausted. Tell the client HOW LONG until a model frees (Retry-After) so
     # its SDK waits out a short throttle and auto-continues once capacity returns.
     eta = _capacity_eta()
@@ -22874,11 +23720,18 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                                    last_prompt=last_prompt)
         yield from _finalize_open_items()
 
-        final_usage = None
-        if usage is not None:
-            pt = int(usage.get("prompt_tokens") or 0)
-            ct = int(usage.get("completion_tokens") or 0)
-            final_usage = {"input_tokens": pt, "output_tokens": ct, "total_tokens": pt + ct}
+        # ALWAYS report usage, sized on the ORIGINAL request (see
+        # _reported_prompt_tokens): Codex's auto-compaction keys on it, and a
+        # stream with no usage -- most free upstreams, before the hub asked for
+        # include_usage -- left Codex blind to its own context filling up.
+        _u = usage if isinstance(usage, dict) else {}
+        pt = _reported_prompt_tokens(_u.get("prompt_tokens"), prompt_est, hop_pid, hop_model)
+        ct = _u.get("completion_tokens")
+        if ct is None:
+            ct = (len("".join(text_buf)) + sum(
+                len("".join(st.get("args") or [])) for st in tools.values())) // 4
+        ct = int(ct or 0)
+        final_usage = {"input_tokens": pt, "output_tokens": ct, "total_tokens": pt + ct}
         final_output = [it for _i, it in sorted(done_items, key=lambda t: t[0])]
         if cut_short[0]:
             final = _obj("incomplete", final_output, final_usage)
@@ -23008,6 +23861,11 @@ def v1_responses(_retry_pass=False):
             base_payload["tool_choice"] = body["tool_choice"]
 
     stream = bool(body.get("stream"))
+    if stream:
+        # Ask the upstream for usage: without it Codex saw none and its own
+        # auto-compaction never fired (see _STREAM_USAGE_OPTIONS).
+        base_payload["stream_options"] = dict(_STREAM_USAGE_OPTIONS)
+    _ctx_begin(body, messages, est)
     errors = _HopErrors()
     last_hard = None  # last hard (non-retryable) upstream error, relayed if chain is exhausted
     last_error = None  # class of the LAST failed hop (transparency header)
@@ -23192,6 +24050,7 @@ def v1_responses(_retry_pass=False):
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
+            _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
             return jsonify(_chat_to_responses(data, model_label)), 200
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
@@ -23222,6 +24081,10 @@ def v1_responses(_retry_pass=False):
                     _err_bodies[_ekey] = _sanitize(resp.text)[:200]
                 except Exception:
                     _err_bodies[_ekey] = "?"
+            if resp.status_code in (400, 413):
+                # A context-length rejection counts towards the native
+                # overflow signal (see _ctx_overflow_reply).
+                _ctx_note_overflow_resp(resp, hop_pid, hop_model)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
@@ -23263,6 +24126,14 @@ def v1_responses(_retry_pass=False):
         return _with_headers(_openai_error(_deadline_error_text(_clock, errors), 504,
                                            "timeout_error"),
                              {"X-Free-LLM-Hub-Last-Error": "deadline"})
+    # CONTEXT OVERFLOW, in Codex's own terms: a streamed response.failed with
+    # code context_length_exceeded is what makes Codex mark its window full
+    # and auto-compact (a bare 400 only prints an error). Before the storm
+    # retry -- retrying the same oversized turn cannot help.
+    _ov = _ctx_overflow_reply("responses", stream=stream,
+                              model_label=(body.get("model") or "auto"))
+    if _ov is not None:
+        return _ov
     if (not last_hard and errors and not _retry_pass
             and all(_TRANSIENT_ERR_RE.search(e or "") for e in errors)):
         _log.info("[chain] all %d hops transient (429/5xx) — backing off %.1fs and retrying",
@@ -23442,18 +24313,68 @@ def _map_stop_reason(finish_reason):
 
 
 def _estimate_input_tokens(body):
-    total = 0
-    images = 0
-    system = body.get("system")
-    if system:
-        total += len(_blocks_to_text(system))
+    """Input tokens of an Anthropic request, as Claude Code would be billed:
+    system, every text block, tool_use inputs, tool_result contents, the TOOL
+    SCHEMAS (Claude Code ships ~15-20K tokens of them -- leaving them out made
+    every count low by exactly the part that never changes), images sized from
+    their own bytes, and non-Latin text at its real density. No routing margin:
+    this number is read by the client."""
+    chars = 0
+    extra = 0.0
+
+    def _text(t):
+        nonlocal chars, extra
+        if isinstance(t, str) and t:
+            chars += len(t)
+            extra += ctxwin.nonlatin_extra_tokens(t)
+
+    def _blocks(content):
+        nonlocal extra
+        if isinstance(content, str):
+            _text(content)
+            return
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if isinstance(block, str):
+                _text(block)
+                continue
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                _text(block.get("text"))
+            elif btype == "tool_result":
+                _blocks(block.get("content"))
+            elif btype == "tool_use":
+                _text(str(block.get("name") or ""))
+                try:
+                    _text(json.dumps(block.get("input") or {}, ensure_ascii=False))
+                except (TypeError, ValueError):
+                    pass
+            elif btype == "image":
+                src = block.get("source") if isinstance(block.get("source"), dict) else {}
+                extra += ctxwin.image_tokens(
+                    url=src.get("url"),
+                    b64=src.get("data") if src.get("type") == "base64" else None)
+            elif btype == "document":
+                src = block.get("source") if isinstance(block.get("source"), dict) else {}
+                if src.get("type") == "text":
+                    _text(src.get("data"))
+                else:
+                    extra += ctxwin.IMAGE_TOKENS_DEFAULT
+
+    _blocks(body.get("system"))
     for msg in body.get("messages") or []:
-        total += len(_blocks_to_text(msg.get("content")))
-        content = msg.get("content")
-        if isinstance(content, list):
-            images += sum(1 for block in content
-                          if isinstance(block, dict) and block.get("type") == "image")
-    return max(1, total // 4 + images * 1000)
+        if isinstance(msg, dict):
+            _blocks(msg.get("content"))
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        try:
+            chars += len(json.dumps(tools, ensure_ascii=False))
+        except (TypeError, ValueError):
+            pass
+    return max(1, chars // 4 + int(extra))
 
 
 def _openai_resp_to_anthropic(data, model_str):
@@ -23497,6 +24418,18 @@ def _openai_resp_to_anthropic(data, model_str):
 
 def _sse_event(name, obj):
     return ("event: %s\ndata: %s\n\n" % (name, json.dumps(obj, ensure_ascii=False))).encode("utf-8")
+
+
+def _anthropic_final_usage(real_in, input_est, pid, model, out_tokens):
+    """The closing message_delta's usage: output tokens, plus input tokens
+    sized on the ORIGINAL request (the upstream count scaled back up by the
+    hop's compaction, or the estimate when upstream reported none)."""
+    u = {"output_tokens": int(out_tokens or 0)}
+    try:
+        u["input_tokens"] = _reported_prompt_tokens(real_in, input_est, pid, model)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return u
 
 
 def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISSING,
@@ -23650,7 +24583,8 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
         yield _sse_event("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": _map_stop_reason(finish_reason), "stop_sequence": None},
-            "usage": {"output_tokens": int(out_tokens)}})
+            "usage": _anthropic_final_usage(real_in_tokens, input_tokens, hop_pid,
+                                            hop_model, out_tokens)})
         yield _sse_event("message_stop", {"type": "message_stop"})
     except Exception as exc:
         # A mid-stream upstream failure (connection reset, ChunkedEncodingError,
@@ -23675,7 +24609,8 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
                 "type": "message_delta",
                 "delta": {"stop_reason": _map_stop_reason(finish_reason),
                           "stop_sequence": None},
-                "usage": {"output_tokens": int(out_tokens)}})
+                "usage": _anthropic_final_usage(real_in_tokens, input_tokens, hop_pid,
+                                                hop_model, out_tokens)})
             yield _sse_event("message_stop", {"type": "message_stop"})
         except Exception:
             pass    # client socket already gone / state not yet bound
@@ -23793,7 +24728,13 @@ def v1_messages():
 
     stream = bool(body.get("stream"))
     requested_model = body.get("model") if isinstance(body.get("model"), str) else None
+    # The ORIGINAL request's size, tools and tool_use/tool_result blocks
+    # included -- what Claude Code is told it sent (message_start, and the
+    # final message_delta), whatever the hop was actually given.
     input_est = _estimate_input_tokens(body)
+    if stream:
+        base_payload["stream_options"] = dict(_STREAM_USAGE_OPTIONS)
+    _ctx_begin(body, oai_messages, input_est)
 
     errors = _HopErrors()
     attempts = 0          # upstream hops actually tried (transparency header)
@@ -23926,6 +24867,7 @@ def v1_messages():
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
+            _ctx_fix_chat_usage(data, input_est, hop_pid, hop_model)
             return jsonify(_openai_resp_to_anthropic(data, model_str)), 200, \
                 _routing_headers(hop_pid, hop_model, attempts, last_error)
         # Non-2xx. Retryable (429/5xx) AND hard errors (404/400/model-not-found)
@@ -23956,6 +24898,10 @@ def v1_messages():
                 # a cooldown here, so a genuinely down hop was retried on every
                 # request. MEASURED 2026-08-05: g4f-nvidia/mistral-medium-3.5.
                 _throttle_failed_hop(hop_pid, hop_model)
+            if resp.status_code in (400, 413):
+                # A context-length rejection counts towards the native
+                # overflow signal (see _ctx_overflow_reply).
+                _ctx_note_overflow_resp(resp, hop_pid, hop_model)
             if resp.status_code == 400 and _classify_soft_400(resp):
                 resp.close()
                 continue
@@ -23976,6 +24922,11 @@ def v1_messages():
         return _with_headers(_anthropic_error("api_error",
                                               _deadline_error_text(_clock, errors), 504),
                              _routing_headers(last_hop[0], last_hop[1], attempts, "deadline"))
+    # CONTEXT OVERFLOW, in Anthropic's words: "prompt is too long" is what
+    # Claude Code's reactive compaction keys on.
+    _ov = _ctx_overflow_reply("anthropic")
+    if _ov is not None:
+        return _ov
     # Chain exhausted -> Retry-After so the client waits out a short throttle + auto-continues.
     eta = _capacity_eta()
     try:  # DIAG (temporary): record WHY the messages chain exhausted (Claude Code's 503).
@@ -23997,7 +24948,9 @@ def v1_messages():
 
 @app.route("/v1/messages/count_tokens", methods=["POST"])
 def v1_count_tokens():
-    """Rough estimate (chars/4) so Anthropic clients that pre-count don't 404."""
+    """Estimate (see _estimate_input_tokens: tools, tool_use/tool_result, images
+    and non-Latin text included) so Anthropic clients that pre-count don't 404
+    -- and so the count Claude Code compacts on matches what it sends."""
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return _anthropic_error("invalid_request_error", "Invalid JSON body.", 400)
