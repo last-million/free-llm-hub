@@ -164,9 +164,15 @@ _DYNAMIC_TTL = 3600.0   # a reading older than this is ignored (window likely ro
 # Rate-limit header conventions, widest-support first. "-requests" variants are the
 # request buckets (not token buckets) most free providers expose; the bare names
 # cover OpenRouter/OpenAI-style; the un-prefixed names cover the IETF draft.
-_RL_REMAINING = ("x-ratelimit-remaining-requests", "x-ratelimit-remaining", "ratelimit-remaining")
-_RL_LIMIT     = ("x-ratelimit-limit-requests", "x-ratelimit-limit", "ratelimit-limit")
-_RL_RESET     = ("x-ratelimit-reset-requests", "x-ratelimit-reset", "ratelimit-reset", "retry-after")
+# The trailing "-day" names are Cerebras' (https://inference-docs.cerebras.ai/support/
+# rate-limits: x-ratelimit-{limit,remaining,reset}-requests-day, per MODEL); last so
+# they never shadow a provider that also sends the plain names.
+_RL_REMAINING = ("x-ratelimit-remaining-requests", "x-ratelimit-remaining", "ratelimit-remaining",
+                 "x-ratelimit-remaining-requests-day")
+_RL_LIMIT     = ("x-ratelimit-limit-requests", "x-ratelimit-limit", "ratelimit-limit",
+                 "x-ratelimit-limit-requests-day")
+_RL_RESET     = ("x-ratelimit-reset-requests", "x-ratelimit-reset", "ratelimit-reset",
+                 "x-ratelimit-reset-requests-day", "retry-after")
 
 # TOKEN buckets. A provider can have plenty of REQUESTS left and still refuse every
 # call because its token budget is spent — g4f.space does exactly this:
@@ -177,9 +183,31 @@ _RL_RESET     = ("x-ratelimit-reset-requests", "x-ratelimit-reset", "ratelimit-r
 # hub un-sidelined it after the ~60s throttle and re-picked it every single request
 # for the next 22 hours, burning a chain hop on a guaranteed 429 each time. Note the
 # remaining count goes NEGATIVE, so this must test `<= 0`, never `== 0`.
-_RL_REMAINING_TOK = ("x-ratelimit-remaining-tokens",)
-_RL_LIMIT_TOK     = ("x-ratelimit-limit-tokens",)
-_RL_RESET_TOK     = ("x-ratelimit-reset-tokens",)
+_RL_REMAINING_TOK = ("x-ratelimit-remaining-tokens", "x-ratelimit-remaining-tokens-minute")
+_RL_LIMIT_TOK     = ("x-ratelimit-limit-tokens", "x-ratelimit-limit-tokens-minute")
+_RL_RESET_TOK     = ("x-ratelimit-reset-tokens", "x-ratelimit-reset-tokens-minute")
+
+# Providers whose rate-limit headers describe the MODEL that answered, not the
+# account. For these a header reading is stored per (provider, model) ONLY — written
+# provider-wide, one model's spent daily bucket read as the whole provider being
+# spent, and is_exhausted() then pulled every sibling model (each with its own full
+# budget) out of routing. One documented source per row:
+#   groq      https://console.groq.com/docs/rate-limits — "Rate limits apply at the
+#             organization level" per MODEL (the RPD/TPM table is per model id), and
+#             the x-ratelimit-* headers report the limits of the model called.
+#   cerebras  https://inference-docs.cerebras.ai/support/rate-limits — the quota
+#             table is per model and the *-requests-day / *-tokens-minute headers
+#             are that model's buckets.
+# OpenRouter is deliberately absent: its free allowance is ONE account-wide daily
+# pool across every ':free' id, so its headers really are provider-wide.
+PER_MODEL_HEADER_PROVIDERS = {"groq", "cerebras"}
+
+# pid -> {model: {key_fingerprint or "": {"remaining", "limit", "reset_at", "seen"}}}
+# Per-(provider, model) quota learned from the headers of PER_MODEL_HEADER_PROVIDERS.
+# Keyed per key too, for the same reason _DYNAMIC is: each key is its own account,
+# so one key's spent model is not the pool's spent model. Nested dicts with string
+# keys so it round-trips through JSON unchanged.
+_MODEL_DYNAMIC: dict = {}
 
 # Consecutive-429 backoff. Fixes "provider quota is spent but the hub keeps calling
 # it every 60s": each recurring 429 within _STRIKE_TTL of the last DOUBLES the short
@@ -260,7 +288,38 @@ def _limit_for(pid: str) -> dict:
 # DST, so a UTC assumption either keeps hammering a still-exhausted key for hours or
 # writes the provider off long after it recovered. Named zones (not fixed offsets)
 # so DST is handled for us. Everything absent from this map stays UTC.
-DAY_RESET_TZ = {"google": "America/Los_Angeles"}
+#
+# RESET_RULES is the single documented table; DAY_RESET_TZ / DAY_RESET_ROLLING are
+# derived from it (kept as names because tests and callers patch them). ONE source
+# per row — a provider with no documented reset rule is deliberately absent and
+# keeps the conservative UTC-midnight default.
+#   ("tz", zone)      day resets at local midnight in `zone`
+#   ("rolling", None) no fixed reset: a rolling 24 h window. Tracked as a 24 h
+#                     window ANCHORED at the first request counted in it (see
+#                     _window_bounds) — the earliest moment a real rolling window
+#                     frees its first slot, so it never claims budget back early.
+RESET_RULES = {
+    # https://ai.google.dev/gemini-api/docs/rate-limits — "Requests per day (RPD)
+    # quotas reset at midnight Pacific time".
+    "google": ("tz", "America/Los_Angeles"),
+    # https://console.groq.com/docs/rate-limits — limits are token BUCKETS that
+    # replenish continuously; the doc's own example answers x-ratelimit-limit-
+    # requests: 14400 with x-ratelimit-reset-requests: 2m59.56s, i.e. the daily
+    # request budget refills minutes after use, never "at midnight".
+    "groq": ("rolling", None),
+}
+DAY_RESET_TZ = {p: v for p, (k, v) in RESET_RULES.items() if k == "tz"}
+DAY_RESET_ROLLING = {p for p, (k, _v) in RESET_RULES.items() if k == "rolling"}
+
+
+def reset_kind(pid: str) -> str:
+    """How pid's DAY window resets, for display: 'rolling-24h', 'tz:<zone>' or
+    'utc-midnight' (the conservative default)."""
+    if pid in DAY_RESET_ROLLING:
+        return "rolling-24h"
+    if pid in DAY_RESET_TZ:
+        return "tz:" + DAY_RESET_TZ[pid]
+    return "utc-midnight"
 
 
 def _day_bounds_tz(zone: str, now: float):
@@ -287,6 +346,19 @@ def _window_bounds(window: str, now: float, pid: str = None):
     if window == "minute":
         start = now - (now % 60)
         return start, start + 60
+    if window == "day" and pid in DAY_RESET_ROLLING:
+        # Anchor = the window_start the provider's counter already carries (set by
+        # record()/mark_throttled() when they open a window). No fresh anchor ->
+        # a window opening NOW, so a mutator stores `now` as the new anchor and a
+        # reader sees a window nothing has been counted in yet (used 0). A state
+        # file written under the old UTC rule migrates for free: its UTC-midnight
+        # window_start is simply read as the anchor, ending at the next midnight.
+        with _LOCK:
+            st = _STATE.get(pid)
+            anchor = st.get("window_start") if isinstance(st, dict) else None
+        if isinstance(anchor, (int, float)) and anchor <= now < anchor + 86400:
+            return anchor, anchor + 86400
+        return now, now + 86400
     if window == "day" and pid in DAY_RESET_TZ:
         bounds = _day_bounds_tz(DAY_RESET_TZ[pid], now)
         if bounds:
@@ -526,11 +598,15 @@ def _parse_reset(v, now):
     return now + n                                     # seconds-from-now
 
 
-def observe_headers(pid: str, headers, key=None) -> None:
+def observe_headers(pid: str, headers, key=None, model=None) -> None:
     """Learn a provider's REAL request quota from its rate-limit response headers,
     so the hub adapts to any quota change (raised by a top-up, or lowered) with no
     probe waste. Best-effort: no usable 'remaining' header -> no-op (static budget
-    stays in force). Never raises."""
+    stays in force). Never raises.
+
+    `model`: the id that answered. For PER_MODEL_HEADER_PROVIDERS the request
+    reading is stored against that model only (see _MODEL_DYNAMIC); without a
+    model id it falls back to the provider-wide slot as before."""
     if not headers:
         return
     now = time.time()
@@ -580,9 +656,17 @@ def observe_headers(pid: str, headers, key=None) -> None:
     # reason: this dict is written to JSON, whose object keys must be strings. A
     # pid never contains "|".
     slot = (pid + "|" + key_fingerprint(key)) if key else pid
+    per_model = (pid in PER_MODEL_HEADER_PROVIDERS
+                 and isinstance(model, str) and bool(model))
+    reading = {"remaining": max(0, rem), "limit": lim,
+               "reset_at": reset_at, "seen": now}
     with _LOCK:
-        _DYNAMIC[slot] = {"remaining": max(0, rem), "limit": lim,
-                          "reset_at": reset_at, "seen": now}
+        if per_model:
+            # The model's bucket, not the provider's: its siblings keep serving.
+            fp = key_fingerprint(key) if key else ""
+            _MODEL_DYNAMIC.setdefault(pid, {}).setdefault(model, {})[fp or ""] = reading
+        else:
+            _DYNAMIC[slot] = reading
         # THE TOKEN BUCKET, KEPT AS ITSELF.
         #
         # Above, a spent token bucket is folded into the REQUEST count, because
@@ -715,20 +799,96 @@ def is_model_throttled(pid: str, model: str) -> bool:
     return bool(mt and mt.get("throttled_until", 0) > time.time())
 
 
+def _model_dynamic(pid: str, model: str, now: float):
+    """Fresh header reading for ONE (provider, model), summed across keys, or None.
+
+    Same pool rule as _dynamic: a model is spent only when every key we heard
+    from reads zero AND we have heard from as many keys as the pool holds — a key
+    never heard from is assumed to still have budget (fail open). A keyless
+    reading (fingerprint "") stands for the whole pool."""
+    with _LOCK:
+        per_key = dict((_MODEL_DYNAMIC.get(pid) or {}).get(model) or {})
+    fresh = {fp: d for fp, d in per_key.items() if _fresh(d, now)}
+    if not fresh:
+        return None
+    remaining = sum(int(d.get("remaining") or 0) for d in fresh.values())
+    if remaining <= 0 and "" not in fresh and len(fresh) < key_count(pid):
+        remaining = 1                           # unheard-from keys are not spent
+    limits = [d["limit"] for d in fresh.values() if isinstance(d.get("limit"), int)]
+    resets = [d["reset_at"] for d in fresh.values() if d.get("reset_at")]
+    return {"remaining": remaining,
+            "limit": sum(limits) if len(limits) == len(fresh) else None,
+            "reset_at": min(resets) if resets else None}
+
+
 def model_status(pid: str, model: str) -> dict:
-    """Per-model view: {used, limit, remaining, limit_known, throttled, exhausted}.
-    `limit` is the PER_MODEL_LIMITS sub-cap (None if the provider has none — then the
-    model shares the provider budget and only a real 429 sidelines it). `exhausted`
-    is per-model only (sub-cap hit OR per-model 429 cooldown); it does NOT fold in
-    provider-level exhaustion — use is_model_exhausted() for the full picture."""
+    """Per-model view: {used, limit, remaining, limit_known, throttled, exhausted,
+    resets_at, source}.
+
+    Two per-model budgets feed it: the documented PER_MODEL_LIMITS sub-cap, and
+    the model's own rate-limit headers (PER_MODEL_HEADER_PROVIDERS). A fresh
+    header reading wins over the sub-cap — it is the provider's own figure.
+    `limit` stays None when neither exists (the model shares the provider budget
+    and only a real 429 sidelines it). `exhausted` is per-model only (budget spent
+    OR per-model 429 cooldown); it does NOT fold in provider-level exhaustion —
+    use is_model_exhausted() for the full picture. `resets_at` is the epoch the
+    model is usable again when exhausted, else None."""
+    now = time.time()
     per = PER_MODEL_LIMITS.get(pid)
     used = models(pid).get(model, 0)
-    limit_known = isinstance(per, int)
+    limit, limit_known, source = per, isinstance(per, int), None
     remaining = max(0, per - used) if limit_known else None
-    throttled = is_model_throttled(pid, model)
-    exhausted = throttled or bool(limit_known and remaining <= 0)
-    return {"used": used, "limit": per, "limit_known": limit_known,
-            "remaining": remaining, "throttled": throttled, "exhausted": exhausted}
+    reset = None
+    if limit_known:
+        source = "documented"
+        reset = _window_bounds(_limit_for(pid)["window"], now, pid)[1]
+    dyn = _model_dynamic(pid, model, now)
+    if dyn is not None:
+        remaining, source = dyn["remaining"], "headers"
+        limit_known = True
+        if isinstance(dyn.get("limit"), int):
+            limit = dyn["limit"]
+        if dyn.get("reset_at"):
+            reset = dyn["reset_at"]
+    with _LOCK:
+        mt = _MODEL_THROTTLE.get((pid, model))
+    throttled_until = mt.get("throttled_until", 0) if mt else 0
+    throttled = throttled_until > now
+    spent = bool(limit_known and remaining is not None and remaining <= 0)
+    exhausted = throttled or spent
+    resets_at = None
+    if exhausted:
+        cands = [t for t in ((reset if spent else None),
+                             (throttled_until if throttled else None)) if t]
+        resets_at = int(max(cands)) if cands else None
+    return {"used": used, "limit": limit, "limit_known": limit_known,
+            "remaining": remaining, "throttled": throttled, "exhausted": exhausted,
+            "resets_at": resets_at, "source": source}
+
+
+def exhausted_models(pid: str) -> dict:
+    """{model_id: resets_at} for every model of pid that is individually spent
+    (sub-cap, header-reported, or its own 429 cooldown). Only models the hub has
+    actually touched can be listed — a model never called has no evidence
+    against it. Never raises."""
+    try:
+        with _LOCK:
+            cands = set((_MODEL_DYNAMIC.get(pid) or {}).keys())
+            # Only LIVE sideline rows: expired ones pile up in memory between
+            # restarts, and status() (a hot path) calls this for every provider.
+            now = time.time()
+            cands.update(m for (p, m), mt in _MODEL_THROTTLE.items()
+                         if p == pid and mt.get("throttled_until", 0) > now)
+        if pid in PER_MODEL_LIMITS:
+            cands.update(models(pid).keys())
+        out = {}
+        for m in cands:
+            ms = model_status(pid, m)
+            if ms["exhausted"]:
+                out[m] = ms["resets_at"]
+        return out
+    except Exception:                                            # noqa: BLE001
+        return {}
 
 
 def is_model_exhausted(pid: str, model: str) -> bool:
@@ -867,6 +1027,15 @@ def status(pid: str) -> dict:
         "remaining": remaining,
         "window": lim["window"], "resets_in": max(0, int(reset_at - now)),
         "resets_at": int(reset_at), "throttled": throttled, "exhausted": exhausted,
+        # A documented zero (FREE_LIMITS limit 0: morph, kimi, ...) is exhausted BY
+        # DESIGN — named so the dashboard can say "no free tier" instead of implying
+        # a budget that ran out and will come back at `resets_at`. Read from the
+        # researched table, not the key-scaled one: zero times any keys is zero.
+        "no_free_tier": FREE_LIMITS.get(pid, DEFAULT_LIMIT).get("limit") == 0,
+        # How many of this provider's models are individually spent while the
+        # provider itself may still serve the rest (per-model routing skips them).
+        "models_exhausted": len(exhausted_models(pid)),
+        "reset_kind": reset_kind(pid),
     }
     # The token allowance, only when the provider itself reported one. Most free
     # tiers meter tokens and publish nothing, so `tokens_known` false is the
@@ -941,6 +1110,9 @@ def save_state() -> None:
                                    for (pid, m), mt in _MODEL_THROTTLE.items()},
                 "dynamic": _DYNAMIC,
                 "tokens": _TOKENS,
+                # Added 2026-09: per-(provider, model) header readings. An older
+                # hub ignores the unknown key; a file without it loads empty.
+                "model_dynamic": _MODEL_DYNAMIC,
             }
         if _extra_dump is not None:
             try:
@@ -1027,6 +1199,21 @@ def _load_state(path: str) -> None:
                     _TOKENS[slot] = d
             for slot in [k for k, v in list(_TOKENS.items()) if _fresh(v, now) is None]:
                 _TOKENS.pop(slot, None)
+        model_dynamic = blob.get("model_dynamic")
+        if isinstance(model_dynamic, dict):
+            for pid, per_model in model_dynamic.items():
+                if not (isinstance(pid, str) and isinstance(per_model, dict)):
+                    continue
+                for model, per_key in per_model.items():
+                    if not (isinstance(model, str) and isinstance(per_key, dict)):
+                        continue
+                    # Same freshness gate as "dynamic": a stale or rolled-over
+                    # reading is dropped, never revived after a restart.
+                    live = {fp: d for fp, d in per_key.items()
+                            if isinstance(fp, str) and isinstance(d, dict)
+                            and _fresh(d, now)}
+                    if live:
+                        _MODEL_DYNAMIC.setdefault(pid, {})[model] = live
         dynamic = blob.get("dynamic")
         if isinstance(dynamic, dict):
             for pid, d in dynamic.items():
