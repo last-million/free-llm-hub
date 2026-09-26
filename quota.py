@@ -816,12 +816,21 @@ def _dynamic(pid: str, now: float):
             "seen": max(d.get("seen", 0) for d in per)}
 
 
-def mark_model_throttled(pid: str, model: str, seconds: float = 60) -> None:
+def mark_model_throttled(pid: str, model: str, seconds: float = 60,
+                         until: float = None, cap: float = None) -> None:
     """A SINGLE model returned 429 — sideline just this id (its siblings on the same
     provider keep serving). Consecutive-429 backoff mirrors the provider path: a 429
     recurring within _STRIKE_TTL doubles the cooldown (capped at _MAX_BACKOFF, never
     past the window reset), so an individually-spent model is retried exponentially
-    less often instead of every 60s. No-op without a model id."""
+    less often instead of every 60s. No-op without a model id.
+
+    `until`: an absolute epoch the provider itself named for THIS model's quota
+    (classify_429 — e.g. Google's per-model RPD, which resets at midnight
+    Pacific). Honoured as-is (capped at _RETRY_AFTER_CAP): the 1h backoff cap and
+    the provider-wide window below exist for GUESSES, and would otherwise hand a
+    model whose day budget is spent back to routing 24 times before it resets.
+    `cap`: a lower ceiling than _MAX_BACKOFF for the doubling — a PER-MINUTE 429
+    passes a few minutes here so no streak of bursts can bench it for an hour."""
     if not (isinstance(model, str) and model):
         return
     lim = _limit_for(pid)
@@ -835,8 +844,13 @@ def mark_model_throttled(pid: str, model: str, seconds: float = 60) -> None:
         else:
             mt["strikes"] = 1
         mt["last_strike"] = now
-        backoff = min((seconds or 60) * (2 ** (mt["strikes"] - 1)), _MAX_BACKOFF)
-        mt["throttled_until"] = max(mt.get("throttled_until", 0), min(now + backoff, reset))
+        if isinstance(until, (int, float)) and not isinstance(until, bool) and until > now:
+            target = min(float(until), now + _RETRY_AFTER_CAP)
+        else:
+            ceiling = _MAX_BACKOFF if not cap else min(float(cap), _MAX_BACKOFF)
+            backoff = min((seconds or 60) * (2 ** (mt["strikes"] - 1)), ceiling)
+            target = min(now + backoff, reset)
+        mt["throttled_until"] = max(mt.get("throttled_until", 0), target)
         _MODEL_THROTTLE[key] = mt
     _persist_maybe()
 
@@ -1130,6 +1144,299 @@ def status(pid: str) -> dict:
 
 def is_exhausted(pid: str) -> bool:
     return status(pid)["exhausted"]
+
+
+# ---------------------------------------------------------------------------
+# WHAT A 429 ACTUALLY SAYS: scope (model vs account), window, reset.
+#
+# Per-model limits used to be learned from success HEADERS for groq/cerebras
+# only; every other 429 was read as a bare "slow down" and the hub guessed the
+# rest. Two guesses were measurably wrong in opposite directions:
+#   - a Google per-model DAILY quota (quotaId
+#     GenerateRequestsPerDayPerProjectPerModel-FreeTier) came with RetryInfo
+#     retryDelay "37s", so the model was retried every few minutes all day, each
+#     retry a burned chain hop -- the day resets at midnight PACIFIC (RESET_RULES)
+#   - a per-MINUTE 429 without a Retry-After header benched the KEY until the
+#     provider's day window reset (mark_key_exhausted's None fallback), so one
+#     burst on a daily-window provider parked a working key for hours.
+# The providers say which it is; this reads it. Documented shapes:
+#   google      error.details[] QuotaFailure.violations[].quotaId / quotaMetric /
+#               quotaDimensions.model, RetryInfo.retryDelay ("37s"). The
+#               OpenAI-compat endpoint wraps the same object in a JSON list.
+#   openrouter  error.message "Rate limit exceeded: free-models-per-day" (the
+#               ACCOUNT-wide ':free' pool) / "free-models-per-min", with
+#               error.metadata.headers X-RateLimit-{Limit,Remaining,Reset(ms)};
+#               an upstream provider's own limit arrives as metadata.raw
+#               "... is temporarily rate-limited upstream" -- that is ONE model.
+#   generic     Retry-After (seconds or HTTP-date), x-ratelimit-reset-*,
+#               "per day / RPD / per minute / TPM" wording, "for model `x`"
+#               (groq), "try again in 1m26.4s" / "retry in 37.47s".
+# Fail-open: anything unreadable yields None fields, and callers then keep
+# their previous defaults. Never raises.
+# ---------------------------------------------------------------------------
+import re as _re_429
+from email.utils import parsedate_to_datetime as _parsedate
+
+_MINUTE_429_CAP = 300.0     # a per-minute limit never benches anything longer
+_HOUR_429_CAP = 3600.0
+_WIN_DAY_RE = _re_429.compile(
+    r"per[ _-]?day|perday|daily|\bRPD\b|\bTPD\b|per 24 ?h(?:ours?)?|/day\b|"
+    r"free-models-per-day", _re_429.I)
+_WIN_HOUR_RE = _re_429.compile(r"per[ _-]?hour|perhour|hourly|\bRPH\b|/hour\b", _re_429.I)
+_WIN_MIN_RE = _re_429.compile(
+    r"per[ _-]?min(?:ute)?\b|perminute|\bRPM\b|\bTPM\b|/min(?:ute)?\b|"
+    r"free-models-per-min", _re_429.I)
+_MODEL_NAMED_RE = _re_429.compile(
+    r"(?:(?:for|on) model|\bmodel:)\s*"
+    r"(?:[`'\"]([^`'\"\s]+)[`'\"]|([\w./:@+-]*\w))", _re_429.I)
+_UPSTREAM_MODEL_RE = _re_429.compile(r"rate[- ]limited upstream|temporarily rate[- ]limited",
+                                     _re_429.I)
+_ACCOUNT_RE = _re_429.compile(
+    r"free-models-per-(?:day|min)|\b(?:account|organi[sz]ation|project|api key)\b",
+    _re_429.I)
+_RETRY_TEXT_RE = _re_429.compile(
+    r"(?:try again|retry)(?:\s+(?:after|in))?\s+"
+    r"((?:\d+(?:\.\d+)?\s*(?:ms|milliseconds?|seconds?|secs?|minutes?|mins?|hours?|"
+    r"hrs?|h|m|s)\b\s*)+)", _re_429.I)
+
+
+def _duration_secs(text):
+    """'1m26.4s' / '37.47s' / '60 seconds' / '2 minutes' -> seconds, or None."""
+    if not text:
+        return None
+    total, hit = 0.0, False
+    for num, unit in _re_429.findall(
+            r"(\d+(?:\.\d+)?)\s*(ms|milliseconds?|seconds?|secs?|minutes?|mins?|"
+            r"hours?|hrs?|h|m|s)", str(text), _re_429.I):
+        u = unit.lower()
+        mult = (0.001 if u.startswith("ms") or u.startswith("milli") else
+                3600 if u.startswith("h") else
+                60 if u.startswith("m") else 1)
+        total += float(num) * mult
+        hit = True
+    return total if hit else None
+
+
+def _json_body(body):
+    """The 429 body as a dict: parsed JSON, a list-wrapped error (Gemini's
+    OpenAI-compat endpoint) unwrapped, or None."""
+    data = body
+    if isinstance(body, (bytes, bytearray)):
+        body = body.decode("utf-8", "ignore")
+    if isinstance(body, str):
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return None
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        data = data[0]
+    return data if isinstance(data, dict) else None
+
+
+def _hdr_ci(headers, name):
+    """Case-insensitive header read that works on plain dicts too."""
+    if not headers:
+        return None
+    try:
+        v = headers.get(name)
+        if v in (None, ""):
+            low = name.lower()
+            for k, val in headers.items():
+                if str(k).lower() == low:
+                    v = val
+                    break
+        return v if v not in (None, "") else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _retry_after_epoch(v, now):
+    """Retry-After: delta-seconds or an HTTP-date -> epoch, or None."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    try:
+        return now + max(0.0, float(s))
+    except ValueError:
+        pass
+    try:
+        return _parsedate(s).timestamp()
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _google_violations(err):
+    out = []
+    for d in (err.get("details") or []):
+        if not isinstance(d, dict):
+            continue
+        for v in (d.get("violations") or []):
+            if isinstance(v, dict) and (v.get("quotaId") or v.get("quotaMetric")):
+                out.append(v)
+    return out
+
+
+def _google_retry_delay(err):
+    for d in (err.get("details") or []):
+        if isinstance(d, dict) and d.get("retryDelay"):
+            return _duration_secs(d.get("retryDelay"))
+    return None
+
+
+def _window_of(text):
+    """Longest window named in text (day > hour > minute): when several are
+    named, the longest one that is spent is the one that binds."""
+    if not text:
+        return None
+    if _WIN_DAY_RE.search(text):
+        return "day"
+    if _WIN_HOUR_RE.search(text):
+        return "hour"
+    if _WIN_MIN_RE.search(text):
+        return "minute"
+    return None
+
+
+def classify_429(pid: str, headers=None, body=None, model: str = None,
+                 per_model_default: bool = False, now: float = None) -> dict:
+    """Read a 429 into {scope, window, reset_at, seconds, model, source,
+    body_headers}.
+
+      scope        "model" (only this id is out), "account" (the whole provider
+                   / key is out) or None (the response did not say).
+                   `per_model_default` fills an unstated scope with "model" for
+                   providers whose limits are documented per model.
+      window       "minute" | "hour" | "day" | None
+      reset_at     epoch when the quota is back, or None when nothing was stated
+                   (a minute window with no explicit reset stays None so the
+                   caller's own cooldown applies).
+      seconds      reset_at - now, or None
+      body_headers x-ratelimit-* values carried in the BODY (OpenRouter's
+                   error.metadata.headers), for observe_headers; else None.
+
+    Durations are bounded by the window: a per-minute limit resets within
+    _MINUTE_429_CAP whatever a header claims, and a per-day limit on a provider
+    listed in RESET_RULES resets at that rule's midnight -- Google's RetryInfo
+    says "37s" on a spent RPD quota. Never raises."""
+    out = {"scope": None, "window": None, "reset_at": None, "seconds": None,
+           "model": None, "source": "generic", "body_headers": None}
+    try:
+        now = time.time() if now is None else float(now)
+        data = _json_body(body)
+        err = data.get("error") if isinstance(data, dict) else None
+        if not isinstance(err, dict):
+            err = data if isinstance(data, dict) else {}
+        msg = err.get("message") if isinstance(err.get("message"), str) else ""
+        raw_text = body if isinstance(body, str) else ""
+        if not msg:
+            for k in ("detail", "error_message"):
+                if isinstance(err.get(k), str) and err.get(k):
+                    msg = err[k]
+                    break
+        if not msg and raw_text:
+            msg = raw_text[:4000]
+        meta = err.get("metadata") if isinstance(err.get("metadata"), dict) else {}
+        meta_raw = meta.get("raw") if isinstance(meta.get("raw"), str) else ""
+        scope = window = named_model = None
+        explicit = []           # candidate reset epochs, most trusted first
+
+        # 1) Retry-After header -- the provider's own number, for this response.
+        explicit.append(_retry_after_epoch(_hdr_ci(headers, "retry-after"), now))
+
+        # 2) Google QuotaFailure / RetryInfo.
+        viol = _google_violations(err)
+        if viol:
+            out["source"] = "google"
+            wins = []
+            for v in viol:
+                qid = "%s %s" % (v.get("quotaId") or "", v.get("quotaMetric") or "")
+                w = ("day" if _re_429.search(r"PerDay|per_day", qid, _re_429.I) else
+                     "hour" if _re_429.search(r"PerHour|per_hour", qid, _re_429.I) else
+                     "minute" if _re_429.search(r"PerMinute|per_minute", qid, _re_429.I)
+                     else None)
+                if w:
+                    wins.append(w)
+                dims = v.get("quotaDimensions") if isinstance(v.get("quotaDimensions"),
+                                                              dict) else {}
+                if dims.get("model") or "PerModel" in qid:
+                    scope = "model"
+                    named_model = named_model or dims.get("model")
+                elif scope is None:
+                    scope = "account"
+            for w in ("day", "hour", "minute"):
+                if w in wins:
+                    window = w
+                    break
+            rd = _google_retry_delay(err)
+            if rd is not None:
+                explicit.append(now + rd)
+        elif _google_retry_delay(err) is not None:
+            out["source"] = "google"
+            explicit.append(now + _google_retry_delay(err))
+
+        # 3) OpenRouter.
+        mh = meta.get("headers") if isinstance(meta.get("headers"), dict) else None
+        if "free-models-per-" in msg or mh or meta_raw:
+            out["source"] = "openrouter"
+        if "free-models-per-" in msg:
+            scope = "account"
+        elif meta_raw and _UPSTREAM_MODEL_RE.search(meta_raw):
+            scope = "model"
+            window = window or "minute"
+        if mh:
+            out["body_headers"] = {str(k).lower(): v for k, v in mh.items()}
+            explicit.append(_parse_reset(_hdr_ci(mh, "x-ratelimit-reset"), now))
+
+        # 4) Generic wording and headers.
+        text = " ".join(t for t in (msg, meta_raw) if t)
+        if window is None:
+            window = _window_of(text)
+        if window is None and _hdr_ci(headers, "x-ratelimit-reset-requests-day"):
+            window = "day"
+        if scope is None:
+            m = _MODEL_NAMED_RE.search(text)
+            if m:
+                scope = "model"
+                named_model = m.group(1) or m.group(2)
+            elif _ACCOUNT_RE.search(text):
+                scope = "account"
+        m = _RETRY_TEXT_RE.search(text)
+        if m:
+            d = _duration_secs(m.group(1))
+            if d is not None:
+                explicit.append(now + d)
+        for h in ("x-ratelimit-reset-requests-day" if window == "day" else
+                  "x-ratelimit-reset-requests", "x-ratelimit-reset"):
+            explicit.append(_parse_reset(_hdr_ci(headers, h), now))
+
+        if scope is None and per_model_default:
+            scope = "model"
+        exp = next((e for e in explicit
+                    if isinstance(e, (int, float)) and e > now), None)
+
+        reset_at = None
+        if window == "day":
+            bounds = _day_bounds_tz(DAY_RESET_TZ[pid], now) if pid in DAY_RESET_TZ else None
+            if bounds:
+                reset_at = bounds[1]          # documented midnight beats a "37s"
+            elif exp:
+                reset_at = exp
+            else:
+                reset_at = _window_bounds("day", now, pid)[1]
+        elif window == "hour":
+            reset_at = min(exp, now + _HOUR_429_CAP) if exp else now + _HOUR_429_CAP
+        elif window == "minute":
+            reset_at = min(exp, now + _MINUTE_429_CAP) if exp else None
+        elif exp:
+            reset_at = min(exp, now + _RETRY_AFTER_CAP)
+        out.update(scope=scope, window=window, model=named_model or None)
+        if reset_at and reset_at > now:
+            out["reset_at"] = float(reset_at)
+            # Rounded so "Retry-After: 17" reads back as 17.0, not 16.99999.
+            out["seconds"] = max(1.0, round(float(reset_at) - now, 3))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
 
 
 # ---------------------------------------------------------------------------

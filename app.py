@@ -3519,15 +3519,27 @@ def _daily_exhaustion_secs(pid, resp, cap=6 * 3600):
 _BILLING_PRECONDITION_RE = re.compile(
     r"card on file|add a card|payment method|billing details|"
     r"requires? a card|add a payment", re.I)
+_QUOTA_EXCEEDED_RE = re.compile(
+    r"exceeded your current quota|quota exceeded|rate limit|resource.?exhausted|"
+    r"too many requests", re.I)
 
 
 def _is_billing_precondition(resp):
     """True for a response whose body says the ACCOUNT needs a payment method.
 
-    Only consulted for statuses the hub would otherwise read as transient; a
-    real rate limit never carries this text."""
+    Only consulted for statuses the hub would otherwise read as transient.
+
+    A real rate limit CAN carry billing words: Google's quota 429 reads "You
+    exceeded your current quota, please check your plan and billing details",
+    which matched "billing details" and graded every Gemini RPM/RPD 429 as a
+    402 -- two models of it and the whole provider was parked as broke. A body
+    that says a quota/rate limit was exceeded is a rate limit, whatever else
+    it mentions."""
     try:
-        return bool(_BILLING_PRECONDITION_RE.search(_upstream_error_detail(resp) or ""))
+        detail = _upstream_error_detail(resp) or ""
+        if _QUOTA_EXCEEDED_RE.search(detail):
+            return False
+        return bool(_BILLING_PRECONDITION_RE.search(detail))
     except Exception:                                            # noqa: BLE001
         return False
 
@@ -4108,6 +4120,92 @@ def _retry_after_seconds(resp):
         return max(1.0, float(raw))
     except (TypeError, ValueError):
         return None                    # an HTTP-date form; the window reset is closer
+
+
+def _classify_429(pid, resp, model=None):
+    """quota.classify_429 for an upstream Response: what the 429 says about its
+    scope (model vs account), window and reset. {} on anything unreadable, so
+    every caller falls back to its old defaults. Never raises."""
+    try:
+        try:
+            body = resp.text
+        except Exception:                                        # noqa: BLE001
+            body = None
+        return quota.classify_429(
+            pid, getattr(resp, "headers", None) or {}, body, model,
+            per_model_default=pid in _PER_MODEL_RATE_LIMIT_PROVIDERS) or {}
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def _key_cooldown_for_429(info, resp):
+    """How long to skip THIS KEY after a 429, from its classification.
+
+    MODEL-scoped: the key is fine for every other model, so it is only skipped
+    briefly (<= 60s) to let the next request start on a sibling key -- benching
+    it for the model's reset (a Google per-model day) would take every model on
+    that key out with it. The model itself is parked by mark_model_throttled.
+    A MINUTE/HOUR window: its own short reset -- never the None fallback, which
+    mark_key_exhausted reads as "until the provider's DAY window resets"
+    (MEASURED: one per-minute burst on a daily-window provider parked a working
+    key for hours). Otherwise the legacy Retry-After (None = window reset)."""
+    try:
+        secs = info.get("seconds") if info else None
+        if info and info.get("scope") == "model":
+            return max(1.0, min(secs or 60.0, 60.0))
+        if info and info.get("window") in ("minute", "hour"):
+            return secs or 60.0
+        if secs:
+            return secs
+    except Exception:                                            # noqa: BLE001
+        pass
+    return _retry_after_seconds(resp)
+
+
+def _apply_429(pid, model, info, resp):
+    """Park what a LAST-key 429 actually ran out of (see quota.classify_429).
+
+      model scope  -> only (pid, model); a per-DAY quota until its own reset
+                      (Google: midnight Pacific), shorter windows via the
+                      capped doubling. Siblings keep serving.
+      account      -> the whole provider, plus the model (it survives the
+                      provider's note_success so it is not re-picked first).
+      unstated     -> the previous behaviour: Retry-After / daily wording, the
+                      whole provider unless it limits per model.
+    Fail-open."""
+    try:
+        info = info or {}
+        scope, window = info.get("scope"), info.get("window")
+        secs = info.get("seconds")
+        daily_secs = None
+        if secs is None:
+            # A DAILY allowance that is spent will not come back in a short
+            # cooldown (Cloudflare: "you have used up your daily free allocation
+            # of 10,000 neurons") -- park it until the window actually resets.
+            daily_secs = _daily_exhaustion_secs(pid, resp)
+            secs = daily_secs
+        elif window == "day":
+            daily_secs = secs
+        # Extra kwargs only when they carry something, so the plain
+        # (pid, model, secs) call stays the common case.
+        extra = {"cap": quota._MINUTE_429_CAP} if window == "minute" else {}
+        if scope == "model" and model:
+            if window == "day" and info.get("reset_at"):
+                quota.mark_model_throttled(pid, model, secs, until=info["reset_at"])
+            else:
+                quota.mark_model_throttled(pid, model, secs or _HOP_COOLDOWN_DEFAULT,
+                                           **extra)
+            return
+        # Per-model-limited providers (Google: 15 RPM PER MODEL): a burst 429 on
+        # ONE model must not bench the whole fleet. Only an explicit ACCOUNT
+        # scope, or a spent daily window, benches the provider.
+        per_model_only = (scope is None and pid in _PER_MODEL_RATE_LIMIT_PROVIDERS
+                          and daily_secs is None)
+        if not per_model_only:
+            quota.mark_throttled(pid, secs or _HOP_COOLDOWN_DEFAULT)
+        quota.mark_model_throttled(pid, model, secs or _HOP_COOLDOWN_DEFAULT, **extra)
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def _provider_key_count(pid):
@@ -8329,6 +8427,7 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         # unanswerable, because every counter was per provider.
         quota.record_key(pid, key, payload.get("model"))
         quota.note_key_outcome(pid, key, resp.status_code not in (401, 403, 429))
+        info_429 = None
         if resp.status_code == 429 and _is_billing_precondition(resp):
             # NOT a rate limit -- the account needs a payment method (see
             # _is_billing_precondition). Benching the key for a Retry-After would
@@ -8337,8 +8436,15 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             _mark_provider_authfail(pid, payload.get("model"), 402)
         elif resp.status_code == 429:
             # THIS key is out, not the provider. Remember it so the next request
-            # starts on one that still has budget.
-            quota.mark_key_exhausted(pid, key, _retry_after_seconds(resp))
+            # starts on one that still has budget -- for as long as what ran out
+            # (a model's quota, a minute, a day) says, not a flat guess.
+            info_429 = _classify_429(pid, resp, payload.get("model"))
+            quota.mark_key_exhausted(pid, key, _key_cooldown_for_429(info_429, resp))
+            if info_429.get("body_headers"):
+                # OpenRouter carries its x-ratelimit-* in the 429 BODY
+                # (error.metadata.headers): the real daily pool, for the dashboard.
+                quota.observe_headers(pid, info_429["body_headers"], key,
+                                      payload.get("model"))
         quota.observe_headers(pid, resp.headers, key, payload.get("model"))  # ADAPT to the real quota (per model for per-model-header providers)
         if resp.status_code == 400:               # learn a small context window from the error
             _learn_context_limit(pid, payload.get("model"), resp)
@@ -8390,34 +8496,12 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         # of pegging it exhausted until the day/month window resets; a real
         # Retry-After is honored as-is.
         if resp.status_code == 429 and is_last:
-            retry_after = resp.headers.get("Retry-After")
-            secs = None
-            try:
-                secs = float(retry_after) if retry_after else None
-            except ValueError:
-                secs = None
-            daily_secs = None
-            if secs is None:
-                # A DAILY allowance that is spent will not come back in a short
-                # cooldown, and retrying it every round burns a chain hop on every
-                # request for the rest of the day (Cloudflare: "you have used up
-                # your daily free allocation of 10,000 neurons"). Park it until
-                # the window actually resets instead — the same self-healing
-                # path, just with an honest ETA.
-                daily_secs = _daily_exhaustion_secs(pid, resp)
-                secs = daily_secs
-            # Per-model-limited providers (Google: 15 RPM PER MODEL): a per-minute
-            # burst 429 on ONE model must not bench the whole fleet — the sibling
-            # models each still have budget and are exactly the capacity that keeps an
-            # agentic loop off a 503. Park only the offending model for the short burst;
-            # only bench the whole provider when the DAILY window is truly spent.
-            per_model_only = pid in _PER_MODEL_RATE_LIMIT_PROVIDERS and daily_secs is None
-            if not per_model_only:
-                quota.mark_throttled(pid, secs or _HOP_COOLDOWN_DEFAULT)
-            # ALSO park just this model: it survives provider note_success(), so when
-            # a sibling model revives the provider, the id that actually 429'd stays
-            # sidelined instead of being re-picked and 429'ing again.
-            quota.mark_model_throttled(pid, payload.get("model"), secs or _HOP_COOLDOWN_DEFAULT)
+            # Scope, window and reset come from what the 429 SAYS (Google
+            # QuotaFailure, OpenRouter free-models-per-*, Retry-After, "per day"
+            # wording) -- see _apply_429. A per-model day quota parks just that
+            # model until its own reset; a per-minute burst never parks anything
+            # for longer than minutes; an account quota benches the provider.
+            _apply_429(pid, payload.get("model"), info_429 or {}, resp)
         # 403 (no access to this model with this key) / 404 (model gone) are about
         # the MODEL, not the key or the quota: sideline just that id so routing
         # stops picking it. Only on the last key — an earlier key's 403 may just
@@ -19776,10 +19860,52 @@ def _sse_chunk_is_progress(raw):
 
 
 _STREAM_DIGEST_CAP = 2 << 20     # bytes of a relayed stream kept for the end check
+_SSE_USAGE_TAIL = 16 << 10       # bytes of a stream's END kept to find its usage frame
+
+
+def _sse_usage(blob):
+    """The LAST OpenAI `usage` object in raw SSE bytes, or None. The tail a
+    caller passes can start mid-frame; unparseable lines are skipped."""
+    try:
+        for line in reversed(bytes(blob or b"").split(b"\n")):
+            line = line.strip()
+            if not line.startswith(b"data:") or b'"usage"' not in line:
+                continue
+            try:
+                chunk = json.loads(line[5:].strip().decode("utf-8", "ignore"))
+            except ValueError:
+                continue
+            u = chunk.get("usage") if isinstance(chunk, dict) else None
+            if isinstance(u, dict) and (u.get("prompt_tokens") or u.get("completion_tokens")):
+                return u
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def _record_sse_usage(hop_pid, hop_model, kept, tail, prompt_est):
+    """Usage for a relayed /v1/chat/completions stream, filed under the REAL hop.
+
+    The passthrough never recorded usage at all -- only the Codex and Anthropic
+    stream paths did (and Codex's under the client's "auto" label) -- so every
+    streamed chat turn was missing from the usage history. Real usage when the
+    stream carried a usage frame, else the char/4 estimate the other paths use.
+    Never raises."""
+    try:
+        u = _sse_usage(tail) or _sse_usage(b"".join(kept))
+        if u is not None:
+            usage_history.record(hop_pid, hop_model, int(u.get("prompt_tokens") or 0),
+                                 int(u.get("completion_tokens") or 0), estimated=False)
+            return
+        text, _tools, _fin = _sse_answer_digest(kept)
+        usage_history.record(hop_pid, hop_model, int(prompt_est or 0),
+                             len(text) // 4, estimated=True)
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None,
-               prompt_text=None, tools_offered=False, last_prompt=None):
+               prompt_text=None, tools_offered=False, last_prompt=None, prompt_est=0):
     """Pass upstream SSE bytes through unchanged. When `iterator`/`first` are
     supplied (the first-byte peek already pulled the first chunk from this exact
     iterator), yield that chunk first, then continue the SAME iterator — so the
@@ -19797,6 +19923,7 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
     saw_done = False
     stalled = False
     kept, kept_len = [], 0
+    tail = b""
     last_progress = time.time()
     try:
         if iterator is None:
@@ -19822,6 +19949,10 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
                 if hop_pid and kept_len < _STREAM_DIGEST_CAP:
                     kept.append(bytes(raw))
                     kept_len += len(raw)
+                elif hop_pid:
+                    # Past the digest cap: keep only the END, where the usage
+                    # frame lives.
+                    tail = (tail + bytes(raw))[-_SSE_USAGE_TAIL:]
                 yield chunk
         if hop_pid and not stalled:
             text, saw_tools, fin = _sse_answer_digest(kept)
@@ -19840,10 +19971,12 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
             except Exception:
                 pass
     finally:
+        if hop_pid and hop_model:
+            _record_sse_usage(hop_pid, hop_model, kept, tail, prompt_est)
         resp.close()
 
 
-_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+_SSE_HEADERS ={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 # Beyond this many bytes with no frame boundary, stop trying to frame and just
 # forward. An upstream that ignores `stream: true` and returns one JSON body has
@@ -22341,6 +22474,7 @@ def _chat_completions_uncached(body):
                                        _CHAT_DEADLINE_TERMINATOR,
                                        "%s/%s" % (hop_pid, hop_model))
                 relay = _proxy_sse(resp, chained, hop_pid=hop_pid, hop_model=hop_model,
+                                   prompt_est=est,
                                    prompt_text=_prompt_text_for_check(payload),
                                    last_prompt=_last_user_text_for_check(payload),
                                    tools_offered=has_tools)
@@ -22903,9 +23037,16 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
         except Exception:
             pass
     finally:
+        # Usage goes to the REAL hop, never to model_label. model_label is the
+        # id the CLIENT asked for, echoed back on purpose (codex sends "auto");
+        # partitioning it filed every Codex stream's tokens under a phantom
+        # provider "auto" with model "", so the real provider's usage row never
+        # moved. No hop ids (the swarm replay, a sub-CLI hop whose usage
+        # _record_chat_usage already filed) = nothing to record here.
         try:
-            hop_pid, _sep, hop_model = model_label.partition("/")
-            if usage is not None:
+            if not (hop_pid and hop_model):
+                pass
+            elif usage is not None:
                 pt = int(usage.get("prompt_tokens") or 0)
                 ct = int(usage.get("completion_tokens") or 0)
                 usage_history.record(hop_pid, hop_model, pt, ct, estimated=False)
