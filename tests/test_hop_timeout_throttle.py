@@ -55,9 +55,15 @@ class _Resp:
 
 
 def test_a_hop_that_times_out_gets_throttled_so_a_retry_skips_it(monkeypatch):
-    throttled = []
+    # The cooldown is scoped to the (provider, model) that timed out -- see
+    # tests/test_hop_breaker_scope.py for why a single slow model no longer
+    # benches the whole provider.
+    monkeypatch.setattr(app, "_hop_model_fail", {})
+    throttled, model_throttled = [], []
     monkeypatch.setattr(app.quota, "mark_throttled",
                         lambda pid, secs=None: throttled.append((pid, secs)))
+    monkeypatch.setattr(app.quota, "mark_model_throttled",
+                        lambda pid, model, secs=None: model_throttled.append((pid, model, secs)))
 
     def fake_dispatch(pid, payload, stream):
         if pid == "nvidia":
@@ -76,8 +82,9 @@ def test_a_hop_that_times_out_gets_throttled_so_a_retry_skips_it(monkeypatch):
         "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 200
     assert r.get_json()["choices"][0]["message"]["content"] == "OK"
-    assert ("nvidia", app._HOP_COOLDOWN_DEFAULT) in throttled, \
-        "a timed-out hop must get the same cooldown a 429 already gets: %r" % throttled
+    assert ("nvidia", "mistral-medium-3.5-128b", app._HOP_COOLDOWN_DEFAULT) in model_throttled, \
+        "a timed-out hop must get the same cooldown a 429 already gets: %r" % model_throttled
+    assert not throttled, "one slow model must not bench the whole provider: %r" % throttled
 
 
 def test_a_fast_failing_hop_is_not_throttled_only_a_real_timeout_is(monkeypatch):
@@ -146,9 +153,12 @@ def test_a_429_with_no_retry_after_uses_the_full_cooldown_default(isolated_confi
 # --------------------------------------------------------------------------- #
 
 def test_a_5xx_response_gets_throttled_so_a_retry_skips_it(monkeypatch):
-    throttled = []
+    monkeypatch.setattr(app, "_hop_model_fail", {})
+    throttled, model_throttled = [], []
     monkeypatch.setattr(app.quota, "mark_throttled",
                         lambda pid, secs=None: throttled.append((pid, secs)))
+    monkeypatch.setattr(app.quota, "mark_model_throttled",
+                        lambda pid, model, secs=None: model_throttled.append((pid, model, secs)))
 
     def fake_dispatch(pid, payload, stream):
         if pid == "g4f-nvidia":
@@ -167,8 +177,10 @@ def test_a_5xx_response_gets_throttled_so_a_retry_skips_it(monkeypatch):
         "model": "auto", "max_tokens": 24, "stream": False,
         "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 200
-    assert ("g4f-nvidia", app._HOP_COOLDOWN_DEFAULT) in throttled, \
-        "a raw 5xx response must get the same cooldown a Timeout already gets: %r" % throttled
+    assert ("g4f-nvidia", "mistralai/mistral-medium-3.5-128b",
+            app._HOP_COOLDOWN_DEFAULT) in model_throttled, \
+        "a raw 5xx response must get the same cooldown a Timeout already gets: %r" % model_throttled
+    assert not throttled, "one 5xx model must not bench the whole provider: %r" % throttled
 
 
 def test_a_429_response_is_not_double_throttled_by_the_5xx_branch(monkeypatch):

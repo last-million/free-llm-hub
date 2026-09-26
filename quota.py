@@ -970,6 +970,24 @@ def _persist_maybe() -> None:
         save_state()
 
 
+def _forget_stale_strikes(st: dict, now: float) -> dict:
+    """Zero a provider's 429-backoff streak once its throttle lifted more than
+    _STRIKE_TTL ago. The next strike would restart at 1 anyway (see
+    mark_throttled), but the stored count survived every restart, so the
+    dashboard kept reporting throttles that expired WEEKS earlier (MEASURED
+    2026-09-26: dahl showed 6 strikes). Fails open: odd values are left alone."""
+    try:
+        ended = max(float(st.get("throttled_until") or 0),
+                    float(st.get("last_strike") or 0))
+        if (st.get("strikes") or st.get("last_strike")) and now - ended > _STRIKE_TTL:
+            st = dict(st)
+            st["strikes"] = 0
+            st["last_strike"] = 0.0
+    except (TypeError, ValueError):
+        pass
+    return st
+
+
 def _load_state(path: str) -> None:
     """Apply a previously saved state file. Fails open: any problem -> empty
     state. Entries past their TTL (expired throttles, stale dynamic readings)
@@ -987,7 +1005,7 @@ def _load_state(path: str) -> None:
         if isinstance(state, dict):
             for pid, st in state.items():
                 if isinstance(pid, str) and isinstance(st, dict):
-                    _STATE[pid] = st
+                    _STATE[pid] = _forget_stale_strikes(st, now)
         model_state = blob.get("model_state")
         if isinstance(model_state, dict):
             for pid, ms in model_state.items():
