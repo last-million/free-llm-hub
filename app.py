@@ -3592,6 +3592,111 @@ def _dead_model_rows():
         return [(p, m, int(exp - now)) for (p, m), exp in _dead_models.items() if exp > now]
 
 
+# --------------------------------------------------------------------------- #
+# Answer canary: health probes that JUDGE THE TEXT.
+#
+# Every probe used to send "hi" and call HTTP 200 healthy. A hop that answers
+# 200 with garbage -- a broken chat template leaking "<|im_end|>" and a second
+# turn after the answer, a quantised model that cannot add, an empty string --
+# passed every check and kept its place at the head of the chain. The canary
+# asks a question with ONE known answer ("What is N plus 1?") so the probe can
+# tell "answered correctly" from "answered with junk" from "HTTP error".
+#
+# A quality failure is a per-(provider, model) SCORE PENALTY, never an identity
+# block and never a dead mark: the same model served by another provider is
+# a different deployment (different template, different quant) and is left
+# alone, and the hop stays routable -- just demoted -- because two bad probe
+# answers are evidence, not proof. The penalty lifts after
+# _CANARY_PENALTY_TTL or on the next correct answer, whichever comes first.
+# State is (pid, model) -> {"strikes", "penalized_until", "last_probe",
+# "verdict"} and rides in the quota "app" blob (see _dead_state_dump), so a
+# 5-hourly auto-update restart neither forgets a demotion nor re-probes every
+# pair on boot (which would break the one-probe-per-pair-per-6h budget).
+# --------------------------------------------------------------------------- #
+_CANARY_STRIKES = 2                  # consecutive quality failures before a demotion
+_CANARY_PENALTY = 15.0               # score points; > _OUTCOME_WEIGHT on purpose: a
+                                     # hop that answers junk is worse than a flaky one
+_CANARY_PENALTY_TTL = 24 * 3600      # a demotion expires on its own after a day
+_CANARY_STATE_TTL = 7 * 86400        # forget an untouched record after a week
+_canary_state = {}
+_canary_lock = threading.Lock()
+
+
+def _answer_quality_penalty(pid, model):
+    """0 unless THIS (pid, model) failed the answer canary _CANARY_STRIKES times
+    running within the last _CANARY_PENALTY_TTL. Never raises."""
+    try:
+        with _canary_lock:
+            rec = _canary_state.get((pid, model))
+            until = float(rec.get("penalized_until") or 0) if rec else 0.0
+        return _CANARY_PENALTY if until > time.time() else 0.0
+    except Exception:                                            # noqa: BLE001
+        return 0.0
+
+
+def _record_canary_verdict(pid, model, verdict):
+    """Fold one canary verdict into the quality state. Never raises.
+
+    "correct" clears strikes AND any live demotion (the "or on a later pass"
+    exit). "junk"/"wrong" add a strike; the _CANARY_STRIKES-th starts a 24h
+    demotion. Anything else ("empty", "http_error", "error") is INCONCLUSIVE --
+    an empty reply from a 16-token probe is usually a reasoning model spending
+    its budget thinking, and HTTP failures already feed _mark_model_dead /
+    _record_outcome -- so it only stamps last_probe."""
+    if not (pid and model):
+        return
+    try:
+        now = time.time()
+        with _canary_lock:
+            rec = dict(_canary_state.get((pid, model)) or {})
+            rec.setdefault("strikes", 0)
+            rec.setdefault("penalized_until", 0)
+            rec["last_probe"] = now
+            rec["verdict"] = verdict
+            if verdict == "correct":
+                rec["strikes"] = 0
+                rec["penalized_until"] = 0
+            elif verdict in ("junk", "wrong"):
+                rec["strikes"] = int(rec.get("strikes") or 0) + 1
+                if rec["strikes"] >= _CANARY_STRIKES:
+                    rec["penalized_until"] = now + _CANARY_PENALTY_TTL
+            _canary_state[(pid, model)] = rec
+        try:
+            quota._persist_maybe()
+        except Exception:                                        # noqa: BLE001
+            pass
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _canary_state_dump():
+    now = time.time()
+    with _canary_lock:
+        return {"%s|%s" % (p, m): dict(r) for (p, m), r in _canary_state.items()
+                if now - float(r.get("last_probe") or 0) <= _CANARY_STATE_TTL}
+
+
+def _canary_state_load(rows):
+    if not isinstance(rows, dict):
+        return
+    now = time.time()
+    with _canary_lock:
+        for key, r in rows.items():
+            if not (isinstance(key, str) and "|" in key and isinstance(r, dict)):
+                continue
+            try:
+                rec = {"strikes": int(r.get("strikes") or 0),
+                       "penalized_until": float(r.get("penalized_until") or 0),
+                       "last_probe": float(r.get("last_probe") or 0),
+                       "verdict": str(r.get("verdict") or "")}
+            except (TypeError, ValueError):
+                continue
+            if now - rec["last_probe"] > _CANARY_STATE_TTL:
+                continue
+            p, m = key.split("|", 1)
+            _canary_state[(p, m)] = rec
+
+
 # Bridge for quota.init_persistence(): the dead-model/provider maps ride along in
 # the same state file as the quota blob (the "app" key). Expired entries are
 # dropped on BOTH dump and load — a sideline that would already have lifted is
@@ -3639,6 +3744,11 @@ def _dead_state_dump():
     with _activity_lock:
         out["activity"] = list(_activity)
         out["activity_seq"] = _activity_seq[0]
+    # Answer-canary quality state (see _record_canary_verdict).
+    try:
+        out["answer_canary"] = _canary_state_dump()
+    except Exception:                                            # noqa: BLE001
+        pass
     return out
 
 
@@ -3705,6 +3815,10 @@ def _dead_state_load(blob):
                 continue                  # stale evidence -- start that hop clean
             p, m = key.split("|", 1)
             _outcomes[(p, m)] = {"ok": int(ok), "fail": int(fail), "last": float(last)}
+    try:
+        _canary_state_load(blob.get("answer_canary"))
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def _retry_after_seconds(resp):
@@ -8002,7 +8116,8 @@ def _agentic_score(entry, sustain_override=None):
         penalty = _sustain_penalty(entry[1])
     return (entry[0] - penalty - _tool_dialect_penalty(entry[2])
             - _reliability_penalty(entry[1], entry[2])
-            - _latency_penalty(entry[1], entry[2]))
+            - _latency_penalty(entry[1], entry[2])
+            - _answer_quality_penalty(entry[1], entry[2]))
 
 
 def _context_ok(pid, model, est):
@@ -9231,11 +9346,20 @@ def _run_relay_model_test(pid):
             results[i] = {"model": m, "ok": False, "skipped": True,
                           "error": "Skipped -- already marked unavailable; retries automatically later."}
             return
-        status, text, detail = _sub_run(pid, "Reply with just the word OK, nothing else.", model=m)
+        # The answer canary, not "reply OK": a known answer is the only way to
+        # tell a real reply from junk. `ok` keeps meaning "the CLI ran and
+        # answered" (backward compatible); `canary` says whether the text was
+        # right. Test-only -- subscriptions never enter the quality state.
+        prompt, expected = _canary_question()
+        status, text, detail = _sub_run(pid, prompt, model=m)
         ok = status == 200
         results[i] = {"model": m, "ok": ok,
                       "response": text if ok else None,
                       "error": None if ok else (detail or ("HTTP %d" % status))}
+        if ok:
+            verdict = _judge_canary(text, expected)
+            results[i]["canary"] = {"verdict": verdict, "expected": expected,
+                                    "summary": _canary_summary(verdict, text)}
 
     threads = [threading.Thread(target=_one, args=(i, m), daemon=True) for i, m in enumerate(models)]
     for t in threads:
@@ -9328,7 +9452,7 @@ def api_test_provider(pid):
     key = pcfg.get("api_key")
     attempted = []  # (model, ok) for every REAL generation this call actually ran
 
-    def _finish(ok, detail, sample_models, cache=True, keys=None):
+    def _finish(ok, detail, sample_models, cache=True, keys=None, canary=None):
         """Single exit point for every REAL attempt (everything past the
         precondition checks below). Persists the outcome and folds in any
         newly-discovered or newly-broken free model ids so the dashboard can
@@ -9342,6 +9466,11 @@ def api_test_provider(pid):
         Absent (or empty) on the paths that never test a specific key."""
         payload = {"ok": bool(ok), "detail": detail, "sample_models": sample_models or [],
                    "keys": keys or []}
+        # Answer-canary verdict of the generation probe ({verdict, model,
+        # expected, answer}); only on the paths that ran one. Additive: every
+        # older field keeps its meaning, and `ok` stays "the key generates".
+        if canary:
+            payload["canary"] = canary
         if cache:
             try:
                 new_models, stale_models = _record_test_result(
@@ -9523,10 +9652,18 @@ def api_test_provider(pid):
 
     def _probe(key_pin):
         """Real 1-token generation across the candidate models, optionally
-        PINNED to one key. Returns (ok, model_that_worked, failure_reason)."""
+        PINNED to one key. Returns (ok, model_that_worked, failure_reason,
+        canary) -- canary is the answer-canary verdict dict for the model that
+        answered, None when nothing did.
+
+        The prompt is the answer canary, not "hi", so a 200 carrying junk is
+        told apart from a clean answer. ok still means "this key GENERATES"
+        (the question this button has always answered); the quality verdict
+        rides alongside in `canary` and in the wording, never flips ok."""
         reason = None
         for model in candidates[:5]:  # cap attempts — this call is user-interactive
             resp = None
+            prompt, expected = _canary_question()
             for attempt in range(2):
                 # Pass only_key ONLY when actually pinning, so the unpinned path
                 # keeps the exact call shape it always had (a test double, or any
@@ -9535,7 +9672,7 @@ def api_test_provider(pid):
                 pin = {} if key_pin is _NO_KEY_PIN else {"only_key": key_pin}
                 try:
                     resp = _upstream_chat(pid, {"model": model,
-                                                "messages": [{"role": "user", "content": "hi"}],
+                                                "messages": [{"role": "user", "content": prompt}],
                                                 "max_tokens": 16},  # 16 = Perplexity's floor
                                           stream=False, **pin)
                 except (requests.RequestException, RuntimeError) as exc:
@@ -9544,7 +9681,12 @@ def api_test_provider(pid):
                     break
                 if resp.status_code == 200:
                     attempted.append((model, True))
-                    return True, model, None
+                    answer = _canary_reply_text(resp)
+                    verdict = _judge_canary(answer, expected)
+                    return True, model, None, {
+                        "verdict": verdict, "model": model, "expected": expected,
+                        "answer": _sanitize(answer.strip())[:120],
+                        "summary": _canary_summary(verdict, answer)}
                 if resp.status_code in _TRANSIENT and attempt == 0:
                     time.sleep(2)
                     continue
@@ -9565,10 +9707,23 @@ def api_test_provider(pid):
                 # note about this exact wording since 2026-07-27. Breaking there
                 # condemned two perfectly good keys and hid five working models.
                 break
-        return False, None, reason
+        return False, None, reason, None
 
-    def _verdict(ok, model, reason):
-        """Same wording the single-key path has always produced."""
+    def _canary_note(canary):
+        """' It answered correctly.' style suffix, '' without a canary."""
+        if not canary:
+            return ""
+        v = canary.get("verdict")
+        if v == "correct":
+            return " It answered correctly."
+        if v in ("junk", "wrong"):
+            return (" But it %s -- the key works, this model's output is "
+                    "unreliable." % canary.get("summary"))
+        return " It %s." % canary.get("summary")
+
+    def _verdict(ok, model, reason, canary=None):
+        """Same wording the single-key path has always produced, plus the
+        answer-canary note when the probe got a reply."""
         if ok:
             # Don't claim "FREE" when the probe ran on a metered catalog id —
             # that would be the one thing a user reading this most needs to
@@ -9578,7 +9733,7 @@ def api_test_provider(pid):
                      "so the probe spent a little of its allowance."
                      if metered_probe else
                      "Key OK — verified FREE generation works "
-                     "(1-token chat succeeded on %s).") % model)
+                     "(1-token chat succeeded on %s).") % model) + _canary_note(canary)
         # Every candidate authenticated but none could actually generate — the
         # spent-wallet case this whole rewrite exists to catch. Plain language,
         # not a bare HTTP status, so the verdict answers "will this work".
@@ -9596,24 +9751,26 @@ def api_test_provider(pid):
     # ONE key (or none): leave the pool logic exactly as it was, so a keyless
     # provider's static_key/no-auth pass is untouched.
     if len(pool) <= 1:
-        ok, model, reason = _probe(_NO_KEY_PIN)
+        ok, model, reason, canary = _probe(_NO_KEY_PIN)
         payload_extra = ([{"index": 0, "masked": _mask_key(pool[0]), "ok": ok,
-                           "detail": _verdict(ok, model, reason)}] if pool else [])
-        return _finish(ok, _verdict(ok, model, reason),
+                           "detail": _verdict(ok, model, reason, canary),
+                           "canary": canary}] if pool else [])
+        return _finish(ok, _verdict(ok, model, reason, canary),
                        (sample_models[:5] or ([model] if model else [])),
-                       keys=payload_extra)
+                       keys=payload_extra, canary=canary)
 
     # SEVERAL keys: test each one SEPARATELY. Without this the pool rotates, so
     # one good key makes the provider look healthy while a dead one beside it
     # keeps burning a routing hop on every request -- and nothing in the UI
     # could tell you which was which.
-    per_key, first_ok_model = [], None
+    per_key, first_ok_model, first_canary = [], None, None
     for i, k in enumerate(pool):
-        k_ok, k_model, k_reason = _probe(k)
+        k_ok, k_model, k_reason, k_canary = _probe(k)
         per_key.append({"index": i, "masked": _mask_key(k), "ok": k_ok,
-                        "detail": _verdict(k_ok, k_model, k_reason)})
+                        "detail": _verdict(k_ok, k_model, k_reason, k_canary),
+                        "canary": k_canary})
         if k_ok and first_ok_model is None:
-            first_ok_model = k_model
+            first_ok_model, first_canary = k_model, k_canary
     good = [r["index"] + 1 for r in per_key if r["ok"]]
     bad = [r["index"] + 1 for r in per_key if not r["ok"]]
     if good and bad:
@@ -9629,7 +9786,7 @@ def api_test_provider(pid):
                   % (len(pool), per_key[0]["detail"] if per_key else ""))
     return _finish(bool(good), detail,
                    (sample_models[:5] or ([first_ok_model] if first_ok_model else [])),
-                   keys=per_key)
+                   keys=per_key, canary=first_canary)
 
 
 @app.route("/api/test-cache", methods=["GET"])
@@ -10194,9 +10351,10 @@ def api_probe_all():
         for m in models:
             if not prov.is_model_allowed(m) or _is_model_dead(pid, m):
                 continue
-            ok, detail = _probe_pair(pid, m)
+            res = _probe_pair_verdict(pid, m)
             results.append({"id": pid + "/" + m, "provider": pid, "model": m,
-                            "ok": bool(ok), "detail": detail})
+                            "ok": bool(res["ok"]), "detail": res["detail"],
+                            "quality": res["verdict"]})
     results.sort(key=lambda r: (not r["ok"], r["provider"]))
     return jsonify({"results": results, "total": len(results),
                     "working": sum(1 for r in results if r["ok"]),
@@ -10216,18 +10374,93 @@ def _ranked_free_pairs(limit=6):
     return cands[:limit]
 
 
-def _probe_pair(pid, model, timeout_s=25):
-    """Send ONE tiny real request to (pid, model). Returns (ok, detail).
-    Marks the model dead on a 403/404 so the rest of the hub routes around it."""
+def _canary_question(n=None):
+    """(prompt, expected) for the answer canary. A fresh random N per probe, so
+    no cache -- ours or a provider's -- can replay a stale correct answer."""
+    if n is None:
+        n = random.randint(1000, 9998)
+    return ("What is %d plus 1? Answer with only the number." % n), str(n + 1)
+
+
+# Wrapping a bare answer in a period, quotes, backticks or bold is formatting,
+# not a wrong answer -- stripped before the exact-match test. Anything else
+# around the number (a sentence, a leaked "<|im_end|>", a second turn) is junk.
+_CANARY_COSMETIC = " \t\r\n.`*\"'"
+
+
+def _judge_canary(text, expected):
+    """Verdict for one canary reply: "correct" (exactly the expected number once
+    thinking blocks and cosmetic wrapping are stripped), "junk" (the right
+    number is there but with anything else around it -- trailing template
+    junk, chatter), "wrong" (non-empty, right number absent) or "empty"."""
+    body = _strip_thinking(text if isinstance(text, str) else "")
+    if not body:
+        return "empty"
+    if body.strip(_CANARY_COSMETIC) == expected:
+        return "correct"
+    if re.search(r"(?<!\d)%s(?!\d)" % re.escape(expected), body):
+        return "junk"
+    return "wrong"
+
+
+def _canary_reply_text(resp):
+    """The assistant text of an OpenAI-shaped non-streaming response, "" when
+    it has none or does not parse. Never raises."""
+    try:
+        data = resp.json()
+        msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, list):   # content-part arrays (some gateways)
+            content = "".join(p.get("text") or "" for p in content if isinstance(p, dict))
+        return content if isinstance(content, str) else ""
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _canary_summary(verdict, answer):
+    """Human wording for a canary verdict (dashboard Test / probe details)."""
+    snippet = _sanitize((answer or "").strip())[:60]
+    if verdict == "correct":
+        return "answered correctly"
+    if verdict == "junk":
+        return "answered with junk: %r" % snippet
+    if verdict == "wrong":
+        return "answered WRONG: %r" % snippet
+    if verdict == "empty":
+        return "answered with an empty reply (inconclusive)"
+    return verdict or "no verdict"
+
+
+def _probe_pair_verdict(pid, model, timeout_s=25):
+    """Send ONE tiny real canary request to (pid, model) and JUDGE the text.
+
+    Returns {"ok", "detail", "verdict", "http_status", "answer", "expected"}.
+    ok is False on an HTTP error AND on a quality failure (junk/wrong): the
+    callers (default-auto, probe-all) are asking "does this hop WORK", and a hop
+    answering garbage with a 200 does not. An empty reply stays ok -- that is
+    what "hi" probes always accepted, and a reasoning model spending 16 tokens
+    thinking is not broken. Marks the model dead on a 403/404 (via
+    _upstream_chat) and folds the verdict into the quality state."""
+    prompt, expected = _canary_question()
     payload = {"model": model, "max_tokens": 16, "stream": False,  # 16 = Perplexity's floor
-               "messages": [{"role": "user", "content": "hi"}]}
+               "messages": [{"role": "user", "content": prompt}]}
+    out = {"ok": False, "detail": "", "verdict": "error", "http_status": None,
+           "answer": "", "expected": expected}
     try:
         r = _upstream_chat(pid, payload, False)
     except Exception as exc:
-        return False, "%s: %s" % (exc.__class__.__name__, _sanitize(str(exc))[:60])
+        out["detail"] = "%s: %s" % (exc.__class__.__name__, _sanitize(str(exc))[:60])
+        return out
     try:
+        out["http_status"] = r.status_code
         if r.status_code == 200:
-            return True, "answered"
+            answer = _canary_reply_text(r)
+            verdict = _judge_canary(answer, expected)
+            out.update(verdict=verdict, answer=_sanitize(answer.strip())[:120],
+                       ok=verdict not in ("junk", "wrong"),
+                       detail=_canary_summary(verdict, answer))
+            _record_canary_verdict(pid, model, verdict)
+            return out
         # _upstream_chat already marks 403/404 dead on the last key
         try:
             b = r.json()
@@ -10235,12 +10468,120 @@ def _probe_pair(pid, model, timeout_s=25):
             msg = e.get("message") if isinstance(e, dict) else str(e)
         except Exception:
             msg = (r.text or "")[:60]
-        return False, "HTTP %d: %s" % (r.status_code, _sanitize(str(msg))[:60])
+        out["verdict"] = "http_error"
+        out["detail"] = "HTTP %d: %s" % (r.status_code, _sanitize(str(msg))[:60])
+        _record_canary_verdict(pid, model, "http_error")
+        return out
     finally:
         try:
             r.close()
         except Exception:
             pass
+
+
+def _probe_pair(pid, model, timeout_s=25):
+    """Send ONE tiny real canary request to (pid, model). Returns (ok, detail)
+    -- the original contract; _probe_pair_verdict has the full verdict."""
+    res = _probe_pair_verdict(pid, model, timeout_s=timeout_s)
+    return res["ok"], res["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# Background answer canary. Very low rate by design: it spends real free quota
+# on nothing but checking, so it touches only the top _CANARY_TOP_N preferred
+# pairs, each at most once per _CANARY_INTERVAL (the last-probe stamp is
+# persisted, so restarts do not reset the budget), and never a throttled or
+# exhausted provider, a local subscription (sub-*, each call is a CLI run on
+# the user's plan) or a paid provider (each call costs money). Flag
+# `answer_canary`, default on.
+# --------------------------------------------------------------------------- #
+_CANARY_TOP_N = 8
+_CANARY_INTERVAL = 6 * 3600          # per pair
+_CANARY_TICK = 30 * 60               # how often the loop wakes to look for due pairs
+_CANARY_BOOT_DELAY = 300             # let the hub boot and serve before spending a call
+_CANARY_PAUSE = 2.0                  # between probes within one tick
+
+
+def _canary_provider_eligible(pid):
+    """False for sub-*, paid, dead, throttled or exhausted providers."""
+    try:
+        if _is_sub(pid) or _is_provider_dead(pid):
+            return False
+        if (prov.get_provider(pid) or {}).get("paid"):
+            return False
+        st = quota.status(pid) or {}
+        return not (st.get("throttled") or st.get("exhausted"))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _canary_due_pairs(now=None):
+    """The top _CANARY_TOP_N eligible preferred pairs whose last canary is older
+    than _CANARY_INTERVAL. Ranked by RAW benchmark score (not _agentic_score)
+    on purpose: a pair the canary demoted must stay in the set so a later
+    correct answer can lift the demotion early."""
+    now = time.time() if now is None else now
+    picked = []
+    for _score, pid, model in _ranked_free_pairs(limit=_CANARY_TOP_N * 4):
+        if len(picked) >= _CANARY_TOP_N:
+            break
+        if not _canary_provider_eligible(pid):
+            continue
+        try:
+            if quota.is_model_throttled(pid, model):
+                continue
+        except Exception:                                        # noqa: BLE001
+            pass
+        picked.append((pid, model))
+    with _canary_lock:
+        return [(p, m) for p, m in picked
+                if now - float((_canary_state.get((p, m)) or {}).get("last_probe") or 0)
+                >= _CANARY_INTERVAL]
+
+
+def _answer_canary_tick(pause=_CANARY_PAUSE):
+    """One pass: probe every due pair once. Returns [(pid, model, verdict)].
+    Never raises."""
+    done = []
+    try:
+        pairs = _canary_due_pairs()
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[canary] candidate listing failed", exc_info=True)
+        return done
+    for i, (pid, model) in enumerate(pairs):
+        if i and pause:
+            time.sleep(pause)
+        try:
+            res = _probe_pair_verdict(pid, model)
+            done.append((pid, model, res.get("verdict")))
+            if res.get("verdict") in ("junk", "wrong"):
+                _log.info("[canary] %s/%s %s", pid, model, res.get("detail"))
+        except Exception:                                        # noqa: BLE001
+            _log.debug("[canary] probe failed for %s/%s", pid, model, exc_info=True)
+    return done
+
+
+def _answer_canary_loop():
+    time.sleep(_CANARY_BOOT_DELAY)
+    while True:
+        try:
+            if config.get_flag("answer_canary", True):
+                _answer_canary_tick()
+        except Exception:                                        # noqa: BLE001
+            _log.debug("[canary] tick error", exc_info=True)
+        time.sleep(_CANARY_TICK)
+
+
+_answer_canary_thread = None
+
+
+def _start_answer_canary():
+    global _answer_canary_thread
+    if _answer_canary_thread is not None:
+        return
+    _answer_canary_thread = threading.Thread(target=_answer_canary_loop, daemon=True,
+                                             name="answer-canary")
+    _answer_canary_thread.start()
 
 
 @app.route("/api/default/auto", methods=["POST"])
@@ -23185,6 +23526,7 @@ if __name__ == "__main__":
     _print_banner()
     _start_auto_update()
     _start_aa_refresh()
+    _start_answer_canary()   # flag answer_canary is read per tick, so off = no calls
     # Previews that outlived the hub that started them (crash, kill, restart
     # while a project was running) keep holding their ports forever. Found 99
     # of the 100 held on this machine, which makes the next preview fail with
