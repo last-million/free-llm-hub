@@ -46,6 +46,16 @@ routing heuristics.
 - First-content peek is adaptive (`_stream_peek_timeout`): slow/reasoning
   models or >=12K-token requests get 60s (both: 90s) instead of the flat 35s —
   the flat budget was killing HEALTHY slow hops on Codex-sized prompts.
+- One wall clock per request (`_ChainClock`, setting
+  `request_deadline_seconds`, default 240, 0 = off) on all three chain loops:
+  no hop starts past it, hops/peeks are cut to what is left, a chain that runs
+  out returns a clean 504 (`X-Free-LLM-Hub-Last-Error: deadline`), and a
+  committed stream past it continues only while it delivers visible content
+  (`_deadline_guard`). Trivial small turns (<12K tokens, classifier "simple")
+  get a 25s/45s (fast/slow) hop budget and a fast-first chain that leaves an
+  all-slow category for fast models. Pipelines keep `swarm_max_seconds` inside
+  an outer bound (`_pipeline_outer_bound`). Covered by
+  `tests/test_request_deadline.py`.
 - `X-Free-LLM-Hub-Last-Error` response header (timeout/conn/413/429/http-N/
   empty/none) names the last hop-failure class; on `/v1/responses` it appears
   on chain-exhausted errors. Diagnosis is one `curl -i` away.
