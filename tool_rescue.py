@@ -29,10 +29,29 @@ Dialects handled, all observed in the wild:
     {"function_call": {"name": "read", "arguments": "{...}"}}
     <function=read>{"path": "a.txt"}</function>
 
+...and the model-NATIVE tool-call syntaxes, which a provider's adapter is meant
+to turn into tool_calls and sometimes hands over as text instead (MEASURED
+2026-09: DeepSeek V4 on /v1/responses and /v1/messages, non-stream, the reply
+text opening "<｜DSML｜" -- fullwidth bars, U+FF5C):
+
+    <｜DSML｜function_calls>
+    <｜DSML｜invoke name="add">
+    <｜DSML｜parameter name="a" string="false">17</｜DSML｜parameter>
+    </｜DSML｜invoke>
+    </｜DSML｜function_calls>
+    <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>add
+    ```json {"a": 17} ```<｜tool▁call▁end｜><｜tool▁calls▁end｜>   (V3 / R1)
+    <｜tool▁call▁begin｜>add<｜tool▁sep｜>{"a": 17}<｜tool▁call▁end｜>   (V3.1)
+    <|tool_call_begin|>functions.add:0<|tool_call_argument_begin|>{..}<|tool_call_end|>
+
+ASCII bars and "_" for the "▁" are accepted too. See rescue_stream for the
+streaming half.
+
 Pure: no I/O, no globals.
 """
 import json
 import re
+import uuid
 
 _TOOL_CALL_BLOCK = re.compile(r"<tool_call>(.*?)</tool_call>", re.I | re.S)
 # An UNCLOSED block still gets a chance: models truncated by max_tokens open the
@@ -186,14 +205,183 @@ def _from_tool_call_block(inner):
     return []
 
 
-def parse(text, allowed_names=None):
+# --------------------------------------------------------------------------- #
+# Model-native markup: DeepSeek DSML, DeepSeek/Kimi special-token calls
+# --------------------------------------------------------------------------- #
+
+_BAR = "[｜|]"                # fullwidth vertical line, or the ASCII one
+_SP = "[▁_ ]"                # sentencepiece "▁", "_" or a plain space
+_DSML_OPEN = r"<\s*" + _BAR + r"\s*DSML\s*" + _BAR + r"\s*"
+_DSML_CLOSE = r"<\s*(?:/\s*" + _BAR + r"|" + _BAR + r"\s*/)\s*DSML\s*" + _BAR + r"\s*"
+
+
+def _special(*words):
+    """A <｜tool▁call▁begin｜>-style token, any bar / space spelling."""
+    return r"<\s*" + _BAR + r"\s*" + _SP.join(words) + r"\s*" + _BAR + r"\s*>"
+
+
+_TC_BEGIN = _special("tool", "call", "begin")
+_TC_END = _special("tool", "call", "end")
+_TCS_END = _special("tool", "calls", "end")
+_TC_SEP = "(?:" + _special("tool", "sep") + "|" + _special("tool", "call", "argument", "begin") + ")"
+
+_DSML_INVOKE_RE = re.compile(
+    _DSML_OPEN + r"invoke\b([^>]*)>(.*?)(?=" + _DSML_CLOSE + r"invoke\s*>|" + _DSML_OPEN
+    + r"invoke\b|" + _DSML_CLOSE + r"function_calls\s*>|\Z)", re.I | re.S)
+_DSML_PARAM_RE = re.compile(
+    _DSML_OPEN + r"parameter\b([^>]*)>(.*?)(?:" + _DSML_CLOSE + r"parameter\s*>|(?="
+    + _DSML_OPEN + r"parameter\b)|\Z)", re.I | re.S)
+_ATTR_RE = re.compile(r"([\w-]+)\s*=\s*([\"'])(.*?)\2", re.S)
+_SPECIAL_CALL_RE = re.compile(
+    _TC_BEGIN + r"(.*?)" + _TC_SEP + r"(.*?)(?=" + _TC_END + "|" + _TC_BEGIN + "|" + _TCS_END
+    + r"|\Z)", re.I | re.S)
+# Where model-native markup STARTS. Deliberately only the openers a model uses
+# for a call: a stray "<|im_end|>" is a template leak (answer_check's job).
+_MARKUP_START_RE = re.compile(
+    r"<\s*/?\s*" + _BAR + r"\s*/?\s*DSML\s*" + _BAR
+    + "|" + _special("tool", "calls", "begin") + "|" + _TC_BEGIN
+    + "|" + _special("tool", "calls", "section", "begin"), re.I)
+# Every tag of that markup, to find where it ENDS.
+_MARKUP_TAG_RE = re.compile(
+    r"<\s*/?\s*" + _BAR + r"\s*/?\s*DSML\s*" + _BAR + r"[^>]*>"
+    r"|<\s*" + _BAR + r"[^<>\n]{0,48}?" + _BAR + r"\s*>", re.I)
+# The openers, normalised (see _norm_marker), for the streaming prefix hold.
+_MARKERS = ("<|dsml|", "<|tool_calls_begin|>", "<|tool_call_begin|>",
+            "<|tool_calls_section_begin|>")
+
+
+def has_model_markup(text):
+    """True when `text` carries a model-native tool-call opener."""
+    return bool(isinstance(text, str) and text and _MARKUP_START_RE.search(text))
+
+
+def _attrs(blob):
+    return {k.lower(): v for k, _q, v in _ATTR_RE.findall(blob or "")}
+
+
+def _schema_type(schemas, name, param):
+    try:
+        t = (((schemas or {}).get(name) or {}).get("properties") or {}).get(param, {}).get("type")
+    except AttributeError:
+        return None
+    return t[0] if isinstance(t, list) and t else t
+
+
+def _dsml_value(raw, attrs, declared):
+    """One DSML parameter value. string="true" is verbatim text; "false" is
+    JSON. Without the hint the tool's schema decides, then "is it a JSON
+    literal"."""
+    flag = (attrs.get("string") or "").strip().lower()
+    s = raw.strip()
+    if flag == "true" or (not flag and declared == "string"):
+        return raw if flag == "true" else raw.strip("\r\n")
+    if flag == "false" or declared in ("integer", "number", "boolean", "object", "array"):
+        try:
+            return json.loads(s)
+        except ValueError:
+            return s
+    if s[:1] in '{["-0123456789' or s in ("true", "false", "null"):
+        try:
+            return json.loads(s)
+        except ValueError:
+            pass
+    return raw.strip("\r\n")
+
+
+def _dsml_calls(text, schemas=None):
+    out = []
+    for attr_blob, body in _DSML_INVOKE_RE.findall(text):
+        name = (_attrs(attr_blob).get("name") or "").strip()
+        if not name:
+            continue
+        args = {}
+        for p_blob, raw in _DSML_PARAM_RE.findall(body):
+            pa = _attrs(p_blob)
+            key = (pa.get("name") or "").strip()
+            if key:
+                args[key] = _dsml_value(raw, pa, _schema_type(schemas, name, key))
+        out.append(_call(name, args))
+    return out
+
+
+def _special_calls(text):
+    out = []
+    for head, body in _SPECIAL_CALL_RE.findall(text):
+        head = head.strip()
+        if head.lower() in ("", "function"):
+            # V3/R1: <｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME\n```json {...}```
+            name, _nl, rest = body.strip().partition("\n")
+            if not _nl and "{" in name:
+                name, rest = name[:name.index("{")], name[name.index("{"):]
+        else:
+            name, rest = head, body       # V3.1 / Kimi: NAME<sep>{...}
+        # Kimi spells the name "functions.add:0"
+        name = re.sub(r":\d+$", "", name.strip().strip("`\"'"))
+        if name.startswith("functions."):
+            name = name[len("functions."):]
+        if not name or re.search(r"\s", name):
+            continue
+        args = next((obj for obj, _s, _e in _json_objects(rest)), None)
+        leftover = _FENCE_MARKS.sub("", rest).strip()
+        if args is None and leftover:
+            continue                      # arguments that are not JSON: unusable
+        out.append(_call(name, args if args is not None else {}))
+    return out
+
+
+_FENCE_MARKS = re.compile(r"```(?:json)?", re.I)
+
+
+def model_markup_calls(text, schemas=None):
+    """Calls in model-native markup (see the module docstring), unfiltered."""
+    if not has_model_markup(text):
+        return []
+    return _dsml_calls(text, schemas) or _special_calls(text)
+
+
+def strip_model_markup(text):
+    """`text` minus the model-native markup: from its first opener to the end of
+    its last tag. Prose on either side survives."""
+    m = _MARKUP_START_RE.search(text or "")
+    if not m:
+        return text or ""
+    end = m.end()
+    for t in _MARKUP_TAG_RE.finditer(text, m.start()):
+        end = max(end, t.end())
+    return (text[:m.start()] + text[end:]).strip()
+
+
+def tool_schemas(tools):
+    """{name: parameters-schema} from an OpenAI (or Anthropic) tools array."""
+    out = {}
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        params = fn.get("parameters") or fn.get("input_schema")
+        if fn.get("name") and isinstance(params, dict):
+            out[str(fn["name"])] = params
+    return out
+
+
+def parse(text, allowed_names=None, schemas=None):
     """Every rescuable call in `text`, as OpenAI function dicts.
 
     `allowed_names`: the tool names the client offered. When given, a call to
-    anything else is dropped -- an invented name is not a usable call."""
+    anything else is dropped -- an invented name is not a usable call.
+    `schemas` ({name: parameters}) only refines DSML value typing."""
     if not text or not isinstance(text, str):
         return []
     found = []
+
+    if has_model_markup(text):
+        # Model-native markup owns the text: the generic JSON fallback below
+        # would read an ARGUMENTS object such as {"name": "x"} as a call to x.
+        found = model_markup_calls(text, schemas)
+        if allowed_names is not None:
+            allowed = {str(n) for n in allowed_names}
+            found = [c for c in found if c["name"] in allowed]
+        return found
 
     for block in _TOOL_CALL_BLOCK.findall(text):
         found.extend(_from_tool_call_block(block))
@@ -253,6 +441,8 @@ def tool_names(tools):
 def _strip_calls(text):
     """Remove the typed call from the prose so the client is not shown raw XML
     next to the real call it now has."""
+    if has_model_markup(text):
+        return strip_model_markup(text)
     out = _TOOL_CALL_BLOCK.sub("", text or "")
     out = _FUNCTION_TAG.sub("", out)
     if "<tool_call>" in out.lower():
@@ -280,7 +470,7 @@ def rescue(data, tools):
     content = msg.get("content")
     if isinstance(content, list):
         content = "".join((p.get("text") or "") for p in content if isinstance(p, dict))
-    calls = parse(content, allowed_names=names)
+    calls = parse(content, allowed_names=names, schemas=tool_schemas(tools))
     if not calls:
         return False
 
@@ -292,3 +482,202 @@ def rescue(data, tools):
     msg["content"] = left or None
     choice["finish_reason"] = "tool_calls"
     return True
+
+
+# --------------------------------------------------------------------------- #
+# The streaming half
+# --------------------------------------------------------------------------- #
+#
+# A streamed reply that types model-native markup reaches the client as text
+# deltas, and nothing downstream can take them back. So the markup is caught
+# on the UPSTREAM chat SSE, before the hub's first-content peek: text flows
+# through untouched until an opener (or a prefix of one) shows up, from there
+# the text is held, and when the upstream finishes the held markup becomes
+# tool_calls deltas + finish_reason "tool_calls" -- the shape every protocol
+# translator already turns into function_call items / tool_use blocks.
+# Unparseable markup becomes an in-stream error frame instead: before the peek
+# commits, that is the peek's "error" status (next hop); after, the
+# translators end the turn on it. Never the raw markup as text.
+
+_FRAME_CAP = 1 << 20
+_STREAM_ERROR = {"error": {"message": "the model wrote a tool call as model-native markup "
+                                      "the hub could not parse",
+                           "type": "upstream_error", "code": "unparseable_tool_markup"}}
+
+
+def _norm_marker(s):
+    return re.sub(r"\s+", "", s.lower().replace("｜", "|").replace("▁", "_"))
+
+
+def _may_open_marker(text):
+    """True when `text` ENDS with what could still become an opener."""
+    i = text.rfind("<", max(0, len(text) - 48))
+    if i < 0:
+        return False
+    tail = _norm_marker(text[i:])
+    return any(m.startswith(tail) for m in _MARKERS)
+
+
+def _units(items, framing):
+    if framing == "lines":
+        yield from items
+        return
+    buf = b""
+    for chunk in items:
+        if not chunk:
+            continue
+        if not isinstance(chunk, (bytes, bytearray)):
+            chunk = str(chunk).encode("utf-8", "ignore")
+        buf += chunk
+        while True:
+            cuts = [c for c in (buf.find(b"\n\n"), buf.find(b"\r\n\r\n")) if c >= 0]
+            if not cuts:
+                break
+            cut = min(cuts)
+            sep = 4 if buf[cut:cut + 4] == b"\r\n\r\n" else 2
+            frame, buf = buf[:cut + sep], buf[cut + sep:]
+            yield frame
+        if len(buf) > _FRAME_CAP:
+            yield buf
+            buf = b""
+    if buf:
+        yield buf
+
+
+def _payload(unit):
+    """("json", dict) | ("done", None) | ("other", None) for one SSE unit."""
+    raw = unit if isinstance(unit, (bytes, bytearray)) else str(unit).encode("utf-8", "ignore")
+    datas = [ln.strip()[5:].strip() for ln in raw.splitlines() if ln.strip().startswith(b"data:")]
+    if len(datas) != 1:
+        return "other", None
+    if datas[0] == b"[DONE]":
+        return "done", None
+    try:
+        obj = json.loads(datas[0].decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return "other", None
+    return ("json", obj) if isinstance(obj, dict) else ("other", None)
+
+
+def _choice0(chunk):
+    ch = (chunk or {}).get("choices") if isinstance(chunk, dict) else None
+    if isinstance(ch, list) and ch and isinstance(ch[0], dict):
+        return ch[0]
+    return {}
+
+
+def rescue_stream(items, tools, framing="lines"):
+    """Wrap an upstream OpenAI chat SSE iterator; see the note above.
+
+    `framing`: "lines" for resp.iter_lines() items (one SSE line each), "frames"
+    for resp.iter_content() chunks (re-framed on the blank line). Anything that
+    is not markup is re-emitted as its original bytes. No-op without tools."""
+    names = tool_names(tools)
+    if not names:
+        yield from items
+        return
+    schemas = tool_schemas(tools)
+    end = b"\n\n" if framing == "frames" else b""
+
+    def emit(obj):
+        return b"data: " + json.dumps(obj).encode("utf-8") + end
+
+    template = {}
+
+    def chunk(delta, finish=None, usage=None):
+        c = {"id": template.get("id") or "chatcmpl-rescued",
+             "object": "chat.completion.chunk",
+             "created": template.get("created") or 0,
+             "model": template.get("model") or "",
+             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        if usage:
+            c["usage"] = usage
+        return emit(c)
+
+    mode = "pass"          # pass | hold (maybe an opener) | markup | done
+    held, pending, markup, tail = [], "", "", []
+    real_calls = False
+
+    def finalize(fin_obj):
+        calls = parse(markup, allowed_names=names, schemas=schemas)
+        usage = (fin_obj or {}).get("usage") if isinstance(fin_obj, dict) else None
+        if real_calls:
+            # It emitted real calls as well: the markup is only noise now.
+            yield from tail
+            yield chunk({}, "tool_calls", usage)
+            return
+        if not calls:
+            yield emit(_STREAM_ERROR)
+            return
+        rest = strip_model_markup(markup)
+        if rest:
+            yield chunk({"content": rest})
+        for i, c in enumerate(calls):
+            yield chunk({"tool_calls": [{"index": i, "id": "call_" + uuid.uuid4().hex[:24],
+                                         "type": "function", "function": c}]})
+        yield from tail
+        yield chunk({}, "tool_calls", usage)
+
+    for unit in _units(items, framing):
+        kind, obj = _payload(unit)
+        ch = _choice0(obj) if kind == "json" else {}
+        delta = ch.get("delta") if isinstance(ch.get("delta"), dict) else {}
+        text = delta.get("content") if isinstance(delta.get("content"), str) else ""
+        fin = ch.get("finish_reason")
+        if kind == "json" and ch:
+            template = obj
+        if mode == "done":
+            yield unit
+            continue
+        if mode == "markup":
+            markup += text
+            if delta.get("tool_calls"):
+                real_calls = True
+                tail.append(unit)
+            elif not text and not fin and kind != "done":
+                tail.append(unit)
+            if fin or kind == "done":
+                yield from finalize(obj if fin else None)
+                mode = "done"
+                if kind == "done":
+                    yield unit
+            continue
+        if mode == "hold":
+            if not text:
+                # Nothing completes an opener across a non-text unit.
+                yield from held
+                held, pending, mode = [], "", "pass"
+                yield unit
+                continue
+            held.append(unit)
+            pending += text
+            text, held_text = pending, True
+        else:
+            held_text = False
+        if not text:
+            yield unit
+            continue
+        m = _MARKUP_START_RE.search(text)
+        if m:
+            if text[:m.start()]:
+                yield chunk({"content": text[:m.start()]})
+            markup, held, pending, mode = text[m.start():], [], "", "markup"
+            if fin:
+                yield from finalize(obj)
+                mode = "done"
+            continue
+        if not fin and _may_open_marker(text):
+            if not held_text:
+                held, pending = [unit], text
+            mode = "hold"
+            continue
+        if held_text:
+            yield from held
+            held, pending = [], ""
+        else:
+            yield unit
+        mode = "pass"
+    if mode == "hold":
+        yield from held
+    elif mode == "markup":
+        yield from finalize(None)

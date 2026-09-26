@@ -657,6 +657,31 @@ def _markup_leak(masked, prompt_text, tools_offered):
     return m.start() if m else None
 
 
+# A salvage must never turn one number into ANOTHER. The periodic scan in
+# _glued_loop walks back over every char that fits the loop, so "2826" followed
+# by a "26" loop ("282626262626...") starts the loop at index 2 and would serve
+# "28" -- a different number, stated with full confidence. So a cut that lands
+# INSIDE a digit run is only kept when everything after it in that run is
+# copies of the kept number ("2826" + "28262826..."): that is the first copy of
+# the loop, not a prefix of a longer number. Otherwise: no salvage (next hop).
+_TRAIL_DIGITS_RE = re.compile(r"\d+$")
+_LEAD_DIGITS_RE = re.compile(r"\d+")
+
+
+def _splits_a_number(text, clean):
+    after = text[len(clean):len(clean) + 1]
+    if not after.isdigit():
+        return False
+    if clean[-1:] in ".," and clean[-2:-1].isdigit():
+        return True                    # "3." + "14159": a decimal split
+    lead = _TRAIL_DIGITS_RE.search(clean)
+    if not lead:
+        return False
+    unit = lead.group(0)
+    run = _LEAD_DIGITS_RE.match(text, len(clean)).group(0)
+    return run != (unit * (len(run) // len(unit) + 1))[:len(run)]
+
+
 def _clip(text):
     if len(text) <= _MAX_SCAN:
         return text
@@ -724,7 +749,7 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
             return result
         result["ok"] = False
         clean = text[:min(cuts)].rstrip()
-        if re.search(r"\w", clean):
+        if re.search(r"\w", clean) and not _splits_a_number(text, clean):
             result["salvage"] = clean
         return result
     except Exception:                                            # noqa: BLE001

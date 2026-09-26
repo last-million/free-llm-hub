@@ -20002,7 +20002,7 @@ _STREAM_TOOLCALL_RE = re.compile(
     rb'(?!\s*:\s*(?:null\b|\[\s*\]|\{\s*\}|""))', re.I)
 
 
-def _judge_peeked(chunks, check=None, raw_items=None):
+def _judge_peeked(chunks, check=None, raw_items=None, prompt=None):
     """"content", "nonanswer" or "junk" for the text collected during the peek.
 
     Runs the same three detectors the non-streaming path has always had. They
@@ -20010,18 +20010,25 @@ def _judge_peeked(chunks, check=None, raw_items=None):
     actually use -- so a turn that typed its tool call, announced work it never
     did, or declined outright was relayed to the CLI as a finished answer.
 
+    Plus the upstream error-page check on the WHOLE collected text: the per-
+    frame check in _peek_until_content misses one split across deltas, and
+    provider error phrasing (_provider_error_kind) is only judged whole.
+    `prompt` is the last user turn (the peek runs off the request thread).
+
     With `check` ({prompt_text, last_prompt, tools_offered}) it also runs
     answer_check.inspect -- the _answer_gate verdict -- on the peeked answer:
     junk with NOTHING salvageable is "junk", and the chain moves to the next
     hop while it still can (nothing is committed yet). Junk WITH a salvage is
     "content": the committed stream's _StreamAnswerGate serves the clean part."""
+    _set_nonanswer_kind(None)
     try:
         text = _peeked_text("".join(chunks))
         if not text:
             return "content"
         if (_looks_like_text_tool_call(text)
                 or _looks_like_announced_not_acted(text)
-                or _looks_like_refusal(text)):
+                or _looks_like_refusal(text)
+                or _is_upstream_nonanswer(text, prompt)):
             return "nonanswer"
         if check and raw_items:
             items = [x if isinstance(x, (bytes, bytearray))
@@ -20081,7 +20088,13 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                    degenerate with nothing salvageable; caller falls through.
     Same daemon-worker discipline as _peek_first_chunk: the buffer/iterator are only
     used when the worker FINISHED (status set) so there's never concurrent iteration."""
-    box = {"buf": [], "status": None}
+    box = {"buf": [], "status": None, "kind": None}
+    prompt = _request_prompt_text()   # the worker has no request context
+
+    def _judge(seen):
+        verdict = _judge_peeked(seen, check, box["buf"], prompt=prompt)
+        box["kind"] = _take_nonanswer_kind()
+        return verdict
 
     def _worker():
         buf = box["buf"]
@@ -20137,7 +20150,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                     box["saw_content"] = True
                     if sum(len(x) for x in seen_content) < _PEEK_JUDGE_CHARS:
                         continue
-                    box["status"] = _judge_peeked(seen_content, check, buf)
+                    box["status"] = _judge(seen_content)
                     return
                 # An error INSIDE a 200 stream (403/429/quota reported as an SSE
                 # error frame instead of an HTTP status) — the single most common
@@ -20153,10 +20166,10 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                     # StopIteration branch below. Calling it "empty" threw away
                     # every answer under _PEEK_JUDGE_CHARS whose [DONE] arrived
                     # as its own read ("5768" then finish then [DONE], which is
-                    # every iter_lines stream and many iter_content ones): the
-                    # trivial answers this chain most needs to keep.
-                    box["status"] = (_judge_peeked(seen_content, check, buf)
-                                     if seen_content else "empty")
+                    # every iter_lines stream -- each line on the /v1/responses
+                    # and /v1/messages paths -- and many iter_content ones):
+                    # the trivial answers this chain most needs to keep.
+                    box["status"] = _judge(seen_content) if seen_content else "empty"
                     return
                 if _STREAM_REASONING_RE.search(b):
                     saw_reasoning = True
@@ -20165,15 +20178,14 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
             # was 400 lines of keepalives/role deltas and committing it hands the
             # CLI a stream that never answers.
             if seen_content:
-                box["status"] = _judge_peeked(seen_content, check, buf)
+                box["status"] = _judge(seen_content)
             else:
                 box["status"] = "content" if saw_reasoning else "empty"
         except StopIteration:
             # The stream ENDED inside the peek window, so everything the model
             # was ever going to say is in hand -- the best possible moment to
             # judge it, and the shape a dead turn usually has.
-            box["status"] = (_judge_peeked(seen_content, check, buf)
-                             if seen_content else "empty")
+            box["status"] = _judge(seen_content) if seen_content else "empty"
         except Exception:
             box["status"] = "empty"     # read error/timeout -> unusable, fall through
 
@@ -20190,7 +20202,10 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
         t.join(content_grace)
     if t.is_alive():
         return "timeout", []
-    return box.get("status") or "empty", list(box["buf"])
+    status = box.get("status") or "empty"
+    # The verdict's KIND for the caller's _note_nonanswer (same thread as it).
+    _set_nonanswer_kind(box.get("kind") if status == "nonanswer" else None)
+    return status, list(box["buf"])
 
 
 def _chain_buffered(buffered, iterator):
@@ -20264,11 +20279,145 @@ _NONANSWER_RE = re.compile(
     r"|maximum prompt length", re.I)
 
 
-def _is_upstream_nonanswer(text):
-    """True if `text` is a COMPLETE, SHORT message that is an upstream service's
-    error/branding rather than an answer."""
+# PROVIDER ERROR PHRASING delivered as the answer.
+#
+# MEASURED 2026-09 (live sweep, /v1/responses model "best", non-stream): an
+# upstream relay answered HTTP 200 with the content "The API key used for this
+# request has reached ..." and the hub served it as the assistant's reply.
+# _NONANSWER_RE knows a handful of exact relay strings; this is the general
+# shape -- a key/quota/credit/rate limit, an unknown model, "try again later".
+#
+# Conservative on three axes, because a real answer can say these words:
+#   * the whole reply is short (_PROVIDER_ERROR_MAX_CHARS);
+#   * it is MOSTLY the error: the sentences carrying the phrasing make up at
+#     least _PROVIDER_ERROR_SHARE of it ("Set your API key in OPENAI_API_KEY,
+#     then ..." is advice, and matches nothing here anyway);
+#   * the last user turn did not ask about keys/quotas/limits/billing -- then
+#     a short reply ABOUT them is exactly right.
+# A hit is not a 6h ban (unlike _NONANSWER_RE): the failure is filed, and a
+# key/quota/credit/rate limit additionally cools the pair down (_note_nonanswer).
+_PROVIDER_ERROR_MAX_CHARS = 400
+_PROVIDER_ERROR_SHARE = 0.6
+_PROVIDER_QUOTA_COOLDOWN = 1800
+_PROVIDER_QUOTA_RE = re.compile(
+    r"\bapi[\s_-]?key\b[^.\n]{0,80}?\b(?:has\s+|have\s+|is\s+|was\s+)?(?:reached|exceeded"
+    r"|hit|run\s+out|exhausted|expired|revoked|disabled|suspended|over\s+(?:its|the)\s+limit)"
+    r"|\b(?:invalid|incorrect|expired|revoked|missing|disabled)\s+api[\s_-]?key\b"
+    r"|\bquota\b[^.\n]{0,40}?\b(?:exceeded|exhausted|reached|used\s+up)"
+    r"|\b(?:exceeded|reached|hit|exhausted)\s+(?:your|the|its|this)\s+(?:\w+\s+){0,3}?"
+    r"(?:quota|rate[\s-]?limit|usage\s+limit|limit|credits?|allowance)\b"
+    r"|\binsufficient\s+(?:credits?|balance|quota|funds)\b"
+    r"|\b(?:credits?|balance|tokens?)\s+(?:is\s+|are\s+|has\s+been\s+|have\s+been\s+)?"
+    r"(?:exhausted|depleted|insufficient|used\s+up|too\s+low)\b"
+    r"|\brate[\s-]?limit(?:ed|s)?\b[^.\n]{0,30}?\b(?:reached|exceeded|hit)\b"
+    r"|\btoo\s+many\s+requests\b"
+    r"|\bupgrade\s+(?:your|to\s+a)\s+(?:\w+\s+)?(?:plan|account|subscription|tier)\b"
+    r"|\b(?:daily|monthly|free|usage|request)\s+(?:usage\s+)?limit\s+(?:has\s+been\s+)?"
+    r"(?:reached|exceeded)\b", re.I)
+_PROVIDER_ERROR_RE = re.compile(
+    r"\baccount\s+(?:has\s+been|is|was)\s+(?:suspended|disabled|banned|deactivated|blocked"
+    r"|restricted|locked|flagged)\b"
+    r"|\b(?:the\s+)?model\s+(?:[`'\"][^`'\"\n]{1,80}[`'\"]\s+|\S+\s+)?(?:is\s+|was\s+)?"
+    r"(?:not\s+found|not\s+available|unavailable|not\s+supported|does\s?n[o']?t\s+exist)\b"
+    r"|\bno\s+such\s+model\b"
+    r"|\b(?:please\s+)?try\s+again\s+later\b"
+    r"|\bservice\s+(?:is\s+)?(?:temporarily\s+)?unavailable\b", re.I)
+# The last user turn asking ABOUT keys/quotas/limits: then a short reply about
+# them is an answer, not an error page.
+_PROVIDER_ERROR_PROMPT_RE = re.compile(
+    r"api[\s_-]?keys?|apikey|quota|rate[\s-]?limit|\bcredits?\b|billing|\bbalance\b"
+    r"|subscription|usage\s+limit|\bupgrade|\b(?:401|402|403|429)\b|error\s+message", re.I)
+# A sentence that opens as advice or a condition explains an error; it is not one.
+_PROVIDER_ADVICE_RE = re.compile(
+    r"\W*(?:if|when|whenever|unless|once|to|make\s+sure|ensure|check|verify|consider"
+    r"|you\s+(?:can|should|may|might|could|need)|this\s+(?:means|happens)|it\s+means)\b",
+    re.I)
+_PROMPT_UNSET = object()
+# Which KIND of non-answer the detector just saw, for _note_nonanswer: set by
+# the detectors on the request thread (the peek hands its worker's verdict
+# back to that thread too), consumed by the next _note_nonanswer.
+_nonanswer_tls = threading.local()
+
+
+def _set_nonanswer_kind(kind):
+    _nonanswer_tls.kind = kind
+
+
+def _take_nonanswer_kind():
+    kind = getattr(_nonanswer_tls, "kind", None)
+    _nonanswer_tls.kind = None
+    return kind
+
+
+def _request_prompt_text():
+    """The LAST user turn of the request being served, any of the three
+    protocols' shapes; None outside a request. Never raises."""
+    try:
+        if not has_request_context():
+            return None
+        body = request.get_json(force=True, silent=True)
+        if not isinstance(body, dict):
+            return None
+        turns = body.get("messages")
+        if not isinstance(turns, list):
+            inp = body.get("input")
+            if isinstance(inp, str):
+                return inp[:_PROMPT_CHECK_CAP]
+            turns = inp if isinstance(inp, list) else []
+        for m in reversed(turns):
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            c = m.get("content")
+            if isinstance(c, list):
+                c = "\n".join(p.get("text") or "" for p in c
+                              if isinstance(p, dict) and isinstance(p.get("text"), str))
+            return (c if isinstance(c, str) else "")[:_PROMPT_CHECK_CAP]
+        return ""
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _provider_error_kind(text, prompt=None):
+    """"provider_quota" | "provider_error" | None -- see the note above."""
     s = (text or "").strip()
-    return bool(s) and len(s) <= _NONANSWER_MAX_CHARS and bool(_NONANSWER_RE.search(s))
+    if not s or len(s) > _PROVIDER_ERROR_MAX_CHARS:
+        return None
+    if prompt and _PROVIDER_ERROR_PROMPT_RE.search(prompt):
+        return None
+    hit, total, quota = 0, 0, False
+    for sent in re.split(r"(?<=[.!?])\s+|\n+", s):
+        sent = sent.strip()
+        if not sent:
+            continue
+        total += len(sent)
+        if _PROVIDER_ADVICE_RE.match(sent):
+            continue              # "If your API key has expired, ..." is advice
+        q = _PROVIDER_QUOTA_RE.search(sent)
+        if q or _PROVIDER_ERROR_RE.search(sent):
+            hit += len(sent)
+            quota = quota or bool(q)
+    if not hit or hit < _PROVIDER_ERROR_SHARE * total:
+        return None
+    return "provider_quota" if quota else "provider_error"
+
+
+def _is_upstream_nonanswer(text, prompt=_PROMPT_UNSET):
+    """True if `text` is a COMPLETE, SHORT message that is an upstream service's
+    error/branding rather than an answer. `prompt` (the last user turn) defaults
+    to the request being served."""
+    _set_nonanswer_kind(None)
+    s = (text or "").strip()
+    if not s:
+        return False
+    if len(s) <= _NONANSWER_MAX_CHARS and _NONANSWER_RE.search(s):
+        return True
+    if prompt is _PROMPT_UNSET:
+        prompt = _request_prompt_text()
+    kind = _provider_error_kind(s, prompt)
+    if kind:
+        _set_nonanswer_kind(kind)
+        return True
+    return False
 
 
 # A tool call TYPED OUT as prose instead of emitted as a tool_calls array.
@@ -20555,7 +20704,12 @@ def _chat_json_nonanswer(data, has_tools=False, tools=None):
     the agent loop fail further downstream.
 
     `tools` is the client's tools array, needed to check the name. Without it
-    the rescue is skipped rather than guessed at."""
+    the rescue is skipped rather than guessed at.
+
+    Model-native markup (DeepSeek's "<｜DSML｜function_calls>", see tool_rescue)
+    the rescue could NOT turn into an offered call is a non-answer too -- only
+    on a tools turn: raw markup served as text is never a usable reply there."""
+    _set_nonanswer_kind(None)
     try:
         msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
         if msg.get("tool_calls"):
@@ -20567,6 +20721,7 @@ def _chat_json_nonanswer(data, has_tools=False, tools=None):
             content = "".join((p.get("text") or "") for p in content
                               if isinstance(p, dict))
         if has_tools and (_looks_like_text_tool_call(content)
+                          or tool_rescue.has_model_markup(content)
                           or _looks_like_announced_not_acted(content)):
             return True
         # A refusal counts with or without tools: it is no more useful in plain
@@ -20583,8 +20738,17 @@ def _note_nonanswer(pid, model):
     never filed, and sideline this (pid, model) for _DEAD_MODEL_TTL. Dead-marking
     is the ONLY mechanism here that actually REMOVES an id from the chain
     (_build_chain checks _is_model_dead) rather than merely re-ordering it --
-    which is why a reliability penalty alone could never have stopped this."""
+    which is why a reliability penalty alone could never have stopped this.
+
+    Provider error PHRASING (_provider_error_kind, a heuristic) files the
+    failure without the dead-mark; a key/quota/credit/rate limit also cools
+    the pair down for _PROVIDER_QUOTA_COOLDOWN."""
+    kind = _take_nonanswer_kind()
     _record_outcome(pid, model, False)
+    if kind in ("provider_quota", "provider_error"):
+        if kind == "provider_quota":
+            _throttle_failed_hop(pid, model, secs=_PROVIDER_QUOTA_COOLDOWN)
+        return
     _mark_model_dead(pid, model, 404)         # 404 is in _DEAD_STATUSES
 
 
@@ -22355,6 +22519,7 @@ def _swarm_tool_result(body):
                         % " ".join((msg.get("content") or "")[:60].split()))
         if not msg.get("tool_calls") and (
                 _looks_like_text_tool_call(msg.get("content"))
+                or tool_rescue.has_model_markup(msg.get("content"))
                 or _looks_like_announced_not_acted(msg.get("content"))):
             # MEASURED: the reported dead turn was swarm mode -- three models
             # ran, none called a tool, and the best-ranked ANNOUNCEMENT won the
@@ -23817,6 +23982,10 @@ def _chat_completions_uncached(body):
                 # stream (no first byte within STREAM_FIRST_BYTE_TIMEOUT) falls
                 # through to the next provider instead of stalling the client.
                 it = resp.iter_content(chunk_size=None)
+                if has_tools:
+                    # Model-native tool-call markup typed as text (DeepSeek
+                    # DSML) becomes real tool_calls BEFORE the peek sees it.
+                    it = tool_rescue.rescue_stream(it, body.get("tools"), "frames")
                 # Peek until REAL content: a 200 that streams no content must fall
                 # through to the next model, not be handed to the client as empty.
                 status, buffered = _peek_until_content(
@@ -24658,6 +24827,9 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 # #4: peek the first line BEFORE committing the 200 SSE stream so a
                 # hung/slow provider falls through to the next hop instead of stalling.
                 line_it = resp.iter_lines(decode_unicode=False)
+                if has_tools:
+                    # DSML typed as text -> real tool_calls (tool_rescue).
+                    line_it = tool_rescue.rescue_stream(line_it, tools, "lines")
                 # Peek until REAL content (not just the first byte): an empty 200
                 # (role delta + [DONE], no content) must fall through to the next
                 # model instead of being streamed to codex as a dead-end answer.
@@ -25405,6 +25577,9 @@ def v1_messages():
                 # #4: peek the first line BEFORE committing the 200 SSE stream so a
                 # hung/slow provider falls through to the next hop instead of stalling.
                 line_it = resp.iter_lines(decode_unicode=False)
+                if has_tools:
+                    # DSML typed as text -> real tool_use blocks (tool_rescue).
+                    line_it = tool_rescue.rescue_stream(line_it, tools, "lines")
                 # Peek until REAL content so an empty 200 falls through to the next
                 # model instead of being handed to the client as a dead-end answer.
                 status, buffered = _peek_until_content(
