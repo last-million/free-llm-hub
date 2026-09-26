@@ -61,6 +61,7 @@ crew gets a senior-engineer reviewer, a research crew gets a fact-hunter, and
 so on. `profile=None` reproduces the generic behaviour byte-for-byte, so the
 plain "swarm" model and its tests are untouched by construction.
 """
+import difflib
 import json
 import re
 import threading
@@ -103,7 +104,8 @@ DEP_CONTEXT_CHARS = 6000
 # The manager plans, checks and fixes; the free models do the work. Every cap
 # below exists to keep its bill small: it is only ever shown CLIPPED summaries
 # (never a full transcript) and asked for short answers. The one place it may
-# write at length is fixing a phase two free models could not get right.
+# write at length is fixing a SHORT phase two free models could not get right
+# (a long one, and the final revision, get directed fixes -- see below).
 MANAGER_PLAN_TOKENS = 1500
 MANAGER_SUPERVISE_TOKENS = 600
 MANAGER_REVIEW_TOKENS = 800
@@ -113,6 +115,20 @@ MANAGER_BRIEF_CHARS = 6000       # the user's brief as the manager sees it
 MANAGER_PHASE_CHARS = 1500       # per phase, in the supervise/review summaries
 MANAGER_DRAFT_CHARS = 8000       # whole draft, in the review summary
 VERDICT_OUTPUT_CHARS = 3000      # one worker's output, in a per-phase verdict
+# DIRECTED FIXES. The manager used to REWRITE the final draft (and a failed
+# phase) itself from a view clipped to a few thousand characters -- so on a
+# long draft the "fixed" version silently lost everything in the trimmed
+# middle, and the manager was paid to re-type text it could not even see. Now
+# it writes short FIX INSTRUCTIONS from compact inputs, a FREE model applies
+# them to the FULL text, and the manager only confirms with a short verdict
+# on what changed.
+MANAGER_INSTRUCT_TOKENS = 900
+FIX_EXCERPT_CHARS = 4000         # the work, as the manager sees it to instruct
+CHANGES_CHARS = 3000             # the diff, as the manager sees it to confirm
+APPLY_MAX_TOKENS = 8000          # a free apply's output ceiling (big drafts)
+# A free apply that returns less than this share of the work dropped content
+# (output cap, or it "summarised"): rejected before any verdict is paid for.
+APPLY_MIN_KEEP = 0.7
 
 
 def _clip(text, limit):
@@ -123,6 +139,22 @@ def _clip(text, limit):
         return text
     head = int(limit * 0.6)
     return text[:head] + "\n\n[... trimmed ...]\n\n" + text[-(limit - head):]
+
+
+def _changes(before, after, limit=CHANGES_CHARS):
+    """What an apply changed, as a clipped unified diff ("" = nothing). The
+    manager confirms a directed fix from THIS, not from a head+tail excerpt
+    that could miss every edited line in the middle."""
+    diff = difflib.unified_diff((before or "").splitlines(),
+                                (after or "").splitlines(),
+                                "before", "after", n=1, lineterm="")
+    return _clip("\n".join(list(diff)[2:]), limit)
+
+
+def _apply_tokens(work, floor):
+    """Output ceiling for a free apply: enough to return the WHOLE work
+    (chars/4 plus headroom), never below the stage's usual cap."""
+    return max(floor, min(APPLY_MAX_TOKENS, len(work or "") // 3 + 500))
 
 _PLAN_SYSTEM = (
     "You are the SUPERVISOR of a team of AI models that will build what the user "
@@ -226,6 +258,39 @@ _FIX_SYSTEM = (
     "complete and correct, meeting every acceptance criterion and fixing every "
     "listed problem. Output only the artefact — no preamble, no notes. Never "
     "invent facts; mark missing real-world data as [NEEDS INPUT: what]."
+)
+
+# The manager directing a fix it cannot see in full (see MANAGER_INSTRUCT_TOKENS).
+_INSTRUCT_SYSTEM = (
+    "You direct an editor who will apply your instructions to the FULL work. "
+    "You see only excerpts of it; the editor sees all of it.\n"
+    "Write numbered, concrete edit instructions that fix every listed problem: "
+    "where (section, heading or quoted anchor text), what to change, and the "
+    "exact replacement text when it is short. Only what the problems require — "
+    "no rewrite of untouched parts, no new scope, no commentary. Never invent "
+    "facts; ask for [NEEDS INPUT: what] markers where real data is missing. "
+    "Plain text, at most 15 instructions."
+)
+
+# The FREE model applying those instructions to the full text.
+_APPLY_SYSTEM = (
+    "You apply an editor's fix instructions to a piece of work. Return the "
+    "COMPLETE work with every instruction applied. Everything the instructions "
+    "do not touch stays exactly as it is — do not shorten, summarise or "
+    "restructure it. Not a diff, not a list of changes: no preamble, no notes. "
+    "Preserve [NEEDS INPUT: ...] markers verbatim."
+)
+
+# The manager's short confirmation of an applied fix, judged from the diff.
+_CONFIRM_SYSTEM = (
+    "You confirm that an editor applied your fix instructions. You see the "
+    "problems, your instructions and a diff of what changed — everything not "
+    "in the diff is unchanged.\n"
+    "Reply with JSON ONLY:\n"
+    '{"ok": true | false, "problems": ["<what is still wrong>"]}\n'
+    "Fail it only for a listed problem left unfixed, a change that broke or "
+    "dropped content, or an invented fact. Style is not a problem. At most 4 "
+    "problems."
 )
 
 
@@ -569,8 +634,12 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     replies; "" from it makes that stage use `dispatch` instead. With it, each
     worker's output is checked (cheap tests, then a short manager verdict),
     retried once on another free model, and written by the manager after two
-    failures; the result gains "manager_tokens" (and "review_warning" when the
-    reviewer's reply stayed unreadable). None = the pipeline exactly as before.
+    failures -- or, when that output is too long for the manager's clipped
+    view, fixed by a free model following the manager's instructions (the
+    final revision always works that way: instructions, free apply on the
+    FULL draft, short manager confirmation). The result gains
+    "manager_tokens" (and "review_warning" when the reviewer's reply stayed
+    unreadable). None = the pipeline exactly as before.
 
     Returns {"text", "plan", "phases", "review", "models"} — `text` is always a
     non-empty answer unless every single call failed."""
@@ -792,6 +861,99 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         return _str_list(verdict.get("problems"), 4, 300) or \
             ["the manager rejected the output without detail — re-check every criterion"]
 
+    def _apply_problems(work, text, extra_check):
+        """Free checks on an applied fix, before any verdict is paid for."""
+        if not (text or "").strip():
+            return ["the editor returned nothing"]
+        if text.strip() == (work or "").strip():
+            return ["the editor changed nothing — apply every instruction"]
+        if len(text) < APPLY_MIN_KEEP * len(work or ""):
+            return ["the editor dropped content (returned %d of %d characters) — "
+                    "return the COMPLETE work with the fixes applied"
+                    % (len(text), len(work))]
+        if answer_check is not None:
+            try:
+                v = answer_check.inspect(text, prompt_text=brief)
+            except Exception:                                   # noqa: BLE001
+                v = {"ok": True}
+            if not v.get("ok", True):
+                return ["the output degenerated (%s) — return clean, complete "
+                        "work only" % ", ".join(v.get("reasons") or ["junk"])]
+        if extra_check is not None:
+            try:
+                return list(extra_check(text) or [])
+            except Exception:                                   # noqa: BLE001
+                return []
+        return []
+
+    def _directed_fix(label, apply_role, mgr_ctx, free_ctx, work, problems, floor,
+                      exclude=(), extra_check=None, need_instructions=True):
+        """The manager DIRECTS a fix it cannot see in full: it writes short
+        instructions from a clipped excerpt, a FREE model applies them to the
+        FULL work, and the manager confirms from the diff. Up to two applies
+        (the second on another provider, told why the first was rejected).
+        Returns (text, who, trail); text "" = nothing accepted, the caller
+        keeps what it had. Without instructions from the manager the reviewer's
+        problems are applied as-is -- unless `need_instructions`."""
+        trail = []
+        if _spent():
+            return "", None, trail
+        probs = [str(p) for p in problems if str(p).strip()][:10]
+        instr, iwho = _mgr(
+            [{"role": "system", "content": _INSTRUCT_SYSTEM},
+             {"role": "user", "content":
+              "%s\n\nPROBLEMS TO FIX\n- %s\n\nTHE WORK (excerpt of %d characters; "
+              "the editor has all of it)\n%s"
+              % (mgr_ctx, "\n- ".join(probs) or "(none stated)", len(work or ""),
+                 _clip(work, FIX_EXCERPT_CHARS))}],
+            MANAGER_INSTRUCT_TOKENS, "fix")
+        if iwho:
+            trail.append(("fix-plan:%s" % label, iwho))
+        if not instr:
+            if need_instructions or not probs:
+                return "", None, trail
+            emit("fix", "%s: manager unavailable — free models" % label[:30])
+            instr = "\n".join("%d. Fix: %s" % (i, p) for i, p in enumerate(probs, 1))
+        failed = set(exclude or ())
+        rejected = []
+        for _attempt in (1, 2):
+            if _spent():
+                break
+            again = ("\n\nA PREVIOUS ATTEMPT WAS REJECTED. Also fix:\n- "
+                     + "\n- ".join(rejected)) if rejected else ""
+            text, who = dispatch(
+                [{"role": "system", "content": _APPLY_SYSTEM},
+                 {"role": "user", "content":
+                  "%s\n\nTHE WORK\n%s\n\nFIX INSTRUCTIONS\n%s%s\n\nReturn the COMPLETE "
+                  "work with every instruction applied — not a diff, not a list "
+                  "of changes." % (free_ctx, work, instr, again)}],
+                _apply_tokens(work, floor), exclude_pids=tuple(failed))
+            if who:
+                trail.append((apply_role, who))
+                failed.add(who.split("/", 1)[0])
+            rejected = _apply_problems(work, text, extra_check)
+            if not rejected:
+                v_text, v_who = _mgr(
+                    [{"role": "system", "content": _CONFIRM_SYSTEM},
+                     {"role": "user", "content":
+                      "PROBLEMS THAT HAD TO BE FIXED\n- %s\n\nYOUR INSTRUCTIONS\n%s"
+                      "\n\nWHAT CHANGED (diff)\n%s"
+                      % ("\n- ".join(probs) or "(none stated)", _clip(instr, 2000),
+                         _changes(work, text))}],
+                    MANAGER_VERDICT_TOKENS, "verify")
+                if v_who:
+                    trail.append(("confirm:%s" % label, v_who))
+                verdict = _parse_json(v_text)
+                # Unreadable passes, like every other verdict here: a checker
+                # must never be what throws away a fix that passed the free tests.
+                if not isinstance(verdict, dict) or "ok" not in verdict or \
+                        verdict.get("ok") is True or str(verdict.get("ok")).lower() == "true":
+                    return text, who, trail
+                rejected = _str_list(verdict.get("problems"), 4, 300) or \
+                    ["the manager rejected the fix without detail — apply every instruction"]
+            emit("fix", "%s: %s" % (label[:30], rejected[0][:44]))
+        return "", None, trail
+
     def _verified(idx, ph, msgs, first):
         """Check one worker's output; on failure retry ONCE on a different free
         model with the problems as instructions; after two failures the manager
@@ -823,7 +985,27 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
             text, used = dispatch(retry, PHASE_MAX_TOKENS, exclude_pids=tuple(failed))
             if used:
                 trail.append(("phase-retry:%s" % title, used))
-        if not _spent():
+        if not _spent() and len(fallback) > VERDICT_OUTPUT_CHARS:
+            # LONG output: the manager would rewrite it from an excerpt and
+            # drop the trimmed middle. It directs the fix instead; a free model
+            # (not one of the two that failed) applies it to the full text.
+            fix_text, fix_who, fix_trail = _directed_fix(
+                title, "phase-fix:%s" % title,
+                "OVERALL GOAL\n%s\n\nPHASE: %s\n%s%s"
+                % (_clip(goal, 1500), title, _clip(ph["task"], MANAGER_BRIEF_CHARS),
+                   ("\n\nDone when: " + _clip(ph["done_when"], MANAGER_PHASE_CHARS))
+                   if ph.get("done_when") else ""),
+                "OVERALL GOAL\n%s\n\nPHASE: %s\n%s%s%s"
+                % (goal, title, ph["task"],
+                   ("\n\nDone when: " + ph["done_when"]) if ph.get("done_when") else "",
+                   _render_brief(ph)),
+                fallback, problems, PHASE_MAX_TOKENS, exclude=tuple(failed),
+                extra_check=lambda t: _mechanical_problems(ph, t))
+            trail.extend(fix_trail)
+            if fix_text:
+                emit("verify", "%s: fixed as the manager directed" % title[:30])
+                return fix_text, fix_who, trail
+        elif not _spent():
             fix_text, fix_who = _mgr(
                 [{"role": "system", "content": _FIX_SYSTEM},
                  {"role": "user", "content":
@@ -1001,17 +1183,22 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                     "Return the COMPLETE corrected work — the full draft with every "
                     "problem fixed, not a diff, not a list of changes."
                     % (b, _clip(draft, DEP_CONTEXT_CHARS), "\n- ".join(problems[:10])))
-        # The final FIX is the manager's when there is one, capped at one
-        # phase's worth of output -- the draft it is shown is already clipped.
-        rev_text, rev_model = _staged(
-            [{"role": "system", "content": phase_system},
-             {"role": "user", "content": _rev_user(brief)}],
-            SYNTH_MAX_TOKENS, "fix",
-            mgr_msgs=[{"role": "system", "content": phase_system},
-                      {"role": "user", "content": _rev_user(mgr_brief)}],
-            mgr_tokens=MANAGER_FIX_TOKENS)
-        if rev_model:
-            models_used.append(("revision", rev_model))
+        if manager is None:
+            rev_text, rev_model = dispatch(
+                [{"role": "system", "content": phase_system},
+                 {"role": "user", "content": _rev_user(brief)}], SYNTH_MAX_TOKENS)
+            if rev_model:
+                models_used.append(("revision", rev_model))
+        else:
+            # With a manager the final fix is DIRECTED (see _directed_fix): the
+            # manager used to rewrite a draft clipped to DEP_CONTEXT_CHARS, so a
+            # long draft lost its middle in the "fixed" version. A rejected
+            # apply leaves `revised` False, and synthesis still gets the
+            # reviewer's problems -- nothing is worse than without a revision.
+            rev_text, rev_model, rev_trail = _directed_fix(
+                "revision", "revision", "BRIEF\n%s" % mgr_brief, "BRIEF\n%s" % brief,
+                draft, problems, SYNTH_MAX_TOKENS, need_instructions=False)
+            models_used.extend(rev_trail)
         if rev_text:
             draft = rev_text
             revised = True

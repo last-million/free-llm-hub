@@ -511,8 +511,8 @@ class _Run:
         # user, purpose, max_tokens) -> (text, tokens)`, injected like every
         # other model call here. None = no verification at all, i.e. the run
         # behaves exactly as it did before managers existed. Not persisted: a
-        # callable does not survive a restart, and a resumed run simply
-        # finishes unverified.
+        # callable does not survive a restart -- resume_interrupted(manager=)
+        # re-attaches the hub's current one.
         self.manager = manager
         self.modes = tuple(modes or ())
         # What the manager cost THIS run, planning included -- the hub's daily
@@ -1323,7 +1323,7 @@ RESUME_MAX_AGE = 6 * 3600
 
 
 def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
-                       max_age=RESUME_MAX_AGE, stop=None):
+                       max_age=RESUME_MAX_AGE, stop=None, manager=None, modes=None):
     """Pick up every run the last process left mid-way. Returns their ids.
 
     THE WORK GETS FINISHED. A run whose process died was marked failed and
@@ -1337,7 +1337,15 @@ def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
     Phases that were DONE keep their summaries; the ones that were running or
     waiting run again, in fresh sessions, in the same folder -- so a worker
     that had written half its files continues from what is on disk. Then the
-    review, then on_done, exactly as if nothing had happened."""
+    review, then on_done, exactly as if nothing had happened.
+
+    `manager` (same contract as start's) RE-ATTACHES the subscription
+    manager: a callable does not survive a restart, so without it every
+    resumed phase finished unverified and the report said "not verified by
+    the manager" for work the person had paid a manager to check. The run's
+    manager_tokens/manager_calls were restored from disk, so the cost keeps
+    accumulating on the same run. `modes` restores the worker-mode keys the
+    manager's verdict may suggest (also not persisted). None = as before."""
     resumed = []
     now = time.time()
     with _LOCK:
@@ -1362,6 +1370,10 @@ def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
             run.restored = False
             run.interrupted = False
             run.stop_flag.clear()
+            if manager is not None:
+                run.manager = manager
+            if modes and not run.modes:
+                run.modes = tuple(modes)
         _persist(run)
         threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure, stop),
                          daemon=True, name="swarm-resume-" + run.id).start()
