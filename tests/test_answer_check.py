@@ -19,6 +19,8 @@ import app
 
 CJK_JUNK = "OK出具证明的，原试题解析 做题如有雷同，纯属巧合…"
 MARKUP_JUNK = "6510</arg_value></tool_call>6510</arg_value></tool_call>The user asked"
+# A junk verdict weighs more than a plain failure (see _JUNK_FAIL_WEIGHT).
+JUNK_FAIL = app._JUNK_FAIL_WEIGHT
 
 
 @pytest.fixture(autouse=True)
@@ -319,7 +321,7 @@ def test_chat_serves_the_salvage_and_records_a_failure(monkeypatch):
     assert body["choices"][0]["message"]["content"] == "OK"
     assert body["choices"][0]["finish_reason"] == "stop"
     assert calls == ["llm7"], "a salvageable answer must not cost another hop"
-    assert _outcome(*BAD) == (0, 1), "a degenerating hop must not be promoted"
+    assert _outcome(*BAD) == (0, JUNK_FAIL), "a degenerating hop must not be promoted"
     assert app._is_model_dead(*BAD) is False, "a heuristic never bans a model"
 
 
@@ -329,7 +331,7 @@ def test_chat_pure_junk_falls_through_to_the_next_hop(monkeypatch):
     assert r.status_code == 200
     assert r.get_json()["choices"][0]["message"]["content"] == "REAL ANSWER"
     assert calls == ["llm7", "groq"]
-    assert _outcome(*BAD) == (0, 1)
+    assert _outcome(*BAD) == (0, JUNK_FAIL)
     assert _outcome(*GOOD) == (1, 0)
 
 
@@ -347,7 +349,7 @@ def test_responses_serves_the_salvage(monkeypatch):
     assert r.status_code == 200
     blob = json.dumps(r.get_json())
     assert "6510" in blob and "tool_call" not in blob
-    assert _outcome(*BAD) == (0, 1)
+    assert _outcome(*BAD) == (0, JUNK_FAIL)
 
 
 def test_messages_pure_junk_falls_through(monkeypatch):
@@ -358,7 +360,7 @@ def test_messages_pure_junk_falls_through(monkeypatch):
     assert r.status_code == 200
     assert "REAL ANSWER" in json.dumps(r.get_json())
     assert calls[:2] == ["llm7", "groq"]
-    assert _outcome(*BAD)[1] == 1
+    assert _outcome(*BAD)[1] == JUNK_FAIL
 
 
 # --------------------------------------------------------------------------- #
@@ -386,7 +388,7 @@ def test_chat_passthrough_stream_records_failure_for_junk():
     out = b"".join(app._proxy_sse(_StreamResp(), iter(frames), hop_pid=BAD[0],
                                   hop_model=BAD[1], prompt_text="Reply with just OK"))
     assert b"\\u51fa\\u5177" in out, "streamed bytes are never un-sent"
-    assert _outcome(*BAD) == (0, 1)
+    assert _outcome(*BAD) == (0, JUNK_FAIL)
 
 
 def test_chat_passthrough_stream_records_success_for_clean():
@@ -399,7 +401,7 @@ def test_chat_passthrough_stream_records_success_for_clean():
 def test_responses_stream_records_outcome():
     list(app._responses_stream(_StreamResp(), "auto", line_iter=iter(_sse(MARKUP_JUNK, fin="length")),
                                hop_pid=BAD[0], hop_model=BAD[1], prompt_text="5 + 6505?"))
-    assert _outcome(*BAD) == (0, 1)
+    assert _outcome(*BAD) == (0, JUNK_FAIL)
     list(app._responses_stream(_StreamResp(), "auto", line_iter=iter(_sse("Fine.")),
                                hop_pid=GOOD[0], hop_model=GOOD[1], prompt_text="hi"))
     assert _outcome(*GOOD) == (1, 0)
@@ -409,7 +411,7 @@ def test_anthropic_stream_records_outcome():
     list(app._anthropic_stream(_StreamResp(), "claude", 5,
                                line_iter=iter(_sse("OK", "出具证明的，原试题解析 做题如有雷同", fin="length")),
                                hop_pid=BAD[0], hop_model=BAD[1], prompt_text="say OK"))
-    assert _outcome(*BAD) == (0, 1)
+    assert _outcome(*BAD) == (0, JUNK_FAIL)
     list(app._anthropic_stream(_StreamResp(), "claude", 5, line_iter=iter(_sse("Fine.")),
                                hop_pid=GOOD[0], hop_model=GOOD[1], prompt_text="hi"))
     assert _outcome(*GOOD) == (1, 0)
