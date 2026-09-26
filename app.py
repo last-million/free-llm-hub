@@ -1006,9 +1006,22 @@ def _codex_dump_models(binary):
 def _refresh_codex_catalog():
     """Rewrite ~/.codex/model_catalog.json so /model offers the hub's modes.
 
+    ONLY WHILE CODEX IS CONNECTED TO THE HUB. REPORTED 2026-09-26: "when I
+    disconnect a CLI from the hub it should not show anymore the models and
+    efforts and modes of Calvoun hub". This ran at every hub start for every
+    installed codex, connected or not, so a disconnected codex kept the hub's
+    category entries and its four effort tiers in /model -- ids that only mean
+    something to this hub. Disconnected now means: write nothing, and remove a
+    catalog this hub wrote earlier (_codex_disconnect_catalog restores the
+    user's own pre-hub catalog when one was backed up, and never touches a
+    catalog that is not ours).
+
     Silent no-op when codex is not installed, when its dump cannot be read, or
     when the file already says what we would write."""
     try:
+        if not _codex_wired_to_hub():
+            _codex_disconnect_catalog()
+            return
         binary = _which_cli("codex")
         if not binary:
             return
@@ -1019,7 +1032,7 @@ def _refresh_codex_catalog():
         if not entries:
             return
         payload = json.dumps({"models": entries}, indent=2) + "\n"
-        path = os.path.join(_home(), ".codex", "model_catalog.json")
+        path = _codex_catalog_path()
         if os.path.isfile(path):
             with open(path, encoding="utf-8") as fh:
                 if fh.read() == payload:
@@ -1038,7 +1051,10 @@ def _refresh_codex_catalog():
             os.remove(tmp)
             _log.warning("[codex] catalog rejected by the installed binary; left alone")
             return
-        if os.path.isfile(path):
+        # Back up only the USER'S catalog. Backing up our own previous write
+        # (what this did before) made the "pre-hub" backup a hub catalog, so a
+        # restore on Disconnect would have put the hub's modes straight back.
+        if os.path.isfile(path) and not _codex_catalog_is_hubs(path):
             _backup_once(path)
         os.replace(tmp, path)
         _log.info("[codex] model catalog refreshed (%d entries)", len(entries))
@@ -1081,11 +1097,25 @@ def _repair_opencode_config():
     Narrow on purpose: the helper only edits a provider block named
     free-llm-hub, only fills in ABSENT fields, and writes nothing when there is
     nothing to add. Backed up first anyway, because this is the user's file and
-    not ours."""
+    not ours.
+
+    Only for a CONNECTED opencode: with no free-llm-hub provider block there is
+    nothing of ours to top up (_upgrade_opencode_seed never creates one), and a
+    disconnected user must not get a .freehub-bak dropped next to their config
+    at every hub start either."""
     try:
         path = _p_opencode()
         if not os.path.isfile(path):
             return
+        try:
+            with open(path, "r", encoding="utf-8-sig") as fh:
+                current = json.load(fh)
+        except (OSError, ValueError):
+            return
+        prov_block = (current.get("provider") or {}) if isinstance(current, dict) else {}
+        if not isinstance(prov_block, dict) or \
+                not isinstance(prov_block.get("free-llm-hub"), dict):
+            return                               # disconnected: leave the file alone
         _backup_once(path)
         agentic_chat._upgrade_opencode_seed(path)
     except Exception as exc:                                     # noqa: BLE001
@@ -16931,6 +16961,342 @@ def _discard_backup(path):
         pass
 
 
+# --- What a disconnected CLI must no longer see -----------------------------
+# REPORTED 2026-09-26: "when I disconnect a CLI from the hub it should not show
+# anymore the models and efforts and modes of Calvoun hub -- they are still
+# there and when I want to use them I have issues." Stripping the provider
+# block was never the whole job. While connected, the CLI's OWN picker writes
+# the hub's virtual ids ("coding", "coding-swarm", "multi", ...) back into its
+# config as the default model, and a pre-hub default the connector replaced was
+# simply dropped. Both leave a CLI that asks a real provider for a model only
+# this hub understands. So every reverter also removes hub-only model ids and
+# puts back the pre-hub value, read from the .freehub-bak taken at Connect
+# (only when that backup is not itself hub-wired).
+
+# Claude Code's own /model aliases: never treated as a hub id even where the
+# hub happens to use the same word.
+_CLAUDE_OWN_MODEL_ALIASES = frozenset({
+    "default", "sonnet", "opus", "haiku", "opusplan", "best",
+    "sonnet[1m]", "opus[1m]"})
+_HUB_PROVIDER_PREFIXES = ("free-llm-hub/", "freehub/", "free-hub/")
+
+
+def _is_hub_virtual_model(mid):
+    """True for a model id only THIS hub understands: the tiers (auto, all,
+    best, max, multi), every category, a '<category>-<effort>' compound, the
+    swarm/crew pipelines, or anything under the hub's own provider prefix.
+    Never raises; a non-string is never ours."""
+    try:
+        if not isinstance(mid, str):
+            return False
+        m = mid.strip().lower()
+        if not m:
+            return False
+        if m.startswith(_HUB_PROVIDER_PREFIXES):
+            return True
+        if m in _virtual_model_ids():
+            return True
+        return _split_category_effort(m)[0] is not None
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _read_backup_text(path):
+    """The Connect-time .freehub-bak of `path` as text, or None."""
+    try:
+        with open(path + ".freehub-bak", "r", encoding="utf-8-sig", errors="ignore") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _read_backup_json(path):
+    """The Connect-time .freehub-bak of `path` as a JSON object, or None."""
+    text = _read_backup_text(path)
+    if text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_json_object(path):
+    """(data, ok): the file as a JSON object. ok=False when missing/unparseable/
+    not an object -- the caller then leaves it alone."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None, False
+    return (data, True) if isinstance(data, dict) else (None, False)
+
+
+def _hub_mcp_kept(cli_id):
+    """Path of the CLI config that still registers the hub's own MCP server
+    (the crew tools), or None. That entry is deliberately NOT removed by
+    Disconnect (see AGENTS.md "MCP: the hub as a tool server") -- it is
+    reported so the user knows it is there and where to remove it."""
+    try:
+        if cli_id not in mcp_manager.supported_clis():
+            return None
+        path = mcp_manager._config_path(cli_id)
+        if not path or not os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        return path if _strip_hub_mcp_table(text) != text else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+# ---- codex ----
+
+_CODEX_TOP_KEY_RE = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*=\s*(.*?)\s*$")
+
+
+def _toml_scalar(rhs):
+    """Value of a TOML right-hand side (`"x"  # note` -> 'x'). Best-effort."""
+    try:
+        import tomllib
+        return tomllib.loads("v = " + rhs).get("v")
+    except Exception:                                            # noqa: BLE001
+        return rhs.split("#", 1)[0].strip().strip("\"'")
+
+
+def _codex_top_entries(lines):
+    """[(index, key, value)] for the bare keys of a TOP-section line list."""
+    out = []
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith("#"):
+            continue
+        m = _CODEX_TOP_KEY_RE.match(ln)
+        if m:
+            out.append((i, m.group(1), _toml_scalar(m.group(2))))
+    return out
+
+
+def _codex_split_top(text):
+    top, rest, in_rest = [], [], False
+    for ln in (text or "").splitlines():
+        if not in_rest and _CODEX_TABLE_RE.match(ln):
+            in_rest = True
+        (rest if in_rest else top).append(ln)
+    return top, rest
+
+
+def _codex_join(top, rest):
+    new_text = "\n".join(top + rest).rstrip("\n")
+    return new_text + "\n" if new_text else ""
+
+
+def _codex_is_ours(key, value):
+    if key == "model_provider":
+        return isinstance(value, str) and value.strip().lower() == "freehub"
+    if key == "model":
+        return _is_hub_virtual_model(value)
+    return False
+
+
+def _codex_revert_top(text, backup_text=None):
+    """Undo the TOP-section keys Connect (and codex's own /model picker, while
+    connected) left behind. Returns (new_text, changed).
+
+      * model_provider = "freehub" is removed;
+      * model = <any hub-only id> is removed -- not just "auto": /model writes
+        the CATEGORY the user picked ("coding"), which a real provider rejects;
+      * a key removed above gets its PRE-HUB line back from the Connect-time
+        backup, when that backup had one that is not the hub's;
+      * model_reasoning_effort, which /model turned into the hub's tier knob
+        (Normal/Max/Swarm/Multi), goes back to its pre-hub value -- only when
+        a backup proves what that was, and only in a pass that disconnected.
+    A key the user has since set to something else is left alone."""
+    top, rest = _codex_split_top(text)
+    removed = False
+    kept = []
+    for ln in top:
+        m = None if ln.lstrip().startswith("#") else _CODEX_TOP_KEY_RE.match(ln)
+        if m and _codex_is_ours(m.group(1), _toml_scalar(m.group(2))):
+            removed = True
+            continue
+        kept.append(ln)
+    if not removed:
+        return text, False
+    bak_top = {}
+    if backup_text is not None:
+        btop, _ = _codex_split_top(backup_text)
+        for i, key, value in _codex_top_entries(btop):
+            if not _codex_is_ours(key, value):
+                bak_top.setdefault(key, btop[i])
+    present = {key for _i, key, _v in _codex_top_entries(kept)}
+    restore = [bak_top[k] for k in ("model_provider", "model")
+               if k not in present and k in bak_top]
+    if backup_text is not None:
+        eff_idx = [i for i, key, _v in _codex_top_entries(kept)
+                   if key == "model_reasoning_effort"]
+        if "model_reasoning_effort" in bak_top:
+            if eff_idx:
+                kept[eff_idx[0]] = bak_top["model_reasoning_effort"]
+            else:
+                restore.append(bak_top["model_reasoning_effort"])
+        else:
+            for i in reversed(eff_idx):
+                del kept[i]
+    # Strip leading blank lines the removals exposed, so the file never starts
+    # with an empty line where our keys used to be.
+    while kept and not kept[0].strip():
+        kept.pop(0)
+    return _codex_join(restore + kept, rest), True
+
+
+def _codex_catalog_path(config_path=None):
+    """~/.codex/model_catalog.json -- next to the config.toml it serves."""
+    return os.path.join(os.path.dirname(config_path or _p_codex()), "model_catalog.json")
+
+
+def _codex_catalog_is_hubs(path):
+    """Did THIS hub write that catalog? Every hub entry is labelled
+    '... (Calvoun hub)' by _codex_catalog_label. An unreadable file is never
+    ours -- it is left exactly where it is."""
+    data, ok = _read_json_object(path)
+    if not ok:
+        return False
+    models = data.get("models")
+    if not isinstance(models, list):
+        return False
+    return any(isinstance(m, dict)
+               and str(m.get("display_name") or "").endswith("(Calvoun hub)")
+               for m in models)
+
+
+def _codex_wired_to_hub(config_path=None):
+    """Is codex's REAL config.toml pointed at this hub right now? The hub's
+    MCP server registration is excluded (a separate, persistent feature)."""
+    path = config_path or _p_codex()
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+            text = f.read()
+    except OSError:
+        return False
+    if re.search(r"^\s*\[\s*model_providers\.freehub\s*\]", text, re.M):
+        return True
+    if re.search(r"""^\s*model_provider\s*=\s*["']freehub["']""", text, re.M):
+        return True
+    return any(fr in _strip_hub_mcp_table(text) for fr in _hub_fragments())
+
+
+def _same_path(value, target):
+    try:
+        v = os.path.expanduser(str(value))
+        if not os.path.isabs(v):
+            v = os.path.join(os.path.dirname(target), v)
+        return os.path.normcase(os.path.abspath(v)) == os.path.normcase(os.path.abspath(target))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _strip_codex_catalog_key(text, catalog_path):
+    """Remove a TOP-section model_catalog_json line naming `catalog_path`.
+    Returns (new_text, removed). A catalog key naming any other file is the
+    user's and stays."""
+    top, rest = _codex_split_top(text)
+    kept, removed = [], False
+    for ln in top:
+        m = None if ln.lstrip().startswith("#") else _CODEX_TOP_KEY_RE.match(ln)
+        if m and m.group(1) == "model_catalog_json" and \
+                _same_path(_toml_scalar(m.group(2)), catalog_path):
+            removed = True
+            continue
+        kept.append(ln)
+    return (_codex_join(kept, rest), True) if removed else (text, False)
+
+
+def _codex_disconnect_catalog(config_path=None):
+    """Take the hub's /model catalog back out of codex. Never raises.
+
+      * the live catalog is ours and a backup of the USER'S own catalog exists
+        -> that backup is put back (the user's pre-hub picker returns);
+      * the live catalog is ours and there is no user backup -> it is deleted,
+        a backup that only holds a hub catalog is deleted too, and a
+        model_catalog_json key in config.toml naming the deleted file is
+        removed (codex would otherwise point at a file that is gone);
+      * the live catalog is not ours -> nothing is touched at all.
+    Returns {"catalog": "deleted"|"restored"|None, "config_key_removed": bool}."""
+    out = {"catalog": None, "config_key_removed": False}
+    try:
+        cfg = config_path or _p_codex()
+        cat = _codex_catalog_path(cfg)
+        bak = cat + ".freehub-bak"
+        live_exists = os.path.isfile(cat)
+        if live_exists and not _codex_catalog_is_hubs(cat):
+            return out                                   # the user's own catalog
+        bak_exists = os.path.isfile(bak)
+        bak_is_users = bak_exists and not _codex_catalog_is_hubs(bak)
+        if live_exists:
+            if bak_is_users:
+                shutil.copy2(bak, cat)
+                os.remove(bak)
+                out["catalog"] = "restored"
+                return out
+            os.remove(cat)
+            out["catalog"] = "deleted"
+        if bak_exists and not bak_is_users:
+            os.remove(bak)          # a "backup" of our own catalog restores nothing of theirs
+        if not os.path.isfile(cat) and os.path.isfile(cfg):
+            with open(cfg, "r", encoding="utf-8-sig", errors="ignore") as f:
+                text = f.read()
+            new_text, removed = _strip_codex_catalog_key(text, cat)
+            if removed:
+                _cli_write_text(cfg, new_text)
+                out["config_key_removed"] = True
+    except OSError as exc:
+        _log.debug("codex catalog cleanup skipped: %s", exc)
+    return out
+
+
+# ---- claude ----
+
+_CLAUDE_HUB_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL")
+_CLAUDE_MODEL_ENV = ("ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                     "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                     "CLAUDE_CODE_SUBAGENT_MODEL")
+
+
+def _claude_is_hub_model(mid):
+    return (_is_hub_virtual_model(mid)
+            and str(mid).strip().lower() not in _CLAUDE_OWN_MODEL_ALIASES)
+
+
+def _claude_strip_hub(data, bak_env=None):
+    """Strip the hub from one parsed Claude settings object in place.
+    Returns changed. The env block is only touched when it points HERE; a
+    top-level "model" that /model set to a hub-only id is dropped either way
+    (Anthropic would reject it)."""
+    changed = False
+    env = data.get("env")
+    if isinstance(env, dict) and _points_at_hub(env.get("ANTHROPIC_BASE_URL")):
+        for k in _CLAUDE_HUB_ENV:
+            if env.pop(k, None) is not None:
+                changed = True
+        for k in _CLAUDE_MODEL_ENV:
+            if _claude_is_hub_model(env.get(k)):
+                env.pop(k, None)
+                changed = True
+        # Put back what Connect overwrote, from a backup that was not hub-wired.
+        if isinstance(bak_env, dict) and not _points_at_hub(bak_env.get("ANTHROPIC_BASE_URL")):
+            for k in _CLAUDE_HUB_ENV:
+                v = bak_env.get(k)
+                if isinstance(v, str) and v and not _claude_is_hub_model(v) and k not in env:
+                    env[k] = v
+        if not env:
+            data.pop("env", None)
+    if _claude_is_hub_model(data.get("model")):
+        data.pop("model", None)
+        changed = True
+    return changed
+
+
 def _disconnect_claude(entry):
     path = entry["write_path"]
     hint = "Restart Claude Code (open a new terminal) so it re-reads ~/.claude/settings.json."
@@ -16940,32 +17306,33 @@ def _disconnect_claude(entry):
     # settings.json AFTER connecting. As long as the live file still parses as JSON
     # we strip ONLY our three env keys and keep everything else, then drop the stale
     # backup. The backup restore is a last resort for a file that no longer parses.
+    # settings.local.json is detected as a connection source too (CLI_REGISTRY),
+    # so the same hub keys are stripped there -- never restored from anything,
+    # never deleted, every other key untouched.
+    local_changed = False
+    local = os.path.join(os.path.dirname(path), "settings.local.json")
+    ldata, lok = _read_json_object(local)
+    if lok and _claude_strip_hub(ldata):
+        _cli_write_text(local, json.dumps(ldata, indent=2, ensure_ascii=False) + "\n")
+        local_changed = True
     if os.path.isfile(path):
-        try:
-            with open(path, "r", encoding="utf-8-sig") as f:  # tolerate a UTF-8 BOM
-                data = json.load(f)
-        except (OSError, ValueError):
-            data = None
-        if isinstance(data, dict):
-            changed = False
-            env = data.get("env")
-            # Only touch keys we set, and only when the base URL is ours.
-            if isinstance(env, dict) and _points_at_hub(env.get("ANTHROPIC_BASE_URL")):
-                for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"):
-                    if env.pop(k, None) is not None:
-                        changed = True
-                if not env:
-                    data.pop("env", None)
+        data, ok = _read_json_object(path)
+        if ok:
+            bak = _read_backup_json(path)
+            bak_env = bak.get("env") if isinstance(bak, dict) else None
+            # Only touch keys we set, and only when the base URL is ours; the
+            # pre-hub values come back from the Connect-time backup.
+            changed = _claude_strip_hub(data, bak_env)
             if changed:
                 _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
             _discard_backup(path)  # strip succeeded -> stale backup no longer needed
             return {"restored_from_backup": False, "wrote_path": path,
-                    "changed": changed, "restart_hint": hint}
+                    "changed": changed or local_changed, "restart_hint": hint}
     # Live file missing or no longer valid JSON -> fall back to the frozen backup.
     if _restore_backup(path):
         return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
     return {"restored_from_backup": False, "wrote_path": path,
-            "changed": False, "restart_hint": hint}
+            "changed": local_changed, "restart_hint": hint}
 
 
 def _disconnect_aider(entry):
@@ -16974,14 +17341,27 @@ def _disconnect_aider(entry):
     if _restore_backup(path):
         return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
     changed = False
+    deleted = False
     if os.path.isfile(path) and _file_points_at_hub(path):
         text, removed = _remove_flat_yaml_keys(
             path, ["openai-api-base", "openai-api-key", "model"])
         if text is not None and removed:
-            _cli_write_text(path, text)
+            # No backup -> Connect CREATED this file; nothing left means nothing
+            # of the user's was ever in it, so remove the empty shell.
+            if not text.strip():
+                try:
+                    os.remove(path)
+                    deleted = True
+                except OSError:
+                    _cli_write_text(path, text)
+            else:
+                _cli_write_text(path, text)
             changed = True
-    return {"restored_from_backup": False, "wrote_path": path,
-            "changed": changed, "restart_hint": hint}
+    out = {"restored_from_backup": False, "wrote_path": path,
+           "changed": changed, "restart_hint": hint}
+    if deleted:
+        out["deleted"] = True
+    return out
 
 
 def _disconnect_pi(entry):
@@ -17015,10 +17395,47 @@ def _disconnect_pi(entry):
                         deleted = True
                     except OSError:
                         _cli_write_text(path, "{}\n")
+            _discard_backup(path)   # strip succeeded -> the first-connect copy is stale litter
+    # Pi's own settings.json remembers the model picked with /model. Left
+    # pointing at the provider we just removed, Pi starts on a model that no
+    # longer exists -- so a default naming OUR provider goes, and nothing else.
+    settings_changed = _pi_forget_hub_default(os.path.dirname(path))
     return {"ok": True, "reverted_path": path if (changed or deleted) else None,
+            "wrote_path": path,
+            "changed": bool(changed or deleted or settings_changed),
             "detail": ("removed the free-llm-hub provider" if changed
                        else "nothing of ours was in the file"),
             "restart_hint": hint}
+
+
+def _pi_forget_hub_default(agent_dir):
+    """Drop Pi's defaultProvider/defaultModel when they name the hub, and any
+    free-llm-hub/* entry of enabledModels. Returns changed. Never raises."""
+    changed = False
+    for spath in (os.path.join(agent_dir, "settings.json"),
+                  os.path.join(os.path.dirname(agent_dir), "settings.json")):
+        data, ok = _read_json_object(spath)
+        if not ok:
+            continue
+        mine = False
+        if str(data.get("defaultProvider") or "").strip().lower() == "free-llm-hub":
+            data.pop("defaultProvider", None)
+            data.pop("defaultModel", None)
+            mine = True
+        enabled = data.get("enabledModels")
+        if isinstance(enabled, list):
+            keep = [m for m in enabled
+                    if not (isinstance(m, str) and m.strip().lower().startswith("free-llm-hub/"))]
+            if len(keep) != len(enabled):
+                data["enabledModels"] = keep
+                mine = True
+        if mine:
+            try:
+                _cli_write_text(spath, json.dumps(data, indent=2) + "\n")
+                changed = True
+            except OSError:
+                pass
+    return changed
 
 
 def _disconnect_opencode(entry):
@@ -17044,8 +17461,34 @@ def _disconnect_opencode(entry):
                     data.pop("provider", None)
             m = data.get("model")
             if isinstance(m, str) and m.startswith("free-llm-hub/"):
-                data.pop("model", None)
+                # Connect replaced the user's default with free-llm-hub/auto;
+                # the Connect-time backup says what it was. Restore it, unless
+                # that backup was itself hub-wired -- then just drop the key.
+                bak = _read_backup_json(path)
+                prev = bak.get("model") if isinstance(bak, dict) else None
+                if isinstance(prev, str) and prev.strip() and \
+                        not prev.startswith("free-llm-hub/"):
+                    data["model"] = prev
+                else:
+                    data.pop("model", None)
                 changed = True
+            # Every other reference to the provider just removed: small_model,
+            # and a per-agent/per-mode model the user pointed at the hub. Left
+            # behind, opencode fails with "model not found" the moment that
+            # agent runs -- the "I have issues when I use them" half of the report.
+            sm = data.get("small_model")
+            if isinstance(sm, str) and sm.startswith("free-llm-hub/"):
+                data.pop("small_model", None)
+                changed = True
+            for section in ("agent", "mode"):
+                block = data.get(section)
+                if not isinstance(block, dict):
+                    continue
+                for spec in block.values():
+                    if isinstance(spec, dict) and isinstance(spec.get("model"), str) \
+                            and spec["model"].startswith("free-llm-hub/"):
+                        spec.pop("model", None)
+                        changed = True
             if changed:
                 # A lone "$schema" (or nothing) left means the file holds nothing of
                 # the user's — remove it for a clean revert instead of leaving a
@@ -17076,9 +17519,15 @@ def _disconnect_opencode(entry):
 def _disconnect_qwen(entry):
     path = entry["write_path"]
     hint = "Re-run `qwen` in a new terminal; it reloads ~/.qwen/.env on startup."
+    # Qwen's /model saves the pick in settings.json (model.name, or a flat
+    # "model" string on older versions). A hub-only id there survives the .env
+    # revert and is sent to whatever provider qwen talks to next.
+    settings_changed = _qwen_forget_hub_model(
+        os.path.join(os.path.dirname(path), "settings.json"))
     if _restore_backup(path):
-        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
-    changed = False
+        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint,
+                "changed": True}
+    changed = settings_changed
     deleted = False
     if os.path.isfile(path) and _file_points_at_hub(path):
         text, removed = _remove_dotenv_keys(
@@ -17103,6 +17552,29 @@ def _disconnect_qwen(entry):
     return out
 
 
+def _qwen_forget_hub_model(spath):
+    """Drop a hub-only model id from Qwen Code's settings.json. Returns changed."""
+    data, ok = _read_json_object(spath)
+    if not ok:
+        return False
+    changed = False
+    model = data.get("model")
+    if isinstance(model, str) and _is_hub_virtual_model(model):
+        data.pop("model", None)
+        changed = True
+    elif isinstance(model, dict) and _is_hub_virtual_model(model.get("name")):
+        model.pop("name", None)
+        if not model:
+            data.pop("model", None)
+        changed = True
+    if changed:
+        try:
+            _cli_write_text(spath, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        except OSError:
+            return False
+    return changed
+
+
 def _remove_toml_table(text, table_name):
     """Remove a '[<table_name>]' block (its header line through the line before
     the next '[table]' header, or EOF). Returns (new_text, removed_bool)."""
@@ -17122,24 +17594,6 @@ def _remove_toml_table(text, table_name):
     return (new_text + "\n" if new_text else ""), removed
 
 
-def _strip_codex_top_keys(text):
-    """Remove our exact 'model_provider = "freehub"' / 'model = "auto"' lines from
-    the TOP (pre-table) section only. Returns (new_text, removed_bool)."""
-    lines = text.splitlines()
-    mp = re.compile(r'^\s*model_provider\s*=\s*"freehub"\s*$')
-    md = re.compile(r'^\s*model\s*=\s*"auto"\s*$')
-    out, removed, in_rest = [], False, False
-    for ln in lines:
-        if not in_rest and _CODEX_TABLE_RE.match(ln):
-            in_rest = True
-        if not in_rest and (mp.match(ln) or md.match(ln)):
-            removed = True
-            continue
-        out.append(ln)
-    new_text = "\n".join(out).rstrip("\n")
-    return (new_text + "\n" if new_text else ""), removed
-
-
 def _disconnect_codex(entry):
     path = entry.get("write_path") or _p_codex()
     hint = "Restart Codex (open a new terminal) so it re-reads ~/.codex/config.toml."
@@ -17148,10 +17602,15 @@ def _disconnect_codex(entry):
     # [mcp_servers.*] / setting the user added to config.toml after connecting
     # survives — never blind-restore the stale first-connect backup. Restore the
     # frozen backup only if the file can't be read at all.
-    # Trade-off (documented): if the user had their OWN model/model_provider before
-    # connecting, autofix overwrote those scalars and the strip removes them rather
-    # than restoring the originals — the same limitation as the line-based CLIs.
-    # Preserving newly-added MCP servers outweighs restoring a trivially-reset scalar.
+    # The user's OWN pre-hub model/model_provider (and reasoning effort) come back
+    # from the Connect-time backup -- key by key, so everything else added since
+    # survives (_codex_revert_top). A model id the /model picker wrote while
+    # connected ("coding", "coding-swarm", "multi") is removed like "auto".
+    # Then the hub's /model catalog goes too (_codex_disconnect_catalog): with
+    # the provider gone its entries and four effort tiers are ids no real
+    # provider serves -- exactly what "still shows the hub's models, efforts
+    # and modes" was.
+    out = None
     if os.path.isfile(path):
         try:
             # utf-8-sig: tolerate/strip a leading UTF-8 BOM on the way back out too.
@@ -17161,19 +17620,28 @@ def _disconnect_codex(entry):
             text = None
         if text is not None:
             text2, tbl_removed = _remove_toml_table(text, "model_providers.freehub")
-            text3, top_removed = _strip_codex_top_keys(text2)
+            text3, top_removed = _codex_revert_top(text2, _read_backup_text(path))
             changed = False
             if tbl_removed or top_removed:
                 _cli_write_text(path, text3)
                 changed = True
             _discard_backup(path)  # strip succeeded -> stale backup no longer needed
-            return {"restored_from_backup": False, "wrote_path": path,
-                    "changed": changed, "restart_hint": hint}
-    # Unreadable / missing -> fall back to the frozen backup.
-    if _restore_backup(path):
-        return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
-    return {"restored_from_backup": False, "wrote_path": path,
-            "changed": False, "restart_hint": hint}
+            out = {"restored_from_backup": False, "wrote_path": path,
+                   "changed": changed, "restart_hint": hint}
+    if out is None:
+        # Unreadable / missing -> fall back to the frozen backup.
+        if _restore_backup(path):
+            out = {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
+        else:
+            out = {"restored_from_backup": False, "wrote_path": path,
+                   "changed": False, "restart_hint": hint}
+    if not _codex_wired_to_hub(path):
+        cat = _codex_disconnect_catalog(path)
+        if cat["catalog"]:
+            out["catalog"] = cat["catalog"]
+        if cat["catalog"] or cat["config_key_removed"]:
+            out["changed"] = True
+    return out
 
 
 _LLM_ITEM_RE = re.compile(r"^\s*-\s+\S")
@@ -17269,16 +17737,42 @@ def _disconnect_openclaw(entry):
             defaults = agents.get("defaults") if isinstance(agents, dict) else None
             if isinstance(defaults, dict):
                 amodels = defaults.get("models")
-                if isinstance(amodels, dict) and amodels.pop("freehub/auto", None) is not None:
-                    changed = True
+                if isinstance(amodels, dict):
+                    for k in [k for k in amodels if str(k).startswith("freehub/")]:
+                        amodels.pop(k, None)
+                        changed = True
+                    if not amodels:
+                        defaults.pop("models", None)
                 mdl = defaults.get("model")
-                if isinstance(mdl, dict) and mdl.get("primary") == "freehub/auto":
-                    prev = config.get_setting("openclaw_prev_primary")
-                    if prev:
-                        mdl["primary"] = prev      # restore what they had before connecting
-                    else:
-                        mdl.pop("primary", None)   # no memory -> let OpenClaw use its own default
-                    changed = True
+                if isinstance(mdl, dict):
+                    if str(mdl.get("primary") or "").startswith("freehub/"):
+                        prev = config.get_setting("openclaw_prev_primary")
+                        if prev:
+                            mdl["primary"] = prev      # restore what they had before connecting
+                        else:
+                            mdl.pop("primary", None)   # no memory -> let OpenClaw use its own default
+                        changed = True
+                    fb = mdl.get("fallbacks")
+                    if isinstance(fb, list):
+                        keep = [m for m in fb if not str(m).startswith("freehub/")]
+                        if len(keep) != len(fb):
+                            mdl["fallbacks"] = keep
+                            changed = True
+                    if not mdl:
+                        defaults.pop("model", None)
+                if not defaults and isinstance(agents, dict):
+                    agents.pop("defaults", None)
+                    if not agents:
+                        data.pop("agents", None)
+            # Connect set models.mode = "merge" (OpenClaw's own default) only to
+            # keep the built-in providers next to ours. Nothing else left in
+            # `models`, and a pre-hub file that had no `models` at all (or no
+            # backup: Connect created the file), means that shell was ours.
+            bak = _read_backup_json(path)
+            if changed and isinstance(models, dict) and \
+                    set(models) <= {"mode"} and models.get("mode", "merge") == "merge" and \
+                    (bak is None or "models" not in bak):
+                data.pop("models", None)
             if changed:
                 config.set_setting("openclaw_prev_primary", "")  # clear the stash
                 _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
@@ -17311,6 +17805,13 @@ def _disconnect_hermes(entry):
                 for k in ("provider", "base_url", "default", "api_key"):
                     if mdl.pop(k, None) is not None:
                         changed = True
+                # Connect OVERWROTE these four; the Connect-time backup holds
+                # the user's own provider/model. Put back the ones it had --
+                # unless that backup was itself pointed at the hub.
+                prev = _hermes_backup_model(path)
+                for k in ("provider", "base_url", "default", "api_key"):
+                    if k in prev and k not in mdl:
+                        mdl[k] = prev[k]
                 if not mdl:
                     data.pop("model", None)
             deleted = False
@@ -17337,6 +17838,27 @@ def _disconnect_hermes(entry):
         return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
     return {"restored_from_backup": False, "wrote_path": path,
             "changed": False, "restart_hint": hint}
+
+
+def _hermes_backup_model(path):
+    """The pre-hub model.{provider,base_url,default,api_key} from Hermes'
+    Connect-time backup, or {} (no backup, unparseable, or hub-wired)."""
+    text = _read_backup_text(path)
+    if not text:
+        return {}
+    try:
+        import yaml
+        data = yaml.safe_load(text)
+    except Exception:                                            # noqa: BLE001
+        return {}
+    mdl = data.get("model") if isinstance(data, dict) else None
+    if not isinstance(mdl, dict) or _points_at_hub(mdl.get("base_url")):
+        return {}
+    out = {k: mdl[k] for k in ("provider", "base_url", "default", "api_key")
+           if k in mdl and mdl[k] is not None}
+    if _is_hub_virtual_model(out.get("default")):
+        out.pop("default", None)
+    return out
 
 
 def _kimi_restore_default_model(text):
@@ -17677,6 +18199,12 @@ def _bulk_hub_off(expected_revision):
                 result = _restore_cli_snapshot(generation, cid)
             except Exception as exc:
                 result = {"status": "conflict", "detail": _sanitize(str(exc))}
+            # The snapshot covers config.toml only; the /model catalog is a
+            # second file, so a codex switched off here would keep the hub's
+            # modes and effort tiers in its picker.
+            if cid == "codex" and result.get("status") == "off" and \
+                    not _codex_wired_to_hub(result.get("path") or None):
+                _codex_disconnect_catalog(result.get("path") or None)
             clients[cid] = result
             conflicts = conflicts or result.get("status") == "conflict"
     else:
@@ -18343,6 +18871,25 @@ def api_cli_disconnect(cid):
     }
     if "changed" in result:
         out["changed"] = bool(result["changed"])
+    notes = []
+    if result.get("catalog") == "deleted":
+        notes.append("The hub's models and effort tiers were removed from %s's "
+                     "/model picker." % entry.get("name", entry["id"]))
+    elif result.get("catalog") == "restored":
+        notes.append("%s's own /model catalog was restored." % entry.get("name", entry["id"]))
+    if result.get("catalog"):
+        out["catalog"] = result["catalog"]
+    # Deliberately KEPT (documented design): the hub's MCP server entry, i.e.
+    # the crew tools. It adds no model, effort or mode -- it is reported so the
+    # user knows it is there and where to remove it.
+    mcp_path = _hub_mcp_kept(entry["id"])
+    if mcp_path:
+        out["mcp_kept"] = _short(mcp_path)
+        notes.append("The hub's MCP tool server (crew tools) stays registered in %s; "
+                     "remove it under Hub controls > MCP servers if you do not want it."
+                     % _short(mcp_path))
+    if notes:
+        out["note"] = " ".join(notes)
     if connected:
         method = row.get("connect_method")
         out["still_connected"] = True

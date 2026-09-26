@@ -7813,6 +7813,7 @@
           warnLine
         ];
         if (r.restart_hint) lines.push({ cls:'cli-setup-note', html: esc(r.restart_hint) });
+        if (r.note) lines.push({ cls:'cli-setup-note', html: esc(r.note) });
         openRestartModal(name + ' disconnected', lines, null);
       });
     }).catch(function(e){
