@@ -6007,7 +6007,12 @@ def _spread_band(pool):
     scores = sorted({p[0] for p in pool}, reverse=True)
     natural = [s for s in scores if s not in _PREF_FLOORS]
     top = natural[0] if natural else scores[0]
-    band = [p for p in pool if p[0] >= top - _ORCH_BAND]
+    # Membership pays the answer-canary quality penalty too (the sort below
+    # already does, via _agentic_score): a pair caught answering junk that the
+    # penalty drops under the cutoff leaves the band. Never empties it.
+    band = [p for p in pool
+            if p[0] - _answer_quality_penalty(p[1], p[2]) >= top - _ORCH_BAND] \
+        or [p for p in pool if p[0] >= top - _ORCH_BAND]
     # Quality first; among EQUAL-benchmark models prefer the one with more free
     # budget left (headroom never outranks quality — see _quota_headroom).
     band.sort(key=lambda t: (-_agentic_score(t), -round(_quota_headroom(t[1]), 1), t[1], t[2]))
@@ -6023,6 +6028,10 @@ def _spread_pick(pool):
     band = _spread_band(pool)
     if not band:
         return None
+    # The band's ORDER already pays the quality penalty, but the rotation below
+    # hands every member a turn -- a pair the answer canary demoted would still
+    # serve one turn in N. Rotate among the clean members while any exist.
+    band = [b for b in band if not _answer_quality_penalty(b[1], b[2])] or band
     lead = band[0]
     # The lead keeps DOUBLE weight only while it still has budget. Once it is
     # nearly drained it falls back to a normal single slot — never dropped (quality
@@ -6321,10 +6330,15 @@ def _chat_pick_key(entry):
     term at all, so a model with a measured string of failures kept the
     primary slot on name alone and every turn paid a dead hop before the
     chain reached something that answers. Both penalties are neutral when
-    unknown, so a never-routed model scores exactly as before. Fail-open."""
+    unknown, so a never-routed model scores exactly as before. Fail-open.
+
+    ...and the answer-canary QUALITY penalty (_answer_quality_penalty), which
+    used to reach only _agentic_score: plain chat kept preferring a pair the
+    canary had twice caught answering junk ("2826HAMSTER-2826…")."""
     score, pid, model = entry
     try:
-        score = score - _reliability_penalty(pid, model) - _latency_penalty(pid, model)
+        score = (score - _reliability_penalty(pid, model) - _latency_penalty(pid, model)
+                 - _answer_quality_penalty(pid, model))
     except Exception:
         pass
     return (score, _quota_headroom(pid))
@@ -19565,6 +19579,24 @@ def _prompt_text_for_check(payload):
         return None
 
 
+def _last_user_text_for_check(payload):
+    """The LAST user turn's text -- where a format constraint ("answer with
+    only the number") lives. An earlier turn's constraint does not bind a
+    later "now describe it". Empty string when there is none. Never raises."""
+    try:
+        for m in reversed((payload or {}).get("messages") or ()):
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            c = m.get("content")
+            if isinstance(c, list):
+                c = "\n".join(p.get("text") or "" for p in c
+                              if isinstance(p, dict) and isinstance(p.get("text"), str))
+            return (c if isinstance(c, str) else "")[:_PROMPT_CHECK_CAP]
+        return ""
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def _answer_gate(data, payload, has_tools):
     """'ok' | 'salvaged' | 'junk' for a non-streamed OpenAI chat JSON.
 
@@ -19585,7 +19617,8 @@ def _answer_gate(data, payload, has_tools):
             return "ok"
         verdict = answer_check.inspect(
             content, prompt_text=_prompt_text_for_check(payload),
-            tools_offered=bool(has_tools), finish_reason=choice.get("finish_reason"))
+            tools_offered=bool(has_tools), finish_reason=choice.get("finish_reason"),
+            last_prompt=_last_user_text_for_check(payload))
         if verdict.get("ok"):
             return "ok"
         _log.warning("[answer-gate] junk in answer (%s), salvage=%s",
@@ -19602,7 +19635,8 @@ def _answer_gate(data, payload, has_tools):
 
 
 def _record_stream_outcome(pid, model, text, *, tool_calls=False,
-                           finish_reason=None, prompt_text=None, tools_offered=False):
+                           finish_reason=None, prompt_text=None, tools_offered=False,
+                           last_prompt=None):
     """The outcome a STREAMED answer never used to file: every stream commit
     point returned the Response without any _record_outcome, so a streaming
     model that delivered was never credited and one that degenerated was never
@@ -19621,7 +19655,7 @@ def _record_stream_outcome(pid, model, text, *, tool_calls=False,
                 return
             ok = answer_check.inspect(
                 text, prompt_text=prompt_text, tools_offered=tools_offered,
-                finish_reason=finish_reason).get("ok", True)
+                finish_reason=finish_reason, last_prompt=last_prompt).get("ok", True)
         _record_outcome(pid, model, ok)
     except Exception:                                            # noqa: BLE001
         pass
@@ -19745,7 +19779,7 @@ _STREAM_DIGEST_CAP = 2 << 20     # bytes of a relayed stream kept for the end ch
 
 
 def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None,
-               prompt_text=None, tools_offered=False):
+               prompt_text=None, tools_offered=False, last_prompt=None):
     """Pass upstream SSE bytes through unchanged. When `iterator`/`first` are
     supplied (the first-byte peek already pulled the first chunk from this exact
     iterator), yield that chunk first, then continue the SAME iterator — so the
@@ -19793,7 +19827,7 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
             text, saw_tools, fin = _sse_answer_digest(kept)
             _record_stream_outcome(hop_pid, hop_model, text, tool_calls=saw_tools,
                                    finish_reason=fin, prompt_text=prompt_text,
-                                   tools_offered=tools_offered)
+                                   tools_offered=tools_offered, last_prompt=last_prompt)
     except Exception as exc:
         # Upstream died mid-stream (reset / ChunkedEncodingError / read timeout).
         # Without a terminator the client sits on a half-open SSE body waiting for
@@ -22308,6 +22342,7 @@ def _chat_completions_uncached(body):
                                        "%s/%s" % (hop_pid, hop_model))
                 relay = _proxy_sse(resp, chained, hop_pid=hop_pid, hop_model=hop_model,
                                    prompt_text=_prompt_text_for_check(payload),
+                                   last_prompt=_last_user_text_for_check(payload),
                                    tools_offered=has_tools)
                 # A tools turn gets its frames checked; a plain chat stream keeps
                 # the zero-copy byte passthrough exactly as it was.
@@ -22628,7 +22663,8 @@ def _chat_to_responses(chat_json, model_label):
 
 
 def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_est=0,
-                      hop_pid=None, hop_model=None, prompt_text=None, tools_offered=False):
+                      hop_pid=None, hop_model=None, prompt_text=None, tools_offered=False,
+                      last_prompt=None):
     """Consume an upstream OpenAI chat SSE stream and re-emit it as Responses API
     events for Codex. When `line_iter`/`first` are supplied (the first-byte peek
     already pulled the first line from this exact iterator) the pre-read line is
@@ -22834,7 +22870,8 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
             # _record_stream_outcome). The client already has the bytes.
             _record_stream_outcome(hop_pid, hop_model, "".join(text_buf),
                                    tool_calls=bool(tools), finish_reason=stream_fin,
-                                   prompt_text=prompt_text, tools_offered=tools_offered)
+                                   prompt_text=prompt_text, tools_offered=tools_offered,
+                                   last_prompt=last_prompt)
         yield from _finalize_open_items()
 
         final_usage = None
@@ -23122,6 +23159,7 @@ def v1_responses(_retry_pass=False):
                     _responses_stream(resp, model_label, line_iter=chained, prompt_est=est,
                                       hop_pid=hop_pid, hop_model=hop_model,
                                       prompt_text=_prompt_text_for_check(payload),
+                                      last_prompt=_last_user_text_for_check(payload),
                                       tools_offered=has_tools)),
                     mimetype="text/event-stream", headers=_SSE_HEADERS)
             try:
@@ -23462,7 +23500,8 @@ def _sse_event(name, obj):
 
 
 def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISSING,
-                      hop_pid=None, hop_model=None, prompt_text=None, tools_offered=False):
+                      hop_pid=None, hop_model=None, prompt_text=None, tools_offered=False,
+                      last_prompt=None):
     """Translate an upstream OpenAI SSE stream into the Anthropic event
     sequence: message_start -> content_block_start -> content_block_delta* ->
     content_block_stop -> message_delta -> message_stop. When `line_iter`/`first`
@@ -23597,7 +23636,8 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
             # _record_stream_outcome). The client already has the bytes.
             _record_stream_outcome(hop_pid, hop_model, "".join(text_parts),
                                    tool_calls=bool(tool_blocks), finish_reason=finish_reason,
-                                   prompt_text=prompt_text, tools_offered=tools_offered)
+                                   prompt_text=prompt_text, tools_offered=tools_offered,
+                                   last_prompt=last_prompt)
         if block_index < 0:  # upstream produced nothing: still emit a valid shape
             block_index = 0
             yield _sse_event("content_block_start", {
@@ -23851,6 +23891,7 @@ def v1_messages():
                     _anthropic_stream(resp, model_str, input_est, line_iter=chained,
                                      hop_pid=hop_pid, hop_model=hop_model,
                                      prompt_text=_prompt_text_for_check(payload),
+                                     last_prompt=_last_user_text_for_check(payload),
                                      tools_offered=has_tools)),
                     mimetype="text/event-stream",
                     headers=dict(_SSE_HEADERS, **_routing_headers(

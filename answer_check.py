@@ -11,6 +11,15 @@ Every existing check (empty 200, relay error page, refusal, typed tool call)
 looked for a BAD answer; none looked for a GOOD answer followed by garbage, so
 both counted as clean deliveries and kept that model winning hop 1.
 
+A second live batch (same model, "What is N plus 1? Answer with only the
+number.", max_tokens 40) slipped past those first detectors:
+
+    "2826HAMSTER-2826282628262826282628262826"   -> _glued_loop
+    "1573 1573 ------------------------------"   -> _separator_run
+    "5499 картинка внутри Thinking content: 5"   -> _script_switch (short head)
+                                                    + _reasoning_leak
+    '8446"Sfc cover" is an additional paramet'   -> _constrained_extra
+
 Leaf module on purpose (no app imports): pure text in, verdict out, trivially
 testable and cheap enough to run on every non-streamed answer and once at the
 end of every stream.
@@ -29,7 +38,10 @@ or costs a hop, so every detector demands a strong, specific signal:
     token cap -- a list of greetings after "Here are some:" is neither;
   * markup leaks are only judged when no tools were offered (with tools, the
     typed-tool-call / tool_rescue path owns that shape) and the prompt itself
-    does not mention the tag;
+    does not mention the tag; reasoning markers only at an odd place (a reply
+    that OPENS with a <think> block is left alone);
+  * the brevity trim needs an IMPERATIVE constraint in the LAST user turn and
+    a leading answer that ends cleanly (see _constrained_extra's guards);
   * truncation alone (finish_reason "length") is reported but never fails an
     answer: a plain truncation is common and legitimate (see
     app._chat_json_starved's notes).
@@ -85,42 +97,73 @@ def _mask_fences_distinct(text):
 # --------------------------------------------------------------------------- #
 # (a) runaway continuation: the reply switches to a script the prompt never used
 # --------------------------------------------------------------------------- #
-# Greek is deliberately absent: alpha/beta/pi show up in ordinary maths answers.
+# key -> (char ranges, language names that mean "the prompt asked for it",
+#         min run). Greek needs RUNS of 3+ letters: a lone alpha/beta/pi is
+# ordinary maths notation, "καλημέρα σας" is a language.
 _SCRIPTS = {
     "cjk": ("぀-ヿ㐀-䶿一-鿿가-힯豈-﫿"
             "　-〿＀-￯",
             ("chinese", "mandarin", "cantonese", "japanese", "korean", "kanji",
              "hanzi", "hiragana", "katakana", "hangul", "pinyin", "chinois",
-             "japonais", "coreen", "coréen", "chino", "japon", "cjk")),
+             "japonais", "coreen", "coréen", "chino", "japon", "cjk"), 1),
     "cyrillic": ("Ѐ-ӿ",
                  ("russian", "ukrainian", "cyrillic", "bulgarian", "serbian",
-                  "russe", "kazakh", "belarus", "mongolian", "macedonian")),
+                  "russe", "kazakh", "belarus", "mongolian", "macedonian"), 1),
     "arabic": ("؀-ۿݐ-ݿ",
                ("arabic", "arabe", "persian", "farsi", "urdu", "pashto",
-                "quran", "coran")),
-    "hebrew": ("֐-׿", ("hebrew", "hébreu", "hebreu", "yiddish")),
-    "thai": ("฀-๿", ("thai", "thaï")),
+                "quran", "coran"), 1),
+    "hebrew": ("֐-׿", ("hebrew", "hébreu", "hebreu", "yiddish"), 1),
+    "greek": ("Ͱ-Ͽἀ-῿", ("greek", "grec", "griego", "hellenic"), 3),
+    "thai": ("฀-๿", ("thai", "thaï"), 1),
     "devanagari": ("ऀ-ॿ", ("hindi", "sanskrit", "marathi", "nepali",
-                                     "devanagari")),
+                                     "devanagari"), 1),
+    "armenian": ("԰-֏", ("armenian", "arménien"), 1),
+    "georgian": ("Ⴀ-ჿ", ("georgian", "géorgien"), 1),
+    "bengali": ("ঀ-৿", ("bengali", "bangla", "assamese"), 1),
+    "gurmukhi": ("਀-੿", ("punjabi", "gurmukhi"), 1),
+    "gujarati": ("઀-૿", ("gujarati",), 1),
+    "tamil": ("஀-௿", ("tamil",), 1),
+    "telugu": ("ఀ-౿", ("telugu",), 1),
+    "kannada": ("ಀ-೿", ("kannada",), 1),
+    "malayalam": ("ഀ-ൿ", ("malayalam",), 1),
+    "sinhala": ("඀-෿", ("sinhala", "sinhalese"), 1),
+    "lao": ("຀-໿", ("lao", "laotian"), 1),
+    "khmer": ("ក-៿", ("khmer", "cambodian"), 1),
+    "myanmar": ("က-႟", ("burmese", "myanmar"), 1),
+    "ethiopic": ("ሀ-፿", ("amharic", "tigrinya", "ethiopic"), 1),
 }
-_SCRIPT_RES = {k: re.compile("[" + rng + "]") for k, (rng, _names) in _SCRIPTS.items()}
+# presence ("did the prompt use this script at all") and detection (min run)
+_SCRIPT_ANY = {k: re.compile("[" + rng + "]") for k, (rng, _n, _r) in _SCRIPTS.items()}
+_SCRIPT_RES = {k: re.compile("[" + rng + "]" + ("{%d,}" % run if run > 1 else ""))
+               for k, (rng, _n, run) in _SCRIPTS.items()}
+_ANY_FOREIGN_RE = re.compile("[" + "".join(r for r, _n, _r in _SCRIPTS.values()) + "]")
 # A prompt using any of these asked for other-language output on purpose.
 _TRANSLATE_HINTS = ("translat", "tradu", "übersetz", "multilingual",
                     "multilingue", "unicode", "transliterat")
 _LATIN_LETTER_RE = re.compile(r"[A-Za-zÀ-ɏ]")
 _MIN_FOREIGN_CHARS = 8          # a word or two of foreign script is never junk
 _FOREIGN_SHARE = 0.6            # ...and the rest of the reply must be MOSTLY it
+# "5499 картинка внутри Thinking content: 5": the switch follows a BARE short
+# answer (one number or one ASCII token, nothing else) -- a complete reply
+# that kept going. That shape is signal on its own, on any finish reason, so
+# the share bar drops (that junk switched back to Latin mid-way). A head with
+# a space in it ("It's called Метрополитен") is a sentence introducing a
+# foreign word and never takes this branch.
+_SHORT_HEAD_RE = re.compile(r"[-+]?\d[\d,.]*%?|[A-Za-z0-9]{1,16}")
+_SHORT_SHARE = 0.3
 
 
-def _script_switch(text, masked, prompt_text, finish_reason):
+def _script_switch(text, masked, prompt_text, finish_reason, at_start=True):
     if prompt_text is None:
         return None             # nothing to compare against -> never guess
+    if not _ANY_FOREIGN_RE.search(masked):
+        return None             # the common all-Latin reply: one scan, done
     low = prompt_text.lower()
     if any(h in low for h in _TRANSLATE_HINTS):
         return None
     best = None
     for key, rx in _SCRIPT_RES.items():
-        if rx.search(prompt_text) or any(n in low for n in _SCRIPTS[key][1]):
+        if _SCRIPT_ANY[key].search(prompt_text) or any(n in low for n in _SCRIPTS[key][1]):
             continue            # the prompt itself used / asked for this script
         m = rx.search(masked)
         if not m:
@@ -130,14 +173,17 @@ def _script_switch(text, masked, prompt_text, finish_reason):
         if not re.search(r"\w", prefix):
             continue            # the reply STARTED in that script: not a switch
         rest = masked[pos:pos + _RATIO_WINDOW]
-        n_foreign = len(rx.findall(rest))
+        n_foreign = sum(len(x) for x in rx.findall(rest))
         if n_foreign < _MIN_FOREIGN_CHARS:
             continue
         n_latin = len(_LATIN_LETTER_RE.findall(rest))
-        if n_foreign < _FOREIGN_SHARE * (n_foreign + n_latin):
-            continue
+        share = n_foreign / float(n_foreign + n_latin)
         glued = prefix[-1].isascii() and prefix[-1].isalnum()
-        if not (glued or finish_reason == "length"):
+        mostly = share >= _FOREIGN_SHARE and (glued or finish_reason == "length")
+        # at_start: a clipped long answer's head is not the reply's head
+        short = (at_start and share >= _SHORT_SHARE
+                 and _SHORT_HEAD_RE.fullmatch(prefix.strip()) is not None)
+        if not (mostly or short):
             continue
         if best is None or pos < best:
             best = pos
@@ -260,6 +306,292 @@ def _tail_loop(masked, prompt_text, finish_reason=None):
     return None
 
 
+# GLUED short-unit loops: "2826HAMSTER-2826282628262826282628262826". The unit
+# is below _tail_loop's 8-char floor and has too few distinct chars for it, and
+# there is no whitespace, so _line_loop never sees a line. Same end-anchored
+# rule as _tail_loop (a runaway loops until the cap), plus:
+#   * 4+ copies at the token cap; 8+ at a natural stop, and then only for a
+#     unit carrying a DIGIT -- "hahahahaha" or a CAG repeat ending a finished
+#     reply is content;
+#   * no whitespace in the unit (spaced repeats are _tail_loop's) and at least
+#     two distinct chars one of them alnum ("aaaa" / "=-=-" are not loops here);
+#   * a repeating decimal or radix literal ("0.090909…", "0b1010…") is a number;
+#   * the prompt asked for it (the unit doubled, or the unit plus "repeat").
+_GLUE_MIN, _GLUE_MAX = 2, 16
+_GLUE_MIN_RUN_CAP = 4
+_GLUE_MIN_RUN = 8
+_NUMBER_PREFIX_RE = re.compile(r"(?:\d[.,]|0[xXbBoO])$")
+_REPEAT_ASK_RE = re.compile(r"repeat|times|répét|fois", re.I)
+
+
+def _periodic_start(s, p):
+    """Smallest i with s[i:] periodic in p (s already known periodic over its
+    last 4p chars). Monotone, so a binary search of C-speed slice compares --
+    a 20 KB loop costs ~15 compares, not 10k stride steps."""
+    n = len(s)
+    lo, hi = 0, n - 4 * p
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if s[mid:n - p] == s[mid + p:n]:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def _glued_loop(masked, prompt_text, finish_reason):
+    s = masked.rstrip()
+    n = len(s)
+    capped = finish_reason == "length"
+    need = _GLUE_MIN_RUN_CAP if capped else _GLUE_MIN_RUN
+    for p in range(_GLUE_MIN, _GLUE_MAX + 1):
+        if 4 * p > n:
+            break
+        if s[n - 4 * p:n - p] != s[n - 3 * p:n]:
+            continue
+        tail = s[n - p:n]
+        if any(c.isspace() for c in tail) or len(set(tail)) < 2:
+            continue
+        if not any(c.isalnum() for c in tail) or _PUA_RE.search(tail):
+            continue
+        start = _periodic_start(s, p)
+        unit = s[start:start + p]
+        if (n - start) // p < need:
+            continue
+        if not capped and not any(c.isdigit() for c in unit):
+            continue
+        head = s[:start]
+        if _NUMBER_PREFIX_RE.search(head):
+            continue
+        if prompt_text and (unit * 2 in prompt_text
+                            or (unit in prompt_text and _REPEAT_ASK_RE.search(prompt_text))):
+            continue
+        core = head.strip()
+        if not core:
+            return start + p    # the loop IS the reply: keep its first copy
+        if core.startswith(unit) and not re.search(r"\s", core):
+            # "2826HAMSTER-" + loop: one glued token that opens with the unit --
+            # the answer, junk, then the answer again. Keep the answer.
+            return (len(head) - len(head.lstrip())) + p
+        return start
+    return None
+
+
+# SEPARATOR RUNS: "1573 1573 ------------------------------". 8+ identical
+# punctuation chars running to the END, on the same line as answer text.
+# A markdown rule / setext underline / fence sits on its own line and a table
+# row carries "|", so neither ever qualifies. Fires at the token cap, or at any
+# finish when the answer before it is itself one token repeated ("1573 1573").
+_SEP_TAIL_RE = re.compile(r"([^\w\s])\1{7,}$")
+
+
+def _repeated_token_end(line):
+    """End offset (within `line`) of the first token when the line is one
+    token repeated 2+ times ("1573 1573 "), else None."""
+    toks = line.split()
+    if len(toks) < 2 or any(t != toks[0] for t in toks):
+        return None
+    return line.index(toks[0]) + len(toks[0])
+
+
+def _separator_run(masked, finish_reason):
+    s = masked.rstrip()
+    m = _SEP_TAIL_RE.search(s)
+    if not m or _PUA_RE.match(m.group(1)):
+        return None
+    start = m.start()
+    line_start = s.rfind("\n", 0, start) + 1
+    head_line = s[line_start:start]
+    if not re.search(r"\w", head_line) or "|" in head_line:
+        return None
+    first = _repeated_token_end(head_line)
+    if first is not None:
+        return line_start + first
+    if finish_reason == "length":
+        return start
+    return None
+
+
+# LEAKED REASONING / TEMPLATE MARKERS after an answer. A reply that OPENS with
+# a <think> block is how some providers ship reasoning and is left alone; only
+# a marker at an odd place counts: <think> or a template token after answer
+# text, "Thinking content:" after answer text, "Thought:" glued mid-line after
+# a number/sentence end (not "Food for Thought:", not a ReAct line start), and
+# a stray </think> with no opener that closes a SHORT head (a long head before
+# it is the scratchpad itself, and its answer is after the tag -- not ours).
+_THINK_OPEN_RE = re.compile(r"<think(?:ing)?>", re.I)
+_THINK_CLOSE_RE = re.compile(r"</think(?:ing)?>", re.I)
+_THINK_BLOCK_RE = re.compile(r"<(think|thinking)>.*?</\1>", re.I | re.S)
+_THINK_LABEL_RE = re.compile(r"Thinking content\s*:", re.I)
+_THOUGHT_RE = re.compile(r"\bThought:")
+_TEMPLATE_TOKEN_RE = re.compile(
+    r"<\|(?:im_start|im_end|endoftext|end_of_text|eot_id|eom_id|start_header_id|"
+    r"end_header_id|end_of_turn|start_of_turn)\|>|<(?:end_of_turn|start_of_turn)>")
+_REASON_PROMPT_RE = re.compile(r"think>|thinking content|thought:|<\||_of_turn>", re.I)
+_SHORT_STRAY_HEAD = 40
+
+
+def _has_answer_before(masked, pos):
+    return re.search(r"\w", _THINK_BLOCK_RE.sub("", masked[:pos])) is not None
+
+
+def _reasoning_leak(masked, prompt_text):
+    if prompt_text and _REASON_PROMPT_RE.search(prompt_text):
+        return None             # the user is asking ABOUT these markers
+    hits = []
+    for rx in (_THINK_OPEN_RE, _THINK_LABEL_RE, _TEMPLATE_TOKEN_RE):
+        for m in rx.finditer(masked):
+            if _has_answer_before(masked, m.start()):
+                hits.append(m.start())
+                break
+    for m in _THINK_CLOSE_RE.finditer(masked):
+        head = masked[:m.start()]
+        if _THINK_OPEN_RE.search(head):
+            continue            # a well-formed block
+        core = head.strip()
+        if core and len(core) <= _SHORT_STRAY_HEAD and re.search(r"\w", core):
+            hits.append(m.start())
+        break
+    for m in _THOUGHT_RE.finditer(masked):
+        before = masked[masked.rfind("\n", 0, m.start()) + 1:m.start()].rstrip()
+        if before and not before[-1].isalpha() and re.search(r"\w", before):
+            hits.append(m.start())
+            break
+    return min(hits) if hits else None
+
+
+# --------------------------------------------------------------------------- #
+# (d) prompt-constrained brevity: "Answer with only the number." + "8446\"Sfc
+# cover\" is an additional paramet" -- a correct answer, then a same-script
+# runaway no other check can call junk. When the LAST user turn explicitly
+# asks for exactly one short thing, the leading short answer IS the reply.
+# Guards (a false positive here trims a real answer):
+#   * the ask must be imperative ("Answer with only the number", "Number
+#     only.", "in one word", "reply with exactly PONG") -- "is 2 the only
+#     number that..." is a question, not a format;
+#   * a prompt that also asks for an explanation/steps/"then ..." is skipped,
+#     and so is a long prompt (a pasted task that merely contains the phrase);
+#   * never with tools (agent turns), never on a reply that opens with markup;
+#   * a number must end where the number ends: "2 + 2 = 4", "10:30", "0xFF",
+#     "6.02e23", "3rd", "1 573" are never cut, and a leading number the prompt
+#     itself contains, followed by more digits, is an echo of the question
+#     ("2825 plus 1 is 2826"), not the answer;
+#   * a Capitalised word followed by another ("New York") is a name, not a word.
+# --------------------------------------------------------------------------- #
+_BRIEF_PROMPT_MAX = 1200
+_BRIEF_KIND = (r"(?P<kind>yes or no|yes/no|oui ou non|numbers?|numerals?|digits?|integers?|"
+               r"figures?|nombres?|chiffres?|words?|mots?|letters?|lettres?)")
+_BRIEF_ARTS = r"(?:(?:with|by|par|avec|the|a|an|one|1|single|le|la|un|une|seul|seule)\s+)*"
+_BRIEF_RES = (
+    # "answer with only the number", "just the word", "uniquement par le nombre"
+    (re.compile(r"\b(?:only|just|solely|exactly|nothing but|uniquement|seulement|juste)\s+"
+                + _BRIEF_ARTS + _BRIEF_KIND + r"\b", re.I), True),
+    # "reply with just the answer"
+    (re.compile(r"\b(?:only|just)\s+(?:give\s+|return\s+|output\s+)?the\s+(?:final\s+)?"
+                r"(?P<kind>answer|result|value|sum|total)\b", re.I), True),
+    # "Number only."
+    (re.compile(r"\b" + _BRIEF_KIND + r"\s+(?:only|uniquement|seulement)\b", re.I), True),
+    # "in one word", "with a single word", "one-word answer"
+    (re.compile(r"\b(?:in|with|using)\s+(?:(?:a|one|1|single)\s+)+(?P<kind>word)\b"
+                r"|\b(?:one|single)[- ](?P<kind2>word)\s+(?:answer|reply|response|only)\b"
+                r"|\b(?:en un|un seul)\s+(?P<kind3>mot)\b", re.I), False),
+)
+_BRIEF_VERB_RE = re.compile(
+    r"\b(?:answer|reply|respond|give|return|output|print|say|write|provide|state|type|"
+    r"r[ée]ponds|r[ée]pondez|donne|donnez|[ée]cris|[ée]crivez)", re.I)
+_BRIEF_LITERAL_RE = re.compile(
+    r"\b(?:reply|respond|answer|say|output|return)\s+(?:with\s+)?exactly\s*:?\s*"
+    r"(?:[\"'“‘`](?P<q>[^\"'”’`\n]{1,40})[\"'”’`]|(?P<w>[A-Za-z0-9_-]{1,40})\b)", re.I)
+_BRIEF_NOT_LITERAL = frozenset(("one", "a", "an", "the", "single", "two", "three", "1", "2", "3"))
+_BRIEF_BLOCK_RE = re.compile(
+    r"\b(?:explain|explanation|justif\w*|why|reason\w*|show (?:your |the )?work|"
+    r"step[- ]by[- ]step|then|followed by|after that|if (?:yes|no|so)|pourquoi|"
+    r"expliqu\w*|puis|ensuite)\b", re.I)
+_NUM_KINDS = frozenset(("number", "numeral", "digit", "integer", "figure", "nombre",
+                        "chiffre", "answer", "result", "value", "sum", "total"))
+_WORD_KINDS = frozenset(("word", "mot"))
+_LETTER_KINDS = frozenset(("letter", "lettre"))
+_YN_KINDS = frozenset(("yes or no", "yes/no", "oui ou non"))
+_LEAD_NUM_RE = re.compile(
+    r"\s*[-+−]?\$?(?:\d{1,3}(?:[ \xa0 ]\d{3})+(?!\d)|\d+(?:,\d{3})*(?:[.,]\d+)?)%?")
+_NUM_CONT_RE = re.compile(
+    r"\s*[-+*/×÷=^<>:]|[0-9A-Fa-f]+\b|[eE][+-]?\d|[xXbBoO][0-9A-Fa-f]|(?:st|nd|rd|th)\b")
+_LEAD_WORD_RE = re.compile(r"\s*[A-Za-zÀ-ÖØ-öø-ɏ][A-Za-zÀ-ÖØ-öø-ɏ0-9'’]*(?:-[A-Za-zÀ-ÖØ-öø-ɏ0-9]+)*")
+_LEAD_YN_RE = re.compile(r"\s*(?:yes|no|oui|non)\b", re.I)
+_TRAILING_OK = " \t\r\n.!?。"
+
+
+def _brief_kinds(prompt):
+    """{kind classes} the prompt imperatively constrains the reply to, plus a
+    literal token for "reply with exactly X" (or None)."""
+    kinds = set()
+    for rx, needs_verb in _BRIEF_RES:
+        for m in rx.finditer(prompt):
+            if needs_verb:
+                cut = max(prompt.rfind(c, 0, m.start()) for c in ".?!\n;")
+                lead = prompt[cut + 1:m.start()]
+                if lead.strip() and not _BRIEF_VERB_RE.search(lead):
+                    continue    # "is 2 the only number that...": not a format
+            kind = next(g for g in m.groups() if g).lower()
+            kind = kind if kind in _YN_KINDS else kind.rstrip("s")
+            if kind in _NUM_KINDS:
+                kinds.add("num")
+            elif kind in _WORD_KINDS:
+                kinds.add("word")
+            elif kind in _LETTER_KINDS:
+                kinds.add("letter")
+            elif kind in _YN_KINDS:
+                kinds.add("yn")
+    literal = None
+    m = _BRIEF_LITERAL_RE.search(prompt)
+    if m:
+        literal = m.group("q") or m.group("w")
+        if literal and literal.lower() in _BRIEF_NOT_LITERAL:
+            literal = None
+    return kinds, literal
+
+
+def _constrained_extra(text, prompt, tools_offered):
+    if tools_offered or not prompt or len(prompt) > _BRIEF_PROMPT_MAX:
+        return None
+    if _BRIEF_BLOCK_RE.search(prompt):
+        return None
+    kinds, literal = _brief_kinds(prompt)
+    if not kinds and not literal:
+        return None
+    head = text[:400]
+    cut = None
+    if literal:
+        lead = len(head) - len(head.lstrip())
+        if head[lead:lead + len(literal)].lower() == literal.lower():
+            end = lead + len(literal)
+            if end >= len(head) or not head[end].isalnum():
+                cut = end
+    if cut is None and "num" in kinds:
+        m = _LEAD_NUM_RE.match(head)
+        if m and not _NUM_CONT_RE.match(head, m.end()):
+            num = m.group(0).strip()
+            echo = re.search(r"(?<![\d.,])" + re.escape(num) + r"(?![\d.,]*\d)", prompt)
+            if not (echo and re.search(r"\d", head[m.end():])):
+                cut = m.end()
+    if cut is None and "yn" in kinds:
+        m = _LEAD_YN_RE.match(head)
+        if m:
+            cut = m.end()
+    if cut is None and ("word" in kinds or "letter" in kinds):
+        m = _LEAD_WORD_RE.match(head)
+        if m:
+            word = m.group(0).strip()
+            name = word[:1].isupper() and re.match(r"[ \t]+[A-Z]", head[m.end():])
+            if ("word" in kinds or len(word) == 1) and not name:
+                cut = m.end()
+    if cut is None:
+        return None
+    if not text[cut:].strip(_TRAILING_OK):
+        return None             # nothing extra: the reply complied
+    return cut
+
+
 # --------------------------------------------------------------------------- #
 # (c) leaked tool-call markup in a plain-chat answer
 # --------------------------------------------------------------------------- #
@@ -282,20 +614,29 @@ def _clip(text):
     return text[-_MAX_SCAN:]
 
 
-def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None):
+def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
+            last_prompt=None):
     """Judge one answer's text.
 
     Returns {"ok": bool, "reasons": [...], "salvage": str|None}. `reasons` may
     hold "truncated" even when ok is True (informational). `salvage` is the
     clean answer before the junk started, or None when the junk is not just a
-    tail (nothing meaningful precedes it). Never raises: any internal error
-    reports ok=True -- the gate must never be the thing that loses an answer."""
+    tail (nothing meaningful precedes it). `last_prompt` is the LAST user
+    turn: the brevity constraint ("answer with only the number") is read from
+    it alone, since an earlier turn's format request does not bind a later
+    "now explain why"; it defaults to `prompt_text`. Never raises: any
+    internal error reports ok=True -- the gate must never be the thing that
+    loses an answer."""
     result = {"ok": True, "reasons": [], "salvage": None}
     try:
         if not isinstance(text, str) or not text.strip():
             return result
         if prompt_text is not None and not isinstance(prompt_text, str):
             prompt_text = str(prompt_text)
+        if last_prompt is None:
+            last_prompt = prompt_text
+        elif not isinstance(last_prompt, str):
+            last_prompt = str(last_prompt)
         if finish_reason == "length":
             result["reasons"].append("truncated")
         # Long answers: judge the tail only. A loop or leak that ran to the cap
@@ -307,10 +648,13 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None):
         cuts = []
         checks = (
             ("runaway_script", lambda: _script_switch(body, masked, prompt_text,
-                                                      finish_reason)),
+                                                      finish_reason, at_start=offset == 0)),
             ("repetition", lambda: _line_loop(loop_masked, prompt_text, finish_reason)),
             ("repetition", lambda: _tail_loop(loop_masked, prompt_text, finish_reason)),
+            ("repetition", lambda: _glued_loop(loop_masked, prompt_text, finish_reason)),
+            ("separator_run", lambda: _separator_run(masked, finish_reason)),
             ("tool_markup", lambda: _markup_leak(masked, prompt_text, tools_offered)),
+            ("reasoning_leak", lambda: _reasoning_leak(masked, prompt_text)),
         )
         for reason, fn in checks:
             cut = fn()
@@ -319,6 +663,11 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None):
             if reason not in result["reasons"]:
                 result["reasons"].append(reason)
             cuts.append(offset + cut)
+        # judged on the reply's HEAD (a leading answer), so never offset
+        cut = _constrained_extra(text, last_prompt, tools_offered)
+        if cut is not None:
+            result["reasons"].append("extra_text")
+            cuts.append(cut)
         if not cuts:
             return result
         result["ok"] = False
