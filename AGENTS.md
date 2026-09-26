@@ -377,6 +377,50 @@ above only suggests).
   `mcp_kept` in the disconnect response. Covered by
   `tests/test_cli_disconnect_leaves_no_trace.py`.
 
+## Context-window management (every CLI, every protocol)
+
+Pure helpers live in `ctxwin.py`; the glue is in app.py. Covered by
+`tests/test_context_window_management.py` (plus the older
+`test_context_refit.py` / `test_compaction_actually_fits.py`).
+
+- **Compaction** (`_compact_to_budget`): a tool call and its results are ONE
+  unit (`_message_units`) — kept or dropped together; an oversized result is
+  truncated head+tail with an "omitted by the hub" marker, never orphaned. The
+  LATEST real instruction (`ctxwin.is_real_instruction` skips Claude Code
+  `<system-reminder>` and Codex AGENTS.md/`<environment_context>` blocks) is
+  pinned in full; the original request rides as a short excerpt. `reserve`
+  (= `_output_reserve`: max_tokens, capped at 25% of the window) comes off the
+  target, and `_upstream_chat` clamps max_tokens to what is left of a KNOWN
+  window and to a learned output cap.
+- **Windows** (`_model_ctx_info`): per-model (catalog or learned) beats the
+  `_PROVIDER_TPM` row, except `_PROVIDER_HARD_REQUEST_CAP` (groq: a real
+  per-request TPM cap); unknown = "default" guess, which never signals
+  overflow nor clamps max_tokens. Learned limits expire after
+  `_LEARNED_CTX_TTL` (7 days) back to the catalog figure. Output caps
+  ("max_tokens must be <= N") go to `_MODEL_MAX_OUTPUT`, never the input table.
+- **Usage to the CLI** is sized on the ORIGINAL request
+  (`_reported_prompt_tokens`: upstream count x this hop's compaction ratio, or
+  the estimate when upstream sent none) on all three protocols, stream and
+  non-stream; translated streams ask upstream for `stream_options.include_usage`
+  (a provider that rejects it is retried without and remembered). This is what
+  lets codex (~96K) / opencode / Claude Code compact at the right time.
+- **Overflow signal** (setting `context_overflow_signal`, default on, /v1 only):
+  a hop that would drop >30% of the history raises `_ContextOverflow` (chain
+  walks on); if nothing holds the request the CLI gets its native error —
+  OpenAI 400 `context_length_exceeded`, Anthropic 400 "prompt is too long",
+  Responses stream `response.failed` with that code. Never for a CLI's own
+  compaction request, never on a guessed window.
+- **Rolling recap**: one per conversation, keyed by `ctxwin.conversation_key`
+  (hub agent session, `X-Claude-Code-Session-Id` / Claude Code
+  `metadata.user_id`, OpenCode `X-Session-Id`/`x-session-affinity`, Codex body
+  `prompt_cache_key` — werkzeug DROPS underscore headers like codex's
+  `session_id` — else a hash of system + first real instruction), extended
+  incrementally, persisted in `state_dir()/compaction-recaps.json` (LRU 500,
+  30-day TTL).
+- Category modes are applied BEFORE the size re-admission
+  (`_mode_first_size_split`); agentic chains put models known to hold much
+  less than `HUB_CONTEXT_WINDOW` behind the others (`_below_declared_window`).
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
