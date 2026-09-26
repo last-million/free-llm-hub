@@ -21341,6 +21341,18 @@ def v1_messages():
         if served is not None:
             return served
         body = dict(body, model="best")
+    # A bare CATEGORY id (ANTHROPIC_MODEL=coding) restricts the pool to that
+    # category for THIS request, exactly as /v1/chat/completions does. REPORTED:
+    # without this, "coding" was merely orchestrate-able (_mode_keys() is in
+    # _is_orchestrate), so Claude Code routed over EVERY category and the mode
+    # it asked for was silently ignored. After the swarm dispatch above, so the
+    # "swarm" category key -- also the fan-out id -- has already been consumed.
+    _req_mode = _valid_mode((body.get("model") or "").strip().lower())
+    if _req_mode and _req_mode != MODE_ALL:
+        try:
+            g.model_mode = _req_mode
+        except Exception:                                        # noqa: BLE001
+            pass
     # Did the CALLER name a model, or is the router choosing? A pinned model
     # opens the turn whatever its record says -- see _build_chain(pinned=).
     # Passed as a kwarg dict for the same reason exclude_identities is: an

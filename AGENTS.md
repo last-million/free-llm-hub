@@ -2,7 +2,7 @@
 
 ## Token economy: use the graphify graph before reading files
 
-`app.py` is ~10.5k lines. Do NOT read it wholesale. A graphify knowledge graph
+`app.py` is ~23k lines. Do NOT read it wholesale. A graphify knowledge graph
 of this repo lives in `graphify-out/` — query it first:
 
 - `graphify query "<topic>"` — returns the relevant symbols with `file:line`
@@ -34,6 +34,15 @@ routing heuristics.
   never deleted. kimi-k2.6/k2.7 hold preference floor 133 (`_PREF_FLOORS[4]`,
   just under k3's 134), matching all id shapes (`@cf/moonshotai/…`,
   `moonshotai/…`, bare). Covered by `tests/test_last_resort_routing.py`.
+- **Shipped default blocklist** (`_DEFAULT_BLOCKED_IDENTITIES`): blocks the
+  gpt-oss and nemotron families (plus a handful of other weak ids) for EVERY
+  install. `_seed_default_blocks` adds them once per install into the editable
+  `blocked_identities` setting and records what it offered, so a family the
+  user unticks is never re-added, while a family added to the shipped set in a
+  later release still arrives on the next boot. Blocked means never routed;
+  the last-resort TAIL ordering above still applies to every family that is
+  NOT blocked (gemma, or a nemotron the user unticked). Covered by
+  `tests/test_default_blocklist.py`.
 - First-content peek is adaptive (`_stream_peek_timeout`): slow/reasoning
   models or >=12K-token requests get 60s (both: 90s) instead of the flat 35s —
   the flat budget was killing HEALTHY slow hops on Codex-sized prompts.
@@ -300,12 +309,26 @@ above only suggests).
   per-CLI server list with Remove, an inline add form (name + command OR
   url), and the install-hub button. It refreshes after every mutation.
 
+## Categories x effort tiers (every CLI)
+
+- **Codex has 4 effort levels** (`_CODEX_EFFORT_MODEL` / `_CODEX_LEVELS`):
+  `low` = Normal (`auto`), `medium` = Max (`best`), `high` = Swarm (`swarm`),
+  `xhigh` = Multi (`multi`). Codex picks the CATEGORY as its model id and the
+  tier as its reasoning level; `_mode_and_effort` splits the pair.
+- **Compound ids** `"<category>-<effort>"` (also `/`), e.g. `coding-swarm`,
+  pick both in one model id — what the opencode picker offers, and usable from
+  any protocol. `_split_category_effort` only splits when the head is a real
+  category (`_mode_keys()`) and the tail a real tier, so the crew ids
+  (`crew-code`) are never mistaken for one; `_apply_category_effort` sets
+  `g.model_mode` and rewrites the model to the bare tier.
+- A bare category id (`coding`) restricts the pool to that category on
+  `/v1/chat/completions` AND `/v1/messages` (`ANTHROPIC_MODEL=coding`) —
+  covered by `tests/test_messages_category_mode.py`.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
 
     python -m pytest tests/ -q
 
-Known pre-existing noise on this machine: ~238 errors from a pytest tmp-dir
-`PermissionError` (environment issue, not the code) and one failure in
-`tests/test_benchmark_scoring.py::test_gemini_ids_do_not_collide_with_bare_mini_pattern`.
+The full suite is green (3770 passed); a new failure is a real regression.
