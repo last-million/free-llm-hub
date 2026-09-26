@@ -275,6 +275,9 @@ TOOLS_MAX_HOPS = 10
 # keep their own budget. Google is 15 RPM *per model* (measured, see memory). Benching
 # all of Google on one gemini's burst is what thinned the agentic pool into a 503.
 _PER_MODEL_RATE_LIMIT_PROVIDERS = {"google"}
+# groq / cerebras document their limits per model too (sources on
+# quota.PER_MODEL_HEADER_PROVIDERS), so one model's 429 parks that model only.
+_PER_MODEL_RATE_LIMIT_PROVIDERS |= quota.PER_MODEL_HEADER_PROVIDERS
 
 MAX_IMAGE_COUNT = 8
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -7261,7 +7264,7 @@ def _upstream_post(pid, path, payload):
         if resp.status_code == 429:
             # THIS key is out, not the provider -- same rule as the chat path.
             quota.mark_key_exhausted(pid, key, _retry_after_seconds(resp))
-        quota.observe_headers(pid, resp.headers, key)
+        quota.observe_headers(pid, resp.headers, key, payload.get("model"))
         # Same rotation rule as chat: these three statuses are about THIS KEY,
         # so the next key in the pool deserves a turn before the provider is
         # written off. Anything else is about the request or the provider and
@@ -7438,7 +7441,7 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             # THIS key is out, not the provider. Remember it so the next request
             # starts on one that still has budget.
             quota.mark_key_exhausted(pid, key, _retry_after_seconds(resp))
-        quota.observe_headers(pid, resp.headers, key)  # ADAPT to the provider's real quota
+        quota.observe_headers(pid, resp.headers, key, payload.get("model"))  # ADAPT to the real quota (per model for per-model-header providers)
         if resp.status_code == 400:               # learn a small context window from the error
             _learn_context_limit(pid, payload.get("model"), resp)
             _maybe_mark_missing_model(pid, payload.get("model"), resp)  # gone/renamed id -> sideline
