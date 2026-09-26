@@ -28948,11 +28948,12 @@ if __name__ == "__main__":
                    "stop it first, or set HUB_FORCE=1 to start anyway.",
                    os.path.dirname(config._config_path()))
         raise SystemExit(1)
+    server = make_server(HOST, PORT, app, threaded=True)
     # After the single-instance claim, never before: a second hub that is
     # about to exit must not file the RUNNING hub's turns as interrupted.
+    # (Started after the bind so the claim stays right next to it.)
     threading.Thread(target=_recover_memory_state, daemon=True,
                      name="memory-recover").start()
-    server = make_server(HOST, PORT, app, threaded=True)
     _runtime_server[0] = server
     try:
         server.serve_forever()
