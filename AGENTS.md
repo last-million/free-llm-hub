@@ -276,6 +276,18 @@ Escalation & agent self-delegation (user request 2026-08-06, covered by
   an "enhance" that pended 150s+ behind a locked composer was the
   "clicked Just answer and nothing happened" bug.
 
+Subscription manager in the prose swarm/crews (covered by
+`tests/test_swarm_manager.py`): `swarm.run`/`crews.run` take `manager=None`;
+app.py passes `_swarm_manager_kwargs()` (only when `_manager_enabled()`). The
+manager PLANS, SUPERVISES, REVIEWS, gives each worker output a ~300-token
+verdict (after free checks: empty, `answer_check.inspect`, quoted-literal /
+word-count / JSON-HTML format tests) and FIXES; workers, gap repairs and
+synthesis stay free. A failed phase retries once on another free provider
+(exclude_pids), then the manager writes it. Manager prompts are clipped
+summaries only; "" from it = that stage uses free dispatch. Result gains
+`manager_tokens` (+ `review_warning` when the review stayed unreadable after
+one re-ask); both land on the activity row. `manager=None` = old pipeline.
+
 ## MCP: the hub as a tool server (2026-08-06)
 
 The hub itself speaks MCP so any MCP-capable agent CLI (Kimi Code, Codex,
