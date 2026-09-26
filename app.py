@@ -112,7 +112,8 @@ hub_mcp.init(
             planner=_pipeline_bound(_swarm_windows_planner),
             configure=_swarm_windows_configure,
             stop=agentic_chat.stop_session,
-            modes=_worker_mode_keys()),
+            modes=_worker_mode_keys(),
+            **_swarm_windows_manager_kw()),
         "status": lambda run_id, events=False: swarm_windows.status(run_id, events),
         "stop": swarm_windows.stop,
     })
@@ -3907,6 +3908,7 @@ def _canary_state_load(rows):
 # because _dead_state_dump/_dead_state_load persist it with the quota state.
 _MANAGER_LOCK = threading.Lock()
 _MANAGER_TOKENS = {"day": "", "spent": 0, "calls": 0, "by_purpose": {}}
+_MANAGER_CALL = threading.local()         # .tokens: this thread's spend (see _manager_charge)
 
 
 def _manager_today():
@@ -5181,6 +5183,11 @@ def _manager_charge(tokens, purpose):
         bp = _MANAGER_TOKENS.setdefault("by_purpose", {})
         key = str(purpose or "other")[:40]
         bp[key] = int(bp.get(key) or 0) + int(tokens)
+    # What THIS thread's manager calls cost, for a caller that bills a job
+    # rather than the day (swarm_windows' per-run total). Thread-local because
+    # _manager_dispatch runs synchronously on the caller's thread, and two
+    # runs verifying at once must not read each other's spend.
+    _MANAGER_CALL.tokens = int(getattr(_MANAGER_CALL, "tokens", 0) or 0) + int(tokens)
     try:
         quota._persist_maybe()
     except Exception:                                            # noqa: BLE001
@@ -11652,6 +11659,50 @@ def _swarm_windows_planner(system, goal):
     return text or ""
 
 
+def _swarm_windows_manager(system, user, purpose, max_tokens):
+    """The subscription manager as swarm_windows sees it: (text, tokens).
+
+    REQUESTED: in a multi-session run the manager "plans, instructs, verifies
+    and fixes; free models do the work; minimal subscription tokens". Plan and
+    per-phase verdicts only -- the workers stay hub-backed CLIs on the free
+    models. ("", 0) whenever _manager_dispatch declines (off, over the daily
+    budget, failed), and swarm_windows then carries on as it would without a
+    manager. `tokens` is what THIS call was charged (see _MANAGER_CALL), so
+    the run can say what it cost."""
+    _MANAGER_CALL.tokens = 0
+    try:
+        text, _who = _manager_dispatch(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            max_tokens, purpose="multi-" + str(purpose or "other"))
+    except Exception:                                            # noqa: BLE001
+        text = ""
+    return text or "", int(getattr(_MANAGER_CALL, "tokens", 0) or 0)
+
+
+def _swarm_windows_manager_kw():
+    """{"manager": ...} for swarm_windows.start when a manager is configured,
+    else {} -- so a hub without one calls start() exactly as it always has."""
+    try:
+        return {"manager": _swarm_windows_manager} if _manager_enabled() else {}
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def _multi_manager_footer(tokens, calls):
+    """The /agent reply's footer line for a run the manager worked on; "" when
+    it made no calls. Only the conversation's reply carries it -- never a /v1
+    answer, where it would be text in someone else's output."""
+    try:
+        calls = int(calls or 0)
+        tokens = int(tokens or 0)
+    except (TypeError, ValueError):
+        return ""
+    if calls <= 0:
+        return ""
+    return "-- manager: %s subscription tokens over %d call%s" % (
+        format(tokens, ","), calls, "" if calls == 1 else "s")
+
+
 def _swarm_windows_spawn(cli_id, project_dir):
     return agentic_chat.start_session(cli_id, project_dir)
 
@@ -11814,7 +11865,8 @@ def _multi_turn_events(session_id, sess_info, text):
             stop=agentic_chat.stop_session,
             modes=_worker_mode_keys(),
             on_done=_multi_owner_record,
-            owner=session_id)
+            owner=session_id,
+            **_swarm_windows_manager_kw())
     except swarm_windows.SwarmWindowsError as exc:
         yield {"event": "error", "status": 400, "detail": str(exc)}
         return
@@ -11835,6 +11887,11 @@ def _multi_record(session_id, run):
     report = swarm_windows.format_result(run.id) or ""
     if run.state == swarm_windows.STOPPED:
         report = (_MULTI_STOPPED_NOTE + "\n\n" + report).strip()
+    # The same footer the live turn showed, so the recorded reply matches it.
+    foot = _multi_manager_footer(getattr(run, "manager_tokens", 0),
+                                 getattr(run, "manager_calls", 0))
+    if foot:
+        report = (report + "\n\n" + foot).strip()
     try:
         live = agentic_chat.get_session(session_id) or {}
         agentic_history.record_turn(session_id, run.cli_id, run.project_dir, "agent",
@@ -11910,6 +11967,16 @@ def _multi_follow_events(run_id, cli_id):
             break
         time.sleep(_MULTI_POLL)
     report = swarm_windows.format_result(run_id) or ""
+    # What the subscription manager cost this run (plan + verdicts), as the
+    # reply's last line. A status read AFTER the run ended: the last frame
+    # above can predate the final verdict's charge.
+    try:
+        final = swarm_windows.status(run_id) or st
+    except Exception:                                            # noqa: BLE001
+        final = st
+    foot = _multi_manager_footer(final.get("manager_tokens"), final.get("manager_calls"))
+    if foot:
+        report = (report + "\n\n" + foot).strip()
     if st.get("state") == swarm_windows.STOPPED:
         yield {"event": "stopped"}
         yield {"event": "message", "text": (_MULTI_STOPPED_NOTE + "\n\n" + report).strip()}
@@ -12000,7 +12067,8 @@ def api_swarm_windows_start():
             planner=_pipeline_bound(_swarm_windows_planner),
             configure=_swarm_windows_configure,
             stop=agentic_chat.stop_session,
-            modes=_worker_mode_keys())
+            modes=_worker_mode_keys(),
+            **_swarm_windows_manager_kw())
     except swarm_windows.SwarmWindowsError as exc:
         return _openai_error(str(exc), 400)
     except Exception as exc:                                     # noqa: BLE001

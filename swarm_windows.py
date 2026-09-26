@@ -55,6 +55,8 @@ import uuid
 _log = logging.getLogger("free-llm-hub")
 from collections import deque
 
+import answer_check                  # a leaf like this one: no app import
+
 # How many workers may run at once, whatever the plan says. Each one is a real
 # CLI process with a model behind it, so this is a RAM and rate-limit bound as
 # much as anything -- the user's own words: "it will consume the ram more".
@@ -250,6 +252,49 @@ Reply with JSON only:
                             "needs": [], "mode": "coding"}]}
 """ % MAX_AGENTS
 
+# THE SAME ASK, WHEN A SUBSCRIPTION MANAGER PLANS.
+#
+# REQUESTED: the subscription model "plans, instructs, verifies and fixes; free
+# models do the work". A free worker cannot ask what was meant, so a plan
+# written by the stronger model is worth most when it spells out what a weak
+# one would otherwise guess: what it starts from, what it must not do, what its
+# final message must contain, and how it will be judged. Only the managed
+# planner is asked for these -- the free planner keeps the prompt it has always
+# had, so a hub with no manager plans exactly as before.
+_PLAN_SYSTEM_MANAGED = _PLAN_SYSTEM.replace(
+    "Reply with JSON only:",
+    """- The agents are weaker models than you: be explicit. For each phase also give
+  "inputs" (what it starts from: files, data, earlier phases), "constraints"
+  (what it must not do or change), "output_format" (what its final message
+  must contain) and "acceptance" (concrete, checkable criteria). Name every
+  file that must exist afterwards in backticks, e.g. `src/app.py`.
+
+Reply with JSON only:""").replace(
+    '"needs": [], "mode": "coding"}]}',
+    '"needs": [], "mode": "coding", "inputs": "...",\n'
+    '                            "constraints": "...", "output_format": "...",\n'
+    '                            "acceptance": "..."}]}')
+
+# The optional per-phase brief fields a managed plan carries. Free-text, each
+# clipped: they are instructions to a worker, not a place for a second task.
+BRIEF_FIELDS = ("inputs", "constraints", "output_format", "acceptance")
+BRIEF_CHARS = 1200
+
+
+def _brief_text(value):
+    """A brief field as one string: models answer with a string, a list, or
+    nothing, and the worker prompt wants text."""
+    if isinstance(value, (list, tuple)):
+        value = "; ".join(str(v).strip() for v in value if str(v or "").strip())
+    return str(value or "").strip()[:BRIEF_CHARS]
+
+
+def _is_review(run, agent):
+    """The appended "Review and finish" phase (see with_review): the last one,
+    under that exact title."""
+    return (agent.title == REVIEW_TITLE and bool(run.agents)
+            and run.agents[-1] is agent)
+
 
 def _extract_json(text):
     """The first JSON object in a model's reply. Models fence it, prefix it with
@@ -305,13 +350,19 @@ def clean_phases(plan, max_phases=MAX_AGENTS, modes=()):
         mode = str(p.get("mode") or "").strip().lower() or None
         if mode and modes and mode not in modes:
             mode = None
-        out.append({
+        row = {
             "title": str(p.get("title") or ("Phase %d" % idx)).strip()[:80],
             "task": task[:4000],
             "done_when": str(p.get("done_when") or "").strip()[:400],
             "needs": needs,
             "mode": mode,
-        })
+        }
+        # Only when present: a plain plan keeps exactly the shape it had.
+        for key in BRIEF_FIELDS:
+            text = _brief_text(p.get(key))
+            if text:
+                row[key] = text
+        out.append(row)
     return out if len(out) >= 1 else []
 
 
@@ -362,7 +413,9 @@ def waves(phases):
 class _Agent:
     __slots__ = ("index", "title", "task", "done_when", "needs", "mode",
                  "session_id", "state", "summary", "error", "started_at",
-                 "ended_at", "events", "last_event_at", "abandoned")
+                 "ended_at", "events", "last_event_at", "abandoned",
+                 "inputs", "constraints", "output_format", "acceptance",
+                 "verified", "problems", "revisions")
 
     def __init__(self, index, phase):
         self.index = index
@@ -371,6 +424,17 @@ class _Agent:
         self.done_when = phase.get("done_when") or ""
         self.needs = list(phase.get("needs") or ())
         self.mode = phase.get("mode") or None
+        # The managed brief (see _PLAN_SYSTEM_MANAGED); "" for a plain plan.
+        self.inputs = phase.get("inputs") or ""
+        self.constraints = phase.get("constraints") or ""
+        self.output_format = phase.get("output_format") or ""
+        self.acceptance = phase.get("acceptance") or ""
+        # Verification (only when a manager is wired): None = never checked,
+        # True = passed, False = still failing after its one revision. The
+        # problems are what the revision and then the review are told to fix.
+        self.verified = None
+        self.problems = []
+        self.revisions = 0
         self.session_id = None
         self.state = PENDING
         self.summary = ""
@@ -393,6 +457,10 @@ class _Agent:
             "summary": self.summary, "error": self.error,
             "started_at": self.started_at, "ended_at": self.ended_at,
             "events": len(self.events),
+            "inputs": self.inputs, "constraints": self.constraints,
+            "output_format": self.output_format, "acceptance": self.acceptance,
+            "verified": self.verified, "problems": list(self.problems),
+            "revisions": self.revisions,
         }
         if with_events:
             out["log"] = list(self.events)
@@ -408,9 +476,11 @@ INTERRUPTED_ERROR = "interrupted by a hub restart"
 class _Run:
     __slots__ = ("id", "goal", "project_dir", "cli_id", "agents", "state",
                  "error", "created_at", "ended_at", "stop_flag", "lock", "waves",
-                 "restored", "interrupted", "store_root", "owner")
+                 "restored", "interrupted", "store_root", "owner",
+                 "manager", "modes", "manager_tokens", "manager_calls")
 
-    def __init__(self, goal, project_dir, cli_id, phases, owner=None):
+    def __init__(self, goal, project_dir, cli_id, phases, owner=None,
+                 manager=None, modes=()):
         self.id = "swarm-" + uuid.uuid4().hex[:12]
         self.goal = goal
         self.project_dir = project_dir
@@ -437,12 +507,31 @@ class _Run:
         # for a run started from the Swarm tab, MCP or a shell. Persisted, so
         # a run resumed after a restart still answers into the right one.
         self.owner = owner or None
+        # THE SUBSCRIPTION MANAGER, when the hub has one: `manager(system,
+        # user, purpose, max_tokens) -> (text, tokens)`, injected like every
+        # other model call here. None = no verification at all, i.e. the run
+        # behaves exactly as it did before managers existed. Not persisted: a
+        # callable does not survive a restart, and a resumed run simply
+        # finishes unverified.
+        self.manager = manager
+        self.modes = tuple(modes or ())
+        # What the manager cost THIS run, planning included -- the hub's daily
+        # budget is global, and "what did this job cost me" is per job.
+        self.manager_tokens = 0
+        self.manager_calls = 0
+
+    def charge(self, tokens):
+        with self.lock:
+            self.manager_tokens += max(0, int(tokens or 0))
+            self.manager_calls += 1
 
     def row(self, with_events=False):
         return {
             "run_id": self.id, "goal": self.goal, "state": self.state,
             "project_dir": self.project_dir, "cli": self.cli_id,
             "owner": self.owner,
+            "manager_tokens": self.manager_tokens,
+            "manager_calls": self.manager_calls,
             "error": self.error, "created_at": self.created_at,
             "ended_at": self.ended_at,
             "waves": [list(w) for w in self.waves],
@@ -462,7 +551,8 @@ class _Run:
             return None
         phases = [{"title": a.get("title") or "?", "task": a.get("task") or "",
                    "done_when": a.get("done_when") or "",
-                   "needs": list(a.get("needs") or ()), "mode": a.get("mode")}
+                   "needs": list(a.get("needs") or ()), "mode": a.get("mode"),
+                   **{k: a.get(k) or "" for k in BRIEF_FIELDS}}
                   for a in (row.get("agents") or ())
                   if isinstance(a, dict)]
         if not phases:
@@ -477,7 +567,16 @@ class _Run:
         run.ended_at = row.get("ended_at")
         run.waves = [list(w) for w in (row.get("waves") or ())] or run.waves
         run.restored = True
+        try:
+            run.manager_tokens = max(0, int(row.get("manager_tokens") or 0))
+            run.manager_calls = max(0, int(row.get("manager_calls") or 0))
+        except (TypeError, ValueError):
+            pass
         for agent, a in zip(run.agents, row.get("agents") or ()):
+            agent.verified = a.get("verified")
+            agent.problems = [str(p) for p in (a.get("problems") or ())][:10]
+            agent.revisions = int(a.get("revisions") or 0) if str(
+                a.get("revisions") or 0).isdigit() else 0
             agent.session_id = a.get("session_id")
             agent.state = a.get("state") or PENDING
             agent.summary = a.get("summary") or ""
@@ -594,6 +693,39 @@ def _agent_prompt(run, agent):
     parts = [agent.task, ""]
     if agent.done_when:
         parts += ["DONE WHEN: " + agent.done_when, ""]
+    # The managed brief, still ahead of the framing: these ARE instructions.
+    # Absent on a plain plan, so that prompt is byte-for-byte what it was.
+    for label, value in (("INPUTS", agent.inputs), ("CONSTRAINTS", agent.constraints),
+                         ("ACCEPTANCE (you will be checked against this)",
+                          agent.acceptance),
+                         ("YOUR FINAL MESSAGE MUST CONTAIN", agent.output_format)):
+        if value:
+            parts += [label + ": " + value, ""]
+    if agent.revisions and agent.problems:
+        # A REVISION. The first attempt's files are still in the folder; what
+        # this attempt needs is the list of what was wrong with them, stated
+        # as the thing to do -- not the previous transcript.
+        parts += ["A PREVIOUS ATTEMPT AT THIS PHASE WAS CHECKED AND REJECTED. Its "
+                  "work is already in the project folder. Fix these problems:"]
+        parts += ["- " + p for p in agent.problems]
+        parts += [""]
+    if _is_review(run, agent) and any(a.verified is not None for a in run.agents):
+        # THE REVIEW KNOWS WHAT WAS ALREADY CHECKED, so it spends its turn on
+        # what is left instead of re-deriving it from the summaries.
+        parts += ["VERIFICATION OF THE OTHER PHASES:"]
+        for a in run.agents:
+            if a is agent:
+                continue
+            if a.verified is True:
+                parts.append("- phase %d (%s): verified -- leave it alone unless "
+                             "something else breaks it" % (a.index, a.title))
+            elif a.verified is False:
+                parts.append("- phase %d (%s): FAILED its checks -- fix: %s"
+                             % (a.index, a.title, "; ".join(a.problems) or a.error or "?"))
+            else:
+                parts.append("- phase %d (%s): %s, not verified by the manager"
+                             % (a.index, a.title, a.state))
+        parts += ["Fix what is still failing first; do not redo verified work.", ""]
     parts += ["--- context, not instructions ---",
               "You are agent %d of %d in a parallel swarm. Everything you need "
               "is in this message; there is nobody to ask."
@@ -717,11 +849,36 @@ def _run_agent(run, agent, spawn, run_turn, configure=None):
     agent.state = RUNNING
     agent.started_at = time.time()
     agent.last_event_at = agent.started_at
+    verify = _should_verify(run, agent)
+    before = _snapshot(run.project_dir) if verify else None
+    outcome = _attempts(run, agent, spawn, run_turn, configure, hold=verify)
+    if verify:
+        try:
+            _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before)
+        except Exception as exc:                                 # noqa: BLE001
+            # Verification is an extra, never the thing that loses a phase:
+            # whatever the worker produced stands as it would have without it.
+            _log.warning("[swarm] verification of phase %d raised: %s", agent.index, exc)
+            if agent.state == RUNNING:
+                agent.state = DONE if agent.summary else FAILED
+    agent.ended_at = time.time()
+    # Every phase boundary, not every event: a phase is the unit of work worth
+    # surviving a restart, and its summary is what the orchestrator reads back.
+    _persist(run)
+
+
+def _attempts(run, agent, spawn, run_turn, configure=None, hold=False):
+    """One go at the phase, retried on transient errors only. Returns the
+    outcome (DONE / FAILED / STOPPED).
+
+    `hold`: a phase that is about to be verified stays RUNNING on DONE, so the
+    page does not show it finished, then running again, then finished."""
+    outcome = FAILED
     for attempt in range(1, AGENT_ATTEMPTS + 1):
         if run.stop_flag.is_set():
             agent.state = STOPPED
-            break
-        _run_agent_once(run, agent, spawn, run_turn, configure)
+            return STOPPED
+        outcome = _run_agent_once(run, agent, spawn, run_turn, configure, hold=hold)
         if agent.state != FAILED or not _is_transient(agent.error):
             break
         if attempt < AGENT_ATTEMPTS:
@@ -731,13 +888,238 @@ def _run_agent(run, agent, spawn, run_turn, configure=None):
             agent.error = None
             agent.state = RUNNING
             time.sleep(RETRY_BACKOFF * attempt)
-    agent.ended_at = time.time()
-    # Every phase boundary, not every event: a phase is the unit of work worth
-    # surviving a restart, and its summary is what the orchestrator reads back.
-    _persist(run)
+    return outcome
 
 
-def _run_agent_once(run, agent, spawn, run_turn, configure=None):
+# --------------------------------------------------------------------------- #
+# Verification: the manager checks, the free models fix
+# --------------------------------------------------------------------------- #
+#
+# REQUESTED: the subscription manager "plans, instructs, verifies and fixes;
+# free models do the work; minimal subscription tokens". So a phase is checked
+# CHEAPLY first -- did it answer, is its answer sane (answer_check), do the
+# files its acceptance names exist -- and the manager is asked only when all of
+# that passes, on a compact summary, never a transcript. A phase that fails gets
+# ONE revision (a fresh worker told what was wrong); still failing, it is handed
+# to the review agent by name instead of being silently counted as done.
+REVISIONS = 1
+# What of a phase's final message the manager sees. Its verdict is about the
+# work, and the files list below says what the work touched.
+VERIFY_TEXT_CHARS = 3000
+VERIFY_MAX_TOKENS = 400
+PLAN_MAX_TOKENS = 3000
+VERIFY_FILES = 40
+# The folder walk that says what a phase changed: bounded, and blind to the
+# directories that are nobody's work product.
+_SNAPSHOT_MAX_FILES = 5000
+_SNAPSHOT_SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", ".next",
+                  "dist", "build", ".cache", ".pytest_cache", ".mypy_cache"}
+
+_VERIFY_SYSTEM = """You verify ONE phase of a multi-agent software job, from a summary.
+Judge only against the phase's task and acceptance criteria. Missing or broken
+work is a problem; style preferences are not. Be brief.
+
+Reply with JSON only:
+{"ok": true|false, "problems": ["concrete thing to fix", ...], "mode": "<optional>"}
+"mode" is optional: name one of {modes} ONLY if a different kind of model would
+clearly do this phase better on its retry."""
+
+
+def _should_verify(run, agent):
+    return run.manager is not None and not _is_review(run, agent)
+
+
+def _snapshot(folder):
+    """{relative path: (mtime, size)} for the project folder, or {} when it
+    cannot be read. Never raises."""
+    out = {}
+    try:
+        if not folder or not os.path.isdir(folder):
+            return out
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if d not in _SNAPSHOT_SKIP]
+            for name in files:
+                path = os.path.join(root, name)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                out[os.path.relpath(path, folder).replace("\\", "/")] = (st.st_mtime, st.st_size)
+                if len(out) >= _SNAPSHOT_MAX_FILES:
+                    return out
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
+
+def _changed_files(before, folder):
+    if before is None:
+        return []
+    after = _snapshot(folder)
+    return sorted(p for p, sig in after.items() if before.get(p) != sig)
+
+
+# A file an acceptance line names. Backticked names always count; a bare one
+# only with a real file extension -- and never a framework written like a file
+# ("Node.js", "Next.js"), which is the false positive that matters here.
+_FILE_EXTS = ("html|htm|css|scss|js|mjs|cjs|ts|tsx|jsx|py|json|md|txt|yml|yaml|toml|"
+              "sql|sh|bat|ps1|go|rs|java|kt|c|cc|cpp|h|hpp|cs|php|rb|vue|svelte|xml|"
+              "svg|csv|ini|cfg|lock|gradle|swift|dart")
+_BARE_FILE_RE = re.compile(r"(?<![\w/.@-])((?:[\w-]+/)*[\w-]+\.(?:%s))(?![\w/])" % _FILE_EXTS, re.I)
+_TICK_FILE_RE = re.compile(r"`([^`\s*?]+\.[A-Za-z0-9]{1,8})`")
+_NOT_FILES = {"node.js", "next.js", "vue.js", "nuxt.js", "express.js", "react.js",
+              "three.js", "chart.js", "d3.js", "socket.io", "p5.js", "alpine.js",
+              "ember.js", "backbone.js", "angular.js", "deno.js", "bun.js"}
+
+
+def _acceptance_files(text):
+    found = []
+    for rx in (_TICK_FILE_RE, _BARE_FILE_RE):
+        for m in rx.finditer(text or ""):
+            name = m.group(1).strip().strip("'\"")
+            if "://" in name or name.lower() in _NOT_FILES:
+                continue
+            if rx is _BARE_FILE_RE and "/" not in name and name.lower().endswith(".js") \
+                    and name[0].isupper():
+                continue                    # "Vue.js"-style names, capitalised
+            if name not in found:
+                found.append(name)
+    return found[:20]
+
+
+def _cheap_problems(run, agent, outcome):
+    """What is plainly wrong without asking anyone. [] when nothing is."""
+    if outcome != DONE or not agent.summary:
+        return [agent.error or "the agent produced no result"]
+    problems = []
+    try:
+        verdict = answer_check.inspect(agent.summary, prompt_text=agent.task)
+        if not verdict.get("ok", True):
+            problems.append("the agent's final message is broken (%s); redo the "
+                            "phase and end with a clean summary"
+                            % ", ".join(verdict.get("reasons") or ["unreadable"]))
+    except Exception:                                            # noqa: BLE001
+        pass
+    for name in _acceptance_files(agent.acceptance):
+        path = name if os.path.isabs(name) else os.path.join(run.project_dir or "", name)
+        if not os.path.exists(path):
+            problems.append("`%s` is named in the acceptance criteria but does not "
+                            "exist in the project folder" % name)
+    return problems
+
+
+def _manager_call(run, system, user, purpose, max_tokens):
+    """One manager call's text, its tokens charged to the run. "" on any
+    failure -- the caller then carries on exactly as if there were no manager."""
+    if run is None or run.manager is None:
+        return ""
+    text, tokens, called = _ask_manager(run.manager, system, user, purpose, max_tokens)
+    if called:
+        run.charge(tokens)
+    return text
+
+
+def _ask_manager(manager, system, user, purpose, max_tokens):
+    """(text, tokens, charged?) from the injected manager. Never raises. A call
+    that returned nothing and cost nothing (disabled, over budget) is not
+    counted as a call."""
+    try:
+        got = manager(system, user, purpose, max_tokens)
+        text, tokens = got if isinstance(got, tuple) else (got, 0)
+        tokens = max(0, int(tokens or 0))
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[swarm] manager %s raised: %s", purpose, exc)
+        return "", 0, False
+    text = str(text or "")
+    return text, tokens, bool(text or tokens)
+
+
+def _manager_verdict(run, agent, changed):
+    """(problems, suggested mode, answered) from the manager. answered=False
+    when it had nothing to say -- no answer, over budget, unreadable. Fail-OPEN:
+    a verdict that cannot be read never fails a phase the cheap checks passed,
+    but it does not call the phase verified either."""
+    brief = ["Overall goal: " + (run.goal or "")[:600],
+             "Phase %d: %s" % (agent.index, agent.title),
+             "Task: " + agent.task[:1500]]
+    if agent.done_when:
+        brief.append("Done when: " + agent.done_when)
+    if agent.acceptance:
+        brief.append("Acceptance: " + agent.acceptance)
+    brief.append("Files changed during the phase: "
+                 + (", ".join(changed[:VERIFY_FILES]) or "(none)")
+                 + (" (+%d more)" % (len(changed) - VERIFY_FILES)
+                    if len(changed) > VERIFY_FILES else ""))
+    text = agent.summary or ""
+    if len(text) > VERIFY_TEXT_CHARS:
+        text = text[:VERIFY_TEXT_CHARS] + "\n[...clipped]"
+    brief += ["", "The agent's final message:", text]
+    system = _VERIFY_SYSTEM.replace("{modes}", ", ".join(run.modes) or "coding")
+    raw = _manager_call(run, system, "\n".join(brief), "verify", VERIFY_MAX_TOKENS)
+    got = _extract_json(raw)
+    if not isinstance(got, dict):
+        return [], None, False
+    if got.get("ok") is not False:
+        return [], None, True
+    problems = [str(p).strip()[:300] for p in (got.get("problems") or ())
+                if str(p or "").strip()][:8]
+    mode = str(got.get("mode") or "").strip().lower() or None
+    return (problems or ["the manager rejected the phase without saying why; "
+                         "re-check it against the task and acceptance"]), mode, True
+
+
+def _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before):
+    """Check the phase; on failure run it ONCE more with the problems as
+    instructions; still failing, mark it for the review. Sets the phase's
+    final state (it was held RUNNING by _attempts)."""
+    for round_ in range(REVISIONS + 1):
+        if run.stop_flag.is_set() or agent.abandoned or outcome == STOPPED \
+                or agent.state == STOPPED:
+            if agent.state == RUNNING:
+                agent.state = STOPPED if run.stop_flag.is_set() else outcome
+            return
+        changed = _changed_files(before, run.project_dir)
+        problems = _cheap_problems(run, agent, outcome)
+        mode, answered = None, False
+        if not problems:
+            problems, mode, answered = _manager_verdict(run, agent, changed)
+        if not problems:
+            # Passed. "Verified" only when the manager actually said so; with
+            # the budget spent it stays unchecked, and done -- as it would
+            # have been with no manager at all.
+            agent.verified = True if answered else None
+            agent.problems = []
+            agent.error = None
+            agent.state = DONE
+            return
+        agent.problems = problems
+        if round_ >= REVISIONS:
+            break
+        # THE REVISION: a fresh worker, told exactly what was wrong. A different
+        # KIND of model when the manager named one that fits; otherwise the
+        # same mode, where the router's weighted pick still lands elsewhere.
+        if mode and mode in run.modes and mode != agent.mode:
+            agent.mode = mode
+        agent.revisions += 1
+        previous = agent.summary
+        agent.session_id = None
+        agent.error = None
+        agent.state = RUNNING
+        agent.last_event_at = time.time()
+        _persist(run)
+        outcome = _attempts(run, agent, spawn, run_turn, configure, hold=True)
+        if not agent.summary:
+            # A revision that produced nothing must not erase what the first
+            # attempt did say -- the review reads it.
+            agent.summary = previous
+    if agent.state == STOPPED or run.stop_flag.is_set() or agent.abandoned:
+        return
+    agent.verified = False
+    agent.state = FAILED
+    agent.error = ("did not pass verification: " + "; ".join(agent.problems))[:400]
+
+
+def _run_agent_once(run, agent, spawn, run_turn, configure=None, hold=False):
     try:
         agent.session_id = spawn(run.cli_id, run.project_dir)
         # DIFFERENT MODELS FOR DIFFERENT PHASES. The planner says what kind of
@@ -757,7 +1139,7 @@ def _run_agent_once(run, agent, spawn, run_turn, configure=None):
             # the phase stays what the run recorded: flipping it to done now
             # would claim the review saw work it never did.
             agent.summary = agent.summary or (summary or "").strip()
-            return
+            return FAILED
         agent.summary = (summary or "").strip()
         if run.stop_flag.is_set():
             agent.state = STOPPED
@@ -766,12 +1148,17 @@ def _run_agent_once(run, agent, spawn, run_turn, configure=None):
         elif not agent.summary:
             agent.state = FAILED
             agent.error = agent.error or "the agent produced no result"
+        elif hold:
+            # Finished, but not yet checked: _verify_and_revise publishes it.
+            return DONE
         else:
             agent.state = DONE
+        return agent.state
     except Exception as exc:                                     # noqa: BLE001
         # A worker that dies must not take the wave with it.
         agent.state = FAILED
         agent.error = "%s: %s" % (exc.__class__.__name__, exc)
+        return FAILED
 
 
 def _give_up(agent, why, stop=None):
@@ -888,12 +1275,31 @@ _PLAN_NUDGE = ("\n\n(Your previous reply could not be read as the JSON object "
                "fences, nothing before the opening brace.)")
 
 
-def plan(goal, planner, max_phases=MAX_AGENTS, modes=()):
+def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None):
     """Ask a model to break `goal` into phases. Returns [] when it cannot.
 
     `planner(system, user) -> str` is injected so this can be tested, and so the
-    hub's own routing decides which model plans."""
-    system = _PLAN_SYSTEM.replace("{modes}", ", ".join(modes) if modes else "coding")
+    hub's own routing decides which model plans.
+
+    `manager(system, user) -> str`, when given, plans FIRST with the richer
+    brief (_PLAN_SYSTEM_MANAGED) -- once, no nudge: a second paid ask is not
+    worth it when the free planner is right here. Its "" (disabled, over
+    budget, failed) or an unreadable plan falls through to the free planner,
+    unchanged."""
+    mode_list = ", ".join(modes) if modes else "coding"
+    if manager is not None:
+        try:
+            raw = manager(_PLAN_SYSTEM_MANAGED.replace("{modes}", mode_list), goal)
+        except Exception as exc:                                 # noqa: BLE001
+            _log.warning("[swarm] manager planner raised: %s", exc)
+            raw = ""
+        phases = clean_phases(_extract_json(raw), max_phases, modes)
+        if phases:
+            return phases
+        if raw:
+            _log.warning("[swarm] manager plan unreadable (%d chars); free planner "
+                         "takes over", len(raw))
+    system = _PLAN_SYSTEM.replace("{modes}", mode_list)
     ask = goal
     for attempt in range(1, PLAN_ATTEMPTS + 1):
         try:
@@ -963,25 +1369,53 @@ def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
     return resumed
 
 
+class _PlanMeter:
+    """Charges the planning call before the run it belongs to exists."""
+
+    def __init__(self, manager):
+        self.manager = manager
+        self.tokens = 0
+        self.calls = 0
+
+    def ask(self, system, user):
+        text, tokens, called = _ask_manager(self.manager, system, user, "plan",
+                                            PLAN_MAX_TOKENS)
+        if called:
+            self.tokens += tokens
+            self.calls += 1
+        return text
+
+
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
-          on_done=None, configure=None, modes=(), review=True, owner=None, stop=None):
+          on_done=None, configure=None, modes=(), review=True, owner=None, stop=None,
+          manager=None):
     """Begin a run. Returns the run id immediately; the work happens on a
     background thread.
 
-    Either `phases` (already planned) or `planner` must be given."""
+    Either `phases` (already planned) or `planner` must be given.
+
+    `manager(system, user, purpose, max_tokens) -> (text, tokens)` is the
+    hub's subscription manager, or None. With it, the manager plans (the free
+    `planner` is the fallback) and verifies each phase; without it, the run is
+    exactly what it always was."""
     goal = str(goal or "").strip()
     if not goal:
         raise SwarmWindowsError("a goal is required")
+    meter = _PlanMeter(manager) if manager is not None else None
     if phases is None:
         if planner is None:
             raise SwarmWindowsError("give either phases or a planner")
-        phases = plan(goal, planner, modes=modes)
+        phases = plan(goal, planner, modes=modes,
+                      manager=meter.ask if meter else None)
     phases = clean_phases({"phases": phases}, modes=modes) if phases else []
     if not phases:
         raise SwarmWindowsError("could not turn that into phases")
     if review:
         phases = with_review(phases)
-    run = _Run(goal, project_dir, cli_id, phases, owner=owner)
+    run = _Run(goal, project_dir, cli_id, phases, owner=owner,
+               manager=manager, modes=modes)
+    if meter:
+        run.manager_tokens, run.manager_calls = meter.tokens, meter.calls
     _remember(run)
     threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure, stop),
                      daemon=True, name="swarm-walk-" + run.id).start()
@@ -1002,10 +1436,13 @@ def result(run_id):
         "run_id": run.id, "goal": run.goal, "state": run.state,
         "phases": [{"index": a.index, "title": a.title, "state": a.state,
                     "summary": a.summary, "error": a.error, "mode": a.mode,
-                    "session_id": a.session_id}
+                    "session_id": a.session_id, "verified": a.verified,
+                    "problems": list(a.problems)}
                    for a in run.agents],
         "done": sum(1 for a in run.agents if a.state == DONE),
         "failed": sum(1 for a in run.agents if a.state == FAILED),
+        "manager_tokens": run.manager_tokens,
+        "manager_calls": run.manager_calls,
     }
 
 
@@ -1020,5 +1457,9 @@ def format_result(run_id):
     for p in res["phases"]:
         lines.append("### Phase %d - %s [%s]" % (p["index"], p["title"], p["state"]))
         lines.append(p["summary"] or ("(no result: %s)" % (p["error"] or "unknown")))
+        if p.get("verified") is False and p.get("problems"):
+            # Only a manager-verified run ever sets this; a plain run's report
+            # reads exactly as before.
+            lines.append("Still failing its checks: " + "; ".join(p["problems"]))
         lines.append("")
     return "\n".join(lines).strip()
