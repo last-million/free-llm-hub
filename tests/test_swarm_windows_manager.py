@@ -497,4 +497,7 @@ def test_no_manager_no_footer(monkeypatch):
 
 def test_every_start_site_passes_the_manager_kw():
     src = open("app.py", encoding="utf-8").read()
-    assert src.count("**_swarm_windows_manager_kw()") == 3
+    # Three start sites, plus the boot-time resume that re-attaches it.
+    assert src.count("**_swarm_windows_manager_kw()") == 4
+    i = src.index("def _resume_interrupted_swarms(")
+    assert "**_swarm_windows_manager_kw()" in src[i:i + 1600]

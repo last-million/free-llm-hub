@@ -474,6 +474,15 @@
   .testout.show{display:block}
   .testout.ok{background:var(--accent-soft);color:var(--ok-text);border:1px solid var(--accent-border)}
   .testout.fail{background:var(--danger-soft);color:var(--danger-text);border:1px solid var(--danger-border)}
+  /* Answer-canary verdict of a Test: did the model answer the known question
+     correctly, answer with junk, or not answer at all (HTTP error)? */
+  .canary-badge{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;
+    font-size:11px;font-weight:600;line-height:1.5;white-space:nowrap;vertical-align:baseline;border:1px solid}
+  .canary-badge.good{background:var(--accent-soft);color:var(--ok-text);border-color:var(--accent-border)}
+  .canary-badge.junk{background:var(--warn-soft);color:var(--warn-text);border-color:var(--warn-border)}
+  .canary-badge.err{background:var(--danger-soft);color:var(--danger-text);border-color:var(--danger-border)}
+  .canary-badge.none{background:transparent;color:var(--text-faint);border-color:var(--border)}
+  .mgr-cost{color:var(--text-faint);font-size:11px;white-space:nowrap}
   /* Swarm switch sits in the chat bar, sized down to match the buttons. */
   .chat-swarm-switch{margin-left:auto;display:flex;align-items:center;gap:6px;flex:none}
   .chat-swarm-switch .lbl{font-size:11.5px;font-weight:600;color:var(--text-dim)}
@@ -5674,7 +5683,8 @@
           var ok = !!r.ok;
           keyHealth[p.id] = { state: ok ? 'ok' : 'bad', detail: r.detail || '' };   /* cache the manual result */
           out.className = 'testout show ' + (ok ? 'ok' : 'fail');
-          var html = (ok ? '&check; ' : '&cross; ') + esc(r.detail || (ok ? 'Key works' : 'Test failed'));
+          var html = (ok ? '&check; ' : '&cross; ') + esc(r.detail || (ok ? 'Key works' : 'Test failed'))
+                   + canaryBadge(r.canary, ok);
           /* PER-KEY breakdown. With several keys on one provider, an overall
              green used to hide a dead key beside a working one: routing rotates
              onto it and burns an attempt every time. Each key is now tested
@@ -5687,6 +5697,7 @@
                    + '<span class="keyname">Key ' + ((k.index|0) + 1) + '</span>'
                    + '<code class="keymask">' + esc(k.masked || '') + '</code>'
                    + '<span class="keydetail">' + esc(k.detail || '') + '</span>'
+                   + canaryBadge(k.canary, !!k.ok)
                    + '</div>';
             }).join('') + '</div>';
           }
@@ -5856,6 +5867,25 @@
     if (d >= t){
       setTimeout(function(){ if (_testProgress.done >= _testProgress.total) wrap.hidden = true; }, 1500);
     }
+  }
+  /* Answer-canary verdict as a badge. The Test prompt is a question with a
+     known answer (app.py _canary_question), and the reply is judged:
+     correct / junk / wrong / empty. A green "Key OK" alone could hide a model
+     that answers "2826HAMSTER-2826…" -- the badge says which it was. No reply
+     at all (`ok` false, no canary) is an HTTP error. '' when there is nothing
+     to say (still running, or an older server without canary fields). */
+  function canaryBadge(canary, ok){
+    var c = canary || null;
+    var v = c && c.verdict;
+    var tip = c ? (c.summary || '') + (c.expected ? ' (expected ' + c.expected + ')' : '') : '';
+    var label, cls;
+    if (v === 'correct'){ label = 'answered correctly'; cls = 'good'; }
+    else if (v === 'junk'){ label = 'answered with junk'; cls = 'junk'; }
+    else if (v === 'wrong'){ label = 'answered wrong'; cls = 'junk'; }
+    else if (v === 'empty'){ label = 'empty reply'; cls = 'none'; }
+    else if (ok === false){ label = 'HTTP error'; cls = 'err'; tip = tip || 'no reply to judge'; }
+    else return '';
+    return '<span class="canary-badge ' + cls + '" title="' + esc(tip) + '">' + label + '</span>';
   }
   /* run one live key check via the shared /api/test route (20s cap). Result is CACHED
      (both in-memory and — server-side, via /api/test itself — to disk);
@@ -8096,7 +8126,8 @@
       var cls = m.skipped ? 'skip' : (m.ok ? 'ok' : 'err');
       var text = m.ok ? ('Replied: ' + (m.response || '')) : (m.error || 'failed');
       return '<div class="sub-test-row ' + cls + '"><span class="tr-i" aria-hidden="true">' + icon + '</span>' +
-             '<code>' + esc(m.model) + '</code><span>' + esc(text) + '</span></div>';
+             '<code>' + esc(m.model) + '</code><span>' + esc(text) + '</span>' +
+             (m.skipped ? '' : canaryBadge(m.canary, !!m.ok)) + '</div>';
     }).join('');
     return '<div class="sub-install-result multi">' + rows + '</div>';
   }
@@ -10628,6 +10659,17 @@
     }
     return prov ? prov + ' · ' + model : model;
   }
+  /* "manager: 1.2K tok · 5 calls" for one run -- swarm.run's manager_tokens,
+     or a multi-session run's manager_tokens/manager_calls. '' when the run
+     had no manager (or it cost nothing), so a plain run shows no noise. */
+  function managerCostHTML(tokens, calls){
+    var t = Number(tokens) || 0;
+    if (t <= 0) return '';
+    var n = Number(calls) || 0;
+    var tt = t >= 1000 ? (Math.round(t / 100) / 10) + 'K' : String(t);
+    return '<span class="mgr-cost" title="Subscription manager tokens this run">manager: ' +
+           esc(tt) + ' tok' + (n > 0 ? ' · ' + n + ' call' + (n === 1 ? '' : 's') : '') + '</span>';
+  }
   function renderActivity(){
     var host = $('#activity-list'); if (!host) return;
     setSecChip('activity', activityState.length ? (activityState.length + ' recent') : '');
@@ -10651,7 +10693,7 @@
       var pipe = Array.isArray(a.pipeline) ? a.pipeline : [];
       var stages = Array.isArray(a.stages) ? a.stages : [];
       var detail = '';
-      if (a.crew || pipe.length || stages.length){
+      if (a.crew || pipe.length || stages.length || a.manager_tokens){
         var chips = pipe.map(function(p){
           return '<span class="af-agent" title="' + esc(p.model) + '">' +
                    '<b>' + esc(p.role) + '</b>' + esc(prettyModel(p.model)) + '</span>';
@@ -10661,6 +10703,10 @@
           '<div class="af-pipe">' +
             (a.crew ? '<span class="af-crew">crew: ' + esc(a.crew) + '</span>' : '') +
             (pipe.length ? '<span class="af-pipe-n">' + pipe.length + ' agents</span>' : '') +
+            /* The subscription manager is the only PAID part of a run: what
+               this one cost, and a review it could not read, on the row. */
+            managerCostHTML(a.manager_tokens, a.manager_calls) +
+            (a.review_warning ? '<span class="canary-badge junk" title="' + esc(a.review_warning) + '">unreviewed</span>' : '') +
             (last && pending ? '<span class="af-stage">' + esc(last.kind) + ' — ' + esc(last.detail) + '</span>' : '') +
             chips +
           '</div>';
@@ -11904,7 +11950,9 @@
           ? ' <span class="sw-sum">after ' + a.needs.join(', ') + '</span>' : '';
         return '<div class="sw-phase ' + esc(a.state) + '">' +
                  '<span class="sw-dot" aria-hidden="true"></span>' +
-                 '<span><span class="sw-title">' + esc(a.title) + '</span>' + needs + sum + '</span>' +
+                 '<span><span class="sw-title">' + esc(a.title) + '</span>' +
+                   (a.verified === true ? ' <span class="mgr-cost" title="Checked by the subscription manager">&check; verified</span>' : '') +
+                   needs + sum + '</span>' +
                  (a.mode ? '<span class="sw-mode">' + esc(a.mode) + '</span>' : '<span></span>') +
                '</div>';
       }).join('');
@@ -11915,6 +11963,7 @@
                  '<span class="sw-goal" title="' + esc(r.goal || '') + '">' + esc(r.goal || '') + '</span>' +
                  '<span class="sw-state ' + esc(r.state) + '">' + esc(r.state) + '</span>' +
                  '<span class="sw-sum">' + (r.done || 0) + '/' + (r.total || 0) + '</span>' +
+                 managerCostHTML(r.manager_tokens, r.manager_calls) +
                  stopBtn +
                '</div>' +
                '<div class="sw-phases">' + phases + '</div>' +

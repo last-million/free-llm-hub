@@ -12103,10 +12103,15 @@ def _resume_interrupted_swarms():
     conversation's run, and its events fed into the live buffer so a reload
     attaches to it as if nothing had happened."""
     try:
+        # The manager is re-attached here (when one is enabled NOW): a resumed
+        # run used to finish every remaining phase unverified, although the
+        # person started it with a manager checking the work.
         resumed = swarm_windows.resume_interrupted(
             _swarm_windows_spawn, _swarm_windows_turn,
             configure=_swarm_windows_configure,
-            stop=agentic_chat.stop_session, on_done=_multi_owner_record)
+            stop=agentic_chat.stop_session, on_done=_multi_owner_record,
+            modes=_worker_mode_keys(),
+            **_swarm_windows_manager_kw())
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("[swarm] could not resume interrupted runs: %s", exc)
         return []
