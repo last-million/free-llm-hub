@@ -311,6 +311,9 @@ def record(pid: str, model: str = None, n: int = 1) -> None:
     lim = _limit_for(pid)
     now = time.time()
     start, _reset = _window_bounds(lim["window"], now, pid)
+    # Resolved OUTSIDE the lock: the resolver reads the Flask request / a
+    # thread-local, and must never be able to deadlock the quota counters.
+    src = _current_source()
     with _LOCK:
         st = _STATE.get(pid)
         if not st or st.get("window_start") != start:
@@ -324,7 +327,57 @@ def record(pid: str, model: str = None, n: int = 1) -> None:
                 ms = {"window_start": start, "models": {}}
             ms["models"][model] = ms["models"].get(model, 0) + n
             _MODEL_STATE[pid] = ms
+        ss = _SOURCE_STATE.get(pid)
+        if not ss or ss.get("window_start") != start:
+            ss = {"window_start": start, "sources": {}}
+        ss["sources"][src] = ss["sources"].get(src, 0) + n
+        _SOURCE_STATE[pid] = ss
     _persist_maybe()
+
+
+# WHO SPENT IT. REPORTED 2026-09-26: the Providers page showed dahl/tokenrouter
+# throttled and four more parked, and the user read that as a bug -- "I did not
+# use them for two days". But the hub spends quota on its OWN behalf too: swarm
+# and crew stages, /build agent sessions, key tests and probes. A per-window
+# counter by source makes the card say who used it instead of leaving the user
+# to guess. app.py installs the resolver (request User-Agent -> CLI label, or a
+# thread-local label such as "swarm" / "probe"); without one every hit is
+# "other". Same window as the usage counter, so the two always agree.
+_SOURCE_STATE = {}           # pid -> {"window_start": ts, "sources": {label: n}}
+_source_resolver = None
+_SOURCE_MAX_LEN = 32
+
+
+def set_source_resolver(fn) -> None:
+    """Install fn() -> short label naming who is making the current request."""
+    global _source_resolver
+    _source_resolver = fn
+
+
+def _current_source() -> str:
+    """The resolver's label, or "other". Never raises: attribution is a
+    dashboard nicety and must not cost a request its quota bookkeeping."""
+    fn = _source_resolver
+    if fn is None:
+        return "other"
+    try:
+        label = fn()
+    except Exception:
+        return "other"
+    label = str(label or "").strip()[:_SOURCE_MAX_LEN]
+    return label or "other"
+
+
+def sources(pid: str) -> dict:
+    """{label: count} of upstream requests for pid in its CURRENT window.
+    Empty once the window rolls over (same rule as models())."""
+    lim = _limit_for(pid)
+    start, _reset = _window_bounds(lim["window"], time.time(), pid)
+    with _LOCK:
+        ss = _SOURCE_STATE.get(pid)
+        if not ss or ss.get("window_start") != start:
+            return {}
+        return dict(ss.get("sources") or {})
 
 
 def key_fingerprint(key) -> str:
@@ -941,6 +994,7 @@ def save_state() -> None:
                                    for (pid, m), mt in _MODEL_THROTTLE.items()},
                 "dynamic": _DYNAMIC,
                 "tokens": _TOKENS,
+                "sources": _SOURCE_STATE,
             }
         if _extra_dump is not None:
             try:
@@ -993,6 +1047,12 @@ def _load_state(path: str) -> None:
             for pid, ms in model_state.items():
                 if isinstance(pid, str) and isinstance(ms, dict):
                     _MODEL_STATE[pid] = ms
+        srcs = blob.get("sources")
+        if isinstance(srcs, dict):
+            for pid, ss in srcs.items():
+                if (isinstance(pid, str) and isinstance(ss, dict)
+                        and isinstance(ss.get("sources"), dict)):
+                    _SOURCE_STATE[pid] = ss
         throttle = blob.get("model_throttle")
         if isinstance(throttle, dict):
             for key, mt in throttle.items():
