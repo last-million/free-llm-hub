@@ -238,8 +238,14 @@ def test_a_task_file_that_vanished_is_said_so(proj):
 def test_every_writer_passes_the_project_folder():
     chat = open("agentic_chat.py", encoding="utf-8").read()
     app = open("app.py", encoding="utf-8").read()
-    assert 'project_dir=(get_session(session_id) or {}).get("project_dir")' in chat
-    assert 'project_dir=(sess_info or {}).get("project_dir"))' in chat
+    start = chat[chat.index("def _memory_turn_start("):]
+    start = start[:start.index("\ndef ")]
+    assert "project_dir=project_dir)" in start           # the original request's stamp
+    assert "_memory_turn_start(session_id, text, sess.project_dir)" in chat
+    durable = chat[chat.index("def send_message_stream_durable("):]
+    durable = durable[:durable.index("\ndef ", 10)]
+    assert 'project_dir = (sess_info or {}).get("project_dir")' in durable
+    assert "project_dir=project_dir)" in durable          # the stopping place's stamp
     assert "memory.remember_summary(sid, out," in app
     assert "why=run.state, project_dir=run.project_dir)" in app
     body = app[app.index("def _multi_turn_events("):app.index("\ndef _multi_record(")]

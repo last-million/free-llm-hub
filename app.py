@@ -15118,13 +15118,16 @@ def api_agent_resume_session(session_id):
             return jsonify(live)
         return jsonify({"error": "No stored conversation with that id.",
                         "code": "no_history"}), 404
-    # The id is written on the agent's turns, so take the most recent one that
-    # has it — earlier turns predate the thread existing.
+    # The conversation-level id is written the moment a turn reports one
+    # (agentic_chat._keep_native), so it is the NEWEST -- including a thread a
+    # stopped turn created, which never got an agent turn to carry it. The ids
+    # on the agent's turns are the fallback for conversations saved before.
     native = conv.get("native_session_id")
-    for turn in reversed(conv.get("turns") or []):
-        if turn.get("native_session_id"):
-            native = turn["native_session_id"]
-            break
+    if not native:
+        for turn in reversed(conv.get("turns") or []):
+            if turn.get("native_session_id"):
+                native = turn["native_session_id"]
+                break
     project_dir = conv.get("project_dir")
     if not project_dir or not os.path.isdir(project_dir):
         return jsonify({"error": "That project folder no longer exists: %s"
@@ -15207,6 +15210,14 @@ def api_agent_send_message(session_id):
     # the outgoing message. Only persist the agent's reply if a turn actually
     # produced one (status 200); a 4xx/409/499/5xx has no reply text to save.
     sess_info = agentic_chat.get_session(session_id)
+    # ...but only a turn that will RUN. A second tab sending while a turn is
+    # going (409), or an empty/oversized message (400), used to be recorded
+    # as a user turn first and refused after -- a phantom turn in history.
+    refused = agentic_chat.precheck_turn(
+        session_id, body["text"],
+        cap=not (sess_info and sess_info.get("quality") == "multi"))
+    if sess_info and refused and refused[0] in (400, 409):
+        return jsonify({"status": refused[0], "text": None, "detail": refused[1]}), refused[0]
     if sess_info:
         # The files as they are RIGHT NOW, before this turn touches anything --
         # so restoring this turn's snapshot puts the project back to how it
@@ -15266,6 +15277,17 @@ def api_agent_send_message_stream(session_id):
         return jsonify({"error": "Pass {\"text\": string}."}), 400
     text = body["text"]
     sess_info = agentic_chat.get_session(session_id)
+    # Refused turns are answered BEFORE anything is recorded: a second tab's
+    # send while a turn runs used to land in the transcript as a user turn and
+    # only then get its 409 (see the plain route above).
+    refused = agentic_chat.precheck_turn(
+        session_id, text, cap=not (sess_info and sess_info.get("quality") == "multi"))
+    if sess_info and refused and refused[0] in (400, 409):
+        def _refused(status=refused[0], detail=refused[1]):
+            yield "data: " + json.dumps({"event": "error", "status": status,
+                                         "detail": detail}) + "\n\n"
+            yield "event: end\ndata: {}\n\n"
+        return Response(_refused(), mimetype="text/event-stream", headers=_SSE_HEADERS)
     if sess_info:
         # Snapshot the files BEFORE the turn touches them, exactly as the
         # non-streaming route does. It was missing here, which made the whole
@@ -15363,9 +15385,12 @@ def api_agent_plan(session_id):
     sess = agentic_chat.get_session(session_id) or {}
     if sess.get("project_dir"):
         # Fresh: the agent may have edited PROGRESS.md mid-turn, and a page
-        # asking now wants what is on disk now.
+        # asking now wants what is on disk now. Mid-turn, the agent wrote it
+        # (seen); between turns, a changed list is the user's edit, which the
+        # next turn is handed (memory.should_restate_rules).
         try:
-            memory.update_tasks_from_project(session_id, sess["project_dir"])
+            memory.update_tasks_from_project(session_id, sess["project_dir"],
+                                             seen=agentic_chat.turn_busy(session_id))
         except Exception:                                        # noqa: BLE001
             pass
     mem = memory.get(session_id)
@@ -15600,6 +15625,48 @@ def api_agent_new_project():
 # project folder's actual files.
 # ---------------------------------------------------------------------------
 
+def _forget_conversation_state(session_id, project_dir=None):
+    """Everything else a conversation owns, dropped with its transcript --
+    on delete and when history retention prunes it.
+
+    Memory (memory/<id>.json and any in-flight marker) and the per-session
+    brief written INTO the project folder used to outlive the conversation
+    forever. Project and global memory are not the conversation's and stay."""
+    try:
+        memory.forget(session_id)
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        agentic_chat.remove_task_brief(project_dir, session_id)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+agentic_history.add_forget_hook(_forget_conversation_state)
+
+
+def _recover_memory_state():
+    """At boot, once this process owns the state dir: a turn the last process
+    died in the middle of becomes a stopping place (memory.recover_inflight),
+    and memory no conversation refers to any more is pruned on history's own
+    retention clock. Never raises."""
+    try:
+        back = memory.recover_inflight()
+        if back:
+            _log.info("filed %d turn(s) cut short by the last shutdown as "
+                      "resumable", len(back))
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("could not recover in-flight turns: %s", exc)
+    try:
+        gone = memory.prune_orphans(agentic_history.known_session_ids(),
+                                    max_age_days=agentic_history.RETENTION_DAYS)
+        if gone:
+            _log.info("pruned memory of %d conversation(s) that no longer exist",
+                      len(gone))
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("could not prune orphaned memory: %s", exc)
+
+
 @app.route("/api/agent/history", methods=["GET"])
 def api_agent_history_list():
     limit = request.args.get("limit", "50")
@@ -15679,6 +15746,17 @@ def api_agent_history_rewind(session_id):
         return jsonify({"error": "Could not restore the files for that message.",
                         "code": "restore_failed"}), 500
     removed = agentic_history.truncate_to_turn(session_id, index)
+    # ...and the MEMORY, the third half. Its recent traces, a recap written
+    # after this point, the task list and the stopping place all described
+    # work that no longer exists on disk -- and the next turn was handed them.
+    try:
+        memory.rewind(session_id, cutoff=(turns[index] or {}).get("ts"),
+                      request=(turns[index] or {}).get("text") or "",
+                      kept_turns=sum(1 for t in turns[:index]
+                                     if (t or {}).get("role") == "user"),
+                      project_dir=project_dir)
+    except Exception:                                            # noqa: BLE001
+        pass
     return jsonify({"session_id": session_id, "index": index,
                     "turns_removed": removed or 0,
                     "text": (turns[index] or {}).get("text") or "",
@@ -27917,6 +27995,10 @@ if __name__ == "__main__":
                    "stop it first, or set HUB_FORCE=1 to start anyway.",
                    os.path.dirname(config._config_path()))
         raise SystemExit(1)
+    # After the single-instance claim, never before: a second hub that is
+    # about to exit must not file the RUNNING hub's turns as interrupted.
+    threading.Thread(target=_recover_memory_state, daemon=True,
+                     name="memory-recover").start()
     server = make_server(HOST, PORT, app, threaded=True)
     _runtime_server[0] = server
     try:

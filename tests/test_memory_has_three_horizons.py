@@ -207,6 +207,8 @@ def test_the_agent_gets_its_project_memory():
 
 def test_every_turn_leaves_a_short_trace():
     src = open("agentic_chat.py", encoding="utf-8").read()
-    body = src[src.index("def send_message_stream(session_id, text):"):]
-    body = body[:body.index("\n    def err(")]
+    body = src[src.index("def _memory_turn_start("):]
+    body = body[:body.index("\ndef ")]
     assert "memory.remember_recent(session_id, text" in body
+    stream = src[src.index("def send_message_stream(session_id, text):"):]
+    assert "_memory_turn_start(session_id, text" in stream[:stream.index("\ndef ")]

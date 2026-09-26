@@ -118,16 +118,23 @@ def test_a_broken_memory_never_fails_a_turn(monkeypatch):
 # Turns are counted where every turn goes through
 # --------------------------------------------------------------------------- #
 
+def _turn_start_body():
+    body = AGENT[AGENT.index("def _memory_turn_start("):]
+    return body[:body.index("\ndef ")]
+
+
 def test_every_turn_is_counted():
+    """Counted once the turn is validated and holds the lock -- not before,
+    where a refused send (a second tab's 409) was a phantom turn."""
+    assert "memory.note_turn(session_id)" in _turn_start_body()
     body = AGENT[AGENT.index("def send_message_stream(session_id, text):"):]
-    body = body[:body.index("\n    def err(")]
-    assert "memory.note_turn(session_id)" in body
+    body = body[:body.index("\ndef ")]
+    assert body.index("sess.turn_lock.acquire(blocking=False)") \
+        < body.index("_memory_turn_start(session_id, text")
 
 
 def test_counting_cannot_fail_a_turn():
-    body = AGENT[AGENT.index("def send_message_stream(session_id, text):"):]
-    body = body[:body.index("\n    def err(")]
-    assert "except Exception" in body
+    assert "except Exception" in _turn_start_body()
 
 
 def test_the_counter_survives_a_resumed_session():
@@ -228,8 +235,7 @@ def test_a_broken_memory_never_fails_a_build(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_the_first_message_is_remembered_as_the_job():
-    body = AGENT[AGENT.index("def send_message_stream(session_id, text):"):]
-    body = body[:body.index("\n    def err(")]
+    body = _turn_start_body()
     assert "memory.note_turn(session_id) == 1" in body
     assert "The original request" in body
 

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -93,13 +94,84 @@ def _conv_path(session_id):
 # usage_history._save() / image_history._save_index(). Callers hold _LOCK.
 # --------------------------------------------------------------------------- #
 
-def _load_index():
+_log = logging.getLogger("free-llm-hub")
+
+
+def _quarantine(path, what):
+    """Set an unparseable file aside as `<name>.corrupt-<ts>` and say so.
+
+    Reading it as empty and carrying on used to OVERWRITE it on the next
+    write -- one corrupt index.json and the whole history list was gone,
+    silently. The bytes are kept for a manual recovery."""
     try:
-        with open(_index_path(), "r", encoding="utf-8") as f:
+        backup = "%s.corrupt-%d" % (path, int(time.time()))
+        n = 0
+        while os.path.exists(backup):
+            n += 1
+            backup = "%s.corrupt-%d-%d" % (path, int(time.time()), n)
+        os.replace(path, backup)
+        _log.warning("agentic history %s %s was unreadable; kept it as %s",
+                     what, path, backup)
+    except OSError as exc:
+        _log.warning("agentic history %s %s is unreadable and could not be set "
+                     "aside: %s", what, path, exc)
+
+
+def _rebuild_index():
+    """The index from the conversation files themselves, newest first."""
+    rows = []
+    try:
+        names = os.listdir(_root())
+    except OSError:
+        return rows
+    for name in names:
+        if not name.endswith(".json") or name == "index.json" or name.startswith("."):
+            continue
+        try:
+            with open(os.path.join(_root(), name), "r", encoding="utf-8") as f:
+                conv = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(conv, dict) and conv.get("session_id"):
+            rows.append(_metadata_row(conv))
+    rows.sort(key=lambda r: r.get("last_active_at") or 0, reverse=True)
+    return rows
+
+
+def _load_index():
+    path = _index_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
-    except (OSError, ValueError):
+        if isinstance(data, list):
+            return data
+    except FileNotFoundError:
         return []
+    except OSError:
+        return []
+    except ValueError:
+        pass
+    # Unparseable or the wrong shape: keep the bytes, rebuild from the
+    # conversation files (each one carries its own metadata).
+    _quarantine(path, "index")
+    rows = _rebuild_index()
+    try:
+        _save_index(rows)
+    except OSError:
+        pass
+    return rows
+
+
+def _replace(tmp, dst):
+    """os.replace, retried over a transient Windows sharing violation (a
+    reader holding the target open). Raises the last error."""
+    for pause in (0.02, 0.05, 0.1, 0.2, 0.4):
+        try:
+            os.replace(tmp, dst)
+            return
+        except PermissionError:
+            time.sleep(pause)
+    os.replace(tmp, dst)
 
 
 def _save_index(entries):
@@ -109,7 +181,7 @@ def _save_index(entries):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(entries, indent=2))
-        os.replace(tmp, _index_path())
+        _replace(tmp, _index_path())
     except BaseException:
         try:
             os.unlink(tmp)
@@ -119,12 +191,20 @@ def _save_index(entries):
 
 
 def _load_conversation(session_id):
+    path = _conv_path(session_id)
     try:
-        with open(_conv_path(session_id), "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else None
-    except (OSError, ValueError):
+        if isinstance(data, dict):
+            return data
+    except OSError:
         return None
+    except ValueError:
+        pass
+    # A transcript that no longer parses would be replaced by a one-turn
+    # conversation on the next record_turn. Set aside first.
+    _quarantine(path, "conversation")
+    return None
 
 
 def _save_conversation(conv):
@@ -134,7 +214,7 @@ def _save_conversation(conv):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(conv, indent=2))
-        os.replace(tmp, _conv_path(conv["session_id"]))
+        _replace(tmp, _conv_path(conv["session_id"]))
     except BaseException:
         try:
             os.unlink(tmp)
@@ -199,7 +279,42 @@ def _prune(entries):
             os.unlink(_conv_path(e.get("session_id")))
         except OSError:
             pass
+        _run_forget_hooks(e.get("session_id"), e.get("project_dir"))
     return kept
+
+
+# WHAT ELSE A CONVERSATION OWNS. The transcript is only one of its files: the
+# hub also keeps its memory (memory.py) and writes a brief into its project
+# folder. Deleting or pruning the transcript left both behind forever. Kept as
+# hooks, registered by app.py, so this module stays a stdlib leaf and a test
+# of it never reaches into the real memory directory.
+_FORGET_HOOKS = []
+
+
+def add_forget_hook(fn):
+    """`fn(session_id, project_dir)` runs whenever a conversation is deleted
+    or pruned. Idempotent per function."""
+    if callable(fn) and fn not in _FORGET_HOOKS:
+        _FORGET_HOOKS.append(fn)
+
+
+def _run_forget_hooks(session_id, project_dir):
+    if not session_id:
+        return
+    for fn in list(_FORGET_HOOKS):
+        try:
+            fn(session_id, project_dir)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+def known_session_ids():
+    """Every conversation id the history still has. Never raises."""
+    try:
+        with _LOCK:
+            return {e.get("session_id") for e in _load_index() if e.get("session_id")}
+    except Exception:                                            # noqa: BLE001
+        return set()
 
 
 def _upsert_index_row(conv):
@@ -274,8 +389,10 @@ def record_turn(session_id, cli_id, project_dir, role, text, native_session_id=N
             conv.setdefault("turns", []).append(turn)
             _save_conversation(conv)
             _upsert_index_row(conv)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Still never raises, but no longer silent: a turn missing from the
+        # transcript should leave a trace of why.
+        _log.warning("agentic history: turn for %s was not saved: %s", session_id, exc)
 
 
 def truncate_to_turn(session_id, index):
@@ -466,13 +583,19 @@ def delete_conversation(session_id):
             existed_file = os.path.exists(path)
             if not existed_row and not existed_file:
                 return False
+            conv = _load_conversation(session_id) or {}
+            project_dir = conv.get("project_dir") or next(
+                (e.get("project_dir") for e in entries
+                 if e.get("session_id") == session_id), None)
             entries = [e for e in entries if e.get("session_id") != session_id]
             _save_index(entries)
             try:
                 os.unlink(path)
             except OSError:
                 pass
-            return True
+        # Outside the lock: the hooks touch other files (memory, the project).
+        _run_forget_hooks(session_id, project_dir)
+        return True
     except Exception:
         return False
 

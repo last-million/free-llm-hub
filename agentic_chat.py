@@ -1962,8 +1962,10 @@ def _sweep_stale_briefs(project_dir, keep):
 # How much remembered context rides along with the brief. It goes in the FILE,
 # never in argv: the worst-case turn-1 command line already measures 8006 chars
 # against cmd.exe's ~8191 ceiling, so there is not room in the prompt for two
-# hundred characters, let alone two thousand.
-_MEMORY_BUDGET = 2000
+# hundred characters, let alone two thousand. The default; a session whose
+# model window is known gets memory.budget_for_window of it (up to 6000, never
+# more than ~5% of the window).
+_MEMORY_BUDGET = memory.MEMORY_BUDGET_DEFAULT
 
 
 def _memory_block(sess, turn_text=""):
@@ -1984,12 +1986,23 @@ def _memory_block(sess, turn_text=""):
         # spent on a turn that asked one question. With it, a fact travels when
         # the turn is actually about it; the job itself and anything phrased as
         # a rule travel always.
-        return memory.context_block(getattr(sess, "id", None),
-                                    budget_chars=_MEMORY_BUDGET,
-                                    project_dir=getattr(sess, "project_dir", None),
-                                    query=turn_text or "")
+        sid = getattr(sess, "id", None)
+        block = memory.context_block(sid,
+                                     budget_chars=memory.budget_for_window(
+                                         _session_context_window(sess)),
+                                     project_dir=getattr(sess, "project_dir", None),
+                                     query=turn_text or "")
     except Exception:                                            # noqa: BLE001
         return ""
+    try:
+        # Handed over: whatever made this turn due (a stopping place, a list
+        # the agent had not seen) has now been delivered, including on a first
+        # turn, which ships without asking _due_for_restate.
+        if sid:
+            memory.mark_memory_delivered(sid)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return block
 
 
 def write_task_brief(project_dir, text, memory_block="", session_id=None):
@@ -2052,9 +2065,98 @@ def write_task_brief(project_dir, text, memory_block="", session_id=None):
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(sep.join(parts) + chr(10))
         _sweep_stale_briefs(project_dir, name)
+        _git_exclude_briefs(project_dir)
         return name
     except Exception:                                            # noqa: BLE001
         return False        # standards are a bonus; never cost the user a turn
+
+
+# The brief lives IN the project folder, so in a git repo it showed up as an
+# untracked file and got swept into the agent's own `git add -A` commits --
+# the conversation's memory, published with the code. Excluded through the
+# repo's LOCAL .git/info/exclude, never .gitignore: that file is the user's,
+# versioned, and editing it would itself be a change to commit.
+_BRIEF_EXCLUDE_PATTERN = ".calvoun-brief*.md"
+_EXCLUDED_REPOS = set()
+
+
+def _git_common_dir(project_dir):
+    """The git directory holding info/exclude for the repo `project_dir` is
+    in (walking up), or None when it is not in one. Handles a worktree's
+    `.git` FILE (gitdir: ...) and its `commondir`."""
+    here = os.path.abspath(project_dir)
+    while True:
+        dot = os.path.join(here, ".git")
+        gitdir = None
+        if os.path.isdir(dot):
+            gitdir = dot
+        elif os.path.isfile(dot):
+            try:
+                with open(dot, encoding="utf-8", errors="replace") as fh:
+                    line = fh.read(4096).strip()
+                if line.startswith("gitdir:"):
+                    gitdir = line[len("gitdir:"):].strip()
+                    if not os.path.isabs(gitdir):
+                        gitdir = os.path.join(here, gitdir)
+            except OSError:
+                gitdir = None
+        if gitdir and os.path.isdir(gitdir):
+            common = os.path.join(gitdir, "commondir")
+            if os.path.isfile(common):
+                try:
+                    with open(common, encoding="utf-8", errors="replace") as fh:
+                        rel = fh.read(4096).strip()
+                    if rel:
+                        cand = rel if os.path.isabs(rel) else os.path.join(gitdir, rel)
+                        if os.path.isdir(cand):
+                            return os.path.normpath(cand)
+                except OSError:
+                    pass
+            return os.path.normpath(gitdir)
+        parent = os.path.dirname(here)
+        if parent == here:
+            return None
+        here = parent
+
+
+def _git_exclude_briefs(project_dir):
+    """Make sure the repo `project_dir` sits in ignores the brief files.
+    Once per repo per process; best-effort, never raises."""
+    try:
+        common = _git_common_dir(project_dir)
+        if not common or common in _EXCLUDED_REPOS:
+            return bool(common)
+        info = os.path.join(common, "info")
+        path = os.path.join(info, "exclude")
+        existing = ""
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                existing = fh.read()
+        if _BRIEF_EXCLUDE_PATTERN not in [l.strip() for l in existing.splitlines()]:
+            os.makedirs(info, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                if existing and not existing.endswith(chr(10)):
+                    fh.write(chr(10))
+                fh.write("# Calvoun Free LLM Hub: per-session agent briefs" + chr(10)
+                         + _BRIEF_EXCLUDE_PATTERN + chr(10))
+        _EXCLUDED_REPOS.add(common)
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def remove_task_brief(project_dir, session_id):
+    """Delete this session's brief from its project (the conversation is
+    being deleted). Only the per-session file: the shared one belongs to no
+    single conversation. Never raises."""
+    try:
+        name = brief_filename(session_id)
+        if not project_dir or name == BRIEF_FILENAME:
+            return False
+        os.unlink(os.path.join(project_dir, name))
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def _claude_model_for(sess) -> str:
@@ -2508,6 +2610,141 @@ def _verify_claude_binary_identity(bin_path):
     return True, None
 
 
+# --------------------------------------------------------------------------- #
+# A turn's memory: when it starts, when it ends
+# --------------------------------------------------------------------------- #
+
+class _HubNudge(str):
+    """A message the HUB sends (the auto-continue nudge), not the user.
+
+    A plain str to everything that runs it; the type is what lets the turn
+    tell it apart from a user who happens to type the same words. It is not
+    counted as a turn and not remembered as the user's -- four nudges used to
+    fill a third of the twelve "last few turns" slots with the hub talking to
+    itself."""
+    __slots__ = ()
+
+
+def _keep_native(sess, native_id):
+    """Keep the CLI's own thread id the moment a turn reports it: on the live
+    session (what the next turn resumes) and in the saved conversation (what a
+    resume after a restart reads). Never raises."""
+    if not native_id:
+        return
+    try:
+        if sess.native_session_id != native_id:
+            sess.native_session_id = native_id
+        agentic_history.set_native_session_id(getattr(sess, "id", None), native_id)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _memory_turn_start(session_id, text, project_dir=None):
+    """What memory records when a VALIDATED turn starts. Never raises.
+
+    A DURABLE turn count: _Session.turn_count resets to 0 when a session is
+    resumed, and the 5-hourly auto-update restart resumes everything -- so it
+    cannot answer "how long has this conversation been going", which is what
+    _due_for_restate depends on."""
+    try:
+        # The FIRST message is the job. Everything else in memory is derived
+        # (a recap of turns that have scrolled away); this is the one thing a
+        # session must not lose, and losing it is what "the agent stopped
+        # before the end" looks like from the inside -- it no longer knows what
+        # the end was. Recorded as a fact, so context_block never trims it.
+        if memory.note_turn(session_id) == 1:
+            memory.remember_fact(session_id, "The original request: "
+                                 + " ".join((text or "").split())[:240],
+                                 project_dir=project_dir)
+        # SHORT horizon: a one-line trace of the turn, kept for the moment
+        # compaction drops the real thing out of the window.
+        memory.remember_recent(session_id, text, "user")
+        # A PROGRESS.md the user edited since the last turn changes the list
+        # without the agent having seen it (should_restate_rules picks it up).
+        if project_dir:
+            memory.update_tasks_from_project(session_id, project_dir)
+        # "continue" / "reprends" with something to continue: hand over the
+        # stopping place and the list now, not on the next scheduled restate.
+        if memory.asks_to_resume(text) and memory.has_unfinished_work(session_id):
+            memory.request_restate(session_id)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _memory_turn_end(session_id, request, project_dir=None, reply=None,
+                     interrupted=False, why=None, doing=(), partial=""):
+    """What memory records when a turn ends. Never raises.
+
+    A finished turn refreshes the task list (the project's PROGRESS.md first,
+    the reply's own checklist second) as one the agent has SEEN -- it wrote
+    it -- and clears any earlier stopping place; a turn that did not finish
+    files where it got to."""
+    try:
+        if reply and not interrupted:
+            memory.clear_interrupted(session_id)
+            memory.remember_recent(session_id, reply, "agent")
+            memory.update_tasks(session_id, reply, project_dir, seen=True)
+        elif interrupted:
+            memory.update_tasks(session_id, partial or "", project_dir)
+            memory.note_interrupted(session_id, request=request, doing=list(doing or []),
+                                    partial=partial or "", why=why or "error",
+                                    project_dir=project_dir)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def turn_busy(session_id):
+    """True while a turn owns this session: its lock is held, or its live
+    buffer is still open (between the processes of one turn -- a retry, an
+    auto-continue -- and for a multi-session turn, which holds no lock)."""
+    with _REGISTRY_LOCK:
+        sess = _REGISTRY.get(session_id)
+    try:
+        if sess is not None and sess.turn_lock.locked():
+            return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return turn_is_live(session_id)
+
+
+def precheck_turn(session_id, text, cap=True):
+    """The checks a turn would fail, run BEFORE anything is recorded for it.
+    Returns None when the turn may run, else (status, detail).
+
+    The routes recorded the user's message into the transcript first and only
+    then learned the turn was refused -- so a second tab sending while a turn
+    ran left a phantom user turn in the history."""
+    if not _master_on():
+        return 403, "Agentic chat is turned off (agentic_chat_enabled=False)."
+    with _REGISTRY_LOCK:
+        sess = _REGISTRY.get(session_id)
+    if sess is None:
+        return 404, "No such agentic session."
+    if not isinstance(text, str) or not text.strip():
+        return 400, "Message text is required."
+    if cap:
+        limit = max_message_chars(getattr(sess, "cli_id", None))
+        if len(text) > limit:
+            return 400, "Message is %d chars; capped at %d per turn." % (len(text), limit)
+    if turn_busy(session_id):
+        return 409, "A turn is already running for this session."
+    return None
+
+
+def _session_context_window(sess):
+    """The model window this session's CLI is told it has, in tokens, or None.
+
+    Codex and opencode are configured by the hub itself with
+    _CODEX_CONTEXT_WINDOW (model_context_window / limit.context); claude's
+    models are 200K. Only used to size the memory block."""
+    cli = getattr(sess, "cli_id", None)
+    if cli in ("codex", "opencode"):
+        return _CODEX_CONTEXT_WINDOW
+    if cli == "claude":
+        return 200000
+    return None
+
+
 def send_message(session_id, text):
     """Run ONE subprocess turn. Never raises. Returns (status, text, detail):
       200 -> text is the assistant's reply
@@ -2542,100 +2779,134 @@ def send_message(session_id, text):
         return 403, None, "%s agentic mode is not currently supported: %s" % (sess.cli_id, reason)
     if not sess.turn_lock.acquire(blocking=False):
         return 409, None, "A turn is already running for this session."
+    # THE PLAIN ROUTE KEPT NO MEMORY AT ALL: no turn count, no trace, no task
+    # list, no stopping place -- a conversation driven through it looked, to
+    # the next streamed turn, like it had never happened. Same bookkeeping as
+    # the streaming path now, marker included (see memory.begin_inflight).
+    outcome = [None, None, None]            # status, reply, detail
+    started = [False]
     try:
-        bin_path = _resolve_bin(sess.cli_id)
-        if not bin_path:
-            return 502, None, "'%s' is no longer on PATH." % _CLI_BIN[sess.cli_id]
-        if _should_check_binary_identity(sess):
-            ok, detail = _verify_claude_binary_identity(bin_path)
-            if not ok:
-                return _BINARY_IDENTITY_FAIL_STATUS, None, detail
-        # One retry, at most, and only for one specific cause: --resume/--session
-        # pointing at an id the CURRENT config directory has never heard of.
-        # Isolation gave every CLI a FRESH config the day this was found, so
-        # any session id captured before that (or from an even earlier reset)
-        # is stale against it. See _STALE_RESUME_PATTERNS for the measured
-        # per-CLI wording. Losing the user's actual message to a confusing
-        # "no conversation found" error is worse than quietly starting the
-        # conversation over, so the retry is silent: same text, no resume.
-        stale_retry_used = False
-        # See the matching comment in send_message_stream: a turn killed for
-        # exceeding _TURN_TIMEOUT used to just fail, no retry, the request
-        # silently discarded -- reported live. One bounded retry, and if a
-        # thread/session id can be salvaged from what the killed process DID
-        # produce (codex/opencode stream JSONL from the first line on; claude
-        # non-streaming JSON is all-or-nothing and has nothing to salvage),
-        # the retry RESUMES instead of starting the whole task over.
-        timeout_retry_used = False
-        transient_retry_used = False
-        while True:
-            was_resume = bool(sess.native_session_id)
-            argv = _build_argv(sess, bin_path, text)
-            try:
-                proc = subprocess.Popen(
-                    argv, cwd=sess.project_dir,
-                    env=_agentic_env(sess.cli_id, sess.project_dir,
-                                      getattr(sess, "quality", "normal"),
-                                      getattr(sess, "id", None),
-                                      getattr(sess, "mode", None)),
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding="utf-8", errors="replace",
-                    **_tree_popen_kwargs())
-            except (OSError, ValueError) as exc:
-                return 502, None, "%s failed to start: %s" % (sess.cli_id, exc.__class__.__name__)
-            sess.last_interrupted = False
-            with sess.proc_lock:
-                sess.proc = proc
-            timed_out = False
-            try:
-                stdout, stderr = proc.communicate(timeout=_TURN_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _terminate(proc)
-                try:
-                    stdout, stderr = proc.communicate(timeout=_KILL_GRACE)
-                except Exception:
-                    stdout, stderr = "", ""
-            with sess.proc_lock:
-                sess.proc = None
-            if sess.last_interrupted:
-                return 499, None, "Turn was stopped."
-            if timed_out:
-                salvaged = _best_effort_native_id(sess.cli_id, stdout)
-                if salvaged:
-                    sess.native_session_id = salvaged
-                if not timeout_retry_used:
-                    timeout_retry_used = True
-                    continue
-                return 504, None, ("%s timed out after %ds (retried once)."
-                                   % (sess.cli_id, _TURN_TIMEOUT))
-            parser = {"codex": _parse_codex_json,
-                      "opencode": _parse_opencode_json}.get(sess.cli_id, _parse_claude_json)
-            result_text, native_id, detail = parser(stdout, stderr, proc.returncode)
-            if (result_text is None and was_resume and not stale_retry_used
-                    and _is_stale_resume_error(sess.cli_id, detail)):
-                sess.native_session_id = None
-                stale_retry_used = True
-                continue
-            if result_text is None:
-                detail = detail or "%s produced no output." % sess.cli_id
-                if _looks_like_auth_error(detail):
-                    # Isolation means the copy we drive has its own login.
-                    # Without this, the message is "not logged in" about a CLI
-                    # the user can see is logged in -- true, and impossible to
-                    # act on.
-                    return 403, None, detail + _auth_help(sess.cli_id)
-                if _looks_transient(detail) and not transient_retry_used:
-                    transient_retry_used = True
-                    time.sleep(_TRANSIENT_RETRY_WAIT)
-                    continue
-                return 502, None, detail
-            if native_id:
-                sess.native_session_id = native_id
-            sess.turn_count += 1
-            return 200, result_text, None
+        try:
+            memory.begin_inflight(session_id, text, getattr(sess, "project_dir", None))
+        except Exception:                                        # noqa: BLE001
+            pass
+        outcome[:] = _send_message_locked(sess, text, started)
+        return tuple(outcome)
     finally:
         sess.turn_lock.release()
+        status, reply, detail = outcome
+        if started[0]:
+            _memory_turn_end(session_id, text, getattr(sess, "project_dir", None),
+                             reply=reply if status == 200 else None,
+                             interrupted=status != 200,
+                             why=("stopped" if status == 499 else
+                                  _sanitize(str(detail or "error"), 60)))
+        try:
+            memory.end_inflight(session_id)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+def _send_message_locked(sess, text, started):
+    """send_message's turn, run while it holds the session's turn lock.
+    Sets started[0] once the turn is past its last refusal and really runs."""
+    bin_path = _resolve_bin(sess.cli_id)
+    if not bin_path:
+        return 502, None, "'%s' is no longer on PATH." % _CLI_BIN[sess.cli_id]
+    if _should_check_binary_identity(sess):
+        ok, detail = _verify_claude_binary_identity(bin_path)
+        if not ok:
+            return _BINARY_IDENTITY_FAIL_STATUS, None, detail
+    # Past every refusal: THIS is a turn (see _memory_turn_start).
+    started[0] = True
+    _memory_turn_start(getattr(sess, "id", None), text, getattr(sess, "project_dir", None))
+    # One retry, at most, and only for one specific cause: --resume/--session
+    # pointing at an id the CURRENT config directory has never heard of.
+    # Isolation gave every CLI a FRESH config the day this was found, so
+    # any session id captured before that (or from an even earlier reset)
+    # is stale against it. See _STALE_RESUME_PATTERNS for the measured
+    # per-CLI wording. Losing the user's actual message to a confusing
+    # "no conversation found" error is worse than quietly starting the
+    # conversation over, so the retry is silent: same text, no resume.
+    stale_retry_used = False
+    # See the matching comment in send_message_stream: a turn killed for
+    # exceeding _TURN_TIMEOUT used to just fail, no retry, the request
+    # silently discarded -- reported live. One bounded retry, and if a
+    # thread/session id can be salvaged from what the killed process DID
+    # produce (codex/opencode stream JSONL from the first line on; claude
+    # non-streaming JSON is all-or-nothing and has nothing to salvage),
+    # the retry RESUMES instead of starting the whole task over.
+    timeout_retry_used = False
+    transient_retry_used = False
+    while True:
+        was_resume = bool(sess.native_session_id)
+        argv = _build_argv(sess, bin_path, text)
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=sess.project_dir,
+                env=_agentic_env(sess.cli_id, sess.project_dir,
+                                  getattr(sess, "quality", "normal"),
+                                  getattr(sess, "id", None),
+                                  getattr(sess, "mode", None)),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                **_tree_popen_kwargs())
+        except (OSError, ValueError) as exc:
+            return 502, None, "%s failed to start: %s" % (sess.cli_id, exc.__class__.__name__)
+        sess.last_interrupted = False
+        with sess.proc_lock:
+            sess.proc = proc
+        timed_out = False
+        try:
+            stdout, stderr = proc.communicate(timeout=_TURN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=_KILL_GRACE)
+            except Exception:
+                stdout, stderr = "", ""
+        with sess.proc_lock:
+            sess.proc = None
+        if sess.last_interrupted:
+            # The thread a stopped FIRST turn created is the only handle to
+            # what it did; without it the next message starts over.
+            _keep_native(sess, _best_effort_native_id(sess.cli_id, stdout))
+            return 499, None, "Turn was stopped."
+        if timed_out:
+            salvaged = _best_effort_native_id(sess.cli_id, stdout)
+            if salvaged:
+                _keep_native(sess, salvaged)
+            if not timeout_retry_used:
+                timeout_retry_used = True
+                continue
+            return 504, None, ("%s timed out after %ds (retried once)."
+                               % (sess.cli_id, _TURN_TIMEOUT))
+        parser = {"codex": _parse_codex_json,
+                  "opencode": _parse_opencode_json}.get(sess.cli_id, _parse_claude_json)
+        result_text, native_id, detail = parser(stdout, stderr, proc.returncode)
+        if (result_text is None and was_resume and not stale_retry_used
+                and _is_stale_resume_error(sess.cli_id, detail)):
+            sess.native_session_id = None
+            stale_retry_used = True
+            continue
+        if result_text is None:
+            detail = detail or "%s produced no output." % sess.cli_id
+            if _looks_like_auth_error(detail):
+                # Isolation means the copy we drive has its own login.
+                # Without this, the message is "not logged in" about a CLI
+                # the user can see is logged in -- true, and impossible to
+                # act on.
+                return 403, None, detail + _auth_help(sess.cli_id)
+            if _looks_transient(detail) and not transient_retry_used:
+                transient_retry_used = True
+                time.sleep(_TRANSIENT_RETRY_WAIT)
+                continue
+            return 502, None, detail
+        if native_id:
+            _keep_native(sess, native_id)
+        sess.turn_count += 1
+        return 200, result_text, None
 
 
 # --------------------------------------------------------------------------- #
@@ -2862,26 +3133,10 @@ def send_message_stream(session_id, text):
     Same validation / turn-lock / tree-kill model as send_message(). Always ends
     with exactly one {"event":"done",...}, {"event":"error",...}, or
     {"event":"stopped"}. Never raises."""
-    # A DURABLE turn count. _Session.turn_count resets to 0 when a session is
-    # resumed, and the 5-hourly auto-update restart resumes everything -- so it
-    # cannot answer "how long has this conversation been going", which is what
-    # _due_for_restate depends on. Counted here, at the one place every turn
-    # goes through, and never allowed to fail a turn.
-    try:
-        # The FIRST message is the job. Everything else in memory is derived
-        # (a recap of turns that have scrolled away); this is the one thing a
-        # session must not lose, and losing it is what "the agent stopped
-        # before the end" looks like from the inside -- it no longer knows what
-        # the end was. Recorded as a fact, so context_block never trims it.
-        if memory.note_turn(session_id) == 1:
-            memory.remember_fact(session_id, "The original request: "
-                                 + " ".join((text or "").split())[:240],
-                                 project_dir=(get_session(session_id) or {}).get("project_dir"))
-        # SHORT horizon: a one-line trace of the turn, kept for the moment
-        # compaction drops the real thing out of the window.
-        memory.remember_recent(session_id, text, "user")
-    except Exception:                                            # noqa: BLE001
-        pass
+    # The durable turn count and the user's trace are kept by
+    # _memory_turn_start -- AFTER the validation below, once this turn holds
+    # the lock. Counted before it, a second tab's rejected send (409) or an
+    # empty/oversized one (400) was a phantom turn in memory.
     def err(status, detail, code=None):
         ev = {"event": "error", "status": status, "detail": detail}
         if code:
@@ -2935,6 +3190,12 @@ def send_message_stream(session_id, text):
             ok, detail = _verify_claude_binary_identity(bin_path)
             if not ok:
                 yield err(_BINARY_IDENTITY_FAIL_STATUS, detail); return
+
+        # Validated, holding the lock, past every refusal: THIS is a turn. The
+        # hub's own auto-continue nudge is not a user turn and is not counted
+        # as one.
+        if not isinstance(text, _HubNudge):
+            _memory_turn_start(session_id, text, sess.project_dir)
 
         parse = {"codex": _codex_stream_events,
                  "opencode": _opencode_stream_events}.get(sess.cli_id, _claude_stream_events)
@@ -3043,6 +3304,11 @@ def send_message_stream(session_id, text):
                     for e in parse(line):
                         if "_native" in e:
                             native_id = e["_native"]
+                            # KEPT THE MOMENT IT IS KNOWN. It sat in this local
+                            # until the turn ended cleanly, so stopping a first
+                            # turn returned before it was saved and the next
+                            # message started a brand-new CLI thread.
+                            _keep_native(sess, native_id)
                         if "_final" in e:
                             final_text = e["_final"]
                         if "_final_error" in e:
@@ -3450,6 +3716,14 @@ def send_message_stream_durable(session_id, text):
     STAYS connected sees no difference at all."""
     sess_info = get_session(session_id)
     q = queue.Queue()
+    if turn_busy(session_id):
+        # A second tab (or a double click) while a turn runs. Refused BEFORE
+        # anything is touched: starting the thread below replaced the running
+        # turn's live buffer, and its 409 was filed in memory as the running
+        # turn's "stopping place".
+        yield {"event": "error", "status": 409,
+               "detail": "A turn is already running for this session."}
+        return
 
     def _run():
         final_reply = None
@@ -3461,11 +3735,20 @@ def send_message_stream_durable(session_id, text):
         doing = collections.deque(maxlen=memory.INTERRUPT_DOING)
         partial = [""]
         why = [None]
+        rejected = False
+        project_dir = (sess_info or {}).get("project_dir")
+        # If the PROCESS dies mid-turn, the finally below never runs; this
+        # marker is what the next boot turns into the stopping place.
+        try:
+            memory.begin_inflight(session_id, text, project_dir)
+        except Exception:                                        # noqa: BLE001
+            pass
         try:
             prompt, rounds = text, 0
             while True:
                 final_reply = None
                 interrupted = False
+                seen_any = False
                 for ev in send_message_stream(session_id, prompt):
                     # The nudge itself is not shown as a user turn: the reader
                     # asked for one thing and should see one conversation.
@@ -3474,20 +3757,28 @@ def send_message_stream_durable(session_id, text):
                     kind = ev.get("event")
                     if kind == "tool" and ev.get("text"):
                         doing.append(ev["text"])
+                        memory.touch_inflight(session_id, doing=list(doing))
                     elif kind == "message" and ev.get("text"):
                         partial[0] = ev["text"]
+                        memory.touch_inflight(session_id, partial=partial[0])
                     if kind == "done":
                         final_reply = ev.get("text")
                     elif kind in ("error", "stopped"):
                         interrupted = True
                         why[0] = ("stopped" if kind == "stopped"
                                   else _sanitize(str(ev.get("detail") or "error"), 60))
+                        # Refused before it ran (a race past turn_busy above):
+                        # not this conversation's stopping place.
+                        if (kind == "error" and not seen_any and rounds == 0
+                                and ev.get("status") == 409):
+                            rejected = True
+                    seen_any = True
                 if interrupted or rounds >= _MAX_AUTO_CONTINUE:
                     break
                 if not looks_unfinished(final_reply):
                     break
                 rounds += 1
-                prompt = _CONTINUE_NUDGE
+                prompt = _HubNudge(_CONTINUE_NUDGE)
                 nudge = {"event": "notice",
                          "text": "The agent stopped with work left on its own list "
                                  "-- continuing (%d of %d)." % (rounds, _MAX_AUTO_CONTINUE)}
@@ -3509,17 +3800,23 @@ def send_message_stream_durable(session_id, text):
             # checklist second) and clears any earlier stopping place; a turn
             # that did not finish files where it got to.
             try:
-                if final_reply and not interrupted:
+                if rejected:
+                    pass
+                elif final_reply and not interrupted:
                     memory.clear_interrupted(session_id)
                     memory.remember_recent(session_id, final_reply, "agent")
+                    # The agent wrote this list itself: seen, not news.
                     memory.update_tasks(session_id, final_reply,
-                                        (sess_info or {}).get("project_dir"))
+                                        project_dir, seen=True)
                 elif interrupted:
-                    memory.update_tasks(session_id, partial[0],
-                                        (sess_info or {}).get("project_dir"))
+                    memory.update_tasks(session_id, partial[0], project_dir)
                     memory.note_interrupted(session_id, request=text, doing=list(doing),
                                             partial=partial[0], why=why[0] or "error",
-                                            project_dir=(sess_info or {}).get("project_dir"))
+                                            project_dir=project_dir)
+            except Exception:                                    # noqa: BLE001
+                pass
+            try:
+                memory.end_inflight(session_id)
             except Exception:                                    # noqa: BLE001
                 pass
             q.put(None)          # sentinel: no more events, thread is done
