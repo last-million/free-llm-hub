@@ -1036,7 +1036,7 @@ _OPENCODE_EFFORT = {
     "best":  "effort: max -- strongest free models only, never the cheap tier",
     "max":   "effort: max -- strongest free models only, never the cheap tier",
     "swarm": "effort: swarm -- several models per turn, best answer wins",
-    "multi": "effort: multi sessions -- several agents work the task in phases",
+    "multi": "effort: multi -- phased crew (plan -> work -> review)",
 }
 
 # The heavier tiers a category can be paired with (auto is the bare category
@@ -1044,7 +1044,7 @@ _OPENCODE_EFFORT = {
 _OPENCODE_COMPOUND_TIERS = (
     ("max", "strongest only"),
     ("swarm", "several per turn"),
-    ("multi", "worked in phases"),
+    ("multi", "phased crew"),
 )
 
 

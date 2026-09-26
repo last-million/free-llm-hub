@@ -26,6 +26,7 @@ import binascii
 import io
 import calendar
 import concurrent.futures
+import contextvars
 import copy
 import ipaddress
 import json
@@ -98,7 +99,7 @@ import memory
 # this file.
 hub_mcp.init(
     lambda messages, crew_name: crews.format_answer(
-        crews.run(messages, _swarm_dispatch, crew_name)),
+        crews.run(messages, _pipeline_bound(_swarm_dispatch), crew_name)),
     swarm={
         # The MCP surface is how a CLI drives the orchestrator -- opencode,
         # codex, claude and the rest all speak it, so one wiring reaches every
@@ -106,7 +107,7 @@ hub_mcp.init(
         "start": lambda goal, project_dir, cli: swarm_windows.start(
             goal, project_dir, cli,
             _swarm_windows_spawn, _swarm_windows_turn,
-            planner=_swarm_windows_planner,
+            planner=_pipeline_bound(_swarm_windows_planner),
             configure=_swarm_windows_configure,
             stop=agentic_chat.stop_session,
             modes=_worker_mode_keys()),
@@ -837,8 +838,10 @@ _CODEX_LEVELS = [
      "description": "Max - strongest free models only, never the cheap tier"},
     {"effort": "high",
      "description": "Swarm - several models per turn, best answer wins"},
+    # Not "Multi sessions": from codex, "multi" is the crew pipeline (or the
+    # best-of-N fan-out on a tool turn), never real session windows.
     {"effort": "xhigh",
-     "description": "Multi sessions - several agents work the task in phases"},
+     "description": "Multi - phased crew (plan -> work -> review)"},
 ]
 
 
@@ -8504,11 +8507,31 @@ def _act_pipeline_result(result):
     try:
         pairs = [(str(r)[:48], str(m)[:64])
                  for r, m in (result.get("models") or []) if m]
+        # The rest of what the answer's trailer used to carry: an API/CLI
+        # caller now receives the deliverable only (see _swarm_completion), so
+        # this row is where "which plan, what did the reviewer flag, did the
+        # wall clock cut it short" stays visible.
+        titles = [str((p or {}).get("title") or "")[:80]
+                  for p in (result.get("phases") or [])][:12]
+        review = result.get("review") or {}
+        problems = [str(p).strip()[:160] for p in
+                    ((review.get("problems") if isinstance(review, dict) else None) or [])
+                    if str(p).strip()][:5]
+        goal = (result.get("plan") or {}).get("goal") \
+            if isinstance(result.get("plan"), dict) else None
         with _activity_lock:
             if result.get("crew"):
                 act["crew"] = str(result["crew"])[:24]
             if pairs:
                 act["pipeline"] = [{"role": r, "model": m} for r, m in pairs]
+            if titles:
+                act["pipeline_plan"] = titles
+            if goal:
+                act["pipeline_goal"] = str(goal)[:200]
+            if problems:
+                act["review_problems"] = problems
+            if result.get("timed_out"):
+                act["pipeline_timed_out"] = True
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -10573,7 +10596,7 @@ def _multi_turn_events(session_id, sess_info, text):
         run_id = swarm_windows.start(
             text, project_dir, cli_id,
             _swarm_windows_spawn, _swarm_windows_turn,
-            planner=_swarm_windows_planner,
+            planner=_pipeline_bound(_swarm_windows_planner, _session_mode_or_none(sess_info)),
             configure=_swarm_windows_configure,
             stop=agentic_chat.stop_session,
             modes=_worker_mode_keys(),
@@ -10761,7 +10784,7 @@ def api_swarm_windows_start():
             goal, project_dir, cli_id,
             _swarm_windows_spawn, _swarm_windows_turn,
             phases=body.get("phases") or None,
-            planner=_swarm_windows_planner,
+            planner=_pipeline_bound(_swarm_windows_planner),
             configure=_swarm_windows_configure,
             stop=agentic_chat.stop_session,
             modes=_worker_mode_keys())
@@ -12086,6 +12109,16 @@ def _active_mode():
             return _valid_mode(m) or MODE_ALL
     except Exception:                                            # noqa: BLE001
         pass
+    # THE MODE A PIPELINE CAPTURED AT ITS START (see _pipeline_bound). A swarm
+    # wave, a crew's gap repairs and the tool fan-out run their stages on
+    # worker threads, where `g` raises "outside of application context" -- so
+    # "coding-swarm" routed its parallel workers by the GLOBAL mode.
+    try:
+        m = _PIPELINE_MODE.get()
+        if m:
+            return _valid_mode(m) or MODE_ALL
+    except Exception:                                            # noqa: BLE001
+        pass
     # THE SESSION'S OWN MODE, for a request that arrived under an agent session.
     # Normally redundant: the mode reaches the CLI as its model id, so the id
     # above has already set it. This covers the case where it did not -- a CLI
@@ -12100,6 +12133,59 @@ def _active_mode():
     except Exception:                                            # noqa: BLE001
         pass
     return _global_mode()
+
+
+# The routing mode a multi-model pipeline was started under, for its stages
+# running on OTHER threads. A ContextVar rather than a thread-local: a fresh
+# thread starts with an empty context, so nothing leaks between pipelines, and
+# _pipeline_bound sets it per call.
+_PIPELINE_MODE = contextvars.ContextVar("free_llm_hub_pipeline_mode", default=None)
+
+
+def _pipeline_bound(fn, mode=None):
+    """`fn`, callable from ANY thread as if it ran inside the calling request.
+
+    PROVEN by tests/test_swarm_keeps_its_category.py before this existed:
+    "coding-swarm" sets g.model_mode = "coding" (_apply_category_effort), but
+    swarm.run's parallel waves, the gap repairs, the tool fan-out and a
+    swarm_windows plan made off-request all dispatch on worker threads, where
+    Flask's `g` does not exist. _active_mode() then fell back to the global
+    mode, so the coding swarm's workers were routed outside coding. Worse, the
+    same missing `g` made _act_pick raise inside _swarm_dispatch AFTER a hop
+    had answered, and the stage's broad except discarded a good answer.
+
+    So the wrapper carries both: a copy of the caller's context (Flask's app and
+    request context live in contextvars, so `g`, the activity row and the
+    session lookup all work on the worker) and the mode captured NOW, at
+    pipeline start -- `mode` when given (a session's own mode, for callers
+    already off-request), else _active_mode(). Each call runs in its own copy:
+    one Context cannot be entered by two threads at once. Never raises on its
+    own account."""
+    if mode is None:
+        try:
+            mode = _active_mode()
+        except Exception:                                        # noqa: BLE001
+            mode = None
+    ctx = contextvars.copy_context()
+
+    def _inner(*a, **kw):
+        _PIPELINE_MODE.set(mode)
+        return fn(*a, **kw)
+
+    def _bound(*a, **kw):
+        return ctx.copy().run(_inner, *a, **kw)
+    return _bound
+
+
+def _session_mode_or_none(sess_info):
+    """A conversation's own category, or None (= "whatever is active"). For the
+    multi-session planner, which runs on the event feeder's thread where
+    neither `g` nor the request -- and so neither route to the session -- exist."""
+    try:
+        m = _valid_mode((sess_info or {}).get("mode"))
+    except Exception:                                            # noqa: BLE001
+        return None
+    return m if m and m != MODE_ALL else None
 
 
 def _mode_allows(mode, pid, model, session_overrides=None):
@@ -18024,7 +18110,11 @@ _VIRTUAL_MODEL_LABELS = {
     "all": "All models · every category, orchestrated",
     "best": "Max · strongest free models only",
     "max": "Max · strongest free models only",
-    "multi": "Multi sessions · several agents work the task in phases",
+    # HONEST about what a CLI gets. "Multi sessions" (real agent windows) only
+    # exists on the /agent page; a stateless /v1 turn maps "multi" to the crew
+    # pipeline (tool-free) or the best-of-N fan-out (tool turns) -- see
+    # _crew_name_for. The old label promised the windows.
+    "multi": "Multi · phased crew (plan → work → review)",
 }
 
 
@@ -18159,8 +18249,13 @@ def _dispatch_chat_with_deadline(pid, payload, deadline=None):
     if deadline is None:
         deadline = _SWARM_HOP_DEADLINE
     box = {}
+    # A fresh thread starts with an EMPTY context: carry the pipeline's mode
+    # across, so nothing below this hop can fall back to the global mode.
+    mode = _PIPELINE_MODE.get()
 
     def _call():
+        if mode is not None:
+            _PIPELINE_MODE.set(mode)
         try:
             box["resp"] = _dispatch_chat(pid, payload, False)
         except (requests.RequestException, RuntimeError) as exc:
@@ -18775,7 +18870,11 @@ def _swarm_tool_result(body):
     _started = time.monotonic()
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(picks))
     try:
-        pending = {ex.submit(_run, pm) for pm in picks}
+        # _pipeline_bound: members run on pool threads, where `g` -- and so the
+        # category a "coding-swarm" id set -- does not exist. Captured here, at
+        # fan-out start, and carried into every member.
+        _member = _pipeline_bound(_run)
+        pending = {ex.submit(_member, pm) for pm in picks}
         _fanout_started = time.monotonic()
         deadline = _fanout_started + _SWARM_TOOL_HOP_DEADLINE
         cutoff = deadline
@@ -19013,6 +19112,47 @@ def _quality_route_kwargs(model, has_images):
     return {}
 
 
+# Overall wall clock for ONE prose pipeline run (swarm / crew* / multi), in
+# seconds; setting `swarm_max_seconds`, 0 = unbounded. Past it swarm.run starts
+# no new stage and synthesises from what finished. Not a hard kill: a stage
+# already in flight is bounded by its own hop deadline (_SWARM_HOP_DEADLINE).
+_SWARM_MAX_SECONDS_DEFAULT = 180
+
+
+def _swarm_max_seconds():
+    """The configured cap, or None for unbounded. Fails open to the default."""
+    try:
+        v = float(config.get_setting("swarm_max_seconds",
+                                     _SWARM_MAX_SECONDS_DEFAULT))
+    except Exception:                                            # noqa: BLE001
+        v = float(_SWARM_MAX_SECONDS_DEFAULT)
+    return v if v > 0 else None
+
+
+def _swarm_fast_path(body, messages):
+    """True when a pipeline id should answer with ONE strong model instead: a
+    tool-free turn whose ask _classify_difficulty calls 'simple' (arithmetic, a
+    one-line fact, a yes/no). Flag `swarm_fast_path`, default on. Fails CLOSED
+    to the pipeline -- the user did pick it."""
+    try:
+        if body.get("tools") or not config.get_flag("swarm_fast_path", True):
+            return False
+        return _classify_difficulty(messages, body.get("max_tokens")) == "simple"
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _wants_pipeline_trailer():
+    """True only for the dashboard's own quick chat, which renders the
+    plan/models/reviewer trailer under the answer. It marks its /v1 request
+    with the same `X-Free-LLM-Hub: dashboard` header every dashboard write
+    carries. Everyone else -- CLIs, SDKs, scripts -- gets the deliverable only."""
+    try:
+        return request.headers.get("X-Free-LLM-Hub") == "dashboard"
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _swarm_completion(body):
     """Run the swarm (or a crew) and return ONE ordinary chat-completions response."""
     if body.get("tools"):
@@ -19047,16 +19187,52 @@ def _swarm_completion(body):
     if not messages:
         return _openai_error("messages is required.", 400)
     asked = (body.get("model") or "").strip()
+    if _swarm_fast_path(body, messages):
+        # MEASURED live: "coding-swarm" took 231 s to answer "What is 5767
+        # plus 1" -- plan, workers, supervisor, review and synthesis, up to
+        # thirteen calls, to agree on 5768. A question the classifier calls
+        # simple gets ONE strong model ('best', same pool and category) instead.
+        _log.info("[swarm] simple tool-free question -> one strong model "
+                  "(fast path, asked %r)", asked)
+        fast = dict(body)
+        fast["model"] = "best"
+        resp = app.make_response(_chat_completions_uncached(fast))
+        resp.headers["X-Free-LLM-Hub-Pipeline"] = "fast-path=simple question, one strong model"
+        return resp
     crew = _crew_name_for(asked)
     # Feed live stage progress + the per-role model list to the activity row.
     _watch = _act_pipeline_watcher()
+    # Bound ONCE, here: the mode in force now (a "coding-swarm" id set it on
+    # `g`) rides into every stage, including the ones swarm.run puts on worker
+    # threads. See _pipeline_bound.
+    dispatch = _pipeline_bound(_swarm_dispatch)
+    cap = _swarm_max_seconds()
+    extra = {"max_seconds": cap} if cap else {}
     if crew is not None:
-        result = crews.run(messages, _swarm_dispatch, crew, on_event=_watch)
-        text = crews.format_answer(result)
+        result = crews.run(messages, dispatch, crew, on_event=_watch, **extra)
     else:
-        result = swarm.run(messages, _swarm_dispatch, on_event=_watch)
-        text = swarm.format_answer(result)
+        result = swarm.run(messages, dispatch, on_event=_watch, **extra)
+    result = result if isinstance(result, dict) else {}
     _act_pipeline_result(result)
+    # THE DELIVERABLE ONLY for an API/CLI caller. "**Plan followed**", "**Models
+    # used**", "**Reviewer raised**" and "**Crew:**" were appended to every
+    # answer, so a CLI that asked "multi" for a file got the file plus a report
+    # about how it was made, pasted into the file. The same facts now go to the
+    # activity row (_act_pipeline_result) and the X-Free-LLM-Hub-Pipeline
+    # header. The dashboard's quick chat renders them under the answer and
+    # marks its request (X-Free-LLM-Hub: dashboard), so it keeps them.
+    if _wants_pipeline_trailer():
+        text = (crews.format_answer(result) if crew is not None
+                else swarm.format_answer(result))
+    else:
+        text = (result.get("text") or "").strip()
+    pipeline_hdr = {}
+    try:
+        summary = swarm.trailer_summary(result)
+        if summary:
+            pipeline_hdr["X-Free-LLM-Hub-Pipeline"] = summary
+    except Exception:                                            # noqa: BLE001
+        pass
     if not text:
         # Same reasoning as the tool path above: a pipeline that produced
         # nothing must not be the reason the user gets no answer at all. One
@@ -19091,8 +19267,9 @@ def _swarm_completion(body):
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
             yield "data: %s\n\n" % json.dumps(done)
             yield "data: [DONE]\n\n"
-        return Response(_one_shot(), mimetype="text/event-stream")
-    return jsonify(out)
+        return Response(_one_shot(), mimetype="text/event-stream",
+                        headers=pipeline_hdr)
+    return jsonify(out), 200, pipeline_hdr
 
 
 # ---------------------------------------------------------------------------

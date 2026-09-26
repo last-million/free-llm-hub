@@ -48,9 +48,13 @@ def spy_crew(monkeypatch):
     # on_event is optional and forwarded to swarm.run (app.py feeds the
     # activity feed's per-agent view through it) -- the spy must mirror the
     # real signature or every crew request 500s on an unexpected kwarg.
+    # **_kw: the wall-clock cap (max_seconds) is forwarded too. The result
+    # carries "text" because an API caller now receives the deliverable alone
+    # (the format_answer trailer is dashboard-only).
     monkeypatch.setattr(crews, "run",
-                        lambda messages, dispatch, name, on_event=None:
-                            calls.append(name) or {"crew": name})
+                        lambda messages, dispatch, name, on_event=None, **_kw:
+                            calls.append(name) or {"crew": name,
+                                                   "text": "crew answer via " + name})
     monkeypatch.setattr(crews, "format_answer",
                         lambda result: "crew answer via " + result["crew"])
     # If escalation does NOT fire the request must not wander onto the real
