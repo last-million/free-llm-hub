@@ -35,6 +35,7 @@ import mimetypes
 import errno
 import os
 import platform
+import queue
 import random
 import re
 import shutil
@@ -6467,6 +6468,24 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
                 if _host != _pinned:
                     _session_pin_set(_skey, _host[0], _host[1])
                 return _host[0], _host[1], difficulty
+        # A TRIVIAL SMALL TOOL TURN ("use the add tool to add 17 and 25") has
+        # nothing for a strong slow model to be strong at. The agentic pool
+        # deliberately skips the fast prefilter (a coding agent waits on
+        # quality), so such a turn landed on a reasoning model that thought for
+        # a minute before calling `add` -- MEASURED 82-112s in a live sweep.
+        # Prefer a FAST tool-capable model, proven ones first. Not pinned: the
+        # session's first real task must still choose its model on strength,
+        # not inherit whatever answered a one-liner. Only an unpinned session
+        # reaches here (the pin above wins), and never a big request -- Codex's
+        # own turns carry 15K+ tokens of prompt and tools.
+        if difficulty == "simple" and est < STREAM_BIG_REQUEST_TOKENS:
+            _quick = [c for c in agentic
+                      if _is_fast(c[1], c[2]) and not _is_low_quality(c[2])
+                      and _chain_reliability_band(c[1], c[2]) < 2]
+            if _quick:
+                _quick = [c for c in _quick if _may_lead_agentic(c[0], c[2])] or _quick
+                _s, pid, model = max(_quick, key=_chat_pick_key)
+                return pid, model, difficulty
         # NOTE: an "AGENTROUTER FIRST" block sat here until 2026-07-31 — it
         # tried the AgentRouter relay's paid models BEFORE the free tier on
         # every fresh coding task. It went with the relay itself (removed at
@@ -6614,6 +6633,17 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         return pid, model, difficulty
     floor = _DIFFICULTY_FLOOR[difficulty]
     qualified = [c for c in pool if c[0] >= floor]
+    if _fast_only and not any(_is_fast(c[1], c[2]) for c in pool):
+        # NOTHING FAST TO ANSWER A SIMPLE ASK -- typically a category mode made
+        # of reasoning models (reasoning, seo, specialist). "Cheapest that
+        # clears the floor" then lands on an arbitrary slow model; MEASURED in a
+        # live sweep, "What is N plus 1?" timed out at 180s in exactly those
+        # three modes. So take the QUICKEST of them: the chain behind it puts
+        # the fast models from outside the category next (see _build_chain's
+        # simple-turn ordering), and the trivial-turn hop budget (_ChainClock)
+        # moves on to them if even this one is slow.
+        _s, pid, model = min(qualified or pool, key=lambda t: _latency_rank(t[1], t[2]))
+        return pid, model, difficulty
     if qualified:
         # cheapest fast model that still clears the bar -> saves strong quota;
         # tie among equal-cheap models -> the one with the MOST free quota left
@@ -7089,6 +7119,7 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # the first model and the chain behind it quietly left the mode again on the
     # first retry. Fail-open per tier, so a mode with nothing available still
     # falls back to the full chain rather than to no chain.
+    _all_fast = list(fast)
     fast = _apply_mode(fast)
     slow = _apply_mode(slow)
     # best model first; tie among equal-score models -> most free quota left, so
@@ -7160,6 +7191,31 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # tool request must exhaust every normal candidate (proven first, then
         # unproven) before a last-resort family is even offered. Fail-open: when
         # only last-resort families live, the order is unchanged.
+        _lq_tail = [e for e in ordered if _is_low_quality(e[2])]
+        if _lq_tail and len(_lq_tail) < len(ordered):
+            ordered = [e for e in ordered if not _is_low_quality(e[2])] + _lq_tail
+        if _simple_turn():
+            # A TRIVIAL SMALL TOOL TURN: fast models first inside every group
+            # above (a stable sort, so proven-before-unproven and the
+            # interleaving survive within each). The strength ordering is what
+            # a real agent turn needs; for "add 17 and 25" it only lined up
+            # reasoning models that each think for a minute before the call.
+            ordered.sort(key=lambda e: (_is_low_quality(e[2]),
+                                        _chain_reliability_band(e[1], e[2]) >= 2,
+                                        not _is_fast(e[1], e[2])))
+    elif _simple_turn():
+        # A SIMPLE SMALL CHAT TURN walks fast models strictly first -- the
+        # category's own, then (when a mode narrowed the pool) the fast models
+        # OUTSIDE it -- and only then the category's slow ones, quickest first.
+        # MEASURED: "What is N plus 1?" timed out at 180s in the reasoning, seo
+        # and specialist modes, whose models are nearly all slow reasoners; a
+        # one-line answer from outside the category beats a timeout inside it.
+        # The interleave that follows mixed fast and slow tiers, which is fine
+        # for real work and exactly wrong for this.
+        _out = [e for e in _all_fast if e not in fast]
+        _out.sort(key=lambda t: (t[0], _quota_headroom(t[1])), reverse=True)
+        ordered = (_interleave_by_provider(fast) + _interleave_by_provider(_out)
+                   + sorted(slow, key=lambda t: _latency_rank(t[1], t[2])))
         _lq_tail = [e for e in ordered if _is_low_quality(e[2])]
         if _lq_tail and len(_lq_tail) < len(ordered):
             ordered = [e for e in ordered if not _is_low_quality(e[2])] + _lq_tail
@@ -18486,6 +18542,367 @@ def _stream_peek_timeout(model, est):
     return STREAM_CONTENT_PEEK_TIMEOUT
 
 
+# ---------------------------------------------------------------------------
+# ONE WALL CLOCK PER REQUEST.
+#
+# Every timeout above is PER SOMETHING: per recv (CHAT_READ_TIMEOUT), per gap
+# between chunks (STREAM_IDLE_TIMEOUT), per hop's first content (the peek), per
+# hop's headers (_STREAM_HEADER_WAIT). None of them bounds the request, and they
+# compound: MAX_HOPS x a 300s per-recv read that a trickling provider resets on
+# every byte has no ceiling at all.
+#
+# MEASURED in a live sweep (before this existed):
+#   "What is N plus 1? Answer with only the number."  -> 180s client timeout in
+#       the reasoning / seo / specialist category modes
+#   "Use the add tool to add 17 and 25"               -> 82-112s in auto/best/
+#       coding/fast, and 962s with coding-max; the client's 180s read timeout
+#       never fired because bytes kept trickling, so the hub held the turn ~16
+#       minutes for an answer of "42".
+#
+# So one deadline, set when routing starts, that every hop, every peek and a
+# committed stream's non-progress all answer to. Setting
+# `request_deadline_seconds` (default 240, 0 = unbounded). 240 matches
+# _STREAM_HEADER_BUDGET: a client that gives up on headers at ~5 minutes must
+# see a clean status before then, not a socket that is still "working".
+# Pipelines (swarm / crew / multi) have their own cap, swarm_max_seconds, and do
+# not start this clock; the single-model fallback behind a failed pipeline does.
+_REQUEST_DEADLINE_DEFAULT = 240
+# Once the deadline has passed, a COMMITTED stream may continue only while it
+# is actually delivering visible content or tool calls -- cutting off a model
+# that is mid-way through writing a file would throw away real work the client
+# has already half-received. A keepalive, a reasoning-only delta or this much
+# silence ends it; so does _POST_DEADLINE_MAX however healthy it looks, so
+# nothing can hold a turn open indefinitely.
+_POST_DEADLINE_IDLE = 20         # seconds of no visible content past the deadline
+_POST_DEADLINE_MAX = 600         # absolute ceiling past the deadline
+# A TRIVIAL SMALL turn ("what is 5+1", "use the add tool on 17 and 25") has an
+# answer a working model produces in seconds. The adaptive peek (35/60/90s) and
+# _STREAM_HEADER_WAIT (60s) are sized for Codex-sized prompts; applied to a
+# one-liner they let one hung hop eat a minute or more before the next model --
+# which then answers in five seconds -- is even tried. That is the 82-112s
+# tool turn: hop one's full peek budget plus hop two's actual answer.
+# Headers AND first content for the hop must arrive inside this budget.
+_TRIVIAL_HOP_BUDGET = 25         # fast model
+_TRIVIAL_SLOW_HOP_BUDGET = 45    # slow / reasoning model (_SLOW_MODEL_RE)
+
+
+def _request_deadline_seconds():
+    """The configured per-request wall clock, or None for unbounded. Fails open
+    to the default -- a broken setting must not silently remove the bound."""
+    try:
+        v = float(config.get_setting("request_deadline_seconds",
+                                     _REQUEST_DEADLINE_DEFAULT))
+    except Exception:                                            # noqa: BLE001
+        v = float(_REQUEST_DEADLINE_DEFAULT)
+    return v if v > 0 else None
+
+
+def _begin_request_deadline():
+    """Start this request's clock (once) and return its absolute monotonic
+    deadline, or None when unbounded / outside a request.
+
+    Idempotent within a request: /v1/responses re-enters itself for its
+    transient-storm retry, and that retry is the same request to the client --
+    it must not get a fresh four minutes."""
+    try:
+        at = getattr(g, "hub_deadline_at", _MISSING)
+        if at is not _MISSING:
+            return at
+        secs = _request_deadline_seconds()
+        at = (time.monotonic() + secs) if secs else None
+        g.hub_deadline_at = at
+        return at
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _is_trivial_turn(messages, max_tokens, difficulty, est, pinned=False):
+    """True for a SMALL turn whose ask is trivial -- the case the tight per-hop
+    budget exists for. Judged on the CLASSIFIER's verdict, not the routed tier:
+    best/max lifts a simple ask to medium to reach a strong model, which is
+    right, but "add 17 and 25" is no less trivial for it. A creation ask is
+    never trivial (see _CREATION_INTENT_RE), a big request never is (a
+    Codex-sized prompt legitimately needs the long peek), and neither is a
+    PINNED model: the caller named it, and a budget that walks away from it
+    silently substitutes a model they did not ask for. Never raises."""
+    try:
+        if pinned or not est or est >= STREAM_BIG_REQUEST_TOKENS:
+            return False
+        if difficulty == "simple":
+            return True
+        if difficulty not in (None, "medium"):
+            return False
+        if _CREATION_INTENT_RE.search(_latest_user_text(messages) or ""):
+            return False
+        return _classify_difficulty(messages, max_tokens) == "simple"
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _mark_turn_shape(difficulty, est, pinned=False):
+    """Tell _build_chain (via `g`, the same channel the routing mode uses) that
+    this turn was ROUTED as a small simple one, so the fallback chain behind the
+    primary orders fast models first. Only the routed tier counts here: best/
+    max asked for the strongest models and keeps the strength ordering."""
+    try:
+        g.hub_simple_turn = bool(not pinned and difficulty == "simple"
+                                 and est and est < STREAM_BIG_REQUEST_TOKENS)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _simple_turn():
+    """True while serving a turn _mark_turn_shape flagged. False outside a
+    request, so probes and pipelines keep the ordinary chain order."""
+    try:
+        return bool(getattr(g, "hub_simple_turn", False))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _latency_rank(pid, model):
+    """Sort key, lower = quicker to a useful answer. The MEASURED duration when
+    there is enough evidence, else a heuristic in the same units derived from
+    _speed_score, so a measured-fast model and a guessed-fast one compare."""
+    try:
+        ms = _measured_latency_ms(pid, model)
+        if ms is None:
+            ms = (100.0 - _speed_score(pid, model)) * 1000.0
+        return (float(ms), -_speed_score(pid, model))
+    except Exception:                                            # noqa: BLE001
+        return (float("inf"), 0)
+
+
+class _HopBudgetExceeded(RuntimeError):
+    """A hop the HUB stopped waiting for -- the request deadline or a trivial
+    turn's hop budget ran out. Deliberately not a requests Timeout: those
+    throttle the hop and count toward parking its provider, and our own
+    impatience on a one-liner is not evidence the provider is broken."""
+
+
+def _call_with_wall_clock(seconds, fn, *a, **kw):
+    """fn(*a, **kw) bounded by a wall clock. Raises _HopBudgetExceeded when it
+    passes; re-raises whatever fn raised.
+
+    Same daemon-worker discipline as _dispatch_chat_with_deadline: the call is
+    abandoned, not cancelled (Python cannot cancel a blocking socket read), and
+    a response it produces after we stopped waiting is closed so its connection
+    goes back to the pool. Runs in a COPY of the caller's context, so `g` (the
+    routing mode, the activity row) and the usage label work on the worker."""
+    box = {}
+    lock = threading.Lock()
+    ctx = contextvars.copy_context()
+
+    def _run():
+        try:
+            v = ctx.run(fn, *a, **kw)
+        except BaseException as exc:                             # noqa: BLE001
+            with lock:
+                box["exc"] = exc
+            return
+        with lock:
+            if box.get("abandoned"):
+                try:
+                    v.close()
+                except Exception:                                # noqa: BLE001
+                    pass
+                return
+            box["v"] = v
+
+    t = threading.Thread(target=_carry_usage_source(_run), daemon=True)
+    t.start()
+    t.join(max(0.0, seconds))
+    with lock:
+        if "exc" in box:
+            raise box["exc"]
+        if "v" in box:
+            return box["v"]
+        box["abandoned"] = True
+    raise _HopBudgetExceeded("no answer within %.0fs" % seconds)
+
+
+def _deadline_error_text(clock, errors):
+    return ("Request deadline of %ds reached before any model answered (setting "
+            "request_deadline_seconds). Tried: %s"
+            % (int(clock.limit or 0), "; ".join(errors) or "none"))
+
+
+class _ChainClock:
+    """The request deadline plus the current hop's budget, for one chain walk.
+
+    The three chain loops (/v1/chat/completions, /v1/responses, /v1/messages)
+    are near-copies of each other; this keeps the timing rules in one place so
+    they cannot drift: `spent()` at the top of each hop, `dispatch()` instead of
+    _dispatch_chat, `peek_timeout()` instead of _stream_peek_timeout, `guard()`
+    around a committed stream."""
+
+    def __init__(self, trivial=False):
+        self.deadline_at = _begin_request_deadline()
+        self.limit = _request_deadline_seconds() if self.deadline_at else None
+        self.trivial = bool(trivial)
+        self._hop_started = None
+        self._hop_budget = None
+
+    def left(self):
+        if self.deadline_at is None:
+            return None
+        return self.deadline_at - time.monotonic()
+
+    def spent(self):
+        left = self.left()
+        return left is not None and left <= 0
+
+    def _budget_for(self, pid, model):
+        budget = None
+        # A local subscription CLI is a subprocess that cold-starts in tens of
+        # seconds whatever the question; a first-content budget sized for an
+        # HTTP API would cut every one of them off. The deadline still applies.
+        if self.trivial and not _is_sub(pid):
+            budget = (_TRIVIAL_SLOW_HOP_BUDGET
+                      if _SLOW_MODEL_RE.search((model or "").lower())
+                      else _TRIVIAL_HOP_BUDGET)
+        left = self.left()
+        if left is not None:
+            budget = left if budget is None else min(budget, left)
+        return None if budget is None else max(0.0, budget)
+
+    def dispatch(self, pid, payload, stream):
+        """_dispatch_chat under this hop's budget. A non-streaming hop gets the
+        whole budget for its answer; a streaming one for its headers, and
+        peek_timeout() hands the rest to the first-content peek."""
+        self._hop_started = time.monotonic()
+        self._hop_budget = self._budget_for(pid, (payload or {}).get("model"))
+        if self._hop_budget is None:
+            return _dispatch_chat(pid, payload, stream)
+        if self._hop_budget <= 0:
+            raise _HopBudgetExceeded("request deadline reached")
+        return _call_with_wall_clock(self._hop_budget, _dispatch_chat,
+                                     pid, payload, stream)
+
+    def peek_timeout(self, model, est):
+        t = _stream_peek_timeout(model, est)
+        if self._hop_budget is not None and self._hop_started is not None:
+            t = min(t, self._hop_budget - (time.monotonic() - self._hop_started))
+        left = self.left()
+        if left is not None:
+            t = min(t, left)
+        return max(0.0, t)
+
+    def guard(self, iterator, terminator=None, label=""):
+        return _deadline_guard(iterator, self.deadline_at, terminator, label)
+
+
+def _stream_item_bytes(item):
+    if isinstance(item, (bytes, bytearray)):
+        return bytes(item)
+    return str(item or "").encode("utf-8", "ignore")
+
+
+def _stream_item_delivers(b):
+    """True when a stream item carries something the client can USE: visible
+    text, a tool call, a finish reason or the terminator. A keepalive comment
+    or a reasoning-only delta is not -- that is exactly what a stream held open
+    past its deadline consists of."""
+    return bool(_STREAM_CONTENT_RE.search(b) or _STREAM_TOOLCALL_RE.search(b)
+                or _STREAM_TERMINAL_RE.search(b)
+                or re.search(rb'"finish_reason"\s*:\s*"', b))
+
+
+def _deadline_guard(iterator, deadline_at, terminator=None, label=""):
+    """Relay `iterator` until the request deadline, then only while it delivers.
+
+    Before the deadline every item passes untouched (a blocked read is waited on
+    only until the deadline, never past it). After it, a blank line passes, a
+    delivering item passes (see _stream_item_delivers), and anything else -- a
+    keepalive, a reasoning-only delta -- or _POST_DEADLINE_IDLE of silence, or
+    _POST_DEADLINE_MAX in total, ends the stream with `terminator` (when given)
+    so the client gets a clean end instead of a socket that never closes.
+
+    The upstream is read on a daemon pump thread so a read blocked inside the
+    socket cannot hold the wall clock hostage; the caller's own finally closes
+    the upstream response, which releases the pump."""
+    if not deadline_at:
+        for item in iterator:
+            yield item
+        return
+    q = queue.Queue(maxsize=256)
+    stop = threading.Event()
+
+    def _put(entry):
+        while not stop.is_set():
+            try:
+                q.put(entry, timeout=1.0)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _pump():
+        try:
+            for item in iterator:
+                if not _put(("item", item)):
+                    return
+            _put(("end", None))
+        except BaseException as exc:                             # noqa: BLE001
+            _put(("exc", exc))
+
+    threading.Thread(target=_pump, daemon=True).start()
+    hard_stop = deadline_at + _POST_DEADLINE_MAX
+    # The idle grace counts from the deadline -- or from the commit, for a
+    # stream committed at the very edge of it, which is owed its first frames.
+    _started = time.monotonic()
+    last_delivery = None       # set when the deadline is first crossed
+    cut = None
+    try:
+        while True:
+            now = time.monotonic()
+            if now < deadline_at:
+                wait = deadline_at - now
+            else:
+                if last_delivery is None:
+                    last_delivery = max(deadline_at, _started)
+                wait = min(last_delivery + _POST_DEADLINE_IDLE, hard_stop) - now
+                if wait <= 0:
+                    cut = "no visible content for %ds past the deadline" % _POST_DEADLINE_IDLE \
+                        if now < hard_stop else "hard ceiling past the deadline"
+                    break
+            try:
+                kind, val = q.get(timeout=wait)
+            except queue.Empty:
+                continue       # re-evaluated at the top: deadline or idle grace
+            if kind == "end":
+                return
+            if kind == "exc":
+                raise val
+            now = time.monotonic()
+            if now >= deadline_at:
+                b = _stream_item_bytes(val)
+                if b.strip():
+                    if not _stream_item_delivers(b):
+                        cut = "keepalive/reasoning only past the deadline"
+                        break
+                    last_delivery = now
+                if now >= hard_stop:
+                    cut = "hard ceiling past the deadline"
+                    break
+            yield val
+        _log.warning("[deadline] %s: cutting the committed stream (%s)",
+                     label or "stream", cut)
+        if terminator:
+            yield terminator
+    finally:
+        stop.set()
+
+
+# The frames a chat-completions stream cut at the deadline ends with. "length",
+# not "stop": the answer was cut short, and an agent must see a half-assembled
+# tool call as truncated rather than as something to run.
+_CHAT_DEADLINE_TERMINATOR = (
+    b'data: {"id":"chatcmpl-deadline","object":"chat.completion.chunk",'
+    b'"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n'
+    b"data: [DONE]\n\n")
+
+
 # How much of a streaming answer to collect before judging it. Small on
 # purpose: the failures being caught are short (an announcement is a sentence, a
 # refusal opens with one), and a turn that is really working emits a tool call,
@@ -19489,6 +19906,8 @@ def _classify_hop_error(exc=None, status=None, peek=None):
     non-json) — so 'why did the chain degrade' is one curl -i away instead of a
     log dig."""
     if exc is not None:
+        if isinstance(exc, _HopBudgetExceeded):
+            return "deadline"      # the hub stopped waiting -- not a provider timeout
         if isinstance(exc, requests.Timeout):
             return "timeout"
         if isinstance(exc, requests.RequestException):
@@ -19809,11 +20228,20 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
         for hop_pid, hop_model in _build_chain(pid, model, est)[:_SWARM_STAGE_MAX_HOPS]:
             if exclude_pids and hop_pid in exclude_pids:
                 continue     # reviewer must not be the provider that wrote it
+            # THE PIPELINE'S OUTER BOUND (see _pipeline_outer_bound): a stage
+            # still in flight when the run's own cap passes may finish, but it
+            # may not start a hop the run can no longer afford.
+            _hop_deadline = _SWARM_HOP_DEADLINE
+            _outer_left = _pipeline_time_left()
+            if _outer_left is not None:
+                if _outer_left <= 1:
+                    break
+                _hop_deadline = min(_hop_deadline, _outer_left)
             payload = {"model": hop_model, "stream": False,
                        "max_tokens": max_tokens, "messages": messages,
                        "_no_craft": True}   # stripped in _upstream_chat
             resp, hop_exc = _dispatch_chat_with_deadline(hop_pid, payload,
-                                                         _SWARM_HOP_DEADLINE)
+                                                         _hop_deadline)
             if resp is None:         # hung hop (deadline) or a failed one
                 _record_outcome(hop_pid, hop_model, False)
                 continue
@@ -20628,6 +21056,41 @@ def _swarm_max_seconds():
     return v if v > 0 else None
 
 
+# THE OUTER BOUND ON A PROSE PIPELINE RUN. swarm_max_seconds is not a hard kill:
+# past it swarm.run starts no new stage and still SYNTHESISES, and a stage in
+# flight walks up to _SWARM_STAGE_MAX_HOPS hops of _SWARM_HOP_DEADLINE each --
+# fifteen minutes for one stage, on top of the cap. So the run gets an absolute
+# ceiling too: its own cap (or the request deadline when the cap is off) plus
+# room for ONE more stage hop, and never more than _PIPELINE_OUTER_MAX. Each
+# stage hop is cut to what is left of it (_swarm_dispatch), so a run that is
+# over simply stops dispatching and synthesises from what finished.
+_PIPELINE_OUTER_GRACE = _SWARM_HOP_DEADLINE
+_PIPELINE_OUTER_MAX = 1800
+# Absolute monotonic deadline of the pipeline run being served. A ContextVar so
+# it rides into the stage threads through _pipeline_bound's context copy.
+_PIPELINE_DEADLINE = contextvars.ContextVar("free_llm_hub_pipeline_deadline",
+                                            default=None)
+
+
+def _pipeline_outer_bound(cap):
+    """Seconds a whole pipeline run may take, cap included. Never raises."""
+    try:
+        base = cap or _request_deadline_seconds() or _PIPELINE_OUTER_MAX
+        return min(float(base) + _PIPELINE_OUTER_GRACE, float(_PIPELINE_OUTER_MAX))
+    except Exception:                                            # noqa: BLE001
+        return float(_PIPELINE_OUTER_MAX)
+
+
+def _pipeline_time_left():
+    """Seconds left before the current pipeline run's outer bound, or None
+    outside a pipeline."""
+    try:
+        at = _PIPELINE_DEADLINE.get()
+    except Exception:                                            # noqa: BLE001
+        return None
+    return None if at is None else at - time.monotonic()
+
+
 def _swarm_fast_path(body, messages):
     """True when a pipeline id should answer with ONE strong model instead: a
     tool-free turn whose ask _classify_difficulty calls 'simple' (arithmetic, a
@@ -20701,19 +21164,26 @@ def _swarm_completion(body):
     crew = _crew_name_for(asked)
     # Feed live stage progress + the per-role model list to the activity row.
     _watch = _act_pipeline_watcher()
-    # Bound ONCE, here: the mode in force now (a "coding-swarm" id set it on
-    # `g`) rides into every stage, including the ones swarm.run puts on worker
-    # threads. See _pipeline_bound.
-    dispatch = _pipeline_bound(_swarm_dispatch)
     cap = _swarm_max_seconds()
     extra = {"max_seconds": cap} if cap else {}
     # A configured subscription manager plans/checks/fixes; free models still
     # do the work. Absent -> no kwarg, the pipeline exactly as before.
     extra.update(_swarm_manager_kwargs())
-    if crew is not None:
-        result = crews.run(messages, dispatch, crew, on_event=_watch, **extra)
-    else:
-        result = swarm.run(messages, dispatch, on_event=_watch, **extra)
+    # The outer bound is set BEFORE binding, so the context copy _pipeline_bound
+    # takes carries it into every stage thread. Reset afterwards: a pooled
+    # server thread must not hand a stale deadline to its next request.
+    _outer_tok = _PIPELINE_DEADLINE.set(time.monotonic() + _pipeline_outer_bound(cap))
+    try:
+        # Bound ONCE, here: the mode in force now (a "coding-swarm" id set it
+        # on `g`) rides into every stage, including the ones swarm.run puts on
+        # worker threads. See _pipeline_bound.
+        dispatch = _pipeline_bound(_swarm_dispatch)
+        if crew is not None:
+            result = crews.run(messages, dispatch, crew, on_event=_watch, **extra)
+        else:
+            result = swarm.run(messages, dispatch, on_event=_watch, **extra)
+    finally:
+        _PIPELINE_DEADLINE.reset(_outer_tok)
     result = result if isinstance(result, dict) else {}
     _act_pipeline_result(result)
     # THE DELIVERABLE ONLY for an API/CLI caller. "**Plan followed**", "**Models
@@ -21500,6 +21970,10 @@ def _chat_completions_uncached(body):
         esc = dict(body)
         esc["model"] = "crew"
         return _swarm_completion(esc)
+    # The request's wall clock starts HERE, before routing (a cold catalog fetch
+    # is time the client is waiting too) and after the pipeline dispatch above,
+    # which runs under its own cap. See _REQUEST_DEADLINE_DEFAULT.
+    _begin_request_deadline()
     # Orchestrate (Auto): route by task difficulty AND request size so weak/small
     # providers take easy work and big requests avoid small-TPM providers (413).
     # Explicit '<pid>/<model>' bypasses model choice (chain still size-filters).
@@ -21616,12 +22090,20 @@ def _chat_completions_uncached(body):
     # _build_chain should not have to know about a parameter it never sees).
     _veto_kw = {"exclude_identities": veto} if veto else {}
     _walk_started = time.monotonic()
+    # See _ChainClock: the request deadline and the trivial-turn hop budget.
+    _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
+    _clock = _ChainClock(trivial=_is_trivial_turn(
+        body.get("messages"), body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)))
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                           prefer=chain_prefer,
                                            require_tools=has_tools,
                                            **_pin_kw,
                                            messages=body.get("messages"),
                                            **_veto_kw):
+        if _clock.spent():
+            errors.append("stopped: request deadline reached")
+            last_error = "deadline"
+            break
         if stream and _header_budget_spent(_walk_started):
             # See _STREAM_HEADER_BUDGET: past this the client has stopped
             # listening for headers, so a further hop cannot be delivered even
@@ -21656,7 +22138,7 @@ def _chat_completions_uncached(body):
             _act_pick(hop_pid, hop_model)
             attempts += 1
             last_hop = (hop_pid, hop_model)
-            resp = _dispatch_chat(hop_pid, payload, dispatch_stream)
+            resp = _clock.dispatch(hop_pid, payload, dispatch_stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             last_error = _classify_hop_error(exc=exc)
@@ -21740,7 +22222,7 @@ def _chat_completions_uncached(body):
                 # Peek until REAL content: a 200 that streams no content must fall
                 # through to the next model, not be handed to the client as empty.
                 status, buffered = _peek_until_content(
-                    it, _stream_peek_timeout(hop_model, est))
+                    it, _clock.peek_timeout(hop_model, est))
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -21752,7 +22234,9 @@ def _chat_completions_uncached(body):
                     resp.close()
                     continue
                 _note_ttft(resp, hop_pid, hop_model)
-                chained = _chain_buffered(buffered, it)
+                chained = _clock.guard(_chain_buffered(buffered, it),
+                                       _CHAT_DEADLINE_TERMINATOR,
+                                       "%s/%s" % (hop_pid, hop_model))
                 relay = _proxy_sse(resp, chained, hop_pid=hop_pid, hop_model=hop_model,
                                    prompt_text=_prompt_text_for_check(payload),
                                    tools_offered=has_tools)
@@ -21792,7 +22276,7 @@ def _chat_completions_uncached(body):
                     retry = dict(payload)
                     retry["max_tokens"] = bigger
                     try:
-                        resp2 = _dispatch_chat(hop_pid, retry, False)
+                        resp2 = _clock.dispatch(hop_pid, retry, False)
                         data2 = resp2.json() if resp2.status_code == 200 else None
                         resp2.close()
                     except (requests.RequestException, RuntimeError, ValueError):
@@ -21887,6 +22371,15 @@ def _chat_completions_uncached(body):
             errors.append("%s: %s reading error body" % (hop_pid, _sanitize(exc.__class__.__name__)))
         resp.close()
         continue
+    if _clock.spent():
+        # The walk stopped on the clock, not on the fleet: say so, as a status
+        # the client can see, instead of dressing it up as "all providers
+        # failed" (or, before the deadline existed, never answering at all).
+        _log.warning("CHAT-DEADLINE stream=%s tools=%s est=%d errors=[%s]",
+                     stream, has_tools, est, "; ".join(errors) or "none")
+        return _with_headers(_openai_error(_deadline_error_text(_clock, errors), 504,
+                                           "timeout_error"),
+                             _routing_headers(last_hop[0], last_hop[1], attempts, "deadline"))
     # Chain exhausted. Tell the client HOW LONG until a model frees (Retry-After) so
     # its SDK waits out a short throttle and auto-continues once capacity returns.
     eta = _capacity_eta()
@@ -22348,6 +22841,9 @@ def v1_responses(_retry_pass=False):
         # No model could serve the fan-out. Still a request for maximum effort,
         # so continue as 'best' -- never as a model named "swarm".
         body = dict(body, model="best")
+    # The request's wall clock starts here, before routing, after the
+    # pipeline (which has its own cap). See _REQUEST_DEADLINE_DEFAULT.
+    _begin_request_deadline()
     # Did the CALLER name a model, or is the router choosing? A pinned model
     # opens the turn whatever its record says -- see _build_chain(pinned=).
     # Passed as a kwarg dict for the same reason exclude_identities is: an
@@ -22402,10 +22898,18 @@ def v1_responses(_retry_pass=False):
     _tried = []  # DIAG: every hop the chain actually offered (root-cause the 503s)
     _err_bodies = {}  # DIAG: first raw error body per (pid:status) — reveals soft-400 reasons
     _walk_started = time.monotonic()
+    # See _ChainClock: the request deadline and the trivial-turn hop budget.
+    _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
+    _clock = _ChainClock(trivial=_is_trivial_turn(
+        messages, body.get("max_output_tokens"), diff, est, pinned=bool(_pin_kw)))
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools, messages=messages,
                                            **_pin_kw):
         _tried.append(hop_pid + "/" + hop_model)
+        if _clock.spent():
+            errors.append("stopped: request deadline reached")
+            last_error = "deadline"
+            break
         if stream and _header_budget_spent(_walk_started):
             # See _STREAM_HEADER_BUDGET: past this the client has stopped
             # listening for headers, so a further hop cannot be delivered even
@@ -22439,7 +22943,7 @@ def v1_responses(_retry_pass=False):
         payload["stream"] = dispatch_stream
         try:
             _act_pick(hop_pid, hop_model)
-            resp = _dispatch_chat(hop_pid, payload, dispatch_stream)
+            resp = _clock.dispatch(hop_pid, payload, dispatch_stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             last_error = _classify_hop_error(exc=exc)
@@ -22521,7 +23025,7 @@ def v1_responses(_retry_pass=False):
                 # (role delta + [DONE], no content) must fall through to the next
                 # model instead of being streamed to codex as a dead-end answer.
                 status, buffered = _peek_until_content(
-                    line_it, _stream_peek_timeout(hop_model, est))
+                    line_it, _clock.peek_timeout(hop_model, est))
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -22533,7 +23037,8 @@ def v1_responses(_retry_pass=False):
                     resp.close()
                     continue
                 _note_ttft(resp, hop_pid, hop_model)
-                chained = _chain_buffered(buffered, line_it)
+                chained = _clock.guard(_chain_buffered(buffered, line_it),
+                                       None, "%s/%s" % (hop_pid, hop_model))
                 return Response(stream_with_context(
                     _responses_stream(resp, model_label, line_iter=chained, prompt_est=est,
                                       hop_pid=hop_pid, hop_model=hop_model,
@@ -22632,6 +23137,15 @@ def v1_responses(_retry_pass=False):
     # So when EVERY failure was transient, wait once and run the chain again.
     # Bounded to a single retry, and only when nothing hard failed — a real 400
     # or 404 still surfaces immediately, because retrying that just wastes time.
+    if _clock.spent():
+        # Stopped on the clock (see _ChainClock). No transient-storm retry: the
+        # retry is the same request to codex, and its time is already gone.
+        _log.warning("RESPONSES-DEADLINE stream=%s tools=%s est=%d tried=[%s] errors=[%s]",
+                     stream, has_tools, est, ", ".join(_tried),
+                     "; ".join(errors) or "none")
+        return _with_headers(_openai_error(_deadline_error_text(_clock, errors), 504,
+                                           "timeout_error"),
+                             {"X-Free-LLM-Hub-Last-Error": "deadline"})
     if (not last_hard and errors and not _retry_pass
             and all(_TRANSIENT_ERR_RE.search(e or "") for e in errors)):
         _log.info("[chain] all %d hops transient (429/5xx) — backing off %.1fs and retrying",
@@ -23091,6 +23605,9 @@ def v1_messages():
         if served is not None:
             return served
         body = dict(body, model="best")
+    # The request's wall clock starts here, before routing, after the
+    # pipeline (which has its own cap). See _REQUEST_DEADLINE_DEFAULT.
+    _begin_request_deadline()
     # A bare CATEGORY id (ANTHROPIC_MODEL=coding) restricts the pool to that
     # category for THIS request, exactly as /v1/chat/completions does. REPORTED:
     # without this, "coding" was merely orchestrate-able (_mode_keys() is in
@@ -23165,9 +23682,17 @@ def v1_messages():
     last_hard = None  # last hard (non-retryable) upstream error, relayed if the chain is exhausted
     last_error = None  # class of the LAST failed hop (transparency header)
     _walk_started = time.monotonic()
+    # See _ChainClock: the request deadline and the trivial-turn hop budget.
+    _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
+    _clock = _ChainClock(trivial=_is_trivial_turn(
+        oai_messages, body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)))
     for hop_pid, hop_model in _build_chain(pid, resolved, est, require_vision=has_images,
                                            require_tools=has_tools, messages=oai_messages,
                                            **_pin_kw):
+        if _clock.spent():
+            errors.append("stopped: request deadline reached")
+            last_error = "deadline"
+            break
         if stream and _header_budget_spent(_walk_started):
             # See _STREAM_HEADER_BUDGET: past this the client has stopped
             # listening for headers, so a further hop cannot be delivered even
@@ -23189,7 +23714,7 @@ def v1_messages():
             _act_pick(hop_pid, hop_model)
             attempts += 1
             last_hop = (hop_pid, hop_model)
-            resp = _dispatch_chat(hop_pid, payload, stream)
+            resp = _clock.dispatch(hop_pid, payload, stream)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
             last_error = _classify_hop_error(exc=exc)
@@ -23229,7 +23754,7 @@ def v1_messages():
                 # Peek until REAL content so an empty 200 falls through to the next
                 # model instead of being handed to the client as a dead-end answer.
                 status, buffered = _peek_until_content(
-                    line_it, _stream_peek_timeout(hop_model, est))
+                    line_it, _clock.peek_timeout(hop_model, est))
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -23241,7 +23766,8 @@ def v1_messages():
                     resp.close()
                     continue
                 _note_ttft(resp, hop_pid, hop_model)
-                chained = _chain_buffered(buffered, line_it)
+                chained = _clock.guard(_chain_buffered(buffered, line_it),
+                                       None, "%s/%s" % (hop_pid, hop_model))
                 return Response(stream_with_context(
                     _anthropic_stream(resp, model_str, input_est, line_iter=chained,
                                      hop_pid=hop_pid, hop_model=hop_model,
@@ -23323,6 +23849,13 @@ def v1_messages():
             errors.append("%s: %s reading error body" % (hop_pid, _sanitize(exc.__class__.__name__)))
         resp.close()
         continue
+    if _clock.spent():
+        # Stopped on the clock (see _ChainClock), not on the fleet.
+        _log.warning("MESSAGES-DEADLINE stream=%s tools=%s est=%d errors=[%s]",
+                     stream, has_tools, est, "; ".join(errors) or "none")
+        return _with_headers(_anthropic_error("api_error",
+                                              _deadline_error_text(_clock, errors), 504),
+                             _routing_headers(last_hop[0], last_hop[1], attempts, "deadline"))
     # Chain exhausted -> Retry-After so the client waits out a short throttle + auto-continues.
     eta = _capacity_eta()
     try:  # DIAG (temporary): record WHY the messages chain exhausted (Claude Code's 503).
