@@ -259,6 +259,11 @@ def test_every_call_site_hands_over_the_offered_tools():
     src = _app_source()
     sites = [l for l in src.splitlines()
              if "_chat_json_nonanswer(data" in l and "def " not in l]
+    # The hedged first hop (_hedge_leg_verdict) only ever races TOOL-FREE
+    # turns (see plan_hedge), so it has no tools to hand over.
+    hedge = [l for l in sites if "_chat_json_nonanswer(data, False, None)" in l]
+    assert len(hedge) == 1
+    sites = [l for l in sites if l not in hedge]
     assert len(sites) == 6
     for line in sites:
         assert "has_tools, " in line, line
