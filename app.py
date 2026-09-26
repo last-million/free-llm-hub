@@ -975,6 +975,24 @@ def _codex_catalog_label(mid):
     return "%s (Calvoun hub)" % mid
 
 
+def _codex_dump_models(binary):
+    """The installed codex's own bundled catalog (`codex debug models
+    --bundled`) as a dict, or None. Shared by the /model catalog refresh below
+    and the subscription model picker (_sub_detect_models), so both read the
+    exact same source. --bundled skips any model_catalog.json we wrote, so the
+    hub's virtual modes never come back as "codex models". Never raises."""
+    try:
+        proc = subprocess.run([binary, "debug", "models", "--bundled"],
+                              capture_output=True, timeout=90,
+                              creationflags=_CREATE_NO_WINDOW)
+        if proc.returncode != 0:
+            return None
+        dump = json.loads(proc.stdout.decode("utf-8", "ignore"))
+        return dump if isinstance(dump, dict) else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def _refresh_codex_catalog():
     """Rewrite ~/.codex/model_catalog.json so /model offers the hub's modes.
 
@@ -984,12 +1002,10 @@ def _refresh_codex_catalog():
         binary = _which_cli("codex")
         if not binary:
             return
-        proc = subprocess.run([binary, "debug", "models", "--bundled"],
-                              capture_output=True, timeout=90,
-                              creationflags=_CREATE_NO_WINDOW)
-        if proc.returncode != 0:
+        dump = _codex_dump_models(binary)
+        if dump is None:
             return
-        entries = _codex_catalog_models(json.loads(proc.stdout.decode("utf-8", "ignore")))
+        entries = _codex_catalog_models(dump)
         if not entries:
             return
         payload = json.dumps({"models": entries}, indent=2) + "\n"
@@ -3592,6 +3608,17 @@ def _dead_model_rows():
         return [(p, m, int(exp - now)) for (p, m), exp in _dead_models.items() if exp > now]
 
 
+# The manager's per-day token counter (see _manager_dispatch). Declared up here
+# because _dead_state_dump/_dead_state_load persist it with the quota state.
+_MANAGER_LOCK = threading.Lock()
+_MANAGER_TOKENS = {"day": "", "spent": 0, "calls": 0, "by_purpose": {}}
+
+
+def _manager_today():
+    """Local calendar day the manager budget is counted against."""
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
 # Bridge for quota.init_persistence(): the dead-model/provider maps ride along in
 # the same state file as the quota blob (the "app" key). Expired entries are
 # dropped on BOTH dump and load — a sideline that would already have lifted is
@@ -3639,11 +3666,30 @@ def _dead_state_dump():
     with _activity_lock:
         out["activity"] = list(_activity)
         out["activity_seq"] = _activity_seq[0]
+    # The manager's per-day token spend (see _manager_dispatch). It is a paid
+    # subscription's budget, so forgetting it on every restart -- including the
+    # automatic 5-hourly one -- would let the hub quietly spend the day's
+    # allowance again from zero.
+    with _MANAGER_LOCK:
+        out["manager_tokens"] = copy.deepcopy(_MANAGER_TOKENS)
     return out
 
 
 def _dead_state_load(blob):
     now = time.time()
+    mt = blob.get("manager_tokens")
+    if isinstance(mt, dict) and mt.get("day") == _manager_today():
+        with _MANAGER_LOCK:
+            try:
+                _MANAGER_TOKENS["day"] = mt["day"]
+                _MANAGER_TOKENS["spent"] = max(0, int(mt.get("spent") or 0))
+                _MANAGER_TOKENS["calls"] = max(0, int(mt.get("calls") or 0))
+                bp = mt.get("by_purpose")
+                _MANAGER_TOKENS["by_purpose"] = {
+                    str(k): int(v) for k, v in (bp or {}).items()
+                    if isinstance(v, int)} if isinstance(bp, dict) else {}
+            except (TypeError, ValueError):
+                pass              # a hand-edited file must not block startup
     rows = blob.get("activity")
     if isinstance(rows, list):
         with _activity_lock:
@@ -4081,6 +4127,169 @@ def _sub_models(pid):
     return [cfg["model"]] if cfg.get("model") else []
 
 
+# --------------------------------------------------------------------------- #
+# Subscription MODEL PICKER.
+#
+# _sub_models() above is the ROUTING identity ('sub-claude/claude') and stays
+# one id per provider -- changing it would rename a chain hop and orphan its
+# dead/outcome records. What the user picks here is the model the CLI is TOLD
+# to use (`--model`), stored per subscription as `sub_<cli>_model`.
+#
+# Defaults reproduce the pre-picker behaviour exactly: claude "opus" (the
+# agent turns' long-stable alias, see agentic_chat._MODEL_ALIAS) and codex ""
+# (no --model at all: codex keeps its own config.toml default).
+#
+# Detection, MEASURED against the installed CLIs 2026-09-26:
+#   codex  -> `codex debug models --bundled` lists every slug with a
+#             `visibility` ("list" = shown in codex's own /model picker, "hide"
+#             = internal/review models). Only "list" slugs are offered, in
+#             codex's own priority order.
+#   claude -> there is NO list-models command. `claude --help` names the
+#             accepted aliases and an example full id in its --model help
+#             ('fable', 'opus', 'sonnet' ... 'claude-fable-5'), so those are
+#             read from there on top of the stable opus/sonnet/haiku aliases.
+# A detection run spawns a CLI, so it never happens on the request path: the
+# dashboard gets the cached (or fallback) list and a background refresh.
+# --------------------------------------------------------------------------- #
+_SUB_MODEL_DEFAULT = {"sub-claude": "opus", "sub-codex": ""}
+_SUB_MODEL_FALLBACK = {
+    # Stable aliases the Claude Code CLI has accepted for its whole life.
+    "sub-claude": ["opus", "sonnet", "haiku"],
+    # The visible slugs of codex's bundled catalog when this was written
+    # (MEASURED 2026-09-26). Only a hint list: codex itself validates.
+    "sub-codex": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+                  "gpt-5.5", "gpt-5.2"],
+}
+_SUB_MODEL_TTL = 6 * 3600
+_SUB_MODEL_CACHE = {}           # pid -> (fetched_at, [models])
+_SUB_MODEL_REFRESHING = set()   # pids with a background detection in flight
+_SUB_MODEL_LOCK = threading.Lock()
+# A model id travels in argv, so it must never be able to read as a flag
+# ("--dangerously-...") or smuggle whitespace. Real ids ('opus', 'gpt-5.6-sol',
+# 'claude-opus-4-1-20250805', 'claude-sonnet-4-5[1m]') all fit.
+_SUB_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\[\]/-]{0,79}$")
+
+
+def _sub_model_setting_key(pid):
+    cfg = _SUB_PROVIDERS.get(pid) or {}
+    return "sub_%s_model" % cfg.get("cli_id", pid)
+
+
+def _sub_selected_model(pid):
+    """The model this subscription's CLI is told to use ("" = none, let the CLI
+    decide). Setting when valid, else the built-in default. Never raises."""
+    default = _SUB_MODEL_DEFAULT.get(pid, "")
+    try:
+        v = config.get_setting(_sub_model_setting_key(pid), None)
+    except Exception:                                            # noqa: BLE001
+        return default
+    if isinstance(v, str) and _SUB_MODEL_ID_RE.match(v.strip()):
+        return v.strip()
+    return default
+
+
+def _sub_cli_model(pid, model=None):
+    """--model value for one run. An explicit CLI model id wins; the routing
+    identity ('claude'/'codex'/'cli') is NOT a CLI model and resolves to the
+    per-subscription setting, which is how every existing caller behaves."""
+    cfg = _SUB_PROVIDERS.get(pid) or {}
+    if (isinstance(model, str) and model
+            and model not in (cfg.get("model"), "cli")
+            and model not in (cfg.get("models") or [])
+            and _SUB_MODEL_ID_RE.match(model)):
+        return model
+    return _sub_selected_model(pid)
+
+
+def _claude_help_models(text):
+    """Model ids named in the --model block of `claude --help`. Pure."""
+    # Anchored on the option's own line, so a description that merely mentions
+    # --model elsewhere in the help cannot be mistaken for it.
+    m = re.search(r"^[ \t]*--model\b(.*?)(?:\n[ \t]*-{1,2}[A-Za-z]|\Z)",
+                  text or "", re.S | re.M)
+    if not m:
+        return []
+    out = []
+    for tok in re.findall(r"'([^'\s]+)'", m.group(1)):
+        if _SUB_MODEL_ID_RE.match(tok) and tok not in out:
+            out.append(tok)
+    return out
+
+
+def _sub_detect_models(pid):
+    """Ask the installed CLI which models it offers. [] when it cannot tell.
+    Spawns a process -- background/refresh use only. Never raises."""
+    try:
+        path = _sub_bin(pid) or shutil.which((_SUB_PROVIDERS.get(pid) or {}).get("bin", ""))
+        if not path:
+            return []
+        if pid == "sub-codex":
+            dump = _codex_dump_models(path)
+            models = (dump or {}).get("models") or []
+            vis = [m for m in models if isinstance(m, dict)
+                   and m.get("visibility") == "list" and isinstance(m.get("slug"), str)]
+            vis.sort(key=lambda m: m.get("priority", 0))
+            return [m["slug"] for m in vis if _SUB_MODEL_ID_RE.match(m["slug"])]
+        if pid == "sub-claude":
+            proc = subprocess.run(_sub_launcher(path) + ["--help"], capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace",
+                                  timeout=30, env=_sub_env(pid),
+                                  creationflags=_CREATE_NO_WINDOW)
+            return _claude_help_models(proc.stdout)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return []
+
+
+def _sub_refresh_models(pid):
+    """Run detection once and cache the result (detected, or the fallback when
+    detection found nothing). Returns the cached list."""
+    found = _sub_detect_models(pid)
+    base = list(_SUB_MODEL_FALLBACK.get(pid, []))
+    if pid == "sub-claude":
+        # The stable aliases stay first even when --help only shows some of them.
+        models = base + [m for m in found if m not in base]
+    else:
+        models = found or base
+    with _SUB_MODEL_LOCK:
+        _SUB_MODEL_CACHE[pid] = (time.time(), models)
+        _SUB_MODEL_REFRESHING.discard(pid)
+    return models
+
+
+def _sub_model_choices(pid, background=True):
+    """Selectable models for one subscription, cached for _SUB_MODEL_TTL.
+
+    background=True (the dashboard path) never blocks: a stale/missing cache
+    returns what is known (or the fallback) and kicks ONE detection thread --
+    only once the user has opted into subscriptions at all, so a stock hub
+    never spawns a vendor CLI just because the dashboard was opened.
+    The currently selected model is always included, so a hand-set id that
+    detection does not know about still shows as selected."""
+    if pid not in _SUB_PROVIDERS:
+        return []
+    may_detect = background and _sub_master_on()
+    with _SUB_MODEL_LOCK:
+        hit = _SUB_MODEL_CACHE.get(pid)
+        fresh = bool(hit) and time.time() - hit[0] < _SUB_MODEL_TTL
+        start = not fresh and may_detect and pid not in _SUB_MODEL_REFRESHING
+        if start:
+            _SUB_MODEL_REFRESHING.add(pid)
+    if fresh:
+        models = list(hit[1])
+    elif background:
+        models = list(hit[1]) if hit else list(_SUB_MODEL_FALLBACK.get(pid, []))
+        if start:
+            threading.Thread(target=_sub_refresh_models, args=(pid,), daemon=True,
+                             name="sub-models-" + pid).start()
+    else:
+        models = _sub_refresh_models(pid)
+    sel = _sub_selected_model(pid)
+    if sel and sel not in models:
+        models.append(sel)
+    return models
+
+
 def _sub_master_on():
     """The master opt-in. DEFAULT FALSE — with it off, nothing below ever runs."""
     return bool(config.get_flag(_SUB_MASTER_FLAG, False))
@@ -4356,6 +4565,29 @@ _SUB_AUTH_ERR = ("not logged in", "not authenticated", "unauthorized", "401",
                  "quota is not enough", "insufficient quota")
 
 
+# Per-thread: the token count the CLI itself reported for the LAST _sub_run on
+# this thread, or None. Thread-local rather than a 4th return value so the
+# (status, text, detail) contract every caller unpacks stays untouched.
+_SUB_USAGE = threading.local()
+_SUB_TOKENS_USED_RE = re.compile(r"tokens used\s*:?\s*([\d,]+)", re.I)
+
+
+def _sub_reported_tokens(*streams):
+    """Total tokens a CLI printed about itself, or None. codex exec ends its
+    stderr with "tokens used\\n12,345" (older builds: "tokens used: 12345");
+    the LAST match wins, since that is the run's final tally. Never raises."""
+    for s in streams:
+        try:
+            hits = _SUB_TOKENS_USED_RE.findall(s or "")
+            if hits:
+                n = int(hits[-1].replace(",", ""))
+                if n > 0:
+                    return n
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _sub_run(pid, prompt, model=None):
     """Run the local CLI ONCE, non-interactively. NEVER raises.
 
@@ -4366,8 +4598,13 @@ def _sub_run(pid, prompt, model=None):
       413 -> prompt over _SUB_MAX_PROMPT_CHARS (request-specific, NOT dead)
       504 -> timed out       502 -> ran but failed / produced nothing
 
-    `model` selects WHICH model for a multi-model pid; ignored for
-    sub-claude/sub-codex, which only ever expose "your logged-in session".
+    `model` is either the routing identity ('claude'/'codex' -> the
+    subscription's picked model, see _sub_cli_model) or an explicit CLI model
+    id (the manager passes one). A non-empty result travels as `--model`; ""
+    sends none, which is codex's default and byte-identical to before.
+
+    CLI-reported token usage (codex prints "tokens used N") is left in
+    _SUB_USAGE.total for the caller that wants real accounting.
 
     Invocation (flags verified against `claude --help` / `codex exec --help`):
       claude -> `claude -p --output-format text`, prompt on STDIN (print mode
@@ -4403,6 +4640,8 @@ def _sub_run(pid, prompt, model=None):
     path = _sub_bin(pid, model)
     if not path:
         return 403, "", "'%s' is no longer on PATH." % bin_name
+    cli_model = _sub_cli_model(pid, model)
+    _SUB_USAGE.total = None
     tmp_out = None
     try:
         if pid == "sub-codex":
@@ -4425,9 +4664,13 @@ def _sub_run(pid, prompt, model=None):
                                           # and nothing is installed in a fresh isolated
                                           # profile for either flag to remove.
                                           "--disable", "plugins", "--disable", "remote_plugin"]
+            if cli_model:
+                argv += ["--model", cli_model]
             argv += ["-o", tmp_out, "-"]
         else:
             argv = _sub_launcher(path) + ["-p", "--output-format", "text"]
+            if cli_model:
+                argv += ["--model", cli_model]
         try:
             proc = subprocess.run(argv, input=prompt, capture_output=True, text=True,
                                   encoding="utf-8", errors="replace",
@@ -4439,6 +4682,9 @@ def _sub_run(pid, prompt, model=None):
         except (OSError, ValueError) as exc:
             return 502, "", "%s failed to start: %s" % (bin_name, exc.__class__.__name__)
         text = (proc.stdout or "").strip()
+        # stderr only: stdout carries the model's own words, and a reply that
+        # happens to say "tokens used: 5" must not become the accounting.
+        _SUB_USAGE.total = _sub_reported_tokens(proc.stderr)
         if pid == "sub-codex":
             last = _read_text(tmp_out).strip()
             text = last or _codex_strip_noise(proc.stdout)
@@ -4543,6 +4789,147 @@ def _subscription_chat(pid, payload):
                      "message": {"role": "assistant", "content": text}}],
         "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
     })
+
+
+# --------------------------------------------------------------------------- #
+# MANAGER primitive: one paid-subscription model the hub may consult for small,
+# high-leverage decisions (planning, review), on a hard per-day token budget.
+#
+# OFF by default (`manager_model` = ""). It never serves user traffic by
+# itself: callers get ("", None) whenever it is disabled, over budget or
+# failed, and fall back to the free models exactly as if it did not exist.
+#   manager_model               "<sub-pid>/<cli model>", e.g. "sub-claude/sonnet"
+#   manager_daily_token_budget  int, default 200000; 0 = unlimited
+# Spend is counted per local day (CLI-reported tokens when the CLI prints them,
+# else chars/4 like the rest of the hub) and persisted with the quota state.
+# --------------------------------------------------------------------------- #
+_MANAGER_DEFAULT_BUDGET = 200000
+
+
+def _manager_parse(value):
+    """(pid, cli_model) from a "<sub-pid>/<model>" setting, or (None, None)."""
+    if not isinstance(value, str) or "/" not in value:
+        return None, None
+    pid, model = value.strip().split("/", 1)
+    if pid not in _SUB_PROVIDERS or not _SUB_MODEL_ID_RE.match(model or ""):
+        return None, None
+    return pid, model
+
+
+def _manager_budget():
+    """Daily token budget; 0 means unlimited. A bad value keeps the default
+    rather than silently meaning 'unlimited'."""
+    try:
+        v = config.get_setting("manager_daily_token_budget", _MANAGER_DEFAULT_BUDGET)
+        v = int(v)
+        return v if v >= 0 else _MANAGER_DEFAULT_BUDGET
+    except Exception:                                            # noqa: BLE001
+        return _MANAGER_DEFAULT_BUDGET
+
+
+def _manager_spent_today():
+    with _MANAGER_LOCK:
+        if _MANAGER_TOKENS.get("day") != _manager_today():
+            return 0
+        return int(_MANAGER_TOKENS.get("spent") or 0)
+
+
+def _manager_charge(tokens, purpose):
+    """Add `tokens` to today's manager spend (rolling the day over first)."""
+    today = _manager_today()
+    with _MANAGER_LOCK:
+        if _MANAGER_TOKENS.get("day") != today:
+            _MANAGER_TOKENS.update({"day": today, "spent": 0, "calls": 0, "by_purpose": {}})
+        _MANAGER_TOKENS["spent"] = int(_MANAGER_TOKENS.get("spent") or 0) + int(tokens)
+        _MANAGER_TOKENS["calls"] = int(_MANAGER_TOKENS.get("calls") or 0) + 1
+        bp = _MANAGER_TOKENS.setdefault("by_purpose", {})
+        key = str(purpose or "other")[:40]
+        bp[key] = int(bp.get(key) or 0) + int(tokens)
+    try:
+        quota._persist_maybe()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _manager_model():
+    """The configured manager ("<pid>/<model>") or "" when off/invalid."""
+    try:
+        v = config.get_setting("manager_model", "") or ""
+    except Exception:                                            # noqa: BLE001
+        return ""
+    pid, model = _manager_parse(v)
+    return "%s/%s" % (pid, model) if pid else ""
+
+
+def _manager_enabled():
+    """True when a valid manager is configured AND its subscription may run
+    (master switch + that provider's switch). Budget is checked per call."""
+    pid, _model = _manager_parse(_manager_model())
+    if not pid or not _sub_master_on():
+        return False
+    try:
+        return bool(config.get_flag(_SUB_PROVIDERS[pid]["flag"], True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _manager_status():
+    """{model, enabled, budget, spent_today, remaining, calls_today, by_purpose}."""
+    budget = _manager_budget()
+    spent = _manager_spent_today()
+    with _MANAGER_LOCK:
+        same_day = _MANAGER_TOKENS.get("day") == _manager_today()
+        calls = int(_MANAGER_TOKENS.get("calls") or 0) if same_day else 0
+        by_purpose = dict(_MANAGER_TOKENS.get("by_purpose") or {}) if same_day else {}
+    return {"model": _manager_model(), "enabled": _manager_enabled(),
+            "budget": budget, "spent_today": spent,
+            "remaining": None if budget == 0 else max(0, budget - spent),
+            "calls_today": calls, "by_purpose": by_purpose}
+
+
+def _manager_dispatch(messages, max_tokens=None, purpose="other"):
+    """Ask the manager subscription model. Returns (text, who) where `who` is
+    "<pid>/<model>", or ("", None) when disabled / over budget / failed --
+    the caller then uses the free models. Never raises.
+
+    The budget is checked BEFORE the run against the prompt's own estimate, so
+    a call that would certainly overrun is refused instead of being paid for.
+    `max_tokens` has no CLI flag; it caps the returned text (chars/4) so a
+    manager answer cannot balloon the caller's next prompt."""
+    try:
+        if not _manager_enabled():
+            return "", None
+        pid, model = _manager_parse(_manager_model())
+        cfg = _SUB_PROVIDERS[pid]
+        if _is_model_dead(pid, cfg["model"]):
+            return "", None           # the routing hop is sidelined; don't pay 120s to relearn it
+        prompt = _sub_flatten(messages)
+        if not prompt:
+            return "", None
+        budget = _manager_budget()
+        est_prompt = max(1, len(prompt) // 4)
+        if budget and _manager_spent_today() + est_prompt > budget:
+            _log.info("[manager] %s skipped: daily budget %d reached", purpose, budget)
+            return "", None
+        status, text, detail = _sub_run(pid, prompt, model=model)
+        reported = getattr(_SUB_USAGE, "total", None)
+        quota.record(pid, cfg["model"])
+        if status in _DEAD_STATUSES:
+            _mark_model_dead(pid, cfg["model"], status)
+        if status != 200 or not text:
+            if reported:
+                _manager_charge(reported, purpose)
+            _log.info("[manager] %s via %s/%s failed: %s", purpose, pid, model,
+                      _sanitize(str(detail or status), 200))
+            return "", None
+        if max_tokens and int(max_tokens) > 0 and len(text) > int(max_tokens) * 4:
+            text = text[:int(max_tokens) * 4]
+        used = reported or (est_prompt + max(1, len(text) // 4))
+        _manager_charge(used, purpose)
+        return text, "%s/%s" % (pid, model)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.debug("manager dispatch skipped: %s", exc)
+        return "", None
 
 
 # --------------------------------------------------------------------------- #
@@ -11349,6 +11736,10 @@ def _sub_provider_rows():
             "isolated_login_command": login_cmd,
             "isolated_login_note": login_note,
             "recommended": bool(cfg.get("recommended")),
+            # Model picker: what the CLI is told to use (--model). "" = none.
+            "model_choices": _sub_model_choices(pid),
+            "selected_model": _sub_selected_model(pid),
+            "default_model": _SUB_MODEL_DEFAULT.get(pid, ""),
         }
         rows.append(row)
     return rows
@@ -11356,7 +11747,7 @@ def _sub_provider_rows():
 
 def _sub_payload():
     return {"enabled": _sub_master_on(), "providers": _sub_provider_rows(),
-            "warning": _SUB_WARNING}
+            "manager": _manager_status(), "warning": _SUB_WARNING}
 
 
 @app.route("/api/subscriptions", methods=["GET"])
@@ -11374,31 +11765,66 @@ def api_subscriptions_update():
       {"enabled": bool}                             -> master switch
       {"provider": "sub-codex", "enabled": bool}     -> that provider's enabled flag
       {"provider": "sub-codex", "isolated": bool}    -> that provider's isolated-profile flag
-      (the last two keys may be combined in one body; each is applied independently)
+      {"provider": "sub-claude", "model": "sonnet"}  -> that CLI's --model ("" = default)
+      (the provider keys may be combined in one body; each is applied independently)
+      {"manager_model": "sub-claude/sonnet" | ""}    -> manager on (that model) / off
+      {"manager_daily_token_budget": int >= 0}       -> 0 = unlimited
 
     When 'provider' is present, 'enabled'/'isolated' apply to THAT provider (the
     master switch is only touched by a body without 'provider') — so one call can
-    never silently mean both."""
+    never silently mean both. The manager keys ride along with either shape."""
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return jsonify({"error": "Invalid JSON body."}), 400
+    # Validate EVERYTHING before writing anything, so a bad field never leaves
+    # the settings half-applied.
+    mgr_touched = False
+    if "manager_model" in body:
+        mm = body.get("manager_model")
+        if mm is None or (isinstance(mm, str) and not mm.strip()):
+            mm = ""
+        elif not (isinstance(mm, str) and _manager_parse(mm)[0]):
+            return jsonify({"error": "manager_model must be '<sub-pid>/<model>' "
+                                     "(e.g. 'sub-claude/sonnet') or ''."}), 400
+        mgr_touched = True
+    if "manager_daily_token_budget" in body:
+        mb = body.get("manager_daily_token_budget")
+        if isinstance(mb, bool) or not isinstance(mb, int) or mb < 0:
+            return jsonify({"error": "manager_daily_token_budget must be an "
+                                     "integer >= 0 (0 = unlimited)."}), 400
+        mgr_touched = True
     pid = body.get("provider")
+    if pid is not None and pid not in _SUB_PROVIDERS:
+        return jsonify({"error": "Unknown subscription provider '%s'."
+                                 % _sanitize(str(pid), 40)}), 400
+    if pid is not None and "model" in body:
+        mv = body.get("model")
+        if not (mv is None or (isinstance(mv, str)
+                               and (not mv.strip() or _SUB_MODEL_ID_RE.match(mv.strip())))):
+            return jsonify({"error": "Invalid model id."}), 400
+    if "manager_model" in body:
+        config.set_value("manager_model", mm.strip() or None)
+    if "manager_daily_token_budget" in body:
+        config.set_setting("manager_daily_token_budget", int(mb))
     if pid is not None:
-        if pid not in _SUB_PROVIDERS:
-            return jsonify({"error": "Unknown subscription provider '%s'."
-                                     % _sanitize(str(pid), 40)}), 400
         touched = False
+        if "model" in body:
+            mv = (body.get("model") or "").strip()
+            # "" returns the CLI to the built-in default rather than pinning it.
+            config.set_value(_sub_model_setting_key(pid), mv or None)
+            touched = True
         if isinstance(body.get("enabled"), bool):
             config.set_flag(_SUB_PROVIDERS[pid]["flag"], bool(body["enabled"]))
             touched = True
         if isinstance(body.get("isolated"), bool):
             config.set_flag(_SUB_PROVIDERS[pid]["isolated_flag"], bool(body["isolated"]))
             touched = True
-        if not touched:
-            return jsonify({"error": "Pass 'enabled' and/or 'isolated' (bool) with 'provider'."}), 400
+        if not touched and not mgr_touched:
+            return jsonify({"error": "Pass 'enabled', 'isolated' (bool) and/or "
+                                     "'model' with 'provider'."}), 400
     elif isinstance(body.get("enabled"), bool):
         config.set_flag(_SUB_MASTER_FLAG, bool(body["enabled"]))
-    else:
+    elif not mgr_touched:
         return jsonify({"error": "Pass {enabled: bool} and/or "
                                  "{provider: 'sub-codex', enabled: bool, isolated: bool}."}), 400
     return jsonify(_sub_payload())

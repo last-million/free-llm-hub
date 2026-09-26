@@ -1075,6 +1075,12 @@
   }
   .sub-mode-pill.iso{background:var(--accent-soft);color:var(--ok-text)}
   .sub-card-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .sub-model-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--text-dim)}
+  .sub-model-row select{max-width:100%;min-width:0}
+  .sub-manager{display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text-dim);
+    border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 14px;margin-bottom:14px}
+  .sub-manager input[type=number]{width:120px}
+  .sub-manager .spent{font-variant-numeric:tabular-nums}
   .sub-install-result{
     width:100%;font-size:12px;line-height:1.5;border-radius:var(--radius-sm);
     padding:8px 11px;display:none;align-items:flex-start;gap:7px;overflow-wrap:anywhere;
@@ -2892,6 +2898,7 @@
           <span class="lbl">Use local subscriptions</span>
         </label>
       </div>
+      <div class="sub-manager" id="sub-manager" hidden></div>
       <div class="cli-grid" id="sub-list" aria-live="polite">
         <div class="skel skel-card"></div>
         <div class="skel skel-card"></div>
@@ -7809,7 +7816,12 @@
     rows.sort(function(a, b){ return (b.recommended ? 1 : 0) - (a.recommended ? 1 : 0); });
     var usable = rows.filter(function(r){ return r.usable; }).length;
     setSecChip('subs', rows.length ? (data.enabled ? (usable + ' / ' + rows.length + ' usable') : 'off') : '');
+    _subManager = data.manager || null;
+    renderSubManager(_subManager);
     if (!host) return;
+    /* The 15s poll rebuilds every card; never yank a model dropdown out from
+       under the user while it is open/focused. */
+    if (host.contains(document.activeElement) && document.activeElement.tagName === 'SELECT') return;
     host.innerHTML = '';
     if (!rows.length){ host.innerHTML = '<div class="empty">No subscription providers known.</div>'; return; }
     rows.forEach(function(r){
@@ -7859,10 +7871,73 @@
         '</label>' +
         testBtnHTML +
       '</div>' +
+      subModelRowHTML(r) +
       resultHTML;
   }
 
+  /* Model picker: what this CLI is told to use (--model) for one-shot hops
+     and agent turns. "" = the CLI's own default (codex); claude defaults to
+     "opus". "Use as manager" points manager_model at this <pid>/<model>. */
+  var _subManager = null;
+  function subModelRowHTML(r){
+    var choices = Array.isArray(r.model_choices) ? r.model_choices : [];
+    var sel = r.selected_model || '';
+    var opts = '';
+    if (!r.default_model) opts += '<option value=""' + (sel ? '' : ' selected') + '>CLI default</option>';
+    choices.forEach(function(m){
+      var label = m + (m === r.default_model ? ' (default)' : '');
+      opts += '<option value="' + esc(m) + '"' + (m === sel ? ' selected' : '') + '>' + esc(label) + '</option>';
+    });
+    var mgr = (_subManager && _subManager.model) || '';
+    var isMgr = !!mgr && mgr.indexOf(r.id + '/') === 0;
+    var mgrTitle = 'Let the hub consult this subscription model for small planning/review decisions, ' +
+                   'within the daily token budget below. Off by default.';
+    return '<div class="sub-model-row">' +
+        '<label>Model <select class="act-sub-model" aria-label="Model for ' + esc(r.name || r.id) + '">' + opts + '</select></label>' +
+        '<label class="switch" title="' + esc(mgrTitle) + '">' +
+          '<input type="checkbox" class="act-sub-manager"' + (isMgr ? ' checked' : '') + (sel ? '' : ' disabled') + '>' +
+          '<span class="track" aria-hidden="true"></span><span class="lbl">Use as manager</span>' +
+        '</label>' +
+      '</div>';
+  }
+
+  function renderSubManager(m){
+    var host = $('#sub-manager'); if (!host) return;
+    if (!m){ host.hidden = true; return; }
+    /* Don't clobber the budget field while the user is typing in it. */
+    if (host.contains(document.activeElement)) return;
+    host.hidden = false;
+    var budget = parseInt(m.budget, 10) || 0;
+    var spent = parseInt(m.spent_today, 10) || 0;
+    host.innerHTML =
+      '<span><strong>Manager:</strong> ' + (m.model ? '<code>' + esc(m.model) + '</code>' + (m.enabled ? '' : ' (inactive)') : 'off') + '</span>' +
+      '<label>Daily token budget <input type="number" min="0" step="1000" class="act-mgr-budget" value="' + budget + '" ' +
+        'title="0 = unlimited"></label>' +
+      '<span class="spent">Spent today: ' + spent.toLocaleString() + (budget ? ' / ' + budget.toLocaleString() : ' (unlimited)') + '</span>';
+    var inp = host.querySelector('.act-mgr-budget');
+    if (inp) inp.addEventListener('change', function(){
+      var v = parseInt(inp.value, 10);
+      if (!(v >= 0)){ toast('Budget must be a whole number >= 0', true); inp.value = budget; return; }
+      inp.blur();
+      postSubFlag({ manager_daily_token_budget: v }, inp, null);
+    });
+  }
+
   function wireSub(card, r){
+    var modelSel = card.querySelector('.act-sub-model');
+    if (modelSel) modelSel.addEventListener('change', function(){
+      var body = { provider: r.id, model: modelSel.value };
+      /* Keep the manager on the same subscription following the new pick. */
+      var mgr = (_subManager && _subManager.model) || '';
+      if (mgr.indexOf(r.id + '/') === 0 && modelSel.value) body.manager_model = r.id + '/' + modelSel.value;
+      modelSel.blur();
+      postSubFlag(body, modelSel, null);
+    });
+    var mgrToggle = card.querySelector('.act-sub-manager');
+    if (mgrToggle) mgrToggle.addEventListener('change', function(){
+      var want = mgrToggle.checked;
+      postSubFlag({ manager_model: want ? (r.id + '/' + (r.selected_model || '')) : '' }, mgrToggle, want);
+    });
     var enableToggle = card.querySelector('.act-sub-enable');
     if (enableToggle) enableToggle.addEventListener('change', function(){
       postSubFlag({ provider: r.id, enabled: enableToggle.checked }, enableToggle, enableToggle.checked);
