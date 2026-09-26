@@ -280,7 +280,9 @@ def test_chat_endpoint_serves_the_salvage(monkeypatch, model, reply, prompt, exp
     assert body["choices"][0]["message"]["content"] == expected
     assert body["choices"][0]["finish_reason"] == "stop"
     assert [c[0] for c in calls] == ["llm7"], "a salvageable answer costs no extra hop"
-    assert _outcome(*BAD) == (0, 1), "a salvaged answer is a FAILED delivery"
+    # A salvaged answer is a FAILED delivery -- and a JUNK one, which weighs
+    # _JUNK_FAIL_WEIGHT plain failures (see _record_outcome).
+    assert _outcome(*BAD) == (0, app._JUNK_FAIL_WEIGHT), "a salvaged answer is a FAILED delivery"
     assert app._reliability(*BAD) < 0.5
     assert app._reliability_penalty(*BAD) > 0
 
@@ -290,7 +292,7 @@ def test_chat_endpoint_rejected_answer_lowers_reliability(monkeypatch):
     r = _post("auto", N_PROMPT % 2825)
     assert r.get_json()["choices"][0]["message"]["content"] == "REAL ANSWER"
     assert [c[0] for c in calls] == ["llm7", "groq"]
-    assert _outcome(*BAD) == (0, 1) and app._reliability(*BAD) < 0.5
+    assert _outcome(*BAD) == (0, app._JUNK_FAIL_WEIGHT) and app._reliability(*BAD) < 0.5
     assert _outcome(*GOOD) == (1, 0)
 
 

@@ -2852,6 +2852,10 @@ _OUTCOME_TTL = 7 * 86400        # forget a record untouched for a week
 _OUTCOME_CAP = 40               # cap each counter; halving on overflow keeps the
                                 # RATIO but lets a fixed provider climb back out
 _OUTCOME_WEIGHT = 9.0           # max points an all-failure record can cost
+_JUNK_FAIL_WEIGHT = 2           # a junk answer counts as this many failures
+_RECENT_WINDOW = 24 * 3600      # the "recent" bucket _reliability favours
+_RECENT_MAX_SHARE = 0.8         # most the recent rate can weigh in the blend
+_RECENT_PRIOR = 4.0             # recent events needed for a 50/50 blend
 _outcomes = {}                  # (pid, model) -> {"ok": int, "fail": int, "last": float}
 _latencies = {}                 # (pid, model) -> {"ms": float, "n": int, "last": float}
 _outcome_lock = threading.Lock()
@@ -2890,17 +2894,28 @@ def _save_perf_stats(force=False):
         pass
 
 
-def _record_outcome(pid, model, ok):
-    """One real delivery result for this (pid, model). Never raises."""
+def _record_outcome(pid, model, ok, junk=False):
+    """One real delivery result for this (pid, model). Never raises.
+
+    `junk=True` marks a failure that was a JUNK ANSWER (answer gate, stream
+    gate, salvaged) rather than a plain HTTP/timeout miss. It weighs
+    _JUNK_FAIL_WEIGHT failures -- a 429 says "busy now", a degenerate answer
+    says "this deployment is broken" -- and is a strike toward the junk
+    bench (_junk_bench_note).
+
+    Every result also lands in a RECENT bucket (rok/rfail, restarted after
+    _RECENT_WINDOW) that _reliability weighs extra, so the last 24 h lead
+    instead of being averaged away under a week of older history."""
     if not (pid and model):
         return
     try:
         now = time.time()
+        weight = _JUNK_FAIL_WEIGHT if (junk and not ok) else 1
         with _outcome_lock:
             rec = _outcomes.get((pid, model))
             if not rec or now - rec.get("last", 0) > _OUTCOME_TTL:
                 rec = {"ok": 0, "fail": 0, "last": now}
-            rec["ok" if ok else "fail"] += 1
+            rec["ok" if ok else "fail"] += weight
             rec["last"] = now
             if rec["ok"] + rec["fail"] > _OUTCOME_CAP:
                 # Halve BOTH so the ratio survives while old evidence decays --
@@ -2908,9 +2923,17 @@ def _record_outcome(pid, model, ok):
                 # its slot back once it starts answering again.
                 rec["ok"] //= 2
                 rec["fail"] //= 2
+            if now - float(rec.get("rstart") or 0) > _RECENT_WINDOW:
+                rec["rok"], rec["rfail"], rec["rstart"] = 0, 0, now
+            rec["rok" if ok else "rfail"] = int(rec.get("rok" if ok else "rfail") or 0) + weight
+            if rec["rok"] + rec["rfail"] > _OUTCOME_CAP:
+                rec["rok"] //= 2
+                rec["rfail"] //= 2
             _outcomes[(pid, model)] = rec
     except Exception:                                            # noqa: BLE001
         pass
+    if junk and not ok:
+        _junk_bench_note(pid, model, "answer")
     _save_perf_stats()
 
 
@@ -3070,10 +3093,26 @@ def _reliability(pid, model):
     single failure cannot condemn a model outright ((0+1)/(1+2) = 0.33, not 0)."""
     with _outcome_lock:
         rec = _outcomes.get((pid, model))
-        if not rec or time.time() - rec.get("last", 0) > _OUTCOME_TTL:
+        now = time.time()
+        if not rec or now - rec.get("last", 0) > _OUTCOME_TTL:
             return 0.5
         ok, fail = rec.get("ok", 0), rec.get("fail", 0)
-    return (ok + 1.0) / (ok + fail + 2.0)
+        rok = rfail = 0
+        if now - float(rec.get("rstart") or 0) <= _RECENT_WINDOW:
+            rok, rfail = int(rec.get("rok") or 0), int(rec.get("rfail") or 0)
+    life = (ok + 1.0) / (ok + fail + 2.0)
+    n_recent = rok + rfail
+    if not n_recent:
+        return life
+    # THE LAST 24 H LEAD. Blend the lifetime rate with the recent one, the
+    # recent weight growing with how much recent evidence there is (capped at
+    # _RECENT_MAX_SHARE). A BLEND, not extra counts: when all the history IS
+    # recent the two rates are equal and nothing changes -- one failure still
+    # reads 0.33, never condemned -- while a pair with a good week that went
+    # bad today reads bad today instead of being outvoted by old successes.
+    recent = (rok + 1.0) / (n_recent + 2.0)
+    w = min(_RECENT_MAX_SHARE, n_recent / (n_recent + _RECENT_PRIOR))
+    return (1.0 - w) * life + w * recent
 
 
 def _reliability_penalty(pid, model):
@@ -3099,7 +3138,8 @@ def _record_chat_usage(hop_pid, hop_model, data, prompt_est, ok=True):
     (_answer_gate "salvaged"): usage still happened, but the hop burned the
     budget degenerating and must not be promoted for it. STREAMED answers are
     recorded once the stream ends, by _record_stream_outcome."""
-    _record_outcome(hop_pid, hop_model, bool(ok))
+    # ok=False here is ALWAYS a salvaged answer (see above): a junk strike.
+    _record_outcome(hop_pid, hop_model, bool(ok), junk=not ok)
     try:
         usage = data.get("usage") if isinstance(data, dict) else None
         if isinstance(usage, dict) and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
@@ -3832,12 +3872,17 @@ _canary_lock = threading.Lock()
 
 def _answer_quality_penalty(pid, model):
     """0 unless THIS (pid, model) failed the answer canary _CANARY_STRIKES times
-    running within the last _CANARY_PENALTY_TTL. Never raises."""
+    running within the last _CANARY_PENALTY_TTL, or sits on the JUNK BENCH
+    (see _junk_bench_note) -- the bench's much larger penalty wins. Every
+    pick key (_chat_pick_key, _agentic_score, _spread_band/_spread_pick)
+    already pays this one, so folding the bench in here reaches all of them
+    through one seam. Never raises."""
     try:
+        bench = _JUNK_BENCH_PENALTY if _is_pair_benched(pid, model) else 0.0
         with _canary_lock:
             rec = _canary_state.get((pid, model))
             until = float(rec.get("penalized_until") or 0) if rec else 0.0
-        return _CANARY_PENALTY if until > time.time() else 0.0
+        return max(bench, _CANARY_PENALTY if until > time.time() else 0.0)
     except Exception:                                            # noqa: BLE001
         return 0.0
 
@@ -3869,12 +3914,205 @@ def _record_canary_verdict(pid, model, verdict):
                 if rec["strikes"] >= _CANARY_STRIKES:
                     rec["penalized_until"] = now + _CANARY_PENALTY_TTL
             _canary_state[(pid, model)] = rec
+        # The canary is also a junk-bench witness: a junk/wrong answer is one
+        # more strike toward the bench, and a CORRECT one is the early exit
+        # from it (the probe is exactly the evidence a benched pair cannot
+        # earn from real traffic, since routing no longer sends it any).
+        if verdict == "correct":
+            _junk_bench_lift(pid, model)
+        elif verdict in ("junk", "wrong"):
+            _junk_bench_note(pid, model, "canary")
         try:
             quota._persist_maybe()
         except Exception:                                        # noqa: BLE001
             pass
     except Exception:                                            # noqa: BLE001
         pass
+
+
+# --------------------------------------------------------------------------- #
+# JUNK BENCH: a (provider, model) that keeps answering garbage sits out.
+#
+# REPORTED 2026-09-26: after the answer gate had recorded failures,
+# llm7/GLM-5.3-Flash still won "best" and coding, live, streaming and not.
+# Every demotion that existed was too weak or too slow to move it:
+# _reliability is Laplace-smoothed over up to _OUTCOME_CAP samples and
+# _reliability_penalty caps at _OUTCOME_WEIGHT (9 points) -- less than the gap
+# between a 138 and the next model down -- and the canary's 15 points need
+# two canary failures at one probe per pair per 6 h.
+#
+# So: _JUNK_BENCH_STRIKES junk/salvaged answers (answer gate, stream gate or
+# canary) within _JUNK_BENCH_WINDOW bench THAT PAIR for _JUNK_BENCH_TTL.
+# Per (pid, model), never per identity: the same weights behind another
+# provider are a different deployment (template, quant) and stay usable.
+# Benched means "ordered last / filtered out while anything else lives",
+# never deleted -- every pick path fails open to it when it is all there is.
+# A correct canary answer lifts it early (see _canary_due_pairs, which
+# re-probes a benched pair after _JUNK_BENCH_RECHECK). Persisted with the
+# quota state (_dead_state_dump) so a restart does not un-bench it.
+# --------------------------------------------------------------------------- #
+_JUNK_BENCH_STRIKES = 3
+_JUNK_BENCH_WINDOW = 60 * 60
+_JUNK_BENCH_TTL = 6 * 3600
+_JUNK_BENCH_PENALTY = 60.0           # score points: out of every top band
+_JUNK_BENCH_RECHECK = 60 * 60        # canary re-probe cadence while benched
+_junk_events = {}                    # (pid, model) -> [epoch, ...] inside the window
+_junk_bench = {}                     # (pid, model) -> {"until", "count", "since", "source"}
+_junk_lock = threading.Lock()
+
+
+def _junk_bench_note(pid, model, source="answer"):
+    """One junk (or salvaged) answer from (pid, model). Returns True when this
+    strike benched the pair. Never raises."""
+    if not (pid and model):
+        return False
+    try:
+        now = time.time()
+        key = (pid, str(model))
+        with _junk_lock:
+            ev = [t for t in (_junk_events.get(key) or ())
+                  if now - t <= _JUNK_BENCH_WINDOW]
+            ev.append(now)
+            _junk_events[key] = ev
+            cur = _junk_bench.get(key)
+            if cur and float(cur.get("until") or 0) > now:
+                cur["count"] = max(int(cur.get("count") or 0), len(ev))
+                return False          # already benched; the TTL is not extended
+            if len(ev) < _JUNK_BENCH_STRIKES:
+                return False
+            _junk_bench[key] = {"until": now + _JUNK_BENCH_TTL, "count": len(ev),
+                                "since": now, "source": str(source or "answer")}
+        _log.warning("[junk-bench] %s/%s benched %d h: %d junk answers in %d min",
+                     pid, model, _JUNK_BENCH_TTL // 3600, len(ev),
+                     _JUNK_BENCH_WINDOW // 60)
+        try:
+            quota._persist_maybe()
+        except Exception:                                        # noqa: BLE001
+            pass
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _junk_bench_lift(pid, model):
+    """Clear a bench and its strikes (a correct canary answer). Never raises."""
+    try:
+        key = (pid, str(model))
+        with _junk_lock:
+            had = _junk_bench.pop(key, None)
+            _junk_events.pop(key, None)
+        if had:
+            _log.info("[junk-bench] %s/%s lifted early: correct canary answer",
+                      pid, model)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _is_pair_benched(pid, model):
+    """True while (pid, model) sits on the junk bench. Never raises."""
+    try:
+        key = (pid, str(model))
+        with _junk_lock:
+            rec = _junk_bench.get(key)
+            if not rec:
+                return False
+            if float(rec.get("until") or 0) <= time.time():
+                _junk_bench.pop(key, None)       # served its time
+                return False
+            return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _unbenched(entries, pid_at=1, model_at=2):
+    """`entries` minus benched pairs, or `entries` unchanged when nothing else
+    would be left (fail-open: a benched answer beats no answer). Works on
+    (score, pid, model) tuples by default; pass pid_at=0, model_at=1 for
+    (pid, model) pairs. Never raises."""
+    try:
+        keep = [e for e in entries
+                if not _is_pair_benched(e[pid_at], e[model_at])]
+        return keep or list(entries)
+    except Exception:                                            # noqa: BLE001
+        return list(entries)
+
+
+def _bench_last(entries, pid_at=1, model_at=2):
+    """Stable partition: benched pairs moved to the TAIL, order otherwise kept.
+    For fallback chains, where a benched hop is still better than a 503."""
+    try:
+        good, bad = [], []
+        for e in entries:
+            (bad if _is_pair_benched(e[pid_at], e[model_at]) else good).append(e)
+        return good + bad
+    except Exception:                                            # noqa: BLE001
+        return list(entries)
+
+
+def _junk_bench_rows(pid=None):
+    """[{provider, model, until, count, detail}] for live benches, soonest-ending
+    first; `pid` narrows to one provider."""
+    now = time.time()
+    out = []
+    try:
+        with _junk_lock:
+            items = [(k, dict(v)) for k, v in _junk_bench.items()]
+        for (p, m), r in items:
+            until = float(r.get("until") or 0)
+            if until <= now or (pid and p != pid):
+                continue
+            n = int(r.get("count") or 0)
+            out.append({"provider": p, "model": m, "until": int(until),
+                        "count": n,
+                        "detail": "%s %s benched %d h: %d junk answer%s" % (
+                            p, m, _JUNK_BENCH_TTL // 3600, n, "" if n == 1 else "s")})
+        out.sort(key=lambda r: r["until"])
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
+
+def _junk_bench_dump():
+    now = time.time()
+    with _junk_lock:
+        return {
+            "bench": {"%s|%s" % (p, m): dict(r) for (p, m), r in _junk_bench.items()
+                      if float(r.get("until") or 0) > now},
+            "events": {"%s|%s" % (p, m): [t for t in ev if now - t <= _JUNK_BENCH_WINDOW]
+                       for (p, m), ev in _junk_events.items()
+                       if any(now - t <= _JUNK_BENCH_WINDOW for t in ev)},
+        }
+
+
+def _junk_bench_load(blob):
+    if not isinstance(blob, dict):
+        return
+    now = time.time()
+    with _junk_lock:
+        for key, r in (blob.get("bench") or {}).items():
+            if not (isinstance(key, str) and "|" in key and isinstance(r, dict)):
+                continue
+            try:
+                until = float(r.get("until") or 0)
+                rec = {"until": until, "count": int(r.get("count") or 0),
+                       "since": float(r.get("since") or 0),
+                       "source": str(r.get("source") or "answer")}
+            except (TypeError, ValueError):
+                continue
+            # A hand-edited or clock-skewed file must not bench a pair for
+            # longer than one bench can ever last.
+            if until <= now or until > now + _JUNK_BENCH_TTL + 60:
+                continue
+            p, m = key.split("|", 1)
+            _junk_bench[(p, m)] = rec
+        for key, ev in (blob.get("events") or {}).items():
+            if not (isinstance(key, str) and "|" in key and isinstance(ev, list)):
+                continue
+            fresh = [float(t) for t in ev if isinstance(t, (int, float))
+                     and 0 <= now - t <= _JUNK_BENCH_WINDOW]
+            if fresh:
+                p, m = key.split("|", 1)
+                _junk_events[(p, m)] = fresh
 
 
 def _canary_state_dump():
@@ -3965,6 +4203,12 @@ def _dead_state_dump():
         out["outcomes"] = {"%s|%s" % (p, m): [r.get("ok", 0), r.get("fail", 0), r.get("last", 0)]
                            for (p, m), r in _outcomes.items()
                            if now - r.get("last", 0) <= _OUTCOME_TTL}
+        # The 24 h bucket _reliability favours, under its own key so an older
+        # build (which insists on 3-element "outcomes" rows) still reads this.
+        out["outcomes_recent"] = {
+            "%s|%s" % (p, m): [r.get("rok", 0), r.get("rfail", 0), r.get("rstart", 0)]
+            for (p, m), r in _outcomes.items()
+            if now - float(r.get("rstart") or 0) <= _RECENT_WINDOW}
     # THE ACTIVITY FEED, which was in memory only -- so the one page that
     # answers "is anything actually working" was blank after every restart,
     # including the 5-hourly automatic one. REPORTED as "I did not see models
@@ -3980,6 +4224,12 @@ def _dead_state_dump():
     # Answer-canary quality state (see _record_canary_verdict).
     try:
         out["answer_canary"] = _canary_state_dump()
+    except Exception:                                            # noqa: BLE001
+        pass
+    # Junk bench (see _junk_bench_note): a restart must not un-bench a pair
+    # that was caught answering garbage an hour ago.
+    try:
+        out["junk_bench"] = _junk_bench_dump()
     except Exception:                                            # noqa: BLE001
         pass
     # The manager's per-day token spend (see _manager_dispatch). It is a paid
@@ -4085,9 +4335,30 @@ def _dead_state_load(blob):
             if now - last > _OUTCOME_TTL:
                 continue                  # stale evidence -- start that hop clean
             p, m = key.split("|", 1)
+            prev = _outcomes.get((p, m)) or {}
             _outcomes[(p, m)] = {"ok": int(ok), "fail": int(fail), "last": float(last)}
+            for k in ("rok", "rfail", "rstart"):      # keep perfstats' recent bucket
+                if k in prev:
+                    _outcomes[(p, m)][k] = prev[k]
+        for key, row in (blob.get("outcomes_recent") or {}).items():
+            if not (isinstance(key, str) and "|" in key
+                    and isinstance(row, list) and len(row) == 3):
+                continue
+            rok, rfail, rstart = row
+            if not all(isinstance(v, (int, float)) for v in (rok, rfail, rstart)):
+                continue
+            if now - rstart > _RECENT_WINDOW:
+                continue
+            p, m = key.split("|", 1)
+            rec = _outcomes.get((p, m))
+            if rec is not None:
+                rec.update(rok=int(rok), rfail=int(rfail), rstart=float(rstart))
     try:
         _canary_state_load(blob.get("answer_canary"))
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        _junk_bench_load(blob.get("junk_bench"))
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -6404,6 +6675,12 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
                     and not quota.model_status(pid, m)["exhausted"]):
                 entry = (_benchmark_score(pid, m), pid, m)
                 (cands if _context_ok(pid, m, est) else _compactable).append(entry)
+    # JUNK BENCH (see _junk_bench_note): a pair caught answering garbage three
+    # times in an hour sits out -- out of the chat pick, the spread band, the
+    # agentic pool, quality_mode and every session pin (they all draw from
+    # `cands`), while the same model on another provider stays in. Fail-open.
+    cands = _unbenched(cands)
+    _compactable = [c for c in _compactable if not _is_pair_benched(c[1], c[2])]
     # A STRONG MODEL ON A TRIMMED CONTEXT BEATS A WEAK ONE ON THE WHOLE THING.
     #
     # _context_ok is LEARNED from real 413s, so only a model the hub has actually
@@ -7278,6 +7555,12 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         _lq_tail = [e for e in ordered if _is_low_quality(e[2])]
         if _lq_tail and len(_lq_tail) < len(ordered):
             ordered = [e for e in ordered if not _is_low_quality(e[2])] + _lq_tail
+    # JUNK-BENCHED pairs go behind EVERYTHING above, low-quality tail included
+    # (see _junk_bench_note): a family that is merely weak can still answer;
+    # a pair caught answering garbage three times this hour is the one hop a
+    # fallback must reach last. Ordered last, never deleted -- when it is all
+    # that lives the chain still has somewhere to go.
+    ordered = _bench_last(ordered)
     # Agentic loops burn through the tool-capable pool in bursts, so give them a
     # deeper chain (reaches the still-fresh sibling models when the top providers are
     # momentarily throttled) than a one-shot chat needs.
@@ -9993,6 +10276,10 @@ def _provider_out_status(pid, p, free_models=None):
             except Exception:                                    # noqa: BLE001
                 break
         notes = []
+        # Junk-benched pairs lead the notes: they are the one sideline caused
+        # by what a model SAID rather than by a status code, and "why does it
+        # not use llm7 GLM any more" has no other answer on the card.
+        notes.extend(r["detail"] for r in _junk_bench_rows(pid))
         if ids and len(dead_exp) >= len(ids):
             out.update(status_reason="models_dead", until=int(min(dead_exp)),
                        detail="all %d models dead (re-probed after %d h)" % (
@@ -10056,6 +10343,9 @@ def _provider_row(pid, live_models=False):
         "status_reason": out_status["status_reason"],
         "until": out_status["until"],
         "detail": out_status["detail"],
+        # Live junk benches on this provider (see _junk_bench_note):
+        # [{provider, model, until, count, detail}].
+        "benched": _junk_bench_rows(pid),
         "used_by": _provider_used_by(pid),
         "id": pid,
         "name": p.get("name") or pid,
@@ -11542,10 +11832,14 @@ def _canary_due_pairs(now=None):
         except Exception:                                        # noqa: BLE001
             pass
         picked.append((pid, model))
+    # A JUNK-BENCHED pair is re-asked every _JUNK_BENCH_RECHECK instead of every
+    # 6 h: routing sends it nothing while benched, so the canary is the only
+    # way it can prove itself fixed and lift the bench early.
+    benched = {(p, m) for p, m in picked if _is_pair_benched(p, m)}
     with _canary_lock:
         return [(p, m) for p, m in picked
                 if now - float((_canary_state.get((p, m)) or {}).get("last_probe") or 0)
-                >= _CANARY_INTERVAL]
+                >= (_JUNK_BENCH_RECHECK if (p, m) in benched else _CANARY_INTERVAL)]
 
 
 def _answer_canary_tick(pause=_CANARY_PAUSE):
@@ -19425,6 +19719,7 @@ def _permissive_candidates():
         except Exception:                                        # noqa: BLE001
             continue
     out.sort(reverse=True)
+    out = _bench_last(out)          # a junk-benched host of one is the last pick
     return [(pid, m) for _s, pid, m in out]
 
 
@@ -19656,7 +19951,8 @@ def _record_stream_outcome(pid, model, text, *, tool_calls=False,
             ok = answer_check.inspect(
                 text, prompt_text=prompt_text, tools_offered=tools_offered,
                 finish_reason=finish_reason, last_prompt=last_prompt).get("ok", True)
-        _record_outcome(pid, model, ok)
+        # A stream that failed the gate degenerated: a junk strike, not a miss.
+        _record_outcome(pid, model, ok, junk=not ok)
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -20365,7 +20661,7 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
             # rewrites the message (and its "length" finish) in place.
             gate = _answer_gate(data, payload, False)
             if gate == "junk":
-                _record_outcome(hop_pid, hop_model, False)
+                _record_outcome(hop_pid, hop_model, False, junk=True)
                 continue
             choice = (data.get("choices") or [{}])[0]
             text = ((choice.get("message") or {}).get("content") or "").strip()
@@ -20627,6 +20923,12 @@ def _swarm_rank(cands, difficulty=None):
     afford = [pm for pm in ordered if _quota_headroom(pm[0]) > _SWARM_MIN_HEADROOM]
     drained = [pm for pm in ordered if pm not in afford]
     ordered = afford + drained
+    # JUNK BENCH (see _junk_bench_note): a benched pair takes NO slot while any
+    # other candidate exists. Not merely demoted like `weak` above: the spread
+    # passes below pick by unseen provider/model, so a demoted-but-present
+    # benched pair would still win a slot in pass 1 whenever its provider was
+    # unique -- and a member known to answer junk is worse than a repeat.
+    ordered = _unbenched(ordered, 0, 1)
 
     # SPREAD BY MODEL, NOT ONLY BY PROVIDER.
     #
@@ -20880,7 +21182,7 @@ def _swarm_tool_result(body):
         # race with its clean answer; pure junk loses the slot, never a ban.
         gate = _answer_gate(data, payload, bool(body.get("tools")))
         if gate == "junk":
-            _record_outcome(hop_pid, hop_model, False)
+            _record_outcome(hop_pid, hop_model, False, junk=True)
             return _why("degenerate answer (nothing salvageable)")
         msg = ((data.get("choices") or [{}])[0].get("message") or {})
         _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
@@ -22299,7 +22601,7 @@ def _chat_completions_uncached(body):
                 if gate == "junk":
                     errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
                     last_error = "junk"
-                    _record_outcome(hop_pid, hop_model, False)
+                    _record_outcome(hop_pid, hop_model, False, junk=True)
                     resp.close()
                     continue
                 _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
@@ -22406,7 +22708,7 @@ def _chat_completions_uncached(body):
                 # A 200 that is ONLY degeneration (see _answer_gate): next hop.
                 errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
                 last_error = "junk"
-                _record_outcome(hop_pid, hop_model, False)
+                _record_outcome(hop_pid, hop_model, False, junk=True)
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
@@ -23123,7 +23425,7 @@ def v1_responses(_retry_pass=False):
                 if gate == "junk":
                     errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
                     last_error = "junk"
-                    _record_outcome(hop_pid, hop_model, False)
+                    _record_outcome(hop_pid, hop_model, False, junk=True)
                     resp.close()
                     continue
                 _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
@@ -23188,7 +23490,7 @@ def v1_responses(_retry_pass=False):
                 # A 200 that is ONLY degeneration (see _answer_gate): next hop.
                 errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
                 last_error = "junk"
-                _record_outcome(hop_pid, hop_model, False)
+                _record_outcome(hop_pid, hop_model, False, junk=True)
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
@@ -23922,7 +24224,7 @@ def v1_messages():
                 # A 200 that is ONLY degeneration (see _answer_gate): next hop.
                 errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
                 last_error = "junk"
-                _record_outcome(hop_pid, hop_model, False)
+                _record_outcome(hop_pid, hop_model, False, junk=True)
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")

@@ -34,6 +34,7 @@ import config
 
 # Match the reliability semantics in app.py so the two halves decay together.
 TTL = 7 * 86400            # forget a pair untouched for a week
+RECENT_WINDOW = 24 * 3600  # mirrors app._RECENT_WINDOW (the favoured 24 h bucket)
 SAVE_INTERVAL = 60.0       # seconds between writes; the hot path never blocks on IO
 
 _FILE = "perf-stats.json"
@@ -82,6 +83,13 @@ def load():
             last = float(row.get("last") or 0)
             if ok or fail:
                 outcomes[key] = {"ok": ok, "fail": fail, "last": last}
+                # The 24 h "recent" bucket app._reliability favours (optional:
+                # older files simply lack it, and a stale one is dropped).
+                rstart = float(row.get("rstart") or 0)
+                if rstart and (now - rstart) <= RECENT_WINDOW:
+                    outcomes[key].update(rok=int(row.get("rok") or 0),
+                                         rfail=int(row.get("rfail") or 0),
+                                         rstart=rstart)
             ms, n = float(row.get("ms") or 0), int(row.get("n") or 0)
             if ms > 0 and n > 0:
                 latency[key] = {"ms": ms, "n": n, "last": last}
@@ -115,6 +123,10 @@ def save(outcomes, latency, force=False):
             if o.get("ok") or o.get("fail"):
                 row["ok"] = int(o.get("ok") or 0)
                 row["fail"] = int(o.get("fail") or 0)
+                if o.get("rstart") and (now - float(o.get("rstart") or 0)) <= RECENT_WINDOW:
+                    row["rok"] = int(o.get("rok") or 0)
+                    row["rfail"] = int(o.get("rfail") or 0)
+                    row["rstart"] = round(float(o.get("rstart") or 0), 3)
             if lat.get("n"):
                 row["ms"] = round(float(lat.get("ms") or 0), 1)
                 row["n"] = int(lat.get("n") or 0)
