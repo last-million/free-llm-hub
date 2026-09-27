@@ -12352,7 +12352,14 @@ def index():
 
 @app.route("/favicon.ico")
 def favicon():
-    """Avoid a noisy 404 when no branded favicon asset is installed."""
+    """The branded icon. Browsers ask for /favicon.ico on their own for any
+    page without a <link rel=icon> (the JSON endpoints, the setup page, a
+    bookmark made before the dashboard loaded), and this used to answer 204
+    even though static/calvoun.ico ships -- so those tabs showed a blank globe
+    instead of the owl. 204 stays only as the fallback if the file is gone."""
+    icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "calvoun.ico")
+    if os.path.isfile(icon):
+        return send_file(icon, mimetype="image/x-icon", max_age=86400)
     return Response(status=204)
 
 
