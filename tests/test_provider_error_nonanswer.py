@@ -47,6 +47,35 @@ def test_legit_answers_mentioning_api_keys_are_not_flagged(text):
     assert A._is_upstream_nonanswer(text, prompt="How do I call the API from Python?") is False
 
 
+# MEASURED 2026-09-27, served as the answer on all three protocols: the opening
+# sentence is only ~17% of the page, the rest is what-to-do lines.
+POLLINATIONS_PAGE = (
+    "The API key used for this request has reached its budget. Please [raise the key "
+    "budget](https://enter.pollinations.ai/edit-key?id=xxxx&ref=agent_key_budget), then "
+    "try again.\n\nTopping up the wallet does not raise this limit. If this isn’t "
+    "your Pollinations account, contact whoever runs the app or service you’re using.")
+
+
+@pytest.mark.parametrize("text", [
+    POLLINATIONS_PAGE,
+    "Sign up and repeat your request.",
+    "Your API key has exceeded its quota. Please top up your wallet. Contact support if this persists.",
+])
+def test_multi_sentence_error_pages_are_non_answers(text):
+    assert A._is_upstream_nonanswer(text, prompt="What is 1234 plus 1? Answer with only the number.") is True
+
+
+@pytest.mark.parametrize("text", [
+    # An answer that EXPLAINS a key error to the user, then continues with content.
+    "Your API key has reached its limit. The script retries with backoff, logs each "
+    "attempt, and writes the partial results to out.json so nothing is lost.",
+    "The API key has expired. Rotate it in the console, then update KEY in config.py "
+    "and restart the worker so the new value is loaded.",
+])
+def test_an_answer_that_opens_with_a_key_error_and_goes_on_is_kept(text):
+    assert A._is_upstream_nonanswer(text, prompt="Why does my nightly job stop at 2am?") is False
+
+
 def test_a_question_about_quotas_may_get_a_short_answer_about_them():
     assert A._is_upstream_nonanswer(
         "Your API key has reached its daily limit.",

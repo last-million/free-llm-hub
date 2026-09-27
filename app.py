@@ -22863,7 +22863,20 @@ _PROVIDER_GENERIC_RE = re.compile(
     r"(?:the\s+)?model\s+(?:[`'\"][^`'\"\n]{1,80}[`'\"]\s+|\S+\s+)?(?:is\s+|was\s+)?"
     r"(?:not\s+found|not\s+available|unavailable|not\s+supported|does\s?n[o']?t\s+exist)\b"
     r"|(?:please\s+)?try\s+again\s+later\b"
-    r"|(?:the\s+)?service\s+(?:is\s+)?(?:temporarily\s+)?unavailable\b)", re.I)
+    r"|(?:the\s+)?service\s+(?:is\s+)?(?:temporarily\s+)?unavailable\b"
+    # A relay's sign-up wall. MEASURED 2026-09-27: g4f's Perplexity route
+    # answered reasoning-max with exactly "Sign up and repeat your request."
+    r"|sign\s+(?:up|in)\s+(?:and|to)\s+(?:repeat|retry|resend|continue|use)\b)", re.I)
+# The relay speaking about THIS request -- "The API key used for this request
+# has reached its budget." A model explaining an expired key to a user says
+# "your key", not "this request".
+_PROVIDER_RELAY_VOICE_RE = re.compile(r"\b(?:this|the)\s+request\b|\bthis\s+app\b", re.I)
+# The follow-up lines an error page carries after its opening sentence: what
+# to do about it, never content.
+_PROVIDER_SUPPORT_RE = re.compile(
+    r"try\s+again|top(?:ping)?\s+up|raise\s+(?:the|your)|contact\s+(?:whoever|the|your|support)"
+    r"|wallet|upgrade|sign\s+(?:up|in)|billing|edit-key|dashboard|your\s+account|this\s+limit",
+    re.I)
 # The request's last turn carries TOOL RESULTS (an agent loop): a short reply
 # then faithfully reports a tool's error output ("the registry returned 429
 # Too Many Requests"), which is the answer, not the provider's error page.
@@ -22953,6 +22966,7 @@ def _provider_error_kind(text, prompt=None):
     if prompt and _PROVIDER_ERROR_PROMPT_RE.search(prompt):
         return None
     hit, total, quota, first = 0, 0, False, None
+    first_quota_voice, rest_support = False, True
     for sent in re.split(r"(?<=[.!?])\s+|\n+", s):
         sent = sent.strip()
         if not sent:
@@ -22965,9 +22979,25 @@ def _provider_error_kind(text, prompt=None):
                 hit += len(sent)
                 quota = quota or bool(q)
                 is_hit = True
+                if first is None and q and _PROVIDER_RELAY_VOICE_RE.search(sent):
+                    first_quota_voice = True
         if first is None:
             first = is_hit
-    if not hit or not first or hit < _PROVIDER_ERROR_SHARE * total:
+        elif not is_hit and not _PROVIDER_SUPPORT_RE.search(sent):
+            rest_support = False
+    if not hit or not first:
+        return None
+    # A quota error that OPENS the reply, followed only by what-to-do lines,
+    # is an error page however long those lines are. MEASURED 2026-09-27: a
+    # Pollinations relay answered every tier with "The API key used for this
+    # request has reached its budget. Please raise the key budget ..., then
+    # try again. Topping up the wallet does not raise this limit. If this
+    # isn't your Pollinations account, contact whoever runs the app ..." --
+    # the opening sentence was 17% of the text, under the share rule below,
+    # so it was served as the answer on all three protocols.
+    if quota and (first_quota_voice or rest_support):
+        return "provider_quota"
+    if hit < _PROVIDER_ERROR_SHARE * total:
         return None
     return "provider_quota" if quota else "provider_error"
 
