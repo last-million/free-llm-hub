@@ -97,8 +97,11 @@ def test_manager_only_plans_supervises_reviews_and_verifies():
     out = swarm.run(ASK, d, manager=m)
     assert set(m.purposes()) <= {"plan", "supervise", "review", "verify", "fix"}
     assert m.purposes().count("plan") == 1
-    assert "supervise" in m.purposes() and "review" in m.purposes()
-    assert m.purposes().count("verify") == 2          # one short verdict per phase
+    # ONE batched verdict for the wave (Hero is proven by its quoted literal,
+    # so only Pricing is judged); the verdict did not answer the coverage
+    # question, so the supervisor still asks it. Every phase passed first
+    # time and the manager confirmed coverage: no second look (review).
+    assert m.purposes() == ["plan", "verify", "supervise"]
     # Free models did the work and never planned/supervised/reviewed.
     assert [c["stage"] for c in d.calls if c["stage"] in ("plan", "supervise", "review")] == []
     assert len(d.of("phase")) == 2 and len(d.of("synth")) == 1
@@ -113,8 +116,9 @@ def test_manager_calls_use_small_token_caps_and_clipped_views():
     swarm.run(ASK, d, manager=m)
     caps = {c["purpose"]: c["max_tokens"] for c in m.calls}
     assert caps["plan"] == swarm.MANAGER_PLAN_TOKENS
-    assert caps["verify"] == swarm.MANAGER_VERDICT_TOKENS
-    assert caps["review"] == swarm.MANAGER_REVIEW_TOKENS
+    # The wave's outputs share ONE verdict (Hero is proven by its literal).
+    assert caps["verify"] in (swarm.MANAGER_VERDICT_TOKENS, swarm.MANAGER_CHECK_TOKENS)
+    assert caps.get("review", swarm.MANAGER_REVIEW_TOKENS) == swarm.MANAGER_REVIEW_TOKENS
     # Never a full transcript: every manager prompt is far below one phase.
     for c in m.calls:
         assert c["chars"] < 12000, (c["purpose"], c["chars"])
@@ -166,8 +170,10 @@ def test_mechanical_failure_retries_on_another_free_model():
     assert failing_pid in retries[0]["exclude"]           # a DIFFERENT free model
     assert "Start free" in retries[0]["user"]             # problems became instructions
     assert "fix" not in m.purposes()
-    # The mechanical check caught it for free: only the retry needed a verdict.
-    assert m.purposes().count("verify") == 2
+    # The mechanical check caught it for free, and the retry is PROVEN by the
+    # same check (its only criterion is the quoted literal): one verdict in
+    # all, for Pricing.
+    assert m.purposes().count("verify") == 1
     assert any(r.startswith("phase-retry:Hero") for r, _ in out["models"])
 
 
@@ -232,8 +238,13 @@ def test_fix_refused_keeps_the_last_real_attempt():
 
 # ---- 5. unreadable review ---------------------------------------------------
 
+# A run whose Hero never passed its checks (it ships its last attempt) is not
+# "clean", so the review always runs.
+_NOT_CLEAN = _phase_by_attempt("no call to action", "still no call to action")
+
+
 def test_unreadable_review_is_reasked_then_shipped_with_a_warning():
-    d = _free(review="I think it is fine overall.")
+    d = _free(review="I think it is fine overall.", phase=_NOT_CLEAN)
     m = _manager(dict(GOOD_MGR, review=["looks good to me", "still prose"]))
     out = swarm.run(ASK, d, manager=m)
     assert m.purposes().count("review") == 2
@@ -242,7 +253,7 @@ def test_unreadable_review_is_reasked_then_shipped_with_a_warning():
 
 
 def test_reasked_review_that_parses_is_used():
-    d = _free()
+    d = _free(phase=_NOT_CLEAN)
     m = _manager(dict(GOOD_MGR, review=[
         "prose", '{"verdict": "revise", "problems": ["FAQ missing"]}']))
     out = swarm.run(ASK, d, manager=m)

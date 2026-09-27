@@ -553,6 +553,39 @@ Covered by `tests/test_pipeline_complete.py`.
 - Brevity trims (`_fit_visible_to_caller`, the stream cap) never cut inside a
   token (`_cut_splits_token`): "50648" is never served as "5064".
 
+## Manager pipeline speed (2026-09-27)
+
+Covered by `tests/test_manager_speed.py`. Live: tally.py + tests + README with
+manager sub-claude/sonnet took 772 s and shipped without the tests (the clock
+ran out; each subscription call is 100-150 s).
+
+- **One verdict per WAVE** (`_verify_set` / `_batch_verdict`), not per phase.
+  Free checks first (answer_check, literals, word counts, and for code:
+  `ast` syntax, test count, imports that exist in the module under test —
+  `_code_problems`); their rejections retry FREE before the verdict. A phase
+  whose acceptance the string tests fully decide (`_proven`) gets no verdict.
+  The LAST wave's verdict also answers the supervisor's coverage question and
+  the undecidable enumerated parts (`check_info`) — no separate supervise /
+  parts call. When what ships passed its checks and the manager confirmed
+  coverage, the review is skipped (never for a profile with its own
+  `review_system` or `max_revisions`).
+- **Pipelined waves**: wave k's verdict runs while wave k+1's free workers
+  build on wave k's output; a changed output rebuilds its dependents.
+  Speculative synthesis runs alongside the review. The plan retry goes to the
+  FREE planner. Each manager call has its own deadline (`MANAGER_DEADLINES`,
+  never past the wall clock) and falls back free.
+- **Tests/docs see the code** (`wire_code_deps`): a tests or README phase is
+  made to need the phase producing its .py file (moved after it when listed
+  first) and gets `INTERFACE OF x.py` (signatures + argparse flags) plus test
+  instructions. Retries see the rejected attempt; a manager that cannot fix
+  leaves one free repair pass. A first attempt cut by the cap races the grace
+  re-run.
+- `claude -p` gets `--strict-mcp-config --no-session-persistence
+  --disable-slash-commands` (+ `--tools ""` for a direct .exe) — only the flags
+  its own cached `--help` lists (`_claude_fast_args`).
+- Scaled simulation (manager 110 s, free phase 50 s, synthesis 60 s), tally
+  plan: 6 manager calls / ~550 s before, 3 calls / ~440 s now.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

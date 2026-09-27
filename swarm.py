@@ -61,6 +61,7 @@ crew gets a senior-engineer reviewer, a research crew gets a fact-hunter, and
 so on. `profile=None` reproduces the generic behaviour byte-for-byte, so the
 plain "swarm" model and its tests are untouched by construction.
 """
+import ast
 import difflib
 import json
 import re
@@ -106,8 +107,22 @@ DEP_CONTEXT_CHARS = 6000
 # (never a full transcript) and asked for short answers. The one place it may
 # write at length is fixing a SHORT phase two free models could not get right
 # (a long one, and the final revision, get directed fixes -- see below).
-MANAGER_PLAN_TOKENS = 1500
+# The hub cuts a manager reply at max_tokens*4 chars AFTER the CLI produced
+# (and billed) it, so a cap below a real plan only ever destroys the JSON: a
+# 3-phase plan with inputs/constraints/acceptance runs 4-7K characters.
+MANAGER_PLAN_TOKENS = 2500
 MANAGER_SUPERVISE_TOKENS = 600
+# ONE batched verdict per wave (+ the supervisor's coverage question on the
+# last wave): per-phase entries, so more room than one verdict, far less than
+# one call per phase (MEASURED: 100-150 s per subscription CLI call).
+MANAGER_CHECK_TOKENS = 1200
+CHECK_OUTPUT_CHARS = 6000        # all judged outputs together, in a batched verdict
+CHECK_EARLIER_CHARS = 2400       # already-checked phases, shown for consistency only
+# Each manager call has its OWN deadline (and never outlives the run's wall
+# clock): past it the stage takes its free fallback and the run moves on.
+MANAGER_DEADLINES = {"plan": 150, "verify": 120, "supervise": 120, "review": 150,
+                     "fix": 150}
+MANAGER_MIN_SECONDS = 20         # less left on the clock than this: no manager call
 MANAGER_REVIEW_TOKENS = 800
 MANAGER_VERDICT_TOKENS = 300
 MANAGER_FIX_TOKENS = PHASE_MAX_TOKENS
@@ -293,6 +308,36 @@ _VERDICT_SYSTEM = (
     "problems."
 )
 
+# The same verdict for SEVERAL workers in one manager call (one per wave).
+_BATCH_VERDICT_SYSTEM = (
+    "You check SEVERAL team members' outputs, each against its own task and "
+    "acceptance criteria. You see clipped excerpts; do not fault what may sit "
+    "in the trimmed middle.\n"
+    "Reply with JSON ONLY:\n"
+    '{"phases": [{"n": <phase number>, "ok": true | false, "problems": '
+    '["<concrete, fixable>"]}]}\n'
+    "One entry for every phase under JUDGE THESE. Fail a phase only for a "
+    "missed criterion, a wrong or invented fact, missing required content, the "
+    "wrong format, or an inconsistency with the work it builds on (wrong names, "
+    "signatures, flags or files). Style is not a problem. At most 4 problems "
+    "per phase."
+)
+
+# Added on the LAST wave: the supervisor's coverage question rides on the
+# same call instead of costing another one.
+_CHECK_COVERAGE_SYSTEM = (
+    "\nYou are also the supervisor: against the PLAN, add to the same JSON\n"
+    '"missing": [{"title": "<short>", "task": "<the specific gap to fill>"}]\n'
+    "-- ONLY work that was assigned and genuinely is not there anywhere, or that "
+    "two workers produced incompatibly; at most 2 items, [] when the team "
+    "covered the goal. No polish, no new scope."
+)
+_CHECK_PARTS_SYSTEM = (
+    '\nAlso add "parts_missing": [<numbers of the REQUIRED PARTS genuinely '
+    "absent from ALL the work shown>] -- never one that may sit in a trimmed "
+    "middle."
+)
+
 # The manager writing a phase itself, after two free attempts failed.
 _FIX_SYSTEM = (
     "Two team members failed this phase. Write the phase's output yourself, "
@@ -436,14 +481,21 @@ def _parse_json(text):
         return None
     s = s[i:]
     j = s.rfind("}")
+    best = None
     for candidate in ([s[:j + 1]] if j > 0 else []) + [s]:
         try:
             out = json.loads(candidate)
+            if isinstance(out, dict):
+                return out                # complete, valid JSON: nothing to weigh
         except ValueError:
             out = _repair_json(candidate)
-        if isinstance(out, dict):
-            return out
-    return None
+        # Repaired readings: keep the one that recovered MORE. A reply cut off
+        # mid-object has its last "}" at the end of an EARLIER phase, and the
+        # text up to it silently drops every later (complete) field.
+        if isinstance(out, dict) and (best is None or
+                                      len(json.dumps(out)) > len(json.dumps(best))):
+            best = out
+    return best
 
 
 def _repair_json(s):
@@ -476,8 +528,56 @@ def _repair_json(s):
     try:
         out = json.loads(fixed)
     except ValueError:
-        return None
+        out = _salvage_truncated(s)
     return out if isinstance(out, dict) else None
+
+
+def _salvage_truncated(s):
+    """JSON cut off mid-value (a reply clipped at its token cap: `"inputs": `
+    or `"acceptance": ["inclu`): walk back to the last separator outside a
+    string, drop the half-written member, close what is open. Everything
+    complete before the cut survives. None when nothing does."""
+    cuts, in_str, esc = [], False, False
+    for i, ch in enumerate(s):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if not in_str and ch in ",{[":
+            cuts.append(i)
+    for pos in reversed(cuts[-60:]):
+        cand = s[:pos] if s[pos] == "," else s[:pos + 1]
+        stack, in_str, esc = [], False, False
+        for ch in cand:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch in "{[":
+                stack.append(ch)
+            elif ch in "}]" and stack:
+                stack.pop()
+        cand = re.sub(r",\s*$", "", cand.rstrip())
+        cand += "".join("}" if c == "{" else "]" for c in reversed(stack))
+        try:
+            out = json.loads(re.sub(r",\s*([}\]])", r"\1", cand))
+        except ValueError:
+            continue
+        if isinstance(out, dict):
+            return out
+    return None
 
 
 def _clean_phases(plan):
@@ -623,6 +723,420 @@ def _mechanical_problems(ph, text):
     return problems[:6]
 
 
+# ---- code phases: a Python file, its tests, its docs ------------------------
+# MEASURED 2026-09-27 (manager sub-claude/sonnet): "tally.py + test_tally.py +
+# README" ran 772 s and shipped WITHOUT the tests. Four sequential manager calls
+# ate the wall clock before the tests wave finished -- and nothing tied the
+# tests to the code: a tests worker planned in parallel (the planner is told to
+# maximise parallelism) never sees tally.py and invents an API; one that does
+# see it gets the file clipped, with no list of the names it may import. These
+# helpers wire tests/docs to the code they describe, hand them its interface,
+# and prove the cheap things (syntax, test count, imports that exist) without
+# a paid verdict.
+_PY_FILE_RE = re.compile(r"\b([\w\-]+\.py)\b", re.I)
+_TEST_FILE_RE = re.compile(r"^(?:test_[\w\-]*|[\w\-]*_test)\.py$", re.I)
+_TEST_PHASE_RE = re.compile(r"\b(?:pytest|unit\s*tests?|test\s+suite|tests?\s+file|"
+                            r"test_[\w\-]+\.py|[\w\-]+_test\.py)\b", re.I)
+_DOCS_PHASE_RE = re.compile(r"\b(?:readme|documentation|docs?\s+section|usage\s+section)\b",
+                            re.I)
+_DOCS_NEEDS_CODE_RE = re.compile(r"\b(?:flags?|options?|usage|arguments?|cli|command[- ]line|"
+                                 r"examples?|api)\b", re.I)
+_FENCED_RE = re.compile(r"```[ \t]*([\w+\-.]*)[^\n]*\n(.*?)(?:```|\Z)", re.S)
+_PY_LOOK_RE = re.compile(r"^\s*(?:def |class |import |from [\w.]+ import |@\w|if __name__)",
+                         re.M)
+_ADD_ARG_RE = re.compile(r"add_argument\(\s*((?:[\"'][^\"']+[\"']\s*,?\s*)+)")
+_BACKTICK_RE = re.compile(r"`([^`\n]{1,80})`")
+_DEFINES_RE = re.compile(r"\b(?:define[sd]?|expose[sd]?|export[s]?|provide[sd]?|"
+                         r"call(?:s|ed)?|named)\b", re.I)
+# Words a mechanical check fully accounts for: a criterion left with nothing
+# else after its literals / counts are removed is PROVEN by the check.
+_CHECK_WORDS = frozenset((
+    "mention mentions mentioned name named show shows titled heading headings "
+    "text exact exactly literal string phrase appear appears word words "
+    "test tests pytest function functions table tables markdown json valid "
+    "define defines defined expose exposes export exports call calls called "
+    "provide provides output result present verbatim least most fewer under "
+    "maximum minimum use uses using include includes contain contains has "
+    "named name").split())
+
+
+
+def _py_target(ph):
+    """The Python file this phase produces (lower-case), or "". Title first,
+    then output_format, then the task; a file only MENTIONED as input is not
+    a target unless nothing else names one."""
+    for field in ("title", "output_format", "task"):
+        m = _PY_FILE_RE.search(str(ph.get(field) or ""))
+        if m:
+            return m.group(1).lower()
+    return ""
+
+
+_TEST_TASK_START_RE = re.compile(r"\s*(?:write|create|add|produce|build|implement)?\s*"
+                                 r"(?:a\s+|the\s+)?(?:pytest\b|unit\s*tests?\b|tests?\b)",
+                                 re.I)
+
+
+def _is_test_phase(ph):
+    """Conservative: the title / output format decide; the task only when
+    they name nothing (a code phase whose task says "easy to unit test" is
+    NOT a tests phase)."""
+    title = str(ph.get("title") or "")
+    fmt = str(ph.get("output_format") or "")
+    for field in (title, fmt):
+        m = _PY_FILE_RE.search(field)
+        if m:
+            return bool(_TEST_FILE_RE.match(m.group(1)))
+    # "Tests" / "Unit tests" -- not a bare "test" ("A/B test copy").
+    if _TEST_PHASE_RE.search(title + " " + fmt) or re.search(r"\btests\b", title, re.I):
+        return True
+    task = str(ph.get("task") or "")
+    m = _PY_FILE_RE.search(task)
+    return bool((m and _TEST_FILE_RE.match(m.group(1))) or _TEST_TASK_START_RE.match(task))
+
+
+def _is_docs_phase(ph):
+    """A README / documentation phase (title or output format say so, or,
+    when they name nothing, the task opens with it). Never a tests phase."""
+    title = str(ph.get("title") or "")
+    fmt = str(ph.get("output_format") or "")
+    if _PY_FILE_RE.search(title) or _PY_FILE_RE.search(fmt) or _is_test_phase(ph):
+        return False
+    if _DOCS_PHASE_RE.search(title + " " + fmt):
+        return True
+    return bool(_DOCS_PHASE_RE.search(str(ph.get("task") or "")[:80]))
+
+
+def _code_file(ph):
+    """The NON-test Python file a phase produces, or ""."""
+    t = _py_target(ph)
+    return "" if (not t or _TEST_FILE_RE.match(t) or _is_test_phase(ph)
+                  or _is_docs_phase(ph)) else t
+
+
+def _py_sources(text):
+    """The Python code in a worker's output: every fenced block tagged
+    python/py (or untagged but plainly Python). With no fence at all, the
+    whole text when it starts like code. [] when there is none."""
+    t = text or ""
+    blocks = []
+    for lang, body in _FENCED_RE.findall(t):
+        lang = (lang or "").lower()
+        if lang in ("python", "py", "python3") or (not lang and _PY_LOOK_RE.search(body)):
+            blocks.append(body)
+    if blocks or "```" in t:
+        return blocks
+    first = next((ln for ln in t.splitlines() if ln.strip()), "")
+    if _PY_LOOK_RE.match(first) or first.startswith(("#!", '"""', "# ")):
+        return [t]
+    return []
+
+
+def _syntax_error(code):
+    """"line N: msg" when `code` is not valid Python, else ""."""
+    try:
+        ast.parse(code)
+        return ""
+    except SyntaxError as exc:
+        return "line %s: %s" % (exc.lineno, exc.msg)
+    except (ValueError, RecursionError, MemoryError):
+        return ""
+
+
+def _top_names(code, imports=True):
+    """Names a module defines at top level (functions, classes, assignments,
+    and -- unless imports=False -- the names it imports, which a test may
+    legally import from it too). None when it does not parse."""
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for tgt in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                for n in ast.walk(tgt):
+                    if isinstance(n, ast.Name):
+                        names.add(n.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)) and imports:
+            for a in node.names:
+                names.add((a.asname or a.name).split(".")[0])
+        elif isinstance(node, (ast.If, ast.Try)):
+            for sub in ast.walk(node):
+                if isinstance(sub, (ast.FunctionDef, ast.ClassDef)):
+                    names.add(sub.name)
+    return names
+
+
+def _interface(code, limit=1500):
+    """A short, exact interface of a Python module: top-level signatures,
+    classes with their public methods, and the command-line flags it
+    registers with argparse. "" when it does not parse."""
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return ""
+    lines = []
+
+    def _sig(fn):
+        try:
+            args = ast.unparse(fn.args)
+        except Exception:                                       # noqa: BLE001
+            args = "..."
+        ret = ""
+        if getattr(fn, "returns", None) is not None:
+            try:
+                ret = " -> " + ast.unparse(fn.returns)
+            except Exception:                                   # noqa: BLE001
+                ret = ""
+        return "def %s(%s)%s" % (fn.name, args, ret)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            lines.append(_sig(node))
+        elif isinstance(node, ast.ClassDef):
+            lines.append("class %s" % node.name)
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and \
+                        (not sub.name.startswith("_") or sub.name == "__init__"):
+                    lines.append("    " + _sig(sub))
+    flags = []
+    for m in _ADD_ARG_RE.finditer(code):
+        for f in re.findall(r"[\"']([^\"']+)[\"']", m.group(1)):
+            if f not in flags:
+                flags.append(f)
+    if flags:
+        lines.append("command-line arguments (argparse): " + ", ".join(flags))
+    if re.search(r"^if\s+__name__\s*==\s*[\"']__main__[\"']", code, re.M):
+        lines.append("runs as a script (if __name__ == \"__main__\")")
+    out = "\n".join(lines)
+    return out if len(out) <= limit else out[:limit - 3].rstrip() + "..."
+
+
+def _test_count_wanted(ph, request=""):
+    """N from "at least N tests" in the phase (or the user's part it serves)."""
+    for src in (_phase_text(ph), request or ""):
+        m = _AT_LEAST_TESTS_RE.search(src or "")
+        if m:
+            return int(m.group(1))
+    return 1
+
+
+def _code_problems(ph, text, deps=None, request=""):
+    """Problems a parser can PROVE in a code phase's output, never a guess:
+    Python that does not parse, a tests file with too few test functions,
+    tests that import names the module they test does not define, or that
+    never touch it at all. `deps` = {module stem: its code} for the Python
+    files this phase was built on."""
+    testy = _is_test_phase(ph)
+    target = _py_target(ph) if testy else _code_file(ph)
+    if (not target and not testy) or _is_docs_phase(ph):
+        return []
+    if testy and not target and not deps and not re.search(
+            r"pytest|\.py\b|python|unittest", _phase_text(ph), re.I):
+        return []                   # tests of something that is not Python code
+    srcs = _py_sources(text)
+    if not srcs:
+        if target or testy:
+            return ["no Python code found -- return the complete %s in one fenced "
+                    "```python block" % (target or "test file")]
+        return []
+    problems = []
+    for code in srcs:
+        err = _syntax_error(code)
+        if err:
+            problems.append("%s is not valid Python (%s) -- return the complete, "
+                            "runnable file" % (target or "the code", err))
+            break
+    if not testy:
+        return problems[:4]
+    joined = "\n".join(srcs)
+    want = _test_count_wanted(ph, request)
+    have = len(re.findall(r"^\s*(?:async\s+)?def\s+test_\w+", joined, re.M))
+    if have < want:
+        problems.append("only %d test function%s (def test_...); at least %d required"
+                        % (have, "" if have == 1 else "s", want))
+    for stem, code in (deps or {}).items():
+        names = _top_names(code)
+        if names is None:
+            continue
+        uses = re.search(r"^\s*(?:from\s+%s\s+import|import\s+%s\b)" % (re.escape(stem),
+                                                                      re.escape(stem)),
+                         joined, re.M) or ("%s.py" % stem) in joined
+        if not uses:
+            problems.append("the tests never import %s (the module under test, "
+                            "%s.py) -- test the real code, do not re-implement or stub "
+                            "it" % (stem, stem))
+            continue
+        bad = []
+        for m in re.finditer(r"^\s*from\s+%s\s+import\s+\(?([^)\n]+)" % re.escape(stem),
+                             joined, re.M):
+            for nm in re.split(r"\s*,\s*", m.group(1)):
+                nm = nm.strip().split(" as ")[0].strip(" ()\\")
+                if nm and nm != "*" and nm not in names and nm not in bad:
+                    bad.append(nm)
+        if re.search(r"^\s*import\s+%s\b" % re.escape(stem), joined, re.M):
+            # Only CALLS through the module (`tally.count(`): a bare
+            # "tally.txt" in a string is a file name, not an attribute.
+            for nm in re.findall(r"(?<![\w.\"'/\\])%s\.([A-Za-z_]\w*)\s*\(" % re.escape(stem),
+                                 joined):
+                if nm not in names and nm not in bad:
+                    bad.append(nm)
+        if bad:
+            real = sorted(n for n in (_top_names(code, imports=False) or names)
+                          if not n.startswith("_"))
+            problems.append("the tests use %s from %s, which %s.py does not define "
+                            "(it defines: %s) -- test the real API"
+                            % (", ".join(bad[:6]), stem, stem, ", ".join(real[:15]) or "nothing"))
+    return problems[:4]
+
+
+def _criterion_proven(crit, text):
+    """True when string tests DECIDE acceptance criterion `crit` and it holds
+    (every quoted/backticked literal it requires is present, word/test counts,
+    a markdown table, valid JSON) and nothing in it is left unchecked. None =
+    a string test cannot decide it (the manager judges); False = it fails."""
+    low = (text or "").lower()
+    rest = " %s " % crit.lower()
+    decided = False
+    lits = _QUOTED_RE.findall(crit) + _BACKTICK_RE.findall(crit)
+    if lits and (_MUST_HAVE_RE.search(crit) or _DEFINES_RE.search(crit)):
+        for lit in lits:
+            key = lit.strip().lower()
+            key = key[:-2] if key.endswith("()") else key
+            if key and key not in low:
+                return False
+            rest = rest.replace(lit.lower(), " ")
+        decided = True
+    words = len(re.findall(r"\w+", text or ""))
+    for rx, ok in ((_MIN_WORDS_RE, lambda n: words >= n),
+                   (_MAX_WORDS_RE, lambda n: words <= int(n * 1.5))):
+        m = rx.search(crit)
+        if m:
+            if not ok(int(m.group(1))):
+                return False
+            rest = rest.replace(m.group(0).lower(), " ")
+            decided = True
+    m = _AT_LEAST_TESTS_RE.search(crit)
+    if m:
+        if len(_TEST_FN_RE.findall(text or "")) < int(m.group(1)):
+            return False
+        rest = rest.replace(m.group(0).lower(), " ")
+        decided = True
+    if re.search(r"\bmarkdown\s+table\b", rest):
+        if not _MD_TABLE_RE.search(text or ""):
+            return False
+        decided = True
+    if re.search(r"\bvalid\s+json\b", rest):
+        if not _looks_like_json(text):
+            return False
+        decided = True
+    if not decided:
+        return None
+    left = [w for w in _part_keywords(rest)
+            if w not in _CHECK_WORDS and _norm_word(w) not in _CHECK_WORDS]
+    return True if not left else None
+
+
+def _verdict_problems(v):
+    """[] for a passing (or unreadable) verdict, else its problems."""
+    if not isinstance(v, dict) or "ok" not in v:
+        return []
+    if v.get("ok") is True or str(v.get("ok")).lower() == "true":
+        return []
+    return _str_list(v.get("problems"), 4, 300) or \
+        ["the manager rejected the output without detail — re-check every criterion"]
+
+
+def _proven(ph, text):
+    """Every acceptance criterion of `ph` decided and passed by string tests
+    (see _criterion_proven) -- the manager's verdict would add nothing. False
+    when there are no criteria: nothing to prove, the manager judges."""
+    crit = ph.get("acceptance") or []
+    return bool(crit) and all(_criterion_proven(c, text) is True for c in crit)
+
+
+def _reorder(phases, order):
+    """`phases` in `order` (a permutation of 1-based indexes), `needs`
+    renumbered; a need that would now point forward is dropped (the scheduler
+    only ever runs lower-numbered dependencies first)."""
+    new_of = {old: new for new, old in enumerate(order, 1)}
+    out = []
+    for new, old in enumerate(order, 1):
+        ph = dict(phases[old - 1])
+        ph["needs"] = [new_of[n] for n in ph["needs"] if new_of.get(n, new) < new]
+        out.append(ph)
+    return out
+
+
+def _requires(phases, a, b):
+    """True when phase `a` (transitively) needs phase `b`."""
+    seen, stack = set(), list(phases[a - 1]["needs"])
+    while stack:
+        n = stack.pop()
+        if n == b:
+            return True
+        if n not in seen and 1 <= n <= len(phases):
+            seen.add(n)
+            stack.extend(phases[n - 1]["needs"])
+    return False
+
+
+def wire_code_deps(phases):
+    """Tests and docs are built ON the code they describe. A tests phase (or
+    a README/docs phase that documents flags, usage or an API) that the plan
+    left independent of the phase producing that Python file gets it as a
+    dependency -- moved after it when the planner listed it first. Returns
+    (phases, notes); `notes` names each wiring made (for the event trail)."""
+    try:
+        code = {}
+        for i, ph in enumerate(phases, 1):
+            f = _code_file(ph)
+            if f and f not in code:
+                code[f] = i
+        if not code:
+            return phases, []
+        notes = []
+        k = 1
+        while k <= len(phases):
+            ph = phases[k - 1]
+            testy, docs = _is_test_phase(ph), _is_docs_phase(ph)
+            if not (testy or docs):
+                k += 1
+                continue
+            text = _phase_text(ph).lower()
+            want = [f for f in code if f in text or ("test_" + f) in text
+                    or (f[:-3] + "_test.py") in text]
+            if not want and len(code) == 1 and (testy or _DOCS_NEEDS_CODE_RE.search(text)):
+                want = list(code)
+            moved = False
+            for f in want:
+                j = code[f]
+                if j == k or j in ph["needs"]:
+                    continue
+                if j < k:
+                    ph["needs"] = sorted(set(ph["needs"]) | {j})
+                    notes.append("%s builds on %s" % (_short(ph["title"], 30), f))
+                    continue
+                if _requires(phases, j, k):
+                    continue            # the code needs this phase: leave it
+                order = [n for n in range(1, len(phases) + 1) if n != k]
+                order.insert(order.index(j) + 1, k)
+                phases = _reorder(phases, order)
+                code = {cf: (ci - 1 if k < ci <= j else ci) for cf, ci in code.items()}
+                newk = code[f] + 1
+                phases[newk - 1]["needs"] = sorted(set(phases[newk - 1]["needs"]) | {code[f]})
+                notes.append("%s moved after %s" % (_short(ph["title"], 30), f))
+                moved = True
+                break
+            if not moved:
+                k += 1
+        return phases, notes
+    except Exception:                                           # noqa: BLE001
+        return phases, []
+
+
 _PHASE_SCAN_RE = re.compile(
     r'"title"\s*:\s*"([^"]{1,120})"\s*,\s*(?:\n\s*)?"task"\s*:\s*"([^"]{1,2000})"'
     r'(?:\s*,\s*"done_when"\s*:\s*"([^"]{0,300})")?', re.S)
@@ -648,6 +1162,14 @@ def _phases_from_text(text):
             out.append({"title": title.strip(), "task": task.strip(),
                         "done_when": (done or "").strip(), "needs": []})
     return out[:MAX_PHASES]
+
+
+def _best_phases(plan, text):
+    """The parsed plan's phases, unless scanning the raw text recovers MORE
+    of them (a salvaged, truncated or unbalanced reply parses to a stub)."""
+    parsed = _clean_phases(plan)
+    scanned = _phases_from_text(text) if len(parsed) < MAX_PHASES else []
+    return scanned if len(scanned) > len(parsed) else parsed
 
 
 def _usable(phases):
@@ -899,7 +1421,7 @@ def _waves(phases):
     return out
 
 
-def _gather(fn, items, timeout, need_one=False):
+def _gather(fn, items, timeout, need_one=False, leftovers=None):
     """Run fn(item) for every item concurrently; {item: (text, who)} for the
     ones that finished within `timeout` seconds (None = wait for all).
 
@@ -910,7 +1432,10 @@ def _gather(fn, items, timeout, need_one=False):
     would make the wall-clock cap in run() wait for the very stragglers it
     exists to stop waiting for. Abandoned workers are bounded by the
     dispatcher's own per-hop deadline. One worker raising must not kill the
-    others."""
+    others.
+
+    `leftovers` (a dict): receives {item: future} for the calls still running
+    when it stopped waiting, so a later stage can still take their answer."""
     out = {}
 
     def _have_text():
@@ -933,6 +1458,10 @@ def _gather(fn, items, timeout, need_one=False):
                     out[item] = fut.result()
                 except Exception:                                # noqa: BLE001
                     out[item] = ("", None)
+        if leftovers is not None:
+            for fut, item in pending.items():
+                if not fut.cancelled():
+                    leftovers[item] = fut
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     return out
@@ -1073,20 +1602,43 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     # stage fall back to `dispatch`, so a manager can only ever add quality.
     mgr_spent = [0]
     mgr_secs = []                    # measured duration of each manager call
+    mgr_calls = []                   # the purpose of each manager call made
     mgr_lock = threading.Lock()
+    staged_by_manager = [False]      # did the last _staged() call get the manager's answer
     extras = {}
 
     def _mgr(msgs, max_tokens, purpose):
         if manager is None:
             return "", None
+        # Its OWN deadline, never past the wall clock: a subscription CLI that
+        # is still thinking when the stage is due is abandoned (its thread and
+        # CLI finish in the background, bounded by the hub's CLI timeout) and
+        # the stage takes its free fallback -- the run never waits on it.
+        limit = float(MANAGER_DEADLINES.get(purpose, 150))
+        left = _left()
+        if left is not None:
+            if left < min(MANAGER_MIN_SECONDS, 0.1 * clock[1]):
+                emit(purpose, "%ds left on the clock — no manager call" % int(left))
+                return "", None
+            limit = min(limit, left)
+        box = {}
+
+        def _call():
+            try:
+                box["out"] = manager(msgs, max_tokens, purpose)
+            except Exception:                                   # noqa: BLE001
+                box["out"] = None
         t0 = time.monotonic()
-        try:
-            out = manager(msgs, max_tokens, purpose)
-        except Exception:                                       # noqa: BLE001
+        th = threading.Thread(target=_call, daemon=True, name="swarm-manager")
+        th.start()
+        th.join(limit)
+        with mgr_lock:
+            mgr_secs.append(time.monotonic() - t0)
+            mgr_calls.append(purpose)
+        if th.is_alive():
+            emit(purpose, "manager gave no answer within %ds — free models" % int(limit))
             return "", None
-        finally:
-            with mgr_lock:
-                mgr_secs.append(time.monotonic() - t0)
+        out = box.get("out")
         if not isinstance(out, (tuple, list)) or len(out) < 2:
             return "", None
         text = out[0] if isinstance(out[0], str) else ""
@@ -1106,9 +1658,11 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                 exclude=None):
         """One manager-eligible stage: the manager on a clipped view first,
         else the free dispatch with EXACTLY the call it always made."""
+        staged_by_manager[0] = False
         if manager is not None:
             text, who = _mgr(mgr_msgs or free_msgs, mgr_tokens or free_tokens, purpose)
             if text:
+                staged_by_manager[0] = True
                 return text, who
             emit(purpose, "manager unavailable — free models")
         if exclude is None:
@@ -1118,6 +1672,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     def _finish(result):
         if manager is not None:
             result["manager_tokens"] = mgr_spent[0]
+            with mgr_lock:
+                result["manager_calls"] = len(mgr_calls)
             result.update(extras)
         return result
 
@@ -1143,7 +1699,7 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     if plan_model:
         models_used.append(("plan", plan_model))
     plan = _parse_json(plan_text) or {}
-    phases = _usable(_clean_phases(plan) or _phases_from_text(plan_text))
+    phases = _usable(_best_phases(plan, plan_text))
     if not phases:
         # ONE retry before giving up on having a team at all. The plan is the
         # linchpin — without it the swarm degrades to a single model, which is
@@ -1155,16 +1711,17 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                   'with }. No prose, no fence, no explanation. Shape:\n'
                   '{"goal":"...","phases":[{"title":"...","task":"...",'
                   '"done_when":"...","needs":[]}]}')
-        plan_text, plan_model = _staged(
+        # The retry goes to the FREE planner even with a manager: a second
+        # subscription call is another 30-150 s on the critical path (MEASURED:
+        # the tally run paid two plan calls), a free planner answers in a few
+        # seconds, and the coverage check below still holds it to every part.
+        plan_text, plan_model = dispatch(
             [{"role": "system", "content": plan_system},
-             {"role": "user", "content": brief + strict}], PLAN_MAX_TOKENS, "plan",
-            mgr_msgs=[{"role": "system", "content": plan_system},
-                      {"role": "user", "content": mgr_brief + strict}],
-            mgr_tokens=MANAGER_PLAN_TOKENS)
+             {"role": "user", "content": brief + strict}], PLAN_MAX_TOKENS)
         if plan_model:
             models_used.append(("plan:retry", plan_model))
         plan = _parse_json(plan_text) or {}
-        phases = _usable(_clean_phases(plan) or _phases_from_text(plan_text))
+        phases = _usable(_best_phases(plan, plan_text))
     single = not phases
     if not phases:
         # Planner failed or returned junk -> ONE phase that is the original ask.
@@ -1195,7 +1752,7 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
             if m2:
                 models_used.append(("plan:coverage", m2))
             p2 = _parse_json(t2) or {}
-            ph2 = _usable(_clean_phases(p2) or _phases_from_text(t2))
+            ph2 = _usable(_best_phases(p2, t2))
             if ph2 and len(_uncovered(parts, ph2)) < len(missing):
                 plan, phases = p2, ph2
                 missing = _uncovered(parts, phases)
@@ -1218,6 +1775,12 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                     "done_when": "", "needs": list(roots)})
             emit("plan", "added %d phase%s for required parts the plan missed"
                  % (len(groups), "" if len(groups) == 1 else "s"))
+
+    # ---- 1b'. CODE DEPENDENCIES — tests and docs see the code they describe --
+    if not single:
+        phases, wired = wire_code_deps(phases)
+        if wired:
+            emit("plan", "wired: " + "; ".join(wired))
 
     # ---- 1c. BUDGET — sized to the plan, not a flat number --------------------
     if clock[0] is not None:
@@ -1264,12 +1827,55 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                 + _clip(brief, WORKER_BRIEF_CHARS))
 
     def _run_phase(idx):
+        """One worker's first attempt. With a manager, the checks run per
+        WAVE afterwards (_verify_set), not here, so one verdict covers them all."""
+        return dispatch(_phase_msgs(idx), PHASE_MAX_TOKENS)
+
+    def _dep_code(idx):
+        """{module stem: its Python source} for the code files phase `idx`
+        builds on (its `needs` that produce a .py file and produced code)."""
+        out = {}
+        for n in phases[idx - 1]["needs"]:
+            f = _code_file(phases[n - 1])
+            if f and outputs.get(n):
+                src = "\n".join(_py_sources(outputs[n]))
+                if src.strip():
+                    out[f[:-3]] = src
+        return out
+
+    def _code_brief(idx):
+        """The exact interface of every code file this phase builds on, and --
+        for a tests phase -- how to test it. "" without code dependencies, so
+        every other worker prompt is byte-identical to before."""
+        deps = _dep_code(idx)
+        if not deps:
+            return ""
         ph = phases[idx - 1]
-        msgs = _phase_msgs(idx)
-        first = dispatch(msgs, PHASE_MAX_TOKENS)
-        if manager is None:
-            return first
-        return _verified(idx, ph, msgs, first)
+        out = []
+        for stem, src in deps.items():
+            iface = _interface(src)
+            if iface:
+                out.append("\n\nINTERFACE OF %s.py (module `%s`) -- use exactly these "
+                           "names, signatures and flags; never rename, re-implement "
+                           "or stub them:\n%s" % (stem, stem, iface))
+        if _is_test_phase(ph):
+            stem = next(iter(deps))
+            out.append(
+                "\n\nHOW TO WRITE THESE TESTS\n"
+                "- Import the real module: `import %s` or `from %s import ...` (%s.py "
+                "sits next to the test file). Never paste, re-implement or mock the "
+                "module under test.\n"
+                "- Call only names from the interface above. For the command line use "
+                "main(argv) when main takes an argv parameter, else subprocess.run("
+                "[sys.executable, str(Path(__file__).with_name(\"%s.py\")), ...], "
+                "capture_output=True, text=True).\n"
+                "- pytest style: tmp_path for files, capsys for printed output, plain "
+                "assert statements.\n"
+                "- At least %d test functions named test_*, each one passing against "
+                "the code shown above.\n"
+                "- Output ONLY the complete test file, in one ```python block."
+                % (stem, stem, stem, stem, _test_count_wanted(ph, request)))
+        return "".join(out)
 
     def _phase_msgs(idx):
         """The worker conversation for phase `idx` (its own fresh context)."""
@@ -1288,15 +1894,17 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         # Appended AFTER the context so a phase without brief fields sends the
         # exact prompt the plain pipeline always sent.
         user += _render_brief(ph)
+        user += _code_brief(idx)
         user += _worker_brief(ph["task"])
         return [{"role": "system", "content": phase_system},
                 {"role": "user", "content": user}]
 
-    def _phase_problems(ph, text, trail):
-        """[] when the output passes, else concrete problems. Cheap checks
-        first (they cost nothing); the manager is asked only about an output
-        that already passed them, and only on a clipped excerpt. An unreadable
-        verdict passes — a checker must never be what loses a phase."""
+    def _cheap_problems(idx, text):
+        """Problems the free checks PROVE (they cost nothing): empty output,
+        degenerate output (answer_check), quoted literals / word counts /
+        JSON-HTML format, and -- for code -- syntax, test count and imports
+        that do not exist in the module under test."""
+        ph = phases[idx - 1]
         if not (text or "").strip():
             return ["the output was empty"]
         if answer_check is not None:
@@ -1307,28 +1915,110 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
             if not v.get("ok", True):
                 return ["the output degenerated (%s) — produce clean, complete "
                         "output only" % ", ".join(v.get("reasons") or ["junk"])]
-        mech = _mechanical_problems(ph, text)
-        if mech:
-            return mech
+        return (_mechanical_problems(ph, text)
+                + _code_problems(ph, text, _dep_code(idx), request))[:6]
+
+    def _acceptance(ph):
         crit = ph.get("acceptance") or ([ph["done_when"]] if ph.get("done_when") else [])
-        v_text, v_who = _mgr(
-            [{"role": "system", "content": _VERDICT_SYSTEM},
-             {"role": "user", "content":
-              "TASK: %s\n%s\n\nACCEPTANCE\n- %s%s\n\nOUTPUT (excerpt)\n%s"
-              % (ph["title"], _clip(ph["task"], 1200),
-                 "\n- ".join(crit) if crit else "(none stated — judge against the task)",
-                 ("\n\nOUTPUT FORMAT: " + ph["output_format"]) if ph.get("output_format") else "",
-                 _clip(text, VERDICT_OUTPUT_CHARS))}],
-            MANAGER_VERDICT_TOKENS, "verify")
-        if v_who:
-            trail.append(("verify:%s" % ph["title"], v_who))
-        verdict = _parse_json(v_text)
-        if not isinstance(verdict, dict) or "ok" not in verdict:
-            return []
-        if verdict.get("ok") is True or str(verdict.get("ok")).lower() == "true":
-            return []
-        return _str_list(verdict.get("problems"), 4, 300) or \
-            ["the manager rejected the output without detail — re-check every criterion"]
+        return "\n- ".join(crit) if crit else "(none stated — judge against the task)"
+
+    def _batch_verdict(idxs, texts, final, current=None):
+        """ONE manager verdict for the phases `idxs` -> ({idx: problems},
+        info, who). A phase a readable reply leaves out passes, and an
+        unreadable reply passes them all: a checker must never be what loses
+        a phase. `final` (the last wave of a team) also asks the supervisor's
+        coverage question -- and which enumerated parts no marker can judge
+        are absent -- in the SAME call; `info` then carries {"missing",
+        "parts_missing"} (None when the reply was unreadable)."""
+        combined = final and len(phases) > 1
+        if len(idxs) == 1 and not combined:
+            i = idxs[0]
+            ph = phases[i - 1]
+            v_text, who = _mgr(
+                [{"role": "system", "content": _VERDICT_SYSTEM},
+                 {"role": "user", "content":
+                  "TASK: %s\n%s\n\nACCEPTANCE\n- %s%s\n\nOUTPUT (excerpt)\n%s"
+                  % (ph["title"], _clip(ph["task"], 1200), _acceptance(ph),
+                     ("\n\nOUTPUT FORMAT: " + ph["output_format"]) if ph.get("output_format") else "",
+                     _clip(texts[i], VERDICT_OUTPUT_CHARS))}],
+                MANAGER_VERDICT_TOKENS, "verify")
+            v = _parse_json(v_text)
+            if not isinstance(v, dict) or "ok" not in v:
+                return None, None, who
+            return {i: _verdict_problems(v)}, None, who
+        per =max(1000, min(VERDICT_OUTPUT_CHARS, CHECK_OUTPUT_CHARS // max(1, len(idxs))))
+        blocks = []
+        for i in idxs:
+            ph = phases[i - 1]
+            dep_titles = [phases[n - 1]["title"] for n in ph["needs"]]
+            blocks.append(
+                "### PHASE %d: %s\nTASK: %s\nACCEPTANCE\n- %s%s%s\nOUTPUT (excerpt)\n%s"
+                % (i, ph["title"], _clip(ph["task"], 700), _acceptance(ph),
+                   ("\nOUTPUT FORMAT: " + ph["output_format"]) if ph.get("output_format") else "",
+                   ("\nBUILDS ON: " + ", ".join(dep_titles)) if dep_titles else "",
+                   _clip(texts[i], per)))
+        system = _BATCH_VERDICT_SYSTEM
+        user = "GOAL\n%s\n\n" % _clip(goal, 1500)
+        unknown_parts = []
+        if combined:
+            plan_lines = "\n".join("%d. %s — %s" % (k, p["title"], _clip(p["task"], 300))
+                                   for k, p in enumerate(phases, 1))
+            user += "PLAN\n%s\n\n" % _clip(plan_lines, 3000)
+            # The rest of the work as it stands NOW (`current` = this wave's
+            # latest texts, retries included), not as it first came back.
+            now = dict(outputs)
+            now.update({k: v for k, v in (current or {}).items() if (v or "").strip()})
+            earlier = [k for k in sorted(now) if k not in idxs]
+            if earlier:
+                each = max(400, CHECK_EARLIER_CHARS // len(earlier))
+                user += ("OTHER WORK (already checked, or settled by the free checks -- "
+                         "for coverage and consistency only)\n%s\n\n" % "\n\n".join(
+                             "## %d. %s\n%s" % (k, phases[k - 1]["title"], _clip(now[k], each))
+                             for k in earlier))
+            system += _CHECK_COVERAGE_SYSTEM
+            # A part without markers is undecidable whatever the text says, so
+            # this is exactly the set the parts check would ask about later.
+            unknown_parts = [k for k, p in enumerate(parts, 1) if _part_present(p, "") is None]
+            if unknown_parts:
+                user += "REQUIRED PARTS (the user enumerated these)\n%s\n\n" % "\n".join(
+                    "%d. %s" % (k, parts[k - 1]) for k in unknown_parts)
+                system += _CHECK_PARTS_SYSTEM
+        user += "JUDGE THESE\n" + "\n\n".join(blocks)
+        if combined:
+            # It may be the LAST manager look at the work (the review is skipped
+            # when it passes everything), so it sees the brief as the review
+            # would: the request and a short excerpt of the conversation.
+            user += "\n\nTHE USER'S BRIEF\n%s" % _clip(mgr_brief, 3500)
+        v_text, who = _mgr([{"role": "system", "content": system},
+                            {"role": "user", "content": user}],
+                           MANAGER_CHECK_TOKENS, "verify")
+        v = _parse_json(v_text)
+        res = {i: [] for i in idxs}
+        info = None
+        if not isinstance(v, dict) or not (isinstance(v.get("phases"), list) or "ok" in v):
+            res = None                    # unreadable: every phase passes, unjudged
+        if isinstance(v, dict):
+            entries = v.get("phases")
+            if isinstance(entries, list):
+                for e in entries:
+                    if not isinstance(e, dict):
+                        continue
+                    try:
+                        n = int(e.get("n", e.get("phase")))
+                    except (TypeError, ValueError):
+                        continue
+                    if n in res:
+                        res[n] = _verdict_problems(e)
+            elif "ok" in v:
+                # One verdict for the lot (a reply in the single-phase shape).
+                p = _verdict_problems(v)
+                res = {i: list(p) for i in idxs}
+            if combined:
+                miss, pm = v.get("missing"), v.get("parts_missing")
+                info = {"missing": miss if isinstance(miss, list) else None,
+                        "parts_missing": (pm if isinstance(pm, list) else None)
+                        if unknown_parts else []}
+        return res, info, who
 
     def _apply_problems(work, text, extra_check):
         """Free checks on an applied fix, before any verdict is paid for."""
@@ -1435,38 +2125,35 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
             emit("fix", "%s: %s" % (label[:30], rejected[0][:44]))
         return "", None, trail
 
-    def _verified(idx, ph, msgs, first):
-        """Check one worker's output; on failure retry ONCE on a different free
-        model with the problems as instructions; after two failures the manager
-        writes the phase itself (the only call where it spends many tokens).
-        Returns (text, who, trail) — trail is every (role, model) it used."""
+    def _retry_msgs(idx, problems, prev):
+        """The worker conversation again, plus the problems to fix -- and the
+        rejected attempt itself (clipped) when it is worth repairing rather
+        than regenerating: a test file with one wrong import is fixed in
+        place, not rewritten from nothing. Never a degenerate/empty one."""
+        msgs = _phase_msgs(idx)
+        extra = ("\n\nA PREVIOUS ATTEMPT AT THIS PHASE WAS REJECTED. Fix every one "
+                 "of these problems:\n- " + "\n- ".join(problems))
+        broken = any(str(p).startswith(("the output degenerated", "the output was empty"))
+                     for p in problems)
+        if (prev or "").strip() and not broken:
+            extra += ("\n\nTHE REJECTED ATTEMPT (keep what is right, fix the problems "
+                      "above, return the COMPLETE corrected output -- not a diff):\n"
+                      + _clip(prev, DEP_CONTEXT_CHARS))
+        return [msgs[0], {"role": "user", "content": msgs[1]["content"] + extra}]
+
+    def _fix_one(idx, fallback, problems, failed):
+        """After two rejected free attempts: the manager fixes the phase (it
+        writes a SHORT one itself, DIRECTS the fix of a long one), and when
+        it cannot -- unavailable, past its deadline, fix rejected -- ONE free
+        repair pass with the problems and the rejected attempt, on a provider
+        that has not failed it yet, kept only if the free checks pass.
+        Returns (text, who, trail); "" = keep the last real attempt."""
+        ph = phases[idx - 1]
         title = ph["title"]
         trail = []
-        text, used = first
-        if used:
-            trail.append(("phase:%s" % title, used))
-        failed = set()
-        fallback = text or ""
-        problems = []
-        for attempt in (1, 2):
-            problems = _phase_problems(ph, text, trail)
-            if not problems:
-                return text, used, trail
-            emit("verify", "%s: %s" % (title[:30], problems[0][:44]))
-            if used:
-                failed.add(used.split("/", 1)[0])
-            if (text or "").strip():
-                fallback = text
-            if attempt == 2 or _spent():
-                break
-            retry = [msgs[0], {"role": "user", "content":
-                               msgs[1]["content"] + "\n\nA PREVIOUS ATTEMPT AT THIS "
-                               "PHASE WAS REJECTED. Fix every one of these problems:\n- "
-                               + "\n- ".join(problems)}]
-            text, used = dispatch(retry, PHASE_MAX_TOKENS, exclude_pids=tuple(failed))
-            if used:
-                trail.append(("phase-retry:%s" % title, used))
-        if not _spent() and len(fallback) > VERDICT_OUTPUT_CHARS:
+        if _spent():
+            return "", None, trail
+        if len(fallback) > VERDICT_OUTPUT_CHARS:
             # LONG output: the manager would rewrite it from an excerpt and
             # drop the trimmed middle. It directs the fix instead; a free model
             # (not one of the two that failed) applies it to the full text.
@@ -1479,14 +2166,15 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                 "OVERALL GOAL\n%s\n\nPHASE: %s\n%s%s%s"
                 % (goal, title, ph["task"],
                    ("\n\nDone when: " + ph["done_when"]) if ph.get("done_when") else "",
-                   _render_brief(ph)),
+                   _render_brief(ph) + _code_brief(idx)),
                 fallback, problems, PHASE_MAX_TOKENS, exclude=tuple(failed),
-                extra_check=lambda t: _mechanical_problems(ph, t))
+                extra_check=lambda t: (_mechanical_problems(ph, t)
+                                       + _code_problems(ph, t, _dep_code(idx), request)))
             trail.extend(fix_trail)
             if fix_text:
                 emit("verify", "%s: fixed as the manager directed" % title[:30])
                 return fix_text, fix_who, trail
-        elif not _spent():
+        else:
             fix_text, fix_who = _mgr(
                 [{"role": "system", "content": _FIX_SYSTEM},
                  {"role": "user", "content":
@@ -1497,52 +2185,287 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                   % (_clip(goal, 1500), title, _clip(ph["task"], MANAGER_BRIEF_CHARS),
                      ("\n\nDone when: " + _clip(ph["done_when"], MANAGER_PHASE_CHARS))
                      if ph.get("done_when") else "",
-                     _render_brief(ph), "\n- ".join(problems),
+                     _render_brief(ph) + _clip(_code_brief(idx), 2500),
+                     "\n- ".join(problems),
                      _clip(fallback, VERDICT_OUTPUT_CHARS) or "(empty)")}],
                 MANAGER_FIX_TOKENS, "fix")
             if fix_text:
                 emit("verify", "%s: fixed by the manager" % title[:30])
                 trail.append(("fix:%s" % title, fix_who))
                 return fix_text, fix_who, trail
-        # Nothing better: ship the last real attempt rather than drop the phase.
-        return fallback, (used if fallback == text else None), trail
+        if _spent() or not (fallback or "").strip():
+            return "", None, trail
+        text, who = dispatch(_retry_msgs(idx, problems, fallback), PHASE_MAX_TOKENS,
+                             exclude_pids=tuple(failed))
+        if who:
+            trail.append(("phase-repair:%s" % title, who))
+        if text and not _cheap_problems(idx, text):
+            emit("verify", "%s: repaired by a free model" % title[:30])
+            return text, who, trail
+        return "", None, trail
 
-    for wave in _waves(phases):
-        if outputs and _over("the next wave"):
-            break            # at least one phase is in hand -- stop adding more
-        names = ", ".join(phases[i - 1]["title"] for i in wave)
-        emit("phase", ("%d in parallel: %s" % (len(wave), names)) if len(wave) > 1
-             else "1/%d %s" % (len(phases), names))
-        if len(wave) == 1 and clock[0] is None:
-            results = {wave[0]: _run_phase(wave[0])}
-        else:
-            # One worker dying must not kill the wave (_gather maps it to an
-            # empty result). Under a cap, a wave stops waiting once the clock is
-            # spent -- but, while nothing at all is in hand, not before one
-            # phase has answered: a slow planner must not leave nothing to
-            # deliver.
-            results = _gather(_run_phase, list(wave), _left(),
-                              need_one=not outputs)
-            if len(results) < len(wave):
-                _over("the rest of the wave")
-        # Applied in phase order, not completion order, so the assembled draft
-        # reads in the sequence the supervisor planned.
-        for i in sorted(results):
-            text, used = results[i][0], results[i][1]
-            if len(results[i]) > 2:
-                # Verified phase: its trail names every worker, retry, verdict
-                # and fix. Only FREE workers count as executors -- the reviewer
-                # must differ from them, not from the manager.
-                for role, who in results[i][2]:
-                    models_used.append((role, who))
-                    if role.startswith("phase"):
-                        exec_pids.add(who.split("/", 1)[0])
-            elif used:
-                models_used.append(("phase:%s" % phases[i - 1]["title"], used))
-                exec_pids.add(used.split("/", 1)[0])
-            if text:
+    def _verify_set(idxs, first, final):
+        """Check a WAVE's outputs together: free checks first, then ONE
+        manager verdict for every output they could not settle (none for an
+        output they PROVE meets its acceptance), free retries in parallel for
+        the rejected ones, one more batched verdict, and a fix only for what
+        still fails. MEASURED before: one verdict per phase, each 100-150 s.
+
+        `first` = {idx: (text, who)}. Returns ({idx: (text, who, trail,
+        changed, clean)}, batch_trail) -- `clean` = what ships passed its
+        checks (first attempt or free retry; no fix, no fallback). On the last
+        wave (`final`) the verdict also answers the supervisor's coverage
+        question (check_info)."""
+        st = {}
+        for i in idxs:
+            text, who = first[i]
+            st[i] = {"text": text or "", "who": who, "trail": [], "failed": set(),
+                     "fallback": text or "", "clean": True}
+        batch_trail = []
+        retried = set()
+        failing = {}
+
+        def _rejected(probs):
+            """Note a rejection: its provider excluded next time, its text
+            kept as the fallback when it has any."""
+            for i, p in sorted(probs.items()):
+                emit("verify", "%s: %s" % (phases[i - 1]["title"][:30], p[0][:44]))
+                if st[i]["who"]:
+                    st[i]["failed"].add(st[i]["who"].split("/", 1)[0])
+                if st[i]["text"].strip():
+                    st[i]["fallback"] = st[i]["text"]
+
+        def _retry(probs):
+            """The rejected ones retry IN PARALLEL, each on a provider that has
+            not failed it, told exactly what was wrong (and shown its attempt)."""
+            got = _gather(lambda i: dispatch(_retry_msgs(i, probs[i], st[i]["text"]),
+                                             PHASE_MAX_TOKENS,
+                                             exclude_pids=tuple(st[i]["failed"])),
+                          sorted(probs), _left())
+            for i in sorted(probs):
+                text, who = (got.get(i) or ("", None))[:2]
+                if who:
+                    st[i]["trail"].append(("phase-retry:%s" % phases[i - 1]["title"], who))
+                st[i]["text"], st[i]["who"] = text or "", who
+                retried.add(i)
+
+        def _judge(ids, combined):
+            """ONE verdict for `ids` -> {idx: problems} of the rejected ones."""
+            if not ids:
+                return {}
+            if _spent():
+                for i in ids:                # the clock ran out before a verdict
+                    st[i]["clean"] = False
+                return {}
+            res, info, who = _batch_verdict(
+                ids, {i: st[i]["text"] for i in ids}, combined,
+                {i: st[i]["text"] for i in idxs})
+            if who:
+                batch_trail.append(("verify:%s" % _short(" + ".join(
+                    phases[i - 1]["title"] for i in ids), 80), who))
+            if not who or res is None:
+                # No usable verdict (manager unavailable, past its deadline,
+                # reply unreadable): the phase passes, as it always did -- but
+                # it was never judged, so it is not "clean" and the final
+                # review still runs.
+                for i in ids:
+                    st[i]["clean"] = False
+                res = res or {}
+            if combined and info is not None:
+                check_info.update(info)
+            return {i: p for i, p in res.items() if p}
+
+        def _unsettled(ids):
+            """(cheap problems, the ids that still need a verdict)."""
+            probs, judge = {}, []
+            for i in ids:
+                p = _cheap_problems(i, st[i]["text"])
+                if p:
+                    probs[i] = p
+                elif not _proven(phases[i - 1], st[i]["text"]):
+                    judge.append(i)
+            return probs, judge
+
+        # A. The free checks' rejections retry for free FIRST, so the one paid
+        #    verdict below sees the repaired work, not the broken one.
+        cheap, judge = _unsettled(idxs)
+        if cheap:
+            _rejected(cheap)
+            if not _spent():
+                _retry(cheap)
+                cheap2, judge2 = _unsettled(sorted(cheap))
+                judge = sorted(set(judge) | set(judge2))
+                failing.update(cheap2)
+                _rejected(cheap2)
+            else:
+                failing.update(cheap)
+        # B. ONE verdict for everything the free checks could not settle (on
+        #    the last wave it also answers the supervisor's coverage question).
+        rejected = _judge(judge, final)
+        if rejected:
+            _rejected(rejected)
+            again = {i: p for i, p in rejected.items() if i not in retried}
+            failing.update({i: p for i, p in rejected.items() if i in retried})
+            # C. First-time rejections get their free retry, then ONE more
+            #    batched verdict; a second rejection goes to the fix below.
+            if again and not _spent():
+                _retry(again)
+                cheap3, judge3 = _unsettled(sorted(again))
+                failing.update(cheap3)
+                _rejected(cheap3)
+                late = _judge(judge3, False)
+                failing.update(late)
+                _rejected(late)
+            elif again:
+                failing.update(again)
+        if failing and not _spent():
+            fixed = _gather(lambda i: _fix_one(i, st[i]["fallback"], failing[i],
+                                               st[i]["failed"]),
+                            sorted(failing), _left())
+            for i in sorted(failing):
+                text, who, trail = (fixed.get(i) or ("", None, []))[:3]
+                st[i]["trail"].extend(trail)
+                if text:
+                    st[i]["text"], st[i]["who"] = text, who
+                    st[i]["fallback"] = text
+        out = {}
+        for i in idxs:
+            s = st[i]
+            if i in failing and s["text"] != s["fallback"]:
+                # Nothing better: ship the last real attempt, never drop it.
+                s["text"], s["who"] = s["fallback"], None
+            text = s["text"] or s["fallback"]
+            # "Clean" = what ships PASSED its checks (proven, or a readable
+            # verdict said ok) -- on the first attempt or after its free retry.
+            # A manager-written fix or a fallback was never checked: not clean.
+            out[i] = (text, s["who"], s["trail"], text != (first[i][0] or ""),
+                      s["clean"] and i not in failing)
+        return out, batch_trail
+
+    def _verify_safe(idxs, first, final):
+        """_verify_set that can never take the run down: on any error the
+        wave's first attempts stand, unjudged (so not "clean")."""
+        try:
+            return _verify_set(idxs, first, final)
+        except Exception:                                       # noqa: BLE001
+            emit("verify", "check failed — keeping the first attempts")
+            return ({i: (first[i][0], first[i][1], [], False, False) for i in idxs}, [])
+
+    def _apply_verified(vres, batch_trail):
+        """Fold one wave's verification into the run; the phases whose
+        output it changed (their dependents built on the old one)."""
+        changed = set()
+        for i in sorted(vres):
+            text, _who, trail, ch, ok = vres[i]
+            for role, w in trail:
+                models_used.append((role, w))
+                if role.startswith("phase") and w:
+                    exec_pids.add(w.split("/", 1)[0])
+            clean[i] = ok
+            if text and ch:
                 outputs[i] = text
                 titles[i] = phases[i - 1]["title"]
+                changed.add(i)
+        models_used.extend(batch_trail)
+        return changed
+
+    running = {}        # phase -> its first attempt, still running when the wave stopped waiting
+    check_info = {}     # the last wave's verdict: {"missing": [...], "parts_missing": [...]}
+    clean = {}          # phase -> what ships passed its checks (no fix, no fallback)
+
+    if manager is None:
+        for wave in _waves(phases):
+            if outputs and _over("the next wave"):
+                break            # at least one phase is in hand -- stop adding more
+            names = ", ".join(phases[i - 1]["title"] for i in wave)
+            emit("phase", ("%d in parallel: %s" % (len(wave), names)) if len(wave) > 1
+                 else "1/%d %s" % (len(phases), names))
+            if len(wave) == 1 and clock[0] is None:
+                results = {wave[0]: _run_phase(wave[0])}
+            else:
+                # One worker dying must not kill the wave (_gather maps it to an
+                # empty result). Under a cap, a wave stops waiting once the clock is
+                # spent -- but, while nothing at all is in hand, not before one
+                # phase has answered: a slow planner must not leave nothing to
+                # deliver.
+                results = _gather(_run_phase, list(wave), _left(),
+                                  need_one=not outputs, leftovers=running)
+                if len(results) < len(wave):
+                    _over("the rest of the wave")
+            # Applied in phase order, not completion order, so the assembled draft
+            # reads in the sequence the supervisor planned.
+            for i in sorted(results):
+                text, used = results[i][0], results[i][1]
+                if used:
+                    models_used.append(("phase:%s" % phases[i - 1]["title"], used))
+                    exec_pids.add(used.split("/", 1)[0])
+                if text:
+                    outputs[i] = text
+                    titles[i] = phases[i - 1]["title"]
+    else:
+        # WITH A MANAGER the waves are PIPELINED: wave k's verification (a
+        # paid call, 30-150 s) runs WHILE wave k+1's free workers build on
+        # wave k's output. When the check changes an output, the phases built
+        # on the old one are rebuilt on the fixed one (free, parallel); in the
+        # common case -- it passed -- nothing waited for it. The last wave is
+        # checked in one call that also answers the supervisor's question.
+        all_waves = _waves(phases)
+        vpool = ThreadPoolExecutor(max_workers=1)
+        pending_v = None
+        try:
+            for wi, wave in enumerate(all_waves):
+                if outputs and _over("the next wave"):
+                    break
+                names = ", ".join(phases[i - 1]["title"] for i in wave)
+                emit("phase", ("%d in parallel: %s" % (len(wave), names)) if len(wave) > 1
+                     else "1/%d %s" % (len(phases), names))
+                got = _gather(_run_phase, list(wave), _left(), need_one=not outputs,
+                              leftovers=running)
+                if len(got) < len(wave):
+                    _over("the rest of the wave")
+                rebuilt = set()
+                if pending_v is not None:
+                    changed = _apply_verified(*pending_v.result())
+                    pending_v = None
+                    redo = [i for i in sorted(got) if set(phases[i - 1]["needs"]) & changed]
+                    if redo and not _spent():
+                        emit("phase", "%d rebuilt on work the check changed: %s"
+                             % (len(redo), ", ".join(phases[i - 1]["title"] for i in redo)))
+                        again = _gather(_run_phase, redo, _left())
+                        for i in sorted(again):
+                            if again[i][0]:
+                                if got[i][1]:           # the discarded first build
+                                    models_used.append(("phase:%s" % phases[i - 1]["title"],
+                                                        got[i][1]))
+                                    exec_pids.add(got[i][1].split("/", 1)[0])
+                                got[i] = again[i]
+                                rebuilt.add(i)
+                            elif again[i][1]:
+                                models_used.append(("phase-rebuild:%s" % phases[i - 1]["title"],
+                                                    again[i][1]))
+                firsts = {}
+                for i in sorted(got):
+                    text, used = got[i][0], got[i][1]
+                    if used:
+                        models_used.append(("%s:%s" % ("phase-rebuild" if i in rebuilt
+                                                       else "phase", phases[i - 1]["title"]),
+                                            used))
+                        exec_pids.add(used.split("/", 1)[0])
+                    if text:
+                        outputs[i] = text
+                        titles[i] = phases[i - 1]["title"]
+                        firsts[i] = (text, used)
+                if not firsts:
+                    continue
+                last = wi == len(all_waves) - 1
+                if last or _spent():
+                    _apply_verified(*_verify_safe(sorted(firsts), firsts, last))
+                else:
+                    pending_v = vpool.submit(_verify_safe, sorted(firsts), firsts, False)
+            if pending_v is not None:
+                _apply_verified(*pending_v.result())
+        finally:
+            vpool.shutdown(wait=False)
 
     # ---- 2a. FINISH WHAT IS MISSING — never a silently partial deliverable ---
     # Phases the cap skipped (a later wave), cut off (still running when it
@@ -1559,8 +2482,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
 
             use = fast if _spent() else dispatch     # time left: full strength
 
-            def _fast_phase(idx):
-                text, who = use(_phase_msgs(idx), PHASE_MAX_TOKENS)
+            def _sane(r):
+                text, who = (r if isinstance(r, tuple) and len(r) >= 2 else ("", None))[:2]
                 if text and answer_check is not None:
                     try:
                         if not answer_check.inspect(text, prompt_text=brief).get("ok", True):
@@ -1568,11 +2491,39 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                     except Exception:                           # noqa: BLE001
                         pass
                 return text, who
+
+            def _fast_phase(idx):
+                orig = running.get(idx)
+                if orig is None:
+                    return _sane(use(_phase_msgs(idx), PHASE_MAX_TOKENS))
+                # The phase's FIRST attempt is still running (the cap cut the
+                # wave, not the call): it races the fast re-run and the first
+                # sane answer wins -- a call that may be seconds from done is
+                # not thrown away for one that starts from nothing.
+                inner = ThreadPoolExecutor(max_workers=1)
+                try:
+                    fresh = inner.submit(lambda: _sane(use(_phase_msgs(idx), PHASE_MAX_TOKENS)))
+                    waiting, best = {orig, fresh}, ("", None)
+                    while waiting:
+                        fin, waiting = wait(waiting, return_when=FIRST_COMPLETED)
+                        for f in fin:
+                            try:
+                                r = _sane(f.result())
+                            except Exception:                   # noqa: BLE001
+                                continue
+                            if r[0]:
+                                return (r[0], r[1], "late") if f is orig else r
+                            if r[1] and not best[1]:
+                                best = r
+                    return best
+                finally:
+                    inner.shutdown(wait=False)
             got = _gather(_fast_phase, unfinished_idx, g_left)
             for i in sorted(got):
                 text, who = got[i][0], got[i][1]
                 if who:
-                    models_used.append(("phase-finish:%s" % phases[i - 1]["title"], who))
+                    models_used.append(("%s:%s" % ("phase" if len(got[i]) > 2 else "phase-finish",
+                                                   phases[i - 1]["title"]), who))
                 if text:
                     outputs[i] = text
                     titles[i] = phases[i - 1]["title"]
@@ -1583,7 +2534,16 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     # Workers that ran in parallel could not see each other, so this is where a
     # genuine gap or a contradiction between them gets caught. Skipped when only
     # one phase produced anything: there is no team to reconcile.
-    if len(done) > 1 and not _over("the supervisor"):
+    gaps = []
+    coverage_by_manager = False
+    sup_text = ""
+    if len(done) > 1 and isinstance(check_info.get("missing"), list):
+        # The last wave's batched verdict already answered this question
+        # (same excerpts, same plan): no second paid call for it.
+        emit("supervise", "coverage checked with the last wave's verdict")
+        coverage_by_manager = True
+        sup_text = json.dumps({"missing": check_info["missing"]})
+    elif len(done) > 1 and not _over("the supervisor"):
         emit("supervise", "checking coverage")
         plan_lines = "\n".join("%d. %s — %s" % (i, p["title"], p["task"])
                                for i, p in enumerate(phases, 1))
@@ -1604,7 +2564,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
             mgr_tokens=MANAGER_SUPERVISE_TOKENS)
         if sup_model:
             models_used.append(("supervisor", sup_model))
-        gaps = []
+        coverage_by_manager = staged_by_manager[0]
+    if sup_text:
         for g in ((_parse_json(sup_text) or {}).get("missing") or [])[:MAX_REPAIRS]:
             if isinstance(g, dict) and str(g.get("task") or "").strip():
                 gaps.append({"title": str(g.get("title") or "Gap").strip()[:80],
@@ -1645,10 +2606,22 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     # manager's when there is one, else a free model's -- while there is time.
     # Every gap goes back to a repair worker that sees the draft, so the part
     # it writes matches the rest (same names, flags, files).
+    gap_parts = []
     if parts:
         verdicts = [_part_present(p, draft) for p in parts]
         unknown = [k for k, v in enumerate(verdicts, 1) if v is None]
-        if unknown and not _spent():
+        said_by_check = check_info.get("parts_missing")
+        if unknown and isinstance(said_by_check, list):
+            # The last wave's verdict was already asked exactly these parts
+            # (a part without markers stays undecidable whatever is added).
+            for n in said_by_check:
+                try:
+                    n = int(n)
+                except (TypeError, ValueError):
+                    continue
+                if n in unknown:
+                    verdicts[n - 1] = False
+        elif unknown and not _spent():
             listing = "\n".join("%d. %s" % (k, parts[k - 1]) for k in unknown)
             v_sys = ("You check a draft against REQUIRED PARTS the user enumerated. "
                      "You may see an excerpt; never report as missing what may sit in "
@@ -1766,10 +2739,46 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                        % (mgr_brief, mgr_work, suffix)}],
             mgr_tokens=MANAGER_REVIEW_TOKENS, exclude=tuple(exec_pids))
 
-    reviewed = not _over("the review")
-    if not reviewed:
+    def _synthesis(text_in, probs):
+        synth_user = "BRIEF\n%s\n\nPHASE OUTPUTS\n%s" % (brief, text_in)
+        if probs:
+            synth_user += "\n\nREVIEWER PROBLEMS TO FIX\n- " + "\n- ".join(probs[:10])
+        # Scaled to what it has to assemble: a fixed 6000-token ceiling cut a big
+        # multi-phase build off mid-file (the hub lowers it per hop to a model's
+        # learned output cap).
+        synth_tokens = max(SYNTH_MAX_TOKENS, min(SYNTH_MAX_CAP, len(text_in) // 3 + 1000))
+        return dispatch([{"role": "system", "content": synth_system},
+                         {"role": "user", "content": synth_user}], synth_tokens)
+
+    # With a manager, a SECOND look at the same excerpts is redundant when every
+    # phase passed its checks on the first attempt and the manager itself
+    # confirmed coverage (no gap, no missing part): the review would re-judge
+    # what was just judged, for another 30-150 s subscription call on the
+    # critical path. Anything that needed a retry, fix, gap or part repair
+    # still gets the review.
+    # A crew that asks for its own reviewer (a custom review prompt, or a
+    # review -> revise loop) always gets it: that review is the point of it.
+    wants_review = bool(profile.get("review_system")) or max_revisions >= 1
+    all_clean = (manager is not None and not single and not wants_review
+                 and coverage_by_manager
+                 and not gaps and not gap_parts
+                 and all(clean.get(i) is True for i in range(1, len(phases) + 1)))
+    reviewed = not all_clean and not _over("the review")
+    spec = None
+    spec_pool = None
+    if all_clean:
+        emit("review", "skipped — the manager passed every phase and the coverage")
+        review_text, review_model = '{"verdict": "ship", "problems": []}', None
+    elif not reviewed:
         review_text, review_model = "", None
     else:
+        if manager is not None and len(done) > 1:
+            # Synthesis starts NOW, alongside the paid review: when the review
+            # says ship (the common case) it is already done; on "revise" it is
+            # discarded and synthesis runs again with the problems.
+            spec_pool = ThreadPoolExecutor(max_workers=1)
+            spec = spec_pool.submit(_synthesis, draft, [])
+            spec_pool.shutdown(wait=False)
         emit("review", "reviewing")
         review_text, review_model = _review()
     if review_model:
@@ -1904,18 +2913,17 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         return _deliver(draft, review)
 
     emit("synthesis", "assembling")
-    synth_user = "BRIEF\n%s\n\nPHASE OUTPUTS\n%s" % (brief, draft)
-    if problems and not revised:
-        # A completed revision pass already fixed these; handing them to
-        # synthesis again would ask it to fix problems that no longer exist.
-        synth_user += "\n\nREVIEWER PROBLEMS TO FIX\n- " + "\n- ".join(problems[:10])
-    # Scaled to what it has to assemble: a fixed 6000-token ceiling cut a big
-    # multi-phase build off mid-file (the hub lowers it per hop to a model's
-    # learned output cap).
-    synth_tokens = max(SYNTH_MAX_TOKENS, min(SYNTH_MAX_CAP, len(draft) // 3 + 1000))
-    final_text, synth_model = dispatch(
-        [{"role": "system", "content": synth_system},
-         {"role": "user", "content": synth_user}], synth_tokens)
+    # A completed revision pass already fixed the problems; handing them to
+    # synthesis again would ask it to fix problems that no longer exist.
+    probs = problems if (problems and not revised) else []
+    final_text, synth_model = "", None
+    if spec is not None and not probs and not revised:
+        try:
+            final_text, synth_model = spec.result()      # started with the review
+        except Exception:                                       # noqa: BLE001
+            final_text, synth_model = "", None
+    if not final_text:
+        final_text, synth_model = _synthesis(draft, probs)
     if synth_model:
         models_used.append(("synthesis", synth_model))
     emit("done", "complete")
@@ -1960,6 +2968,8 @@ def trailer_summary(result):
         parts.insert(0, "unfinished=%d: %s" % (len(unfinished), " | ".join(unfinished)))
     if result.get("manager_tokens"):
         parts.append("manager_tokens=%d" % int(result["manager_tokens"]))
+    if result.get("manager_calls"):
+        parts.append("manager_calls=%d" % int(result["manager_calls"]))
     if result.get("review_warning"):
         parts.append("review_unreadable=1")
     line = "; ".join(parts)
