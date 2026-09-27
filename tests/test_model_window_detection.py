@@ -129,12 +129,12 @@ def test_google_native_catalog_records_input_token_limit(monkeypatch):
         return pages.pop(0)
 
     monkeypatch.setattr(A.requests, "get", fake_get)
-    n = A._harvest_native_ctx_catalog("google", {"api_key": "AIzaTEST"})
+    n = A._harvest_native_ctx_catalog("google", {"api_key": "google-test-key"})
     assert n == 2
     assert A._window_info("google", "models/gemini-9-flash") == (1048576, "catalog")
     assert A._window_info("google", "models/gemma-9-27b-it") == (131072, "catalog")
     # the key rides in Google's own header, never as a bearer; page 2 is fetched
-    assert seen[0][1] == {"x-goog-api-key": "AIzaTEST"}
+    assert seen[0][1] == {"x-goog-api-key": "google-test-key"}
     assert "pageToken=p2" in seen[1][0]
 
 
