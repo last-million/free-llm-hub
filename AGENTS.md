@@ -854,6 +854,20 @@ for 420s twice").
   port's one adopt try) and resumes with `resume_instruction` (what blocked,
   whether it listened, the detached spellings, never a kill suggestion). The
   first one does not spend the wedge retry; at most 3 attempts.
+- **Early detection** (`agent_servers.early_server_diagnosis`, covered by
+  `tests/test_agent_early_server.py`): after `AGENTIC_CHAT_SERVER_PROBE`
+  (60 s, 0 = off, clamped 15..600) of silence the watchdog probes every 10 s.
+  It fires only when a process the shell tool started is a server (listening
+  on a non-hub port, or an unambiguous server command; `main.py`/`index.js`
+  need a port), started AFTER the CLI's last line (so detached /
+  run_in_background servers never count), up >= 20 s, and nothing else under
+  the shell is real work (test runners, installers, builds = busy). ORPHANS:
+  `start /B` / a bare `&` leave the server outside the CLI's tree (verified by
+  a real-process test); every attempt's CLI env carries `CALVOUN_AGENT_TURN`,
+  so `orphan_processes` finds them and `stop_processes` stops ONLY processes
+  carrying this attempt's marker (never a hub PID, never the preview). The
+  server is stopped, not left running: MEASURED, with its pipe reader gone
+  `http.server`/print-logging servers answer RemoteDisconnected.
 - **Limitation**: the hub cannot stop an agent shell from killing the hub
   (same user, no privilege to withhold, opencode reports a command only after
   it ran); prevention via the brief is the only defence.

@@ -235,6 +235,32 @@ _TURN_TIMEOUT = int(os.environ.get("AGENTIC_CHAT_TIMEOUT", "1800") or "1800")
 # model call inside a turn can legitimately be quiet for minutes.
 _STALL_TIMEOUT = int(os.environ.get("AGENTIC_CHAT_STALL", "420") or "420")
 
+
+def _probe_after_setting(raw):
+    """AGENTIC_CHAT_SERVER_PROBE: seconds of silence before the early server
+    check; 0 turns it off. Bounded to 15..600 so a typo cannot make it fire
+    on every pause or never."""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 60.0
+    return 0.0 if v <= 0 else min(600.0, max(15.0, v))
+
+
+# THE EARLY SERVER CHECK. MEASURED live 2026-09-27: an opencode turn whose shell
+# was blocked on a server it had started in the foreground waited the full
+# _STALL_TIMEOUT twice (2 x 420 s) before anything was said -- and opencode
+# reports a command only once it returned, so its stream never shows what is
+# blocking. After this much silence the watchdog asks
+# agent_servers.early_server_diagnosis, every _SERVER_PROBE_EVERY seconds until
+# the stall deadline, whether the shell tool is waiting on a server (and on
+# nothing else); a yes resumes at once with the server instruction. A long
+# test run, install, build or a model thinking is never a yes.
+_SERVER_PROBE_AFTER = _probe_after_setting(os.environ.get("AGENTIC_CHAT_SERVER_PROBE", "60"))
+_SERVER_PROBE_EVERY = 10.0
+# The watchdog's longest sleep between checks.
+_WATCH_TICK_MAX = 5.0
+
 # A FAILURE THAT IS NOT THE TURN'S FAULT.
 #
 # MEASURED live: opencode keeps ONE SQLite database for the whole machine
@@ -3388,17 +3414,52 @@ def _recover_text_from_claude_transcript(config_dir, native_id):
     return None
 
 
-def _stall_diagnosis(sess, proc, last_tool, last_line_at):
+def _stall_diagnosis(sess, proc, last_tool, last_line_at, marker=None, since=None):
     """At a stall, before the kill: is the CLI's shell blocked on a server it
     started? agent_servers.diagnose_stall's dict, or None. Never raises --
-    this runs on the watchdog thread, which must still kill the process."""
+    this runs on the watchdog thread, which must still kill the process.
+
+    The tree under the CLI plus this turn's orphans (processes carrying
+    `marker`, started after the last line `since`): a server launched with
+    `start /B` or a bare `&` outlives its shell and is in no tree."""
     try:
         cmd, at = last_tool[0], last_tool[1]
+        pid = getattr(proc, "pid", None)
+        procs = list(agent_servers.session_processes(pid) or [])
+        procs += list(agent_servers.orphan_processes(
+            marker, since, {p.get("pid") for p in procs} | {pid}) or [])
         return agent_servers.diagnose_stall(
-            getattr(proc, "pid", None), cli_id=getattr(sess, "cli_id", None),
-            last_tool=cmd, tool_was_last=(at is not None and at == last_line_at))
+            pid, cli_id=getattr(sess, "cli_id", None),
+            last_tool=cmd, tool_was_last=(at is not None and at == last_line_at),
+            processes=procs)
     except Exception:                                            # noqa: BLE001
         return None
+
+
+def _early_server_check(sess, proc, last_tool, last_line_at, marker, since):
+    """The early (~60 s) server check: agent_servers.early_server_diagnosis's
+    dict or None. Never raises (watchdog thread)."""
+    try:
+        cmd, at = last_tool[0], last_tool[1]
+        announced = (getattr(sess, "cli_id", None) in agent_servers.TOOL_EVENT_AT_START
+                     and at is not None and at == last_line_at)
+        return agent_servers.early_server_diagnosis(
+            getattr(proc, "pid", None), marker=marker, since=since, now=time.time(),
+            last_tool=cmd if announced else None)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _stop_turn_servers(diag, marker):
+    """After the CLI's tree kill: stop the diagnosed servers the tree kill
+    could not reach (orphans) and record what is still alive in
+    diag["survivors"], so the resume prompt never claims a port is free when
+    it is not. Only processes carrying this turn's marker are touched."""
+    try:
+        diag["survivors"] = agent_servers.stop_processes(
+            diag.get("stop") or diag.get("pids") or [], marker)
+    except Exception:                                            # noqa: BLE001
+        diag["survivors"] = []
 
 
 def _server_resume_prompt(sess, original, diag, resumed):
@@ -3409,7 +3470,8 @@ def _server_resume_prompt(sess, original, diag, resumed):
     guessing why it had been stopped. Starting over (no thread id): the task
     first, then the instruction, as long as the pair fits the per-turn cap;
     past it the task alone (the brief file carries the same rules)."""
-    note = agent_servers.resume_instruction(diag, _STALL_TIMEOUT)
+    note = agent_servers.resume_instruction(diag, (diag or {}).get("silent")
+                                            or _STALL_TIMEOUT)
     if resumed:
         return _HubNudge(note)
     combined = str(original) + chr(10) + chr(10) + "---" + chr(10) + note
@@ -3512,6 +3574,7 @@ def send_message_stream(session_id, text):
         # retry above (see _stall_diagnosis / agent_servers).
         server_resume_used = False
         original_text = text
+        attempt = 0
         while True:
             was_resume = bool(sess.native_session_id)
             argv = _build_argv(sess, bin_path, text, stream=True)
@@ -3519,6 +3582,13 @@ def send_message_stream(session_id, text):
                                      getattr(sess, "quality", "normal"),
                                      getattr(sess, "id", None),
                                      getattr(sess, "mode", None))
+            # Inherited by every process this attempt's CLI starts, detached
+            # ones included: how the watchdog recognises (and is allowed to
+            # stop) a server that outlived the shell that launched it.
+            attempt += 1
+            turn_marker = "%s/%d/%s" % (getattr(sess, "id", None) or "agent", attempt,
+                                        uuid.uuid4().hex[:12])
+            child_env[agent_servers.TURN_MARKER] = turn_marker
             try:
                 proc = subprocess.Popen(
                     argv, cwd=sess.project_dir, env=child_env,
@@ -3551,6 +3621,10 @@ def send_message_stream(session_id, text):
             timed_out[0] = False
             stalled = [False]
             last_event = [time.monotonic()]
+            # The same instant on the wall clock: process start times are
+            # compared with it (a server started after the last line belongs
+            # to a command that has not returned).
+            last_line_wall = [time.time()]
             # The last tool event and the time of the line that carried it:
             # equal to last_event[0] at a stall means it was the very last
             # thing the CLI printed.
@@ -3570,27 +3644,28 @@ def send_message_stream(session_id, text):
                 # A hub configured with a 30-second turn timeout must not wait
                 # five seconds to notice it passed, and a test that sets one
                 # of these to a fraction of a second is asking the same thing.
-                tick = min(5.0, max(0.02, min(_TURN_TIMEOUT,
-                                              _STALL_TIMEOUT or _TURN_TIMEOUT) / 4.0))
+                tick = min(_WATCH_TICK_MAX,
+                           max(0.02, min(_TURN_TIMEOUT, _STALL_TIMEOUT or _TURN_TIMEOUT,
+                                         _SERVER_PROBE_AFTER or _TURN_TIMEOUT) / 4.0))
+                next_probe = 0.0
                 while not watchdog_stop.wait(tick):
                     now = time.monotonic()
                     if now - started > _TURN_TIMEOUT:
                         timed_out[0] = True
                         _terminate(proc)
                         return
-                    if _STALL_TIMEOUT and now - last_event[0] > _STALL_TIMEOUT:
-                        stalled[0] = True
-                        timed_out[0] = True
-                        # BEFORE the kill: the tree is only walkable while
-                        # the CLI is alive to be its root.
-                        stall_diag[0] = _stall_diagnosis(sess, proc, last_tool,
-                                                         last_event[0])
-                        if stall_diag[0]:
+                    silent = now - last_event[0]
+                    # Both silences end the same way below; the diagnosis
+                    # runs BEFORE the kill -- the tree is only walkable while
+                    # the CLI is alive to be its root.
+                    if _STALL_TIMEOUT and silent > _STALL_TIMEOUT:
+                        diag = _stall_diagnosis(sess, proc, last_tool, last_event[0],
+                                                turn_marker, last_line_wall[0])
+                        if diag:
                             _log.warning("agentic turn silent for %ds: shell blocked "
                                          "on %r ports=%s via=%s (session=%s cli=%s)",
-                                         _STALL_TIMEOUT, stall_diag[0].get("command"),
-                                         stall_diag[0].get("ports"),
-                                         stall_diag[0].get("source"),
+                                         _STALL_TIMEOUT, diag.get("command"),
+                                         diag.get("ports"), diag.get("source"),
                                          getattr(sess, "id", "?"),
                                          getattr(sess, "cli_id", "?"))
                         else:
@@ -3598,8 +3673,33 @@ def send_message_stream(session_id, text):
                                          "(session=%s cli=%s) -- treating as wedged",
                                          _STALL_TIMEOUT, getattr(sess, "id", "?"),
                                          getattr(sess, "cli_id", "?"))
-                        _terminate(proc)
-                        return
+                    elif (_SERVER_PROBE_AFTER and silent > _SERVER_PROBE_AFTER
+                            and now >= next_probe):
+                        # Not a wedge yet: only a server blocking the shell
+                        # (and nothing else) ends the attempt this early.
+                        next_probe = now + _SERVER_PROBE_EVERY
+                        diag = _early_server_check(sess, proc, last_tool, last_event[0],
+                                                   turn_marker, last_line_wall[0])
+                        if not diag:
+                            continue
+                        diag["silent"] = int(silent)
+                        _log.warning("agentic turn silent for %ds: shell blocked on "
+                                     "server %r ports=%s pids=%s orphans=%s -- "
+                                     "resuming early (session=%s cli=%s)",
+                                     int(silent), diag.get("command"),
+                                     diag.get("ports"), diag.get("pids"),
+                                     diag.get("orphans"), getattr(sess, "id", "?"),
+                                     getattr(sess, "cli_id", "?"))
+                    else:
+                        continue
+                    stall_diag[0] = diag
+                    stalled[0] = True
+                    timed_out[0] = True
+                    _terminate(proc)
+                    if diag:
+                        # What the tree kill cannot reach: orphans.
+                        _stop_turn_servers(diag, turn_marker)
+                    return
 
             timer = threading.Thread(target=_watch, daemon=True,
                                      name="agentic-watchdog-%s"
@@ -3615,6 +3715,7 @@ def send_message_stream(session_id, text):
                     # Any line at all is proof of life -- including one that
                     # parses to nothing we act on.
                     last_event[0] = time.monotonic()
+                    last_line_wall[0] = time.time()
                     for e in parse(line):
                         if "_native" in e:
                             native_id = e["_native"]
@@ -3711,8 +3812,8 @@ def send_message_stream(session_id, text):
                         timeout_retry_used = True
                     server_resume_used = True
                     yield {"event": "notice",
-                           "text": agent_servers.stall_notice(diag, _STALL_TIMEOUT,
-                                                              again=again)}
+                           "text": agent_servers.stall_notice(
+                               diag, diag.get("silent") or _STALL_TIMEOUT, again=again)}
                     # The next attempt resumes whenever the session holds a
                     # thread id -- captured now or carried from before.
                     text = _server_resume_prompt(sess, original_text, diag,
