@@ -28266,6 +28266,23 @@ _SWARM_STRAGGLER_GRACE = 150
 # lands inside the window still wins (acted beats answered, below).
 _SWARM_TEXT_SETTLE = 25          # = _TRIVIAL_HOP_BUDGET, the normal trivial budget
 
+# A CHECKED TOOL CALL SETTLES THE RACE SHORT. MEASURED 2026-09-27 on the
+# owner's OpenCode /agent session (quality swarm, e021e26): every tool turn
+# ended 200 on an nvidia member's tool call and still took ~137-145 s, because
+# the 150 s grace above kept the race open for members that were going to fail
+# anyway (g4f 524/504, dahl 429, a 400). In one logged turn the winner's reply
+# was in hand ~85 s in and the turn ended ~55 s later.
+#
+# So once a member has made a VALID tool call (_swarm_tool_calls_valid: named,
+# offered, JSON-object arguments) the race ends after a SHORT grace that follows
+# the winner's own latency -- _SWARM_TOOL_SETTLE_FACTOR of it, clamped to
+# [MIN, MAX] -- and never longer than _SWARM_STRAGGLER_GRACE. A fast answer gets
+# 15 s for a second opinion, a slow one 25 s. An invalid tool call keeps the
+# long grace: it may still lose to a valid one.
+_SWARM_TOOL_SETTLE_MIN = 15
+_SWARM_TOOL_SETTLE_MAX = 25
+_SWARM_TOOL_SETTLE_FACTOR = 0.5
+
 # A STREAMED fan-out holds the client's response headers until it finishes,
 # and every streaming CLI gives up on headers at ~300 s (see
 # LONG_DEADLINE_STREAM_MAX). A fan-out that outlives that is not merely slow:
@@ -28735,6 +28752,195 @@ def _swarm_rank(cands, difficulty=None):
     return picks
 
 
+# FAN-OUT MEMBER HEALTH. MEASURED 2026-09-27 (owner's OpenCode /agent session,
+# quality swarm, e021e26): of five members per tool turn, four came from
+# providers the hub already knew were failing -- g4f glm-5.3 HTTP 524, g4f
+# kimi-k3 524/504, dahl DeepSeek-V4-Flash 429, a gemini-3.8-flash listing
+# HTTP 400 -- while /api/providers showed dahl, g4f and google throttled. Three
+# gaps put them there:
+#   1. _swarm_rank re-sorts by score, which undoes the chain's recent-failure
+#      TAIL: a pair that 429'd a minute ago took a slot again on its score;
+#   2. the identity de-duplication kept the FIRST listing of a model, so a
+#      failing g4f listing of glm-5.3 / kimi-k3 took the slot and the healthy
+#      nvidia listing of the same model was dropped as a duplicate;
+#   3. the fan-out filed a member's 429/5xx/400 nowhere but _record_outcome,
+#      so nothing kept it out of the NEXT turn's fan-out (the chain loops cool
+#      a 5xx down with _throttle_failed_hop and remember a 429; this did not).
+# So a sick pair takes NO slot while at least _SWARM_FANOUT_MIN healthy ones
+# exist; below that the old selection runs unchanged (a thin swarm of doubtful
+# members beats no swarm).
+_SWARM_MEMBER_FAIL_TTL = 600           # = _RECENT_FAIL_TTL
+_swarm_member_fail = {}                # (pid, model) -> (epoch, kind)
+_swarm_member_lock = threading.Lock()
+
+
+def _note_swarm_member_fail(pid, model, kind):
+    """A fan-out member failed (HTTP error or exception). Never raises."""
+    if not (pid and model):
+        return
+    try:
+        with _swarm_member_lock:
+            _swarm_member_fail[(pid, str(model))] = (time.time(), str(kind or "fail"))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _swarm_member_failed(pid, model):
+    """The kind of this pair's fan-out failure inside _SWARM_MEMBER_FAIL_TTL,
+    else None. Never raises."""
+    try:
+        key = (pid, str(model))
+        with _swarm_member_lock:
+            rec = _swarm_member_fail.get(key)
+            if not rec:
+                return None
+            if time.time() - rec[0] > _SWARM_MEMBER_FAIL_TTL:
+                _swarm_member_fail.pop(key, None)
+                return None
+            return rec[1]
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _swarm_note_member_status(pid, model, code, race_failed=None):
+    """File a fan-out member's non-200 the way the chain loops do: a 429 goes
+    to _recent_hop_fail, a 5xx (502/503/504/524...) is cooled down by
+    _throttle_failed_hop; every one lands in the fan-out ledger. A 429 or 5xx
+    also names the PROVIDER in `race_failed`, so the running race stops
+    waiting on its other members. Never raises."""
+    try:
+        code = int(code)
+        if code == 429:
+            _note_recent_hop_failure(pid, model, "429")
+        elif code >= 500:
+            _throttle_failed_hop(pid, model)
+        if (code == 429 or code >= 500) and race_failed is not None:
+            race_failed.add(pid)
+        _note_swarm_member_fail(pid, model, "HTTP %d" % code)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _swarm_note_member_exc(pid, model, exc):
+    """File a fan-out member that raised: a timeout goes to _recent_hop_fail, a
+    relay that could not be reached is a tool-turn strike (as in _ChainClock);
+    both land in the fan-out ledger. Never raises."""
+    try:
+        if isinstance(exc, requests.exceptions.Timeout):
+            _note_recent_hop_failure(pid, model, "timeout")
+        elif isinstance(exc, requests.exceptions.ConnectionError):
+            _note_relay_tool_fail(pid, model)       # no-op for a non-relay pid
+        _note_swarm_member_fail(pid, model, type(exc).__name__)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _swarm_member_sick(pid, model):
+    """Why (pid, model) must not take a tool fan-out slot right now, or None.
+    Provider parked / throttled / exhausted, the model throttled, dead, not
+    offered or junk-benched, a recent 429 or stall (_recent_hop_fail), a relay
+    server struck on tool turns, or a failure in a recent fan-out. Local state
+    only; fail-open (an error is None)."""
+    try:
+        if _is_provider_dead(pid):
+            return "provider parked"
+        if quota.is_exhausted(pid):
+            return "provider throttled/exhausted"
+        if quota.is_model_exhausted(pid, model):
+            return "model throttled/exhausted"
+        if _is_model_skipped(pid, model):
+            return "model dead or not offered"
+        if _is_pair_benched(pid, model):
+            return "junk-benched"
+        kind = _recent_hop_failure(pid, model)
+        if kind:
+            return "recent %s" % kind
+        if _relay_tool_sick(pid, model):
+            return "relay server struck on tool turns"
+        kind = _swarm_member_failed(pid, model)
+        if kind:
+            return "recent fan-out %s" % kind
+    except Exception:                                            # noqa: BLE001
+        return None
+    return None
+
+
+def _swarm_tool_candidates(chain):
+    """(candidates, skipped) for a tool fan-out from a _build_chain result.
+
+    Candidates are distinct MODELS (one listing each), subscriptions left out,
+    at most _SWARM_TOOL_CANDIDATES. Sick pairs (_swarm_member_sick) are
+    excluded BEFORE the identity de-duplication, so a healthy listing of the
+    same model on another provider takes the place of a failing one. With
+    fewer than _SWARM_FANOUT_MIN healthy candidates the old selection is
+    returned unchanged (first listing per model) and `skipped` is empty.
+    `skipped` is [(pid, model, reason)]."""
+    healthy, legacy, skipped = [], [], []
+    seen_h, seen_l = set(), set()
+    for hop_pid, hop_model in chain:
+        # A LOCAL SUBSCRIPTION CANNOT EMIT A TOOL CALL (see _swarm_tool_result).
+        if _is_sub(hop_pid):
+            continue
+        ident = _normalize_model_identity(hop_model)
+        if ident not in seen_l and len(legacy) < _SWARM_TOOL_CANDIDATES:
+            seen_l.add(ident)
+            legacy.append((hop_pid, hop_model))
+        why = _swarm_member_sick(hop_pid, hop_model)
+        if why:
+            skipped.append((hop_pid, hop_model, why))
+            continue
+        if ident in seen_h or len(healthy) >= _SWARM_TOOL_CANDIDATES:
+            continue
+        seen_h.add(ident)
+        healthy.append((hop_pid, hop_model))
+    if len(healthy) >= _SWARM_FANOUT_MIN:
+        return healthy, skipped
+    return legacy, []
+
+
+def _swarm_tool_calls_valid(msg, tools):
+    """True when every tool call in `msg` is one the CLI can run: a non-empty
+    name among the offered tools (when every offered tool has a name) and
+    arguments that are empty or a JSON object. Never raises."""
+    try:
+        calls = (msg or {}).get("tool_calls") or []
+        if not calls:
+            return False
+        tool_list = [t for t in (tools or []) if isinstance(t, dict)]
+        names = set(tool_rescue.tool_names(tool_list))
+        check_names = bool(names) and len(names) >= len(tool_list)
+        for tc in calls:
+            if not isinstance(tc, dict):
+                return False
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = str(fn.get("name") or "").strip()
+            if not name or (check_names and name not in names):
+                return False
+            args = fn.get("arguments")
+            if args is None or isinstance(args, dict):
+                continue
+            if not isinstance(args, str):
+                return False
+            if not args.strip():
+                continue
+            if not isinstance(json.loads(args), dict):
+                return False
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _swarm_tool_grace(latency):
+    """Seconds to keep waiting after the first VALID tool call, which landed
+    `latency` seconds into the fan-out (see _SWARM_TOOL_SETTLE_MIN)."""
+    try:
+        g_ = _SWARM_TOOL_SETTLE_FACTOR * max(0.0, float(latency))
+    except (TypeError, ValueError):
+        g_ = 0.0
+    g_ = max(float(_SWARM_TOOL_SETTLE_MIN), min(float(_SWARM_TOOL_SETTLE_MAX), g_))
+    return min(g_, float(_SWARM_STRAGGLER_GRACE))
+
+
 @_usage_source_as("swarm")
 def _swarm_tool_result(body):
     """Swarm for a TOOL-CALLING turn: run the same request on several strong
@@ -28786,36 +28992,34 @@ def _swarm_tool_result(body):
     # Distinct MODELS, not distinct listings: three copies of one model relayed
     # by one provider is not a second opinion, it is the same opinion three
     # times at three times the cost.
-    cands, seen = [], set()
-    for hop_pid, hop_model in _build_chain(pid, resolved, est, require_tools=True,
-                                           messages=messages):
-        # A LOCAL SUBSCRIPTION CANNOT EMIT A TOOL CALL, so it can never win a
-        # fan-out whose whole purpose is to produce one. _subscription_chat
-        # reads only payload["messages"] and never payload["tools"], and its
-        # response shim is a two-key {"role","content"} literal with no
-        # tool_calls key at all -- structural, not a model failing today.
-        #
-        # MEASURED over three live fan-outs: sub-claude took a member slot every
-        # time and returned the same prose every time -- "Blocked: write
-        # permission not granted for <an AppData path>" -- at ~21s against 3-7s
-        # for the models that answered. One slot in five, spent on a certainty.
-        #
-        # Skipped HERE rather than in _build_chain: `require_tools` is
-        # bool(body["tools"]), which is true for every Claude Code, opencode and
-        # codex turn INCLUDING read-only questions the CLI attaches its schema
-        # to. Gating the chain own sub append on it would turn those into 503s
-        # exactly when the free fleet is empty and the paid subscription is the
-        # only thing left. The chain keeps its last resort; the swarm, which
-        # needs a tool call specifically, stops spending a slot on one.
-        if _is_sub(hop_pid):
-            continue
-        ident = _normalize_model_identity(hop_model)
-        if ident in seen:
-            continue
-        seen.add(ident)
-        cands.append((hop_pid, hop_model))
-        if len(cands) >= _SWARM_TOOL_CANDIDATES:
-            break
+    #
+    # A LOCAL SUBSCRIPTION CANNOT EMIT A TOOL CALL, so it can never win a
+    # fan-out whose whole purpose is to produce one. _subscription_chat
+    # reads only payload["messages"] and never payload["tools"], and its
+    # response shim is a two-key {"role","content"} literal with no
+    # tool_calls key at all -- structural, not a model failing today.
+    #
+    # MEASURED over three live fan-outs: sub-claude took a member slot every
+    # time and returned the same prose every time -- "Blocked: write
+    # permission not granted for <an AppData path>" -- at ~21s against 3-7s
+    # for the models that answered. One slot in five, spent on a certainty.
+    #
+    # Skipped HERE rather than in _build_chain: `require_tools` is
+    # bool(body["tools"]), which is true for every Claude Code, opencode and
+    # codex turn INCLUDING read-only questions the CLI attaches its schema
+    # to. Gating the chain own sub append on it would turn those into 503s
+    # exactly when the free fleet is empty and the paid subscription is the
+    # only thing left. The chain keeps its last resort; the swarm, which
+    # needs a tool call specifically, stops spending a slot on one.
+    #
+    # Sick members (throttled / parked / recently failed / struck relay /
+    # benched / not offered) take no slot -- see _swarm_member_sick. Both the
+    # de-duplication and that filter live in _swarm_tool_candidates.
+    cands, _skipped = _swarm_tool_candidates(
+        _build_chain(pid, resolved, est, require_tools=True, messages=messages))
+    if _skipped:
+        _log.info("[swarm-tools] %d unhealthy member(s) left out: %s", len(_skipped),
+                  "; ".join("%s/%s (%s)" % s for s in _skipped[:8]))
     # Rank by delivery, don't just take the top of the chain -- see _swarm_rank.
     #
     # The ROUTER above forces "hard" on purpose: a tool turn needs a model that
@@ -28872,6 +29076,7 @@ def _swarm_tool_result(body):
                 # failures -- caught by test_a_real_failure_is_still_recorded.
                 if hop_exc is not None:
                     _record_outcome(hop_pid, hop_model, False)
+                    _swarm_note_member_exc(hop_pid, hop_model, hop_exc)
                 # A pure deadline files nothing: it is indistinguishable
                 # from impatience, and counting it turned slow-but-working
                 # models into "unreliable" ones, dropping them below
@@ -28884,6 +29089,8 @@ def _swarm_tool_result(body):
         try:
             if resp.status_code != 200:
                 _record_outcome(hop_pid, hop_model, False)
+                _swarm_note_member_status(hop_pid, hop_model, resp.status_code,
+                                          _race_failed_pids)
                 return _why("HTTP %d" % resp.status_code)
             data = resp.json() or {}
         except (ValueError, AttributeError):
@@ -28962,6 +29169,10 @@ def _swarm_tool_result(body):
             # _SWARM_TEXT_SETTLE). A salvaged one still competes, but a reply
             # the gate had to repair does not get to cut the others short.
             _text_final.add((hop_pid, hop_model))
+        if msg.get("tool_calls") and _swarm_tool_calls_valid(msg, body.get("tools")):
+            # A tool call the CLI can run: it may settle the race short (see
+            # _SWARM_TOOL_SETTLE_MIN).
+            _valid_acted.add((hop_pid, hop_model))
         return (hop_pid, hop_model, data, msg)
 
     # `ex.map` waited for EVERY member, which is why a turn cost the slowest one
@@ -28976,6 +29187,8 @@ def _swarm_tool_result(body):
     results = []
     _member_why = {}
     _text_final = set()          # members whose answer is a clean TEXT final answer
+    _valid_acted = set()         # members whose tool calls passed _swarm_tool_calls_valid
+    _race_failed_pids = set()    # providers that answered 429/5xx in THIS race
     _started = time.monotonic()
     # A stream's fan-out must finish under the client's header timeout (see
     # _SWARM_TOOL_STREAM_DEADLINE), and the fallback after an empty fan-out
@@ -28991,11 +29204,23 @@ def _swarm_tool_result(body):
         # category a "coding-swarm" id set -- does not exist. Captured here, at
         # fan-out start, and carried into every member.
         _member = _pipeline_bound(_carry_usage_source(_run))
-        pending = {ex.submit(_member, pm) for pm in picks}
+        _fut_pid = {}
+        for pm in picks:
+            _fut_pid[ex.submit(_member, pm)] = pm[0]
+        pending = set(_fut_pid)
         _fanout_started = time.monotonic()
         deadline = _fanout_started + _fan_limit
+        # Never past a request clock that is already running (a stream starts
+        # it just above): the grace below can only shorten the race.
+        try:
+            _req_at = getattr(g, "hub_deadline_at", None)
+        except RuntimeError:                     # outside a request context
+            _req_at = None
+        if isinstance(_req_at, (int, float)) and _req_at > _fanout_started:
+            deadline = min(deadline, _req_at)
         cutoff = deadline
         settled_empty = 0            # members that finished without a usable answer
+        short_grace = False          # the valid-tool-call grace has been set
         while pending:
             remaining = cutoff - time.monotonic()
             if remaining <= 0:
@@ -29018,7 +29243,18 @@ def _swarm_tool_result(body):
             texts = [r for r in results
                      if not (r[3] or {}).get("tool_calls")
                      and (r[0], r[1]) in _text_final]
-            if cutoff == deadline and (acted_now or texts):
+            # Members still running on a provider that already answered 429 or
+            # 5xx in this race: same account / same gateway, same fate
+            # (measured: two g4f members 524'd in one race). Not waited on.
+            doomed = {f for f in pending if _fut_pid.get(f) in _race_failed_pids}
+            if not short_grace and any((r[0], r[1]) in _valid_acted for r in results):
+                # A CHECKED tool call is in hand: short grace, adaptive to how
+                # long the winner took (see _SWARM_TOOL_SETTLE_MIN).
+                short_grace = True
+                _now = time.monotonic()
+                cutoff = min(cutoff, deadline,
+                             _now + _swarm_tool_grace(_now - _fanout_started))
+            elif cutoff == deadline and (acted_now or texts):
                 # THE GRACE IS A FLOOR, NOT A CEILING. Measured in the note on
                 # _SWARM_STRAGGLER_GRACE: members answered at 5s, 78s and 111s.
                 # Starting a 90s clock at the FIRST answer put the cutoff at
@@ -29034,10 +29270,16 @@ def _swarm_tool_result(body):
                 # (picks minus those that already failed) answered in clean
                 # text and none called a tool -- the turn is a question. Settle
                 # within the trivial budget from the fan-out's start.
-                viable = len(picks) - settled_empty
+                viable = len(picks) - settled_empty - len(doomed)
                 if 2 * len(texts) > viable:
                     cutoff = min(cutoff, max(time.monotonic(),
                                              _fanout_started + _SWARM_TEXT_SETTLE))
+            if results and pending and pending <= doomed:
+                # An answer is in hand and everything still running is on a
+                # provider that already failed this race: stop now. With NO
+                # answer yet they are still waited on -- falling back would
+                # re-dispatch to the same providers while these still run.
+                break
     finally:
         # Anything still running from here on was abandoned by US, not failed by
         # the provider -- stop counting it against the model.
@@ -29064,7 +29306,9 @@ def _swarm_tool_result(body):
     # where the others reached for a tool has done strictly less of the job.
     # Within either group, the better-ranked model wins.
     acted = [r for r in results if (r[3].get("tool_calls"))]
-    pool = acted or results
+    # ...and a tool call the CLI can run beats one it cannot (unknown tool name,
+    # arguments that are not a JSON object -- _swarm_tool_calls_valid).
+    pool = [r for r in acted if (r[0], r[1]) in _valid_acted] or acted or results
     hop_pid, hop_model, data, _msg = max(
         pool, key=lambda r: _benchmark_score(r[0], r[1]))
     _log.info("[swarm-tools] %d/%d models answered, %d used a tool -> %s/%s",

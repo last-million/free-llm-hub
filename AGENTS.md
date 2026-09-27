@@ -715,6 +715,16 @@ Covered by `tests/test_tool_turn_timeouts.py`. Live on 7cb23ff: Claude Code
 - **Streamed fan-out bound**: `_SWARM_TOOL_STREAM_DEADLINE` (180 s) and the
   request clock starts at the fan-out, so the fallback after an empty
   fan-out shares it (the turn stays under the ~300 s client header timeout).
+- **Fan-out members & settle** (`tests/test_swarm_fanout_members.py`):
+  `_swarm_tool_candidates` drops sick pairs (`_swarm_member_sick`: provider
+  parked/throttled/exhausted, model throttled/dead/not offered/benched,
+  `_recent_hop_fail`, `_relay_tool_sick`, the fan-out ledger
+  `_swarm_member_fail`) BEFORE the identity de-dup; < 2 healthy = old
+  selection. A member's 429 -> `_recent_hop_fail`, 5xx -> `_throttle_failed_hop`,
+  any failure -> `_swarm_member_fail` (600 s). A VALID tool call
+  (`_swarm_tool_calls_valid`) ends the race after `_swarm_tool_grace`
+  (0.5x its latency, 15-25 s, <= `_SWARM_STRAGGLER_GRACE`); with an answer in
+  hand, members of a provider that 429/5xx'd in the same race are not waited on.
 - **Stalls vs 429s**: `_recent_hop_stall` (recent failure kind
   deadline/timeout). When every candidate failed recently the router still
   prefers a pair that 429'd over one that stalled (so a session pin re-picks
