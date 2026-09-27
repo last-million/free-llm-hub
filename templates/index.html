@@ -7501,6 +7501,7 @@
         connPill +
       '</div>' +
       (c.detail ? '<div class="cli-card-detail">' + esc(c.detail) + '</div>' : '') +
+      (c.env_note ? '<div class="cli-setup-note cli-env-note">' + esc(c.env_note) + '</div>' : '') +
       '<div class="cli-card-foot">' +
         '<button type="button" class="' + btnClass + '">' + btnLabel + '</button>' +
         '<button type="button" class="btn sm ghost act-test" title="Send a live 1-token request through the hub to verify it works">Test</button>' +
@@ -7799,6 +7800,135 @@
     });
   }
 
+  /* ---------- shared environment variables (OPENAI_BASE_URL, ...) ----------
+     A hub URL in the user's persistent environment is shared by every tool that
+     reads that var. Disconnect removes it only when no other connected tool
+     relies on it; otherwise this modal names who still uses it and offers an
+     explicit "Remove <VAR>" whose preview (the tools it reaches) is shown before
+     the user confirms. All dynamic text goes through esc(). */
+  function envRemoveControl(name){
+    var box = document.createElement('div'); box.className = 'env-remove';
+    var btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'btn sm danger';
+    btn.textContent = 'Remove ' + name + ' from my user environment';
+    var out = document.createElement('div'); out.className = 'env-remove-out'; out.setAttribute('role', 'status');
+    btn.addEventListener('click', function(){
+      btn.disabled = true;
+      out.innerHTML = '';
+      api('/api/env/remove', { method: 'POST', body: { name: name } }).then(function(p){
+        var aff = (p && Array.isArray(p.affects)) ? p.affects : [];
+        var t = document.createElement('div'); t.className = 'note';
+        t.innerHTML = 'Removing <code>' + esc(name) + '</code> affects ' +
+          (aff.length ? 'these tools' : 'no tool on this dashboard') +
+          ', and any other program that reads it:';
+        out.appendChild(t);
+        if (aff.length){
+          var ul = document.createElement('ul');
+          aff.forEach(function(a){
+            var li = document.createElement('li');
+            li.innerHTML = '<b>' + esc(a.name) + '</b>' + (a.connected ? ' (connected)' : '') +
+              (a.via ? ' — ' + esc(a.via) : '');
+            ul.appendChild(li);
+          });
+          out.appendChild(ul);
+        }
+        var row = document.createElement('div'); row.className = 'modal-block';
+        var yes = document.createElement('button');
+        yes.type = 'button'; yes.className = 'btn sm danger'; yes.textContent = 'Yes, remove ' + name;
+        var no = document.createElement('button');
+        no.type = 'button'; no.className = 'btn sm ghost'; no.textContent = 'Cancel';
+        no.addEventListener('click', function(){ out.innerHTML = ''; btn.disabled = false; });
+        yes.addEventListener('click', function(){
+          yes.disabled = true; no.disabled = true;
+          api('/api/env/remove', { method: 'POST', body: { name: name, confirm: true } }).then(function(res){
+            out.innerHTML = '';
+            var d = document.createElement('div'); d.className = 'note';
+            d.textContent = (res && res.note) || ('Removed ' + name + ' from your user environment.');
+            out.appendChild(d);
+            btn.remove();
+            toast('Removed ' + name + ' from your user environment');
+            loadClis();
+          }).catch(function(e){
+            out.innerHTML = '';
+            var d = document.createElement('div'); d.className = 'cli-setup-note';
+            d.textContent = 'Not removed: ' + e.message;
+            out.appendChild(d);
+            btn.disabled = false;
+          });
+        });
+        row.appendChild(yes); row.appendChild(no);
+        out.appendChild(row);
+      }).catch(function(e){
+        var d = document.createElement('div'); d.className = 'cli-setup-note';
+        d.textContent = 'Not removed: ' + e.message;
+        out.appendChild(d);
+        btn.disabled = false;
+      });
+    });
+    box.appendChild(btn); box.appendChild(out);
+    return box;
+  }
+  function envKeptBlock(k){
+    var wrap = document.createElement('div'); wrap.className = 'modal-block env-var-block';
+    var users = Array.isArray(k.used_by) ? k.used_by : [];
+    var shared = Array.isArray(k.shared_by) ? k.shared_by : [];
+    var html = '<code>' + esc(k.name) + '</code> in your user environment still points at the hub';
+    if (users.length){
+      html += ' and was left in place: ' + esc(users.join(', ')) + (users.length === 1 ? ' still uses' : ' still use') + ' it.';
+    } else {
+      html += k.error ? ' (' + esc(k.error) + ').' : '.';
+    }
+    html += shared.length ? ' Shared by: ' + esc(shared.join(', ')) + '.' : ' No other installed tool on this dashboard reads it.';
+    var p = document.createElement('div'); p.className = 'note'; p.innerHTML = html;
+    wrap.appendChild(p);
+    if (k.scope === 'user') wrap.appendChild(envRemoveControl(k.name));
+    return wrap;
+  }
+  function openEnvModal(c, r){
+    var name = c.name || c.id, safe = esc(name);
+    var env = r.env || {};
+    var box = frag();
+    function line(cls, html){
+      var d = document.createElement('div'); d.className = cls; d.innerHTML = html; box.appendChild(d);
+    }
+    if (r.still_connected){
+      line('chat-note show', esc(r.still_connected_detail || (name + ' still reaches the hub.')));
+    } else {
+      line('note', safe + ' is disconnected' +
+        (r.wrote_path ? ': its hub setup was removed from <code>' + esc(shortPath(r.wrote_path)) + '</code>' : '') +
+        '. The hub’s models, efforts and modes no longer appear in it.');
+    }
+    (env.removed || []).forEach(function(n){
+      line('cli-setup-note', 'Removed <code>' + esc(n) + '</code> from your user environment — no other connected tool used it.');
+    });
+    var shown = {};
+    (env.kept || []).forEach(function(k){ shown[String(k.name).toUpperCase()] = 1; box.appendChild(envKeptBlock(k)); });
+    (env.session || []).forEach(function(n){
+      shown[String(n).toUpperCase()] = 1;
+      line('cli-setup-note', '<code>' + esc(n) + '</code> points at the hub in the environment the hub was started from (not your saved user environment); it goes away when that terminal is closed and the hub is restarted from a new one.');
+    });
+    if (env.effect) line('cli-setup-note', esc(env.effect));
+    line('chat-note show', 'Terminals that are already open keep the old value until you close and reopen them. If ' + safe + ' is open, restart it.');
+    if (r.commands) appendCommandBlocks(box, r.commands);
+    /* Other hub-pointing vars no tool on this card reads (e.g. LLM_BASE_URL). */
+    var others = document.createElement('div');
+    box.appendChild(others);
+    api('/api/env/hub-vars').then(function(h){
+      (h && Array.isArray(h.vars) ? h.vars : []).forEach(function(v){
+        if (shown[String(v.name).toUpperCase()] || v.scope !== 'user') return;
+        var aff = Array.isArray(v.affects) ? v.affects.map(function(a){ return a.name; }) : [];
+        others.appendChild(envKeptBlock({ name: v.name, scope: v.scope, used_by: [], shared_by: aff }));
+      });
+    }).catch(function(){});
+    var act = document.createElement('div'); act.className = 'modal-block';
+    var got = document.createElement('button');
+    got.type = 'button'; got.className = 'btn primary'; got.textContent = 'Got it';
+    got.addEventListener('click', closeModal);
+    act.appendChild(got);
+    box.appendChild(act);
+    openModal(name + (r.still_connected ? ' — still connected' : ' disconnected'), box);
+  }
+
   function doDisconnect(c, btn){
     busyBtn(btn, 'Disconnecting…');
     api('/api/clis/' + encodeURIComponent(c.id) + '/disconnect', { method: 'POST' }).then(function(r){
@@ -7824,9 +7954,20 @@
         resetBtn(btn, 'Disconnect');
         return;
       }
+      /* A shared env var (OPENAI_BASE_URL, ...) was involved: removed, or left in
+         place because another connected tool uses it. Say exactly that — what was
+         disconnected, which var remains, who shares it — with an explicit Remove
+         button, instead of the old "an env var still points X at the hub" toast
+         (a shared var never made a config-wired CLI "connected"). */
+      var envInfo = (r.env && typeof r.env === 'object') ? r.env : null;
+      if (envInfo && ((envInfo.kept || []).length || (envInfo.removed || []).length || (envInfo.session || []).length)){
+        toast(r.still_connected
+          ? name + ' still reaches the hub through a shared environment variable'
+          : name + ' disconnected', !!r.still_connected);
+        return loadClis().then(function(){ openEnvModal(c, r); });
+      }
       /* The backend re-checks reality after reverting: `still_connected` means the
-         config revert worked but something else — usually a hub-pointing env var,
-         which overrides the config file — still wires the CLI to the hub. Warn
+         config revert worked but the CLI still reports as wired to the hub. Warn
          instead of claiming a clean success (the old lie behind "I clicked
          Disconnect, it said done, but the CLI is still connected"). The card will
          keep showing "Connected" after loadClis(); that is now truthful. */
@@ -7835,9 +7976,7 @@
         var warnHtml = r.note
           ? esc(r.note)
           : ('Config was reverted, but ' + safe + ' is still pointed at the hub via ' + esc(via) + '.');
-        toast(via === 'env'
-          ? 'Disconnected in config — but an env var still points ' + name + ' at the hub'
-          : name + ' disconnected in config — but it still reports as connected', true);
+        toast(name + ' disconnected in config — but it still reports as connected', true);
         return loadClis().then(function(){
           var wlines = [ { cls:'chat-note show', html: warnHtml } ];
           if (r.restart_hint) wlines.push({ cls:'cli-setup-note', html: esc(r.restart_hint) });
