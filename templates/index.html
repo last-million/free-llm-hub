@@ -2229,7 +2229,12 @@
      reachable from the sidebar — so it costs ~64px of the very height the split
      needs. Hidden only on that view. */
   body.cx-agent-view > header{ display:none; }
-  body.cx-agent-view main.wrap{ padding-top:14px; }
+  body.cx-agent-view main.wrap{ padding-top:6px; }
+  /* .section's generic 26px top margin stacked on the padding above: ~40px of
+     empty band over the first row. REPORTED 2026-09-27 with a screenshot
+     ("still useless empty space on top"). The agent view's first row sits
+     right under the top edge instead. */
+  body.cx-agent-view main.wrap > section#agent-section.cx-active{ margin-top:0; }
   /* The agent view is a full-height working surface -- a terminal above a
      preview -- so every strip of chrome comes straight out of the space the
      user is actually working in. The quota banner and the site footer are both
