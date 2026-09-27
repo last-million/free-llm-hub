@@ -187,8 +187,26 @@ when it exists, and Connect/Disconnect act on all of them (per-file previous
 default under `_kimi_prev_setting(path)`). Connect writes one alias per tier
 (`_HUB_TIER_IDS`: auto/best/swarm); a user alias with a tier's name is kept.
 A Connect-created file is deleted on Disconnect. Covered by
-`tests/test_kimi_code_home.py`. Open gap: `mcp_manager` still registers kimi
-MCP servers in `~/.kimi/config.toml`; Kimi Code reads `~/.kimi-code/mcp.json`.
+`tests/test_kimi_code_home.py`. MCP: `mcp_manager` writes kimi servers to
+`<KIMI_CODE_HOME or ~/.kimi-code>/mcp.json` as `{"mcpServers": {name:
+{"transport": "http"|"stdio", ...}}}` (Kimi Code's own zod schema); a machine
+with only the legacy `~/.kimi/config.toml` keeps `[mcp_servers.*]`. Legacy TOML
+entries stay listed and are removed too. Covered by `tests/test_protocol_misc.py`.
+
+## Protocol leftovers (2026-09-27, `tests/test_protocol_misc.py`)
+
+- Hermes Connect also writes `providers.free-llm-hub` (`api` = model.base_url,
+  `models.<tier>.context_length`); Hermes matches it to the route by URL
+  (`get_custom_provider_context_length`). Disconnect removes it.
+- `/v1/responses` never emits a nameless `function_call`: named from its
+  arguments when exactly one offered tool fits (`_infer_tool_name`), else
+  dropped; a peek whose only tool call stays nameless is `empty` (next hop).
+  Headers `X-Free-LLM-Hub-Provider/-Model` + `metadata.free_llm_hub_provider/
+  _model`; `model` still echoes the client's id (verified with codex 0.154).
+- 400 "not currently offered" (dahl) = `_NOT_OFFERED_TTL` (60 s) routing skip
+  (`_is_model_skipped`), no reliability failure, no dead mark, never relayed.
+- `_is_slow_model`: measured TTFT (>= 5 samples: p50 >= 17.5 s slow, p95 <
+  17.5 s fast) before `_SLOW_MODEL_RE`; drives the peek and trivial budgets.
 
 ## Config-only CLIs: tiers + windows in the documented file (2026-09-27)
 
