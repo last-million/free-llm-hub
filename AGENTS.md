@@ -637,6 +637,38 @@ ran out; each subscription call is 100-150 s).
 - Scaled simulation (manager 110 s, free phase 50 s, synthesis 60 s), tally
   plan: 6 manager calls / ~550 s before, 3 calls / ~440 s now.
 
+## Tool-turn reliability (2026-09-27)
+
+Covered by `tests/test_tool_turn_reliability.py`. Live on 8bf19be: a 16K
+opencode tool turn spent all 240 s on nvidia (llama-3.2-90b-vision ReadTimeout,
+then more nvidia); kimi saw 9x 504/503 with g4f walking 7 relay hops.
+
+- **Chain** (`_build_chain`, tool branch): vision-specialised ids
+  (`_is_vision_specialised`: `-vision`, `-vl-`, llava...) go behind every other
+  candidate unless the turn has an image, and `_route_by_difficulty` never
+  opens a tool turn on one; a pair measured on TOOL turns to mostly fail
+  (`_tool_outcomes`, `_tool_turn_sick`) joins the measured-to-fail group; a
+  pair measured slow to first content (`_tool_ttft`, else all ttft samples,
+  p50 > `_TOOL_SLOW_TTFT_MS`) goes behind the quick ones in its group.
+  Unmeasured moves nothing; a healthy chain keeps its strength order.
+- **Walk** (`_ChainClock(tools=, est=)`): a provider that stalled
+  (timeout/hop budget/silent peek) or had `_TOOL_PER_PROVIDER_HOPS` (2) failed
+  hops goes behind the others; while another provider waits, one provider gets
+  at most `_TOOL_PROVIDER_SHARE` (50%, 75% past 48K tokens) of the deadline.
+- **Relays**: `_relay_server_id` = the g4f backend prefix (`srv_x`,
+  `pa:hash`, `RelayRouter`). ConnectionError / non-answer on a tool turn is a
+  strike; 2 in 15 min skips that server for tool requests. Tool chains carry
+  at most `_TOOL_RELAY_MAX_HOPS` (3) relay hops; a server that failed in a
+  walk is not retried in it.
+- **Trims** (`_trim_largest_message`): middle-only, line-aligned; the marker
+  states the exact chars (and lines) cut "from the MIDDLE"; a tool result keeps
+  half as tail and always its whole last line. `<env>` /
+  `<environment_context>` blocks and cwd lines in the cut are carried over
+  verbatim. MEASURED live on old code: Kimi-shaped prompt trimmed for groq
+  (8K) -> cwd lost 5/5; the new trim's payload -> cwd answered 4/4.
+- Pipeline tool turns (fan-out + fast path) pass the CLI's messages
+  unchanged to every member; the env loss was the per-model trim above.
+
 ## Long conversations in real use (2026-09-27)
 
 Verified live (160K-token histories on all 3 protocols; Claude Code
