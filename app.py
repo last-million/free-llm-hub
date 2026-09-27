@@ -18716,14 +18716,27 @@ def _autofix_claude(entry, key, base_root, base_v1, model):
     # to ONE provider and skips difficulty/vision routing + load spreading entirely.
     # Assigned rather than skipped so a stale pin from an earlier connect is cleared.
     env["ANTHROPIC_MODEL"] = "auto"
+    # Claude Code >= 2.1.283 refuses to treat "auto" (or any hub id) as a model
+    # it knows until a modelPicker row maps it (behavesAs), and assumes a 200k
+    # window meanwhile -- see agentic_chat.claude_model_picker for the
+    # measurements. The picker rows also make every tier / category / compound
+    # selectable in /model. What was there before is remembered so Disconnect
+    # can put it back (_claude_remember_prior / _claude_strip_hub).
+    hub_env = agentic_chat.claude_hub_env()
+    picker = agentic_chat.claude_model_picker()
+    _claude_remember_prior(env, data, hub_env, picker)
+    env.update(hub_env)
     data["env"] = env
+    data["modelPicker"] = picker
     _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     return {
         "ok": True,
         "wrote_path": path,
         "backup_path": backup,
         "applied": {"file_key": "env", "ANTHROPIC_BASE_URL": base_root,
-                    "ANTHROPIC_AUTH_TOKEN": _mask_key(key), "ANTHROPIC_MODEL": "auto"},
+                    "ANTHROPIC_AUTH_TOKEN": _mask_key(key), "ANTHROPIC_MODEL": "auto",
+                    "modelPicker": "%d hub models" % len(picker["options"]),
+                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": hub_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]},
         "restart_hint": "Restart Claude Code (open a new terminal) so it re-reads ~/.claude/settings.json.",
     }
 
@@ -19300,9 +19313,7 @@ def _discard_backup(path):
 
 # Claude Code's own /model aliases: never treated as a hub id even where the
 # hub happens to use the same word.
-_CLAUDE_OWN_MODEL_ALIASES = frozenset({
-    "default", "sonnet", "opus", "haiku", "opusplan", "best",
-    "sonnet[1m]", "opus[1m]"})
+_CLAUDE_OWN_MODEL_ALIASES = agentic_chat._CLAUDE_CODE_ALIASES
 _HUB_PROVIDER_PREFIXES = ("free-llm-hub/", "freehub/", "free-hub/")
 
 
@@ -19593,17 +19604,103 @@ def _claude_is_hub_model(mid):
             and str(mid).strip().lower() not in _CLAUDE_OWN_MODEL_ALIASES)
 
 
-def _claude_strip_hub(data, bak_env=None):
+# What Connect found in settings.json before it wrote the model mapping, so
+# Disconnect can put exactly that back: {"env": {key: prior value or None},
+# "wrote_env": {key: value written}, "modelPicker": prior value or None,
+# "wrote_picker_models": [ids]}. Consumed by Disconnect.
+_CLAUDE_PREV_SETTING = "claude_connect_prev"
+
+
+def _claude_prev_record():
+    try:
+        rec = config.get_setting(_CLAUDE_PREV_SETTING)
+    except Exception:                                            # noqa: BLE001
+        return {}
+    return dict(rec) if isinstance(rec, dict) else {}
+
+
+def _claude_is_hub_picker(value, extra=()):
+    """True for a modelPicker whose every row is a hub-only id (ours)."""
+    if not isinstance(value, dict):
+        return False
+    rows = value.get("options")
+    if not isinstance(rows, list) or not rows:
+        return False
+    extra = {str(m).strip().lower() for m in extra or ()}
+    for r in rows:
+        m = r.get("model") if isinstance(r, dict) else None
+        if not isinstance(m, str):
+            return False
+        if not (_is_hub_virtual_model(m) or m.strip().lower() in extra):
+            return False
+    return True
+
+
+def _claude_remember_prior(env, data, hub_env, picker):
+    """Record, before Connect overwrites them, the user's own values of the keys
+    the model mapping writes. A reconnect keeps the FIRST connect's prior values
+    (the current ones are ours by then); a value equal to ours, or a hub id, is
+    never recorded as the user's."""
+    rec = _claude_prev_record()
+    prev_env = rec.get("env") if isinstance(rec.get("env"), dict) else {}
+    prev_env = dict(prev_env)
+    for k, v in hub_env.items():
+        if k in prev_env:
+            continue
+        cur = env.get(k)
+        keep = isinstance(cur, str) and cur and cur != v and not _claude_is_hub_model(cur)
+        prev_env[k] = cur if keep else None
+    rec["env"] = prev_env
+    rec["wrote_env"] = dict(hub_env)
+    if "modelPicker" not in rec:
+        cur = data.get("modelPicker")
+        rec["modelPicker"] = None if (cur is None or _claude_is_hub_picker(cur)) else cur
+    rec["wrote_picker_models"] = [r["model"] for r in picker.get("options", [])]
+    config.set_setting(_CLAUDE_PREV_SETTING, rec)
+
+
+def _claude_strip_mapping_env(env, rec=None):
+    """Drop the model-mapping / window keys Connect wrote and put back what was
+    there before (rec). A key the user has changed since is theirs and stays.
+    Without a record (a connect made by an older hub, or settings.local.json)
+    only values that are ours are dropped. Returns changed."""
+    rec = rec if isinstance(rec, dict) else {}
+    wrote = rec.get("wrote_env") if isinstance(rec.get("wrote_env"), dict) else {}
+    prev = rec.get("env") if isinstance(rec.get("env"), dict) else {}
+    now = agentic_chat.claude_hub_env()
+    changed = False
+    for k in dict.fromkeys(list(now) + list(wrote)):
+        v = env.get(k)
+        if v is not None:
+            ours = (v == wrote.get(k) or v == now.get(k)
+                    or (k.startswith("ANTHROPIC_") and _claude_is_hub_model(v)))
+            if not ours:
+                continue
+            env.pop(k, None)
+            changed = True
+        p = prev.get(k)
+        if isinstance(p, str) and p and k not in env:
+            env[k] = p
+            changed = True
+    return changed
+
+
+def _claude_strip_hub(data, bak_env=None, rec=None):
     """Strip the hub from one parsed Claude settings object in place.
     Returns changed. The env block is only touched when it points HERE; a
-    top-level "model" that /model set to a hub-only id is dropped either way
-    (Anthropic would reject it)."""
+    top-level "model" that /model set to a hub-only id, and a modelPicker made
+    only of hub ids, are dropped either way (Anthropic would reject them).
+    `rec` (the Connect-time record) restores what the mapping replaced."""
     changed = False
     env = data.get("env")
     if isinstance(env, dict) and _points_at_hub(env.get("ANTHROPIC_BASE_URL")):
         for k in _CLAUDE_HUB_ENV:
             if env.pop(k, None) is not None:
                 changed = True
+        # Before the _CLAUDE_MODEL_ENV sweep below: it would drop our
+        # ANTHROPIC_DEFAULT_*_MODEL values without restoring the user's.
+        if _claude_strip_mapping_env(env, rec):
+            changed = True
         for k in _CLAUDE_MODEL_ENV:
             if _claude_is_hub_model(env.get(k)):
                 env.pop(k, None)
@@ -19616,6 +19713,12 @@ def _claude_strip_hub(data, bak_env=None):
                     env[k] = v
         if not env:
             data.pop("env", None)
+    rec = rec if isinstance(rec, dict) else {}
+    if _claude_is_hub_picker(data.get("modelPicker"), rec.get("wrote_picker_models")):
+        data.pop("modelPicker", None)
+        if rec.get("modelPicker") is not None:
+            data["modelPicker"] = rec["modelPicker"]
+        changed = True
     if _claude_is_hub_model(data.get("model")):
         data.pop("model", None)
         changed = True
@@ -19646,14 +19749,21 @@ def _disconnect_claude(entry):
             bak = _read_backup_json(path)
             bak_env = bak.get("env") if isinstance(bak, dict) else None
             # Only touch keys we set, and only when the base URL is ours; the
-            # pre-hub values come back from the Connect-time backup.
-            changed = _claude_strip_hub(data, bak_env)
+            # pre-hub values come back from the Connect-time backup (the three
+            # connection keys) and the Connect-time record (the model mapping).
+            rec = _claude_prev_record()
+            changed = _claude_strip_hub(data, bak_env, rec)
             if changed:
                 _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
             _discard_backup(path)  # strip succeeded -> stale backup no longer needed
+            if rec:
+                config.set_setting(_CLAUDE_PREV_SETTING, None)   # consumed
             return {"restored_from_backup": False, "wrote_path": path,
                     "changed": changed or local_changed, "restart_hint": hint}
     # Live file missing or no longer valid JSON -> fall back to the frozen backup.
+    if _claude_prev_record():
+        config.set_setting(_CLAUDE_PREV_SETTING, None)
+
     if _restore_backup(path):
         return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
     return {"restored_from_backup": False, "wrote_path": path,

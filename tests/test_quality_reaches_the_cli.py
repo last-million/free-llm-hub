@@ -97,7 +97,9 @@ def test_claude_normal_is_unchanged():
 
 
 def test_claude_max_asks_for_best():
-    assert _model_in(_argv("claude", "max")) == "best"
+    # The best tier, spelled `max`: Claude Code resolves "best" as its OWN
+    # alias (MEASURED on 2.1.283: sent as model="claude-fable-5-1").
+    assert _model_in(_argv("claude", "max")) == "max"
 
 
 def test_claude_swarm_asks_for_swarm():

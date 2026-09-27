@@ -55,11 +55,15 @@ def test_an_unknown_quality_falls_back_to_normal():
 
 
 def test_max_launches_the_cli_pointed_at_best():
+    """The best tier, spelled `max` for Claude Code: "best" is one of its OWN
+    aliases, and MEASURED on 2.1.283 it went out as model="claude-fable-5-1" --
+    plain auto routing. The hub treats `max` exactly like `best`."""
     env = {}
     with mock.patch.object(agentic_chat, "_isolated_signed_in", return_value=False), \
             mock.patch.object(agentic_chat, "_hub_base_url", return_value="http://h"):
         agentic_chat._apply_claude_hub_fallback(env, "/cfg", "max")
-    assert env["ANTHROPIC_MODEL"] == "best"
+    assert env["ANTHROPIC_MODEL"] == "max"
+    assert app._quality_route_kwargs("max", False) == app._quality_route_kwargs("best", False)
 
 
 def test_normal_launches_the_cli_pointed_at_auto():
