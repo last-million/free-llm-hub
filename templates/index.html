@@ -2517,7 +2517,23 @@
   body.cx-agent-view #agent-section > #agent-warning{ grid-column:1; }
   body.cx-agent-view #agent-section > #agent-collapse-bar{ grid-column:2; }
   body.cx-agent-view #agent-section.agent-top-collapsed > #agent-collapse-bar{
-    grid-column:1 / -1; margin:0 0 8px; }
+    grid-column:1 / -1; margin:0 0 4px; }
+  /* Collapsed = ONE THIN LINE. REPORTED 2026-09-27: "even after collapsing it's
+     a large vertical space" -- the 34px button and 8px margin made the summary
+     row as tall as the controls it replaced. Desktop gets a 24px button and a
+     tight line; phones keep the 44px touch target (see the media query). */
+  body.cx-agent-view #agent-section.agent-top-collapsed{ row-gap:0; }
+  body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-bar{ gap:6px; }
+  body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-summary{
+    font-size:11.5px; line-height:1.2; gap:6px; }
+  body.cx-agent-view #agent-section.agent-top-collapsed .acs-perm{
+    font-size:10px; padding:1px 6px; }
+  @media (min-width:641px){
+    body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-btn{
+      width:24px; height:24px; }
+    body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-btn svg{
+      width:14px; height:14px; }
+  }
   .agent-collapse-bar{ display:flex; align-items:center; justify-content:flex-end;
     gap:10px; min-width:0; }
   .agent-collapse-summary{ display:flex; align-items:center; gap:8px; flex:1 1 auto;
