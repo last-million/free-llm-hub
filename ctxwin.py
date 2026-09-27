@@ -281,13 +281,18 @@ _USER_FACT_RE = re.compile(
     r"|\b[A-Za-z]+[-_]?\d+[\w.-]*\b|\b\d[\d.,]*\s*(?:ms|s|sec|seconds?|minutes?|px|%|"
     r"kb|mb|gb|k|tokens?|usd|eur)\b"
     r"|\b(?:prefer|always|never|must|remember|call me|my name|named?|codename|"
-    r"instead of|do not|don't|deadline|port|version)\b", re.I)
+    r"instead of|do not|don't|deadline|port|version|favou?rite|preferred)\b"
+    # a personal fact with no digit and no "remember": "My favourite colour is
+    # teal" was dropped (nothing above matched a plain "my X is <word>").
+    r"|\bmy\s+(?:[\w'’-]+\s+){0,2}?(?:colou?r|name|email|city|country|timezone|time\s+zone"
+    r"|birthday|pet|dog|cat|username|handle|nickname|pronouns?|language|editor|shell)"
+    r"\s+(?:is|are|was)\b", re.I)
 _USER_FACT_MAX_SENTENCE = 300      # longer is a pasted blob, not a statement
 # A STANDING rule / preference / name: kept in its own share, so a long run of
 # per-step values ("step 12: use value=12") cannot push "I prefer tabs" out.
 _USER_RULE_RE = re.compile(
     r"\b(?:prefer|always|never|must|remember|call me|my name|codename|"
-    r"instead of|do not|don't)\b", re.I)
+    r"instead of|do not|don't|favou?rite|preferred)\b", re.I)
 EXACT_FACTS_MAX_RULES = 8
 _DECISION_LINE_RE = re.compile(
     r"^\s*(?:[-*]\s*)?(?:decision|decided|constraint|agreed)\b\s*[:\-]", re.I | re.M)
