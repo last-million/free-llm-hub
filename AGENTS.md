@@ -577,6 +577,9 @@ turn 1 recalled at turn 7). Covered by `tests/test_long_request_upload.py`,
   (`_summary_user_content`) and the recap carries a USER FACTS & RULES
   section — it once obeyed the conversation's "answer in French, start with
   OK:" rule and invented a goal.
+- **Template junk**: answer_check `template_junk` rejects a reply that is only
+  a `<|x|>` token (+ at most one glued word) and a punctuation run —
+  nvidia/kimi-k3 shipped "<|close|>!!!!…" as 3 codex turns.
 - Still true at 220K real tokens: one free hop can need 110-210s, so a
   request can hit `request_deadline_seconds` (240) -> clean 504. The CLIs'
   declared windows (128K / codex 96K) keep real sessions well below that.
