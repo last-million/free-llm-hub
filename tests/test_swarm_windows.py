@@ -871,6 +871,31 @@ def test_evicting_a_run_removes_its_file_too():
     assert len(files) <= SW.MAX_RUNS + 1
 
 
+def test_a_locked_run_file_is_retried_not_silently_lost(monkeypatch):
+    """Windows os.replace raises PermissionError while another handle has the
+    target open; _persist used to swallow it and the run record was lost."""
+    rid = SW.start("g", ".", "opencode", _spawn, _turn("good"), phases=PHASES,
+                   review=False)
+    _wait(rid)
+    run = SW._RUNS[rid]
+    path = os.path.join(SW._store_root(), rid + ".json")
+    os.remove(path)
+    real = SW.os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(13, "locked")
+        return real(src, dst)
+
+    monkeypatch.setattr(SW.os, "replace", flaky)
+    monkeypatch.setattr(SW.time, "sleep", lambda s: None)
+    assert SW._persist(run) is True          # one save, locked twice, then written
+    assert calls["n"] == 3
+    assert os.path.exists(path)
+
+
 def test_a_corrupt_run_file_is_skipped_not_fatal():
     rid = SW.start("g", ".", "opencode", _spawn, _turn("good"), phases=PHASES,
                    review=False)

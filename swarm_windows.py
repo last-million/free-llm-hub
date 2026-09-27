@@ -210,6 +210,39 @@ def _run_path(run_id, root=None):
     return os.path.join(root or _store_root(), rid + ".json")
 
 
+def _replace_with_retry(tmp, path, attempts=8, delay=0.05):
+    """os.replace, retried while Windows reports the target locked.
+
+    On Windows os.replace raises PermissionError while ANY handle has the
+    target open -- a status read or load() walking the store at that instant.
+    _persist swallowed that, so the run's record was silently not written.
+    FOUND 2026-09-27: test_a_corrupt_run_file_is_skipped_not_fatal saw load()
+    return 0 under full-suite load, passing 100/100 alone. memory.py's _save
+    got the same retry for the same reason; this is its twin."""
+    for i in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay * (i + 1))
+
+
+def _read_json_with_retry(path, attempts=8, delay=0.05):
+    """json-load a run file, retried while Windows reports it locked: a read
+    that lands while _persist is replacing the file raises PermissionError,
+    and load() used to count that GOOD file as corrupt and skip it."""
+    for i in range(attempts):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay * (i + 1))
+
+
 def _persist(run):
     """Write one run to disk. Best-effort: a swarm never fails because the
     record of it could not be written."""
@@ -227,7 +260,7 @@ def _persist(run):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(row, fh, ensure_ascii=False)
-            os.replace(tmp, path)
+            _replace_with_retry(tmp, path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -264,8 +297,7 @@ def load():
     loaded = 0
     for name in names:
         try:
-            with open(os.path.join(root, name), encoding="utf-8") as fh:
-                row = json.load(fh)
+            row = _read_json_with_retry(os.path.join(root, name))
             run = _Run.from_row(row)
         except (OSError, ValueError, TypeError, KeyError):
             continue
