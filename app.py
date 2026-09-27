@@ -9211,6 +9211,24 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         if _benched:
             ordered = [e for e in ordered if not _is_pair_benched(e[1], e[2])]
             _recent = _bench_last(_benched + _recent)
+    if require_tools:
+        # The relay rules (_cap_relay_hops, re-applied below as a fail-open
+        # pass) act WHILE filling, so hop_cap counts only hops that survive
+        # them: dropped relay slots used to shrink a 10-hop tool chain to 6
+        # with alive non-relay candidates left unused.
+        try:
+            _n_relay = sum(1 for e in chain if _is_relay_pid(e[0]))
+            _kept = []
+            for e in ordered:
+                if _is_relay_pid(e[1]) and (e[1], e[2]) not in seen:
+                    if _n_relay >= _TOOL_RELAY_MAX_HOPS or _relay_tool_sick(e[1], e[2]):
+                        continue
+                    _n_relay += 1
+                _kept.append(e)
+            if _kept:
+                ordered = _kept
+        except Exception:                                        # noqa: BLE001
+            pass
     for _score, pid, m in ordered:
         if len(chain) >= hop_cap:
             break
@@ -24195,6 +24213,11 @@ def _stream_peek_timeout(model, est, pid=None):
     byte, and killing that hop abandoned HEALTHY strong models mid-chain."""
     slow = _is_slow_model(pid, model)
     big = bool(est) and est >= STREAM_BIG_REQUEST_TOKENS
+    if big and not slow and _SLOW_MODEL_RE.search((model or "").lower()):
+        # TTFT samples are size-blind (mostly small chats), so a measured
+        # "fast" may ADD nothing here: it never clears a reasoning model's
+        # name-based slowness on a big prompt.
+        slow = True
     if slow and big:
         return STREAM_SLOW_BIG_PEEK_TIMEOUT + _huge_prefill_allowance(est)
     if slow or big:
@@ -24814,6 +24837,7 @@ class _ChainClock:
     # plain one; __init__ gives every instance its own ledgers.
     tools = False
     est = 0
+    pinned = False
     _cur = None
     _rest = ()
     _relay_hops = 0
@@ -24821,7 +24845,7 @@ class _ChainClock:
     _prov_secs = None
     _relay_bad = None
 
-    def __init__(self, trivial=False, tools=False, est=0, stream=False):
+    def __init__(self, trivial=False, tools=False, est=0, stream=False, pinned=False):
         # `est` / `stream`: a long request's deadline grows with its size
         # (see _scaled_request_deadline); omitted, the base deadline as before.
         self.deadline_at = _begin_request_deadline(est, stream) if est else \
@@ -24831,6 +24855,9 @@ class _ChainClock:
         self.trivial = bool(trivial)
         self.tools = bool(tools)
         self.est = int(est or 0)
+        # An explicit `<pid>/<model>` request: _build_chain puts that model at
+        # hop 1 whatever its record says, and the walk must not reorder it.
+        self.pinned = bool(pinned)
         self._hop_started = None
         self._hop_budget = None
         self._last_peek = None
@@ -24870,6 +24897,7 @@ class _ChainClock:
         chain as built."""
         self._ensure_ledgers()
         self._rest = rest = list(chain or ())
+        first = True
         while rest:
             self._close_hop()
             if self.tools:
@@ -24877,7 +24905,12 @@ class _ChainClock:
                 if not rest:
                     break
             i = 0
-            if (self.trivial or self.tools) and (self._stalled or self.tools):
+            if first and self.pinned:
+                # THE USER NAMED THE HEAD (see _build_chain's pinned branch):
+                # it opens the turn even when benched -- the picker below
+                # would silently serve a different model.
+                pass
+            elif (self.trivial or self.tools) and (self._stalled or self.tools):
                 # A junk-benched pair is never what the demotion promotes: it
                 # stays the last hop the built chain made it (see _bench_last).
                 # MEASURED 2026-09-27: nvidia stalled one hop and the benched
@@ -24888,6 +24921,7 @@ class _ChainClock:
                 if i is None:
                     i = next((k for k, e in enumerate(rest)
                               if not _is_pair_benched(e[0], e[1])), 0)
+            first = False
             yield rest.pop(i)
         self._close_hop()
 
@@ -25818,10 +25852,15 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
             if seen_content:
                 box["status"] = _judge(seen_content, complete=False)
             else:
-                # A long nameless tool stream: commit, the translator names it
-                # from its arguments or leaves it out (_responses_stream).
-                box["status"] = ("content" if saw_reasoning or box.get("nameless_tool")
-                                 else "empty")
+                # A long nameless tool stream: commit only when its arguments
+                # so far name the tool (_nameless_verdict; the translator then
+                # repairs it). An uninferable one would reach codex as an
+                # empty response.completed with the 200 already committed, so
+                # it walks to the next hop like a short one does.
+                if box.get("nameless_tool"):
+                    box["status"] = _nameless_verdict(buf, check)
+                else:
+                    box["status"] = "content" if saw_reasoning else "empty"
         except StopIteration:
             # The stream ENDED inside the peek window, so everything the model
             # was ever going to say is in hand -- the best possible moment to
@@ -29989,7 +30028,7 @@ def _chat_completions_uncached(body):
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
         body.get("messages"), body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)),
-        tools=has_tools, est=est, stream=stream)
+        tools=has_tools, est=est, stream=stream, pinned=bool(_pin_kw))
     # Context bookkeeping for this request (original size, conversation id).
     # The native overflow error is an OpenAI-client contract, so it is only
     # armed on the real /v1/chat/completions route -- not on the foreign
@@ -31024,7 +31063,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
         messages, body.get("max_output_tokens"), diff, est, pinned=bool(_pin_kw)),
-        tools=has_tools, est=est, stream=stream)
+        tools=has_tools, est=est, stream=stream, pinned=bool(_pin_kw))
     _chain = _build_chain(pid, resolved, est, require_vision=has_images,
                           require_tools=has_tools, messages=messages,
                           **_pin_kw)
@@ -31955,7 +31994,7 @@ def v1_messages():
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
         oai_messages, body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)),
-        tools=has_tools, est=est, stream=stream)
+        tools=has_tools, est=est, stream=stream, pinned=bool(_pin_kw))
     _chain = _build_chain(pid, resolved, est, require_vision=has_images,
                           require_tools=has_tools, messages=oai_messages,
                           **_pin_kw)

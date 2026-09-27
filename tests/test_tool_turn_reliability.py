@@ -537,3 +537,23 @@ def test_the_fast_path_hands_the_whole_prompt_to_the_strong_model(monkeypatch):
     assert got["model"] == "best"
     assert got["messages"] == body["messages"]
     assert got["tools"] == TOOLS
+
+
+def test_dropped_relay_slots_are_backfilled_up_to_the_hop_cap(fleet, monkeypatch):
+    """The relay cap used to run AFTER the chain was cut at hop_cap, so every
+    relay slot it dropped was simply lost -- a 10-hop tool chain came out
+    shorter with alive non-relay candidates left unused."""
+    fleet["g4f"] = ["srv_%d:model-%d" % (i, i) for i in range(8)]
+    fleet["cerebras"] = ["glm-5.3"] + ["extra-%d" % i for i in range(8)]
+    scores = {"srv_%d:model-%d" % (i, i): 300.0 - i for i in range(8)}
+    base = A._benchmark_score
+    monkeypatch.setattr(A, "_benchmark_score",
+                        lambda pid, m: scores.get(m) or base(pid, m))
+    for srv in ("srv_0:model-0", "srv_1:model-1"):      # sick relay servers
+        A._note_relay_tool_fail("g4f", srv)
+        A._note_relay_tool_fail("g4f", srv)
+    chain = _tool_chain()
+    relay = [e for e in chain if e[0] == "g4f"]
+    assert len(relay) <= A._TOOL_RELAY_MAX_HOPS, chain
+    assert not any(A._relay_tool_sick(p, mm) for p, mm in relay), chain
+    assert len(chain) >= A.TOOLS_MAX_HOPS, chain

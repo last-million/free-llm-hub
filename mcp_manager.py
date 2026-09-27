@@ -54,9 +54,10 @@ _SUPPORTED = ("kimi", "codex", "claude", "opencode", "openclaw", "hermes")
 
 # Only these three are ALSO installed privately by the hub (agentic_chat.py
 # runs them with CODEX_HOME / CLAUDE_CONFIG_DIR / XDG_CONFIG_HOME redirected).
-# openclaw/hermes have no isolated copy, so isolated=True is a clean no-op for
+# kimi/openclaw/hermes have no isolated copy (agentic_chat never runs them, and
+# no KIMI_CODE_HOME redirect exists), so isolated=True is a clean no-op for
 # them rather than a write to a path nothing reads.
-_ISOLATED_CLIS = ("kimi", "codex", "claude", "opencode")
+_ISOLATED_CLIS = ("codex", "claude", "opencode")
 
 
 def _home():
@@ -93,9 +94,6 @@ def _config_path(cli, isolated=False):
         if cli not in _ISOLATED_CLIS:
             return None
         d = _isolated_dir(cli)
-        if cli == "kimi":
-            # Kimi Code run with KIMI_CODE_HOME=d reads d/mcp.json.
-            return os.path.join(d, "mcp.json")
         if cli == "codex":
             return os.path.join(d, "config.toml")
         if cli == "claude":
@@ -183,7 +181,12 @@ def _kimi_legacy_toml():
 def _kimi_uses_mcp_json():
     """True when the installed kimi is Kimi Code (reads mcp.json). Mirrors
     app._p_kimi(): only a machine that has the legacy config and no Kimi Code
-    home at all keeps the legacy TOML file as the active one."""
+    home at all keeps the legacy TOML file as the active one. An explicit
+    KIMI_CODE_HOME always means Kimi Code, even before its dir exists
+    (app._p_kimi uses it unconditionally too)."""
+    env = os.environ.get("KIMI_CODE_HOME")
+    if env and env.strip() and not os.environ.get("MCP_MANAGER_HOME"):
+        return True
     if os.path.isdir(_kimi_code_home()):
         return True
     return not os.path.isfile(_kimi_legacy_toml())

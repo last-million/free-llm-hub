@@ -2308,6 +2308,10 @@
     .cx-burger{width:var(--tap);height:var(--tap)}
     body.cx-on header .logo{margin-left:calc(var(--tap) + 8px);min-height:var(--tap)}
     body.cx-on #exhaust-banner{padding-left:calc(var(--tap) + 24px)}
+    /* A visible banner holds the fixed burger (tall enough to clear it), so
+       the brand row below needs no burger gutter. */
+    body.cx-on:not(.cx-agent-view) #exhaust-banner.show{min-height:calc(var(--tap) + 12px)}
+    body.cx-on:not(.cx-agent-view) #exhaust-banner.show ~ header .logo{margin-left:0}
   }
   @media (prefers-reduced-motion:reduce){
     body.cx-on main.wrap > section.section.cx-active{ animation:none; }
@@ -4631,7 +4635,7 @@
       setPill('pill-providers', n > 0, n + ' enabled');
       setPill('pill-default', !!s.has_default, s.has_default ? 'default set' : 'no default');
       setPill('pill-auth', true, s.local_api_key_set ? 'gateway key set' : 'open (localhost)');
-      if (!s.local_api_key_set){ $('#pill-auth').classList.remove('ok'); syncHeaderStatusSummary(); }
+      if (!s.local_api_key_set){ $('#pill-auth').classList.add('neutral'); $('#pill-auth').classList.remove('ok'); syncHeaderStatusSummary(); }
       var sn = s.connect_snippets || {};
       $('#snippet-claude').textContent = sn.claude_code || '# gateway not ready';
       $('#snippet-openai').textContent = sn.openai || '# gateway not ready';
@@ -8492,8 +8496,11 @@
         if (!el.checked) return;
         var radios = document.querySelectorAll('input[name="sub-scope"]');
         Array.prototype.forEach.call(radios, function(x){ x.disabled = true; });
-        api('/api/subscriptions', { method: 'POST', body: { subscription_scope: el.value } }).then(function(){
-          return loadSubscriptions();
+        /* The POST answers with the same payload renderSubs needs, and
+           renderSubs re-enables the radios. Re-fetching instead left them
+           disabled whenever that GET failed (loadSubscriptions swallows it). */
+        api('/api/subscriptions', { method: 'POST', body: { subscription_scope: el.value } }).then(function(r){
+          renderSubs(r || {});
         }).catch(function(e){
           toast('Update failed: ' + e.message, true);
           Array.prototype.forEach.call(radios, function(x){ x.disabled = false; });
@@ -8506,8 +8513,11 @@
     m.addEventListener('change', function(){
       var want = m.checked;
       m.disabled = true;
-      api('/api/subscriptions', { method: 'POST', body: { enabled: want } }).then(function(){
-        return loadSubscriptions();
+      api('/api/subscriptions', { method: 'POST', body: { enabled: want } }).then(function(r){
+        /* renderSubs never touches the switch's disabled state: re-enable it
+           here, or it stayed greyed out after every successful toggle. */
+        m.disabled = false;
+        renderSubs(r || {});
       }).catch(function(e){
         toast('Update failed: ' + e.message, true);
         m.checked = !want; m.disabled = false;
@@ -12053,13 +12063,18 @@
     var btn = document.getElementById('hd-status-toggle');
     if (!btn) return;
     var pills = document.querySelectorAll('#statusbar .pill:not(.byline)');
-    var bad = 0, ok = 0;
+    /* A .neutral pill (gateway auth "open (localhost)", the stock default)
+       is neither good nor bad: it leaves the denominator, or the dot could
+       never turn green on a default install. */
+    var bad = 0, ok = 0, counted = 0;
     for (var i = 0; i < pills.length; i++){
+      if (pills[i].classList.contains('neutral')) continue;
+      counted++;
       if (pills[i].classList.contains('bad')) bad++;
       else if (pills[i].classList.contains('ok')) ok++;
     }
     btn.classList.toggle('bad', bad > 0);
-    btn.classList.toggle('ok', bad === 0 && ok === pills.length && ok > 0);
+    btn.classList.toggle('ok', bad === 0 && ok === counted && ok > 0);
     btn.setAttribute('aria-label', bad
       ? 'Show hub status (' + bad + ' need' + (bad === 1 ? 's' : '') + ' attention)'
       : 'Show hub status');

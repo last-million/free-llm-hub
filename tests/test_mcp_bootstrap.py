@@ -61,7 +61,7 @@ def test_the_isolated_copies_get_them_too(home):
     """The /agent sessions run against the isolated configs, so a global-only
     registration would leave the hub's own agent chat without either tool."""
     app._ensure_mcp_servers_once()
-    for cli in ("codex", "claude", "opencode", "kimi"):
+    for cli in ("codex", "claude", "opencode"):
         path = m._config_path(cli, isolated=True)
         assert os.path.isfile(path), "%s isolated config not written" % cli
         text = open(path, encoding="utf-8").read()
@@ -148,9 +148,11 @@ def test_list_servers_isolated_returns_a_dict_for_every_cli(home):
     assert isinstance(listed, dict), "must never return add_server's (ok, msg) tuple"
     for cli in m.supported_clis():
         assert cli in listed, "%s missing -- the listing was truncated early" % cli
-    for cli in ("codex", "claude", "opencode", "kimi"):
+    for cli in ("codex", "claude", "opencode"):
         assert [e["name"] for e in listed[cli]], cli
-    for cli in ("openclaw", "hermes"):
+    # kimi has no isolated copy: agentic_chat never runs it and nothing sets
+    # KIMI_CODE_HOME for it, so a file there would be written but never read.
+    for cli in ("openclaw", "hermes", "kimi"):
         assert listed[cli] == [], "no isolated copy -> empty list, not an error"
 
 
@@ -220,3 +222,12 @@ def test_a_stdio_server_is_skipped_when_its_command_is_missing(home, monkeypatch
         assert "playwright" not in names, cli
         assert {"free-llm-hub", "context7"} <= names, \
             "the url-based servers must still be registered: %s" % cli
+
+
+def test_kimi_has_no_isolated_copy_so_install_hub_says_skipped(home):
+    """No code path runs an isolated kimi (agentic_chat has no KIMI_CODE_HOME
+    redirect), so claiming "(and the hub's own isolated copy)" was false."""
+    assert m._config_path("kimi", isolated=True) is None
+    ok, msg = m.add_server("kimi", "x", {"url": "http://127.0.0.1:1/mcp"}, isolated=True)
+    assert not ok and "no isolated copy" in msg
+    assert not os.path.exists(os.path.join(m._isolated_dir("kimi"), "mcp.json"))

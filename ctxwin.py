@@ -281,7 +281,7 @@ _USER_FACT_RE = re.compile(
     r"|\b[A-Za-z]+[-_]?\d+[\w.-]*\b|\b\d[\d.,]*\s*(?:ms|s|sec|seconds?|minutes?|px|%|"
     r"kb|mb|gb|k|tokens?|usd|eur)\b"
     r"|\b(?:prefer|always|never|must|remember|call me|my name|named?|codename|"
-    r"instead of|do not|don't|deadline|password|port|version)\b", re.I)
+    r"instead of|do not|don't|deadline|port|version)\b", re.I)
 _USER_FACT_MAX_SENTENCE = 300      # longer is a pasted blob, not a statement
 # A STANDING rule / preference / name: kept in its own share, so a long run of
 # per-step values ("step 12: use value=12") cannot push "I prefer tabs" out.
@@ -463,7 +463,21 @@ def exact_facts(messages, max_chars=EXACT_FACTS_MAX_CHARS):
     """The verbatim facts of `messages` (OpenAI chat shape), oldest first, as
     bullet-less lines. Pure, bounded, never raises."""
     try:
-        return _exact_facts(messages or [], max_chars)
+        facts = _exact_facts(messages or [], max_chars)
+    except Exception:                                            # noqa: BLE001
+        return []
+    # NEVER a credential: these lines are persisted in the recap store and
+    # handed to crew/swarm workers and /agent context -- the same rule as
+    # memory.py's ("a candidate that carries a credential is dropped whole").
+    return _drop_secrets(facts)
+
+
+def _drop_secrets(facts):
+    """`facts` minus every line that looks like it carries a credential
+    (memory._looks_secret). Fails CLOSED: no filter, no verbatim facts."""
+    try:
+        from memory import _looks_secret
+        return [f for f in facts if not _looks_secret(str(f))]
     except Exception:                                            # noqa: BLE001
         return []
 
@@ -550,7 +564,9 @@ def _exact_facts(messages, max_chars):
 
 
 def format_exact_facts(facts):
-    """The block that carries `facts`, or "" when there are none."""
+    """The block that carries `facts`, or "" when there are none. A stored
+    entry written before the secret filter existed is filtered here too."""
+    facts = _drop_secrets(facts or [])
     if not facts:
         return ""
     return EXACT_FACTS_HEADER + "\n" + "\n".join("- " + f for f in facts)

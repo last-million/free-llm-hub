@@ -421,3 +421,18 @@ def test_tool_walk_demotion_does_not_pull_a_benched_pair_forward():
         clock._stalled = {"nvidia"}
         out = list(clock.walk([("nvidia", "x"), BAD, ("groq", "g"), ("nvidia", "y")]))
     assert out == [("groq", "g"), ("nvidia", "x"), ("nvidia", "y"), BAD], out
+
+
+def test_a_pinned_head_opens_a_tool_walk_even_when_benched():
+    """An explicit `<pid>/<model>` request: _build_chain puts the named model
+    at hop 1 whatever its record says, so the tool walk's bench/demotion
+    picker must not silently serve a different model in its place."""
+    _junk(BAD, 3)
+    chain = [BAD, ("nvidia", "kimi-k3"), ("groq", "x")]
+    with app.app.test_request_context():
+        out = list(app._ChainClock(tools=True, pinned=True).walk(chain))
+    assert out[0] == BAD, out
+    assert out[1:] == [("nvidia", "kimi-k3"), ("groq", "x")], out
+    with app.app.test_request_context():
+        unpinned = list(app._ChainClock(tools=True).walk(chain))
+    assert unpinned[0] == ("nvidia", "kimi-k3") and unpinned[-1] == BAD, unpinned
