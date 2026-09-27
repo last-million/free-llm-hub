@@ -657,6 +657,228 @@ def _usable(phases):
     return phases if len(phases) >= MIN_PHASES else []
 
 
+# ---- ENUMERATED DELIVERABLES ------------------------------------------------
+# MEASURED 2026-09-27 (manager sub-claude/sonnet, model "swarm"): "1) the full
+# tally.py using argparse ... 2) a pytest file test_tally.py with at least 5
+# tests ... 3) a README section with a description, a usage block, a markdown
+# table of the 3 flags and one example ... Every part must be consistent."
+# came back after 359 s as tally.py ALONE -- no tests, no README table -- with
+# only "timed_out=1" in a header to say so. Nothing checked that the parts the
+# user NUMBERED were all planned, all produced, and all still there after
+# synthesis. They are now: the plan must cover each one (MAX_PHASES may be
+# exceeded by MAX_PART_PHASES to do it), the draft is checked for each one
+# before review, and the final text again after synthesis; a part still
+# missing is named in a "Not finished" note, never dropped silently.
+MAX_PARTS = 8
+MAX_PART_PHASES = 3              # phases added for uncovered parts, beyond MAX_PHASES
+PART_CHARS = 300
+_NUM_ITEM_RE = re.compile(r"(?:^|(?<=[\s:;]))\(?(\d{1,2})[.)](?=\s)", re.M)
+_BULLET_RE = re.compile(r"^\s*[-*•]\s+(\S.*)$")
+_PARTS_HEAD_RE = re.compile(
+    r"\b(?:deliver(?:ables?)?|include[sd]?|including|required(?:\s+parts)?|"
+    r"requirements?|must\s+(?:have|include|contain)|the\s+following|parts?|"
+    r"sections?|provide|produce|i\s+need|output)\s*:", re.I)
+# A trailing sentence that talks about the parts as a whole ("Every part must
+# be consistent.") is an instruction for all of them, not more of the last one.
+_WHOLE_SENTENCE_RE = re.compile(
+    r"(?<=[.!?])\s+(?=[A-Z][^.!?]*\b(?:every|each|all|both|consistent|together)\b)")
+_PART_STOP = frozenset((
+    "a an the and or of to for with in on at by from into as is are be this that "
+    "these those it its your you we our their must should will can each every all "
+    "any one two three four five six seven eight nine ten part parts file files "
+    "using use make write create build produce provide give include including "
+    "includes contain containing following least most exactly only also then than "
+    "more less some such other which what when where how full complete short long "
+    "new plus about there them they has have had not but so if do does per via "
+    "section sections").split())
+_FILE_TOKEN_RE = re.compile(r"^[\w\-]+\.[a-z]{1,5}$")
+_CODE_EXT_RE = re.compile(r"\b[\w\-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|rb|sh|c|cc|cpp|h|"
+                          r"cs|php|kt|swift|html|css|sql)\b", re.I)
+_MD_TABLE_RE = re.compile(r"^\s*\|.*\|\s*$\n^\s*\|?\s*:?-{3,}", re.M)
+_MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S", re.M)
+_FENCE_RE = re.compile(r"```")
+_CODE_LINE_RE = re.compile(r"^\s*(?:def |class |import |from \w|function |const |let |"
+                           r"#include|package |fn |public |<\w)", re.M)
+_TEST_FN_RE = re.compile(r"\bdef\s+test_\w+|\b(?:it|test)\(\s*[\"']")
+_AT_LEAST_TESTS_RE = re.compile(r"\bat\s+least\s+(\d{1,2})\s+(?:\w+\s+)?tests?\b", re.I)
+
+
+def _norm_word(w):
+    w = w.strip(".-_")
+    return w[:-1] if len(w) > 4 and w.endswith("s") and not w.endswith("ss") else w
+
+
+def _part_keywords(text):
+    """Distinctive lowercase tokens of `text` (file names kept whole)."""
+    out = []
+    for tok in re.findall(r"[a-z0-9_][a-z0-9_.\-]*", (text or "").lower()):
+        tok = tok.strip(".-")
+        if _FILE_TOKEN_RE.match(tok) or "_" in tok:
+            out.append(tok)
+            continue
+        w = _norm_word(tok)
+        if len(w) >= 3 and w not in _PART_STOP and not w.isdigit():
+            out.append(w)
+    return out
+
+
+def _split_inline(s):
+    """'a, b (x, y), and c' -> ['a', 'b (x, y)', 'c'] (commas inside brackets
+    kept). One item left -> split on ' and '."""
+    items, depth, cur = [], 0, []
+    for ch in s:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if ch in ",;" and depth == 0:
+            items.append("".join(cur))
+            cur = []
+            continue
+        cur.append(ch)
+    items.append("".join(cur))
+    items = [re.sub(r"^\s*(?:and|or)\s+", "", i).strip() for i in items]
+    items = [i for i in items if i]
+    if len(items) == 1:
+        items = [i.strip() for i in re.split(r"\s+and\s+", items[0]) if i.strip()]
+    return items
+
+
+def required_parts(request):
+    """The deliverables the user ENUMERATED in `request`, or []: a numbered
+    list ("1) ... 2) ..." / "1. ..." / "(1) ..."), a bullet list under a line
+    ending in ":", or an inline list after "Deliver:" / "Include:" and the
+    like. Conservative on purpose -- prose that merely mentions several things
+    is not a checklist. At most MAX_PARTS, each clipped. Never raises."""
+    try:
+        text = str(request or "")
+        # 1. numbered items, the longest run 1, 2, 3, ...
+        marks = [(m.start(), m.end(), int(m.group(1))) for m in _NUM_ITEM_RE.finditer(text)]
+        best = []
+        for i, (s, e, n) in enumerate(marks):
+            if n != 1:
+                continue
+            run, want = [(s, e)], 2
+            for s2, e2, n2 in marks[i + 1:]:
+                if n2 == want:
+                    run.append((s2, e2))
+                    want += 1
+            if len(run) >= 2 and len(run) > len(best):
+                best = run
+        items = []
+        if best:
+            for k, (_s, e) in enumerate(best):
+                end = best[k + 1][0] if k + 1 < len(best) else len(text)
+                items.append(text[e:end])
+            last = items[-1]
+            para = re.search(r"\n\s*\n", last)
+            if para:
+                last = last[:para.start()]
+            whole = _WHOLE_SENTENCE_RE.search(last)
+            items[-1] = last[:whole.start()] if whole else last
+        if not items:
+            # 2. a bullet list under a heading line that ends with ":"
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                if not line.rstrip().endswith(":"):
+                    continue
+                run = []
+                for nxt in lines[i + 1:]:
+                    m = _BULLET_RE.match(nxt)
+                    if not m:
+                        if nxt.strip():
+                            break
+                        continue
+                    run.append(m.group(1))
+                if len(run) >= 2:
+                    items = run
+                    break
+        if not items:
+            # 3. inline, on the same line as "Deliver:" / "Include:" ...
+            m = _PARTS_HEAD_RE.search(text)
+            if m:
+                rest = text[m.end():]
+                stop = re.search(r"(?<=[^\s.]{2})\.(?:\s|$)|\n", rest)
+                seg = rest[:stop.start()] if stop else rest
+                cand = _split_inline(seg)
+                if len(cand) >= 2:
+                    items = cand
+        out = []
+        for it in items:
+            it = re.sub(r"\s+", " ", it).strip(" \t;,")
+            if len(it) >= 3 and re.search(r"[A-Za-z]", it):
+                out.append(it[:PART_CHARS])
+        return out[:MAX_PARTS]
+    except Exception:                                           # noqa: BLE001
+        return []
+
+
+def _phase_text(ph):
+    """Everything a plan says about one phase, for the coverage test."""
+    return " ".join([str(ph.get("title") or ""), str(ph.get("task") or ""),
+                     str(ph.get("done_when") or ""), str(ph.get("inputs") or ""),
+                     str(ph.get("output_format") or "")]
+                    + [str(x) for x in (ph.get("acceptance") or [])]
+                    + [str(x) for x in (ph.get("constraints") or [])])
+
+
+def _covers(part, text):
+    """True when `text` (one phase's plan text) addresses `part`: at least 40%
+    of the part's distinctive words (and at least one) appear in it."""
+    keys = list(dict.fromkeys(_part_keywords(part)))
+    if not keys:
+        return True
+    have = set(_part_keywords(text))
+    low = (text or "").lower()
+    hits = sum(1 for k in keys if k in have or (_FILE_TOKEN_RE.match(k) and k in low))
+    return hits >= max(1, -(-len(keys) * 2 // 5))
+
+
+def _uncovered(parts, phases):
+    """Indexes (1-based) of the parts no single phase addresses."""
+    return [k for k, p in enumerate(parts, 1)
+            if not any(_covers(p, _phase_text(ph)) for ph in phases)]
+
+
+def _part_present(part, text):
+    """True / False / None (cannot tell) for whether `text` contains `part`,
+    by the markers a string test can prove: a markdown table, a heading for a
+    README, a fenced block for a usage/code block, N test functions, code for
+    a code file, and quoted literals. Every marker is a NECESSARY condition,
+    so False is only ever said on hard evidence; no marker -> None."""
+    p = (part or "").lower()
+    t = text or ""
+    checks = []
+    if re.search(r"\btables?\b", p):
+        checks.append(bool(_MD_TABLE_RE.search(t)) or "<table" in t.lower())
+    if "readme" in p:
+        checks.append(bool(_MD_HEADING_RE.search(t)))
+    if re.search(r"\b(?:usage|code)\s+block\b", p):
+        checks.append(bool(_FENCE_RE.search(t)))
+    if re.search(r"\b(?:pytest|unit\s*tests?|tests?\s+file|test\s+suite|\d+\s+tests)\b", p):
+        n = len(_TEST_FN_RE.findall(t))
+        m = _AT_LEAST_TESTS_RE.search(part or "")
+        checks.append(n >= (int(m.group(1)) if m else 1))
+    if "argparse" in p:
+        checks.append("argparse" in t)
+    if _CODE_EXT_RE.search(p) and not re.search(r"\b(?:readme|pytest|tests?)\b", p):
+        checks.append(bool(_FENCE_RE.search(t) or _CODE_LINE_RE.search(t)))
+    for lit in _QUOTED_RE.findall(part or ""):
+        checks.append(lit.strip().lower() in t.lower())
+    if not checks:
+        return None
+    return all(checks)
+
+
+def _short(text, n):
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    return s if len(s) <= n else s[:n - 3].rstrip() + "..."
+
+
+def _part_label(k, part):
+    return "part %d (%s)" % (k, _short(part, 70))
+
+
 def _waves(phases):
     """Group phases into dependency waves. Everything in one wave is independent
     of everything else in it, so a wave runs CONCURRENTLY.
@@ -717,7 +939,8 @@ def _gather(fn, items, timeout, need_one=False):
 
 
 def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
-        manager=None, context=None):
+        manager=None, context=None, seconds_per_phase=0, max_seconds_ceiling=None,
+        grace_seconds=0, fast_dispatch=None):
     """Run the pipeline. `dispatch(msgs, max_tokens, exclude_pids=()) ->
     (text, pid_model)`; it must never raise — an empty text means that call
     failed, and every stage below treats that as "carry on with what we have".
@@ -757,8 +980,24 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     conversation_brief(), bounded; the manager sees an excerpt of it
     (MANAGER_CONTEXT_CHARS) in its plan and review prompts.
 
-    Returns {"text", "plan", "phases", "review", "models"} — `text` is always a
-    non-empty answer unless every single call failed."""
+    THE BUDGET SCALES WITH THE PLAN. `max_seconds` is the BASE cap; once the
+    plan is known it grows by `seconds_per_phase` per phase beyond MIN_PHASES
+    and, with a manager, by its MEASURED call latency for every manager stage
+    on the critical path (the plan, one verdict per wave, supervise, review) --
+    a subscription CLI takes 30-150 s per call, and a flat cap spent on three
+    of them left no time for the work. Never above `max_seconds_ceiling`.
+    Past the cap, phases that produced nothing are finished IN PARALLEL by
+    `fast_dispatch` (default: dispatch) within `grace_seconds`; what is still
+    missing is named in a "Not finished" note and in result["unfinished"].
+
+    ENUMERATED PARTS (required_parts): each must be covered by a phase (one
+    re-ask of a free planner, then phases are added), present in the draft
+    before review (mechanical markers, then a manager-or-free verdict; gaps
+    are produced by a repair worker) and present after synthesis.
+
+    Returns {"text", "plan", "phases", "review", "models", "planned"[,
+    "unfinished", "cap_seconds"]} — `text` is always a non-empty answer unless
+    every single call failed."""
     profile = profile or {}
     plan_system = profile.get("plan_system") or _PLAN_SYSTEM
     phase_system = profile.get("phase_system") or _PHASE_SYSTEM
@@ -782,24 +1021,45 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         cap = float(max_seconds or 0)
     except (TypeError, ValueError):
         cap = 0.0
-    stop_at = (time.monotonic() + cap) if cap > 0 else None
+    t_start = time.monotonic()
+    # [stop_at, effective cap]: mutable, the cap is re-sized once the plan is in.
+    clock = [(t_start + cap) if cap > 0 else None, cap]
     timed_out = [False]
+    grace_until = [None]
 
     def _left():
         """Seconds left on the wall clock (None = unbounded, 0 = spent)."""
-        if stop_at is None:
+        if clock[0] is None:
             return None
-        return max(0.0, stop_at - time.monotonic())
+        return max(0.0, clock[0] - time.monotonic())
 
     def _over(stage):
         """True once the cap is spent; says so ONCE in the event trail."""
-        if stop_at is None or time.monotonic() < stop_at:
+        if clock[0] is None or time.monotonic() < clock[0]:
             return False
         if not timed_out[0]:
             timed_out[0] = True
             emit("budget", "wall-clock cap (%ds) reached before %s — "
-                           "synthesising from what finished" % (int(cap), stage))
+                           "synthesising from what finished" % (int(clock[1]), stage))
         return True
+
+    def _grace_secs():
+        try:
+            return max(0.0, float(grace_seconds or 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _grace_left():
+        """Seconds left of the ONE post-cap grace window (opened on first
+        use, shared by phase finishing and part repairs); 0 = none."""
+        g = _grace_secs()
+        if g <= 0:
+            return 0.0
+        if grace_until[0] is None:
+            grace_until[0] = time.monotonic() + g
+        return max(0.0, grace_until[0] - time.monotonic())
+
+    fast = fast_dispatch or dispatch
 
     brief, ctx_block = conversation_brief(messages, context)
     request = _last_user_text(messages)
@@ -812,16 +1072,21 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     # repairs, synthesis). "" from it (off, over budget, failed) makes that one
     # stage fall back to `dispatch`, so a manager can only ever add quality.
     mgr_spent = [0]
+    mgr_secs = []                    # measured duration of each manager call
     mgr_lock = threading.Lock()
     extras = {}
 
     def _mgr(msgs, max_tokens, purpose):
         if manager is None:
             return "", None
+        t0 = time.monotonic()
         try:
             out = manager(msgs, max_tokens, purpose)
         except Exception:                                       # noqa: BLE001
             return "", None
+        finally:
+            with mgr_lock:
+                mgr_secs.append(time.monotonic() - t0)
         if not isinstance(out, (tuple, list)) or len(out) < 2:
             return "", None
         text = out[0] if isinstance(out[0], str) else ""
@@ -858,7 +1123,7 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
 
     def _spent():
         """Wall clock spent — checked from worker threads, so it never emits."""
-        return stop_at is not None and time.monotonic() >= stop_at
+        return clock[0] is not None and time.monotonic() >= clock[0]
 
     # The manager's view: the request (clipped as always) plus a SHORT excerpt
     # of the conversation context, so its plan and review know what "it" is.
@@ -900,6 +1165,7 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
             models_used.append(("plan:retry", plan_model))
         plan = _parse_json(plan_text) or {}
         phases = _usable(_clean_phases(plan) or _phases_from_text(plan_text))
+    single = not phases
     if not phases:
         # Planner failed or returned junk -> ONE phase that is the original ask.
         # Degrading to a normal answer beats erroring out.
@@ -907,6 +1173,71 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         emit("plan", "planner unusable — running as a single phase")
     else:
         emit("plan", "%d phases" % len(phases))
+
+    # ---- 1b. COVERAGE — every part the user enumerated has a phase ----------
+    # The single-phase fallback carries the WHOLE brief, so it covers all.
+    parts = required_parts(request)
+    if parts and not single:
+        missing = _uncovered(parts, phases)
+        if missing and manager is None and not _spent():
+            # ONE re-ask of the (free, fast) planner, naming what it left out.
+            # With a paid manager the phases are added directly below instead:
+            # a second subscription call is 30-150 s the run cannot spare.
+            emit("plan", "plan misses %d required part%s — asking once more"
+                 % (len(missing), "" if len(missing) == 1 else "s"))
+            ask = (brief + "\n\nREQUIRED PARTS (the request enumerates these; EVERY "
+                   "one must be produced by at least one phase):\n"
+                   + "\n".join("%d. %s" % (k, p) for k, p in enumerate(parts, 1))
+                   + "\n\nYour previous plan left out: "
+                   + "; ".join(_part_label(k, parts[k - 1]) for k in missing))
+            t2, m2 = dispatch([{"role": "system", "content": plan_system},
+                               {"role": "user", "content": ask}], PLAN_MAX_TOKENS)
+            if m2:
+                models_used.append(("plan:coverage", m2))
+            p2 = _parse_json(t2) or {}
+            ph2 = _usable(_clean_phases(p2) or _phases_from_text(t2))
+            if ph2 and len(_uncovered(parts, ph2)) < len(missing):
+                plan, phases = p2, ph2
+                missing = _uncovered(parts, phases)
+        if missing:
+            # Still uncovered: a phase per part (bounded; the rest share one).
+            # It builds on the phases that start the plan, so it sees the work
+            # it must stay consistent with ("every part must be consistent").
+            roots = [i for i, ph in enumerate(phases, 1) if not ph["needs"]][:2]
+            room = max(1, MAX_PHASES + MAX_PART_PHASES - len(phases))
+            groups = ([[k] for k in missing] if len(missing) <= room else
+                      [[k] for k in missing[:room - 1]] + [missing[room - 1:]])
+            for grp in groups:
+                text = "\n".join("- " + parts[k - 1] for k in grp)
+                phases.append({
+                    "title": ("Part %d: %s" % (grp[0], _short(parts[grp[0] - 1], 48))
+                              if len(grp) == 1 else "Remaining required parts"),
+                    "task": "Produce %s of the user's request, complete and ready "
+                            "to use:\n%s" % ("this required part" if len(grp) == 1
+                                              else "these required parts", text),
+                    "done_when": "", "needs": list(roots)})
+            emit("plan", "added %d phase%s for required parts the plan missed"
+                 % (len(groups), "" if len(groups) == 1 else "s"))
+
+    # ---- 1c. BUDGET — sized to the plan, not a flat number --------------------
+    if clock[0] is not None:
+        try:
+            extra = max(0.0, float(seconds_per_phase or 0)) * max(0, len(phases) - MIN_PHASES)
+            if mgr_secs:
+                # plan (spent from the base) + one verdict per wave + supervise
+                # + review (+ the parts verdict): each is a manager call at its
+                # measured latency.
+                extra += max(mgr_secs) * (len(_waves(phases)) + (4 if parts else 3))
+            eff = cap + extra
+            if max_seconds_ceiling:
+                eff = min(eff, max(cap, float(max_seconds_ceiling)))
+            if eff > clock[1]:
+                clock[0], clock[1] = t_start + eff, eff
+                emit("budget", "wall clock %ds for %d phase%s%s"
+                     % (int(eff), len(phases), "" if len(phases) == 1 else "s",
+                        " (manager ~%ds/call)" % int(max(mgr_secs)) if mgr_secs else ""))
+        except (TypeError, ValueError):
+            pass
 
     # ---- 2. PHASES — one subagent each, own context, waves run in parallel --
     #
@@ -934,6 +1265,15 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
 
     def _run_phase(idx):
         ph = phases[idx - 1]
+        msgs = _phase_msgs(idx)
+        first = dispatch(msgs, PHASE_MAX_TOKENS)
+        if manager is None:
+            return first
+        return _verified(idx, ph, msgs, first)
+
+    def _phase_msgs(idx):
+        """The worker conversation for phase `idx` (its own fresh context)."""
+        ph = phases[idx - 1]
         ctx = "".join(
             "\n\n### Output of phase %d (%s)\n%s"
             % (n, phases[n - 1]["title"], _clip(outputs[n], DEP_CONTEXT_CHARS))
@@ -949,12 +1289,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         # exact prompt the plain pipeline always sent.
         user += _render_brief(ph)
         user += _worker_brief(ph["task"])
-        msgs = [{"role": "system", "content": phase_system},
+        return [{"role": "system", "content": phase_system},
                 {"role": "user", "content": user}]
-        first = dispatch(msgs, PHASE_MAX_TOKENS)
-        if manager is None:
-            return first
-        return _verified(idx, ph, msgs, first)
 
     def _phase_problems(ph, text, trail):
         """[] when the output passes, else concrete problems. Cheap checks
@@ -1177,7 +1513,7 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         names = ", ".join(phases[i - 1]["title"] for i in wave)
         emit("phase", ("%d in parallel: %s" % (len(wave), names)) if len(wave) > 1
              else "1/%d %s" % (len(phases), names))
-        if len(wave) == 1 and stop_at is None:
+        if len(wave) == 1 and clock[0] is None:
             results = {wave[0]: _run_phase(wave[0])}
         else:
             # One worker dying must not kill the wave (_gather maps it to an
@@ -1207,6 +1543,39 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
             if text:
                 outputs[i] = text
                 titles[i] = phases[i - 1]["title"]
+
+    # ---- 2a. FINISH WHAT IS MISSING — never a silently partial deliverable ---
+    # Phases the cap skipped (a later wave), cut off (still running when it
+    # hit) or that failed: finished IN PARALLEL by the fastest capable free
+    # models, inside one short grace window. Each gets its dependencies'
+    # outputs when they exist, and one free sanity check.
+    unfinished_idx = [i for i in range(1, len(phases) + 1) if i not in outputs]
+    if unfinished_idx and outputs and (_spent() or _grace_secs() > 0):
+        g_left = _grace_left() if _spent() else (_left() or _grace_secs())
+        if g_left:
+            emit("budget", "%d phase%s unfinished — finishing with fast models (%ds)"
+                 % (len(unfinished_idx), "" if len(unfinished_idx) == 1 else "s",
+                    int(g_left)))
+
+            use = fast if _spent() else dispatch     # time left: full strength
+
+            def _fast_phase(idx):
+                text, who = use(_phase_msgs(idx), PHASE_MAX_TOKENS)
+                if text and answer_check is not None:
+                    try:
+                        if not answer_check.inspect(text, prompt_text=brief).get("ok", True):
+                            return "", who
+                    except Exception:                           # noqa: BLE001
+                        pass
+                return text, who
+            got = _gather(_fast_phase, unfinished_idx, g_left)
+            for i in sorted(got):
+                text, who = got[i][0], got[i][1]
+                if who:
+                    models_used.append(("phase-finish:%s" % phases[i - 1]["title"], who))
+                if text:
+                    outputs[i] = text
+                    titles[i] = phases[i - 1]["title"]
 
     done = [{"title": titles[i], "output": outputs[i]} for i in sorted(outputs)]
 
@@ -1264,8 +1633,120 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         return _finish({"text": "", "plan": plan, "phases": [], "review": None,
                         "models": models_used, "timed_out": timed_out[0]})
 
-    draft = "\n\n".join("## %s\n%s" % (d["title"], d["output"]) for d in done) \
-        if len(done) > 1 else done[0]["output"]
+    def _assemble():
+        return "\n\n".join("## %s\n%s" % (d["title"], d["output"]) for d in done) \
+            if len(done) > 1 else done[0]["output"]
+
+    draft = _assemble()
+
+    # ---- 2c. PARTS CHECK — is every enumerated part in the draft? -----------
+    # Mechanical markers first (free, and only ever "missing" on hard
+    # evidence); the parts they cannot judge go to ONE short verdict -- the
+    # manager's when there is one, else a free model's -- while there is time.
+    # Every gap goes back to a repair worker that sees the draft, so the part
+    # it writes matches the rest (same names, flags, files).
+    if parts:
+        verdicts = [_part_present(p, draft) for p in parts]
+        unknown = [k for k, v in enumerate(verdicts, 1) if v is None]
+        if unknown and not _spent():
+            listing = "\n".join("%d. %s" % (k, parts[k - 1]) for k in unknown)
+            v_sys = ("You check a draft against REQUIRED PARTS the user enumerated. "
+                     "You may see an excerpt; never report as missing what may sit in "
+                     "the trimmed middle.\nReply with JSON ONLY: {\"missing\": "
+                     "[<numbers of the parts that are genuinely absent>]}")
+            v_text, v_who = _staged(
+                [{"role": "system", "content": v_sys},
+                 {"role": "user", "content": "REQUIRED PARTS\n%s\n\nDRAFT (%d characters)\n%s"
+                  % (listing, len(draft), _clip(draft, FREE_INSTRUCT_CHARS))}],
+                SUPERVISE_MAX_TOKENS, "verify",
+                mgr_msgs=[{"role": "system", "content": v_sys},
+                          {"role": "user", "content": "REQUIRED PARTS\n%s\n\nDRAFT (excerpt of "
+                           "%d characters)\n%s" % (listing, len(draft),
+                                                   _clip(draft, MANAGER_DRAFT_CHARS))}],
+                mgr_tokens=MANAGER_VERDICT_TOKENS)
+            if v_who:
+                models_used.append(("verify:parts", v_who))
+            said = (_parse_json(v_text) or {}).get("missing")
+            for n in (said if isinstance(said, list) else []):
+                try:
+                    n = int(n)
+                except (TypeError, ValueError):
+                    continue
+                if n in unknown:
+                    verdicts[n - 1] = False
+        gap_parts = [k for k, v in enumerate(verdicts, 1) if v is False]
+        p_left = _grace_left() if _spent() else _left()
+        if gap_parts and (p_left is None or p_left > 0):
+            emit("verify", "%d required part%s missing from the draft — producing %s"
+                 % (len(gap_parts), "" if len(gap_parts) == 1 else "s",
+                    "it" if len(gap_parts) == 1 else "them"))
+            use_p = fast if _spent() else dispatch
+
+            def _part_repair(k):
+                part = parts[k - 1]
+                return use_p(
+                    [{"role": "system", "content": phase_system},
+                     {"role": "user", "content":
+                      "OVERALL GOAL\n%s\n\nYOUR TASK: produce this REQUIRED PART of the "
+                      "deliverable -- the work so far does not contain it:\n%s\n\nIt "
+                      "must be consistent with the work below: same names, flags, "
+                      "files and facts. Output ONLY this part.%s\n\nTHE WORK SO FAR "
+                      "(excerpt)\n%s" % (goal, part, _worker_brief(part),
+                                         _clip(draft, DEP_CONTEXT_CHARS))}],
+                    PHASE_MAX_TOKENS)
+            got = _gather(_part_repair, gap_parts, p_left)
+            for k in sorted(got):
+                text, who = got[k][0], got[k][1]
+                if who:
+                    models_used.append(("repair:part %d" % k, who))
+                if text and _part_present(parts[k - 1], text) is not False:
+                    done.append({"title": "Part %d: %s" % (k, _short(parts[k - 1], 48)),
+                                 "output": text})
+            draft = _assemble()
+
+    def _deliver(text, review):
+        """The result, after the LAST parts check: synthesis (or a revision)
+        can drop a part the phases had -- it is restored from the phase that
+        had it. Whatever is still missing -- an enumerated part, or a phase
+        that never produced anything and maps to no part -- is NAMED in a
+        "Not finished" note and in result["unfinished"]: a partial answer
+        may ship, a silently partial one may not."""
+        text = text or ""
+        unfinished = []
+        if parts and text.strip():
+            for k, part in enumerate(parts, 1):
+                if _part_present(part, text) is not False:
+                    continue
+                src = next((d for d in done
+                            if _part_present(part, d["output"]) is True), None)
+                if src is not None:
+                    text = text.rstrip() + "\n\n## %s\n%s" % (src["title"], src["output"])
+                    emit("verify", "part %d restored — the final pass dropped it" % k)
+                    if _part_present(part, text) is not False:
+                        continue
+                unfinished.append(_part_label(k, part))
+        for i, ph in enumerate(phases, 1):
+            if i in outputs:
+                continue
+            if parts and any(_covers(p, _phase_text(ph)) for p in parts):
+                continue        # judged through the part(s) it was planned for
+            unfinished.append(ph["title"])
+        out = {"text": text, "plan": plan, "phases": done, "review": review,
+               "models": models_used, "timed_out": timed_out[0],
+               "planned": [ph["title"] for ph in phases]}
+        if clock[0] is not None:
+            out["cap_seconds"] = round(clock[1], 1)
+        if unfinished and text.strip():
+            out["unfinished"] = unfinished
+            out["text"] = (text.rstrip() + "\n\n---\n**Not finished:** "
+                           + "; ".join(unfinished)
+                           + " -- the run ended before %s produced (%s). Ask again "
+                             "to complete %s."
+                           % ("this was" if len(unfinished) == 1 else "these were",
+                              "time cap reached" if timed_out[0] else "the models failed",
+                              "it" if len(unfinished) == 1 else "them"))
+            emit("budget", "not finished: %s" % "; ".join(unfinished)[:120])
+        return _finish(out)
 
     # ---- 3. REVIEW (different provider on purpose) ------------------------
     # Skipped past the wall clock: an unreviewed answer now beats a reviewed
@@ -1420,8 +1901,7 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     # rewrite would only risk making it worse.
     if len(done) == 1 and not needs_work:
         emit("done", "single phase, review passed")
-        return _finish({"text": draft, "plan": plan, "phases": done, "review": review,
-                        "models": models_used, "timed_out": timed_out[0]})
+        return _deliver(draft, review)
 
     emit("synthesis", "assembling")
     synth_user = "BRIEF\n%s\n\nPHASE OUTPUTS\n%s" % (brief, draft)
@@ -1439,8 +1919,7 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     if synth_model:
         models_used.append(("synthesis", synth_model))
     emit("done", "complete")
-    return _finish({"text": final_text or draft, "plan": plan, "phases": done,
-                    "review": review, "models": models_used, "timed_out": timed_out[0]})
+    return _deliver(final_text or draft, review)
 
 
 def trailer_summary(result):
@@ -1455,7 +1934,14 @@ def trailer_summary(result):
     if result.get("crew"):
         parts.append("crew=%s" % result["crew"])
     phases = result.get("phases") or []
-    if phases:
+    # plan= is the PLAN (every phase planned), not just the phases that
+    # finished: listing only the finished ones made a 3-phase plan cut short
+    # after phase 1 read as a 1-phase plan. done= says how many finished.
+    planned = [str(t or "") for t in (result.get("planned") or [])]
+    if planned:
+        parts.append("plan=" + " | ".join(planned))
+        parts.append("done=%d/%d" % (min(len(phases), len(planned)), len(planned)))
+    elif phases:
         parts.append("plan=" + " | ".join(str(p.get("title") or "") for p in phases))
     models = result.get("models") or []
     if models:
@@ -1466,6 +1952,12 @@ def trailer_summary(result):
         parts.append("reviewer_raised=%d" % len(problems))
     if result.get("timed_out"):
         parts.append("timed_out=1")
+    if result.get("cap_seconds"):
+        parts.append("cap=%ds" % int(result["cap_seconds"]))
+    unfinished = [str(u) for u in (result.get("unfinished") or [])]
+    if unfinished:
+        # Early in the line: a long models= list must not push it past the cap.
+        parts.insert(0, "unfinished=%d: %s" % (len(unfinished), " | ".join(unfinished)))
     if result.get("manager_tokens"):
         parts.append("manager_tokens=%d" % int(result["manager_tokens"]))
     if result.get("review_warning"):
@@ -1491,8 +1983,15 @@ def format_answer(result):
         goal = (result.get("plan") or {}).get("goal")
         if goal:
             lines.append("*%s*" % goal)
-        for i, p in enumerate(phases, 1):
-            lines.append("%d. [x] %s" % (i, p["title"]))
+        planned = result.get("planned") or []
+        finished = {p["title"] for p in phases}
+        if planned:
+            # Every planned phase, ticked only when it actually produced.
+            for i, t in enumerate(planned, 1):
+                lines.append("%d. [%s] %s" % (i, "x" if t in finished else " ", t))
+        else:
+            for i, p in enumerate(phases, 1):
+                lines.append("%d. [x] %s" % (i, p["title"]))
     models = result.get("models") or []
     if models:
         lines.append("\n**Models used**")

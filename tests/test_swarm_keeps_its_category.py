@@ -262,12 +262,14 @@ def test_a_hard_ask_still_runs_the_pipeline():
 
 
 def test_the_wall_clock_default_and_off_switch(monkeypatch):
+    """The BASE of the plan-sized budget: raised from 180 (a subscription
+    manager spent all of it on three calls, see swarm.run)."""
     monkeypatch.setattr(A.config, "get_setting", lambda name, default=None: default)
-    assert A._swarm_max_seconds() == 180
+    assert A._swarm_max_seconds() == A._SWARM_MAX_SECONDS_DEFAULT >= 300
     monkeypatch.setattr(A.config, "get_setting", lambda name, default=None: 0)
     assert A._swarm_max_seconds() is None
     monkeypatch.setattr(A.config, "get_setting", lambda name, default=None: "junk")
-    assert A._swarm_max_seconds() == 180
+    assert A._swarm_max_seconds() == A._SWARM_MAX_SECONDS_DEFAULT
 
 
 def _slow_dispatch(calls, slow=("Beta", "Gamma"), delay=2.0):
@@ -294,7 +296,11 @@ def test_past_the_cap_the_run_stops_waiting_and_delivers():
                     max_seconds=0.3)
     assert time.monotonic() - t0 < 1.5, "must not wait for the slow phases"
     assert out["timed_out"] is True
-    assert out["text"] == "part"
+    # The part that finished ships -- and the parts that did not are NAMED
+    # (no grace given here, so nothing finished them): never silently partial.
+    assert out["text"].startswith("part")
+    assert "Not finished" in out["text"] and "Beta" in out["text"]
+    assert out["unfinished"] == ["Beta", "Gamma"]
     assert "review" not in calls and "supervise" not in calls
 
 

@@ -43,6 +43,8 @@ def test_a_broken_block_list_does_not_break_the_error_path():
 
 def test_the_hint_reaches_the_actual_503s():
     """Three routes build that message; a hint only one of them uses is a hint
-    the user meets by luck."""
+    the user meets by luck. They now share ONE builder, which carries it."""
     src = open("app.py", encoding="utf-8").read()
-    assert src.count("_no_candidates_hint()") >= 3
+    assert src.count("_chain_exhausted_text(errors, last_hard)") >= 3
+    with mock.patch.object(A, "_blocked_models", return_value={"a/b"}):
+        assert "Settings" in A._chain_exhausted_text(["p: HTTP 404"])
