@@ -8675,9 +8675,16 @@ _relay_tool_lock = threading.Lock()
 # Models built to READ IMAGES, not to drive tools: '...-vision-instruct',
 # '...-vl-...', llava & friends. General multimodal models (gemini, llama-4,
 # gpt-4o) are not matched -- they are strong tool callers.
+# GLM names its vision line with a bare 'v' on the version (glm-4.1v-thinking,
+# glm-4.5v, glm-4.6v-flash), which the '-vl' rule never saw. MEASURED
+# 2026-09-27: an opencode tool turn's session was pinned to glm/glm-4.6v-flash
+# (band 2, so it never actually led) and every later turn of that session was
+# opened by whatever the ranked chain put first instead of a model the pin
+# could keep. The version digits are required, so glm-5.3 / glm-4.6 stay out.
 _VISION_SPECIALISED_RE = re.compile(
     r"(?<![a-z])vision|(?:^|[-_./:])vl(?:$|[-_.:])|llava|paligemma|moondream"
-    r"|florence-|cogvlm|internvl|kosmos|deplot|(?:^|[-_/])ocr(?:$|[-_.])", re.I)
+    r"|florence-|cogvlm|internvl|kosmos|deplot|(?:^|[-_/])ocr(?:$|[-_.])"
+    r"|(?:^|[-_./:])glm-?\d+(?:\.\d+)?v(?:$|[-_.:])", re.I)
 
 
 def _is_vision_specialised(model):

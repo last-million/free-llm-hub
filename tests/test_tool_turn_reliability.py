@@ -125,6 +125,17 @@ def test_vision_specialised_ids_are_recognised():
         assert not A._is_vision_specialised(m), m
 
 
+def test_glm_vision_line_is_vision_specialised():
+    """GLM's vision models carry a bare 'v' on the version (MEASURED live:
+    glm/glm-4.6v-flash opened an opencode tool session)."""
+    for m in ("glm-4.6v-flash", "z-ai/glm-4.6v-flash-free", "zai-org/GLM-4.5V",
+              "thudm/glm-4.1v-thinking-flash", "community/MarcosFRG/glm-4.6v-flash"):
+        assert A._is_vision_specialised(m), m
+    for m in ("glm-4.6", "z-ai/glm-5.3", "zai-org/GLM-5.3-Flash", "glm-4.7-flash",
+              "g4f/srv_mp1v9cyha31b95fa8c9a:z-ai/glm-5.3", "glm-5-turbo"):
+        assert not A._is_vision_specialised(m), m
+
+
 def test_a_vision_model_goes_behind_every_other_candidate_on_a_tool_turn(fleet):
     chain = _tool_chain()
     assert chain[-1] == ("nvidia", "meta/llama-3.2-90b-vision-instruct"), chain
