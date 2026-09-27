@@ -73,10 +73,15 @@ def test_the_tree_is_signalled_before_the_parent():
     assert lines.index("_signal_tree(proc.pid, hard=False)") < lines.index("proc.terminate()")
 
 
-def test_workers_and_the_brief_say_not_to_park_a_server_in_the_shell():
+def test_workers_and_the_brief_say_not_to_park_a_server_in_the_shell(tmp_path):
+    # The wording changed on 2026-09-27 (tests/test_agent_servers.py): the old
+    # "Do not start a server ... (no `&`, `nohup`, `start`...)" contradicted
+    # craft.SHIP and did not stop a live turn parking `python app.py` in its
+    # shell. The rule itself -- never in the foreground -- still holds.
     import swarm_windows as SW
     run = SW._Run("g", ".", "opencode", [{"title": "T", "task": "t", "needs": []}])
-    assert "Do not start a server or any long-running process from the shell" \
+    assert "Never run a server or watcher in the foreground" \
         in SW._agent_prompt(run, run.agents[0])
-    src = open("agentic_chat.py", encoding="utf-8").read()
-    assert "Do not start a server or any long-running process from the shell" in src
+    name = AC.write_task_brief(str(tmp_path), "build a site")
+    brief = (tmp_path / name).read_text(encoding="utf-8")
+    assert "run in the FOREGROUND never returns" in brief

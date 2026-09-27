@@ -55,6 +55,7 @@ import uuid
 _log = logging.getLogger("free-llm-hub")
 from collections import deque
 
+import agent_servers                 # a leaf too: server rules, hub PID/port
 import answer_check                  # a leaf like this one: no app import
 
 _SUMMARY_THINK_RE = re.compile(r"<(think|thinking)>(.*?)</\1>", re.I | re.S)
@@ -844,10 +845,10 @@ def _agent_prompt(run, agent):
               "paths relative to it, or that exact absolute spelling. Do not "
               "reuse a path printed by a shell (`pwd` may print it in another "
               "form) and never write to /, /tmp or /workspace.",
-              "Do not start a server or any long-running process from the shell "
-              "(no `&`, `nohup`, `start`, or a watch mode): the shell tool waits "
-              "for it and the turn hangs. To check a server, run a one-shot "
-              "command with a short timeout, or leave it to the hub's preview."]
+              # Detached spellings measured to return, and the hub's PID and
+              # port so a worker knows which python is not its to kill (live
+              # 2026-09-27: an agent listed python processes and killed one).
+              agent_servers.worker_rules()]
     parts += ["", "Work only on YOUR phase, and do it now -- do not ask for "
                   "confirmation. Finish with a short summary of what you "
                   "changed and anything the other agents need to know."]
