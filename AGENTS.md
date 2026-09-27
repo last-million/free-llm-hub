@@ -489,6 +489,41 @@ Covered by `tests/test_pipelines_keep_the_conversation.py`.
 - **Quick chat** sends `X-Conversation-Id: quick-<chat id>`; its recap is
   dropped with the chat (`ctxwin.quick_chat_key`).
 
+## Thinking models & truncated stubs (2026-09-27)
+
+Covered by `tests/test_thinking_budget.py`. Live: gemini-3-flash at
+max_tokens 40 answered "94" for 2994 (finish "length", completion_tokens 1 —
+hidden reasoning ate the budget).
+
+- **Who thinks**: `_thinks_by_default` = `_SLOW_MODEL_RE`, the docs table
+  `_THINKING_DOC_RE` (Gemini 2.5/3.x non-lite, gpt-5, o-series, MiniMax-M),
+  or runtime evidence (`_THINKING_LEARNED`: reasoning_tokens > 0, reasoning
+  text, a starved/stub reply; 7-day TTL). `_can_think` adds catalog flags
+  (`_catalog_row_thinks`: `reasoning`/`thinking: true`, capabilities,
+  `supported_parameters`), harvested in `_learn_ctx_from_catalog` and
+  OpenRouter's public catalog (identity-level).
+- **`_apply_reasoning_effort(payload, model, diff, pid=)`**: a caller budget
+  < 8192 gets `+_THINKING_ALLOWANCE[effort]` (low 1024 / medium 2048 / high
+  4096); the caller's own budget rides in the private key
+  `_hub_caller_max_tokens`, stripped in `_dispatch_chat`/`_upstream_chat`.
+  Effort is SENT only to default thinkers (LOW on a < 512 ask or a simple
+  turn); a catalog-only flag earns room, not effort (it would switch a
+  hybrid's thinking on). A 400 naming the parameter is retried without it and
+  remembered per (provider, model) (`_REASONING_REJECTED`).
+- **Stubs**: `_starve_kind` / `_is_truncated_stub` — finish "length" with
+  visible text under half the CALLER's budget. One same-pair retry with room
+  on all three protocols: non-stream `_starve_retry`, stream via the peek
+  status `starved` + `_stream_starve_retry` (before any byte is committed).
+  Filed as a failure only when the retry starves too. A stub never wins a
+  hedge race. The caller still gets ~its visible budget
+  (`_fit_visible_to_caller`, the stream gate's `visible_cap`).
+- **Pipeline fast path** (`_swarm_fast_path` / `_is_trivial_ask`): swarm /
+  crew* / multi / compounds answer a TRIVIAL ask with one strong model
+  ('best'), with or without tools (tool turns only on a fresh user
+  instruction, never mid-loop). Trivial = one short question / one-line
+  request: never a write/create/build ask, never enumerated parts
+  ("Include:", lists, 3+ joined items, > 2 sentences).
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

@@ -235,9 +235,19 @@ def test_a_simple_question_skips_the_pipeline(model):
     assert "fast-path" in resp.headers.get("X-Free-LLM-Hub-Pipeline", "")
 
 
-def test_a_simple_tool_turn_is_not_fast_pathed():
-    assert A._swarm_fast_path({"tools": [{"type": "function"}]},
-                              [{"role": "user", "content": SIMPLE}]) is False
+def test_a_simple_tool_turn_is_fast_pathed_only_on_a_fresh_instruction():
+    """CHANGED 2026-09-27: LIVE, Claude Code on multi/coding-swarm fanned
+    "What is N plus 1?" out to five models (~180 s). A trivial ask carrying a
+    tools array now takes the fast path too -- but never mid-loop, when the
+    turn ends on a tool result."""
+    tools = {"tools": [{"type": "function"}]}
+    assert A._swarm_fast_path(tools, [{"role": "user", "content": SIMPLE}]) is True
+    mid_loop = [{"role": "user", "content": SIMPLE},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "x", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "5768"}]
+    assert A._swarm_fast_path(tools, mid_loop) is False
 
 
 def test_the_fast_path_can_be_switched_off(monkeypatch):

@@ -588,6 +588,8 @@ def _learn_ctx_from_catalog(payload_pid, payload):
             mid = it.get("id") or it.get("name") or it.get("model")
             if not isinstance(mid, str) or not mid:
                 continue
+            # The same row may say the model REASONS (see _catalog_row_thinks).
+            _learn_thinking_from_row(payload_pid, it)
             ctx = _catalog_row_ctx(it, extra)
             if ctx is None:
                 continue
@@ -1814,6 +1816,9 @@ def _fetch_aa_scores_keyless():
         for row in (resp.json().get("data") or []):
             if not isinstance(row, dict):
                 continue
+            # Its supported_parameters also say which models REASON -- known
+            # per identity, for every provider serving the same model.
+            _learn_thinking_from_row(None, row)
             bench = row.get("benchmarks")
             aa = (bench or {}).get("artificial_analysis") if isinstance(bench, dict) else None
             idx = (aa or {}).get("intelligence_index") if isinstance(aa, dict) else None
@@ -3357,6 +3362,8 @@ def _record_chat_usage(hop_pid, hop_model, data, prompt_est, ok=True):
     recorded once the stream ends, by _record_stream_outcome."""
     # ok=False here is ALWAYS a salvaged answer (see above): a junk strike.
     _record_outcome(hop_pid, hop_model, bool(ok), junk=not ok)
+    # ...and the reply says whether this model spends hidden reasoning tokens.
+    _note_thinking_evidence(hop_pid, hop_model, data)
     try:
         usage = data.get("usage") if isinstance(data, dict) else None
         if isinstance(usage, dict) and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
@@ -6518,6 +6525,7 @@ def _dispatch_chat(pid, payload, stream):
     time-to-first-byte and average two different quantities into one number.
     A non-2xx is not timed either -- failing fast is not being fast, and
     _reliability already covers not delivering."""
+    payload = _strip_private_keys(payload)
     if _is_sub(pid):
         return _subscription_chat(pid, payload)
     if stream:
@@ -6562,30 +6570,401 @@ _DIFFICULTY_EFFORT = {"simple": "low", "medium": "medium", "hard": "high"}
 _EFFORT_MIN_BUDGET = ((2000, "medium"), (800, "low"))
 
 
-def _apply_reasoning_effort(payload, model, difficulty):
-    """For a reasoning model, set reasoning_effort from the task difficulty so easy
-    questions answer fast and hard ones think more. No-op for non-reasoning models.
+# --------------------------------------------------------------------------- #
+# THINKING MODELS -- hidden reasoning is paid out of the caller's max_tokens.
+#
+# MEASURED LIVE 2026-09-27 (non-stream /v1/chat/completions, "What is N plus 1?
+# Answer with only the number.", max_tokens 40): modes fast / context /
+# reasoning were served by google/models/gemini-3-flash-preview and answered
+# "4", "2", "8", "94" -- the first token of a four-digit answer -- with
+# finish_reason "length" and usage.completion_tokens == 1. Gemini spent the
+# other 39 tokens thinking and reports none of them. The same model with
+# reasoning_effort "low" (or "minimal") answered "5418" in full, finish "stop".
+# Two gaps let the stub through: _apply_reasoning_effort only knew the
+# _SLOW_MODEL_RE families (gemini-3 flash is not one), and the starved-budget
+# retry fired only on an EMPTY reply, never on a truncated stub.
+#
+# So a thinking model is recognised from DATA -- a catalog flag, the provider's
+# documented family, or what it did here (reasoning_tokens, reasoning text, a
+# starved/stub reply) -- and given room: upstream max_tokens = the caller's
+# budget + an allowance sized by the effort in force, with LOW effort on a
+# small ask. The caller still gets ~its own budget of VISIBLE text
+# (_fit_visible_to_caller / the stream gate's cap).
+# --------------------------------------------------------------------------- #
+_THINKING_ALLOWANCE = {"none": 1024, "minimal": 1024, "low": 1024,
+                       "medium": 2048, "high": 4096, "xhigh": 4096}
+_THINKING_ALLOWANCE_BELOW = 8192   # a caller asking this much already leaves room
+_THINKING_SMALL_ASK = 512          # below this budget, ask for LOW reasoning
+_THINKING_LEARNED_TTL = 7 * 86400  # runtime evidence, re-learned after it expires
+# Private payload key: the budget the CALLER asked for, when the hub raised
+# max_tokens above it. Stripped by _dispatch_chat / _upstream_chat before
+# anything goes upstream.
+_CALLER_MAX_KEY = "_hub_caller_max_tokens"
+# Provider docs, not a name guess: Gemini 2.5 Pro/Flash and every Gemini 3.x
+# think by default (ai.google.dev "Gemini thinking"); the Flash-LITE tiers
+# default to no thinking, so they are left to catalog/runtime evidence. GPT-5
+# (not 5.1+), the o-series and MiniMax-M1/M2 always reason.
+_THINKING_DOC_RE = re.compile(
+    r"gemini[-_ ]?(?:2\.5|[3-9](?:\.\d+)?)(?![\d.])(?!.*lite)"
+    r"|gemini[-_](?:flash|pro)[-_]latest"
+    # gpt-5.1+ default to reasoning "none": left to runtime evidence.
+    r"|\bgpt[-_]?5(?!\.\d)(?![-_.]?chat)|\bo[1-4](?:[-_](?:mini|pro|preview))?\b"
+    r"|minimax[-_/]?m[12]\b", re.I)
+# Catalog fields that state a model reasons (verified shapes: models.dev
+# "reasoning": true, Google's native list "thinking": true, DeepSeek-style
+# "capabilities": {"reasoning": true}, OpenRouter supported_parameters).
+_THINKING_PARAMS = frozenset({"reasoning", "include_reasoning", "reasoning_effort",
+                              "thinking", "thinking_budget"})
+_thinking_lock = threading.Lock()
+_THINKING_CATALOG = set()     # (pid, model) a provider catalog says can think
+_THINKING_IDENTS = set()      # normalised identities any catalog says can think
+_THINKING_LEARNED = {}        # (pid, model) -> epoch of the runtime evidence
+_REASONING_REJECTED = {}      # (pid, model) -> epoch the provider 400'd the param
+
+
+def _catalog_row_thinks(row):
+    """True when one catalog row states the model can reason. Never raises."""
+    try:
+        if not isinstance(row, dict):
+            return False
+        if row.get("reasoning") is True or row.get("thinking") is True:
+            return True
+        caps = row.get("capabilities")
+        if isinstance(caps, dict) and (caps.get("reasoning") is True
+                                       or caps.get("thinking") is True):
+            return True
+        for field in ("supported_parameters", "capabilities", "features"):
+            v = row.get(field)
+            if isinstance(v, (list, tuple)) and any(
+                    isinstance(x, str) and x.strip().lower() in _THINKING_PARAMS
+                    for x in v):
+                return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return False
+
+
+def _learn_thinking_from_row(pid, row):
+    """Record a catalog row's thinking flag. `pid` None = a cross-provider
+    catalog (OpenRouter's public one): identity-level only. Never raises."""
+    try:
+        if not _catalog_row_thinks(row):
+            return False
+        mid = row.get("id") or row.get("name") or row.get("model")
+        if not isinstance(mid, str) or not mid:
+            return False
+        ident = _normalize_model_identity(mid)
+        with _thinking_lock:
+            if pid:
+                _THINKING_CATALOG.add((pid, mid))
+            if ident:
+                _THINKING_IDENTS.add(ident)
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _note_thinking(pid, model, why=""):
+    """Runtime evidence that (pid, model) spends hidden reasoning tokens."""
+    if not pid or not model:
+        return
+    with _thinking_lock:
+        fresh = (pid, model) not in _THINKING_LEARNED
+        _THINKING_LEARNED[(pid, model)] = time.time()
+    if fresh:
+        _log.info("[thinking] %s/%s reasons (%s): its budget gets a reasoning "
+                  "allowance from now on", pid, model, why or "evidence")
+
+
+def _note_thinking_evidence(pid, model, data=None, usage=None):
+    """Learn from a finished reply: reasoning_tokens > 0 in usage, or reasoning
+    text on the message. Never raises."""
+    try:
+        if usage is None and isinstance(data, dict):
+            usage = data.get("usage")
+        det = (usage or {}).get("completion_tokens_details") if isinstance(usage, dict) else None
+        rt = (det or {}).get("reasoning_tokens") if isinstance(det, dict) else None
+        if isinstance(rt, (int, float)) and rt > 0:
+            _note_thinking(pid, model, "reasoning_tokens")
+            return
+        if isinstance(data, dict):
+            msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+            for k in ("reasoning_content", "reasoning"):
+                if isinstance(msg.get(k), str) and msg[k].strip():
+                    _note_thinking(pid, model, k)
+                    return
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _thinks_by_default(pid, model):
+    """True when (pid, model) is known to spend hidden reasoning tokens on an
+    ordinary request: a reasoning family, a documented default thinker, or
+    runtime evidence from this hub."""
+    low = (model or "").lower()
+    if not low:
+        return False
+    if _SLOW_MODEL_RE.search(low) or _THINKING_DOC_RE.search(low):
+        return True
+    with _thinking_lock:
+        at = _THINKING_LEARNED.get((pid, model))
+    return bool(at and time.time() - at < _THINKING_LEARNED_TTL)
+
+
+def _can_think(pid, model):
+    """_thinks_by_default, or a catalog flag says the model CAN reason (a
+    hybrid may think only when asked, so this alone earns room, not effort)."""
+    if _thinks_by_default(pid, model):
+        return True
+    try:
+        ident = _normalize_model_identity(model)
+    except Exception:                                            # noqa: BLE001
+        ident = None
+    with _thinking_lock:
+        return (pid, model) in _THINKING_CATALOG or bool(ident and ident in _THINKING_IDENTS)
+
+
+def _reasoning_rejected(pid, model):
+    with _thinking_lock:
+        return (pid, model) in _REASONING_REJECTED
+
+
+def _budget_key(payload):
+    """The output-budget field this payload uses, or None."""
+    if not isinstance(payload, dict):
+        return None
+    for k in ("max_tokens", "max_completion_tokens"):
+        v = payload.get(k)
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            return k
+    return None
+
+
+def _caller_budget(payload):
+    """The output budget the CALLER asked for (before any reasoning allowance),
+    or None when there is none."""
+    try:
+        v = payload.get(_CALLER_MAX_KEY)
+        if isinstance(v, int) and v > 0:
+            return v
+        k = _budget_key(payload)
+        return int(payload[k]) if k else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _strip_private_keys(payload):
+    if isinstance(payload, dict) and _CALLER_MAX_KEY in payload:
+        payload = dict(payload)
+        payload.pop(_CALLER_MAX_KEY, None)
+    return payload
+
+
+def _apply_reasoning_effort(payload, model, difficulty, pid=None):
+    """For a thinking model: set reasoning_effort (from the task difficulty, LOW
+    on a small ask) and raise max_tokens by a reasoning allowance so hidden
+    thinking cannot eat the visible answer. No-op for non-thinking models.
 
     The effort is CAPPED by the output budget. Thinking is spent from the same
     max_tokens as the answer, so 'high' effort on a small budget makes the model
     burn the whole allowance reasoning and return finish_reason='length' with EMPTY
     content — which the chain then discards as a dead hop. That silently knocked the
     deep-quota reasoning workhorses (gpt-oss-120b, glm-4.7) out of every heavy turn
-    and funnelled the work onto whichever non-reasoning model was left."""
-    if not (difficulty and _SLOW_MODEL_RE.search((model or "").lower())):
+    and funnelled the work onto whichever non-reasoning model was left.
+
+    Effort is only SENT to a model that thinks by default (a hybrid that thinks
+    only when asked would start thinking because of it); a catalog-only flag
+    earns the allowance alone. A provider that 400'd the parameter for this
+    model is never sent it again (_REASONING_REJECTED)."""
+    low = (model or "").lower()
+    slow = bool(_SLOW_MODEL_RE.search(low))
+    default = slow or _thinks_by_default(pid, model)
+    if not (default or _can_think(pid, model)):
         return payload
-    effort = _DIFFICULTY_EFFORT.get(difficulty, "medium")
-    try:
-        budget = int(payload.get("max_tokens") or 0)
-    except (TypeError, ValueError):
-        budget = 0
-    if budget > 0:
-        order = {"low": 0, "medium": 1, "high": 2}
-        for need, cap in _EFFORT_MIN_BUDGET:
-            if budget < need and order.get(effort, 1) > order[cap]:
-                effort = cap
-    payload["reasoning_effort"] = effort
+    key = _budget_key(payload)
+    budget = int(payload[key]) if key else 0
+    effort = None
+    if slow and difficulty:
+        effort = _DIFFICULTY_EFFORT.get(difficulty, "medium")
+        if budget > 0:
+            order = {"low": 0, "medium": 1, "high": 2}
+            for need, cap in _EFFORT_MIN_BUDGET:
+                if budget < need and order.get(effort, 1) > order[cap]:
+                    effort = cap
+    elif default and (difficulty == "simple"
+                      or (0 < budget < _THINKING_SMALL_ASK)):
+        effort = "low"
+    if effort and not _reasoning_rejected(pid, model):
+        payload["reasoning_effort"] = effort
+    if key and 0 < budget < _THINKING_ALLOWANCE_BELOW and _CALLER_MAX_KEY not in payload:
+        in_force = str(effort or payload.get("reasoning_effort") or "medium").lower()
+        payload[key] = budget + _THINKING_ALLOWANCE.get(in_force, 2048)
+        payload[_CALLER_MAX_KEY] = budget
     return payload
+
+
+# --------------------------------------------------------------------------- #
+# STARVED / TRUNCATED-STUB replies. The empty case is _chat_json_starved's
+# (measured 49/49 as empty + "length"); a STUB is the same starvation with a
+# token or two of the answer showing ("94" for 2994). Both mean the budget
+# went to hidden reasoning, not that the model answered.
+# --------------------------------------------------------------------------- #
+_STUB_MAX_TOKENS = 512            # a longer truncated reply is a real truncation
+_STUB_DEFAULT_BUDGET = 256        # reference budget when nobody set one
+_STUB_RETRY_MAX = 16384           # past this a stub is the model's problem
+
+
+def _visible_tokens_est(text):
+    """Generous (over-)estimate of the tokens in visible text: bytes / 3."""
+    b = len((text or "").encode("utf-8"))
+    return -(-b // 3) if b else 0
+
+
+def _usage_visible_tokens(usage, msg=None):
+    """Visible completion tokens from a usage object, or None when it cannot
+    tell (completion_tokens absent, or it may include unreported reasoning)."""
+    try:
+        if not isinstance(usage, dict):
+            return None
+        ct = usage.get("completion_tokens")
+        if not isinstance(ct, (int, float)) or isinstance(ct, bool):
+            return None
+        det = usage.get("completion_tokens_details")
+        rt = det.get("reasoning_tokens") if isinstance(det, dict) else None
+        if isinstance(rt, (int, float)) and rt >= 0:
+            return max(0, int(ct - rt))
+        if isinstance(msg, dict) and any(isinstance(msg.get(k), str) and msg[k].strip()
+                                         for k in ("reasoning_content", "reasoning")):
+            return None        # reasoning shown but not counted apart: unknowable
+        return int(ct)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _is_truncated_stub(text, finish_reason, budget, visible=None):
+    """True when a reply cut at finish_reason 'length' carries only a short
+    STUB of an answer: under half of `budget` (the caller's) in visible
+    tokens. A plain non-thinking truncation fills its budget, so it never
+    qualifies; an empty reply is the older starved case, not a stub."""
+    if (finish_reason or "") != "length":
+        return False
+    text = (text or "").strip()
+    if not text:
+        return False
+    try:
+        ref = int(budget) if budget else _STUB_DEFAULT_BUDGET
+    except (TypeError, ValueError):
+        ref = _STUB_DEFAULT_BUDGET
+    vis = _visible_tokens_est(text) if visible is None else int(visible)
+    return vis <= _STUB_MAX_TOKENS and vis * 2 < ref
+
+
+def _starve_kind(data, payload):
+    """None | 'empty' | 'stub' for a non-streamed 200 (see above)."""
+    try:
+        choice = (data.get("choices") or [{}])[0] or {}
+        if (choice.get("finish_reason") or "") != "length":
+            return None
+        msg = choice.get("message") or {}
+        if msg.get("tool_calls"):
+            return None
+        if _chat_json_is_empty(data):
+            return "empty"
+        c = msg.get("content")
+        if isinstance(c, list):
+            c = "".join((p.get("text") or "") for p in c if isinstance(p, dict))
+        if _is_truncated_stub(str(c or ""), "length", _caller_budget(payload),
+                              _usage_visible_tokens(data.get("usage"), msg)):
+            return "stub"
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def _stub_retry_budget(caller, sent):
+    """Budget for the one retry after a stub: what was sent plus at least a
+    low-effort allowance (doubling when an allowance was already given)."""
+    base = max(int(sent or 0), int(caller or 0))
+    if base >= _STUB_RETRY_MAX:
+        return None
+    return base + max(_THINKING_ALLOWANCE["low"], base if base > (caller or 0) else 0)
+
+
+def _starve_retry_payload(pid, payload, kind):
+    """The payload for ONE same-pair retry of a starved hop, or None when a
+    retry cannot help. 'empty' keeps the measured _starved_retry_budget sizing;
+    a stub (or a streamed starvation) gets the reasoning allowance on top of
+    what was sent. A small ask also gets LOW effort."""
+    key = _budget_key(payload) or "max_tokens"
+    sent = payload.get(key) if isinstance(payload.get(key), int) else None
+    caller = _caller_budget(payload)
+    bigger = (_starved_retry_budget(sent) if kind == "empty"
+              else _stub_retry_budget(caller, sent))
+    if not bigger or (sent and bigger <= sent):
+        return None
+    retry = dict(payload)
+    retry[key] = bigger
+    if caller:
+        retry[_CALLER_MAX_KEY] = caller
+    if (caller or 0) < _THINKING_SMALL_ASK and not _reasoning_rejected(pid, payload.get("model")):
+        retry["reasoning_effort"] = "low"
+    return retry
+
+
+def _starve_retry(clock, pid, model, payload, kind):
+    """Retry a starved NON-streamed hop once on the same pair with more room.
+    Returns (data, payload) of a usable retry, or (None, None): the caller then
+    walks on. A hop is filed as a quality failure only when the retry starves
+    too (or a stub could not be retried at all)."""
+    _note_thinking(pid, model, "starved-" + kind)
+    retry = _starve_retry_payload(pid, payload, kind)
+    if retry is None:
+        if kind == "stub":
+            _record_outcome(pid, model, False)
+        return None, None
+    try:
+        resp2 = clock.dispatch(pid, retry, False, hedge=False)
+        data2 = resp2.json() if resp2.status_code == 200 else None
+        resp2.close()
+    except Exception:                                            # noqa: BLE001
+        data2 = None
+    if not isinstance(data2, dict):
+        return None, None
+    if _chat_json_is_empty(data2) or _starve_kind(data2, retry):
+        _record_outcome(pid, model, False)
+        return None, None
+    return data2, retry
+
+
+def _fit_visible_to_caller(data, payload):
+    """Keep a non-streamed reply to ~the caller's own budget of VISIBLE text
+    when the hub raised max_tokens for reasoning room. A reply within
+    1.25x + 8 tokens is left alone; a longer one is cut at a word boundary and
+    marked finish_reason 'length' -- what a non-thinking model would have
+    returned for that budget. Tool calls are never touched. Never raises."""
+    try:
+        caller = payload.get(_CALLER_MAX_KEY) if isinstance(payload, dict) else None
+        if not isinstance(caller, int) or caller <= 0:
+            return data
+        choice = (data.get("choices") or [{}])[0] or {}
+        msg = choice.get("message") or {}
+        c = msg.get("content")
+        if msg.get("tool_calls") or not isinstance(c, str) or not c:
+            return data
+        vis = _usage_visible_tokens(data.get("usage"), msg)
+        if vis is None:
+            vis = len(c) // 4
+        if vis <= caller * 1.25 + 8:
+            return data
+        cut = c[:caller * 4]
+        sp = max(cut.rfind(" "), cut.rfind("\n"))
+        if sp > len(cut) // 2:
+            cut = cut[:sp]
+        msg["content"] = cut.rstrip()
+        choice["finish_reason"] = "length"
+    except Exception:                                            # noqa: BLE001
+        pass
+    return data
 
 
 # --------------------------------------------------------------------------- #
@@ -8207,6 +8586,11 @@ _NO_KEY_PIN = object()
 _STREAM_USAGE_OPTIONS = {"include_usage": True}
 _NO_STREAM_OPTIONS = set()
 _STREAM_OPTIONS_ERR_RE = re.compile(r"stream_options|include_usage", re.I)
+# A 400 about the reasoning parameter itself (not, say, a context overflow).
+_REASONING_PARAM_ERR_RE = re.compile(
+    r"reasoning[_ .]?effort|thinking[_ ]?(?:budget|level|config)"
+    r"|(?:unknown|unrecognized|unsupported|invalid|extra)[^.\n]{0,60}reasoning"
+    r"|reasoning[^.\n]{0,60}(?:not supported|unsupported|not allowed|not permitted)", re.I)
 
 
 def _resp_text_safe(resp):
@@ -10161,6 +10545,13 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
     `only_key` pins the call to a single key instead of the pool (None means
     "send no Authorization header"). _NO_KEY_PIN, not None, is the "not pinned"
     default precisely because None is itself a meaningful key value here."""
+    payload = _strip_private_keys(payload)
+    if (isinstance(payload, dict) and payload.get("reasoning_effort") is not None
+            and _reasoning_rejected(pid, payload.get("model"))):
+        # This provider already 400'd the parameter for this model (see the
+        # learn-and-drop below): never send it again, whoever set it.
+        payload = dict(payload)
+        payload.pop("reasoning_effort", None)
     if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
         # (1) AUTO-COMPACT the history to THIS model's context window (per-model
         # memory management — a small-context model gets recent turns only), then
@@ -10359,6 +10750,24 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                 resp.close()
                 payload = dict(payload)
                 payload.pop("stream_options", None)
+                _post_kw["json"] = payload
+                resp = (_post_with_header_deadline(_STREAM_HEADER_WAIT,
+                                                   requests.post, **_post_kw)
+                        if stream else requests.post(**_post_kw))
+            # Same learn-and-drop for reasoning_effort: some provider/model
+            # pairs reject it outright (groq's qwen3 takes only none/default,
+            # plain chat models refuse the field). Retried once without it and
+            # remembered per (provider, model), instead of losing the hop.
+            if (resp.status_code in (400, 422) and isinstance(payload, dict)
+                    and payload.get("reasoning_effort") is not None
+                    and _REASONING_PARAM_ERR_RE.search(_resp_text_safe(resp))):
+                with _thinking_lock:
+                    _REASONING_REJECTED[(pid, payload.get("model"))] = time.time()
+                _log.info("[thinking] %s/%s rejects reasoning_effort: dropped from "
+                          "now on", pid, payload.get("model"))
+                resp.close()
+                payload = dict(payload)
+                payload.pop("reasoning_effort", None)
                 _post_kw["json"] = payload
                 resp = (_post_with_header_deadline(_STREAM_HEADER_WAIT,
                                                    requests.post, **_post_kw)
@@ -22367,6 +22776,8 @@ def _hedge_leg_verdict(item, payload):
                 return "nonanswer"
             if _chat_json_is_empty(data):
                 return "empty"
+            if _starve_kind(data, payload) == "stub":
+                return "starved"   # a stub must not win the race
             return _answer_gate(data, payload, False)
         if kind == "peek":
             status, buffered, _it = extra
@@ -22374,6 +22785,9 @@ def _hedge_leg_verdict(item, payload):
                 return status
             raw = "".join(b.decode("utf-8", "ignore") if isinstance(b, (bytes, bytearray))
                           else str(b) for b in buffered if b)
+            _full, _tools, _fin = _buffered_digest(buffered)
+            if not _tools and _is_truncated_stub(_full, _fin, _caller_budget(payload)):
+                return "starved"
             text = _peeked_text(raw)
             if text and not answer_check.inspect(
                     text, prompt_text=_prompt_text_for_check(payload),
@@ -22504,7 +22918,7 @@ class _ChainClock:
         pl["model"] = model
         if plan["output_budget"]:
             _apply_output_budget(pl, pid)
-        _apply_reasoning_effort(pl, model, plan["diff"])
+        _apply_reasoning_effort(pl, model, plan["diff"], pid=pid)
         pl["stream"] = stream
         return pl
 
@@ -22959,6 +23373,12 @@ def _judge_peeked(chunks, check=None, raw_items=None, prompt=None):
             # iter_lines items carry no newline; iter_content chunks do.
             sep = b"" if any(b"\n" in x for x in items) else b"\n"
             full, saw_tools, fin = _sse_answer_digest([sep.join(items)])
+            if (check.get("starve_check") and not saw_tools
+                    and _is_truncated_stub(full, fin, check.get("budget"))):
+                # The stream ENDED at "length" on a stub ("94" of 2994): the
+                # budget went to hidden reasoning. Caught here, before a byte
+                # is committed, so the loop can retry with room.
+                return "starved"
             if full.strip() and not saw_tools:
                 v = answer_check.inspect(
                     full, prompt_text=check.get("prompt_text"),
@@ -22991,6 +23411,65 @@ def _peeked_text(raw):
         except Exception:                                        # noqa: BLE001
             out.append(m.group(1))
     return "".join(out).strip()
+
+
+def _empty_or_starved(buf, check):
+    """Verdict for a stream that ENDED with no visible text: 'starved' when it
+    ended on finish_reason "length" (all of the budget went to reasoning --
+    retryable with room, see _stream_starve_retry), else 'empty'."""
+    try:
+        if check and check.get("starve_check"):
+            _text, saw_tools, fin = _buffered_digest(buf)
+            if fin == "length" and not saw_tools:
+                return "starved"
+    except Exception:                                            # noqa: BLE001
+        pass
+    return "empty"
+
+
+def _buffered_digest(buffered):
+    """_sse_answer_digest over peeked stream items, whichever way they were
+    read (iter_lines items carry no newline; iter_content chunks do)."""
+    items = [x if isinstance(x, (bytes, bytearray))
+             else str(x).encode("utf-8", "ignore") for x in (buffered or ()) if x]
+    sep = b"" if any(b"\n" in x for x in items) else b"\n"
+    return _sse_answer_digest([sep.join(items)])
+
+
+def _stream_starve_retry(clock, pid, model, payload, est, has_tools, tools, lines):
+    """ONE same-pair retry for a streamed hop whose peek said 'starved', with
+    the reasoning allowance on top of what was sent. Nothing has reached the
+    client yet (the peek commits nothing), so the retry is invisible to it.
+    Returns (resp, iterator, status, buffered, payload) of the retry -- status
+    is the retry's own peek verdict -- or None when no retry was possible (the
+    caller walks on). A retry that starves again files a quality failure."""
+    _note_thinking(pid, model, "starved stream")
+    retry = _starve_retry_payload(pid, payload, "stub")
+    if retry is None:
+        _record_outcome(pid, model, False)
+        return None
+    retry["stream"] = True
+    try:
+        resp2 = clock.dispatch(pid, retry, True, hedge=False)
+    except Exception:                                            # noqa: BLE001
+        return None
+    if getattr(resp2, "status_code", None) != 200:
+        try:
+            resp2.close()
+        except Exception:                                        # noqa: BLE001
+            pass
+        return None
+    it = (resp2.iter_lines(decode_unicode=False) if lines
+          else resp2.iter_content(chunk_size=None))
+    if has_tools:
+        it = tool_rescue.rescue_stream(it, tools, "lines" if lines else "frames")
+    status, buffered = _peek_until_content(
+        it, clock.peek_timeout(model, est), content_grace=clock.content_grace(),
+        check=_peek_check(retry, has_tools))
+    clock.note_peek(pid, model, status)
+    if status == "starved":
+        _record_outcome(pid, model, False)
+    return resp2, it, status, buffered, retry
 
 
 def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
@@ -23092,7 +23571,8 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                     # every iter_lines stream -- each line on the /v1/responses
                     # and /v1/messages paths -- and many iter_content ones):
                     # the trivial answers this chain most needs to keep.
-                    box["status"] = _judge(seen_content) if seen_content else "empty"
+                    box["status"] = (_judge(seen_content) if seen_content
+                                     else _empty_or_starved(buf, check))
                     return
                 if _STREAM_REASONING_RE.search(b):
                     saw_reasoning = True
@@ -23108,7 +23588,8 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
             # The stream ENDED inside the peek window, so everything the model
             # was ever going to say is in hand -- the best possible moment to
             # judge it, and the shape a dead turn usually has.
-            box["status"] = _judge(seen_content) if seen_content else "empty"
+            box["status"] = (_judge(seen_content) if seen_content
+                             else _empty_or_starved(buf, check))
         except Exception:
             box["status"] = "empty"     # read error/timeout -> unusable, fall through
 
@@ -23960,8 +24441,12 @@ class _StreamAnswerGate:
 
     def __init__(self, iterator, *, mode="bytes", hop_pid=None, hop_model=None,
                  prompt_text=None, last_prompt=None, tools_offered=False,
-                 hold_chars=None, hold_seconds=None):
+                 hold_chars=None, hold_seconds=None, visible_cap=None):
         self._it = iterator
+        # Chars of visible text past which the stream is ended at "length":
+        # set only when the hub raised max_tokens for reasoning room, so the
+        # caller still gets ~the visible length it asked for.
+        self._cap_chars = visible_cap if isinstance(visible_cap, int) and visible_cap > 0 else None
         self._lines = mode == "lines"
         self._pid, self._model_id = hop_pid, hop_model
         self._prompt = prompt_text
@@ -23980,7 +24465,59 @@ class _StreamAnswerGate:
         self.reasons = []
 
     def __iter__(self):
-        return self._run()
+        run = self._run()
+        return self._capped(run) if self._cap_chars else run
+
+    def _capped(self, frames):
+        """Relay `frames` (the gate's own output) until the visible text passes
+        self._cap_chars, then end the stream at finish_reason "length" -- what
+        a non-thinking model would have sent for the caller's budget. A tool
+        call disarms the cap: an agent's arguments are never cut."""
+        sent, rest, passthrough = 0, b"", False
+        try:
+            for item in frames:
+                if passthrough:
+                    yield item
+                    continue
+                if self._lines:
+                    pieces = [item]
+                else:
+                    buf = rest + _stream_item_bytes(item)
+                    pieces, pos = [], 0
+                    for m in _SSE_FRAME_END_RE.finditer(buf):
+                        pieces.append(buf[pos:m.end()])
+                        pos = m.end()
+                    rest = buf[pos:]
+                    if len(rest) > _SSE_FRAME_CAP:
+                        pieces.append(rest)
+                        rest = b""
+                for fr in pieces:
+                    if passthrough:
+                        yield fr
+                        continue
+                    k, t, _fin = self._classify(fr)
+                    if k == "disarm":
+                        passthrough = True
+                    elif k == "text":
+                        if sent + len(t) > self._cap_chars:
+                            piece = t[:max(0, self._cap_chars - sent)]
+                            sp = max(piece.rfind(" "), piece.rfind("\n"))
+                            if sp > 0:
+                                piece = piece[:sp]
+                            if piece.strip():
+                                yield self._synth({"content": piece}, None)
+                            yield self._synth({}, "length")
+                            yield self._done()
+                            return
+                        sent += len(t)
+                    yield fr
+            if rest:
+                yield rest
+        finally:
+            try:
+                frames.close()
+            except Exception:                                    # noqa: BLE001
+                pass
 
     @property
     def _text(self):
@@ -24258,11 +24795,15 @@ def _gate_stream(iterator, mode, hop_pid, hop_model, payload, has_tools):
     the upstream iterator is relayed untouched (the gate is never the thing
     that loses an answer)."""
     try:
+        cap = None
+        caller = payload.get(_CALLER_MAX_KEY) if isinstance(payload, dict) else None
+        if isinstance(caller, int) and caller > 0:
+            cap = int(caller * 4 * 1.25) + 32     # ~caller tokens of text, 25% slack
         return _StreamAnswerGate(
             iterator, mode=mode, hop_pid=hop_pid, hop_model=hop_model,
             prompt_text=_prompt_text_for_check(payload),
             last_prompt=_last_user_text_for_check(payload),
-            tools_offered=bool(has_tools))
+            tools_offered=bool(has_tools), visible_cap=cap)
     except Exception:                                            # noqa: BLE001
         return iterator
 
@@ -24273,7 +24814,11 @@ def _peek_check(payload, has_tools):
     try:
         return {"prompt_text": _prompt_text_for_check(payload),
                 "last_prompt": _last_user_text_for_check(payload),
-                "tools_offered": bool(has_tools)}
+                "tools_offered": bool(has_tools),
+                # The caller's own budget: a reply cut at "length" far below
+                # it is a starved stub, not an answer (_is_truncated_stub).
+                "budget": _caller_budget(payload),
+                "starve_check": True}
     except Exception:                                            # noqa: BLE001
         return None
 
@@ -24392,6 +24937,11 @@ def _record_sse_usage(hop_pid, hop_model, kept, tail, prompt_est):
     Never raises."""
     try:
         u = _sse_usage(tail) or _sse_usage(b"".join(kept))
+        if u is not None:
+            _note_thinking_evidence(hop_pid, hop_model, usage=u)
+        if any(_STREAM_REASONING_RE.search(bytes(k)) for k in (kept or ())[:64]
+                 if isinstance(k, (bytes, bytearray))):
+            _note_thinking(hop_pid, hop_model, "reasoning deltas")
         if u is not None:
             usage_history.record(hop_pid, hop_model, int(u.get("prompt_tokens") or 0),
                                  int(u.get("completion_tokens") or 0), estimated=False)
@@ -25845,17 +26395,107 @@ def _pipeline_time_left():
     return None if at is None else at - time.monotonic()
 
 
-def _swarm_fast_path(body, messages):
-    """True when a pipeline id should answer with ONE strong model instead: a
-    tool-free turn whose ask _classify_difficulty calls 'simple' (arithmetic, a
-    one-line fact, a yes/no). Flag `swarm_fast_path`, default on. Fails CLOSED
-    to the pipeline -- the user did pick it."""
+# THE PIPELINE FAST PATH IS FOR TRIVIAL ASKS ONLY. The classifier alone was too
+# loose: LIVE, model "swarm" answered "Write a concise README section for a
+# command-line tool named tally ... Include: a one-paragraph description, a
+# usage block, a markdown table of exactly 3 flags (-l, -w, -c) with
+# descriptions, and one example command with its output." on the fast path
+# (204 s, one model) because it scores 'simple' -- so the pipeline and the
+# subscription manager the user picked never ran. A trivial ask is ONE short
+# question or one-line request whose answer is short (arithmetic, a fact,
+# yes/no, a single value, a one-sentence rewrite): never a request to write /
+# create / build / design / implement something, never one that enumerates
+# several required parts.
+_FAST_PATH_MAX_CHARS = 200
+_FAST_PATH_CREATE_RE = re.compile(
+    r"\b(?:" + "|".join(v for v in _CREATION_VERBS
+                        # a one-sentence rewrite IS trivial; "code"/"port" are
+                        # nouns far more often in a question ("status code")
+                        if v not in ("rewrite", "code", "port")) + r")\b", re.I)
+_FAST_PATH_PARTS_RE = re.compile(
+    r"\b(?:include|includes|including|containing|contains|requirements?|"
+    r"with the following|the following|must (?:have|include|contain))\s*:"
+    r"|^\s*(?:\d+[.)]|[-*•])\s+\S", re.I | re.M)
+_FAST_PATH_JOIN_RE = re.compile(r"[,;]|\band\b", re.I)
+
+
+def _trivial_ask_text(messages):
+    """The latest REAL user instruction (CLI wrapper blocks such as Claude
+    Code's <system-reminder> removed), or "" when the turn does not end on
+    one -- a tool result means the agent is mid-task."""
+    for m in reversed(messages or []):
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") != "user":
+            return ""
+        return ctxwin.instruction_text(ctxwin.message_text(m))
+    return ""
+
+
+def _is_trivial_ask(messages, max_tokens=None):
+    """True for ONE short question / one-line request with a short answer
+    (see above). Judged on the latest real instruction alone. Never raises."""
     try:
-        if body.get("tools") or not config.get_flag("swarm_fast_path", True):
+        text = _trivial_ask_text(messages).strip()
+        if not text or len(text) > _FAST_PATH_MAX_CHARS or text.count("\n") > 1:
             return False
-        return _classify_difficulty(messages, body.get("max_tokens")) == "simple"
+        if _FAST_PATH_CREATE_RE.search(text) or _FAST_PATH_PARTS_RE.search(text):
+            return False
+        if len(_FAST_PATH_JOIN_RE.findall(text)) >= 3:
+            return False            # "a, b, c and d": several deliverables
+        if len([s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]) > 2:
+            return False            # more than a question + one format line
+        return _classify_difficulty([{"role": "user", "content": text}],
+                                    max_tokens) == "simple"
     except Exception:                                            # noqa: BLE001
         return False
+
+
+def _swarm_fast_path(body, messages, tools=None, max_tokens=None):
+    """True when a pipeline id (swarm / crew* / multi / a "<category>-swarm"
+    compound) should answer with ONE strong model instead: a TRIVIAL ask
+    (_is_trivial_ask). A tool-carrying turn qualifies too -- LIVE, Claude
+    Code on multi/coding-swarm spent ~180 s fanning "What is N plus 1?" out to
+    five models -- but only when the turn ends on a fresh user instruction
+    (first turn or a short follow-up, never mid-loop on a tool result) and the
+    conversation itself is small. Medium/hard tool turns keep the fan-out.
+    Flag `swarm_fast_path`, default on. Fails CLOSED to the pipeline -- the
+    user did pick it."""
+    try:
+        if not config.get_flag("swarm_fast_path", True):
+            return False
+        tools = tools if tools is not None else body.get("tools")
+        if max_tokens is None:
+            max_tokens = body.get("max_tokens") or body.get("max_output_tokens")
+        if tools and _est_tokens(messages) >= STREAM_BIG_REQUEST_TOKENS:
+            return False
+        return _is_trivial_ask(messages, max_tokens)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+_PIPELINE_FAST_NOTE = "fast-path=simple question, one strong model"
+
+
+def _note_pipeline_fast_path():
+    """Mark this request as served by the pipeline fast path; the
+    X-Free-LLM-Hub-Pipeline header is added on the way out (the /v1/responses
+    and /v1/messages loops return from many places)."""
+    try:
+        g.hub_pipeline_note = _PIPELINE_FAST_NOTE
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+@app.after_request
+def _pipeline_note_after(response):
+    try:
+        note = getattr(g, "hub_pipeline_note", None)
+        if note and "X-Free-LLM-Hub-Pipeline" not in response.headers:
+            response.headers["X-Free-LLM-Hub-Pipeline"] = note
+    except Exception:                                            # noqa: BLE001
+        pass
+    return response
 
 
 def _wants_pipeline_trailer():
@@ -25925,6 +26565,21 @@ def _pipeline_context(body, messages, sid=None):
 
 def _swarm_completion(body):
     """Run the swarm (or a crew) and return ONE ordinary chat-completions response."""
+    asked = (body.get("model") or "").strip()
+    if _swarm_fast_path(body, body.get("messages") or []):
+        # MEASURED live: "coding-swarm" took 231 s to answer "What is 5767
+        # plus 1" -- plan, workers, supervisor, review and synthesis, up to
+        # thirteen calls, to agree on 5768 -- and a tool-carrying turn fanned
+        # the same question out to five models (~180 s). A TRIVIAL ask (see
+        # _is_trivial_ask) gets ONE strong model ('best', same pool and
+        # category) instead, with or without tools.
+        _log.info("[swarm] trivial %s ask -> one strong model (fast path, asked %r)",
+                  "tool" if body.get("tools") else "tool-free", asked)
+        fast = dict(body)
+        fast["model"] = "best"
+        resp = app.make_response(_chat_completions_uncached(fast))
+        resp.headers["X-Free-LLM-Hub-Pipeline"] = _PIPELINE_FAST_NOTE
+        return resp
     if body.get("tools"):
         # A tool-carrying turn cannot use the prose pipeline (it emits no tool
         # calls, so an agent driven by it writes nothing). Run the parallel
@@ -25956,19 +26611,6 @@ def _swarm_completion(body):
     messages = body.get("messages") or []
     if not messages:
         return _openai_error("messages is required.", 400)
-    asked = (body.get("model") or "").strip()
-    if _swarm_fast_path(body, messages):
-        # MEASURED live: "coding-swarm" took 231 s to answer "What is 5767
-        # plus 1" -- plan, workers, supervisor, review and synthesis, up to
-        # thirteen calls, to agree on 5768. A question the classifier calls
-        # simple gets ONE strong model ('best', same pool and category) instead.
-        _log.info("[swarm] simple tool-free question -> one strong model "
-                  "(fast path, asked %r)", asked)
-        fast = dict(body)
-        fast["model"] = "best"
-        resp = app.make_response(_chat_completions_uncached(fast))
-        resp.headers["X-Free-LLM-Hub-Pipeline"] = "fast-path=simple question, one strong model"
-        return resp
     crew = _crew_name_for(asked)
     # Feed live stage progress + the per-role model list to the activity row.
     _watch = _act_pipeline_watcher()
@@ -26957,7 +27599,7 @@ def _chat_completions_uncached(body):
         payload = dict(body)
         payload["model"] = hop_model
         _apply_output_budget(payload, hop_pid)
-        _apply_reasoning_effort(payload, hop_model, diff)
+        _apply_reasoning_effort(payload, hop_model, diff, pid=hop_pid)
         dispatch_stream = stream and not is_sub_hop
         payload["stream"] = dispatch_stream
         try:
@@ -27059,6 +27701,15 @@ def _chat_completions_uncached(body):
                     content_grace=_clock.content_grace(),
                     check=_peek_check(payload, has_tools))
                 _clock.note_peek(hop_pid, hop_model, status)
+                if status == "starved":
+                    # Ended at "length" on a stub / nothing: hidden reasoning
+                    # ate the budget. One same-pair retry with room, before a
+                    # byte reaches the client (see _stream_starve_retry).
+                    resp.close()
+                    _again = _stream_starve_retry(_clock, hop_pid, hop_model, payload, est,
+                                                  has_tools, body.get("tools"), lines=False)
+                    if _again is not None:
+                        resp, it, status, buffered, payload = _again
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -27103,6 +27754,20 @@ def _chat_completions_uncached(body):
                 last_error = "non-json"
                 resp.close()
                 continue
+            # Starved by the token budget rather than broken -- empty at
+            # "length", or a truncated STUB ("94" for 2994)? Give this SAME hop
+            # one more go with room to answer, instead of serving the stub or
+            # throwing away a model that was about to work (_starve_retry).
+            _sk = _starve_kind(data, payload)
+            if _sk:
+                resp.close()
+                data2, payload2 = _starve_retry(_clock, hop_pid, hop_model, payload, _sk)
+                if data2 is None:
+                    errors.append("%s: %s even with more room" % (
+                        hop_pid, "empty" if _sk == "empty" else "truncated stub"))
+                    last_error = "empty" if _sk == "empty" else "starved"
+                    continue
+                data, payload = data2, payload2
             if _chat_json_nonanswer(data, has_tools, body.get("tools")):
                 # A 200 whose content IS the relay backend's error page (see
                 # _chat_json_nonanswer). Falls through to the next hop exactly
@@ -27113,34 +27778,6 @@ def _chat_completions_uncached(body):
                 resp.close()
                 continue
             if _chat_json_is_empty(data):
-                # Starved by the token budget rather than broken? Give this SAME
-                # hop one more go with room to answer, instead of throwing away a
-                # model that was about to work. See _chat_json_starved.
-                bigger = _starved_retry_budget(payload.get("max_tokens")) \
-                    if _chat_json_starved(data) else None
-                if bigger:
-                    resp.close()
-                    retry = dict(payload)
-                    retry["max_tokens"] = bigger
-                    try:
-                        resp2 = _clock.dispatch(hop_pid, retry, False, hedge=False)
-                        data2 = resp2.json() if resp2.status_code == 200 else None
-                        resp2.close()
-                    except (requests.RequestException, RuntimeError, ValueError):
-                        data2 = None
-                    gate2 = "junk"
-                    if (data2 and not _chat_json_is_empty(data2)
-                            and not _chat_json_nonanswer(data2, has_tools, body.get("tools"))):
-                        gate2 = _answer_gate(data2, payload, has_tools)
-                    if gate2 != "junk":
-                        _record_chat_usage(hop_pid, hop_model, data2, est, ok=gate2 == "ok")
-                        _ctx_fix_chat_usage(data2, est, hop_pid, hop_model)
-                        data2["model"] = hop_pid + "/" + hop_model
-                        return (jsonify(data2), 200,
-                                _routing_headers(hop_pid, hop_model, attempts, last_error))
-                    errors.append("%s: empty even at max_tokens=%d" % (hop_pid, bigger))
-                    last_error = "empty"
-                    continue
                 errors.append("%s: empty (200 but no content)" % hop_pid)
                 last_error = "empty"
                 resp.close()
@@ -27157,6 +27794,8 @@ def _chat_completions_uncached(body):
             # The CLIENT sees the size of the request it sent, not of the
             # compacted one (usage_history above keeps the real upstream count).
             _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
+            # ...and ~the visible length it asked for (reasoning allowance).
+            _fit_visible_to_caller(data, payload)
             if isinstance(data, dict):
                 data["model"] = hop_pid + "/" + hop_model
                 # An answer cut off at the provider's OWN default budget is a
@@ -27722,6 +28361,12 @@ def v1_responses(_retry_pass=False, _hedged=False):
     # /v1/chat/completions -- which codex never calls -- so "swarm" arrived here
     # as an unknown bare id and _resolve_model turned it into a literal model on
     # the default provider. Measured live: 'groq/swarm ! groq: HTTP 404'.
+    if _is_swarm_model(body.get("model")) and _swarm_fast_path(
+            dict(body, tools=tools, max_tokens=body.get("max_output_tokens")), messages):
+        # A TRIVIAL ask on a pipeline id: one strong model, no fan-out (see
+        # _swarm_fast_path; the header names it).
+        _note_pipeline_fast_path()
+        body = dict(body, model="best")
     if _is_swarm_model(body.get("model")):
         served = _swarm_as_responses(body, messages, tools, est)
         if served is not None:
@@ -27840,7 +28485,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
         is_sub_hop = _is_sub(hop_pid)
         payload = dict(base_payload)
         payload["model"] = hop_model
-        _apply_reasoning_effort(payload, hop_model, diff)
+        _apply_reasoning_effort(payload, hop_model, diff, pid=hop_pid)
         dispatch_stream = stream and not is_sub_hop
         payload["stream"] = dispatch_stream
         try:
@@ -27935,6 +28580,13 @@ def v1_responses(_retry_pass=False, _hedged=False):
                     content_grace=_clock.content_grace(),
                     check=_peek_check(payload, has_tools))
                 _clock.note_peek(hop_pid, hop_model, status)
+                if status == "starved":
+                    # See the twin in /v1/chat/completions.
+                    resp.close()
+                    _again = _stream_starve_retry(_clock, hop_pid, hop_model, payload, est,
+                                                  has_tools, tools, lines=True)
+                    if _again is not None:
+                        resp, line_it, status, buffered, payload = _again
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -27965,6 +28617,18 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 last_error = "non-json"
                 resp.close()
                 continue
+            # Starved (empty or a truncated stub at "length"): one same-pair
+            # retry with room -- see the twin in /v1/chat/completions.
+            _sk = _starve_kind(data, payload)
+            if _sk:
+                resp.close()
+                data2, payload2 = _starve_retry(_clock, hop_pid, hop_model, payload, _sk)
+                if data2 is None:
+                    errors.append("%s: %s even with more room" % (
+                        hop_pid, "empty" if _sk == "empty" else "truncated stub"))
+                    last_error = "empty" if _sk == "empty" else "starved"
+                    continue
+                data, payload = data2, payload2
             if _chat_json_nonanswer(data, has_tools, tools):
                 # A 200 whose content IS the relay backend's error page (see
                 # _chat_json_nonanswer). Falls through to the next hop exactly
@@ -27989,6 +28653,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
+            _fit_visible_to_caller(data, payload)
             return jsonify(_chat_to_responses(data, model_label)), 200
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
@@ -28592,6 +29257,10 @@ def v1_messages():
     has_tools = bool(tools)
     diff = None
     # Same two modes, on claude's protocol. See the note in /v1/responses.
+    if _is_swarm_model(body.get("model")) and _swarm_fast_path(
+            dict(body, tools=tools), oai_messages):
+        _note_pipeline_fast_path()
+        body = dict(body, model="best")
     if _is_swarm_model(body.get("model")):
         served = _swarm_as_anthropic(body, oai_messages, tools)
         if served is not None:
@@ -28712,7 +29381,7 @@ def v1_messages():
             continue
         payload = dict(base_payload)
         payload["model"] = hop_model
-        _apply_reasoning_effort(payload, hop_model, diff)
+        _apply_reasoning_effort(payload, hop_model, diff, pid=hop_pid)
         payload["stream"] = stream
         try:
             _act_pick(hop_pid, hop_model)
@@ -28767,6 +29436,13 @@ def v1_messages():
                     content_grace=_clock.content_grace(),
                     check=_peek_check(payload, has_tools))
                 _clock.note_peek(hop_pid, hop_model, status)
+                if status == "starved":
+                    # See the twin in /v1/chat/completions.
+                    resp.close()
+                    _again = _stream_starve_retry(_clock, hop_pid, hop_model, payload, est,
+                                                  has_tools, tools, lines=True)
+                    if _again is not None:
+                        resp, line_it, status, buffered, payload = _again
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -28799,6 +29475,18 @@ def v1_messages():
                 last_error = "non-json"
                 resp.close()
                 continue
+            # Starved (empty or a truncated stub at "length"): one same-pair
+            # retry with room -- see the twin in /v1/chat/completions.
+            _sk = _starve_kind(data, payload)
+            if _sk:
+                resp.close()
+                data2, payload2 = _starve_retry(_clock, hop_pid, hop_model, payload, _sk)
+                if data2 is None:
+                    errors.append("%s: %s even with more room" % (
+                        hop_pid, "empty" if _sk == "empty" else "truncated stub"))
+                    last_error = "empty" if _sk == "empty" else "starved"
+                    continue
+                data, payload = data2, payload2
             if _chat_json_nonanswer(data, has_tools, tools):
                 # A 200 whose content IS the relay backend's error page (see
                 # _chat_json_nonanswer). Falls through to the next hop exactly
@@ -28823,6 +29511,7 @@ def v1_messages():
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             _ctx_fix_chat_usage(data, input_est, hop_pid, hop_model)
+            _fit_visible_to_caller(data, payload)
             return jsonify(_openai_resp_to_anthropic(data, model_str)), 200, \
                 _routing_headers(hop_pid, hop_model, attempts, last_error)
         # Non-2xx. Retryable (429/5xx) AND hard errors (404/400/model-not-found)

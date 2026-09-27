@@ -46,3 +46,25 @@ def _isolate_junk_bench():
 def _reset_recent_hop_failures():
     _clear_recent_hop_failures()
     yield
+
+
+def _clear_thinking_ledgers():
+    """THINKING LEDGERS: which (provider, model) reasons (catalog flags and
+    runtime evidence) and which rejected reasoning_effort. Tests feed fake
+    replies carrying reasoning text and starved stubs, which would otherwise
+    give a later test's fake model a reasoning allowance it never earned."""
+    mod = sys.modules.get("app")
+    if mod is None or not hasattr(mod, "_thinking_lock"):
+        return
+    with mod._thinking_lock:
+        mod._THINKING_CATALOG.clear()
+        mod._THINKING_IDENTS.clear()
+        mod._THINKING_LEARNED.clear()
+        mod._REASONING_REJECTED.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_thinking_ledgers():
+    _clear_thinking_ledgers()
+    yield
+    _clear_thinking_ledgers()
