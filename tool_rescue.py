@@ -395,7 +395,8 @@ def parse(text, allowed_names=None, schemas=None):
         if allowed_names is not None:
             allowed = {str(n) for n in allowed_names}
             found = [c for c in found if c["name"] in allowed]
-        return found
+        # An exact repeat is one call typed twice, as on the generic path below.
+        return dedupe_calls(found)[0]
 
     for block in _TOOL_CALL_BLOCK.findall(text):
         found.extend(_from_tool_call_block(block))
@@ -423,12 +424,7 @@ def parse(text, allowed_names=None, schemas=None):
             found.extend(_from_mapping(obj))
 
     # de-duplicate: the same call often matches two dialects at once
-    seen, unique = set(), []
-    for c in found:
-        key = (c["name"], c["arguments"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(c)
+    unique = dedupe_calls(found)[0]
 
     if allowed_names is not None:
         allowed = {str(n) for n in allowed_names}
@@ -662,13 +658,17 @@ def rescue_stream(items, tools, framing="lines"):
         fin = ch.get("finish_reason")
         if kind == "json" and ch:
             template = obj
+        if delta.get("tool_calls"):
+            # Real calls BEFORE any markup count too. Only the markup branch
+            # used to note them, so a model that emitted a call and then also
+            # typed it re-sent that call as a second (index-colliding) one.
+            real_calls = True
         if mode == "done":
             yield unit
             continue
         if mode == "markup":
             markup += text
             if delta.get("tool_calls"):
-                real_calls = True
                 tail.append(unit)
             elif not text and not fin and kind != "done":
                 tail.append(unit)
@@ -727,3 +727,258 @@ def rescue_stream(items, tools, framing="lines"):
         yield from held
     elif mode == "markup":
         yield from finalize(None)
+
+
+# --------------------------------------------------------------------------- #
+# Exact duplicate calls in ONE response
+# --------------------------------------------------------------------------- #
+#
+# MEASURED 2026-09-27: opencode rejected a reply with its doom_loop guard --
+# three IDENTICAL bash calls in one response (llm7/GLM-5.3-Flash). No hub path
+# was found that turns one upstream call into three (the one path that could
+# re-send a call -- rescue_stream promoting typed markup after a real call --
+# is fixed above), so the copies came from the model. Either way the client
+# must not run the same command N times: an exact repeat (same name,
+# byte-identical arguments) is collapsed to its FIRST copy, whose id and
+# position are kept. Different arguments are never touched.
+
+def _args_text(args):
+    if args is None:
+        return ""
+    if isinstance(args, str):
+        return args
+    try:
+        return json.dumps(args)
+    except (TypeError, ValueError):
+        return str(args)
+
+
+def _call_key(tc):
+    """(name, arguments) of a tool_calls entry or a bare {name, arguments}
+    function dict; None when it has no name (never judged a duplicate)."""
+    if not isinstance(tc, dict):
+        return None
+    fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+    name = str(fn.get("name") or "").strip()
+    if not name:
+        return None
+    return name, _args_text(fn.get("arguments"))
+
+
+def dedupe_calls(calls):
+    """(kept, dropped): `calls` minus every exact repeat of an earlier call.
+    Kept entries that carry an `index` are renumbered 0..n-1 so no gap is
+    left. Anything unreadable is kept as it is. Never raises."""
+    if not isinstance(calls, list) or len(calls) < 2:
+        return calls, 0
+    seen, kept = set(), []
+    for tc in calls:
+        key = _call_key(tc)
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        kept.append(tc)
+    dropped = len(calls) - len(kept)
+    if dropped:
+        kept = [dict(tc, index=i) if isinstance(tc, dict) and "index" in tc else tc
+                for i, tc in enumerate(kept)]
+    return kept, dropped
+
+
+def dedupe_message(data):
+    """Collapse exact duplicate tool_calls in a chat.completion JSON (every
+    choice), in place. Returns how many calls were dropped."""
+    total = 0
+    try:
+        for ch in data.get("choices") or []:
+            msg = ch.get("message") if isinstance(ch, dict) else None
+            if not isinstance(msg, dict):
+                continue
+            kept, n = dedupe_calls(msg.get("tool_calls"))
+            if n:
+                msg["tool_calls"] = kept
+                total += n
+    except AttributeError:
+        pass
+    return total
+
+
+def dedupe_stream(items, framing="lines", on_drop=None):
+    """Wrap an OpenAI chat SSE iterator and drop exact duplicate tool calls.
+
+    A call streams live unless its name matches an EARLIER call's and its
+    arguments so far are a prefix of that call's: only then are its deltas
+    held. They are released (renumbered to the next free index) the moment
+    the arguments differ, and dropped when the call ends -- the next call
+    starts, the finish frame, [DONE] or the end of the stream -- byte-
+    identical to an earlier one. A later delta for a dropped call means it was
+    not finished after all: it is released then. Frames nothing touched pass
+    as their original bytes; n>1 choices pass untouched. `on_drop(name,
+    arguments)` is called per dropped call."""
+    end = b"\n\n" if framing == "frames" else b""
+    calls, order = {}, []           # key -> state; keys in first-seen order
+    by_index, by_id = {}, {}
+    last, next_out = [None], [0]
+    template = {}
+
+    def emit(obj):
+        return b"data: " + json.dumps(obj).encode("utf-8") + end
+
+    def args_of(st):
+        a = st["args"]
+        if len(a) > 1:
+            st["args"] = a = ["".join(a)]
+        return a[0] if a else ""
+
+    def earlier(st):
+        for k in order:
+            o = calls[k]
+            if o is st:
+                return
+            if not o["dropped"] and o["name"] == st["name"]:
+                yield o
+
+    def may_dup(st):
+        if not st["name"]:
+            return not st["args"]         # the name may still come
+        cur = args_of(st)
+        return any(args_of(o).startswith(cur) for o in earlier(st))
+
+    def release(st):
+        st["out"], st["dropped"] = next_out[0], False
+        next_out[0] += 1
+        out = [tc if tc.get("index") == st["out"] else dict(tc, index=st["out"])
+               for tc in st["held"]]
+        st["held"] = []
+        return out
+
+    def resolve(st):
+        """A held call is complete: drop it (exact repeat) or release it."""
+        if st["out"] is not None or st["dropped"]:
+            return []
+        cur = args_of(st)
+        if st["name"] and any(args_of(o) == cur for o in earlier(st)):
+            st["dropped"] = True
+            if on_drop is not None:
+                try:
+                    on_drop(st["name"], cur)
+                except Exception:                                # noqa: BLE001
+                    pass
+            return []
+        return release(st)
+
+    def resolve_all():
+        out = []
+        for k in order:
+            out.extend(resolve(calls[k]))
+        return out
+
+    def synth(tcs):
+        return emit({"id": template.get("id") or "chatcmpl-dedupe",
+                     "object": "chat.completion.chunk",
+                     "created": template.get("created") or 0,
+                     "model": template.get("model") or "",
+                     "choices": [{"index": 0, "delta": {"tool_calls": tcs},
+                                  "finish_reason": None}]})
+
+    def key_for(tc):
+        idx = tc.get("index")
+        idx = idx if isinstance(idx, int) and not isinstance(idx, bool) else None
+        tid = tc.get("id") or None
+        if tid is not None and tid in by_id:
+            return by_id[tid], idx, tid
+        if idx is not None and idx in by_index:
+            cand = by_index[idx]
+            # a NEW id on a used index is a new call, not a continuation
+            if tid is None or calls[cand]["id"] in (None, tid):
+                return cand, idx, tid
+            return None, idx, tid
+        if idx is None and tid is None:
+            return last[0], idx, tid
+        return None, idx, tid
+
+    units = _units(items, framing)
+    try:
+        for unit in units:
+            kind, obj = _payload(unit)
+            if kind == "done":
+                pending = resolve_all()
+                if pending:
+                    yield synth(pending)
+                yield unit
+                continue
+            choices = obj.get("choices") if kind == "json" else None
+            if not (isinstance(choices, list) and len(choices) == 1
+                    and isinstance(choices[0], dict)
+                    and (choices[0].get("index") or 0) == 0):
+                yield unit
+                continue
+            template = obj
+            ch = choices[0]
+            delta = ch.get("delta") if isinstance(ch.get("delta"), dict) else {}
+            tcs = delta.get("tool_calls")
+            fin = ch.get("finish_reason")
+            if not isinstance(tcs, list) or not tcs:
+                if fin:
+                    pending = resolve_all()
+                    if pending:
+                        yield synth(pending)
+                yield unit
+                continue
+            out_tcs = []
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    out_tcs.append(tc)
+                    continue
+                key, idx, tid = key_for(tc)
+                if key is None:
+                    if last[0] is not None:
+                        out_tcs.extend(resolve(calls[last[0]]))  # it is complete
+                    key = len(order)
+                    calls[key] = {"name": "", "args": [], "id": tid, "out": None,
+                                  "held": [], "dropped": False}
+                    order.append(key)
+                st = calls[key]
+                if idx is not None:
+                    by_index[idx] = key
+                if tid is not None:
+                    by_id.setdefault(tid, key)
+                    if st["id"] is None:
+                        st["id"] = tid
+                last[0] = key
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                name = str(fn.get("name") or "").strip()
+                if name and not st["name"]:
+                    st["name"] = name
+                if fn.get("arguments") is not None:
+                    st["args"].append(_args_text(fn.get("arguments")))
+                if st["out"] is not None:
+                    out_tcs.append(tc if tc.get("index") == st["out"]
+                                   else dict(tc, index=st["out"]))
+                    continue
+                st["held"].append(tc)
+                if st["dropped"] or not may_dup(st):
+                    out_tcs.extend(release(st))
+            if fin:
+                out_tcs.extend(resolve_all())
+            if len(out_tcs) == len(tcs) and all(a is b for a, b in zip(out_tcs, tcs)):
+                yield unit
+                continue
+            nd = dict(delta)
+            if out_tcs:
+                nd["tool_calls"] = out_tcs
+            else:
+                nd.pop("tool_calls", None)
+            if not (out_tcs or fin or obj.get("usage")
+                    or any(v not in (None, "") for v in nd.values())):
+                continue                  # nothing left to say in this frame
+            yield emit(dict(obj, choices=[dict(ch, delta=nd)]))
+        pending = resolve_all()
+        if pending:
+            yield synth(pending)
+    finally:
+        try:
+            units.close()
+        except Exception:                                        # noqa: BLE001
+            pass
