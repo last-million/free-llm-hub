@@ -8643,6 +8643,49 @@ _NO_KEY_PIN = object()
 _STREAM_USAGE_OPTIONS = {"include_usage": True}
 _NO_STREAM_OPTIONS = set()
 _STREAM_OPTIONS_ERR_RE = re.compile(r"stream_options|include_usage", re.I)
+
+# Optional top-level request fields a provider refused BY NAME in a 400/422
+# (e.g. nvidia: "Unsupported parameter(s): `prompt_cache_key`"). pid -> set.
+# Learned per process; the request is retried once without them. Fields the
+# request cannot mean the same thing without are never dropped.
+_UNSUPPORTED_PARAMS = {}
+_NEVER_DROP_PARAMS = frozenset({
+    "model", "messages", "tools", "tool_choice", "stream", "max_tokens",
+    "max_completion_tokens", "response_format", "functions", "function_call"})
+_PARAM_REFUSAL_RE = re.compile(
+    r"unsupported|unrecognized|unknown|not supported|not permitted|not allowed"
+    r"|extra (?:inputs?|fields?)|additional propert|invalid (?:parameter|field|argument)",
+    re.I)
+
+
+def _rejected_optional_params(payload, err_text):
+    """The optional top-level fields of `payload` that `err_text` (a provider's
+    400/422 body) refuses by name. Empty unless the text reads as a refusal of
+    a parameter and names a field actually present. Short, generic keys
+    ("user", "n", "seed") are only matched when quoted, so an error that merely
+    uses the word is never read as naming them."""
+    if not isinstance(payload, dict) or not err_text or not _PARAM_REFUSAL_RE.search(err_text):
+        return set()
+    text = str(err_text)[:4000]
+    out = set()
+    for key in payload:
+        if not isinstance(key, str) or key in _NEVER_DROP_PARAMS or key.startswith("_"):
+            continue
+        esc = re.escape(key)
+        if len(key) >= 6 and "_" in key:
+            hit = re.search(r"(?<![A-Za-z0-9_])" + esc + r"(?![A-Za-z0-9_])", text)
+        else:
+            hit = re.search(r"[`'\"]" + esc + r"[`'\"]", text)
+        if hit:
+            out.add(key)
+    return out
+
+
+def _remember_unsupported_params(pid, keys):
+    if not keys:
+        return
+    _UNSUPPORTED_PARAMS.setdefault(pid, set()).update(keys)
+    _log.info("[params] %s rejects %s: dropped from now on", pid, ", ".join(sorted(keys)))
 # A 400 about the reasoning parameter itself (not, say, a context overflow).
 _REASONING_PARAM_ERR_RE = re.compile(
     r"reasoning[_ .]?effort|thinking[_ ]?(?:budget|level|config)"
@@ -9540,6 +9583,7 @@ def _ctx_begin(body, messages, est, signal=True):
     _ctx_set("_ctx_signal", bool(signal) and not compaction and bool(
         config.get_flag("context_overflow_signal", True)))
     _ctx_set("_ctx_orig_est", int(est or 0))
+    _ctx_set("_ctx_fixed_est", _ctx_fixed_part_est(messages, body))
     _ctx_set("_ctx_overflow", None)
     _ctx_set("_ctx_hops", {})
     _ctx_set("_ctx_tried", set())
@@ -9548,6 +9592,41 @@ def _ctx_begin(body, messages, est, signal=True):
     except Exception:                                            # noqa: BLE001
         conv = None
     _ctx_set("_ctx_conv", conv)
+
+
+def _ctx_fixed_part_est(messages, body):
+    """Tokens of what NO client-side compaction can shrink: the system /
+    developer messages and the tool schemas. 0 when unknown. Never raises."""
+    try:
+        fixed = [m for m in (messages or [])
+                 if isinstance(m, dict) and m.get("role") in ("system", "developer")]
+        tools = body.get("tools") if isinstance(body, dict) else None
+        if not fixed and not tools:
+            return 0
+        return int(_est_tokens(fixed, tools) or 0)
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+# The overflow reply tells the CLI to compact its history and retry. When the
+# part compaction cannot touch (system prompt + tool schemas) already fills
+# this much of the largest window tried, compacting cannot make the request
+# fit, so the reply would only end the turn. MEASURED 2026-09-27 on /agent
+# (Claude Code, hub-backed): with every large-window model sidelined by
+# timeouts, the two 32K hops left overflowed and the hub answered "prompt is
+# too long" -- Claude Code then died with "A single-exchange conversation
+# cannot be compacted" on a ~1.7K-token conversation. That is a capacity
+# failure (the big models were busy), so it gets the capacity reply
+# (503 + Retry-After), which the CLI waits out and retries.
+_CTX_FUTILE_FIXED_SHARE = 0.75
+
+
+def _ctx_compaction_futile(fixed_est, window):
+    try:
+        fixed_est, window = int(fixed_est or 0), int(window or 0)
+    except (TypeError, ValueError):
+        return False
+    return fixed_est > 0 and window > 0 and fixed_est >= window * _CTX_FUTILE_FIXED_SHARE
 
 
 def _ctx_note_hop(pid, model, before, after):
@@ -9656,6 +9735,12 @@ def _ctx_overflow_reply(kind, stream=False, model_label="auto"):
         return None               # some hop failed for another reason
     orig = int(_ctx_g("_ctx_orig_est") or 0)
     window = int(ov.get("window") or 0)
+    if _ctx_compaction_futile(_ctx_g("_ctx_fixed_est"), window):
+        _log.info("[ctx] %s request overflowed every hop tried (largest window %d), "
+                  "but its system prompt + tools alone are ~%d tokens: compacting "
+                  "cannot help, answering as a capacity failure", kind, window,
+                  int(_ctx_g("_ctx_fixed_est") or 0))
+        return None
     hdrs = {"X-Free-LLM-Hub-Last-Error": "context"}
     _log.info("[ctx] %s request of ~%d tokens overflowed every hop (largest window "
               "tried %d): answering with the native context-length error", kind,
@@ -10709,6 +10794,11 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             not stream or pid in _NO_STREAM_OPTIONS):
         payload = dict(payload)
         payload.pop("stream_options", None)
+    # Optional fields this provider has already refused by name: never sent
+    # again, so the refusal costs one round trip per process, not one per call.
+    _learned_bad = _UNSUPPORTED_PARAMS.get(pid)
+    if _learned_bad and isinstance(payload, dict) and any(k in payload for k in _learned_bad):
+        payload = {k: v for k, v in payload.items() if k not in _learned_bad}
     # Perplexity rejects max_tokens < 16 ("max_tokens must be at least 16"). Clamp up
     # harmlessly so a small-output request (classification, a probe) doesn't 400.
     if pid == "perplexity" and isinstance(payload, dict):
@@ -10829,6 +10919,21 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                 resp = (_post_with_header_deadline(_STREAM_HEADER_WAIT,
                                                    requests.post, **_post_kw)
                         if stream else requests.post(**_post_kw))
+            # ...and for any OTHER optional field a provider refuses BY NAME.
+            # MEASURED 2026-09-27: nvidia 400'd every opencode/Codex-style chat
+            # request carrying `prompt_cache_key` ("Validation: Unsupported
+            # parameter(s): `prompt_cache_key`"), so the whole provider was
+            # lost for those clients, request after request.
+            if resp.status_code in (400, 422) and isinstance(payload, dict):
+                _bad = _rejected_optional_params(payload, _resp_text_safe(resp))
+                if _bad:
+                    _remember_unsupported_params(pid, _bad)
+                    resp.close()
+                    payload = {k: v for k, v in payload.items() if k not in _bad}
+                    _post_kw["json"] = payload
+                    resp = (_post_with_header_deadline(_STREAM_HEADER_WAIT,
+                                                       requests.post, **_post_kw)
+                            if stream else requests.post(**_post_kw))
         except requests.RequestException as exc:
             last_exc = exc
             if is_last:
@@ -10950,6 +11055,16 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         # is given up on. On the last key, return it so the caller can react
         # (429/5xx -> provider fallback; 401/403 -> surfaced as an error).
         if resp.status_code in _KEY_ROTATE_STATUSES and not is_last:
+            resp.close()
+            continue
+        # A MODEL-gone answer (404/410) on an earlier key: try the next key too.
+        # MEASURED 2026-09-27: nvidia (2 keys) answered 404 "Function ...: Not
+        # found for account ..." -- per ACCOUNT, so the other key may serve it --
+        # and because 404 returned from the FIRST iteration, is_last was never
+        # true, the dead-mark above never ran, and every request for the next
+        # hours opened its chain on the same 404. Rotating reaches the last key,
+        # which serves the model or dead-marks it.
+        if resp.status_code in (404, 410) and not is_last:
             resp.close()
             continue
         return resp
@@ -17697,10 +17812,17 @@ def api_agent_stop_session(session_id):
 
 @app.route("/api/agent/sessions/<session_id>", methods=["DELETE"])
 def api_agent_end_session(session_id):
+    ended, closed = _end_live_session(session_id)
+    return jsonify({"ended": ended, "app_closed": bool(closed)})
+
+
+def _end_live_session(session_id):
+    """End one live /agent session and what it owns. (ended, app_closed)."""
     # Take the folder BEFORE ending: end_session drops the registry entry, and
     # after that there is nothing left to say which project this session owned.
     sess = agentic_chat.get_session(session_id)
-    project_dir = getattr(sess, "project_dir", None) if sess else None
+    project_dir = (sess.get("project_dir") if isinstance(sess, dict)
+                   else getattr(sess, "project_dir", None)) if sess else None
     ended = agentic_chat.end_session(session_id)
     # And its model rules. Nothing else ever removed them, so a hub that had
     # run a few hundred conversations carried a few hundred dead entries.
@@ -17717,7 +17839,7 @@ def api_agent_end_session(session_id):
             closed = workspace.shutdown(project_dir)
         except Exception as exc:                                 # noqa: BLE001
             _log.warning("could not stop the preview for %s: %s", project_dir, exc)
-    return jsonify({"ended": ended, "app_closed": bool(closed)})
+    return ended, bool(closed)
 
 
 # --------------------------------------------------------------------------- #
@@ -17941,11 +18063,74 @@ def api_agent_history_set_title(session_id):
     return jsonify({"session_id": session_id, "title": title})
 
 
+_DELETE_SETTLE_SECS = 20          # wait this long for a stopped turn to write its end
+_DELETE_LATE_SECS = 900          # ...and sweep again when one finishes later still
+
+
+def _conversation_busy(session_id):
+    try:
+        return bool(agentic_chat.turn_busy(session_id) or _multi_run_for(session_id))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _end_conversation_work(session_id):
+    """Stop and end whatever is still running for a conversation being deleted:
+    its turn, its multi-session run, its live session. Returns True when
+    something was still busy after the settle wait."""
+    try:
+        agentic_chat.stop_session(session_id)
+    except Exception:                                            # noqa: BLE001
+        pass
+    with _MULTI_LOCK:
+        rid = _MULTI_RUNS.get(session_id)
+    if rid:
+        try:
+            swarm_windows.stop(rid)
+        except Exception:                                        # noqa: BLE001
+            pass
+    try:
+        if agentic_chat.get_session(session_id) is not None:
+            _end_live_session(session_id)
+    except Exception:                                            # noqa: BLE001
+        pass
+    deadline = time.time() + _DELETE_SETTLE_SECS
+    while _conversation_busy(session_id) and time.time() < deadline:
+        time.sleep(0.25)
+    return _conversation_busy(session_id)
+
+
+def _delete_again_when_idle(session_id):
+    """A turn that outlived the settle wait still writes its ending (the reply,
+    the stopping place, the turn count) -- which re-created the deleted
+    conversation. Sweep once more when it is really over."""
+    def _sweep():
+        deadline = time.time() + _DELETE_LATE_SECS
+        while _conversation_busy(session_id) and time.time() < deadline:
+            time.sleep(1.0)
+        time.sleep(1.0)
+        try:
+            if not agentic_history.delete_conversation(session_id):
+                _forget_conversation_state(session_id)
+        except Exception:                                        # noqa: BLE001
+            pass
+    threading.Thread(target=_sweep, daemon=True, name="agent-delete-sweep").start()
+
+
 @app.route("/api/agent/history/<session_id>", methods=["DELETE"])
 def api_agent_history_delete(session_id):
+    # A conversation that is still LIVE has to stop first. MEASURED 2026-09-27:
+    # deleting one whose turn was running removed the transcript and memory,
+    # then the turn ended and wrote them back -- the conversation reappeared
+    # in the history holding one orphan agent reply, with a fresh memory file.
+    still_busy = _end_conversation_work(session_id)
     deleted = agentic_history.delete_conversation(session_id)
     if not deleted:
+        if still_busy:
+            _delete_again_when_idle(session_id)
         return jsonify({"error": "No such conversation."}), 404
+    if still_busy:
+        _delete_again_when_idle(session_id)
     return jsonify({"deleted": True})
 
 
@@ -23518,7 +23703,10 @@ def _judge_peeked(chunks, check=None, raw_items=None, prompt=None):
         if (_looks_like_text_tool_call(text)
                 or _looks_like_announced_not_acted(text)
                 or _looks_like_refusal(text)
-                or _is_upstream_nonanswer(text, prompt)):
+                or _is_upstream_nonanswer(text, prompt)
+                or (check and check.get("tools")
+                    and (tool_rescue.is_bare_tool_name(text, check.get("tools"))
+                         or _looks_like_dangling_lead_in(text)))):
             return "nonanswer"
         if check and raw_items:
             items = [x if isinstance(x, (bytes, bytearray))
@@ -23981,8 +24169,16 @@ def _provider_error_kind(text, prompt=None):
     s = (text or "").strip()
     if not s or len(s) > _PROVIDER_ERROR_MAX_CHARS:
         return None
-    if prompt == _TOOL_RESULT_TURN:
-        return None
+    # A tool-result turn is judged ONLY for the unmistakable error page: a
+    # quota sentence in the relay's own voice ("... used for this request has
+    # reached its budget") opening the reply, followed by nothing but what-to-
+    # do lines. MEASURED 2026-09-27 (/agent, codex "continue" after a stop):
+    # g4f answered exactly that page while the last input item was a tool
+    # output, the blanket exemption waved it through, and the turn ENDED with
+    # the relay's billing notice as the agent's reply.
+    after_tools = prompt == _TOOL_RESULT_TURN
+    if after_tools:
+        prompt = None
     if prompt and _PROVIDER_ERROR_PROMPT_RE.search(prompt):
         return None
     hit, total, quota, first = 0, 0, False, None
@@ -24007,6 +24203,9 @@ def _provider_error_kind(text, prompt=None):
             rest_support = False
     if not hit or not first:
         return None
+    if after_tools:
+        return ("provider_quota" if quota and first_quota_voice and rest_support
+                else None)
     # A quota error that OPENS the reply, followed only by what-to-do lines,
     # is an error page however long those lines are. MEASURED 2026-09-27: a
     # Pollinations relay answered every tier with "The API key used for this
@@ -24296,6 +24495,23 @@ def _looks_like_announced_not_acted(text):
     return bool(_INTENT_RE.search(body) and _WORK_VERB_RE.search(body))
 
 
+def _looks_like_dangling_lead_in(text):
+    """True for a SHORT reply that ends on a colon with nothing after it -- a
+    lead-in to a step that never came. Only ever judged on a tools turn, where
+    the step after the colon was meant to be a tool call.
+
+    MEASURED 2026-09-27 (/agent, codex, max tier): a 20-minute turn ENDED on
+    "The default working directory isn't valid, but I can pinpoint it by
+    locating where the brief file is:" -- no tool call followed, the test file
+    was never written, and the phrasing slipped past _INTENT_RE ("I can")."""
+    if not text or not isinstance(text, str):
+        return False
+    body = text.strip()
+    if not body or len(body) > _ANNOUNCE_MAX_CHARS or "```" in body:
+        return False
+    return body.endswith(":")
+
+
 def _looks_like_text_tool_call(text):
     """True when `text` contains a tool call the model wrote out instead of
     emitting. Requires a real closing/paired marker, not a passing mention, so
@@ -24343,7 +24559,9 @@ def _chat_json_nonanswer(data, has_tools=False, tools=None):
                               if isinstance(p, dict))
         if has_tools and (_looks_like_text_tool_call(content)
                           or tool_rescue.has_model_markup(content)
-                          or _looks_like_announced_not_acted(content)):
+                          or _looks_like_announced_not_acted(content)
+                          or tool_rescue.is_bare_tool_name(content, tools)
+                          or _looks_like_dangling_lead_in(content)):
             return True
         # A refusal counts with or without tools: it is no more useful in plain
         # chat, and the hub has other models that will answer.
@@ -24972,6 +25190,10 @@ def _peek_check(payload, has_tools):
         return {"prompt_text": _prompt_text_for_check(payload),
                 "last_prompt": _last_user_text_for_check(payload),
                 "tools_offered": bool(has_tools),
+                # The offered tools themselves: a reply that is ONLY one of
+                # their names ("shell_command") is a failed hop.
+                "tools": (payload.get("tools") if has_tools and isinstance(payload, dict)
+                          else None),
                 # The caller's own budget: a reply cut at "length" far below
                 # it is a starved stub, not an answer (_is_truncated_stub).
                 "budget": _caller_budget(payload),
@@ -28179,6 +28401,18 @@ def _responses_to_chat(body):
     if isinstance(inp, str):
         messages.append({"role": "user", "content": inp})
         return messages
+    # A function_call with NO NAME, and its output, are left out. MEASURED
+    # 2026-09-27 (/agent, codex): a model streamed a tool call whose name never
+    # arrived, codex replayed it in every later request, and dahl then 400'd
+    # the whole conversation: "messages[40].tool_calls[0].function.name: must
+    # not be empty". Nothing ran for that call (codex cannot dispatch a
+    # nameless tool), so dropping the pair loses nothing -- and its output
+    # alone would be an orphan tool message, which strict templates reject too.
+    nameless = {(it.get("call_id") or it.get("id"))
+                for it in (inp or []) if isinstance(it, dict)
+                and it.get("type") == "function_call"
+                and not str(it.get("name") or "").strip()}
+    nameless.discard(None)
     for item in inp or []:
         if isinstance(item, str):
             messages.append({"role": "user", "content": item})
@@ -28186,6 +28420,11 @@ def _responses_to_chat(body):
         if not isinstance(item, dict):
             continue
         itype = item.get("type")
+        if itype == "function_call" and not str(item.get("name") or "").strip():
+            continue
+        if itype == "function_call_output" and nameless and (
+                item.get("call_id") or item.get("id")) in nameless:
+            continue
         if itype == "function_call":
             messages.append({
                 "role": "assistant",

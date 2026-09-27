@@ -57,6 +57,36 @@ from collections import deque
 
 import answer_check                  # a leaf like this one: no app import
 
+_SUMMARY_THINK_RE = re.compile(r"<(think|thinking)>(.*?)</\1>", re.I | re.S)
+_SUMMARY_THINK_OPEN_RE = re.compile(r"<(?:think|thinking)>(.*)$", re.I | re.S)
+_SUMMARY_EMPTY_FENCE_RE = re.compile(r"```[\w+-]*\s*```")
+
+
+def clean_summary(text):
+    """A phase's reply as the report shows it: leaked reasoning blocks out.
+
+    MEASURED 2026-09-27 (/agent multi run swarm-7cfdb7f6e0a6): phase 2's whole
+    reply was "```html\\n<think>The user has successfully created ...</think>\\n```"
+    and the report printed it verbatim -- a reasoning block in a code fence as
+    the phase's result. The text OUTSIDE the blocks is the summary; when there
+    is none, the reasoning's own words (tags and empty fences removed) stand in,
+    so a phase that did its work is never emptied into "produced no result"."""
+    if not isinstance(text, str):
+        return ""
+    raw = text.strip()
+    if "<think" not in raw.lower():
+        return raw
+    inner = [m.group(2).strip() for m in _SUMMARY_THINK_RE.finditer(raw)]
+    outside = _SUMMARY_THINK_RE.sub("", raw)
+    m = _SUMMARY_THINK_OPEN_RE.search(outside)
+    if m:
+        inner.append(m.group(1).strip())
+        outside = outside[:m.start()]
+    outside = _SUMMARY_EMPTY_FENCE_RE.sub("", outside).strip()
+    if outside:
+        return outside
+    return "\n\n".join(x for x in inner if x).strip() or raw
+
 # How many workers may run at once, whatever the plan says. Each one is a real
 # CLI process with a model behind it, so this is a RAM and rate-limit bound as
 # much as anything -- the user's own words: "it will consume the ram more".
@@ -1198,9 +1228,9 @@ def _run_agent_once(run, agent, spawn, run_turn, configure=None, hold=False):
             # the hub could, stopped it). Its result is kept for reading but
             # the phase stays what the run recorded: flipping it to done now
             # would claim the review saw work it never did.
-            agent.summary = agent.summary or (summary or "").strip()
+            agent.summary = agent.summary or clean_summary(summary or "")
             return FAILED
-        agent.summary = (summary or "").strip()
+        agent.summary = clean_summary(summary or "")
         if run.stop_flag.is_set():
             agent.state = STOPPED
         elif agent.error and not agent.summary:
