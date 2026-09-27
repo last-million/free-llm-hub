@@ -264,7 +264,9 @@ def test_every_call_site_hands_over_the_offered_tools():
     hedge = [l for l in sites if "_chat_json_nonanswer(data, False, None)" in l]
     assert len(hedge) == 1
     sites = [l for l in sites if l not in hedge]
-    assert len(sites) == 6
+    # 5, not 6: the starved-budget retry's reply (data2) no longer has its own
+    # check -- it re-enters the main path (_starve_retry) and meets this one.
+    assert len(sites) == 5
     for line in sites:
         assert "has_tools, " in line, line
 

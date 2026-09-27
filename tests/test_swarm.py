@@ -130,7 +130,7 @@ def test_a_tool_turn_takes_the_parallel_path_not_the_prose_pipeline():
 
     with mock.patch.object(app, "_swarm_tool_turn", side_effect=fake_tool_turn),             mock.patch.object(app.swarm, "run", side_effect=boom):
         r = app.app.test_client().post("/v1/chat/completions", json={
-            "model": "swarm", "messages": [{"role": "user", "content": "hi"}],
+            "model": "swarm", "messages": [{"role": "user", "content": "implement the login form"}],
             "tools": [{"type": "function", "function": {"name": "x", "parameters": {}}}]})
     assert r.status_code == 200
     assert called["body"]["tools"], "the tools must be passed through, not stripped"

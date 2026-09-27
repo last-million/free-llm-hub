@@ -96,7 +96,7 @@ def test_responses_runs_the_swarm_instead_of_looking_for_a_model_called_swarm():
 def test_responses_swarm_answer_is_in_the_responses_shape():
     with mock.patch.object(app, "_swarm_tool_result", return_value=_winner("ok")):
         r = _client().post("/v1/responses", json={
-            "model": "swarm", "stream": False, "input": "hi"})
+            "model": "swarm", "stream": False, "input": "build it"})
     body = r.get_json()
     assert body.get("object") == "response"
     assert isinstance(body.get("output"), list) and body["output"]
@@ -105,7 +105,7 @@ def test_responses_swarm_answer_is_in_the_responses_shape():
 def test_responses_swarm_streams_as_responses_events():
     with mock.patch.object(app, "_swarm_tool_result", return_value=_winner("streamed")):
         r = _client().post("/v1/responses", json={
-            "model": "swarm", "stream": True, "input": "hi"})
+            "model": "swarm", "stream": True, "input": "build it"})
     text = r.get_data(as_text=True)
     assert r.status_code == 200
     assert "response.created" in text and "response.completed" in text
@@ -117,7 +117,7 @@ def test_responses_swarm_keeps_tool_calls():
     the prose pipeline cannot serve an agent."""
     with mock.patch.object(app, "_swarm_tool_result", return_value=_winner("", tool=True)):
         r = _client().post("/v1/responses", json={
-            "model": "swarm", "stream": True, "input": "hi"})
+            "model": "swarm", "stream": True, "input": "build it"})
     assert "function_call" in r.get_data(as_text=True)
 
 
@@ -156,7 +156,7 @@ def test_responses_falls_back_to_best_when_the_swarm_cannot_answer():
             mock.patch.object(app, "_dispatch_chat",
                               lambda pid, payload, stream: _FakeOK()):
         r = _client().post("/v1/responses", json={
-            "model": "swarm", "stream": False, "input": "hi"})
+            "model": "swarm", "stream": False, "input": "build it"})
     assert r.status_code == 200
     assert seen.get("quality_mode") is True, seen
 
@@ -181,7 +181,7 @@ def test_messages_swarm_answer_is_in_the_anthropic_shape():
     with mock.patch.object(app, "_swarm_tool_result", return_value=_winner("ok")):
         r = _client().post("/v1/messages", json={
             "model": "swarm", "max_tokens": 64, "stream": False,
-            "messages": [{"role": "user", "content": "hi"}]})
+            "messages": [{"role": "user", "content": "build it"}]})
     body = r.get_json()
     assert body.get("type") == "message"
     assert body.get("role") == "assistant"
@@ -192,7 +192,7 @@ def test_messages_swarm_streams_as_anthropic_events():
     with mock.patch.object(app, "_swarm_tool_result", return_value=_winner("streamed")):
         r = _client().post("/v1/messages", json={
             "model": "swarm", "max_tokens": 64, "stream": True,
-            "messages": [{"role": "user", "content": "hi"}]})
+            "messages": [{"role": "user", "content": "build it"}]})
     text = r.get_data(as_text=True)
     assert "message_start" in text and "message_stop" in text
     assert "streamed" in text
