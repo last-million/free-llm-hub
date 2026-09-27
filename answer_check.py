@@ -1021,6 +1021,121 @@ def _clip(text):
 
 
 # --------------------------------------------------------------------------- #
+# A second answer glued onto the first
+# --------------------------------------------------------------------------- #
+# MEASURED LIVE 2026-09-27 (Claude Code `-p --model max` through the hub): ONE
+# upstream stream carried two complete answers back to back, the second glued
+# on with no separator at all --
+#   "...Nothing else needed. Next: what would you like to do?The last line of
+#    big3.txt is: ..."
+# -- the model's end-of-turn token was dropped by the provider and sampling
+# ran on into a fresh answer. Claude Code prints the last text block, so the
+# user saw both. (Verified against the real CLI with a fake server: a SECOND
+# block or a second message is never glued in `-p` output; only one block
+# holding both answers is.) The signature: the reply's own opening line
+# restated right after a non-space character -- a stripped token leaves no
+# whitespace, and a real answer does not restate its first sentence glued
+# onto its last one.
+RESTART_KEY_MAX = 40
+_RESTART_KEY_MIN = 18
+_RESTART_KEY_WORDS = 3
+_RESTART_WORD_RE = re.compile(r"[^\W_]{2,}")
+# What may END the first answer right before a glued restatement.
+_RESTART_PREV = frozenset('.!?)]}"\'`*’”')
+# ...of which these also OPEN a quote / span when a space precedes them.
+_RESTART_OPENERS = frozenset('"\'`*’”')
+
+
+def restart_key(text):
+    """The opening a glued second answer would restate: the reply's first
+    non-empty line, stripped, cut to RESTART_KEY_MAX chars -- or None when it
+    is too short or too plain to be distinctive (a bare "4", "Yes.", a code
+    fence) or not complete yet (no newline and under RESTART_KEY_MAX chars).
+    Never raises."""
+    try:
+        if not isinstance(text, str):
+            return None
+        s = text[:2048].lstrip()          # the head only: O(1) on a long stream
+        nl = s.find("\n")
+        if nl < 0 and len(s) < RESTART_KEY_MAX:
+            return None
+        line = s if nl < 0 else s[:nl]
+        key = line.strip()[:RESTART_KEY_MAX]
+        if len(key) < _RESTART_KEY_MIN or key.startswith("```"):
+            return None
+        if len(_RESTART_WORD_RE.findall(key)) < _RESTART_KEY_WORDS:
+            return None
+        return key
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def restart_boundary(before, cur):
+    """The character test of restart_glued_at: `before` is the text right
+    before the restatement (its last two characters are enough), `cur` the
+    restatement's first character. Never raises."""
+    try:
+        if not before or not cur:
+            return False
+        prev = before[-1]
+        if prev.isspace():
+            return False
+        if prev.isalnum():
+            return cur.isupper()              # else one word running on
+        if prev not in _RESTART_PREV:
+            return False
+        if prev in _RESTART_OPENERS and (len(before) < 2 or before[-2].isspace()):
+            return False                      # an opening quote/emphasis, not an end
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def restart_glued_at(text, q):
+    """True when a restatement starting at `q` is glued onto what precedes it:
+    the answer before it ENDS right there (sentence punctuation, a closing
+    bracket/quote/fence, or a word run straight into a capital), not inside a
+    code fence, and not an opening quote / a word running on. Never raises."""
+    try:
+        if q <= 0 or q >= len(text):
+            return False
+        if not restart_boundary(text[max(0, q - 2):q], text[q]):
+            return False
+        return text.count("```", 0, q) % 2 == 0
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def glued_restart(text, key=None, start=0, first_end=None):
+    """Offset in `text` where a glued second answer starts (see above), or
+    None. `key` defaults to restart_key(text); `first_end` (where the opening
+    itself ends) is found when not given. Only occurrences at or after
+    `start` are looked at, so a stream re-checks just its new text. Never
+    raises."""
+    try:
+        if not isinstance(text, str):
+            return None
+        key = key or restart_key(text)
+        if not key:
+            return None
+        if first_end is None:
+            first = text.find(key)
+            if first < 0:
+                return None
+            first_end = first + len(key)
+        pos = max(first_end, start)
+        while True:
+            q = text.find(key, pos)
+            if q < 0:
+                return None
+            if restart_glued_at(text, q):
+                return q
+            pos = q + 1
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # Early release for the stream hold-back gate
 # --------------------------------------------------------------------------- #
 # The gate holds a stream's first visible text until it can judge it. Every
@@ -1136,6 +1251,10 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
         if cut is not None:
             result["reasons"].append("glued_junk")
             cuts.append(cut)
+        cut = glued_restart(text)
+        if cut is not None:
+            result["reasons"].append("restarted")
+            cuts.append(cut)
         if not cuts:
             return result
         result["ok"] = False
@@ -1225,6 +1344,10 @@ def inspect_tail(text, *, window=TAIL_WINDOW, prompt_text=None, tools_offered=Fa
             found.extend(c for c in (_constrained_extra(text, lp, tools_offered),
                                      _glued_foreign(text, lp, prompt_text))
                          if c is not None)
+        # A glued second answer (restart_key reads only the reply's head).
+        r = glued_restart(text, start=start)
+        if r is not None:
+            found.append(r - start + len(pad))
         if not found:
             return None
         return max(0, start + min(found) - len(pad))
