@@ -310,11 +310,17 @@ def test_the_primary_pick_is_unrestricted_under_all(fleet, monkeypatch):
 
 def test_the_fallback_chain_honours_the_mode(fleet, monkeypatch):
     """Otherwise a mode chose the first model and the chain behind it quietly
-    left the mode again on the very first retry."""
+    left the mode again on the very first retry.
+
+    Every in-mode hop comes first; the only out-of-mode hops are the short
+    fail-open tail AFTER the last of them (see _mode_fallback_tail and
+    tests/test_a_mode_that_cannot_answer_falls_open.py)."""
     monkeypatch.setattr(A, "_active_mode", lambda: "coding")
     chain = A._build_chain("pa", "pa-coder", 500, require_tools=True, messages=MSGS)
     assert chain
-    assert all(m.endswith("-coder") for _p, m in chain), chain
+    flags = [m.endswith("-coder") for _p, m in chain]
+    assert flags[:2] == [True, True], chain
+    assert flags == sorted(flags, reverse=True), chain
 
 
 def test_the_chain_is_unrestricted_under_all(fleet, monkeypatch):

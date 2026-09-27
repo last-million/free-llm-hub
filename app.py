@@ -8680,6 +8680,10 @@ def _chain_entries(name):
 # every other provider has had its turn (the rest follow, in order).
 _TRIVIAL_PER_PROVIDER_HOPS = 2
 
+# A category mode's chain ends with at most this many healthy models from
+# OUTSIDE the mode, one per provider (see _mode_fallback_tail).
+_MODE_FALLBACK_TAIL = 3
+
 # ---------------------------------------------------------------------------
 # TOOL-TURN RELIABILITY (2026-09-27).
 #
@@ -8932,6 +8936,59 @@ def _spread_by_provider(entries, per, already=()):
         return entries
 
 
+def _mode_fallback_tail(entries, seen, require_tools=False, require_vision=False,
+                        cap=None):
+    """Up to `cap` (default _MODE_FALLBACK_TAIL) (pid, model) hops from
+    `entries` -- the (score, pid, model) candidates a category mode FILTERED
+    OUT of this chain -- for the chain's very end, one per provider.
+
+    _apply_mode fails open only when the mode leaves NOTHING; a mode whose few
+    models are all listed-but-broken left a chain that walked them to the end
+    and 503'd. MEASURED 2026-09-27, global mode "coding": "Use the add tool to
+    add 17 and 25" 503'd after 122.7s on tokenrouter (model_not_found), dahl
+    (503, 429) and four stalled nvidia hops, while groq/qwen/qwen3.8-27b --
+    outside the category -- answered the very next request in 1.1s, because
+    the ROUTER fails open on recent failures and the chain did not.
+
+    Healthy first (not recently failed, not a band-2/tool-sick pair, not the
+    low-quality or vision-specialised tail), quick first on a simple turn,
+    then strongest. Benched pairs, and on a tool turn models that cannot call
+    one or relay servers sick on tool turns, never join. Never raises."""
+    try:
+        cap = _MODE_FALLBACK_TAIL if cap is None else cap
+        pool = [e for e in entries or ()
+                if (e[1], e[2]) not in seen and not _is_pair_benched(e[1], e[2])]
+        if require_tools:
+            pool = [e for e in pool if _supports_tools(e[1], e[2])
+                    and not _relay_tool_sick(e[1], e[2])]
+        if not pool or cap <= 0:
+            return []
+        simple = _simple_turn()
+        sustain = _model_identity_min_penalty(pool) if require_tools else None
+
+        def key(e):
+            pid, m = e[1], e[2]
+            return (_recent_hop_failure(pid, m) is not None,
+                    _chain_reliability_band(pid, m) >= 2
+                    or (require_tools and _tool_turn_sick(pid, m)),
+                    _is_low_quality(m),
+                    not require_vision and _is_vision_specialised(m),
+                    simple and not _is_fast(pid, m),
+                    -(_agentic_score(e, sustain) if require_tools else e[0]))
+        pool.sort(key=key)
+        out, pids = [], set()
+        for e in pool:
+            if e[1] in pids:
+                continue          # ONE per provider: a way out, not a fan-out
+            pids.add(e[1])
+            out.append((e[1], e[2]))
+            if len(out) >= cap:
+                break
+        return out
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
 def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_tools=False,
                   messages=None, exclude_identities=None, prefer=None, pinned=False):
     """Priority-ordered [(pid, model)] fallback chain. Primary first, then the
@@ -9088,6 +9145,8 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # model, and on big-context turns the fallbacks left the category.
     _all_fast = list(fast)
     _in_mode = set(_apply_mode(fast + slow))
+    # ...and what the mode left out is not forgotten: see _mode_fallback_tail.
+    _out_of_mode = [e for e in fast + slow if e not in _in_mode]
     fast = [e for e in fast if e in _in_mode]
     slow = [e for e in slow if e in _in_mode]
     # best model first; tie among equal-score models -> most free quota left, so
@@ -9303,6 +9362,15 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     chain = _prefer_fast_long_context(
         chain, est,
         keep_head=1 if (pinned and chain and tuple(chain[0]) == (primary_pid, model_id)) else 0)
+    # A CATEGORY MODE'S WAY OUT, after every in-mode hop (recent failures
+    # included) and ahead of the paid subscriptions: the best few healthy
+    # models the mode filtered out, one per provider (see _mode_fallback_tail).
+    # The mode still owns every retry while it has a hop left; on a tool or
+    # trivial turn the walk reaches this tail early only once each remaining
+    # in-mode provider has stalled or failed its share (_ChainClock.walk).
+    for e in _mode_fallback_tail(_out_of_mode, seen, require_tools, require_vision):
+        chain.append(e)
+        seen.add(e)
     if require_tools:
         # Relay hops on a tool turn: a relay server that keeps failing tool
         # turns is skipped, and the rest are capped (see _cap_relay_hops).
@@ -24921,6 +24989,10 @@ def _quality_fallback_pick(entries, tools=False, stalled=()):
         def keep(cands, pred):
             return [c for c in cands if pred(c)] or cands
 
+        # The chain now ends with hops from OUTSIDE a category mode (see
+        # _mode_fallback_tail): they are the mode's last resort, not its
+        # fallback's first pick while an in-mode hop is left. Fail-open.
+        pool = _apply_mode(pool)
         pool = keep(pool, lambda c: _is_fast(c[1], c[2]))
         pool = keep(pool, lambda c: c[1] not in stalled)
         pool = keep(pool, lambda c: not _recent_hop_stall(c[1], c[2]))

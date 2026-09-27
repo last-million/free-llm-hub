@@ -543,7 +543,11 @@ def test_a_non_simple_chain_keeps_the_category(fleet, monkeypatch):
     with A.app.test_request_context():
         A._mark_turn_shape("hard", 400)
         chain = A._build_chain("", "", 400, messages=SIMPLE)
-    assert not {"pa-chat", "pb-chat"} & {m for _p, m in chain}
+    # Every category model before any model outside it: the out-of-category
+    # hops are only the fail-open tail (see _mode_fallback_tail).
+    inside = [m in {"pa-r1", "pb-r1-mini", "pc-r-fast"} for _p, m in chain]
+    assert inside[:3] == [True, True, True], chain
+    assert inside == sorted(inside, reverse=True), chain
 
 
 def test_a_trivial_tool_turn_prefers_a_fast_tool_model(fleet, monkeypatch):

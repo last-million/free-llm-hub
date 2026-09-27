@@ -310,7 +310,12 @@ def fleet(monkeypatch):
 def test_the_chain_stays_in_mode_when_the_mode_is_all_slow(fleet, monkeypatch):
     monkeypatch.setattr(A, "_active_mode", lambda: "coding")
     chain = A._build_chain("pa", "pa-coder", 500, require_tools=True, messages=MSGS)
-    assert chain and all(m.endswith("-coder") for _p, m in chain), chain
+    # The FAST out-of-mode models no longer ride in ahead of the slow in-mode
+    # ones; they only appear as the fail-open tail after every in-mode hop
+    # (see _mode_fallback_tail).
+    flags = [m.endswith("-coder") for _p, m in chain]
+    assert flags[:2] == [True, True], chain
+    assert flags == sorted(flags, reverse=True), chain
 
 
 # --------------------------------------------------------------------------- #
