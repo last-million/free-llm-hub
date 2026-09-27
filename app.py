@@ -14542,6 +14542,26 @@ def _swarm_windows_spawn(cli_id, project_dir):
     return agentic_chat.start_session(cli_id, project_dir)
 
 
+def _swarm_run_cleanup(run):
+    """When a multi-session run ends, take its workers' per-session briefs out
+    of the project folder. MEASURED 2026-09-27: a 3-phase run left three
+    .calvoun-brief-<worker>.md files in the user's project for good -- nothing
+    ever removed a worker's brief (only a deleted conversation's). The worker
+    SESSIONS stay, so their logs can still be read (_swarm_windows_turn)."""
+    project_dir = getattr(run, "project_dir", None)
+    if not project_dir:
+        return
+    for sid in swarm_windows.worker_session_ids(run):
+        try:
+            if sid != getattr(run, "owner", None):
+                agentic_chat.remove_task_brief(project_dir, sid)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+swarm_windows.add_run_end_hook(_swarm_run_cleanup)
+
+
 def _swarm_windows_configure(session_id, mode):
     """Give one worker its own KIND of model.
 

@@ -472,7 +472,7 @@ class _Agent:
                  "session_id", "state", "summary", "error", "started_at",
                  "ended_at", "events", "last_event_at", "abandoned",
                  "inputs", "constraints", "output_format", "acceptance",
-                 "verified", "problems", "revisions")
+                 "verified", "problems", "revisions", "past_sessions")
 
     def __init__(self, index, phase):
         self.index = index
@@ -493,6 +493,7 @@ class _Agent:
         self.problems = []
         self.revisions = 0
         self.session_id = None
+        self.past_sessions = []
         self.state = PENDING
         self.summary = ""
         self.error = None
@@ -971,7 +972,7 @@ def _attempts(run, agent, spawn, run_turn, configure=None, hold=False):
         if attempt < AGENT_ATTEMPTS:
             # A fresh session too: the one we got may not have survived
             # whatever went wrong while it was being created.
-            agent.session_id = None
+            _retire_session(agent)
             agent.error = None
             agent.state = RUNNING
             time.sleep(RETRY_BACKOFF * attempt)
@@ -1192,7 +1193,7 @@ def _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before):
             agent.mode = mode
         agent.revisions += 1
         previous = agent.summary
-        agent.session_id = None
+        _retire_session(agent)
         agent.error = None
         agent.state = RUNNING
         agent.last_event_at = time.time()
@@ -1351,6 +1352,42 @@ def _walk(run, spawn, run_turn, on_done=None, configure=None, stop=None):
                 on_done(run)
             except Exception:                                    # noqa: BLE001
                 pass
+        for hook in list(_RUN_END_HOOKS):
+            try:
+                hook(run)
+            except Exception:                                    # noqa: BLE001
+                pass
+
+
+# Called with the run once it has ended, whatever its state and whoever
+# started it (a conversation's multi turn, the MCP tools, a resume) -- see
+# add_run_end_hook. app.py cleans each worker's per-session brief out of the
+# project folder there.
+_RUN_END_HOOKS = []
+
+
+def _retire_session(agent):
+    """Forget a worker's session for a fresh one, remembering the old id so
+    the run-end hooks can still clean up after it."""
+    if agent.session_id:
+        agent.past_sessions = list(getattr(agent, "past_sessions", None) or []) + [
+            agent.session_id]
+    agent.session_id = None
+
+
+def add_run_end_hook(fn):
+    if fn not in _RUN_END_HOOKS:
+        _RUN_END_HOOKS.append(fn)
+
+
+def worker_session_ids(run):
+    """Every session a run's workers used, revisions' earlier ones included."""
+    out = []
+    for a in getattr(run, "agents", None) or []:
+        for sid in list(getattr(a, "past_sessions", None) or []) + [a.session_id]:
+            if sid and sid not in out:
+                out.append(sid)
+    return out
 
 
 # A second ask when the first answer was not a plan. MEASURED 2026-09-12: a
@@ -1457,7 +1494,7 @@ def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
             for agent in todo:
                 agent.state = PENDING
                 agent.error = None
-                agent.session_id = None
+                _retire_session(agent)
                 agent.started_at = None
                 agent.ended_at = None
             run.state = PENDING
@@ -1523,7 +1560,7 @@ def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
         for agent in todo + review:
             agent.state = PENDING
             agent.error = None
-            agent.session_id = None
+            _retire_session(agent)
             agent.started_at = None
             agent.ended_at = None
             agent.abandoned = False

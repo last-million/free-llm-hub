@@ -305,6 +305,45 @@ def test_a_turn_ending_after_the_settle_wait_is_swept_again(isolated_state, monk
 
 
 # --------------------------------------------------------------------------- #
+# 10. a finished multi run leaves no worker briefs in the project
+# --------------------------------------------------------------------------- #
+
+def test_run_end_removes_every_worker_brief_but_the_owners(tmp_path):
+    import swarm_windows
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    class _Agent:
+        def __init__(self, sid, past=()):
+            self.session_id = sid
+            self.past_sessions = list(past)
+
+    class _Run:
+        project_dir = str(proj)
+        owner = "ownerownerowner1"
+        agents = [_Agent("worker1worker1ab"), _Agent("worker2worker2ab", past=["oldrev0oldrev0ab"])]
+
+    ids = ["worker1worker1ab", "worker2worker2ab", "oldrev0oldrev0ab", "ownerownerowner1"]
+    for sid in ids:
+        (proj / agentic_chat.brief_filename(sid)).write_text("brief", encoding="utf-8")
+    (proj / "app.py").write_text("print(1)", encoding="utf-8")
+    assert A._swarm_run_cleanup in swarm_windows._RUN_END_HOOKS
+    A._swarm_run_cleanup(_Run())
+    left = sorted(p.name for p in proj.iterdir())
+    assert left == sorted(["app.py", agentic_chat.brief_filename("ownerownerowner1")])
+
+
+def test_a_retired_worker_session_is_remembered():
+    import swarm_windows
+
+    class _Agent:
+        session_id = "first-session-id"
+    a = _Agent()
+    swarm_windows._retire_session(a)
+    assert a.session_id is None and a.past_sessions == ["first-session-id"]
+
+
+# --------------------------------------------------------------------------- #
 # 8. a relay's billing page after a tool result
 # --------------------------------------------------------------------------- #
 
