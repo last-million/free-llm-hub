@@ -338,6 +338,9 @@
   .prov-subgrid{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr));
     gap:16px; padding:0 16px 16px }
   @media (max-width:1280px){ .prov-subgrid{grid-template-columns:repeat(2,minmax(0,1fr))} }
+  /* Phone: two ~160px columns squeezed every card line (key masks wrapped per
+     character); one card per row, like .grid below 820px. */
+  @media (max-width:640px){ .prov-subgrid{grid-template-columns:1fr; padding:0 10px 12px} }
   .card{
     background:var(--surface);
     border:1px solid var(--border-soft);border-radius:12px;
@@ -1087,6 +1090,7 @@
   .sub-mode-pill{
     display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;
     padding:3px 9px;border-radius:999px;background:var(--surface-3);color:var(--text-faint);white-space:nowrap;
+    align-self:flex-start;  /* was stretched to the name row's width inside .cli-card-id */
   }
   .sub-mode-pill.iso{background:var(--accent-soft);color:var(--ok-text)}
   .sub-card-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
@@ -1094,7 +1098,12 @@
   .sub-model-row select{max-width:100%;min-width:0}
   .sub-manager{display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--text-dim);
     border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 14px;margin-bottom:14px}
-  .sub-manager input[type=number]{width:120px}
+  /* Same field language as the selects beside it (it rendered as a bare
+     browser input: white box, black border, no dark theme). */
+  .sub-manager input[type=number]{width:120px;margin-left:6px;background:var(--surface-2);color:var(--text);
+    border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 10px;font-size:13px;
+    font-variant-numeric:tabular-nums}
+  .sub-manager input[type=number]:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
   .sub-manager .spent{font-variant-numeric:tabular-nums}
   .sub-install-result{
     width:100%;font-size:12px;line-height:1.5;border-radius:var(--radius-sm);
@@ -1796,6 +1805,14 @@
   .modal-body ol{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:7px;font-size:13px;color:var(--text-dim);line-height:1.55}
   .modal-body .note{font-size:12.5px;color:var(--text-dim);line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}
   .modal-block{display:flex;flex-direction:column;gap:7px}
+  /* Shared env var: the Remove preview (tools it reaches) sits at note size
+     under its button, not at body size, and its confirm row is horizontal. */
+  .env-remove{display:flex;flex-direction:column;align-items:flex-start;gap:7px}
+  .env-remove-out:empty,.env-others:empty{display:none}
+  .env-remove-out{display:flex;flex-direction:column;gap:6px;width:100%}
+  .env-remove-out ul{margin:0;padding-left:18px;font-size:12.5px;color:var(--text-dim);line-height:1.5;overflow-wrap:anywhere}
+  .env-remove-out ul b{color:var(--text)}
+  .env-remove-out .modal-block{flex-direction:row;flex-wrap:wrap}
   .modal-block .blk-h{display:flex;align-items:center;gap:8px}
   .modal-block .blk-h .lab{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text-faint)}
   .modal-block pre{
@@ -1903,6 +1920,7 @@
     border-radius:var(--radius-sm);padding:7px 11px;font-size:.82rem}
   .tk-score{font-family:var(--mono);font-weight:600;min-width:42px;text-align:right;color:var(--text)}
   .tk-state{min-width:70px;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+  .tk-state .tk-in{text-transform:none;font-weight:500;letter-spacing:0}
   .tk-ok{color:var(--accent)}
   .tk-dead,.tk-provider-dead{color:var(--danger)}
   .tk-throttled{color:var(--warn)}
@@ -2327,6 +2345,15 @@
     display:flex; align-items:center; gap:8px; }
   body.cx-agent-view #sec-agent .agent-session-info{ overflow:hidden;
     text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+  /* Phone: the session bar (effort, model, bookmarks, running, end) was
+     squeezed into what was left of the switch+tabs row and pushed its buttons
+     off-screen (measured at 390px: page scrollWidth 601). Give it its own
+     full-width row and let its controls wrap. */
+  @media (max-width:640px){
+    body.cx-agent-view #sec-agent .agent-session-bar{ flex:1 1 100%; flex-wrap:wrap; }
+    /* the category <select> shrank to 29px ("Cl") beside the effort pills */
+    body.cx-agent-view #sec-agent .agent-session-bar .agent-mode{ flex:0 0 auto; min-width:130px; }
+  }
   /* The permissions disclosure STAYS — it is a deliberate safety notice and its
      own comment says never to gate it. It is made compact here, not hidden:
      smaller type, one line, still fully readable. */
@@ -5196,8 +5223,17 @@
   var REC_NOTES = { puter: 'Latest GPT-5.6 + 500 models with one free token' };
   /* Exhausted = the free window is spent, OR every pooled account is empty.
      Shared so the card class, the cross mark and the quota line never disagree. */
+  /* A RESEARCHED ZERO (limit_known, limit 0 -- morph bills every model): not
+     a spent allowance, so never an "out of quota" card (see cardHTML). */
+  function providerNeverFree(p){
+    var q = p && p.quota;
+    var allowanceSpent = !!(p && p.allowance && p.allowance.remaining <= 0);
+    return !allowanceSpent && (p.status_reason === 'no_free_tier' ||
+                               !!(q && q.limit_known && q.limit === 0));
+  }
   function providerExhausted(p){
     if (!p) return false;
+    if (providerNeverFree(p)) return false;
     if (p.quota && p.quota.exhausted) return true;
     /* Parked / every model down: out of routing just as surely as a spent
        quota, so the card says so (status_reason comes from /api/providers). */
@@ -5238,6 +5274,17 @@
     return '<div class="quota-line used-by" title="Upstream requests this quota window, by who made them">' +
            '<span>used by: ' + esc(txt) + '</span></div>';
   }
+  /* Junk-benched models (/api/providers `benched`). While the card is healthy
+     the backend already leads `detail` with them; once a reason (parked,
+     rate-limited...) takes over `detail`, they would vanish -- so say it here. */
+  function benchedLine(p){
+    var rows = Array.isArray(p.benched) ? p.benched : [];
+    if (!rows.length || !OUT_REASONS[p.status_reason]) return '';
+    var txt = rows.slice(0, 3).map(function(r){ return r.model; }).join(', ') +
+              (rows.length > 3 ? ' +' + (rows.length - 3) + ' more' : '');
+    return '<div class="quota-line" title="' + esc(rows.map(function(r){ return r.detail; }).join('\n')) + '">' +
+           '<span class="out-detail">benched for junk answers: ' + esc(txt) + '</span></div>';
+  }
   /* Countdowns on the cards tick without a re-fetch. */
   setInterval(function(){
     var els = document.querySelectorAll('.quota-countdown[data-until]');
@@ -5264,11 +5311,14 @@
     if (p['new']) badges += '<span class="badge new-provider" title="' + esc(NEW_TIP) + '">' + NEW_SVG + 'New</span>';
     // Additive badges. Only PURE_PAID providers (OpenAI/Claude/Higgsfield) lack a
     // free tier; every other provider has one, so it shows BOTH free + paid.
-    var hasFree = fmCount > 0 || (p.paid && !PURE_PAID[p.id]);
+    /* No free tier (morph): its catalog still lists models, but none is free
+       -- a "free" badge and "12 free models" beside "No free tier" contradict. */
+    var noFreeTier = providerNeverFree(p);
+    var hasFree = !noFreeTier && (fmCount > 0 || (p.paid && !PURE_PAID[p.id]));
     if (hasFree) badges += '<span class="badge free">free</span>';
-    if (p.paid) badges += '<span class="badge paid">paid</span>';
+    if (p.paid || noFreeTier) badges += '<span class="badge paid">paid</span>';
     if (p.trial) badges += '<span class="badge trial" title="' + esc(TRIAL_TIP) + '">' + HOURGLASS_SVG + 'Trial credits</span>';
-    if (!hasFree && !p.paid && !p.trial) badges += '<span class="badge free">free</span>';
+    if (!hasFree && !p.paid && !p.trial && !noFreeTier) badges += '<span class="badge free">free</span>';
     if (p.no_key) badges += '<span class="badge nokey" title="Public gateway — works instantly, no API key to paste">no key needed</span>';
     if (p.has_key) badges += '<span class="badge keyed">' + kc + ' key' + (kc > 1 ? 's' : '') + ' saved</span>';
     if (p.image_free_count > 0){
@@ -5334,7 +5384,10 @@
        waiting changes nothing. ASKED 2026-09-05: "why i see this in morph and
        all api keys tests was ok". The keys ARE ok; there was never a free
        allowance for them to spend. */
-    var neverFree = !!(q && q.limit_known && q.limit === 0 && !allowanceSpent);
+    var neverFree = providerNeverFree(p);
+    /* ...and no red "out of quota" cross either: the quota line says what it
+       is, and the card is not out of anything. */
+    if (neverFree) isExhausted = false;
     var quotaLine = '';
     if (neverFree){
       quotaLine = '<div class="quota-line"><span>No free tier</span>' +
@@ -5359,7 +5412,7 @@
       if (OUT_REASONS[p.status_reason]) quotaLine = reasonLine;
       else quotaLine += reasonLine;
     }
-    quotaLine += usedByLine(p);
+    quotaLine += benchedLine(p) + usedByLine(p);
     isExhausted = isExhausted || !!OUT_REASONS[p.status_reason];
     return '' +
       '<div class="card-top">' +
@@ -5404,7 +5457,7 @@
           esc(p.relay.name) + '</b> — ' + (p.relay.usable ? 'usable right now' : esc(p.relay.detail || 'not set up yet')) + '.</span>' +
           '<button type="button" class="btn sm relay-jump-btn" data-jump-view="sec-subs">Go to Subscriptions</button>' +
         '</div>' : '') +
-      (fm.length ? '<div class="models-preview"><b>' + fm.length + ' free model' + (fm.length > 1 ? 's' : '') + ':</b> ' + esc(fmPrev) + '</div>' : '') +
+      (fm.length ? '<div class="models-preview"><b>' + fm.length + (noFreeTier ? ' billed' : ' free') + ' model' + (fm.length > 1 ? 's' : '') + ':</b> ' + esc(fmPrev) + '</div>' : '') +
       /* Puter is the one provider with no key to fetch: there is no API-key
          page to send anyone to, and "Connect with Puter" below does the whole
          thing (sign in on puter.com, token captured and saved automatically).
@@ -7881,7 +7934,9 @@
     html += shared.length ? ' Shared by: ' + esc(shared.join(', ')) + '.' : ' No other installed tool on this dashboard reads it.';
     var p = document.createElement('div'); p.className = 'note'; p.innerHTML = html;
     wrap.appendChild(p);
-    if (k.scope === 'user') wrap.appendChild(envRemoveControl(k.name));
+    /* `removable: false` = a protected name (/api/env/hub-vars): the remove
+       route refuses it with a 400, so offering the button would only fail. */
+    if (k.scope === 'user' && k.removable !== false) wrap.appendChild(envRemoveControl(k.name));
     return wrap;
   }
   function openEnvModal(c, r){
@@ -7907,17 +7962,19 @@
       shown[String(n).toUpperCase()] = 1;
       line('cli-setup-note', '<code>' + esc(n) + '</code> points at the hub in the environment the hub was started from (not your saved user environment); it goes away when that terminal is closed and the hub is restarted from a new one.');
     });
+    /* Other hub-pointing vars no tool on this card reads (e.g. LLM_BASE_URL),
+       beside the vars above rather than under the restart notice. */
+    var others = document.createElement('div');
+    others.className = 'modal-block env-others';
+    box.appendChild(others);
     if (env.effect) line('cli-setup-note', esc(env.effect));
     line('chat-note show', 'Terminals that are already open keep the old value until you close and reopen them. If ' + safe + ' is open, restart it.');
     if (r.commands) appendCommandBlocks(box, r.commands);
-    /* Other hub-pointing vars no tool on this card reads (e.g. LLM_BASE_URL). */
-    var others = document.createElement('div');
-    box.appendChild(others);
     api('/api/env/hub-vars').then(function(h){
       (h && Array.isArray(h.vars) ? h.vars : []).forEach(function(v){
         if (shown[String(v.name).toUpperCase()] || v.scope !== 'user') return;
         var aff = Array.isArray(v.affects) ? v.affects.map(function(a){ return a.name; }) : [];
-        others.appendChild(envKeptBlock({ name: v.name, scope: v.scope, used_by: [], shared_by: aff }));
+        others.appendChild(envKeptBlock({ name: v.name, scope: v.scope, used_by: [], shared_by: aff, removable: v.removable }));
       });
     }).catch(function(){});
     var act = document.createElement('div'); act.className = 'modal-block';
@@ -8125,8 +8182,12 @@
      "opus". "Use as manager" points manager_model at this <pid>/<model>. */
   var _subManager = null;
   function subModelRowHTML(r){
-    var choices = Array.isArray(r.model_choices) ? r.model_choices : [];
+    var choices = Array.isArray(r.model_choices) ? r.model_choices.slice() : [];
     var sel = r.selected_model || '';
+    /* A saved model the list does not offer (set by an older release or by
+       hand) must still show as the selection -- otherwise the dropdown shows
+       the first option while the CLI is really told to use `sel`. */
+    if (sel && choices.indexOf(sel) < 0) choices.push(sel);
     var opts = '';
     if (!r.default_model) opts += '<option value=""' + (sel ? '' : ' selected') + '>CLI default</option>';
     choices.forEach(function(m){
@@ -8278,7 +8339,10 @@
       var text = m.ok ? ('Replied: ' + (m.response || '')) : (m.error || 'failed');
       return '<div class="sub-test-row ' + cls + '"><span class="tr-i" aria-hidden="true">' + icon + '</span>' +
              '<code>' + esc(m.model) + '</code><span>' + esc(text) + '</span>' +
-             (m.skipped ? '' : canaryBadge(m.canary, !!m.ok)) + '</div>';
+             /* A failed relay hop is a CLI subprocess error (timeout, exit
+                code, not signed in), already spelled out in the row: the
+                generic "HTTP error" badge would mislabel it. */
+             (m.skipped || !m.ok ? '' : canaryBadge(m.canary, true)) + '</div>';
     }).join('');
     return '<div class="sub-install-result multi">' + rows + '</div>';
   }
@@ -10912,13 +10976,26 @@
     host.innerHTML = trackState.map(function(r){
       var q = r.quota || {};
       var qtxt = q.exhausted ? 'exhausted' : (q.limit == null ? (q.remaining == null ? 'no cap' : String(q.remaining)) : (q.remaining + '/' + q.limit));
-      var extra = r.dead_expires_in ? (' ' + Math.round(r.dead_expires_in / 60) + 'm') : '';
+      /* The state is upper-cased by CSS, which turned "dead 346m" into
+         "DEAD 346M" (346 million?). The countdown sits in its own span. */
+      var extra = r.dead_expires_in
+        ? ' <span class="tk-in" title="re-probed in">' + esc(fmtCountdown(r.dead_expires_in)) + '</span>' : '';
+      /* The detected input window (/api/tracking ctx_window + ctx_source:
+         catalog | learned | inferred | reference). "default" is a guess, so
+         it gets no tag; the learned figure is the fallback for older servers. */
+      var cw = Number(r.ctx_window), ctxTag = '';
+      if (cw > 0 && r.ctx_source && r.ctx_source !== 'default'){
+        ctxTag = '<span class="tk-tag" title="' + esc('Context window, source: ' + r.ctx_source) + '">ctx ' +
+                 esc(cw >= 1e6 ? (Math.round(cw / 1e5) / 10) + 'M' : cw >= 1000 ? Math.round(cw / 1000) + 'K' : String(cw)) +
+                 '</span>';
+      } else if (r.learned_ctx){
+        ctxTag = '<span class="tk-tag">ctx ' + esc(r.learned_ctx) + '</span>';
+      }
       var tags = (r.tool_capable ? '<span class="tk-tag">tools</span>' : '') +
-                 (r.fast ? '<span class="tk-tag">fast</span>' : '') +
-                 (r.learned_ctx ? '<span class="tk-tag">ctx ' + esc(r.learned_ctx) + '</span>' : '');
+                 (r.fast ? '<span class="tk-tag">fast</span>' : '') + ctxTag;
       return '<div class="track-row">' +
           '<span class="tk-score">' + esc(r.score) + '</span>' +
-          '<span class="tk-state tk-' + esc(r.state) + '">' + esc(r.state) + esc(extra) + '</span>' +
+          '<span class="tk-state tk-' + esc(r.state) + '">' + esc(r.state) + extra + '</span>' +
           '<span class="tk-model">' + esc(r.id) + '</span>' +
           '<span class="tk-tags">' + tags + '</span>' +
           '<span class="tk-quota">' + esc(qtxt) + '</span>' +
@@ -12100,7 +12177,7 @@
           ? '<span class="sw-sum">' + esc(String(a.summary).split(/\r?\n/)[0].slice(0, 160)) + '</span>'
           : (a.error ? '<span class="sw-sum">' + esc(String(a.error).slice(0, 160)) + '</span>' : '');
         var needs = (a.needs && a.needs.length)
-          ? ' <span class="sw-sum">after ' + a.needs.join(', ') + '</span>' : '';
+          ? ' <span class="sw-sum">after ' + esc(a.needs.join(', ')) + '</span>' : '';
         return '<div class="sw-phase ' + esc(a.state) + '">' +
                  '<span class="sw-dot" aria-hidden="true"></span>' +
                  '<span><span class="sw-title">' + esc(a.title) + '</span>' +
@@ -12115,7 +12192,7 @@
                '<div class="sw-run-h">' +
                  '<span class="sw-goal" title="' + esc(r.goal || '') + '">' + esc(r.goal || '') + '</span>' +
                  '<span class="sw-state ' + esc(r.state) + '">' + esc(r.state) + '</span>' +
-                 '<span class="sw-sum">' + (r.done || 0) + '/' + (r.total || 0) + '</span>' +
+                 '<span class="sw-sum">' + esc((r.done || 0) + '/' + (r.total || 0)) + '</span>' +
                  managerCostHTML(r.manager_tokens, r.manager_calls) +
                  stopBtn +
                '</div>' +
