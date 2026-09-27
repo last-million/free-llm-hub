@@ -227,6 +227,336 @@ def is_compaction_request(messages):
 
 
 # --------------------------------------------------------------------------- #
+# Exact facts: what a summary must never paraphrase
+# --------------------------------------------------------------------------- #
+#
+# MEASURED 2026-09-27: codex with a 12K compaction limit (3 compactions in 7
+# turns) kept a stated preference but answered a file's last line with ANOTHER
+# file's value -- a model-written summary had merged two files' contents. A
+# summary paraphrases; a value copied mechanically does not. So the facts a
+# later turn is likely to ask for exactly -- what each file/command printed,
+# what was written to which file, the user's stated values and rules, recorded
+# decisions -- are extracted here by pattern, verbatim, with no model call, and
+# attached next to (never inside) the summary. Bounded: the newest facts win,
+# the user's own statements have their own share so a burst of file reads
+# cannot push them out.
+
+EXACT_FACTS_MARKER = "EXACT FACTS (verbatim"
+EXACT_FACTS_HEADER = (
+    "[EXACT FACTS (verbatim, extracted by the hub -- not a summary). Quote these "
+    "values exactly; a value belongs ONLY to the file / command it is listed "
+    "under. Later lines supersede earlier ones for the same file.]")
+EXACT_FACTS_MAX_CHARS = 4000
+EXACT_FACTS_MAX_FILE = 24          # newest file / command facts kept
+EXACT_FACTS_MAX_USER = 16          # newest user statements / decisions kept
+_FACT_VALUE_CHARS = 160
+_FACT_CMD_CHARS = 80
+
+# A file path: something with a letter-led extension, optionally with dirs.
+# Not preceded by "/" or ":" so a URL's host ("https://x.com/a") is not a file.
+_FACT_PATH_RE = re.compile(
+    r"(?<![\w/:.\\-])((?:[A-Za-z]:[\\/])?(?:[\w.-]+[\\/])*[\w-][\w.-]*"
+    r"\.[A-Za-z][A-Za-z0-9]{0,7})(?![\w\\/-])")
+_FACT_SECTION_RE = re.compile(r"^==> (.+?) <==$", re.M)
+_FACT_META_LINE_RE = re.compile(r"^[A-Z][\w ]{1,40}:")
+_FACT_HEREDOC_RES = (
+    re.compile(r"cat\s+>\s*(['\"]?)([^\s'\"<>|;&]+)\1\s*<<-?\s*(['\"]?)(\w+)\3[^\n]*\n(.*?)\n\s*\4\b",
+               re.S),
+    re.compile(r"cat\s+<<-?\s*(['\"]?)(\w+)\1\s*>\s*(['\"]?)([^\s'\"<>|;&]+)\3[^\n]*\n(.*?)\n\s*\2\b",
+               re.S),
+)
+_FACT_ECHO_RE = re.compile(
+    r"(?:echo|printf)\s+(?:-[a-zA-Z]+\s+)*(['\"])(.*?)(?<!\\)\1\s*(>>?)\s*(['\"]?)([^\s'\"<>|;&]+)\4")
+_FACT_WRITE_REDIRECT_RE = re.compile(r"(?<![<>&0-9])>{1,2}(?!&)")
+_FACT_PATCH_ADD_RE = re.compile(r"^\*\*\* Add File: (.+)$", re.M)
+_FACT_PATH_KEYS = ("path", "file_path", "filePath", "filename", "file", "target_file")
+_FACT_CONTENT_KEYS = ("content", "contents", "file_text", "text")
+_FACT_CMD_KEYS = ("command", "cmd", "script", "input")
+# A user sentence worth keeping verbatim: a quoted literal, a stated value
+# ("is 42", "= 8787", "port 5173", "ORCHID-9", "300 ms"), or a standing rule /
+# preference / name. A bare digit ("step 3") is not a fact.
+_USER_FACT_RE = re.compile(
+    r"[\"'`][^\"'`\n]{1,120}[\"'`]"
+    r"|(?:\b(?:is|are|was|equals|to|of)\b|[=:])\s*[^\s,;]*\d"
+    r"|\b[A-Za-z]+[-_]?\d+[\w.-]*\b|\b\d[\d.,]*\s*(?:ms|s|sec|seconds?|minutes?|px|%|"
+    r"kb|mb|gb|k|tokens?|usd|eur)\b"
+    r"|\b(?:prefer|always|never|must|remember|call me|my name|named?|codename|"
+    r"instead of|do not|don't|deadline|password|port|version)\b", re.I)
+_USER_FACT_MAX_SENTENCE = 300      # longer is a pasted blob, not a statement
+# A STANDING rule / preference / name: kept in its own share, so a long run of
+# per-step values ("step 12: use value=12") cannot push "I prefer tabs" out.
+_USER_RULE_RE = re.compile(
+    r"\b(?:prefer|always|never|must|remember|call me|my name|codename|"
+    r"instead of|do not|don't)\b", re.I)
+EXACT_FACTS_MAX_RULES = 8
+_DECISION_LINE_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:decision|decided|constraint|agreed)\b\s*[:\-]", re.I | re.M)
+# A CLI's own compaction SUMMARY carried into the history (codex: "Another
+# language model started to solve this problem and produced a summary of its
+# thinking process..."). Its prose is a paraphrase -- never mined for facts --
+# but an EXACT FACTS block inside it is carried forward as is.
+_SUMMARY_BRIDGE_RE = re.compile(
+    r"another language model started|produced a summary of|summary of (?:the|our) "
+    r"(?:earlier |previous )?conversation", re.I)
+
+
+def _fact_clip(value, n=_FACT_VALUE_CHARS):
+    value = str(value or "").replace("\r", "").strip()
+    return value if len(value) <= n else value[:n] + "...[cut]"
+
+
+def _fact_tool_output(text):
+    """The payload of a tool result: codex's JSON {"output": ...} and its
+    "Exit code: / Wall time: / Output:" header are unwrapped."""
+    t = text or ""
+    s = t.lstrip()
+    if s.startswith("{"):
+        try:
+            d = json.loads(s)
+            if isinstance(d, dict) and isinstance(d.get("output"), str):
+                t = d["output"]
+        except ValueError:
+            pass
+    lines = t.split("\n")
+    for i in range(min(10, len(lines))):
+        if lines[i].strip() == "Output:" and all(
+                (not ln.strip()) or _FACT_META_LINE_RE.match(ln) for ln in lines[:i]):
+            return "\n".join(lines[i + 1:])
+    return t
+
+
+def _fact_command(args):
+    """(command text, parsed args dict or None) of a tool call's arguments."""
+    raw = args if isinstance(args, str) else json.dumps(args or {})
+    try:
+        d = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        d = None
+    if isinstance(d, dict):
+        for k in _FACT_CMD_KEYS:
+            v = d.get(k)
+            if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+                # ["bash", "-lc", "cat a.txt"] -> the script; else the argv.
+                return (v[-1] if len(v) >= 3 and v[-2] in ("-c", "-lc") else " ".join(v)), d
+            if isinstance(v, str) and v.strip():
+                return v, d
+        return "", d
+    return raw or "", None
+
+
+def _fact_lines_of(text):
+    return [ln.rstrip() for ln in (text or "").replace("\r", "").split("\n") if ln.strip()]
+
+
+def _fact_describe(path, label, body_lines):
+    if not body_lines:
+        return None
+    if len(body_lines) == 1:
+        return '%s%s: "%s"' % (path, label, _fact_clip(body_lines[0]))
+    return '%s%s: %d lines; first "%s"; last "%s"' % (
+        path, label, len(body_lines), _fact_clip(body_lines[0]), _fact_clip(body_lines[-1]))
+
+
+def _fact_writes(cmd, d):
+    """[(path, kind, fact)] for content a tool call WROTE: a write tool's
+    path + content, an apply_patch "Add File", a heredoc or echo redirect."""
+    out = []
+    if isinstance(d, dict):
+        path = next((d.get(k) for k in _FACT_PATH_KEYS if isinstance(d.get(k), str)), None)
+        content = next((d.get(k) for k in _FACT_CONTENT_KEYS
+                        if isinstance(d.get(k), str)), None)
+        if path and content is not None:
+            f = _fact_describe(path, " (written)", _fact_lines_of(content))
+            if f:
+                out.append((path, "write", f))
+    text = cmd or ""
+    for m in _FACT_PATCH_ADD_RE.finditer(text):
+        path = m.group(1).strip()
+        rest = text[m.end():]
+        stop = re.search(r"^\*\*\* ", rest, re.M)
+        body = rest[:stop.start()] if stop else rest
+        added = [ln[1:] for ln in body.split("\n") if ln.startswith("+")]
+        f = _fact_describe(path, " (written)", [ln for ln in added if ln.strip()])
+        if f:
+            out.append((path, "write", f))
+    for rx in _FACT_HEREDOC_RES:
+        for m in rx.finditer(text):
+            g = m.groups()
+            path, body = (g[1], g[4]) if rx is _FACT_HEREDOC_RES[0] else (g[3], g[4])
+            f = _fact_describe(path, " (written)", _fact_lines_of(body))
+            if f:
+                out.append((path, "write", f))
+    for m in _FACT_ECHO_RE.finditer(text):
+        value, op, path = m.group(2), m.group(3), m.group(5)
+        kind = "append" if op == ">>" else "write"
+        f = '%s (%s): "%s"' % (path, "appended" if kind == "append" else "written",
+                                _fact_clip(value))
+        out.append((path, kind, f))
+    return out
+
+
+_FACT_LINENO_RE = re.compile(r"^\s*\d+(?:→|\t)", re.M)
+
+
+def _fact_reads(cmd, output, read_path=None):
+    """[(path, fact)] for what a tool call PRINTED about a file: per section of
+    a multi-file `==> path <==` listing, else attributed to the command's ONE
+    path, else to a read tool's own `path` argument (Claude Code Read: its
+    "   12->" line numbers are dropped). Two or more paths and no section
+    headers -> nothing: guessing which file a line came from is exactly the
+    mistake this exists to prevent."""
+    out = []
+    text = _fact_tool_output(output).strip("\n")
+    if not text.strip():
+        return out
+    if not cmd and read_path:
+        f = _fact_describe(read_path, " (read)",
+                           _fact_lines_of(_FACT_LINENO_RE.sub("", text)))
+        return [(read_path, f)] if f else out
+    via = " (via `%s`)" % _fact_clip(re.sub(r"\s+", " ", cmd), _FACT_CMD_CHARS) if cmd else ""
+    heads = list(_FACT_SECTION_RE.finditer(text))
+    if heads:
+        for i, m in enumerate(heads):
+            end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+            f = _fact_describe(m.group(1).strip(), via, _fact_lines_of(text[m.end():end]))
+            if f:
+                out.append((m.group(1).strip(), f))
+        return out
+    if not cmd or _FACT_WRITE_REDIRECT_RE.search(cmd):
+        return out
+    paths = list(dict.fromkeys(_FACT_PATH_RE.findall(cmd)))
+    if len(paths) != 1:
+        return out
+    f = _fact_describe(paths[0], via, _fact_lines_of(text))
+    if f:
+        out.append((paths[0], f))
+    return out
+
+
+def _carried_facts(text):
+    """Bullet lines of an EXACT FACTS block already present in `text`."""
+    i = text.find(EXACT_FACTS_MARKER)
+    if i < 0:
+        return []
+    out = []
+    for ln in text[i:].split("\n")[1:]:
+        s = ln.strip()
+        if not s:
+            if out:
+                break
+            continue
+        if not s.startswith("- "):
+            break
+        out.append(s[2:])
+    return out
+
+
+def _sentences(text):
+    for ln in (text or "").split("\n"):
+        for s in re.split(r"(?<=[.!?])\s+(?=[A-Z\"'`])", ln):
+            s = s.strip(" \t-*")
+            if s:
+                yield s
+
+
+def exact_facts(messages, max_chars=EXACT_FACTS_MAX_CHARS):
+    """The verbatim facts of `messages` (OpenAI chat shape), oldest first, as
+    bullet-less lines. Pure, bounded, never raises."""
+    try:
+        return _exact_facts(messages or [], max_chars)
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def _exact_facts(messages, max_chars):
+    files = OrderedDict()       # key -> (path, fact)
+    users = OrderedDict()       # key -> fact
+    calls = {}                  # tool_call_id -> command text
+
+    def _put_file(key, path, fact):
+        files.pop(key, None)
+        files[key] = (path, fact)
+
+    def _drop_path(path):
+        for k in [k for k, v in files.items() if v[0] == path]:
+            files.pop(k, None)
+
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        text = message_text(m)
+        for carried in _carried_facts(text):
+            if carried.startswith("user said:") or _DECISION_LINE_RE.match(carried):
+                users.pop(carried.lower(), None)
+                users[carried.lower()] = carried
+                continue
+            p = carried.split(" ", 1)[0].rstrip(":")
+            _put_file(("carried", carried), p, carried)
+        if role == "assistant":
+            for tc in m.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                cmd, d = _fact_command((tc.get("function") or {}).get("arguments"))
+                read_path = None
+                if isinstance(d, dict) and not any(isinstance(d.get(k), str)
+                                                   for k in _FACT_CONTENT_KEYS + ("new_string",)):
+                    read_path = next((d.get(k) for k in _FACT_PATH_KEYS
+                                      if isinstance(d.get(k), str) and d.get(k)), None)
+                if tc.get("id"):
+                    calls[tc["id"]] = (cmd, read_path)
+                for path, kind, fact in _fact_writes(cmd, d):
+                    if kind == "write":
+                        _drop_path(path)
+                    _put_file((path, kind, fact), path, fact)
+        elif role == "tool":
+            cmd, read_path = calls.get(m.get("tool_call_id")) or ("", None)
+            for path, fact in _fact_reads(cmd, text, read_path):
+                _put_file((path, cmd or "read"), path, fact)
+        elif role == "user" and not _COMPACTION_REQUEST_RE.search(text[-6000:]) \
+                and not _SUMMARY_BRIDGE_RE.search(text[:2000]):
+            said = instruction_text(text)
+            for s in _sentences(said):
+                if 4 <= len(s) <= _USER_FACT_MAX_SENTENCE and _USER_FACT_RE.search(s):
+                    line = "user said: \"%s\"" % _fact_clip(s, 200)
+                    users.pop(line.lower(), None)
+                    users[line.lower()] = line
+        if role in ("user", "assistant") and not _SUMMARY_BRIDGE_RE.search(text[:2000]):
+            for dm in _DECISION_LINE_RE.finditer(text):
+                line = text[dm.start():].split("\n", 1)[0].strip(" \t-*")
+                users.pop(line.lower(), None)
+                users[line.lower()] = _fact_clip(line, 200)
+    file_facts = [v[1] for v in files.values()][-EXACT_FACTS_MAX_FILE:]
+    said = list(users.values())
+    is_rule = [bool(_USER_RULE_RE.search(v) or _DECISION_LINE_RE.match(v)) for v in said]
+    rule_idx = [i for i, r in enumerate(is_rule) if r][-EXACT_FACTS_MAX_RULES:]
+    room = max(0, EXACT_FACTS_MAX_USER - len(rule_idx))
+    other_idx = [i for i, r in enumerate(is_rule) if not r][-room:] if room else []
+    rules = [said[i] for i in rule_idx]
+    others = [said[i] for i in other_idx]
+    order = {v: i for i, v in enumerate(said)}
+
+    def _size():
+        return sum(len(x) + 3 for x in rules + others + file_facts)
+    # Over the char cap: the oldest file facts go first, then the oldest
+    # per-step values, the standing rules last.
+    while file_facts and _size() > max_chars:
+        file_facts.pop(0)
+    while others and _size() > max_chars:
+        others.pop(0)
+    while rules and _size() > max_chars:
+        rules.pop(0)
+    return sorted(rules + others, key=order.get) + file_facts
+
+
+def format_exact_facts(facts):
+    """The block that carries `facts`, or "" when there are none."""
+    if not facts:
+        return ""
+    return EXACT_FACTS_HEADER + "\n" + "\n".join("- " + f for f in facts)
+
+
+# --------------------------------------------------------------------------- #
 # Conversation identity
 # --------------------------------------------------------------------------- #
 
