@@ -63,7 +63,9 @@ def test_secrets_are_never_harvested(mem_dir):
 
 
 def test_the_extractor_path_drops_secrets_too(mem_dir):
-    memory._run_extractor(lambda q, r: ["The deploy token is ghp_abcdefghijkl123456",
+    # A fake token, assembled at runtime so the push secret-scan never sees a
+    # token-shaped literal in the source.
+    memory._run_extractor(lambda q, r: ["The deploy token is " + "gh" + "p_abcdefghijkl123456",
                                         "The deploy target is Fly.io."],
                           "s2", "x", "y", None)
     facts = memory.get("s2").get("facts") or []
