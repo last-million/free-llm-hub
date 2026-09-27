@@ -144,8 +144,13 @@ def test_manager_plan_and_review_see_a_bounded_context_excerpt():
     m = _manager()
     d = _dispatch()
     swarm.run(FOLLOW_UP, d, manager=m, context="MEMO " + "z" * 8000)
-    for purpose in ("plan", "review"):
-        call = next(c for c in m.calls if c["purpose"] == purpose)
+    # The review, or -- when every phase passed first time and the review is
+    # skipped -- the last wave's combined check, which carries the same brief.
+    final_look = [c for c in m.calls if c["purpose"] == "review"] or \
+        [c for c in m.calls if c["purpose"] == "verify" and "JUDGE THESE" in c["user"]]
+    assert final_look, [c["purpose"] for c in m.calls]
+    for purpose, call in (("plan", next(c for c in m.calls if c["purpose"] == "plan")),
+                          ("final look", final_look[-1])):
         assert "CONVERSATION CONTEXT" in call["user"], purpose
         ctx = call["user"].split("CONVERSATION CONTEXT", 1)[1]
         assert len(ctx) <= swarm.MANAGER_CONTEXT_CHARS + 400, purpose

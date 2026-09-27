@@ -131,8 +131,9 @@ def test_revision_applies_manager_instructions_to_the_full_draft():
         assert c["chars"] < 12000, (c["stage"], c["chars"])
     # The manager never rewrote the draft itself.
     assert m.of("phase") == [] and d.of("revision") == []
-    # Synthesis got the revised draft and no stale problem list.
-    synth = d.of("synth")[0]["user"]
+    # Synthesis got the revised draft and no stale problem list (the one
+    # started alongside the review, on the unrevised draft, was discarded).
+    synth = d.of("synth")[-1]["user"]
     assert "## FAQ" in synth and "REVIEWER PROBLEMS" not in synth
     assert out["text"] == "FINAL"
     assert ("revision", "free%d/model" % d.calls.index(applies[0])) in out["models"]
@@ -153,18 +154,19 @@ def test_lossy_apply_is_rejected_free_and_retried_on_another_provider():
     assert "dropped content" in applies[1]["user"]
     # Only the good apply was worth a manager verdict.
     assert len(m.of("confirm")) == 1
-    assert "## FAQ" in d.of("synth")[0]["user"]
+    assert "## FAQ" in d.of("synth")[-1]["user"]
 
 
 def test_confirm_rejected_twice_keeps_the_draft_and_hands_problems_to_synthesis():
-    answers = dict(GOOD, verify=['{"ok": true}', '{"ok": true}',
+    # ONE batched verdict for the wave's two phases, then the two confirms.
+    answers = dict(GOOD, verify=['{"ok": true}',
                                  '{"ok": false, "problems": ["FAQ still missing"]}',
                                  '{"ok": false, "problems": ["FAQ still missing"]}'])
     d, m = _free(), _manager(answers)
     out = swarm.run(ASK, d, profile=REV, manager=m)
     assert len(d.of("apply")) == 2
     assert "FAQ still missing" in d.of("apply")[1]["user"]
-    synth = d.of("synth")[0]["user"]
+    synth = d.of("synth")[-1]["user"]
     assert "REVIEWER PROBLEMS TO FIX" in synth and "## FAQ" not in synth
     assert out["text"] == "FINAL"
 
@@ -194,7 +196,7 @@ def test_without_a_manager_the_revision_is_directed_too():
     assert HERO in work and PRICING in work and "[... trimmed ...]" not in work
     # The free instructions were empty, so the reviewer's problems stood in.
     assert "1. Fix: FAQ section missing" in applies[0]["user"]
-    assert "## FAQ" in d.of("synth")[0]["user"]
+    assert "## FAQ" in d.of("synth")[-1]["user"]
 
 
 # ---- a long phase that failed twice --------------------------------------
@@ -270,4 +272,4 @@ def test_a_draft_too_long_for_any_apply_pays_for_no_instructions():
     swarm.run(ASK, d, profile=REV, manager=m)
     assert m.of("instruct") == [] and d.of("apply") == []
     assert "fix" not in [c["purpose"] for c in m.calls]
-    assert "REVIEWER PROBLEMS TO FIX" in d.of("synth")[0]["user"]
+    assert "REVIEWER PROBLEMS TO FIX" in d.of("synth")[-1]["user"]

@@ -5529,6 +5529,66 @@ def _sub_flatten(messages):
     return "\n\n".join(parts)
 
 
+# One-shot `claude -p` speed. A plain print-mode call still starts EVERY MCP
+# server in the user's config (a user with playwright/github/stitch servers
+# waits on each connect -- some time out), lists every installed skill and
+# ships the full tool schemas in the system prompt, and writes a resumable
+# session to disk. A text completion needs none of it. Each flag is sent ONLY
+# when this CLI's own `--help` lists it (verified on Claude Code 2.1.283), so
+# an older CLI never sees an option it would reject.
+_CLAUDE_FAST_FLAGS = (
+    ("--strict-mcp-config", []),         # no --mcp-config given -> no MCP servers
+    ("--no-session-persistence", []),
+    ("--disable-slash-commands", []),    # no skill listing in the prompt
+)
+# `--tools ""` (no tool schemas at all) needs an EMPTY argv element, which a
+# .cmd/.bat shim run through cmd.exe cannot be trusted to pass through intact:
+# only for a directly executable binary.
+_CLAUDE_NO_TOOLS = ("--tools", [""])
+_CLAUDE_HELP_CACHE = {}                  # resolved path -> (monotonic ts, help text)
+_CLAUDE_HELP_TTL = 6 * 3600
+_CLAUDE_HELP_LOCK = threading.Lock()
+
+
+def _claude_help_text(path, env=None):
+    """`claude --help` for this binary, cached. "" when it cannot be read.
+    Never raises."""
+    now = time.monotonic()
+    with _CLAUDE_HELP_LOCK:
+        hit = _CLAUDE_HELP_CACHE.get(path)
+        if hit and now - hit[0] < _CLAUDE_HELP_TTL:
+            return hit[1]
+    text = ""
+    try:
+        proc = subprocess.run(_sub_launcher(path) + ["--help"], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=20, env=env, cwd=tempfile.gettempdir(),
+                              creationflags=_CREATE_NO_WINDOW)
+        text = proc.stdout or ""
+    except Exception:                                            # noqa: BLE001
+        text = ""
+    with _CLAUDE_HELP_LOCK:
+        _CLAUDE_HELP_CACHE[path] = (now, text)
+    return text
+
+
+def _claude_fast_args(path, env=None):
+    """The one-shot speed flags this claude binary supports (see
+    _CLAUDE_FAST_FLAGS). [] when its --help cannot be read."""
+    help_text = _claude_help_text(path, env)
+    if not help_text:
+        return []
+    out = []
+    flags = list(_CLAUDE_FAST_FLAGS)
+    if os.path.splitext(path)[1].lower() not in (".cmd", ".bat"):
+        flags.append(_CLAUDE_NO_TOOLS)
+    for flag, values in flags:
+        if re.search(r"(?m)^\s*(?:-\w,\s*)?%s\b" % re.escape(flag), help_text) or \
+                re.search(r",\s*%s\b" % re.escape(flag), help_text):
+            out += [flag] + list(values)
+    return out
+
+
 def _sub_launcher(path):
     """argv prefix that can actually execute `path`.
 
@@ -5721,6 +5781,7 @@ def _sub_run(pid, prompt, model=None):
             argv += ["-o", tmp_out, "-"]
         else:
             argv = _sub_launcher(path) + ["-p", "--output-format", "text"]
+            argv += _claude_fast_args(path, _sub_env(pid, model))
             if cli_model:
                 argv += ["--model", cli_model]
         try:
