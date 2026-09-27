@@ -377,6 +377,28 @@ above only suggests).
   `mcp_kept` in the disconnect response. Covered by
   `tests/test_cli_disconnect_leaves_no_trace.py`.
 
+## Shared env vars are not a CLI's connection (2026-09-27)
+
+Covered by `tests/test_shared_env_vars.py`.
+
+- The hub never writes the persistent environment; the only source of a hub
+  URL in HKCU\Environment is the user running the `setx` block from
+  `_env_commands` (`/api/clis/<cid>/instructions`), which records `cid` as an
+  owner (`_env_record_owner`, config key `env_var_owners`). A var with no
+  record is seeded with every CLI whose `env_check` lists it.
+- `_CONFIG_WIRED_CLIS` (claude, pi, opencode, codex, qwen, openclaw, hermes,
+  kimi) are connected ONLY by their config file; a shared var gives
+  `env_vars` + `env_note` on the card. Env-only CLIs (aider, llm,
+  cursor-agent) still count the var as their connection.
+- Disconnect (`_env_release_on_disconnect`) removes a var only when no other
+  installed, still-connected owner reads it; otherwise the response's
+  `env.kept[].used_by` names them. `GET /api/env/hub-vars`,
+  `POST /api/env/remove {name, confirm}` (no confirm = preview of the tools it
+  reaches; refuses values not pointing at the hub and protected names).
+- `userenv.py` is the only registry access (winreg + WM_SETTINGCHANGE, no child
+  process). The root conftest swaps in `userenv.MemoryBackend` for every test
+  and fingerprints the real vars in the tripwire.
+
 ## Context-window management (every CLI, every protocol)
 
 Pure helpers live in `ctxwin.py`; the glue is in app.py. Covered by

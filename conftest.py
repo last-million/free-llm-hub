@@ -55,6 +55,7 @@ above -- a file's own monkeypatch.setenv still wins for the duration of that
 test, and an operator/CI override of the real env var is never touched.
 """
 import os
+import sys
 import tempfile
 
 import pytest
@@ -114,10 +115,58 @@ _CLAUDE_HUB_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODE
                    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_AUTO_COMPACT_WINDOW")
 
 
+# THE USER'S PERSISTENT ENVIRONMENT (HKCU\Environment). userenv.py removes
+# hub-pointing vars from it on Disconnect, so for the whole run it is an
+# in-memory fake (fresh per test) and the real values of the vars the hub could
+# ever touch are fingerprinted too. The same vars are also dropped from THIS
+# process's environment for the run: a developer whose shell carries
+# OPENAI_BASE_URL=http://127.0.0.1:8787 would otherwise see every OpenAI-shaped
+# CLI read as "connected" in tests that never set it.
+_HUB_ENV_VARS = ("OPENAI_BASE_URL", "OPENAI_API_BASE", "ANTHROPIC_BASE_URL", "LLM_BASE_URL",
+                 "OPENAI_API_KEY", "OPENAI_MODEL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL")
+_SCRUBBED_ENV_VARS = ("OPENAI_BASE_URL", "OPENAI_API_BASE", "ANTHROPIC_BASE_URL", "LLM_BASE_URL")
+
+
+def _fingerprint_real_user_env():
+    import hashlib
+    if os.name != "nt":
+        return {}
+    try:
+        import userenv
+        real = userenv._WinRegBackend()
+        return {"HKCU\\Environment\\" + n: hashlib.sha256(
+                    (real.get(n) or "\0absent").encode("utf-8")).hexdigest()
+                for n in _HUB_ENV_VARS}
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+_SESSION_USERENV = []
+
+
+@pytest.fixture(autouse=True)
+def _persistent_user_env_is_a_fake():
+    """Every test gets an empty in-memory HKCU\\Environment."""
+    try:
+        import userenv
+    except Exception:                                            # noqa: BLE001
+        yield
+        return
+    prev = userenv.set_backend(userenv.MemoryBackend())
+    mod = sys.modules.get("app")
+    memo = getattr(mod, "_installed_memo", None) if mod else None
+    if isinstance(memo, dict):
+        memo.clear()
+    yield
+    # Back to the session-wide fake, never to the real registry.
+    userenv.set_backend(prev if isinstance(prev, userenv.MemoryBackend)
+                        else userenv.MemoryBackend())
+
+
 def _fingerprint_real_cli_configs(home):
     import hashlib
     import json
-    out = {}
+    out = _fingerprint_real_user_env()
     for parts in _REAL_CLI_FILES:
         p = os.path.join(home, *parts)
         try:
@@ -142,7 +191,14 @@ def _sandbox_the_home(config):
     config._real_home = real_home
     config._real_cli_before = _fingerprint_real_cli_configs(real_home)
     sandbox = os.path.join(tempfile.gettempdir(), "hub-pytest-home")
-    config._saved_home_env = {v: os.environ.get(v) for v in _HOME_VARS}
+    config._saved_home_env = {v: os.environ.get(v) for v in _HOME_VARS + _SCRUBBED_ENV_VARS}
+    for var in _SCRUBBED_ENV_VARS:
+        os.environ.pop(var, None)
+    try:
+        import userenv
+        userenv.set_backend(userenv.MemoryBackend())   # before any test can import app
+    except Exception:                                            # noqa: BLE001
+        pass
     try:
         os.makedirs(os.path.join(sandbox, "AppData", "Roaming"), exist_ok=True)
         os.makedirs(os.path.join(sandbox, "AppData", "Local"), exist_ok=True)

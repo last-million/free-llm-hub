@@ -87,6 +87,7 @@ import hub_mcp
 import mcp_manager
 import usage_history
 import ctxwin
+import userenv
 
 # The hub is also an MCP server (POST /mcp, JSON-RPC 2.0) so any MCP-capable
 # agent CLI can call the crews as native tools. The runner goes through the
@@ -18375,14 +18376,272 @@ def _file_points_at_hub(path):
     return any(fr in _strip_hub_mcp_table(txt) for fr in _hub_fragments())
 
 
+# --------------------------------------------------------------------------- #
+# Shared environment variables (OPENAI_BASE_URL, ANTHROPIC_BASE_URL, ...).
+#
+# REPORTED 2026-09-27: Disconnect on OpenCode removed its free-llm-hub provider
+# block (the ONLY thing that shows the hub's models/efforts/modes in OpenCode),
+# yet the card said "Disconnected in config — but an env var still points
+# OpenCode at the hub". The user's HKCU\Environment held OPENAI_BASE_URL (and
+# LLM_BASE_URL) = http://127.0.0.1:8787 -- one var read by EVERY OpenAI-shaped
+# tool, so it made every one of them look connected.
+#
+# WHERE THESE VARS COME FROM. The hub itself never writes the persistent
+# environment. The only writer is the user running the `setx` block the manual
+# setup hands out (_env_commands, from /api/clis/<cid>/instructions and the
+# dashboard's Setup details): OPENAI_API_BASE/OPENAI_BASE_URL/OPENAI_API_KEY/
+# OPENAI_MODEL for OpenAI-kind CLIs, ANTHROPIC_* for Claude Code. So ownership
+# is recorded there (_env_record_owner), and a hub-pointing var found without
+# a record is seeded CONSERVATIVELY with every connector that reads it.
+#
+# WHAT COUNTS AS CONNECTED. A CLI wired through its OWN config file is
+# connected only when that file points at the hub; a shared env var alone is a
+# note on its card (_cli_env_vars), not the connection. Env-only CLIs (aider,
+# llm, cursor-agent, gemini) have no other wiring, so for them the var still
+# is the connection.
+# --------------------------------------------------------------------------- #
+_CONFIG_WIRED_CLIS = frozenset({"claude", "pi", "opencode", "codex", "qwen",
+                                "openclaw", "hermes", "kimi"})
+
+# What a hub-pointing var still does to a config-wired CLI that reads it.
+_ENV_EFFECT = {
+    "opencode": "OpenCode's built-in OpenAI provider would also use it",
+    "claude": ("Claude Code reads it directly, so new Claude Code sessions would "
+               "still go through the hub"),
+    "qwen": "Qwen Code would still use it when ~/.qwen/.env does not set its own value",
+    "hermes": "Hermes would use it only in its openai-api provider mode",
+}
+
+_ENV_OWNERS_KEY = "env_var_owners"
+_env_owner_lock = threading.Lock()
+_ENV_TERMINAL_NOTE = ("Terminals that are already open keep the old value until you "
+                      "close and reopen them.")
+
+
+def _cli_config_wired(entry):
+    return entry.get("id") in _CONFIG_WIRED_CLIS
+
+
+def _env_scope(name):
+    """Where `name` points at the hub: ('user', value) when the PERSISTENT user
+    environment holds it (removable), ('session', value) when only this
+    process's environment does (the shell the hub was started from, or a
+    system-wide var), else (None, None). Never raises."""
+    pv = userenv.get(name)
+    if _points_at_hub(pv):
+        return "user", pv
+    sv = os.environ.get(name)
+    if _points_at_hub(sv):
+        return "session", sv
+    return None, None
+
+
+def _env_readers(name):
+    """Registry CLIs that read `name` (it is in their env_check)."""
+    return [e for e in CLI_REGISTRY if name in (e.get("env_check") or [])]
+
+
+_installed_memo = {}
+
+
+def _cli_installed_cached(entry, ttl=10.0):
+    """_cli_installed with a short memo: the env-sharing notes ask it for every
+    reader of every var on every card, and each call walks PATH."""
+    cid = entry.get("id")
+    now = time.time()
+    hit = _installed_memo.get(cid)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = bool(_cli_installed(entry)[0])
+    _installed_memo[cid] = (now, val)
+    return val
+
+
+def _env_owner_ledger():
+    led = config.get_json(_ENV_OWNERS_KEY, {}) or {}
+    return led if isinstance(led, dict) else {}
+
+
+def _env_owners_save(name, owners, source):
+    """Persist the owner list of `name` (None drops the record). Best-effort."""
+    led = dict(_env_owner_ledger())
+    if owners is None:
+        led.pop(name, None)
+    else:
+        led[name] = {"owners": sorted(set(owners)), "source": source,
+                     "updated": int(time.time())}
+    try:
+        config.set_json(_ENV_OWNERS_KEY, led or None)
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+def _env_owners(name, seed=True):
+    """CLI ids recorded as relying on persistent var `name`. A var written
+    before ownership was tracked has no record: it is seeded, conservatively,
+    with every connector that reads it -- over-counting only ever keeps a var
+    longer, never removes one a tool needs. Caller holds _env_owner_lock."""
+    rec = _env_owner_ledger().get(name)
+    if isinstance(rec, dict) and isinstance(rec.get("owners"), list):
+        return [c for c in rec["owners"] if isinstance(c, str)]
+    owners = [e["id"] for e in _env_readers(name)]
+    if seed:
+        _env_owners_save(name, owners, "inferred")
+    return owners
+
+
+def _env_record_owner(name, cid):
+    """`cid` was handed a `setx <name>` command: record it as an owner."""
+    with _env_owner_lock:
+        owners = set(_env_owners(name, seed=False))
+        if cid in owners and name in _env_owner_ledger():
+            return
+        owners.add(cid)
+        _env_owners_save(name, owners, "recorded")
+
+
+def _env_sharers(name, exclude=None):
+    """Installed CLIs (other than `exclude`) that read `name`."""
+    return [e for e in _env_readers(name)
+            if e["id"] != exclude and _cli_installed_cached(e)]
+
+
+def _env_affects(name):
+    """Every installed tool a hub-pointing `name` reaches, for the removal
+    preview: [{id, name, connected, via}]. `via` says what the var does to it."""
+    out = []
+    for e in _env_readers(name):
+        if not _cli_installed_cached(e):
+            continue
+        if _cli_config_wired(e):
+            via = _ENV_EFFECT.get(e["id"]) or ("%s would also read it" % e["name"])
+        else:
+            via = "%s connects to the hub through it" % e["name"]
+        out.append({"id": e["id"], "name": e["name"],
+                    "connected": bool(_cli_connected(e)[0]), "via": via})
+    return out
+
+
+def _env_scope_phrase(scope):
+    return ("in your user environment" if scope == "user"
+            else "in the environment the hub was started from")
+
+
+def _cli_env_vars(entry):
+    """Hub-pointing vars a config-wired CLI still reads, for its card:
+    [{name, scope, shared_by: [tool names]}]."""
+    out = []
+    for name in entry.get("env_check") or []:
+        scope, _val = _env_scope(name)
+        if scope:
+            out.append({"name": name, "scope": scope,
+                        "shared_by": [e["name"] for e in _env_sharers(name, entry.get("id"))]})
+    return out
+
+
+def _env_note(entry, env_vars):
+    """'OPENAI_BASE_URL in your user environment still points at the hub; it is
+    shared by Aider, Qwen Code; OpenCode's built-in OpenAI provider would also
+    use it.'"""
+    parts = []
+    effect = _ENV_EFFECT.get(entry.get("id")) or ("%s would also read it" % entry.get("name"))
+    for v in env_vars:
+        shared = v.get("shared_by") or []
+        parts.append("%s %s still points at the hub; %s; %s." % (
+            v["name"], _env_scope_phrase(v.get("scope")),
+            ("it is shared by " + ", ".join(shared)) if shared
+            else "no other installed tool on this dashboard reads it",
+            effect))
+    return " ".join(parts)
+
+
+def _env_remove_persistent(name):
+    """Remove a hub-pointing `name` from the persistent user environment AND
+    from this process (so status is right without a hub restart), and drop its
+    owner record. True if the persistent var was removed."""
+    if not _points_at_hub(userenv.get(name)):
+        return False
+    if not userenv.remove(name):
+        return False
+    if _points_at_hub(os.environ.get(name)):
+        os.environ.pop(name, None)
+    with _env_owner_lock:
+        _env_owners_save(name, None, "removed")
+    return True
+
+
+def _env_release_on_disconnect(entry):
+    """After a CLI's config revert: for each var it reads whose PERSISTENT value
+    points at the hub, drop it from the owners; remove the var only when no
+    other still-connected owner reads it. Returns
+    {removed: [names], kept: [{name, scope, used_by, used_by_ids}],
+     session: [names]} ('session' = set only in the hub's own environment,
+    nothing persistent to remove)."""
+    cid = entry.get("id")
+    out = {"removed": [], "kept": [], "session": []}
+    for name in entry.get("env_check") or []:
+        scope, _val = _env_scope(name)
+        if scope is None:
+            continue
+        if scope == "session":
+            out["session"].append(name)
+            continue
+        with _env_owner_lock:
+            owners = [o for o in _env_owners(name) if o != cid]
+            _env_owners_save(name, owners, "recorded")
+        blockers = []
+        for oid in owners:
+            other = _CLI_BY_ID.get(oid)
+            if not other or name not in (other.get("env_check") or []):
+                continue
+            if _cli_installed_cached(other) and _cli_connected(other)[0]:
+                blockers.append(other)
+        if not blockers and _env_remove_persistent(name):
+            out["removed"].append(name)
+            continue
+        kept = {"name": name, "scope": scope,
+                "used_by": [b["name"] for b in blockers],
+                "used_by_ids": [b["id"] for b in blockers],
+                "shared_by": [e["name"] for e in _env_sharers(name, cid)]}
+        if not blockers:
+            kept["error"] = "could not be removed from your user environment"
+        out["kept"].append(kept)
+    return out
+
+
+def _env_hub_var_rows():
+    """Every var pointing at the hub: all persistent ones (whatever their
+    name -- LLM_BASE_URL included), plus session-only ones a CLI reads."""
+    rows, seen = [], set()
+    for name in userenv.names():
+        if name.upper() in seen or not userenv.valid_name(name):
+            continue
+        if _points_at_hub(userenv.get(name)):
+            seen.add(name.upper())
+            rows.append({"name": name, "scope": "user", "affects": _env_affects(name),
+                         "removable": not userenv.is_protected(name)})
+    for name in sorted({n for e in CLI_REGISTRY for n in (e.get("env_check") or [])}):
+        if name.upper() in seen:
+            continue
+        scope, _val = _env_scope(name)
+        if scope:
+            seen.add(name.upper())
+            rows.append({"name": name, "scope": scope, "affects": _env_affects(name),
+                         "removable": scope == "user"})
+    return rows
+
+
 def _cli_connected(entry):
     """(connected, method, detail) — best-effort, never raises.
-    method is 'env' or 'config' when connected, else the entry default."""
+    method is 'env' or 'config' when connected, else the entry default.
+    A config-wired CLI (_CONFIG_WIRED_CLIS) is connected only by its config
+    file; a shared env var is reported by _cli_env_vars instead."""
     frags = _hub_fragments()
-    for ev in entry.get("env_check", []):
-        val = os.environ.get(ev)
-        if val and any(fr in val for fr in frags):
-            return True, "env", "Connected via the %s environment variable." % ev
+    if not _cli_config_wired(entry):
+        for ev in entry.get("env_check", []):
+            scope, _val = _env_scope(ev)
+            if scope:
+                return True, "env", "Connected via the %s environment variable." % ev
     for path in entry.get("config_paths", []):
         try:
             if not os.path.isfile(path):
@@ -18498,7 +18757,7 @@ def _cli_row(entry):
         detail = cdetail
     else:
         detail = entry.get("hint") or "Installed. Not pointed at this hub yet."
-    return {
+    row = {
         "id": entry["id"],
         "name": entry["name"],
         "kind": entry["kind"],
@@ -18508,6 +18767,14 @@ def _cli_row(entry):
         "connect_method": method if connected else entry.get("default_method", "manual"),
         "detail": detail,
     }
+    # A config-wired CLI that is NOT connected by its config but still reads a
+    # hub-pointing shared var: say so, instead of calling it connected.
+    if installed and not connected and _cli_config_wired(entry):
+        env_vars = _cli_env_vars(entry)
+        if env_vars:
+            row["env_vars"] = env_vars
+            row["env_note"] = _env_note(entry, env_vars)
+    return row
 
 
 def _first_free_model_id():
@@ -20729,10 +20996,91 @@ def _recover_interrupted_hub_transition():
         _hub_switch_lock.release()
 
 
-def _env_unset_commands(entry):
-    """Copy-paste commands to REMOVE the hub env vars a manual CLI would use.
-    Names only — never a value, so no secret can leak."""
-    if entry.get("kind") == "anthropic":
+def _env_disconnect_notes(entry, env):
+    """Plain sentences for the env part of a Disconnect: what was removed, what
+    stays and who still uses it, and that open terminals keep the old value."""
+    notes = []
+    removed = env.get("removed") or []
+    if removed:
+        notes.append("Removed %s from your user environment — no other connected tool "
+                     "used %s." % (", ".join(removed), "it" if len(removed) == 1 else "them"))
+    for k in env.get("kept") or []:
+        users = k.get("used_by") or []
+        if users:
+            notes.append("%s in your user environment still points at the hub and was left "
+                         "in place because %s still use%s it." % (
+                             k["name"], ", ".join(users), "s" if len(users) == 1 else ""))
+        else:
+            notes.append("%s in your user environment still points at the hub (%s)."
+                         % (k["name"], k.get("error") or "left in place"))
+    for n in env.get("session") or []:
+        notes.append("%s points at the hub in the environment the hub was started from "
+                     "(not your saved user environment); it goes away when that terminal "
+                     "is closed and the hub is restarted from a new one." % n)
+    if not notes:
+        return []
+    if (env.get("kept") or env.get("session")) and _cli_config_wired(entry):
+        effect = _ENV_EFFECT.get(entry.get("id"))
+        if effect:
+            notes.append(effect[0].upper() + effect[1:] + ".")
+    notes.append(_ENV_TERMINAL_NOTE)
+    return notes
+
+
+@app.route("/api/env/hub-vars", methods=["GET"])
+def api_env_hub_vars():
+    """Every environment variable that points at this hub, with the tools each
+    one reaches. `managed` says whether the hub can remove persistent ones here
+    (Windows user environment)."""
+    return jsonify({"managed": userenv.available(), "vars": _env_hub_var_rows(),
+                    "terminal_note": _ENV_TERMINAL_NOTE})
+
+
+@app.route("/api/env/remove", methods=["POST"])
+def api_env_remove():
+    """Remove ONE hub-pointing var from the user's persistent environment, on an
+    explicit request. Without `confirm: true` nothing is removed: the reply is
+    the preview -- the tools the var reaches -- for the user to confirm. Refuses
+    any var whose value does not point at this hub, and protected names."""
+    body = request.get_json(force=True, silent=True) or {}
+    name = str(body.get("name") or "").strip()
+    if not userenv.valid_name(name) or userenv.is_protected(name):
+        return jsonify({"ok": False, "error": "not a removable environment variable name"}), 400
+    if not userenv.available():
+        return jsonify({"ok": False,
+                        "error": ("the hub can only edit the persistent user environment on "
+                                  "Windows; remove %s from your shell profile instead" % name),
+                        "commands": {"windows": 'reg delete "HKCU\\Environment" /F /V %s' % name,
+                                     "unix": "unset %s" % name}}), 400
+    value = userenv.get(name)
+    if value is None:
+        return jsonify({"ok": False,
+                        "error": "%s is not set in your user environment" % name}), 404
+    if not _points_at_hub(value):
+        # Never touch a var the hub did not point here: it is someone else's.
+        return jsonify({"ok": False,
+                        "error": ("%s does not point at this hub, so the hub will not "
+                                  "remove it" % name)}), 409
+    affects = _env_affects(name)
+    out = {"name": name, "affects": affects, "terminal_note": _ENV_TERMINAL_NOTE}
+    if not body.get("confirm"):
+        out.update({"ok": True, "dry_run": True, "removed": False})
+        return jsonify(out)
+    removed = _env_remove_persistent(name)
+    out.update({"ok": removed, "removed": removed})
+    if removed:
+        out["note"] = "Removed %s from your user environment. %s" % (name, _ENV_TERMINAL_NOTE)
+    else:
+        out["error"] = "could not remove %s from your user environment" % name
+    return jsonify(out)
+
+
+def _env_unset_commands(entry, names=None):
+    """Copy-paste commands to REMOVE the hub env vars a manual CLI would use
+    (or exactly `names`). Names only — never a value, so no secret can leak."""
+    if names:
+        names = [n for n in names if userenv.valid_name(n)]
+    elif entry.get("kind") == "anthropic":
         names = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"]
     else:
         names = ["OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL"]
@@ -21280,6 +21628,20 @@ def api_cli_disconnect(cid):
                 "note": (entry.get("manual_note")
                          or "This CLI isn't wired through environment variables; nothing to unset."),
             })
+        # An env-only CLI (cursor-agent, ...): the persistent var IS its wiring.
+        # Release it like any other Disconnect -- removed only when no other
+        # still-connected tool relies on it.
+        env = _env_release_on_disconnect(entry)
+        if env["removed"] or env["kept"]:
+            env_notes = _env_disconnect_notes(entry, env)
+            row = _cli_row(entry)
+            out = {"ok": True, "connected": bool(row.get("connected")), "env": env,
+                   "env_note": " ".join(env_notes), "note": " ".join(env_notes)}
+            if row.get("connected"):
+                out.update({"still_connected": True,
+                            "still_connected_via": row.get("connect_method"),
+                            "still_connected_detail": row.get("detail")})
+            return jsonify(out)
         return jsonify({
             "ok": False, "manual": True,
             "note": ("This CLI was configured manually; remove the hub env vars/config "
@@ -21291,14 +21653,16 @@ def api_cli_disconnect(cid):
     except OSError as exc:
         return jsonify({"ok": False, "reason": _sanitize("could not restore config: %s" % exc)})
     _mark_hub_mode_unmanaged()
+    # Shared env vars this CLI reads: removed from the persistent user
+    # environment only when no OTHER still-connected tool relies on them,
+    # otherwise left in place and named (see _env_release_on_disconnect).
+    env = _env_release_on_disconnect(entry)
     # VERIFY THE REVERT. Recompute freshly from disk/env so 'connected' reflects
     # reality, and if the CLI is STILL wired to the hub, say so instead of
     # reporting a clean success. This is the honest answer to "I clicked
-    # Disconnect, it said done, but the CLI is still connected": the config
-    # revert worked, but a hub-pointing env var (OPENAI_BASE_URL / ANTHROPIC_
-    # BASE_URL, often left over from an older manual setup) still overrides it,
-    # and we do NOT silently unset a user's environment. Hand back the exact
-    # commands instead so the popup can show them.
+    # Disconnect, it said done, but the CLI is still connected". A shared var
+    # alone no longer makes a config-wired CLI "connected" (its own config is
+    # the connection); it is reported under `env` with the tools sharing it.
     row = _cli_row(entry)
     connected = bool(row.get("connected"))
     out = {
@@ -21327,6 +21691,18 @@ def api_cli_disconnect(cid):
         notes.append("The hub's MCP tool server (crew tools) stays registered in %s; "
                      "remove it under Hub controls > MCP servers if you do not want it."
                      % _short(mcp_path))
+    env_notes = _env_disconnect_notes(entry, env)
+    if env_notes:
+        effect = _ENV_EFFECT.get(entry["id"])
+        if effect and (env["kept"] or env["session"]) and _cli_config_wired(entry):
+            env["effect"] = effect[0].upper() + effect[1:] + "."
+        out["env"] = env
+        out["env_note"] = " ".join(env_notes)
+        notes.extend(env_notes)
+        if env["session"] or (env["kept"] and not userenv.available()):
+            # Nothing the hub can remove itself -- hand back the commands.
+            out["commands"] = _env_unset_commands(
+                entry, env["session"] + [k["name"] for k in env["kept"]])
     if notes:
         out["note"] = " ".join(notes)
     if connected:
@@ -21335,12 +21711,16 @@ def api_cli_disconnect(cid):
         out["still_connected_via"] = method
         out["still_connected_detail"] = row.get("detail")
         if method == "env":
-            out["note"] = (
-                "Config reverted, but %s is STILL pointed at the hub by an environment "
-                "variable (%s). Environment variables override the config file, so run "
-                "the commands below to finish disconnecting, then open a NEW terminal."
-                % (entry.get("name", entry["id"]), row.get("detail") or "an env var"))
-            out["commands"] = _env_unset_commands(entry)
+            # Only an env-only CLI (aider, llm, ...) can still be connected by a
+            # var: it has no other wiring, and the var was kept because another
+            # connected tool relies on it.
+            out["note"] = " ".join(
+                ["%s's config was reverted, but it still reaches the hub through an "
+                 "environment variable (%s)." % (entry.get("name", entry["id"]),
+                                                 row.get("detail") or "an env var")]
+                + env_notes)
+            if not out.get("commands") and not env["kept"]:
+                out["commands"] = _env_unset_commands(entry)
         else:
             out["note"] = (
                 "Config reverted, but %s still reports as connected (%s). Nothing else "
@@ -21387,6 +21767,12 @@ def api_cli_instructions(cid):
     }
     if env_based:
         out["commands"] = _env_commands(env)
+        # These `setx` lines are the ONLY way a hub URL ever lands in the
+        # persistent environment: record this CLI as relying on each base-URL
+        # var, so a later Disconnect of ANOTHER tool does not remove it.
+        for name, val in env.items():
+            if _points_at_hub(val):
+                _env_record_owner(name, entry["id"])
     return jsonify(out)
 
 

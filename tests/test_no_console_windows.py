@@ -30,6 +30,7 @@ SOURCES = {
     "app.py": open("app.py", encoding="utf-8").read(),
     "agentic_chat.py": open("agentic_chat.py", encoding="utf-8").read(),
     "workspace.py": open("workspace.py", encoding="utf-8").read(),
+    "userenv.py": open("userenv.py", encoding="utf-8").read(),
 }
 
 
@@ -117,6 +118,15 @@ def test_the_agent_turn_launcher_is_covered():
     body = src[src.index("def _tree_popen_kwargs("):]
     body = body[:body.index("\ndef ")]
     assert "CREATE_NEW_PROCESS_GROUP | _NO_WINDOW" in body
+
+
+def test_the_user_env_layer_spawns_no_process():
+    """Removing a var from HKCU\\Environment goes through winreg + one ctypes
+    broadcast -- not `reg delete` / `setx` in a child process, which would
+    flash a console on every Disconnect."""
+    src = SOURCES["userenv.py"]
+    for launcher in ("subprocess", "os.system", "os.popen", "os.startfile"):
+        assert launcher not in src, launcher
 
 
 def test_the_preview_server_is_covered():
