@@ -698,7 +698,14 @@ Covered by `tests/test_tool_turn_timeouts.py`. Live on 7cb23ff: Claude Code
   `messages`, after the question. `_anthropic_to_openai_messages` folds it
   into the leading system message; it used to become the LAST USER message,
   so the pipeline fast path, the difficulty classifier and upstream models
-  read the environment instead of the question.
+  read the environment instead of the question. (That shape appears when the
+  model id is unrecognised; with the hub's picker settings the block sits in
+  `system`.)
+- **Fast path on an opening turn**: `_swarm_fast_path`'s 12K "small
+  conversation" gate now applies only once the conversation has an answer in
+  it (`_has_prior_turns`). Claude Code's opening turn with the hub's settings
+  is ~13.5K tokens of system prompt + CLAUDE.md reminders, which sent
+  "What is N plus 1?" on `multi`/`coding-swarm` to the fan-out every time.
 - **Fan-out settles on text** (`_swarm_tool_result`): a member's CHECKED text
   answer (`_text_final`: answer_gate "ok", not refusal/announcement/typed
   call) starts the same `_SWARM_STRAGGLER_GRACE` a tool call does; once more
