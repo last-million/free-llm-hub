@@ -255,6 +255,30 @@ def test_a_body_without_in_messages_system_is_unchanged():
         {"role": "assistant", "content": "yo"}, {"role": "user", "content": "again"}]
 
 
+BIG_SYSTEM = "You are Claude Code. " + ("Follow the tool rules carefully. " * 2400)
+
+
+def test_a_big_cli_system_prompt_does_not_block_an_opening_trivial_ask():
+    """MEASURED live on the merged fix: with the hub's own Claude Code settings
+    the opening turn has NO in-messages system block, but it estimates 13.5K
+    tokens (system ~6.8K + CLAUDE.md reminders) -- over the 12K "small
+    conversation" gate, so `multi` still fanned "What is N plus 1?" out. An
+    opening turn has no conversation to be big."""
+    msgs = [{"role": "system", "content": BIG_SYSTEM},
+            {"role": "user", "content": "What is 5555 plus 1? Reply with only the number."}]
+    assert A._est_tokens(msgs) >= A.STREAM_BIG_REQUEST_TOKENS
+    assert A._swarm_fast_path({"tools": TOOLS}, msgs) is True
+
+
+def test_a_big_conversation_still_keeps_the_pipeline_for_a_short_follow_up():
+    msgs = [{"role": "system", "content": BIG_SYSTEM},
+            {"role": "user", "content": "Refactor the parser."},
+            {"role": "assistant", "content": "Done: parser split into two modules."},
+            {"role": "user", "content": "What is 5555 plus 1?"}]
+    assert A._est_tokens(msgs) >= A.STREAM_BIG_REQUEST_TOKENS
+    assert A._swarm_fast_path({"tools": TOOLS}, msgs) is False
+
+
 def test_claude_code_multi_trivial_ask_takes_the_fast_path(monkeypatch):
     """End to end through /v1/messages: no fan-out, one strong model."""
     for name in ("_record_chat_usage", "_record_outcome", "_save_perf_stats",

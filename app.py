@@ -29008,6 +29008,16 @@ def _is_trivial_ask(messages, max_tokens=None):
         return False
 
 
+def _has_prior_turns(messages):
+    """True once the conversation has an answer in it (an assistant or tool
+    message) -- i.e. it is not an opening turn. Never raises."""
+    try:
+        return any(isinstance(m, dict) and m.get("role") in ("assistant", "tool")
+                   for m in messages or ())
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
 def _swarm_fast_path(body, messages, tools=None, max_tokens=None):
     """True when a pipeline id (swarm / crew* / multi / a "<category>-swarm"
     compound) should answer with ONE strong model instead: a TRIVIAL ask
@@ -29024,7 +29034,15 @@ def _swarm_fast_path(body, messages, tools=None, max_tokens=None):
         tools = tools if tools is not None else body.get("tools")
         if max_tokens is None:
             max_tokens = body.get("max_tokens") or body.get("max_output_tokens")
-        if tools and _est_tokens(messages) >= STREAM_BIG_REQUEST_TOKENS:
+        # "The conversation itself is small" -- a size test on a CONVERSATION.
+        # An OPENING turn (system + user messages, nothing answered yet) has
+        # none: its size is the CLI's own system prompt and wrapper blocks.
+        # MEASURED 2026-09-27, Claude Code with the hub's settings: the
+        # opening turn of `-p "What is N plus 1?" --model multi` estimates
+        # 13.5K tokens (system ~6.8K + CLAUDE.md reminders), so this gate
+        # sent the one-liner to the five-model fan-out every time.
+        if (tools and _has_prior_turns(messages)
+                and _est_tokens(messages) >= STREAM_BIG_REQUEST_TOKENS):
             return False
         return _is_trivial_ask(messages, max_tokens)
     except Exception:                                            # noqa: BLE001
