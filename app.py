@@ -25825,7 +25825,7 @@ def _judge_peeked(chunks, check=None, raw_items=None, prompt=None, complete=True
         if check and check.get("tools_offered") and _no_tools_claim(
                 text, tools_offered=True,
                 prompt=prompt if prompt is not None else check.get("last_prompt"),
-                used_tools=bool(check.get("used_tools"))):
+                used_tools=bool(check.get("used_tools")), complete=complete):
             _set_nonanswer_kind("no_tools_claim")
             return "nonanswer"
         if (_looks_like_text_tool_call(text)
@@ -25964,6 +25964,13 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
     used when the worker FINISHED (status set) so there's never concurrent iteration."""
     box = {"buf": [], "status": None, "kind": None}
     prompt = _request_prompt_text()   # the worker has no request context
+    started = time.monotonic()
+    # A tools turn where "I don't have tools" would be a non-answer: the peek
+    # reads on past its usual verdict point for that claim alone (below).
+    watch = bool(check and check.get("tools_offered") and _no_tools_watch(
+        tools_offered=True,
+        prompt=prompt if prompt is not None else check.get("last_prompt"),
+        used_tools=bool(check.get("used_tools"))))
 
     def _judge(seen, complete=True):
         verdict = _judge_peeked(seen, check, box["buf"], prompt=prompt,
@@ -25971,10 +25978,19 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
         box["kind"] = _take_nonanswer_kind()
         return verdict
 
+    def _read_on_end(seen):
+        """Verdict for a stream that ENDED while the peek read on for a
+        no-tools claim: everything else was judged "content" already."""
+        if _looks_like_no_tools_claim(_peeked_text("".join(seen))):
+            box["kind"] = "no_tools_claim"
+            return "nonanswer"
+        return "content"
+
     def _worker():
         buf = box["buf"]
         saw_reasoning = False
         seen_content = []
+        read_on_at, read_on_budget = None, 0.0
         try:
             for _ in range(max_lines):
                 item = next(iterator)
@@ -26034,8 +26050,32 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                     box["saw_content"] = True
                     if sum(len(x) for x in seen_content) < _PEEK_JUDGE_CHARS:
                         continue
-                    box["status"] = _judge(seen_content, complete=False)
-                    return
+                    if read_on_at is None:
+                        verdict = _judge(seen_content, complete=False)
+                        if verdict != "content" or not watch:
+                            box["status"] = verdict
+                            return
+                        # MEASURED 2026-09-27: _PEEK_JUDGE_CHARS counts frame
+                        # BYTES, so on per-token frames the verdict above saw
+                        # ~4 tokens ("I'm here to help, but I") and "I
+                        # currently don't have the tools" came after it. Read
+                        # on for that claim alone, while it is still possible
+                        # (_no_tools_peek_state), within _NO_TOOLS_PEEK_EXTRA_S
+                        # and never past what the peek itself may wait.
+                        read_on_at = time.monotonic()
+                        read_on_budget = max(0.0, min(
+                            _NO_TOOLS_PEEK_EXTRA_S,
+                            deadline_s + (content_grace or 0.0)
+                            - (read_on_at - started) - 0.5))
+                    state = _no_tools_peek_state(_peeked_text("".join(seen_content)))
+                    if state == "claim":
+                        box["kind"] = "no_tools_claim"
+                        box["status"] = "nonanswer"
+                        return
+                    if state == "clear" or time.monotonic() - read_on_at >= read_on_budget:
+                        box["status"] = "content"
+                        return
+                    continue
                 # An error INSIDE a 200 stream (403/429/quota reported as an SSE
                 # error frame instead of an HTTP status) — the single most common
                 # way a provider dead-ends a turn. Report it so the caller drops
@@ -26053,7 +26093,8 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                     # every iter_lines stream -- each line on the /v1/responses
                     # and /v1/messages paths -- and many iter_content ones):
                     # the trivial answers this chain most needs to keep.
-                    box["status"] = (_judge(seen_content) if seen_content
+                    box["status"] = (_read_on_end(seen_content) if read_on_at is not None
+                                     else _judge(seen_content) if seen_content
                                      else _nameless_verdict(buf, check)
                                      if box.get("nameless_tool")
                                      else _empty_or_starved(buf, check))
@@ -26064,7 +26105,9 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
             # stream if we saw the model THINKING (reasoning deltas) — otherwise it
             # was 400 lines of keepalives/role deltas and committing it hands the
             # CLI a stream that never answers.
-            if seen_content:
+            if read_on_at is not None:
+                box["status"] = "content"     # judged already; no claim seen
+            elif seen_content:
                 box["status"] = _judge(seen_content, complete=False)
             else:
                 # A long nameless tool stream: commit only when its arguments
@@ -26080,7 +26123,8 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
             # The stream ENDED inside the peek window, so everything the model
             # was ever going to say is in hand -- the best possible moment to
             # judge it, and the shape a dead turn usually has.
-            box["status"] = (_judge(seen_content) if seen_content
+            box["status"] = (_read_on_end(seen_content) if read_on_at is not None
+                             else _judge(seen_content) if seen_content
                              else _nameless_verdict(buf, check)
                              if box.get("nameless_tool")
                              else _empty_or_starved(buf, check))
@@ -26596,10 +26640,34 @@ def _looks_like_refusal(text):
 #     a short "Sorry."; within _NO_TOOLS_CLAIM_AT chars, no code before it)
 #     and name TOOLS, FUNCTIONS, FILES, a file
 #     system, commands or the user's machine -- in plural/generic form: "I
-#     can't call the function `foo` directly" is about code, and passes.
+#     can't call the function `foo` directly" is about code, and passes;
+#   * ...or, in a SHORT COMPLETE reply (< _NO_TOOLS_SHORT_REPLY chars), sit in
+#     its first _NO_TOOLS_SHORT_SENTENCES sentences with only PREAMBLE before
+#     it (_NT_PREAMBLE_RE: greetings, "I'm here to help", "I'd be happy to
+#     help", "I understand you want...", "To do that I would need..."). A
+#     sentence that already answers ("Here is the answer: 4.") ends the
+#     search: a short answer that did the work and then names a limitation
+#     is served.
+# MEASURED 2026-09-27 (live /v1/responses, coding tier, plain tools): "I'm here
+# to help, but I currently don't have the tools..." was SERVED -- the adverb
+# before "don't" defeated the regex, and the stream peek judged the reply on
+# its first ~4 per-token frames (_PEEK_JUDGE_CHARS counts frame BYTES), long
+# before the claim arrived. The peek now reads on for the claim alone
+# (_no_tools_peek_state), bounded by _NO_TOOLS_PEEK_EXTRA_S.
 # A hit is a non-answer (next hop) and a quality failure for the pair, never
 # a dead-mark (_note_nonanswer, kind "no_tools_claim").
 _NO_TOOLS_CLAIM_AT = 160
+_NO_TOOLS_SHORT_REPLY = 600
+_NO_TOOLS_SHORT_SENTENCES = 3
+_NO_TOOLS_SHORT_AT = 320
+# Seconds the stream peek may read past its usual verdict point, only to see
+# whether a no-tools claim follows (see _no_tools_peek_state).
+_NO_TOOLS_PEEK_EXTRA_S = 4.0
+# "I currently don't have", "I, unfortunately, cannot", "I'm currently unable".
+_NT_ADV0 = (r"(?:(?:currently|actually|unfortunately|really|still|simply|just|presently"
+            r"|also|sadly|genuinely|honestly|at\s+the\s+moment|right\s+now)\s*,?\s+)?")
+_NT_I = (r"i(?:\s*,?\s+(?:currently|actually|unfortunately|really|still|simply|just"
+         r"|presently|also|sadly|genuinely|honestly)\s*,?)?\s*")
 _NT_DET = (r"(?:(?:any|the|your|my|external|local|real|direct|such|these|those|a|an|"
            r"specific|additional|built[\s-]?in|real[\s-]?time)\s+)*")
 _NT_OBJ = (r"(?:tools|tool[\s-]?(?:calls?|calling|use|access)|functions"
@@ -26611,13 +26679,14 @@ _NT_VERB = (r"(?:use|call|invoke|access|execute|run|read|open|browse|interact\s+
             r"|perform|modify|edit|write\s+to|see|view|list)\w*"
             # "access or modify", "execute code or access", "read, write"
             r"(?:(?:\s+\w+)?\s*(?:,|/|\bor\b|\band\b)\s*(?:\w+\s+)?\w+){0,3}")
-_NT_HAVE = (r"i\s*(?:(?:do\s+not|don['’]?t)\s+(?:currently\s+|actually\s+)?have"
-            r"|have\s+no|lack)\s+")
+_NT_HAVE = (_NT_I + r"(?:(?:do\s+not|don['’]?t)\s+(?:currently\s+|actually\s+|really\s+)?have"
+            r"|have\s+no|(?:currently\s+)?lack)\s+")
 _NO_TOOLS_CLAIM_RE = re.compile(
     r"\b(?:"
     # I can't / cannot / am unable to  <verb> ... <object>
-    r"i\s*(?:can\s*not|can['’]?t|cannot|am\s+(?:not\s+able|unable|not\s+capable)"
-    r"|['’]m\s+(?:not\s+able|unable|not\s+capable))\s+(?:to\s+|of\s+)?"
+    + _NT_I + r"(?:can\s*not|can['’]?t|cannot|am\s+" + _NT_ADV0
+    + r"(?:not\s+able|unable|not\s+capable)"
+    r"|['’]m\s+" + _NT_ADV0 + r"(?:not\s+able|unable|not\s+capable))\s+(?:to\s+|of\s+)?"
     + _NT_ADV + _NT_VERB + r"\s+" + _NT_DET + _NT_OBJ +
     # I don't have the ability / capability to <verb> ... <object>
     r"|" + _NT_HAVE + r"(?:the\s+|any\s+)?(?:ability|capability|capacity|means|way)\s+"
@@ -26656,15 +26725,57 @@ _NT_FILLER_RE = re.compile(
     r"\W*(?:i\s*['’]?m\s+sorry|sorry|i\s+apologi[sz]e|apologies|unfortunately|hello|hi|hey"
     r"|thanks|thank\s+you|sure|of\s+course|certainly|understood|okay|ok|note|hmm|well"
     r"|i\s+understand|i\s+see)\b", re.I)
+# A sentence that only leads up to the claim: a greeting, an offer to help,
+# the ask restated, or what the work "would need". Anchored at the sentence
+# start; a sentence that already carries an answer never matches.
+_NT_INTERJ = (r"(?:i\s*['’]?m\s+sorry|sorry|i\s+apologi[sz]e|apologies|unfortunately"
+              r"|hello(?:\s+there)?|hi(?:\s+there)?|hey|thanks|thank\s+you|sure|of\s+course"
+              r"|certainly|absolutely|understood|okay|ok|alright|got\s+it|no\s+problem"
+              r"|great\s+question|good\s+question|hmm|well|yes)")
+_NT_PREAMBLE_RE = re.compile(
+    r"\W*(?:" + _NT_INTERJ + r"\W*$|(?:" + _NT_INTERJ + r"\W+)?(?:"
+    r"i\s*(?:['’]m|\s+am)\s+(?:here|happy|glad|ready|more\s+than\s+happy)\s+to\s+(?:help|assist)"
+    r"|i\s*(?:['’]d|\s+would)\s+(?:be\s+)?(?:happy|glad|love)\s+to\s+(?:help|assist)"
+    r"|(?:i\s+)?(?:can|could|will|['’]ll|want\s+to|would\s+like\s+to)\s+(?:help|assist)\b"
+    r"|(?:happy|glad)\s+to\s+(?:help|assist)"
+    r"|thanks\s+for|thank\s+you\s+for|i\s+appreciate"
+    r"|i\s+(?:understand|see)\b|it\s+(?:sounds|seems|looks)\s+like\s+you"
+    r"|you['’]?(?:re|\s+are)\s+(?:asking|trying|looking|wanting)|you\s+(?:want|need|would\s+like"
+    r"|['’]d\s+like)"
+    r"|(?:in\s+order\s+)?to\s+(?:do\s+)?(?:this|that|so)\b|to\s+\w+\s+(?:the|your|this|that|these"
+    r"|those|a|an)\b[^.!?]{0,80}?,\s*i\s+(?:would|will|['’]d|['’]ll)\s+need"
+    r"|i\s+(?:would|will|['’]d|['’]ll)\s+need\s+to|(?:this|that|it)\s+(?:would\s+)?requires?\b"
+    r"))", re.I)
+# One sentence: ends at . ! ? followed by whitespace / the end, or a newline
+# ("config.py" and "e.g" stay inside their sentence).
+_NT_SENTENCE_RE = re.compile(r"(?:[^.!?\n]|[.!?]+(?=[^\s.!?]))*(?:[.!?]+(?=\s|$)|\n+|$)")
 
 
-def _looks_like_no_tools_claim(text):
+def _nt_sentences(text, limit):
+    """(start offset, sentence) for the first `limit` sentences of `text`."""
+    out = []
+    for m in _NT_SENTENCE_RE.finditer(text):
+        s = m.group(0)
+        if s.strip():
+            out.append((m.start() + len(s) - len(s.lstrip()), s.strip()))
+            if len(out) >= limit:
+                break
+        if m.end() >= len(text):
+            break
+    return out
+
+
+def _looks_like_no_tools_claim(text, complete=True):
     """True when `text` OPENS by claiming the model has no tools / cannot call
-    functions / cannot access files. Text only: _no_tools_claim applies the
-    turn's context."""
+    functions / cannot access files -- or, when `text` is a SHORT COMPLETE
+    reply, makes that claim in its first few sentences with only preamble
+    before it. Text only: _no_tools_claim applies the turn's context.
+    `complete` False = a stream still arriving: its length is unknown, so
+    only the opening rule applies."""
     if not text or not isinstance(text, str):
         return False
-    head = text.strip()[:_NO_TOOLS_CLAIM_AT + 200]
+    body = text.strip()
+    head = body[:_NO_TOOLS_CLAIM_AT + 200]
     # The OPENING sentence ("Here is the answer: 4. I can't run tools to
     # verify it." answered first), or the second after a short "Sorry."/"Sure!".
     parts = re.split(r"(?<=[.!?])\s+", head, 2)
@@ -26672,9 +26783,55 @@ def _looks_like_no_tools_claim(text):
     if len(parts) > 1 and len(parts[0]) <= 60 and _NT_FILLER_RE.match(parts[0]):
         scope = parts[0] + " " + parts[1]
     m = _NO_TOOLS_CLAIM_RE.search(scope)
-    if not m or m.start() > _NO_TOOLS_CLAIM_AT:
+    if m and m.start() <= _NO_TOOLS_CLAIM_AT and "```" not in scope[:m.start()]:
+        return True
+    if not complete or len(body) >= _NO_TOOLS_SHORT_REPLY:
         return False
-    return "```" not in scope[:m.start()]
+    # A short reply: the claim in one of its first few sentences, every
+    # sentence before it preamble, no code before it.
+    for start, sent in _nt_sentences(body[:_NO_TOOLS_SHORT_AT + 200],
+                                     _NO_TOOLS_SHORT_SENTENCES):
+        m = _NO_TOOLS_CLAIM_RE.search(sent)
+        if m:
+            at = start + m.start()
+            return at <= _NO_TOOLS_SHORT_AT and "`" not in body[:at]
+        if len(sent) > 160 or "`" in sent or not _NT_PREAMBLE_RE.match(sent):
+            return False
+    return False
+
+
+def _no_tools_peek_state(text):
+    """For the stream peek, which reads on past its usual verdict point only
+    to see whether a no-tools claim follows: "claim" (the opening rule already
+    holds), "clear" (no claim is possible any more: the reply is past the
+    short-reply size, carries code, or its first few sentences are in and
+    none made one), or "open" (keep reading). Text only; the caller has
+    already decided the turn is one to watch."""
+    if not text:
+        return "open"
+    if _looks_like_no_tools_claim(text, complete=False):
+        return "claim"
+    body = text.strip()
+    if len(body) >= _NO_TOOLS_SHORT_REPLY:
+        return "clear"
+    # The same walk as _looks_like_no_tools_claim's short-reply loop, on a
+    # reply still arriving (the last sentence may be unfinished).
+    sents = _nt_sentences(body[:_NO_TOOLS_SHORT_AT + 200], _NO_TOOLS_SHORT_SENTENCES)
+    for st, s in sents:
+        m = _NO_TOOLS_CLAIM_RE.search(s)
+        if m:
+            at = st + m.start()
+            if at > _NO_TOOLS_SHORT_AT or "`" in body[:at]:
+                return "clear"
+            # The short-reply rule's claim: its verdict needs the reply's
+            # length -- read on until it ends or outgrows the short size.
+            return "open"
+        done = st + len(s) < len(body)
+        if "`" in s or len(s) > 160 or (done and not _NT_PREAMBLE_RE.match(s)):
+            return "clear"
+        if not done:
+            return "open"                 # this sentence is still arriving
+    return "clear" if len(sents) >= _NO_TOOLS_SHORT_SENTENCES else "open"
 
 
 def _turn_used_tools(turns):
@@ -26721,21 +26878,35 @@ def _request_used_tools():
         return False
 
 
-def _no_tools_claim(text, *, tools_offered, prompt=None, used_tools=False):
-    """The policy around _looks_like_no_tools_claim (see the note above).
-    `prompt` is the last user turn (wrappers are stripped here) or the
-    tool-results sentinel; `used_tools` whether tools already ran this turn.
-    The caller has already established that the reply made no tool call."""
+def _no_tools_watch(*, tools_offered, prompt=None, used_tools=False):
+    """True when this turn is one where a no-tools claim would be a non-answer:
+    tools offered, none ran yet this turn, and the user's own words neither
+    ask about tools nor rule them out."""
     try:
         if not tools_offered or used_tools or prompt == _TOOL_RESULT_TURN:
-            return False
-        if not _looks_like_no_tools_claim(text):
             return False
         if isinstance(prompt, str) and prompt:
             own = answer_check._instruction(prompt) or ""
             if _NO_TOOLS_ASKED_RE.search(own[:_PROMPT_CHECK_CAP]):
                 return False
         return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _no_tools_claim(text, *, tools_offered, prompt=None, used_tools=False, complete=True):
+    """The policy around _looks_like_no_tools_claim (see the note above).
+    `prompt` is the last user turn (wrappers are stripped here) or the
+    tool-results sentinel; `used_tools` whether tools already ran this turn;
+    `complete` False for a stream still arriving (opening rule only).
+    The caller has already established that the reply made no tool call."""
+    try:
+        if not tools_offered or used_tools or prompt == _TOOL_RESULT_TURN:
+            return False
+        if not _looks_like_no_tools_claim(text, complete=complete):
+            return False
+        return _no_tools_watch(tools_offered=tools_offered, prompt=prompt,
+                               used_tools=used_tools)
     except Exception:                                            # noqa: BLE001
         return False
 
@@ -26874,18 +27045,21 @@ def _chat_json_nonanswer(data, has_tools=False, tools=None):
         if isinstance(content, list):
             content = "".join((p.get("text") or "") for p in content
                               if isinstance(p, dict))
+        # "I don't have access to tools" on a turn that offered them: next hop,
+        # a quality failure, never a dead-mark (see _no_tools_claim). Judged
+        # BEFORE the announcement check: the live claim ended "...and I'll help
+        # you interpret it", which read as announced work and dead-marked the
+        # pair for 6 hours over one reply.
+        if has_tools and _no_tools_claim(content, tools_offered=True,
+                                         prompt=_request_prompt_text(),
+                                         used_tools=_request_used_tools()):
+            _set_nonanswer_kind("no_tools_claim")
+            return True
         if has_tools and (_looks_like_text_tool_call(content)
                           or tool_rescue.has_model_markup(content)
                           or _looks_like_announced_not_acted(content)
                           or tool_rescue.is_bare_tool_name(content, tools)
                           or _looks_like_dangling_lead_in(content)):
-            return True
-        # "I don't have access to tools" on a turn that offered them: next hop,
-        # a quality failure, never a dead-mark (see _no_tools_claim).
-        if has_tools and _no_tools_claim(content, tools_offered=True,
-                                         prompt=_request_prompt_text(),
-                                         used_tools=_request_used_tools()):
-            _set_nonanswer_kind("no_tools_claim")
             return True
         # A refusal counts with or without tools: it is no more useful in plain
         # chat, and the hub has other models that will answer.

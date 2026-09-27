@@ -244,13 +244,14 @@ def hub(monkeypatch, ledger):
     monkeypatch.setattr(A, "_resolve_model", lambda m: ("p1", "codestral"))
     monkeypatch.setattr(A, "_build_chain",
                         lambda *a, **k: [("p1", "codestral"), ("p2", "good-model")])
-    state = {"framed": False, "text": CLAIM, "calls": []}
+    state = {"framed": False, "text": CLAIM, "calls": [], "per_token": False}
 
     def dispatch(pid, payload, stream):
         state["calls"].append(pid)
         if pid == "p1":
             if stream:
-                units = _frames(state["text"])
+                units = (_token_frames(state["text"]) if state["per_token"]
+                         else _frames(state["text"]))
                 return _Resp(chunks=[u + b"\n\n" for u in units] if state["framed"] else units)
             return _Resp(payload=_chat(state["text"]))
         if stream:
@@ -349,6 +350,213 @@ def test_a_fan_out_member_claiming_no_tools_loses_its_slot():
     assert "a.txt" in data["choices"][0]["message"]["content"]
     assert ("p3", "c", False) in recorded
     assert not dead.called
+
+
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-09-27 (live /v1/responses, coding tier, plain tools): the claim
+# came AFTER a preamble ("I'm here to help, but I currently don't have the
+# t[ools]...") and was served. Two gaps: the adverb before "don't" defeated
+# the regex, and the stream peek judged on ~4 per-token frames (its budget is
+# frame BYTES), before the claim arrived. A SHORT complete reply now also
+# counts when the claim sits in its first few sentences behind preamble only.
+# --------------------------------------------------------------------------- #
+
+LIVE = ("I'm here to help, but I currently don't have the tools to execute code or "
+        "access your files directly. However, you can run the command yourself and "
+        "share the output with me, and I'll help you interpret it.")
+
+
+@pytest.mark.parametrize("text", [
+    LIVE,
+    "I'm here to help, but I currently don't have the ability to run functions.",
+    "I'm here to help, but I currently don't have the ability to execute functions "
+    "or access your files.",
+    "Hello! I'm here to help. Unfortunately, I currently don't have the ability to run "
+    "commands or access your files. Could you paste the output here?",
+    "I'd be happy to help with that! However, I currently don't have access to tools "
+    "that can read files on your machine. Please paste the file here.",
+    "Sure, I can help with that. I don't currently have the ability to execute "
+    "functions, but here's what you can do: run `ls -la` and share the result.",
+    "To list the files, I would need to run a command. Unfortunately, I don't have the "
+    "tools to do that in this chat.",
+    "I understand you want me to fix config.py. I currently lack the tools to edit "
+    "files directly, so here is the change to make by hand.",
+    "I, unfortunately, cannot access your file system.",
+    "I'm currently unable to run commands on your machine.",
+    "I actually can't access files on your computer.",
+])
+def test_the_live_claim_and_its_variants_are_recognised(text):
+    assert A._looks_like_no_tools_claim(text) is True
+    assert A._no_tools_claim(text, tools_offered=True, prompt=ASK) is True
+
+
+@pytest.mark.parametrize("text", [
+    # answered first, then named the limitation
+    "Here is the answer: 4. I can't run tools to verify it.",
+    "The bug is on line 12: `x = y` should be `x == y`. I can't run commands to test "
+    "it, though.",
+    "Your function returns None because the loop never runs. I currently don't have "
+    "the tools to test it, so please run it.",
+    "Done - I renamed the helper. I can't run commands on your machine, so please run "
+    "the tests.",
+    # a LONG helpful answer: a limitation in its second sentence is not the reply
+    "I'd be happy to walk you through the migration. I can't run commands on your "
+    "machine, so here is every step. " + "First, back up the database with pg_dump, "
+    "then apply each migration in order and check the row counts after each one. " * 6,
+    # code before the claim
+    "`ls -la` lists them. I don't have the tools to run it here.",
+])
+def test_legit_short_and_long_answers_stay_answers(text):
+    assert A._looks_like_no_tools_claim(text) is False
+
+
+def test_the_short_reply_rule_needs_the_whole_reply():
+    """A stream still arriving has no known length: only the opening rule."""
+    text = ("Hello! I'm here to help. Unfortunately, I currently don't have the ability "
+            "to run commands.")
+    assert A._looks_like_no_tools_claim(text, complete=True) is True
+    assert A._looks_like_no_tools_claim(text, complete=False) is False
+    assert A._no_tools_peek_state(text) == "open"
+
+
+@pytest.mark.parametrize("text,state", [
+    ("I'm here to help, but I currently don't have the tools", "claim"),
+    ("Hello! I'm here to", "open"),
+    ("Hello! I'm here to help. Unfortunately, I currently don't have the tools", "open"),
+    ("The folder has three files. Here", "clear"),
+    ("```python\nprint(1)", "clear"),
+    ("Hi. Sure. I'm here to help. Then", "clear"),
+    ("x" * 700, "clear"),
+])
+def test_the_peek_reads_on_only_while_a_claim_is_possible(text, state):
+    assert A._no_tools_peek_state(text) == state
+
+
+@pytest.mark.parametrize("prompt,used,expected", [
+    (ASK, False, True),
+    (ASK, True, False),                        # tools already ran this turn
+    ("Do you have any tools?", False, False),   # the user asked about tools
+    ("Can you access my files?", False, False),
+])
+def test_the_live_claim_keeps_the_policy(prompt, used, expected):
+    assert A._no_tools_claim(LIVE, tools_offered=True, prompt=prompt,
+                             used_tools=used) is expected
+    assert A._no_tools_claim(LIVE, tools_offered=False, prompt=prompt) is False
+
+
+def _token_frames(text):
+    """One SSE frame per word, full-size chunk envelopes -- what codestral and
+    most providers really send. ~170 bytes each, so _PEEK_JUDGE_CHARS (600
+    bytes) is reached after ~4 words."""
+    import re as _re
+    out = []
+    for tok in _re.findall(r"\S+\s*", text):
+        out.append(("data: " + json.dumps({
+            "id": "chatcmpl-abc123", "object": "chat.completion.chunk",
+            "created": 1727400000, "model": "codestral-latest",
+            "choices": [{"index": 0, "delta": {"content": tok}, "finish_reason": None}]})
+        ).encode())
+    out.append(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}')
+    out.append(b"data: [DONE]")
+    return out
+
+
+def test_the_stream_peek_catches_the_live_claim_on_per_token_frames():
+    check = {"tools_offered": True, "tools": TOOLS, "last_prompt": ASK}
+    status, _buf = A._peek_until_content(iter(_token_frames(LIVE)), 5, check=check)
+    assert status == "nonanswer"
+    assert A._take_nonanswer_kind() == "no_tools_claim"
+
+
+def test_the_stream_peek_catches_a_short_reply_claim_after_preamble():
+    text = ("Hello! I'm here to help. Unfortunately, I currently don't have the ability "
+            "to run commands or access your files. Could you paste the output here?")
+    check = {"tools_offered": True, "tools": TOOLS, "last_prompt": ASK}
+    status, _buf = A._peek_until_content(iter(_token_frames(text)), 5, check=check)
+    assert status == "nonanswer"
+
+
+@pytest.mark.parametrize("text", [
+    "The folder has three files: a.txt, b.txt and notes.md. " * 12,
+    "I'd be happy to walk you through the migration. I can't run commands on your "
+    "machine, so here is every step. " + "First, back up the database with pg_dump, "
+    "then apply each migration in order and check the row counts. " * 8,
+])
+def test_the_stream_peek_commits_a_real_answer_without_reading_it_all(text):
+    check = {"tools_offered": True, "tools": TOOLS, "last_prompt": ASK}
+    frames = _token_frames(text)
+    status, buf = A._peek_until_content(iter(frames), 5, check=check)
+    assert status == "content"
+    assert len(buf) < len(frames) - 2          # committed mid-stream, not at the end
+
+
+def test_the_stream_peek_does_not_read_on_when_not_watching():
+    check = {"tools_offered": True, "tools": TOOLS, "last_prompt": ASK, "used_tools": True}
+    status, buf = A._peek_until_content(iter(_token_frames(LIVE)), 5, check=check)
+    assert status == "content" and len(buf) <= 5
+    status, buf = A._peek_until_content(iter(_token_frames(LIVE)), 5,
+                                        check={"tools_offered": False, "last_prompt": ASK})
+    assert status == "content" and len(buf) <= 5
+
+
+def test_the_read_on_is_bounded_in_time(monkeypatch):
+    monkeypatch.setattr(A, "_NO_TOOLS_PEEK_EXTRA_S", 0.0)
+    check = {"tools_offered": True, "tools": TOOLS, "last_prompt": ASK}
+    text = "Hello! I'm here to help. " + "Unfortunately, I don't have the tools to run it."
+    status, buf = A._peek_until_content(iter(_token_frames(text)), 5, check=check)
+    assert status == "content" and len(buf) <= 6
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_chat_completions_skips_the_live_claim(hub, ledger, stream):
+    hub.state.update(framed=True, text=LIVE, per_token=True)
+    r = hub.post("/v1/chat/completions", json={
+        "model": "auto", "stream": stream, "tools": TOOLS,
+        "messages": [{"role": "user", "content": ASK}]})
+    body = r.get_data(as_text=True)
+    assert "have the tools" not in body and "bash" in body
+    assert ("p1", "codestral", False) in ledger["outcome"]
+    assert ledger["dead"] == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_skips_the_live_claim(hub, ledger, stream):
+    hub.state.update(text=LIVE, per_token=True)
+    r = hub.post("/v1/responses", json={
+        "model": "auto", "stream": stream, "input": ASK,
+        "tools": [{"type": "function", "name": "bash",
+                   "parameters": TOOLS[0]["function"]["parameters"]}]})
+    body = r.get_data(as_text=True)
+    assert "have the tools" not in body and "function_call" in body
+    assert ("p1", "codestral", False) in ledger["outcome"]
+    assert ledger["dead"] == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_messages_skips_the_live_claim(hub, ledger, stream):
+    hub.state.update(text=LIVE, per_token=True)
+    r = hub.post("/v1/messages", json={
+        "model": "auto", "max_tokens": 256, "stream": stream,
+        "tools": [{"name": "bash", "input_schema": TOOLS[0]["function"]["parameters"]}],
+        "messages": [{"role": "user", "content": ASK}]})
+    body = r.get_data(as_text=True)
+    assert "have the tools" not in body and "tool_use" in body
+    assert ("p1", "codestral", False) in ledger["outcome"]
+    assert ledger["dead"] == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_long_real_answer_on_per_token_frames_is_served(hub, stream):
+    text = ("I'd be happy to walk you through the migration. I can't run commands on "
+            "your machine, so here is every step. " + "First, back up the database "
+            "with pg_dump, then apply each migration in order. " * 8)
+    hub.state.update(framed=True, text=text, per_token=True)
+    r = hub.post("/v1/chat/completions", json={
+        "model": "auto", "stream": stream, "tools": TOOLS,
+        "messages": [{"role": "user", "content": ASK}]})
+    body = r.get_data(as_text=True)
+    assert r.status_code == 200 and "pg_dump" in body and "bash" not in body
+    assert hub.state["calls"] == ["p1"]
 
 
 def test_a_user_asking_about_tools_gets_the_first_answer(hub):

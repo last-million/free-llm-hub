@@ -368,6 +368,29 @@ def test_a_standing_rule_outlives_a_run_of_per_step_values():
     assert len(facts) <= ctxwin.EXACT_FACTS_MAX_USER
 
 
+@pytest.mark.parametrize("said", [
+    "My favourite colour is teal.",
+    "My favorite editor is helix.",
+    "My dog's name is Biscuit.",
+    "My email is dana at example dot org.",
+])
+def test_a_plain_personal_fact_is_kept(said):
+    """No digit, no "remember": "My favourite colour is teal." was dropped."""
+    facts = ctxwin.exact_facts([{"role": "user", "content": said + " Now read big1.txt."}])
+    assert 'user said: "%s"' % said in facts
+
+
+def test_a_favourite_outlives_a_run_of_per_step_values():
+    msgs = [{"role": "user", "content": "My favourite colour is teal."}]
+    msgs += [{"role": "user", "content": "Set the retry count to %d." % i} for i in range(60)]
+    assert 'user said: "My favourite colour is teal."' in ctxwin.exact_facts(msgs)
+
+
+@pytest.mark.parametrize("said", ["My code is broken", "Fix my tests please"])
+def test_ordinary_sentences_about_my_things_are_not_facts(said):
+    assert ctxwin.exact_facts([{"role": "user", "content": said}]) == []
+
+
 def test_a_cli_summary_is_not_mined_but_its_exact_block_is_carried():
     """After codex's own compaction the history holds its SUMMARY (a paraphrase)
     -- which may contain the hub's block from the previous compaction."""
