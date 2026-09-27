@@ -590,6 +590,15 @@ def _learn_ctx_from_catalog(payload_pid, payload):
                 continue
             # The same row may say the model REASONS (see _catalog_row_thinks).
             _learn_thinking_from_row(payload_pid, it)
+            # ...or name the REAL model behind a marketing id: pollinations'
+            # "openai-fast" row lists aliases ["openai", "gpt-oss",
+            # "gpt-oss-20b", ...] (MEASURED 2026-09-27). The window lookup
+            # tries those when the id itself is unknown (_ctx_alias_candidates).
+            al = it.get("aliases")
+            if isinstance(al, (list, tuple)):
+                names = tuple(a for a in al if isinstance(a, str) and a.strip())
+                if names and _CTX_ALIASES.get((payload_pid, mid)) != names:
+                    _CTX_ALIASES[(payload_pid, mid)] = names
             ctx = _catalog_row_ctx(it, extra)
             if ctx is None:
                 continue
@@ -8948,6 +8957,7 @@ def _model_ctx_info(pid, model):
 # through _set_learned_ctx exactly as before.
 # --------------------------------------------------------------------------- #
 _REF_CATALOG_CTX = {}          # identity -> window, OpenRouter's public catalog
+_CTX_ALIASES = {}              # (pid, model) -> aliases its own catalog row names
 _REF_CATALOG_AT = [0.0]        # when it was fetched (persisted with the state)
 _REF_CATALOG_TTL = 24 * 3600
 _CTX_INDEX_GEN = [0]
@@ -9071,6 +9081,34 @@ _CTX_NAMED_RE = re.compile(r"(?:^|-)(\d{1,4})k(?:-|$)")
 # early; a too-large one 400s), and hosts may serve less still: a real 400
 # teaches the real value. Families whose window I cannot source are left out.
 _CTX_REFERENCE = (
+    # Anthropic docs (context windows): Claude 3.x / 4.x serve 200K by default
+    # (1M is an opt-in beta on some). First, so relay spellings that wrap a
+    # Claude id ("gemini-claude-opus-4-6-thinking", "claude41opusthinking")
+    # never fall into another family's row.
+    (re.compile(r"claude"), 200000),
+    # OpenAI model docs: GPT-4o (and its audio/search previews) 128,000;
+    # GPT-4.1 family 1,047,576; gpt-5-chat 128,000; GPT-5 / 5.x 400,000 of
+    # which 128,000 is output -> 272,000 of input.
+    (re.compile(r"^gpt-4o"), 128000),
+    (re.compile(r"^gpt-4\.1"), 1047576),
+    (re.compile(r"^gpt-5(?:\.\d+)?-chat"), 128000),
+    (re.compile(r"^gpt-5(?:\.\d+)?(?:-|$)"), 272000),
+    # xAI docs: grok-4 256,000 (grok-4-fast states 2M; the family's smaller
+    # figure is kept); grok-3 / grok-3-mini 131,072.
+    (re.compile(r"^grok-4"), 256000),
+    (re.compile(r"^grok-3"), 131072),
+    # Mistral docs: mistral-tiny was the alias of open-mistral-7b (32K).
+    (re.compile(r"mistral-tiny"), 32768),
+    # NIM-hosted families with no catalog figure: 01.AI platform docs yi-large
+    # 32K; AI21 docs Jamba 1.5 256K; Databricks DBRX model card 32K;
+    # StarCoder2 model card 16,384; DeepSeek-Coder (v1) model card 16K,
+    # DeepSeek-Coder-V2 128K.
+    (re.compile(r"^yi-large"), 32768),
+    (re.compile(r"jamba-1\.5"), 262144),
+    (re.compile(r"^dbrx"), 32768),
+    (re.compile(r"starcoder2"), 16384),
+    (re.compile(r"deepseek-coder-v2"), 131072),
+    (re.compile(r"deepseek-coder-\d"), 16384),
     # Google AI docs, model pages: Gemini 2.x/3.x input limit 1,048,576.
     (re.compile(r"^gemini-(?:[2-9]|flash|pro)"), 1048576),
     # Gemma 3 model card: 128K (4B/12B/27B), 32K for 1B; Gemma 3n: 32K.
@@ -9164,19 +9202,101 @@ def _reference_ctx(model):
     return None
 
 
+# Relay / vendor spellings of a model another catalog names canonically, as
+# (pattern, replacement) applied IN ORDER to the normalized identity. Each
+# only re-spells the id -- the window itself still comes from a catalog for
+# those weights (inferred) or the documented table, never from here. Seen on
+# the live fleet 2026-09-27 as "default":
+#   morph:    morph-kimik3, morph-glm53-744b, morph-glm53flash, morph-dsv4flash
+#   g4f:      zai-org-glm-4.6, zai-org-glm-5-3-flash, gpt-5-2, kimi-k3-base,
+#             claude41opusthinking, gemini-claude-opus-4-6-thinking
+_CTX_ID_REWRITES = (
+    (re.compile(r"^morph-kimik(\d+)(?:-fast)?$"), r"kimi-k\1"),
+    (re.compile(r"^morph-glm(\d)(\d)-\d+b$"), r"glm-\1.\2"),
+    (re.compile(r"^morph-glm(\d)(\d)flash$"), r"glm-\1.\2-flash"),
+    (re.compile(r"^morph-dsv(\d+)flash(?:-\d{4})?$"), r"deepseek-v\1-flash"),
+    (re.compile(r"^zai-org-"), ""),
+    (re.compile(r"^(glm-\d+)-(\d)(?=-|$)"), r"\1.\2"),
+    (re.compile(r"^(gpt-\d+)-(\d)$"), r"\1.\2"),
+    (re.compile(r"-base$"), ""),
+    (re.compile(r"^claude(\d)(\d)(opus|sonnet|haiku)(?:thinking)?$"), r"claude-\3-\1.\2"),
+    (re.compile(r"^gemini-(claude-.*?)(?:-thinking)?$"), r"\1"),
+    (re.compile(r"^(claude-[a-z]+-\d+)-(\d)(?=-|$)"), r"\1.\2"),
+)
+# An Ollama tag carrying the size: 'srv_x:gemma4:31b' normalizes to the bare
+# identity "gemma4" (the tag is stripped), so the size is read off the raw id.
+_CTX_OLLAMA_SIZED_RE = re.compile(r"(?:^|[:/])([a-z]+)(\d+(?:\.\d+)?):(\d+(?:\.\d+)?b)\b")
+_CTX_RESPELL_CACHE = {}
+
+
+def _ctx_alias_candidates(pid, model):
+    """Other spellings of `model` to look its window up under: the aliases its
+    own catalog row names (most specific first), then the re-spelled identity
+    (_CTX_ID_REWRITES), then an Ollama-tagged size ('gemma4:31b' ->
+    'gemma-4-31b-it'). Never the identity itself; generic ids never."""
+    out = []
+    try:
+        ident = _ctx_ident(model)
+        names = _CTX_ALIASES.get((pid, model)) or ()
+        for a in sorted(names, key=lambda a: (not re.search(r"\d", a), -len(a))):
+            out.append(a)
+        spelled = _CTX_RESPELL_CACHE.get(model or "")
+        if spelled is None:
+            spelled = []
+            s = ident or ""
+            for rx, repl in _CTX_ID_REWRITES:
+                s = rx.sub(repl, s)
+            if s and s != ident:
+                spelled.append(s)
+            m = _CTX_OLLAMA_SIZED_RE.search((model or "").strip().lower())
+            if m:
+                spelled.append("%s-%s-%s-it" % m.groups())
+            if len(_CTX_RESPELL_CACHE) > 20000:
+                _CTX_RESPELL_CACHE.clear()
+            _CTX_RESPELL_CACHE[model or ""] = spelled = tuple(spelled)
+        out.extend(spelled)
+        seen, keep = {ident}, []
+        for a in out:
+            ai = _ctx_ident(a)
+            if ai and ai not in seen and len(ai) >= 3 and ai not in _CTX_GENERIC_IDENTS:
+                seen.add(ai)
+                keep.append(a)
+        return keep
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def _inferred_ctx_for(pid, model):
+    """_inferred_ctx for the model, else for its first alias a catalog knows."""
+    w = _inferred_ctx(model)
+    if w:
+        return w
+    for a in _ctx_alias_candidates(pid, model):
+        w = _inferred_ctx(a)
+        if w:
+            return w
+    return None
+
+
 def _window_info(pid, model):
     """(window or None, source) for ONE model, WITHOUT the provider row:
     source is "learned" | "catalog" | "inferred" | "reference" | "default".
-    What the dashboard shows and what the declared windows are built from."""
+    What the dashboard shows and what the declared windows are built from.
+    Aliases (_ctx_alias_candidates) are tried after the id itself, inferred
+    before reference, so a catalog fact always beats a family figure."""
     lim = _ctx_limit(pid, model)
     if lim:
         return lim, ("learned" if (pid, model) in _MODEL_LEARNED_AT else "catalog")
-    w = _inferred_ctx(model)
+    w = _inferred_ctx_for(pid, model)
     if w:
         return w, "inferred"
     w = _reference_ctx(model)
     if w:
         return w, "reference"
+    for a in _ctx_alias_candidates(pid, model):
+        w = _reference_ctx(a)
+        if w:
+            return w, "reference"
     return None, "default"
 
 
@@ -11463,7 +11583,7 @@ def _context_ok(pid, model, est):
         return True
     lim = _ctx_limit(pid, model)
     if lim is None:
-        lim = _inferred_ctx(model)
+        lim = _inferred_ctx_for(pid, model)
         # ...capped by a measured provider row, as _model_ctx_info does
         if lim and pid in _PROVIDER_TPM:
             lim = min(lim, _PROVIDER_TPM[pid])
@@ -22493,8 +22613,35 @@ _TRIVIAL_SLOW_HOP_BUDGET = 45    # slow / reasoning model (_SLOW_MODEL_RE)
 # next one was. A hop with a MEASURED history gets max(_ADAPTIVE_HOP_FLOOR,
 # _ADAPTIVE_HOP_MULT x its p90) for its first content; an unmeasured one keeps
 # the ceiling, because there is no evidence to be tighter on.
+#
+# SET FROM MEASURED DATA 2026-09-27 (/api/model-speed on the live hub: 18
+# models with time-to-first-content samples, 11 of them with n >= 5; plus
+# perf-stats.json, 33 pairs). The snapshot and the derivations live in
+# tests/test_latency_constants.py, which re-derives every number below:
+#   * within-model tail p95/p50 (n >= 5, hung outliers > 10x excluded):
+#     1.24 1.26 1.31 1.44 1.49 1.60 2.21 2.93 3.31 3.33 -> median 1.55,
+#     max 3.33.
+#     _ADAPTIVE_HOP_MULT must cover the heaviest HEALTHY tail even for a
+#     bimodal model whose p90 sits near its p50: 3.33 rounds up to 3.5 (was
+#     3.0, which covers glm-4.5-flash / groq qwen3.8's p95 only while their
+#     p90 stays >= 1.11x their p50). Cost: a hung hop is dropped at most
+#     0.5x its p90 later (nothing below the 6 s floor moves).
+#     _HEDGE_DELAY_MULT = the median ratio (1.55 -> 1.5, unchanged): hedging
+#     at ~a model's own p95 starts an extra call on ~1 request in 20.
+#   * fastest measured class: codestral p50 1.3 s / p95 2.2 s total, ttft
+#     p50 1.5 s -> _ADAPTIVE_HOP_FLOOR 6 s (~2.7x that p95) and
+#     _HEDGE_DELAY_MIN 3 s (above 1.5x its p50 of 2.3 s): unchanged.
+#   * ttft p95s (n >= 4, codestral's hang excluded) 12.6 15.0 15.4 18.2
+#     19.0 20.7 22.2 22.5 48.2 55.1 62.3 s: _TRIVIAL_HOP_BUDGET 25 s covers
+#     8 of 11 on MIXED traffic (Codex-sized prompts included; a trivial turn
+#     is faster). The three above it have p50s of 14-34 s, which
+#     _SIMPLE_SLOW_MS already moves out of the speed-first pick. Unchanged.
+#   * no measured model matches _SLOW_MODEL_RE, so _TRIVIAL_SLOW_HOP_BUDGET
+#     (45 s) has no data behind a change. Unchanged.
+#   * fleet ttft: median of per-model p50s 12.1 s -> _SIMPLE_SLOW_MS 10 s
+#     stays the "not speed-first" line (9 of 18 models are faster). Unchanged.
 _ADAPTIVE_HOP_FLOOR = 6.0        # seconds: never tighter than this
-_ADAPTIVE_HOP_MULT = 3.0         # x the measured p90 time to first content
+_ADAPTIVE_HOP_MULT = 3.5         # x the measured p90 time to first content
 _ADAPTIVE_MIN_SAMPLES = 3        # never judge a hop on one or two requests
 # HEDGING a trivial, tool-free, small turn: when the hop has produced nothing
 # after _HEDGE_DELAY_MULT x its p50 (min _HEDGE_DELAY_MIN; _HEDGE_DELAY_UNKNOWN
@@ -24564,8 +24711,9 @@ def _sse_answer_digest(raw_frames):
 # Deliberately never held or altered: tool-call deltas (one disarms the gate
 # for the rest of the turn, flushing held text first so order is kept),
 # reasoning deltas, keepalives, usage and error frames -- they pass at once.
-# The cost is bounded by the hold window: a clean answer's first 400 chars
-# arrive together instead of token by token, at most 2.5 s late.
+# The cost is bounded by the hold window: a clean answer's first ~80 chars
+# arrive together (early release, below); only text that does not yet read
+# as an answer waits for 400 chars, at most 2.5 s.
 #
 # Works on OpenAI chat SSE in both shapes the hub relays: raw iter_content
 # chunks ("bytes", re-framed on blank lines) for /v1/chat/completions, and
@@ -24574,6 +24722,19 @@ def _sse_answer_digest(raw_frames):
 # --------------------------------------------------------------------------- #
 _HOLD_CHARS = 400
 _HOLD_SECONDS = 2.5
+# ...but the hold ends EARLY once the held text reads as a normal answer
+# (answer_check.reads_as_answer: >= 80 chars of varied prose/code, no glued
+# run, no leak marker, no number/word/yes-no brevity ask). Every junk sample
+# the hold exists for is short or glued; a clean answer no longer waits for
+# 400 chars / 2.5 s, so first-token latency is ~the time to its first 80
+# chars. The released text is still judged by inspect() before it goes out.
+_HOLD_EARLY_CHARS = answer_check.EARLY_MIN_CHARS
+_EARLY_EVERY = 16
+# Leak markers a released stream may receive split across deltas (see
+# _StreamAnswerGate._marker_open); "<|...|>" template tokens separately.
+_LEAK_MARKER_HEADS = ("<think>", "<thinking>", "</think>", "</thinking>",
+                      "<tool_call", "</tool_call", "<arg_", "</arg_")
+_TEMPLATE_OPEN_RE = re.compile(r"<\|[\w.-]*\|?")
 # The rolling tail check costs O(window) per call, so after release it runs
 # once per _TAIL_EVERY new chars rather than on every delta -- MEASURED before:
 # a 60 KB answer in 4-char deltas spent 13.9 s of CPU in tail checks. A delta
@@ -24594,7 +24755,8 @@ class _StreamAnswerGate:
 
     def __init__(self, iterator, *, mode="bytes", hop_pid=None, hop_model=None,
                  prompt_text=None, last_prompt=None, tools_offered=False,
-                 hold_chars=None, hold_seconds=None, visible_cap=None):
+                 hold_chars=None, hold_seconds=None, visible_cap=None,
+                 early_chars="default"):
         self._it = iterator
         # Chars of visible text past which the stream is ended at "length":
         # set only when the hub raised max_tokens for reasoning room, so the
@@ -24607,6 +24769,13 @@ class _StreamAnswerGate:
         self._tools = bool(tools_offered)
         self._hold_chars = _HOLD_CHARS if hold_chars is None else hold_chars
         self._hold_seconds = _HOLD_SECONDS if hold_seconds is None else hold_seconds
+        # Early release (reads_as_answer): off when a caller pins its own hold
+        # window (tests measuring the window itself), or via early_chars=None.
+        if early_chars == "default":
+            early_chars = None if hold_chars is not None else _HOLD_EARLY_CHARS
+        self._early_min = early_chars
+        self._early_at = -_EARLY_EVERY
+        self._frag = ""              # a possibly-split leak marker (_marker_open)
         self._rest = b""
         self._parts = []             # visible text so far (joined lazily)
         self._len = 0
@@ -24798,6 +24967,21 @@ class _StreamAnswerGate:
         end = len(salvage) if salvage and self._text.startswith(salvage) else 0
         return self._cut_at(end, v.get("reasons"))
 
+    def _reads_early(self):
+        """True once the held text already reads as a normal answer
+        (answer_check.reads_as_answer): the gate then releases at once
+        instead of waiting out _HOLD_CHARS / _HOLD_SECONDS. The check runs at
+        most once per _EARLY_EVERY new chars (it is O(held text))."""
+        if self._early_min is None or self._len < self._early_min \
+                or self._len - self._early_at < _EARLY_EVERY:
+            return False
+        self._early_at = self._len
+        try:
+            return answer_check.reads_as_answer(self._text,
+                                                last_prompt=self._last_prompt)
+        except Exception:                                        # noqa: BLE001
+            return False
+
     def _judge_tail(self, t=""):
         if self._len - self._judged < _TAIL_EVERY \
                 and not _TAIL_TRIGGER_CHARS.intersection(t):
@@ -24812,6 +24996,29 @@ class _StreamAnswerGate:
         if c is None:
             return None
         return self._cut_at(c, ["tail"])
+
+    def _marker_open(self, t):
+        """True while the released text ends in what may be the START of a
+        leak marker split across deltas ("<thi" + "nk>"): that delta is then
+        kept back until the marker completes (judged and cut by _judge_tail)
+        or turns out to be ordinary text. Without it, the first half of a
+        split "<think>" reached the client before the second half was
+        judged -- more often now that clean answers are released early."""
+        if "<" in t:
+            self._frag = t[t.rfind("<"):]
+        elif self._frag:
+            self._frag += t
+        else:
+            return False
+        f = self._frag.lower()
+        if f.startswith("<|"):
+            if len(f) <= 24 and _TEMPLATE_OPEN_RE.fullmatch(f):
+                return True
+        elif len(f) <= 16 and ">" not in f and any(
+                m.startswith(f) or f.startswith(m) for m in _LEAK_MARKER_HEADS):
+            return True
+        self._frag = ""
+        return False
 
     # -- the relay --------------------------------------------------------- #
     def _run(self):
@@ -24865,7 +25072,7 @@ class _StreamAnswerGate:
                     # owed to the client (judged, as always) -- as it was
                     # before anything was held.
                     if held:
-                        stop_frames = self._judge_held(None)
+                        stop_frames = self._judge_held(None) if holding else None
                         if stop_frames:
                             yield from stop_frames
                             return
@@ -24897,7 +25104,8 @@ class _StreamAnswerGate:
                             if first_at is None:
                                 first_at = time.monotonic()
                             if not fin and self._len < self._hold_chars \
-                                    and time.monotonic() - first_at < self._hold_seconds:
+                                    and time.monotonic() - first_at < self._hold_seconds \
+                                    and not self._reads_early():
                                 continue
                             stop_frames = self._judge_held(fin, partial=True)
                             if stop_frames:
@@ -24911,6 +25119,12 @@ class _StreamAnswerGate:
                         if stop_frames:
                             yield from stop_frames
                             return
+                        if not fin and self._marker_open(t):
+                            held.append(fr)      # a split leak marker may follow
+                            continue
+                        if held:
+                            yield from held
+                            held = []
                         self._emitted = self._len
                         yield fr
                         continue
@@ -24920,6 +25134,11 @@ class _StreamAnswerGate:
                         if stop_frames:
                             yield from stop_frames
                             return
+                        yield from held
+                        held = []
+                        self._emitted = self._len
+                    elif held:
+                        # a kept-back marker start that never completed
                         yield from held
                         held = []
                         self._emitted = self._len
@@ -24936,7 +25155,7 @@ class _StreamAnswerGate:
                     self._rest = b""
             # Upstream ended without a finish frame / [DONE].
             if held:
-                stop_frames = self._judge_held(None)
+                stop_frames = self._judge_held(None) if holding else None
                 if stop_frames:
                     yield from stop_frames
                     return

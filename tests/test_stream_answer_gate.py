@@ -498,6 +498,7 @@ def test_tail_check_is_throttled_and_uses_the_scan_cache(monkeypatch):
     g = _gate(_frames(ans, fin="stop", size=4), "write a long tutorial")
     text, _fins, _done = _parse_chat(b"".join(g))
     assert text == ans and not g.cut
-    after_hold = len(ans) - app._HOLD_CHARS
+    # Clean prose is released early (reads_as_answer), at ~_HOLD_EARLY_CHARS.
+    after_hold = len(ans) - app._HOLD_EARLY_CHARS
     assert 0 < len(calls) <= after_hold // app._TAIL_EVERY + 2
     assert g._tail_state.get("fpos", 0) > 0

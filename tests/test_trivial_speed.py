@@ -8,7 +8,7 @@ limited or slow before one answered -- while other categories answered in 1-8s.
 Pinned here, with fake providers and tiny sleeps (no network):
   * a (provider, model) that 429'd or ran out its time in the last ten minutes
     is ordered last in every chain and never opens the turn;
-  * hop budgets follow the MEASURED p90 (max 6s, 3x p90) instead of a flat 25s;
+  * hop budgets follow the MEASURED p90 (max 6s, 3.5x p90) instead of a flat 25s;
   * a streamed hop already writing visible text is never cut by its budget;
   * hedging: a trivial, tool-free, small turn whose hop stays silent starts the
     next candidate in parallel and serves the first VALID answer -- at most one
@@ -226,9 +226,10 @@ def test_a_measured_fast_hop_gets_the_floor(monkeypatch):
     assert A._hedge_delay("p", "m") == A._HEDGE_DELAY_MIN
 
 
-def test_a_measured_hop_gets_three_times_its_p90(monkeypatch):
+def test_a_measured_hop_gets_a_multiple_of_its_p90(monkeypatch):
     _samples(monkeypatch, ttft=[3000, 4000, 5000, 5000])
-    assert A._adaptive_hop_budget("p", "m", 25) == pytest.approx(15.0)
+    assert A._adaptive_hop_budget("p", "m", 25) == pytest.approx(
+        A._ADAPTIVE_HOP_MULT * 5.0)
     assert A._hedge_delay("p", "m") == pytest.approx(1.5 * 4.0)
 
 
@@ -239,7 +240,8 @@ def test_the_adaptive_budget_never_exceeds_the_old_ceiling(monkeypatch):
 
 def test_a_non_streamed_hop_is_judged_on_its_durations(monkeypatch):
     _samples(monkeypatch, ttft=[500, 500, 500], dur=[4000, 4000, 4000])
-    assert A._adaptive_hop_budget("p", "m", 25, stream=False) == pytest.approx(12.0)
+    assert A._adaptive_hop_budget("p", "m", 25, stream=False) == pytest.approx(
+        A._ADAPTIVE_HOP_MULT * 4.0)
     assert A._adaptive_hop_budget("p", "m", 25, stream=True) == A._ADAPTIVE_HOP_FLOOR
 
 

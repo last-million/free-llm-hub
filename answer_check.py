@@ -243,10 +243,64 @@ def _end_min_run(finish_reason):
     return _LINE_MIN_RUN if finish_reason == "length" else _END_MIN_RUN
 
 
+# STRUCTURED LINES repeat legitimately: list items ("- TBD by the owner",
+# "- [ ] Review the migration"), table rows without a leading pipe, test
+# runner / log output ("test_x ... ok", "[WARN] retrying connection",
+# "PASSED", "12:00:01 GET /health 200"), indented code/output, key: value
+# records, REPL/shell lines. A runaway loop never stops by itself -- it runs to
+# the token cap -- so for these lines:
+#   * finish "length": the plain rule (3 copies at the end: the cap IS the loop);
+#   * a natural finish: a run is content up to _STRUCT_END_MAX_RUN copies (the
+#     model chose to stop there);
+#   * a stream still going: _STRUCT_PARTIAL_MIN_RUN copies must reach the end;
+#   * mid-text (more content follows): _STRUCT_PARTIAL_MIN_RUN copies, not 8.
+_STRUCT_PARTIAL_MIN_RUN = 16
+_STRUCT_END_MAX_RUN = 50
+_STRUCT_LINE_RE = re.compile(
+    r"""^(?:
+        (?:\ {4}|\t)                                   # indented code / output
+      | \s*(?:[-*+•]|\d{1,4}[.)]|[A-Za-z][.)])\s  # bullet / numbered item
+      | \s*\[[^\]\n]{1,40}\]                           # [INFO] / [PASS] / [ ]
+      | \s*\d{4}-\d{2}-\d{2}                           # dated log line
+      | \s*\d{1,2}:\d{2}(?::\d{2})?\b                  # timed log line
+      | \s*(?:PASS(?:ED)?|FAIL(?:ED)?|ok|not\ ok|OK|ERROR|WARN(?:ING)?|INFO
+              |DEBUG|TRACE|SKIP(?:PED)?|XFAIL|XPASS)(?=[\s:\]]|$)  # test / log
+      | \s*[✓✔✗✘×√]      # check / cross marks
+      | \s*(?:>>>|\.\.\.|\$|PS\ [A-Z]:\\[^>]*>)\s      # REPL / shell prompt
+      | \s*[A-Za-z_][\w.-]{0,30}(?:\ [A-Z][\w.-]*)?:\s+\S  # key: value record
+    )""", re.X)
+_STRUCT_END_RE = re.compile(r"(?:\.\.\.\s*(?:ok|OK|PASSED|FAILED|passed|failed|done)"
+                            r"|\s(?:PASSED|FAILED|SKIPPED|ok|OK))\s*$")
+
+
+def _line_is_structured(line):
+    """A list item, table row, test/log output line, indented code or a
+    key: value record -- shapes that repeat verbatim in real answers."""
+    if not line or not line.strip():
+        return False
+    if line.count("|") >= 2 or "\t" in line.strip():
+        return True             # a table row, with or without a leading pipe
+    if "::" in line and re.search(r"\w::\w", line):
+        return True             # pytest node ids / C++ scopes
+    return bool(_STRUCT_LINE_RE.match(line) or _STRUCT_END_RE.search(line))
+
+
+def _struct_end_allows(run, finish_reason):
+    """True when a run of `run` structured lines reaching the text's end is
+    content under `finish_reason` (see _STRUCT_LINE_RE's comment)."""
+    if finish_reason == "length":
+        return run < _LINE_MIN_RUN
+    if finish_reason == PARTIAL:
+        return run < _STRUCT_PARTIAL_MIN_RUN
+    return run < _STRUCT_END_MAX_RUN
+
+
 def _line_loop(masked, prompt_text, finish_reason=None):
     """Offset just past the first copy of a line repeated in a row: at least
-    _MID_MIN_RUN copies anywhere, or _end_min_run copies running to the end."""
+    _MID_MIN_RUN copies anywhere, or _end_min_run copies running to the end.
+    Structured lines (_line_is_structured) follow their own rule."""
     prev = None
+    prev_raw = ""
     run = 0
     first_end = 0
     pos = 0
@@ -269,7 +323,8 @@ def _line_loop(masked, prompt_text, finish_reason=None):
             continue
         if norm == prev:
             run += 1
-            if run >= _MID_MIN_RUN:
+            if run >= (_STRUCT_PARTIAL_MIN_RUN if _line_is_structured(prev_raw)
+                       else _MID_MIN_RUN):
                 cut = hit(norm)
                 if cut is not None:
                     return cut
@@ -277,11 +332,25 @@ def _line_loop(masked, prompt_text, finish_reason=None):
             pass                # partial last copy of a loop cut by the cap
         else:
             prev = norm
+            prev_raw = line
             run = 1
             first_end = start + len(line)
     if prev is not None and run >= _end_min_run(finish_reason):
+        if _line_is_structured(prev_raw) and _struct_end_allows(run, finish_reason):
+            return None
         return hit(prev)
     return None
+
+
+def _loop_lines_structured(region):
+    """True when every whole line of a loop region (its first line may be a
+    partial copy, so it is skipped; so is a last line still being written)
+    is a structured line."""
+    lines = [ln for ln in region.split("\n")[1:] if ln.strip()]
+    if len(lines) > 1 and any(o != lines[-1] and o.startswith(lines[-1])
+                              for o in lines[:-1]):
+        lines.pop()
+    return bool(lines) and all(_line_is_structured(ln) for ln in lines)
 
 
 def _tail_loop(masked, prompt_text, finish_reason=None):
@@ -313,8 +382,12 @@ def _tail_loop(masked, prompt_text, finish_reason=None):
         unit = s[start:start + p]
         if not _unit_is_meaningful(unit):
             continue
-        if (n - start) // p < _end_min_run(finish_reason):
+        copies = (n - start) // p
+        if copies < _end_min_run(finish_reason):
             continue            # 3-4 copies at the end of a finished reply: content
+        if "\n" in unit and _loop_lines_structured(s[start:]) \
+                and _struct_end_allows(copies, finish_reason):
+            continue            # whole list items / rows / log lines, repeated
         if prompt_text and unit * 2 in prompt_text:
             continue            # the user asked for this repetition
         return start + p
@@ -423,6 +496,8 @@ def _separator_run(masked, finish_reason):
     head_line = s[line_start:start]
     if not re.search(r"\w", head_line) or "|" in head_line:
         return None
+    if head_line.lstrip().startswith(m.group(1) * 3):
+        return None             # a banner: "===== 5 passed in 0.12s ====="
     first = _repeated_token_end(head_line)
     if first is not None:
         return line_start + first
@@ -686,6 +761,57 @@ def _clip(text):
     if len(text) <= _MAX_SCAN:
         return text
     return text[-_MAX_SCAN:]
+
+
+# --------------------------------------------------------------------------- #
+# Early release for the stream hold-back gate
+# --------------------------------------------------------------------------- #
+# The gate holds a stream's first visible text until it can judge it. Every
+# junk sample it exists for is SHORT or GLUED: "3324TouchableOpacity_FP$.
+# Actually, the answer is" (a brevity prompt), "319231923192" (a glued loop),
+# a leaked <think>/<|im_end|>. Once the held text is ordinary prose or code,
+# waiting for 400 chars / 2.5 s only costs first-token latency, so the gate
+# releases as soon as reads_as_answer() says so (inspect() still judges it).
+EARLY_MIN_CHARS = 80
+_EARLY_MIN_WORDS = 10
+_EARLY_MIN_DISTINCT = 0.6       # distinct words / words
+_EARLY_MAX_WORD = 40            # a longer "word" is a glued run or a blob
+_EARLY_MIN_WORDCHAR = 0.55      # letters+digits share of non-space chars
+_EARLY_MARKER_RE = re.compile(r"<\s*/?\s*(?:think|thinking|tool_call|arg_)|<\||\|>|"
+                              r"\bThought:|Thinking content", re.I)
+
+
+def reads_as_answer(text, *, last_prompt=None):
+    """True when `text` (the start of a streamed reply, no finish yet) already
+    reads as a normal answer: >= EARLY_MIN_CHARS of varied words, no glued
+    run, no reasoning/template marker, and the prompt does not constrain the
+    reply to a number/word/yes-no (there the whole short answer IS the
+    thing judged). Code counts: it has words and punctuation too. Never
+    raises (False)."""
+    try:
+        if not isinstance(text, str) or len(text.strip()) < EARLY_MIN_CHARS:
+            return False
+        if last_prompt:
+            lp = str(last_prompt)
+            if len(lp) <= _BRIEF_PROMPT_MAX:
+                kinds, literal = _brief_kinds(lp)
+                if kinds or literal:
+                    return False
+        if _EARLY_MARKER_RE.search(text):
+            return False
+        words = text.split()
+        if len(words) < _EARLY_MIN_WORDS:
+            return False
+        if max(len(w) for w in words) > _EARLY_MAX_WORD:
+            return False
+        if len(set(words)) < _EARLY_MIN_DISTINCT * len(words):
+            return False
+        dense = [c for c in text if not c.isspace()]
+        if sum(1 for c in dense if c.isalnum()) < _EARLY_MIN_WORDCHAR * len(dense):
+            return False
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
