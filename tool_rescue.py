@@ -452,6 +452,27 @@ def tool_names(tools):
     return names
 
 
+_BARE_NAME_WRAP = re.compile(r"^[`'\"\s]*(?:functions?[.:])?(.*?)(?:\(\s*\))?[`'\"\s.]*$", re.S)
+
+
+def is_bare_tool_name(text, tools):
+    """True when the WHOLE reply is just the name of an offered tool -- a call
+    with no arguments and no envelope, e.g. the reply "shell_command".
+
+    MEASURED 2026-09-27 on /agent (codex, llm7/codestral-latest): the final
+    reply of a turn was literally "shell_command". Nothing ran, nothing could
+    be rescued (no arguments), and the CLI ended the turn showing the user a
+    tool name as its answer. Such a reply is a failed hop, not an answer."""
+    names = set(tool_names(tools))
+    if not names or not isinstance(text, str):
+        return False
+    body = text.strip()
+    if not body or len(body) > 80 or "\n" in body:
+        return False
+    m = _BARE_NAME_WRAP.match(body)
+    return bool(m) and m.group(1).strip() in names
+
+
 def _strip_calls(text):
     """Remove the typed call from the prose so the client is not shown raw XML
     next to the real call it now has."""

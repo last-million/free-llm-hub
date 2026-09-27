@@ -61,6 +61,8 @@ def _clear_thinking_ledgers():
         mod._THINKING_IDENTS.clear()
         mod._THINKING_LEARNED.clear()
         mod._REASONING_REJECTED.clear()
+    # Optional params a provider refused by name (prompt_cache_key etc.).
+    getattr(mod, "_PARAM_REJECTED", {}).clear()
 
 
 @pytest.fixture(autouse=True)
