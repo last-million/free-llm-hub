@@ -20636,6 +20636,13 @@ def _kimi_strip_hub_tables(text):
     return out, removed
 
 
+def _kimi_user_auto_alias(text):
+    """True when the file keeps a [models."auto"] alias of the USER's own (it
+    points at another provider, so the hub strip leaves it in place)."""
+    body, _ = _kimi_strip_hub_tables(text or "")
+    return bool(re.search(r'(?m)^\s*\[\s*models\."auto"\s*\]\s*$', body))
+
+
 def _kimi_apply_text(text, base_v1, key):
     """Pure transform for ~/.kimi/config.toml (no IO). ADDITIVELY + REVERSIBLY:
       1. drop any previous [providers.free-hub] / [models."auto"] tables so a
@@ -20671,8 +20678,10 @@ def _kimi_apply_text(text, base_v1, key):
     ]
     for mid in _HUB_TIER_IDS:
         # An alias of that name that is still here after the strip is the
-        # user's (another provider): a second table would be invalid TOML.
-        if mid != "auto" and re.search(r'(?m)^\s*\[\s*models\."%s"\s*\]\s*$' % re.escape(mid), body):
+        # user's (another provider): a second table would be invalid TOML
+        # ("Cannot declare ('models', 'auto') twice"). _autofix_kimi refuses
+        # up front when that alias is "auto" (default_model points at it).
+        if re.search(r'(?m)^\s*\[\s*models\."%s"\s*\]\s*$' % re.escape(mid), body):
             continue
         block += ["", '[models."%s"]' % mid, 'provider = "free-hub"', 'model = "%s"' % mid,
                   "max_context_size = %d" % agentic_chat.declared_window(mid)]
@@ -20727,6 +20736,13 @@ def _autofix_kimi(entry, key, base_root, base_v1, model):
                 texts[path] = ""
         except OSError as exc:
             return {"ok": False, "reason": _sanitize("could not read %s: %s" % (_short(path), exc))}
+    for path in paths:
+        if _kimi_user_auto_alias(texts[path]):
+            # Connect sets default_model = "auto" and adds its own
+            # [models."auto"]; a second table would make the file invalid TOML.
+            return {"ok": False, "reason": _sanitize(
+                '%s already has your own [models."auto"] alias (another provider). '
+                'Rename or remove it, then Connect again.' % _short(path))}
     backups = {}
     for path in paths:          # every backup BEFORE any write: all-or-nothing
         backups[path] = _backup_once(path)
@@ -24377,7 +24393,7 @@ _STREAM_TOOLCALL_RE = re.compile(
     rb'(?!\s*:\s*(?:null\b|\[\s*\]|\{\s*\}|""))', re.I)
 
 
-def _judge_peeked(chunks, check=None, raw_items=None, prompt=None):
+def _judge_peeked(chunks, check=None, raw_items=None, prompt=None, complete=True):
     """"content", "nonanswer" or "junk" for the text collected during the peek.
 
     Runs the same three detectors the non-streaming path has always had. They
@@ -24404,7 +24420,10 @@ def _judge_peeked(chunks, check=None, raw_items=None, prompt=None):
                 or _looks_like_announced_not_acted(text)
                 or _looks_like_refusal(text)
                 or _is_upstream_nonanswer(text, prompt)
-                or (check and check.get("tools")
+                # Bare-tool-name and dangling-colon only mean anything on a
+                # COMPLETE reply: mid-stream, "Changes made to parser.py:" is
+                # just the lead-in to the list that follows.
+                or (complete and check and check.get("tools")
                     and (tool_rescue.is_bare_tool_name(text, check.get("tools"))
                          or _looks_like_dangling_lead_in(text)))):
             return "nonanswer"
@@ -24534,8 +24553,9 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
     box = {"buf": [], "status": None, "kind": None}
     prompt = _request_prompt_text()   # the worker has no request context
 
-    def _judge(seen):
-        verdict = _judge_peeked(seen, check, box["buf"], prompt=prompt)
+    def _judge(seen, complete=True):
+        verdict = _judge_peeked(seen, check, box["buf"], prompt=prompt,
+                                complete=complete)
         box["kind"] = _take_nonanswer_kind()
         return verdict
 
@@ -24593,7 +24613,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                     box["saw_content"] = True
                     if sum(len(x) for x in seen_content) < _PEEK_JUDGE_CHARS:
                         continue
-                    box["status"] = _judge(seen_content)
+                    box["status"] = _judge(seen_content, complete=False)
                     return
                 # An error INSIDE a 200 stream (403/429/quota reported as an SSE
                 # error frame instead of an HTTP status) — the single most common
@@ -24622,7 +24642,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
             # was 400 lines of keepalives/role deltas and committing it hands the
             # CLI a stream that never answers.
             if seen_content:
-                box["status"] = _judge(seen_content)
+                box["status"] = _judge(seen_content, complete=False)
             else:
                 box["status"] = "content" if saw_reasoning else "empty"
         except StopIteration:

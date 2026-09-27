@@ -2132,7 +2132,8 @@
   body.cx-hidden .cx-sidebar:hover .cx-nav-item,
   body.cx-hidden .cx-sidebar:focus-within .cx-nav-item{
     justify-content:flex-start; padding-left:12px; padding-right:12px; }
-  body.cx-hidden .cx-sidebar:hover .cx-group-label .gl-caret{ display:block; }
+  body.cx-hidden .cx-sidebar:hover .cx-group-label .gl-caret,
+  body.cx-hidden .cx-sidebar:focus-within .cx-group-label .gl-caret{ display:block; }
   body.cx-rail .cx-sidebar:hover .cx-nav-item,
   body.cx-rail .cx-sidebar:focus-within .cx-nav-item{
     justify-content:flex-start; padding-left:12px; padding-right:12px; }
@@ -2188,8 +2189,8 @@
      thin lines with the section names clipped away. */
   body.cx-hidden .cx-sidebar:hover .cx-group-label,
   body.cx-hidden .cx-sidebar:focus-within .cx-group-label{
-    height:auto; padding:5px 12px 3px; margin:0; overflow:visible; background:none;
-    text-align:left; }
+    width:100%; height:auto; padding:5px 12px 3px; margin:0; overflow:visible;
+    background:none; text-align:left; }
   body.cx-rail .cx-sidebar:hover .cx-group-label,
   body.cx-rail .cx-sidebar:focus-within .cx-group-label{ text-align:left; padding:5px 12px 3px; }
   body.cx-rail .cx-sidebar:hover .cx-side-foot, body.cx-hidden .cx-sidebar:hover .cx-side-foot,

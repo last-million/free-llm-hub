@@ -739,6 +739,9 @@ _TEST_PHASE_RE = re.compile(r"\b(?:pytest|unit\s*tests?|test\s+suite|tests?\s+fi
                             r"test_[\w\-]+\.py|[\w\-]+_test\.py)\b", re.I)
 _DOCS_PHASE_RE = re.compile(r"\b(?:readme|documentation|docs?\s+section|usage\s+section)\b",
                             re.I)
+# A phase whose OUTPUT is documentation even when its title names the .py
+# file it documents ("README.md for tally.py").
+_DOCS_OUTPUT_RE = re.compile(r"\breadme\b|\b[\w\-]+\.md\b|\bmarkdown\b", re.I)
 _DOCS_NEEDS_CODE_RE = re.compile(r"\b(?:flags?|options?|usage|arguments?|cli|command[- ]line|"
                                  r"examples?|api)\b", re.I)
 _FENCED_RE = re.compile(r"```[ \t]*([\w+\-.]*)[^\n]*\n(.*?)(?:```|\Z)", re.S)
@@ -800,7 +803,11 @@ def _is_docs_phase(ph):
     when they name nothing, the task opens with it). Never a tests phase."""
     title = str(ph.get("title") or "")
     fmt = str(ph.get("output_format") or "")
-    if _PY_FILE_RE.search(title) or _PY_FILE_RE.search(fmt) or _is_test_phase(ph):
+    if _is_test_phase(ph):
+        return False
+    if _DOCS_OUTPUT_RE.search(title + " " + fmt) or _DOCS_PHASE_RE.match(title.strip()):
+        return True
+    if _PY_FILE_RE.search(title) or _PY_FILE_RE.search(fmt):
         return False
     if _DOCS_PHASE_RE.search(title + " " + fmt):
         return True
@@ -923,6 +930,25 @@ def _test_count_wanted(ph, request=""):
     return 1
 
 
+def _tested_stem(ph, deps):
+    """The module a tests phase targets, among `deps` ({stem: code}): the one
+    its test file is named after (test_<stem>.py / <stem>_test.py), else the
+    first one its text mentions as <stem>.py, else the first dependency."""
+    if not deps:
+        return ""
+    m = re.match(r"^(?:test_([\w\-]+)|([\w\-]+)_test)\.py$", _py_target(ph) or "", re.I)
+    if m:
+        want = (m.group(1) or m.group(2)).lower()
+        for stem in deps:
+            if stem.lower() == want:
+                return stem
+    text = _phase_text(ph).lower()
+    for stem in deps:
+        if ("%s.py" % stem.lower()) in text:
+            return stem
+    return next(iter(deps))
+
+
 def _code_problems(ph, text, deps=None, request=""):
     """Problems a parser can PROVE in a code phase's output, never a guess:
     Python that does not parse, a tests file with too few test functions,
@@ -957,17 +983,22 @@ def _code_problems(ph, text, deps=None, request=""):
     if have < want:
         problems.append("only %d test function%s (def test_...); at least %d required"
                         % (have, "" if have == 1 else "s", want))
-    for stem, code in (deps or {}).items():
+    deps = deps or {}
+
+    def _uses(stem):
+        return bool(re.search(r"^\s*(?:from\s+%s\s+import|import\s+%s\b)"
+                              % (re.escape(stem), re.escape(stem)), joined, re.M)
+                    or ("%s.py" % stem) in joined)
+    # A tests file may target ONE of several dependencies (test_core.py
+    # needing core.py and cli.py): only importing NONE of them is proof.
+    if deps and not any(_uses(st) for st in deps):
+        stem = _tested_stem(ph, deps)
+        problems.append("the tests never import %s (the module under test, "
+                        "%s.py) -- test the real code, do not re-implement or stub "
+                        "it" % (stem, stem))
+    for stem, code in deps.items():
         names = _top_names(code)
-        if names is None:
-            continue
-        uses = re.search(r"^\s*(?:from\s+%s\s+import|import\s+%s\b)" % (re.escape(stem),
-                                                                      re.escape(stem)),
-                         joined, re.M) or ("%s.py" % stem) in joined
-        if not uses:
-            problems.append("the tests never import %s (the module under test, "
-                            "%s.py) -- test the real code, do not re-implement or stub "
-                            "it" % (stem, stem))
+        if names is None or not _uses(stem):
             continue
         bad = []
         for m in re.finditer(r"^\s*from\s+%s\s+import\s+\(?([^)\n]+)" % re.escape(stem),
@@ -1625,16 +1656,37 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
 
         def _call():
             try:
-                box["out"] = manager(msgs, max_tokens, purpose)
+                out = manager(msgs, max_tokens, purpose)
             except Exception:                                   # noqa: BLE001
-                box["out"] = None
+                out = None
+            box["out"] = out
+            # Accounted HERE, on the manager's own thread, so a call abandoned
+            # at its deadline still counts once it finishes (it is billed on
+            # the daily budget either way). A call that finishes after the run
+            # returned is not in that run's figures. A call that never ran
+            # (refused: budget, dead model) is neither a call nor tokens.
+            if not isinstance(out, (tuple, list)) or len(out) < 2:
+                return
+            text = out[0] if isinstance(out[0], str) else ""
+            tokens = out[2] if len(out) > 2 else None
+            if tokens is None:
+                # The caller did not report real usage: chars/4, like the hub.
+                tokens = ((sum(len(str(m.get("content") or "")) for m in msgs)
+                           + len(text)) // 4) if text else 0
+            try:
+                tokens = max(0, int(tokens))
+            except (TypeError, ValueError):
+                tokens = 0
+            if tokens or text.strip():
+                with mgr_lock:
+                    mgr_spent[0] += tokens
+                    mgr_calls.append(purpose)
         t0 = time.monotonic()
         th = threading.Thread(target=_call, daemon=True, name="swarm-manager")
         th.start()
         th.join(limit)
         with mgr_lock:
             mgr_secs.append(time.monotonic() - t0)
-            mgr_calls.append(purpose)
         if th.is_alive():
             emit(purpose, "manager gave no answer within %ds — free models" % int(limit))
             return "", None
@@ -1642,16 +1694,6 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         if not isinstance(out, (tuple, list)) or len(out) < 2:
             return "", None
         text = out[0] if isinstance(out[0], str) else ""
-        tokens = out[2] if len(out) > 2 else None
-        if tokens is None:
-            # The caller did not report real usage: chars/4, like the hub.
-            tokens = ((sum(len(str(m.get("content") or "")) for m in msgs)
-                       + len(text)) // 4) if text else 0
-        try:
-            with mgr_lock:
-                mgr_spent[0] += max(0, int(tokens))
-        except (TypeError, ValueError):
-            pass
         return (text, out[1] or "manager") if text.strip() else ("", None)
 
     def _staged(free_msgs, free_tokens, purpose, mgr_msgs=None, mgr_tokens=None,
@@ -1671,8 +1713,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
 
     def _finish(result):
         if manager is not None:
-            result["manager_tokens"] = mgr_spent[0]
             with mgr_lock:
+                result["manager_tokens"] = mgr_spent[0]
                 result["manager_calls"] = len(mgr_calls)
             result.update(extras)
         return result
@@ -1859,7 +1901,7 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                            "names, signatures and flags; never rename, re-implement "
                            "or stub them:\n%s" % (stem, stem, iface))
         if _is_test_phase(ph):
-            stem = next(iter(deps))
+            stem = _tested_stem(ph, deps)
             out.append(
                 "\n\nHOW TO WRITE THESE TESTS\n"
                 "- Import the real module: `import %s` or `from %s import ...` (%s.py "
