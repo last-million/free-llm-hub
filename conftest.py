@@ -87,7 +87,103 @@ def _isolated_claude_settings_stay_out_of_the_real_home(monkeypatch):
     monkeypatch.setattr(ac, "_claude_settings_file", redirected)
 
 
+# THE USER'S OWN CLI CONFIGS. FOUND 2026-09-27: after a full-suite run the
+# user's terminal ~/.config/opencode/opencode.json had lost its free-llm-hub
+# provider block -- a test drove the real Connect/Disconnect code against the
+# real home. The hub-state isolation above covers ~/.free-llm-hub only; the
+# connectors write under ~/.config, ~/.codex, ~/.claude, ~/.kimi, AppData...
+# So for the whole run every home-like variable points at a sandbox, and a
+# tripwire fingerprints the real files before the run and FAILS the run if any
+# of them changed -- the next leak is caught the first time, not noticed a day
+# later as "my CLI stopped working".
+_HOME_VARS = ("HOME", "USERPROFILE", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA")
+_REAL_CLI_FILES = (
+    (".config", "opencode", "opencode.json"),
+    (".config", "opencode", "opencode.jsonc"),
+    (".codex", "config.toml"),
+    (".codex", "model_catalog.json"),
+    (".kimi", "config.toml"),
+    (".qwen", ".env"),
+    (".pi", "agent", "models.json"),
+)
+# Claude's settings.json is also written by the user's own Claude Code (/model,
+# permissions), so only the keys the hub's connector owns are compared.
+_CLAUDE_SETTINGS = (".claude", "settings.json")
+_CLAUDE_HUB_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL",
+                   "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                   "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+
+
+def _fingerprint_real_cli_configs(home):
+    import hashlib
+    import json
+    out = {}
+    for parts in _REAL_CLI_FILES:
+        p = os.path.join(home, *parts)
+        try:
+            with open(p, "rb") as fh:
+                out[p] = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            out[p] = None
+    p = os.path.join(home, *_CLAUDE_SETTINGS)
+    try:
+        with open(p, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        env = data.get("env") if isinstance(data.get("env"), dict) else {}
+        out[p] = json.dumps({"env": {k: env.get(k) for k in _CLAUDE_HUB_ENV},
+                             "modelPicker": data.get("modelPicker")}, sort_keys=True)
+    except (OSError, ValueError, AttributeError):
+        out[p] = None
+    return out
+
+
+def _sandbox_the_home(config):
+    real_home = os.path.expanduser("~")
+    config._real_home = real_home
+    config._real_cli_before = _fingerprint_real_cli_configs(real_home)
+    sandbox = os.path.join(tempfile.gettempdir(), "hub-pytest-home")
+    config._saved_home_env = {v: os.environ.get(v) for v in _HOME_VARS}
+    try:
+        os.makedirs(os.path.join(sandbox, "AppData", "Roaming"), exist_ok=True)
+        os.makedirs(os.path.join(sandbox, "AppData", "Local"), exist_ok=True)
+        os.makedirs(os.path.join(sandbox, ".config"), exist_ok=True)
+    except OSError:
+        return
+    os.environ["HOME"] = sandbox
+    os.environ["USERPROFILE"] = sandbox
+    os.environ["XDG_CONFIG_HOME"] = os.path.join(sandbox, ".config")
+    os.environ["APPDATA"] = os.path.join(sandbox, "AppData", "Roaming")
+    os.environ["LOCALAPPDATA"] = os.path.join(sandbox, "AppData", "Local")
+
+
+def pytest_unconfigure(config):
+    for var, val in (getattr(config, "_saved_home_env", None) or {}).items():
+        if val is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = val
+
+
+def pytest_sessionfinish(session, exitstatus):
+    config = session.config
+    before = getattr(config, "_real_cli_before", None)
+    if not before:
+        return
+    after = _fingerprint_real_cli_configs(config._real_home)
+    changed = [p for p in before if before[p] != after.get(p)]
+    if changed:
+        tr = config.pluginmanager.get_plugin("terminalreporter")
+        msg = ("A TEST CHANGED THE USER'S REAL CLI CONFIG (tests must use the sandbox "
+               "home): " + ", ".join(changed))
+        if tr:
+            tr.write_line(msg, red=True, bold=True)
+        else:
+            print(msg)
+        session.exitstatus = 1
+
+
 def pytest_configure(config):
+    _sandbox_the_home(config)
     base = os.path.join(tempfile.gettempdir(), "hub-pytest-base")
 
     # Two independent guards, each with its OWN "explicit wins" check -- an

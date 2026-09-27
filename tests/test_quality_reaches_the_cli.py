@@ -49,8 +49,17 @@ def _sess(cli, quality="normal", native=None):
 
 
 def _argv(cli, quality, native=None, signed_in=False):
-    """argv for one turn, with the hub standing in as the CLI's backend."""
+    """argv for one turn, with the hub standing in as the CLI's backend.
+
+    The hub backs a CLI only when the hub's OWN isolated copy is installed and
+    not signed in (ac._hub_backs). Both halves are pinned here: the install is
+    faked, so the answer never depends on whether this machine happens to have
+    ~/.free-llm-hub/isolated-clis/<cli> installed, and no subscription model is
+    picked, so the signed-in fallback is the plain _MODEL_ALIAS."""
+    fake_install = os.path.join(tempfile.gettempdir(), "isolated-clis", cli, "install", cli)
     with mock.patch.object(ac, "_launcher", return_value=["BIN"]), \
+            mock.patch.object(ac, "_isolated_bin", return_value=fake_install), \
+            mock.patch.object(ac, "_sub_model_setting", return_value=""), \
             mock.patch.object(ac, "_isolated_signed_in", return_value=signed_in), \
             mock.patch.object(ac, "write_task_brief", return_value=False), \
             mock.patch.object(ac, "_system_prompt_addition", return_value=""):

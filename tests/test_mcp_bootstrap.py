@@ -27,6 +27,12 @@ import mcp_manager as m
 def home(monkeypatch):
     d = tempfile.mkdtemp(prefix="hub-pytest-mcpboot-")
     monkeypatch.setenv("MCP_MANAGER_HOME", d)
+    # opencode's global config follows XDG_CONFIG_HOME BEFORE MCP_MANAGER_HOME
+    # (mcp_manager._xdg_config). The test run's sandbox home sets that variable
+    # for the whole session, so without this every test here wrote into ONE
+    # shared <sandbox>/.config/opencode/opencode.json -- and the "npx missing"
+    # test then found the playwright entry an earlier test had registered.
+    monkeypatch.setenv("XDG_CONFIG_HOME", os.path.join(d, ".config"))
     monkeypatch.setenv("HERMES_HOME", os.path.join(d, "hermes"))
     for v in ("OPENCLAW_CONFIG_PATH", "OPENCLAW_CONFIG",
               "OPENCLAW_STATE_DIR", "OPENCLAW_HOME"):

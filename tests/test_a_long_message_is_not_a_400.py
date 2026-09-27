@@ -52,13 +52,54 @@ def test_the_direct_cap_leaves_real_headroom():
     assert AC._MAX_MESSAGE_CHARS_DIRECT + 3000 < 32767
 
 
+# The two shim shapes npm writes, copied from the hub's real isolated installs
+# (opencode/claude forward straight to a bundled .exe; codex runs node on a .js).
+_NPM_PREAMBLE = ("@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n"
+                 ":start\r\nSETLOCAL\r\nCALL :find_dp0\r\n")
+_NPM_SHIMS = {
+    "opencode": ("node_modules/opencode-ai/bin/opencode.exe",
+                 '"%dp0%\\node_modules\\opencode-ai\\bin\\opencode.exe"   %*\r\n'),
+    "claude": ("node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+               '"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"   %*\r\n'),
+    "codex": ("node_modules/@openai/codex/bin/codex.js",
+              'IF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n'
+              '  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\n'
+              'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  '
+              '"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n'),
+}
+
+
 @pytest.mark.skipif(not WINDOWS, reason="the shell path is a Windows problem")
-def test_an_installed_cli_gets_the_bigger_cap():
+def test_an_installed_cli_gets_the_bigger_cap(tmp_path, monkeypatch):
     """All three resolve to a real .exe (or node plus a script), so none of
-    them goes through cmd.exe any more."""
+    them goes through cmd.exe any more.
+
+    Built from npm-shaped installs in tmp_path rather than whatever this
+    machine has on PATH: a real lookup finds the hub's isolated copy on one
+    machine, a user's own wrapper .cmd (which is NOT an npm shim, and rightly
+    keeps the shell cap) on another, and nothing at all on a third -- where the
+    old `if _resolve_bin(cli)` guard made this test assert nothing."""
+    install = tmp_path / "install"
+    shims = {}
+    for cli, (target, forward) in _NPM_SHIMS.items():
+        real = install.joinpath(*target.split("/"))
+        real.parent.mkdir(parents=True, exist_ok=True)
+        real.write_bytes(b"")
+        shim = install / (cli + ".cmd")
+        shim.write_text(_NPM_PREAMBLE + forward, encoding="utf-8", newline="")
+        shims[cli] = str(shim)
+    # codex's shim runs `node`: give it one, first on PATH, owned by the test.
+    node_dir = tmp_path / "nodejs"
+    node_dir.mkdir()
+    (node_dir / "node.exe").write_bytes(b"")
+    monkeypatch.setenv("PATH", str(node_dir) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setattr(AC, "_SHIM_TARGET_CACHE", {})
+    monkeypatch.setattr(AC, "_resolve_bin", lambda cli: shims.get(cli))
+
     for cli in ("opencode", "codex", "claude"):
-        if AC._resolve_bin(cli):
-            assert AC.max_message_chars(cli) == AC._MAX_MESSAGE_CHARS_DIRECT, cli
+        argv = AC._launcher(shims[cli])
+        assert os.path.basename(argv[0]).lower() not in ("cmd.exe", "cmd"), (cli, argv)
+        assert AC.max_message_chars(cli) == AC._MAX_MESSAGE_CHARS_DIRECT, cli
 
 
 def test_an_unknown_cli_keeps_the_safe_number():
