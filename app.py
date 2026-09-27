@@ -476,9 +476,89 @@ def _models_url_for(pid, pcfg):
 # context (131072). Deliberately EXCLUDES max_completion_tokens /
 # max_output_length / max_tokens: those bound the REPLY, and treating an output
 # cap as the input window would over-compact every conversation.
+#
+# Widened 2026-09-27 ("the hub should DETECT the context window of models"):
+# only 43 of 123 live models had a known window, because every catalog spells
+# it differently. Also read, in this order after the originals:
+#   max_model_len              vLLM / SGLang /v1/models (uncloseai is vLLM)
+#   inputTokenLimit            Google's NATIVE models list (camelCase) ...
+#   input_token_limit          ... and the snake_case twin some proxies emit
+#   n_ctx / num_ctx            llama.cpp server / Ollama-style catalogs
+#   contextLength / contextWindow / max_seq_len   JS-style and HF-style rows
+# plus the NESTED shapes in _CTX_NESTED (OpenRouter's top_provider,
+# models.dev-style limit(s).context, GitHub/Copilot capabilities.limits) and
+# Cloudflare's properties list. A numeric STRING ("131072") counts.
 _CTX_FIELDS = ("context_length", "context_window", "context",
-               "max_context_length", "max_input_tokens", "context_size")
+               "max_context_length", "max_input_tokens", "context_size",
+               "max_model_len", "inputTokenLimit", "input_token_limit",
+               "n_ctx", "num_ctx", "contextLength", "contextWindow",
+               "max_seq_len")
+_CTX_NESTED = (("top_provider", "context_length"),
+               ("limits", "context"), ("limit", "context"),
+               ("limits", "context_window"), ("limit", "context_window"),
+               ("limits", "max_input_tokens"), ("limit", "input"),
+               ("capabilities", "limits", "max_context_window_tokens"),
+               ("capabilities", "limits", "max_prompt_tokens"),
+               ("meta", "context_length"), ("metadata", "context_length"))
+# Cloudflare's model search lists facts as [{"property_id", "value"}].
+_CTX_PROPERTY_IDS = frozenset({"context_window", "context_length", "max_input_tokens"})
 _CTX_SANE_MIN, _CTX_SANE_MAX = 1000, 5_000_000
+
+
+def _ctx_number(v):
+    """A sane window from a catalog value (int, float or numeric string)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, str):
+        s = v.strip().replace("_", "").replace(",", "")
+        if not s.isdigit():
+            return None
+        v = int(s)
+    if isinstance(v, (int, float)) and _CTX_SANE_MIN <= v <= _CTX_SANE_MAX:
+        return int(v)
+    return None
+
+
+def _catalog_row_ctx(it, extra_fields=()):
+    """The INPUT window one catalog row states, or None. First field wins, in
+    _CTX_FIELDS order, then `extra_fields` (a provider that documents
+    max_tokens as its context opts in via its registry row), then the nested
+    shapes, then Cloudflare-style properties."""
+    if not isinstance(it, dict):
+        return None
+    for f in _CTX_FIELDS + tuple(extra_fields or ()):
+        n = _ctx_number(it.get(f))
+        if n:
+            return n
+    for path in _CTX_NESTED:
+        v = it
+        for k in path:
+            v = v.get(k) if isinstance(v, dict) else None
+        n = _ctx_number(v)
+        if n:
+            return n
+    props = it.get("properties")
+    if isinstance(props, list):
+        for p in props:
+            if isinstance(p, dict) and p.get("property_id") in _CTX_PROPERTY_IDS:
+                n = _ctx_number(p.get("value"))
+                if n:
+                    return n
+    return None
+
+
+def _catalog_items(payload):
+    """The list of model rows in a /models payload, whatever it is wrapped in."""
+    items = payload
+    if isinstance(payload, dict):
+        for k in ("data", "models", "result"):
+            v = payload.get(k)
+            if isinstance(v, dict):
+                v = v.get("models")
+            if isinstance(v, list):
+                items = v
+                break
+    return items if isinstance(items, list) else []
 
 
 def _learn_ctx_from_catalog(payload_pid, payload):
@@ -488,38 +568,26 @@ def _learn_ctx_from_catalog(payload_pid, payload):
     fires after a request has already failed, which costs a real hop on the best
     model in the chain (measured: a Codex session lost its top hop on every turn
     to a 32k model the router believed was 120k). A catalog states the same fact
-    for free, before anything is sent. Never raises."""
+    for free, before anything is sent. Returns how many windows it recorded.
+    Never raises."""
+    found = 0
     try:
-        items = payload
-        if isinstance(payload, dict):
-            for k in ("data", "models", "result"):
-                v = payload.get(k)
-                if isinstance(v, dict):
-                    v = v.get("models")
-                if isinstance(v, list):
-                    items = v
-                    break
-        if not isinstance(items, list):
-            return
-        found = 0
-        for it in items:
+        extra = ()
+        try:
+            if (prov.get_provider(payload_pid) or {}).get("catalog_max_tokens_is_context"):
+                # ONLY where the provider documents it that way: everywhere
+                # else max_tokens is the REPLY cap (see the note above).
+                extra = ("max_tokens",)
+        except Exception:                                        # noqa: BLE001
+            extra = ()
+        changed = False
+        for it in _catalog_items(payload):
             if not isinstance(it, dict):
                 continue
             mid = it.get("id") or it.get("name") or it.get("model")
             if not isinstance(mid, str) or not mid:
                 continue
-            ctx = None
-            for f in _CTX_FIELDS:
-                v = it.get(f)
-                # openrouter nests a second copy under top_provider
-                if v is None and f == "context_length":
-                    v = (it.get("top_provider") or {}).get("context_length") \
-                        if isinstance(it.get("top_provider"), dict) else None
-                if isinstance(v, bool):
-                    continue
-                if isinstance(v, (int, float)) and _CTX_SANE_MIN <= v <= _CTX_SANE_MAX:
-                    ctx = int(v)
-                    break
+            ctx = _catalog_row_ctx(it, extra)
             if ctx is None:
                 continue
             with _model_max_input_lock:
@@ -529,6 +597,8 @@ def _learn_ctx_from_catalog(payload_pid, payload):
                 # the provider-wide guess.
                 prev_cat = _MODEL_CATALOG_CTX.get((payload_pid, mid))
                 _MODEL_CATALOG_CTX[(payload_pid, mid)] = ctx
+                if prev_cat != ctx:
+                    changed = True
                 cur = _MODEL_MAX_INPUT.get((payload_pid, mid))
                 if cur and prev_cat == cur and (payload_pid, mid) not in _MODEL_LEARNED_AT:
                     cur = None        # it WAS the catalog's number: take the new one
@@ -536,11 +606,73 @@ def _learn_ctx_from_catalog(payload_pid, payload):
                 # authoritative over an optimistic catalog number.
                 _MODEL_MAX_INPUT[(payload_pid, mid)] = min(cur, ctx) if cur else ctx
             found += 1
+        if changed:
+            _ctx_index_touch()
         if found:
             _log.debug("[ctx] %s: learned %d context windows from its catalog",
                        payload_pid, found)
     except Exception:                                                # noqa: BLE001
         _log.debug("[ctx] catalog harvest failed for %s", payload_pid, exc_info=True)
+    return found
+
+
+# Providers whose OpenAI-compatible /models omits the window while a NATIVE
+# listing states it (registry key `ctx_models_url`). Google: the compat list is
+# id/object/owned_by only, the native v1beta/models carries inputTokenLimit per
+# model under the SAME "models/<id>" names. Fetched off-thread, at most once per
+# _CTX_NATIVE_INTERVAL per provider, so discovery never waits on it.
+_CTX_NATIVE_INTERVAL = 6 * 3600
+_CTX_NATIVE_LAST = {}
+_ctx_native_lock = threading.Lock()
+
+
+def _harvest_native_ctx_catalog(pid, pcfg):
+    """Fetch `ctx_models_url` (paginated, nextPageToken) and record its windows.
+    Returns how many were recorded. Never raises."""
+    total = 0
+    try:
+        p = prov.get_provider(pid) or {}
+        url = p.get("ctx_models_url")
+        key = (pcfg or {}).get("api_key")
+        if not url or not key or (pcfg or {}).get("base_url"):
+            return 0                  # a custom base's key may not be Google's
+        hdr = p.get("ctx_models_auth") or "Authorization"
+        headers = ({"Authorization": "Bearer " + key} if hdr == "Authorization"
+                   else {hdr: key})
+        token = None
+        for _page in range(10):
+            u = url
+            if token:
+                u = url + ("&" if "?" in url else "?") + "pageToken=" + quote(str(token))
+            resp = requests.get(u, headers=headers,
+                                timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            total += _learn_ctx_from_catalog(pid, data)
+            token = data.get("nextPageToken") if isinstance(data, dict) else None
+            if not token:
+                break
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[ctx] native catalog harvest failed for %s", pid, exc_info=True)
+    return total
+
+
+def _maybe_harvest_native_ctx(pid, pcfg):
+    """Start _harvest_native_ctx_catalog on a daemon thread when due."""
+    try:
+        if not (prov.get_provider(pid) or {}).get("ctx_models_url"):
+            return False
+        now = time.time()
+        with _ctx_native_lock:
+            if now - _CTX_NATIVE_LAST.get(pid, 0.0) < _CTX_NATIVE_INTERVAL:
+                return False
+            _CTX_NATIVE_LAST[pid] = now
+        threading.Thread(target=_harvest_native_ctx_catalog, args=(pid, dict(pcfg or {})),
+                         name="ctx-native-" + pid, daemon=True).start()
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 _PRICE_FIELDS = ("prompt", "completion", "input", "output",
@@ -716,6 +848,9 @@ def provider_free_models(pid, live=True):
                 # already holding the catalog. Learning it from a failed request
                 # works but costs a real hop; the catalog states it for free.
                 _learn_ctx_from_catalog(pid, resp.json())
+                # ...and from the provider's NATIVE listing when its compat
+                # one states no window (Google). Off-thread and throttled.
+                _maybe_harvest_native_ctx(pid, pcfg)
                 ids = _parse_model_ids(resp.json())
                 # A 'pricing_zero' provider can only be judged against the prices
                 # in the payload we are already holding; hand it that list, or it
@@ -965,6 +1100,9 @@ def _codex_catalog_models(dump):
     out = []
     for offset, mid in enumerate((MODE_ALL,) + tuple(_mode_keys())):
         entry = copy.deepcopy(template)
+        # PER ENTRY: the window the models behind THIS id actually hold (see
+        # _declared_window_for), not one fixed figure for every mode.
+        win = agentic_chat.declared_window(mid)
         entry.update({
             "slug": mid,
             "display_name": _codex_catalog_label(mid),
@@ -973,11 +1111,11 @@ def _codex_catalog_models(dump):
             "visibility": "list",
             "supported_reasoning_levels": copy.deepcopy(_CODEX_LEVELS),
             "default_reasoning_level": _CODEX_LEVELS[0]["effort"],
-            "context_window": agentic_chat._CODEX_CONTEXT_WINDOW,
-            "max_context_window": agentic_chat._CODEX_CONTEXT_WINDOW,
+            "context_window": win,
+            "max_context_window": win,
         })
         if "auto_compact_token_limit" in entry:
-            entry["auto_compact_token_limit"] = agentic_chat._CODEX_COMPACT_LIMIT
+            entry["auto_compact_token_limit"] = agentic_chat.declared_compact_limit(mid)
         out.append(entry)
     return out + [copy.deepcopy(m) for m in models if isinstance(m, dict)]
 
@@ -1016,7 +1154,17 @@ def _refresh_codex_catalog():
     """Rewrite ~/.codex/model_catalog.json so /model offers the hub's modes.
 
     Silent no-op when codex is not installed, when its dump cannot be read, or
-    when the file already says what we would write."""
+    when the file already says what we would write. Serialised: it runs at
+    startup AND again once the catalogs are warm (declared windows sharpen),
+    and both would write the same .tmp path."""
+    with _codex_catalog_lock:
+        _refresh_codex_catalog_locked()
+
+
+_codex_catalog_lock = threading.Lock()
+
+
+def _refresh_codex_catalog_locked():
     try:
         binary = _which_cli("codex")
         if not binary:
@@ -1118,8 +1266,16 @@ def _warm_catalogs_async():
     finds nothing warm."""
     def _go():
         try:
-            _prefetch_free_models(list(_enabled_keyed()))
+            catalogs = _prefetch_free_models(list(_enabled_keyed()))
             _log.info("[warm] provider catalogs ready")
+            # How much of the fleet has a KNOWN window, and from where.
+            _log_ctx_coverage(catalogs)
+            # The declared windows were computed at startup from registry
+            # defaults; the real lists are in now, so re-declare (a no-op
+            # when the catalog file already says the same).
+            with _declared_lock:
+                _declared_fleet_cache[1] = None
+            _refresh_codex_catalog()
         except Exception as exc:                                 # noqa: BLE001
             _log.debug("[warm] catalog warm-up skipped: %s", exc)
     threading.Thread(target=_usage_source_as("warm-up")(_go), name="warm-catalogs",
@@ -3979,6 +4135,10 @@ def _dead_state_dump():
                                      for (p, m), ts in _MODEL_LEARNED_AT.items()}
         out["model_ctx_catalog"] = {"%s|%s" % (p, m): v
                                     for (p, m), v in _MODEL_CATALOG_CTX.items()}
+        # OpenRouter's public per-identity windows (inference source), so a
+        # restart infers at once instead of after the next daily fetch.
+        out["model_ctx_reference"] = dict(_REF_CATALOG_CTX)
+        out["model_ctx_reference_at"] = _REF_CATALOG_AT[0]
         out["model_max_output"] = {"%s|%s" % (p, m): v
                                    for (p, m), v in _MODEL_MAX_OUTPUT.items()}
     # Learned delivery reliability rides along too (see _record_outcome). It is
@@ -4102,6 +4262,15 @@ def _dead_state_load(blob):
             if isinstance(key, str) and "|" in key and isinstance(v, int) and v >= 1000:
                 p, m = key.split("|", 1)
                 _MODEL_CATALOG_CTX.setdefault((p, m), v)
+        _ref_map = blob.get("model_ctx_reference")
+        if isinstance(_ref_map, dict) and not _REF_CATALOG_CTX:
+            for ident, v in _ref_map.items():
+                if isinstance(ident, str) and isinstance(v, int) and v >= 1000:
+                    _REF_CATALOG_CTX[ident] = v
+            _at = blob.get("model_ctx_reference_at")
+            if isinstance(_at, (int, float)) and _REF_CATALOG_CTX:
+                _REF_CATALOG_AT[0] = float(_at)
+        _ctx_index_touch()
         for key, v in (blob.get("model_max_input") or {}).items():
             if isinstance(key, str) and "|" in key and isinstance(v, int) and v >= 1000:
                 p, m = key.split("|", 1)
@@ -7764,21 +7933,508 @@ _PROVIDER_HARD_REQUEST_CAP = frozenset({"groq"})
 
 def _model_ctx_info(pid, model):
     """(budget, source) for a model's INPUT window, most specific first:
-      "learned"  -- from a real 400/413 (authoritative, expires after
-                    _LEARNED_CTX_TTL so one transient error cannot shrink a
-                    model forever), or the catalog's own per-model number;
-      "table"    -- the provider row in _PROVIDER_TPM;
-      "default"  -- _DEFAULT_TPM, a GUESS: nothing is known about this model.
+      "learned"   -- from a real 400/413 (authoritative, expires after
+                     _LEARNED_CTX_TTL so one transient error cannot shrink a
+                     model forever), or the catalog's own per-model number;
+      "inferred"  -- the SAME model's window as other providers' catalogs /
+                     OpenRouter's public catalog state it (_inferred_ctx);
+      "reference" -- a documented per-family figure (_reference_ctx);
+      "table"     -- the provider row in _PROVIDER_TPM;
+      "default"   -- _DEFAULT_TPM, a GUESS: nothing is known about this model.
     A known per-model window is never capped by the provider figure, except
-    on the providers whose figure is a hard per-request cap (see above)."""
-    lim = _ctx_limit(pid, model)
+    on the providers whose figure is a hard per-request cap (see above).
+    An inferred/reference figure describes the MODEL, not this host, and a
+    host may serve less than the weights allow -- so where the provider has a
+    measured row it can only LOWER that row, never raise it."""
+    lim, src = _window_info(pid, model)
     if isinstance(lim, int) and lim > 0:
-        if pid in _PROVIDER_HARD_REQUEST_CAP and pid in _PROVIDER_TPM:
-            return min(lim, _PROVIDER_TPM[pid]), "learned"
-        return lim, "learned"
+        if src in ("learned", "catalog"):
+            if pid in _PROVIDER_HARD_REQUEST_CAP and pid in _PROVIDER_TPM:
+                return min(lim, _PROVIDER_TPM[pid]), "learned"
+            return lim, "learned"
+        if pid in _PROVIDER_TPM and _PROVIDER_TPM[pid] <= lim:
+            return _PROVIDER_TPM[pid], "table"
+        return lim, src
     if pid in _PROVIDER_TPM:
         return _PROVIDER_TPM[pid], "table"
     return _provider_tpm(pid), "default"
+
+
+# --------------------------------------------------------------------------- #
+# WINDOW DETECTION beyond a model's own catalog row (2026-09-27, "the hub
+# should DETECT the context window of models"). MEASURED on the live fleet:
+# only 43 of 123 alive models (35%) had a known window -- nvidia (57), google
+# (11), dahl, llm7, glm... publish none in their /models -- while known windows
+# span 4096..1,000,000 (median 262,144), so no single assumption is right.
+#
+# _window_info resolves, most specific first:
+#   learned   -- a real 400/413 on THIS (pid, model); expires (_LEARNED_CTX_TTL)
+#   catalog   -- this provider's own /models row for this id
+#   inferred  -- the same model (_normalize_model_identity) as OTHER catalogs
+#                state it: every provider catalog the hub has read, plus
+#                OpenRouter's keyless public catalog (_REF_CATALOG_CTX). The
+#                LOWER MEDIAN over providers (one vote each, a provider's own
+#                min when it lists the identity twice), so one relay's odd cap
+#                (g4f: 8000 on a 1M model) cannot drag it and one optimistic
+#                listing cannot inflate it. When the exact identity is unknown,
+#                a looser key (variant tails like -instruct/-it/-v0.1/-2507
+#                stripped, _ctx_loose_ident) is tried.
+#   reference -- a documented per-family figure (_CTX_REFERENCE); lowest.
+#   default   -- nothing known.
+# Inferred/reference are NOT stored in _MODEL_MAX_INPUT: any direct or learned
+# value overrides them, and a 400/413 still teaches the real (smaller) window
+# through _set_learned_ctx exactly as before.
+# --------------------------------------------------------------------------- #
+_REF_CATALOG_CTX = {}          # identity -> window, OpenRouter's public catalog
+_REF_CATALOG_AT = [0.0]        # when it was fetched (persisted with the state)
+_REF_CATALOG_TTL = 24 * 3600
+_CTX_INDEX_GEN = [0]
+_CTX_INDEX = {"sig": None, "exact": {}, "loose": {}}
+_ctx_index_lock = threading.Lock()
+_CTX_IDENT_CACHE = {}
+
+
+def _ctx_index_touch():
+    """Something a window index is built from changed: rebuild on next read."""
+    _CTX_INDEX_GEN[0] += 1
+
+
+def _ctx_ident(model):
+    """_normalize_model_identity, memoised (called per candidate per route)."""
+    key = model or ""
+    hit = _CTX_IDENT_CACHE.get(key)
+    if hit is None:
+        if len(_CTX_IDENT_CACHE) > 20000:
+            _CTX_IDENT_CACHE.clear()
+        hit = _CTX_IDENT_CACHE[key] = _normalize_model_identity(key)
+    return hit
+
+
+# Variant tails that name a BUILD of a model, not a different model:
+# gemma-3-12b-it, mistral-7b-instruct-v0.3, qwen3-235b-a22b-2507,
+# deepseek-v4-flash-0731, hermes-3-llama-3.1-8b-awq. Stripped only while what
+# remains still carries a digit, so 'deepseek-v3' never collapses to
+# 'deepseek'.
+_CTX_LOOSE_TAIL_RE = re.compile(
+    r"-(?:instruct|chat|it|hf|latest|preview|exp|experimental|"
+    r"awq|gptq|gguf|fp8|fp16|bf16|int4|int8|"
+    r"v\d+(?:\.\d+)*|\d{4}|\d{6,8})$")
+
+
+def _ctx_loose_ident(ident):
+    s = ident or ""
+    for _ in range(6):
+        t = _CTX_LOOSE_TAIL_RE.sub("", s)
+        if t == s or not t or not re.search(r"\d", t):
+            break
+        s = t
+    return s
+
+
+def _lower_median(values):
+    vals = sorted(v for v in values if isinstance(v, int) and v > 0)
+    return vals[(len(vals) - 1) // 2] if vals else None
+
+
+def _ctx_index():
+    """{"exact": {identity: window}, "loose": {loose identity: window}} over
+    every provider catalog + the OpenRouter reference catalog, rebuilt only
+    when one of them changed."""
+    sig = (_CTX_INDEX_GEN[0], len(_MODEL_CATALOG_CTX), len(_REF_CATALOG_CTX))
+    idx = _CTX_INDEX
+    if idx["sig"] == sig:
+        return idx
+    with _ctx_index_lock:
+        if _CTX_INDEX["sig"] == sig:
+            return _CTX_INDEX
+        with _model_max_input_lock:
+            items = list(_MODEL_CATALOG_CTX.items())
+            ref = list(_REF_CATALOG_CTX.items())
+        per = {}                                  # identity -> {pid: window}
+        for (p, m), v in items:
+            if not isinstance(v, int) or v <= 0:
+                continue
+            d = per.setdefault(_ctx_ident(m), {})
+            d[p] = min(d.get(p, v), v)
+        for ident, v in ref:
+            if isinstance(v, int) and v > 0:
+                # The keyed openrouter provider's own catalog wins over the
+                # public copy of the same catalog: one vote, not two.
+                per.setdefault(ident, {}).setdefault("openrouter", v)
+        loose = {}
+        for ident, d in per.items():
+            ld = loose.setdefault(_ctx_loose_ident(ident), {})
+            for p, v in d.items():
+                ld[p] = min(ld.get(p, v), v)
+        _CTX_INDEX.update({
+            "sig": sig,
+            "exact": {i: _lower_median(d.values()) for i, d in per.items()},
+            "loose": {i: _lower_median(d.values()) for i, d in loose.items()},
+        })
+        return _CTX_INDEX
+
+
+# Identities that name a ROUTER or an alias, not a model: openrouter/auto (2M)
+# and a g4f 'pa:<hash>:auto' share the identity "auto" and nothing else. Also
+# anything under 3 characters. Never inferred across providers.
+_CTX_GENERIC_IDENTS = frozenset({"auto", "default", "router", "free", "best", "fast",
+                                 "chat", "latest", "model", "base", "turbo", "pro",
+                                 "mini", "large", "small", "medium", "flash", "lite"})
+
+
+def _inferred_ctx(model):
+    """The window other catalogs state for this same model, or None."""
+    try:
+        ident = _ctx_ident(model)
+        if not ident or len(ident) < 3 or ident in _CTX_GENERIC_IDENTS:
+            return None
+        idx = _ctx_index()
+        w = idx["exact"].get(ident)
+        if not w:
+            w = idx["loose"].get(_ctx_loose_ident(ident))
+        return w if isinstance(w, int) and w > 0 else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+# A window the id itself states: phi-3-vision-128k-instruct, palmyra-fin-70b-32k,
+# mistral-nemo-minitron-8b-8k-instruct. Vendors put it in the name precisely
+# because it differs between otherwise-identical builds.
+_CTX_NAMED_RE = re.compile(r"(?:^|-)(\d{1,4})k(?:-|$)")
+
+# Documented NATIVE windows per family, for identities no catalog describes
+# (nvidia NIM publishes none). Searched against the normalized identity, first
+# match wins, so the specific rows come before the general ones. Deliberately
+# the SMALLER figure where a family spans several (a too-small window compacts
+# early; a too-large one 400s), and hosts may serve less still: a real 400
+# teaches the real value. Families whose window I cannot source are left out.
+_CTX_REFERENCE = (
+    # Google AI docs, model pages: Gemini 2.x/3.x input limit 1,048,576.
+    (re.compile(r"^gemini-(?:[2-9]|flash|pro)"), 1048576),
+    # Gemma 3 model card: 128K (4B/12B/27B), 32K for 1B; Gemma 3n: 32K.
+    (re.compile(r"^gemma-3n"), 32768),
+    (re.compile(r"^gemma-3-1b"), 32768),
+    (re.compile(r"^gemma-3-"), 131072),
+    # Gemma 1/2, CodeGemma, RecurrentGemma model cards: 8,192.
+    (re.compile(r"^(?:gemma-2|gemma-\d+(?:\.\d+)?b|codegemma|recurrentgemma)"), 8192),
+    # Meta Llama 3.1 / 3.2 / 3.3 model cards: 128K. Covers derivatives named
+    # after their base (llama-3.1-nemotron-*, hermes-3-llama-3.1-*).
+    (re.compile(r"llama-?3\.[123]\b"), 131072),
+    # Meta Llama 3 (3.0) model card: 8,192 (llama3-chatqa-1.5 is built on it).
+    (re.compile(r"llama-?3(?![.\d])"), 8192),
+    # Llama 4 natively 1M+ (Scout 10M), but hosts serve far less; 128K is the
+    # common served floor (Meta's own API launch figure for Maverick).
+    (re.compile(r"llama-?4"), 131072),
+    # Llama 2 paper: 4,096. Code Llama paper: trained on 16K sequences.
+    (re.compile(r"codellama|code-llama"), 16384),
+    (re.compile(r"llama-?2"), 4096),
+    # Mistral docs (models overview): Mixtral 8x22B 64K, 8x7B 32K, Mistral 7B
+    # v0.2+ 32K, NeMo 128K, Large 2 128K, Small 3.1/3.2 128K, Small 3 32K,
+    # Codestral 22B v0.1 32K, Codestral 25.01+ 256K, Medium 3 128K.
+    (re.compile(r"mixtral-8x22b"), 65536),
+    (re.compile(r"mixtral-8x7b"), 32768),
+    (re.compile(r"mistral-7b-instruct-v0\.1"), 8192),     # v0.1 predates 32K
+    (re.compile(r"mistral-7b"), 32768),
+    (re.compile(r"mistral-nemo"), 131072),
+    (re.compile(r"mistral-large"), 131072),
+    (re.compile(r"mistral-small-3\.[1-9]"), 131072),
+    (re.compile(r"mistral-small"), 32768),
+    (re.compile(r"mistral-medium"), 131072),
+    (re.compile(r"codestral-22b"), 32768),
+    (re.compile(r"codestral"), 262144),
+    # Microsoft model cards: Phi-3.5 128K, Phi-4-mini 128K, Phi-4 16K.
+    (re.compile(r"phi-3\.5"), 131072),
+    (re.compile(r"phi-4-mini"), 131072),
+    (re.compile(r"phi-4"), 16384),
+    # Qwen model cards: Qwen3-Coder / Qwen3-Next / Qwen3 *-2507 256K native;
+    # Qwen3 (original) 32,768 native; Qwen2.5 32,768 native; QwQ-32B 128K.
+    (re.compile(r"qwen3-(?:coder|next)|qwen3-.*-2507"), 262144),
+    (re.compile(r"^qwq"), 131072),
+    # 'qwen3-' only: later point releases (qwen3.5, qwen3.8) are not Qwen3.
+    (re.compile(r"qwen(?:2\.5|3-)"), 32768),
+    # DeepSeek API docs: V3 / V3.1 / V3.2 / R1 served at 128K.
+    (re.compile(r"deepseek-(?:v3|r1|chat|reasoner)"), 131072),
+    # OpenAI gpt-oss model card: 128K (131,072).
+    (re.compile(r"gpt-oss"), 131072),
+    # Moonshot platform docs: kimi-k2-0905 / k2-thinking / K2.5+ 256K
+    # (dahl's page states K2.6 256K); the original K2 (0711) 128K.
+    (re.compile(r"kimi-k2(?:-0905|-thinking|\.\d)"), 262144),
+    (re.compile(r"kimi-k2"), 131072),
+    # Z.AI docs: GLM-4.5 / 4.5-Air / 4.5-Flash 128K; GLM-4.6 / 4.7 200K.
+    (re.compile(r"^glm-4\.5(?!v)"), 131072),
+    (re.compile(r"^glm-4\.[67](?!v)"), 200000),
+    # MiniMax docs: M2 family 204,800; dahl 200K; sambanova's catalog 196,608
+    # -- the smallest host figure. M1: 1M.
+    (re.compile(r"minimax-m2"), 196608),
+    (re.compile(r"minimax-m1"), 1000000),
+    # NVIDIA model cards: Nemotron-4-340B 4,096. Nemotron 3 lists up to 1M
+    # but NIM serving varies; 128K is the conservative served figure.
+    (re.compile(r"nemotron-4-340b"), 4096),
+    (re.compile(r"nemotron-(?:3|nano-3|3\.5)"), 131072),
+    # IBM Granite model cards: 3.0 4,096; 3.1+ 128K; Granite Code 34B 8K and
+    # 3B/8B 4K (base releases).
+    (re.compile(r"granite-3\.0"), 4096),
+    (re.compile(r"granite-3\.[1-9]"), 131072),
+    (re.compile(r"granite-34b-code"), 8192),
+    (re.compile(r"granite-(?:3|8)b-code"), 4096),
+    # Cohere docs: Command R / R+ 128K; Command A 256K.
+    (re.compile(r"command-a"), 262144),
+    (re.compile(r"command-r"), 131072),
+)
+
+
+def _reference_ctx(model):
+    """A documented window for this model's family, or None."""
+    try:
+        ident = _ctx_ident(model)
+        if not ident:
+            return None
+        m = _CTX_NAMED_RE.search(ident)
+        if m:
+            n = int(m.group(1))
+            if 2 <= n <= 2048:
+                return n * 1024
+        for pat, win in _CTX_REFERENCE:
+            if pat.search(ident):
+                return win
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def _window_info(pid, model):
+    """(window or None, source) for ONE model, WITHOUT the provider row:
+    source is "learned" | "catalog" | "inferred" | "reference" | "default".
+    What the dashboard shows and what the declared windows are built from."""
+    lim = _ctx_limit(pid, model)
+    if lim:
+        return lim, ("learned" if (pid, model) in _MODEL_LEARNED_AT else "catalog")
+    w = _inferred_ctx(model)
+    if w:
+        return w, "inferred"
+    w = _reference_ctx(model)
+    if w:
+        return w, "reference"
+    return None, "default"
+
+
+def _learn_ctx_reference(rows, fetched_at=None):
+    """OpenRouter public-catalog rows -> _REF_CATALOG_CTX. Returns the count.
+    A smaller figure wins when two rows share an identity (a ':free' variant
+    is often served with less)."""
+    ref = {}
+    for row in rows or ():
+        if not isinstance(row, dict):
+            continue
+        ctx = _catalog_row_ctx(row)
+        if not ctx:
+            continue
+        for slug in (row.get("id"), row.get("canonical_slug")):
+            if isinstance(slug, str) and slug:
+                ident = _ctx_ident(slug)
+                if ident:
+                    ref[ident] = min(ref.get(ident, ctx), ctx)
+    if ref:
+        with _model_max_input_lock:
+            _REF_CATALOG_CTX.clear()
+            _REF_CATALOG_CTX.update(ref)
+            _REF_CATALOG_AT[0] = float(fetched_at or time.time())
+        _ctx_index_touch()
+    return len(ref)
+
+
+def _refresh_ctx_reference(force=False):
+    """Fetch OpenRouter's keyless public catalog when the copy is stale.
+    Returns how many identities it now describes (0 = nothing fetched)."""
+    if (not force and _REF_CATALOG_CTX
+            and time.time() - _REF_CATALOG_AT[0] < _REF_CATALOG_TTL):
+        return 0
+    try:
+        resp = requests.get(_OPENROUTER_CATALOG_URL,
+                            timeout=(CONNECT_TIMEOUT, MODELS_READ_TIMEOUT))
+        if resp.status_code != 200:
+            return 0
+        data = resp.json()
+        return _learn_ctx_reference(data.get("data") if isinstance(data, dict) else None)
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[ctx] reference catalog fetch failed", exc_info=True)
+        return 0
+
+
+def _start_ctx_reference_refresh():
+    """Daemon: refresh the reference catalog (checked hourly, fetched daily)."""
+    def _loop():
+        time.sleep(3)
+        while True:
+            try:
+                n = _refresh_ctx_reference()
+                if n:
+                    _log.info("[ctx] %d reference windows from OpenRouter's public "
+                              "catalog", n)
+                    _log_ctx_coverage()
+            except Exception:                                    # noqa: BLE001
+                pass
+            time.sleep(3600)
+    threading.Thread(target=_loop, name="ctx-reference", daemon=True).start()
+
+
+def _ctx_coverage(pairs):
+    """{"known", "total", "by_source"} over (pid, model) pairs."""
+    by = {}
+    for pid, m in pairs:
+        _w, src = _window_info(pid, m)
+        by[src] = by.get(src, 0) + 1
+    total = sum(by.values())
+    return {"known": total - by.get("default", 0), "total": total, "by_source": by}
+
+
+def _alive_models(catalogs):
+    """(pid, model) pairs routing can use right now, from {pid: [models]}."""
+    now = time.time()
+    with _dead_lock:
+        dead = dict(_dead_models)
+    out = []
+    for pid, models in (catalogs or {}).items():
+        try:
+            if _is_provider_dead(pid):
+                continue
+        except Exception:                                        # noqa: BLE001
+            pass
+        for m in models or ():
+            exp = dead.get((pid, m))
+            if exp and exp > now:
+                continue
+            try:
+                if not prov.is_model_allowed(m):
+                    continue
+            except Exception:                                    # noqa: BLE001
+                pass
+            out.append((pid, m))
+    return out
+
+
+def _cached_catalogs():
+    """{pid: [models]} from the discovery cache only (registry defaults for a
+    provider not fetched yet) -- never a network call."""
+    out = {}
+    for pid in _enabled_keyed():
+        with _model_cache_lock:
+            hit = _model_cache.get(pid)
+        out[pid] = list(hit[1]) if hit else provider_free_models(pid, live=False)
+    return out
+
+
+def _log_ctx_coverage(catalogs=None):
+    """One log line: how many alive models have a known window, and from where."""
+    try:
+        cov = _ctx_coverage(_alive_models(catalogs or _cached_catalogs()))
+        by = cov["by_source"]
+        _log.info("[ctx] windows known for %d/%d models (catalog %d, learned %d, "
+                  "inferred %d, reference %d)", cov["known"], cov["total"],
+                  by.get("catalog", 0), by.get("learned", 0),
+                  by.get("inferred", 0), by.get("reference", 0))
+        return cov
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[ctx] coverage log failed", exc_info=True)
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# DECLARED windows: what each hub id tells a CLI its context is
+# (agentic_chat.declared_window, registered at startup). It used to be one
+# fixed 128000 for every id; the fleet behind "auto" spans 4K..1M. A CLI
+# compacts against the number it is told, so the SAFE figure is one most of
+# the models an id can route to actually hold: the 25th percentile of the
+# known windows among alive, allowed, tool-capable candidates of that id's
+# category (and, for best/max, of its strong tier) -- three in four of them
+# take a full-window request unchanged, and the hub compacts or reroutes for
+# the rest as it always has. Too few known (fewer than 5, or under a third of
+# the candidates) -> None, and agentic_chat falls back to its fixed default.
+# Built from the discovery CACHE only: never a network call.
+# --------------------------------------------------------------------------- #
+_DECLARED_PCTL = 0.25
+_DECLARED_MIN_KNOWN = 5
+_DECLARED_MIN_SHARE = 1.0 / 3
+_DECLARED_FLEET_TTL = 30.0
+_declared_fleet_cache = [0.0, None]
+_declared_lock = threading.Lock()
+
+
+def _declared_fleet():
+    """[(pid, model, budget or None, score)] for every alive, allowed,
+    tool-capable model (CLIs always send tools). Cached _DECLARED_FLEET_TTL."""
+    now = time.time()
+    with _declared_lock:
+        if (_declared_fleet_cache[1] is not None
+                and now - _declared_fleet_cache[0] < _DECLARED_FLEET_TTL):
+            return _declared_fleet_cache[1]
+    fleet = []
+    for pid, m in _alive_models(_cached_catalogs()):
+        try:
+            if _is_model_blocked_by_user(pid, m):
+                continue
+        except Exception:                                        # noqa: BLE001
+            pass
+        if not _supports_tools(pid, m):
+            continue
+        w, src = _window_info(pid, m)
+        if w and pid in _PROVIDER_TPM and (
+                pid in _PROVIDER_HARD_REQUEST_CAP or src in ("inferred", "reference")):
+            w = min(w, _PROVIDER_TPM[pid])      # what the hub will really send there
+        try:
+            score = float(_benchmark_score(pid, m))
+        except Exception:                                        # noqa: BLE001
+            score = 0.0
+        fleet.append((pid, m, w, score))
+    with _declared_lock:
+        _declared_fleet_cache[0] = now
+        _declared_fleet_cache[1] = fleet
+    return fleet
+
+
+def _declared_window_for(model_id=None):
+    """The window to DECLARE for a hub id, or None (= use the fixed default).
+
+    Accepts every id a CLI is handed: an effort tier (auto/best/max/swarm/
+    multi/crew*), a category (coding), a compound (coding-swarm, coding/max),
+    "all", or a pinned "<pid>/<model>" (that model's own known window)."""
+    mid = str(model_id or "auto").strip().lower()
+    cat, eff = _split_category_effort(mid)
+    if cat is None:
+        if mid in _mode_keys():
+            cat, eff = mid, "auto"
+        elif "/" in mid and prov.get_provider(mid.split("/", 1)[0]):
+            pid, model = mid.split("/", 1)
+            for p, m, w, _s in _declared_fleet():
+                if p == pid and m.lower() == model:
+                    return w or None
+            return None
+    # CAPABLE = what the id routes a CLI turn to. Only a "simple" turn drops
+    # below the medium floor (medium joins hard on the strongest branch), and
+    # a CLI turn carrying tools and a growing history is not that -- so a
+    # 4K helper model that only ever answers one-word probes must not drag
+    # the window every session compacts against. best/max: the hard floor.
+    floor = _DIFFICULTY_FLOOR["hard" if eff in ("best", "max") else "medium"]
+    fleet = _declared_fleet()
+
+    def _pick(min_score):
+        cands = []
+        for p, m, w, s in fleet:
+            if cat and not _mode_allows(cat, p, m, session_overrides={}):
+                continue
+            if s < min_score:
+                continue
+            cands.append(w)
+        return cands, sorted(w for w in cands if w)
+
+    cands, wins = _pick(floor)
+    if len(wins) < _DECLARED_MIN_KNOWN:
+        cands, wins = _pick(float("-inf"))   # too few capable ones: the whole pool
+    if len(wins) < _DECLARED_MIN_KNOWN or len(wins) < len(cands) * _DECLARED_MIN_SHARE:
+        return None
+    w = wins[int(_DECLARED_PCTL * (len(wins) - 1))]
+    return max(agentic_chat._DECLARED_WINDOW_MIN,
+               min(agentic_chat._DECLARED_WINDOW_MAX, int(w)))
 
 
 def _ctx_limit(pid, model):
@@ -7849,11 +8505,15 @@ def _big_window_models(est):
 
 def _below_declared_window(pid, model):
     """True when this model is KNOWN to hold clearly less than the window every
-    CLI is told the hub has (HUB_CONTEXT_WINDOW). Unknown is not small."""
+    CLI is told the hub has (HUB_CONTEXT_WINDOW). Unknown is not small, and
+    neither is a provider-wide stand-in row -- except a hard per-request cap.
+    An inferred or reference window counts as known: it is per model."""
     try:
-        lim = _ctx_limit(pid, model)
-        if pid in _PROVIDER_HARD_REQUEST_CAP and pid in _PROVIDER_TPM:
-            lim = min(lim or _PROVIDER_TPM[pid], _PROVIDER_TPM[pid])
+        lim, src = _model_ctx_info(pid, model)
+        if src == "default":
+            return False
+        if src == "table" and pid not in _PROVIDER_HARD_REQUEST_CAP:
+            return False
         return bool(lim) and lim < int(HUB_CONTEXT_WINDOW * 0.9)
     except Exception:                                            # noqa: BLE001
         return False
@@ -9702,10 +10362,17 @@ def _agentic_score(entry, sustain_override=None):
 
 def _context_ok(pid, model, est):
     """False once we've LEARNED this (pid, model) can't hold an est-token request
-    (5% headroom for estimate error). True when unknown — never blocks on a guess."""
+    (5% headroom for estimate error). True when unknown — never blocks on a guess.
+    A window INFERRED from other catalogs' figure for the same model counts
+    (it is that model's fact, not a guess); a family reference does not."""
     if not est:
         return True
     lim = _ctx_limit(pid, model)
+    if lim is None:
+        lim = _inferred_ctx(model)
+        # ...capped by a measured provider row, as _model_ctx_info does
+        if lim and pid in _PROVIDER_TPM:
+            lim = min(lim, _PROVIDER_TPM[pid])
     return lim is None or est <= lim * 0.95
 
 
@@ -11869,7 +12536,14 @@ def api_tracking():
                      "opencode-only" if _zen_client_only(pid, m) else
                      "provider-exhausted" if qs.get("exhausted") else
                      "throttled" if thr else "ok")
+            try:
+                ctx_w, ctx_src = _window_info(pid, m)
+            except Exception:                                    # noqa: BLE001
+                ctx_w, ctx_src = None, "default"
             out.append({
+                # The model's detected INPUT window and where it came from:
+                # catalog | learned | inferred | reference | default (unknown).
+                "ctx_window": ctx_w, "ctx_source": ctx_src,
                 "id": pid + "/" + m, "provider": pid, "model": m,
                 "score": score, "tool_capable": _supports_tools(pid, m),
                 "fast": _is_fast(pid, m), "state": state,
@@ -11888,10 +12562,44 @@ def api_tracking():
     # to actually use them with their key).
     shown = {r["provider"] for r in out}
     keyed_no_free = sorted(pid for pid in _enabled_keyed() if pid not in shown)
+    ok_rows = [r for r in out if r["state"] == "ok"]
+    ctx_by = {}
+    for r in ok_rows:
+        ctx_by[r["ctx_source"]] = ctx_by.get(r["ctx_source"], 0) + 1
     return jsonify({"models": out, "total": len(out), "by_state": by_state,
                     "providers": sorted({r["provider"] for r in out}),
                     "usable": sum(1 for r in out if r["state"] == "ok"),
-                    "keyed_no_free": keyed_no_free})
+                    "keyed_no_free": keyed_no_free,
+                    # Window coverage over the USABLE models.
+                    "ctx_coverage": {"known": len(ok_rows) - ctx_by.get("default", 0),
+                                     "total": len(ok_rows), "by_source": ctx_by}})
+
+
+@app.route("/api/model-windows", methods=["GET"])
+def api_model_windows():
+    """Every alive model's detected context window and its source, the
+    coverage summary, and the window each hub id DECLARES to the CLIs
+    (agentic_chat.declared_window). Read-only; catalogs come from the same
+    60s discovery cache /api/tracking uses."""
+    catalogs = _prefetch_auto_models(list(_enabled_keyed()))
+    rows = []
+    for pid, m in _alive_models(catalogs):
+        w, src = _window_info(pid, m)
+        budget, bsrc = _model_ctx_info(pid, m)
+        rows.append({"id": pid + "/" + m, "provider": pid, "model": m,
+                     "window": w, "source": src,
+                     "budget": budget, "budget_source": bsrc})
+    rows.sort(key=lambda r: (r["source"] == "default", r["provider"], r["model"]))
+    cov = _ctx_coverage((r["provider"], r["model"]) for r in rows)
+    declared = {}
+    for mid in ("auto", "best") + tuple(_mode_keys()):
+        try:
+            declared[mid] = agentic_chat.declared_window(mid)
+        except Exception:                                        # noqa: BLE001
+            declared[mid] = agentic_chat._CODEX_CONTEXT_WINDOW
+    return jsonify({"models": rows, "coverage": cov, "declared": declared,
+                    "reference_catalog": {"identities": len(_REF_CATALOG_CTX),
+                                          "fetched_at": _REF_CATALOG_AT[0] or None}})
 
 
 def _identity_rows(scope_sid=None):
@@ -17231,7 +17939,8 @@ def _pi_provider_block(key, base_v1):
         "models": [{
             "id": mid,
             "name": label,
-            "contextWindow": _PI_CTX,
+            # Per id, from the fleet behind it (_PI_CTX when not yet known).
+            "contextWindow": agentic_chat.declared_window(mid),
             "maxTokens": _PI_MAX_TOKENS,
             "input": ["text"],
             # Free, and Pi shows a running cost -- reporting anything else would
@@ -17520,7 +18229,9 @@ def _autofix_openclaw(entry, key, base_root, base_v1, model):
             "reasoning": False,
             "input": ["text"],
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-            "contextWindow": HUB_CONTEXT_WINDOW,
+            # The same declared window every other CLI gets for this id
+            # (HUB_CONTEXT_WINDOW until the fleet's windows are known).
+            "contextWindow": agentic_chat.declared_window("auto"),
             "maxTokens": HUB_MAX_TOKENS,
         }],
     }
@@ -17653,7 +18364,7 @@ def _kimi_apply_text(text, base_v1, key):
         '[models."auto"]',
         'provider = "free-hub"',
         'model = "auto"',
-        "max_context_size = 128000",
+        "max_context_size = %d" % agentic_chat.declared_window("auto"),
     ]
     new_text = "\n".join(top + rest).rstrip("\n")
     return (new_text + "\n\n" if new_text else "") + "\n".join(block) + "\n"
@@ -26553,6 +27264,11 @@ if __name__ == "__main__":
     _mark_runtime_started()
     _bootstrap_no_key_providers()  # no-key providers have nothing to configure -> on
     _init_quota_persistence()      # restore quota/dead-model state from the last run
+    # Declared context windows follow the fleet (agentic_chat.declared_window);
+    # registered here, after the windows above are restored, so every CLI
+    # config written from now on is sized on known windows.
+    agentic_chat.set_window_provider(_declared_window_for)
+    _start_ctx_reference_refresh()  # OpenRouter's public windows, for inference
     _seed_default_blocks()         # ship the owner's blocklist to every install
     # Encrypt any provider keys still stored in plaintext. A no-op once done, so
     # an ordinary start does not rewrite the config file for nothing.
