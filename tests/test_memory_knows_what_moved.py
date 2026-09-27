@@ -62,6 +62,12 @@ def test_a_file_that_changed_is_marked_and_a_touch_is_not(proj):
     os.utime(proj / "app.py", (t, t))                  # same content, new mtime
     assert "[" not in _block("s1", proj), "a touch is not a change: the hash says so"
     (proj / "app.py").write_text("print(2)", encoding="utf-8")
+    # Windows file times tick every ~15.6 ms: a same-size write inside the
+    # same tick as the recorded mtime is indistinguishable by stat. A real
+    # edit comes later than that, so give it a distinct mtime (flaked in the
+    # full suite otherwise).
+    t2 = time.time() + 10
+    os.utime(proj / "app.py", (t2, t2))
     assert "[changed since: app.py]" in _block("s1", proj)
 
 

@@ -274,7 +274,7 @@ the most out of free tiers on your own machine.
 python -m pytest -q
 ```
 
-**3330 tests, 216 files.** They are written as evidence: most carry a docstring
+**4474 tests, 278 files.** They are written as evidence: most carry a docstring
 recording the measurement or the live failure that produced them.
 
 ---
