@@ -116,9 +116,11 @@ def swarm(monkeypatch):
     calls = {"start": [], "stop": [], "frames": [], "on_done": None}
 
     def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
-              on_done=None, configure=None, modes=(), review=True, owner=None, stop=None):
+              on_done=None, configure=None, modes=(), review=True, owner=None, stop=None,
+              context=""):
         calls["start"].append({"goal": goal, "project_dir": project_dir,
                                "cli": cli_id, "modes": tuple(modes), "owner": owner})
+        calls.setdefault("context", []).append(context)
         calls["on_done"] = on_done
         return "swarm-test"
 

@@ -2672,7 +2672,7 @@ def _memory_turn_start(session_id, text, project_dir=None):
 
 
 def _memory_turn_end(session_id, request, project_dir=None, reply=None,
-                     interrupted=False, why=None, doing=(), partial=""):
+                     interrupted=False, why=None, doing=(), partial="", tools=()):
     """What memory records when a turn ends. Never raises.
 
     A finished turn refreshes the task list (the project's PROGRESS.md first,
@@ -2684,6 +2684,9 @@ def _memory_turn_end(session_id, request, project_dir=None, reply=None,
             memory.clear_interrupted(session_id)
             memory.remember_recent(session_id, reply, "agent")
             memory.update_tasks(session_id, reply, project_dir, seen=True)
+            # LONG horizon: what this turn made durable (no model call).
+            memory.harvest_facts(session_id, request=request, reply=reply,
+                                 project_dir=project_dir, tools=tools)
         elif interrupted:
             memory.update_tasks(session_id, partial or "", project_dir)
             memory.note_interrupted(session_id, request=request, doing=list(doing or []),
@@ -3733,6 +3736,9 @@ def send_message_stream_durable(session_id, text):
         # memory.note_interrupted and handed to the next turn, so "continue"
         # continues (see memory.resume_block).
         doing = collections.deque(maxlen=memory.INTERRUPT_DOING)
+        # Every tool call of the turn (bounded), for the fact harvest: which
+        # files it wrote, which test/build commands it ran.
+        tools_all = collections.deque(maxlen=200)
         partial = [""]
         why = [None]
         rejected = False
@@ -3757,6 +3763,7 @@ def send_message_stream_durable(session_id, text):
                     kind = ev.get("event")
                     if kind == "tool" and ev.get("text"):
                         doing.append(ev["text"])
+                        tools_all.append(ev["text"])
                         memory.touch_inflight(session_id, doing=list(doing))
                     elif kind == "message" and ev.get("text"):
                         partial[0] = ev["text"]
@@ -3808,6 +3815,10 @@ def send_message_stream_durable(session_id, text):
                     # The agent wrote this list itself: seen, not news.
                     memory.update_tasks(session_id, final_reply,
                                         project_dir, seen=True)
+                    # LONG horizon: decisions, preferences, files written and
+                    # commands that passed -- no model call.
+                    memory.harvest_facts(session_id, request=text, reply=final_reply,
+                                         project_dir=project_dir, tools=list(tools_all))
                 elif interrupted:
                     memory.update_tasks(session_id, partial[0], project_dir)
                     memory.note_interrupted(session_id, request=text, doing=list(doing),

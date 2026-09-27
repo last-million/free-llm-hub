@@ -30,9 +30,12 @@ def _stage_of(system_prompt, user_prompt):
     identified by prompt equality alone — the user-message scaffolding built
     inside swarm.run is the stable part. Positional scripting is not an
     option either: phases in a wave run concurrently."""
-    # The revision worker reuses the phase SYSTEM prompt, so identify it by
-    # the draft it is handed BEFORE the exact-prompt matches below.
-    if "\n\nDRAFT\n" in user_prompt and "REVIEWER PROBLEMS TO FIX" in user_prompt:
+    # The manager-less revision is DIRECTED (swarm._free_revision): a free
+    # call writes fix instructions, a free apply edits the FULL draft. The
+    # apply is "the revision"; the instructing call has its own stage.
+    if system_prompt == swarm._INSTRUCT_SYSTEM:
+        return "instruct"
+    if system_prompt == swarm._APPLY_SYSTEM:
         return "revision"
     for name, prompt in (("plan", swarm._PLAN_SYSTEM),
                          ("phase", swarm._PHASE_SYSTEM),
@@ -103,6 +106,9 @@ SHIP = json.dumps({"verdict": "ship", "problems": []})
 REVISE = json.dumps({"verdict": "revise", "problems": ["part A is wrong"]})
 NO_GAPS = json.dumps({"missing": []})
 ASK = [{"role": "user", "content": "build me a small tool"}]
+# The revision is an APPLY to the full draft: it must return the whole work
+# (a reply shorter than swarm.APPLY_MIN_KEEP of the draft is rejected as lossy).
+REVISED = "## Part A\nREVISED-DRAFT of part A\n\n## Part B\ndraft B"
 CREW_NAMES = ("code", "research", "write", "design")
 
 
@@ -191,7 +197,7 @@ def test_the_code_crew_does_not_get_the_design_brief():
 
 def test_a_revise_verdict_runs_a_revision_before_synthesis():
     d = _dispatch(plan=PLAN, phases=["draft A", "draft B"], supervise=NO_GAPS,
-                  review=REVISE, revision="REVISED-DRAFT", synth="FINAL")
+                  review=REVISE, revision=REVISED, synth="FINAL")
     out = swarm.run(ASK, d, profile={"max_revisions": 1})
     revisions = _revision_calls(d)
     assert revisions, "verdict was revise but nothing was revised"
@@ -203,7 +209,7 @@ def test_a_revise_verdict_runs_a_revision_before_synthesis():
 def test_the_revision_worker_is_shown_the_draft_and_the_problems():
     """It cannot fix what it cannot see."""
     d = _dispatch(plan=PLAN, phases=["draft A", "draft B"], supervise=NO_GAPS,
-                  review=REVISE, revision="REVISED-DRAFT", synth="FINAL")
+                  review=REVISE, revision=REVISED, synth="FINAL")
     swarm.run(ASK, d, profile={"max_revisions": 1})
     rev = _revision_calls(d)[0]
     assert "draft A" in rev["user"], "revision worker was not shown the draft"
@@ -215,7 +221,7 @@ def test_max_revisions_zero_keeps_todays_behaviour():
     """profile defaults must reproduce the swarm exactly: a revise verdict is
     folded into synthesis, never worked on by a revision pass."""
     d = _dispatch(plan=PLAN, phases=["draft A", "draft B"], supervise=NO_GAPS,
-                  review=REVISE, revision="REVISED-DRAFT", synth="FINAL")
+                  review=REVISE, revision=REVISED, synth="FINAL")
     out = swarm.run(ASK, d, profile={"max_revisions": 0})
     assert not _revision_calls(d), "a revision ran with max_revisions=0"
     assert out["text"] == "FINAL"
@@ -225,7 +231,7 @@ def test_max_revisions_zero_keeps_todays_behaviour():
 
 def test_no_profile_at_all_is_the_plain_swarm():
     d = _dispatch(plan=PLAN, phases=["draft A", "draft B"], supervise=NO_GAPS,
-                  review=REVISE, revision="REVISED-DRAFT", synth="FINAL")
+                  review=REVISE, revision=REVISED, synth="FINAL")
     out = swarm.run(ASK, d)
     assert not _revision_calls(d)
     assert out["text"] == "FINAL"
@@ -233,7 +239,7 @@ def test_no_profile_at_all_is_the_plain_swarm():
 
 def test_a_ship_verdict_never_triggers_a_revision():
     d = _dispatch(plan=PLAN, phases=["draft A", "draft B"], supervise=NO_GAPS,
-                  review=SHIP, revision="REVISED-DRAFT", synth="FINAL")
+                  review=SHIP, revision=REVISED, synth="FINAL")
     swarm.run(ASK, d, profile={"max_revisions": 1})
     assert not _revision_calls(d), "approved work was revised anyway"
 
@@ -241,12 +247,12 @@ def test_a_ship_verdict_never_triggers_a_revision():
 def test_the_code_crew_revises_but_the_write_crew_does_not():
     """Revise loop ON for code/research, OFF for write/design."""
     d = _dispatch(plan=PLAN, phases=["draft A", "draft B"], supervise=NO_GAPS,
-                  review=REVISE, revision="REVISED-DRAFT", synth="FINAL")
+                  review=REVISE, revision=REVISED, synth="FINAL")
     crews.run(ASK, d, "code")
     assert _revision_calls(d), "code crew did not revise a revise verdict"
 
     d2 = _dispatch(plan=PLAN, phases=["draft A", "draft B"], supervise=NO_GAPS,
-                   review=REVISE, revision="REVISED-DRAFT", synth="FINAL")
+                   review=REVISE, revision=REVISED, synth="FINAL")
     crews.run(ASK, d2, "write")
     assert not _revision_calls(d2), "write crew ran a revision pass"
 

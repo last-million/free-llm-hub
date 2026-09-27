@@ -421,6 +421,36 @@ Pure helpers live in `ctxwin.py`; the glue is in app.py. Covered by
   (`_mode_first_size_split`); agentic chains put models known to hold much
   less than `HUB_CONTEXT_WINDOW` behind the others (`_below_declared_window`).
 
+## Pipelines keep the conversation (2026-09-27)
+
+Covered by `tests/test_pipelines_keep_the_conversation.py`.
+
+- **Swarm / crews**: `swarm.conversation_brief(messages, context)` = the last
+  user message (unclipped) + a bounded block (<= 6000 chars): caller context,
+  the previous answer when the request refers back, earlier requests. A
+  one-message conversation with no context is byte-identical to before.
+  `swarm.run(..., context=)` / `crews.run(..., context=)`; `_swarm_completion`
+  passes `_pipeline_context()` = the per-conversation rolling recap
+  (`ctxwin.conversation_key`, same key as compaction) + the /agent session's
+  memory block. Manager plan/review see <= 1500 chars of it. Workers see the
+  user brief (<= 6000). Synthesis max_tokens scales (cap `SYNTH_MAX_CAP`,
+  lowered per hop to `_model_output_cap`).
+- **Manager-less revision is directed** (`_free_revision`): free instruct call
+  -> free apply on the FULL draft, or per phase when too long for one apply.
+  Never a clipped rewrite.
+- **Multi**: `swarm_windows.start(context=)` (planner, every worker, manager
+  plan + verdicts; persisted). A short "continue" after a run with unfinished
+  phases calls `swarm_windows.resume()` on THAT run (only non-DONE phases +
+  review) instead of planning "continue". `_multi_context` = memory block +
+  recap + previous run result.
+- **Facts**: `memory.harvest_facts` after every finished /agent turn and multi
+  run, no model call: Decision/Note/Constraint and Must/Never/Always lines,
+  user preferences, ONE rolling files fact, ONE rolling verified-commands
+  fact, into the project scope. Flag `memory_fact_extractor` (default off)
+  adds a cheap free-model pass.
+- **Quick chat** sends `X-Conversation-Id: quick-<chat id>`; its recap is
+  dropped with the chat (`ctxwin.quick_chat_key`).
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

@@ -6253,13 +6253,23 @@
       } catch(e){ return null; }
     })();
 
-    function saveChatTurn(userText, assistantText){
-      if (!userText || !assistantText) return;
+    /* The id exists from the FIRST send, not the first saved turn: every
+       request carries it (X-Conversation-Id), and the hub keys this chat's
+       rolling compaction recap by it -- the same per-conversation recap a
+       terminal CLI's session id gets -- so a long quick chat keeps a recap of
+       the turns compaction drops, across reloads and hub restarts. */
+    function ensureChatConvId(){
       if (!chatConvId){
         chatConvId = 'c' + Date.now().toString(36) +
                      Math.random().toString(36).slice(2, 10);
         try { window.cxSetHashSession('sec-chat', chatConvId); } catch(e){}
       }
+      return chatConvId;
+    }
+
+    function saveChatTurn(userText, assistantText){
+      if (!userText || !assistantText) return;
+      ensureChatConvId();
       api('/api/chat/history/' + encodeURIComponent(chatConvId) + '/turn',
           { method: 'POST', body: { user: userText, assistant: assistantText,
                                     model: modelSel ? modelSel.value : null } })
@@ -6623,7 +6633,8 @@
          "Plan followed / Models used / Reviewer raised" trailer ONLY for this
          chat; CLI and API callers get the deliverable alone
          (_wants_pipeline_trailer in app.py). */
-      var hdrs = { 'Content-Type': 'application/json', 'X-Free-LLM-Hub': 'dashboard' };
+      var hdrs = { 'Content-Type': 'application/json', 'X-Free-LLM-Hub': 'dashboard',
+                   'X-Conversation-Id': 'quick-' + ensureChatConvId() };
       /* "Retry with a different model": name the ones already tried so the
          router skips them. Matched by leaf name server-side, so this excludes
          the same model on every host, not just the one that answered. */

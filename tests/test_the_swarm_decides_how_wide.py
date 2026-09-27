@@ -179,5 +179,6 @@ def test_a_worker_is_never_planned_onto_the_cheap_tier(monkeypatch):
 def test_every_swarm_start_offers_the_worker_list():
     src = open("app.py", encoding="utf-8").read()
     assert "modes=_mode_keys()" not in src
-    # the three start sites plus the resumed-run (manager re-attach) path
-    assert src.count("modes=_worker_mode_keys()") == 4
+    # the three start sites, the resumed-run (manager re-attach) path and the
+    # multi-tier "continue" that resumes a run's unfinished phases
+    assert src.count("modes=_worker_mode_keys()") == 5

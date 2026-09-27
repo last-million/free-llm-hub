@@ -1198,4 +1198,5 @@ def test_the_hard_cap_is_hours_and_the_idle_limit_beats_the_stall_watchdog():
 
 def test_every_hub_start_passes_the_stop_hook():
     src = open("app.py", encoding="utf-8").read()
-    assert src.count("stop=agentic_chat.stop_session") == 4
+    # +1: the "continue" path that resumes a run's unfinished phases
+    assert src.count("stop=agentic_chat.stop_session") == 5

@@ -8758,6 +8758,76 @@ def _summarize_worker(key, text, sid=None, conv=None, prev=None, head=None,
             _summary_inflight.discard(key)
 
 
+# OPTIONAL model-based fact extraction (flag memory_fact_extractor, default
+# OFF). memory.harvest_facts files the durable facts of every finished turn by
+# pattern alone, for free; with the flag on it ALSO asks one cheap free model
+# for the facts a pattern cannot see. Runs on memory's own daemon thread,
+# never on a request; never a paid subscription; any failure files nothing.
+_FACT_EXTRACT_SYSTEM = (
+    "From this finished exchange between a user and a coding agent, list the "
+    "DURABLE facts worth remembering for future work in the same project: "
+    "decisions made, constraints, stated user preferences, commands that "
+    "work, where things live. One per line, each a short standalone sentence, "
+    "at most 5. Nothing temporary, nothing speculative, nothing not stated in "
+    "the exchange. If there are none, reply NONE.")
+_FACT_EXTRACT_MAX_TOKENS = 400
+
+
+def _memory_fact_extractor(request_text, reply_text):
+    try:
+        if not config.get_flag("memory_fact_extractor", False):
+            return []
+    except Exception:                                            # noqa: BLE001
+        return []
+    msgs = [{"role": "system", "content": _FACT_EXTRACT_SYSTEM},
+            {"role": "user", "content": "USER:\n%s\n\nAGENT:\n%s"
+             % (str(request_text or "")[:3000], str(reply_text or "")[-6000:])}]
+    try:
+        pid, model, _d = _route_by_difficulty(msgs, _FACT_EXTRACT_MAX_TOKENS,
+                                              require_tools=False,
+                                              force_difficulty="simple")
+        if not pid:
+            return []
+        for hop_pid, hop_model in _build_chain(pid, model)[:3]:
+            if _is_sub(hop_pid):
+                continue                   # never spend a paid subscription here
+            try:
+                resp = _dispatch_chat(hop_pid, {"model": hop_model, "stream": False,
+                                                "max_tokens": _FACT_EXTRACT_MAX_TOKENS,
+                                                "messages": msgs}, False)
+                data = resp.json() if resp.status_code == 200 else None
+                resp.close()
+            except (requests.RequestException, RuntimeError, ValueError):
+                continue
+            out = _strip_thinking(
+                (((data or {}).get("choices") or [{}])[0].get("message") or {})
+                .get("content") or "").strip()
+            if not out:
+                continue
+            if out.upper().startswith("NONE"):
+                return []
+            facts = []
+            for line in out.splitlines():
+                line = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s*", "", line).strip()
+                if line and line.upper() != "NONE":
+                    facts.append(line[:memory.MAX_FACT_CHARS])
+            return facts[:5]
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[memory] fact extractor failed", exc_info=True)
+    return []
+
+
+def _memory_fact_extractor_on():
+    try:
+        return bool(config.get_flag("memory_fact_extractor", False))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+_memory_fact_extractor.enabled = _memory_fact_extractor_on
+memory.set_fact_extractor(_memory_fact_extractor)
+
+
 def _summarize_dropped(dropped):
     """A recap of the discarded turns if one is READY, else None — and start
     computing it in the background for next time.
@@ -13219,6 +13289,50 @@ def _multi_wants_a_swarm(text):
     return bool(words & set(_MULTI_WORK_WORDS))
 
 
+# A "continue" is short: "continue the header in blue, and add a footer" is new
+# work that happens to start with the word, and gets a new run (with context).
+_MULTI_CONTINUE_MAX_CHARS = 80
+_MULTI_CONTEXT_MEMORY_CHARS = 2000
+_MULTI_CONTEXT_RECAP_CHARS = 2000
+_MULTI_CONTEXT_PREV_CHARS = 2000
+
+
+def _multi_is_continue(text):
+    t = " ".join((text or "").split())
+    try:
+        return bool(t) and len(t) <= _MULTI_CONTINUE_MAX_CHARS and memory.asks_to_resume(t)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _multi_context(session_id, project_dir, text, prev=None):
+    """What a multi run in this conversation must know beyond `text`
+    (bounded by swarm_windows.CONTEXT_CHARS): the owner session's memory
+    block, the conversation's rolling recap, and the previous run's result.
+    "" when there is nothing. Never raises."""
+    parts = []
+    try:
+        block = memory.context_block(session_id, budget_chars=_MULTI_CONTEXT_MEMORY_CHARS,
+                                     project_dir=project_dir or None, query=text or "")
+        if block:
+            parts.append(block.strip())
+    except Exception:                                            # noqa: BLE001
+        pass
+    recap = _conversation_recap("agent:" + str(session_id)[:120]) if session_id else ""
+    if recap:
+        parts.append("Recap of the earlier turns:\n"
+                     + swarm._clip(recap, _MULTI_CONTEXT_RECAP_CHARS))
+    if prev is not None:
+        try:
+            res = swarm_windows.format_result(prev.id) or ""
+        except Exception:                                        # noqa: BLE001
+            res = ""
+        if res:
+            parts.append("The previous multi-session run in this conversation:\n"
+                         + swarm._clip(res, _MULTI_CONTEXT_PREV_CHARS))
+    return "\n\n".join(parts).strip()[:swarm_windows.CONTEXT_CHARS]
+
+
 def _multi_turn_events(session_id, sess_info, text):
     """A turn in the "multi" tier: `text` is the goal of a swarm_windows run in
     this conversation's folder, under this conversation's CLI. Whether a
@@ -13255,6 +13369,38 @@ def _multi_turn_events(session_id, sess_info, text):
     except Exception:                                            # noqa: BLE001
         pass
 
+    # THE CONVERSATION, NOT JUST THIS MESSAGE. A follow-up is resolved against
+    # what came before it: the previous run in this conversation, the rolling
+    # recap, the session's memory.
+    prev = swarm_windows.last_run_for(session_id)
+    context = _multi_context(session_id, project_dir, text, prev)
+    if _multi_is_continue(text) and swarm_windows.unfinished(prev):
+        # "continue" after a run that left phases unfinished resumes THOSE
+        # phases -- never a fresh plan whose goal is the word "continue".
+        todo = swarm_windows.unfinished(prev)
+        try:
+            run_id = swarm_windows.resume(
+                prev.id, _swarm_windows_spawn, _swarm_windows_turn,
+                configure=_swarm_windows_configure,
+                on_done=_multi_owner_record,
+                stop=agentic_chat.stop_session,
+                modes=_worker_mode_keys(),
+                context=context or None,
+                **_swarm_windows_manager_kw())
+        except Exception:                                        # noqa: BLE001
+            run_id = None
+        if run_id:
+            with _MULTI_LOCK:
+                _MULTI_RUNS[session_id] = run_id
+            yield {"event": "notice",
+                   "text": "Continuing run %s: re-running the %d phase%s that did "
+                           "not finish (%s)." % (
+                               run_id, len(todo), "" if len(todo) == 1 else "s",
+                               ", ".join(a.title for a in todo)[:200])}
+            for ev in _multi_follow_events(run_id, cli_id):
+                yield ev
+            return
+
     try:
         run_id = swarm_windows.start(
             text, project_dir, cli_id,
@@ -13265,7 +13411,7 @@ def _multi_turn_events(session_id, sess_info, text):
             modes=_worker_mode_keys(),
             on_done=_multi_owner_record,
             owner=session_id,
-            **_swarm_windows_manager_kw())
+            **dict(_swarm_windows_manager_kw(), **({"context": context} if context else {})))
     except swarm_windows.SwarmWindowsError as exc:
         yield {"event": "error", "status": 400, "detail": str(exc)}
         return
@@ -13305,6 +13451,13 @@ def _multi_record(session_id, run):
         memory.update_tasks(session_id, report, run.project_dir)
         if run.state == swarm_windows.DONE:
             memory.clear_interrupted(session_id)
+            # LONG horizon: the decisions the phases stated and the goal's
+            # stated preferences, filed for the project (no model call).
+            tools = [e.get("text") for a in run.agents for e in list(a.events)
+                     if isinstance(e, dict) and e.get("event") == "tool"
+                     and e.get("text")][-200:]
+            memory.harvest_facts(session_id, request=run.goal, reply=report,
+                                 project_dir=run.project_dir, tools=tools)
         else:
             doing = ["phase %d %s: %s" % (a.index, a.title, a.state) for a in run.agents]
             memory.note_interrupted(session_id, request=run.goal, doing=doing,
@@ -16339,7 +16492,15 @@ def api_chat_history_get(cid):
 
 @app.route("/api/chat/history/<cid>", methods=["DELETE"])
 def api_chat_history_delete(cid):
-    return jsonify({"deleted": quick_history.delete_conversation(cid)})
+    deleted = quick_history.delete_conversation(cid)
+    # Its rolling compaction recap goes with it (keyed by the chat id the
+    # page sends as X-Conversation-Id): a deleted chat must not live on as a
+    # recap a later chat could never see but the store still carries.
+    try:
+        _recap_store.delete(ctxwin.quick_chat_key(cid))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return jsonify({"deleted": deleted})
 
 
 @app.route("/api/chat/history/<cid>/turn", methods=["POST"])
@@ -23429,8 +23590,15 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
                 if _outer_left <= 1:
                     break
                 _hop_deadline = min(_hop_deadline, _outer_left)
+            # Bounded by the hop's own output cap when one was learned: a
+            # synthesis now asks for up to swarm.SYNTH_MAX_CAP, which a model
+            # capped lower would refuse outright.
+            _hop_max = max_tokens
+            _ocap = _model_output_cap(hop_pid, hop_model)
+            if _ocap and isinstance(_hop_max, int) and _hop_max > _ocap:
+                _hop_max = _ocap
             payload = {"model": hop_model, "stream": False,
-                       "max_tokens": max_tokens, "messages": messages,
+                       "max_tokens": _hop_max, "messages": messages,
                        "_no_craft": True}   # stripped in _upstream_chat
             resp, hop_exc = _dispatch_chat_with_deadline(hop_pid, payload,
                                                          _hop_deadline)
@@ -24314,6 +24482,60 @@ def _wants_pipeline_trailer():
         return False
 
 
+# THE CONVERSATION, FOR A PROSE PIPELINE. swarm.run folds the earlier turns in
+# `messages` into the brief itself; this is what the hub knows BEYOND them --
+# the conversation's persisted rolling recap (the turns a CLI already compacted
+# away) and, for a request from an /agent session, that session's memory
+# block. Keyed exactly like compaction (ctxwin.conversation_key: the CLI's own
+# session id, the dashboard chat's id, else a content hash), so a swarm/crew/
+# multi request from any terminal CLI uses the same per-session recap.
+_PIPELINE_CONTEXT_CHARS = 3000
+_PIPELINE_MEMORY_CHARS = 2000
+
+
+def _conversation_recap(conv):
+    """The persisted rolling recap of conversation `conv`, or ""."""
+    try:
+        entry = _recap_store.get(conv) if conv else None
+        return str((entry or {}).get("recap") or "").strip()
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _pipeline_context(body, messages, sid=None):
+    """Bounded (<= _PIPELINE_CONTEXT_CHARS) context for swarm/crews.run's
+    `context`, or "". Never raises."""
+    try:
+        sid = sid or _build_sid()
+    except Exception:                                            # noqa: BLE001
+        sid = None
+    parts = []
+    if sid:
+        try:
+            sess = agentic_chat.get_session(sid) or {}
+            block = memory.context_block(
+                sid, budget_chars=_PIPELINE_MEMORY_CHARS,
+                project_dir=sess.get("project_dir") or None,
+                query=swarm._last_user_text(messages))
+        except Exception:                                        # noqa: BLE001
+            block = ""
+        if block:
+            parts.append(block.strip())
+    try:
+        hdrs = request.headers
+    except Exception:                                            # noqa: BLE001
+        hdrs = None
+    try:
+        conv = ctxwin.conversation_key(hdrs, body, sid, messages)
+    except Exception:                                            # noqa: BLE001
+        conv = None
+    recap = _conversation_recap(conv)
+    room = _PIPELINE_CONTEXT_CHARS - sum(len(p) + 2 for p in parts) - 40
+    if recap and room > 200:
+        parts.append("Recap of the earlier turns:\n" + swarm._clip(recap, room))
+    return "\n\n".join(parts).strip()[:_PIPELINE_CONTEXT_CHARS]
+
+
 def _swarm_completion(body):
     """Run the swarm (or a crew) and return ONE ordinary chat-completions response."""
     if body.get("tools"):
@@ -24368,6 +24590,11 @@ def _swarm_completion(body):
     # A configured subscription manager plans/checks/fixes; free models still
     # do the work. Absent -> no kwarg, the pipeline exactly as before.
     extra.update(_swarm_manager_kwargs())
+    # The conversation beyond `messages` (recap / session memory); swarm.run
+    # folds it into the brief with the earlier turns. Absent -> no kwarg.
+    _ctx_text = _pipeline_context(body, messages)
+    if _ctx_text:
+        extra["context"] = _ctx_text
     # The outer bound is set BEFORE binding, so the context copy _pipeline_bound
     # takes carries it into every stage thread. Reset afterwards: a pooled
     # server thread must not hand a stale deadline to its next request.

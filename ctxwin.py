@@ -448,10 +448,28 @@ class RecapStore:
                 self._data.popitem(last=False)
             self._save()
 
+    def delete(self, key):
+        """Forget one conversation's recap (it was deleted). True if it had one."""
+        if not key:
+            return False
+        with self._lock:
+            self._ensure_loaded()
+            if self._data.pop(key, None) is None:
+                return False
+            self._save()
+            return True
+
     def __len__(self):
         with self._lock:
             self._ensure_loaded()
             return len(self._data)
+
+
+def quick_chat_key(chat_id):
+    """The conversation key the dashboard quick chat's requests resolve to:
+    it sends X-Conversation-Id: quick-<chat id> (see conversation_key)."""
+    cid = _clean_id("quick-" + str(chat_id or "")) if chat_id else None
+    return ("hdr:" + cid) if cid else None
 
 
 # --------------------------------------------------------------------------- #

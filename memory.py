@@ -1154,6 +1154,233 @@ def forget_project(project_dir):
     return forget(project_key(project_dir))
 
 
+# LONG-TERM FACTS, HARVESTED. The long horizon (remember_project_fact, the
+# project/global scopes) had no writer outside the tests -- the only fact any
+# conversation ever filed was "The original request". So every new session in a
+# project re-learned the package manager, the test command and the decisions
+# the last one made. After each completed /agent turn and each multi run this
+# harvests what is durable, CHEAPLY: no model call (unless the optional
+# extractor below is switched on), just what the turn said in so many words.
+#
+#   decisions   reply lines "Decision:/Note:/Constraint:" or starting with
+#               Must/Never/Always (outside code fences)
+#   preferences what the USER stated: "always ...", "never ...", "use ...",
+#               "I want ..."
+#   files       what the turn's tool calls created or edited (ONE rolling fact)
+#   commands    test/build commands the turn ran, when the reply says they
+#               passed (ONE rolling fact)
+#
+# Stored with remember_project_fact (project scope, stamped) when the turn has
+# a folder, else in the session's own facts; deduplicated and capped like
+# every other fact.
+HARVEST_MAX_DECISIONS = 5
+HARVEST_MAX_PREFS = 3
+HARVEST_FILES = 8
+HARVEST_COMMANDS = 4
+HARVEST_MIN_CHARS = 12
+FILES_FACT_PREFIX = "Files recently created or changed: "
+COMMANDS_FACT_PREFIX = "Commands verified to work here: "
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_LEAD_RE = re.compile(r"^\s*(?:[-*+>]|\d+[.)]|#{1,6})\s+")
+_DECISION_RE = re.compile(r"^(decision|decided|note|constraint)\s*:\s*(.+)$", re.I)
+_RULE_START_RE = re.compile(r"^(must|never|always)\b", re.I)
+_PREF_RE = re.compile(r"^(?:please\s+)?(always|never|use|i want|i'd like|i prefer)\b", re.I)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+|\n+")
+_WRITE_TOOL_RE = re.compile(
+    r"^\s*(write|edit|create|multiedit|multi_edit|str_replace\w*|apply_patch|"
+    r"notebookedit|create_file|write_file|edit_file|replace)\b\s*:?\s+"
+    r"[\"'`]?([^\s\"'`]+)", re.I)
+_VERIFY_CMD_RE = re.compile(
+    r"\b(pytest|py\.test|unittest|npm (?:run )?(?:test|build)|pnpm (?:run )?(?:test|build)|"
+    r"yarn (?:run )?(?:test|build)|bun (?:run )?(?:test|build)|cargo (?:test|build|check)|"
+    r"go (?:test|build|vet)|make (?:test|build|check)|tsc\b|vitest|jest|"
+    r"mvn (?:test|package|verify)|gradlew? (?:test|build)|dotnet (?:test|build)|"
+    r"ruff|flake8|mypy|eslint)", re.I)
+_PASSED_RE = re.compile(
+    r"\b(tests? pass(?:ed|es|ing)?|all (?:\d+ )?(?:tests? )?pass(?:ed|ing)?|"
+    r"\d+ passed|pass(?:ed|es) (?:cleanly|locally)|build (?:succeeded|passes|passed|is green|ok)|"
+    r"succeeded|green|no (?:errors|failures)|0 failed|compiles? cleanly)\b", re.I)
+_FAILED_RE = re.compile(
+    r"\b([1-9]\d* (?:failed|failing|errors?)|tests? (?:fail|failed|failing)|"
+    r"build failed|still fail\w*|could not (?:run|pass)|did not pass)\b", re.I)
+
+# Optional model-based extractor (flag memory_fact_extractor, default off; the
+# hub installs it). `fn(request, reply) -> [str]`, run OFF the caller's thread.
+_FACT_EXTRACTOR = None
+
+
+def set_fact_extractor(fn):
+    global _FACT_EXTRACTOR
+    _FACT_EXTRACTOR = fn if callable(fn) else None
+
+
+def _prose_lines(text):
+    """The reply's lines outside code fences, markdown leads stripped."""
+    out, fenced = [], False
+    for raw in (text or "").splitlines():
+        if _FENCE_RE.match(raw):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        line = _LEAD_RE.sub("", raw).replace("**", "").replace("__", "").strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def harvest_decisions(reply):
+    """Explicit decision / constraint lines in a reply, as facts."""
+    out = []
+    for line in _prose_lines(reply):
+        m = _DECISION_RE.match(line)
+        if m:
+            fact = "%s: %s" % (m.group(1).capitalize(), m.group(2).strip())
+        elif _RULE_START_RE.match(line):
+            fact = line
+        else:
+            continue
+        if len(fact) >= HARVEST_MIN_CHARS and fact not in out:
+            out.append(fact[:MAX_FACT_CHARS])
+        if len(out) >= HARVEST_MAX_DECISIONS:
+            break
+    return out
+
+
+def harvest_preferences(request):
+    """Standing preferences the USER stated, as facts."""
+    out = []
+    for sent in _SENTENCE_SPLIT_RE.split(request or ""):
+        s = " ".join(_LEAD_RE.sub("", sent).split()).rstrip(" .;")
+        if not (HARVEST_MIN_CHARS <= len(s) <= 200) or not _PREF_RE.match(s):
+            continue
+        fact = "User preference: " + s
+        if fact not in out:
+            out.append(fact)
+        if len(out) >= HARVEST_MAX_PREFS:
+            break
+    return out
+
+
+def _rel_path(path, project_dir):
+    p = (path or "").strip().strip(",;)")
+    if not p:
+        return ""
+    if project_dir and os.path.isabs(p):
+        try:
+            rel = os.path.relpath(p, project_dir)
+        except ValueError:                   # another drive on Windows
+            return ""
+        if rel.startswith(".."):
+            return ""                        # outside the project: not its fact
+        p = rel
+    return p.replace("\\", "/")
+
+
+def harvest_files(tools, project_dir=None):
+    """Files the turn's tool calls created or edited, newest first."""
+    out = []
+    for t in reversed(list(tools or ())):
+        m = _WRITE_TOOL_RE.match(str(t or ""))
+        if not m:
+            continue
+        p = _rel_path(m.group(2), project_dir)
+        if p and p not in out and "." in os.path.basename(p):
+            out.append(p)
+        if len(out) >= HARVEST_FILES:
+            break
+    return out
+
+
+def harvest_commands(tools, reply):
+    """Test/build commands the turn ran, when the reply says they passed."""
+    r = reply or ""
+    if not _PASSED_RE.search(r) or _FAILED_RE.search(r):
+        return []
+    out = []
+    for t in reversed(list(tools or ())):
+        s = " ".join(str(t or "").split())
+        if not s or not _VERIFY_CMD_RE.search(s) or _WRITE_TOOL_RE.match(s):
+            continue
+        # "bash: pytest -q" / "shell pytest -q" -> the command itself
+        s = re.sub(r"^(bash|shell|sh|powershell|cmd|run|exec|command)\s*:?\s+", "",
+                   s, flags=re.I)
+        s = re.sub(r"^-l?c\s+", "", s).strip("'\" ")[:120]
+        if s and s not in out:
+            out.append(s)
+        if len(out) >= HARVEST_COMMANDS:
+            break
+    return out
+
+
+def _merge_rolling(scope, prefix, items, project_dir, limit, sep):
+    """ONE rolling fact per kind: the new items first, then the ones it
+    already listed, capped -- and the previous version of it removed, so a
+    busy project does not push its decisions out with file lists."""
+    if not scope or not items:
+        return False
+    with _LOCK:
+        mem = get(scope)
+        facts = [f for f in mem.get("facts") or [] if isinstance(f, str)]
+        old = []
+        for f in facts:
+            if f.startswith(prefix):
+                old += [x.strip().strip("`") for x in f[len(prefix):].split(sep.strip())
+                        if x.strip()]
+        merged = []
+        for x in list(items) + old:
+            x = x.strip().strip("`")
+            if x and x not in merged:
+                merged.append(x)
+        merged = merged[:limit]
+        mem["facts"] = [f for f in facts if not f.startswith(prefix)]
+        _save(mem)
+    shown = sep.join(("`%s`" % x) if sep == "; " else x for x in merged)
+    return remember_fact(scope, prefix + shown, project_dir=project_dir)
+
+
+def harvest_facts(session_id, request="", reply="", project_dir=None, tools=()):
+    """File the durable facts of a finished turn (see above). Returns the
+    facts it filed. Never raises."""
+    filed = []
+    try:
+        scope = project_key(project_dir) if project_dir else session_id
+        if not scope:
+            return filed
+        for fact in harvest_preferences(request) + harvest_decisions(reply):
+            if remember_fact(scope, fact, project_dir=project_dir):
+                filed.append(fact)
+        files = harvest_files(tools, project_dir)
+        if files and _merge_rolling(scope, FILES_FACT_PREFIX, files, project_dir,
+                                    HARVEST_FILES, ", "):
+            filed.append(FILES_FACT_PREFIX + ", ".join(files))
+        cmds = harvest_commands(tools, reply)
+        if cmds and _merge_rolling(scope, COMMANDS_FACT_PREFIX, cmds, project_dir,
+                                   HARVEST_COMMANDS, "; "):
+            filed.append(COMMANDS_FACT_PREFIX + "; ".join(cmds))
+        extractor = _FACT_EXTRACTOR
+        enabled = getattr(extractor, "enabled", None)
+        if extractor is not None and callable(enabled) and not enabled():
+            extractor = None              # switched off: no thread at all
+        if extractor is not None and (request or reply):
+            threading.Thread(target=_run_extractor,
+                             args=(extractor, scope, request, reply, project_dir),
+                             daemon=True, name="memory-facts").start()
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[memory] harvest failed", exc_info=True)
+    return filed
+
+
+def _run_extractor(extractor, scope, request, reply, project_dir):
+    try:
+        facts = extractor(request or "", reply or "") or []
+        for f in list(facts)[:HARVEST_MAX_DECISIONS]:
+            if isinstance(f, str) and len(f.strip()) >= HARVEST_MIN_CHARS:
+                remember_fact(scope, f.strip(), project_dir=project_dir)
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[memory] fact extractor failed", exc_info=True)
+
+
 # WHEN A LONG MEMORY IS WORTH ITS TOKENS.
 #
 # "long memory or context can be used only when really needed." Injecting

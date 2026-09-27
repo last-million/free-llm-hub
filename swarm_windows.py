@@ -85,6 +85,33 @@ EVENT_BUFFER = 400
 # What a parent's summary is clipped to when it is fed to a child. Same
 # reasoning as swarm.DEP_CONTEXT_CHARS: dependencies are context, not the task.
 DEP_CONTEXT_CHARS = 4000
+
+# The conversation a run is a turn of, as the run carries it (see _Run.context):
+# at most CONTEXT_CHARS in all; the planner sees up to PLAN_CONTEXT_CHARS of it,
+# each worker WORKER_CONTEXT_CHARS, the (paid) manager MANAGER_CONTEXT_CHARS.
+CONTEXT_CHARS = 6000
+PLAN_CONTEXT_CHARS = 4000
+WORKER_CONTEXT_CHARS = 2000
+MANAGER_CONTEXT_CHARS = 1500
+_CONTEXT_HEADING = ("--- conversation context (earlier in this conversation; "
+                    "use it to understand the goal, do not redo finished work) ---")
+
+
+def _clip_text(text, limit):
+    """Head + tail, so a clipped context keeps how it starts AND ends."""
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    head = int(limit * 0.6)
+    return text[:head] + "\n[... trimmed ...]\n" + text[-(limit - head - 20):]
+
+
+def _with_context(goal, context, limit):
+    """`goal`, plus the bounded context under its heading when there is any."""
+    context = _clip_text(context, limit)
+    return goal if not context else "%s\n\n%s\n%s" % (goal, _CONTEXT_HEADING, context)
+
+
 # The last wave is a REVIEW: one agent that reads what every other agent did and
 # finishes the job rather than reporting on it.
 #
@@ -477,12 +504,21 @@ class _Run:
     __slots__ = ("id", "goal", "project_dir", "cli_id", "agents", "state",
                  "error", "created_at", "ended_at", "stop_flag", "lock", "waves",
                  "restored", "interrupted", "store_root", "owner",
-                 "manager", "managed", "modes", "manager_tokens", "manager_calls")
+                 "manager", "managed", "modes", "manager_tokens", "manager_calls",
+                 "context", "resumes")
 
     def __init__(self, goal, project_dir, cli_id, phases, owner=None,
-                 manager=None, modes=()):
+                 manager=None, modes=(), context=""):
         self.id = "swarm-" + uuid.uuid4().hex[:12]
         self.goal = goal
+        # WHAT THE CONVERSATION ALREADY ESTABLISHED (bounded, see
+        # CONTEXT_CHARS): the owner session's memory block, its recap, the
+        # previous run's result. The goal alone is one message; "make it
+        # better" as a goal meant planning from three words. Persisted, so a
+        # resumed run's workers are briefed the same way.
+        self.context = _clip_text(context, CONTEXT_CHARS)
+        # How many times this run was picked back up by a "continue".
+        self.resumes = 0
         self.project_dir = project_dir
         self.cli_id = cli_id
         self.agents = [_Agent(i + 1, p) for i, p in enumerate(phases)]
@@ -538,6 +574,7 @@ class _Run:
             "managed": bool(self.managed or self.manager is not None),
             "manager_tokens": self.manager_tokens,
             "manager_calls": self.manager_calls,
+            "context": self.context, "resumes": self.resumes,
             "error": self.error, "created_at": self.created_at,
             "ended_at": self.ended_at,
             "waves": [list(w) for w in self.waves],
@@ -564,7 +601,12 @@ class _Run:
         if not phases:
             return None
         run = cls(row.get("goal") or "", row.get("project_dir") or "",
-                  row.get("cli") or "", phases)
+                  row.get("cli") or "", phases,
+                  context=row.get("context") if isinstance(row.get("context"), str) else "")
+        try:
+            run.resumes = max(0, int(row.get("resumes") or 0))
+        except (TypeError, ValueError):
+            run.resumes = 0
         run.id = str(row["run_id"])
         run.owner = row.get("owner") or None
         run.state = row.get("state") or DONE
@@ -742,6 +784,11 @@ def _agent_prompt(run, agent):
               % (agent.index, len(run.agents)),
               "The swarm's overall goal is: " + run.goal,
               "Your phase is called: " + agent.title]
+    ctx = _clip_text(getattr(run, "context", ""), WORKER_CONTEXT_CHARS)
+    if ctx:
+        # The conversation this run continues: what "it" is, what was already
+        # decided and built. Context, like the rest of this section.
+        parts += ["", "WHAT THE CONVERSATION ALREADY ESTABLISHED:", ctx]
     deps = [a for a in run.agents if a.index in agent.needs]
     finished = [a for a in deps if a.summary]
     if finished:
@@ -1056,6 +1103,9 @@ def _manager_verdict(run, agent, changed):
         brief.append("Done when: " + agent.done_when)
     if agent.acceptance:
         brief.append("Acceptance: " + agent.acceptance)
+    ctx = _clip_text(getattr(run, "context", ""), MANAGER_CONTEXT_CHARS)
+    if ctx:
+        brief.append("Conversation context (excerpt): " + ctx)
     brief.append("Files changed during the phase: "
                  + (", ".join(changed[:VERIFY_FILES]) or "(none)")
                  + (" (+%d more)" % (len(changed) - VERIFY_FILES)
@@ -1285,7 +1335,7 @@ _PLAN_NUDGE = ("\n\n(Your previous reply could not be read as the JSON object "
                "fences, nothing before the opening brace.)")
 
 
-def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None):
+def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context=""):
     """Ask a model to break `goal` into phases. Returns [] when it cannot.
 
     `planner(system, user) -> str` is injected so this can be tested, and so the
@@ -1295,11 +1345,16 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None):
     brief (_PLAN_SYSTEM_MANAGED) -- once, no nudge: a second paid ask is not
     worth it when the free planner is right here. Its "" (disabled, over
     budget, failed) or an unreadable plan falls through to the free planner,
-    unchanged."""
+    unchanged.
+
+    `context` (the conversation so far, see _Run.context) follows the goal
+    under its own heading: up to PLAN_CONTEXT_CHARS for the free planner,
+    MANAGER_CONTEXT_CHARS for the manager. "" = the goal alone, as before."""
     mode_list = ", ".join(modes) if modes else "coding"
     if manager is not None:
         try:
-            raw = manager(_PLAN_SYSTEM_MANAGED.replace("{modes}", mode_list), goal)
+            raw = manager(_PLAN_SYSTEM_MANAGED.replace("{modes}", mode_list),
+                          _with_context(goal, context, MANAGER_CONTEXT_CHARS))
         except Exception as exc:                                 # noqa: BLE001
             _log.warning("[swarm] manager planner raised: %s", exc)
             raw = ""
@@ -1310,6 +1365,7 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None):
             _log.warning("[swarm] manager plan unreadable (%d chars); free planner "
                          "takes over", len(raw))
     system = _PLAN_SYSTEM.replace("{modes}", mode_list)
+    goal = _with_context(goal, context, PLAN_CONTEXT_CHARS)
     ask = goal
     for attempt in range(1, PLAN_ATTEMPTS + 1):
         try:
@@ -1391,6 +1447,77 @@ def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
     return resumed
 
 
+def last_run_for(owner):
+    """The most recent run that was a turn of conversation `owner`, or None."""
+    if not owner:
+        return None
+    with _LOCK:
+        mine = [r for r in _RUNS.values() if getattr(r, "owner", None) == owner]
+    return max(mine, key=lambda r: r.created_at) if mine else None
+
+
+def unfinished(run):
+    """The phases of an ENDED run a "continue" should pick back up: every
+    phase that did not finish (failed, stopped, never started). [] while the
+    run is still going, or when every phase is done."""
+    if run is None or run.state in (PENDING, RUNNING):
+        return []
+    return [a for a in run.agents if a.state != DONE and not _is_review(run, a)] or \
+        [a for a in run.agents if a.state != DONE]
+
+
+def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
+           manager=None, modes=None, context=None):
+    """Pick an ENDED run back up where it stopped. Returns the run id, or None
+    when there is nothing to resume.
+
+    REPORTED: in a conversation set to Multi sessions, "continue" after a run
+    that left phases failed was treated as NEW work -- a fresh run whose goal
+    was literally "continue", planned from that one word, that rebuilt things
+    the first run had finished. A continue now re-runs exactly the phases that
+    did not finish (in fresh sessions, the same folder, so a worker that wrote
+    half its files carries on from what is on disk), then the review again,
+    and the same run's report answers -- like resume_interrupted, for a run
+    that ended rather than one a restart cut off.
+
+    `context` (optional) REPLACES the run's conversation context -- the
+    conversation has moved on since the run started."""
+    run = get(run_id)
+    if run is None:
+        return None
+    with run.lock:
+        todo = unfinished(run)
+        if not todo:
+            return None
+        review = [a for a in run.agents if _is_review(run, a) and a not in todo]
+        for agent in todo + review:
+            agent.state = PENDING
+            agent.error = None
+            agent.session_id = None
+            agent.started_at = None
+            agent.ended_at = None
+            agent.abandoned = False
+            agent.verified = None
+            agent.revisions = 0
+        run.state = PENDING
+        run.error = None
+        run.ended_at = None
+        run.restored = False
+        run.interrupted = False
+        run.stop_flag.clear()
+        run.resumes += 1
+        if context is not None:
+            run.context = _clip_text(context, CONTEXT_CHARS)
+        if manager is not None and run.managed:
+            run.manager = manager
+        if modes and not run.modes:
+            run.modes = tuple(modes)
+    _persist(run)
+    threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure, stop),
+                     daemon=True, name="swarm-continue-" + run.id).start()
+    return run.id
+
+
 class _PlanMeter:
     """Charges the planning call before the run it belongs to exists."""
 
@@ -1410,7 +1537,7 @@ class _PlanMeter:
 
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
           on_done=None, configure=None, modes=(), review=True, owner=None, stop=None,
-          manager=None):
+          manager=None, context=""):
     """Begin a run. Returns the run id immediately; the work happens on a
     background thread.
 
@@ -1419,7 +1546,11 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     `manager(system, user, purpose, max_tokens) -> (text, tokens)` is the
     hub's subscription manager, or None. With it, the manager plans (the free
     `planner` is the fallback) and verifies each phase; without it, the run is
-    exactly what it always was."""
+    exactly what it always was.
+
+    `context` is the conversation this run continues (bounded to
+    CONTEXT_CHARS): the planner, every worker and the manager's plan and
+    verdicts see it under its own heading. "" = the goal alone."""
     goal = str(goal or "").strip()
     if not goal:
         raise SwarmWindowsError("a goal is required")
@@ -1427,15 +1558,16 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     if phases is None:
         if planner is None:
             raise SwarmWindowsError("give either phases or a planner")
+        extra = {"context": context} if context else {}
         phases = plan(goal, planner, modes=modes,
-                      manager=meter.ask if meter else None)
+                      manager=meter.ask if meter else None, **extra)
     phases = clean_phases({"phases": phases}, modes=modes) if phases else []
     if not phases:
         raise SwarmWindowsError("could not turn that into phases")
     if review:
         phases = with_review(phases)
     run = _Run(goal, project_dir, cli_id, phases, owner=owner,
-               manager=manager, modes=modes)
+               manager=manager, modes=modes, context=context)
     if meter:
         run.manager_tokens, run.manager_calls = meter.tokens, meter.calls
     _remember(run)

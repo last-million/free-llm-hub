@@ -178,15 +178,23 @@ def test_no_instructions_from_the_manager_applies_the_reviewer_problems():
     assert HERO in _work_of(applies[0]["user"])
 
 
-def test_without_a_manager_the_revision_call_is_unchanged():
+def test_without_a_manager_the_revision_is_directed_too():
+    """CHANGED: the plain pipeline used to hand one free model the draft
+    CLIPPED to DEP_CONTEXT_CHARS and let its rewrite replace the draft, so a
+    long draft lost its trimmed middle. Now a free call writes instructions
+    and a free apply edits the FULL draft -- no clipped rewrite anywhere."""
     d = _free()
     swarm.run(ASK, d, profile=REV)
-    assert d.of("apply") == [] and d.of("instruct") == []
-    rev = d.of("revision")
-    assert len(rev) == 1 and rev[0]["max_tokens"] == swarm.SYNTH_MAX_TOKENS
-    # The plain pipeline still clips the draft, exactly as it always did.
-    assert "[... trimmed ...]" in rev[0]["user"]
-    assert "## FAQ" not in d.of("synth")[0]["user"]
+    assert d.of("revision") == [], "a clipped whole-draft rewrite still ran"
+    instruct = d.of("instruct")
+    assert len(instruct) == 1 and "FAQ section missing" in instruct[0]["user"]
+    applies = d.of("apply")
+    assert len(applies) == 1
+    work = _work_of(applies[0]["user"])
+    assert HERO in work and PRICING in work and "[... trimmed ...]" not in work
+    # The free instructions were empty, so the reviewer's problems stood in.
+    assert "1. Fix: FAQ section missing" in applies[0]["user"]
+    assert "## FAQ" in d.of("synth")[0]["user"]
 
 
 # ---- a long phase that failed twice --------------------------------------

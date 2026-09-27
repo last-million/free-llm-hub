@@ -345,6 +345,20 @@ def detect_crew(messages):
     text = swarm._last_user_text(messages)
     if not text:
         return ""
+    got = _detect_text(text)
+    if got:
+        return got
+    # A follow-up ("make it better") names no domain: the conversation it
+    # continues does. The most recent earlier request that names one wins.
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            got = _detect_text(swarm._text_of(m))
+            if got:
+                return got
+    return ""
+
+
+def _detect_text(text):
     # Order matters where vocabularies overlap: "write a script" is code,
     # "landing page copy" is design — the more structural domain wins.
     if _CODE_RE.search(text):
@@ -405,7 +419,7 @@ def looks_like_full_project(text):
 
 
 def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
-        manager=None):
+        manager=None, context=None):
     """Run the swarm pipeline under a crew persona. Same dispatch contract and
     result-dict shape as swarm.run(); the result gains a "crew" key naming the
     persona actually used ("" = generic pipeline).
@@ -422,7 +436,10 @@ def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
     so a caller (or a test double of swarm.run) that predates it is untouched.
 
     `manager` is swarm.run's optional plan/check/fix model (see its docstring);
-    forwarded only when given, for the same reason."""
+    forwarded only when given, for the same reason.
+
+    `context` is swarm.run's conversation context (recap / memory block),
+    folded into the brief with the earlier turns; forwarded only when set."""
     name = (crew_name or "").strip().lower()
     if name.startswith("crew-"):
         name = name[5:]
@@ -432,6 +449,8 @@ def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
     extra = {"max_seconds": max_seconds} if max_seconds else {}
     if manager is not None:
         extra["manager"] = manager
+    if context:
+        extra["context"] = context
     result = swarm.run(messages, dispatch, profile=profile, on_event=on_event,
                        **extra)
     result["crew"] = name if profile else ""

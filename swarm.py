@@ -133,6 +133,44 @@ APPLY_MIN_KEEP = 0.7
 # apply-ceiling * this / APPLY_MIN_KEEP cannot come back whole from one apply.
 APPLY_CHARS_PER_TOKEN = 4
 
+# ---- The conversation, not just its last message --------------------------
+# REPORTED: the brief was ONLY the last user message, so a follow-up such as
+# "make it better" reached the planner as three words with no idea what "it"
+# was, and the team rebuilt something unrelated. A follow-up's brief now
+# carries a BOUNDED digest of the conversation: what the caller knows about it
+# (the rolling compaction recap, or an /agent session's memory block), the
+# previous answer when the request refers back to it, and the earlier
+# requests. The request itself is never clipped; only the added context is.
+BRIEF_CONTEXT_CHARS = 6000       # everything added to the request, in total
+CALLER_CONTEXT_CHARS = 2500      # recap / memory handed in by the caller
+PREV_ANSWER_CHARS = 3000         # the previous deliverable, when referred to
+EARLIER_REQUEST_CHARS = 400      # each earlier request
+MANAGER_CONTEXT_CHARS = 1500     # the context, as the (paid) manager sees it
+# Every worker also sees the user's request itself (bounded): a planner's task
+# text is capped and paraphrased, and the details it dropped were the ones
+# the review then flagged as missing.
+WORKER_BRIEF_CHARS = 6000
+PHASE_TASK_CHARS = 4000
+# Synthesis output ceiling scales with what it has to assemble (chars/3 plus
+# headroom), bounded here; the hub lowers it further to a model's learned
+# output cap per hop.
+SYNTH_MAX_CAP = 16000
+# The free "directed fix" when no manager is configured: how much of the
+# draft the instructing model sees (it is free, so more than the manager).
+FREE_INSTRUCT_CHARS = 12000
+FREE_INSTRUCT_TOKENS = 1500
+_CONTEXT_HEADING = ("CONVERSATION CONTEXT (earlier in this conversation -- use it "
+                    "to resolve what the request above refers to; do what the "
+                    "request asks now, do not redo finished work unless asked)")
+# A follow-up that points back at earlier work. Short messages nearly always
+# do ("make it blue"); a long one only when it says so.
+_REFERS_BACK_RE = re.compile(
+    r"\b(previous|above|earlier|again|better|improve|continue|same|instead|"
+    r"redo|rewrite|revise|polish|tweak|shorter|longer|expand|extend|your "
+    r"(answer|code|version|draft|page|output)|the (code|page|draft|version|"
+    r"answer|output|file|site|app|design))\b", re.I)
+_REFER_SHORT_CHARS = 400
+
 
 def _clip(text, limit):
     """Head + tail, so a truncated dependency keeps how it starts AND how it
@@ -297,16 +335,85 @@ _CONFIRM_SYSTEM = (
 )
 
 
+def _text_of(m):
+    c = (m or {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):                # multimodal turn -> text parts only
+        return "\n".join(p.get("text", "") for p in c
+                         if isinstance(p, dict) and p.get("type") == "text")
+    return ""
+
+
 def _last_user_text(messages):
     for m in reversed(messages or []):
-        if m.get("role") == "user":
-            c = m.get("content")
-            if isinstance(c, str):
-                return c
-            if isinstance(c, list):        # multimodal turn -> text parts only
-                return "\n".join(p.get("text", "") for p in c
-                                 if isinstance(p, dict) and p.get("type") == "text")
+        if isinstance(m, dict) and m.get("role") == "user":
+            return _text_of(m)
     return ""
+
+
+def _refers_back(request):
+    r = (request or "").strip()
+    return len(r) <= _REFER_SHORT_CHARS or bool(_REFERS_BACK_RE.search(r))
+
+
+def conversation_brief(messages, context=""):
+    """(brief, context_block) for a pipeline run.
+
+    `brief` is the last user message, unclipped, followed -- only when there
+    IS something -- by a bounded context block (<= BRIEF_CONTEXT_CHARS):
+    the caller's `context` (recap / memory), the previous assistant answer
+    when the request refers back to it, and the earlier user requests.
+    A single-message conversation with no context returns the message
+    itself byte-for-byte, so the opening turn is exactly what it was."""
+    msgs = [m for m in (messages or []) if isinstance(m, dict)]
+    last_idx = None
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].get("role") == "user":
+            last_idx = i
+            break
+    request = _text_of(msgs[last_idx]) if last_idx is not None else ""
+    prior = msgs[:last_idx] if last_idx is not None else msgs
+    prior = [m for m in prior if m.get("role") in ("user", "assistant")]
+    context = str(context or "").strip()
+    if not prior and not context:
+        return request, ""
+    budget = BRIEF_CONTEXT_CHARS
+    sections = []
+    if context:
+        c = _clip(context, min(CALLER_CONTEXT_CHARS, budget))
+        sections.append("What the conversation established so far:\n" + c)
+        budget -= len(sections[-1])
+    prev = ""
+    for m in reversed(prior):
+        if m.get("role") == "assistant" and _text_of(m).strip():
+            prev = _text_of(m).strip()
+            break
+    if prev and budget > 200 and _refers_back(request):
+        room = min(PREV_ANSWER_CHARS, budget - 120)
+        sections.append("The previous answer -- the work this request refers to "
+                        "(%d characters%s):\n%s"
+                        % (len(prev), ", excerpt" if len(prev) > room else "",
+                           _clip(prev, room)))
+        budget -= len(sections[-1])
+    earlier = [" ".join(_text_of(m).split()) for m in prior if m.get("role") == "user"]
+    earlier = [e for e in earlier if e]
+    if earlier and budget > 120:
+        lines, used = [], len("Earlier requests (oldest first):")
+        for e in reversed(earlier):
+            line = "- " + (e if len(e) <= EARLIER_REQUEST_CHARS
+                           else e[:EARLIER_REQUEST_CHARS - 3] + "...")
+            if used + len(line) + 1 > budget:
+                break
+            lines.insert(0, line)
+            used += len(line) + 1
+        if lines:
+            sections.append("Earlier requests (oldest first):\n" + "\n".join(lines))
+    block = "\n\n".join(sections).strip()
+    if not block:
+        return request, ""
+    block = _clip(block, BRIEF_CONTEXT_CHARS)
+    return "%s\n\n---\n%s\n%s" % (request, _CONTEXT_HEADING, block), block
 
 
 def _parse_json(text):
@@ -404,7 +511,7 @@ def _clean_phases(plan):
                     needs.append(n)
         cleaned = {
             "title": str(p.get("title") or "Phase %d" % idx).strip()[:80],
-            "task": task[:2000],
+            "task": task[:PHASE_TASK_CHARS],
             "done_when": str(p.get("done_when") or "").strip()[:300],
             "needs": needs,
         }
@@ -610,7 +717,7 @@ def _gather(fn, items, timeout, need_one=False):
 
 
 def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
-        manager=None):
+        manager=None, context=None):
     """Run the pipeline. `dispatch(msgs, max_tokens, exclude_pids=()) ->
     (text, pid_model)`; it must never raise — an empty text means that call
     failed, and every stage below treats that as "carry on with what we have".
@@ -643,6 +750,12 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     FULL draft, short manager confirmation). The result gains
     "manager_tokens" (and "review_warning" when the reviewer's reply stayed
     unreadable). None = the pipeline exactly as before.
+
+    `context` is what the caller knows about the conversation beyond
+    `messages` (its rolling recap, an /agent session's memory block). It and
+    the earlier turns in `messages` are folded into the brief by
+    conversation_brief(), bounded; the manager sees an excerpt of it
+    (MANAGER_CONTEXT_CHARS) in its plan and review prompts.
 
     Returns {"text", "plan", "phases", "review", "models"} — `text` is always a
     non-empty answer unless every single call failed."""
@@ -688,7 +801,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                            "synthesising from what finished" % (int(cap), stage))
         return True
 
-    brief = _last_user_text(messages)
+    brief, ctx_block = conversation_brief(messages, context)
+    request = _last_user_text(messages)
     models_used = []
 
     # ---- the optional manager ---------------------------------------------
@@ -746,7 +860,12 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         """Wall clock spent — checked from worker threads, so it never emits."""
         return stop_at is not None and time.monotonic() >= stop_at
 
-    mgr_brief = _clip(brief, MANAGER_BRIEF_CHARS)
+    # The manager's view: the request (clipped as always) plus a SHORT excerpt
+    # of the conversation context, so its plan and review know what "it" is.
+    mgr_brief = _clip(brief, MANAGER_BRIEF_CHARS) if not ctx_block else (
+        "%s\n\n---\n%s (excerpt)\n%s"
+        % (_clip(request, MANAGER_BRIEF_CHARS), _CONTEXT_HEADING,
+           _clip(ctx_block, MANAGER_CONTEXT_CHARS)))
 
     # ---- 1. PLAN ----------------------------------------------------------
     emit("plan", "planning")
@@ -803,6 +922,16 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     titles = {}
     exec_pids = set()
 
+    def _worker_brief(task):
+        """The user's own request (and its conversation context), bounded,
+        for a worker. "" when its task already IS the whole brief (the
+        single-phase fallback) -- no need to say it twice."""
+        if not brief.strip() or (task or "").strip() == brief.strip():
+            return ""
+        return ("\n\nTHE USER'S REQUEST (for reference: honour every detail it "
+                "gives that concerns your phase; do ONLY your phase)\n"
+                + _clip(brief, WORKER_BRIEF_CHARS))
+
     def _run_phase(idx):
         ph = phases[idx - 1]
         ctx = "".join(
@@ -819,6 +948,7 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         # Appended AFTER the context so a phase without brief fields sends the
         # exact prompt the plain pipeline always sent.
         user += _render_brief(ph)
+        user += _worker_brief(ph["task"])
         msgs = [{"role": "system", "content": phase_system},
                 {"role": "user", "content": user}]
         first = dispatch(msgs, PHASE_MAX_TOKENS)
@@ -890,7 +1020,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         return []
 
     def _directed_fix(label, apply_role, mgr_ctx, free_ctx, work, problems, floor,
-                      exclude=(), extra_check=None, need_instructions=True):
+                      exclude=(), extra_check=None, need_instructions=True,
+                      instructions=None):
         """The manager DIRECTS a fix it cannot see in full: it writes short
         instructions from a clipped excerpt, a FREE model applies them to the
         FULL work, and the manager confirms from the diff. Up to two applies
@@ -908,14 +1039,19 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
             emit("fix", "%s: too long for one apply — kept as is" % label[:30])
             return "", None, trail
         probs = [str(p) for p in problems if str(p).strip()][:10]
-        instr, iwho = _mgr(
-            [{"role": "system", "content": _INSTRUCT_SYSTEM},
-             {"role": "user", "content":
-              "%s\n\nPROBLEMS TO FIX\n- %s\n\nTHE WORK (excerpt of %d characters; "
-              "the editor has all of it)\n%s"
-              % (mgr_ctx, "\n- ".join(probs) or "(none stated)", len(work or ""),
-                 _clip(work, FIX_EXCERPT_CHARS))}],
-            MANAGER_INSTRUCT_TOKENS, "fix")
+        if instructions:
+            # Already written (the free instructing call of a manager-less
+            # revision): do not ask the manager again.
+            instr, iwho = instructions, None
+        else:
+            instr, iwho = _mgr(
+                [{"role": "system", "content": _INSTRUCT_SYSTEM},
+                 {"role": "user", "content":
+                  "%s\n\nPROBLEMS TO FIX\n- %s\n\nTHE WORK (excerpt of %d characters; "
+                  "the editor has all of it)\n%s"
+                  % (mgr_ctx, "\n- ".join(probs) or "(none stated)", len(work or ""),
+                     _clip(work, FIX_EXCERPT_CHARS))}],
+                MANAGER_INSTRUCT_TOKENS, "fix")
         if iwho:
             trail.append(("fix-plan:%s" % label, iwho))
         if not instr:
@@ -1111,8 +1247,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                 g = gaps[k]
                 return dispatch(
                     [{"role": "system", "content": phase_system},
-                     {"role": "user", "content": "OVERALL GOAL\n%s\n\nYOUR TASK: %s\n%s"
-                      % (goal, g["title"], g["task"])}],
+                     {"role": "user", "content": "OVERALL GOAL\n%s\n\nYOUR TASK: %s\n%s%s"
+                      % (goal, g["title"], g["task"], _worker_brief(g["task"]))}],
                     PHASE_MAX_TOKENS)
             fixed = _gather(_repair, list(range(len(gaps))), _left())
             if len(fixed) < len(gaps):
@@ -1184,20 +1320,87 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     # corrected work — the Claude Code style plan->do->review->fix loop. It is
     # capped at ONE pass on purpose: each loop is a full extra model call, and
     # a reviewer that will not say "ship" would otherwise loop forever.
+    def _free_revision(probs):
+        """The manager-less revision: (text, who, trail); text "" = keep the
+        draft. Never replaces the full draft with a clipped rewrite."""
+        trail = []
+        probs = [str(p) for p in probs if str(p).strip()][:10]
+        instr = ""
+        if not _spent():
+            instr, iwho = dispatch(
+                [{"role": "system", "content": _INSTRUCT_SYSTEM},
+                 {"role": "user", "content":
+                  "USER BRIEF\n%s\n\nPROBLEMS TO FIX\n- %s\n\nTHE WORK (%s%d "
+                  "characters; the editor has all of it)\n%s"
+                  % (_clip(brief, MANAGER_BRIEF_CHARS), "\n- ".join(probs),
+                     "excerpt of " if len(draft) > FREE_INSTRUCT_CHARS else "",
+                     len(draft), _clip(draft, FREE_INSTRUCT_CHARS))}],
+                FREE_INSTRUCT_TOKENS)
+            if iwho:
+                trail.append(("fix-plan:revision", iwho))
+        # No instructions came back: the reviewer's problems ARE the
+        # instructions, exactly as the manager path does it.
+        instr = (instr or "").strip() or "\n".join(
+            "%d. Fix: %s" % (i, p) for i, p in enumerate(probs, 1))
+        whole_fits = (len(draft) * APPLY_MIN_KEEP
+                      <= _apply_tokens(draft, SYNTH_MAX_TOKENS) * APPLY_CHARS_PER_TOKEN)
+        if whole_fits or len(done) < 2:
+            text, who, t2 = _directed_fix(
+                "revision", "revision", "", "USER BRIEF\n%s" % brief, draft, probs,
+                SYNTH_MAX_TOKENS, need_instructions=False, instructions=instr)
+            trail.extend(t2)
+            return text, who, trail
+        # Too long to come back whole from one apply: revise PER PHASE, each
+        # part edited in full, the parts no instruction touches left alone.
+        emit("revise", "draft too long for one pass — revising per phase")
+
+        def _one(k):
+            work = done[k]["output"]
+            if _spent() or len(work) * APPLY_MIN_KEEP > \
+                    _apply_tokens(work, PHASE_MAX_TOKENS) * APPLY_CHARS_PER_TOKEN:
+                return "", None
+            return dispatch(
+                [{"role": "system", "content": _APPLY_SYSTEM},
+                 {"role": "user", "content":
+                  "USER BRIEF\n%s\n\nTHIS IS PART %d OF %d (%s). Apply ONLY the "
+                  "instructions that concern this part; if none do, return it "
+                  "unchanged.\n\nTHE WORK\n%s\n\nFIX INSTRUCTIONS\n%s\n\nReturn "
+                  "the COMPLETE part with the relevant instructions applied — "
+                  "not a diff, not a list of changes."
+                  % (_clip(brief, MANAGER_BRIEF_CHARS), k + 1, len(done),
+                     done[k]["title"], work, instr)}],
+                _apply_tokens(work, PHASE_MAX_TOKENS))
+        got = _gather(_one, list(range(len(done))), _left())
+        parts, changed = [dict(d) for d in done], False
+        for k in sorted(got):
+            text, who = got[k][0], got[k][1]
+            if who:
+                trail.append(("revision:%s" % done[k]["title"], who))
+            before = done[k]["output"]
+            if not (text or "").strip() or text.strip() == before.strip():
+                continue                  # untouched part, or a failed apply
+            if _apply_problems(before, text, None):
+                continue                  # lossy or junk: keep the original part
+            parts[k]["output"] = text
+            changed = True
+        if not changed:
+            return "", None, trail
+        return ("\n\n".join("## %s\n%s" % (d["title"], d["output"]) for d in parts),
+                "per-phase", trail)
+
     revised = False
     if needs_work and max_revisions >= 1 and not _over("the revision"):
         emit("revise", "fixing %d problem%s" % (len(problems), "" if len(problems) == 1 else "s"))
-        def _rev_user(b):
-            return ("BRIEF\n%s\n\nDRAFT\n%s\n\nREVIEWER PROBLEMS TO FIX\n- %s\n\n"
-                    "Return the COMPLETE corrected work — the full draft with every "
-                    "problem fixed, not a diff, not a list of changes."
-                    % (b, _clip(draft, DEP_CONTEXT_CHARS), "\n- ".join(problems[:10])))
         if manager is None:
-            rev_text, rev_model = dispatch(
-                [{"role": "system", "content": phase_system},
-                 {"role": "user", "content": _rev_user(brief)}], SYNTH_MAX_TOKENS)
-            if rev_model:
-                models_used.append(("revision", rev_model))
+            # DIRECTED here too. The plain pipeline used to hand ONE free
+            # model the draft clipped to DEP_CONTEXT_CHARS and let its rewrite
+            # REPLACE the draft -- so on a long draft the "revised" answer
+            # silently lost its trimmed middle. Now a free call writes fix
+            # instructions from the problems, a free apply edits the FULL
+            # draft (when it can come back whole), else each phase is revised
+            # on its own; a rejected apply keeps the draft as it was.
+            rev_text, rev_model, rev_trail = _free_revision(problems)
+            models_used.extend(rev_trail)
         else:
             # With a manager the final fix is DIRECTED (see _directed_fix): the
             # manager used to rewrite a draft clipped to DEP_CONTEXT_CHARS, so a
@@ -1226,9 +1429,13 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         # A completed revision pass already fixed these; handing them to
         # synthesis again would ask it to fix problems that no longer exist.
         synth_user += "\n\nREVIEWER PROBLEMS TO FIX\n- " + "\n- ".join(problems[:10])
+    # Scaled to what it has to assemble: a fixed 6000-token ceiling cut a big
+    # multi-phase build off mid-file (the hub lowers it per hop to a model's
+    # learned output cap).
+    synth_tokens = max(SYNTH_MAX_TOKENS, min(SYNTH_MAX_CAP, len(draft) // 3 + 1000))
     final_text, synth_model = dispatch(
         [{"role": "system", "content": synth_system},
-         {"role": "user", "content": synth_user}], SYNTH_MAX_TOKENS)
+         {"role": "user", "content": synth_user}], synth_tokens)
     if synth_model:
         models_used.append(("synthesis", synth_model))
     emit("done", "complete")
