@@ -761,6 +761,28 @@ explicit `sub-*/<model>` pick and `_check_provider_ready` are refused, and the
 GET/POST `/api/subscriptions` and the dashboard "What the subscription may be
 used for" radio. Covered by `tests/test_subscription_scope.py`.
 
+## Static ranking rebench (2026-09-27)
+
+Covered by `tests/test_rebench_2026_09.py`. A table entry moves only when two
+independent boards agree (Artificial Analysis II + Arena text), or one
+authoritative narrow board for a category (LMArena Vision, tau-bench,
+Terminal-Bench 4.0 on tbench.ai + AA). Each change carries its numbers in a
+comment at the site.
+
+- `_STRONG_ROOTS` versions must FOLLOW the root and are never a parameter
+  count (`_root_versions`): `codellama-70b` had read as Llama v70 (104 live).
+- Measured floors: GLM-5.3+ flash 133.6 (over dsv4-pro / minimax-m3, under
+  dsv4 flash), MiMo-V2.6+ Pro 134.09 (qwen3.8 level, under kimi-k3),
+  deepseek v4.x +0.01/minor, Gemini 3.5+ Flash-Lite 60. llama-4 /
+  llama-3.3-70b (44) and mistral-large (52) left Tier A, now under
+  mistral-medium (56).
+- AA lookup: OpenRouter vendor namespaces (`deepseek/`, `qwen/`, `xiaomi/`,
+  `anthropic/`, `x-ai/`, `minimax/` …) are stripped, and a pre-fix cache's
+  vendor-joined keys still match exactly (`_AA_LEGACY_VENDOR_KEYS`).
+- Unchanged because the owner set them or the boards disagree: the Claude floor
+  (Sonnet 5 trails k3 / glm-5.3 / qwen3.8 on both boards), the gpt-5.x and
+  kimi floors, gemini pro-over-flash, and the last-resort tail.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
