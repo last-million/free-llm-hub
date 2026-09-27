@@ -92,10 +92,23 @@ def test_the_swarm_skips_sub_providers():
     src = open("app.py", encoding="utf-8").read()
     i = src.index("def _swarm_tool_result(")
     # The ranker now takes the turn's difficulty as well, so anchor on the
-    # call NAME rather than its exact arguments.
+    # call NAME rather than its exact arguments. The candidate loop moved into
+    # _swarm_tool_candidates (it also drops sick members now), which the
+    # fan-out calls before ranking.
     loop = src[i:src.index("picks = _swarm_rank(", i)]
-    assert "if _is_sub(hop_pid):" in loop
-    assert "continue" in loop
+    assert "_swarm_tool_candidates(" in loop
+    j = src.index("def _swarm_tool_candidates(")
+    body = src[j:src.index("\ndef ", j + 10)]
+    assert "if _is_sub(hop_pid):" in body
+    assert "continue" in body
+    # ...and measured, on both of its paths (healthy and legacy fallback).
+    sub = next((p for p in ("sub-claude", "sub-codex") if A._is_sub(p)), None)
+    if sub is None:
+        pytest.skip("no sub provider id recognised")
+    for chain in ([(sub, "sonnet"), ("fake-a", "m-a"), ("fake-b", "m-b")],
+                  [(sub, "sonnet"), ("fake-a", "m-a")]):
+        cands, _skipped = A._swarm_tool_candidates(chain)
+        assert cands and not [p for p, _m in cands if A._is_sub(p)]
 
 
 def test_the_chain_keeps_its_last_resort():

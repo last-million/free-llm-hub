@@ -34,7 +34,8 @@ def _clear_recent_hop_failures():
     if isinstance(ledger, dict):
         ledger.clear()
     # Tool-turn ledgers (per-pair TTFT/outcomes, per-relay-server failures).
-    for name in ("_tool_ttft", "_tool_outcomes", "_relay_tool_fail"):
+    for name in ("_tool_ttft", "_tool_outcomes", "_relay_tool_fail",
+                 "_swarm_member_fail"):
         other = getattr(mod, name, None) if mod else None
         if isinstance(other, dict):
             other.clear()
