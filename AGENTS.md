@@ -827,6 +827,37 @@ comment at the site.
   (Sonnet 5 trails k3 / glm-5.3 / qwen3.8 on both boards), the gpt-5.x and
   kimi floors, gemini pro-over-flash, and the last-resort tail.
 
+## /agent servers & hub self-protection (2026-09-27)
+
+Covered by `tests/test_agent_servers.py`. Live: an opencode turn ran
+`python app.py` in the foreground, the 420 s stall watchdog resumed blindly,
+the model listed/killed python processes and blocked again ("produced nothing
+for 420s twice").
+
+- **Rules** (`agent_servers.brief_section` in every brief file, all CLIs and
+  tiers; `worker_rules` in each swarm_windows worker prompt): servers start
+  DETACHED with output to a log, a web app is left to the preview (it runs the
+  project at turn end and adopts any printed `http://127.0.0.1:PORT`), only
+  processes the agent started may be stopped, and the hub's PID(s) (venv
+  launcher included) and port are named. Spellings MEASURED here under
+  pipe-EOF semantics: bash `nohup CMD > log 2>&1 &` and PowerShell
+  `Start-Process -WindowStyle Hidden -FilePath cmd -ArgumentList '/c','CMD >
+  log 2>&1'` (cmd: the same via `powershell -Command`) return in < 1 s;
+  `start /B`, `Start-Process -NoNewWindow`/`-Redirect*` and a bare `&` HANG
+  (inherited pipe handles).
+- **Smart resume**: at a stall, BEFORE the kill, `diagnose_stall` checks the
+  CLI's process tree (a shell-spawned descendant listening, or running a
+  server/watcher command) and, for codex/claude only, a server command that
+  was the last line printed. opencode emits `tool_use` only on
+  completed/error (read in its binary), so for it only the tree counts. A hit
+  shows "Server running on port N ..." (no URL -- the preview would burn that
+  port's one adopt try) and resumes with `resume_instruction` (what blocked,
+  whether it listened, the detached spellings, never a kill suggestion). The
+  first one does not spend the wedge retry; at most 3 attempts.
+- **Limitation**: the hub cannot stop an agent shell from killing the hub
+  (same user, no privilege to withhold, opencode reports a command only after
+  it ran); prevention via the brief is the only defence.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

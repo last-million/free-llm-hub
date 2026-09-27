@@ -116,6 +116,7 @@ import threading
 import time
 import uuid
 
+import agent_servers
 import agentic_history
 import memory
 
@@ -2303,12 +2304,15 @@ def write_task_brief(project_dir, text, memory_block="", session_id=None):
                   + "Every file you create or edit must be inside it. Use paths "
                   "relative to it, or that exact absolute spelling. Do not reuse a "
                   "path printed by a shell (`pwd` may print it in another form) and "
-                  "never write to /, /tmp or /workspace." + chr(10)
-                  + "Do not start a server or any long-running process from the shell "
-                  "(no `&`, `nohup`, `start`, or a watch mode): the shell tool waits "
-                  "for it and your turn hangs. To check a server, run a one-shot "
-                  "command with a short timeout, or leave it to the hub's preview.")
-        parts = [header, folder]
+                  "never write to /, /tmp or /workspace.")
+        # SERVERS, and which python is the hub. This used to be one line --
+        # "Do not start a server ... (no `&`, `nohup`, `start`...)" -- which
+        # contradicted craft.SHIP's "start it in the BACKGROUND" in the same
+        # file, never named the hub, and did not stop the live 2026-09-27
+        # opencode turn that parked `python app.py` in its shell, then listed
+        # and killed python processes. The rules, with the detached spellings
+        # measured on this machine, live in agent_servers.
+        parts = [header, folder, agent_servers.brief_section()]
         if memory_block:
             parts.append("## What this conversation already established"
                          + chr(10) + chr(10) + memory_block)
@@ -3384,6 +3388,36 @@ def _recover_text_from_claude_transcript(config_dir, native_id):
     return None
 
 
+def _stall_diagnosis(sess, proc, last_tool, last_line_at):
+    """At a stall, before the kill: is the CLI's shell blocked on a server it
+    started? agent_servers.diagnose_stall's dict, or None. Never raises --
+    this runs on the watchdog thread, which must still kill the process."""
+    try:
+        cmd, at = last_tool[0], last_tool[1]
+        return agent_servers.diagnose_stall(
+            getattr(proc, "pid", None), cli_id=getattr(sess, "cli_id", None),
+            last_tool=cmd, tool_was_last=(at is not None and at == last_line_at))
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _server_resume_prompt(sess, original, diag, resumed):
+    """What the turn is resumed with after a server-blocked stall.
+
+    Resuming the CLI's own thread: the instruction alone -- the thread already
+    holds the task, and re-sending the user's words is what left the model
+    guessing why it had been stopped. Starting over (no thread id): the task
+    first, then the instruction, as long as the pair fits the per-turn cap;
+    past it the task alone (the brief file carries the same rules)."""
+    note = agent_servers.resume_instruction(diag, _STALL_TIMEOUT)
+    if resumed:
+        return _HubNudge(note)
+    combined = str(original) + chr(10) + chr(10) + "---" + chr(10) + note
+    if len(combined) <= max_message_chars(getattr(sess, "cli_id", None)):
+        return combined
+    return original
+
+
 def send_message_stream(session_id, text):
     """Generator: run ONE turn, yielding normalized progress events as they occur.
     Same validation / turn-lock / tree-kill model as send_message(). Always ends
@@ -3472,6 +3506,12 @@ def send_message_stream(session_id, text):
         # would be its own kind of confusing.
         timeout_retry_used = False
         transient_retry_used = False
+        # A stall whose shell is blocked on a server the turn started is NOT a
+        # wedge: the model did something specific and can be told what. The
+        # first one resumes with that instruction without spending the wedge
+        # retry above (see _stall_diagnosis / agent_servers).
+        server_resume_used = False
+        original_text = text
         while True:
             was_resume = bool(sess.native_session_id)
             argv = _build_argv(sess, bin_path, text, stream=True)
@@ -3511,6 +3551,11 @@ def send_message_stream(session_id, text):
             timed_out[0] = False
             stalled = [False]
             last_event = [time.monotonic()]
+            # The last tool event and the time of the line that carried it:
+            # equal to last_event[0] at a stall means it was the very last
+            # thing the CLI printed.
+            last_tool = [None, None]
+            stall_diag = [None]
             watchdog_stop = threading.Event()
 
             def _watch():
@@ -3536,10 +3581,23 @@ def send_message_stream(session_id, text):
                     if _STALL_TIMEOUT and now - last_event[0] > _STALL_TIMEOUT:
                         stalled[0] = True
                         timed_out[0] = True
-                        _log.warning("agentic turn produced nothing for %ds "
-                                     "(session=%s cli=%s) -- treating as wedged",
-                                     _STALL_TIMEOUT, getattr(sess, "id", "?"),
-                                     getattr(sess, "cli_id", "?"))
+                        # BEFORE the kill: the tree is only walkable while
+                        # the CLI is alive to be its root.
+                        stall_diag[0] = _stall_diagnosis(sess, proc, last_tool,
+                                                         last_event[0])
+                        if stall_diag[0]:
+                            _log.warning("agentic turn silent for %ds: shell blocked "
+                                         "on %r ports=%s via=%s (session=%s cli=%s)",
+                                         _STALL_TIMEOUT, stall_diag[0].get("command"),
+                                         stall_diag[0].get("ports"),
+                                         stall_diag[0].get("source"),
+                                         getattr(sess, "id", "?"),
+                                         getattr(sess, "cli_id", "?"))
+                        else:
+                            _log.warning("agentic turn produced nothing for %ds "
+                                         "(session=%s cli=%s) -- treating as wedged",
+                                         _STALL_TIMEOUT, getattr(sess, "id", "?"),
+                                         getattr(sess, "cli_id", "?"))
                         _terminate(proc)
                         return
 
@@ -3571,6 +3629,8 @@ def send_message_stream(session_id, text):
                             final_error = e["_final_error"]
                         if e.get("event") == "message" and e.get("text"):
                             last_message_text = e["text"]
+                        if e.get("event") == "tool":
+                            last_tool[0], last_tool[1] = e.get("text"), last_event[0]
                         if e.get("event"):
                             yield e
             except Exception as exc:
@@ -3636,8 +3696,35 @@ def send_message_stream(session_id, text):
                 # instead of continuing the one already under way.
                 if native_id:
                     sess.native_session_id = native_id
+                # SILENT BECAUSE ITS SHELL IS BLOCKED ON A SERVER. MEASURED
+                # live 2026-09-27: resumed with the user's own words again,
+                # the model had no idea why it was stopped, hunted python
+                # processes, killed one, and blocked the same way -- "produced
+                # nothing for 420s twice". Resume with what happened and the
+                # detached spelling instead; the first time does not spend
+                # the wedge retry, and the notice says "server running on
+                # port N", not "looks wedged".
+                diag = stall_diag[0] if stalled[0] else None
+                if diag and (not server_resume_used or not timeout_retry_used):
+                    again = server_resume_used
+                    if again:
+                        timeout_retry_used = True
+                    server_resume_used = True
+                    yield {"event": "notice",
+                           "text": agent_servers.stall_notice(diag, _STALL_TIMEOUT,
+                                                              again=again)}
+                    # The next attempt resumes whenever the session holds a
+                    # thread id -- captured now or carried from before.
+                    text = _server_resume_prompt(sess, original_text, diag,
+                                                 bool(sess.native_session_id))
+                    continue
+                if diag:
+                    yield err(504, agent_servers.failure_detail(sess.cli_id, diag)); return
                 if not timeout_retry_used:
                     timeout_retry_used = True
+                    # Not about a server this time: the request itself again,
+                    # never a server note left over from an earlier resume.
+                    text = original_text
                     yield {"event": "notice",
                           "text": (("Nothing for %ds — looks wedged, %s."
                                     % (_STALL_TIMEOUT,
@@ -3678,6 +3765,9 @@ def send_message_stream(session_id, text):
                     and _is_stale_resume_error(sess.cli_id, stale_source)):
                 sess.native_session_id = None
                 stale_retry_used = True
+                # A fresh thread knows nothing of a server-resume note meant
+                # for the old one: it gets the request itself again.
+                text = original_text
                 continue
 
             if native_id:
