@@ -54,7 +54,13 @@ CATEGORIES = [
         ("claude-sonnet", "claude-fable", "claude-haiku", "gpt-4o", "gpt-5.2",
          "gpt-5.6", "deepseek-v4-pro", "llama-3.3-70b", "gpt-oss",
          "nemotron-3", "gemini-3", "kimi-k3", "kimi-k2.6", "qwen3.6",
-         "minimax-m3", "glm-5.3", "hy4"),
+         "minimax-m3", "glm-5.3", "hy4",
+         # REBENCH 2026-09-27, tau-bench (taubench.com, tau3-Banking pass^1,
+         # newest submissions 2026-08-04), the agentic tool-use board:
+         # Qwen 3.8 Max #1 at 55.2% (above every closed model), GLM-5.2
+         # (xhigh) 37.1% -- level with Kimi K3 (max) 37.1%, already listed.
+         # Live fleet 2026-09-27: no qwen3.8-max id; glm-5.2 only via g4f.
+         "qwen3.8-max", "glm-5.2"),
     ),
     (
         "coding",
@@ -69,7 +75,15 @@ CATEGORIES = [
         ("claude-sonnet", "claude-fable", "claude-haiku", "deepseek-v4",
          "qwen3-coder", "qwen3.6", "codestral", "codellama", "granite-34b-code",
          "mimo", "gpt-5.6", "gpt-5.2", "glm-5.3", "glm-5.2", "kimi-k3",
-         "kimi-k2.6", "devstral", "hy3", "hy4"),
+         "kimi-k2.6", "devstral", "hy3", "hy4",
+         # REBENCH 2026-09-27, Terminal-Bench 4.0 on two independent boards:
+         #   Gemini 3.8 Flash (high): tbench.ai #11 19.1%; Artificial Analysis
+         #     TB4.0 20% (fetched 2026-09-27)
+         #   Grok 4.7 (xhigh): tbench.ai #6 37.6%; Artificial Analysis 26%
+         # Both beat listed members on both boards (Kimi K3 AA TB4.0 13%,
+         # DeepSeek V4 Pro 14%, Claude Sonnet 5 tbench 12.4% / AA 14%).
+         # Live fleet 2026-09-27: gemini-3.8-flash answers; no grok-4.7 id.
+         "gemini-3.8", "grok-4.7"),
     ),
     (
         "reasoning",
@@ -103,7 +117,14 @@ CATEGORIES = [
         # naming one of them left gemini-2.5-pro outside the vision mode.
         ("vl-plus", "-vl", "vision", "veo-", "vila", "gemini-", "llava",
          "internvl", "qwen3-vl", "llama-4-maverick", "llama-4-scout",
-         "gemma-4", "pixtral", "molmo"),
+         "gemma-4", "pixtral", "molmo",
+         # REBENCH 2026-09-27, LMArena Vision (overall, style control, page
+         # dated Sep 13 2026 -- the narrow-domain board for this category):
+         # qwen3.8-max #2 at 1302, glm-5.3-flash 1275 (best open-weight),
+         # kimi-k2.6 1262 -- all at or above gemma-4-31b (1261), which is
+         # already listed. Named narrowly: the board scores these exact models.
+         # Live fleet 2026-09-27: glm-5.3-flash answers (dahl); no qwen3.8-max.
+         "qwen3.8-max", "glm-5.3-flash", "kimi-k2.6"),
     ),
     (
         "uncensored",

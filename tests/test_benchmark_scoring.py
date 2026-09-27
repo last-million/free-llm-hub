@@ -95,10 +95,13 @@ def test_demoted_families_stay_below_the_strong_band():
 
 
 def test_promoted_families_hit_the_top_bands():
-    """The user's top-tier list: llama-4 / llama-3.3-70b / mistral-large /
-    gpt-4o land in Tier A (84+); glm-4.7 / gemini-2.5-pro / qwen3-max in Tier S."""
-    for tier_a in ("llama-4-maverick", "llama-3.3-70b-instruct",
-                   "mistral-large", "gpt-4o"):
+    """The user's top-tier list: gpt-4o lands in Tier A (84+); glm-4.7 /
+    gemini-2.5-pro / qwen3-max in Tier S.
+
+    REBENCH 2026-09-27: llama-4 / llama-3.3-70b / mistral-large left Tier A --
+    Artificial Analysis and the Arena text board both put them under Mistral
+    Medium 3.5 (see tests/test_rebench_2026_09.py)."""
+    for tier_a in ("gpt-4o",):
         assert app._benchmark_score("testpid", tier_a) >= 84, tier_a
     for tier_s in ("glm-4.7", "gemini-2.5-pro", "qwen3-max"):
         assert app._benchmark_score("testpid", tier_s) >= 100, tier_s

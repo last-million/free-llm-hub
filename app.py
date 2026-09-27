@@ -1515,12 +1515,27 @@ _BENCH_FAMILY = [
     (("deepseek-v3", "deepseek-r1", "deepseek-chat",
       "qwen3-235b", "qwen3-next", "qwen3-coder", "qwen3-32b", "qwen3",
       "kimi-k2", "minimax-m2", "gemini-2.5-flash",
-      "llama-4", "llama4", "llama-3.3-70",
-      "mistral-large", "gpt-4o",
+      "gpt-4o",
       "hunyuan-a13", "hunyuan-turbos", "command-a"), 84),  # hy3 promoted to Tier S above
     # Tier B — capable mid (routine content, not hard reasoning).
     (("mistral-medium", "phi-4", "solar-pro", "nova-2-pro", "granite-4",
       "command-r-plus"), 56),
+    # REBENCH 2026-09-27 -- llama-4 / llama-3.3-70b / mistral-large moved OUT of
+    # Tier A (84), where they tied deepseek-v3 and qwen3. Two independent
+    # sources agree they sit BELOW Mistral Medium 3.5 (Tier B above):
+    #   Artificial Analysis Intelligence Index (fetched 2026-09-27):
+    #     Mistral Medium 3.5 14, Mistral Large 3 9, Llama 4 Maverick 10*,
+    #     Llama 3.3 70B 8*
+    #   Arena text leaderboard (arena.ai, Sep 25 2026):
+    #     mistral-medium-3.5 1426, mistral-large-3 1413,
+    #     llama-4-maverick 1327, llama-3.3-70b-instruct 1318
+    # Mistral Large 3 stays ABOVE Llama 3.3 70B (AA 9 vs 8*, Arena 1413 vs
+    # 1318); Large 3 vs Maverick is disputed (AA 9 vs 10, Arena 1413 vs 1327)
+    # so it keeps the higher slot. Llama stays >= the simple-tier floor (45)
+    # on its usual hosts (groq llama-3.3-70b-versatile ~48.6), so trivial turns
+    # can still use the fast Llama hosts.
+    (("mistral-large",), 52),
+    (("llama-4", "llama4", "llama-3.3-70"), 44),
     # Tier C-hi — older mid / mid-small usable.
     (("qwen2.5-72", "mistral-small", "command-r"), 40),
     # Tier C — legacy / superseded / specialized (avoid for heavy).
@@ -1553,7 +1568,32 @@ _STRONG_ROOTS = (
     ("gemini",     3.0, 100),   # gemini-3/3.5/4…  (gemini-2.x -> <3; flash-lite CAPed)
     ("llama",      5.0, 100),   # llama-5+ only (Llama-4 flopped -> stays mid)
 )
-_VER_AFTER_RE = re.compile(r"(\d+(?:\.\d+)?)")
+# The version must FOLLOW the root (one optional separator) and must not be a
+# parameter count. REBENCH 2026-09-27: the old pattern took the first number
+# ANYWHERE after the root, so 'nvidia/meta/codellama-70b' read "llama" + "70"
+# as Llama v70 >= 5, scored 100 (104 live) and sat #2 in the coding pick above
+# GLM-5.3-Flash -- a 2023 Llama-2 derivative, while Artificial Analysis
+# (Llama 3.3 70B: II 8*) and the Arena text board (llama-3.3-70b-instruct
+# 1318, #257) both put even the NEWER Llama 3.x at the bottom of the field.
+# The same bug lifted 'qwen-72b' (Qwen 1) and 'gemini-exp-1206'.
+_VER_AFTER_RE = re.compile(r"[-_ ]?(\d+(?:\.\d+)?)(?![\d.]*b(?![a-z]))")
+
+
+def _root_versions(low, root):
+    """Every version number written right after an occurrence of `root`."""
+    out = []
+    start = 0
+    while True:
+        idx = low.find(root, start)
+        if idx < 0:
+            return out
+        m = _VER_AFTER_RE.match(low, idx + len(root))
+        if m:
+            try:
+                out.append(float(m.group(1)))
+            except ValueError:
+                pass
+        start = idx + 1
 
 
 def _strong_new_version_score(low):
@@ -1561,17 +1601,8 @@ def _strong_new_version_score(low):
     family ROOT appears with a version >= its pin, else 0."""
     best = 0
     for root, pin, pts in _STRONG_ROOTS:
-        idx = low.find(root)
-        if idx < 0:
-            continue
-        m = _VER_AFTER_RE.search(low[idx + len(root):])
-        if not m:
-            continue
-        try:
-            if float(m.group(1)) >= pin:
-                best = max(best, pts)
-        except ValueError:
-            pass
+        if any(v >= pin for v in _root_versions(low, root)):
+            best = max(best, pts)
     return best
 
 
@@ -1581,16 +1612,8 @@ def _strong_root_version_excess(low):
     glm-5.3-flash) instead of flatlining at the cap. Fail-safe 0."""
     best = 0.0
     for root, pin, _pts in _STRONG_ROOTS:
-        idx = low.find(root)
-        if idx < 0:
-            continue
-        m = _VER_AFTER_RE.search(low[idx + len(root):])
-        if not m:
-            continue
-        try:
-            best = max(best, min(float(m.group(1)) - pin, 9.0))
-        except ValueError:
-            pass
+        for v in _root_versions(low, root):
+            best = max(best, min(v - pin, 9.0))
     return best
 
 
@@ -1691,10 +1714,20 @@ _QWEN_LATEST_RE = re.compile(r"qwen-?(\d+)(?:\.(\d+))?\b")
 # DeepSeek V4 (and later) — deepseek-v4, deepseek-v4-flash, deepseek/deepseek-v4,
 # and morph's 'dsv4flash' once _canon_model_id has expanded it. V3 and R1 keep
 # their measured Tier A/S scores; only the v4+ generation gets the floor.
-_DSV4_RE = re.compile(r"deepseek[-_/]?v([4-9])(?:\.\d+)?")
+_DSV4_RE = re.compile(r"deepseek[-_/]?v([4-9])(?:\.(\d+))?")
 # MiniMax M3 (and later) — minimax-m3, MiniMaxAI/MiniMax-M3, and morph's
 # 'minimax3' after canonicalisation. M2/M2.7 stay on their measured score.
 _MINIMAX3_RE = re.compile(r"minimax-m([3-9])(?:\.\d+)?")
+# Xiaomi MiMo, version captured: xiaomi/mimo-v2.6-pro, mimo-v2-flash.
+_MIMO_VER_RE = re.compile(r"\bmimo-?v?(\d+)(?:\.(\d+))?")
+# REBENCH 2026-09-27 floors (measured, not user preference). Each sits in the
+# existing preference ladder at the point two independent leaderboards agree
+# on; see the use sites in _benchmark_score for the numbers.
+_GLM_FLASH_FLOOR = 133.6      # glm-5.3+ -flash: above dsv4-pro (133.5) / minimax-m3 (133)
+_GLM_FLASH_CEILING = 133.95   # ...never up to the deepseek-v4 flash floor (134)
+_MIMO_PRO_FLOOR = 134.09      # mimo-v2.6+ -pro: level with qwen3.8/3.9 (134.08/.09)
+_MIMO_PRO_CEILING = 134.49    # ...never past hy3 (134.5) on a version bump
+_GEMINI_LITE_FLOOR = 60.0     # gemini-3.5+ flash-lite: above mistral-medium (56)
 # Gemini 3.1+ (Google) — gemini-3.1, gemini-3.5-flash, models/gemini-3.6-flash,
 # google/gemini-4. Version-scaled like gpt-5.x because the user's rule is the
 # same one: a higher version number means a better model. 3.0 and 2.x are NOT
@@ -1761,7 +1794,17 @@ def _save_aa_cache(cache):
 
 _AA_SLUG_STRIP_RE = re.compile(
     r"^(?:@cf/|nvidia/|z-ai/|zai-org/|moonshotai/|meta/|meta-llama/|google/|models/|"
-    r"deepseek-ai/|minimaxai/|openai/|nousresearch/|inclusionai/|poolside/|cohere/)+")
+    r"deepseek-ai/|minimaxai/|openai/|nousresearch/|inclusionai/|poolside/|cohere/|"
+    # REBENCH 2026-09-27: the vendor namespaces OpenRouter's catalog (the
+    # keyless AA source) uses but hosts spell differently. Without them
+    # 'deepseek/deepseek-v4.1-flash' keyed as 'deepseekdeepseekv41flash' and
+    # nvidia's 'deepseek-ai/deepseek-v4.1-flash' as 'deepseekv41flash', so AA's
+    # real number never reached deepseek, minimax, qwen, mimo, claude or grok.
+    r"deepseek/|minimax/|qwen/|xiaomi/|anthropic/|x-ai/|mistralai/|tencent/|ibm/)+")
+# Cache files written before that fix still hold vendor-joined keys; exact
+# lookups retry with these prefixes (see _aa_score_for) until the next refresh.
+_AA_LEGACY_VENDOR_KEYS = ("deepseek", "minimax", "qwen", "xiaomi", "anthropic",
+                          "xai", "mistralai", "tencent", "ibm")
 _AA_SLUG_SUFFIX_RE = re.compile(r"(?::free|:beta|:extended|:nitro|:floor|:online)+$", re.IGNORECASE)
 _AA_SLUG_PUNCT_RE = re.compile(r"[^a-z0-9]+")
 
@@ -1990,7 +2033,16 @@ def _aa_score_for(model_id):
     number rather than an admittedly-generic tier guess."""
     if not _aa_scores:
         return None
-    return _aa_scores.get(_normalize_aa_slug(model_id))
+    norm = _normalize_aa_slug(model_id)
+    hit = _aa_scores.get(norm)
+    if hit is None and norm:
+        # Still an EXACT key match: the same core under a vendor namespace a
+        # pre-2026-09-27 cache kept joined on ('deepseekdeepseekv41flash').
+        for v in _AA_LEGACY_VENDOR_KEYS:
+            hit = _aa_scores.get(v + norm)
+            if hit is not None:
+                break
+    return hit
 
 
 def _aa_refresh_once():
@@ -2319,8 +2371,20 @@ def _benchmark_score(pid, model_id):
     # the family's established level -- same as glm-5.2, per the instruction
     # above, unretracted -- and -pro drops one notch below it, still a hair
     # above minimax-m3's "almost like deepseek 4" floor.
-    if _DSV4_RE.search(low):
-        score = max(score, _PREF_FLOORS[9] - (0.5 if "pro" in low else 0))
+    _dsm = _DSV4_RE.search(low)
+    if _dsm:
+        # REBENCH 2026-09-27: newer v4.x above older v4, +0.01 per minor.
+        # Artificial Analysis (2026-09-27): DeepSeek V4.1 Flash 39 > V4 Pro 0813
+        # 36 > V4 Flash Vision 35; Arena text (Sep 25 2026): deepseek-v4.1-
+        # flash-max 1477 > deepseek-v4-pro 1458. Tiny on purpose: both sources
+        # still put Qwen3.8 Max (45 / 1479) and Gemini 3.8 Flash (41 / 1492)
+        # above V4.1 Flash, i.e. under qwen3.8's 134.08 and gemini-3.8's 134.07.
+        try:
+            _dsminor = min(int(_dsm.group(2) or 0), 5)
+        except ValueError:
+            _dsminor = 0
+        score = max(score, _PREF_FLOORS[9] - (0.5 if "pro" in low else 0)
+                    + _dsminor * 0.01)
     # USER PREFERENCE, stated as "latest kimi / qwen / deepseek" being the top
     # picks together — but only kimi, glm and deepseek ever got a floor, so qwen
     # was left on its natural score. MEASURED 2026-08-30: qwen3.8-27b scored
@@ -2349,6 +2413,26 @@ def _benchmark_score(pid, model_id):
             score = max(score, _PREF_FLOORS[7] + _bump)
     if _MINIMAX3_RE.search(low):
         score = max(score, _PREF_FLOORS[10])
+    # REBENCH 2026-09-27: MiMo-V2.6-Pro sat on the bare Tier S 100, i.e. BELOW
+    # minimax-m3 (133) and deepseek-v4 (134). Both independent boards put it
+    # above those and level with Qwen3.8 Max:
+    #   Artificial Analysis II (2026-09-27): MiMo-V2.6-Pro 46, Qwen3.8 Max 45,
+    #     GLM-5.3 45, DeepSeek V4.1 Flash 39, MiniMax-M3 29
+    #   Arena text (Sep 25 2026): mimo-v2.6-pro 1480, qwen3.8-max 1479,
+    #     deepseek-v4.1-flash-max 1477, minimax-m3 1440
+    # vs Kimi K3 the boards disagree (AA 46 > 44, Arena 1480 < 1488), so it
+    # stays under k3's 134.8. Pro only: MiMo-V2.5-Pro (AA 26) is below
+    # MiniMax-M3 and keeps its tier score; speed cuts keep theirs.
+    _mim = _MIMO_VER_RE.search(low)
+    if _mim and "pro" in low and not _SPEED_VARIANT_RE.search(low):
+        try:
+            _mmaj, _mmin = int(_mim.group(1)), int(_mim.group(2) or 0)
+            if (_mmaj, _mmin) >= (2, 6):
+                score = max(score, min(_MIMO_PRO_FLOOR
+                                       + _band_version_bump(_mmaj, _mmin, 2, 6),
+                                       _MIMO_PRO_CEILING))
+        except ValueError:
+            pass
     # USER PREFERENCE 2026-08-01: "gemini flash or pro 3.1, 3.5, 3.6 and up are
     # better than deepseek 4 / v4 — but gemini pro is better than gemini flash,
     # of course."
@@ -2437,6 +2521,48 @@ def _benchmark_score(pid, model_id):
         # +0.1 per version step past the pin (max +0.9): newer stays above
         # older, and the whole group stays under the full models at ~100+.
         score = min(score, _STRONG_SPEED_CAP) + _strong_root_version_excess(low) * 0.1
+    # REBENCH 2026-09-27 -- measured exceptions to the speed caps above. Both
+    # stay under every full model the boards rank above them.
+    #
+    # GLM-5.3-Flash was capped to 99, BELOW deepseek-v4-pro (133.5) and
+    # minimax-m3 (133). Both independent boards rank it above those two:
+    #   Artificial Analysis II (2026-09-27): GLM-5.3-Flash 42, DeepSeek V4
+    #     Pro 0813 36, MiniMax-M3 29 (TB4.0: 33% vs 14% vs 2%)
+    #   Arena text (Sep 25 2026): glm-5.3-flash 1474, deepseek-v4-pro 1458,
+    #     minimax-m3 1440
+    # ...and both rank it under GLM-5.3 max (45 / 1480), Kimi K3 (44 / 1488)
+    # and Qwen3.8 Max (45 / 1479), so it stops at 133.6 -- still under the
+    # deepseek-v4 flash floor (134; V4.1 Flash vs GLM-5.3-Flash is disputed:
+    # AA 39 < 42, Arena 1477 > 1474). best/max still partition speed cuts
+    # behind any live full model (quality_mode), so this changes fallback
+    # order and auto, not the best/max primary.
+    if strong_speed and "flash" in low:
+        _gfv = _GLM_VERSION_RE.search(low)
+        if _gfv:
+            try:
+                _gfmaj, _gfmin = int(_gfv.group(1)), int(_gfv.group(2) or 0)
+                if (_gfmaj, _gfmin) >= (5, 3):
+                    score = max(score, min(
+                        _GLM_FLASH_FLOOR + _band_version_bump(_gfmaj, _gfmin, 5, 3),
+                        _GLM_FLASH_CEILING))
+            except ValueError:
+                pass
+    # Gemini 3.5+ Flash-Lite was on the 30-point tiny cap, below Mistral
+    # Medium 3.5 (56), Mistral Large 3 and every Llama. Both boards put it
+    # above all of them:
+    #   Artificial Analysis II (2026-09-27): Gemini 3.5 Flash-Lite 22,
+    #     Mistral Medium 3.5 14, gpt-oss-120b 12, Llama 4 Maverick 10*,
+    #     Mistral Large 3 9, Llama 3.3 70B 8*
+    #   Arena text (Sep 25 2026): gemini-3.5-flash-lite 1456, mistral-medium-
+    #     3.5 1426, mistral-large-3 1413, llama-4-maverick 1327
+    # Only 3.5+: no board row exists for 3.1 Flash-Lite, which keeps the cap.
+    # Stays under _TOOLS_MIN_SCORE, so it is never an agentic primary.
+    if "flash-lite" in low and _gem:
+        try:
+            if int(_gem.group(1)) + int(_gem.group(2) or 0) / 10.0 >= 3.5:
+                score = max(score, _GEMINI_LITE_FLOOR)
+        except ValueError:
+            pass
     score -= _shared_budget_penalty(pid, low)
     # RELAY DISCOUNT, applied LAST so it survives the preference floors above
     # (those use max(score, floor), so a bias added earlier would be erased).

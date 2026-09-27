@@ -20,13 +20,18 @@ def no_aa(monkeypatch):
 # Scoring: speed-tier cuts never share the flagship's rank
 # --------------------------------------------------------------------------- #
 
+# REBENCH 2026-09-27: deepseek-v4-pro and qwen3-max left this list. Artificial
+# Analysis (GLM-5.3-Flash 42 vs DeepSeek V4 Pro 36) and the Arena text board
+# (1474 vs 1458) both rank the flash cut ABOVE V4 Pro; Qwen3 Max has no row on
+# either board and AA's newer Qwen3.7 Max already sits below GLM-5.3-Flash.
+# See tests/test_rebench_2026_09.py for the measured order.
 FRONTIER = [
     ("nvidia", "z-ai/glm-5.2"),
     ("tokenrouter", "z-ai/glm-5.3"),
-    ("nvidia", "deepseek-ai/deepseek-v4-pro"),
     ("nvidia", "moonshotai/kimi-k3"),
     ("openrouter", "anthropic/claude-opus-5"),
-    ("openrouter", "qwen/qwen3-max"),
+    ("openrouter", "qwen/qwen3.8-max"),
+    ("nvidia", "deepseek-ai/deepseek-v4-flash"),
 ]
 
 
@@ -37,9 +42,11 @@ def test_glm_53_flash_ranks_below_every_full_frontier_model(no_aa, pid, model):
 
 
 def test_glm_53_flash_is_not_in_the_top_preference_band(no_aa):
+    """Measured floor (rebench 2026-09-27), still under the deepseek-v4 /
+    glm-5.2 level and far under the claude/glm-5.3 band."""
     flash = app._benchmark_score("llm7", "GLM-5.3-Flash")
-    assert flash < app._STRONG_SPEED_CAP + 1.0
-    assert flash < min(f for f in app._PREF_FLOORS if f)
+    assert flash < app._PREF_FLOORS[9]
+    assert flash < app._PREF_FLOORS[5]
 
 
 def test_strong_speed_variant_stays_a_usable_agentic_fallback(no_aa):
