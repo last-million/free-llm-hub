@@ -353,11 +353,17 @@ def _window_bounds(window: str, now: float, pid: str = None):
         # reader sees a window nothing has been counted in yet (used 0). A state
         # file written under the old UTC rule migrates for free: its UTC-midnight
         # window_start is simply read as the anchor, ending at the next midnight.
+        # The per-KEY counter is anchored too: record_key() without a prior
+        # record() (a key outcome before any provider count) otherwise saw "a
+        # window opening NOW" on every call -- a new window_start each time
+        # the clock ticked, which wiped the previous key's row and made keys()
+        # read the live window as stale.
         with _LOCK:
-            st = _STATE.get(pid)
-            anchor = st.get("window_start") if isinstance(st, dict) else None
-        if isinstance(anchor, (int, float)) and anchor <= now < anchor + 86400:
-            return anchor, anchor + 86400
+            anchors = [s.get("window_start") for s in (_STATE.get(pid), _KEY_STATE.get(pid))
+                       if isinstance(s, dict)]
+        for anchor in anchors:
+            if isinstance(anchor, (int, float)) and anchor <= now < anchor + 86400:
+                return anchor, anchor + 86400
         return now, now + 86400
     if window == "day" and pid in DAY_RESET_TZ:
         bounds = _day_bounds_tz(DAY_RESET_TZ[pid], now)

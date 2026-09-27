@@ -523,10 +523,21 @@ def output_cap_from_error(text):
 # Native "context too long" error bodies, one per protocol
 # --------------------------------------------------------------------------- #
 
+def _overflow_numbers(requested, window):
+    """(requested, window) that always state a request LARGER than its limit.
+    The signal also fires when a hop would drop most of the history well
+    under its raw window, and the window can be a table figure; printed as
+    given that read "90000 tokens > 100000 maximum"."""
+    requested, window = int(requested or 0), int(window or 0)
+    if window and requested <= window:
+        requested = window + 1
+    return requested, window
+
+
 def openai_overflow_body(requested, window):
     """OpenAI's own shape and code -- what opencode, the OpenAI SDKs and codex
     (non-stream) recognise as 'compact and retry'."""
-    requested, window = int(requested or 0), int(window or 0)
+    requested, window = _overflow_numbers(requested, window)
     if window:
         msg = ("This model's maximum context length is %d tokens. However, your "
                "messages resulted in %d tokens. Please reduce the length of the "
@@ -541,7 +552,7 @@ def openai_overflow_body(requested, window):
 def anthropic_overflow_body(requested, window):
     """Anthropic's shape. Claude Code keys its reactive compaction on the
     message starting 'prompt is too long'."""
-    requested, window = int(requested or 0), int(window or 0)
+    requested, window = _overflow_numbers(requested, window)
     msg = "prompt is too long: %d tokens > %d maximum" % (requested, window or max(1, requested - 1))
     return {"type": "error", "error": {"type": "invalid_request_error", "message": msg}}
 

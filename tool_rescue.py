@@ -250,9 +250,23 @@ _MARKERS = ("<|dsml|", "<|tool_calls_begin|>", "<|tool_call_begin|>",
             "<|tool_calls_section_begin|>")
 
 
+def _markup_start(text, ticks=0):
+    """The first model-native opener in `text` that is NOT inside backticks
+    (inline code or a fence), or None. `ticks`: backticks already seen before
+    `text` (the streamed text emitted so far). Prose that MENTIONS a token --
+    "the parser now recognises Kimi's `<|tool_call_begin|>`" -- is an answer
+    about chat templates, not a call; treated as one it killed the stream."""
+    if not isinstance(text, str) or not text:
+        return None
+    for m in _MARKUP_START_RE.finditer(text):
+        if (ticks + text.count("`", 0, m.start())) % 2 == 0:
+            return m
+    return None
+
+
 def has_model_markup(text):
-    """True when `text` carries a model-native tool-call opener."""
-    return bool(isinstance(text, str) and text and _MARKUP_START_RE.search(text))
+    """True when `text` carries a model-native tool-call opener (outside code)."""
+    return _markup_start(text) is not None
 
 
 def _attrs(blob):
@@ -342,7 +356,7 @@ def model_markup_calls(text, schemas=None):
 def strip_model_markup(text):
     """`text` minus the model-native markup: from its first opener to the end of
     its last tag. Prose on either side survives."""
-    m = _MARKUP_START_RE.search(text or "")
+    m = _markup_start(text or "")
     if not m:
         return text or ""
     end = m.end()
@@ -597,6 +611,7 @@ def rescue_stream(items, tools, framing="lines"):
     mode = "pass"          # pass | hold (maybe an opener) | markup | done
     held, pending, markup, tail = [], "", "", []
     real_calls = False
+    ticks = 0              # backticks in the text passed through (see _markup_start)
 
     def finalize(fin_obj):
         calls = parse(markup, allowed_names=names, schemas=schemas)
@@ -643,9 +658,18 @@ def rescue_stream(items, tools, framing="lines"):
                     yield unit
             continue
         if mode == "hold":
+            if not text and kind == "other" and not bytes(
+                    unit if isinstance(unit, (bytes, bytearray))
+                    else str(unit).encode("utf-8", "ignore")).strip():
+                # The blank separator line iter_lines() yields between SSE
+                # events is transparent: flushing on it leaked every opener
+                # split across two deltas ('<' | 'DSML...') as plain text.
+                held.append(unit)
+                continue
             if not text:
                 # Nothing completes an opener across a non-text unit.
                 yield from held
+                ticks += pending.count("`")
                 held, pending, mode = [], "", "pass"
                 yield unit
                 continue
@@ -657,7 +681,7 @@ def rescue_stream(items, tools, framing="lines"):
         if not text:
             yield unit
             continue
-        m = _MARKUP_START_RE.search(text)
+        m = _markup_start(text, ticks)
         if m:
             if text[:m.start()]:
                 yield chunk({"content": text[:m.start()]})
@@ -671,6 +695,7 @@ def rescue_stream(items, tools, framing="lines"):
                 held, pending = [unit], text
             mode = "hold"
             continue
+        ticks += text.count("`")
         if held_text:
             yield from held
             held, pending = [], ""

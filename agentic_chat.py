@@ -3744,11 +3744,12 @@ def send_message_stream_durable(session_id, text):
         rejected = False
         project_dir = (sess_info or {}).get("project_dir")
         # If the PROCESS dies mid-turn, the finally below never runs; this
-        # marker is what the next boot turns into the stopping place.
-        try:
-            memory.begin_inflight(session_id, text, project_dir)
-        except Exception:                                        # noqa: BLE001
-            pass
+        # marker is what the next boot turns into the stopping place. Written
+        # on the turn's FIRST event, once send_message_stream holds the turn
+        # lock -- not before: a send that loses the race past turn_busy (409)
+        # overwrote the RUNNING turn's marker, then its finally unlinked it,
+        # so a crash of the live turn left no stopping place at all.
+        began = False
         try:
             prompt, rounds = text, 0
             while True:
@@ -3756,6 +3757,12 @@ def send_message_stream_durable(session_id, text):
                 interrupted = False
                 seen_any = False
                 for ev in send_message_stream(session_id, prompt):
+                    if not began and ev.get("event") != "error":
+                        began = True
+                        try:
+                            memory.begin_inflight(session_id, text, project_dir)
+                        except Exception:                        # noqa: BLE001
+                            pass
                     # The nudge itself is not shown as a user turn: the reader
                     # asked for one thing and should see one conversation.
                     q.put(ev)
@@ -3826,10 +3833,11 @@ def send_message_stream_durable(session_id, text):
                                             project_dir=project_dir)
             except Exception:                                    # noqa: BLE001
                 pass
-            try:
-                memory.end_inflight(session_id)
-            except Exception:                                    # noqa: BLE001
-                pass
+            if began:            # never another turn's marker (see above)
+                try:
+                    memory.end_inflight(session_id)
+                except Exception:                                # noqa: BLE001
+                    pass
             q.put(None)          # sentinel: no more events, thread is done
 
     threading.Thread(target=_run, daemon=True).start()

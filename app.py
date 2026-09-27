@@ -1012,7 +1012,21 @@ def _codex_dump_models(binary):
         return None
 
 
-def _refresh_codex_catalog():
+def _refresh_codex_catalog_soon():
+    """_refresh_codex_catalog off the request thread (it runs `codex debug
+    models`, up to 90s). Called after every successful codex CONNECT: startup
+    was its only caller, so after Disconnect (which deletes the catalog) then
+    Connect, /model lacked the hub's modes and effort tiers until a restart."""
+    try:
+        # The config path is resolved NOW, on the caller's thread: the one the
+        # connect just wrote is the one whose catalog this refreshes.
+        threading.Thread(target=_refresh_codex_catalog, args=(_p_codex(),),
+                         daemon=True, name="codex-catalog").start()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _refresh_codex_catalog(config_path=None):
     """Rewrite ~/.codex/model_catalog.json so /model offers the hub's modes.
 
     ONLY WHILE CODEX IS CONNECTED TO THE HUB. REPORTED 2026-09-26: "when I
@@ -1028,8 +1042,8 @@ def _refresh_codex_catalog():
     Silent no-op when codex is not installed, when its dump cannot be read, or
     when the file already says what we would write."""
     try:
-        if not _codex_wired_to_hub():
-            _codex_disconnect_catalog()
+        if not _codex_wired_to_hub(config_path):
+            _codex_disconnect_catalog(config_path)
             return
         binary = _which_cli("codex")
         if not binary:
@@ -1041,7 +1055,7 @@ def _refresh_codex_catalog():
         if not entries:
             return
         payload = json.dumps({"models": entries}, indent=2) + "\n"
-        path = _codex_catalog_path()
+        path = _codex_catalog_path(config_path)
         if os.path.isfile(path):
             with open(path, encoding="utf-8") as fh:
                 if fh.read() == payload:
@@ -7738,11 +7752,14 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
             (fast if _is_fast(entry[1], entry[2]) else slow).append(entry)
     # MODE, the same filter the primary pick applies -- otherwise a mode chose
     # the first model and the chain behind it quietly left the mode again on the
-    # first retry. Fail-open per tier, so a mode with nothing available still
-    # falls back to the full chain rather than to no chain.
+    # first retry. Fail-open over BOTH tiers together, so a mode with nothing
+    # available still falls back to the full chain rather than to no chain --
+    # per tier, a mode whose models are all slow kept every out-of-mode FAST
+    # model, and on big-context turns the fallbacks left the category.
     _all_fast = list(fast)
-    fast = _apply_mode(fast)
-    slow = _apply_mode(slow)
+    _in_mode = set(_apply_mode(fast + slow))
+    fast = [e for e in fast if e in _in_mode]
+    slow = [e for e in slow if e in _in_mode]
     # best model first; tie among equal-score models -> most free quota left, so
     # the fallback chain keeps using providers that still have budget.
     fast.sort(key=lambda t: (t[0], _quota_headroom(t[1])), reverse=True)
@@ -8142,7 +8159,8 @@ def _refit_payload_to_learned_ctx(pid, payload):
                                                 stats=_st,
                                                 abort_frac=_CTX_OVERFLOW_DROP_FRAC)
             if _st.get("overflow"):
-                _ctx_note_overflow(_model_ctx_budget(pid, payload.get("model")))
+                _ctx_note_overflow(_model_ctx_budget(pid, payload.get("model")),
+                                   pid=pid, model=payload.get("model"))
                 return None
         else:
             compacted, did = _compact_to_budget(msgs, payload.get("tools"), budget)
@@ -8407,12 +8425,22 @@ def _request_path_endswith(suffix):
 def _ctx_begin(body, messages, est, signal=True):
     """Called by each /v1 handler right before its chain walk: turns the
     overflow signal on for this request (setting context_overflow_signal,
-    default on), remembers the ORIGINAL request size and the conversation id."""
-    _ctx_set("_ctx_signal", bool(signal) and bool(
+    default on), remembers the ORIGINAL request size and the conversation id.
+
+    NEVER for a CLI's own compaction request: the overflow error is the cue
+    to compact, so answering the compaction call itself with it (after a real
+    upstream 400 on a guessed window) left Claude Code / Codex no way out.
+    Such a request falls through to the ordinary chain-exhausted reply."""
+    try:
+        compaction = ctxwin.is_compaction_request(messages)
+    except Exception:                                            # noqa: BLE001
+        compaction = False
+    _ctx_set("_ctx_signal", bool(signal) and not compaction and bool(
         config.get_flag("context_overflow_signal", True)))
     _ctx_set("_ctx_orig_est", int(est or 0))
     _ctx_set("_ctx_overflow", None)
     _ctx_set("_ctx_hops", {})
+    _ctx_set("_ctx_tried", set())
     try:
         conv = ctxwin.conversation_key(request.headers, body, _build_sid(), messages)
     except Exception:                                            # noqa: BLE001
@@ -8465,9 +8493,26 @@ def _reported_prompt_tokens(upstream_pt, orig_est, pid=None, model=None):
         return 0
 
 
-def _ctx_note_overflow(window=None):
+def _ctx_note_tried(pid, model):
+    """A chain hop was dispatched (see _ChainClock.dispatch): the overflow
+    reply needs to know every hop tried, not only the ones that overflowed."""
+    tried = _ctx_g("_ctx_tried")
+    if isinstance(tried, set):
+        tried.add((pid, model))
+
+
+def _ctx_note_overflow(window=None, pid=None, model=None):
     ov = _ctx_g("_ctx_overflow") or {"hops": 0, "window": 0}
-    ov["hops"] = int(ov.get("hops") or 0) + 1
+    dup = False
+    if pid is not None:
+        # One hop can be counted twice (the refit refuses it, then its 400
+        # reaches the handler): counted once per (pid, model).
+        keys = ov.setdefault("keys", [])
+        dup = [pid, model] in keys
+        if not dup:
+            keys.append([pid, model])
+    if not dup:
+        ov["hops"] = int(ov.get("hops") or 0) + 1
     try:
         ov["window"] = max(int(ov.get("window") or 0), int(window or 0))
     except (TypeError, ValueError):
@@ -8487,18 +8532,26 @@ def _ctx_note_overflow_resp(resp, pid, model):
     if ctxwin.output_cap_from_error(text) and not re.search(
             r"context|prompt|input", text, re.I):
         return
-    _ctx_note_overflow(_ctx_limit(pid, model) or _model_ctx_budget(pid, model))
+    _ctx_note_overflow(_ctx_limit(pid, model) or _model_ctx_budget(pid, model),
+                       pid=pid, model=model)
 
 
 def _ctx_overflow_reply(kind, stream=False, model_label="auto"):
     """The protocol's native "context too long" reply when this request
     overflowed every hop it tried, else None. kind: openai | responses |
-    anthropic."""
+    anthropic.
+
+    EVERY hop: one that failed on a 429, a 5xx or a timeout might have held
+    the request, and telling the CLI "too long" then makes it compact its own
+    history over a rate limit instead of waiting out the Retry-After."""
     if not _ctx_g("_ctx_signal"):
         return None
     ov = _ctx_g("_ctx_overflow")
     if not ov or not ov.get("hops"):
         return None
+    tried = _ctx_g("_ctx_tried")
+    if isinstance(tried, set) and len(tried) > int(ov.get("hops") or 0):
+        return None               # some hop failed for another reason
     orig = int(_ctx_g("_ctx_orig_est") or 0)
     window = int(ov.get("window") or 0)
     hdrs = {"X-Free-LLM-Hub-Last-Error": "context"}
@@ -9105,7 +9158,11 @@ def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stat
         body = [m for m in units[u] if id(m) not in pinned_ids]
         if not body:
             continue
-        c = sum(_est_tokens([m]) for m in body)
+        # Per-message cost WITHOUT the 400-token per-request overhead (`base`
+        # already carries it once) -- the same measure as `total` above.
+        # Charged per message, 150 small tool pairs "cost" 120K and a request
+        # 5% over its target lost 98% of its history.
+        c = sum(_est_tokens([m], overhead=0) for m in body)
         if u < forced_from and running + c > target:
             break
         keep_ids.update(id(m) for m in body)
@@ -9196,19 +9253,31 @@ def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stat
     return out, True
 
 
+def _is_tool_call_msg(m):
+    return (isinstance(m, dict) and m.get("role") == "assistant"
+            and isinstance(m.get("tool_calls"), list))
+
+
 def _message_units(rest):
     """The history as UNITS: an assistant message with tool_calls together with
     the tool results that immediately answer it, or a single other message.
     Compaction keeps or drops a unit whole, so a call is never separated from
-    its result (which _sanitize_tool_messages would then delete as an orphan)."""
+    its result (which _sanitize_tool_messages would then delete as an orphan).
+
+    A RUN of tool-calling assistant messages is one unit with every result
+    that follows it: /v1/responses turns Codex's parallel calls into one
+    assistant message PER function_call (asst a, asst b, tool a, tool b), and
+    unit-per-assistant let compaction keep tool a while dropping asst a."""
     units, i, n = [], 0, len(rest)
     while i < n:
         m = rest[i]
-        if (isinstance(m, dict) and m.get("role") == "assistant"
-                and isinstance(m.get("tool_calls"), list)):
-            ids = {tc.get("id") for tc in m["tool_calls"]
-                   if isinstance(tc, dict) and tc.get("id")}
+        if _is_tool_call_msg(m):
             unit, j = [m], i + 1
+            while j < n and _is_tool_call_msg(rest[j]):
+                unit.append(rest[j])
+                j += 1
+            ids = {tc.get("id") for a in unit for tc in a["tool_calls"]
+                   if isinstance(tc, dict) and tc.get("id")}
             while (j < n and isinstance(rest[j], dict) and rest[j].get("role") == "tool"
                    and (not ids or rest[j].get("tool_call_id") in ids)):
                 unit.append(rest[j])
@@ -9495,7 +9564,7 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             # Serving this hop would silently drop over _CTX_OVERFLOW_DROP_FRAC
             # of the conversation. Skip it; if no hop can hold the request the
             # handler answers with the protocol's native context-length error.
-            _ctx_note_overflow(_budget)
+            _ctx_note_overflow(_budget, pid=pid, model=payload.get("model"))
             raise _ContextOverflow(
                 "request of ~%d tokens would lose %.0f%% of its history to fit "
                 "%s/%s's %d-token window" % (_cstats.get("before") or 0,
@@ -16620,6 +16689,18 @@ def _forget_conversation_state(session_id, project_dir=None):
         agentic_chat.remove_task_brief(project_dir, session_id)
     except Exception:                                            # noqa: BLE001
         pass
+    _forget_agent_recap(session_id)
+
+
+def _forget_agent_recap(session_id):
+    """Drop an /agent session's rolling compaction recap ('agent:<sid>').
+    On delete it would sit on disk for 30 days; on rewind _multi_context and
+    _rolling_recap handed the next turn a recap of work that was undone."""
+    try:
+        if session_id:
+            _recap_store.delete(ctxwin.conversation_key(agent_sid=session_id))
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 agentic_history.add_forget_hook(_forget_conversation_state)
@@ -16737,6 +16818,7 @@ def api_agent_history_rewind(session_id):
                       project_dir=project_dir)
     except Exception:                                            # noqa: BLE001
         pass
+    _forget_agent_recap(session_id)     # it recapped turns that no longer happened
     return jsonify({"session_id": session_id, "index": index,
                     "turns_removed": removed or 0,
                     "text": (turns[index] or {}).get("text") or "",
@@ -19709,6 +19791,8 @@ def _bulk_hub_on(expected_revision):
                 clients[cid]["rollback"] = "conflict"
                 clients[cid]["detail"] = _sanitize(str(exc))
         return _finalize_hub_state(changing["revision"], "error", clients)
+    if "codex" in changed_ids:
+        _refresh_codex_catalog_soon()     # its /model modes, as at startup
     return _finalize_hub_state(changing["revision"], "on", clients)
 
 
@@ -20345,6 +20429,8 @@ def api_cli_autofix(cid):
         return jsonify({"ok": False, "reason": _sanitize("could not write config: %s" % exc)})
     if result.get("ok"):
         _mark_hub_mode_unmanaged()
+        if entry.get("id") == "codex":
+            _refresh_codex_catalog_soon()
     return jsonify(result)
 
 
@@ -20929,8 +21015,17 @@ def _call_with_wall_clock(seconds, fn, *a, **kw):
             box["v"] = v
 
     t = threading.Thread(target=_carry_usage_source(_run), daemon=True)
+    end = time.monotonic() + max(0.0, seconds)
     t.start()
     t.join(max(0.0, seconds))
+    # join() can return a hair EARLY by time.monotonic()'s reckoning (15.6 ms
+    # ticks on Windows): the chain then saw its deadline "not yet spent" and
+    # started another hop with a few ms left. Wait out the true remainder.
+    while t.is_alive():
+        rest = end - time.monotonic()
+        if rest <= 0:
+            break
+        t.join(rest)
     with lock:
         if "exc" in box:
             raise box["exc"]
@@ -21017,6 +21112,10 @@ def _run_hedge_leg(idx, pid, payload, stream, lines, budget, q, lock, abandoned,
                         content_grace=grace,
                         on_content=(lambda: streaming.add(idx))
                         if streaming is not None else None)
+                    # The verdict's KIND lives in THIS thread's slot; carry it
+                    # on the leg's response so _record_losers files it right.
+                    _tag_nonanswer_kind(resp, _take_nonanswer_kind()
+                                        if status == "nonanswer" else None)
                     item = (idx, "peek", resp, (status, buffered, it))
                 except Exception as exc:                         # noqa: BLE001
                     _close_hedge_item(item)
@@ -21029,6 +21128,13 @@ def _run_hedge_leg(idx, pid, payload, stream, lines, budget, q, lock, abandoned,
             q.put(item)
     if drop:
         _close_hedge_item(item)
+
+
+def _tag_nonanswer_kind(resp, kind):
+    try:
+        resp._hub_nonanswer_kind = kind
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def _hedge_leg_verdict(item, payload):
@@ -21048,6 +21154,9 @@ def _hedge_leg_verdict(item, payload):
             if not isinstance(data, dict):
                 return "non-json"
             if _chat_json_nonanswer(data, False, None):
+                # Two legs are judged one after the other on this thread: the
+                # kind rides on the leg, not in the single thread-local slot.
+                _tag_nonanswer_kind(obj, _take_nonanswer_kind())
                 return "nonanswer"
             if _chat_json_is_empty(data):
                 return "empty"
@@ -21346,7 +21455,8 @@ class _ChainClock:
                         # the junk bench): losing the race is no excuse.
                         _record_outcome(p, m, False, junk=True)
                     elif verdict == "nonanswer":
-                        _note_nonanswer(p, m)
+                        _note_nonanswer(p, m, kind=getattr(
+                            obj, "_hub_nonanswer_kind", None))
                     elif verdict == "timeout":
                         _note_recent_hop_failure(p, m, "deadline")
             except Exception:                                    # noqa: BLE001
@@ -21384,6 +21494,7 @@ class _ChainClock:
         `hedge=False` for a same-hop retry, which must stay on its hop."""
         self._served = None
         model = (payload or {}).get("model")
+        _ctx_note_tried(pid, model)
         self._hop_started = time.monotonic()
         self._hop_budget = self._budget_for(pid, model, stream)
         if self._hop_budget is None:
@@ -21922,11 +22033,20 @@ _PROVIDER_QUOTA_RE = re.compile(
 _PROVIDER_ERROR_RE = re.compile(
     r"\baccount\s+(?:has\s+been|is|was)\s+(?:suspended|disabled|banned|deactivated|blocked"
     r"|restricted|locked|flagged)\b"
-    r"|\b(?:the\s+)?model\s+(?:[`'\"][^`'\"\n]{1,80}[`'\"]\s+|\S+\s+)?(?:is\s+|was\s+)?"
+    r"|\bno\s+such\s+model\b", re.I)
+# GENERIC error phrasing counts only in the upstream's own voice: the sentence
+# OPENS with it. "No, the model is not available on Azure yet." and "The job
+# failed because the service is temporarily unavailable." are answers.
+_PROVIDER_GENERIC_RE = re.compile(
+    r"^\W*(?:(?:error|sorry)\b[\s:,.!-]*)?(?:"
+    r"(?:the\s+)?model\s+(?:[`'\"][^`'\"\n]{1,80}[`'\"]\s+|\S+\s+)?(?:is\s+|was\s+)?"
     r"(?:not\s+found|not\s+available|unavailable|not\s+supported|does\s?n[o']?t\s+exist)\b"
-    r"|\bno\s+such\s+model\b"
-    r"|\b(?:please\s+)?try\s+again\s+later\b"
-    r"|\bservice\s+(?:is\s+)?(?:temporarily\s+)?unavailable\b", re.I)
+    r"|(?:please\s+)?try\s+again\s+later\b"
+    r"|(?:the\s+)?service\s+(?:is\s+)?(?:temporarily\s+)?unavailable\b)", re.I)
+# The request's last turn carries TOOL RESULTS (an agent loop): a short reply
+# then faithfully reports a tool's error output ("the registry returned 429
+# Too Many Requests"), which is the answer, not the provider's error page.
+_TOOL_RESULT_TURN = "\x00tool-results\x00"
 # The last user turn asking ABOUT keys/quotas/limits: then a short reply about
 # them is an answer, not an error page.
 _PROVIDER_ERROR_PROMPT_RE = re.compile(
@@ -21969,6 +22089,8 @@ def _request_prompt_text():
             if isinstance(inp, str):
                 return inp[:_PROMPT_CHECK_CAP]
             turns = inp if isinstance(inp, list) else []
+        if turns and _carries_tool_results(turns[-1]):
+            return _TOOL_RESULT_TURN
         for m in reversed(turns):
             if not isinstance(m, dict) or m.get("role") != "user":
                 continue
@@ -21982,26 +22104,49 @@ def _request_prompt_text():
         return None
 
 
+def _carries_tool_results(m):
+    """True for a turn that IS tool output: OpenAI role "tool", an Anthropic
+    user turn of tool_result blocks, a Responses function_call_output item."""
+    if not isinstance(m, dict):
+        return False
+    if m.get("role") == "tool" or m.get("type") == "function_call_output":
+        return True
+    c = m.get("content")
+    return (m.get("role") == "user" and isinstance(c, list)
+            and any(isinstance(p, dict) and p.get("type") == "tool_result" for p in c))
+
+
 def _provider_error_kind(text, prompt=None):
-    """"provider_quota" | "provider_error" | None -- see the note above."""
+    """"provider_quota" | "provider_error" | None -- see the note above.
+
+    The error must be the upstream's OWN voice: the reply's opening sentence
+    is a hit (not a report further in), generic phrasing ("try again later",
+    "model ... not available") only counts where it opens a sentence, and a
+    turn answering tool results is never judged (an agent's faithful report
+    of a tool's error output looked exactly like a relay's error page)."""
     s = (text or "").strip()
     if not s or len(s) > _PROVIDER_ERROR_MAX_CHARS:
         return None
+    if prompt == _TOOL_RESULT_TURN:
+        return None
     if prompt and _PROVIDER_ERROR_PROMPT_RE.search(prompt):
         return None
-    hit, total, quota = 0, 0, False
+    hit, total, quota, first = 0, 0, False, None
     for sent in re.split(r"(?<=[.!?])\s+|\n+", s):
         sent = sent.strip()
         if not sent:
             continue
         total += len(sent)
-        if _PROVIDER_ADVICE_RE.match(sent):
-            continue              # "If your API key has expired, ..." is advice
-        q = _PROVIDER_QUOTA_RE.search(sent)
-        if q or _PROVIDER_ERROR_RE.search(sent):
-            hit += len(sent)
-            quota = quota or bool(q)
-    if not hit or hit < _PROVIDER_ERROR_SHARE * total:
+        is_hit = False
+        if not _PROVIDER_ADVICE_RE.match(sent):   # "If your API key has expired" is advice
+            q = _PROVIDER_QUOTA_RE.search(sent)
+            if q or _PROVIDER_ERROR_RE.search(sent) or _PROVIDER_GENERIC_RE.match(sent):
+                hit += len(sent)
+                quota = quota or bool(q)
+                is_hit = True
+        if first is None:
+            first = is_hit
+    if not hit or not first or hit < _PROVIDER_ERROR_SHARE * total:
         return None
     return "provider_quota" if quota else "provider_error"
 
@@ -22338,7 +22483,7 @@ def _chat_json_nonanswer(data, has_tools=False, tools=None):
         return False
 
 
-def _note_nonanswer(pid, model):
+def _note_nonanswer(pid, model, kind=_PROMPT_UNSET):
     """Both consequences in one hook: file the delivery failure the 200 branch
     never filed, and sideline this (pid, model) for _DEAD_MODEL_TTL. Dead-marking
     is the ONLY mechanism here that actually REMOVES an id from the chain
@@ -22347,8 +22492,13 @@ def _note_nonanswer(pid, model):
 
     Provider error PHRASING (_provider_error_kind, a heuristic) files the
     failure without the dead-mark; a key/quota/credit/rate limit also cools
-    the pair down for _PROVIDER_QUOTA_COOLDOWN."""
-    kind = _take_nonanswer_kind()
+    the pair down for _PROVIDER_QUOTA_COOLDOWN.
+
+    `kind`: the verdict's kind when the caller carries it (hedge legs are
+    judged on other threads, and one after another); otherwise the thread-
+    local slot the detector on THIS thread just set."""
+    if kind is _PROMPT_UNSET:
+        kind = _take_nonanswer_kind()
     _record_outcome(pid, model, False)
     if kind in ("provider_quota", "provider_error"):
         if kind == "provider_quota":

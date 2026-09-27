@@ -753,7 +753,7 @@ def remember_summary(session_id, text, project_dir=None):
         return _save(mem)
 
 
-def remember_fact(session_id, text, project_dir=None):
+def remember_fact(session_id, text, project_dir=None, by=None):
     """A decision or constraint worth not re-deciding.
 
     Deduplicated and bounded: the failure mode of a fact store is that it fills
@@ -770,6 +770,9 @@ def remember_fact(session_id, text, project_dir=None):
     # The stamp stats files; taken before the lock, so a slow folder (a
     # cloud-synced one) cannot hold every other conversation's memory up.
     stamp = _stamp(text, project_dir) if project_dir else None
+    if stamp is not None and by:
+        # The conversation that filed it: its rewind takes it back (rewind).
+        stamp["by"] = str(by).strip()[:120]
     with _LOCK:
         mem = get(session_id)
         facts = [f for f in mem.get("facts") or [] if isinstance(f, str)]
@@ -1183,8 +1186,57 @@ COMMANDS_FACT_PREFIX = "Commands verified to work here: "
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _LEAD_RE = re.compile(r"^\s*(?:[-*+>]|\d+[.)]|#{1,6})\s+")
 _DECISION_RE = re.compile(r"^(decision|decided|note|constraint)\s*:\s*(.+)$", re.I)
+# A "Note:" that is the agent's own passing status ("I could not find the file
+# yet") describes this turn, not the project: not a lasting fact.
+_STATUS_NOTE_RE = re.compile(
+    r"^(?:i|i'm|i've|i'll|we|we're|we've)\b|\b(?:yet|so far|for now|right now|at the moment)\b",
+    re.I)
 _RULE_START_RE = re.compile(r"^(must|never|always)\b", re.I)
-_PREF_RE = re.compile(r"^(?:please\s+)?(always|never|use|i want|i'd like|i prefer)\b", re.I)
+# STANDING RULES only. "I want you to build a landing page" and "Use X to do
+# this" open nearly every conversation and are the TASK, not a preference; as
+# project facts they pushed the real decisions out of the capped fact list.
+_PREF_RE = re.compile(
+    r"^(?:please\s+)?(?:always|never|from now on|going forward|don'?t ever|do not ever"
+    r"|i (?:always |generally |usually )?prefer|prefer)\b", re.I)
+# "use pnpm" / "use tabs, not spaces" is a lasting choice; "use my key for ..." /
+# "use the following ..." / "use React to build ..." is about this one task.
+_PREF_USE_RE = re.compile(r"^(?:please\s+)?use\s+(?!(?:this|that|these|those|my|the|it|a|an"
+                          r"|following|your|our)\b)[^\s,.;]+(?:\s*,?\s*(?:not|instead of|over"
+                          r"|rather than)\s+[^\s,.;]+)?$", re.I)
+# NEVER remembered: a fact is handed to every later conversation in the folder,
+# to free providers and into the brief written inside the project. A candidate
+# that carries a credential is dropped whole; a harvested command has secret
+# env assignments stripped first (see _strip_secret_env).
+_SECRET_RE = re.compile(
+    r"\b(?:sk|pk|rk)[-_](?:[A-Za-z]+[-_])?[A-Za-z0-9]{6,}"          # sk-..., sk-proj-...
+    r"|\bgh[pousr]_[A-Za-z0-9]{10,}|\bgithub_pat_[A-Za-z0-9_]{10,}"
+    r"|\bxox[abposr]-[A-Za-z0-9-]{6,}|\b(?:AKIA|ASIA)[A-Z0-9]{12,}"
+    r"|\bAIza[0-9A-Za-z_-]{20,}|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"
+    r"|\b[A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIALS?)\s*=\s*\S+"
+    r"|\b(?:password|passwd|passphrase|api[\s_-]?key|secret|token|access[\s_-]?key"
+    r"|credentials?)\b\s*(?:is|was|=|:)?\s*[\"'`]?[^\s\"'`]{4,}", re.I)
+_LONG_TOKEN_RE = re.compile(r"[A-Za-z0-9_+/=-]{32,}")
+_SECRET_ENV_RE = re.compile(
+    r"(?:^|(?<=\s))[A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIALS?)"
+    r"=\S*\s*", re.I)
+
+
+def _looks_secret(text):
+    """True when `text` seems to carry a credential (see _SECRET_RE). Errs on
+    the side of dropping: a lost fact costs a line, a stored key leaks."""
+    s = text or ""
+    if _SECRET_RE.search(s):
+        return True
+    for tok in _LONG_TOKEN_RE.findall(s):
+        # A long run mixing letters AND digits is a key/hash, not prose or a path.
+        if re.search(r"[A-Za-z]", tok) and re.search(r"\d", tok) and "/" not in tok:
+            return True
+    return False
+
+
+def _strip_secret_env(cmd):
+    """A command minus its secret env assignments (OPENAI_API_KEY=... pytest)."""
+    return " ".join(_SECRET_ENV_RE.sub(" ", cmd or "").split())
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+|\n+")
 _WRITE_TOOL_RE = re.compile(
     r"^\s*(write|edit|create|multiedit|multi_edit|str_replace\w*|apply_patch|"
@@ -1203,6 +1255,16 @@ _PASSED_RE = re.compile(
 _FAILED_RE = re.compile(
     r"\b([1-9]\d* (?:failed|failing|errors?)|tests? (?:fail|failed|failing)|"
     r"build failed|still fail\w*|could not (?:run|pass)|did not pass)\b", re.I)
+# Tool events that only NAME a file or pattern (read/search tools), never ran it.
+_NON_SHELL_TOOL_RE = re.compile(
+    r"^(?:read|grep|glob|search|ls|list|view|open|fetch|webfetch|websearch|todo\w*|task"
+    r"|notebookread|read_file|list_dir|find_files?)\b\s*:?\s", re.I)
+# A command that itself runs a verify tool: optional `cd x &&` / env
+# assignments, an optional launcher (npx, python -m, uv run, ./), then the tool.
+_RUNS_VERIFY_RE = re.compile(
+    r"^(?:(?:cd\s+\S+|[A-Za-z_]\w*=\S*)\s*(?:&&|;)?\s*)*"
+    r"(?:(?:npx|pnpx|bunx|uvx|uv\s+run|poetry\s+run|pipenv\s+run|pdm\s+run|hatch\s+run"
+    r"|python\d*(?:\.\d+)?\s+-m|py\s+-m)\s+)?(?:\./)?" + _VERIFY_CMD_RE.pattern, re.I)
 
 # Optional model-based extractor (flag memory_fact_extractor, default off; the
 # hub installs it). `fn(request, reply) -> [str]`, run OFF the caller's thread.
@@ -1235,6 +1297,8 @@ def harvest_decisions(reply):
     for line in _prose_lines(reply):
         m = _DECISION_RE.match(line)
         if m:
+            if m.group(1).lower() == "note" and _STATUS_NOTE_RE.search(m.group(2).strip()):
+                continue                  # the agent's passing status, not a rule
             fact = "%s: %s" % (m.group(1).capitalize(), m.group(2).strip())
         elif _RULE_START_RE.match(line):
             fact = line
@@ -1252,7 +1316,9 @@ def harvest_preferences(request):
     out = []
     for sent in _SENTENCE_SPLIT_RE.split(request or ""):
         s = " ".join(_LEAD_RE.sub("", sent).split()).rstrip(" .;")
-        if not (HARVEST_MIN_CHARS <= len(s) <= 200) or not _PREF_RE.match(s):
+        if not (HARVEST_MIN_CHARS <= len(s) <= 200):
+            continue
+        if not (_PREF_RE.match(s) or _PREF_USE_RE.match(s)):
             continue
         fact = "User preference: " + s
         if fact not in out:
@@ -1302,31 +1368,50 @@ def harvest_commands(tools, reply):
         s = " ".join(str(t or "").split())
         if not s or not _VERIFY_CMD_RE.search(s) or _WRITE_TOOL_RE.match(s):
             continue
+        # A Read/Grep/Glob/... event NAMING a tool ("Read: pytest.ini") is not
+        # a command that ran; only shell events (or a bare command) are.
+        if _NON_SHELL_TOOL_RE.match(s):
+            continue
         # "bash: pytest -q" / "shell pytest -q" -> the command itself
-        s = re.sub(r"^(bash|shell|sh|powershell|cmd|run|exec|command)\s*:?\s+", "",
-                   s, flags=re.I)
-        s = re.sub(r"^-l?c\s+", "", s).strip("'\" ")[:120]
-        if s and s not in out:
+        s = re.sub(r"^(bash|shell|sh|powershell|pwsh|cmd|run|exec|command|terminal)\s*:?\s+",
+                   "", s, flags=re.I)
+        s = re.sub(r"^-l?c\s+", "", s).strip("'\" ")
+        s = _strip_secret_env(s)[:120]
+        # The command itself must RUN a verify tool (after `cd x &&` / env /
+        # npx-style launchers): "cat ruff.toml" or "rm -rf dist && tsc" is not
+        # a verified test/build command.
+        if not s or "`" in s or not _RUNS_VERIFY_RE.match(s) or _looks_secret(s):
+            continue
+        if s not in out:
             out.append(s)
         if len(out) >= HARVEST_COMMANDS:
             break
     return out
 
 
-def _merge_rolling(scope, prefix, items, project_dir, limit, sep):
+def _merge_rolling(scope, prefix, items, project_dir, limit, sep, by=None):
     """ONE rolling fact per kind: the new items first, then the ones it
     already listed, capped -- and the previous version of it removed, so a
-    busy project does not push its decisions out with file lists."""
+    busy project does not push its decisions out with file lists.
+
+    With sep "; " the items are rendered backtick-quoted and read back BY
+    BACKTICK PAIRS, so a command containing ';' ("cd web; npm run build")
+    survives a merge whole instead of coming back as two "verified" pieces."""
     if not scope or not items:
         return False
+    quoted = sep == "; "
     with _LOCK:
         mem = get(scope)
         facts = [f for f in mem.get("facts") or [] if isinstance(f, str)]
         old = []
         for f in facts:
             if f.startswith(prefix):
-                old += [x.strip().strip("`") for x in f[len(prefix):].split(sep.strip())
-                        if x.strip()]
+                body = f[len(prefix):]
+                if quoted:
+                    old += [x.strip() for x in re.findall(r"`([^`]+)`", body) if x.strip()]
+                else:
+                    old += [x.strip().strip("`") for x in body.split(sep.strip())
+                            if x.strip()]
         merged = []
         for x in list(items) + old:
             x = x.strip().strip("`")
@@ -1335,8 +1420,8 @@ def _merge_rolling(scope, prefix, items, project_dir, limit, sep):
         merged = merged[:limit]
         mem["facts"] = [f for f in facts if not f.startswith(prefix)]
         _save(mem)
-    shown = sep.join(("`%s`" % x) if sep == "; " else x for x in merged)
-    return remember_fact(scope, prefix + shown, project_dir=project_dir)
+    shown = sep.join(("`%s`" % x) if quoted else x for x in merged)
+    return remember_fact(scope, prefix + shown, project_dir=project_dir, by=by)
 
 
 def harvest_facts(session_id, request="", reply="", project_dir=None, tools=()):
@@ -1347,16 +1432,21 @@ def harvest_facts(session_id, request="", reply="", project_dir=None, tools=()):
         scope = project_key(project_dir) if project_dir else session_id
         if not scope:
             return filed
+        # `by`: which conversation filed a project fact, so its rewind can
+        # take back exactly what its undone turns learned (see rewind).
+        by = session_id if project_dir else None
         for fact in harvest_preferences(request) + harvest_decisions(reply):
-            if remember_fact(scope, fact, project_dir=project_dir):
+            if _looks_secret(fact):
+                continue                  # never a credential as a lasting fact
+            if remember_fact(scope, fact, project_dir=project_dir, by=by):
                 filed.append(fact)
-        files = harvest_files(tools, project_dir)
+        files = [f for f in harvest_files(tools, project_dir) if not _looks_secret(f)]
         if files and _merge_rolling(scope, FILES_FACT_PREFIX, files, project_dir,
-                                    HARVEST_FILES, ", "):
+                                    HARVEST_FILES, ", ", by=by):
             filed.append(FILES_FACT_PREFIX + ", ".join(files))
         cmds = harvest_commands(tools, reply)
         if cmds and _merge_rolling(scope, COMMANDS_FACT_PREFIX, cmds, project_dir,
-                                   HARVEST_COMMANDS, "; "):
+                                   HARVEST_COMMANDS, "; ", by=by):
             filed.append(COMMANDS_FACT_PREFIX + "; ".join(cmds))
         extractor = _FACT_EXTRACTOR
         enabled = getattr(extractor, "enabled", None)
@@ -1365,18 +1455,20 @@ def harvest_facts(session_id, request="", reply="", project_dir=None, tools=()):
         if extractor is not None and (request or reply):
             threading.Thread(target=_run_extractor,
                              args=(extractor, scope, request, reply, project_dir),
+                             kwargs={"by": by},
                              daemon=True, name="memory-facts").start()
     except Exception:                                            # noqa: BLE001
         _log.debug("[memory] harvest failed", exc_info=True)
     return filed
 
 
-def _run_extractor(extractor, scope, request, reply, project_dir):
+def _run_extractor(extractor, scope, request, reply, project_dir, by=None):
     try:
         facts = extractor(request or "", reply or "") or []
         for f in list(facts)[:HARVEST_MAX_DECISIONS]:
-            if isinstance(f, str) and len(f.strip()) >= HARVEST_MIN_CHARS:
-                remember_fact(scope, f.strip(), project_dir=project_dir)
+            if (isinstance(f, str) and len(f.strip()) >= HARVEST_MIN_CHARS
+                    and not _looks_secret(f)):
+                remember_fact(scope, f.strip(), project_dir=project_dir, by=by)
     except Exception:                                            # noqa: BLE001
         _log.debug("[memory] fact extractor failed", exc_info=True)
 
@@ -1679,6 +1771,12 @@ def budget_for_window(window_tokens):
 # from exactly there.
 INFLIGHT_TOUCH_EVERY = 5.0
 _INFLIGHT_TOUCHED = {}
+# Which PROCESS IMAGE wrote a marker. The pid alone is not enough: the
+# auto-updater restarts through os.execv, which on Linux/macOS keeps the SAME
+# pid -- so every marker the killed turns left looked like "a turn running now"
+# and was never recovered. A new image re-imports this module: a new token.
+_BOOT_TOKEN = "%d-%s" % (os.getpid(), hashlib.sha1(
+    ("%r|%r" % (time.time(), os.urandom(8))).encode()).hexdigest()[:16])
 
 
 def _inflight_dir():
@@ -1734,7 +1832,7 @@ def begin_inflight(session_id, request="", project_dir=None):
         _INFLIGHT_TOUCHED[session_id] = time.monotonic()
         return _write_json(path, {
             "session_id": session_id.strip(), "started_at": now, "at": now,
-            "pid": os.getpid(),
+            "pid": os.getpid(), "boot": _BOOT_TOKEN,
             "request": " ".join((request or "").split())[:300],
             "project_dir": str(project_dir or ""),
             "doing": [], "partial": ""})
@@ -1808,8 +1906,9 @@ def recover_inflight():
                 rec = json.load(fh)
         except (OSError, ValueError):
             rec = None
-        if isinstance(rec, dict) and rec.get("pid") == os.getpid():
-            continue
+        if (isinstance(rec, dict) and rec.get("pid") == os.getpid()
+                and rec.get("boot") == _BOOT_TOKEN):
+            continue                 # this very process image: a turn running now
         if isinstance(rec, dict) and _path(sid):
             try:
                 note_interrupted(sid, request=rec.get("request") or "",
@@ -1889,9 +1988,45 @@ def rewind(session_id, cutoff=None, request="", kept_turns=None, project_dir=Non
                           "request": " ".join((request or "").split())[:200]}
         mem["restate_due"] = True
         ok = _save(mem)
+        if project_dir and cut is not None:
+            _rewind_project_facts(session_id, project_dir, cut)
     if project_dir:
         update_tasks_from_project(session_id, project_dir)      # the restored list
     return ok
+
+
+def _rewind_project_facts(session_id, project_dir, cut):
+    """Take back the PROJECT facts this conversation's undone turns filed.
+
+    harvest_facts files a /build turn's decisions, preferences and the rolling
+    files/commands facts under the project, not the conversation, so rewinding
+    the conversation alone left "Files recently created or changed:
+    newpage.html" describing work that no longer exists -- right next to the
+    "this conversation was rewound" notice. Only facts stamped `by` THIS
+    session at or after the cut go; another conversation's project facts are
+    never touched. Caller holds _LOCK."""
+    scope = project_key(project_dir)
+    if not scope:
+        return
+    pmem = get(scope)
+    meta = pmem.get("fact_meta") if isinstance(pmem.get("fact_meta"), dict) else {}
+    sid = str(session_id).strip()[:120]
+    keep = []
+    for f in pmem.get("facts") or []:
+        m = meta.get(_fact_key(f)) if isinstance(f, str) else None
+        if isinstance(m, dict) and m.get("by") == sid:
+            try:
+                if float(m.get("at") or 0) >= cut:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        keep.append(f)
+    if len(keep) == len(pmem.get("facts") or []):
+        return
+    pmem["facts"] = keep
+    live = {_fact_key(f) for f in keep if isinstance(f, str)}
+    pmem["fact_meta"] = {k: v for k, v in meta.items() if k in live}
+    _save(pmem)
 
 
 def prune_orphans(keep_ids=(), max_age_days=30):

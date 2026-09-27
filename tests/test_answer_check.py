@@ -217,17 +217,38 @@ def test_degenerate_inputs_never_raise(text):
     assert answer_check.inspect(text)["ok"] is True
 
 
+def _best_ms(fn, reps=10, rounds=5):
+    """Fastest per-call time over several rounds: a round that a busy CPU
+    (the rest of the suite, the live hub) preempted does not count."""
+    best = float("inf")
+    for _ in range(rounds):
+        t0 = time.perf_counter()
+        for _ in range(reps):
+            fn()
+        best = min(best, (time.perf_counter() - t0) / reps * 1000)
+    return best
+
+
+def _reference_work():
+    return sum(i * i for i in range(5000))
+
+
 def test_fast_on_20kb():
+    """Budget ~2 ms per 20 KB answer. Unreliable before: ONE 20-call sample
+    against a flat 8 ms bound, so a burst of load from the suite itself
+    failed it with nothing slow in the code. Now best-of-N, and the bound
+    scales with a pure-Python reference timed the same way (unloaded ~0.27 ms,
+    slowest sample ~10x that): a CPU running slow slows both, a real
+    regression in inspect() moves only one."""
     samples = [ESSAY[:20000], ("x = foo(bar)\n" * 1600)[:20000], "a" * 20000,
                "Sure: " + "中文" * 10000, CODE_ANSWER * 40]
     for s in samples:
         answer_check.inspect(s, prompt_text="write", finish_reason="length")  # warm
-        t0 = time.perf_counter()
-        for _ in range(20):
-            answer_check.inspect(s, prompt_text="write", finish_reason="length")
-        per_call_ms = (time.perf_counter() - t0) / 20 * 1000
-        # budget is 2 ms; allow headroom for a CPU shared with the live hub
-        assert per_call_ms < 8, (s[:20], per_call_ms)
+        per_call_ms = _best_ms(lambda: answer_check.inspect(
+            s, prompt_text="write", finish_reason="length"))
+        ref_ms = _best_ms(_reference_work)
+        limit = max(8.0, 30.0 * ref_ms)
+        assert per_call_ms < limit, (s[:20], per_call_ms, ref_ms)
 
 
 # --------------------------------------------------------------------------- #

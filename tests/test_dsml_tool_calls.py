@@ -183,6 +183,40 @@ def test_stream_lines_become_tool_call_deltas(text):
     assert out[-1] == b"data: [DONE]"
 
 
+def _with_blank_separators(units):
+    """What requests' iter_lines() really yields: b'' between SSE events."""
+    out = []
+    for u in units:
+        out += [u, b""]
+    return out
+
+
+@pytest.mark.parametrize("text", SAMPLES, ids=IDS)
+def test_stream_lines_with_blank_separators_become_tool_call_deltas(text):
+    """The blank line after a delta ending in '<' used to flush the held
+    prefix, so the rest of the opener never matched and the raw markup
+    reached /v1/responses and /v1/messages clients as text."""
+    lines = _with_blank_separators(_upstream_lines(text, "Adding.\n"))
+    out = list(T.rescue_stream(iter(lines), OAI_TOOLS, "lines"))
+    prose, calls, fin, errors = _decode(out)
+    assert not errors
+    assert "DSML" not in prose and "tool" not in prose and prose.strip() == "Adding."
+    assert [c[0] for c in calls.values()] == ["add"]
+    assert fin == "tool_calls"
+
+
+def test_prose_that_mentions_a_token_in_backticks_is_not_a_call():
+    text = ("Done. The parser now recognises Kimi's `<|tool_call_begin|>` token and "
+            "DeepSeek's `<｜DSML｜function_calls>` block.")
+    lines = _with_blank_separators(_upstream_lines(text))
+    out = list(T.rescue_stream(iter(lines), OAI_TOOLS, "lines"))
+    prose, calls, fin, errors = _decode(out)
+    assert not errors and not calls and fin == "stop"
+    assert prose == text
+    assert T.has_model_markup(text) is False
+    assert A._chat_json_nonanswer(_chat(text), True, OAI_TOOLS) is False
+
+
 def test_stream_frames_survive_arbitrary_chunk_boundaries():
     blob = b"".join(u + b"\n\n" for u in _upstream_lines(DSML))
     chunks = [blob[i:i + 7] for i in range(0, len(blob), 7)]

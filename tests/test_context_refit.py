@@ -235,12 +235,19 @@ def test_the_refit_budget_is_deliberately_conservative():
     """_est_tokens is chars/4, tuned for prose; code runs ~2.2 chars/token, so
     the estimate can be ~1.8x optimistic. MEASURED: a payload estimated at
     27,780 tokens still overflowed a 32,768 window. Re-fitting to the full
-    estimated window fails twice and loses the hop anyway."""
+    estimated window fails twice and loses the hop anyway.
+
+    The factor is 0.80 of the window (re-measured 2026-08-01, see the SAFETY
+    FACTOR note in _refit_payload_to_learned_ctx), times compaction's own 15%
+    headroom. The old 0.55 bound here only held because compaction charged
+    every kept message the 400-token REQUEST overhead, keeping far less
+    history than the budget allowed."""
     app._MODEL_MAX_INPUT[("t", "m")] = 32768
     refit = app._refit_payload_to_learned_ctx(
         "t", {"model": "m", "max_tokens": 100, "messages": _convo(400)})
     assert refit is not None
-    assert app._est_tokens(refit["messages"]) <= 32768 * 0.55
+    assert app._est_tokens(refit["messages"]) <= 32768 * 0.80 * 0.85 * 1.05
+    assert app._est_tokens(refit["messages"]) >= 32768 * 0.55   # history kept
 
 
 # --------------------------------------------------------------------------- #
