@@ -3483,9 +3483,13 @@ def _prefer_fast_long_context(chain, est, keep_head=0):
         bands = [_long_ctx_band(e[0], e[1]) for e in rest]
         if all(b == 1 for b in bands):
             return chain
-        # Recent failures stay at the tail too (see _recent_hop_failure).
+        # Recent failures stay at the tail too (see _recent_hop_failure), and
+        # a junk-benched pair behind everything, measured fast or not (see
+        # _bench_last): speed is no reason to serve a model caught answering
+        # garbage.
         order = sorted(range(len(rest)),
-                       key=lambda i: (_is_low_quality(rest[i][1]),
+                       key=lambda i: (_is_pair_benched(rest[i][0], rest[i][1]),
+                                      _is_low_quality(rest[i][1]),
                                       _recent_hop_failure(rest[i][0], rest[i][1]) is not None,
                                       bands[i], i))
         return head + [rest[i] for i in order]
@@ -9196,6 +9200,17 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     _recent = [e for e in ordered if _recent_hop_failure(e[1], e[2])]
     if _recent:
         ordered = [e for e in ordered if not _recent_hop_failure(e[1], e[2])]
+        # ...but the JUNK BENCH stays the very last rule. Partitioning on
+        # recent failures alone moved every 429'd pair BEHIND the one pair
+        # that had not failed recently -- a benched one -- so it opened the
+        # turn. MEASURED 2026-09-27: dahl/DeepSeek-V4-Flash-0731, benched for
+        # three garbage answers, led a Claude Code turn with google/dahl/
+        # openrouter all 429'd and answered "## lortyran". A 429 nine minutes
+        # ago may have its quota back; a garbage answer is served as a 200.
+        _benched = [e for e in ordered if _is_pair_benched(e[1], e[2])]
+        if _benched:
+            ordered = [e for e in ordered if not _is_pair_benched(e[1], e[2])]
+            _recent = _bench_last(_benched + _recent)
     for _score, pid, m in ordered:
         if len(chain) >= hop_cap:
             break

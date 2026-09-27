@@ -363,3 +363,47 @@ def test_chain_puts_the_benched_pair_last(fleet):
     # always appends is a different rule), the benched pair is the last.
     fleet_hops = [p for p in chain if p[1] in FLEET.get(p[0], ())]
     assert fleet_hops[-1] == BAD, chain
+
+
+@pytest.fixture
+def recent_fail_ledger():
+    with app._recent_fail_lock:
+        saved = dict(app._recent_hop_fail)
+        app._recent_hop_fail.clear()
+    try:
+        yield
+    finally:
+        with app._recent_fail_lock:
+            app._recent_hop_fail.clear()
+            app._recent_hop_fail.update(saved)
+
+
+def test_benched_pair_stays_behind_recent_failures(fleet, recent_fail_ledger):
+    """MEASURED 2026-09-27: every other candidate had 429'd or timed out in the
+    last ten minutes, and the recent-failure partition moved them all behind
+    the one pair that was NOT recent -- the junk-benched one -- so it opened a
+    Claude Code turn and answered "## lortyran". A 429 nine minutes ago may
+    have its quota back; a pair benched for garbage answers is the last hop."""
+    _junk(BAD, 3)
+    for pid, models in FLEET.items():
+        for m in models:
+            if (pid, m) != BAD:
+                app._note_recent_hop_failure(pid, m, "429")
+    chain = app._build_chain(TWIN[0], TWIN[1], est=100, messages=_HARD)
+    fleet_hops = [p for p in chain if p[1] in FLEET.get(p[0], ())]
+    assert BAD in fleet_hops, chain
+    assert fleet_hops[-1] == BAD, chain
+    assert fleet_hops[0] != BAD, chain
+
+
+def test_long_context_reorder_keeps_the_benched_pair_last(recent_fail_ledger, monkeypatch):
+    """_prefer_fast_long_context re-sorts a long request's chain by measured
+    speed; a benched pair measured FAST must still not jump the queue."""
+    _junk(BAD, 3)
+    other = [("nvidia", "z-ai/glm-5.2"), ("groq", "llama-3.3-70b-versatile")]
+    for p in other:
+        app._note_recent_hop_failure(p[0], p[1], "timeout")
+    monkeypatch.setattr(app, "_long_ctx_band",
+                        lambda pid, m: 0 if (pid, m) == BAD else 2)
+    out = app._prefer_fast_long_context(other + [BAD], app.LONG_CTX_SPEED_TOKENS + 1)
+    assert out[-1] == BAD, out
