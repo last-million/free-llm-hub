@@ -6936,6 +6936,15 @@ def _starve_retry(clock, pid, model, payload, kind):
     return data2, retry
 
 
+def _cut_splits_token(text, i):
+    """True when cutting `text` at index `i` lands INSIDE a whitespace-
+    delimited token (a number or a word would be served as a prefix)."""
+    try:
+        return 0 < i < len(text) and not text[i].isspace() and not text[i - 1].isspace()
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _fit_visible_to_caller(data, payload):
     """Keep a non-streamed reply to ~the caller's own budget of VISIBLE text
     when the hub raised max_tokens for reasoning room. A reply within
@@ -6958,7 +6967,16 @@ def _fit_visible_to_caller(data, payload):
             return data
         cut = c[:caller * 4]
         sp = max(cut.rfind(" "), cut.rfind("\n"))
-        if sp > len(cut) // 2:
+        if _cut_splits_token(c, len(cut)):
+            # NEVER serve a prefix of a token: a cut inside "50648" serves
+            # "5064", a different number stated with full confidence (the
+            # rule answer_check's salvage already follows). Back off to the
+            # last whitespace; a reply whose first token alone overruns the
+            # budget is kept whole -- a long answer beats a wrong one.
+            if sp <= 0:
+                return data
+            cut = cut[:sp]
+        elif sp > len(cut) // 2:
             cut = cut[:sp]
         msg["content"] = cut.rstrip()
         choice["finish_reason"] = "length"
@@ -8151,6 +8169,34 @@ def _chain_entries(name):
     return out
 
 
+# A trivial TOOL turn's chain takes at most this many hops per provider before
+# every other provider has had its turn (the rest follow, in order).
+_TRIVIAL_PER_PROVIDER_HOPS = 2
+
+
+def _spread_by_provider(entries, per, already=()):
+    """Stable partition of (score, pid, model) entries: the first `per` of
+    each provider keep their order, every later one goes behind them (same
+    order among themselves). Demoted, never dropped. `already`: (pid, model)
+    hops that open the chain ahead of these (the primary) -- they count
+    toward their provider's `per` and are not counted twice. Never raises."""
+    try:
+        head, tail, seen = [], [], {}
+        opened = set(already or ())
+        for pid, _m in opened:
+            seen[pid] = seen.get(pid, 0) + 1
+        for e in entries:
+            if (e[1], e[2]) in opened:
+                head.append(e)
+                continue
+            n = seen.get(e[1], 0)
+            (head if n < per else tail).append(e)
+            seen[e[1]] = n + 1
+        return head + tail
+    except Exception:                                            # noqa: BLE001
+        return entries
+
+
 def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_tools=False,
                   messages=None, exclude_identities=None, prefer=None, pinned=False):
     """Priority-ordered [(pid, model)] fallback chain. Primary first, then the
@@ -8400,6 +8446,17 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
             ordered.sort(key=lambda e: (_is_low_quality(e[2]),
                                         _chain_reliability_band(e[1], e[2]) >= 2,
                                         not _is_fast(e[1], e[2])))
+            # ...and SPREAD across providers. The groupings above (proven,
+            # reliability, fast) re-cluster whatever the interleave spread
+            # out, and one provider hosting most of the proven tool models
+            # owned the chain: MEASURED 2026-09-27, "Use the add tool to add
+            # 17 and 25" walked a 10-hop chain of 8 nvidia + 2 dahl -- nvidia's
+            # gateway stalled (hop budget x2, a silent peek, an empty 200),
+            # three of its catalog ids 404'd, dahl 429'd twice -- and 503'd
+            # after 117s while other providers answered the same question in
+            # seconds. A one-liner needs a different GATEWAY far more than a
+            # fourth sibling behind the same one.
+            ordered = _spread_by_provider(ordered, _TRIVIAL_PER_PROVIDER_HOPS, chain)
     elif _simple_turn():
         # A SIMPLE SMALL CHAT TURN walks fast models strictly first -- the
         # category's own, then (when a mode narrowed the pool) the fast models
@@ -11907,8 +11964,12 @@ def _act_pipeline_result(result):
         # caller now receives the deliverable only (see _swarm_completion), so
         # this row is where "which plan, what did the reviewer flag, did the
         # wall clock cut it short" stays visible.
-        titles = [str((p or {}).get("title") or "")[:80]
-                  for p in (result.get("phases") or [])][:12]
+        # The PLAN (every planned phase) when the pipeline reports it -- the
+        # finished phases alone made a 3-phase plan cut short read as one.
+        titles = ([str(t or "")[:80] for t in (result.get("planned") or [])][:12]
+                  or [str((p or {}).get("title") or "")[:80]
+                      for p in (result.get("phases") or [])][:12])
+        unfinished = [str(u)[:120] for u in (result.get("unfinished") or [])][:8]
         review = result.get("review") or {}
         problems = [str(p).strip()[:160] for p in
                     ((review.get("problems") if isinstance(review, dict) else None) or [])
@@ -11928,6 +11989,9 @@ def _act_pipeline_result(result):
                 act["review_problems"] = problems
             if result.get("timed_out"):
                 act["pipeline_timed_out"] = True
+            if unfinished:
+                # A partial deliverable is flagged on the row, never silent.
+                act["pipeline_unfinished"] = unfinished
             # What the subscription manager cost this run (it is the only
             # paid part of the pipeline), and a review it could not read.
             if result.get("manager_tokens"):
@@ -22657,6 +22721,68 @@ def _deadline_error_text(clock, errors):
             % (int(clock.limit or 0), "; ".join(errors) or "none"))
 
 
+# THE HUB'S OWN WORDS WHEN EVERY HOP FAILED. The exhausted-chain reply used to
+# RELAY the last hard upstream error verbatim -- MEASURED 2026-09-27: a trivial
+# tool turn got HTTP 503 with body {"detail": "Function '4df48b4f-...': Not
+# found for account ..."}, an NVIDIA NIM function id and account message from
+# ONE of nine hops, presented to the client as if it were the answer to its
+# request. That body describes one provider's catalog, not the request, and it
+# leaks upstream ids. The client now gets every hop's failure CLASS (the same
+# "pid: HTTP 404 / empty / timeout" strings the log line records), the last
+# hard status by number, and nothing an upstream wrote. The raw body stays in
+# the CHAT-503 / RESPONSES-503 / MESSAGES-503 log line for diagnosis.
+_HOP_CLASS_WORDS = (
+    ("_HopBudgetExceeded", "no answer within the hop budget"),
+    ("ReadTimeout", "timeout"), ("ConnectTimeout", "connect timeout"),
+    ("ConnectionError", "connection error"),
+)
+
+
+def _client_hop_errors(errors):
+    """The hop-failure list for a client: internal exception names spelled as
+    classes, consecutive repeats folded ("nvidia: HTTP 404 x3"). Never raises."""
+    out = []
+    try:
+        for e in errors or ():
+            s = str(e or "").strip()
+            for raw, words in _HOP_CLASS_WORDS:
+                s = s.replace(raw, words)
+            s = _sanitize(s, 160)
+            if out and out[-1][0] == s:
+                out[-1][1] += 1
+            else:
+                out.append([s, 1])
+    except Exception:                                            # noqa: BLE001
+        return ["(unavailable)"]
+    return ["%s x%d" % (s, n) if n > 1 else s for s, n in out]
+
+
+def _chain_exhausted_text(errors, last_hard=None):
+    """The exhausted-chain error message, in the hub's own words (see above)."""
+    hops = _client_hop_errors(errors)
+    text = "All providers failed: " + ("; ".join(hops) or "none available")
+    try:
+        if last_hard:
+            code = last_hard.get("http", last_hard.get("status"))
+            text += " (last hard error: HTTP %s from %s)" % (int(code), last_hard.get("pid"))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return text + _no_candidates_hint()
+
+
+def _last_hard_log_body(last_hard):
+    """The raw upstream body of the last hard error, clipped -- LOG ONLY."""
+    try:
+        if not last_hard:
+            return "none"
+        body = last_hard.get("json")
+        if body is not None:
+            return _sanitize(json.dumps(body), 500)
+        return _sanitize(str(last_hard.get("text") or last_hard.get("detail") or ""), 500)
+    except Exception:                                            # noqa: BLE001
+        return "?"
+
+
 class _PrePeekedResponse:
     """A streamed hop whose first content a hedge leg already read: the loop's
     iter_content()/iter_lines() replays what was read, then continues the SAME
@@ -22819,6 +22945,27 @@ class _ChainClock:
         self._hedge_fired = False    # at most ONE extra call per request
         self._consumed = set()       # chain entries a hedge already ran
         self._served = None          # (pid, model, payload) a hedge served
+        self._stalled = set()        # providers that stalled a hop in THIS walk
+
+    # -- stalled gateways ---------------------------------------------------- #
+
+    def walk(self, chain):
+        """Iterate the chain; on a TRIVIAL turn, once a provider has STALLED a
+        hop (hop budget / timeout / a silent peek) its remaining hops go behind
+        every other provider's. A sibling model behind the same slow gateway is
+        the likeliest to stall for the same reason -- the rule the hedge
+        partner pick already follows -- and on a one-liner each stall costs
+        25-45s. Demoted, never dropped. Any other turn: the chain as built."""
+        rest = list(chain or ())
+        while rest:
+            i = 0
+            if self.trivial and self._stalled:
+                i = next((k for k, e in enumerate(rest) if e[0] not in self._stalled), 0)
+            yield rest.pop(i)
+
+    def _note_stall(self, pid):
+        if self.trivial and pid:
+            self._stalled.add(pid)
 
     def left(self):
         if self.deadline_at is None:
@@ -23118,19 +23265,23 @@ class _ChainClock:
         _ctx_note_tried(pid, model)
         self._hop_started = time.monotonic()
         self._hop_budget = self._budget_for(pid, model, stream)
-        if self._hop_budget is None:
+        try:
+            if self._hop_budget is None:
+                return self._plain(pid, model, payload, stream)
+            if self._hop_budget <= 0:
+                raise _HopBudgetExceeded("request deadline reached")
+            partner = self._hedge_partner(pid, model) if hedge else None
+            if partner is not None:
+                delay = _hedge_delay(pid, model, stream)
+                if delay < self._hop_budget:
+                    resp = self._dispatch_hedged(pid, payload, stream, delay, partner)
+                    s = self._served or (pid, model, payload)
+                    self._note_status(s[0], s[1], resp, stream)
+                    return resp
             return self._plain(pid, model, payload, stream)
-        if self._hop_budget <= 0:
-            raise _HopBudgetExceeded("request deadline reached")
-        partner = self._hedge_partner(pid, model) if hedge else None
-        if partner is not None:
-            delay = _hedge_delay(pid, model, stream)
-            if delay < self._hop_budget:
-                resp = self._dispatch_hedged(pid, payload, stream, delay, partner)
-                s = self._served or (pid, model, payload)
-                self._note_status(s[0], s[1], resp, stream)
-                return resp
-        return self._plain(pid, model, payload, stream)
+        except (_HopBudgetExceeded, requests.exceptions.Timeout):
+            self._note_stall(pid)            # see walk()
+            raise
 
     def _plain(self, pid, model, payload, stream):
         try:
@@ -23167,6 +23318,8 @@ class _ChainClock:
         ledger: content clears it, a silent hop that used a fair budget is
         remembered (see _RECENT_FAIL_TTL)."""
         try:
+            if status == "timeout":
+                self._note_stall(pid)        # see walk()
             if status == "content":
                 _clear_recent_hop_failure(pid, model)
             elif status == "timeout" and max(self._hop_budget or 0,
@@ -24504,6 +24657,10 @@ class _StreamAnswerGate:
                             sp = max(piece.rfind(" "), piece.rfind("\n"))
                             if sp > 0:
                                 piece = piece[:sp]
+                            elif _cut_splits_token(t, len(piece)):
+                                # Never a prefix of a token ("5064" of
+                                # "50648"): see _fit_visible_to_caller.
+                                piece = ""
                             if piece.strip():
                                 yield self._synth({"content": piece}, None)
                             yield self._synth({}, "length")
@@ -25496,11 +25653,14 @@ def _is_swarm_model(model):
 
 
 @_usage_source_as("swarm")
-def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
+def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False):
     """One stage of the pipeline, routed and executed through the SAME chain
     every other request uses (so fallback, key rotation, quota accounting and
     the activity trail all behave identically). Returns (text, 'pid/model');
-    never raises — an empty text tells swarm.py that stage failed."""
+    never raises — an empty text tells swarm.py that stage failed.
+
+    `fast`: the FASTEST capable models instead of the strongest -- the
+    stage is racing the post-cap grace window (see _swarm_fast_dispatch)."""
     try:
         est = _est_tokens(messages)
         # force_difficulty="hard": every swarm stage is creation work and must
@@ -25515,13 +25675,18 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
         # walk down a twelve-model chain is an hour for one stage -- and a crew
         # is five stages. Three hops is two fallbacks, which is what the chain
         # is for; past that the stage is not going to be rescued by a fourth.
-        for hop_pid, hop_model in _build_chain(pid, model, est)[:_SWARM_STAGE_MAX_HOPS]:
+        _stage_chain = _build_chain(pid, model, est)
+        if fast:
+            # Capable (the strong end of the chain), then quickest first.
+            _stage_chain = sorted(_stage_chain[:_SWARM_FAST_POOL],
+                                  key=lambda e: _latency_rank(e[0], e[1]))
+        for hop_pid, hop_model in _stage_chain[:_SWARM_STAGE_MAX_HOPS]:
             if exclude_pids and hop_pid in exclude_pids:
                 continue     # reviewer must not be the provider that wrote it
             # THE PIPELINE'S OUTER BOUND (see _pipeline_outer_bound): a stage
             # still in flight when the run's own cap passes may finish, but it
             # may not start a hop the run can no longer afford.
-            _hop_deadline = _SWARM_HOP_DEADLINE
+            _hop_deadline = _SWARM_FAST_HOP_DEADLINE if fast else _SWARM_HOP_DEADLINE
             _outer_left = _pipeline_time_left()
             if _outer_left is not None:
                 if _outer_left <= 1:
@@ -25592,6 +25757,16 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=()):
     except Exception:                                            # noqa: BLE001
         _log.debug("[swarm] stage failed", exc_info=True)
     return "", None
+
+
+# The fast finish picks the quickest of the chain's strongest few.
+_SWARM_FAST_POOL = 8
+
+
+def _swarm_fast_dispatch(messages, max_tokens, exclude_pids=()):
+    """swarm.run's `fast_dispatch`: finishes what the wall clock cut off,
+    inside the grace window, on the quickest capable models (short hops)."""
+    return _swarm_dispatch(messages, max_tokens, exclude_pids, fast=True)
 
 
 # How many distinct models attempt a tool-carrying swarm turn in parallel.
@@ -26347,7 +26522,22 @@ def _quality_route_kwargs(model, has_images):
 # seconds; setting `swarm_max_seconds`, 0 = unbounded. Past it swarm.run starts
 # no new stage and synthesises from what finished. Not a hard kill: a stage
 # already in flight is bounded by its own hop deadline (_SWARM_HOP_DEADLINE).
-_SWARM_MAX_SECONDS_DEFAULT = 180
+#
+# It is now the BASE of a budget sized to the plan (see swarm.run). MEASURED
+# 2026-09-27: a 3-part request under a subscription manager (sub-claude/sonnet)
+# spent the flat 180 s on plan + phase 1 + its verdict -- the CLI takes 30-150 s
+# a call -- so phases 2 and 3 never started, review was skipped, and tally.py
+# alone shipped after 359 s as "the answer". Raised to 300, plus
+# `swarm_seconds_per_phase` for each phase past two, plus the manager's
+# MEASURED latency per manager stage, never above `swarm_max_seconds_ceiling`;
+# past the cap, `swarm_grace_seconds` for the fastest free models to finish
+# what is missing (then a "Not finished" note names the rest).
+_SWARM_MAX_SECONDS_DEFAULT = 300
+_SWARM_SECONDS_PER_PHASE_DEFAULT = 60
+_SWARM_MAX_SECONDS_CEILING_DEFAULT = 1200
+_SWARM_GRACE_SECONDS_DEFAULT = 90
+# A fast-finish hop is short by design: it is racing the grace window.
+_SWARM_FAST_HOP_DEADLINE = 90
 
 
 def _swarm_max_seconds():
@@ -26358,6 +26548,35 @@ def _swarm_max_seconds():
     except Exception:                                            # noqa: BLE001
         v = float(_SWARM_MAX_SECONDS_DEFAULT)
     return v if v > 0 else None
+
+
+def _swarm_setting_seconds(name, default, lo=0.0, hi=None):
+    """A numeric pipeline-budget setting, clamped; the default on junk."""
+    try:
+        v = float(config.get_setting(name, default))
+    except Exception:                                            # noqa: BLE001
+        v = float(default)
+    v = max(lo, v)
+    return min(v, hi) if hi is not None else v
+
+
+def _swarm_budget_kwargs(cap):
+    """swarm.run / crews.run budget kwargs for a capped run ({} when the cap
+    is off: an unbounded run has nothing to scale). The ceiling is bounded
+    so the whole run -- ceiling, grace and the synthesis after it -- fits
+    inside _PIPELINE_OUTER_MAX."""
+    if not cap:
+        return {}
+    grace = _swarm_setting_seconds("swarm_grace_seconds",
+                                   _SWARM_GRACE_SECONDS_DEFAULT, 0, 600)
+    ceiling = _swarm_setting_seconds(
+        "swarm_max_seconds_ceiling", _SWARM_MAX_SECONDS_CEILING_DEFAULT, 0,
+        _PIPELINE_OUTER_MAX - _PIPELINE_OUTER_GRACE - grace)
+    return {"seconds_per_phase": _swarm_setting_seconds(
+                "swarm_seconds_per_phase", _SWARM_SECONDS_PER_PHASE_DEFAULT, 0, 600),
+            "max_seconds_ceiling": max(float(cap), ceiling),
+            "grace_seconds": grace,
+            "fast_dispatch": _pipeline_bound(_swarm_fast_dispatch)}
 
 
 # THE OUTER BOUND ON A PROSE PIPELINE RUN. swarm_max_seconds is not a hard kill:
@@ -26616,6 +26835,12 @@ def _swarm_completion(body):
     _watch = _act_pipeline_watcher()
     cap = _swarm_max_seconds()
     extra = {"max_seconds": cap} if cap else {}
+    # The cap is the BASE of a plan-sized budget with a post-cap grace (see
+    # _SWARM_MAX_SECONDS_DEFAULT); the outer bound below covers all of it.
+    _budget = _swarm_budget_kwargs(cap)
+    extra.update(_budget)
+    _outer_span = ((_budget["max_seconds_ceiling"] + _budget["grace_seconds"])
+                   if _budget else cap)
     # A configured subscription manager plans/checks/fixes; free models still
     # do the work. Absent -> no kwarg, the pipeline exactly as before.
     extra.update(_swarm_manager_kwargs())
@@ -26627,7 +26852,7 @@ def _swarm_completion(body):
     # The outer bound is set BEFORE binding, so the context copy _pipeline_bound
     # takes carries it into every stage thread. Reset afterwards: a pooled
     # server thread must not hand a stale deadline to its next request.
-    _outer_tok = _PIPELINE_DEADLINE.set(time.monotonic() + _pipeline_outer_bound(cap))
+    _outer_tok = _PIPELINE_DEADLINE.set(time.monotonic() + _pipeline_outer_bound(_outer_span))
     try:
         # Bound ONCE, here: the mode in force now (a "coding-swarm" id set it
         # on `g`) rides into every stage, including the ones swarm.run puts on
@@ -27565,7 +27790,7 @@ def _chat_completions_uncached(body):
     # (see _HEDGE_DELAY_MIN); the partner's payload is built like the loop's.
     _clock.plan_hedge(_chain, body, diff, est=est, tools=has_tools, images=has_images,
                       output_budget=True)
-    for hop_pid, hop_model in _chain:
+    for hop_pid, hop_model in _clock.walk(_chain):
         if _clock.consumed(hop_pid, hop_model):
             continue              # a hedge already ran this hop
         if _clock.spent():
@@ -27885,21 +28110,18 @@ def _chat_completions_uncached(body):
     # its SDK waits out a short throttle and auto-continues once capacity returns.
     eta = _capacity_eta()
     try:  # DIAG (temporary): record WHY the chat chain exhausted (any CLI's 503).
-        _log.warning("CHAT-503 stream=%s tools=%s images=%s est=%d errors=[%s] last_hard=%s",
+        _log.warning("CHAT-503 stream=%s tools=%s images=%s est=%d errors=[%s] last_hard=%s body=%s",
                      stream, has_tools, has_images, est, "; ".join(errors) or "none",
-                     (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none")
+                     (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none",
+                     _last_hard_log_body(last_hard))
     except Exception:
         pass
     hdrs = _routing_headers(last_hop[0], last_hop[1], attempts, last_error)
-    if last_hard is not None:
-        if last_hard["json"] is not None:
-            return _with_headers(_with_retry_after(
-                (jsonify(last_hard["json"]), _retryable_relay_status(last_hard["status"])), eta), hdrs)
-        return _with_headers(_with_retry_after(_openai_error(
-            "Upstream returned non-JSON (%s, HTTP %d): %s"
-            % (last_hard["pid"], last_hard["status"], last_hard["text"]), 503, "upstream_error"), eta), hdrs)
+    # The hub's own message, never the upstream body (see _chain_exhausted_text).
+    # A hard 4xx still maps to a client-retryable status, as before.
+    status = _retryable_relay_status(last_hard["status"]) if last_hard is not None else 503
     return _with_headers(_with_retry_after(_openai_error(
-        "All providers failed: " + ("; ".join(errors) or "none available") + _no_candidates_hint(), 503, "upstream_error"), eta), hdrs)
+        _chain_exhausted_text(errors, last_hard), status, "upstream_error"), eta), hdrs)
 
 
 # ---------------------------------------------------------------------------
@@ -28449,7 +28671,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
     if not _hedged:
         _clock.plan_hedge(_chain, base_payload, diff, est=est, tools=has_tools,
                           images=has_images, lines=True)
-    for hop_pid, hop_model in _chain:
+    for hop_pid, hop_model in _clock.walk(_chain):
         if _clock.consumed(hop_pid, hop_model):
             continue              # a hedge already ran this hop
         _tried.append(hop_pid + "/" + hop_model)
@@ -28766,15 +28988,10 @@ def v1_responses(_retry_pass=False, _hedged=False):
     # Codex's path carried no routing headers at all — surface at least the last
     # hop-failure class so 'why did the chain degrade' is one curl -i away.
     hdrs = {"X-Free-LLM-Hub-Last-Error": last_error or "none"}
-    if last_hard is not None:
-        if last_hard["json"] is not None:
-            return _with_headers(_with_retry_after(
-                (jsonify(last_hard["json"]), _retryable_relay_status(last_hard["status"])), eta), hdrs)
-        return _with_headers(_with_retry_after(_openai_error(
-            "Upstream returned non-JSON (%s, HTTP %d): %s"
-            % (last_hard["pid"], last_hard["status"], last_hard["text"]), 503, "upstream_error"), eta), hdrs)
+    # The hub's own message, never the upstream body (see _chain_exhausted_text).
+    status = _retryable_relay_status(last_hard["status"]) if last_hard is not None else 503
     return _with_headers(_with_retry_after(_openai_error(
-        "All providers failed: " + ("; ".join(errors) or "none available") + _no_candidates_hint(), 503, "upstream_error"), eta), hdrs)
+        _chain_exhausted_text(errors, last_hard), status, "upstream_error"), eta), hdrs)
 
 
 # ---------------------------------------------------------------------------
@@ -29359,7 +29576,7 @@ def v1_messages():
     # See the twin in /v1/chat/completions (hedging a trivial turn).
     _clock.plan_hedge(_chain, base_payload, diff, est=est, tools=has_tools,
                       images=has_images, lines=True)
-    for hop_pid, hop_model in _chain:
+    for hop_pid, hop_model in _clock.walk(_chain):
         if _clock.consumed(hop_pid, hop_model):
             continue              # a hedge already ran this hop
         if _clock.spent():
@@ -29574,20 +29791,17 @@ def v1_messages():
     # Chain exhausted -> Retry-After so the client waits out a short throttle + auto-continues.
     eta = _capacity_eta()
     try:  # DIAG (temporary): record WHY the messages chain exhausted (Claude Code's 503).
-        _log.warning("MESSAGES-503 stream=%s tools=%s images=%s est=%d errors=[%s] last_hard=%s",
+        _log.warning("MESSAGES-503 stream=%s tools=%s images=%s est=%d errors=[%s] last_hard=%s body=%s",
                      stream, has_tools, has_images, est, "; ".join(errors) or "none",
-                     (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none")
+                     (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none",
+                     _last_hard_log_body(last_hard))
     except Exception:
         pass
     hdrs = _routing_headers(last_hop[0], last_hop[1], attempts, last_error)
-    if last_hard is not None:
-        return _with_headers(_with_retry_after(_anthropic_error("api_error",
-                                "Upstream %s error (HTTP %d): %s"
-                                % (last_hard["pid"], last_hard["http"], last_hard["detail"]),
-                                last_hard["status"]), eta), hdrs)
-    return _with_headers(_with_retry_after(_anthropic_error("api_error",
-                            "All providers failed: " + ("; ".join(errors) or "none available") + _no_candidates_hint(),
-                            503), eta), hdrs)
+    # The hub's own message, never the upstream body (see _chain_exhausted_text).
+    return _with_headers(_with_retry_after(_anthropic_error(
+        "api_error", _chain_exhausted_text(errors, last_hard),
+        last_hard["status"] if last_hard is not None else 503), eta), hdrs)
 
 
 @app.route("/v1/messages/count_tokens", methods=["POST"])

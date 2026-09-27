@@ -419,7 +419,7 @@ def looks_like_full_project(text):
 
 
 def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
-        manager=None, context=None):
+        manager=None, context=None, **budget):
     """Run the swarm pipeline under a crew persona. Same dispatch contract and
     result-dict shape as swarm.run(); the result gains a "crew" key naming the
     persona actually used ("" = generic pipeline).
@@ -439,7 +439,11 @@ def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
     forwarded only when given, for the same reason.
 
     `context` is swarm.run's conversation context (recap / memory block),
-    folded into the brief with the earlier turns; forwarded only when set."""
+    folded into the brief with the earlier turns; forwarded only when set.
+
+    `**budget` carries swarm.run's plan-sized wall clock and grace
+    (seconds_per_phase, max_seconds_ceiling, grace_seconds, fast_dispatch);
+    only the keys that are set are forwarded."""
     name = (crew_name or "").strip().lower()
     if name.startswith("crew-"):
         name = name[5:]
@@ -451,6 +455,10 @@ def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
         extra["manager"] = manager
     if context:
         extra["context"] = context
+    for key in ("seconds_per_phase", "max_seconds_ceiling", "grace_seconds",
+                "fast_dispatch"):
+        if budget.get(key):
+            extra[key] = budget[key]
     result = swarm.run(messages, dispatch, profile=profile, on_event=on_event,
                        **extra)
     result["crew"] = name if profile else ""

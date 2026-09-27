@@ -10858,6 +10858,8 @@
                this one cost, and a review it could not read, on the row. */
             managerCostHTML(a.manager_tokens, a.manager_calls) +
             (a.review_warning ? '<span class="canary-badge junk" title="' + esc(a.review_warning) + '">unreviewed</span>' : '') +
+            /* A partial deliverable is named, never silent (see swarm.run). */
+            (a.pipeline_unfinished && a.pipeline_unfinished.length ? '<span class="canary-badge junk" title="Not finished: ' + esc(a.pipeline_unfinished.join('; ')) + '">unfinished ' + a.pipeline_unfinished.length + '</span>' : '') +
             (last && pending ? '<span class="af-stage">' + esc(last.kind) + ' — ' + esc(last.detail) + '</span>' : '') +
             chips +
           '</div>';

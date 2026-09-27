@@ -524,6 +524,35 @@ hidden reasoning ate the budget).
   request: never a write/create/build ask, never enumerated parts
   ("Include:", lists, 3+ joined items, > 2 sentences).
 
+## Complete pipeline answers & the hub's own chain errors (2026-09-27)
+
+Covered by `tests/test_pipeline_complete.py`.
+
+- **Enumerated parts** (`swarm.required_parts`: "1) … 2) …", bullets under a
+  "…:" line, inline "Deliver:/Include: a, b and c"): each must be covered by a
+  phase (one re-ask of a FREE planner, then phases are added — with a manager
+  they are added directly), present in the draft before review (mechanical
+  markers `_part_present`, then one manager-or-free verdict; gaps go to a
+  repair worker) and present after synthesis (restored from its phase).
+- **Budget sized to the plan**: `swarm_max_seconds` (default 300) is the BASE;
+  + `swarm_seconds_per_phase` (60) per phase past two + the manager's MEASURED
+  latency x (waves + 3/4 stages), capped by `swarm_max_seconds_ceiling` (1200,
+  bounded under `_PIPELINE_OUTER_MAX`). Past the cap, missing phases are
+  finished in parallel by `_swarm_fast_dispatch` (quickest of the chain's
+  strongest 8, 90 s hops) within `swarm_grace_seconds` (90).
+- **Never silently partial**: anything still missing is appended as a
+  "**Not finished:** …" note, `result["unfinished"]`, `unfinished=` first in
+  `X-Free-LLM-Hub-Pipeline`, and `pipeline_unfinished` on the activity row.
+  `plan=` in the header is the PLAN (`result["planned"]`), with `done=k/n`.
+- **Chain exhausted** on all three protocols: `_chain_exhausted_text` (hop
+  failure classes + last hard status), never an upstream body/id; the raw
+  body goes to the CHAT/RESPONSES/MESSAGES-503 log line only.
+- **Trivial turns**: a trivial TOOL chain takes <= 2 hops per provider before
+  the others (`_spread_by_provider`), and `_ChainClock.walk` moves a provider
+  that stalled a hop (budget/timeout/silent peek) behind every other one.
+- Brevity trims (`_fit_visible_to_caller`, the stream cap) never cut inside a
+  token (`_cut_splits_token`): "50648" is never served as "5064".
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
