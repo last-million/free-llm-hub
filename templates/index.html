@@ -2540,7 +2540,9 @@
       width:14px; height:14px; }
   }
   .agent-collapse-bar{ display:flex; align-items:center; justify-content:flex-end;
-    gap:10px; min-width:0; }
+    gap:10px; min-width:0; cursor:pointer; }
+  /* Open: clicking the permissions notice folds the top away (see the JS). */
+  body.cx-agent-view #agent-section:not(.agent-top-collapsed) > #agent-warning{ cursor:pointer; }
   .agent-collapse-summary{ display:flex; align-items:center; gap:8px; flex:1 1 auto;
     min-width:0; margin:0; font-size:12.5px; line-height:1.4; color:var(--text-dim);
     animation:agentTopIn .2s ease-out; }
@@ -4428,6 +4430,23 @@
       if (el) el.addEventListener('change', summarize);
     });
     btn.addEventListener('click', function(){ setCollapsed(!collapsed, true); });
+    /* The whole top line toggles too, not only the chevron (REQUESTED
+       2026-09-27: "click on top to show, click again to collapse"). Clicks on
+       real controls inside it (the chevron itself, links, fields) keep doing
+       their own job; the chevron stays the keyboard-accessible control. */
+    function isControl(t){
+      return !!(t && t.closest && t.closest('button, a, input, select, textarea, label'));
+    }
+    var bar = document.getElementById('agent-collapse-bar');
+    var warn = document.getElementById('agent-warning');
+    if (bar) bar.addEventListener('click', function(e){
+      if (isControl(e.target)) return;
+      setCollapsed(!collapsed, true);
+    });
+    if (warn) warn.addEventListener('click', function(e){
+      if (collapsed || isControl(e.target)) return;
+      setCollapsed(true, true);
+    });
 
     var stored = null;
     try { stored = localStorage.getItem(KEY); } catch(e){}
