@@ -664,9 +664,39 @@ turn 1 recalled at turn 7). Covered by `tests/test_long_request_upload.py`,
 - **Template junk**: answer_check `template_junk` rejects a reply that is only
   a `<|x|>` token (+ at most one glued word) and a punctuation run —
   nvidia/kimi-k3 shipped "<|close|>!!!!…" as 3 codex turns.
-- Still true at 220K real tokens: one free hop can need 110-210s, so a
-  request can hit `request_deadline_seconds` (240) -> clean 504. The CLIs'
-  declared windows (128K / codex 96K) keep real sessions well below that.
+- At 220K real tokens one free hop can need 110-270s. The deadline now
+  scales (see next section); the CLIs' declared windows (128K / codex 96K)
+  still keep real sessions well below that size.
+
+## Long-context deadlines & exact facts (2026-09-27)
+
+Covered by `tests/test_long_context.py`.
+
+- **Scaled deadline** (`_scaled_request_deadline`): past
+  `LONG_DEADLINE_FROM_TOKENS` (60K est) the request deadline gains
+  `request_deadline_per_10k_seconds` (15) per started 10K tokens, capped at
+  `request_deadline_max_seconds` (600): 220K -> 480s. A STREAM is capped at
+  `LONG_DEADLINE_STREAM_MAX` (285, under the clients' ~300s header timeout);
+  `_STREAM_HEADER_BUDGET`, the peeks and the post-deadline rules are
+  unchanged. `_begin_request_deadline(tokens, stream)` only EXTENDS, from the
+  clock's original start; `_ChainClock(est=, stream=)` on all three loops.
+- **Fast long-context hops first**: `_long_ctx_speed` (in memory, 6h TTL)
+  records time to first content / buffered duration of requests >= 60K est,
+  and a hop that waited >= 60s for nothing as a stall. `_long_ctx_band`
+  0 fast (median <= 60s) / 1 unknown / 2 slow (>= 120s or latest stalled);
+  `_build_chain` stable-reorders by band (`_prefer_fast_long_context`) inside
+  the last-resort and recent-failure partitions; a pinned hop one never moves.
+- **Exact facts** (`ctxwin.exact_facts`, no model call): what each file /
+  command printed (attributed only when unambiguous: one path, or `==> f <==`
+  sections), what was written where (write tools, apply_patch Add File,
+  heredoc, echo `>`/`>>`), the user's stated values and standing rules (own
+  share, `EXACT_FACTS_MAX_RULES`), `Decision:` lines. A CLI summary's prose is
+  never mined, its EXACT FACTS block is carried. Compaction adds it as its OWN
+  system message after the notice (room reserved in the keep loop, ~5% of the
+  target); the rolling recap entry stores `exact` and `_conversation_recap`
+  appends it; a CLI's own compaction request (codex CONTEXT CHECKPOINT) gets
+  the block appended to its last user message with "copy UNCHANGED"
+  (`_with_cli_compaction_facts`). Flag `compact_exact_facts` (default on).
 
 ## Tests
 

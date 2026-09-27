@@ -3284,6 +3284,83 @@ def _record_ttft(pid, model, ms):
     _record_speed_sample(_ttft, pid, model, ms)
 
 
+# SPEED AT LONG CONTEXT, kept apart from the everyday samples above. A model's
+# p50 on 5K-token turns says nothing about how it prefills 200K: MEASURED
+# 2026-09-27 at ~220K real tokens one free hop took 110-270 s while others
+# answer the same size far sooner. Only requests of >= LONG_CTX_SPEED_TOKENS
+# estimated tokens land here: (epoch, ms, stalled). `stalled` = the hop ran out
+# its time with nothing (a LOWER bound on its real time). In memory only, like
+# _ttft, and forgotten after LONG_CTX_SPEED_TTL.
+LONG_CTX_SPEED_TOKENS = 60000
+LONG_CTX_SPEED_SAMPLES = 8
+LONG_CTX_SPEED_TTL = 6 * 3600
+LONG_CTX_FAST_MS = 60000.0      # median first content at long size: "fast"
+LONG_CTX_SLOW_MS = 120000.0     # at or above: "slow"
+_long_ctx_speed = {}            # (pid, model) -> [(epoch, ms, stalled), ...]
+
+
+def _record_long_ctx_speed(pid, model, tokens, ms, stalled=False):
+    """One long-context timing sample; ignored below LONG_CTX_SPEED_TOKENS.
+    Never raises."""
+    try:
+        if not (pid and model) or int(tokens or 0) < LONG_CTX_SPEED_TOKENS:
+            return
+        if not ms or ms <= 0:
+            return
+        with _outcome_lock:
+            row = _long_ctx_speed.setdefault((pid, model), [])
+            row.append((time.time(), float(ms), bool(stalled)))
+            if len(row) > LONG_CTX_SPEED_SAMPLES:
+                del row[:-LONG_CTX_SPEED_SAMPLES]
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _long_ctx_band(pid, model):
+    """0 = measured fast at long context, 1 = unmeasured / middling,
+    2 = measured slow (median >= LONG_CTX_SLOW_MS, or its LATEST long request
+    stalled). Never raises (1 on error)."""
+    try:
+        now = time.time()
+        with _outcome_lock:
+            rows = [r for r in (_long_ctx_speed.get((pid, model)) or ())
+                    if now - r[0] <= LONG_CTX_SPEED_TTL]
+        if not rows:
+            return 1
+        if rows[-1][2]:
+            return 2
+        med = _percentile([r[1] for r in rows], 50)
+        if med >= LONG_CTX_SLOW_MS:
+            return 2
+        return 0 if med <= LONG_CTX_FAST_MS else 1
+    except Exception:                                            # noqa: BLE001
+        return 1
+
+
+def _prefer_fast_long_context(chain, est, keep_head=0):
+    """For a request of >= LONG_CTX_SPEED_TOKENS, move hops MEASURED fast at
+    long context ahead and hops measured slow behind the unmeasured ones --
+    a stable reorder inside each last-resort class, so ranking still decides
+    within a band and the _LOW_QUALITY_RE tail stays the tail. The first
+    `keep_head` entries (a pinned model) never move. Below the threshold, or
+    with no long-context measurements at all, the chain is returned as is."""
+    try:
+        if int(est or 0) < LONG_CTX_SPEED_TOKENS or not chain:
+            return chain
+        head, rest = list(chain[:keep_head]), list(chain[keep_head:])
+        bands = [_long_ctx_band(e[0], e[1]) for e in rest]
+        if all(b == 1 for b in bands):
+            return chain
+        # Recent failures stay at the tail too (see _recent_hop_failure).
+        order = sorted(range(len(rest)),
+                       key=lambda i: (_is_low_quality(rest[i][1]),
+                                      _recent_hop_failure(rest[i][0], rest[i][1]) is not None,
+                                      bands[i], i))
+        return head + [rest[i] for i in order]
+    except Exception:                                            # noqa: BLE001
+        return chain
+
+
 def _note_ttft(resp, pid, model):
     """Record TTFT for a streaming hop that just produced its first content.
 
@@ -3294,7 +3371,9 @@ def _note_ttft(resp, pid, model):
     if started is None:
         return
     try:
-        _record_ttft(pid, model, (time.perf_counter() - started) * 1000.0)
+        ms = (time.perf_counter() - started) * 1000.0
+        _record_ttft(pid, model, ms)
+        _record_long_ctx_speed(pid, model, getattr(resp, "_hub_est_tokens", 0), ms)
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -6641,6 +6720,8 @@ def _dispatch_chat(pid, payload, stream):
         resp = _upstream_chat(pid, payload, stream)
         try:
             resp._hub_started = started
+            # Size of what was asked, for the long-context speed ledger.
+            resp._hub_est_tokens = _payload_est_tokens(payload)
         except Exception:                                        # noqa: BLE001
             pass
         return resp
@@ -6653,11 +6734,22 @@ def _dispatch_chat(pid, payload, stream):
     resp = _upstream_chat(pid, payload, stream)
     try:
         if resp is not None and getattr(resp, "status_code", None) == 200:
-            _record_latency(pid, (payload or {}).get("model"),
-                            (time.perf_counter() - started) * 1000.0)
+            ms = (time.perf_counter() - started) * 1000.0
+            _record_latency(pid, (payload or {}).get("model"), ms)
+            _record_long_ctx_speed(pid, (payload or {}).get("model"),
+                                   _payload_est_tokens(payload), ms)
     except Exception:                                            # noqa: BLE001
         pass
     return resp
+
+
+def _payload_est_tokens(payload):
+    """_est_tokens of a chat payload's messages + tools; 0 when unmeasurable."""
+    try:
+        p = payload or {}
+        return _est_tokens(p.get("messages"), p.get("tools"))
+    except Exception:                                            # noqa: BLE001
+        return 0
 
 
 
@@ -8635,6 +8727,11 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         if (pid, m) not in seen:
             chain.append((pid, m))
             seen.add((pid, m))
+    # A HUGE request walks the hops measured FAST at long context first (see
+    # _prefer_fast_long_context). A pinned model keeps hop one.
+    chain = _prefer_fast_long_context(
+        chain, est,
+        keep_head=1 if (pinned and chain and tuple(chain[0]) == (primary_pid, model_id)) else 0)
     # LAST RESORT — the user's PAID local subscriptions, opt-in and OFF by
     # default (so this loop normally adds NOTHING and the chain is identical to
     # before). Appended after BOTH free tiers: a sub hop must only ever run once
@@ -10050,8 +10147,76 @@ _SUMMARY_SYSTEM = (
     "in the recap itself. If the goal is not stated, omit GOAL rather than guess.\n"
     "Be specific: real file paths, real names, real values. No filler, no advice, "
     "no restating these instructions. Under 300 words. Facts only — never invent a "
-    "detail that was not in the text."
+    "detail that was not in the text. Never attach a value to a file, command or "
+    "name other than the one it came from; when unsure, leave the value out -- "
+    "the hub appends an EXACT FACTS list of the verbatim values separately."
 )
+
+
+def _exact_facts_on():
+    try:
+        return bool(config.get_flag("compact_exact_facts", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _exact_facts_block(messages, target_tokens=None):
+    """ctxwin.format_exact_facts of `messages`, sized to ~5% of a compaction
+    target (floor 600 chars, cap ctxwin.EXACT_FACTS_MAX_CHARS), or "" when off
+    or empty. Never raises."""
+    try:
+        if not _exact_facts_on():
+            return ""
+        cap = ctxwin.EXACT_FACTS_MAX_CHARS
+        if target_tokens:
+            cap = max(600, min(cap, int(target_tokens * 4 * 0.05)))
+        return ctxwin.format_exact_facts(ctxwin.exact_facts(messages, max_chars=cap))
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+# A CLI's OWN compaction request (codex "CONTEXT CHECKPOINT COMPACTION", Claude
+# Code's "create a detailed summary") is answered by a model-written summary
+# the CLI then carries INSTEAD of the history -- the codex misquote above came
+# from exactly that. The request's last user message is given the conversation's
+# exact facts with an instruction to copy them unchanged, so they survive in
+# the CLI's own summary (and _carried_facts carries them through the next one).
+_CLI_COMPACTION_FACTS_NOTE = (
+    "\n\nWhen writing the summary, include the block below UNCHANGED at its end "
+    "under the heading EXACT FACTS -- copy every line character for character, "
+    "do not merge, reorder or reword values, and do not move a value to another "
+    "file.\n")
+
+
+def _with_cli_compaction_facts(messages):
+    """`messages` with the exact-facts block appended to a CLI compaction
+    request's last user message; unchanged for anything else, when the block
+    is already there, or when there are no facts. Never raises."""
+    try:
+        if not messages or not ctxwin.is_compaction_request(messages):
+            return messages
+        idx = next((i for i in range(len(messages) - 1, -1, -1)
+                    if isinstance(messages[i], dict)
+                    and messages[i].get("role") == "user"), None)
+        if idx is None:
+            return messages
+        last = messages[idx]
+        if ctxwin.EXACT_FACTS_MARKER in ctxwin.message_text(last):
+            return messages
+        block = _exact_facts_block(messages[:idx])
+        if not block:
+            return messages
+        extra = _CLI_COMPACTION_FACTS_NOTE + block
+        content = last.get("content")
+        if isinstance(content, str):
+            new = dict(last, content=content + extra)
+        elif isinstance(content, list):
+            new = dict(last, content=list(content) + [{"type": "text", "text": extra}])
+        else:
+            return messages
+        return list(messages[:idx]) + [new] + list(messages[idx + 1:])
+    except Exception:                                            # noqa: BLE001
+        return messages
 # MEASURED live 2026-09-27: with the transcript handed over bare, a recap came
 # back as "OK: GOAL — Développer un système de gestion de tâches..." -- the
 # summariser OBEYED the conversation's "answer in French, start with OK:" rule
@@ -10176,7 +10341,8 @@ def _rolling_recap(conv, dropped):
                         target=_summarize_worker, args=(ikey, new_text, sid),
                         kwargs={"conv": conv, "prev": entry.get("recap"),
                                 "head": entry.get("head"), "last": hashes[-1],
-                                "n": len(hashes)},
+                                "n": len(hashes),
+                                "exact": ctxwin.exact_facts(dropped)},
                         daemon=True, name="summarize-roll").start()
         return entry.get("recap")
     except Exception:                                            # noqa: BLE001
@@ -10185,7 +10351,7 @@ def _rolling_recap(conv, dropped):
 
 
 def _summarize_worker(key, text, sid=None, conv=None, prev=None, head=None,
-                      last=None, n=0):
+                      last=None, n=0, exact=None):
     """Compute one recap and cache it. Runs OFF the request path.
 
     `sid` names the conversation so the recap can also be written where it
@@ -10233,8 +10399,12 @@ def _summarize_worker(key, text, sid=None, conv=None, prev=None, head=None,
                 _summary_cache[key] = out
             # The conversation's ROLLING recap, persisted (see _rolling_recap).
             if conv:
-                _recap_store.put(conv, {"recap": out, "head": head, "last": last,
-                                        "n": int(n or 0)})
+                _entry = {"recap": out, "head": head, "last": last, "n": int(n or 0)}
+                if exact:
+                    # The verbatim facts of the same dropped part, filed beside
+                    # (never inside) the summary -- see ctxwin.exact_facts.
+                    _entry["exact"] = list(exact)
+                _recap_store.put(conv, _entry)
             # ...and durably, for the conversation this recap belongs to. The
             # cache above is 64 entries of RAM: the hub auto-updates every five
             # hours, so a long conversation's recap was reliably lost before
@@ -10363,7 +10533,8 @@ def _summarize_dropped(dropped):
         threading.Thread(target=_summarize_worker, args=(key, text, sid),
                          kwargs={"conv": conv, "head": ctxwin.head_hash(dropped),
                                  "last": ctxwin.message_hash(dropped[-1]),
-                                 "n": len(dropped)},
+                                 "n": len(dropped),
+                                 "exact": ctxwin.exact_facts(dropped)},
                          daemon=True, name="summarize").start()
     except Exception:                                            # noqa: BLE001
         _log.debug("[summary] could not schedule", exc_info=True)
@@ -10594,6 +10765,12 @@ def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stat
     pinned_ids = {id(latest)} if latest is not None else set()
     brief = _brief_excerpt(first) if first is not None else None
     base = _est_tokens(lead_sys + [x for x in (brief, latest) if x is not None], tools)
+    # Room for the EXACT FACTS message (see below), sized on the whole history:
+    # the dropped part's block is never bigger (same cap). Nothing reserved
+    # when the history carries no such facts.
+    _facts_room = _exact_facts_block(rest, target)
+    if _facts_room:
+        base += _est_tokens([{"role": "system", "content": _facts_room}], overhead=0)
     keep_ids, running = set(), base
     for u in range(len(units) - 1, -1, -1):        # keep newest-first until full
         body = [m for m in units[u] if id(m) not in pinned_ids]
@@ -10664,7 +10841,15 @@ def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stat
     if recap:
         note += "\n\n[Recap of the dropped turns]\n" + recap
     notice = {"role": "system", "content": note}
-    out = (lead_sys + [notice] + ([brief] if brief_needed else [])
+    # ...and NEXT TO it, never inside it, the facts a summary must not
+    # paraphrase: what each file/command printed, what was written where, the
+    # user's stated values (ctxwin.exact_facts). Mechanical, so present from
+    # the first compaction on; ~5% of the target at most, room reserved above.
+    # Its OWN message: the trim below cuts the biggest message head+tail, and
+    # inside the notice it lost its header to that cut.
+    facts = _exact_facts_block(dropped, target) if _facts_room else ""
+    facts_msg = [{"role": "system", "content": facts}] if facts else []
+    out = (lead_sys + [notice] + facts_msg + ([brief] if brief_needed else [])
            + [m for m in rest if id(m) in keep_ids])
     # DROPPING TURNS IS NOT ENOUGH ON ITS OWN.
     #
@@ -10967,6 +11152,8 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         msgs = (payload["messages"] if payload.get("_no_craft")
                 else _apply_craft_brief(payload["messages"],
                                         agentic=bool(payload.get("tools"))))
+        # A CLI's own compaction request carries the exact facts to copy.
+        msgs = _with_cli_compaction_facts(msgs)
         payload = dict(payload)
         payload.pop("_no_craft", None)      # never goes upstream
         payload["messages"] = msgs
@@ -23483,23 +23670,95 @@ def _request_deadline_seconds():
     return v if v > 0 else None
 
 
-def _begin_request_deadline():
+# THE DEADLINE GROWS WITH THE REQUEST. MEASURED live 2026-09-27: at ~220K real
+# tokens (~650 KB) ONE free hop needed 110-270 s to answer, so a request that
+# was doing nothing wrong ended in a clean 504 at the flat 240 s -- the second
+# hop never got the time the first one used up uploading and prefilling. Past
+# LONG_DEADLINE_FROM_TOKENS the deadline gains `request_deadline_per_10k_seconds`
+# per started 10K tokens, capped at `request_deadline_max_seconds`. A request
+# below the threshold keeps exactly the base deadline.
+#
+# A STREAM keeps its stall limits: the hub withholds a stream's 200 until a hop
+# produces content, and every streaming client has a ~300 s header/idle timeout
+# (opencode 300 s, codex stream_idle_timeout 300 s). A stream's scaled deadline
+# therefore never passes LONG_DEADLINE_STREAM_MAX, _STREAM_HEADER_BUDGET still
+# stops new hops, and the post-deadline idle/max rules are unchanged.
+LONG_DEADLINE_FROM_TOKENS = 60000
+_REQUEST_DEADLINE_PER_10K_DEFAULT = 15       # seconds per started 10K tokens
+_REQUEST_DEADLINE_MAX_DEFAULT = 600          # seconds, buffered requests
+LONG_DEADLINE_STREAM_MAX = 285               # seconds, under the clients' 300
+
+
+def _long_deadline_setting(key, default):
+    try:
+        v = float(config.get_setting(key, default))
+    except Exception:                                            # noqa: BLE001
+        v = float(default)
+    return v if v >= 0 else float(default)
+
+
+def _scaled_request_deadline(tokens=None, stream=False):
+    """The request deadline for a request of `tokens` estimated tokens: the
+    base (`_request_deadline_seconds`), plus the long-request allowance above
+    LONG_DEADLINE_FROM_TOKENS, capped. None when unbounded. Never below the
+    base, never raises."""
+    base = _request_deadline_seconds()
+    if not base:
+        return base
+    try:
+        over = int(tokens or 0) - LONG_DEADLINE_FROM_TOKENS
+        if over <= 0:
+            return base
+        per = _long_deadline_setting("request_deadline_per_10k_seconds",
+                                     _REQUEST_DEADLINE_PER_10K_DEFAULT)
+        cap = _long_deadline_setting("request_deadline_max_seconds",
+                                     _REQUEST_DEADLINE_MAX_DEFAULT)
+        if stream:
+            cap = min(cap, LONG_DEADLINE_STREAM_MAX)
+        steps = -(-over // 10000)                    # started 10K blocks
+        return max(base, min(cap, base + per * steps))
+    except Exception:                                            # noqa: BLE001
+        return base
+
+
+def _begin_request_deadline(tokens=None, stream=False):
     """Start this request's clock (once) and return its absolute monotonic
     deadline, or None when unbounded / outside a request.
 
     Idempotent within a request: /v1/responses re-enters itself for its
     transient-storm retry, and that retry is the same request to the client --
-    it must not get a fresh four minutes."""
+    it must not get a fresh four minutes. The clock starts at the FIRST call
+    (before routing); a later call that knows the request's size may only
+    EXTEND the deadline, measured from that same start (see
+    _scaled_request_deadline)."""
     try:
         at = getattr(g, "hub_deadline_at", _MISSING)
-        if at is not _MISSING:
-            return at
-        secs = _request_deadline_seconds()
-        at = (time.monotonic() + secs) if secs else None
-        g.hub_deadline_at = at
+        if at is _MISSING:
+            secs = _request_deadline_seconds()
+            g.hub_deadline_started = time.monotonic()
+            at = (g.hub_deadline_started + secs) if secs else None
+            g.hub_deadline_at = at
+        if at is not None and tokens:
+            started = getattr(g, "hub_deadline_started", None)
+            secs = _scaled_request_deadline(tokens, stream)
+            if started is not None and secs:
+                at = max(at, started + secs)
+                g.hub_deadline_at = at
         return at
     except Exception:                                            # noqa: BLE001
         return None
+
+
+def _request_deadline_limit():
+    """Seconds this request's deadline allows in total (for messages), or None."""
+    try:
+        at = getattr(g, "hub_deadline_at", None)
+        started = getattr(g, "hub_deadline_started", None)
+        if at is not None and started is not None:
+            return at - started
+    except Exception:                                            # noqa: BLE001
+        pass
+    return _request_deadline_seconds()
 
 
 def _is_trivial_turn(messages, max_tokens, difficulty, est, pinned=False):
@@ -23835,9 +24094,14 @@ class _ChainClock:
     _dispatch_chat, `peek_timeout()` instead of _stream_peek_timeout, `guard()`
     around a committed stream."""
 
-    def __init__(self, trivial=False):
-        self.deadline_at = _begin_request_deadline()
-        self.limit = _request_deadline_seconds() if self.deadline_at else None
+    def __init__(self, trivial=False, est=None, stream=False):
+        # `est` / `stream`: a long request's deadline grows with its size
+        # (see _scaled_request_deadline); omitted, the base deadline as before.
+        self.deadline_at = _begin_request_deadline(est, stream) if est else \
+            _begin_request_deadline()
+        self.limit = (_request_deadline_limit() if est else _request_deadline_seconds()) \
+            if self.deadline_at else None
+        self.est = int(est or 0)
         self.trivial = bool(trivial)
         self._hop_started = None
         self._hop_budget = None
@@ -24196,12 +24460,27 @@ class _ChainClock:
             # squeezed into the last second of the request deadline is not.
             if (self._hop_budget or 0) >= _ADAPTIVE_HOP_FLOOR:
                 _note_recent_hop_failure(pid, model, "deadline")
+            self._note_long_stall(pid, model)
             raise
         except requests.exceptions.Timeout:
             _note_recent_hop_failure(pid, model, "timeout")
+            self._note_long_stall(pid, model)
             raise
         self._note_status(pid, model, resp, stream)
         return resp
+
+    def _note_long_stall(self, pid, model):
+        """A LONG request's hop that waited at least LONG_CTX_FAST_MS and got
+        nothing is measured not-fast at long context (see _long_ctx_band). A
+        shorter wait -- a hop squeezed by the deadline -- is no evidence."""
+        try:
+            if self.est < LONG_CTX_SPEED_TOKENS or self._hop_started is None:
+                return
+            ms = (time.monotonic() - self._hop_started) * 1000.0
+            if ms >= LONG_CTX_FAST_MS:
+                _record_long_ctx_speed(pid, model, self.est, ms, stalled=True)
+        except Exception:                                        # noqa: BLE001
+            pass
 
     @staticmethod
     def _note_status(pid, model, resp, stream):
@@ -24221,6 +24500,7 @@ class _ChainClock:
         try:
             if status == "timeout":
                 self._note_stall(pid)        # see walk()
+                self._note_long_stall(pid, model)
             if status == "content":
                 _clear_recent_hop_failure(pid, model)
             elif status == "timeout" and max(self._hop_budget or 0,
@@ -27757,7 +28037,13 @@ def _conversation_recap(conv):
     """The persisted rolling recap of conversation `conv`, or ""."""
     try:
         entry = _recap_store.get(conv) if conv else None
-        return str((entry or {}).get("recap") or "").strip()
+        recap = str((entry or {}).get("recap") or "").strip()
+        exact = (entry or {}).get("exact")
+        if recap and isinstance(exact, list) and _exact_facts_on():
+            block = ctxwin.format_exact_facts([str(x) for x in exact if x])
+            if block:
+                recap += "\n\n" + block
+        return recap
     except Exception:                                            # noqa: BLE001
         return ""
 
@@ -28787,7 +29073,7 @@ def _chat_completions_uncached(body):
     # See _ChainClock: the request deadline and the trivial-turn hop budget.
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
-        body.get("messages"), body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)))
+        body.get("messages"), body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)), est=est, stream=stream)
     # Context bookkeeping for this request (original size, conversation id).
     # The native overflow error is an OpenAI-client contract, so it is only
     # armed on the real /v1/chat/completions route -- not on the foreign
@@ -29692,7 +29978,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
     # See _ChainClock: the request deadline and the trivial-turn hop budget.
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
-        messages, body.get("max_output_tokens"), diff, est, pinned=bool(_pin_kw)))
+        messages, body.get("max_output_tokens"), diff, est, pinned=bool(_pin_kw)), est=est, stream=stream)
     _chain = _build_chain(pid, resolved, est, require_vision=has_images,
                           require_tools=has_tools, messages=messages,
                           **_pin_kw)
@@ -30600,7 +30886,7 @@ def v1_messages():
     # See _ChainClock: the request deadline and the trivial-turn hop budget.
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
-        oai_messages, body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)))
+        oai_messages, body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)), est=est, stream=stream)
     _chain = _build_chain(pid, resolved, est, require_vision=has_images,
                           require_tools=has_tools, messages=oai_messages,
                           **_pin_kw)
