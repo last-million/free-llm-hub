@@ -177,7 +177,7 @@ def test_a_listening_child_of_the_shell_is_the_server():
                          tool_was_last=True, exclude_pids=[999], exclude_ports=[8787],
                          processes=_server_tree())
     assert d == {"command": "python app.py", "ports": [5000], "source": "process",
-                 "leaky": False}
+                 "leaky": False, "pids": [13]}
 
 
 def test_the_cli_itself_never_counts():

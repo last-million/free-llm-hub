@@ -52,6 +52,13 @@ so swarm_windows can use it too):
        and the CLI announces a command BEFORE running it (codex item.started,
        claude's assistant tool_use).
 
+   EARLY (early_server_diagnosis, ~60 s of silence instead of 420 s): the
+   same question, asked strictly -- the shell tool is waiting on a server
+   started after the CLI's last line and on nothing else -- and extended to
+   ORPHANS (`start /B`, a bare `&`: the server outlives the shell that started
+   it, so it is in no tree), recognised by the TURN_MARKER every turn's CLI
+   carries in its environment. See the section above early_server_diagnosis.
+
 3. THE WORDS for the live view (stall_notice) and the resume prompt
    (resume_instruction): "your last command `X` starts a server that never
    returns ... it was / was not listening on port N ... start it detached with
@@ -70,6 +77,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 
 # The hub's port when PORT is unset -- the same default app.py, agentic_chat
 # and workspace use.
@@ -353,8 +361,12 @@ def session_processes(root_pid):
                         ports.add(int(c.laddr.port))
             except Exception:                                    # noqa: BLE001
                 pass
+            try:
+                started = k.create_time()
+            except Exception:                                    # noqa: BLE001
+                started = None
             info[k.pid] = {"pid": k.pid, "ppid": k.ppid(), "name": name,
-                           "cmd": cmd, "ports": ports}
+                           "cmd": cmd, "ports": ports, "started": started}
         except Exception:                                        # noqa: BLE001
             continue
     out = []
@@ -366,8 +378,9 @@ def session_processes(root_pid):
                 via = True
                 break
             up = info[up]["ppid"]
-        out.append({"pid": pid, "name": p["name"], "cmd": p["cmd"],
-                    "ports": sorted(p["ports"]), "via_shell": via})
+        out.append({"pid": pid, "ppid": p["ppid"], "name": p["name"], "cmd": p["cmd"],
+                    "ports": sorted(p["ports"]), "via_shell": via,
+                    "started": p["started"]})
     return out
 
 
@@ -410,9 +423,335 @@ def diagnose_stall(root_pid, cli_id=None, last_tool=None, tool_was_last=False,
             command = server_command(best["cmd"]) or _one_line(best["cmd"], 120)
             source = "process"
         return {"command": command, "ports": ports, "source": source,
-                "leaky": bool(tool_cmd and leaky_launch(tool_cmd))}
+                "leaky": bool(tool_cmd and leaky_launch(tool_cmd)),
+                "pids": [s.get("pid") for s in servers + runners]}
     except Exception:                                            # noqa: BLE001
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Early detection: a server blocking the shell tool, long before the stall
+# --------------------------------------------------------------------------- #
+#
+# diagnose_stall above runs only once a turn has been silent for the whole
+# stall deadline (420 s), and for opencode -- which reports a command only
+# after it returned -- the process tree is its only evidence. The live failure
+# cost 2 x 420 s before anything was said. early_server_diagnosis answers the
+# same question after ~60 s of silence, so it must be much stricter: it may
+# only fire when the CLI's shell tool is waiting on a server and on NOTHING
+# ELSE, so a long `pytest`, `npm install`, `cargo build` or a model thinking
+# for minutes is never touched.
+#
+# ORPHANS. `start /B python app.py` (cmd), `python app.py &` (bash) and
+# Start-Process hand the shell's pipe to the server and let the shell exit:
+# the server is then nobody's child -- the tree walk from the CLI never sees
+# it, the old tree kill never reached it, and it kept its port (live: the
+# resumed model found the first attempt's server still on :5000 in netstat and
+# killed it by PID). The hub stamps every turn's CLI with TURN_MARKER in its
+# environment, which every process the agent starts inherits, so such an
+# orphan is recognised by that marker -- and only a process carrying it is
+# ever stopped.
+#
+# WHY IT IS STOPPED, NOT LEFT RUNNING. The shell tool stays blocked until
+# every holder of its pipe's write end is gone, and that handle lives inside
+# the server; the only other way out is to kill the CLI (the pipe's reader),
+# and a server whose output pipe has no reader breaks. MEASURED here: with its
+# stdout/stderr pipe reader closed, `python -m http.server` and a handler that
+# print()s stayed alive but answered 3/3 requests with RemoteDisconnected (the
+# request log write raises before the response); only a logging-based handler
+# (werkzeug's shape) kept answering 200. So the server is stopped with the
+# blocked shell and the model is told to restart it detached.
+
+TURN_MARKER = "CALVOUN_AGENT_TURN"
+# workspace._PREVIEW_MARKER: the hub's own preview of the project. Never the
+# agent's, whatever else its environment carries.
+PREVIEW_MARKER = "CALVOUN_PREVIEW"
+# A server must have been up this long before it counts: the model may be
+# about to curl it and stop it itself.
+SERVER_MIN_AGE = 20.0
+
+# The CLI's own helpers that happen to sit under a shell (an MCP server or a
+# language server launched through a .cmd shim) -- never the agent's command.
+_HELPER_RE = re.compile(r"mcp|--stdio\b|language-?server|langserver|\blsp\b", re.I)
+# Pipeline filters and console hosts: they wait on whatever feeds them.
+_NEUTRAL = frozenset({"conhost", "openconsole", "tee", "cat", "grep", "egrep", "fgrep",
+                      "findstr", "head", "tail", "sed", "awk", "gawk", "cut", "tr",
+                      "more", "less", "sort", "uniq", "wc"})
+# Finite work that may LISTEN while it runs (a test's live server, a kernel, a
+# download): a listening socket on one of these is not a server blocking the
+# shell -- the shell is legitimately waiting for it to finish.
+_FINITE_RE = re.compile(
+    r"\b(?:py\.?test|unittest|nose2|tox|nox|jest|vitest|mocha|ava|karma|playwright|"
+    r"cypress|puppeteer|selenium|go\s+(?:test|build)|cargo\s+(?:test|build|check)|"
+    r"mvnw?|gradlew?|msbuild|dotnet\s+(?:test|build)|pip3?|pipx|"
+    r"(?:npm|pnpm|yarn|bun)\s+(?:i|install|ci|add|test|t)|torchrun|accelerate|"
+    r"deepspeed|ipykernel(?:_launcher)?|nbconvert|curl|wget)\b", re.I)
+# What only starts something else: the shell waiting on it waits on its child.
+_LAUNCHER_RE = re.compile(
+    r"^(?:npm|npx|pnpm|pnpx|yarn|bun|bunx|uv|uvx|poetry|pipenv|pdm|hatch|rye|py|"
+    r"nohup|env|timeout|cross-env|dotenv|concurrently|npm-run-all|run-p|run-s|"
+    r"winpty)\b|^(?:cargo|go|dotnet)\s+(?:run|watch)\b", re.I)
+# `node ...\npm\bin\npm-cli.js run dev` is `npm run dev`.
+_NODE_PM_RE = re.compile(r"^node\s+.*?[\\/](npm|npx|pnpm|pnpx|yarn)(?:-cli)?\.[cm]?js\b",
+                         re.I)
+# Entry points that are batch scripts about as often as servers: a port is
+# needed before one of these counts.
+_WEAK_ENTRY_RE = re.compile(r"\b(?:main|run|api|index)\.(?:py|[cm]?js)\b|"
+                            r"\bdotnet\s+run\b", re.I)
+
+
+def _normal_cmd(cmd):
+    return _NODE_PM_RE.sub(lambda m: m.group(1), str(cmd or "").strip(), count=1)
+
+
+def server_by_command(cmd):
+    """Does this command line alone say "server" (no port needed)?
+    `python app.py`, `npm run dev`, `uvicorn m:app` yes; `python main.py`,
+    `node index.js` -- as often a batch job -- only with a listening port."""
+    cmd = _normal_cmd(cmd)
+    return starts_long_running(cmd) and starts_long_running(_WEAK_ENTRY_RE.sub(" ", cmd))
+
+
+def _kind(p, exclude_ports):
+    """helper | shell | server | neutral | launcher | other, plus the ports."""
+    name = str(p.get("name") or "").lower()
+    cmd = _normal_cmd(p.get("cmd") or name)
+    if _HELPER_RE.search(cmd):
+        return "helper", []
+    if name in _SHELLS:
+        return "shell", []
+    if _FINITE_RE.search(cmd):
+        return "other", []
+    ports = [x for x in (p.get("ports") or []) if x not in exclude_ports]
+    if ports:
+        return "server", ports
+    if server_by_command(cmd):
+        return "server", []
+    if name in _NEUTRAL:
+        return "neutral", []
+    if _LAUNCHER_RE.match(cmd) or starts_long_running(cmd):
+        return "launcher", []
+    return "other", []
+
+
+def _listening_ports(pids):
+    """{pid: {port}} for the given pids, one system-wide table read."""
+    pids = set(pids or ())
+    out = {}
+    if not pids:
+        return out
+    try:
+        import psutil
+    except ImportError:
+        return out
+    try:
+        for c in psutil.net_connections(kind="inet"):
+            if c.pid in pids and c.status == psutil.CONN_LISTEN and c.laddr:
+                out.setdefault(c.pid, set()).add(int(c.laddr.port))
+        return out
+    except Exception:                                            # noqa: BLE001
+        pass
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+            get = getattr(proc, "net_connections", None) or proc.connections
+            for c in get(kind="inet"):
+                if c.status == psutil.CONN_LISTEN and c.laddr:
+                    out.setdefault(pid, set()).add(int(c.laddr.port))
+        except Exception:                                        # noqa: BLE001
+            continue
+    return out
+
+
+def orphan_processes(marker, since, tree_pids=()):
+    """Processes started after `since` (epoch seconds) whose environment
+    carries this turn's `marker` but that are no longer under the CLI: what
+    `start /B`, a bare `&` or Start-Process leave behind once the shell that
+    launched them exited. Same dict shape as session_processes (plus
+    "orphan": True). [] without psutil, a marker or a start time; never raises."""
+    if not marker or since is None:
+        return []
+    try:
+        import psutil
+    except ImportError:
+        return []
+    skip = set(tree_pids or ()) | {os.getpid()}
+    found = []
+    try:
+        procs = psutil.process_iter(["pid", "ppid", "name", "create_time"])
+        for proc in procs:
+            try:
+                info = proc.info
+                pid, started = info.get("pid"), info.get("create_time")
+                if pid in skip or not started or started <= since:
+                    continue
+                env = proc.environ()
+                if env.get(TURN_MARKER) != marker or env.get(PREVIEW_MARKER):
+                    continue
+                name = (info.get("name") or "").lower()
+                if name.endswith(".exe"):
+                    name = name[:-4]
+                try:
+                    cmd = _short_cmdline(proc.cmdline())
+                except Exception:                                # noqa: BLE001
+                    cmd = name
+                found.append({"pid": pid, "ppid": info.get("ppid"), "name": name,
+                              "cmd": cmd, "ports": [], "via_shell": True,
+                              "started": started, "orphan": True})
+            except Exception:                                    # noqa: BLE001
+                continue
+    except Exception:                                            # noqa: BLE001
+        return found
+    ports = _listening_ports(p["pid"] for p in found)
+    for p in found:
+        p["ports"] = sorted(ports.get(p["pid"], ()))
+    return found
+
+
+def early_server_diagnosis(root_pid, marker=None, since=None, now=None,
+                           exclude_pids=None, exclude_ports=None, processes=None,
+                           orphans=None, min_age=SERVER_MIN_AGE, last_tool=None):
+    """After a short silence: is the CLI's shell tool blocked on a server --
+    and on nothing else?
+
+    `since` is the wall-clock time of the last line the CLI printed. Every
+    CLI prints something once a command returns (opencode its tool_use,
+    codex item.completed, claude the tool_result), so a server started AFTER
+    that line belongs to a command that has not returned -- and one started
+    before it (run detached, or Claude Code's run_in_background) is never a
+    candidate, however long the model then thinks.
+
+    Fires only when all of these hold:
+      * a process the shell tool started (in the CLI's tree below a shell, or
+        an orphan carrying `marker`) is a server: LISTENING on a port that is
+        not the hub's, or running an unambiguous server/watcher command;
+      * it started after `since` and has been up `min_age` seconds;
+      * nothing else the shell tool runs is real work: every other process
+        there is a shell, a launcher (npm/npx/uv/py...), a pipeline filter, a
+        server or a server's own child. A test runner, installer or build --
+        even one that started a server of its own -- means the shell is
+        legitimately busy and the answer is None.
+    The hub's PIDs and port are never candidates. Returns None or
+    {"command", "ports", "pids" (what listens, best first), "stop" (every
+    candidate, launchers included), "orphans", "source": "early", "leaky"}.
+    Never raises."""
+    try:
+        now = time.time() if now is None else float(now)
+        exclude_pids = set(hub_pids() if exclude_pids is None else exclude_pids)
+        exclude_ports = set([hub_port()] if exclude_ports is None else exclude_ports)
+        tree = session_processes(root_pid) if processes is None else processes
+        tree = [p for p in (tree or []) if isinstance(p, dict)]
+        if orphans is None:
+            orphans = orphan_processes(marker, since,
+                                       {p.get("pid") for p in tree} | {root_pid})
+        pool = {}
+        for p in tree:
+            if p.get("via_shell") and p.get("pid") not in exclude_pids:
+                pool[p.get("pid")] = dict(p, orphan=False)
+        for p in orphans or []:
+            if (isinstance(p, dict) and p.get("pid") not in pool
+                    and p.get("pid") not in exclude_pids):
+                pool[p.get("pid")] = dict(p, orphan=True)
+        if not pool:
+            return None
+        kinds = {pid: _kind(p, exclude_ports) for pid, p in pool.items()}
+
+        def under(pid, wanted):
+            seen, up = set(), pool[pid].get("ppid")
+            while up in pool and up not in seen:
+                seen.add(up)
+                if kinds[up][0] in wanted:
+                    return up
+                up = pool[up].get("ppid")
+            return None
+
+        for pid, (kind, _ports) in kinds.items():
+            if kind == "other" and under(pid, ("server", "helper")) is None:
+                return None                     # the shell is doing real work
+        cands = []
+        for pid, (kind, ports) in kinds.items():
+            if kind != "server" or under(pid, ("helper",)) is not None:
+                continue
+            started = pool[pid].get("started")
+            if started is None or now - float(started) < float(min_age):
+                continue
+            if since is not None and float(started) <= float(since):
+                continue
+            cands.append((pid, ports))
+        if not cands:
+            return None
+        cands.sort(key=lambda c: (not c[1], float(pool[c[0]].get("started") or 0)))
+        best = cands[0][0]
+        # Quote what the model typed: the topmost launcher/server above the
+        # process that listens (`npm run dev` rather than node ...\vite.js).
+        shown, up = best, pool[best].get("ppid")
+        while up in pool and kinds[up][0] in ("server", "launcher", "shell"):
+            if server_by_command(pool[up].get("cmd")):
+                shown = up
+            up = pool[up].get("ppid")
+        cmd = pool[shown].get("cmd") or pool[best].get("cmd")
+        command = server_command(_normal_cmd(cmd)) or _one_line(cmd, 120)
+        # Shown: what listens (not `npm run dev` above it). Stopped: all of it.
+        listening = [pid for pid, ports in cands if ports]
+        return {"command": command,
+                "ports": sorted({x for _pid, ports in cands for x in ports}),
+                "pids": listening or [pid for pid, _ports in cands],
+                "stop": [pid for pid, _ports in cands],
+                "orphans": [pid for pid, _ports in cands if pool[pid].get("orphan")],
+                "source": "early",
+                "leaky": bool(last_tool and leaky_launch(last_tool)
+                              and starts_long_running(last_tool))}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def stop_processes(pids, marker, exclude_pids=None, grace=3.0):
+    """Stop the servers THIS TURN started, with their children, and return
+    the PIDs still alive afterwards. A process is only touched when its
+    environment carries `marker` (so a stale or reused PID, the hub's preview
+    or anyone else's process never is) and it is not one of the hub's PIDs.
+    Never raises."""
+    pids = [p for p in (pids or []) if isinstance(p, int)]
+    if not pids or not marker:
+        return []
+    try:
+        import psutil
+    except ImportError:
+        return []
+    protect = set(hub_pids() if exclude_pids is None else exclude_pids)
+
+    def ours(proc):
+        try:
+            env = proc.environ()
+            return (proc.pid not in protect and env.get(TURN_MARKER) == marker
+                    and not env.get(PREVIEW_MARKER))
+        except Exception:                                        # noqa: BLE001
+            return False
+    victims = {}
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+        except Exception:                                        # noqa: BLE001
+            continue
+        if not ours(proc):
+            continue
+        try:
+            kids = proc.children(recursive=True)
+        except Exception:                                        # noqa: BLE001
+            kids = []
+        for k in kids + [proc]:
+            if k.pid not in victims and ours(k):
+                victims[k.pid] = k
+    for v in victims.values():
+        try:
+            v.kill()
+        except Exception:                                        # noqa: BLE001
+            pass
+    try:
+        _gone, alive = psutil.wait_procs(list(victims.values()), timeout=grace)
+    except Exception:                                            # noqa: BLE001
+        return []
+    return sorted(v.pid for v in alive)
 
 
 def _ports_text(ports):
@@ -432,14 +771,28 @@ def stall_notice(diag, stall_seconds, again=False):
     cmd = (diag or {}).get("command") or "a server"
     where = _ports_text((diag or {}).get("ports"))
     if where:
-        head = "Server running on %s in the foreground (`%s`)" % (where, cmd)
+        head = "Server running on %s in the foreground (`%s`)%s" % (
+            where, cmd, _pids_note(diag))
     else:
-        head = "`%s` is a long-running process started in the foreground" % cmd
+        head = "`%s` is a long-running process started in the foreground%s" % (
+            cmd, _pids_note(diag))
+    left = [p for p in (diag or {}).get("survivors") or [] if isinstance(p, int)]
+    stopped = ("the hub stopped the blocked shell, but could not stop PID %s -- "
+               "resuming with instructions to start it detached on another port"
+               % ", ".join(str(p) for p in left)) if left else (
+               "the hub stopped it with the blocked shell and is resuming with "
+               "instructions to start it detached")
     return ("%s%s: the shell never returned, so nothing came for %ds. Not a "
-            "wedge -- the hub stopped it with the blocked shell and is resuming "
-            "with instructions to start it detached%s."
-            % (head, " again" if again else "", int(stall_seconds),
+            "wedge -- %s%s."
+            % (head, " again" if again else "", int(stall_seconds), stopped,
                " (last retry)" if again else ""))
+
+
+def _pids_note(diag):
+    pids = [p for p in (diag or {}).get("pids") or [] if isinstance(p, int)]
+    if not pids:
+        return ""
+    return ", PID %s" % ", ".join(str(p) for p in pids[:3])
 
 
 def resume_instruction(diag, stall_seconds, pids=None, port=None, windows=None):
@@ -448,10 +801,19 @@ def resume_instruction(diag, stall_seconds, pids=None, port=None, windows=None):
     port = hub_port() if port is None else port
     cmd = (diag or {}).get("command") or "your server command"
     where = _ports_text((diag or {}).get("ports"))
-    if where:
-        state = ("It was listening on %s, but in the foreground, so the hub had "
+    pid_list = [p for p in (diag or {}).get("pids") or [] if isinstance(p, int)][:3]
+    pid_text = (" (PID %s)" % ", ".join(str(p) for p in pid_list)) if pid_list else ""
+    left = [p for p in (diag or {}).get("survivors") or [] if isinstance(p, int)]
+    if left:
+        state = ("It was %s%s. The hub stopped your blocked shell but could NOT "
+                 "stop PID %s, so %s may still be taken: start yours on another "
+                 "port." % (("listening on " + where) if where else "running",
+                            pid_text, ", ".join(str(p) for p in left),
+                            where or "its port"))
+    elif where:
+        state = ("It was listening on %s%s, but in the foreground, so the hub had "
                  "to stop it together with your blocked shell: it is NOT running "
-                 "now." % where)
+                 "now and there is nothing left to stop." % (where, pid_text))
     else:
         state = ("It was not listening on any port yet; the hub stopped it "
                  "together with your blocked shell, so it is not running now.")
