@@ -476,7 +476,8 @@ def test_every_chain_loop_runs_on_the_clock():
     assert src.count("if _clock.spent():") == 6        # hop top + after the loop, x3
     assert src.count("resp = _dispatch_chat(hop_pid, payload, dispatch_stream)") == 0
     assert src.count("resp = _dispatch_chat(hop_pid, payload, stream)") == 0
-    assert src.count("_clock.peek_timeout(hop_model, est)") == 3
+    # pid rides along so measured TTFT can class the hop slow (_is_slow_model)
+    assert src.count("_clock.peek_timeout(hop_model, est, pid=hop_pid)") == 3
     assert src.count("_clock.guard(_chain_buffered(") == 3
 
 

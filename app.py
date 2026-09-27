@@ -2496,7 +2496,7 @@ def _best_free_pair(working_only=True):
     best, best_pid, best_score = None, None, -1.0
     for pid in _available_providers():
         for m in _auto_models(pid):
-            if working_only and (not prov.is_model_allowed(m) or _is_model_dead(pid, m)):
+            if working_only and (not prov.is_model_allowed(m) or _is_model_skipped(pid, m)):
                 continue
             s = _benchmark_score(pid, m)
             if s > best_score:
@@ -2828,7 +2828,7 @@ def _vision_candidates(est=0):
         free = {m.lower(): m for m in provider_free_models(pid)}
         for verified in _vision_model_ids(pid):
             model = free.get(verified.lower())
-            if model and prov.is_model_allowed(model) and not _is_model_dead(pid, model):
+            if model and prov.is_model_allowed(model) and not _is_model_skipped(pid, model):
                 available.append((pid, model))
 
     state = config.get_media_state()
@@ -3730,6 +3730,57 @@ def _is_model_dead_upstream(pid, model):
             _dead_models.pop(key, None)   # TTL expired -> give it another chance
             return False
         return True
+
+
+# "NOT OFFERED RIGHT NOW" -- a SHORT per-model skip, not a death.
+# MEASURED 2026-09-27: dahl answers 400 "This model is not currently offered:
+# <id>" for models that are served again seconds later (its backend rotates
+# which models it has loaded). Filed as a hop failure that sank the model's
+# reliability and, being a 400, could end up relayed to the CLI as the
+# chain's hard error. It is neither: the model is fine, just not loaded this
+# minute. So routing skips it for _NOT_OFFERED_TTL, and nothing else happens
+# -- no reliability failure, no dead mark, no relayed error.
+_NOT_OFFERED_RE = re.compile(r"(?:model\s+is\s+)?not\s+currently\s+offered", re.I)
+_NOT_OFFERED_TTL = 60
+_not_offered = {}                      # (pid, model) -> skip-until epoch
+_not_offered_lock = threading.Lock()
+
+
+def _resp_not_offered(resp):
+    """True for an upstream 400 that only says the model is not offered at the
+    moment (see _NOT_OFFERED_RE). Never raises."""
+    try:
+        if getattr(resp, "status_code", None) != 400:
+            return False
+        return bool(_NOT_OFFERED_RE.search(resp.text or ""))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _note_not_offered(pid, model):
+    if not pid or not model:
+        return
+    with _not_offered_lock:
+        _not_offered[(pid, str(model))] = time.time() + _NOT_OFFERED_TTL
+
+
+def _is_not_offered(pid, model):
+    key = (pid, str(model))
+    with _not_offered_lock:
+        exp = _not_offered.get(key)
+        if not exp:
+            return False
+        if exp <= time.time():
+            _not_offered.pop(key, None)
+            return False
+        return True
+
+
+def _is_model_skipped(pid, model):
+    """Routing's filter: dead/blocked (_is_model_dead) OR briefly not offered.
+    Kept apart from _is_model_dead so the dashboard and the model lists never
+    show a 60-second skip as a dead model."""
+    return _is_model_dead(pid, model) or _is_not_offered(pid, model)
 
 
 # PROVIDER-level sideline. When a provider fails AUTH/credit (401/402/403) across
@@ -7625,7 +7676,7 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
                 continue          # this provider is here only for its big-window models
             # skip ids this key provably can't use (403/404 learned at runtime) and
             # ids individually rate-limited / over their per-model sub-cap.
-            if (prov.is_model_allowed(m) and not _is_model_dead(pid, m)
+            if (prov.is_model_allowed(m) and not _is_model_skipped(pid, m)
                     and not quota.is_model_throttled(pid, m)
                     and not quota.model_status(pid, m)["exhausted"]):
                 entry = (_benchmark_score(pid, m), pid, m)
@@ -8285,7 +8336,7 @@ def _chain_entries(name):
         if ident not in live or "/" not in ident:
             continue
         pid, model = ident.split("/", 1)
-        if _is_model_dead(pid, model):
+        if _is_model_skipped(pid, model):
             continue
         out.append((pid, model))
     return out
@@ -8421,7 +8472,7 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         for m in _catalogs.get(pid) or []:
             if _only is not None and m not in _only:
                 continue
-            if (pid, m) in seen or not prov.is_model_allowed(m) or _is_model_dead(pid, m):
+            if (pid, m) in seen or not prov.is_model_allowed(m) or _is_model_skipped(pid, m):
                 continue
             if _veto and _normalize_model_identity(m) in _veto:
                 continue          # caller asked for a DIFFERENT model than this
@@ -8689,7 +8740,7 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
             _pool = [m for m in (_catalogs.get(pid) or [])
                      if (pid, m) not in seen
                      and prov.is_model_allowed(m)
-                     and not _is_model_dead(pid, m)
+                     and not _is_model_skipped(pid, m)
                      and not (_veto and _normalize_model_identity(m) in _veto)
                      and not quota.is_model_throttled(pid, m)
                      and not quota.model_status(pid, m)["exhausted"]
@@ -11219,7 +11270,10 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                 quota.observe_headers(pid, info_429["body_headers"], key,
                                       payload.get("model"))
         quota.observe_headers(pid, resp.headers, key, payload.get("model"))  # ADAPT to the real quota (per model for per-model-header providers)
-        if resp.status_code == 400:               # learn a small context window from the error
+        if resp.status_code == 400 and _resp_not_offered(resp):
+            # Not loaded THIS minute (see _NOT_OFFERED_RE): a short skip only.
+            _note_not_offered(pid, payload.get("model"))
+        elif resp.status_code == 400:             # learn a small context window from the error
             _learn_context_limit(pid, payload.get("model"), resp)
             _maybe_mark_missing_model(pid, payload.get("model"), resp)  # gone/renamed id -> sideline
         if resp.status_code == 413:               # 'too large for this model's TPM' -> learn the cap
@@ -11238,7 +11292,7 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         # Now the freshly-learned limit is applied immediately: recompact to the
         # REAL window and try the same hop once more, so a big conversation is
         # served by the strong model instead of being handed to a weak one.
-        if resp.status_code in (400, 413) and not refit_done:
+        if resp.status_code in (400, 413) and not refit_done and not _resp_not_offered(resp):
             refit_done = True                 # at most one re-fit per key attempt
             refit = _refit_payload_to_learned_ctx(pid, payload)
             if refit is not None:
@@ -14361,7 +14415,7 @@ def _ranked_free_pairs(limit=6):
     cands = []
     for pid, models in _prefetch_auto_models(_available_providers()).items():
         for m in models:
-            if not prov.is_model_allowed(m) or _is_model_dead(pid, m):
+            if not prov.is_model_allowed(m) or _is_model_skipped(pid, m):
                 continue
             cands.append((_benchmark_score(pid, m), pid, m))
     cands.sort(key=lambda t: t[0], reverse=True)
@@ -20552,6 +20606,10 @@ def _autofix_openclaw(entry, key, base_root, base_v1, model):
     }
 
 
+# The named `providers:` entry Hermes Connect writes (per-tier context_length).
+_HERMES_PROVIDER_KEY = "free-llm-hub"
+
+
 def _autofix_hermes(entry, key, base_root, base_v1, model):
     """Set model.{provider,base_url,default,api_key} in Hermes' config.yaml (merge-safe
     via PyYAML). Hermes needs a restart to re-read it."""
@@ -20585,6 +20643,27 @@ def _autofix_hermes(entry, key, base_root, base_v1, model):
     mdl["default"] = "auto"
     mdl["api_key"] = key
     data["model"] = mdl
+    # Context windows. Hermes' config carried none, so it fell back to its
+    # 128K default for every hub tier. Hermes documents per-model windows on a
+    # NAMED provider entry (providers.<name>.models.<id>.context_length) and
+    # matches that entry to the active route by BASE URL (hermes_cli/
+    # config_providers.py get_custom_provider_context_length -> _entries_for_
+    # route, verified 2026-09-27), so model.provider stays "custom" and the
+    # entry's api equals model.base_url. The entry also makes every tier
+    # reachable as /model custom:free-llm-hub:<tier>.
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    windows = {mid: int(agentic_chat.declared_window(mid)) for mid in _HUB_TIER_IDS}
+    providers[_HERMES_PROVIDER_KEY] = {
+        "name": "Calvoun Free LLM Hub",
+        "api": base_v1,
+        "api_key": key,
+        "default_model": "auto",
+        "context_length": windows["auto"],
+        "models": {mid: {"context_length": w} for mid, w in windows.items()},
+    }
+    data["providers"] = providers
     _cli_write_text(path, yaml.safe_dump(data, default_flow_style=False, sort_keys=False,
                                          allow_unicode=True))
     return {
@@ -20592,7 +20671,9 @@ def _autofix_hermes(entry, key, base_root, base_v1, model):
         "wrote_path": path,
         "backup_path": backup,
         "applied": {"model.provider": "custom", "model.base_url": base_v1,
-                    "model.default": "auto", "model.api_key": _mask_key(key)},
+                    "model.default": "auto", "model.api_key": _mask_key(key),
+                    "providers.%s.models" % _HERMES_PROVIDER_KEY:
+                        {mid: {"context_length": w} for mid, w in windows.items()}},
         "restart_hint": "Restart the Hermes CLI/session so it re-reads config.yaml.",
     }
 
@@ -21790,6 +21871,18 @@ def _disconnect_hermes(entry):
                         mdl[k] = prev[k]
                 if not mdl:
                     data.pop("model", None)
+            # The named provider entry Connect added for the context windows --
+            # only when it still points HERE (a user's own entry that happens
+            # to share the name is left alone).
+            provs = data.get("providers")
+            if isinstance(provs, dict):
+                ours = provs.get(_HERMES_PROVIDER_KEY)
+                if isinstance(ours, dict) and any(
+                        _points_at_hub(ours.get(k)) for k in ("api", "base_url", "url")):
+                    provs.pop(_HERMES_PROVIDER_KEY, None)
+                    changed = True
+                    if not provs:
+                        data.pop("providers", None)
             deleted = False
             if changed:
                 if not data:
@@ -23283,14 +23376,47 @@ def _header_budget_spent(started):
         return False
 
 
-def _stream_peek_timeout(model, est):
+# SLOWNESS FROM MEASUREMENT. _SLOW_MODEL_RE only knows names: MEASURED
+# 2026-09-27, pollinations "openai-fast" (really gpt-oss-20b behind an alias)
+# has a TTFT p50 of 34 s -- right at the flat 35 s peek -- yet matched nothing,
+# so about half its healthy answers were cut as "timeout". With enough TTFT
+# samples the MEASUREMENT decides: p50 at/over _SLOW_TTFT_MS is slow; p95
+# under it (even the slow tail is quick) is fast, whatever the name says. In
+# between, or with too few samples, the name regex stays the fallback. (TTFT
+# is recorded only for hops that reached content, so a lone fast sample set
+# never overrules the regex on its own median -- hence the p95 rule.)
+_SLOW_TTFT_MS = STREAM_CONTENT_PEEK_TIMEOUT * 1000.0 / 2      # 17.5 s
+_SLOW_TTFT_MIN_SAMPLES = 5
+
+
+def _is_slow_model(pid, model):
+    """True when (pid, model) is slow to its first content token: by measured
+    TTFT when there are >= _SLOW_TTFT_MIN_SAMPLES samples, else by name."""
+    by_name = bool(_SLOW_MODEL_RE.search((model or "").lower()))
+    if not pid or not model:
+        return by_name
+    try:
+        with _outcome_lock:
+            ttfts = list(_ttft.get((pid, model)) or [])
+        if len(ttfts) >= _SLOW_TTFT_MIN_SAMPLES:
+            if _percentile(ttfts, 50) >= _SLOW_TTFT_MS:
+                return True
+            if _percentile(ttfts, 95) < _SLOW_TTFT_MS:
+                return False
+    except Exception:                                            # noqa: BLE001
+        pass
+    return by_name
+
+
+def _stream_peek_timeout(model, est, pid=None):
     """Adaptive deadline for _peek_until_content: how long to wait for a stream's
     first REAL content before falling through to the next hop. A fast model on a
     small request answers in seconds, so a >35s silence means a hung provider —
-    but a slow/reasoning model (_SLOW_MODEL_RE) or a big agentic prompt (Codex's
+    but a slow/reasoning model (_is_slow_model: measured TTFT, else
+    _SLOW_MODEL_RE) or a big agentic prompt (Codex's
     15-40K tokens + tool schemas) legitimately needs longer before the first
     byte, and killing that hop abandoned HEALTHY strong models mid-chain."""
-    slow = bool(_SLOW_MODEL_RE.search((model or "").lower()))
+    slow = _is_slow_model(pid, model)
     big = bool(est) and est >= STREAM_BIG_REQUEST_TOKENS
     if slow and big:
         return STREAM_SLOW_BIG_PEEK_TIMEOUT + _huge_prefill_allowance(est)
@@ -23884,7 +24010,7 @@ class _ChainClock:
         # HTTP API would cut every one of them off. The deadline still applies.
         if self.trivial and not _is_sub(pid):
             ceiling = (_TRIVIAL_SLOW_HOP_BUDGET
-                       if _SLOW_MODEL_RE.search((model or "").lower())
+                       if _is_slow_model(pid, model)
                        else _TRIVIAL_HOP_BUDGET)
             budget = _adaptive_hop_budget(pid, model, ceiling, stream)
         left = self.left()
@@ -24229,8 +24355,8 @@ class _ChainClock:
         except Exception:                                        # noqa: BLE001
             pass
 
-    def peek_timeout(self, model, est):
-        t = _stream_peek_timeout(model, est)
+    def peek_timeout(self, model, est, pid=None):
+        t = _stream_peek_timeout(model, est, pid=pid)
         if self._hop_budget is not None and self._hop_started is not None:
             t = min(t, self._hop_budget - (time.monotonic() - self._hop_started))
         left = self.left()
@@ -24388,6 +24514,48 @@ _PEEK_JUDGE_CHARS = 600
 # An EMPTY key is not a tool call: LiteLLM-style relays serialize every content
 # delta with "tool_calls":null,"function_call":null, which used to disarm the
 # stream gate (and commit the peek) on the first frame of a plain answer.
+# A tool-call frame that NAMES its tool (OpenAI function.name, Anthropic
+# tool_use name). An empty "name" is no name.
+_STREAM_TOOLNAME_RE = re.compile(rb'"name"\s*:\s*"\s*[^"\s]')
+
+
+def _nameless_verdict(buffered, check):
+    """Peek verdict for a stream that ENDED having sent tool-call deltas but
+    never a tool name: "content" when every call's arguments name their tool
+    unambiguously (_infer_tool_name -- the translator repairs them), else
+    "empty": nothing a client could run, so the chain walks to the next hop
+    before a byte is committed."""
+    try:
+        calls = {}
+        for x in buffered or ():
+            b = x if isinstance(x, (bytes, bytearray)) else str(x).encode("utf-8", "ignore")
+            for line in b.split(b"\n"):
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                try:
+                    chunk = json.loads(line[5:].strip().decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                for ch in (chunk.get("choices") or []) if isinstance(chunk, dict) else []:
+                    for tcd in ((ch or {}).get("delta") or {}).get("tool_calls") or []:
+                        if not isinstance(tcd, dict):
+                            continue
+                        st = calls.setdefault(tcd.get("index", 0), {"name": "", "args": []})
+                        fn = tcd.get("function") or {}
+                        if str(fn.get("name") or "").strip():
+                            st["name"] = str(fn["name"]).strip()
+                        if isinstance(fn.get("arguments"), str):
+                            st["args"].append(fn["arguments"])
+        tools = (check or {}).get("tools")
+        if calls and all(st["name"] or _infer_tool_name("".join(st["args"]), tools)
+                         for st in calls.values()):
+            return "content"
+    except Exception:                                            # noqa: BLE001
+        pass
+    return "empty"
+
+
 _STREAM_TOOLCALL_RE = re.compile(
     rb'"(?:tool_calls|function_call|tool_use|function_call_arguments)"'
     rb'(?!\s*:\s*(?:null\b|\[\s*\]|\{\s*\}|""))', re.I)
@@ -24524,7 +24692,7 @@ def _stream_starve_retry(clock, pid, model, payload, est, has_tools, tools, line
     if has_tools:
         it = tool_rescue.rescue_stream(it, tools, "lines" if lines else "frames")
     status, buffered = _peek_until_content(
-        it, clock.peek_timeout(model, est), content_grace=clock.content_grace(),
+        it, clock.peek_timeout(model, est, pid=pid), content_grace=clock.content_grace(),
         check=_peek_check(retry, has_tools))
     clock.note_peek(pid, model, status)
     if status == "starved":
@@ -24575,8 +24743,17 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                 # once: nothing below can improve on that, and every extra frame
                 # here is latency on the turns that are going well.
                 if _STREAM_TOOLCALL_RE.search(b):
-                    box["status"] = "content"
-                    return
+                    # ...but only a call that NAMES its tool. A nameless start
+                    # frame usually gets its name on the next delta; one that
+                    # never does is not work (codex cannot run it), so keep
+                    # reading until a name arrives or the stream ends (judged
+                    # below by _peeked_tools_usable). Without tool context
+                    # (`check`) the old commit-at-once rule stands.
+                    if _STREAM_TOOLNAME_RE.search(b) or not (check and check.get("tools")):
+                        box["status"] = "content"
+                        return
+                    box["nameless_tool"] = True
+                    continue
                 if _STREAM_CONTENT_RE.search(b):
                     # LIVE-VERIFIED 2026-08-07: the api.airforce backend behind
                     # g4f ships its ENTIRE error in ONE content delta, so a
@@ -24633,6 +24810,8 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                     # and /v1/messages paths -- and many iter_content ones):
                     # the trivial answers this chain most needs to keep.
                     box["status"] = (_judge(seen_content) if seen_content
+                                     else _nameless_verdict(buf, check)
+                                     if box.get("nameless_tool")
                                      else _empty_or_starved(buf, check))
                     return
                 if _STREAM_REASONING_RE.search(b):
@@ -24644,12 +24823,17 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
             if seen_content:
                 box["status"] = _judge(seen_content, complete=False)
             else:
-                box["status"] = "content" if saw_reasoning else "empty"
+                # A long nameless tool stream: commit, the translator names it
+                # from its arguments or leaves it out (_responses_stream).
+                box["status"] = ("content" if saw_reasoning or box.get("nameless_tool")
+                                 else "empty")
         except StopIteration:
             # The stream ENDED inside the peek window, so everything the model
             # was ever going to say is in hand -- the best possible moment to
             # judge it, and the shape a dead turn usually has.
             box["status"] = (_judge(seen_content) if seen_content
+                             else _nameless_verdict(buf, check)
+                             if box.get("nameless_tool")
                              else _empty_or_starved(buf, check))
         except Exception:
             box["status"] = "empty"     # read error/timeout -> unusable, fall through
@@ -25161,7 +25345,7 @@ def _permissive_candidates():
     for pid in _available_providers():
         try:
             for m in provider_free_models(pid) or []:
-                if _is_permissive(m) and not _is_model_dead(pid, m):
+                if _is_permissive(m) and not _is_model_skipped(pid, m):
                     out.append((_benchmark_score(pid, m), pid, m))
         except Exception:                                        # noqa: BLE001
             continue
@@ -26407,6 +26591,20 @@ def _mode_status(pid, model):
         return m, not _mode_allows(m, pid, model)
     except Exception:                                            # noqa: BLE001
         return None, False
+
+
+def _served_metadata(pid, model):
+    """{"free_llm_hub_provider", "free_llm_hub_model"}: the pair that REALLY
+    answered a /v1/responses request, for the Responses `metadata` map (a
+    string->string map every Responses client already accepts). `model` on
+    the response stays the id the client asked for -- codex keys its model
+    metadata on it -- so this is where the served pair travels in the body."""
+    out = {}
+    if pid:
+        out["free_llm_hub_provider"] = str(pid)
+    if model:
+        out["free_llm_hub_model"] = str(model)
+    return out
 
 
 def _routing_headers(pid, model, attempts, last_error=None):
@@ -28936,7 +29134,7 @@ def _chat_completions_uncached(body):
                 # Peek until REAL content: a 200 that streams no content must fall
                 # through to the next model, not be handed to the client as empty.
                 status, buffered = _peek_until_content(
-                    it, _clock.peek_timeout(hop_model, est),
+                    it, _clock.peek_timeout(hop_model, est, pid=hop_pid),
                     content_grace=_clock.content_grace(),
                     check=_peek_check(payload, has_tools))
                 _clock.note_peek(hop_pid, hop_model, status)
@@ -29056,6 +29254,13 @@ def _chat_completions_uncached(body):
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
             last_error = _classify_hop_error(status=resp.status_code)
+            if _resp_not_offered(resp):
+                # Not loaded this minute (see _NOT_OFFERED_RE): _upstream_chat
+                # already filed the short skip. No reliability failure, and
+                # never the chain's relayed hard error -- just the next hop.
+                errors[-1] = "%s: model not offered right now" % hop_pid
+                resp.close()
+                continue
             # EVERY non-2xx hop is a delivery failure for the reliability
             # ledger, not just 5xx. MEASURED 2026-08-07, chasing an
             # api.airforce error the user reported THREE times: g4f fronts ~42
@@ -29271,8 +29476,79 @@ def _responses_to_chat(body):
     return messages
 
 
-def _chat_to_responses(chat_json, model_label):
-    """Non-streaming OpenAI chat-completions JSON -> a Responses `response` object."""
+def _infer_tool_name(arguments, tool_defs):
+    """The one offered tool whose schema the call's ARGUMENTS fit, or None.
+
+    For a tool call whose name never arrived (see _responses_stream). Only an
+    UNAMBIGUOUS fit counts: the arguments parse to a JSON object, every key is
+    a declared property of the tool, every required property is present --
+    and exactly one offered tool passes. A tool that declares no properties
+    fits only an empty object. Anything else is None: guessing a name would
+    run the wrong tool with the user's arguments."""
+    try:
+        args = json.loads(_repair_tool_arguments(arguments or "") or "{}")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(args, dict):
+        return None
+    fits = []
+    for t in tool_defs or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        params = fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {}
+        props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+        required = [r for r in (params.get("required") or []) if isinstance(r, str)]
+        if not props:
+            if not args:
+                fits.append(name)
+            continue
+        if set(args) <= set(props) and set(required) <= set(args):
+            fits.append(name)
+    return fits[0] if len(fits) == 1 else None
+
+
+def _fix_nameless_tool_calls(chat_json, tool_defs):
+    """Give every nameless tool call in a chat-completions body the name its
+    arguments unambiguously imply (_infer_tool_name), and DROP the ones that
+    stay nameless -- a Responses client (codex) cannot run a call without a
+    name, and replays it in every later request. Mutates and returns the
+    body; a message left with no tool calls loses the key, so
+    _chat_json_is_empty sees an all-nameless reply as the empty 200 it is."""
+    try:
+        msg = ((chat_json.get("choices") or [{}])[0] or {}).get("message")
+        if not isinstance(msg, dict) or not msg.get("tool_calls"):
+            return chat_json
+        kept = []
+        for tc in msg.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            if not str(fn.get("name") or "").strip():
+                name = _infer_tool_name(fn.get("arguments"), tool_defs)
+                if not name:
+                    _log.warning("[nameless-tool-call] dropped a tool call with no name")
+                    continue
+                fn = dict(fn, name=name)
+                tc = dict(tc, function=fn)
+            kept.append(tc)
+        if kept:
+            msg["tool_calls"] = kept
+        else:
+            msg.pop("tool_calls", None)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return chat_json
+
+
+def _chat_to_responses(chat_json, model_label, tool_defs=None):
+    """Non-streaming OpenAI chat-completions JSON -> a Responses `response` object.
+    A tool call without a name is repaired from its arguments when that is
+    unambiguous, else left out (_fix_nameless_tool_calls) -- never emitted."""
+    _fix_nameless_tool_calls(chat_json, tool_defs)
     choice = (chat_json.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     output = []
@@ -29314,7 +29590,7 @@ def _chat_to_responses(chat_json, model_label):
 
 def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_est=0,
                       hop_pid=None, hop_model=None, prompt_text=None, tools_offered=False,
-                      last_prompt=None, answer_gate=None):
+                      last_prompt=None, answer_gate=None, tool_defs=None, served=None):
     """Consume an upstream OpenAI chat SSE stream and re-emit it as Responses API
     events for Codex. When `line_iter`/`first` are supplied (the first-byte peek
     already pulled the first line from this exact iterator) the pre-read line is
@@ -29336,6 +29612,11 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
     def _obj(status, output_items, usage=None):
         o = {"id": resp_id, "object": "response", "created_at": created,
              "status": status, "model": model_label, "output": output_items}
+        if served:
+            # Which provider/model REALLY answered. `model` stays the id the
+            # client asked for (codex keys its model metadata on it), so the
+            # served pair rides in the Responses API's own string map.
+            o["metadata"] = dict(served)
         if usage is not None:
             o["usage"] = usage
         return o
@@ -29351,6 +29632,38 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
     cut_short = [False]      # the request deadline cut this stream (_DEADLINE_CUT_LINE)
     if line_iter is None:
         line_iter = resp.iter_lines(decode_unicode=False)
+
+    def _announce_tool(st, repair=False):
+        """Emit output_item.added for a tool call ONCE it has a name, plus the
+        argument text buffered while it had none. MEASURED 2026-09-27: an
+        upstream streamed a tool call whose name never arrived; announcing it
+        on its first delta handed codex a function_call with name "", which
+        it replayed in every later request until a strict provider 400'd the
+        whole conversation. With `repair` (end of stream) a still-nameless
+        call is named from its arguments when unambiguous (_infer_tool_name),
+        else dropped -- never emitted unnamed."""
+        nonlocal next_index
+        if not st["name"] and repair:
+            st["name"] = _infer_tool_name("".join(st["args"]), tool_defs) or ""
+            if not st["name"]:
+                _log.warning("[nameless-tool-call] %s/%s: dropped a streamed tool call "
+                             "that never named its tool", hop_pid, hop_model)
+                return
+        if not st["name"] or st["out_index"] is not None:
+            return
+        st["out_index"] = next_index
+        next_index += 1
+        yield _sse_event("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": st["out_index"],
+            "item": {"type": "function_call", "id": st["item_id"],
+                     "call_id": st["call_id"], "name": st["name"],
+                     "arguments": "", "status": "in_progress"}})
+        if st["args"]:
+            yield _sse_event("response.function_call_arguments.delta", {
+                "type": "response.function_call_arguments.delta",
+                "item_id": st["item_id"], "output_index": st["out_index"],
+                "delta": "".join(st["args"])})
 
     def _finalize_open_items():
         """Emit done-events for whatever text/tool item is still in_progress and
@@ -29379,7 +29692,15 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                 "output_index": text_index, "item": item})
             done_items.append((text_index, item))
 
-        for _oai_idx, st in sorted(tools.items(), key=lambda kv: kv[1]["out_index"]):
+        # A call whose name NEVER arrived: name it from its arguments when that
+        # is unambiguous, else leave it out entirely. Its output_item.added was
+        # held back (see _announce_tool), so nothing about it reached the client.
+        for st in sorted(tools.values(), key=lambda s: s["seq"]):
+            if st["out_index"] is None:
+                yield from _announce_tool(st, repair=True)
+        for _oai_idx, st in sorted(((k, s) for k, s in tools.items()
+                                    if s["out_index"] is not None),
+                                   key=lambda kv: kv[1]["out_index"]):
             # Repair before emitting so we never hand the CLI a doubled-JSON tool_call
             # that it will replay and 503 on every later turn (see _repair_tool_arguments),
             # then strip a git-diff header block apply_patch parsers reject even though
@@ -29488,38 +29809,44 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                 fn = tcd.get("function") or {}
                 st = tools.get(oai_idx)
                 if st is None:
-                    st = {"out_index": next_index,
+                    # out_index is assigned when the call is ANNOUNCED, which
+                    # waits for its name (see _announce_tool).
+                    st = {"out_index": None, "seq": len(tools),
                           "item_id": "fc_" + uuid.uuid4().hex,
                           "call_id": tcd.get("id") or ("call_" + uuid.uuid4().hex[:24]),
-                          "name": fn.get("name") or "", "args": []}
-                    next_index += 1
+                          "name": str(fn.get("name") or "").strip(), "args": []}
                     tools[oai_idx] = st
-                    yield _sse_event("response.output_item.added", {
-                        "type": "response.output_item.added",
-                        "output_index": st["out_index"],
-                        "item": {"type": "function_call", "id": st["item_id"],
-                                 "call_id": st["call_id"], "name": st["name"],
-                                 "arguments": "", "status": "in_progress"}})
                 else:
                     if tcd.get("id"):
                         st["call_id"] = tcd["id"]
-                    if fn.get("name"):
-                        st["name"] = fn["name"]
+                    if str(fn.get("name") or "").strip() and not st["name"]:
+                        st["name"] = str(fn["name"]).strip()
                 args = fn.get("arguments")
                 if args is not None and not isinstance(args, str):
                     args = str(args)  # tool-call args must be str for the join()
                 if args:
                     st["args"].append(args)
+                if st["out_index"] is None:
+                    # Announces (with the buffered args) once a name exists.
+                    yield from _announce_tool(st)
+                elif args:
                     yield _sse_event("response.function_call_arguments.delta", {
                         "type": "response.function_call_arguments.delta",
                         "item_id": st["item_id"], "output_index": st["out_index"],
                         "delta": args})
 
+        # Name what never got one, BEFORE the outcome is filed: a stream whose
+        # only "tool call" stays nameless delivered nothing usable, and must
+        # be judged exactly like an empty one.
+        for st in tools.values():
+            if not st["name"]:
+                st["name"] = _infer_tool_name("".join(st["args"]), tool_defs) or ""
         if not judged and not getattr(answer_gate, "cut", False):
             # The stream ENDED: file the outcome it never used to (see
             # _record_stream_outcome). The client already has the bytes.
             _record_stream_outcome(hop_pid, hop_model, "".join(text_buf),
-                                   tool_calls=bool(tools), finish_reason=stream_fin,
+                                   tool_calls=any(st["name"] for st in tools.values()),
+                                   finish_reason=stream_fin,
                                    prompt_text=prompt_text, tools_offered=tools_offered,
                                    last_prompt=last_prompt)
         yield from _finalize_open_items()
@@ -29816,8 +30143,12 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 synth = json.dumps({"choices": [{"delta": delta}]}).encode("utf-8")
                 line_iter = iter([b"data: " + synth, b"data: [DONE]"])
                 return Response(stream_with_context(
-                    _responses_stream(resp, model_label, line_iter=line_iter, prompt_est=est)),
-                    mimetype="text/event-stream", headers=_SSE_HEADERS)
+                    _responses_stream(resp, model_label, line_iter=line_iter, prompt_est=est,
+                                      tool_defs=tools,
+                                      served=_served_metadata(hop_pid, hop_model))),
+                    mimetype="text/event-stream",
+                    headers=dict(_SSE_HEADERS, **_routing_headers(
+                        hop_pid, hop_model, len(_tried), last_error)))
             if stream:
                 # #4: peek the first line BEFORE committing the 200 SSE stream so a
                 # hung/slow provider falls through to the next hop instead of stalling.
@@ -29829,7 +30160,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 # (role delta + [DONE], no content) must fall through to the next
                 # model instead of being streamed to codex as a dead-end answer.
                 status, buffered = _peek_until_content(
-                    line_it, _clock.peek_timeout(hop_model, est),
+                    line_it, _clock.peek_timeout(hop_model, est, pid=hop_pid),
                     content_grace=_clock.content_grace(),
                     check=_peek_check(payload, has_tools))
                 _clock.note_peek(hop_pid, hop_model, status)
@@ -29861,8 +30192,12 @@ def v1_responses(_retry_pass=False, _hedged=False):
                                       hop_pid=hop_pid, hop_model=hop_model,
                                       prompt_text=_prompt_text_for_check(payload),
                                       last_prompt=_last_user_text_for_check(payload),
-                                      tools_offered=has_tools, answer_gate=gated)),
-                    mimetype="text/event-stream", headers=_SSE_HEADERS)
+                                      tools_offered=has_tools, answer_gate=gated,
+                                      tool_defs=tools,
+                                      served=_served_metadata(hop_pid, hop_model))),
+                    mimetype="text/event-stream",
+                    headers=dict(_SSE_HEADERS, **_routing_headers(
+                        hop_pid, hop_model, len(_tried), last_error)))
             try:
                 data = resp.json()
             except (ValueError, requests.RequestException):
@@ -29882,6 +30217,10 @@ def v1_responses(_retry_pass=False, _hedged=False):
                     last_error = "empty" if _sk == "empty" else "starved"
                     continue
                 data, payload = data2, payload2
+            # A nameless tool call is named from its arguments when that is
+            # unambiguous, else removed -- so an all-nameless reply is the
+            # empty 200 below (next hop), never a call codex cannot run.
+            _fix_nameless_tool_calls(data, tools)
             if _chat_json_nonanswer(data, has_tools, tools):
                 # A 200 whose content IS the relay backend's error page (see
                 # _chat_json_nonanswer). Falls through to the next hop exactly
@@ -29907,10 +30246,20 @@ def v1_responses(_retry_pass=False, _hedged=False):
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
             _fit_visible_to_caller(data, payload)
-            return jsonify(_chat_to_responses(data, model_label)), 200
+            out = _chat_to_responses(data, model_label, tool_defs=tools)
+            out["metadata"] = _served_metadata(hop_pid, hop_model)
+            return (jsonify(out), 200,
+                    _routing_headers(hop_pid, hop_model, len(_tried), last_error))
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
             last_error = _classify_hop_error(status=resp.status_code)
+            if _resp_not_offered(resp):
+                # Not loaded this minute (see _NOT_OFFERED_RE): _upstream_chat
+                # already filed the short skip. No reliability failure, and
+                # never the chain's relayed hard error -- just the next hop.
+                errors[-1] = "%s: model not offered right now" % hop_pid
+                resp.close()
+                continue
             # EVERY non-2xx hop is a delivery failure for the reliability
             # ledger, not just 5xx. MEASURED 2026-08-07, chasing an
             # api.airforce error the user reported THREE times: g4f fronts ~42
@@ -30680,7 +31029,7 @@ def v1_messages():
                 # Peek until REAL content so an empty 200 falls through to the next
                 # model instead of being handed to the client as a dead-end answer.
                 status, buffered = _peek_until_content(
-                    line_it, _clock.peek_timeout(hop_model, est),
+                    line_it, _clock.peek_timeout(hop_model, est, pid=hop_pid),
                     content_grace=_clock.content_grace(),
                     check=_peek_check(payload, has_tools))
                 _clock.note_peek(hop_pid, hop_model, status)
@@ -30770,6 +31119,13 @@ def v1_messages():
         try:
             errors.append("%s: HTTP %d" % (hop_pid, resp.status_code))
             last_error = _classify_hop_error(status=resp.status_code)
+            if _resp_not_offered(resp):
+                # Not loaded this minute (see _NOT_OFFERED_RE): _upstream_chat
+                # already filed the short skip. No reliability failure, and
+                # never the chain's relayed hard error -- just the next hop.
+                errors[-1] = "%s: model not offered right now" % hop_pid
+                resp.close()
+                continue
             # EVERY non-2xx hop is a delivery failure for the reliability
             # ledger, not just 5xx. MEASURED 2026-08-07, chasing an
             # api.airforce error the user reported THREE times: g4f fronts ~42

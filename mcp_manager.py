@@ -93,7 +93,10 @@ def _config_path(cli, isolated=False):
         if cli not in _ISOLATED_CLIS:
             return None
         d = _isolated_dir(cli)
-        if cli in ("kimi", "codex"):
+        if cli == "kimi":
+            # Kimi Code run with KIMI_CODE_HOME=d reads d/mcp.json.
+            return os.path.join(d, "mcp.json")
+        if cli == "codex":
             return os.path.join(d, "config.toml")
         if cli == "claude":
             return os.path.join(d, ".claude.json")
@@ -101,7 +104,9 @@ def _config_path(cli, isolated=False):
             return os.path.join(d, "opencode", "opencode.json")
         return None
     if cli == "kimi":
-        return os.path.join(_home(), ".kimi", "config.toml")
+        if _kimi_uses_mcp_json():
+            return os.path.join(_kimi_code_home(), "mcp.json")
+        return _kimi_legacy_toml()
     if cli == "codex":
         return os.path.join(_home(), ".codex", "config.toml")
     if cli == "claude":
@@ -143,10 +148,69 @@ def _config_path(cli, isolated=False):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Kimi: two generations, two MCP files.
+#
+# MEASURED 2026-09-27 on kimi-code 0.39.1 (npm @moonshot-ai/kimi-code): the
+# `kimi` on PATH is the Node Kimi Code. Its GlobalMcpConfigStore reads and
+# writes <KIMI_CODE_HOME or ~/.kimi-code>/mcp.json as
+#   {"mcpServers": {"<name>": {"transport": "http"|"sse"|"stdio", ...}}}
+# (a zod discriminated union on "transport"; its own writer persists the
+# field, a missing one is inferred from url/command). It never reads the
+# [mcp_servers.*] tables of ~/.kimi/config.toml that this module used to write
+# -- those belong to the legacy Python kimi-cli. So:
+#   * the ACTIVE kimi file is mcp.json whenever Kimi Code is installed (its
+#     home exists / KIMI_CODE_HOME is set) or no legacy config exists either;
+#     a machine with ONLY the legacy ~/.kimi/config.toml keeps TOML;
+#   * listing also reads the legacy TOML file, and removing a name removes it
+#     from both, so entries written by an older hub stay visible/removable.
+
+
+def _kimi_code_home():
+    """KIMI_CODE_HOME, else <home>/.kimi-code -- Kimi Code's own resolution.
+    KIMI_CODE_HOME is ignored under an MCP_MANAGER_HOME override (tests) so a
+    developer's real KIMI_CODE_HOME can never be written from a test run."""
+    env = os.environ.get("KIMI_CODE_HOME")
+    if env and env.strip() and not os.environ.get("MCP_MANAGER_HOME"):
+        return os.path.abspath(os.path.expanduser(env.strip()))
+    return os.path.join(_home(), ".kimi-code")
+
+
+def _kimi_legacy_toml():
+    return os.path.join(_home(), ".kimi", "config.toml")
+
+
+def _kimi_uses_mcp_json():
+    """True when the installed kimi is Kimi Code (reads mcp.json). Mirrors
+    app._p_kimi(): only a machine that has the legacy config and no Kimi Code
+    home at all keeps the legacy TOML file as the active one."""
+    if os.path.isdir(_kimi_code_home()):
+        return True
+    return not os.path.isfile(_kimi_legacy_toml())
+
+
+def _legacy_paths(cli, isolated=False):
+    """Older files an earlier hub wrote `cli`'s MCP entries to, which the
+    active path no longer is. Read by list, cleaned by remove; never written."""
+    if cli != "kimi":
+        return []
+    active = _config_path(cli, isolated)
+    old = (os.path.join(_isolated_dir(cli), "config.toml") if isolated
+           else _kimi_legacy_toml())
+    if active and os.path.normcase(os.path.abspath(old)) == os.path.normcase(os.path.abspath(active)):
+        return []
+    return [old]
+
+
 # Which top-level container key holds MCP servers in each file, and whether
-# the file is TOML or JSON.
-def _format(cli):
-    if cli in ("kimi", "codex"):
+# the file is TOML or JSON. Kimi depends on WHICH file (see above), so the
+# path decides; without one the active path is assumed.
+def _format(cli, path=None):
+    if cli == "kimi":
+        if path is None:
+            path = _config_path(cli)
+        return "toml" if str(path or "").lower().endswith(".toml") else "json"
+    if cli == "codex":
         return "toml"
     if cli == "hermes":
         return "yaml"
@@ -410,7 +474,7 @@ def _yaml_add_server(text, name, spec):
 
 
 def _json_container_key(cli):
-    if cli == "claude":
+    if cli in ("claude", "kimi"):       # kimi = Kimi Code's mcp.json
         return "mcpServers"
     if cli == "openclaw":
         return "mcp.servers"        # NESTED: {"mcp": {"servers": {...}}}
@@ -473,6 +537,18 @@ class UnsupportedShape(Exception):
 
 def _json_entry_shape(cli, spec):
     """The CLI's documented config shape for one server."""
+    if cli == "kimi":
+        # Kimi Code's mcpServerConfigSchema: discriminated on "transport"
+        # ("http" = streamable HTTP, which the hub's /mcp serves; "sse";
+        # "stdio"). Written explicitly, exactly as Kimi's own store persists it.
+        if spec.get("url"):
+            return {"transport": "http", "url": spec["url"]}
+        entry = {"transport": "stdio", "command": spec["command"]}
+        if spec.get("args"):
+            entry["args"] = list(spec["args"])
+        if spec.get("env"):
+            entry["env"] = dict(spec["env"])
+        return entry
     if spec.get("url"):
         if cli == "claude":
             return {"type": "http", "url": spec["url"]}
@@ -601,6 +677,22 @@ def supported_clis():
     return list(_SUPPORTED)
 
 
+def _read_servers(cli, path):
+    """-> (servers_dict, error_or_None) for one config file of `cli`."""
+    try:
+        text = _read_text(path)
+    except OSError as exc:
+        return {}, "unreadable: %s" % exc
+    fmt = _format(cli, path)
+    if fmt == "toml":
+        servers, err = _toml_servers(text)
+    elif fmt == "yaml":
+        servers, err = _yaml_servers(text)
+    else:
+        _doc, servers, err = _json_servers(cli, text)
+    return (dict(servers) if not err else {}), err
+
+
 def list_servers(isolated=False):
     """-> {cli_id: [normalised entries], "errors": [...]}. A config that is
     missing is simply an empty list; one that cannot be read or parsed is an
@@ -620,22 +712,23 @@ def list_servers(isolated=False):
             # and truncate the listing at the first such cli.
             out[cli] = []
             continue
-        try:
-            text = _read_text(path)
-        except OSError as exc:
-            errors.append({"cli": cli, "path": path, "error": "unreadable: %s" % exc})
-            out[cli] = []
-            continue
-        if _format(cli) == "toml":
-            servers, err = _toml_servers(text)
-        elif _format(cli) == "yaml":
-            servers, err = _yaml_servers(text)
-        else:
-            _doc, servers, err = _json_servers(cli, text)
+        servers, err = _read_servers(cli, path)
         if err:
             errors.append({"cli": cli, "path": path, "error": err})
             out[cli] = []
             continue
+        # Entries an older hub wrote to a file this CLI version no longer
+        # reads (kimi's legacy config.toml) stay visible, so they can be
+        # removed; the active file wins a name collision.
+        for old in _legacy_paths(cli, isolated):
+            if not os.path.isfile(old):
+                continue
+            legacy, lerr = _read_servers(cli, old)
+            if lerr:
+                errors.append({"cli": cli, "path": old, "error": lerr})
+                continue
+            for name, entry in legacy.items():
+                servers.setdefault(name, entry)
         out[cli] = [_normalize_entry(cli, name, entry)
                     for name, entry in sorted(servers.items())]
     out["errors"] = errors
@@ -689,7 +782,7 @@ def add_server(cli, name, spec, isolated=False):
         except OSError as exc:
             return False, "could not read %s: %s" % (path, exc)
 
-        if _format(cli) == "toml":
+        if _format(cli, path) == "toml":
             body = text or ""
             servers, perr = _toml_servers(body)
             if perr:
@@ -705,7 +798,7 @@ def add_server(cli, name, spec, isolated=False):
             new_text = body.rstrip("\n")
             new_text = (new_text + "\n\n" if new_text else "") + block + "\n"
             _write_text(path, new_text)
-        elif _format(cli) == "yaml":
+        elif _format(cli, path) == "yaml":
             servers, perr = _yaml_servers(text)
             if perr:
                 return False, "refusing to edit unparseable config %s: %s" % (path, perr)
@@ -738,6 +831,56 @@ def add_server(cli, name, spec, isolated=False):
         return False, "unexpected error: %s" % exc
 
 
+def _remove_from(cli, path, name):
+    """Remove `name` from ONE config file. -> (ok, msg); msg 'not found'
+    when the file does not hold it."""
+    try:
+        text = _read_text(path)
+    except OSError as exc:
+        return False, "could not read %s: %s" % (path, exc)
+
+    if _format(cli, path) == "toml":
+        body = text or ""
+        servers, perr = _toml_servers(body)
+        if perr:
+            return False, "refusing to edit unparseable config %s: %s" % (path, perr)
+        if name not in servers:
+            return False, "not found"
+        guard = _prepare_write(path)
+        if guard:
+            return False, guard
+        new_text, _ = _remove_toml_server(body, name)
+        _write_text(path, new_text)
+    elif _format(cli, path) == "yaml":
+        # hermes: this branch was missing, so a yaml config fell into the
+        # JSON parser and every hermes remove was refused as "invalid JSON".
+        servers, perr = _yaml_servers(text)
+        if perr:
+            return False, "refusing to edit unparseable config %s: %s" % (path, perr)
+        if name not in servers:
+            return False, "not found"
+        block, start, end = _yaml_block(text)
+        if block is None:
+            return False, "not found"
+        guard = _prepare_write(path)
+        if guard:
+            return False, guard
+        _write_text(path, text[:start] + _yaml_remove_entry(block, name) + text[end:])
+    else:
+        doc, servers, perr = _json_servers(cli, text)
+        if perr:
+            return False, "refusing to edit unparseable config %s: %s" % (path, perr)
+        if name not in servers:
+            return False, "not found"
+        guard = _prepare_write(path)
+        if guard:
+            return False, guard
+        del servers[name]
+        doc = _json_set_servers(cli, doc, servers)
+        _write_text(path, json.dumps(doc, indent=2) + "\n")
+    return True, "removed"
+
+
 def remove_server(cli, name, isolated=False):
     """Remove one MCP server entry from `cli`'s config. -> (ok, msg).
     Removing a name that is not there is (False, 'not found')."""
@@ -755,35 +898,18 @@ def remove_server(cli, name, isolated=False):
             # TypeError as "unexpected error", which reads like a real bug.
             return False, ("%s has no isolated copy (the hub only installs "
                            "private copies of %s)" % (cli, ", ".join(_ISOLATED_CLIS)))
-        try:
-            text = _read_text(path)
-        except OSError as exc:
-            return False, "could not read %s: %s" % (path, exc)
-
-        if _format(cli) == "toml":
-            body = text or ""
-            servers, perr = _toml_servers(body)
-            if perr:
-                return False, "refusing to edit unparseable config %s: %s" % (path, perr)
-            if name not in servers:
-                return False, "not found"
-            guard = _prepare_write(path)
-            if guard:
-                return False, guard
-            new_text, _ = _remove_toml_server(body, name)
-            _write_text(path, new_text)
-        else:
-            doc, servers, perr = _json_servers(cli, text)
-            if perr:
-                return False, "refusing to edit unparseable config %s: %s" % (path, perr)
-            if name not in servers:
-                return False, "not found"
-            guard = _prepare_write(path)
-            if guard:
-                return False, guard
-            del servers[name]
-            doc = _json_set_servers(cli, doc, servers)
-            _write_text(path, json.dumps(doc, indent=2) + "\n")
-        return True, "removed %r from %s (%s)" % (name, cli, path)
+        # The active file plus any legacy file an older hub wrote the entry
+        # to (kimi's config.toml): the name is removed wherever it is.
+        removed_from = []
+        for target in [path] + [p for p in _legacy_paths(cli, isolated)
+                                if os.path.isfile(p)]:
+            ok, msg = _remove_from(cli, target, name)
+            if ok:
+                removed_from.append(target)
+            elif msg != "not found":
+                return False, msg
+        if not removed_from:
+            return False, "not found"
+        return True, "removed %r from %s (%s)" % (name, cli, ", ".join(removed_from))
     except Exception as exc:  # never-raising contract
         return False, "unexpected error: %s" % exc
