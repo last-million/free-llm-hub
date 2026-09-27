@@ -26785,6 +26785,15 @@ _TEMPLATE_OPEN_RE = re.compile(r"<\|[\w.-]*\|?")
 # itself is unchanged).
 _TAIL_EVERY = 64
 _TAIL_TRIGGER_CHARS = frozenset("<>:|")
+# A BARE-VALUE ask ("Reply with only the number.", answer_check.brevity_ask):
+# the whole answer is a few chars, so the hold does not end on the 2.5 s
+# clock -- only at the finish, _HOLD_CHARS, or this much longer bound for a
+# slow model. MEASURED LIVE (Claude Code /v1/messages stream, model max):
+# "4349âmara=METADATA:8;Note: TOKEN count=298121; REF:5" reached the client
+# whole. Until the text passes _HOLD_CHARS every later delta is judged at
+# once (not throttled), head rules included (inspect_tail's last_prompt), so
+# a clock-released "4349" cannot grow junk unseen.
+_BRIEF_HOLD_SECONDS = 8.0
 _SSE_FRAME_END_RE = re.compile(rb"\r?\n\r?\n")
 
 
@@ -26809,7 +26818,10 @@ class _StreamAnswerGate:
         self._last_prompt = last_prompt
         self._tools = bool(tools_offered)
         self._hold_chars = _HOLD_CHARS if hold_chars is None else hold_chars
-        self._hold_seconds = _HOLD_SECONDS if hold_seconds is None else hold_seconds
+        self._brief = answer_check.brevity_ask(last_prompt)
+        if hold_seconds is None:
+            hold_seconds = _BRIEF_HOLD_SECONDS if self._brief else _HOLD_SECONDS
+        self._hold_seconds = hold_seconds
         # Early release (reads_as_answer): off when a caller pins its own hold
         # window (tests measuring the window itself), or via early_chars=None.
         if early_chars == "default":
@@ -27024,14 +27036,17 @@ class _StreamAnswerGate:
             return False
 
     def _judge_tail(self, t=""):
-        if self._len - self._judged < _TAIL_EVERY \
+        short_brief = self._brief and self._len <= self._hold_chars
+        if not short_brief and self._len - self._judged < _TAIL_EVERY \
                 and not _TAIL_TRIGGER_CHARS.intersection(t):
             return None
         self._judged = self._len
         try:
             c = answer_check.inspect_tail(self._text, prompt_text=self._prompt,
                                           tools_offered=self._tools,
-                                          state=self._tail_state)
+                                          state=self._tail_state,
+                                          last_prompt=self._last_prompt
+                                          if self._brief else None)
         except Exception:                                        # noqa: BLE001
             return None
         if c is None:
