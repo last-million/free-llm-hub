@@ -18441,9 +18441,40 @@ def _p_hermes():
     return os.path.join(_home(), ".hermes", "config.yaml")
 
 
-def _p_kimi():
-    """Kimi Code's config.toml (~/.kimi/config.toml on every platform)."""
+def _p_kimi_legacy():
+    """The Python kimi-cli's config (~/.kimi/config.toml): what `kimi` was until
+    the Node rewrite, still installed next to it as kimi-cli / kimi-legacy."""
     return os.path.join(_home(), ".kimi", "config.toml")
+
+
+def _p_kimi():
+    """The config the CURRENT `kimi` reads: Kimi Code (npm @moonshot-ai/kimi-code)
+    resolves KIMI_CODE_HOME, else ~/.kimi-code -- NOT ~/.kimi.
+
+    MEASURED 2026-09-27 (kimi-code 0.39.1): Connect wrote ~/.kimi/config.toml,
+    `kimi -p` in that home answered "No model configured", and the same file
+    under KIMI_CODE_HOME passed `kimi doctor` and ran. Only a machine that has
+    the legacy config and no ~/.kimi-code at all keeps ~/.kimi as primary."""
+    env = os.environ.get("KIMI_CODE_HOME")
+    if env and env.strip():
+        return os.path.join(env, "config.toml")
+    new = os.path.join(_home(), ".kimi-code", "config.toml")
+    legacy = _p_kimi_legacy()
+    if os.path.isdir(os.path.dirname(new)) or not os.path.isfile(legacy):
+        return new
+    return legacy
+
+
+def _kimi_config_paths():
+    """Every Kimi config Connect wires / Disconnect reverts: the primary plus the
+    legacy kimi-cli file when it exists (both binaries are often installed, and
+    whichever the user runs must see the hub). Primary first, no duplicates."""
+    out = [_p_kimi()]
+    legacy = _p_kimi_legacy()
+    if os.path.isfile(legacy) and \
+            os.path.normcase(os.path.abspath(legacy)) != os.path.normcase(os.path.abspath(out[0])):
+        out.append(legacy)
+    return out
 
 
 # The CLI registry: known local AI CLIs and how each connects to a custom
@@ -18696,7 +18727,7 @@ CLI_REGISTRY = [
         "name": "Kimi Code",
         "kind": "openai",
         "bins": ["kimi"],
-        "config_paths": [_p_kimi()],
+        "config_paths": _kimi_config_paths(),
         # NO env_check: Kimi Code wires custom providers ONLY through
         # ~/.kimi/config.toml ([providers.*] tables). Its documented credential
         # priority is config api_key > [providers.*.env] sub-table — there is NO
@@ -18711,13 +18742,15 @@ CLI_REGISTRY = [
         "write_path": _p_kimi(),
         "default_method": "config",
         "hint": ("Installed. Connect writes a [providers.free-hub] block + an 'auto' model "
-                 "alias into ~/.kimi/config.toml and switches default_model to it; "
+                 "alias into ~/.kimi-code/config.toml (plus the legacy ~/.kimi/config.toml "
+                 "when kimi-cli is also set up) and switches default_model to it; "
                  "Disconnect strips them and restores your previous default_model. "
                  "Restart kimi afterwards."),
         "manual_note": (
             "One click does all of this — Connect writes it for you (and Disconnect reverses it, "
             "restoring your previous default_model); the manual steps below are only a fallback.\n\n"
-            "Kimi Code is wired through ~/.kimi/config.toml ([providers.*] tables), NOT shell "
+            "Kimi Code is wired through ~/.kimi-code/config.toml (KIMI_CODE_HOME overrides it; "
+            "the legacy Python kimi-cli reads ~/.kimi/config.toml) ([providers.*] tables), NOT shell "
             "environment variables. Per the official docs, api_key is a REQUIRED field — startup "
             "fails without one — so give it a placeholder; the localhost hub accepts any bearer "
             "when no local API key is set (if you DID set a hub key, paste that instead). Add:\n"
@@ -19492,6 +19525,9 @@ _PI_MODELS = [
     ("best", "Best (strongest models only)"),
     ("swarm", "Swarm (several models, best answer wins)"),
 ]
+# The tier ids every config-file CLI lists (kimi aliases, qwen modelProviders,
+# openclaw models) -- Pi's list, one definition.
+_HUB_TIER_IDS = tuple(m[0] for m in _PI_MODELS)
 # How much context the hub tells a CLI it has, and how much of that to keep
 # free for the reply. ONE number, because a CLI compacts (or refuses) against
 # whatever it was told: codex has had it since July (model_context_window),
@@ -19564,22 +19600,81 @@ def _autofix_pi(entry, key, base_root, base_v1, model):
     }
 
 
+def _p_aider_metadata():
+    """Aider's model metadata file (context window / cost per model id), read
+    from the home directory, the git root or the cwd."""
+    return os.path.join(_home(), ".aider.model.metadata.json")
+
+
+def _aider_hub_metadata():
+    """litellm-shaped metadata for every hub tier as aider names it
+    ("openai/<tier>"): the declared window and a zero cost, so aider neither
+    warns "Unknown context window size" nor invents a bill."""
+    return {"openai/" + mid: {
+        "max_tokens": HUB_MAX_TOKENS,
+        "max_input_tokens": agentic_chat.declared_window(mid),
+        "max_output_tokens": HUB_MAX_TOKENS,
+        "input_cost_per_token": 0.0, "output_cost_per_token": 0.0,
+        "litellm_provider": "openai", "mode": "chat",
+    } for mid in _HUB_TIER_IDS}
+
+
 def _autofix_aider(entry, key, base_root, base_v1, model):
     path = _p_aider()
-    updates = {"openai-api-base": base_v1, "openai-api-key": key, "model": "openai/" + model}
+    # "openai/auto", never "openai/" + the `model` argument: that argument is
+    # ONE concrete free model, and pinning it skipped the hub's orchestration
+    # (and died with that provider) -- the same bug opencode had.
+    updates = {"openai-api-base": base_v1, "openai-api-key": key, "model": "openai/auto"}
+    mpath = _p_aider_metadata()
+    mdata, mok = _read_json_object(mpath)
+    if not mok and os.path.isfile(mpath) and os.path.getsize(mpath) > 0:
+        return {"ok": False, "reason": "existing %s is not a JSON object; not overwriting."
+                % _short(mpath)}
     backup = _backup_once(path)
     abort = _abort_if_backup_failed(path, backup)  # scalar-replace: never overwrite an un-backed-up conf
     if abort:
         return abort
+    mbackup = _backup_once(mpath)
+    abort = _abort_if_backup_failed(mpath, mbackup)
+    if abort:
+        return abort
     _cli_write_text(path, _merge_flat_yaml(path, updates))
+    meta = dict(mdata or {})
+    meta.update(_aider_hub_metadata())
+    _cli_write_text(mpath, json.dumps(meta, indent=2) + "\n")
     return {
         "ok": True,
         "wrote_path": path,
+        "also_wrote": [mpath],
         "backup_path": backup,
         "applied": {"openai-api-base": base_v1, "openai-api-key": _mask_key(key),
-                    "model": "openai/" + model},
-        "restart_hint": "Re-run aider in a new session; it reads ~/.aider.conf.yml on startup.",
+                    "model": "openai/auto"},
+        "restart_hint": ("Re-run aider in a new session; it reads ~/.aider.conf.yml on startup "
+                         "(--model openai/best or openai/swarm for the other tiers)."),
     }
+
+
+def _aider_revert_metadata():
+    """Drop the hub tiers from ~/.aider.model.metadata.json; the file goes when
+    Connect created it and nothing else is left. Returns changed."""
+    mpath = _p_aider_metadata()
+    data, ok = _read_json_object(mpath)
+    changed = False
+    if ok:
+        for k in _aider_hub_metadata():
+            if k in data:
+                data.pop(k)
+                changed = True
+        if changed:
+            if not data and not os.path.exists(mpath + ".freehub-bak"):
+                try:
+                    os.remove(mpath)
+                except OSError:
+                    _cli_write_text(mpath, "{}\n")
+            else:
+                _cli_write_text(mpath, json.dumps(data, indent=2) + "\n")
+    _discard_backup(mpath)
+    return changed
 
 
 def _autofix_opencode(entry, key, base_root, base_v1, model):
@@ -19632,8 +19727,10 @@ def _autofix_opencode(entry, key, base_root, base_v1, model):
         "ok": True,
         "wrote_path": path,
         "backup_path": backup,
+        # What was WRITTEN (data["model"]), not the unused `model` argument --
+        # the card used to report a pinned model the file never contained.
         "applied": {"provider": "free-llm-hub", "baseURL": base_v1, "apiKey": _mask_key(key),
-                    "model": "free-llm-hub/" + model},
+                    "model": data["model"]},
         "restart_hint": ("Restart opencode. If it complains about the provider, run its install/auth "
                          "step for @ai-sdk/openai-compatible (schema varies by version)."),
     }
@@ -19650,15 +19747,146 @@ def _autofix_qwen(entry, key, base_root, base_v1, model):
     abort = _abort_if_backup_failed(path, backup)  # scalar-replace: never overwrite an un-backed-up .env
     if abort:
         return abort
+    spath = os.path.join(os.path.dirname(path), "settings.json")
+    sdata, sok = _read_json_object(spath)
+    if not sok and os.path.isfile(spath) and os.path.getsize(spath) > 0:
+        return {"ok": False, "reason": ("existing %s is not valid JSON (comments aren't "
+                "auto-merged) — configure it by hand, then retry." % _short(spath))}
+    sbackup = _backup_once(spath)
+    abort = _abort_if_backup_failed(spath, sbackup)
+    if abort:
+        return abort
     _cli_write_text(path, _merge_dotenv(path, updates))
+    _cli_write_text(spath, json.dumps(_qwen_apply_settings(sdata, base_v1), indent=2,
+                                      ensure_ascii=False) + "\n")
     return {
         "ok": True,
         "wrote_path": path,
+        "also_wrote": [spath],
         "backup_path": backup,
         "applied": {"OPENAI_API_BASE": base_v1, "OPENAI_BASE_URL": base_v1,
-                    "OPENAI_API_KEY": _mask_key(key), "OPENAI_MODEL": "auto"},
+                    "OPENAI_API_KEY": _mask_key(key), "OPENAI_MODEL": "auto",
+                    "models": list(_HUB_TIER_IDS)},
         "restart_hint": "Re-run `qwen` in a new terminal; it loads ~/.qwen/.env on startup.",
     }
+
+
+def _qwen_hub_providers(base_v1):
+    """Qwen Code's documented modelProviders.openai entries, one per hub tier,
+    each with its window (generationConfig.contextWindowSize) so /model lists
+    every tier and qwen compacts against the right size. The key comes from
+    OPENAI_API_KEY, which the sibling .env sets."""
+    return [{"id": mid, "name": "%s (Calvoun hub)" % label.split(" (")[0],
+             "description": label, "baseUrl": base_v1, "envKey": "OPENAI_API_KEY",
+             "generationConfig": {"contextWindowSize": agentic_chat.declared_window(mid)}}
+            for mid, label in _PI_MODELS]
+
+
+def _qwen_is_hub_provider(p):
+    return isinstance(p, dict) and _points_at_hub(p.get("baseUrl"))
+
+
+def _qwen_apply_settings(data, base_v1):
+    """Pure transform of ~/.qwen/settings.json (the documented one-file setup):
+    hub entries in modelProviders.openai (the user's own entries kept, ours
+    rewritten clean), security.auth.selectedType = "openai" (otherwise a fresh
+    qwen opens its auth dialog / OAuth instead of using the env) and the
+    default model "auto"."""
+    data = dict(data or {})
+    mp = data.get("modelProviders")
+    mp = dict(mp) if isinstance(mp, dict) else {}
+    own = [p for p in (mp.get("openai") or []) if not _qwen_is_hub_provider(p)] \
+        if isinstance(mp.get("openai"), list) else []
+    mp["openai"] = own + _qwen_hub_providers(base_v1)
+    data["modelProviders"] = mp
+    sec = data.get("security")
+    sec = dict(sec) if isinstance(sec, dict) else {}
+    auth = sec.get("auth")
+    auth = dict(auth) if isinstance(auth, dict) else {}
+    auth["selectedType"] = "openai"
+    sec["auth"] = auth
+    data["security"] = sec
+    model = data.get("model")
+    if isinstance(model, str):
+        data["model"] = "auto"
+    else:
+        model = dict(model) if isinstance(model, dict) else {}
+        model["name"] = "auto"
+        data["model"] = model
+    return data
+
+
+def _qwen_revert_settings(spath):
+    """Undo _qwen_apply_settings: drop the hub's modelProviders entries, and put
+    selectedType / model.name back as the Connect-time backup had them (removed
+    when it had none). Everything the user added since survives. A file that
+    Connect created and that is now empty is deleted. Returns changed."""
+    data, ok = _read_json_object(spath)
+    if not ok or not os.path.isfile(spath):
+        return False
+    bak = spath + ".freehub-bak"
+    before = _read_json_object(bak)[0] if os.path.isfile(bak) else None
+    before = before if isinstance(before, dict) else {}
+    changed = False
+    mp = data.get("modelProviders")
+    if isinstance(mp, dict) and isinstance(mp.get("openai"), list):
+        own = [p for p in mp["openai"] if not _qwen_is_hub_provider(p)]
+        if len(own) != len(mp["openai"]):
+            changed = True
+            if own:
+                mp["openai"] = own
+            else:
+                mp.pop("openai", None)
+            if not mp:
+                data.pop("modelProviders", None)
+
+    def _get(d, *ks):
+        for k in ks:
+            if not isinstance(d, dict) or k not in d:
+                return None
+            d = d[k]
+        return d
+
+    sel, old_sel = _get(data, "security", "auth", "selectedType"), \
+        _get(before, "security", "auth", "selectedType")
+    if sel == "openai" and old_sel != "openai" and changed:
+        auth = data["security"]["auth"]
+        if old_sel:
+            auth["selectedType"] = old_sel
+        else:
+            auth.pop("selectedType", None)
+            if not auth:
+                data["security"].pop("auth", None)
+            if not data["security"]:
+                data.pop("security", None)
+        changed = True
+    old_model = _get(before, "model", "name") if isinstance(before.get("model"), dict) \
+        else before.get("model")
+    cur = data.get("model")
+    cur_name = cur.get("name") if isinstance(cur, dict) else cur
+    if _is_hub_virtual_model(cur_name):
+        if old_model and not _is_hub_virtual_model(old_model):
+            if isinstance(cur, dict):
+                cur["name"] = old_model
+            else:
+                data["model"] = old_model
+        elif isinstance(cur, dict):
+            cur.pop("name", None)
+            if not cur:
+                data.pop("model", None)
+        else:
+            data.pop("model", None)
+        changed = True
+    if changed:
+        if not data and not os.path.isfile(bak):
+            try:
+                os.remove(spath)
+            except OSError:
+                _cli_write_text(spath, "{}\n")
+        else:
+            _cli_write_text(spath, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    _discard_backup(spath)
+    return changed
 
 
 _CODEX_TABLE_RE = re.compile(r"^\s*\[")
@@ -19801,17 +20029,19 @@ def _autofix_openclaw(entry, key, base_root, base_v1, model):
         "apiKey": key,
         "api": "openai-completions",
         "timeoutSeconds": 300,
+        # One entry per hub tier (Pi's list: auto / best / swarm), so /model
+        # reaches every tier, not only auto.
         "models": [{
-            "id": "auto",
-            "name": "Calvoun Free LLM Hub (auto)",
+            "id": mid,
+            "name": "Calvoun Free LLM Hub (%s)" % mid,
             "reasoning": False,
             "input": ["text"],
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
             # The same declared window every other CLI gets for this id
             # (HUB_CONTEXT_WINDOW until the fleet's windows are known).
-            "contextWindow": agentic_chat.declared_window("auto"),
+            "contextWindow": agentic_chat.declared_window(mid),
             "maxTokens": HUB_MAX_TOKENS,
-        }],
+        } for mid in _HUB_TIER_IDS],
     }
     models["providers"] = providers
     data["models"] = models
@@ -19825,6 +20055,8 @@ def _autofix_openclaw(entry, key, base_root, base_v1, model):
     if not isinstance(amodels, dict):
         amodels = {}
     amodels["freehub/auto"] = {"alias": "Free LLM Hub"}  # allowlist (else "model not allowed")
+    for mid in _HUB_TIER_IDS[1:]:
+        amodels["freehub/" + mid] = {"alias": "Free LLM Hub %s" % mid}
     defaults["models"] = amodels
     mdl = defaults.get("model")
     if not isinstance(mdl, dict):
@@ -19908,6 +20140,29 @@ def _kimi_prev_default_model(text):
     return None
 
 
+def _kimi_strip_hub_tables(text):
+    """Remove [providers.free-hub] and every [models."<tier>"] alias that points
+    at it. An alias table with a hub tier's name but another provider is the
+    user's and stays. Returns (new_text, removed_bool)."""
+    out, removed = _remove_toml_table(text, "providers.free-hub")
+    for mid in _HUB_TIER_IDS:
+        name = 'models."%s"' % mid
+        hdr = re.compile(r"^\s*\[\s*%s\s*\]\s*$" % re.escape(name))
+        lines, block, grab = out.splitlines(), [], False
+        for ln in lines:
+            if hdr.match(ln):
+                grab = True
+                continue
+            if grab and _CODEX_TABLE_RE.match(ln):
+                break
+            if grab:
+                block.append(ln)
+        if grab and any(re.match(r'^\s*provider\s*=\s*["\']free-hub["\']\s*$', b) for b in block):
+            out, did = _remove_toml_table(out, name)
+            removed = removed or did
+    return out, removed
+
+
 def _kimi_apply_text(text, base_v1, key):
     """Pure transform for ~/.kimi/config.toml (no IO). ADDITIVELY + REVERSIBLY:
       1. drop any previous [providers.free-hub] / [models."auto"] tables so a
@@ -19916,9 +20171,11 @@ def _kimi_apply_text(text, base_v1, key):
          default_model line in place, else prepending it);
       3. append the two tables that wire Kimi Code to this hub.
     Every other line (other [providers.*], [models.*], MCP blocks, comments)
-    survives verbatim. Returns the new file text."""
-    body, _ = _remove_toml_table(text, "providers.free-hub")
-    body, _ = _remove_toml_table(body, 'models."auto"')
+    survives verbatim. Returns the new file text.
+
+    One alias per tier (_HUB_TIER_IDS: auto / best / swarm, Pi's list), so
+    `kimi -m best` and the /model picker reach every tier, not only auto."""
+    body, _ = _kimi_strip_hub_tables(text)
     top, rest, in_rest = [], [], False
     for ln in body.splitlines():
         if not in_rest and _CODEX_TABLE_RE.match(ln):
@@ -19938,45 +20195,83 @@ def _kimi_apply_text(text, base_v1, key):
         # api_key is a REQUIRED field per Kimi's docs (startup fails without
         # one). The localhost hub accepts any bearer when no local key is set.
         'api_key = "%s"' % key,
-        "",
-        '[models."auto"]',
-        'provider = "free-hub"',
-        'model = "auto"',
-        "max_context_size = %d" % agentic_chat.declared_window("auto"),
     ]
+    for mid in _HUB_TIER_IDS:
+        # An alias of that name that is still here after the strip is the
+        # user's (another provider): a second table would be invalid TOML.
+        if mid != "auto" and re.search(r'(?m)^\s*\[\s*models\."%s"\s*\]\s*$' % re.escape(mid), body):
+            continue
+        block += ["", '[models."%s"]' % mid, 'provider = "free-hub"', 'model = "%s"' % mid,
+                  "max_context_size = %d" % agentic_chat.declared_window(mid)]
     new_text = "\n".join(top + rest).rstrip("\n")
     return (new_text + "\n\n" if new_text else "") + "\n".join(block) + "\n"
 
 
+def _kimi_prev_setting(path):
+    """The setting remembering the default_model Connect replaced in THIS file.
+    The legacy ~/.kimi file keeps the historical key, so a hub upgraded between
+    Connect and Disconnect still restores what it replaced there."""
+    legacy = os.path.normcase(os.path.abspath(_p_kimi_legacy()))
+    return ("kimi_prev_default_model" if os.path.normcase(os.path.abspath(path)) == legacy
+            else "kimi_code_prev_default_model")
+
+
+def _kimi_targets(entry=None):
+    """Files Connect/Disconnect act on: _kimi_config_paths() (resolved NOW, so a
+    kimi installed after the hub started is covered) plus whatever the entry
+    names, primary first, deduplicated."""
+    out, seen = [], set()
+    extra = [(entry or {}).get("write_path")] + list((entry or {}).get("config_paths") or [])
+    for p in _kimi_config_paths() + extra:
+        if not p:
+            continue
+        k = os.path.normcase(os.path.abspath(p))
+        if k not in seen:
+            seen.add(k)
+            out.append(p)
+    return out
+
+
 def _autofix_kimi(entry, key, base_root, base_v1, model):
-    """Point Kimi Code at this hub in ONE click. Kimi is wired ONLY through
-    ~/.kimi/config.toml ([providers.*] tables) — it has no shell-env fallback —
-    so this writes that file additively/reversibly (a .freehub-bak backup is
-    taken first) instead of handing out manual TOML to paste. The previous
-    default_model (normally Kimi's managed 'kimi-code' OAuth service) is
-    remembered so Disconnect puts it back exactly."""
-    path = _p_kimi()
-    try:
-        if os.path.isfile(path):
-            # utf-8-sig: strip a leading BOM so it can't land mid-file after we
-            # prepend default_model (a mid-file BOM breaks TOML parsing).
-            with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
-                text = f.read()
-        else:
-            text = ""
-    except OSError as exc:
-        return {"ok": False, "reason": _sanitize("could not read %s: %s" % (_short(path), exc))}
-    backup = _backup_once(path)
-    abort = _abort_if_backup_failed(path, backup)
-    if abort:
-        return abort
-    prev = _kimi_prev_default_model(text)
-    if prev and prev != "auto":
-        config.set_setting("kimi_prev_default_model", prev)  # remember for Disconnect
-    _cli_write_text(path, _kimi_apply_text(text, base_v1, key))
+    """Point Kimi Code at this hub in ONE click. Kimi is wired ONLY through its
+    config.toml ([providers.*] tables) — it has no shell-env fallback — so this
+    writes that file additively/reversibly (a .freehub-bak backup is taken
+    first) instead of handing out manual TOML to paste. The Node Kimi Code
+    reads ~/.kimi-code (KIMI_CODE_HOME), the legacy Python kimi-cli ~/.kimi:
+    the primary is always written and the legacy file too when it exists
+    (_kimi_config_paths). The previous default_model of EACH file (normally
+    Kimi's managed OAuth model) is remembered so Disconnect puts it back."""
+    paths = _kimi_config_paths()
+    texts = {}
+    for path in paths:
+        try:
+            if os.path.isfile(path):
+                # utf-8-sig: strip a leading BOM so it can't land mid-file after
+                # we prepend default_model (a mid-file BOM breaks TOML parsing).
+                with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+                    texts[path] = f.read()
+            else:
+                texts[path] = ""
+        except OSError as exc:
+            return {"ok": False, "reason": _sanitize("could not read %s: %s" % (_short(path), exc))}
+    backups = {}
+    for path in paths:          # every backup BEFORE any write: all-or-nothing
+        backups[path] = _backup_once(path)
+        abort = _abort_if_backup_failed(path, backups[path])
+        if abort:
+            return abort
+    prev = None
+    for path in paths:
+        p = _kimi_prev_default_model(texts[path])
+        if p and p not in _HUB_TIER_IDS:
+            config.set_setting(_kimi_prev_setting(path), p)  # remember for Disconnect
+            prev = prev or p
+        _cli_write_text(path, _kimi_apply_text(texts[path], base_v1, key))
+    path, backup = paths[0], backups[paths[0]]
     return {
         "ok": True,
         "wrote_path": path,
+        "also_wrote": paths[1:],
         "backup_path": backup,
         "applied": {"provider": "free-hub", "type": "openai", "base_url": base_v1,
                     "api_key": _mask_key(key), "model_alias": "auto",
@@ -19985,8 +20280,8 @@ def _autofix_kimi(entry, key, base_root, base_v1, model):
                  "difficulty-aware orchestration (the 'auto' model)."
                  + (" Your previous default_model (%s) is remembered and restored "
                     "on Disconnect." % prev if prev and prev != "auto" else "")),
-        "restart_hint": ("Restart Kimi Code — it reads ~/.kimi/config.toml on startup. "
-                         "In an already-open session, pick 'auto' via /model."),
+        "restart_hint": ("Restart Kimi Code — it reads %s on startup. "
+                         "In an already-open session, pick 'auto' via /model." % _short(path)),
     }
 
 
@@ -20513,9 +20808,10 @@ def _disconnect_claude(entry):
 def _disconnect_aider(entry):
     path = entry["write_path"]
     hint = "Re-run aider in a new session; it reads ~/.aider.conf.yml on startup."
+    meta_changed = _aider_revert_metadata()
     if _restore_backup(path):
         return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
-    changed = False
+    changed = meta_changed
     deleted = False
     if os.path.isfile(path) and _file_points_at_hub(path):
         text, removed = _remove_flat_yaml_keys(
@@ -20697,8 +20993,11 @@ def _disconnect_qwen(entry):
     # Qwen's /model saves the pick in settings.json (model.name, or a flat
     # "model" string on older versions). A hub-only id there survives the .env
     # revert and is sent to whatever provider qwen talks to next.
-    settings_changed = _qwen_forget_hub_model(
-        os.path.join(os.path.dirname(path), "settings.json"))
+    # Connect also writes the documented settings.json setup (modelProviders +
+    # selectedType + model.name) -- reverted key by key against its backup.
+    spath = os.path.join(os.path.dirname(path), "settings.json")
+    settings_changed = _qwen_revert_settings(spath)
+    settings_changed = _qwen_forget_hub_model(spath) or settings_changed
     if _restore_backup(path):
         return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint,
                 "changed": True}
@@ -20948,12 +21247,25 @@ def _disconnect_openclaw(entry):
                     set(models) <= {"mode"} and models.get("mode", "merge") == "merge" and \
                     (bak is None or "models" not in bak):
                 data.pop("models", None)
+            deleted = False
             if changed:
                 config.set_setting("openclaw_prev_primary", "")  # clear the stash
-                _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+                if not data and not os.path.exists(path + ".freehub-bak"):
+                    # No backup -> Connect CREATED this file; an empty "{}" left
+                    # behind is a hub trace, not the user's config.
+                    try:
+                        os.remove(path)
+                        deleted = True
+                    except OSError:
+                        pass
+                if not deleted:
+                    _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
             _discard_backup(path)  # strip succeeded -> stale backup no longer needed
-            return {"restored_from_backup": False, "wrote_path": path,
-                    "changed": changed, "restart_hint": hint}
+            out = {"restored_from_backup": False, "wrote_path": path,
+                   "changed": changed, "restart_hint": hint}
+            if deleted:
+                out["deleted"] = True
+            return out
     # Live file missing or no longer valid JSON -> fall back to the frozen backup.
     if _restore_backup(path):
         return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
@@ -21036,14 +21348,17 @@ def _hermes_backup_model(path):
     return out
 
 
-def _kimi_restore_default_model(text):
+def _kimi_restore_default_model(text, setting="kimi_prev_default_model"):
     """Undo our `default_model = "auto"` in the TOP (pre-table) section only:
-    put back the value remembered at connect time, or drop the line entirely if
-    there was none. A default_model the user has since changed to something
-    else is left alone (the line no longer matches). Returns
-    (new_text, changed_bool)."""
-    prev = config.get_setting("kimi_prev_default_model")
-    ours = re.compile(r'^\s*default_model\s*=\s*"auto"\s*$')
+    put back the value remembered at connect time (under `setting`, see
+    _kimi_prev_setting), or drop the line entirely if there was none. A
+    default_model the user has since changed to something else is left alone
+    (the line no longer matches). Returns (new_text, changed_bool)."""
+    prev = config.get_setting(setting)
+    # Any hub tier alias -- the /model picker may have saved "best" or "swarm"
+    # as the default while connected; left behind it would name a deleted alias.
+    ours = re.compile(r'^\s*default_model\s*=\s*["\'](?:%s)["\']\s*$'
+                      % "|".join(re.escape(m) for m in _HUB_TIER_IDS))
     out, changed, in_rest = [], False, False
     for ln in text.splitlines():
         if not in_rest and _CODEX_TABLE_RE.match(ln):
@@ -21055,7 +21370,7 @@ def _kimi_restore_default_model(text):
             continue
         out.append(ln)
     if changed and isinstance(prev, str) and prev:
-        config.set_setting("kimi_prev_default_model", "")  # consumed
+        config.set_setting(setting, "")  # consumed
     new_text = "\n".join(out).rstrip("\n")
     return (new_text + "\n" if new_text else ""), changed
 
@@ -21065,10 +21380,28 @@ def _disconnect_kimi(entry):
     default_model line (restoring the remembered one), so any provider / model
     alias / setting added to config.toml after connecting survives. Restoring
     the frozen first-connect backup is the last resort, for a file we can no
-    longer read at all."""
-    path = entry.get("write_path") or _p_kimi()
-    hint = ("Restart Kimi Code so it re-reads ~/.kimi/config.toml "
-            "(an open session keeps the old model until then).")
+    longer read at all.
+
+    Every Kimi config is reverted (_kimi_targets): the Node Kimi Code's
+    ~/.kimi-code and the legacy ~/.kimi alike, so an older build's Connect
+    (which wrote only ~/.kimi) is undone too. A file that holds nothing once
+    our lines are gone was created by Connect and is removed."""
+    results = [_disconnect_kimi_file(p) for p in _kimi_targets(entry)]
+    first = next((r for r in results if r.get("changed") or r.get("restored_from_backup")),
+                 results[0])
+    out = dict(first)
+    out["changed"] = any(r.get("changed") for r in results)
+    out["restored_from_backup"] = any(r.get("restored_from_backup") for r in results)
+    touched = [r["wrote_path"] for r in results
+               if r.get("changed") or r.get("restored_from_backup")]
+    if len(touched) > 1:
+        out["also_wrote"] = [p for p in touched if p != out["wrote_path"]]
+    return out
+
+
+def _disconnect_kimi_file(path):
+    hint = ("Restart Kimi Code so it re-reads %s "
+            "(an open session keeps the old model until then)." % _short(path))
     if os.path.isfile(path):
         try:
             with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
@@ -21076,15 +21409,27 @@ def _disconnect_kimi(entry):
         except OSError:
             text = None
         if text is not None:
-            text2, prov_removed = _remove_toml_table(text, "providers.free-hub")
-            text3, alias_removed = _remove_toml_table(text2, 'models."auto"')
-            text4, top_changed = _kimi_restore_default_model(text3)
-            changed = bool(prov_removed or alias_removed or top_changed)
+            text3, tables_removed = _kimi_strip_hub_tables(text)
+            text4, top_changed = _kimi_restore_default_model(text3, _kimi_prev_setting(path))
+            changed = bool(tables_removed or top_changed)
+            deleted = False
             if changed:
-                _cli_write_text(path, text4)
+                if not text4.strip() and not os.path.isfile(path + ".freehub-bak"):
+                    # No backup -> Connect CREATED this file and nothing of the
+                    # user's was ever in it: remove the empty shell.
+                    try:
+                        os.remove(path)
+                        deleted = True
+                    except OSError:
+                        _cli_write_text(path, text4)
+                else:
+                    _cli_write_text(path, text4)
             _discard_backup(path)  # strip succeeded -> stale backup no longer needed
-            return {"restored_from_backup": False, "wrote_path": path,
-                    "changed": changed, "restart_hint": hint}
+            out = {"restored_from_backup": False, "wrote_path": path,
+                   "changed": changed, "restart_hint": hint}
+            if deleted:
+                out["deleted"] = True
+            return out
     if _restore_backup(path):
         return {"restored_from_backup": True, "wrote_path": path, "restart_hint": hint}
     return {"restored_from_backup": False, "wrote_path": path,
@@ -21255,7 +21600,27 @@ def _restore_cli_snapshot(generation, cid):
         except FileNotFoundError:
             pass
     _discard_backup(path)
+    _revert_side_files(cid, path)
     return {"status": "off", "path": path, "changed": True}
+
+
+def _revert_side_files(cid, write_path):
+    """A byte-restore puts back write_path only; some Connects also write a
+    second file (kimi's legacy ~/.kimi config, qwen's settings.json, aider's
+    model metadata). Revert those semantically so hub mode OFF leaves no tier
+    list behind. Best-effort, never raises."""
+    try:
+        if cid == "kimi":
+            wp = os.path.normcase(os.path.abspath(write_path))
+            for p in _kimi_targets():
+                if os.path.normcase(os.path.abspath(p)) != wp:
+                    _disconnect_kimi_file(p)
+        elif cid == "qwen":
+            _qwen_revert_settings(os.path.join(os.path.dirname(write_path), "settings.json"))
+        elif cid == "aider":
+            _aider_revert_metadata()
+    except Exception:                                            # noqa: BLE001
+        _log.warning("side-file revert failed for %s", cid)
 
 
 def _hub_mode_payload():

@@ -244,7 +244,9 @@ def test_one_context_window_for_every_cli():
     body = body[:body.index("\ndef ")]
     # The one declared figure every CLI gets (fixed default until the fleet's
     # windows are known -- see tests/test_model_window_detection.py).
-    assert 'agentic_chat.declared_window("auto")' in body
+    # One entry per hub tier since 2026-09-27, each sized by the same call.
+    assert "agentic_chat.declared_window(mid)" in body
+    assert "for mid in _HUB_TIER_IDS" in body
     assert "200000" not in body
 
 
