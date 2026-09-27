@@ -3199,6 +3199,7 @@ def _record_outcome(pid, model, ok, junk=False):
         pass
     if junk and not ok:
         _junk_bench_note(pid, model, "answer")
+    _note_tool_turn_outcome(pid, model, ok)
     _save_perf_stats()
 
 
@@ -3282,6 +3283,11 @@ def _record_ttft(pid, model, ms):
     folding it into the same average as a non-streaming total would have mixed
     two different quantities. Kept apart, both are worth having."""
     _record_speed_sample(_ttft, pid, model, ms)
+    if _in_tool_turn():
+        # A TOOL turn's first content is a different quantity again: a 16K
+        # prompt plus a tool schema, often a tool call rather than text. Kept
+        # in its own bucket so tool-chain ordering is judged on it.
+        _record_speed_sample(_tool_ttft, pid, model, ms)
 
 
 # SPEED AT LONG CONTEXT, kept apart from the everyday samples above. A model's
@@ -7913,6 +7919,13 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # Fail-open: if nothing clears the bar (all strong keys weak/exhausted), keep
         # the full pool rather than fail.
         agentic = [c for c in pool if c[0] >= _TOOLS_MIN_SCORE] or pool
+        # Never OPEN a tool turn on a vision-specialised model (this router
+        # never sees an image turn -- _route_for_vision does), on a relay
+        # server that keeps failing tool turns, or on a pair measured to mostly
+        # fail tool turns. Each fail-open: they stay in the chain's tail.
+        agentic = [c for c in agentic if not _is_vision_specialised(c[2])] or agentic
+        agentic = [c for c in agentic if not _relay_tool_sick(c[1], c[2])] or agentic
+        agentic = [c for c in agentic if not _tool_turn_sick(c[1], c[2])] or agentic
         # ════════════════════════════════════════════════════════════════════
         # SESSION AFFINITY — one model per TASK, rotation only between tasks.
         # Rotating per-TURN spread the load nicely but wrecked the OUTPUT: a
@@ -8486,6 +8499,227 @@ def _chain_entries(name):
 # every other provider has had its turn (the rest follow, in order).
 _TRIVIAL_PER_PROVIDER_HOPS = 2
 
+# ---------------------------------------------------------------------------
+# TOOL-TURN RELIABILITY (2026-09-27).
+#
+# MEASURED on 8bf19be, live CLI runs against the hub:
+#   * opencode "read big.txt (~600 KB), answer its last line": 0/4. One
+#     ~16K-token tool request spent its whole 240 s deadline on nvidia --
+#     nvidia/meta/llama-3.2-90b-vision-instruct ReadTimeout, then
+#     _HopBudgetExceeded, then more nvidia hops. A VISION-specialised model on
+#     a text tool turn, and ONE provider eating the whole deadline.
+#   * kimi auto on the same task: 9 requests in a row ended 504/503, g4f
+#     walking up to 7 relay hops (ConnectionError / non-answer each time).
+# So, for every TOOL turn (not only the trivial ones):
+#   * vision-specialised ids go behind every other candidate unless the turn
+#     carries an image (_is_vision_specialised);
+#   * a pair MEASURED on tool turns to mostly fail joins the measured-to-fail
+#     group, and one measured slow to first content (_TOOL_SLOW_TTFT_MS) goes
+#     behind the quick ones inside its group (_tool_turn_sick/_tool_turn_slow);
+#   * the walk (_ChainClock) gives each provider at most
+#     _TOOL_PER_PROVIDER_HOPS failed hops and _TOOL_PROVIDER_SHARE of the
+#     deadline while another provider is still waiting, and moves a provider
+#     that stalled (timeout / hop budget / silent peek) behind the others;
+#   * relay (g4f) hops are capped (_TOOL_RELAY_MAX_HOPS) and a relay SERVER
+#     (the backend prefix in the model id) that failed with ConnectionError
+#     or a non-answer _RELAY_TOOL_FAIL_LIMIT times recently is skipped for
+#     tool requests (_relay_tool_sick). Covered by
+#     tests/test_tool_turn_reliability.py.
+#   The built chain of a non-trivial tool turn keeps its strength order
+#   (tests/test_pipeline_complete.py): the per-provider caps act in the WALK,
+#   on hops that actually failed, not on the ranking.
+_TOOL_PER_PROVIDER_HOPS = 2          # failed hops per provider before the others
+_TOOL_PROVIDER_SHARE = 0.5           # of the request deadline, per provider
+_TOOL_PROVIDER_SHARE_HUGE = 0.75     # ...for a prompt past STREAM_HUGE_REQUEST_TOKENS
+_TOOL_PROVIDER_MIN_SECONDS = 60.0    # never a smaller per-provider allowance
+_TOOL_PROVIDER_MIN_HOP = 20.0        # never squeeze a capped hop below this
+_TOOL_RELAY_PIDS = ("g4f",)
+_TOOL_RELAY_MAX_HOPS = 3             # relay hops per tool chain / walk
+_RELAY_TOOL_FAIL_TTL = 900.0         # seconds a relay-server failure is remembered
+_RELAY_TOOL_FAIL_LIMIT = 2           # failures in the TTL -> skipped on tool turns
+_TOOL_SLOW_TTFT_MS = 30000.0         # measured p50 first content past this = slow
+_TOOL_MIN_SAMPLES = 3                # never judge a pair on one or two tool turns
+_TOOL_SICK_RATE = 0.35               # same line as _CHAIN_UNRELIABLE
+
+_tool_ttft = {}          # (pid, model) -> [ms, ...] first content on TOOL turns
+_tool_outcomes = {}      # (pid, model) -> {"ok", "fail", "last"} on TOOL turns
+_relay_tool_fail = {}    # (pid, relay server id) -> [monotonic ts, ...]
+_relay_tool_lock = threading.Lock()
+
+# Models built to READ IMAGES, not to drive tools: '...-vision-instruct',
+# '...-vl-...', llava & friends. General multimodal models (gemini, llama-4,
+# gpt-4o) are not matched -- they are strong tool callers.
+_VISION_SPECIALISED_RE = re.compile(
+    r"(?<![a-z])vision|(?:^|[-_./:])vl(?:$|[-_.:])|llava|paligemma|moondream"
+    r"|florence-|cogvlm|internvl|kosmos|deplot|(?:^|[-_/])ocr(?:$|[-_.])", re.I)
+
+
+def _is_vision_specialised(model):
+    try:
+        return bool(_VISION_SPECIALISED_RE.search(str(model or "")))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _in_tool_turn():
+    """True while serving a TOOL-carrying turn (set by _ChainClock). False
+    outside a request, so probes and pipelines record nothing tool-specific."""
+    try:
+        return bool(getattr(g, "hub_tool_turn", False))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _note_tool_turn_outcome(pid, model, ok):
+    """File one delivery result in the tool-turn ledger (only on a tool turn).
+    Never raises."""
+    if not (pid and model) or not _in_tool_turn():
+        return
+    try:
+        now = time.time()
+        with _outcome_lock:
+            rec = _tool_outcomes.get((pid, model))
+            if not rec or now - rec.get("last", 0) > _OUTCOME_TTL:
+                rec = {"ok": 0, "fail": 0, "last": now}
+            rec["ok" if ok else "fail"] += 1
+            rec["last"] = now
+            if rec["ok"] + rec["fail"] > _OUTCOME_CAP:
+                rec["ok"] //= 2
+                rec["fail"] //= 2
+            _tool_outcomes[(pid, model)] = rec
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _tool_turn_reliability(pid, model):
+    """Laplace-smoothed delivery rate on TOOL turns, or None while fewer than
+    _TOOL_MIN_SAMPLES results exist (or they went stale)."""
+    try:
+        with _outcome_lock:
+            rec = dict(_tool_outcomes.get((pid, model)) or {})
+        if not rec or time.time() - rec.get("last", 0) > _OUTCOME_TTL:
+            return None
+        ok, fail = int(rec.get("ok", 0)), int(rec.get("fail", 0))
+        if ok + fail < _TOOL_MIN_SAMPLES:
+            return None
+        return (ok + 1.0) / (ok + fail + 2.0)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _tool_turn_sick(pid, model):
+    """Measured on tool turns to mostly not deliver."""
+    r = _tool_turn_reliability(pid, model)
+    return r is not None and r < _TOOL_SICK_RATE
+
+
+def _tool_turn_slow(pid, model):
+    """Measured slow to first content: the tool-turn samples when there are
+    enough, else every streamed sample. Unmeasured is NOT slow -- the speed
+    HEURISTIC (_is_fast) deliberately does not reorder a tool chain, because
+    it flags strong deep-quota coders as slow (see _build_chain)."""
+    try:
+        with _outcome_lock:
+            s = list(_tool_ttft.get((pid, model)) or [])
+            if len(s) < _TOOL_MIN_SAMPLES:
+                s = list(_ttft.get((pid, model)) or [])
+        if len(s) < _TOOL_MIN_SAMPLES:
+            return False
+        return _percentile(s, 50) > _TOOL_SLOW_TTFT_MS
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _is_relay_pid(pid):
+    p = str(pid or "").lower()
+    return any(p == r or p.startswith(r + "-") for r in _TOOL_RELAY_PIDS)
+
+
+def _relay_server_id(pid, model):
+    """The relay BACKEND a relay model id names, or None for a non-relay pid.
+    g4f prefixes the real id with it: 'srv_mkom688d:openai/gpt-oss-120b' ->
+    'srv_mkom688d', 'pa:657cce02:auto' -> 'pa:657cce02', 'G4FSpace:srv_x:z-ai/
+    glm-5.3' -> 'G4FSpace:srv_x', 'RelayRouter:gemini-3.7-flash' ->
+    'RelayRouter'. An id with no prefix is its own server."""
+    if not _is_relay_pid(pid):
+        return None
+    try:
+        parts = str(model or "").split(":")
+        if len(parts) < 2:
+            server = str(model or "")
+        elif len(parts) >= 3 and (parts[0].lower() == "pa"
+                                  or parts[1].lower().startswith("srv_")):
+            server = parts[0] + ":" + parts[1]
+        else:
+            server = parts[0]
+        return "%s|%s" % (str(pid).lower(), server)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _note_relay_tool_fail(pid, model):
+    """One ConnectionError / non-answer from a relay server on a tool turn."""
+    server = _relay_server_id(pid, model)
+    if not server:
+        return
+    try:
+        now = time.monotonic()
+        with _relay_tool_lock:
+            row = [t for t in _relay_tool_fail.get(server, ())
+                   if now - t <= _RELAY_TOOL_FAIL_TTL]
+            row.append(now)
+            _relay_tool_fail[server] = row[-10:]
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _relay_tool_sick(pid, model):
+    """True for a relay server that failed a tool turn _RELAY_TOOL_FAIL_LIMIT
+    times within _RELAY_TOOL_FAIL_TTL: skipped for tool requests."""
+    server = _relay_server_id(pid, model)
+    if not server:
+        return False
+    try:
+        now = time.monotonic()
+        with _relay_tool_lock:
+            n = sum(1 for t in _relay_tool_fail.get(server, ())
+                    if now - t <= _RELAY_TOOL_FAIL_TTL)
+        return n >= _RELAY_TOOL_FAIL_LIMIT
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _slow_behind_in_group(fit, proven_grouped):
+    """A tool chain's healthy entries with the MEASURED-slow ones (see
+    _tool_turn_slow) behind the quick ones inside each group: a stable sort,
+    so proven-before-unproven and the strength order survive. Unmeasured
+    moves nothing. Never raises."""
+    try:
+        return sorted(fit, key=lambda e: (proven_grouped and not _is_tool_proven(e[2]),
+                                          _tool_turn_slow(e[1], e[2])))
+    except Exception:                                            # noqa: BLE001
+        return fit
+
+
+def _cap_relay_hops(chain, cap=None):
+    """A TOOL chain without the relay hops it must not take: every entry on a
+    relay server _relay_tool_sick names, and relay entries past `cap`
+    (default _TOOL_RELAY_MAX_HOPS). Order kept. Fail-open: a chain this would
+    empty is returned with only the cap applied. Never raises."""
+    try:
+        cap = _TOOL_RELAY_MAX_HOPS if cap is None else cap
+        healthy = [e for e in chain if not _relay_tool_sick(e[0], e[1])] or list(chain)
+        out, n = [], 0
+        for e in healthy:
+            if _is_relay_pid(e[0]):
+                if n >= cap:
+                    continue
+                n += 1
+            out.append(e)
+        return out or list(chain)
+    except Exception:                                            # noqa: BLE001
+        return chain
+
 
 def _spread_by_provider(entries, per, already=()):
     """Stable partition of (score, pid, model) entries: the first `per` of
@@ -8734,12 +8968,26 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # unproven one that replies. Without this the split below regrouped the
         # 0.33 hops ahead of every healthy non-proven model again, which is the
         # ordering that produced the reported stall.
-        _sick = [e for e in ordered if _chain_reliability_band(e[1], e[2]) >= 2]
-        _fit = [e for e in ordered if _chain_reliability_band(e[1], e[2]) < 2]
+        # ...and measured to mostly fail on TOOL turns specifically (see
+        # _tool_turn_sick): same group, same reasoning.
+        def _is_sick(e):
+            return (_chain_reliability_band(e[1], e[2]) >= 2
+                    or _tool_turn_sick(e[1], e[2]))
+        _sick = [e for e in ordered if _is_sick(e)]
+        _fit = [e for e in ordered if not _is_sick(e)]
         _proven_ordered = [e for e in _fit if _is_tool_proven(e[2])]
         if _proven_ordered:
             _fit = _proven_ordered + [e for e in _fit if not _is_tool_proven(e[2])]
+        _fit = _slow_behind_in_group(_fit, bool(_proven_ordered))
         ordered = _fit + _sick
+        # VISION-SPECIALISED models behind every other candidate on a turn
+        # that carries no image (see _is_vision_specialised) -- MEASURED: a
+        # 16K-token tool turn opened on llama-3.2-90b-vision-instruct and
+        # timed out. Ordered, never dropped.
+        if not require_vision:
+            _vis = [e for e in ordered if _is_vision_specialised(e[2])]
+            if _vis and len(_vis) < len(ordered):
+                ordered = [e for e in ordered if not _is_vision_specialised(e[2])] + _vis
         # LOW-QUALITY TAIL, AFTER proven-first (see _LOW_QUALITY_RE): the proven
         # allowlist still names nemotron/gpt-oss, so proven-first alone walked the
         # chain straight onto the demoted families while glm-4.7/kimi-k2.6 sat
@@ -8757,7 +9005,9 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
             # a real agent turn needs; for "add 17 and 25" it only lined up
             # reasoning models that each think for a minute before the call.
             ordered.sort(key=lambda e: (_is_low_quality(e[2]),
-                                        _chain_reliability_band(e[1], e[2]) >= 2,
+                                        _is_sick(e),
+                                        (not require_vision
+                                         and _is_vision_specialised(e[2])),
                                         not _is_fast(e[1], e[2])))
             # ...and SPREAD across providers. The groupings above (proven,
             # reliability, fast) re-cluster whatever the interleave spread
@@ -8831,6 +9081,13 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     chain = _prefer_fast_long_context(
         chain, est,
         keep_head=1 if (pinned and chain and tuple(chain[0]) == (primary_pid, model_id)) else 0)
+    if require_tools:
+        # Relay hops on a tool turn: a relay server that keeps failing tool
+        # turns is skipped, and the rest are capped (see _cap_relay_hops).
+        # A pinned primary is the caller's choice and always stays.
+        _head = chain[:1] if pinned else []
+        chain = _head + [e for e in _cap_relay_hops(chain[len(_head):])
+                         if e not in _head]
     # LAST RESORT — the user's PAID local subscriptions, opt-in and OFF by
     # default (so this loop normally adds NOTHING and the chain is identical to
     # before). Appended after BOTH free tiers: a sub hop must only ever run once
@@ -11081,16 +11338,31 @@ def _trim_largest_message(messages, tools, target):
 
     Head+tail rather than a plain cut: the start of a pasted file (imports,
     signatures) and its end (the part just being edited) both carry more signal
-    than the middle. Returns (messages, changed)."""
+    than the middle. Returns (messages, changed).
+
+    Three guarantees (tests/test_tool_turn_reliability.py):
+      * ONLY THE MIDDLE is cut, and the marker says so with the exact number
+        of characters (and lines) omitted -- MEASURED: a model given a cut
+        read of a 12,001-line file answered "line 1897" as its last line.
+      * THE TRUE TAIL IS INTACT: the tail starts on a line boundary and always
+        holds the complete last line, so "the last line below" is the
+        output's real last line (a tool result keeps a larger tail share).
+      * THE ENVIRONMENT SURVIVES: <env>/<environment_context> blocks and
+        "working directory" lines that fall in the cut are carried over
+        verbatim after the marker. MEASURED: Kimi Code states its cwd at ~61%
+        of a 20K-char system prompt, where a 60/40 head+tail cut removed it,
+        and pipeline members on small windows guessed nonexistent cwd paths.
+    List content made only of text parts is flattened to a string first."""
     try:
         over = _est_tokens(messages, tools) - target
         if over <= 0:
             return messages, False
         idx, biggest = None, 0
         for i, m in enumerate(messages):
-            if not isinstance(m, dict) or not isinstance(m.get("content"), str):
+            text = _trimmable_text(m)
+            if text is None:
                 continue
-            n = len(m["content"])
+            n = len(text)
             if n > biggest:
                 idx, biggest = i, n
         if idx is None:
@@ -11099,28 +11371,138 @@ def _trim_largest_message(messages, tools, target):
         cut = min(biggest - 400, int(over * 4) + 400)
         if cut <= 0 or biggest - cut < 400:
             return messages, False
-        text = messages[idx]["content"]
+        text = _trimmable_text(messages[idx])
+        is_tool = messages[idx].get("role") == "tool"
         keep = biggest - cut
-        head = text[: int(keep * 0.6)]
-        tail = text[-int(keep * 0.4):] if int(keep * 0.4) else ""
+        # A tool result's END is what gets asked about ("the last line", the
+        # test summary, the error at the bottom): it keeps half, not 40%.
+        head_n, tail_n = _head_tail_split(text, keep, 0.5 if is_tool else 0.6)
+        head, tail = text[:head_n], text[len(text) - tail_n:] if tail_n else ""
+        omitted = text[head_n:len(text) - tail_n]
+        n_cut = len(omitted)
+        n_lines = omitted.count("\n")
+        kept_env = _protected_spans(omitted)
         out = list(messages)
         out[idx] = dict(messages[idx])
-        if messages[idx].get("role") == "tool":
+        if is_tool:
             # A tool result is truncated, never dropped: dropping it (or its
             # call) left the agent with no result at all, and it re-ran the
             # same read forever.
-            marker = ("\n\n[... %d characters omitted by the hub to fit the model's "
-                      "context window; this tool output is truncated -- re-run the "
-                      "tool on a narrower range if you need the missing part ...]\n\n"
-                      % cut)
+            marker = ("\n\n[... %d characters (about %d lines) omitted by the hub from "
+                      "the MIDDLE of this tool output to fit the model's context window; "
+                      "this tool output is truncated in the middle only -- the beginning "
+                      "above and the END below are verbatim, so the last line below is "
+                      "the output's true last line. Re-run the tool on a narrower range "
+                      "if you need the missing middle ...]\n\n" % (n_cut, n_lines))
         else:
-            marker = ("\n\n[... %d characters omitted by the hub to fit the model's "
-                      "context window; ask for the missing part if you need it ...]\n\n"
-                      % cut)
+            marker = ("\n\n[... %d characters omitted by the hub from the MIDDLE of this "
+                      "message to fit the model's context window; the beginning and the "
+                      "end are verbatim -- ask for the missing part if you need it ...]\n\n"
+                      % n_cut)
+        if kept_env:
+            marker += ("[Kept from the omitted middle -- environment, verbatim:]\n"
+                       + kept_env + "\n\n")
         out[idx]["content"] = head + marker + tail
         return out, True
     except Exception:                                                # noqa: BLE001
         return messages, False
+
+
+def _trimmable_text(m):
+    """The text a trim may cut: string content, or content made ONLY of text
+    parts (joined). None for anything else (images, no content)."""
+    if not isinstance(m, dict):
+        return None
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list) and c and all(
+            isinstance(p, dict) and p.get("type") in ("text", "input_text", "output_text")
+            and isinstance(p.get("text"), str) for p in c):
+        return "\n".join(p["text"] for p in c)
+    return None
+
+
+# The longest last line a trim guarantees to keep whole (a minified file's
+# single line is not "a line" worth a whole window).
+_TRIM_LAST_LINE_MAX = 4000
+
+
+def _head_tail_split(text, keep, head_share):
+    """(head_chars, tail_chars) for a middle cut keeping about `keep` chars:
+    the head ends on a line boundary, the tail starts on one and always holds
+    the complete last line (up to _TRIM_LAST_LINE_MAX). Never overlaps."""
+    n = len(text)
+    keep = max(0, min(int(keep), n))
+    head_n = int(keep * head_share)
+    tail_n = keep - head_n
+    # The tail starts right AFTER a newline, so it never opens mid-line.
+    if tail_n > 0:
+        start = n - tail_n
+        nl = text.find("\n", start)
+        if nl != -1 and nl + 1 < n and (nl + 1 - start) <= max(200, tail_n // 4):
+            start = nl + 1
+        # ...and it holds the whole last line even when that line alone is
+        # longer than the tail budget -- unless that line reaches back into the
+        # head (a single-line message): extending there would cut NOTHING and
+        # only add the marker, growing the message a trim meant to shrink.
+        body = text.rstrip("\n")
+        last_nl = body.rfind("\n")
+        last_start = last_nl + 1 if last_nl != -1 else 0
+        if start > last_start > head_n and n - last_start <= _TRIM_LAST_LINE_MAX:
+            start = last_start
+        tail_n = n - start
+    # The head ends ON a newline (kept), so it never stops mid-line either.
+    if head_n > 0:
+        nl = text.rfind("\n", 0, head_n)
+        if nl != -1 and (head_n - nl) <= max(200, head_n // 4):
+            head_n = nl + 1
+    if head_n + tail_n > n:
+        head_n = max(0, n - tail_n)
+    return head_n, tail_n
+
+
+# Environment facts a trim must never lose: the CLI's <env> block (opencode,
+# Claude Code), codex's <environment_context>, and single "working directory"
+# / platform lines in whatever prose the CLI wraps them in (Kimi Code: "The
+# current working directory is `C:\...`").
+_ENV_BLOCK_RE = re.compile(
+    r"<env>.*?</env>|<environment_context>.*?</environment_context>"
+    r"|<environment>.*?</environment>", re.S | re.I)
+_ENV_LINE_RE = re.compile(
+    r"^[^\n]*(?:working directory|current directory|\bcwd\b|project root"
+    r"|workspace root|is directory a git repo|^\s*platform\s*:|^\s*shell\s*:"
+    r"|^\s*os version\s*:)[^\n]*$", re.I | re.M)
+_PROTECTED_MAX_CHARS = 3000
+
+
+def _protected_spans(omitted):
+    """The environment facts inside `omitted`, joined, capped at
+    _PROTECTED_MAX_CHARS. "" when there are none. Never raises."""
+    try:
+        out, total, seen = [], 0, set()
+        spans = [m.group(0) for m in _ENV_BLOCK_RE.finditer(omitted or "")]
+        rest = _ENV_BLOCK_RE.sub("", omitted or "")
+        # A line naming the working directory, but only when it carries a
+        # path-looking token -- "never access files outside the working
+        # directory" is a rule, not a fact about this machine.
+        for m in _ENV_LINE_RE.finditer(rest):
+            line = m.group(0).strip()
+            if re.search(r"[\\/`]|[A-Za-z]:\\", line) or re.match(
+                    r"(?i)\s*(platform|shell|os version|is directory a git repo)\s*:", line):
+                spans.append(line)
+        for s in spans:
+            s = s.strip()
+            if not s or s in seen:
+                continue
+            if total + len(s) > _PROTECTED_MAX_CHARS:
+                break
+            seen.add(s)
+            out.append(s)
+            total += len(s) + 1
+        return "\n".join(out)
+    except Exception:                                            # noqa: BLE001
+        return ""
 
 
 # How many providers an embedding request is allowed to fall through before
@@ -24280,15 +24662,27 @@ class _ChainClock:
     _dispatch_chat, `peek_timeout()` instead of _stream_peek_timeout, `guard()`
     around a committed stream."""
 
-    def __init__(self, trivial=False, est=None, stream=False):
+    # Class defaults so a clock built without __init__ (tests) walks like a
+    # plain one; __init__ gives every instance its own ledgers.
+    tools = False
+    est = 0
+    _cur = None
+    _rest = ()
+    _relay_hops = 0
+    _prov_hops = None
+    _prov_secs = None
+    _relay_bad = None
+
+    def __init__(self, trivial=False, tools=False, est=0, stream=False):
         # `est` / `stream`: a long request's deadline grows with its size
         # (see _scaled_request_deadline); omitted, the base deadline as before.
         self.deadline_at = _begin_request_deadline(est, stream) if est else \
             _begin_request_deadline()
         self.limit = (_request_deadline_limit() if est else _request_deadline_seconds()) \
             if self.deadline_at else None
-        self.est = int(est or 0)
         self.trivial = bool(trivial)
+        self.tools = bool(tools)
+        self.est = int(est or 0)
         self._hop_started = None
         self._hop_budget = None
         self._last_peek = None
@@ -24297,25 +24691,110 @@ class _ChainClock:
         self._consumed = set()       # chain entries a hedge already ran
         self._served = None          # (pid, model, payload) a hedge served
         self._stalled = set()        # providers that stalled a hop in THIS walk
+        # TOOL turns (see _TOOL_PER_PROVIDER_HOPS): per-provider hops and
+        # seconds spent in THIS walk, relay hops and failed relay servers.
+        self._prov_hops = {}
+        self._prov_secs = {}
+        self._cur = None             # (pid, model, started) of the hop in flight
+        self._rest = []              # what the walk has not yielded yet
+        self._relay_hops = 0
+        self._relay_bad = set()
+        if self.tools:
+            try:
+                g.hub_tool_turn = True
+            except Exception:                                    # noqa: BLE001
+                pass
 
     # -- stalled gateways ---------------------------------------------------- #
 
     def walk(self, chain):
-        """Iterate the chain; on a TRIVIAL turn, once a provider has STALLED a
-        hop (hop budget / timeout / a silent peek) its remaining hops go behind
-        every other provider's. A sibling model behind the same slow gateway is
-        the likeliest to stall for the same reason -- the rule the hedge
-        partner pick already follows -- and on a one-liner each stall costs
-        25-45s. Demoted, never dropped. Any other turn: the chain as built."""
-        rest = list(chain or ())
+        """Iterate the chain; on a TRIVIAL or TOOL turn, once a provider has
+        STALLED a hop (hop budget / timeout / a silent peek) its remaining hops
+        go behind every other provider's. A sibling model behind the same slow
+        gateway is the likeliest to stall for the same reason -- the rule the
+        hedge partner pick already follows -- and on a one-liner each stall
+        costs 25-45s. Demoted, never dropped.
+
+        A TOOL turn also demotes a provider that has had
+        _TOOL_PER_PROVIDER_HOPS failed hops or its share of the deadline
+        (_provider_cap), and skips relay hops past _TOOL_RELAY_MAX_HOPS or on a
+        relay server that already failed in this walk. Any other turn: the
+        chain as built."""
+        self._ensure_ledgers()
+        self._rest = rest = list(chain or ())
         while rest:
+            self._close_hop()
+            if self.tools:
+                rest[:] = [e for e in rest if not self._relay_skip(e)]
+                if not rest:
+                    break
             i = 0
-            if self.trivial and self._stalled:
-                i = next((k for k, e in enumerate(rest) if e[0] not in self._stalled), 0)
+            if (self.trivial or self.tools) and (self._stalled or self.tools):
+                i = next((k for k, e in enumerate(rest)
+                          if not self._demoted(e[0])), 0)
             yield rest.pop(i)
+        self._close_hop()
+
+    def _ensure_ledgers(self):
+        if self._prov_hops is None:
+            self._prov_hops = {}
+        if self._prov_secs is None:
+            self._prov_secs = {}
+        if self._relay_bad is None:
+            self._relay_bad = set()
+
+    def _demoted(self, pid):
+        if pid in self._stalled:
+            return True
+        if not self.tools:
+            return False
+        if self._prov_hops.get(pid, 0) >= _TOOL_PER_PROVIDER_HOPS:
+            return True
+        cap = self._provider_cap()
+        return cap is not None and self._prov_secs.get(pid, 0.0) >= cap
+
+    def _relay_skip(self, entry):
+        """A relay hop a tool walk must not take (see walk)."""
+        try:
+            pid, model = entry[0], entry[1]
+            if not _is_relay_pid(pid):
+                return False
+            if self._relay_hops >= _TOOL_RELAY_MAX_HOPS:
+                return True
+            return _relay_server_id(pid, model) in self._relay_bad
+        except Exception:                                        # noqa: BLE001
+            return False
+
+    def _close_hop(self):
+        """The walk resumed, so the hop in flight FAILED (a served hop ends the
+        loop): charge its time to its provider, and remember a failed relay
+        server for the rest of this walk."""
+        cur, self._cur = self._cur, None
+        if not cur:
+            return
+        pid, model, started = cur
+        try:
+            self._prov_secs[pid] = (self._prov_secs.get(pid, 0.0)
+                                    + max(0.0, time.monotonic() - started))
+            if self.tools and _is_relay_pid(pid):
+                self._relay_bad.add(_relay_server_id(pid, model))
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _provider_cap(self):
+        """Seconds one provider may spend on this TOOL turn while another
+        provider still waits, or None (no deadline / not a tool turn)."""
+        if not self.tools or not self.limit:
+            return None
+        share = (_TOOL_PROVIDER_SHARE_HUGE if self.est >= STREAM_HUGE_REQUEST_TOKENS
+                 else _TOOL_PROVIDER_SHARE)
+        return max(_TOOL_PROVIDER_MIN_SECONDS, share * float(self.limit))
+
+    def _others_waiting(self, pid):
+        return any(e[0] != pid for e in (self._rest or ()))
 
     def _note_stall(self, pid):
-        if self.trivial and pid:
+        if (self.trivial or self.tools) and pid:
             self._stalled.add(pid)
 
     def left(self):
@@ -24337,6 +24816,13 @@ class _ChainClock:
                        if _is_slow_model(pid, model)
                        else _TRIVIAL_HOP_BUDGET)
             budget = _adaptive_hop_budget(pid, model, ceiling, stream)
+        # A TOOL turn: while another provider still waits, one provider may
+        # not spend more than its share of the deadline -- MEASURED, nvidia
+        # took all 240 s of a 16K tool turn over three hops.
+        cap = self._provider_cap()
+        if cap is not None and not _is_sub(pid) and self._others_waiting(pid):
+            room = max(_TOOL_PROVIDER_MIN_HOP, cap - self._prov_secs.get(pid, 0.0))
+            budget = room if budget is None else min(budget, room)
         left = self.left()
         if left is not None:
             budget = left if budget is None else min(budget, left)
@@ -24615,6 +25101,13 @@ class _ChainClock:
         model = (payload or {}).get("model")
         _ctx_note_tried(pid, model)
         self._hop_started = time.monotonic()
+        self._ensure_ledgers()
+        if self._cur is None or self._cur[0] != pid:
+            # A same-hop retry (hedge=False) is the SAME hop: counted once.
+            self._prov_hops[pid] = self._prov_hops.get(pid, 0) + 1
+            if self.tools and _is_relay_pid(pid):
+                self._relay_hops += 1
+            self._cur = (pid, model, self._hop_started)
         self._hop_budget = self._budget_for(pid, model, stream)
         try:
             if self._hop_budget is None:
@@ -24651,6 +25144,12 @@ class _ChainClock:
         except requests.exceptions.Timeout:
             _note_recent_hop_failure(pid, model, "timeout")
             self._note_long_stall(pid, model)
+            raise
+        except requests.exceptions.ConnectionError:
+            # A relay server that cannot even be reached on a tool turn: one
+            # strike toward skipping it for tool requests (_relay_tool_sick).
+            if self.tools:
+                _note_relay_tool_fail(pid, model)
             raise
         self._note_status(pid, model, resp, stream)
         return resp
@@ -25833,6 +26332,8 @@ def _note_nonanswer(pid, model, kind=_PROMPT_UNSET):
     if kind is _PROMPT_UNSET:
         kind = _take_nonanswer_kind()
     _record_outcome(pid, model, False)
+    if _in_tool_turn():
+        _note_relay_tool_fail(pid, model)   # no-op for a non-relay provider
     if kind in ("provider_quota", "provider_error"):
         if kind == "provider_quota":
             _throttle_failed_hop(pid, model, secs=_PROVIDER_QUOTA_COOLDOWN)
@@ -29331,7 +29832,8 @@ def _chat_completions_uncached(body):
     # See _ChainClock: the request deadline and the trivial-turn hop budget.
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
-        body.get("messages"), body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)), est=est, stream=stream)
+        body.get("messages"), body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)),
+        tools=has_tools, est=est, stream=stream)
     # Context bookkeeping for this request (original size, conversation id).
     # The native overflow error is an OpenAI-client contract, so it is only
     # armed on the real /v1/chat/completions route -- not on the foreign
@@ -30365,7 +30867,8 @@ def v1_responses(_retry_pass=False, _hedged=False):
     # See _ChainClock: the request deadline and the trivial-turn hop budget.
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
-        messages, body.get("max_output_tokens"), diff, est, pinned=bool(_pin_kw)), est=est, stream=stream)
+        messages, body.get("max_output_tokens"), diff, est, pinned=bool(_pin_kw)),
+        tools=has_tools, est=est, stream=stream)
     _chain = _build_chain(pid, resolved, est, require_vision=has_images,
                           require_tools=has_tools, messages=messages,
                           **_pin_kw)
@@ -31295,7 +31798,8 @@ def v1_messages():
     # See _ChainClock: the request deadline and the trivial-turn hop budget.
     _mark_turn_shape(diff, est, pinned=bool(_pin_kw))
     _clock = _ChainClock(trivial=_is_trivial_turn(
-        oai_messages, body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)), est=est, stream=stream)
+        oai_messages, body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)),
+        tools=has_tools, est=est, stream=stream)
     _chain = _build_chain(pid, resolved, est, require_vision=has_images,
                           require_tools=has_tools, messages=oai_messages,
                           **_pin_kw)
