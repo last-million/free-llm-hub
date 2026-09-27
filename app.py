@@ -25828,8 +25828,17 @@ def _judge_peeked(chunks, check=None, raw_items=None, prompt=None, complete=True
                 used_tools=bool(check.get("used_tools")), complete=complete):
             _set_nonanswer_kind("no_tools_claim")
             return "nonanswer"
+        # A bare announcement on a TOOL turn is judged only on the COMPLETE
+        # reply: mid-stream "I'll update the" is usually the lead-in to the
+        # tool call that follows (the peek reads on for it -- see
+        # _announce_pending), and judging the partial text threw such turns
+        # away. Kind "announced": a quality failure, one retry per request.
+        tools_turn = bool(check and check.get("tools_offered"))
+        if tools_turn and complete and _ends_with_announcement(text):
+            _set_nonanswer_kind("announced")
+            return "nonanswer"
         if (_looks_like_text_tool_call(text)
-                or _looks_like_announced_not_acted(text)
+                or (not tools_turn and _looks_like_announced_not_acted(text))
                 or _looks_like_refusal(text)
                 or _is_upstream_nonanswer(text, prompt)
                 # Bare-tool-name and dangling-colon only mean anything on a
@@ -25971,6 +25980,7 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
         tools_offered=True,
         prompt=prompt if prompt is not None else check.get("last_prompt"),
         used_tools=bool(check.get("used_tools"))))
+    tools_turn = bool(check and check.get("tools_offered"))
 
     def _judge(seen, complete=True):
         verdict = _judge_peeked(seen, check, box["buf"], prompt=prompt,
@@ -25980,9 +25990,14 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
 
     def _read_on_end(seen):
         """Verdict for a stream that ENDED while the peek read on for a
-        no-tools claim: everything else was judged "content" already."""
-        if _looks_like_no_tools_claim(_peeked_text("".join(seen))):
+        no-tools claim or a possible bare announcement: everything else was
+        judged "content" already."""
+        text = _peeked_text("".join(seen))
+        if watch and _looks_like_no_tools_claim(text):
             box["kind"] = "no_tools_claim"
+            return "nonanswer"
+        if tools_turn and _ends_with_announcement(text):
+            box["kind"] = "announced"
             return "nonanswer"
         return "content"
 
@@ -26052,7 +26067,16 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                         continue
                     if read_on_at is None:
                         verdict = _judge(seen_content, complete=False)
-                        if verdict != "content" or not watch:
+                        # A tool turn whose reply so far may still END as a
+                        # bare announcement ("I'll read the file."): read on
+                        # until a tool call arrives (commit), the text grows
+                        # past one (commit) or the stream ends (judged whole
+                        # by _read_on_end). MEASURED LIVE 2026-09-27: codex's
+                        # turn ended on "I'll read the last line of big1.txt
+                        # for you." -- committed after ~4 per-token frames.
+                        box["ann"] = (verdict == "content" and tools_turn
+                                      and _announce_pending(_peeked_text("".join(seen_content))))
+                        if verdict != "content" or not (watch or box["ann"]):
                             box["status"] = verdict
                             return
                         # MEASURED 2026-09-27: _PEEK_JUDGE_CHARS counts frame
@@ -26067,12 +26091,19 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                             _NO_TOOLS_PEEK_EXTRA_S,
                             deadline_s + (content_grace or 0.0)
                             - (read_on_at - started) - 0.5))
-                    state = _no_tools_peek_state(_peeked_text("".join(seen_content)))
-                    if state == "claim":
-                        box["kind"] = "no_tools_claim"
-                        box["status"] = "nonanswer"
-                        return
-                    if state == "clear" or time.monotonic() - read_on_at >= read_on_budget:
+                        box["nt"] = watch
+                    text_now = _peeked_text("".join(seen_content))
+                    if box.get("nt"):
+                        state = _no_tools_peek_state(text_now)
+                        if state == "claim":
+                            box["kind"] = "no_tools_claim"
+                            box["status"] = "nonanswer"
+                            return
+                        if state == "clear" or time.monotonic() - read_on_at >= read_on_budget:
+                            box["nt"] = False
+                    if box.get("ann") and not _announce_pending(text_now):
+                        box["ann"] = False
+                    if not (box.get("nt") or box.get("ann")):
                         box["status"] = "content"
                         return
                     continue
@@ -26311,6 +26342,11 @@ def _take_nonanswer_kind():
     kind = getattr(_nonanswer_tls, "kind", None)
     _nonanswer_tls.kind = None
     return kind
+
+
+def _peek_nonanswer_kind():
+    """The kind _take_nonanswer_kind would return, left in place for it."""
+    return getattr(_nonanswer_tls, "kind", None)
 
 
 def _request_prompt_text():
@@ -26983,6 +27019,125 @@ def _looks_like_announced_not_acted(text):
     return bool(_INTENT_RE.search(body) and _WORK_VERB_RE.search(body))
 
 
+# A TOOL turn that ends on "I'll read the last line of big1.txt for you." did
+# nothing. MEASURED LIVE 2026-09-27 (codex, /v1/responses): that exact reply
+# ended a turn -- _WORK_VERB_RE is about BUILDING (write/fix/run...), so the
+# read-only actions an agent announces most (read, open, look at, list...)
+# never matched. This is the stricter shape for them: the intent phrase at a
+# sentence start, then (a few adverbs at most) the action verb itself. Only
+# ever judged on a COMPLETE reply to a turn that offered tools -- mid-stream,
+# "I'll read the file." is usually the lead-in to the call that follows.
+_ANNOUNCE_ACTION_RE = re.compile(
+    r"(?:^|(?<=[.!?:])\s+|\n)\W*"
+    r"(?:i\s*['’]?ll|i will|let me(?!\s+know)|i\s*['’]?m (?:now )?going to|i am (?:now )?going to"
+    r"|i\s*['’]?m (?:now )?about to|i am about to|now,? i\s*['’]?ll|first,? i\s*['’]?ll"
+    r"|next,? i\s*['’]?ll)\s+"
+    r"(?:(?:now|first|quickly|just|then|also|go ahead and|start by|begin by)\s+)*"
+    r"(?:read\w*|open\w*|look\w*|check\w*|inspect\w*|examin\w*|view\w*|list\w*|search\w*"
+    r"|grep\w*|find\w*|locat\w*|fetch\w*|get|grab\w*|run\w*|execut\w*|print\w*|show\w*"
+    r"|display\w*|tail\w*|cat|scan\w*|explor\w*|investigat\w*|count\w*|quer\w*|pull\w*"
+    r"|verif\w*|test\w*|use|call\w*|invok\w*)\b", re.I)
+
+
+def _looks_like_announced_action(text):
+    """True when `text` (a COMPLETE reply on a tool turn) is only an
+    announcement of an action -- see the note above. Short, no question."""
+    if not text or not isinstance(text, str):
+        return False
+    body = text.strip()
+    if not body or len(body) > _ANNOUNCE_MAX_CHARS or "?" in body or "```" in body:
+        return False
+    return bool(_ANNOUNCE_ACTION_RE.search(body))
+
+
+def _announced_only(text):
+    """Either announcement detector (see both notes): a reply that states what
+    it is about to do and does nothing. For COMPLETE replies on tool turns."""
+    return _looks_like_announced_not_acted(text) or _looks_like_announced_action(text)
+
+
+_LAST_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+# The intent phrase OPENING a last sentence. Stricter than _INTENT_RE (which
+# also takes a bare "I'm" and "let me"): "I'm here to help." and "Let me know
+# if you want me to add tests." end real answers.
+_LAST_INTENT_RE = re.compile(
+    r"\W*(?:i\s*['’]?ll\b|i will\b|let me\b(?!\s+know)"
+    r"|(?:i\s*['’]?m|i am)\s+(?:now\s+)?(?:going to|about to|[a-z-]+ing\b)"
+    r"|(?:now|first|next),?\s+i\s*['’]?ll\b|(?:now|first|next),?\s+i will\b"
+    r"|now (?:writing|creating|building|generating|adding|updating)"
+    r"|proceeding to|moving (?:on )?to|starting (?:on|with))", re.I)
+
+
+def _ends_with_announcement(text):
+    """True when a COMPLETE streamed reply on a tool turn ENDS on an
+    announcement of an action (its last sentence opens with the intent and
+    names the action) and is short. Judged on the last sentence, not the
+    whole reply: "...you can run the command yourself, and I'll help you
+    interpret it." (a no-tools claim after tools ran) names work, but it does
+    not end by announcing any. Never raises."""
+    try:
+        if not text or not isinstance(text, str):
+            return False
+        body = text.strip()
+        if not body or len(body) > _ANNOUNCE_MAX_CHARS or "?" in body or "```" in body:
+            return False
+        parts = [p for p in _LAST_SENTENCE_SPLIT_RE.split(body) if p.strip()]
+        last = parts[-1].strip() if parts else body
+        if _ANNOUNCE_ACTION_RE.search(last):
+            return True
+        return bool(_LAST_INTENT_RE.match(last) and _WORK_VERB_RE.search(last))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _announce_pending(text):
+    """True while a PARTIAL reply on a tool turn may still end as a bare
+    announcement: short, no question, an intent phrase in it. The peek reads
+    on instead of judging it now (a tool call may follow) -- see
+    _peek_until_content."""
+    try:
+        if not text or not isinstance(text, str):
+            return False
+        body = text.strip()
+        if not body or len(body) > _ANNOUNCE_MAX_CHARS or "?" in body or "```" in body:
+            return False
+        if _ends_with_announcement(body):
+            return True
+        # ...or its last sentence is still OPEN and opens with the intent
+        # ("I'll read the" -- the action may be the next word).
+        parts = [p for p in _LAST_SENTENCE_SPLIT_RE.split(body) if p.strip()]
+        last = parts[-1].strip() if parts else body
+        return last[-1:] not in ".!?:" and bool(_LAST_INTENT_RE.match(last))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _announce_skip_spent(kind):
+    """ONE retry per request for a reply that only announced its action: the
+    first such reply walks the chain on (kind "announced"); a second one in
+    the same request is served, so a pool that keeps announcing cannot burn
+    the whole deadline. False for any other kind. Never raises."""
+    if kind != "announced":
+        return False
+    try:
+        if getattr(g, "hub_announce_skipped", False):
+            return True
+        g.hub_announce_skipped = True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return False
+
+
+def _skip_nonanswer():
+    """For a hop the detectors just called a non-answer: True to walk on to
+    the next hop (the usual), False when it is a SECOND bare announcement in
+    this request -- served instead (see _announce_skip_spent)."""
+    if _announce_skip_spent(_peek_nonanswer_kind()):
+        _take_nonanswer_kind()
+        return False
+    return True
+
+
 def _looks_like_dangling_lead_in(text):
     """True for a SHORT reply that ends on a colon with nothing after it -- a
     lead-in to a step that never came. Only ever judged on a tools turn, where
@@ -27057,9 +27212,13 @@ def _chat_json_nonanswer(data, has_tools=False, tools=None):
             return True
         if has_tools and (_looks_like_text_tool_call(content)
                           or tool_rescue.has_model_markup(content)
-                          or _looks_like_announced_not_acted(content)
                           or tool_rescue.is_bare_tool_name(content, tools)
                           or _looks_like_dangling_lead_in(content)):
+            return True
+        if has_tools and _announced_only(content):
+            # kind "announced": a quality failure, one retry per request
+            # (_announce_skip_spent) -- never a dead-mark over one reply.
+            _set_nonanswer_kind("announced")
             return True
         # A refusal counts with or without tools: it is no more useful in plain
         # chat, and the hub has other models that will answer.
@@ -27089,9 +27248,10 @@ def _note_nonanswer(pid, model, kind=_PROMPT_UNSET):
     _record_outcome(pid, model, False)
     if _in_tool_turn():
         _note_relay_tool_fail(pid, model)   # no-op for a non-relay provider
-    # "no_tools_claim" (_no_tools_claim) is a heuristic about ONE reply: the
-    # failure is filed, the pair stays routable.
-    if kind in ("provider_quota", "provider_error", "no_tools_claim"):
+    # "no_tools_claim" (_no_tools_claim) and "announced" (_announced_only /
+    # _ends_with_announcement) are heuristics about ONE reply: the failure is
+    # filed, the pair stays routable.
+    if kind in ("provider_quota", "provider_error", "no_tools_claim", "announced"):
         if kind == "provider_quota":
             _throttle_failed_hop(pid, model, secs=_PROVIDER_QUOTA_COOLDOWN)
         return
@@ -27319,6 +27479,9 @@ _TEMPLATE_OPEN_RE = re.compile(r"<\|[\w.-]*\|?")
 # or script switch is cut at most _TAIL_EVERY chars late (the cut point
 # itself is unchanged).
 _TAIL_EVERY = 64
+# Chars of the text's end the gate keeps for its per-delta restart checks
+# (answer_check.RESTART_KEY_MAX plus room for the boundary before it).
+_GATE_TAIL = 2 * answer_check.RESTART_KEY_MAX + 8
 _TAIL_TRIGGER_CHARS = frozenset("<>:|")
 # A BARE-VALUE ask ("Reply with only the number.", answer_check.brevity_ask):
 # the whole answer is a few chars, so the hold does not end on the 2.5 s
@@ -27371,6 +27534,12 @@ class _StreamAnswerGate:
         self._tail_state = {}        # answer_check.inspect_tail's scan cache
         self._emitted = 0            # chars of self._text already sent
         self._meta = {}              # id / created / model of the upstream chunks
+        # A glued second answer (answer_check.glued_restart): the reply's
+        # opening line once known (False = none), and where it ends.
+        self._rkey = None
+        self._rfirst_end = None
+        self._tail = ""              # the last _GATE_TAIL chars of the text
+        self._tail_before = ""       # ...as they were before the latest delta
         self.cut = False
         self.reasons = []
 
@@ -27444,6 +27613,10 @@ class _StreamAnswerGate:
     def _add(self, t):
         self._parts.append(t)
         self._len += len(t)
+        # Per-delta checks read only this rolling tail: self._text joins the
+        # whole answer, which on every delta would be O(n^2) on a long one.
+        self._tail_before = self._tail
+        self._tail = (self._tail + t)[-_GATE_TAIL:]
 
     # -- framing ----------------------------------------------------------- #
     def _frames(self, item):
@@ -27588,6 +27761,68 @@ class _StreamAnswerGate:
             return None
         return self._cut_at(c, ["tail"])
 
+    # -- a second answer glued onto the first (answer_check.glued_restart) -- #
+    def _restart_key(self):
+        k = self._rkey
+        if k is None:
+            head = self._text[:2048]
+            s = head.lstrip()
+            if "\n" in s or len(s) >= answer_check.RESTART_KEY_MAX:
+                k = answer_check.restart_key(head) or False
+                if k:
+                    at = head.find(k)
+                    self._rfirst_end = at + len(k) if at >= 0 else None
+                    if self._rfirst_end is None:
+                        k = False
+                self._rkey = k
+        return k or None
+
+    def _judge_restart(self, t):
+        """Frames ending the stream where a glued second answer starts, or
+        None. Checks only the new text (plus a key's length before it)."""
+        key = self._restart_key()
+        if not key:
+            return None
+        try:
+            region = self._tail_before[-(len(key) + 2):] + t
+            base = self._len - len(region)          # offset of region[0]
+            i = region.find(key, 1)
+            while i >= 0:
+                if self._restart_at(base + i, region[max(0, i - 2):i], region[i]):
+                    return self._cut_at(base + i, ["restarted"])
+                i = region.find(key, i + 1)
+        except Exception:                                        # noqa: BLE001
+            pass
+        return None
+
+    def _restart_at(self, q, before, cur):
+        """A restatement at absolute offset `q` (`before`: the chars right
+        before it) is a glued second answer: past the opening itself, glued
+        (answer_check.restart_boundary), and not inside a code fence -- the
+        one O(n) test, reached only by a real candidate."""
+        return (q >= (self._rfirst_end or 0)
+                and answer_check.restart_boundary(before, cur)
+                and self._text.count("```", 0, q) % 2 == 0)
+
+    def _restart_pending(self):
+        """True while the text ENDS in a glued proper prefix of the reply's
+        opening line -- maybe the start of a second answer. That text is kept
+        back until the restatement completes (and is cut) or diverges, so not
+        one character of a second answer reaches the client."""
+        key = self._restart_key()
+        if not key:
+            return False
+        try:
+            tail = self._tail
+            base = self._len - len(tail)
+            for j in range(max(1, len(tail) - len(key) + 1), len(tail)):
+                if key.startswith(tail[j:]) and self._restart_at(
+                        base + j, tail[max(0, j - 2):j], tail[j]):
+                    return True
+        except Exception:                                        # noqa: BLE001
+            return False
+        return False
+
     def _marker_open(self, t):
         """True while the released text ends in what may be the START of a
         leak marker split across deltas ("<thi" + "nk>"): that delta is then
@@ -27651,6 +27886,11 @@ class _StreamAnswerGate:
                     if stop_frames:
                         yield from stop_frames
                         return
+                    if self._restart_pending():
+                        # maybe a second answer starting: the relay branch
+                        # below keeps it back until it completes or diverges
+                        holding = False
+                        continue
                     yield from held
                     held, holding = [], False
                     self._emitted = self._judged = self._len
@@ -27702,17 +27942,21 @@ class _StreamAnswerGate:
                             if stop_frames:
                                 yield from stop_frames
                                 return
+                            if not fin and self._restart_pending():
+                                holding = False  # kept back: see the relay branch
+                                continue
                             yield from held
                             held, holding = [], False
                             self._emitted = self._judged = self._len
                             continue
-                        stop_frames = self._judge_tail(t)
+                        stop_frames = self._judge_restart(t) or self._judge_tail(t)
                         if stop_frames:
                             yield from stop_frames
                             return
-                        if not fin and self._marker_open(t):
-                            held.append(fr)      # a split leak marker may follow
-                            continue
+                        marker = self._marker_open(t)
+                        if not fin and (marker or self._restart_pending()):
+                            held.append(fr)      # a split leak marker, or a glued
+                            continue             # second answer, may follow
                         if held:
                             yield from held
                             held = []
@@ -31074,7 +31318,7 @@ def _chat_completions_uncached(body):
                     last_error = "non-json"
                     resp.close()
                     continue
-                if _chat_json_nonanswer(data, has_tools, body.get("tools")):
+                if _chat_json_nonanswer(data, has_tools, body.get("tools")) and _skip_nonanswer():
                     # A 200 whose content IS the relay backend's error page (see
                     # _chat_json_nonanswer). Falls through to the next hop exactly
                     # like an empty 200, and sidelines the id so it stops winning.
@@ -31135,6 +31379,8 @@ def _chat_completions_uncached(body):
                                                   has_tools, body.get("tools"), lines=False)
                     if _again is not None:
                         resp, it, status, buffered, payload = _again
+                if status == "nonanswer" and not _skip_nonanswer():
+                    status = "content"    # a 2nd bare announcement: served (one retry)
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -31195,7 +31441,7 @@ def _chat_completions_uncached(body):
                     last_error = "empty" if _sk == "empty" else "starved"
                     continue
                 data, payload = data2, payload2
-            if _chat_json_nonanswer(data, has_tools, body.get("tools")):
+            if _chat_json_nonanswer(data, has_tools, body.get("tools")) and _skip_nonanswer():
                 # A 200 whose content IS the relay backend's error page (see
                 # _chat_json_nonanswer). Falls through to the next hop exactly
                 # like an empty 200, and sidelines the id so it stops winning.
@@ -32111,7 +32357,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                     last_error = "non-json"
                     resp.close()
                     continue
-                if _chat_json_nonanswer(data, has_tools, tools):
+                if _chat_json_nonanswer(data, has_tools, tools) and _skip_nonanswer():
                     # A 200 whose content IS the relay backend's error page (see
                     # _chat_json_nonanswer). Falls through to the next hop exactly
                     # like an empty 200, and sidelines the id so it stops winning.
@@ -32165,6 +32411,8 @@ def v1_responses(_retry_pass=False, _hedged=False):
                                                   has_tools, tools, lines=True)
                     if _again is not None:
                         resp, line_it, status, buffered, payload = _again
+                if status == "nonanswer" and not _skip_nonanswer():
+                    status = "content"    # a 2nd bare announcement: served (one retry)
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -32219,7 +32467,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
             # unambiguous, else removed -- so an all-nameless reply is the
             # empty 200 below (next hop), never a call codex cannot run.
             _fix_nameless_tool_calls(data, tools)
-            if _chat_json_nonanswer(data, has_tools, tools):
+            if _chat_json_nonanswer(data, has_tools, tools) and _skip_nonanswer():
                 # A 200 whose content IS the relay backend's error page (see
                 # _chat_json_nonanswer). Falls through to the next hop exactly
                 # like an empty 200, and sidelines the id so it stops winning.
@@ -32639,6 +32887,40 @@ def _sse_event(name, obj):
     return ("event: %s\ndata: %s\n\n" % (name, json.dumps(obj, ensure_ascii=False))).encode("utf-8")
 
 
+def _anthropic_close_blocks(block_index, text_open, tool_blocks, late_text, closed):
+    """The content_block events that end an Anthropic stream: a stop for every
+    block still open (the live text block, every tool block), then the text
+    that arrived after a tool call started as ONE text block, or an empty text
+    block when nothing was sent at all. Idempotent -- `closed` and `late_text`
+    are updated in place -- so the error path after a partial close never
+    stops a block twice. See the note in _anthropic_stream."""
+    open_ = [i for i in ([text_open] if text_open is not None else [])
+             + sorted(tool_blocks.values()) if i not in closed]
+    for i in open_:
+        closed.add(i)
+        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": i})
+    started = [block_index] + list(closed) + list(tool_blocks.values())
+    late = "".join(late_text)
+    del late_text[:]
+    nxt = max(started) + 1
+    if late.strip():
+        closed.add(nxt)
+        yield _sse_event("content_block_start", {
+            "type": "content_block_start", "index": nxt,
+            "content_block": {"type": "text", "text": ""}})
+        yield _sse_event("content_block_delta", {
+            "type": "content_block_delta", "index": nxt,
+            "delta": {"type": "text_delta", "text": late}})
+        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": nxt})
+    elif nxt == 0 and not closed:
+        # upstream produced nothing: still emit a valid shape
+        closed.add(0)
+        yield _sse_event("content_block_start", {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}})
+        yield _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+
+
 def _anthropic_final_usage(real_in, input_est, pid, model, out_tokens):
     """The closing message_delta's usage: output tokens, plus input tokens
     sized on the ORIGINAL request (the upstream count scaled back up by the
@@ -32668,6 +32950,7 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
     if line_iter is None:
         line_iter = resp.iter_lines(decode_unicode=False)
     last_progress = time.time()
+    message_ended = False
     try:
         yield _sse_event("message_start", {"type": "message_start", "message": {
             "id": msg_id, "type": "message", "role": "assistant", "model": model_str,
@@ -32675,9 +32958,21 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
             "usage": {"input_tokens": input_tokens, "output_tokens": 0}}})
         yield _sse_event("ping", {"type": "ping"})
 
-        block_index = -1        # index of the currently open anthropic block
-        block_kind = None       # None | 'text' | 'tool'
+        # EVERY BLOCK IS STARTED ONCE AND STOPPED ONCE, and no delta ever names
+        # a stopped block. Claude Code rejects anything else as a malformed
+        # stream ("event referenced an already-closed content block"), keeps
+        # what it had and -- in -p mode -- asks the model to "resume" in a
+        # SECOND request: a second answer. It used to happen whenever text
+        # arrived between a tool call's argument deltas (the tool block was
+        # stopped for the text, then got more arguments) or when a failure
+        # after the final stop sent the stop again. Now text before the first
+        # tool call streams live; text after it is sent as ONE text block after
+        # the tool blocks, which stay open until the upstream is done.
+        block_index = -1        # highest anthropic block index started
+        text_open = None        # index of the open live text block
         tool_blocks = {}        # openai tool_call index -> anthropic block index
+        late_text = []          # text that arrived after a tool call started
+        closed = set()          # block indexes already stopped
         finish_reason = None
         out_tokens = None
         real_out_tokens = None   # usage_history: only set from a REAL upstream usage object
@@ -32740,21 +33035,21 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
                     (p.get("text") or "") for p in dtext
                     if isinstance(p, dict)) if isinstance(dtext, list) else str(dtext)
             if dtext:
-                if block_kind != "text":
-                    if block_kind is not None:
-                        yield _sse_event("content_block_stop",
-                                         {"type": "content_block_stop", "index": block_index})
-                    block_index += 1
-                    block_kind = "text"
-                    yield _sse_event("content_block_start", {
-                        "type": "content_block_start", "index": block_index,
-                        "content_block": {"type": "text", "text": ""}})
                 text_chars += len(dtext)
                 if hop_pid and text_chars <= _STREAM_DIGEST_CAP:
                     text_parts.append(dtext)
-                yield _sse_event("content_block_delta", {
-                    "type": "content_block_delta", "index": block_index,
-                    "delta": {"type": "text_delta", "text": dtext}})
+                if tool_blocks:
+                    late_text.append(dtext)        # see the note on block_index
+                else:
+                    if text_open is None:
+                        block_index += 1
+                        text_open = block_index
+                        yield _sse_event("content_block_start", {
+                            "type": "content_block_start", "index": block_index,
+                            "content_block": {"type": "text", "text": ""}})
+                    yield _sse_event("content_block_delta", {
+                        "type": "content_block_delta", "index": text_open,
+                        "delta": {"type": "text_delta", "text": dtext}})
 
             for tcd in delta.get("tool_calls") or []:
                 if not isinstance(tcd, dict):
@@ -32762,11 +33057,12 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
                 oai_idx = tcd.get("index", 0)
                 fn = tcd.get("function") or {}
                 if oai_idx not in tool_blocks:
-                    if block_kind is not None:
+                    if text_open is not None:
+                        closed.add(text_open)
                         yield _sse_event("content_block_stop",
-                                         {"type": "content_block_stop", "index": block_index})
+                                         {"type": "content_block_stop", "index": text_open})
+                        text_open = None
                     block_index += 1
-                    block_kind = "tool"
                     tool_blocks[oai_idx] = block_index
                     yield _sse_event("content_block_start", {
                         "type": "content_block_start", "index": block_index,
@@ -32790,13 +33086,9 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
                                    tool_calls=bool(tool_blocks), finish_reason=finish_reason,
                                    prompt_text=prompt_text, tools_offered=tools_offered,
                                    last_prompt=last_prompt)
-        if block_index < 0:  # upstream produced nothing: still emit a valid shape
-            block_index = 0
-            yield _sse_event("content_block_start", {
-                "type": "content_block_start", "index": 0,
-                "content_block": {"type": "text", "text": ""}})
-        yield _sse_event("content_block_stop",
-                         {"type": "content_block_stop", "index": block_index})
+        for ev in _anthropic_close_blocks(block_index, text_open, tool_blocks,
+                                          late_text, closed):
+            yield ev
         if out_tokens is None:
             out_tokens = max(1, text_chars // 4)
         yield _sse_event("message_delta", {
@@ -32804,6 +33096,7 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
             "delta": {"stop_reason": _map_stop_reason(finish_reason), "stop_sequence": None},
             "usage": _anthropic_final_usage(real_in_tokens, input_tokens, hop_pid,
                                             hop_model, out_tokens)})
+        message_ended = True
         yield _sse_event("message_stop", {"type": "message_stop"})
     except Exception as exc:
         # A mid-stream upstream failure (connection reset, ChunkedEncodingError,
@@ -32815,13 +33108,13 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
         # normal client disconnect still tears the generator down as before.
         _log.error("Anthropic stream error: %s", _sanitize(str(exc)))
         try:
-            if block_index < 0:
-                block_index = 0
-                yield _sse_event("content_block_start", {
-                    "type": "content_block_start", "index": 0,
-                    "content_block": {"type": "text", "text": ""}})
-            yield _sse_event("content_block_stop",
-                             {"type": "content_block_stop", "index": block_index})
+            if message_ended:
+                return          # message_stop already went out: nothing to close
+            # Stops only what is still open -- a block stopped before the
+            # failure is never stopped twice (see the note on block_index).
+            for ev in _anthropic_close_blocks(block_index, text_open, tool_blocks,
+                                              late_text, closed):
+                yield ev
             if out_tokens is None:
                 out_tokens = max(1, text_chars // 4)
             yield _sse_event("message_delta", {
@@ -33062,6 +33355,8 @@ def v1_messages():
                                                   has_tools, tools, lines=True)
                     if _again is not None:
                         resp, line_it, status, buffered, payload = _again
+                if status == "nonanswer" and not _skip_nonanswer():
+                    status = "content"    # a 2nd bare announcement: served (one retry)
                 if status != "content":
                     errors.append("%s: %s (200 but no content)" % (hop_pid, status))
                     last_error = _classify_hop_error(peek=status)
@@ -33109,7 +33404,7 @@ def v1_messages():
                     last_error = "empty" if _sk == "empty" else "starved"
                     continue
                 data, payload = data2, payload2
-            if _chat_json_nonanswer(data, has_tools, tools):
+            if _chat_json_nonanswer(data, has_tools, tools) and _skip_nonanswer():
                 # A 200 whose content IS the relay backend's error page (see
                 # _chat_json_nonanswer). Falls through to the next hop exactly
                 # like an empty 200, and sidelines the id so it stops winning.

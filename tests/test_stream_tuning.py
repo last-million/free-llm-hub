@@ -114,7 +114,11 @@ def test_clean_answer_is_released_after_its_first_80_chars_not_400():
     # chars (2.0 s here) or 2.5 s.
     t0 = time.monotonic()
     first_at = None
-    g = _gate(_slow(_frames(PROSE * 2), 0.02), "how do I rotate logs")
+    # Two paragraphs, not PROSE * 2: a paragraph restated GLUED onto itself
+    # is the double-answer shape the gate now cuts (see
+    # tests/test_double_answer.py).
+    two = PROSE + "\n\n" + PROSE
+    g = _gate(_slow(_frames(two), 0.02), "how do I rotate logs")
     body = []
     for fr in g:
         body.append(fr)
@@ -122,7 +126,7 @@ def test_clean_answer_is_released_after_its_first_80_chars_not_400():
             first_at = time.monotonic() - t0
     assert first_at is not None and first_at < 1.2, first_at
     text, fins = _parse(b"".join(body))
-    assert text == PROSE * 2 and fins == ["stop"] and not g.cut
+    assert text == two and fins == ["stop"] and not g.cut
     assert app._HOLD_EARLY_CHARS == AC.EARLY_MIN_CHARS == 80
 
 
