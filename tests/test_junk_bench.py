@@ -407,3 +407,17 @@ def test_long_context_reorder_keeps_the_benched_pair_last(recent_fail_ledger, mo
                         lambda pid, m: 0 if (pid, m) == BAD else 2)
     out = app._prefer_fast_long_context(other + [BAD], app.LONG_CTX_SPEED_TOKENS + 1)
     assert out[-1] == BAD, out
+
+
+def test_tool_walk_demotion_does_not_pull_a_benched_pair_forward():
+    """The WALK of a tool/trivial turn moves a stalled provider's remaining
+    hops behind the other providers' -- which pulled a benched pair ahead of
+    them (MEASURED 2026-09-27: dahl/DeepSeek-V4-Flash-0731, benched, was tried
+    before nvidia/kimi-k3 once nvidia had stalled one hop). A stall costs
+    time; a benched pair's garbage is served as a 200. Benched stays last."""
+    _junk(BAD, 3)
+    with app.app.test_request_context():
+        clock = app._ChainClock(tools=True)
+        clock._stalled = {"nvidia"}
+        out = list(clock.walk([("nvidia", "x"), BAD, ("groq", "g"), ("nvidia", "y")]))
+    assert out == [("groq", "g"), ("nvidia", "x"), ("nvidia", "y"), BAD], out

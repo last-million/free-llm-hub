@@ -24878,8 +24878,16 @@ class _ChainClock:
                     break
             i = 0
             if (self.trivial or self.tools) and (self._stalled or self.tools):
+                # A junk-benched pair is never what the demotion promotes: it
+                # stays the last hop the built chain made it (see _bench_last).
+                # MEASURED 2026-09-27: nvidia stalled one hop and the benched
+                # dahl pair was walked before nvidia's healthy sibling.
                 i = next((k for k, e in enumerate(rest)
-                          if not self._demoted(e[0])), 0)
+                          if not self._demoted(e[0])
+                          and not _is_pair_benched(e[0], e[1])), None)
+                if i is None:
+                    i = next((k for k, e in enumerate(rest)
+                              if not _is_pair_benched(e[0], e[1])), 0)
             yield rest.pop(i)
         self._close_hop()
 
