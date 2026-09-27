@@ -60,7 +60,7 @@ routing heuristics.
   429'd or ran out its time in the last 10 min (`_recent_hop_fail`,
   `_RECENT_FAIL_TTL`) is out of the primary pick and at the TAIL of every
   chain (kept, never dropped; not for a pinned model). The 25s/45s budgets are
-  now ceilings: a measured hop gets max(6s, 3x p90) (`_adaptive_hop_budget`).
+  now ceilings: a measured hop gets max(6s, 3.5x p90) (`_adaptive_hop_budget`).
   Trivial tool-free small turns HEDGE (`_ChainClock.plan_hedge`, flag
   `hedge_simple_turns`): after 1.5x p50 (min 3s) of silence the next candidate
   starts in parallel, first answer that passes answer_check wins, at most one
@@ -552,6 +552,33 @@ Covered by `tests/test_pipeline_complete.py`.
   that stalled a hop (budget/timeout/silent peek) behind every other one.
 - Brevity trims (`_fit_visible_to_caller`, the stream cap) never cut inside a
   token (`_cut_splits_token`): "50648" is never served as "5064".
+
+## Stream gate & budget tuning (2026-09-27)
+
+- **Early release**: `_StreamAnswerGate` still holds up to 400 chars / 2.5 s,
+  but releases as soon as `answer_check.reads_as_answer` passes (>= 80 chars,
+  >= 10 varied words, no glued run, no `<think>`/`<|`/tool markup, NOT a
+  number/word/yes-no brevity ask). Measured at 40 tok/s: first visible text
+  2.52 s -> 0.62 s. Passing `hold_chars=` pins the old window (tests). After
+  release a delta ending in a possible split leak marker ("<thi") is kept
+  back one delta (`_marker_open`) so half a `<think>` never leaks.
+- **Structured tails** (`answer_check._line_is_structured`: list items,
+  pipe rows, `[WARN]`/timestamp/PASSED log lines, indented output,
+  `key: value`, `>>>`/`$` prompts): a run is a loop only at the token cap
+  (3 copies), past 16 mid-stream/mid-text, or past 50 at a natural stop.
+  Plain prose keeps 5/8. A `=== 12 passed ===` banner is not a separator run.
+  Covered by `tests/test_stream_tuning.py`.
+- **Window aliases**: `_window_info` also tries `_ctx_alias_candidates` —
+  the `aliases` a provider's own catalog row names (pollinations
+  `openai-fast` -> `gpt-oss-20b`), relay re-spellings `_CTX_ID_REWRITES`
+  (morph-kimik3 -> kimi-k3, zai-org-glm-5-3-flash -> glm-5.3-flash, gpt-5-2,
+  gemma4:31b -> gemma-4-31b-it) — inferred before reference. New sourced
+  `_CTX_REFERENCE` rows: Claude, GPT-4o/4.1/5, Grok 3/4, mistral-tiny,
+  yi-large, Jamba 1.5, DBRX, StarCoder2, DeepSeek-Coder. Live replay:
+  "default" 60 -> 35 of 256. Covered by `tests/test_window_coverage.py`.
+- **Budgets from data**: `_ADAPTIVE_HOP_MULT` 3.0 -> 3.5 (heaviest healthy
+  p95/p50 = 3.33); every other adaptive constant re-checked against the
+  measured snapshot in `tests/test_latency_constants.py` and kept.
 
 ## Tests
 
