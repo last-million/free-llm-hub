@@ -57,6 +57,35 @@ test, and an operator/CI override of the real env var is never touched.
 import os
 import tempfile
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolated_claude_settings_stay_out_of_the_real_home(monkeypatch):
+    """THE SAME PROBLEM, ONE MORE FILE. The /agent claude fallback writes the
+    hub's modelPicker into the isolated copy's settings.json
+    (agentic_chat._seed_claude_picker). 16 tests across 5 files build a real
+    claude env against the REAL ~/.free-llm-hub/isolated-clis/claude/config
+    (found 2026-09-27: the file reappeared after every suite run). Writes
+    aimed at that one directory land in a sandbox instead; any other config
+    home -- every test that passes its own -- is untouched."""
+    try:
+        import agentic_chat as ac
+        real = os.path.normcase(os.path.abspath(ac._isolated_config_dir("claude")))
+        orig = ac._claude_settings_file
+    except Exception:                                            # noqa: BLE001
+        return
+    sandbox = os.path.join(tempfile.gettempdir(), "hub-pytest-hub-state",
+                           "isolated-claude-config")
+
+    def redirected(config_home):
+        if os.path.normcase(os.path.abspath(config_home)) == real:
+            os.makedirs(sandbox, exist_ok=True)
+            return os.path.join(sandbox, "settings.json")
+        return orig(config_home)
+
+    monkeypatch.setattr(ac, "_claude_settings_file", redirected)
+
 
 def pytest_configure(config):
     base = os.path.join(tempfile.gettempdir(), "hub-pytest-base")

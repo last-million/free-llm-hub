@@ -763,6 +763,7 @@ def _apply_claude_hub_fallback(env, config_home, quality="normal", session_id=No
     this stops touching the env at all and the real subscription -- generally
     the stronger option -- takes over on its own."""
     if _isolated_signed_in("claude"):
+        _unseed_claude_picker(config_home)   # hub ids would now go to Anthropic
         return
     env["ANTHROPIC_BASE_URL"] = _hub_base_url(session_id)
     env["ANTHROPIC_AUTH_TOKEN"] = config.get_local_api_key() or "free-llm-hub"
@@ -774,7 +775,16 @@ def _apply_claude_hub_fallback(env, config_home, quality="normal", session_id=No
     # carries no session identity of its own.
     # One mapping, not a second copy of it: a mode id missing here would be a
     # turn routed as plain `auto` while the UI said otherwise.
-    env["ANTHROPIC_MODEL"] = _hub_model_for(quality, mode)
+    # claude_model_id: Claude Code swallows "best" as its own alias.
+    env["ANTHROPIC_MODEL"] = claude_model_id(_hub_model_for(quality, mode))
+    # The same mapping Connect writes for a real install (claude_hub_env), with
+    # ONE difference: opus maps to this session's own tier, not `max`. A normal
+    # turn is launched with `--model opus` (_MODEL_ALIAS), so opus->max would
+    # silently lift every normal session into the max tier.
+    env.update(claude_hub_env(opus=env["ANTHROPIC_MODEL"]))
+    # The picker rows are what make these ids known (behavesAs); only a settings
+    # file can carry them, so the isolated copy's own settings.json gets them.
+    _seed_claude_picker(config_home)
 
 
 # Bare minimum codex needs to treat the hub as a provider -- the same shape
@@ -829,6 +839,15 @@ _CODEX_HUB_MARKER = "# free-llm-hub: isolated fallback -- removed automatically 
 # writing it would hand every user a codex that breaks the next time OpenAI
 # adds one. A cosmetic warning is the cheaper of the two.
 _CODEX_CONTEXT_WINDOW = 128000
+
+
+def declared_window(model_id=None):
+    """The context window the hub declares to a CLI for `model_id` (None = the
+    hub-wide figure). One place to ask, so a per-tier/per-category figure can
+    replace the constant without touching any caller."""
+    return _CODEX_CONTEXT_WINDOW
+
+
 # When codex compacts history. It defaults this off the context window, so a
 # guessed window means a badly-timed compaction too; stated at 75% of ours.
 _CODEX_COMPACT_LIMIT = 96000
@@ -1113,6 +1132,190 @@ def _opencode_hub_models():
 
 
 _OPENCODE_HUB_MODELS = _opencode_hub_models()
+
+
+# --------------------------------------------------------------------------- #
+# Claude Code: the hub's ids as real /model entries
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-09-27 with Claude Code 2.1.283 (installed binary, a fresh
+# CLAUDE_CONFIG_DIR, pointed at this hub):
+#     claude -p "What is 2 plus 2?" --model auto
+#     stderr: "auto" isn't described by this version's model catalog; update
+#             Claude Code, or map it with behavesAs on a modelPicker row ...
+#             [claude-code:unrecognized_model] {"model":"auto",...}
+# plus an assumed 200k window. The binary's settings schema names the fix:
+#     modelPicker: {options: [{model, label?, description?, behavesAs?}],
+#                   replaceBuiltInOptions?}
+# honored from user settings and --settings (never from a project checkout).
+# With one row per hub id carrying behavesAs the same call prints NOTHING on
+# stderr, and the SDK `initialize` reply lists exactly "Default" plus those rows
+# -- that list IS the /model picker. Verified for auto, max, multi, fast and
+# coding-swarm, via --model and via ANTHROPIC_MODEL alike.
+#
+# Rejected, on evidence from the same binary:
+#   modelOverrides      maps an id Claude Code KNOWS to a provider id: one hub id
+#                       per Claude model, never a row of its own.
+#   ANTHROPIC_CUSTOM_MODEL_OPTION   a single row, hidden by replaceBuiltInOptions.
+#   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY   a discovered id this version
+#                       does not know is "not offered until Claude Code is
+#                       updated" unless a picker row gives it behavesAs anyway.
+#   CLAUDE_CODE_MAX_CONTEXT_TOKENS alone   fixes the window, but the
+#                       [claude-code:unrecognized_model] line stays.
+#
+# THE WINDOW. behavesAs makes an id "known", and a known model's window is the
+# one of the model it behaves as: CLAUDE_CODE_MAX_CONTEXT_TOKENS=128000 was
+# MEASURED ignored then (debug log: effectiveWindow=180000).
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW is what holds (effectiveWindow=108000, i.e.
+# 128000 minus the 20000 output reserve). Both are set: MAX_CONTEXT_TOKENS still
+# covers an id typed by hand that has no row (crew-code, team, plan ...).
+# Neither accepts a per-model figure, so both take declared_window(None).
+
+# The model whose client-side handling (prompt profile, capabilities, effort
+# defaults) a hub id borrows. A long-lived id this and later builds know, with
+# a 200k window -- above the declared one, so the compact window above is what
+# binds, never a 1M assumption. MEASURED on the wire with it: thinking
+# {"type": "adaptive"}, output_config {"effort": "high"}, max_tokens 32000;
+# the hub answered every such request in the live runs.
+_CLAUDE_BEHAVES_AS = "claude-sonnet-4-6"
+
+# Claude Code 2.1.283's own model aliases (the literal list in its binary). A
+# hub id spelled like one never reaches the hub: MEASURED, `--model best` went
+# out as model="claude-fable-5-1" -- plain auto routing, not the hub's best
+# tier. `max` is the same tier on the hub (_quality_route_kwargs), so Claude
+# Code is always handed `max` instead.
+_CLAUDE_CODE_ALIASES = frozenset({
+    "default", "sonnet", "opus", "haiku", "fable", "best", "opusplan",
+    "sonnet[1m]", "opus[1m]", "fable[1m]"})
+
+# What Claude Code's own family aliases resolve to while it runs on the hub
+# (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). opus is the strongest tier, sonnet the
+# everyday one, haiku -- the model Claude Code uses for its small background
+# calls -- the fast category. MEASURED: `--model opus` then sends "max",
+# `--model haiku` sends "fast", neither with an unrecognised-model notice.
+_CLAUDE_FAMILY_IDS = (("OPUS", "max"), ("SONNET", "auto"), ("HAIKU", "fast"))
+
+
+def claude_model_id(mid):
+    """The id to hand Claude Code for hub id `mid` ('best' -> 'max', see
+    _CLAUDE_CODE_ALIASES); anything else unchanged."""
+    if isinstance(mid, str) and mid.strip().lower() == "best":
+        return "max"
+    return mid
+
+
+def claude_model_picker():
+    """The `modelPicker` settings value: one row per id of the opencode picker
+    (tiers, categories, category+effort compounds -- the same list, same
+    labels), minus ids Claude Code would read as its own alias.
+    replaceBuiltInOptions hides the built-in Opus/Sonnet/Haiku rows: against the
+    hub they are only more names for `auto`."""
+    rows = []
+    for mid, spec in _opencode_hub_models().items():
+        if mid.lower() in _CLAUDE_CODE_ALIASES:
+            continue
+        head, _sep, tail = str(spec.get("name") or mid).partition(" -- ")
+        head = head.strip() or mid
+        rows.append({"model": mid, "label": head,
+                     "description": tail.strip() or head,
+                     "behavesAs": _CLAUDE_BEHAVES_AS})
+    return {"replaceBuiltInOptions": True, "options": rows}
+
+
+def claude_hub_env(opus=None):
+    """Env vars Claude Code needs beside BASE_URL/TOKEN/MODEL to run on the hub:
+    the family-alias mapping and the declared window. `opus` overrides the opus
+    mapping (an /agent session maps it to its own tier -- see
+    _apply_claude_hub_fallback). A family whose target has no picker row is
+    left unmapped rather than pointed at an id Claude Code would not know."""
+    win = str(int(declared_window(None)))
+    env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": win,
+           "CLAUDE_CODE_MAX_CONTEXT_TOKENS": win}
+    ids = {r["model"] for r in claude_model_picker()["options"]}
+    for family, mid in _CLAUDE_FAMILY_IDS:
+        if family == "OPUS" and opus:
+            mid = claude_model_id(opus)
+        if mid in ids:
+            env["ANTHROPIC_DEFAULT_%s_MODEL" % family] = mid
+    return env
+
+
+def _is_claude_hub_picker(value):
+    """True for a modelPicker every row of which is a hub id (i.e. ours)."""
+    if not isinstance(value, dict):
+        return False
+    rows = value.get("options")
+    if not isinstance(rows, list) or not rows:
+        return False
+    ids = set(_opencode_hub_models()) | {"best"}
+    return all(isinstance(r, dict) and r.get("model") in ids for r in rows)
+
+
+def _claude_settings_file(config_home):
+    return os.path.join(config_home, "settings.json")
+
+
+def _read_json_dict(path):
+    """(dict, ok). ok=False only when the file exists but is not a JSON object."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}, True
+    except (OSError, ValueError):
+        return None, False
+    return (data, True) if isinstance(data, dict) else (None, False)
+
+
+def _write_json_atomic(path, data):
+    tmp = path + ".tmp-%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def _seed_claude_picker(config_home):
+    """Put the hub's modelPicker into the isolated copy's user settings, which is
+    where Claude Code reads it (env vars cannot carry it). Never creates the
+    directory, keeps every other key, leaves a picker that is not ours alone,
+    and skips the write when nothing changed. Never raises."""
+    try:
+        if not config_home or not os.path.isdir(config_home):
+            return
+        path = _claude_settings_file(config_home)
+        data, ok = _read_json_dict(path)
+        if not ok:
+            return
+        cur = data.get("modelPicker")
+        if cur is not None and not _is_claude_hub_picker(cur):
+            return
+        want = claude_model_picker()
+        if cur == want:
+            return
+        data["modelPicker"] = want
+        _write_json_atomic(path, data)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _unseed_claude_picker(config_home):
+    """The revert: once the isolated copy is signed in, the hub's ids would be
+    sent to Anthropic, so our picker goes (and the file, if it held nothing
+    else). Never raises."""
+    try:
+        if not config_home or not os.path.isdir(config_home):
+            return
+        path = _claude_settings_file(config_home)
+        data, ok = _read_json_dict(path)
+        if not ok or not _is_claude_hub_picker(data.get("modelPicker")):
+            return
+        data.pop("modelPicker", None)
+        if data:
+            _write_json_atomic(path, data)
+        else:
+            os.remove(path)
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def _upgrade_opencode_seed(target):
@@ -2063,7 +2266,7 @@ def _claude_model_for(sess) -> str:
     "opus" alias)."""
     _mid = _session_model_id(sess)
     if _mid and _hub_backs("claude"):
-        return _mid
+        return claude_model_id(_mid)   # never "best": Claude Code's own alias
     return _sub_model_setting("claude") or _MODEL_ALIAS
 
 

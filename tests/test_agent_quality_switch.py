@@ -69,7 +69,9 @@ def test_the_next_turn_launches_with_the_new_mode():
         with mock.patch.object(agentic_chat, "_isolated_signed_in", return_value=False), \
                 mock.patch.object(agentic_chat, "_hub_base_url", return_value="http://h"):
             agentic_chat._apply_claude_hub_fallback(env, "/cfg", sess.quality)
-        assert env["ANTHROPIC_MODEL"] == "best"
+        # the best tier, spelled `max` for Claude Code (its own "best" alias
+        # would swallow it -- see test_agent_quality_mode)
+        assert env["ANTHROPIC_MODEL"] == "max"
     finally:
         with agentic_chat._REGISTRY_LOCK:
             agentic_chat._REGISTRY.pop(sess.id, None)
