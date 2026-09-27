@@ -1619,13 +1619,26 @@ def _strong_root_version_excess(low):
 
 # User-preference floors applied by _benchmark_score: (hy3, kimi-k3, puter
 # gpt-5.6-sol class, puter gpt-5.6-terra/gpt-5.5-pro class, kimi-k2.6/k2.7,
-# claude, gpt-5.5+, glm-5.x, gpt-5.x, deepseek-v4, minimax-m3).
+# claude, gpt-5.5+, glm-5.x, gpt-5.x, deepseek-v4, minimax-m3, pixel-canary).
 # They are
 # deliberate thumb-on-the-scale values, NOT measured strength, so any code that
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
-#                 hy3    k3     sol  terra k2.6  claude gpt5.5+ glm5.x gpt5.x  dsv4   mm3
-_PREF_FLOORS = (134.5, 134.8, 136, 135, 0,    138,   136,    134,   135,   134,   133)
+#                 hy3    k3     sol  terra k2.6  claude gpt5.5+ glm5.x gpt5.x  dsv4   mm3  pixel
+_PREF_FLOORS = (134.5, 134.8, 136, 135, 0,    138,   136,    134,   135,   134,   133, 137.6)
+# OWNER DIRECTIVE 2026-09-27: "Pixel Canary" is better than Kimi K3 and GPT-6
+# Astra, per the owner's own benchmark reading (no public board or web source
+# is claimed here). Listed by NO provider on that date (0 of 401 catalog rows
+# matched pixel/canary), so this is written ahead of arrival -- the same
+# reason as the hy4 floor: an unknown family scores 10.0, dead last.
+# Index 11 = 137.6: above kimi-k3 (134.8, k4+ up to 135.7) and above the WHOLE
+# gpt ladder, whose cap is claude - 0.5 = 137.5 (gpt-6-astra 137.0,
+# gpt-6.x/7+ 137.5), so no gpt-6 release can tie it; still under Claude's
+# owner-set 138 and the glm-5.3+/hy4 band, which the directive did not touch.
+# "pixel" must sit right next to "canary" (-, _, space, . or nothing): the
+# hub's own answer-canary health checks and unrelated ids such as
+# 'canary-build', 'chrome-canary' or nvidia's ASR 'canary-1b' never match.
+_PIXEL_CANARY_RE = re.compile(r"(?<![a-z0-9])pixel[-_ .]?canary(?![a-z])")
 # kimi-k2.6/k2.7 are CAPPED, not floored: the user ranks them below qwen3.5/
 # 3.6 (108-109) and below mimo-2.5 (100), so the ceiling sits just under mimo.
 _KIMI_K2_CEILING = 98
@@ -2321,6 +2334,12 @@ def _benchmark_score(pid, model_id):
         if _major >= 5:
             score = max(score, min(135.0 + (_major - 5) * 2 + _minor * 0.2,
                                    _PREF_FLOORS[5] - 0.5))
+    # OWNER DIRECTIVE 2026-09-27: Pixel Canary above kimi-k3 and gpt-6-astra
+    # (see _PREF_FLOORS[11]). Any vendor/relay prefix or version/size suffix.
+    # Its speed cuts are NOT exempt: the speed cap below still runs last.
+    _pixel_canary = bool(_PIXEL_CANARY_RE.search(low))
+    if _pixel_canary:
+        score = max(score, _PREF_FLOORS[11])
     # USER PREFERENCE 2026-07-31: "GLM 5.2 is also good — if available it should
     # be used." Floored level with hy3, i.e. just under the named top three, so
     # a live glm-5.x is reached for ahead of the ordinary field. glm-4.x and the
@@ -2495,10 +2514,17 @@ def _benchmark_score(pid, model_id):
     # ranked that family's flash on purpose (_speed_variant_exempt).
     strong_speed = False
     if "flash" in low and not any(ok in low for ok in flash_ok):
-        if not sv:
+        if not sv and not _pixel_canary:
             capped = True
         elif not _speed_variant_exempt(low):
             strong_speed = True
+    # Pixel Canary's speed cuts are treated like a strong root's (it is not in
+    # _STRONG_ROOTS, so sv is 0): -flash lands on _STRONG_SPEED_CAP like
+    # kimi-k3-flash, -mini/-lite/-nano are already on the 30-point cap above,
+    # and '-small' (in _SPEED_VARIANT_RE but not in the tuple) is caught here
+    # so no speed cut keeps the flagship floor.
+    if _pixel_canary and not capped and _SPEED_VARIANT_RE.search(low):
+        strong_speed = True
     if params_b is not None and params_b < 14:
         capped = True
     # USER DIRECTIVE 2026-07-31: "ALL available Claude models should be in top."
