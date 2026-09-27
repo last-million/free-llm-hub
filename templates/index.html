@@ -2501,6 +2501,80 @@
   body.cx-agent-view .confignote{ display:none; }
   body.cx-agent-view main.wrap{ padding-bottom:10px; }
   body.cx-agent-view #agent-off-note{ margin:0 0 8px; }
+
+  /* ---------- Collapsible top of the agent view ----------
+     One icon button folds away the permissions notice, the switch + tabs +
+     session bar line, and (while a session is open) the folder setup, leaving
+     a one-line summary of what is running. Laid out as a 2-column grid so the
+     button sits BESIDE the notice while expanded, instead of costing a row of
+     height on the one view where height is the whole point. Collapsed, the bar
+     spans the row and shows the summary. Only display/opacity/transform move;
+     the chat below shifts by exactly the height that was folded away. */
+  body.cx-on.cx-agent-view main.wrap > section#agent-section.cx-active{
+    display:grid; grid-template-columns:minmax(0,1fr) auto; column-gap:10px;
+    align-items:start; }
+  body.cx-agent-view #agent-section > *{ grid-column:1 / -1; min-width:0; }
+  body.cx-agent-view #agent-section > #agent-warning{ grid-column:1; }
+  body.cx-agent-view #agent-section > #agent-collapse-bar{ grid-column:2; }
+  body.cx-agent-view #agent-section.agent-top-collapsed > #agent-collapse-bar{
+    grid-column:1 / -1; margin:0 0 8px; }
+  .agent-collapse-bar{ display:flex; align-items:center; justify-content:flex-end;
+    gap:10px; min-width:0; }
+  .agent-collapse-summary{ display:flex; align-items:center; gap:8px; flex:1 1 auto;
+    min-width:0; margin:0; font-size:12.5px; line-height:1.4; color:var(--text-dim);
+    animation:agentTopIn .2s ease-out; }
+  .agent-collapse-summary[hidden]{ display:none; }
+  .acs-perm{ flex:none; font-size:11px; font-weight:700; letter-spacing:.01em;
+    padding:2px 8px; border-radius:999px; color:var(--danger-text);
+    background:var(--danger-soft); border:1px solid var(--danger-border); }
+  .acs-text{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    font-family:var(--mono); }
+  .agent-collapse-btn{ flex:none; display:inline-grid; place-items:center;
+    width:34px; height:34px; padding:0; border-radius:var(--radius-sm);
+    border:1px solid var(--border); background:var(--surface-2); color:var(--text-dim);
+    cursor:pointer; touch-action:manipulation;
+    transition:background .15s ease, color .15s ease, border-color .15s ease; }
+  .agent-collapse-btn:hover{ background:var(--surface-3); color:var(--text);
+    border-color:var(--accent); }
+  .agent-collapse-btn:active{ transform:translateY(1px); }
+  .agent-collapse-btn:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .agent-collapse-btn .acb-ic{ transition:transform .2s ease; }
+  .agent-collapse-btn[aria-expanded="false"] .acb-ic{ transform:rotate(180deg); }
+  /* 44 RENDERED px on a phone (--tap divides out the root zoom). */
+  @media (max-width:640px){
+    .agent-collapse-btn{ width:var(--tap, 44px); height:var(--tap, 44px); }
+  }
+  /* What folds. The individual rows are named too, so the fold still works
+     before (or without) initAgentLayout() building the shared topline. The
+     setup only folds while a session is open: with none open it IS the page
+     (pick a CLI, pick a folder, start), and hiding it would leave nothing. */
+  #agent-section.agent-top-collapsed #agent-warning,
+  #agent-section.agent-top-collapsed #sec-agent .agent-topline,
+  #agent-section.agent-top-collapsed #sec-agent #agent-master-row,
+  #agent-section.agent-top-collapsed #sec-agent #agent-view-toggle,
+  #agent-section.agent-top-collapsed #sec-agent #agent-session-bar,
+  #agent-section.agent-top-collapsed.agent-has-session #sec-agent #agent-setup{ display:none; }
+  /* Short and directional: out 160ms ease-in, back in 200ms ease-out. */
+  #agent-section.agent-top-leaving #agent-warning,
+  #agent-section.agent-top-leaving #sec-agent .agent-topline,
+  #agent-section.agent-top-leaving.agent-has-session #sec-agent #agent-setup{
+    opacity:0; transform:translateY(-4px);
+    transition:opacity .16s ease-in, transform .16s ease-in; }
+  #agent-section.agent-top-entering #agent-warning,
+  #agent-section.agent-top-entering #sec-agent .agent-topline,
+  #agent-section.agent-top-entering.agent-has-session #sec-agent #agent-setup{
+    animation:agentTopIn .2s ease-out both; }
+  @keyframes agentTopIn{ from{ opacity:0; transform:translateY(-4px); } to{ opacity:1; transform:none; } }
+  @media (prefers-reduced-motion:reduce){
+    .agent-collapse-summary,
+    #agent-section.agent-top-entering #agent-warning,
+    #agent-section.agent-top-entering #sec-agent .agent-topline,
+    #agent-section.agent-top-entering.agent-has-session #sec-agent #agent-setup{ animation:none; }
+    #agent-section.agent-top-leaving #agent-warning,
+    #agent-section.agent-top-leaving #sec-agent .agent-topline,
+    #agent-section.agent-top-leaving.agent-has-session #sec-agent #agent-setup{ transition:none; }
+    .agent-collapse-btn, .agent-collapse-btn .acb-ic{ transition:none; }
+  }
   .agent-chat-col{ display:flex; flex-direction:column; gap:10px; min-width:0; min-height:0; }
   /* KEEP EVERYTHING INSIDE THE COLUMN.
      Measured at a 1100px viewport: the chat column was 309px wide and a single
@@ -3090,7 +3164,7 @@
        from "Chat / Test" below (that's a stateless free-model text completion) — this is
        a stateful, high-permission session, so it gets its own master switch and its own
        persistent safety disclosure. -->
-  <section class="section" aria-labelledby="h-agent">
+  <section class="section" id="agent-section" aria-labelledby="h-agent">
     <div class="section-h">
       <h2 id="h-agent" tabindex="-1">Chat CLI</h2>
       <span class="sub">run your real Claude Code / ChatGPT Codex subscription as a full coding agent on a project folder</span>
@@ -3109,12 +3183,36 @@
     </div>
     <!-- Persistent safety disclosure — deliberately a sibling of .section-body, NOT a
          child of it, so it is always on screen regardless of view-switching.
-         Never gate this behind the master switch, a <details>, or JS visibility logic. -->
+         Never gate this behind the master switch, a <details>, or JS visibility logic.
+         ONE exception, asked for by the owner (2026-09-27): the user's own
+         "Hide controls" button below may fold it away together with the rest of
+         the top of the workspace. It starts expanded, and the collapsed summary
+         line keeps a "Full permissions" chip, so the disclosure never fully
+         leaves the screen. -->
     <div class="agent-warning" id="agent-warning">
       <strong>Full permissions.</strong> This runs your real Codex / OpenCode subscription with FULL file/command permissions in the folder you choose &mdash; it can create, edit, and delete files, and run shell commands, without asking first.
     </div>
+    <!-- Collapse control for the top of the workspace (the permissions notice,
+         the master switch + Session/History/Swarm tabs + session bar, and the
+         folder picker). Asked for: "an icon button that collapses / shows this
+         top section". The bar sits to the RIGHT of the notice while expanded
+         (so it costs no row of its own) and becomes the one-line summary of
+         what is running while collapsed, so the button never scrolls or hides
+         away with what it controls. State is per browser (localStorage). -->
+    <div class="agent-collapse-bar" id="agent-collapse-bar">
+      <p class="agent-collapse-summary" id="agent-collapse-summary" hidden>
+        <span class="acs-perm">Full permissions</span>
+        <span class="acs-text" id="agent-collapse-text">No session open</span>
+      </p>
+      <button type="button" class="agent-collapse-btn" id="agent-collapse-btn"
+              aria-expanded="true"
+              aria-controls="agent-warning agent-master-row agent-view-toggle agent-session-bar agent-setup"
+              aria-label="Session controls" title="Hide controls">
+        <svg class="acb-ic" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m18 15-6-6-6 6"/></svg>
+      </button>
+    </div>
     <div class="section-body" id="sec-agent">
-      <div class="sub-master-row">
+      <div class="sub-master-row" id="agent-master-row">
         <label class="switch" title="Master opt-in — nothing below runs while this is off">
           <input id="agent-master-switch" type="checkbox">
           <span class="track" aria-hidden="true"></span>
@@ -3165,8 +3263,12 @@
         <!-- "Create new project" leads, and is the default. Starting a fresh
              project is the common case here; defaulting to a folder path the
              user must go and find made the first thing on screen the harder
-             of the two. -->
-        <p class="agent-setup-label">Where should it work?</p>
+             of the two.
+             No heading here any more (owner, 2026-09-27: drop the folder
+             question heading). It was also the one part of the setup that stayed on
+             screen DURING a session, since setSetupVisible() hides the rows
+             but never the label. The choice keeps its accessible names:
+             "Workspace mode" on the toggle, "Project folder" on the input. -->
         <div class="seg-toggle sm" id="agent-dir-mode" role="tablist" aria-label="Workspace mode">
           <button type="button" class="seg-btn" id="agent-mode-new" role="tab" aria-selected="true">Create new project</button>
           <button type="button" class="seg-btn" id="agent-mode-existing" role="tab" aria-selected="false">Use existing folder</button>
@@ -3186,7 +3288,7 @@
         </div><!-- /agent-setup -->
 
         <div class="agent-session" id="agent-session" hidden>
-          <div class="agent-session-bar">
+          <div class="agent-session-bar" id="agent-session-bar">
             <span class="agent-session-info" id="agent-session-info"></span>
             <!-- Three switches, exactly one on. Radios rather than checkboxes
                  because the modes are mutually exclusive and the browser then
@@ -4057,6 +4159,7 @@
     initNavGroups();
     initUiScale();
     initAgentLayout();
+    initAgentTopCollapse();
     /* No click handler for the sidebar's Settings entry any more: it is an
        ordinary .cx-nav-item anchor with a data-view, so the SPA nav handler
        already routes it -- and forwarding the click to another button was what
@@ -4188,6 +4291,113 @@
     /* Re-measure when the view is switched to, since the split has no box while
        the section is display:none. */
     document.addEventListener('cx:view', measure);
+  }
+
+  /* Hide / show the top of the agent view (see #agent-collapse-bar).
+     Remembered per browser; every storage access is guarded, so a private
+     window or blocked site data simply starts expanded and still toggles. */
+  function initAgentTopCollapse(){
+    var sec = document.getElementById('agent-section');
+    var btn = document.getElementById('agent-collapse-btn');
+    var summary = document.getElementById('agent-collapse-summary');
+    var text = document.getElementById('agent-collapse-text');
+    if (!sec || !btn || !summary || !text) return;
+    var KEY = 'cx_agent_top_collapsed';
+    var LEAVE_MS = 160, ENTER_MS = 200;
+    var QUALITY = { normal: 'Normal', max: 'Max quality',
+                    swarm: 'Swarm best-of-N', multi: 'Multi sessions' };
+    var collapsed = false, timer = null;
+
+    function reducedMotion(){
+      try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; }
+      catch(e){ return false; }
+    }
+    function folderName(p){
+      var parts = String(p || '').split(/[\\/]+/).filter(Boolean);
+      return parts.length ? parts[parts.length - 1] : '';
+    }
+    /* One line: CLI · folder name · quality · category · turn N. Read off the
+       session bar the page already keeps current, so there is one source. */
+    function summarize(){
+      var box = document.getElementById('agent-session');
+      var open = !!box && !box.hidden;
+      sec.classList.toggle('agent-has-session', open);
+      if (!open){
+        text.textContent = 'No session open';
+        summary.title = 'Full permissions: the agent can edit files and run commands in its folder.';
+        return;
+      }
+      var infoEl = document.getElementById('agent-session-info');
+      var info = infoEl ? (infoEl.textContent || '').trim() : '';
+      var dash = info.indexOf(' — ');
+      var cli = dash >= 0 ? info.slice(0, dash) : info;
+      var rest = dash >= 0 ? info.slice(dash + 3).split(' · ') : [];
+      var parts = [cli.trim(), folderName(rest.shift())];
+      var q = document.querySelector('#agent-quality input[name="agent-quality"]:checked');
+      if (q && QUALITY[q.value]) parts.push(QUALITY[q.value]);
+      var mode = document.getElementById('agent-mode');
+      if (mode && mode.value && mode.value !== 'all' && mode.selectedIndex >= 0){
+        parts.push((mode.options[mode.selectedIndex].text || '').trim());
+      }
+      rest.forEach(function(x){
+        x = String(x || '').trim();
+        if (/^turn \d+$/.test(x) || x === 'running') parts.push(x);
+      });
+      var line = parts.filter(Boolean).join(' · ');
+      text.textContent = line || 'Session open';
+      summary.title = 'Full permissions. ' + (info || line);
+    }
+    function paint(on){
+      collapsed = on;
+      summarize();
+      sec.classList.toggle('agent-top-collapsed', on);
+      summary.hidden = !on;
+      btn.setAttribute('aria-expanded', on ? 'false' : 'true');
+      btn.title = on ? 'Show controls' : 'Hide controls';
+      /* The split's height is measured from where it starts; the notice is
+         outside the observed element, so ask for a re-measure explicitly. */
+      try { window.dispatchEvent(new Event('resize')); } catch(e){}
+    }
+    function setCollapsed(on, animate){
+      clearTimeout(timer);
+      sec.classList.remove('agent-top-leaving', 'agent-top-entering');
+      try { localStorage.setItem(KEY, on ? '1' : '0'); } catch(e){}
+      if (!animate || reducedMotion()){ paint(on); return; }
+      if (on){
+        collapsed = true;
+        summarize();
+        btn.setAttribute('aria-expanded', 'false');   /* chevron turns at once */
+        btn.title = 'Show controls';
+        sec.classList.add('agent-top-leaving');
+        timer = setTimeout(function(){
+          sec.classList.remove('agent-top-leaving');
+          paint(true);
+        }, LEAVE_MS);
+      } else {
+        paint(false);
+        sec.classList.add('agent-top-entering');
+        timer = setTimeout(function(){ sec.classList.remove('agent-top-entering'); }, ENTER_MS);
+      }
+    }
+
+    if (window.MutationObserver){
+      var mo = new MutationObserver(summarize);
+      var infoEl = document.getElementById('agent-session-info');
+      var box = document.getElementById('agent-session');
+      var modeSel = document.getElementById('agent-mode');
+      if (infoEl) mo.observe(infoEl, { childList: true, characterData: true, subtree: true });
+      if (box) mo.observe(box, { attributes: true, attributeFilter: ['hidden'] });
+      if (modeSel) mo.observe(modeSel, { childList: true });
+    }
+    ['agent-quality', 'agent-mode'].forEach(function(id){
+      var el = document.getElementById(id);
+      if (el) el.addEventListener('change', summarize);
+    });
+    btn.addEventListener('click', function(){ setCollapsed(!collapsed, true); });
+
+    var stored = null;
+    try { stored = localStorage.getItem(KEY); } catch(e){}
+    paint(stored === '1');
   }
 
   /* Interface size. 80% is the shipped default because it fits more of the
