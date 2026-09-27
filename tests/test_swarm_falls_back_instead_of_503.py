@@ -292,9 +292,13 @@ def test_it_no_longer_waits_for_every_member():
     assert "FIRST_COMPLETED" in body
 
 
-def test_the_grace_starts_only_once_a_tool_was_called():
-    """A prose-only answer must NOT start it: waiting longer is exactly right
-    while the only thing on the table is something the CLI cannot execute."""
+def test_the_grace_starts_on_a_tool_call_or_a_checked_text_answer():
+    """CHANGED 2026-09-27 (was: "starts only once a tool was called"). A CLI
+    attaches its tools to plain questions, and there the text IS the answer --
+    Claude Code `multi` waited the whole deadline on "What is N plus 1?" (see
+    tests/test_tool_turn_timeouts.py). The guard now reads the tool calls AND
+    the text answers _run CHECKED (_text_final: gate "ok", not a refusal,
+    announcement or typed tool call) -- never any prose at all."""
     src = open("app.py", encoding="utf-8").read()
     # Scoped to the `if` that guards the grace, not to a fixed number of
     # characters before it: a window measured in bytes fails the moment
@@ -302,7 +306,11 @@ def test_the_grace_starts_only_once_a_tool_was_called():
     # about whether the guard is still there.
     i = src.index("cutoff = min(deadline, time.monotonic() + _SWARM_STRAGGLER_GRACE)")
     guard = src.rindex("if cutoff == deadline", 0, i)
-    assert 'get("tool_calls")' in src[guard:i]
+    assert "acted_now or texts" in src[guard:i]
+    body = src.split("def _swarm_tool_result(", 1)[1]
+    body = body[:body.index("\ndef ")]
+    assert 'acted_now = any((r[3] or {}).get("tool_calls")' in body
+    assert "in _text_final]" in body
 
 
 def test_the_grace_can_never_exceed_the_deadline():

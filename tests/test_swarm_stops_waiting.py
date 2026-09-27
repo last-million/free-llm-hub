@@ -141,17 +141,36 @@ def test_a_close_second_still_gets_in(fanout, monkeypatch):
     assert "slow" in seen, "a member answering inside the grace was dropped"
 
 
-def test_prose_alone_does_not_start_the_grace(fanout, monkeypatch):
-    """While the only answer on the table is something the CLI cannot execute,
-    waiting longer is the right call -- a tool-caller may still be coming."""
+def test_a_valid_prose_answer_starts_the_grace_too(fanout, monkeypatch):
+    """CHANGED 2026-09-27. This used to assert the opposite -- "prose alone does
+    not start the grace, a tool-caller may still be coming". MEASURED on Claude
+    Code (`multi`, "What is N plus 1?"): the members answered the number in
+    text, which IS the answer, and every fan-out waited the whole 360 s for a
+    tool call that was never coming -- past the client's header timeout, so it
+    retried seven times. A CHECKED text answer (not a refusal, announcement or
+    typed tool call) now starts the same grace a tool call does."""
     monkeypatch.setattr(A, "_dispatch_chat_with_deadline", _dispatcher({
-        "fast": (0.0, _prose()),               # prose: must NOT start the grace
+        "fast": (0.0, _prose()),               # a valid text answer
         "slow": (3.0, _with_tool_call()),      # well past a 1s grace
+        "never": (15.0, None),
+    }))
+    started = time.monotonic()
+    data, _hdrs = A._swarm_tool_result(dict(BODY))
+    assert time.monotonic() - started < 2.5
+    assert data["choices"][0]["message"]["content"] == "here is some prose about the task"
+
+
+def test_a_tool_call_inside_the_grace_still_wins_over_prose(fanout, monkeypatch):
+    """What the old rule protected is kept where it matters: a tool-caller that
+    lands inside the grace beats the earlier prose (acted beats answered)."""
+    monkeypatch.setattr(A, "_dispatch_chat_with_deadline", _dispatcher({
+        "fast": (0.0, _prose()),
+        "slow": (0.4, _with_tool_call()),      # inside the 1s grace
         "never": (15.0, None),
     }))
     data, _hdrs = A._swarm_tool_result(dict(BODY))
     msg = data["choices"][0]["message"]
-    assert msg.get("tool_calls"), "the later tool call was cut off by the grace"
+    assert msg.get("tool_calls"), "the tool call inside the grace was cut off"
 
 
 def test_everything_failing_still_returns_none(fanout, monkeypatch):

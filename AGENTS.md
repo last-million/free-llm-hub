@@ -687,6 +687,33 @@ then more nvidia); kimi saw 9x 504/503 with g4f walking 7 relay hops.
 - Pipeline tool turns (fan-out + fast path) pass the CLI's messages
   unchanged to every member; the env loss was the per-model trim above.
 
+## Tool-turn timeouts (2026-09-27)
+
+Covered by `tests/test_tool_turn_timeouts.py`. Live on 7cb23ff: Claude Code
+`multi` "What is N plus 1?" ran 1753 s (seven back-to-back 360 s fan-outs,
+"0 used a tool" each, client retrying past its header timeout).
+
+- **Claude Code's in-messages system block**: claude 2.1.x sends its
+  `# Environment` block (cwd, agents, skills) as a role `system` entry INSIDE
+  `messages`, after the question. `_anthropic_to_openai_messages` folds it
+  into the leading system message; it used to become the LAST USER message,
+  so the pipeline fast path, the difficulty classifier and upstream models
+  read the environment instead of the question.
+- **Fan-out settles on text** (`_swarm_tool_result`): a member's CHECKED text
+  answer (`_text_final`: answer_gate "ok", not refusal/announcement/typed
+  call) starts the same `_SWARM_STRAGGLER_GRACE` a tool call does; once more
+  than half of the members still in the race answered in text and none acted,
+  the race ends at `_SWARM_TEXT_SETTLE` (25 s = trivial budget) from its start,
+  or at once. A tool call inside the window still wins.
+- **Streamed fan-out bound**: `_SWARM_TOOL_STREAM_DEADLINE` (180 s) and the
+  request clock starts at the fan-out, so the fallback after an empty
+  fan-out shares it (the turn stays under the ~300 s client header timeout).
+- **Stalls vs 429s**: `_recent_hop_stall` (recent failure kind
+  deadline/timeout). When every candidate failed recently the router still
+  prefers a pair that 429'd over one that stalled (so a session pin re-picks
+  instead of re-choosing the pair that just cost a hop budget), and the
+  chain's recent-failure tail puts stalls behind 429s.
+
 ## Long conversations in real use (2026-09-27)
 
 Verified live (160K-token histories on all 3 protocols; Claude Code
