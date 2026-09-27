@@ -4432,6 +4432,24 @@ def _recent_hop_failure(pid, model):
         return None
 
 
+# A STALL COSTS A WHOLE HOP BUDGET; A 429 COSTS A SECOND. Both put a pair in the
+# recent-failure tail, but they are not the same risk when the tail is all that
+# is left -- which is exactly the degraded-fleet case. MEASURED 2026-09-27
+# (google quota gone, dahl/llm7/openrouter 429, nvidia stalling): every
+# candidate had failed recently, so the recent-failure filter failed open and
+# the session pin put a tool session straight back on the nvidia pair that had
+# just cost it ~100-120 s of _HopBudgetExceeded -- turn after turn. A pair that
+# 429'd is retried in about a second and may have its quota back; a pair that
+# stalled will most likely stall again.
+_RECENT_STALL_KINDS = ("deadline", "timeout")
+
+
+def _recent_hop_stall(pid, model):
+    """True when this pair's recent failure was a STALL (hop budget / deadline
+    / read timeout), not a fast refusal. Never raises."""
+    return _recent_hop_failure(pid, model) in _RECENT_STALL_KINDS
+
+
 def _dead_provider_rows():
     now = time.time()
     with _provider_dead_lock:
@@ -7962,8 +7980,15 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     # A pair that 429'd or ran out its time in the last ten minutes does not
     # get to OPEN the turn (see _RECENT_FAIL_TTL); _build_chain keeps it as a
     # last resort. Fail-open: when every candidate failed recently, all stay.
-    cands = [c for c in cands if not _recent_hop_failure(c[1], c[2])] or cands
+    # ...and when EVERY candidate failed recently, one that merely 429'd still
+    # opens before one that STALLED (see _recent_hop_stall): this is also what
+    # stops a session pin from re-choosing the pair that just cost it a whole
+    # hop budget -- the pinned pair is simply not in the pool the pin is
+    # checked against, so the session re-picks.
+    cands = ([c for c in cands if not _recent_hop_failure(c[1], c[2])]
+             or [c for c in cands if not _recent_hop_stall(c[1], c[2])] or cands)
     _compactable = ([c for c in _compactable if not _recent_hop_failure(c[1], c[2])]
+                    or [c for c in _compactable if not _recent_hop_stall(c[1], c[2])]
                     or _compactable)
     # A STRONG MODEL ON A TRIMMED CONTEXT BEATS A WEAK ONE ON THE WHOLE THING.
     #
@@ -9200,6 +9225,11 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     _recent = [e for e in ordered if _recent_hop_failure(e[1], e[2])]
     if _recent:
         ordered = [e for e in ordered if not _recent_hop_failure(e[1], e[2])]
+        # Inside the tail, a pair that STALLED goes behind one that fast-failed
+        # (see _recent_hop_stall): stable, so every rule above still orders
+        # each half.
+        _recent = ([e for e in _recent if not _recent_hop_stall(e[1], e[2])]
+                   + [e for e in _recent if _recent_hop_stall(e[1], e[2])])
         # ...but the JUNK BENCH stays the very last rule. Partitioning on
         # recent failures alone moved every 429'd pair BEHIND the one pair
         # that had not failed recently -- a benched one -- so it opened the
@@ -27835,6 +27865,35 @@ _SWARM_TOOL_HOP_DEADLINE = 360
 # slow members room without reversing that trade.
 _SWARM_STRAGGLER_GRACE = 150
 
+# A VALID TEXT FINAL ANSWER ENDS THE RACE TOO. The grace above used to start
+# only on a tool call, "because the CLI cannot execute prose" -- but a tool turn
+# is every turn a CLI sends (Claude Code / opencode / codex attach their tool
+# schema to a plain question), and for a question the text IS the answer.
+# MEASURED 2026-09-27, Claude Code `-p "What is N plus 1?" --model multi`: the
+# members answered the number in seconds, none called a tool (correctly), and
+# every fan-out waited out the whole 360 s deadline -- past the client's ~300 s
+# stream header timeout, so Claude Code retried and the SAME fan-out ran seven
+# times back to back (1753 s, killed by hand).
+#
+# So a member whose text passed every check in _run (not a refusal, not an
+# announcement, not a typed tool call, answer_gate "ok") starts the same
+# _SWARM_STRAGGLER_GRACE a tool call does, and once MOST of the members still
+# in the race have answered in text -- the turn is a question, not an action --
+# the fan-out settles within the trivial-turn budget measured from its start
+# (_SWARM_TEXT_SETTLE), or at once if that is already past. A tool call that
+# lands inside the window still wins (acted beats answered, below).
+_SWARM_TEXT_SETTLE = 25          # = _TRIVIAL_HOP_BUDGET, the normal trivial budget
+
+# A STREAMED fan-out holds the client's response headers until it finishes,
+# and every streaming CLI gives up on headers at ~300 s (see
+# LONG_DEADLINE_STREAM_MAX). A fan-out that outlives that is not merely slow:
+# the client never sees its answer and RETRIES, re-running the whole fan-out
+# (the seven back-to-back runs above). A stream's fan-out therefore stops at
+# this bound, and the single-model fallback after an empty fan-out shares the
+# same request clock (started at the fan-out, see _swarm_tool_result), so the
+# whole turn stays under the client's limit.
+_SWARM_TOOL_STREAM_DEADLINE = 180
+
 
 def _dispatch_chat_with_deadline(pid, payload, deadline=None):
     """_dispatch_chat(..., stream=False) bounded by an OVERALL deadline.
@@ -28508,6 +28567,11 @@ def _swarm_tool_result(body):
             return _why("degenerate answer (nothing salvageable)")
         msg = ((data.get("choices") or [{}])[0].get("message") or {})
         _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
+        if gate == "ok" and not msg.get("tool_calls"):
+            # A clean TEXT final answer: it may end the race (see
+            # _SWARM_TEXT_SETTLE). A salvaged one still competes, but a reply
+            # the gate had to repair does not get to cut the others short.
+            _text_final.add((hop_pid, hop_model))
         return (hop_pid, hop_model, data, msg)
 
     # `ex.map` waited for EVERY member, which is why a turn cost the slowest one
@@ -28521,7 +28585,16 @@ def _swarm_tool_result(body):
     # trade-off _dispatch_chat_with_deadline already documents.
     results = []
     _member_why = {}
+    _text_final = set()          # members whose answer is a clean TEXT final answer
     _started = time.monotonic()
+    # A stream's fan-out must finish under the client's header timeout (see
+    # _SWARM_TOOL_STREAM_DEADLINE), and the fallback after an empty fan-out
+    # must not get a fresh request clock on top of it: start the request clock
+    # HERE, so _begin_request_deadline in the fallback measures from now.
+    _fan_limit = float(_SWARM_TOOL_HOP_DEADLINE)
+    if body.get("stream"):
+        _fan_limit = min(_fan_limit, float(_SWARM_TOOL_STREAM_DEADLINE))
+        _begin_request_deadline()
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(picks))
     try:
         # _pipeline_bound: members run on pool threads, where `g` -- and so the
@@ -28530,8 +28603,9 @@ def _swarm_tool_result(body):
         _member = _pipeline_bound(_carry_usage_source(_run))
         pending = {ex.submit(_member, pm) for pm in picks}
         _fanout_started = time.monotonic()
-        deadline = _fanout_started + _SWARM_TOOL_HOP_DEADLINE
+        deadline = _fanout_started + _fan_limit
         cutoff = deadline
+        settled_empty = 0            # members that finished without a usable answer
         while pending:
             remaining = cutoff - time.monotonic()
             if remaining <= 0:
@@ -28548,8 +28622,13 @@ def _swarm_tool_result(body):
                     r = None
                 if r:
                     results.append(r)
-            if cutoff == deadline and any((r[3] or {}).get("tool_calls")
-                                          for r in results):
+                else:
+                    settled_empty += 1
+            acted_now = any((r[3] or {}).get("tool_calls") for r in results)
+            texts = [r for r in results
+                     if not (r[3] or {}).get("tool_calls")
+                     and (r[0], r[1]) in _text_final]
+            if cutoff == deadline and (acted_now or texts):
                 # THE GRACE IS A FLOOR, NOT A CEILING. Measured in the note on
                 # _SWARM_STRAGGLER_GRACE: members answered at 5s, 78s and 111s.
                 # Starting a 90s clock at the FIRST answer put the cutoff at
@@ -28557,7 +28636,18 @@ def _swarm_tool_result(body):
                 # and displayed as "no answer". A fast first answer is not a
                 # reason to stop waiting for the rest; it is only a reason not
                 # to wait forever.
+                # A clean TEXT final answer starts the same grace a tool call
+                # does (see _SWARM_TEXT_SETTLE).
                 cutoff = min(deadline, time.monotonic() + _SWARM_STRAGGLER_GRACE)
+            if texts and not acted_now:
+                # MOSTLY TEXT: more than half of the members still in the race
+                # (picks minus those that already failed) answered in clean
+                # text and none called a tool -- the turn is a question. Settle
+                # within the trivial budget from the fan-out's start.
+                viable = len(picks) - settled_empty
+                if 2 * len(texts) > viable:
+                    cutoff = min(cutoff, max(time.monotonic(),
+                                             _fanout_started + _SWARM_TEXT_SETTLE))
     finally:
         # Anything still running from here on was abandoned by US, not failed by
         # the provider -- stop counting it against the model.
@@ -31464,14 +31554,32 @@ def _anthropic_image_to_openai(block):
 def _anthropic_to_openai_messages(body):
     """Anthropic system+messages -> OpenAI messages (tools included)."""
     out = []
+    system_parts = []
     system = body.get("system")
     if system:
         text = system if isinstance(system, str) else _blocks_to_text(system)
         if text:
-            out.append({"role": "system", "content": text})
+            system_parts.append(text)
     for msg in body.get("messages") or []:
         role = msg.get("role")
         content = msg.get("content")
+        if role == "system":
+            # CLAUDE CODE PUTS A SYSTEM MESSAGE INSIDE `messages`. MEASURED
+            # 2026-09-27 (claude 2.1.283, body captured against a local stub):
+            # messages = [user(<system-reminder>s + the question),
+            #             system("# Environment ... Primary working directory
+            #             ... agent types ... skills")]. It fell into the
+            # "user" branch below, so the hub's LAST USER MESSAGE was the
+            # environment block, not the question: the pipeline fast path
+            # never recognised "What is N plus 1?" (so multi/coding-swarm
+            # fanned it out to five models), the difficulty classifier read
+            # the environment, and upstream models saw the cwd as a trailing
+            # user turn. It is system context: folded into the leading system
+            # message, where every OpenAI-shaped upstream accepts it.
+            text = content if isinstance(content, str) else _blocks_to_text(content)
+            if text and text not in system_parts:
+                system_parts.append(text)
+            continue
         if isinstance(content, str):
             out.append({"role": role, "content": content})
             continue
@@ -31521,6 +31629,8 @@ def _anthropic_to_openai_messages(body):
                            if p.get("type") == "text")
             if content_parts or not tool_results:
                 out.append({"role": "user", "content": content_parts if has_image else text})
+    if system_parts:
+        out.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
     return out
 
 
