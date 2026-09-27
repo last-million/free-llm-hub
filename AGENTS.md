@@ -420,6 +420,22 @@ Pure helpers live in `ctxwin.py`; the glue is in app.py. Covered by
 - Category modes are applied BEFORE the size re-admission
   (`_mode_first_size_split`); agentic chains put models known to hold much
   less than `HUB_CONTEXT_WINDOW` behind the others (`_below_declared_window`).
+- **Window detection** (`_window_info` -> catalog | learned | inferred |
+  reference | default; covered by `tests/test_model_window_detection.py`):
+  `_catalog_row_ctx` reads every common field shape (vLLM `max_model_len`,
+  Google `inputTokenLimit`, `top_provider`, `limit(s).context`, Cloudflare
+  properties...); Google's native list is harvested via the registry's
+  `ctx_models_url`. Unknown on one host -> the lower median of other
+  catalogs + OpenRouter's public catalog for the same identity ("inferred";
+  router aliases like `auto` never), else the `_CTX_REFERENCE` family table.
+  Inferred/reference only LOWER a `_PROVIDER_TPM` row; a 400/413 still wins.
+  `/api/model-windows` + `/api/tracking` (`ctx_window`/`ctx_source`) report it.
+- **Declared windows** follow the fleet: `agentic_chat.declared_window(id)`
+  (app registers `_declared_window_for` at startup: P25 of known windows of
+  alive tool-capable candidates above the medium floor, hard floor for
+  best/max, clamped 32K..1M; fixed 128000 when unregistered or too few
+  known) sizes opencode `limit.context`, the codex catalog + fallback,
+  Pi, openclaw and Kimi.
 
 ## Pipelines keep the conversation (2026-09-27)
 

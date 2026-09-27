@@ -568,6 +568,12 @@ PROVIDERS: Dict[str, dict] = {
         "name": "Google Gemini (AI Studio)",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "models_url": "https://generativelanguage.googleapis.com/v1beta/openai/models",
+        # The compat list above carries NO context window (id/object/owned_by
+        # only). The NATIVE list states inputTokenLimit per model under the
+        # same "models/<id>" names; app._harvest_native_ctx_catalog reads it
+        # (key in the x-goog-api-key header, paginated by nextPageToken).
+        "ctx_models_url": "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",
+        "ctx_models_auth": "x-goog-api-key",
         "signup_url": "https://aistudio.google.com/apikey",
         "key_hint": "AIza...",
         # gemini-2.5-pro IS "Free of charge" in Google's own pricing HTML (the

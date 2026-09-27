@@ -242,7 +242,9 @@ def test_one_context_window_for_every_cli():
     src = open("app.py", encoding="utf-8").read()
     body = src.split("def _autofix_openclaw(", 1)[1]
     body = body[:body.index("\ndef ")]
-    assert "HUB_CONTEXT_WINDOW" in body
+    # The one declared figure every CLI gets (fixed default until the fleet's
+    # windows are known -- see tests/test_model_window_detection.py).
+    assert 'agentic_chat.declared_window("auto")' in body
     assert "200000" not in body
 
 

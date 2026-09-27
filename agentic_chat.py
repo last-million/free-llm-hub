@@ -832,6 +832,47 @@ _CODEX_CONTEXT_WINDOW = 128000
 # When codex compacts history. It defaults this off the context window, so a
 # guessed window means a badly-timed compaction too; stated at 75% of ours.
 _CODEX_COMPACT_LIMIT = 96000
+
+# --------------------------------------------------------------------------- #
+# DECLARED windows follow the fleet. The two figures above are now only the
+# FAIL-SAFE: app.py registers a provider at startup (set_window_provider) that
+# returns, per hub id, a window most of the models that id can route to
+# actually hold (the 25th percentile of their known windows -- see
+# app._declared_window_for). This module must not import app (cycle), hence
+# the callback. Unregistered, failing, or "too few known" -> the fixed default.
+# --------------------------------------------------------------------------- #
+_DECLARED_WINDOW_MIN = 32000
+_DECLARED_WINDOW_MAX = 1000000
+_window_provider = None
+
+
+def set_window_provider(fn):
+    """Register `fn(model_id) -> int | None` (None/invalid = use the default).
+    Pass None to unregister."""
+    global _window_provider
+    _window_provider = fn if callable(fn) else None
+
+
+def declared_window(model_id=None):
+    """The context window to tell a CLI for hub id `model_id` (auto, best,
+    a category, a compound like coding-swarm, or None for auto). Always an
+    int in [_DECLARED_WINDOW_MIN, _DECLARED_WINDOW_MAX]; never raises."""
+    fn = _window_provider
+    if fn is None:
+        return _CODEX_CONTEXT_WINDOW
+    try:
+        v = fn(model_id)
+    except Exception:                                            # noqa: BLE001
+        return _CODEX_CONTEXT_WINDOW
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+        return _CODEX_CONTEXT_WINDOW
+    return int(max(_DECLARED_WINDOW_MIN, min(_DECLARED_WINDOW_MAX, int(v))))
+
+
+def declared_compact_limit(model_id=None):
+    """When to auto-compact for that id: the same 75% of the declared window
+    _CODEX_COMPACT_LIMIT is of _CODEX_CONTEXT_WINDOW."""
+    return int(declared_window(model_id) * _CODEX_COMPACT_LIMIT // _CODEX_CONTEXT_WINDOW)
 _CODEX_TOP_TABLE_RE = re.compile(r"^\s*\[")
 _CODEX_MODEL_PROVIDER_RE = re.compile(r"^\s*model_provider\s*=", re.M)
 
@@ -895,9 +936,9 @@ def _codex_hub_fallback_text(existing, session_id=None):
     _set_top_key("model", "auto")
     # Unquoted: TOML would read a quoted value as a string, and codex wants an
     # integer here.
-    _set_top_key("model_context_window", _CODEX_CONTEXT_WINDOW,
+    _set_top_key("model_context_window", declared_window("auto"),
                  quote=False, keep_existing=True)
-    _set_top_key("model_auto_compact_token_limit", _CODEX_COMPACT_LIMIT,
+    _set_top_key("model_auto_compact_token_limit", declared_compact_limit("auto"),
                  quote=False, keep_existing=True)
 
     cleaned, skip = [], False
@@ -1078,24 +1119,29 @@ def _opencode_hub_models():
     avoids.
 
     An effort id always wins: "swarm" is both a category name and the swarm
-    PIPELINE's id, and the pipeline is the one a CLI has to send."""
-    def spec(name, attachment=False):
+    PIPELINE's id, and the pipeline is the one a CLI has to send.
+
+    `limit.context` is PER ID (declared_window): the window the models behind
+    that id actually hold, not one figure for every mode. The output reserve
+    stays _HUB_MAX_OUTPUT, capped at a quarter of a small window."""
+    def spec(mid, name, attachment=False):
         # A FRESH limit dict per entry: one shared object means a later edit to
         # any single model silently rewrites all ten, and json.dump would not
         # show the aliasing.
+        ctx = declared_window(mid)
         return {"name": name,
-                "limit": {"context": _CODEX_CONTEXT_WINDOW,
-                          "output": _HUB_MAX_OUTPUT},
+                "limit": {"context": ctx,
+                          "output": min(_HUB_MAX_OUTPUT, ctx // 4)},
                 "tool_call": True,
                 "temperature": True,
                 "attachment": attachment}
 
-    out = {k: spec(v) for k, v in _OPENCODE_EFFORT.items()}
+    out = {k: spec(k, v) for k, v in _OPENCODE_EFFORT.items()}
     for key, label, _help in model_categories.labels():
         # Only the vision mode routes to models that can take an image. Saying
         # so on every mode would invite the CLI to send one into a chain that
         # cannot serve it.
-        out.setdefault(key, spec("mode: %s -- %s only" % (key, label.lower()),
+        out.setdefault(key, spec(key, "mode: %s -- %s only" % (key, label.lower()),
                                  attachment=(key == "vision")))
         # ...and the same category combined with each heavier effort, so the one
         # pick a flat-list CLI makes can carry BOTH axes ("coding + swarm").
@@ -1105,10 +1151,11 @@ def _opencode_hub_models():
         if key in _OPENCODE_EFFORT:
             continue
         for tier, tail in _OPENCODE_COMPOUND_TIERS:
-            out.setdefault("%s-%s" % (key, tier),
-                           spec("%s + %s -- %s models, %s" % (
-                               key, tier, label.lower(), tail),
-                                attachment=(key == "vision")))
+            cid = "%s-%s" % (key, tier)
+            if cid in out:
+                continue
+            out[cid] = spec(cid, "%s + %s -- %s models, %s" % (
+                key, tier, label.lower(), tail), attachment=(key == "vision"))
     return out
 
 
@@ -1127,7 +1174,10 @@ def _upgrade_opencode_seed(target):
     are filled in too.
 
     Only absent fields. A label the user renamed, or a window they raised
-    because they know their own fleet, is theirs and stays."""
+    because they know their own fleet, is theirs and stays. One exception: a
+    window still at the old FIXED figure every entry used to get
+    (_CODEX_CONTEXT_WINDOW, with its _HUB_MAX_OUTPUT reserve) is ours, not a
+    choice, and follows the declared window for that id."""
     try:
         with open(target, encoding="utf-8") as fh:
             cfg = json.load(fh)
@@ -1138,7 +1188,7 @@ def _upgrade_opencode_seed(target):
         if not isinstance(models, dict):
             return
         changed = False
-        for mid, spec in _OPENCODE_HUB_MODELS.items():
+        for mid, spec in _opencode_hub_models().items():
             cur = models.get(mid)
             if not isinstance(cur, dict):
                 models[mid] = copy.deepcopy(spec)
@@ -1148,6 +1198,13 @@ def _upgrade_opencode_seed(target):
                 if field not in cur:
                     cur[field] = copy.deepcopy(value)
                     changed = True
+            lim = cur.get("limit")
+            if (isinstance(lim, dict) and lim.get("context") == _CODEX_CONTEXT_WINDOW
+                    and lim.get("output") in (None, _HUB_MAX_OUTPUT)
+                    and spec["limit"] != {"context": lim.get("context"),
+                                          "output": lim.get("output")}):
+                lim.update(copy.deepcopy(spec["limit"]))
+                changed = True
         if not changed:
             return
         tmp = target + ".tmp"
@@ -1200,7 +1257,8 @@ def _seed_opencode_config(config_home):
                     "name": "Calvoun Free LLM Hub",
                     "options": {"baseURL": "http://127.0.0.1:%d/v1" % _port(),
                                 "apiKey": key},
-                    "models": _OPENCODE_HUB_MODELS,
+                    # Built NOW, so the per-id windows are the current ones.
+                    "models": _opencode_hub_models(),
                 },
             },
             "model": "free-llm-hub/auto",
