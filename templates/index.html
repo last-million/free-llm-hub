@@ -157,11 +157,16 @@
   }
   .hd{max-width:none;margin:0;padding:13px 28px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
   .logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:15.5px;letter-spacing:-.01em}
+  /* The header mark is the SAME owl as the sidebar brand. It was a generic
+     green lightning bolt, so the page carried two different logos side by side.
+     Decorative (alt="") because the wordmark right next to it names the app. */
   .logo-mark{
-    width:30px;height:30px;border-radius:8px;flex:none;
-    background:var(--accent);
-    display:grid;place-items:center;color:var(--on-accent);
+    width:30px;height:30px;border-radius:8px;flex:none;display:block;object-fit:contain;
   }
+  /* With the sidebar on screen its brand row already shows the owl a few
+     pixels away; a second copy in the header reads as a duplicate. Below the
+     drawer breakpoint the sidebar is off-canvas, so the header keeps it there. */
+  @media (min-width:1025px){ body.cx-on header .logo-mark{ display:none; } }
   .logo small{display:block;font-weight:500;font-size:11px;color:var(--text-faint);letter-spacing:.03em}
   .statusbar{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap;align-items:center}
   .pill{
@@ -1040,7 +1045,7 @@
   .cli-card-name{font-weight:700;font-size:15px;letter-spacing:-.01em;display:flex;align-items:center;gap:8px;flex-wrap:wrap;overflow-wrap:anywhere}
   .cli-card-name .pid{font-family:var(--mono);font-size:11px;color:var(--text-faint);font-weight:500}
   .cli-inst-badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;color:var(--text-dim)}
-  .cli-inst-badge svg{color:var(--accent);flex:none}
+  .cli-inst-badge svg{color:var(--accent);flex:none;width:12px;height:12px}
   .conn-pill{
     margin-left:auto;flex:none;display:inline-flex;align-items:center;gap:6px;
     font-size:11.5px;font-weight:700;letter-spacing:.02em;border-radius:999px;padding:4px 11px;white-space:nowrap;
@@ -1591,7 +1596,10 @@
      line of help) waste most of a wide screen on their own row, while the
      model list and the session list want the full width -- so those opt back
      out with .sd-wide. */
-  .sd-grid{display:grid;gap:12px;grid-template-columns:1fr}
+  /* minmax(0,1fr), not 1fr: a bare 1fr track has an `auto` minimum, so one
+     long unbreakable line inside a group sized the column to ~1200px and the
+     Settings page scrolled sideways at phone width (document 998px at 390). */
+  .sd-grid{display:grid;gap:12px;grid-template-columns:minmax(0,1fr)}
   @media (min-width:900px){
     .sd-grid{grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}
     .sd-grid > .sd-wide{grid-column:1 / -1}
@@ -1979,11 +1987,21 @@
     object-fit:contain; display:block; }
   .cx-brand .cx-mark{ width:30px; height:30px; border-radius:8px; display:grid; place-items:center;
     background:var(--accent); color:var(--on-accent); flex:none; }
-  .cx-brand small{ display:block; font-size:10.5px; font-weight:500; color:var(--text-faint); letter-spacing:.02em; }
+  /* Small sidebar captions (brand subtitle, group labels) get their own token:
+     --text-faint measured 3.69:1 (light) / 3.82:1 (dark) on the sidebar, under
+     the 4.5:1 AA floor for text this small. Halfway to --text-dim clears it in
+     both themes and still reads a step quieter than the nav labels. */
+  .cx-sidebar{ --nav-caption:#687280; --nav-caption:color-mix(in srgb, var(--text-dim) 55%, var(--text-faint)); }
+  .cx-brand-text{ min-width:0; line-height:1.25; }
+  /* One line, always: the subtitle used to wrap and leave "127.0.0.1" alone on
+     a third line under the wordmark. The host is in the tooltip and in the
+     header's "local gateway" line. */
+  .cx-brand small{ display:block; font-size:10.5px; font-weight:500; color:var(--nav-caption);
+    letter-spacing:.02em; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .cx-nav{ padding:10px 10px 22px; display:flex; flex-direction:column; }
   .cx-group{ margin-top:10px; }
-  .cx-group-label{ font-size:10px; text-transform:uppercase; letter-spacing:.12em;
-    color:var(--text-faint); padding:5px 12px 3px; font-weight:700; }
+  .cx-group-label{ font-size:10.5px; text-transform:uppercase; letter-spacing:.12em;
+    color:var(--nav-caption); padding:5px 12px 3px; font-weight:700; }
   /* Anchors, not buttons: right-click > "Open in new tab", middle-click and
      ctrl-click only work on a real link with a real href. They were <button>
      elements, so none of that did anything -- reported. The left-click handler
@@ -1999,14 +2017,23 @@
      already uses elsewhere, so it never turns into permanent nag clutter. */
   .nav-new-badge{ margin-left:auto; flex:none; font-size:9px; font-weight:800;
     letter-spacing:.04em; text-transform:uppercase; color:var(--on-accent);
-    background:var(--accent); border-radius:999px; padding:2.5px 7px; }
+    /* accent-strong, not accent: white on the light theme's #16A34A is 3.3:1
+       for 9px text; #15803D is 5:1. Dark theme's strong green is lighter, and
+       its on-accent is near-black, so it only gets more legible there. */
+    background:var(--accent-strong); border-radius:999px; padding:2.5px 7px; line-height:1.2;
+    white-space:nowrap; }
   .nav-new-badge[hidden]{ display:none; }
-  .cx-nav-item:hover{ background:var(--surface-2); color:var(--text); }
-  .cx-nav-item:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
-  .cx-nav-item.active{ color:var(--text); background:var(--accent-soft); }
+  .cx-nav-item > span:not(.nav-new-badge){ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  /* The global a:hover underline (0,1,1) out-ranked .cx-nav-item's
+     text-decoration:none, so hovering a nav link underlined its label. */
+  .cx-nav-item:hover, .cx-nav-item:focus-visible{ background:var(--surface-2); color:var(--text); text-decoration:none; }
+  /* Inset ring: the nav column is the sidebar's scroll box, so an outset ring
+     was shaved off at its edges; inside the item it is always whole. */
+  .cx-nav-item:focus-visible{ outline:2px solid var(--accent); outline-offset:-2px; }
+  .cx-nav-item.active{ color:var(--text); background:var(--accent-soft); font-weight:600; }
   .cx-nav-item.active::before{ content:""; position:absolute; left:0; top:8px; bottom:8px; width:3px;
-    border-radius:3px; background:var(--accent); }
-  .cx-nav-item.active svg{ opacity:1; color:var(--accent); }
+    border-radius:3px; background:var(--accent-strong); }
+  .cx-nav-item.active svg{ opacity:1; color:var(--accent-strong); }
   body.cx-on{ padding-left:var(--sidebar-w); }
 
   /* ── Sidebar modes: full → rail (icons only) → hidden (hover strip) ────────
@@ -2075,7 +2102,9 @@
   body.cx-hidden .cx-group-label .gl-caret{ display:none; }
   /* Group labels are pure text, so while collapsed they are dead space between
      icon clusters. The border keeps the grouping legible without them. */
-  body.cx-hidden .cx-group-label{ height:1px; padding:0; margin:8px 12px;
+  /* width:auto, not the base 100%: 100% + the 12px side margins ran the
+     divider past the strip's right edge. */
+  body.cx-hidden .cx-group-label{ width:auto; height:1px; padding:0; margin:8px 12px;
     overflow:hidden; background:var(--border-soft); border-radius:1px; }
   /* Hover (or keyboard focus) restores the full sidebar, floating above the page. */
   body.cx-rail .cx-sidebar:hover, body.cx-rail .cx-sidebar:focus-within,
@@ -2116,11 +2145,11 @@
      rail/hidden above, this just folds one section's own items, and stays
      available at every width including inside the mobile drawer. */
   .cx-group-label{ display:flex; align-items:center; gap:6px; width:100%;
-    border:0; background:none; cursor:pointer; font:inherit; font-size:10px;
-    text-transform:uppercase; letter-spacing:.12em; color:var(--text-faint);
+    border:0; background:none; cursor:pointer; font:inherit; font-size:10.5px;
+    text-transform:uppercase; letter-spacing:.12em; color:var(--nav-caption);
     font-weight:700; text-align:left; border-radius:6px;
     transition:color .15s ease; }
-  .cx-group-label:hover{ color:var(--text-dim); }
+  .cx-group-label:hover{ color:var(--text); }
   .cx-group-label:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
   .cx-group-label .gl-caret{ margin-left:auto; flex:none; width:12px; height:12px;
     transition:transform .18s ease; }
@@ -2138,9 +2167,34 @@
      you could enter and not leave. */
   @media (min-width:1025px){
   body.cx-rail .cx-sidebar-toggle, body.cx-hidden .cx-sidebar-toggle{ margin-left:0; }
-  body.cx-rail .cx-brand, body.cx-hidden .cx-brand{ justify-content:center; padding:14px 6px; }
-  body.cx-rail .cx-sidebar:hover .cx-brand, body.cx-hidden .cx-sidebar:hover .cx-brand{
-    justify-content:flex-start; padding:18px 16px 14px; }
+  /* Logo ABOVE the toggle while collapsed. Side by side they need 30+10+28 =
+     68px, wider than the 56px rail and the 46px strip, so the row overflowed
+     and the owl was pushed off the left edge -- only a sliver of the logo
+     showed in both collapsed modes. Stacked, both fit and stay centred. */
+  body.cx-rail .cx-brand, body.cx-hidden .cx-brand{ flex-direction:column; justify-content:center;
+    gap:8px; padding:14px 0 12px; }
+  body.cx-rail .cx-sidebar:hover .cx-brand, body.cx-hidden .cx-sidebar:hover .cx-brand,
+  body.cx-rail .cx-sidebar:focus-within .cx-brand, body.cx-hidden .cx-sidebar:focus-within .cx-brand{
+    flex-direction:row; justify-content:flex-start; gap:10px; padding:18px 16px 14px; }
+  body.cx-rail .cx-sidebar:hover .cx-sidebar-toggle, body.cx-hidden .cx-sidebar:hover .cx-sidebar-toggle,
+  body.cx-rail .cx-sidebar:focus-within .cx-sidebar-toggle, body.cx-hidden .cx-sidebar:focus-within .cx-sidebar-toggle{
+    margin-left:auto; }
+  body.cx-rail .cx-sidebar:focus-within .cx-brand-text,
+  body.cx-hidden .cx-sidebar:focus-within .cx-brand-text,
+  body.cx-rail .cx-sidebar:focus-within .nav-new-badge,
+  body.cx-hidden .cx-sidebar:focus-within .nav-new-badge{ display:revert; }
+  /* Hidden mode turns group labels into 1px dividers; the hover-expanded
+     sidebar has to turn them back into labels, or the full-width menu showed
+     thin lines with the section names clipped away. */
+  body.cx-hidden .cx-sidebar:hover .cx-group-label,
+  body.cx-hidden .cx-sidebar:focus-within .cx-group-label{
+    height:auto; padding:5px 12px 3px; margin:0; overflow:visible; background:none;
+    text-align:left; }
+  body.cx-rail .cx-sidebar:hover .cx-group-label,
+  body.cx-rail .cx-sidebar:focus-within .cx-group-label{ text-align:left; padding:5px 12px 3px; }
+  body.cx-rail .cx-sidebar:hover .cx-side-foot, body.cx-hidden .cx-sidebar:hover .cx-side-foot,
+  body.cx-rail .cx-sidebar:focus-within .cx-side-foot, body.cx-hidden .cx-sidebar:focus-within .cx-side-foot{
+    flex-direction:row; align-items:center; padding:14px 16px 18px; }
   }
 
   @media (prefers-reduced-motion:reduce){
@@ -2182,6 +2236,16 @@
        the same corner. The X inside the sidebar is the only opener needed
        once it is open, so the burger steps out of the way entirely. */
     body.cx-drawer-open .cx-burger{ display:none; }
+    /* The burger is fixed at 12px/12px, 42px square, so whatever sits in the
+       top-left corner lived UNDER it: the quota banner's first words ("Some
+       providers are out of free quota" read "…viders are out…") and, with no
+       banner, the header logo itself. Both start past it now (12 + 42 + 12). */
+    body.cx-on #exhaust-banner{ padding-left:66px; }
+    body.cx-on header .hd{ padding-top:12px; }
+    body.cx-on header .logo{ margin-left:38px; min-height:42px; }
+    /* The agent view hides the header, so its first row (the permissions
+       notice) was the thing under the burger there. */
+    body.cx-on.cx-agent-view main.wrap{ padding-top:64px; }
     /* The X replaces the rail/icons-only cycle button here -- that control
        answers "how narrow", which is not a question a full-screen drawer
        has. One unambiguous way to close it instead. */
@@ -2343,6 +2407,14 @@
   body.cx-agent-view #sec-agent .agent-topline > *{ margin:0 !important; }
   body.cx-agent-view #sec-agent .agent-session-bar{ flex:1; min-width:0;
     display:flex; align-items:center; gap:8px; }
+  /* Phone width: the session bar was squeezed to ~14px by flex:1/min-width:0
+     beside the view toggle, its buttons and the quality picker spilled out,
+     and the whole page scrolled sideways (document 601px wide at 390). It takes
+     its own full row there, and the picker wraps instead of overflowing. */
+  @media (max-width:640px){
+    body.cx-agent-view #sec-agent .agent-session-bar{ flex:1 1 100%; flex-wrap:wrap; }
+    body.cx-agent-view #sec-agent .agent-quality{ flex-wrap:wrap; max-width:100%; }
+  }
   body.cx-agent-view #sec-agent .agent-session-info{ overflow:hidden;
     text-overflow:ellipsis; white-space:nowrap; min-width:0; }
   /* Phone: the session bar (effort, model, bookmarks, running, end) was
@@ -2629,7 +2701,7 @@
   <div class="cx-brand">
     <img class="cx-mark-img" src="/static/calvoun-logo.webp" width="30" height="30"
          alt="Calvoun logo: a white owl whose outstretched wings are formed from the letters of the word CALVOUN, with a cyan beak, on a purple rounded square." decoding="async">
-    <span class="cx-brand-text">Calvoun Hub<small>LLM Calvoun V2.8 &middot; 127.0.0.1</small></span>
+    <span class="cx-brand-text">Calvoun Hub<small title="LLM Calvoun V2.8 &middot; local gateway at 127.0.0.1">LLM Calvoun V2.8</small></span>
     <button class="cx-sidebar-toggle" id="cx-sidebar-toggle" type="button"
             aria-label="Collapse the sidebar" title="Collapse the sidebar (full → icons → hidden)">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
@@ -2702,9 +2774,7 @@
 <header>
   <div class="hd">
     <div class="logo">
-      <span class="logo-mark" aria-hidden="true">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 11-13h-7l1-7z"/></svg>
-      </span>
+      <img class="logo-mark" src="/static/calvoun-logo.webp" width="30" height="30" alt="" decoding="async">
       <span>Calvoun Free LLM Hub<small>local gateway &middot; 127.0.0.1</small></span>
     </div>
     <div class="statusbar" id="statusbar" aria-live="polite">
@@ -7783,7 +7853,10 @@
     });
   }
 
-  var CHECK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 13 4 4L19 7"/></svg>';
+  /* TERM_, not CHECK_SVG: a second `var CHECK_SVG` here (same function scope,
+     so it silently REPLACED the 12x12 one above) had no width/height, and every
+     CLI card's "installed" badge rendered a ~90px green check. */
+  var TERM_CHECK_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 13 4 4L19 7"/></svg>';
   var CROSS_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>';
   /* "(214s)" is not a duration anyone reads. */
   function fmtElapsed(ms){
@@ -10393,7 +10466,7 @@
         head.className = 'agent-term-line ' + (failed ? 'err' : 'done');
         var took = fmtElapsed(Date.now() - elapsedStart);
         head.innerHTML =
-          '<span class="agent-check">' + (failed ? CROSS_SVG : CHECK_SVG) + '</span>' +
+          '<span class="agent-check">' + (failed ? CROSS_SVG : TERM_CHECK_SVG) + '</span>' +
           '<span>' + (failed ? 'Failed' : 'Finished') + '</span>' +
           '<span class="agent-elapsed">' + esc(took) + '</span>';
         if (!failed && finalText){ var art = extractArtifactHTML(finalText); if (art) addArtifactButton(asstEl, art); }
