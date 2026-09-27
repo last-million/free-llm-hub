@@ -1092,6 +1092,13 @@
     border:1px solid var(--warn-border);border-radius:var(--radius-sm);padding:11px 14px;margin-bottom:14px;
   }
   .sub-master-row{margin-bottom:14px}
+  .sub-scope{border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 14px;margin:0 0 14px;
+    display:flex;flex-direction:column;gap:8px;font-size:12px;color:var(--text-dim);min-width:0}
+  .sub-scope legend{padding:0 4px;font-weight:600;color:var(--text)}
+  .sub-scope label{display:flex;align-items:flex-start;gap:8px;cursor:pointer;line-height:1.5}
+  .sub-scope input[type=radio]{margin-top:3px;accent-color:var(--accent)}
+  .sub-scope input[type=radio]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .sub-scope strong{color:var(--text)}
   .sub-mode-pill{
     display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;
     padding:3px 9px;border-radius:999px;background:var(--surface-3);color:var(--text-faint);white-space:nowrap;
@@ -2999,7 +3006,7 @@
   <section class="section" aria-labelledby="h-subs">
     <div class="section-h">
       <h2 id="h-subs" tabindex="-1">Local subscriptions</h2>
-      <span class="sub">use your PAID Claude Code / ChatGPT Codex plan as a last-resort tier &mdash; opt-in, off by default</span>
+      <span class="sub">use your PAID Claude Code / ChatGPT Codex plan as the manager (and optionally a last-resort tier) &mdash; opt-in, off by default</span>
       <span class="sec-chip" id="chip-subs" hidden></span>
     </div>
     <div class="section-body" id="sec-subs">
@@ -3011,6 +3018,13 @@
           <span class="lbl">Use local subscriptions</span>
         </label>
       </div>
+      <fieldset class="sub-scope" id="sub-scope">
+        <legend>What the subscription may be used for</legend>
+        <label><input type="radio" name="sub-scope" value="manager_only">
+          <span><strong>Manager only (recommended)</strong> &mdash; only the manager (planning / review, capped by its daily budget) spends the subscription. Ordinary requests never fall back to it.</span></label>
+        <label><input type="radio" name="sub-scope" value="all">
+          <span><strong>Manager + fallback for all traffic</strong> &mdash; the manager, and also a last-resort provider for any request once every free model has failed.</span></label>
+      </fieldset>
       <div class="sub-manager" id="sub-manager" hidden></div>
       <div class="cli-grid" id="sub-list" aria-live="polite">
         <div class="skel skel-card"></div>
@@ -8188,6 +8202,10 @@
     var host = $('#sub-list');
     if (warn) warn.textContent = data.warning || '';
     if (master) master.checked = !!data.enabled;
+    var scope = data.subscription_scope === 'manager_only' ? 'manager_only' : 'all';
+    Array.prototype.forEach.call(document.querySelectorAll('input[name="sub-scope"]'), function(el){
+      el.checked = (el.value === scope); el.disabled = false;
+    });
     var rows = Array.isArray(data.providers) ? data.providers : [];
     rows.sort(function(a, b){ return (b.recommended ? 1 : 0) - (a.recommended ? 1 : 0); });
     var usable = rows.filter(function(r){ return r.usable; }).length;
@@ -8422,6 +8440,20 @@
   }
 
   function initSubscriptions(){
+    Array.prototype.forEach.call(document.querySelectorAll('input[name="sub-scope"]'), function(el){
+      el.addEventListener('change', function(){
+        if (!el.checked) return;
+        var radios = document.querySelectorAll('input[name="sub-scope"]');
+        Array.prototype.forEach.call(radios, function(x){ x.disabled = true; });
+        api('/api/subscriptions', { method: 'POST', body: { subscription_scope: el.value } }).then(function(){
+          return loadSubscriptions();
+        }).catch(function(e){
+          toast('Update failed: ' + e.message, true);
+          Array.prototype.forEach.call(radios, function(x){ x.disabled = false; });
+          return loadSubscriptions(true);
+        });
+      });
+    });
     var m = $('#sub-master-switch');
     if (!m) return;
     m.addEventListener('change', function(){

@@ -668,6 +668,19 @@ turn 1 recalled at turn 7). Covered by `tests/test_long_request_upload.py`,
   request can hit `request_deadline_seconds` (240) -> clean 504. The CLIs'
   declared windows (128K / codex 96K) keep real sessions well below that.
 
+## Subscription scope (manager-only)
+
+Setting `subscription_scope` = `"all"` (default when absent — the old
+behaviour: manager + sub-* last-resort routing) | `"manager_only"`. With
+`manager_only`, `_sub_routing_on()` is false, so `_sub_available_providers()`
+returns [] (no sub-* candidate, primary, chain tail or /v1/models row), an
+explicit `sub-*/<model>` pick and `_check_provider_ready` are refused, and the
+`_subscription_chat` dispatch shim answers 403 without running the CLI.
+`_manager_dispatch` still works (it gates on `_sub_master_on()` only), and
+`/agent` sessions have their own switch. Exposed as `subscription_scope` in
+GET/POST `/api/subscriptions` and the dashboard "What the subscription may be
+used for" radio. Covered by `tests/test_subscription_scope.py`.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

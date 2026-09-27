@@ -5377,6 +5377,39 @@ def _sub_master_on():
     return bool(config.get_flag(_SUB_MASTER_FLAG, False))
 
 
+# What the master switch unlocks (owner decision 2026-09-27):
+#   "all"          -> today's behaviour: the manager AND sub-* as a last-resort
+#                     routing provider for ordinary traffic. Default when the
+#                     setting is absent, so existing installs are unchanged.
+#   "manager_only" -> ONLY _manager_dispatch may spend the subscription. sub-*
+#                     is never a candidate, primary or chain member for any
+#                     request (chat/responses/messages, swarm, fan-out, probes,
+#                     recaps), never listed in /v1/models, and an explicit
+#                     'sub-codex/codex' pick is refused. /agent sessions have
+#                     their own switch (agentic_chat) and are not affected.
+_SUB_SCOPE_SETTING = "subscription_scope"
+_SUB_SCOPES = ("all", "manager_only")
+
+
+def _sub_scope():
+    try:
+        v = config.get_setting(_SUB_SCOPE_SETTING, "all")
+    except Exception:                                            # noqa: BLE001
+        return "all"
+    return v if v in _SUB_SCOPES else "all"
+
+
+def _sub_routing_on():
+    """True when sub-* may serve ordinary traffic as a routing provider:
+    master switch on AND scope is not "manager_only"."""
+    return _sub_master_on() and _sub_scope() != "manager_only"
+
+
+_SUB_MANAGER_ONLY_MSG = ("Local subscriptions are set to 'Manager only': they are "
+                         "never used to serve requests directly. Switch the scope "
+                         "to 'Manager + fallback for all traffic' to allow this.")
+
+
 def _sub_bin(pid, model=None):
     """Absolute path to the CLI binary, or None. Never raises.
 
@@ -5511,8 +5544,11 @@ def _sub_available_providers():
     caller below is a no-op on a stock hub. NOTE: deliberately NOT merged into
     _available_providers(): that function feeds _best_free_pair() /
     aggregated_models() / the FREE quota banner, and a paid subscription must
-    never leak into "best FREE model" or be auto-persisted as the default."""
-    if not _sub_master_on():
+    never leak into "best FREE model" or be auto-persisted as the default.
+
+    Also [] under subscription_scope "manager_only": this list is what makes
+    sub-* a routing candidate, and the manager does not read it."""
+    if not _sub_routing_on():
         return []
     out = []
     for pid in _SUB_PROVIDERS:
@@ -5910,6 +5946,14 @@ def _subscription_chat(pid, payload):
     streams. Shape matches _upstream_chat's contract so every downstream
     translator (_chat_to_responses / _openai_resp_to_anthropic) just works."""
     cfg = _SUB_PROVIDERS.get(pid) or {}
+    if not _sub_routing_on():
+        # Last line of defence: every routing path already drops sub-* under
+        # "manager_only"; a hop that still got here must not spend the plan.
+        # Not marked dead -- the subscription itself is fine (manager uses it).
+        return _SubResponse(403, {"error": {
+            "message": _SUB_MANAGER_ONLY_MSG if _sub_master_on()
+            else "Local subscription providers are turned off.",
+            "type": "upstream_error", "code": 403}})
     default_model = cfg.get("model") or ((cfg.get("models") or [None])[0])
     model = payload.get("model") or default_model or "cli"
     prompt = _sub_flatten(payload.get("messages"))
@@ -8019,6 +8063,8 @@ def _resolve_model(model):
             if not _sub_master_on():
                 return None, ("Local subscription providers are off. Turn them on "
                               "first — they spend your PAID Claude/ChatGPT plan.")
+            if not _sub_routing_on():
+                return None, _SUB_MANAGER_ONLY_MSG
             _e, _i, _a, detail = _sub_state(head)
             return None, ("%s is not available: %s"
                           % (_SUB_PROVIDERS[head]["name"], detail or "disabled"))
@@ -8054,6 +8100,8 @@ def _check_provider_ready(pid):
         if not _sub_master_on():
             return ("Local subscription providers are off. Turn them on first — "
                     "they spend your PAID Claude/ChatGPT plan.")
+        if not _sub_routing_on():
+            return _SUB_MANAGER_ONLY_MSG
         enabled, _installed, authed, detail = _sub_state(pid)
         if not enabled:
             return "%s is switched off." % _SUB_PROVIDERS[pid]["name"]
@@ -15875,7 +15923,9 @@ def _sub_provider_rows():
 
 def _sub_payload():
     return {"enabled": _sub_master_on(), "providers": _sub_provider_rows(),
-            "manager": _manager_status(), "warning": _SUB_WARNING}
+            "manager": _manager_status(), "warning": _SUB_WARNING,
+            "subscription_scope": _sub_scope(),
+            "routing_enabled": _sub_routing_on()}
 
 
 @app.route("/api/subscriptions", methods=["GET"])
@@ -15897,6 +15947,8 @@ def api_subscriptions_update():
       (the provider keys may be combined in one body; each is applied independently)
       {"manager_model": "sub-claude/sonnet" | ""}    -> manager on (that model) / off
       {"manager_daily_token_budget": int >= 0}       -> 0 = unlimited
+      {"subscription_scope": "all" | "manager_only"} -> what the master switch
+          unlocks: manager + last-resort routing, or the manager alone
 
     When 'provider' is present, 'enabled'/'isolated' apply to THAT provider (the
     master switch is only touched by a body without 'provider') — so one call can
@@ -15921,6 +15973,12 @@ def api_subscriptions_update():
             return jsonify({"error": "manager_daily_token_budget must be an "
                                      "integer >= 0 (0 = unlimited)."}), 400
         mgr_touched = True
+    if _SUB_SCOPE_SETTING in body:
+        sc = body.get(_SUB_SCOPE_SETTING)
+        if sc not in _SUB_SCOPES:
+            return jsonify({"error": "subscription_scope must be 'all' or "
+                                     "'manager_only'."}), 400
+        mgr_touched = True
     pid = body.get("provider")
     if pid is not None and pid not in _SUB_PROVIDERS:
         return jsonify({"error": "Unknown subscription provider '%s'."
@@ -15934,6 +15992,8 @@ def api_subscriptions_update():
         config.set_value("manager_model", mm.strip() or None)
     if "manager_daily_token_budget" in body:
         config.set_setting("manager_daily_token_budget", int(mb))
+    if _SUB_SCOPE_SETTING in body:
+        config.set_setting(_SUB_SCOPE_SETTING, sc)
     if pid is not None:
         touched = False
         if "model" in body:
