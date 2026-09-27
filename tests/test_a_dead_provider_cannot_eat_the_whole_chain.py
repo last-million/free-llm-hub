@@ -166,6 +166,6 @@ def test_only_the_streaming_path_is_bounded(monkeypatch):
     caller is waiting on a BODY, not on headers -- the budget this protects is
     the client's header timeout, which only a streaming request has."""
     src = open("app.py", encoding="utf-8").read()
-    i = src.index("_post_with_header_deadline(_STREAM_HEADER_WAIT")
+    i = src.index("_post_with_header_deadline(_hdr_wait")
     window = src[max(0, i - 400):i + 200]
     assert "if stream" in window or "stream else" in window, window

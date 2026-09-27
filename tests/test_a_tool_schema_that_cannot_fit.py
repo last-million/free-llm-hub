@@ -152,7 +152,7 @@ def test_the_guard_runs_before_the_request_is_sent():
     """The whole point is not paying for the round trip."""
     src = open("app.py", encoding="utf-8").read()
     guard = src.index("_tools_exceed_budget(payload, _model_ctx_budget(")
-    post = src.index("_post_with_header_deadline(_STREAM_HEADER_WAIT")
+    post = src.index("_post_with_header_deadline(_hdr_wait")
     assert guard < post
 
 
