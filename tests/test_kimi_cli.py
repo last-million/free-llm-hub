@@ -63,8 +63,10 @@ def test_kimi_entry_registered_with_sane_fields():
     assert e["name"] == "Kimi Code"
     assert e["kind"] == "openai"
     assert e["bins"] == ["kimi"]
+    # The Node Kimi Code (`kimi` since 0.3x) reads ~/.kimi-code, not ~/.kimi;
+    # the sandboxed home has neither, so the primary is the new one alone.
     assert len(e["config_paths"]) == 1
-    assert e["config_paths"][0].endswith(os.path.join(".kimi", "config.toml"))
+    assert e["config_paths"][0].endswith(os.path.join(".kimi-code", "config.toml"))
     # TOML config surface, no shell-env wiring -> config method, no env_check,
     # and still listed among the CLIs that must NOT get an env-var block.
     assert not e.get("env_check")
@@ -73,7 +75,7 @@ def test_kimi_entry_registered_with_sane_fields():
     # One-click since 2026-07-31: a real autofix strategy + reverter, both
     # writing the SAME file the entry advertises.
     assert e.get("autofix") == "kimi"
-    assert e["write_path"].endswith(os.path.join(".kimi", "config.toml"))
+    assert e["write_path"] == e["config_paths"][0]
     assert app._AUTOFIXERS["kimi"] is app._autofix_kimi
     assert app._DISCONNECTERS["kimi"] is app._disconnect_kimi
 
@@ -182,7 +184,7 @@ def test_kimi_autofix_writes_valid_toml_and_connects(monkeypatch):
     # The user's pre-existing managed provider survives untouched...
     assert data["providers"]["managed:kimi-code"]["base_url"] == "https://api.kimi.com/coding/v1"
     # ...and the clobbered default_model is remembered for Disconnect.
-    assert store["kimi_prev_default_model"] == "kimi-code/kimi-for-coding"
+    assert store[app._kimi_prev_setting(path)] == "kimi-code/kimi-for-coding"
     connected, method, _ = app._cli_connected(_kimi_entry_at(path))
     assert connected is True and method == "config"
 
@@ -236,10 +238,13 @@ def test_kimi_connect_from_no_config_file_at_all(monkeypatch):
     assert data["default_model"] == "auto"
     assert data["providers"]["free-hub"]["base_url"] == HUB_V1
     # Nothing was clobbered -> nothing to remember.
-    assert "kimi_prev_default_model" not in store
-    # Disconnect drops our default_model line entirely rather than inventing one.
-    app._disconnect_kimi(_kimi_entry_at(path))
-    assert "default_model" not in tomllib.loads(_read(path))
+    assert app._kimi_prev_setting(path) not in store
+    # Disconnect drops our default_model line entirely rather than inventing one
+    # -- and Connect created the file, so nothing of the user's is left: the
+    # empty shell goes too (like aider's).
+    out = app._disconnect_kimi(_kimi_entry_at(path))
+    assert out["changed"] is True and out.get("deleted") is True
+    assert not os.path.exists(path)
 
 
 def test_kimi_autofix_never_echoes_the_key(monkeypatch):

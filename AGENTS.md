@@ -177,6 +177,30 @@ generic `_remove_toml_table` / `_backup_once` helpers, so unrelated tables the
 user added after connecting survive a revert. `manual_note` is kept as fallback.
 Covered by `tests/test_kimi_cli.py` (round-trip + idempotence + no-key-echo).
 
+**Which file (2026-09-27, measured on kimi-code 0.39.1):** the `kimi` on PATH
+is the Node Kimi Code (npm `@moonshot-ai/kimi-code`), which reads
+`KIMI_CODE_HOME` else `~/.kimi-code/config.toml` — NOT `~/.kimi`. Writing only
+`~/.kimi` left `kimi -p` at "No model configured" while the card said
+Connected. `_p_kimi()` is now the Kimi Code file (legacy `~/.kimi` only when
+it is the sole config); `_kimi_config_paths()` adds the legacy kimi-cli file
+when it exists, and Connect/Disconnect act on all of them (per-file previous
+default under `_kimi_prev_setting(path)`). Connect writes one alias per tier
+(`_HUB_TIER_IDS`: auto/best/swarm); a user alias with a tier's name is kept.
+A Connect-created file is deleted on Disconnect. Covered by
+`tests/test_kimi_code_home.py`. Open gap: `mcp_manager` still registers kimi
+MCP servers in `~/.kimi/config.toml`; Kimi Code reads `~/.kimi-code/mcp.json`.
+
+## Config-only CLIs: tiers + windows in the documented file (2026-09-27)
+
+Covered by `tests/test_other_cli_formats.py`. qwen also gets the documented
+`~/.qwen/settings.json` setup (`modelProviders.openai` one entry per tier with
+`generationConfig.contextWindowSize`, `security.auth.selectedType = "openai"`,
+`model.name = "auto"`), reverted key by key against its Connect-time backup.
+openclaw lists every tier (+ allowlist) and a Connect-created file is removed.
+aider uses `openai/auto` (never the concrete `model` argument) plus
+`~/.aider.model.metadata.json` windows. Hub mode OFF byte-restores only
+write_path, so `_revert_side_files` cleans these second files.
+
 ## AgentRouter: removed (2026-07-31)
 
 Both halves are gone at user request: the `agentrouter` provider entry
