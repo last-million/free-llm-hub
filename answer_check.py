@@ -682,6 +682,32 @@ def _splits_a_number(text, clean):
     return run != (unit * (len(run) // len(unit) + 1))[:len(run)]
 
 
+# A reply that is NOTHING but chat-template tokens and punctuation. MEASURED
+# live 2026-09-27 on a codex `exec resume` turn: nvidia/kimi-k3 streamed
+# "<|close|>!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" and it shipped as the answer --
+# the head has "close" in it, so the separator-run check saw answer text, and
+# "<|close|>" is not one of the known template tokens. No word outside a
+# <|...|> token = no answer: cut at 0, no salvage, the chain moves on.
+_ANY_SPECIAL_TOKEN_RE = re.compile(r"<[|｜][\w.:\-▁]{1,40}[|｜]>")
+# one stray word glued to the token, then only a punctuation run to the end
+_TOKEN_WORD_RUN_RE = re.compile(r"^\s*\w{1,16}\s*([^\w\s])\1{7,}\s*$")
+
+
+def _special_token_junk(text, prompt_text):
+    if prompt_text and ("<|" in prompt_text or "<｜" in prompt_text):
+        return None             # the user is asking ABOUT these tokens
+    if not _ANY_SPECIAL_TOKEN_RE.search(text):
+        return None
+    rest = _ANY_SPECIAL_TOKEN_RE.sub(" ", text)
+    if _TOKEN_WORD_RUN_RE.match(rest):
+        return 0                # "<|close|>think!!!!!!!!" (same turn, next try)
+    if re.search(r"\w", rest):
+        return None
+    # A stream head that so far holds only "<|x|>" may still turn into an
+    # answer; junk is the token PLUS a run of punctuation after it.
+    return 0 if len(re.sub(r"\s", "", rest)) >= 8 else None
+
+
 def _clip(text):
     if len(text) <= _MAX_SCAN:
         return text
@@ -732,6 +758,8 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
             ("separator_run", lambda: _separator_run(masked, finish_reason)),
             ("tool_markup", lambda: _markup_leak(masked, prompt_text, tools_offered)),
             ("reasoning_leak", lambda: _reasoning_leak(masked, prompt_text)),
+            ("template_junk", lambda: (None if offset else
+                                       _special_token_junk(body, prompt_text))),
         )
         for reason, fn in checks:
             cut = fn()

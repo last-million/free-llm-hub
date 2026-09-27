@@ -442,3 +442,40 @@ def test_stream_without_hop_ids_records_nothing():
     list(app._responses_stream(_StreamResp(), "auto", line_iter=iter(_sse("x"))))
     with app._outcome_lock:
         assert not app._outcomes
+
+
+# --------------------------------------------------------------------------- #
+# A reply that is nothing but a template token and punctuation (live
+# 2026-09-27, nvidia/kimi-k3 on a codex resume turn: "<|close|>!!!!...").
+# --------------------------------------------------------------------------- #
+
+def test_template_token_plus_punctuation_is_junk():
+    v = answer_check.inspect("<|close|>" + "!" * 33)
+    assert not v["ok"] and "template_junk" in v["reasons"] and v["salvage"] is None
+
+
+def test_fullwidth_template_token_junk():
+    v = answer_check.inspect("<\uff5cend\u2581of\u2581sentence\uff5c>........")
+    assert not v["ok"] and v["salvage"] is None
+
+
+def test_a_real_answer_next_to_a_token_is_not_template_junk():
+    assert "template_junk" not in answer_check.inspect("<|close|> The answer is 42.")["reasons"]
+
+
+def test_a_stream_head_with_only_the_token_is_not_judged_yet():
+    assert answer_check.inspect("<|close|>", partial=True)["ok"]
+
+
+def test_asking_about_the_tokens_is_allowed():
+    v = answer_check.inspect("<|im_end|> ........", prompt_text="what does <|im_end|> mean?")
+    assert "template_junk" not in v["reasons"]
+
+
+def test_plain_punctuation_answers_are_untouched():
+    assert answer_check.inspect("!!!!!!!!!!", prompt_text="print ten exclamation marks")["ok"]
+
+
+def test_template_token_with_a_stray_word_then_punctuation_is_junk():
+    v = answer_check.inspect("<|close|>think" + "!" * 32)
+    assert not v["ok"] and v["salvage"] is None

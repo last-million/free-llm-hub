@@ -553,6 +553,34 @@ Covered by `tests/test_pipeline_complete.py`.
 - Brevity trims (`_fit_visible_to_caller`, the stream cap) never cut inside a
   token (`_cut_splits_token`): "50648" is never served as "5064".
 
+## Long conversations in real use (2026-09-27)
+
+Verified live (160K-token histories on all 3 protocols; Claude Code
+`-p --continue` and codex `exec resume --last`, 7 turns each, facts from
+turn 1 recalled at turn 7). Covered by `tests/test_long_request_upload.py`,
+`tests/test_unsupported_param_drop.py`,
+`tests/test_recap_treats_transcript_as_data.py`.
+
+- **Uploads**: urllib3 sends the BODY under the CONNECT timeout. This
+  machine's uplink moved ~20 KB/s, so a flat 10s killed every body >~200 KB
+  ("The write operation timed out" -> ConnectionError on every hop -> 503).
+  `_send_timeout(_body_bytes(payload))` (floor `UPLOAD_FLOOR_BYTES_PER_S`,
+  cap `UPLOAD_TIMEOUT_CAP`) on every chat/puter/embedding post; the streaming
+  header wait is `_STREAM_HEADER_WAIT + _upload_allowance(...)`.
+- **Prefill**: past `STREAM_HUGE_REQUEST_TOKENS` the first-content peek grows
+  1s per `STREAM_PREFILL_TOKENS_PER_S` (cap `STREAM_PREFILL_EXTRA_CAP`).
+- **Refused optional params** (`prompt_cache_key` -> nvidia 400 "Unsupported
+  parameter(s)"): `_rejected_optional_params` drops a key a 400/422 names next
+  to a refusal word, retries once, remembers it per provider
+  (`_PARAM_REJECTED`); model/messages/tools/stream are never dropped.
+- **Recap**: the summariser's input is fenced as data
+  (`_summary_user_content`) and the recap carries a USER FACTS & RULES
+  section — it once obeyed the conversation's "answer in French, start with
+  OK:" rule and invented a goal.
+- Still true at 220K real tokens: one free hop can need 110-210s, so a
+  request can hit `request_deadline_seconds` (240) -> clean 504. The CLIs'
+  declared windows (128K / codex 96K) keep real sessions well below that.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
