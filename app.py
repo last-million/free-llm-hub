@@ -24854,6 +24854,91 @@ def _hedge_leg_verdict(item, payload):
     return "error"
 
 
+# best/max DEGRADE GRACEFULLY instead of hanging.
+#
+# MEASURED 2026-09-27 on 3c10c24: Claude Code `claude -p "What is N plus 1?
+# Reply with only the number." --model max` (/v1/messages, tools, stream) had
+# no answer after 421 s, while `--model multi` answered in 7 s and the protocol
+# sweep ran at a 0.9 s median. Upstream was degraded (google quota exhausted,
+# dahl/openrouter 429, nvidia stalling). best/max lift a simple ask to medium,
+# so the turn skipped every quick-turn rule `auto` uses (fast primary, fast-
+# first chain, the tight trivial hop budget) and walked the strength-ordered
+# chain one stall at a time until the 240 s deadline -- then the client retried.
+#
+# Now: once _QUALITY_FALLBACK_SHARE of the request deadline (at least
+# _QUALITY_FALLBACK_MIN_SECONDS; _QUALITY_FALLBACK_TRIVIAL_SECONDS for a
+# trivial ask) passed with nothing served, the walk jumps to the best
+# AVAILABLE fast capable candidates (_quality_fallback_pick) -- healthy, not
+# stalled, strongest first among them -- and a hop still waiting at that
+# moment is cut there. The answer is marked: X-Free-LLM-Hub-Fallback
+# ("max->auto") and the activity row's `fallback`. A healthy strong pool
+# answers long before the mark and is unaffected.
+_QUALITY_FALLBACK_SHARE = 0.45
+_QUALITY_FALLBACK_MIN_SECONDS = 45.0
+_QUALITY_FALLBACK_TRIVIAL_SECONDS = 30.0
+_QUALITY_FALLBACK_PAIRS = 3
+
+
+def _quality_fallback_pick(entries, tools=False, stalled=()):
+    """Up to _QUALITY_FALLBACK_PAIRS (pid, model) of `entries` (the chain not
+    walked yet) to serve a best/max turn whose strong pool did not answer in
+    time: fast, not in a provider that stalled this walk, not recently
+    stalled/failed, not benched, clearing the simple floor, tool-safe on a
+    tool turn -- each filter fail-open -- then healthiest, measured-quick,
+    strongest first. Never raises ([] on error)."""
+    try:
+        pool = []
+        for e in entries or ():
+            pid, model = e[0], e[1]
+            pool.append((_benchmark_score(pid, model), pid, model))
+
+        def keep(cands, pred):
+            return [c for c in cands if pred(c)] or cands
+
+        pool = keep(pool, lambda c: _is_fast(c[1], c[2]))
+        pool = keep(pool, lambda c: c[1] not in stalled)
+        pool = keep(pool, lambda c: not _recent_hop_stall(c[1], c[2]))
+        pool = keep(pool, lambda c: not _is_pair_benched(c[1], c[2]))
+        pool = keep(pool, lambda c: not _is_low_quality(c[2]))
+        pool = keep(pool, lambda c: c[0] >= _DIFFICULTY_FLOOR["simple"])
+        if tools:
+            pool = keep(pool, lambda c: not _is_vision_specialised(c[2]))
+            pool = keep(pool, lambda c: not _tool_turn_sick(c[1], c[2]))
+            pool = keep(pool, lambda c: not _relay_tool_sick(c[1], c[2]))
+        pool.sort(key=lambda c: (_chain_reliability_band(c[1], c[2]) >= 2,
+                                 bool(_recent_hop_failure(c[1], c[2])),
+                                 _simple_speed_rank(c[1], c[2])[1],
+                                 -c[0]))
+        return [(p, m) for _s, p, m in pool[:_QUALITY_FALLBACK_PAIRS]]
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def _plan_quality_fallback(clock, model, has_images, pinned, messages, max_tokens):
+    """Arm `clock`'s best/max fallback when this request routes in quality
+    mode (the same test _quality_route_kwargs makes; never for a pinned
+    model). Never raises."""
+    try:
+        if pinned or not _quality_route_kwargs(model, has_images):
+            return
+        clock.plan_quality_fallback("%s->auto" % str(model).strip().lower(),
+                                    messages, max_tokens)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _quality_fallback_header(pid, model):
+    """The fallback label when (pid, model) is one this request's best/max
+    fallback put forward, else None. Never raises."""
+    try:
+        fb = getattr(g, "hub_quality_fallback", None)
+        if fb and (pid, model) in fb.get("pairs", ()):
+            return fb.get("label")
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
 class _ChainClock:
     """The request deadline plus the current hop's budget, for one chain walk.
 
@@ -24874,6 +24959,7 @@ class _ChainClock:
     _prov_hops = None
     _prov_secs = None
     _relay_bad = None
+    _qf = None                       # best/max fallback plan (plan_quality_fallback)
 
     def __init__(self, trivial=False, tools=False, est=0, stream=False, pinned=False):
         # `est` / `stream`: a long request's deadline grows with its size
@@ -24930,6 +25016,8 @@ class _ChainClock:
         first = True
         while rest:
             self._close_hop()
+            if self._quality_due():
+                self._fire_quality_fallback(rest)
             if self.tools:
                 rest[:] = [e for e in rest if not self._relay_skip(e)]
                 if not rest:
@@ -24954,6 +25042,60 @@ class _ChainClock:
             first = False
             yield rest.pop(i)
         self._close_hop()
+
+    # -- best/max graceful degrade (see _QUALITY_FALLBACK_SHARE) ------------ #
+
+    def plan_quality_fallback(self, label, messages=None, max_tokens=None):
+        """Arm the best/max fallback for this walk. `label` names it in the
+        header and the activity row ("max->auto"). The mark is measured from
+        the REQUEST's start, so a second walk of the same request does not
+        restart it. Never raises."""
+        try:
+            trivial = _is_trivial_ask(messages, max_tokens) if messages else False
+            if trivial:
+                wait = _QUALITY_FALLBACK_TRIVIAL_SECONDS
+            else:
+                wait = max(_QUALITY_FALLBACK_MIN_SECONDS,
+                           _QUALITY_FALLBACK_SHARE * float(self.limit or 0))
+            start = (self.deadline_at - float(self.limit)
+                     if self.deadline_at is not None and self.limit else time.monotonic())
+            self._qf = {"label": str(label), "at": start + wait, "start": start,
+                        "fired": False, "trivial": bool(trivial)}
+        except Exception:                                        # noqa: BLE001
+            self._qf = None
+
+    def _quality_due(self):
+        qf = self._qf
+        return bool(qf and not qf["fired"] and time.monotonic() >= qf["at"])
+
+    def _fire_quality_fallback(self, rest):
+        """Move the fallback picks to the front of `rest` (in place) and mark
+        the request. Fires once per walk."""
+        qf = self._qf
+        qf["fired"] = True
+        try:
+            stalled = set(self._stalled) | {e[0] for e in rest if self._demoted(e[0])}
+            picks = _quality_fallback_pick(rest, tools=self.tools, stalled=stalled)
+            if not picks:
+                return
+            rest[:] = picks + [e for e in rest if e not in picks]
+            if qf.get("trivial"):
+                # a one-liner: the picks get the tight trivial hop budget, so
+                # one of them stalling cannot eat what is left either
+                self.trivial = True
+            fb = getattr(g, "hub_quality_fallback", None) or {"pairs": set()}
+            fb["label"] = qf["label"]
+            fb["pairs"] = set(fb.get("pairs") or ()) | set(picks)
+            g.hub_quality_fallback = fb
+            act = getattr(g, "act", None)
+            if act is not None:
+                with _activity_lock:
+                    act["fallback"] = qf["label"]
+            _log.warning("[quality-fallback] %s: nothing served after %.0fs -> %s",
+                         qf["label"], time.monotonic() - qf["start"],
+                         ", ".join("%s/%s" % p for p in picks))
+        except Exception:                                        # noqa: BLE001
+            pass
 
     def _ensure_ledgers(self):
         if self._prov_hops is None:
@@ -25042,6 +25184,13 @@ class _ChainClock:
         cap = self._provider_cap()
         if cap is not None and not _is_sub(pid) and self._others_waiting(pid):
             room = max(_TOOL_PROVIDER_MIN_HOP, cap - self._prov_secs.get(pid, 0.0))
+            budget = room if budget is None else min(budget, room)
+        # best/max: a hop still waiting at the fallback mark is cut there, so
+        # the fallback (see plan_quality_fallback) gets the time that is left
+        # -- only while something is left to fall back to.
+        qf = self._qf
+        if qf and not qf["fired"] and self._rest and not _is_sub(pid):
+            room = max(_ADAPTIVE_HOP_FLOOR, qf["at"] - time.monotonic())
             budget = room if budget is None else min(budget, room)
         left = self.left()
         if left is not None:
@@ -25643,6 +25792,16 @@ def _judge_peeked(chunks, check=None, raw_items=None, prompt=None, complete=True
         text = _peeked_text("".join(chunks))
         if not text:
             return "content"
+        # A claim to have no tools on a turn that offered them (see
+        # _no_tools_claim). The peek commits at once on a real tool call, so
+        # text reaching here carried none so far; kind "no_tools_claim" makes
+        # it a quality failure, not a dead-mark.
+        if check and check.get("tools_offered") and _no_tools_claim(
+                text, tools_offered=True,
+                prompt=prompt if prompt is not None else check.get("last_prompt"),
+                used_tools=bool(check.get("used_tools"))):
+            _set_nonanswer_kind("no_tools_claim")
+            return "nonanswer"
         if (_looks_like_text_tool_call(text)
                 or _looks_like_announced_not_acted(text)
                 or _looks_like_refusal(text)
@@ -26391,6 +26550,170 @@ def _looks_like_refusal(text):
     return bool(_REFUSAL_RE.search(first))
 
 
+# A model CLAIMING IT HAS NO TOOLS on a turn that offered them.
+#
+# MEASURED 2026-09-27 (protocol_sweep): llm7/codestral answered three tool-turn
+# checks in TEXT -- "I don't have access to tools/functions..." -- while the
+# request carried a tools array, and the hub served that as the answer. None
+# of the detectors above fires on it: it declines nothing ("I cannot help" is
+# _REFUSAL_RE's shape), announces nothing and types no call.
+#
+# Conservative on every axis, because a model may legitimately explain a
+# tool's limits:
+#   * only on a turn that OFFERED tools, with no tool call in the reply;
+#   * never once tools ran this turn (a tool result is in the history after
+#     the last user message): "I can't access that file, the read failed" is
+#     a report, not a claim;
+#   * never when the user's OWN words ask about tools / capabilities, or say
+#     not to use them: then a reply about having none is the answer;
+#   * the claim must OPEN the reply (its first sentence, or the second after
+#     a short "Sorry."; within _NO_TOOLS_CLAIM_AT chars, no code before it)
+#     and name TOOLS, FUNCTIONS, FILES, a file
+#     system, commands or the user's machine -- in plural/generic form: "I
+#     can't call the function `foo` directly" is about code, and passes.
+# A hit is a non-answer (next hop) and a quality failure for the pair, never
+# a dead-mark (_note_nonanswer, kind "no_tools_claim").
+_NO_TOOLS_CLAIM_AT = 160
+_NT_DET = (r"(?:(?:any|the|your|my|external|local|real|direct|such|these|those|a|an|"
+           r"specific|additional|built[\s-]?in|real[\s-]?time)\s+)*")
+_NT_OBJ = (r"(?:tools|tool[\s-]?(?:calls?|calling|use|access)|functions"
+           r"|function[\s-]?(?:calls?|calling)|(?:shell|terminal|system|bash|cli)\s+commands"
+           r"|commands|files|file[\s-]?systems?|filesystems?|machine|computer|terminal"
+           r"|shell|workspace|codebase|repository)\b")
+_NT_ADV = r"(?:(?:directly|actually|currently|physically|really|personally)\s+)?"
+_NT_VERB = (r"(?:use|call|invoke|access|execute|run|read|open|browse|interact\s+with|make"
+            r"|perform|modify|edit|write\s+to|see|view|list)\w*"
+            # "access or modify", "execute code or access", "read, write"
+            r"(?:(?:\s+\w+)?\s*(?:,|/|\bor\b|\band\b)\s*(?:\w+\s+)?\w+){0,3}")
+_NT_HAVE = (r"i\s*(?:(?:do\s+not|don['’]?t)\s+(?:currently\s+|actually\s+)?have"
+            r"|have\s+no|lack)\s+")
+_NO_TOOLS_CLAIM_RE = re.compile(
+    r"\b(?:"
+    # I can't / cannot / am unable to  <verb> ... <object>
+    r"i\s*(?:can\s*not|can['’]?t|cannot|am\s+(?:not\s+able|unable|not\s+capable)"
+    r"|['’]m\s+(?:not\s+able|unable|not\s+capable))\s+(?:to\s+|of\s+)?"
+    + _NT_ADV + _NT_VERB + r"\s+" + _NT_DET + _NT_OBJ +
+    # I don't have the ability / capability to <verb> ... <object>
+    r"|" + _NT_HAVE + r"(?:the\s+|any\s+)?(?:ability|capability|capacity|means|way)\s+"
+    r"(?:to\s+|of\s+)?" + _NT_ADV + _NT_VERB + r"\s+" + _NT_DET + _NT_OBJ +
+    # I don't have (direct) access to <object>
+    r"|" + _NT_HAVE + _NT_DET + r"(?:direct\s+)?access\s+to\s+" + _NT_DET + _NT_OBJ +
+    # I don't have (any) tools / function calling
+    r"|" + _NT_HAVE + _NT_DET + r"(?:tools?|tool[\s-]?(?:calling|use|access)|functions"
+    r"|function[\s-]?calling)\b"
+    # I'm a text-based AI and can't access your files
+    r"|i\s*(?:['’]m|\s+am)\s+(?:just\s+|only\s+|merely\s+|simply\s+)?an?\s+(?:[\w-]+\s+){0,3}?"
+    r"(?:ai|model|assistant|chatbot|llm)\b[^.!?\n]{0,40}?\b(?:and|so|which\s+means)\s+"
+    r"(?:i\s+)?(?:therefore\s+|thus\s+)?(?:can\s*not|can['’]?t|cannot"
+    r"|(?:do\s+not|don['’]?t)\s+have\s+(?:direct\s+)?access\s+to|have\s+no\s+access\s+to)\s+"
+    + _NT_ADV + r"(?:" + _NT_VERB + r"\s+)?" + _NT_DET + _NT_OBJ +
+    # no tools are available (to me)
+    r"|(?:there\s+are\s+)?no\s+(?:tools|functions|tool\s+calls?)\s+(?:are\s+|is\s+)?"
+    r"(?:available|provided|accessible|enabled|at\s+my\s+disposal)\b"
+    r"|(?:tools|functions|function[\s-]?calling|tool[\s-]?calling)\s+(?:are|is)\s+"
+    r"(?:not|n['’]t)\s+(?:available|enabled|supported|accessible)\s+(?:to\s+me|for\s+me"
+    r"|here|in\s+this)"
+    r")", re.I)
+# The user asking ABOUT tools (then "I have none" answers it) or ruling them out.
+_NO_TOOLS_ASKED_RE = re.compile(
+    r"\b(?:tools?|functions|function[\s-]?calling|tool[\s-]?calling|capabilit\w*)\b"
+    r"[^.?!\n]{0,40}?\b(?:you|your)\b[^.!\n]*\?"
+    r"|\b(?:you|your)\b[^.?!\n]{0,40}?\b(?:tools?|functions|function[\s-]?calling"
+    r"|tool[\s-]?calling|capabilit\w*)\b[^.!\n]*\?"
+    r"|\b(?:can|could|do|are|will)\s+you\b[^.?!\n]{0,30}?\b(?:access|read|see|open|run"
+    r"|execute)\b[^.!\n]*\?"
+    r"|\b(?:without|no|don['’]?t|do\s+not|never)\s+(?:use\s+|using\s+|call\s+|calling\s+)?"
+    r"(?:any\s+)?(?:tools?|functions|tool\s+calls?)\b"
+    r"|\b(?:list|describe|what\s+are|tell\s+me)\b[^.?!\n]{0,20}?\byour\s+"
+    r"(?:tools|capabilities|functions)\b", re.I)
+_NT_FILLER_RE = re.compile(
+    r"\W*(?:i\s*['’]?m\s+sorry|sorry|i\s+apologi[sz]e|apologies|unfortunately|hello|hi|hey"
+    r"|thanks|thank\s+you|sure|of\s+course|certainly|understood|okay|ok|note|hmm|well"
+    r"|i\s+understand|i\s+see)\b", re.I)
+
+
+def _looks_like_no_tools_claim(text):
+    """True when `text` OPENS by claiming the model has no tools / cannot call
+    functions / cannot access files. Text only: _no_tools_claim applies the
+    turn's context."""
+    if not text or not isinstance(text, str):
+        return False
+    head = text.strip()[:_NO_TOOLS_CLAIM_AT + 200]
+    # The OPENING sentence ("Here is the answer: 4. I can't run tools to
+    # verify it." answered first), or the second after a short "Sorry."/"Sure!".
+    parts = re.split(r"(?<=[.!?])\s+", head, 2)
+    scope = parts[0]
+    if len(parts) > 1 and len(parts[0]) <= 60 and _NT_FILLER_RE.match(parts[0]):
+        scope = parts[0] + " " + parts[1]
+    m = _NO_TOOLS_CLAIM_RE.search(scope)
+    if not m or m.start() > _NO_TOOLS_CLAIM_AT:
+        return False
+    return "```" not in scope[:m.start()]
+
+
+def _turn_used_tools(turns):
+    """True when tools already ran in the CURRENT turn: a tool result or a
+    tool call sits after the last real user message. Every protocol's shape
+    (OpenAI tool/tool_calls, Anthropic tool_use/tool_result, Responses
+    function_call/_output items). Never raises."""
+    try:
+        for m in reversed(turns or []):
+            if not isinstance(m, dict):
+                continue
+            if _carries_tool_results(m) or m.get("type") in (
+                    "function_call", "function_call_output", "custom_tool_call",
+                    "custom_tool_call_output", "local_shell_call"):
+                return True
+            role = m.get("role")
+            if role == "assistant":
+                if m.get("tool_calls"):
+                    return True
+                c = m.get("content")
+                if isinstance(c, list) and any(isinstance(p, dict) and p.get("type") == "tool_use"
+                                               for p in c):
+                    return True
+            elif role == "user":
+                return False
+    except Exception:                                            # noqa: BLE001
+        pass
+    return False
+
+
+def _request_used_tools():
+    """_turn_used_tools of the request being served; False outside one."""
+    try:
+        if not has_request_context():
+            return False
+        body = request.get_json(force=True, silent=True)
+        if not isinstance(body, dict):
+            return False
+        turns = body.get("messages")
+        if not isinstance(turns, list):
+            turns = body.get("input") if isinstance(body.get("input"), list) else []
+        return _turn_used_tools(turns)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _no_tools_claim(text, *, tools_offered, prompt=None, used_tools=False):
+    """The policy around _looks_like_no_tools_claim (see the note above).
+    `prompt` is the last user turn (wrappers are stripped here) or the
+    tool-results sentinel; `used_tools` whether tools already ran this turn.
+    The caller has already established that the reply made no tool call."""
+    try:
+        if not tools_offered or used_tools or prompt == _TOOL_RESULT_TURN:
+            return False
+        if not _looks_like_no_tools_claim(text):
+            return False
+        if isinstance(prompt, str) and prompt:
+            own = answer_check._instruction(prompt) or ""
+            if _NO_TOOLS_ASKED_RE.search(own[:_PROMPT_CHECK_CAP]):
+                return False
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 # The models the user named as accepting work others decline. Matched on the
 # normalised identity, so every provider's spelling of them counts.
 _PERMISSIVE_MODELS = ("hy3", "deepseek-v4-flash", "qwen3.8")
@@ -26531,6 +26854,13 @@ def _chat_json_nonanswer(data, has_tools=False, tools=None):
                           or tool_rescue.is_bare_tool_name(content, tools)
                           or _looks_like_dangling_lead_in(content)):
             return True
+        # "I don't have access to tools" on a turn that offered them: next hop,
+        # a quality failure, never a dead-mark (see _no_tools_claim).
+        if has_tools and _no_tools_claim(content, tools_offered=True,
+                                         prompt=_request_prompt_text(),
+                                         used_tools=_request_used_tools()):
+            _set_nonanswer_kind("no_tools_claim")
+            return True
         # A refusal counts with or without tools: it is no more useful in plain
         # chat, and the hub has other models that will answer.
         if _looks_like_refusal(content):
@@ -26559,7 +26889,9 @@ def _note_nonanswer(pid, model, kind=_PROMPT_UNSET):
     _record_outcome(pid, model, False)
     if _in_tool_turn():
         _note_relay_tool_fail(pid, model)   # no-op for a non-relay provider
-    if kind in ("provider_quota", "provider_error"):
+    # "no_tools_claim" (_no_tools_claim) is a heuristic about ONE reply: the
+    # failure is filed, the pair stays routable.
+    if kind in ("provider_quota", "provider_error", "no_tools_claim"):
         if kind == "provider_quota":
             _throttle_failed_hop(pid, model, secs=_PROVIDER_QUOTA_COOLDOWN)
         return
@@ -26639,6 +26971,9 @@ def _answer_gate(data, payload, has_tools):
         choice = ((data.get("choices") or [{}])[0]) or {}
         msg = choice.get("message") or {}
         if msg.get("tool_calls"):
+            # The same call N times in one answer is one call (see
+            # tool_rescue.dedupe_stream): every non-streamed hop passes here.
+            _dedupe_tool_calls_json(data)
             return "ok"
         content = msg.get("content")
         if isinstance(content, list):
@@ -27251,6 +27586,10 @@ def _peek_check(payload, has_tools):
                 # their names ("shell_command") is a failed hop.
                 "tools": (payload.get("tools") if has_tools and isinstance(payload, dict)
                           else None),
+                # Tools already ran this turn: a later "I can't access that
+                # file" is a report, not a claim to have no tools.
+                "used_tools": bool(has_tools) and _turn_used_tools(
+                    payload.get("messages") if isinstance(payload, dict) else None),
                 # The caller's own budget: a reply cut at "length" far below
                 # it is a starved stub, not an answer (_is_truncated_stub).
                 "budget": _caller_budget(payload),
@@ -27580,6 +27919,7 @@ def _sub_stream_message(data):
 
     One helper for both, because they had already drifted -- the chat one
     carried `role`, the responses one did not."""
+    _dedupe_tool_calls_json(data)
     choice = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
     msg = choice.get("message") or {}
     delta = {"role": "assistant", "content": msg.get("content") or ""}
@@ -27622,6 +27962,29 @@ def _repair_tool_sse(chunks):
             buf = b""
     if buf:
         yield _repair_sse_frame(buf, state)
+
+
+def _dedupe_tool_calls_json(data):
+    """Collapse exact duplicate tool calls (same name, byte-identical
+    arguments) in a non-streamed chat JSON, in place; the first copy keeps its
+    id. MEASURED: opencode's doom_loop guard rejected a reply carrying three
+    identical bash calls. Never raises."""
+    try:
+        n = tool_rescue.dedupe_message(data)
+        if n:
+            _log.warning("[tool-dedupe] dropped %d exact duplicate tool call(s) (%s)",
+                         n, (data.get("model") if isinstance(data, dict) else None) or "?")
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _dedupe_tool_stream(iterator, framing, hop_pid=None, hop_model=None):
+    """tool_rescue.dedupe_stream over a committed tools-turn stream (all three
+    protocols feed it upstream OpenAI chat SSE), logging each dropped copy."""
+    def _dropped(name, args):
+        _log.warning("[tool-dedupe] %s/%s: dropped an exact duplicate %s call (%s)",
+                     hop_pid, hop_model, name, _sanitize(args, 80))
+    return tool_rescue.dedupe_stream(iterator, framing, on_drop=_dropped)
 
 
 def _classify_hop_error(exc=None, status=None, peek=None):
@@ -27708,6 +28071,10 @@ def _routing_headers(pid, model, attempts, last_error=None):
         h["X-Free-LLM-Hub-Mode"] = str(_mode)
         if _missed:
             h["X-Free-LLM-Hub-Mode-Applied"] = "no"
+    # best/max served by its graceful-degrade fallback (_QUALITY_FALLBACK_SHARE)
+    _fb = _quality_fallback_header(pid, model)
+    if _fb:
+        h["X-Free-LLM-Hub-Fallback"] = _fb
     return h
 
 
@@ -28565,6 +28932,14 @@ def _swarm_tool_result(body):
             _record_outcome(hop_pid, hop_model, False)
             return _why("refused: %s"
                         % " ".join((msg.get("content") or "")[:60].split()))
+        if not msg.get("tool_calls") and _no_tools_claim(
+                msg.get("content"), tools_offered=bool(body.get("tools")),
+                prompt=_last_user_text_for_check(body),
+                used_tools=_turn_used_tools(body.get("messages"))):
+            # Same policy as the single-model path: lose the slot, file the
+            # failure, no dead-mark.
+            _record_outcome(hop_pid, hop_model, False)
+            return _why("claimed it has no tools")
         if not msg.get("tool_calls") and (
                 _looks_like_text_tool_call(msg.get("content"))
                 or tool_rescue.has_model_markup(msg.get("content"))
@@ -28742,6 +29117,7 @@ def _swarm_stream_chunks(data):
     fan-out has already completed by the time anything streams, so there is
     nothing to interleave -- but a CLI still expects stream shape, and a
     tool_calls delta that goes missing here is a turn that writes no files."""
+    _dedupe_tool_calls_json(data)
     out_msg = ((data.get("choices") or [{}])[0].get("message") or {})
     delta = {"role": "assistant"}
     if out_msg.get("content"):
@@ -30152,6 +30528,8 @@ def _chat_completions_uncached(body):
     _clock = _ChainClock(trivial=_is_trivial_turn(
         body.get("messages"), body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)),
         tools=has_tools, est=est, stream=stream, pinned=bool(_pin_kw))
+    _plan_quality_fallback(_clock, body.get("model"), has_images, bool(_pin_kw),
+                           body.get("messages"), body.get("max_tokens"))
     # Context bookkeeping for this request (original size, conversation id).
     # The native overflow error is an OpenAI-client contract, so it is only
     # armed on the real /v1/chat/completions route -- not on the foreign
@@ -30341,6 +30719,8 @@ def _chat_completions_uncached(body):
                 # the zero-copy byte passthrough exactly as it was.
                 if has_tools:
                     relay = _repair_tool_sse(relay)
+                    # ...then one copy of a call sent N times (tool_rescue.dedupe_stream)
+                    relay = _dedupe_tool_stream(relay, "frames", hop_pid, hop_model)
                 # Usage frames report the ORIGINAL request size (see
                 # _reported_prompt_tokens); one is added when the client asked
                 # for usage and the upstream sent none.
@@ -30715,6 +31095,7 @@ def _chat_to_responses(chat_json, model_label, tool_defs=None):
     A tool call without a name is repaired from its arguments when that is
     unambiguous, else left out (_fix_nameless_tool_calls) -- never emitted."""
     _fix_nameless_tool_calls(chat_json, tool_defs)
+    _dedupe_tool_calls_json(chat_json)
     choice = (chat_json.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     output = []
@@ -31187,6 +31568,8 @@ def v1_responses(_retry_pass=False, _hedged=False):
     _clock = _ChainClock(trivial=_is_trivial_turn(
         messages, body.get("max_output_tokens"), diff, est, pinned=bool(_pin_kw)),
         tools=has_tools, est=est, stream=stream, pinned=bool(_pin_kw))
+    _plan_quality_fallback(_clock, body.get("model"), has_images, bool(_pin_kw),
+                           messages, body.get("max_output_tokens"))
     _chain = _build_chain(pid, resolved, est, require_vision=has_images,
                           require_tools=has_tools, messages=messages,
                           **_pin_kw)
@@ -31355,7 +31738,11 @@ def v1_responses(_retry_pass=False, _hedged=False):
                                        _DEADLINE_CUT_LINE, "%s/%s" % (hop_pid, hop_model))
                 gated = _gate_stream(chained, "lines", hop_pid, hop_model, payload, has_tools)
                 return Response(stream_with_context(
-                    _responses_stream(resp, model_label, line_iter=gated, prompt_est=est,
+                    _responses_stream(resp, model_label,
+                                      line_iter=(_dedupe_tool_stream(gated, "lines", hop_pid,
+                                                                     hop_model)
+                                                 if has_tools else gated),
+                                      prompt_est=est,
                                       hop_pid=hop_pid, hop_model=hop_model,
                                       prompt_text=_prompt_text_for_check(payload),
                                       last_prompt=_last_user_text_for_check(payload),
@@ -31765,6 +32152,7 @@ def _estimate_input_tokens(body):
 
 
 def _openai_resp_to_anthropic(data, model_str):
+    _dedupe_tool_calls_json(data)
     choice = (data.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     content = []
@@ -32138,6 +32526,8 @@ def v1_messages():
     _clock = _ChainClock(trivial=_is_trivial_turn(
         oai_messages, body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)),
         tools=has_tools, est=est, stream=stream, pinned=bool(_pin_kw))
+    _plan_quality_fallback(_clock, body.get("model"), has_images, bool(_pin_kw),
+                           oai_messages, body.get("max_tokens"))
     _chain = _build_chain(pid, resolved, est, require_vision=has_images,
                           require_tools=has_tools, messages=oai_messages,
                           **_pin_kw)
@@ -32245,7 +32635,10 @@ def v1_messages():
                                        _DEADLINE_CUT_LINE, "%s/%s" % (hop_pid, hop_model))
                 gated = _gate_stream(chained, "lines", hop_pid, hop_model, payload, has_tools)
                 return Response(stream_with_context(
-                    _anthropic_stream(resp, model_str, input_est, line_iter=gated,
+                    _anthropic_stream(resp, model_str, input_est,
+                                     line_iter=(_dedupe_tool_stream(gated, "lines", hop_pid,
+                                                                    hop_model)
+                                                if has_tools else gated),
                                      hop_pid=hop_pid, hop_model=hop_model,
                                      prompt_text=_prompt_text_for_check(payload),
                                      last_prompt=_last_user_text_for_check(payload),
