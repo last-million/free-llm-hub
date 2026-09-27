@@ -2528,7 +2528,17 @@
      row as tall as the controls it replaced. Desktop gets a 24px button and a
      tight line; phones keep the 44px touch target (see the media query). */
   body.cx-agent-view #agent-section.agent-top-collapsed{ row-gap:0; }
-  body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-bar{ gap:6px; }
+  body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-bar{ gap:6px;
+    /* A calm green glow marks the folded top (REQUESTED 2026-09-27: "glowing
+       green border, not noisy to the eye"): static -- no pulse, no animation --
+       a thin border plus a soft outer halo, same in both themes. */
+    padding:3px 4px 3px 8px; border-radius:10px;
+    border:1px solid rgba(34,197,94,.45);
+    box-shadow:0 0 0 1px rgba(34,197,94,.06), 0 0 10px rgba(34,197,94,.16);
+    transition:box-shadow .2s ease, border-color .2s ease; }
+  body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-bar:hover{
+    border-color:rgba(34,197,94,.65);
+    box-shadow:0 0 0 1px rgba(34,197,94,.10), 0 0 14px rgba(34,197,94,.24); }
   body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-summary{
     font-size:11.5px; line-height:1.2; gap:6px; }
   body.cx-agent-view #agent-section.agent-top-collapsed .acs-perm{
