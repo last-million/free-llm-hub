@@ -36,7 +36,11 @@ def test_the_provider_test_shows_the_canary_overall_and_per_key():
 
 
 def test_the_subscription_test_shows_the_canary_per_model():
-    assert "canaryBadge(m.canary, !!m.ok)" in _body("subTestResultHTML", 1500)
+    body = _body("subTestResultHTML", 1800)
+    # A reply gets its verdict badge; a failed CLI hop does not get the
+    # generic "HTTP error" badge -- its own error text is already on the row.
+    assert "canaryBadge(m.canary, true)" in body
+    assert "m.skipped || !m.ok ? ''" in body
 
 
 def test_the_activity_row_shows_manager_cost_and_an_unreadable_review():

@@ -14979,6 +14979,12 @@ def api_status():
         if p.get("paid"):
             continue
         s = quota.status(pid)
+        # Same reasoning for a RESEARCHED zero (morph: every model bills from
+        # token one): limit 0 reads as exhausted, so every keyed one of them
+        # kept the "Some providers are out of free quota - Morph resets in 3d"
+        # banner up forever. Its card already says "No free tier".
+        if s.get("limit_known") and s.get("limit") == 0:
+            continue
         s["name"] = p.get("name", pid)
         s["models"] = quota.models(pid)  # {model_id: used_count} this window
         # HOW MANY KEYS THIS ALLOWANCE IS BUILT FROM. quota.status already
