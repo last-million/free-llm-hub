@@ -17,7 +17,7 @@ psutil==7.2.1
 # WebP re-encoding of generated images (app.py _to_webp_b64). Optional at
 # runtime -- the hub falls back to the generator's own format if it is
 # missing -- but pinned here so every install actually gets WebP.
-Pillow==10.2.0
+Pillow==12.3.0
 
 # AES-256-GCM for the provider API keys stored in config.json (secretstore.py).
 # NOT optional, despite the guarded import that makes it look that way.
