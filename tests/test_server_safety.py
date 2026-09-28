@@ -273,3 +273,11 @@ def test_an_opencode_turn_in_a_temp_folder_reads_its_brief_there(opencode_turn,
     brief = os.path.join(os.path.abspath(str(proj)), AC.brief_filename(sid))
     assert brief in seen["argv"][-1]
     assert os.path.isfile(brief)
+
+
+def test_brief_gives_the_msys_taskkill_spelling():
+    # Live 2026-09-28 (opencode, bash tool): `taskkill /PID 3248 /T /F` failed
+    # twice -- MSYS turned /PID into a path -- and `//PID` worked on try three.
+    import agent_servers
+    text = agent_servers.brief_section(pids=[1], port=8787, windows=True)
+    assert "taskkill //PID <pid> //T //F" in text

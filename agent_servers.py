@@ -356,7 +356,10 @@ def brief_section(pids=None, port=None, windows=None):
             "server itself running. A bash `$!` is a bash PID, not a Windows "
             "one: stop it with bash's own `kill`, never pass it to `taskkill` or "
             "`Stop-Process`. The by-port lines print the PID of the server "
-            "itself; stop it with `taskkill /PID <that pid> /F`.")
+            "itself; stop it with `taskkill /PID <that pid> /F`. From a bash "
+            "shell (Git Bash/MSYS) double the slashes -- `taskkill //PID <pid> "
+            "//T //F` -- or bash rewrites `/PID` into a file path and taskkill "
+            "fails.")
     else:
         lines.append("  The by-port line prints the PID of the server itself; stop "
                      "it with `kill <that pid>`.")
