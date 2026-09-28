@@ -565,15 +565,112 @@ def key_available(pid: str, key) -> bool:
 
 
 def usable_keys(pid: str, key_list):
-    """`key_list` reordered so keys with quota come first.
+    """`key_list` minus keys that are cooling down (post-429) or DEAD (see
+    mark_key_dead).
 
-    FAIL-OPEN: when every key is cooling down the original list is returned
-    unchanged. Refusing to try is worse than trying -- a cooldown is an estimate,
-    and the provider is the only real authority on whether a key still works."""
+    FAIL-OPEN: when every key is cooling down or dead the original list is
+    returned unchanged. Refusing to try is worse than trying -- a cooldown or a
+    dead mark is an estimate, and the provider is the only real authority on
+    whether a key still works."""
     if not key_list or len(key_list) == 1:
         return list(key_list or [])
-    fresh = [k for k in key_list if key_available(pid, k)]
+    fresh = [k for k in key_list if key_available(pid, k) and not key_dead(pid, k)]
     return fresh if fresh else list(key_list)
+
+
+# DEAD KEYS: keys that authenticate (or not) but cannot GENERATE.
+#
+# MEASURED 2026-09-28 on the live Providers page: opencode-zen 0/4 and
+# tokenrouter 0/4 keys "authenticate and list models ... but generation FAILS",
+# zenmux 1/5, g4f 1/4. Rotation advanced past a 401/403 key within one request
+# but never REMEMBERED it, so every request re-spent a hop on the same dead
+# key -- on zenmux four of five attempts. A 429 already had memory
+# (_KEY_COOLDOWN); a dead key had none.
+#
+# Two witnesses mark a key dead:
+#   * the provider Test (source "test"): a real generation probe per key --
+#     the strongest evidence there is, so it holds _KEY_DEAD_TEST_TTL;
+#   * live traffic (source "live"): _KEY_AUTH_STRIKES_TO_DEAD credential-shaped
+#     401/403 answers inside _KEY_AUTH_STRIKE_WINDOW, held _KEY_DEAD_LIVE_TTL.
+# A key that GENERATES (a 2xx, or a passing Test) is cleared at once.
+# usable_keys skips dead keys and fails open when nothing else is left.
+_KEY_DEAD = {}              # (pid, fingerprint) -> {"until", "why", "source", "since"}
+_KEY_AUTH_STRIKES = {}      # (pid, fingerprint) -> [epoch, ...]
+_KEY_DEAD_TEST_TTL = 6 * 3600
+_KEY_DEAD_LIVE_TTL = 30 * 60
+_KEY_AUTH_STRIKES_TO_DEAD = 2
+_KEY_AUTH_STRIKE_WINDOW = 600
+
+
+def mark_key_dead(pid: str, key, seconds: float = None, why: str = "",
+                  source: str = "test") -> None:
+    """This key cannot generate: skip it for `seconds` (default by source)."""
+    fp = key_fingerprint(key)
+    if not fp:
+        return
+    if seconds is None:
+        seconds = _KEY_DEAD_TEST_TTL if source == "test" else _KEY_DEAD_LIVE_TTL
+    now = time.time()
+    with _LOCK:
+        _KEY_DEAD[(pid, fp)] = {"until": now + float(seconds),
+                                "why": str(why or "")[:200],
+                                "source": str(source or "test"), "since": now}
+        _KEY_AUTH_STRIKES.pop((pid, fp), None)
+    _persist_maybe()
+
+
+def clear_key_dead(pid: str, key) -> None:
+    """The key just generated: forget any dead mark and auth strikes."""
+    fp = key_fingerprint(key)
+    if not fp:
+        return
+    with _LOCK:
+        had = _KEY_DEAD.pop((pid, fp), None)
+        _KEY_AUTH_STRIKES.pop((pid, fp), None)
+    if had:
+        _persist_maybe()
+
+
+def key_dead(pid: str, key) -> bool:
+    """True while `key` carries a live dead mark. Never raises."""
+    fp = key_fingerprint(key)
+    if not fp:
+        return False
+    with _LOCK:
+        rec = _KEY_DEAD.get((pid, fp))
+        if not rec:
+            return False
+        if float(rec.get("until") or 0) <= time.time():
+            _KEY_DEAD.pop((pid, fp), None)      # served its time
+            return False
+        return True
+
+
+def note_key_auth_failure(pid: str, key, why: str = "") -> bool:
+    """One credential-shaped 401/403 on live traffic. The
+    _KEY_AUTH_STRIKES_TO_DEAD-th inside the window marks the key dead
+    (source "live"). Returns True when this strike did."""
+    fp = key_fingerprint(key)
+    if not fp:
+        return False
+    now = time.time()
+    with _LOCK:
+        ev = [t for t in (_KEY_AUTH_STRIKES.get((pid, fp)) or ())
+              if now - t <= _KEY_AUTH_STRIKE_WINDOW]
+        ev.append(now)
+        _KEY_AUTH_STRIKES[(pid, fp)] = ev
+        if len(ev) < _KEY_AUTH_STRIKES_TO_DEAD:
+            return False
+    mark_key_dead(pid, key, _KEY_DEAD_LIVE_TTL, why, source="live")
+    return True
+
+
+def dead_keys(pid: str) -> dict:
+    """{fingerprint: {until, why, source, since}} of pid's live dead marks."""
+    now = time.time()
+    with _LOCK:
+        return {fp: dict(r) for (p, fp), r in _KEY_DEAD.items()
+                if p == pid and float(r.get("until") or 0) > now}
 
 
 def key_cooldowns(pid: str) -> dict:
@@ -1503,6 +1600,10 @@ def save_state() -> None:
                 # hub ignores the unknown key; a file without it loads empty.
                 "model_dynamic": _MODEL_DYNAMIC,
                 "sources": _SOURCE_STATE,
+                # Dead keys (fingerprints only, never the key): a Test verdict
+                # holds 6 h and must survive an auto-update restart.
+                "key_dead": {"%s|%s" % (p, fp): r for (p, fp), r in _KEY_DEAD.items()
+                             if float(r.get("until") or 0) > time.time()},
             }
         if _extra_dump is not None:
             try:
@@ -1586,6 +1687,18 @@ def _load_sections(blob, now):
             for pid, ms in model_state.items():
                 if isinstance(pid, str) and isinstance(ms, dict):
                     _MODEL_STATE[pid] = ms
+        kdead = blob.get("key_dead")
+        if isinstance(kdead, dict):
+            for key, r in kdead.items():
+                if not (isinstance(key, str) and "|" in key and isinstance(r, dict)):
+                    continue
+                try:
+                    if float(r.get("until") or 0) <= now:
+                        continue            # expired: the key gets a fresh chance
+                except (TypeError, ValueError):
+                    continue
+                p, fp = key.split("|", 1)
+                _KEY_DEAD[(p, fp)] = dict(r)
         srcs = blob.get("sources")
         if isinstance(srcs, dict):
             for pid, ss in srcs.items():

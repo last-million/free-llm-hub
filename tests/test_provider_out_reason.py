@@ -72,7 +72,7 @@ def _row(pid=PID):
 def test_every_row_carries_the_new_fields():
     for r in _rows().values():
         assert r["status_reason"] in ("ok", "throttled", "parked", "exhausted",
-                                      "no_free_tier", "models_dead")
+                                      "no_free_tier", "models_dead", "no_key")
         assert "until" in r and "detail" in r
         assert isinstance(r["used_by"], list)
 

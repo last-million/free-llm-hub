@@ -891,6 +891,30 @@ for 420s twice").
   (same user, no privilege to withhold, opencode reports a command only after
   it ran); prevention via the brief is the only defence.
 
+## Provider status: no key, dead keys, echoed decimals (2026-09-28)
+
+Covered by `tests/test_provider_status.py`.
+
+- **no_key**: an ENABLED provider that needs a key and has none reports
+  `status_reason: "no_key"`, detail "No API key saved — add one or switch it
+  off" (`_NO_KEY_DETAIL`). Routing skipped it already (`_enabled_keyed`).
+  The card labels it via `NOTE_REASONS` (not `OUT_REASONS`: no red cross).
+- **Dead keys** (`quota.mark_key_dead`, fingerprints only, persisted as
+  `key_dead`): the per-key Test marks a key whose real generation failed with
+  an HTTP 4xx/5xx (not 429, not a network error) dead for 6 h (5xx: 30 min);
+  live traffic marks it after 2 credential-shaped 401/403 in 10 min
+  (`_note_key_live_status`; a model-scoped 401 like opencode-zen's "Model X
+  is not supported" files nothing). A 2xx or a passing Test clears it.
+  `usable_keys` skips dead keys and FAILS OPEN when every key is dead (a pool
+  of all-dead keys is still tried). The card detail carries "dead keys: N of
+  M"; `keys[]` rows carry `dead` / `dead_until` / `dead_why`.
+- **Echoed decimal** (`answer_check.echoed_decimal`): "2768.2768" /
+  "11991199.1199" under an "only the number" ask is a valid decimal shape, so
+  it is NEVER cut; `inspect` adds the informational reason `echoed_decimal`
+  (ok stays True) and `_answer_gate(..., hop=)` / `_record_stream_outcome`
+  file `_note_quality_strike`: a junk-weighted failure + a junk-bench strike
+  for that (provider, model) only.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

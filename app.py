@@ -3311,7 +3311,7 @@ def _save_perf_stats(force=False):
         pass
 
 
-def _record_outcome(pid, model, ok, junk=False):
+def _record_outcome(pid, model, ok, junk=False, junk_source="answer"):
     """One real delivery result for this (pid, model). Never raises.
 
     `junk=True` marks a failure that was a JUNK ANSWER (answer gate, stream
@@ -3350,9 +3350,34 @@ def _record_outcome(pid, model, ok, junk=False):
     except Exception:                                            # noqa: BLE001
         pass
     if junk and not ok:
-        _junk_bench_note(pid, model, "answer")
+        _junk_bench_note(pid, model, junk_source)
     _note_tool_turn_outcome(pid, model, ok)
     _save_perf_stats()
+
+
+def _note_quality_strike(pid, model, reason):
+    """A DELIVERED answer that is suspect junk but was not cut -- today only
+    answer_check's "echoed_decimal" ("2768.2768" for 'only the number'): it
+    could be a real decimal, so the client keeps it, but the pair that said
+    it takes one JUNK strike (a junk-weighted reliability failure and a strike
+    toward the junk bench), so a model that does it repeatedly is demoted and
+    then benched. Never raises."""
+    if not (pid and model):
+        return
+    try:
+        _log.info("[quality] %s/%s: %s -- served uncut, filed as a junk strike",
+                  pid, model, reason)
+        _record_outcome(pid, model, False, junk=True, junk_source=str(reason))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _answer_quality_strikes(reasons):
+    """The informational answer_check reasons that are a quality strike."""
+    return [r for r in (reasons or ()) if r in _QUALITY_STRIKE_REASONS]
+
+
+_QUALITY_STRIKE_REASONS = ("echoed_decimal",)
 
 
 # Measured latency. Deliberately narrow: only NON-STREAMING hops are timed, so
@@ -9565,6 +9590,91 @@ def _resp_text_safe(resp):
         return ""
 
 
+def _auth_detail_is_model_scoped(detail):
+    """True when an auth-shaped failure (401/403) is really about the MODEL.
+
+    A credential problem cannot be fixed by trying a sibling model; a
+    withdrawn model can. Providers disagree about which status to use for
+    the second case (opencode-zen answers 401 "Model X is not supported"), so
+    the message is the only reliable signal."""
+    text = (detail or "").lower()
+    if "model" not in text:
+        return False
+    return any(w in text for w in ("not supported", "not found", "unavailable",
+                                   "does not exist", "no longer", "unknown model",
+                                   "invalid model", "decommissioned"))
+
+
+def _note_key_live_status(pid, key, resp):
+    """Feed the dead-key ledger (quota.mark_key_dead) from one live answer on
+    `key`: a 2xx proves the key generates and clears any dead mark; a
+    CREDENTIAL-shaped 401/403 is a strike (two in 10 min = skipped by
+    rotation for 30 min). A model-scoped 401/403 says nothing about the key
+    and files nothing. Never raises."""
+    if not key:
+        return
+    try:
+        code = int(getattr(resp, "status_code", 0) or 0)
+        if 200 <= code < 300:
+            quota.clear_key_dead(pid, key)
+        elif code in (401, 403):
+            detail = _resp_text_safe(resp)
+            if _auth_detail_is_model_scoped(detail):
+                return
+            quota.note_key_auth_failure(pid, key, "HTTP %d on live traffic" % code)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+# Only a Test failure the PROVIDER answered says something about the key
+# ("HTTP 4xx/5xx: ..."). A 429 is quota (the 429 cooldown owns that), and an
+# exception (connection, timeout, SSL) never reached the provider's key check.
+_KEY_TEST_DEAD_RE = re.compile(r"^HTTP (?!429\b)\d{3}\b")
+_KEY_TEST_5XX_RE = re.compile(r"^HTTP 5\d\d\b")
+
+
+def _note_key_test_verdict(pid, key, ok, reason):
+    """Fold one per-key provider-Test verdict into the dead-key ledger:
+    a key that generated is cleared; a key whose real generation probe failed
+    on every candidate is DEAD -- for _KEY_DEAD_TEST_TTL (6 h), or only the
+    live TTL (30 min) when the last failure was a 5xx (the provider may be
+    the thing that is down). 429s and network errors mark nothing. Never
+    raises."""
+    if not key:
+        return
+    try:
+        if ok:
+            quota.clear_key_dead(pid, key)
+            return
+        why = str(reason or "")
+        if not _KEY_TEST_DEAD_RE.search(why):
+            return
+        ttl = (quota._KEY_DEAD_LIVE_TTL if _KEY_TEST_5XX_RE.search(why)
+               else quota._KEY_DEAD_TEST_TTL)
+        quota.mark_key_dead(pid, key, ttl, "Test: " + why[:160], source="test")
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _dead_key_note(pid, keys):
+    """'dead keys: N of M' for a provider's saved pool, '' when none is dead.
+    From the dead-key ledger (the latest Test verdicts + live 401/403
+    strikes). Never raises."""
+    try:
+        keys = [k for k in (keys or ()) if isinstance(k, str) and k]
+        if not keys:
+            return ""
+        dead = sum(1 for k in keys if quota.key_dead(pid, k))
+        if not dead:
+            return ""
+        if dead >= len(keys):
+            return ("dead keys: %d of %d -- none can generate; still tried as a "
+                    "last resort" % (dead, len(keys)))
+        return "dead keys: %d of %d (skipped by rotation)" % (dead, len(keys))
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
 def _next_key_start(pid, n):
     """Round-robin starting index for provider `pid`, advanced per request so
     load spreads across the pool instead of always hammering key[0]."""
@@ -11871,6 +11981,7 @@ def _upstream_post(pid, path, payload):
         quota.record(pid, payload.get("model"))
         quota.record_key(pid, key, payload.get("model"))
         quota.note_key_outcome(pid, key, resp.status_code not in (401, 403, 429))
+        _note_key_live_status(pid, key, resp)
         if resp.status_code == 429:
             # THIS key is out, not the provider -- same rule as the chat path.
             quota.mark_key_exhausted(pid, key, _retry_after_seconds(resp))
@@ -12158,6 +12269,7 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         # unanswerable, because every counter was per provider.
         quota.record_key(pid, key, payload.get("model"))
         quota.note_key_outcome(pid, key, resp.status_code not in (401, 403, 429))
+        _note_key_live_status(pid, key, resp)     # dead-key memory (see quota)
         info_429 = None
         if resp.status_code == 429 and _is_billing_precondition(resp):
             # NOT a rate limit -- the account needs a payment method (see
@@ -13706,9 +13818,15 @@ def _key_rows(pid, keys):
     the provider total says nothing about which member is carrying it or which
     is being rotated onto and rejected every time."""
     used = quota.keys(pid)
+    try:
+        dead = quota.dead_keys(pid)
+    except Exception:                                            # noqa: BLE001
+        dead = {}
     rows = []
     for i, k in enumerate(keys):
-        stat = used.get(quota.key_fingerprint(k)) or {}
+        fp = quota.key_fingerprint(k)
+        stat = used.get(fp) or {}
+        drec = dead.get(fp) or {}
         rows.append({
             "masked": _mask_key(k),
             "index": i,
@@ -13716,6 +13834,11 @@ def _key_rows(pid, keys):
             "ok": stat.get("ok", 0),
             "failed": stat.get("fail", 0),
             "last_used": stat.get("last", 0) or None,
+            # Dead-key ledger (latest Test verdict / live 401-403 strikes):
+            # skipped by rotation until `dead_until` unless every key is dead.
+            "dead": bool(drec),
+            "dead_until": int(drec["until"]) if drec.get("until") else None,
+            "dead_why": drec.get("why") or "",
         })
     return rows
 
@@ -13822,13 +13945,19 @@ def _sized(v):
         return 0
 
 
+_NO_KEY_DETAIL = "No API key saved — add one or switch it off"
+
+
 def _provider_out_status(pid, p, free_models=None):
     """Why a provider card is out, and until when:
     {status_reason, until, detail}.
 
     status_reason: ok | throttled | parked | exhausted | no_free_tier |
-    models_dead. `until` is an epoch (None when there is nothing to wait
-    for). `detail` is one short human line.
+    models_dead | no_key. `until` is an epoch (None when there is nothing to
+    wait for). `detail` is one short human line. no_key = switched on, needs
+    a key, has none (REPORTED 2026-09-28: such cards read "ok" while routing
+    skipped them). Dead keys (quota.mark_key_dead) ride in `detail` as
+    "dead keys: N of M".
 
     REPORTED 2026-09-26: the Providers page showed six providers out with no
     why and no when, and the user took it as a bug. Every signal here was
@@ -13851,6 +13980,20 @@ def _provider_out_status(pid, p, free_models=None):
             out.update(status_reason="no_free_tier",
                        detail="no free tier (documented free limit is 0)")
             return out
+        # Switched ON but no key saved (and not an open no-key gateway):
+        # routing already skips it (_enabled_providers / _check_provider_ready
+        # test the same `api_key`), so the card must not read "ok".
+        pcfg = config.get_provider_config(pid) or {}
+        if pcfg.get("enabled") and not pcfg.get("api_key") and _needs_key(pid):
+            out.update(status_reason="no_key", detail=_NO_KEY_DETAIL)
+            return out
+        dead_key_note = _dead_key_note(pid, pcfg.get("api_keys") or [])
+
+        def _plus_keys(detail):
+            # Dead keys ride along on every later reason: a pool of dead keys
+            # is usually WHY a provider ends up parked or failing.
+            return "%s; %s" % (detail, dead_key_note) if dead_key_note else detail
+
         with _provider_dead_lock:
             exp = _dead_providers.get(pid) or 0
             why = _dead_provider_why.get(pid)
@@ -13860,21 +14003,21 @@ def _provider_out_status(pid, p, free_models=None):
         if exp > now:
             ttl_min = int(round(_PROVIDER_DEAD_TTL / 60.0))
             out.update(status_reason="parked", until=int(exp),
-                       detail="parked %d min after %s" % (
-                           ttl_min, why or "repeated hard failures"))
+                       detail=_plus_keys("parked %d min after %s" % (
+                           ttl_min, why or "repeated hard failures")))
             return out
         if q.get("throttled") or q.get("exhausted"):
             until = q.get("resets_at") or None
             if q.get("throttled"):
                 out.update(status_reason="throttled", until=until,
-                           detail="rate-limited by the provider (HTTP 429)")
+                           detail=_plus_keys("rate-limited by the provider (HTTP 429)"))
             else:
                 used, lim = q.get("used"), q.get("limit")
                 span = q.get("window") or "window"
                 out.update(status_reason="exhausted", until=until,
-                           detail=("used %s of %s this %s" % (used, lim, span)
-                                   if lim is not None else
-                                   "free allowance spent this %s" % span))
+                           detail=_plus_keys("used %s of %s this %s" % (used, lim, span)
+                                         if lim is not None else
+                                         "free allowance spent this %s" % span))
             return out
         # Models: only "out" when EVERY listed free model is sidelined; a few
         # dead ones is a note on an otherwise healthy card.
@@ -13896,10 +14039,12 @@ def _provider_out_status(pid, p, free_models=None):
         # by what a model SAID rather than by a status code, and "why does it
         # not use llm7 GLM any more" has no other answer on the card.
         notes.extend(r["detail"] for r in _junk_bench_rows(pid))
+        if dead_key_note:
+            notes.append(dead_key_note)
         if ids and len(dead_exp) >= len(ids):
             out.update(status_reason="models_dead", until=int(min(dead_exp)),
-                       detail="all %d models dead (re-probed after %d h)" % (
-                           len(ids), _DEAD_MODEL_TTL // 3600))
+                       detail=_plus_keys("all %d models dead (re-probed after %d h)" % (
+                           len(ids), _DEAD_MODEL_TTL // 3600)))
             return out
         if dead_exp:
             notes.append("%d of %d models dead" % (len(dead_exp), len(ids))
@@ -14544,18 +14689,7 @@ def api_test_provider(pid):
                                   "generation with." % models_list_note, sample_models[:5])
         return _finish(False, "Provider has no models_url and no default model to test with.", [])
 
-    def _looks_like_model_scoped(detail):
-        """True when an auth-shaped failure is really about the MODEL.
-
-        A credential problem cannot be fixed by trying a sibling model; a
-        withdrawn model can. Providers disagree about which status to use for
-        the second case, so the message is the only reliable signal."""
-        text = (detail or "").lower()
-        if "model" not in text:
-            return False
-        return any(w in text for w in ("not supported", "not found", "unavailable",
-                                       "does not exist", "no longer", "unknown model",
-                                       "invalid model", "decommissioned"))
+    _looks_like_model_scoped = _auth_detail_is_model_scoped   # shared with live rotation
 
     # Transient statuses (a live rate-limit blip, momentary overload) get ONE
     # retry after a short pause before moving to the next candidate — without
@@ -14669,6 +14803,8 @@ def api_test_provider(pid):
         payload_extra = ([{"index": 0, "masked": _mask_key(pool[0]), "ok": ok,
                            "detail": _verdict(ok, model, reason, canary),
                            "canary": canary}] if pool else [])
+        if pool:
+            _note_key_test_verdict(pid, pool[0], ok, reason)
         return _finish(ok, _verdict(ok, model, reason, canary),
                        (sample_models[:5] or ([model] if model else [])),
                        keys=payload_extra, canary=canary)
@@ -14683,6 +14819,7 @@ def api_test_provider(pid):
         per_key.append({"index": i, "masked": _mask_key(k), "ok": k_ok,
                         "detail": _verdict(k_ok, k_model, k_reason, k_canary),
                         "canary": k_canary})
+        _note_key_test_verdict(pid, k, k_ok, k_reason)
         if k_ok and first_ok_model is None:
             first_ok_model, first_canary = k_model, k_canary
     good = [r["index"] + 1 for r in per_key if r["ok"]]
@@ -27392,12 +27529,15 @@ def _last_user_text_for_check(payload):
         return None
 
 
-def _answer_gate(data, payload, has_tools):
+def _answer_gate(data, payload, has_tools, hop=None):
     """'ok' | 'salvaged' | 'junk' for a non-streamed OpenAI chat JSON.
 
     'salvaged' REWRITES `data` in place: content becomes the clean answer and a
     "length" finish becomes "stop" (the served text is complete). A message
     with real tool_calls is always 'ok' -- its content is not the answer.
+    `hop` = (pid, model): an 'ok' answer carrying an informational quality
+    strike (answer_check "echoed_decimal") files it against that pair via
+    _note_quality_strike -- the answer itself is served unchanged.
     Fail-open: any error is 'ok', so the gate can never lose an answer."""
     try:
         choice = ((data.get("choices") or [{}])[0]) or {}
@@ -27418,6 +27558,9 @@ def _answer_gate(data, payload, has_tools):
             tools_offered=bool(has_tools), finish_reason=choice.get("finish_reason"),
             last_prompt=_last_user_text_for_check(payload))
         if verdict.get("ok"):
+            strikes = _answer_quality_strikes(verdict.get("reasons"))
+            if strikes and hop and len(hop) == 2:
+                _note_quality_strike(hop[0], hop[1], strikes[0])
             return "ok"
         _log.warning("[answer-gate] junk in answer (%s), salvage=%s",
                      ",".join(verdict.get("reasons") or ()),
@@ -27447,15 +27590,20 @@ def _record_stream_outcome(pid, model, text, *, tool_calls=False,
     if not (pid and model):
         return
     try:
-        ok = True
+        ok, strikes = True, []
         if not tool_calls:
             if not (text or "").strip():
                 return
-            ok = answer_check.inspect(
+            v = answer_check.inspect(
                 text, prompt_text=prompt_text, tools_offered=tools_offered,
-                finish_reason=finish_reason, last_prompt=last_prompt).get("ok", True)
+                finish_reason=finish_reason, last_prompt=last_prompt)
+            ok = v.get("ok", True)
+            strikes = _answer_quality_strikes(v.get("reasons")) if ok else []
         # A stream that failed the gate degenerated: a junk strike, not a miss.
         _record_outcome(pid, model, ok, junk=not ok)
+        if strikes:
+            # Delivered uncut (it may be a real value) -- see _note_quality_strike.
+            _note_quality_strike(pid, model, strikes[0])
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -28944,7 +29092,7 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False):
             # Degeneration check FIRST: a junk loop usually runs to the cap, so
             # left alone it would be filed as a mere truncation below. Salvage
             # rewrites the message (and its "length" finish) in place.
-            gate = _answer_gate(data, payload, False)
+            gate = _answer_gate(data, payload, False, hop=(hop_pid, hop_model))
             if gate == "junk":
                 _record_outcome(hop_pid, hop_model, False, junk=True)
                 continue
@@ -29674,7 +29822,8 @@ def _swarm_tool_result(body):
             return _why("answered in prose without calling a tool")
         # Degenerate text (see _answer_gate): salvage keeps the member in the
         # race with its clean answer; pure junk loses the slot, never a ban.
-        gate = _answer_gate(data, payload, bool(body.get("tools")))
+        gate = _answer_gate(data, payload, bool(body.get("tools")),
+                            hop=(hop_pid, hop_model))
         if gate == "junk":
             _record_outcome(hop_pid, hop_model, False, junk=True)
             return _why("degenerate answer (nothing salvageable)")
@@ -31404,7 +31553,7 @@ def _chat_completions_uncached(body):
                     last_error = "empty"
                     resp.close()
                     continue
-                gate = _answer_gate(data, payload, has_tools)
+                gate = _answer_gate(data, payload, has_tools, hop=(hop_pid, hop_model))
                 if gate == "junk":
                     errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
                     last_error = "junk"
@@ -31527,7 +31676,7 @@ def _chat_completions_uncached(body):
                 last_error = "empty"
                 resp.close()
                 continue
-            gate = _answer_gate(data, payload, has_tools)
+            gate = _answer_gate(data, payload, has_tools, hop=(hop_pid, hop_model))
             if gate == "junk":
                 # A 200 that is ONLY degeneration (see _answer_gate): next hop.
                 errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
@@ -32443,7 +32592,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                     last_error = "empty"
                     resp.close()
                     continue
-                gate = _answer_gate(data, payload, has_tools)
+                gate = _answer_gate(data, payload, has_tools, hop=(hop_pid, hop_model))
                 if gate == "junk":
                     errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
                     last_error = "junk"
@@ -32553,7 +32702,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 last_error = "empty"
                 resp.close()
                 continue
-            gate = _answer_gate(data, payload, has_tools)
+            gate = _answer_gate(data, payload, has_tools, hop=(hop_pid, hop_model))
             if gate == "junk":
                 # A 200 that is ONLY degeneration (see _answer_gate): next hop.
                 errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)
@@ -33490,7 +33639,7 @@ def v1_messages():
                 last_error = "empty"
                 resp.close()
                 continue
-            gate = _answer_gate(data, payload, has_tools)
+            gate = _answer_gate(data, payload, has_tools, hop=(hop_pid, hop_model))
             if gate == "junk":
                 # A 200 that is ONLY degeneration (see _answer_gate): next hop.
                 errors.append("%s: degenerate answer (nothing salvageable)" % hop_pid)

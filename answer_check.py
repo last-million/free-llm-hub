@@ -742,6 +742,41 @@ def brevity_ask(last_prompt):
         return False
 
 
+# "2768.2768" / "11991199.1199" for "What is 2767 plus 1? Answer with only the
+# number." (REPORTED 2026-09-28): the answer, a dot, and the answer again --
+# the same glued-copy degeneration as "319231923192", but with a dot in it the
+# whole thing IS a well-formed decimal. Cutting it would trim a reply that
+# could be a real value (a price, a version-like figure), so it is never cut:
+# it is only FLAGGED ("echoed_decimal", ok stays True) so the caller can file
+# a junk quality strike for the (provider, model) that said it. Guards: a
+# constrained number ask, no tools, the right side 3+ digits, the left side
+# 1+ whole copies of it, and the value not in the prompt.
+_ECHOED_DECIMAL_RE = re.compile(r"\s*[-+]?(?P<left>\d+)\.(?P<right>\d{3,})\s*[.!]?\s*")
+
+
+def echoed_decimal(text, last_prompt, tools_offered=False):
+    """True when `text` is a bare number made of one digit run repeated around
+    a dot ("2768.2768", "11991199.1199") under a "only the number" ask. A
+    QUALITY SIGNAL, never a cut. Never raises (False)."""
+    try:
+        if tools_offered or not isinstance(text, str) or not last_prompt:
+            return False
+        kinds, _literal = _brevity(last_prompt if isinstance(last_prompt, str)
+                                   else str(last_prompt))
+        if "num" not in kinds:
+            return False
+        m = _ECHOED_DECIMAL_RE.fullmatch(text)
+        if not m:
+            return False
+        left, right = m.group("left"), m.group("right")
+        if len(left) % len(right) or left != right * (len(left) // len(right)):
+            return False
+        value = "%s.%s" % (left, right)
+        return value not in (_instruction(last_prompt) or "")
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _constrained_extra(text, prompt, tools_offered):
     if tools_offered or not prompt:
         return None
@@ -1255,6 +1290,11 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
         if cut is not None:
             result["reasons"].append("restarted")
             cuts.append(cut)
+        # Informational like "truncated": flagged, never cut (see
+        # echoed_decimal). Only on a finished reply -- a stream in progress
+        # may still be writing the real answer.
+        if not partial and echoed_decimal(text, last_prompt, tools_offered):
+            result["reasons"].append("echoed_decimal")
         if not cuts:
             return result
         result["ok"] = False
