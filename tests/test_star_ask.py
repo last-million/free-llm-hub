@@ -34,9 +34,11 @@ def test_the_welcome_dialog_offers_a_star_alongside_the_socials():
 def test_the_whats_new_dialog_ends_with_the_star_ask():
     """Last, so the release notes stay the point of the dialog."""
     html = _html()
-    i = html.find('showWhatsNew')
+    # The whole function: its first mention is now a CALL (the Settings
+    # "What changed" button), and the grouped list made the body longer.
+    i = html.find('function showWhatsNew(')
     assert i != -1
-    block = html[i:i + 4000]
+    block = html[i:html.index('/* ---------- multi swarm windows', i)]
     star = block.find('star-ask')
     body_append = block.find('body.appendChild(box)')
     assert star != -1, "no star ask in the what's-new dialog"

@@ -1,0 +1,27 @@
+{
+  "_comment": "Plain-language 'What changed' entries for commits made before the Release-note: trailer existed. Keys are commit hash prefixes (7+ chars). kind: new | fix | improved | change | docs (docs are never shown). New commits carry their own note as a trailer: 'Release-note: fix: <one plain sentence>'.",
+  "notes": {
+    "3c9280d": {"kind": "fix", "scope": "Answers", "title": "A real answer about your own app's API quota is never mistaken for a provider's billing message"},
+    "307d035": {"kind": "fix", "scope": "Agent sessions", "title": "Agent sessions no longer fail silently: Google Gemini is used again after the first tool call, relay billing messages are never shown as answers, and a turn no model can serve stops and says why"},
+    "c9c2fd7": {"kind": "new", "scope": "Settings", "title": "Low-memory mode: fewer parallel workers on weak or busy machines (Auto, On or Off)"},
+    "5d3aaac": {"kind": "new", "scope": "Settings", "title": "Skills: switch each built-in skill on or off, and add your own named skills"},
+    "36b95cf": {"kind": "fix", "scope": "Agent sessions", "title": "Agents stop the servers they started on the first try in Git Bash"},
+    "be0a6a3": {"kind": "fix", "scope": "Health check", "title": "A provider that refuses outside apps, or is down, is no longer reported as dead keys"},
+    "08a35d4": {"kind": "docs", "title": "README route count"},
+    "559b204": {"kind": "fix", "scope": "Agent sessions", "title": "Agents stop only the servers they started (by process ID or port), never the hub"},
+    "eed9754": {"kind": "improved", "scope": "Providers", "title": "Provider cards show “No API key” and how many keys are dead; broken keys are skipped automatically"},
+    "b1ecee8": {"kind": "new", "scope": "Settings", "title": "One-click health check: tests every provider and key, then gives recommendations"},
+    "dd55529": {"kind": "fix", "scope": "Agent sessions", "title": "A server blocking the agent's shell is caught after about 60 seconds instead of 7 minutes"},
+    "30262cf": {"kind": "improved", "scope": "Agent view", "title": "A calm green outline around the folded top bar"},
+    "6dab905": {"kind": "improved", "scope": "Agent view", "title": "Click the top line to fold or unfold it"},
+    "0391b82": {"kind": "improved", "scope": "Preview", "title": "Tabs and the run bar share one row, so the preview gets more height"},
+    "5f818ef": {"kind": "fix", "scope": "Agent view", "title": "No more empty space above the first row"},
+    "c49f712": {"kind": "improved", "scope": "Agent view", "title": "The folded top bar is one thin line; phones keep a large tap target"},
+    "03cbdde": {"kind": "new", "scope": "Agent view", "title": "A button folds the top controls into a one-line summary"},
+    "ff8a638": {"kind": "fix", "scope": "Routing", "title": "A category whose models all fail now falls back to a few healthy models outside it"},
+    "b529b7d": {"kind": "fix", "scope": "Multi sessions", "title": "A run is never lost when Windows briefly locks its file"},
+    "3f48874": {"kind": "fix", "scope": "Answers", "title": "One clean answer per request: glued double answers are cut, and a model that only announced an action is retried"},
+    "1197fd6": {"kind": "fix", "scope": "Agent sessions", "title": "Agents start servers in the background and resume correctly when a server blocks"},
+    "ec171a3": {"kind": "improved", "scope": "Ranking", "title": "Pixel Canary now ranks above Kimi K3 and GPT-6"}
+  }
+}

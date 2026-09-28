@@ -172,6 +172,27 @@ It survives the restart the context window does not: when compaction drops old
 turns, what they established rides back in on the next turn instead of being
 gone.
 
+**Skills you control.** Short, specific briefs (web design, landing pages,
+e-commerce, engineering, run & deploy, security, SEO, images) are added to the
+opening turn of a request that calls for them, in every CLI, the dashboard chat
+and `/agent`. Settings -> Skills switches each one off, or adds your own named
+skills that apply on your keywords or on every request.
+
+**A health check in one click.** Settings -> Run health check tests every
+enabled provider and key, sends real requests through the hub's own routing
+(plain and tool-calling, streamed and not), and says what to do: add a key,
+replace a dead one, or turn off a provider that refuses outside apps.
+
+**Low-memory mode.** On a machine under 8 GB of RAM or 4 cores (Auto), multi
+sessions run 1-2 agents at a time instead of 4; on any machine, one at a time
+while free memory is under 1.5 GB. Auto, On or Off in Settings.
+
+**Honest failures.** When no free model can serve an agent turn, the turn
+stops and names the providers and why ("nvidia: too slow; dahl:
+rate-limited") instead of retrying in silence, and a relay's billing notice is
+never passed off as an answer. Settings -> What changed lists every update in
+plain words, grouped as New, Fixed and Improved.
+
 **Local-first with a real threat model.** AES-256-GCM at rest, a control token
 on every `/api/*`, bound to `127.0.0.1`, and no telemetry of any kind.
 

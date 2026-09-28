@@ -60,8 +60,11 @@ def test_each_note_carries_a_date_a_hash_and_a_subject(monkeypatch):
            "def5678\x1f2026-09-08\x1fanother one\x1e", ""))
     with A.app.test_request_context("/api/release-notes"):
         rows = A.api_release_notes().get_json()["notes"]
-    assert rows == [{"hash": "abc1234", "date": "2026-09-09", "subject": "a real subject"},
-                    {"hash": "def5678", "date": "2026-09-08", "subject": "another one"}]
+    # (+ kind/title/scope since 2026-09-28, see tests/test_whats_new_design.py)
+    assert [{k: r[k] for k in ("hash", "date", "subject")} for r in rows] == [
+        {"hash": "abc1234", "date": "2026-09-09", "subject": "a real subject"},
+        {"hash": "def5678", "date": "2026-09-08", "subject": "another one"}]
+    assert rows[0]["title"] == "A real subject" and rows[0]["kind"] == "change"
 
 
 def test_a_subject_containing_the_delimiter_is_not_a_problem(monkeypatch):
@@ -143,7 +146,7 @@ def test_opening_it_counts_as_showing_it():
     """Escape and the X close the modal without touching Got it. Stamping only
     on the button brought it straight back on the next load."""
     i = SRC.index("function showWhatsNew(")
-    body = SRC[i:i + 3500]
+    body = SRC[i:SRC.index("/* ---------- multi swarm windows", i)]   # the whole function
     assert body.count("flh.whatsNewAt") >= 2, "stamped on dismiss only"
 
 

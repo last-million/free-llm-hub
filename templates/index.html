@@ -105,7 +105,10 @@
     --new-soft:rgba(124,58,237,.10);
     --new-border:rgba(124,58,237,.30);
     --new-text:#6D28D9;
-    --ok-text:#15803D;
+    /* #166534, not #15803D: on a green tint (--accent-soft) the lighter
+       green measured 4.39:1 and 3.95:1 -- under AA; this is 6.2:1 there and
+       7.1:1 on white (tests/test_whats_new_design.py measures it). */
+    --ok-text:#166534;
     --code-text:#24292F;
     --scrim:rgba(23,28,36,.45);
   }
@@ -1661,22 +1664,61 @@
   .sk-form .sk-inline > *{flex:1 1 180px}
   .sk-err{font-size:12px;color:var(--danger,#ef4444)}
 
-  /* ---------- "what changed" ---------- */
-  .wn{display:flex;flex-direction:column;gap:12px}
-  .wn-head{display:flex;align-items:baseline;gap:8px}
-  .wn-ver{font-weight:700;font-size:14px}
-  .wn-hash{font-family:var(--mono);font-size:11.5px;opacity:.7;
-    padding:1px 6px;border-radius:5px;background:var(--bg-soft,rgba(127,127,127,.12))}
-  .wn-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
-    max-height:46vh;overflow-y:auto}
-  .wn-list li{display:flex;gap:10px;padding:8px 0;font-size:12.5px;line-height:1.45;
-    border-bottom:1px solid var(--border-soft)}
-  .wn-list li:last-child{border-bottom:0}
-  .wn-date{flex:none;width:76px;font-family:var(--mono);font-size:11px;opacity:.55;
-    font-variant-numeric:tabular-nums}
-  .wn-sub{flex:1;min-width:0}
-  .wn-empty{margin:0;font-size:12.5px;color:var(--text-faint);line-height:1.5}
+  /* ---------- "what changed" ----------
+     REQUESTED 2026-09-28: better colours, light AND dark. Every colour is a
+     theme token, so both themes follow; each kind maps to one existing
+     semantic family: new = --new (violet), fixed = --accent/--ok-text (green),
+     improved = --info (blue), other = neutral. Text on its tint stays the
+     family's *-text shade (>= 4.5:1 in both themes); dates use --text-dim,
+     not --text-faint, which is under 4.5:1 on a raised surface. */
+  .wn{display:flex;flex-direction:column;gap:14px}
+  .wn-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .wn-ver{font-weight:700;font-size:15px;color:var(--text);letter-spacing:-.01em}
+  .wn-hash{font-family:var(--mono);font-size:11px;color:var(--text-dim);
+    padding:2px 8px;border-radius:999px;background:var(--surface-2);
+    border:1px solid var(--border)}
+  .wn-k-new{--k:var(--new);--k-soft:var(--new-soft);--k-border:var(--new-border);--k-text:var(--new-text)}
+  .wn-k-fix{--k:var(--accent);--k-soft:var(--accent-soft);--k-border:var(--accent-border);--k-text:var(--ok-text)}
+  .wn-k-improved{--k:var(--info);--k-soft:var(--info-soft);--k-border:var(--info-border);--k-text:var(--info-text)}
+  .wn-k-change{--k:var(--text-faint);--k-soft:var(--surface-2);--k-border:var(--border);--k-text:var(--text-dim)}
+  .wn-sum{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto}
+  .wn-count{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;
+    border-radius:999px;font-size:11.5px;font-weight:600;line-height:1.4;
+    background:var(--k-soft);border:1px solid var(--k-border);color:var(--k-text)}
+  .wn-dot{width:7px;height:7px;border-radius:50%;background:var(--k);flex:none}
+  .wn-fresh-note{font-size:12px;color:var(--text-dim);margin:-4px 0 0}
+  .wn-scroll{display:flex;flex-direction:column;gap:16px;max-height:54vh;
+    overflow-y:auto;padding-right:4px;overscroll-behavior:contain}
+  .wn-group{display:flex;flex-direction:column;gap:8px}
+  .wn-gh{display:flex;align-items:center;gap:8px;font-size:11px;font-weight:700;
+    letter-spacing:.06em;text-transform:uppercase;color:var(--k-text)}
+  .wn-gh .wn-n{font-weight:600;letter-spacing:0;color:var(--text-dim)}
+  .wn-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+  .wn-list li{display:flex;flex-direction:column;gap:4px;padding:9px 12px 9px 13px;
+    border-radius:var(--radius-sm);background:var(--surface-2);
+    border:1px solid var(--border-soft);border-left:3px solid var(--k-border);
+    transition:border-color .15s ease,background .15s ease}
+  .wn-list li:hover{border-color:var(--border);border-left-color:var(--k)}
+  .wn-sub{font-size:13px;line-height:1.5;color:var(--text);overflow-wrap:anywhere}
+  .wn-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px;color:var(--text-dim)}
+  .wn-scope{padding:1px 8px;border-radius:999px;background:var(--surface-3);
+    color:var(--text-dim);font-weight:600}
+  .wn-date{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .wn-fresh-tag{padding:1px 7px;border-radius:999px;font-weight:700;
+    background:var(--accent-soft);color:var(--ok-text);border:1px solid var(--accent-border)}
+  .wn-empty{margin:0;font-size:12.5px;color:var(--text-dim);line-height:1.5}
   .wn-actions{justify-content:flex-end;align-items:center}
+  .wn .star-ask{margin:0;background:var(--surface-2);border-color:var(--border-soft)}
+  .wn .star-ask a{background:var(--text);color:var(--surface)}
+  .wn .star-ask a:hover{filter:none;opacity:.88}
+  .wn .star-ask a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  @media (max-width:600px){
+    .wn-sum{margin-left:0}
+    .wn-scroll{max-height:60vh}
+  }
+  @media (prefers-reduced-motion:reduce){
+    .wn-list li{transition:none}
+  }
 
   /* ---------- multi swarm windows, on the agent page ---------- */
   .agent-swarm{display:flex;flex-direction:column;gap:10px;padding:12px 0}
@@ -4035,6 +4077,7 @@
       <div class="sd-label">Update</div>
       <div class="sd-actions">
         <button class="btn sm" id="settings-update-check" type="button">Check for updates</button>
+        <button class="btn sm ghost" id="settings-whats-new" type="button">What changed</button>
       </div>
       <p class="sd-help" id="settings-update-status">Checking current version&hellip;</p>
     </div>
@@ -12872,23 +12915,77 @@
     api('/api/release-notes').then(function(r){
       var v = r && r.version;
       if (!v || v === 'unknown' || seen === v) return;
-      showWhatsNew(v, (r && r.notes) || [], r && r.release);
+      showWhatsNew(v, (r && r.notes) || [], r && r.release, seen);
     }).catch(function(){});
   }
 
-  function showWhatsNew(version, notes, release){
+  /* Settings -> Update -> "What changed": the same window, any time. */
+  function initWhatsNewButton(){
+    var b = $('#settings-whats-new');
+    if (!b) return;
+    b.addEventListener('click', function(){
+      b.disabled = true;
+      api('/api/release-notes').then(function(r){
+        showWhatsNew((r && r.version) || '', (r && r.notes) || [], r && r.release, null);
+      }).catch(function(e){ toast('What changed: ' + e.message, true); })
+        .then(function(){ b.disabled = false; });
+    });
+  }
+
+  /* Each note's kind (see _release_note_view): new / fix / improved, anything
+     else is "Other changes". Order = what a reader looks for first. */
+  var WN_KINDS = [['new', 'New', 'new'], ['fix', 'Fixed', 'fixed'],
+                  ['improved', 'Improved', 'improved'], ['change', 'Other changes', 'other']];
+  function wnKind(n){
+    var k = n && n.kind;
+    return (k === 'new' || k === 'fix' || k === 'improved') ? k : 'change';
+  }
+
+  function showWhatsNew(version, notes, release, seen){
     var body = frag();
     var box = document.createElement('div');
     box.className = 'wn';
+    /* NEW SINCE THE LAST VISIT: every note above the one whose hash is the
+       version seen last. A manual open (seen = null) marks none; a last-seen
+       version older than the whole list marks them all. */
+    var fresh = {}, nFresh = 0;
+    if (seen && seen !== version){
+      var upto = notes.length;
+      for (var i = 0; i < notes.length; i++){
+        if (notes[i].hash === seen){ upto = i; break; }
+      }
+      for (var j = 0; j < upto; j++){ fresh[notes[j].hash] = true; nFresh++; }
+    }
+    var groups = WN_KINDS.map(function(k){
+      return {kind: k[0], label: k[1], word: k[2],
+              items: notes.filter(function(n){ return wnKind(n) === k[0]; })};
+    }).filter(function(gr){ return gr.items.length; });
     var head = '<div class="wn-head">' +
                  '<span class="wn-ver">' + esc(release || 'Hub') + '</span>' +
                  '<code class="wn-hash">' + esc(version) + '</code>' +
-               '</div>';
+                 (groups.length ? '<div class="wn-sum">' + groups.map(function(gr){
+                   return '<span class="wn-count wn-k-' + gr.kind + '"><span class="wn-dot"></span>' +
+                          gr.items.length + ' ' + gr.word + '</span>';
+                 }).join('') + '</div>' : '') +
+               '</div>' +
+               (nFresh ? '<p class="wn-fresh-note">' + nFresh + ' change' +
+                         (nFresh === 1 ? '' : 's') + ' since your last visit ' +
+                         (nFresh === 1 ? 'is' : 'are') + ' marked.</p>' : '');
     var list = notes.length
-      ? '<ul class="wn-list">' + notes.map(function(n){
-          return '<li><span class="wn-date">' + esc(n.date) + '</span>' +
-                 '<span class="wn-sub">' + esc(n.subject) + '</span></li>';
-        }).join('') + '</ul>'
+      ? '<div class="wn-scroll">' + groups.map(function(gr){
+          return '<section class="wn-group wn-k-' + gr.kind + '" aria-label="' + esc(gr.label) + '">' +
+            '<div class="wn-gh"><span class="wn-dot"></span>' + esc(gr.label) +
+              '<span class="wn-n">' + gr.items.length + '</span></div>' +
+            '<ul class="wn-list">' + gr.items.map(function(n){
+              var title = n.title ? esc(n.title) : esc(n.subject);
+              return '<li><span class="wn-sub">' + title + '</span>' +
+                '<span class="wn-meta">' +
+                  (fresh[n.hash] ? '<span class="wn-fresh-tag">Since last visit</span>' : '') +
+                  (n.scope ? '<span class="wn-scope">' + esc(n.scope) + '</span>' : '') +
+                  '<span class="wn-date">' + esc(n.date) + '</span>' +
+                '</span></li>';
+            }).join('') + '</ul></section>';
+        }).join('') + '</div>'
       : '<p class="wn-empty">Updated. This install has no commit log to read ' +
         'notes from, so there is nothing more to show here.</p>';
     /* The ask goes LAST, inside the box and under the notes: what the reader
@@ -13368,6 +13465,7 @@
   initPromptEnhance();
   initSkills();
   initLowres();
+  initWhatsNewButton();
     initSocialWebSearch();
     initSdModels();
   initUpdateCheck();

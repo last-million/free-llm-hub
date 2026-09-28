@@ -16508,6 +16508,71 @@ def api_version():
 
 _RELEASE_NOTES_CACHE = {"at": 0.0, "rows": None}
 _RELEASE_NOTES_TTL = 900          # 15 min; the hub pulls every 5 hours
+_RELEASE_NOTES_SCAN = 24          # commits read (docs-only ones are dropped)...
+_RELEASE_NOTES_SHOWN = 16         # ...and at most this many shown
+# PLAIN-LANGUAGE NOTES. REQUESTED 2026-09-28: the popup should list the new
+# fixes, readable, in good colours in both themes. A commit subject is written
+# for developers ("Provider status: no_key reason, dead-key memory,
+# echoed-decimal junk strike"); the popup now shows, in order of preference:
+#   1. release_notes.json -> {"notes": {"<hash prefix>": {kind, title}}}, for
+#      commits made before the trailer existed (a commit cannot name its own
+#      hash, so this file only ever describes OLDER commits and cannot go stale:
+#      an old entry just scrolls out of the window);
+#   2. the commit's own trailer, "Release-note: <kind>: <plain sentence>";
+#   3. the subject, split into "Scope: rest" (kind "change").
+# kind: new | fix | improved | change | docs (docs never shown).
+_RELEASE_KINDS = ("new", "fix", "improved", "change", "docs")
+_RELEASE_KIND_ALIASES = {"fixed": "fix", "feature": "new", "added": "new",
+                         "improvement": "improved", "doc": "docs"}
+_RELEASE_TRAILER_RE = re.compile(r"\s*([A-Za-z]+)\s*:\s*(\S.*)", re.S)
+_RELEASE_DOCS_SUBJECT_RE = re.compile(r"(?:README|docs?|AGENTS(?:\.md)?|CHANGELOG)\b", re.I)
+_RELEASE_NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "release_notes.json")
+
+
+def _release_kind(word):
+    k = str(word or "").strip().lower()
+    k = _RELEASE_KIND_ALIASES.get(k, k)
+    return k if k in _RELEASE_KINDS else None
+
+
+def _release_note_overrides():
+    """{hash prefix: {kind, title}} from release_notes.json; {} when absent or
+    unreadable (the popup then falls back to trailers and subjects)."""
+    try:
+        with open(_RELEASE_NOTES_FILE, encoding="utf-8") as fh:
+            notes = (json.load(fh) or {}).get("notes") or {}
+        return {str(k).lower(): v for k, v in notes.items()
+                if isinstance(v, dict) and len(str(k)) >= 7}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _release_note_view(full_hash, subject, trailer, overrides):
+    """{kind, title, scope} for one commit (see _RELEASE_KINDS above)."""
+    subject = str(subject or "").strip()
+    head, sep, rest = subject.partition(":")
+    scope = head.strip() if sep and rest.strip() and 0 < len(head.strip()) <= 32 else ""
+    kind = title = None
+    full = str(full_hash or "").lower()
+    o = next((v for k, v in overrides.items() if full.startswith(k)), None)
+    if o:
+        kind, title = _release_kind(o.get("kind")), str(o.get("title") or "").strip() or None
+        if str(o.get("scope") or "").strip():
+            scope = str(o["scope"]).strip()[:32]
+    tr = str(trailer or "").strip()
+    if tr and not tr.startswith("%(") and not title:
+        m = _RELEASE_TRAILER_RE.match(tr)
+        if m and _release_kind(m.group(1)):
+            kind, title = kind or _release_kind(m.group(1)), m.group(2).strip()
+        else:
+            title = tr
+    if not kind:
+        kind = "docs" if _RELEASE_DOCS_SUBJECT_RE.match(subject) else "change"
+    if not title:
+        title = rest.strip() if scope else subject
+        title = title[:1].upper() + title[1:]
+    return {"kind": kind, "title": title, "scope": scope}
 
 
 def _swarm_windows_planner(system, goal):
@@ -17096,15 +17161,26 @@ def api_release_notes():
         if _is_git_repo():
             # %x1f/%x1e are the ASCII unit/record separators: a commit subject
             # can contain anything a person can type, including whatever
-            # delimiter looked safe.
-            rc, out, _err = _git("log", "-12", "--no-merges",
-                                 "--pretty=format:%h%x1f%cs%x1f%s%x1e", timeout=20)
+            # delimiter looked safe. Fields: short hash, date, subject, full
+            # hash, the commit's "Release-note:" trailer (see
+            # _release_note_view).
+            rc, out, _err = _git(
+                "log", "-%d" % _RELEASE_NOTES_SCAN, "--no-merges",
+                "--pretty=format:%h%x1f%cs%x1f%s%x1f%H%x1f"
+                "%(trailers:key=Release-note,valueonly,separator=%x20)%x1e", timeout=20)
             if rc == 0:
+                overrides = _release_note_overrides()
                 for rec in out.split("\x1e"):
                     parts = rec.strip().split("\x1f")
-                    if len(parts) == 3 and parts[2]:
-                        rows.append({"hash": parts[0], "date": parts[1],
-                                     "subject": parts[2]})
+                    if len(parts) < 3 or not parts[2]:
+                        continue
+                    row = {"hash": parts[0], "date": parts[1], "subject": parts[2]}
+                    row.update(_release_note_view(
+                        parts[3] if len(parts) > 3 and parts[3] else parts[0],
+                        parts[2], parts[4] if len(parts) > 4 else "", overrides))
+                    if row["kind"] != "docs":
+                        rows.append(row)
+                rows = rows[:_RELEASE_NOTES_SHOWN]
         _RELEASE_NOTES_CACHE["rows"] = rows
         _RELEASE_NOTES_CACHE["at"] = now
     return jsonify({"version": _HUB_VERSION, "release": HUB_RELEASE,

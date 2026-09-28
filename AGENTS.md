@@ -1017,6 +1017,26 @@ billing notice as the answer.
   `coding-swarm`) instead of dropping one axis; it used to send bare `coding`
   (Normal tier) for Max + coding, and two turns were served by a 2.6B model.
 
+## "What changed" window & release notes (2026-09-28)
+
+Covered by `tests/test_whats_new_design.py` (+ the older
+`tests/test_the_whats_new_popup.py`). `/api/release-notes` reads the last 24
+non-merge commits and returns up to 16, each with `kind` (new | fix | improved
+| change; `docs` is dropped), a plain-language `title` and a `scope` chip
+(`_release_note_view`). Source order: `release_notes.json` (hash prefix ->
+{kind, scope, title}, for commits older than the trailer), then the commit's
+own trailer, then the subject split as "Scope: rest".
+
+**Every user-visible commit gets a trailer** in its message's last paragraph:
+
+    Release-note: fix: <one plain sentence a non-developer understands>
+
+(kinds: new, fix, improved; docs-only commits: `Release-note: docs: ...` or a
+`README:` subject). The window groups by kind with counts, marks what is new
+since the last visit, and opens from Settings -> Update -> What changed. Its
+CSS uses theme tokens only; the test measures every text/background pair at
+>= 4.5:1 in both themes (the light `--ok-text` was darkened to #166534 for it).
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
