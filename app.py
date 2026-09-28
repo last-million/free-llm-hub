@@ -14713,6 +14713,437 @@ def api_test_cache():
         return jsonify(_load_test_cache())
 
 
+# --------------------------------------------------------------------------- #
+# One-click health check (Settings -> "Run health check"): the owner's monthly
+# maintenance pass in one click.
+#   (a) every ENABLED provider's /api/test/<pid>, one at a time, skipping the
+#       ones a test cannot say anything useful about right now (no key saved,
+#       free allowance spent / rate-limited, no free tier) with the reason;
+#   (b) a small live routing check through the hub's OWN /v1 stack
+#       (in-process test client, no socket): auto non-stream + stream, and one
+#       tool turn non-stream + stream;
+#   (c) a summary: working providers, keys that failed, enabled providers
+#       with no key, window coverage (the /api/model-windows data) and plain
+#       recommendations.
+# Runs in ONE background thread (a second POST while it runs is a 409), is
+# cancellable between steps, and never writes a setting: the only files it
+# writes are its own report (state_dir()/health-check.json) and whatever the
+# provider test already writes (the test-result cache).
+# --------------------------------------------------------------------------- #
+HEALTH_REPORT_NAME = "health-check.json"
+_HEALTH_SKIP_REASONS = ("exhausted", "throttled", "no_free_tier")
+_HEALTH_AUTH_RE = re.compile(
+    r"\b(401|403)\b|unauthori[sz]ed|invalid[ _-]?(api[ _-]?)?key|api key|"
+    r"expired|revoked|forbidden|out of funds|insufficient[ _-]?(funds|credit|balance)|"
+    r"keys? (is|are) rejected|none of the \d+ keys work", re.I)
+_HEALTH_TOOL_NAME = "get_utc_time"
+_health_lock = threading.Lock()
+_health_cancel = threading.Event()
+_health_state = {"running": False, "phase": "idle", "done": 0, "total": 0,
+                 "current": "", "started_at": None, "cancel_requested": False}
+
+
+def _health_report_path():
+    return os.path.join(config.state_dir(), HEALTH_REPORT_NAME)
+
+
+def _health_load_report():
+    try:
+        with open(_health_report_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _health_save_report(report):
+    """Atomic write (temp file + os.replace), best-effort like the test cache."""
+    try:
+        path = _health_report_path()
+        parent = os.path.dirname(path)
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".health-check-", suffix=".tmp", dir=parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        for _attempt in range(6):
+            try:
+                os.replace(tmp, path)
+                return True
+            except PermissionError:
+                time.sleep(0.15)
+            except OSError:
+                break
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[health] report save failed", exc_info=True)
+    return False
+
+
+def _health_progress(**kw):
+    with _health_lock:
+        _health_state.update(kw)
+
+
+def _health_enabled_providers():
+    """[(pid, name, has_key, needs_key)] for every ENABLED provider."""
+    out = []
+    for p in prov.list_providers():
+        pid = p["id"]
+        pcfg = config.get_provider_config(pid)
+        if not pcfg.get("enabled"):
+            continue
+        has_key = bool(pcfg.get("api_keys") or pcfg.get("api_key"))
+        out.append((pid, p.get("name") or pid, has_key, _needs_key(pid)))
+    return out
+
+
+def _health_skip_reason(pid, has_key, needs_key):
+    """(reason, detail) when a test would only restate a known state, else None.
+    Local state only -- never a network call."""
+    if needs_key and not has_key:
+        return "no_key", "no API key saved"
+    st = _provider_out_status(pid, prov.get_provider(pid) or {})
+    if st.get("status_reason") in _HEALTH_SKIP_REASONS:
+        return st["status_reason"], st.get("detail") or st["status_reason"]
+    return None
+
+
+def _health_test_provider(pid):
+    """The Test button's own verdict for `pid` (api_test_provider, called
+    in-process). Returns its JSON dict."""
+    with app.test_request_context("/api/test/%s" % pid, method="POST"):
+        resp = app.make_response(api_test_provider(pid))
+        return resp.get_json(silent=True) or {}
+
+
+def _health_key_failures(result, has_key):
+    """[{index, masked, detail}] of the keys the test says do NOT work."""
+    keys = result.get("keys") or []
+    bad = [{"index": k.get("index", 0), "masked": k.get("masked") or "",
+            "detail": _sanitize(k.get("detail") or "", 240)}
+           for k in keys if isinstance(k, dict) and not k.get("ok")]
+    if not keys and has_key and not result.get("ok"):
+        # A single key whose models listing already failed never reaches the
+        # per-key breakdown; the provider verdict IS that key's verdict.
+        bad = [{"index": 0, "masked": "", "detail": _sanitize(result.get("detail") or "", 240)}]
+    return bad
+
+
+def _health_v1_headers():
+    headers = {"X-Free-LLM-Hub-Cache": "bypass"}
+    local_key = config.get_local_api_key()
+    if local_key:
+        headers["Authorization"] = "Bearer " + local_key
+    return headers
+
+
+def _health_route_bodies():
+    tool = {"type": "function", "function": {
+        "name": _HEALTH_TOOL_NAME,
+        "description": "Return the current UTC time.",
+        "parameters": {"type": "object", "properties": {}, "required": []}}}
+    ping = [{"role": "user", "content": "Reply with the single word: pong"}]
+    ask_tool = [{"role": "user", "content": "What is the current UTC time? "
+                                            "Call the %s tool to find out." % _HEALTH_TOOL_NAME}]
+    return [
+        ("auto", False, {"model": "auto", "messages": ping, "max_tokens": 32}),
+        ("auto", True, {"model": "auto", "messages": ping, "max_tokens": 32,
+                        "stream": True}),
+        ("tool turn", False, {"model": "auto", "messages": ask_tool, "tools": [tool],
+                              "max_tokens": 256}),
+        ("tool turn", True, {"model": "auto", "messages": ask_tool, "tools": [tool],
+                             "max_tokens": 256, "stream": True}),
+    ]
+
+
+def _health_parse_sse(chunks, cancel):
+    """(content, tool_names, error, done, cancelled) from an SSE byte stream."""
+    buf, content, tools, error, done = "", [], [], None, False
+    for chunk in chunks:
+        if cancel.is_set():
+            return "".join(content), tools, error, done, True
+        buf += chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else str(chunk)
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                done = True
+                continue
+            try:
+                obj = json.loads(data)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and obj.get("error"):
+                err = obj["error"]
+                error = err.get("message") if isinstance(err, dict) else str(err)
+                continue
+            for ch in (obj.get("choices") or []) if isinstance(obj, dict) else []:
+                delta = ch.get("delta") or {}
+                if delta.get("content"):
+                    content.append(delta["content"])
+                for tc in delta.get("tool_calls") or []:
+                    name = ((tc or {}).get("function") or {}).get("name")
+                    if name:
+                        tools.append(name)
+    return "".join(content), tools, error, done, False
+
+
+def _health_route_check(label, stream, body, cancel):
+    """One request through the hub's own /v1/chat/completions (in-process).
+    Returns {name, stream, ok, provider, model, ms, detail}."""
+    row = {"name": label, "stream": bool(stream), "ok": False,
+           "provider": "", "model": "", "ms": 0, "detail": ""}
+    want_tool = "tools" in body
+    t0 = time.time()
+    resp = None
+    try:
+        client = app.test_client()
+        resp = client.post("/v1/chat/completions", json=body,
+                           headers=_health_v1_headers(), buffered=not stream)
+        row["provider"] = resp.headers.get("X-Free-LLM-Hub-Provider") or ""
+        row["model"] = resp.headers.get("X-Free-LLM-Hub-Model") or ""
+        last_err = resp.headers.get("X-Free-LLM-Hub-Last-Error") or ""
+        if resp.status_code != 200:
+            try:
+                j = json.loads(resp.get_data(as_text=True) or "{}")
+                err = j.get("error") if isinstance(j, dict) else None
+                msg = err.get("message") if isinstance(err, dict) else err
+            except Exception:                                    # noqa: BLE001
+                msg = None
+            row["detail"] = "HTTP %d%s%s" % (
+                resp.status_code, (": %s" % msg) if msg else "",
+                (" (last hop failure: %s)" % last_err) if last_err else "")
+        elif stream:
+            content, tools, error, done, cancelled = _health_parse_sse(resp.response, cancel)
+            if cancelled:
+                row["detail"] = "cancelled"
+            elif error:
+                row["detail"] = "stream error: %s" % error
+            elif want_tool:
+                row["ok"] = _HEALTH_TOOL_NAME in tools
+                row["detail"] = ("called %s" % _HEALTH_TOOL_NAME if row["ok"] else
+                                 "answered in text without calling the tool"
+                                 if content.strip() else "empty stream")
+            else:
+                row["ok"] = bool(content.strip())
+                row["detail"] = ("answered: %s" % content.strip()[:60] if row["ok"]
+                                 else "empty stream")
+            if row["ok"] and not done:
+                row["detail"] += " (no [DONE] marker)"
+        else:
+            j = resp.get_json(silent=True) or {}
+            msg = ((j.get("choices") or [{}])[0] or {}).get("message") or {}
+            content = msg.get("content") or ""
+            names = [((tc or {}).get("function") or {}).get("name")
+                     for tc in (msg.get("tool_calls") or [])]
+            if want_tool:
+                row["ok"] = _HEALTH_TOOL_NAME in names
+                row["detail"] = ("called %s" % _HEALTH_TOOL_NAME if row["ok"] else
+                                 "answered in text without calling the tool"
+                                 if str(content).strip() else "empty answer")
+            else:
+                row["ok"] = bool(str(content).strip())
+                row["detail"] = ("answered: %s" % str(content).strip()[:60] if row["ok"]
+                                 else "empty answer")
+    except Exception as exc:                                     # noqa: BLE001
+        row["detail"] = "%s: %s" % (exc.__class__.__name__, exc)
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:                                    # noqa: BLE001
+                pass
+    row["ms"] = int((time.time() - t0) * 1000)
+    row["detail"] = _sanitize(row["detail"], 300)
+    return row
+
+
+def _health_window_coverage():
+    """The /api/model-windows coverage block, plus how many alive models on
+    each provider still run on the default (unknown) window."""
+    with app.test_request_context("/api/model-windows"):
+        data = app.make_response(api_model_windows()).get_json(silent=True) or {}
+    unknown = {}
+    for r in data.get("models") or []:
+        if r.get("source") == "default":
+            unknown[r.get("provider")] = unknown.get(r.get("provider"), 0) + 1
+    cov = data.get("coverage") or {}
+    return {"known": cov.get("known", 0), "total": cov.get("total", 0),
+            "by_source": cov.get("by_source") or {},
+            "unknown_by_provider": dict(sorted(unknown.items(), key=lambda kv: -kv[1]))}
+
+
+def _health_summarize(providers, routing, windows):
+    working = [p["id"] for p in providers if p["status"] == "ok"]
+    dead_keys = [{"id": p["id"], "name": p["name"], "keys": p["bad_keys"],
+                  "all_dead": p["status"] != "ok"}
+                 for p in providers if p.get("bad_keys") and (
+                     p["status"] == "ok" or p.get("auth_failure"))]
+    failing = [{"id": p["id"], "name": p["name"], "detail": p["detail"]}
+               for p in providers if p["status"] == "failed" and not p.get("auth_failure")]
+    no_key = [p["id"] for p in providers if p.get("reason") == "no_key"]
+    skipped = [{"id": p["id"], "reason": p["reason"], "detail": p["detail"]}
+               for p in providers if p["status"] == "skipped" and p["reason"] != "no_key"]
+    names = {p["id"]: p["name"] for p in providers}
+    recs = []
+    if no_key:
+        recs.append("Add an API key for %s (enabled but no key saved), or disable %s."
+                    % (", ".join(names[i] for i in no_key),
+                       "it" if len(no_key) == 1 else "them"))
+    for d in dead_keys:
+        idx = ", ".join("#%d" % (k["index"] + 1) for k in d["keys"])
+        if d["all_dead"]:
+            recs.append("%s: its key%s failed the test (%s) -- replace or remove %s."
+                        % (d["name"], "" if len(d["keys"]) == 1 else "s", idx,
+                           "it" if len(d["keys"]) == 1 else "them"))
+        else:
+            recs.append("%s: remove the dead key%s %s -- routing still spends a hop on %s."
+                        % (d["name"], "" if len(d["keys"]) == 1 else "s", idx,
+                           "it" if len(d["keys"]) == 1 else "them"))
+    for f in failing:
+        recs.append("%s failed its test (%s) -- re-test later; if it keeps failing, disable it."
+                    % (f["name"], f["detail"][:120]))
+    bad_routes = [r for r in routing if not r.get("ok")]
+    if bad_routes:
+        recs.append("Routing check: %d of %d requests failed (%s)."
+                    % (len(bad_routes), len(routing),
+                       "; ".join("%s %s: %s" % (r["name"], "stream" if r["stream"] else
+                                                "non-stream", r["detail"][:80])
+                                 for r in bad_routes)))
+    if windows and windows.get("total"):
+        unknown = windows["total"] - windows.get("known", 0)
+        if unknown:
+            recs.append("%d of %d usable models have no known context window (the hub "
+                        "guesses a default for them)." % (unknown, windows["total"]))
+    if not working and providers:
+        recs.append("No enabled provider passed its test -- add a working key first.")
+    return {"working": working, "dead_keys": dead_keys, "failing": failing,
+            "no_key": no_key, "skipped": skipped,
+            "routing_ok": sum(1 for r in routing if r.get("ok")),
+            "routing_total": len(routing), "recommendations": recs}
+
+
+def _health_run(cancel):
+    """The worker. Never raises; always persists a report (partial on cancel)."""
+    started = time.time()
+    report = {"started_at": started, "finished_at": None, "status": "running",
+              "providers": [], "routing": [], "windows": None, "summary": None}
+    try:
+        with _usage_source_as("health-check"):
+            plist = _health_enabled_providers()
+            bodies = _health_route_bodies()
+            _health_progress(phase="providers", total=len(plist) + len(bodies), done=0)
+            for pid, name, has_key, needs_key in plist:
+                if cancel.is_set():
+                    break
+                _health_progress(current=pid)
+                row = {"id": pid, "name": name, "status": "skipped", "reason": "",
+                       "detail": "", "bad_keys": [], "auth_failure": False}
+                skip = _health_skip_reason(pid, has_key, needs_key)
+                if skip:
+                    row["reason"], row["detail"] = skip[0], _sanitize(skip[1], 240)
+                else:
+                    try:
+                        res = _health_test_provider(pid)
+                    except Exception as exc:                     # noqa: BLE001
+                        res = {"ok": False, "detail": "%s: %s" % (exc.__class__.__name__, exc)}
+                    row["status"] = "ok" if res.get("ok") else "failed"
+                    row["detail"] = _sanitize(res.get("detail") or "", 300)
+                    row["bad_keys"] = _health_key_failures(res, has_key)
+                    row["auth_failure"] = bool(
+                        row["status"] == "failed" and row["bad_keys"]
+                        and (_HEALTH_AUTH_RE.search(row["detail"]) or
+                             any(_HEALTH_AUTH_RE.search(k["detail"]) for k in row["bad_keys"])))
+                report["providers"].append(row)
+                _health_progress(done=len(report["providers"]))
+            if not cancel.is_set():
+                _health_progress(phase="routing")
+                for label, stream, body in bodies:
+                    if cancel.is_set():
+                        break
+                    _health_progress(current="%s (%s)" % (label, "stream" if stream else "non-stream"))
+                    report["routing"].append(_health_route_check(label, stream, body, cancel))
+                    _health_progress(done=len(plist) + len(report["routing"]))
+            if not cancel.is_set():
+                _health_progress(phase="summary", current="window coverage")
+                try:
+                    report["windows"] = _health_window_coverage()
+                except Exception as exc:                         # noqa: BLE001
+                    report["windows"] = {"error": _sanitize(str(exc), 200)}
+        report["status"] = "cancelled" if cancel.is_set() else "done"
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[health] run failed: %s", exc, exc_info=True)
+        report["status"] = "error"
+        report["error"] = _sanitize("%s: %s" % (exc.__class__.__name__, exc), 300)
+    try:
+        report["summary"] = _health_summarize(
+            report["providers"], report["routing"],
+            report["windows"] if isinstance(report.get("windows"), dict)
+            and "error" not in report["windows"] else None)
+    except Exception as exc:                                     # noqa: BLE001
+        report["summary"] = {"recommendations": [], "error": _sanitize(str(exc), 200)}
+    report["finished_at"] = time.time()
+    _health_save_report(report)
+    with _health_lock:
+        _health_state.update(running=False, phase="idle", current="",
+                             cancel_requested=False)
+    return report
+
+
+def _health_status_payload():
+    with _health_lock:
+        state = dict(_health_state)
+    return {"running": state["running"],
+            "progress": {"phase": state["phase"], "done": state["done"],
+                         "total": state["total"], "current": state["current"],
+                         "started_at": state["started_at"],
+                         "cancel_requested": state["cancel_requested"]},
+            "report": _health_load_report()}
+
+
+@app.route("/api/health-check", methods=["GET", "POST"])
+def api_health_check():
+    """GET -> {running, progress, report}. POST -> start one run in the
+    background (409 while one is already running). Control-token gated like
+    every /api/* route."""
+    if request.method == "GET":
+        return jsonify(_health_status_payload())
+    with _health_lock:
+        if _health_state["running"]:
+            return jsonify({"error": "a health check is already running",
+                            "code": "already_running"}), 409
+        _health_cancel.clear()
+        _health_state.update(running=True, phase="starting", done=0, total=0,
+                             current="", started_at=time.time(), cancel_requested=False)
+    try:
+        threading.Thread(target=_health_run, args=(_health_cancel,),
+                         name="health-check", daemon=True).start()
+    except Exception as exc:                                     # noqa: BLE001
+        with _health_lock:
+            _health_state.update(running=False, phase="idle")
+        return jsonify({"error": "could not start: %s" % exc}), 500
+    return jsonify(_health_status_payload()), 202
+
+
+@app.route("/api/health-check/cancel", methods=["POST"])
+def api_health_check_cancel():
+    """Ask the running check to stop. It stops before the next provider test
+    or routing request (one already in flight finishes or times out first)
+    and saves what it has as a 'cancelled' report."""
+    with _health_lock:
+        running = _health_state["running"]
+        if running:
+            _health_cancel.set()
+            _health_state["cancel_requested"] = True
+    return jsonify({"ok": True, "running": running})
+
+
 @app.route("/api/aa-benchmarks", methods=["GET", "POST"])
 def api_aa_benchmarks():
     """GET -> status of the Artificial Analysis benchmark integration (has_key,

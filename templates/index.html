@@ -1635,6 +1635,10 @@
   }
   .sd-label{font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--text-dim)}
   .sd-help{font-size:12px;color:var(--text-faint);line-height:1.5}
+  .hc-report{font-size:12px;line-height:1.5;max-height:320px;overflow:auto;overflow-wrap:anywhere}
+  .hc-head{font-weight:600;color:var(--text);margin-top:6px}
+  .hc-sub{font-weight:600;color:var(--text);margin-top:6px}
+  .hc-list{margin:2px 0 0 16px;padding:0;color:var(--text-faint)}
   .sd-actions{display:flex;gap:8px;flex-wrap:wrap}
 
   /* ---------- "what changed" ---------- */
@@ -3939,6 +3943,15 @@
         <span class="lbl">Enhance opening prompts</span>
       </label>
       <p class="sd-help">Rewrites the <em>first</em> prompt of a dashboard chat, and every image prompt, into a sharper version before sending &mdash; so a two-word ask still gets the model&rsquo;s best work. Anti-slop by design: no &ldquo;masterpiece, 8k&rdquo; padding, no role-play framing. You always see the rewrite and can revert it. Requests from your CLIs are never touched.</p>
+    </div>
+    <div class="sd-group" id="health-check-group">
+      <div class="sd-label">Health check</div>
+      <div class="sd-actions">
+        <button class="btn sm" id="health-check-run" type="button" title="Test every enabled provider, then send a few tiny requests through the hub's routing">Run health check</button>
+        <button class="btn sm ghost" id="health-check-cancel" type="button" hidden>Cancel</button>
+      </div>
+      <p class="sd-help" id="health-check-progress" aria-live="polite">Tests every enabled provider one at a time, then 4 tiny routing requests (auto and a tool turn, streamed and not). Uses a little free quota; never changes a setting.</p>
+      <div id="health-check-report" class="hc-report"></div>
     </div>
     <div class="sd-group">
       <div class="sd-label">Backup &amp; restore</div>
@@ -12234,6 +12247,99 @@
       toast('Update check failed: ' + e.message, true);
     }).then(function(){ _updateChecking = false; });
   }
+  /* ---------- one-click health check (Settings) ----------
+     POST /api/health-check starts ONE background run (409 while one runs);
+     GET returns {running, progress, report}. Everything server-provided is
+     rendered through esc(). */
+  var _hcTimer = null;
+  function hcWhen(ts){
+    if (!ts) return '';
+    try { return new Date(ts * 1000).toLocaleString(); } catch (e) { return ''; }
+  }
+  function hcList(title, items){
+    if (!items || !items.length) return '';
+    return '<div class="hc-sub">' + esc(title) + '</div><ul class="hc-list">' +
+      items.map(function(t){ return '<li>' + esc(t) + '</li>'; }).join('') + '</ul>';
+  }
+  function renderHealthReport(rep){
+    var host = $('#health-check-report');
+    if (!host) return;
+    if (!rep){ host.innerHTML = '<p class="sd-help">No health check has run yet.</p>'; return; }
+    var s = rep.summary || {};
+    var head = 'Last run: ' + hcWhen(rep.finished_at || rep.started_at) +
+      (rep.status && rep.status !== 'done' ? ' (' + rep.status + ')' : '');
+    var html = '<div class="hc-head">' + esc(head) + '</div>';
+    if (rep.error) html += '<p class="sd-help">' + esc(rep.error) + '</p>';
+    var provs = rep.providers || [];
+    var tested = provs.filter(function(p){ return p.status !== 'skipped'; }).length;
+    html += '<p class="sd-help">' + esc((s.working || []).length + ' of ' + tested +
+      ' tested providers work; routing ' + (s.routing_ok || 0) + '/' + (s.routing_total || 0) +
+      ' requests passed' + (rep.windows && rep.windows.total ?
+        '; context windows known for ' + rep.windows.known + '/' + rep.windows.total + ' usable models' : '') + '.') + '</p>';
+    html += hcList('Recommendations', s.recommendations || []);
+    html += hcList('Working', (s.working || []));
+    html += hcList('Dead keys', (s.dead_keys || []).map(function(d){
+      return d.name + ': key ' + (d.keys || []).map(function(k){
+        return '#' + ((k.index || 0) + 1) + (k.masked ? ' (' + k.masked + ')' : '');
+      }).join(', ') + (d.all_dead ? ' (no working key)' : '');
+    }));
+    html += hcList('Failed (not a key problem)', (s.failing || []).map(function(f){ return f.name + ': ' + f.detail; }));
+    html += hcList('No key saved', s.no_key || []);
+    html += hcList('Skipped', (s.skipped || []).map(function(k){ return k.id + ': ' + k.detail; }));
+    html += hcList('Routing', (rep.routing || []).map(function(r){
+      return (r.ok ? 'OK ' : 'FAIL ') + r.name + (r.stream ? ' (stream)' : ' (non-stream)') +
+        (r.provider ? ' via ' + r.provider + '/' + r.model : '') + ' - ' + r.detail;
+    }));
+    host.innerHTML = html;
+  }
+  function renderHealthStatus(st){
+    st = st || {};
+    var p = st.progress || {};
+    var line = $('#health-check-progress');
+    var run = $('#health-check-run');
+    var cancel = $('#health-check-cancel');
+    if (run) run.disabled = !!st.running;
+    if (cancel){ cancel.hidden = !st.running; cancel.disabled = !!p.cancel_requested; }
+    if (line && st.running){
+      line.textContent = (p.cancel_requested ? 'Cancelling after the current step… ' : 'Running: ') +
+        (p.phase || '') + ' ' + (p.done || 0) + '/' + (p.total || 0) +
+        (p.current ? ' - ' + p.current : '');
+    } else if (line && st.report){
+      line.textContent = 'Last health check: ' + hcWhen(st.report.finished_at || st.report.started_at) + '.';
+    }
+    renderHealthReport(st.report);
+  }
+  function pollHealthCheck(){
+    clearTimeout(_hcTimer);
+    return api('/api/health-check').then(function(st){
+      renderHealthStatus(st);
+      if (st && st.running) _hcTimer = setTimeout(pollHealthCheck, 1500);
+    }).catch(function(e){
+      var line = $('#health-check-progress');
+      if (line) line.textContent = 'Health check status unavailable: ' + e.message;
+    });
+  }
+  function initHealthCheck(){
+    var run = $('#health-check-run');
+    var cancel = $('#health-check-cancel');
+    if (run) run.addEventListener('click', function(){
+      run.disabled = true;
+      api('/api/health-check', { method: 'POST', body: {} }).then(function(st){
+        renderHealthStatus(st);
+        pollHealthCheck();
+      }).catch(function(e){
+        toast('Health check: ' + e.message, true);
+        pollHealthCheck();
+      });
+    });
+    if (cancel) cancel.addEventListener('click', function(){
+      cancel.disabled = true;
+      api('/api/health-check/cancel', { method: 'POST', body: {} })
+        .then(pollHealthCheck)
+        .catch(function(e){ toast('Cancel failed: ' + e.message, true); });
+    });
+    if (run) pollHealthCheck();
+  }
   function initUpdateCheck(){
     var btn = $('#settings-update-check');
     if (btn) btn.addEventListener('click', runUpdateCheck);
@@ -13053,6 +13159,7 @@
     initSocialWebSearch();
     initSdModels();
   initUpdateCheck();
+  initHealthCheck();
   initThemeToggle();
   initHeaderStatusToggle();
   initSettingsDrawer();
