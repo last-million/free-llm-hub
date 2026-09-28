@@ -1650,7 +1650,7 @@
   .sk-cols{display:grid;gap:12px;grid-template-columns:minmax(0,1fr)}
   @media (min-width:900px){.sk-cols{grid-template-columns:repeat(2,minmax(0,1fr))}}
   .sk-form{display:flex;flex-direction:column;gap:8px;margin-top:10px}
-  .sk-form input,.sk-form select,.sk-form textarea{
+  .sk-form input,.sk-form select,.sk-form textarea,#lowres-mode{
     background:var(--surface-2);border:1px solid var(--border);
     border-radius:var(--radius-sm);padding:7px 10px;font:inherit;
     font-size:12.5px;color:var(--text);width:100%;box-sizing:border-box;
@@ -4002,6 +4002,16 @@
         <span class="lbl">Enhance opening prompts</span>
       </label>
       <p class="sd-help">Rewrites the <em>first</em> prompt of a dashboard chat, and every image prompt, into a sharper version before sending &mdash; so a two-word ask still gets the model&rsquo;s best work. Anti-slop by design: no &ldquo;masterpiece, 8k&rdquo; padding, no role-play framing. You always see the rewrite and can revert it. Requests from your CLIs are never touched.</p>
+    </div>
+    <div class="sd-group" id="lowres-group">
+      <div class="sd-label">Low-memory mode</div>
+      <select id="lowres-mode" aria-label="Low-memory mode">
+        <option value="auto">Auto (on for weak machines)</option>
+        <option value="on">On</option>
+        <option value="off">Off (full speed)</option>
+      </select>
+      <p class="sd-help" id="lowres-status">Checking this machine&hellip;</p>
+      <p class="sd-help">Runs fewer multi-session workers at once (each is a CLI process of 150&ndash;400&nbsp;MB): 1&ndash;2 instead of 4 when active, and 1 whenever free memory drops under 1.5&nbsp;GB. Auto turns it on under 8&nbsp;GB of RAM or 4 cores.</p>
     </div>
     <div class="sd-group" id="health-check-group">
       <div class="sd-label">Health check</div>
@@ -11575,6 +11585,37 @@
     apply();
   }
 
+  /* ---------- low-memory mode (Settings drawer) ---------- */
+  function renderLowres(r){
+    if (!r) return;
+    var sel = $('#lowres-mode'), st = $('#lowres-status');
+    if (sel) sel.value = r.mode || 'auto';
+    if (!st) return;
+    var m = r.machine || {};
+    var parts = [];
+    if (m.total_gb != null) parts.push(m.total_gb + ' GB RAM');
+    if (m.free_gb != null) parts.push(m.free_gb + ' GB free');
+    if (m.cores != null) parts.push(m.cores + ' cores');
+    st.textContent = (parts.length ? 'This machine: ' + parts.join(', ') + '. ' : '') +
+      (r.active ? 'Active' : 'Not active') + ' \u2014 up to ' + r.workers +
+      ' multi-session worker' + (r.workers === 1 ? '' : 's') + ' at once.';
+  }
+  function loadLowres(silent){
+    return api('/api/low-resource').then(renderLowres)
+      .catch(function(e){ if (!silent) toast('Low-memory mode: ' + e.message, true); });
+  }
+  function initLowres(){
+    var sel = $('#lowres-mode');
+    if (!sel) return;
+    sel.addEventListener('change', function(){
+      var want = sel.value; sel.disabled = true;
+      api('/api/low-resource', { method: 'POST', body: { mode: want } })
+        .then(function(r){ renderLowres(r); toast('Low-memory mode: ' + want); })
+        .catch(function(e){ toast('Low-memory mode: ' + e.message, true); loadLowres(true); })
+        .then(function(){ sel.disabled = false; });
+    });
+  }
+
   /* ---------- Settings -> Skills ---------- */
   var _skillsCustom = [];
   function skillSwitch(id, on, label){
@@ -12643,6 +12684,7 @@
     try { loadTestVerification(silent); } catch (e) {}
     try { loadPromptEnhance(silent); } catch (e) {}
     try { loadSkills(silent); } catch (e) {}
+    try { loadLowres(silent); } catch (e) {}
     try { loadSocialWebSearch(silent); } catch (e) {}
     try { loadUpdateStatus(silent); } catch (e) {}
     try { loadSdModels(silent); } catch (e) {}
@@ -12655,7 +12697,7 @@
     var c = $('#settings-drawer-close');
     if (c) c.focus();
     loadTestVerification(true);
-    loadPromptEnhance(true); loadSkills(true);
+    loadPromptEnhance(true); loadSkills(true); loadLowres(true);
     loadSocialWebSearch(true); loadSdModels(true);
     loadUpdateStatus(true);
   }
@@ -13325,6 +13367,7 @@
   initTestVerification();
   initPromptEnhance();
   initSkills();
+  initLowres();
     initSocialWebSearch();
     initSdModels();
   initUpdateCheck();

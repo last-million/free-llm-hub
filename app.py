@@ -77,6 +77,7 @@ import quick_history
 import config
 import image_history
 import craft
+import lowres
 import skills
 import perfstats
 import providers as prov
@@ -18933,6 +18934,23 @@ def api_web_search_policy():
         # Settings -> Skills switched the skill off; SKILL.md stops on this.
         body = {"social_search": False, "skill_enabled": False}
     return jsonify(body)
+
+
+@app.route("/api/low-resource", methods=["GET"])
+def api_low_resource():
+    """Low-resource mode (lowres.py): mode, whether it is active, the machine
+    it measured and the multi-session worker cap that follows."""
+    return jsonify(lowres.status())
+
+
+@app.route("/api/low-resource", methods=["POST"])
+def api_low_resource_update():
+    body = request.get_json(force=True, silent=True)
+    mode = body.get("mode") if isinstance(body, dict) else None
+    if mode not in lowres.MODES:
+        return jsonify({"error": "mode must be one of: %s." % ", ".join(lowres.MODES)}), 400
+    config.set_setting("low_resource_mode", mode)
+    return jsonify(lowres.status())
 
 
 @app.route("/api/web-search-policy", methods=["POST"])

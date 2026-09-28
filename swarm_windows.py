@@ -92,6 +92,17 @@ def clean_summary(text):
 # CLI process with a model behind it, so this is a RAM and rate-limit bound as
 # much as anything -- the user's own words: "it will consume the ram more".
 MAX_CONCURRENT = 4
+
+
+def _concurrency():
+    """MAX_CONCURRENT, lowered by low-resource mode (lowres.workers): 1-2 on a
+    weak machine, 1 while free RAM is short. Re-read before every spawn, so a
+    run that starts when RAM is fine still backs off if it runs short."""
+    try:
+        import lowres
+        return lowres.workers(MAX_CONCURRENT)
+    except Exception:                                            # noqa: BLE001
+        return MAX_CONCURRENT
 # Hard ceiling on workers in a run. The planner is asked for fewer; this is the
 # guard against a plan that ignores the ask.
 MAX_AGENTS = 8
@@ -1308,7 +1319,8 @@ def _run_wave(run, indexes, spawn, run_turn, configure=None, stop=None):
     if not indexes:
         return
     threads = []
-    first = indexes[:MAX_CONCURRENT] if len(indexes) > MAX_CONCURRENT else indexes
+    cap = _concurrency()
+    first = indexes[:cap] if len(indexes) > cap else indexes
     for n, i in enumerate(first):
         agent = run.agents[i - 1]
         t = threading.Thread(target=_run_agent,
@@ -1325,7 +1337,7 @@ def _run_wave(run, indexes, spawn, run_turn, configure=None, stop=None):
     # Anything past the concurrency cap runs as soon as a slot frees, which is
     # what the cap is FOR -- a plan with eight independent phases must not spawn
     # eight CLI processes at once.
-    queued = list(indexes[MAX_CONCURRENT:]) if len(indexes) > MAX_CONCURRENT else []
+    queued = list(indexes[cap:]) if len(indexes) > cap else []
     while threads or queued:
         now = time.time()
         for t, agent in list(threads):
@@ -1341,7 +1353,9 @@ def _run_wave(run, indexes, spawn, run_turn, configure=None, stop=None):
             elif quiet > AGENT_IDLE_TIMEOUT:
                 _give_up(agent, "no output for %ds" % int(quiet), stop)
                 threads.remove((t, agent))
-        while queued and len(threads) < MAX_CONCURRENT:
+        if queued:
+            cap = _concurrency()
+        while queued and len(threads) < cap:
             i = queued.pop(0)
             agent = run.agents[i - 1]
             # `configure` HAS to be passed here too. Without it, every phase

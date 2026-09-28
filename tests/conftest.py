@@ -84,3 +84,17 @@ def _reset_thinking_ledgers():
     _clear_thinking_ledgers()
     yield
     _clear_thinking_ledgers()
+
+
+@pytest.fixture(autouse=True)
+def _steady_machine(monkeypatch):
+    """Low-resource mode reads the REAL machine; pin a roomy one so a test that
+    runs while this PC is short of RAM (or on a weak CI box) keeps the
+    multi-session concurrency it asserts. tests/test_low_resource.py
+    overrides it."""
+    import lowres
+    lowres._CACHE.update(at=0.0, value=None)
+    monkeypatch.setattr(lowres, "_read_machine",
+                        lambda: {"total_gb": 32.0, "free_gb": 16.0, "cores": 8})
+    yield
+    lowres._CACHE.update(at=0.0, value=None)

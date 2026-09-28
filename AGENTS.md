@@ -964,6 +964,21 @@ Covered by `tests/test_skills_settings.py`. "Skills" = the craft briefs
   = update), `POST /api/skills/custom/delete {id}`. UI: `#skills-group` in the
   Settings drawer.
 
+## Low-resource mode (2026-09-28)
+
+Covered by `tests/test_low_resource.py`. `lowres.py` (leaf: psutil + config,
+fails open to "not weak"). Setting `low_resource_mode` auto (default) | on |
+off; auto = active under 8 GB RAM or 4 logical cores. The one real RAM
+multiplier is multi-session: each worker is a Node CLI (150-400 MB) and a run
+started `swarm_windows.MAX_CONCURRENT` (4) at once. `swarm_windows._concurrency()`
+= `lowres.workers(MAX_CONCURRENT)`: active -> 1 (< 6 GB) or 2; free RAM under
+1.5 GB -> 1 on ANY machine unless mode is "off"; re-read before each queued
+spawn (machine reading cached 5 s). Deliberately untouched: the shared
+Playwright server (its browser launches only on use; the stdio fallback would
+spawn one per CLI turn, which is worse) and HTTP fan-out threads (no real
+RAM). `GET/POST /api/low-resource {mode}`; Settings `#lowres-group`.
+`tests/conftest.py` pins a roomy machine for every test.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
