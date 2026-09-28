@@ -961,6 +961,60 @@ def _meta_cut(text, pos):
     return _glued_run_start(text, len(head.rstrip(_META_SEP_TAIL)))
 
 
+# --------------------------------------------------------------------------- #
+# Upstream service notices served as the answer
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-09-27 18:51 (/agent session 47a25faa, opencode): a g4f relay
+# server whose own backend was Pollinations answered HTTP 200 with the
+# BACKEND's billing notice as the message content -- "The API key used for this
+# request has reached its budget. Please [raise the key budget](https://enter.
+# pollinations.ai/edit-key?id=...), then try again." -- and the hub served it
+# as the answer. The user then asked why the agent talked about Pollinations.
+# A notice addressed to the API CALLER (quota, budget, credits, rate limit) is
+# never an answer to the user's question: the whole reply is junk (cut at 0,
+# no salvage), so the hop fails over like any other non-answer.
+_NOTICE_MAX_CHARS = 1200        # a notice is short; a long answer MENTIONING one is not
+_NOTICE_RE = re.compile(
+    r"\b(?:the|your|this) api key\b[^.\n]{0,60}\b(?:has )?(?:reached|exceeded|run out|"
+    r"exhausted|hit)\b|"
+    r"\b(?:raise|increase|top[- ]?up|upgrade|add (?:more )?)\s*(?:the |your )?(?:key )?"
+    r"(?:budget|balance|credits?|plan|quota|wallet|funds)\b|"
+    r"\b(?:insufficient|not enough|out of|no (?:more )?)\s*(?:credits?|balance|funds|quota)\b|"
+    r"\byou (?:have )?exceeded your (?:current |daily |monthly )?(?:quota|limit|budget)\b|"
+    r"\brate[- ]limit(?:ed)?\b[^.\n]{0,40}\b(?:exceeded|reached|hit)\b|"
+    r"\b(?:has|have) reached (?:its|your|the) (?:budget|quota|limit|credit limit)\b", re.I)
+# ...and it must be addressed to the caller of an API, not be prose about one.
+_NOTICE_CALLER_RE = re.compile(
+    r"https?://\S+|\bapi key\b|\bthis request\b|\byour (?:account|plan|key|wallet)\b|"
+    r"\bbilling\b|\btry again\b", re.I)
+# A question ABOUT these things legitimately gets an answer that uses the words.
+_NOTICE_TOPIC_RE = re.compile(
+    r"\bbudget|\bquota|\bbilling|\bcredits?\b|\brate[- ]?limit|\bapi[- ]?keys?\b|"
+    r"\bwallet", re.I)
+
+
+def _provider_notice(masked, prompt_text):
+    """0 when the whole reply is an upstream quota/billing/rate-limit notice
+    addressed to the API caller, else None. Judged on the code-masked text,
+    skipped when the user's own prompt is about those topics."""
+    head = (masked or "").strip()
+    if not head or len(head) > _NOTICE_MAX_CHARS:
+        return None
+    if prompt_text and _NOTICE_TOPIC_RE.search(_instruction(str(prompt_text)) or ""):
+        return None
+    if not _NOTICE_RE.search(head[:400]):
+        return None
+    return 0 if _NOTICE_CALLER_RE.search(head) else None
+
+
+def is_provider_notice(text, prompt_text=None):
+    """Public form of the notice check (see _provider_notice). Never raises."""
+    try:
+        return isinstance(text, str) and _provider_notice(_mask_code(text), prompt_text) == 0
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _meta_leak(masked, text, prompt_text, at_start=True):
     """Offset of leaked metadata/template junk in `text` (indices shared with
     `masked`), or None. `at_start`: `text` is the reply's head, so the
@@ -1206,6 +1260,8 @@ def reads_as_answer(text, *, last_prompt=None):
                     return False
         if _EARLY_MARKER_RE.search(text):
             return False
+        if is_provider_notice(text, last_prompt):
+            return False
         words = text.split()
         if len(words) < _EARLY_MIN_WORDS:
             return False
@@ -1269,6 +1325,8 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
                                        _special_token_junk(body, prompt_text))),
             ("metadata_leak", lambda: _meta_leak(masked, body, prompt_text,
                                                  at_start=offset == 0)),
+            ("provider_notice", lambda: (None if offset else
+                                         _provider_notice(masked, last_prompt))),
         )
         for reason, fn in checks:
             cut = fn()

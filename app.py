@@ -8621,11 +8621,102 @@ def _history_has_tool_calls(messages):
     return False
 
 
+# Gemini's thought-signature validator can be told to skip a tool call it did
+# not sign -- history from another model, or its own call whose signature the
+# client dropped (opencode/codex do not round-trip `extra_content`). The value
+# is Google's own skip sentinel for exactly this; sent in the OpenAI-compatible
+# shape, extra_content.google.thought_signature on the tool call.
+# MEASURED 2026-09-28 on generativelanguage /v1beta/openai, gemini-flash-latest:
+# a foreign `call_abc123` in history + this value -> HTTP 200, answered from
+# the tool result. WHY IT MATTERS: the hard exclusion below kept Google out of
+# EVERY /agent turn after the first (all of them carry tool calls), and on
+# 2026-09-28 15:13-15:28 that left a 54K-token opencode session with nvidia
+# (stalling), dahl/openrouter (429) and tokenrouter (503): four 504s, then a
+# failed turn -- while Google had 569 of 600 requests left.
+_GEMINI_SKIP_SIGNATURE = "skip_thought_signature_validator"
+# If Google ever refuses the sentinel (a thought_signature 400 on a payload
+# that carried it), the old exclusion comes back for this long, then re-tries.
+_GEMINI_SIG_RETRY_SECONDS = 24 * 3600
+_gemini_sig_rejected_at = [0.0]
+
+
+def _gemini_signature_rejected():
+    at = _gemini_sig_rejected_at[0]
+    return bool(at) and (time.time() - at) < _GEMINI_SIG_RETRY_SECONDS
+
+
+def _tool_call_has_gemini_signature(tc):
+    try:
+        return bool(((tc.get("extra_content") or {}).get("google") or {})
+                    .get("thought_signature"))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _with_gemini_history_signatures(payload):
+    """`payload` with the skip sentinel on the FIRST tool call of every
+    assistant step that carries no signature at all (Gemini validates the
+    first functionCall of each step; a step whose call is already signed --
+    a real Gemini signature a client kept -- is left alone). Only for the
+    Google hop: other providers never see `extra_content`. Returns the same
+    object when nothing changes. Never raises."""
+    try:
+        msgs = payload.get("messages") if isinstance(payload, dict) else None
+        if not isinstance(msgs, list) or _gemini_signature_rejected():
+            return payload
+        out, changed = [], False
+        for m in msgs:
+            tcs = m.get("tool_calls") if isinstance(m, dict) and m.get("role") == "assistant" else None
+            if (isinstance(tcs, list) and tcs and isinstance(tcs[0], dict)
+                    and not any(isinstance(tc, dict) and _tool_call_has_gemini_signature(tc)
+                                for tc in tcs)):
+                first = dict(tcs[0])
+                extra = dict(first.get("extra_content") or {})
+                extra["google"] = dict(extra.get("google") or {},
+                                       thought_signature=_GEMINI_SKIP_SIGNATURE)
+                first["extra_content"] = extra
+                m = dict(m, tool_calls=[first] + list(tcs[1:]))
+                changed = True
+            out.append(m)
+        if not changed:
+            return payload
+        payload = dict(payload)
+        payload["messages"] = out
+        return payload
+    except Exception:                                            # noqa: BLE001
+        return payload
+
+
+def _note_gemini_signature_rejection(pid, payload, resp):
+    """A thought_signature 400 from Google on a payload that carried the skip
+    sentinel: Google stopped accepting it, so tool continuations go back to
+    being routed away from Google (see _exclude_google_for_foreign_tool_history)
+    for _GEMINI_SIG_RETRY_SECONDS. Never raises."""
+    try:
+        if pid != "google" or not isinstance(payload, dict):
+            return
+        carried = any(_tool_call_has_gemini_signature(tc)
+                      for m in payload.get("messages") or ()
+                      if isinstance(m, dict)
+                      for tc in (m.get("tool_calls") or ()) if isinstance(tc, dict))
+        if carried and _SOFT_400_TOOL_RE.search(resp.text or ""):
+            _gemini_sig_rejected_at[0] = time.time()
+            _log.warning("[gemini] thought_signature 400 despite the skip value -- "
+                         "tool continuations avoid Google for %dh",
+                         _GEMINI_SIG_RETRY_SECONDS // 3600)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _exclude_google_for_foreign_tool_history(pids, require_tools, messages):
     """Drop 'google' from a candidate provider list when this is a tool-calling
-    continuation (see _history_has_tool_calls) — fail-open if that would empty
-    the pool (google is the only option left)."""
+    continuation (see _history_has_tool_calls) AND Google has refused the skip
+    signature recently (see _GEMINI_SKIP_SIGNATURE -- normally every unsigned
+    tool call in the history is sent with it, so Google stays a candidate).
+    Fail-open if that would empty the pool (google is the only option left)."""
     if not require_tools or "google" not in pids or not _history_has_tool_calls(messages):
+        return pids
+    if not _gemini_signature_rejected():
         return pids
     filtered = [p for p in pids if p != "google"]
     return filtered or pids
@@ -12129,6 +12220,10 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         if isinstance(mt, int) and mt < 16:
             payload = dict(payload)
             payload["max_tokens"] = 16
+    # Gemini refuses a tool call in history that it did not sign unless the
+    # call carries its skip value (see _GEMINI_SKIP_SIGNATURE).
+    if pid == "google":
+        payload = _with_gemini_history_signatures(payload)
     # Puter speaks a DRIVER protocol, not OpenAI-over-HTTP — its
     # /chat/completions surface 403s the app tokens this hub can obtain. The
     # branch lives HERE, not only in _dispatch_chat, so every caller (the key
@@ -12295,6 +12390,7 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             # Not loaded THIS minute (see _NOT_OFFERED_RE): a short skip only.
             _note_not_offered(pid, payload.get("model"))
         elif resp.status_code == 400:             # learn a small context window from the error
+            _note_gemini_signature_rejection(pid, payload, resp)
             _learn_context_limit(pid, payload.get("model"), resp)
             _maybe_mark_missing_model(pid, payload.get("model"), resp)  # gone/renamed id -> sideline
         if resp.status_code == 413:               # 'too large for this model's TPM' -> learn the cap
@@ -12463,10 +12559,10 @@ def _retryable_relay_status(status):
 #   - a small-context model rejecting a request that's too big for its window
 #     ("context_length_exceeded" / "reduce the length of the messages")
 #   - Gemini's 400 "missing thought_signature in functionCall parts" on
-#     multi-turn tool use — a protocol quirk of GEMINI'S OWN tool-calling
-#     continuity that a stateless proxy cannot repair by editing the payload
-#     (the signature must come from a prior Gemini turn the hub never saw).
-#     The fix is routing around it, not patching the payload.
+#     multi-turn tool use. Since 2026-09-28 the Google hop carries Google's
+#     skip value on unsigned calls (_with_gemini_history_signatures); this
+#     400 now means Google refused it, which _note_gemini_signature_rejection
+#     turns back into routing around Google for a while.
 # Both must fall through to the next chain hop SILENTLY instead of being
 # replayed to the CLI as `last_hard` once the chain is exhausted — surfacing
 # either one just breaks the CLI's turn for a cause it can't act on, when a
@@ -13475,10 +13571,108 @@ class _HopErrors(list):
 
 def _activity_done(act, status, http=None):
     with _activity_lock:
-        if act.get("finished") is None:
-            act["status"] = status
-            act["http"] = http
-            act["finished"] = time.time()
+        if act.get("finished") is not None:
+            return
+        act["status"] = status
+        act["http"] = http
+        act["finished"] = time.time()
+    _note_agent_upstream(act)
+
+
+# --------------------------------------------------------------------------- #
+# /agent sessions whose requests the hub could not serve
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-09-28 15:02-15:27, session 47a25faa (opencode, ~54K tokens):
+# four requests in a row ended 504 at the request deadline (no model that could
+# hold the conversation answered in time); opencode retried each one silently,
+# so the /agent watchdog saw 420 s of nothing, said "looks wedged, resuming",
+# resumed into the same outage and failed after 25 minutes with no reason given.
+# The hub KNOWS why: this ledger lets the watchdog say so and stop instead of
+# resuming blindly (agentic_chat.set_upstream_probe).
+# sid -> {"fails": [(ts, seq, http, why)], "ok_seq": seq}. ORDER is a sequence
+# number, not the clock: Windows' time.time() ticks every ~15 ms, so a success
+# right after a failure could carry the same timestamp.
+_AGENT_UPSTREAM = {}
+_AGENT_UPSTREAM_KEEP = 12            # failures kept per session
+_AGENT_UPSTREAM_SESSIONS = 200       # sessions kept (oldest dropped)
+_agent_upstream_lock = threading.Lock()
+_agent_upstream_seq = [0]
+_HOP_FAIL_WORDS = (
+    (re.compile(r"HopBudget|timeout|Timeout|deadline", re.I), "too slow"),
+    (re.compile(r"HTTP 429"), "rate-limited"),
+    (re.compile(r"ContextOverflow|413"), "conversation too long for it"),
+    (re.compile(r"HTTP 5\d\d"), "server error"),
+    (re.compile(r"HTTP 40[13]"), "key refused"),
+    (re.compile(r"HTTP 404"), "model unavailable"),
+    (re.compile(r"no content|nonanswer|empty", re.I), "sent no answer"),
+)
+
+
+def _hops_failure_summary(hops):
+    """'nvidia: too slow; dahl: rate-limited' from an activity row's hop list
+    ("pid/model ! pid: reason" strings). Never raises."""
+    try:
+        by_pid = {}
+        for h in hops or ():
+            if not isinstance(h, str) or " ! " not in h:
+                continue
+            pid = h.split("/", 1)[0].strip()
+            why = h.split(" ! ", 1)[1]
+            label = next((w for rx, w in _HOP_FAIL_WORDS if rx.search(why)), "failed")
+            labels = by_pid.setdefault(pid, [])
+            if label not in labels:
+                labels.append(label)
+        return "; ".join("%s: %s" % (p, ", ".join(ls)) for p, ls in by_pid.items())[:300]
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _note_agent_upstream(act):
+    """Record how an /agent session's request ended: ok clears the outage,
+    a 502/503/504 error (the chain found no model in time) is a failure.
+    Never raises."""
+    try:
+        sid = act.get("session")
+        if not sid:
+            return
+        status, http = act.get("status"), act.get("http")
+        now = time.time()
+        with _agent_upstream_lock:
+            _agent_upstream_seq[0] += 1
+            seq = _agent_upstream_seq[0]
+            rec = _AGENT_UPSTREAM.pop(sid, None) or {"fails": [], "ok_seq": 0}
+            if status == "ok":
+                rec["ok_seq"] = seq
+            elif status == "error" and http in (502, 503, 504):
+                rec["fails"] = (rec["fails"] + [
+                    (now, seq, http, _hops_failure_summary(act.get("hops")))
+                ])[-_AGENT_UPSTREAM_KEEP:]
+            _AGENT_UPSTREAM[sid] = rec           # re-inserted: most recent last
+            while len(_AGENT_UPSTREAM) > _AGENT_UPSTREAM_SESSIONS:
+                _AGENT_UPSTREAM.pop(next(iter(_AGENT_UPSTREAM)))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _agent_upstream_probe(sid, since):
+    """For agentic_chat's watchdog: the requests of session `sid` the hub
+    could not serve since wall time `since`, or None. {"failures": n,
+    "http": last status, "why": last hop summary, "ok_after": a request
+    succeeded after the last failure}."""
+    try:
+        with _agent_upstream_lock:
+            rec = _AGENT_UPSTREAM.get(sid)
+            fails = [f for f in (rec or {}).get("fails", ()) if f[0] >= since]
+            ok_seq = (rec or {}).get("ok_seq", 0)
+        if not fails:
+            return None
+        return {"failures": len(fails), "http": fails[-1][2], "why": fails[-1][3],
+                "ok_after": ok_seq > fails[-1][1]}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+agentic_chat.set_upstream_probe(_agent_upstream_probe)
 
 
 def _build_sid():
@@ -13597,6 +13791,7 @@ def _activity_before():
             # a script, another tool.
             "source": "build" if _build_sid() else "cli",
             "project": _build_project(),
+            "session": _build_sid(),
             "model_req": model_req if isinstance(model_req, str) else None,
             "provider": None, "model": None, "status": "in_progress",
             "http": None, "stream": False,

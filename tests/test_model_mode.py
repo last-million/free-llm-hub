@@ -182,20 +182,24 @@ def test_a_session_mode_becomes_the_model_id():
     assert AC._session_model_id(s) == "coding"
 
 
-def test_a_mode_outranks_the_quality_tier():
-    """"max" only says never the cheap models; "coding" says which KIND. A user
-    who picked a mode for this project asked for that kind."""
+def test_a_mode_and_the_quality_tier_are_both_kept():
+    """"coding" says which KIND, "max" says never the cheap ones: the compound
+    id carries both (it used to be bare "coding" -- the Normal tier; MEASURED
+    2026-09-28, a Max + coding session was served by a 2.6B model)."""
     s = _Sess()
     s.quality, s.mode = "max", "coding"
-    assert AC._session_model_id(s) == "coding"
+    assert AC._session_model_id(s) == "coding-max"
+    assert A._split_category_effort("coding-max") == ("coding", "max")
 
 
-def test_the_swarm_pipeline_outranks_a_mode():
+def test_the_swarm_pipeline_keeps_the_mode():
     """Routing a fan-out as a single model would silently switch the feature
-    off."""
+    off -- and dropping the mode would switch the category off: the compound
+    keeps both."""
     s = _Sess()
     s.quality, s.mode = "swarm", "coding"
-    assert AC._session_model_id(s) == "swarm"
+    assert AC._session_model_id(s) == "coding-swarm"
+    assert A._split_category_effort("coding-swarm") == ("coding", "swarm")
 
 
 def test_quality_alone_still_works():

@@ -891,6 +891,51 @@ def set_window_provider(fn):
     _window_provider = fn if callable(fn) else None
 
 
+# --------------------------------------------------------------------------- #
+# Silence explained by the hub itself: no model could serve the turn
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-09-28 (session 47a25faa, opencode, ~54K tokens): the CLI's
+# requests kept ending 504 at the hub's deadline and it retried them silently,
+# so the watchdog said "looks wedged, resuming", resumed into the same outage
+# and failed 25 minutes in with no reason. app.py registers a probe over its
+# per-session ledger; when the silence is fully explained by requests the hub
+# could not serve, the turn stops with that reason instead of resuming.
+_upstream_probe = None
+
+
+def set_upstream_probe(fn):
+    """Register `fn(session_id, since_wall_ts) -> dict | None` (see
+    app._agent_upstream_probe). Pass None to unregister."""
+    global _upstream_probe
+    _upstream_probe = fn if callable(fn) else None
+
+
+def _upstream_outage(sess, since_wall):
+    """The probe's report when this session's requests failed to find a model
+    since `since_wall` and none succeeded after, else None. Never raises."""
+    fn = _upstream_probe
+    if fn is None:
+        return None
+    try:
+        rep = fn(getattr(sess, "id", None), since_wall)
+    except Exception:                                            # noqa: BLE001
+        return None
+    if not isinstance(rep, dict) or not rep.get("failures") or rep.get("ok_after"):
+        return None
+    return rep
+
+
+def outage_detail(cli_id, rep):
+    """The failure text for a turn stopped by _upstream_outage."""
+    why = str(rep.get("why") or "").strip()
+    n = int(rep.get("failures") or 0)
+    return ("No free model could answer this turn: %s request%s in a row found no "
+            "model in time%s. Nothing is wrong with your project -- the models that "
+            "can hold this conversation were all busy or failing. Send \"continue\" "
+            "in a few minutes to pick up where %s stopped."
+            % (n, "" if n == 1 else "s", (" (%s)" % why) if why else "", cli_id))
+
+
 def declared_window(model_id=None):
     """The context window to tell a CLI for hub id `model_id` (auto, best,
     a category, a compound like coding-swarm, or None for auto). Always an
@@ -2062,13 +2107,16 @@ def _hub_model_for(quality: str = None, mode: str = None) -> str:
     "auto" is ordinary routing. Anything unrecognised falls back to auto rather
     than inventing a model name nothing serves."""
     if mode:
-        # A MODE is more specific than a quality tier: "max" only says never the
-        # cheap models, while "coding" says which KIND. A user who picked a mode
-        # for this project asked for that kind, so it wins. "swarm" is not a
-        # mode but a PIPELINE, and keeps precedence over both -- routing a
-        # fan-out as a single model would silently turn the feature off.
-        if (quality or "normal") == "swarm":
-            return "swarm"
+        # BOTH axes, as the compound the pickers list ("coding-max",
+        # "coding-swarm", see _OPENCODE_COMPOUND_TIERS; app routes it with
+        # _split_category_effort). It used to return the bare mode for "max"
+        # and bare "swarm" for swarm, dropping one of the two choices.
+        # MEASURED 2026-09-28, session 47a25faa (Max + coding): every request
+        # asked for "coding" -- the Normal tier -- and two agent turns were
+        # served by liquid/lfm-2.5-2.6b, a 2.6B model.
+        q = quality or "normal"
+        if q in ("max", "swarm"):
+            return "%s-%s" % (mode, q)
         return mode
     # "multi" is not a model either: the message becomes a swarm_windows run
     # and the workers carry their own modes. The parent session itself rarely
@@ -3871,6 +3919,15 @@ def send_message_stream(session_id, text):
                     continue
                 if diag:
                     yield err(504, agent_servers.failure_detail(sess.cli_id, diag)); return
+                # SILENT BECAUSE NO MODEL COULD SERVE IT (see _upstream_outage):
+                # resuming would send the same conversation into the same
+                # outage, so stop and say why.
+                outage = (_upstream_outage(sess, last_line_wall[0]) if stalled[0] else None)
+                if outage:
+                    _log.warning("agentic turn stopped: %d request(s) found no model "
+                                 "(session=%s cli=%s why=%s)", outage.get("failures", 0),
+                                 getattr(sess, "id", "?"), sess.cli_id, outage.get("why"))
+                    yield err(503, outage_detail(sess.cli_id, outage)); return
                 if not timeout_retry_used:
                     timeout_retry_used = True
                     # Not about a server this time: the request itself again,

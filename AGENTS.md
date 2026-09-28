@@ -979,6 +979,41 @@ spawn one per CLI turn, which is worse) and HTTP fan-out threads (no real
 RAM). `GET/POST /api/low-resource {mode}`; Settings `#lowres-group`.
 `tests/conftest.py` pins a roomy machine for every test.
 
+## /agent outage fixes (2026-09-28, session 47a25faa)
+
+Live: an opencode Max + coding session (~54K tokens) failed after 25 min —
+four 504s at the request deadline (nvidia stalling, dahl/openrouter 429,
+tokenrouter 503, small models too short), opencode retrying silently, the
+watchdog resuming blindly. Earlier a g4f relay (Pollinations backend) served a
+billing notice as the answer.
+
+- **Google on tool continuations** (`tests/test_gemini_tool_history.py`):
+  Google used to be HARD-excluded from any request whose history had a tool
+  call (Gemini 400s unsigned calls) — i.e. from every /agent turn after the
+  first. The Google hop now carries Google's skip value
+  `skip_thought_signature_validator` as `extra_content.google.thought_signature`
+  on the first unsigned call of each assistant step
+  (`_with_gemini_history_signatures`, in `_upstream_chat`, google only;
+  MEASURED 200 on gemini-flash-latest). A thought_signature 400 on a payload
+  that carried it (`_note_gemini_signature_rejection`) restores the exclusion
+  for `_GEMINI_SIG_RETRY_SECONDS` (24 h).
+- **Provider notices** (`tests/test_provider_notice.py`): answer_check
+  `provider_notice` — a reply <= 1200 chars that is a quota/budget/credits/
+  rate-limit notice addressed to the API caller (URL, "api key", "this
+  request", "try again"...) is junk (cut at 0, no salvage), unless the user's
+  own prompt is about those topics; `reads_as_answer` never releases one.
+- **Outage stop** (`tests/test_agent_upstream_outage.py`): every activity row
+  carries `session` (`_build_sid`); `_activity_done` feeds
+  `_note_agent_upstream` (ok / 502-504 error per /agent session, ordered by a
+  sequence number, not the ~15 ms Windows clock). `agentic_chat` asks
+  `_agent_upstream_probe` at the 420 s stall: if the silence is explained by
+  requests the hub could not serve (and none succeeded after), the turn ends
+  503 with `outage_detail` (the providers and why, "send continue in a few
+  minutes") instead of "looks wedged, resuming".
+- **Mode + quality**: `_hub_model_for` sends the compound (`coding-max`,
+  `coding-swarm`) instead of dropping one axis; it used to send bare `coding`
+  (Normal tier) for Max + coding, and two turns were served by a 2.6B model.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
