@@ -997,7 +997,10 @@ billing notice as the answer.
   MEASURED 200 on gemini-flash-latest). A thought_signature 400 on a payload
   that carried it (`_note_gemini_signature_rejection`) restores the exclusion
   for `_GEMINI_SIG_RETRY_SECONDS` (24 h).
-- **Provider notices** (`tests/test_provider_notice.py`): answer_check
+- **Provider notices** (`tests/test_provider_notice.py`, RELAY hops only --
+  `inspect(relay=)` / `reads_as_answer(relay=)`, set from `_is_relay_pid`
+  by the three gates; a direct provider reports quota as an HTTP error, and a
+  real answer about the user's OWN API quota must pass): answer_check
   `provider_notice` — a reply <= 1200 chars that is a quota/budget/credits/
   rate-limit notice addressed to the API caller (URL, "api key", "this
   request", "try again"...) is junk (cut at 0, no salvage), unless the user's

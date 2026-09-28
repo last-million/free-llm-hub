@@ -1242,7 +1242,7 @@ _EARLY_MARKER_RE = re.compile(r"<\s*/?\s*(?:think|thinking|tool_call|arg_)|<\||\
                               r"\bThought:|Thinking content", re.I)
 
 
-def reads_as_answer(text, *, last_prompt=None):
+def reads_as_answer(text, *, last_prompt=None, relay=False):
     """True when `text` (the start of a streamed reply, no finish yet) already
     reads as a normal answer: >= EARLY_MIN_CHARS of varied words, no glued
     run, no reasoning/template marker, and the prompt does not constrain the
@@ -1260,7 +1260,7 @@ def reads_as_answer(text, *, last_prompt=None):
                     return False
         if _EARLY_MARKER_RE.search(text):
             return False
-        if is_provider_notice(text, last_prompt):
+        if relay and is_provider_notice(text, last_prompt):
             return False
         words = text.split()
         if len(words) < _EARLY_MIN_WORDS:
@@ -1278,7 +1278,7 @@ def reads_as_answer(text, *, last_prompt=None):
 
 
 def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
-            last_prompt=None, partial=False):
+            last_prompt=None, partial=False, relay=False):
     """Judge one answer's text.
 
     Returns {"ok": bool, "reasons": [...], "salvage": str|None}. `reasons` may
@@ -1325,7 +1325,10 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
                                        _special_token_junk(body, prompt_text))),
             ("metadata_leak", lambda: _meta_leak(masked, body, prompt_text,
                                                  at_start=offset == 0)),
-            ("provider_notice", lambda: (None if offset else
+            # RELAY hops only (`relay`): a direct provider reports its quota
+            # as an HTTP error, and a real answer explaining the user's OWN
+            # API quota must never be taken for a notice.
+            ("provider_notice", lambda: (None if offset or not relay else
                                          _provider_notice(masked, last_prompt))),
         )
         for reason, fn in checks:

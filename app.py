@@ -28341,7 +28341,8 @@ def _answer_gate(data, payload, has_tools, hop=None):
         verdict = answer_check.inspect(
             content, prompt_text=_prompt_text_for_check(payload),
             tools_offered=bool(has_tools), finish_reason=choice.get("finish_reason"),
-            last_prompt=_last_user_text_for_check(payload))
+            last_prompt=_last_user_text_for_check(payload),
+            relay=bool(hop) and _is_relay_pid(hop[0]))
         if verdict.get("ok"):
             strikes = _answer_quality_strikes(verdict.get("reasons"))
             if strikes and hop and len(hop) == 2:
@@ -28381,7 +28382,8 @@ def _record_stream_outcome(pid, model, text, *, tool_calls=False,
                 return
             v = answer_check.inspect(
                 text, prompt_text=prompt_text, tools_offered=tools_offered,
-                finish_reason=finish_reason, last_prompt=last_prompt)
+                finish_reason=finish_reason, last_prompt=last_prompt,
+                relay=_is_relay_pid(pid))
             ok = v.get("ok", True)
             strikes = _answer_quality_strikes(v.get("reasons")) if ok else []
         # A stream that failed the gate degenerated: a junk strike, not a miss.
@@ -28724,7 +28726,7 @@ class _StreamAnswerGate:
             v = answer_check.inspect(
                 self._text, prompt_text=self._prompt, tools_offered=self._tools,
                 finish_reason=fin, last_prompt=self._last_prompt,
-                partial=partial and not fin)
+                partial=partial and not fin, relay=_is_relay_pid(self._pid))
         except Exception:                                        # noqa: BLE001
             return None
         if v.get("ok", True):
@@ -28744,7 +28746,8 @@ class _StreamAnswerGate:
         self._early_at = self._len
         try:
             return answer_check.reads_as_answer(self._text,
-                                                last_prompt=self._last_prompt)
+                                                last_prompt=self._last_prompt,
+                                                relay=_is_relay_pid(self._pid))
         except Exception:                                        # noqa: BLE001
             return False
 
