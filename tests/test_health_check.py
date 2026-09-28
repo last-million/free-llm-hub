@@ -317,3 +317,42 @@ def test_settings_ui_has_button_progress_and_escaped_report():
     assert "Last run: " in body          # the report carries its date
     # No raw interpolation of report fields into markup.
     assert not re.search(r"'>' \+ (r|d|f|k|p|s|rep)\.", body)
+
+
+def test_policy_refusal_and_server_outage_are_not_dead_keys(fakes, monkeypatch):
+    # Live 2026-09-28: opencode-zen 403 "free tier can only be used from within
+    # OpenCode" on every key; tokenrouter 503 "No available channel" on every key.
+    monkeypatch.setattr(app, "_health_enabled_providers", lambda: [
+        ("zen", "Zen AI", True, True), ("router", "Router AI", True, True),
+        ("half", "Half AI", True, True)])
+    pre = "Key authenticates and lists models, but generation FAILS on every candidate tried: "
+    results = {
+        "zen": {"ok": False, "detail": "None of the 2 keys work.", "keys": [
+            {"index": i, "masked": "k", "ok": False, "detail": pre +
+             "HTTP 403: Zen's free tier can only be used from within Zen"} for i in range(2)]},
+        "router": {"ok": False, "detail": "None of the 2 keys work.", "keys": [
+            {"index": i, "masked": "k", "ok": False, "detail": pre +
+             "HTTP 503: No available channel for model x-free"} for i in range(2)]},
+        "half": {"ok": True, "detail": "1 of 3 keys work.", "keys": [
+            {"index": 0, "masked": "k", "ok": True},
+            {"index": 1, "masked": "k", "ok": False, "detail": "HTTP 502: bad gateway"},
+            {"index": 2, "masked": "k", "ok": False, "detail": "HTTP 403: no permission"}]},
+    }
+    monkeypatch.setattr(app, "_health_test_provider", lambda pid: dict(results[pid]))
+    s = app._health_run(threading.Event())["summary"]
+    assert [b["id"] for b in s["blocked"]] == ["zen"]
+    assert [f["id"] for f in s["failing"]] == ["router"]
+    assert "HTTP 503: No available channel" in s["failing"][0]["detail"]
+    dead = {d["id"]: d for d in s["dead_keys"]}
+    assert set(dead) == {"half"}
+    assert [k["index"] for k in dead["half"]["keys"]] == [2]   # the 502 is the provider's
+    recs = "\n".join(s["recommendations"])
+    assert "Zen AI refuses third-party apps" in recs and "disable it" in recs
+    assert "Zen AI: its keys failed" not in recs and "Router AI: its keys" not in recs
+    assert "Router AI failed its test" in recs
+
+
+def test_settings_ui_lists_blocked_providers():
+    src = open(os.path.join(os.path.dirname(__file__), "..", "templates", "index.html"),
+               encoding="utf-8").read()
+    assert "s.blocked" in src

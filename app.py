@@ -14873,6 +14873,17 @@ _HEALTH_AUTH_RE = re.compile(
     r"\b(401|403)\b|unauthori[sz]ed|invalid[ _-]?(api[ _-]?)?key|api key|"
     r"expired|revoked|forbidden|out of funds|insufficient[ _-]?(funds|credit|balance)|"
     r"keys? (is|are) rejected|none of the \d+ keys work", re.I)
+# Live 2026-09-28: opencode-zen answers every key 403 "OpenCode's free tier can
+# only be used from within OpenCode". The key is fine; the PROVIDER refuses
+# third-party clients. Replacing keys cannot help and impersonating the app is
+# off the table, so it is reported as "blocked", not as dead keys.
+_HEALTH_POLICY_RE = re.compile(
+    r"can only be used (from )?(within|inside|in) |only (available|usable) (from |in |inside |within )"
+    r"|not (allowed|permitted|supported) (outside|from third|for third)"
+    r"|third[- ]party (clients?|apps?|applications?|tools?) (are )?not", re.I)
+# Live 2026-09-28: tokenrouter answered every key 503 "No available channel for
+# model ...": the provider is down, the keys are not dead.
+_HEALTH_5XX_RE = re.compile(r"\bHTTP 5\d\d\b")
 _HEALTH_TOOL_NAME = "get_utc_time"
 _health_lock = threading.Lock()
 _health_cancel = threading.Event()
@@ -14966,7 +14977,27 @@ def _health_key_failures(result, has_key):
         # A single key whose models listing already failed never reaches the
         # per-key breakdown; the provider verdict IS that key's verdict.
         bad = [{"index": 0, "masked": "", "detail": _sanitize(result.get("detail") or "", 240)}]
+    for k in bad:
+        k["kind"] = _health_failure_kind(k["detail"])
     return bad
+
+
+def _health_failure_kind(detail):
+    """'policy' (the provider refuses this client, not the key), 'server'
+    (a 5xx: the provider is down) or 'key' (anything else: the key itself)."""
+    detail = str(detail or "")
+    if _HEALTH_POLICY_RE.search(detail):
+        return "policy"
+    if _HEALTH_5XX_RE.search(detail) and not re.search(r"\bHTTP (401|403)\b", detail):
+        return "server"
+    return "key"
+
+
+def _health_failure_excerpt(detail):
+    """The 'HTTP NNN: ...' part of a long per-key verdict, else its tail."""
+    detail = str(detail or "")
+    m = re.search(r"HTTP \d{3}.*", detail)
+    return (m.group(0) if m else detail)[:160]
 
 
 def _health_v1_headers():
@@ -15118,12 +15149,19 @@ def _health_window_coverage():
 
 def _health_summarize(providers, routing, windows):
     working = [p["id"] for p in providers if p["status"] == "ok"]
-    dead_keys = [{"id": p["id"], "name": p["name"], "keys": p["bad_keys"],
+    def key_bad(p):
+        # Only failures of the KEY itself: a 5xx or a client-policy refusal is
+        # the provider's, and replacing the key would not change it.
+        return [k for k in p.get("bad_keys") or () if k.get("kind", "key") == "key"]
+    dead_keys = [{"id": p["id"], "name": p["name"], "keys": key_bad(p),
                   "all_dead": p["status"] != "ok"}
-                 for p in providers if p.get("bad_keys") and (
+                 for p in providers if key_bad(p) and not p.get("policy_block") and (
                      p["status"] == "ok" or p.get("auth_failure"))]
+    blocked = [{"id": p["id"], "name": p["name"], "detail": p["detail"]}
+               for p in providers if p.get("policy_block")]
     failing = [{"id": p["id"], "name": p["name"], "detail": p["detail"]}
-               for p in providers if p["status"] == "failed" and not p.get("auth_failure")]
+               for p in providers if p["status"] == "failed"
+               and not p.get("auth_failure") and not p.get("policy_block")]
     no_key = [p["id"] for p in providers if p.get("reason") == "no_key"]
     skipped = [{"id": p["id"], "reason": p["reason"], "detail": p["detail"]}
                for p in providers if p["status"] == "skipped" and p["reason"] != "no_key"]
@@ -15143,6 +15181,10 @@ def _health_summarize(providers, routing, windows):
             recs.append("%s: remove the dead key%s %s -- routing still spends a hop on %s."
                         % (d["name"], "" if len(d["keys"]) == 1 else "s", idx,
                            "it" if len(d["keys"]) == 1 else "them"))
+    for b in blocked:
+        recs.append("%s refuses third-party apps (%s) -- the keys are fine, but the hub "
+                    "cannot use it without pretending to be that app; disable it."
+                    % (b["name"], _health_failure_excerpt(b["detail"])[:120]))
     for f in failing:
         recs.append("%s failed its test (%s) -- re-test later; if it keeps failing, disable it."
                     % (f["name"], f["detail"][:120]))
@@ -15160,7 +15202,7 @@ def _health_summarize(providers, routing, windows):
                         "guesses a default for them)." % (unknown, windows["total"]))
     if not working and providers:
         recs.append("No enabled provider passed its test -- add a working key first.")
-    return {"working": working, "dead_keys": dead_keys, "failing": failing,
+    return {"working": working, "dead_keys": dead_keys, "blocked": blocked, "failing": failing,
             "no_key": no_key, "skipped": skipped,
             "routing_ok": sum(1 for r in routing if r.get("ok")),
             "routing_total": len(routing), "recommendations": recs}
@@ -15193,10 +15235,20 @@ def _health_run(cancel):
                     row["status"] = "ok" if res.get("ok") else "failed"
                     row["detail"] = _sanitize(res.get("detail") or "", 300)
                     row["bad_keys"] = _health_key_failures(res, has_key)
+                    kinds = {k["kind"] for k in row["bad_keys"]}
+                    row["policy_block"] = bool(
+                        row["status"] == "failed" and
+                        ("policy" in kinds or _HEALTH_POLICY_RE.search(row["detail"])))
+                    key_bad = [k for k in row["bad_keys"] if k["kind"] == "key"]
                     row["auth_failure"] = bool(
-                        row["status"] == "failed" and row["bad_keys"]
+                        row["status"] == "failed" and key_bad and not row["policy_block"]
                         and (_HEALTH_AUTH_RE.search(row["detail"]) or
-                             any(_HEALTH_AUTH_RE.search(k["detail"]) for k in row["bad_keys"])))
+                             any(_HEALTH_AUTH_RE.search(k["detail"]) for k in key_bad)))
+                    if row["status"] == "failed" and row["bad_keys"] and not row["auth_failure"]:
+                        # "None of the 4 keys work" says nothing; name the cause.
+                        ex = _health_failure_excerpt(row["bad_keys"][0]["detail"])
+                        if ex and ex not in row["detail"]:
+                            row["detail"] = _sanitize("%s (%s)" % (row["detail"], ex), 300)
                 report["providers"].append(row)
                 _health_progress(done=len(report["providers"]))
             if not cancel.is_set():

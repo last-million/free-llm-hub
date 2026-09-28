@@ -932,6 +932,11 @@ or an auth-shaped provider failure), failing (non-key), no key, skipped,
 recommendations. Report at `state_dir()/health-check.json`. Never writes a
 setting (the provider test still updates its own test cache). Usage is
 labelled `health-check`. Covered by `tests/test_health_check.py`.
+First live run (2026-09-28, 859 s, routing 4/4): each failed key gets a
+`kind` (`_health_failure_kind`): `policy` (opencode-zen 403 "free tier can
+only be used from within OpenCode" -> summary `blocked`, recommend disable;
+never spoof the client), `server` (tokenrouter 503 "No available channel" ->
+`failing`, not dead keys) or `key`. Only `key` failures are dead keys.
 
 ## Tests
 

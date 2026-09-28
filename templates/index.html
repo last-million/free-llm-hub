@@ -12287,7 +12287,8 @@
         return '#' + ((k.index || 0) + 1) + (k.masked ? ' (' + k.masked + ')' : '');
       }).join(', ') + (d.all_dead ? ' (no working key)' : '');
     }));
-    html += hcList('Failed (not a key problem)', (s.failing || []).map(function(f){ return f.name + ': ' + f.detail; }));
+    html += hcList('Blocked by the provider (third-party apps refused)', (s.blocked || []).map(function(b){ return b.name + ': ' + b.detail; }));
+    html += hcList('Failed (not a key problem)',(s.failing || []).map(function(f){ return f.name + ': ' + f.detail; }));
     html += hcList('No key saved', s.no_key || []);
     html += hcList('Skipped', (s.skipped || []).map(function(k){ return k.id + ': ' + k.detail; }));
     html += hcList('Routing', (rep.routing || []).map(function(r){
