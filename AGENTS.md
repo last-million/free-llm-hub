@@ -868,6 +868,25 @@ for 420s twice").
   carrying this attempt's marker (never a hub PID, never the preview). The
   server is stopped, not left running: MEASURED, with its pipe reader gone
   `http.server`/print-logging servers answer RemoteDisconnected.
+- **PID / port only** (`tests/test_server_safety.py`; live 2026-09-28, opencode
+  run 1476d09d: `Get-Process | Where-Object {... -like "*app.py*"}` then
+  `Stop-Process -Id` on the result — that filter matches the hub). Every
+  detached spelling also writes `server.pid` (bash `& echo $! > server.pid`,
+  PowerShell/cmd `Start-Process ... -PassThru | Select-Object -ExpandProperty
+  Id | Set-Content server.pid`; measured to return in < 1 s like before). The
+  brief (`stop_examples`) stops only by that PID (`taskkill /PID <pid> /T /F`
+  — MEASURED: the recorded PID is cmd.exe's, `Stop-Process -Id` on it left
+  the server listening; bash: its own `kill`, a `$!` is an MSYS PID) or by the
+  port (`Get-NetTCPConnection -LocalPort N -State Listen`), and forbids any
+  name / command-line search. `resume_instruction` (early and 420 s alike)
+  carries the same guard and still names no kill command.
+- **Brief pointer = absolute path**: same run, opencode's instance dir, session
+  dir and PWD were the temp project folder (opencode log), but the model read
+  a made-up `C:\Users\hamza\Desktop\Projects\opencode-evals\.calvoun-brief-*.md`
+  — the pointer said "This folder contains <name>". It now names
+  `<abs project dir>\<name>` (`_brief_pointer_path`); on the cmd.exe fallback
+  with a message too close to the cap the bare name ships (`_pointer_dir`,
+  keeps the ~8191 budget).
 - **Limitation**: the hub cannot stop an agent shell from killing the hub
   (same user, no privilege to withhold, opencode reports a command only after
   it ran); prevention via the brief is the only defence.
