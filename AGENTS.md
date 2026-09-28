@@ -1037,6 +1037,38 @@ since the last visit, and opens from Settings -> Update -> What changed. Its
 CSS uses theme tokens only; the test measures every text/background pair at
 >= 4.5:1 in both themes (the light `--ok-text` was darkened to #166534 for it).
 
+## The orchestrator (2026-09-28)
+
+Covered by `tests/test_orchestrator.py`. `orchestrator.py` (pure: command
+parser, fuzzy `match_model`, `ConversationStore` at
+`state_dir()/orchestrators.json`, LRU 1000 / 60 days).
+
+- **Why "Set orchestrator" did nothing**: it saved `config.set_default()`,
+  which only resolves BARE/unknown model names; every CLI sends auto / best /
+  a category and those always went through `_route_by_difficulty`. The saved
+  default on the owner's install was AUTO-picked (`_autoselect_default_if_unset`:
+  groq/llama-3.3-70b), so it is deliberately NOT wired into auto traffic.
+- **Two levels**: setting `orchestrator_preferred` ("pid/model", absent =
+  auto) for all conversations; the store keyed by `ctxwin.conversation_key`
+  (`agent:<sid>` for /agent, CLI session header/body id otherwise) for one
+  conversation ("auto" = force auto, absent = follow global).
+  `_apply_orchestrator` runs right after the router on all three protocols;
+  the chosen pair opens the turn, the chain is built behind it, and
+  `_orch_unusable` skips it for that turn (provider off, blocked, not offered,
+  throttled/resting, no tools on a tool turn, no vision on an image turn,
+  window < est) with `[orchestrator] ... skipped` logged.
+- **`/orchestrator` command** (whole last user message, `<system-reminder>`
+  blocks stripped): `_orch_command_response` answers it in the caller's
+  protocol with no model call (provider header `hub`). Forms: `<name>`,
+  `auto`, `all <name>`, `reset`, bare = status. The Build page send route
+  answers it without starting the CLI. opencode Connect writes
+  `command.orchestrator` (template `[free-llm-hub] /orchestrator $ARGUMENTS`),
+  Disconnect removes it; a user's own command of that name is kept.
+- **UI**: Orchestrator page (Auto option; Set and Auto-pick both set the
+  global choice, a model also the bare-name default), Build page
+  `#agent-orchestrator` per conversation. `GET/POST /api/orchestrator
+  {model, session_id?}`.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

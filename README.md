@@ -112,6 +112,25 @@ The hub exposes its routing as **model ids**, so any CLI can pick one with
 
 Codex gets both as its native two-screen picker (model, then reasoning level). The full, live list of modes — with how many models each one currently has — is on the **Settings** page, and at `GET /api/model-mode`.
 
+**Choosing the orchestrator** — the model that answers — works the same way
+everywhere:
+
+```text
+/orchestrator kimi-k3        this conversation starts every turn on that model
+/orchestrator auto           this conversation: the best model for each task
+/orchestrator all kimi-k3    every conversation
+/orchestrator reset          this conversation follows the global choice again
+/orchestrator                show the current choice and strong models right now
+```
+
+Type it in any CLI connected to the hub (opencode lists it as a command after
+Connect) or in the Build page's message box; the hub answers it itself, no model
+is called. The Build page also has an **Orchestrator** picker per conversation,
+and the **Orchestrator model** page sets it for everyone. It is a preference,
+not a cage: if the chosen model is busy, failing, too small for the
+conversation or cannot call the tools a turn needs, that turn falls back to
+normal routing.
+
 ---
 
 ## What makes it different
@@ -267,7 +286,7 @@ keys can actually reach right now, which is the only number that matters.
 | **MCP** | `/mcp` — `crew_run`, `crew_start`, `crew_result`, `swarm_windows_*` |
 | **Dashboard** | `/api/*` (control-token gated) |
 
-151 routes in total; the dashboard is the documentation for the rest.
+152 routes in total; the dashboard is the documentation for the rest.
 
 ---
 

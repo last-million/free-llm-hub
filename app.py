@@ -78,6 +78,7 @@ import config
 import image_history
 import craft
 import lowres
+import orchestrator
 import skills
 import perfstats
 import providers as prov
@@ -13675,6 +13676,295 @@ def _agent_upstream_probe(sid, since):
 agentic_chat.set_upstream_probe(_agent_upstream_probe)
 
 
+# --------------------------------------------------------------------------- #
+# The orchestrator: which model answers a conversation (see orchestrator.py)
+# --------------------------------------------------------------------------- #
+_orch_store = [None]
+
+
+def _orch_conversations():
+    """The per-conversation store, under THIS config's state dir (re-opened if
+    the state dir changed -- the tests switch it per test)."""
+    path = os.path.join(config.state_dir(), orchestrator.STORE_NAME)
+    st = _orch_store[0]
+    if st is None or st.path != path:
+        st = _orch_store[0] = orchestrator.ConversationStore(path)
+    return st
+
+
+def _orch_global():
+    v = config.get_setting(orchestrator.GLOBAL_SETTING)
+    return v if orchestrator.split_choice(v) else None
+
+
+def _orch_key(body=None, messages=None):
+    """This request's conversation key (ctxwin.conversation_key: the /agent
+    session, a CLI session header or body id, else a content hash)."""
+    try:
+        return ctxwin.conversation_key(request.headers, body, _build_sid(), messages)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _orch_effective(key):
+    """(choice, scope): the conversation's own pick, else the choice for all
+    conversations, else (None, None) = auto."""
+    own = _orch_conversations().get(key) if key else None
+    if own:
+        return own, "this conversation"
+    glob = _orch_global()
+    return (glob, "all conversations") if glob else (None, None)
+
+
+def _orch_live():
+    """[(pid, model, tools_ok, score)] for every model the hub can reach."""
+    rows = []
+    for pid, models in (_prefetch_free_models(_available_providers()) or {}).items():
+        for m in models or ():
+            try:
+                rows.append((pid, m, bool(_supports_tools(pid, m)), float(_benchmark_score(pid, m))))
+            except Exception:                                    # noqa: BLE001
+                rows.append((pid, m, False, 0.0))
+    return rows
+
+
+def _orch_unusable(pid, model, est=0, tools=False, images=False, veto=None):
+    """Why the chosen pair cannot open THIS turn, or None."""
+    if pid not in _available_providers():
+        return "%s is off or has no working key" % pid
+    blocked = _model_block_reason(pid, model)
+    if blocked:
+        return blocked
+    if veto and _normalize_model_identity(model) in veto:
+        return "a different model was asked for this time"
+    if model not in ((_prefetch_free_models([pid]) or {}).get(pid) or ()):
+        return "%s does not offer it right now" % pid
+    if _is_model_skipped(pid, model) or quota.is_model_throttled(pid, model):
+        return "it is rate-limited or resting after failures"
+    if tools and not _supports_tools(pid, model):
+        return "it cannot call the tools this turn needs"
+    if images and not _is_vision_model(pid, model):
+        return "it cannot read images"
+    try:
+        window, src = _model_ctx_info(pid, model)
+    except Exception:                                            # noqa: BLE001
+        window, src = None, "default"
+    if src != "default" and window and est and est > window:
+        return "this conversation (~%dK tokens) is bigger than its window (%dK)" % (
+            est // 1000, window // 1000)
+    return None
+
+
+def _apply_orchestrator(pid, resolved, messages, est=0, tools=False, images=False,
+                        veto=None, body=None):
+    """The router's pick, replaced by the orchestrator chosen for this
+    conversation (or for all of them) whenever that model can open this
+    turn. The fallback chain is built behind it as usual. Never raises."""
+    try:
+        choice, scope = _orch_effective(_orch_key(body, messages))
+        pair = orchestrator.split_choice(choice)
+        if not pair:
+            return pid, resolved
+        why = _orch_unusable(pair[0], pair[1], est, tools, images, veto)
+        if why:
+            _log.info("[orchestrator] %s (%s) skipped this turn: %s", choice, scope, why)
+            g.hub_orchestrator = "skipped (%s)" % why
+            return pid, resolved
+        g.hub_orchestrator = "%s (%s)" % (choice, scope)
+        return pair
+    except Exception:                                            # noqa: BLE001
+        return pid, resolved
+
+
+def _orch_last_command(messages):
+    """The /orchestrator command when it is the LAST message (a fresh user
+    turn), with any <system-reminder> blocks a CLI adds stripped; else None."""
+    if not messages or not isinstance(messages[-1], dict):
+        return None
+    last = messages[-1]
+    if last.get("role") != "user":
+        return None
+    content = last.get("content")
+    parts = [content] if isinstance(content, str) else [
+        p.get("text") for p in (content or ()) if isinstance(p, dict)
+        and p.get("type") in ("text", "input_text")]
+    for t in reversed([p for p in parts if isinstance(p, str)]):
+        t = re.sub(r"<system-reminder>.*?</system-reminder>", "", t, flags=re.S).strip()
+        if not t:
+            continue
+        return t if orchestrator.is_command(t) else None
+    return None
+
+
+def _orch_label(choice):
+    return choice if orchestrator.split_choice(choice) else "Auto (the best model for each task)"
+
+
+def _orch_suggestions(live, n=5):
+    strong = sorted((r for r in live if r[2]), key=lambda r: -r[3])
+    seen, out = set(), []
+    for pid, m, _t, _s in strong:
+        ident = _normalize_model_identity(m)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append("%s/%s" % (pid, m))
+        if len(out) >= n:
+            break
+    return out
+
+
+_ORCH_USAGE = ("Usage: `/orchestrator <model>` for this conversation, `/orchestrator auto` "
+               "for the best model per task, `/orchestrator all <model>` for every "
+               "conversation, `/orchestrator reset` to follow the global choice again.")
+
+
+def _orch_status_text(key, live=None):
+    own = _orch_conversations().get(key) if key else None
+    glob = _orch_global()
+    lines = ["Orchestrator for this conversation: %s" % (
+        _orch_label(own) if own else "follows the global choice -- %s" % _orch_label(glob)),
+        "For all conversations: %s" % _orch_label(glob)]
+    sugg = _orch_suggestions(live if live is not None else _orch_live())
+    if sugg:
+        lines.append("Strong models right now: " + ", ".join(sugg))
+    lines.append(_ORCH_USAGE)
+    return "\n".join(lines)
+
+
+def _orch_command_text(key, text):
+    """Apply one /orchestrator command and return the hub's reply, or None
+    when `text` is not one."""
+    cmd = orchestrator.parse_command(text)
+    if cmd is None:
+        return None
+    live = _orch_live()
+    if cmd["action"] == "show":
+        return _orch_status_text(key, live)
+    target, scope = cmd["target"], cmd["scope"]
+    choice, note = target, ""
+    if target and target != orchestrator.AUTO:
+        pair, others = orchestrator.match_model(target, live)
+        if not pair:
+            sugg = _orch_suggestions(live)
+            return "No model matches \"%s\".%s\n%s" % (
+                target, (" Try: " + ", ".join(sugg) + ".") if sugg else "", _ORCH_USAGE)
+        choice = "%s/%s" % pair
+        blocked = _model_block_reason(*pair)
+        if blocked:
+            return "%s is blocked here: %s" % (choice, blocked)
+        if not _supports_tools(*pair):
+            note += (" Note: it cannot call tools, so agent turns that need them "
+                     "will use another model.")
+        if others:
+            note += " (Other matches: %s.)" % ", ".join(others[:3])
+    if scope == "all":
+        config.set_setting(orchestrator.GLOBAL_SETTING,
+                           choice if orchestrator.split_choice(choice) else None)
+        return ("Orchestrator for all conversations: %s. From the next message; if it "
+                "is busy or failing, the usual fallback answers.%s" % (_orch_label(choice), note))
+    if not key:
+        return ("This client sends no conversation id, so a per-conversation choice "
+                "cannot stick. Use `/orchestrator all <model>` or the dashboard.")
+    _orch_conversations().set(key, choice)
+    if choice is None:
+        return ("This conversation follows the global choice again: %s."
+                % _orch_label(_orch_global()))
+    return ("Orchestrator for this conversation: %s. From the next message; if it is "
+            "busy or failing, the usual fallback answers.%s" % (_orch_label(choice), note))
+
+
+def _hub_text_completion(text, label):
+    return {"id": "chatcmpl-hub-" + uuid.uuid4().hex[:16], "object": "chat.completion",
+            "created": int(time.time()), "model": label,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": text}}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+
+
+def _orch_command_response(protocol, body, messages, est=0):
+    """The hub's own answer to an /orchestrator command in `protocol`
+    ("chat" | "responses" | "messages"), or None when this turn is not one.
+    No model is called."""
+    try:
+        text = _orch_last_command(messages)
+        if text is None:
+            return None
+        reply = _orch_command_text(_orch_key(body, messages), text)
+        if reply is None:
+            return None
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[orchestrator] command failed: %s", exc)
+        return None
+    label = (body.get("model") or "").strip() or "orchestrator"
+    data = _hub_text_completion(reply, label)
+    hdrs = {"X-Free-LLM-Hub-Provider": "hub", "X-Free-LLM-Hub-Model": "orchestrator"}
+    try:
+        _act_pick("hub", "orchestrator")
+    except Exception:                                            # noqa: BLE001
+        pass
+    stream = bool(body.get("stream"))
+    if protocol == "responses":
+        if not stream:
+            return jsonify(_chat_to_responses(data, label)), 200, hdrs
+        return Response(stream_with_context(
+            _responses_stream(_ReplayUpstream(_swarm_sse_lines(data)), label)),
+            mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
+    if protocol == "messages":
+        if not stream:
+            return jsonify(_openai_resp_to_anthropic(data, label)), 200, hdrs
+        return Response(stream_with_context(
+            _anthropic_stream(_ReplayUpstream(_swarm_sse_lines(data)), label, est)),
+            mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
+    if not stream:
+        return jsonify(data), 200, hdrs
+
+    def _one_shot():
+        for chunk in _swarm_stream_chunks(data):
+            yield "data: %s\n\n" % json.dumps(chunk)
+        yield "data: [DONE]\n\n"
+    return Response(_one_shot(), mimetype="text/event-stream",
+                    headers=dict(_SSE_HEADERS, **hdrs))
+
+
+@app.route("/api/orchestrator", methods=["GET", "POST"])
+def api_orchestrator():
+    """GET -> {"global", "session"?, "session_choice"?}. POST {"model":
+    "<pid>/<model>"|"auto"|"", "session_id"?}: with session_id, that /agent
+    conversation ("" = follow the global choice); without, all conversations
+    ("auto" or "" = auto)."""
+    sid = str(request.args.get("session_id") or "").strip()
+    if request.method == "POST":
+        body = request.get_json(force=True, silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"error": "invalid JSON body"}), 400
+        sid = str(body.get("session_id") or "").strip()
+        want = str(body.get("model") or "").strip()
+        choice = None
+        if want and want.lower() != orchestrator.AUTO:
+            pair = orchestrator.split_choice(want)
+            if not pair or not prov.get_provider(pair[0]):
+                return jsonify({"error": "Use \"<provider>/<model>\" or \"auto\"."}), 400
+            blocked = _model_block_reason(*pair)
+            if blocked:
+                return jsonify({"error": blocked}), 403
+            choice = "%s/%s" % pair
+        elif want.lower() == orchestrator.AUTO:
+            choice = orchestrator.AUTO
+        if sid:
+            if agentic_chat.get_session(sid) is None and not agentic_history.get_conversation(sid):
+                return jsonify({"error": "No such agent session."}), 404
+            _orch_conversations().set(ctxwin.conversation_key(agent_sid=sid), choice)
+        else:
+            config.set_setting(orchestrator.GLOBAL_SETTING,
+                               choice if orchestrator.split_choice(choice) else None)
+    out = {"global": _orch_global() or orchestrator.AUTO}
+    if sid:
+        out["session_id"] = sid
+        out["session_choice"] = _orch_conversations().get(ctxwin.conversation_key(agent_sid=sid))
+    return jsonify(out)
+
+
 def _build_sid():
     """The agent session id this request arrived under, or None."""
     try:
@@ -19885,6 +20175,19 @@ def api_agent_send_message_stream(session_id):
                                          "detail": detail}) + "\n\n"
             yield "event: end\ndata: {}\n\n"
         return Response(_refused(), mimetype="text/event-stream", headers=_SSE_HEADERS)
+    if sess_info and orchestrator.is_command(text.strip()):
+        # "/orchestrator ..." typed here: the hub answers it for THIS
+        # conversation without starting the CLI (see orchestrator.py).
+        reply = _orch_command_text(ctxwin.conversation_key(agent_sid=session_id), text.strip())
+        agentic_history.record_turn(session_id, sess_info["cli"], sess_info["project_dir"],
+                                    "user", text)
+        agentic_history.record_turn(session_id, sess_info["cli"], sess_info["project_dir"],
+                                    "agent", reply)
+
+        def _orch_done(reply=reply):
+            yield "data: " + json.dumps({"event": "done", "text": reply}) + "\n\n"
+            yield "event: end\ndata: {}\n\n"
+        return Response(_orch_done(), mimetype="text/event-stream", headers=_SSE_HEADERS)
     if sess_info:
         # Snapshot the files BEFORE the turn touches them, exactly as the
         # non-streaming route does. It was missing here, which made the whole
@@ -22121,6 +22424,12 @@ def _aider_revert_metadata():
     return changed
 
 
+def _is_hub_orchestrator_command(spec):
+    """True for the /orchestrator command definition the hub wrote."""
+    return (isinstance(spec, dict)
+            and str(spec.get("template") or "").startswith("[free-llm-hub] /orchestrator"))
+
+
 def _autofix_opencode(entry, key, base_root, base_v1, model):
     path = _p_opencode()
     data = {}
@@ -22166,6 +22475,15 @@ def _autofix_opencode(entry, key, base_root, base_v1, model):
     # next to a 37-id list without it. "auto" is listed, orchestrated, and what
     # the isolated /agent copy already defaults to (_seed_opencode_config).
     data["model"] = "free-llm-hub/auto"
+    # "/orchestrator" in opencode's own command list (orchestrator.py): its
+    # template reaches the hub as the message, which the hub answers itself.
+    # A command of that name the user wrote is left alone.
+    commands = data.get("command")
+    if not isinstance(commands, dict):
+        commands = {}
+    if "orchestrator" not in commands or _is_hub_orchestrator_command(commands["orchestrator"]):
+        commands["orchestrator"] = dict(orchestrator.OPENCODE_COMMAND)
+    data["command"] = commands
     _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     return {
         "ok": True,
@@ -23437,6 +23755,12 @@ def _disconnect_opencode(entry):
             sm = data.get("small_model")
             if isinstance(sm, str) and sm.startswith("free-llm-hub/"):
                 data.pop("small_model", None)
+                changed = True
+            cmds = data.get("command")
+            if isinstance(cmds, dict) and _is_hub_orchestrator_command(cmds.get("orchestrator")):
+                cmds.pop("orchestrator", None)
+                if not cmds:
+                    data.pop("command", None)
                 changed = True
             for section in ("agent", "mode"):
                 block = data.get(section)
@@ -32153,6 +32477,10 @@ def _chat_completions_uncached(body):
     # "coding-swarm"/"coding-multi" reach the pipeline exactly as bare
     # "swarm"/"multi" do, but with the pool cut to the category.
     body = _apply_category_effort(body)
+    # "/orchestrator ..." as the whole message: the hub answers it itself.
+    _orch_reply = _orch_command_response("chat", body, body.get("messages"))
+    if _orch_reply is not None:
+        return _orch_reply
     # SWARM: an explicitly-selected virtual model, never an automatic mode — a
     # multi-pass pipeline applied behind a client's back would corrupt the agent
     # loops Codex/Claude Code run (see swarm.py's header). Tool-carrying turns
@@ -32250,6 +32578,8 @@ def _chat_completions_uncached(body):
             g.model_mode = _req_mode
         pid, resolved, diff = router(body.get("messages"), body.get("max_tokens"), est,
                                      require_tools=has_tools, **_rkw)
+        pid, resolved = _apply_orchestrator(pid, resolved, body.get("messages"), est,
+                                            has_tools, has_images, veto, body)
         if veto and pid is not None and _normalize_model_identity(resolved) in veto:
             # Auto landed on exactly the model the user just rejected. Hand the
             # choice to _build_chain with an empty primary: it applies the same
@@ -33259,6 +33589,9 @@ def v1_responses(_retry_pass=False, _hedged=False):
     # route across available, SIZE-CAPABLE providers; explicit '<pid>/<model>' bypasses.
     has_tools = bool(tools)
     diff = None
+    _orch_reply = _orch_command_response("responses", body, messages, est)
+    if _orch_reply is not None:
+        return _orch_reply
     # SWARM on codex's own protocol. This dispatch used to exist only in
     # /v1/chat/completions -- which codex never calls -- so "swarm" arrived here
     # as an unknown bare id and _resolve_model turned it into a literal model on
@@ -33291,6 +33624,8 @@ def v1_responses(_retry_pass=False, _hedged=False):
         pid, resolved, diff = router(messages, body.get("max_output_tokens"), est,
                                      require_tools=has_tools,
                                      **_quality_route_kwargs(body.get("model"), has_images))
+        pid, resolved = _apply_orchestrator(pid, resolved, messages, est, has_tools,
+                                            has_images, None, body)
         if pid is None:
             if has_images:
                 return _openai_error(
@@ -34250,6 +34585,9 @@ def v1_messages():
     est = _est_tokens(oai_messages, tools)
     has_tools = bool(tools)
     diff = None
+    _orch_reply = _orch_command_response("messages", body, oai_messages, est)
+    if _orch_reply is not None:
+        return _orch_reply
     # Same two modes, on claude's protocol. See the note in /v1/responses.
     if _is_swarm_model(body.get("model")) and _swarm_fast_path(
             dict(body, tools=tools), oai_messages):
@@ -34287,6 +34625,8 @@ def v1_messages():
         pid, resolved, diff = router(oai_messages, body.get("max_tokens"), est,
                                      require_tools=has_tools,
                                      **_quality_route_kwargs(body.get("model"), has_images))
+        pid, resolved = _apply_orchestrator(pid, resolved, oai_messages, est, has_tools,
+                                            has_images, None, body)
         if pid is None:
             if has_images:
                 return _anthropic_error(

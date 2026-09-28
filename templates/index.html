@@ -3444,6 +3444,15 @@
                     title="Restrict this project to one kind of model. Applies from the NEXT message.">
               <option value="all">All models</option>
             </select>
+            <!-- ORCHESTRATOR, per conversation (orchestrator.py): which model
+                 answers this conversation. Typing "/orchestrator <model>" in
+                 the message box does the same. -->
+            <select class="agent-mode agent-orch" id="agent-orchestrator"
+                    aria-label="Which model answers this conversation"
+                    title="Which model answers this conversation. Applies from the NEXT message; if it is busy, the usual fallback answers.">
+              <option value="">Orchestrator: follow global</option>
+              <option value="auto">Orchestrator: Auto (best per task)</option>
+            </select>
             <button class="btn sm ghost" id="agent-models" type="button"
                     title="Choose which models THIS conversation may use, and which belong to its modes (coding, vision, ...). Opens Settings with this conversation selected.">Models&hellip;</button>
             <button class="btn sm ghost" id="agent-checkpoint" type="button" title="Mark this point in the transcript. To put the FILES back too, use Restore &amp; rerun on one of your own messages.">Bookmark</button>
@@ -3597,7 +3606,7 @@
   <section class="section" aria-labelledby="h-default">
     <div class="section-h">
       <h2 id="h-default" tabindex="-1">Orchestrator model</h2>
-      <span class="sub">used when a client sends a bare / unknown model name</span>
+      <span class="sub">the model every conversation starts with &mdash; Auto picks the best one per task; a conversation can choose its own (Build page, or <code>/orchestrator</code> in a CLI)</span>
     </div>
     <div class="section-body" id="sec-default">
     <div class="default-row">
@@ -5523,32 +5532,48 @@
         });
         sel.appendChild(og);
       });
+      ensureAutoOption(sel);
       if (cur && sel.querySelector('option[value="' + CSS.escape(cur) + '"]')) sel.value = cur;
     }).catch(function(e){ toast('Models: ' + e.message, true); });
   }
+  /* THE ORCHESTRATOR (orchestrator.py). This page used to save /api/default,
+     which only resolves a bare/unknown model name -- every CLI sends auto or
+     a tier, so "Set orchestrator" had no visible effect. It now sets the model
+     every conversation starts with (Auto = the best model per task); a
+     conversation can override it (Build page, or /orchestrator in a CLI). */
+  function ensureAutoOption(sel){
+    if (!sel || sel.querySelector('option[value="auto"]')) return;
+    var o = document.createElement('option');
+    o.value = 'auto';
+    o.textContent = 'Auto — the best model for each task';
+    sel.insertBefore(o, sel.firstChild);
+  }
   function loadDefault(){
-    return api('/api/default').then(function(j){
-      var d = (j && j.provider) ? j : (j && j.default) ? j.default : null;
+    return api('/api/orchestrator').then(function(j){
+      var cur = (j && j.global) || 'auto';
       var el = $('#current-default');
-      if (d && d.provider && d.model){
-        el.textContent = 'current: ' + d.provider + '/' + d.model;
-        el.hidden = false;
-        var full = d.provider + '/' + d.model;
-        var sel = $('#model-select');
-        if (sel.querySelector('option[value="' + CSS.escape(full) + '"]')) sel.value = full;
-      } else {
-        el.hidden = true;
-      }
-    }).catch(function(){ /* default may be unset */ });
+      var sel = $('#model-select');
+      ensureAutoOption(sel);
+      el.textContent = 'now: ' + (cur === 'auto' ? 'Auto (best per task)' : cur);
+      el.hidden = false;
+      if (sel.querySelector('option[value="' + CSS.escape(cur) + '"]')) sel.value = cur;
+    }).catch(function(){ /* optional */ });
   }
   $('#btn-set-default').addEventListener('click', function(){
     var v = $('#model-select').value;
     if (!v){ toast('Pick a model first', true); return; }
-    var i = v.indexOf('/');
-    var payload = { provider: v.slice(0, i), model: v.slice(i + 1) };
     var btn = this; btn.disabled = true;
-    api('/api/default', { method:'POST', body: payload }).then(function(){
-      toast('Orchestrator set: ' + v);
+    var i = v.indexOf('/');
+    /* A model also becomes the default for bare/unknown model names, as
+       before; Auto leaves that default alone. */
+    var also = (v !== 'auto' && i > 0)
+      ? api('/api/default', { method:'POST', body: { provider: v.slice(0, i), model: v.slice(i + 1) } })
+      : Promise.resolve();
+    api('/api/orchestrator', { method:'POST', body: { model: v } }).then(function(){
+      return also;
+    }).then(function(){
+      toast(v === 'auto' ? 'Orchestrator: Auto (best model per task)'
+                         : 'Orchestrator for all conversations: ' + v);
       return Promise.all([loadDefault(), loadStatus()]);
     }).catch(function(e){ toast('Set orchestrator: ' + e.message, true); })
       .then(function(){ btn.disabled = false; });
@@ -5600,9 +5625,16 @@
       if (res.status === 200 && r.ok){
         /* same refresh path as saving a default by hand — no duplicated render logic */
         renderAutoTrail(r.tried, '', r.note);
-        return Promise.all([loadDefault(), loadStatus()]).then(function(){
-          toast('Default → ' + (r.label || (r.provider + '/' + r.model)) + ' (verified)');
-        });
+        /* Clicked on the Orchestrator page: the verified model becomes the
+           orchestrator for all conversations too, not only the bare-name
+           default -- otherwise the page said "Auto" right after picking. */
+        return api('/api/orchestrator', { method:'POST',
+                                          body: { model: r.provider + '/' + r.model } })
+          .catch(function(){})
+          .then(function(){ return Promise.all([loadDefault(), loadStatus()]); })
+          .then(function(){
+            toast('Orchestrator → ' + (r.label || (r.provider + '/' + r.model)) + ' (verified)');
+          });
       }
       /* 409 (or anything else): existing default is left untouched, show why */
       renderAutoTrail(r.tried, r.reason || ('Auto-pick failed (HTTP ' + res.status + ')'));
@@ -9842,7 +9874,88 @@
            session will inherit. */
         var cur = (r && r.session && r.session.mode) || (r && r.mode) || 'all';
         renderAgentMode(sel, cur);
+      }).catch(function(){ /* optional control: never block the agent page */ })
+        .then(function(){ try { loadAgentOrchestrator(); } catch (e) {} });
+    }
+
+    /* ---------- the orchestrator, per conversation (orchestrator.py) ----------
+       "" = follow the global choice, "auto" = the best model per task, else
+       "<provider>/<model>". Chosen before the session exists, it is applied
+       as soon as the session does. */
+    var _pendingOrch = null;
+    function fillAgentOrchestrator(sel, models){
+      sel.innerHTML = '<option value="">Orchestrator: follow global</option>' +
+                      '<option value="auto">Orchestrator: Auto (best per task)</option>';
+      var byProv = {};
+      models.forEach(function(m){
+        var pid = m.provider || (m.id ? m.id.split('/')[0] : '?');
+        (byProv[pid] = byProv[pid] || []).push(m);
+      });
+      Object.keys(byProv).sort().forEach(function(pid){
+        var og = document.createElement('optgroup');
+        og.label = pid;
+        byProv[pid].forEach(function(m){
+          var o = document.createElement('option');
+          o.value = m.id || (pid + '/' + m.model);
+          o.textContent = m.model || m.id;
+          og.appendChild(o);
+        });
+        sel.appendChild(og);
+      });
+      sel.dataset.filled = '1';
+    }
+    function showAgentOrchestrator(sel, v){
+      if (v && !sel.querySelector('option[value="' + CSS.escape(v) + '"]')){
+        var o = document.createElement('option');
+        o.value = v; o.textContent = v;
+        sel.appendChild(o);
+      }
+      sel.value = v || '';
+      if (v) sel.classList.add('set'); else sel.classList.remove('set');
+    }
+    function loadAgentOrchestrator(){
+      var sel = $('#agent-orchestrator');
+      if (!sel) return Promise.resolve();
+      if (sessionId && _pendingOrch !== null){
+        var want = _pendingOrch;
+        _pendingOrch = null;
+        return api('/api/orchestrator', { method: 'POST',
+                                          body: { model: want, session_id: sessionId } })
+          .catch(function(e){ toast('Orchestrator: ' + e.message, true); })
+          .then(loadAgentOrchestrator);
+      }
+      var q = sessionId ? '?session_id=' + encodeURIComponent(sessionId) : '';
+      return Promise.all([sel.dataset.filled ? null : api('/api/models'),
+                          api('/api/orchestrator' + q)]).then(function(res){
+        if (res[0]) fillAgentOrchestrator(sel, asList(res[0], ['models', 'data']));
+        var r = res[1] || {};
+        showAgentOrchestrator(sel, sessionId ? (r.session_choice || '') : (_pendingOrch || ''));
+        sel.title = 'Which model answers this conversation (all conversations: ' +
+                    ((r.global && r.global !== 'auto') ? r.global : 'Auto') +
+                    '). Applies from the next message; if it is busy, the usual fallback answers.';
       }).catch(function(){ /* optional control: never block the agent page */ });
+    }
+    function initAgentOrchestrator(){
+      var sel = $('#agent-orchestrator');
+      if (!sel) return;
+      sel.addEventListener('change', function(){
+        var want = sel.value || '';
+        var label = want === 'auto' ? 'Auto' : (want || 'follow global');
+        if (!sessionId){
+          _pendingOrch = want;
+          showAgentOrchestrator(sel, want);
+          toast('Orchestrator: ' + label + ' — applies when the session starts');
+          return;
+        }
+        sel.disabled = true;
+        api('/api/orchestrator', { method: 'POST', body: { model: want, session_id: sessionId } })
+          .then(function(r){
+            showAgentOrchestrator(sel, (r && r.session_choice) || '');
+            toast('Orchestrator for this conversation: ' + label + ' — from the next message');
+          })
+          .catch(function(e){ toast('Orchestrator: ' + e.message, true); loadAgentOrchestrator(); })
+          .then(function(){ sel.disabled = false; });
+      });
     }
 
     /* "Models..." beside the mode: Settings, with THIS conversation already
@@ -11363,6 +11476,7 @@
                              calling it from the top level is the exact bug
                              that took the whole dashboard down earlier. */
     initAgentMode();
+    initAgentOrchestrator();
     initAgentModelsLink();
     initPlanStrip();
     loadAgentMode();
