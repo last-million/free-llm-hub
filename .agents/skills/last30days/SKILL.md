@@ -50,6 +50,9 @@ X/social/authenticated source, check the hub policy:
 curl -s -m 3 http://127.0.0.1:8787/api/web-search-policy
 ```
 
+- If the response contains `"skill_enabled": false`, STOP: do not run this
+  skill at all. Tell the user the last30days skill is switched off in the
+  hub's Settings -> Skills, and answer without it.
 - Only use social/authenticated sources when the response is exactly
   `{"social_search": true}` (HTTP 200). Any other result — `false`,
   non-200, or an unreachable hub — means SOCIAL SEARCH IS OFF. Fail closed.

@@ -450,6 +450,10 @@ def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
     if name in ("", "crew", "auto"):
         name = detect_crew(messages)
     profile = CREWS.get(name)          # unknown/undetected -> None -> generic
+    if (profile and profile.get("worker_extra") == craft.WEB_DESIGN
+            and not craft.skill_enabled("web_design")):
+        # Settings -> Skills switched the web-design skill off.
+        profile = dict(profile, worker_extra="")
     extra = {"max_seconds": max_seconds} if max_seconds else {}
     if manager is not None:
         extra["manager"] = manager

@@ -77,6 +77,7 @@ import quick_history
 import config
 import image_history
 import craft
+import skills
 import perfstats
 import providers as prov
 import quota
@@ -18927,7 +18928,11 @@ def api_web_search_policy():
     GET is exempt from the control token (see _CONTROL_TOKEN_EXEMPT_GETS in
     _local_control_guard) so token-less local agents can read the single
     non-sensitive boolean; POST below keeps full protection."""
-    return jsonify({"social_search": config.get_social_web_search()})
+    body = {"social_search": config.get_social_web_search()}
+    if "last30days" in _skills_disabled():
+        # Settings -> Skills switched the skill off; SKILL.md stops on this.
+        body = {"social_search": False, "skill_enabled": False}
+    return jsonify(body)
 
 
 @app.route("/api/web-search-policy", methods=["POST"])
@@ -18938,6 +18943,90 @@ def api_web_search_policy_update():
         return jsonify({"error": "social_search must be a boolean."}), 400
     config.set_social_web_search(value)
     return jsonify({"social_search": config.get_social_web_search()})
+
+
+# --------------------------------------------------------------------------- #
+# Settings -> Skills: switch the built-in briefs on/off, add named user skills.
+# craft.match() reads both through _skill_source (registered below), so every
+# protocol, /agent brief file and crew honours them from the next request.
+# --------------------------------------------------------------------------- #
+def _skills_disabled():
+    v = config.get_setting("skills_disabled", [])
+    return [x for x in v if x in skills.BUILTIN_IDS] if isinstance(v, list) else []
+
+
+def _custom_skills():
+    v = config.get_setting("custom_skills", [])
+    return [x for x in v if isinstance(x, dict) and x.get("id")] if isinstance(v, list) else []
+
+
+def _skill_source():
+    return _skills_disabled(), _custom_skills()
+
+
+craft.set_skill_source(_skill_source)
+
+
+def _skills_view():
+    off = set(_skills_disabled())
+    return {"enabled": config.get_flag("craft_briefs", True),
+            "builtin": [{"id": i, "name": n, "description": d, "enabled": i not in off}
+                        for i, n, d in skills.BUILTIN],
+            "custom": _custom_skills(),
+            "limits": {"max_custom": skills.MAX_CUSTOM, "max_name": skills.MAX_NAME,
+                       "max_instructions": skills.MAX_INSTRUCTIONS,
+                       "max_keywords": skills.MAX_KEYWORDS}}
+
+
+@app.route("/api/skills", methods=["GET"])
+def api_skills():
+    return jsonify(_skills_view())
+
+
+@app.route("/api/skills/toggle", methods=["POST"])
+def api_skills_toggle():
+    """{id, enabled}: a built-in id, a custom skill id, or "all" (the master
+    switch, flag craft_briefs)."""
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return jsonify({"error": "send {id, enabled: true|false}."}), 400
+    sid, on = body.get("id"), body["enabled"]
+    if sid == "all":
+        config.set_flag("craft_briefs", on)
+    elif sid in skills.BUILTIN_IDS:
+        off = [x for x in _skills_disabled() if x != sid]
+        config.set_setting("skills_disabled", off if on else off + [sid])
+    else:
+        custom = _custom_skills()
+        hit = [c for c in custom if c.get("id") == sid]
+        if not hit:
+            return jsonify({"error": "unknown skill."}), 404
+        config.set_setting("custom_skills", skills.upsert(custom, dict(hit[0], enabled=on)))
+    return jsonify(_skills_view())
+
+
+@app.route("/api/skills/custom", methods=["POST"])
+def api_skills_custom_save():
+    """Create (no id) or update (id of a saved skill) one user skill."""
+    custom = _custom_skills()
+    try:
+        skill = skills.validate(request.get_json(force=True, silent=True), custom)
+    except skills.SkillError as exc:
+        return jsonify({"error": str(exc)}), 400
+    config.set_setting("custom_skills", skills.upsert(custom, skill))
+    return jsonify(dict(_skills_view(), saved=skill["id"]))
+
+
+@app.route("/api/skills/custom/delete", methods=["POST"])
+def api_skills_custom_delete():
+    body = request.get_json(force=True, silent=True)
+    sid = body.get("id") if isinstance(body, dict) else None
+    custom = _custom_skills()
+    left = [c for c in custom if c.get("id") != sid]
+    if len(left) == len(custom):
+        return jsonify({"error": "unknown skill."}), 404
+    config.set_setting("custom_skills", left)
+    return jsonify(_skills_view())
 
 
 @app.route("/api/agent/vision-status", methods=["GET"])

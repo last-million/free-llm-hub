@@ -1640,6 +1640,26 @@
   .hc-sub{font-weight:600;color:var(--text);margin-top:6px}
   .hc-list{margin:2px 0 0 16px;padding:0;color:var(--text-faint)}
   .sd-actions{display:flex;gap:8px;flex-wrap:wrap}
+  /* ---------- Settings -> Skills ---------- */
+  .sk-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+  .sk-row{display:flex;align-items:flex-start;gap:10px;justify-content:space-between}
+  .sk-row .sk-txt{min-width:0;flex:1}
+  .sk-row .sk-name{font-size:13px;font-weight:600;color:var(--text);overflow-wrap:anywhere}
+  .sk-row .sk-desc{font-size:12px;color:var(--text-faint);line-height:1.45;overflow-wrap:anywhere}
+  .sk-row .sk-acts{display:flex;gap:6px;align-items:center;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end}
+  .sk-cols{display:grid;gap:12px;grid-template-columns:minmax(0,1fr)}
+  @media (min-width:900px){.sk-cols{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  .sk-form{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+  .sk-form input,.sk-form select,.sk-form textarea{
+    background:var(--surface-2);border:1px solid var(--border);
+    border-radius:var(--radius-sm);padding:7px 10px;font:inherit;
+    font-size:12.5px;color:var(--text);width:100%;box-sizing:border-box;
+  }
+  .sk-form textarea{min-height:110px;resize:vertical;line-height:1.5}
+  .sk-form input:focus,.sk-form select:focus,.sk-form textarea:focus{border-color:var(--accent);outline:none}
+  .sk-form .sk-inline{display:flex;gap:8px;flex-wrap:wrap}
+  .sk-form .sk-inline > *{flex:1 1 180px}
+  .sk-err{font-size:12px;color:var(--danger,#ef4444)}
 
   /* ---------- "what changed" ---------- */
   .wn{display:flex;flex-direction:column;gap:12px}
@@ -3926,6 +3946,45 @@
       <p class="sd-help">Every agent session the hub is holding. The mode set here applies to
         that conversation only, and overrides the category chosen above.</p>
       <div class="sd-sessions" id="sd-sessions"><div class="skel skel-row"></div></div>
+    </div>
+
+    <div class="sd-group sd-wide" id="skills-group">
+      <div class="sd-models-head">
+        <b>Skills</b>
+        <label class="switch" title="Master switch: when off, no skill is added to any request">
+          <input id="skills-master-switch" type="checkbox" aria-label="Skills on">
+          <span class="track" aria-hidden="true"></span>
+          <span class="lbl">On</span>
+        </label>
+      </div>
+      <p class="sd-help">Instructions the hub adds to the <em>opening</em> turn of a request that calls for them &mdash; in every CLI, the dashboard chat and <code>/agent</code>. Switch any built-in skill off, or add your own.</p>
+      <div class="sk-cols">
+        <div>
+          <div class="sd-label">Built-in</div>
+          <div class="sk-list" id="skills-builtin"><div class="skel skel-row"></div></div>
+        </div>
+        <div>
+          <div class="sd-label">Your skills</div>
+          <div class="sk-list" id="skills-custom"></div>
+          <form class="sk-form" id="skills-form" autocomplete="off">
+            <input type="hidden" id="sk-id">
+            <div class="sk-inline">
+              <input type="text" id="sk-name" maxlength="60" placeholder="Skill name, e.g. Brand voice" aria-label="Skill name" spellcheck="false">
+              <select id="sk-trigger" aria-label="When the skill applies">
+                <option value="keywords">When the request mentions&hellip;</option>
+                <option value="always">On every request</option>
+              </select>
+            </div>
+            <input type="text" id="sk-keywords" placeholder="Keywords, comma-separated: newsletter, email, blog post" aria-label="Keywords" spellcheck="false">
+            <textarea id="sk-text" maxlength="4000" placeholder="Instructions, e.g. Write in a warm, direct tone. Short sentences. No filler words." aria-label="Skill instructions"></textarea>
+            <div class="sk-err" id="sk-err" role="alert" hidden></div>
+            <div class="sd-actions">
+              <button class="btn sm" type="submit" id="sk-save">Add skill</button>
+              <button class="btn sm ghost" type="button" id="sk-cancel" hidden>Cancel edit</button>
+            </div>
+          </form>
+        </div>
+      </div>
     </div>
 
     <div class="sd-group">
@@ -11516,6 +11575,109 @@
     apply();
   }
 
+  /* ---------- Settings -> Skills ---------- */
+  var _skillsCustom = [];
+  function skillSwitch(id, on, label){
+    return '<label class="switch" title="' + (on ? 'Switch off' : 'Switch on') + '">' +
+      '<input type="checkbox" data-skill="' + esc(id) + '"' + (on ? ' checked' : '') +
+      ' aria-label="' + esc(label) + '"><span class="track" aria-hidden="true"></span></label>';
+  }
+  function renderSkills(r){
+    if (!r) return;
+    var m = $('#skills-master-switch');
+    if (m) m.checked = !!r.enabled;
+    var b = $('#skills-builtin');
+    if (b) b.innerHTML = (r.builtin || []).map(function(k){
+      return '<div class="sk-row"><div class="sk-txt"><div class="sk-name">' + esc(k.name) +
+        '</div><div class="sk-desc">' + esc(k.description) + '</div></div>' +
+        '<div class="sk-acts">' + skillSwitch(k.id, k.enabled, k.name) + '</div></div>';
+    }).join('');
+    _skillsCustom = r.custom || [];
+    var c = $('#skills-custom');
+    if (c) c.innerHTML = _skillsCustom.length ? _skillsCustom.map(function(k){
+      var when = k.trigger === 'always' ? 'Every request' :
+        'When the request mentions: ' + (k.keywords || []).join(', ');
+      return '<div class="sk-row"><div class="sk-txt"><div class="sk-name">' + esc(k.name) +
+        '</div><div class="sk-desc">' + esc(when) + '</div></div><div class="sk-acts">' +
+        '<button class="btn sm ghost" type="button" data-skill-edit="' + esc(k.id) + '">Edit</button>' +
+        '<button class="btn sm ghost" type="button" data-skill-del="' + esc(k.id) + '">Delete</button>' +
+        skillSwitch(k.id, k.enabled !== false, k.name) + '</div></div>';
+    }).join('') : '<p class="sd-help">None yet. Name a skill, say when it applies, write its instructions.</p>';
+  }
+  function loadSkills(silent){
+    return api('/api/skills').then(renderSkills)
+      .catch(function(e){ if (!silent) toast('Skills: ' + e.message, true); });
+  }
+  function skillsTriggerSync(){
+    $('#sk-keywords').hidden = $('#sk-trigger').value === 'always';
+  }
+  function skillsFormReset(){
+    $('#sk-id').value = ''; $('#sk-name').value = ''; $('#sk-keywords').value = '';
+    $('#sk-text').value = ''; $('#sk-trigger').value = 'keywords';
+    $('#sk-save').textContent = 'Add skill'; $('#sk-cancel').hidden = true;
+    $('#sk-err').hidden = true; skillsTriggerSync();
+  }
+  function initSkills(){
+    var group = $('#skills-group');
+    if (!group) return;
+    var m = $('#skills-master-switch');
+    m.addEventListener('change', function(){
+      var want = m.checked; m.disabled = true;
+      api('/api/skills/toggle', { method: 'POST', body: { id: 'all', enabled: want } })
+        .then(function(r){ renderSkills(r); toast('Skills ' + (want ? 'on' : 'off')); })
+        .catch(function(e){ m.checked = !want; toast('Skills: ' + e.message, true); })
+        .then(function(){ m.disabled = false; });
+    });
+    group.addEventListener('change', function(ev){
+      var t = ev.target;
+      if (!t || !t.getAttribute || !t.getAttribute('data-skill')) return;
+      var want = t.checked; t.disabled = true;
+      api('/api/skills/toggle', { method: 'POST', body: { id: t.getAttribute('data-skill'), enabled: want } })
+        .then(renderSkills)
+        .catch(function(e){ t.checked = !want; t.disabled = false; toast('Skills: ' + e.message, true); });
+    });
+    group.addEventListener('click', function(ev){
+      var t = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+      if (!t) return;
+      var del = t.getAttribute('data-skill-del'), ed = t.getAttribute('data-skill-edit');
+      if (del){
+        var k = _skillsCustom.filter(function(x){ return x.id === del; })[0];
+        if (!k || !window.confirm('Delete the skill "' + k.name + '"?')) return;
+        api('/api/skills/custom/delete', { method: 'POST', body: { id: del } })
+          .then(function(r){ renderSkills(r); if ($('#sk-id').value === del) skillsFormReset(); toast('Skill deleted'); })
+          .catch(function(e){ toast('Skills: ' + e.message, true); });
+      } else if (ed){
+        var s = _skillsCustom.filter(function(x){ return x.id === ed; })[0];
+        if (!s) return;
+        $('#sk-id').value = s.id; $('#sk-name').value = s.name;
+        $('#sk-trigger').value = s.trigger || 'keywords';
+        $('#sk-keywords').value = (s.keywords || []).join(', ');
+        $('#sk-text').value = s.instructions || '';
+        $('#sk-save').textContent = 'Save changes'; $('#sk-cancel').hidden = false;
+        skillsTriggerSync(); $('#sk-name').focus();
+      }
+    });
+    $('#sk-trigger').addEventListener('change', skillsTriggerSync);
+    $('#sk-cancel').addEventListener('click', skillsFormReset);
+    $('#skills-form').addEventListener('submit', function(ev){
+      ev.preventDefault();
+      var err = $('#sk-err'), btn = $('#sk-save'), id = $('#sk-id').value;
+      var body = { name: $('#sk-name').value, trigger: $('#sk-trigger').value,
+                   keywords: $('#sk-keywords').value, instructions: $('#sk-text').value };
+      if (id){
+        body.id = id;
+        var cur = _skillsCustom.filter(function(x){ return x.id === id; })[0];
+        body.enabled = cur ? cur.enabled !== false : true;
+      }
+      err.hidden = true; btn.disabled = true;
+      api('/api/skills/custom', { method: 'POST', body: body })
+        .then(function(r){ renderSkills(r); toast(id ? 'Skill saved' : 'Skill added'); skillsFormReset(); })
+        .catch(function(e){ err.textContent = e.message; err.hidden = false; })
+        .then(function(){ btn.disabled = false; });
+    });
+    skillsTriggerSync();
+  }
+
   /* ---------- enhance-opening-prompts toggle (Settings drawer) ---------- */
   function loadPromptEnhance(silent){
     return api('/api/prompt-enhance').then(function(r){
@@ -12480,6 +12642,7 @@
   function loadSettingsView(silent){
     try { loadTestVerification(silent); } catch (e) {}
     try { loadPromptEnhance(silent); } catch (e) {}
+    try { loadSkills(silent); } catch (e) {}
     try { loadSocialWebSearch(silent); } catch (e) {}
     try { loadUpdateStatus(silent); } catch (e) {}
     try { loadSdModels(silent); } catch (e) {}
@@ -12492,7 +12655,7 @@
     var c = $('#settings-drawer-close');
     if (c) c.focus();
     loadTestVerification(true);
-    loadPromptEnhance(true);
+    loadPromptEnhance(true); loadSkills(true);
     loadSocialWebSearch(true); loadSdModels(true);
     loadUpdateStatus(true);
   }
@@ -13161,6 +13324,7 @@
   initVisionGap();
   initTestVerification();
   initPromptEnhance();
+  initSkills();
     initSocialWebSearch();
     initSdModels();
   initUpdateCheck();

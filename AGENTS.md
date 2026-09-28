@@ -938,6 +938,32 @@ only be used from within OpenCode" -> summary `blocked`, recommend disable;
 never spoof the client), `server` (tokenrouter 503 "No available channel" ->
 `failing`, not dead keys) or `key`. Only `key` failures are dead keys.
 
+## Settings -> Skills (2026-09-28)
+
+Covered by `tests/test_skills_settings.py`. "Skills" = the craft briefs
+(craft.py) + the vendored last30days agent skill + the user's own named skills.
+
+- `skills.py` (pure): `BUILTIN` catalog (id = craft brief name, plus
+  `last30days`), `validate` (name <= 60, instructions <= 4000, trigger
+  `keywords` | `always`, <= 20 keywords, <= 20 saved skills, unique names),
+  `custom_hits` (keywords matched as escaped, word-bounded words, never a user
+  regex; <= 3 user skills per request).
+- Storage: settings `skills_disabled` (built-in ids) and `custom_skills`;
+  master switch = existing flag `craft_briefs`. app.py registers
+  `craft.set_skill_source(_skill_source)` at import, so `craft.match` (every
+  protocol, /agent brief files) skips disabled built-ins and appends user
+  skills as `USER SKILL: <name>` blocks; unregistered = old behaviour exactly.
+  A tool-less request whose only hits are user skills gets no VERIFY_READ
+  (it points at ANTI lines only built-ins carry). crew-design drops its
+  WEB_DESIGN `worker_extra` when web_design is off (copy, CREWS not mutated).
+- last30days off: GET `/api/web-search-policy` returns
+  `{"social_search": false, "skill_enabled": false}` (unchanged shape when
+  on) and SKILL.md stops on it.
+- Routes (control-token gated): `GET /api/skills`, `POST /api/skills/toggle
+  {id | "all", enabled}`, `POST /api/skills/custom` (no id = create, saved id
+  = update), `POST /api/skills/custom/delete {id}`. UI: `#skills-group` in the
+  Settings drawer.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

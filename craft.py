@@ -24,6 +24,33 @@ decisions a good practitioner actually makes — not a style lecture, not
 """
 import re
 
+import skills
+
+# Settings -> Skills. app.py registers a callable returning
+# (disabled built-in ids, the user's custom skills); unregistered (tests, other
+# processes) = every built-in on, no custom skill -- the old behaviour exactly.
+_SKILL_SOURCE = None
+
+
+def set_skill_source(fn):
+    global _SKILL_SOURCE
+    _SKILL_SOURCE = fn
+
+
+def _skill_state():
+    if _SKILL_SOURCE is None:
+        return frozenset(), []
+    try:
+        disabled, custom = _SKILL_SOURCE()
+        return frozenset(disabled or ()), [c for c in (custom or ()) if isinstance(c, dict)]
+    except Exception:                                            # noqa: BLE001
+        return frozenset(), []
+
+
+def skill_enabled(name):
+    return name not in _skill_state()[0]
+
+
 # --------------------------------------------------------------------------- #
 # Briefs. Each is (name, trigger regex, text).
 #
@@ -264,20 +291,27 @@ def match(text):
     page" should get LANDING + ECOMMERCE, not five overlapping briefs."""
     if not isinstance(text, str) or not text.strip():
         return []
+    disabled, custom = _skill_state()
     out = []
     for name, rx, brief in _BRIEFS:
+        if name in disabled:
+            continue
         if rx.search(text):
             out.append((name, brief))
             if len(out) >= MAX_BRIEFS:
                 break
     extra = 0
     for name, rx, brief in _ORTHOGONAL:
+        if name in disabled:
+            continue
         if rx.search(text):
             out.append((name, brief))
             extra += 1
             if extra >= MAX_ORTHOGONAL:
                 break
-    return out
+    # The user's own skills (Settings -> Skills) ride along like the orthogonal
+    # briefs, with their own cap (skills.MAX_CUSTOM_PER_TURN).
+    return out + skills.custom_hits(text, custom)
 
 
 # --------------------------------------------------------------------------- #
@@ -412,7 +446,11 @@ def system_message(text, tools=True):
                 "content": "\n\n".join([PLAN_PHASES, ACT_RUN, VERIFY_RUN])} if tools else None
     # The loop goes LAST: it says "every brief above" and "every ANTI line
     # above", and both references dangle if it is prepended.
-    tail = [PLAN_PHASES, ACT_RUN, VERIFY_RUN] if tools else [VERIFY_READ]
+    # VERIFY_READ checks against "the ANTI lines above", which only built-in
+    # briefs carry; a user skill alone gets no tool-less verify block.
+    builtin = any(not n.startswith("custom:") for n, _b in hits)
+    tail = ([PLAN_PHASES, ACT_RUN, VERIFY_RUN] if tools
+            else [VERIFY_READ] if builtin else [])
     body = "\n\n".join([b for _n, b in hits] + tail)
     return {"role": "system", "content": body}
 

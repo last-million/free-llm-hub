@@ -212,7 +212,8 @@ def test_settings_is_a_responsive_grid():
 def test_the_data_heavy_groups_span_the_full_width():
     assert ".sd-wide{grid-column:1 / -1}" in SRC.replace(" > ", " > ") or \
            "sd-wide{grid-column:1 / -1}" in SRC
-    assert SRC.count('class="sd-group sd-wide"') == 2
+    # models, running sessions, and Skills (built-in + your own, side by side)
+    assert SRC.count('class="sd-group sd-wide"') == 3
 
 
 def test_there_is_a_small_screen_layout():
