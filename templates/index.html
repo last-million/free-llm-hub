@@ -5663,8 +5663,12 @@
      and the user read that as a bug ("I did not use them for 2 days") -- but
      the hub's own swarm stages, agent sessions and probes spend quota too.
      One line for the reason + countdown + detail, one for who used it. */
+  /* Reasons that keep a card out of routing but are NOT an outage or a spent
+     quota, so they never paint the red "out of quota" cross. no_key: switched
+     on with no key saved -- routing skips it; the detail says what to do. */
+  var NOTE_REASONS = { no_key: 'No API key' };
   function outReasonLine(p){
-    var label = OUT_REASONS[p.status_reason];
+    var label = OUT_REASONS[p.status_reason] || NOTE_REASONS[p.status_reason];
     if (!label){
       return p.detail ? '<div class="quota-line"><span class="out-detail">' +
                         esc(p.detail) + '</span></div>' : '';

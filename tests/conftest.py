@@ -39,6 +39,14 @@ def _clear_recent_hop_failures():
         other = getattr(mod, name, None) if mod else None
         if isinstance(other, dict):
             other.clear()
+    # DEAD KEYS (quota.mark_key_dead / note_key_auth_failure): tests share fake
+    # key strings ("k1", "sk-test"...), so one test's dead mark would drop that
+    # key from usable_keys in the next.
+    q = sys.modules.get("quota")
+    for name in ("_KEY_DEAD", "_KEY_AUTH_STRIKES"):
+        ledger = getattr(q, name, None) if q else None
+        if isinstance(ledger, dict):
+            ledger.clear()
 
 
 @pytest.fixture(autouse=True)
