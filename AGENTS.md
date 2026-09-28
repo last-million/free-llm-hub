@@ -915,6 +915,24 @@ Covered by `tests/test_provider_status.py`.
   file `_note_quality_strike`: a junk-weighted failure + a junk-bench strike
   for that (provider, model) only.
 
+## One-click health check (2026-09-28)
+
+Settings drawer "Health check" group. `POST /api/health-check` starts ONE
+background run (`_health_run`; a second POST while it runs = 409
+`already_running`), `GET` returns `{running, progress, report}`,
+`POST /api/health-check/cancel` stops it before the next step (a request in
+flight finishes or times out first) and saves a `cancelled` partial report.
+Steps: every ENABLED provider's `api_test_provider` in-process, sequentially,
+skipping no_key / exhausted / throttled / no_free_tier (`_health_skip_reason`,
+local state only); then 4 requests through the hub's own
+`/v1/chat/completions` via the in-process test client (auto + tool turn, each
+non-stream and stream; a tool turn passes only if it calls the tool); then the
+`/api/model-windows` coverage. Summary: working, dead keys (per-key failures,
+or an auth-shaped provider failure), failing (non-key), no key, skipped,
+recommendations. Report at `state_dir()/health-check.json`. Never writes a
+setting (the provider test still updates its own test cache). Usage is
+labelled `health-check`. Covered by `tests/test_health_check.py`.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
