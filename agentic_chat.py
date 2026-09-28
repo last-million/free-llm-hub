@@ -2111,10 +2111,56 @@ _VISION_GAP_SNIPPET = (
 )
 
 
+# The brief's ABSOLUTE path, not "this folder contains <name>". MEASURED
+# 2026-09-28 (opencode log, run 1476d09d): opencode's instance directory,
+# session directory and PWD were all the session's project folder (a temp
+# folder), yet the model's first tool call read
+# C:\Users\hamza\Desktop\Projects\opencode-evals\.calvoun-brief-<id>.md --
+# a folder that does not exist on this machine. It was handed a bare file
+# name and "this folder", and it made up the folder. An absolute path leaves
+# nothing to make up.
 _BRIEF_POINTER = (
-    "This folder contains %s -- required standards for this task, and what "
-    "this conversation has already established. READ IT FIRST and follow it."
+    "READ FIRST: %s -- this task's required standards and what this "
+    "conversation already established. Open it at that exact path and follow it."
 )
+
+
+def _brief_pointer_path(has_brief, project_dir=None):
+    """What the pointer names: the brief's absolute path when the project
+    folder is known, else its bare name in the working directory (older
+    callers, and the cmd.exe fallback with no room left -- _pointer_dir)."""
+    name = has_brief if isinstance(has_brief, str) else BRIEF_FILENAME
+    if project_dir:
+        try:
+            return os.path.join(os.path.abspath(project_dir), name)
+        except (TypeError, ValueError):
+            pass
+    return name + " in your working directory"
+
+
+def _pointer_dir(sess, bin_path, text):
+    """The project folder for the brief pointer, or None for the bare name.
+
+    Always the folder when the CLI is launched directly (CreateProcess: 32,767
+    characters, _MAX_MESSAGE_CHARS_DIRECT leaves ~6,000 spare). On the cmd.exe
+    fallback the worst-case turn-1 argv sits ~120 characters under ~8191, and
+    an absolute path can be 260: there the path is paid for out of the
+    MESSAGE's own headroom -- used when the message is at least that much
+    under _MAX_MESSAGE_CHARS, else the bare name (what shipped before)."""
+    pdir = getattr(sess, "project_dir", None)
+    if not pdir:
+        return None
+    try:
+        head = os.path.basename(_launcher(bin_path)[0]).lower()
+    except Exception:                                            # noqa: BLE001
+        head = "cmd.exe"                  # unknown: assume the tight path
+    if head not in ("cmd.exe", "cmd"):
+        return pdir
+    try:
+        cost = len(os.path.abspath(pdir)) + 1
+    except (TypeError, ValueError):
+        return None
+    return pdir if len(text or "") + cost <= _MAX_MESSAGE_CHARS else None
 
 _RESTATE_SNIPPET = (
     "Before you create anything, restate in ONE line what you are building and "
@@ -2146,7 +2192,8 @@ _PLANNING_SNIPPET = (
 )
 
 
-def _system_prompt_addition(text: str = "", has_brief: bool = False) -> str:
+def _system_prompt_addition(text: str = "", has_brief: bool = False,
+                            project_dir: str = None) -> str:
     """Extra system-prompt text for this turn, or "" for none. Never raises --
     a diagnostics read failing must not block a turn from running.
 
@@ -2184,9 +2231,9 @@ def _system_prompt_addition(text: str = "", has_brief: bool = False) -> str:
     if has_brief:
         # has_brief is the FILENAME when one was written (a per-session name in
         # a shared folder), and True from older callers -- both mean "there is
-        # one", and only the first knows what it is called.
-        parts.append(_BRIEF_POINTER
-                     % (has_brief if isinstance(has_brief, str) else BRIEF_FILENAME))
+        # one", and only the first knows what it is called. With project_dir
+        # the pointer names the ABSOLUTE path (see _BRIEF_POINTER).
+        parts.append(_BRIEF_POINTER % _brief_pointer_path(has_brief, project_dir))
     # chr(10) rather than a backslash-n literal: this file gets edited through
     # tooling that has repeatedly turned that escape into a RAW newline, which
     # splits the string across lines and makes the module unimportable.
@@ -2498,7 +2545,8 @@ def _build_argv(sess: _Session, bin_path: str, text: str, stream=False):
         text if fresh else "",
         has_brief=fresh and write_task_brief(sess.project_dir, text,
                                              memory_block=_memory_block(sess, text),
-                                             session_id=getattr(sess, "id", None)))
+                                             session_id=getattr(sess, "id", None)),
+        project_dir=_pointer_dir(sess, bin_path, text))
     if addition:
         args += ["--append-system-prompt", addition]
     return _launcher(bin_path) + args
@@ -2542,7 +2590,8 @@ def _build_argv_codex(sess: "_Session", bin_path: str, text: str):
         addition = _system_prompt_addition(
             text, has_brief=write_task_brief(sess.project_dir, text,
                                              memory_block=_memory_block(sess, text),
-                                             session_id=getattr(sess, "id", None)))
+                                             session_id=getattr(sess, "id", None)),
+            project_dir=_pointer_dir(sess, bin_path, text))
     prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
         if addition else text
     base = ["exec"]
@@ -2611,7 +2660,8 @@ def _build_argv_opencode(sess: "_Session", bin_path: str, text: str):
         addition = _system_prompt_addition(
             text, has_brief=write_task_brief(sess.project_dir, text,
                                              memory_block=_memory_block(sess, text),
-                                             session_id=getattr(sess, "id", None)))
+                                             session_id=getattr(sess, "id", None)),
+            project_dir=_pointer_dir(sess, bin_path, text))
     prompt = (text + "\n\n---\n(Standing instruction for this session: " + addition + ")") \
         if addition else text
     # --auto: "auto-approve permissions that are not explicitly denied".

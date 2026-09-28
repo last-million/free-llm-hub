@@ -38,6 +38,26 @@ so swarm_windows can use it too):
    -NoNewWindow/-Redirect*) and a bash redirect do not. In the three that
    return, the server was still alive afterwards and its log was in the cwd.
 
+   Each spelling also RECORDS THE PID in server.pid (bash `& echo $! >
+   server.pid`; PowerShell `-PassThru | Select-Object -ExpandProperty Id |
+   Set-Content server.pid`, cmd the same through `powershell -Command`).
+   MEASURED 2026-09-28, same harness, a listening python http server: bash
+   0.1 s, pwsh 7.6 0.5 s, PowerShell 5.1 0.6 s, cmd 0.4 s, server listening
+   afterwards in all four. Stopping by the recorded PID:
+     PowerShell/cmd  the PID is cmd.exe's (the server is its child):
+                     `Stop-Process -Id <it>` left the server LISTENING;
+                     `taskkill /PID <it> /T /F` freed the port.
+     bash            `$!` is an MSYS PID, not a Windows one; bash's own
+                     `kill $(cat server.pid)` freed the port 13 times of 14
+                     (hence "check the port afterwards, else stop by port").
+     by port         `Get-NetTCPConnection -LocalPort N -State Listen` names
+                     the python itself; `taskkill /PID <it> /F` freed it.
+   Stopping by NAME or COMMAND LINE is forbidden in every text the agent gets:
+   live 2026-09-28 (opencode log, run 1476d09d), an agent ran `Get-Process |
+   Where-Object {$_.ProcessName -like "*python*" -and $_.CommandLine -like
+   "*app.py*"} | Select-Object Id`, then `Stop-Process -Id 1488` on what it
+   found -- the hub is a `python app.py` too, so that filter matches it.
+
 2. THE STALL DIAGNOSIS (diagnose_stall): when a turn has been silent for the
    stall deadline, is the CLI's shell blocked on a server it started? Two
    kinds of evidence, either suffices:
@@ -70,8 +90,9 @@ privilege the hub could withhold; a watcher that restarted the hub would be the
 extra process this design rules out, and the hub's own events arrive too late
 to intervene -- opencode reports a command only after it ran. So the defence is
 prevention: the brief names the hub's PID(s) and port, every rule says to stop
-only what the agent itself started, and nothing the hub writes to the agent
-ever suggests killing a python process.
+only what the agent itself started -- by the PID it recorded or the port it
+chose, never by name or command line -- the brief's stop spellings are only
+PID/port based, and the resume prompt names no kill command at all.
 """
 from __future__ import annotations
 
@@ -234,19 +255,49 @@ def _one_line(text, limit=160):
 
 
 # The three spellings, with `{cmd}` for the server command. See the docstring
-# for the measurements behind each one.
+# for the measurements behind each one. Each one also RECORDS THE PID in
+# server.pid (PID_FILE): the only safe way to stop the server later is by
+# that PID or by the port it listens on, never by searching processes by name
+# or command line -- the hub itself is a `python app.py` and matches such a
+# search (live 2026-09-28, see the module docstring).
+PID_FILE = "server.pid"
+
+
 def detach_examples(cmd="python app.py", windows=None):
     cmd = _one_line(cmd or "python app.py", 120).replace("'", "")
     if windows is None:
         windows = os.name == "nt"
-    bash = "nohup %s > server.log 2>&1 &" % cmd
+    bash = "nohup %s > server.log 2>&1 & echo $! > %s" % (cmd, PID_FILE)
     if not windows:
         return [("bash", bash)]
+    # -PassThru returns the started process; its Id is cmd.exe's (the server
+    # is cmd's child), which is why the stop rule says taskkill /T.
     ps = ("Start-Process -WindowStyle Hidden -FilePath cmd -ArgumentList "
-          "'/c','%s > server.log 2>&1'" % cmd)
+          "'/c','%s > server.log 2>&1' -PassThru | Select-Object -ExpandProperty Id "
+          "| Set-Content %s" % (cmd, PID_FILE))
     cmd_exe = ('powershell -NoProfile -Command "Start-Process -WindowStyle Hidden '
-               "-FilePath cmd -ArgumentList '/c','%s > server.log 2>&1'\"" % cmd)
+               "-FilePath cmd -ArgumentList '/c','%s > server.log 2>&1' -PassThru "
+               "| Select-Object -ExpandProperty Id | Set-Content %s\"" % (cmd, PID_FILE))
     return [("bash", bash), ("PowerShell", ps), ("cmd", cmd_exe)]
+
+
+def stop_examples(port="PORT", windows=None):
+    """How to stop a server the agent started: by the PID it recorded, or by
+    the port it started it on. Only for the BRIEF -- the resume prompt never
+    names a kill command (see the module docstring's last paragraph)."""
+    if windows is None:
+        windows = os.name == "nt"
+    bash = "kill $(cat %s)" % PID_FILE
+    if not windows:
+        return [("bash, by PID", bash),
+                ("by port", "lsof -t -iTCP:%s -sTCP:LISTEN" % port)]
+    return [
+        ("bash, by PID", bash),
+        ("PowerShell or cmd, by PID", "taskkill /PID <pid from %s> /T /F" % PID_FILE),
+        ("PowerShell, by port", "Get-NetTCPConnection -LocalPort %s -State Listen "
+                                "| Select-Object -ExpandProperty OwningProcess" % port),
+        ("cmd, by port", "netstat -ano | findstr LISTENING | findstr :%s" % port),
+    ]
 
 
 def brief_section(pids=None, port=None, windows=None):
@@ -289,11 +340,42 @@ def brief_section(pids=None, port=None, windows=None):
         "  Then check it with ONE request that has a timeout (`curl -s -m 5 "
         "http://127.0.0.1:PORT/`; in PowerShell `curl.exe`) or read server.log. "
         "Never wait on it with a command that has no timeout.",
-        "- Stop only what YOU started in this session, by the PID you started. "
-        "Never kill processes by name (`taskkill /IM python.exe`, `pkill python`, "
-        "`Stop-Process -Name python`) and never kill a PID you only found in a "
-        "process list or in netstat. If a port is taken, use another port: what "
-        "holds it may be the hub's preview of this project or someone else's app.",
+        "- RECORD THE PID of every server you start, at the moment you start it: "
+        "the spellings above write it to `%s` (`cat %s`, in PowerShell "
+        "`Get-Content %s`). Keep the port you started it on, too."
+        % (PID_FILE, PID_FILE, PID_FILE),
+        "- Stop only what YOU started in this session, and only in one of two "
+        "ways: by that recorded PID, or by the port you started it on. Spellings:",
+    ]
+    for how, example in stop_examples(windows=windows):
+        lines.append("  - %s: `%s`" % (how, example))
+    if windows:
+        lines.append(
+            "  The PowerShell/cmd PID is the `cmd` that runs your server, so stop "
+            "it with `/T` (its whole tree): `Stop-Process -Id` on it leaves the "
+            "server itself running. A bash `$!` is a bash PID, not a Windows "
+            "one: stop it with bash's own `kill`, never pass it to `taskkill` or "
+            "`Stop-Process`. The by-port lines print the PID of the server "
+            "itself; stop it with `taskkill /PID <that pid> /F`.")
+    else:
+        lines.append("  The by-port line prints the PID of the server itself; stop "
+                     "it with `kill <that pid>`.")
+    lines += [
+        "  After stopping it, check the port is free (the same one request with "
+        "a timeout); if it still answers, stop it by its port.",
+        "  If a PID you are about to stop is one of the hub's PIDs below, it is "
+        "not your server: do not stop it.",
+        "- NEVER find a process to stop by its name or its command line: not "
+        "`Get-Process | Where-Object ... app.py`, not `Get-CimInstance "
+        "Win32_Process` / `wmic` filtered on a command line, not `tasklist | "
+        "findstr python`, not `ps | grep python`, not `pkill -f app.py`, "
+        "`taskkill /IM python.exe` or `Stop-Process -Name python`. The hub below "
+        "is itself a `python app.py`, so every such search matches the hub too. "
+        "Never kill processes by name, and never kill a PID you only found in a "
+        "process list, or in netstat for any port other than the one you "
+        "started your server on. If a port is taken by something you did not "
+        "start, use another port: what holds it may be the hub's preview of "
+        "this project or someone else's app.",
         "- THE HUB IS NOT YOURS. Calvoun Free LLM Hub is the `python app.py` with "
         "PID %s, listening on port %d; it is what runs this session. Never stop, "
         "restart or signal it, and never bind port %d."
@@ -309,11 +391,12 @@ def worker_rules(pids=None, port=None, windows=None):
     ex = "; ".join("%s: `%s`" % (s, e) for s, e in
                    detach_examples("CMD", windows=windows)[:2])
     return ("Never run a server or watcher in the foreground: the shell tool waits "
-            "for it and the turn hangs. Start it DETACHED with its output in a log "
-            "(%s), check it with one request that has a timeout, or leave it to "
-            "the hub's preview. Stop only processes you started yourself; the hub "
-            "(python app.py, PID %s, port %d) is not yours -- never kill python "
-            "processes by name." % (ex, _pid_text(pids), port))
+            "for it and the turn hangs. Start it DETACHED, log and PID recorded "
+            "(%s), check it with one request with a timeout, or leave it to the "
+            "hub's preview. Stop only what you started, by that PID or its port, "
+            "never by a name or command-line search: python/app.py matches the "
+            "hub (python app.py, PID %s, port %d), not yours."
+            % (ex, _pid_text(pids), port))
 
 
 # --------------------------------------------------------------------------- #
@@ -831,10 +914,15 @@ def resume_instruction(diag, stall_seconds, pids=None, port=None, windows=None):
             "(curl -s -m 5 http://127.0.0.1:PORT/) or read server.log, and "
             "continue the task where you left off. For a web app you may also "
             "skip running it: the hub's preview starts the project itself when "
-            "your turn ends. Stop only processes you started yourself; do not "
+            "your turn ends. When you start it again, keep the PID it records in "
+            "%s and the port you gave it: if you must stop it later, stop it "
+            "ONLY by that PID or by that port, never by searching processes by "
+            "name or command line -- a search for python or app.py matches the "
+            "hub too. Stop only processes you started yourself; do not "
             "kill python processes by name or by a PID from a process list -- "
             "the hub (python app.py, PID %s, port %d) runs this session."
-            % (cmd, int(stall_seconds), state, leaky, ex, _pid_text(pids), port))
+            % (cmd, int(stall_seconds), state, leaky, ex, PID_FILE,
+               _pid_text(pids), port))
 
 
 def failure_detail(cli_id, diag):
