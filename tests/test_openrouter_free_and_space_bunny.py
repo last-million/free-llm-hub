@@ -148,3 +148,22 @@ def test_all_empty_still_proves_the_key(monkeypatch):
     body, calls = _run_test(monkeypatch, {})
     assert body["ok"] is True and "inconclusive" in body["detail"]
     assert len(calls) == 3                                           # tried each once
+
+
+def test_a_model_that_hangs_is_abandoned_and_the_next_one_tried(monkeypatch):
+    # MEASURED 2026-09-29: the health check spent 10+ minutes on nvidia alone.
+    import time as _t
+    monkeypatch.setattr(app, "_TEST_PROBE_CALL_SECONDS", 0.3)
+    monkeypatch.setattr(app, "_TEST_PROBE_KEY_SECONDS", 5)
+    real_chat = {"qwen/qwen3.8-27b:free": None, "liquid/lfm-2.5-2.6b:free": "7"}
+
+    def slow_or_fast(pid, payload, stream, only_key=app._NO_KEY_PIN):
+        if real_chat.get(payload["model"]) is None:
+            _t.sleep(3)                                              # hangs
+        return _chat_resp(real_chat.get(payload["model"]) or "")
+    started = _t.monotonic()
+    body, _calls = _run_test(monkeypatch, {"liquid/lfm-2.5-2.6b:free": "7"})
+    monkeypatch.setattr(app, "_upstream_chat", slow_or_fast)
+    body = app.app.test_client().post("/api/test/openrouter", headers=_hdrs()).get_json()
+    assert body["ok"] is True and "liquid/lfm-2.5-2.6b:free" in body["detail"]
+    assert _t.monotonic() - started < 2.5

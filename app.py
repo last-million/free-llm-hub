@@ -732,6 +732,31 @@ _PRICE_FIELDS = ("prompt", "completion", "input", "output",
 # Visible-answer room for the provider Test's probe on a FREE provider: a
 # thinking model spends its budget on reasoning first (see _probe).
 _TEST_PROBE_MAX_TOKENS = 512
+# ...and its time: one probe call, and all the candidates of one key.
+_TEST_PROBE_CALL_SECONDS = 40
+_TEST_PROBE_KEY_SECONDS = 90
+
+
+def _bounded_probe_call(pid, payload, pin, seconds):
+    """_upstream_chat(pid, payload, stream=False, **pin) that gives up after
+    `seconds`: raises requests.Timeout then (the call is abandoned on its
+    daemon thread, as _dispatch_chat_with_deadline does)."""
+    box = {}
+
+    def _call():
+        try:
+            box["resp"] = _upstream_chat(pid, payload, stream=False, **pin)
+        except (requests.RequestException, RuntimeError) as exc:
+            box["exc"] = exc
+
+    t = threading.Thread(target=_carry_usage_source(_call), daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        raise requests.Timeout("no answer within %ds" % int(seconds))
+    if "exc" in box:
+        raise box["exc"]
+    return box.get("resp")
 
 # Router ALIASES in OpenRouter's catalog, not models: openrouter/free picks
 # some free model per request, openrouter/auto a paid one.
@@ -15273,7 +15298,17 @@ def api_test_provider(pid):
         # 16 tokens (16 = Perplexity's floor): it spends the user's allowance.
         max_tok = 16 if metered_probe else _TEST_PROBE_MAX_TOKENS
         first_empty = None
+        # BOUNDED. MEASURED 2026-09-29: with room for an answer and a move-on
+        # past empty replies, the health check spent 10+ minutes on nvidia
+        # alone (slow hops at the 300 s read timeout, 2 keys x 5 models).
+        # Each call gets _TEST_PROBE_CALL_SECONDS and each key
+        # _TEST_PROBE_KEY_SECONDS; a model that says nothing in time is a
+        # failed candidate, and the next one is tried while time is left.
+        key_deadline = time.monotonic() + _TEST_PROBE_KEY_SECONDS
         for model in candidates[:5]:  # cap attempts — this call is user-interactive
+            if time.monotonic() >= key_deadline:
+                reason = reason or ("no answer within %ds" % _TEST_PROBE_KEY_SECONDS)
+                break
             resp = None
             prompt, expected = _canary_question()
             for attempt in range(2):
@@ -15283,10 +15318,12 @@ def api_test_provider(pid):
                 # a parameter this path never uses).
                 pin = {} if key_pin is _NO_KEY_PIN else {"only_key": key_pin}
                 try:
-                    resp = _upstream_chat(pid, {"model": model,
-                                                "messages": [{"role": "user", "content": prompt}],
-                                                "max_tokens": max_tok},
-                                          stream=False, **pin)
+                    resp = _bounded_probe_call(
+                        pid, {"model": model,
+                              "messages": [{"role": "user", "content": prompt}],
+                              "max_tokens": max_tok},
+                        pin, min(_TEST_PROBE_CALL_SECONDS,
+                                 max(1.0, key_deadline - time.monotonic())))
                 except (requests.RequestException, RuntimeError) as exc:
                     reason = _sanitize("%s: %s" % (exc.__class__.__name__, exc))
                     resp = None
