@@ -184,3 +184,25 @@ def test_quick_models_are_probed_before_slow_ones(monkeypatch):
     body, calls = _run_test(monkeypatch, {"liquid/lfm-2.5-2.6b:free": "7",
                                           "qwen/qwen3.8-27b:free": "7"})
     assert calls[0][0] == "liquid/lfm-2.5-2.6b:free"                 # quick one first
+
+
+def test_a_test_where_nothing_answered_in_time_does_not_blame_the_keys(monkeypatch):
+    # MEASURED 2026-09-29: nvidia's strong models ran past 30 s while its
+    # nemotron models answered with the same key; the Test said "None of the
+    # 2 keys work".
+    import time as _t
+    monkeypatch.setattr(app, "_TEST_PROBE_CALL_SECONDS", 0.2)
+    monkeypatch.setattr(app, "_TEST_PROBE_KEY_SECONDS", 1)
+
+    def hang(pid, payload, stream, only_key=app._NO_KEY_PIN):
+        _t.sleep(2)
+        return _chat_resp("7")
+    _run_test(monkeypatch, {})
+    monkeypatch.setattr(app, "_upstream_chat", hang)
+    body = app.app.test_client().post("/api/test/openrouter", headers=_hdrs()).get_json()
+    assert body["ok"] is False
+    # one key: that key's own verdict; several: "No key could be verified"
+    assert ("No key could be verified" in body["detail"]
+            or body["detail"].startswith("Could not verify this key"))
+    assert "None of the" not in body["detail"]
+    assert body["keys"][0]["detail"].startswith("Could not verify this key")

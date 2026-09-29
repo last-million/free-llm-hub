@@ -15398,6 +15398,15 @@ def api_test_provider(pid):
         # Every candidate authenticated but none could actually generate — the
         # spent-wallet case this whole rewrite exists to catch. Plain language,
         # not a bare HTTP status, so the verdict answers "will this work".
+        # NO ANSWER IN TIME is not a key failure. MEASURED 2026-09-29: nvidia's
+        # glm-5.3 / kimi-k3 / deepseek-v4.1 all ran past 30 s while its
+        # nemotron models answered with the SAME key -- and the Test said
+        # "None of the 2 keys work".
+        if models_list_note and _HEALTH_SLOW_RE.search(str(reason or "")) \
+                and not re.search(r"\bHTTP \d{3}\b", str(reason or "")):
+            return ("Could not verify this key: the models tried did not answer within "
+                    "the Test's time limit (%s). The provider is slow or overloaded right "
+                    "now -- routing moves past it; try the Test again later." % reason)
         if models_list_note:
             return ("Key authenticates and lists models (%s), but generation FAILS on "
                     "every candidate tried — this will NOT work for free usage: %s"
@@ -15445,6 +15454,11 @@ def api_test_provider(pid):
                      ", #".join(map(str, bad))))
     elif good:
         detail = "All %d keys work." % len(pool)
+    elif per_key and all(str(k["detail"]).startswith("Could not verify this key")
+                         for k in per_key):
+        detail = ("No key could be verified: the provider's models did not answer in "
+                  "time -- it is slow or overloaded right now, which says nothing "
+                  "against the keys. %s" % per_key[0]["detail"])
     else:
         detail = ("None of the %d keys work. %s"
                   % (len(pool), per_key[0]["detail"] if per_key else ""))
