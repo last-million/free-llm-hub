@@ -1107,6 +1107,21 @@ Covered by `tests/test_openrouter_free_and_space_bunny.py`.
   (nemotron-3-nano-omni ...:free) 403 "credit limit insufficient, remaining
   0" -- it bills a paid balance. Do not re-add without a real free 200.
 
+## Categories by name AND by evidence (2026-09-29)
+
+Covered by `tests/test_category_evidence.py`. Rechecked against the live
+fleet: 34 of 117 alive models were in no category, including the #2 model
+(stealth/space-bunny-alpha); qwen3.8-27b was only "uncensored", MiniMax-M2.7
+in none. Named now: `space-bunny` (swarm, coding, context, vision, seo),
+`qwen3.8` and `minimax-m2` (swarm, coding). `app._category_matches` is the ONE
+membership test (routing `_mode_allows`, the Settings list, the mode counts):
+the name patterns, else `_category_by_evidence` unless a "!" pattern rules
+the model out (`model_categories.excluded`): context = KNOWN window >=
+400K; swarm/coding/seo = tool-capable and score >= 130; reasoning = that and
+`_thinks_by_default`. uncensored/specialist/fast/vision stay name-only.
+`tests/conftest.py` stands evidence aside for tests that patch
+`model_categories.matches` to define membership themselves.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

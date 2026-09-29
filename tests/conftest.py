@@ -98,3 +98,23 @@ def _steady_machine(monkeypatch):
                         lambda: {"total_gb": 32.0, "free_gb": 16.0, "cores": 8})
     yield
     lowres._CACHE.update(at=0.0, value=None)
+
+
+@pytest.fixture(autouse=True)
+def _category_evidence_yields_to_patched_patterns(monkeypatch):
+    """app._category_by_evidence (2026-09-29) adds top-band tool-capable
+    models to coding/swarm/... Tests that DEFINE membership by replacing
+    model_categories.matches (a fleet where every model scores 134) mean
+    exactly that membership, so evidence stands aside for them only.
+    tests/test_category_evidence.py leaves the patterns alone and keeps it."""
+    import app
+    import model_categories
+    real_matches = model_categories.matches
+    real_evidence = app._category_by_evidence
+
+    def evidence(key, pid, model):
+        if model_categories.matches is not real_matches:
+            return False
+        return real_evidence(key, pid, model)
+    monkeypatch.setattr(app, "_category_by_evidence", evidence)
+    yield

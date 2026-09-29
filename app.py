@@ -16041,7 +16041,7 @@ def api_model_categories():
     out = []
     for key, label, helptext in model_categories.labels():
         ids = sorted(mid for _p, _m, mid, ident in live
-                     if model_categories.matches(key, _p, _m, ident))
+                     if _category_matches(key, _p, _m, ident))
         out.append({"key": key, "label": label, "help": helptext,
                     "count": len(ids), "ids": ids,
                     "enabled": sum(1 for i in ids if i not in blocked)})
@@ -16095,7 +16095,7 @@ def api_model_mode():
             continue          # a pipeline id, not a mode -- see _mode_keys
         modes.append({"key": key, "label": label, "help": helptext,
                       "count": sum(1 for p, m, i in live
-                                   if model_categories.matches(key, p, m, i))})
+                                   if _category_matches(key, p, m, i))})
     out = {"mode": _global_mode(), "modes": modes}
     sid = str(request.args.get("session_id") or "").strip()
     if sid:
@@ -19061,9 +19061,54 @@ def _mode_allows(mode, pid, model, session_overrides=None):
             return False
         if ident in ov.get("add", ()):
             return True
-        return model_categories.matches(mode, pid, model, ident)
+        return _category_matches(mode, pid, model, ident)
     except Exception:                                            # noqa: BLE001
         return True
+
+
+# CATEGORIES BY EVIDENCE. RECHECKED 2026-09-29 against the live fleet: 34 of
+# 117 alive models were in no category, among them the #2 model overall
+# (stealth/space-bunny-alpha, 137.7) -- so choosing "coding" shut out exactly
+# the models the ranking rates best. The name patterns in model_categories
+# stay authoritative; these MEASURED facts add a model on top, so a new
+# strong model lands in the right categories the day it appears:
+#   context  -- a KNOWN window (catalog / learned / inferred / reference, not
+#               the default guess) of at least _CATEGORY_LONG_CONTEXT;
+#   swarm, coding -- calls tools AND ranks in the top band (_CATEGORY_TOP_SCORE);
+#   seo      -- the same, unless an SEO "!" pattern (the cheap tier) rules it out;
+#   reasoning -- the same, and it thinks by default (docs table / live evidence).
+# Behavioural categories (uncensored, specialist, fast, vision) stay by name.
+_CATEGORY_TOP_SCORE = 130.0
+_CATEGORY_LONG_CONTEXT = 400_000
+
+
+def _category_by_evidence(key, pid, model):
+    try:
+        if key == "context":
+            window, src = _model_ctx_info(pid, model)
+            return src != "default" and bool(window) and window >= _CATEGORY_LONG_CONTEXT
+        if key in ("swarm", "coding", "seo", "reasoning"):
+            if not _supports_tools(pid, model) or \
+                    _benchmark_score(pid, model) < _CATEGORY_TOP_SCORE:
+                return False
+            if key == "reasoning":
+                return bool(_thinks_by_default(pid, model))
+            return True
+    except Exception:                                            # noqa: BLE001
+        return False
+    return False
+
+
+def _category_matches(key, pid, model, ident=None):
+    """Category membership: the name patterns, else measured evidence (see
+    _category_by_evidence) unless a "!" pattern rules the model out. The ONE
+    test routing, the Settings list and the mode counts all use."""
+    ident = ident if ident is not None else _normalize_model_identity(model)
+    if model_categories.matches(key, pid, model, ident):
+        return True
+    if model_categories.excluded(key, pid, model, ident):
+        return False
+    return _category_by_evidence(key, pid, model)
 
 
 def _mode_first_size_split(fits, compactable, floor):

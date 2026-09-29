@@ -60,7 +60,14 @@ CATEGORIES = [
          # Qwen 3.8 Max #1 at 55.2% (above every closed model), GLM-5.2
          # (xhigh) 37.1% -- level with Kimi K3 (max) 37.1%, already listed.
          # Live fleet 2026-09-27: no qwen3.8-max id; glm-5.2 only via g4f.
-         "qwen3.8-max", "glm-5.2"),
+         "qwen3.8-max", "glm-5.2",
+         # RECHECK 2026-09-29 against the live fleet: the #2 model on it
+         # (OpenRouter's stealth/space-bunny-alpha: tools, reasoning, 1M
+         # window per its own catalog row; owner directive "one of the best")
+         # and qwen3.8-27b (134.1, top band) were in no agent category, and
+         # MiniMax-M2.x -- the family MiniMax built for agents and code -- in
+         # none at all.
+         "space-bunny", "qwen3.8", "minimax-m2"),
     ),
     (
         "coding",
@@ -83,7 +90,9 @@ CATEGORIES = [
          # Both beat listed members on both boards (Kimi K3 AA TB4.0 13%,
          # DeepSeek V4 Pro 14%, Claude Sonnet 5 tbench 12.4% / AA 14%).
          # Live fleet 2026-09-27: gemini-3.8-flash answers; no grok-4.7 id.
-         "gemini-3.8", "grok-4.7"),
+         "gemini-3.8", "grok-4.7",
+         # RECHECK 2026-09-29 (see swarm): the top-band coders it missed.
+         "space-bunny", "qwen3.8", "minimax-m2"),
     ),
     (
         "reasoning",
@@ -103,7 +112,8 @@ CATEGORIES = [
         # (1M tokens) and llama-4-maverick is the other very-long-context
         # family the fleet actually serves.
         ("gemini-", "kimi-k3", "kimi-k2.6", "minimax-m3", "qwen3.6",
-         "llama-4-maverick", "glm-5.3", "hy3", "hy4"),
+         "llama-4-maverick", "glm-5.3", "hy3", "hy4",
+         "space-bunny"),          # 1M window, its own catalog row (2026-09-29)
     ),
     (
         "vision",
@@ -124,7 +134,9 @@ CATEGORIES = [
          # kimi-k2.6 1262 -- all at or above gemma-4-31b (1261), which is
          # already listed. Named narrowly: the board scores these exact models.
          # Live fleet 2026-09-27: glm-5.3-flash answers (dahl); no qwen3.8-max.
-         "qwen3.8-max", "glm-5.3-flash", "kimi-k2.6"),
+         "qwen3.8-max", "glm-5.3-flash", "kimi-k2.6",
+         # its own OpenRouter catalog row lists image AND video input (2026-09-29)
+         "space-bunny"),
     ),
     (
         "uncensored",
@@ -178,6 +190,7 @@ CATEGORIES = [
         ("claude-sonnet", "claude-opus", "claude-fable", "gpt-5.6", "gpt-5.2",
          "gpt-4o", "thinking", "reasoner", "deepseek-v4-pro", "kimi-k3",
          "kimi-k2.6", "qwen3.6", "glm-5.3", "gemini-", "magistral", "hy3",
+         "space-bunny",
          # ...but never the cheap tier: "max thinking" is the whole request,
          # and a flash/lite/mini variant is the one thing it rules out.
          # "!-mini" for the same reason "-mini" is spelled that way above:
@@ -230,6 +243,18 @@ def matches(key, provider, model, identity=None):
     return any(_hit(p) for p in pats if not p.startswith("!"))
 
 
+def excluded(key, provider, model, identity=None):
+    """True when one of category `key`'s "!" patterns rules this model out
+    (app's evidence-based membership must not override an explicit "not this
+    one", e.g. SEO's cheap-tier exclusions)."""
+    pats = _BY_KEY.get(key) or ()
+    hay = ("%s/%s" % (provider or "", model or "")).lower()
+    ident = (identity or "").lower()
+    return any(p.startswith("!") and (p[1:] in hay or (ident and p[1:] in ident))
+               for p in pats)
+
+
 def categories_for(provider, model, identity=None):
-    """Every category this model belongs to."""
+    """Every category this model belongs to (by name patterns only; app adds
+    measured evidence on top -- see app._category_matches)."""
     return [k for k in CATEGORY_KEYS if matches(k, provider, model, identity)]
