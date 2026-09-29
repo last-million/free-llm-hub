@@ -729,6 +729,50 @@ _PRICE_FIELDS = ("prompt", "completion", "input", "output",
                  "prompt_price", "completion_price")
 
 
+# Visible-answer room for the provider Test's probe on a FREE provider: a
+# thinking model spends its budget on reasoning first (see _probe).
+_TEST_PROBE_MAX_TOKENS = 512
+
+# Router ALIASES in OpenRouter's catalog, not models: openrouter/free picks
+# some free model per request, openrouter/auto a paid one.
+_ZERO_TEXT_ALIASES = frozenset({"openrouter/free", "openrouter/auto"})
+
+
+def _zero_priced_text_ids(payload):
+    """Ids WITHOUT the ':free' suffix that are free anyway, for a
+    'suffix_free' provider with `free_zero_text` (OpenRouter).
+
+    MEASURED 2026-09-29 on OpenRouter's live catalog, the only zero-priced
+    non-':free' rows were stealth/space-bunny-alpha (text out), the
+    openrouter/free router alias, and google/lyria-3-pro/clip-preview, which
+    report 0 prompt/completion but output AUDIO and bill per song. So: every
+    published price zero, output modalities exactly ["text"], not an alias.
+    A row without prices or modalities is left out (unknown is not free)."""
+    out = []
+    rows = (payload.get("data") or payload.get("models") or []) \
+        if isinstance(payload, dict) else (payload or [])
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id")
+        if not isinstance(mid, str) or not mid or mid.lower().endswith(":free") \
+                or mid.lower() in _ZERO_TEXT_ALIASES:
+            continue
+        pricing = item.get("pricing")
+        if not isinstance(pricing, dict) or not pricing:
+            continue
+        try:
+            if any(float(v) != 0 for v in pricing.values() if v not in (None, "")):
+                continue
+        except (TypeError, ValueError):
+            continue
+        outs = (item.get("architecture") or {}).get("output_modalities")
+        if outs != ["text"]:
+            continue
+        out.append(mid)
+    return out
+
+
 def _zero_priced_ids(payload):
     """Ids in a catalog whose published price is ZERO, for 'pricing_zero' providers.
 
@@ -905,6 +949,8 @@ def provider_free_models(pid, live=True):
                 # in the payload we are already holding; hand it that list, or it
                 # fails closed on every id and stays frozen on its static list.
                 known_free = None
+                if p.get("free_zero_text"):
+                    prov.note_extra_free(pid, _zero_priced_text_ids(resp.json()))
                 if p.get("free_filter") == "pricing_zero":
                     known_free = _zero_priced_ids(resp.json())
                 # Same idea for a catalog that labels tiers instead of prices.
@@ -1627,8 +1673,14 @@ def _strong_root_version_excess(low):
 # deliberate thumb-on-the-scale values, NOT measured strength, so any code that
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
-#                 hy3    k3     sol  terra k2.6  claude gpt5.5+ glm5.x gpt5.x  dsv4   mm3  pixel
-_PREF_FLOORS = (134.5, 134.8, 136, 135, 0,    138,   136,    134,   135,   134,   133, 137.6)
+#                 hy3    k3     sol  terra k2.6  claude gpt5.5+ glm5.x gpt5.x  dsv4   mm3  pixel  bunny
+_PREF_FLOORS = (134.5, 134.8, 136, 135, 0,    138,   136,    134,   135,   134,   133, 137.6, 137.7)
+# OWNER DIRECTIVE 2026-09-29: "space bunny alpha ... make it from the best
+# models, it is wooow". OpenRouter's stealth/space-bunny-alpha (anonymous, free
+# while in stealth, 1M window, tools, reasoning, image input -- its own catalog
+# row) scored 14 as an unknown family. Index 12 = 137.7: the owner's top band,
+# just above Pixel Canary (137.6) and still under Claude's owner-set 138.
+_SPACE_BUNNY_RE = re.compile(r"(?<![a-z0-9])space[-_ .]?bunny(?![a-z])")
 # OWNER DIRECTIVE 2026-09-27: "Pixel Canary" is better than Kimi K3 and GPT-6
 # Astra, per the owner's own benchmark reading (no public board or web source
 # is claimed here). Listed by NO provider on that date (0 of 401 catalog rows
@@ -2343,6 +2395,9 @@ def _benchmark_score(pid, model_id):
     _pixel_canary = bool(_PIXEL_CANARY_RE.search(low))
     if _pixel_canary:
         score = max(score, _PREF_FLOORS[11])
+    # OWNER DIRECTIVE 2026-09-29: Space Bunny in the top band (_PREF_FLOORS[12]).
+    if _SPACE_BUNNY_RE.search(low):
+        score = max(score, _PREF_FLOORS[12])
     # USER PREFERENCE 2026-07-31: "GLM 5.2 is also good — if available it should
     # be used." Floored level with hy3, i.e. just under the named top three, so
     # a live glm-5.x is reached for ahead of the ordinary field. glm-4.x and the
@@ -15107,6 +15162,8 @@ def api_test_provider(pid):
             # test must ask the same question routing asks, or it is testing a
             # hub that does not exist.
             _known_free = None
+            if p.get("free_zero_text"):
+                prov.note_extra_free(pid, _zero_priced_text_ids(resp.json()))
             if p.get("free_filter") == "pricing_zero":
                 _known_free = _zero_priced_ids(resp.json())
             elif p.get("free_filter") == "free_tier":
@@ -15155,6 +15212,17 @@ def api_test_provider(pid):
         if m and m not in seen and prov.is_model_allowed(m):
             seen.add(m)
             candidates.append(m)
+    # Models the hub would ROUTE to first, strongest first. MEASURED
+    # 2026-09-29: OpenRouter's Test probed its catalog in listed order and
+    # landed on inclusionai/ling-3.0-flash-sante -- a model the user's
+    # blocklist switches off -- for every key, and reported "empty reply
+    # (inconclusive)". A blocked model still proves a key generates, so it
+    # stays, behind the rest. Stable sort: equal scores keep catalog order.
+    try:
+        candidates.sort(key=lambda m: (_model_block_reason(pid, m) is not None,
+                                       -_benchmark_score(pid, m)))
+    except Exception:                                            # noqa: BLE001
+        pass
     # A provider with NO free models still has a key worth testing. Puter is the
     # live case: it is metered (~25c/month per account), so it deliberately
     # declares zero free models — which left Test with nothing to probe and made
@@ -15196,6 +15264,15 @@ def api_test_provider(pid):
         (the question this button has always answered); the quality verdict
         rides alongside in `canary` and in the wording, never flips ok."""
         reason = None
+        # An EMPTY 200 proves the key generates but says nothing about the
+        # model: a thinking model spends a 16-token budget before any visible
+        # text (MEASURED 2026-09-29, every OpenRouter key: "answered with an
+        # empty reply (inconclusive)"). So a free probe gets room for the
+        # reasoning, and an empty 200 moves on to the next candidate, falling
+        # back to it only when nothing answers in words. A METERED probe keeps
+        # 16 tokens (16 = Perplexity's floor): it spends the user's allowance.
+        max_tok = 16 if metered_probe else _TEST_PROBE_MAX_TOKENS
+        first_empty = None
         for model in candidates[:5]:  # cap attempts — this call is user-interactive
             resp = None
             prompt, expected = _canary_question()
@@ -15208,7 +15285,7 @@ def api_test_provider(pid):
                 try:
                     resp = _upstream_chat(pid, {"model": model,
                                                 "messages": [{"role": "user", "content": prompt}],
-                                                "max_tokens": 16},  # 16 = Perplexity's floor
+                                                "max_tokens": max_tok},
                                           stream=False, **pin)
                 except (requests.RequestException, RuntimeError) as exc:
                     reason = _sanitize("%s: %s" % (exc.__class__.__name__, exc))
@@ -15218,15 +15295,21 @@ def api_test_provider(pid):
                     attempted.append((model, True))
                     answer = _canary_reply_text(resp)
                     verdict = _judge_canary(answer, expected)
-                    return True, model, None, {
-                        "verdict": verdict, "model": model, "expected": expected,
-                        "answer": _sanitize(answer.strip())[:120],
-                        "summary": _canary_summary(verdict, answer)}
+                    canary = {"verdict": verdict, "model": model, "expected": expected,
+                              "answer": _sanitize(answer.strip())[:120],
+                              "summary": _canary_summary(verdict, answer)}
+                    if answer.strip() or metered_probe:
+                        return True, model, None, canary
+                    if first_empty is None:
+                        first_empty = (model, canary)
+                    break
                 if resp.status_code in _TRANSIENT and attempt == 0:
                     time.sleep(2)
                     continue
                 reason = "HTTP %d: %s" % (resp.status_code, _upstream_error_detail(resp))
                 break
+            if first_empty is not None and first_empty[0] == model:
+                continue            # it answered, in no words: try the next one
             attempted.append((model, False))  # candidate didn't pan out — try the next
             if (resp is not None and resp.status_code == 401
                     and not _looks_like_model_scoped(reason)):
@@ -15242,6 +15325,8 @@ def api_test_provider(pid):
                 # note about this exact wording since 2026-07-27. Breaking there
                 # condemned two perfectly good keys and hid five working models.
                 break
+        if first_empty is not None:
+            return True, first_empty[0], None, first_empty[1]
         return False, None, reason, None
 
     def _canary_note(canary):

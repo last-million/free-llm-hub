@@ -66,6 +66,10 @@ PROVIDERS: Dict[str, dict] = {
         # don't model: they report 0 and would silently spend real money.
         # All 20 ':free' ids are zero across every pricing field — no false positives.
         "free_filter": "suffix_free",
+        # ...PLUS zero-priced ids with TEXT-only output (stealth models such as
+        # stealth/space-bunny-alpha carry no ':free'). Lyria stays out: it
+        # outputs audio. See app._zero_priced_text_ids.
+        "free_zero_text": True,
         # RE-VERIFIED 2026-07-27 against the live /models catalog + a real 1-token
         # generation per id through the hub itself. Removed: llama-3.3-70b-instruct
         # (openrouter itself 503s "unavailable for free, use this slug instead"),
@@ -1879,6 +1883,19 @@ _NON_CHAT_PATTERNS = [
 _NONCHAT_RE = re.compile("|".join(_NON_CHAT_PATTERNS), re.IGNORECASE)
 
 
+# Ids a 'suffix_free' provider publishes as free WITHOUT the suffix, learned
+# from its live catalog at discovery (app._zero_priced_text_ids, providers with
+# `free_zero_text`). OpenRouter's stealth models are the case: MEASURED
+# 2026-09-29, stealth/space-bunny-alpha was priced 0 with no ':free', so the
+# suffix rule hid it. {pid: set of lower-cased ids}.
+_EXTRA_FREE: Dict[str, set] = {}
+
+
+def note_extra_free(provider_id: str, model_ids) -> None:
+    """Replace `provider_id`'s learned suffix-less free ids (see _EXTRA_FREE)."""
+    _EXTRA_FREE[provider_id] = {str(m).lower() for m in (model_ids or ()) if m}
+
+
 def is_free_model(provider_id: str, model_id: Optional[str],
                   is_free_tier: bool = True,
                   known_free: Optional[List[str]] = None) -> bool:
@@ -1923,7 +1940,8 @@ def is_free_model(provider_id: str, model_id: Optional[str],
         # free-model list stays genuinely LIVE — new/removed '-free' ids are
         # picked up automatically instead of needing a hand-maintained
         # default_free_models list re-verified by hand every time it drifts.
-        return low.endswith(str(prov.get("free_suffix") or ":free"))
+        return (low.endswith(str(prov.get("free_suffix") or ":free"))
+                or low in _EXTRA_FREE.get(provider_id, ()))
     if free_filter == "family":
         families = [f.lower() for f in (prov.get("free_families") or [])]
         if not families:

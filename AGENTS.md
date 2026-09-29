@@ -1069,6 +1069,26 @@ parser, fuzzy `match_model`, `ConversationStore` at
   `#agent-orchestrator` per conversation. `GET/POST /api/orchestrator
   {model, session_id?}`.
 
+## OpenRouter free models, Space Bunny, conclusive provider Test (2026-09-29)
+
+Covered by `tests/test_openrouter_free_and_space_bunny.py`.
+
+- OpenRouter stays `suffix_free` (Lyria bills per song at price 0) PLUS
+  `free_zero_text`: discovery and the Test call `_zero_priced_text_ids`
+  (every published price 0, `architecture.output_modalities == ["text"]`, not
+  the `openrouter/free`/`auto` aliases) and `providers.note_extra_free`;
+  `is_free_model` accepts those ids. MEASURED: stealth/space-bunny-alpha was
+  the only real model this admitted.
+- OWNER DIRECTIVE: Space Bunny floor `_PREF_FLOORS[12]` = 137.7
+  (`_SPACE_BUNNY_RE`), above Pixel Canary, under Claude's 138. No public
+  benchmark exists for it (anonymous stealth model).
+- Provider Test: candidates sorted unblocked-first, strongest-first; a free
+  probe gets `_TEST_PROBE_MAX_TOKENS` (512, metered probes keep 16); an empty
+  200 moves on to the next candidate and is only the fallback verdict.
+- AA scores ARE applied where the feed has them (nemotron-3 ultra/super,
+  inkling, north-mini-code...); gemma-4, laguna, ling, dots, lfm-2.5 and
+  inkling-small have no feed entry and score by family table.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):
