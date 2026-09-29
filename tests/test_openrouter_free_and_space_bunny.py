@@ -167,3 +167,20 @@ def test_a_model_that_hangs_is_abandoned_and_the_next_one_tried(monkeypatch):
     body = app.app.test_client().post("/api/test/openrouter", headers=_hdrs()).get_json()
     assert body["ok"] is True and "liquid/lfm-2.5-2.6b:free" in body["detail"]
     assert _t.monotonic() - started < 2.5
+
+
+def test_a_slow_provider_is_not_reported_as_dead_keys():
+    # MEASURED 2026-09-29: "Timeout: no answer within 9s" put nvidia under
+    # DEAD KEYS in the health report.
+    for d in ("Key authenticates ... FAILS on every candidate tried: Timeout: no answer within 9s",
+              "ReadTimeout: HTTPSConnectionPool read timed out", "ConnectionError: refused"):
+        assert app._health_failure_kind(d) == "server", d
+    assert app._health_failure_kind("HTTP 401: invalid api key") == "key"
+    assert app._health_failure_kind("HTTP 403: no permission") == "key"
+
+
+def test_quick_models_are_probed_before_slow_ones(monkeypatch):
+    monkeypatch.setattr(app, "_is_slow_model", lambda p, m: m == "qwen/qwen3.8-27b:free")
+    body, calls = _run_test(monkeypatch, {"liquid/lfm-2.5-2.6b:free": "7",
+                                          "qwen/qwen3.8-27b:free": "7"})
+    assert calls[0][0] == "liquid/lfm-2.5-2.6b:free"                 # quick one first

@@ -15243,8 +15243,12 @@ def api_test_provider(pid):
     # blocklist switches off -- for every key, and reported "empty reply
     # (inconclusive)". A blocked model still proves a key generates, so it
     # stays, behind the rest. Stable sort: equal scores keep catalog order.
+    # ...and QUICK before slow: the probe has a time limit, and nvidia's
+    # strongest models (the slowest) used all of it and made two working keys
+    # look dead (MEASURED 2026-09-29). _is_slow_model is measured TTFT.
     try:
         candidates.sort(key=lambda m: (_model_block_reason(pid, m) is not None,
+                                       bool(_is_slow_model(pid, m)),
                                        -_benchmark_score(pid, m)))
     except Exception:                                            # noqa: BLE001
         pass
@@ -15493,6 +15497,9 @@ _HEALTH_POLICY_RE = re.compile(
 # Live 2026-09-28: tokenrouter answered every key 503 "No available channel for
 # model ...": the provider is down, the keys are not dead.
 _HEALTH_5XX_RE = re.compile(r"\bHTTP 5\d\d\b")
+_HEALTH_SLOW_RE = re.compile(
+    r"\b(?:Read|Connect)?Timeout\b|timed out|no answer within|ConnectionError|"
+    r"RemoteDisconnected", re.I)
 _HEALTH_TOOL_NAME = "get_utc_time"
 _health_lock = threading.Lock()
 _health_cancel = threading.Event()
@@ -15598,6 +15605,11 @@ def _health_failure_kind(detail):
     if _HEALTH_POLICY_RE.search(detail):
         return "policy"
     if _HEALTH_5XX_RE.search(detail) and not re.search(r"\bHTTP (401|403)\b", detail):
+        return "server"
+    # No answer in time is the PROVIDER being slow or unreachable, never the
+    # key. MEASURED 2026-09-29: nvidia's keys were reported dead after
+    # "Timeout: no answer within 9s" under the probe's time limit.
+    if _HEALTH_SLOW_RE.search(detail) and not re.search(r"\bHTTP \d{3}\b", detail):
         return "server"
     return "key"
 
