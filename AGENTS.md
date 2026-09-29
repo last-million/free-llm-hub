@@ -1089,6 +1089,24 @@ Covered by `tests/test_openrouter_free_and_space_bunny.py`.
   inkling, north-mini-code...); gemma-4, laguna, ling, dots, lfm-2.5 and
   inkling-small have no feed entry and score by family table.
 
+## Only working keys & TokenRouter removed (2026-09-29)
+
+- **Dead keys escalate** (`tests/test_dead_key_escalation.py`): an expired
+  dead mark is KEPT (only `clear_key_dead` on a 2xx / passing Test removes
+  it), so a key found dead again within `_KEY_DEAD_REPEAT_WINDOW` (3 days)
+  doubles its time out, up to `_KEY_DEAD_MAX_TTL` (7 days). 5xx marks are
+  `escalate=False` (an outage is the provider's, not the key's).
+  `usable_keys` still fails open when EVERY key of a provider is out.
+- **Provider Test time limits**: `_TEST_PROBE_CALL_SECONDS` (40) per call,
+  `_TEST_PROBE_KEY_SECONDS` (90) per key, quick models first
+  (`_is_slow_model`); when nothing answered in time the verdict is "Could not
+  verify this key ... slow or overloaded", never "None of the keys work", and
+  `_health_failure_kind` files timeouts as `server`.
+- **TokenRouter: removed** at user request. Re-probed with the user's keys:
+  kimi-k3-free 503 "No available channel", and the only other free-named id
+  (nemotron-3-nano-omni ...:free) 403 "credit limit insufficient, remaining
+  0" -- it bills a paid balance. Do not re-add without a real free 200.
+
 ## Tests
 
 Run with the SYSTEM python (the `.venv` has no pytest):

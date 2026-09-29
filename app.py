@@ -9825,7 +9825,9 @@ def _note_key_test_verdict(pid, key, ok, reason):
             return
         ttl = (quota._KEY_DEAD_LIVE_TTL if _KEY_TEST_5XX_RE.search(why)
                else quota._KEY_DEAD_TEST_TTL)
-        quota.mark_key_dead(pid, key, ttl, "Test: " + why[:160], source="test")
+        # A 5xx is about the provider, not the key: never escalated.
+        quota.mark_key_dead(pid, key, ttl, "Test: " + why[:160], source="test",
+                            escalate=not _KEY_TEST_5XX_RE.search(why))
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -14468,7 +14470,6 @@ _RECOMMENDED_QUALITY_THRESHOLD = 95
 # this is a snapshot list, same tradeoff the static 'recommended' flag
 # already makes. Update when a real new batch lands.
 _NEW_PROVIDER_IDS = frozenset((
-    "tokenrouter",
     "deepinfra", "together", "hyperbolic", "nebius", "cohere",
     "scaleway", "stepfun", "aion", "sealion", "requesty",
     "dahl",

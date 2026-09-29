@@ -71,8 +71,9 @@ def test_the_static_hand_curated_flag_still_works_standalone(isolated_config):
     assert row["recommended"] is True
 
 
-def test_tokenrouter_is_flagged_new(isolated_config):
-    row = app._provider_row("tokenrouter", live_models=False)
+def test_a_recently_added_provider_is_flagged_new(isolated_config):
+    # (was tokenrouter, removed 2026-09-29 -- no free models left)
+    row = app._provider_row("deepinfra", live_models=False)
     assert row["new"] is True
 
 

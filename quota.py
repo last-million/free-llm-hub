@@ -602,9 +602,23 @@ _KEY_AUTH_STRIKES_TO_DEAD = 2
 _KEY_AUTH_STRIKE_WINDOW = 600
 
 
+# REPEAT OFFENDERS stay out longer. REQUESTED 2026-09-29: "make sure it uses
+# only working API keys". A key found dead AGAIN within _KEY_DEAD_REPEAT_WINDOW
+# of its last mark ending doubles its time out, up to _KEY_DEAD_MAX_TTL (6 h ->
+# 12 h -> 24 h ... 7 days for a Test mark). MEASURED: zenmux keys #1/#3/#4/#5
+# answer 403 "no permission" on every Test, yet came back every 6 hours and
+# cost an attempt each time. A 2xx or a passing Test clears the record
+# (clear_key_dead), so a key the user fixes returns at once. `escalate=False`
+# for a mark that is about the PROVIDER (a 5xx): an outage must not bench a
+# good key for a week.
+_KEY_DEAD_MAX_TTL = 7 * 86400
+_KEY_DEAD_REPEAT_WINDOW = 3 * 86400
+
+
 def mark_key_dead(pid: str, key, seconds: float = None, why: str = "",
-                  source: str = "test") -> None:
-    """This key cannot generate: skip it for `seconds` (default by source)."""
+                  source: str = "test", escalate: bool = True) -> None:
+    """This key cannot generate: skip it for `seconds` (default by source),
+    doubled for each repeat (see _KEY_DEAD_MAX_TTL)."""
     fp = key_fingerprint(key)
     if not fp:
         return
@@ -612,9 +626,16 @@ def mark_key_dead(pid: str, key, seconds: float = None, why: str = "",
         seconds = _KEY_DEAD_TEST_TTL if source == "test" else _KEY_DEAD_LIVE_TTL
     now = time.time()
     with _LOCK:
+        prev = _KEY_DEAD.get((pid, fp))
+        count = 1
+        if escalate and prev and now - float(prev.get("until") or 0) <= _KEY_DEAD_REPEAT_WINDOW:
+            count = int(prev.get("count") or 1) + 1
+        if escalate:
+            seconds = min(float(seconds) * (2 ** (count - 1)), max(float(seconds), _KEY_DEAD_MAX_TTL))
         _KEY_DEAD[(pid, fp)] = {"until": now + float(seconds),
                                 "why": str(why or "")[:200],
-                                "source": str(source or "test"), "since": now}
+                                "source": str(source or "test"), "since": now,
+                                "count": count}
         _KEY_AUTH_STRIKES.pop((pid, fp), None)
     _persist_maybe()
 
@@ -640,10 +661,9 @@ def key_dead(pid: str, key) -> bool:
         rec = _KEY_DEAD.get((pid, fp))
         if not rec:
             return False
-        if float(rec.get("until") or 0) <= time.time():
-            _KEY_DEAD.pop((pid, fp), None)      # served its time
-            return False
-        return True
+        # Served its time: usable again, but the record stays so a repeat
+        # can escalate (see _KEY_DEAD_MAX_TTL); a success clears it.
+        return float(rec.get("until") or 0) > time.time()
 
 
 def note_key_auth_failure(pid: str, key, why: str = "") -> bool:
