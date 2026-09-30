@@ -1206,6 +1206,18 @@ coding): a French fix request was answered by one session on the Normal tier.
   when its run is not live, and flags `resumed` for a run the boot picked back
   up (`swarm_windows.resume_interrupted` -- no click needed for Multi).
 
+## Multi plans run side by side (2026-09-30)
+
+Covered by `tests/test_multi_runs_in_parallel.py`. Live run swarm-4f2aab7204a4
+was waves [[1],[2],[3],[4]] on a machine allowing 4 at once -- the PLAN was
+the bottleneck. `_PLAN_SYSTEM` (and the managed variant built from it) now
+says a chain is the slowest plan, that finding and fixing a problem is ONE
+phase, and to split by file/area. `clean_phases` ends in `merge_handoffs`: a
+look-only phase (`_LOOK_ONLY_RE` title -- locate/diagnose/investigate... --
+and no acting verb, `_ACTS_RE`) whose ONE follower needs it is folded into
+that follower ("First -- … Then -- …"), needs renumbered. A look phase that
+feeds several phases stays.
+
 ## LMArena board, daily (2026-09-30)
 
 Covered by `tests/test_arena_board.py`. `arena.py` (pure + fetch): LMArena's

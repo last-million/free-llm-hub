@@ -339,8 +339,14 @@ Each phase is given to a SEPARATE agent with its own fresh context. An agent
 sees only its own task plus the summaries of the phases it declares in "needs".
 
 Rules:
-- Prefer phases that can run AT THE SAME TIME. Two phases that touch the same
-  file are not independent; say so with "needs".
+- SPEED: phases that need nothing run AT THE SAME TIME (up to 4 agents). A
+  chain where each phase needs the previous one is the SLOWEST plan; use a
+  "needs" only when a phase cannot start without another phase's RESULT.
+- Finding a problem and fixing it is ONE phase: the agent that investigates
+  also fixes. Never plan "diagnose X" followed by "fix X".
+- Split the work by file or area (backend, frontend, separate modules, docs)
+  so agents work side by side. Two phases that touch the same file are not
+  independent; say so with "needs".
 - "needs" lists earlier phase numbers only (1-based). No self-references.
 - Between 2 and %d phases. Fewer, larger phases beat many tiny ones.
 - Each "task" must be self-contained: an agent cannot ask you a question.
@@ -464,7 +470,59 @@ def clean_phases(plan, max_phases=MAX_AGENTS, modes=()):
             if text:
                 row[key] = text
         out.append(row)
-    return out if len(out) >= 1 else []
+    return merge_handoffs(out) if len(out) >= 1 else []
+
+
+# A phase that only LOOKS (diagnose, locate, investigate...) and whose one
+# follower is the phase that acts on what it found. Owner, 2026-09-30:
+# "multi session mode should do jobs in parallel agents to speed up".
+# MEASURED the same day, run swarm-4f2aab7204a4: "Locate code and diagnose
+# contour defects" -> "Implement contour fixes" -> verify -> review, strictly
+# one after another -- the first hand-off alone cost a whole CLI start, a
+# re-read of the project and a summary the second agent had to trust.
+_LOOK_ONLY_RE = re.compile(
+    r"^\s*(?:locate|diagnos|investigat|analy[sz]|inspect|explore|research|"
+    r"identify|find|understand|audit|reproduce|study|examine)", re.I)
+_ACTS_RE = re.compile(
+    r"\b(?:fix|implement|build|write|create|add|update|change|refactor|edit|"
+    r"apply|patch|rewrite|remove|delete|migrate)\b", re.I)
+
+
+def _looks_only(phase):
+    title = str(phase.get("title") or "")
+    return bool(_LOOK_ONLY_RE.search(title)) and not _ACTS_RE.search(title)
+
+
+def merge_handoffs(phases):
+    """`phases` with every look-only phase folded into its ONE follower (the
+    phase that needs it, when nothing else does): the follower's agent
+    investigates first, then acts. Renumbers "needs". Never raises; a plan
+    it cannot read comes back as it was."""
+    try:
+        phases = [dict(p) for p in phases]
+        merged = True
+        while merged:
+            merged = False
+            for i, p in enumerate(phases, start=1):
+                if not _looks_only(p):
+                    continue
+                followers = [j for j, q in enumerate(phases, start=1) if i in q["needs"]]
+                if len(followers) != 1:
+                    continue
+                j = followers[0]
+                f = phases[j - 1]
+                f["task"] = ("First -- %s: %s\n\nThen -- %s" % (
+                    p["title"], p["task"], f["task"]))[:4000]
+                f["needs"] = sorted(set(p["needs"]) | (set(f["needs"]) - {i}))
+                f["mode"] = f.get("mode") or p.get("mode")
+                del phases[i - 1]
+                for q in phases:                     # renumber after removing i
+                    q["needs"] = [n - 1 if n > i else n for n in q["needs"]]
+                merged = True
+                break
+        return phases
+    except Exception:                                            # noqa: BLE001
+        return phases
 
 
 def with_review(phases):
