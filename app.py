@@ -77,6 +77,7 @@ import quick_history
 import config
 import image_history
 import craft
+import arena
 import lowres
 import orchestrator
 import skills
@@ -2176,6 +2177,56 @@ def _aa_refresh_loop():
 _aa_refresh_thread = None
 
 
+# LMArena's text board, refreshed every 24 h (see arena.py). Asked
+# 2026-09-30: "is there a free API for LM Arena that updates every 24 hours?
+# if yes integrate it". Keyless: LMArena's own public Hugging Face dataset.
+_arena = [None]
+_ARENA_CHECK_SECONDS = 3600          # how often the loop asks "is it a day old?"
+
+
+def _arena_board():
+    """The board under THIS config's state dir (re-opened if the state dir
+    changed -- the tests switch it per test)."""
+    path = os.path.join(config.state_dir(), arena.CACHE_NAME)
+    b = _arena[0]
+    if b is None or b.path != path:
+        b = _arena[0] = arena.Board(path)
+    return b
+
+
+def _arena_entry(model_id):
+    """The Arena board's entry for a hub model id, or None. Never raises."""
+    try:
+        return _arena_board().lookup(model_id)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _arena_refresh_once():
+    board = _arena_board()
+    n = board.refresh(requests.get)
+    if n:
+        _log.info("[arena] %d models from the LMArena text board (published %s)",
+                  n, board.published or "?")
+    return n
+
+
+def _arena_refresh_loop():
+    time.sleep(20)                   # let the server finish booting first
+    while True:
+        try:
+            if _arena_board().stale():
+                _arena_refresh_once()
+        except Exception as exc:                                 # noqa: BLE001
+            _log.info("[arena] refresh failed, keeping the last board: %s",
+                      _sanitize(str(exc), 160))
+        time.sleep(_ARENA_CHECK_SECONDS)
+
+
+def _start_arena_refresh():
+    threading.Thread(target=_arena_refresh_loop, daemon=True, name="arena-refresh").start()
+
+
 def _start_aa_refresh():
     global _aa_refresh_thread
     if _aa_refresh_thread is not None:
@@ -2296,6 +2347,17 @@ def _benchmark_score(pid, model_id):
     # NEW-VERSION HEURISTIC: auto-rank a newer release of a known-strong family.
     sv = _strong_new_version_score(low)
     score = max(score, sv)
+    # A model NO table knows (the unknown-family 10 after every lookup above)
+    # but that the LMArena board rates: its rating instead, capped under the
+    # owner's top band at the end of this function (arena.HUB_CAP). Measured
+    # 2026-09-29: stealth/space-bunny-alpha scored 14 until the owner ranked
+    # it by hand. Known families are never touched.
+    _arena_based = False
+    if aa is None and score <= 10:
+        _entry = _arena_entry(model_id)
+        _from_board = arena.hub_score(_entry.get("rating")) if _entry else None
+        if _from_board is not None:
+            score, _arena_based = _from_board, True
     # Explicit parameter size nudges within a family (…-70b > …-8b).
     params_b = None
     m = re.search(r"(\d{1,4})\s*b\b", low)
@@ -2693,6 +2755,8 @@ def _benchmark_score(pid, model_id):
     # first-party hosts are rate-limited — it just stops outranking them on a
     # claimed name alone. Sized so a relayed frontier id lands beside the
     # first-party field (138 -> 134) rather than below it.
+    if _arena_based:
+        score = min(score, arena.HUB_CAP)
     score -= _RELAY_DISCOUNT.get(pid, 0.0)
     return score
 
@@ -14151,6 +14215,17 @@ def _orch_command_response(protocol, body, messages, est=0):
                     headers=dict(_SSE_HEADERS, **hdrs))
 
 
+@app.route("/api/arena", methods=["GET"])
+def api_arena():
+    """The LMArena text board the hub holds: when it was published and
+    fetched, and its top models. Refreshed every 24 h (arena.py)."""
+    b = _arena_board()
+    top = sorted(b.models.values(), key=lambda m: -float(m.get("rating") or 0))[:25]
+    return jsonify({"published": b.published, "fetched_at": b.fetched_at or None,
+                    "models": len(b.models), "stale": b.stale(),
+                    "refresh_hours": arena.REFRESH_SECONDS / 3600, "top": top})
+
+
 @app.route("/api/orchestrator", methods=["GET", "POST"])
 def api_orchestrator():
     """GET -> {"global", "session"?, "session_choice"?}. POST {"model":
@@ -16384,10 +16459,14 @@ def api_tracking():
                 ctx_w, ctx_src = _window_info(pid, m)
             except Exception:                                    # noqa: BLE001
                 ctx_w, ctx_src = None, "default"
+            _ar = _arena_entry(m)
             out.append({
                 # The model's detected INPUT window and where it came from:
                 # catalog | learned | inferred | reference | default (unknown).
                 "ctx_window": ctx_w, "ctx_source": ctx_src,
+                # Its LMArena text rating and rank, when the board has it.
+                "arena_rating": _ar.get("rating") if _ar else None,
+                "arena_rank": _ar.get("rank") if _ar else None,
                 "id": pid + "/" + m, "provider": pid, "model": m,
                 "score": score, "tool_capable": _supports_tools(pid, m),
                 "fast": _is_fast(pid, m), "state": state,
@@ -37127,6 +37206,7 @@ if __name__ == "__main__":
     _print_banner()
     _start_auto_update()
     _start_aa_refresh()
+    _start_arena_refresh()
     _start_answer_canary()   # flag answer_canary is read per tick, so off = no calls
     # Previews that outlived the hub that started them (crash, kill, restart
     # while a project was running) keep holding their ports forever. Found 99

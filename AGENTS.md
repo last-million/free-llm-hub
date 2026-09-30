@@ -1206,6 +1206,23 @@ coding): a French fix request was answered by one session on the Normal tier.
   when its run is not live, and flags `resumed` for a run the boot picked back
   up (`swarm_windows.resume_interrupted` -- no click needed for Multi).
 
+## LMArena board, daily (2026-09-30)
+
+Covered by `tests/test_arena_board.py`. `arena.py` (pure + fetch): LMArena's
+own public HF dataset `lmarena-ai/leaderboard-dataset`, config
+`text_style_control` (= arena.ai's default board; the plain `text` config is
+~10 points off), split `latest`, category `overall`, read through the
+datasets-server rows API (keyless, 100 rows/page; MEASURED 353 models, 3.6 s).
+Best-rated variant per identity (`normalize`: vendor/relay prefixes, effort /
+thinking / date suffixes stripped, "5.1" == "5-1"), >= `MIN_VOTES`. Cached in
+`state_dir()/arena_scores.json`; `_arena_refresh_loop` refetches when a day
+old (checks hourly; a failed/empty fetch keeps the last board).
+`_benchmark_score`: ONLY a model still at the unknown-family 10 after AA, the
+family table and the new-version heuristic takes `arena.hub_score(rating)`,
+and the final score is capped at `arena.HUB_CAP` (134.5, under every owner
+floor) after all bonuses. Known models never move. `/api/tracking` rows carry
+`arena_rating` / `arena_rank`; `GET /api/arena` = the board.
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):

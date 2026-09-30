@@ -144,6 +144,13 @@ is a different model from the one that wrote it. While it runs, the
 conversation shows a **Helpers** panel: each helper's step, model, time and what
 it is doing right now, with **Open ↗** to watch any one in its own window.
 
+**Benchmarks, refreshed daily and free.** Besides Artificial Analysis, the hub
+reads the LMArena text leaderboard every 24 hours from LMArena's own public
+Hugging Face dataset (no key). A brand-new model none of the hub's tables know
+gets its score from its Arena rating instead of starting at the bottom — capped
+under the models you ranked yourself — and every model's Arena rating and rank
+show in `/api/tracking`; `GET /api/arena` shows the board.
+
 ---
 
 ## What makes it different
@@ -299,7 +306,7 @@ keys can actually reach right now, which is the only number that matters.
 | **MCP** | `/mcp` — `crew_run`, `crew_start`, `crew_result`, `swarm_windows_*` |
 | **Dashboard** | `/api/*` (control-token gated) |
 
-152 routes in total; the dashboard is the documentation for the rest.
+153 routes in total; the dashboard is the documentation for the rest.
 
 ---
 
