@@ -2713,12 +2713,43 @@
   .agent-plan-list li.done .pl-box{ background:var(--accent); border-color:var(--accent); color:#fff; }
   .agent-plan-list li.done .pl-text{ color:var(--text-dim); text-decoration:line-through; }
   .agent-plan-list li.doing .pl-box{ border-color:var(--accent); color:var(--accent); }
+  /* HELPERS: the same strip during a Multi run -- one row per helper, its
+     model, what it is doing now, and a link to its own page. */
+  .agent-plan-list li.hp{ align-items:flex-start; padding:3px 0; }
+  .agent-plan-list li.hp + li.hp{ border-top:1px solid var(--border); padding-top:5px; }
+  .hp-main{ flex:1 1 auto; min-width:0; display:flex; flex-direction:column; gap:1px; }
+  .hp-top{ display:flex; align-items:center; gap:6px; flex-wrap:wrap; min-width:0; }
+  .hp-top .pl-text{ font-weight:600; min-width:0; }
+  .agent-plan-list li.hp.done .pl-text{ text-decoration:none; }
+  .hp-model{ font-family:var(--mono); font-size:10.5px; color:var(--text-dim);
+    background:var(--surface-2); border:1px solid var(--border); border-radius:999px;
+    padding:0 6px; line-height:16px; white-space:nowrap; }
+  .hp-time{ color:var(--text-faint); font-size:11px; font-variant-numeric:tabular-nums; }
+  .hp-open{ margin-left:auto; font-size:11.5px; font-weight:600; color:var(--accent);
+    text-decoration:none; padding:3px 6px; border-radius:var(--radius-sm); white-space:nowrap; }
+  .hp-open:hover{ background:var(--accent-soft); }
+  .hp-open:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  .hp-last{ color:var(--text-dim); font-size:11.5px; overflow:hidden; text-overflow:ellipsis;
+    white-space:nowrap; font-family:var(--mono); }
+  .hp-sr{ position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0);
+    white-space:nowrap; }
+  .agent-plan-list li.hp.failed .pl-box{ border-color:var(--danger); color:var(--danger-text); }
+  .agent-plan-list li.hp.failed .pl-text{ color:var(--danger-text); }
+  .agent-plan-list li.hp.doing .pl-box{ animation:hpPulse 1.6s ease-in-out infinite; }
+  @keyframes hpPulse{ 0%,100%{ opacity:1 } 50%{ opacity:.45 } }
+  @media (prefers-reduced-motion:reduce){ .agent-plan-list li.hp.doing .pl-box{ animation:none } }
   .agent-plan-cut{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:2px 0 8px;
     padding:7px 9px; border-radius:var(--radius-sm); background:var(--accent-soft);
     color:var(--text); }
   .agent-plan-cut .pc-what{ flex:1 1 240px; min-width:0; }
   .agent-plan-cut .pc-what b{ font-weight:700; }
   .agent-plan-cut .pc-doing{ color:var(--text-dim); font-size:11.5px; }
+  .agent-resume{ margin:0 0 8px; border:1px solid var(--border); font-size:12.5px; }
+  .agent-resume .pc-hint{ color:var(--text-dim); font-size:11.5px; }
+  .agent-resume .pc-x{ border:0; background:none; color:var(--text-dim); cursor:pointer;
+    font:inherit; font-size:16px; line-height:1; padding:4px 8px; border-radius:var(--radius-sm); }
+  .agent-resume .pc-x:hover{ color:var(--text); background:var(--surface-2); }
+  .agent-resume .pc-x:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
   .agent-chat-col .msg .bubble,
   .agent-chat-col .agent-term-line,
   .agent-chat-col .agent-answer{ overflow-wrap:anywhere; word-break:break-word; }
@@ -3471,12 +3502,11 @@
                    where he was working exactly". -->
               <div class="agent-plan" id="agent-plan" hidden>
                 <button type="button" class="agent-plan-h" id="agent-plan-toggle" aria-expanded="true">
-                  <span class="agent-plan-title">Plan</span>
+                  <span class="agent-plan-title" id="agent-plan-title">Plan</span>
                   <span class="agent-plan-n" id="agent-plan-n"></span>
                   <span class="agent-plan-src" id="agent-plan-src"></span>
                 </button>
                 <div class="agent-plan-body" id="agent-plan-body">
-                  <div class="agent-plan-cut" id="agent-plan-cut" hidden></div>
                   <ul class="agent-plan-list" id="agent-plan-list"></ul>
                 </div>
               </div>
@@ -3490,6 +3520,13 @@
                    he works". Kept per conversation in this browser, so a
                    reload does not lose them. -->
               <div class="agent-queue" id="agent-queue" hidden aria-live="polite"></div>
+              <!-- WHERE IT STOPPED, next to where you type: a turn cut short by a
+                   hub restart, an error or a Stop. "Continue from there" picks
+                   the work back up; typing anything else just sends it. Owner,
+                   2026-09-30: "if we restart the hub, see a button that it was
+                   interrupted, click it to continue exactly where it stopped,
+                   or type something normally". -->
+              <div class="agent-plan-cut agent-resume" id="agent-plan-cut" role="status" hidden></div>
               <div class="chat-input-row">
                 <textarea id="agent-text" placeholder="Tell the agent what to do&hellip;  (Enter to send, Shift+Enter for a new line, paste or drop a screenshot)" aria-label="Message to agent" rows="2"></textarea>
                 <div class="chat-send-col">
@@ -10597,18 +10634,84 @@
         .then(function(p){ if (sessionId === sid) renderPlan(p || {}); })
         .catch(function(){});
     }
+    /* One helper of a Multi run: its state (icon AND words, never colour
+       alone), the model it runs on, how long it has taken, what it is doing
+       now, and its own page in a new window. */
+    var _planLive = false;
+    var _resumeDismissed = '';
+    var HP_STATE = { done:'done', running:'working', pending:'waiting', failed:'failed', stopped:'stopped' };
+    function hpElapsed(t, now){
+      if (!t.started_at) return '';
+      var end = t.ended_at || (t.doing ? (now || Date.now() / 1000) : null);
+      if (!end) return '';
+      var s = Math.max(0, Math.round(end - t.started_at));
+      if (s < 60) return s + 's';
+      var m = Math.floor(s / 60);
+      return m < 60 ? m + 'm' : Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+    }
+    function helperRow(t, now){
+      var state = t.state || (t.done ? 'done' : t.doing ? 'running' : 'pending');
+      var li = document.createElement('li');
+      li.className = 'hp ' + (t.done ? 'done' : t.doing ? 'doing' : state === 'failed' ? 'failed' : '');
+      var b = document.createElement('span'); b.className = 'pl-box'; b.setAttribute('aria-hidden', 'true');
+      b.textContent = t.done ? '\u2713' : t.doing ? '\u2022' : state === 'failed' ? '\u2715' : '';
+      var main = document.createElement('div'); main.className = 'hp-main';
+      var top = document.createElement('div'); top.className = 'hp-top';
+      var sr = document.createElement('span'); sr.className = 'hp-sr';
+      sr.textContent = (HP_STATE[state] || state) + ': ';
+      var x = document.createElement('span'); x.className = 'pl-text';
+      x.textContent = 'Phase ' + t.index + ' \u00b7 ' + (t.title || '');
+      top.appendChild(sr); top.appendChild(x);
+      if (t.model){
+        var m = document.createElement('span'); m.className = 'hp-model';
+        m.textContent = t.model; m.title = 'Model this helper runs on';
+        top.appendChild(m);
+      }
+      var el = hpElapsed(t, now);
+      if (el){
+        var tm = document.createElement('span'); tm.className = 'hp-time'; tm.textContent = el;
+        top.appendChild(tm);
+      }
+      if (t.url){
+        var a = document.createElement('a'); a.className = 'hp-open';
+        a.href = t.url; a.target = '_blank'; a.rel = 'noopener';
+        a.textContent = 'Open \u2197';
+        a.setAttribute('aria-label', 'Open helper ' + t.index + ' (' + (t.title || '') + ') in a new window');
+        top.appendChild(a);
+      }
+      main.appendChild(top);
+      if (t.last || !t.done){
+        var last = document.createElement('div'); last.className = 'hp-last';
+        last.textContent = t.last || (state === 'pending' ? 'waiting for the step before' : '');
+        if (t.last) last.title = t.last;
+        if (last.textContent) main.appendChild(last);
+      }
+      li.appendChild(b); li.appendChild(main);
+      return li;
+    }
     function renderPlan(p){
       var box = $('#agent-plan'), list = $('#agent-plan-list'), cut = $('#agent-plan-cut');
       if (!box || !list || !cut) return;
       var items = p.tasks || [];
       var stopped = p.interrupted || null;
-      box.hidden = !items.length && !stopped;
+      renderResume(stopped);
+      box.hidden = !items.length;
       if (box.hidden) return;
-      $('#agent-plan-n').textContent = items.length ? (p.done || 0) + '/' + items.length + ' done' : '';
-      $('#agent-plan-src').textContent = p.source ? 'from ' + p.source : '';
+      var helpers = !!p.run_id;
+      _planLive = helpers && items.some(function(t){ return t.doing; });
+      $('#agent-plan-title').textContent = helpers ? 'Helpers' : 'Plan';
+      $('#agent-plan-n').textContent = !items.length ? '' :
+        (helpers && p.current ? 'step ' + p.current + ' of ' + items.length + ' \u00b7 ' : '') +
+        (p.done || 0) + '/' + items.length + ' done';
+      $('#agent-plan-src').textContent = (p.source ? 'from ' + p.source : '') +
+        (p.resumed ? ' \u00b7 resumed after a restart' : '');
       box.setAttribute('data-collapsed', _planCollapsed ? '1' : '0');
       $('#agent-plan-toggle').setAttribute('aria-expanded', _planCollapsed ? 'false' : 'true');
       list.innerHTML = '';
+      if (helpers){
+        items.forEach(function(t){ list.appendChild(helperRow(t, p.now)); });
+        items = [];
+      }
       items.forEach(function(t){
         var li = document.createElement('li');
         li.className = t.done ? 'done' : (t.doing ? 'doing' : '');
@@ -10619,15 +10722,21 @@
         li.appendChild(b); li.appendChild(x);
         list.appendChild(li);
       });
-      cut.innerHTML = '';
-      cut.hidden = !stopped;
-      if (stopped){
+      /* The stopping place is drawn by renderResume, above the message box. */
+      function renderResume(stopped){
+        cut.innerHTML = '';
+        var key = stopped ? sessionId + '|' + (stopped.why || '') + '|' + (stopped.request || '') : '';
+        cut.hidden = !stopped || turnBusy || key === _resumeDismissed;
+        if (cut.hidden) return;
         var what = document.createElement('div'); what.className = 'pc-what';
-        var why = stopped.why === 'stopped' ? 'Stopped by you' : 'Cut short (' + (stopped.why || 'error') + ')';
+        var why = stopped.why === 'stopped' ? 'Stopped by you'
+          : stopped.why === 'hub restarted' ? 'Interrupted: the hub restarted'
+          : 'Cut short (' + (stopped.why || 'error') + ')';
         what.innerHTML = '<b>' + esc(why) + '</b>' +
           (stopped.request ? ' while working on: ' + esc(stopped.request) : '') +
           ((stopped.doing || []).length
-            ? '<div class="pc-doing">last: ' + esc((stopped.doing || []).slice(-3).join(' \u2192 ')) + '</div>' : '');
+            ? '<div class="pc-doing">last: ' + esc((stopped.doing || []).slice(-3).join(' \u2192 ')) + '</div>' : '') +
+          '<div class="pc-hint">Continue picks up exactly where it stopped \u2014 or just type a new message below.</div>';
         cut.appendChild(what);
         var go = document.createElement('button');
         go.type = 'button'; go.className = 'btn sm primary';
@@ -10638,6 +10747,11 @@
           doSend();
         });
         cut.appendChild(go);
+        var x = document.createElement('button');
+        x.type = 'button'; x.className = 'pc-x'; x.textContent = '\u00d7';
+        x.setAttribute('aria-label', 'Dismiss: I will type a new message instead');
+        x.addEventListener('click', function(){ _resumeDismissed = key; cut.hidden = true; });
+        cut.appendChild(x);
       }
     }
     function initPlanStrip(){
@@ -10646,7 +10760,13 @@
       /* While a turn runs the agent is editing PROGRESS.md; the strip follows
          it every 10s so "tracks it while working" is true on screen, not
          only at the end of the turn. Idle sessions cost nothing. */
-      setInterval(function(){ if (sessionId && turnBusy) loadPlan(); }, 10000);
+      /* ...and a Multi run's helpers every 5s, turn or not: a page opened
+         mid-run is not "busy" but its helpers are working. */
+      var _planTick = 0;
+      setInterval(function(){
+        _planTick++;
+        if (sessionId && (_planLive || (turnBusy && _planTick % 2 === 0))) loadPlan();
+      }, 5000);
       t.addEventListener('click', function(){
         _planCollapsed = !_planCollapsed;
         var box = $('#agent-plan');
@@ -10925,6 +11045,8 @@
     function doSend(){
       if (!sessionId) return;
       var text = textEl.value.trim();
+      /* Sending anything answers the "where it stopped" bar (see renderResume). */
+      if (text){ var _cut = $('#agent-plan-cut'); if (_cut) _cut.hidden = true; }
       /* Attached screenshots are named as PATHS the CLI can open, not inlined:
          Claude Code and Codex read images off disk, and a base64 blob in the
          prompt would burn the context window on bytes they cannot decode. */

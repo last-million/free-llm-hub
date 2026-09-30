@@ -1181,6 +1181,30 @@ coding): a French fix request was answered by one session on the Normal tier.
   while the run is going and after it until PROGRESS.md is written again (it
   used to show the previous turn's "9/9 done"). Each worker prompt tells it to
   keep its own "- [ ] Phase N: title" line under "## <run id>" in PROGRESS.md.
+- **Live work on the page** (`tests/test_multi_shows_live_work.py`): the
+  conversation's turn used to get events only when a phase started or ended,
+  so an hour-long phase looked blocked. `_multi_follow_events` now reads
+  `status(run_id, with_events=True)` once per `_MULTI_POLL` and
+  `_multi_activity` forwards the working phases' NEW tool/note events as
+  "Phase N · …" tool lines (<= `_MULTI_ACTIVITY_PER_POLL` per look, clipped;
+  a reloaded page sees the last few, not the history). New-ness comes from
+  `_Agent.event_total` (monotonic; the ring buffer caps at EVENT_BUFFER).
+- **Helpers panel**: during a run the Build page's plan strip becomes
+  "Helpers · step N of M": `_multi_run_plan` rows also carry index, title,
+  model, `url` (`/agent/<worker sid>`), started/ended, `last`
+  (`_multi_last_action`); `helperRow()` in index.html renders state icon + a
+  screen-reader word, model chip, elapsed, the last action and "Open ↗"
+  (`target=_blank rel=noopener`). A live run refreshes it every 5 s even
+  when the page is not in a busy turn (`_planLive`).
+- **Where it stopped, next to the message box** (`tests/test_the_work_continues_
+  where_it_stopped.py`): `#agent-plan-cut` moved from the plan strip to just
+  above `.chat-input-row`; `renderResume()` (inside renderPlan) shows it for
+  `mem.interrupted` -- "Interrupted: the hub restarted" for a turn
+  `memory.recover_inflight` filed at boot -- with "Continue from there", a
+  "type a new message below" hint and a dismiss ×; hidden while a turn runs and
+  as soon as anything is sent. `_multi_run_plan` passes `interrupted` through
+  when its run is not live, and flags `resumed` for a run the boot picked back
+  up (`swarm_windows.resume_interrupted` -- no click needed for Multi).
 
 ## Tests
 

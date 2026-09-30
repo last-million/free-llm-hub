@@ -140,7 +140,9 @@ the load), and the fallbacks behind it follow strength too — a proven but
 weaker family is never queued ahead of a stronger model. In a **Multi** run,
 each new worker opens on a strong model the run's earlier workers have not used
 yet (never more than 4 points under the best), so the one that reviews the work
-is a different model from the one that wrote it.
+is a different model from the one that wrote it. While it runs, the
+conversation shows a **Helpers** panel: each helper's step, model, time and what
+it is doing right now, with **Open ↗** to watch any one in its own window.
 
 ---
 

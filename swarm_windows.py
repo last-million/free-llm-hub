@@ -516,7 +516,8 @@ class _Agent:
                  "session_id", "state", "summary", "error", "started_at",
                  "ended_at", "events", "last_event_at", "abandoned",
                  "inputs", "constraints", "output_format", "acceptance",
-                 "verified", "problems", "revisions", "past_sessions")
+                 "verified", "problems", "revisions", "past_sessions",
+                 "event_total")
 
     def __init__(self, index, phase):
         self.index = index
@@ -544,6 +545,9 @@ class _Agent:
         self.started_at = None
         self.ended_at = None
         self.events = deque(maxlen=EVENT_BUFFER)
+        # Every event ever drained, not capped like the ring above: lets a
+        # follower tell which ring entries are NEW once the ring is full.
+        self.event_total = 0
         self.last_event_at = None       # the idle limit is measured from this
         # Set by the wave when it gives up on this worker: the worker thread
         # may still be draining a CLI that has not noticed, and its late
@@ -559,6 +563,7 @@ class _Agent:
             "summary": self.summary, "error": self.error,
             "started_at": self.started_at, "ended_at": self.ended_at,
             "events": len(self.events),
+            "events_total": self.event_total,
             "inputs": self.inputs, "constraints": self.constraints,
             "output_format": self.output_format, "acceptance": self.acceptance,
             "verified": self.verified, "problems": list(self.problems),
@@ -718,6 +723,7 @@ class _Run:
             agent.ended_at = a.get("ended_at")
             for e in (a.get("log") or ()):
                 agent.events.append(e)
+            agent.event_total = len(agent.events)
         # Nothing is walking this run any more. Leaving a worker RUNNING would
         # show a swarm as live for the rest of the hub's life.
         for agent in run.agents:
@@ -926,6 +932,7 @@ def _drain(agent, events):
         if not isinstance(ev, dict):
             continue
         agent.events.append(ev)
+        agent.event_total = getattr(agent, "event_total", 0) + 1
         agent.last_event_at = time.time()
         # "event" is what agentic_chat actually emits; "type" is the OpenAI
         # streaming spelling. MEASURED on the first live run: reading only

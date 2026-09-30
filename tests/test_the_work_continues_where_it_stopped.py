@@ -231,4 +231,46 @@ def test_it_costs_the_command_line_nothing():
 def test_the_strip_follows_the_file_while_the_turn_runs():
     body = SRC[SRC.index("function initPlanStrip(){"):]
     body = body[:body.index("function refreshSessionInfo(){")]
-    assert "if (sessionId && turnBusy) loadPlan();" in body
+    # every other 5 s tick while a turn runs (= 10 s), every tick while a
+    # Multi run's helpers work (tests/test_multi_run_task_list.py)
+    assert "turnBusy && _planTick % 2 === 0" in body and "loadPlan();" in body
+
+
+# --------------------------------------------------------------------------- #
+# After a restart: the bar sits next to where you type (owner, 2026-09-30: "if
+# we restart the hub, see a button that it was interrupted, click it to
+# continue exactly where it stopped, or type something normally")
+# --------------------------------------------------------------------------- #
+def test_the_stopping_place_is_shown_above_the_message_box():
+    cut = SRC.index('id="agent-plan-cut"')
+    assert SRC.index('id="agent-queue"') < cut < SRC.index('<div class="chat-input-row">', cut)
+    strip = SRC[SRC.index('id="agent-plan"'):SRC.index('id="agent-messages"')]
+    assert 'agent-plan-cut' not in strip
+
+
+def test_a_restart_says_so_and_typing_is_the_other_choice():
+    body = SRC[SRC.index("function renderResume(stopped){"):]
+    body = body[:body.index("function initPlanStrip(){")]
+    assert "'Interrupted: the hub restarted'" in body
+    assert "or just type a new message below" in body
+    assert "aria-label', 'Dismiss" in body
+    assert "turnBusy" in body                       # never while the agent works
+    send = SRC[SRC.index("function doSend(){"):][:600]
+    assert "_cut.hidden = true" in send             # sending anything answers it
+
+
+def test_the_bar_survives_a_multi_run_being_shown(tmp_path, monkeypatch):
+    import app as A
+    import swarm_windows as SW
+    run = SW._Run("goal", str(tmp_path), "opencode",
+                  SW.clean_phases({"phases": [{"title": "a", "task": "t"}]}), owner="conv-cut")
+    run.state, run.ended_at = SW.STOPPED, run.created_at + 5
+    SW._remember(run)
+    monkeypatch.setattr(A.memory, "interrupted",
+                        lambda sid: {"why": "hub restarted", "request": "fix it"} if sid == "conv-cut" else None)
+    try:
+        plan = A._multi_run_plan("conv-cut", str(tmp_path))
+    finally:
+        with SW._LOCK:
+            SW._RUNS.pop(run.id, None)
+    assert plan["interrupted"] == {"why": "hub restarted", "request": "fix it"}

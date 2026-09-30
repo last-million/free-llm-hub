@@ -17290,6 +17290,12 @@ def _swarm_windows_turn(session_id, text):
 _MULTI_RUNS = {}                # session_id -> run_id of the turn in flight
 _MULTI_LOCK = threading.Lock()
 _MULTI_POLL = 2.0               # seconds between looks at the run
+# WHAT A WORKER IS DOING, on the conversation's page. MEASURED 2026-09-30:
+# phase 2 of run swarm-4f2aab7204a4 worked for an hour (164 edit/bash/notes
+# events) and the page showed nothing between "phase 2 started" and the
+# end -- it looked blocked. At most this many new lines per look (2 s).
+_MULTI_ACTIVITY_PER_POLL = 4
+_MULTI_ACTIVITY_CHARS = 160
 # What the reply is when the run is cut short: enough for the reader to see
 # which phases got somewhere, never the transcripts.
 _MULTI_STOPPED_NOTE = "Stopped before every phase finished."
@@ -17638,14 +17644,61 @@ def _multi_owner_record(run):
         _multi_record(run.owner, run)
 
 
+def _multi_activity_line(agent_row, ev):
+    """One of a working phase's events as a page line, or None: its tool
+    actions ("edit app.py", "bash pytest") and its notes, clipped."""
+    if not isinstance(ev, dict):
+        return None
+    kind = ev.get("event") or ev.get("type")
+    if kind not in ("tool", "message"):
+        return None
+    text = " ".join(str(ev.get("text") or "").split())
+    if not text:
+        return None
+    if len(text) > _MULTI_ACTIVITY_CHARS:
+        text = text[:_MULTI_ACTIVITY_CHARS - 1] + "\u2026"
+    return "Phase %s \u00b7 %s" % (agent_row.get("index"), text)
+
+
+def _multi_activity(status_row, forwarded):
+    """New activity lines of the run's WORKING phases since the last look,
+    from one status(with_events=True) row. `forwarded` maps phase index ->
+    events already shown (updated here). On first sight of a phase (a page
+    that reloads mid-run) its last few actions are shown, not its whole
+    history. Never raises."""
+    out = []
+    try:
+        for a in (status_row or {}).get("agents") or []:
+            if a.get("state") != swarm_windows.RUNNING:
+                continue
+            key = a.get("index")
+            total = int(a.get("events_total") or 0)
+            prev = forwarded.get(key)
+            if prev is None:
+                prev = max(0, total - _MULTI_ACTIVITY_PER_POLL)
+            new = total - prev
+            forwarded[key] = total
+            if new <= 0:
+                continue
+            log = a.get("log") or []
+            lines = [line for line in (_multi_activity_line(a, e)
+                                       for e in log[-min(new, len(log)):]) if line]
+            out.extend(lines[-_MULTI_ACTIVITY_PER_POLL:])
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out
+
+
 def _multi_follow_events(run_id, cli_id):
     """The turn's events from a run already started: phases starting and
-    finishing, then the report. Shared by a turn sent now and a run picked
-    back up after a restart."""
+    finishing, what the working phases are doing, then the report. Shared by
+    a turn sent now and a run picked back up after a restart."""
     seen = {}
+    forwarded = {}
     total = 0
     while True:
-        st = swarm_windows.status(run_id)
+        # ONE look per poll, with the workers' logs (for _multi_activity).
+        st = swarm_windows.status(run_id, with_events=True)
         if not st:
             yield {"event": "error", "status": 500, "detail": "the run vanished"}
             return
@@ -17672,6 +17725,8 @@ def _multi_follow_events(run_id, cli_id):
                 yield {"event": "output",
                        "text": _multi_phase_line(a, total) + " -- failed: " +
                                _sanitize(str(a.get("error") or "unknown"), 200)}
+        for line in _multi_activity(st, forwarded):
+            yield {"event": "tool", "text": line}
         if st.get("state") in (swarm_windows.DONE, swarm_windows.FAILED,
                                swarm_windows.STOPPED):
             break
@@ -20705,6 +20760,18 @@ def api_agent_send_message_stream(session_id):
     return Response(stream_with_context(gen()), mimetype="text/event-stream", headers=_SSE_HEADERS)
 
 
+def _multi_last_action(agent):
+    """A helper's latest tool action or note, clipped for one line, or None."""
+    try:
+        for ev in reversed(list(getattr(agent, "events", None) or ())):
+            line = _multi_activity_line({"index": agent.index}, ev)
+            if line:
+                return line.split(" \u00b7 ", 1)[-1]
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
 def _multi_run_plan(session_id, project_dir=None):
     """The Build page's task list from this conversation's Multi run: one
     line per phase (done / working / waiting / failed, and the model the
@@ -20735,13 +20802,33 @@ def _multi_run_plan(session_id, project_dir=None):
                 text += " \u00b7 " + model
             if a.state == swarm_windows.FAILED:
                 text += " (failed)"
+            # Each helper is a real agent session with its own page: the
+            # conversation lists them and opens any one in a new window
+            # (owner, 2026-09-30: "see the helpers in the same conversation,
+            # and open each one we want in a new window").
             items.append({"text": text, "done": a.state == swarm_windows.DONE,
                           "doing": a.state == swarm_windows.RUNNING,
-                          "state": a.state})
+                          "state": a.state, "index": a.index, "title": a.title,
+                          "model": model, "session_id": a.session_id or None,
+                          "url": ("/agent/" + a.session_id) if a.session_id else None,
+                          "started_at": a.started_at, "ended_at": a.ended_at,
+                          "last": _multi_last_action(a)})
+        running = [t["index"] for t in items if t["doing"]]
+        # The stopping place stays visible next to the helpers: a run that was
+        # cut short (or a turn cut by a restart) still offers Continue.
+        try:
+            cut = None if live else memory.interrupted(session_id)
+        except Exception:                                        # noqa: BLE001
+            cut = None
         return {"session_id": session_id, "tasks": items,
                 "done": sum(1 for t in items if t["done"]),
                 "source": "multi-session run %s" % run.id,
-                "run_id": run.id, "interrupted": None}
+                "run_id": run.id, "run_state": run.state,
+                "current": running[0] if running else None,
+                # Picked back up by this process after a restart (it did not
+                # need a click: swarm_windows.resume_interrupted at boot).
+                "resumed": bool(live and getattr(run, "restored", False)),
+                "now": time.time(), "interrupted": cut}
     except Exception:                                            # noqa: BLE001
         return None
 
