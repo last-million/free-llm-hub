@@ -106,14 +106,18 @@ def test_a_collapsed_pool_widens_back_out(monkeypatch):
 
 def test_a_diverse_proven_pool_is_left_alone(monkeypatch):
     """Proven-first still wins when it is genuinely diverse -- this must not
-    become 'always widen', which would undo the allowlist entirely."""
+    become 'always widen', which would undo the allowlist entirely.
+
+    The unproven model here is WEAKER than every proven one. A stronger one
+    joins the lead group since 2026-09-30 (_may_lead_pool: a weaker allowlisted
+    family never outranks a stronger model; see test_best_model_leads.py)."""
     agentic = [
         _cand(100.0, "google", "gemini-3.5-flash"),
         _cand(99.0, "g4f", "gemini-3.6-flash"),
         _cand(98.0, "llm7", "gemini-3.1-flash-lite"),
         _cand(97.0, "openrouter", "gemini-3-flash-preview"),
         _cand(96.0, "kilocode", "gemini-3.5-flash-lite"),
-        _cand(130.0, "nvidia", "z-ai/glm-5.2"),        # strong but NOT proven
+        _cand(95.0, "nvidia", "z-ai/glm-5.2"),         # NOT proven, and weaker
     ]
     picked = _drive(monkeypatch, agentic, rounds=12)
     assert "nvidia" not in {p for p, _m in picked}, (

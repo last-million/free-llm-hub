@@ -131,7 +131,13 @@ is called. The Build page also has an **Orchestrator** picker per conversation,
 and the **Orchestrator model** page sets it for everyone. It is a preference,
 not a cage: if the chosen model is busy, failing, too small for the
 conversation or cannot call the tools a turn needs, that turn falls back to
-normal routing.
+normal routing. Simple small turns (a one-line question, a quick lookup) go to a
+medium model whichever orchestrator is chosen; real work opens on it.
+
+On **auto**, a conversation opens on the strongest model available right now
+(within 2 points of the top score, so equal copies on different providers share
+the load), and the fallbacks behind it follow strength too — a proven but
+weaker family is never queued ahead of a stronger model.
 
 ---
 

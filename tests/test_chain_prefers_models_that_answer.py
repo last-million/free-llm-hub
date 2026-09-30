@@ -159,7 +159,7 @@ def test_the_bands_are_applied_before_the_proven_split():
     tool turn, "can it call a tool at all" outranks "does it usually answer"."""
     src = open("app.py", encoding="utf-8").read()
     sort_at = src.index("ordered.sort(key=lambda e: _chain_reliability_band")
-    split_at = src.index("_proven_ordered = [e for e in _fit")
+    split_at = src.index("_fit = _lead_first(")        # the lead split (see _lead_first)
     assert sort_at < split_at
 
 

@@ -7967,6 +7967,28 @@ def _session_pin_set(key, pid, model, agentic=True):
 
 _AGENTIC_PICK_TEMPERATURE = 5.0  # score points at which weight roughly e-folds
 
+# How far under the best _agentic_score a model may be and still be drawn as
+# a session's model. The weighted pick alone shared picks across the WHOLE
+# pool: MEASURED 2026-09-30 (pool 55), ~40 models at 130-134 each at weight
+# ~0.2 outweighed the single 138 one, so Auto rarely used the best model.
+# Owner: "always the best model available if set automatic". Within the band
+# the pick still shares load between equals (same model on several hosts,
+# near-tied peers); across concurrent sessions _spread_pool still spreads.
+_AUTO_TOP_BAND = 2.0
+
+
+def _auto_top_band(pool, sustain_override=None):
+    """The entries of `pool` within _AUTO_TOP_BAND of its best _agentic_score
+    (the pool itself when that is empty or anything fails)."""
+    try:
+        if len(pool) <= 1:
+            return list(pool)
+        scored = [(_agentic_score(c, sustain_override), c) for c in pool]
+        best = max(s for s, _ in scored)
+        return [c for s, c in scored if s >= best - _AUTO_TOP_BAND] or list(pool)
+    except Exception:                                            # noqa: BLE001
+        return list(pool)
+
 
 def _weighted_pick(pool, sustain_override=None):
     """Pick one (score, pid, model) from `pool` with OpenRouter's own approach to
@@ -8290,7 +8312,7 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # separate runs, three different silent failures, zero files each time).
         # Fail-OPEN: if none of the proven models can serve this request right now,
         # fall back to the full agentic pool rather than refusing to answer.
-        _proven = [c for c in agentic if _may_lead_agentic(c[0], c[2])]
+        _proven = _may_lead_pool(agentic)
         _pool = _proven or agentic
         # LOW-QUALITY TAIL (see _LOW_QUALITY_RE): the proven list still names
         # nemotron/gpt-oss from the 2026-07-25 dialect evidence, so proven-first
@@ -8341,7 +8363,9 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # holding a lock across it costs nothing.
         with _spread_pick_lock:
             _pool = _spread_pool(_pool, _skey)
-            picked = _weighted_pick(_pool, _model_identity_min_penalty(_pool))
+            _sustain = _model_identity_min_penalty(_pool)
+            _pool = _auto_top_band(_pool, _sustain)
+            picked = _weighted_pick(_pool, _sustain)
             _s, pid, model = picked
             _session_pin_set(_skey, pid, model)
             _log.info("[spread] %s -> %s/%s (pool %d, held elsewhere %d)",
@@ -9080,13 +9104,31 @@ def _relay_tool_sick(pid, model):
         return False
 
 
+def _lead_first(fit):
+    """A tool chain's healthy entries with the lead group (_may_lead_pool: a
+    stronger model is never queued behind a weaker allowlisted family) first,
+    then _slow_behind_in_group inside each group. Stable, so the strength and
+    provider-interleave order survive. Never raises."""
+    try:
+        lead = {id(e) for e in _may_lead_pool(fit)}
+        head = [e for e in fit if id(e) in lead]
+        if head:
+            fit = head + [e for e in fit if id(e) not in lead]
+        return _slow_behind_in_group(fit, lead if head else None)
+    except Exception:                                            # noqa: BLE001
+        return fit
+
+
 def _slow_behind_in_group(fit, proven_grouped):
     """A tool chain's healthy entries with the MEASURED-slow ones (see
     _tool_turn_slow) behind the quick ones inside each group: a stable sort,
     so proven-before-unproven and the strength order survive. Unmeasured
     moves nothing. Never raises."""
     try:
-        return sorted(fit, key=lambda e: (proven_grouped and not _is_tool_proven(e[2]),
+        if proven_grouped is True:                 # legacy callers: the allowlist
+            proven_grouped = {id(e) for e in fit if _is_tool_proven(e[2])}
+        lead = proven_grouped or None
+        return sorted(fit, key=lambda e: (lead is not None and id(e) not in lead,
                                           _tool_turn_slow(e[1], e[2])))
     except Exception:                                            # noqa: BLE001
         return fit
@@ -9210,6 +9252,11 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
     # through to the normal "none available" path rather than quietly serving
     # the excluded model anyway.
     _veto = set(exclude_identities or ())
+    # The CHOSEN orchestrator is a user's pick like a named model: it opens the
+    # turn whatever its record says (MEASURED 2026-09-30: a stale 12-to-1
+    # failure record from empty replies fixed the day before kept
+    # space-bunny off hop 1 on every turn, so it could never earn a new one).
+    pinned = pinned or _is_orchestrator_lead(primary_pid, model_id)
     if (not primary_pid or not model_id
             or (_veto and _normalize_model_identity(model_id) in _veto)):
         # No primary to seed: either the caller has none to offer (it wants the
@@ -9420,11 +9467,7 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
             return (_chain_reliability_band(e[1], e[2]) >= 2
                     or _tool_turn_sick(e[1], e[2]))
         _sick = [e for e in ordered if _is_sick(e)]
-        _fit = [e for e in ordered if not _is_sick(e)]
-        _proven_ordered = [e for e in _fit if _is_tool_proven(e[2])]
-        if _proven_ordered:
-            _fit = _proven_ordered + [e for e in _fit if not _is_tool_proven(e[2])]
-        _fit = _slow_behind_in_group(_fit, bool(_proven_ordered))
+        _fit = _lead_first([e for e in ordered if not _is_sick(e)])
         ordered = _fit + _sick
         # VISION-SPECIALISED models behind every other candidate on a turn
         # that carries no image (see _is_vision_specialised) -- MEASURED: a
@@ -13039,6 +13082,24 @@ def _may_lead_agentic(score, model_id):
     return _is_tool_proven(model_id) or score >= _PREF_FLOORS[5]
 
 
+def _may_lead_pool(pool):
+    """The (score, pid, model) entries of `pool` that may lead a tool turn:
+    _may_lead_agentic, plus every model at least as strong as the strongest
+    allowlisted one present.
+
+    The allowlist keeps an unproven MID-TIER model from leading; it was never
+    meant to rank a weaker proven family above a stronger model. MEASURED
+    2026-09-30, session 47a25faa (coding): every gemini-3 (134.1, and a relay
+    copy at 130.1) sat ahead of z-ai/glm-5.3 (138) and space-bunny (137.7),
+    so 22 of 24 turns ran on gemini flash."""
+    try:
+        proven_best = max((c[0] for c in pool if _is_tool_proven(c[2])), default=None)
+        return [c for c in pool if _may_lead_agentic(c[0], c[2])
+                or (proven_best is not None and c[0] >= proven_best)]
+    except Exception:                                            # noqa: BLE001
+        return [c for c in pool if _may_lead_agentic(c[0], c[2])]
+
+
 def _is_tool_proven(model_id):
     """True for a model empirically shown to complete an agentic CLI build."""
     low = (model_id or "").lower()
@@ -13838,14 +13899,24 @@ def _orch_unusable(pid, model, est=0, tools=False, images=False, veto=None):
 
 
 def _apply_orchestrator(pid, resolved, messages, est=0, tools=False, images=False,
-                        veto=None, body=None):
+                        veto=None, body=None, diff=None):
     """The router's pick, replaced by the orchestrator chosen for this
     conversation (or for all of them) whenever that model can open this
-    turn. The fallback chain is built behind it as usual. Never raises."""
+    turn. The fallback chain is built behind it as usual, and the chosen
+    model opens it whatever its learned record says (g.hub_orchestrator_pair,
+    read by _build_chain). Never raises.
+
+    A SIMPLE small turn keeps the router's pick: the orchestrator does the
+    real work, easy turns go to medium models (owner, 2026-09-30: "mix with
+    medium level models for things that don't need a very good model, no
+    matter the selected orchestrator") -- the router's own quick-turn rule."""
     try:
         choice, scope = _orch_effective(_orch_key(body, messages))
         pair = orchestrator.split_choice(choice)
         if not pair:
+            return pid, resolved
+        if diff == "simple" and (est or 0) < STREAM_BIG_REQUEST_TOKENS and pid:
+            g.hub_orchestrator = "resting (simple turn)"
             return pid, resolved
         why = _orch_unusable(pair[0], pair[1], est, tools, images, veto)
         if why:
@@ -13853,9 +13924,19 @@ def _apply_orchestrator(pid, resolved, messages, est=0, tools=False, images=Fals
             g.hub_orchestrator = "skipped (%s)" % why
             return pid, resolved
         g.hub_orchestrator = "%s (%s)" % (choice, scope)
-        return pair
-    except Exception:                                            # noqa: BLE001
+        g.hub_orchestrator_pair = tuple(pair)
+        return tuple(pair)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[orchestrator] not applied (%s: %s)", type(exc).__name__, exc)
         return pid, resolved
+
+
+def _is_orchestrator_lead(pid, model):
+    """True when (pid, model) is the orchestrator this request applied."""
+    try:
+        return getattr(g, "hub_orchestrator_pair", None) == (pid, model)
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def _orch_last_command(messages):
@@ -32773,7 +32854,7 @@ def _chat_completions_uncached(body):
         pid, resolved, diff = router(body.get("messages"), body.get("max_tokens"), est,
                                      require_tools=has_tools, **_rkw)
         pid, resolved = _apply_orchestrator(pid, resolved, body.get("messages"), est,
-                                            has_tools, has_images, veto, body)
+                                            has_tools, has_images, veto, body, diff=diff)
         if veto and pid is not None and _normalize_model_identity(resolved) in veto:
             # Auto landed on exactly the model the user just rejected. Hand the
             # choice to _build_chain with an empty primary: it applies the same
@@ -33819,7 +33900,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                                      require_tools=has_tools,
                                      **_quality_route_kwargs(body.get("model"), has_images))
         pid, resolved = _apply_orchestrator(pid, resolved, messages, est, has_tools,
-                                            has_images, None, body)
+                                            has_images, None, body, diff=diff)
         if pid is None:
             if has_images:
                 return _openai_error(
@@ -34820,7 +34901,7 @@ def v1_messages():
                                      require_tools=has_tools,
                                      **_quality_route_kwargs(body.get("model"), has_images))
         pid, resolved = _apply_orchestrator(pid, resolved, oai_messages, est, has_tools,
-                                            has_images, None, body)
+                                            has_images, None, body, diff=diff)
         if pid is None:
             if has_images:
                 return _anthropic_error(

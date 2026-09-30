@@ -1122,6 +1122,28 @@ the model out (`model_categories.excluded`): context = KNOWN window >=
 `tests/conftest.py` stands evidence aside for tests that patch
 `model_categories.matches` to define membership themselves.
 
+## Best model leads; the orchestrator opens real turns (2026-09-30)
+
+Covered by `tests/test_best_model_leads.py`. Live, session 47a25faa (opencode,
+coding): 22 of 24 turns on gemini-3.6/3.7-flash (134.1) while glm-5.3 (138) and
+the conversation's chosen orchestrator space-bunny (137.7) sat unused.
+
+- **Auto pick**: `_auto_top_band` keeps entries within `_AUTO_TOP_BAND` (2.0)
+  of the best `_agentic_score` before `_weighted_pick` (after `_spread_pool`).
+  Alone, the softmax (T=5) over a pool of 14-55 let ~40 models at 130-134
+  outweigh the one at 138.
+- **Lead group**: `_may_lead_pool` = `_may_lead_agentic` (unchanged) plus any
+  model at least as strong as the strongest `_TOOL_PROVEN` one present. Used by
+  the router's agentic pool and `_build_chain`'s tool grouping, which put every
+  gemini-3 (even a relay copy at 130.1) ahead of every stronger model.
+- **Orchestrator**: `_apply_orchestrator` sets `g.hub_orchestrator_pair`;
+  `_build_chain` treats that primary as `pinned` (opens hop 1 whatever its
+  learned record; a stale 12-to-1 failure record from pre-fix empty replies
+  kept space-bunny off hop 1, so it never earned a new one). A `simple` turn
+  under `STREAM_BIG_REQUEST_TOKENS` keeps the router's pick (owner: medium
+  models for easy turns whatever the orchestrator). An exception in it is now
+  logged (`[orchestrator] not applied`) instead of silently dropped.
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):
