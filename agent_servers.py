@@ -791,6 +791,94 @@ def early_server_diagnosis(root_pid, marker=None, since=None, now=None,
         return None
 
 
+# The agent CLIs a turn launches (the executable's name, or a word of a
+# node.exe command line). A process carrying TURN_MARKER is only a STALE CLI
+# when it is one of these -- a server an agent started detached carries the
+# marker too and is the owner's running app, never touched here.
+_AGENT_CLI_WORDS = ("opencode", "codex", "claude", "kimi", "qwen", "gemini",
+                    "hermes", "openclaw", "aider", "cursor-agent")
+
+
+def _is_agent_cli(name, cmdline):
+    name = (name or "").lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    if any(name == w or name.startswith(w + "-") for w in _AGENT_CLI_WORDS):
+        return True
+    if name in ("node", "bun", "deno"):
+        text = " ".join(cmdline or ()).lower()
+        return any(w in text for w in _AGENT_CLI_WORDS)
+    return False
+
+
+def stale_agent_clis(exclude_pids=None):
+    """Agent CLI processes carrying TURN_MARKER. Called at BOOT, before this
+    hub starts any turn, every one of them belongs to a hub process that is
+    gone. MEASURED 2026-09-30: after a restart five opencode workers of the
+    previous run kept calling the new hub for minutes -- spending quota and
+    holding the top models, so a new run's helper was spread onto a weaker
+    one. [{pid, name, cmd}]; [] without psutil; never raises."""
+    try:
+        import psutil
+    except ImportError:
+        return []
+    skip = set(hub_pids() if exclude_pids is None else exclude_pids) | {os.getpid()}
+    found = []
+    try:
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                pid, name = proc.info.get("pid"), proc.info.get("name")
+                if pid in skip:
+                    continue
+                env = proc.environ()
+                if not env.get(TURN_MARKER) or env.get(PREVIEW_MARKER):
+                    continue
+                cmd = proc.cmdline()
+                if not _is_agent_cli(name, cmd):
+                    continue
+                found.append({"pid": pid, "name": name, "cmd": _short_cmdline(cmd)})
+            except Exception:                                    # noqa: BLE001
+                continue
+    except Exception:                                            # noqa: BLE001
+        return found
+    return found
+
+
+def stop_stale_agent_clis(grace=3.0):
+    """Stop every stale agent CLI (see stale_agent_clis) with its children.
+    Returns the ones stopped. Never raises."""
+    stale = stale_agent_clis()
+    if not stale:
+        return []
+    try:
+        import psutil
+    except ImportError:
+        return []
+    victims = []
+    for row in stale:
+        try:
+            proc = psutil.Process(row["pid"])
+            kids = proc.children(recursive=True)
+            for p in kids + [proc]:
+                try:
+                    p.terminate()
+                except Exception:                                # noqa: BLE001
+                    pass
+            victims.extend(kids + [proc])
+        except Exception:                                        # noqa: BLE001
+            continue
+    try:
+        _gone, alive = psutil.wait_procs(victims, timeout=grace)
+        for p in alive:
+            try:
+                p.kill()
+            except Exception:                                    # noqa: BLE001
+                pass
+    except Exception:                                            # noqa: BLE001
+        pass
+    return stale
+
+
 def stop_processes(pids, marker, exclude_pids=None, grace=3.0):
     """Stop the servers THIS TURN started, with their children, and return
     the PIDs still alive afterwards. A process is only touched when its

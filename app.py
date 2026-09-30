@@ -37464,6 +37464,16 @@ if __name__ == "__main__":
 
     _recover_interrupted_hub_transition()
     _mark_runtime_started()
+    # Agent CLIs the previous hub process launched and never stopped (a hard
+    # restart kills the hub, not its children on Windows): stopped before
+    # this hub starts any turn of its own -- see agent_servers.stale_agent_clis.
+    try:
+        _stale = agent_servers.stop_stale_agent_clis()
+        if _stale:
+            _log.info("[boot] stopped %d agent CLI process(es) the previous hub left running: %s",
+                      len(_stale), ", ".join("%s(%s)" % (p["name"], p["pid"]) for p in _stale)[:300])
+    except Exception as _exc:                                    # noqa: BLE001
+        _log.warning("[boot] could not check for leftover agent CLIs: %s", _exc)
     # The CLIs the last Stop disconnected, wired again once the server answers.
     threading.Thread(target=lambda: (time.sleep(15), _reconnect_clis_after_stop()),
                      daemon=True, name="stop-reconnect").start()

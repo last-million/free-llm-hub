@@ -1268,6 +1268,14 @@ Covered by `tests/test_opened_while_working.py`.
 - **Any-language difficulty**: `_HARD_HINTS` gained FR/ES/PT/IT/DE stems; 5+
   words with no `_ENGLISH_FUNCTION_WORDS` classify at least medium
   (`tests/test_any_language_difficulty.py`).
+- **Leftover agent CLIs stopped at boot** (`tests/test_boot_stops_leftover_clis.py`):
+  a hard restart kills the hub, not its children (Windows). MEASURED: five
+  opencode workers of an earlier run kept calling the new hub -- quota, pins
+  holding the top models, edits in the same project. At boot, before any turn,
+  `agent_servers.stop_stale_agent_clis()` stops every process carrying
+  `TURN_MARKER` that is an agent CLI (`_is_agent_cli`: opencode/codex/claude/
+  kimi/... or node/bun running one); agent-started servers, previews and the
+  owner's own terminal CLIs are never touched.
 - **Test hygiene**: conftest `_aa_scores_stay_put` (no benchmark refetch, no
   write to the real aa_scores.json, scores restored per test);
   `test_a_locked_run_file_is_retried_not_silently_lost` locks only its own
