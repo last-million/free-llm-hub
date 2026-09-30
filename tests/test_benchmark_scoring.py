@@ -114,22 +114,21 @@ def test_promoted_families_hit_the_top_bands():
 # Id-keyed like the other floors (no provider-id checks in routing).
 # --------------------------------------------------------------------------- #
 
-def test_user_ranking_claude_then_gpt5_then_kimi_k3_then_gemini():
-    """USER RANKING, 2nd revision 2026-07-31: claude > gpt-5.x > kimi-k3 >
-    gemini. K3 was briefly top; the user corrected it to sit AFTER the gpt-5
-    family and claude."""
+def test_user_ranking_kimi_k3_then_claude_then_gpt5_then_gemini():
+    """USER RANKING, 3rd revision 2026-09-30: kimi-k3 > claude/glm-5.3 >
+    gpt-5.x > gemini. The owner put Kimi K3 "just above GLM 5.3" as the top
+    free model (Arena text 1488 vs 1480; AA Index 44 vs 45 -- a tie). The
+    2nd revision (2026-07-31) had it after claude and every gpt-5.x."""
     kimi = app._benchmark_score("testpid", "kimi-k3")
     claude = app._benchmark_score("puter", "claude-opus-5")
     gpt = app._benchmark_score("puter", "gpt-5.6-sol")
     gemini = app._benchmark_score("puter", "gemini-3-pro")
-    assert claude > gpt > kimi > gemini, (claude, gpt, kimi, gemini)
+    assert kimi > claude > gpt > gemini, (kimi, claude, gpt, gemini)
     # kimi-k3 and claude are flat floors; the GPT floor SCALES with the version
     # (since 2026-07-31), so it is checked as a band rather than an exact value.
-    # REVISED: kimi-k3 now ranks BELOW claude and every gpt-5.x, per
-    # "kimi k3 is the best one AFTER gpt models from 5 up and claude models".
     assert claude == 138
+    assert abs(kimi - 138.1) < 1e-6
     assert 135 <= gpt < 138
-    assert kimi < gpt, (kimi, gpt)
 
 
 def test_gemini_is_ranked_last_by_getting_no_floor_at_all():

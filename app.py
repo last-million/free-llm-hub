@@ -1699,7 +1699,11 @@ def _strong_root_version_excess(low):
 # reasons about the SHAPE of the score distribution (the spread band) must exclude
 # them. Kept as one tuple so the floor sites and _spread_pick can never drift apart.
 #                 hy3    k3     sol  terra k2.6  claude gpt5.5+ glm5.x gpt5.x  dsv4   mm3  pixel  bunny
-_PREF_FLOORS = (134.5, 134.8, 136, 135, 0,    138,   136,    134,   135,   134,   133, 137.6, 137.7)
+_PREF_FLOORS = (134.5, 138.1, 136, 135, 0,    138,   136,    134,   135,   134,   133, 137.6, 137.7)
+# OWNER DIRECTIVE 2026-09-30: Kimi K3 "just above GLM 5.3" -- the top free model
+# (index 1: 134.8 -> 138.1). Boards read that day: Arena text kimi-k3-max 1488 >
+# glm-5.3-max 1480; AA Index v4.3.2 GLM-5.3 45 > Kimi K3 44 -- a tie within
+# noise, so the owner's preference decides. Newer Kimi keeps +0.1 per major.
 # OWNER DIRECTIVE 2026-09-29: "space bunny alpha ... make it from the best
 # models, it is wooow". OpenRouter's stealth/space-bunny-alpha (anonymous, free
 # while in stealth, 1M window, tools, reasoning, image input -- its own catalog
