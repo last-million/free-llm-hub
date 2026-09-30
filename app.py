@@ -17274,30 +17274,118 @@ _MULTI_WORK_WORDS = ("build", "create", "make", "implement", "fix", "add", "writ
                      "finish", "test", "run", "install", "update", "change", "improve")
 
 
+# The same short commands in the other languages the owner writes in. Only
+# the fallback reads these (see _multi_wants_a_swarm): the model verdict is
+# what makes the tier work in ANY language.
+_MULTI_WORK_WORDS_INTL = (
+    # French
+    "corrige", "corriger", "corrigez", "répare", "réparer", "repare", "reparer",
+    "crée", "créer", "cree", "creer", "construis", "construire", "ajoute", "ajouter",
+    "écris", "écrire", "ecris", "ecrire", "refais", "refaire", "continuer",
+    "termine", "terminer", "finis", "finir", "teste", "tester", "lance", "lancer",
+    "installe", "installer", "modifie", "modifier", "changer", "améliore",
+    "améliorer", "ameliore", "ameliorer", "réécris", "reecris", "optimise", "optimiser",
+    "nettoie", "nettoyer", "mets", "développe", "developpe", "intègre", "integre",
+    "déploie", "deploie", "migre", "migrer",
+    # Spanish / Portuguese / Italian / German
+    "arregla", "crea", "añade", "agrega", "escribe", "construye", "mejora",
+    "cria", "adiciona", "escreve", "melhora", "conserta",
+    "correggi", "aggiungi", "scrivi", "migliora", "costruisci",
+    "behebe", "repariere", "erstelle", "baue", "füge", "schreibe", "verbessere",
+    "ändere",
+)
+_MULTI_QUESTION_ENDS = ("?", "\uff1f", "\u061f")        # ? and the CJK / Arabic marks
+_MULTI_SHORT_QUESTION_WORDS = 12
+_MULTI_SHORT_CHAT_WORDS = 3
+_MULTI_INTENT_SYSTEM = (
+    "You label ONE message a user sent to a coding agent working on their "
+    "project. Reply with exactly one word.\n"
+    "WORK: it asks the agent to do something in the project -- build, create, "
+    "change, fix, improve, redo, continue, test, check -- even when it is "
+    "phrased as a question or a complaint (\"the edges are not perfect, can you "
+    "fix that?\" is WORK).\n"
+    "CHAT: it only wants an answer, or is thanks, a greeting, a yes/no or small "
+    "talk (\"all good?\", \"what did you change?\", \"thanks\").\n"
+    "The message can be in any language. Never answer the message itself.")
+_MULTI_INTENT_DEADLINE = 12
+_MULTI_INTENT_HOPS = 2
+
+
+def _multi_intent_by_model(text):
+    """"work" | "chat" from a quick model verdict, or None when no hop gave a
+    clear one. Language-independent -- the reason it exists (owner,
+    2026-09-30: "it should work in any language of course"). Never raises;
+    never spends a subscription."""
+    messages = [{"role": "system", "content": _MULTI_INTENT_SYSTEM},
+                {"role": "user", "content": "Message:\n<<<\n%s\n>>>" % text}]
+    try:
+        pid, model, _diff = _route_by_difficulty(messages, 8, require_tools=False,
+                                                 force_difficulty="medium")
+        if not pid:
+            return None
+        hops = 0
+        for hop_pid, hop_model in _build_chain(pid, model):
+            if _is_sub(hop_pid):
+                continue
+            hops += 1
+            if hops > _MULTI_INTENT_HOPS:
+                break
+            payload = {"model": hop_model, "stream": False, "max_tokens": 8,
+                       "temperature": 0, "messages": messages}
+            resp, _exc = _dispatch_chat_with_deadline(hop_pid, payload,
+                                                      _MULTI_INTENT_DEADLINE)
+            if resp is None:
+                continue
+            try:
+                if resp.status_code != 200:
+                    continue
+                data = resp.json() or {}
+            except ValueError:
+                continue
+            finally:
+                try:
+                    resp.close()
+                except Exception:                                    # noqa: BLE001
+                    pass
+            out = (((data.get("choices") or [{}])[0].get("message") or {})
+                   .get("content") or "").upper()
+            m = re.search(r"\b(WORK|CHAT)\b", out)
+            if m:
+                return m.group(1).lower()
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[multi] intent verdict failed", exc_info=True)
+    return None
+
+
 def _multi_wants_a_swarm(text):
-    """True when a message in the multi tier is work worth splitting."""
+    """True when a message in the multi tier is work worth splitting.
+
+    The owner SELECTED Multi, so the answer leans to yes: a quick model
+    verdict decides in any language (_multi_intent_by_model), and without
+    one only structure counts -- a short question (it ends in a question
+    mark, any script) or a few words naming no work ("ok", "merci",
+    "thanks a lot") are answered directly; everything else follows the tier.
+    MEASURED 2026-09-30: a French fix request was answered directly because
+    the old test knew English verbs only and the classifier called it simple."""
     t = " ".join((text or "").split())
     if not t:
         return False
     if len(t) > _MULTI_DIRECT_MAX_CHARS:
         return True
-    try:
-        difficulty = _classify_difficulty([{"role": "user", "content": t}])
-    except Exception:                                            # noqa: BLE001
-        difficulty = "hard"
-    if difficulty != "simple":
-        return True
+    verdict = _multi_intent_by_model(t)
+    if verdict:
+        return verdict == "work"
     low = t.lower()
+    words = re.findall(r"[^\W\d_]+", low)
+    names_work = bool(set(words) & (set(_MULTI_WORK_WORDS) | set(_MULTI_WORK_WORDS_INTL)))
     # A question is answered, not planned -- "what did you change?" names
     # "change" and is still a question. The ordinary turn that answers it
     # has the same tools, so a "can you fix the zoom?" still gets fixed.
-    if low.endswith("?") and re.match(r"^(what|why|how|is|are|was|were|did|does|do|can|could|"
-                                       r"should|would|where|which|when|who)(?:\s|$)", low):
+    if low.endswith(_MULTI_QUESTION_ENDS) and len(words) <= _MULTI_SHORT_QUESTION_WORDS:
         return False
-    # A short message that names work still is work: "fix the zoom",
-    # "continue", "make it blue".
-    words = set(re.findall(r"[a-z]+", low))
-    return bool(words & set(_MULTI_WORK_WORDS))
+    if len(words) <= _MULTI_SHORT_CHAT_WORDS and not names_work:
+        return False
+    return True
 
 
 # A "continue" is short: "continue the header in blue, and add a footer" is new
@@ -17395,7 +17483,8 @@ def _multi_turn_events(session_id, sess_info, text):
                 configure=_swarm_windows_configure,
                 on_done=_multi_owner_record,
                 stop=agentic_chat.stop_session,
-                modes=_worker_mode_keys(),
+                modes=_multi_worker_modes(sess_info),
+                default_mode=_session_mode_or_none(sess_info),
                 context=context or None,
                 **_swarm_windows_manager_kw())
         except Exception:                                        # noqa: BLE001
@@ -17419,7 +17508,8 @@ def _multi_turn_events(session_id, sess_info, text):
             planner=_pipeline_bound(_swarm_windows_planner, _session_mode_or_none(sess_info)),
             configure=_swarm_windows_configure,
             stop=agentic_chat.stop_session,
-            modes=_worker_mode_keys(),
+            modes=_multi_worker_modes(sess_info),
+            default_mode=_session_mode_or_none(sess_info),
             on_done=_multi_owner_record,
             owner=session_id,
             **dict(_swarm_windows_manager_kw(), **({"context": context} if context else {})))
@@ -18997,6 +19087,16 @@ _WORKER_MODE_EXCLUDED = ("fast",)
 
 def _worker_mode_keys():
     return tuple(k for k in _mode_keys() if k not in _WORKER_MODE_EXCLUDED)
+
+
+def _multi_worker_modes(sess_info):
+    """The categories a Multi run's workers may use: the conversation's own
+    category when the user selected one (every worker runs in it), else the
+    planner's choice among all worker categories."""
+    mode = _session_mode_or_none(sess_info)
+    if mode and mode != MODE_ALL and _valid_mode(mode) not in (None, MODE_ALL):
+        return (mode,)
+    return _worker_mode_keys()
 
 
 def _valid_mode(mode):

@@ -62,7 +62,7 @@ def test_a_parent_turn_in_it_is_routed_at_the_top_tier():
     """The parent rarely runs a turn itself in this tier; when it does, it is
     not a cheap one."""
     assert AC._hub_model_for("multi") == "best"
-    assert AC._hub_model_for("multi", "coding") == "coding"
+    assert AC._hub_model_for("multi", "coding") == "coding-max"
 
 
 # --------------------------------------------------------------------------- #
@@ -117,9 +117,10 @@ def swarm(monkeypatch):
 
     def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
               on_done=None, configure=None, modes=(), review=True, owner=None, stop=None,
-              context=""):
+              context="", default_mode=None):
         calls["start"].append({"goal": goal, "project_dir": project_dir,
                                "cli": cli_id, "modes": tuple(modes), "owner": owner})
+        calls.setdefault("default_mode", []).append(default_mode)
         calls.setdefault("context", []).append(context)
         calls["on_done"] = on_done
         return "swarm-test"

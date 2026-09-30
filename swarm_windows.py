@@ -580,10 +580,10 @@ class _Run:
                  "error", "created_at", "ended_at", "stop_flag", "lock", "waves",
                  "restored", "interrupted", "store_root", "owner",
                  "manager", "managed", "modes", "manager_tokens", "manager_calls",
-                 "context", "resumes")
+                 "context", "resumes", "default_mode")
 
     def __init__(self, goal, project_dir, cli_id, phases, owner=None,
-                 manager=None, modes=(), context=""):
+                 manager=None, modes=(), context="", default_mode=None):
         self.id = "swarm-" + uuid.uuid4().hex[:12]
         self.goal = goal
         # WHAT THE CONVERSATION ALREADY ESTABLISHED (bounded, see
@@ -631,6 +631,10 @@ class _Run:
         # tokens nobody opted into).
         self.managed = manager is not None
         self.modes = tuple(modes or ())
+        # The category a phase runs in when the plan names none: the one the
+        # user selected for the conversation (a "Review and finish" phase used
+        # to run under "all"). Persisted, like owner.
+        self.default_mode = default_mode or None
         # What the manager cost THIS run, planning included -- the hub's daily
         # budget is global, and "what did this job cost me" is per job.
         self.manager_tokens = 0
@@ -646,6 +650,7 @@ class _Run:
             "run_id": self.id, "goal": self.goal, "state": self.state,
             "project_dir": self.project_dir, "cli": self.cli_id,
             "owner": self.owner,
+            "default_mode": self.default_mode,
             "managed": bool(self.managed or self.manager is not None),
             "manager_tokens": self.manager_tokens,
             "manager_calls": self.manager_calls,
@@ -684,6 +689,7 @@ class _Run:
             run.resumes = 0
         run.id = str(row["run_id"])
         run.owner = row.get("owner") or None
+        run.default_mode = row.get("default_mode") or None
         run.state = row.get("state") or DONE
         run.error = row.get("error")
         run.created_at = float(row.get("created_at") or time.time())
@@ -1262,9 +1268,10 @@ def _run_agent_once(run, agent, spawn, run_turn, configure=None, hold=False):
         # under, so a code phase gets a coding model and a phase that has to
         # read a screenshot gets one that can see. Best-effort: a session that
         # will not take a mode still does its work under the default.
-        if configure and agent.mode:
+        mode = agent.mode or getattr(run, "default_mode", None)
+        if configure and mode:
             try:
-                configure(agent.session_id, agent.mode)
+                configure(agent.session_id, mode)
             except Exception:                                    # noqa: BLE001
                 pass
         summary = _drain(agent, run_turn(agent.session_id, _agent_prompt(run, agent)))
@@ -1581,7 +1588,7 @@ def unfinished(run):
 
 
 def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
-           manager=None, modes=None, context=None):
+           manager=None, modes=None, context=None, default_mode=None):
     """Pick an ENDED run back up where it stopped. Returns the run id, or None
     when there is nothing to resume.
 
@@ -1626,6 +1633,8 @@ def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
             run.manager = manager
         if modes and not run.modes:
             run.modes = tuple(modes)
+        if default_mode:
+            run.default_mode = default_mode
     _persist(run)
     threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure, stop),
                      daemon=True, name="swarm-continue-" + run.id).start()
@@ -1651,7 +1660,7 @@ class _PlanMeter:
 
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
           on_done=None, configure=None, modes=(), review=True, owner=None, stop=None,
-          manager=None, context=""):
+          manager=None, context="", default_mode=None):
     """Begin a run. Returns the run id immediately; the work happens on a
     background thread.
 
@@ -1681,7 +1690,8 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     if review:
         phases = with_review(phases)
     run = _Run(goal, project_dir, cli_id, phases, owner=owner,
-               manager=manager, modes=modes, context=context)
+               manager=manager, modes=modes, context=context,
+               default_mode=default_mode)
     if meter:
         run.manager_tokens, run.manager_calls = meter.tokens, meter.calls
     _remember(run)

@@ -2115,6 +2115,12 @@ def _hub_model_for(quality: str = None, mode: str = None) -> str:
         # asked for "coding" -- the Normal tier -- and two agent turns were
         # served by liquid/lfm-2.5-2.6b, a 2.6B model.
         q = quality or "normal"
+        # "multi" as a single turn (a question the run did not split, or the
+        # parent's own turn) is the top tier, like the no-mode branch below:
+        # it used to send the bare mode -- the Normal tier -- so the owner's
+        # Multi + coding session answered on gemini flash (2026-09-30).
+        if q == "multi":
+            q = "max"
         if q in ("max", "swarm"):
             return "%s-%s" % (mode, q)
         return mode

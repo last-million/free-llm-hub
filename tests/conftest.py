@@ -101,6 +101,16 @@ def _steady_machine(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_multi_intent_model(monkeypatch):
+    """app._multi_intent_by_model asks a real model "WORK or CHAT?" before a
+    Multi run; tests get "no verdict" (the language-independent fallback) and
+    tests/test_multi_french_work.py patches in the verdicts it checks."""
+    import app
+    monkeypatch.setattr(app, "_multi_intent_by_model", lambda text: None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _category_evidence_yields_to_patched_patterns(monkeypatch):
     """app._category_by_evidence (2026-09-29) adds top-band tool-capable
     models to coding/swarm/... Tests that DEFINE membership by replacing

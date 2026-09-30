@@ -181,4 +181,8 @@ def test_every_swarm_start_offers_the_worker_list():
     assert "modes=_mode_keys()" not in src
     # the three start sites, the resumed-run (manager re-attach) path and the
     # multi-tier "continue" that resumes a run's unfinished phases
-    assert src.count("modes=_worker_mode_keys()") == 5
+    # (the two multi-tier sites pass _multi_worker_modes, which is the worker
+    # list unless the conversation selected a category -- see
+    # tests/test_multi_follows_the_selection.py)
+    assert (src.count("modes=_worker_mode_keys()")
+            + src.count("modes=_multi_worker_modes(sess_info)")) == 5

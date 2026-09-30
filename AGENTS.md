@@ -1144,6 +1144,29 @@ the conversation's chosen orchestrator space-bunny (137.7) sat unused.
   models for easy turns whatever the orchestrator). An exception in it is now
   logged (`[orchestrator] not applied`) instead of silently dropped.
 
+## Multi follows the selection, in any language (2026-09-30)
+
+Covered by `tests/test_multi_french_work.py` and
+`tests/test_multi_follows_the_selection.py`. Live, session 47a25faa (Multi +
+coding): a French fix request was answered by one session on the Normal tier.
+
+- **Is it work?** `_multi_wants_a_swarm`: > `_MULTI_DIRECT_MAX_CHARS` = work;
+  else a quick model verdict `_multi_intent_by_model` ("WORK"/"CHAT", any
+  language, medium route, 2 hops x 12 s, no subscription; MEASURED 2-7 s,
+  correct on FR/AR/chat). No verdict = language-independent fallback: a
+  question (ends ? / U+FF1F / U+061F) of <= 12 words or <= 3 words naming no
+  work (`_MULTI_WORK_WORDS` + `_MULTI_WORK_WORDS_INTL`) is answered directly,
+  everything else follows the tier. The classifier is no longer consulted
+  (English-only hints). `tests/conftest.py` stubs the verdict to None.
+- **Category**: `_multi_worker_modes(sess_info)` = `(session category,)` when
+  one is selected, so the planner cannot pick another one, and
+  `swarm_windows.start/resume(default_mode=)` (persisted on the run) is the
+  category of a phase the plan names none for (`_run_agent_once`: `agent.mode
+  or run.default_mode`). The planner's vision/coding choices used to win, and a
+  phase with none ran under "all".
+- **Effort**: `_hub_model_for("multi", mode)` = `"<mode>-max"` (was the bare
+  mode = Normal tier).
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):
