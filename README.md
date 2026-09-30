@@ -137,7 +137,10 @@ medium model whichever orchestrator is chosen; real work opens on it.
 On **auto**, a conversation opens on the strongest model available right now
 (within 2 points of the top score, so equal copies on different providers share
 the load), and the fallbacks behind it follow strength too — a proven but
-weaker family is never queued ahead of a stronger model.
+weaker family is never queued ahead of a stronger model. In a **Multi** run,
+each new worker opens on a strong model the run's earlier workers have not used
+yet (never more than 4 points under the best), so the one that reviews the work
+is a different model from the one that wrote it.
 
 ---
 

@@ -1166,6 +1166,21 @@ coding): a French fix request was answered by one session on the Normal tier.
   phase with none ran under "all".
 - **Effort**: `_hub_model_for("multi", mode)` = `"<mode>-max"` (was the bare
   mode = Normal tier).
+- **One run, several strong models** (`tests/test_run_workers_mix_models.py`):
+  a run's workers mostly go one after another, and `_spread_pool` only spreads
+  CONCURRENT sessions, so each worker drew from the same top two. The agentic
+  first pick now runs `_rotate_within_run` before `_spread_pool`: models the
+  run's other workers opened on (`swarm_windows.sibling_sessions` + the
+  `_WORKER_MODEL` ledger written by `_note_worker_model` at the pick) are
+  skipped while a model within `_RUN_ROTATE_MAX_DROP` (4) of the best is left;
+  else the full pool. Logged as `[rotate]`. A worker still keeps ONE model for
+  its own turns (the session pin).
+- **Task list** (`tests/test_multi_run_task_list.py`): `/api/agent/sessions/
+  <sid>/plan` returns `_multi_run_plan` -- one line per phase of the
+  conversation's run ("Phase N: title · model", done / doing / failed) --
+  while the run is going and after it until PROGRESS.md is written again (it
+  used to show the previous turn's "9/9 done"). Each worker prompt tells it to
+  keep its own "- [ ] Phase N: title" line under "## <run id>" in PROGRESS.md.
 
 ## Tests
 

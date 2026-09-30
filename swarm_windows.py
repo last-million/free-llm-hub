@@ -900,7 +900,17 @@ def _agent_prompt(run, agent):
               agent_servers.worker_rules()]
     parts += ["", "Work only on YOUR phase, and do it now -- do not ask for "
                   "confirmation. Finish with a short summary of what you "
-                  "changed and anything the other agents need to know."]
+                  "changed and anything the other agents need to know.",
+              # THE TODO LIST STAYS TRUE. MEASURED 2026-09-30: a run's workers
+              # never touched PROGRESS.md, so the conversation's list still
+              # said "ALL GATES COMPLETE" from the previous turn while four
+              # new phases were being worked. Owner: "he should always update
+              # his todolist and progress".
+              "Keep PROGRESS.md in the project folder true for YOUR phase: "
+              "under a heading \"## %s\" keep one line \"- [ ] Phase %d: %s\" "
+              "(add it when missing), and when your phase is done tick it "
+              "\"- [x]\" with one short line of what you verified. Leave the "
+              "other lines as they are." % (run.id, agent.index, agent.title)]
     return "\n".join(parts)
 
 
@@ -1575,6 +1585,22 @@ def last_run_for(owner):
     with _LOCK:
         mine = [r for r in _RUNS.values() if getattr(r, "owner", None) == owner]
     return max(mine, key=lambda r: r.created_at) if mine else None
+
+
+def sibling_sessions(session_id):
+    """Session ids of the OTHER workers of the run `session_id` works for
+    (those that have one yet), in phase order; [] when it is no worker.
+    Lets the hub give each worker a different strong model."""
+    if not session_id:
+        return []
+    with _LOCK:
+        runs = list(_RUNS.values())
+    for run in runs:
+        agents = list(getattr(run, "agents", None) or ())
+        if any(a.session_id == session_id for a in agents):
+            return [a.session_id for a in agents
+                    if a.session_id and a.session_id != session_id]
+    return []
 
 
 def unfinished(run):

@@ -7936,6 +7936,61 @@ def _spread_pool(pool, exclude_key=None):
         return pool
 
 
+# ONE RUN, SEVERAL STRONG MODELS. A Multi run's workers usually go one after
+# another (diagnose -> fix -> verify -> review), so _spread_pool, which only
+# sees workers running AT THE SAME TIME, never spread them: every worker drew
+# from the same top two (MEASURED 2026-09-30, run swarm-4f2aab7204a4). Owner:
+# "mixing between top models is a good idea" -- a reviewer on a different
+# model than the one that wrote the code is a real second opinion. So a
+# worker's first pick avoids the models its run's earlier workers used, among
+# models within _RUN_ROTATE_MAX_DROP of the best (never onto a weak one), and
+# falls back to the full pool when every strong one is used.
+_RUN_ROTATE_MAX_DROP = 4.0
+_WORKER_MODEL = {}                  # worker session id -> model identity
+_WORKER_MODEL_MAX = 2000
+_worker_model_lock = threading.Lock()
+
+
+def _note_worker_model(session_key, model):
+    """Remember which model a session opened on (for its run's siblings)."""
+    if not session_key or not model:
+        return
+    with _worker_model_lock:
+        if len(_WORKER_MODEL) >= _WORKER_MODEL_MAX:
+            for k in list(_WORKER_MODEL)[:_WORKER_MODEL_MAX // 4]:
+                _WORKER_MODEL.pop(k, None)
+        _WORKER_MODEL[session_key] = _normalize_model_identity(model)
+
+
+def _run_used_identities(session_key):
+    """Model identities the OTHER workers of this session's run opened on."""
+    try:
+        sibs = swarm_windows.sibling_sessions(session_key)
+    except Exception:                                            # noqa: BLE001
+        return set()
+    with _worker_model_lock:
+        return {_WORKER_MODEL[s] for s in sibs if s in _WORKER_MODEL}
+
+
+def _rotate_within_run(pool, session_key):
+    """`pool` without the models this worker's run already used, as long as a
+    model within _RUN_ROTATE_MAX_DROP of the best is left; else `pool`."""
+    try:
+        used = _run_used_identities(session_key)
+        if not used or not pool:
+            return pool
+        best = max(c[0] for c in pool)
+        fresh = [c for c in pool
+                 if _normalize_model_identity(c[2]) not in used
+                 and c[0] >= best - _RUN_ROTATE_MAX_DROP]
+        if fresh:
+            _log.info("[rotate] %s: its run already used %s -> choosing among %d other strong model(s)",
+                      (session_key or "-")[:8], ", ".join(sorted(used)), len(fresh))
+        return fresh or pool
+    except Exception:                                            # noqa: BLE001
+        return pool
+
+
 def _session_pin_drop(key):
     """A finished conversation holds no model. MEASURED 2026-09-12: the
     workers of two earlier multi-session runs still counted as "holding" the
@@ -8362,12 +8417,14 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # on one model while a sibling model idled. Picking is microseconds;
         # holding a lock across it costs nothing.
         with _spread_pick_lock:
+            _pool = _rotate_within_run(_pool, _skey)
             _pool = _spread_pool(_pool, _skey)
             _sustain = _model_identity_min_penalty(_pool)
             _pool = _auto_top_band(_pool, _sustain)
             picked = _weighted_pick(_pool, _sustain)
             _s, pid, model = picked
             _session_pin_set(_skey, pid, model)
+            _note_worker_model(_skey, model)
             _log.info("[spread] %s -> %s/%s (pool %d, held elsewhere %d)",
                       (_skey or "-")[:8], pid, model, len(_pool),
                       len(_pinned_elsewhere(_skey)))
@@ -20648,6 +20705,47 @@ def api_agent_send_message_stream(session_id):
     return Response(stream_with_context(gen()), mimetype="text/event-stream", headers=_SSE_HEADERS)
 
 
+def _multi_run_plan(session_id, project_dir=None):
+    """The Build page's task list from this conversation's Multi run: one
+    line per phase (done / working / waiting / failed, and the model the
+    worker runs on), or None when no run should be shown.
+
+    Shown while the run is going, and after it ended until PROGRESS.md is
+    written again. MEASURED 2026-09-30: during a four-phase run the strip
+    still read "9/9 done ... ALL GATES COMPLETE" from the previous turn's
+    PROGRESS.md."""
+    try:
+        run = swarm_windows.last_run_for(session_id)
+        if run is None:
+            return None
+        live = run.state in (swarm_windows.PENDING, swarm_windows.RUNNING)
+        if not live:
+            try:
+                path = os.path.join(project_dir or run.project_dir, "PROGRESS.md")
+                if os.path.getmtime(path) > (run.ended_at or run.created_at):
+                    return None
+            except (OSError, TypeError):
+                pass
+        items = []
+        for a in run.agents:
+            text = "Phase %d: %s" % (a.index, a.title)
+            with _worker_model_lock:
+                model = _WORKER_MODEL.get(a.session_id) if a.session_id else None
+            if model:
+                text += " \u00b7 " + model
+            if a.state == swarm_windows.FAILED:
+                text += " (failed)"
+            items.append({"text": text, "done": a.state == swarm_windows.DONE,
+                          "doing": a.state == swarm_windows.RUNNING,
+                          "state": a.state})
+        return {"session_id": session_id, "tasks": items,
+                "done": sum(1 for t in items if t["done"]),
+                "source": "multi-session run %s" % run.id,
+                "run_id": run.id, "interrupted": None}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 @app.route("/api/agent/sessions/<session_id>/plan", methods=["GET"])
 def api_agent_plan(session_id):
     """The conversation's task list and, if its last turn did not finish,
@@ -20658,6 +20756,9 @@ def api_agent_plan(session_id):
     if gate:
         return gate
     sess = agentic_chat.get_session(session_id) or {}
+    run_plan = _multi_run_plan(session_id, sess.get("project_dir"))
+    if run_plan is not None:
+        return jsonify(run_plan)
     if sess.get("project_dir"):
         # Fresh: the agent may have edited PROGRESS.md mid-turn, and a page
         # asking now wants what is on disk now. Mid-turn, the agent wrote it
