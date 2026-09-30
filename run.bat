@@ -123,7 +123,7 @@ rem 60-200s of network round-trips before the hub bound its port -- painful, and
 rem it makes the hub look hung. The stamp holds a hash of requirements.txt, so a
 rem pinned-version bump still triggers a real install; nothing else does.
 set "DEPS_OK="
-python -c "import hashlib,os,sys;h=hashlib.sha256(open('requirements.txt','rb').read()).hexdigest();p=os.path.join('.venv','.deps-stamp');ok=os.path.exists(p) and open(p).read().strip()==h;__import__('flask');__import__('requests');__import__('cryptography');__import__('psutil');__import__('PIL');sys.exit(0 if ok else 1)" >nul 2>nul
+python -c "import hashlib,os,sys;h=hashlib.sha256(open('requirements.txt','rb').read()).hexdigest();p=os.path.join('.venv','.deps-stamp');ok=os.path.exists(p) and open(p).read().strip()==h;__import__('flask');__import__('requests');__import__('cryptography');__import__('psutil');__import__('PIL');__import__('yaml');__import__('tzdata');sys.exit(0 if ok else 1)" >nul 2>nul
 if not errorlevel 1 set "DEPS_OK=1"
 if defined DEPS_OK (
   echo [free-llm-hub] Dependencies already installed - skipping pip.

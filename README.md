@@ -70,9 +70,11 @@ first start; paste it into the dashboard once, then add provider keys.
 right thing on the system it belongs to.</sub>
 
 **Dependencies** (all pinned in `requirements.txt`): Flask, requests, psutil,
-Pillow, cryptography. Python 3.9+. The last two are **not** optional —
+Pillow, cryptography, PyYAML, tzdata. Python 3.9+. None is optional —
 `cryptography` encrypts your keys at rest, and a missing one has cost an install
-its whole keyring before.
+its whole keyring before; PyYAML lets Connect/Disconnect edit Hermes'
+`config.yaml`; tzdata gives Windows the time-zone table Google's daily quota
+resets on (midnight Pacific).
 
 ---
 

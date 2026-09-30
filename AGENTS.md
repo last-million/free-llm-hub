@@ -1124,8 +1124,14 @@ the model out (`model_categories.excluded`): context = KNOWN window >=
 
 ## Tests
 
-Run with the SYSTEM python (the `.venv` has no pytest):
+Run with either python (the `.venv` has pytest too):
 
     python -m pytest tests/ -q
+    .venv\Scripts\python.exe -m pytest tests/ -q
+
+The hub itself RUNS from the `.venv`, so a dependency present only in the
+system python (PyYAML, tzdata — both missing there until 2026-09-30) passes
+the suite while failing live. Run the suite under the `.venv` after touching
+imports or `requirements.txt`.
 
 The full suite is green (3770 passed); a new failure is a real regression.

@@ -34,3 +34,17 @@ Pillow==10.2.0
 # missing package fails SILENTLY, which is exactly why it has to be pinned
 # here. config.py now also says so out loud when it cannot read a key.
 cryptography==50.0.1
+
+# Hermes Connect/Disconnect (app._autofix_hermes / _disconnect_hermes /
+# _hermes_backup_model edit Hermes' config.yaml). NOT optional in practice:
+# the imports are guarded, so without it Connect says "add it by hand" and --
+# worse -- Disconnect silently leaves the hub's model block in Hermes' config.
+# MEASURED 2026-09-30: the hub runs from the .venv, which had no yaml; the
+# tests only passed under the system Python, which happened to have it.
+PyYAML==6.0.2
+
+# Time-zone table for zoneinfo (quota._day_bounds_tz: Google's per-model day
+# quota resets at midnight America/Los_Angeles). Windows ships no tz database,
+# so without it ZoneInfo raises and the reset silently falls back to UTC
+# midnight -- 7-8 h off. MEASURED 2026-09-30 in the .venv.
+tzdata==2025.2
