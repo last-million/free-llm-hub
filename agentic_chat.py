@@ -1763,7 +1763,7 @@ def _terminate(proc) -> None:
 class _Session:
     __slots__ = ("id", "cli_id", "project_dir", "native_session_id", "turn_count",
                  "created_at", "proc", "proc_lock", "turn_lock", "last_interrupted",
-                 "tools_notified", "quality", "mode")
+                 "tools_notified", "quality", "mode", "stop_pending")
 
     def __init__(self, cli_id, project_dir, quality="normal", mode=None):
         self.id = uuid.uuid4().hex
@@ -1776,6 +1776,10 @@ class _Session:
         self.proc_lock = threading.Lock()  # guards .proc
         self.turn_lock = threading.Lock()  # only one turn may run at a time
         self.last_interrupted = False
+        # A Stop pressed while the turn owns the session but no CLI process is
+        # alive (before the first one starts, or between two -- a retry, an
+        # auto-continue): honoured by the next process the turn starts.
+        self.stop_pending = False
         self.tools_notified = False        # missing-toolchain notice, once per session
         # "normal" | "max". Chosen once, when the session starts. "max" launches
         # the CLI with ANTHROPIC_MODEL=best instead of auto, so every turn it
@@ -3169,6 +3173,7 @@ def send_message(session_id, text):
         return 403, None, "%s agentic mode is not currently supported: %s" % (sess.cli_id, reason)
     if not sess.turn_lock.acquire(blocking=False):
         return 409, None, "A turn is already running for this session."
+    sess.stop_pending = False
     # THE PLAIN ROUTE KEPT NO MEMORY AT ALL: no turn count, no trace, no task
     # list, no stopping place -- a conversation driven through it looked, to
     # the next streamed turn, like it had never happened. Same bookkeeping as
@@ -3246,6 +3251,10 @@ def _send_message_locked(sess, text, started):
         sess.last_interrupted = False
         with sess.proc_lock:
             sess.proc = proc
+            stop_now, sess.stop_pending = sess.stop_pending, False
+        if stop_now:
+            sess.last_interrupted = True
+            _terminate(proc)
         timed_out = False
         try:
             stdout, stderr = proc.communicate(timeout=_TURN_TIMEOUT)
@@ -3620,6 +3629,7 @@ def send_message_stream(session_id, text):
         yield err(403, "%s agentic mode is not supported: %s" % (sess.cli_id, reason)); return
     if not sess.turn_lock.acquire(blocking=False):
         yield err(409, "A turn is already running for this session."); return
+    sess.stop_pending = False
     proc = None
     timer = None
     timed_out = [False]
@@ -3704,6 +3714,10 @@ def send_message_stream(session_id, text):
             sess.last_interrupted = False
             with sess.proc_lock:
                 sess.proc = proc
+                stop_now, sess.stop_pending = sess.stop_pending, False
+            if stop_now:
+                sess.last_interrupted = True
+                _terminate(proc)
 
             stderr_buf[:] = []
             drain_done = threading.Event()
@@ -4437,8 +4451,16 @@ def stop_session(session_id) -> bool:
         return False
     with sess.proc_lock:
         proc = sess.proc
-    if proc is None or proc.poll() is not None:
-        return False
+        if proc is None or proc.poll() is not None:
+            # No process alive, but a turn may own the session (before its
+            # first process, or between two). MEASURED 2026-09-30: once the
+            # page showed "working" for that whole span, a Stop there found
+            # nothing to kill and the next process ran on. Leave the Stop
+            # for the turn's next process (checked under this same lock).
+            if sess.turn_lock.locked():
+                sess.stop_pending = True
+                return True
+            return False
     sess.last_interrupted = True
     _terminate(proc)
     return True
@@ -4482,6 +4504,15 @@ def get_session(session_id):
     with sess.proc_lock:
         proc = sess.proc
     running = bool(proc is not None and proc.poll() is None)
+    # A turn is running for its WHOLE length, not only while a CLI process is
+    # alive: between the processes of one turn (a retry, an auto-continue) the
+    # process slot is empty but the turn still owns the session. MEASURED
+    # 2026-09-30: a page opened in that gap showed an idle conversation.
+    if not running:
+        try:
+            running = turn_busy(sess.id)
+        except Exception:                                        # noqa: BLE001
+            pass
     return {
         "session_id": sess.id,
         "cli": sess.cli_id,

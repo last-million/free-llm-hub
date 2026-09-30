@@ -1206,6 +1206,37 @@ coding): a French fix request was answered by one session on the Normal tier.
   when its run is not live, and flags `resumed` for a run the boot picked back
   up (`swarm_windows.resume_interrupted` -- no click needed for Multi).
 
+## Working is always visible (2026-09-30)
+
+Covered by `tests/test_opened_while_working.py`.
+
+- **Opened while working**: opening a conversation from the History list
+  (both branches: live session and /resume) now reattaches a running turn via
+  `showReconnectedStillWorking` like a page load; it used to mount the
+  transcript and say "send a message to continue". `agentic_chat.get_session`
+  reads `currently_running` = CLI process alive OR `turn_busy` (the turn owns
+  the session between two processes of one turn).
+- **Planning shown as it happens**: `_multi_turn_events` yields
+  `_MULTI_PLANNING_LINE` at once, runs `swarm_windows.start` (which plans
+  before returning) on a thread inside `contextvars.copy_context()`, yields
+  "Still planning (Ns)…" every `_MULTI_PLAN_HEARTBEAT`, and after the plan
+  the notice is followed by `_multi_plan_lines` (one line per wave, helpers
+  that run together named). While it plans, `_MULTI_PLANNING[sid]` makes
+  `_multi_run_plan` show "Planning the Multi run (Ns so far)" in the strip.
+- **Stop in the whole "working" span**: `stop_session` with no live process
+  but the turn lock held sets `_Session.stop_pending`; both spawn sites check
+  it under `proc_lock` right after assigning `sess.proc` and terminate that
+  process (the turn then ends "stopped" as usual); both turn entries clear it.
+  Before this, a Stop before the first process or between two was ignored
+  (it also hung `test_send_message_after_stop_reports_interrupted` once the
+  page -- and the test -- saw "working" from the lock).
+- **A helper's own page** (`tests/test_helper_page_shows_its_run.py`):
+  `_multi_run_plan` for a worker session (`swarm_windows.worker_info`) shows
+  ITS run (never the project's shared PROGRESS.md), items flagged `this`,
+  plus `helper`; the page draws `#agent-helper-bar` ("Helper N of M · title
+  -- one step of a Multi run", "Open the conversation ↗") and marks the row
+  "this window".
+
 ## Running now: open anything in a new window (2026-09-30)
 
 Covered by `tests/test_running_now_opens_anything.py`. `runRow(title, sub,

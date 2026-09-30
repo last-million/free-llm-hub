@@ -17373,6 +17373,10 @@ def _swarm_windows_turn(session_id, text):
 _MULTI_RUNS = {}                # session_id -> run_id of the turn in flight
 _MULTI_LOCK = threading.Lock()
 _MULTI_POLL = 2.0               # seconds between looks at the run
+_MULTI_PLAN_HEARTBEAT = 20.0    # a "still planning" line this often
+_MULTI_PLANNING_LINE = ("Planning the work \u2014 deciding the steps and which "
+                        "helpers can work at the same time\u2026")
+_MULTI_PLANNING = {}            # conversation -> when its Multi plan started
 # WHAT A WORKER IS DOING, on the conversation's page. MEASURED 2026-09-30:
 # phase 2 of run swarm-4f2aab7204a4 worked for an hour (164 edit/bash/notes
 # events) and the page showed nothing between "phase 2 started" and the
@@ -17647,25 +17651,60 @@ def _multi_turn_events(session_id, sess_info, text):
                 yield ev
             return
 
+    # PLANNING, SHOWN AS IT HAPPENS. swarm_windows.start plans before it
+    # returns -- a free planner, or the manager, retried when its first plan
+    # is unusable -- and the conversation used to show nothing for all of it
+    # (owner, 2026-09-30: "it should show if it is planning ... instantly,
+    # like /activity does"). The plan runs on its own thread, in a copy of
+    # this context (the planner routes through the hub's chain, which reads
+    # the request), while this turn says what is happening.
+    start_kw = dict(
+        planner=_pipeline_bound(_swarm_windows_planner, _session_mode_or_none(sess_info)),
+        configure=_swarm_windows_configure,
+        stop=agentic_chat.stop_session,
+        modes=_multi_worker_modes(sess_info),
+        default_mode=_session_mode_or_none(sess_info),
+        on_done=_multi_owner_record,
+        owner=session_id,
+        **dict(_swarm_windows_manager_kw(), **({"context": context} if context else {})))
+    yield {"event": "tool", "text": _MULTI_PLANNING_LINE}
+    box = {}
+    ctx = contextvars.copy_context()
+
+    def _plan_and_start():
+        try:
+            box["run_id"] = ctx.run(swarm_windows.start, text, project_dir, cli_id,
+                                    _swarm_windows_spawn, _swarm_windows_turn, **start_kw)
+        except BaseException as exc:                             # noqa: BLE001
+            box["exc"] = exc
+
+    with _MULTI_LOCK:
+        _MULTI_PLANNING[session_id] = time.time()
     try:
-        run_id = swarm_windows.start(
-            text, project_dir, cli_id,
-            _swarm_windows_spawn, _swarm_windows_turn,
-            planner=_pipeline_bound(_swarm_windows_planner, _session_mode_or_none(sess_info)),
-            configure=_swarm_windows_configure,
-            stop=agentic_chat.stop_session,
-            modes=_multi_worker_modes(sess_info),
-            default_mode=_session_mode_or_none(sess_info),
-            on_done=_multi_owner_record,
-            owner=session_id,
-            **dict(_swarm_windows_manager_kw(), **({"context": context} if context else {})))
-    except swarm_windows.SwarmWindowsError as exc:
+        th = threading.Thread(target=_plan_and_start, daemon=True,
+                              name="multi-plan-" + str(session_id)[:8])
+        th.start()
+        began, beat = time.monotonic(), _MULTI_PLAN_HEARTBEAT
+        while th.is_alive():
+            th.join(_MULTI_POLL)
+            waited = time.monotonic() - began
+            if th.is_alive() and waited >= beat:
+                yield {"event": "tool",
+                       "text": "Still planning (%ds) \u2014 deciding the steps and which "
+                               "helpers can work at the same time\u2026" % int(waited)}
+                beat += _MULTI_PLAN_HEARTBEAT
+    finally:
+        with _MULTI_LOCK:
+            _MULTI_PLANNING.pop(session_id, None)
+    exc = box.get("exc")
+    if isinstance(exc, swarm_windows.SwarmWindowsError):
         yield {"event": "error", "status": 400, "detail": str(exc)}
         return
-    except Exception as exc:                                     # noqa: BLE001
+    if exc is not None or not box.get("run_id"):
         yield {"event": "error", "status": 500,
-               "detail": "could not start: " + _sanitize(str(exc))}
+               "detail": "could not start: " + _sanitize(str(exc or "no run"))}
         return
+    run_id = box["run_id"]
     with _MULTI_LOCK:
         _MULTI_RUNS[session_id] = run_id
     for ev in _multi_follow_events(run_id, cli_id):
@@ -17725,6 +17764,22 @@ def _multi_owner_record(run):
     """on_done for a run that is a conversation's turn: the run knows whose."""
     if getattr(run, "owner", None):
         _multi_record(run.owner, run)
+
+
+def _multi_plan_lines(status_row):
+    """The plan as page lines, one per wave: which phases start first, which
+    run at the same time, which wait. Never raises."""
+    try:
+        titles = {a.get("index"): a.get("title") or "" for a in status_row.get("agents") or []}
+        waves = status_row.get("waves") or [[i] for i in sorted(titles)]
+        out = []
+        for n, wave in enumerate(waves, start=1):
+            names = " | ".join("%s \u00b7 %s" % (i, titles.get(i, "")) for i in wave)
+            together = " (%d helpers at the same time)" % len(wave) if len(wave) > 1 else ""
+            out.append("Plan \u00b7 %s%s: %s" % ("first" if n == 1 else "then", together, names))
+        return out
+    except Exception:                                            # noqa: BLE001
+        return []
 
 
 def _multi_activity_line(agent_row, ev):
@@ -17791,6 +17846,8 @@ def _multi_follow_events(run_id, cli_id):
                    "text": "Multi sessions: %d phase%s across real %s sessions, in "
                            "this folder (run %s -- also on the Swarm tab)."
                            % (total, "" if total == 1 else "s", cli_id, run_id)}
+            for line in _multi_plan_lines(st):
+                yield {"event": "tool", "text": line}
         for a in st.get("agents") or []:
             key = a.get("index")
             state = a.get("state")
@@ -20875,11 +20932,27 @@ def _multi_run_plan(session_id, project_dir=None):
     still read "9/9 done ... ALL GATES COMPLETE" from the previous turn's
     PROGRESS.md."""
     try:
-        run = swarm_windows.last_run_for(session_id)
+        with _MULTI_LOCK:
+            planning_since = _MULTI_PLANNING.get(session_id)
+        if planning_since:
+            return {"session_id": session_id,
+                    "tasks": [{"text": "Planning the Multi run (%ds so far)"
+                                       % int(time.time() - planning_since),
+                               "done": False, "doing": True}],
+                    "done": 0, "source": "multi-session run \u00b7 planning",
+                    "interrupted": None}
+        # A HELPER'S OWN PAGE (opened with Open ↗) shows ITS run, with itself
+        # marked -- never the project's shared PROGRESS.md, which every helper
+        # works in and which read as an old, unrelated plan (owner,
+        # 2026-09-30: "when I open helpers in a new window I see nothing
+        # accurate, the old plan from PROGRESS.md").
+        helper = swarm_windows.worker_info(session_id)
+        run = (swarm_windows.get(helper["run_id"]) if helper
+               else swarm_windows.last_run_for(session_id))
         if run is None:
             return None
         live = run.state in (swarm_windows.PENDING, swarm_windows.RUNNING)
-        if not live:
+        if not live and not helper:
             try:
                 path = os.path.join(project_dir or run.project_dir, "PROGRESS.md")
                 if os.path.getmtime(path) > (run.ended_at or run.created_at):
@@ -20901,6 +20974,7 @@ def _multi_run_plan(session_id, project_dir=None):
             # and open each one we want in a new window").
             items.append({"text": text, "done": a.state == swarm_windows.DONE,
                           "doing": a.state == swarm_windows.RUNNING,
+                          "this": bool(helper and a.index == helper.get("index")),
                           "state": a.state, "index": a.index, "title": a.title,
                           "model": model, "session_id": a.session_id or None,
                           "url": ("/agent/" + a.session_id) if a.session_id else None,
@@ -20916,6 +20990,7 @@ def _multi_run_plan(session_id, project_dir=None):
         return {"session_id": session_id, "tasks": items,
                 "done": sum(1 for t in items if t["done"]),
                 "source": "multi-session run %s" % run.id,
+                "helper": helper,
                 "run_id": run.id, "run_state": run.state,
                 "current": running[0] if running else None,
                 # Picked back up by this process after a restart (it did not

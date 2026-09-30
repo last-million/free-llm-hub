@@ -2733,6 +2733,16 @@
     white-space:nowrap; font-family:var(--mono); }
   .hp-sr{ position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0);
     white-space:nowrap; }
+  .agent-helper-bar{ display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+    border:1px solid var(--accent); background:var(--accent-soft); color:var(--text);
+    border-radius:var(--radius-sm); padding:7px 10px; margin-bottom:6px; font-size:12.5px; }
+  .agent-helper-bar b{ font-weight:700; }
+  .agent-helper-bar a{ margin-left:auto; color:var(--accent); font-weight:600;
+    text-decoration:none; white-space:nowrap; }
+  .agent-helper-bar a:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  .agent-plan-list li.hp.hp-this{ background:var(--accent-soft); border-radius:var(--radius-sm);
+    padding-left:4px; padding-right:4px; }
+  .hp-this-chip{ font-size:10.5px; font-weight:700; color:var(--accent); white-space:nowrap; }
   .agent-plan-list li.hp.failed .pl-box{ border-color:var(--danger); color:var(--danger-text); }
   .agent-plan-list li.hp.failed .pl-text{ color:var(--danger-text); }
   .agent-plan-list li.hp.doing .pl-box{ animation:hpPulse 1.6s ease-in-out infinite; }
@@ -3506,6 +3516,9 @@
                    sure he always creates a todo list and tracks it and updates
                    it while working, and if I stop the agent ... continue from
                    where he was working exactly". -->
+              <!-- THIS WINDOW IS A HELPER of a Multi run: which step, and the
+                   conversation it works for (filled by renderPlan from /plan). -->
+              <div class="agent-helper-bar" id="agent-helper-bar" role="note" hidden></div>
               <div class="agent-plan" id="agent-plan" hidden>
                 <button type="button" class="agent-plan-h" id="agent-plan-toggle" aria-expanded="true">
                   <span class="agent-plan-title" id="agent-plan-title">Plan</span>
@@ -10699,7 +10712,8 @@
     function helperRow(t, now){
       var state = t.state || (t.done ? 'done' : t.doing ? 'running' : 'pending');
       var li = document.createElement('li');
-      li.className = 'hp ' + (t.done ? 'done' : t.doing ? 'doing' : state === 'failed' ? 'failed' : '');
+      li.className = 'hp ' + (t.done ? 'done' : t.doing ? 'doing' : state === 'failed' ? 'failed' : '') +
+        (t.this ? ' hp-this' : '');
       var b = document.createElement('span'); b.className = 'pl-box'; b.setAttribute('aria-hidden', 'true');
       b.textContent = t.done ? '\u2713' : t.doing ? '\u2022' : state === 'failed' ? '\u2715' : '';
       var main = document.createElement('div'); main.className = 'hp-main';
@@ -10719,7 +10733,11 @@
         var tm = document.createElement('span'); tm.className = 'hp-time'; tm.textContent = el;
         top.appendChild(tm);
       }
-      if (t.url){
+      if (t.this){
+        var me = document.createElement('span'); me.className = 'hp-this-chip';
+        me.textContent = 'this window';
+        top.appendChild(me);
+      } else if (t.url){
         var a = document.createElement('a'); a.className = 'hp-open';
         a.href = t.url; a.target = '_blank'; a.rel = 'noopener';
         a.textContent = 'Open \u2197';
@@ -10742,6 +10760,7 @@
       var items = p.tasks || [];
       var stopped = p.interrupted || null;
       renderResume(stopped);
+      renderHelperBar(p.helper || null, items.length);
       box.hidden = !items.length;
       if (box.hidden) return;
       var helpers = !!p.run_id;
@@ -10769,6 +10788,26 @@
         li.appendChild(b); li.appendChild(x);
         list.appendChild(li);
       });
+      /* This window is one helper of a Multi run: say which, and link the
+         conversation it works for. */
+      function renderHelperBar(h, total){
+        var bar = $('#agent-helper-bar');
+        if (!bar) return;
+        bar.hidden = !h;
+        if (!h) return;
+        bar.innerHTML = '';
+        var t = document.createElement('span');
+        t.innerHTML = '<b>Helper ' + esc(String(h.index)) + (total ? ' of ' + total : '') + '</b> \u00b7 ' +
+          esc(h.title || '') + ' \u2014 one step of a Multi run (' + esc(h.run_id || '') + ').';
+        bar.appendChild(t);
+        if (h.owner){
+          var a = document.createElement('a');
+          a.href = '/agent/' + encodeURIComponent(h.owner); a.target = '_blank'; a.rel = 'noopener';
+          a.textContent = 'Open the conversation \u2197';
+          a.setAttribute('aria-label', 'Open the conversation this helper works for in a new window');
+          bar.appendChild(a);
+        }
+      }
       /* The stopping place is drawn by renderResume, above the message box. */
       function renderResume(stopped){
         cut.innerHTML = '';
@@ -11591,6 +11630,17 @@
         if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
         showSessionState(r.cli || conv.cli_id, r.project_dir || conv.project_dir);
         setQuality(r.quality || conv.quality || 'normal');
+        /* A conversation opened from the list WHILE it works reattaches to the
+           running turn ("Still working...") like a page load does. It used to
+           show the transcript and say "send a message to continue" -- a
+           working conversation that looked stopped (owner, 2026-09-30: "I
+           open the conversation and don't see working anymore, I think it is
+           blocked"). */
+        if (r.currently_running){
+          switchTab('session');
+          showReconnectedStillWorking(sessionId, r.turn_count || (conv.turns || []).length);
+          return;
+        }
         api('/api/agent/history/' + encodeURIComponent(conv.session_id)).then(function(full){
           mountTranscript(msgsEl, full || {});
           if (full && (full.turns || []).length) checkpointBtn.disabled = false;
@@ -11613,6 +11663,11 @@
             showSessionState(r.cli || conv.cli_id, r.project_dir || conv.project_dir);
             /* The server put the rebuilt session back in the saved mode; show it. */
             setQuality(r.quality || conv.quality || 'normal');
+            if (r.currently_running){              /* e.g. a Multi run resumed at boot */
+              switchTab('session');
+              showReconnectedStillWorking(sessionId, r.turn_count);
+              return;
+            }
             api('/api/agent/history/' + encodeURIComponent(sessionId)).then(function(full){
               mountTranscript(msgsEl, full || {});
               if (full && (full.turns || []).length) checkpointBtn.disabled = false;

@@ -183,9 +183,14 @@ def test_progress_arrives_as_ordinary_turn_events(swarm):
     ]
     evs = list(A._multi_turn_events("s1", SESS, "make it"))
     kinds = [e["event"] for e in evs]
-    assert kinds[0] == "notice" and "2 phases" in evs[0]["text"]
-    assert kinds.count("tool") == 2, "each phase starting is a tool line"
-    assert "Phase 1/2 Build (coding)" in evs[1]["text"]
+    # Planning is said at once (2026-09-30), then the plan, then the phases.
+    assert evs[0] == {"event": "tool", "text": A._MULTI_PLANNING_LINE}
+    assert kinds[1] == "notice" and "2 phases" in evs[1]["text"]
+    tools = [e["text"] for e in evs if e["event"] == "tool"]
+    assert [t for t in tools if t.startswith("Plan · ")], "the plan is shown"
+    starts = [t for t in tools if t.startswith("Phase ")]
+    assert len(starts) == 2, "each phase starting is a tool line"
+    assert "Phase 1/2 Build (coding)" in starts[0]
     outs = [e["text"] for e in evs if e["event"] == "output"]
     assert any(o.startswith("Phase 1/2 Build -- done: Wrote index.html") for o in outs)
     assert kinds[-2:] == ["message", "done"]
@@ -250,7 +255,8 @@ def test_a_run_that_could_not_be_planned_says_so(swarm, monkeypatch):
         raise SW.SwarmWindowsError("could not turn that into phases")
     monkeypatch.setattr(A.swarm_windows, "start", start)
     evs = list(A._multi_turn_events("s1", SESS, "go"))
-    assert evs == [{"event": "error", "status": 400,
+    assert evs == [{"event": "tool", "text": A._MULTI_PLANNING_LINE},
+                   {"event": "error", "status": 400,
                     "detail": "could not turn that into phases"}]
 
 
