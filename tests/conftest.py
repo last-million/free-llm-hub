@@ -101,6 +101,39 @@ def _steady_machine(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _stop_never_touches_real_clis(monkeypatch):
+    """POST /api/runtime/stop disconnects every CLI wired to the hub
+    (app._disconnect_all_clis) and a boot reconnects them -- both read and
+    WRITE the owner's real CLI config files. No test may do that;
+    tests/test_stop_disconnects_clis.py checks the real functions on fakes."""
+    import app
+    monkeypatch.setattr(app, "_disconnect_all_clis",
+                        lambda: {"disconnected": [], "failed": []})
+    monkeypatch.setattr(app, "_reconnect_clis_after_stop", lambda: [])
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _aa_scores_stay_put(monkeypatch, tmp_path_factory):
+    """No test fetches benchmark scores or writes the real cache.
+
+    MEASURED 2026-09-30: a test that showed discovery an unknown model id made
+    app._maybe_recheck_aa_for_unknown start _aa_refresh_once on a thread -- a
+    real GET to OpenRouter's catalog -- which then overwrote the owner's
+    ~/.free-llm-hub/aa_scores.json and left 214 real scores in memory, so a
+    later test's scores depended on test ORDER (tests/test_benchmark_scoring.py
+    failed after tests/test_openrouter_free_and_space_bunny.py).
+    tests/test_aa_unknown_recheck.py patches _aa_refresh_once itself."""
+    import app
+    before = app._aa_scores
+    monkeypatch.setattr(app, "_aa_refresh_once", lambda: None)
+    monkeypatch.setattr(app, "AA_SCORE_CACHE_PATH",
+                        str(tmp_path_factory.getbasetemp() / "aa_scores.json"))
+    yield
+    app._aa_scores = before
+
+
+@pytest.fixture(autouse=True)
 def _no_multi_intent_model(monkeypatch):
     """app._multi_intent_by_model asks a real model "WORK or CHAT?" before a
     Multi run; tests get "no verdict" (the language-independent fallback) and

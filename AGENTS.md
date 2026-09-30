@@ -1237,6 +1237,42 @@ Covered by `tests/test_opened_while_working.py`.
   -- one step of a Multi run", "Open the conversation ↗") and marks the row
   "this window".
 
+## Restart, Stop and the queue: the owner decides (2026-09-30)
+
+- **Continue after a restart is a choice** (`tests/test_auto_resume_choice.py`):
+  per conversation `agentic_history.set_auto_resume` / `auto_resume` (default
+  OFF), checkbox `#agent-auto-resume` ("Continue by itself after a
+  restart"), `POST /api/agent/sessions/<sid>/auto-resume {enabled}`; GET
+  session and /resume rows carry `auto_resume`. Boot:
+  `swarm_windows.resume_interrupted(should_resume=_multi_should_auto_resume)`
+  resumes a conversation's run only when ticked (owner-less runs as before);
+  the rest are filed by `_file_unresumed_runs` (why "hub restarted") so the
+  page offers Continue. Turns cut by the restart continue by themselves only
+  when ticked (`_auto_continue_turns`, sends `_CONTINUE_TEXT`). The Continue
+  button's text counts as `_multi_is_continue` (it resumes the run's
+  unfinished phases instead of planning a new run from the sentence).
+- **Stop disconnects every CLI** (`tests/test_stop_disconnects_clis.py`):
+  `api_runtime_stop` runs `_disconnect_all_clis` (every `_cli_connected` CLI
+  through `api_cli_disconnect`) before the shutdown thread, stores them in
+  setting `stop_disconnected_clis` and returns `clis_disconnected`; the next
+  boot's `_reconnect_clis_after_stop` wires exactly those back (via
+  `api_cli_autofix`) and forgets the list. `tests/conftest.py` stubs both --
+  they write the owner's real CLI configs.
+- **Queued messages after a reload** (`tests/test_queue_after_restart.py`): a
+  restored queue starts paused (`_queueRestored`), is never sent by a
+  finishing turn, and offers "Send them, in order" / "Clear all"; each item
+  stays editable and removable; the interrupted bar says how many wait.
+- **Old failures fade** (`_OUTCOME_IDLE_HALF_LIFE`, 8 h): `_reliability`
+  halves an UNTRIED pair's lifetime counts per half-life toward neutral, so a
+  pair demoted to the tail earns a fresh try in ~1.5 days (was: a week).
+- **Any-language difficulty**: `_HARD_HINTS` gained FR/ES/PT/IT/DE stems; 5+
+  words with no `_ENGLISH_FUNCTION_WORDS` classify at least medium
+  (`tests/test_any_language_difficulty.py`).
+- **Test hygiene**: conftest `_aa_scores_stay_put` (no benchmark refetch, no
+  write to the real aa_scores.json, scores restored per test);
+  `test_a_locked_run_file_is_retried_not_silently_lost` locks only its own
+  file.
+
 ## Running now: open anything in a new window (2026-09-30)
 
 Covered by `tests/test_running_now_opens_anything.py`. `runRow(title, sub,

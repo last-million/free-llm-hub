@@ -884,6 +884,11 @@ def test_a_locked_run_file_is_retried_not_silently_lost(monkeypatch):
     calls = {"n": 0}
 
     def flaky(src, dst):
+        # os.replace is patched process-wide: other threads (earlier runs still
+        # finishing, the hub's own state writes) call it too under full-suite
+        # load. Count -- and lock -- only THIS run's file, or the count flakes.
+        if os.path.normcase(os.path.abspath(dst)) != os.path.normcase(os.path.abspath(path)):
+            return real(src, dst)
         calls["n"] += 1
         if calls["n"] <= 2:
             raise PermissionError(13, "locked")

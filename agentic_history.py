@@ -495,6 +495,35 @@ def set_quality(session_id, quality):
         return None
 
 
+def set_auto_resume(session_id, enabled):
+    """Whether this conversation continues BY ITSELF after a hub restart.
+    Off unless the owner ticks it (owner, 2026-09-30: "not let all
+    conversations continue automatically after restarting; continued
+    manually by me, or a checkbox if I want this one to continue itself")."""
+    if not session_id:
+        return None
+    try:
+        with _LOCK:
+            conv = _load_conversation(session_id)
+            if conv is None:
+                return None
+            conv["auto_resume"] = bool(enabled)
+            _save_conversation(conv)
+            _upsert_index_row(conv)
+            return bool(enabled)
+    except Exception:
+        return None
+
+
+def auto_resume(session_id):
+    """True when the conversation asked to continue by itself. Never raises."""
+    try:
+        conv = get_conversation(session_id) or {}
+        return bool(conv.get("auto_resume"))
+    except Exception:
+        return False
+
+
 def set_mode(session_id, mode):
     """Remember the model MODE a conversation is running in.
 

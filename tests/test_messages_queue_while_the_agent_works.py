@@ -65,7 +65,7 @@ def test_a_reattached_turn_drains_it_too():
 
 def test_after_stop_or_error_it_waits_for_a_person():
     fn = _fn("function queueAfterTurn(failed, stopped){")
-    assert "if (failed || stopped){" in fn
+    assert "if (failed || stopped || _queueRestored){" in fn     # + a restored queue (2026-09-30)
     assert "_queuePaused = !!_queue.length;" in fn
     render = _fn("function queueRender(){")
     assert "'Send next'" in render and "paused after the last turn stopped" in render

@@ -3182,7 +3182,25 @@ _HARD_HINTS = (
     # "bug", and not a single word for "it is broken".
     "bug", "not working", "doesn't work", "does not work", "broken", "crash",
     "error", "exception", "fails", "failing", "stuck", "hangs",
+    # THE SAME ASKS IN THE OTHER LANGUAGES THE OWNER WRITES IN (2026-09-30:
+    # "it should work in any language"). Stems, matched as substrings like the
+    # English ones: French, Spanish, Portuguese, Italian, German.
+    "corrig", "répar", "repar", "débogu", "debogu", "implément", "construi",
+    "créer", "crée ", "creer", "optimis", "réécri", "reecri", "refactoris",
+    "intègr", "integr", "fonctionnalit", "base de donn", "ne marche pas",
+    "ne fonctionne pas", "marche pas", "planté", "erreur", "bogue", "améliore",
+    "ameliore", "arregl", "implementa", "construy", "no funciona", "mejora",
+    "conserta", "não funciona", "correggi", "non funziona", "behebe", "funktioniert nicht",
+    "erstelle", "verbesser",
 )
+# English function words: a message of several words with none of them is
+# (almost always) not English, and the English-only lists above cannot judge
+# it -- so it is not called "simple" just for being short (_classify_difficulty).
+_ENGLISH_FUNCTION_WORDS = frozenset((
+    "the", "and", "to", "of", "is", "are", "it", "this", "that", "you", "with",
+    "for", "what", "how", "please", "my", "your", "can", "be", "do", "does",
+    "was", "were", "have", "has", "i", "me", "we", "not", "if", "from", "about",
+))
 
 # WHAT is being asked for, weighted double, because naming a whole deliverable
 # IS the heaviness -- and it is the part that survives typos.
@@ -3301,6 +3319,14 @@ def _classify_difficulty(messages, max_tokens=None):
             score += 1
     except (TypeError, ValueError):
         pass
+    # NOT ENGLISH: the hint lists above are mostly English, so a short ask in
+    # another language used to read "simple" and go to a small model --
+    # MEASURED 2026-09-30, a French fix request ("les contours sont pas
+    # parfaits ... pour corriger ca ?"). Five words or more with no English
+    # function word is judged at least medium.
+    words = re.findall(r"[^\W\d_]+", low)
+    if len(words) >= 5 and not any(w in _ENGLISH_FUNCTION_WORDS for w in words):
+        score = max(score, 1)
     if score >= 3:
         return "hard"
     if score <= 0:
@@ -3417,6 +3443,7 @@ def _est_tokens(messages, tools=None, overhead=400):
 # supplements.
 # --------------------------------------------------------------------------- #
 _OUTCOME_TTL = 7 * 86400        # forget a record untouched for a week
+_OUTCOME_IDLE_HALF_LIFE = 8 * 3600   # an untried record fades by half this often (see _reliability)
 _OUTCOME_CAP = 40               # cap each counter; halving on overflow keeps the
                                 # RATIO but lets a fixed provider climb back out
 _OUTCOME_WEIGHT = 9.0           # max points an all-failure record can cost
@@ -3782,6 +3809,17 @@ def _reliability(pid, model):
         rok = rfail = 0
         if now - float(rec.get("rstart") or 0) <= _RECENT_WINDOW:
             rok, rfail = int(rec.get("rok") or 0), int(rec.get("rfail") or 0)
+        idle = max(0.0, now - float(rec.get("last") or now))
+    # AN UNUSED RECORD FADES. A pair measured to fail is put at the tail, so it
+    # is rarely tried again and its record never moved -- only the week-long
+    # _OUTCOME_TTL wiped it. MEASURED 2026-09-30: space-bunny kept 12 failures
+    # to 1 from empty replies fixed the day before, and sat last all day.
+    # While a pair goes untried its lifetime counts halve every
+    # _OUTCOME_IDLE_HALF_LIFE, drifting toward the neutral 0.5, so it earns a
+    # fresh try in about a day and a half. A pair in use keeps "last" current
+    # and is not faded at all.
+    fade = 0.5 ** (idle / _OUTCOME_IDLE_HALF_LIFE)
+    ok, fail = ok * fade, fail * fade
     life = (ok + 1.0) / (ok + fail + 2.0)
     n_recent = rok + rfail
     if not n_recent:
@@ -17548,6 +17586,8 @@ _MULTI_CONTEXT_PREV_CHARS = 2000
 
 def _multi_is_continue(text):
     t = " ".join((text or "").split())
+    if t.startswith(_CONTINUE_TEXT[:40]):
+        return True                  # the Continue button (or an auto-continue)
     try:
         return bool(t) and len(t) <= _MULTI_CONTINUE_MAX_CHARS and memory.asks_to_resume(t)
     except Exception:                                            # noqa: BLE001
@@ -17894,6 +17934,54 @@ def _multi_follow_events(run_id, cli_id):
     yield {"event": "done", "text": report}
 
 
+# What the Continue button sends (templates/index.html renderResume) -- also
+# what a conversation that continues by itself sends after a restart.
+_CONTINUE_TEXT = ("Continue exactly where you stopped. Do not start over; check what is "
+                  "already done on disk and carry on from there.")
+
+
+def _multi_should_auto_resume(run):
+    """A run with no conversation (Swarm tab, MCP) continues as before; a
+    conversation's run only when that conversation ticked "continue by itself
+    after a restart"."""
+    owner = getattr(run, "owner", None)
+    return (not owner) or agentic_history.auto_resume(owner)
+
+
+def _file_unresumed_runs():
+    """Every conversation run a restart left and that was not picked back up:
+    filed as the conversation's stopping place, so its page shows Continue."""
+    for run in swarm_windows.interrupted_runs():
+        owner = getattr(run, "owner", None)
+        if not owner:
+            continue
+        try:
+            doing = ["phase %d %s: %s" % (a.index, a.title, a.state) for a in run.agents]
+            memory.note_interrupted(owner, request=run.goal, doing=doing, partial="",
+                                    why="hub restarted", project_dir=run.project_dir)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+def _auto_continue_turns(session_ids):
+    """Conversations whose turn a restart cut short AND that asked to continue
+    by themselves: rebuilt and sent the Continue message. Others wait for the
+    owner's Continue. Never raises."""
+    for sid in session_ids or ():
+        if not agentic_history.auto_resume(sid):
+            continue
+        try:
+            with app.test_request_context("/api/agent/sessions/%s/resume" % sid,
+                                          method="POST", json={}):
+                api_agent_resume_session(sid)
+            for _ev in agentic_chat.send_message_stream_durable(sid, _CONTINUE_TEXT):
+                pass
+            _log.info("[resume] %s continued by itself after the restart", sid[:12])
+        except Exception as exc:                                 # noqa: BLE001
+            _log.warning("[resume] %s could not continue by itself: %s",
+                         sid[:12], _sanitize(str(exc), 160))
+
+
 def _resume_interrupted_swarms():
     """At boot: finish the runs the last process left mid-way (see
     swarm_windows.resume_interrupted), and put each one that is a
@@ -17909,10 +17997,12 @@ def _resume_interrupted_swarms():
             configure=_swarm_windows_configure,
             stop=agentic_chat.stop_session, on_done=_multi_owner_record,
             modes=_worker_mode_keys(),
+            should_resume=_multi_should_auto_resume,
             **_swarm_windows_manager_kw())
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("[swarm] could not resume interrupted runs: %s", exc)
         return []
+    _file_unresumed_runs()
     for rid in resumed:
         run = swarm_windows.get(rid)
         owner = getattr(run, "owner", None) if run else None
@@ -18295,6 +18385,14 @@ def api_runtime_stop():
                 continue
         return jsonify({"error": "could not create the intentional-stop marker",
                         "state": config.get_runtime_state()}), 500
+    # Every CLI wired to the hub goes back to its own provider BEFORE the hub
+    # goes away (see _disconnect_all_clis); remembered for the next start.
+    cli_result = _disconnect_all_clis()
+    try:
+        if cli_result["disconnected"]:
+            config.set_setting(_STOP_DISCONNECTED_SETTING, cli_result["disconnected"])
+    except Exception:                                            # noqa: BLE001
+        pass
     thread = _runtime_shutdown_thread[0]
     if thread is None or not thread.is_alive():
         thread = threading.Thread(target=_graceful_shutdown_worker,
@@ -18302,6 +18400,8 @@ def api_runtime_stop():
         _runtime_shutdown_thread[0] = thread
         thread.start()
     return jsonify({"ok": True, "state": state, "active_requests": _runtime_active[0],
+                    "clis_disconnected": cli_result["disconnected"],
+                    "clis_not_disconnected": cli_result["failed"],
                     "message": "Shutdown accepted; draining active inference requests."}), 202
 
 
@@ -20674,6 +20774,7 @@ def api_agent_resume_session(session_id):
     # Honest about which kind of continue this is: with a thread id the model
     # still has the conversation; without one it only has the files on disk.
     row["resumed_thread"] = bool(native)
+    row["auto_resume"] = bool(conv.get("auto_resume"))
     return jsonify(row)
 
 
@@ -20718,7 +20819,22 @@ def api_agent_get_session(session_id):
     # reads this flag to know whether to keep waiting.
     if not sess.get("currently_running") and _multi_run_for(session_id):
         sess["currently_running"] = True
+    sess["auto_resume"] = agentic_history.auto_resume(session_id)
     return jsonify(sess)
+
+
+@app.route("/api/agent/sessions/<session_id>/auto-resume", methods=["POST"])
+def api_agent_auto_resume(session_id):
+    """{enabled} -> whether this conversation continues by itself after a
+    hub restart (default off: the owner presses Continue)."""
+    gate = _agent_gate()
+    if gate:
+        return gate
+    body = request.get_json(silent=True) or {}
+    got = agentic_history.set_auto_resume(session_id, bool(body.get("enabled")))
+    if got is None:
+        return jsonify({"error": "No such conversation."}), 404
+    return jsonify({"session_id": session_id, "auto_resume": got})
 
 
 @app.route("/api/agent/sessions/<session_id>/message", methods=["POST"])
@@ -21313,6 +21429,10 @@ def _recover_memory_state():
         if back:
             _log.info("filed %d turn(s) cut short by the last shutdown as "
                       "resumable", len(back))
+            # Only the conversations that asked to continue by themselves do;
+            # the rest wait for the owner's Continue.
+            threading.Thread(target=lambda: (time.sleep(20), _auto_continue_turns(back)),
+                             daemon=True, name="auto-continue").start()
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("could not recover in-flight turns: %s", exc)
     try:
@@ -37187,6 +37307,78 @@ def _print_banner():
     print(line)
 
 
+# STOP MEANS OFF FOR EVERY CLI TOO. Owner, 2026-09-30: "when we click Stop
+# the hub in Settings it should really stop it and auto disconnect from all
+# CLIs". A CLI still wired to a stopped hub fails every request; disconnected,
+# it goes back to its own provider. The ones Stop disconnected are remembered
+# and wired again when the hub starts (a Stop is usually temporary) -- only
+# those: a CLI the owner disconnected by hand stays disconnected.
+_STOP_DISCONNECTED_SETTING = "stop_disconnected_clis"
+
+
+def _route_json(resp):
+    """The JSON body of a route function's return value (resp or (resp, code))."""
+    try:
+        if isinstance(resp, tuple):
+            resp = resp[0]
+        return resp.get_json(silent=True) or {}
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def _disconnect_all_clis():
+    """Disconnect every CLI wired to this hub (config or env). Returns
+    {"disconnected": [ids], "failed": [{id, why}]}. Never raises."""
+    done, failed = [], []
+    for entry in CLI_REGISTRY:
+        cid = entry.get("id")
+        try:
+            if not _cli_connected(entry)[0]:
+                continue
+        except Exception:                                        # noqa: BLE001
+            continue
+        try:
+            data = _route_json(api_cli_disconnect(cid))
+        except Exception as exc:                                 # noqa: BLE001
+            failed.append({"id": cid, "why": _sanitize(str(exc), 160)})
+            continue
+        if data.get("ok") and not data.get("still_connected"):
+            done.append(cid)
+        else:
+            failed.append({"id": cid, "why": _sanitize(str(data.get("note") or data.get("error")
+                                                            or "still connected"), 160)})
+    return {"disconnected": done, "failed": failed}
+
+
+def _reconnect_clis_after_stop():
+    """At boot: wire again exactly the CLIs the last Stop disconnected.
+    Returns the ids reconnected. Never raises."""
+    try:
+        ids = [c for c in (config.get_setting(_STOP_DISCONNECTED_SETTING) or [])
+               if isinstance(c, str)]
+    except Exception:                                            # noqa: BLE001
+        return []
+    if not ids:
+        return []
+    back = []
+    for cid in ids:
+        try:
+            with app.test_request_context("/api/clis/%s/autofix" % cid, method="POST", json={}):
+                data = _route_json(api_cli_autofix(cid))
+            if data.get("ok") or data.get("connected"):
+                back.append(cid)
+        except Exception as exc:                                 # noqa: BLE001
+            _log.warning("[stop] could not reconnect %s: %s", cid, _sanitize(str(exc), 160))
+    try:
+        config.set_setting(_STOP_DISCONNECTED_SETTING, None)
+    except Exception:                                            # noqa: BLE001
+        pass
+    if back:
+        _log.info("[stop] reconnected %d CLI(s) the last Stop disconnected: %s",
+                  len(back), ", ".join(back))
+    return back
+
+
 def _mark_runtime_started():
     config.clear_intentional_stop()
     for _attempt in range(3):
@@ -37272,6 +37464,9 @@ if __name__ == "__main__":
 
     _recover_interrupted_hub_transition()
     _mark_runtime_started()
+    # The CLIs the last Stop disconnected, wired again once the server answers.
+    threading.Thread(target=lambda: (time.sleep(15), _reconnect_clis_after_stop()),
+                     daemon=True, name="stop-reconnect").start()
     _bootstrap_no_key_providers()  # no-key providers have nothing to configure -> on
     _init_quota_persistence()      # restore quota/dead-model state from the last run
     # Declared context windows follow the fleet (agentic_chat.declared_window);

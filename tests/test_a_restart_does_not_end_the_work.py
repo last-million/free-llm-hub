@@ -192,6 +192,9 @@ def test_the_recorder_reads_the_conversation_off_the_run(monkeypatch):
 
 def test_at_boot_the_hub_finishes_them_and_the_page_can_follow(monkeypatch):
     run = _interrupted_run(owner="conv-3")
+    # Since 2026-09-30 only a conversation that ticked "Continue by itself
+    # after a restart" resumes at boot (tests/test_auto_resume_choice.py).
+    monkeypatch.setattr(A.agentic_history, "auto_resume", lambda sid: sid == "conv-3")
     monkeypatch.setattr(A, "_swarm_windows_spawn", _spawn)
     monkeypatch.setattr(A, "_swarm_windows_turn", lambda sid, text: _turn("done again")(sid, text))
     monkeypatch.setattr(A, "_swarm_windows_configure", lambda sid, mode: True)

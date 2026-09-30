@@ -2733,6 +2733,9 @@
     white-space:nowrap; font-family:var(--mono); }
   .hp-sr{ position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0);
     white-space:nowrap; }
+  .agent-autoresume{ display:inline-flex; align-items:center; gap:6px; font-size:12px;
+    color:var(--text-dim); cursor:pointer; margin-left:8px; }
+  .agent-autoresume input{ accent-color:var(--accent); }
   .agent-helper-bar{ display:flex; flex-wrap:wrap; align-items:center; gap:8px;
     border:1px solid var(--accent); background:var(--accent-soft); color:var(--text);
     border-radius:var(--radius-sm); padding:7px 10px; margin-bottom:6px; font-size:12.5px; }
@@ -3482,6 +3485,12 @@
                 <span>Multi sessions</span>
               </label>
             </div>
+            <!-- Off by default: after a hub restart this conversation waits
+                 for Continue unless ticked (owner, 2026-09-30). -->
+            <label class="agent-autoresume" title="After a hub or computer restart, pick this conversation's unfinished work back up by itself instead of waiting for you to press Continue">
+              <input type="checkbox" id="agent-auto-resume">
+              <span>Continue by itself after a restart</span>
+            </label>
             <!-- MODE, per project. Quality says how HARD to try; mode says which
                  KIND of model. A select rather than radios because there are
                  eight of them and the row is already full -- and unlike quality,
@@ -5279,8 +5288,18 @@
         : Promise.resolve();
       step.then(function(){
         return api('/api/runtime/stop', { method:'POST', body:{ revision: runtimeState.revision } });
-      }).then(function(){
+      }).then(function(r){
         markHubOffline(shortcutPath, shortcutErr, wantShortcut);
+        /* Say which CLIs went back to their own provider (and come back
+           connected when the hub starts again). */
+        var gone = (r && r.clis_disconnected) || [];
+        var kept = (r && r.clis_not_disconnected) || [];
+        var detail = $('#lifecycle-detail');
+        if (detail && (gone.length || kept.length)){
+          detail.textContent += (gone.length ? ' Disconnected ' + gone.join(', ') +
+            ' so they keep working without the hub; they reconnect when it starts again.' : '') +
+            (kept.length ? ' Could not disconnect ' + kept.map(function(k){ return k.id; }).join(', ') + '.' : '');
+        }
       }).catch(function(e){
         resetBtn(confirmBtn, 'Stop the hub');
         confirmBtn.disabled = false; cancelBtn.disabled = false; scInput.disabled = false;
@@ -9874,6 +9893,7 @@
          wrong until a turn finished and refreshSessionInfo happened to run.
          Measured: server said swarm, switch said Normal. */
       setQuality(r.quality);
+      setAutoResume(r.auto_resume);
       if (r.currently_running){
         showReconnectedStillWorking(r.session_id, r.turn_count);
         return;
@@ -9903,6 +9923,27 @@
        learns it -- session start, the periodic refresh, and Continue -- because
        the control defaulting to "Normal" while the session was actually running
        in swarm was the reported bug: the mode was right, the switch lied. */
+    /* "Continue by itself after a restart", per conversation (default off). */
+    function setAutoResume(on){
+      var cb = $('#agent-auto-resume');
+      if (cb) cb.checked = !!on;
+    }
+    (function initAutoResume(){
+      var cb = document.getElementById('agent-auto-resume');
+      if (!cb) return;
+      cb.addEventListener('change', function(){
+        if (!sessionId){ cb.checked = false; return; }
+        var want = cb.checked;
+        api('/api/agent/sessions/' + encodeURIComponent(sessionId) + '/auto-resume',
+            { method: 'POST', body: { enabled: want } })
+          .then(function(r){
+            cb.checked = !!(r && r.auto_resume);
+            toast(cb.checked ? 'This conversation will continue by itself after a restart.'
+                             : 'After a restart this conversation waits for you to press Continue.');
+          })
+          .catch(function(e){ cb.checked = !want; toast('Could not save: ' + e.message, true); });
+      });
+    })();
     function setQuality(v){
       if (!v) return;
       var rs = qualityRadios();
@@ -10822,7 +10863,9 @@
           (stopped.request ? ' while working on: ' + esc(stopped.request) : '') +
           ((stopped.doing || []).length
             ? '<div class="pc-doing">last: ' + esc((stopped.doing || []).slice(-3).join(' \u2192 ')) + '</div>' : '') +
-          '<div class="pc-hint">Continue picks up exactly where it stopped \u2014 or just type a new message below.</div>';
+          '<div class="pc-hint">Continue picks up exactly where it stopped \u2014 or just type a new message below.' +
+          (_queue.length ? ' ' + _queue.length + ' queued message' + (_queue.length === 1 ? ' is' : 's are') +
+            ' waiting below: send, edit or remove them when you want.' : '') + '</div>';
         cut.appendChild(what);
         var go = document.createElement('button');
         go.type = 'button'; go.className = 'btn sm primary';
@@ -10998,6 +11041,7 @@
            sends it when that turn ends. */
     var turnBusy = false;
     var _queue = [];
+    var _queueRestored = false;   /* waited through a reload: paused until released */
     var _queuePaused = false;
 
     function queueKey(){ return sessionId ? 'flh.queue.' + sessionId : null; }
@@ -11020,6 +11064,10 @@
           if (Array.isArray(arr)) _queue = arr.filter(function(t){ return typeof t === 'string' && t.trim(); });
         } catch (e) { _queue = []; }
       }
+      /* Messages that waited through a reload or a hub restart are the
+         owner's to release: never sent on their own (owner, 2026-09-30: "see
+         the queued messages and select if I want to use them to continue"). */
+      _queueRestored = _queuePaused = _queue.length > 0;
       queueRender();
     }
     function queueForget(sid){
@@ -11074,13 +11122,20 @@
       if (_queuePaused && !turnBusy){
         var note = document.createElement('span');
         note.className = 'queue-paused';
-        note.textContent = 'paused after the last turn stopped —';
+        note.textContent = _queueRestored
+          ? 'waiting since before the page reloaded \u2014 edit or \u00d7 any, then'
+          : 'paused after the last turn stopped \u2014';
         host.appendChild(note);
         var go = document.createElement('button');
         go.type = 'button'; go.className = 'btn sm';
-        go.textContent = 'Send next';
-        go.addEventListener('click', function(){ _queuePaused = false; queueDrain(); });
+        go.textContent = _queueRestored ? 'Send them, in order' : 'Send next';
+        go.addEventListener('click', function(){ _queueRestored = false; _queuePaused = false; queueDrain(); });
         host.appendChild(go);
+        var clr = document.createElement('button');
+        clr.type = 'button'; clr.className = 'btn sm ghost';
+        clr.textContent = 'Clear all';
+        clr.addEventListener('click', function(){ queueForget(sessionId); _queueRestored = false; });
+        host.appendChild(clr);
       }
     }
     /* Send the next waiting message, if the agent is free and nothing paused
@@ -11094,7 +11149,7 @@
       doSend();
     }
     function queueAfterTurn(failed, stopped){
-      if (failed || stopped){
+      if (failed || stopped || _queueRestored){
         _queuePaused = !!_queue.length;
         queueRender();
         return;
@@ -11630,6 +11685,7 @@
         if (window.cxSetHashSession) window.cxSetHashSession('sec-agent', sessionId);
         showSessionState(r.cli || conv.cli_id, r.project_dir || conv.project_dir);
         setQuality(r.quality || conv.quality || 'normal');
+        setAutoResume(r.auto_resume);
         /* A conversation opened from the list WHILE it works reattaches to the
            running turn ("Still working...") like a page load does. It used to
            show the transcript and say "send a message to continue" -- a
@@ -11663,6 +11719,7 @@
             showSessionState(r.cli || conv.cli_id, r.project_dir || conv.project_dir);
             /* The server put the rebuilt session back in the saved mode; show it. */
             setQuality(r.quality || conv.quality || 'normal');
+            setAutoResume(r.auto_resume);
             if (r.currently_running){              /* e.g. a Multi run resumed at boot */
               switchTab('session');
               showReconnectedStillWorking(sessionId, r.turn_count);

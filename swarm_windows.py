@@ -1584,8 +1584,17 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context="
 RESUME_MAX_AGE = 6 * 3600
 
 
+def interrupted_runs():
+    """Runs a restart left mid-way that were NOT picked back up (still
+    interrupted). Never raises."""
+    with _LOCK:
+        return [r for r in _RUNS.values()
+                if getattr(r, "restored", False) and getattr(r, "interrupted", False)]
+
+
 def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
-                       max_age=RESUME_MAX_AGE, stop=None, manager=None, modes=None):
+                       max_age=RESUME_MAX_AGE, stop=None, manager=None, modes=None,
+                       should_resume=None):
     """Pick up every run the last process left mid-way. Returns their ids.
 
     THE WORK GETS FINISHED. A run whose process died was marked failed and
@@ -1614,6 +1623,13 @@ def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
         candidates = [r for r in _RUNS.values() if r.restored and r.interrupted]
     for run in candidates:
         if now - run.created_at > max_age:
+            continue
+        # A conversation's run continues by itself only when that
+        # conversation asked to (app._multi_should_auto_resume).
+        try:
+            if should_resume is not None and not should_resume(run):
+                continue
+        except Exception:                                        # noqa: BLE001
             continue
         with run.lock:
             todo = [a for a in run.agents
