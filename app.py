@@ -20625,7 +20625,17 @@ def api_agent_list_sessions():
     gate = _agent_gate()
     if gate:
         return gate
-    return jsonify({"sessions": agentic_chat.list_sessions()})
+    sessions = agentic_chat.list_sessions()
+    # Which of them are helpers of a Multi run (the Running-now popup nests
+    # them under their conversation and names their step).
+    for s in sessions:
+        try:
+            info = swarm_windows.worker_info(s.get("session_id"))
+        except Exception:                                        # noqa: BLE001
+            info = None
+        if info:
+            s["helper"] = info
+    return jsonify({"sessions": sessions})
 
 
 @app.route("/api/agent/recent-projects", methods=["GET"])

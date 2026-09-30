@@ -1206,6 +1206,17 @@ coding): a French fix request was answered by one session on the Normal tier.
   when its run is not live, and flags `resumed` for a run the boot picked back
   up (`swarm_windows.resume_interrupted` -- no click needed for Multi).
 
+## Running now: open anything in a new window (2026-09-30)
+
+Covered by `tests/test_running_now_opens_anything.py`. `runRow(title, sub,
+action, onAction, open, nested)` renders an "Open ↗" link (`target=_blank
+rel=noopener`, aria-label "… in a new window") for every conversation
+(`/agent/<sid>`), helper and preview (its `url`). `GET /api/agent/sessions`
+rows of a Multi worker carry `helper` = `swarm_windows.worker_info(sid)`
+({run_id, index, title, owner, state}; retried workers via `past_sessions`),
+so the popup lists each conversation (working first) with its helpers
+indented under it; helpers whose conversation is not open come last.
+
 ## Multi plans run side by side (2026-09-30)
 
 Covered by `tests/test_multi_runs_in_parallel.py`. Live run swarm-4f2aab7204a4

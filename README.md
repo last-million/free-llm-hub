@@ -142,7 +142,9 @@ each new worker opens on a strong model the run's earlier workers have not used
 yet (never more than 4 points under the best), so the one that reviews the work
 is a different model from the one that wrote it. While it runs, the
 conversation shows a **Helpers** panel: each helper's step, model, time and what
-it is doing right now, with **Open ↗** to watch any one in its own window.
+it is doing right now, with **Open ↗** to watch any one in its own window. The
+**Running now** popup does the same for everything open: each conversation, its
+helpers listed under it, and each running preview has **Open ↗** (new window).
 
 **Benchmarks, refreshed daily and free.** Besides Artificial Analysis, the hub
 reads the LMArena text leaderboard every 24 hours from LMArena's own public

@@ -2796,6 +2796,12 @@
   .runrow-t{ font-size:12.5px; color:var(--text); overflow:hidden;
     text-overflow:ellipsis; white-space:nowrap; }
   .runrow-s{ font-size:11.5px; color:var(--text-faint); }
+  /* A helper of a Multi run, indented under its conversation. */
+  .runrow-helper{ padding-left:30px; position:relative; }
+  .runrow-helper::before{ content:""; position:absolute; left:17px; top:6px; bottom:6px;
+    border-left:2px solid var(--border); }
+  .runrow-open{ text-decoration:none; white-space:nowrap; }
+  .runrow-open:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
   .runpanel-note{ font-size:11.5px; color:var(--text-dim); padding:10px 13px;
     border-top:1px solid var(--border-soft); line-height:1.5; }
   .runpanel-empty{ padding:14px 13px; font-size:12.5px; color:var(--text-dim); }
@@ -9533,15 +9539,27 @@
       return sec < 60 ? sec + 's' : Math.floor(sec / 60) + 'm';
     }
 
-    function runRow(title, sub, actionLabel, onAction){
+    /* Every row opens in a NEW WINDOW (owner, 2026-09-30: "in the Running
+       now popup, click and open each running conversation or helper, no
+       matter, in a new window"). `open` = {href, label}; `nested` indents a
+       helper under its conversation. */
+    function runRow(title, sub, actionLabel, onAction, open, nested){
       var d = document.createElement('div');
-      d.className = 'runrow';
+      d.className = 'runrow' + (nested ? ' runrow-helper' : '');
       var main = document.createElement('div');
       main.className = 'runrow-main';
       var t = document.createElement('div'); t.className = 'runrow-t'; t.textContent = title;
       var s2 = document.createElement('div'); s2.className = 'runrow-s'; s2.textContent = sub;
       main.appendChild(t); main.appendChild(s2);
       d.appendChild(main);
+      if (open && open.href){
+        var a = document.createElement('a');
+        a.className = 'btn sm ghost runrow-open';
+        a.href = open.href; a.target = '_blank'; a.rel = 'noopener';
+        a.textContent = 'Open \u2197';
+        a.setAttribute('aria-label', 'Open ' + (open.label || title) + ' in a new window');
+        d.appendChild(a);
+      }
       if (actionLabel){
         var b = document.createElement('button');
         b.type = 'button'; b.className = 'btn sm ghost'; b.textContent = actionLabel;
@@ -9613,18 +9631,45 @@
             e1.className = 'runpanel-empty'; e1.textContent = 'None open.';
             body.appendChild(e1);
           }
-          sessions.forEach(function(x){
-            body.appendChild(runRow(
+          /* Conversations first (working ones on top), each followed by the
+             helpers of its Multi run; helpers whose conversation is not open
+             come last, still named. */
+          function endSession(x){
+            return function(){
+              api('/api/agent/sessions/' + encodeURIComponent(x.session_id), { method: 'DELETE' })
+                .then(function(){ load(); if (onChange) onChange(); })
+                .catch(function(){ load(); });
+            };
+          }
+          function convRow(x){
+            return runRow(
               x.project_dir || x.session_id,
               (x.cli || '?') + ' · ' + (x.turn_count || 0) + ' turns · ' +
                 (x.currently_running ? 'working now' : 'idle (nothing running)'),
-              'End',
-              function(){
-                api('/api/agent/sessions/' + encodeURIComponent(x.session_id), { method: 'DELETE' })
-                  .then(function(){ load(); if (onChange) onChange(); })
-                  .catch(function(){ load(); });
-              }));
+              'End', endSession(x),
+              { href: '/agent/' + encodeURIComponent(x.session_id), label: 'this conversation' });
+          }
+          function helperRow2(x, nested){
+            var h = x.helper || {};
+            return runRow(
+              'Helper ' + h.index + ' \u00b7 ' + (h.title || ''),
+              (x.cli || '?') + ' · ' + (h.state === 'running' ? 'working now' : (h.state || 'idle')) +
+                ' · run ' + (h.run_id || '?'),
+              'End', endSession(x),
+              { href: '/agent/' + encodeURIComponent(x.session_id), label: 'helper ' + h.index },
+              nested);
+          }
+          var convs = sessions.filter(function(x){ return !x.helper; });
+          var helpers = sessions.filter(function(x){ return x.helper; });
+          convs.sort(function(a, b){ return (b.currently_running ? 1 : 0) - (a.currently_running ? 1 : 0); });
+          var shown = {};
+          convs.forEach(function(x){
+            body.appendChild(convRow(x));
+            helpers.filter(function(h){ return h.helper.owner === x.session_id; })
+              .sort(function(a, b){ return a.helper.index - b.helper.index; })
+              .forEach(function(h){ shown[h.session_id] = 1; body.appendChild(helperRow2(h, true)); });
           });
+          helpers.forEach(function(h){ if (!shown[h.session_id]) body.appendChild(helperRow2(h, false)); });
           var h2 = document.createElement('div');
           h2.className = 'runpanel-sec';
           h2.textContent = 'Previews (' + previews.length + ')';
@@ -9644,7 +9689,9 @@
                 api('/api/workspace/stop', { method: 'POST', body: { project_dir: x.project_dir } })
                   .then(function(){ load(); if (onChange) onChange(); })
                   .catch(function(){ load(); });
-              }));
+              },
+              (x.url || x.port) ? { href: x.url || ('http://127.0.0.1:' + x.port + '/'),
+                                    label: 'this preview' } : null));
           });
           note.textContent =
             'A conversation between turns runs nothing — the CLI starts for one message and exits. ' +

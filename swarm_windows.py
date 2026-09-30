@@ -1652,6 +1652,23 @@ def last_run_for(owner):
     return max(mine, key=lambda r: r.created_at) if mine else None
 
 
+def worker_info(session_id):
+    """{run_id, index, title, owner, state} when `session_id` is (or was) a
+    worker of a run, else None -- lets a list of sessions say "helper 2 of
+    this conversation's run" instead of showing a bare folder."""
+    if not session_id:
+        return None
+    with _LOCK:
+        runs = list(_RUNS.values())
+    for run in runs:
+        for a in list(getattr(run, "agents", None) or ()):
+            if a.session_id == session_id or session_id in (getattr(a, "past_sessions", None) or ()):
+                return {"run_id": run.id, "index": a.index, "title": a.title,
+                        "owner": getattr(run, "owner", None), "state": a.state,
+                        "run_state": run.state}
+    return None
+
+
 def sibling_sessions(session_id):
     """Session ids of the OTHER workers of the run `session_id` works for
     (those that have one yet), in phase order; [] when it is no worker.
