@@ -10323,7 +10323,23 @@ def _model_ctx_info(pid, model):
     on the providers whose figure is a hard per-request cap (see above).
     An inferred/reference figure describes the MODEL, not this host, and a
     host may serve less than the weights allow -- so where the provider has a
-    measured row it can only LOWER that row, never raise it."""
+    measured row it can only LOWER that row, never raise it.
+
+    A provider's per-request input cap (_PROVIDER_REQUEST_TOKEN_CAP: google's
+    free-tier 250K input tokens per minute, spent by ONE bigger request) is
+    applied last, on every source: routing, the overflow reply and the
+    declared/live windows then agree that a 300K request does not fit there.
+    Before, routing still sent ~300K requests to every gemini variant (each a
+    429 after 30-250 s) and _ctx_hop_cannot_serve read that 429 as a short
+    wait, which kept the CLI from being told to compact."""
+    lim, src = _model_ctx_info_uncapped(pid, model)
+    cap = _PROVIDER_REQUEST_TOKEN_CAP.get(pid)
+    if cap and isinstance(lim, int) and lim > cap:
+        return cap, src
+    return lim, src
+
+
+def _model_ctx_info_uncapped(pid, model):
     lim, src = _window_info(pid, model)
     if isinstance(lim, int) and lim > 0:
         if src in ("learned", "catalog"):

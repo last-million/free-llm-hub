@@ -483,6 +483,11 @@ Pure helpers live in `ctxwin.py`; the glue is in app.py. Covered by
     in `_ChainClock.dispatch`). MEASURED 2026-10-03: a 326K OpenCode turn
     503'd forever while gemini (1M) sat on a spent day quota. Covered by
     `tests/test_overflow_when_big_models_are_out.py`.
+  - `_model_ctx_info` applies `_PROVIDER_REQUEST_TOKEN_CAP` (google 250K:
+    the free tier's input tokens per minute, spent by ONE bigger request) on
+    every source, so routing, this reply and the declared/live windows agree
+    a 300K request does not fit on gemini (it used to take a 30-250 s hop
+    that 429'd and blocked this reply as a "short wait").
 - **Rolling recap**: one per conversation, keyed by `ctxwin.conversation_key`
   (hub agent session, `X-Claude-Code-Session-Id` / Claude Code
   `metadata.user_id`, OpenCode `X-Session-Id`/`x-session-affinity`, Codex body

@@ -140,6 +140,10 @@ def world(monkeypatch):
     monkeypatch.setattr(A, "_is_provider_dead", lambda pid: False)
     monkeypatch.setattr(A, "_dead_models", {})
     monkeypatch.setattr(A, "_not_offered", {})
+    # These cases model gemini as a model that COULD hold the request (1M);
+    # the real free-tier per-request cap is exercised on its own below
+    # (test_google_per_request_cap_makes_a_minute_429_an_overflow).
+    monkeypatch.setattr(A, "_PROVIDER_REQUEST_TOKEN_CAP", {})
     # Google's day resets at midnight Pacific; pinned 6 h away so the test
     # never runs into a reset a few minutes off.
     monkeypatch.setattr(quota, "_day_bounds_tz",
@@ -332,6 +336,17 @@ def test_a_short_rate_limit_is_still_not_an_overflow_on_responses(world, monkeyp
     world(_measured_plan(google="minute429"))
     raw = _responses_stream().get_data(as_text=True)
     assert "context_length_exceeded" not in raw
+
+
+def test_google_per_request_cap_makes_a_minute_429_an_overflow(world, monkeypatch):
+    """MEASURED 2026-10-03: every gemini variant 429'd every ~300K request (the
+    free tier's 250K input tokens per minute, spent by one request) while
+    smaller ones passed. With the cap applied to the model window, a ~326K
+    request no longer counts gemini as a model a short wait could fix."""
+    monkeypatch.setattr(A, "_PROVIDER_REQUEST_TOKEN_CAP", {"google": 250000})
+    world(_measured_plan(google="minute429"))
+    assert A._model_ctx_info(*GEMINI_A)[0] == 250000
+    _assert_openai_overflow(_chat(stream=False))
 
 
 @pytest.mark.parametrize("failure", ["5xx", "timeout", "conn", "empty200"])
