@@ -11091,6 +11091,7 @@ def _ctx_begin(body, messages, est, signal=True):
     _ctx_set("_ctx_overflow", None)
     _ctx_set("_ctx_hops", {})
     _ctx_set("_ctx_tried", set())
+    _ctx_set("_ctx_results", {})
     try:
         conv = ctxwin.conversation_key(request.headers, body, _build_sid(), messages)
     except Exception:                                            # noqa: BLE001
@@ -11186,6 +11187,125 @@ def _ctx_note_tried(pid, model):
         tried.add((pid, model))
 
 
+def _ctx_note_hop_result(pid, model, status=None, exc=None):
+    """How this request's hop on (pid, model) ended: the HTTP status it
+    answered, or the exception it raised (the last attempt wins). Read by
+    _ctx_overflow_reply for the hops that did NOT overflow. Never raises."""
+    try:
+        res = _ctx_g("_ctx_results")
+        if not isinstance(res, dict):
+            return
+        rec = {}
+        if isinstance(status, int) and not isinstance(status, bool):
+            rec["status"] = status
+        if exc is not None:
+            rec["exc"] = type(exc).__name__
+        res[(pid, model)] = rec
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+# THE NARROWED EXCEPTION to "every hop tried must have overflowed" (see
+# _ctx_overflow_reply). MEASURED 2026-10-03, hub.log: an OpenCode turn of
+# ~326K tokens was answered 503 again and again -- kilocode, groq and nvidia
+# overflowed, kilocode's other model 400'd "not supported", and the only
+# model that could hold it (google gemini flash, 1M) 429'd on its spent DAILY
+# quota, parked until midnight Pacific. The CLI retried the identical
+# oversized turn into the same 503 forever. A hop that did not overflow
+# blocks the native reply only while a SHORT wait could let it serve: its
+# window could hold the request and it failed on a short rate limit, a 5xx,
+# a timeout, a connection error or a 200 with nothing usable. It does not
+# block when its own KNOWN window is below what the request needs, when it is
+# out for at least _CTX_OVERFLOW_LONG_WAIT seconds (day quota spent, provider
+# parked, model dead), or when it refused with a non-retryable, non-context
+# 4xx. Covered by tests/test_overflow_when_big_models_are_out.py.
+_CTX_OVERFLOW_LONG_WAIT = 300
+# 4xx statuses that mean "try again shortly", never "cannot serve this".
+_CTX_SHORT_WAIT_STATUSES = frozenset({408, 409, 425, 429})
+
+
+def _ctx_hop_wait_seconds(pid, model):
+    """Seconds until (pid, model) is callable again by the hub's own quota
+    state: the provider's quota / 429 throttle and the model's own day quota
+    or 429 cooldown. 0 when nothing holds it. Never raises."""
+    now = time.time()
+    waits = [0.0]
+    try:
+        s = quota.status(pid)
+        if s.get("exhausted"):
+            waits.append(float(s.get("resets_in") or 0))
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        ms = quota.model_status(pid, model)
+        if ms.get("exhausted") and ms.get("resets_at"):
+            waits.append(float(ms["resets_at"]) - now)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return max(waits)
+
+
+def _ctx_hop_cannot_serve(pid, model, need, rec):
+    """Why waiting a short while would not let the NON-overflowed hop
+    (pid, model) serve this request, or None when it might (see the comment
+    above _CTX_OVERFLOW_LONG_WAIT). `need` = the window the request needs,
+    `rec` = what _ctx_note_hop_result recorded. Never raises."""
+    try:
+        try:
+            lim, src = _model_ctx_info(pid, model)
+        except Exception:                                        # noqa: BLE001
+            lim, src = None, "default"
+        # (a) Too small anyway. "default" is a guess and proves nothing -- the
+        # same bar the hub uses before it raises _ContextOverflow on a hop.
+        if src != "default" and isinstance(lim, int) and 0 < lim < need:
+            return "its %d-token window cannot hold ~%d" % (lim, need)
+        # (b) Out for a long time, whatever the failure was.
+        if _is_provider_dead(pid):
+            return "provider parked"
+        if _is_model_dead(pid, model):
+            return "model dead or switched off"
+        st = (rec or {}).get("status")
+        if st == 429:
+            wait = _ctx_hop_wait_seconds(pid, model)
+            if wait >= _CTX_OVERFLOW_LONG_WAIT:
+                return "rate-limited for ~%d min (quota spent)" % max(1, int(wait // 60))
+            return None                         # a short rate limit: wait it out
+        # (c) Refused outright: a non-retryable 4xx that was not about context
+        # (a context 400 counts as an overflow and never reaches here).
+        if (isinstance(st, int) and 400 <= st < 500
+                and st not in _CTX_SHORT_WAIT_STATUSES):
+            if st == 400 and _is_not_offered(pid, model):
+                return None                     # "not offered right now": back in a minute
+            return "refused with HTTP %d" % st
+    except Exception:                                            # noqa: BLE001
+        return None
+    return None
+
+
+def _ctx_others_cannot_serve(tried, ov):
+    """For a request where some hops overflowed and others failed otherwise:
+    ["pid/model: why", ...] when EVERY tried hop that did not overflow is one
+    a short wait cannot fix (_ctx_hop_cannot_serve), else None. Never raises."""
+    try:
+        over = {tuple(k) for k in (ov.get("keys") or [])
+                if isinstance(k, (list, tuple)) and len(k) == 2}
+        others = [t for t in tried if tuple(t) not in over]
+        if not over or not others:
+            return None
+        need = int(int(_ctx_g("_ctx_orig_est") or 0) * 1.15) + 512
+        results = _ctx_g("_ctx_results")
+        results = results if isinstance(results, dict) else {}
+        why = []
+        for pid, model in sorted(others, key=lambda t: (str(t[0]), str(t[1]))):
+            reason = _ctx_hop_cannot_serve(pid, model, need, results.get((pid, model)))
+            if not reason:
+                return None
+            why.append("%s/%s: %s" % (pid, model, reason))
+        return why
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def _ctx_note_overflow(window=None, pid=None, model=None):
     ov = _ctx_g("_ctx_overflow") or {"hops": 0, "window": 0}
     dup = False
@@ -11228,15 +11348,24 @@ def _ctx_overflow_reply(kind, stream=False, model_label="auto"):
 
     EVERY hop: one that failed on a 429, a 5xx or a timeout might have held
     the request, and telling the CLI "too long" then makes it compact its own
-    history over a rate limit instead of waiting out the Retry-After."""
+    history over a rate limit instead of waiting out the Retry-After.
+
+    ...unless no such wait can help: a hop that did not overflow does not
+    count against the reply when its own known window is too small anyway,
+    when it is out for a long time (day quota spent, parked, dead) or when it
+    refused the request with a non-retryable, non-context 4xx (see
+    _ctx_others_cannot_serve)."""
     if not _ctx_g("_ctx_signal"):
         return None
     ov = _ctx_g("_ctx_overflow")
     if not ov or not ov.get("hops"):
         return None
     tried = _ctx_g("_ctx_tried")
+    out_of_reach = None
     if isinstance(tried, set) and len(tried) > int(ov.get("hops") or 0):
-        return None               # some hop failed for another reason
+        out_of_reach = _ctx_others_cannot_serve(tried, ov)
+        if out_of_reach is None:
+            return None           # some hop failed for a reason a wait can fix
     orig = int(_ctx_g("_ctx_orig_est") or 0)
     window = int(ov.get("window") or 0)
     if _ctx_compaction_futile(_ctx_g("_ctx_fixed_est"), window):
@@ -11246,9 +11375,16 @@ def _ctx_overflow_reply(kind, stream=False, model_label="auto"):
                   int(_ctx_g("_ctx_fixed_est") or 0))
         return None
     hdrs = {"X-Free-LLM-Hub-Last-Error": "context"}
-    _log.info("[ctx] %s request of ~%d tokens overflowed every hop (largest window "
-              "tried %d): answering with the native context-length error", kind,
-              orig, window)
+    if out_of_reach:
+        _log.info("[ctx] %s request of ~%d tokens overflowed %d hop(s) (largest window "
+                  "tried %d) and the models that could hold it are out (day quota / no "
+                  "capacity): %s -- answering with the native context-length error so "
+                  "the CLI compacts", kind, orig, int(ov.get("hops") or 0), window,
+                  "; ".join(out_of_reach))
+    else:
+        _log.info("[ctx] %s request of ~%d tokens overflowed every hop (largest window "
+                  "tried %d): answering with the native context-length error", kind,
+                  orig, window)
     if kind == "anthropic":
         return jsonify(ctxwin.anthropic_overflow_body(orig, window)), 400, hdrs
     if kind == "responses" and stream:
@@ -28101,8 +28237,12 @@ class _ChainClock:
                     self._note_status(s[0], s[1], resp, stream)
                     return resp
             return self._plain(pid, model, payload, stream)
-        except (_HopBudgetExceeded, requests.exceptions.Timeout):
+        except (_HopBudgetExceeded, requests.exceptions.Timeout) as exc:
             self._note_stall(pid)            # see walk()
+            _ctx_note_hop_result(pid, model, exc=exc)
+            raise
+        except Exception as exc:                                 # noqa: BLE001
+            _ctx_note_hop_result(pid, model, exc=exc)
             raise
 
     def _plain(self, pid, model, payload, stream):
@@ -28149,6 +28289,8 @@ class _ChainClock:
     def _note_status(pid, model, resp, stream):
         try:
             code = getattr(resp, "status_code", None)
+            # How the hop ended, for the overflow reply (_ctx_overflow_reply).
+            _ctx_note_hop_result(pid, model, status=code)
             if code == 429:
                 _note_recent_hop_failure(pid, model, "429")
             elif code == 200 and not stream:

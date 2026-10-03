@@ -474,6 +474,15 @@ Pure helpers live in `ctxwin.py`; the glue is in app.py. Covered by
   OpenAI 400 `context_length_exceeded`, Anthropic 400 "prompt is too long",
   Responses stream `response.failed` with that code. Never for a CLI's own
   compaction request, never on a guessed window.
+  - A hop that failed otherwise blocks that reply only while a SHORT wait
+    could let it serve (short 429, 5xx, timeout, conn, empty 200 on a model
+    whose window could hold it). It does not block when its KNOWN window is
+    < est x1.15+512, it is out >= `_CTX_OVERFLOW_LONG_WAIT` (300 s: day
+    quota, parked, dead) or it refused with a non-retryable non-context 4xx
+    (`_ctx_others_cannot_serve`; per-hop outcome via `_ctx_note_hop_result`
+    in `_ChainClock.dispatch`). MEASURED 2026-10-03: a 326K OpenCode turn
+    503'd forever while gemini (1M) sat on a spent day quota. Covered by
+    `tests/test_overflow_when_big_models_are_out.py`.
 - **Rolling recap**: one per conversation, keyed by `ctxwin.conversation_key`
   (hub agent session, `X-Claude-Code-Session-Id` / Claude Code
   `metadata.user_id`, OpenCode `X-Session-Id`/`x-session-affinity`, Codex body
