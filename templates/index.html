@@ -1880,6 +1880,7 @@
   .af-status.ok{background:var(--accent-soft);color:var(--ok-text)}
   .af-status.err{background:var(--danger-soft);color:var(--danger-text)}
   .af-status.stall{background:var(--surface-3);color:var(--text-dim)}
+  .af-status.cancel{background:var(--surface-3);color:var(--text-dim)}
   @keyframes afpulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(.6)}}
 
   /* ---------- modal ---------- */
@@ -11880,8 +11881,12 @@
     host.innerHTML = activityState.map(function(a){
       var st = a.status || 'in_progress';
       var pending = (st === 'in_progress' || st === 'streaming');
-      var statusClass = pending ? 'pending' : (st === 'ok' ? 'ok' : (st === 'stalled' ? 'stall' : 'err'));
-      var statusLabel = (st === 'in_progress') ? 'in progress' : st;
+      /* 'cancelled' = the client left before its answer was finished (its CLI
+         was stopped, the terminal closed, a timeout fired) and the hub stopped
+         the work: finished, and nobody's failure -- neutral, never red. */
+      var statusClass = pending ? 'pending' : (st === 'ok' ? 'ok' : (st === 'stalled' ? 'stall' : (st === 'cancelled' ? 'cancel' : 'err')));
+      var statusLabel = (st === 'in_progress') ? 'in progress' : (st === 'cancelled' ? 'client left' : st);
+      var statusTitle = (st === 'cancelled') ? 'The client disconnected before the answer was finished; the hub stopped the work' : '';
       var httpTxt = (a.http != null) ? (' · ' + a.http) : '';
       var hasResolved = a.provider && a.model;
       var modelTxt = hasResolved ? (a.provider + '/' + a.model) : (a.model_req || '—');
@@ -11930,7 +11935,7 @@
           '<span class="af-model">' + modelHTML + '</span>' +
           '<span class="af-dur js-af-dur" data-started="' + esc(a.started) + '" data-pending="' + (pending ? '1' : '0') +
             '" data-ms="' + esc(numOr(a.duration_ms, 0)) + '">' + esc(fmtDuration(a.duration_ms)) + '</span>' +
-          '<span class="af-status ' + statusClass + '"><span class="d"></span>' + esc(statusLabel) + esc(httpTxt) + '</span>' +
+          '<span class="af-status ' + statusClass + '"' + (statusTitle ? ' title="' + esc(statusTitle) + '"' : '') + '><span class="d"></span>' + esc(statusLabel) + esc(httpTxt) + '</span>' +
         '</div>' + detail;
     }).join('');
   }

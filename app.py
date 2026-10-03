@@ -93,6 +93,12 @@ import mcp_manager
 import usage_history
 import ctxwin
 import userenv
+import clientgone
+
+# A client that leaves while the hub waits stops the work it started (see
+# clientgone): every upstream HTTP call made for a request is tracked, and one
+# that would start after the client left is refused.
+clientgone.install_urllib3_hook()
 
 # The hub is also an MCP server (POST /mcp, JSON-RPC 2.0) so any MCP-capable
 # agent CLI can call the crews as native tools. The runner goes through the
@@ -3511,6 +3517,8 @@ def _record_outcome(pid, model, ok, junk=False, junk_source="answer"):
     instead of being averaged away under a week of older history."""
     if not (pid and model):
         return
+    if not ok and _client_gone():
+        return          # the client left: not the provider's failure
     try:
         now = time.time()
         weight = _JUNK_FAIL_WEIGHT if (junk and not ok) else 1
@@ -3550,6 +3558,8 @@ def _note_quality_strike(pid, model, reason):
     then benched. Never raises."""
     if not (pid and model):
         return
+    if _client_gone():
+        return          # the client left: not the provider's failure
     try:
         _log.info("[quality] %s/%s: %s -- served uncut, filed as a junk strike",
                   pid, model, reason)
@@ -3676,6 +3686,8 @@ def _record_long_ctx_speed(pid, model, tokens, ms, stalled=False):
             return
         if not ms or ms <= 0:
             return
+        if stalled and _client_gone():
+            return      # the client left: the wait was cut, not measured
         with _outcome_lock:
             row = _long_ctx_speed.setdefault((pid, model), [])
             row.append((time.time(), float(ms), bool(stalled)))
@@ -4437,6 +4449,8 @@ def _note_provider_result(pid, ok, hard_fail=False):
     Neither flag set (429/5xx) leaves the streak untouched."""
     if not pid:
         return
+    if not ok and _client_gone():
+        return          # the client left: not the provider's failure
     if ok:
         # Any real answer is evidence about TWO things: this provider is alive,
         # and so is the network. The second is what lets the timeout breaker tell
@@ -4519,6 +4533,8 @@ def _note_provider_timeout(pid, exc):
     provider's fault -- see the three gates above."""
     if not isinstance(exc, requests.exceptions.ReadTimeout):
         return                              # gate 1: not a provider fact
+    if _client_gone():
+        return          # the client left: not the provider's failure
     if not _fleet_is_alive():
         return                              # gate 3: the network, not the provider
     try:
@@ -4601,6 +4617,8 @@ def _throttle_failed_hop(pid, model, exc=None, secs=None):
     provider-wide only on provider-wide evidence (see _HOP_ESCALATE_WINDOW).
     Fail-open: never raises into the hop loop. 429 does NOT come through here --
     it stays owned by _upstream_chat's own key-rotation/backoff."""
+    if _client_gone():
+        return          # the client left: not the provider's failure
     secs = secs or _HOP_COOLDOWN_DEFAULT
     try:
         if not model or _is_provider_wide_failure(exc):
@@ -4647,6 +4665,8 @@ def _note_recent_hop_failure(pid, model, kind):
     """Remember that this hop 429'd or ran out its time. Never raises."""
     if not (pid and model):
         return
+    if _client_gone():
+        return          # the client left: not the provider's failure
     try:
         with _recent_fail_lock:
             _recent_hop_fail[(pid, model)] = (time.time(), str(kind or "fail"))
@@ -6298,6 +6318,51 @@ def _sub_reported_tokens(*streams):
     return None
 
 
+def _run_cli_cancellable(argv, input=None, timeout=None, capture_output=True,
+                         **kw):
+    """The standard library's run-to-completion call (input, captured output,
+    timeout) that also ends when the client of the request it runs for leaves
+    (clientgone): a subscription CLI call (the manager, a sub-* hop) takes
+    100-150 s and is PAID, so it is killed instead of finishing for nobody.
+    Outside a watched request: exactly the plain call. Raises
+    clientgone.ClientGone on a cancel, subprocess.TimeoutExpired on the
+    timeout. No console window either way."""
+    flags = kw.pop("creationflags", _CREATE_NO_WINDOW)
+    tok = clientgone.current()
+    if tok is None:
+        return subprocess.run(argv, input=input, capture_output=capture_output,
+                              timeout=timeout, creationflags=flags or _CREATE_NO_WINDOW,
+                              **kw)
+    if tok.cancelled:
+        raise clientgone.ClientGone("the client disconnected")
+    pipes = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE) if capture_output else {}
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE if input is not None else None,
+                            creationflags=flags or _CREATE_NO_WINDOW, **pipes, **kw)
+    hook = tok.add_hook(proc.kill)
+    try:
+        end = None if timeout is None else time.monotonic() + float(timeout)
+        pending_input = input
+        while True:
+            slice_s = 0.5 if end is None else max(0.01, min(0.5, end - time.monotonic()))
+            try:
+                out, err = proc.communicate(pending_input, timeout=slice_s)
+                break
+            except subprocess.TimeoutExpired:
+                pending_input = None          # sent once; communicate keeps it
+                if tok.cancelled or (end is not None and time.monotonic() >= end):
+                    proc.kill()
+                    proc.communicate()
+                    if tok.cancelled:
+                        raise clientgone.ClientGone("the client disconnected")
+                    raise subprocess.TimeoutExpired(argv, timeout)
+    finally:
+        tok.remove_hook(hook)
+    if tok.cancelled and proc.returncode != 0:
+        # Killed by the cancel hook mid-run: not the CLI's failure.
+        raise clientgone.ClientGone("the client disconnected")
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
 def _sub_run(pid, prompt, model=None):
     """Run the local CLI ONCE, non-interactively. NEVER raises.
 
@@ -6387,11 +6452,11 @@ def _sub_run(pid, prompt, model=None):
             if cli_model:
                 argv += ["--model", cli_model]
         try:
-            proc = subprocess.run(argv, input=prompt, capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace",
-                                  timeout=_SUB_TIMEOUT, env=_sub_env(pid, model),
-                                  cwd=tempfile.gettempdir(),
-                                  creationflags=_CREATE_NO_WINDOW)
+            proc = _run_cli_cancellable(argv, input=prompt, capture_output=True, text=True,
+                                        encoding="utf-8", errors="replace",
+                                        timeout=_SUB_TIMEOUT, env=_sub_env(pid, model),
+                                        cwd=tempfile.gettempdir(),
+                                        creationflags=_CREATE_NO_WINDOW)
         except subprocess.TimeoutExpired:
             _SUB_USAGE.ran = True
             return 504, "", "%s timed out after %ds." % (bin_name, _SUB_TIMEOUT)
@@ -6634,6 +6699,8 @@ def _manager_dispatch(messages, max_tokens=None, purpose="other"):
     try:
         if not _manager_enabled():
             return "", None
+        if _client_gone():
+            return "", None     # the client left: no paid call for it
         pid, model = _manager_parse(_manager_model())
         cfg = _SUB_PROVIDERS[pid]
         if _is_model_dead(pid, cfg["model"]):
@@ -9169,6 +9236,8 @@ def _note_tool_turn_outcome(pid, model, ok):
     Never raises."""
     if not (pid and model) or not _in_tool_turn():
         return
+    if not ok and _client_gone():
+        return          # the client left: not the provider's failure
     try:
         now = time.time()
         with _outcome_lock:
@@ -9253,6 +9322,8 @@ def _relay_server_id(pid, model):
 
 def _note_relay_tool_fail(pid, model):
     """One ConnectionError / non-answer from a relay server on a tool turn."""
+    if _client_gone():
+        return          # the client left: not the provider's failure
     server = _relay_server_id(pid, model)
     if not server:
         return
@@ -14429,7 +14500,7 @@ class _HopErrors(list):
     def append(self, item):
         list.append(self, item)
         try:
-            _act_hop_failed(item)
+            _act_hop_failed("cancelled: the client left" if _client_gone() else item)
         except Exception:
             pass    # diagnostics must never break a request
 
@@ -15019,8 +15090,11 @@ def _activity_after(response):
     if response.mimetype == "text/event-stream" and 200 <= response.status_code < 300:
         with _activity_lock:
             act["stream"] = True
-            act["status"] = "streaming"
-            act["http"] = response.status_code
+            # A row the client-disconnect cancel already finished stays
+            # "cancelled" (see _watch_client_before).
+            if act.get("finished") is None:
+                act["status"] = "streaming"
+                act["http"] = response.status_code
         code = response.status_code
         # Finalize when the streamed BODY is exhausted (the generator's finally
         # runs on the terminal next()), NOT only when the connection closes.
@@ -15032,6 +15106,7 @@ def _activity_after(response):
 
         def _finalizing_body(src=_body, a=act, http=code):
             saw_content = saw_terminal = saw_error = False
+            gone = False
             try:
                 for chunk in src:
                     b = chunk if isinstance(chunk, (bytes, bytearray)) \
@@ -15043,27 +15118,147 @@ def _activity_after(response):
                     if not saw_error and _STREAM_ERROR_RE.search(b):
                         saw_error = True
                     yield chunk
+            except GeneratorExit:
+                # werkzeug closed the body before it ended: a write to the
+                # client failed, i.e. the client left mid-stream. Whatever was
+                # already sent, the answer was not delivered.
+                gone = True
+                # ...and close what it wraps NOW (the cancel watcher among
+                # them), not whenever this frame is collected.
+                try:
+                    close = getattr(src, "close", None)
+                    if close is not None:
+                        close()
+                except Exception:                                # noqa: BLE001
+                    pass
+                raise
             finally:
                 # 'ok'   -> a real answer (text or tool call) was delivered
                 # 'empty'-> stream finished cleanly but produced nothing
                 # 'error'-> an error event, or the stream cut off before any output
-                if saw_content:
-                    status = "ok"
+                # 'cancelled' -> the client left before the body ended
+                if gone or _client_gone():
+                    _activity_done(a, "cancelled", _CLIENT_GONE_HTTP)
+                elif saw_content:
+                    _activity_done(a, "ok", http)
                 elif saw_error:
-                    status = "error"
+                    _activity_done(a, "error", http)
                 elif saw_terminal:
-                    status = "empty"
+                    _activity_done(a, "empty", http)
                 else:
-                    status = "error"
-                _activity_done(a, status, http)
+                    _activity_done(a, "error", http)
 
         response.response = _finalizing_body()
-        # Backstop: if the client disconnects before the body is fully consumed,
-        # connection-close still finalizes (no-op if already done).
-        response.call_on_close(lambda: _activity_done(act, "ok", code))
+        # Backstop: connection-close with the row still open means the body was
+        # NOT consumed to its end (the finalizer above files every body that
+        # was) -- the client left. It used to be filed "ok".
+        response.call_on_close(lambda: _activity_done(act, "cancelled", _CLIENT_GONE_HTTP))
     else:
         ok = 200 <= response.status_code < 300
-        _activity_done(act, "ok" if ok else "error", response.status_code)
+        if _client_gone() or response.status_code == _CLIENT_GONE_HTTP:
+            _activity_done(act, "cancelled", _CLIENT_GONE_HTTP)
+        else:
+            _activity_done(act, "ok" if ok else "error", response.status_code)
+    return response
+
+
+# --------------------------------------------------------------------------- #
+# Client disconnect stops the work (see clientgone)
+# --------------------------------------------------------------------------- #
+# nginx's "client closed request": what the activity row and the (unsendable)
+# reply carry when the client left before its answer was finished.
+_CLIENT_GONE_HTTP = 499
+
+
+def _client_gone():
+    """True when the client of the request this code runs for has left.
+    Cheap (one contextvar read); never raises."""
+    try:
+        return clientgone.cancelled()
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _client_gone_reply():
+    """The reply for a client that left: nobody reads it, but the handler has
+    to return something, and it must not look like a provider failure."""
+    return Response(json.dumps({"error": {
+        "message": "The client disconnected; the hub stopped this request.",
+        "type": "client_closed_request", "code": "client_disconnected"}}),
+        status=_CLIENT_GONE_HTTP, mimetype="application/json",
+        headers={"X-Free-LLM-Hub-Last-Error": "cancelled"})
+
+
+def _watch_disconnect_path(path):
+    """The inference surfaces: everything that can walk the chain or run a
+    pipeline (OpenAI, Responses, Anthropic, /v1/completions, Gemini, Ollama)."""
+    p = path or ""
+    return p.startswith("/v1/") or p.startswith("/v1beta/") or _is_ollama_path(p)
+
+
+@app.before_request
+def _watch_client_before():
+    """Give an inference request a cancel token and watch its client socket.
+
+    Registered AFTER _activity_before, so the activity row exists for the
+    cancel hook. The body is read in full FIRST (cached for the handler): the
+    monitor's MSG_PEEK must only ever see what comes after it."""
+    # A thread can serve more than one request (the test client): never
+    # inherit an earlier request's token.
+    clientgone.set_current(None)
+    try:
+        if request.method != "POST" or not _watch_disconnect_path(request.path):
+            return None
+        sock = request.environ.get("werkzeug.socket")
+        if sock is None or not config.get_flag("client_disconnect_cancel", True):
+            return None
+        request.get_data(cache=True)
+        tok = clientgone.Token(label="%s %s" % (request.method, request.path))
+        act = getattr(g, "act", None)
+        if act is not None:
+            # Finished at the moment the cancel is detected, not when the
+            # request thread gets round to returning.
+            tok.add_hook(lambda a=act: _activity_done(a, "cancelled", _CLIENT_GONE_HTTP))
+        if clientgone.MONITOR.watch(sock, tok):
+            clientgone.set_current(tok)
+            g.hub_cancel = tok
+    except Exception as exc:                                     # noqa: BLE001
+        _log.debug("client-disconnect watch not armed: %s", exc)
+    return None
+
+
+@app.after_request
+def _watch_client_after(response):
+    """Stop watching once the reply is in werkzeug's hands: a plain reply at
+    once (werkzeug's own write sees a gone client from here on), a stream when
+    its body ends. A stream body CLOSED before its end is a client that left
+    (a write failed): that cancels too, so whatever still runs for it stops."""
+    tok = getattr(g, "hub_cancel", None)
+    if tok is None:
+        return response
+    if not response.is_streamed:
+        clientgone.MONITOR.forget(tok)
+        return response
+    src = response.response
+
+    def _watched_body():
+        try:
+            for chunk in src:
+                yield chunk
+        except GeneratorExit:
+            tok.cancel("client disconnected (write failed)")
+            raise
+        finally:
+            clientgone.MONITOR.forget(tok)
+            close = getattr(src, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:                                # noqa: BLE001
+                    pass
+
+    response.response = _watched_body()
+    response.call_on_close(lambda: clientgone.MONITOR.forget(tok))
     return response
 
 
@@ -27332,9 +27527,12 @@ def _post_with_header_deadline(deadline, post, **kw):
         except BaseException as exc:                             # noqa: BLE001
             box["exc"] = exc
 
-    t = threading.Thread(target=_call, daemon=True)
+    # clientgone.bind: a plain thread starts with an empty context, and the
+    # upstream call it makes must still be tracked for the request's cancel.
+    t = threading.Thread(target=clientgone.bind(_call), daemon=True)
     t.start()
-    t.join(deadline)
+    if clientgone.join(t, deadline):
+        raise clientgone.ClientGone("the client disconnected")
     if t.is_alive():
         raise requests.exceptions.ReadTimeout(
             "no response headers in %ss" % deadline)
@@ -27777,7 +27975,18 @@ def _call_with_wall_clock(seconds, fn, *a, **kw):
     t = threading.Thread(target=_carry_usage_source(_run), daemon=True)
     end = time.monotonic() + max(0.0, seconds)
     t.start()
-    t.join(max(0.0, seconds))
+    if clientgone.join(t, max(0.0, seconds)):
+        # The client left (clientgone): stop waiting at once. The worker's
+        # upstream socket was shut down by the cancel, so it ends too.
+        with lock:
+            box["abandoned"] = True
+            late = box.pop("v", None)
+        if late is not None:
+            try:
+                late.close()             # it landed just as the client left
+            except Exception:                                    # noqa: BLE001
+                pass
+        raise clientgone.ClientGone("the client disconnected")
     # join() can return a hair EARLY by time.monotonic()'s reckoning (15.6 ms
     # ticks on Windows): the chain then saw its deadline "not yet spent" and
     # started another hop with a few ms left. Wait out the true remainder.
@@ -28171,6 +28380,8 @@ class _ChainClock:
         first = True
         while rest:
             self._close_hop()
+            if _client_gone():
+                break        # the client left: no further hop (clientgone)
             if self._quality_due():
                 self._fire_quality_fallback(rest)
             if self.tools:
@@ -28465,11 +28676,18 @@ class _ChainClock:
         # junk JSON answer IN PLACE, so re-judging it later reads "ok".
         verdicts = {}
         while pending:
+            if _client_gone():
+                # The client left: stop every leg, start none (their
+                # sockets were already shut down by the cancel).
+                self._settle(lock, abandoned, q, legs, keep=None, live=live)
+                raise clientgone.ClientGone("the client disconnected")
             wait_to = end if fired or 0 in streaming else min(t0 + delay, end)
             try:
-                item = q.get(timeout=max(0.0, wait_to - time.monotonic()))
+                item = q.get(timeout=min(0.5, max(0.0, wait_to - time.monotonic())))
             except queue.Empty:
                 now = time.monotonic()
+                if now < wait_to:
+                    continue     # a 0.5 s slice, so a cancel is seen above
                 if not fired and now < end:
                     if 0 in streaming:
                         # Leg 0 is answering (slowly, under the judge
@@ -28623,6 +28841,8 @@ class _ChainClock:
         `hedge=False` for a same-hop retry, which must stay on its hop."""
         self._served = None
         model = (payload or {}).get("model")
+        if _client_gone():
+            raise clientgone.ClientGone("the client disconnected")
         _ctx_note_tried(pid, model)
         self._hop_started = time.monotonic()
         self._ensure_ledgers()
@@ -29299,7 +29519,8 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
-    t.join(deadline_s)
+    if clientgone.join(t, deadline_s):
+        return "cancelled", []      # the client left (clientgone)
     if t.is_alive() and content_grace and box.get("saw_content"):
         # VISIBLE TEXT IS ALREADY ARRIVING -- it just has not reached
         # _PEEK_JUDGE_CHARS (or the end of the stream) yet. With the tight
@@ -30380,6 +30601,8 @@ def _note_nonanswer(pid, model, kind=_PROMPT_UNSET):
     local slot the detector on THIS thread just set."""
     if kind is _PROMPT_UNSET:
         kind = _take_nonanswer_kind()
+    if _client_gone():
+        return          # the client left: not the provider's failure
     _record_outcome(pid, model, False)
     if _in_tool_turn():
         _note_relay_tool_fail(pid, model)   # no-op for a non-relay provider
@@ -30516,6 +30739,8 @@ def _record_stream_outcome(pid, model, text, *, tool_calls=False,
     and a guess either way would teach routing something false. Never raises."""
     if not (pid and model):
         return
+    if _client_gone():
+        return          # the client left mid-answer: nothing to judge
     try:
         ok, strikes = True, []
         if not tool_calls:
@@ -31425,6 +31650,11 @@ def _note_broken_stream(pid, model, exc, where):
     _RECENT_FAIL_TTL -- one failure in a long ok-history would not move its
     reliability band. A read timeout is filed as a stall ("timeout"), anything
     else as "conn". Never raises."""
+    if _client_gone():
+        # The hub cut this stream itself: its client left (clientgone).
+        _log.info("[broken-stream] %s %s/%s: cut because the client left; "
+                  "nothing filed", where, pid, model)
+        return
     try:
         _log.warning("[broken-stream] %s %s/%s: upstream died before finishing (%s); "
                      "the client got a retryable error, hop filed as failed",
@@ -32055,9 +32285,10 @@ def _dispatch_chat_with_deadline(pid, payload, deadline=None):
     # _carry_usage_source: the worker thread has neither the caller's
     # thread-local label nor its request, so its quota hit would otherwise be
     # filed as "background" instead of "swarm" / the calling CLI.
-    t = threading.Thread(target=_carry_usage_source(_call), daemon=True)
+    t = threading.Thread(target=clientgone.bind(_carry_usage_source(_call)),
+                         daemon=True)
     t.start()
-    t.join(deadline)
+    clientgone.join(t, deadline)    # returns early once the client left
     if t.is_alive():
         return None, None            # hung hop — abandon and walk the chain on
     return box.get("resp"), box.get("exc")
@@ -32126,6 +32357,8 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False):
             _stage_chain = sorted(_stage_chain[:_SWARM_FAST_POOL],
                                   key=lambda e: _latency_rank(e[0], e[1]))
         for hop_pid, hop_model in _stage_chain[:_SWARM_STAGE_MAX_HOPS]:
+            if _client_gone():
+                break        # the client left: the stage ends empty, at once
             if exclude_pids and hop_pid in exclude_pids:
                 continue     # reviewer must not be the provider that wrote it
             # THE PIPELINE'S OUTER BOUND (see _pipeline_outer_bound): a stage
@@ -32517,6 +32750,8 @@ def _note_swarm_member_fail(pid, model, kind):
     """A fan-out member failed (HTTP error or exception). Never raises."""
     if not (pid and model):
         return
+    if _client_gone():
+        return          # the client left: not the provider's failure
     try:
         with _swarm_member_lock:
             _swarm_member_fail[(pid, str(model))] = (time.time(), str(kind or "fail"))
@@ -32965,10 +33200,15 @@ def _swarm_tool_result(body):
             remaining = cutoff - time.monotonic()
             if remaining <= 0:
                 break
+            if _client_gone():
+                results = []               # the client left: nobody to answer
+                break
             done, pending = concurrent.futures.wait(
-                pending, timeout=remaining,
+                pending, timeout=min(remaining, 0.5),
                 return_when=concurrent.futures.FIRST_COMPLETED)
             if not done:
+                if time.monotonic() < cutoff:
+                    continue               # a 0.5 s slice, so a cancel is seen
                 break                      # nothing landed before the cutoff
             for fut in done:
                 try:
@@ -33025,6 +33265,8 @@ def _swarm_tool_result(body):
         # the provider -- stop counting it against the model.
         moved_on[0] = True
         ex.shutdown(wait=False, cancel_futures=True)
+    if _client_gone():
+        return None          # the client left: the caller replies 499 (clientgone)
     if not results:
         # LOG IT. The success line below sits after this early return, so a run
         # where NOTHING answered used to leave no trace at all -- five failing
@@ -34395,6 +34637,10 @@ def _chat_completions_uncached(body):
 
     Still runs inside a real request context (it reads request.headers for
     X-Free-LLM-Hub-Exclude), it just no longer re-reads the JSON body."""
+    if _client_gone():
+        # The client left (e.g. while a pipeline ran): never start the
+        # fallback walk this call usually is.
+        return _client_gone_reply()
     try:
         body["messages"], image_count = _normalize_openai_messages(body.get("messages"))
     except ValueError as exc:
@@ -34892,6 +35138,8 @@ def _chat_completions_uncached(body):
             errors.append("%s: %s reading error body" % (hop_pid, _sanitize(exc.__class__.__name__)))
         resp.close()
         continue
+    if _client_gone():
+        return _client_gone_reply()      # the walk stopped on a cancel
     if _clock.spent():
         # The walk stopped on the clock, not on the fleet: say so, as a status
         # the client can see, instead of dressing it up as "all providers
@@ -35578,6 +35826,8 @@ def v1_responses(_retry_pass=False, _hedged=False):
         served = _swarm_as_responses(body, messages, tools, est)
         if served is not None:
             return served
+        if _client_gone():
+            return _client_gone_reply()
         # No model could serve the fan-out. Still a request for maximum effort,
         # so continue as 'best' -- never as a model named "swarm".
         body = dict(body, model="best")
@@ -35960,6 +36210,8 @@ def v1_responses(_retry_pass=False, _hedged=False):
     # So when EVERY failure was transient, wait once and run the chain again.
     # Bounded to a single retry, and only when nothing hard failed — a real 400
     # or 404 still surfaces immediately, because retrying that just wastes time.
+    if _client_gone():
+        return _client_gone_reply()      # the walk stopped on a cancel
     if _clock.spent():
         # Stopped on the clock (see _ChainClock). No transient-storm retry: the
         # retry is the same request to codex, and its time is already gone.
@@ -36607,6 +36859,8 @@ def v1_messages():
         served = _swarm_as_anthropic(body, oai_messages, tools)
         if served is not None:
             return served
+        if _client_gone():
+            return _client_gone_reply()
         body = dict(body, model="best")
     # The request's wall clock starts here, before routing, after the
     # pipeline (which has its own cap). See _REQUEST_DEADLINE_DEFAULT.
@@ -36918,6 +37172,8 @@ def v1_messages():
             errors.append("%s: %s reading error body" % (hop_pid, _sanitize(exc.__class__.__name__)))
         resp.close()
         continue
+    if _client_gone():
+        return _client_gone_reply()      # the walk stopped on a cancel
     if _clock.spent():
         # Stopped on the clock (see _ChainClock), not on the fleet.
         _log.warning("MESSAGES-DEADLINE stream=%s tools=%s est=%d errors=[%s]",

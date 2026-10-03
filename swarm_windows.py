@@ -1664,6 +1664,19 @@ def _run_wave(run, indexes, spawn, run_turn, configure=None, stop=None):
             t.start()
             threads.append((t, agent))
         if run.stop_flag.is_set():
+            # STOP MEANS STOP. The flag alone only stopped NEW phases: every
+            # worker already running kept its CLI going -- editing the folder
+            # and calling the hub, which kept working for it -- until its turn
+            # ended by itself. Stop each one's CLI (the hub's stop_session
+            # kills the process tree; its open request to the hub then ends
+            # too, see app.py "Client disconnect stops the work").
+            if stop:
+                for _t, agent in threads:
+                    if agent.session_id:
+                        try:
+                            stop(agent.session_id)
+                        except Exception:                        # noqa: BLE001
+                            pass
             break
         time.sleep(0.02)
 

@@ -856,6 +856,69 @@ COMPLETE (exit 0, no message) and nothing was filed against the pair.
 - Unchanged: the 150 s keepalive stall cut (`_STREAM_PROGRESS_DEADLINE`) still
   ends cleanly; kimi-cli shows an error frame as an error (no retry).
 
+## Client disconnect stops the work (2026-10-04)
+
+Covered by `tests/test_client_disconnect_stops_work.py` (real werkzeug
+threaded server on an ephemeral port, a raw-TCP fake provider, clients that
+leave). MEASURED 2026-10-03 23:13: `curl -N -m 3` on a streaming coding-max
+request left after 3 s; the activity row stayed `in_progress` and the chain
+walked g4f relay hops for 58+ s. werkzeug sees a gone client only when it
+WRITES; while the hub waits (pre-commit peek, chain walk, buffered tool turn,
+fan-out, pipelines, stream gate hold) nothing is written.
+
+- **Detection** (`clientgone.py`, `MONITOR`): `_watch_client_before` (POST on
+  `/v1/*`, `/v1beta/*`, Ollama paths; flag `client_disconnect_cancel`, default
+  on) reads the body in full FIRST, then registers `environ["werkzeug.socket"]`
+  with one shared daemon thread: every 0.5 s a zero-timeout `select()` (<= 500
+  sockets per call, Windows' FD_SETSIZE is 512), and a read-ready socket is
+  peeked with `recv(1, MSG_PEEK)`: `b""` or reset/abort = gone; pending bytes =
+  alive; nothing is ever consumed. werkzeug answers `Connection: close` to
+  every request, so there is no keep-alive read to confuse it. TLS sockets and
+  the test client (no socket) are not watched. Unregistered when a plain reply
+  leaves the handler, or when a stream body ends.
+- **Cancel** (`Token.cancel`): flag first, then hooks (the activity row ends
+  `cancelled` / 499 at the moment of detection; a subscription CLI process is
+  killed), then every upstream connection the request opened is shut down
+  with the BASE `socket.shutdown(SHUT_RDWR)`. A urllib3 hook
+  (`HTTPConnectionPool._make_request`, `connect`) tracks connections made
+  under the request's token (contextvar; plain threads get it through
+  `clientgone.bind`) and refuses to START one after the cancel
+  (`ClientGone`, a RuntimeError the chain loops already treat as "hop over").
+  MEASURED on Windows: shutdown unblocks a blocked read on a timeout socket at
+  once; `resp.close()` from another thread does NOT (it waits on the reader's
+  buffer lock until the read returns) -- never close a response from the
+  monitor. http.client drops `conn.sock` once a reply says Connection: close,
+  so the socket is remembered at connect time (`_hub_raw_sock`).
+- **Who checks the flag**: `_ChainClock.walk` (no next hop) and `dispatch`;
+  the hedge race (0.5 s slices); `_call_with_wall_clock`,
+  `_post_with_header_deadline`, `_dispatch_chat_with_deadline`,
+  `_peek_until_content` (`clientgone.join`, status "cancelled"); the tool
+  fan-out wait (0.5 s slices); `_swarm_dispatch` stage hops;
+  `_manager_dispatch`; `_run_cli_cancellable` (sub-* / manager CLI); the
+  three loops after the walk and `_chat_completions_uncached` / the swarm
+  fall-throughs (`_client_gone_reply`, 499).
+- **Nothing filed against the provider**: `_record_outcome(False)`,
+  `_note_recent_hop_failure`, `_throttle_failed_hop`,
+  `_note_provider_timeout`, `_note_provider_result(False)`,
+  `_note_nonanswer`, `_note_relay_tool_fail`, `_note_tool_turn_outcome(False)`,
+  `_note_quality_strike`, `_record_long_ctx_speed(stalled)`,
+  `_record_stream_outcome`, `_note_broken_stream`, `_note_swarm_member_fail`
+  return early while `_client_gone()`. Usage already spent is still recorded.
+- **Activity**: `cancelled` (499) is a finished status; the dashboard shows it
+  neutral ("client left"). A stream body closed before its end
+  (GeneratorExit = a write failed) is `cancelled` and cancels the token too;
+  the `call_on_close` backstop files `cancelled`, never "ok".
+- **Stop**: /agent Stop kills the CLI tree -> its socket closes -> the
+  request is cancelled (test kills a real client process). Multi:
+  `swarm_windows._run_wave` now calls `stop(session)` for every worker still
+  running when the run's stop flag is set (before, the flag only stopped NEW
+  phases and running workers kept their CLIs going).
+- Live probe (worktree app served on 8799 with sandboxed state, real
+  `curl -N -m 3`, a relay that sends headers then nothing): row `cancelled`
+  0.5 s after curl left, relay connection cut at +0.5 s, 1 hop total; with
+  the flag off the row stayed `in_progress` past 20 s and the relay
+  connection was never cut.
+
 ## Long-context deadlines & exact facts (2026-09-27)
 
 Covered by `tests/test_long_context.py`.
