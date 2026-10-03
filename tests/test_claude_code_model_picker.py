@@ -120,7 +120,8 @@ def test_picker_replaces_the_builtin_rows():
 
 
 def test_hub_env_takes_the_declared_window(monkeypatch):
-    monkeypatch.setattr(ac, "declared_window", lambda model_id=None: 64000)
+    # (cli=: the opencode picker rows behind it ask per CLI -- live window steering)
+    monkeypatch.setattr(ac, "declared_window", lambda model_id=None, cli=None: 64000)
     env = ac.claude_hub_env()
     assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "64000"
     assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "64000"

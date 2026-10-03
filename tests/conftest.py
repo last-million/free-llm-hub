@@ -115,6 +115,11 @@ def _stop_never_touches_real_clis(monkeypatch):
     # tests/test_declared_window_providers.py runs the real one on temp homes.
     monkeypatch.setattr(app, "_resync_declared_windows", lambda: [])
     monkeypatch.setattr(app, "_start_declared_window_resync", lambda: None)
+    # Live window steering asks which UA-less CLIs (pi, openclaw, hermes,
+    # kimi) are wired to the hub by READING the owner's real configs: a test's
+    # reported usage must not depend on that machine state.
+    # tests/test_live_window_steering.py runs the real one on temp homes.
+    monkeypatch.setattr(app, "_steer_connected_unidentifiable", lambda: ())
     yield
 
 

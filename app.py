@@ -1150,6 +1150,9 @@ def _apply_category_effort(body):
     exactly what it sees for a plain 'swarm'/'multi'/'best' with an active mode.
     Returns a body to route with; the caller's dict is never mutated (a retry
     pass must see the same request the first attempt did)."""
+    # Every /v1 handler passes here first: the id the CLIENT sent is what its
+    # declared window is looked up by (live window steering, _ctx_steer_pair).
+    _note_client_model(body.get("model"))
     cat, eff = _split_category_effort(body.get("model"))
     if not cat:
         return body
@@ -1224,7 +1227,7 @@ def _codex_catalog_models(dump):
         entry = copy.deepcopy(template)
         # PER ENTRY: the window the models behind THIS id actually hold (see
         # _declared_window_for), not one fixed figure for every mode.
-        win = agentic_chat.declared_window(mid)
+        win = agentic_chat.declared_window(mid, cli="codex")
         entry.update({
             "slug": mid,
             "display_name": _codex_catalog_label(mid),
@@ -1237,7 +1240,8 @@ def _codex_catalog_models(dump):
             "max_context_window": win,
         })
         if "auto_compact_token_limit" in entry:
-            entry["auto_compact_token_limit"] = agentic_chat.declared_compact_limit(mid)
+            entry["auto_compact_token_limit"] = agentic_chat.declared_compact_limit(
+                mid, cli="codex")
         out.append(entry)
     return out + [copy.deepcopy(m) for m in models if isinstance(m, dict)]
 
@@ -10894,48 +10898,69 @@ def _declared_fleet():
     return fleet
 
 
-def _declared_window_for(model_id=None):
-    """The window to DECLARE for a hub id, or None (= use the fixed default).
-
-    Accepts every id a CLI is handed: an effort tier (auto/best/max/swarm/
-    multi/crew*), a category (coding), a compound (coding-swarm, coding/max),
-    "all", or a pinned "<pid>/<model>" (that model's own known window)."""
+def _tier_pool(model_id=None):
+    """(candidates, pinned) for a hub id as the declared windows read it:
+    candidates = [(pid, model, window or None)] of the fleet that id routes a
+    CLI turn to; pinned = True for "<pid>/<model>" (the list is then that one
+    model, or empty). Accepts every id a CLI is handed: an effort tier
+    (auto/best/max/swarm/multi/crew*), a category (coding), a compound
+    (coding-swarm, coding/max), "all", or a pinned "<pid>/<model>"."""
     mid = str(model_id or "auto").strip().lower()
     cat, eff = _split_category_effort(mid)
+    fleet = _declared_fleet()
     if cat is None:
         if mid in _mode_keys():
             cat, eff = mid, "auto"
         elif "/" in mid and prov.get_provider(mid.split("/", 1)[0]):
             pid, model = mid.split("/", 1)
-            for p, m, w, _s in _declared_fleet():
+            for p, m, w, _s in fleet:
                 if p == pid and m.lower() == model:
-                    return w or None
-            return None
+                    return [(p, m, w)], True
+            return [], True
     # CAPABLE = what the id routes a CLI turn to. Only a "simple" turn drops
     # below the medium floor (medium joins hard on the strongest branch), and
     # a CLI turn carrying tools and a growing history is not that -- so a
     # 4K helper model that only ever answers one-word probes must not drag
     # the window every session compacts against. best/max: the hard floor.
     floor = _DIFFICULTY_FLOOR["hard" if eff in ("best", "max") else "medium"]
-    fleet = _declared_fleet()
 
     def _pick(min_score):
-        cands = []
-        for p, m, w, s in fleet:
-            if cat and not _mode_allows(cat, p, m, session_overrides={}):
-                continue
-            if s < min_score:
-                continue
-            cands.append((p, w))
-        return cands, sorted(w for _p, w in cands if w)
+        return [(p, m, w) for p, m, w, s in fleet
+                if s >= min_score
+                and not (cat and not _mode_allows(cat, p, m, session_overrides={}))]
 
-    cands, wins = _pick(floor)
-    if len(wins) < _DECLARED_MIN_KNOWN:
-        cands, wins = _pick(float("-inf"))   # too few capable ones: the whole pool
-    if len(wins) < _DECLARED_MIN_KNOWN or len(wins) < len(cands) * _DECLARED_MIN_SHARE:
+    cands = _pick(floor)
+    if sum(1 for _p, _m, w in cands if w) < _DECLARED_MIN_KNOWN:
+        cands = _pick(float("-inf"))         # too few capable ones: the whole pool
+    return cands, False
+
+
+def _pool_too_unknown(cands):
+    """True when too few windows of `cands` are known to declare anything."""
+    known = sum(1 for _p, _m, w in cands if w)
+    return known < _DECLARED_MIN_KNOWN or known < len(cands) * _DECLARED_MIN_SHARE
+
+
+def _declared_window_for(model_id=None, cli=None):
+    """The window to DECLARE for a hub id, or None (= use the fixed default).
+
+    `cli` = the CLI whose config carries it: one whose own compaction follows
+    the usage the hub reports (_REACH_CLIS) is declared the REACH window
+    (_reach_window_for) -- the hub steers its usage by live window per
+    request -- and every other CLI (None included) the SAFE one below. A
+    pinned "<pid>/<model>" is that model's own known window either way."""
+    if cli in _REACH_CLIS:
+        reach = _reach_window_for(model_id)
+        if reach:
+            return reach
+    cands, pinned = _tier_pool(model_id)
+    if pinned:
+        return (cands[0][2] or None) if cands else None
+    if _pool_too_unknown(cands):
         return None
+    wins = sorted(w for _p, _m, w in cands if w)
     w = wins[int(_DECLARED_PCTL * (len(wins) - 1))]
-    held = _declared_provider_windows(cands)
+    held = _declared_provider_windows([(p, w) for p, _m, w in cands])
     if not held:
         return None                          # every known window is a relay's
     w = min(w, held[min(_DECLARED_MIN_PROVIDERS, len(held)) - 1])
@@ -10953,6 +10978,318 @@ def _declared_provider_windows(cands):
         if w and not _is_relay_pid(p):
             per[p] = max(per.get(p, 0), int(w))
     return sorted(per.values(), reverse=True)
+
+
+# --------------------------------------------------------------------------- #
+# LIVE WINDOW STEERING (owner request 2026-10-03: "the context-max switch
+# should be done automatically by the hub, in all CLIs that use it").
+#
+# A CLI compacts against the window written into its config at Connect. The
+# SAFE figure above (what 3 providers hold, ~250-262K) keeps a conversation off
+# the cliff when two big providers run dry -- but it also stops it at ~250K
+# when a 1M model is free, which is why the owner kept picking context-max by
+# hand. Instead, for a CLI whose own compaction follows the usage the hub
+# REPORTS:
+#   1. REACH: it is declared the biggest window its tier can reach (largest
+#      known window among the tier's eligible non-relay providers);
+#   2. LIVE: per request the hub works out the biggest window among the
+#      tier's models usable NOW (not dead, not parked, not out for at least
+#      _CTX_OVERFLOW_LONG_WAIT, not user-blocked, tool-capable);
+#   3. STEER: when live < declared, the prompt tokens it reports are
+#      real * declared / live, so the CLI reaches its OWN threshold at the
+#      same fraction of the LIVE window and compacts in time. live >= declared
+#      or unknown: unchanged. A CLI's own compaction request: never steered.
+#
+# WHICH CLIs -- verified from source 2026-10-03, each where the trigger is
+# decided:
+#   opencode  packages/opencode/src/session/overflow.ts isOverflow():
+#             tokens.total || input + output + cache.read + cache.write of the
+#             assistant message (the provider's usage) >= usable(limit.context).
+#   codex     codex-rs/core/src/session/context_window.rs: active tokens =
+#             sess.get_total_token_usage() = last_token_usage.total_tokens
+#             (context_manager/history.rs: the server's usage) + an estimate of
+#             later items, against auto_compact_token_limit / context_window.
+#             An unknown slug runs on fallback metadata, context_window 272000
+#             (models-manager/src/model_info.rs model_info_from_slug), and a
+#             config model_context_window is capped at the slug's
+#             max_context_window (with_config_overrides).
+#   claude    Claude Code 2.1.288 binary: the context count is input_tokens +
+#             cache_creation + cache_read + output_tokens of the last assistant
+#             message's usage; its /config text: "The actual threshold is the
+#             minimum of this setting and your model's maximum context window"
+#             -- the behavesAs model's 200K. So Claude Code keeps the SAFE
+#             figure and is steered against min(it, _CLAUDE_MODEL_WINDOW).
+#   qwen      packages/core/src/services/chatCompressionService.ts:
+#             originalTokenCount ("reflects only the prior turn's API usage")
+#             + the pending message's estimate vs computeThresholds(
+#             contextWindowSize).auto.
+#   kimi      Kimi Code 0.39.1 dist/main.mjs: TokenCountingAgentModel.measured()
+#             anchors tokenUsageTotal(usage); checkAutoCompaction() ->
+#             shouldCompact(size) = size >= max_input/context * triggerRatio.
+#             (kimi-cli soul/kimisoul.py: update_token_count(usage.input) too.)
+#   pi        packages/coding-agent/src/core/agent-session.ts:
+#             calculateContextTokens(assistantMessage.usage) -> shouldCompact(
+#             tokens, contextWindow, settings).
+#   openclaw  src/agents/sessions/agent-session-compaction.ts: the same
+#             calculateContextTokens(assistantMessage.usage) -> shouldCompact.
+#   hermes    agent/context_compressor.py update_from_response():
+#             last_prompt_tokens = usage["prompt_tokens"]; should_compress() and
+#             the preflight (agent/turn_context.py: "a valid provider usage
+#             anchor" first) compare it with threshold_tokens.
+# NOT steered:
+#   aider     aider/history.py ChatSummary.too_big(): its own
+#             litellm.token_counter over the messages -- reported usage is never
+#             read -- so it keeps the SAFE window and honest numbers.
+# Covered by tests/test_live_window_steering.py.
+# --------------------------------------------------------------------------- #
+_STEERED_CLIS = frozenset({"opencode", "codex", "claude", "qwen", "kimi", "pi",
+                           "openclaw", "hermes"})
+_REACH_CLIS = _STEERED_CLIS - {"claude"}
+_CLAUDE_MODEL_WINDOW = 200000        # agentic_chat._CLAUDE_BEHAVES_AS's window
+_CODEX_FALLBACK_WINDOW = 272000      # codex's metadata for a slug it does not know
+# Below this share of the live window no verified CLI threshold (the lowest:
+# hermes compresses at 50%) can be crossed by the steered figure either, so
+# the honest number is reported: small turns read true, compaction unchanged.
+_STEER_FROM_SHARE = 0.25
+# User-Agent substring -> CLI (first match). pi, openclaw and hermes send their
+# SDK's UA ("OpenAI/JS ...", "OpenAI/Python ...") and cannot be told apart.
+_STEER_UA = (("opencode", "opencode"), ("codex", "codex"), ("claude", "claude"),
+             ("qwen", "qwen"), ("kimi", "kimi"), ("aider", "aider"),
+             ("hermes", "hermes"), ("openclaw", "openclaw"))
+_STEER_UNIDENTIFIABLE = ("pi", "openclaw", "hermes", "kimi")
+_STEER_CONNECTED_TTL = 60.0
+_steer_connected_cache = [0.0, ()]
+
+# Per-request INPUT caps a provider enforces below its model windows, for the
+# reach and live windows only (routing keeps its own rules). google: the free
+# tier's input-tokens-per-minute quota PER MODEL (Google's rate-limit table:
+# 250,000 TPM) is spent by ONE request above it. hub.log 2026-10-03
+# 13:29-15:42: every gemini variant tried (3.5/3.6/3.7/3.8-flash, 3.1/3.5-
+# flash-lite, flash-lite-latest, 3-flash-preview) answered 429 to every
+# ~296K-326K-token request, minutes after gemini-3.5-flash served smaller
+# ones; across the three log files no google hop 429'd on a 100K-250K request
+# (31 of 33 failed requests >= 250K had a google 429). The logged bodies stop
+# before the quota metric, so the figure is the documented one, not a parsed one.
+_PROVIDER_REQUEST_TOKEN_CAP = {"google": 250000}
+
+
+def _request_capped_window(pid, window):
+    try:
+        w = int(window or 0)
+    except (TypeError, ValueError):
+        return 0
+    cap = _PROVIDER_REQUEST_TOKEN_CAP.get(pid)
+    return min(w, cap) if cap else w
+
+
+def _clamp_declared(w):
+    return max(agentic_chat._DECLARED_WINDOW_MIN,
+               min(agentic_chat._DECLARED_WINDOW_MAX, int(w)))
+
+
+def _reach_window_for(model_id=None):
+    """The REACH window of a hub id: the largest known window among its
+    eligible NON-RELAY candidates (per-request caps applied), clamped like
+    every declared figure. None for a pinned id or a pool too unknown to
+    declare anything (the caller falls back to the safe figure)."""
+    try:
+        cands, pinned = _tier_pool(model_id)
+        if pinned or _pool_too_unknown(cands):
+            return None
+        best = max([_request_capped_window(p, w) for p, _m, w in cands
+                    if w and not _is_relay_pid(p)] or [0])
+        return _clamp_declared(best) if best > 0 else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _usable_now(pid, model):
+    """Could (pid, model) take a request now or within a short wait? Not when
+    its provider is parked, the model is dead / switched off, or the hub's
+    quota state holds it for at least _CTX_OVERFLOW_LONG_WAIT."""
+    try:
+        if _is_provider_dead(pid) or _is_model_dead(pid, model):
+            return False
+        return _ctx_hop_wait_seconds(pid, model) < _CTX_OVERFLOW_LONG_WAIT
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _live_window_for(model_id=None):
+    """The LIVE window of a hub id: the largest known window (per-request caps
+    applied) among its eligible non-relay candidates usable now (_usable_now),
+    clamped like the declared figures. None when nothing known is usable, or
+    for a pinned id. The cached fleet only: no network, and the walk stops at
+    the first usable model from the biggest window down."""
+    try:
+        cands, pinned = _tier_pool(model_id)
+        if pinned:
+            return None
+        known = sorted(((_request_capped_window(p, w), p, m) for p, m, w in cands
+                        if w and not _is_relay_pid(p)), reverse=True)
+        for w, p, m in known:
+            if w > 0 and _usable_now(p, m):
+                return _clamp_declared(w)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def _declared_hub_ids():
+    """Every hub id a CLI config can carry a window for."""
+    return set(agentic_chat._opencode_hub_models()) | set(_HUB_TIER_IDS) \
+        | {MODE_ALL} | set(_mode_keys())
+
+
+def _cli_declared_window(cli, model_id, agent=False):
+    """The window CLI `cli` compacts against for the id it SENT, or None when
+    unknown (= do not steer). agent=True: an /agent session (codex there gets
+    the top-level model_context_window override, agentic_chat
+    _codex_hub_fallback_text). Never raises."""
+    try:
+        mid = str(model_id or "").strip().lower()
+        if cli == "claude":
+            # One figure for every id (agentic_chat.claude_hub_env), capped by
+            # the behavesAs model's own window (see the comment above).
+            return min(int(agentic_chat.declared_window(None)), _CLAUDE_MODEL_WINDOW)
+        if cli == "codex":
+            slug = mid == MODE_ALL or mid in _mode_keys()
+            # the slug's max_context_window: the hub catalog's entry, else
+            # codex's fallback metadata
+            cap = (int(agentic_chat.declared_window(mid, cli="codex")) if slug
+                   else _CODEX_FALLBACK_WINDOW)
+            if agent:
+                return min(int(agentic_chat.declared_window("auto", cli="codex")), cap)
+            return cap
+        if cli not in _STEERED_CLIS or mid not in _declared_hub_ids():
+            return None
+        return int(agentic_chat.declared_window(mid, cli=cli))
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _agent_session_cli(sid):
+    """The CLI an /agent session runs (its registry entry), or None."""
+    if not sid:
+        return None
+    try:
+        with agentic_chat._REGISTRY_LOCK:
+            sess = agentic_chat._REGISTRY.get(sid)
+        cid = getattr(sess, "cli_id", None)
+        return str(cid).lower() if cid else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _steer_cli_from_ua():
+    try:
+        ua = (request.headers.get("User-Agent") or "").lower()
+    except Exception:                                            # noqa: BLE001
+        return None
+    for sub, cid in _STEER_UA:
+        if sub in ua:
+            return cid
+    return None
+
+
+def _steer_connected_unidentifiable():
+    """The steered CLIs that cannot be told apart by User-Agent and are wired
+    to the hub right now (cached _STEER_CONNECTED_TTL). Reads their config
+    files, so tests/conftest.py stubs it."""
+    now = time.time()
+    if now - _steer_connected_cache[0] < _STEER_CONNECTED_TTL:
+        return _steer_connected_cache[1]
+    out = []
+    for cid in _STEER_UNIDENTIFIABLE:
+        try:
+            entry = _get_cli_entry(cid)
+            if entry and _cli_connected(entry)[0]:
+                out.append(cid)
+        except Exception:                                        # noqa: BLE001
+            continue
+    _steer_connected_cache[0], _steer_connected_cache[1] = now, tuple(out)
+    return _steer_connected_cache[1]
+
+
+def _ctx_client_declared():
+    """The declared window the CLI behind this request compacts against for
+    the id it sent, or None. The CLI: the /agent session's, else the
+    User-Agent's; unidentified -> the figure the connected UA-less steered
+    CLIs were declared for that id, only when they all agree."""
+    mid = _ctx_g("_ctx_client_model")
+    cli = _agent_session_cli(_build_sid())
+    agent = bool(cli)
+    if not cli:
+        cli = _steer_cli_from_ua()
+    if cli:
+        return _cli_declared_window(cli, mid, agent=agent) if cli in _STEERED_CLIS else None
+    figures = {_cli_declared_window(c, mid) for c in _steer_connected_unidentifiable()}
+    if len(figures) == 1 and None not in figures:
+        return figures.pop()
+    return None
+
+
+def _ctx_steer_pair():
+    """(declared, live) when this request's reported prompt tokens are
+    steered (live < declared), else None. Computed once per request, lazily
+    -- after the hops this request already tried have updated the quota state.
+    Never for a CLI's own compaction request, never outside a /v1 handler."""
+    got = _ctx_g("_ctx_steer")
+    if got is not None:
+        return got or None
+    pair = False
+    try:
+        route = _ctx_g("_ctx_route_id")
+        if (route and not _ctx_g("_ctx_compaction")
+                and config.get_flag("context_live_steering", True)):
+            declared = _ctx_client_declared()
+            if declared:
+                live = _live_window_for(route)
+                if live and live < declared:
+                    pair = (int(declared), int(live))
+    except Exception:                                            # noqa: BLE001
+        pair = False
+    _ctx_set("_ctx_steer", pair)
+    return pair or None
+
+
+def _steer_reported(real):
+    """`real` prompt tokens as reported under live window steering:
+    round(real * declared / live), never below real; real itself when the
+    request is not steered or real is under _STEER_FROM_SHARE of live."""
+    pair = _ctx_steer_pair()
+    if not pair or real <= 0:
+        return real
+    declared, live = pair
+    if real < live * _STEER_FROM_SHARE:
+        return real
+    return max(real, int(round(real * declared / float(live))))
+
+
+def _ctx_route_id(body):
+    """The id this request ROUTES on, for its live window: the body's model
+    (after the compound split) with the active category folded back in."""
+    try:
+        mid = str((body or {}).get("model") or "auto").strip().lower()
+        cat, _eff = _split_category_effort(mid)
+        if cat or mid in _mode_keys() or mid == MODE_ALL or "/" in mid:
+            return mid
+        mode = _active_mode()
+        if mode and mode != MODE_ALL and mode in _mode_keys() and mid in _EFFORT_SUFFIXES:
+            return "%s-%s" % (mode, mid)
+        return mid
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _note_client_model(model):
+    """Remember the model id the CLIENT sent (first call per request wins:
+    the compound split and codex's effort mapping rewrite it later)."""
+    try:
+        if g.get("_ctx_client_model") is None:
+            g._ctx_client_model = model
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def _ctx_limit(pid, model):
@@ -11095,6 +11432,12 @@ def _ctx_begin(body, messages, est, signal=True):
         compaction = False
     _ctx_set("_ctx_signal", bool(signal) and not compaction and bool(
         config.get_flag("context_overflow_signal", True)))
+    # Live window steering (_ctx_steer_pair): what this request routes on, and
+    # never for the CLI's own compaction request -- the summary it asks for
+    # must be sized on the real conversation.
+    _ctx_set("_ctx_compaction", bool(compaction))
+    _ctx_set("_ctx_route_id", _ctx_route_id(body))
+    _ctx_set("_ctx_steer", None)
     _ctx_set("_ctx_orig_est", int(est or 0))
     _ctx_set("_ctx_fixed_est", _ctx_fixed_part_est(messages, body))
     _ctx_set("_ctx_overflow", None)
@@ -11174,18 +11517,27 @@ def _reported_prompt_tokens(upstream_pt, orig_est, pid=None, model=None):
     the hub quietly dropped history underneath a CLI that believed it had room.
     So an upstream count is scaled back up by how much this hop compacted, and
     when the upstream reports nothing, the estimate of the original request
-    (tools and images included) stands in."""
+    (tools and images included) stands in.
+
+    THE ONE PLACE all three protocols report through (chat JSON + SSE,
+    responses JSON + stream, messages JSON + stream): live window steering
+    (_steer_reported) scales the figure by declared / live window here."""
     try:
         pt = int(upstream_pt or 0)
     except (TypeError, ValueError):
         pt = 0
     if pt > 0:
         ratio = _ctx_hop_ratio(pid, model)
-        return int(round(pt * ratio)) if ratio > 1.0 else pt
+        real = int(round(pt * ratio)) if ratio > 1.0 else pt
+    else:
+        try:
+            real = max(0, int(orig_est or 0))
+        except (TypeError, ValueError):
+            real = 0
     try:
-        return max(0, int(orig_est or 0))
-    except (TypeError, ValueError):
-        return 0
+        return _steer_reported(real)
+    except Exception:                                            # noqa: BLE001
+        return real
 
 
 def _ctx_note_tried(pid, model):
@@ -11444,7 +11796,7 @@ def _ctx_usage_sse(relay, body, orig_est, pid, model):
         want = bool(((body or {}).get("stream_options") or {}).get("include_usage"))
     except AttributeError:
         want = False
-    if not want and _ctx_hop_ratio(pid, model) <= 1.0:
+    if not want and _ctx_hop_ratio(pid, model) <= 1.0 and not _ctx_steer_pair():
         return relay
     return ctxwin.fix_chat_sse_usage(
         relay, lambda upt: _reported_prompt_tokens(upt, orig_est, pid, model),
@@ -16733,13 +17085,19 @@ def api_model_windows():
                      "budget": budget, "budget_source": bsrc})
     rows.sort(key=lambda r: (r["source"] == "default", r["provider"], r["model"]))
     cov = _ctx_coverage((r["provider"], r["model"]) for r in rows)
-    declared = {}
+    declared, reach, live = {}, {}, {}
     for mid in ("auto", "best") + tuple(_mode_keys()):
         try:
             declared[mid] = agentic_chat.declared_window(mid)
         except Exception:                                        # noqa: BLE001
             declared[mid] = agentic_chat._CODEX_CONTEXT_WINDOW
+        # live window steering: what the steered CLIs are told, and what the
+        # models usable right now hold
+        reach[mid] = _reach_window_for(mid) or declared[mid]
+        live[mid] = _live_window_for(mid)
     return jsonify({"models": rows, "coverage": cov, "declared": declared,
+                    "declared_reach": reach, "live": live,
+                    "steered_clis": sorted(_STEERED_CLIS),
                     "reference_catalog": {"identities": len(_REF_CATALOG_CTX),
                                           "fetched_at": _REF_CATALOG_AT[0] or None}})
 
@@ -23333,7 +23691,7 @@ def _pi_provider_block(key, base_v1):
             "id": mid,
             "name": label,
             # Per id, from the fleet behind it (_PI_CTX when not yet known).
-            "contextWindow": agentic_chat.declared_window(mid),
+            "contextWindow": agentic_chat.declared_window(mid, cli="pi"),
             "maxTokens": _PI_MAX_TOKENS,
             "input": ["text"],
             # Free, and Pi shows a running cost -- reporting anything else would
@@ -23572,7 +23930,8 @@ def _qwen_hub_providers(base_v1):
     OPENAI_API_KEY, which the sibling .env sets."""
     return [{"id": mid, "name": "%s (Calvoun hub)" % label.split(" (")[0],
              "description": label, "baseUrl": base_v1, "envKey": "OPENAI_API_KEY",
-             "generationConfig": {"contextWindowSize": agentic_chat.declared_window(mid)}}
+             "generationConfig": {"contextWindowSize":
+                                  agentic_chat.declared_window(mid, cli="qwen")}}
             for mid, label in _PI_MODELS]
 
 
@@ -23833,7 +24192,7 @@ def _autofix_openclaw(entry, key, base_root, base_v1, model):
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
             # The same declared window every other CLI gets for this id
             # (HUB_CONTEXT_WINDOW until the fleet's windows are known).
-            "contextWindow": agentic_chat.declared_window(mid),
+            "contextWindow": agentic_chat.declared_window(mid, cli="openclaw"),
             "maxTokens": HUB_MAX_TOKENS,
         } for mid in _HUB_TIER_IDS],
     }
@@ -23921,7 +24280,8 @@ def _autofix_hermes(entry, key, base_root, base_v1, model):
     providers = data.get("providers")
     if not isinstance(providers, dict):
         providers = {}
-    windows = {mid: int(agentic_chat.declared_window(mid)) for mid in _HUB_TIER_IDS}
+    windows = {mid: int(agentic_chat.declared_window(mid, cli="hermes"))
+               for mid in _HUB_TIER_IDS}
     providers[_HERMES_PROVIDER_KEY] = {
         "name": "Calvoun Free LLM Hub",
         "api": base_v1,
@@ -24032,7 +24392,7 @@ def _kimi_apply_text(text, base_v1, key):
         if re.search(r'(?m)^\s*\[\s*models\."%s"\s*\]\s*$' % re.escape(mid), body):
             continue
         block += ["", '[models."%s"]' % mid, 'provider = "free-hub"', 'model = "%s"' % mid,
-                  "max_context_size = %d" % agentic_chat.declared_window(mid)]
+                  "max_context_size = %d" % agentic_chat.declared_window(mid, cli="kimi")]
     new_text = "\n".join(top + rest).rstrip("\n")
     return (new_text + "\n\n" if new_text else "") + "\n".join(block) + "\n"
 
@@ -24201,7 +24561,7 @@ def _resync_pi_windows():
         for m in blk.get("models") or ():
             if isinstance(m, dict) and m.get("id") in _HUB_TIER_IDS:
                 changed |= _set_window(m, "contextWindow",
-                                       agentic_chat.declared_window(m["id"]))
+                                       agentic_chat.declared_window(m["id"], cli="pi"))
         return changed
     return _resync_json_file(_p_pi_models(), fix,
                              lambda p, d: _cli_write_text(p, json.dumps(d, indent=2) + "\n"))
@@ -24234,7 +24594,7 @@ def _resync_qwen_windows():
         for p in entries if isinstance(entries, list) else ():
             if _qwen_is_hub_provider(p) and p.get("id") in _HUB_TIER_IDS:
                 changed |= _set_window(p.get("generationConfig"), "contextWindowSize",
-                                       agentic_chat.declared_window(p["id"]))
+                                       agentic_chat.declared_window(p["id"], cli="qwen"))
         return changed
     spath = os.path.join(os.path.dirname(_p_qwen_env()), "settings.json")
     return _resync_json_file(spath, fix, _json_write_like_connect)
@@ -24251,7 +24611,7 @@ def _resync_openclaw_windows():
         for m in blk.get("models") or ():
             if isinstance(m, dict) and m.get("id") in _HUB_TIER_IDS:
                 changed |= _set_window(m, "contextWindow",
-                                       agentic_chat.declared_window(m["id"]))
+                                       agentic_chat.declared_window(m["id"], cli="openclaw"))
         return changed
     return _resync_json_file(_p_openclaw(), fix, _json_write_like_connect)
 
@@ -24282,12 +24642,13 @@ def _resync_hermes_windows():
         if isinstance(data, dict) and isinstance(data.get("providers"), dict) else None
     if not isinstance(blk, dict) or not _points_at_hub(blk.get("api")):
         return []
-    changed = _set_window(blk, "context_length", int(agentic_chat.declared_window("auto")))
+    changed = _set_window(blk, "context_length",
+                          int(agentic_chat.declared_window("auto", cli="hermes")))
     models = blk.get("models")
     for mid in _HUB_TIER_IDS:
         if isinstance(models, dict):
             changed |= _set_window(models.get(mid), "context_length",
-                                   int(agentic_chat.declared_window(mid)))
+                                   int(agentic_chat.declared_window(mid, cli="hermes")))
     if not changed:
         return []
     _cli_write_text(path, yaml.safe_dump(data, default_flow_style=False, sort_keys=False,
@@ -24323,7 +24684,7 @@ def _kimi_resync_text(text):
         if not span or not any(re.match(r'^\s*provider\s*=\s*["\']free-hub["\']\s*$', ln)
                                for ln in lines[span[0]:span[1]]):
             continue
-        want = int(agentic_chat.declared_window(mid))
+        want = int(agentic_chat.declared_window(mid, cli="kimi"))
         for i in range(span[0], span[1]):
             m = _KIMI_CTX_LINE_RE.match(lines[i].rstrip("\r\n"))
             if m and int(m.group(2)) != want:
@@ -24358,7 +24719,8 @@ def _resync_codex_windows():
     data, ok = _read_json_object(cat)
     stale = ok and any(
         isinstance(e, dict) and str(e.get("display_name") or "").endswith("(Calvoun hub)")
-        and e.get("context_window") != agentic_chat.declared_window(e.get("slug"))
+        and e.get("context_window") != agentic_chat.declared_window(e.get("slug"),
+                                                                    cli="codex")
         for e in data.get("models") or ())
     if not stale:
         return []
@@ -24400,10 +24762,13 @@ def _resync_declared_windows():
 
 
 def _declared_window_signature():
-    """Every figure a CLI config can carry, as one comparable value."""
-    ids = set(agentic_chat._opencode_hub_models()) | set(_HUB_TIER_IDS) \
-        | {MODE_ALL} | set(_mode_keys())
-    return tuple(sorted((mid, agentic_chat.declared_window(mid)) for mid in ids)) \
+    """Every figure a CLI config can carry, as one comparable value: the safe
+    figure and the reach figure (_declared_window_for gives every one of
+    _REACH_CLIS the same one, so one of them stands for all)."""
+    ids = _declared_hub_ids()
+    rep = sorted(_REACH_CLIS)[0]
+    return tuple(sorted((mid, agentic_chat.declared_window(mid),
+                         agentic_chat.declared_window(mid, cli=rep)) for mid in ids)) \
         + (("<none>", agentic_chat.declared_window(None)),)
 
 
@@ -35937,7 +36302,10 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
         yield _sse_event("message_start", {"type": "message_start", "message": {
             "id": msg_id, "type": "message", "role": "assistant", "model": model_str,
             "content": [], "stop_reason": None, "stop_sequence": None,
-            "usage": {"input_tokens": input_tokens, "output_tokens": 0}}})
+            # the same figure the closing message_delta reports (live window
+            # steering included, _reported_prompt_tokens)
+            "usage": {"input_tokens": _reported_prompt_tokens(None, input_tokens),
+                      "output_tokens": 0}}})
         yield _sse_event("ping", {"type": "ping"})
 
         # EVERY BLOCK IS STARTED ONCE AND STOPPED ONCE, and no delta ever names

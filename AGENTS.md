@@ -525,6 +525,27 @@ Pure helpers live in `ctxwin.py`; the glue is in app.py. Covered by
   warm-up, then `_declared_resync_loop` every 30 min when the figures
   changed. conftest stubs it. Covered by
   `tests/test_declared_window_providers.py`.
+- **Live window steering** (2026-10-03, owner: "context-max should be
+  automatic"; `tests/test_live_window_steering.py`). CLIs PROVEN from source
+  to compact from the usage the hub reports (`_STEERED_CLIS`: opencode,
+  codex, claude, qwen, kimi, pi, openclaw, hermes -- file + what it reads in
+  the comment at the site; aider counts locally and is NOT steered) are
+  declared the REACH window (`_reach_window_for`: largest known window among
+  the tier's non-relay providers) via `agentic_chat.declared_window(mid,
+  cli=...)`; Claude Code keeps the safe figure (it caps AUTO_COMPACT_WINDOW
+  at its behavesAs model's 200K). Per request `_ctx_steer_pair` = (the
+  window that CLI was declared for the id it SENT, `_cli_declared_window`;
+  live = `_live_window_for`: biggest window usable now -- not dead/parked/
+  out >= `_CTX_OVERFLOW_LONG_WAIT`, relays never). live < declared ->
+  `_reported_prompt_tokens` reports `real * declared / live` (never below
+  real; under 25% of live honest), all three protocols, stream + non-stream.
+  Never a CLI compaction request; flag `context_live_steering`. CLI = /agent
+  registry entry, else User-Agent; UA-less (pi/openclaw/hermes) only when
+  the connected ones' figures agree (`_steer_connected_unidentifiable`,
+  stubbed in conftest). google counts at most 250000 in reach/live
+  (`_PROVIDER_REQUEST_TOKEN_CAP`: free-tier input TPM per model, every
+  >=250K request 429'd in hub.log). Codex: catalog slug -> its entry, else
+  its fallback metadata 272000.
 
 ## Pipelines keep the conversation (2026-09-27)
 

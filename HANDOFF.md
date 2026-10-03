@@ -91,16 +91,8 @@ All in `AGENTS.md` with tests; headlines only:
    died mid-answer, see the broken-stream fix), phase 3 cut by a hub restart.
    The owner presses Continue when they want it (auto-resume is off).
 
-6. **Live window steering (owner request 2026-10-03, not merged yet).** Goal:
-   the owner never picks `context-max` by hand. CLIs proven to compact from
-   the usage the hub reports get the biggest window their tier can reach;
-   per request the hub scales reported prompt tokens by declared / live
-   window (live = what usable models hold right now), so the CLI compacts in
-   time when the big models are out. Builds on `0ec193f` (3-provider cap +
-   `_resync_declared_windows`) and `d23272f` (native overflow when big models
-   are out for long). Today `context`/`context-max` are capped at 262144 too.
-   If a worktree branch `worktree-agent-*` holds a steering commit, review it,
-   run the full suite once, merge; otherwise rebuild from this spec.
+6. ~~Live window steering~~ DONE 2026-10-03 (`tests/test_live_window_steering.py`,
+   AGENTS.md "Live window steering"); run the full suite once after merging.
 7. **Next context ideas (research done 2026-10-03, owner to pick):** age-based
    clearing of old tool results (keep newest ~5, no model call; measured
    -52% cost, solve rate flat), cache-stable prefix + one provider per

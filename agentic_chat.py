@@ -104,6 +104,7 @@ from __future__ import annotations
 import copy
 import collections
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -880,17 +881,32 @@ _CODEX_COMPACT_LIMIT = 96000
 # app._resync_declared_windows carries a changed figure into the configs of
 # the CLIs still wired to the hub). This module must not import app (cycle), hence
 # the callback. Unregistered, failing, or "too few known" -> the fixed default.
+# A writer passes cli=<its CLI>: a CLI whose own compaction follows the usage
+# the hub reports is told the REACH window instead (the biggest its tier can
+# reach), and the hub scales that usage per request by declared / live window
+# (app._STEERED_CLIS, app._reported_prompt_tokens).
 # --------------------------------------------------------------------------- #
 _DECLARED_WINDOW_MIN = 32000
 _DECLARED_WINDOW_MAX = 1000000
 _window_provider = None
+_window_provider_takes_cli = False
 
 
 def set_window_provider(fn):
-    """Register `fn(model_id) -> int | None` (None/invalid = use the default).
-    Pass None to unregister."""
-    global _window_provider
+    """Register `fn(model_id) -> int | None` (None/invalid = use the default),
+    or `fn(model_id, cli=None)` when the figure depends on WHICH CLI is told
+    (app: the CLIs steered by live window get the reach window, see
+    app._STEERED_CLIS). Pass None to unregister."""
+    global _window_provider, _window_provider_takes_cli
     _window_provider = fn if callable(fn) else None
+    takes = False
+    if _window_provider is not None:
+        try:
+            params = inspect.signature(_window_provider).parameters.values()
+            takes = any(p.name == "cli" or p.kind == p.VAR_KEYWORD for p in params)
+        except (TypeError, ValueError):
+            takes = False
+    _window_provider_takes_cli = takes
 
 
 # --------------------------------------------------------------------------- #
@@ -938,15 +954,20 @@ def outage_detail(cli_id, rep):
             % (n, "" if n == 1 else "s", (" (%s)" % why) if why else "", cli_id))
 
 
-def declared_window(model_id=None):
+def declared_window(model_id=None, cli=None):
     """The context window to tell a CLI for hub id `model_id` (auto, best,
-    a category, a compound like coding-swarm, or None for auto). Always an
-    int in [_DECLARED_WINDOW_MIN, _DECLARED_WINDOW_MAX]; never raises."""
+    a category, a compound like coding-swarm, or None for auto). `cli` names
+    the CLI whose config carries it (None = the safe figure every CLI may be
+    told). Always an int in [_DECLARED_WINDOW_MIN, _DECLARED_WINDOW_MAX];
+    never raises."""
     fn = _window_provider
     if fn is None:
         return _CODEX_CONTEXT_WINDOW
     try:
-        v = fn(model_id)
+        if cli is not None and _window_provider_takes_cli:
+            v = fn(model_id, cli=cli)
+        else:
+            v = fn(model_id)
     except Exception:                                            # noqa: BLE001
         return _CODEX_CONTEXT_WINDOW
     if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
@@ -954,10 +975,11 @@ def declared_window(model_id=None):
     return int(max(_DECLARED_WINDOW_MIN, min(_DECLARED_WINDOW_MAX, int(v))))
 
 
-def declared_compact_limit(model_id=None):
+def declared_compact_limit(model_id=None, cli=None):
     """When to auto-compact for that id: the same 75% of the declared window
     _CODEX_COMPACT_LIMIT is of _CODEX_CONTEXT_WINDOW."""
-    return int(declared_window(model_id) * _CODEX_COMPACT_LIMIT // _CODEX_CONTEXT_WINDOW)
+    return int(declared_window(model_id, cli=cli) * _CODEX_COMPACT_LIMIT
+               // _CODEX_CONTEXT_WINDOW)
 _CODEX_TOP_TABLE_RE = re.compile(r"^\s*\[")
 _CODEX_MODEL_PROVIDER_RE = re.compile(r"^\s*model_provider\s*=", re.M)
 
@@ -1021,9 +1043,10 @@ def _codex_hub_fallback_text(existing, session_id=None):
     _set_top_key("model", "auto")
     # Unquoted: TOML would read a quoted value as a string, and codex wants an
     # integer here.
-    _set_top_key("model_context_window", declared_window("auto"),
+    _set_top_key("model_context_window", declared_window("auto", cli="codex"),
                  quote=False, keep_existing=True)
-    _set_top_key("model_auto_compact_token_limit", declared_compact_limit("auto"),
+    _set_top_key("model_auto_compact_token_limit",
+                 declared_compact_limit("auto", cli="codex"),
                  quote=False, keep_existing=True)
 
     cleaned, skip = [], False
@@ -1213,7 +1236,7 @@ def _opencode_hub_models():
         # A FRESH limit dict per entry: one shared object means a later edit to
         # any single model silently rewrites all ten, and json.dump would not
         # show the aliasing.
-        ctx = declared_window(mid)
+        ctx = declared_window(mid, cli="opencode")
         return {"name": name,
                 "limit": {"context": ctx,
                           "output": min(_HUB_MAX_OUTPUT, ctx // 4)},
@@ -1288,7 +1311,11 @@ _OPENCODE_HUB_MODELS = _opencode_hub_models()
 # a 200k window -- above the declared one, so the compact window above is what
 # binds, never a 1M assumption. MEASURED on the wire with it: thinking
 # {"type": "adaptive"}, output_config {"effort": "high"}, max_tokens 32000;
-# the hub answered every such request in the live runs.
+# the hub answered every such request in the live runs. A declared figure above
+# 200k no longer binds: Claude Code caps its auto-compact window at the model's
+# own ("the minimum of this setting and your model's maximum context window",
+# 2.1.288), which is why app._cli_declared_window steers it against
+# min(declared, 200000).
 _CLAUDE_BEHAVES_AS = "claude-sonnet-4-6"
 
 # Claude Code 2.1.283's own model aliases (the literal list in its binary). A
