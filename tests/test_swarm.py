@@ -590,11 +590,16 @@ def test_the_internal_flag_never_reaches_a_provider():
 
 def test_hung_hop_is_abandoned_at_the_deadline():
     import app as _app
+    import threading as _threading
     import time as _time
 
+    released = _threading.Event()
+
     def hanging_dispatch(pid, payload, stream):
-        _time.sleep(30)            # the provider that never answers
-        raise AssertionError("the test must have moved on long before this")
+        # The provider that never answers. Released when the test ends, so the
+        # abandoned thread exits quietly instead of raising 30 s later inside
+        # some other test (PytestUnhandledThreadExceptionWarning).
+        released.wait(30)
 
     orig = _app._dispatch_chat
     orig_deadline = _app._SWARM_HOP_DEADLINE
@@ -606,6 +611,7 @@ def test_hung_hop_is_abandoned_at_the_deadline():
                                                       _app._SWARM_HOP_DEADLINE)
         elapsed = _time.time() - t0
     finally:
+        released.set()
         _app._dispatch_chat = orig
         _app._SWARM_HOP_DEADLINE = orig_deadline
     assert resp is None and exc is None

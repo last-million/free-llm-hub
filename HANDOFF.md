@@ -86,9 +86,10 @@ All in `AGENTS.md` with tests; headlines only:
    pick `sonnet` when re-enabling (verified working 2026-09-30, 13.8 s per call).
 4. **g4f relays** (the only route to Claude/GPT) are rate-limited by the
    service (HTTP 429); the hub re-probes every 30 min. Not a hub bug.
-5. The owner's vectorizer Multi run (`swarm-44ff0fcd1a2a`, conversation
-   `47a25faa…`) had step 1 fail ("opencode produced no reply" on qwen3.8);
-   check it and press Continue if steps are unfinished.
+5. Multi run `swarm-bc02d72cd325` (conversation `92424bc3…`, landing page
+   overhaul) failed: phase 1 "opencode produced no reply" (provider stream
+   died mid-answer, see the broken-stream fix), phase 3 cut by a hub restart.
+   The owner presses Continue when they want it (auto-resume is off).
 
 6. **Live window steering (owner request 2026-10-03, not merged yet).** Goal:
    the owner never picks `context-max` by hand. CLIs proven to compact from

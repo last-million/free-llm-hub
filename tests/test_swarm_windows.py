@@ -882,12 +882,16 @@ def test_a_locked_run_file_is_retried_not_silently_lost(monkeypatch):
     os.remove(path)
     real = SW.os.replace
     calls = {"n": 0}
+    me = threading.get_ident()
 
     def flaky(src, dst):
         # os.replace is patched process-wide: other threads (earlier runs still
         # finishing, the hub's own state writes) call it too under full-suite
-        # load. Count -- and lock -- only THIS run's file, or the count flakes.
-        if os.path.normcase(os.path.abspath(dst)) != os.path.normcase(os.path.abspath(path)):
+        # load. Count -- and lock -- only THIS run's file written by THIS
+        # thread: the run's own walker can still save the same file once after
+        # _wait returns (seen 2026-10-03: 4 calls instead of 3).
+        if (threading.get_ident() != me or os.path.normcase(os.path.abspath(dst))
+                != os.path.normcase(os.path.abspath(path))):
             return real(src, dst)
         calls["n"] += 1
         if calls["n"] <= 2:
@@ -1009,6 +1013,41 @@ def test_a_real_failure_is_not_retried():
     st = _wait(rid, timeout=20)
     assert st["state"] == SW.FAILED
     assert tries[0] == 1
+
+
+def test_a_phase_that_ends_with_no_reply_gets_one_more_go():
+    """MEASURED 2026-10-03 (run swarm-bc02d72cd325): the provider's stream died
+    mid-answer, opencode exited 0 with nothing and seven minutes of work were
+    written off as "opencode produced no reply.". One fresh go, not zero."""
+    tries = [0]
+
+    def silent_then_ok(session_id, prompt):
+        tries[0] += 1
+        if tries[0] < 2:
+            yield {"event": "error", "status": 502, "detail": "opencode produced no reply."}
+        else:
+            yield {"event": "message", "text": "built it"}
+
+    rid = SW.start("g", ".", "opencode", _spawn, silent_then_ok,
+                   phases=[{"title": "a", "task": "t", "needs": []}], review=False)
+    st = _wait(rid, timeout=30)
+    assert st["state"] == SW.DONE
+    assert st["agents"][0]["summary"] == "built it"
+    assert tries[0] == 2
+
+
+def test_no_reply_twice_is_a_real_failure():
+    tries = [0]
+
+    def always_silent(session_id, prompt):
+        tries[0] += 1
+        yield {"event": "error", "status": 502, "detail": "opencode produced no reply."}
+
+    rid = SW.start("g", ".", "opencode", _spawn, always_silent,
+                   phases=[{"title": "a", "task": "t", "needs": []}], review=False)
+    st = _wait(rid, timeout=30)
+    assert st["state"] == SW.FAILED
+    assert tries[0] == 1 + SW.NO_REPLY_RETRIES
 
 
 def test_it_gives_up_rather_than_retrying_forever():

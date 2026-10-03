@@ -1044,6 +1044,15 @@ _TRANSIENT_ERRORS = (
 # and short enough that a genuinely broken phase still fails quickly.
 AGENT_ATTEMPTS = 3
 RETRY_BACKOFF = 4.0
+# A worker whose CLI ended its turn with NO reply gets ONE more go in a fresh
+# session (the project files it already wrote stay). MEASURED 2026-10-03, run
+# swarm-bc02d72cd325 phase 1: seven minutes of real work (reads, a capture
+# script, a screenshot), then the provider's stream died mid-answer ("SSE
+# passthrough error: Response ended prematurely"), opencode exited 0 with no
+# message and the phase was written off as "opencode produced no reply.".
+# Only once: a phase that twice ends with nothing is a real failure.
+_NO_REPLY_MARK = "produced no reply"
+NO_REPLY_RETRIES = 1
 # Seconds between starting one worker and the next in the same wave. Cheap
 # insurance: the collision above is concentrated in the first moments, when
 # every worker is opening the same database.
@@ -1087,13 +1096,20 @@ def _attempts(run, agent, spawn, run_turn, configure=None, hold=False):
     `hold`: a phase that is about to be verified stays RUNNING on DONE, so the
     page does not show it finished, then running again, then finished."""
     outcome = FAILED
+    no_reply_left = NO_REPLY_RETRIES
     for attempt in range(1, AGENT_ATTEMPTS + 1):
         if run.stop_flag.is_set():
             agent.state = STOPPED
             return STOPPED
         outcome = _run_agent_once(run, agent, spawn, run_turn, configure, hold=hold)
-        if agent.state != FAILED or not _is_transient(agent.error):
+        if agent.state != FAILED:
             break
+        if not _is_transient(agent.error):
+            if no_reply_left <= 0 or _NO_REPLY_MARK not in str(agent.error or "").lower():
+                break
+            no_reply_left -= 1
+            _log.info("[swarm] phase %d ended with no reply; one more go in a fresh "
+                      "session", agent.index)
         if attempt < AGENT_ATTEMPTS:
             # A fresh session too: the one we got may not have survived
             # whatever went wrong while it was being created.
