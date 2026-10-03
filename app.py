@@ -17742,6 +17742,68 @@ def _detect_hub_version():
 
 _HUB_VERSION = _detect_hub_version()
 
+# Monotonic start time for the unauthenticated liveness probe below.  Captured
+# once at import so every /health response can report uptime without touching
+# config or the filesystem.
+_HUB_START_TIME = time.time()
+
+
+@app.route("/health", methods=["GET"])
+@app.route("/healthz", methods=["GET"])
+def api_health():
+    """Unauthenticated liveness probe for containers and uptime monitors.
+
+    Intentionally outside /api/* so the control-token gate never applies,
+    and intentionally trivial so it answers even when every provider is
+    exhausted or throttled.  A 200 here means "the process is alive and
+    Flask is serving" — nothing more.  Use /ready when you need to know
+    whether the hub can actually complete an inference request."""
+    return jsonify({
+        "status": "ok",
+        "version": _HUB_VERSION,
+        "release": HUB_RELEASE,
+        "uptime_seconds": int(time.time() - _HUB_START_TIME),
+    })
+
+
+@app.route("/ready", methods=["GET"])
+@app.route("/readyz", methods=["GET"])
+def api_ready():
+    """Unauthenticated readiness probe: 200 when the hub can serve inference,
+    503 otherwise (stopped / draining).  Like /health, lives outside /api/*
+    so no control token is required — exactly what a k8s readinessProbe or
+    Docker HEALTHCHECK needs."""
+    state = config.get_runtime_state()
+    desired = state.get("desired")
+    phase = state.get("phase")
+    if desired == "stopped" or phase in ("draining", "stopped"):
+        return jsonify({
+            "status": "not_ready",
+            "reason": "hub is %s" % (phase or desired),
+            "version": _HUB_VERSION,
+            "release": HUB_RELEASE,
+        }), 503
+    # At least one enabled, keyed provider, or an open (no_key) gateway,
+    # is enough to be "ready" — the detailed per-provider breakdown lives
+    # on the authenticated /api/status endpoint.
+    keyed = _enabled_keyed()
+    has_free_provider = any(
+        not (prov.get_provider(pid) or {}).get("paid") for pid in keyed
+    )
+    if not has_free_provider:
+        return jsonify({
+            "status": "not_ready",
+            "reason": "no enabled free provider",
+            "version": _HUB_VERSION,
+            "release": HUB_RELEASE,
+        }), 503
+    return jsonify({
+        "status": "ready",
+        "version": _HUB_VERSION,
+        "release": HUB_RELEASE,
+        "uptime_seconds": int(time.time() - _HUB_START_TIME),
+    })
+
 
 @app.route("/api/version", methods=["GET"])
 def api_version():
