@@ -33393,6 +33393,12 @@ def _swarm_fast_path(body, messages, tools=None, max_tokens=None):
     Flag `swarm_fast_path`, default on. Fails CLOSED to the pipeline -- the
     user did pick it."""
     try:
+        # A CLI's OWN compaction request is one summary, never a project: a
+        # pipeline turns it into a plan + phases + review + synthesis (MEASURED
+        # 2026-10-03, opencode on coding-multi: 300-600 s per summary, the CLI
+        # stuck on "compaction"). Always one strong model, whatever the flag.
+        if ctxwin.is_compaction_request(messages):
+            return True
         if not config.get_flag("swarm_fast_path", True):
             return False
         tools = tools if tools is not None else body.get("tools")
@@ -34411,6 +34417,9 @@ def _chat_completions_uncached(body):
             and not body.get("tools") and not has_images
             and len([m for m in (body.get("messages") or [])
                      if isinstance(m, dict) and m.get("role") == "user"]) == 1
+            # opencode sends its compaction as ONE tool-free user message: a
+            # summary to write, never a project for a crew.
+            and not ctxwin.is_compaction_request(body.get("messages") or [])
             and crews.looks_like_full_project(
                 swarm._last_user_text(body.get("messages")))):
         esc = dict(body)

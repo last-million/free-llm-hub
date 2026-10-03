@@ -555,6 +555,17 @@ Pure helpers live in `ctxwin.py`; the glue is in app.py. Covered by
   holds the conversation, each turn re-sends it, models degrade with length);
   the live window is not capped, so nothing is steered while that model is up.
 
+- **A CLI's compaction is one summary, never a pipeline** (2026-10-04,
+  `tests/test_cli_compaction_never_runs_a_pipeline.py`). MEASURED: opencode's
+  prompt ("Create a new anchored summary ..." / "Construct a new summary that
+  combines both") matched no `ctxwin._COMPACTION_REQUEST_RE` spelling, so on
+  `coding-multi` each compaction ran plan + phases + review + synthesis
+  (300-600 s; opencode stuck on "compaction"). The regex now also knows
+  kimi-cli and gemini/qwen (system prompt) spellings; `is_compaction_request`
+  checks the system prompt even when a user message exists;
+  `_swarm_fast_path` returns True for any compaction (one strong model, flag
+  ignored) and crew auto-escalation skips it.
+
 ## Pipelines keep the conversation (2026-09-27)
 
 Covered by `tests/test_pipelines_keep_the_conversation.py`.

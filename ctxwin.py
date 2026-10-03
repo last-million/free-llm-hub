@@ -204,12 +204,27 @@ def is_real_instruction(msg):
 # (compacted by the hub if need be), never answered with "context too long":
 # that error is the CLI's cue to compact, and the compaction request itself
 # failing with it would leave the CLI no way out.
+#
+# Spellings verified in each CLI's source (2026-10-04): opencode
+# packages/core/src/session/compaction.ts buildPrompt ("Create a new anchored
+# summary from the conversation history ..." / the update path's "Construct a
+# new summary that combines both"), kimi-cli prompts/compact.md ("compact this
+# conversation context"), gemini-cli / qwen-code compression system prompt
+# ("distilling chat history into a structured XML <state_snapshot>").
+# MEASURED 2026-10-03: opencode's prompt matched none of the older spellings,
+# so on `coding-multi` every compaction ran the whole Multi pipeline (plan,
+# phases "Extract anchor state" / "Render anchored Markdown summary", review,
+# synthesis): 300-600 s per summary, and opencode looked stuck on "compaction".
 _COMPACTION_REQUEST_RE = re.compile(
     r"CONTEXT CHECKPOINT COMPACTION|"
     r"create a detailed summary of the conversation|"
     r"(?:summary|prompt) for continuing (?:our|the|this) conversation|"
     r"summari[sz]e (?:the|this|our) (?:entire |whole )?conversation|"
-    r"handoff summary", re.I)
+    r"handoff summary|"
+    r"create a new anchored summary|"
+    r"construct a new summary that combines both|"
+    r"compact this conversation context|"
+    r"distilling chat history into a structured", re.I)
 
 
 def is_compaction_request(messages):
@@ -218,7 +233,10 @@ def is_compaction_request(messages):
         if isinstance(m, dict) and m.get("role") == "user":
             t = message_text(m)
             if t.strip():
-                return bool(_COMPACTION_REQUEST_RE.search(t[-6000:]))
+                if _COMPACTION_REQUEST_RE.search(t[-6000:]):
+                    return True
+                break
+    # gemini-cli / qwen-code ask for it in the SYSTEM prompt of the call.
     for m in messages or []:
         if isinstance(m, dict) and m.get("role") == "system":
             if _COMPACTION_REQUEST_RE.search(message_text(m)[:6000]):
