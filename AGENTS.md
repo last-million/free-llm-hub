@@ -787,6 +787,35 @@ turn 1 recalled at turn 7). Covered by `tests/test_long_request_upload.py`,
   scales (see next section); the CLIs' declared windows (128K / codex 96K)
   still keep real sessions well below that size.
 
+## Broken upstream streams (2026-10-03)
+
+Covered by `tests/test_broken_stream_retry.py`. Live: a Multi worker (opencode,
+session fe4bbd96) lost its provider's stream after 7 min ("Response ended
+prematurely"); the passthrough appended `[DONE]`, opencode took the partial as
+COMPLETE (exit 0, no message) and nothing was filed against the pair.
+
+- When the upstream ITERATOR raises (`_upstream_reads`) or streams an
+  `{"error": ...}` object BEFORE any finish_reason / [DONE], each protocol ends
+  with what its clients RETRY on (source evidence at each site): chat =
+  `_chat_broken_frame` (`{"error":{message,type:"server_error",code:"ECONNRESET"}}`,
+  no `choices`, no [DONE]; opencode fromError -> isRetryable, qwen-code
+  'transport'); responses = `response.failed` code `upstream_error` and NO
+  `output_item.done` (codex CodexErr::Stream, stream_max_retries 5; a partial
+  item would be replayed into history); messages = the body just ENDS, no
+  stop/delta/error event (Claude Code docs: a cleanly ended body is a dropped
+  connection, retried "even if some text had already started streaming"; an
+  error event is retried only before any text; stopping a block completes it).
+- Died AFTER its finish_reason = complete answer: today's clean end + judge.
+  A fault in the hub's own frame handling keeps the old except path.
+- `_note_broken_stream` files `_record_outcome(False)` + `_note_recent_hop_failure`
+  ("timeout" for a read timeout, else "conn") -- the ledger `_build_chain`
+  reads, so the next request puts the pair at the tail. Skipped when the answer
+  gate cut (it filed already). `_sse_deltas` raises on the error frame, so
+  /v1/completions, Ollama and Gemini surfaces end with their own error shape;
+  a Puter NDJSON `error` event now raises instead of becoming finish "stop".
+- Unchanged: the 150 s keepalive stall cut (`_STREAM_PROGRESS_DEADLINE`) still
+  ends cleanly; kimi-cli shows an error frame as an error (no retry).
+
 ## Long-context deadlines & exact facts (2026-09-27)
 
 Covered by `tests/test_long_context.py`.

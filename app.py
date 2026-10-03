@@ -6999,7 +6999,15 @@ class _PuterStreamResponse:
             elif kind == "usage":
                 self._usage = _puter_usage(ev.get("usage"))
             elif kind == "error":
-                self._finish = "stop"
+                # Not a finished answer: it used to become finish "stop", i.e.
+                # a clean completion of whatever had streamed. Raised, it is a
+                # failed peek before the commit (next hop) and a broken stream
+                # after it (a retryable error to the CLI -- BROKEN UPSTREAM
+                # STREAMS).
+                err = ev.get("error")
+                raise _UpstreamStreamError("puter stream error: %s" % _sanitize(
+                    (err.get("message") if isinstance(err, dict) else err)
+                    or ev.get("message") or "unspecified", 200))
 
     def iter_lines(self, decode_unicode=False):
         cid = "chatcmpl-puter-" + uuid.uuid4().hex
@@ -30912,6 +30920,124 @@ def _record_sse_usage(hop_pid, hop_model, kept, tail, prompt_est):
         pass
 
 
+# --------------------------------------------------------------------------- #
+# BROKEN UPSTREAM STREAMS: an answer the upstream never finished is never handed
+# to a CLI as a finished one. Covered by tests/test_broken_stream_retry.py.
+#
+# MEASURED 2026-10-03 (hub.log, Multi worker, opencode session fe4bbd96): after
+# 7 minutes of real work the provider's stream died mid-answer ("SSE
+# passthrough error: Response ended prematurely"). The passthrough then sent
+# `data: [DONE]`, which tells the CLI the answer is COMPLETE: opencode ended the
+# turn (exit 0, no message), the phase was written off as "opencode produced no
+# reply", and nothing was filed against the pair, so the next request could
+# pick it again. /v1/responses and /v1/messages did the same in their own
+# shape (response.completed / message_stop on a partial answer).
+#
+# Now, when the upstream ITERATOR raises (reset, ChunkedEncodingError, read
+# timeout, a Puter error event) -- or streams an error object -- BEFORE any
+# finish_reason / terminal event, each protocol gets the signal its clients
+# retry on (the evidence per CLI is at each site) and the pair is filed failed
+# (_note_broken_stream). An upstream that had already sent its finish_reason
+# delivered a complete answer: that keeps today's clean end. An exception from
+# the hub's OWN frame handling is not upstream death and keeps the old path.
+# --------------------------------------------------------------------------- #
+class _UpstreamStreamError(Exception):
+    """An upstream stream that reported an error instead of finishing (a Puter
+    error event, an OpenAI `{"error": ...}` frame after the commit)."""
+
+
+def _upstream_reads(iterator, box):
+    """Relay `iterator`. An exception IT raises ends the relay quietly and is
+    kept in box["exc"], so the caller can tell upstream death (the iterator
+    raised) from a fault in its own frame handling (its loop raised).
+    GeneratorExit (a client disconnect) is not caught."""
+    try:
+        for item in iterator:
+            yield item
+    except Exception as exc:                                     # noqa: BLE001
+        box["exc"] = exc
+
+
+def _stream_error_text(exc):
+    """A short, key-free reason for a broken stream."""
+    try:
+        if isinstance(exc, _UpstreamStreamError):
+            return _sanitize(str(exc) or "upstream stream error", 200)
+        return _sanitize("%s: %s" % (type(exc).__name__, exc), 200)
+    except Exception:                                            # noqa: BLE001
+        return "upstream stream error"
+
+
+def _stream_error_frame_text(chunk):
+    """The message of an OpenAI `{"error": ...}` stream frame."""
+    err = chunk.get("error") if isinstance(chunk, dict) else None
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("code") or err.get("type")
+                   or "upstream error")
+    return str(err or "upstream error")
+
+
+_BROKEN_STREAM_TEXT = ("upstream connection lost mid-stream before the answer was "
+                       "finished (%s); service unavailable, retry the request")
+
+
+def _chat_broken_frame(exc, open_frame=False):
+    """The end of a /v1/chat/completions stream whose upstream died before its
+    finish_reason: ONE OpenAI error frame, then the body closes -- no [DONE].
+
+    Evidence (sources read 2026-10-03):
+    * opencode (anomalyco/opencode dev, ai 6.0.168 + @ai-sdk/openai-compatible
+      2.0.41, patched): the chunk schema is z.union([chunkBase, errorSchema]);
+      errorSchema = {error: {message: string, type?, param?, code?}} and
+      chunkBase REQUIRES `choices`, so the frame carries no `choices`. The
+      error part reaches session/llm/ai-sdk.ts (`case "error": Effect.fail`);
+      message-v2.ts fromError maps `code === "ECONNRESET"` to APIError
+      "Connection reset by server", isRetryable: true; session/retry.ts also
+      retries any message containing "unavailable" / "connection lost" /
+      "server_error" (RETRY_MAX_RETRIES 5, 2s x 2^n backoff). VERIFIED.
+      By contrast `[DONE]` with no finish_reason is NOT an error there:
+      parseJsonEventStream drops [DONE], flush reports finishReason 'other'
+      -> opencode "unknown" -> prompt.ts loops on with the partial answer in
+      history (and the measured run ended the turn with no reply).
+    * qwen-code (QwenLM/qwen-code main): openai-node raises a `data:` frame
+      with an `error` key as APIError(undefined, data.error), whose .code is
+      the frame's code; utils/retryErrorClassification.ts getTransportCode
+      finds "ECONNRESET" (in TRANSPORT_ERROR_CODES) -> 'transport', retried.
+      VERIFIED. (A [DONE] with no finish_reason is retried there as well --
+      InvalidStreamError NO_FINISH_REASON -- but not in opencode, and kimi-cli
+      accepts it as complete; there an error frame is shown as an error,
+      not retried. The frame is the one signal that reads "not finished"
+      in all of them.)
+    `open_frame`: the last relayed chunk ended mid-line; a blank line first
+    closes it so the error frame is parsed on its own."""
+    body = {"error": {"message": _BROKEN_STREAM_TEXT % _stream_error_text(exc),
+                      "type": "server_error", "code": "ECONNRESET"}}
+    frame = b"data: " + json.dumps(body).encode("utf-8") + b"\n\n"
+    return (b"\n\n" + frame) if open_frame else frame
+
+
+def _note_broken_stream(pid, model, exc, where):
+    """File a committed stream that died before its finish_reason: one failed
+    delivery (_record_outcome -> reliability) AND a recent failure
+    (_note_recent_hop_failure), which is the ledger _build_chain and the
+    router read to put the pair behind every other candidate for
+    _RECENT_FAIL_TTL -- one failure in a long ok-history would not move its
+    reliability band. A read timeout is filed as a stall ("timeout"), anything
+    else as "conn". Never raises."""
+    try:
+        _log.warning("[broken-stream] %s %s/%s: upstream died before finishing (%s); "
+                     "the client got a retryable error, hop filed as failed",
+                     where, pid, model, _stream_error_text(exc))
+        if not (pid and model):
+            return
+        _record_outcome(pid, model, False)
+        kind = "timeout" if (isinstance(exc, (requests.Timeout, TimeoutError))
+                             or "timed out" in str(exc).lower()) else "conn"
+        _note_recent_hop_failure(pid, model, kind)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None,
                prompt_text=None, tools_offered=False, last_prompt=None, prompt_est=0,
                answer_gate=None):
@@ -30930,16 +31056,24 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
     via _record_stream_outcome) and its outcome recorded -- the bytes are
     kept (capped) and parsed only then, so the relay stays a passthrough.
     `answer_gate` (the _StreamAnswerGate feeding `iterator`) skips that when
-    the gate already cut the stream and filed the failure itself."""
+    the gate already cut the stream and filed the failure itself.
+
+    An upstream that dies BEFORE its finish_reason / [DONE] ends the relay
+    with _chat_broken_frame (a retryable error frame, no [DONE]) and is filed
+    failed -- see BROKEN UPSTREAM STREAMS above."""
     saw_done = False
+    finished = False         # a finish_reason frame passed: the answer is complete
     stalled = False
     kept, kept_len = [], 0
     tail = b""
+    prev = b""               # end of the previous chunk (a finish split across two)
+    open_frame = False       # the last relayed byte was not a frame/line end
+    reads = {}               # what the upstream iterator raised (_upstream_reads)
     last_progress = time.time()
     try:
         if iterator is None:
             iterator = resp.iter_content(chunk_size=None)
-        for chunk in _chain_first(first, iterator):
+        for chunk in _upstream_reads(_chain_first(first, iterator), reads):
             now = time.time()
             if _sse_chunk_is_progress(chunk):
                 last_progress = now
@@ -30957,6 +31091,10 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
                        else str(chunk).encode("utf-8", "ignore"))
                 if not saw_done and _STREAM_TERMINAL_RE.search(raw):
                     saw_done = True
+                if not finished and _STREAM_FINISH_RE.search(prev + bytes(raw)):
+                    finished = True
+                prev = bytes(raw[-64:])
+                open_frame = not raw.endswith(b"\n")
                 if hop_pid and kept_len < _STREAM_DIGEST_CAP:
                     kept.append(bytes(raw))
                     kept_len += len(raw)
@@ -30965,16 +31103,32 @@ def _proxy_sse(resp, iterator=None, first=_MISSING, hop_pid=None, hop_model=None
                     # frame lives.
                     tail = (tail + bytes(raw))[-_SSE_USAGE_TAIL:]
                 yield chunk
+        broken = reads.get("exc")
+        if broken is not None and not (saw_done or finished):
+            # The upstream died before finishing: never [DONE] (= "complete"
+            # to every client). See BROKEN UPSTREAM STREAMS / _chat_broken_frame.
+            if not getattr(answer_gate, "cut", False):
+                _note_broken_stream(hop_pid, hop_model, broken, "chat")
+            yield _chat_broken_frame(broken, open_frame)
+            return
+        if broken is not None:
+            # Died AFTER its finish_reason: the answer is complete. Close it as
+            # before and judge it like any finished stream.
+            _log.error("SSE passthrough error after the answer finished: %s",
+                       _stream_error_text(broken))
+            if not saw_done:
+                saw_done = True
+                yield b"data: [DONE]\n\n"
         if hop_pid and not stalled and not getattr(answer_gate, "cut", False):
             text, saw_tools, fin = _sse_answer_digest(kept)
             _record_stream_outcome(hop_pid, hop_model, text, tool_calls=saw_tools,
                                    finish_reason=fin, prompt_text=prompt_text,
                                    tools_offered=tools_offered, last_prompt=last_prompt)
     except Exception as exc:
-        # Upstream died mid-stream (reset / ChunkedEncodingError / read timeout).
-        # Without a terminator the client sits on a half-open SSE body waiting for
-        # a [DONE] that will never come. Byte passthrough is unchanged on the happy
-        # path; this only appends the terminator the upstream failed to send.
+        # A fault in THIS relay's own handling (upstream death is caught by
+        # _upstream_reads above and never reaches here). Without a terminator
+        # the client sits on a half-open SSE body waiting for a [DONE] that
+        # will never come; this only appends it.
         _log.error("SSE passthrough error: %s", _sanitize(str(exc)))
         if not saw_done:
             try:
@@ -33139,8 +33293,14 @@ def _sse_deltas(resp):
     """Yield (text, tool_calls, finish_reason, usage) from an OpenAI SSE stream.
 
     Every foreign streaming surface needs exactly this and nothing more, so the
-    frame parsing lives here once rather than three times."""
+    frame parsing lives here once rather than three times.
+
+    An error frame (the passthrough's _chat_broken_frame when the upstream
+    died before finishing) raises _UpstreamStreamError: each surface then
+    ends with its OWN error shape instead of its success terminator. After a
+    finish_reason the answer stands and a later error frame is skipped."""
     buf = ""
+    seen_fin = False
     for raw in resp.response:
         buf += raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
         while "\n\n" in buf:
@@ -33156,8 +33316,14 @@ def _sse_deltas(resp):
                     obj = json.loads(payload)
                 except ValueError:
                     continue
+                if isinstance(obj, dict) and obj.get("error") and not obj.get("choices"):
+                    if not seen_fin:
+                        raise _UpstreamStreamError(_stream_error_frame_text(obj))
+                    continue            # after the finish: the answer stands
                 choice = (obj.get("choices") or [{}])[0]
                 delta = choice.get("delta") or {}
+                if choice.get("finish_reason"):
+                    seen_fin = True
                 yield (delta.get("content") or "", delta.get("tool_calls"),
                        choice.get("finish_reason"), obj.get("usage"))
 
@@ -33207,15 +33373,23 @@ def v1_completions():
         cid = "cmpl-" + uuid.uuid4().hex
 
         def gen():
-            for text, _tc, finish, _u in _sse_deltas(resp):
-                if not text and not finish:
-                    continue
-                yield "data: " + json.dumps({
-                    "id": cid, "object": "text_completion",
-                    "created": int(time.time()), "model": model,
-                    "choices": [{"text": text, "index": 0,
-                                 "finish_reason": finish, "logprobs": None}],
-                }) + "\n\n"
+            try:
+                for text, _tc, finish, _u in _sse_deltas(resp):
+                    if not text and not finish:
+                        continue
+                    yield "data: " + json.dumps({
+                        "id": cid, "object": "text_completion",
+                        "created": int(time.time()), "model": model,
+                        "choices": [{"text": text, "index": 0,
+                                     "finish_reason": finish, "logprobs": None}],
+                    }) + "\n\n"
+            except _UpstreamStreamError as exc:
+                # The upstream died before finishing: the OpenAI error frame,
+                # never [DONE] (BROKEN UPSTREAM STREAMS).
+                yield "data: " + json.dumps({"error": {
+                    "message": str(exc), "type": "server_error",
+                    "code": "ECONNRESET"}}) + "\n\n"
+                return
             yield "data: [DONE]\n\n"
         return Response(stream_with_context(gen()), mimetype="text/event-stream",
                         headers=_SSE_HEADERS)
@@ -33445,16 +33619,22 @@ def _ollama_chat_like(kind):
 
     def gen():
         usage, calls = None, None
-        for text, tool_calls, _finish, u in _sse_deltas(resp):
-            if u:
-                usage = u
-            if tool_calls:
-                calls = tool_calls
-            if not text:
-                continue
-            yield wire_ollama.ndjson(
-                wire_ollama.chat_chunk(model, text) if kind == "chat"
-                else wire_ollama.generate_chunk(model, text))
+        try:
+            for text, tool_calls, _finish, u in _sse_deltas(resp):
+                if u:
+                    usage = u
+                if tool_calls:
+                    calls = tool_calls
+                if not text:
+                    continue
+                yield wire_ollama.ndjson(
+                    wire_ollama.chat_chunk(model, text) if kind == "chat"
+                    else wire_ollama.generate_chunk(model, text))
+        except _UpstreamStreamError as exc:
+            # The upstream died before finishing: Ollama's streamed error line,
+            # never done:true (BROKEN UPSTREAM STREAMS).
+            yield wire_ollama.ndjson(wire_ollama.error_payload(str(exc)))
+            return
         if calls and kind == "chat":
             yield wire_ollama.ndjson(wire_ollama.chat_chunk(model, "", calls))
         ns = int((time.time() - started) * 1_000_000_000)
@@ -33553,17 +33733,27 @@ def gemini_generate(spec):
 
     def gen():
         usage, first = None, True
-        for text, tool_calls, finish, u in _sse_deltas(resp):
-            if u:
-                usage = u
-            if not text and not tool_calls and not finish:
-                continue
-            chunk = wire_gemini.stream_chunk(text, model, finish, tool_calls)
+        try:
+            for text, tool_calls, finish, u in _sse_deltas(resp):
+                if u:
+                    usage = u
+                if not text and not tool_calls and not finish:
+                    continue
+                chunk = wire_gemini.stream_chunk(text, model, finish, tool_calls)
+                if as_sse:
+                    yield "data: " + json.dumps(chunk) + "\n\n"
+                else:
+                    yield ("[" if first else ",") + json.dumps(chunk)
+                    first = False
+        except _UpstreamStreamError as exc:
+            # The upstream died before finishing: Google's error envelope
+            # (503 UNAVAILABLE), never the "stop" tail (BROKEN UPSTREAM STREAMS).
+            err = wire_gemini.error_payload(str(exc), 503, "UNAVAILABLE")
             if as_sse:
-                yield "data: " + json.dumps(chunk) + "\n\n"
+                yield "data: " + json.dumps(err) + "\n\n"
             else:
-                yield ("[" if first else ",") + json.dumps(chunk)
-                first = False
+                yield ("[" if first else ",") + json.dumps(err) + "]"
+            return
         tail = wire_gemini.stream_chunk("", model, "stop", None, usage)
         if as_sse:
             yield "data: " + json.dumps(tail) + "\n\n"
@@ -34588,8 +34778,10 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
               function_call_arguments.done -> output_item.done
       response.completed
     The assistant message (if any) is output_index 0; each tool call takes the
-    next index. Defensive: unparseable chunks are skipped, and a mid-stream
-    failure still emits a terminal response.completed so Codex never hangs."""
+    next index. Defensive: unparseable chunks are skipped, and a stream always
+    ends with a terminal event so Codex never hangs: an upstream that died
+    before its finish_reason gets `response.failed` (codex retries it, see
+    BROKEN UPSTREAM STREAMS); any other failure still ends response.completed."""
     resp_id = "resp_" + uuid.uuid4().hex
     created = int(time.time())
 
@@ -34706,11 +34898,12 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
 
     last_progress = time.time()
     judged = False           # outcome already filed (stall / error / end check)
+    reads = {}               # what the upstream iterator raised (_upstream_reads)
     try:
         yield _sse_event("response.created",
                          {"type": "response.created", "response": _obj("in_progress", [])})
 
-        for raw in _chain_first(first, line_iter):
+        for raw in _upstream_reads(_chain_first(first, line_iter), reads):
             now = time.time()
             if _sse_chunk_is_progress(raw):
                 last_progress = now
@@ -34730,8 +34923,14 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
             except (ValueError, UnicodeDecodeError):
                 continue
             if isinstance(chunk, dict) and chunk.get("error"):
-                # provider streamed an error object on a 200 -> stop cleanly,
-                # emit the terminal below (never relay the error as content)
+                if stream_fin is None:
+                    # The upstream gave up before finishing: a broken stream,
+                    # not a finished answer (see the end of this loop).
+                    reads["exc"] = _UpstreamStreamError(_stream_error_frame_text(chunk))
+                    break
+                # an error object AFTER the finish_reason: the answer stands --
+                # stop cleanly, emit the terminal below (never relay the error
+                # as content)
                 _record_outcome(hop_pid, hop_model, False)
                 judged = True
                 break
@@ -34818,6 +35017,37 @@ def _responses_stream(resp, model_label, line_iter=None, first=_MISSING, prompt_
                         "type": "response.function_call_arguments.delta",
                         "item_id": st["item_id"], "output_index": st["out_index"],
                         "delta": args})
+
+        broken = reads.get("exc")
+        if broken is not None and stream_fin is None:
+            # The upstream died before its finish_reason (BROKEN UPSTREAM
+            # STREAMS). Evidence, openai/codex main, read 2026-10-03:
+            # codex-api/src/sse/responses.rs stores a `response.failed` error
+            # and raises it when the body closes; sse/responses_error.rs
+            # parse_failed_response: an UNKNOWN error code -> ApiError::Retryable
+            # -> CodexErr::Stream ("stream disconnected before completion"),
+            # which core/src/session/turn.rs retries up to the provider's
+            # stream_max_retries (default 5, "Reconnecting... n/5"). Fatal
+            # codes avoided: context_length_exceeded, insufficient_quota,
+            # usage_not_included, invalid_prompt, server_is_overloaded (fatal
+            # without a retry-after). A body closed with no response.completed
+            # is retried the same way; the event only adds a readable reason.
+            # NO output_item.done for the partial items: handle_output_item_done
+            # records each one into history, and the retry rebuilds its prompt
+            # from that history -- the partial would be duplicated.
+            if not judged and not getattr(answer_gate, "cut", False):
+                _note_broken_stream(hop_pid, hop_model, broken, "responses")
+            failed = _obj("failed", [])
+            failed["error"] = {"code": "upstream_error",
+                               "message": _BROKEN_STREAM_TEXT % _stream_error_text(broken)}
+            yield _sse_event("response.failed", {"type": "response.failed",
+                                                 "response": failed})
+            return
+        if broken is not None:
+            # Died AFTER its finish_reason: the answer is complete -- finish it
+            # as any ended stream (judged, finalized, response.completed).
+            _log.error("Responses stream error after the answer finished: %s",
+                       _stream_error_text(broken))
 
         # Name what never got one, BEFORE the outcome is filed: a stream whose
         # only "tool call" stays nameless delivered nothing usable, and must
@@ -35732,8 +35962,9 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
         text_chars = 0
         text_parts = []          # for the end-of-stream judgement only
         judged = False           # outcome already filed (stall / error)
+        reads = {}               # what the upstream iterator raised (_upstream_reads)
 
-        for raw in _chain_first(first, line_iter):
+        for raw in _upstream_reads(_chain_first(first, line_iter), reads):
             now = time.time()
             if _sse_chunk_is_progress(raw):
                 last_progress = now
@@ -35753,7 +35984,12 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
             except (ValueError, UnicodeDecodeError):
                 continue
             if isinstance(chunk, dict) and chunk.get("error"):
-                # error object on a 200 stream -> stop cleanly, emit terminal below
+                if finish_reason is None:
+                    # gave up before finishing: a broken stream (end of loop)
+                    reads["exc"] = _UpstreamStreamError(_stream_error_frame_text(chunk))
+                    break
+                # error object after the finish_reason -> the answer stands:
+                # stop cleanly, emit terminal below
                 _record_outcome(hop_pid, hop_model, False)
                 judged = True
                 break
@@ -35831,6 +36067,35 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
                         "type": "content_block_delta", "index": tool_blocks[oai_idx],
                         "delta": {"type": "input_json_delta", "partial_json": args}})
 
+        broken = reads.get("exc")
+        if broken is not None and finish_reason is None:
+            # The upstream died before its finish_reason (BROKEN UPSTREAM
+            # STREAMS): the body ENDS here, cleanly, with NO further event --
+            # no content_block_stop, message_delta, message_stop or error.
+            # Evidence, code.claude.com/docs/en/errors (read 2026-10-03,
+            # VERIFIED): "Connection lost mid-response ... You also see this
+            # variant when a proxy or gateway ends the response body cleanly
+            # before the response has finished", and Claude Code retries
+            # "Dropped connections ... before Claude has completed any part of
+            # its response ... even if some text had already started
+            # streaming" (CLAUDE_CODE_MAX_RETRIES, default 10). An `event:
+            # error` (overloaded_error) is retried only "before any of
+            # Claude's response has streamed" -- and the commit here always
+            # follows content, so the clean end is the signal that retries.
+            # Stopping the open text block would COMPLETE it, and a failure
+            # "after Claude has completed a block" is never retried. A text
+            # block already stopped by a tool call stays kept (Claude Code:
+            # "The response above may be incomplete"), never reported done.
+            # (The Anthropic TS SDK raises an `event: error` frame as APIError
+            # with no status; the closed source's reading of it is INFERRED.)
+            if not judged and not getattr(answer_gate, "cut", False):
+                _note_broken_stream(hop_pid, hop_model, broken, "messages")
+            message_ended = True        # the except below must not close it
+            return
+        if broken is not None:
+            # Died AFTER its finish_reason: the answer is complete.
+            _log.error("Anthropic stream error after the answer finished: %s",
+                       _stream_error_text(broken))
         if not judged and not getattr(answer_gate, "cut", False):
             # The stream ENDED: file the outcome it never used to (see
             # _record_stream_outcome). The client already has the bytes.
@@ -35851,11 +36116,11 @@ def _anthropic_stream(resp, model_str, input_tokens, line_iter=None, first=_MISS
         message_ended = True
         yield _sse_event("message_stop", {"type": "message_stop"})
     except Exception as exc:
-        # A mid-stream upstream failure (connection reset, ChunkedEncodingError,
-        # read timeout) used to propagate out of this generator and truncate the
-        # SSE body with NO terminal event, which leaves Claude Code waiting forever
-        # on a turn that is already dead. Always close the message properly instead:
-        # the client gets a well-formed (if short) turn and can continue.
+        # A fault in this translator's OWN handling (an upstream that dies is
+        # caught by _upstream_reads and answered with _anthropic_broken_event
+        # above). Propagating would truncate the SSE body with NO terminal
+        # event, which leaves Claude Code waiting forever on a turn that is
+        # already dead. Close the message properly instead.
         # NOTE: `except Exception` deliberately does not catch GeneratorExit, so a
         # normal client disconnect still tears the generator down as before.
         _log.error("Anthropic stream error: %s", _sanitize(str(exc)))

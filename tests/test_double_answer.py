@@ -453,14 +453,33 @@ def test_a_failure_after_the_last_block_never_stops_it_twice(monkeypatch):
     assert [s["index"] for s in stops] == [0]
 
 
-def test_an_upstream_failure_mid_stream_still_ends_well_formed():
+def test_an_upstream_failure_mid_stream_is_never_reported_done():
+    """Was "still ends well-formed" (message_delta + message_stop on the
+    partial turn): that told Claude Code the answer was complete. The body now
+    just ends -- Claude Code's documented dropped-connection retry; see
+    tests/test_broken_stream_retry.py. What WAS sent stays valid: no block
+    stopped twice, no delta to a stopped block, the open tool block (a call
+    that never finished) never stopped."""
     def dies():
         yield _chunk({"content": "Partial answer "})
         yield _chunk({"tool_calls": [{"index": 0, "id": "c", "type": "function",
                                       "function": {"name": "bash", "arguments": "{}"}}]})
         raise ConnectionError("reset")
     body = b"".join(A._anthropic_stream(_Resp(), "max", 10, line_iter=dies())).decode()
-    _assert_well_formed(body)
+    started, stopped = set(), []
+    for e in _events(body):
+        if e.get("type") == "content_block_start":
+            started.add(e["index"])
+        elif e.get("type") == "content_block_delta":
+            assert e["index"] in started and e["index"] not in stopped
+        elif e.get("type") == "content_block_stop":
+            assert e["index"] in started and e["index"] not in stopped
+            stopped.append(e["index"])
+    types = [e.get("type") for e in _events(body)]
+    assert "message_stop" not in types and "message_delta" not in types
+    tool_blocks = [e["index"] for e in _events(body) if e.get("type") == "content_block_start"
+                   and e["content_block"]["type"] == "tool_use"]
+    assert tool_blocks and not set(tool_blocks) & set(stopped)
 
 
 # --------------------------------------------------------------------------- #
