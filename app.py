@@ -11114,9 +11114,18 @@ def _reach_window_for(model_id=None):
             return None
         best = max([_request_capped_window(p, w) for p, _m, w in cands
                     if w and not _is_relay_pid(p)] or [0])
-        return _clamp_declared(best) if best > 0 else None
+        return _clamp_declared(min(best, _REACH_WINDOW_CAP)) if best > 0 else None
     except Exception:                                            # noqa: BLE001
         return None
+
+
+# OWNER DECISION 2026-10-03: the reach is capped at 400K. Above ~262K only one
+# free model (openrouter/stealth/space-bunny-alpha, daily-limited) holds the
+# conversation at all; every turn re-sends it (~4 MB at 1M tokens, minutes on
+# this machine's measured ~20 KB/s uplink), and every model degrades as input
+# grows (Chroma "context rot", 18 models). The CLI compacts at 400K instead;
+# files stay on disk and the hub's exact facts survive every summary.
+_REACH_WINDOW_CAP = 400000
 
 
 def _usable_now(pid, model):

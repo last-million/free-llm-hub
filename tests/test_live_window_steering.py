@@ -149,13 +149,14 @@ def test_steered_clis_are_declared_the_reach_window(monkeypatch):
         for cli in (None, "aider", "claude", "cursor-agent"):
             assert A._declared_window_for(mid, cli=cli) == 262144, (mid, cli)
         for cli in sorted(A._REACH_CLIS):
-            # space-bunny on openrouter holds 1M; google is capped per request
-            assert A._declared_window_for(mid, cli=cli) == 1000000, (mid, cli)
+            # space-bunny on openrouter holds 1M (google is capped per request);
+            # the owner caps the reach at _REACH_WINDOW_CAP (400K).
+            assert A._declared_window_for(mid, cli=cli) == A._REACH_WINDOW_CAP, (mid, cli)
     AC.set_window_provider(A._declared_window_for)
-    assert AC.declared_window("coding-max", cli="opencode") == 1000000
+    assert AC.declared_window("coding-max", cli="opencode") == A._REACH_WINDOW_CAP
     assert AC.declared_window("coding-max", cli="aider") == 262144
     assert AC.declared_window("coding-max") == 262144
-    assert AC.declared_compact_limit("auto", cli="codex") == 1000000 * 96000 // 128000
+    assert AC.declared_compact_limit("auto", cli="codex") == A._REACH_WINDOW_CAP * 96000 // 128000
 
 
 def test_google_counts_with_its_per_request_input_cap(monkeypatch):
@@ -244,15 +245,16 @@ def test_end_to_end_the_cli_is_steered_once_the_1m_provider_runs_dry(monkeypatch
     _quota(monkeypatch)
     ctx = _begin("coding-max", ua="opencode/1.4.2")
     try:
-        assert A._ctx_steer_pair() is None                           # 1M usable: told 1M
+        assert A._ctx_steer_pair() is None                           # 1M usable: no steering
         assert A._reported_prompt_tokens(200000, 0) == 200000
     finally:
         ctx.pop()
     _quota(monkeypatch, waits={"openrouter": 6 * 3600})              # day quota spent
     ctx = _begin("coding-max", ua="opencode/1.4.2")
     try:
-        assert A._ctx_steer_pair() == (1000000, 262144)
-        assert A._reported_prompt_tokens(200000, 0) == round(200000 * 1000000 / 262144)
+        cap = A._REACH_WINDOW_CAP                                     # declared reach (400K)
+        assert A._ctx_steer_pair() == (cap, 262144)
+        assert A._reported_prompt_tokens(200000, 0) == round(200000 * cap / 262144)
     finally:
         ctx.pop()
 
@@ -610,6 +612,17 @@ def test_model_windows_api_shows_reach_and_live(monkeypatch):
     monkeypatch.setattr(A, "_prefetch_auto_models", lambda pids: {"nvidia": ["z-ai/glm-5.3"]})
     with A.app.test_request_context("/api/model-windows"):
         data = A.api_model_windows().get_json()
-    assert data["declared_reach"]["auto"] == 1000000
+    assert data["declared_reach"]["auto"] == A._REACH_WINDOW_CAP
     assert data["live"]["auto"] == 262144
     assert "aider" not in data["steered_clis"] and "opencode" in data["steered_clis"]
+
+
+def test_the_reach_is_capped_at_400k_by_the_owner(monkeypatch):
+    """OWNER DECISION 2026-10-03: a 1M reach let one conversation grow to ~4 MB
+    per turn on a single daily-limited model; the CLI compacts at 400K instead.
+    The live window still reports the 1M model, so nothing is steered while it
+    is usable (live >= declared)."""
+    assert A._REACH_WINDOW_CAP == 400000
+    TD._fleet(monkeypatch, TD._gemini_flood(7))
+    assert A._reach_window_for("coding-max") == 400000
+    assert A._live_window_for("coding-max") == 1000000

@@ -550,7 +550,10 @@ Pure helpers live in `ctxwin.py`; the glue is in app.py. Covered by
   stubbed in conftest). google counts at most 250000 in reach/live
   (`_PROVIDER_REQUEST_TOKEN_CAP`: free-tier input TPM per model, every
   >=250K request 429'd in hub.log). Codex: catalog slug -> its entry, else
-  its fallback metadata 272000.
+  its fallback metadata 272000. OWNER DECISION: the reach is capped at
+  `_REACH_WINDOW_CAP` = 400000 (above ~262K only one daily-limited free model
+  holds the conversation, each turn re-sends it, models degrade with length);
+  the live window is not capped, so nothing is steered while that model is up.
 
 ## Pipelines keep the conversation (2026-09-27)
 
