@@ -245,7 +245,9 @@ def test_one_context_window_for_every_cli():
     # The one declared figure every CLI gets (fixed default until the fleet's
     # windows are known -- see tests/test_model_window_detection.py).
     # One entry per hub tier since 2026-09-27, each sized by the same call.
-    assert "agentic_chat.declared_window(mid)" in body
+    # (cli=: the per-CLI figure since live window steering, 2026-10-03.)
+    assert ("agentic_chat.declared_window(mid)" in body
+            or 'agentic_chat.declared_window(mid, cli="openclaw")' in body)
     assert "for mid in _HUB_TIER_IDS" in body
     assert "200000" not in body
 

@@ -187,7 +187,7 @@ def _hermes_entry(path):
 
 def test_hermes_connect_declares_per_tier_windows_and_disconnect_cleans(tmp_path, monkeypatch):
     monkeypatch.setattr(A.agentic_chat, "declared_window",
-                        lambda mid: {"auto": 200000, "best": 150000}.get(mid, 128000))
+                        lambda mid, cli=None: {"auto": 200000, "best": 150000}.get(mid, 128000))
     hdir = tmp_path / "hermes"
     hdir.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(hdir))
