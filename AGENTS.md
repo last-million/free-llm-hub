@@ -1333,4 +1333,4 @@ system python (PyYAML, tzdata — both missing there until 2026-09-30) passes
 the suite while failing live. Run the suite under the `.venv` after touching
 imports or `requirements.txt`.
 
-The full suite is green (3770 passed); a new failure is a real regression.
+The full suite is green (5985 tests, 2026-10-03); a new failure is a real regression.
