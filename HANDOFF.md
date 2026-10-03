@@ -10,9 +10,9 @@ is only: current state, how to operate, owner rules, open items.
 
 | | |
 |---|---|
-| Branch | `main` @ `f254e9f`, in sync with `origin/main`, nothing uncommitted |
-| Running hub | `f254e9f` on `127.0.0.1:8787` (only this PC) |
-| Tests | 5985 collected; last full run green |
+| Branch | `main` @ `7d5738f`, in sync with `origin/main` (another session's landing-page edits are uncommitted: leave them) |
+| Running hub | `7d5738f` on `127.0.0.1:8787` (only this PC) |
+| Tests | 6040 passed, 1 skipped (2026-10-03) |
 | Keys | 42 provider keys in `config.load_config()` (check after every restart, never print values) |
 | Open PR | #4 by an outside contributor (`osumtr-web`), see "Open items" |
 
@@ -89,6 +89,21 @@ All in `AGENTS.md` with tests; headlines only:
 5. The owner's vectorizer Multi run (`swarm-44ff0fcd1a2a`, conversation
    `47a25faa…`) had step 1 fail ("opencode produced no reply" on qwen3.8);
    check it and press Continue if steps are unfinished.
+
+6. **Live window steering (owner request 2026-10-03, not merged yet).** Goal:
+   the owner never picks `context-max` by hand. CLIs proven to compact from
+   the usage the hub reports get the biggest window their tier can reach;
+   per request the hub scales reported prompt tokens by declared / live
+   window (live = what usable models hold right now), so the CLI compacts in
+   time when the big models are out. Builds on `0ec193f` (3-provider cap +
+   `_resync_declared_windows`) and `d23272f` (native overflow when big models
+   are out for long). Today `context`/`context-max` are capped at 262144 too.
+   If a worktree branch `worktree-agent-*` holds a steering commit, review it,
+   run the full suite once, merge; otherwise rebuild from this spec.
+7. **Next context ideas (research done 2026-10-03, owner to pick):** age-based
+   clearing of old tool results (keep newest ~5, no model call; measured
+   -52% cost, solve rate flat), cache-stable prefix + one provider per
+   conversation, function signatures of files read in the recap.
 
 ## Gotchas
 
