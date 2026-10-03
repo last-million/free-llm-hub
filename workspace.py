@@ -302,36 +302,150 @@ def _venv_python(project_dir):
     return exe if os.path.isfile(exe) else sys.executable
 
 
+# Every setup command has a time limit (2026-10-04 audit: _run_blocking had
+# none, so ONE hung `npm install` -- a registry that stops answering, a
+# postinstall waiting on a prompt nobody can see -- left the preview on
+# "installing dependencies..." forever, with nothing to click).
+# INSTALL_TIMEOUT is for the two DOWNLOADS (npm install, pip install -r): a
+# fresh Next.js/Vite tree is a few hundred MB of packages, which takes 1-3 min
+# on a normal line, so 10 min leaves a slow connection room and still ends.
+# SETUP_TIMEOUT is for local-only setup (python -m venv: MEASURED 10.4 s on
+# this machine, OneDrive folder + antivirus included), so 2 min is >10x that.
+INSTALL_TIMEOUT = 600.0
+SETUP_TIMEOUT = 120.0
+# After the tree is killed: how long to wait for it to die and for the last
+# output it wrote to be read.
+_KILL_WAIT = 5.0
+
+
 def install(project_dir, log):
     """Create the project's own dependency environment. Blocking; the caller runs
-    it on a worker thread. `log(line)` receives progress."""
+    it on a worker thread. `log(line)` receives progress.
+
+    Returns None when every step ran to its end, else the reason one did not
+    (it ran past its time limit and was stopped) -- the caller shows that
+    reason as the preview's error instead of starting a half-installed
+    project. A step that merely FAILED still returns None, as before: the
+    start that follows reports what is missing in the project's own words."""
     pkg = os.path.join(project_dir, "package.json")
     req = os.path.join(project_dir, "requirements.txt")
-    if os.path.isfile(pkg) and not os.path.isdir(os.path.join(project_dir, "node_modules")):
+    nm = os.path.join(project_dir, "node_modules")
+    if os.path.isfile(pkg) and not os.path.isdir(nm):
         log("[hub] npm install (own node_modules for this project)")
-        _run_blocking([_npm("npm"), "install"], project_dir, log)
+        failure = _run_blocking([_npm("npm"), "install"], project_dir, log,
+                                timeout=INSTALL_TIMEOUT, label="npm install")
+        if failure:
+            # detect() reads "node_modules exists" as "installed", so a tree
+            # this killed run left half-written would make the next Run skip
+            # the install and start on broken packages. It did not exist
+            # before this call, so it is ours to remove.
+            _remove_partial(nm, log)
+            return failure
     if os.path.isfile(req):
         vd = _venv_dir(project_dir)
         if not os.path.isdir(vd):
             log("[hub] creating .venv (own python deps for this project)")
-            _run_blocking([sys.executable, "-m", "venv", vd], project_dir, log)
+            failure = _run_blocking([sys.executable, "-m", "venv", vd], project_dir,
+                                    log, timeout=SETUP_TIMEOUT,
+                                    label="creating the project's .venv")
+            if failure:
+                _remove_partial(vd, log)
+                return failure
         log("[hub] pip install -r requirements.txt")
-        _run_blocking([_venv_python(project_dir), "-m", "pip", "install",
-                       "-q", "-r", "requirements.txt"], project_dir, log)
+        failure = _run_blocking([_venv_python(project_dir), "-m", "pip", "install",
+                                 "-q", "-r", "requirements.txt"], project_dir, log,
+                                timeout=INSTALL_TIMEOUT,
+                                label="pip install -r requirements.txt")
+        if failure:
+            return failure      # needs_install stays true: the next Run retries
+    return None
 
 
-def _run_blocking(argv, cwd, log):
+def _remove_partial(path, log):
+    shutil.rmtree(path, ignore_errors=True)
+    if os.path.isdir(path):
+        log("[hub] could not fully remove the half-written %s; delete it before "
+            "the next Run" % os.path.basename(path))
+
+
+def _kill_tree(popen, sig=None):
+    """Kill `popen` AND everything it started. npm runs the real work in a
+    child (cmd -> node), pip in its own subprocesses, and a venv python on
+    Windows is a launcher with the real interpreter as its child -- killing
+    only the top process leaves those running. Windows: `taskkill /T` walks the
+    tree by parent PID. POSIX: the process was started in its own session, so
+    its group id is its pid and killpg takes every member. Never raises."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(popen.pid)],
+                           capture_output=True, timeout=15,
+                           creationflags=_NO_WINDOW)
+        else:
+            import signal
+            sig = signal.SIGKILL if sig is None else sig
+            try:
+                pgid = os.getpgid(popen.pid)
+            except OSError:
+                pgid = popen.pid    # leader gone; the group outlives it
+            os.killpg(pgid, sig)
+    except Exception:                                            # noqa: BLE001
+        try:
+            popen.kill()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+def _run_blocking(argv, cwd, log, timeout=None, label=None):
+    """Run a setup command, streaming its output to `log`. Returns None when
+    it ran to its end (whatever its exit code), else the reason it did not:
+    past `timeout` seconds the whole process tree is killed and the reason
+    reads "<label> did not finish in N s". timeout None = no limit."""
+    label = label or os.path.basename(str(argv[0]))
     try:
         p = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True,
                              encoding="utf-8", errors="replace",
-                             creationflags=_NO_WINDOW)
+                             creationflags=_NO_WINDOW,
+                             # Own group on POSIX, so _kill_tree's killpg takes
+                             # its children and never the hub's own group.
+                             start_new_session=(os.name != "nt"))
     except (OSError, ValueError) as exc:
         log("[hub] could not run %s: %s" % (argv[0], exc))
-        return
-    for line in p.stdout:
-        log(line.rstrip())
-    p.wait()
+        return None
+
+    # The output is read on its own thread so the wait below can give up:
+    # reading it inline (as this used to) blocks until EVERY process holding
+    # the pipe exits, which a hung install never does.
+    def pump():
+        try:
+            for line in p.stdout:
+                log(line.rstrip())
+        except Exception:                                        # noqa: BLE001
+            pass
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(p)
+        try:
+            p.wait(timeout=_KILL_WAIT)
+        except subprocess.TimeoutExpired:
+            pass
+        reader.join(_KILL_WAIT)     # what it printed up to the kill is logged
+        reason = "%s did not finish in %d s" % (label, int(round(timeout)))
+        log("[hub] %s -- stopped it and everything it started; press Run to "
+            "try again" % reason)
+        return reason
+    # It exited in time. Something it started in the background can still
+    # hold the pipe open; read what is left, but not forever.
+    reader.join(None if deadline is None
+                else max(_KILL_WAIT, deadline - time.monotonic()))
+    if reader.is_alive():
+        log("[hub] %s finished, but a process it started still holds its "
+            "output open; not waiting for it" % label)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -591,7 +705,17 @@ def start(project_dir, on_done=None):
                 proc.state = "stopped"
                 return
             if spec["needs_install"]:
-                install(run_dir, proc.log)
+                failure = install(run_dir, proc.log)
+                if failure:
+                    # A setup step ran out of time and was killed: say so on
+                    # the preview instead of starting on half the packages.
+                    if proc.stopping:
+                        proc.state = "stopped"
+                    else:
+                        proc.state = "failed"
+                        proc.error = ("%s; the hub stopped it -- press Run to "
+                                      "try again" % failure)
+                    return
             proc.state = "starting"
             argv = _argv_with_port(spec["argv"], spec["kind"], port)
             if spec["kind"].startswith("python:"):
@@ -709,20 +833,10 @@ def stop(project_dir):
         # the worker went on to spawn an untracked server on a reserved port.
         proc.state = "stopped"
         return True
-    try:
-        if os.name == "nt":
-            # taskkill /T is what actually takes npm's grandchildren on Windows;
-            # terminate() alone leaves the real server holding the port.
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.popen.pid)],
-                           capture_output=True, timeout=15,
-                           creationflags=_NO_WINDOW)
-        else:
-            os.killpg(os.getpgid(proc.popen.pid), 15)
-    except Exception:                                            # noqa: BLE001
-        try:
-            proc.popen.kill()
-        except Exception:                                        # noqa: BLE001
-            pass
+    # taskkill /T is what actually takes npm's grandchildren on Windows;
+    # terminate() alone leaves the real server holding the port. POSIX: a
+    # SIGTERM to the preview's own process group.
+    _kill_tree(proc.popen, 15)
     proc.state = "stopped"
     return True
 

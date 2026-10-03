@@ -1415,6 +1415,21 @@ and the final score is capped at `arena.HUB_CAP` (134.5, under every owner
 floor) after all bonuses. Known models never move. `/api/tracking` rows carry
 `arena_rating` / `arena_rank`; `GET /api/arena` = the board.
 
+## Preview setup commands always end (2026-10-04)
+
+- `workspace.install` (npm install / python -m venv / pip install -r, run
+  before a preview starts) goes through `_run_blocking(..., timeout=, label=)`:
+  `INSTALL_TIMEOUT` 600 s for the two downloads, `SETUP_TIMEOUT` 120 s for venv
+  creation (MEASURED 10.4 s here). Past it `_kill_tree` kills the WHOLE tree
+  (Windows `taskkill /F /T /PID`, POSIX killpg of its own session; `stop()`
+  uses the same helper), output up to the kill stays in the log, a half-written
+  `node_modules`/`.venv` it created is removed, and the preview goes `failed`
+  with "<step> did not finish in N s; the hub stopped it -- press Run to try
+  again". Before, one hung install left it on "installing dependencies..."
+  forever. A non-zero exit still returns None (the start reports it). Output is
+  read on its own thread, so a grandchild holding the pipe cannot hang it
+  either. Covered by `tests/test_install_timeout.py` (real child + grandchild).
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):
