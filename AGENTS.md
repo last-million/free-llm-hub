@@ -500,6 +500,22 @@ Pure helpers live in `ctxwin.py`; the glue is in app.py. Covered by
   best/max, clamped 32K..1M; fixed 128000 when unregistered or too few
   known) sizes opencode `limit.context`, the codex catalog + fallback,
   Pi, openclaw and Kimi.
+- **Declared = what 3 providers hold** (2026-10-03, MEASURED: a ~326K-token
+  OpenCode session got 503s because coding-max/-multi were declared 500000 —
+  Gemini flash variants + g4f copies, all 1M on ONE exhausted Google quota,
+  outnumbered the rows). The P25 is now capped at the 3rd-largest window
+  among DISTINCT NON-RELAY providers (`_declared_provider_windows`: one
+  largest window per pid, `_is_relay_pid` never counts; fewer providers =
+  the window every one holds; only relay windows known = None);
+  `_DECLARED_MIN_PROVIDERS` = 3. Pinned `<pid>/<model>` unchanged.
+  `_resync_declared_windows` rewrites ONLY the hub's own window fields of
+  CLIs still wired to the hub (opencode real + isolated seed — a user's
+  (context, output) pair that breaks the hub's shape stays —, codex catalog
+  via `_refresh_codex_catalog`, claude settings env, pi, qwen, openclaw,
+  aider metadata, hermes, kimi), no new `.freehub-bak`; boot pass after the
+  warm-up, then `_declared_resync_loop` every 30 min when the figures
+  changed. conftest stubs it. Covered by
+  `tests/test_declared_window_providers.py`.
 
 ## Pipelines keep the conversation (2026-09-27)
 

@@ -110,6 +110,11 @@ def _stop_never_touches_real_clis(monkeypatch):
     monkeypatch.setattr(app, "_disconnect_all_clis",
                         lambda: {"disconnected": [], "failed": []})
     monkeypatch.setattr(app, "_reconnect_clis_after_stop", lambda: [])
+    # The declared-window resync (boot pass + periodic check) rewrites the
+    # window fields of every CLI wired to the hub -- the owner's real files.
+    # tests/test_declared_window_providers.py runs the real one on temp homes.
+    monkeypatch.setattr(app, "_resync_declared_windows", lambda: [])
+    monkeypatch.setattr(app, "_start_declared_window_resync", lambda: None)
     yield
 
 

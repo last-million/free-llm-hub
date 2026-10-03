@@ -1441,6 +1441,9 @@ def _warm_catalogs_async():
             with _declared_lock:
                 _declared_fleet_cache[1] = None
             _refresh_codex_catalog()
+            # ...and every connected CLI's config follows (written at Connect
+            # with whatever was declared then -- _resync_declared_windows).
+            _resync_declared_windows_if_changed(force=True)
         except Exception as exc:                                 # noqa: BLE001
             _log.debug("[warm] catalog warm-up skipped: %s", exc)
     threading.Thread(target=_usage_source_as("warm-up")(_go), name="warm-catalogs",
@@ -10824,10 +10827,27 @@ def _log_ctx_coverage(catalogs=None):
 # the rest as it always has. Too few known (fewer than 5, or under a third of
 # the candidates) -> None, and agentic_chat falls back to its fixed default.
 # Built from the discovery CACHE only: never a network call.
+#
+# ...and never more than _DECLARED_MIN_PROVIDERS distinct NON-RELAY providers
+# hold. MEASURED 2026-10-03: an OpenCode conversation reached ~326K tokens and
+# every request got 503. coding / coding-max / coding-multi had been declared
+# 500000, because the percentile counts one row per (provider, model) and the
+# Gemini flash variants (3.5/3.6/3.7/3.8, -latest, plus the g4f relay copies,
+# all 1M) outnumber everything else -- yet they share ONE Google quota, which
+# was exhausted (429). Apart from them only stealth/space-bunny-alpha on
+# OpenRouter (1M, daily limit used) held that much; nvidia's glm-5.3 / kimi-k3
+# hold ~250K, kilocode's qwen3.8-27b 262K, so every one raised
+# _ContextOverflow and OpenCode, told 500K, never compacted. So each provider
+# counts ONCE (its largest eligible window) and relays (g4f: copies of other
+# providers' models) not at all, and the declaration is capped at the window
+# the 3rd-largest provider holds: two providers may run dry and the
+# conversation still fits somewhere. Fewer eligible providers -> the window
+# every one of them holds. With that fleet: 262144 instead of 500000.
 # --------------------------------------------------------------------------- #
 _DECLARED_PCTL = 0.25
 _DECLARED_MIN_KNOWN = 5
 _DECLARED_MIN_SHARE = 1.0 / 3
+_DECLARED_MIN_PROVIDERS = 3
 _DECLARED_FLEET_TTL = 30.0
 _declared_fleet_cache = [0.0, None]
 _declared_lock = threading.Lock()
@@ -10897,8 +10917,8 @@ def _declared_window_for(model_id=None):
                 continue
             if s < min_score:
                 continue
-            cands.append(w)
-        return cands, sorted(w for w in cands if w)
+            cands.append((p, w))
+        return cands, sorted(w for _p, w in cands if w)
 
     cands, wins = _pick(floor)
     if len(wins) < _DECLARED_MIN_KNOWN:
@@ -10906,8 +10926,24 @@ def _declared_window_for(model_id=None):
     if len(wins) < _DECLARED_MIN_KNOWN or len(wins) < len(cands) * _DECLARED_MIN_SHARE:
         return None
     w = wins[int(_DECLARED_PCTL * (len(wins) - 1))]
+    held = _declared_provider_windows(cands)
+    if not held:
+        return None                          # every known window is a relay's
+    w = min(w, held[min(_DECLARED_MIN_PROVIDERS, len(held)) - 1])
     return max(agentic_chat._DECLARED_WINDOW_MIN,
                min(agentic_chat._DECLARED_WINDOW_MAX, int(w)))
+
+
+def _declared_provider_windows(cands):
+    """Largest known window per distinct NON-RELAY provider among `cands`
+    [(pid, window or None)], biggest first. A relay (_is_relay_pid) re-serves
+    other providers' models, so it never counts as one more provider that can
+    hold a conversation (see _DECLARED_MIN_PROVIDERS)."""
+    per = {}
+    for p, w in cands:
+        if w and not _is_relay_pid(p):
+            per[p] = max(per.get(p, 0), int(w))
+    return sorted(per.values(), reverse=True)
 
 
 def _ctx_limit(pid, model):
@@ -23952,6 +23988,308 @@ _AUTOFIXERS = {
     "hermes": _autofix_hermes,
     "kimi": _autofix_kimi,
 }
+
+
+# --------------------------------------------------------------------------- #
+# DECLARED-WINDOW RESYNC: connected CLIs follow the fleet
+# --------------------------------------------------------------------------- #
+# Connect writes each tier's declared window (agentic_chat.declared_window)
+# into the CLI's config ONCE. MEASURED 2026-10-03: after the rule behind it
+# changed, ~/.config/opencode/opencode.json still said limit.context 500000 for
+# coding / coding-max / coding-multi and the isolated /agent seed 1000000, so
+# a ~326K-token session got 503s instead of compacting. This rewrites ONLY the
+# hub's own window fields (the tier entries Connect wrote, nothing else), ONLY
+# in a config still wired to the hub, once the fleet is warm at boot and then
+# whenever the declared figures change (checked every _DECLARED_RESYNC_EVERY).
+# Formats as each Connect writes them. No .freehub-bak is taken: a connected
+# CLI already has its Connect-time one, and a backup made now would hold a
+# hub-wired file -- Disconnect reads the ABSENCE of one as "Connect created
+# this file" and deletes it. Never raises; nothing is written when nothing
+# changed. tests/test_declared_window_providers.py.
+# --------------------------------------------------------------------------- #
+_DECLARED_RESYNC_EVERY = 1800.0
+_declared_resync_last = [None]     # signature of the figures the last pass applied
+
+
+def _set_window(d, key, want):
+    """d[key] = want when d holds a DIFFERENT number there; True if changed.
+    A field the file does not have is not added."""
+    if isinstance(d, dict) and key in d and d[key] != want:
+        d[key] = want
+        return True
+    return False
+
+
+def _resync_json_file(path, fix, write):
+    """Read `path` as a JSON object, let fix(data) edit it in place (returns
+    True on a change) and write it back with write(path, data). [path] when
+    rewritten, else []."""
+    data, ok = _read_json_object(path)
+    if not ok or not fix(data):
+        return []
+    write(path, data)
+    return [path]
+
+
+def _json_write_like_connect(path, data):
+    _cli_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def _resync_opencode_windows():
+    """The terminal opencode config and the isolated /agent seed."""
+    out = []
+    for path in (_p_opencode(),
+                 os.path.join(agentic_chat._isolated_config_dir("opencode"),
+                              "opencode", "opencode.json")):
+        if agentic_chat.resync_opencode_windows(path):
+            out.append(path)
+    return out
+
+
+def _resync_pi_windows():
+    def fix(data):
+        provs = data.get("providers")
+        blk = provs.get("free-llm-hub") if isinstance(provs, dict) else None
+        if not isinstance(blk, dict) or not _points_at_hub(blk.get("baseUrl")):
+            return False
+        changed = False
+        for m in blk.get("models") or ():
+            if isinstance(m, dict) and m.get("id") in _HUB_TIER_IDS:
+                changed |= _set_window(m, "contextWindow",
+                                       agentic_chat.declared_window(m["id"]))
+        return changed
+    return _resync_json_file(_p_pi_models(), fix,
+                             lambda p, d: _cli_write_text(p, json.dumps(d, indent=2) + "\n"))
+
+
+def _resync_aider_windows():
+    try:
+        with open(_p_aider(), "r", encoding="utf-8-sig", errors="ignore") as f:
+            wired = any(fr in f.read() for fr in _hub_fragments())
+    except OSError:
+        wired = False
+    if not wired:
+        return []
+
+    def fix(data):
+        changed = False
+        for mid in _HUB_TIER_IDS:
+            changed |= _set_window(data.get("openai/" + mid), "max_input_tokens",
+                                   agentic_chat.declared_window(mid))
+        return changed
+    return _resync_json_file(_p_aider_metadata(), fix,
+                             lambda p, d: _cli_write_text(p, json.dumps(d, indent=2) + "\n"))
+
+
+def _resync_qwen_windows():
+    def fix(data):
+        mp = data.get("modelProviders")
+        entries = mp.get("openai") if isinstance(mp, dict) else None
+        changed = False
+        for p in entries if isinstance(entries, list) else ():
+            if _qwen_is_hub_provider(p) and p.get("id") in _HUB_TIER_IDS:
+                changed |= _set_window(p.get("generationConfig"), "contextWindowSize",
+                                       agentic_chat.declared_window(p["id"]))
+        return changed
+    spath = os.path.join(os.path.dirname(_p_qwen_env()), "settings.json")
+    return _resync_json_file(spath, fix, _json_write_like_connect)
+
+
+def _resync_openclaw_windows():
+    def fix(data):
+        models = data.get("models")
+        provs = models.get("providers") if isinstance(models, dict) else None
+        blk = provs.get("freehub") if isinstance(provs, dict) else None
+        if not isinstance(blk, dict) or not _points_at_hub(blk.get("baseUrl")):
+            return False
+        changed = False
+        for m in blk.get("models") or ():
+            if isinstance(m, dict) and m.get("id") in _HUB_TIER_IDS:
+                changed |= _set_window(m, "contextWindow",
+                                       agentic_chat.declared_window(m["id"]))
+        return changed
+    return _resync_json_file(_p_openclaw(), fix, _json_write_like_connect)
+
+
+def _resync_claude_windows():
+    """Claude Code's compaction window lives in settings.json `env` (one
+    figure, declared_window(None) -- see agentic_chat.claude_hub_env)."""
+    def fix(data):
+        env = data.get("env")
+        if not isinstance(env, dict) or not _points_at_hub(env.get("ANTHROPIC_BASE_URL")):
+            return False
+        hub_env = agentic_chat.claude_hub_env()
+        changed = False
+        for k in ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_CODE_MAX_CONTEXT_TOKENS"):
+            changed |= _set_window(env, k, hub_env[k])
+        return changed
+    return _resync_json_file(_p_claude(), fix, _json_write_like_connect)
+
+
+def _resync_hermes_windows():
+    path = _p_hermes()
+    if not os.path.isfile(path):
+        return []
+    import yaml
+    with open(path, "r", encoding="utf-8-sig") as f:
+        data = yaml.safe_load(f)
+    blk = (data.get("providers") or {}).get(_HERMES_PROVIDER_KEY) \
+        if isinstance(data, dict) and isinstance(data.get("providers"), dict) else None
+    if not isinstance(blk, dict) or not _points_at_hub(blk.get("api")):
+        return []
+    changed = _set_window(blk, "context_length", int(agentic_chat.declared_window("auto")))
+    models = blk.get("models")
+    for mid in _HUB_TIER_IDS:
+        if isinstance(models, dict):
+            changed |= _set_window(models.get(mid), "context_length",
+                                   int(agentic_chat.declared_window(mid)))
+    if not changed:
+        return []
+    _cli_write_text(path, yaml.safe_dump(data, default_flow_style=False, sort_keys=False,
+                                         allow_unicode=True))
+    return [path]
+
+
+_KIMI_CTX_LINE_RE = re.compile(r"^(\s*max_context_size\s*=\s*)(\d+)(.*)$")
+
+
+def _kimi_resync_text(text):
+    """(new_text, changed): max_context_size of every [models."<tier>"] alias
+    that points at the hub's [providers.free-hub] (and only when that provider
+    points at this hub) set to the tier's declared window. Every other byte
+    stays, line endings included."""
+    lines = text.splitlines(keepends=True)
+    tables, cur = [], None            # [(name, first body line, end)]
+    for i, ln in enumerate(lines):
+        if _CODEX_TABLE_RE.match(ln):
+            if cur:
+                tables.append((cur[0], cur[1], i))
+            cur = (ln.strip().strip("[]").strip(), i + 1)
+    if cur:
+        tables.append((cur[0], cur[1], len(lines)))
+    body = {name: (a, b) for name, a, b in tables}
+    prov = body.get("providers.free-hub")
+    if not prov or not any(_points_at_hub(ln) for ln in lines[prov[0]:prov[1]]
+                           if re.match(r"^\s*base_url\s*=", ln)):
+        return text, False
+    changed = False
+    for mid in _HUB_TIER_IDS:
+        span = body.get('models."%s"' % mid)
+        if not span or not any(re.match(r'^\s*provider\s*=\s*["\']free-hub["\']\s*$', ln)
+                               for ln in lines[span[0]:span[1]]):
+            continue
+        want = int(agentic_chat.declared_window(mid))
+        for i in range(span[0], span[1]):
+            m = _KIMI_CTX_LINE_RE.match(lines[i].rstrip("\r\n"))
+            if m and int(m.group(2)) != want:
+                eol = lines[i][len(lines[i].rstrip("\r\n")):]
+                lines[i] = "%s%d%s%s" % (m.group(1), want, m.group(3), eol)
+                changed = True
+    return "".join(lines), changed
+
+
+def _resync_kimi_windows():
+    out = []
+    for path in _kimi_config_paths():
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+                text = f.read()
+        except OSError:
+            continue
+        new, changed = _kimi_resync_text(text)
+        if changed:
+            _cli_write_text(path, new)
+            out.append(path)
+    return out
+
+
+def _resync_codex_windows():
+    """The /model catalog: rebuilt by _refresh_codex_catalog (the only writer
+    that knows codex's entry schema) when a hub entry's window is stale."""
+    cfg = _p_codex()
+    cat = _codex_catalog_path(cfg)
+    if not _codex_wired_to_hub(cfg) or not _codex_catalog_is_hubs(cat):
+        return []
+    data, ok = _read_json_object(cat)
+    stale = ok and any(
+        isinstance(e, dict) and str(e.get("display_name") or "").endswith("(Calvoun hub)")
+        and e.get("context_window") != agentic_chat.declared_window(e.get("slug"))
+        for e in data.get("models") or ())
+    if not stale:
+        return []
+    with open(cat, "rb") as f:
+        before = f.read()
+    _refresh_codex_catalog(cfg)
+    try:
+        with open(cat, "rb") as f:
+            return [cat] if f.read() != before else []
+    except OSError:
+        return []
+
+
+_DECLARED_RESYNCERS = (
+    ("opencode", "_resync_opencode_windows"), ("codex", "_resync_codex_windows"),
+    ("claude", "_resync_claude_windows"), ("pi", "_resync_pi_windows"),
+    ("qwen", "_resync_qwen_windows"), ("openclaw", "_resync_openclaw_windows"),
+    ("aider", "_resync_aider_windows"), ("hermes", "_resync_hermes_windows"),
+    ("kimi", "_resync_kimi_windows"),
+)
+
+
+def _resync_declared_windows():
+    """Rewrite the declared-window fields of every CLI still wired to the hub
+    to the current agentic_chat.declared_window figures. Returns
+    [(cli, path)] for every file rewritten. Never raises: one CLI's unreadable
+    config never stops the others."""
+    done = []
+    for cid, fn_name in _DECLARED_RESYNCERS:
+        try:
+            for path in globals()[fn_name]() or ():
+                done.append((cid, path))
+        except Exception as exc:                                 # noqa: BLE001
+            _log.debug("[ctx] declared-window resync of %s skipped: %s", cid, exc)
+    if done:
+        _log.info("[ctx] declared windows resynced: %s",
+                  ", ".join("%s (%s)" % (c, _short(p)) for c, p in done))
+    return done
+
+
+def _declared_window_signature():
+    """Every figure a CLI config can carry, as one comparable value."""
+    ids = set(agentic_chat._opencode_hub_models()) | set(_HUB_TIER_IDS) \
+        | {MODE_ALL} | set(_mode_keys())
+    return tuple(sorted((mid, agentic_chat.declared_window(mid)) for mid in ids)) \
+        + (("<none>", agentic_chat.declared_window(None)),)
+
+
+def _resync_declared_windows_if_changed(force=False):
+    """_resync_declared_windows when the declared figures differ from the last
+    pass (always with force=True). Never raises."""
+    try:
+        sig = _declared_window_signature()
+        if not force and sig == _declared_resync_last[0]:
+            return []
+        done = _resync_declared_windows()
+        _declared_resync_last[0] = sig
+        return done
+    except Exception as exc:                                     # noqa: BLE001
+        _log.debug("[ctx] declared-window resync skipped: %s", exc)
+        return []
+
+
+def _declared_resync_loop():
+    while True:
+        time.sleep(_DECLARED_RESYNC_EVERY)
+        _resync_declared_windows_if_changed()
+
+
+def _start_declared_window_resync():
+    """The periodic check (the boot pass runs from _warm_catalogs_async)."""
+    try:
+        threading.Thread(target=_declared_resync_loop, daemon=True,
+                         name="declared-resync").start()
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 # --- Disconnect / revert: turn an auto-fixed CLI back to its NORMAL config ----
@@ -37530,6 +37868,7 @@ if __name__ == "__main__":
     vision_status.start_heartbeat()
     _warm_catalogs_async()     # so the first CLI to ask does not pay the sweep
     _repair_opencode_config()  # a limitless model entry is a session that never compacts
+    _start_declared_window_resync()   # connected CLIs follow a changed declared window
     threading.Thread(target=_start_playwright_mcp, daemon=True,
                      name="playwright-mcp").start()   # one browser, kept between turns
     threading.Thread(target=_refresh_codex_catalog, daemon=True,

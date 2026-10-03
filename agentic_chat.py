@@ -875,8 +875,10 @@ _CODEX_COMPACT_LIMIT = 96000
 # DECLARED windows follow the fleet. The two figures above are now only the
 # FAIL-SAFE: app.py registers a provider at startup (set_window_provider) that
 # returns, per hub id, a window most of the models that id can route to
-# actually hold (the 25th percentile of their known windows -- see
-# app._declared_window_for). This module must not import app (cycle), hence
+# actually hold (the 25th percentile of their known windows, capped at what
+# three distinct non-relay providers hold -- see app._declared_window_for;
+# app._resync_declared_windows carries a changed figure into the configs of
+# the CLIs still wired to the hub). This module must not import app (cycle), hence
 # the callback. Unregistered, failing, or "too few known" -> the fixed default.
 # --------------------------------------------------------------------------- #
 _DECLARED_WINDOW_MIN = 32000
@@ -1480,6 +1482,59 @@ def _upgrade_opencode_seed(target):
         os.replace(tmp, target)
     except Exception:                                            # noqa: BLE001
         pass                    # a stale seed is a clear error later, not a crash
+
+
+def _opencode_limit_is_hubs(lim):
+    """Is this `limit` one the hub wrote? _opencode_hub_models always pairs a
+    context with output = min(_HUB_MAX_OUTPUT, context // 4) -- the old fixed
+    128000/16384 included. A pair that breaks that shape (the user's raised
+    window with their own reserve, say 999999/4096) is theirs and stays."""
+    if not isinstance(lim, dict):
+        return False
+    ctx = lim.get("context")
+    if isinstance(ctx, bool) or not isinstance(ctx, int) or ctx <= 0:
+        return False
+    return lim.get("output") in (None, min(_HUB_MAX_OUTPUT, ctx // 4))
+
+
+def resync_opencode_windows(target):
+    """Bring the hub's own `limit` of every hub id in an opencode config the
+    hub WIRED (provider free-llm-hub pointing at this hub) to the current
+    declared window. Only those two fields of existing entries change -- no
+    entry is added (that is _upgrade_opencode_seed's job), nothing else is
+    touched, and nothing is written when nothing changed. Unlike
+    _upgrade_opencode_seed, which runs at boot before the fleet is known and so
+    follows only the old fixed figure, this follows ANY window the hub wrote
+    (app._resync_declared_windows calls it once the fleet is warm). Returns
+    True when the file was rewritten. Never raises."""
+    try:
+        if not target or not os.path.isfile(target):
+            return False
+        with open(target, encoding="utf-8-sig") as fh:
+            cfg = json.load(fh)
+        prov = (cfg.get("provider") or {}).get(_OPENCODE_PROVIDER_ID) \
+            if isinstance(cfg, dict) else None
+        if not isinstance(prov, dict) or \
+                not _points_at_hub((prov.get("options") or {}).get("baseURL")):
+            return False                    # not wired to the hub: not ours to edit
+        models = prov.get("models")
+        if not isinstance(models, dict):
+            return False
+        changed = False
+        for mid, spec in _opencode_hub_models().items():
+            cur = models.get(mid)
+            lim = cur.get("limit") if isinstance(cur, dict) else None
+            if not _opencode_limit_is_hubs(lim):
+                continue
+            want = spec["limit"]
+            if lim.get("context") != want["context"] or lim.get("output") != want["output"]:
+                lim["context"], lim["output"] = want["context"], want["output"]
+                changed = True
+        if changed:
+            _write_json_atomic(target, cfg)
+        return changed
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 # The provider id the seed registers this hub under -- also what the per-
