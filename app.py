@@ -63,6 +63,7 @@ except Exception:  # pragma: no cover - jinja2 always ships with flask
         pass
 
 import agentic_chat
+import agent_servers
 import agentic_history
 import antigravity
 import secretstore

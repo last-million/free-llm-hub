@@ -52,3 +52,11 @@ def test_the_boot_calls_it_before_any_turn():
     src = open("app.py", encoding="utf-8").read()
     boot = src[src.index("    _mark_runtime_started()\n"):][:900]
     assert "agent_servers.stop_stale_agent_clis()" in boot
+
+
+def test_the_boot_can_reach_it():
+    # MEASURED 2026-10-03, hub.log: "[boot] could not check for leftover
+    # agent CLIs: name 'agent_servers' is not defined" -- the call above sat in
+    # app.py with no import of the module, so the boot pass never ran.
+    import app
+    assert app.agent_servers.stop_stale_agent_clis is S.stop_stale_agent_clis
