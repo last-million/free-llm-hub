@@ -10,9 +10,9 @@ is only: current state, how to operate, owner rules, open items.
 
 | | |
 |---|---|
-| Branch | `main` @ `90ada7d`, in sync with `origin/main` (another session's landing-page edits are uncommitted: `app.py` `/`+`/hub` routes, `make_landing.py`, `templates/landing.html`, `static/*.webp|jpg` — LEAVE THEM, and never `git add -A`: use explicit paths) |
-| Running hub | `90ada7d` on `127.0.0.1:8787` (only this PC) |
-| Tests | 6733 passed, 1 skipped (2026-10-04) |
+| Branch | `main` @ `117579d`, in sync with `origin/main` (another session's landing-page edits are uncommitted: `app.py` `/`+`/hub` routes, `make_landing.py`, `templates/landing.html`, `static/*.webp|jpg` — LEAVE THEM, and never `git add -A`: use explicit paths) |
+| Running hub | `117579d` on `127.0.0.1:8787` (only this PC) |
+| Tests | 6765 passed, 1 skipped (2026-10-04) |
 | Keys | 42 provider keys in `config.load_config()` (check after every restart, never print values) |
 | Open PR | #4 by an outside contributor (`osumtr-web`), see "Open items" |
 
@@ -68,6 +68,19 @@ All in `AGENTS.md` with tests; headlines only. These sit ON TOP of the
   at design time + checked in finished web files (`slopcheck.py`, feeds the one
   revision). Flags: `tool_turn_race`, `pipeline_search`, `model_guides`,
   `turn_verifier`. Eval: `scripts/role_eval.py` + `state_dir()/turn-roles.jsonl`.
+- **Team notes (`117579d`)**: on a HARD, fresh-instruction tool turn (not a loop
+  continuation, not trivial, <= 60K tokens, not a CLI compaction) the hub runs 2-3
+  DIFFERENT models in parallel on read-only jobs (scout, critic, designer for
+  build/web work), merges their notes with NO model call (<= 2500 chars, cached
+  per conversation) and gives the brief to the actor. Flag `tool_turn_specialists`
+  (default on). Activity shows `specialist: <role>` chips; header
+  `X-Free-LLM-Hub-Roles` has `specialists=N`; `turn-roles.jsonl` rows carry them.
+  FIRST LIVE PROBE (2026-10-04, coding-multi): scout + designer timed out (25 s,
+  free models slow/429), critic answered, 5 calls total (design estimate was 3-4).
+  Tune the specialist timeout / pick only models with fast measured TTFT if most
+  specialists keep timing out.
+- **Tests**: conftest pins the bandit tie-breaker to 0 outside files that mention
+  `bandit` (it made `test_model_mode` flaky, 4/15 runs).
 - **Context**: OpenCode 503 loop fixed (declared windows capped at what 3
   non-relay providers hold, reach window per-CLI, google 250K per-request cap);
   native "context too long" when only out-for-long big models fit; a CLI's own
@@ -130,7 +143,8 @@ All in `AGENTS.md` with tests; headlines only:
    (freebuff.com/terms-of-service) forbids multiple accounts, bot/script/tmux
    control, and proxying its models — so `fbuff.sh` and any hub integration are
    out. Use Freebuff by hand only.
-7. **Verify the orchestration live, then measure:** run real tool turns and
+7. **Verify the orchestration live, then measure** (the specialists have ONE live
+   probe so far, see above): run real tool turns and
    `python scripts/role_eval.py` to compare roles vs the old race (calls/turn,
    input tokens, zero-answer rate) from `turn-roles.jsonl` vs hub.log. The
    token-saving and verifier fix/break claims are DESIGN estimates, not yet
