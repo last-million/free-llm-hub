@@ -18346,8 +18346,15 @@ def _multi_record(session_id, run):
             tools = [e.get("text") for a in run.agents for e in list(a.events)
                      if isinstance(e, dict) and e.get("event") == "tool"
                      and e.get("text")][-200:]
+            # Verified commands come ONLY from what the phases were OBSERVED
+            # to run (their evidence rows), never from the report's words.
+            observed = [e for a in run.agents for e in list(getattr(a, "evidence", None) or ())
+                        if isinstance(e, dict)][-200:]
+            receipt = next((a.receipt for a in reversed(run.agents)
+                            if getattr(a, "receipt", None)), None)
             memory.harvest_facts(session_id, request=run.goal, reply=report,
-                                 project_dir=run.project_dir, tools=tools)
+                                 project_dir=run.project_dir, tools=tools,
+                                 results=observed, receipt=receipt)
         else:
             doing = ["phase %d %s: %s" % (a.index, a.title, a.state) for a in run.agents]
             memory.note_interrupted(session_id, request=run.goal, doing=doing,
@@ -21659,7 +21666,11 @@ def _multi_run_plan(session_id, project_dir=None):
                           "model": model, "session_id": a.session_id or None,
                           "url": ("/agent/" + a.session_id) if a.session_id else None,
                           "started_at": a.started_at, "ended_at": a.ended_at,
-                          "last": _multi_last_action(a)})
+                          "last": _multi_last_action(a),
+                          # What the phase's result rests on, honestly
+                          # labelled: "12 passed (observed)" / "claimed,
+                          # not checked" / "reviewed" (swarm_windows.check_of).
+                          "check": swarm_windows.check_of(a)})
         running = [t["index"] for t in items if t["doing"]]
         # The stopping place stays visible next to the helpers: a run that was
         # cut short (or a turn cut by a restart) still offers Continue.

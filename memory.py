@@ -52,6 +52,8 @@ import tempfile
 import threading
 import time
 
+import evidence                      # pure: observed test/build verdicts
+
 _log = logging.getLogger("free-llm-hub")
 
 # One file per conversation, beside the rest of the hub's state.
@@ -1248,13 +1250,8 @@ _VERIFY_CMD_RE = re.compile(
     r"go (?:test|build|vet)|make (?:test|build|check)|tsc\b|vitest|jest|"
     r"mvn (?:test|package|verify)|gradlew? (?:test|build)|dotnet (?:test|build)|"
     r"ruff|flake8|mypy|eslint)", re.I)
-_PASSED_RE = re.compile(
-    r"\b(tests? pass(?:ed|es|ing)?|all (?:\d+ )?(?:tests? )?pass(?:ed|ing)?|"
-    r"\d+ passed|pass(?:ed|es) (?:cleanly|locally)|build (?:succeeded|passes|passed|is green|ok)|"
-    r"succeeded|green|no (?:errors|failures)|0 failed|compiles? cleanly)\b", re.I)
-_FAILED_RE = re.compile(
-    r"\b([1-9]\d* (?:failed|failing|errors?)|tests? (?:fail|failed|failing)|"
-    r"build failed|still fail\w*|could not (?:run|pass)|did not pass)\b", re.I)
+# (The reply-text "passed" words that used to verify a command are gone: a
+# reply saying "all green" is a claim. See harvest_commands / evidence.py.)
 # Tool events that only NAME a file or pattern (read/search tools), never ran it.
 _NON_SHELL_TOOL_RE = re.compile(
     r"^(?:read|grep|glob|search|ls|list|view|open|fetch|webfetch|websearch|todo\w*|task"
@@ -1358,38 +1355,61 @@ def harvest_files(tools, project_dir=None):
     return out
 
 
-def harvest_commands(tools, reply):
-    """Test/build commands the turn ran, when the reply says they passed."""
-    r = reply or ""
-    if not _PASSED_RE.search(r) or _FAILED_RE.search(r):
-        return []
+def _verify_command(cmd):
+    """A command as the rolling fact spells it, or "" when it is not a plain
+    test/build command worth remembering."""
+    s = " ".join(evidence.inner_command(str(cmd or "")).split())
+    if not s or not _VERIFY_CMD_RE.search(s) or _WRITE_TOOL_RE.match(s):
+        return ""
+    # A Read/Grep/Glob/... event NAMING a tool ("Read: pytest.ini") is not
+    # a command that ran; only shell events (or a bare command) are.
+    if _NON_SHELL_TOOL_RE.match(s):
+        return ""
+    # "bash: pytest -q" / "shell pytest -q" -> the command itself
+    s = re.sub(r"^(bash|shell|sh|powershell|pwsh|cmd|run|exec|command|terminal)\s*:?\s+",
+               "", s, flags=re.I)
+    s = re.sub(r"^-l?c\s+", "", s).strip("'\" ")
+    s = _strip_secret_env(s)[:120]
+    # The command itself must RUN a verify tool (after `cd x &&` / env /
+    # npx-style launchers): "cat ruff.toml" or "rm -rf dist && tsc" is not
+    # a verified test/build command.
+    if not s or "`" in s or not _RUNS_VERIFY_RE.match(s) or _looks_secret(s):
+        return ""
+    return s
+
+
+def harvest_commands(tools=(), reply="", results=()):
+    """Test/build commands the hub OBSERVED pass this turn, newest first.
+
+    A command is filed ONLY when the LAST observed result for it (a CLI's
+    tool_result: exit code + the tool's own summary, evidence.classify)
+    is PASS. MEASURED 2026-10-04 (read-only audit): this used to file any
+    tool-event command whenever the REPLY contained "green", "succeeded" or
+    "no errors" -- a claim, not a result. `tools` and `reply` are kept for
+    callers and are no longer evidence of anything."""
+    latest, order = {}, []
+    for r in results or ():
+        if not isinstance(r, dict):
+            continue
+        s = _verify_command(r.get("command"))
+        if not s:
+            continue
+        verdict = r.get("verdict")
+        if verdict not in evidence.VERDICTS:
+            verdict = evidence.classify(r.get("command"), r.get("exit_code"),
+                                        r.get("output_tail"), r.get("is_error"))["verdict"]
+        latest[s] = verdict
+        order.append(s)
     out = []
-    for t in reversed(list(tools or ())):
-        s = " ".join(str(t or "").split())
-        if not s or not _VERIFY_CMD_RE.search(s) or _WRITE_TOOL_RE.match(s):
-            continue
-        # A Read/Grep/Glob/... event NAMING a tool ("Read: pytest.ini") is not
-        # a command that ran; only shell events (or a bare command) are.
-        if _NON_SHELL_TOOL_RE.match(s):
-            continue
-        # "bash: pytest -q" / "shell pytest -q" -> the command itself
-        s = re.sub(r"^(bash|shell|sh|powershell|pwsh|cmd|run|exec|command|terminal)\s*:?\s+",
-                   "", s, flags=re.I)
-        s = re.sub(r"^-l?c\s+", "", s).strip("'\" ")
-        s = _strip_secret_env(s)[:120]
-        # The command itself must RUN a verify tool (after `cd x &&` / env /
-        # npx-style launchers): "cat ruff.toml" or "rm -rf dist && tsc" is not
-        # a verified test/build command.
-        if not s or "`" in s or not _RUNS_VERIFY_RE.match(s) or _looks_secret(s):
-            continue
-        if s not in out:
+    for s in reversed(order):
+        if latest.get(s) == evidence.PASS and s not in out:
             out.append(s)
         if len(out) >= HARVEST_COMMANDS:
             break
     return out
 
 
-def _merge_rolling(scope, prefix, items, project_dir, limit, sep, by=None):
+def _merge_rolling(scope, prefix, items, project_dir, limit, sep, by=None, suffix=""):
     """ONE rolling fact per kind: the new items first, then the ones it
     already listed, capped -- and the previous version of it removed, so a
     busy project does not push its decisions out with file lists.
@@ -1421,12 +1441,33 @@ def _merge_rolling(scope, prefix, items, project_dir, limit, sep, by=None):
         mem["facts"] = [f for f in facts if not f.startswith(prefix)]
         _save(mem)
     shown = sep.join(("`%s`" % x) if quoted else x for x in merged)
+    # A suffix (the receipt a verified command came from) only when it fits:
+    # the fact is capped at MAX_FACT_CHARS, and a cut inside a backtick pair
+    # would lose a command on the next merge.
+    if suffix and len(prefix + shown + suffix) <= MAX_FACT_CHARS:
+        shown += suffix
     return remember_fact(scope, prefix + shown, project_dir=project_dir, by=by)
 
 
-def harvest_facts(session_id, request="", reply="", project_dir=None, tools=()):
+def _receipt_suffix(receipt):
+    if not receipt:
+        return ""
+    try:
+        import receipts
+        return " (receipt: %s)" % receipts.short_path(receipt)
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def harvest_facts(session_id, request="", reply="", project_dir=None, tools=(),
+                  results=(), receipt=None):
     """File the durable facts of a finished turn (see above). Returns the
-    facts it filed. Never raises."""
+    facts it filed. Never raises.
+
+    `results`: the turn's OBSERVED tool results (parser tool_result events or
+    evidence rows) -- the only source of "Commands verified to work here".
+    `receipt`: the receipt file those results were written to; the commands
+    fact names it."""
     filed = []
     try:
         scope = project_key(project_dir) if project_dir else session_id
@@ -1444,9 +1485,10 @@ def harvest_facts(session_id, request="", reply="", project_dir=None, tools=()):
         if files and _merge_rolling(scope, FILES_FACT_PREFIX, files, project_dir,
                                     HARVEST_FILES, ", ", by=by):
             filed.append(FILES_FACT_PREFIX + ", ".join(files))
-        cmds = harvest_commands(tools, reply)
+        cmds = harvest_commands(tools, reply, results=results)
         if cmds and _merge_rolling(scope, COMMANDS_FACT_PREFIX, cmds, project_dir,
-                                   HARVEST_COMMANDS, "; ", by=by):
+                                   HARVEST_COMMANDS, "; ", by=by,
+                                   suffix=_receipt_suffix(receipt)):
             filed.append(COMMANDS_FACT_PREFIX + "; ".join(cmds))
         extractor = _FACT_EXTRACTOR
         enabled = getattr(extractor, "enabled", None)

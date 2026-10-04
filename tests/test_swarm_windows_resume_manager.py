@@ -93,7 +93,9 @@ def test_resume_reattaches_the_manager_and_verifies_the_remaining_phases():
     assert run.manager is mgr and run.modes == ("coding",)
     # Only the two phases that ran again were checked -- A was done before.
     assert mgr.calls.count("verify") == 2
-    assert run.agents[1].verified is True and run.agents[2].verified is True
+    # The manager agreed with their summaries: reviewed (verified needs an
+    # observed passing test run).
+    assert run.agents[1].reviewed is True and run.agents[2].reviewed is True
     # The cost keeps accumulating on the SAME run, on top of what was restored.
     assert st["manager_tokens"] == 500 + 2 * 40
     assert st["manager_calls"] == 3 + 2

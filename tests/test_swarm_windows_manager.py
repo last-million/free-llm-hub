@@ -152,7 +152,10 @@ def test_the_manager_writes_the_plan_with_a_brief(tmp_path):
                    "YOUR FINAL MESSAGE MUST CONTAIN: list every file"):
         assert needle in head
     assert st["state"] == SW.DONE
-    assert [a["verified"] for a in st["agents"][:2]] == [True, True]
+    # The manager agreed with two SUMMARIES: reviewed, not verified -- no test
+    # run was observed (2026-10-04: verified means observed).
+    assert [(a["verified"], a["reviewed"]) for a in st["agents"][:2]] == [(None, True)] * 2
+    assert [a["check"] for a in st["agents"][:2]] == [{"kind": "reviewed", "text": "reviewed"}] * 2
     # plan + two verdicts; the review phase is never sent to the manager.
     assert st["manager_calls"] == 3 and st["manager_tokens"] == 300
     assert len(mgr.verifies()) == 2
@@ -225,7 +228,7 @@ def test_a_rejected_phase_is_retried_with_its_problems_then_flagged(tmp_path):
     # the review is told which phase still fails and which passed
     review = w.prompts_for(SW.REVIEW_TITLE)[0]
     assert "phase 1 (Page): FAILED its checks -- fix: the hero is still missing" in review
-    assert "phase 2 (Styles): verified" in review
+    assert "phase 2 (Styles): reviewed by the manager (its summary, not a test run)" in review
     # the run is not a failure: the review still ran
     assert st["state"] == SW.DONE
     report = SW.format_result(rid)
@@ -239,7 +242,8 @@ def test_a_revision_that_passes_is_done_and_verified(tmp_path):
                    phases=[PHASES[0]], manager=mgr)
     st = _wait(rid)
     a = st["agents"][0]
-    assert (a["state"], a["verified"], a["revisions"], a["problems"]) == (SW.DONE, True, 1, [])
+    assert (a["state"], a["reviewed"], a["revisions"], a["problems"]) == (SW.DONE, True, 1, [])
+    assert a["verified"] is None, "the manager read a summary; nothing was observed"
     assert a["error"] is None
 
 
@@ -280,7 +284,7 @@ def test_an_acceptance_file_the_worker_wrote_passes_the_cheap_check(tmp_path):
                    phases=[dict(PHASES[0], acceptance="index.html has a hero")],
                    manager=mgr)
     st = _wait(rid)
-    assert st["agents"][0]["verified"] is True
+    assert st["agents"][0]["reviewed"] is True
     brief = mgr.verifies()[0]["user"]
     assert "Files changed during the phase: index.html" in brief
     assert "wrote index.html" in brief
@@ -328,7 +332,7 @@ def test_a_broken_final_message_fails_the_cheap_check(tmp_path, monkeypatch):
                    phases=[PHASES[0]], manager=mgr)
     st = _wait(rid)
     a = st["agents"][0]
-    assert a["state"] == SW.DONE and a["verified"] is True
+    assert a["state"] == SW.DONE and a["reviewed"] is True
     assert "repetition" in w.prompts_for("Page")[1]
     assert len(mgr.verifies()) == 1, "only the clean attempt reached the manager"
 

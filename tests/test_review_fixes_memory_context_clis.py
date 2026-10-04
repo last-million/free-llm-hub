@@ -53,7 +53,9 @@ def test_secrets_are_never_harvested(mem_dir):
         "s1", request="Always use my OpenAI key sk-proj-AbC123xyz456 for the widget.",
         reply="Note: the admin password is hunter2secret\nDecision: use pnpm, not npm.\n"
               "All tests passed.",
-        project_dir=proj, tools=["bash: OPENAI_API_KEY=sk-live-999999 pytest -q"])
+        project_dir=proj, tools=["bash: OPENAI_API_KEY=sk-live-999999 pytest -q"],
+        results=[{"command": "OPENAI_API_KEY=sk-live-999999 pytest -q", "exit_code": 0,
+                  "output_tail": "3 passed in 0.10s"}])
     facts = memory.project_facts(proj)
     blob = "\n".join(facts)
     assert "sk-proj" not in blob and "hunter2" not in blob and "sk-live" not in blob
@@ -101,17 +103,22 @@ def test_only_real_verify_commands_are_verified():
     tools = ["Read: pytest.ini", "bash: cat ruff.toml", "Grep: jest in src",
              "bash: rm -rf dist && tsc", "bash: cd web && npm run build",
              "python -m pytest -q"]
-    assert memory.harvest_commands(tools, "All tests passed.") == [
+    # Every one of these is given as OBSERVED passing: what is tested here is
+    # which command SHAPES may become a verified-command fact.
+    passed = [{"command": t, "verdict": "PASS"} for t in tools]
+    assert memory.harvest_commands(results=passed) == [
         "python -m pytest -q", "cd web && npm run build"]
+    # The reply's words alone verify nothing.
+    assert memory.harvest_commands(tools, "All tests passed.") == []
 
 
 def test_a_compound_command_survives_the_rolling_merge(mem_dir):
     proj = os.path.join(mem_dir, "p2")
     os.makedirs(proj)
     memory.harvest_facts("s1", reply="All tests passed.", project_dir=proj,
-                         tools=["bash: cd web; npm run build"])
+                         results=[{"command": "cd web; npm run build", "verdict": "PASS"}])
     memory.harvest_facts("s1", reply="All tests passed.", project_dir=proj,
-                         tools=["bash: pytest -q"])
+                         results=[{"command": "pytest -q", "verdict": "PASS"}])
     cmds = [f for f in memory.project_facts(proj)
             if f.startswith(memory.COMMANDS_FACT_PREFIX)]
     assert cmds == [memory.COMMANDS_FACT_PREFIX + "`pytest -q`; `cd web; npm run build`"]

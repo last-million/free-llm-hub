@@ -57,6 +57,8 @@ from collections import deque
 
 import agent_servers                 # a leaf too: server rules, hub PID/port
 import answer_check                  # a leaf like this one: no app import
+import evidence                      # pure: observed test/build verdicts
+import receipts                      # what was observed, on disk
 
 _SUMMARY_THINK_RE = re.compile(r"<(think|thinking)>(.*?)</\1>", re.I | re.S)
 _SUMMARY_THINK_OPEN_RE = re.compile(r"<(?:think|thinking)>(.*)$", re.I | re.S)
@@ -575,7 +577,8 @@ class _Agent:
                  "ended_at", "events", "last_event_at", "abandoned",
                  "inputs", "constraints", "output_format", "acceptance",
                  "verified", "problems", "revisions", "past_sessions",
-                 "event_total")
+                 "event_total", "evidence", "reviewed", "claimed_unobserved",
+                 "receipt")
 
     def __init__(self, index, phase):
         self.index = index
@@ -589,10 +592,22 @@ class _Agent:
         self.constraints = phase.get("constraints") or ""
         self.output_format = phase.get("output_format") or ""
         self.acceptance = phase.get("acceptance") or ""
-        # Verification (only when a manager is wired): None = never checked,
-        # True = passed, False = still failing after its one revision. The
-        # problems are what the revision and then the review are told to fix.
+        # VERIFIED MEANS OBSERVED (2026-10-04): True only when the hub saw a
+        # test/build command the worker ran PASS (exit 0 + the tool's own
+        # summary, evidence.classify) with no failure left behind it; False =
+        # still failing after its one revision; None = nothing observed. A
+        # manager that agreed with the SUMMARY sets `reviewed`, never
+        # `verified`. The problems are what the revision and then the review
+        # are told to fix.
         self.verified = None
+        self.reviewed = False
+        # The final message says tests/build pass, but no passing run was
+        # observed: shown as "claimed, not checked" -- not a failure.
+        self.claimed_unobserved = False
+        # What the hub observed this phase's test/build commands do (evidence
+        # rows, oldest first, capped at EVIDENCE_MAX) and the receipt file.
+        self.evidence = []
+        self.receipt = None
         self.problems = []
         self.revisions = 0
         self.session_id = None
@@ -626,6 +641,11 @@ class _Agent:
             "output_format": self.output_format, "acceptance": self.acceptance,
             "verified": self.verified, "problems": list(self.problems),
             "revisions": self.revisions,
+            "reviewed": bool(self.reviewed),
+            "claimed_not_observed": bool(self.claimed_unobserved),
+            "evidence": [dict(e) for e in self.evidence],
+            "receipt": self.receipt,
+            "check": check_of(self),
         }
         if with_events:
             out["log"] = list(self.events)
@@ -770,6 +790,15 @@ class _Run:
             else run.manager_calls > 0
         for agent, a in zip(run.agents, row.get("agents") or ()):
             agent.verified = a.get("verified")
+            agent.reviewed = bool(a.get("reviewed"))
+            agent.claimed_unobserved = bool(a.get("claimed_not_observed"))
+            agent.evidence = [e for e in (a.get("evidence") or ())
+                              if isinstance(e, dict)][-EVIDENCE_MAX:]
+            agent.receipt = a.get("receipt") if isinstance(a.get("receipt"), str) else None
+            if "reviewed" not in a and agent.verified is True:
+                # Written before 2026-10-04, when "verified" meant the manager
+                # agreed with the summary: that is "reviewed" now.
+                agent.verified, agent.reviewed = None, True
             agent.problems = [str(p) for p in (a.get("problems") or ())][:10]
             agent.revisions = int(a.get("revisions") or 0) if str(
                 a.get("revisions") or 0).isdigit() else 0
@@ -906,22 +935,32 @@ def _agent_prompt(run, agent):
                   "work is already in the project folder. Fix these problems:"]
         parts += ["- " + p for p in agent.problems]
         parts += [""]
-    if _is_review(run, agent) and any(a.verified is not None for a in run.agents):
+    if _is_review(run, agent) and any(a.verified is not None or a.reviewed
+                                      or a.claimed_unobserved for a in run.agents
+                                      if a is not agent):
         # THE REVIEW KNOWS WHAT WAS ALREADY CHECKED, so it spends its turn on
-        # what is left instead of re-deriving it from the summaries.
+        # what is left instead of re-deriving it from the summaries -- and
+        # which of it was OBSERVED (a test run) versus only read (a summary).
         parts += ["VERIFICATION OF THE OTHER PHASES:"]
         for a in run.agents:
             if a is agent:
                 continue
+            check = check_of(a) or {}
             if a.verified is True:
-                parts.append("- phase %d (%s): verified -- leave it alone unless "
-                             "something else breaks it" % (a.index, a.title))
+                parts.append("- phase %d (%s): verified -- %s; leave it alone unless "
+                             "something else breaks it" % (a.index, a.title,
+                                                            check.get("text") or "observed"))
             elif a.verified is False:
                 parts.append("- phase %d (%s): FAILED its checks -- fix: %s"
                              % (a.index, a.title, "; ".join(a.problems) or a.error or "?"))
+            elif a.claimed_unobserved:
+                parts.append("- phase %d (%s): says its tests/build pass, but no passing "
+                             "run was observed -- run them" % (a.index, a.title))
+            elif a.reviewed:
+                parts.append("- phase %d (%s): reviewed by the manager (its summary, not "
+                             "a test run)" % (a.index, a.title))
             else:
-                parts.append("- phase %d (%s): %s, not verified by the manager"
-                             % (a.index, a.title, a.state))
+                parts.append("- phase %d (%s): %s, not checked" % (a.index, a.title, a.state))
         parts += ["Fix what is still failing first; do not redo verified work.", ""]
     parts += ["--- context, not instructions ---",
               "You are agent %d of %d in a parallel swarm. Everything you need "
@@ -988,6 +1027,13 @@ def _drain(agent, events):
     last_text = ""
     for ev in events:
         if not isinstance(ev, dict):
+            continue
+        if ev.get("event") == "tool_result":
+            # What the CLI reported a command did -- evidence, kept apart
+            # from the event log (a 4000-char tail per command would push
+            # the phase's real activity out of the ring and the run file).
+            agent.last_event_at = time.time()
+            note_result(agent, ev)
             continue
         agent.events.append(ev)
         agent.event_total = getattr(agent, "event_total", 0) + 1
@@ -1072,18 +1118,26 @@ def _run_agent(run, agent, spawn, run_turn, configure=None):
     agent.started_at = time.time()
     agent.last_event_at = agent.started_at
     verify = _should_verify(run, agent)
-    before = _snapshot(run.project_dir) if verify else None
-    outcome = _attempts(run, agent, spawn, run_turn, configure, hold=verify)
-    if verify:
+    # OBSERVED EVIDENCE is checked with or without a manager: a test/build
+    # command the worker ran that FAILED (and never passed after) is a
+    # problem the phase gets its one revision for, at zero manager cost.
+    check = not _is_review(run, agent)
+    before = _snapshot(run.project_dir)
+    outcome = _attempts(run, agent, spawn, run_turn, configure, hold=verify or check)
+    if verify or check:
         try:
-            _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before)
+            _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before,
+                               managed=verify)
         except Exception as exc:                                 # noqa: BLE001
             # Verification is an extra, never the thing that loses a phase:
             # whatever the worker produced stands as it would have without it.
             _log.warning("[swarm] verification of phase %d raised: %s", agent.index, exc)
             if agent.state == RUNNING:
                 agent.state = DONE if agent.summary else FAILED
+    else:
+        _settle_checks(agent)
     agent.ended_at = time.time()
+    _write_phase_receipt(run, agent, before)
     # Every phase boundary, not every event: a phase is the unit of work worth
     # surviving a restart, and its summary is what the orchestrator reads back.
     _persist(run)
@@ -1158,6 +1212,116 @@ def _should_verify(run, agent):
     return run.manager is not None and not _is_review(run, agent)
 
 
+# --------------------------------------------------------------------------- #
+# Observed evidence: what the worker's CLI REPORTED its checks did
+# --------------------------------------------------------------------------- #
+#
+# MEASURED 2026-10-04 (read-only audit): without a manager any phase that ended
+# with a summary was DONE; with one, "verified" meant the manager agreed with
+# that summary. The CLIs report each command's exit code (agentic_chat's
+# tool_result events) -- that, classified by evidence.py, is what decides now.
+EVIDENCE_MAX = 30
+# What of the observed results the manager's verdict brief carries.
+OBSERVED_LINES = 8
+
+
+def note_result(agent, ev):
+    """File one tool_result event on the phase when it ran a test/build
+    check. Never raises."""
+    try:
+        if not evidence.detect(ev.get("command")):
+            return
+        row = evidence.from_event(ev)
+        row["command"] = row["command"][:300]
+        row["attempt"] = agent.revisions
+        row["at"] = time.time()
+        agent.evidence.append(row)
+        del agent.evidence[:-EVIDENCE_MAX]
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def check_of(agent):
+    """{"kind", "text"} -- what the phase's result rests on, honestly
+    labelled -- or None when there is nothing to say:
+
+        observed_fail  "2 failed (observed)"       a check failed, never re-passed
+        observed_pass  "12 passed (observed)"      a check passed, nothing failing
+        claimed        "claimed, not checked"      says it passes, none observed
+        reviewed       "reviewed"                  the manager read the summary
+        no_tests       "no tests ran (observed)"
+    """
+    ev = list(getattr(agent, "evidence", None) or ())
+    text = evidence.label(ev)
+    if evidence.outstanding_failures(ev):
+        return {"kind": "observed_fail", "text": text}
+    if evidence.passes(ev):
+        out = {"kind": "observed_pass", "text": text}
+        if getattr(agent, "reviewed", False):
+            out["reviewed"] = True
+        return out
+    if getattr(agent, "claimed_unobserved", False):
+        return {"kind": "claimed", "text": "claimed, not checked"}
+    if getattr(agent, "reviewed", False):
+        return {"kind": "reviewed", "text": "reviewed"}
+    if text:
+        return {"kind": "no_tests", "text": text}
+    return None
+
+
+def _observed_problems(agent):
+    """A problem per check that FAILED and was never re-run green (newest
+    last, at most three), stated as the thing to fix."""
+    out = []
+    for f in evidence.outstanding_failures(agent.evidence)[-3:]:
+        cmd = " ".join(evidence.inner_command(f.get("command") or "").split())[:160]
+        out.append("`%s` failed when you ran it (exit %s: %s). Fix the cause and run it "
+                   "again until it passes." % (cmd, f.get("exit_code") if f.get("exit_code")
+                                               is not None else "non-zero",
+                                               f.get("line") or f.get("tool") or "failure"))
+    return out
+
+
+def _observed_lines(agent):
+    lines = []
+    for e in agent.evidence[-OBSERVED_LINES:]:
+        cmd = " ".join(evidence.inner_command(e.get("command") or "").split())[:120]
+        lines.append("- `%s` -> exit %s, %s%s" % (
+            cmd, e.get("exit_code") if e.get("exit_code") is not None else "unknown",
+            e.get("verdict"), (": " + e["line"]) if e.get("line") else ""))
+    return lines
+
+
+def _settle_checks(agent):
+    """`verified` / `claimed_unobserved` from what was observed: verified only
+    with an observed PASS and nothing failing behind it."""
+    fails = evidence.outstanding_failures(agent.evidence)
+    ok = evidence.passes(agent.evidence)
+    if ok and not fails:
+        agent.verified = True
+    elif agent.verified is True:
+        agent.verified = None
+    agent.claimed_unobserved = bool(not ok and evidence.claims_checks_passed(agent.summary))
+
+
+def _write_phase_receipt(run, agent, before):
+    """receipts/<run id>/<phase>.json when the phase ran test/build checks."""
+    if not agent.evidence:
+        return
+    try:
+        path = receipts.write(
+            run.id, "multi-phase", agent.evidence, cwd=run.project_dir,
+            changed=_changed_files(before, run.project_dir),
+            started_at=agent.started_at, ended_at=agent.ended_at, number=agent.index,
+            extra={"run_id": run.id, "phase": agent.index, "title": agent.title,
+                   "session_id": agent.session_id, "phase_state": agent.state,
+                   "verified": agent.verified, "reviewed": bool(agent.reviewed)})
+        if path:
+            agent.receipt = path
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _snapshot(folder):
     """{relative path: (mtime, size)} for the project folder, or {} when it
     cannot be read. Never raises."""
@@ -1217,10 +1381,13 @@ def _acceptance_files(text):
 
 
 def _cheap_problems(run, agent, outcome):
-    """What is plainly wrong without asking anyone. [] when nothing is."""
+    """What is plainly wrong without asking anyone. [] when nothing is.
+
+    First of all: a test/build command the worker ran that FAILED and was
+    never re-run green -- observed, so no model has to judge it."""
     if outcome != DONE or not agent.summary:
         return [agent.error or "the agent produced no result"]
-    problems = []
+    problems = _observed_problems(agent)
     try:
         verdict = answer_check.inspect(agent.summary, prompt_text=agent.task)
         if not verdict.get("ok", True):
@@ -1282,6 +1449,16 @@ def _manager_verdict(run, agent, changed):
                  + (", ".join(changed[:VERIFY_FILES]) or "(none)")
                  + (" (+%d more)" % (len(changed) - VERIFY_FILES)
                     if len(changed) > VERIFY_FILES else ""))
+    # WHAT WAS OBSERVED, not only what the summary says: each test/build
+    # command the worker ran, with the exit code its CLI reported and the
+    # tool's own summary line.
+    observed = _observed_lines(agent)
+    brief.append("Test/build commands the hub OBSERVED the agent run (exit code + "
+                 "the tool's own summary): " + ("\n" + "\n".join(observed) if observed
+                                                 else "(none ran)"))
+    if not evidence.passes(agent.evidence) and evidence.claims_checks_passed(agent.summary):
+        brief.append("NOTE: the final message says tests/build pass, but no passing "
+                     "run was observed.")
     text = agent.summary or ""
     if len(text) > VERIFY_TEXT_CHARS:
         text = text[:VERIFY_TEXT_CHARS] + "\n[...clipped]"
@@ -1300,29 +1477,45 @@ def _manager_verdict(run, agent, changed):
                          "re-check it against the task and acceptance"]), mode, True
 
 
-def _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before):
+def _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before,
+                       managed=True):
     """Check the phase; on failure run it ONCE more with the problems as
     instructions; still failing, mark it for the review. Sets the phase's
-    final state (it was held RUNNING by _attempts)."""
+    final state (it was held RUNNING by _attempts).
+
+    `managed` False (no manager): ONLY observed evidence is checked -- an
+    empty or broken phase fails exactly as it did before, unretried; a phase
+    whose observed test/build run failed gets the same one revision."""
     for round_ in range(REVISIONS + 1):
         if run.stop_flag.is_set() or agent.abandoned or outcome == STOPPED \
                 or agent.state == STOPPED:
             if agent.state == RUNNING:
                 agent.state = STOPPED if run.stop_flag.is_set() else outcome
+            _settle_checks(agent)
+            return
+        if not managed and (outcome != DONE or not agent.summary):
+            if agent.state == RUNNING:
+                agent.state = outcome if outcome != DONE else FAILED
+            _settle_checks(agent)
             return
         changed = _changed_files(before, run.project_dir)
-        problems = _cheap_problems(run, agent, outcome)
+        if managed:
+            problems = _cheap_problems(run, agent, outcome)
+        else:
+            problems = _observed_problems(agent)
         mode, answered = None, False
-        if not problems:
+        if not problems and managed:
             problems, mode, answered = _manager_verdict(run, agent, changed)
         if not problems:
-            # Passed. "Verified" only when the manager actually said so; with
+            # Passed. "Verified" only with an observed passing check;
+            # "reviewed" when the manager read the summary and agreed. With
             # the budget spent it stays unchecked, and done -- as it would
             # have been with no manager at all.
-            agent.verified = True if answered else None
+            agent.reviewed = bool(answered)
             agent.problems = []
             agent.error = None
             agent.state = DONE
+            _settle_checks(agent)
             return
         agent.problems = problems
         if round_ >= REVISIONS:
@@ -1345,8 +1538,11 @@ def _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before):
             # attempt did say -- the review reads it.
             agent.summary = previous
     if agent.state == STOPPED or run.stop_flag.is_set() or agent.abandoned:
+        _settle_checks(agent)
         return
+    _settle_checks(agent)
     agent.verified = False
+    agent.reviewed = False
     agent.state = FAILED
     agent.error = ("did not pass verification: " + "; ".join(agent.problems))[:400]
 
@@ -1759,6 +1955,8 @@ def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
             agent.ended_at = None
             agent.abandoned = False
             agent.verified = None
+            agent.reviewed = False
+            agent.claimed_unobserved = False
             agent.revisions = 0
         run.state = PENDING
         run.error = None
@@ -1855,29 +2053,56 @@ def result(run_id):
         "phases": [{"index": a.index, "title": a.title, "state": a.state,
                     "summary": a.summary, "error": a.error, "mode": a.mode,
                     "session_id": a.session_id, "verified": a.verified,
+                    "reviewed": bool(a.reviewed), "check": check_of(a),
+                    "receipt": a.receipt,
                     "problems": list(a.problems)}
                    for a in run.agents],
         "done": sum(1 for a in run.agents if a.state == DONE),
         "failed": sum(1 for a in run.agents if a.state == FAILED),
+        "verified": sum(1 for a in run.agents if a.verified is True),
+        "reviewed": sum(1 for a in run.agents if a.reviewed and a.verified is not True),
         "manager_tokens": run.manager_tokens,
         "manager_calls": run.manager_calls,
     }
 
 
 def format_result(run_id):
-    """The run as text a model can read back."""
+    """The run as text a model can read back.
+
+    DONE IS NOT VERIFIED: the header counts phases verified by an OBSERVED
+    test/build run apart from the ones only reviewed (a manager read the
+    summary) -- shown whenever anything was checked at all; a run where
+    nothing was reads exactly as before."""
     res = result(run_id)
     if not res:
         return ""
-    lines = ["Swarm run %s - %s (%d/%d phases done)"
-             % (res["run_id"], res["state"], res["done"], len(res["phases"])),
+    head = "%d/%d phases done" % (res["done"], len(res["phases"]))
+    if any(p.get("check") for p in res["phases"]):
+        head += ", %d verified by an observed test/build run" % res["verified"]
+        if res["reviewed"]:
+            head += ", %d only reviewed" % res["reviewed"]
+    lines = ["Swarm run %s - %s (%s)" % (res["run_id"], res["state"], head),
              "Goal: " + res["goal"], ""]
     for p in res["phases"]:
         lines.append("### Phase %d - %s [%s]" % (p["index"], p["title"], p["state"]))
         lines.append(p["summary"] or ("(no result: %s)" % (p["error"] or "unknown")))
+        check = p.get("check")
+        if check:
+            lines.append("Checked: %s" % (_CHECK_WORDS.get(check["kind"], "%s") % check["text"]))
         if p.get("verified") is False and p.get("problems"):
-            # Only a manager-verified run ever sets this; a plain run's report
-            # reads exactly as before.
+            # Only a checked phase ever sets this; a plain run's report reads
+            # exactly as before.
             lines.append("Still failing its checks: " + "; ".join(p["problems"]))
         lines.append("")
     return "\n".join(lines).strip()
+
+
+# How the report words each kind of check (check_of): what was RUN versus
+# what was only READ.
+_CHECK_WORDS = {
+    "observed_pass": "%s",
+    "observed_fail": "%s",
+    "no_tests": "%s",
+    "claimed": "%s -- the summary says tests/build pass, but no passing run was observed",
+    "reviewed": "%s by the manager (it read the summary; no test run was observed)",
+}

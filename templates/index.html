@@ -2725,6 +2725,14 @@
     background:var(--surface-2); border:1px solid var(--border); border-radius:999px;
     padding:0 6px; line-height:16px; white-space:nowrap; }
   .hp-time{ color:var(--text-faint); font-size:11px; font-variant-numeric:tabular-nums; }
+  /* What a helper's "done" rests on: a test run the hub OBSERVED, or only a
+     claim / a manager's read of the summary. Tokens only (both themes). */
+  .hp-check{ font-size:10.5px; line-height:16px; padding:0 6px; border-radius:999px;
+    border:1px solid var(--border); background:var(--surface-2); color:var(--text-dim);
+    white-space:nowrap; }
+  .hp-check.observed_pass{ background:var(--accent-soft); color:var(--ok-text); border-color:transparent; }
+  .hp-check.observed_fail{ background:var(--danger-soft); color:var(--danger-text); border-color:var(--danger-border); }
+  .hp-check.claimed{ background:var(--warn-soft); color:var(--warn-text); border-color:var(--warn-border); }
   .hp-open{ margin-left:auto; font-size:11.5px; font-weight:600; color:var(--accent);
     text-decoration:none; padding:3px 6px; border-radius:var(--radius-sm); white-space:nowrap; }
   .hp-open:hover{ background:var(--accent-soft); }
@@ -10741,6 +10749,13 @@
     var _planLive = false;
     var _resumeDismissed = '';
     var HP_STATE = { done:'done', running:'working', pending:'waiting', failed:'failed', stopped:'stopped' };
+    var HP_CHECK_TIP = {
+      observed_pass: 'The hub saw this helper run its tests/build and they passed (exit code and the tool’s own summary)',
+      observed_fail: 'The hub saw a test/build run fail and no later run pass',
+      claimed: 'The helper says its tests/build pass, but the hub saw no passing run',
+      reviewed: 'The manager read the helper’s summary and agreed; no test run was observed',
+      no_tests: 'The test command ran but found no tests'
+    };
     function hpElapsed(t, now){
       if (!t.started_at) return '';
       var end = t.ended_at || (t.doing ? (now || Date.now() / 1000) : null);
@@ -10773,6 +10788,16 @@
       if (el){
         var tm = document.createElement('span'); tm.className = 'hp-time'; tm.textContent = el;
         top.appendChild(tm);
+      }
+      /* Done is not verified: "12 passed (observed)" only when the hub saw the
+         helper's test run pass; "claimed, not checked" when its summary says so
+         but no run was seen; "reviewed" when the manager only read the summary. */
+      if (t.check && t.check.text){
+        var ck = document.createElement('span');
+        ck.className = 'hp-check ' + (t.check.kind || '');
+        ck.textContent = t.check.text;
+        ck.title = HP_CHECK_TIP[t.check.kind] || '';
+        top.appendChild(ck);
       }
       if (t.this){
         var me = document.createElement('span'); me.className = 'hp-this-chip';
@@ -13470,7 +13495,8 @@
         return '<div class="sw-phase ' + esc(a.state) + '">' +
                  '<span class="sw-dot" aria-hidden="true"></span>' +
                  '<span><span class="sw-title">' + esc(a.title) + '</span>' +
-                   (a.verified === true ? ' <span class="mgr-cost" title="Checked by the subscription manager">&check; verified</span>' : '') +
+                   (a.verified === true ? ' <span class="mgr-cost" title="The hub saw its tests/build run pass">&check; verified (observed)</span>'
+                     : (a.check && a.check.text ? ' <span class="mgr-cost" title="What this phase’s result rests on">' + esc(a.check.text) + '</span>' : '')) +
                    needs + sum + '</span>' +
                  (a.mode ? '<span class="sw-mode">' + esc(a.mode) + '</span>' : '<span></span>') +
                '</div>';

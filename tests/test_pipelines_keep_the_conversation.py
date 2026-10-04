@@ -234,8 +234,13 @@ def test_a_turn_files_decisions_preferences_files_and_passing_commands(mem_dir):
     os.makedirs(proj)
     tools = ["write %s" % os.path.join(proj, "src", "app.py"),
              "Write: README.md", "bash pytest -q", "read other.txt"]
+    # The command is filed because the CLI REPORTED it passing (exit 0 + the
+    # tool's own summary), not because the reply says "All 12 tests passed".
+    observed = [{"event": "tool_result", "command": "pytest -q", "exit_code": 0,
+                 "is_error": False, "output_tail": "12 passed in 0.31s\n"}]
     filed = memory.harvest_facts("s1", request="Always use tabs. Build me a page.",
-                                 reply=REPLY, project_dir=proj, tools=tools)
+                                 reply=REPLY, project_dir=proj, tools=tools,
+                                 results=observed)
     facts = memory.project_facts(proj)
     assert "Decision: use pnpm, not npm, for every install." in facts
     assert "Never commit the .env file." in facts
@@ -263,7 +268,9 @@ def test_the_rolling_facts_are_one_each_and_deduplicated(mem_dir):
 
 
 def test_a_failing_run_files_no_verified_command(mem_dir):
-    memory.harvest_facts("s9", reply="3 failed, 9 passed", tools=["pytest -q"])
+    memory.harvest_facts("s9", reply="3 failed, 9 passed", tools=["pytest -q"],
+                         results=[{"command": "pytest -q", "exit_code": 1,
+                                   "output_tail": "3 failed, 9 passed in 1.02s"}])
     assert not any(f.startswith(memory.COMMANDS_FACT_PREFIX)
                    for f in memory.get("s9").get("facts") or [])
 

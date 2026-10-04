@@ -119,7 +119,9 @@ import uuid
 
 import agent_servers
 import agentic_history
+import evidence                      # pure: observed test/build verdicts
 import memory
+import receipts
 
 # The effort tiers a session can run in; the list itself lives with the
 # conversation store, which is where a tier has to survive a restart.
@@ -2871,6 +2873,68 @@ def _parse_opencode_json(stdout, stderr, returncode):
     return None, session_id, "opencode produced no reply."
 
 
+# --------------------------------------------------------------------------- #
+# OBSERVED RESULTS. Each stream parser below also emits, next to its usual
+# "tool"/"output" events (unchanged), one
+#
+#     {"event": "tool_result", "command": str, "exit_code": int|None,
+#      "is_error": bool|None, "output_tail": str (last <= 4000 chars),
+#      "started_at": float|None, "ended_at": float}
+#
+# per finished shell command -- what the CLI itself reported the command did.
+# evidence.classify turns it into PASS/FAIL/NO_TESTS/UNDETERMINED; memory and
+# Multi act on that instead of on the reply's own words. The browser ignores
+# the event (index.html handles only the kinds it knows), and the durable
+# turn forwards only the ones that ran a test/build check.
+# --------------------------------------------------------------------------- #
+
+def _tool_result_event(command, exit_code, is_error, output, started_at=None, ended_at=None):
+    if not isinstance(command, str) or not command.strip():
+        return None
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        exit_code = None
+    return {"event": "tool_result", "command": command[:2000], "exit_code": exit_code,
+            "is_error": is_error if isinstance(is_error, bool) else None,
+            "output_tail": evidence.tail(output if isinstance(output, str) else ""),
+            "started_at": started_at if isinstance(started_at, (int, float)) else None,
+            "ended_at": ended_at if isinstance(ended_at, (int, float)) else time.time()}
+
+
+def _opencode_tool_result(part):
+    """opencode 1.18.34 (its binary, read 2026-10-04): `run --format json`
+    emits {"type":"tool_use","part":...} only when part.state.status is
+    "completed" or "error"; the shell tool returns
+    {title: command, metadata: {output, exit: <exit code | null on
+    abort/timeout>, truncated}, output: <combined output>} -- so the exit code
+    is state.metadata.exit and a non-zero exit is still status "completed".
+    state.time.start/end are epoch milliseconds."""
+    state = part.get("state") if isinstance(part, dict) else None
+    if not isinstance(state, dict):
+        return None
+    inp = state.get("input") if isinstance(state.get("input"), dict) else {}
+    command = inp.get("command")
+    if not isinstance(command, str):
+        return None
+    status = state.get("status")
+    meta = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+    if status == "completed":
+        output = state.get("output")
+        if not isinstance(output, str):
+            output = meta.get("output") if isinstance(meta.get("output"), str) else ""
+        is_error = False
+    elif status == "error":
+        output = state.get("error") if isinstance(state.get("error"), str) else ""
+        is_error = True
+    else:
+        return None
+    times = state.get("time") if isinstance(state.get("time"), dict) else {}
+
+    def _sec(v):
+        return v / 1000.0 if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    return _tool_result_event(command, meta.get("exit"), is_error, output,
+                              _sec(times.get("start")), _sec(times.get("end")))
+
+
 def _opencode_stream_events(line):
     """One `opencode run --format json` line -> normalized event dicts."""
     line = (line or "").strip()
@@ -2902,6 +2966,9 @@ def _opencode_stream_events(line):
                         detail = " " + inp[k][:160]
                         break
             out.append({"event": "tool", "text": tool + detail})
+            observed = _opencode_tool_result(part)
+            if observed:
+                out.append(observed)
     elif etype == "text":
         txt = part.get("text")
         if isinstance(txt, str) and txt.strip():
@@ -3142,6 +3209,42 @@ def _memory_turn_start(session_id, text, project_dir=None):
             memory.request_restate(session_id)
     except Exception:                                            # noqa: BLE001
         pass
+
+
+def _start_turn_snapshot(project_dir):
+    """The project folder as it was when the turn started ({path: (mtime,
+    size)}, swarm_windows._snapshot), read on a side thread so the turn never
+    waits on it. None when there is no folder. Never raises."""
+    if not project_dir or not os.path.isdir(project_dir):
+        return None
+    box = {"done": threading.Event()}
+
+    def _take():
+        try:
+            import swarm_windows          # no cycle: it never imports this module
+            box["files"] = swarm_windows._snapshot(project_dir)
+        except Exception:                                        # noqa: BLE001
+            pass
+        finally:
+            box["done"].set()
+    threading.Thread(target=_take, daemon=True, name="turn-snapshot").start()
+    return box
+
+
+def _write_turn_receipt(session_id, project_dir, observed, started_at, before):
+    """receipts/<session>/<n>.json for a turn whose CLI ran test/build
+    commands; its path, or None. Never raises."""
+    try:
+        changed = []
+        if before is not None and before["done"].wait(10.0) and "files" in before:
+            import swarm_windows
+            changed = swarm_windows._changed_files(before["files"], project_dir)
+        rows = [evidence.from_event(ev) for ev in observed]
+        return receipts.write(session_id, "agent-turn", rows, cwd=project_dir,
+                              changed=changed, started_at=started_at,
+                              ended_at=time.time(), extra={"session_id": session_id})
+    except Exception:                                            # noqa: BLE001
+        return None
 
 
 def _memory_turn_end(session_id, request, project_dir=None, reply=None,
@@ -3421,6 +3524,30 @@ def _is_benign_codex_notice(msg):
         and "not found" in msg.lower()
 
 
+def _codex_tool_result(item):
+    """codex 0.154.0 (codex-rs/exec/src/exec_events.rs at rust-v0.154.0,
+    read 2026-10-04; field names also present in the installed codex.exe):
+
+        pub struct CommandExecutionItem { command: String,
+            aggregated_output: String, exit_code: Option<i32>,
+            status: CommandExecutionStatus }   // in_progress|completed|failed|declined
+
+    serialized inside {"type":"item.completed","item":{"id":..,"type":
+    "command_execution",...}}. `command` is argv shlex-joined (on Windows
+    argv[0] is pwsh/powershell, evidence.inner_command unwraps it); exit_code
+    is null for a declined or still-running command."""
+    command = item.get("command")
+    status = item.get("status")
+    if status == "in_progress":
+        return None
+    output = item.get("aggregated_output")
+    if not isinstance(output, str):
+        output = item.get("output") if isinstance(item.get("output"), str) else ""
+    is_error = True if status in ("failed", "declined") else (False if status == "completed"
+                                                                 else None)
+    return _tool_result_event(command, item.get("exit_code"), is_error, output)
+
+
 def _codex_stream_events(line):
     """One `codex exec --json` JSONL line -> list of normalized event dicts."""
     line = (line or "").strip()
@@ -3456,6 +3583,9 @@ def _codex_stream_events(line):
             ag = item.get("aggregated_output") or item.get("output")
             if isinstance(ag, str) and ag.strip():
                 out.append({"event": "output", "text": ag[:4000]})
+            observed = _codex_tool_result(item)
+            if observed:
+                out.append(observed)
         elif it == "error":
             msg = item.get("message")
             if isinstance(msg, str) and msg and not _is_benign_codex_notice(msg):
@@ -3471,6 +3601,64 @@ def _codex_stream_events(line):
         if isinstance(msg, str) and msg:
             out.append({"_final_error": msg})
     return out
+
+
+# Claude Code names the command in the assistant's tool_use block and reports
+# its result later, in a user event, by tool_use_id -- so the command is held
+# here between the two lines. Ids are globally unique (toolu_...); bounded.
+_CLAUDE_TOOL_CALLS = collections.OrderedDict()
+_CLAUDE_TOOL_CALLS_MAX = 512
+_CLAUDE_TOOL_LOCK = threading.Lock()
+_CLAUDE_EXIT_RE = re.compile(r"^Exit code (-?\d+)\s*$", re.M)
+
+
+def _claude_note_tool_call(block):
+    tid = block.get("id")
+    inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+    cmd = inp.get("command")
+    if not isinstance(tid, str) or not tid or not isinstance(cmd, str) or not cmd.strip():
+        return
+    with _CLAUDE_TOOL_LOCK:
+        _CLAUDE_TOOL_CALLS[tid] = {"name": block.get("name") or "", "command": cmd,
+                                   "background": bool(inp.get("run_in_background")),
+                                   "at": time.time()}
+        while len(_CLAUDE_TOOL_CALLS) > _CLAUDE_TOOL_CALLS_MAX:
+            _CLAUDE_TOOL_CALLS.popitem(last=False)
+
+
+def _claude_tool_result(block, text, structured=None):
+    """Claude Code 2.1.288 (its binary, read 2026-10-04; and the owner's own
+    transcripts): a Bash call that exits non-zero comes back as
+    {"type":"tool_result","content":"Exit code 7\\nhub: HTTP 000",
+     "is_error":true,"tool_use_id":"toolu_..."} -- the error text is built as
+    [`Exit code ${code}`, stderr, stdout]. A command that succeeded is
+    "is_error":false with toolUseResult {stdout, stderr, interrupted, isImage,
+    noOutputExpected}; the Bash tool's default interpretation is
+    isError = (code !== 0), except commands whose non-zero codes mean
+    something (grep, diff, ...), which then carry returnCodeInterpretation.
+    So: "Exit code N" -> N; is_error false with no interpretation -> 0;
+    anything else (background, interrupted, timed out) -> unknown."""
+    tid = block.get("tool_use_id")
+    if not isinstance(tid, str):
+        return None
+    with _CLAUDE_TOOL_LOCK:
+        call = _CLAUDE_TOOL_CALLS.pop(tid, None)
+    if not call:
+        return None
+    is_error = block.get("is_error") if isinstance(block.get("is_error"), bool) else None
+    lines = (text or "").strip().splitlines()
+    m = _CLAUDE_EXIT_RE.match(lines[0]) if lines else None
+    if not m and lines:
+        m = _CLAUDE_EXIT_RE.match(lines[-1])
+    exit_code = int(m.group(1)) if m else None
+    s = structured if isinstance(structured, dict) else {}
+    if (exit_code is None and is_error is False and not call["background"]
+            and call["name"] in ("Bash", "PowerShell")
+            and not s.get("returnCodeInterpretation") and not s.get("interrupted")
+            and not s.get("backgroundTaskId") and not s.get("timedOutAfterMs")):
+        exit_code = 0
+    return _tool_result_event(call["command"], exit_code, is_error, text,
+                              started_at=call.get("at"))
 
 
 def _claude_stream_events(line):
@@ -3509,6 +3697,7 @@ def _claude_stream_events(line):
                 desc = (inp.get("command") or inp.get("file_path") or inp.get("path")
                         or (json.dumps(inp)[:200] if inp else ""))
                 out.append({"event": "tool", "text": "%s: %s" % (block.get("name") or "tool", desc)})
+                _claude_note_tool_call(block)
     elif etype == "user":
         # MEASURED gap, reported live: this parser only ever surfaced the
         # TOOL CALL ("Bash: npm run build") and never what it actually did --
@@ -3520,9 +3709,9 @@ def _claude_stream_events(line):
         # command_execution -> "output"); this brings claude to parity with
         # the SAME event name, so the frontend needs no changes.
         msg = ev.get("message") or {}
-        for block in (msg.get("content") or []):
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue
+        blocks = [b for b in (msg.get("content") or []) if isinstance(b, dict)
+                  and b.get("type") == "tool_result"] if isinstance(msg.get("content"), list) else []
+        for block in blocks:
             content = block.get("content")
             if isinstance(content, list):
                 text = "".join(b.get("text", "") for b in content
@@ -3533,6 +3722,15 @@ def _claude_stream_events(line):
                 text = ""
             if text.strip():
                 out.append({"event": "output", "text": text[:4000]})
+            # The structured result rides beside the message ("tool_use_result"
+            # in stream-json, "toolUseResult" in the transcript); with several
+            # tool_result blocks it cannot be told apart, so it is used only
+            # when there is exactly one.
+            structured = ev.get("tool_use_result", ev.get("toolUseResult")) \
+                if len(blocks) == 1 else None
+            observed = _claude_tool_result(block, text, structured)
+            if observed:
+                out.append(observed)
     elif etype == "result":
         if isinstance(ev.get("session_id"), str):
             out.append({"_native": ev["session_id"]})
@@ -4392,10 +4590,18 @@ def send_message_stream_durable(session_id, text):
         # Every tool call of the turn (bounded), for the fact harvest: which
         # files it wrote, which test/build commands it ran.
         tools_all = collections.deque(maxlen=200)
+        # What the CLI REPORTED its test/build commands did (tool_result
+        # events whose command is a check): the only thing memory may call
+        # verified, and what this turn's receipt records.
+        observed = collections.deque(maxlen=60)
+        turn_started = time.time()
         partial = [""]
         why = [None]
         rejected = False
         project_dir = (sess_info or {}).get("project_dir")
+        # The folder as it was, for the receipt's changed-file hashes; taken
+        # beside the turn (a CLI needs seconds before its first write).
+        before = _start_turn_snapshot(project_dir)
         # If the PROCESS dies mid-turn, the finally below never runs; this
         # marker is what the next boot turns into the stopping place. Written
         # on the turn's FIRST event, once send_message_stream holds the turn
@@ -4416,11 +4622,20 @@ def send_message_stream_durable(session_id, text):
                             memory.begin_inflight(session_id, text, project_dir)
                         except Exception:                        # noqa: BLE001
                             pass
+                    kind = ev.get("event")
+                    if kind == "tool_result":
+                        # Evidence, not display: kept for the turn's harvest
+                        # and receipt, forwarded (to a Multi worker's drain)
+                        # only when it ran a check, never to the reload buffer.
+                        if evidence.detect(ev.get("command")):
+                            observed.append(ev)
+                            q.put(ev)
+                        seen_any = True
+                        continue
                     # The nudge itself is not shown as a user turn: the reader
                     # asked for one thing and should see one conversation.
                     q.put(ev)
                     _live_put(session_id, ev)       # for a page that reloads
-                    kind = ev.get("event")
                     if kind == "tool" and ev.get("text"):
                         doing.append(ev["text"])
                         tools_all.append(ev["text"])
@@ -4462,6 +4677,12 @@ def send_message_stream_durable(session_id, text):
                         native_session_id=after.get("native_session_id"))
                 except Exception:
                     pass
+            # A RECEIPT for a turn that ran test/build commands, finished or
+            # not: what each one returned, at which commit, over which files.
+            receipt = None
+            if observed and not rejected:
+                receipt = _write_turn_receipt(session_id, project_dir, list(observed),
+                                              turn_started, before)
             # THE LIST AND THE STOPPING PLACE. A finished turn refreshes the
             # task list (the project's PROGRESS.md first, the reply's own
             # checklist second) and clears any earlier stopping place; a turn
@@ -4476,9 +4697,10 @@ def send_message_stream_durable(session_id, text):
                     memory.update_tasks(session_id, final_reply,
                                         project_dir, seen=True)
                     # LONG horizon: decisions, preferences, files written and
-                    # commands that passed -- no model call.
+                    # commands OBSERVED to pass -- no model call.
                     memory.harvest_facts(session_id, request=text, reply=final_reply,
-                                         project_dir=project_dir, tools=list(tools_all))
+                                         project_dir=project_dir, tools=list(tools_all),
+                                         results=list(observed), receipt=receipt)
                 elif interrupted:
                     memory.update_tasks(session_id, partial[0], project_dir)
                     memory.note_interrupted(session_id, request=text, doing=list(doing),

@@ -1430,6 +1430,61 @@ floor) after all bonuses. Known models never move. `/api/tracking` rows carry
   read on its own thread, so a grandchild holding the pipe cannot hang it
   either. Covered by `tests/test_install_timeout.py` (real child + grandchild).
 
+## Observed evidence, not claims (2026-10-04)
+
+Owner-approved items 1-4 of the evidence proposal; item 5 (the hub RE-RUNNING
+tests) is NOT approved -- the hub runs no command in a project, it only reads
+what the agent's CLI already ran. Covered by `tests/test_evidence.py` and
+`tests/test_observed_results.py`.
+
+- **Why** (read-only audit): without a manager any Multi phase that ended with
+  a summary was DONE; with one, `verified=True` meant "the manager agreed with
+  the summary"; `memory.harvest_commands` filed "Commands verified to work
+  here" whenever the REPLY said "green" / "succeeded" / "no errors"
+  (`_PASSED_RE`, now deleted). The parsers threw the real evidence away.
+- **Parsers** (`agentic_chat`): beside their unchanged events each emits
+  `{"event": "tool_result", command, exit_code, is_error, output_tail (<=4000),
+  started_at, ended_at}`. Shapes read from the INSTALLED CLIs (comments at
+  each parser): codex 0.154 `item.completed` `command_execution`
+  {aggregated_output, exit_code, status} (exec_events.rs; command = argv
+  shlex-joined, argv[0] = pwsh on Windows -> `evidence.inner_command`);
+  Claude Code 2.1.288 `tool_result` "Exit code N" + `is_error` (command from
+  the earlier `tool_use` by id, `_CLAUDE_TOOL_CALLS`; is_error false + no
+  `returnCodeInterpretation` = exit 0); opencode 1.18.34 `tool_use`
+  `state.metadata.exit` (status stays "completed" on a non-zero exit). The
+  durable turn forwards only CHECK results (never to the reload buffer); the
+  browser ignores the event kind.
+- **`evidence.py`** (pure): `classify(command, exit_code, output, is_error)`
+  -> PASS | FAIL | NO_TESTS | UNDETERMINED with adapters for pytest, unittest,
+  jest, vitest, mocha, cargo test, go test, node --test, bun test, tsc, vite /
+  next / webpack builds, and npm/pnpm/yarn/bun test|run build (delegated to
+  the echoed script's tool, else the tool's own summary). PASS = exit 0 AND
+  the tool's pass summary (builds: exit 0 AND none of its error lines);
+  FAIL = non-zero AND a failure in the tool's format; a pipe / `;` / `|| true`
+  after the check = exit unknown; never PASS from words.
+- **Memory**: a verified command = the LAST observed result for it was PASS;
+  the fact links its receipt (`(receipt: receipts/<scope>/<n>.json)`, only
+  when it fits MAX_FACT_CHARS).
+- **Multi** (with AND without a manager): `agent.evidence` (<= 30 rows,
+  persisted). An outstanding observed FAIL (no later PASS covering it,
+  `evidence.covers`) is a `_cheap_problems` problem -> the one revision, zero
+  manager cost (no manager: only this check runs, so an empty phase still
+  fails unretried as before). A summary claiming a pass with none observed =
+  `claimed_not_observed` (not a failure). The manager's verdict brief lists the
+  observed results. `verified` = observed PASS only; manager OK = `reviewed`
+  (old run files: verified True -> reviewed on load).
+- **Labels** (`swarm_windows.check_of`): "12 passed (observed)", "2 failed
+  (observed)", "claimed, not checked", "reviewed"; on `_multi_run_plan` rows
+  (`check`), the helpers panel chip (`.hp-check`), the swarm panel and
+  `format_result` ("N verified by an observed test/build run, M only
+  reviewed" when anything was checked; a plain run reads as before).
+- **Receipts** (`receipts.py`): `state_dir()/receipts/<run id>/<phase>.json`
+  and `<session>/<n>.json` per /agent turn that ran a check: command, argv,
+  cwd, git HEAD (read from .git files; snapshots git helper with a 5 s timeout
+  only as fallback), tool + version, started/ended, exit code, counts,
+  verdict, source "observed", SHA-256 of the CHANGED files only (40 files /
+  5 MB). json library, atomic replace, LRU-pruned to 500.
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):
