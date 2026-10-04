@@ -15063,6 +15063,10 @@ def _orch_unusable(pid, model, est=0, tools=False, images=False, veto=None):
         return "%s does not offer it right now" % pid
     if _is_model_skipped(pid, model) or quota.is_model_throttled(pid, model):
         return "it is rate-limited or resting after failures"
+    if tools and _empty_resting(pid, model):
+        n = _empty_streak(pid, model)
+        _log.info("[orchestrator] pinned %s/%s resting (%d empties)", pid, model, n)
+        return "resting (%d empties)" % n
     if tools and not _supports_tools(pid, model):
         return "it cannot call the tools this turn needs"
     if images and not _is_vision_model(pid, model):
@@ -34118,18 +34122,94 @@ _ROLE_LOG_MAX_BYTES = 5 * 1024 * 1024
 _role_log_lock = threading.Lock()
 
 
-def _tool_hedge_delay(pid, model):
+# STALLS ARE REMEMBERED (2026-10-04). An unmeasured actor's backup delay is the
+# FLEET's measured tool-turn p50 x _TOOL_FLEET_MULT, clamped; only a huge
+# prompt (>= _TOOL_HEDGE_HUGE_EST) still waits _TOOL_HEDGE_UNKNOWN.
+_TOOL_FLEET_MULT = 2.5
+_TOOL_FLEET_MIN_SAMPLES = 5
+_TOOL_FLEET_CLAMP = (12.0, 30.0)
+_TOOL_HEDGE_HUGE_EST = 100000
+_ROLE_MIN_HOP_SECONDS = 20.0         # an actor hop never gets less of the turn
+# Empty / junk 200s on a tool turn: 3 in 10 min rest the pair (even a pin).
+_EMPTY_STREAK_LIMIT = 3
+_EMPTY_STREAK_TTL = 600.0
+_empty_200 = {}                      # (pid, model) -> [epoch, ...]
+_empty_200_lock = threading.Lock()
+
+
+def _note_empty_200(pid, model):
+    """File one empty/junk 200 on a tool turn. Not when the client left."""
+    if not (pid and model) or _client_gone():
+        return
+    try:
+        now = time.time()
+        with _empty_200_lock:
+            row = [t for t in _empty_200.get((pid, model), ()) if now - t <= _EMPTY_STREAK_TTL]
+            row.append(now)
+            _empty_200[(pid, model)] = row[-_EMPTY_STREAK_LIMIT:]
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _clear_empty_200(pid, model):
+    try:
+        with _empty_200_lock:
+            _empty_200.pop((pid, model), None)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _empty_streak(pid, model):
+    """Empty/junk 200s of this pair inside the TTL (0 when none). Never raises."""
+    try:
+        now = time.time()
+        with _empty_200_lock:
+            return len([t for t in _empty_200.get((pid, model), ())
+                        if now - t <= _EMPTY_STREAK_TTL])
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+def _empty_resting(pid, model):
+    """True while the pair is resting after _EMPTY_STREAK_LIMIT empties."""
+    return _empty_streak(pid, model) >= _EMPTY_STREAK_LIMIT
+
+
+def _fleet_tool_p50_ms():
+    """Median over pairs with >= _TOOL_FLEET_MIN_SAMPLES tool-turn samples of
+    each pair's p50, or None while no pair has that many."""
+    try:
+        with _outcome_lock:
+            rows = [list(s) for s in _tool_ttft.values()]
+        meds = sorted(_percentile(s, 50) for s in rows if len(s) >= _TOOL_FLEET_MIN_SAMPLES)
+        if not meds:
+            return None
+        n = len(meds)
+        return meds[n // 2] if n % 2 else (meds[n // 2 - 1] + meds[n // 2]) / 2.0
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _tool_hedge_delay(pid, model, est=0):
     """Seconds of silence from a tool-turn actor before the backup starts:
     max(_TOOL_HEDGE_FLOOR, _TOOL_HEDGE_MULT x its tool-turn p50) from
     _tool_ttft (streamed first content on tool turns, plus every role call's
-    duration -- a buffered tool call is usable only once complete), or
-    _TOOL_HEDGE_UNKNOWN while fewer than _TOOL_MIN_SAMPLES exist."""
+    duration -- a buffered tool call is usable only once complete). While the
+    pair has fewer than _TOOL_MIN_SAMPLES: the fleet median x 2.5 clamped to
+    12-30 s (30 s with no fleet data), and _TOOL_HEDGE_UNKNOWN for a request
+    of _TOOL_HEDGE_HUGE_EST tokens or more."""
     try:
         with _outcome_lock:
             s = list(_tool_ttft.get((pid, model)) or [])
-        if len(s) < _TOOL_MIN_SAMPLES:
+        if len(s) >= _TOOL_MIN_SAMPLES:
+            return max(_TOOL_HEDGE_FLOOR, _TOOL_HEDGE_MULT * _percentile(s, 50) / 1000.0)
+        if (est or 0) >= _TOOL_HEDGE_HUGE_EST:
             return _TOOL_HEDGE_UNKNOWN
-        return max(_TOOL_HEDGE_FLOOR, _TOOL_HEDGE_MULT * _percentile(s, 50) / 1000.0)
+        fleet = _fleet_tool_p50_ms()
+        if fleet is None:
+            return _TOOL_FLEET_CLAMP[1]
+        lo, hi = _TOOL_FLEET_CLAMP
+        return min(hi, max(lo, _TOOL_FLEET_MULT * fleet / 1000.0))
     except Exception:                                            # noqa: BLE001
         return _TOOL_HEDGE_UNKNOWN
 
@@ -34389,6 +34469,7 @@ def _role_judge(pid, model, resp, exc, body, payload, est, kind):
         msg = ((data.get("choices") or [{}])[0].get("message") or {})
         if not (msg.get("tool_calls") or (msg.get("content") or "").strip()):
             _record_outcome(pid, model, False)
+            _note_empty_200(pid, model)
             return fail("empty", "200 with an empty message")
         if not msg.get("tool_calls") and tools:
             if tool_rescue.rescue(data, tools):
@@ -34411,11 +34492,13 @@ def _role_judge(pid, model, resp, exc, body, payload, est, kind):
         gate = _answer_gate(data, payload, bool(tools), hop=(pid, model))
         if gate == "junk":
             _record_outcome(pid, model, False, junk=True)
+            _note_empty_200(pid, model)
             return fail("junk", "degenerate answer (nothing salvageable)", 0)
         msg = ((data.get("choices") or [{}])[0].get("message") or {})
         if msg.get("tool_calls") and not _swarm_tool_calls_valid(msg, tools):
             _record_outcome(pid, model, False)
             return fail("invalid", "a tool call the CLI cannot run", 0)
+        _clear_empty_200(pid, model)
         _record_chat_usage(pid, model, data, est, ok=gate == "ok")
         return {"ok": True, "data": data, "msg": msg, "gate": gate}
     except Exception as e:                                       # noqa: BLE001
@@ -34449,7 +34532,32 @@ def _role_start_leg(idx, pid, model, body, deadline, q, est, kind):
     return tok
 
 
-def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spent=None):
+def _role_share(room, attempts_left):
+    """Seconds one attempt may take of `room` when `attempts_left` attempts
+    must still fit: room / attempts_left, never under _ROLE_MIN_HOP_SECONDS,
+    never over the room itself."""
+    n = max(1, int(attempts_left or 1))
+    return min(room, max(_ROLE_MIN_HOP_SECONDS, room / n))
+
+
+def _note_actor_stall(clock, pid, model, silent_s):
+    """An actor the hub stopped waiting for after `silent_s` of silence (its
+    backup fired, or the hop ran out): a CENSORED tool-turn timing sample
+    (>= silent_s) plus the recent-stall mark _build_chain reads, so the next
+    turn puts the pair behind the quick ones. Files nothing when the client
+    left. Never raises."""
+    if _client_gone():
+        return
+    try:
+        _record_speed_sample(_tool_ttft, pid, model, float(silent_s) * 1000.0)
+        _note_recent_hop_failure(pid, model, "timeout")
+        clock._note_stall(pid)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spent=None,
+                    attempts_left=1):
     """One actor hop with its stall backup. Returns (pid, model, data, msg)
     of the first VALID answer, or None (the walk moves on).
 
@@ -34459,6 +34567,9 @@ def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spe
     budget = clock.open_role_hop(pid, model)
     now = time.monotonic()
     room = turn_end - now
+    # attempts_left attempts (this actor, its backup, the next hop) must fit in
+    # the turn: a silent first hop cannot eat half the clock.
+    room = _role_share(room, attempts_left)
     deadline = room if budget is None else min(budget, room)
     if deadline <= 1.0:
         return None
@@ -34469,7 +34580,7 @@ def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spe
     toks = {0: _role_start_leg(0, pid, model, body, deadline, q, est, kind)}
     rec["calls"] += 1
     rec["sent_tokens"] += est
-    delay = _tool_hedge_delay(pid, model)
+    delay = _tool_hedge_delay(pid, model, est)
     partner = clock.tool_hedge_partner(pid, model) if delay < deadline - 1.0 else None
     t0, end = now, now + deadline
     pending, fired = {0}, False
@@ -34494,7 +34605,9 @@ def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spe
                 fired = True
                 p1, m1 = partner
                 b1 = clock._budget_for(p1, m1, False)
-                d1 = (turn_end - now) if b1 is None else min(b1, turn_end - now)
+                d1 = _role_share(turn_end - now, max(1, attempts_left - 1))
+                if b1 is not None:
+                    d1 = min(b1, d1)
                 if d1 > 1.0:
                     clock.fire_tool_hedge(p1, m1)
                     legs[1] = (p1, m1)
@@ -34512,6 +34625,13 @@ def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spe
             break                        # out of time
         pending.discard(idx)
         if v.get("ok"):
+            if idx == 1 and 0 in pending:
+                # The actor was silent for the whole delay and lost to its
+                # backup: remembered. (A backup that loses is not: it ran for
+                # less than its own delay.)
+                _note_actor_stall(clock, pid, model, time.monotonic() - t0)
+            elif idx == 0:
+                _clear_recent_hop_failure(pid, model)
             for j in pending:
                 toks[j].cancel("another actor answered first")
             _row(idx, "actor" if idx == 0 else "backup (stall)")
@@ -34536,6 +34656,8 @@ def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spe
         clock._note_stall(pid)
         if deadline >= _ADAPTIVE_HOP_FLOOR:
             _note_recent_hop_failure(pid, model, "deadline")
+            _record_speed_sample(_tool_ttft, pid, model,
+                                 (time.monotonic() - t0) * 1000.0)
     return None
 
 
@@ -35470,6 +35592,9 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
                                else _SWARM_TOOL_HOP_DEADLINE)
     if clock.deadline_at is not None:
         turn_end = min(turn_end, clock.deadline_at)
+    # Pairs resting after 3 empty/junk 200s go to the TAIL (kept, never dropped).
+    chain = ([e for e in chain if not _empty_resting(e[0], e[1])]
+             + [e for e in chain if _empty_resting(e[0], e[1])])
     clock.plan_tool_hedge(chain)
     rows, served, hops = [], None, 0
     spent = []          # every pair dispatched to: kept off the verifier pool
@@ -35488,7 +35613,8 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
             rec["nudge"] = round(_bandit_delta(kind, hop_pid, hop_model,
                                                _benchmark_score(hop_pid, hop_model)), 3)
         served = _role_actor_hop(clock, abody, hop_pid, hop_model, est, kind, rec, rows,
-                                 turn_end, spent)
+                                 turn_end, spent,
+                                 attempts_left=max(1, min(3, _ROLE_MAX_ACTOR_HOPS - hops + 1)))
         if served:
             break
     rec["actor_hops"] = hops

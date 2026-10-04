@@ -1870,6 +1870,23 @@ Owner: "each model must do something -- collaboration, not racing."
   `_verify_family()` -> `verify.family` or None; `_free_verdict(brief)` with
   `brief["text"]` (+ optional `producer`, `avoid_families`) -> {"ok",
   "problems", "severity"} or None (fail-open).
+- **Stalls are remembered** (2026-10-04, `tests/test_tool_turn_stalls.py`).
+  MEASURED live: nvidia/z-ai/glm-5.3 "silent 45 s -> backup" at 17:02 and
+  again first at 17:04. An actor that loses to its backup (silent for the
+  whole delay) gets a CENSORED `_tool_ttft` sample (>= the silence) plus
+  `_note_recent_hop_failure("timeout")` + `clock._note_stall` (`_note_actor_stall`),
+  so `_build_chain` puts it in the stall tail and `_tool_turn_slow` sees it.
+  A backup that loses, or an actor that answers first, files nothing; a
+  client that left files nothing; an actor win clears the mark.
+- **Backup delay** (`_tool_hedge_delay(pid, model, est)`): unmeasured pair =
+  fleet median of per-pair tool-turn p50 (pairs with >= 5 samples) x 2.5,
+  clamped 12-30 s (30 s with no fleet data); 45 s only at >= 100K tokens.
+- **Budget**: an actor hop gets room / attempts_left (3 -> 2 -> 1, floor 20 s,
+  `_role_share`); the backup likewise; deadline constants unchanged.
+- **Empty-200 streak**: 3 empty/junk 200s from one pair in 10 min rest it for
+  tool turns (`_empty_resting`): walked last, and `_orch_unusable` skips the
+  orchestrator pin (`[orchestrator] pinned <pair> resting (3 empties)`); a good
+  answer or the TTL clears it.
 
 ## Team notes: parallel specialists for hard tool turns (2026-10-04)
 

@@ -333,7 +333,8 @@ def test_hedge_delay_is_max_floor_and_measured_p50():
         with A._outcome_lock:
             A._tool_ttft[("hp", "hm")] = [500.0, 500.0, 500.0]
         assert A._tool_hedge_delay("hp", "hm") == A._TOOL_HEDGE_FLOOR    # 6 s floor
-        assert A._tool_hedge_delay("never", "seen") == A._TOOL_HEDGE_UNKNOWN
+        assert A._TOOL_FLEET_CLAMP[0] <= A._tool_hedge_delay("never", "seen") <= A._TOOL_FLEET_CLAMP[1]
+        assert A._tool_hedge_delay("never", "seen", 150000) == A._TOOL_HEDGE_UNKNOWN
     finally:
         with A._outcome_lock:
             A._tool_ttft.pop(("hp", "hm"), None)
