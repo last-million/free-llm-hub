@@ -142,10 +142,14 @@ def _shutdown_conn(conn, token):
 
 
 class Token:
-    """One request's cancel flag. Thread-safe; cancel() runs once."""
+    """One request's cancel flag. Thread-safe; cancel() runs once.
 
-    def __init__(self, label=""):
+    `log=False` for a per-hop token (see child()): abandoning a hop is routine
+    and must not log like a client that left."""
+
+    def __init__(self, label="", log=True):
         self.label = str(label or "")
+        self.log = bool(log)
         self.started = time.monotonic()
         self.reason = None
         self.cancelled_at = None         # time.time() of the cancel
@@ -218,12 +222,127 @@ class Token:
                 n += 1
         self.closed_upstream = n
         try:
-            _log.warning("[cancel] %s after %.1fs: %s -- stopped its work "
-                         "(%d upstream call(s) cut)", self.label or "request",
-                         self.after, self.reason, n)
+            if self.log:
+                _log.warning("[cancel] %s after %.1fs: %s -- stopped its work "
+                             "(%d upstream call(s) cut)", self.label or "request",
+                             self.after, self.reason, n)
+            elif n:
+                _log.debug("[hop] %s abandoned after %.1fs: %d upstream call(s) cut",
+                           self.label or "hop", self.after, n)
         except Exception:                                        # noqa: BLE001
             pass
         return True
+
+
+def child(label="hop"):
+    """A token for ONE upstream hop run on a worker thread, so the hop's
+    connection can be cut when the hub stops waiting for it (hop budget,
+    header deadline, a hedge leg that lost) instead of staying open until the
+    provider's read timeout. Cancelled with the request's own token too."""
+    parent = current()
+    tok = Token(label=label, log=False)
+    if parent is not None:
+        parent.add_hook(lambda: tok.cancel(parent.reason or "client disconnected"))
+    return tok
+
+
+def run_as(token, fn, *a, **kw):
+    """fn(*a, **kw) with `token` current (inside a ctx.run or a fresh thread)."""
+    _CURRENT.set(token)
+    return fn(*a, **kw)
+
+
+# --------------------------------------------------------------------------- #
+# Closing an abandoned upstream response without waiting on it
+# --------------------------------------------------------------------------- #
+# MEASURED on Windows (requests 2.34 / urllib3 2.7): resp.close() from one
+# thread while another is blocked reading the same streamed body waits on the
+# reader's buffer lock until that read returns -- for a silent relay, the read
+# timeout (STREAM_IDLE_TIMEOUT, ~90 s). Every hop the hub gave up on (a peek
+# that saw no content, a stall cut, a hedge loser, the deadline guard) closed
+# its response that way, so the chain walked one hop per read timeout. A base
+# socket.shutdown() returns at once and makes the blocked read return; the
+# close itself then finishes on a daemon thread.
+CLOSE_WAIT = 0.2
+
+
+def response_socket(resp):
+    """The live client socket under a requests/urllib3 response, or None (body
+    fully read and released, a fake, a wrapper without one)."""
+    try:
+        raw = getattr(resp, "raw", None)
+        if raw is None:
+            return None
+        conn = getattr(raw, "_connection", None)
+        if conn is not None:
+            sock = _raw_socket(conn) or getattr(conn, "_hub_raw_sock", None)
+            if sock is not None and sock.fileno() >= 0:
+                return sock
+        fp = getattr(raw, "_fp", None)             # http.client.HTTPResponse
+        buf = getattr(fp, "fp", None)              # BufferedReader (None once closed)
+        sio = getattr(buf, "raw", None)            # socket.SocketIO
+        sock = getattr(sio, "_sock", None)
+        if sock is not None and sock.fileno() >= 0:
+            return sock
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def shutdown_socket(sock):
+    """Base socket.shutdown(SHUT_RDWR); never raises, never blocks."""
+    try:
+        if isinstance(sock, socket.socket) and sock.fileno() >= 0:
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+            return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return False
+
+
+def nonblocking_close(resp):
+    """Make `resp.close()` (a requests.Response) safe to call while another
+    thread is still blocked reading it: the socket is shut down first, then
+    the real close runs on a daemon thread, waited on for at most CLOSE_WAIT.
+    A response with no live socket closes inline, exactly as before.
+    Idempotent; anything that is not a requests.Response is left alone (the
+    wrappers' own close() reaches the one inside). Returns `resp`."""
+    try:
+        import requests as _rq
+        if not isinstance(resp, _rq.Response) or getattr(resp, "_hub_nb_close", False):
+            return resp
+        # WEAK, and the class's own close: a closure holding the response (or
+        # its bound close) is a reference cycle, and MEASURED, that kept a
+        # fully read response -- so its urllib3 pool and kept-alive socket --
+        # open until the cyclic GC ran, instead of freeing it at once.
+        ref = weakref.ref(resp)
+        cls_close = type(resp).close
+
+        def close():
+            r = ref()
+            if r is None:
+                return None
+            sock = response_socket(r)
+            if sock is None:
+                return cls_close(r)
+            shutdown_socket(sock)
+
+            def _quiet(target):
+                try:
+                    cls_close(target)
+                except Exception:                                # noqa: BLE001
+                    pass
+            t = threading.Thread(target=_quiet, args=(r,), daemon=True,
+                                 name="upstream-close")
+            t.start()
+            t.join(CLOSE_WAIT)
+            return None
+
+        resp.close = close
+        resp._hub_nb_close = True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return resp
 
 
 def peer_closed(sock):

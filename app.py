@@ -7289,7 +7289,7 @@ def _dispatch_chat(pid, payload, stream):
         # _note_ttft reads it back off the response when the first real content
         # arrives, which is the number that actually describes a stream.
         started = time.perf_counter()
-        resp = _upstream_chat(pid, payload, stream)
+        resp = _nb_close(_upstream_chat(pid, payload, stream))
         try:
             resp._hub_started = started
             # Size of what was asked, for the long-context speed ledger.
@@ -27529,11 +27529,14 @@ def _post_with_header_deadline(deadline, post, **kw):
 
     # clientgone.bind: a plain thread starts with an empty context, and the
     # upstream call it makes must still be tracked for the request's cancel.
-    t = threading.Thread(target=clientgone.bind(_call), daemon=True)
+    hop = clientgone.child("header-wait")
+    t = threading.Thread(target=clientgone.run_as, args=(hop, _call), daemon=True)
     t.start()
     if clientgone.join(t, deadline):
+        hop.cancel("client disconnected")
         raise clientgone.ClientGone("the client disconnected")
     if t.is_alive():
+        hop.cancel("no response headers in time")   # cut, not left open
         raise requests.exceptions.ReadTimeout(
             "no response headers in %ss" % deadline)
     if "exc" in box:
@@ -27955,10 +27958,14 @@ def _call_with_wall_clock(seconds, fn, *a, **kw):
     box = {}
     lock = threading.Lock()
     ctx = contextvars.copy_context()
+    # The worker's own hop token (clientgone.child): when the wait below
+    # gives up, its call is CUT instead of left open until the provider's
+    # read timeout.
+    hop = ctx.run(clientgone.child, "hop")
 
     def _run():
         try:
-            v = ctx.run(fn, *a, **kw)
+            v = ctx.run(clientgone.run_as, hop, fn, *a, **kw)
         except BaseException as exc:                             # noqa: BLE001
             with lock:
                 box["exc"] = exc
@@ -27981,6 +27988,7 @@ def _call_with_wall_clock(seconds, fn, *a, **kw):
         with lock:
             box["abandoned"] = True
             late = box.pop("v", None)
+        hop.cancel("client disconnected")
         if late is not None:
             try:
                 late.close()             # it landed just as the client left
@@ -28001,6 +28009,7 @@ def _call_with_wall_clock(seconds, fn, *a, **kw):
         if "v" in box:
             return box["v"]
         box["abandoned"] = True
+    hop.cancel("hop budget spent")     # cut the abandoned call now
     raise _HopBudgetExceeded("no answer within %.0fs" % seconds)
 
 
@@ -28099,6 +28108,27 @@ class _PrePeekedResponse:
         return getattr(self._resp, name)
 
 
+def _nb_close(resp):
+    """Make an upstream response's close() safe while a reader thread is
+    still blocked on it (clientgone.nonblocking_close): the socket is shut
+    down first, the close finishes on a daemon thread. Reaches the real
+    response inside the hub's wrappers. Returns `resp`; never raises.
+
+    MEASURED before this: a hop the hub gave up on (a peek with no content,
+    a stall cut, a hedge loser) closed its silent stream from the request
+    thread, which waited on the blocked reader until the provider's read
+    timeout (~90 s) -- one hop per read timeout instead of per peek."""
+    try:
+        clientgone.nonblocking_close(resp)
+        for attr in ("_resp", "_upstream"):
+            inner = getattr(resp, "__dict__", {}).get(attr)
+            if inner is not None:
+                clientgone.nonblocking_close(inner)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return resp
+
+
 def _close_hedge_item(item):
     try:
         if item[1] in ("resp", "json", "peek"):
@@ -28118,7 +28148,7 @@ def _run_hedge_leg(idx, pid, payload, stream, lines, budget, q, lock, abandoned,
     still peeking it, so a loser stops reading upstream at once."""
     started = time.monotonic()
     try:
-        resp = _dispatch_chat(pid, payload, stream)
+        resp = _nb_close(_dispatch_chat(pid, payload, stream))
     except BaseException as exc:                                 # noqa: BLE001
         item = (idx, "exc", exc, None)
     else:
@@ -28656,12 +28686,18 @@ class _ChainClock:
         graced = False
         legs = {0: (pid, (payload or {}).get("model"), payload, time.monotonic())}
 
+        # One hop token per leg (clientgone.child): a leg the race leaves
+        # behind has its in-flight call cut, not left open until its read
+        # timeout.
+        self._leg_tokens = leg_tokens = {}
+
         def _start(idx, p, pl, budget):
             ctx = contextvars.copy_context()
+            hop = leg_tokens[idx] = ctx.run(clientgone.child, "hedge-leg")
 
             def _run():
-                ctx.run(_run_hedge_leg, idx, p, pl, stream, lines, budget, q, lock,
-                        abandoned, grace, streaming, live)
+                ctx.run(clientgone.run_as, hop, _run_hedge_leg, idx, p, pl, stream,
+                        lines, budget, q, lock, abandoned, grace, streaming, live)
             threading.Thread(target=_carry_usage_source(_run), daemon=True).start()
 
         budget0 = self._hop_budget
@@ -28670,6 +28706,9 @@ class _ChainClock:
         _start(0, pid, payload, budget0)
         fired = False
         pending = {0}
+        # Legs whose result the race has NOT received: the only ones _settle
+        # may cut (a received leg's response may be the one handed back).
+        self._leg_pending = pending
         fallback = None
         failed = {}
         # Each leg's verdict as judged in the race: _answer_gate salvages a
@@ -28764,6 +28803,10 @@ class _ChainClock:
         with lock:
             abandoned.update(i for i in legs if i != keep)
             running = [r for i, r in (live or {}).items() if i != keep]
+        tokens = getattr(self, "_leg_tokens", None) or {}
+        for i in list(getattr(self, "_leg_pending", None) or ()):
+            if i != keep and i in tokens:
+                tokens[i].cancel("hedge leg abandoned")   # its call, still in flight
         for r in running:
             try:
                 r.close()
@@ -28882,6 +28925,7 @@ class _ChainClock:
             else:
                 resp = _call_with_wall_clock(self._hop_budget, _dispatch_chat,
                                              pid, payload, stream)
+            _nb_close(resp)
         except _HopBudgetExceeded:
             # Only a budget big enough to be a fair wait is evidence: a hop
             # squeezed into the last second of the request deadline is not.
@@ -32285,11 +32329,13 @@ def _dispatch_chat_with_deadline(pid, payload, deadline=None):
     # _carry_usage_source: the worker thread has neither the caller's
     # thread-local label nor its request, so its quota hit would otherwise be
     # filed as "background" instead of "swarm" / the calling CLI.
-    t = threading.Thread(target=clientgone.bind(_carry_usage_source(_call)),
-                         daemon=True)
+    hop = clientgone.child("stage-hop")
+    t = threading.Thread(target=clientgone.run_as,
+                         args=(hop, _carry_usage_source(_call)), daemon=True)
     t.start()
     clientgone.join(t, deadline)    # returns early once the client left
     if t.is_alive():
+        hop.cancel("stage hop deadline")   # cut the hung call, do not leak it
         return None, None            # hung hop — abandon and walk the chain on
     return box.get("resp"), box.get("exc")
 

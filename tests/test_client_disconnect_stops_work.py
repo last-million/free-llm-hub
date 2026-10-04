@@ -560,6 +560,97 @@ def test_an_idle_keep_alive_client_between_two_requests_is_not_cancelled(
 
 
 # --------------------------------------------------------------------------- #
+# A hop the hub gives up on is closed WITHOUT blocking the next one
+# --------------------------------------------------------------------------- #
+# MEASURED before the fix (Windows, requests 2.34 / urllib3 2.7): after a
+# first-content peek gave up on a relay that sent headers then nothing, the
+# loop's resp.close() waited on the peek worker's blocked read until the read
+# timeout -- on the 8799 sandbox with an 8 s peek, hop 2 had not started 20 s
+# later. clientgone.nonblocking_close shuts the socket down first.
+
+def _two_hop_relay(first):
+    """Connection 0: `first`; connection 1: a complete streamed answer."""
+    answer = [(0, SSE_HEAD), (0, _frame({"role": "assistant", "content": ANSWER})),
+              (0, _frame({}, "stop")), (0, _chunked(b"data: [DONE]\n\n")),
+              (0, b"0\r\n\r\n")]
+    return lambda n: first if n == 0 else answer
+
+
+def test_a_silent_hop_after_its_peek_does_not_hold_the_next_hop(
+        hub, upstream, filed, monkeypatch):
+    peek = 1.5
+    monkeypatch.setattr(A, "_stream_peek_timeout", lambda *a, **k: peek)
+    up = upstream(_two_hop_relay([(0, SSE_HEAD), (0, _chunked(b": keepalive\n\n"))]))
+    _wire(monkeypatch, filed, up)
+    cli = _send(hub, {"model": "auto", "stream": True,
+                      "messages": [{"role": "user", "content": "explain hash maps in depth"}]})
+    cli.settimeout(30)
+    got = b""
+    while b"[DONE]" not in got:
+        chunk = cli.recv(65536)
+        if not chunk:
+            break
+        got += chunk
+    cli.close()
+    assert b"tombstone" in got, "hop 2 answered"
+    assert len(up.conns) == 2
+    gap = up.conns[1]["opened"] - up.conns[0]["opened"]
+    assert gap < peek + 1.0, "hop 2 started %.2fs after hop 1 (peek %.1fs)" % (gap, peek)
+    assert _until(lambda: up.conns[0]["closed"], 2), "the abandoned stream is closed"
+    assert up.conns[0]["closed"] - up.conns[0]["opened"] < peek + 1.0
+    # ...and the hop that SERVED is released too, not kept open by the close
+    # wrapper (a reference cycle there held it until the cyclic GC).
+    assert _until(lambda: up.conns[1]["closed"], 3), "the served stream is released"
+    row = _until(lambda: (_row() or {}).get("finished") and _row(), 4)
+    assert row["status"] == "ok", row
+
+
+def test_a_hop_out_of_budget_has_its_call_cut_not_left_open(
+        hub, upstream, filed, monkeypatch):
+    """A buffered hop past its budget (_call_with_wall_clock): the request
+    walks on, and the abandoned call's connection is closed at once instead
+    of staying open until the provider's read timeout."""
+    budget = 1.0
+    monkeypatch.setattr(A, "_is_trivial_turn", lambda *a, **k: True)
+    monkeypatch.setattr(A, "_TRIVIAL_HOP_BUDGET", budget)
+    monkeypatch.setattr(A, "_TRIVIAL_SLOW_HOP_BUDGET", budget)
+    monkeypatch.setattr(A, "_adaptive_hop_budget", lambda pid, model, ceiling, stream=None: ceiling)
+    up = upstream(lambda n: [] if n == 0 else [(0, _json_reply(ANSWER))])
+    _wire(monkeypatch, filed, up)
+    conn = http.client.HTTPConnection("127.0.0.1", hub, timeout=20)
+    conn.request("POST", "/v1/chat/completions", body=json.dumps({
+        "model": "auto", "stream": False,
+        "messages": [{"role": "user", "content": "What is 5767 plus 1?"}]}),
+        headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    assert resp.status == 200 and b"tombstone" in data
+    assert len(up.conns) == 2
+    assert up.conns[1]["opened"] - up.conns[0]["opened"] < budget + 1.0
+    assert _until(lambda: up.conns[0]["closed"], 2), "the abandoned call is cut"
+    assert up.conns[0]["closed"] - up.conns[0]["opened"] < budget + 1.0
+
+
+def test_a_response_nobody_reads_still_closes_inline():
+    """No live socket (a fully read body, a fake): close() is the plain one."""
+    import requests as rq
+
+    class _Raw:
+        _connection = None
+        _fp = None
+
+    r = rq.Response()
+    r.raw = _Raw()
+    closed = []
+    r.raw.close = lambda: closed.append(1)
+    clientgone.nonblocking_close(r)
+    clientgone.nonblocking_close(r)              # idempotent
+    r.close()
+    assert closed == [1]
+
+
+# --------------------------------------------------------------------------- #
 # Multi: Stop reaches the workers that are already running
 # --------------------------------------------------------------------------- #
 

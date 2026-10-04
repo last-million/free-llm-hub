@@ -918,6 +918,23 @@ fan-out, pipelines, stream gate hold) nothing is written.
   0.5 s after curl left, relay connection cut at +0.5 s, 1 hop total; with
   the flag off the row stayed `in_progress` past 20 s and the relay
   connection was never cut.
+- **Abandoned hops close without blocking** (same test file). MEASURED on
+  Windows: a `resp.close()` while a peek/pump thread is blocked reading that
+  streamed body waits on the reader's buffer lock until the read returns --
+  for a relay that sent headers then nothing, the 90 s read timeout. So every
+  hop the hub gave up on (a peek with no content, a stall cut, a hedge loser,
+  the deadline guard) held the request thread: on the 8799 sandbox (peek 8 s)
+  hop 2 started at +90.0 s; now at +8.1 s. `_nb_close` (=
+  `clientgone.nonblocking_close`, installed on every streamed response in
+  `_dispatch_chat`, `_ChainClock._plain` and each hedge leg) makes `close()`
+  shut the socket down first, then close on a daemon thread (waited <= 0.2 s);
+  no live socket = the plain close. The closure holds the response WEAKLY
+  (a cycle kept fully read responses' sockets open until the cyclic GC).
+  In-flight calls the hub stops waiting for run under a per-hop token
+  (`clientgone.child`, linked to the request's): `_call_with_wall_clock`
+  (hop budget), `_post_with_header_deadline`, `_dispatch_chat_with_deadline`
+  and hedge legs still pending at `_settle` are CUT (`hop.cancel`) instead of
+  left open until the provider's read timeout.
 
 ## Long-context deadlines & exact facts (2026-09-27)
 
