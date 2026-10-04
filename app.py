@@ -15638,16 +15638,6 @@ def view_page(slug, rest=None):
 
 
 @app.route("/")
-def landing():
-    """Serve the marketing landing page."""
-    try:
-        return render_template("landing.html",
-                               csp_nonce=getattr(g, "csp_nonce", ""))
-    except TemplateNotFound:
-        return index()
-
-
-@app.route("/hub")
 def index():
     try:
         page = make_response(
