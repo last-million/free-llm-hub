@@ -75,6 +75,21 @@ def test_a_slow_plan_says_planning_at_once_and_keeps_saying_it(monkeypatch):
     assert A._multi_run_plan("conv-p") is None
 
 
+def test_the_plan_names_what_each_helper_waits_for():
+    # Phases start as soon as their own needs are finished (not wave by wave),
+    # so the lines say what each one waits for.
+    lines = A._multi_plan_lines({"agents": [
+        {"index": 1, "title": "Backend", "needs": []},
+        {"index": 2, "title": "Frontend", "needs": []},
+        {"index": 3, "title": "API tests", "needs": [1]},
+        {"index": 4, "title": "Review and finish", "needs": [1, 2, 3]}],
+        "waves": [[1, 2], [3], [4]]})
+    assert lines == [
+        "Plan · start now (2 helpers at the same time): 1 · Backend | 2 · Frontend",
+        "Plan · 3 · API tests: starts when 1 is done",
+        "Plan · 4 · Review and finish: starts when all the others are done"]
+
+
 def test_the_plan_is_shown_wave_by_wave():
     lines = A._multi_plan_lines({"agents": [
         {"index": 1, "title": "Backend"}, {"index": 2, "title": "Frontend"},

@@ -18573,10 +18573,35 @@ def _multi_owner_record(run):
 
 
 def _multi_plan_lines(status_row):
-    """The plan as page lines, one per wave: which phases start first, which
-    run at the same time, which wait. Never raises."""
+    """The plan as page lines: which phases start at once, and what each other
+    phase waits for. Since the run starts a phase as soon as the phases it
+    NEEDS are finished (swarm_windows._run_phases), the lines name those needs
+    instead of "first ... then ..." waves; rows without `needs` (older runs)
+    keep the wave wording. Never raises."""
     try:
-        titles = {a.get("index"): a.get("title") or "" for a in status_row.get("agents") or []}
+        rows = [a for a in status_row.get("agents") or [] if isinstance(a, dict)]
+        titles = {a.get("index"): a.get("title") or "" for a in rows}
+        if rows and all("needs" in a for a in rows):
+            out = []
+            now = [a for a in rows if not a.get("needs")]
+            if now:
+                names = " | ".join("%s · %s" % (a.get("index"), titles.get(a.get("index"), ""))
+                                   for a in now)
+                together = " (%d helpers at the same time)" % len(now) if len(now) > 1 else ""
+                out.append("Plan · start now%s: %s" % (together, names))
+            for a in rows:
+                needs = [n for n in (a.get("needs") or []) if n != a.get("index")]
+                if not needs:
+                    continue
+                others = sorted(i for i in titles if i != a.get("index"))
+                if len(needs) > 1 and sorted(needs) == others:
+                    when = "all the others are done"
+                else:
+                    when = "%s %s done" % (", ".join(str(n) for n in needs),
+                                           "is" if len(needs) == 1 else "are")
+                out.append("Plan · %s · %s: starts when %s" % (
+                    a.get("index"), titles.get(a.get("index"), ""), when))
+            return out
         waves = status_row.get("waves") or [[i] for i in sorted(titles)]
         out = []
         for n, wave in enumerate(waves, start=1):
