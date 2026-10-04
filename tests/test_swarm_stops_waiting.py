@@ -243,3 +243,24 @@ def test_the_hubs_own_deadline_is_not_the_models_fault(fanout, monkeypatch):
     A._swarm_tool_result(dict(BODY))
     assert not [r for r in recorded if r[2] is False], \
         "a deadline was counted against the model"
+
+
+def test_a_member_the_hub_stopped_waiting_for_is_not_shown_as_no_answer(fanout, monkeypatch):
+    """REPORTED 2026-10-04 (owner): the Activity race showed "no answer" next to
+    a model the hub had simply stopped waiting for once another model's tool
+    call was in hand -- it read as a broken model. It now says what happened."""
+    monkeypatch.setattr(A, "_dispatch_chat_with_deadline", _dispatcher({
+        "fast": (0.0, _with_tool_call()),
+        "slow": (4.0, None),        # still running when the grace ends
+        "never": (4.0, None),
+    }))
+    act = {}
+    with A.app.test_request_context("/v1/chat/completions", method="POST"):
+        A.g.act = act
+        out = A._swarm_tool_result(dict(BODY))
+    assert out is not None
+    roles = {row["model"].split("/")[0]: row["role"] for row in act["pipeline"]}
+    assert roles["fast"] == "winner"
+    assert roles["slow"] == "stopped: another model answered first"
+    assert roles["never"] == "stopped: another model answered first"
+    assert "no answer" not in act["pipeline"].__repr__()

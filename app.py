@@ -33261,8 +33261,11 @@ def _swarm_tool_result(body):
         # fan-out start, and carried into every member.
         _member = _pipeline_bound(_carry_usage_source(_run))
         _fut_pid = {}
+        _fut_pair = {}
         for pm in picks:
-            _fut_pid[ex.submit(_member, pm)] = pm[0]
+            _f = ex.submit(_member, pm)
+            _fut_pid[_f] = pm[0]
+            _fut_pair[_f] = (pm[0], pm[1])
         pending = set(_fut_pid)
         _fanout_started = time.monotonic()
         deadline = _fanout_started + _fan_limit
@@ -33342,6 +33345,19 @@ def _swarm_tool_result(body):
                 # re-dispatch to the same providers while these still run.
                 break
     finally:
+        # Members still running when the race ended were stopped by the HUB
+        # (a winner was in hand, or the clock ran out) -- name that, instead of
+        # the activity row's "no answer", which read as a broken model
+        # (owner, 2026-10-04: "why I see some models don't answer").
+        try:
+            for _f in pending:
+                _pr = _fut_pair.get(_f)
+                if _pr and _pr not in _member_why:
+                    _member_why[_pr] = (
+                        "abandoned: another model answered first" if results
+                        else "no answer before the time limit")
+        except Exception:                                        # noqa: BLE001
+            pass
         # Anything still running from here on was abandoned by US, not failed by
         # the provider -- stop counting it against the model.
         moved_on[0] = True
@@ -33404,7 +33420,8 @@ def _swarm_tool_result(body):
                 # showing it as one is what made the fan-out look like half the
                 # fleet was broken.
                 why = _member_why.get((p_id, m_id)) or "no answer"
-                role = "abandoned" if why.startswith("abandoned") else why[:60]
+                role = ("stopped: another model answered first"
+                        if why.startswith("abandoned") else why[:60])
             rows.append({"role": role, "model": p_id + "/" + m_id})
         act = getattr(g, "act", None)
         if act is not None:
