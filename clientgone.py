@@ -362,8 +362,14 @@ def peer_closed(sock):
 class Monitor:
     """The one thread that watches every registered client socket."""
 
-    def __init__(self, poll=POLL_SECONDS):
+    def __init__(self, poll=POLL_SECONDS, background=True):
+        # background=False: no thread; only explicit check() passes look at
+        # the sockets (tests). With the thread, a pass it makes takes a gone
+        # token before a caller's own check() can (MEASURED under a loaded
+        # suite: the thread started late, ran after the close, and an
+        # explicit check() then returned [] for a token already cancelled).
         self.poll = poll
+        self.background = bool(background)
         self._lock = threading.Lock()
         self._entries = {}               # token -> socket
         self._wake = threading.Event()
@@ -379,6 +385,8 @@ class Monitor:
             return False
         with self._lock:
             self._entries[token] = sock
+            if not self.background:
+                return True
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(target=self._run, daemon=True,
                                                 name="client-disconnect-monitor")

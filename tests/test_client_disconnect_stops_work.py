@@ -304,7 +304,11 @@ def _pair():
 
 
 def test_the_monitor_tells_a_gone_client_from_a_live_one():
-    mon = clientgone.Monitor(poll=60)
+    # background=False: only the explicit check() passes below look. With the
+    # thread, a loaded machine started it late, its first pass ran after the
+    # close and took the gone token first, so check() returned [] (FULL SUITE,
+    # 2026-10-04). The FIN's arrival is waited for, never assumed.
+    mon = clientgone.Monitor(poll=60, background=False)
     live_c, live_s = _pair()
     busy_c, busy_s = _pair()
     gone_c, gone_s = _pair()
@@ -313,12 +317,22 @@ def test_the_monitor_tells_a_gone_client_from_a_live_one():
         for s, t in ((live_s, t_live), (busy_s, t_busy), (gone_s, t_gone)):
             assert mon.watch(s, t)
         busy_c.sendall(b"GET /next HTTP/1.1\r\n")    # a pipelined request: data pending
+        assert mon.check() == [], "nobody has left yet"
         gone_c.close()
-        time.sleep(0.1)
-        assert mon.check() == [t_gone]
+        found = []
+        assert _until(lambda: found.extend(mon.check()) or found, 10), \
+            "the closed client is seen within 10 s"
+        assert found == [t_gone]
         assert t_gone.cancelled and not t_live.cancelled and not t_busy.cancelled
         assert not mon.watching(t_gone) and mon.watching(t_live) and mon.watching(t_busy)
+        # No false positive, however many passes: a live idle client and one
+        # with bytes pending stay watched and uncancelled.
+        for _ in range(5):
+            assert mon.check() == []
+            time.sleep(0.05)
+        assert not t_live.cancelled and not t_busy.cancelled
         # MSG_PEEK consumed nothing: the pending bytes are all still there
+        busy_s.settimeout(5)
         assert busy_s.recv(100) == b"GET /next HTTP/1.1\r\n"
         assert mon.check() == []                     # a live idle client, again
     finally:
@@ -335,13 +349,16 @@ def test_a_killed_client_process_reads_as_gone():
                               "import socket,time;c=socket.create_connection(('127.0.0.1',%d));"
                               "time.sleep(60)" % srv.getsockname()[1]])
     try:
+        srv.settimeout(30)
         s, _ = srv.accept()
-        mon, tok = clientgone.Monitor(poll=60), clientgone.Token()
+        mon, tok = clientgone.Monitor(poll=60, background=False), clientgone.Token()
         mon.watch(s, tok)
         assert mon.check() == [] and not tok.cancelled
         child.kill()
         child.wait(10)
-        assert _until(lambda: mon.check() == [tok] or tok.cancelled, 3)
+        found = []
+        assert _until(lambda: found.extend(mon.check()) or found, 10)
+        assert found == [tok] and tok.cancelled
         s.close()
     finally:
         if child.poll() is None:
