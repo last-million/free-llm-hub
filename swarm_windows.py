@@ -1563,6 +1563,11 @@ def _run_agent_once(run, agent, spawn, run_turn, configure=None, hold=False):
                 configure(agent.session_id, mode)
             except Exception:                                    # noqa: BLE001
                 pass
+        if run.stop_flag.is_set():
+            # Stop landed while the session was being made: the scheduler's
+            # one Stop pass found no session to stop, so no CLI turn either.
+            agent.state = STOPPED
+            return STOPPED
         summary = _drain(agent, run_turn(agent.session_id, _agent_prompt(run, agent)))
         if agent.abandoned:
             # The wave gave up on this worker and went on without it (and, when
@@ -1728,8 +1733,8 @@ def _run_phases(run, indexes, spawn, run_turn, configure=None, stop=None):
             t = threading.Thread(target=_run_agent,
                                  args=(run, agent, spawn, run_turn, configure),
                                  daemon=True, name="swarm-%s-%d" % (run.id, i))
-            last_spawn = time.time()
             t.start()
+            last_spawn = time.time()        # after start: the gap is never short
             running.append([t, agent, i, last_spawn])
         time.sleep(_SCHED_TICK)
 
