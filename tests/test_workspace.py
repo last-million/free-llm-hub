@@ -999,3 +999,43 @@ def test_a_test_run_leaks_no_preview_ports(proj, monkeypatch):
                     if p.popen is None and not getattr(p, "stopping", False)]
     assert leftover == [], (
         "projects left mid-spawn with no owner: %r" % leftover)
+
+
+def test_a_reserved_device_name_in_the_folder_does_not_break_the_tree(tmp_path, monkeypatch):
+    """MEASURED 2026-09-29: a project folder held a file named `nul` (a tool ran
+    `> nul`); os.path.relpath raised ValueError and /api/workspace/tree answered
+    HTTP 500 2548 times. The entry is skipped, the rest of the tree is listed."""
+    import os
+    import workspace as W
+    (tmp_path / "a.txt").write_text("x")
+
+    class _E:
+        name = "nul"
+
+        def is_dir(self, **k):
+            return False
+
+        def stat(self, **k):
+            return os.stat(tmp_path)
+
+    real_scandir = os.scandir
+
+    class _It:
+        def __init__(self, items):
+            self.items = items
+
+        def __enter__(self):
+            return iter(self.items)
+
+        def __exit__(self, *a):
+            return False
+
+    def fake(path):
+        with real_scandir(path) as it:
+            items = list(it)
+        return _It(items + [_E()])
+
+    monkeypatch.setattr(W.os, "scandir", fake)
+    out = W.tree(str(tmp_path), None)
+    names = [e["name"] for e in out["entries"]]
+    assert "a.txt" in names and "nul" not in names

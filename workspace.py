@@ -979,14 +979,22 @@ def tree(project_dir, rel=None):
                     break
                 if e.name in _TREE_SKIP or e.name.startswith("."):
                     continue
-                r = os.path.relpath(os.path.join(target, e.name), root).replace("\\", "/")
+                # A Windows reserved device name (nul, con, aux, com1 ...) that a
+                # tool left in the folder makes relpath raise ValueError ("path
+                # is on mount '\\.\nul'") -- MEASURED: 2548 HTTP 500s on
+                # /api/workspace/tree for a project holding a file named `nul`.
+                # Such an entry is not browsable: skip it, never fail the tree.
+                try:
+                    r = os.path.relpath(os.path.join(target, e.name), root).replace("\\", "/")
+                except ValueError:
+                    continue
                 try:
                     if e.is_dir(follow_symlinks=False):
                         dirs.append({"name": e.name, "rel": r, "dir": True})
                     else:
                         files.append({"name": e.name, "rel": r, "dir": False,
                                       "size": e.stat().st_size})
-                except OSError:
+                except (OSError, ValueError):
                     continue
     except PermissionError:
         raise WorkspaceError("permission denied")
