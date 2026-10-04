@@ -116,6 +116,12 @@ def roles_stats(rows):
         "verifier_fixes": corrected,                 # a correction shipped
         "corrections_rejected": rejected,            # corrector ran, its step was not usable
         "revise_shipped_as_is": revise_kept,         # low severity / no time / no corrector
+        "team_turns": sum(1 for r in turns if r.get("specialists")),
+        "team_specialist_calls": sum(len(r.get("specialists") or []) for r in turns),
+        "team_brief_chars_avg": (round(sum(int(r.get("brief_chars") or 0)
+                                           for r in turns if r.get("specialists"))
+                                       / max(1, sum(1 for r in turns if r.get("specialists"))))
+                                 if any(r.get("specialists") for r in turns) else None),
         "text_turns_reviewed": len(text),
         "next_turn_credits": sum(int(r.get("credited") or 0) for r in credits),
     }

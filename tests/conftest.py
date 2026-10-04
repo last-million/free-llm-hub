@@ -216,6 +216,17 @@ def _race_tests_keep_the_race(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _team_notes_off_unless_tested(request, monkeypatch):
+    """TEAM NOTES (parallel specialists) are default ON; every other test file
+    is about its own subject and must not see extra specialist calls."""
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_tool_turn_specialists":
+        import app
+        monkeypatch.setattr(app, "_team_flag_on", lambda: False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _weak_models_not_force_verified(request, monkeypatch):
     """Tests written with low fake scores (10-100) are about their own subject;
     the "weak actor is always verified" wiring has its own test file."""
@@ -225,4 +236,24 @@ def _weak_models_not_force_verified(request, monkeypatch):
         return
     import app
     monkeypatch.setattr(app, "_model_is_weak", lambda pid, model: False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _bandit_tie_break_is_deterministic(request, monkeypatch):
+    """The learned tie-breaker (bandit.py) draws random numbers on purpose, so
+    any routing test that expects a fixed pick among EQUAL scores would flake
+    (MEASURED 2026-10-04: test_model_mode.py::test_the_primary_pick_is_
+    unrestricted_under_all failed 4 of 15 runs). Every file that is not about
+    the bandit sees a zero nudge; the files that mention it keep the real one."""
+    mod = getattr(request.node, "module", None)
+    try:
+        src = open(mod.__file__, encoding="utf-8", errors="ignore").read()
+    except Exception:                                            # noqa: BLE001
+        src = ""
+    if "bandit" in src:
+        yield
+        return
+    import app
+    monkeypatch.setattr(app, "_bandit_delta", lambda kind, pid, model, base: 0.0)
     yield

@@ -1812,6 +1812,53 @@ Owner: "each model must do something -- collaboration, not racing."
   `brief["text"]` (+ optional `producer`, `avoid_families`) -> {"ok",
   "problems", "severity"} or None (fail-open).
 
+## Team notes: parallel specialists for hard tool turns (2026-10-04)
+
+Covered by `tests/test_tool_turn_specialists.py`. A CLI turn yields ONE next
+action, but the thinking around it can be shared. Inside `_tool_turn_roles_run`
+(before the actor walk), `_team_notes_for_turn` may run up to 3 read-only
+SPECIALISTS in parallel and hand the actor their merged notes.
+
+- **When** (`_specialists_wanted(body, kind)`): flag `tool_turn_specialists`
+  (default ON), `lowres.active()` false, the conversation ENDS on a real user
+  instruction (opening or fresh follow-up -- never a tool-result
+  continuation), real difficulty `hard`, not `_is_trivial_ask`, not
+  `ctxwin.is_compaction_request`, est <= `_TEAM_MAX_EST` (60K). Otherwise the
+  roles turn is byte-for-byte as before. Pipeline tiers only (it lives in the
+  roles path); Multi on /agent and prose swarm/crews are untouched.
+- **Who**: `_team_pick` over `_role_candidates` (the routed actor pair, subs,
+  sick pairs and last-resort families out; bandit nudge only inside the top
+  band): DIFFERENT identities, preferring a new provider AND family
+  (`verify.family`), then a new provider, then any new identity. Roles:
+  SCOUT (files/symbols/commands visible in the digest, "unknown" over
+  invented paths), CRITIC (risks, how to verify, what not to do), plus
+  DESIGNER when `craft.is_web_ui(goal)` or the goal creates something new.
+  Each: no tools, non-streamed, `_no_craft`, <= 700 tokens, <= 25 s, on its
+  own `clientgone.child` token, input = `_team_digest` (last instruction,
+  last 3 tool results, tool NAMES only; ~6K tokens max).
+- **Orchestrator** (`_orchestrate_brief`, no model call): drops empty /
+  "unknown" parts, dedupes lines across parts, orders scout -> design ->
+  risks, labels, clips to 2500 chars (each part keeps a share). Injected as
+  ONE system message after the leading system messages of the ACTOR's request
+  only (`_with_team_notes`); verifier / corrector / specialists never see it.
+  Failed specialist = omitted; none answered = plain roles.
+- **Cost per hard fresh turn**: +2 or +3 calls of ~6K tokens in, <= 700 out;
+  0 on every continuation. Cache `_team_cache` (key `ctxwin.conversation_key`,
+  fallback first-instruction hash): same instruction within
+  `_TEAM_CACHE_TURNS` (3) assistant turns reuses the brief on continuations
+  and retries (no calls); a NEW instruction inside that window runs no team
+  and gets no stale brief.
+- **Nothing learned from specialist text**: no bandit reward/punishment. A
+  specialist 429/5xx/timeout is filed like any hop failure; when the client
+  left, tokens are cancelled and nothing is filed.
+- **Visible**: activity chips `specialist: scout|designer|critic` (+ `: why`
+  on failure) with the model, then `actor`; `X-Free-LLM-Hub-Roles` gains
+  `specialists=N` (answered); `turn-roles.jsonl` rows carry `specialists`
+  [{role, model, ok, ms, why}], `brief_chars`, `team` (ran | cached |
+  skipped); `scripts/role_eval.py` reports `team_turns`,
+  `team_specialist_calls`, `team_brief_chars_avg`. conftest turns the flag
+  off for every test file except this one.
+
 ## Model guides (weak and specific models) (2026-10-04)
 
 Owner: "make ANY model, even weak ones, work as well as possible". Covered by

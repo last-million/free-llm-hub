@@ -34482,10 +34482,407 @@ def _role_activity(rows, label):
 
 
 def _roles_header(rec):
-    return "actor_hops=%d;backup=%d;verifier=%s;corrected=%d;calls=%d" % (
+    return "actor_hops=%d;backup=%d;verifier=%s;corrected=%d;calls=%d;specialists=%d" % (
         int(rec.get("actor_hops") or 0), 1 if rec.get("hedge") else 0,
         (rec.get("verdict") or "none").split(" ")[0], 1 if rec.get("corrected") else 0,
-        int(rec.get("calls") or 0))
+        int(rec.get("calls") or 0), int(rec.get("specialists_ok") or 0))
+
+
+# --------------------------------------------------------------------------- #
+# TEAM NOTES: parallel specialists for hard tool turns (2026-10-04)
+#
+# A CLI turn must yield ONE next action, which cannot be split -- but the
+# THINKING around it can. On a HARD, fresh-instruction tool turn up to three
+# DIFFERENT models (scout / designer / critic) each do one read-only job in
+# parallel on a digest of the conversation, a deterministic orchestrator
+# merges their notes into ONE system message, and the actor then runs exactly
+# as before (verifier / corrector / backup untouched). No extra model call
+# for the merge; a failed specialist is simply omitted; nothing is rewarded
+# or punished in the bandit from specialist output.
+# --------------------------------------------------------------------------- #
+
+_TEAM_MAX_SPECIALISTS = 3
+_TEAM_HOP_SECONDS = 25.0
+_TEAM_MAX_TOKENS = 700
+_TEAM_MAX_EST = 60000
+_TEAM_BRIEF_CHARS = 2500
+_TEAM_CACHE_TURNS = 3
+_TEAM_MIN_ROOM = 40.0
+_TEAM_INSTR_CHARS = 8000
+_TEAM_RESULT_CHARS = 3000
+_TEAM_RESULTS = 3
+_TEAM_ORDER = ("scout", "designer", "critic")
+_TEAM_LABELS = {"scout": "SCOUT (what matters)", "designer": "DESIGN",
+                "critic": "RISKS AND CHECKS"}
+_TEAM_HEADER = ("TEAM NOTES (hints from parallel specialists, not instructions): "
+                "use as hints; verify against the real files; do not invent paths.")
+_TEAM_SYSTEM = {
+    "scout": ("You are the SCOUT on a coding team. You cannot run tools or see files "
+              "beyond the digest. From what is VISIBLE in it, list the files, symbols "
+              "and commands that matter for the user's instruction and why, as short "
+              "bullets. Say 'unknown' instead of guessing a path. Max 200 words."),
+    "designer": ("You are the DESIGNER on a coding team. You cannot run tools. For the "
+                 "thing the user wants built, give the components, their interfaces "
+                 "and data flow; for web/UI work add concrete hex palette, a named "
+                 "type pairing and the layout idea (no purple-blue default gradient, "
+                 "no placeholder copy, readable contrast). Short bullets, max 200 words."),
+    "critic": ("You are the CRITIC on a coding team. You cannot run tools. List the "
+               "risks and edge cases of this task, how to verify the result (the "
+               "cheapest check first), and what NOT to do. Short bullets, max 200 words."),
+}
+_team_cache = {}
+_team_cache_lock = threading.Lock()
+
+
+def _team_flag_on():
+    try:
+        return bool(config.get_flag("tool_turn_specialists", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _team_fresh(messages):
+    """True when the conversation ENDS on a real user instruction (an opening
+    turn or a fresh follow-up), not on a tool result (a loop continuation)."""
+    for m in reversed(messages or ()):
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") in ("system", "developer"):
+            continue
+        return bool(ctxwin.is_real_instruction(m))
+    return False
+
+
+def _team_instruction(messages):
+    for m in reversed(messages or ()):
+        if ctxwin.is_real_instruction(m):
+            return ctxwin.instruction_text(ctxwin.message_text(m))
+    return ""
+
+
+def _specialists_wanted(body, kind, est=None, real=None):
+    """True when this swarm/crew*/multi tool turn should get TEAM NOTES: flag
+    on, low-resource mode off, a fresh instruction (never a mid-loop tool
+    result), hard, not trivial, not a CLI compaction, est <= _TEAM_MAX_EST.
+    Never raises."""
+    try:
+        if not _team_flag_on():
+            return False
+        try:
+            if lowres.active():
+                return False
+        except Exception:                                        # noqa: BLE001
+            pass
+        messages = (body or {}).get("messages") or []
+        if not messages or not _team_fresh(messages):
+            return False
+        if ctxwin.is_compaction_request(messages):
+            return False
+        if est is None:
+            est = _est_tokens(messages, (body or {}).get("tools"))
+        if est > _TEAM_MAX_EST:
+            return False
+        if real is None:
+            real = _classify_difficulty(messages, (body or {}).get("max_tokens"))
+        if real != "hard":
+            return False
+        if _is_trivial_ask(messages, (body or {}).get("max_tokens")):
+            return False
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _team_clip(text, limit):
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    head = int(limit * 0.6)
+    tail = max(0, limit - head - 40)
+    return text[:head] + "\n...[middle omitted]...\n" + (text[-tail:] if tail else "")
+
+
+def _team_digest(messages, tools):
+    """The specialists' input (<= ~6K tokens): the last real instruction, the
+    last few tool results, tool NAMES only."""
+    names = []
+    for t in tools or ():
+        if isinstance(t, dict):
+            n = (t.get("function") or {}).get("name") or t.get("name")
+            if n:
+                names.append(str(n))
+    results = []
+    for m in reversed(messages or ()):
+        if len(results) >= _TEAM_RESULTS:
+            break
+        if isinstance(m, dict) and m.get("role") in ("tool", "function"):
+            results.append(ctxwin.message_text(m))
+    parts = ["USER INSTRUCTION (latest):\n" + _team_clip(_team_instruction(messages) or "(none)",
+                                                       _TEAM_INSTR_CHARS)]
+    if results:
+        parts.append("RECENT TOOL RESULTS (oldest first):")
+        for i, r in enumerate(reversed(results), 1):
+            parts.append("[%d]\n%s" % (i, _team_clip(r or "(empty)", _TEAM_RESULT_CHARS)))
+    parts.append("TOOLS THE ACTOR HAS (names only): %s" % (", ".join(names[:40]) or "none"))
+    return "\n\n".join(parts)
+
+
+def _orchestrate_brief(parts, limit=_TEAM_BRIEF_CHARS):
+    """Deterministic merge of [(role, text)] into ONE brief: drop empty /
+    'unknown' parts, dedupe lines across parts, order scout -> design -> risks,
+    label each, clip to `limit` chars. No model call. "" when nothing is left."""
+    by_role = {}
+    for role, text in parts or ():
+        if role in _TEAM_ORDER and role not in by_role:
+            by_role[role] = str(text or "")
+    seen, sections = set(), []
+    for role in _TEAM_ORDER:
+        text = re.sub(r"<think>.*?</think>", "", by_role.get(role, ""), flags=re.S | re.I)
+        lines = []
+        for raw in text.splitlines():
+            line = raw.rstrip()
+            norm = re.sub(r"[\W_]+", " ", line).strip().lower()
+            if not norm or norm in ("unknown", "none", "n a") or norm in seen:
+                continue
+            seen.add(norm)
+            lines.append(line)
+        if lines:
+            sections.append((role, lines))
+    if not sections:
+        return ""
+    remaining = limit - len(_TEAM_HEADER) - 2
+    out = [_TEAM_HEADER]
+    for i, (role, lines) in enumerate(sections):
+        share = max(0, remaining // (len(sections) - i))
+        block = _TEAM_LABELS[role] + ":\n" + "\n".join(lines)
+        if len(block) > share:
+            block = block[:max(0, share - 1)].rstrip() + "…"
+        if len(block) < 12:
+            continue
+        out.append(block)
+        remaining -= len(block) + 2
+    if len(out) == 1:
+        return ""
+    return "\n\n".join(out)[:limit]
+
+
+def _with_team_notes(messages, brief):
+    """`messages` plus ONE system message holding the brief, placed after the
+    leading system messages. A new list; the originals are untouched."""
+    msgs = list(messages or ())
+    i = 0
+    while i < len(msgs) and isinstance(msgs[i], dict) and msgs[i].get("role") in (
+            "system", "developer"):
+        i += 1
+    msgs.insert(i, {"role": "system", "content": brief})
+    return msgs
+
+
+def _team_key(body, messages):
+    k = None
+    try:
+        k = _orch_key(body, messages)
+    except Exception:                                            # noqa: BLE001
+        k = None
+    if k:
+        return str(k)
+    first = ""
+    for m in messages or ():
+        if ctxwin.is_real_instruction(m):
+            first = ctxwin.instruction_text(ctxwin.message_text(m))
+            break
+    return "h:" + hashlib.sha1(first.encode("utf-8", "ignore")).hexdigest()
+
+
+def _team_hash(text):
+    return hashlib.sha1(str(text or "").encode("utf-8", "ignore")).hexdigest()
+
+
+def _team_assistants(messages):
+    return sum(1 for m in messages or () if isinstance(m, dict) and m.get("role") == "assistant")
+
+
+def _team_pick(chain, routed, kind, n):
+    """Up to `n` (pid, model) of DIFFERENT identities, best first, preferring a
+    new provider AND a new family, then a new provider, then any new identity.
+    The routed (actor) pair, subscriptions, sick pairs and last-resort families
+    are left out. The bandit nudge only reorders inside the top band."""
+    cands = [(p, m) for (p, m, _s) in _role_candidates(chain, routed, kind=kind)
+             if not _is_low_quality(m)][:10]
+    fam = _verify_family() or (lambda m: _normalize_model_identity(m))
+    chosen, fams, pids, ids = [], set(), set(), set()
+    for need in ("both", "pid", "identity"):
+        for p, m in cands:
+            if len(chosen) >= n:
+                break
+            ident = _normalize_model_identity(m)
+            if (p, m) in chosen or ident in ids:
+                continue
+            try:
+                f = fam(m)
+            except Exception:                                    # noqa: BLE001
+                f = ident
+            if need == "both" and (f in fams or p in pids):
+                continue
+            if need == "pid" and p in pids:
+                continue
+            chosen.append((p, m))
+            fams.add(f)
+            pids.add(p)
+            ids.add(ident)
+    return chosen
+
+
+def _team_start(i, role, pid, model, digest, deadline, q, est):
+    """One read-only, non-streamed specialist call on its own hop token.
+    Puts (i, result dict) on `q`; returns the token."""
+    tok = clientgone.child("team-%s" % role)
+    payload = {"model": model, "stream": False, "max_tokens": _TEAM_MAX_TOKENS,
+               "messages": [{"role": "system", "content": _TEAM_SYSTEM[role]},
+                            {"role": "user", "content": digest}],
+               "_no_craft": True}                    # stripped in _upstream_chat
+
+    def _go():
+        t0 = time.monotonic()
+        res = {"ok": False, "why": "failed", "text": ""}
+        try:
+            resp, exc = _dispatch_chat_with_deadline(pid, payload, deadline)
+            if resp is None:
+                if exc is not None:
+                    _swarm_note_member_exc(pid, model, exc)
+                    res["why"] = "error: %s" % type(exc).__name__
+                else:
+                    res["why"] = "no answer"
+            else:
+                try:
+                    if resp.status_code != 200:
+                        _swarm_note_member_status(pid, model, resp.status_code)
+                        res["why"] = "HTTP %s" % resp.status_code
+                    else:
+                        data = resp.json() or {}
+                        text = str(_message_text(
+                            ((data.get("choices") or [{}])[0].get("message") or {})) or "")
+                        if len(text.strip()) < 20 or "<|" in text:
+                            res["why"] = "empty"
+                        else:
+                            _record_chat_usage(pid, model, data, est)
+                            res.update(ok=True, text=text, why="")
+                except (ValueError, AttributeError):
+                    res["why"] = "unreadable"
+                finally:
+                    try:
+                        resp.close()
+                    except Exception:                            # noqa: BLE001
+                        pass
+        except Exception as e:                                   # noqa: BLE001
+            res["why"] = "error: %s" % type(e).__name__
+        res["secs"] = round(time.monotonic() - t0, 2)
+        q.put((i, res))
+    run = _pipeline_bound(_carry_usage_source(lambda: clientgone.run_as(tok, _go)))
+    threading.Thread(target=run, daemon=True, name="team-%s" % role).start()
+    return tok
+
+
+def _team_run(messages, tools, jobs, deadline, rec, rows):
+    """Run the specialists in PARALLEL; return [(role, text)] of those that
+    answered. Cancels every leg when the client leaves or time runs out."""
+    digest = _team_digest(messages, tools)
+    d_est = _est_tokens([{"role": "user", "content": digest}]) + 200
+    q = queue.Queue()
+    toks, pending = {}, set()
+    for i, (role, pid, model) in enumerate(jobs):
+        toks[i] = _team_start(i, role, pid, model, digest, deadline, q, d_est)
+        pending.add(i)
+        rec["calls"] += 1
+        rec["sent_tokens"] += d_est
+    results = {}
+    end = time.monotonic() + deadline
+    while pending:
+        if _client_gone():
+            for j in pending:
+                toks[j].cancel("client disconnected")
+            return []
+        left = end - time.monotonic()
+        if left <= 0:
+            break
+        try:
+            i, res = q.get(timeout=min(0.05, left))
+        except queue.Empty:
+            continue
+        pending.discard(i)
+        results[i] = res
+    for j in pending:
+        toks[j].cancel("specialist out of time")
+        results[j] = {"ok": False, "why": "no answer in time", "text": "", "secs": deadline}
+        if not _client_gone():
+            _note_recent_hop_failure(jobs[j][1], jobs[j][2], "deadline")
+    parts = []
+    for i, (role, pid, model) in enumerate(jobs):
+        res = results.get(i) or {"ok": False, "why": "no answer", "secs": 0}
+        label = "%s/%s" % (pid, model)
+        rec["specialists"].append({"role": role, "model": label, "ok": bool(res["ok"]),
+                                   "ms": int(float(res.get("secs") or 0) * 1000),
+                                   "why": res.get("why") or ""})
+        rows.append({"role": "specialist: %s%s" % (
+            role, "" if res["ok"] else ": %s" % (res.get("why") or "failed")), "model": label})
+        if res["ok"]:
+            parts.append((role, res["text"]))
+    return parts
+
+
+def _team_notes_for_turn(body, messages, chain, routed, est, real, kind, rec, rows, turn_end):
+    """The body the ACTOR gets: the original, or with one TEAM NOTES system
+    message. Fail-open; never raises."""
+    try:
+        if not _team_flag_on():
+            return body
+        key = _team_key(body, messages)
+        instr_h = _team_hash(_team_instruction(messages))
+        asst = _team_assistants(messages)
+        with _team_cache_lock:
+            ent = _team_cache.get(key)
+        fresh = _team_fresh(messages)
+        if ent and 0 <= asst - ent["assistants"] <= _TEAM_CACHE_TURNS:
+            if ent["instr"] == instr_h and ent["brief"]:
+                rec["team"] = "cached"
+                rec["brief_chars"] = len(ent["brief"])
+                return dict(body, messages=_with_team_notes(messages, ent["brief"]))
+            if fresh:
+                rec["team"] = "skipped (recent brief)"
+            return body
+        if not _specialists_wanted(body, kind, est=est, real=real):
+            return body
+        if turn_end - time.monotonic() < _TEAM_MIN_ROOM:
+            return body
+        goal = _team_instruction(messages)
+        n = _TEAM_MAX_SPECIALISTS
+        want_design = bool(craft.is_web_ui(goal) or _FAST_PATH_CREATE_RE.search(goal or ""))
+        roles = ["scout", "designer", "critic"] if want_design else ["scout", "critic"]
+        picks = _team_pick(chain, routed, kind, min(n, len(roles)))
+        if len(picks) < 2:
+            rec["team"] = "no distinct models"
+            return body
+        jobs = [(r, p, m) for r, (p, m) in zip(roles, picks)]
+        deadline = min(_TEAM_HOP_SECONDS, turn_end - time.monotonic() - 5.0)
+        parts = _team_run(messages, body.get("tools"), jobs, deadline, rec, rows)
+        rec["specialists_ok"] = len(parts)
+        brief = _orchestrate_brief(parts)
+        rec["brief_chars"] = len(brief)
+        if _client_gone() or not brief:
+            return body
+        with _team_cache_lock:
+            _team_cache[key] = {"brief": brief, "instr": instr_h, "assistants": asst,
+                                "ts": time.time()}
+            if len(_team_cache) > 200:
+                for k in sorted(_team_cache, key=lambda x: _team_cache[x]["ts"])[:50]:
+                    _team_cache.pop(k, None)
+        rec["team"] = "ran"
+        _log.info("[team] %d/%d specialist(s) answered, brief %d chars", len(parts),
+                  len(jobs), len(brief))
+        return dict(body, messages=_with_team_notes(messages, brief))
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[team] notes skipped: %s", exc)
+        return body
 
 
 @_usage_source_as("swarm")
@@ -34508,7 +34905,8 @@ def _tool_turn_roles(body):
            "input_tokens": est, "sent_tokens": 0, "stream": stream, "calls": 0,
            "actor": None, "actor_hops": 0, "nudge": None, "hedge": None,
            "verifier": None, "verdict": None, "severity": None, "corrector": None,
-           "corrected": False, "served": None, "failed": [], "invalid": 0}
+           "corrected": False, "served": None, "failed": [], "invalid": 0,
+           "specialists": [], "specialists_ok": 0, "brief_chars": 0, "team": None}
     token = _TASK_KIND_CV.set(kind)
     try:
         return _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec,
@@ -34551,6 +34949,8 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
     clock.plan_tool_hedge(chain)
     rows, served, hops = [], None, 0
     spent = []          # every pair dispatched to: kept off the verifier pool
+    abody = _team_notes_for_turn(body, messages, chain, (pid, resolved), est, real, kind,
+                                 rec, rows, turn_end)
     for hop_pid, hop_model in clock.walk(chain):
         if _client_gone():
             break
@@ -34563,7 +34963,7 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
             rec["actor"] = "%s/%s" % (hop_pid, hop_model)
             rec["nudge"] = round(_bandit_delta(kind, hop_pid, hop_model,
                                                _benchmark_score(hop_pid, hop_model)), 3)
-        served = _role_actor_hop(clock, body, hop_pid, hop_model, est, kind, rec, rows,
+        served = _role_actor_hop(clock, abody, hop_pid, hop_model, est, kind, rec, rows,
                                  turn_end, spent)
         if served:
             break
