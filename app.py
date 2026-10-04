@@ -11067,6 +11067,54 @@ def _declared_provider_windows(cands):
     return sorted(per.values(), reverse=True)
 
 
+# STABLE PUBLISHED FIGURES. MEASURED 2026-10-03/04 (hub.log): the 30-min resync
+# rewrote opencode.json (and codex's catalog) 7 times in ~7 h -- the computed
+# figures follow the live fleet (models coming and going, windows inferred
+# from catalogs that refresh), so they flipped back and forth. What a CLI is
+# TOLD is now published with hysteresis: a DECREASE applies at once (a too-big
+# window is the 503 risk), an INCREASE only once the higher figure has held for
+# _DECLARED_RAISE_AFTER seconds (more than one resync interval). The value is
+# what every writer, the codex catalog and live steering see
+# (agentic_chat.declared_window -> this provider), so they stay in agreement.
+# tests/test_declared_window_stability.py.
+_DECLARED_RAISE_AFTER = 2700.0
+_declared_published = {}        # (model id, cli) -> published figure
+_declared_raise_seen = {}       # (model id, cli) -> (higher figure, first seen)
+_declared_pub_lock = threading.Lock()
+
+
+def _stable_declared_window_for(model_id=None, cli=None):
+    """_declared_window_for with the hysteresis above. None passes through
+    (the caller's fixed default). Never raises."""
+    try:
+        raw = _declared_window_for(model_id, cli=cli)
+    except Exception:                                            # noqa: BLE001
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+        return raw
+    raw = int(raw)
+    key = (str(model_id or "auto").strip().lower(), cli)
+    now = time.time()
+    with _declared_pub_lock:
+        pub = _declared_published.get(key)
+        if pub is None or raw < pub:
+            _declared_published[key] = raw
+            _declared_raise_seen.pop(key, None)
+            return raw
+        if raw == pub:
+            _declared_raise_seen.pop(key, None)
+            return pub
+        seen = _declared_raise_seen.get(key)
+        if seen is None or seen[0] != raw:
+            _declared_raise_seen[key] = (raw, now)
+            return pub
+        if now - seen[1] >= _DECLARED_RAISE_AFTER:
+            _declared_published[key] = raw
+            _declared_raise_seen.pop(key, None)
+            return raw
+        return pub
+
+
 # --------------------------------------------------------------------------- #
 # LIVE WINDOW STEERING (owner request 2026-10-03: "the context-max switch
 # should be done automatically by the hub, in all CLIs that use it").
@@ -25045,6 +25093,14 @@ def _resync_declared_windows_if_changed(force=False):
         sig = _declared_window_signature()
         if not force and sig == _declared_resync_last[0]:
             return []
+        # rows are (id, safe figure, reach figure) plus ("<none>", figure)
+        prev = {e[0]: tuple(e[1:]) for e in (_declared_resync_last[0] or ())}
+        changed = ["%s %s->%s" % (e[0], "/".join(map(str, prev[e[0]])),
+                                  "/".join(map(str, e[1:])))
+                   for e in sig if e[0] in prev and prev[e[0]] != tuple(e[1:])]
+        if changed:
+            # Which figures moved, so a flip is diagnosable from hub.log.
+            _log.info("[ctx] declared windows changed: %s", ", ".join(changed)[:600])
         done = _resync_declared_windows()
         _declared_resync_last[0] = sig
         return done
@@ -38995,7 +39051,7 @@ if __name__ == "__main__":
     # Declared context windows follow the fleet (agentic_chat.declared_window);
     # registered here, after the windows above are restored, so every CLI
     # config written from now on is sized on known windows.
-    agentic_chat.set_window_provider(_declared_window_for)
+    agentic_chat.set_window_provider(_stable_declared_window_for)
     _start_ctx_reference_refresh()  # OpenRouter's public windows, for inference
     _seed_default_blocks()         # ship the owner's blocklist to every install
     # Encrypt any provider keys still stored in plaintext. A no-op once done, so
