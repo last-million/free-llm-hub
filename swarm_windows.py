@@ -550,7 +550,9 @@ def with_review(phases):
 
 def waves(phases):
     """Phases grouped into dependency waves; everything inside one wave is
-    independent and runs concurrently.
+    independent. The plan as it is SHOWN and persisted (run.waves): the run
+    itself does not wait for a whole wave -- _run_phases starts each phase as
+    soon as what it needs has finished.
 
     An unsatisfiable graph degrades to "run the rest together" rather than
     hanging -- the same choice swarm._waves makes, for the same reason: a swarm
@@ -1605,64 +1607,87 @@ def _give_up(agent, why, stop=None):
             pass
 
 
-def _run_wave(run, indexes, spawn, run_turn, configure=None, stop=None):
-    # A resumed run (resume_interrupted) walks its waves again; the phases
-    # that finished before the interruption keep their summaries and are not
-    # run twice.
-    indexes = [i for i in indexes if run.agents[i - 1].state != DONE]
-    if not indexes:
+# How often the scheduler looks at its workers: a finished phase's dependents
+# start within this, and Stop reaches the running CLIs within this.
+_SCHED_TICK = 0.05
+
+
+def _phase_needs(agent):
+    """The phase numbers `agent` waits for, as ints (a hand-edited run file
+    may hold strings); [] for anything unreadable."""
+    out = []
+    for n in (getattr(agent, "needs", None) or ()):
+        try:
+            out.append(int(n))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _run_phases(run, indexes, spawn, run_turn, configure=None, stop=None):
+    """Run phases `indexes` of `run`, each AS SOON AS every phase it needs has
+    finished -- not when its whole wave has. Owner, 2026-10-04: "each phase
+    should work in parallel if it does not need to wait for other things".
+    Waves made phase 3 (needs 1) wait for a slow phase 2 only because 2 shared
+    phase 1's wave.
+
+    "Finished" is what the wave barrier meant: the worker's thread ended
+    (DONE, FAILED or STOPPED, its verification and revision included) or the
+    run gave up on it (_give_up). A failed dependency does not block: its
+    dependents still run and are told it produced nothing (_agent_prompt).
+    A phase already DONE is not run again (a resumed run) and counts as
+    finished, like a dependency outside `indexes`.
+
+    Ready phases start in plan order, at most _concurrency() at once (re-read
+    before every start), SPAWN_STAGGER apart. A graph that can never be
+    satisfied (a cycle, a need that names no phase) runs the rest regardless
+    of needs once nothing is running -- waves()' "run the rest together". The
+    review phase starts only after every other phase here has finished."""
+    total = len(run.agents)
+    order = []
+    for i in indexes:
+        if i not in order and run.agents[i - 1].state != DONE:
+            order.append(i)
+    if not order:
         return
-    threads = []
-    cap = _concurrency()
-    first = indexes[:cap] if len(indexes) > cap else indexes
-    for n, i in enumerate(first):
+    order.sort()
+    pending = list(order)
+    unsettled = set(order)          # in this call and not finished yet
+    running = []                    # [thread, agent, index, spawned_at]
+    last = run.agents[-1]
+    review = last if getattr(last, "title", None) == REVIEW_TITLE else None
+    forced = False
+    last_spawn = None
+
+    def ready(i):
         agent = run.agents[i - 1]
-        t = threading.Thread(target=_run_agent,
-                             args=(run, agent, spawn, run_turn, configure),
-                             daemon=True, name="swarm-%s-%d" % (run.id, i))
-        t.start()
-        threads.append((t, agent))
-        # Staggered, not simultaneous. Every worker opens the same CLI state
-        # store in its first moments, and starting three at the same instant is
-        # what put two of them on "database is locked" (see _TRANSIENT_ERRORS).
-        # Seconds against a phase that runs for minutes.
-        if SPAWN_STAGGER and n + 1 < len(first) and not run.stop_flag.is_set():
-            time.sleep(SPAWN_STAGGER)
-    # Anything past the concurrency cap runs as soon as a slot frees, which is
-    # what the cap is FOR -- a plan with eight independent phases must not spawn
-    # eight CLI processes at once.
-    queued = list(indexes[cap:]) if len(indexes) > cap else []
-    while threads or queued:
+        if agent is review and unsettled - {i}:
+            return False
+        if forced:
+            return True
+        return not any(n in unsettled or not 1 <= n <= total
+                       for n in _phase_needs(agent))
+
+    while pending or running:
         now = time.time()
-        for t, agent in list(threads):
-            t.join(timeout=0.05)
+        for entry in list(running):
+            t, agent, i, spawned = entry
             if not t.is_alive():
-                threads.remove((t, agent))
+                running.remove(entry)
+                unsettled.discard(i)
                 continue
-            began = agent.started_at or now
-            quiet = now - (agent.last_event_at or began)
+            # Measured from THIS start too: a resumed phase still carries the
+            # previous walk's times until its thread writes new ones.
+            began = max(agent.started_at or 0.0, spawned)
+            quiet = now - max(agent.last_event_at or 0.0, began)
             if now - began > AGENT_TIMEOUT:
                 _give_up(agent, "timed out after %ds" % int(AGENT_TIMEOUT), stop)
-                threads.remove((t, agent))
             elif quiet > AGENT_IDLE_TIMEOUT:
                 _give_up(agent, "no output for %ds" % int(quiet), stop)
-                threads.remove((t, agent))
-        if queued:
-            cap = _concurrency()
-        while queued and len(threads) < cap:
-            i = queued.pop(0)
-            agent = run.agents[i - 1]
-            # `configure` HAS to be passed here too. Without it, every phase
-            # past the concurrency cap silently ran under the default model
-            # instead of the one its mode asked for -- so a plan with five
-            # phases gave the fifth the wrong model, and only ever the fifth,
-            # which is exactly the kind of bug that never shows up in a
-            # three-phase test.
-            t = threading.Thread(target=_run_agent,
-                                 args=(run, agent, spawn, run_turn, configure),
-                                 daemon=True, name="swarm-%s-%d" % (run.id, i))
-            t.start()
-            threads.append((t, agent))
+            else:
+                continue
+            running.remove(entry)
+            unsettled.discard(i)
         if run.stop_flag.is_set():
             # STOP MEANS STOP. The flag alone only stopped NEW phases: every
             # worker already running kept its CLI going -- editing the folder
@@ -1671,23 +1696,59 @@ def _run_wave(run, indexes, spawn, run_turn, configure=None, stop=None):
             # kills the process tree; its open request to the hub then ends
             # too, see app.py "Client disconnect stops the work").
             if stop:
-                for _t, agent in threads:
+                for _t, agent, _i, _s in running:
                     if agent.session_id:
                         try:
                             stop(agent.session_id)
                         except Exception:                        # noqa: BLE001
                             pass
             break
-        time.sleep(0.02)
+        can = [i for i in pending if ready(i)]
+        if not can and not running and pending:
+            forced = True
+            can = [i for i in pending if ready(i)]
+        while can:
+            # Staggered, not simultaneous. Every worker opens the same CLI
+            # state store in its first moments, and starting three at the same
+            # instant is what put two of them on "database is locked" (see
+            # _TRANSIENT_ERRORS). Seconds against a phase that runs for minutes.
+            if SPAWN_STAGGER and last_spawn is not None \
+                    and time.time() - last_spawn < SPAWN_STAGGER:
+                break
+            # The cap is what stops a plan with eight independent phases
+            # spawning eight CLI processes at once; re-read, so a run that
+            # started with RAM to spare backs off when it runs short.
+            if len(running) >= _concurrency():
+                break
+            i = can.pop(0)
+            pending.remove(i)
+            agent = run.agents[i - 1]
+            # `configure` goes to EVERY start: without it, phases past the
+            # concurrency cap once silently ran under the default model.
+            t = threading.Thread(target=_run_agent,
+                                 args=(run, agent, spawn, run_turn, configure),
+                                 daemon=True, name="swarm-%s-%d" % (run.id, i))
+            last_spawn = time.time()
+            t.start()
+            running.append([t, agent, i, last_spawn])
+        time.sleep(_SCHED_TICK)
+
+
+def _run_wave(run, indexes, spawn, run_turn, configure=None, stop=None):
+    """One group of phases through the scheduler. A wave's phases need nothing
+    from each other, so this is the old wave exactly; kept for callers that
+    hand it one."""
+    _run_phases(run, indexes, spawn, run_turn, configure, stop)
 
 
 def _walk(run, spawn, run_turn, on_done=None, configure=None, stop=None):
     try:
         run.state = RUNNING
-        for wave in run.waves:
-            if run.stop_flag.is_set():
-                break
-            _run_wave(run, wave, spawn, run_turn, configure, stop)
+        # The whole plan at once, dependency-driven (_run_phases). run.waves
+        # stays the plan's DISPLAY ("first ... then ..."), not a barrier.
+        if not run.stop_flag.is_set():
+            _run_phases(run, list(range(1, len(run.agents) + 1)), spawn, run_turn,
+                        configure, stop)
         if run.stop_flag.is_set():
             run.state = STOPPED
         elif all(a.state == FAILED for a in run.agents):

@@ -1478,6 +1478,11 @@ and no acting verb, `_ACTS_RE`) whose ONE follower needs it is folded into
 that follower ("First -- … Then -- …"), needs renumbered. A look phase that
 feeds several phases stays.
 
+**No wave barrier** (`tests/test_multi_dependency_scheduling.py`): `_run_phases`
+starts a phase once every phase it `needs` finished (a FAILED need does not block),
+plan order, <= `_concurrency()`, `SPAWN_STAGGER` apart, review last; `run.waves` is
+display only. Verdicts stay one per phase inside its worker (no batch exists here).
+
 ## LMArena board, daily (2026-09-30)
 
 Covered by `tests/test_arena_board.py`. `arena.py` (pure + fetch): LMArena's
