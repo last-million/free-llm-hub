@@ -91,24 +91,131 @@ def clean_summary(text):
         return outside
     return "\n\n".join(x for x in inner if x).strip() or raw
 
-# How many workers may run at once, whatever the plan says. Each one is a real
-# CLI process with a model behind it, so this is a RAM and rate-limit bound as
-# much as anything -- the user's own words: "it will consume the ram more".
-MAX_CONCURRENT = 4
+# How many workers may run at once. Each one is a real CLI process with a model
+# behind it, so this is a RAM, CPU and rate-limit bound -- the user's own words:
+# "it will consume the ram more". Owner, 2026-10-04: "I prefer 4 DIFFERENT
+# models at once, or 5-6 if needed". The cap is the setting multi_parallel_max
+# (default MAX_CONCURRENT = 6, range 1..MAX_PARALLEL_LIMIT); _concurrency() is
+# the smallest of that, what the machine holds, how many distinct good models
+# the fleet has and the 429 back-off.
+MAX_CONCURRENT = 6
+MAX_PARALLEL_LIMIT = 8
+LEGACY_CONCURRENT = 4          # what the old fixed cap was: the no-numbers fallback
+FLOOR_PARALLEL = 2             # fleet and 429 limits never go under this
+BACKOFF_429_PER = 3            # one helper fewer per this many recent 429s...
+BACKOFF_WINDOW = 120.0         # ...inside this many seconds
+
+_HOOKS = {"fleet": None, "rate429": None}
+_last_backoff = [None]
+
+
+def set_fleet_counter(fn):
+    """app registers fn() -> number of distinct healthy tool-capable models
+    within the best-available band (quota-aware)."""
+    _HOOKS["fleet"] = fn
+
+
+def set_rate_counter(fn):
+    """app registers fn(window_seconds) -> recent hop 429 count."""
+    _HOOKS["rate429"] = fn
+
+
+def parallel_cap():
+    """The owner's setting multi_parallel_max, clamped 1..MAX_PARALLEL_LIMIT."""
+    try:
+        import config
+        v = int(config.get_setting("multi_parallel_max", MAX_CONCURRENT))
+    except Exception:                                            # noqa: BLE001
+        v = MAX_CONCURRENT
+    return max(1, min(MAX_PARALLEL_LIMIT, v))
+
+
+def concurrency_info():
+    """{now, max, by_machine, by_fleet, backoff, limited_by}: how the number of
+    helpers allowed at once was reached. Never raises."""
+    cap = parallel_cap()
+    info = {"max": cap, "by_machine": cap, "by_fleet": None, "backoff": 0}
+    try:
+        import lowres
+        m = lowres.machine()
+        info["by_machine"] = min(lowres.workers(cap, m), lowres.ram_cores_cap(cap, m))
+        if m.get("free_gb") is None:
+            info["by_machine"] = min(info["by_machine"], LEGACY_CONCURRENT)
+    except Exception:                                            # noqa: BLE001
+        info["by_machine"] = cap
+    n = min(cap, info["by_machine"])
+    try:
+        if _HOOKS["fleet"]:
+            f = int(_HOOKS["fleet"]())
+            if f >= 1:
+                info["by_fleet"] = max(FLOOR_PARALLEL, f)
+                n = min(n, info["by_fleet"])
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        if _HOOKS["rate429"]:
+            back = int(_HOOKS["rate429"](BACKOFF_WINDOW)) // BACKOFF_429_PER
+            if back > 0:
+                info["backoff"] = back
+                n = min(n, max(FLOOR_PARALLEL, n - back))
+                if _last_backoff[0] != n:
+                    _log.info("[multi] backing off to %d (429s)", n)
+            _last_backoff[0] = n
+    except Exception:                                            # noqa: BLE001
+        pass
+    info["now"] = max(1, n)
+    if info["now"] >= cap:
+        info["limited_by"] = None
+    elif info["backoff"] and (not info["by_fleet"] or info["now"] < info["by_fleet"]) \
+            and info["now"] < info["by_machine"]:
+        info["limited_by"] = "429s"
+    elif info["now"] == info["by_machine"]:
+        info["limited_by"] = "machine"
+    else:
+        info["limited_by"] = "fleet"
+    return info
 
 
 def _concurrency():
-    """MAX_CONCURRENT, lowered by low-resource mode (lowres.workers): 1-2 on a
-    weak machine, 1 while free RAM is short. Re-read before every spawn, so a
-    run that starts when RAM is fine still backs off if it runs short."""
+    """The helpers allowed at once: the smallest of the setting, the machine
+    (lowres.workers: 1-2 on a weak one, 1 while RAM is short; free RAM and
+    cores), the fleet's distinct good models and the 429 back-off. Re-read
+    before every spawn."""
     try:
-        import lowres
-        return lowres.workers(MAX_CONCURRENT)
+        return concurrency_info()["now"]
     except Exception:                                            # noqa: BLE001
         return MAX_CONCURRENT
+
+
+def spawn_allowed(n_running):
+    """May one more helper start now? n_running < _concurrency(), and the live
+    RAM/CPU governor (lowres.GOV) has room -- except that a run with NOTHING
+    running always gets one (queued phases must make progress). The governor
+    only ever stops NEW starts; it never touches a running helper."""
+    if n_running >= _concurrency():
+        return False
+    if n_running <= 0:
+        return True
+    try:
+        import lowres
+        room = lowres.GOV.headroom()
+        return room is None or room > 0
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def waiting_for_ram():
+    """True while the governor is the only thing holding a queued phase."""
+    try:
+        import lowres
+        return lowres.GOV.headroom() == 0
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 # Hard ceiling on workers in a run. The planner is asked for fewer; this is the
 # guard against a plan that ignores the ask.
-MAX_AGENTS = 8
+MAX_AGENTS = 10
 # One worker's wall clock -- the HARD cap. MEASURED 2026-09-12 on a real
 # four-phase build: two phases legitimately ran 35 and 44 minutes and a third
 # was still working when the old 900s cap "timed it out". The cap did not stop
@@ -354,7 +461,7 @@ Rules:
   a file that exists, a behaviour you can see). Cover EVERY part the user
   listed. The plan is dry-run before any agent starts: shared files, missing
   parts and missing inputs are caught there.
-- SPEED: phases that need nothing run AT THE SAME TIME (up to 4 agents). A
+- SPEED: phases that need nothing run AT THE SAME TIME (up to {helpers} agents). A
   chain where each phase needs the previous one is the SLOWEST plan; use a
   "needs" only when a phase cannot start without another phase's RESULT.
 - Finding a problem and fixing it is ONE phase: the agent that investigates
@@ -399,10 +506,43 @@ WEB/UI GOAL: "design" must also carry "visual", chosen for THIS product (no defa
 """
 
 
-def plan_system(goal, managed=False):
+# REAL PARALLELISM (owner, 2026-10-04: "4 different models at once, or 5-6 if
+# needed, working together"). Only for a goal big enough to fill the helpers
+# and only when 3+ can run at once: a small task stays small (no ceremony).
+_MICRO_ASK = """
+PARALLEL CAPACITY: this machine runs up to {helpers} helpers AT ONCE, each on a
+different model. This goal is big enough to use them: split every BIG phase
+into MICRO-TASKS by file or component so {helpers} helpers can work at the same
+time. Give each micro-task its own "files" list (the files it owns) with NO
+file shared by two micro-tasks that run together, and keep ONE final
+integrate/review phase that needs the rest. A big phase that cannot be split
+further gets "parallel": true (a second helper then assists it).
+"""
+
+_SIZEABLE_CHARS = 280
+_ENUM_RE = re.compile(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+\S")
+
+
+def sizeable_goal(goal):
+    """True for a goal big enough to fill several helpers: long, or listing
+    three or more parts. A one-liner fix is not."""
+    g = str(goal or "")
+    return len(g) >= _SIZEABLE_CHARS or len(_ENUM_RE.findall(g)) >= 3
+
+
+def plan_system(goal, managed=False, helpers=None):
     """The planner's system prompt for `goal` ({modes} still unfilled): the
-    base prompt, plus the visual-decision ask for a web/UI goal."""
-    base = _PLAN_SYSTEM_MANAGED if managed else _PLAN_SYSTEM
+    base prompt with the number of helpers that can run at once, plus the
+    micro-task ask for a sizeable goal and the visual-decision ask for a
+    web/UI goal."""
+    try:
+        n = int(helpers) if helpers else _concurrency()
+    except Exception:                                            # noqa: BLE001
+        n = MAX_CONCURRENT
+    n = max(1, n)
+    base = (_PLAN_SYSTEM_MANAGED if managed else _PLAN_SYSTEM).replace("{helpers}", str(n))
+    if n >= 3 and sizeable_goal(goal):
+        base += _MICRO_ASK.replace("{helpers}", str(n))
     try:
         import craft
         if craft.skill_enabled("web_design") and craft.is_web_ui(goal or ""):
@@ -538,6 +678,8 @@ def clean_phases(plan, max_phases=MAX_AGENTS, modes=(), notes=None):
         files = plan_check.norm_files(p.get("files"))
         if files:
             row["files"] = files
+        if p.get("parallel") is True or str(p.get("parallel")).lower() == "true":
+            row["parallel"] = True
         out.append(row)
     return merge_handoffs(out, notes=notes) if len(out) >= 1 else []
 
@@ -585,6 +727,8 @@ def merge_handoffs(phases, notes=None):
                     p["title"], p["task"], f["task"]))[:4000]
                 f["needs"] = sorted(set(p["needs"]) | (set(f["needs"]) - {i}))
                 f["mode"] = f.get("mode") or p.get("mode")
+                if p.get("parallel") or f.get("parallel"):
+                    f["parallel"] = True
                 if p.get("files") or f.get("files"):
                     f["files"] = list(dict.fromkeys(list(f.get("files") or [])
                                                     + list(p.get("files") or [])))
@@ -655,7 +799,9 @@ class _Agent:
                  "inputs", "constraints", "output_format", "acceptance",
                  "verified", "problems", "revisions", "past_sessions",
                  "event_total", "evidence", "reviewed", "claimed_unobserved",
-                 "receipt", "files", "free_check", "widen", "slop")
+                 "receipt", "files", "free_check", "widen", "slop",
+                 "parallel", "pair_session", "pair_state", "pair_summary",
+                 "pair_error", "pair_started_at", "pair_ended_at")
 
     def __init__(self, index, phase):
         self.index = index
@@ -666,6 +812,15 @@ class _Agent:
         self.mode = phase.get("mode") or None
         # The paths the plan says this phase owns ([] when it named none).
         self.files = list(phase.get("files") or ())
+        # The planner marked this phase big and not splittable further: a
+        # second helper (another family) may assist it (PAIR mode, below).
+        self.parallel = bool(phase.get("parallel"))
+        self.pair_session = None
+        self.pair_state = None          # None | running | done | failed | stopped
+        self.pair_summary = ""
+        self.pair_error = None
+        self.pair_started_at = None
+        self.pair_ended_at = None
         # The managed brief (see _PLAN_SYSTEM_MANAGED); "" for a plain plan.
         self.inputs = phase.get("inputs") or ""
         self.constraints = phase.get("constraints") or ""
@@ -722,6 +877,12 @@ class _Agent:
             "index": self.index, "title": self.title, "task": self.task,
             "done_when": self.done_when, "needs": list(self.needs),
             "mode": self.mode, "files": list(self.files),
+            "parallel": bool(self.parallel),
+            "pair": ({"session_id": self.pair_session, "state": self.pair_state,
+                      "summary": self.pair_summary, "error": self.pair_error,
+                      "started_at": self.pair_started_at,
+                      "ended_at": self.pair_ended_at}
+                     if self.pair_state else None),
             "session_id": self.session_id, "state": self.state,
             "summary": self.summary, "error": self.error,
             "started_at": self.started_at, "ended_at": self.ended_at,
@@ -927,6 +1088,17 @@ class _Run:
             agent.revisions = int(a.get("revisions") or 0) if str(
                 a.get("revisions") or 0).isdigit() else 0
             agent.session_id = a.get("session_id")
+            agent.parallel = bool(a.get("parallel"))
+            pr = a.get("pair") if isinstance(a.get("pair"), dict) else None
+            if pr:
+                agent.pair_session = pr.get("session_id")
+                agent.pair_state = pr.get("state")
+                agent.pair_summary = pr.get("summary") or ""
+                agent.pair_error = pr.get("error")
+                agent.pair_started_at = pr.get("started_at")
+                agent.pair_ended_at = pr.get("ended_at")
+                if agent.pair_state == "running":
+                    agent.pair_state = "stopped"      # the hub restarted under it
             agent.state = a.get("state") or PENDING
             agent.summary = a.get("summary") or ""
             agent.error = a.get("error")
@@ -1991,7 +2163,171 @@ def _phase_needs(agent):
     return out
 
 
+# --------------------------------------------------------------------------- #
+# PAIR mode: two helpers (different families) on ONE big phase
+# --------------------------------------------------------------------------- #
+# Owner, 2026-10-04: "always working TOGETHER on the same task or micro-task,
+# whenever the task really needs multiple models". A phase that is big (many
+# files, or the planner marked it "parallel") and was not split further gets a
+# co-pilot in its own session on another model. Simple and safe by design:
+# it READS and reviews freely, writes only files NO phase owns (never the
+# lead's, plan_check ownership), runs no installs or servers, coordinates
+# through its own PROGRESS.md line, ends when the lead ends, and its notes
+# are merged into the phase summary. It only starts in a spare slot (nothing
+# else waiting for one) -- setting multi_pair_phases: "auto" (default, on when
+# there is a spare slot) | true | false.
+PAIR_MIN_FILES = 4
+PAIR_GRACE = 5.0                 # seconds the lead's end waits for the pair's stop
+
+
+def pair_flag():
+    """The multi_pair_phases setting: True (on), False (off), or None = auto."""
+    try:
+        import config
+        v = config.get_setting("multi_pair_phases", "auto")
+    except Exception:                                            # noqa: BLE001
+        return None
+    if v in (False, "false", "off", "0", 0):
+        return False
+    if v in (True, "true", "on", "1", 1):
+        return True
+    return None
+
+
+def pair_eligible(run, agent, review=None):
+    """May `agent` get a co-pilot? Flag not off, a real (non-review) phase
+    that is big -- parallel:true or >= PAIR_MIN_FILES owned files -- with no
+    pair yet. The spare-slot condition is the scheduler's."""
+    try:
+        if pair_flag() is False:
+            return False
+        if agent is review or getattr(agent, "pair_state", None) or _is_review(run, agent):
+            return False
+        return bool(getattr(agent, "parallel", False)
+                    or len(getattr(agent, "files", None) or ()) >= PAIR_MIN_FILES)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _pair_prompt(run, agent):
+    owned = []
+    for a in run.agents:
+        for f in (a.files or ()):
+            owned.append(f)
+    mine = list(agent.files or ())
+    lines = [
+        "You are the CO-PILOT of another helper who owns this phase. Work "
+        "WITH it, in your own session, on the SAME task:", "", agent.task, ""]
+    if agent.done_when:
+        lines += ["DONE WHEN (for the pair): " + agent.done_when, ""]
+    lines += [
+        "RULES (hard):",
+        "- Read anything and review the lead's progress freely.",
+        "- NEVER edit or overwrite a file the lead owns: %s."
+        % (", ".join(mine) or "any file the lead creates for this phase"),
+        "- Write ONLY new files that no phase owns (owned by phases: %s). Pick "
+        "tests, docs, fixtures or helper modules the lead did not claim."
+        % (", ".join(owned) or "none declared"),
+        "- Do NOT run installs, package managers or servers.",
+        "- Coordinate through PROGRESS.md in the project folder: under \"## %s\" "
+        "keep one line \"- [ ] Phase %d pair: <what you take>\" (tick it when "
+        "done) and read the lead's line to avoid overlap." % (run.id, agent.index),
+        "- Stop when your part is done; the lead finishes the phase. End with a "
+        "SHORT summary: files you wrote, problems you found in the lead's work.",
+        "", "THE PROJECT FOLDER IS: " + run.project_dir,
+        "The overall goal is: " + run.goal, "Phase: " + agent.title,
+        "", agent_servers.worker_rules()]
+    return "\n".join(lines)
+
+
+class _PairSink:
+    """What _drain needs of an agent, for the pair's own stream."""
+
+    def __init__(self):
+        self.events = deque(maxlen=EVENT_BUFFER)
+        self.event_total = 0
+        self.last_event_at = None
+        self.error = None
+        self.evidence = []
+        self.revisions = 0
+
+
+def _run_pair(run, agent, spawn, run_turn, configure=None):
+    """The co-pilot's thread. Never raises; the lead is never affected."""
+    agent.pair_started_at = time.time()
+    sink = _PairSink()
+    try:
+        agent.pair_session = spawn(run.cli_id, run.project_dir)
+        mode = agent.mode or getattr(run, "default_mode", None)
+        if configure and mode:
+            try:
+                configure(agent.pair_session, mode)
+            except Exception:                                    # noqa: BLE001
+                pass
+        if run.stop_flag.is_set():
+            agent.pair_state = "stopped"
+            return
+        text = _drain(sink, run_turn(agent.pair_session, _pair_prompt(run, agent)))
+        agent.pair_summary = clean_summary(text or "")
+        if agent.pair_state == "stopped":
+            return
+        agent.pair_error = sink.error
+        agent.pair_state = "done" if agent.pair_summary else "failed"
+    except Exception as exc:                                     # noqa: BLE001
+        agent.pair_state = "failed"
+        agent.pair_error = "%s: %s" % (exc.__class__.__name__, exc)
+    finally:
+        agent.pair_ended_at = time.time()
+
+
+def _live_pairs(pairs):
+    return sum(1 for t, _s in pairs.values() if t.is_alive())
+
+
+def _finish_pair(agent, entry, stop=None):
+    """The lead ended: stop its co-pilot if still going, then merge what it
+    found into the phase summary. Never raises."""
+    if not entry:
+        return
+    try:
+        t = entry[0]
+        if t.is_alive():
+            agent.pair_state = "stopped"
+            if stop and agent.pair_session:
+                try:
+                    stop(agent.pair_session)
+                except Exception:                                # noqa: BLE001
+                    pass
+            t.join(PAIR_GRACE)
+        note = (agent.pair_summary or "").strip()
+        if note and agent.state == DONE:
+            agent.summary = ((agent.summary or "").rstrip()
+                             + "\n\nCO-PILOT HELPER (second model) NOTES:\n" + note[:2000])
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _run_phases(run, indexes, spawn, run_turn, configure=None, stop=None):
+    """See _run_phases_loop. The live RAM/CPU monitor (lowres) ticks while a
+    run walks; it only ever stops NEW starts."""
+    monitor = False
+    try:
+        import lowres
+        lowres.acquire_monitor()
+        monitor = True
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        _run_phases_loop(run, indexes, spawn, run_turn, configure, stop)
+    finally:
+        if monitor:
+            try:
+                lowres.release_monitor()
+            except Exception:                                    # noqa: BLE001
+                pass
+
+
+def _run_phases_loop(run, indexes, spawn, run_turn, configure=None, stop=None):
     """Run phases `indexes` of `run`, each AS SOON AS every phase it needs has
     finished -- not when its whole wave has. Owner, 2026-10-04: "each phase
     should work in parallel if it does not need to wait for other things".
@@ -2021,6 +2357,7 @@ def _run_phases(run, indexes, spawn, run_turn, configure=None, stop=None):
     pending = list(order)
     unsettled = set(order)          # in this call and not finished yet
     running = []                    # [thread, agent, index, spawned_at]
+    pairs = {}                      # phase index -> [thread, spawned_at] (PAIR mode)
     last = run.agents[-1]
     review = last if getattr(last, "title", None) == REVIEW_TITLE else None
     forced = False
@@ -2041,6 +2378,7 @@ def _run_phases(run, indexes, spawn, run_turn, configure=None, stop=None):
             t, agent, i, spawned = entry
             if not t.is_alive():
                 running.remove(entry)
+                _finish_pair(agent, pairs.pop(i, None), stop)
                 unsettled.discard(i)
                 continue
             # Measured from THIS start too: a resumed phase still carries the
@@ -2054,6 +2392,7 @@ def _run_phases(run, indexes, spawn, run_turn, configure=None, stop=None):
             else:
                 continue
             running.remove(entry)
+            _finish_pair(agent, pairs.pop(i, None), stop)
             unsettled.discard(i)
         if run.stop_flag.is_set():
             # STOP MEANS STOP. The flag alone only stopped NEW phases: every
@@ -2064,11 +2403,12 @@ def _run_phases(run, indexes, spawn, run_turn, configure=None, stop=None):
             # too, see app.py "Client disconnect stops the work").
             if stop:
                 for _t, agent, _i, _s in running:
-                    if agent.session_id:
-                        try:
-                            stop(agent.session_id)
-                        except Exception:                        # noqa: BLE001
-                            pass
+                    for sid in (agent.session_id, getattr(agent, "pair_session", None)):
+                        if sid:
+                            try:
+                                stop(sid)
+                            except Exception:                    # noqa: BLE001
+                                pass
             break
         can = [i for i in pending if ready(i)]
         if not can and not running and pending:
@@ -2085,7 +2425,7 @@ def _run_phases(run, indexes, spawn, run_turn, configure=None, stop=None):
             # The cap is what stops a plan with eight independent phases
             # spawning eight CLI processes at once; re-read, so a run that
             # started with RAM to spare backs off when it runs short.
-            if len(running) >= _concurrency():
+            if not spawn_allowed(len(running) + _live_pairs(pairs)):
                 break
             i = can.pop(0)
             pending.remove(i)
@@ -2098,6 +2438,33 @@ def _run_phases(run, indexes, spawn, run_turn, configure=None, stop=None):
             t.start()
             last_spawn = time.time()        # after start: the gap is never short
             running.append([t, agent, i, last_spawn])
+            try:
+                import lowres
+                lowres.GOV.note_spawn()
+            except Exception:                                    # noqa: BLE001
+                pass
+        # PAIR mode: only into slots NOTHING else is waiting for.
+        if not can and not [i for i in pending if run.agents[i - 1] is not review]:
+            for t, agent, i, _s in running:
+                if i in pairs or not t.is_alive() or not pair_eligible(run, agent, review):
+                    continue
+                if SPAWN_STAGGER and last_spawn is not None \
+                        and time.time() - last_spawn < SPAWN_STAGGER:
+                    break
+                if not spawn_allowed(len(running) + _live_pairs(pairs)):
+                    break
+                pt = threading.Thread(target=_run_pair,
+                                      args=(run, agent, spawn, run_turn, configure),
+                                      daemon=True, name="pair-%s-%d" % (run.id, i))
+                agent.pair_state = "running"
+                pt.start()
+                last_spawn = time.time()
+                pairs[i] = [pt, last_spawn]
+                try:
+                    import lowres
+                    lowres.GOV.note_spawn()
+                except Exception:                                # noqa: BLE001
+                    pass
         time.sleep(_SCHED_TICK)
 
 
@@ -2385,10 +2752,12 @@ def sibling_sessions(session_id):
         runs = list(_RUNS.values())
     for run in runs:
         agents = list(getattr(run, "agents", None) or ())
-        me = next((a for a in agents if a.session_id == session_id), None)
+        me = next((a for a in agents if a.session_id == session_id
+                   or getattr(a, "pair_session", None) == session_id), None)
         if me is not None:
-            out = [a.session_id for a in agents
-                   if a.session_id and a.session_id != session_id]
+            out = [s for a in agents
+                   for s in (a.session_id, getattr(a, "pair_session", None))
+                   if s and s != session_id]
             if getattr(me, "widen", False):
                 out += [s for s in (getattr(me, "past_sessions", None) or ())
                         if s and s != session_id and s not in out]
@@ -2503,7 +2872,8 @@ def dry_run(goal, phases, design, project_dir, planner=None, modes=(), context="
         ask = plan_check.replan_ask(_with_context(goal, context, PLAN_CONTEXT_CHARS),
                                     replan, fixed, design)
         try:
-            raw = planner(_PLAN_SYSTEM.replace("{modes}", mode_list), ask)
+            raw = planner(_PLAN_SYSTEM.replace("{helpers}", str(_concurrency()))
+                          .replace("{modes}", mode_list), ask)
         except Exception as exc:                                 # noqa: BLE001
             _log.warning("[swarm] plan re-ask raised: %s", exc)
             raw = ""
@@ -2588,6 +2958,10 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     if review:
         phases = with_review(phases)
     if report is not None:
+        try:
+            report["max_parallel"] = _concurrency()
+        except Exception:                                        # noqa: BLE001
+            pass
         plan_check.summarize(report, phases)
         _log.info("[swarm] %s", report.get("line"))
     run = _Run(goal, project_dir, cli_id, phases, owner=owner,
@@ -2670,3 +3044,39 @@ _CHECK_WORDS = {
     "claimed": "%s -- the summary says tests/build pass, but no passing run was observed",
     "reviewed": "%s by the manager (it read the summary; no test run was observed)",
 }
+
+
+# --------------------------------------------------------------------------- #
+# What the page says about parallelism (calm: waiting for RAM is not an error)
+# --------------------------------------------------------------------------- #
+
+def parallel_view(run=None):
+    """{at_once, max, line, ram_line, waiting, pairs} for the helpers panel and
+    the conversation. `at_once` counts running helpers and co-pilots of `run`.
+    Never raises."""
+    out = {"at_once": 0, "max": MAX_CONCURRENT, "line": "", "ram_line": "",
+           "waiting": False, "pairs": []}
+    try:
+        info = concurrency_info()
+        out["max"] = info["now"]
+        out["cap"] = info["max"]
+        out["limited_by"] = info["limited_by"]
+        agents = list(getattr(run, "agents", None) or ())
+        out["at_once"] = sum(1 for a in agents if a.state == RUNNING) + sum(
+            1 for a in agents if getattr(a, "pair_state", None) == "running")
+        out["pairs"] = [a.index for a in agents if getattr(a, "pair_state", None)]
+        out["line"] = "%d helper%s at once (max %d)" % (
+            out["at_once"], "" if out["at_once"] == 1 else "s", info["now"])
+        import lowres
+        g = lowres.GOV
+        if g.fresh() and g.free_gb is not None and lowres.mode() != "off":
+            out["ram_line"] = ("RAM: %.1f GB free, keeping %.1f GB for your other programs"
+                               % (g.free_gb, g.reserve or 0.0))
+            out["waiting"] = bool(
+                g.headroom() == 0 and any(a.state == PENDING for a in agents))
+            if out["waiting"]:
+                out["ram_line"] += " · waiting for " + (
+                    "the CPU to calm down" if g.cpu_hold else "RAM to free up")
+    except Exception:                                            # noqa: BLE001
+        pass
+    return out

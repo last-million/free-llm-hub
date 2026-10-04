@@ -1153,6 +1153,27 @@ spawn one per CLI turn, which is worse) and HTTP fan-out threads (no real
 RAM). `GET/POST /api/low-resource {mode}`; Settings `#lowres-group`.
 `tests/conftest.py` pins a roomy machine for every test.
 
+**Live RAM governor (2026-10-04, `tests/test_multi_parallel_models.py`)**:
+the user's own programs come first. `lowres.Governor` (psutil only, fake-able
+machine/clock/procs/cpu/priority) is ticked every 2 s by ONE daemon thread
+while a Multi run walks (`acquire_monitor`/`release_monitor` around
+`_run_phases`). Reserve = setting `multi_ram_reserve_gb` ("auto" = max(3 GB,
+20% of total RAM)); new helpers allowed = (available - reserve) / per-helper
+cost, where the cost is MEASURED (RSS of each worker process tree = processes
+carrying `CALVOUN_AGENT_TURN`; p90 of the last 10 samples; 0.5 GB until
+measured) and spawns younger than 15 s are subtracted (their RAM is not used
+yet). Lowers at once, raises only after the higher value held 20 s. It ONLY
+stops NEW starts (`swarm_windows.spawn_allowed`): never kills/suspends a
+running helper, queued phases just wait ("Waiting for RAM to free up" - not an
+error), and a run with nothing running always gets one helper. Free RAM < 1 GB
+lowers the OS priority of the marker processes (BELOW_NORMAL on Windows, nice
++10 elsewhere) and restores it at >= 1.5 GB. Non-hub CPU > 90% for 10 s holds
+new spawns the same way. Stale monitor (> 10 s), a failure, unreadable numbers
+or `low_resource_mode` "off" = no live limit (the old behaviour). Measured
+here (39.7 GB, 18.5 GB free, 8 cores): reserve 7.9 GB, cost 0.5 GB until
+measured -> 21 new helpers by RAM, so the cap/fleet decide. `GET /api/low-
+resource` gains `reserve_gb`, `per_helper_gb`, `allowed_now`, `limited_by`.
+
 ## /agent outage fixes (2026-09-28, session 47a25faa)
 
 Live: an opencode Max + coding session (~54K tokens) failed after 25 min —
@@ -1482,6 +1503,44 @@ feeds several phases stays.
 starts a phase once every phase it `needs` finished (a FAILED need does not block),
 plan order, <= `_concurrency()`, `SPAWN_STAGGER` apart, review last; `run.waves` is
 display only. Verdicts stay one per phase inside its worker (no batch exists here).
+Since 2026-10-04 the cap is adaptive and `MAX_AGENTS` is 10 (see "Multi: up to
+6 different models at once").
+
+## Multi: up to 6 different models at once (2026-10-04)
+
+Covered by `tests/test_multi_parallel_models.py`. Owner: "4 DIFFERENT models at
+once, or 5-6 if needed, working TOGETHER".
+
+- **Formula**: `swarm_windows._concurrency()` = min(`multi_parallel_max`
+  (default 6, 1..8), by-machine, by-fleet, 429 back-off). By-machine =
+  `min(lowres.workers(cap), free RAM / 0.5 GB, cores)` (weak machine 1-2, free
+  RAM < 1.5 GB -> 1, mode "off" skips the RAM term, unreadable numbers -> 4).
+  By-fleet = `app._multi_fleet_size()` registered via
+  `set_fleet_counter`: distinct healthy tool-capable identities within 6
+  points of the best (throttled/parked provider, low-quality, blocked do not
+  count), floor 2, 0/unknown = no limit. Back-off = one helper fewer per 3
+  `_recent_hop_fail` 429 pairs in 120 s, floor 2, logged `[multi] backing off
+  to N (429s)`. This PC: min(6, 8 cores, RAM 37) = 6 unless the fleet is
+  narrower. `GET/POST /api/multi-parallel {max, pair_phases, ram_reserve_gb}`.
+- **Rotation** (`app._rotate_within_run`): workers of one run get distinct
+  identities; among unused models the order is new provider AND family, new
+  provider, new family, any (`verify.family`). Band = 4 points of the best; it
+  widens to `_RUN_ROTATE_WIDE_DROP` 6 only when it holds fewer distinct models
+  than the run needs. Low-quality and user-blocked models never. A worker
+  keeps its model (session pin).
+- **Planner**: `{helpers}` in `_PLAN_SYSTEM`; a sizeable goal (>= 280 chars or
+  3+ listed parts) with >= 3 helpers also gets `_MICRO_ASK` (split big phases
+  into file-owning micro-tasks, final integrate/review, `"parallel": true` for
+  a big unsplittable phase). Plan check line ends "running up to N helpers at
+  once".
+- **PAIR mode** (`multi_pair_phases` auto | true | false): a phase with
+  `parallel: true` or >= 4 owned files gets a co-pilot session (another model
+  via `sibling_sessions`) ONLY when nothing else is pending for a slot. It
+  reads/reviews freely, writes only files no phase owns, no installs/servers,
+  coordinates via its PROGRESS.md line, is stopped when the lead ends; its
+  notes are appended to the phase summary ("CO-PILOT HELPER NOTES").
+- **Panel**: `_multi_run_plan` carries `parallel` ({line "N helpers at once
+  (max M)", ram_line, waiting}) and per-helper `pair`.
 
 ## LMArena board, daily (2026-09-30)
 
@@ -2011,6 +2070,49 @@ Covered by `tests/test_wiring_roles_guides_pipelines.py`.
   prompt. A weak actor (`_model_is_weak`) is always verified in
   `_role_verify_and_correct`. Routing is untouched.
 - **`turn_verifier`** (default on): kill switch for verifier + corrector.
+
+## Swarm distinct models, team reliability (2026-10-04)
+
+Covered by `tests/test_swarm_distinct_models.py` and
+`tests/test_team_and_verifier_reliability.py`. Why (turn-roles.jsonl, 214 role
+turns): team notes ran on 3.7%, 5 of 12 specialist calls answered (4 hit the 25 s
+limit; answered p50 11.9 s / p90 19.4 s), the verifier gave a usable verdict on
+21% (15 of 19 "no verdict"), and prose swarm/crew workers all clustered on the
+top 1-2 models.
+
+- **Distinct workers**: `swarm.run(ledger=True)` (crews forward it) makes one
+  `swarm.RunLedger` per run and passes `ledger=` to `dispatch` on WORKER calls
+  only (first attempt, retries, wider attempts). `_swarm_dispatch(ledger=)` ->
+  `_distinct_first`: the chain is re-ordered so the worker opens on a model
+  identity no other worker of the run holds (then unused family, then unused
+  provider), inside `_AUTO_TOP_BAND`, widened to 4 points only when the narrow
+  band has none; never a last-resort family, never an excluded provider, never
+  dropped (only re-ordered); the pair is reserved under the ledger lock (a
+  failed hop gives it back). Flag `swarm_distinct_models` (default on) via
+  `_pipeline_check_kwargs()`. Result gains `workers_models`.
+- **Phase verdict**: `swarm.run(free_verdict=)` (no manager): a code/format-bound
+  phase (`swarm.verdict_bound`) whose free checks pass gets ONE `_free_verdict`;
+  not-ok + HIGH -> the existing single retry on another provider (kept only if
+  the free checks pass); `result["phase_verdicts"]`. Flag `swarm_phase_verdict`
+  (default on). None / unreadable / raising = unchanged.
+- **Specialists by measurement**: `_team_stats` (in memory, seeded once from the
+  last 500 rows of turn-roles.jsonl) ranks the pool by answered rate (Beta(1,1))
+  then p50, only inside the top band; 2 failures in the last 3 calls rest a
+  pair for 30 min; `_TEAM_HOP_SECONDS` 25 -> 35. Verifier pool: `_rank_verifier_pool`
+  puts measured usable-verdict rate before score inside the band (family
+  diversity still first in `pick_verifier`).
+- **Verifier contract**: `VERDICT: ACCEPT|REVISE` FIRST, then `PROBLEMS:` bullets
+  and `SEVERITY:` (survives a reply cut by the token cap); JSON still accepted;
+  the parser also reads the verdict mid-text, bare sentences ("looks correct",
+  never high severity). Unreadable reply -> ONE retry on the next verifier with
+  `verify.STRICT_VERIFIER_SYSTEM` (also in `_free_verdict`); `verifier_unparsed`
+  / `verifier_retry` in turn-roles.jsonl and scripts/role_eval.py.
+- **Medium gate**: `_specialists_wanted` also accepts a MEDIUM fresh build /
+  implement / refactor instruction (`_medium_build_ask`, est <= 30K, not a
+  question or one-line edit), scout + critic only; flag
+  `tool_turn_specialists_medium` (default on). MEASURED: the log's 188 medium
+  turns are agent-loop continuations (min 39K, p50 139K tokens), so this gate
+  adds ~0 calls on that traffic; it fires on fresh opening turns only.
 
 ## Tests
 

@@ -234,7 +234,7 @@ def test_the_prose_stages_keep_the_short_one():
     stalling; only the tool path needed the longer budget."""
     src = open("app.py", encoding="utf-8").read()
     i = src.index("def _swarm_dispatch")
-    assert "_SWARM_HOP_DEADLINE" in src[i:i + 1500]
+    assert "_SWARM_HOP_DEADLINE" in src[i:i + 4500]
 
 
 # --------------------------------------------------------------------------- #

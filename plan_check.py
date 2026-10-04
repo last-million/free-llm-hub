@@ -629,6 +629,12 @@ def check_line(report):
     bits.append("%d fixed" % len(fixed) + (" (%s)" % _clip_items(fixed) if fixed else ""))
     bits.append("%d warning%s" % (len(warns), "" if len(warns) == 1 else "s")
                 + (" (%s)" % _clip_items(warns) if warns else ""))
+    try:
+        mp = int(report.get("max_parallel") or 0)
+    except (TypeError, ValueError):
+        mp = 0
+    if mp >= 2 and n >= 2:
+        bits.append("running up to %d helpers at once" % mp)
     return "Plan check: " + ", ".join(bits)
 
 

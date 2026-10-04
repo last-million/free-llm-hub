@@ -8141,15 +8141,22 @@ _WORKER_MODEL_MAX = 2000
 _worker_model_lock = threading.Lock()
 
 
-def _note_worker_model(session_key, model):
-    """Remember which model a session opened on (for its run's siblings)."""
+_WORKER_PID = {}                    # worker session id -> provider id
+
+
+def _note_worker_model(session_key, model, pid=None):
+    """Remember which model (and provider) a session opened on (for its run's
+    siblings)."""
     if not session_key or not model:
         return
     with _worker_model_lock:
         if len(_WORKER_MODEL) >= _WORKER_MODEL_MAX:
             for k in list(_WORKER_MODEL)[:_WORKER_MODEL_MAX // 4]:
                 _WORKER_MODEL.pop(k, None)
+                _WORKER_PID.pop(k, None)
         _WORKER_MODEL[session_key] = _normalize_model_identity(model)
+        if pid:
+            _WORKER_PID[session_key] = pid
 
 
 def _run_used_identities(session_key):
@@ -8162,23 +8169,108 @@ def _run_used_identities(session_key):
         return {_WORKER_MODEL[s] for s in sibs if s in _WORKER_MODEL}
 
 
-def _rotate_within_run(pool, session_key):
-    """`pool` without the models this worker's run already used, as long as a
-    model within _RUN_ROTATE_MAX_DROP of the best is left; else `pool`."""
+# UP TO SIX DIFFERENT MODELS AT ONCE (owner, 2026-10-04). The 4-point band
+# stays the rule (best available first); only when it holds fewer distinct
+# models than the run needs (its other workers + this one) does the slot widen
+# to _RUN_ROTATE_WIDE_DROP. Among the unused models: a new provider AND family
+# first, then a new provider, then a new family, then any. Low-quality and
+# user-blocked models are never rotated onto.
+_RUN_ROTATE_WIDE_DROP = 6.0
+
+
+def _run_used_picks(session_key):
+    """(identities, providers, families) the OTHER workers of this session's
+    run opened on."""
     try:
-        used = _run_used_identities(session_key)
+        sibs = swarm_windows.sibling_sessions(session_key)
+    except Exception:                                            # noqa: BLE001
+        return set(), set(), set()
+    with _worker_model_lock:
+        ids = {_WORKER_MODEL[s] for s in sibs if s in _WORKER_MODEL}
+        pids = {_WORKER_PID[s] for s in sibs if s in _WORKER_PID}
+    fams = set()
+    v = _verify()
+    for i in ids:
+        fams.add(v.family(i) if v else i)
+    return ids, pids, fams
+
+
+def _rotation_candidate_ok(c):
+    try:
+        return not _is_low_quality(c[2]) and not _is_model_blocked_by_user(c[1], c[2])
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _rotate_within_run(pool, session_key):
+    """`pool` narrowed to models this worker's run has NOT used, on a new
+    provider and family where possible, within _RUN_ROTATE_MAX_DROP of the
+    best (widened to _RUN_ROTATE_WIDE_DROP only when that band holds fewer
+    distinct models than the run needs); else `pool`."""
+    try:
+        used, used_pids, used_fams = _run_used_picks(session_key)
         if not used or not pool:
             return pool
         best = max(c[0] for c in pool)
-        fresh = [c for c in pool
-                 if _normalize_model_identity(c[2]) not in used
-                 and c[0] >= best - _RUN_ROTATE_MAX_DROP]
-        if fresh:
-            _log.info("[rotate] %s: its run already used %s -> choosing among %d other strong model(s)",
-                      (session_key or "-")[:8], ", ".join(sorted(used)), len(fresh))
-        return fresh or pool
+        need = len(used) + 1
+
+        def _band(drop):
+            return [c for c in pool if c[0] >= best - drop and _rotation_candidate_ok(c)]
+
+        band = _band(_RUN_ROTATE_MAX_DROP)
+        if len({_normalize_model_identity(c[2]) for c in band}) < need:
+            band = _band(_RUN_ROTATE_WIDE_DROP)
+        fresh = [c for c in band if _normalize_model_identity(c[2]) not in used]
+        if not fresh:
+            return pool
+        v = _verify()
+
+        def _fam(c):
+            return v.family(c[2]) if v else _normalize_model_identity(c[2])
+
+        for keep in (lambda c: c[1] not in used_pids and _fam(c) not in used_fams,
+                     lambda c: c[1] not in used_pids,
+                     lambda c: _fam(c) not in used_fams):
+            tier = [c for c in fresh if keep(c)]
+            if tier:
+                fresh = tier
+                break
+        _log.info("[rotate] %s: its run already used %s -> choosing among %d other strong model(s)",
+                  (session_key or "-")[:8], ", ".join(sorted(used)), len(fresh))
+        return fresh
     except Exception:                                            # noqa: BLE001
         return pool
+
+
+def _multi_fleet_size():
+    """Distinct healthy tool-capable model identities within the wide rotation
+    band of the best available one (a throttled/exhausted/parked provider,
+    low-quality or blocked model does not count). 0 = unknown."""
+    try:
+        fleet = [(s, p, m) for p, m, _w, s in _declared_fleet()
+                 if not _is_low_quality(m) and not _swarm_member_sick(p, m)]
+        if not fleet:
+            return 0
+        best = max(s for s, _p, _m in fleet)
+        return len({_normalize_model_identity(m) for s, _p, m in fleet
+                    if s >= best - _RUN_ROTATE_WIDE_DROP})
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+def _recent_429_count(window=120.0):
+    """How many (provider, model) pairs 429'd inside `window` seconds."""
+    try:
+        now = time.time()
+        with _recent_fail_lock:
+            return sum(1 for ts, kind in _recent_hop_fail.values()
+                       if kind == "429" and now - ts <= window)
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+swarm_windows.set_fleet_counter(_multi_fleet_size)
+swarm_windows.set_rate_counter(_recent_429_count)
 
 
 def _session_pin_drop(key):
@@ -8776,7 +8868,7 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
             picked = _weighted_pick(_pool, _sustain)
             _s, pid, model = picked
             _session_pin_set(_skey, pid, model)
-            _note_worker_model(_skey, model)
+            _note_worker_model(_skey, model, pid)
             _log.info("[spread] %s -> %s/%s (pool %d, held elsewhere %d)",
                       (_skey or "-")[:8], pid, model, len(_pool),
                       len(_pinned_elsewhere(_skey)))
@@ -18960,6 +19052,7 @@ def _multi_follow_events(run_id, cli_id):
     seen = {}
     forwarded = {}
     total = 0
+    said_waiting = False
     while True:
         # ONE look per poll, with the workers' logs (for _multi_activity).
         st = swarm_windows.status(run_id, with_events=True)
@@ -18980,6 +19073,19 @@ def _multi_follow_events(run_id, cli_id):
             check = st.get("plan_check") or {}
             if check.get("line") and not st.get("resumes"):
                 yield {"event": "tool", "text": check["line"]}
+            pv = swarm_windows.parallel_view(swarm_windows.get(run_id))
+            if pv.get("ram_line") and total > 1:
+                yield {"event": "tool", "text": "Running up to %d helpers at once (%s)"
+                                                  % (pv["max"], pv["ram_line"].split(" · ")[0])}
+        # Calm, not an error: queued phases wait for the user's RAM/CPU.
+        pv = swarm_windows.parallel_view(swarm_windows.get(run_id))
+        if pv.get("waiting") and not said_waiting:
+            said_waiting = True
+            yield {"event": "tool", "text": "Waiting for " + (
+                "the CPU to calm down" if "CPU" in pv.get("ram_line", "")
+                else "RAM to free up") + " before starting the next helper (your other programs come first)"}
+        elif not pv.get("waiting"):
+            said_waiting = False
         for a in st.get("agents") or []:
             key = a.get("index")
             state = a.get("state")
@@ -19133,7 +19239,7 @@ def _multi_turn_blocking(session_id, sess_info, text):
 @app.route("/api/swarm-windows", methods=["GET"])
 def api_swarm_windows_list():
     return jsonify({"runs": swarm_windows.list_runs(),
-                    "max_concurrent": swarm_windows.MAX_CONCURRENT,
+                    "max_concurrent": swarm_windows._concurrency(),
                     "max_agents": swarm_windows.MAX_AGENTS})
 
 
@@ -21333,6 +21439,50 @@ def api_low_resource_update():
     return jsonify(lowres.status())
 
 
+def _multi_parallel_status():
+    info = swarm_windows.concurrency_info()
+    info["setting"] = swarm_windows.parallel_cap()
+    info["limit"] = swarm_windows.MAX_PARALLEL_LIMIT
+    info["pair_phases"] = swarm_windows.pair_flag()      # True / False / None = auto
+    info["ram_reserve_gb"] = lowres.reserve_gb()
+    info["lowres"] = lowres.status()
+    return info
+
+
+@app.route("/api/multi-parallel", methods=["GET"])
+def api_multi_parallel():
+    """How many helpers a Multi run may run at once and why (setting, machine,
+    fleet, 429 back-off, live RAM governor)."""
+    return jsonify(_multi_parallel_status())
+
+
+@app.route("/api/multi-parallel", methods=["POST"])
+def api_multi_parallel_update():
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "send a JSON object."}), 400
+    if "max" in body:
+        v = body["max"]
+        if isinstance(v, bool) or not isinstance(v, int) or not \
+                1 <= v <= swarm_windows.MAX_PARALLEL_LIMIT:
+            return jsonify({"error": "max must be an integer from 1 to %d."
+                                     % swarm_windows.MAX_PARALLEL_LIMIT}), 400
+    if "pair_phases" in body and body["pair_phases"] not in (True, False, "auto"):
+        return jsonify({"error": "pair_phases must be true, false or \"auto\"."}), 400
+    if "ram_reserve_gb" in body:
+        r = body["ram_reserve_gb"]
+        if r != "auto" and (isinstance(r, bool) or not isinstance(r, (int, float))
+                            or not 0 <= r <= 256):
+            return jsonify({"error": "ram_reserve_gb must be \"auto\" or a number of GB."}), 400
+    if "max" in body:
+        config.set_setting("multi_parallel_max", body["max"])
+    if "pair_phases" in body:
+        config.set_setting("multi_pair_phases", body["pair_phases"])
+    if "ram_reserve_gb" in body:
+        config.set_setting("multi_ram_reserve_gb", body["ram_reserve_gb"])
+    return jsonify(_multi_parallel_status())
+
+
 @app.route("/api/web-search-policy", methods=["POST"])
 def api_web_search_policy_update():
     body = request.get_json(force=True, silent=True)
@@ -22130,6 +22280,18 @@ def _multi_last_action(agent):
     return None
 
 
+def _multi_pair_view(agent):
+    """The co-pilot of a phase for the helpers panel: {model, state, url}, or
+    None when the phase has none (swarm_windows PAIR mode)."""
+    if not getattr(agent, "pair_state", None):
+        return None
+    sid = agent.pair_session
+    with _worker_model_lock:
+        model = _WORKER_MODEL.get(sid) if sid else None
+    return {"model": model, "state": agent.pair_state, "session_id": sid,
+            "url": ("/agent/" + sid) if sid else None}
+
+
 def _multi_run_plan(session_id, project_dir=None):
     """The Build page's task list from this conversation's Multi run: one
     line per phase (done / working / waiting / failed, and the model the
@@ -22191,7 +22353,8 @@ def _multi_run_plan(session_id, project_dir=None):
                           # What the phase's result rests on, honestly
                           # labelled: "12 passed (observed)" / "claimed,
                           # not checked" / "reviewed" (swarm_windows.check_of).
-                          "check": swarm_windows.check_of(a)})
+                          "check": swarm_windows.check_of(a),
+                          "pair": _multi_pair_view(a)})
         running = [t["index"] for t in items if t["doing"]]
         # The stopping place stays visible next to the helpers: a run that was
         # cut short (or a turn cut by a restart) still offers Continue.
@@ -22208,6 +22371,7 @@ def _multi_run_plan(session_id, project_dir=None):
                 # components, 4 interfaces"), and its dry-run line.
                 "design": swarm_windows.design_view(run),
                 "plan_check": (getattr(run, "plan_check", None) or {}).get("line"),
+                "parallel": swarm_windows.parallel_view(run),
                 "current": running[0] if running else None,
                 # Picked back up by this process after a restart (it did not
                 # need a click: swarm_windows.resume_interrupted at boot).
@@ -32764,8 +32928,84 @@ def _is_swarm_model(model):
     return m.startswith("crew/") and ("crew-" + m[len("crew/"):]) in crews.CREW_IDS
 
 
+_DISTINCT_WIDEN_BAND = 4.0     # at most this far below the best, only when needed
+
+
+def _distinct_models_on():
+    """Flag `swarm_distinct_models` (default ON): concurrent swarm/crew workers
+    of one run open on different model identities."""
+    try:
+        return bool(config.get_flag("swarm_distinct_models", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _distinct_first(chain, ledger, exclude_pids=()):
+    """(chain, reserved): `chain` with the best candidate whose model identity
+    no other worker of this run holds moved to the FRONT, and that pair
+    reserved in `ledger`. A candidate must sit within _AUTO_TOP_BAND of the
+    best benchmark score (widened to _DISTINCT_WIDEN_BAND only when the
+    narrow band holds no unused identity), is never a last-resort family and
+    never a provider in `exclude_pids`. Preference: an unused identity, then
+    an unused family, then an unused provider; ties keep chain order, so the
+    best model still wins whenever it is free. Nothing unused = the chain
+    untouched (the pair at its head is reserved). Provider and model are
+    never excluded, only re-ordered. Never raises."""
+    chain = list(chain or ())
+    if not chain:
+        return chain, None
+    try:
+        with ledger.lock:
+            used = list(ledger._used)           # the reservation is made under this lock
+            used_pairs = [u.split("/", 1) for u in used if "/" in u]
+            used_ids = {_normalize_model_identity(m) for _p, m in used_pairs}
+            used_pids = {p for p, _m in used_pairs}
+            fam = _verify_family() or (lambda m: _normalize_model_identity(m))
+            used_fams = set()
+            for _p, m in used_pairs:
+                try:
+                    used_fams.add(fam(m))
+                except Exception:                                # noqa: BLE001
+                    pass
+            scored = [(_benchmark_score(e[0], e[1]), e) for e in chain]
+            cand = [(sc, e) for sc, e in scored
+                    if not _is_low_quality(e[1])
+                    and not (exclude_pids and e[0] in exclude_pids)]
+            pick = None
+            if cand:
+                best = max(sc for sc, _e in cand)
+                for band in (_AUTO_TOP_BAND, _DISTINCT_WIDEN_BAND):
+                    best_key, best_i = None, None
+                    for i, (sc, e) in enumerate(cand):
+                        if sc < best - band:
+                            continue
+                        if _normalize_model_identity(e[1]) in used_ids:
+                            continue
+                        try:
+                            f = fam(e[1])
+                        except Exception:                        # noqa: BLE001
+                            f = _normalize_model_identity(e[1])
+                        key = (f not in used_fams, e[0] not in used_pids, -i)
+                        if best_key is None or key > best_key:
+                            best_key, best_i = key, i
+                    if best_i is not None:
+                        pick = cand[best_i][1]
+                        break
+            if pick is None:
+                head = next((e for e in chain if not (exclude_pids and e[0] in exclude_pids)),
+                            chain[0])
+                ledger._used.append("%s/%s" % (head[0], head[1]))
+                return chain, (head[0], head[1])
+            ledger._used.append("%s/%s" % (pick[0], pick[1]))
+            rest = [e for e in chain if e is not pick]
+            return [pick] + rest, (pick[0], pick[1])
+    except Exception:                                            # noqa: BLE001
+        return chain, None
+
+
 @_usage_source_as("swarm")
-def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_families=()):
+def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_families=(),
+                    ledger=None):
     """One stage of the pipeline, routed and executed through the SAME chain
     every other request uses (so fallback, key rotation, quota accounting and
     the activity trail all behave identically). Returns (text, 'pid/model');
@@ -32777,7 +33017,12 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_fam
     `avoid_families`: model families (verify.family) this stage should not
     be written by -- e.g. a reviewer of the family that wrote the draft. Their
     candidates go to the BACK of the stage chain (_avoid_families_last):
-    never excluded, never a failure, a no-op without the verify module."""
+    never excluded, never a failure, a no-op without the verify module.
+
+    `ledger` (swarm.RunLedger, a WORKER call of a run with distinct models
+    on): the stage chain is re-ordered so this worker opens on a model
+    identity no other worker of the run has (_distinct_first), and the pair
+    it uses is reserved in the ledger. None = the chain exactly as built."""
     try:
         est = _est_tokens(messages)
         # force_difficulty="hard": every swarm stage is creation work and must
@@ -32799,11 +33044,24 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_fam
                                   key=lambda e: _latency_rank(e[0], e[1]))
         if avoid_families:
             _stage_chain = _avoid_families_last(_stage_chain, avoid_families)
+        _reserved = None
+        _use_ledger = ledger is not None and not fast and _distinct_models_on()
+        if _use_ledger:
+            _stage_chain, _reserved = _distinct_first(_stage_chain, ledger, exclude_pids)
         for hop_pid, hop_model in _stage_chain[:_SWARM_STAGE_MAX_HOPS]:
             if _client_gone():
                 break        # the client left: the stage ends empty, at once
             if exclude_pids and hop_pid in exclude_pids:
                 continue     # reviewer must not be the provider that wrote it
+            if _use_ledger and _reserved != (hop_pid, hop_model):
+                # A hop that failed gives its reservation back to the run.
+                try:
+                    if _reserved is not None:
+                        ledger.release(*_reserved)
+                    ledger.reserve(hop_pid, hop_model)
+                except Exception:                                # noqa: BLE001
+                    pass
+                _reserved = (hop_pid, hop_model)
             # THE PIPELINE'S OUTER BOUND (see _pipeline_outer_bound): a stage
             # still in flight when the run's own cap passes may finish, but it
             # may not start a hop the run can no longer afford.
@@ -34309,11 +34567,29 @@ def _role_candidates(chain, producer, failed=(), kind=None):
     return out
 
 
-def _run_verifier(v, vp, vm, messages, msg, deadline, rec):
+def _run_verifier(v, vp, vm, messages, msg, deadline, rec, strict=False, info=None):
     """One non-streamed verifier call -> parsed verdict dict, or None on ANY
-    error / timeout / unreadable verdict (the caller fails open)."""
+    error / timeout / unreadable verdict (the caller fails open).
+
+    `strict`: the one-line retry contract (verify.STRICT_VERIFIER_SYSTEM).
+    `info` (a dict): gets "unparsed" = True when the reply was text that
+    verify.parse_verdict could not read, "empty" = True for a blank reply.
+    The call is filed in the verifier ledger (_verifier_rate) as usable or
+    not, unless the client left."""
+    usable = False
     try:
-        vmsgs = v.digest(messages, msg)
+        return _run_verifier_inner(v, vp, vm, messages, msg, deadline, rec, strict, info)
+    finally:
+        if not _client_gone():
+            _verifier_stats_note(vp, vm, bool(rec.pop("_v_usable", False)))
+
+
+def _run_verifier_inner(v, vp, vm, messages, msg, deadline, rec, strict, info):
+    if info is None:
+        info = {}
+    rec.pop("_v_usable", None)
+    try:
+        vmsgs = v.digest(messages, msg, strict=True) if strict else v.digest(messages, msg)
         max_tokens = int(getattr(v, "VERIFY_MAX_TOKENS", 400) or 400)
     except Exception:                                            # noqa: BLE001
         return None
@@ -34342,6 +34618,7 @@ def _run_verifier(v, vp, vm, messages, msg, deadline, rec):
     try:
         text = _message_text(((data.get("choices") or [{}])[0].get("message") or {}))
         if not str(text or "").strip():
+            info["empty"] = True
             return None
         _record_chat_usage(vp, vm, data, v_est)
         verdict = v.parse_verdict(text)
@@ -34349,7 +34626,9 @@ def _run_verifier(v, vp, vm, messages, msg, deadline, rec):
         # "unparsed": True. Fail-open here too, but it is NOT a verification:
         # no reward, nothing shown as "verifier: ok".
         if not isinstance(verdict, dict) or "ok" not in verdict or verdict.get("unparsed"):
+            info["unparsed"] = True
             return None
+        rec["_v_usable"] = True
         return verdict
     except Exception:                                            # noqa: BLE001
         return None
@@ -34383,7 +34662,7 @@ def _role_verify_and_correct(body, messages, producer, msg, chain, kind, difficu
             rec["verdict"] = "skipped: no time left"
             return None
         ppid, pmodel = producer
-        pool = _role_candidates(chain, producer, failed, kind)
+        pool = _rank_verifier_pool(_role_candidates(chain, producer, failed, kind))
         try:
             pick = v.pick_verifier((ppid, pmodel), pool)
         except Exception:                                        # noqa: BLE001
@@ -34393,10 +34672,31 @@ def _role_verify_and_correct(body, messages, producer, msg, chain, kind, difficu
             return None
         vp, vm = pick[0], pick[1]
         rec["verifier"] = "%s/%s" % (vp, vm)
+        vinfo = {}
         verdict = _run_verifier(v, vp, vm, messages, msg,
-                                min(_VERIFY_DEADLINE, turn_end - time.monotonic()), rec)
+                                min(_VERIFY_DEADLINE, turn_end - time.monotonic()), rec,
+                                info=vinfo)
         if _client_gone():
             return None
+        if verdict is None and (vinfo.get("unparsed") or vinfo.get("empty")):
+            # A reply that could not be read: ONE retry on the next-best
+            # verifier with the strict one-line contract, if time remains.
+            rec["verifier_unparsed"] = int(rec.get("verifier_unparsed") or 0) + 1
+            left = min(_VERIFY_DEADLINE, turn_end - time.monotonic())
+            if left >= _VERIFY_MIN_SECONDS + 4.0:
+                try:
+                    pick2 = v.pick_verifier(
+                        (ppid, pmodel), [e for e in pool if (e[0], e[1]) != (vp, vm)])
+                except Exception:                                # noqa: BLE001
+                    pick2 = None
+                if pick2:
+                    rec["verifier_retry"] = int(rec.get("verifier_retry") or 0) + 1
+                    vp, vm = pick2[0], pick2[1]
+                    rec["verifier"] = "%s/%s" % (vp, vm)
+                    verdict = _run_verifier(v, vp, vm, messages, msg, left, rec,
+                                            strict=True)
+                    if _client_gone():
+                        return None
         if verdict is None:
             rec["verdict"] = "no verdict (fail-open)"
             rows.append({"role": "verifier: no verdict", "model": rec["verifier"]})
@@ -34502,7 +34802,7 @@ def _roles_header(rec):
 # --------------------------------------------------------------------------- #
 
 _TEAM_MAX_SPECIALISTS = 3
-_TEAM_HOP_SECONDS = 25.0
+_TEAM_HOP_SECONDS = 35.0     # MEASURED: answered p50 11.9 s, p90 19.4 s; 4 of 12 hit the old 25 s
 _TEAM_MAX_TOKENS = 700
 _TEAM_MAX_EST = 60000
 _TEAM_BRIEF_CHARS = 2500
@@ -34585,10 +34885,72 @@ def _specialists_wanted(body, kind, est=None, real=None):
         if real is None:
             real = _classify_difficulty(messages, (body or {}).get("max_tokens"))
         if real != "hard":
-            return False
+            if not (real == "medium" and _team_medium_ok(messages, est)):
+                return False
         if _is_trivial_ask(messages, (body or {}).get("max_tokens")):
             return False
         return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+_TEAM_MEDIUM_MAX_EST = 30000
+_TEAM_IMPLEMENT_RE = re.compile(
+    r"\b(?:implement\w*|refactor\w*|migrat\w+|restructur\w+|rewrit\w+|overhaul\w*|"
+    r"integrat\w+|extract\w*|multi[- ]?file)\b"
+    r"|\b(?:across|in\s+all|in\s+every|throughout)\s+(?:(?:the|all)\s+)*"
+    r"(?:files?|modules?|codebase|repo|repository|project|tests?|components?)\b"
+    r"|\badd\b[^.\n]{0,40}\b(?:feature|endpoint|command|page|component|module|support|"
+    r"route|api|handler|service)\b", re.I)
+_TEAM_SMALL_EDIT_RE = re.compile(
+    r"\b(?:typo|one[- ]?lin(?:e|er)|single\s+line|small\s+tweak|bump\s+(?:the\s+)?version|"
+    r"rename\s+\w+\s+to|change\s+the\s+(?:text|colou?r|title|label|name)\b)", re.I)
+_TEAM_QUESTION_START_RE = re.compile(
+    r"^\s*(?:what|why|how|which|where|when|who|is|are|does|do|did|explain|describe|"
+    r"show|list|tell|summari[sz]e|compare)\b", re.I)
+_TEAM_POLITE_RE = re.compile(
+    r"^\s*(?:(?:hey|hi|ok|okay|so|please)[,\s]+)*(?:can|could|would|will)\s+you\s+"
+    r"(?:please\s+)?", re.I)
+
+
+def _team_medium_flag_on():
+    try:
+        return bool(config.get_flag("tool_turn_specialists_medium", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _medium_build_ask(text):
+    """Is the instruction a build / create / implement / refactor / fix-across-
+    files ask worth a team (a MEDIUM turn)? Not a question, not a one-line
+    edit, not tiny. 'Can you implement X?' is a polite build ask, 'how does X
+    work?' is a question. Never raises."""
+    try:
+        t = " ".join(str(text or "").split())
+        if len(t.split()) < 8:
+            return False
+        polite = bool(_TEAM_POLITE_RE.match(t))
+        body = _TEAM_POLITE_RE.sub("", t, count=1) if polite else t
+        if _TEAM_QUESTION_START_RE.match(body):
+            return False
+        if t.rstrip().endswith("?") and not polite:
+            return False
+        if _TEAM_SMALL_EDIT_RE.search(t):
+            return False
+        return bool(_FAST_PATH_CREATE_RE.search(t) or _TEAM_IMPLEMENT_RE.search(t))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _team_medium_ok(messages, est):
+    """The MEDIUM-turn team gate: flag on, est <= _TEAM_MEDIUM_MAX_EST and the
+    latest instruction is a build ask (_medium_build_ask)."""
+    try:
+        if not _team_medium_flag_on():
+            return False
+        if est is not None and est > _TEAM_MEDIUM_MAX_EST:
+            return False
+        return _medium_build_ask(_team_instruction(messages))
     except Exception:                                            # noqa: BLE001
         return False
 
@@ -34702,13 +35064,169 @@ def _team_assistants(messages):
     return sum(1 for m in messages or () if isinstance(m, dict) and m.get("role") == "assistant")
 
 
+_TEAM_DROP_SECONDS = 1800.0     # a specialist that failed 2 of its last 3 rests this long
+_TEAM_STATS_EVENTS = 20
+_TEAM_STATS_SEED_ROWS = 500
+_TEAM_UNKNOWN_P50 = 20.0
+_team_stats = {}                # (pid, model) -> [(ts, role, ok, secs)]
+_team_stats_lock = threading.Lock()
+_team_stats_seeded = [False]
+
+
+def _split_label(label):
+    """(pid, model) from a 'pid/model' label (the model may hold slashes)."""
+    if isinstance(label, str) and "/" in label:
+        p, m = label.split("/", 1)
+        return p, m
+    return None
+
+
+def _team_stats_note(pid, model, role, ok, secs, ts=None):
+    """File one specialist call. Never raises."""
+    try:
+        with _team_stats_lock:
+            lst = _team_stats.setdefault((pid, model), [])
+            lst.append((float(ts if ts is not None else time.time()), str(role), bool(ok),
+                        float(secs or 0.0)))
+            del lst[:-_TEAM_STATS_EVENTS]
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _team_stats_seed(path=None, force=False):
+    """Seed the specialist (and verifier) ledgers from the last
+    _TEAM_STATS_SEED_ROWS rows of turn-roles.jsonl, once per process. Never
+    raises; a missing or unreadable file seeds nothing."""
+    if _team_stats_seeded[0] and not force:
+        return
+    _team_stats_seeded[0] = True
+    try:
+        path = path or os.path.join(config.state_dir(), _ROLE_LOG_NAME)
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-_TEAM_STATS_SEED_ROWS:]
+    except Exception:                                            # noqa: BLE001
+        return
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        ts = row.get("ts")
+        for sp in row.get("specialists") or ():
+            pair = _split_label(sp.get("model")) if isinstance(sp, dict) else None
+            if pair:
+                _team_stats_note(pair[0], pair[1], sp.get("role"), sp.get("ok"),
+                                 float(sp.get("ms") or 0) / 1000.0, ts)
+        pair = _split_label(row.get("verifier"))
+        verdict = str(row.get("verdict") or "")
+        if pair and verdict and not verdict.startswith(("skipped", "no verifier")):
+            _verifier_stats_note(pair[0], pair[1], verdict.split(" ")[0] in ("ok", "revise"), ts)
+
+
+def _team_events(pid, model):
+    _team_stats_seed()
+    with _team_stats_lock:
+        return list(_team_stats.get((pid, model)) or ())
+
+
+def _team_rate(pid, model):
+    """Answered rate with a Beta(1,1) prior: (answered + 1) / (calls + 2)."""
+    ev = _team_events(pid, model)
+    return (sum(1 for e in ev if e[2]) + 1.0) / (len(ev) + 2.0)
+
+
+def _team_p50(pid, model):
+    """Median seconds of its ANSWERED calls, _TEAM_UNKNOWN_P50 when none."""
+    secs = sorted(e[3] for e in _team_events(pid, model) if e[2])
+    return secs[len(secs) // 2] if secs else _TEAM_UNKNOWN_P50
+
+
+def _team_recently_failing(pid, model, now=None):
+    """Failed >= 2 of its last 3 specialist calls, the latest failure within
+    _TEAM_DROP_SECONDS of `now`: out of the team pool for those 30 minutes."""
+    ev = _team_events(pid, model)[-3:]
+    fails = [e for e in ev if not e[2]]
+    if len(fails) < 2:
+        return False
+    now = time.time() if now is None else now
+    return now - max(e[0] for e in fails) < _TEAM_DROP_SECONDS
+
+
+def _team_rank(rows):
+    """[(pid, model, score)] best-first -> the specialists' pool: recently
+    failing pairs dropped, and INSIDE the top band (_AUTO_TOP_BAND of the
+    best score) re-ordered by answered rate, then p50 latency. Slots outside
+    the band keep their place. Never raises."""
+    rows = list(rows or ())
+    try:
+        rows = [r for r in rows if not _team_recently_failing(r[0], r[1])]
+        if len(rows) < 2:
+            return rows
+        best = max(float(r[2]) for r in rows)
+        band = [i for i, r in enumerate(rows) if float(r[2]) >= best - _AUTO_TOP_BAND]
+        ranked = sorted(band, key=lambda i: (-_team_rate(rows[i][0], rows[i][1]),
+                                             _team_p50(rows[i][0], rows[i][1]), i))
+        out = list(rows)
+        for slot, i in zip(band, ranked):
+            out[slot] = rows[i]
+        return out
+    except Exception:                                            # noqa: BLE001
+        return rows
+
+
+_verifier_stats = {}            # (pid, model) -> [(ts, usable)]
+
+
+def _verifier_stats_note(pid, model, usable, ts=None):
+    try:
+        with _team_stats_lock:
+            lst = _verifier_stats.setdefault((pid, model), [])
+            lst.append((float(ts if ts is not None else time.time()), bool(usable)))
+            del lst[:-_TEAM_STATS_EVENTS]
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _verifier_rate(pid, model):
+    """Usable-verdict rate with a Beta(1,1) prior."""
+    _team_stats_seed()
+    with _team_stats_lock:
+        ev = list(_verifier_stats.get((pid, model)) or ())
+    return (sum(1 for e in ev if e[1]) + 1.0) / (len(ev) + 2.0)
+
+
+def _rank_verifier_pool(pool):
+    """[(pid, model, score)] with the scores of the top-band members replaced
+    by 1000 + 100 x usable-verdict rate + 0.01 x score, so verify.pick_verifier
+    (family, identity, provider, THEN score) breaks its last tie by measured
+    usable verdicts -- family diversity still comes first, and nothing outside
+    the band can win a tie. Never raises."""
+    pool = list(pool or ())
+    try:
+        if len(pool) < 2:
+            return pool
+        best = max(float(e[2]) for e in pool)
+        out = []
+        for e in pool:
+            sc = float(e[2])
+            if sc >= best - _AUTO_TOP_BAND:
+                sc = 1000.0 + 100.0 * _verifier_rate(e[0], e[1]) + 0.01 * sc
+            out.append((e[0], e[1], sc))
+        return out
+    except Exception:                                            # noqa: BLE001
+        return pool
+
+
 def _team_pick(chain, routed, kind, n):
     """Up to `n` (pid, model) of DIFFERENT identities, best first, preferring a
     new provider AND a new family, then a new provider, then any new identity.
     The routed (actor) pair, subscriptions, sick pairs and last-resort families
     are left out. The bandit nudge only reorders inside the top band."""
-    cands = [(p, m) for (p, m, _s) in _role_candidates(chain, routed, kind=kind)
-             if not _is_low_quality(m)][:10]
+    rows = [r for r in _role_candidates(chain, routed, kind=kind)
+            if not _is_low_quality(r[1])][:10]
+    cands = [(p, m) for (p, m, _s) in _team_rank(rows)]
     fam = _verify_family() or (lambda m: _normalize_model_identity(m))
     chosen, fams, pids, ids = [], set(), set(), set()
     for need in ("both", "pid", "identity"):
@@ -34820,6 +35338,8 @@ def _team_run(messages, tools, jobs, deadline, rec, rows):
     for i, (role, pid, model) in enumerate(jobs):
         res = results.get(i) or {"ok": False, "why": "no answer", "secs": 0}
         label = "%s/%s" % (pid, model)
+        if not _client_gone():
+            _team_stats_note(pid, model, role, res.get("ok"), res.get("secs"))
         rec["specialists"].append({"role": role, "model": label, "ok": bool(res["ok"]),
                                    "ms": int(float(res.get("secs") or 0) * 1000),
                                    "why": res.get("why") or ""})
@@ -34858,6 +35378,9 @@ def _team_notes_for_turn(body, messages, chain, routed, est, real, kind, rec, ro
         n = _TEAM_MAX_SPECIALISTS
         want_design = bool(craft.is_web_ui(goal) or _FAST_PATH_CREATE_RE.search(goal or ""))
         roles = ["scout", "designer", "critic"] if want_design else ["scout", "critic"]
+        if real != "hard":
+            roles = ["scout", "critic"]           # a MEDIUM turn: at most two
+            rec["team_tier"] = "medium"
         picks = _team_pick(chain, routed, kind, min(n, len(roles)))
         if len(picks) < 2:
             rec["team"] = "no distinct models"
@@ -34906,7 +35429,8 @@ def _tool_turn_roles(body):
            "actor": None, "actor_hops": 0, "nudge": None, "hedge": None,
            "verifier": None, "verdict": None, "severity": None, "corrector": None,
            "corrected": False, "served": None, "failed": [], "invalid": 0,
-           "specialists": [], "specialists_ok": 0, "brief_chars": 0, "team": None}
+           "specialists": [], "specialists_ok": 0, "brief_chars": 0, "team": None,
+           "verifier_unparsed": 0, "verifier_retry": 0}
     token = _TASK_KIND_CV.set(kind)
     try:
         return _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec,
@@ -35087,6 +35611,10 @@ def _pipeline_check_kwargs():
             out["family"] = fam
         if _pipeline_search_on():
             out["search"] = True
+        if _distinct_models_on():
+            out["ledger"] = True
+        if _verify() is not None and config.get_flag("swarm_phase_verdict", True):
+            out["free_verdict"] = _free_verdict
     except Exception:                                            # noqa: BLE001
         return {}
     return out
@@ -35126,7 +35654,9 @@ def _free_verdict(brief, producer=None):
     family, verify.pick_verifier) and brief["avoid_families"]. A plain string
     or a message list is accepted too. Returns {"ok", "problems", "severity"}
     or None on ANY failure, timeout or unreadable verdict -- the pipeline then
-    proceeds exactly as without it. Never raises."""
+    proceeds exactly as without it. A reply that could not be READ gets ONE
+    retry on the next-best verifier with the strict one-line contract
+    (verify.STRICT_VERIFIER_SYSTEM). Never raises."""
     v = _verify()
     if v is None or not brief or _client_gone():
         return None
@@ -35141,51 +35671,79 @@ def _free_verdict(brief, producer=None):
             brief = str(text)
         producer = _brief_producer(producer)
         if isinstance(brief, list):
-            messages = list(brief)
+            base = list(brief)
         else:
-            messages = [{"role": "user", "content": str(brief)}]
-            system = getattr(v, "VERIFIER_SYSTEM", None)
-            if isinstance(system, str) and system.strip():
-                messages.insert(0, {"role": "system", "content": system})
-        est = _est_tokens(messages)
-        pid, model, _d = _route_by_difficulty(messages, None, est,
+            base = [{"role": "user", "content": str(brief)}]
+        first = base[0].get("role") if base and isinstance(base[0], dict) else None
+        probe = list(base)
+        system = getattr(v, "VERIFIER_SYSTEM", None)
+        if first != "system" and isinstance(system, str) and system.strip():
+            probe.insert(0, {"role": "system", "content": system})
+        est = _est_tokens(probe)
+        pid, model, _d = _route_by_difficulty(probe, None, est,
                                               force_difficulty="medium")
         if not pid:
             return None
-        pool = _role_candidates(_avoid_families_last(_build_chain(pid, model, est), avoid),
-                                producer or (None, None))
-        if producer:
-            pick = v.pick_verifier(producer, pool)
-        else:
-            pick = pool[0][:2] if pool else None
-        if not pick:
-            return None
-        payload = {"model": pick[1], "stream": False, "messages": messages,
-                   "max_tokens": int(getattr(v, "VERIFY_MAX_TOKENS", 400) or 400),
-                   "_no_craft": True}
-        resp, _exc = _dispatch_chat_with_deadline(pick[0], payload, _VERIFY_DEADLINE)
-        if resp is None:
-            return None
-        try:
-            if resp.status_code != 200:
-                _swarm_note_member_status(pick[0], pick[1], resp.status_code)
+        pool = _rank_verifier_pool(_role_candidates(
+            _avoid_families_last(_build_chain(pid, model, est), avoid),
+            producer or (None, None)))
+        t_end = time.monotonic() + 2.0 * _VERIFY_DEADLINE
+        tried = set()
+        for attempt in (0, 1):
+            cand = [e for e in pool if (e[0], e[1]) not in tried]
+            if producer:
+                pick = v.pick_verifier(producer, cand)
+            else:
+                pick = cand[0][:2] if cand else None
+            if not pick:
                 return None
-            data = resp.json() or {}
-        finally:
-            try:
-                resp.close()
-            except Exception:                                    # noqa: BLE001
-                pass
-        text = _message_text(((data.get("choices") or [{}])[0].get("message") or {}))
-        if not str(text or "").strip():
-            return None
-        _record_chat_usage(pick[0], pick[1], data, est)
-        verdict = v.parse_verdict(text)
-        if not isinstance(verdict, dict) or "ok" not in verdict or verdict.get("unparsed"):
-            return None
-        return {"ok": bool(verdict.get("ok")),
-                "problems": list(verdict.get("problems") or []),
-                "severity": str(verdict.get("severity") or "low")}
+            tried.add((pick[0], pick[1]))
+            messages = list(probe)
+            if attempt:
+                strict = getattr(v, "STRICT_VERIFIER_SYSTEM", None)
+                if isinstance(strict, str) and strict.strip():
+                    messages = [m for m in base if m.get("role") != "system"]
+                    messages.insert(0, {"role": "system", "content": strict})
+                else:
+                    messages = list(probe) + [{"role": "user", "content":
+                                               "Answer with ONE line: VERDICT: ACCEPT or "
+                                               "VERDICT: REVISE - <problem>."}]
+            payload = {"model": pick[1], "stream": False, "messages": messages,
+                       "max_tokens": int(getattr(v, "VERIFY_MAX_TOKENS", 400) or 400),
+                       "_no_craft": True}
+            resp, _exc = _dispatch_chat_with_deadline(
+                pick[0], payload, max(1.0, min(_VERIFY_DEADLINE, t_end - time.monotonic())))
+            text, readable = "", False
+            if resp is not None:
+                try:
+                    if resp.status_code != 200:
+                        _swarm_note_member_status(pick[0], pick[1], resp.status_code)
+                    else:
+                        data = resp.json() or {}
+                        text = _message_text(
+                            ((data.get("choices") or [{}])[0].get("message") or {}))
+                        if str(text or "").strip():
+                            _record_chat_usage(pick[0], pick[1], data, est)
+                except (ValueError, AttributeError):
+                    pass
+                finally:
+                    try:
+                        resp.close()
+                    except Exception:                            # noqa: BLE001
+                        pass
+            verdict = v.parse_verdict(text) if str(text or "").strip() else None
+            readable = (isinstance(verdict, dict) and "ok" in verdict
+                        and not verdict.get("unparsed"))
+            if not _client_gone():
+                _verifier_stats_note(pick[0], pick[1], readable)
+            if readable:
+                return {"ok": bool(verdict.get("ok")),
+                        "problems": list(verdict.get("problems") or []),
+                        "severity": str(verdict.get("severity") or "low")}
+            # Retry only a reply that arrived but could not be read.
+            if resp is None or not str(text or "").strip() or t_end - time.monotonic() < 8.0:
+                return None
+        return None
     except Exception:                                            # noqa: BLE001
         return None
 

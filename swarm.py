@@ -1608,6 +1608,60 @@ def review_severity(review):
     return ""
 
 
+class RunLedger:
+    """The model identities one pipeline run's workers have been given
+    ("pid/model" strings), so concurrent workers can spread over DIFFERENT
+    models. Pure bookkeeping, thread-safe: the hub's dispatch decides what to
+    do with it (it prefers an unused identity inside the top score band) and
+    reserves the pair it picks, so two workers picking at the same moment
+    cannot both take the same one."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._used = []
+
+    @property
+    def lock(self):
+        return self._lock
+
+    def used(self):
+        with self._lock:
+            return list(self._used)
+
+    def reserve(self, pid, model):
+        with self._lock:
+            self._used.append("%s/%s" % (pid, model))
+
+    def release(self, pid, model):
+        """Take one reservation back (the hop failed: another worker may use it)."""
+        key = "%s/%s" % (pid, model)
+        with self._lock:
+            if key in self._used:
+                self._used.remove(key)
+
+
+_VERDICT_BOUND_RE = re.compile(
+    r"\b(json|html|sql|yaml|toml|xml|csv|schema|regex|api|endpoint|migration|"
+    r"config(?:uration)?|script|function|class|algorithm|code|query|"
+    r"dockerfile|css|javascript|typescript|python)\b", re.I)
+
+
+def verdict_bound(ph):
+    """Is this phase worth ONE free cross-family verdict? A code file, or a
+    phase bound to a strict format / code (JSON, HTML, SQL, a script...) --
+    where a wrong output breaks what is built on it. Prose phases are not."""
+    try:
+        if _code_file(ph):
+            return True
+        if str(ph.get("output_format") or "").strip():
+            return True
+        head = " ".join([str(ph.get("title") or ""), str(ph.get("task") or "")[:400],
+                         str(ph.get("done_when") or "")[:200]])
+        return bool(_VERDICT_BOUND_RE.search(head))
+    except Exception:                                           # noqa: BLE001
+        return False
+
+
 class Search:
     """AB-MCTS lite: for ONE run, Thompson sampling between WIDER (a fresh
     attempt by a different model) and DEEPER (refine the best attempt). Each
@@ -1675,7 +1729,8 @@ def make_search(search, log=None):
 
 def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         manager=None, context=None, seconds_per_phase=0, max_seconds_ceiling=None,
-        grace_seconds=0, fast_dispatch=None, family=None, search=None):
+        grace_seconds=0, fast_dispatch=None, family=None, search=None,
+        ledger=None, free_verdict=None):
     """Run the pipeline. `dispatch(msgs, max_tokens, exclude_pids=()) ->
     (text, pid_model)`; it must never raise — an empty text means that call
     failed, and every stage below treats that as "carry on with what we have".
@@ -1756,6 +1811,16 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     nothing extra. Every choice and outcome is in result["search"]
     ({posteriors, log}).
 
+    DISTINCT WORKERS (`ledger`: None/False = off; True or a RunLedger = on):
+    the worker calls (first attempts, retries, wider attempts) pass
+    `ledger=` to `dispatch`, which then prefers a model identity no other
+    worker of this run has (see app._swarm_dispatch); result["workers_models"]
+    lists the models that wrote phases. PER-PHASE VERDICT (`free_verdict`
+    callable, no manager only): a phase whose free checks pass and that is
+    code / format bound (verdict_bound) gets ONE free cross-family verdict;
+    not ok with HIGH severity earns the existing single retry
+    (result["phase_verdicts"]).
+
     Returns {"text", "plan", "phases", "review", "models", "planned"[,
     "unfinished", "cap_seconds", "review_family", "search"]} — `text` is
     always a non-empty answer unless every single call failed."""
@@ -1776,6 +1841,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     # The family hint reaches dispatch only when the caller opted in.
     avoid_ok = callable(family) or _names_kw(dispatch, "avoid_families")
     policy = make_search(search)
+    run_ledger = (ledger if isinstance(ledger, RunLedger) else RunLedger()) if ledger else None
+    verdict_log = []
     always = {}                      # result keys added with or without a manager
 
     def _fam(who):
@@ -1935,6 +2002,13 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         result.update(always)
         if policy is not None:
             result["search"] = policy.snapshot()
+        wm = []
+        for role, w in models_used:
+            if w and str(role).startswith("phase") and w not in wm:
+                wm.append(w)
+        result["workers_models"] = wm
+        if verdict_log:
+            result["phase_verdicts"] = list(verdict_log)
         return result
 
     def _spent():
@@ -2086,10 +2160,16 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                 "gives that concerns your phase; do ONLY your phase)\n"
                 + _clip(brief, WORKER_BRIEF_CHARS))
 
+    def _wd(msgs, tokens, **kw):
+        """A WORKER call: carries the run's ledger when distinct models are on."""
+        if run_ledger is not None:
+            kw["ledger"] = run_ledger
+        return dispatch(msgs, tokens, **kw)
+
     def _run_phase(idx):
         """One worker's first attempt. With a manager, the checks run per
         WAVE afterwards (_verify_set), not here, so one verdict covers them all."""
-        return dispatch(_phase_msgs(idx), PHASE_MAX_TOKENS)
+        return _wd(_phase_msgs(idx), PHASE_MAX_TOKENS)
 
     def _dep_code(idx):
         """{module stem: its Python source} for the code files phase `idx`
@@ -2492,11 +2572,11 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                       or any(str(p).startswith(_BROKEN_PREFIXES) for p in best["probs"]))
             choice = "wider" if forced else policy.choose()
             if choice == "wider":
-                got = dispatch(_phase_msgs(idx), PHASE_MAX_TOKENS,
-                               exclude_pids=tuple(sorted(tried)))
+                got = _wd(_phase_msgs(idx), PHASE_MAX_TOKENS,
+                          exclude_pids=tuple(sorted(tried)))
             else:
-                got = dispatch(_retry_msgs(idx, best["probs"], best["text"]),
-                               PHASE_MAX_TOKENS, exclude_pids=())
+                got = _wd(_retry_msgs(idx, best["probs"], best["text"]),
+                          PHASE_MAX_TOKENS, exclude_pids=())
             t, w = (tuple(got if isinstance(got, (tuple, list)) else ()) + ("", None))[:2]
             t = t or ""
             p = _cheap_problems(idx, t)
@@ -2551,9 +2631,9 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         def _retry(probs):
             """The rejected ones retry IN PARALLEL, each on a provider that has
             not failed it, told exactly what was wrong (and shown its attempt)."""
-            got = _gather(lambda i: dispatch(_retry_msgs(i, probs[i], st[i]["text"]),
-                                             PHASE_MAX_TOKENS,
-                                             exclude_pids=tuple(st[i]["failed"])),
+            got = _gather(lambda i: _wd(_retry_msgs(i, probs[i], st[i]["text"]),
+                                        PHASE_MAX_TOKENS,
+                                        exclude_pids=tuple(st[i]["failed"])),
                           sorted(probs), _left())
             for i in sorted(probs):
                 text, who = (got.get(i) or ("", None))[:2]
@@ -2702,6 +2782,60 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         models_used.extend(batch_trail)
         return changed
 
+    def _phase_verdicts(idxs, whos):
+        """ONE free cross-family verdict per code/format-bound phase whose free
+        checks pass (no manager: with one, ITS verdict is the check). Not ok
+        with HIGH severity -> the existing single retry on another provider,
+        kept only if the free checks pass. A verdict that is missing, late or
+        unreadable changes nothing. Never raises."""
+        try:
+            todo = [i for i in idxs if outputs.get(i) and phases[i - 1]
+                    and verdict_bound(phases[i - 1]) and not _cheap_problems(i, outputs[i])]
+            if not todo or _left() is not None and _left() < SEARCH_MIN_SECONDS / 2:
+                return
+
+            def _one(i):
+                who = whos.get(i)
+                ph = phases[i - 1]
+                brief = {"producer": who, "avoid_families": (_fam(who),) if who else (),
+                         "text": ("PHASE: %s\nTASK: %s\nDONE WHEN: %s\n\nOUTPUT (excerpt)\n%s\n\n"
+                                  "Is this output correct and complete for its task? Reply "
+                                  "VERDICT: ACCEPT or VERDICT: REVISE." % (
+                                      ph["title"], _clip(ph["task"], 1500),
+                                      ph.get("done_when") or "(not stated)",
+                                      _clip(outputs[i], VERDICT_OUTPUT_CHARS)))}
+                return free_verdict(brief)
+            got = _gather(_one, todo, min(60.0, _left()) if _left() is not None else 60.0)
+            retry = {}
+            for i in todo:
+                v = got.get(i)
+                if not isinstance(v, dict) or "ok" not in v:
+                    verdict_log.append({"phase": i, "verdict": "none"})
+                    continue
+                sev = str(v.get("severity") or "").strip().lower()
+                verdict_log.append({"phase": i, "verdict": "ok" if v.get("ok") else "revise",
+                                    "severity": sev})
+                if not v.get("ok") and sev in _HIGH_SEVERITY:
+                    probs = [str(x) for x in (v.get("problems") or ()) if str(x).strip()]
+                    retry[i] = probs[:5] or ["an independent reviewer found this output wrong"]
+            if not retry or _spent():
+                return
+            redo = _gather(lambda i: _wd(_retry_msgs(i, retry[i], outputs[i]), PHASE_MAX_TOKENS,
+                                         exclude_pids=tuple(
+                                             {(whos.get(i) or "").split("/", 1)[0]} - {""})),
+                           sorted(retry), _left())
+            for i in sorted(retry):
+                t, w = (redo.get(i) or ("", None))[:2]
+                if t and t.strip() and not _cheap_problems(i, t):
+                    if w:
+                        models_used.append(("phase-retry:%s" % phases[i - 1]["title"], w))
+                    outputs[i] = t
+                    for rec in verdict_log:
+                        if rec.get("phase") == i:
+                            rec["retried"] = True
+        except Exception:                                       # noqa: BLE001
+            pass
+
     running = {}        # phase -> its first attempt, still running when the wave stopped waiting
     check_info = {}     # the last wave's verdict: {"missing": [...], "parts_missing": [...]}
     clean = {}          # phase -> what ships passed its checks (no fix, no fallback)
@@ -2758,6 +2892,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                             exec_pids.add(w.split("/", 1)[0])
                         if r[0]:
                             outputs[i] = r[0]
+            if callable(free_verdict) and not _spent():
+                _phase_verdicts(sorted(results), {i: results[i][1] for i in results})
     else:
         # WITH A MANAGER the waves are PIPELINED: wave k's verification (a
         # paid call, 30-150 s) runs WHILE wave k+1's free workers build on

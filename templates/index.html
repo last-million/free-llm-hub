@@ -10790,6 +10790,12 @@
         m.textContent = t.model; m.title = 'Model this helper runs on';
         top.appendChild(m);
       }
+      if (t.pair){
+        var pc = document.createElement('span'); pc.className = 'hp-model';
+        pc.textContent = 'pair: ' + (t.pair.model || t.pair.state || '');
+        pc.title = 'A second helper (another model) works with this one on the same phase';
+        top.appendChild(pc);
+      }
       var el = hpElapsed(t, now);
       if (el){
         var tm = document.createElement('span'); tm.className = 'hp-time'; tm.textContent = el;
@@ -10842,7 +10848,9 @@
         (helpers && p.current ? 'step ' + p.current + ' of ' + items.length + ' \u00b7 ' : '') +
         (p.done || 0) + '/' + items.length + ' done';
       $('#agent-plan-src').textContent = (p.source ? 'from ' + p.source : '') +
-        (p.resumed ? ' \u00b7 resumed after a restart' : '');
+        (p.resumed ? ' \u00b7 resumed after a restart' : '') +
+        (helpers && p.parallel && p.parallel.line ? ' \u00b7 ' + p.parallel.line +
+          (p.parallel.waiting ? ' \u00b7 waiting for RAM to free up' : '') : '');
       box.setAttribute('data-collapsed', _planCollapsed ? '1' : '0');
       $('#agent-plan-toggle').setAttribute('aria-expanded', _planCollapsed ? 'false' : 'true');
       list.innerHTML = '';

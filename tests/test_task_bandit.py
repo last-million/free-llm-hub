@@ -1,4 +1,6 @@
 """bandit.py: learned model choice per kind of task (Thompson nudges)."""
+USES_REAL_BANDIT = True   # opts in to the real (random) nudge, see conftest
+
 import ast
 import json
 import os

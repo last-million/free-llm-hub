@@ -441,7 +441,8 @@ def looks_like_full_project(text):
 
 
 def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
-        manager=None, context=None, family=None, search=None, **budget):
+        manager=None, context=None, family=None, search=None, ledger=None,
+        free_verdict=None, **budget):
     """Run the swarm pipeline under a crew persona. Same dispatch contract and
     result-dict shape as swarm.run(); the result gains a "crew" key naming the
     persona actually used ("" = generic pipeline).
@@ -465,7 +466,9 @@ def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
 
     `family` (the reviewer avoids the producers' model families) and
     `search` (wider-or-deeper extra attempts where a free check scores a
-    phase) are swarm.run's; each forwarded only when given.
+    phase), `ledger` (distinct models for the workers) and `free_verdict`
+    (one free verdict per code/format-bound phase) are swarm.run's; each
+    forwarded only when given.
 
     `**budget` carries swarm.run's plan-sized wall clock and grace
     (seconds_per_phase, max_seconds_ceiling, grace_seconds, fast_dispatch);
@@ -491,6 +494,10 @@ def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
         extra["family"] = family
     if search:
         extra["search"] = search
+    if ledger:
+        extra["ledger"] = ledger
+    if free_verdict is not None:
+        extra["free_verdict"] = free_verdict
     for key in ("seconds_per_phase", "max_seconds_ceiling", "grace_seconds",
                 "fast_dispatch"):
         if budget.get(key):

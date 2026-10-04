@@ -19,3 +19,4 @@ testpaths = ["tests"]
 # The repo root has to be importable: every test does `import app`, and there is
 # no installed package to import instead.
 pythonpath = ["."]
+markers = ["real_bandit: keep the real random bandit nudge (conftest pins it to 0 otherwise)"]

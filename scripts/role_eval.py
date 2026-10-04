@@ -122,6 +122,14 @@ def roles_stats(rows):
                                            for r in turns if r.get("specialists"))
                                        / max(1, sum(1 for r in turns if r.get("specialists"))))
                                  if any(r.get("specialists") for r in turns) else None),
+        "verifier_unparsed": sum(int(r.get("verifier_unparsed") or 0) for r in turns + text),
+        "verifier_retry": sum(int(r.get("verifier_retry") or 0) for r in turns + text),
+        "verifier_usable_rate": (round(sum(1 for r in turns + text if r.get("verifier")
+                                           and str(r.get("verdict") or "").split(" ")[0]
+                                           in ("ok", "revise"))
+                                       / max(1, sum(1 for r in turns + text if r.get("verifier"))), 3)
+                                 if any(r.get("verifier") for r in turns + text) else None),
+        "team_medium_turns": sum(1 for r in turns if r.get("team_tier") == "medium"),
         "text_turns_reviewed": len(text),
         "next_turn_credits": sum(int(r.get("credited") or 0) for r in credits),
     }

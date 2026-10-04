@@ -507,12 +507,27 @@ VERIFIER_SYSTEM = (
     "that was not asked; ignoring the instruction; or claiming success (done, fixed, tests "
     "pass) that the tool results do not show. Do not judge style or wording and do not "
     "rewrite the proposal. When what you are shown is not enough to tell, accept it.\n\n"
-    "Reply with ONE JSON object and nothing else:\n"
-    '{"ok": true, "problems": [], "severity": "low"}\n'
-    '"ok": true to accept, false when the proposal must be revised. "problems": at most 5 '
-    "short, concrete sentences (empty when ok is true). \"severity\": \"high\" when following "
-    "the proposal would break code or data, ignore the instruction or report a success that "
-    'did not happen; "low" otherwise.'
+    "Reply in EXACTLY this format, starting with the VERDICT line (no preamble, no "
+    "thinking out loud before it):\n"
+    "VERDICT: ACCEPT\n"
+    "or\n"
+    "VERDICT: REVISE\n"
+    "PROBLEMS:\n"
+    "- one short, concrete sentence (at most 5 lines)\n"
+    "SEVERITY: high\n\n"
+    "REVISE when the proposal must be changed. SEVERITY is high when following the "
+    "proposal would break code or data, ignore the instruction or report a success that "
+    "did not happen; low otherwise. An ACCEPT reply is the single line VERDICT: ACCEPT."
+)
+# The retry contract for a verifier whose first reply could not be read: one
+# line, nothing else a weak model can get wrong.
+STRICT_VERIFIER_SYSTEM = (
+    "You are an independent reviewer of a proposed next AI message. Answer with ONE "
+    "line and nothing else:\n"
+    "VERDICT: ACCEPT\n"
+    "or, only if it is wrong, broken or unsafe for the user's instruction:\n"
+    "VERDICT: REVISE - <the main problem in one sentence>\n"
+    "When what you see is not enough to tell, answer VERDICT: ACCEPT."
 )
 _NO_INSTRUCTION = "(no user instruction found)"
 
@@ -630,12 +645,14 @@ def _render_proposal(proposed):
     return "\n\n".join(parts) or "(empty message)"
 
 
-def digest(messages, proposed):
+def digest(messages, proposed, strict=False):
     """OpenAI chat messages for the verifier: the system contract plus ONE
     user message holding the last real user instruction (CLI wrapper blocks
     removed), the last 2 tool results and the proposed next assistant message
     (text and/or tool calls), each cut head+tail so the whole digest stays
-    within DIGEST_MAX_CHARS. Dispatch with max_tokens=VERIFY_MAX_TOKENS."""
+    within DIGEST_MAX_CHARS. Dispatch with max_tokens=VERIFY_MAX_TOKENS.
+    `strict`: the one-line retry contract (STRICT_VERIFIER_SYSTEM)."""
+    system = STRICT_VERIFIER_SYSTEM if strict else VERIFIER_SYSTEM
     instruction = _last_instruction(messages) or _NO_INSTRUCTION
     results = _recent_tool_results(messages, 2)
     proposal = _render_proposal(proposed)
@@ -664,10 +681,10 @@ def digest(messages, proposed):
     weights.append(3.0)
     shares.append(0.6)
 
-    overhead = len(VERIFIER_SYSTEM) + sum(len(h) for h in headers)
+    overhead = len(system) + sum(len(h) for h in headers)
     alloc = _allocate([len(b) for b in bodies], weights, DIGEST_MAX_CHARS - overhead)
     user = "".join(h + _clip_middle(b, n, s) for h, b, n, s in zip(headers, bodies, alloc, shares))
-    return [{"role": "system", "content": VERIFIER_SYSTEM},
+    return [{"role": "system", "content": system},
             {"role": "user", "content": user}]
 
 
@@ -853,6 +870,82 @@ def _keyword_verdict(text):
     return {"ok": ok, "problems": problems, "severity": "low"}
 
 
+_LINE_VERDICT_RE = re.compile(
+    r"(?im)(?:^|(?<=[.!?]\s))[ \t>#*_`\-]*(?:final\s+|my\s+)?verdict\s*\**\s*[:=\-]\s*[*_`\"']*\s*"
+    r"(accept(?:ed)?|approved?|pass(?:ed)?|ok(?:ay)?|lgtm|revise[d]?|reject(?:ed)?|fail(?:ed)?)\b"
+    r"[*_`\"']*[ \t]*[:.\-\u2013\u2014]*[ \t]*(.*)$")
+_PROBLEMS_HEAD_RE = re.compile(
+    r"(?im)^[ \t>#*_`]*(?:problems?|issues?|reasons?)\s*\**\s*:\s*\**\s*(.*)$")
+_SEVERITY_LINE_RE = re.compile(
+    r"(?im)^[ \t>#*_`\-]*severity\s*\**\s*[:=]\s*[*_`\"']*\s*([A-Za-z]+)")
+_BULLET_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s*")
+_PROSE_ACCEPT_RE = re.compile(
+    r"\b(?:looks?|seems?|appears?|is|are|was)\s+(?:to\s+be\s+)?(?:fully\s+|entirely\s+|completely\s+|all\s+)?"
+    r"(?:correct|good|fine|right|accurate|valid|acceptable|safe|sound|appropriate)\b"
+    r"|\bno\s+(?:issues?|problems?|errors?|concerns?|bugs?)\b"
+    r"|\blgtm\b|\bi\s+(?:would\s+)?(?:accept|approve)\b|\bshould\s+be\s+accepted\b", re.I)
+_PROSE_REVISE_RE = re.compile(
+    r"\b(?:is|are|looks?|seems?)\s+(?:not\s+correct|incorrect|wrong|broken|buggy|invalid|unsafe|incomplete)\b"
+    r"|\b(?:does|do|did)\s+not\s+(?:work|satisfy|meet|match|follow|address|fulfil+)\b"
+    r"|\b(?:isn't|aren't|wasn't)\s+(?:correct|right|valid|safe|complete)\b"
+    r"|\bshould\s+be\s+(?:revised|rejected|changed|fixed|rewritten)\b"
+    r"|\bneeds?\s+(?:to\s+be\s+)?(?:revis|fix|chang|correct|rewrit)\w*", re.I)
+
+
+def _line_verdict(text):
+    """'VERDICT: ACCEPT' / 'VERDICT: REVISE' on a line anywhere in the reply
+    (bold, quoted, after a short preamble), with optional 'PROBLEMS:' bullet
+    lines and a 'SEVERITY:' line. Also reads 'VERDICT: REVISE - <problem>'."""
+    m = _LINE_VERDICT_RE.search(text)
+    if not m:
+        return None
+    word = m.group(1).lower()
+    ok = word.startswith(("accept", "approve", "pass", "ok", "lgtm"))
+    problems = []
+    rest = (m.group(2) or "").strip()
+    if not ok and rest and not _PROBLEMS_HEAD_RE.match(rest):
+        problems.append(" ".join(rest.split())[:_MAX_PROBLEM_CHARS])
+    after = text[m.end():]
+    head = _PROBLEMS_HEAD_RE.search(after)
+    if head is not None and not ok:
+        inline = (head.group(1) or "").strip()
+        if inline:
+            problems.append(" ".join(inline.split())[:_MAX_PROBLEM_CHARS])
+        for line in after[head.end():].splitlines():
+            if _SEVERITY_LINE_RE.match(line):
+                break
+            if not line.strip():
+                continue
+            problems.append(_BULLET_RE.sub("", line).strip()[:_MAX_PROBLEM_CHARS])
+            if len(problems) >= _MAX_PROBLEMS:
+                break
+    sev = _SEVERITY_LINE_RE.search(text)
+    severity = "high" if (not ok and sev and sev.group(1).lower() in _HIGH_WORDS) else "low"
+    return {"ok": bool(ok), "problems": [p for p in problems if p][:_MAX_PROBLEMS],
+            "severity": severity}
+
+
+def _prose_verdict(text):
+    """A verdict stated in plain sentences ('The answer looks correct.', 'This
+    should be revised because ...'). Only when ONE side speaks: a reply that
+    both approves and objects is left unparsed. Severity stays low -- a
+    sentence is never evidence enough to trigger a corrector."""
+    t = " ".join(text.split())
+    if not t or len(t) > 3000:
+        return None
+    acc = _PROSE_ACCEPT_RE.search(t)
+    rev = _PROSE_REVISE_RE.search(t)
+    if bool(acc) == bool(rev):
+        return None
+    if acc:
+        return {"ok": True, "problems": [], "severity": "low", "inferred": True}
+    start = max(0, t.rfind(". ", 0, rev.start()) + 1)
+    end = t.find(". ", rev.end())
+    sentence = t[start:end + 1 if end >= 0 else len(t)].strip()
+    return {"ok": False, "problems": [sentence[:_MAX_PROBLEM_CHARS]], "severity": "low",
+            "inferred": True}
+
+
 def parse_verdict(text):
     """{"ok": bool, "problems": [str], "severity": "low"|"high"} from the
     verifier's reply. Tolerant: reasoning blocks dropped, the JSON may sit in a
@@ -870,7 +963,7 @@ def parse_verdict(text):
         hit = next((o for o in objs if _has_contract_keys(o)), None)
         if hit is not None:
             return _normalize_verdict(hit)
-    return _keyword_verdict(t) or _unparsed()
+    return _line_verdict(t) or _keyword_verdict(t) or _prose_verdict(t) or _unparsed()
 
 
 # --------------------------------------------------------------------------- #

@@ -101,6 +101,20 @@ def _steady_machine(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_governor(monkeypatch):
+    """The live RAM/CPU governor (lowres.GOV) samples the REAL processes of
+    this PC from a daemon thread and carries state between runs; a test that
+    asserts a concurrency must not depend on it. Its own tests build a
+    Governor with fakes (tests/test_multi_parallel_models.py)."""
+    import lowres
+    monkeypatch.setattr(lowres, "acquire_monitor", lambda: None)
+    monkeypatch.setattr(lowres, "release_monitor", lambda: None)
+    lowres.GOV.reset()
+    yield
+    lowres.GOV.reset()
+
+
+@pytest.fixture(autouse=True)
 def _stop_never_touches_real_clis(monkeypatch):
     """POST /api/runtime/stop disconnects every CLI wired to the hub
     (app._disconnect_all_clis) and a boot reconnects them -- both read and
@@ -240,18 +254,35 @@ def _weak_models_not_force_verified(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _team_and_verifier_ledgers_start_empty():
+    """The specialist / verifier success ledgers are process-wide memory seeded
+    from the owner's turn-roles.jsonl; every test starts with empty ledgers and
+    never reads the real log."""
+    try:
+        import app
+    except Exception:                                            # noqa: BLE001
+        yield
+        return
+    app._team_stats.clear()
+    app._verifier_stats.clear()
+    app._team_stats_seeded[0] = True
+    yield
+    app._team_stats.clear()
+    app._verifier_stats.clear()
+
+
+@pytest.fixture(autouse=True)
 def _bandit_tie_break_is_deterministic(request, monkeypatch):
     """The learned tie-breaker (bandit.py) draws random numbers on purpose, so
     any routing test that expects a fixed pick among EQUAL scores would flake
     (MEASURED 2026-10-04: test_model_mode.py::test_the_primary_pick_is_
-    unrestricted_under_all failed 4 of 15 runs). Every file that is not about
-    the bandit sees a zero nudge; the files that mention it keep the real one."""
+    unrestricted_under_all failed 4 of 15 runs). Every file sees a zero nudge unless it
+    sets the module attribute USES_REAL_BANDIT = True (or the test carries
+    @pytest.mark.real_bandit) (an explicit opt-in, not
+    a substring guess: a file that merely MENTIONS the bandit was flaky)."""
     mod = getattr(request.node, "module", None)
-    try:
-        src = open(mod.__file__, encoding="utf-8", errors="ignore").read()
-    except Exception:                                            # noqa: BLE001
-        src = ""
-    if "bandit" in src:
+    if (getattr(mod, "USES_REAL_BANDIT", False)
+            or request.node.get_closest_marker("real_bandit")):
         yield
         return
     import app

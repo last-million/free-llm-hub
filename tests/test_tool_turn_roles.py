@@ -241,8 +241,10 @@ def test_a_risky_write_fires_the_real_verifier(roles, monkeypatch):
         "p2": (0.0, _text("I could not tell."), 200),   # verifier: no JSON verdict
         "p3": (0.0, _text("I could not tell."), 200)}, calls))
     data, hdrs = A._swarm_tool_result(_body())
-    # one actor call + exactly one verifier call, and the verifier is NOT p1
-    assert len(calls) == 2 and calls[0][0] == "p1" and calls[1][0] != "p1"
+    # the actor call, one verifier call, and -- the reply being unreadable --
+    # ONE strict-contract retry on the next verifier; neither is p1
+    assert len(calls) == 3 and calls[0][0] == "p1"
+    assert calls[1][0] != "p1" and calls[2][0] not in ("p1", calls[1][0])
     assert data["model"] == "p1/m1"                 # fail-open keeps the original
     assert data["choices"][0]["message"]["tool_calls"][0]["id"] == "orig"
     assert "verifier=no" in hdrs["X-Free-LLM-Hub-Roles"]   # "no verdict"
@@ -673,6 +675,7 @@ def test_a_134_model_with_max_nudge_never_outranks_an_available_138(fake_bandit,
     assert ordered[0] == ("pa", "a-138")
 
 
+@pytest.mark.real_bandit
 def test_138_and_137_7_can_swap_by_nudge(fake_bandit):
     score = {"a": 138.0, "b": 137.7}.get
     pairs = [("pa", "a"), ("pb", "b")]
@@ -689,6 +692,7 @@ def test_138_and_137_7_can_swap_by_nudge(fake_bandit):
     assert out[2] == ("pc", "c")
 
 
+@pytest.mark.real_bandit
 def test_swarm_rank_breaks_ties_only_inside_the_band(fake_bandit, monkeypatch):
     sc = {"a": 138.0, "b": 137.7, "c": 134.0}
     monkeypatch.setattr(A, "_benchmark_score", lambda p, m: sc[m])

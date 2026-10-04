@@ -38,12 +38,14 @@ def test_a_web_goal_plan_prompt_asks_for_the_visual_decisions():
     for managed in (False, True):
         s = SW.plan_system(WEB_GOAL, managed)
         assert '"visual"' in s and "palette" in s and "reduced-motion" in s
-        assert s.startswith(SW._PLAN_SYSTEM_MANAGED if managed else SW._PLAN_SYSTEM)
+        base = SW._PLAN_SYSTEM_MANAGED if managed else SW._PLAN_SYSTEM
+        assert s.startswith(base.replace("{helpers}", str(SW._concurrency())))
 
 
 def test_a_non_web_goal_plan_prompt_is_unchanged():
-    assert SW.plan_system(CODE_GOAL) == SW._PLAN_SYSTEM
-    assert SW.plan_system(CODE_GOAL, True) == SW._PLAN_SYSTEM_MANAGED
+    n = str(SW._concurrency())
+    assert SW.plan_system(CODE_GOAL) == SW._PLAN_SYSTEM.replace("{helpers}", n)
+    assert SW.plan_system(CODE_GOAL, True) == SW._PLAN_SYSTEM_MANAGED.replace("{helpers}", n)
 
 
 def test_the_visual_ask_is_small():
@@ -65,7 +67,8 @@ def test_plan_sends_the_web_ask_to_the_planner_only_for_web(monkeypatch):
 
 def test_the_web_design_skill_switch_removes_the_ask(monkeypatch):
     monkeypatch.setattr(craft, "skill_enabled", lambda name: False)
-    assert SW.plan_system(WEB_GOAL) == SW._PLAN_SYSTEM
+    assert SW.plan_system(WEB_GOAL, helpers=6) == SW._PLAN_SYSTEM.replace("{helpers}", "6") + (
+        SW._MICRO_ASK.replace("{helpers}", "6") if SW.sizeable_goal(WEB_GOAL) else "")
 
 
 # --------------------------------------------------------------------------- #

@@ -168,7 +168,7 @@ def test_a_manager_that_declines_the_plan_hands_it_to_the_free_planner(tmp_path)
     rid = SW.start("make a site", str(tmp_path), "opencode", w.spawn, w.run_turn,
                    planner=_free_planner(free), manager=mgr)
     st = _wait(rid)
-    assert free == [SW._PLAN_SYSTEM.replace("{modes}", "coding")], \
+    assert free == [SW._PLAN_SYSTEM.replace("{helpers}", str(SW._concurrency())).replace("{modes}", "coding")], \
         "the free planner gets the prompt it always had"
     assert st["state"] == SW.DONE
     # the declined plan cost nothing and is not a call

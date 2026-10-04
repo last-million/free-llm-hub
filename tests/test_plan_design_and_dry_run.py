@@ -99,6 +99,13 @@ def _planner(*answers, asks=None):
 # The design
 # --------------------------------------------------------------------------- #
 
+def _no_par(line):
+    """The line without its closing "running up to N helpers at once" (N is the
+    machine's, tests/test_multi_parallel_models.py covers it)."""
+    import re
+    return re.sub(r", running up to \d+ helpers at once$", "", line)
+
+
 def test_the_planner_is_asked_for_a_design_and_owned_files():
     for prompt in (SW._PLAN_SYSTEM, SW._PLAN_SYSTEM_MANAGED):
         assert '"design"' in prompt and '"interfaces"' in prompt and '"files"' in prompt
@@ -323,7 +330,7 @@ def test_a_re_ask_that_does_not_help_fails_open_with_the_findings_surfaced(tmp_p
     assert st["state"] == SW.DONE, "fail open: the run goes ahead"
     check = st["plan_check"]
     assert check["warnings"] == ['no phase covers "a README with usage examples"']
-    assert check["line"] == ('Plan check: 3 phases, 1 start now, planner re-asked once, '
+    assert _no_par(check["line"]) == ('Plan check: 3 phases, 1 start now, planner re-asked once, '
                              '0 fixed, 1 warning (no phase covers "a README with usage examples")')
     assert all(f["action"] != "replan" for f in check["findings"])
 
@@ -373,7 +380,7 @@ def test_the_report_line_counts_the_plan_as_it_runs(tmp_path):
     rid = SW.start("g", str(tmp_path), "opencode", w.spawn, w.run_turn, planner=_planner(plan))
     st = _wait(rid)
     assert [a["needs"] for a in st["agents"]][:3] == [[], [1], []]
-    assert st["plan_check"]["line"] == (
+    assert _no_par(st["plan_check"]["line"]) == (
         "Plan check: 4 phases, 2 start now, 1 fixed (phase 2 waits for 1 (both edit app.py)), "
         "1 warning (phase 3 (Docs) has no concrete done-when)")
 

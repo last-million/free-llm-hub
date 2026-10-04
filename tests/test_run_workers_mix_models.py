@@ -76,4 +76,4 @@ def test_the_pick_rotates_before_it_spreads_and_remembers_the_model():
     src = open("app.py", encoding="utf-8").read()
     at = src.index("_pool = _rotate_within_run(_pool, _skey)")
     assert at < src.index("_pool = _spread_pool(_pool, _skey)", at)
-    assert "_note_worker_model(_skey, model)" in src[at:at + 600]
+    assert "_note_worker_model(_skey, model, pid)" in src[at:at + 600]

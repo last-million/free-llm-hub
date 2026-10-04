@@ -330,7 +330,7 @@ def test_digest_shape_and_the_real_instruction():
                                               "new_string": "i < n"})]}
     msgs = verify.digest(_conversation(), proposed)
     assert [m["role"] for m in msgs] == ["system", "user"]
-    assert '"ok"' in msgs[0]["content"] and '"severity"' in msgs[0]["content"]
+    assert "VERDICT: ACCEPT" in msgs[0]["content"] and "SEVERITY" in msgs[0]["content"]
     user = msgs[1]["content"]
     assert "Fix the off-by-one in counter.py" in user
     assert "Todo list is empty" not in user           # reminder block is not the instruction
