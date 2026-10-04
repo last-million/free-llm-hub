@@ -10,9 +10,9 @@ is only: current state, how to operate, owner rules, open items.
 
 | | |
 |---|---|
-| Branch | `main` @ `117579d`, in sync with `origin/main` (another session's landing-page edits are uncommitted: `app.py` `/`+`/hub` routes, `make_landing.py`, `templates/landing.html`, `static/*.webp|jpg` — LEAVE THEM, and never `git add -A`: use explicit paths) |
-| Running hub | `117579d` on `127.0.0.1:8787` (only this PC) |
-| Tests | 6765 passed, 1 skipped (2026-10-04) |
+| Branch | `main` @ `fd3dc1e`, in sync with `origin/main` (another session's landing-page edits are uncommitted: `app.py` `/`+`/hub` routes, `make_landing.py`, `templates/landing.html`, `static/*.webp|jpg` — LEAVE THEM, and never `git add -A`: use explicit paths) |
+| Running hub | `fd3dc1e` on `127.0.0.1:8787` (only this PC) |
+| Tests | 6929 passed, 1 skipped (2026-10-04) |
 | Keys | 42 provider keys in `config.load_config()` (check after every restart, never print values) |
 | Open PR | #4 by an outside contributor (`osumtr-web`), see "Open items" |
 
@@ -68,6 +68,28 @@ All in `AGENTS.md` with tests; headlines only. These sit ON TOP of the
   at design time + checked in finished web files (`slopcheck.py`, feeds the one
   revision). Flags: `tool_turn_race`, `pipeline_search`, `model_guides`,
   `turn_verifier`. Eval: `scripts/role_eval.py` + `state_dir()/turn-roles.jsonl`.
+- **Multi up to 6 different models at once (`f0a452d`)**: `_concurrency()` =
+  min(`multi_parallel_max` (default 6), by-machine, by-fleet, 429 back-off). A LIVE
+  RAM governor (2 s tick while a run walks) keeps `reserve` = max(3 GB, 20% of
+  RAM) free for the user's own programs, learns the real per-helper cost (p90 of
+  the last 10 RSS samples), lowers at once / raises after 20 s, and only STOPS
+  STARTING helpers (never kills one); below 1 GB free it lowers the helpers'
+  process priority. Helpers of a run get distinct model/provider/family; big phases
+  can get a pair helper (`multi_pair_phases`); `MAX_AGENTS` 10. Status:
+  `GET/POST /api/multi-parallel`, `/api/low-resource` (`reserve_gb`, `allowed_now`).
+  Verified live 2026-10-04: reserve 7.9 GB, 19 GB free, `now` 6. NOT yet verified
+  with a real run: the RSS sampling and the priority change (tests use fakes).
+- **Swarm/crews distinct models + reliability (`f0a452d`)**: workers of one run take
+  distinct identities (`RunLedger`, `swarm_distinct_models`); per-phase free verdict
+  (`swarm_phase_verdict`); specialists/verifiers ranked by measured success and
+  speed (limit 35 s); the verifier asks for a one-line `VERDICT:` with one retry;
+  medium build asks get scout+critic (`tool_turn_specialists_medium`). Tests pin
+  the random bandit nudge to 0 unless a file sets `USES_REAL_BANDIT = True`.
+- **Stalls are remembered (`fd3dc1e`)**: an actor replaced by the stall backup is
+  demoted for tool turns (it was picked first again within 2 min, 45 s lost each
+  time); unmeasured backup delay = fleet median x2.5 (12-30 s); 3 attempts fit in
+  180 s; 3 empty-200s rest a pair 10 min (orchestrator pin included). Open: if the
+  stalled pair IS the orchestrator pin, the pinned-head rule may still open on it.
 - **Team notes (`117579d`)**: on a HARD, fresh-instruction tool turn (not a loop
   continuation, not trivial, <= 60K tokens, not a CLI compaction) the hub runs 2-3
   DIFFERENT models in parallel on read-only jobs (scout, critic, designer for
@@ -143,8 +165,9 @@ All in `AGENTS.md` with tests; headlines only:
    (freebuff.com/terms-of-service) forbids multiple accounts, bot/script/tmux
    control, and proxying its models — so `fbuff.sh` and any hub integration are
    out. Use Freebuff by hand only.
-7. **Verify the orchestration live, then measure** (the specialists have ONE live
-   probe so far, see above): run real tool turns and
+7. **Verify the orchestration live, then measure** (specialists: 12 live calls, 42%
+   answered before the ranking fix; verifier usable-verdict rate was 21%; re-measure
+   with `scripts/role_eval.py` after a day of traffic): run real tool turns and
    `python scripts/role_eval.py` to compare roles vs the old race (calls/turn,
    input tokens, zero-answer rate) from `turn-roles.jsonl` vs hub.log. The
    token-saving and verifier fix/break claims are DESIGN estimates, not yet
