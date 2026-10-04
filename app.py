@@ -18679,6 +18679,12 @@ def _multi_follow_events(run_id, cli_id):
                            % (total, "" if total == 1 else "s", cli_id, run_id)}
             for line in _multi_plan_lines(st):
                 yield {"event": "tool", "text": line}
+            # THE PLAN'S DRY RUN (swarm_windows.dry_run): what it fixed before
+            # any helper started, and what it warns about. A fresh run only --
+            # a "continue" runs the plan that was already checked.
+            check = st.get("plan_check") or {}
+            if check.get("line") and not st.get("resumes"):
+                yield {"event": "tool", "text": check["line"]}
         for a in st.get("agents") or []:
             key = a.get("index")
             state = a.get("state")
@@ -21903,6 +21909,10 @@ def _multi_run_plan(session_id, project_dir=None):
                 "source": "multi-session run %s" % run.id,
                 "helper": helper,
                 "run_id": run.id, "run_state": run.state,
+                # The plan's design as ONE collapsed row ("Design: 3
+                # components, 4 interfaces"), and its dry-run line.
+                "design": swarm_windows.design_view(run),
+                "plan_check": (getattr(run, "plan_check", None) or {}).get("line"),
                 "current": running[0] if running else None,
                 # Picked back up by this process after a restart (it did not
                 # need a click: swarm_windows.resume_interrupted at boot).

@@ -94,4 +94,5 @@ def test_the_budget_was_not_raised_again():
                 ("build an online store and deploy it",
                  "create a landing page for my saas",
                  "build me a restaurant website"))
-    assert worst / 4 < 32768 * 0.125, "briefs cost ~%d tokens" % (worst // 4)
+    # 0.13 since the DESIGN + DRY-RUN steps (2026-10-04, see test_craft_briefs).
+    assert worst / 4 < 32768 * 0.13, "briefs cost ~%d tokens" % (worst // 4)

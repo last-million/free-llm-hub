@@ -160,7 +160,14 @@ def test_worst_case_brief_cost():
     # degrading the wording further. This is the ceiling moving for a feature,
     # not creep: the heaviest request now pays 11.02% of the smallest window we
     # route to, and a simple coding question still pays nothing.
-    assert worst / 4 < 32768 * 0.125, "briefs cost ~%d tokens" % (worst // 4)
+    #
+    # 0.125 -> 0.13 on 2026-10-04, deliberately and once, for the owner's
+    # "design, plan well in a perfect architecture, then go -- and prevent
+    # problems with a DRY RUN in planning": PLAN_PHASES gained a DESIGN and a
+    # DRY-RUN step. Funded first by folding NEEDS into the phases line and
+    # cutting two clauses, so the block costs +49 tokens (626 -> 823 chars)
+    # instead of +70; the heaviest request lands at ~12.63%.
+    assert worst / 4 < 32768 * 0.13, "briefs cost ~%d tokens" % (worst // 4)
 
 
 # --------------------------------------------------------------------------- #

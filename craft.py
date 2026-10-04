@@ -375,11 +375,18 @@ ACT_RUN = """ACT (applies to every brief above, comes before VERIFY/FIX/STOP)
 - Neither covers a genuinely open decision (which real option, anything destructive/irreversible, anything you are missing information for) -- state those and wait, same as always."""
 
 
+# DESIGN and DRY RUN added 2026-10-04 at the owner's request: "In all works the
+# hub must do steps: design, plan well in a perfect architecture, then go --
+# and prevent problems with a DRY RUN in planning." The Multi planner does the
+# same deterministically (plan_check.py); a single session can only be asked.
+# Budget: 626 -> 823 chars (+49 tokens) on every tool-carrying opening turn,
+# part-funded by folding NEEDS into the phases line.
 PLAN_PHASES = """PLAN FIRST (applies to every brief above)
 Before touching anything, write the todo list you will work from:
-- Phases, each with a CONCRETE artefact and an observable "done when".
-- Say what each phase NEEDS from another. Phases that need nothing from each other run at the SAME TIME -- name those and do them together; only a real dependency waits for it.
-- Keep it in PROGRESS.md in the project as a checklist (- [ ] / - [x] / - [~] in progress); if PROGRESS.md exists, read it first and continue from it.
+- DESIGN first for a build/feature (skip for a small fix): components, the interfaces between them, which files each phase touches.
+- Phases, each with a CONCRETE artefact, an observable "done when" and what it NEEDS from another. Phases that need nothing from each other run at the SAME TIME -- do them together.
+- DRY-RUN the plan before editing: every asked part has a phase, no two same-time phases edit one file, each has a done when. Fix the plan first.
+- Keep it in PROGRESS.md as a checklist (- [ ] / - [x] / - [~] in progress); if PROGRESS.md exists, read it first and continue from it.
 - Then execute it, updating the list as each phase lands. Do not stop between phases to report; the list IS the report."""
 
 

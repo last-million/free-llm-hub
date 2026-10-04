@@ -1570,6 +1570,43 @@ what the agent's CLI already ran. Covered by `tests/test_evidence.py` and
   verdict, source "observed", SHA-256 of the CHANGED files only (40 files /
   5 MB). json library, atomic replace, LRU-pruned to 500.
 
+## Design, plan, dry run (2026-10-04)
+
+Owner: "design, plan well in a perfect architecture, then go -- and prevent
+problems with a DRY RUN in planning". Covered by
+`tests/test_plan_design_and_dry_run.py`.
+
+- **Design** (Multi): `_PLAN_SYSTEM` (and the managed variant) asks a build /
+  feature plan for `"design": {components, interfaces, data_flow}` before its
+  phases and `"files"` (owned paths) per phase; a small fix or a one-phase
+  plan gets `{}` (`_plan_design`). `plan_check.normalize_design` reads any
+  shape; `clean_phases` keeps `files` (`plan_check.norm_files`, merged phases
+  union them). `run.design` and `agent.files` are persisted; every worker
+  prompt gets `design_block` (<= `DESIGN_CHARS` 2500, its own files first);
+  a plan with no design and no files keeps its old prompt byte for byte.
+  `_multi_run_plan` carries `design` ({line "Design: 3 components, 4
+  interfaces", text}) -> one collapsed `<details>` row (`designRow`).
+- **Dry run** (`plan_check.check_plan`, pure: no model call, no command; reads
+  only file NAMES of the project): parallel phases owning one file -> the later
+  needs the earlier (fixed); a phase reading a file an earlier non-needed phase
+  writes -> needs it (fixed); a file only a later phase writes, or one missing
+  from the project and named by no phase -> warn; no concrete done_when /
+  acceptance -> warn; `clean_phases(notes=)` reports dropped needs (cycle /
+  dangling), dropped empty phases, merged look-only phases (fixed) and phases
+  past `MAX_AGENTS` (warn); 3+ phases in one chain -> warn; an enumerated part
+  (`swarm.required_parts` + `swarm._uncovered`) no phase covers -> ONE re-ask
+  of the FREE planner with the findings and the plan (`dry_run`), the revised
+  plan taken only if it covers more; still uncovered -> warn, run goes ahead.
+  A check that raises never stops the run (report None).
+- **Shown**: `run.plan_check` (persisted) -> one conversation line after the
+  plan lines, fresh runs only: "Plan check: N phases, K start now[, planner
+  re-asked once], X fixed (...), Y warnings (...)".
+- **Single sessions**: `craft.PLAN_PHASES` gained DESIGN (skip for a small fix)
+  and DRY-RUN steps: 626 -> 823 chars (+49 tokens), part-funded by folding
+  NEEDS into the phases line; the brief ceiling moved 12.5% -> 13% once
+  (note in `test_craft_briefs.test_worst_case_brief_cost`). The prose swarm
+  already checks coverage (`swarm._uncovered`, `plan:coverage`); untouched.
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):

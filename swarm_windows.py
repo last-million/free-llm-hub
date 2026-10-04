@@ -58,6 +58,7 @@ from collections import deque
 import agent_servers                 # a leaf too: server rules, hub PID/port
 import answer_check                  # a leaf like this one: no app import
 import evidence                      # pure: observed test/build verdicts
+import plan_check                    # pure: the design + the plan's dry run
 import receipts                      # what was observed, on disk
 
 _SUMMARY_THINK_RE = re.compile(r"<(think|thinking)>(.*?)</\1>", re.I | re.S)
@@ -338,9 +339,21 @@ class SwarmWindowsError(Exception):
 _PLAN_SYSTEM = """You break a software task into INDEPENDENT phases for parallel agents.
 
 Each phase is given to a SEPARATE agent with its own fresh context. An agent
-sees only its own task plus the summaries of the phases it declares in "needs".
+sees only its own task, the shared design, and the summaries of the phases it
+declares in "needs".
 
 Rules:
+- DESIGN FIRST for a build or a feature (2+ phases): before the phases give
+  "design" -- the components, the interfaces between them (function
+  signatures, endpoints, file formats: the contracts agents working at the
+  same time build to) and the data flow. A small fix or a one-phase plan
+  gives "design": {}.
+- "files" lists the paths a phase creates or edits (relative to the project).
+  Two phases that run at the same time must not share a file.
+- Every phase gets a concrete, checkable "done_when" (a command that passes,
+  a file that exists, a behaviour you can see). Cover EVERY part the user
+  listed. The plan is dry-run before any agent starts: shared files, missing
+  parts and missing inputs are caught there.
 - SPEED: phases that need nothing run AT THE SAME TIME (up to 4 agents). A
   chain where each phase needs the previous one is the SLOWEST plan; use a
   "needs" only when a phase cannot start without another phase's RESULT.
@@ -357,8 +370,12 @@ Rules:
   quick mechanical edits). Leave it out when nothing fits; do not guess.
 
 Reply with JSON only:
-{"goal": "...", "phases": [{"title": "...", "task": "...", "done_when": "...",
-                            "needs": [], "mode": "coding"}]}
+{"goal": "...",
+ "design": {"components": ["name: what it does"],
+            "interfaces": ["the contract, e.g. GET /api/items -> [{id, name}]"],
+            "data_flow": "..."},
+ "phases": [{"title": "...", "task": "...", "done_when": "...", "files": ["path"],
+             "needs": [], "mode": "coding"}]}
 """ % MAX_AGENTS
 
 # THE SAME ASK, WHEN A SUBSCRIPTION MANAGER PLANS.
@@ -381,8 +398,8 @@ _PLAN_SYSTEM_MANAGED = _PLAN_SYSTEM.replace(
 Reply with JSON only:""").replace(
     '"needs": [], "mode": "coding"}]}',
     '"needs": [], "mode": "coding", "inputs": "...",\n'
-    '                            "constraints": "...", "output_format": "...",\n'
-    '                            "acceptance": "..."}]}')
+    '             "constraints": "...", "output_format": "...",\n'
+    '             "acceptance": "..."}]}')
 
 # The optional per-phase brief fields a managed plan carries. Free-text, each
 # clipped: they are instructions to a worker, not a place for a second task.
@@ -425,21 +442,36 @@ def _extract_json(text):
     return None
 
 
-def clean_phases(plan, max_phases=MAX_AGENTS, modes=()):
+def clean_phases(plan, max_phases=MAX_AGENTS, modes=(), notes=None):
     """Validated phases, or [] when the plan is unusable.
 
     `needs` is sanitised hard for the same reason swarm._clean_phases does it: a
     self-reference or a forward reference deadlocks the wave scheduler, and a
     plan that makes every phase depend on every earlier one is a sequential
-    pipeline wearing a swarm's clothes."""
+    pipeline wearing a swarm's clothes.
+
+    `notes` (a list, optional) receives what was changed, as {kind, text,
+    phase} -- the plan's dry run (plan_check) reports it instead of the
+    sanitising staying silent."""
     if not isinstance(plan, dict):
         return []
+    note = notes.append if isinstance(notes, list) else (lambda _n: None)
     out = []
+    raw_phases = [p for p in (plan.get("phases") or []) if isinstance(p, dict)] \
+        if isinstance(plan.get("phases"), list) else []
+    usable = [p for p in raw_phases if str(p.get("task") or "").strip()]
+    if len(usable) > max_phases:
+        note({"kind": "too_many_phases", "phase": None,
+              "text": "%d phases planned; past the limit of %d the rest were dropped"
+                      % (len(usable), max_phases)})
     for p in (plan.get("phases") or [])[:max_phases]:
         if not isinstance(p, dict):
             continue
         task = str(p.get("task") or "").strip()
         if not task:
+            note({"kind": "no_task", "phase": None,
+                  "text": "dropped a phase with no task (%s)"
+                          % (str(p.get("title") or "untitled")[:40])})
             continue
         idx = len(out) + 1
         needs = []
@@ -452,6 +484,11 @@ def clean_phases(plan, max_phases=MAX_AGENTS, modes=()):
                     continue
                 if 1 <= n < idx and n not in needs:
                     needs.append(n)
+                elif n not in needs:
+                    note({"kind": "need_dropped", "phase": idx,
+                          "text": "phase %d: dropped need %d (%s)" % (
+                              idx, n, "itself" if n == idx else
+                              "a later phase, could deadlock" if n > idx else "no such phase")})
         # WHICH KIND OF MODEL THIS PHASE GETS. Validated against the modes the
         # caller actually serves rather than trusted: a planner inventing
         # "mode": "genius" would otherwise reach set_session_mode and either
@@ -471,8 +508,13 @@ def clean_phases(plan, max_phases=MAX_AGENTS, modes=()):
             text = _brief_text(p.get(key))
             if text:
                 row[key] = text
+        # The paths this phase OWNS (creates or edits) -- what the dry run
+        # checks for two helpers working on one file at the same time.
+        files = plan_check.norm_files(p.get("files"))
+        if files:
+            row["files"] = files
         out.append(row)
-    return merge_handoffs(out) if len(out) >= 1 else []
+    return merge_handoffs(out, notes=notes) if len(out) >= 1 else []
 
 
 # A phase that only LOOKS (diagnose, locate, investigate...) and whose one
@@ -495,11 +537,12 @@ def _looks_only(phase):
     return bool(_LOOK_ONLY_RE.search(title)) and not _ACTS_RE.search(title)
 
 
-def merge_handoffs(phases):
+def merge_handoffs(phases, notes=None):
     """`phases` with every look-only phase folded into its ONE follower (the
     phase that needs it, when nothing else does): the follower's agent
     investigates first, then acts. Renumbers "needs". Never raises; a plan
-    it cannot read comes back as it was."""
+    it cannot read comes back as it was. `notes` (optional list) gets one
+    {kind: "merged", ...} per fold."""
     try:
         phases = [dict(p) for p in phases]
         merged = True
@@ -517,6 +560,13 @@ def merge_handoffs(phases):
                     p["title"], p["task"], f["task"]))[:4000]
                 f["needs"] = sorted(set(p["needs"]) | (set(f["needs"]) - {i}))
                 f["mode"] = f.get("mode") or p.get("mode")
+                if p.get("files") or f.get("files"):
+                    f["files"] = list(dict.fromkeys(list(f.get("files") or [])
+                                                    + list(p.get("files") or [])))
+                if isinstance(notes, list):
+                    notes.append({"kind": "merged", "phase": j - 1,
+                                  "text": "merged look-only \"%s\" into \"%s\""
+                                          % (p["title"][:40], f["title"][:40])})
                 del phases[i - 1]
                 for q in phases:                     # renumber after removing i
                     q["needs"] = [n - 1 if n > i else n for n in q["needs"]]
@@ -580,7 +630,7 @@ class _Agent:
                  "inputs", "constraints", "output_format", "acceptance",
                  "verified", "problems", "revisions", "past_sessions",
                  "event_total", "evidence", "reviewed", "claimed_unobserved",
-                 "receipt")
+                 "receipt", "files")
 
     def __init__(self, index, phase):
         self.index = index
@@ -589,6 +639,8 @@ class _Agent:
         self.done_when = phase.get("done_when") or ""
         self.needs = list(phase.get("needs") or ())
         self.mode = phase.get("mode") or None
+        # The paths the plan says this phase owns ([] when it named none).
+        self.files = list(phase.get("files") or ())
         # The managed brief (see _PLAN_SYSTEM_MANAGED); "" for a plain plan.
         self.inputs = phase.get("inputs") or ""
         self.constraints = phase.get("constraints") or ""
@@ -633,7 +685,7 @@ class _Agent:
         out = {
             "index": self.index, "title": self.title, "task": self.task,
             "done_when": self.done_when, "needs": list(self.needs),
-            "mode": self.mode,
+            "mode": self.mode, "files": list(self.files),
             "session_id": self.session_id, "state": self.state,
             "summary": self.summary, "error": self.error,
             "started_at": self.started_at, "ended_at": self.ended_at,
@@ -665,12 +717,19 @@ class _Run:
                  "error", "created_at", "ended_at", "stop_flag", "lock", "waves",
                  "restored", "interrupted", "store_root", "owner",
                  "manager", "managed", "modes", "manager_tokens", "manager_calls",
-                 "context", "resumes", "default_mode")
+                 "context", "resumes", "default_mode", "design", "plan_check")
 
     def __init__(self, goal, project_dir, cli_id, phases, owner=None,
-                 manager=None, modes=(), context="", default_mode=None):
+                 manager=None, modes=(), context="", default_mode=None,
+                 design=None, check_report=None):
         self.id = "swarm-" + uuid.uuid4().hex[:12]
         self.goal = goal
+        # THE DESIGN the plan carried (plan_check.normalize_design; {} for a
+        # small fix): every worker's prompt gets it, so helpers working side
+        # by side build to the same interfaces. And the plan's DRY RUN report
+        # (plan_check.summarize; None when no check ran). Both persisted.
+        self.design = design if isinstance(design, dict) else {}
+        self.plan_check = check_report if isinstance(check_report, dict) else None
         # WHAT THE CONVERSATION ALREADY ESTABLISHED (bounded, see
         # CONTEXT_CHARS): the owner session's memory block, its recap, the
         # previous run's result. The goal alone is one message; "make it
@@ -740,6 +799,8 @@ class _Run:
             "manager_tokens": self.manager_tokens,
             "manager_calls": self.manager_calls,
             "context": self.context, "resumes": self.resumes,
+            "design": dict(self.design or {}),
+            "plan_check": dict(self.plan_check) if self.plan_check else None,
             "error": self.error, "created_at": self.created_at,
             "ended_at": self.ended_at,
             "waves": [list(w) for w in self.waves],
@@ -760,6 +821,8 @@ class _Run:
         phases = [{"title": a.get("title") or "?", "task": a.get("task") or "",
                    "done_when": a.get("done_when") or "",
                    "needs": list(a.get("needs") or ()), "mode": a.get("mode"),
+                   "files": [str(f) for f in (a.get("files") or ())
+                             if isinstance(f, str)][:plan_check.MAX_FILES],
                    **{k: a.get(k) or "" for k in BRIEF_FIELDS}}
                   for a in (row.get("agents") or ())
                   if isinstance(a, dict)]
@@ -767,7 +830,9 @@ class _Run:
             return None
         run = cls(row.get("goal") or "", row.get("project_dir") or "",
                   row.get("cli") or "", phases,
-                  context=row.get("context") if isinstance(row.get("context"), str) else "")
+                  context=row.get("context") if isinstance(row.get("context"), str) else "",
+                  design=plan_check.normalize_design(row.get("design")),
+                  check_report=row.get("plan_check"))
         try:
             run.resumes = max(0, int(row.get("resumes") or 0))
         except (TypeError, ValueError):
@@ -904,6 +969,32 @@ def stop(run_id):
 # Running
 # --------------------------------------------------------------------------- #
 
+DESIGN_CHARS = plan_check.DESIGN_CHARS
+
+
+def design_block(run, agent=None):
+    """The design block a worker's prompt carries (bounded to DESIGN_CHARS),
+    or "" when the run has no design and no phase owns a file."""
+    try:
+        owners = [(a.index, a.title, list(a.files)) for a in run.agents
+                  if getattr(a, "files", None)]
+        return plan_check.render_design(
+            getattr(run, "design", None) or {}, owners,
+            agent.index if agent is not None else None,
+            list(getattr(agent, "files", None) or ()) if agent is not None else (),
+            DESIGN_CHARS)
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def design_view(run):
+    """{"line": "Design: 3 components, 4 interfaces", "text": the block} for
+    the Build page's collapsed design row, or None when the run has none."""
+    if run is None or not getattr(run, "design", None):
+        return None
+    return {"line": plan_check.design_line(run.design), "text": design_block(run)}
+
+
 def _agent_prompt(run, agent):
     """One worker's whole brief.
 
@@ -929,6 +1020,13 @@ def _agent_prompt(run, agent):
                          ("YOUR FINAL MESSAGE MUST CONTAIN", agent.output_format)):
         if value:
             parts += [label + ": " + value, ""]
+    # THE SHARED DESIGN (owner, 2026-10-04: "design, plan well in a perfect
+    # architecture, then go"): helpers working at the same time build to the
+    # same interfaces, and each knows which files are its own. Absent for a
+    # plan with no design and no owned files -- that prompt is unchanged.
+    design = design_block(run, agent)
+    if design:
+        parts += [design, ""]
     if agent.revisions and agent.problems:
         # A REVISION. The first attempt's files are still in the folder; what
         # this attempt needs is the list of what was wrong with them, stated
@@ -1822,8 +1920,20 @@ _PLAN_NUDGE = ("\n\n(Your previous reply could not be read as the JSON object "
                "fences, nothing before the opening brace.)")
 
 
-def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context=""):
+def _plan_design(obj, phases):
+    """The design a plan object carries, {} for a one-phase plan (a small fix
+    needs no ceremony) or when there is none."""
+    if not isinstance(obj, dict) or len(phases or ()) <= 1:
+        return {}
+    return plan_check.normalize_design(obj.get("design"))
+
+
+def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context="",
+         out=None):
     """Ask a model to break `goal` into phases. Returns [] when it cannot.
+
+    `out` (a dict, optional) receives "design" (the plan's design, {} for a
+    small fix) and "notes" (what clean_phases changed) of the plan returned.
 
     `planner(system, user) -> str` is injected so this can be tested, and so the
     hub's own routing decides which model plans.
@@ -1838,6 +1948,15 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context="
     under its own heading: up to PLAN_CONTEXT_CHARS for the free planner,
     MANAGER_CONTEXT_CHARS for the manager. "" = the goal alone, as before."""
     mode_list = ", ".join(modes) if modes else "coding"
+    out = out if isinstance(out, dict) else {}
+
+    def _read(raw):
+        obj, notes = _extract_json(raw), []
+        got = clean_phases(obj, max_phases, modes, notes=notes)
+        if got:
+            out["design"], out["notes"] = _plan_design(obj, got), notes
+        return got
+
     if manager is not None:
         try:
             raw = manager(_PLAN_SYSTEM_MANAGED.replace("{modes}", mode_list),
@@ -1845,7 +1964,7 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context="
         except Exception as exc:                                 # noqa: BLE001
             _log.warning("[swarm] manager planner raised: %s", exc)
             raw = ""
-        phases = clean_phases(_extract_json(raw), max_phases, modes)
+        phases = _read(raw)
         if phases:
             return phases
         if raw:
@@ -1860,7 +1979,7 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context="
         except Exception as exc:                                 # noqa: BLE001
             _log.warning("[swarm] planner raised on attempt %d: %s", attempt, exc)
             return []
-        phases = clean_phases(_extract_json(raw), max_phases, modes)
+        phases = _read(raw)
         if phases:
             return phases
         _log.warning("[swarm] planner attempt %d was not a plan (%d chars): %r",
@@ -2075,6 +2194,52 @@ class _PlanMeter:
         return text
 
 
+def dry_run(goal, phases, design, project_dir, planner=None, modes=(), context="",
+            notes=(), max_phases=MAX_AGENTS):
+    """The plan's DRY RUN, before any worker starts: (phases, design, report).
+
+    plan_check.check_plan finds what the plan would get wrong and applies what
+    it can (a dependency between two phases that would edit one file at the
+    same time, or between a phase and the earlier one that writes what it
+    reads). What only the planner can fix (a part the user listed that no
+    phase covers) earns ONE re-ask of the FREE `planner`, with the findings
+    and the plan they were found in; the revised plan is taken when it fixes
+    more than it breaks. Whatever is still wrong is surfaced as a warning and
+    the run goes ahead (fail open). No model call besides that one re-ask, no
+    command run."""
+    fixed, report = plan_check.check_plan(phases, design, goal, project_dir,
+                                          notes=notes, max_phases=max_phases)
+    replan = [f for f in report["findings"] if f.get("action") == "replan"]
+    if replan and planner is not None:
+        mode_list = ", ".join(modes) if modes else "coding"
+        ask = plan_check.replan_ask(_with_context(goal, context, PLAN_CONTEXT_CHARS),
+                                    replan, fixed, design)
+        try:
+            raw = planner(_PLAN_SYSTEM.replace("{modes}", mode_list), ask)
+        except Exception as exc:                                 # noqa: BLE001
+            _log.warning("[swarm] plan re-ask raised: %s", exc)
+            raw = ""
+        obj, notes2 = _extract_json(raw), []
+        again = clean_phases(obj, max_phases, modes, notes=notes2)
+        if again:
+            design2 = _plan_design(obj, again) or (design if len(again) > 1 else {})
+            fixed2, report2 = plan_check.check_plan(
+                again, design2, goal, project_dir, notes=notes2, max_phases=max_phases)
+            still = [f for f in report2["findings"] if f.get("action") == "replan"]
+            if len(still) < len(replan):
+                gone = [f.get("part") or f["text"] for f in replan
+                        if f["text"] not in {s["text"] for s in still}]
+                report2["findings"].insert(0, {
+                    "kind": "replanned", "action": "fixed", "phase": None,
+                    "text": "re-planned to cover " + ", ".join('"%s"' % g for g in gone)})
+                fixed, design, report = fixed2, design2, report2
+        report["replanned"] = True
+    for f in report["findings"]:
+        if f.get("action") == "replan":        # fail open: run, but say so
+            f["action"] = "warn"
+    return fixed, design, report
+
+
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
           on_done=None, configure=None, modes=(), review=True, owner=None, stop=None,
           manager=None, context="", default_mode=None):
@@ -2095,20 +2260,35 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     if not goal:
         raise SwarmWindowsError("a goal is required")
     meter = _PlanMeter(manager) if manager is not None else None
+    info = {}
     if phases is None:
         if planner is None:
             raise SwarmWindowsError("give either phases or a planner")
         extra = {"context": context} if context else {}
         phases = plan(goal, planner, modes=modes,
-                      manager=meter.ask if meter else None, **extra)
-    phases = clean_phases({"phases": phases}, modes=modes) if phases else []
+                      manager=meter.ask if meter else None, out=info, **extra)
+    notes = list(info.get("notes") or ())
+    phases = clean_phases({"phases": phases}, modes=modes, notes=notes) if phases else []
     if not phases:
         raise SwarmWindowsError("could not turn that into phases")
+    design = info.get("design") or {}
+    report = None
+    # DESIGN, PLAN, DRY RUN, THEN GO (owner, 2026-10-04). Fail open: a check
+    # that breaks never stops the run.
+    try:
+        phases, design, report = dry_run(goal, phases, design, project_dir,
+                                         planner=planner, modes=modes, context=context,
+                                         notes=notes)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[swarm] plan dry run failed (run goes ahead): %s", exc)
     if review:
         phases = with_review(phases)
+    if report is not None:
+        plan_check.summarize(report, phases)
+        _log.info("[swarm] %s", report.get("line"))
     run = _Run(goal, project_dir, cli_id, phases, owner=owner,
                manager=manager, modes=modes, context=context,
-               default_mode=default_mode)
+               default_mode=default_mode, design=design, check_report=report)
     if meter:
         run.manager_tokens, run.manager_calls = meter.tokens, meter.calls
     _remember(run)

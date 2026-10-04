@@ -2734,6 +2734,11 @@
   .hp-check.observed_pass{ background:var(--accent-soft); color:var(--ok-text); border-color:transparent; }
   .hp-check.observed_fail{ background:var(--danger-soft); color:var(--danger-text); border-color:var(--danger-border); }
   .hp-check.claimed{ background:var(--warn-soft); color:var(--warn-text); border-color:var(--warn-border); }
+  .agent-plan-list li.hp-design{ display:block; padding:2px 0 4px; }
+  .hp-design summary{ cursor:pointer; font-size:11.5px; color:var(--text-dim); }
+  .hp-design summary:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  .hp-design-text{ margin:4px 0 0; font-family:var(--mono); font-size:11px; color:var(--text-dim);
+    white-space:pre-wrap; overflow-wrap:anywhere; max-height:220px; overflow:auto; }
   .hp-open{ margin-left:auto; font-size:11.5px; font-weight:600; color:var(--accent);
     text-decoration:none; padding:3px 6px; border-radius:var(--radius-sm); white-space:nowrap; }
   .hp-open:hover{ background:var(--accent-soft); }
@@ -10842,8 +10847,22 @@
       $('#agent-plan-toggle').setAttribute('aria-expanded', _planCollapsed ? 'false' : 'true');
       list.innerHTML = '';
       if (helpers){
+        if (p.design && p.design.line) list.appendChild(designRow(p.design, p.plan_check));
         items.forEach(function(t){ list.appendChild(helperRow(t, p.now)); });
         items = [];
+      }
+      /* The run's design (components, interfaces, who owns which file) as ONE
+         collapsed row above the helpers; the plan's dry-run line inside it. */
+      function designRow(d, check){
+        var li = document.createElement('li'); li.className = 'hp-design';
+        var det = document.createElement('details');
+        var sum = document.createElement('summary'); sum.textContent = d.line;
+        det.appendChild(sum);
+        var pre = document.createElement('pre'); pre.className = 'hp-design-text';
+        pre.textContent = (d.text || '') + (check ? '\n\n' + check : '');
+        det.appendChild(pre);
+        li.appendChild(det);
+        return li;
       }
       items.forEach(function(t){
         var li = document.createElement('li');
