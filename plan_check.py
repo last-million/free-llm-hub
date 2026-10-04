@@ -19,6 +19,12 @@ is a bounded walk of the project folder's file NAMES):
   with action "fixed" (already applied to the returned copy), "replan" (worth
   ONE re-ask of the planner -- swarm_windows.dry_run does that) or "warn"
   (surfaced, the run goes ahead: fail open).
+
+- NO AI SLOP, FROM THE PLAN ON (owner, 2026-10-04): a web/UI build's design
+  keeps its visual decisions (`design["visual"]`: palette, type, layout,
+  motion, copy source) and the dry run runs slopcheck.check_design on it; a
+  missing hex palette or type pairing, or the default purple gradient, is a
+  "replan" finding, so the look is decided before any helper writes markup.
 """
 import os
 import re
@@ -67,10 +73,62 @@ def _items(value, cap):
     return out[:cap]
 
 
+# The VISUAL decisions of a web/UI design (palette, type, layout, motion, copy
+# source), kept as "role: value" lines under design["visual"]. A planner may
+# answer {"visual": {...}} or put the keys straight into "design"; both read
+# the same. Without these the slop check's re-ask could never be satisfied:
+# the revised plan's palette would be dropped right here.
+_VISUAL_KEYS = (
+    ("palette", ("palette", "colors", "colours", "color_palette", "colour_palette", "color", "colour")),
+    ("type", ("type", "typography", "fonts", "font", "font_pairing", "type_pairing", "typefaces")),
+    ("layout", ("layout", "layout_concept", "composition")),
+    ("motion", ("motion", "animation", "motion_stance")),
+    ("copy", ("copy", "copy_source", "content_source")),
+    ("look", ("look", "art_direction", "visual_direction", "direction", "mood")),
+)
+_MAX_VISUAL = 8
+
+
+def _flat(value):
+    if isinstance(value, dict):
+        return "; ".join("%s: %s" % (k, _flat(v)) for k, v in value.items() if _flat(v))
+    if isinstance(value, (list, tuple)):
+        return ", ".join(_flat(v) for v in value if _flat(v))
+    return " ".join(str(value if value is not None else "").split())
+
+
+def _visual(raw):
+    src = raw.get("visual")
+    if isinstance(src, (list, tuple, str)):          # already lines (a stored run)
+        lines = _items(src, _MAX_VISUAL)
+        src = {}
+    else:
+        lines, src = [], dict(src) if isinstance(src, dict) else {}
+    for key in list(raw):
+        if key != "visual" and any(key in names for _r, names in _VISUAL_KEYS):
+            src.setdefault(key, raw[key])
+    for role, names in _VISUAL_KEYS:
+        for name in names:
+            if name in src:
+                text = _flat(src.pop(name))
+                if text:
+                    lines.append(("%s: %s" % (role, text))[:_ITEM_CHARS])
+                break
+    for key, val in src.items():                     # a role we did not foresee
+        text = _flat(val)
+        if text:
+            lines.append(("%s: %s" % (key, text))[:_ITEM_CHARS])
+    out = []
+    for line in lines:
+        if line not in out:
+            out.append(line)
+    return out[:_MAX_VISUAL]
+
+
 def normalize_design(raw):
-    """{"components": [str], "interfaces": [str], "data_flow": str}, keys only
-    when non-empty; {} for no design (a small fix, an unreadable answer).
-    Never raises."""
+    """{"components": [str], "interfaces": [str], "data_flow": str,
+    "visual": [str]}, keys only when non-empty; {} for no design (a small fix,
+    an unreadable answer). Never raises."""
     try:
         if not isinstance(raw, dict):
             return {}
@@ -87,6 +145,9 @@ def normalize_design(raw):
         flow = " ".join(str(flow or "").split())[:_FLOW_CHARS]
         if flow:
             out["data_flow"] = flow
+        visual = _visual(raw)
+        if visual:
+            out["visual"] = visual
         return out
     except Exception:                                            # noqa: BLE001
         return {}
@@ -125,6 +186,8 @@ def design_line(design):
             "%d interface%s" % (m, "" if m == 1 else "s")]
     if d.get("data_flow"):
         bits.append("data flow")
+    if d.get("visual"):
+        bits.append("visual decisions")
     return "Design: " + ", ".join(bits)
 
 
@@ -142,6 +205,11 @@ def render_design(design, owners=(), your_index=None, your_files=(), limit=DESIG
         head.append("YOUR FILES (phase %s): %s. Change another phase's files "
                     "only if your task says so." % (your_index, ", ".join(your_files)))
     body = []
+    # Visual decisions first: short, and the one part a clip must never cut
+    # (two helpers inventing two palettes is the slop this exists to stop).
+    if d.get("visual"):
+        body += ["Visual decisions (every helper uses exactly these -- no substitutes, "
+                 "no defaults):"] + ["- " + v for v in d["visual"]]
     if d.get("components"):
         body += ["Components:"] + ["- " + c for c in d["components"]]
     if d.get("interfaces"):
@@ -336,6 +404,60 @@ def _uncovered_parts(goal_text, phases):
         return []
 
 
+# Web/UI slop in the DESIGN, before any code (owner, 2026-10-04: "slop must be
+# prevented from the BEGINNING, in planning and in designing the
+# architecture"). Only a web BUILD is checked: a 2+ phase plan (or one with a
+# design) for a goal craft.is_web_ui calls web work, and not a pure fix -- a
+# footer typo needs no palette. The re-ask label says what was added.
+_FIX_ONLY_RE = re.compile(r"\b(?:fix|fixes|bug|bugs|debug|broken|repair|typo|corrig\w*|r[ée]pare\w*|"
+                          r"arregla\w*)\b", re.I)
+_BUILD_RE = re.compile(r"\b(?:build|create|make|design|redesign|new|generate|scaffold|develop|craft|"
+                       r"launch|construi\w*|cr[ée]e\w*|fai[st]|refai\w*|refonte|dise[ñn]a\w*|crea\w*)\b", re.I)
+_SLOP_PART = {"no_palette": "a hex palette", "no_type_pairing": "a type pairing",
+              "default_gradient": "a non-default hero", "vague_style": "concrete visual decisions"}
+
+
+def _web_build(goal_text, phases, design):
+    try:
+        import craft
+        if not craft.skill_enabled("web_design") or not craft.is_web_ui(goal_text or ""):
+            return False
+    except Exception:                                            # noqa: BLE001
+        return False
+    if len(phases) < 2 and not design:
+        return False
+    goal = goal_text or ""
+    return not (_FIX_ONLY_RE.search(goal) and not _BUILD_RE.search(goal))
+
+
+def design_text(design, phases):
+    """The plan as the slop check reads it: the design (visual decisions
+    included) and every phase's words."""
+    d = design or {}
+    lines = list(d.get("visual") or ()) + list(d.get("components") or ()) \
+        + list(d.get("interfaces") or ()) + [d.get("data_flow") or ""]
+    for p in phases or ():
+        lines += [str(p.get(k) or "") for k in ("title", "task", "done_when", "acceptance",
+                                                 "constraints", "inputs")]
+    return "\n".join(x for x in lines if x)
+
+
+def _design_slop(goal_text, phases, design):
+    """slopcheck.check_design on a web build's plan as findings: high = replan
+    (the planner's one re-ask, with the fix), the rest = warn."""
+    if not _web_build(goal_text, phases, design):
+        return []
+    import slopcheck
+    out = []
+    for f in slopcheck.check_design(design_text(design, phases), request=goal_text or ""):
+        high = f["severity"] == "high"
+        out.append({"kind": "design_slop", "action": "replan" if high else "warn", "phase": None,
+                    "rule": f["rule"], "fix": f["fix"],
+                    "part": _SLOP_PART.get(f["rule"], f["why"])[:80],
+                    "text": "design: " + f["why"]})
+    return out
+
+
 def _note_finding(note):
     """A clean_phases note ({kind, text}) as a finding."""
     kind = str(note.get("kind") or "sanitised")
@@ -362,6 +484,11 @@ def check_plan(phases, design, goal_text, project_dir, notes=(), max_phases=None
       uncovered_part  a part the user enumerated that no phase covers
                       (replan: worth one re-ask)
       sequential      3+ phases and nothing runs side by side (warn)
+      design_slop     web/UI build only: slopcheck.check_design on the
+                      design + phases -- no hex palette, no type pairing,
+                      the default purple gradient, adjectives for a style
+                      (replan); stock skeleton, no layout concept, no copy
+                      source, a default AI face (warn)
       `notes`         what clean_phases changed: needs dropped (a cycle or a
                       dangling need), look-only phases merged, phases past
                       the limit (fixed / warn)
@@ -455,6 +582,12 @@ def check_plan(phases, design, goal_text, project_dir, notes=(), max_phases=None
     except Exception:                                            # noqa: BLE001
         pass
 
+    # 6. Web/UI: the look is decided in the design, not left to defaults.
+    try:
+        findings += _design_slop(goal_text, out, design)
+    except Exception:                                            # noqa: BLE001
+        pass
+
     report = {"findings": findings[:30], "phases": len(out),
               "start_now": sum(1 for p in out if not p.get("needs")),
               "replanned": False}
@@ -510,8 +643,16 @@ def replan_ask(goal, findings, phases, design):
         prev_text = json.dumps(prev, ensure_ascii=False)
     except (TypeError, ValueError):
         prev_text = ""
+    visual = ""
+    if any(f.get("kind") == "design_slop" for f in findings):
+        visual = ('\nPut the look in the design: "design": {..., "visual": {"palette": '
+                  '["#hex role", ...], "type": "display face + body face", "layout": "the '
+                  'composition and why", "motion": "...", "copy": "where the real words come '
+                  'from"}} -- concrete values chosen for THIS product, no defaults.')
     return (goal + "\n\n(A dry run of your previous plan found these problems. "
             "Fix them -- add or change phases, keep what was right -- and reply "
             "with the whole corrected JSON object only.)\nProblems:\n"
-            + "\n".join("- " + f["text"] for f in findings)
+            + "\n".join("- " + f["text"] + (" -- fix: " + f["fix"] if f.get("fix") else "")
+                        for f in findings)
+            + visual
             + ("\nYour previous plan:\n" + prev_text[:6000] if prev_text else ""))

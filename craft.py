@@ -63,16 +63,16 @@ def skill_enabled(name):
 
 WEB_DESIGN = """WEB DESIGN BRIEF (apply unless the user says otherwise)
 - Decide a POV first: who it is for, the one feeling it should give, the one action it asks for. Then design to that.
-- Type: one family, 3-4 sizes max, headline 1.1-1.2 line-height, body 1.5-1.65, measure 60-75 chars. Real hierarchy comes from size+weight+space, not colour.
+- Type: a display face paired with a body face (never Inter/system-only), 3-4 sizes max, headline 1.1-1.2 line-height, body 1.5-1.65, measure 60-75 chars. Real hierarchy comes from size+weight+space, not colour.
 - Space: one scale (4/8px). Section rhythm beats decoration. Whitespace is the design.
-- Colour: one accent, one neutral ramp, semantic tokens. Never convey meaning by colour alone.
-- Motion everywhere, but not the SAME motion everywhere: hover/active/focus on every control, an entrance for every section, VARIED — slide, stagger, reveal on scroll, parallax — one identical fade-and-rise everywhere is itself an AI tell. 150-300ms for state changes, up to 500ms for an entrance, ease-out (cubic-bezier(0.16,1,0.3,1)), exit faster than entrance. Transform/opacity only (compositor; layout properties jank). Honour prefers-reduced-motion, and CONTENT MUST BE VISIBLE BY DEFAULT — JS enhances an entrance, it never gates whether the content exists. An installed animation skill (hyperframes-animation, gsap) is a technique reference for eases/stagger/timelines/3D — never copy its data-*/class="clip" markup into a live page, that is for its video renderer.
+- Colour: one accent, one neutral ramp, semantic tokens, all as hex; text >=4.5:1 on its background. Never convey meaning by colour alone.
+- Motion everywhere, but not the SAME motion everywhere: hover/active/focus on every control, an entrance for every section, VARIED — slide, stagger, reveal on scroll, parallax — one identical fade-and-rise everywhere is itself an AI tell. 150-300ms for state changes, up to 500ms for an entrance, ease-out (cubic-bezier(0.16,1,0.3,1)), exit faster than entrance. Transform/opacity only (compositor; layout properties jank). Honour prefers-reduced-motion, and CONTENT MUST BE VISIBLE BY DEFAULT — JS enhances an entrance, it never gates whether the content exists. An installed animation skill (hyperframes-animation, gsap) is a technique reference only — never copy its data-*/class="clip" markup into a live page.
 - Hero motion when the brief wants impact — pick ONE, never both:
   * VIDEO: a genuinely licence-free clip (Pexels/Pixabay/Coverr; check the clip's own licence and name the source). Cut 4-6s, seamless loop, under ~2MB: <video autoplay muted loop playsinline poster="still.webp">. Overlay to hold text contrast; fall back to the poster on prefers-reduced-motion and narrow screens.
   * 3D/CANVAS: a real generative scene in JS. One canvas, devicePixelRatio capped at 2, paused when hidden or scrolled out (IntersectionObserver), static fallback without WebGL, and it must never block first paint.
-- Do not hand-roll what a free component set already solves. If the stack suits it, take the widgets with a keyboard contract — modal/dialog, combobox, tabs, date picker, menu — from shadcn/ui, Radix, Headless UI, DaisyUI or Flowbite, name which, and check its licence like a video clip: a hand-built modal is where the focus trap, aria and Esc key quietly go missing. A static one-pager needs none of this.
-- Look for an installed design skill first (ui-ux-pro-max and the like): a searchable engine of patterns, palettes and type pairings for this product type beats inventing a look from nothing.
-- Responsive: mobile-first, no horizontal scroll, tap targets >=44px, images with width/height so nothing shifts.
+- Widgets with a keyboard contract (modal/dialog, combobox, tabs, date picker, menu): when the stack suits it, take them from a free component set — shadcn/ui, Radix, Headless UI, DaisyUI or Flowbite — name which and check its licence; hand-built modals lose the focus trap, aria and Esc. A static one-pager needs none.
+- Look for an installed design skill first (ui-ux-pro-max and the like): its palettes and type pairings for this product type beat inventing a look.
+- Responsive: viewport meta, mobile-first, max-width not fixed px widths, no horizontal scroll, tap targets >=44px, images with width/height and real alt text.
 - Space above a heading must exceed the space below it — a heading binds to what follows.
 - Elevation once: border OR shadow, never both. Shadows have an offset and a soft blur; a zero-offset coloured halo is decoration, not depth.
 - Type scale must actually be a scale: largest at least 2x the smallest, ~1.25x between adjacent steps. Interactive text never below 11px.
@@ -83,12 +83,13 @@ SELF-CHECK before you report done — fix what fails, do not make the user catch
 2. Click every link and button yourself. Anything dead or wrong?
 3. Multi-page: flip through each page — same system, but does it still look distinct, not reskinned?
 4. Phone-width viewport: anything overflow, overlap, clip, or fall under a 44px tap target?
-5. Every section its own entrance, not one fade-and-rise pasted everywhere? Hover/active/focus on everything interactive?
+5. Every section its own entrance, not one fade-and-rise pasted everywhere? Hover/active and a visible :focus-visible on everything interactive (never a bare outline:none)?
 ANTI (each of these is a specific, recognisable AI tell):
-- Fonts: Inter, Geist, Plus Jakarta Sans, Space Grotesk, Instrument Sans/Serif, Fraunces, Recoleta, Playfair, DM Sans/Serif, Outfit, Syne, Montserrat. Pick a face with a point of view — but if you cannot verify the webfont actually loads, use a system stack rather than ship a broken @font-face.
-- Structure: a rounded-square icon tile above a heading; a tiny tracked uppercase eyebrow above a heading; cards inside cards; 01/02/03 section numbers; a coloured border-left on cards or callouts; centred hero + 3 identical feature cards + gradient blob.
-- Copy: "Elevate/Unlock/Seamless/Empower/supercharge/world-class/next-generation"; manufactured-contrast aphorisms ("Not a feature. A platform.", "X. Just Y.") — once is fine, three sections doing it is the tell.
-- Also: gradient text, glassmorphism as decoration, emoji as icons, stock-photo grids, a testimonial or statistic you invented."""
+- Fonts: Inter, Geist, Plus Jakarta Sans, Space Grotesk, Instrument Sans/Serif, Fraunces, Recoleta, Playfair, DM Sans/Serif, Outfit, Syne, Montserrat, Poppins. Pick a face with a point of view — but if you cannot verify the webfont actually loads, use a system stack rather than ship a broken @font-face.
+- Structure: a rounded-square icon tile above a heading; a tiny tracked uppercase eyebrow above a heading; cards inside cards; 01/02/03 section numbers; a coloured border-left on cards or callouts; centred hero + 3 identical feature cards + gradient blob; the same card grid in every section; everything centred.
+- Copy: "Elevate/Unlock/Seamless/Empower/supercharge/Revolutionize/cutting-edge/world-class/next-generation", "In today's fast-paced...", "Welcome to..."; manufactured-contrast aphorisms ("Not a feature. A platform.", "X. Just Y.") — once is fine, three sections doing it is the tell.
+- Placeholders: lorem ipsum, Your Company, John Doe, @example.com, 555 numbers, Feature 1/2/3 — real copy or [NEEDS INPUT].
+- Also: a purple->blue/indigo hero gradient, gradient text, glassmorphism as decoration, emoji as icons, stock-photo grids, a "Built with AI" credit or generator meta tag, a testimonial or statistic you invented."""
 
 SEO = """SEO BRIEF (build every page this way — do not wait to be asked for SEO)
 - One page = one intent = one primary keyword. Do not write a page you cannot name the query for.
@@ -390,6 +391,41 @@ Before touching anything, write the todo list you will work from:
 - Then execute it, updating the list as each phase lands. Do not stop between phases to report; the list IS the report."""
 
 
+# DESIGN DECISIONS FIRST, added 2026-10-04 at the owner's request: "slop must be
+# prevented from the BEGINNING, in planning and in designing the architecture,
+# not only caught at the end." WEB_DESIGN says what good looks like; this makes
+# the five choices that decide whether a page reads as AI-made happen BEFORE
+# the first line of markup, written down, so a default never gets in by
+# omission. Web/UI turns only (the web_design brief matched), tool-carrying or
+# not -- a model writing the page in its answer decides first too. The Multi
+# planner gets the same rule deterministically (plan_check -> slopcheck), and a
+# helper whose prompt already carries those decisions is told to use them.
+DESIGN_FIRST = """DESIGN DECISIONS FIRST (web/UI, before any code -- no defaults; a shared DESIGN already fixes them? use it)
+- Palette: 4-6 hex with roles (bg, text, accent, muted); text >=4.5:1.
+- Type: a named display + body pairing (or a system stack, said so).
+- Layout: the composition and why THIS product needs it, not hero + 3 cards + testimonials + CTA.
+- Motion: what moves, and the reduced-motion fallback.
+- Copy: the user's real words and facts; missing = [NEEDS INPUT], never lorem."""
+
+
+# Is this web / UI work? The web_design trigger plus the site nouns that mean a
+# page will be built, and a few non-English forms (the owner writes French).
+# Used by plan_check to decide whether a plan's design gets the slop check;
+# deliberately NOT used to widen when the WEB_DESIGN brief ships.
+_WEB_UI_RE = re.compile(
+    r"\blanding page\b|\bweb ?site\b|\bwebpage\b|\bweb design\b|\bui design\b|"
+    r"\b(?:the|my|our|this) site\b|\bhero section\b|\bredesign\b|\bstyle the\b|"
+    r"\btailwind\b|\bfront[- ]?end\b|\bhomepage\b|\bportfolio (?:site|page)\b|\bonline store\b|"
+    r"\bstorefront\b|\bweb ?app\b|\bui\b|\bux\b|\buser interface\b|\bmockup\b|\bwireframe\b|"
+    r"\bsite (?:web|internet|vitrine)\b|\bsitio web\b|\bp[áa]gina web\b|\bwebseite\b|"
+    r"\bpage d'accueil\b", re.I)
+
+
+def is_web_ui(text):
+    """True when `text` asks for web / UI work (a page, a site, a front end)."""
+    return isinstance(text, str) and bool(_WEB_UI_RE.search(text))
+
+
 def plan_message():
     """The phased-plan instruction as a standalone system message.
 
@@ -456,8 +492,11 @@ def system_message(text, tools=True):
     # VERIFY_READ checks against "the ANTI lines above", which only built-in
     # briefs carry; a user skill alone gets no tool-less verify block.
     builtin = any(not n.startswith("custom:") for n, _b in hits)
-    tail = ([PLAN_PHASES, ACT_RUN, VERIFY_RUN] if tools
-            else [VERIFY_READ] if builtin else [])
+    # Web/UI: the design decisions come right after the plan (tools) or right
+    # after the briefs (tool-less) -- decided before any code either way.
+    design = [DESIGN_FIRST] if any(n == "web_design" for n, _b in hits) else []
+    tail = ([PLAN_PHASES] + design + [ACT_RUN, VERIFY_RUN] if tools
+            else design + [VERIFY_READ] if builtin else [])
     body = "\n\n".join([b for _n, b in hits] + tail)
     return {"role": "system", "content": body}
 

@@ -56,7 +56,7 @@ def _recording_dispatch(seen, plan=PLAN_3_PARALLEL):
     on which thread."""
     lock = threading.Lock()
 
-    def _d(msgs, max_tokens, exclude_pids=()):
+    def _d(msgs, max_tokens, exclude_pids=(), **_kw):
         with lock:
             seen.append((_stage(msgs), A._active_mode(),
                          threading.current_thread() is threading.main_thread()))

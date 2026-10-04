@@ -94,8 +94,10 @@ def test_briefs_stay_small():
     composition markup into a live page -- that markup is real and would
     silently no-op without HyperFrames' own JS runtime present."""
     # web_design carries the most rules of any brief and grew again on
-    # 2026-08-31 for the component-set and design-skill lines.
-    budget = {"web_design": 5250}
+    # 2026-08-31 for the component-set and design-skill lines, and on
+    # 2026-10-04 for the owner's anti-slop list (+353 chars, ~88 tokens, after
+    # tightening the component, design-skill and animation-skill lines).
+    budget = {"web_design": 5500}
     for name, _rx, body in craft._BRIEFS:
         limit = budget.get(name, 1400)
         assert len(body) < limit, "%s brief is too long (%d chars)" % (name, len(body))
@@ -167,7 +169,15 @@ def test_worst_case_brief_cost():
     # DRY-RUN step. Funded first by folding NEEDS into the phases line and
     # cutting two clauses, so the block costs +49 tokens (626 -> 823 chars)
     # instead of +70; the heaviest request lands at ~12.63%.
-    assert worst / 4 < 32768 * 0.13, "briefs cost ~%d tokens" % (worst // 4)
+    #
+    # 0.13 -> 0.135 on 2026-10-04 (later the same day), deliberately and once,
+    # for the owner's "no AI slop ... prevented from the BEGINNING, in planning
+    # and in designing the architecture": craft.DESIGN_FIRST (palette in hex,
+    # type pairing, layout, motion, copy source -- decided before any code,
+    # web/UI turns only, 479 chars) and the anti-slop list in WEB_DESIGN (+353
+    # chars, funded in part by tightening three of its lines). The heaviest
+    # request lands at ~13.27%; a non-web request pays nothing more.
+    assert worst / 4 < 32768 * 0.135, "briefs cost ~%d tokens" % (worst // 4)
 
 
 # --------------------------------------------------------------------------- #

@@ -339,7 +339,9 @@ def test_startup_logs_coverage():
     body = body[:body.index("\ndef ")]
     assert "_log_ctx_coverage(" in body
     main = src[src.index('if __name__ == "__main__":'):]
-    assert "agentic_chat.set_window_provider(_declared_window_for)" in main
+    # The published provider is the hysteresis wrapper around _declared_window_for
+    # (see _stable_declared_window_for).
+    assert "agentic_chat.set_window_provider(_stable_declared_window_for)" in main
     assert "_start_ctx_reference_refresh()" in main
 
 

@@ -40,7 +40,22 @@ CREW_IDS = ("crew", "crew-code", "crew-research", "crew-write", "crew-design")
 #
 # The review prompts MUST keep the JSON contract
 # {"verdict": "ship"|"revise", "problems": [...]} — swarm parses it.
+#
+# "revise_on": "high" (write, design): ONE bounded revision even at
+# max_revisions 0, but only when the reviewer marks a problem HIGH severity
+# (swarm.review_severity) -- a forced pass on every "revise" mostly re-rolled
+# style, a pass on a broken deliverable is what the reviewer is for. Those
+# reviewers add "severity" to the contract (_SEVERITY_RULE).
 # ---------------------------------------------------------------------------
+
+_SEVERITY_RULE = (
+    "\"severity\" is the WORST problem's: \"high\" = the deliverable fails the "
+    "brief (a part the user asked for is missing, a fact or figure is "
+    "invented, the markup/structure is broken or unusable, sections "
+    "contradict each other); \"medium\" = clearly weaker than asked but "
+    "usable; \"low\" = polish. Only \"high\" triggers a fix pass, so never "
+    "call taste or wording high."
+)
 
 CREWS = {
     # Software build: the planner splits by component, the workers write real
@@ -186,7 +201,8 @@ CREWS = {
 
     # Long-form copy: structure, draft and polish are different skills, so the
     # planner is told to split along those lines. Review stays advisory (fed
-    # to synthesis) — a forced revision pass on prose mostly re-rolls style.
+    # to synthesis) — a forced revision pass on prose mostly re-rolls style —
+    # except for a HIGH-severity problem, which gets ONE revision ("revise_on").
     "write": {
         "plan_system": (
             "You are the SUPERVISOR of a team of AI writers producing the "
@@ -228,13 +244,13 @@ CREWS = {
             "before this reaches the user.\n"
             "Reply with JSON ONLY:\n"
             '{"verdict": "ship" | "revise", "problems": ["<concrete, '
-            'actionable>"]}\n'
+            'actionable>"], "severity": "high" | "medium" | "low"}\n'
             "Judge only: does it do what was asked, does the structure hold, "
             "is the voice consistent across sections, is anything factually "
             "invented, is any part generic filler that would fit any other "
             "piece. Personal taste is not a problem. If it is genuinely good, "
             "say ship with an empty problems list — do not manufacture "
-            "criticism."
+            "criticism.\n" + _SEVERITY_RULE
         ),
         "synth_system": (
             "Assemble the final piece from the section outputs, applying the "
@@ -246,6 +262,7 @@ CREWS = {
             "verbatim. Cut anything that reads as generic AI filler."
         ),
         "max_revisions": 0,
+        "revise_on": "high",
     },
 
     # Web/design work: the same pipeline, but every worker carries the hub's
@@ -273,9 +290,12 @@ CREWS = {
             "OWN context and is shown ONLY the output of the phases it lists. "
             "Copy and layout can usually start together; a phase that "
             "assembles or styles must list what it builds on.\n"
-            "- A phase may only need LOWER-numbered phases."
-        ) % swarm.MAX_PHASES,
+            "- A phase may only need LOWER-numbered phases.\n"
+            "- Phase 1 writes the design decisions below as a short spec every "
+            "other phase needs (decided once, here, before any markup).\n\n"
+        ) % swarm.MAX_PHASES + craft.DESIGN_FIRST,
         "phase_system": (
+            craft.DESIGN_FIRST + "\n\n"
             "You are one designer/engineer on a team. Produce YOUR "
             "deliverable only, completely, to production standard.\n"
             "Output the actual artefact — the markup, the CSS, the copy. No "
@@ -291,14 +311,14 @@ CREWS = {
             "check before this reaches the user.\n"
             "Reply with JSON ONLY:\n"
             '{"verdict": "ship" | "revise", "problems": ["<concrete, '
-            'actionable>"]}\n'
+            'actionable>"], "severity": "high" | "medium" | "low"}\n'
             "Judge only: does it deliver what was asked, does it follow the "
             "web design brief (hierarchy, spacing, responsive behaviour, "
             "accessibility), are there placeholders where real content was "
             "available, does anything contradict itself between sections. "
             "Personal taste beyond the brief is not a problem. If it is "
             "genuinely good, say ship with an empty problems list — do not "
-            "manufacture criticism."
+            "manufacture criticism.\n" + _SEVERITY_RULE
         ),
         "synth_system": (
             "Assemble the final web deliverable from the phase outputs, "
@@ -310,7 +330,9 @@ CREWS = {
             "that reads as generic filler."
         ),
         "worker_extra": craft.WEB_DESIGN,
+        "slop_check": True,       # swarm.run: slopcheck on the finished HTML
         "max_revisions": 0,
+        "revise_on": "high",
     },
 }
 
@@ -419,7 +441,7 @@ def looks_like_full_project(text):
 
 
 def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
-        manager=None, context=None, **budget):
+        manager=None, context=None, family=None, search=None, **budget):
     """Run the swarm pipeline under a crew persona. Same dispatch contract and
     result-dict shape as swarm.run(); the result gains a "crew" key naming the
     persona actually used ("" = generic pipeline).
@@ -441,6 +463,10 @@ def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
     `context` is swarm.run's conversation context (recap / memory block),
     folded into the brief with the earlier turns; forwarded only when set.
 
+    `family` (the reviewer avoids the producers' model families) and
+    `search` (wider-or-deeper extra attempts where a free check scores a
+    phase) are swarm.run's; each forwarded only when given.
+
     `**budget` carries swarm.run's plan-sized wall clock and grace
     (seconds_per_phase, max_seconds_ceiling, grace_seconds, fast_dispatch);
     only the keys that are set are forwarded."""
@@ -453,12 +479,18 @@ def run(messages, dispatch, crew_name, on_event=None, max_seconds=None,
     if (profile and profile.get("worker_extra") == craft.WEB_DESIGN
             and not craft.skill_enabled("web_design")):
         # Settings -> Skills switched the web-design skill off.
-        profile = dict(profile, worker_extra="")
+        profile = dict(profile, worker_extra="", slop_check=False,
+                       plan_system=profile["plan_system"].replace(craft.DESIGN_FIRST, ""),
+                       phase_system=profile["phase_system"].replace(craft.DESIGN_FIRST, ""))
     extra = {"max_seconds": max_seconds} if max_seconds else {}
     if manager is not None:
         extra["manager"] = manager
     if context:
         extra["context"] = context
+    if family is not None:
+        extra["family"] = family
+    if search:
+        extra["search"] = search
     for key in ("seconds_per_phase", "max_seconds_ceiling", "grace_seconds",
                 "fast_dispatch"):
         if budget.get(key):

@@ -1607,6 +1607,364 @@ problems with a DRY RUN in planning". Covered by
   (note in `test_craft_briefs.test_worst_case_brief_cost`). The prose swarm
   already checks coverage (`swarm._uncovered`, `plan:coverage`); untouched.
 
+## Learned model choice (bandit.py) (2026-10-04)
+
+Covered by `tests/test_task_bandit.py`. Owner-approved, Sakana
+Conductor/Trinity-style, no training: the hub learns which model is best per
+KIND of task from its own measured outcomes. Pure module (stdlib only, no
+import from app/swarm/verify, one lock, never raises).
+
+- **Tie-breaker only** (owner rule 2026-10-04: best AVAILABLE models first):
+  the benchmarks (AA / LMArena) and the owner floors set the order;
+  `MAX_NUDGE` = 1.0, so +1 / -1 spans at most app.py's 2-point
+  `_AUTO_TOP_BAND` and a learned favourite never overtakes a model more than
+  2 points stronger.
+- `task_kind(category, difficulty, tools, est_tokens)` -> e.g.
+  `coding|hard|tools|m` (None/"all" -> `any`, unknown difficulty -> `any`,
+  `notools`, size band s < 12K / m < 60K / l).
+- `Bandit(path=None, clock=time.time, rng=None)`: a Beta posterior per
+  (kind, pid, model) and per (pid, model). `nudge(kind, pid, model,
+  base_score)` = base + (Thompson draw - 0.5) x 2 x `MAX_NUDGE` (1.0),
+  drawn from the kind posterior once it holds >= 3 observations, else the
+  model's global one, else the prior Beta(1,1) (0 on average).
+  `propensity_note` -> `{alpha, beta, n, source: kind|model|prior}`.
+  Evidence decays toward the prior with a 7-day half-life (`HALF_LIFE`).
+- `reward(kind, pid, model, value)`: value in {0, 0.5, 1}, else ignored.
+  QUALITY ONLY: a 429, an abandoned swarm/hedge member, a client that went
+  away or a deadline cut is never rewarded (not even 0).
+- Tool turns: `remember_tool_calls(ids, pid, model, kind)` (LRU 5000, TTL
+  2 h) + `credit_from_messages(messages, grade)` rewards
+  `grade(tool_message)` once per remembered role "tool" `tool_call_id`
+  (None = skip, retried later); the repeating history never credits twice.
+- `stats(limit)`, `save(force=False)` / `load()` (json, atomic replace,
+  autosave <= 1 per 30 s; missing/corrupt file -> empty), `default` (in
+  memory) and `configure(path)` to point it at a file.
+
+## Verifier and corrector (verify.py)
+
+Owner-approved design (Sakana Trinity-style ACCEPT/REVISE): an independent
+VERIFIER from a DIFFERENT model family checks a producer's proposed next
+message; on REVISE a CORRECTOR writes the fixed one. `verify.py` is the pure
+half (stdlib + `ctxwin` only, no model call, no app import); app.py decides
+when to verify and dispatches. Covered by `tests/test_verify.py`.
+
+- `family(model_id)`: vendor family in any spelling (relay/host prefixes,
+  `:free`/`-free`, Ollama tags, case): kimi, glm, qwen, deepseek, gemini,
+  gemma, llama, mistral, claude, gpt, gpt-oss, minimax, mimo, nemotron, grok,
+  cohere, phi, else `unknown:<identity>` (each unknown its own family).
+  Ordered patterns resolve two-vendor names (nemotron before llama, claude
+  before gemini for g4f's `gemini-claude-opus-*`, deepseek before a distill's
+  base). `identity()` mirrors `app._normalize_model_identity` (test-pinned).
+- `pick_verifier(producer, candidates)` -> `(pid, model)` or None: other
+  family > other model > other provider > score; never the producer itself.
+- `is_risky(tool_calls, difficulty, observed_pass=None)` (`tool_calls` may
+  be the call list, the whole assistant message, or its text): hard turn +
+  a writing/editing/patching/deleting/running call (name words AND argument
+  shapes incl. opencode camelCase); a plainly read-only shell command (`ls`,
+  `cat`, `git status`, no redirect / `$(...)`) and an editor `view` are NOT
+  risky. Or, on any non-`simple` turn, text claiming done/fixed/tests pass
+  while `observed_pass` is not True (hedged plans and "N failed" reports are
+  not claims).
+- `digest(messages, proposed)`: system contract + ONE user message (last real
+  instruction via `ctxwin.is_real_instruction`, last 2 tool results, the
+  proposal), head+tail clipped by weighted water-filling to
+  `DIGEST_MAX_CHARS` (20000). Dispatch with `VERIFY_MAX_TOKENS` (300).
+- `parse_verdict(text)`: fenced / prose-wrapped / lenient JSON,
+  `"verdict": "ACCEPT"|"REVISE"`, bare `REVISE: ...`; unparseable = ACCEPT
+  with `unparsed: True` (fail open).
+- `corrector_messages(messages, proposed, verdict)`: original conversation +
+  the proposal + a user note (`CORRECTOR_NOTE_HEADER`) listing the problems.
+  A tool-call proposal stays a native `tool_calls` message, each call answered
+  by a tool message `NOT_EXECUTED_TEXT` — providers 400 on calls left without
+  results.
+
+## Pipelines verify and search (2026-10-04)
+
+Owner-approved (Sakana Trinity / Conductor / AB-MCTS adapted, no training).
+Covered by `tests/test_pipeline_verify_and_search.py`. swarm.py, crews.py and
+swarm_windows.py never import verify.py: every capability is an INJECTED
+kwarg whose default is the old behaviour.
+
+- **Reviewer family** (`swarm.run(family=)`, `crews.run(family=)`):
+  `family(who) -> str`, called with the dispatch's `"pid/model"`; default
+  `swarm.default_family` (last path segment's leading letters: kimi, llama,
+  qwen). The free review gets `avoid_families=(<producer families>)` next to
+  `exclude_pids` -- ONLY when `family` was injected or the dispatch NAMES the
+  keyword (`_pipeline_bound`'s `**kw` does not count: it would forward it to a
+  `_swarm_dispatch` that rejects it). **app.py must**, before passing
+  `family=`: accept `avoid_families=()` in `_swarm_dispatch` (the review is
+  the only caller; fast_dispatch never gets it) and PREFER candidates whose
+  family is not in it (tail, never exclude, never fail for it). Result `review_family` = {producers, reviewer, distinct,
+  hinted} when a free reviewer answered (not for a manager review).
+- **Crews**: write/design carry `"revise_on": "high"` (max_revisions stays 0)
+  and their reviewers add `"severity": "high"|"medium"|"low"` (`_SEVERITY_RULE`);
+  `swarm.review_severity` reads a top-level field, per-problem objects or a
+  "[HIGH] ..." tag. HIGH -> ONE revision (the same `_free_revision` /
+  directed fix); medium/low/none -> synthesis only. code/research unchanged.
+  `swarm.review_problems` turns object problems into text.
+- **Multi free verdict** (`swarm_windows.start/resume/resume_interrupted(
+  free_verdict=)`, not persisted, like the manager): no manager, a finished
+  phase with NO observed PASS and no outstanding FAIL, and a risky outcome
+  (`_risky_outcome`: claims checks pass with none observed, admits it is
+  incomplete, or changed source files with no check run) -> ONE call
+  `free_verdict(brief)`; `brief` is a dict (run_id, goal, phase, title, task,
+  done_when, acceptance, summary, changed_files, observed, reason, `text` = the
+  manager's verdict brief). Expected reply `{"ok", "problems", "severity"}`
+  (verify.parse_verdict); not ok + high/critical -> the existing one revision;
+  anything else, None or an exception -> unchanged. `agent.free_check` is
+  persisted (row `free_check`).
+- **Wider or deeper** (`search=` on swarm.run / crews.run / start / resume /
+  resume_interrupted; None = off; True = a fresh `swarm.Search`; a Search
+  instance for tests): only where a scorer exists. Swarm: a phase the free
+  checks reject (`_cheap_problems` count, 0 = accepted) -- in `_verify_set`
+  step A instead of the one retry, and after each wave without a manager.
+  Multi: an outstanding observed FAIL (`_observed_score` = failed tests).
+  Each extra attempt is WIDER (swarm: fresh phase prompt, every tried
+  provider excluded; Multi: fresh session, and `sibling_sessions` names the
+  worker's own past sessions while `agent.widen`, so app's existing rotation
+  picks another model) or DEEPER (swarm: `_retry_msgs` on the best attempt,
+  no exclusion; Multi: the SAME session continues), by Thompson sampling on
+  Beta(1,1)-seeded per-run posteriors (success = strictly better score).
+  Cap `SEARCH_MAX_EXTRA` = 2; past the first (today's one retry/revision) an
+  attempt needs `SEARCH_MIN_SECONDS` (45) on the swarm clock / the phase's
+  AGENT_TIMEOUT room (`_search_time_ok`). The best attempt is never replaced
+  by a worse one; a Multi search attempt that produces nothing leaves the
+  earlier one standing. Records (phase, attempt, choice, success,
+  score_before/after, accepted, forced, at) -> swarm `result["search"]`,
+  Multi run row `search` (persisted; a resume re-seeds from its log).
+  A manager judgement is not a scorer: it keeps the single revision.
+
+## Roles instead of racing (2026-10-04)
+
+Covered by `tests/test_tool_turn_roles.py`. MEASURED hub.log 2026-09-26..10-04:
+the swarm/crew*/multi tool-turn race sent one turn to 3.72 models, 4.02
+upstream calls per served answer, 75% of member calls (2897/3857) served
+nothing, each resending the whole prompt, and caused the hub's own 429s.
+Owner: "each model must do something -- collaboration, not racing."
+
+- **Switch**: flag `tool_turn_race` (default OFF). Off, `_swarm_tool_result`
+  (every protocol: `_swarm_tool_turn`, `_swarm_for`) returns
+  `_tool_turn_roles(body)`; on, the old race below it runs unchanged. Same
+  contract: (data, headers) or None -> the caller falls back to `best`.
+  `tests/conftest.py` `_RACE_TESTS` pins the race for the tests written
+  against its member grace / labels / ranking.
+- **Actor**: ONE model = the router's pick (`force_difficulty="hard"`), then
+  the chain (`_build_chain`, subs dropped) walked with `_ChainClock.walk`
+  (tool demotion, relay caps), <= `_ROLE_MAX_ACTOR_HOPS` (4), non-streamed
+  (`_dispatch_chat_with_deadline`), each call on its own hop token
+  (`_role_start_leg`). A failed hop = 429/5xx/exc/empty/junk, an INVALID tool
+  call (`_swarm_tool_calls_valid`), a refusal / no-tools claim / typed call /
+  announcement (`_role_judge`, the race's member checks). A clean text final
+  answer is served. Budget: stream `_SWARM_TOOL_STREAM_DEADLINE` (180 s),
+  else `_SWARM_TOOL_HOP_DEADLINE`, never past the request clock (started
+  here, so the fallback shares it).
+- **Stall backup** (`_ChainClock.plan_tool_hedge` / `tool_hedge_partner` /
+  `fire_tool_hedge`, flag `hedge_tool_turns`): ONE extra actor per turn, on
+  another provider first (the trivial hedge's partner rule minus
+  `_swarm_member_sick`), after `_tool_hedge_delay` = max(6 s, 3.5 x the
+  pair's `_tool_ttft` p50; 45 s unmeasured). Every successful role call adds
+  its duration to `_tool_ttft`. First valid answer wins; the other leg's
+  token is cancelled (its call is cut and files nothing).
+- **Verifier** (`verify` module, lazy `_verify()`): only when
+  `verify.is_risky(<whole assistant msg>, real difficulty, observed_pass=
+  _observed_pass(messages))` (evidence.classify on command tool results).
+  `verify.pick_verifier(producer, [(pid, model, score)])` over healthy chain
+  entries (`_role_candidates`), one non-streamed call, `VERIFY_MAX_TOKENS`,
+  `_no_craft`, <= `_VERIFY_DEADLINE` (25 s). Any error / timeout / unparsed
+  verdict (`"unparsed": True`) = fail-open, ship the original, no reward.
+- **Corrector**: only on ok=false + severity "high", ONE call to the best
+  other actor (another identity) with `verify.corrector_messages` sent as-is;
+  a tool step must pass `_swarm_tool_calls_valid`, prose only replaces prose,
+  else the original ships. Needs `_CORRECT_MIN_SECONDS` left.
+- **Max text** (`_max_text_review`, all three non-stream success points):
+  model best/max, difficulty hard, no tools, non-streamed -> the same
+  verifier/corrector. Never on streamed or Normal turns. Kill switch for both:
+  flag `turn_verifier` (default on).
+- **Bandit** (`bandit` module, lazy `_bandit()`; PyPI's `bandit` linter is
+  rejected by attribute check): `_task_kind` = bandit.task_kind(mode,
+  difficulty, tools, est). OWNER RULE: nudge <= `_NUDGE_CAP` (1.0) and ONLY
+  among candidates within `_AUTO_TOP_BAND` (2.0) of the best available score
+  (`_band_scores`: a nudged member never drops under the band floor):
+  `_auto_top_band(kind=)` (auto + Multi worker pick, after
+  `_rotate_within_run`), `_swarm_rank` (`_nudge_in_band`), verifier/corrector
+  pools. Never for `_is_low_quality`; never touches floors or the blocklist.
+  Rewards (quality only, never 429/5xx/timeout/hub-cut/client-gone): verifier
+  ok 1, revise 0.5, junk/invalid/prose-instead-of-action 0. Every served tool
+  call -> `remember_tool_calls`; each /v1 request (chat, responses, messages)
+  starts with `_bandit_credit(messages)` -> `credit_from_messages(messages,
+  _make_bandit_grade(messages))`: observed PASS 1.0, FAIL 0.5, else an error
+  marker 0.5 / clean 1.0. `bandit.configure(state_dir()/task-bandit.json)` at
+  BOOT only (`_bandit_boot`).
+- **Log**: one row per role turn in `state_dir()/turn-roles.jsonl` (rolled to
+  `.1` at 5 MB; kind, actor, nudge, hedge, verifier, verdict, severity,
+  corrector, corrected, served, calls, input/sent tokens, latency, failed
+  hops, invalid) + `{"event": "credit"}` rows. `scripts/role_eval.py` compares
+  it with hub.log's `[swarm-tools]` race lines, offline.
+- **Activity / headers**: crew "swarm (roles)" / "max (verified)", chips
+  "actor", "actor: HTTP 429", "backup (stall)", "verifier: ok|revise",
+  "corrector", "corrector: kept the original (...)"; header
+  `X-Free-LLM-Hub-Roles: actor_hops=;backup=;verifier=;corrected=;calls=`.
+- **Pipeline helpers** (wired by the pipelines after merge):
+  `_swarm_dispatch(..., avoid_families=())` / `_swarm_fast_dispatch` put
+  candidates whose `verify.family` is listed at the BACK of the stage chain
+  (`_avoid_families_last`; never excluded, no-op without verify);
+  `_verify_family()` -> `verify.family` or None; `_free_verdict(brief)` with
+  `brief["text"]` (+ optional `producer`, `avoid_families`) -> {"ok",
+  "problems", "severity"} or None (fail-open).
+
+## Model guides (weak and specific models) (2026-10-04)
+
+Owner: "make ANY model, even weak ones, work as well as possible". Covered by
+`tests/test_model_guides.py`. `model_guides.py` is pure (stdlib, never imports
+app, never raises); not wired into routing yet -- the caller passes
+`verify.family` as `family`.
+
+- **Files** `model_guides/<family>.md`, each <= 1200 chars of bullets ("Do X.
+  Never Y."), `<!-- evidence: ... -->` comments first (stripped before use),
+  optional `## any` / `## tools` / `## answer` sections picked by `task_kind`
+  (a chat answer is never told how to call tools). A family gets a file ONLY
+  with evidence. hub.log 2026-09-12..10-04 + measured code notes:
+  deepseek (8 canary junk, 13 stream-gate cuts, 3 junk-benchings, 8 duplicate
+  tool calls, DSML markup as text, invented apply_patch shapes), glm (ran on
+  past the answer into other scripts and `</arg_value>`, 3 identical bash
+  calls, junk-bench), kimi (4 canary misses narrating "The user is asking...",
+  `<|close|>!!!` template junk, native call markup as text), minimax (narrated
+  canary, tool JSON leaked into the text channel), gemini (5 cut-number canary
+  misses: hidden reasoning ate the budget). No file for qwen / llama / gemma /
+  mistral / claude / gpt / nemotron / gpt-oss: no behaviour evidence (their
+  log failures are 429s, timeouts, relay empties, or hub-side context sizing).
+- `weak.md` (generic scaffolding) and `strong.md` (two lines: do not
+  over-instruct). `guide_for(model_id, family, score, task_kind)` = "MODEL
+  GUIDE" + family guide + (weak.md if `is_weak(score)` else strong.md),
+  trimmed to `GUIDE_MAX_CHARS` (1500) on whole lines, family lines first. The
+  caller's family name is normalised (z-ai -> glm, moonshot -> kimi...); when
+  it names nothing with a file, builtin id patterns try (gemma never reads as
+  gemini). Reads cached per mtime.
+- **`WEAK_SCORE` = 120**: every owner floor >= 133, Arena newcomers capped at
+  134.5, category evidence from 130 -- the strong band; under it the family
+  tiers (S 100, A 84, B 56, llama 44, C 26, unknown 10). arena.py maps 120 to
+  Arena ~1445 (minimax-m3 "~120 by strength" and claude-haiku-4.5 under it).
+  Unknown / unreadable score = weak (a missing guide costs a failed turn).
+- `scaffold(score, task_kind)`: weak only -> `max_step_scope` "one file or one
+  function", `always_verify`, `context_budget_tokens` 12000
+  (`STREAM_BIG_REQUEST_TOKENS`) or 8000 under the medium floor 50 (8K-cap
+  hosts), `temperature` None (the cards disagree: Gemini 3 loops below 1.0,
+  Qwen3.8 instruct 0.7, GLM-4.7 agentic 0.7), a kind-specific `checklist`.
+  `sampling_for(model_id, task_kind)` returns a model card's sampling ONLY for
+  the version that card covers (DeepSeek-V4, GLM-4.7, Kimi-K2.6,
+  MiniMax-M2.7, Gemini 3, Qwen3.8; fetched 2026-10-04), else {}.
+- **ECC** (github.com/affaan-m/ecc, MIT, (c) Affaan Mustafa; ideas adapted in
+  our own words, nothing vendored or fetched at runtime). Adopted into the
+  guides: fix incrementally and verify each fix; cheapest check first, a
+  failing build stops the loop; keep a weak model's working context well
+  inside its window. Already in the hub: plan first (`craft.PLAN_PHASES`,
+  plan_check.py), verify loop (`craft.VERIFY_RUN`), read code before changing
+  it / never swallow errors (`craft.PROGRAMMING`), security brief, fresh-eyes
+  reviewer (swarm / crews), session memory and learned facts
+  (`memory.harvest_facts`), context compaction (ctxwin), cost-aware routing
+  (difficulty tiers). Skipped: per-language rule packs (context tax on every
+  turn, no hub evidence per language), TDD with an 80% coverage target and
+  file/function size limits (over-instructs strong models, not evidenced
+  here), repository-pattern / API-shape conventions (architecture taste, not
+  model reliability), harness hooks and AgentShield (client-side, not
+  something a model guide can do).
+
+## No AI slop: prevented in planning, checked in output (2026-10-04)
+
+Owner: "In web design: no AI slop, no AI watermark/tells -- perfect. And slop
+must be prevented from the BEGINNING, in planning and in designing the
+architecture, not only caught at the end." Covered by `tests/test_slopcheck.py`
+(every rule both ways + the false positives each was tuned against).
+
+- **`slopcheck.py`** (pure, stdlib, no model call). `check_design(text,
+  request="")` before code, `check_files(paths_or_texts, kind=None)` on output
+  (HTML/CSS/JSX/TSX/Vue/MD; node_modules, vendor and `*.min.*` skipped). A
+  finding is `{rule, severity, where ("file:line" | "design"), why, fix}`.
+  `contrast_ratio` is WCAG 2.x (translucent text composited first);
+  `summary` scores each rule once (high 15 / medium 7 / low 2, +3/+1/0 per
+  repeat, max 4).
+- **Output rules**: placeholder (lorem; "Your Company" only as a NAME --
+  copyright line, alone on a line, "... Name"; John Doe; @example.com; 555 and
+  01 23 45 67 89; "Feature 1/2" needs two numbers), ai_credit (built/made with
+  an AI tool, generated/written by, generator meta: AI tool high, Hugo-style
+  low; "Powered by AI" and "made by Claude" are left alone), no_viewport (whole
+  documents only), img_alt (missing high; empty alt medium only on a
+  content-named image), contrast (colour + background in the SAME rule, var()
+  from :root; gradients, translucent backgrounds, placeholder/disabled
+  skipped), ai_gradient (a violet stop with blue/pink partners and no warm
+  stop; Tailwind from/via/to; high on hero/body/header), outline_none (unless a
+  :focus rule replaces it), no_focus_styles (low), ai_copy, fake_proof (round
+  stat with no source marker; LLM-favourite testimonial names / fake
+  companies, never "Sarah M."), emoji_icons (2+ at the start of nav / button /
+  li / heading text or `icon:`; check, star, close glyphs excluded),
+  dead_link (`href="#"`), fixed_width (>= 600px outside media queries without
+  max-width), identical_cards (>= 3 card-grid sections, >= 60% of >= 4),
+  centered_everything, generic_fonts (EVERY text family Inter/system),
+  glassmorphism (blur on 3+ elements), reduced_motion (3+ animation signals or
+  an animation library, no prefers-reduced-motion).
+- **Design rules**: HIGH = default_gradient (not when the request names the
+  colour), vague_style (2+ adjectives, no hex, no face), no_palette (< 2 colour
+  values and no "existing palette / brand colours / stylesheet"),
+  no_type_pairing (no face, no system stack). MEDIUM = one face only,
+  slop_font (WEB_DESIGN's ANTI faces unless requested), stock_skeleton (hero +
+  3 stock sections, no reason word), no_layout_concept, no_copy_source.
+  Negations ("no purple gradient", "avoid Inter, Poppins") rule a mention out.
+- **Planning** (`plan_check`): `normalize_design` keeps `design["visual"]`
+  ("palette: ...", type, layout, motion, copy, look; from `{"visual": {...}}`
+  or top-level keys; idempotent); `render_design` puts it FIRST so a clip never
+  cuts it; `design_line` adds "visual decisions". `check_plan` step 6: a web
+  BUILD (`craft.is_web_ui(goal)`, 2+ phases or a design, not a fix-only goal,
+  web_design skill on) runs `check_design(design_text(design, phases),
+  request=goal)`: high -> `design_slop` "replan" (the EXISTING one re-ask;
+  `replan_ask` adds each fix and where the look goes), the rest -> warnings on
+  the "Plan check:" line. Non-web goals are untouched.
+- **Single sessions** (`craft`): `DESIGN_FIRST` (479 chars) ships on
+  web_design turns after PLAN FIRST (tools) / before VERIFY_READ (tool-less):
+  hex palette, a named pairing, layout + why, motion + reduced-motion fallback,
+  real copy or [NEEDS INPUT]; a helper given a shared DESIGN uses it.
+  WEB_DESIGN +353 chars (pairing replaces "one family", hex + 4.5:1, viewport /
+  max-width / alt, focus-visible, placeholder and credit tells), part-funded by
+  tightening three lines. Ceiling 0.13 -> 0.135 once (heaviest 13.27%).
+- **Wired (`tests/test_slop_wiring.py`)**: (1) `swarm_windows.plan_system(goal,
+  managed)` appends `_WEB_PLAN_ASK` (~110 tokens: the `design.visual` shape) for
+  a web/UI goal only (`craft.is_web_ui`, web_design skill on); other goals get
+  the base prompt byte-for-byte. (2) crew-design's `plan_system` / `phase_system`
+  carry `craft.DESIGN_FIRST` (one text; stripped when the skill is off) and its
+  profile has `slop_check: True`. (3) Output: `verify.slop_report` /
+  `slop_problems` / `html_blocks` / `read_web_files` (lazy slopcheck, <= 40
+  files, <= 1 MB each, never raises). Multi: `_verify_and_revise` scans the web
+  files the phase CHANGED (`_slop_scan`); HIGH findings join the cheap problems
+  (the ONE revision, no model call), the rest stay warnings in `agent.slop`
+  (`{line: "Slop check: N high, M medium", warnings, problems, ...}`, in the row,
+  the phase receipt and the saved run). A phase that wrote no web file is never
+  scanned. Prose swarm / crews: HTML in the final draft's code fences (crew-design
+  or a web brief) is scanned before the revision decision; HIGH findings are
+  problems and earn the one bounded revision even on a "ship" verdict; the line
+  rides on `result["slop_check"]`. Still open: app.py's verifier/corrector does
+  not call `verify.slop_problems` yet (agent G).
+
+## How the pieces are wired (2026-10-04)
+
+Covered by `tests/test_wiring_roles_guides_pipelines.py`.
+
+- **`tool_turn_race`** (default off): roles instead of racing, see above.
+- **`pipeline_search`** (default on): `_pipeline_check_kwargs()` -> `family=
+  _verify_family()` + `search=True` for `swarm.run` / `crews.run` (the
+  `_swarm_completion` call and the MCP crew runner); `_multi_check_kwargs()` ->
+  `free_verdict=_free_verdict` + `search=True` for `swarm_windows.start` /
+  `resume` / `resume_interrupted` (Multi turn, boot resume, the REST and MCP
+  starts). No `verify` module = no family / free_verdict; flag off = no search.
+- **`model_guides`** (default on): `_with_model_guide` runs inside
+  `_upstream_chat` (per HOP, after `_apply_craft_brief`, so it follows the model
+  that answers; never for `_no_craft` pipeline-stage calls). `_model_guide_text`
+  = `model_guides.guide_for(model, verify.family, _benchmark_score, "tools"|
+  "answer")`; a weak model also gets the scaffold (step scope, context-budget
+  hint, checklist), total <= 1500 chars. Multi workers are CLI sessions whose
+  model is picked per hop, so scaffolding rides this hop path, not the phase
+  prompt. A weak actor (`_model_is_weak`) is always verified in
+  `_role_verify_and_correct`. Routing is untouched.
+- **`turn_verifier`** (default on): kill switch for verifier + corrector.
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):

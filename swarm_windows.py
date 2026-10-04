@@ -387,6 +387,31 @@ Reply with JSON only:
 # final message must contain, and how it will be judged. Only the managed
 # planner is asked for these -- the free planner keeps the prompt it has always
 # had, so a hub with no manager plans exactly as before.
+# WEB / UI GOALS ONLY (owner, 2026-10-04: slop prevented from the BEGINNING):
+# the look is decided in the plan's design, so the first plan already passes
+# slopcheck.check_design instead of spending its one re-ask. Not in the base
+# prompts -- a non-web goal's prompt is byte-identical to before.
+_WEB_PLAN_ASK = """
+WEB/UI GOAL: "design" must also carry "visual", chosen for THIS product (no defaults):
+"visual": {"palette": ["#hex role", ...4-6, text >=4.5:1], "type": "display face + body face",
+ "layout": "the composition and why this product needs it, not hero+3 cards+CTA",
+ "motion": "what moves + reduced-motion fallback", "copy": "where the real words come from"}.
+"""
+
+
+def plan_system(goal, managed=False):
+    """The planner's system prompt for `goal` ({modes} still unfilled): the
+    base prompt, plus the visual-decision ask for a web/UI goal."""
+    base = _PLAN_SYSTEM_MANAGED if managed else _PLAN_SYSTEM
+    try:
+        import craft
+        if craft.skill_enabled("web_design") and craft.is_web_ui(goal or ""):
+            return base + _WEB_PLAN_ASK
+    except Exception:                                            # noqa: BLE001
+        pass
+    return base
+
+
 _PLAN_SYSTEM_MANAGED = _PLAN_SYSTEM.replace(
     "Reply with JSON only:",
     """- The agents are weaker models than you: be explicit. For each phase also give
@@ -630,7 +655,7 @@ class _Agent:
                  "inputs", "constraints", "output_format", "acceptance",
                  "verified", "problems", "revisions", "past_sessions",
                  "event_total", "evidence", "reviewed", "claimed_unobserved",
-                 "receipt", "files")
+                 "receipt", "files", "free_check", "widen", "slop")
 
     def __init__(self, index, phase):
         self.index = index
@@ -662,6 +687,17 @@ class _Agent:
         # rows, oldest first, capped at EVIDENCE_MAX) and the receipt file.
         self.evidence = []
         self.receipt = None
+        # The ONE free verdict this phase may get without a manager
+        # ({ok, severity, problems, reason}, or {asked, answered: False});
+        # None = never asked. Persisted.
+        self.free_check = None
+        # The slop check of the web files this phase wrote ({line, high, medium,
+        # low, warnings, problems}); None = no web file written. Persisted.
+        self.slop = None
+        # True only while a WIDER search attempt runs: sibling_sessions then
+        # names this worker's own earlier sessions, so the hub picks another
+        # model. Not persisted.
+        self.widen = False
         self.problems = []
         self.revisions = 0
         self.session_id = None
@@ -700,6 +736,8 @@ class _Agent:
             "evidence": [dict(e) for e in self.evidence],
             "receipt": self.receipt,
             "check": check_of(self),
+            "free_check": dict(self.free_check) if isinstance(self.free_check, dict) else None,
+            "slop": dict(self.slop) if isinstance(self.slop, dict) else None,
         }
         if with_events:
             out["log"] = list(self.events)
@@ -717,11 +755,12 @@ class _Run:
                  "error", "created_at", "ended_at", "stop_flag", "lock", "waves",
                  "restored", "interrupted", "store_root", "owner",
                  "manager", "managed", "modes", "manager_tokens", "manager_calls",
-                 "context", "resumes", "default_mode", "design", "plan_check")
+                 "context", "resumes", "default_mode", "design", "plan_check",
+                 "free_verdict", "search", "search_saved")
 
     def __init__(self, goal, project_dir, cli_id, phases, owner=None,
                  manager=None, modes=(), context="", default_mode=None,
-                 design=None, check_report=None):
+                 design=None, check_report=None, free_verdict=None, search=None):
         self.id = "swarm-" + uuid.uuid4().hex[:12]
         self.goal = goal
         # THE DESIGN the plan carried (plan_check.normalize_design; {} for a
@@ -783,6 +822,15 @@ class _Run:
         # budget is global, and "what did this job cost me" is per job.
         self.manager_tokens = 0
         self.manager_calls = 0
+        # THE FREE VERIFIER (no manager): `free_verdict(phase_brief) ->
+        # {"ok", "problems", "severity"} | None`, injected like the manager
+        # and, like it, not persisted. None = no free verdict, as before.
+        self.free_verdict = free_verdict if callable(free_verdict) else None
+        # WIDER OR DEEPER (swarm.Search, or None = off): the run's Thompson
+        # posteriors and every choice's outcome. `search_saved` is a restored
+        # run's record ({posteriors, log}) until a resume re-attaches a policy.
+        self.search = search
+        self.search_saved = None
 
     def charge(self, tokens):
         with self.lock:
@@ -801,6 +849,8 @@ class _Run:
             "context": self.context, "resumes": self.resumes,
             "design": dict(self.design or {}),
             "plan_check": dict(self.plan_check) if self.plan_check else None,
+            "search": (self.search.snapshot() if self.search is not None
+                       else self.search_saved),
             "error": self.error, "created_at": self.created_at,
             "ended_at": self.ended_at,
             "waves": [list(w) for w in self.waves],
@@ -855,7 +905,14 @@ class _Run:
         # least its planning call.
         run.managed = bool(row["managed"]) if "managed" in row \
             else run.manager_calls > 0
+        saved = row.get("search")
+        if isinstance(saved, dict) and isinstance(saved.get("log"), list):
+            run.search_saved = {"posteriors": saved.get("posteriors") or {},
+                                "log": [r for r in saved["log"] if isinstance(r, dict)]}
         for agent, a in zip(run.agents, row.get("agents") or ()):
+            agent.free_check = a.get("free_check") if isinstance(a.get("free_check"), dict) \
+                else None
+            agent.slop = a.get("slop") if isinstance(a.get("slop"), dict) else None
             agent.verified = a.get("verified")
             agent.reviewed = bool(a.get("reviewed"))
             agent.claimed_unobserved = bool(a.get("claimed_not_observed"))
@@ -1415,7 +1472,8 @@ def _write_phase_receipt(run, agent, before):
             started_at=agent.started_at, ended_at=agent.ended_at, number=agent.index,
             extra={"run_id": run.id, "phase": agent.index, "title": agent.title,
                    "session_id": agent.session_id, "phase_state": agent.state,
-                   "verified": agent.verified, "reviewed": bool(agent.reviewed)})
+                   "verified": agent.verified, "reviewed": bool(agent.reviewed),
+                   "slop": agent.slop})
         if path:
             agent.receipt = path
     except Exception:                                            # noqa: BLE001
@@ -1480,6 +1538,35 @@ def _acceptance_files(text):
     return found[:20]
 
 
+SLOP_REVISION_MAX = 8
+
+
+def _slop_scan(run, agent, changed):
+    """The slop check (slopcheck via verify, no model call) of the web files
+    this phase wrote: sets agent.slop and returns the HIGH findings as
+    problems for the phase's one revision. Medium/low stay warnings in
+    agent.slop. A phase that wrote no web file is never scanned; any failure
+    means no findings."""
+    try:
+        import craft
+        import verify
+        if not craft.skill_enabled("web_design"):
+            return []
+        docs = verify.read_web_files(run.project_dir, changed)
+        if not docs:
+            agent.slop = None
+            return []
+        rep = verify.slop_report(docs)
+    except Exception:                                            # noqa: BLE001
+        return []
+    c = rep["counts"]
+    agent.slop = {"line": rep["line"] or "Slop check: clean", "high": c["high"],
+                  "medium": c["medium"], "low": c["low"], "score": rep.get("score"),
+                  "files": len(docs), "warnings": list(rep["warnings"])[:SLOP_REVISION_MAX],
+                  "problems": list(rep["high"])[:SLOP_REVISION_MAX]}
+    return list(rep["high"])[:SLOP_REVISION_MAX]
+
+
 def _cheap_problems(run, agent, outcome):
     """What is plainly wrong without asking anyone. [] when nothing is.
 
@@ -1530,11 +1617,10 @@ def _ask_manager(manager, system, user, purpose, max_tokens):
     return text, tokens, bool(text or tokens)
 
 
-def _manager_verdict(run, agent, changed):
-    """(problems, suggested mode, answered) from the manager. answered=False
-    when it had nothing to say -- no answer, over budget, unreadable. Fail-OPEN:
-    a verdict that cannot be read never fails a phase the cheap checks passed,
-    but it does not call the phase verified either."""
+def _verdict_brief(run, agent, changed):
+    """The lines a verdict is asked on: goal, phase, task, acceptance,
+    context excerpt, changed files, the OBSERVED checks and the final
+    message. The manager's and the free verifier's brief alike."""
     brief = ["Overall goal: " + (run.goal or "")[:600],
              "Phase %d: %s" % (agent.index, agent.title),
              "Task: " + agent.task[:1500]]
@@ -1563,6 +1649,15 @@ def _manager_verdict(run, agent, changed):
     if len(text) > VERIFY_TEXT_CHARS:
         text = text[:VERIFY_TEXT_CHARS] + "\n[...clipped]"
     brief += ["", "The agent's final message:", text]
+    return brief
+
+
+def _manager_verdict(run, agent, changed):
+    """(problems, suggested mode, answered) from the manager. answered=False
+    when it had nothing to say -- no answer, over budget, unreadable. Fail-OPEN:
+    a verdict that cannot be read never fails a phase the cheap checks passed,
+    but it does not call the phase verified either."""
+    brief = _verdict_brief(run, agent, changed)
     system = _VERIFY_SYSTEM.replace("{modes}", ", ".join(run.modes) or "coding")
     raw = _manager_call(run, system, "\n".join(brief), "verify", VERIFY_MAX_TOKENS)
     got = _extract_json(raw)
@@ -1577,6 +1672,121 @@ def _manager_verdict(run, agent, changed):
                          "re-check it against the task and acceptance"]), mode, True
 
 
+# --------------------------------------------------------------------------- #
+# Pipelines verify and search (2026-10-04): a FREE verdict without a manager,
+# and WIDER-or-DEEPER extra attempts where observed test counts score a phase
+# --------------------------------------------------------------------------- #
+
+FREE_VERDICTS_PER_PHASE = 1
+_HIGH_SEVERITY = ("high", "critical", "blocker", "severe")
+# A final message that admits the work is not complete.
+_INCOMPLETE_RE = re.compile(
+    r"\b(?:could\s*n[o']t|unable\s+to|not\s+(?:yet\s+)?implemented|todo|stubbed|"
+    r"placeholder|skipped|partially|left\s+out|did\s*n[o']t\s+(?:finish|complete)|"
+    r"still\s+failing|not\s+tested|untested)\b", re.I)
+_SOURCE_EXT_RE = re.compile(
+    r"\.(?:py|js|mjs|cjs|ts|tsx|jsx|go|rs|java|rb|php|c|cc|cpp|h|hpp|cs|swift|kt|"
+    r"scala|sh|ps1|html?|css|scss|vue|svelte|sql)$", re.I)
+
+
+def _risky_outcome(agent, changed):
+    """Why a finished phase that NO observed check settled deserves a free
+    verdict -- "" when nothing about it is risky (docs only, nothing claimed):
+    it claims tests/build pass with none observed, admits it is incomplete,
+    or changed source files while no check ran at all."""
+    summary = agent.summary or ""
+    if evidence.claims_checks_passed(summary):
+        return "claims checks pass, none observed"
+    if _INCOMPLETE_RE.search(summary):
+        return "says the work is incomplete"
+    if not agent.evidence and any(_SOURCE_EXT_RE.search(str(p)) for p in (changed or ())):
+        return "changed source files, no check ran"
+    return ""
+
+
+def _free_verdict_problems(run, agent, changed):
+    """Problems from the injected FREE verifier, or []. At most
+    FREE_VERDICTS_PER_PHASE per phase; asked only when observed evidence
+    decides nothing (an observed PASS = ok, an observed FAIL = the existing
+    revision) and the outcome is risky/claimed. Only a not-ok verdict of
+    HIGH severity is a problem; anything else -- ok, lower severity, no
+    answer, an exception -- leaves the phase as it was."""
+    fv = getattr(run, "free_verdict", None)
+    if fv is None or agent.free_check is not None:
+        return []
+    if evidence.passes(agent.evidence) or evidence.outstanding_failures(agent.evidence):
+        return []
+    reason = _risky_outcome(agent, changed)
+    if not reason:
+        return []
+    brief = {"run_id": run.id, "goal": run.goal, "phase": agent.index,
+             "title": agent.title, "task": agent.task, "done_when": agent.done_when,
+             "acceptance": agent.acceptance, "summary": agent.summary or "",
+             "changed_files": list(changed or ())[:VERIFY_FILES],
+             "observed": _observed_lines(agent), "reason": reason,
+             "text": "\n".join(_verdict_brief(run, agent, changed))}
+    try:
+        v = fv(brief)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[swarm] free verdict of phase %d raised: %s", agent.index, exc)
+        v = None
+    if not isinstance(v, dict):
+        agent.free_check = {"asked": True, "answered": False, "reason": reason}
+        return []
+    raw = v.get("problems")
+    raw = [raw] if isinstance(raw, str) else (raw if isinstance(raw, (list, tuple)) else [])
+    problems = [str(p).strip()[:300] for p in raw if str(p or "").strip()][:8]
+    severity = str(v.get("severity") or "").strip().lower()
+    ok = v.get("ok") is not False
+    agent.free_check = {"asked": True, "answered": True, "ok": ok, "severity": severity,
+                        "problems": problems, "reason": reason}
+    if ok or severity not in _HIGH_SEVERITY:
+        return []
+    return problems or ["a reviewer found a high-severity problem in this phase; "
+                        "re-check it against the task and acceptance"]
+
+
+def _observed_score(agent):
+    """The phase's observed-test SCORE: the failures still outstanding (a
+    check's failed-test count, at least 1 per failing check). 0 = nothing
+    observed failing -- the acceptance an extra attempt aims for."""
+    return sum(max(1, int(f.get("failed") or 0))
+               for f in evidence.outstanding_failures(agent.evidence))
+
+
+def _search_time_ok(agent, last_secs):
+    """An extra attempt past today's one revision only while the phase's own
+    budget (AGENT_TIMEOUT from its start) still holds one more attempt as
+    long as the last one took."""
+    began = agent.started_at or time.time()
+    return (time.time() - began) + max(0.0, last_secs or 0.0) <= AGENT_TIMEOUT
+
+
+def _deeper_attempt(run, agent, run_turn):
+    """DEEPER: the SAME worker -- its session, so its model and its whole
+    context -- continues with the problems to fix. Returns the outcome; the
+    caller publishes the state (hold semantics, like _attempts)."""
+    if run.stop_flag.is_set():
+        agent.state = STOPPED
+        return STOPPED
+    try:
+        summary = _drain(agent, run_turn(agent.session_id, _agent_prompt(run, agent)))
+    except Exception as exc:                                     # noqa: BLE001
+        agent.error = "%s: %s" % (exc.__class__.__name__, exc)
+        return FAILED
+    if agent.abandoned:
+        agent.summary = agent.summary or clean_summary(summary or "")
+        return FAILED
+    agent.summary = clean_summary(summary or "")
+    if run.stop_flag.is_set():
+        agent.state = STOPPED
+        return STOPPED
+    if not agent.summary:
+        agent.error = agent.error or "the agent produced no result"
+        return FAILED
+    return DONE
+
+
 def _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before,
                        managed=True):
     """Check the phase; on failure run it ONCE more with the problems as
@@ -1585,8 +1795,22 @@ def _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before,
 
     `managed` False (no manager): ONLY observed evidence is checked -- an
     empty or broken phase fails exactly as it did before, unretried; a phase
-    whose observed test/build run failed gets the same one revision."""
-    for round_ in range(REVISIONS + 1):
+    whose observed test/build run failed gets the same one revision. With a
+    FREE verifier (run.free_verdict) a phase no observed check settled and
+    whose outcome is risky/claimed gets ONE free verdict; not ok at HIGH
+    severity = the same one revision.
+
+    WIDER OR DEEPER (run.search): when the problems include an observed
+    failure (the scorer: _observed_score), each revision is either WIDER (a
+    fresh worker in a fresh session, its earlier sessions named to the hub so
+    it picks another model) or DEEPER (the same session continues), chosen
+    by Thompson sampling, and a second one may follow while the phase's time
+    budget holds (at most swarm.SEARCH_MAX_EXTRA). Without run.search, or
+    with no observed failure, the one revision runs exactly as before."""
+    policy = getattr(run, "search", None)
+    rounds = max(REVISIONS, policy.max_extra) if policy is not None else REVISIONS
+    last_secs = (time.time() - agent.started_at) if agent.started_at else 0.0
+    for round_ in range(rounds + 1):
         if run.stop_flag.is_set() or agent.abandoned or outcome == STOPPED \
                 or agent.state == STOPPED:
             if agent.state == RUNNING:
@@ -1599,10 +1823,13 @@ def _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before,
             _settle_checks(agent)
             return
         changed = _changed_files(before, run.project_dir)
+        slop = _slop_scan(run, agent, changed) if (outcome == DONE and agent.summary) else []
         if managed:
-            problems = _cheap_problems(run, agent, outcome)
+            problems = _cheap_problems(run, agent, outcome) + slop
         else:
-            problems = _observed_problems(agent)
+            problems = _observed_problems(agent) + slop
+            if not problems:
+                problems = _free_verdict_problems(run, agent, changed)
         mode, answered = None, False
         if not problems and managed:
             problems, mode, answered = _manager_verdict(run, agent, changed)
@@ -1618,7 +1845,9 @@ def _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before,
             _settle_checks(agent)
             return
         agent.problems = problems
-        if round_ >= REVISIONS:
+        scored = policy is not None and bool(evidence.outstanding_failures(agent.evidence))
+        if round_ >= REVISIONS and not (scored and round_ < rounds
+                                        and _search_time_ok(agent, last_secs)):
             break
         # THE REVISION: a fresh worker, told exactly what was wrong. A different
         # KIND of model when the manager named one that fits; otherwise the
@@ -1627,16 +1856,51 @@ def _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before,
             agent.mode = mode
         agent.revisions += 1
         previous = agent.summary
-        _retire_session(agent)
-        agent.error = None
-        agent.state = RUNNING
-        agent.last_event_at = time.time()
-        _persist(run)
-        outcome = _attempts(run, agent, spawn, run_turn, configure, hold=True)
+        choice, forced, score_before = None, False, 0
+        if scored:
+            score_before = _observed_score(agent)
+            choice = policy.choose()
+            if choice == "deeper" and not agent.session_id:
+                choice, forced = "wider", True       # no session left to continue
+        t0 = time.time()
+        if choice == "deeper":
+            agent.error = None
+            agent.state = RUNNING
+            agent.last_event_at = time.time()
+            _persist(run)
+            outcome = _deeper_attempt(run, agent, run_turn)
+        else:
+            _retire_session(agent)
+            agent.error = None
+            agent.state = RUNNING
+            agent.last_event_at = time.time()
+            _persist(run)
+            agent.widen = choice == "wider"
+            try:
+                outcome = _attempts(run, agent, spawn, run_turn, configure, hold=True)
+            finally:
+                agent.widen = False
+        last_secs = time.time() - t0
         if not agent.summary:
             # A revision that produced nothing must not erase what the first
             # attempt did say -- the review reads it.
             agent.summary = previous
+        if choice is not None:
+            if outcome == FAILED and previous and not run.stop_flag.is_set() \
+                    and not agent.abandoned:
+                # A SEARCH attempt that produced nothing improves nothing; the
+                # earlier attempt's work (on disk, its summary) still stands and
+                # is scored again -- not written off as a failed phase.
+                outcome = DONE
+                agent.error = None
+                agent.state = RUNNING
+            score_after = _observed_score(agent)
+            policy.note(choice, score_after < score_before, run_id=run.id,
+                        phase=agent.index, title=agent.title[:80], attempt=agent.revisions,
+                        score_before=score_before, score_after=score_after,
+                        accepted=score_after == 0, forced=forced,
+                        seconds=round(last_secs, 1))
+            _persist(run)
     if agent.state == STOPPED or run.stop_flag.is_set() or agent.abandoned:
         _settle_checks(agent)
         return
@@ -1959,7 +2223,7 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context="
 
     if manager is not None:
         try:
-            raw = manager(_PLAN_SYSTEM_MANAGED.replace("{modes}", mode_list),
+            raw = manager(plan_system(goal, True).replace("{modes}", mode_list),
                           _with_context(goal, context, MANAGER_CONTEXT_CHARS))
         except Exception as exc:                                 # noqa: BLE001
             _log.warning("[swarm] manager planner raised: %s", exc)
@@ -1970,7 +2234,7 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context="
         if raw:
             _log.warning("[swarm] manager plan unreadable (%d chars); free planner "
                          "takes over", len(raw))
-    system = _PLAN_SYSTEM.replace("{modes}", mode_list)
+    system = plan_system(goal).replace("{modes}", mode_list)
     goal = _with_context(goal, context, PLAN_CONTEXT_CHARS)
     ask = goal
     for attempt in range(1, PLAN_ATTEMPTS + 1):
@@ -2002,9 +2266,19 @@ def interrupted_runs():
                 if getattr(r, "restored", False) and getattr(r, "interrupted", False)]
 
 
+def _attach_checks(run, free_verdict=None, search=None):
+    """Re-attach the free verifier and the search policy on a resume (neither
+    survives a restart as a callable/object; the search's saved log seeds the
+    new policy). Absent kwargs leave the run as it is."""
+    if callable(free_verdict):
+        run.free_verdict = free_verdict
+    if search and run.search is None:
+        run.search = _search_policy(search, run)
+
+
 def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
                        max_age=RESUME_MAX_AGE, stop=None, manager=None, modes=None,
-                       should_resume=None):
+                       should_resume=None, free_verdict=None, search=None):
     """Pick up every run the last process left mid-way. Returns their ids.
 
     THE WORK GETS FINISHED. A run whose process died was marked failed and
@@ -2052,6 +2326,7 @@ def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
                 _retire_session(agent)
                 agent.started_at = None
                 agent.ended_at = None
+                agent.free_check = None
             run.state = PENDING
             run.error = None
             run.ended_at = None
@@ -2062,6 +2337,7 @@ def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
                 run.manager = manager
             if modes and not run.modes:
                 run.modes = tuple(modes)
+            _attach_checks(run, free_verdict, search)
         _persist(run)
         threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure, stop),
                          daemon=True, name="swarm-resume-" + run.id).start()
@@ -2098,16 +2374,25 @@ def worker_info(session_id):
 def sibling_sessions(session_id):
     """Session ids of the OTHER workers of the run `session_id` works for
     (those that have one yet), in phase order; [] when it is no worker.
-    Lets the hub give each worker a different strong model."""
+    Lets the hub give each worker a different strong model.
+
+    During a WIDER search attempt (agent.widen) the asking worker's OWN
+    earlier sessions are named too, after the others: "a fresh attempt by a
+    different model" through the hub's existing rotation, no new wiring."""
     if not session_id:
         return []
     with _LOCK:
         runs = list(_RUNS.values())
     for run in runs:
         agents = list(getattr(run, "agents", None) or ())
-        if any(a.session_id == session_id for a in agents):
-            return [a.session_id for a in agents
-                    if a.session_id and a.session_id != session_id]
+        me = next((a for a in agents if a.session_id == session_id), None)
+        if me is not None:
+            out = [a.session_id for a in agents
+                   if a.session_id and a.session_id != session_id]
+            if getattr(me, "widen", False):
+                out += [s for s in (getattr(me, "past_sessions", None) or ())
+                        if s and s != session_id and s not in out]
+            return out
     return []
 
 
@@ -2122,7 +2407,8 @@ def unfinished(run):
 
 
 def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
-           manager=None, modes=None, context=None, default_mode=None):
+           manager=None, modes=None, context=None, default_mode=None,
+           free_verdict=None, search=None):
     """Pick an ENDED run back up where it stopped. Returns the run id, or None
     when there is nothing to resume.
 
@@ -2156,6 +2442,7 @@ def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
             agent.reviewed = False
             agent.claimed_unobserved = False
             agent.revisions = 0
+            agent.free_check = None
         run.state = PENDING
         run.error = None
         run.ended_at = None
@@ -2171,6 +2458,7 @@ def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
             run.modes = tuple(modes)
         if default_mode:
             run.default_mode = default_mode
+        _attach_checks(run, free_verdict, search)
     _persist(run)
     threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure, stop),
                      daemon=True, name="swarm-continue-" + run.id).start()
@@ -2240,9 +2528,19 @@ def dry_run(goal, phases, design, project_dir, planner=None, modes=(), context="
     return fixed, design, report
 
 
+def _search_policy(search, run=None):
+    """The `search=` kwarg -> a swarm.Search (or None = off). A run read back
+    from disk keeps what it learnt: its saved log seeds the posteriors."""
+    if not search:
+        return None
+    import swarm                        # lazy: this module stays a leaf at import
+    saved = getattr(run, "search_saved", None) if run is not None else None
+    return swarm.make_search(search, log=(saved or {}).get("log"))
+
+
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
           on_done=None, configure=None, modes=(), review=True, owner=None, stop=None,
-          manager=None, context="", default_mode=None):
+          manager=None, context="", default_mode=None, free_verdict=None, search=None):
     """Begin a run. Returns the run id immediately; the work happens on a
     background thread.
 
@@ -2255,7 +2553,13 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
 
     `context` is the conversation this run continues (bounded to
     CONTEXT_CHARS): the planner, every worker and the manager's plan and
-    verdicts see it under its own heading. "" = the goal alone."""
+    verdicts see it under its own heading. "" = the goal alone.
+
+    `free_verdict(phase_brief) -> {"ok", "problems", "severity"} | None` is
+    the FREE verifier for a run with no manager (see _free_verdict_problems;
+    phase_brief is a dict whose "text" is the rendered brief). `search`
+    (True or a swarm.Search) turns on wider-or-deeper revisions where an
+    observed test run scores a phase. Both default to the run as before."""
     goal = str(goal or "").strip()
     if not goal:
         raise SwarmWindowsError("a goal is required")
@@ -2288,7 +2592,8 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
         _log.info("[swarm] %s", report.get("line"))
     run = _Run(goal, project_dir, cli_id, phases, owner=owner,
                manager=manager, modes=modes, context=context,
-               default_mode=default_mode, design=design, check_report=report)
+               default_mode=default_mode, design=design, check_report=report,
+               free_verdict=free_verdict, search=_search_policy(search))
     if meter:
         run.manager_tokens, run.manager_calls = meter.tokens, meter.calls
     _remember(run)

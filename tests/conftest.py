@@ -171,3 +171,58 @@ def _category_evidence_yields_to_patched_patterns(monkeypatch):
         return real_evidence(key, pid, model)
     monkeypatch.setattr(app, "_category_by_evidence", evidence)
     yield
+
+
+# Tests written against the old tool-turn RACE (best-of-N fan-out): its
+# member grace, its "doomed provider" cut, its winner labels, its ranking of
+# members. The race is still shipped -- flag `tool_turn_race` (default OFF
+# since 2026-10-04, see "Roles instead of racing" in AGENTS.md and
+# tests/test_tool_turn_roles.py) -- so these keep testing it, with the flag on.
+_RACE_TESTS = {
+    "test_client_disconnect_stops_work": {
+        "test_a_client_that_leaves_the_tool_fan_out_stops_every_member"},
+    "test_swarm_falls_back_instead_of_503": {
+        "test_the_fan_out_rejects_a_member_that_refuses",
+        "test_it_no_longer_waits_for_every_member",
+        "test_the_grace_starts_on_a_tool_call_or_a_checked_text_answer",
+        "test_a_member_that_raises_does_not_lose_the_others"},
+    "test_swarm_fanout_members": {
+        "test_members_of_a_provider_that_failed_this_race_are_not_waited_on",
+        "test_a_sick_pair_is_never_dispatched_end_to_end"},
+    "test_swarm_picks_models_that_answer": {
+        "test_the_fanout_ranks_its_candidates_instead_of_taking_chain_order"},
+    "test_swarm_stops_waiting": {
+        "test_a_close_second_still_gets_in",
+        "test_a_tool_call_inside_the_grace_still_wins_over_prose",
+        "test_a_member_the_hub_stopped_waiting_for_is_not_shown_as_no_answer"},
+    "test_swarm_tool_turns": {"test_among_equals_the_stronger_model_wins"},
+    "test_the_swarm_decides_how_wide": {"test_the_tool_path_passes_the_real_difficulty"},
+    "test_tool_turn_reliability": {"test_fan_out_members_see_the_clis_system_prompt"},
+    "test_tool_turn_timeouts": {
+        "test_a_tool_call_inside_the_grace_still_beats_an_earlier_text",
+        "test_a_minority_text_answer_keeps_the_tool_grace"},
+    "test_no_tools_claim": {"test_a_fan_out_member_claiming_no_tools_loses_its_slot"},
+}
+
+
+@pytest.fixture(autouse=True)
+def _race_tests_keep_the_race(request, monkeypatch):
+    mod = getattr(request.node, "module", None)
+    name = getattr(request.node, "originalname", None) or request.node.name
+    if mod is not None and name in _RACE_TESTS.get(mod.__name__.rsplit(".", 1)[-1], ()):
+        import app
+        monkeypatch.setattr(app, "_tool_turn_race_on", lambda: True)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _weak_models_not_force_verified(request, monkeypatch):
+    """Tests written with low fake scores (10-100) are about their own subject;
+    the "weak actor is always verified" wiring has its own test file."""
+    mod = getattr(request.node, "module", None)
+    if mod is not None and mod.__name__.rsplit(".", 1)[-1] == "test_wiring_roles_guides_pipelines":
+        yield
+        return
+    import app
+    monkeypatch.setattr(app, "_model_is_weak", lambda pid, model: False)
+    yield

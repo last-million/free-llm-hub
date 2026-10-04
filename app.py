@@ -21,6 +21,7 @@ Run:  python app.py    (PORT env overrides default 8787)
 
 import hashlib
 import hmac
+import importlib
 import base64
 import binascii
 import io
@@ -115,7 +116,7 @@ import memory
 hub_mcp.init(
     lambda messages, crew_name: crews.format_answer(
         crews.run(messages, _pipeline_bound(_swarm_dispatch), crew_name,
-                  **_swarm_manager_kwargs())),
+                  **_swarm_manager_kwargs(), **_pipeline_check_kwargs())),
     swarm={
         # The MCP surface is how a CLI drives the orchestrator -- opencode,
         # codex, claude and the rest all speak it, so one wiring reaches every
@@ -127,7 +128,7 @@ hub_mcp.init(
             configure=_swarm_windows_configure,
             stop=agentic_chat.stop_session,
             modes=_worker_mode_keys(),
-            **_swarm_windows_manager_kw()),
+            **_swarm_windows_manager_kw(), **_multi_check_kwargs()),
         "status": lambda run_id, events=False: swarm_windows.status(run_id, events),
         "stop": swarm_windows.stop,
     })
@@ -8221,15 +8222,174 @@ _AGENTIC_PICK_TEMPERATURE = 5.0  # score points at which weight roughly e-folds
 _AUTO_TOP_BAND = 2.0
 
 
-def _auto_top_band(pool, sustain_override=None):
+# --------------------------------------------------------------------------- #
+# Task bandit + cross-family verifier: optional modules, imported LAZILY
+# --------------------------------------------------------------------------- #
+# `bandit` (learned per-task-kind nudge) and `verify` (cross-family verifier)
+# are separate modules; app.py runs unchanged without them. A missing module
+# is re-probed at most every _OPTIONAL_MODULE_RETRY seconds (a failed import
+# is not cached by Python and costs a path search per call on the routing hot
+# path); a module already in sys.modules -- a test's fake -- is used at once.
+# The name check matters: PyPI's security linter is also called `bandit`.
+_OPTIONAL_MODULE_RETRY = 60.0
+_optional_module_miss = {}
+
+
+def _optional_module(name, required):
+    m = sys.modules.get(name)
+    if m is None:
+        missed = _optional_module_miss.get(name)
+        if missed is not None and time.monotonic() - missed < _OPTIONAL_MODULE_RETRY:
+            return None
+        try:
+            m = importlib.import_module(name)
+        except Exception:                                        # noqa: BLE001
+            _optional_module_miss[name] = time.monotonic()
+            return None
+    if not all(hasattr(m, a) for a in required):
+        return None
+    return m
+
+
+def _bandit():
+    """The task-bandit module, or None (absent / not ours)."""
+    return _optional_module("bandit", ("task_kind", "default"))
+
+
+def _verify():
+    """The cross-family verifier module, or None."""
+    return _optional_module("verify", ("pick_verifier", "parse_verdict", "digest"))
+
+
+def _evidence():
+    """The observed-evidence module (evidence.py), or None."""
+    return _optional_module("evidence", ("classify",))
+
+
+# OWNER RULE (2026-10-04): "always prioritize the best AVAILABLE models first;
+# we already have benchmarks, no manual benchmarking." The bandit only breaks
+# near-ties: its nudge is at most _NUDGE_CAP points and is applied ONLY among
+# candidates already within _AUTO_TOP_BAND of the best available score for
+# that pick. It never carries a model across a larger gap, never edits an
+# owner floor, never revives a blocked model and never lifts a last-resort
+# family (_is_low_quality) out of the tail. Benchmarks are the order
+# everywhere else.
+_NUDGE_CAP = 1.0
+_TASK_KIND_CV = contextvars.ContextVar("free_llm_hub_task_kind", default=None)
+
+
+def _task_kind(difficulty, tools, est, category=None):
+    """The bandit's task kind for this turn, or None (no bandit / error)."""
+    b = _bandit()
+    if b is None:
+        return None
+    try:
+        if category is None:
+            category = _active_mode()
+        k = b.task_kind(category, difficulty, bool(tools), int(est or 0))
+        return str(k) if k else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _bandit_delta(kind, pid, model, base):
+    """The bandit's nudge for (pid, model) on `kind`, in score points, within
+    +-_NUDGE_CAP (0.0 without a bandit, kind, or for a last-resort family).
+    bandit.default.nudge returns the NUDGED score; a bare delta is accepted
+    too (|value| <= cap and far from `base`). Never raises."""
+    b = _bandit()
+    if b is None or not kind:
+        return 0.0
+    try:
+        if _is_low_quality(model):
+            return 0.0
+        cap = _NUDGE_CAP
+        try:
+            cap = min(cap, abs(float(getattr(b, "MAX_NUDGE", cap))))
+        except (TypeError, ValueError):
+            pass
+        base = float(base)
+        ret = float(b.default.nudge(kind, pid, model, base))
+        if ret != ret:                              # NaN
+            return 0.0
+        if abs(ret - base) <= cap + 1e-9:
+            d = ret - base
+        elif abs(ret) <= cap:
+            d = ret
+        else:
+            d = ret - base
+        return max(-cap, min(cap, d))
+    except Exception:                                            # noqa: BLE001
+        return 0.0
+
+
+def _band_scores(items, kind, score_of, pid_of=lambda it: it[0],
+                 model_of=lambda it: it[1]):
+    """(scores, band): each item's score, the bandit nudge added ONLY for the
+    items within _AUTO_TOP_BAND of the best (never a last-resort family), and
+    a nudged score never below the band's floor -- so no item crosses a gap
+    larger than the band either way. `band` = the indexes nudged. Never
+    raises (plain scores, empty band)."""
+    scores = []
+    try:
+        scores = [float(score_of(it)) for it in items]
+        if len(items) < 2 or not kind or _bandit() is None:
+            return scores, []
+        best = max(scores)
+        floor = best - _AUTO_TOP_BAND
+        band = [i for i, s in enumerate(scores)
+                if s >= floor and not _is_low_quality(model_of(items[i]))]
+        if len(band) < 2:
+            return scores, []
+        out = list(scores)
+        for i in band:
+            out[i] = max(floor, scores[i] + _bandit_delta(
+                kind, pid_of(items[i]), model_of(items[i]), scores[i]))
+        return out, band
+    except Exception:                                            # noqa: BLE001
+        return scores or [0.0] * len(items), []
+
+
+def _nudge_in_band(items, kind, score_of, pid_of=lambda it: it[0],
+                   model_of=lambda it: it[1]):
+    """`items` (already in the caller's best-first order) with ONLY the ones
+    within _AUTO_TOP_BAND of the best score re-ordered by score + bandit nudge,
+    each moving only among those slots. Everything else -- and every
+    last-resort family -- keeps its place. Never raises."""
+    items = list(items or ())
+    if len(items) < 2 or not kind:
+        return items
+    try:
+        scores, band = _band_scores(items, kind, score_of, pid_of, model_of)
+        if len(band) < 2:
+            return items
+        keyed = sorted(band, key=lambda i: -scores[i])          # stable
+        out = list(items)
+        for slot, i in zip(band, keyed):
+            out[slot] = items[i]
+        return out
+    except Exception:                                            # noqa: BLE001
+        return items
+
+
+def _auto_top_band(pool, sustain_override=None, kind=None):
     """The entries of `pool` within _AUTO_TOP_BAND of its best _agentic_score
-    (the pool itself when that is empty or anything fails)."""
+    (the pool itself when that is empty or anything fails).
+
+    `kind` (a bandit task kind): the band is chosen on the plain scores FIRST,
+    then each member's score carries the bandit's nudge (<= _NUDGE_CAP), so
+    the weighted pick that follows breaks near-ties with what was learned and
+    no model outside the band can enter it."""
     try:
         if len(pool) <= 1:
             return list(pool)
         scored = [(_agentic_score(c, sustain_override), c) for c in pool]
         best = max(s for s, _ in scored)
-        return [c for s, c in scored if s >= best - _AUTO_TOP_BAND] or list(pool)
+        band = [c for s, c in scored if s >= best - _AUTO_TOP_BAND] or list(pool)
+        if kind and len(band) > 1 and _bandit() is not None:
+            band = [(c[0] + _bandit_delta(kind, c[1], c[2], c[0]),) + tuple(c[1:])
+                    for c in band]
+        return band
     except Exception:                                            # noqa: BLE001
         return list(pool)
 
@@ -8605,11 +8765,14 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # away from. MEASURED 2026-09-12: 11 of 15 requests of a two-worker run
         # on one model while a sibling model idled. Picking is microseconds;
         # holding a lock across it costs nothing.
+        # The bandit's task kind (None without a bandit): a role turn set it
+        # with the turn's REAL difficulty; otherwise this pick's own.
+        _kind = _TASK_KIND_CV.get() or _task_kind(difficulty, require_tools, est)
         with _spread_pick_lock:
             _pool = _rotate_within_run(_pool, _skey)
             _pool = _spread_pool(_pool, _skey)
             _sustain = _model_identity_min_penalty(_pool)
-            _pool = _auto_top_band(_pool, _sustain)
+            _pool = _auto_top_band(_pool, _sustain, kind=_kind)
             picked = _weighted_pick(_pool, _sustain)
             _s, pid, model = picked
             _session_pin_set(_skey, pid, model)
@@ -12414,6 +12577,86 @@ def _message_text(m):
     return content or ""
 
 
+def _model_guides_on():
+    try:
+        return bool(config.get_flag("model_guides", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _guide_module():
+    try:
+        import model_guides as _mg
+        return _mg
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _model_is_weak(pid, model):
+    """True when `model_guides` calls (pid, model) weak (flag `model_guides`
+    on). Never raises; unknown module = False."""
+    try:
+        mg = _guide_module()
+        if mg is None or not _model_guides_on() or not model:
+            return False
+        return bool(mg.is_weak(_benchmark_score(pid, model)))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+_GUIDE_TOTAL_MAX = 1500
+
+
+def _model_guide_text(pid, model, has_tools, difficulty=None):
+    """The guide for the model that WILL answer this hop ("" = none). Strong
+    models get the two-line strong guide; weak ones also get the scaffold
+    (step scope, context budget hint, checklist). <= _GUIDE_TOTAL_MAX chars."""
+    try:
+        mg = _guide_module()
+        if mg is None or not _model_guides_on() or not model:
+            return ""
+        score = _benchmark_score(pid, model)
+        fam = None
+        v = _verify()
+        if v is not None:
+            fam = v.family(model)
+        kind = "tools" if has_tools else "answer"
+        text = mg.guide_for(model, fam, score, kind) or ""
+        sc = mg.scaffold(score, kind) or {}
+        if sc:
+            extra = ["Keep each step to %s." % sc.get("max_step_scope", "one file"),
+                     "Keep your working context under ~%d tokens: re-read only what "
+                     "you need." % int(sc.get("context_budget_tokens") or 8000)]
+            extra += [str(c) for c in (sc.get("checklist") or [])]
+            lines = (text.split("\n") if text else []) + extra
+            out, used = [], 0
+            for ln in lines:
+                if used + len(ln) + 1 > _GUIDE_TOTAL_MAX:
+                    break
+                out.append(ln)
+                used += len(ln) + 1
+            text = "\n".join(out)
+        return text[:_GUIDE_TOTAL_MAX]
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _with_model_guide(msgs, pid, model, has_tools):
+    """`msgs` plus the answering model's guide as one system message after the
+    leading system messages. Idempotent; unchanged when there is no guide."""
+    text = _model_guide_text(pid, model, has_tools)
+    if not text or not isinstance(msgs, list):
+        return msgs
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "system" \
+                and str(m.get("content") or "").startswith("MODEL GUIDE"):
+            return msgs
+    i = 0
+    while i < len(msgs) and isinstance(msgs[i], dict) and msgs[i].get("role") == "system":
+        i += 1
+    return msgs[:i] + [{"role": "system", "content": text}] + msgs[i:]
+
+
 def _apply_craft_brief(messages, agentic=False):
     """Prepend a domain craft brief when the OPENING turn calls for one —
     plus, for tool-carrying (agentic) requests, the crew-delegation hint.
@@ -13093,6 +13336,10 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         msgs = (payload["messages"] if payload.get("_no_craft")
                 else _apply_craft_brief(payload["messages"],
                                         agentic=bool(payload.get("tools"))))
+        if not payload.get("_no_craft"):
+            # Per HOP: the guide is for the model answering THIS call.
+            msgs = _with_model_guide(msgs, pid, payload.get("model"),
+                                     bool(payload.get("tools")))
         # A CLI's own compaction request carries the exact facts to copy.
         msgs = _with_cli_compaction_facts(msgs)
         payload = dict(payload)
@@ -15391,6 +15638,16 @@ def view_page(slug, rest=None):
 
 
 @app.route("/")
+def landing():
+    """Serve the marketing landing page."""
+    try:
+        return render_template("landing.html",
+                               csp_nonce=getattr(g, "csp_nonce", ""))
+    except TemplateNotFound:
+        return index()
+
+
+@app.route("/hub")
 def index():
     try:
         page = make_response(
@@ -18483,7 +18740,7 @@ def _multi_turn_events(session_id, sess_info, text):
                 modes=_multi_worker_modes(sess_info),
                 default_mode=_session_mode_or_none(sess_info),
                 context=context or None,
-                **_swarm_windows_manager_kw())
+                **_swarm_windows_manager_kw(), **_multi_check_kwargs())
         except Exception:                                        # noqa: BLE001
             run_id = None
         if run_id:
@@ -18843,7 +19100,7 @@ def _resume_interrupted_swarms():
             stop=agentic_chat.stop_session, on_done=_multi_owner_record,
             modes=_worker_mode_keys(),
             should_resume=_multi_should_auto_resume,
-            **_swarm_windows_manager_kw())
+            **_swarm_windows_manager_kw(), **_multi_check_kwargs())
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("[swarm] could not resume interrupted runs: %s", exc)
         return []
@@ -18913,7 +19170,7 @@ def api_swarm_windows_start():
             configure=_swarm_windows_configure,
             stop=agentic_chat.stop_session,
             modes=_worker_mode_keys(),
-            **_swarm_windows_manager_kw())
+            **_swarm_windows_manager_kw(), **_multi_check_kwargs())
     except swarm_windows.SwarmWindowsError as exc:
         return _openai_error(str(exc), 400)
     except Exception as exc:                                     # noqa: BLE001
@@ -28977,16 +29234,7 @@ class _ChainClock:
         model = (payload or {}).get("model")
         if _client_gone():
             raise clientgone.ClientGone("the client disconnected")
-        _ctx_note_tried(pid, model)
-        self._hop_started = time.monotonic()
-        self._ensure_ledgers()
-        if self._cur is None or self._cur[0] != pid:
-            # A same-hop retry (hedge=False) is the SAME hop: counted once.
-            self._prov_hops[pid] = self._prov_hops.get(pid, 0) + 1
-            if self.tools and _is_relay_pid(pid):
-                self._relay_hops += 1
-            self._cur = (pid, model, self._hop_started)
-        self._hop_budget = self._budget_for(pid, model, stream)
+        self._open_hop(pid, model, stream)
         try:
             if self._hop_budget is None:
                 return self._plain(pid, model, payload, stream)
@@ -29008,6 +29256,67 @@ class _ChainClock:
         except Exception as exc:                                 # noqa: BLE001
             _ctx_note_hop_result(pid, model, exc=exc)
             raise
+
+    def _open_hop(self, pid, model, stream):
+        """The hop ledger + this hop's budget (see dispatch). Returns the
+        budget (None = unbounded)."""
+        _ctx_note_tried(pid, model)
+        self._hop_started = time.monotonic()
+        self._ensure_ledgers()
+        if self._cur is None or self._cur[0] != pid:
+            # A same-hop retry (hedge=False) is the SAME hop: counted once.
+            self._prov_hops[pid] = self._prov_hops.get(pid, 0) + 1
+            if self.tools and _is_relay_pid(pid):
+                self._relay_hops += 1
+            self._cur = (pid, model, self._hop_started)
+        self._hop_budget = self._budget_for(pid, model, stream)
+        return self._hop_budget
+
+    # -- tool-turn roles (see _tool_turn_roles) ------------------------------ #
+
+    def open_role_hop(self, pid, model):
+        """dispatch()'s ledger and budget for a NON-streamed tool-turn hop the
+        caller runs itself (the role actor). None = unbounded."""
+        return self._open_hop(pid, model, False)
+
+    def plan_tool_hedge(self, chain):
+        """Arm the STALL hedge for a tool-turn role walk: one extra actor, on
+        another provider, after _tool_hedge_delay of silence (flag
+        `hedge_tool_turns`, default on). The trivial-turn hedge (plan_hedge)
+        is unchanged; this plan is only read by tool_hedge_partner."""
+        self._hedge_plan = None
+        try:
+            if not config.get_flag("hedge_tool_turns", True):
+                return
+            self._hedge_plan = {"chain": [tuple(e) for e in (chain or ())],
+                                "base": {}, "diff": None, "lines": False,
+                                "output_budget": False, "tool_roles": True}
+        except Exception:                                        # noqa: BLE001
+            self._hedge_plan = None
+
+    def tool_hedge_partner(self, pid, model):
+        """The backup actor for (pid, model), or None: the trivial hedge's
+        partner rule (later in the chain, another provider first, not failing
+        recently) minus pairs a tool turn must not take (_swarm_member_sick).
+        At most one per request."""
+        plan = self._hedge_plan
+        if not plan or not plan.get("tool_roles") or self._hedge_fired:
+            return None
+        try:
+            saved = list(plan["chain"])
+            plan["chain"] = [e for e in saved
+                             if e == (pid, model) or not _swarm_member_sick(e[0], e[1])]
+            try:
+                return self._hedge_partner(pid, model)
+            finally:
+                plan["chain"] = saved
+        except Exception:                                        # noqa: BLE001
+            return None
+
+    def fire_tool_hedge(self, pid, model):
+        """Mark the backup actor started: consumed by the walk, no second one."""
+        self._hedge_fired = True
+        self._consumed.add((pid, model))
 
     def _plain(self, pid, model, payload, stream):
         try:
@@ -32466,14 +32775,19 @@ def _is_swarm_model(model):
 
 
 @_usage_source_as("swarm")
-def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False):
+def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_families=()):
     """One stage of the pipeline, routed and executed through the SAME chain
     every other request uses (so fallback, key rotation, quota accounting and
     the activity trail all behave identically). Returns (text, 'pid/model');
     never raises — an empty text tells swarm.py that stage failed.
 
     `fast`: the FASTEST capable models instead of the strongest -- the
-    stage is racing the post-cap grace window (see _swarm_fast_dispatch)."""
+    stage is racing the post-cap grace window (see _swarm_fast_dispatch).
+
+    `avoid_families`: model families (verify.family) this stage should not
+    be written by -- e.g. a reviewer of the family that wrote the draft. Their
+    candidates go to the BACK of the stage chain (_avoid_families_last):
+    never excluded, never a failure, a no-op without the verify module."""
     try:
         est = _est_tokens(messages)
         # force_difficulty="hard": every swarm stage is creation work and must
@@ -32493,6 +32807,8 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False):
             # Capable (the strong end of the chain), then quickest first.
             _stage_chain = sorted(_stage_chain[:_SWARM_FAST_POOL],
                                   key=lambda e: _latency_rank(e[0], e[1]))
+        if avoid_families:
+            _stage_chain = _avoid_families_last(_stage_chain, avoid_families)
         for hop_pid, hop_model in _stage_chain[:_SWARM_STAGE_MAX_HOPS]:
             if _client_gone():
                 break        # the client left: the stage ends empty, at once
@@ -32578,9 +32894,12 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False):
 _SWARM_FAST_POOL = 8
 
 
-def _swarm_fast_dispatch(messages, max_tokens, exclude_pids=()):
+def _swarm_fast_dispatch(messages, max_tokens, exclude_pids=(), avoid_families=()):
     """swarm.run's `fast_dispatch`: finishes what the wall clock cut off,
     inside the grace window, on the quickest capable models (short hops)."""
+    if avoid_families:
+        return _swarm_dispatch(messages, max_tokens, exclude_pids, fast=True,
+                               avoid_families=avoid_families)
     return _swarm_dispatch(messages, max_tokens, exclude_pids, fast=True)
 
 
@@ -32770,9 +33089,14 @@ def _swarm_rank(cands, difficulty=None):
         return []
     # Sized from THIS turn's candidates and difficulty, not a constant.
     fanout = _swarm_fanout(cands, difficulty)
-    ranked = sorted(cands, reverse=True,
-                    key=lambda pm: _agentic_score((_benchmark_score(pm[0], pm[1]),
-                                                   pm[0], pm[1])))
+    def _rank_score(pm):
+        return _agentic_score((_benchmark_score(pm[0], pm[1]), pm[0], pm[1]))
+    ranked = sorted(cands, reverse=True, key=_rank_score)
+    # The bandit breaks near-ties only: re-orders the models within
+    # _AUTO_TOP_BAND of the best, never across a bigger gap (_nudge_in_band).
+    ranked = _nudge_in_band(ranked, _TASK_KIND_CV.get()
+                            or _task_kind(difficulty or "hard", True, 0),
+                            _rank_score)
     # THREE tiers, not two. Splitting on the reliability number alone put
     # "measured, delivers" and "never tried" in the same bucket, because an
     # unknown scores a neutral 0.5 and 0.5 >= the health bar. So an untried
@@ -33052,10 +33376,23 @@ def _swarm_tool_grace(latency):
     return min(g_, float(_SWARM_STRAGGLER_GRACE))
 
 
+def _tool_turn_race_on():
+    """Flag `tool_turn_race` (default OFF): True restores the old best-of-N
+    fan-out (_swarm_tool_result) for every swarm/crew*/multi tool turn; off,
+    the turn runs as ROLES (_tool_turn_roles). Fails to the default."""
+    try:
+        return bool(config.get_flag("tool_turn_race", False))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 @_usage_source_as("swarm")
 def _swarm_tool_result(body):
     """Swarm for a TOOL-CALLING turn: run the same request on several strong
     models AT ONCE and return the best single response.
+
+    Since 2026-10-04 only with flag `tool_turn_race`; by default the turn runs
+    as ROLES, same contract (see _tool_turn_roles).
 
     The multi-phase pipeline (planner -> workers -> reviewer) cannot serve a CLI
     agent: it emits finished prose, never tool calls, so a coding agent driven
@@ -33075,6 +33412,8 @@ def _swarm_tool_result(body):
     of the three. Every protocol now runs this same race and translates the
     winner into its own shape.
     """
+    if not _tool_turn_race_on():
+        return _tool_turn_roles(body)
     messages = body.get("messages") or []
     # OPENING turn of a swarm session: ask for the phased plan up front. The
     # prose pipeline plans this way on its own (swarm._waves runs independent
@@ -33142,7 +33481,11 @@ def _swarm_tool_result(body):
         _real = _classify_difficulty(messages, body.get("max_tokens"))
     except Exception:                                            # noqa: BLE001
         _real = None
-    picks = _swarm_rank(cands, _real)
+    _kt = _TASK_KIND_CV.set(_task_kind(_real or "hard", True, est))
+    try:
+        picks = _swarm_rank(cands, _real)
+    finally:
+        _TASK_KIND_CV.reset(_kt)
     if not picks:
         return None
 
@@ -33489,6 +33832,995 @@ def _swarm_tool_result(body):
     data["model"] = hop_pid + "/" + hop_model
     hdrs = _routing_headers(hop_pid, hop_model, len(picks), None)
     return data, hdrs
+
+
+# --------------------------------------------------------------------------- #
+# Roles instead of racing: the models of a tool turn COLLABORATE
+# --------------------------------------------------------------------------- #
+# MEASURED hub.log 2026-09-26..10-04 (see _swarm_tool_result): the race sent one
+# tool turn to 3.72 models on average -- 4.02 upstream calls per served answer,
+# 75% of member calls (2897/3857) served nothing, each resending ~100K+ prompt
+# tokens -- and caused the hub's own 429s. Owner: "each model must do
+# something -- collaboration, not racing." Each model now has a ROLE:
+#   1. ACTOR     ONE model: the chain's head (router pick; the bandit only
+#                breaks ties inside _AUTO_TOP_BAND), walked fail-fast on
+#                429/5xx/empty/junk/invalid/prose-instead-of-action with the
+#                same _ChainClock.walk rules as every tool chain;
+#   2. BACKUP    ONE extra actor on another provider, started only after the
+#                actor's MEASURED silence (_tool_hedge_delay); first valid
+#                answer wins, the other call is cut (its hop token);
+#   3. VERIFIER  only when verify.is_risky: a model of ANOTHER family reviews
+#                the proposed step (non-streamed, <= _VERIFY_DEADLINE,
+#                fail-open on any error);
+#   4. CORRECTOR only on a high-severity "revise": ONE call to the best other
+#                actor; its step must pass _swarm_tool_calls_valid, else the
+#                original ships.
+# The turn stays BUFFERED, exactly as the race was (members never streamed,
+# the winner is replayed): a streaming client's first byte goes out after the
+# verdict. Expected calls per turn: 1 (+1 on a stall, +1-2 on a risky step).
+_TOOL_HEDGE_FLOOR = 6.0          # seconds: never hedge sooner (= _ADAPTIVE_HOP_FLOOR)
+_TOOL_HEDGE_MULT = 3.5           # x the pair's measured tool-turn p50 (= _ADAPTIVE_HOP_MULT)
+_TOOL_HEDGE_UNKNOWN = 45.0       # no tool-turn timing for the pair yet
+_ROLE_MAX_ACTOR_HOPS = 4         # actor hops before the turn falls back to `best`
+_VERIFY_DEADLINE = 25.0          # one verifier call, all in
+_VERIFY_MIN_SECONDS = 4.0        # less turn time left than this: no verifier
+_CORRECT_MIN_SECONDS = 15.0      # less turn time left than this: no corrector
+_ROLE_LOG_NAME = "turn-roles.jsonl"
+_ROLE_LOG_MAX_BYTES = 5 * 1024 * 1024
+_role_log_lock = threading.Lock()
+
+
+def _tool_hedge_delay(pid, model):
+    """Seconds of silence from a tool-turn actor before the backup starts:
+    max(_TOOL_HEDGE_FLOOR, _TOOL_HEDGE_MULT x its tool-turn p50) from
+    _tool_ttft (streamed first content on tool turns, plus every role call's
+    duration -- a buffered tool call is usable only once complete), or
+    _TOOL_HEDGE_UNKNOWN while fewer than _TOOL_MIN_SAMPLES exist."""
+    try:
+        with _outcome_lock:
+            s = list(_tool_ttft.get((pid, model)) or [])
+        if len(s) < _TOOL_MIN_SAMPLES:
+            return _TOOL_HEDGE_UNKNOWN
+        return max(_TOOL_HEDGE_FLOOR, _TOOL_HEDGE_MULT * _percentile(s, 50) / 1000.0)
+    except Exception:                                            # noqa: BLE001
+        return _TOOL_HEDGE_UNKNOWN
+
+
+def _role_log(row):
+    """Append one row to state_dir()/turn-roles.jsonl (rolled to .1 past
+    _ROLE_LOG_MAX_BYTES). Read offline by scripts/role_eval.py. Never raises."""
+    try:
+        path = os.path.join(config.state_dir(), _ROLE_LOG_NAME)
+        line = json.dumps(dict(row, ts=round(time.time(), 3)), ensure_ascii=False,
+                          default=str) + "\n"
+        with _role_log_lock:
+            try:
+                if os.path.getsize(path) > _ROLE_LOG_MAX_BYTES:
+                    os.replace(path, path + ".1")
+            except OSError:
+                pass
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _bandit_reward(kind, pid, model, value):
+    """File a QUALITY reward (1 / 0.5 / 0) with the bandit. Never for a client
+    that left or a call the hub cut (_client_gone on the leg's token); the
+    callers never call it for 429 / 5xx / timeouts. Never raises."""
+    b = _bandit()
+    if b is None or not kind or not (pid and model) or _client_gone():
+        return False
+    try:
+        b.default.reward(kind, pid, model, float(value))
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _bandit_remember(calls, pid, model, kind):
+    """Tell the bandit which tool calls (pid, model) served, so the NEXT
+    request's tool results credit it (_bandit_credit). Never raises."""
+    b = _bandit()
+    ids = [tc.get("id") for tc in (calls or ())
+           if isinstance(tc, dict) and tc.get("id")]
+    if b is None or not kind or not ids:
+        return
+    try:
+        b.default.remember_tool_calls(ids, pid, model, kind)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _ensure_tool_call_ids(msg):
+    """Give every tool call an id (a remembered call must be findable when the
+    CLI sends its result back). In place; never raises."""
+    try:
+        for tc in (msg or {}).get("tool_calls") or ():
+            if isinstance(tc, dict) and not tc.get("id"):
+                tc["id"] = "call_" + uuid.uuid4().hex[:24]
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+_EXIT_CODE_RE = re.compile(
+    r"(?i)\b(?:exit(?:ed)?(?:\s+with)?|process\s+exited\s+with|returned)\s+"
+    r"(?:exit\s+)?(?:code|status)\s*[:=]?\s*(-?\d+)")
+# A tool result that reads as an ERROR (no evidence verdict available).
+_TOOL_ERROR_RE = re.compile(
+    r"(?im)^\s*(?:error\b|traceback \(most recent call last\)|fatal:|"
+    r"[\w.]*(?:error|exception):)|command not found|no such file or directory"
+    r"|\bexit(?:ed)?(?:\s+with)?\s+(?:code|status)\s*[:=]?\s*[1-9]\d*")
+
+
+def _exit_code_in(text):
+    """The exit code a tool result states ("Exit code: 1"), or None."""
+    try:
+        m = _EXIT_CODE_RE.search(str(text or "")[-4000:])
+        return int(m.group(1)) if m else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _command_from_call(call):
+    """The shell command a tool call runs (its arguments' command / cmd /
+    script, an argv list joined), or None."""
+    try:
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            args = json.loads(args) if args.strip() else {}
+        if not isinstance(args, dict):
+            return None
+        for key in ("command", "cmd", "script", "commands"):
+            v = args.get(key)
+            if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+                import shlex
+                return shlex.join(v)
+            if isinstance(v, str) and v.strip():
+                return v
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def _tool_call_commands(messages):
+    """{tool_call_id: command} for every command-running tool call in the
+    conversation (OpenAI shape -- all three protocols are translated to it)."""
+    out = {}
+    for m in messages or ():
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        for tc in m.get("tool_calls") or ():
+            if isinstance(tc, dict) and tc.get("id"):
+                cmd = _command_from_call(tc)
+                if cmd:
+                    out[tc["id"]] = cmd
+    return out
+
+
+def _observed_pass(messages):
+    """True when the conversation's LAST observed test/build result is a PASS,
+    False when a FAIL, None when none was observed (evidence.classify on the
+    tool results of command calls; never from words). Never raises."""
+    ev = _evidence()
+    if ev is None:
+        return None
+    try:
+        cmds = _tool_call_commands(messages)
+        last = None
+        for m in messages or ():
+            if not isinstance(m, dict) or m.get("role") != "tool":
+                continue
+            cmd = cmds.get(m.get("tool_call_id"))
+            if not cmd:
+                continue
+            out = _message_text(m)
+            verdict = (ev.classify(cmd, _exit_code_in(out), out, None) or {}).get("verdict")
+            if verdict == getattr(ev, "PASS", "PASS"):
+                last = True
+            elif verdict == getattr(ev, "FAIL", "FAIL"):
+                last = False
+        return last
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _make_bandit_grade(messages):
+    """The `grade` callable bandit.credit_from_messages uses on a served tool
+    call's RESULT: 1.0 for an observed PASS or a clean result, 0.5 for an
+    observed FAIL or a result reading as an error. Accepts the result message
+    (dict), its text, its tool_call_id and/or the call itself in any order."""
+    memo = {}
+    ev = _evidence()
+
+    def grade(*args, **kwargs):
+        if "cmds" not in memo:       # built on first use: most requests credit nothing
+            memo["cmds"] = _tool_call_commands(messages)
+        cmds = memo["cmds"]
+        result = call = text = None
+        cmd = None
+        for a in list(args) + list(kwargs.values()):
+            if isinstance(a, dict):
+                if isinstance(a.get("function"), dict):
+                    call = a
+                elif result is None and ("content" in a or a.get("role") == "tool"):
+                    result = a
+            elif isinstance(a, str):
+                if a in cmds:
+                    cmd = cmds[a]
+                elif text is None:
+                    text = a
+        out = _message_text(result) if result is not None else (text or "")
+        if not isinstance(out, str):
+            out = str(out or "")
+        if call is not None:
+            cmd = _command_from_call(call) or cmd
+        if cmd is None and isinstance(result, dict):
+            cmd = cmds.get(result.get("tool_call_id"))
+        is_err = result.get("is_error") if isinstance(result, dict) else None
+        is_err = is_err if isinstance(is_err, bool) else None
+        if ev is not None and cmd:
+            try:
+                vd = (ev.classify(cmd, _exit_code_in(out), out, is_err) or {}).get("verdict")
+                if vd == getattr(ev, "PASS", "PASS"):
+                    return 1.0
+                if vd == getattr(ev, "FAIL", "FAIL"):
+                    return 0.5
+            except Exception:                                    # noqa: BLE001
+                pass
+        if is_err is True or _TOOL_ERROR_RE.search(out[:4000]):
+            return 0.5
+        return 1.0
+    return grade
+
+
+def _bandit_credit(messages):
+    """At the start of every /v1 request: the tool results this conversation
+    sends back credit the models whose calls produced them (bandit
+    remembered the call ids). Returns how many were credited. Never raises."""
+    b = _bandit()
+    if b is None or not messages:
+        return 0
+    try:
+        n = int(b.default.credit_from_messages(messages, _make_bandit_grade(messages)) or 0)
+    except Exception:                                            # noqa: BLE001
+        return 0
+    if n:
+        _role_log({"event": "credit", "credited": n})
+    return n
+
+
+def _bandit_boot():
+    """bandit.configure(state_dir()/task-bandit.json) -- at hub BOOT only
+    (never at import: a test importing app must not touch any state file)."""
+    b = _bandit()
+    if b is None or not hasattr(b, "configure"):
+        return
+    try:
+        b.configure(os.path.join(config.state_dir(), "task-bandit.json"))
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[bandit] not configured: %s", exc)
+
+
+def _role_judge(pid, model, resp, exc, body, payload, est, kind):
+    """One role call's result -> {"ok": True, "data", "msg", "gate"} or
+    {"ok": False, "fail", "why"}. The fan-out's member checks, plus: a tool
+    call the CLI cannot run is a FAILED hop here (one actor, nothing to
+    prefer it over). Files outcomes like the fan-out did and the quality
+    reward 0 for junk / invalid / prose-instead-of-action. Never raises."""
+    tools = body.get("tools")
+
+    def fail(kind_, why, reward=None):
+        if reward is not None:
+            _bandit_reward(kind, pid, model, reward)
+        return {"ok": False, "fail": kind_, "why": why}
+    try:
+        if resp is None:
+            if exc is not None:
+                _record_outcome(pid, model, False)
+                _swarm_note_member_exc(pid, model, exc)
+                return fail("exc", type(exc).__name__)
+            return fail("deadline", "no answer in time")
+        try:
+            if resp.status_code != 200:
+                _record_outcome(pid, model, False)
+                _swarm_note_member_status(pid, model, resp.status_code)
+                return fail("http", "HTTP %d" % resp.status_code)
+            data = resp.json() or {}
+        except (ValueError, AttributeError):
+            return fail("bad-json", "200 but the body was not usable JSON")
+        finally:
+            try:
+                resp.close()
+            except Exception:                                    # noqa: BLE001
+                pass
+        if not isinstance(data, dict):
+            return fail("bad-json", "200 but the body was not a JSON object")
+        msg = ((data.get("choices") or [{}])[0].get("message") or {})
+        if not (msg.get("tool_calls") or (msg.get("content") or "").strip()):
+            _record_outcome(pid, model, False)
+            return fail("empty", "200 with an empty message")
+        if not msg.get("tool_calls") and tools:
+            if tool_rescue.rescue(data, tools):
+                msg = ((data.get("choices") or [{}])[0].get("message") or {})
+        content = msg.get("content")
+        if not msg.get("tool_calls"):
+            if _looks_like_refusal(content) or _looks_like_permission_block(content):
+                _record_outcome(pid, model, False)
+                return fail("prose", "refused: %s" % " ".join(str(content or "")[:60].split()), 0)
+            if tools and _no_tools_claim(
+                    content, tools_offered=True, prompt=_last_user_text_for_check(body),
+                    used_tools=_turn_used_tools(body.get("messages"))):
+                _record_outcome(pid, model, False)
+                return fail("prose", "claimed it has no tools", 0)
+            if tools and (_looks_like_text_tool_call(content)
+                          or tool_rescue.has_model_markup(content)
+                          or _looks_like_announced_not_acted(content)):
+                _note_nonanswer(pid, model)
+                return fail("prose", "answered in prose without calling a tool", 0)
+        gate = _answer_gate(data, payload, bool(tools), hop=(pid, model))
+        if gate == "junk":
+            _record_outcome(pid, model, False, junk=True)
+            return fail("junk", "degenerate answer (nothing salvageable)", 0)
+        msg = ((data.get("choices") or [{}])[0].get("message") or {})
+        if msg.get("tool_calls") and not _swarm_tool_calls_valid(msg, tools):
+            _record_outcome(pid, model, False)
+            return fail("invalid", "a tool call the CLI cannot run", 0)
+        _record_chat_usage(pid, model, data, est, ok=gate == "ok")
+        return {"ok": True, "data": data, "msg": msg, "gate": gate}
+    except Exception as e:                                       # noqa: BLE001
+        return {"ok": False, "fail": "error", "why": "error: %s" % type(e).__name__}
+
+
+def _role_start_leg(idx, pid, model, body, deadline, q, est, kind):
+    """Start one non-streamed role call on its own thread under its own hop
+    token (clientgone.child): cancelling the token cuts the call, and inside
+    it _client_gone() is then True, so a call the hub cut files nothing.
+    Puts (idx, verdict) on `q`. Returns the token."""
+    tok = clientgone.child("role-leg")
+    payload = dict(body)
+    payload["model"] = model
+    payload["stream"] = False
+
+    def _go():
+        t0 = time.monotonic()
+        try:
+            resp, exc = _dispatch_chat_with_deadline(pid, payload, deadline)
+            v = _role_judge(pid, model, resp, exc, body, payload, est, kind)
+            if v.get("ok"):
+                _record_speed_sample(_tool_ttft, pid, model,
+                                     (time.monotonic() - t0) * 1000.0)
+        except Exception as e:                                   # noqa: BLE001
+            v = {"ok": False, "fail": "error", "why": "error: %s" % type(e).__name__}
+        v["secs"] = round(time.monotonic() - t0, 2)
+        q.put((idx, v))
+    run = _pipeline_bound(_carry_usage_source(lambda: clientgone.run_as(tok, _go)))
+    threading.Thread(target=run, daemon=True, name="role-leg-%d" % idx).start()
+    return tok
+
+
+def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spent=None):
+    """One actor hop with its stall backup. Returns (pid, model, data, msg)
+    of the first VALID answer, or None (the walk moves on).
+
+    `spent` (a list the caller owns) collects every pair this hop dispatched
+    to -- the actor, and the backup if it fired -- so the verifier that runs
+    afterwards is never a model that just stalled or lost the race here."""
+    budget = clock.open_role_hop(pid, model)
+    now = time.monotonic()
+    room = turn_end - now
+    deadline = room if budget is None else min(budget, room)
+    if deadline <= 1.0:
+        return None
+    q = queue.Queue()
+    legs = {0: (pid, model)}
+    if spent is not None:
+        spent.append((pid, model))
+    toks = {0: _role_start_leg(0, pid, model, body, deadline, q, est, kind)}
+    rec["calls"] += 1
+    rec["sent_tokens"] += est
+    delay = _tool_hedge_delay(pid, model)
+    partner = clock.tool_hedge_partner(pid, model) if delay < deadline - 1.0 else None
+    t0, end = now, now + deadline
+    pending, fired = {0}, False
+
+    def _row(idx, role):
+        p, m = legs[idx]
+        rows.append({"role": role, "model": "%s/%s" % (p, m)})
+
+    while pending:
+        if _client_gone():
+            for j in pending:
+                toks[j].cancel("client disconnected")
+            return None
+        wait_to = end if (fired or partner is None) else min(t0 + delay, end)
+        try:
+            idx, v = q.get(timeout=max(0.0, min(0.5, wait_to - time.monotonic())))
+        except queue.Empty:
+            now = time.monotonic()
+            if now < wait_to:
+                continue                 # a 0.5 s slice, so a cancel is seen
+            if not fired and partner is not None and now < end:
+                fired = True
+                p1, m1 = partner
+                b1 = clock._budget_for(p1, m1, False)
+                d1 = (turn_end - now) if b1 is None else min(b1, turn_end - now)
+                if d1 > 1.0:
+                    clock.fire_tool_hedge(p1, m1)
+                    legs[1] = (p1, m1)
+                    if spent is not None:
+                        spent.append((p1, m1))
+                    toks[1] = _role_start_leg(1, p1, m1, body, d1, q, est, kind)
+                    pending.add(1)
+                    rec["calls"] += 1
+                    rec["sent_tokens"] += est
+                    rec["hedge"] = "%s/%s" % (p1, m1)
+                    end = min(max(end, now + d1), turn_end)
+                    _log.info("[roles] %s/%s silent %.1fs -> backup %s/%s",
+                              pid, model, now - t0, p1, m1)
+                continue
+            break                        # out of time
+        pending.discard(idx)
+        if v.get("ok"):
+            for j in pending:
+                toks[j].cancel("another actor answered first")
+            _row(idx, "actor" if idx == 0 else "backup (stall)")
+            if pending:
+                _row(min(pending), "%s: stopped, %s answered first" % (
+                    "actor" if 0 in pending else "backup (stall)",
+                    "the backup" if idx else "the actor"))
+            return (legs[idx][0], legs[idx][1], v["data"], v["msg"])
+        why = str(v.get("why") or "failed")[:60]
+        _row(idx, "%s: %s" % ("actor" if idx == 0 else "backup (stall)", why))
+        rec["failed"].append({"pair": "%s/%s" % legs[idx], "why": why})
+        if v.get("fail") in ("invalid", "prose", "junk"):
+            rec["invalid"] += 1
+        if v.get("fail") == "deadline" and not _client_gone():
+            clock._note_stall(legs[idx][0])
+            if deadline >= _ADAPTIVE_HOP_FLOOR:
+                _note_recent_hop_failure(legs[idx][0], legs[idx][1], "deadline")
+    for j in pending:
+        toks[j].cancel("role hop out of time")
+        _row(j, "%s: no answer in time" % ("actor" if j == 0 else "backup (stall)"))
+    if 0 in pending and not _client_gone():
+        clock._note_stall(pid)
+        if deadline >= _ADAPTIVE_HOP_FLOOR:
+            _note_recent_hop_failure(pid, model, "deadline")
+    return None
+
+
+def _role_candidates(chain, producer, failed=(), kind=None):
+    """[(pid, model, score)] -- the shape verify.pick_verifier takes -- for
+    the healthy chain entries other than `producer` and the pairs that failed
+    this turn: chain (= benchmark) order and benchmark score, with the bandit
+    nudge applied only inside the top band (_band_scores / _nudge_in_band)."""
+    pairs = []
+    bad = {tuple(p) for p in failed or ()}
+    prod = tuple(producer)[:2]
+    for e in chain or ():
+        p, m = e[0], e[1]
+        if (p, m) == prod or (p, m) in bad or _is_sub(p):
+            continue
+        if _swarm_member_sick(p, m):
+            continue
+        pairs.append((p, m))
+    if not pairs:
+        return []
+
+    def _score(e):
+        return _benchmark_score(e[0], e[1])
+    scores, band = _band_scores(pairs, kind, _score)
+    rows = [(p, m, round(s, 4)) for (p, m), s in zip(pairs, scores)]
+    out = list(rows)
+    for slot, i in zip(band, sorted(band, key=lambda i: -scores[i])):
+        out[slot] = rows[i]          # only the band's own slots move
+    return out
+
+
+def _run_verifier(v, vp, vm, messages, msg, deadline, rec):
+    """One non-streamed verifier call -> parsed verdict dict, or None on ANY
+    error / timeout / unreadable verdict (the caller fails open)."""
+    try:
+        vmsgs = v.digest(messages, msg)
+        max_tokens = int(getattr(v, "VERIFY_MAX_TOKENS", 400) or 400)
+    except Exception:                                            # noqa: BLE001
+        return None
+    payload = {"model": vm, "stream": False, "max_tokens": max_tokens,
+               "messages": vmsgs, "_no_craft": True}    # stripped in _upstream_chat
+    rec["calls"] += 1
+    v_est = _est_tokens(vmsgs)
+    rec["sent_tokens"] += v_est
+    resp, exc = _dispatch_chat_with_deadline(vp, payload, deadline)
+    if resp is None:
+        if exc is not None:
+            _swarm_note_member_exc(vp, vm, exc)
+        return None
+    try:
+        if resp.status_code != 200:
+            _swarm_note_member_status(vp, vm, resp.status_code)
+            return None
+        data = resp.json() or {}
+    except (ValueError, AttributeError):
+        return None
+    finally:
+        try:
+            resp.close()
+        except Exception:                                        # noqa: BLE001
+            pass
+    try:
+        text = _message_text(((data.get("choices") or [{}])[0].get("message") or {}))
+        if not str(text or "").strip():
+            return None
+        _record_chat_usage(vp, vm, data, v_est)
+        verdict = v.parse_verdict(text)
+        # verify.parse_verdict turns an unreadable reply into ACCEPT with
+        # "unparsed": True. Fail-open here too, but it is NOT a verification:
+        # no reward, nothing shown as "verifier: ok".
+        if not isinstance(verdict, dict) or "ok" not in verdict or verdict.get("unparsed"):
+            return None
+        return verdict
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _role_verify_and_correct(body, messages, producer, msg, chain, kind, difficulty,
+                             rec, rows, turn_end, est, tool_turn=True, failed=()):
+    """VERIFIER (+ at most ONE CORRECTOR) for a proposed answer. Returns
+    (pid, model, data, msg) of an accepted correction, else None (ship the
+    original). Rewards the producer on the verdict (1 ok / 0.5 revise).
+    Fail-open everywhere. Never raises."""
+    v = _verify()
+    if v is None:
+        return None
+    try:
+        if not config.get_flag("turn_verifier", True):
+            return None
+        calls = msg.get("tool_calls") or []
+        if tool_turn:
+            # The WHOLE assistant message: verify.is_risky reads its tool
+            # calls (write/exec on a hard turn) and its text ("done" / "tests
+            # pass" claimed with no observed PASS on any non-simple turn).
+            try:
+                risky = bool(v.is_risky(msg, difficulty,
+                                        observed_pass=_observed_pass(messages)))
+            except Exception:                                    # noqa: BLE001
+                risky = False
+            if not risky and not _model_is_weak(*producer[:2]):
+                return None
+        if turn_end - time.monotonic() < _VERIFY_MIN_SECONDS:
+            rec["verdict"] = "skipped: no time left"
+            return None
+        ppid, pmodel = producer
+        pool = _role_candidates(chain, producer, failed, kind)
+        try:
+            pick = v.pick_verifier((ppid, pmodel), pool)
+        except Exception:                                        # noqa: BLE001
+            pick = None
+        if not pick:
+            rec["verdict"] = "no verifier available"
+            return None
+        vp, vm = pick[0], pick[1]
+        rec["verifier"] = "%s/%s" % (vp, vm)
+        verdict = _run_verifier(v, vp, vm, messages, msg,
+                                min(_VERIFY_DEADLINE, turn_end - time.monotonic()), rec)
+        if _client_gone():
+            return None
+        if verdict is None:
+            rec["verdict"] = "no verdict (fail-open)"
+            rows.append({"role": "verifier: no verdict", "model": rec["verifier"]})
+            return None
+        ok = bool(verdict.get("ok"))
+        sev = str(verdict.get("severity") or "").strip().lower()
+        rec["verdict"] = "ok" if ok else "revise"
+        rec["severity"] = sev or None
+        rows.append({"role": "verifier: %s" % rec["verdict"], "model": rec["verifier"]})
+        _bandit_reward(kind, ppid, pmodel, 1.0 if ok else 0.5)
+        if ok or sev != "high":
+            return None
+        if turn_end - time.monotonic() < _CORRECT_MIN_SECONDS:
+            rec["correction"] = "skipped: no time left"
+            return None
+        ident = _normalize_model_identity(pmodel)
+        cpool = [e for e in pool if _normalize_model_identity(e[1]) != ident]
+        if not cpool:
+            rec["correction"] = "no other actor"
+            return None
+        cp, cm = cpool[0][0], cpool[0][1]
+        try:
+            cbody = dict(body)
+            # verify.corrector_messages keeps a proposed tool_calls message
+            # native and answers each call "not executed" before the
+            # problems note (providers 400 without them): sent as-is.
+            cbody["messages"] = v.corrector_messages(messages, msg, verdict)
+        except Exception:                                        # noqa: BLE001
+            return None
+        q = queue.Queue()
+        c_est = _est_tokens(cbody["messages"], cbody.get("tools"))
+        dl = max(1.0, turn_end - time.monotonic())
+        tok = _role_start_leg(2, cp, cm, cbody, dl, q, c_est, kind)
+        rec["calls"] += 1
+        rec["sent_tokens"] += c_est
+        rec["corrector"] = "%s/%s" % (cp, cm)
+        got = None
+        stop_at = time.monotonic() + dl + 1.0
+        while time.monotonic() < stop_at:
+            if _client_gone():
+                tok.cancel("client disconnected")
+                return None
+            try:
+                got = q.get(timeout=0.5)[1]
+                break
+            except queue.Empty:
+                continue
+        if got is None:
+            tok.cancel("corrector out of time")
+            rows.append({"role": "corrector: no answer in time", "model": rec["corrector"]})
+            return None
+        cmsg = got.get("msg") or {}
+        if cmsg.get("tool_calls"):
+            # A corrected STEP must be one the CLI can run.
+            accepted = (bool(got.get("ok")) and tool_turn
+                        and _swarm_tool_calls_valid(cmsg, cbody.get("tools")))
+        else:
+            # Prose replaces prose only: a proposed tool step is never swapped
+            # for text.
+            accepted = bool(got.get("ok")) and not calls
+        if not accepted:
+            why = got.get("why") or "not a usable correction"
+            rows.append({"role": "corrector: kept the original (%s)" % str(why)[:40],
+                         "model": rec["corrector"]})
+            return None
+        rec["corrected"] = True
+        rows.append({"role": "corrector", "model": rec["corrector"]})
+        return (cp, cm, got["data"], cmsg)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _role_activity(rows, label):
+    """Show the roles on the activity row (the pipeline chips)."""
+    try:
+        act = getattr(g, "act", None)
+        if act is not None:
+            with _activity_lock:
+                act["crew"] = label
+                act["pipeline"] = list(rows)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _roles_header(rec):
+    return "actor_hops=%d;backup=%d;verifier=%s;corrected=%d;calls=%d" % (
+        int(rec.get("actor_hops") or 0), 1 if rec.get("hedge") else 0,
+        (rec.get("verdict") or "none").split(" ")[0], 1 if rec.get("corrected") else 0,
+        int(rec.get("calls") or 0))
+
+
+@_usage_source_as("swarm")
+def _tool_turn_roles(body):
+    """A swarm/crew*/multi TOOL turn as ROLES (see the block comment above):
+    (data, headers) -- `data` an ordinary OpenAI chat completion -- or None
+    when no actor delivered, so the caller falls back to single-model `best`
+    routing. Never raises."""
+    messages = body.get("messages") or []
+    tools = body.get("tools")
+    stream = bool(body.get("stream"))
+    started = time.monotonic()
+    est = _est_tokens(messages, tools)
+    try:
+        real = _classify_difficulty(messages, body.get("max_tokens"))
+    except Exception:                                            # noqa: BLE001
+        real = None
+    kind = _task_kind(real or "hard", True, est)
+    rec = {"event": "turn", "turn": "tool", "kind": kind, "difficulty": real,
+           "input_tokens": est, "sent_tokens": 0, "stream": stream, "calls": 0,
+           "actor": None, "actor_hops": 0, "nudge": None, "hedge": None,
+           "verifier": None, "verdict": None, "severity": None, "corrector": None,
+           "corrected": False, "served": None, "failed": [], "invalid": 0}
+    token = _TASK_KIND_CV.set(kind)
+    try:
+        return _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec,
+                                    started)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[roles] tool turn failed inside the hub: %s", exc)
+        rec["outcome"] = "error: %s" % type(exc).__name__
+        return None
+    finally:
+        _TASK_KIND_CV.reset(token)
+        rec["latency_s"] = round(time.monotonic() - started, 2)
+        if _client_gone():
+            rec["outcome"] = "client gone"
+        _role_log(rec)
+
+
+def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, started):
+    pid, resolved, _d = _route_by_difficulty(messages, body.get("max_tokens"), est,
+                                             require_tools=True,
+                                             force_difficulty="hard")
+    if not pid:
+        rec["outcome"] = "no route"
+        return None
+    # A LOCAL SUBSCRIPTION CANNOT EMIT A TOOL CALL (see _swarm_tool_result).
+    chain = [(e[0], e[1]) for e in _build_chain(pid, resolved, est, require_tools=True,
+                                                 messages=messages)
+             if not _is_sub(e[0])]
+    if not chain:
+        rec["outcome"] = "no candidate"
+        return None
+    rec["routed"] = "%s/%s" % (pid, resolved)
+    # A stream's turn must finish under the client's header timeout (see
+    # _SWARM_TOOL_STREAM_DEADLINE); the clock below also starts the REQUEST
+    # clock, so a fallback after an empty turn shares it.
+    clock = _ChainClock(tools=True, est=est, stream=stream)
+    turn_end = started + float(_SWARM_TOOL_STREAM_DEADLINE if stream
+                               else _SWARM_TOOL_HOP_DEADLINE)
+    if clock.deadline_at is not None:
+        turn_end = min(turn_end, clock.deadline_at)
+    clock.plan_tool_hedge(chain)
+    rows, served, hops = [], None, 0
+    spent = []          # every pair dispatched to: kept off the verifier pool
+    for hop_pid, hop_model in clock.walk(chain):
+        if _client_gone():
+            break
+        if clock.consumed(hop_pid, hop_model):
+            continue                    # the backup already ran it
+        if hops >= _ROLE_MAX_ACTOR_HOPS or time.monotonic() >= turn_end - 1.0:
+            break
+        hops += 1
+        if rec["actor"] is None:
+            rec["actor"] = "%s/%s" % (hop_pid, hop_model)
+            rec["nudge"] = round(_bandit_delta(kind, hop_pid, hop_model,
+                                               _benchmark_score(hop_pid, hop_model)), 3)
+        served = _role_actor_hop(clock, body, hop_pid, hop_model, est, kind, rec, rows,
+                                 turn_end, spent)
+        if served:
+            break
+    rec["actor_hops"] = hops
+    if _client_gone():
+        return None          # the client left: the caller replies 499 (clientgone)
+    if not served:
+        rec["outcome"] = "no answer"
+        _log.warning("[roles] no actor delivered in %d hop(s), %.0fs -> %s", hops,
+                     time.monotonic() - started,
+                     "; ".join("%s: %s" % (f["pair"], f["why"]) for f in rec["failed"][:6]))
+        _role_activity(rows, "swarm (roles)")
+        return None
+    spid, smodel, data, msg = served
+    _ensure_tool_call_ids(msg)
+    # A model that FAILED, STALLED or lost the stall race this turn is not a
+    # second opinion -- keep every pair we already dispatched to off the
+    # verifier pool (the producer is excluded by verify.pick_verifier anyway).
+    excluded = list({tuple(f["pair"].split("/", 1)) for f in rec["failed"]} | set(spent))
+    corrected = _role_verify_and_correct(body, messages, (spid, smodel), msg, chain, kind,
+                                         real, rec, rows, turn_end, est, tool_turn=True,
+                                         failed=excluded)
+    if corrected:
+        spid, smodel, data, msg = corrected
+        _ensure_tool_call_ids(msg)
+    if _client_gone():
+        return None
+    _bandit_remember(msg.get("tool_calls"), spid, smodel, kind)
+    rec["served"] = "%s/%s" % (spid, smodel)
+    rec["outcome"] = "tool call" if msg.get("tool_calls") else "text"
+    _log.info("[roles] %s/%s served after %d actor hop(s), %d call(s)%s%s%s", spid, smodel,
+              hops, rec["calls"], ", backup %s" % rec["hedge"] if rec["hedge"] else "",
+              ", verifier %s: %s" % (rec["verifier"], rec["verdict"]) if rec["verifier"] else "",
+              ", corrected" if rec["corrected"] else "")
+    _role_activity(rows, "swarm (roles)")
+    data["model"] = spid + "/" + smodel
+    hdrs = _routing_headers(spid, smodel, rec["calls"], None)
+    hdrs["X-Free-LLM-Hub-Roles"] = _roles_header(rec)
+    return data, hdrs
+
+
+def _max_text_review(tier, difficulty, has_tools, messages, pid, model, data, chain, est,
+                     max_tokens=None, usage_est=None):
+    """Max tier (best/max), HARD, NON-streamed TEXT answer: the same verifier
+    (+ one corrector on a high-severity revise) as a risky tool step. Never on
+    streamed or Normal turns. Returns (pid, model, data) when a correction
+    replaced the answer, else None (serve it as is). Fail-open; never raises."""
+    try:
+        if has_tools or difficulty != "hard" or _client_gone():
+            return None
+        if str(tier or "").strip().lower() not in ("best", "max"):
+            return None
+        if _verify() is None or not config.get_flag("turn_verifier", True):
+            return None
+        msg = ((data.get("choices") or [{}])[0].get("message") or {})
+        if msg.get("tool_calls") or not str(_message_text(msg) or "").strip():
+            return None
+        started = time.monotonic()
+        kind = _task_kind(difficulty, False, est)
+        rec = {"event": "turn", "turn": "text", "kind": kind, "difficulty": difficulty,
+               "input_tokens": est, "sent_tokens": 0, "stream": False, "calls": 0,
+               "actor": "%s/%s" % (pid, model), "actor_hops": 1, "hedge": None,
+               "verifier": None, "verdict": None, "severity": None, "corrector": None,
+               "corrected": False, "served": "%s/%s" % (pid, model), "failed": [],
+               "invalid": 0}
+        try:
+            at = getattr(g, "hub_deadline_at", None)
+        except Exception:                                        # noqa: BLE001
+            at = None
+        turn_end = started + float(_SWARM_HOP_DEADLINE)
+        if isinstance(at, (int, float)):
+            turn_end = min(turn_end, at)
+        rows = [{"role": "actor", "model": "%s/%s" % (pid, model)}]
+        body = {"messages": messages}
+        if max_tokens:
+            body["max_tokens"] = max_tokens
+        out = _role_verify_and_correct(body, messages, (pid, model), msg,
+                                       [tuple(e[:2]) for e in (chain or ())], kind,
+                                       difficulty, rec, rows, turn_end, est, tool_turn=False)
+        rec["latency_s"] = round(time.monotonic() - started, 2)
+        if rec.get("verifier"):
+            _role_activity(rows, "max (verified)")
+        if out:
+            cp, cm, cdata, _cmsg = out
+            rec["served"] = "%s/%s" % (cp, cm)
+            _ctx_fix_chat_usage(cdata, usage_est or est, cp, cm)
+            cdata["model"] = cp + "/" + cm
+            _role_log(rec)
+            return cp, cm, cdata
+        if rec.get("verifier"):
+            _role_log(rec)
+        return None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _verify_family():
+    """verify.family (model id -> family name), for the pipelines' own
+    verifier choice (swarm.run / crews.run / swarm_windows.start), or None."""
+    v = _verify()
+    fam = getattr(v, "family", None) if v is not None else None
+    return fam if callable(fam) else None
+
+
+def _pipeline_search_on():
+    """Flag `pipeline_search` (default ON): wider-or-deeper retries."""
+    try:
+        return bool(config.get_flag("pipeline_search", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _pipeline_check_kwargs():
+    """swarm.run / crews.run kwargs for the reviewer family and the search.
+    {} when verify is absent and the flag is off (the pipeline exactly as
+    before); never raises."""
+    out = {}
+    try:
+        fam = _verify_family()
+        if fam is not None:
+            out["family"] = fam
+        if _pipeline_search_on():
+            out["search"] = True
+    except Exception:                                            # noqa: BLE001
+        return {}
+    return out
+
+
+def _multi_check_kwargs():
+    """swarm_windows.start / resume / resume_interrupted kwargs: the free
+    verdict (no manager needed) and the search. Same fail-open contract."""
+    out = {}
+    try:
+        if _verify() is not None:
+            out["free_verdict"] = _free_verdict
+        if _pipeline_search_on():
+            out["search"] = True
+    except Exception:                                            # noqa: BLE001
+        return {}
+    return out
+
+
+def _brief_producer(value):
+    """(pid, model) from a (pid, model) pair or a "pid/model" string, else None."""
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return (str(value[0]), str(value[1]))
+    if isinstance(value, str) and "/" in value:
+        p, m = value.split("/", 1)
+        return (p, m)
+    return None
+
+
+def _free_verdict(brief, producer=None):
+    """A FREE cross-family verdict on one pipeline phase, for the pipelines'
+    own review (swarm.run / crews.run / swarm_windows.start).
+
+    `brief` is a dict: brief["text"] = the phase brief the verifier reads (the
+    task and the phase's output); optional brief["producer"] = (pid, model) or
+    "pid/model" of the model that wrote it (the verifier is then of ANOTHER
+    family, verify.pick_verifier) and brief["avoid_families"]. A plain string
+    or a message list is accepted too. Returns {"ok", "problems", "severity"}
+    or None on ANY failure, timeout or unreadable verdict -- the pipeline then
+    proceeds exactly as without it. Never raises."""
+    v = _verify()
+    if v is None or not brief or _client_gone():
+        return None
+    try:
+        avoid = ()
+        if isinstance(brief, dict):
+            text = brief.get("text")
+            producer = _brief_producer(brief.get("producer")) or producer
+            avoid = tuple(brief.get("avoid_families") or ())
+            if not str(text or "").strip():
+                return None
+            brief = str(text)
+        producer = _brief_producer(producer)
+        if isinstance(brief, list):
+            messages = list(brief)
+        else:
+            messages = [{"role": "user", "content": str(brief)}]
+            system = getattr(v, "VERIFIER_SYSTEM", None)
+            if isinstance(system, str) and system.strip():
+                messages.insert(0, {"role": "system", "content": system})
+        est = _est_tokens(messages)
+        pid, model, _d = _route_by_difficulty(messages, None, est,
+                                              force_difficulty="medium")
+        if not pid:
+            return None
+        pool = _role_candidates(_avoid_families_last(_build_chain(pid, model, est), avoid),
+                                producer or (None, None))
+        if producer:
+            pick = v.pick_verifier(producer, pool)
+        else:
+            pick = pool[0][:2] if pool else None
+        if not pick:
+            return None
+        payload = {"model": pick[1], "stream": False, "messages": messages,
+                   "max_tokens": int(getattr(v, "VERIFY_MAX_TOKENS", 400) or 400),
+                   "_no_craft": True}
+        resp, _exc = _dispatch_chat_with_deadline(pick[0], payload, _VERIFY_DEADLINE)
+        if resp is None:
+            return None
+        try:
+            if resp.status_code != 200:
+                _swarm_note_member_status(pick[0], pick[1], resp.status_code)
+                return None
+            data = resp.json() or {}
+        finally:
+            try:
+                resp.close()
+            except Exception:                                    # noqa: BLE001
+                pass
+        text = _message_text(((data.get("choices") or [{}])[0].get("message") or {}))
+        if not str(text or "").strip():
+            return None
+        _record_chat_usage(pick[0], pick[1], data, est)
+        verdict = v.parse_verdict(text)
+        if not isinstance(verdict, dict) or "ok" not in verdict or verdict.get("unparsed"):
+            return None
+        return {"ok": bool(verdict.get("ok")),
+                "problems": list(verdict.get("problems") or []),
+                "severity": str(verdict.get("severity") or "low")}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _avoid_families_last(chain, avoid_families=()):
+    """`chain` with every entry whose verify.family(model) is in
+    `avoid_families` moved to the BACK (order kept on both sides). Never
+    excludes anything; a no-op without the verify module or families.
+    Never raises."""
+    chain = list(chain or ())
+    try:
+        fams = {str(f).strip().lower() for f in (avoid_families or ()) if f}
+        fam = _verify_family() if fams else None
+        if not fams or fam is None:
+            return chain
+        keep, back = [], []
+        for e in chain:
+            try:
+                f = str(fam(e[1]) or "").strip().lower()
+            except Exception:                                    # noqa: BLE001
+                f = ""
+            (back if f and f in fams else keep).append(e)
+        return keep + back
+    except Exception:                                            # noqa: BLE001
+        return chain
 
 
 def _swarm_stream_chunks(data):
@@ -33983,6 +35315,7 @@ def _swarm_completion(body):
     # A configured subscription manager plans/checks/fixes; free models still
     # do the work. Absent -> no kwarg, the pipeline exactly as before.
     extra.update(_swarm_manager_kwargs())
+    extra.update(_pipeline_check_kwargs())
     # The conversation beyond `messages` (recap / session memory); swarm.run
     # folds it into the brief with the earlier turns. Absent -> no kwarg.
     _ctx_text = _pipeline_context(body, messages)
@@ -34575,6 +35908,9 @@ def v1_chat_completions():
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         return _openai_error("Invalid JSON body.", 400)
+    # The tool results this turn carries credit the models whose calls made
+    # them (bandit; a no-op without it). See _bandit_credit.
+    _bandit_credit(body.get("messages"))
     return _chat_completions(body)
 
 
@@ -35216,6 +36552,13 @@ def _chat_completions_uncached(body):
             _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
             # ...and ~the visible length it asked for (reasoning allowance).
             _fit_visible_to_caller(data, payload)
+            # Max tier, hard, non-streamed TEXT: a cross-family verifier (+ one
+            # corrector on a high-severity revise). Fail-open; see roles.
+            _rv = _max_text_review(body.get("model"), diff, has_tools,
+                                   body.get("messages"), hop_pid, hop_model, data,
+                                   _chain, est, max_tokens=body.get("max_tokens"))
+            if _rv:
+                hop_pid, hop_model, data = _rv
             if isinstance(data, dict):
                 data["model"] = hop_pid + "/" + hop_model
                 # An answer cut off at the provider's OWN default budget is a
@@ -35946,6 +37289,8 @@ def v1_responses(_retry_pass=False, _hedged=False):
         return _openai_error("Could not translate request: " + _sanitize(str(exc)), 400)
     if not messages:
         return _openai_error("No input to send.", 400)
+    if not _retry_pass:
+        _bandit_credit(messages)       # see _bandit_credit
     # Codex picks a MODE on one screen and a REASONING LEVEL on the next; the
     # pair is the hub's (mode, effort). Must happen before the swarm dispatch
     # below, which keys off the model id. /v1/chat/completions has always read
@@ -36288,6 +37633,11 @@ def v1_responses(_retry_pass=False, _hedged=False):
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
             _fit_visible_to_caller(data, payload)
+            _rv = _max_text_review(body.get("model"), diff, has_tools, messages,
+                                   hop_pid, hop_model, data, _chain, est,
+                                   max_tokens=body.get("max_output_tokens"))
+            if _rv:
+                hop_pid, hop_model, data = _rv
             out = _chat_to_responses(data, model_label, tool_defs=tools)
             out["metadata"] = _served_metadata(hop_pid, hop_model)
             return (jsonify(out), 200,
@@ -36990,6 +38340,7 @@ def v1_messages():
                                 "Could not translate request: " + _sanitize(exc), 400)
     if not oai_messages:
         return _anthropic_error("invalid_request_error", "No messages to send.", 400)
+    _bandit_credit(oai_messages)       # see _bandit_credit
     has_images = image_count > 0
     # A "<category>-<effort>" compound (e.g. from ANTHROPIC_MODEL=coding-swarm)
     # sets the mode and becomes a plain effort tier, before the swarm dispatch
@@ -37272,6 +38623,11 @@ def v1_messages():
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
             _ctx_fix_chat_usage(data, input_est, hop_pid, hop_model)
             _fit_visible_to_caller(data, payload)
+            _rv = _max_text_review(body.get("model"), diff, has_tools, oai_messages,
+                                   hop_pid, hop_model, data, _chain, est,
+                                   max_tokens=body.get("max_tokens"), usage_est=input_est)
+            if _rv:
+                hop_pid, hop_model, data = _rv
             return jsonify(_openai_resp_to_anthropic(data, model_str)), 200, \
                 _routing_headers(hop_pid, hop_model, attempts, last_error)
         # Non-2xx. Retryable (429/5xx) AND hard errors (404/400/model-not-found)
@@ -39048,6 +40404,7 @@ if __name__ == "__main__":
                      daemon=True, name="stop-reconnect").start()
     _bootstrap_no_key_providers()  # no-key providers have nothing to configure -> on
     _init_quota_persistence()      # restore quota/dead-model state from the last run
+    _bandit_boot()                 # task bandit state: state_dir()/task-bandit.json
     # Declared context windows follow the fleet (agentic_chat.declared_window);
     # registered here, after the windows above are restored, so every CLI
     # config written from now on is sized on known windows.

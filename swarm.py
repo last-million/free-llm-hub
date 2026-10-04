@@ -63,7 +63,9 @@ plain "swarm" model and its tests are untouched by construction.
 """
 import ast
 import difflib
+import inspect
 import json
+import random
 import re
 import threading
 import time
@@ -1498,9 +1500,182 @@ def _gather(fn, items, timeout, need_one=False, leftovers=None):
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Pipelines verify and search (2026-10-04)
+# --------------------------------------------------------------------------- #
+#
+# Owner-approved design, adapted from Sakana's Trinity / Conductor / AB-MCTS
+# with no training: (1) the reviewer should be a DIFFERENT MODEL FAMILY from
+# the ones that produced the work (two hosts serving one family share its
+# blind spots -- excluding the producer's provider alone did not prevent
+# that); (2) where a deterministic SCORER exists (the free checks:
+# `_cheap_problems` / `_code_problems`, Multi's observed test counts) a phase
+# whose first result scores below acceptance may get up to two extra
+# attempts, each either WIDER (a fresh attempt by a different model) or
+# DEEPER (refine the best attempt so far), chosen by Thompson sampling on
+# per-choice Beta posteriors kept for the run. No scorer -> nothing extra
+# runs. Every capability the hub's verify.py provides is INJECTED (family=,
+# search=, free_verdict=), so this module stays a leaf.
+
+SEARCH_CHOICES = ("wider", "deeper")
+SEARCH_MAX_EXTRA = 2          # extra attempts per phase, hard cap
+SEARCH_MIN_SECONDS = 45       # an attempt past today's one retry needs this much clock
+SEARCH_LOG_MAX = 200          # records kept per run (persisted with it)
+_FAMILY_RE = re.compile(r"[A-Za-z]+")
+_HIGH_SEVERITY = frozenset(("high", "critical", "blocker", "severe"))
+# "[HIGH] x", "(high): x" or "High: x" -- a bare leading word needs the colon.
+_SEVERITY_TAG_RE = re.compile(
+    r"^\s*(?:[\[(]\s*(high|critical|blocker|severe|medium|low|minor)\s*[\])]\s*"
+    r"[:\-–—]?|(high|critical|blocker|severe|medium|low|minor)\s*"
+    r"[:\-–—])\s*", re.I)
+_BROKEN_PREFIXES = ("the output degenerated", "the output was empty")
+
+
+def default_family(model_id):
+    """The fallback family of a model id (or a dispatch's "pid/model"): the
+    leading letters of its LAST path segment, lowercased --
+    "moonshotai/kimi-k3" -> "kimi", "groq/llama-3.3-70b" -> "llama",
+    "@cf/qwen/qwen3-coder" -> "qwen". "" when it has none. app.py passes
+    verify.family instead once that exists."""
+    seg = str(model_id or "").strip().rstrip("/").rsplit("/", 1)[-1]
+    m = _FAMILY_RE.match(seg)
+    return m.group(0).lower() if m else ""
+
+
+def safe_family(family, model_id):
+    """family(model_id), never raising; "" when unknown."""
+    if not model_id:
+        return ""
+    try:
+        return str((family or default_family)(model_id) or "").strip().lower()
+    except Exception:                                           # noqa: BLE001
+        return ""
+
+
+def _names_kw(fn, name):
+    """Does `fn` NAME the keyword `name`? A bare **kwargs does not count: the
+    hub's _pipeline_bound wrapper takes **kw and would forward a keyword its
+    wrapped dispatch rejects."""
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def review_problems(review):
+    """The reviewer's problems as plain strings. An item may be a string
+    (optionally tagged "[HIGH] ...") or an object {"problem"|"text"|"issue":
+    ..., "severity": ...}; tags are stripped from the text."""
+    out = []
+    items = review.get("problems") if isinstance(review, dict) else None
+    if isinstance(items, str):
+        items = [items]                 # one problem, not one per character
+    for p in (items if isinstance(items, list) else []):
+        if isinstance(p, dict):
+            p = (p.get("problem") or p.get("text") or p.get("issue")
+                 or p.get("description") or "")
+        s = _SEVERITY_TAG_RE.sub("", str(p or "")).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def review_severity(review):
+    """The WORST severity a reviewer's reply states: "high" / "medium" /
+    "low", or "" when it states none. Read from a top-level "severity", a
+    per-problem "severity", or a "[HIGH] ..." tag on a problem string."""
+    if not isinstance(review, dict):
+        return ""
+    seen = []
+    top = review.get("severity")
+    if isinstance(top, str):
+        seen.append(top)
+    items = review.get("problems")
+    for p in (items if isinstance(items, list) else []):
+        if isinstance(p, dict) and isinstance(p.get("severity"), str):
+            seen.append(p["severity"])
+        elif isinstance(p, str):
+            m = _SEVERITY_TAG_RE.match(p)
+            if m:
+                seen.append(m.group(1) or m.group(2))
+    seen = [s.strip().lower() for s in seen]
+    if any(s in _HIGH_SEVERITY for s in seen):
+        return "high"
+    if "medium" in seen:
+        return "medium"
+    if any(s in ("low", "minor") for s in seen):
+        return "low"
+    return ""
+
+
+class Search:
+    """AB-MCTS lite: for ONE run, Thompson sampling between WIDER (a fresh
+    attempt by a different model) and DEEPER (refine the best attempt). Each
+    choice keeps a Beta(successes + 1, failures + 1) posterior, seeded (1, 1);
+    a success = the attempt scored strictly better than the best before it.
+    Thread-safe (a run's phases search in parallel). `log` re-derives the
+    posteriors from a persisted record (a resumed run keeps what it learnt).
+    `rng` needs .betavariate(a, b) -- tests pass a seeded or scripted one."""
+
+    def __init__(self, rng=None, max_extra=SEARCH_MAX_EXTRA, log=None):
+        self.rng = rng if rng is not None else random.Random()
+        try:
+            self.max_extra = max(0, min(SEARCH_MAX_EXTRA, int(max_extra)))
+        except (TypeError, ValueError):
+            self.max_extra = SEARCH_MAX_EXTRA
+        self.post = {c: [1, 1] for c in SEARCH_CHOICES}
+        self.log = []
+        self._lock = threading.Lock()
+        for rec in (log or ()):
+            if isinstance(rec, dict) and rec.get("choice") in self.post:
+                self._learn(rec["choice"], bool(rec.get("success")))
+                self.log.append(dict(rec))
+        del self.log[:-SEARCH_LOG_MAX]
+
+    def _learn(self, choice, success):
+        self.post[choice][0 if success else 1] += 1
+
+    def choose(self):
+        with self._lock:
+            draws = {}
+            for c in SEARCH_CHOICES:
+                a, b = self.post[c]
+                try:
+                    draws[c] = float(self.rng.betavariate(a, b))
+                except Exception:                               # noqa: BLE001
+                    draws[c] = a / float(a + b)
+        return max(SEARCH_CHOICES, key=lambda c: draws[c])    # tie -> wider
+
+    def note(self, choice, success, **record):
+        """File one attempt's outcome; returns the record."""
+        rec = dict(record, choice=choice, success=bool(success), at=round(time.time(), 3))
+        with self._lock:
+            if choice in self.post:
+                self._learn(choice, bool(success))
+            self.log.append(rec)
+            del self.log[:-SEARCH_LOG_MAX]
+        return rec
+
+    def snapshot(self):
+        with self._lock:
+            return {"posteriors": {c: list(v) for c, v in self.post.items()},
+                    "log": [dict(r) for r in self.log]}
+
+
+def make_search(search, log=None):
+    """The `search=` kwarg -> a Search or None. None/False = off (nothing
+    extra ever runs); True = on, a fresh policy (seeded from `log` when a
+    persisted run is resumed); a Search instance is used as it is."""
+    if not search:
+        return None
+    if isinstance(search, Search):
+        return search
+    return Search(log=log)
+
+
 def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         manager=None, context=None, seconds_per_phase=0, max_seconds_ceiling=None,
-        grace_seconds=0, fast_dispatch=None):
+        grace_seconds=0, fast_dispatch=None, family=None, search=None):
     """Run the pipeline. `dispatch(msgs, max_tokens, exclude_pids=()) ->
     (text, pid_model)`; it must never raise — an empty text means that call
     failed, and every stage below treats that as "carry on with what we have".
@@ -1555,9 +1730,35 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     before review (mechanical markers, then a manager-or-free verdict; gaps
     are produced by a repair worker) and present after synthesis.
 
+    THE REVIEWER IS ANOTHER FAMILY. `family(who) -> str` (default:
+    default_family) names a model's family from the dispatch's "pid/model".
+    The free review is asked to AVOID the families that produced the phases:
+    `dispatch(..., exclude_pids=..., avoid_families=(...))` -- passed only
+    when `family` was injected or `dispatch` itself names `avoid_families`
+    (a dispatch that does not know the keyword never receives it). The
+    dispatch must PREFER candidates outside those families and never refuse
+    to answer because of them. The result gains "review_family" ({producers,
+    reviewer, distinct, hinted}) whenever a free reviewer answered.
+
+    A profile with "revise_on": "high" (the write and design crews) runs ONE
+    bounded revision, even at max_revisions 0, when the reviewer marks a
+    problem HIGH severity (review_severity) -- prose that only needs polish
+    is not re-rolled.
+
+    WIDER OR DEEPER (`search`: None/False = off; True or a Search = on). A
+    phase whose output the free checks reject (a scorer: _cheap_problems)
+    gets up to SEARCH_MAX_EXTRA extra attempts instead of one retry, each
+    "wider" (the phase from scratch, every provider tried so far excluded) or
+    "deeper" (the best attempt so far plus its problems), chosen by Thompson
+    sampling on the run's per-choice Beta posteriors; the best-scoring
+    attempt ships. Past today's one retry an attempt needs
+    SEARCH_MIN_SECONDS on the clock. A phase no free check rejects gets
+    nothing extra. Every choice and outcome is in result["search"]
+    ({posteriors, log}).
+
     Returns {"text", "plan", "phases", "review", "models", "planned"[,
-    "unfinished", "cap_seconds"]} — `text` is always a non-empty answer unless
-    every single call failed."""
+    "unfinished", "cap_seconds", "review_family", "search"]} — `text` is
+    always a non-empty answer unless every single call failed."""
     profile = profile or {}
     plan_system = profile.get("plan_system") or _PLAN_SYSTEM
     phase_system = profile.get("phase_system") or _PHASE_SYSTEM
@@ -1570,6 +1771,16 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         max_revisions = max(0, int(profile.get("max_revisions") or 0))
     except (TypeError, ValueError):
         max_revisions = 0
+    revise_on_high = str(profile.get("revise_on") or "").strip().lower() == "high"
+    fam_fn = family if callable(family) else default_family
+    # The family hint reaches dispatch only when the caller opted in.
+    avoid_ok = callable(family) or _names_kw(dispatch, "avoid_families")
+    policy = make_search(search)
+    always = {}                      # result keys added with or without a manager
+
+    def _fam(who):
+        return safe_family(fam_fn, who)
+
     def emit(kind, detail):
         if on_event:
             try:
@@ -1697,9 +1908,10 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         return (text, out[1] or "manager") if text.strip() else ("", None)
 
     def _staged(free_msgs, free_tokens, purpose, mgr_msgs=None, mgr_tokens=None,
-                exclude=None):
+                exclude=None, avoid=None):
         """One manager-eligible stage: the manager on a clipped view first,
-        else the free dispatch with EXACTLY the call it always made."""
+        else the free dispatch with EXACTLY the call it always made (plus the
+        `avoid_families` hint, only when the caller opted in to it)."""
         staged_by_manager[0] = False
         if manager is not None:
             text, who = _mgr(mgr_msgs or free_msgs, mgr_tokens or free_tokens, purpose)
@@ -1707,9 +1919,12 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                 staged_by_manager[0] = True
                 return text, who
             emit(purpose, "manager unavailable — free models")
-        if exclude is None:
-            return dispatch(free_msgs, free_tokens)
-        return dispatch(free_msgs, free_tokens, exclude_pids=exclude)
+        kw = {}
+        if exclude is not None:
+            kw["exclude_pids"] = exclude
+        if avoid and avoid_ok:
+            kw["avoid_families"] = tuple(avoid)
+        return dispatch(free_msgs, free_tokens, **kw)
 
     def _finish(result):
         if manager is not None:
@@ -1717,6 +1932,9 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                 result["manager_tokens"] = mgr_spent[0]
                 result["manager_calls"] = len(mgr_calls)
             result.update(extras)
+        result.update(always)
+        if policy is not None:
+            result["search"] = policy.snapshot()
         return result
 
     def _spent():
@@ -2246,6 +2464,59 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
             return text, who, trail
         return "", None, trail
 
+    def _search_ok(n):
+        """May extra attempt `n` start? The first stands in for today's one
+        retry (only a spent clock stops it); a later one needs
+        SEARCH_MIN_SECONDS left on the run's clock."""
+        if _spent():
+            return False
+        left = _left()
+        return n <= 1 or left is None or left >= SEARCH_MIN_SECONDS
+
+    def _search_phase(idx, text, who, probs, failed):
+        """WIDER or DEEPER, up to policy.max_extra extra attempts while the
+        free checks (the scorer: problem count, 0 = accepted) reject the
+        best attempt. -> (best text, its who, trail, its problems). The best
+        attempt is never replaced by a worse one; an empty reply never wins."""
+        title = phases[idx - 1]["title"]
+        best = {"text": text or "", "who": who, "probs": list(probs or ())}
+        trail = []
+        tried = {p for p in (failed or ()) if p}
+        if who:
+            tried.add(who.split("/", 1)[0])
+        for n in range(1, policy.max_extra + 1):
+            if not best["probs"] or not _search_ok(n):
+                break
+            # A degenerate/empty best has nothing to refine: wider, forced.
+            forced = (not best["text"].strip()
+                      or any(str(p).startswith(_BROKEN_PREFIXES) for p in best["probs"]))
+            choice = "wider" if forced else policy.choose()
+            if choice == "wider":
+                got = dispatch(_phase_msgs(idx), PHASE_MAX_TOKENS,
+                               exclude_pids=tuple(sorted(tried)))
+            else:
+                got = dispatch(_retry_msgs(idx, best["probs"], best["text"]),
+                               PHASE_MAX_TOKENS, exclude_pids=())
+            t, w = (tuple(got if isinstance(got, (tuple, list)) else ()) + ("", None))[:2]
+            t = t or ""
+            p = _cheap_problems(idx, t)
+            if w:
+                trail.append(("phase-%s:%s" % (choice, title), w))
+                tried.add(w.split("/", 1)[0])
+            before = len(best["probs"])
+            after = len(p) if t.strip() else None
+            better = after is not None and after < before
+            policy.note(choice, better, phase=idx, title=title[:80], attempt=n,
+                        score_before=before, score_after=after,
+                        accepted=after == 0, forced=forced, who=w)
+            emit("search", "%s: %s attempt %d — %s"
+                 % (title[:30], choice, n, "accepted" if after == 0 else
+                    "no answer" if after is None else
+                    "%d problem%s" % (after, "" if after == 1 else "s")))
+            if after is not None and after <= before:
+                best = {"text": t, "who": w, "probs": p}
+        return best["text"], best["who"], trail, best["probs"]
+
     def _verify_set(idxs, first, final):
         """Check a WAVE's outputs together: free checks first, then ONE
         manager verdict for every output they could not settle (none for an
@@ -2317,6 +2588,23 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                 check_info.update(info)
             return {i: p for i, p in res.items() if p}
 
+        def _search(probs):
+            """The free checks scored these below acceptance: WIDER or
+            DEEPER attempts (see _search_phase) in place of the one retry;
+            the best-scoring attempt is what the verdict then judges."""
+            got = _gather(lambda i: _search_phase(i, st[i]["text"], st[i]["who"],
+                                                  probs[i], st[i]["failed"]),
+                          sorted(probs), _left())
+            for i in sorted(probs):
+                r = got.get(i)
+                retried.add(i)
+                if not isinstance(r, tuple) or len(r) < 4:
+                    continue                 # cut by the clock: the first attempt stands
+                text, who, trail = r[0], r[1], r[2]
+                st[i]["trail"].extend(trail)
+                if text:
+                    st[i]["text"], st[i]["who"] = text, who
+
         def _unsettled(ids):
             """(cheap problems, the ids that still need a verdict)."""
             probs, judge = {}, []
@@ -2334,7 +2622,10 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
         if cheap:
             _rejected(cheap)
             if not _spent():
-                _retry(cheap)
+                if policy is not None:
+                    _search(cheap)
+                else:
+                    _retry(cheap)
                 cheap2, judge2 = _unsettled(sorted(cheap))
                 judge = sorted(set(judge) | set(judge2))
                 failing.update(cheap2)
@@ -2444,6 +2735,29 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                 if text:
                     outputs[i] = text
                     titles[i] = phases[i - 1]["title"]
+            if policy is not None:
+                # WIDER OR DEEPER without a manager: only the phases the free
+                # checks score below acceptance (no scorer, nothing extra),
+                # before the next wave builds on them.
+                scored = {}
+                for i in sorted(results):
+                    if outputs.get(i):
+                        p = _cheap_problems(i, outputs[i])
+                        if p:
+                            scored[i] = p
+                if scored and not _spent():
+                    got = _gather(lambda i: _search_phase(i, outputs[i], results[i][1],
+                                                          scored[i], ()),
+                                  sorted(scored), _left())
+                    for i in sorted(got):
+                        r = got[i]
+                        if not isinstance(r, tuple) or len(r) < 4:
+                            continue
+                        for role, w in r[2]:
+                            models_used.append((role, w))
+                            exec_pids.add(w.split("/", 1)[0])
+                        if r[0]:
+                            outputs[i] = r[0]
     else:
         # WITH A MANAGER the waves are PIPELINED: wave k's verification (a
         # paid call, 30-150 s) runs WHILE wave k+1's free workers build on
@@ -2763,23 +3077,40 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
             emit("budget", "not finished: %s" % "; ".join(unfinished)[:120])
         return _finish(out)
 
-    # ---- 3. REVIEW (different provider on purpose) ------------------------
+    # ---- 3. REVIEW (different provider AND family on purpose) --------------
     # Skipped past the wall clock: an unreviewed answer now beats a reviewed
     # one after the client has given up.
+    def _producer_families():
+        """The families of every model whose output is in the draft."""
+        fams = set()
+        for role, w in models_used:
+            if w and str(role).startswith(("phase", "repair")):
+                f = _fam(w)
+                if f:
+                    fams.add(f)
+        return tuple(sorted(fams))
+
     def _review(suffix=""):
         # The manager reviews excerpts; the full draft goes only to a free
-        # reviewer, exactly as before.
+        # reviewer, exactly as before -- asked to avoid the producers' families.
         mgr_work = _clip("\n\n".join(
             "## %s\n%s" % (d["title"], _clip(d["output"], MANAGER_PHASE_CHARS))
             for d in done) if len(done) > 1 else done[0]["output"], MANAGER_DRAFT_CHARS)
-        return _staged(
+        fams = _producer_families()
+        text, who = _staged(
             [{"role": "system", "content": review_system},
              {"role": "user", "content": "BRIEF\n%s\n\nWORK\n%s%s" % (brief, draft, suffix)}],
             REVIEW_MAX_TOKENS, "review",
             mgr_msgs=[{"role": "system", "content": review_system},
                       {"role": "user", "content": "BRIEF\n%s\n\nWORK (excerpts)\n%s%s"
                        % (mgr_brief, mgr_work, suffix)}],
-            mgr_tokens=MANAGER_REVIEW_TOKENS, exclude=tuple(exec_pids))
+            mgr_tokens=MANAGER_REVIEW_TOKENS, exclude=tuple(exec_pids), avoid=fams)
+        if who and not staged_by_manager[0]:
+            rf = _fam(who)
+            always["review_family"] = {"producers": list(fams), "reviewer": rf,
+                                       "distinct": bool(rf) and rf not in fams,
+                                       "hinted": bool(fams) and avoid_ok}
+        return text, who
 
     def _synthesis(text_in, probs):
         synth_user = "BRIEF\n%s\n\nPHASE OUTPUTS\n%s" % (brief, text_in)
@@ -2800,7 +3131,8 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
     # still gets the review.
     # A crew that asks for its own reviewer (a custom review prompt, or a
     # review -> revise loop) always gets it: that review is the point of it.
-    wants_review = bool(profile.get("review_system")) or max_revisions >= 1
+    wants_review = (bool(profile.get("review_system")) or max_revisions >= 1
+                    or revise_on_high)
     all_clean = (manager is not None and not single and not wants_review
                  and coverage_by_manager
                  and not gaps and not gap_parts
@@ -2842,8 +3174,36 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
             extras["review_warning"] = ("the reviewer's reply was unreadable twice "
                                         "— shipped without a review")
             emit("review", "unreadable twice — shipping unreviewed")
-    problems = [str(p).strip() for p in (review.get("problems") or []) if str(p).strip()]
-    needs_work = (str(review.get("verdict") or "").lower() == "revise") and problems
+    problems = review_problems(review)
+    # WEB SLOP in the finished text (slopcheck, no model call): the HTML/CSS in
+    # code fences of a web answer. HIGH findings join the reviewer's problems
+    # (and earn the one bounded revision); the rest ride along as a warning.
+    slop_high = []
+    try:
+        import craft
+        import verify
+        if craft.skill_enabled("web_design") and (
+                profile.get("slop_check") or craft.is_web_ui(brief)):
+            blocks = verify.html_blocks(draft)
+            rep = verify.slop_report(blocks) if blocks else None
+            if rep and rep["findings"]:
+                slop_high = rep["high"]
+                always["slop_check"] = {"line": rep["line"], "high": rep["counts"]["high"],
+                                        "medium": rep["counts"]["medium"],
+                                        "warnings": rep["warnings"]}
+                emit("verify", rep["line"])
+    except Exception:                                            # noqa: BLE001
+        slop_high = []
+    problems = problems + slop_high
+    needs_work = ((str(review.get("verdict") or "").lower() == "revise") and problems) \
+        or bool(slop_high)
+    # ONE bounded revision for a HIGH-severity problem when the profile asks
+    # ("revise_on": "high" -- the write and design crews), else as before.
+    rev_cap = max_revisions
+    if needs_work and rev_cap < 1 and revise_on_high and (
+            slop_high or review_severity(review) == "high"):
+        rev_cap = 1
+        emit("revise", "the reviewer marked a problem high severity — one revision")
 
     # ---- 3b. REVISION — one bounded pass, only when the profile asks --------
     # max_revisions 0 (the default, and the plain "swarm" model) keeps today's
@@ -2921,7 +3281,7 @@ def run(messages, dispatch, profile=None, on_event=None, max_seconds=None,
                 "per-phase", trail)
 
     revised = False
-    if needs_work and max_revisions >= 1 and not _over("the revision"):
+    if needs_work and rev_cap >= 1 and not _over("the revision"):
         emit("revise", "fixing %d problem%s" % (len(problems), "" if len(problems) == 1 else "s"))
         if manager is None:
             # DIRECTED here too. The plain pipeline used to hand ONE free
