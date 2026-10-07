@@ -2131,6 +2131,51 @@ top 1-2 models.
   turns are agent-loop continuations (min 39K, p50 139K tokens), so this gate
   adds ~0 calls on that traffic; it fires on fresh opening turns only.
 
+## Provider fairness (2026-10-07)
+
+Covered by `tests/test_provider_fairness.py`. Owner: "it doesn't use all
+providers equally; groq and other providers are almost never used." MEASURED
+over 7 days of tool turns (`turn-roles.jsonl`, 2329 turns): nvidia served
+**29.6%** of all served tool turns (tried 1076x, median 65.7 s, 113 timeouts)
+while it piled up; uncloseai 13.2%, g4f 13.6%, kilocode 12.6%, dahl 12.1%,
+openrouter 10.4%, google 7.1%; **groq tried 68x, served 0** (its free tier caps
+one request at ~8K tokens and **97% of tool turns are >= 60K** -- only 28 of
+2329 were < 12K -- so its instant `_ContextOverflow` is a real provider limit,
+not a bug). Band coverage: small (<12K) 6 providers tried / 4 served, medium
+(12-60K) 11 / 9, big (>=60K) 12 / 8. The band holds several equally-good
+providers, but `_weighted_pick` + the session pin kept landing fresh sessions
+on the same strongest host (the `[spread]` log showed pool size 1 on 863 of
+1031 picks -- nothing to spread for a lone session).
+
+- **The rule**: `_fair_spread_band(band, est)` runs between `_auto_top_band`
+  and `_weighted_pick` in the agentic pick (`_route_by_difficulty`'s
+  `_spread_pick_lock` block, and the trivial quick-turn pick). It NEVER crosses
+  the band -- benchmarks + owner floors still set the order, a 134 never beats
+  an available 138 -- it only NARROWS the band (every member already within
+  `_AUTO_TOP_BAND` = 2.0 of the best, the owner's "equally good") to the
+  provider carrying the least current load, and FAILS OPEN at every step (the
+  full band comes back whenever a narrowing would empty it, and a cold fleet is
+  left untouched so the weighted pick behaves exactly as before).
+- **Load** = in-flight upstream requests + recent (2 min) hop failures + 2x the
+  15-min routing share (`_provider_load`). Steps: (1) small request (est <
+  `_FAIR_SMALL_EST` = 8000) prefers FAST providers in the band -- this is where
+  groq/cerebras-class SHOULD be used often, and the band is already window-
+  filtered (`_context_ok`) so a too-small window is never chosen; (2) a provider
+  at/over the per-provider in-flight soft cap (setting
+  `provider_inflight_soft_cap`, default 3) yields; (3) a provider carrying
+  >= 50% of the last 15 min of picks yields; (4) the least-loaded provider(s)
+  win. Flag `provider_fairness` (default on).
+- **In-flight counter** (`_inflight_inc` / `_dec` / `_count`, thread-safe)
+  wraps `_dispatch_chat`: a non-stream hop is counted for the whole call; a
+  stream stays counted until its response object is finalized (whole stream
+  duration), via `weakref.finalize`. **Routing picks** are logged per turn
+  (`_note_route_pick`, incl. pinned turns) into `_ROUTE_LOG` for the 15-min
+  share -- so a provider carrying real traffic (even via pins) raises its own
+  share and fresh sessions spread away from it.
+- **Visible**: `GET /api/provider-load` (control-token gated) -- per provider:
+  `inflight`, `routed_15m`, `routed_24h`, `share_15m`, `recent_failures`,
+  `load`; plus `total_inflight`, `soft_cap`, `fairness_on`.
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):

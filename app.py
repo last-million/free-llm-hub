@@ -7284,36 +7284,54 @@ def _dispatch_chat(pid, payload, stream):
     payload = _strip_private_keys(payload)
     if _is_sub(pid):
         return _subscription_chat(pid, payload)
-    if stream:
-        # A streaming call returns once headers are in, so there is no total
-        # duration to record here -- but the clock is still worth starting:
-        # _note_ttft reads it back off the response when the first real content
-        # arrives, which is the number that actually describes a stream.
+    # IN-FLIGHT LOAD (see _fair_spread_band): count one open upstream request to
+    # this provider for the duration of the call. For a NON-stream hop that is
+    # the whole request; for a STREAM, _dispatch_chat returns once headers are
+    # in while the body keeps flowing, so the release is deferred to the
+    # response object's finalizer -- the provider stays counted for the whole
+    # stream, which is exactly the contention a slow host creates. Fail-open.
+    _inflight_inc(pid)
+    _released = False
+    try:
+        if stream:
+            # A streaming call returns once headers are in, so there is no total
+            # duration to record here -- but the clock is still worth starting:
+            # _note_ttft reads it back off the response when the first real content
+            # arrives, which is the number that actually describes a stream.
+            started = time.perf_counter()
+            resp = _nb_close(_upstream_chat(pid, payload, stream))
+            try:
+                resp._hub_started = started
+                # Size of what was asked, for the long-context speed ledger.
+                resp._hub_est_tokens = _payload_est_tokens(payload)
+            except Exception:                                        # noqa: BLE001
+                pass
+            try:
+                # Release when the stream response is done with / GC'd.
+                weakref.finalize(resp, _inflight_dec, pid)
+                _released = True
+            except Exception:                                        # noqa: BLE001
+                pass
+            return resp
+        # perf_counter, not time(): this is a DURATION, so it must be monotonic (an
+        # NTP step or DST jump mid-request must not record a negative or wildly
+        # inflated one) AND high-resolution. time.monotonic() ticks at ~15.6ms on
+        # Windows, which floors any faster hop to exactly 0.0 -- and _record_latency
+        # drops a 0, so those samples would vanish and bias the average slow.
         started = time.perf_counter()
-        resp = _nb_close(_upstream_chat(pid, payload, stream))
+        resp = _upstream_chat(pid, payload, stream)
         try:
-            resp._hub_started = started
-            # Size of what was asked, for the long-context speed ledger.
-            resp._hub_est_tokens = _payload_est_tokens(payload)
-        except Exception:                                        # noqa: BLE001
+            if resp is not None and getattr(resp, "status_code", None) == 200:
+                ms = (time.perf_counter() - started) * 1000.0
+                _record_latency(pid, (payload or {}).get("model"), ms)
+                _record_long_ctx_speed(pid, (payload or {}).get("model"),
+                                       _payload_est_tokens(payload), ms)
+        except Exception:                                            # noqa: BLE001
             pass
         return resp
-    # perf_counter, not time(): this is a DURATION, so it must be monotonic (an
-    # NTP step or DST jump mid-request must not record a negative or wildly
-    # inflated one) AND high-resolution. time.monotonic() ticks at ~15.6ms on
-    # Windows, which floors any faster hop to exactly 0.0 -- and _record_latency
-    # drops a 0, so those samples would vanish and bias the average slow.
-    started = time.perf_counter()
-    resp = _upstream_chat(pid, payload, stream)
-    try:
-        if resp is not None and getattr(resp, "status_code", None) == 200:
-            ms = (time.perf_counter() - started) * 1000.0
-            _record_latency(pid, (payload or {}).get("model"), ms)
-            _record_long_ctx_speed(pid, (payload or {}).get("model"),
-                                   _payload_est_tokens(payload), ms)
-    except Exception:                                            # noqa: BLE001
-        pass
-    return resp
+    finally:
+        if not _released:
+            _inflight_dec(pid)
 
 
 def _payload_est_tokens(payload):
@@ -8549,6 +8567,205 @@ def _chat_pick_key(entry):
     return (score, _quota_headroom(pid))
 
 
+# ─────────────────────────────────────────────────────────────────────────── #
+# PROVIDER FAIRNESS (2026-10-07). Owner: "it doesn't use all providers equally;
+# groq and other providers are almost never used." MEASURED (7 days of tool
+# turns, turn-roles.jsonl): nvidia served 29.6% of all tool turns (tried 1076x,
+# median 65.7s, 113 timeouts) while it piled up; groq was tried 68x and served
+# 0 (its free tier caps a single request at ~8K tokens and 97% of tool turns
+# are >= 60K). The top band often holds several equally-good providers, but the
+# weighted pick + session pin kept landing fresh sessions on the same strongest
+# host. This adds a LOAD-aware tie-break INSIDE the band (never across it): among
+# models already within _AUTO_TOP_BAND of the best (the owner's "equally good"),
+# prefer the provider carrying the least current load. It only ever NARROWS the
+# band to a subset of equally-good candidates and fails open at every step, so
+# "best available first" is never broken and a weaker-than-band model is never
+# introduced. Visible at GET /api/provider-load.
+import collections                         # noqa: E402  (stdlib; idempotent)
+import weakref                             # noqa: E402  (stdlib; stream in-flight finalizer)
+
+_PROVIDER_INFLIGHT = collections.defaultdict(int)   # pid -> upstream calls open now
+_inflight_lock = threading.Lock()
+
+
+def _inflight_inc(pid):
+    """Count one upstream request open to `pid` (around _dispatch_chat)."""
+    if not pid:
+        return
+    try:
+        with _inflight_lock:
+            _PROVIDER_INFLIGHT[pid] += 1
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _inflight_dec(pid):
+    """Release one. Never goes below zero; a settled provider drops out."""
+    if not pid:
+        return
+    try:
+        with _inflight_lock:
+            n = _PROVIDER_INFLIGHT.get(pid, 0) - 1
+            if n > 0:
+                _PROVIDER_INFLIGHT[pid] = n
+            else:
+                _PROVIDER_INFLIGHT.pop(pid, None)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _inflight_count(pid):
+    try:
+        with _inflight_lock:
+            return _PROVIDER_INFLIGHT.get(pid, 0)
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+
+def _inflight_snapshot():
+    try:
+        with _inflight_lock:
+            return dict(_PROVIDER_INFLIGHT)
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+# Routing picks (ts, pid): the 15-min measured share the tie-break reads and
+# what /api/provider-load reports. A pinned session logs its host EVERY turn, so
+# a provider that is carrying real traffic (even via pins) raises its own share
+# and fresh sessions spread away from it -- which is the whole point.
+_ROUTE_LOG = collections.deque(maxlen=20000)
+_route_log_lock = threading.Lock()
+
+
+def _note_route_pick(pid):
+    if not pid:
+        return
+    try:
+        with _route_log_lock:
+            _ROUTE_LOG.append((time.time(), pid))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _route_counts(window):
+    """pid -> routing picks inside `window` seconds."""
+    cutoff = time.time() - window
+    out = collections.Counter()
+    try:
+        with _route_log_lock:
+            snap = list(_ROUTE_LOG)
+    except Exception:                                            # noqa: BLE001
+        snap = []
+    for ts, pid in snap:
+        if ts >= cutoff:
+            out[pid] += 1
+    return out
+
+
+def _provider_recent_share(pid, window=900.0):
+    """Fraction of routing picks in the last `window` seconds that went to
+    `pid` (0.0 when nothing has been routed)."""
+    c = _route_counts(window)
+    tot = sum(c.values())
+    return (c.get(pid, 0) / tot) if tot else 0.0
+
+
+def _provider_recent_fails(pid, window=120.0):
+    """How many of `pid`'s (pid, model) pairs failed a hop inside `window`
+    seconds (the existing recent-failure ledger, summed per provider)."""
+    now = time.time()
+    try:
+        with _recent_fail_lock:
+            items = list(_recent_hop_fail.items())
+    except Exception:                                            # noqa: BLE001
+        return 0
+    return sum(1 for (p, _m), rec in items
+               if p == pid and rec and now - rec[0] <= window)
+
+
+_PROVIDER_INFLIGHT_SOFT_CAP = 3     # per-provider in-flight; setting overrides
+_FAIR_SMALL_EST = 8000              # groq/cerebras-class fit here -> let them compete
+_FAIR_SHARE_HOG = 0.50             # a provider >= 50% of the last 15 min yields
+_FAIR_LOAD_TIE = 0.75              # keep providers within this of the min load
+
+
+def _provider_soft_cap():
+    try:
+        v = int(config.get_setting("provider_inflight_soft_cap",
+                                   _PROVIDER_INFLIGHT_SOFT_CAP))
+        return v if v > 0 else _PROVIDER_INFLIGHT_SOFT_CAP
+    except Exception:                                            # noqa: BLE001
+        return _PROVIDER_INFLIGHT_SOFT_CAP
+
+
+def _provider_load(pid):
+    """Lower = less loaded. in-flight requests + recent hop failures + twice the
+    15-min routing share. 0.0 for a cold, unseen provider -- so a quiet fleet is
+    judged exactly as before (the tie-break below only engages under load)."""
+    try:
+        return (float(_inflight_count(pid))
+                + float(_provider_recent_fails(pid, 120.0))
+                + 2.0 * _provider_recent_share(pid, 900.0))
+    except Exception:                                            # noqa: BLE001
+        return 0.0
+
+
+def _fair_spread_band(band, est=0):
+    """`band` (every member already within _AUTO_TOP_BAND of the best, i.e.
+    'equally good') narrowed to the provider(s) carrying the LEAST current load.
+
+    OWNER RULE kept: benchmarks + owner floors set the order; this only ever
+    chooses AMONG equally-good models, never introduces a weaker-than-band one,
+    and FAILS OPEN at every step (the full band comes back whenever a narrowing
+    would empty it). Returns `band` unchanged when fairness is off, the band has
+    one member, or one provider."""
+    try:
+        if not config.get_flag("provider_fairness", True):
+            return list(band or ())
+        band = list(band or ())
+        if len(band) < 2:
+            return band
+        if len({c[1] for c in band}) < 2:
+            return band                     # one provider -> nothing to spread
+        elig = band
+        # (1) SMALL request -> let the FAST providers (groq/cerebras-class)
+        #     compete inside the band. This is where groq SHOULD be used often.
+        #     The band is already filtered to models whose window fits the
+        #     request (_context_ok upstream), so a too-small window is never
+        #     chosen here.
+        if est and est < _FAIR_SMALL_EST:
+            fast = [c for c in elig if _is_fast(c[1], c[2])]
+            if fast:
+                elig = fast
+        # (2) SOFT CAP: a provider at/over the per-provider in-flight cap yields
+        #     to an equally-good provider under it.
+        cap = _provider_soft_cap()
+        under = [c for c in elig if _inflight_count(c[1]) < cap]
+        if under and len({c[1] for c in under}) < len({c[1] for c in elig}):
+            elig = under
+        # (3) SHARE HOG: a provider already carrying >= 50% of the last 15 min of
+        #     picks yields to an equally-good model elsewhere.
+        hogs = {p for p in {c[1] for c in elig}
+                if _provider_recent_share(p) >= _FAIR_SHARE_HOG}
+        if hogs:
+            others = [c for c in elig if c[1] not in hogs]
+            if others:
+                elig = others
+        # (4) LOWEST LOAD WINS. Only engages when some provider is actually
+        #     loaded, so a cold fleet hands the full band to the weighted pick
+        #     exactly as before.
+        loads = {p: _provider_load(p) for p in {c[1] for c in elig}}
+        if loads and max(loads.values()) > 0.0:
+            lo = min(loads.values())
+            least = [c for c in elig if loads[c[1]] <= lo + _FAIR_LOAD_TIE]
+            if least:
+                elig = least
+        return elig or band
+    except Exception:                                            # noqa: BLE001
+        return list(band or ())
+
+
 def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=False,
                          force_difficulty=None, quality_mode=False):
     """Pick (pid, model) by task difficulty across AVAILABLE providers that can
@@ -8771,6 +8988,7 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
             if _host:
                 if _host != _pinned:
                     _session_pin_set(_skey, _host[0], _host[1])
+                _note_route_pick(_host[0])    # a pinned turn is still provider load
                 return _host[0], _host[1], difficulty
         # A TRIVIAL SMALL TOOL TURN ("use the add tool to add 17 and 25") has
         # nothing for a strong slow model to be strong at. The agentic pool
@@ -8788,7 +9006,10 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
                       and _chain_reliability_band(c[1], c[2]) < 2]
             if _quick:
                 _quick = [c for c in _quick if _may_lead_agentic(c[0], c[2])] or _quick
+                # Among equally-quick candidates, prefer the least-loaded host.
+                _quick = _fair_spread_band(_quick, est)
                 _s, pid, model = max(_quick, key=_chat_pick_key)
+                _note_route_pick(pid)
                 return pid, model, difficulty
         # NOTE: an "AGENTROUTER FIRST" block sat here until 2026-07-31 — it
         # tried the AgentRouter relay's paid models BEFORE the free tier on
@@ -8865,10 +9086,12 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
             _pool = _spread_pool(_pool, _skey)
             _sustain = _model_identity_min_penalty(_pool)
             _pool = _auto_top_band(_pool, _sustain, kind=_kind)
+            _pool = _fair_spread_band(_pool, est)   # least-loaded host wins ties
             picked = _weighted_pick(_pool, _sustain)
             _s, pid, model = picked
             _session_pin_set(_skey, pid, model)
             _note_worker_model(_skey, model, pid)
+            _note_route_pick(pid)
             _log.info("[spread] %s -> %s/%s (pool %d, held elsewhere %d)",
                       (_skey or "-")[:8], pid, model, len(_pool),
                       len(_pinned_elsewhere(_skey)))
@@ -17678,6 +17901,45 @@ def api_tracking():
                     # Window coverage over the USABLE models.
                     "ctx_coverage": {"known": len(ok_rows) - ctx_by.get("default", 0),
                                      "total": len(ok_rows), "by_source": ctx_by}})
+
+
+@app.route("/api/provider-load", methods=["GET"])
+def api_provider_load():
+    """LIVE per-provider load the fairness tie-break reads (see
+    _fair_spread_band): upstream requests in flight right now, routing picks
+    over the last 15 min / 24 h and the 15-min share, and recent (last 2 min)
+    hop failures. Read-only; control-token gated by the global before_request
+    like every /api/* route; makes NO upstream calls."""
+    inflight = _inflight_snapshot()
+    c15 = _route_counts(900.0)
+    c24 = _route_counts(86400.0)
+    tot15 = sum(c15.values())
+    try:
+        keyed = set(_enabled_keyed())
+    except Exception:                                            # noqa: BLE001
+        keyed = set()
+    provs = sorted(set(inflight) | set(c15) | set(c24) | keyed)
+    rows = []
+    for pid in provs:
+        rows.append({
+            "provider": pid,
+            "inflight": inflight.get(pid, 0),
+            "routed_15m": c15.get(pid, 0),
+            "routed_24h": c24.get(pid, 0),
+            "share_15m": round(c15.get(pid, 0) / tot15, 4) if tot15 else 0.0,
+            "recent_failures": _provider_recent_fails(pid, 120.0),
+            "load": round(_provider_load(pid), 3),
+        })
+    rows.sort(key=lambda r: (-r["inflight"], -r["routed_15m"], r["provider"]))
+    return jsonify({
+        "providers": rows,
+        "total_inflight": sum(inflight.values()),
+        "routed_15m": tot15,
+        "routed_24h": sum(c24.values()),
+        "soft_cap": _provider_soft_cap(),
+        "fairness_on": config.get_flag("provider_fairness", True),
+        "window_seconds": {"share": 900, "recent_failures": 120},
+    })
 
 
 @app.route("/api/model-windows", methods=["GET"])
