@@ -20935,7 +20935,25 @@ _DEFAULT_BLOCKED_IDENTITIES = frozenset({
     "nex-n2.5-mini", "nex-n2.5-pro",
     "north-mini-code",
     "sauerkrautlm-nemo-12b-instruct",
+    # OWNER DECISION 2026-10-07: the owner's own blocklist ships as the default
+    # for every install (IBM Granite 3.x / code, LFM 2.5 2.6B, Poolside Laguna,
+    # StepFun Step-3.7-Flash, Apodex mini, Gemma 4 on every host).
+    "apodex-1.1-mini",
+    "gemma-4-26b-a4b-it", "gemma-4-31b-it",
+    "granite-3.0-3b-a800m-instruct", "granite-3.0-8b-instruct",
+    "granite-34b-code-instruct", "granite-8b-code-instruct",
+    "lfm-2.5-2.6b",
+    "poolside-laguna-s-2.1",
+    "step-3.7-flash",
 })
+# Exact provider/model pairs the owner switched off where the SAME model stays
+# fine on other hosts (identity-level blocking would lose those copies).
+# Seeded into the editable blocked_models list with the same "offered once"
+# snapshot rule as the identities above.
+_DEFAULT_BLOCKED_MODELS = frozenset({
+    "dahl/MiniMaxAI/MiniMax-M2.7",
+})
+_DEFAULT_MODEL_BLOCKS_SEEDED_SETTING = "default_model_blocks_seeded_ids"
 # Which shipped identities this install has ALREADY been offered. Seeding adds
 # only entries NOT in this snapshot, then records the whole shipped set here --
 # so a family the user later unticks is never re-added (it is already in the
@@ -21277,8 +21295,9 @@ def _seed_default_blocks():
     except Exception:                                            # noqa: BLE001
         already = set()
     fresh = {i for i in _DEFAULT_BLOCKED_IDENTITIES if i not in already}
+    added = _seed_default_model_blocks()
     if not fresh:
-        return 0
+        return added
     cur = _identity_set(_BLOCKED_IDENTITY_SETTING)
     to_add = {i for i in fresh if i not in cur}
     try:
@@ -21288,7 +21307,28 @@ def _seed_default_blocks():
                            sorted(already | set(_DEFAULT_BLOCKED_IDENTITIES)))
     except Exception:                                            # noqa: BLE001
         pass
-    return len(to_add)
+    return len(to_add) + added
+
+
+def _seed_default_model_blocks():
+    """The same offered-once seed as _seed_default_blocks, for exact
+    provider/model pairs (_DEFAULT_BLOCKED_MODELS -> blocked_models). Returns
+    how many were newly added. Never raises."""
+    try:
+        already = {str(x) for x in (config.get_setting(
+            _DEFAULT_MODEL_BLOCKS_SEEDED_SETTING, []) or []) if str(x).strip()}
+        fresh = {m for m in _DEFAULT_BLOCKED_MODELS if m not in already}
+        if not fresh:
+            return 0
+        cur = _blocked_models()
+        to_add = {m for m in fresh if m not in cur}
+        if to_add:
+            config.set_setting(_BLOCKED_SETTING, sorted(cur | to_add))
+        config.set_setting(_DEFAULT_MODEL_BLOCKS_SEEDED_SETTING,
+                           sorted(already | set(_DEFAULT_BLOCKED_MODELS)))
+        return len(to_add)
+    except Exception:                                            # noqa: BLE001
+        return 0
 
 
 def _category_overrides():

@@ -56,7 +56,7 @@ def test_the_defaults_are_bare_identities_not_provider_ids():
 
 def test_a_fresh_install_gets_every_default(store):
     added = A._seed_default_blocks()
-    assert added == len(A._DEFAULT_BLOCKED_IDENTITIES)
+    assert added == len(A._DEFAULT_BLOCKED_IDENTITIES) + len(A._DEFAULT_BLOCKED_MODELS)
     assert A._DEFAULT_BLOCKED_IDENTITIES <= A._blocked_identities()
     # The whole shipped set is recorded as offered.
     assert A._DEFAULT_BLOCKED_IDENTITIES <= set(store[A._DEFAULT_BLOCKS_SEEDED_SETTING])
@@ -106,3 +106,31 @@ def test_a_users_own_block_is_preserved(store):
     got = A._blocked_identities()
     assert "something-i-hate" in got
     assert A._DEFAULT_BLOCKED_IDENTITIES <= got
+
+
+# --------------------------------------------------------------------------- #
+# The owner's own blocklist ships as the default (2026-10-07)
+# --------------------------------------------------------------------------- #
+
+def test_the_owners_blocklist_is_shipped():
+    assert {"apodex-1.1-mini", "gemma-4-26b-a4b-it", "gemma-4-31b-it",
+            "granite-3.0-3b-a800m-instruct", "granite-3.0-8b-instruct",
+            "granite-34b-code-instruct", "granite-8b-code-instruct",
+            "lfm-2.5-2.6b", "poolside-laguna-s-2.1",
+            "step-3.7-flash"} <= A._DEFAULT_BLOCKED_IDENTITIES
+    assert "dahl/MiniMaxAI/MiniMax-M2.7" in A._DEFAULT_BLOCKED_MODELS
+
+
+def test_shipped_model_blocks_are_offered_once(store):
+    A._seed_default_blocks()
+    assert A._DEFAULT_BLOCKED_MODELS <= A._blocked_models()
+    # The owner unticks one: the next boot does not put it back.
+    store[A._BLOCKED_SETTING] = []
+    assert A._seed_default_blocks() == 0
+    assert "dahl/MiniMaxAI/MiniMax-M2.7" not in A._blocked_models()
+
+
+def test_model_blocks_keep_the_users_own_entries(store):
+    store[A._BLOCKED_SETTING] = ["groq/some/model"]
+    A._seed_default_model_blocks()
+    assert {"groq/some/model"} | set(A._DEFAULT_BLOCKED_MODELS) == A._blocked_models()
