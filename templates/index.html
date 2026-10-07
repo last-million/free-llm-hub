@@ -11916,8 +11916,20 @@
       var statusTitle = (st === 'cancelled') ? 'The client disconnected before the answer was finished; the hub stopped the work' : '';
       var httpTxt = (a.http != null) ? (' · ' + a.http) : '';
       var hasResolved = a.provider && a.model;
-      var modelTxt = hasResolved ? (a.provider + '/' + a.model) : (a.model_req || '—');
-      var modelHTML = hasResolved ? esc(modelTxt) : '<span class="req">' + esc(modelTxt) + '</span>';
+      var resolvedTxt = hasResolved ? (a.provider + '/' + a.model) : '';
+      /* The REQUESTED id, shown alongside the resolved model when it was a mode
+         or tier (auto / best / coding-swarm / multi …) rather than a pinned
+         provider/model — so a swarm/roles turn does not read as if the client
+         had asked for the single model that happened to answer it. A pinned
+         "pid/model" request resolves to itself, so there is nothing to add. */
+      var reqMode = (a.model_req && a.model_req.indexOf('/') < 0
+                     && a.model_req.toLowerCase() !== resolvedTxt.toLowerCase())
+                    ? a.model_req : '';
+      var modelTxt = hasResolved ? resolvedTxt : (a.model_req || '—');
+      var modelHTML = hasResolved
+        ? (reqMode ? '<span class="req">' + esc(reqMode) + '</span> → ' + esc(modelTxt)
+                   : esc(modelTxt))
+        : '<span class="req">' + esc(modelTxt) + '</span>';
       /* A swarm/crew request is ONE row whose stages all ran inside it. Show
          WHICH agent used WHICH model instead of a single opaque line -- the
          data was always in swarm.py (result["models"] + its emit() events),

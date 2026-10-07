@@ -10888,6 +10888,30 @@ def _model_ctx_info(pid, model):
     return lim, src
 
 
+def _window_fits(pid, model, est):
+    """False only when this model's KNOWN window is too small to hold ~`est`
+    tokens; True otherwise (an unknown or provider-wide stand-in window is not
+    proof it cannot fit, so it fails open). Same bar _ctx_hop_cannot_serve and
+    _below_declared_window use: "default" / a plain "table" row proves nothing,
+    but a hard per-request cap (groq's 8K TPM) does. This is what keeps a
+    last-chance pick (the quality fallback, the roles actor walk) from handing a
+    79K request to a model whose window is ~8K -- it can only ever overflow,
+    wasting the one fallback slot / actor hop it was given. Never raises."""
+    try:
+        need = int(int(est or 0))
+        if need <= 0:
+            return True
+        need = int(need * 1.15) + 512
+        lim, src = _model_ctx_info(pid, model)
+        if src == "default":
+            return True
+        if src == "table" and pid not in _PROVIDER_HARD_REQUEST_CAP:
+            return True
+        return not (isinstance(lim, int) and 0 < lim < need)
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
 def _model_ctx_info_uncapped(pid, model):
     lim, src = _window_info(pid, model)
     if isinstance(lim, int) and lim > 0:
@@ -15729,7 +15753,14 @@ def _activity_after(response):
                         saw_content = True
                     if not saw_terminal and _STREAM_TERMINAL_RE.search(b):
                         saw_terminal = True
-                    if not saw_error and _STREAM_ERROR_RE.search(b):
+                    # The VALUE-carrying variant: a bare `"error": null` / `{}`
+                    # envelope (many OpenAI-compatible gateways put one in every
+                    # frame) is NOT an error. MEASURED 2026-10-07: a Codex
+                    # /v1/responses stream from glm/glm-4.7-flash completed in
+                    # 816 ms yet the row read "error · 200" -- it carried such an
+                    # envelope and no output_text delta, so saw_error fired on
+                    # nothing. Only a real error object/string counts now.
+                    if not saw_error and _STREAM_ERROR_VALUE_RE.search(b):
                         saw_error = True
                     yield chunk
             except GeneratorExit:
@@ -20820,7 +20851,7 @@ def api_agent_settings_update():
                     "default_cli": agentic_chat.default_cli()})
 
 
-def _no_candidates_hint():
+def _no_candidates_hint(est=0, tools=False):
     """Extra context on an exhausted-chain 503, when the hub knows the reason.
 
     REPORTED 2026-09-05: "why now he say all providers failed". It was not the
@@ -20831,16 +20862,46 @@ def _no_candidates_hint():
     user can undo.
 
     An error naming a cause the reader cannot act on, while hiding the cause
-    they CAN, is worse than a short one."""
+    they CAN, is worse than a short one.
+
+    `est` / `tools`: only count a blocked model that could ACTUALLY have served
+    THIS request -- its window holds it, it is tool-capable on a tool turn, it
+    is not a last-resort id. MEASURED 2026-10-07: a 79K turn's 503 told the user
+    "35 model(s) are switched OFF ... which is what leaves the chain this short"
+    while every one of those 35 was too small to hold 79K anyway -- blaming the
+    one lever the user controls when it was not the cause. When none of the
+    off-list could have fitted, say the real constraint instead."""
     try:
-        blocked = len(_blocked_models())
+        blocked = _blocked_models()
     except Exception:                                            # noqa: BLE001
         return ""
     if not blocked:
         return ""
-    return (" — note: %d model(s) are switched OFF in Settings, which is what "
-            "leaves the chain this short. Turn some back on there (the category "
-            "buttons replace the selection rather than adding to it)." % blocked)
+    est = int(est or 0)
+    relevant = len(blocked)
+    if est > 0:
+        relevant = 0
+        for mid in blocked:
+            if "/" not in str(mid):
+                relevant += 1       # a bare id: cannot test its fit, count it
+                continue
+            p, m = str(mid).split("/", 1)
+            try:
+                if tools and not _supports_tools(p, m):
+                    continue
+                if _is_low_quality(m):
+                    continue
+                if _window_fits(p, m, est):
+                    relevant += 1
+            except Exception:                                    # noqa: BLE001
+                relevant += 1       # unknown: it might have helped
+    if relevant:
+        return (" — note: %d model(s) are switched OFF in Settings, which is what "
+                "leaves the chain this short. Turn some back on there (the category "
+                "buttons replace the selection rather than adding to it)." % relevant)
+    return (" — note: this request is ~%d tokens and the models switched off in "
+            "Settings are too small (or not capable enough) to have held it, so "
+            "turning them back on would not have helped here." % est)
 
 
 # Models the USER has switched off, as "pid/model" ids, kept in config.json
@@ -21508,8 +21569,20 @@ def _is_model_blocked_by_user(pid, model):
         return True
     ident = _normalize_model_identity(model)
     rules = _request_model_rules()
-    if ident in rules["block"] or ident in _blocked_identities():
+    blocked_idents = _blocked_identities()
+    if ident in rules["block"] or ident in blocked_idents:
         return True
+    # ALIAS BLOCKING. A model whose own catalog row names another identity is
+    # that model: pollinations "openai-fast" aliases "gpt-oss-20b" (see
+    # _ctx_alias_candidates). Blocking "gpt-oss-20b" must switch off every
+    # spelling of it, including the relay alias -- otherwise a default-blocked
+    # family keeps being routed under a cover name. MEASURED 2026-10-07:
+    # pollinations/openai-fast was still routed while gpt-oss-20b was blocked.
+    block_set = rules["block"] | blocked_idents
+    if block_set:
+        for alias in _ctx_alias_candidates(pid, model):
+            if _normalize_model_identity(alias) in block_set:
+                return True
     allowed = rules["allow"] or _allowed_identities()
     return bool(allowed) and ident not in allowed
 
@@ -28863,7 +28936,7 @@ def _client_hop_errors(errors):
     return ["%s x%d" % (s, n) if n > 1 else s for s, n in out]
 
 
-def _chain_exhausted_text(errors, last_hard=None):
+def _chain_exhausted_text(errors, last_hard=None, est=0, tools=False):
     """The exhausted-chain error message, in the hub's own words (see above)."""
     hops = _client_hop_errors(errors)
     text = "All providers failed: " + ("; ".join(hops) or "none available")
@@ -28873,7 +28946,7 @@ def _chain_exhausted_text(errors, last_hard=None):
             text += " (last hard error: HTTP %s from %s)" % (int(code), last_hard.get("pid"))
     except Exception:                                            # noqa: BLE001
         pass
-    return text + _no_candidates_hint()
+    return text + _no_candidates_hint(est, tools)
 
 
 def _last_hard_log_body(last_hard):
@@ -29077,13 +29150,20 @@ _QUALITY_FALLBACK_TRIVIAL_SECONDS = 30.0
 _QUALITY_FALLBACK_PAIRS = 3
 
 
-def _quality_fallback_pick(entries, tools=False, stalled=()):
+def _quality_fallback_pick(entries, tools=False, stalled=(), est=0):
     """Up to _QUALITY_FALLBACK_PAIRS (pid, model) of `entries` (the chain not
     walked yet) to serve a best/max turn whose strong pool did not answer in
     time: fast, not in a provider that stalled this walk, not recently
     stalled/failed, not benched, clearing the simple floor, tool-safe on a
     tool turn -- each filter fail-open -- then healthiest, measured-quick,
-    strongest first. Never raises ([] on error)."""
+    strongest first. Never raises ([] on error).
+
+    The fit filter (its KNOWN window must hold ~`est` tokens) is the one HARD
+    one: a fallback that cannot hold the request is no fallback at all -- it
+    would only overflow (MEASURED 2026-10-07: `best->auto` picked
+    groq/qwen3.8-27b, ~8K TPM, for a 79K turn, 25 times in 3 h, each a wasted
+    _ContextOverflow). So when nothing left can fit, the pick is empty and the
+    chain goes straight to the native overflow reply instead of a dead pick."""
     try:
         pool = []
         for e in entries or ():
@@ -29093,6 +29173,12 @@ def _quality_fallback_pick(entries, tools=False, stalled=()):
         def keep(cands, pred):
             return [c for c in cands if pred(c)] or cands
 
+        # A pick that cannot hold the request is dropped outright (not fail-open
+        # like the preference filters below): handing it the turn only overflows.
+        if est:
+            pool = [c for c in pool if _window_fits(c[1], c[2], est)]
+            if not pool:
+                return []
         # The chain now ends with hops from OUTSIDE a category mode (see
         # _mode_fallback_tail): they are the mode's last resort, not its
         # fallback's first pick while an in-mode hop is left. Fail-open.
@@ -29279,7 +29365,8 @@ class _ChainClock:
         qf["fired"] = True
         try:
             stalled = set(self._stalled) | {e[0] for e in rest if self._demoted(e[0])}
-            picks = _quality_fallback_pick(rest, tools=self.tools, stalled=stalled)
+            picks = _quality_fallback_pick(rest, tools=self.tools, stalled=stalled,
+                                           est=self.est)
             if not picks:
                 return
             rest[:] = picks + [e for e in rest if e not in picks]
@@ -32882,6 +32969,38 @@ def _classify_hop_error(exc=None, status=None, peek=None):
     return peek or "error"
 
 
+def _note_hop_detail(pid, exc):
+    """LOG ONLY: remember a hop's exception class AND its sanitized message for
+    the 503/deadline diagnosis line. The client never sees this (it gets the
+    folded class words of _client_hop_errors); the log does, so a burst of
+    "ConnectionError" can be read as what it really was -- a reset, a connect
+    refusal, which host -- instead of a bare class name. Keys are redacted by
+    _sanitize. Per-request (g); never raises."""
+    try:
+        msg = _sanitize(str(exc) if exc is not None else "", 200).strip()
+        detail = "%s: %s%s" % (pid, type(exc).__name__ if exc is not None else "none",
+                               (" " + msg) if msg else "")
+        lst = getattr(g, "hub_hop_details", None)
+        if lst is None:
+            lst = []
+            try:
+                g.hub_hop_details = lst
+            except Exception:                                    # noqa: BLE001
+                return
+        if len(lst) < 24:
+            lst.append(detail)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _hop_details_log():
+    """The log-only hop exception details for this request ("none" when none)."""
+    try:
+        return "; ".join(getattr(g, "hub_hop_details", None) or ()) or "none"
+    except Exception:                                            # noqa: BLE001
+        return "none"
+
+
 def _mode_status(pid, model):
     """(the mode in force, True when `model` is NOT in it). Reporting only.
 
@@ -33801,9 +33920,16 @@ def _swarm_note_member_status(pid, model, code, race_failed=None):
         code = int(code)
         if code == 429:
             _note_recent_hop_failure(pid, model, "429")
+        elif code in (401, 403):
+            # A credential / policy refusal (zenmux 403 "free tier only in
+            # OpenCode", a dead key): the pair will refuse again for a while, so
+            # rest it for the recent-failure TTL instead of re-dispatching to it
+            # every actor hop. MEASURED 2026-10-07: zenmux/glm-4.7-flash-free
+            # 403'd on repeated roles hops of one big turn.
+            _note_recent_hop_failure(pid, model, "http-%d" % code)
         elif code >= 500:
             _throttle_failed_hop(pid, model)
-        if (code == 429 or code >= 500) and race_failed is not None:
+        if (code == 429 or code in (401, 403) or code >= 500) and race_failed is not None:
             race_failed.add(pid)
         _note_swarm_member_fail(pid, model, "HTTP %d" % code)
     except Exception:                                            # noqa: BLE001
@@ -34751,7 +34877,8 @@ def _role_judge(pid, model, resp, exc, body, payload, est, kind):
             if exc is not None:
                 _record_outcome(pid, model, False)
                 _swarm_note_member_exc(pid, model, exc)
-                return fail("exc", type(exc).__name__)
+                _m = _sanitize(str(exc), 120).strip()
+                return fail("exc", "%s%s" % (type(exc).__name__, (": " + _m) if _m else ""))
             return fail("deadline", "no answer in time")
         try:
             if resp.status_code != 200:
@@ -34834,12 +34961,69 @@ def _role_start_leg(idx, pid, model, body, deadline, q, est, kind):
     return tok
 
 
+# A BIG tool turn needs a bigger actor share than room/attempts_left: MEASURED
+# 2026-10-07, OpenCode coding-swarm at ~79K tokens, nvidia/kimi-k3 and
+# glm-4.7-flash ended "no answer in time" because the 3-way split (~60 s) cut a
+# healthy model that needed ~70-120 s at that size. So past
+# LONG_CTX_SPEED_TOKENS the split is capped to _LONG_CTX_ROLE_ATTEMPTS (so each
+# attempt gets ~room/2 ≈ 90 s, which still fits two actors inside the ~180-270 s
+# turn), and a model MEASURED healthy-but-slow at long context gets at least its
+# own long-context p90 -- capped so one more attempt still fits
+# (_LONG_CTX_ROLE_FLOOR_SHARE of the room). The fastest long-context model opens
+# the walk anyway (_prefer_fast_long_context in _build_chain).
+_LONG_CTX_ROLE_ATTEMPTS = 2
+_LONG_CTX_ROLE_FLOOR_SHARE = 0.6
+_LONG_CTX_ROLE_FLOOR_MARGIN = 1.2
+
+
 def _role_share(room, attempts_left):
     """Seconds one attempt may take of `room` when `attempts_left` attempts
     must still fit: room / attempts_left, never under _ROLE_MIN_HOP_SECONDS,
     never over the room itself."""
     n = max(1, int(attempts_left or 1))
     return min(room, max(_ROLE_MIN_HOP_SECONDS, room / n))
+
+
+def _role_longctx_floor(pid, model, est):
+    """A measured floor (seconds) for an actor hop on a BIG request, from this
+    pair's long-context first-content p90 (non-stalled samples), falling back to
+    its tool-turn p90; 0 when the request is not big or the pair is unmeasured.
+    Never raises."""
+    try:
+        if int(est or 0) < LONG_CTX_SPEED_TOKENS:
+            return 0.0
+        now = time.time()
+        with _outcome_lock:
+            rows = [r for r in (_long_ctx_speed.get((pid, model)) or ())
+                    if not r[2] and now - r[0] <= LONG_CTX_SPEED_TTL]
+            tool = list(_tool_ttft.get((pid, model)) or [])
+        if len(rows) >= 2:
+            return _percentile([r[1] for r in rows], 90) / 1000.0
+        if len(tool) >= _TOOL_MIN_SAMPLES:
+            return _percentile(tool, 90) / 1000.0
+        return 0.0
+    except Exception:                                            # noqa: BLE001
+        return 0.0
+
+
+def _role_hop_deadline(clock, pid, model, room_total, attempts_left, est, budget):
+    """Seconds for one actor hop. A big request caps the split at
+    _LONG_CTX_ROLE_ATTEMPTS and lifts the share to a measured-healthy-but-slow
+    model's long-context p90 (capped at _LONG_CTX_ROLE_FLOOR_SHARE of the room so
+    a second attempt still fits). Never raises (plain _role_share on error)."""
+    try:
+        n = attempts_left
+        if int(est or 0) >= LONG_CTX_SPEED_TOKENS:
+            n = min(n, _LONG_CTX_ROLE_ATTEMPTS)
+        share = _role_share(room_total, n)
+        floor = _role_longctx_floor(pid, model, est)
+        if floor:
+            share = min(room_total, max(share, min(floor * _LONG_CTX_ROLE_FLOOR_MARGIN,
+                                                   room_total * _LONG_CTX_ROLE_FLOOR_SHARE)))
+        return share if budget is None else min(budget, share)
+    except Exception:                                            # noqa: BLE001
+        share = _role_share(room_total, attempts_left)
+        return share if budget is None else min(budget, share)
 
 
 def _note_actor_stall(clock, pid, model, silent_s):
@@ -34868,11 +35052,12 @@ def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spe
     afterwards is never a model that just stalled or lost the race here."""
     budget = clock.open_role_hop(pid, model)
     now = time.monotonic()
-    room = turn_end - now
     # attempts_left attempts (this actor, its backup, the next hop) must fit in
-    # the turn: a silent first hop cannot eat half the clock.
-    room = _role_share(room, attempts_left)
-    deadline = room if budget is None else min(budget, room)
+    # the turn: a silent first hop cannot eat half the clock. A big request caps
+    # the split so a healthy slow model is not cut just before it answers (see
+    # _role_hop_deadline).
+    deadline = _role_hop_deadline(clock, pid, model, turn_end - now, attempts_left,
+                                  est, budget)
     if deadline <= 1.0:
         return None
     q = queue.Queue()
@@ -34947,6 +35132,12 @@ def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spe
         rec["failed"].append({"pair": "%s/%s" % legs[idx], "why": why})
         if v.get("fail") in ("invalid", "prose", "junk"):
             rec["invalid"] += 1
+            # A tool call the CLI cannot run (or prose/junk where a tool call
+            # was due) answered FAST but wrong: demote the pair for tool turns
+            # like a stall, so _build_chain's recent-failure tail orders it
+            # behind the healthy ones next turn. Not when the client left.
+            if not _client_gone():
+                _note_recent_hop_failure(legs[idx][0], legs[idx][1], v.get("fail"))
         if v.get("fail") == "deadline" and not _client_gone():
             clock._note_stall(legs[idx][0])
             if deadline >= _ADAPTIVE_HOP_FLOOR:
@@ -35907,6 +36098,17 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
             break
         if clock.consumed(hop_pid, hop_model):
             continue                    # the backup already ran it
+        if not _window_fits(hop_pid, hop_model, est):
+            # Its KNOWN window cannot hold this request: dispatching to it only
+            # burns an actor hop on a _ContextOverflow (MEASURED 2026-10-07:
+            # groq/qwen3.8-27b, ~8K TPM, on a 79K turn). Skip it WITHOUT
+            # spending a hop; when nothing left fits the walk ends fast and the
+            # caller falls back to `best`, which emits the native overflow reply.
+            rows.append({"role": "actor: skipped (window too small)",
+                         "model": "%s/%s" % (hop_pid, hop_model)})
+            rec["failed"].append({"pair": "%s/%s" % (hop_pid, hop_model),
+                                  "why": "window too small for ~%d tokens" % est})
+            continue
         if hops >= _ROLE_MAX_ACTOR_HOPS or time.monotonic() >= turn_end - 1.0:
             break
         hops += 1
@@ -37740,6 +37942,7 @@ def _chat_completions_uncached(body):
             last_hop = (hop_pid, hop_model)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
+            _note_hop_detail(hop_pid, exc)       # log-only: class + message
             last_error = _classify_hop_error(exc=exc)
             if isinstance(exc, requests.exceptions.Timeout):
                 # A hop that TIMES OUT (unlike a fast-fail 429/400) can burn
@@ -38017,8 +38220,8 @@ def _chat_completions_uncached(body):
         # The walk stopped on the clock, not on the fleet: say so, as a status
         # the client can see, instead of dressing it up as "all providers
         # failed" (or, before the deadline existed, never answering at all).
-        _log.warning("CHAT-DEADLINE stream=%s tools=%s est=%d errors=[%s]",
-                     stream, has_tools, est, "; ".join(errors) or "none")
+        _log.warning("CHAT-DEADLINE stream=%s tools=%s est=%d errors=[%s] details=[%s]",
+                     stream, has_tools, est, "; ".join(errors) or "none", _hop_details_log())
         return _with_headers(_openai_error(_deadline_error_text(_clock, errors), 504,
                                            "timeout_error"),
                              _routing_headers(last_hop[0], last_hop[1], attempts, "deadline"))
@@ -38033,8 +38236,8 @@ def _chat_completions_uncached(body):
     # its SDK waits out a short throttle and auto-continues once capacity returns.
     eta = _capacity_eta()
     try:  # DIAG (temporary): record WHY the chat chain exhausted (any CLI's 503).
-        _log.warning("CHAT-503 stream=%s tools=%s images=%s est=%d errors=[%s] last_hard=%s body=%s",
-                     stream, has_tools, has_images, est, "; ".join(errors) or "none",
+        _log.warning("CHAT-503 stream=%s tools=%s images=%s est=%d errors=[%s] details=[%s] last_hard=%s body=%s",
+                     stream, has_tools, has_images, est, "; ".join(errors) or "none", _hop_details_log(),
                      (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none",
                      _last_hard_log_body(last_hard))
     except Exception:
@@ -38044,7 +38247,8 @@ def _chat_completions_uncached(body):
     # A hard 4xx still maps to a client-retryable status, as before.
     status = _retryable_relay_status(last_hard["status"]) if last_hard is not None else 503
     return _with_headers(_with_retry_after(_openai_error(
-        _chain_exhausted_text(errors, last_hard), status, "upstream_error"), eta), hdrs)
+        _chain_exhausted_text(errors, last_hard, est, has_tools), status, "upstream_error"),
+        eta), hdrs)
 
 
 # ---------------------------------------------------------------------------
@@ -38831,6 +39035,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
             hop_pid, hop_model, payload = _clock.served(hop_pid, hop_model, payload)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
+            _note_hop_detail(hop_pid, exc)       # log-only: class + message
             last_error = _classify_hop_error(exc=exc)
             if isinstance(exc, requests.exceptions.Timeout):
                 # A hop that TIMES OUT (unlike a fast-fail 429/400) can burn
@@ -39095,9 +39300,9 @@ def v1_responses(_retry_pass=False, _hedged=False):
     if _clock.spent():
         # Stopped on the clock (see _ChainClock). No transient-storm retry: the
         # retry is the same request to codex, and its time is already gone.
-        _log.warning("RESPONSES-DEADLINE stream=%s tools=%s est=%d tried=[%s] errors=[%s]",
+        _log.warning("RESPONSES-DEADLINE stream=%s tools=%s est=%d tried=[%s] errors=[%s] details=[%s]",
                      stream, has_tools, est, ", ".join(_tried),
-                     "; ".join(errors) or "none")
+                     "; ".join(errors) or "none", _hop_details_log())
         return _with_headers(_openai_error(_deadline_error_text(_clock, errors), 504,
                                            "timeout_error"),
                              {"X-Free-LLM-Hub-Last-Error": "deadline"})
@@ -39128,9 +39333,9 @@ def v1_responses(_retry_pass=False, _hedged=False):
             except Exception:
                 _lh_body = "?"
         _log.warning(
-            "RESPONSES-503 stream=%s tools=%s images=%s est=%d hops=%d tried=[%s] errors=[%s] last_hard=%s body=%s bodies=%s",
+            "RESPONSES-503 stream=%s tools=%s images=%s est=%d hops=%d tried=[%s] errors=[%s] details=[%s] last_hard=%s body=%s bodies=%s",
             stream, has_tools, has_images, est, len(_tried), ", ".join(_tried),
-            "; ".join(errors) or "none",
+            "; ".join(errors) or "none", _hop_details_log(),
             (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none",
             _lh_body, json.dumps(_err_bodies)[:1400])
     except Exception:
@@ -39141,7 +39346,8 @@ def v1_responses(_retry_pass=False, _hedged=False):
     # The hub's own message, never the upstream body (see _chain_exhausted_text).
     status = _retryable_relay_status(last_hard["status"]) if last_hard is not None else 503
     return _with_headers(_with_retry_after(_openai_error(
-        _chain_exhausted_text(errors, last_hard), status, "upstream_error"), eta), hdrs)
+        _chain_exhausted_text(errors, last_hard, est, has_tools), status, "upstream_error"),
+        eta), hdrs)
 
 
 # ---------------------------------------------------------------------------
@@ -39874,6 +40080,7 @@ def v1_messages():
             last_hop = (hop_pid, hop_model)
         except (requests.RequestException, RuntimeError) as exc:
             errors.append("%s: %s" % (hop_pid, _sanitize(exc.__class__.__name__)))
+            _note_hop_detail(hop_pid, exc)       # log-only: class + message
             last_error = _classify_hop_error(exc=exc)
             if isinstance(exc, requests.exceptions.Timeout):
                 # A hop that TIMES OUT (unlike a fast-fail 429/400) can burn
@@ -40062,8 +40269,8 @@ def v1_messages():
         return _client_gone_reply()      # the walk stopped on a cancel
     if _clock.spent():
         # Stopped on the clock (see _ChainClock), not on the fleet.
-        _log.warning("MESSAGES-DEADLINE stream=%s tools=%s est=%d errors=[%s]",
-                     stream, has_tools, est, "; ".join(errors) or "none")
+        _log.warning("MESSAGES-DEADLINE stream=%s tools=%s est=%d errors=[%s] details=[%s]",
+                     stream, has_tools, est, "; ".join(errors) or "none", _hop_details_log())
         return _with_headers(_anthropic_error("api_error",
                                               _deadline_error_text(_clock, errors), 504),
                              _routing_headers(last_hop[0], last_hop[1], attempts, "deadline"))
@@ -40075,8 +40282,8 @@ def v1_messages():
     # Chain exhausted -> Retry-After so the client waits out a short throttle + auto-continues.
     eta = _capacity_eta()
     try:  # DIAG (temporary): record WHY the messages chain exhausted (Claude Code's 503).
-        _log.warning("MESSAGES-503 stream=%s tools=%s images=%s est=%d errors=[%s] last_hard=%s body=%s",
-                     stream, has_tools, has_images, est, "; ".join(errors) or "none",
+        _log.warning("MESSAGES-503 stream=%s tools=%s images=%s est=%d errors=[%s] details=[%s] last_hard=%s body=%s",
+                     stream, has_tools, has_images, est, "; ".join(errors) or "none", _hop_details_log(),
                      (str(last_hard.get("status")) + "/" + str(last_hard.get("pid"))) if last_hard else "none",
                      _last_hard_log_body(last_hard))
     except Exception:
@@ -40084,7 +40291,7 @@ def v1_messages():
     hdrs = _routing_headers(last_hop[0], last_hop[1], attempts, last_error)
     # The hub's own message, never the upstream body (see _chain_exhausted_text).
     return _with_headers(_with_retry_after(_anthropic_error(
-        "api_error", _chain_exhausted_text(errors, last_hard),
+        "api_error", _chain_exhausted_text(errors, last_hard, est, has_tools),
         last_hard["status"] if last_hard is not None else 503), eta), hdrs)
 
 

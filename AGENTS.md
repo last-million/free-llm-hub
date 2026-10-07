@@ -2176,6 +2176,72 @@ on the same strongest host (the `[spread]` log showed pool size 1 on 863 of
   `inflight`, `routed_15m`, `routed_24h`, `share_15m`, `recent_failures`,
   `load`; plus `total_inflight`, `soft_cap`, `fairness_on`.
 
+## Big tool turns that used to time out (2026-10-07)
+
+Covered by `tests/test_cli_big_turn_reliability.py`. MEASURED (hub.log, 3 h,
+OpenCode `coding-swarm`, ~77-79K-token stream tool turns): 25x
+`[quality-fallback] best->auto -> groq/qwen3.8-27b` (an ~8K-TPM model picked
+for a 79K request), roles actors "no answer in time" on nvidia/kimi-k3 and
+glm-4.7-flash, 4+ min turns ending 503, ConnectionError bursts (5 hops in ~4 s),
+a 403 and "a tool call the CLI cannot run" re-dispatched every hop, and a 503
+blaming "35 model(s) are switched OFF" when none could have held the request.
+
+- **ConnectionError bursts are NOT the hub's clientgone work.** REPRODUCED
+  (raw-TCP fake provider, real `requests`, the clientgone urllib3 hook
+  installed): the hub posts per hop with `requests.post` (a FRESH pool each
+  call -- there is no shared `requests.Session` anywhere), so a socket
+  `Token.cancel`/`nonblocking_close` shuts down is never handed to a later
+  call; and even in the worst case (a shared pool) urllib3 2.x discards a
+  dropped pooled socket and opens a fresh one. The cancel token never leaks:
+  the main thread keeps the request token (`set_current(None)` guards a reused
+  thread), child hop tokens live only on their worker thread. So the bursts are
+  genuine transient upstream resets (already noted at app.py ~10228). What
+  changed: the `CHAT/RESPONSES/MESSAGES-503`/`-DEADLINE` log lines now carry
+  `details=[...]` -- each hop's exception CLASS **and** sanitized message
+  (`_note_hop_detail`/`_hop_details_log`, keys redacted, log-only, never shown
+  to the client) -- and a roles `exc` failure records the message too, so the
+  next burst is diagnosable instead of a bare "ConnectionError".
+- **A last-chance pick never gets a request it cannot hold** (`_window_fits`):
+  the KNOWN window must hold ~est*1.15 tokens (same bar as
+  `_ctx_hop_cannot_serve`; a hard per-request cap like groq's 8K TPM counts, a
+  "default"/plain "table" window does not). `_quality_fallback_pick(..., est=)`
+  drops non-fitting picks OUTRIGHT (not fail-open) -> no pick when nothing fits,
+  so the chain goes straight to `_ctx_overflow_reply`. The roles walk skips a
+  non-fitting candidate WITHOUT spending an actor hop, so an all-too-small
+  chain ends fast and falls back to the native overflow reply.
+- **Actor budget for a big request** (`_role_hop_deadline`): past
+  `LONG_CTX_SPEED_TOKENS` (60K) the actor split is capped to
+  `_LONG_CTX_ROLE_ATTEMPTS` (2) so each actor gets ~room/2 (~90 s on a 180 s
+  stream turn) instead of room/3 (~60 s), and a model MEASURED healthy-but-slow
+  at long context (`_long_ctx_speed`/`_tool_ttft` p90) is given at least that,
+  capped at `_LONG_CTX_ROLE_FLOOR_SHARE` (0.6) of the room so a 2nd attempt
+  still fits. The fastest long-context model already opens the walk
+  (`_prefer_fast_long_context` in `_build_chain`).
+- **Roles failure handling**: a 401/403 (credential/policy -- zenmux free tier)
+  rests the pair for the recent-failure TTL in `_swarm_note_member_status`; an
+  "invalid"/"prose"/"junk" actor result (`a tool call the CLI cannot run`)
+  `_note_recent_hop_failure`s the pair so `_build_chain` demotes it next turn;
+  5xx still throttles as before.
+- **Activity display**: `model_req` (the mode, e.g. `coding-swarm`) is kept on
+  the row and is NOT overwritten by the resolved actor pick; the dashboard now
+  shows `coding-swarm -> nvidia/muse-glimmer-30b` for a mode/tier request
+  instead of only the single model that happened to answer (a pinned
+  `pid/model` resolves to itself, unchanged).
+- **Codex `/agent` "error - 200"**: `_finalizing_body` now tests the
+  VALUE-carrying `_STREAM_ERROR_VALUE_RE`, so a bare `"error": null` / `{}`
+  envelope (many OpenAI-compatible gateways send one every frame) on a cleanly
+  completed stream reads as `ok`/`empty`, not `error` (MEASURED on
+  glm/glm-4.7-flash, 816 ms).
+- **Blocklist aliases**: `_is_model_blocked_by_user` also checks each
+  `_ctx_alias_candidates` identity against the block lists, so blocking
+  `gpt-oss-20b` also switches off pollinations `openai-fast` (its catalog
+  alias).
+- **Honest "switched OFF" note** (`_no_candidates_hint(est, tools)`): only
+  counts an off-list model that could ACTUALLY have served THIS request (window
+  fits, tool-capable on a tool turn, not low-quality); when none could, it
+  states the real constraint ("this request is ~N tokens ... too small ...")
+  instead of blaming the Settings switch.
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):
