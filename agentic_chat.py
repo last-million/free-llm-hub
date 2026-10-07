@@ -911,6 +911,29 @@ def set_window_provider(fn):
     _window_provider_takes_cli = takes
 
 
+# THE GOAL BEHIND THE WORK (taskboard.py, via app). `fn(project_dir) -> str`
+# returns the <= 600-char goal brief for a project folder, or "" when there is
+# no active goal or the feature is off. None = unregistered = the brief file is
+# exactly what it was before the task board existed. Injected into
+# write_task_brief so a Build session reads the goal in its brief file.
+_goal_brief_source = None
+
+
+def set_goal_brief_source(fn):
+    """Register `fn(project_dir) -> str` (the goal brief) or None to clear."""
+    global _goal_brief_source
+    _goal_brief_source = fn if callable(fn) else None
+
+
+def _goal_brief_section(project_dir):
+    if _goal_brief_source is None:
+        return ""
+    try:
+        return (_goal_brief_source(project_dir) or "").strip()
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
 # --------------------------------------------------------------------------- #
 # Silence explained by the hub itself: no model could serve the turn
 # --------------------------------------------------------------------------- #
@@ -2528,6 +2551,13 @@ def write_task_brief(project_dir, text, memory_block="", session_id=None):
         # and killed python processes. The rules, with the detached spellings
         # measured on this machine, live in agent_servers.
         parts = [header, folder, agent_servers.brief_section()]
+        # THE GOAL BEHIND THE WORK (taskboard, via app): the same brief the
+        # terminal CLIs and the Multi phases see, so the Build page has the
+        # same goal alignment. Absent (no active goal / feature off) = the
+        # file is byte-for-byte what it was.
+        goal = _goal_brief_section(project_dir)
+        if goal:
+            parts.append("## The goal behind this work" + chr(10) + chr(10) + goal)
         if memory_block:
             parts.append("## What this conversation already established"
                          + chr(10) + chr(10) + memory_block)

@@ -110,6 +110,7 @@ clientgone.install_urllib3_hook()
 import vision_status
 import swarm_windows
 import memory
+import taskboard
 
 # Both tool families are wired here, and for the same reason: every name below
 # is resolved at CALL time, not at import time, so they can live far lower in
@@ -13078,6 +13079,100 @@ def _apply_craft_brief(messages, agentic=False):
         return messages
 
 
+# --------------------------------------------------------------------------- #
+# THE GOAL BEHIND EVERY TASK (taskboard.py). The same <= 600-char brief reaches
+# a Multi phase (swarm_windows goal_brief kwarg), a Build session's brief file
+# (agentic_chat goal-brief source hook) and the opening turn of a terminal CLI
+# conversation whose project folder has an active goal. Flag `goal_brief`.
+# --------------------------------------------------------------------------- #
+
+def _goal_brief_for_project(project_dir):
+    """The goal brief for a project folder, or "" when the flag is off, there
+    is no board goal, or anything goes wrong. Registered on agentic_chat so a
+    Build session's brief file carries it, and called when a Multi run starts.
+    Never raises."""
+    try:
+        if not config.get_flag("goal_brief", True) or not project_dir:
+            return ""
+        if taskboard.default.goal_for(project_dir) is None:
+            return ""
+        return taskboard.default.goal_brief(project_dir=project_dir) or ""
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def _project_dir_from_messages(messages):
+    """The working directory a CLI stated in its environment block, or None.
+
+    Reuses the same env-block / working-directory extraction the context trim
+    protects (_ENV_BLOCK_RE / _ENV_LINE_RE): opencode and Claude Code <env>,
+    codex <environment_context>, and single "working directory" lines in
+    whatever prose a CLI wraps them in. Returns the first path-looking token.
+    Never raises."""
+    try:
+        text_parts = []
+        for m in (messages or []):
+            if not isinstance(m, dict):
+                continue
+            if m.get("role") not in ("system", "user"):
+                continue
+            text_parts.append(_message_text(m))
+        blob = "\n".join(p for p in text_parts if p)
+        if not blob:
+            return None
+        spans = [mt.group(0) for mt in _ENV_BLOCK_RE.finditer(blob)]
+        spans += [mt.group(0) for mt in _ENV_LINE_RE.finditer(blob)]
+        for span in spans:
+            for mt in re.finditer(r"([A-Za-z]:\\[^\s\"'`<>|]+|/[^\s\"'`<>|]+)", span):
+                cand = mt.group(1).strip().rstrip("\\/.,);")
+                # A real folder, not "/v1/..." or a rule like "outside the
+                # working directory". Must exist as a directory to count.
+                try:
+                    if os.path.isdir(cand):
+                        return cand
+                except Exception:                                # noqa: BLE001
+                    continue
+        return None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _apply_goal_note(messages):
+    """On the OPENING turn of a terminal CLI conversation whose project folder
+    has an active board goal, prepend ONE small system note naming that goal.
+
+    Opening-turn-only and never on a compaction request, for the same reason
+    the craft brief is (_awaiting_new_instruction): injecting into a running
+    tool loop is noise. Additive -- a system message after any leading system
+    messages, the user's text untouched. Returns the original list when nothing
+    applies, so the common case allocates nothing. Never raises."""
+    try:
+        if not config.get_flag("goal_brief", True):
+            return messages
+        if not isinstance(messages, list) or not messages:
+            return messages
+        if not _awaiting_new_instruction(messages):
+            return messages
+        if ctxwin.is_compaction_request(messages):
+            return messages
+        project_dir = _project_dir_from_messages(messages)
+        if not project_dir:
+            return messages
+        brief = _goal_brief_for_project(project_dir)
+        if not brief:
+            return messages
+        note = {"role": "system",
+                "content": "The goal behind the work in this project folder "
+                           "(keep every step serving it):\n" + brief}
+        i = 0
+        while i < len(messages) and isinstance(messages[i], dict) \
+                and messages[i].get("role") == "system":
+            i += 1
+        return messages[:i] + [note] + messages[i:]
+    except Exception:                                            # noqa: BLE001
+        return messages
+
+
 def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stats=None,
                        abort_frac=None):
     """AUTO-COMPACT: if a conversation is bigger than a model's context budget, drop
@@ -13680,6 +13775,11 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             # Per HOP: the guide is for the model answering THIS call.
             msgs = _with_model_guide(msgs, pid, payload.get("model"),
                                      bool(payload.get("tools")))
+            # THE GOAL BEHIND THE TASK: one system note on the opening turn of
+            # a terminal CLI conversation whose project folder has a board
+            # goal (opening-turn-only, never on compaction). Pipeline-internal
+            # stage calls (_no_craft) are skipped with the brief.
+            msgs = _apply_goal_note(msgs)
         # A CLI's own compaction request carries the exact facts to copy.
         msgs = _with_cli_compaction_facts(msgs)
         payload = dict(payload)
@@ -18926,6 +19026,123 @@ _MULTI_ACTIVITY_CHARS = 160
 # which phases got somewhere, never the transcripts.
 _MULTI_STOPPED_NOTE = "Stopped before every phase finished."
 
+# TASK BOARD x MULTI (taskboard): run_id -> {phase index: task id}. A run of a
+# project with an active goal links each phase to a board task (one created
+# per phase the goal has none for); the follow loop moves the task through
+# doing -> done/failed as its phase does. Best-effort, behind the goal_brief
+# flag; a run with no goal has no entry.
+_MULTI_TASKS = {}
+
+
+def _multi_link_tasks(run_id, project_dir):
+    """Link a Multi run's phases to the project's active-goal tasks, creating
+    one task per phase the goal does not already have (matched by title).
+    Stores {phase_index: task_id}. Never raises."""
+    try:
+        if not config.get_flag("goal_brief", True) or not project_dir:
+            return
+        board = taskboard.default
+        goal = board.goal_for(project_dir)
+        if goal is None:
+            return
+        gid = goal["id"]
+        # Open tasks the goal already has, by title (the owner may have
+        # written them, or an earlier run may have created them).
+        existing = {}
+        for t in board.tasks(goal_id=gid):
+            if t.get("status") != "done":
+                existing.setdefault(t.get("title"), t["id"])
+        st = swarm_windows.status(run_id) or {}
+        mapping = {}
+        for a in st.get("agents") or ():
+            idx = a.get("index")
+            if idx is None:
+                continue
+            title = a.get("title") or ("Phase %s" % idx)
+            tid = existing.get(title)
+            if not tid:
+                tid = board.add_task(gid, title, needs=(),
+                                     files=a.get("files") or ())
+                existing[title] = tid
+            mapping[idx] = tid
+        with _MULTI_LOCK:
+            _MULTI_TASKS[run_id] = mapping
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _multi_sync_task(run_id, agent_row):
+    """Move the task linked to one phase as that phase changes state. Called
+    from the follow loop at each transition. Never raises."""
+    try:
+        with _MULTI_LOCK:
+            mapping = _MULTI_TASKS.get(run_id) or {}
+            tid = mapping.get(agent_row.get("index"))
+        if not tid:
+            return
+        state = agent_row.get("state")
+        if state == swarm_windows.RUNNING:
+            taskboard.default.update(tid, status="doing",
+                                     owner=agent_row.get("session_id"),
+                                     run_id=run_id, note="phase started")
+        elif state == swarm_windows.DONE:
+            why = ("verified by an observed run" if agent_row.get("verified") is True
+                   else "reviewed" if agent_row.get("reviewed")
+                   else "finished")
+            taskboard.default.update(tid, status="done", run_id=run_id, note=why)
+        elif state == swarm_windows.FAILED:
+            taskboard.default.update(tid, status="failed", run_id=run_id,
+                                     note=_sanitize(str(agent_row.get("error")
+                                                        or "unknown"), 200))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+_PHASE_TICK_RE = re.compile(r"phase\s+(\d+)\b", re.I)
+
+
+def _multi_progress_sync(run_id, project_dir):
+    """Reconcile the run's board tasks with the worker-maintained PROGRESS.md
+    ticks ("- [x] Phase N: ...") -- the copy a worker keeps by hand. Only
+    promotes (a ticked phase -> done, a doing phase -> doing), never regresses
+    a task the phase state already settled. Best-effort; never raises."""
+    try:
+        with _MULTI_LOCK:
+            mapping = dict(_MULTI_TASKS.get(run_id) or {})
+        if not mapping or not project_dir:
+            return
+        text = ""
+        for name in getattr(memory, "TASK_FILES", ("PROGRESS.md",)):
+            path = os.path.join(str(project_dir), name)
+            try:
+                if os.path.isfile(path) and os.path.getsize(path) <= 256 * 1024:
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        text = fh.read()
+                    break
+            except OSError:
+                continue
+        if not text:
+            return
+        for item in memory.parse_checklist(text):
+            m = _PHASE_TICK_RE.search(item.get("text") or "")
+            if not m:
+                continue
+            tid = mapping.get(int(m.group(1)))
+            if not tid:
+                continue
+            if item.get("done"):
+                taskboard.default.update(tid, status="done", run_id=run_id,
+                                         note="ticked in PROGRESS.md")
+            elif item.get("doing"):
+                taskboard.default.update(tid, status="doing", run_id=run_id)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _multi_forget_tasks(run_id):
+    with _MULTI_LOCK:
+        _MULTI_TASKS.pop(run_id, None)
+
 
 def _multi_run_for(session_id):
     """The live multi-session run behind a conversation, or None."""
@@ -19177,12 +19394,14 @@ def _multi_turn_events(session_id, sess_info, text):
                 modes=_multi_worker_modes(sess_info),
                 default_mode=_session_mode_or_none(sess_info),
                 context=context or None,
+                goal_brief=_goal_brief_for_project(project_dir),
                 **_swarm_windows_manager_kw(), **_multi_check_kwargs())
         except Exception:                                        # noqa: BLE001
             run_id = None
         if run_id:
             with _MULTI_LOCK:
                 _MULTI_RUNS[session_id] = run_id
+            _multi_link_tasks(run_id, project_dir)
             yield {"event": "notice",
                    "text": "Continuing run %s: re-running the %d phase%s that did "
                            "not finish (%s)." % (
@@ -19207,6 +19426,7 @@ def _multi_turn_events(session_id, sess_info, text):
         default_mode=_session_mode_or_none(sess_info),
         on_done=_multi_owner_record,
         owner=session_id,
+        goal_brief=_goal_brief_for_project(project_dir),
         **dict(_swarm_windows_manager_kw(), **({"context": context} if context else {})))
     yield {"event": "tool", "text": _MULTI_PLANNING_LINE}
     box = {}
@@ -19248,6 +19468,7 @@ def _multi_turn_events(session_id, sess_info, text):
     run_id = box["run_id"]
     with _MULTI_LOCK:
         _MULTI_RUNS[session_id] = run_id
+    _multi_link_tasks(run_id, project_dir)
     for ev in _multi_follow_events(run_id, cli_id):
         yield ev
 
@@ -19447,6 +19668,7 @@ def _multi_follow_events(run_id, cli_id):
             if seen.get(key) == state:
                 continue
             seen[key] = state
+            _multi_sync_task(run_id, a)        # move the linked board task
             if state == swarm_windows.RUNNING:
                 yield {"event": "tool", "text": _multi_phase_line(a, total)}
             elif state == swarm_windows.DONE:
@@ -19464,6 +19686,11 @@ def _multi_follow_events(run_id, cli_id):
                                swarm_windows.STOPPED):
             break
         time.sleep(_MULTI_POLL)
+    try:                               # worker PROGRESS.md ticks -> board tasks
+        _multi_progress_sync(run_id, (st or {}).get("project_dir"))
+    except Exception:                                            # noqa: BLE001
+        pass
+    _multi_forget_tasks(run_id)        # the board tasks keep their final state
     report = swarm_windows.format_result(run_id) or ""
     # What the subscription manager cost this run (plan + verdicts), as the
     # reply's last line. A status read AFTER the run ended: the last frame
@@ -21956,6 +22183,8 @@ def _skill_source():
 
 
 craft.set_skill_source(_skill_source)
+# A Build session's brief file carries the project's goal brief (taskboard).
+agentic_chat.set_goal_brief_source(_goal_brief_for_project)
 
 
 def _skills_view():
@@ -22040,6 +22269,88 @@ def api_agent_vision_status():
     on, not an agentic-session-scoped resource -- same "informational, no
     live CLI subprocess touched" reasoning as the history routes below."""
     return jsonify(vision_status.status())
+
+
+# --------------------------------------------------------------------------- #
+# TASK BOARD -- the goal behind every task, and a persistent list of tasks
+# agents pick from. The board itself is taskboard.py (pure + JSON); these four
+# routes are the dashboard's door to it and are token-gated by the global
+# _local_control_guard like every other /api route. The goal brief these
+# records produce is injected into Multi phases, the Build brief file and the
+# opening turn of a terminal CLI conversation (see _goal_brief_for_project and
+# _apply_goal_note); flag `goal_brief`, default on.
+# --------------------------------------------------------------------------- #
+
+def _goal_brief_on():
+    return config.get_flag("goal_brief", True)
+
+
+def _taskboard_goals_view(project_dir=None, include_closed=False):
+    board = taskboard.default
+    return {
+        "goals": board.goals(project_dir=project_dir or None,
+                             include_closed=include_closed),
+        "active": board.goal_for(project_dir) if project_dir else None,
+        "enabled": _goal_brief_on(),
+    }
+
+
+@app.route("/api/goals", methods=["GET", "POST"])
+def api_goals():
+    board = taskboard.default
+    if request.method == "GET":
+        pd = request.args.get("project_dir") or None
+        inc = request.args.get("include_closed") in ("1", "true", "yes")
+        return jsonify(_taskboard_goals_view(pd, inc))
+    body = request.get_json(force=True, silent=True) or {}
+    title = (body.get("title") or "").strip()
+    if not title:
+        return jsonify({"error": "send {title, project_dir?, detail?}."}), 400
+    gid = board.add_goal(title, project_dir=body.get("project_dir") or None,
+                         detail=body.get("detail") or "")
+    pd = body.get("project_dir") or None
+    return jsonify(dict(_taskboard_goals_view(pd), created=gid))
+
+
+@app.route("/api/goals/<goal_id>/close", methods=["POST"])
+def api_goal_close(goal_id):
+    ok = taskboard.default.close_goal(goal_id)
+    if not ok:
+        return jsonify({"error": "unknown or already-closed goal."}), 404
+    return jsonify(_taskboard_goals_view(request.args.get("project_dir") or None))
+
+
+@app.route("/api/tasks", methods=["GET", "POST"])
+def api_tasks():
+    board = taskboard.default
+    if request.method == "GET":
+        gid = request.args.get("goal_id") or None
+        pd = request.args.get("project_dir") or None
+        status = request.args.get("status") or None
+        return jsonify({"tasks": board.tasks(goal_id=gid, project_dir=pd,
+                                             status=status)})
+    body = request.get_json(force=True, silent=True) or {}
+    gid = body.get("goal_id")
+    title = (body.get("title") or "").strip()
+    if not gid or not title:
+        return jsonify({"error": "send {goal_id, title, detail?, needs?, "
+                                 "files?, priority?}."}), 400
+    tid = board.add_task(gid, title, detail=body.get("detail") or "",
+                         needs=body.get("needs") or (),
+                         files=body.get("files") or (),
+                         priority=body.get("priority") or 0)
+    return jsonify({"tasks": board.tasks(goal_id=gid), "created": tid})
+
+
+@app.route("/api/tasks/<task_id>", methods=["POST"])
+def api_task_update(task_id):
+    body = request.get_json(force=True, silent=True) or {}
+    out = taskboard.default.update(
+        task_id, status=body.get("status"), note=body.get("note"),
+        owner=body.get("owner"), run_id=body.get("run_id"))
+    if out is None:
+        return jsonify({"error": "unknown task."}), 404
+    return jsonify({"task": out})
 
 
 # --------------------------------------------------------------------------- #
@@ -42062,6 +42373,10 @@ if __name__ == "__main__":
     _bootstrap_no_key_providers()  # no-key providers have nothing to configure -> on
     _init_quota_persistence()      # restore quota/dead-model state from the last run
     _bandit_boot()                 # task bandit state: state_dir()/task-bandit.json
+    try:                           # the goal/task board -- state_dir()/taskboard.json
+        taskboard.configure(os.path.join(config.state_dir(), "taskboard.json"))
+    except Exception as _exc:                                    # noqa: BLE001
+        _log.warning("[taskboard] not configured: %s", _exc)
     # Declared context windows follow the fleet (agentic_chat.declared_window);
     # registered here, after the windows above are restored, so every CLI
     # config written from now on is sized on known windows.

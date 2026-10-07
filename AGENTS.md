@@ -2300,6 +2300,65 @@ blaming "35 model(s) are switched OFF" when none could have held the request.
   states the real constraint ("this request is ~N tokens ... too small ...")
   instead of blaming the Settings switch.
 
+## Task board and the goal behind every task (2026-10-08)
+
+Owner (inspired by Paperclip's goal alignment + task board): "goal behind every
+task" across runs and sessions, and a PERSISTENT task board agents pick work
+from -- the SAME quality in any terminal CLI and in the Build page. Covered by
+`tests/test_taskboard.py` and `tests/test_goal_everywhere.py`.
+
+- **`taskboard.py`** (pure, stdlib only, never imports app/swarm/config; one
+  RLock, atomic replace, every read fails open). A GOAL is one durable outcome
+  for a project folder (newest OPEN goal wins, matched by abspath+normcase); a
+  TASK belongs to a goal with `needs` (other task ids), owned `files`,
+  `priority` and a status in `STATUSES` (todo/doing/done/blocked/failed).
+  FIXED INTERFACE (agent H codes against it -- do not rename): `Board(path=None,
+  clock=)`, `add_goal/goals/close_goal/goal_for`, `add_task/update(appends to
+  history)/tasks/next_batch(deps done, priority then age)`, `goal_brief(goal_id
+  =None, project_dir=None, max_chars=600) -> "GOAL: ...\nOPEN TASKS: ..."`.
+  `default = Board()` is in memory until `configure(path)`; app calls
+  `taskboard.configure(state_dir()/"taskboard.json")` at BOOT only.
+- **Routes** (token-gated by the global `_local_control_guard` like every
+  `/api/*`, no in-body check): GET/POST `/api/goals`, POST
+  `/api/goals/<id>/close`, GET/POST `/api/tasks`, POST `/api/tasks/<id>`
+  (status/note/owner/run_id). +4 `@app.route`, so README's route count line
+  moved 156 -> 160 (`tests/test_readme_claims.py` counts `@app.route(`).
+- **The goal brief is the SAME string everywhere** (`goal_brief()` already
+  carries "GOAL: ... / OPEN TASKS: ..."), <= 600 chars, flag `goal_brief`
+  (default on):
+  - **Multi**: `swarm_windows.start/resume(goal_brief=<str|callable>)` stores
+    `_Run.goal_brief` (persisted via `row()`/`from_row()`, cap
+    `GOAL_BRIEF_CHARS` 700). The planner sees it ahead of the conversation
+    context (`start` prepends it to the plan context only, so workers are not
+    told twice); every worker's `_agent_prompt` carries a "THE GOAL BEHIND THIS
+    WORK (keep every step serving it)" block ahead of the design. "" / no
+    callable = the prompt is byte-for-byte as before.
+  - **Build brief file**: `agentic_chat.set_goal_brief_source(fn)` (app
+    registers `_goal_brief_for_project`); `write_task_brief` adds a "## The
+    goal behind this work" section. Unregistered / no goal = the file is
+    unchanged.
+  - **Terminal CLI opening turn**: `_apply_goal_note(messages)` (called in
+    `_upstream_chat` right after the craft brief, skipped for `_no_craft`
+    stages) prepends ONE small system note when `_awaiting_new_instruction`
+    (opening turn, never a tool-loop continuation), not a compaction request,
+    and `_project_dir_from_messages` (reuses `_ENV_BLOCK_RE`/`_ENV_LINE_RE`)
+    finds a real folder with an active goal. A dashboard request carries no
+    env block, so it is never touched. Token cost: ~the brief (<= 600 chars,
+    ~160 tokens) once per opening turn, 0 on continuations.
+- **Multi integration** (`_multi_link_tasks` / `_multi_sync_task` /
+  `_multi_progress_sync`, ledger `_MULTI_TASKS` run_id -> {phase index: task
+  id}): a run of a project with an active goal passes `goal_brief=` to
+  `start`/`resume` and links each phase to a board task (one created per phase
+  the goal has none for, matched by title). The follow loop moves the task:
+  phase RUNNING -> `doing` (owner = helper session), DONE -> `done` (noting
+  verified/reviewed), FAILED -> `failed` with the reason; at the end worker
+  PROGRESS.md `- [x] Phase N` ticks reconcile tasks to `done` (best effort,
+  only promotes). The plan/dry-run, evidence and verdict logic are unchanged.
+- **UI**: a "Tasks" panel on the Build page (`#agent-tasks`, theme tokens
+  only) -- active goal line, open tasks with status chips + a Done button,
+  add-goal / add-task inputs, close-goal. `loadTasks()` fetches
+  `/api/goals` + `/api/tasks` for the session's `curProjectDir`.
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):

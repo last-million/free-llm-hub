@@ -2693,6 +2693,41 @@
   .agent-chat-col .agent-term-line.run > *,
   .agent-chat-col .agent-answer{ min-width:0; max-width:100%; }
   .agent-chat-col .chat-messages{ overflow-x:hidden; }
+  /* The task board: the goal behind the work in this folder and the open
+     tasks. Theme tokens only, so it reads in both themes. */
+  .agent-tasks{ border:1px solid var(--border); border-radius:var(--radius-sm);
+    background:var(--surface); margin-bottom:6px; font-size:12.5px; flex:none;
+    max-height:34%; overflow:auto; padding:6px 10px; }
+  .agent-tasks-h{ display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+  .agent-tasks-goal{ color:var(--text-dim); min-width:0; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; flex:1 1 auto; }
+  .agent-tasks-x{ flex:none; border:1px solid var(--border); background:none;
+    color:var(--text-dim); border-radius:var(--radius-sm); font:inherit;
+    font-size:11px; padding:1px 6px; cursor:pointer; }
+  .agent-tasks-x:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  .agent-tasks-list{ list-style:none; margin:0 0 4px; padding:0; display:flex;
+    flex-direction:column; gap:3px; }
+  .agent-tasks-list li{ display:flex; gap:7px; align-items:center; line-height:1.35; }
+  .agent-tasks-list .tk-text{ flex:1 1 auto; min-width:0; }
+  .agent-tasks-list li.done .tk-text{ color:var(--text-dim); text-decoration:line-through; }
+  .tk-chip{ flex:none; font-size:10px; letter-spacing:.04em; text-transform:uppercase;
+    border-radius:999px; padding:1px 7px; border:1px solid var(--border);
+    color:var(--text-dim); background:var(--surface-2,var(--bg)); }
+  .tk-chip.doing{ color:var(--accent); border-color:var(--accent); }
+  .tk-chip.done{ color:#fff; background:var(--accent); border-color:var(--accent); }
+  .tk-chip.failed,.tk-chip.blocked{ color:var(--danger-text,#b91c1c); border-color:var(--danger,#b91c1c); }
+  .tk-done{ flex:none; border:1px solid var(--border); background:none; cursor:pointer;
+    color:var(--accent); font:inherit; font-size:11px; padding:1px 6px; border-radius:var(--radius-sm); }
+  .tk-done:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  .agent-tasks-add{ display:flex; gap:6px; margin-top:4px; }
+  .agent-tasks-add input{ flex:1 1 auto; min-width:0; border:1px solid var(--border);
+    border-radius:var(--radius-sm); background:var(--bg); color:var(--text);
+    font:inherit; font-size:12px; padding:3px 7px; }
+  .agent-tasks-add input:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  .agent-tasks-add button{ flex:none; border:1px solid var(--border); background:none;
+    color:var(--text); font:inherit; font-size:12px; padding:3px 9px;
+    border-radius:var(--radius-sm); cursor:pointer; }
+  .agent-tasks-add button:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
   /* The plan strip: compact, collapsible, never taller than a third of the
      column so the conversation stays the thing on screen. */
   .agent-plan{ border:1px solid var(--border); border-radius:var(--radius-sm);
@@ -3551,6 +3586,28 @@
                 <div class="agent-plan-body" id="agent-plan-body">
                   <ul class="agent-plan-list" id="agent-plan-list"></ul>
                 </div>
+              </div>
+              <!-- TASK BOARD (taskboard): the goal behind the work in this
+                   folder and the tasks agents pick from. The same goal brief
+                   rides into every Multi phase, the Build brief file and the
+                   opening turn of a terminal CLI. -->
+              <div class="agent-tasks" id="agent-tasks" hidden>
+                <div class="agent-tasks-h">
+                  <span class="agent-plan-title">Tasks</span>
+                  <span class="agent-tasks-goal" id="agent-tasks-goal">No goal yet for this project.</span>
+                  <button type="button" class="agent-tasks-x" id="agent-goal-close" hidden>Close goal</button>
+                </div>
+                <ul class="agent-tasks-list" id="agent-tasks-list"></ul>
+                <form class="agent-tasks-add" id="agent-task-form" hidden>
+                  <input type="text" id="agent-task-input" maxlength="200"
+                         placeholder="Add a task to this goal" aria-label="New task">
+                  <button type="submit">Add</button>
+                </form>
+                <form class="agent-tasks-add" id="agent-goal-form">
+                  <input type="text" id="agent-goal-input" maxlength="200"
+                         placeholder="Set the goal for this project" aria-label="New goal">
+                  <button type="submit">Set goal</button>
+                </form>
               </div>
               <div class="chat-messages" id="agent-messages" aria-live="polite">
                 <div class="chat-empty">Send a message to start working with the agent in this folder.</div>
@@ -9505,6 +9562,8 @@
       queueForget(sessionId);         /* nothing to send to a conversation that ended */
       var planBox = $('#agent-plan');
       if (planBox) planBox.hidden = true;
+      var tasksBox = $('#agent-tasks');
+      if (tasksBox) tasksBox.hidden = true;
       sessionId = null;
       curProjectDir = null;
       curSessionCli = null;
@@ -10169,6 +10228,7 @@
       curSessionCli = cli || null;
       queueLoad();                    /* this conversation's waiting messages */
       loadPlan();                     /* ...and its task list */
+      loadTasks();                    /* ...and the project's goal + tasks */
       startRow.hidden = true;
       setSetupVisible(false);
       sessionBox.hidden = false;
@@ -10759,6 +10819,97 @@
         .then(function(p){ if (sessionId === sid) renderPlan(p || {}); })
         .catch(function(){});
     }
+
+    /* ---------- The task board: the goal behind the work ---------- */
+    var curGoalId = null;
+    function loadTasks(){
+      var panel = document.getElementById('agent-tasks');
+      if (!panel) return Promise.resolve();
+      if (!curProjectDir){ panel.hidden = true; return Promise.resolve(); }
+      panel.hidden = false;
+      var dir = curProjectDir;
+      var q = 'project_dir=' + encodeURIComponent(dir);
+      return Promise.all([
+        api('/api/goals?' + q).catch(function(){ return {}; }),
+        api('/api/tasks?' + q).catch(function(){ return {}; })
+      ]).then(function(res){
+        if (curProjectDir !== dir) return;
+        renderTasks(res[0] || {}, (res[1] && res[1].tasks) || []);
+      });
+    }
+    function renderTasks(goalsData, tasks){
+      var goalEl = document.getElementById('agent-tasks-goal');
+      var listEl = document.getElementById('agent-tasks-list');
+      var taskForm = document.getElementById('agent-task-form');
+      var closeBtn = document.getElementById('agent-goal-close');
+      if (!goalEl || !listEl) return;
+      var active = goalsData.active || (asList(goalsData, ['goals'])[0] || null);
+      curGoalId = active ? active.id : null;
+      if (active){
+        goalEl.textContent = active.title + (active.detail ? ' — ' + active.detail : '');
+        if (taskForm) taskForm.hidden = false;
+        if (closeBtn) closeBtn.hidden = false;
+      } else {
+        goalEl.textContent = 'No goal yet for this project.';
+        if (taskForm) taskForm.hidden = true;
+        if (closeBtn) closeBtn.hidden = true;
+      }
+      listEl.innerHTML = '';
+      var open = (tasks || []).filter(function(t){
+        return active && t.goal_id === active.id && t.status !== 'done';
+      });
+      if (!open.length){ return; }
+      open.forEach(function(t){
+        var li = document.createElement('li');
+        if (t.status === 'done') li.className = 'done';
+        var text = document.createElement('span');
+        text.className = 'tk-text'; text.textContent = t.title;
+        var chip = document.createElement('span');
+        chip.className = 'tk-chip ' + t.status; chip.textContent = t.status;
+        li.appendChild(text); li.appendChild(chip);
+        if (t.status !== 'done'){
+          var btn = document.createElement('button');
+          btn.type = 'button'; btn.className = 'tk-done'; btn.textContent = 'Done';
+          btn.addEventListener('click', function(){
+            api('/api/tasks/' + encodeURIComponent(t.id),
+                { method: 'POST', body: { status: 'done' } })
+              .then(loadTasks).catch(function(){});
+          });
+          li.appendChild(btn);
+        }
+        listEl.appendChild(li);
+      });
+    }
+    (function wireTaskForms(){
+      var goalForm = document.getElementById('agent-goal-form');
+      var taskForm = document.getElementById('agent-task-form');
+      var closeBtn = document.getElementById('agent-goal-close');
+      if (goalForm) goalForm.addEventListener('submit', function(e){
+        e.preventDefault();
+        var inp = document.getElementById('agent-goal-input');
+        var title = (inp && inp.value || '').trim();
+        if (!title || !curProjectDir) return;
+        api('/api/goals', { method: 'POST',
+            body: { title: title, project_dir: curProjectDir } })
+          .then(function(){ if (inp) inp.value = ''; return loadTasks(); })
+          .catch(function(){});
+      });
+      if (taskForm) taskForm.addEventListener('submit', function(e){
+        e.preventDefault();
+        var inp = document.getElementById('agent-task-input');
+        var title = (inp && inp.value || '').trim();
+        if (!title || !curGoalId) return;
+        api('/api/tasks', { method: 'POST',
+            body: { goal_id: curGoalId, title: title } })
+          .then(function(){ if (inp) inp.value = ''; return loadTasks(); })
+          .catch(function(){});
+      });
+      if (closeBtn) closeBtn.addEventListener('click', function(){
+        if (!curGoalId) return;
+        api('/api/goals/' + encodeURIComponent(curGoalId) + '/close',
+            { method: 'POST' }).then(loadTasks).catch(function(){});
+      });
+    })();
     /* One helper of a Multi run: its state (icon AND words, never colour
        alone), the model it runs on, how long it has taken, what it is doing
        now, and its own page in a new window. */

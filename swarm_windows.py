@@ -245,6 +245,9 @@ CONTEXT_CHARS = 6000
 PLAN_CONTEXT_CHARS = 4000
 WORKER_CONTEXT_CHARS = 2000
 MANAGER_CONTEXT_CHARS = 1500
+# The goal brief (taskboard) a run carries: the owner's <= 600-char cap, with
+# a little headroom for its heading when it was built right at the limit.
+GOAL_BRIEF_CHARS = 700
 _CONTEXT_HEADING = ("--- conversation context (earlier in this conversation; "
                     "use it to understand the goal, do not redo finished work) ---")
 
@@ -917,11 +920,12 @@ class _Run:
                  "restored", "interrupted", "store_root", "owner",
                  "manager", "managed", "modes", "manager_tokens", "manager_calls",
                  "context", "resumes", "default_mode", "design", "plan_check",
-                 "free_verdict", "search", "search_saved")
+                 "free_verdict", "search", "search_saved", "goal_brief")
 
     def __init__(self, goal, project_dir, cli_id, phases, owner=None,
                  manager=None, modes=(), context="", default_mode=None,
-                 design=None, check_report=None, free_verdict=None, search=None):
+                 design=None, check_report=None, free_verdict=None, search=None,
+                 goal_brief=""):
         self.id = "swarm-" + uuid.uuid4().hex[:12]
         self.goal = goal
         # THE DESIGN the plan carried (plan_check.normalize_design; {} for a
@@ -936,6 +940,11 @@ class _Run:
         # better" as a goal meant planning from three words. Persisted, so a
         # resumed run's workers are briefed the same way.
         self.context = _clip_text(context, CONTEXT_CHARS)
+        # THE GOAL BEHIND THE RUN (taskboard, via app): the <= 600-char brief
+        # naming the project's active goal and its open tasks. Every worker's
+        # prompt carries it, the planner saw it, and a restored run keeps it
+        # (persisted). "" = no goal, i.e. the prompt is exactly as before.
+        self.goal_brief = _clip_text(goal_brief, GOAL_BRIEF_CHARS)
         # How many times this run was picked back up by a "continue".
         self.resumes = 0
         self.project_dir = project_dir
@@ -1008,6 +1017,7 @@ class _Run:
             "manager_tokens": self.manager_tokens,
             "manager_calls": self.manager_calls,
             "context": self.context, "resumes": self.resumes,
+            "goal_brief": self.goal_brief or "",
             "design": dict(self.design or {}),
             "plan_check": dict(self.plan_check) if self.plan_check else None,
             "search": (self.search.snapshot() if self.search is not None
@@ -1049,6 +1059,7 @@ class _Run:
         except (TypeError, ValueError):
             run.resumes = 0
         run.id = str(row["run_id"])
+        run.goal_brief = _clip_text(row.get("goal_brief") or "", GOAL_BRIEF_CHARS)
         run.owner = row.get("owner") or None
         run.default_mode = row.get("default_mode") or None
         run.state = row.get("state") or DONE
@@ -1249,6 +1260,14 @@ def _agent_prompt(run, agent):
                          ("YOUR FINAL MESSAGE MUST CONTAIN", agent.output_format)):
         if value:
             parts += [label + ": " + value, ""]
+    # THE GOAL BEHIND THIS WORK (taskboard, via app): why this run exists and
+    # what else is still open under the same goal, so a worker's phase serves
+    # the outcome and not just its own title. Ahead of the design, still an
+    # instruction. "" (no active goal) = the prompt is unchanged.
+    gb = getattr(run, "goal_brief", "")
+    if gb:
+        parts += ["THE GOAL BEHIND THIS WORK (keep every step serving it):",
+                  gb, ""]
     # THE SHARED DESIGN (owner, 2026-10-04: "design, plan well in a perfect
     # architecture, then go"): helpers working at the same time build to the
     # same interfaces, and each knows which files are its own. Absent for a
@@ -2777,7 +2796,7 @@ def unfinished(run):
 
 def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
            manager=None, modes=None, context=None, default_mode=None,
-           free_verdict=None, search=None):
+           free_verdict=None, search=None, goal_brief=None):
     """Pick an ENDED run back up where it stopped. Returns the run id, or None
     when there is nothing to resume.
 
@@ -2821,6 +2840,9 @@ def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
         run.resumes += 1
         if context is not None:
             run.context = _clip_text(context, CONTEXT_CHARS)
+        if goal_brief is not None:
+            gb = goal_brief() if callable(goal_brief) else goal_brief
+            run.goal_brief = _clip_text(gb, GOAL_BRIEF_CHARS)
         if manager is not None and run.managed:
             run.manager = manager
         if modes and not run.modes:
@@ -2910,7 +2932,8 @@ def _search_policy(search, run=None):
 
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
           on_done=None, configure=None, modes=(), review=True, owner=None, stop=None,
-          manager=None, context="", default_mode=None, free_verdict=None, search=None):
+          manager=None, context="", default_mode=None, free_verdict=None, search=None,
+          goal_brief=None):
     """Begin a run. Returns the run id immediately; the work happens on a
     background thread.
 
@@ -2933,12 +2956,18 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     goal = str(goal or "").strip()
     if not goal:
         raise SwarmWindowsError("a goal is required")
+    # THE GOAL BEHIND THE RUN (taskboard, via app): a string, or a callable
+    # resolved once here. The planner sees it ahead of the conversation
+    # context; every worker's prompt carries it (see _agent_prompt). "" = off.
+    gb = goal_brief() if callable(goal_brief) else goal_brief
+    gb = _clip_text(gb, GOAL_BRIEF_CHARS)
     meter = _PlanMeter(manager) if manager is not None else None
     info = {}
     if phases is None:
         if planner is None:
             raise SwarmWindowsError("give either phases or a planner")
-        extra = {"context": context} if context else {}
+        plan_context = (gb + "\n\n" + context).strip() if gb else context
+        extra = {"context": plan_context} if plan_context else {}
         phases = plan(goal, planner, modes=modes,
                       manager=meter.ask if meter else None, out=info, **extra)
     notes = list(info.get("notes") or ())
@@ -2967,7 +2996,8 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     run = _Run(goal, project_dir, cli_id, phases, owner=owner,
                manager=manager, modes=modes, context=context,
                default_mode=default_mode, design=design, check_report=report,
-               free_verdict=free_verdict, search=_search_policy(search))
+               free_verdict=free_verdict, search=_search_policy(search),
+               goal_brief=gb)
     if meter:
         run.manager_tokens, run.manager_calls = meter.tokens, meter.calls
     _remember(run)

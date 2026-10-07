@@ -309,7 +309,7 @@ keys can actually reach right now, which is the only number that matters.
 | **Dashboard** | `/api/*` (control-token gated) |
 | **Probes** | `/health`, `/healthz` (liveness), `/ready`, `/readyz` (readiness, 503 + `reason` when not ready) — no token, loopback only, no version or provider data |
 
-161 routes in total; the dashboard is the documentation for the rest.
+165 routes in total; the dashboard is the documentation for the rest.
 
 ---
 

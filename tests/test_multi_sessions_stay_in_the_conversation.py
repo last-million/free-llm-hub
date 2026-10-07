@@ -117,7 +117,7 @@ def swarm(monkeypatch):
 
     def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
               on_done=None, configure=None, modes=(), review=True, owner=None, stop=None,
-              context="", default_mode=None):
+              context="", default_mode=None, goal_brief=None):
         calls["start"].append({"goal": goal, "project_dir": project_dir,
                                "cli": cli_id, "modes": tuple(modes), "owner": owner})
         calls.setdefault("default_mode", []).append(default_mode)
