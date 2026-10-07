@@ -95,6 +95,17 @@ routing heuristics.
   `GET /api/hub/stopped` returns `{stopped: bool}`.
 - Covered by `tests/test_hub_lifecycle.py`.
 
+## Liveness / readiness probes (2026-10-08)
+
+Idea from PR #4, rewritten. `GET /health` + `/healthz` (liveness: always 200,
+`{status, uptime_seconds}`, monotonic clock) and `GET /ready` + `/readyz`
+(readiness, `_hub_readiness`: 503 `{status: not_ready, reason}` with reason
+draining | stopped | no_provider | error; ready = /v1 accepted and an enabled,
+usable, NON-paid provider exists). Outside `/api/*`, so no control token; the
+loopback Host/Origin guard still applies. They carry NO version, release or
+provider id (the hub shows those to token holders only). `Cache-Control:
+no-store`; HEAD works. Covered by `tests/test_health_probes.py`.
+
 ## Puter zero-manual connect (dashboard)
 
 The `puter` card (Recommended zone) has a "Connect with Puter" button —

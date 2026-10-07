@@ -307,8 +307,9 @@ keys can actually reach right now, which is the only number that matters.
 | **Gemini** | `/v1beta/models/<model>:generateContent`, `:streamGenerateContent`, `:countTokens` |
 | **MCP** | `/mcp` — `crew_run`, `crew_start`, `crew_result`, `swarm_windows_*` |
 | **Dashboard** | `/api/*` (control-token gated) |
+| **Probes** | `/health`, `/healthz` (liveness), `/ready`, `/readyz` (readiness, 503 + `reason` when not ready) — no token, loopback only, no version or provider data |
 
-157 routes in total; the dashboard is the documentation for the rest.
+161 routes in total; the dashboard is the documentation for the rest.
 
 ---
 

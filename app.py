@@ -18648,6 +18648,63 @@ def api_version():
     return jsonify({"version": _HUB_VERSION, "release": HUB_RELEASE})
 
 
+# Liveness / readiness probes (idea from PR #4). They live outside /api/* so a
+# Docker HEALTHCHECK or an uptime monitor gets an answer without the control
+# token; the loopback Host / Origin guard still applies, so only this machine
+# can ask. They answer status words only -- no version, release, provider id
+# or key state: the hub shows those to token holders alone (/api/version).
+# Flask answers HEAD on both, which is what most uptime monitors send.
+_HUB_STARTED_MONO = time.monotonic()
+
+
+def _probe_reply(payload, status=200):
+    resp = jsonify(payload)
+    resp.status_code = status
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _hub_readiness():
+    """(ready, reason): reason is "" when ready, else draining | stopped |
+    no_provider. Reads the runtime state and the provider switches only (the
+    same test `_runtime_before` applies to /v1), never the network."""
+    state = config.get_runtime_state() or {}
+    phase = state.get("phase")
+    if phase == "draining":
+        return False, "draining"
+    if state.get("desired") == "stopped" or phase == "stopped":
+        return False, "stopped"
+    for pid in _enabled_keyed():
+        # A paid provider is kept out of free routing, so it cannot make the
+        # hub ready on its own.
+        if not (prov.get_provider(pid) or {}).get("paid"):
+            return True, ""
+    return False, "no_provider"
+
+
+@app.route("/health", methods=["GET"])
+@app.route("/healthz", methods=["GET"])
+def probe_health():
+    """Liveness: 200 whenever the process serves requests. Reads nothing, so
+    it answers while every provider is throttled or the hub is draining."""
+    return _probe_reply({"status": "ok",
+                         "uptime_seconds": int(time.monotonic() - _HUB_STARTED_MONO)})
+
+
+@app.route("/ready", methods=["GET"])
+@app.route("/readyz", methods=["GET"])
+def probe_ready():
+    """Readiness: 200 when /v1 traffic is accepted and at least one enabled
+    free provider is usable; 503 with a reason otherwise."""
+    try:
+        ready, reason = _hub_readiness()
+    except Exception:
+        ready, reason = False, "error"
+    if ready:
+        return _probe_reply({"status": "ready"})
+    return _probe_reply({"status": "not_ready", "reason": reason}, 503)
+
+
 _RELEASE_NOTES_CACHE = {"at": 0.0, "rows": None}
 _RELEASE_NOTES_TTL = 900          # 15 min; the hub pulls every 5 hours
 _RELEASE_NOTES_SCAN = 24          # commits read (docs-only ones are dropped)...
