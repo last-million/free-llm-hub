@@ -1138,6 +1138,53 @@ Covered by `tests/test_skills_settings.py`. "Skills" = the craft briefs
   = update), `POST /api/skills/custom/delete {id}`. UI: `#skills-group` in the
   Settings drawer.
 
+## ECC skills (vendored, opt-in) (2026-10-08)
+
+Covered by `tests/test_ecc_skills.py`. Nine coding-agent rule documents vendored
+from github.com/affaan-m/ECC (commit `ef648e0`, repo VERSION 2.2.3), **MIT, (c)
+Affaan Mustafa** -- the licence idea the "Model guides" section already credits,
+now shipped as real toggleable skills. This is instructions only: no script,
+hook, binary or `agents/openai.yaml` was vendored (supply-chain risk; the hub
+only injects text).
+
+- **The files** live in `skills_ecc/`: `LICENSE` (verbatim), `VENDORED.md`
+  (source URL + commit + what was taken / modified / left out and why), and
+  `skills_ecc/<name>.md` for each skill (the upstream `SKILL.md`, frontmatter
+  kept for attribution). Skills: tdd-workflow, verification-loop,
+  security-review, coding-standards, agent-introspection-debugging,
+  backend-patterns, frontend-patterns, api-design, e2e-testing. Left out: the
+  ~30 content/marketing/business skills; `strategic-compact` (built on the
+  Claude-Code-only `/compact`, which does not work through the hub; the hub
+  compacts itself in ctxwin). ONE modification: `tdd-workflow.md`'s "Step 0"
+  dropped ECC's bundled package-manager detector script for a script-free
+  instruction (an HTML comment marks the edit; see `VENDORED.md`).
+- **`ecc.py`** (pure, stdlib, never raises): `CATALOG` (id `ecc:<name>`, display
+  name, one-line description, trigger keywords drawn from each skill's own
+  frontmatter), `matches`/`hits` (word-bounded keywords, never a user regex),
+  and a mtime-cached reader (`load_body`) that strips the YAML frontmatter.
+  `render(id)` = one bounded block `ECC SKILL: <name> (opt-in; MIT, (c) Affaan
+  Mustafa -- ...)\n<body>`, each `<= MAX_CHARS` (1500); `hits(text, enabled_ids)`
+  returns at most `MAX_PER_TURN` (2), ENABLED-and-matched only; a missing dir /
+  unreadable file = no hits (the off state).
+- **Default OFF.** Enabled ids live in setting `ecc_enabled` (default `[]`).
+  `_skill_source()` now returns a THIRD element (enabled ECC ids); `craft.py`
+  unpacks it length-tolerantly (a 2-tuple source = no ECC, the old shape some
+  tests still use) and `craft.match` appends `ecc.hits` after the user skills.
+  An ECC skill carries no ANTI lines, so like a user skill it never pulls the
+  tool-less VERIFY_READ block. Rides every protocol, CLI, /agent brief file and
+  crew through the same `craft.match` / `craft.system_message` path -- /v1 via
+  `_apply_craft_brief`, the Build brief via `agentic_chat`.
+- **Routes** (control-token gated, same `/api/skills/toggle`): id `ecc:<name>`
+  toggles one, id `ecc_all` toggles every ECC skill; `GET /api/skills` gains
+  `ecc` (`[{id,name,description,enabled}]`), `ecc_all` and `ecc_credit`. UI: a
+  collapsed `<details id="skills-ecc-group">` inside `#skills-group` with the
+  licence/credit line, "Enable all ECC", and per-skill switches.
+- **Cost**: with EVERY ECC skill enabled, the heaviest request still lands at
+  ~13.27% of the 32K floor (the saas landing page, which matches no ECC skill);
+  the heaviest ECC-matching request is ~11.7%. The existing
+  `test_craft_briefs.test_worst_case_brief_cost` (0.135) stays green because ECC
+  is off by default.
+
 ## Low-resource mode (2026-09-28)
 
 Covered by `tests/test_low_resource.py`. `lowres.py` (leaf: psutil + config,

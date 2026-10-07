@@ -24,11 +24,14 @@ decisions a good practitioner actually makes — not a style lecture, not
 """
 import re
 
+import ecc
 import skills
 
 # Settings -> Skills. app.py registers a callable returning
-# (disabled built-in ids, the user's custom skills); unregistered (tests, other
-# processes) = every built-in on, no custom skill -- the old behaviour exactly.
+# (disabled built-in ids, the user's custom skills[, enabled ECC skill ids]);
+# unregistered (tests, other processes) = every built-in on, no custom skill, no
+# ECC skill -- the old behaviour exactly. The ECC element is optional: a 2-tuple
+# source (the older shape, still used by some tests) reads as "no ECC enabled".
 _SKILL_SOURCE = None
 
 
@@ -39,12 +42,16 @@ def set_skill_source(fn):
 
 def _skill_state():
     if _SKILL_SOURCE is None:
-        return frozenset(), []
+        return frozenset(), [], frozenset()
     try:
-        disabled, custom = _SKILL_SOURCE()
-        return frozenset(disabled or ()), [c for c in (custom or ()) if isinstance(c, dict)]
+        vals = _SKILL_SOURCE()
+        disabled, custom = vals[0], vals[1]
+        ecc_on = vals[2] if len(vals) > 2 else ()
+        return (frozenset(disabled or ()),
+                [c for c in (custom or ()) if isinstance(c, dict)],
+                frozenset(ecc_on or ()))
     except Exception:                                            # noqa: BLE001
-        return frozenset(), []
+        return frozenset(), [], frozenset()
 
 
 def skill_enabled(name):
@@ -292,7 +299,7 @@ def match(text):
     page" should get LANDING + ECOMMERCE, not five overlapping briefs."""
     if not isinstance(text, str) or not text.strip():
         return []
-    disabled, custom = _skill_state()
+    disabled, custom, ecc_on = _skill_state()
     out = []
     for name, rx, brief in _BRIEFS:
         if name in disabled:
@@ -311,8 +318,9 @@ def match(text):
             if extra >= MAX_ORTHOGONAL:
                 break
     # The user's own skills (Settings -> Skills) ride along like the orthogonal
-    # briefs, with their own cap (skills.MAX_CUSTOM_PER_TURN).
-    return out + skills.custom_hits(text, custom)
+    # briefs, with their own cap (skills.MAX_CUSTOM_PER_TURN); then the opt-in
+    # ECC skills (default off), with their own cap (ecc.MAX_PER_TURN).
+    return out + skills.custom_hits(text, custom) + ecc.hits(text, ecc_on)
 
 
 # --------------------------------------------------------------------------- #
@@ -490,8 +498,10 @@ def system_message(text, tools=True):
     # The loop goes LAST: it says "every brief above" and "every ANTI line
     # above", and both references dangle if it is prepended.
     # VERIFY_READ checks against "the ANTI lines above", which only built-in
-    # briefs carry; a user skill alone gets no tool-less verify block.
-    builtin = any(not n.startswith("custom:") for n, _b in hits)
+    # briefs carry; a user skill or an ECC skill alone gets no tool-less verify
+    # block (neither carries ANTI lines the reference could point at).
+    builtin = any(not n.startswith("custom:") and not n.startswith("ecc:")
+                  for n, _b in hits)
     # Web/UI: the design decisions come right after the plan (tools) or right
     # after the briefs (tool-less) -- decided before any code either way.
     design = [DESIGN_FIRST] if any(n == "web_design" for n, _b in hits) else []

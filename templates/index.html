@@ -4115,6 +4115,16 @@
           </form>
         </div>
       </div>
+      <details class="sk-ecc" id="skills-ecc-group">
+        <summary>ECC skills (opt-in) &mdash; <span id="ecc-credit-line">from github.com/affaan-m/ECC, MIT &copy; Affaan Mustafa</span></summary>
+        <p class="sd-help">Coding-agent rules &mdash; TDD, a verification loop, security review, self-debugging, and API / backend / frontend / E2E patterns &mdash; vendored from the <a href="https://github.com/affaan-m/ECC" target="_blank" rel="noopener">ECC project</a> under the MIT license (&copy; Affaan Mustafa). Off by default: switch on the ones you want, or all of them.</p>
+        <label class="switch" title="Enable or disable every ECC skill at once">
+          <input type="checkbox" data-skill="ecc_all" id="skills-ecc-all" aria-label="Enable all ECC skills">
+          <span class="track" aria-hidden="true"></span>
+          <span class="lbl">Enable all ECC</span>
+        </label>
+        <div class="sk-list" id="skills-ecc"></div>
+      </details>
     </div>
 
     <div class="sd-group">
@@ -12140,6 +12150,14 @@
         '</div><div class="sk-desc">' + esc(k.description) + '</div></div>' +
         '<div class="sk-acts">' + skillSwitch(k.id, k.enabled, k.name) + '</div></div>';
     }).join('');
+    var e = $('#skills-ecc');
+    if (e) e.innerHTML = (r.ecc || []).map(function(k){
+      return '<div class="sk-row"><div class="sk-txt"><div class="sk-name">' + esc(k.name) +
+        '</div><div class="sk-desc">' + esc(k.description) + '</div></div>' +
+        '<div class="sk-acts">' + skillSwitch(k.id, k.enabled, k.name) + '</div></div>';
+    }).join('');
+    var ea = $('#skills-ecc-all'); if (ea) ea.checked = !!r.ecc_all;
+    var ec = $('#ecc-credit-line'); if (ec && r.ecc_credit) ec.textContent = 'from ' + r.ecc_credit;
     _skillsCustom = r.custom || [];
     var c = $('#skills-custom');
     if (c) c.innerHTML = _skillsCustom.length ? _skillsCustom.map(function(k){

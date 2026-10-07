@@ -83,6 +83,7 @@ import arena
 import lowres
 import orchestrator
 import skills
+import ecc
 import perfstats
 import providers as prov
 import quota
@@ -21887,8 +21888,14 @@ def _custom_skills():
     return [x for x in v if isinstance(x, dict) and x.get("id")] if isinstance(v, list) else []
 
 
+def _ecc_enabled():
+    """The opt-in ECC skill ids the owner switched ON (default none)."""
+    v = config.get_setting("ecc_enabled", [])
+    return [x for x in v if x in ecc.IDS] if isinstance(v, list) else []
+
+
 def _skill_source():
-    return _skills_disabled(), _custom_skills()
+    return _skills_disabled(), _custom_skills(), _ecc_enabled()
 
 
 craft.set_skill_source(_skill_source)
@@ -21896,10 +21903,14 @@ craft.set_skill_source(_skill_source)
 
 def _skills_view():
     off = set(_skills_disabled())
+    ecc_on = _ecc_enabled()
     return {"enabled": config.get_flag("craft_briefs", True),
             "builtin": [{"id": i, "name": n, "description": d, "enabled": i not in off}
                         for i, n, d in skills.BUILTIN],
             "custom": _custom_skills(),
+            "ecc": ecc.view(ecc_on),
+            "ecc_all": bool(ecc_on) and len(ecc_on) == len(ecc.IDS),
+            "ecc_credit": ecc.CREDIT,
             "limits": {"max_custom": skills.MAX_CUSTOM, "max_name": skills.MAX_NAME,
                        "max_instructions": skills.MAX_INSTRUCTIONS,
                        "max_keywords": skills.MAX_KEYWORDS}}
@@ -21912,7 +21923,8 @@ def api_skills():
 
 @app.route("/api/skills/toggle", methods=["POST"])
 def api_skills_toggle():
-    """{id, enabled}: a built-in id, a custom skill id, or "all" (the master
+    """{id, enabled}: a built-in id, a custom skill id, an ECC skill id
+    ("ecc:<name>") or "ecc_all" (every ECC skill at once), or "all" (the master
     switch, flag craft_briefs)."""
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
@@ -21920,6 +21932,11 @@ def api_skills_toggle():
     sid, on = body.get("id"), body["enabled"]
     if sid == "all":
         config.set_flag("craft_briefs", on)
+    elif sid == "ecc_all":
+        config.set_setting("ecc_enabled", list(ecc.IDS) if on else [])
+    elif sid in ecc.IDS:
+        en = [x for x in _ecc_enabled() if x != sid]
+        config.set_setting("ecc_enabled", en + [sid] if on else en)
     elif sid in skills.BUILTIN_IDS:
         off = [x for x in _skills_disabled() if x != sid]
         config.set_setting("skills_disabled", off if on else off + [sid])
