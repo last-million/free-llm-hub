@@ -2899,7 +2899,9 @@ failed first hops**: `uncloseai/turboderp/Qwen3.8-27B-exl3` HTTP 400 x173,
 x42; 86 turns (17%) ended with no server.
 
 - **Why one weak pair kept opening chains** (`[spread] ... pool 1, held elsewhere
-  N`): `_spread_pool` and `_rotate_within_run` measured "comparable" on the RAW
+  N`; 185 of 1071 logged picks, 148 of them with >= 1 model held by a sibling --
+  REPRODUCED with a fake fleet; the 37 with "held elsewhere 0" are INFERRED, see
+  below): `_spread_pool` and `_rotate_within_run` measured "comparable" on the RAW
   benchmark score (a 10-point window) while `_auto_top_band` -- which runs AFTER
   them -- applies the learned reliability penalty. With the strong models held by
   sibling sessions (or just stalled: a stall is a `_recent_hop_failure` and drops
@@ -2915,7 +2917,12 @@ x42; 86 turns (17%) ended with no server.
   is). Owner rule intact: parallel helpers still get different models WHEN they
   are in the band. The fresh pick also drops a model whose KNOWN window cannot
   hold the request even after the hub's allowed trim (`_roomy` in
-  `_route_by_difficulty`, same bar as the overflow signal), fail-open.
+  `_route_by_difficulty`, same bar as the overflow signal), fail-open. INFERRED
+  (not reproduced before the fix): the "held elsewhere 0" picks and the repeated
+  re-picks of one session after "pin dropped" -- the strong models stalled (a
+  stall leaves the primary pick through `_recent_hop_failure`; a HTTP 400 is not
+  such a kind) so the fast-failing pair was what was left; the streak rest and the
+  system-message fix remove that cause, but no test failed on it before.
 - **Why the HTTP 400 (all 7 logged bodies)**: `"System message must be at the
   beginning."` -- the Qwen chat template raises on ANY system message that is not
   the very first one, including a second leading one, and the hub puts its own
@@ -2936,9 +2943,11 @@ x42; 86 turns (17%) ended with no server.
   Exempt: 429/quota/billing/413, a client that left, a local-network failure
   (`_local_net_failed`), an explicit `provider/model` request (its chain is seeded
   before any of this). Resting rides `_tool_turn_sick` (primary pick, chain sick
-  group, quality fallback) plus `_empty_resting` (roles walk tail, orchestrator
-  pin), `_build_chain`'s primary seed and the verifier/specialist pool: always
-  fail-open, the pair stays reachable as the LAST resort. `_empty_200` entries
+  group, quality fallback) plus `_empty_resting` (roles walk tail),
+  `_build_chain`'s primary seed and the verifier/specialist pool: always
+  fail-open, the pair stays reachable as the LAST resort. The chosen
+  ORCHESTRATOR (the user's pick) keeps the old short empties-only rest -- a
+  skipped pair could never earn the success that clears an hours-long one. `_empty_200` entries
   may now be `(epoch, class)`; a bare epoch is the legacy "empty" event.
 - **Known-too-small windows are not walked ahead of a pair that fits**:
   `_ChainClock._roomy_first` (every tool walk) moves a hop that would only raise

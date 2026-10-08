@@ -596,3 +596,107 @@ def test_an_unusable_verifier_gets_another_look_later(verifier_stats):
     with A._team_stats_lock:
         A._verifier_stats[("a", "m1")] = [(long_ago, False)] * 10
     assert not A._verifier_unusable("a", "m1")
+
+
+# --------------------------------------------------------------------------- #
+# 6. the real mechanism: _dispatch_chat feeds the streak; consumers honour it
+# --------------------------------------------------------------------------- #
+
+def _dispatch(monkeypatch, upstream, payload):
+    monkeypatch.setattr(A, "_upstream_chat", upstream)
+    return A._dispatch_chat(P[0], payload, False)
+
+
+TOOL_PAYLOAD = {"model": P[1], "tools": [{"type": "function"}],
+                "messages": [{"role": "user", "content": "hi"}]}
+
+
+def test_dispatch_chat_files_a_tool_turns_4xx_and_rests_the_pair(monkeypatch):
+    for _ in range(3):
+        _dispatch(monkeypatch, lambda *a, **k: _Resp(400, "bad"), dict(TOOL_PAYLOAD))
+    assert A._pair_resting(*P) and A._tool_turn_sick(*P)
+
+
+def test_dispatch_chat_streamed_4xx_counts_too(monkeypatch):
+    monkeypatch.setattr(A, "_upstream_chat", lambda *a, **k: _Resp(403, "no"))
+    for _ in range(3):
+        A._dispatch_chat(P[0], dict(TOOL_PAYLOAD), True)
+    assert A._pair_resting(*P)
+
+
+def test_dispatch_chat_without_tools_files_nothing(monkeypatch):
+    chat = {"model": P[1], "messages": [{"role": "user", "content": "hi"}]}
+    for _ in range(4):
+        _dispatch(monkeypatch, lambda *a, **k: _Resp(400, "bad"), dict(chat))
+    assert not A._pair_resting(*P) and not A._empty_200.get(P)
+
+
+def test_dispatch_chat_429_files_nothing(monkeypatch):
+    for _ in range(4):
+        _dispatch(monkeypatch, lambda *a, **k: _Resp(429, "slow down"), dict(TOOL_PAYLOAD))
+    assert not A._pair_resting(*P)
+
+
+def _boom(*a, **k):
+    raise A.requests.ConnectionError("connection reset by peer")
+
+
+def test_dispatch_chat_request_exceptions_rest_the_pair(monkeypatch):
+    for _ in range(3):
+        with pytest.raises(A.requests.ConnectionError):
+            _dispatch(monkeypatch, _boom, dict(TOOL_PAYLOAD))
+    assert A._pair_resting(*P)
+
+
+def test_dispatch_chat_local_network_failures_rest_nobody(monkeypatch):
+    monkeypatch.setattr(A, "_local_net_failed", lambda *a, **k: True)
+    for _ in range(4):
+        with pytest.raises(A.requests.ConnectionError):
+            _dispatch(monkeypatch, _boom, dict(TOOL_PAYLOAD))
+    assert not A._pair_resting(*P)
+
+
+def test_a_delivering_dispatch_does_not_clear_but_a_recorded_success_does(monkeypatch):
+    _fail("http4xx", 2)
+    _dispatch(monkeypatch, lambda *a, **k: _Resp(200), dict(TOOL_PAYLOAD))
+    assert len(A._empty_200[P]) == 2          # a 200 is not yet a DELIVERY (could be empty)
+    A._record_outcome(*P, True)
+    assert not A._empty_200.get(P)
+
+
+def test_the_verifier_and_specialist_pool_skips_a_resting_pair(monkeypatch):
+    monkeypatch.setattr(A, "_swarm_member_sick", lambda *a, **k: False)
+    monkeypatch.setattr(A, "_benchmark_score", lambda pid, m: 130.0)
+    _fail("exc", 3, ("p2", "m2"))
+    rows = A._role_candidates([("p1", "m1"), ("p2", "m2"), ("p3", "m3")], ("p1", "m1"))
+    assert [(r[0], r[1]) for r in rows] == [("p3", "m3")]
+
+
+def _orch_world(monkeypatch):
+    monkeypatch.setattr(A, "_available_providers", lambda *a, **k: [P[0]])
+    monkeypatch.setattr(A, "_model_block_reason", lambda *a, **k: None)
+    monkeypatch.setattr(A, "_prefetch_free_models", lambda *a, **k: {P[0]: [P[1]]})
+    monkeypatch.setattr(A, "_is_model_skipped", lambda *a, **k: False)
+    monkeypatch.setattr(A.quota, "is_model_throttled", lambda *a, **k: False)
+    monkeypatch.setattr(A, "_supports_tools", lambda *a, **k: True)
+
+
+def test_the_chosen_orchestrator_is_not_skipped_for_the_long_rest(monkeypatch):
+    """It is the user's pick (the chain already seeds it as pinned): an
+    hours-long rest would keep it from ever earning the success that clears it."""
+    _orch_world(monkeypatch)
+    _fail("http4xx", 3)
+    assert A._pair_resting(*P)
+    assert A._orch_unusable(P[0], P[1], tools=True) is None
+    A._clear_empty_200(*P)                    # ...but the short empties rest still applies
+    for _ in range(3):
+        A._note_empty_200(*P)
+    assert "resting" in (A._orch_unusable(P[0], P[1], tools=True) or "")
+
+
+def test_the_roles_tail_spares_the_orchestrator_lead_from_the_long_rest():
+    _fail("http4xx", 3)
+    with A.app.test_request_context("/v1/chat/completions"):
+        assert A._resting_for_walk(*P)
+        A.g.hub_orchestrator_pair = P
+        assert not A._resting_for_walk(*P)

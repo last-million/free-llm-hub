@@ -15988,7 +15988,10 @@ def _orch_unusable(pid, model, est=0, tools=False, images=False, veto=None):
         return "%s does not offer it right now" % pid
     if _is_model_skipped(pid, model) or quota.is_model_throttled(pid, model):
         return "it is rate-limited or resting after failures"
-    if tools and _empty_resting(pid, model):
+    # EMPTIES ONLY (10 minutes): the chosen orchestrator is the user's pick, so
+    # the hours-long same-way failure rest (_pair_resting) does not apply to it
+    # -- a skipped pair could never earn the success that clears that rest.
+    if tools and _empty_streak(pid, model) >= _EMPTY_STREAK_LIMIT:
         n = _empty_streak(pid, model)
         _log.info("[orchestrator] pinned %s/%s resting (%d empties)", pid, model, n)
         return "resting (%d empties)" % n
@@ -36267,6 +36270,14 @@ def _empty_resting(pid, model):
     return _empty_streak(pid, model) >= _EMPTY_STREAK_LIMIT or _pair_resting(pid, model)
 
 
+def _resting_for_walk(pid, model):
+    """_empty_resting for the roles walk's tail partition: the chosen
+    orchestrator (the user's pick) is only moved back for the short empties
+    rest, never for the hours-long same-way failure rest."""
+    return (_empty_streak(pid, model) >= _EMPTY_STREAK_LIMIT
+            or (_pair_resting(pid, model) and not _is_orchestrator_lead(pid, model)))
+
+
 def _fleet_tool_p50_ms():
     """Median over pairs with >= _TOOL_FLEET_MIN_SAMPLES tool-turn samples of
     each pair's p50, or None while no pair has that many."""
@@ -38163,8 +38174,8 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
     if clock.deadline_at is not None:
         turn_end = min(turn_end, clock.deadline_at)
     # Pairs resting after 3 empty/junk 200s go to the TAIL (kept, never dropped).
-    chain = ([e for e in chain if not _empty_resting(e[0], e[1])]
-             + [e for e in chain if _empty_resting(e[0], e[1])])
+    chain = ([e for e in chain if not _resting_for_walk(e[0], e[1])]
+             + [e for e in chain if _resting_for_walk(e[0], e[1])])
     clock.plan_tool_hedge(chain)
     rows, served, hops = [], None, 0
     spent = []          # every pair dispatched to: kept off the verifier pool
