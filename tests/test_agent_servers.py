@@ -379,6 +379,18 @@ def turn(monkeypatch, tmp_path):
     monkeypatch.setattr(AC, "_TURN_TIMEOUT", 600)
     monkeypatch.setattr(AC, "_terminate", lambda p: p.kill_now())
     monkeypatch.setattr(S, "_HUB_PIDS", [4242])
+    # The watchdog's diagnosis scans real OS processes for orphans and stops
+    # the servers it found. The FIRST such psutil scan in a fresh interpreter
+    # is cold and can take ~30 s on Windows (process_iter + per-process
+    # environ()), far longer than the scripted hang below -- so run alone, the
+    # watchdog never fires before the fake process "dies" and no stall notice
+    # is emitted; run after any psutil-using test it is warm (~0.1 s) and the
+    # stall fires in time. That is the whole order-dependence. This turn
+    # exercises the watchdog against the FAKE trees handed through
+    # session_processes, so the real orphan/stop scans must be stubbed out too
+    # (session_processes already is), keeping the diagnosis hermetic and fast.
+    monkeypatch.setattr(S, "orphan_processes", lambda *a, **k: [])
+    monkeypatch.setattr(S, "stop_processes", lambda *a, **k: [])
     monkeypatch.setenv("PORT", "8787")
 
     def run(attempts, text="build my flask app and run it"):
