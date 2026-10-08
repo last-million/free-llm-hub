@@ -9018,6 +9018,22 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # be released when the session ends. The hub's own id does both.
         _skey = _build_sid() or _session_key(messages)
         _pinned = _session_pin_get(_skey)
+        # A PIN MUST NOT OUTLIVE THE WINDOW. MEASURED 2026-10-08, session
+        # c39a30c1 (~504K tokens): pinned to uncloseai/Qwen3.8-27B (65K, "pool
+        # 1"), so every turn opened on a model that could only overflow. A pin
+        # whose KNOWN window cannot hold this request is dropped and the
+        # session re-picked among the candidates that can (fail-open: when none
+        # can, the pool is left as it is and the front door / the overflow
+        # reply take over).
+        if _pinned and not _window_fits(_pinned[0], _pinned[1], est):
+            _session_pin_drop(_skey)
+            _roomy = [c for c in agentic if _window_fits(c[1], c[2], est)]
+            _log.info("[spread] %s pin %s/%s dropped: its known window cannot hold "
+                      "~%d tokens (%d of %d candidates can)", (_skey or "-")[:8],
+                      _pinned[0], _pinned[1], est, len(_roomy), len(agentic))
+            if _roomy:
+                agentic = _roomy
+            _pinned = None
         if _pinned:
             # Keep an in-progress task on the model it started on — but pin the
             # MODEL, not the provider. Two providers serving the SAME model id
@@ -9161,6 +9177,11 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
     _ckey = _session_key(messages)
     if not require_tools and _ckey:
         _cpin = _session_pin_get(_ckey)
+        if _cpin and not _window_fits(_cpin[0], _cpin[1], est):
+            # Outgrown (see the twin in the agentic branch above).
+            _session_pin_drop(_ckey)
+            pool = [c for c in pool if _window_fits(c[1], c[2], est)] or pool
+            _cpin = None
         if _cpin:
             _host = _pick_same_model_host(pool, _cpin)
             if _host:
@@ -12207,7 +12228,7 @@ def _ctx_hop_ratio(pid, model):
     return 1.0
 
 
-def _reported_prompt_tokens(upstream_pt, orig_est, pid=None, model=None):
+def _reported_prompt_tokens(upstream_pt, orig_est, pid=None, model=None, steer=True):
     """Prompt tokens to REPORT to the client: the size of the request IT sent.
 
     The upstream's own count is exact for what was forwarded -- and that is
@@ -12233,6 +12254,8 @@ def _reported_prompt_tokens(upstream_pt, orig_est, pid=None, model=None):
             real = max(0, int(orig_est or 0))
         except (TypeError, ValueError):
             real = 0
+    if not steer:
+        return real          # a pipeline answer: its stream translator steers once
     try:
         return _steer_reported(real)
     except Exception:                                            # noqa: BLE001
@@ -12445,6 +12468,24 @@ def _ctx_overflow_reply(kind, stream=False, model_label="auto"):
         _log.info("[ctx] %s request of ~%d tokens overflowed every hop (largest window "
                   "tried %d): answering with the native context-length error", kind,
                   orig, window)
+    return _native_overflow_reply(kind, stream, orig, window, model_label, hdrs)
+
+
+def _note_context_reply(orig, window):
+    """Mark THIS request as one answered with the native "context too long"
+    reply, so its activity row ends "context too long" (not a bare
+    "error . 200" / "error . 400") and the /agent ledger can tell the Build
+    page why the turn failed (_activity_after, _agent_context_probe)."""
+    try:
+        g.ctx_reply = {"tokens": int(orig or 0), "window": int(window or 0)}
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _native_overflow_reply(kind, stream, orig, window, model_label, hdrs):
+    """The protocol's native "context too long" reply (see _ctx_overflow_reply
+    and _front_door_overflow, the two callers)."""
+    _note_context_reply(orig, window)
     if kind == "anthropic":
         return jsonify(ctxwin.anthropic_overflow_body(orig, window)), 400, hdrs
     if kind == "responses" and stream:
@@ -12461,7 +12502,116 @@ def _ctx_overflow_reply(kind, stream=False, model_label="auto"):
     return jsonify(ctxwin.openai_overflow_body(orig, window)), 400, hdrs
 
 
-def _ctx_fix_chat_usage(data, orig_est, pid=None, model=None):
+# --------------------------------------------------------------------------- #
+# FRONT DOOR: a conversation no model can hold is refused BEFORE any hop
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-10-08 (hub.log, Build page session c39a30c1, codex coding-max,
+# ~504K estimated tokens): the request overflowed every model with a KNOWN
+# window (largest 262144), yet each message still walked the chain -- relays
+# whose window is only the "default" guess fail open (a guess never raises
+# _ContextOverflow), each took a ~2 MB upload, and the walk ended as a 503 after
+# 85-265 s (or as the native reply, only when every hop happened to overflow).
+# Codex retried the same oversized turn into that again.
+#
+# So a NON-compaction request whose estimate exceeds 1.15x (_FRONT_DOOR_SLACK_PCT,
+# the estimator's measured over-count) times the LARGEST window any alive
+# candidate could hold gets the protocol's native "context too long" reply at
+# once: zero hops, zero upload. Candidates are every alive, usable-now,
+# not-user-blocked model (tool-capable on a tool request, vision-capable on an
+# image request), NOT the mode-filtered pool -- the mode fails open, so a
+# category cannot lower the bound. A window the hub KNOWS (learned / catalog /
+# inferred / reference, per-request caps applied) counts at that window; one it
+# only GUESSES (the "default" guess, a provider-wide stand-in row) counts as
+# holding at most _REACH_WINDOW_CAP, never more. A CLI's own compaction request
+# is never refused (the refusal is its cue to compact). Everything at or under
+# the bound behaves exactly as before. Flags: context_overflow_signal (the
+# existing switch) and context_front_door (this guard only). Covered by
+# tests/test_oversized_conversation.py.
+_FRONT_DOOR_SLACK_PCT = 115          # est must exceed 115% of the largest window
+_FRONT_DOOR_MIN_EST = 2000           # no usable model's window is under ~1.7K tokens
+_FRONT_DOOR_TTL = 20.0
+_front_door_cache = {}
+_front_door_lock = threading.Lock()
+
+
+def _front_door_window_of(pid, model):
+    """(effective window, known) of one candidate. Known = a per-model fact (or
+    a hard per-request cap); anything else is only a guess and counts at
+    _REACH_WINDOW_CAP. Never raises."""
+    try:
+        lim, src = _model_ctx_info(pid, model)
+        if isinstance(lim, int) and lim > 0 and (
+                src in ("learned", "inferred", "reference")
+                or (src == "table" and pid in _PROVIDER_HARD_REQUEST_CAP)):
+            return lim, True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return _REACH_WINDOW_CAP, False
+
+
+def _front_door_bound(tools=False, images=False):
+    """(largest effective window, candidates counted) over every alive,
+    usable-now candidate, cached _FRONT_DOOR_TTL seconds per request shape.
+    (0, 0) when nothing is known (the guard then stays out of the way)."""
+    key = (bool(tools), bool(images))
+    now = time.time()
+    with _front_door_lock:
+        hit = _front_door_cache.get(key)
+        if hit and now - hit[0] < _FRONT_DOOR_TTL:
+            return hit[1], hit[2]
+    best = n = 0
+    try:
+        for pid, m in _alive_models(_cached_catalogs()):
+            try:
+                if _is_model_blocked_by_user(pid, m) or not _usable_now(pid, m):
+                    continue
+                if tools and not _supports_tools(pid, m):
+                    continue
+                if images and not _is_vision_model(pid, m):
+                    continue
+            except Exception:                                    # noqa: BLE001
+                pass                       # a doubt counts the model IN
+            w, _known = _front_door_window_of(pid, m)
+            n += 1
+            best = max(best, w)
+    except Exception:                                            # noqa: BLE001
+        best = n = 0
+    with _front_door_lock:
+        _front_door_cache[key] = (now, best, n)
+    return best, n
+
+
+def _front_door_overflow(kind, messages, tools, est, stream=False, model_label="auto",
+                         images=False, armed=True):
+    """The native overflow reply for a request NO alive model can hold (see the
+    block comment above), else None. kind: openai | responses | anthropic.
+    `armed` False = a surface that has no native overflow contract (Gemini,
+    Ollama, /v1/completions). Never raises."""
+    try:
+        est = int(est or 0)
+        if not armed or est < _FRONT_DOOR_MIN_EST:
+            return None
+        if not (config.get_flag("context_overflow_signal", True)
+                and config.get_flag("context_front_door", True)):
+            return None
+        if ctxwin.is_compaction_request(messages):
+            return None
+        bound, n = _front_door_bound(bool(tools), images)
+        if n <= 0 or bound <= 0 or est * 100 <= bound * _FRONT_DOOR_SLACK_PCT:
+            return None
+        fixed = _ctx_fixed_part_est(messages, {"tools": tools})
+        if _ctx_compaction_futile(fixed, bound):
+            return None          # compacting cannot help: the capacity reply applies
+        _log.info("[ctx] %s request of ~%d tokens exceeds 1.15x the largest window any "
+                  "alive model could hold (%d, %d candidates): answering with the "
+                  "native context-length error before any hop", kind, est, bound, n)
+        return _native_overflow_reply(kind, stream, est, bound, model_label,
+                                      {"X-Free-LLM-Hub-Last-Error": "context"})
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _ctx_fix_chat_usage(data, orig_est, pid=None, model=None, steer=True):
     """Rewrite (or fill in) an OpenAI chat JSON's usage to the ORIGINAL request
     size. Mutates `data`; never raises."""
     try:
@@ -12475,7 +12625,8 @@ def _ctx_fix_chat_usage(data, orig_est, pid=None, model=None):
             for tc in msg.get("tool_calls") or []:
                 chars += len(str(((tc or {}).get("function") or {}).get("arguments") or ""))
             ct = max(1, chars // 4) if chars else 0
-        pt = _reported_prompt_tokens(u.get("prompt_tokens"), orig_est, pid, model)
+        pt = _reported_prompt_tokens(u.get("prompt_tokens"), orig_est, pid, model,
+                                     steer=steer)
         u = dict(u)
         u["prompt_tokens"] = pt
         u["completion_tokens"] = int(ct or 0)
@@ -15374,6 +15525,8 @@ def _activity_done(act, status, http=None):
 # number, not the clock: Windows' time.time() ticks every ~15 ms, so a success
 # right after a failure could carry the same timestamp.
 _AGENT_UPSTREAM = {}
+# sid -> the last "context too long" reply that session got (see _note_context_reply)
+_AGENT_CONTEXT = {}
 _AGENT_UPSTREAM_KEEP = 12            # failures kept per session
 _AGENT_UPSTREAM_SESSIONS = 200       # sessions kept (oldest dropped)
 _agent_upstream_lock = threading.Lock()
@@ -15424,6 +15577,14 @@ def _note_agent_upstream(act):
             rec = _AGENT_UPSTREAM.pop(sid, None) or {"fails": [], "ok_seq": 0}
             if status == "ok":
                 rec["ok_seq"] = seq
+            elif status == "context":
+                # Not an outage: the conversation is too long for every model.
+                # Kept apart so the Build page can say so (_agent_context_probe).
+                _AGENT_CONTEXT[sid] = {
+                    "at": now, "seq": seq, "tokens": int(act.get("ctx_tokens") or 0),
+                    "window": int(act.get("ctx_window") or 0)}
+                while len(_AGENT_CONTEXT) > _AGENT_UPSTREAM_SESSIONS:
+                    _AGENT_CONTEXT.pop(next(iter(_AGENT_CONTEXT)))
             elif status == "error" and http in (502, 503, 504):
                 rec["fails"] = (rec["fails"] + [
                     (now, seq, http, _hops_failure_summary(act.get("hops")))
@@ -15454,6 +15615,24 @@ def _agent_upstream_probe(sid, since):
 
 
 agentic_chat.set_upstream_probe(_agent_upstream_probe)
+
+
+def _agent_context_probe(sid, since):
+    """For agentic_chat's turn end: the context-overflow reply this /agent
+    session last got at or after wall time `since` -- {"tokens", "window"} --
+    unless a request succeeded after it; else None. Never raises."""
+    try:
+        with _agent_upstream_lock:
+            rec = _AGENT_CONTEXT.get(sid)
+            ok_seq = (_AGENT_UPSTREAM.get(sid) or {}).get("ok_seq", 0)
+            if not rec or rec["at"] < since or ok_seq > rec["seq"]:
+                return None
+            return {"tokens": rec["tokens"], "window": rec["window"]}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+agentic_chat.set_context_probe(_agent_context_probe)
 
 
 # --------------------------------------------------------------------------- #
@@ -15936,6 +16115,12 @@ def _activity_after(response):
     act = getattr(g, "act", None)
     if act is None:
         return response
+    # Answered with the native "context too long" reply (see _note_context_reply):
+    # the row says so, with the sizes, instead of a bare "error . 200/400".
+    ctxrep = getattr(g, "ctx_reply", None)
+    if isinstance(ctxrep, dict):
+        act["ctx_tokens"] = ctxrep.get("tokens")
+        act["ctx_window"] = ctxrep.get("window")
     if response.mimetype == "text/event-stream" and 200 <= response.status_code < 300:
         with _activity_lock:
             act["stream"] = True
@@ -15995,6 +16180,8 @@ def _activity_after(response):
                 # 'cancelled' -> the client left before the body ended
                 if gone or _client_gone():
                     _activity_done(a, "cancelled", _CLIENT_GONE_HTTP)
+                elif isinstance(ctxrep, dict):
+                    _activity_done(a, "context", http)
                 elif saw_content:
                     _activity_done(a, "ok", http)
                 elif saw_error:
@@ -16013,6 +16200,8 @@ def _activity_after(response):
         ok = 200 <= response.status_code < 300
         if _client_gone() or response.status_code == _CLIENT_GONE_HTTP:
             _activity_done(act, "cancelled", _CLIENT_GONE_HTTP)
+        elif isinstance(ctxrep, dict):
+            _activity_done(act, "context", response.status_code)
         else:
             _activity_done(act, "ok" if ok else "error", response.status_code)
     return response
@@ -37964,6 +38153,43 @@ def _swarm_stream_chunks(data):
     yield dict(base, choices=[{"index": 0, "delta": {}, "finish_reason": fin}])
 
 
+def _pipeline_usage(data, est, final):
+    """The usage a pipeline tier (swarm / crew* / multi / compound) tool turn
+    reports for the ORIGINAL request -- not the compacted payload its actor
+    saw, and never zero. It reported neither before: the streamed replay
+    carried no usage frame at all (Codex read input_tokens = 0), the JSON
+    shapes carried the actor's raw upstream count, so a CLI on these tiers
+    never saw its context fill up and never compacted.
+
+    The actor is named by data["model"] ("pid/model"). final=True: the whole
+    reporting pass (hop compaction ratio + live window steering) -- for a
+    reply no translator touches again. final=False: the ratio only; the
+    stream translator (_responses_stream / _anthropic_stream) steers once, so
+    steering is not applied twice. Mutates and returns `data`; never raises."""
+    try:
+        if not isinstance(data, dict):
+            return data
+        pid, _sep, model = str(data.get("model") or "").partition("/")
+        if not (pid and model):
+            pid = model = None
+        _ctx_fix_chat_usage(data, est, pid, model, steer=bool(final))
+    except Exception:                                            # noqa: BLE001
+        pass
+    return data
+
+
+def _swarm_usage_line(data):
+    """The replayed answer's usage as one more SSE line (an OpenAI usage-only
+    chunk), or None when the answer carries none."""
+    u = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(u, dict) or not u:
+        return None
+    return b"data: " + json.dumps({
+        "id": data.get("id") or "chatcmpl-swarm", "object": "chat.completion.chunk",
+        "created": data.get("created") or int(time.time()),
+        "model": data.get("model") or "swarm", "choices": [], "usage": u}).encode("utf-8")
+
+
 def _swarm_sse_lines(data):
     """The same chunks as the RAW BYTE LINES an upstream OpenAI SSE stream would
     have produced. _responses_stream and _anthropic_stream both already accept a
@@ -37972,6 +38198,10 @@ def _swarm_sse_lines(data):
     claude a correctly-shaped stream without a second translator per protocol."""
     for chunk in _swarm_stream_chunks(data):
         yield b"data: " + json.dumps(chunk).encode("utf-8")
+        yield b""
+    usage_line = _swarm_usage_line(data)
+    if usage_line is not None:
+        yield usage_line
         yield b""
     yield b"data: [DONE]"
 
@@ -37982,12 +38212,16 @@ def _swarm_tool_turn(body):
     if out is None:
         return None
     data, hdrs = out
+    _pipeline_usage(data, _est_tokens(body.get("messages"), body.get("tools")), True)
     if not body.get("stream"):
         return (jsonify(data), 200, hdrs)
 
     def _one_shot():
         for chunk in _swarm_stream_chunks(data):
             yield "data: %s\n\n" % json.dumps(chunk)
+        usage_line = _swarm_usage_line(data)
+        if usage_line is not None:
+            yield usage_line.decode("utf-8") + "\n\n"
         yield "data: [DONE]\n\n"
     return Response(_one_shot(), mimetype="text/event-stream", headers=hdrs)
 
@@ -38022,9 +38256,12 @@ def _swarm_as_responses(body, messages, tools, est):
     data, hdrs = out
     label = (body.get("model") or "").strip() or data.get("model") or "swarm"
     if not body.get("stream"):
+        _pipeline_usage(data, est, True)
         return jsonify(_chat_to_responses(data, label)), 200, hdrs
+    _pipeline_usage(data, est, False)       # _responses_stream steers once
     return Response(stream_with_context(
-        _responses_stream(_ReplayUpstream(_swarm_sse_lines(data)), label)),
+        _responses_stream(_ReplayUpstream(_swarm_sse_lines(data)), label,
+                          prompt_est=est)),
         mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
 
 
@@ -38035,11 +38272,13 @@ def _swarm_as_anthropic(body, oai_messages, tools):
         return None
     data, hdrs = out
     label = (body.get("model") or "").strip() or data.get("model") or "swarm"
+    est = _est_tokens(oai_messages, tools)
     if not body.get("stream"):
+        _pipeline_usage(data, est, True)
         return jsonify(_openai_resp_to_anthropic(data, label)), 200, hdrs
+    _pipeline_usage(data, est, False)       # _anthropic_stream steers once
     return Response(stream_with_context(
-        _anthropic_stream(_ReplayUpstream(_swarm_sse_lines(data)), label,
-                          _est_tokens(oai_messages, tools))),
+        _anthropic_stream(_ReplayUpstream(_swarm_sse_lines(data)), label, est)),
         mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
 
 
@@ -39255,6 +39494,24 @@ def _chat_completions_uncached(body):
     _orch_reply = _orch_command_response("chat", body, body.get("messages"))
     if _orch_reply is not None:
         return _orch_reply
+    # FRONT DOOR (see _front_door_overflow): a conversation no alive model can
+    # hold is refused here, BEFORE the pipeline dispatch and any hop -- and the
+    # context state (original size, live-window steering) is set up once so the
+    # pipeline tiers below report usage the same way the single-model path does.
+    # Only on the real /v1/chat/completions route: Gemini, Ollama and
+    # /v1/completions share this router but have no native overflow contract.
+    _armed = _request_path_endswith("/v1/chat/completions")
+    _est0 = _est_tokens(body.get("messages"), body.get("tools"))
+    # signal=False: this early call only sets up the original size and the
+    # steering state; arming the overflow signal here would change how a
+    # pipeline actor hop is served (the later _ctx_begin arms the single-model
+    # path exactly as before).
+    _ctx_begin(body, body.get("messages"), _est0, signal=False)
+    _fd = _front_door_overflow("openai", body.get("messages"), body.get("tools"), _est0,
+                               stream=bool(body.get("stream")), images=has_images,
+                               armed=_armed)
+    if _fd is not None:
+        return _fd
     # SWARM: an explicitly-selected virtual model, never an automatic mode — a
     # multi-pass pipeline applied behind a client's back would corrupt the agent
     # loops Codex/Claude Code run (see swarm.py's header). Tool-carrying turns
@@ -40428,6 +40685,18 @@ def v1_responses(_retry_pass=False, _hedged=False):
     _orch_reply = _orch_command_response("responses", body, messages, est)
     if _orch_reply is not None:
         return _orch_reply
+    # FRONT DOOR (see _front_door_overflow): a conversation no alive model can
+    # hold is refused HERE -- before the pipeline dispatch, routing and any hop,
+    # so nothing is uploaded. The context state is set up once, early, so the
+    # pipeline tiers below report usage like the single-model path.
+    # signal=False: see the twin in _chat_completions_uncached.
+    _ctx_begin(body, messages, est, signal=False)
+    _fd = _front_door_overflow("responses", messages, tools, est,
+                               stream=bool(body.get("stream")),
+                               model_label=(body.get("model") or "auto"),
+                               images=has_images)
+    if _fd is not None:
+        return _fd
     # SWARM on codex's own protocol. This dispatch used to exist only in
     # /v1/chat/completions -- which codex never calls -- so "swarm" arrived here
     # as an unknown bare id and _resolve_model turned it into a literal model on
@@ -41479,6 +41748,12 @@ def v1_messages():
     _orch_reply = _orch_command_response("messages", body, oai_messages, est)
     if _orch_reply is not None:
         return _orch_reply
+    # FRONT DOOR (see _front_door_overflow and the twin in /v1/responses).
+    _ctx_begin(body, oai_messages, est, signal=False)
+    _fd = _front_door_overflow("anthropic", oai_messages, tools, est,
+                               stream=bool(body.get("stream")), images=has_images)
+    if _fd is not None:
+        return _fd
     # Same two modes, on claude's protocol. See the note in /v1/responses.
     if _is_swarm_model(body.get("model")) and _swarm_fast_path(
             dict(body, tools=tools), oai_messages):

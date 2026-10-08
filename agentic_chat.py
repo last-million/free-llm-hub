@@ -1000,6 +1000,67 @@ def outage_detail(cli_id, rep):
             % (n, "" if n == 1 else "s", (" (%s)" % why) if why else "", cli_id))
 
 
+# --------------------------------------------------------------------------- #
+# A conversation too long for every model: say so, in plain words
+# --------------------------------------------------------------------------- #
+# MEASURED 2026-10-08 (session c39a30c1, codex, ~504K estimated tokens): every
+# message ended as the CLI's own "ran out of room in the model's context window"
+# error or a bare 503, and the Build page showed those. The hub knows exactly
+# what happened -- the request was refused (or overflowed every hop) with the
+# native context-length reply -- and records it per /agent session. app.py
+# registers a probe over that ledger; when this turn's failure IS that reply,
+# the person gets the sizes and the way out instead of a CLI error string.
+_context_probe = None
+
+
+def set_context_probe(fn):
+    """Register `fn(session_id, since_wall_ts) -> {"tokens", "window"} | None`
+    (see app._agent_context_probe). Pass None to unregister."""
+    global _context_probe
+    _context_probe = fn if callable(fn) else None
+
+
+# What the three CLIs print for the hub's native overflow reply (codex:
+# ContextWindowExceeded, claude: "prompt is too long", opencode / OpenAI SDKs:
+# context_length_exceeded) -- the fallback when the ledger has nothing.
+_CONTEXT_FAIL_RE = re.compile(
+    r"context[ _]length[ _]exceeded|maximum context length|exceeds? the context window|"
+    r"ran out of room in the model.s context window|prompt is too long|"
+    r"input exceeds the context window", re.I)
+
+
+def context_too_long(sess, since_wall, detail=""):
+    """{"tokens": N|0, "window": M|0} when this turn failed because the
+    conversation is too long for every model, else None. The hub's own ledger
+    (the probe) decides; the CLI's error text is the fallback, without sizes.
+    Never raises."""
+    rep = None
+    fn = _context_probe
+    if fn is not None:
+        try:
+            rep = fn(getattr(sess, "id", None), since_wall)
+        except Exception:                                        # noqa: BLE001
+            rep = None
+    if isinstance(rep, dict):
+        return {"tokens": int(rep.get("tokens") or 0), "window": int(rep.get("window") or 0)}
+    if detail and _CONTEXT_FAIL_RE.search(str(detail)):
+        return {"tokens": 0, "window": 0}
+    return None
+
+
+def context_detail(rep):
+    """The Build page's failure text for context_too_long()."""
+    tokens = int((rep or {}).get("tokens") or 0)
+    window = int((rep or {}).get("window") or 0)
+    sizes = ""
+    if tokens and window:
+        sizes = " (~%s tokens; the largest holds %s)" % (format(tokens, ","), format(window, ","))
+    elif tokens:
+        sizes = " (~%s tokens)" % format(tokens, ",")
+    return ("This conversation is too long for any available model%s. Press Continue to "
+            "compact it or start a new conversation." % sizes)
+
+
 def declared_window(model_id=None, cli=None):
     """The context window to tell a CLI for hub id `model_id` (auto, best,
     a category, a compound like coding-swarm, or None for auto). `cli` names
@@ -3471,6 +3532,7 @@ def _send_message_locked(sess, text, started):
     transient_retry_used = False
     while True:
         was_resume = bool(sess.native_session_id)
+        attempt_wall = time.time()                  # this attempt's start (wall clock)
         argv = _build_argv(sess, bin_path, text)
         try:
             proc = subprocess.Popen(
@@ -3527,6 +3589,10 @@ def _send_message_locked(sess, text, started):
             continue
         if result_text is None:
             detail = detail or "%s produced no output." % sess.cli_id
+            # TOO LONG FOR EVERY MODEL (see context_too_long).
+            _ctx_rep = context_too_long(sess, attempt_wall, detail)
+            if _ctx_rep is not None:
+                return 413, None, context_detail(_ctx_rep)
             if _looks_like_auth_error(detail):
                 # Isolation means the copy we drive has its own login.
                 # Without this, the message is "not logged in" about a CLI
@@ -4074,6 +4140,7 @@ def send_message_stream(session_id, text):
             # compared with it (a server started after the last line belongs
             # to a command that has not returned).
             last_line_wall = [time.time()]
+            attempt_wall = last_line_wall[0]        # this attempt's start (wall clock)
             # The last tool event and the time of the line that carried it:
             # equal to last_event[0] at a stall means it was the very last
             # thing the CLI printed.
@@ -4333,6 +4400,11 @@ def send_message_stream(session_id, text):
                 sess.native_session_id = native_id
             if final_text is None:
                 detail = final_error or stderr_text or ("%s produced no reply." % sess.cli_id)
+                # TOO LONG FOR EVERY MODEL: plain words and the way out, not the
+                # CLI's own error string (see context_too_long).
+                _ctx_rep = context_too_long(sess, attempt_wall, detail)
+                if _ctx_rep is not None:
+                    yield err(413, context_detail(_ctx_rep), code="context_too_long"); return
                 if _looks_like_auth_error(detail):
                     # A structured signal, not prose-sniffing: the frontend
                     # offers a one-click Sign in button on this code+cli pair

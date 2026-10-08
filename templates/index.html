@@ -11555,6 +11555,25 @@
         else if (ev.event === 'error'){
           asstEl.className = 'msg assistant error';
           line('err', ev.detail || 'error');
+          /* Too long for every model: the backend's text already says what
+             happened; the button is the "Continue" it names (the CLI compacts
+             its own history on the next turn). */
+          if (ev.code === 'context_too_long'){
+            var ctxWrap = document.createElement('div');
+            ctxWrap.className = 'agent-term-line';
+            var ctxBtn = document.createElement('button');
+            ctxBtn.type = 'button';
+            ctxBtn.className = 'btn sm primary';
+            ctxBtn.textContent = 'Continue';
+            ctxWrap.appendChild(ctxBtn);
+            term.appendChild(ctxWrap);
+            ctxBtn.addEventListener('click', function(){
+              if (turnBusy){ toast('The agent is already working', true); return; }
+              textEl.value = 'Continue exactly where you stopped. Do not start over; check what is already done on disk and carry on from there.';
+              doSend();
+            });
+            term.scrollTop = term.scrollHeight;
+          }
           /* A structured signal from the backend (not text-sniffing the
              message, which is meant for a human and free to change): offer
              the SAME one-click Sign in here, right where the failure was
@@ -12103,9 +12122,16 @@
       /* 'cancelled' = the client left before its answer was finished (its CLI
          was stopped, the terminal closed, a timeout fired) and the hub stopped
          the work: finished, and nobody's failure -- neutral, never red. */
-      var statusClass = pending ? 'pending' : (st === 'ok' ? 'ok' : (st === 'stalled' ? 'stall' : (st === 'cancelled' ? 'cancel' : 'err')));
-      var statusLabel = (st === 'in_progress') ? 'in progress' : (st === 'cancelled' ? 'client left' : st);
-      var statusTitle = (st === 'cancelled') ? 'The client disconnected before the answer was finished; the hub stopped the work' : '';
+      /* 'context' = the conversation is longer than any available model can
+         hold, so the hub answered with the native "context too long" reply at
+         once (no model was called): the CLI's cue to compact, not a failure of
+         any provider -- shown plainly, with the sizes, never a bare "error". */
+      var statusClass = pending ? 'pending' : (st === 'ok' ? 'ok' : (st === 'stalled' ? 'stall' : (st === 'cancelled' ? 'cancel' : (st === 'context' ? 'cancel' : 'err'))));
+      var statusLabel = (st === 'in_progress') ? 'in progress' : (st === 'cancelled' ? 'client left' : (st === 'context' ? 'context too long' : st));
+      var statusTitle = (st === 'cancelled') ? 'The client disconnected before the answer was finished; the hub stopped the work'
+        : (st === 'context' ? ('This conversation is too long for any available model' +
+            (a.ctx_tokens ? ' (~' + a.ctx_tokens + ' tokens' + (a.ctx_window ? '; the largest holds ' + a.ctx_window : '') + ')' : '') +
+            '. The CLI compacts it, or start a new conversation.') : '');
       var httpTxt = (a.http != null) ? (' · ' + a.http) : '';
       var hasResolved = a.provider && a.model;
       var resolvedTxt = hasResolved ? (a.provider + '/' + a.model) : '';

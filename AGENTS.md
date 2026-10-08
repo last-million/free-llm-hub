@@ -2665,3 +2665,117 @@ had no failure. Only two log lines carry `NameResolutionError` (the per-hop
   `_record_long_ctx_speed` are not gated because those events are not
   resolution failures; with a single failing host the 503 reads as the old
   generic one.
+
+## Oversized conversations (2026-10-08)
+
+Covered by `tests/test_oversized_conversation.py` (hermetic: fake upstream, no
+network). Live, hub.log 2026-10-08 UTC, Build page session c39a30c1 (codex,
+`coding-max`, `/v1/responses`): the request sat at ~504K estimated tokens
+(`[ctx] responses request of ~503553 / 504077 / 504558 tokens overflowed every
+hop (largest window tried 262144)`), every message ended as the native
+context-length reply (`response.failed` inside an HTTP 200, "error . 200") or as
+`RESPONSES-503` after 85-265 s ("error . 503"): relays whose window is only the
+"default" guess never raise `_ContextOverflow`, so they failed open, each took
+the upload, and `_ctx_overflow_reply` was withheld ("some hop failed for a
+reason a wait can fix"). `[spread]` had the session pinned to a 65K model
+("pool 1").
+
+- **What was measured (and what was only inferred).** Reproduced with a fake
+  upstream on the REAL code path, in the live shape (a registered codex /agent
+  session, model `coding-max`, unpatched `declared_window`, a fleet of
+  ~250K / 262K / 65K / two 1M models with the 1M ones out):
+  `coding-max` is a compound id, NOT a codex catalog slug (the catalog lists
+  `auto` + the categories), so `_cli_declared_window("codex", "coding-max",
+  agent=True)` takes the 272000 fallback branch, not the slug's
+  (`declared_window("auto"/"coding", cli="codex")` = 400000 reach cap and
+  `declared_compact_limit` = 300000 are what config.toml carries -- figures of
+  the SYNTHETIC fleet used here, shaped after the log, not the live ones;
+  codex caps the window at its fallback metadata (the notes above), and where
+  it then compacts -- ~90% of 272000, ~245K reported -- is from memory of
+  codex's source and UNVERIFIED here). Served turns report faithfully: `usage.input_tokens` = upstream count x the
+  hop's compaction ratio x declared/live (272000/262144 = 1.04): with a fake
+  upstream counting 0.8 x the sent estimate, 91K / 183K / 251K / 343K / 435K
+  for requests of est 109K / 219K / 302K / 412K / 523K -- never below the real
+  size, so a served turn that big makes codex compact. A CLI's OWN compaction request at 500K is SERVED (never
+  refused, `_ctx_signal` off): `_compact_to_budget` trims it to the hop's window
+  (55K sent to the 65K hop, 222K to a 262K hop, 84K to a default-window relay),
+  so the summary is lossy (it sees the newest 10-42% of the history plus the
+  structural notice / exact facts / recap) but it works. Overflow and 503 turns
+  carry NO usage event, so codex's recorded usage stays frozen at its last
+  successful turn. NOT reproduced, so the cause of the ~504K is UNPROVEN (the
+  real hub.log was off limits; only the task's excerpt was seen, which shows no
+  compaction request but is not the whole log): why codex never started a
+  compaction during 00:23-02:48. The hub assumed that the `response.failed` /
+  `context_length_exceeded` reply makes codex mark its window full and
+  auto-compact on the next turn; the excerpt (three messages, +500 tokens each)
+  suggests that does not hold in a long session. The only under-reporting
+  REPRODUCED is the pipeline tiers below -- the incident session was
+  `coding-max` (not a pipeline tier), so that bug does not by itself explain
+  504K. If it does not, "Continue" re-sends the
+  same oversized turn: the way out is codex's own compaction on a SUCCESSFUL
+  turn that reports usage over its limit, or a new conversation. Open idea, needs
+  the owner's call: answer such a request with a short successful reply whose
+  usage is over codex's limit instead of the refusal.
+- **The one under-reporting bug found and fixed: pipeline tiers.** swarm /
+  crew* / multi / compound tool turns (`_swarm_tool_turn`, `_swarm_as_responses`,
+  `_swarm_as_anthropic`) reported the actor's RAW count: streamed Responses
+  `input_tokens = 0` (the replay had no usage frame and no `prompt_est`), JSON
+  shapes the compacted payload's count (40000 for a 300K request compacted 6x).
+  Codex/opencode/Claude Code on those tiers never saw the context fill.
+  `_pipeline_usage(data, est, final)` now runs the same single reporting pass as
+  the single-model path: the hop ratio (the actor is `data["model"]`) and live
+  window steering, ONCE (`final=True` for replies no translator touches;
+  `final=False` for the streamed Responses / Messages replays, whose translator
+  steers -- `_reported_prompt_tokens(..., steer=)` / `_ctx_fix_chat_usage(...,
+  steer=)`). `_swarm_sse_lines` and the chat `_one_shot` stream add one usage-only
+  chunk when the answer has usage (`_swarm_stream_chunks` is unchanged: tests
+  index its last chunk).
+- **Front door** (`_front_door_overflow`, `_front_door_bound`): a NON-compaction
+  request whose estimate exceeds 1.15x (`est * 100 > bound * 115`, integers) the
+  LARGEST window any alive candidate could hold gets the protocol's native
+  overflow reply at once -- zero routing, chain building, dispatch or upload --
+  on chat (only the real `/v1/chat/completions` route: Gemini / Ollama /
+  `/v1/completions` share the router but have no such contract), responses and
+  messages, stream and non-stream. It runs right after `est` is known and BEFORE
+  the pipeline dispatch (the roles path uploads to relays). Candidates are every
+  alive (`_alive_models(_cached_catalogs())`), usable-now (`_usable_now`: not
+  parked / dead / out >= `_CTX_OVERFLOW_LONG_WAIT`), not user-blocked model,
+  tool-capable on a tool request, vision-capable on an image request -- NOT the
+  mode-filtered pool (`_apply_mode` fails open). A window the hub KNOWS (learned /
+  catalog / inferred / reference via `_model_ctx_info`, so google's 250K and
+  groq's caps apply) counts at that window; a "default" guess or a provider-wide
+  stand-in row counts as `_REACH_WINDOW_CAP` (400000), never more. Nothing
+  alive = no guard; below `_FRONT_DOOR_MIN_EST` (2K, under any usable window)
+  the scan is skipped; the bound is cached `_FRONT_DOOR_TTL` (20 s) per (tools,
+  images). Futile
+  compaction (system prompt + tools >= 75% of the bound) still gets the capacity
+  reply. Flags: `context_overflow_signal` (existing semantics) and
+  `context_front_door` (this guard only), both default on. The reply is shared
+  with the hop-exhaustion path (`_native_overflow_reply`).
+- **A pin never outlives the window** (`_route_by_difficulty`): a session pin
+  (agentic and plain-chat) whose KNOWN window cannot hold the request
+  (`_window_fits`) is dropped (`[spread] ... pin ... dropped`) and the pool
+  narrowed to the candidates that can (fail-open: when none can, the pool is
+  untouched). A first pick is unchanged -- the "strong model on a trimmed
+  context" re-admission still stands.
+- **Plain words on the Build page.** A turn whose failure is that reply ends
+  `error` code `context_too_long` (status 413) with "This conversation is too
+  long for any available model (~N tokens; the largest holds M). Press Continue
+  to compact it or start a new conversation." (`agentic_chat.context_too_long` /
+  `context_detail`; the sizes come from the per-session ledger `_AGENT_CONTEXT`
+  through `set_context_probe`, the CLI's error text is the fallback without
+  sizes) and the page adds a Continue button. The Activity row ends status
+  `context` (label "context too long", neutral, with the sizes in its
+  tooltip) -- set by `_note_context_reply`, read by `_activity_after`, on both
+  the front door and the hop-exhaustion paths. Not an outage: `context` does not
+  count as an upstream failure in `_AGENT_UPSTREAM`.
+- **Left alone on purpose:** compaction requests still go to whichever hop the
+  chain opens on (a largest-window-first order would upload ~2 MB to a 1M relay
+  instead of 55K to a small one); the estimator's chars/4 over-count is the only
+  slack (1.15x); default-window relays still fail open for requests under the
+  bound (a request between the known max window and 460K can still reach them);
+  a provider-wide "table" stand-in row (not a hard per-request cap) counts as an
+  unknown window, i.e. 400K (the spec only names the "default" guess). The early
+  `_ctx_begin(..., signal=False)` calls before the pipeline dispatch must stay
+  `signal=False`: arming the overflow signal there would make a pipeline actor
+  hop raise `_ContextOverflow` instead of being served compacted.
