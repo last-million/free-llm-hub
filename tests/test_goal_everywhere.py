@@ -160,6 +160,38 @@ def test_link_creates_a_task_per_phase(tmp_path):
         A._multi_forget_tasks(run.id)
 
 
+def test_resume_relink_does_not_duplicate_tasks(tmp_path):
+    gid = taskboard.default.add_goal("the goal", project_dir=str(tmp_path))
+    run = SW._Run("g", str(tmp_path), "opencode", SW.clean_phases({"phases": [
+        {"title": "Alpha", "task": "t"}, {"title": "Beta", "task": "t"}]}))
+    SW._remember(run)
+    try:
+        A._multi_link_tasks(run.id, str(tmp_path))          # first run
+        with A._MULTI_LOCK:
+            first = dict(A._MULTI_TASKS.get(run.id) or {})
+        assert len(first) == 2
+        # Phase 1 finished and is observed done.
+        A._multi_sync_task(run.id, {"index": 1, "state": SW.DONE, "verified": True})
+        done_id = first[1]
+        assert next(t for t in taskboard.default.tasks(goal_id=gid)
+                    if t["id"] == done_id)["status"] == "done"
+        # Continue TWICE: re-link each time, same ids, no new tasks.
+        A._multi_link_tasks(run.id, str(tmp_path))
+        A._multi_link_tasks(run.id, str(tmp_path))
+        assert len(taskboard.default.tasks(goal_id=gid)) == 2
+        with A._MULTI_LOCK:
+            again = dict(A._MULTI_TASKS.get(run.id) or {})
+        assert again == first                                # same task ids reused
+        # A spurious RUNNING on the done phase does not regress it.
+        A._multi_sync_task(run.id, {"index": 1, "state": SW.RUNNING, "session_id": "w"})
+        assert next(t for t in taskboard.default.tasks(goal_id=gid)
+                    if t["id"] == done_id)["status"] == "done"
+    finally:
+        with SW._LOCK:
+            SW._RUNS.pop(run.id, None)
+        A._multi_forget_tasks(run.id)
+
+
 def test_sync_moves_task_through_doing_done_failed(tmp_path):
     gid = taskboard.default.add_goal("the goal", project_dir=str(tmp_path))
     t1 = taskboard.default.add_task(gid, "P1")

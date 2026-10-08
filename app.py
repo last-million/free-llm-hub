@@ -19035,9 +19035,14 @@ _MULTI_TASKS = {}
 
 
 def _multi_link_tasks(run_id, project_dir):
-    """Link a Multi run's phases to the project's active-goal tasks, creating
-    one task per phase the goal does not already have (matched by title).
-    Stores {phase_index: task_id}. Never raises."""
+    """Link a Multi run's phases to the project's active-goal tasks. A phase is
+    matched to an EXISTING task first by (this run's id, phase index), then by
+    title -- across ALL statuses -- so a resumed/continued run re-uses the same
+    task ids instead of making fresh ones; a task is created only for a phase
+    with no match. Stores {phase_index: task_id}. Never raises.
+
+    Done and failed tasks are re-used, not duplicated: linking never changes a
+    task's status (the follow loop moves only the phases that actually run)."""
     try:
         if not config.get_flag("goal_brief", True) or not project_dir:
             return
@@ -19046,12 +19051,14 @@ def _multi_link_tasks(run_id, project_dir):
         if goal is None:
             return
         gid = goal["id"]
-        # Open tasks the goal already has, by title (the owner may have
-        # written them, or an earlier run may have created them).
-        existing = {}
+        # Every task the goal has, indexed two ways. (run_id, phase) is exact
+        # for a run we already linked once; title catches owner-written tasks
+        # and a first run's tasks before they carried this run's id.
+        by_phase, by_title = {}, {}
         for t in board.tasks(goal_id=gid):
-            if t.get("status") != "done":
-                existing.setdefault(t.get("title"), t["id"])
+            if t.get("run_id") == run_id and isinstance(t.get("phase"), int):
+                by_phase[t["phase"]] = t["id"]
+            by_title.setdefault(t.get("title"), t["id"])
         st = swarm_windows.status(run_id) or {}
         mapping = {}
         for a in st.get("agents") or ():
@@ -19059,11 +19066,13 @@ def _multi_link_tasks(run_id, project_dir):
             if idx is None:
                 continue
             title = a.get("title") or ("Phase %s" % idx)
-            tid = existing.get(title)
+            tid = by_phase.get(idx) or by_title.get(title)
             if not tid:
                 tid = board.add_task(gid, title, needs=(),
-                                     files=a.get("files") or ())
-                existing[title] = tid
+                                     files=a.get("files") or (),
+                                     run_id=run_id, phase=idx)
+                by_phase[idx] = tid
+                by_title.setdefault(title, tid)
             mapping[idx] = tid
         with _MULTI_LOCK:
             _MULTI_TASKS[run_id] = mapping
@@ -19082,6 +19091,11 @@ def _multi_sync_task(run_id, agent_row):
             return
         state = agent_row.get("state")
         if state == swarm_windows.RUNNING:
+            # Never regress an already-done task back to "doing" -- a resumed
+            # run re-runs only its unfinished phases, but guard anyway.
+            cur = [t for t in taskboard.default.tasks() if t.get("id") == tid]
+            if cur and cur[0].get("status") == "done":
+                return
             taskboard.default.update(tid, status="doing",
                                      owner=agent_row.get("session_id"),
                                      run_id=run_id, note="phase started")

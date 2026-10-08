@@ -130,16 +130,23 @@ class Board:
     # ------------------------------------------------------------------ #
 
     def add_task(self, goal_id, title, detail="", needs=(), files=(),
-                 priority=0) -> str:
+                 priority=0, run_id=None, phase=None) -> str:
         """Create a task under a goal and return its id. A task under an
         unknown goal is still created (goal_id kept as given) so a caller is
-        never left without an id; callers that care check goals() first."""
+        never left without an id; callers that care check goals() first.
+
+        `run_id` / `phase` (optional) record which Multi run phase the task
+        was made for, so a resumed run finds the SAME task again."""
         tid = "t-" + uuid.uuid4().hex[:12]
         now = self._now()
         try:
             prio = int(priority)
         except (TypeError, ValueError):
             prio = 0
+        try:
+            phase = int(phase) if phase is not None else None
+        except (TypeError, ValueError):
+            phase = None
         with self._lock:
             self._tasks[tid] = {
                 "id": tid,
@@ -151,7 +158,8 @@ class Board:
                 "priority": prio,
                 "status": "todo",
                 "owner": None,
-                "run_id": None,
+                "run_id": run_id or None,
+                "phase": phase,
                 "created_at": now,
                 "updated_at": now,
                 "history": [],
@@ -374,6 +382,7 @@ class Board:
             "status": status if status in STATUSES else "todo",
             "owner": t.get("owner"),
             "run_id": t.get("run_id"),
+            "phase": t.get("phase") if isinstance(t.get("phase"), int) else None,
             "created_at": t.get("created_at") or 0,
             "updated_at": t.get("updated_at") or t.get("created_at") or 0,
             "history": list(t.get("history") or []),

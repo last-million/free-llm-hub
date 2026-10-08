@@ -141,6 +141,21 @@ def test_corrupt_file_leaves_empty_board(tmp_path):
     assert b.goals()[0]["id"] == gid
 
 
+def test_add_task_records_run_and_phase(tmp_path):
+    path = str(tmp_path / "tb.json")
+    b = taskboard.Board(path=path)
+    gid = b.add_goal("g")
+    tid = b.add_task(gid, "P1", run_id="swarm-x", phase=1)
+    t = b.tasks(goal_id=gid)[0]
+    assert t["id"] == tid and t["run_id"] == "swarm-x" and t["phase"] == 1
+    # A non-int phase is tolerated as None; persistence keeps run_id/phase.
+    assert b.add_task(gid, "P?", phase="nope")
+    b2 = taskboard.Board(path=path)
+    kept = {x["title"]: x for x in b2.tasks(goal_id=gid)}
+    assert kept["P1"]["run_id"] == "swarm-x" and kept["P1"]["phase"] == 1
+    assert kept["P?"]["phase"] is None
+
+
 def test_memory_only_board_never_writes(tmp_path):
     b = taskboard.Board(path=None)
     gid = b.add_goal("in memory")
