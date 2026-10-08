@@ -1,6 +1,6 @@
 # HANDOFF — free-llm-hub (LLM Calvoun)
 
-Snapshot for the next session or agent. Written 2026-10-03.
+Snapshot for the next session or agent. Written 2026-10-08.
 
 **Source of truth for HOW things work: `AGENTS.md`** (one section per feature, with
 the test file that covers it). `README.md` is the user-facing manual. This file
@@ -10,11 +10,11 @@ is only: current state, how to operate, owner rules, open items.
 
 | | |
 |---|---|
-| Branch | `main` @ `fd3dc1e`, in sync with `origin/main` (another session's landing-page edits are uncommitted: `app.py` `/`+`/hub` routes, `make_landing.py`, `templates/landing.html`, `static/*.webp|jpg` — LEAVE THEM, and never `git add -A`: use explicit paths) |
-| Running hub | `fd3dc1e` on `127.0.0.1:8787` (only this PC) |
-| Tests | 6929 passed, 1 skipped (2026-10-04) |
+| Branch | `main` after the 2026-10-08 merge (see `git log`), in sync with `origin/main` (another session's landing-page edits are uncommitted: `app.py` `/`+`/hub` routes, `make_landing.py`, `templates/landing.html`, `static/*.webp|jpg` — LEAVE THEM, and never `git add -A`: use explicit paths) |
+| Running hub | `fd3dc1e` on `127.0.0.1:8787` until the next restart: `0b98a88` and the 2026-10-08 batch are NOT live before it |
+| Tests | 7094 passed, 1 skipped, 2 order-dependent self-update failures fixed after (`e75688a`, leaked stub run) — 2026-10-08 |
 | Keys | 42 provider keys in `config.load_config()` (check after every restart, never print values) |
-| Open PR | #4 by an outside contributor (`osumtr-web`), see "Open items" |
+| Open PR | #4 by `osumtr-web`: an improved version landed on `main` (`74c3fde`); the PR is NOT approved/closed yet, see "Open items" |
 
 ## Operate
 
@@ -49,7 +49,39 @@ unless its "Continue by itself after a restart" box is ticked.
   Kimi K3 top free model (138.1, just above GLM 5.3's 138); Space Bunny 137.7;
   subscription scope `manager_only` (manager model: sonnet when re-enabled).
 
-## What changed most recently (2026-10-03 → 2026-10-04, through 90ada7d)
+## What changed 2026-10-07 → 2026-10-08
+
+All in `AGENTS.md` with tests; headlines only.
+
+- **Owner blocklist ships as the default** (`0b98a88`): `_DEFAULT_BLOCKED_IDENTITIES`
+  + `_DEFAULT_BLOCKED_MODELS` (one exact `pid/model`), offered once per install.
+- **Provider fairness** (`d05e702`, `a05fd8a`): load-aware tie-break INSIDE the
+  2-point top band (in-flight soft cap, 15-min share, recent fails); small
+  requests let groq/cerebras-class compete; a share counts only after 6 picks;
+  `GET /api/provider-load`. Groq stays rare on big turns for a real reason: 97%
+  of tool turns are >= 60K tokens and its free tier caps one request ~8K.
+- **Big CLI turns** (`2416e5b`): fallbacks only pick a model whose window holds
+  the request; actor budget sized for big turns; honest "switched OFF" note;
+  model_req shows `mode -> model`; Codex "error · 200" was a false match on
+  `"error": null`. The nvidia/glm ConnectionError bursts were reproduced: NOT a
+  hub socket/pool leak (no shared Session); 503 lines now carry per-hop details.
+- **ECC skills** (`360f974`): 9 vendored MIT skills (Affaan Mustafa), OFF by
+  default, per-skill + "enable all" in Settings -> Skills (`ecc.py`).
+- **Probes** (`74c3fde`): token-free `/health` `/healthz` `/ready` `/readyz`, no
+  version or provider data (PR #4's idea, rewritten).
+- **Task board + the goal behind every task** (`a371798`, `2198e0c`):
+  `taskboard.py`; goal brief (<= 600 chars) in Multi planner/workers, the Build
+  brief file and the opening terminal-CLI turn; Multi phases move their tasks.
+- **Heartbeats + budgets** (`8c6a76c`): `heartbeat.py` schedules (OFF by default,
+  `heartbeats_enabled`), skip when the owner is busy / no RAM / 429s; per-run
+  token/call/time budgets stop a run cleanly (`multi_default_budget`).
+- **CLI and Build parity** (`d4e05bb`): terminal CLIs and Build single sessions
+  get the web-slop check, specialists on hard fresh tool turns (auto/best),
+  observed test/build receipts from the conversation, project facts, PROGRESS
+  upkeep on every step. Flags `turn_slop_check`, `tool_turn_specialists_single`,
+  `v1_observed_evidence`, `v1_memory_facts`.
+
+## What changed 2026-10-03 → 2026-10-04 (through 90ada7d)
 
 All in `AGENTS.md` with tests; headlines only. These sit ON TOP of the
 2026-09-30 batch further down.
@@ -139,15 +171,14 @@ All in `AGENTS.md` with tests; headlines only:
 
 ## Open items
 
-1. **PR #4** (`feat/unauthenticated-health-probes`, +62 lines, `app.py` only):
-   adds token-free `GET /health`, `/healthz`, `/ready`, `/readyz` for container
-   health checks and uptime monitors. Reviewed 2026-10-03:
-   - Safe: the hub binds `127.0.0.1`, the routes return only status, version,
-     release, uptime and a not-ready reason; `/ready` reads the runtime state and
-     whether a free provider is enabled. No keys, no config writes.
-   - After merging: `tests/test_readme_claims.py` checks the route count in
-     `README.md` (4 new routes), and the PR has no tests. Follow up with a test
-     file and the README route-count/endpoint lines in the same session.
+1. **PR #4**: the improved probes are on `main` (`74c3fde`). The approval and a
+   "landed as 74c3fde, closing" comment were NOT posted: this machine has no
+   GitHub auth for `last-million` (`gh` not installed, `GH_TOKEN` rejected, the
+   Chrome profile is signed out, the GitHub MCP plugin fails). Owner decision:
+   approve only, never merge (sole contributor). Close it after the comment.
+   SECURITY: the Windows Credential Manager entry for `git:https://github.com`
+   belongs to ANOTHER account (`jaddireda4-design`, admin scopes); it was not
+   used. The owner was told to remove it if it is not theirs.
 2. **Codex subscription** is not signed in inside the hub's isolated folder;
    the owner must run (PowerShell):
    `$env:CODEX_HOME = "$HOME\.free-llm-hub\isolated-clis\codex\config"; & "$HOME\.free-llm-hub\isolated-clis\codex\install\codex.CMD" login`
@@ -172,7 +203,10 @@ All in `AGENTS.md` with tests; headlines only:
    input tokens, zero-answer rate) from `turn-roles.jsonl` vs hub.log. The
    token-saving and verifier fix/break claims are DESIGN estimates, not yet
    measured on live traffic.
-8. **Next context ideas (research done 2026-10-03, owner to pick):** age-based
+8. **Small tech debt**: two helpers read the project folder from a CLI's env
+   block (`_project_dir_from_messages` from the task board, `_v1_project_cwd`
+   from the parity work); merge them when either is touched next.
+9. **Next context ideas (research done 2026-10-03, owner to pick):** age-based
    clearing of old tool results (keep newest ~5, no model call; measured
    -52% cost, solve rate flat), cache-stable prefix + one provider per
    conversation, function signatures of files read in the recap.
