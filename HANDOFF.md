@@ -218,6 +218,13 @@ All in `AGENTS.md` with tests; headlines only:
    one-tick provider dip (a decrease applies at once by design, a raise waits
    `_DECLARED_RAISE_AFTER`); a log-only `[ctx] declared window inputs` line now says why;
    decide on a policy change after reading it.
+1c. **PARKED IDEA, owner 2026-10-08 (do NOT build yet; remind the owner next conversation):**
+   push a Build project to GitHub from the Build page, choosing private or public at repo
+   creation (default private), then push/sync whenever asked. Design notes are in the
+   assistant's memory (`idea-github-push-for-build-projects`): explicit click per push, a
+   token stored encrypted like provider keys, secret scan + .gitignore before the first
+   push, never force-push, hermetic tests with a fake GitHub API. This PC has no usable
+   GitHub API auth today (see item 1).
 2. **Codex subscription** is not signed in inside the hub's isolated folder;
    the owner must run (PowerShell):
    `$env:CODEX_HOME = "$HOME\.free-llm-hub\isolated-clis\codex\config"; & "$HOME\.free-llm-hub\isolated-clis\codex\install\codex.CMD" login`
