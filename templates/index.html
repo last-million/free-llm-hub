@@ -1663,6 +1663,20 @@
   .sk-form .sk-inline{display:flex;gap:8px;flex-wrap:wrap}
   .sk-form .sk-inline > *{flex:1 1 180px}
   .sk-err{font-size:12px;color:var(--danger,#ef4444)}
+  /* Heartbeats (Settings drawer) */
+  .hb-list{display:flex;flex-direction:column;gap:6px;margin:8px 0}
+  .hb-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    background:var(--surface-2,var(--bg-inset));border:1px solid var(--border);
+    border-radius:var(--radius-sm);padding:7px 10px}
+  .hb-row .hb-when{font-size:12.5px;font-weight:600;color:var(--text)}
+  .hb-row .hb-meta{font-size:11.5px;color:var(--text-faint,var(--muted));flex:1 1 180px;overflow-wrap:anywhere}
+  .hb-add{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .hb-add input{background:var(--surface-2,var(--bg-inset));border:1px solid var(--border);
+    border-radius:var(--radius-sm);padding:7px 10px;font:inherit;font-size:12.5px;
+    color:var(--text);box-sizing:border-box}
+  .hb-add input[type=text]{flex:1 1 160px}
+  .hb-add input[type=number]{width:72px}
+  .hb-add input:focus{border-color:var(--accent);outline:none}
 
   /* ---------- "what changed" ----------
      REQUESTED 2026-09-28: better colours, light AND dark. Every colour is a
@@ -4209,6 +4223,20 @@
       </select>
       <p class="sd-help" id="lowres-status">Checking this machine&hellip;</p>
       <p class="sd-help">Runs fewer multi-session workers at once (each is a CLI process of 150&ndash;400&nbsp;MB): 1&ndash;2 instead of 4 when active, and 1 whenever free memory drops under 1.5&nbsp;GB. Auto turns it on under 8&nbsp;GB of RAM or 4 cores.</p>
+    </div>
+    <div class="sd-group sd-wide" id="heartbeats-group">
+      <div class="sd-label">Heartbeats</div>
+      <label><input type="checkbox" id="hb-enabled"> Let agents wake themselves on a schedule</label>
+      <p class="sd-help">On a beat the hub takes a goal&rsquo;s next open tasks and starts one Multi run &mdash; skipped (and retried next tick) while you&rsquo;re working, when memory is short, when providers are rate-limited, or during quiet hours. Every heartbeat run carries a budget.</p>
+      <div id="hb-list" class="hb-list" aria-live="polite"></div>
+      <div class="hb-add">
+        <input type="text" id="hb-when" placeholder="when, e.g. every 30 min / daily 09:00 / weekdays 18:30" aria-label="When">
+        <input type="text" id="hb-goal" placeholder="goal id (or leave blank to use the project)" aria-label="Goal id">
+        <input type="text" id="hb-project" placeholder="project folder (absolute path)" aria-label="Project folder">
+        <input type="number" id="hb-max" min="1" max="50" value="3" aria-label="Max tasks per beat" title="Tasks per beat">
+        <button class="btn sm" id="hb-add" type="button">Add schedule</button>
+      </div>
+      <p class="sd-help" id="hb-status" aria-live="polite"></p>
     </div>
     <div class="sd-group" id="health-check-group">
       <div class="sd-label">Health check</div>
@@ -11011,7 +11039,10 @@
       $('#agent-plan-src').textContent = (p.source ? 'from ' + p.source : '') +
         (p.resumed ? ' \u00b7 resumed after a restart' : '') +
         (helpers && p.parallel && p.parallel.line ? ' \u00b7 ' + p.parallel.line +
-          (p.parallel.waiting ? ' \u00b7 waiting for RAM to free up' : '') : '');
+          (p.parallel.waiting ? ' \u00b7 waiting for RAM to free up' : '') : '') +
+        /* Budget: X / Y in the run header (heartbeat + owner-capped runs). */
+        (helpers && p.budget && p.budget.line ? ' \u00b7 ' + p.budget.line +
+          (p.budget.reached ? ' (reached)' : '') : '');
       box.setAttribute('data-collapsed', _planCollapsed ? '1' : '0');
       $('#agent-plan-toggle').setAttribute('aria-expanded', _planCollapsed ? 'false' : 'true');
       list.innerHTML = '';
@@ -12284,6 +12315,70 @@
     });
   }
 
+  /* ---------- Heartbeats (Settings drawer) ---------- */
+  function hbFmtWhen(t){ return esc(t.when || ''); }
+  function renderHeartbeats(r){
+    if (!r) return;
+    var en = $('#hb-enabled'); if (en) en.checked = !!r.enabled;
+    var box = $('#hb-list'); if (!box) return;
+    var rows = r.schedules || [];
+    if (!rows.length){ box.innerHTML = '<p class="sd-help">No schedules yet.</p>'; return; }
+    box.innerHTML = '';
+    rows.forEach(function(s){
+      var li = document.createElement('div'); li.className = 'hb-row';
+      var next = s.next_due ? new Date(s.next_due * 1000).toLocaleString() : '—';
+      var skip = s.last_skip ? (' · last skipped: ' + esc(s.last_skip.reason)) : '';
+      var last = s.last_result ? (' · last: ' + esc(s.last_result)) : '';
+      li.innerHTML = '<span class="hb-when">' + hbFmtWhen(s) + '</span>' +
+        '<span class="hb-meta">' + esc(s.goal_id || s.project_dir || '') +
+        ' · ' + (s.max_tasks || 3) + ' task' + ((s.max_tasks === 1) ? '' : 's') +
+        (s.valid ? (' · next ' + esc(next)) : ' · unreadable schedule') +
+        last + skip + '</span>';
+      var toggle = document.createElement('button');
+      toggle.className = 'btn sm ghost'; toggle.type = 'button';
+      toggle.textContent = s.enabled ? 'On' : 'Off';
+      toggle.addEventListener('click', function(){
+        api('/api/heartbeats/' + encodeURIComponent(s.id), { method: 'PUT',
+          body: { enabled: !s.enabled } }).then(renderHeartbeats)
+          .catch(function(e){ toast('Heartbeat: ' + e.message, true); });
+      });
+      var del = document.createElement('button');
+      del.className = 'btn sm ghost'; del.type = 'button'; del.textContent = 'Remove';
+      del.addEventListener('click', function(){
+        api('/api/heartbeats/' + encodeURIComponent(s.id), { method: 'DELETE' })
+          .then(renderHeartbeats).catch(function(e){ toast('Heartbeat: ' + e.message, true); });
+      });
+      li.appendChild(toggle); li.appendChild(del);
+      box.appendChild(li);
+    });
+  }
+  function loadHeartbeats(silent){
+    return api('/api/heartbeats').then(renderHeartbeats)
+      .catch(function(e){ if (!silent) toast('Heartbeats: ' + e.message, true); });
+  }
+  function initHeartbeats(){
+    var en = $('#hb-enabled');
+    if (en) en.addEventListener('change', function(){
+      api('/api/heartbeats', { method: 'POST', body: { enabled: en.checked } })
+        .then(renderHeartbeats)
+        .catch(function(e){ toast('Heartbeats: ' + e.message, true); loadHeartbeats(true); });
+    });
+    var add = $('#hb-add');
+    if (add) add.addEventListener('click', function(){
+      var when = ($('#hb-when').value || '').trim();
+      var goal = ($('#hb-goal').value || '').trim();
+      var project = ($('#hb-project').value || '').trim();
+      var max = parseInt($('#hb-max').value, 10) || 3;
+      if (!when){ toast('Heartbeats: enter when, e.g. "every 30 min"', true); return; }
+      api('/api/heartbeats', { method: 'POST', body: {
+        when: when, goal_id: goal || null, project_dir: project || null, max_tasks: max } })
+        .then(function(r){ renderHeartbeats(r);
+          $('#hb-when').value = ''; $('#hb-goal').value = ''; $('#hb-project').value = '';
+          toast('Heartbeat schedule added'); })
+        .catch(function(e){ toast('Heartbeats: ' + e.message, true); });
+    });
+  }
+
   /* ---------- Settings -> Skills ---------- */
   var _skillsCustom = [];
   function skillSwitch(id, on, label){
@@ -13373,7 +13468,7 @@
     var c = $('#settings-drawer-close');
     if (c) c.focus();
     loadTestVerification(true);
-    loadPromptEnhance(true); loadSkills(true); loadLowres(true);
+    loadPromptEnhance(true); loadSkills(true); loadLowres(true); loadHeartbeats(true);
     loadSocialWebSearch(true); loadSdModels(true);
     loadUpdateStatus(true);
   }
@@ -14099,6 +14194,7 @@
   initPromptEnhance();
   initSkills();
   initLowres();
+  initHeartbeats();
   initWhatsNewButton();
     initSocialWebSearch();
     initSdModels();

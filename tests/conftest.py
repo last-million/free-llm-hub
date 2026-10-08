@@ -115,6 +115,20 @@ def _no_live_governor(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_heartbeat_scheduler(monkeypatch):
+    """The heartbeat scheduler is a daemon thread that, once the kill switch is
+    on, starts REAL Multi runs on the owner's projects. No test may launch it;
+    tests/test_heartbeat.py drives heartbeat.Scheduler.tick() by hand with
+    fakes and an injected clock."""
+    try:
+        import app
+        monkeypatch.setattr(app, "_start_heartbeat_scheduler", lambda: None)
+    except Exception:                                            # noqa: BLE001
+        pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _stop_never_touches_real_clis(monkeypatch):
     """POST /api/runtime/stop disconnects every CLI wired to the hub
     (app._disconnect_all_clis) and a boot reconnects them -- both read and

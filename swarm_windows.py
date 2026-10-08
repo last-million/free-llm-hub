@@ -294,6 +294,117 @@ list of what you changed and anything still genuinely open."""
 
 PENDING, RUNNING, DONE, FAILED, STOPPED = "pending", "running", "done", "failed", "stopped"
 
+# What a phase that a spent budget stopped from starting is marked with: a
+# STOPPED state (not FAILED -- nothing failed) and this reason, so the report
+# and the page can say "left for next time", and a later "continue" re-runs it.
+BUDGET_STOPPED_ERROR = "stopped (budget)"
+
+
+# --------------------------------------------------------------------------- #
+# Spend budgets (tokens / seconds / calls). Pure helpers: the run holds a cap
+# and an injected `spent(run_id)` accountant; these compare the two.
+# --------------------------------------------------------------------------- #
+# The hub's spend accountant, registered once (app.set_spent_counter ->
+# _run_spent): spent(run_id) -> {"tokens", "calls"}. A run with its own
+# injected spent_fn (a test, or a caller that passes spent=) overrides it; a
+# run with neither simply never trips a tokens/calls budget.
+_SPENT_HOOK = [None]
+
+
+def set_spent_counter(fn):
+    """app registers how a run's token/call spend is measured, so no call site
+    has to thread it through. Never required; None = only seconds budgets."""
+    _SPENT_HOOK[0] = fn if callable(fn) else None
+
+
+def normalize_budget(budget):
+    """A {tokens, seconds, calls} dict -> a clean one (ints >= 0, or None per
+    axis for "no cap on this axis"), or None when nothing is capped."""
+    if not isinstance(budget, dict):
+        return None
+    out, any_set = {}, False
+    for k in ("tokens", "seconds", "calls"):
+        v = budget.get(k)
+        if v is None:
+            out[k] = None
+            continue
+        try:
+            out[k] = max(0, int(v))
+            any_set = True
+        except (TypeError, ValueError):
+            out[k] = None
+    return out if any_set else None
+
+
+def _fmt_tokens(n):
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return ("%.1fM" % (n / 1_000_000)).replace(".0M", "M")
+    if n >= 1_000:
+        return ("%.0fK" % (n / 1_000)) if n % 1000 else ("%dK" % (n // 1000))
+    return str(n)
+
+
+def _fmt_seconds(n):
+    n = int(n or 0)
+    if n < 60:
+        return "%ds" % n
+    if n < 3600:
+        return "%d min" % round(n / 60)
+    h, m = divmod(round(n / 60), 60)
+    return "%dh %02dm" % (h, m)
+
+
+def budget_check(budget, spent):
+    """(reached, reason, message). `budget` from normalize_budget, `spent` a
+    {tokens, calls, seconds} dict. Tokens, then calls, then seconds."""
+    if not budget:
+        return (False, None, None)
+    st = int((spent or {}).get("tokens") or 0)
+    sc = int((spent or {}).get("calls") or 0)
+    ss = float((spent or {}).get("seconds") or 0)
+    t, c, s = budget.get("tokens"), budget.get("calls"), budget.get("seconds")
+    if t is not None and st >= t:
+        return (True, "tokens", "Budget reached: %s of %s tokens"
+                % (_fmt_tokens(st), _fmt_tokens(t)))
+    if c is not None and sc >= c:
+        return (True, "calls", "Budget reached: %d of %d calls" % (sc, c))
+    if s is not None and ss >= s:
+        return (True, "seconds", "Budget reached: %s of %s"
+                % (_fmt_seconds(ss), _fmt_seconds(s)))
+    return (False, None, None)
+
+
+def budget_view(run):
+    """What the Build page header shows for a run's budget, or None. One part
+    per capped axis ({label, spent, cap, reached}) plus a one-line summary and
+    the budget-reached note."""
+    budget = getattr(run, "budget", None)
+    if not budget:
+        return None
+    try:
+        spent = run.budget_spent()
+    except Exception:                                            # noqa: BLE001
+        spent = {"tokens": 0, "calls": 0, "seconds": 0}
+    parts = []
+    for key, label, fmt in (("tokens", "tokens", _fmt_tokens),
+                            ("seconds", "time", _fmt_seconds),
+                            ("calls", "calls", lambda n: str(int(n or 0)))):
+        cap = budget.get(key)
+        if cap is None:
+            continue
+        got = spent.get(key) or 0
+        parts.append({"key": key, "label": label, "spent": fmt(got),
+                      "cap": fmt(cap), "reached": got >= cap})
+    if not parts:
+        return None
+    line = "Budget: " + " · ".join(
+        "%s / %s %s" % (p["spent"], p["cap"], p["label"]) for p in parts)
+    return {"parts": parts, "line": line,
+            "reached": bool(getattr(run, "budget_reached", None)),
+            "note": getattr(run, "budget_note", None)}
+
+
 _RUNS = {}
 _LOCK = threading.RLock()
 # Runs are kept so their transcripts stay readable after they finish; without a
@@ -920,12 +1031,14 @@ class _Run:
                  "restored", "interrupted", "store_root", "owner",
                  "manager", "managed", "modes", "manager_tokens", "manager_calls",
                  "context", "resumes", "default_mode", "design", "plan_check",
-                 "free_verdict", "search", "search_saved", "goal_brief")
+                 "free_verdict", "search", "search_saved", "goal_brief",
+                 "budget", "spent_fn", "budget_elapsed", "budget_walk_start",
+                 "budget_note", "budget_reached")
 
     def __init__(self, goal, project_dir, cli_id, phases, owner=None,
                  manager=None, modes=(), context="", default_mode=None,
                  design=None, check_report=None, free_verdict=None, search=None,
-                 goal_brief=""):
+                 goal_brief="", budget=None, spent=None):
         self.id = "swarm-" + uuid.uuid4().hex[:12]
         self.goal = goal
         # THE DESIGN the plan carried (plan_check.normalize_design; {} for a
@@ -1001,11 +1114,58 @@ class _Run:
         # run's record ({posteriors, log}) until a resume re-attaches a policy.
         self.search = search
         self.search_saved = None
+        # A SPEND BUDGET (tokens / seconds / calls), or None = unlimited, as
+        # every run was before budgets existed. A heartbeat run always carries
+        # one; a conversation's run carries the owner's optional cap. Reaching
+        # it stops STARTING new phases -- running ones finish their turn (no
+        # kill, no lost work) and the rest are marked "stopped (budget)".
+        # Persisted; `spent` (the hub's own usage accounting, injected like the
+        # manager) is re-attached on a resume, not persisted.
+        self.budget = normalize_budget(budget)
+        self.spent_fn = spent if callable(spent) else None
+        # Active seconds across every walk of this run (a resume continues from
+        # here), plus the current walk's start while one is going.
+        self.budget_elapsed = 0.0
+        self.budget_walk_start = None
+        self.budget_note = None
+        self.budget_reached = None
 
     def charge(self, tokens):
         with self.lock:
             self.manager_tokens += max(0, int(tokens or 0))
             self.manager_calls += 1
+
+    # -- budget ------------------------------------------------------------- #
+    def budget_active_seconds(self):
+        """Seconds this run has spent WALKING: prior walks' time plus the
+        current walk's, so a resume respects the remaining seconds."""
+        base = self.budget_elapsed or 0.0
+        if self.budget_walk_start:
+            base += max(0.0, time.time() - self.budget_walk_start)
+        return base
+
+    def budget_spent(self):
+        """{tokens, calls, seconds} spent by this run -- tokens/calls from the
+        injected hub accounting of its worker sessions, seconds from the run
+        clock. Measured, never guessed; fails open to zero."""
+        spent = {"tokens": 0, "calls": 0}
+        fn = self.spent_fn or _SPENT_HOOK[0]
+        if callable(fn):
+            try:
+                got = fn(self.id) or {}
+                spent["tokens"] = max(0, int(got.get("tokens") or 0))
+                spent["calls"] = max(0, int(got.get("calls") or 0))
+            except Exception:                                    # noqa: BLE001
+                pass
+        spent["seconds"] = self.budget_active_seconds()
+        return spent
+
+    def budget_status(self):
+        """(reached, reason, message) for THIS run, now. ("", None, None) when
+        it has no budget."""
+        if not self.budget:
+            return (False, None, None)
+        return budget_check(self.budget, self.budget_spent())
 
     def row(self, with_events=False):
         return {
@@ -1022,6 +1182,10 @@ class _Run:
             "plan_check": dict(self.plan_check) if self.plan_check else None,
             "search": (self.search.snapshot() if self.search is not None
                        else self.search_saved),
+            "budget": dict(self.budget) if self.budget else None,
+            "budget_elapsed": self.budget_active_seconds(),
+            "budget_note": self.budget_note,
+            "budget_reached": self.budget_reached,
             "error": self.error, "created_at": self.created_at,
             "ended_at": self.ended_at,
             "waves": [list(w) for w in self.waves],
@@ -1077,6 +1241,15 @@ class _Run:
         # least its planning call.
         run.managed = bool(row["managed"]) if "managed" in row \
             else run.manager_calls > 0
+        run.budget = normalize_budget(row.get("budget"))
+        try:
+            run.budget_elapsed = max(0.0, float(row.get("budget_elapsed") or 0.0))
+        except (TypeError, ValueError):
+            run.budget_elapsed = 0.0
+        run.budget_note = row.get("budget_note") if isinstance(
+            row.get("budget_note"), str) else None
+        run.budget_reached = row.get("budget_reached") if isinstance(
+            row.get("budget_reached"), str) else None
         saved = row.get("search")
         if isinstance(saved, dict) and isinstance(saved.get("log"), list):
             run.search_saved = {"posteriors": saved.get("posteriors") or {},
@@ -2380,6 +2553,7 @@ def _run_phases_loop(run, indexes, spawn, run_turn, configure=None, stop=None):
     last = run.agents[-1]
     review = last if getattr(last, "title", None) == REVIEW_TITLE else None
     forced = False
+    budget_stopped = False
     last_spawn = None
 
     def ready(i):
@@ -2429,6 +2603,23 @@ def _run_phases_loop(run, indexes, spawn, run_turn, configure=None, stop=None):
                             except Exception:                    # noqa: BLE001
                                 pass
             break
+        # BUDGET: a spent budget stops STARTING new phases. Running ones (and
+        # their co-pilots) finish their current turn -- no kill, no lost work;
+        # the rest are marked "stopped (budget)" once nothing is running, and
+        # the run says so. Checked once; the note holds the first reach.
+        if getattr(run, "budget", None) and not budget_stopped:
+            reached, reason, msg = run.budget_status()
+            if reached:
+                budget_stopped = True
+                run.budget_reached = reason
+                run.budget_note = msg
+                _log.info("[swarm] %s on run %s -- no new phases will start",
+                          msg, run.id)
+        if budget_stopped:
+            if not running and not pairs:
+                break
+            time.sleep(_SCHED_TICK)
+            continue
         can = [i for i in pending if ready(i)]
         if not can and not running and pending:
             forced = True
@@ -2485,6 +2676,26 @@ def _run_phases_loop(run, indexes, spawn, run_turn, configure=None, stop=None):
                 except Exception:                                # noqa: BLE001
                     pass
         time.sleep(_SCHED_TICK)
+    if budget_stopped:
+        _mark_budget_stopped(run)
+
+
+def _mark_budget_stopped(run):
+    """Every phase a spent budget kept from starting (still PENDING once the
+    running ones finished) is marked STOPPED/"stopped (budget)", and the run's
+    note gains how many are left for next time. Returns that count."""
+    left = 0
+    for a in run.agents:
+        if a.state == PENDING:
+            a.state = STOPPED
+            a.error = BUDGET_STOPPED_ERROR
+            a.ended_at = a.ended_at or time.time()
+            left += 1
+    base = run.budget_note or "Budget reached"
+    if left and " left for next time" not in base:
+        run.budget_note = "%s — %d task%s left for next time" % (
+            base, left, "" if left == 1 else "s")
+    return left
 
 
 def _run_wave(run, indexes, spawn, run_turn, configure=None, stop=None):
@@ -2495,6 +2706,11 @@ def _run_wave(run, indexes, spawn, run_turn, configure=None, stop=None):
 
 
 def _walk(run, spawn, run_turn, on_done=None, configure=None, stop=None):
+    # BUDGET CLOCK: this walk's active seconds count toward the run's seconds
+    # budget, on top of what earlier walks spent (a resume continues from
+    # there). Started here, folded into budget_elapsed when the walk ends.
+    if getattr(run, "budget", None):
+        run.budget_walk_start = time.time()
     try:
         run.state = RUNNING
         # The whole plan at once, dependency-driven (_run_phases). run.waves
@@ -2514,6 +2730,9 @@ def _walk(run, spawn, run_turn, on_done=None, configure=None, stop=None):
         run.error = "%s: %s" % (exc.__class__.__name__, exc)
     finally:
         run.ended_at = time.time()
+        if run.budget_walk_start:
+            run.budget_elapsed = run.budget_active_seconds()
+            run.budget_walk_start = None
         _persist(run)
         if on_done:
             try:
@@ -2662,9 +2881,23 @@ def _attach_checks(run, free_verdict=None, search=None):
         run.search = _search_policy(search, run)
 
 
+def _attach_budget(run, budget=None, spent=None):
+    """Re-attach the spend accountant (never persisted, like the manager) and,
+    when the caller passes one, replace the cap. The accumulated seconds stay,
+    so a resumed run respects the remaining budget. The budget-reached note is
+    cleared so the resumed run can earn a fresh one (and, if the cap is already
+    spent, stop again at once)."""
+    if callable(spent):
+        run.spent_fn = spent
+    if budget is not None:
+        run.budget = normalize_budget(budget)
+    run.budget_reached = None
+    run.budget_note = None
+
+
 def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
                        max_age=RESUME_MAX_AGE, stop=None, manager=None, modes=None,
-                       should_resume=None, free_verdict=None, search=None):
+                       should_resume=None, free_verdict=None, search=None, spent=None):
     """Pick up every run the last process left mid-way. Returns their ids.
 
     THE WORK GETS FINISHED. A run whose process died was marked failed and
@@ -2724,6 +2957,10 @@ def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
             if modes and not run.modes:
                 run.modes = tuple(modes)
             _attach_checks(run, free_verdict, search)
+            # The cap rode to disk with the run (budget=None keeps it); only
+            # the accountant is re-attached, so a budgeted run picked up after
+            # a restart still stops where it should.
+            _attach_budget(run, budget=None, spent=spent)
         _persist(run)
         threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure, stop),
                          daemon=True, name="swarm-resume-" + run.id).start()
@@ -2796,7 +3033,8 @@ def unfinished(run):
 
 def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
            manager=None, modes=None, context=None, default_mode=None,
-           free_verdict=None, search=None, goal_brief=None):
+           free_verdict=None, search=None, goal_brief=None, budget=None,
+           spent=None):
     """Pick an ENDED run back up where it stopped. Returns the run id, or None
     when there is nothing to resume.
 
@@ -2850,6 +3088,7 @@ def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
         if default_mode:
             run.default_mode = default_mode
         _attach_checks(run, free_verdict, search)
+        _attach_budget(run, budget, spent)
     _persist(run)
     threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure, stop),
                      daemon=True, name="swarm-continue-" + run.id).start()
@@ -2933,7 +3172,7 @@ def _search_policy(search, run=None):
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
           on_done=None, configure=None, modes=(), review=True, owner=None, stop=None,
           manager=None, context="", default_mode=None, free_verdict=None, search=None,
-          goal_brief=None):
+          goal_brief=None, budget=None, spent=None):
     """Begin a run. Returns the run id immediately; the work happens on a
     background thread.
 
@@ -2997,7 +3236,7 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
                manager=manager, modes=modes, context=context,
                default_mode=default_mode, design=design, check_report=report,
                free_verdict=free_verdict, search=_search_policy(search),
-               goal_brief=gb)
+               goal_brief=gb, budget=budget, spent=spent)
     if meter:
         run.manager_tokens, run.manager_calls = meter.tokens, meter.calls
     _remember(run)
@@ -3031,6 +3270,7 @@ def result(run_id):
         "reviewed": sum(1 for a in run.agents if a.reviewed and a.verified is not True),
         "manager_tokens": run.manager_tokens,
         "manager_calls": run.manager_calls,
+        "budget": budget_view(run),
     }
 
 
@@ -3062,6 +3302,12 @@ def format_result(run_id):
             # exactly as before.
             lines.append("Still failing its checks: " + "; ".join(p["problems"]))
         lines.append("")
+    budget = res.get("budget")
+    if budget and budget.get("note"):
+        # Said in the conversation: "Budget reached: ... -- N tasks left for
+        # next time." A run with no budget, or one that finished inside it,
+        # adds nothing.
+        lines.append(budget["note"])
     return "\n".join(lines).strip()
 
 

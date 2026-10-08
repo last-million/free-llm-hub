@@ -109,6 +109,7 @@ clientgone.install_urllib3_hook()
 # time, not at import time.
 import vision_status
 import swarm_windows
+import heartbeat
 import memory
 import taskboard
 
@@ -130,7 +131,8 @@ hub_mcp.init(
             configure=_swarm_windows_configure,
             stop=agentic_chat.stop_session,
             modes=_worker_mode_keys(),
-            **_swarm_windows_manager_kw(), **_multi_check_kwargs()),
+            **_swarm_windows_manager_kw(), **_multi_check_kwargs(),
+            **_multi_budget_kwargs()),
         "status": lambda run_id, events=False: swarm_windows.status(run_id, events),
         "stop": swarm_windows.stop,
     })
@@ -3891,6 +3893,10 @@ def _record_chat_usage(hop_pid, hop_model, data, prompt_est, ok=True):
             usage_history.record(hop_pid, hop_model,
                                  usage.get("prompt_tokens") or 0,
                                  usage.get("completion_tokens") or 0, estimated=False)
+            # BUDGET: the run/conversation spend ledger (keyed by the build
+            # session this request arrived under; terminal CLIs file nothing).
+            _note_session_spend(_build_sid(), usage.get("prompt_tokens") or 0,
+                                usage.get("completion_tokens") or 0)
             return
         content = ""
         choice = (data.get("choices") or [{}])[0] if isinstance(data, dict) else {}
@@ -3898,6 +3904,7 @@ def _record_chat_usage(hop_pid, hop_model, data, prompt_est, ok=True):
         if isinstance(msg.get("content"), str):
             content = msg["content"]
         usage_history.record(hop_pid, hop_model, prompt_est, len(content) // 4, estimated=True)
+        _note_session_spend(_build_sid(), prompt_est, len(content) // 4)
     except Exception:
         pass
 
@@ -19409,7 +19416,8 @@ def _multi_turn_events(session_id, sess_info, text):
                 default_mode=_session_mode_or_none(sess_info),
                 context=context or None,
                 goal_brief=_goal_brief_for_project(project_dir),
-                **_swarm_windows_manager_kw(), **_multi_check_kwargs())
+                **_swarm_windows_manager_kw(), **_multi_check_kwargs(),
+                **_multi_budget_kwargs(session_id))
         except Exception:                                        # noqa: BLE001
             run_id = None
         if run_id:
@@ -19441,6 +19449,7 @@ def _multi_turn_events(session_id, sess_info, text):
         on_done=_multi_owner_record,
         owner=session_id,
         goal_brief=_goal_brief_for_project(project_dir),
+        **_multi_budget_kwargs(session_id),
         **dict(_swarm_windows_manager_kw(), **({"context": context} if context else {})))
     yield {"event": "tool", "text": _MULTI_PLANNING_LINE}
     box = {}
@@ -19862,7 +19871,8 @@ def api_swarm_windows_start():
             configure=_swarm_windows_configure,
             stop=agentic_chat.stop_session,
             modes=_worker_mode_keys(),
-            **_swarm_windows_manager_kw(), **_multi_check_kwargs())
+            **_swarm_windows_manager_kw(), **_multi_check_kwargs(),
+            **_multi_budget_kwargs())
     except swarm_windows.SwarmWindowsError as exc:
         return _openai_error(str(exc), 400)
     except Exception as exc:                                     # noqa: BLE001
@@ -22948,6 +22958,16 @@ def api_agent_send_message_stream(session_id):
                                          "detail": detail}) + "\n\n"
             yield "event: end\ndata: {}\n\n"
         return Response(_refused(), mimetype="text/event-stream", headers=_SSE_HEADERS)
+    # BUDGET: a conversation's optional spend cap ends the turn cleanly with a
+    # message (a Multi turn's cap is enforced by its run, not here).
+    if sess_info and sess_info.get("quality") != "multi":
+        capped = _conversation_budget_block(session_id)
+        if capped:
+            def _capped(status=capped[0], detail=capped[1]):
+                yield "data: " + json.dumps({"event": "error", "status": status,
+                                             "detail": detail}) + "\n\n"
+                yield "event: end\ndata: {}\n\n"
+            return Response(_capped(), mimetype="text/event-stream", headers=_SSE_HEADERS)
     if sess_info and orchestrator.is_command(text.strip()):
         # "/orchestrator ..." typed here: the hub answers it for THIS
         # conversation without starting the CLI (see orchestrator.py).
@@ -23150,6 +23170,8 @@ def _multi_run_plan(session_id, project_dir=None):
                 "design": swarm_windows.design_view(run),
                 "plan_check": (getattr(run, "plan_check", None) or {}).get("line"),
                 "parallel": swarm_windows.parallel_view(run),
+                # Budget: X / Y in the run header (None when the run has no cap).
+                "budget": swarm_windows.budget_view(run),
                 "current": running[0] if running else None,
                 # Picked back up by this process after a restart (it did not
                 # need a click: swarm_windows.resume_interrupted at boot).
@@ -32928,10 +32950,13 @@ def _record_sse_usage(hop_pid, hop_model, kept, tail, prompt_est):
         if u is not None:
             usage_history.record(hop_pid, hop_model, int(u.get("prompt_tokens") or 0),
                                  int(u.get("completion_tokens") or 0), estimated=False)
+            _note_session_spend(_build_sid(), u.get("prompt_tokens") or 0,
+                                u.get("completion_tokens") or 0)
             return
         text, _tools, _fin = _sse_answer_digest(kept)
         usage_history.record(hop_pid, hop_model, int(prompt_est or 0),
                              len(text) // 4, estimated=True)
+        _note_session_spend(_build_sid(), int(prompt_est or 0), len(text) // 4)
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -36647,6 +36672,355 @@ def _pipeline_check_kwargs():
     except Exception:                                            # noqa: BLE001
         return {}
     return out
+
+
+# ========================================================================= #
+# Heartbeats and budgets (2026-10-07; owner: Paperclip-style heartbeats +
+# per-run budgets). A self-contained section: the per-session spend ledger
+# (so a run's budget is MEASURED from its worker sessions), the budget kwargs
+# injected into the Multi start path, the conversation spend cap, the heartbeat
+# scheduler wiring and the three routes. Hook points elsewhere are named
+# "BUDGET:" / "HEARTBEAT:".
+# ========================================================================= #
+
+# -- per-(build) session spend ledger --------------------------------------- #
+# Every hub-launched agent session (a Multi worker included) reaches the hub as
+# /build/<session_id>/... (_BuildPrefix), so _build_sid() names the session a
+# request arrived under. The usage hooks (_record_chat_usage / _record_sse_usage)
+# add each request's tokens here; _run_spent sums a run's worker sessions, and a
+# conversation's own cap reads its session directly. This is the hub's OWN usage
+# accounting -- measured, never a guess.
+_SESSION_SPEND = {}
+_session_spend_lock = threading.Lock()
+_SESSION_SPEND_MAX = 2000
+
+
+def _note_session_spend(sid, prompt_tokens=0, completion_tokens=0):
+    """Add one request's tokens (and one call) to a build session's running
+    total. No session (terminal CLI, off-request) files nothing. Never raises."""
+    if not sid:
+        return
+    try:
+        tok = max(0, int(prompt_tokens or 0)) + max(0, int(completion_tokens or 0))
+    except (TypeError, ValueError):
+        tok = 0
+    try:
+        with _session_spend_lock:
+            rec = _SESSION_SPEND.get(sid)
+            if rec is None:
+                if len(_SESSION_SPEND) >= _SESSION_SPEND_MAX:
+                    _SESSION_SPEND.pop(next(iter(_SESSION_SPEND)), None)
+                rec = {"tokens": 0, "calls": 0}
+                _SESSION_SPEND[sid] = rec
+            rec["tokens"] += tok
+            rec["calls"] += 1
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _session_spend(sid):
+    with _session_spend_lock:
+        rec = _SESSION_SPEND.get(sid)
+        return {"tokens": rec["tokens"], "calls": rec["calls"]} if rec \
+            else {"tokens": 0, "calls": 0}
+
+
+def _run_spent(run_id):
+    """{tokens, calls} spent by a Multi run, summed over its worker sessions
+    (swarm_windows.worker_session_ids -- retried workers' past sessions too).
+    Injected into swarm_windows.start/resume so a budget is measured. Never
+    raises (a budget that cannot be measured simply never trips)."""
+    try:
+        run = swarm_windows.get(run_id)
+        if run is None:
+            return {"tokens": 0, "calls": 0}
+        tokens = calls = 0
+        for sid in swarm_windows.worker_session_ids(run):
+            s = _session_spend(sid)
+            tokens += s["tokens"]
+            calls += s["calls"]
+        return {"tokens": tokens, "calls": calls}
+    except Exception:                                            # noqa: BLE001
+        return {"tokens": 0, "calls": 0}
+
+
+# BUDGET: register the spend accountant now that _run_spent exists, so every
+# run measures its token/call spend without any call site threading it through.
+swarm_windows.set_spent_counter(_run_spent)
+
+
+def _multi_budget_kwargs(session_id=None):
+    """BUDGET: swarm_windows.start / resume kwargs. The run's cap: the
+    conversation's own cap when it set one, else the multi_default_budget
+    setting (None = unlimited, as today). Empty when nothing is capped -- so a
+    run with no budget calls start()/resume() exactly as before. The spend
+    accountant is a module hook (swarm_windows.set_spent_counter(_run_spent)),
+    not a per-call kwarg."""
+    cap = None
+    if session_id:
+        try:
+            cap = agentic_history.budget(session_id)
+        except Exception:                                        # noqa: BLE001
+            cap = None
+    if cap is None:
+        try:
+            cap = config.get_json("multi_default_budget", None)
+        except Exception:                                        # noqa: BLE001
+            cap = None
+    b = swarm_windows.normalize_budget(cap) if isinstance(cap, dict) else None
+    return {"budget": b} if b else {}
+
+
+# -- the per-conversation spend cap (plain /agent Build turns) --------------- #
+def _conversation_budget(session_id):
+    """{cap, spent, reached, message} for a conversation's OPTIONAL spend cap
+    (tokens/calls, measured from its session). No cap = never reached."""
+    try:
+        cap = agentic_history.budget(session_id)
+    except Exception:                                            # noqa: BLE001
+        cap = None
+    spent = _session_spend(session_id)
+    if not isinstance(cap, dict) or not cap:
+        return {"cap": None, "spent": spent, "reached": False, "message": None}
+    reached, reason, msg = swarm_windows.budget_check(
+        swarm_windows.normalize_budget(cap), spent)
+    return {"cap": cap, "spent": spent, "reached": reached,
+            "reason": reason, "message": msg}
+
+
+def _conversation_budget_block(session_id):
+    """(status, detail) when a plain /agent turn must be refused for its cap,
+    else None. Terminal CLIs have no build session, so they are never capped."""
+    try:
+        b = _conversation_budget(session_id)
+    except Exception:                                            # noqa: BLE001
+        return None
+    if b.get("reached"):
+        return (429, (b.get("message") or "Budget reached")
+                + " — this conversation has reached its spend cap. "
+                  "Raise or clear it in the conversation to continue.")
+    return None
+
+
+# -- heartbeat scheduler wiring --------------------------------------------- #
+_HEARTBEAT = [None]
+_HB_CONVO = {}                 # schedule id -> the conversation its runs belong to
+
+
+def _hb_enabled():
+    return config.get_flag("heartbeats_enabled", False)
+
+
+def _hb_load():
+    v = config.get_json("heartbeats", [])
+    return v if isinstance(v, list) else []
+
+
+def _hb_save(schedules):
+    config.set_setting("heartbeats", list(schedules or []))
+
+
+def _hb_state_get():
+    v = config.get_json("heartbeat_state", {})
+    return v if isinstance(v, dict) else {}
+
+
+def _hb_state_set(state):
+    config.set_setting("heartbeat_state", state if isinstance(state, dict) else {})
+
+
+def _hb_busy(sched):
+    """HEARTBEAT skip: the owner is working -- a live Multi run for this
+    project, or any hub request in flight / finished in the last 60s."""
+    try:
+        project = (sched or {}).get("project_dir")
+        for r in swarm_windows.list_runs():
+            if r.get("state") in (swarm_windows.PENDING, swarm_windows.RUNNING) \
+                    and (not project or r.get("project_dir") == project):
+                return True
+        now = time.time()
+        with _activity_lock:
+            for a in list(_activity):
+                if a.get("finished") is None:
+                    return True
+                if (now - (a.get("finished") or 0)) <= 60:
+                    return True
+    except Exception:                                            # noqa: BLE001
+        return True            # unsure = do not compete with the owner
+    return False
+
+
+def _hb_ram_ok():
+    """HEARTBEAT skip: no room for a new run (the live RAM governor's rules)."""
+    try:
+        import lowres
+        m = lowres.machine()
+        free = m.get("free_gb")
+        if free is None:
+            return True
+        return (free - lowres.reserve_gb(m)) >= 0.6
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _hb_providers_ok():
+    """HEARTBEAT skip: the providers are rate-limited (the Multi 429 back-off)."""
+    try:
+        info = swarm_windows.concurrency_info()
+        return not (info.get("backoff") or info.get("limited_by") == "429s")
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _hb_conversation(sched):
+    """A conversation the schedule's runs belong to, so the Build page shows
+    them and Continue/Stop work. Reused across beats; recreated if it was
+    deleted. None when agentic chat is off or the project is gone."""
+    sid = _HB_CONVO.get(sched.get("id"))
+    if sid:
+        try:
+            if agentic_chat.get_session(sid) is not None \
+                    or agentic_history.get_conversation(sid) is not None:
+                return sid
+        except Exception:                                        # noqa: BLE001
+            pass
+    project = sched.get("project_dir")
+    if not project or not os.path.isdir(project):
+        return None
+    try:
+        sid = agentic_chat.start_session(sched.get("cli") or "opencode", project,
+                                         quality="multi", mode=sched.get("mode"))
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[heartbeat] could not open a conversation: %s", exc)
+        return None
+    try:
+        agentic_history.set_title(sid, "Heartbeat %s" % sched.get("id"))
+        agentic_history.set_quality(sid, "multi")
+    except Exception:                                            # noqa: BLE001
+        pass
+    _HB_CONVO[sched.get("id")] = sid
+    return sid
+
+
+def _hb_start_run(sched, goal_text, tasks, budget):
+    """HEARTBEAT: start ONE Multi run for the schedule's project with the open
+    tasks as its goal, through the same path the Build page uses. Returns the
+    run id, or None. owner = the conversation (so it shows up and Continue/Stop
+    work); the heartbeat origin rides in the beat log and the title."""
+    if not goal_text:
+        return None
+    project = sched.get("project_dir")
+    cli_id = sched.get("cli") or "opencode"
+    sid = _hb_conversation(sched)
+    owner = sid or ("heartbeat:" + str(sched.get("id")))
+    try:
+        run_id = swarm_windows.start(
+            goal_text, project, cli_id,
+            _swarm_windows_spawn, _swarm_windows_turn,
+            planner=_pipeline_bound(_swarm_windows_planner, sched.get("mode")),
+            configure=_swarm_windows_configure,
+            stop=agentic_chat.stop_session,
+            modes=((sched["mode"],) if sched.get("mode") else _worker_mode_keys()),
+            default_mode=sched.get("mode"),
+            on_done=_multi_owner_record,
+            owner=owner,
+            budget=swarm_windows.normalize_budget(budget), spent=_run_spent,
+            **_swarm_windows_manager_kw(), **_multi_check_kwargs())
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[heartbeat] run could not start: %s", exc)
+        return None
+    if sid and run_id:
+        with _MULTI_LOCK:
+            _MULTI_RUNS[sid] = run_id
+    return run_id
+
+
+def _heartbeat_scheduler():
+    if _HEARTBEAT[0] is None:
+        _HEARTBEAT[0] = heartbeat.Scheduler(
+            load=_hb_load, state_get=_hb_state_get, state_set=_hb_state_set,
+            enabled=_hb_enabled, busy=_hb_busy, ram_ok=_hb_ram_ok,
+            providers_ok=_hb_providers_ok, start_run=_hb_start_run)
+    return _HEARTBEAT[0]
+
+
+def _start_heartbeat_scheduler():
+    """HEARTBEAT boot: start the one daemon thread (no immediate beat). The
+    kill switch (heartbeats_enabled, default OFF) is checked every tick, so the
+    thread is cheap while there is nothing to do. Stubbed out in tests."""
+    try:
+        _heartbeat_scheduler().start()
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("could not start the heartbeat scheduler: %s", exc)
+
+
+@app.route("/api/heartbeats", methods=["GET", "POST"])
+def api_heartbeats():
+    """GET: the kill switch, every schedule, its next-due time, last beat and
+    last skip reason. POST {"enabled": bool} flips the kill switch; POST a
+    schedule spec (needs a readable `when` and a goal_id or project_dir) adds
+    one."""
+    if request.method == "GET":
+        return jsonify(_heartbeat_scheduler().status())
+    body = request.get_json(force=True, silent=True) or {}
+    if "enabled" in body and len(body) == 1:
+        config.set_flag("heartbeats_enabled", bool(body["enabled"]))
+        return jsonify(_heartbeat_scheduler().status())
+    schedules, sched = heartbeat.add(_hb_load(), body.get("schedule") or body)
+    if sched is None:
+        return _openai_error("a schedule needs a readable 'when' "
+                             "(e.g. 'every 30 min', 'daily 09:00') and a "
+                             "goal_id or project_dir", 400)
+    _hb_save(schedules)
+    return jsonify({"added": sched, **_heartbeat_scheduler().status()})
+
+
+@app.route("/api/heartbeats/<hb_id>", methods=["PUT", "DELETE"])
+def api_heartbeat_edit(hb_id):
+    if request.method == "DELETE":
+        schedules, removed = heartbeat.remove(_hb_load(), hb_id)
+        if not removed:
+            return _openai_error("no such schedule", 404)
+        _hb_save(schedules)
+        _HB_CONVO.pop(hb_id, None)
+        return jsonify(_heartbeat_scheduler().status())
+    patch = request.get_json(force=True, silent=True) or {}
+    schedules, sched = heartbeat.update(_hb_load(), hb_id, patch)
+    if sched is None:
+        return _openai_error("no such schedule, or the change left it invalid", 400)
+    _hb_save(schedules)
+    return jsonify({"updated": sched, **_heartbeat_scheduler().status()})
+
+
+@app.route("/api/budgets", methods=["GET"])
+def api_budgets():
+    """Spent vs cap for every live budgeted Multi run, and every conversation
+    that set a spend cap."""
+    runs = []
+    try:
+        for r in swarm_windows.list_runs():
+            run = swarm_windows.get(r.get("run_id"))
+            bv = swarm_windows.budget_view(run) if run is not None else None
+            if bv:
+                runs.append({"run_id": r.get("run_id"), "state": r.get("state"),
+                             "project_dir": r.get("project_dir"),
+                             "owner": r.get("owner"), "budget": bv})
+    except Exception:                                            # noqa: BLE001
+        pass
+    conversations = []
+    try:
+        with _session_spend_lock:
+            sids = list(_SESSION_SPEND.keys())
+        for sid in sids:
+            cap = agentic_history.budget(sid)
+            if not isinstance(cap, dict) or not cap:
+                continue
+            b = _conversation_budget(sid)
+            conversations.append({"session_id": sid, "cap": b["cap"],
+                                  "spent": b["spent"], "reached": b["reached"]})
+    except Exception:                                            # noqa: BLE001
+        pass
+    return jsonify({"runs": runs, "conversations": conversations})
 
 
 def _multi_check_kwargs():
@@ -42440,6 +42814,7 @@ if __name__ == "__main__":
     _maybe_auto_create_desktop_shortcut()
     _start_agent_cli_autoinstall()
     vision_status.start_heartbeat()
+    _start_heartbeat_scheduler()   # agents wake themselves on the owner's schedule
     _warm_catalogs_async()     # so the first CLI to ask does not pay the sweep
     _repair_opencode_config()  # a limitless model entry is a session that never compacts
     _start_declared_window_resync()   # connected CLIs follow a changed declared window

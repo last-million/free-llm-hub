@@ -495,6 +495,41 @@ def set_quality(session_id, quality):
         return None
 
 
+def set_budget(session_id, budget):
+    """Remember this conversation's OPTIONAL spend cap (a dict
+    {tokens, seconds, calls} with None/absent = no cap on that axis), or None
+    to clear it. A Multi turn's run carries it as its run budget; a plain
+    /agent turn is refused cleanly once the cap is reached (see app's
+    Heartbeats and budgets section). Stored like every other per-conversation
+    setting so it survives the 5-hourly restart. Never raises."""
+    if not session_id:
+        return None
+    budget = budget if isinstance(budget, dict) and budget else None
+    try:
+        with _LOCK:
+            conv = _load_conversation(session_id)
+            if conv is None:
+                return None
+            if conv.get("budget") == budget:
+                return budget
+            conv["budget"] = budget
+            _save_conversation(conv)
+            _upsert_index_row(conv)
+            return budget
+    except Exception:
+        return None
+
+
+def budget(session_id):
+    """This conversation's spend cap, or None. Never raises."""
+    try:
+        conv = get_conversation(session_id) or {}
+        b = conv.get("budget")
+        return b if isinstance(b, dict) and b else None
+    except Exception:
+        return None
+
+
 def set_auto_resume(session_id, enabled):
     """Whether this conversation continues BY ITSELF after a hub restart.
     Off unless the owner ticks it (owner, 2026-09-30: "not let all

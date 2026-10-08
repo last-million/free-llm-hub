@@ -2359,6 +2359,65 @@ from -- the SAME quality in any terminal CLI and in the Build page. Covered by
   add-goal / add-task inputs, close-goal. `loadTasks()` fetches
   `/api/goals` + `/api/tasks` for the session's `curProjectDir`.
 
+## Heartbeats and budgets (2026-10-07)
+
+Owner (inspired by Paperclip's heartbeats + budgets): (1) agents wake
+themselves at times the owner picks and continue open tasks; (2) every run has
+a spend budget and stops cleanly when it is spent. Covered by
+`tests/test_heartbeat.py` + `tests/test_run_budgets.py`.
+
+- **`heartbeat.py`** (pure, stdlib only; every side injected). cron-lite
+  `parse_when`: `"every N min"` / `"every N hours"` -> `{kind:"every",
+  seconds}`; `"daily HH:MM"`; `"weekdays|weekends HH:MM"`; `"mon,wed,fri
+  HH:MM"` -> `{kind:"weekly", days, hh, mm}`; anything else None. `due` /
+  `next_due` from the last beat (an `every` with no beat is due at once;
+  daily/weekly fire once per slot, after its local HH:MM). `in_quiet_hours`
+  ("HH:MM-HH:MM", wraps midnight). Schedule records are pure list transforms
+  (`normalize_schedule` needs a readable `when` and a goal_id or project_dir;
+  `add`/`update`/`remove`). Stored in settings `heartbeats`; runtime state
+  (last beat, last skip, beats log) in `heartbeat_state`.
+- **`Scheduler`**: ONE daemon thread, `tick(now)` fires every due schedule.
+  Boot starts the thread only -- the loop WAITS a tick before its first beat
+  (no beat the instant the hub comes up). A beat is SKIPPED (reason recorded in
+  `last_skip`, surfaced in status, last_beat_at NOT advanced so it retries next
+  tick -- never a tight loop) when, in order: quiet hours, the owner is busy
+  (app `_hb_busy`: a live Multi run for the project, or any hub request in
+  flight / finished in the last 60s), no RAM room (`_hb_ram_ok`: free -
+  `lowres.reserve_gb` >= 0.6 GB), the providers are rate-limited (`_hb_providers_ok`:
+  `swarm_windows.concurrency_info` backoff / limited_by 429s), or there are no
+  tasks. Never two beats of one schedule at once (an in-flight guard). Else it
+  takes `taskboard.default.next_batch(goal, max_tasks)`, starts ONE Multi run
+  (app `_hb_start_run`: a per-schedule conversation is the `owner`, so the
+  Build page shows it and Continue/Stop work), marks the tasks `doing`
+  (`owner="heartbeat:<id>"`, the run id), and records the beat. Kill switch
+  `heartbeats_enabled` (default OFF). `taskboard` is imported LAZILY (agent T
+  ships it; a missing board reads as "no tasks").
+- **Budgets** (`swarm_windows`): `start`/`resume(budget={tokens,seconds,calls},
+  spent=fn)`, persisted on the run (`spent` re-attached on resume/boot, like
+  the manager). `budget_check` compares the cap with the MEASURED spend --
+  tokens/calls from `spent(run_id)` (app `_run_spent` sums the run's worker
+  sessions via `worker_session_ids` from the per-build-session ledger
+  `_SESSION_SPEND`, fed by `_record_chat_usage` / `_record_sse_usage`), seconds
+  from the run clock (`budget_active_seconds`, accumulated across walks).
+  `_run_phases_loop`: when the budget is reached it stops STARTING new phases;
+  running ones finish their turn (no kill), the rest are marked STOPPED /
+  `BUDGET_STOPPED_ERROR`, and `budget_note` ("Budget reached: X of Y tokens --
+  N tasks left for next time") rides on `result`/`format_result`/`budget_view`
+  and the run header. A resume respects the remaining budget. Heartbeat runs
+  ALWAYS carry one (schedule's, else `heartbeat.DEFAULT_BUDGET` = 45 min / 2M
+  tokens / 400 calls); a conversation's Multi run uses its own cap
+  (`agentic_history.budget`) else `multi_default_budget` (None = unlimited, as
+  today), wired via `_multi_budget_kwargs`. A plain /agent Build turn is
+  refused cleanly (`_conversation_budget_block`, 429 + message) when its cap is
+  reached; terminal CLIs get only the counter.
+- **Routes** (control-token gated): `GET/POST /api/heartbeats` (status / flip
+  the kill switch / add a schedule), `PUT|DELETE /api/heartbeats/<id>`,
+  `GET /api/budgets` (spent vs cap per live run and capped conversation).
+  Settings drawer `#heartbeats-group`; the Build run header shows "Budget:
+  X / Y". app.py edits are a NEW section (hooks named `BUDGET:` / `HEARTBEAT:`).
+  `tests/conftest.py` stubs `_start_heartbeat_scheduler` so no test launches
+  the real thread.
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):
