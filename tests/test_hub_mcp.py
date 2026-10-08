@@ -81,7 +81,10 @@ def test_tools_list_exposes_the_three_crew_tools():
     # ...and nothing unexpected has crept in.
     assert set(tools) <= {"crew_run", "crew_start", "crew_result",
                           "swarm_windows_start", "swarm_windows_status",
-                          "swarm_windows_stop"}
+                          "swarm_windows_stop",
+                          # third family (PUBLISH-CLI): publish_*, wired by app.py
+                          "publish_start", "publish_status", "publish_stop",
+                          "publish_renew"}
 
 
 def test_crew_run_sync(fake_runner):

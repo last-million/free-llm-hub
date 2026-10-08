@@ -69,21 +69,34 @@ _RUNNER = None  # set by init(); None = tools/call fails cleanly
 # with a completely different contract (start/poll/stop over a run id, not one
 # blocking call) would have had to pretend to be a crew to reuse that slot.
 _SWARM = None  # {"start", "status", "stop"} callables, or None
+# PUBLISH-CLI: the agent-facing publish tools (a free Cloudflare tunnel for a
+# finished web app). A third family with its own contract again: four short,
+# synchronous calls whose answers are plain dicts (`{error, code}` on failure).
+_PUBLISH = None  # {"start", "status", "stop", "renew"} callables, or None
 _JOBS = {}  # job_id -> {"status", "text", "error", "created"}
 _JOBS_LOCK = threading.Lock()
 
+PUBLISH_TOOLS = ("publish_start", "publish_status", "publish_stop", "publish_renew")
 
-def init(runner, version=None, swarm=None):
+
+def init(runner, version=None, swarm=None, publish=None):
     """Wire the crew execution contract: runner(messages, crew_name) -> str,
     blocking. Called once by app.py after crews.run/format_answer exist.
 
     `swarm` optionally wires the multi-agent orchestrator: a dict of
     start/status/stop callables. Absent, those tools are not advertised at all
-    -- a client must never be shown a tool that cannot run."""
-    global _RUNNER, SERVER_VERSION, _SWARM
+    -- a client must never be shown a tool that cannot run.
+
+    `publish` wires the publish tools the same way: a dict of callables
+    start(port, project_dir=None, ttl_minutes=None), status(project_dir=None),
+    stop(tunnel_id), renew(tunnel_id, ttl_minutes=None), each returning a dict
+    (a failure is `{"error": ..., "code": ...}`)."""
+    global _RUNNER, SERVER_VERSION, _SWARM, _PUBLISH
     _RUNNER = runner
     if swarm:
         _SWARM = swarm
+    if publish:
+        _PUBLISH = publish
     if version:
         SERVER_VERSION = version
 
@@ -199,7 +212,85 @@ def _tools():
                 "required": ["run_id"]
             }
         }
-    ])
+    ]) + _publish_tools()
+
+
+# The consent wording below is load-bearing (tests pin it): these tools put a
+# local app on the PUBLIC internet, so every description a model reads says
+# when it may call them (only after the user said yes), who can open the link
+# (anyone who has it) and that it expires.
+_PUBLISH_CONSENT = (
+    "CALL ONLY AFTER THE USER SAID YES to publishing this app online -- ask "
+    "first, never publish on your own. Anyone with the link can open the app, "
+    "and the link expires.")
+
+
+def _publish_tools():
+    if _PUBLISH is None:
+        return []
+    ttl_prop = {"type": "integer", "minimum": 1,
+                "description": "How long the link should live, in minutes. "
+                               "Leave out for the hub's default."}
+    id_prop = {"type": "string",
+               "description": "The tunnel id from publish_start or publish_status."}
+    return [
+        {
+            "name": "publish_start",
+            "description": (
+                "Publish a web app that is running on this machine through a "
+                "free Cloudflare tunnel, so it gets a temporary public https "
+                "link. " + _PUBLISH_CONSENT + " Returns the url and when it "
+                "expires: tell the user both. If cloudflared is missing, the "
+                "user can install it from the Build page's Publish panel."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "port": {"type": "integer", "minimum": 1, "maximum": 65535,
+                             "description": "The local port the app listens on."},
+                    "project_dir": {"type": "string",
+                                    "description": "Absolute path of the folder "
+                                                   "you built the app in."},
+                    "ttl_minutes": ttl_prop,
+                },
+                "required": ["port"],
+            },
+        },
+        {
+            "name": "publish_status",
+            "description": (
+                "List the published links (url, state, minutes left) and whether "
+                "cloudflared is available. Read-only; call it to find a tunnel "
+                "id or to check whether a link is still live."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project_dir": {
+                    "type": "string",
+                    "description": "Only the links of this project folder."}},
+            },
+        },
+        {
+            "name": "publish_stop",
+            "description": ("Take a published link offline now. Call it when the "
+                            "user asks to stop publishing or unpublish."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": id_prop},
+                "required": ["id"],
+            },
+        },
+        {
+            "name": "publish_renew",
+            "description": (
+                "Give a published app a fresh lifetime (a NEW link when the old "
+                "one has expired or the user asks for a new one). "
+                + _PUBLISH_CONSENT + " Tell the user the url and the new expiry."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": id_prop, "ttl_minutes": ttl_prop},
+                "required": ["id"],
+            },
+        },
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +408,69 @@ def _call_swarm_tool(name, arguments):
     return _text_result(json.dumps(st, ensure_ascii=False, indent=1))
 
 
+def _int_arg(arguments, key, lo=None, hi=None, required=False):
+    """An integer argument (a numeric string is accepted: models quote ports).
+    ValueError when it is not one; None when absent and not required."""
+    v = arguments.get(key)
+    if v is None or v == "":
+        if required:
+            raise ValueError("'%s' must be an integer" % key)
+        return None
+    if isinstance(v, str) and v.strip().isdigit():
+        v = int(v.strip())
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise ValueError("'%s' must be an integer" % key)
+    if (lo is not None and v < lo) or (hi is not None and v > hi):
+        raise ValueError("'%s' is out of range" % key)
+    return v
+
+
+def _str_arg(arguments, key, required=False):
+    v = arguments.get(key)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        if required:
+            raise ValueError("'%s' must be a non-empty string" % key)
+        return None
+    if not isinstance(v, str):
+        raise ValueError("'%s' must be a string" % key)
+    return v.strip()
+
+
+def _call_publish_tool(name, arguments):
+    """The publish tools. A bad ARGUMENT is a JSON-RPC error (the client built
+    the call wrong); a refusal by the hub or the engine -- switched off, no
+    cloudflared, too many tunnels -- comes back as tool text with isError and a
+    `code`, because the model can read that and tell the user what to do."""
+    try:
+        # Validate everything BEFORE the glue runs, so a bad call never
+        # touches a tunnel.
+        if name == "publish_start":
+            args = ((), {"port": _int_arg(arguments, "port", 1, 65535, required=True),
+                         "project_dir": _str_arg(arguments, "project_dir"),
+                         "ttl_minutes": _int_arg(arguments, "ttl_minutes")})
+            fn = _PUBLISH["start"]
+        elif name == "publish_status":
+            args = ((), {"project_dir": _str_arg(arguments, "project_dir")})
+            fn = _PUBLISH["status"]
+        elif name == "publish_stop":
+            args = ((_str_arg(arguments, "id", required=True),), {})
+            fn = _PUBLISH["stop"]
+        else:  # publish_renew
+            args = ((_str_arg(arguments, "id", required=True),),
+                    {"ttl_minutes": _int_arg(arguments, "ttl_minutes")})
+            fn = _PUBLISH["renew"]
+    except ValueError as exc:
+        return _error(-32602, str(exc))
+    try:
+        out = fn(*args[0], **args[1])
+    except Exception as exc:                                     # noqa: BLE001
+        return _text_result({"error": "publish failed: %s" % type(exc).__name__,
+                             "code": "failed"}, is_error=True)
+    if not isinstance(out, dict):
+        out = {"result": out}
+    return _text_result(out, is_error=bool(out.get("error")))
+
+
 def _call_tool(params):
     """Returns a JSON-RPC error dict OR a tools/call result dict."""
     if not isinstance(params, dict):
@@ -329,6 +483,10 @@ def _call_tool(params):
         if _SWARM is None:
             return _error(-32603, "swarm orchestrator not wired")
         return _call_swarm_tool(name, arguments)
+    if name in PUBLISH_TOOLS:
+        if _PUBLISH is None:
+            return _error(-32603, "publishing not wired")
+        return _call_publish_tool(name, arguments)
     if name not in ("crew_run", "crew_start", "crew_result"):
         return _error(-32602, "Unknown tool: %r" % (name,))
     if _RUNNER is None:

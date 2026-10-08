@@ -2604,7 +2604,9 @@ def write_task_brief(project_dir, text, memory_block="", session_id=None):
     because they are phases of one job whose summaries the review phase shares
     deliberately anyway. It would not be tolerable for anything private."""
     try:
-        brief = craft.system_message(text or "")
+        # session_id lets the publish question skip a Multi helper (app's
+        # predicate): the PUBLISH line asks the USER, and a helper has none.
+        brief = craft.system_message(text or "", session_id=session_id)
         memory_block = (memory_block or "").strip()
         name = brief_filename(session_id)
         path = os.path.join(project_dir, name)

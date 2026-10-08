@@ -147,6 +147,14 @@ hub_mcp.init(
             **_multi_budget_kwargs()),
         "status": lambda run_id, events=False: swarm_windows.status(run_id, events),
         "stop": swarm_windows.stop,
+    },
+    # PUBLISH-CLI: the four publish_* tools (glue in the PUBLISH-CLI section
+    # below; resolved at call time like everything above).
+    publish={
+        "start": lambda **kw: _publish_cli_start(**kw),
+        "status": lambda **kw: _publish_cli_status(**kw),
+        "stop": lambda tunnel_id: _publish_cli_stop(tunnel_id),
+        "renew": lambda tunnel_id, **kw: _publish_cli_renew(tunnel_id, **kw),
     })
 
 import logging
@@ -21289,6 +21297,278 @@ def api_hub_desktop_shortcut():
     except OSError as exc:
         return jsonify({"ok": False, "error": _sanitize(str(exc))}), 500
     return jsonify({"ok": True, "path": path})
+
+
+# ---------------------------------------------------------------------------
+# PUBLISH-CLI: publishing a finished web app from an agent (terminal CLIs via
+# the hub's MCP tools, /agent Build sessions through the same brief)
+# ---------------------------------------------------------------------------
+# Workflow: the brief (craft.PUBLISH_ASK) makes the agent give the LOCAL url,
+# then ASK the user once whether to also publish it through a free Cloudflare
+# tunnel. Only on an explicit yes does it call publish_start; it tells the user
+# the url and when it expires; publish_renew gives a new link / lifetime; expiry
+# closes the tunnel (publish.py owns the tunnels and their clock; the Build
+# page's badge reads the same registry, so an agent-started tunnel shows there
+# with no UI code here).
+#
+# This section is thin glue: it never starts a process, it imports `publish`
+# lazily (the engine is its own module) and turns every outcome into a compact
+# dict the model can read -- `{error, code}` on any refusal. Safety: consent is
+# in the brief AND in every tool description, the engine caps the lifetime,
+# every agent-started tunnel is logged in hub.log WITHOUT its url, and the
+# setting flag `agent_publish` (default on) switches the tools to
+# `disabled` and takes the brief line out. Covered by
+# tests/test_publish_cli_flow.py.
+
+_PUBLISH_WAIT_SECONDS = 20.0     # how long publish_start waits for the link
+_PUBLISH_POLL_SECONDS = 0.5
+_PUBLISH_NOTE = ("Tell the user this url and when it expires. Anyone with the "
+                 "link can open the app until then.")
+_PUBLISH_STARTING_NOTE = ("The tunnel is still starting: call publish_status in "
+                          "a few seconds to get the link. Do not give the user a "
+                          "link yet.")
+_PUBLISH_INSTALL_HINT = ("cloudflared (the free tunnel tool) is not installed on "
+                         "this machine. The user can install it with one click "
+                         "from the Build page's Publish panel; then try again.")
+
+
+def _agent_publish_on():
+    try:
+        return bool(config.get_flag("agent_publish", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _publish_brief_allowed(session_id=None):
+    """craft's predicate for the PUBLISH line: the flag is on and the session is
+    not a Multi helper (a helper has no user to ask)."""
+    if not _agent_publish_on():
+        return False
+    try:
+        if session_id and swarm_windows.worker_info(session_id):
+            return False
+    except Exception:                                            # noqa: BLE001
+        pass
+    return True
+
+
+craft.set_publish_source(_publish_brief_allowed)
+
+
+def _publish_engine():
+    """(module, engine) of publish.py, or (None, None) when this hub has none."""
+    try:
+        import publish as _pub
+        eng = getattr(_pub, "default", None)
+        return (_pub, eng) if eng is not None else (None, None)
+    except Exception:                                            # noqa: BLE001
+        return None, None
+
+
+def _publish_fail(code, message, **extra):
+    out = {"error": message, "code": code}
+    out.update(extra)
+    return out
+
+
+def _publish_gate():
+    """(module, engine, None) when publishing may run, else (None, None, the
+    `disabled` answer)."""
+    if not _agent_publish_on():
+        return None, None, _publish_fail(
+            "disabled", "Publishing from agents is switched off in this hub "
+                        "(setting agent_publish).")
+    pub, eng = _publish_engine()
+    if eng is None:
+        return None, None, _publish_fail(
+            "disabled", "Publishing is not available in this hub.")
+    return pub, eng, None
+
+
+def _publish_project_name(path):
+    name = os.path.basename(str(path or "").rstrip("/\\")) or "project"
+    return re.sub(r"[^\w .@+-]", "_", name)[:60]
+
+
+def _publish_human(seconds):
+    s = int(seconds)
+    if s < 60:
+        return "less than a minute"
+    m = s // 60
+    if m < 60:
+        return "about %d minute%s" % (m, "" if m == 1 else "s")
+    h, m = divmod(m, 60)
+    return "about %d hour%s%s" % (h, "" if h == 1 else "s",
+                                  (" %d min" % m) if m else "")
+
+
+def _publish_view(t):
+    """The compact tunnel record the model sees. Never an `error` key (the MCP
+    layer reads that as a failed call); a failed tunnel's reason is `reason`."""
+    out = {}
+    if not isinstance(t, dict):
+        return out
+    for key in ("id", "state", "url", "port", "expires_at", "remaining_seconds"):
+        v = t.get(key)
+        if v not in (None, ""):
+            out[key] = v
+    if t.get("error"):
+        out["reason"] = _sanitize(t["error"], 200)
+    rem = t.get("remaining_seconds")
+    if isinstance(rem, (int, float)) and not isinstance(rem, bool) and rem >= 0:
+        out["expires_in"] = _publish_human(rem)
+    if t.get("project_dir"):
+        out["project"] = _publish_project_name(t["project_dir"])
+    return out
+
+
+def _publish_error(pub, exc, folder=None, port=None, eng=None):
+    """An engine refusal (publish.PublishError, .code) or any other failure as
+    the `{error, code}` answer. A tunnel already running for this app is named
+    so the agent tells the user THAT link instead of failing."""
+    perr = getattr(pub, "PublishError", None)
+    if perr is None or not isinstance(exc, perr):
+        _log.info("[publish] agent call failed: %s", type(exc).__name__)
+        return _publish_fail("failed", "Publishing failed (%s)." % type(exc).__name__)
+    code = str(getattr(exc, "code", "") or "failed")
+    message = _sanitize(str(exc) or "Publishing was refused.", 300)
+    if code == "no_cloudflared":
+        message = _PUBLISH_INSTALL_HINT
+    out = _publish_fail(code, message)
+    if code == "already_published" and eng is not None and folder:
+        try:
+            for t in (eng.status(folder) or {}).get("tunnels") or []:
+                if isinstance(t, dict) and t.get("state") in ("live", "starting") \
+                        and (port is None or t.get("port") == port):
+                    out["tunnel"] = _publish_view(t)
+                    out["hint"] = ("It is already published: tell the user this "
+                                   "link; publish_renew gives it a fresh lifetime.")
+                    break
+        except Exception:                                        # noqa: BLE001
+            pass
+    return out
+
+
+def _publish_wait_live(eng, folder, tunnel):
+    """publish_start may return before cloudflared prints its url: poll the
+    registry (bounded) so the agent gets the link in the same call."""
+    t = tunnel if isinstance(tunnel, dict) else {}
+    try:
+        deadline = time.monotonic() + _PUBLISH_WAIT_SECONDS
+        while (t.get("state") == "starting" or not t.get("url")) \
+                and t.get("state") not in ("failed", "expired", "stopped") \
+                and time.monotonic() < deadline:
+            time.sleep(_PUBLISH_POLL_SECONDS)
+            fresh = next((c for c in (eng.status(folder) or {}).get("tunnels") or []
+                          if isinstance(c, dict) and c.get("id") == t.get("id")), None)
+            if fresh is None:
+                break
+            t = fresh
+    except Exception:                                            # noqa: BLE001
+        pass
+    return t
+
+
+def _publish_result(t):
+    """A started / renewed tunnel as the answer: the link and its expiry, or an
+    honest "still starting" / "failed"."""
+    view = _publish_view(t)
+    if view.get("state") == "failed":
+        return _publish_fail("failed", view.get("reason") or "The tunnel could not start.",
+                             id=view.get("id"))
+    if view.get("state") == "starting" or not view.get("url"):
+        view.pop("url", None)
+        view["note"] = _PUBLISH_STARTING_NOTE
+    else:
+        view["note"] = _PUBLISH_NOTE
+    return view
+
+
+def _publish_guess_dir(port):
+    """The folder of the preview the hub already knows on this port."""
+    try:
+        for r in workspace.running():
+            if r.get("port") == port and r.get("project_dir"):
+                return r["project_dir"]
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def _publish_cli_start(port, project_dir=None, ttl_minutes=None):
+    pub, eng, refused = _publish_gate()
+    if refused:
+        return refused
+    folder = (project_dir or "").strip() or _publish_guess_dir(port) or ""
+    if not folder or not os.path.isabs(folder) or not os.path.isdir(folder):
+        return _publish_fail(
+            "no_project", "Pass project_dir: the absolute path of the folder you "
+                          "built the app in.")
+    folder = os.path.abspath(folder)
+    name = _publish_project_name(folder)
+    try:
+        tunnel = eng.start(folder, port=port, ttl_minutes=ttl_minutes, source="agent")
+    except Exception as exc:                                     # noqa: BLE001
+        out = _publish_error(pub, exc, folder, port, eng)
+        _log.info("[publish] agent start refused (%s) for %s port %s",
+                  out.get("code"), name, port)
+        return out
+    # The owner's trace of every agent-started tunnel -- and never the url.
+    _log.info("[publish] agent started a tunnel for %s port %s", name, port)
+    return _publish_result(_publish_wait_live(eng, folder, tunnel))
+
+
+def _publish_cli_status(project_dir=None):
+    pub, eng, refused = _publish_gate()
+    if refused:
+        return refused
+    folder = (project_dir or "").strip()
+    folder = os.path.abspath(folder) if folder and os.path.isabs(folder) else None
+    try:
+        st = eng.status(folder) or {}
+    except Exception as exc:                                     # noqa: BLE001
+        return _publish_error(pub, exc)
+    cf = st.get("cloudflared") if isinstance(st.get("cloudflared"), dict) else {}
+    limits = st.get("limits") if isinstance(st.get("limits"), dict) else {}
+    out = {"tunnels": [_publish_view(t) for t in st.get("tunnels") or []
+                       if isinstance(t, dict)],
+           "cloudflared_available": bool(cf.get("available")),
+           "cloudflared_installable": bool(cf.get("installable"))}
+    for key in ("max_tunnels", "default_ttl_minutes"):
+        if limits.get(key):
+            out[key] = limits[key]
+    if not cf.get("available"):
+        out["note"] = _PUBLISH_INSTALL_HINT
+    return out
+
+
+def _publish_cli_stop(tunnel_id):
+    pub, eng, refused = _publish_gate()
+    if refused:
+        return refused
+    try:
+        eng.stop(tunnel_id)
+    except Exception as exc:                                     # noqa: BLE001
+        return _publish_error(pub, exc)
+    _log.info("[publish] agent stopped tunnel %s", _sanitize(tunnel_id, 40))
+    return {"ok": True, "id": tunnel_id, "state": "stopped"}
+
+
+def _publish_cli_renew(tunnel_id, ttl_minutes=None):
+    pub, eng, refused = _publish_gate()
+    if refused:
+        return refused
+    try:
+        t = eng.renew(tunnel_id, ttl_minutes=ttl_minutes)
+    except Exception as exc:                                     # noqa: BLE001
+        return _publish_error(pub, exc)
+    t = t if isinstance(t, dict) else {}
+    folder = t.get("project_dir")
+    if folder and (t.get("state") == "starting" or not t.get("url")):
+        t = _publish_wait_live(eng, folder, t)
+    _log.info("[publish] agent renewed a tunnel for %s",
+              _publish_project_name(t.get("project_dir")))
+    return _publish_result(t)
 
 
 # ---------------------------------------------------------------------------

@@ -3093,3 +3093,67 @@ and `resume_after_update` (default true).
   turns of a Multi run going and still starting that run's later phases until
   the cap (it does not pause phase starts); a CLI that gave up before the hub
   came back is a CLI-side limit, not something the hub can resume.
+
+## Publishing from the CLIs (2026-10-08)
+
+Owner: when an agent has FINISHED building a web app and gives the user the
+LOCAL url, it must ASK whether to also publish it online through a free
+Cloudflare tunnel, and publish only on an explicit yes. Same behaviour in the
+terminal CLIs (opencode/codex/claude via `/v1`) and in `/agent` Build sessions.
+The engine (`publish.py`, tunnels + clock + the Build page's Publish panel/badge)
+is a separate module; this section is the agent-facing workflow. Covered by
+`tests/test_publish_cli_flow.py` (against a FAKE `publish` module; no tunnel is
+started and nothing contacts Cloudflare in tests).
+
+- **Workflow**: (1) the agent gives the local url and ASKS once: "Publish it
+  online through a free Cloudflare tunnel (temporary public link)? yes/no" ->
+  (2) nothing happens until the user says yes -> (3) the agent calls the hub MCP
+  tool `publish_start {port, project_dir}` -> (4) it tells the user the public url
+  and when it expires (`expires_in` / `expires_at` in the result, plus a `note`
+  saying so) -> (5) "a new link" = `publish_renew {id}` (id from `publish_start` /
+  `publish_status`), `publish_stop {id}` takes it down -> (6) expiry closes the
+  tunnel (the engine's clock; nothing for the agent to do). A tunnel an agent
+  started shows in the Build page's badge by itself (same registry, `source`
+  "agent"); no UI code lives here.
+- **The brief line** `craft.PUBLISH_ASK` (236 chars, ~59 tokens) ships inside
+  `craft.system_message(text, tools=True, session_id=None)` ONLY for a web/UI
+  deliverable (`craft.is_web_ui`) on a tool-carrying request, right after the
+  domain briefs and BEFORE the loop (PLAN/ACT/VERIFY stay last: their "every
+  brief above" back-references and `test_craft_briefs`). That one function feeds
+  both the `/v1` opening turn (`_apply_craft_brief`, so a following "yes" turn
+  carries it too via the project-opening-instruction fallback) and the Build
+  brief file (`agentic_chat.write_task_brief` passes `session_id`). Everything
+  else is byte-identical to before. It is deliberately minimal (the saas landing
+  page had 232 chars of room under the 0.135 ceiling, which did NOT move; one
+  sentence of IMAGES was tightened to fund the rest). What the line leaves out
+  lives where the model meets it: the tool descriptions and each result's `note`.
+  If the hub tools are not in the CLI the line says to use the Build page's
+  Publish button (a CLI needs the hub MCP entry: Hub controls -> MCP servers -> "Enable hub
+  crews in this CLI"; tools/list is dynamic, nothing is enumerated in the entry).
+- **MCP tools** (`hub_mcp.py`, a third slot `_PUBLISH` wired by `init(publish=)`
+  next to `_SWARM`; glue in app.py's `PUBLISH-CLI:` section, `_publish_cli_*`):
+  `publish_start {port, project_dir?, ttl_minutes?}`, `publish_status
+  {project_dir?}`, `publish_stop {id}`, `publish_renew {id, ttl_minutes?}`. The
+  start/renew descriptions carry the consent wording ("CALL ONLY AFTER THE USER
+  SAID YES ... Anyone with the link can open the app, and the link expires").
+  Bad arguments are JSON-RPC -32602; every refusal is tool text with `isError`
+  and `{error, code}`: the engine's `PublishError.code` (no_cloudflared,
+  no_preview, forbidden_port, not_http, too_many, bad_ttl, install_failed,
+  not_found, already_published, disabled) passes through (`no_cloudflared`
+  says the user can install it from the Build page's Publish panel;
+  `already_published` names the running tunnel), plus the glue's own `no_project`
+  (project_dir missing, relative or not a folder: the hub guesses it from
+  `workspace.running()` by port first) and `failed`. A tunnel that is still
+  "starting" is polled (`_PUBLISH_WAIT_SECONDS`, 20 s) so the agent gets the link
+  in the same call; never a link before it is live. `source="agent"` is always
+  passed to the engine.
+- **Safety**: consent lives in the brief AND in every tool description; the link
+  lifetime is the engine's TTL; every agent-started tunnel is logged in hub.log
+  as `[publish] agent started a tunnel for <project name> port <n>` WITHOUT the
+  url (a refusal logs only its code); the setting flag `agent_publish` (default
+  on, `config.get_flag`) is the kill switch: off, the four tools answer
+  `{error, code: "disabled"}` and the brief line is not injected (the engine's
+  own `publish_enabled` flag passes through as its `disabled` error). A Multi
+  helper session never gets the line (`swarm_windows.worker_info`, via
+  `craft.set_publish_source(_publish_brief_allowed)`): it has no user to ask. A
+  hub without `publish.py` answers `disabled` too.

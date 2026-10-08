@@ -148,7 +148,7 @@ ANTI: stopping at "you can now deploy this to Vercel" or "run npm start to see i
 
 IMAGES = """IMAGES — YOU HAVE A LOCAL GENERATOR, USE IT (any task that will show images)
 - Do NOT say you have no image tool and silently fall back to Unsplash. This gateway generates images locally, free, in ~3s. Never claim otherwise.
-- When the build needs pictures, DO NOT STOP TO ASK. Take BOTH (option 3), say in one line which source you used for what, and keep building. Use a different one only if the user already told you which they want. Asking here halted every single website build on turn one, because every website needs pictures:
+- When the build needs pictures, DO NOT STOP TO ASK. Take BOTH (option 3), say in one line which source you used for what, and keep building. Use a different one only if the user already told you which they want. Asking halted every website build on turn one:
   1. FREE STOCK — real photos, no copyright issue (Unsplash/Pexels source URLs). Best for real faces, food, places, anything that must look authentically photographed.
   2. GENERATED — made here from your prompt, unique to this project, no attribution and no licence question. Best for hero art, backgrounds, illustrations, icons, textures, anything abstract or brand-specific.
   3. BOTH — stock for photographic content, generated for hero/abstract/brand art. The default: it is the right answer for a real site, which is why it is taken without asking.
@@ -416,6 +416,42 @@ DESIGN_FIRST = """DESIGN DECISIONS FIRST (web/UI, before any code -- no defaults
 - Copy: the user's real words and facts; missing = [NEEDS INPUT], never lorem."""
 
 
+# PUBLISH_ASK, added 2026-10-08 at the owner's request: when an agent has FINISHED
+# a web app and given the user its LOCAL url, it must ASK whether to also put it
+# online through a free Cloudflare tunnel, and publish ONLY on an explicit yes.
+# Tool-carrying turns of a web/UI deliverable only (a tool-less client cannot
+# call anything). It is deliberately the shortest it can be: the heaviest
+# request (a saas landing page) had 232 chars of room under the 0.135 ceiling in
+# test_craft_briefs, and the ceiling did NOT move for this. What the line leaves
+# out lives where the model meets it at the moment it matters -- the publish_*
+# tool descriptions (consent, "anyone with the link", expiry) and each tool
+# result's `note` (tell the user the URL and when it expires; publish_renew for a
+# new link). Off with the `agent_publish` flag, and never for a Multi helper
+# (it does not talk to the user): app.py registers the predicate.
+PUBLISH_ASK = """PUBLISH (web app running, local URL given): ask once "Publish it online through a free Cloudflare tunnel (temporary public link)? yes/no". Nothing until yes, then hub tool publish_start {port}. No hub tools? Build page's Publish button."""
+
+# Registered by app.py: fn(session_id=None) -> bool (flag on, not a helper).
+# Unregistered (tests, other processes) = on, so the cost tests measure the line.
+_PUBLISH_SOURCE = None
+
+
+def set_publish_source(fn):
+    global _PUBLISH_SOURCE
+    _PUBLISH_SOURCE = fn
+
+
+def publish_wanted(text, session_id=None):
+    """True when the publish question belongs in the brief for `text`."""
+    if not is_web_ui(text):
+        return False
+    if _PUBLISH_SOURCE is None:
+        return True
+    try:
+        return bool(_PUBLISH_SOURCE(session_id))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 # Is this web / UI work? The web_design trigger plus the site nouns that mean a
 # page will be built, and a few non-English forms (the owner writes French).
 # Used by plan_check to decide whether a plan's design gets the slop check;
@@ -468,7 +504,7 @@ def act_message():
     return {"role": "system", "content": ACT_RUN}
 
 
-def system_message(text, tools=True):
+def system_message(text, tools=True, session_id=None):
     """One system message for `text`, or None when nothing applies.
 
     `tools` says whether the CALLER can actually execute a check. It selects
@@ -486,6 +522,11 @@ def system_message(text, tools=True):
     above", so it stands alone with no domain brief present. VERIFY_READ does
     reference ANTI lines, so the tools=False path stays gated on a real hit."""
     hits = match(text)
+    # The publish question (web/UI deliverable, tool-carrying, flag on, not a
+    # Multi helper) rides right after the briefs and BEFORE the loop: the loop
+    # must stay last (its "every brief above" back-references), and this is
+    # about the end of the work, not the loop.
+    pub = [PUBLISH_ASK] if tools and publish_wanted(text, session_id) else []
     # PLAN -> ACT -> VERIFY, in that reading order: plan the work, do the work,
     # check the work. PLAN ships for any TOOL-CARRYING opening turn, in every
     # quality mode -- it used to have a single call site inside the swarm, so
@@ -494,7 +535,7 @@ def system_message(text, tools=True):
     # Tool-less chat is excluded on purpose: a plan is a thing you EXECUTE.
     if not hits:
         return {"role": "system",
-                "content": "\n\n".join([PLAN_PHASES, ACT_RUN, VERIFY_RUN])} if tools else None
+                "content": "\n\n".join(pub + [PLAN_PHASES, ACT_RUN, VERIFY_RUN])} if tools else None
     # The loop goes LAST: it says "every brief above" and "every ANTI line
     # above", and both references dangle if it is prepended.
     # VERIFY_READ checks against "the ANTI lines above", which only built-in
@@ -507,7 +548,7 @@ def system_message(text, tools=True):
     design = [DESIGN_FIRST] if any(n == "web_design" for n, _b in hits) else []
     tail = ([PLAN_PHASES] + design + [ACT_RUN, VERIFY_RUN] if tools
             else design + [VERIFY_READ] if builtin else [])
-    body = "\n\n".join([b for _n, b in hits] + tail)
+    body = "\n\n".join([b for _n, b in hits] + pub + tail)
     return {"role": "system", "content": body}
 
 
