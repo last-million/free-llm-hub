@@ -8672,12 +8672,17 @@ def _route_counts(window):
     return out
 
 
+_FAIR_MIN_PICKS = 6                 # fewer picks than this: a share means nothing
+
+
 def _provider_recent_share(pid, window=900.0):
     """Fraction of routing picks in the last `window` seconds that went to
-    `pid` (0.0 when nothing has been routed)."""
+    `pid`. 0.0 while fewer than _FAIR_MIN_PICKS were routed in that window:
+    after ONE pick its provider held "100%" and yielded the next turn to a
+    model outside the band's spirit (a quiet hub must route as before)."""
     c = _route_counts(window)
     tot = sum(c.values())
-    return (c.get(pid, 0) / tot) if tot else 0.0
+    return (c.get(pid, 0) / tot) if tot >= _FAIR_MIN_PICKS else 0.0
 
 
 def _provider_recent_fails(pid, window=120.0):
@@ -9015,8 +9020,10 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
                       and _chain_reliability_band(c[1], c[2]) < 2]
             if _quick:
                 _quick = [c for c in _quick if _may_lead_agentic(c[0], c[2])] or _quick
-                # Among equally-quick candidates, prefer the least-loaded host.
-                _quick = _fair_spread_band(_quick, est)
+                # Among equally-quick AND equally-good candidates (the top
+                # band -- _fair_spread_band's precondition), prefer the
+                # least-loaded host; never a weaker quick model for load.
+                _quick = _fair_spread_band(_auto_top_band(_quick), est)
                 _s, pid, model = max(_quick, key=_chat_pick_key)
                 _note_route_pick(pid)
                 return pid, model, difficulty

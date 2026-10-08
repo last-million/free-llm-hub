@@ -233,5 +233,7 @@ def test_stream_and_non_stream_walk_the_same_hops(hub):
     A._recent_hop_fail.clear()
     _r1, _b1, plain = _ask(hub, False)
     A._recent_hop_fail.clear()
+    with A._route_log_lock:             # the fairness tie-break reads the
+        A._ROUTE_LOG.clear()            # first request's pick otherwise
     _r2, _b2, streamed = _ask(hub, True)
     assert plain == streamed, (plain, streamed)

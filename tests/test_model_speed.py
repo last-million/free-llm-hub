@@ -142,7 +142,7 @@ def test_a_response_without_a_clock_is_ignored_not_guessed():
 
 def test_the_streaming_dispatch_starts_the_clock():
     src = open("app.py", encoding="utf-8").read()
-    body = src.split("def _dispatch_chat(", 1)[1][:1600]
+    body = src.split("def _dispatch_chat(", 1)[1][:2400]
     assert "_hub_started = started" in body
 
 

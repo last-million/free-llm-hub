@@ -39,6 +39,13 @@ def _clear_recent_hop_failures():
         other = getattr(mod, name, None) if mod else None
         if isinstance(other, dict):
             other.clear()
+    # PROVIDER FAIRNESS: the routing-pick log and the in-flight counter are
+    # process-wide too; one test's picks would make the next one's tie-break
+    # prefer a different provider (load-aware spread inside the top band).
+    for name in ("_ROUTE_LOG", "_PROVIDER_INFLIGHT"):
+        other = getattr(mod, name, None) if mod else None
+        if other is not None and hasattr(other, "clear"):
+            other.clear()
     # DEAD KEYS (quota.mark_key_dead / note_key_auth_failure): tests share fake
     # key strings ("k1", "sk-test"...), so one test's dead mark would drop that
     # key from usable_keys in the next.

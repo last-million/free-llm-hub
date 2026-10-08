@@ -637,3 +637,36 @@ def test_outside_a_pipeline_a_stage_keeps_its_own_deadline(monkeypatch):
     _stage_fakes(monkeypatch, seen)
     A._swarm_dispatch([{"role": "user", "content": "x"}], 100)
     assert seen == [A._SWARM_HOP_DEADLINE]
+
+
+def test_one_routed_pick_does_not_make_its_provider_a_hog():
+    """Fairness reads a provider's share of recent picks; after ONE pick that
+    share was 100% and the next turn left the best model for a weaker one."""
+    with A._route_log_lock:
+        A._ROUTE_LOG.clear()
+    A._note_route_pick("pa")
+    assert A._provider_recent_share("pa") == 0.0
+    for _ in range(A._FAIR_MIN_PICKS):
+        A._note_route_pick("pa")
+    assert A._provider_recent_share("pa") == 1.0
+    with A._route_log_lock:
+        A._ROUTE_LOG.clear()
+
+
+def test_a_loaded_host_never_hands_a_simple_turn_to_a_weaker_quick_model(fleet, monkeypatch):
+    """The quick pick narrows by load only inside the top band."""
+    scores = {"pa-r1": 140.0, "pb-r1-mini": 135.0, "pa-chat": 100.0, "pb-chat": 90.0,
+              "pc-r-fast": 80.0}
+    monkeypatch.setattr(A, "_benchmark_score", lambda pid, m: scores[m])
+    monkeypatch.setattr(A, "_active_mode", lambda: A.MODE_ALL)
+    monkeypatch.setattr(A, "_may_lead_agentic", lambda s, m: True)
+    with A._inflight_lock:
+        A._PROVIDER_INFLIGHT["pa"] = 9          # pa far over the soft cap
+    try:
+        msgs = [{"role": "user", "content": "Use the add tool to add 17 and 25"}]
+        _pid, model, diff = A._route_by_difficulty(msgs, None, 600, require_tools=True)
+    finally:
+        with A._inflight_lock:
+            A._PROVIDER_INFLIGHT.clear()
+    assert diff == "simple"
+    assert model == "pa-chat", model
