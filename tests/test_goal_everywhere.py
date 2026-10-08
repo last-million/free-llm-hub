@@ -61,8 +61,13 @@ def test_start_feeds_the_planner_the_goal_brief(tmp_path, monkeypatch):
                    lambda *a, **k: None, lambda *a, **k: iter(()),
                    planner=planner, goal_brief="GOAL: fix the thing well",
                    review=False)
-    assert "GOAL: fix the thing well" in seen.get("user", "")
-    assert SW.get(rid).goal_brief == "GOAL: fix the thing well"
+    try:
+        assert "GOAL: fix the thing well" in seen.get("user", "")
+        assert SW.get(rid).goal_brief == "GOAL: fix the thing well"
+    finally:
+        # _walk is stubbed, so the run would stay PENDING in the registry for
+        # the rest of the session (the self-update tests then see it busy).
+        SW._RUNS.pop(rid, None)
 
 
 # --------------------------------------------------------------------------- #
