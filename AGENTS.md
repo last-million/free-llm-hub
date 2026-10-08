@@ -2460,6 +2460,17 @@ behaviour with its flag off. Covered by `tests/test_cli_build_parity.py`.
   update PROGRESS.md after EACH step (ceiling in
   `tests/test_craft_briefs.py::test_worst_case_brief_cost` stays 0.135).
 
+## Children never get the hub's port (2026-10-08)
+
+run.bat/run.sh export `PORT=8787` for the hub, and every agent / subscription
+CLI inherited it: an agent's `npm run dev` (vite.config `port: process.env.PORT`)
+bound `[::]:8787` beside the hub, and the next restart refused to start (run.bat
+saw the port taken). `agentic_chat.strip_hub_port_vars` drops `PORT`, `VITE_PORT`,
+`FLASK_RUN_PORT` when they hold the hub's port, in `_agentic_env` and `app._sub_env`;
+other values pass, the hub's own environment is untouched, previews still set
+their own PORT (`workspace._env_for`). Covered by
+`tests/test_children_never_get_the_hub_port.py`.
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):

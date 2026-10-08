@@ -6254,6 +6254,7 @@ def _sub_env(pid=None, model=None):
     for k in list(env.keys()):
         if _points_at_hub(env.get(k)):
             env.pop(k, None)
+    agentic_chat.strip_hub_port_vars(env)      # a CLI's dev server: not the hub's port
     if pid and _sub_isolated_on(pid):
         cfg = _SUB_PROVIDERS.get(pid) or {}
         cli_id = cfg.get("cli_id")

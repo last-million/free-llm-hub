@@ -671,6 +671,26 @@ def _points_at_hub(val) -> bool:
     return isinstance(val, str) and any(fr in val for fr in _hub_fragments())
 
 
+# THE HUB'S OWN PORT, AS A BARE NUMBER. run.bat / run.sh export PORT=8787 for
+# the hub itself, and every child inherited it: _points_at_hub only matches
+# host:port values, never a bare "8787". MEASURED 2026-10-08: an agent's
+# `npm run dev` in a Build project whose vite.config reads process.env.PORT
+# bound [::]:8787 next to the hub; at the next restart run.bat saw the port
+# taken and refused to start the hub at all. A dev server an agent starts must
+# pick its own port (the preview sets PORT itself, workspace._env_for).
+_HUB_PORT_VARS = ("PORT", "VITE_PORT", "FLASK_RUN_PORT")
+
+
+def strip_hub_port_vars(env: dict) -> dict:
+    """Drop the port variables that hold the hub's own port. Other values (a
+    user's PORT=3000) pass through. Mutates and returns `env`."""
+    hub = str(_port())
+    for k in _HUB_PORT_VARS:
+        if str(env.get(k, "")).strip() == hub:
+            env.pop(k, None)
+    return env
+
+
 # Where each CLI keeps its own settings and credentials, and the env var that
 # moves it. Isolation is only half done without this: running the hub's own
 # COPY of a binary while it reads ~/.claude means an agent session can still
@@ -723,6 +743,7 @@ def _agentic_env(cli_id: str = None, project_dir: str = None,
     for k in list(env.keys()):
         if _points_at_hub(env.get(k)):
             env.pop(k, None)
+    strip_hub_port_vars(env)
     if project_dir:
         env["PWD"] = project_dir
     if cli_id and _isolated_bin(cli_id):
