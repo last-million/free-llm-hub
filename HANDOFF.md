@@ -11,8 +11,8 @@ is only: current state, how to operate, owner rules, open items.
 | | |
 |---|---|
 | Branch | `main` after the 2026-10-08 merge (see `git log`), in sync with `origin/main` (another session's landing-page edits are uncommitted: `app.py` `/`+`/hub` routes, `make_landing.py`, `templates/landing.html`, `static/*.webp|jpg` — LEAVE THEM, and never `git add -A`: use explicit paths) |
-| Running hub | `fd3dc1e` on `127.0.0.1:8787` until the next restart: `0b98a88` and the 2026-10-08 batch are NOT live before it |
-| Tests | 7094 passed, 1 skipped, 2 order-dependent self-update failures fixed after (`e75688a`, leaked stub run) — 2026-10-08 |
+| Running hub | `bf08bc5` on `127.0.0.1:8787` until the next restart. NOT live yet: the port fix (`7b953de`) and the whole evening batch below (DNS, old-result clearing, oversized conversations, planner bounds) |
+| Tests | 7310 passed, 1 skipped on the merged branch before the planner commit (2026-10-08 evening); the planner + diagnostic commits ran targeted tests only |
 | Keys | 42 provider keys in `config.load_config()` (check after every restart, never print values) |
 | Open PR | #4 by `osumtr-web`: an improved version landed on `main` (`74c3fde`); the PR is NOT approved/closed yet, see "Open items" |
 
@@ -48,6 +48,38 @@ unless its "Continue by itself after a restart" box is ticked.
 - Ranking choices made by the owner (do not "fix" them from benchmarks alone):
   Kimi K3 top free model (138.1, just above GLM 5.3's 138); Space Bunny 137.7;
   subscription scope `manager_only` (manager model: sonnet when re-enabled).
+
+## What changed 2026-10-08 evening (errors seen in /agent and the CLIs)
+
+Trigger: the owner saw `error · 200`, `error · 503` and `error · 504` in /agent and
+the CLIs. Evidence-first; headlines, details in `AGENTS.md`.
+
+- **Build `error · 200`/`503`** = ONE Codex conversation (session `c39a30c1`) stuck at
+  ~504K estimated tokens for hours (no model holds more than 262K): the hub's native
+  context-length reply shows as 200 (a `response.failed` inside a 200 stream), and the
+  chain walk over default-window relays (each got a ~2 MB upload) ended in 503 after
+  85-265 s. WHY it never compacted is NOT proven (served turns report usage correctly;
+  Codex's own compaction request is served trimmed). `e019d96`: the front door refuses
+  such a request with zero hops and no upload on all 3 protocols (`_front_door_overflow`),
+  a session pin on a too-small model is dropped, Build says "context too long" with a
+  Continue button, and swarm/crew/multi tool tiers now report usage (they reported 0/40000).
+- **CLI `error · 503`**: one burst on 2026-10-08 02:48 UTC was `NameResolutionError` on three
+  hosts at once, one second after the hub uploaded a ~2 MB body. The DNS cause is a
+  HYPOTHESIS from one event (only 2 log lines carry it); a clean 72-lookup test minutes later
+  had 0 failures. `f5da506`: `netresolve.py` reuses the last good address when the resolver
+  fails (flag `dns_stale_cache`), a local-network failure is filed against no provider, the
+  chain pauses and re-walks once, and the 503 says it is this computer's DNS.
+- **CLI `error · 504`** on ~85K-token tool turns (nvidia kimi-k3 slower than the 106 s hop
+  budget): `36e42bb` clears OLD tool outputs above 60K tokens (flag `old_tool_result_clearing`,
+  default on; synthetic 85K history -82% tokens; reported usage stays sized on the original).
+  KNOWN GAP: the `window too small` exclusions still use the pre-clear estimate.
+- **Multi planning took 9 minutes** (two empty planner replies after 190 s / 138 s):
+  `10b49a3`: planner hops 90 s, an empty reply hands over inside the attempt, thinking models
+  get low effort + 1024 tokens, the optional dry-run re-ask is capped (flag
+  `planner_time_bounds`). The reason for the empties was NOT observable (no per-hop planner
+  log existed); a `[plan] hops` log line now records it.
+- **Hub port inherited by agent CLIs** (`7b953de`): an agent's `npm run dev` took 8787 and
+  `run.bat` then refused to start the hub. `agentic_chat.strip_hub_port_vars`.
 
 ## What changed 2026-10-07 → 2026-10-08
 
@@ -179,6 +211,13 @@ All in `AGENTS.md` with tests; headlines only:
    SECURITY: the Windows Credential Manager entry for `git:https://github.com`
    belongs to ANOTHER account (`jaddireda4-design`, admin scopes); it was not
    used. The owner was told to remove it if it is not theirs.
+1b. **Owner decisions pending (2026-10-08):** (a) the "compact trick": answer an oversized
+   request with a SHORT SUCCESSFUL reply whose usage is over Codex's compact limit so Codex
+   compacts by itself (works around an unverified Codex behaviour and adds a hub-written
+   line to the conversation); (b) the CLI-declared window dips to 32000 for 90 min after a
+   one-tick provider dip (a decrease applies at once by design, a raise waits
+   `_DECLARED_RAISE_AFTER`); a log-only `[ctx] declared window inputs` line now says why;
+   decide on a policy change after reading it.
 2. **Codex subscription** is not signed in inside the hub's isolated folder;
    the owner must run (PowerShell):
    `$env:CODEX_HOME = "$HOME\.free-llm-hub\isolated-clis\codex\config"; & "$HOME\.free-llm-hub\isolated-clis\codex\install\codex.CMD" login`
