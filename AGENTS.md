@@ -3157,6 +3157,52 @@ started and nothing contacts Cloudflare in tests).
   helper session never gets the line (`swarm_windows.worker_info`, via
   `craft.set_publish_source(_publish_brief_allowed)`): it has no user to ask. A
   hub without `publish.py` answers `disabled` too.
+- **Which port an agent may publish** (security fix 2026-10-08; the server
+  cannot see the chat, so "only after the user said yes" is a request to the
+  model, not a control). `publish_start` calls
+  `_publish_port_is_project_server(folder, port)` BEFORE the engine and refuses
+  with `{error: "Only a server running from the project folder <name> can be
+  published. Start the app from that folder, then ask again.", code:
+  "not_project_server"}` (hub.log: `[publish] agent start refused
+  (not_project_server) for <project> port <n>`, no url; the helper is
+  `_publish_cli_fail`, never the HTTP routes' `_publish_fail`). Allowed ONLY
+  when (a) the hub's OWN preview of that folder runs on that port
+  (`workspace.running()`, `state` running, not `external`: an ADOPTED preview
+  does not count, because `workspace.adopt` takes the agent's printed url and
+  fails open when nothing contradicts it), or (b) EVERY process listening on
+  that port has its working directory inside the folder, or a parent up to three
+  levels up does (npm -> node). Compared by whole path components on
+  `normcase(realpath(..))` (`proj` does not contain `proj-evil`). Fails closed:
+  unreadable working directory, no listener, a listener psutil cannot name, psutil
+  missing, any error = refused. Listeners count when bound to loopback OR a
+  wildcard (`0.0.0.0`, `::`; Node's `listen(port)` binds `::`); all of them must
+  pass because a specific bind can beat a wildcard one. Where the system-wide
+  socket table needs root (macOS) each process is asked about its own sockets. A
+  folder that is a filesystem root, the user's home or anything above it is
+  refused outright (the folder is the agent's own argument). `publish_renew`,
+  `publish_status`, `publish_stop` are unchanged, and the dashboard's Publish
+  button (`/api/publish/start`, `confirm: true`) is a human click and does not
+  pass through this rule. **Strict mode**: setting `agent_publish_requires_approval`
+  (`config.get_flag`, default OFF; an unreadable config counts as ON): `publish_start`
+  starts nothing, records the request in memory (one per project + port, kept 10
+  minutes, asking again does not restart the clock; at most 20) and answers
+  `{pending: true, note: "Waiting for the user to approve this in the Build
+  page's Publish panel."}`; only a request that passed the port rule is recorded.
+  Approval is the user pressing Publish for that project and port:
+  `GET /api/publish` lists `pending_agent_requests` (`project_dir`, `port`,
+  `requested_at`; honours `?project_dir=`), and an entry is dropped when its
+  project + port has a live tunnel or when `/api/publish/start` starts one. A
+  second `publish_start` for a port that is already live returns that link.
+  Covered by `tests/test_publish_agent_port_rules.py` (fake psutil, no sockets).
+  **Residual risk, in plain words**: after the user's yes, ANY process that runs
+  from that project folder can be published (a dev server, an admin page the
+  project itself ships); and an agent can pass any folder it likes, so a
+  prompt-injected agent can still publish the app it was asked to build, or a
+  service that happens to run from some other non-broad folder it names. It can
+  no longer publish an arbitrary local service by port alone (a database admin
+  page on 8080 that runs from its own folder is refused while the agent names the
+  project's folder). Strict mode closes the rest: nothing goes online without the
+  user's own click.
 
 ## Publish button in the Build page (2026-10-08)
 

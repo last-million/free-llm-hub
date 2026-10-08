@@ -21470,11 +21470,16 @@ def api_hub_desktop_shortcut():
 # This section is thin glue: it never starts a process, it imports `publish`
 # lazily (the engine is its own module) and turns every outcome into a compact
 # dict the model can read -- `{error, code}` on any refusal. Safety: consent is
-# in the brief AND in every tool description, the engine caps the lifetime,
-# every agent-started tunnel is logged in hub.log WITHOUT its url, and the
-# setting flag `agent_publish` (default on) switches the tools to
-# `disabled` and takes the brief line out. Covered by
-# tests/test_publish_cli_flow.py.
+# asked in the brief AND in every tool description (the server cannot see the
+# chat, so that part is only a request to the model); what the SERVER enforces
+# is WHICH PORT an agent may publish (`_publish_port_is_project_server`: only a
+# server running from the project folder; fail closed), the engine caps the
+# lifetime, every agent-started tunnel is logged in hub.log WITHOUT its url, and
+# the setting flag `agent_publish` (default on) switches the tools to
+# `disabled` and takes the brief line out. The flag
+# `agent_publish_requires_approval` (default off) makes publish_start only
+# RECORD a request that the user approves with the Publish button. Covered by
+# tests/test_publish_cli_flow.py and tests/test_publish_agent_port_rules.py.
 
 _PUBLISH_WAIT_SECONDS = 20.0     # how long publish_start waits for the link
 _PUBLISH_POLL_SECONDS = 0.5
@@ -21651,6 +21656,246 @@ def _publish_guess_dir(port):
     return None
 
 
+# Which ports an AGENT may publish (server-side, fail closed). The brief asks the
+# model to get a yes first, but the server cannot see the chat: a prompt-injected
+# agent could otherwise publish ANY local HTTP service (a database admin page on
+# 8080). So publish_start only goes through for a server that runs FROM the
+# project folder. The dashboard's Publish button (the /api/publish/* routes)
+# keeps its own explicit-click consent and does not pass through here.
+_PUBLISH_PENDING_TTL = 600.0       # a held request lives 10 minutes
+_PUBLISH_PENDING_MAX = 20
+_PUBLISH_PARENT_LEVELS = 3         # npm -> node: the listener's ancestors we read
+_PUBLISH_PENDING_NOTE = ("Waiting for the user to approve this in the Build "
+                         "page's Publish panel.")
+_PUBLISH_PENDING = {}              # (real folder, port) -> {project_dir, port, requested_at}
+_PUBLISH_PENDING_LOCK = threading.Lock()
+
+
+def _publish_clock():
+    return time.time()
+
+
+def _publish_real(path):
+    """One spelling of a folder for comparing: absolute, symlinks resolved, case
+    folded on Windows."""
+    return os.path.normcase(os.path.realpath(os.path.abspath(str(path))))
+
+
+def _publish_inside(folder, path):
+    """`path` is `folder` or lives under it, by whole path components
+    (`C:\\proj` does not contain `C:\\proj-evil`). Never a string prefix; paths on
+    another drive are simply not inside."""
+    try:
+        a, b = _publish_real(folder), _publish_real(path)
+        return os.path.commonpath([a, b]) == a
+    except (ValueError, OSError, TypeError):
+        return False
+
+
+def _publish_folder_too_broad(folder):
+    """A filesystem root, the user's home or anything above it: "inside" such a
+    folder is nearly every process, so it can never be a project folder (the
+    folder is the agent's own argument)."""
+    f = _publish_real(folder)
+    if os.path.dirname(f) == f:
+        return True
+    try:
+        home = os.path.expanduser("~")
+    except Exception:                                            # noqa: BLE001
+        return True
+    return home in ("", "~") or _publish_inside(f, home)
+
+
+def _publish_reaches_loopback(ip):
+    """127.x / ::1 and the wildcard binds (0.0.0.0, ::): Node's listen(port) binds
+    `::`, and a wildcard socket answers on loopback too."""
+    try:
+        addr = ipaddress.ip_address(str(ip).split("%")[0])
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    return bool(addr.is_loopback or addr.is_unspecified)
+
+
+def _publish_is_listener_on(psutil, conn, port):
+    laddr = getattr(conn, "laddr", None)
+    if not laddr or getattr(conn, "status", None) != getattr(psutil, "CONN_LISTEN", "LISTEN"):
+        return False
+    return (getattr(laddr, "port", None) == port
+            and _publish_reaches_loopback(getattr(laddr, "ip", "")))
+
+
+def _publish_listener_pids(psutil, port):
+    """Every pid listening on `port` where a loopback connection can land (None
+    stands for "a listener we cannot name"), or None when the machine's
+    sockets cannot be listed at all.
+
+    The system-wide table needs root on macOS (and some Linux setups), so on a
+    failure each process is asked about its own sockets: that works for the
+    user's own processes, which is where a project's server runs."""
+    pids = set()
+    try:
+        for c in psutil.net_connections(kind="tcp"):
+            if _publish_is_listener_on(psutil, c, port):
+                pids.add(getattr(c, "pid", None) or None)
+        return pids
+    except Exception:                                            # noqa: BLE001
+        pids = set()
+    try:
+        procs = list(psutil.process_iter(["pid"]))
+    except Exception:                                            # noqa: BLE001
+        return None
+    for proc in procs:
+        try:
+            get = getattr(proc, "net_connections", None) or proc.connections
+            conns = get(kind="tcp")
+        except Exception:                                        # noqa: BLE001
+            continue                      # not ours / gone: cannot be the project's
+        if any(_publish_is_listener_on(psutil, c, port) for c in conns):
+            pids.add(getattr(proc, "pid", None) or None)
+    return pids
+
+
+def _publish_pid_in_folder(psutil, pid, folder):
+    """The process, or one of its first three ancestors (npm -> node), runs from
+    inside `folder`. A working directory that cannot be read (another user's
+    process, a process that just exited) is "no", never "maybe"."""
+    if not pid:
+        return False
+    try:
+        proc = psutil.Process(pid)
+    except Exception:                                            # noqa: BLE001
+        return False
+    seen = set()
+    for _ in range(_PUBLISH_PARENT_LEVELS + 1):
+        marker = getattr(proc, "pid", None)
+        if marker in seen:
+            return False
+        seen.add(marker)
+        try:
+            cwd = proc.cwd()
+        except Exception:                                        # noqa: BLE001
+            return False
+        if not cwd:
+            return False
+        if _publish_inside(folder, cwd):
+            return True
+        try:
+            proc = proc.parent()
+        except Exception:                                        # noqa: BLE001
+            return False
+        if proc is None or getattr(proc, "pid", None) in (0, 1):
+            return False
+    return False
+
+
+def _publish_port_is_project_server(folder, port):
+    """May an agent publish `port` for the project in `folder`? Only when it is
+    that project's own server:
+
+      (a) the hub's own preview of this folder runs on that port (a server the
+          hub started; an ADOPTED preview does not count here -- the hub adopts
+          on the agent's printed url when nothing contradicts it, so the
+          registry cannot vouch for it), or
+      (b) every process listening on that port has its working directory inside
+          `folder` (or a parent up to three levels up does).
+
+    Fails closed: an unreadable working directory, no listener, a listener we
+    cannot name, psutil missing or any error is "no"."""
+    try:
+        if _publish_folder_too_broad(folder):
+            return False
+        want = _publish_real(folder)
+        try:
+            for r in workspace.running() or []:
+                if (isinstance(r, dict) and not r.get("external") and r.get("port") == port
+                        and r.get("project_dir") and r.get("state", "running") == "running"
+                        and _publish_real(r["project_dir"]) == want):
+                    return True
+        except Exception:                                        # noqa: BLE001
+            pass                                  # (b) can still prove it
+        try:
+            import psutil
+        except ImportError:
+            return False
+        pids = _publish_listener_pids(psutil, port)
+        if not pids:
+            return False
+        return all(_publish_pid_in_folder(psutil, pid, folder) for pid in pids)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _publish_requires_approval():
+    """Strict mode (default OFF): publish_start only records a request. Unreadable
+    config reads as ON -- the safer side."""
+    try:
+        return bool(config.get_flag("agent_publish_requires_approval", False))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _publish_pending_add(folder, port):
+    """Record "an agent asked to publish this" (one per project + port, kept 10
+    minutes; asking again does not restart the clock)."""
+    now = _publish_clock()
+    with _PUBLISH_PENDING_LOCK:
+        for k in [k for k, v in _PUBLISH_PENDING.items()
+                  if now - v["requested_at"] > _PUBLISH_PENDING_TTL]:
+            del _PUBLISH_PENDING[k]
+        key = (_publish_real(folder), port)
+        if key not in _PUBLISH_PENDING:
+            while len(_PUBLISH_PENDING) >= _PUBLISH_PENDING_MAX:
+                del _PUBLISH_PENDING[min(_PUBLISH_PENDING,
+                                         key=lambda k: _PUBLISH_PENDING[k]["requested_at"])]
+            _PUBLISH_PENDING[key] = {"project_dir": os.path.abspath(folder), "port": port,
+                                     "requested_at": now}
+
+
+def _publish_pending_clear(project_dir, port):
+    """The user pressed Publish for this project + port: the request is answered."""
+    try:
+        with _PUBLISH_PENDING_LOCK:
+            _PUBLISH_PENDING.pop((_publish_real(project_dir), port), None)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _publish_pending_list(project_dir=None, tunnels=None):
+    """What `GET /api/publish` shows as `pending_agent_requests`: unexpired
+    requests (optionally one project's), minus any whose project + port now has a
+    live or starting tunnel -- those were approved, and are forgotten."""
+    now = _publish_clock()
+    want = _publish_real(project_dir) if project_dir else None
+    active = set()
+    for t in tunnels or []:
+        if isinstance(t, dict) and t.get("state") in ("live", "starting") and t.get("project_dir"):
+            active.add((_publish_real(t["project_dir"]), t.get("port")))
+    out = []
+    with _PUBLISH_PENDING_LOCK:
+        for k, v in list(_PUBLISH_PENDING.items()):
+            if now - v["requested_at"] > _PUBLISH_PENDING_TTL or k in active:
+                del _PUBLISH_PENDING[k]
+            elif want is None or k[0] == want:
+                out.append(dict(v))
+    out.sort(key=lambda v: v["requested_at"])
+    return out
+
+
+def _publish_active_tunnel(eng, folder, port):
+    """The live / starting tunnel for this project + port, or None."""
+    try:
+        for t in (eng.status(folder) or {}).get("tunnels") or []:
+            if isinstance(t, dict) and t.get("port") == port \
+                    and t.get("state") in ("live", "starting"):
+                return t
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
 def _publish_cli_start(port, project_dir=None, ttl_minutes=None):
     pub, eng, refused = _publish_gate()
     if refused:
@@ -21662,6 +21907,20 @@ def _publish_cli_start(port, project_dir=None, ttl_minutes=None):
                           "built the app in.")
     folder = os.path.abspath(folder)
     name = _publish_project_name(folder)
+    if not _publish_port_is_project_server(folder, port):
+        _log.info("[publish] agent start refused (not_project_server) for %s port %s",
+                  name, port)
+        return _publish_cli_fail(
+            "not_project_server",
+            "Only a server running from the project folder %s can be published. "
+            "Start the app from that folder, then ask again." % name)
+    if _publish_requires_approval():
+        live = _publish_active_tunnel(eng, folder, port)
+        if live is not None:                    # the user already approved it
+            return _publish_result(live)
+        _publish_pending_add(folder, port)
+        _log.info("[publish] agent start held for approval for %s port %s", name, port)
+        return {"pending": True, "note": _PUBLISH_PENDING_NOTE}
     try:
         tunnel = eng.start(folder, port=port, ttl_minutes=ttl_minutes, source="agent")
     except Exception as exc:                                     # noqa: BLE001
@@ -39391,8 +39650,18 @@ def _publish_id(body):
 @app.route("/api/publish", methods=["GET"])
 def api_publish_status():
     """Every tunnel (optionally one project's), the cloudflared state and the
-    limits. `?project_dir=` filters."""
-    return _publish_json(publish.default.status(request.args.get("project_dir") or None))
+    limits. `?project_dir=` filters. `pending_agent_requests` lists what an agent
+    asked to publish while `agent_publish_requires_approval` is on (the Publish
+    button is the approval)."""
+    project_dir = request.args.get("project_dir") or None
+    st = publish.default.status(project_dir)
+    if isinstance(st, dict):
+        st = dict(st)
+        try:
+            st["pending_agent_requests"] = _publish_pending_list(project_dir, st.get("tunnels"))
+        except Exception:                                        # noqa: BLE001
+            st["pending_agent_requests"] = []
+    return _publish_json(st)
 
 
 @app.route("/api/publish/start", methods=["POST"])
@@ -39410,6 +39679,8 @@ def api_publish_start():
             source="agent" if body.get("source") == "agent" else "build")
     except publish.PublishError as exc:
         return _publish_fail(exc)
+    if isinstance(tunnel, dict) and tunnel.get("project_dir"):
+        _publish_pending_clear(tunnel["project_dir"], tunnel.get("port"))
     return _publish_json({"ok": True, "tunnel": tunnel})
 
 

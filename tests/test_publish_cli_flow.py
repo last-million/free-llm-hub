@@ -119,6 +119,10 @@ def engine(monkeypatch):
     monkeypatch.setitem(sys.modules, "publish", mod)
     monkeypatch.setattr(A, "_PUBLISH_POLL_SECONDS", 0)
     monkeypatch.setattr(A, "_PUBLISH_WAIT_SECONDS", 1)
+    # This file tests the tool glue, not the port rule: the rule (a listener
+    # running from the project folder) has its own file,
+    # test_publish_agent_port_rules.py, which does NOT use this fixture.
+    monkeypatch.setattr(A, "_publish_port_is_project_server", lambda folder, port: True)
     return eng
 
 
