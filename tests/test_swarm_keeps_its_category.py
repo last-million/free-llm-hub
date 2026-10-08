@@ -201,7 +201,9 @@ def test_the_multi_session_planner_uses_the_conversation_category(global_all,
 def test_every_planner_call_site_is_bound():
     src = open("app.py", encoding="utf-8").read()
     assert "planner=_swarm_windows_planner," not in src
-    assert src.count("planner=_pipeline_bound(_swarm_windows_planner") == 3
+    # MCP start, REST start, the conversation's Multi turn, and the heartbeat
+    # start site (_hb_start_run, bound to the schedule's mode).
+    assert src.count("planner=_pipeline_bound(_swarm_windows_planner") == 4
 
 
 # --------------------------------------------------------------------------- #
