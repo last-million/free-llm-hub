@@ -11,8 +11,8 @@ is only: current state, how to operate, owner rules, open items.
 | | |
 |---|---|
 | Branch | `main` after the 2026-10-08 merge (see `git log`), in sync with `origin/main` (another session's landing-page edits are uncommitted: `app.py` `/`+`/hub` routes, `make_landing.py`, `templates/landing.html`, `static/*.webp|jpg` — LEAVE THEM, and never `git add -A`: use explicit paths) |
-| Running hub | `bf08bc5` on `127.0.0.1:8787` until the next restart. NOT live yet: the port fix (`7b953de`) and the whole evening batch below (DNS, old-result clearing, oversized conversations, planner bounds) |
-| Tests | 7310 passed, 1 skipped on the merged branch before the planner commit (2026-10-08 evening); the planner + diagnostic commits ran targeted tests only |
+| Running hub | `eebe22b` on `127.0.0.1:8787` (restarted 2026-10-08 ~04:20 UTC; the owner's Multi run resumed by itself). NOT live yet: everything in "What changed 2026-10-08 night" below (ranking, publish, graceful update, fewer wasted hops) |
+| Tests | 7812 passed, 2 skipped, 0 failed on the final merge (2026-10-08 night, 11.5 min; pytest exit code 0) |
 | Keys | 42 provider keys in `config.load_config()` (check after every restart, never print values) |
 | Open PR | #4 by `osumtr-web`: an improved version landed on `main` (`74c3fde`); the PR is NOT approved/closed yet, see "Open items" |
 
@@ -48,6 +48,37 @@ unless its "Continue by itself after a restart" box is ticked.
 - Ranking choices made by the owner (do not "fix" them from benchmarks alone):
   Kimi K3 top free model (138.1, just above GLM 5.3's 138); Space Bunny 137.7;
   subscription scope `manager_only` (manager model: sonnet when re-enabled).
+
+## What changed 2026-10-08 night
+
+Details in `AGENTS.md` (one section each, appended at the end). Headlines:
+
+- **Publish online** (free Cloudflare quick tunnel; `publish.py`, 5 routes `/api/publish*`,
+  Build-page button with countdown, MCP tools `publish_*` + a one-line ask in the briefs):
+  explicit click or an explicit YES in the CLI, TTL 15 min-24 h (default 1 h) enforced by the hub,
+  new link any time, the URL is never logged, only a project's own preview (never the hub port),
+  at most 3 tunnels. `cloudflared` is NOT installed on this PC: the Publish panel's Install button
+  downloads the official release only after a click and refuses without a matching SHA-256.
+  NEVER run against the real Cloudflare yet: every test used a fake. First real run = owner's call.
+- **Newest and biggest first inside a family** (`modelrank.py`): higher version first, Opus > Sonnet >
+  Haiku (Haiku a small model), older generations stay as fallbacks. Two real bugs fixed: weaker relay
+  copies took all 3 relay slots; one failure marked a pair "measured to fail" for ~1.8 h. The g4f
+  relay (the only route to Claude 5 / GPT-6) is PARKED by its own gateway until ~21 h out, so they
+  cannot serve until it unparks. OPEN DECISION: every g4f row loses 29 points in the agentic score
+  (`_sustain_penalty` reads "5 per minute" as per day); fixing it also lifts llm7/navy/nararouter.
+- **Fewer wasted hops**: the 173 "HTTP 400" on uncloseai Qwen3.8 were the hub sending several system
+  messages (the template wants one, first) -> merged and retried; spread/rotation no longer leave the
+  band for a weak leftover; 3 identical failures rest a pair (doubling, cap 6 h, still a last resort);
+  `wasted_calls` + `scripts/role_eval.py` summary. Before: 2.40 calls/turn, ~32% wasted.
+- **Graceful updates**: an update drains new work (503 + Retry-After), lets running work finish (max 10
+  min), writes `update-resume.json`, restarts, and every cut conversation continues by itself with a
+  notice. `POST /api/hub/restart {resume, drain}` is the safe way to restart. CLI retry evidence:
+  Claude Code/opencode/kimi-code retry 503 (~2.5-5 min); Codex is UNVERIFIED (a long update may show an
+  error in a TERMINAL Codex; Build conversations resume through the marker either way).
+- **Merge lessons**: two agents defined `_publish_fail` in app.py (later def won, 21 failures); strict
+  one-argument test stubs broke when the brief gained `session_id`; an agent's test assumed its
+  AGENTS.md section was last. Give each parallel agent unique helper names (prefix) and never assert
+  "last section".
 
 ## What changed 2026-10-08 evening (errors seen in /agent and the CLIs)
 
@@ -225,6 +256,12 @@ All in `AGENTS.md` with tests; headlines only:
    token stored encrypted like provider keys, secret scan + .gitignore before the first
    push, never force-push, hermetic tests with a fake GitHub API. This PC has no usable
    GitHub API auth today (see item 1).
+1d. **Smaller follow-ups from the night batch:** the `window too small` exclusions still use the
+   pre-clear token estimate (a 65K model could hold a cleared 85K turn); `.btn.primary` is white on
+   `#16A34A` = 3.3:1 in the light theme (below 4.5:1, pre-existing, now also on Publish); the
+   `[ctx] declared window inputs:` log line now says why a CLI-declared window dips to 32000 (read it
+   before changing that policy); groq `RequestException` (49 in 24 h) is not root-caused; the
+   verifier gave no usable verdict on 72% of its runs (kimi-k3 and muse-glimmer left its pool).
 2. **Codex subscription** is not signed in inside the hub's isolated folder;
    the owner must run (PowerShell):
    `$env:CODEX_HOME = "$HOME\.free-llm-hub\isolated-clis\codex\config"; & "$HOME\.free-llm-hub\isolated-clis\codex\install\codex.CMD" login`
