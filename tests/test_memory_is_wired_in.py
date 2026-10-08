@@ -206,7 +206,7 @@ def test_memory_alone_is_enough_to_write_the_file(tmp_path, monkeypatch):
     """A task with no craft brief still has a conversation to remember. The
     brief is stubbed out because craft matches on every string today -- that is
     a craft decision, not one this path may assume."""
-    monkeypatch.setattr(AC.craft, "system_message", lambda text: None)
+    monkeypatch.setattr(AC.craft, "system_message", lambda text, *a, **k: None)
     sess = AC._Session("claude", str(tmp_path))
     memory.remember_fact(sess.id, "MUST stay on Postgres")
     assert AC.write_task_brief(str(tmp_path), "zzzz",
@@ -218,7 +218,7 @@ def test_with_nothing_else_the_brief_still_names_the_folder(tmp_path, monkeypatc
     """It used to write nothing when no standard matched and the memory was
     empty. The project-folder line applies to every turn (see
     test_the_work_continues_where_it_stopped), so the file is always there."""
-    monkeypatch.setattr(AC.craft, "system_message", lambda text: None)
+    monkeypatch.setattr(AC.craft, "system_message", lambda text, *a, **k: None)
     assert AC.write_task_brief(str(tmp_path), "zzzz", memory_block="") == AC.BRIEF_FILENAME
     body = (tmp_path / AC.BRIEF_FILENAME).read_text(encoding="utf-8")
     assert "THE PROJECT FOLDER IS" in body and "established" not in body

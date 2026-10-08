@@ -21521,7 +21521,7 @@ def _publish_engine():
         return None, None
 
 
-def _publish_fail(code, message, **extra):
+def _publish_cli_fail(code, message, **extra):
     out = {"error": message, "code": code}
     out.update(extra)
     return out
@@ -21531,12 +21531,12 @@ def _publish_gate():
     """(module, engine, None) when publishing may run, else (None, None, the
     `disabled` answer)."""
     if not _agent_publish_on():
-        return None, None, _publish_fail(
+        return None, None, _publish_cli_fail(
             "disabled", "Publishing from agents is switched off in this hub "
                         "(setting agent_publish).")
     pub, eng = _publish_engine()
     if eng is None:
-        return None, None, _publish_fail(
+        return None, None, _publish_cli_fail(
             "disabled", "Publishing is not available in this hub.")
     return pub, eng, None
 
@@ -21585,12 +21585,12 @@ def _publish_error(pub, exc, folder=None, port=None, eng=None):
     perr = getattr(pub, "PublishError", None)
     if perr is None or not isinstance(exc, perr):
         _log.info("[publish] agent call failed: %s", type(exc).__name__)
-        return _publish_fail("failed", "Publishing failed (%s)." % type(exc).__name__)
+        return _publish_cli_fail("failed", "Publishing failed (%s)." % type(exc).__name__)
     code = str(getattr(exc, "code", "") or "failed")
     message = _sanitize(str(exc) or "Publishing was refused.", 300)
     if code == "no_cloudflared":
         message = _PUBLISH_INSTALL_HINT
-    out = _publish_fail(code, message)
+    out = _publish_cli_fail(code, message)
     if code == "already_published" and eng is not None and folder:
         try:
             for t in (eng.status(folder) or {}).get("tunnels") or []:
@@ -21630,7 +21630,7 @@ def _publish_result(t):
     honest "still starting" / "failed"."""
     view = _publish_view(t)
     if view.get("state") == "failed":
-        return _publish_fail("failed", view.get("reason") or "The tunnel could not start.",
+        return _publish_cli_fail("failed", view.get("reason") or "The tunnel could not start.",
                              id=view.get("id"))
     if view.get("state") == "starting" or not view.get("url"):
         view.pop("url", None)
@@ -21657,7 +21657,7 @@ def _publish_cli_start(port, project_dir=None, ttl_minutes=None):
         return refused
     folder = (project_dir or "").strip() or _publish_guess_dir(port) or ""
     if not folder or not os.path.isabs(folder) or not os.path.isdir(folder):
-        return _publish_fail(
+        return _publish_cli_fail(
             "no_project", "Pass project_dir: the absolute path of the folder you "
                           "built the app in.")
     folder = os.path.abspath(folder)
