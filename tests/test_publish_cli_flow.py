@@ -372,8 +372,7 @@ def test_stop_and_its_errors(engine, proj):
 
 
 def test_renew_returns_the_new_link_and_expiry(engine, proj):
-    engine.start(os.path.abspath(proj), 3000)
-    engine.tunnels[0].update(state="expired", url=None, remaining_seconds=0)
+    engine.start(os.path.abspath(proj), 3000)             # live: an agent may only renew a live link
     out, is_err = answer("publish_renew", id="t1", ttl_minutes=120)
     assert not is_err and out["url"] == URL and out["state"] == "live"
     assert out["expires_in"] == "about 1 hour 59 min"
@@ -384,6 +383,7 @@ def test_renew_returns_the_new_link_and_expiry(engine, proj):
 def test_renew_errors(engine, proj):
     out, is_err = answer("publish_renew", id="ghost")
     assert is_err and out["code"] == "not_found"
+    engine.start(os.path.abspath(proj), 3000)
     engine.fail["renew"] = ("bad_ttl", "That lifetime is not allowed.")
     out, is_err = answer("publish_renew", id="t1", ttl_minutes=99999)
     assert is_err and out["code"] == "bad_ttl"

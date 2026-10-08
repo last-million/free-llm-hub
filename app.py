@@ -21969,10 +21969,73 @@ def _publish_cli_stop(tunnel_id):
     return {"ok": True, "id": tunnel_id, "state": "stopped"}
 
 
+_PUBLISH_AGENT_RENEWS_PER_DAY = 3     # agent renewals per app per rolling day
+_PUBLISH_RENEW_LOG = {}               # (folder, port) -> [timestamps] of AGENT renewals
+
+
+def _publish_row(eng, tunnel_id):
+    """The registry row for `tunnel_id` (any project), or None."""
+    try:
+        for t in (eng.status() or {}).get("tunnels") or []:
+            if isinstance(t, dict) and t.get("id") == tunnel_id:
+                return t
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def _publish_renew_allowed(folder, port):
+    """True and records the renewal when this app has used fewer than
+    _PUBLISH_AGENT_RENEWS_PER_DAY agent renewals in the last 24 h. The user's own
+    Publish-panel click is not counted or limited."""
+    now = _publish_clock()
+    key = (folder, port)
+    recent = [x for x in _PUBLISH_RENEW_LOG.get(key, []) if now - x < 86400]
+    if len(recent) >= _PUBLISH_AGENT_RENEWS_PER_DAY:
+        _PUBLISH_RENEW_LOG[key] = recent
+        return False
+    recent.append(now)
+    _PUBLISH_RENEW_LOG[key] = recent
+    return True
+
+
 def _publish_cli_renew(tunnel_id, ttl_minutes=None):
     pub, eng, refused = _publish_gate()
     if refused:
         return refused
+    # A renew gives a NEW public link and a fresh lifetime, so it gets the same
+    # server-side gates as publish_start (automated security review, 2026-10-08):
+    # an agent must not revive a link that already ended (the user's timer is the
+    # limit), route around the port rule, skip the strict-mode approval or keep
+    # one link alive forever by renewing it in a loop.
+    row = _publish_row(eng, tunnel_id)
+    if row is None:
+        return _publish_cli_fail("not_found", "No such tunnel.")
+    folder, port = row.get("project_dir"), row.get("port")
+    name = _publish_project_name(folder)
+    if row.get("state") not in ("live", "starting"):
+        _log.info("[publish] agent renew refused (not_live) for %s port %s", name, port)
+        return _publish_cli_fail(
+            "not_live", "That link has already ended. Ask the user whether to publish "
+                        "it again, then call publish_start.")
+    if not _publish_port_is_project_server(folder, port):
+        _log.info("[publish] agent renew refused (not_project_server) for %s port %s",
+                  name, port)
+        return _publish_cli_fail(
+            "not_project_server",
+            "Only a server running from the project folder %s can be published. "
+            "Start the app from that folder, then ask again." % name)
+    if _publish_requires_approval():
+        _publish_pending_add(folder, port)
+        _log.info("[publish] agent renew held for approval for %s port %s", name, port)
+        return {"pending": True, "note": _PUBLISH_PENDING_NOTE}
+    if not _publish_renew_allowed(folder, port):
+        _log.info("[publish] agent renew refused (too_many_renewals) for %s port %s",
+                  name, port)
+        return _publish_cli_fail(
+            "too_many_renewals",
+            "This link was already renewed %d times today. Ask the user to renew it "
+            "from the Publish panel." % _PUBLISH_AGENT_RENEWS_PER_DAY)
     try:
         t = eng.renew(tunnel_id, ttl_minutes=ttl_minutes)
     except Exception as exc:                                     # noqa: BLE001

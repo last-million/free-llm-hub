@@ -519,15 +519,102 @@ def test_an_engine_refusal_still_comes_back_after_the_rule_passes(box, eng):
     assert is_err and out["code"] == "too_many"
 
 
-def test_renew_status_and_stop_do_not_ask_about_the_port(box, eng):
+def test_status_and_stop_do_not_ask_about_the_port(box, eng):
     folder = os.path.abspath(box.folder)
     eng.tunnels.append(eng._t(folder, PORT))              # started earlier; no listener now
-    out, is_err = tool("publish_renew", id="t1")
-    assert not is_err and out["url"] == URL
     out, is_err = tool("publish_status", project_dir=folder)
     assert not is_err and out["tunnels"][0]["id"] == "t1"
     out, is_err = tool("publish_stop", id="t1")
     assert not is_err and out["state"] == "stopped"
+
+
+# --------------------------------------------------------------------------- #
+# 6b. publish_renew gets the same server-side gates as publish_start
+#     (automated security review of the push, 2026-10-08)
+# --------------------------------------------------------------------------- #
+
+def _renews(eng):
+    return [c for c in eng.calls if c[0] == "renew"]
+
+
+def test_renew_of_a_live_tunnel_works_while_its_server_runs_from_the_project(
+        box, eng, clock, monkeypatch):
+    monkeypatch.setattr(A, "_PUBLISH_RENEW_LOG", {})
+    folder = os.path.abspath(box.folder)
+    box.listen(folder)
+    eng.tunnels.append(eng._t(folder, PORT))
+    out, is_err = tool("publish_renew", id="t1")
+    assert not is_err and out["url"] == URL
+    assert len(_renews(eng)) == 1
+
+
+@pytest.mark.parametrize("state", ["expired", "stopped", "failed"])
+def test_an_agent_cannot_revive_a_link_that_already_ended(box, eng, clock, monkeypatch, state):
+    monkeypatch.setattr(A, "_PUBLISH_RENEW_LOG", {})
+    folder = os.path.abspath(box.folder)
+    box.listen(folder)
+    eng.tunnels.append(eng._t(folder, PORT, state=state))
+    out, is_err = tool("publish_renew", id="t1")
+    assert is_err and out["code"] == "not_live"
+    assert "publish_start" in out["error"]
+    assert not _renews(eng)
+
+
+def test_renew_cannot_route_around_the_port_rule(box, eng, clock, monkeypatch, caplog):
+    monkeypatch.setattr(A, "_PUBLISH_RENEW_LOG", {})
+    folder = os.path.abspath(box.folder)                  # nothing listens from this folder now
+    eng.tunnels.append(eng._t(folder, PORT))
+    with caplog.at_level(logging.INFO):
+        out, is_err = tool("publish_renew", id="t1")
+    assert is_err and out["code"] == "not_project_server"
+    assert not _renews(eng)
+    assert URL not in caplog.text and "not_project_server" in caplog.text
+
+
+def test_renew_of_an_unknown_tunnel_is_not_found(box, eng, clock, monkeypatch):
+    monkeypatch.setattr(A, "_PUBLISH_RENEW_LOG", {})
+    out, is_err = tool("publish_renew", id="nope")
+    assert is_err and out["code"] == "not_found"
+    assert not _renews(eng)
+
+
+def test_strict_mode_holds_a_renew_for_the_users_click(box, eng, clock, monkeypatch):
+    monkeypatch.setattr(A, "_PUBLISH_RENEW_LOG", {})
+    _flags(monkeypatch, agent_publish_requires_approval=True)
+    folder = os.path.abspath(box.folder)
+    box.listen(folder)
+    eng.tunnels.append(eng._t(folder, PORT))
+    out, is_err = tool("publish_renew", id="t1")
+    assert not is_err and out.get("pending") is True
+    assert not _renews(eng)
+    assert [(v["port"]) for v in A._PUBLISH_PENDING.values()] == [PORT]
+
+
+def test_an_agent_cannot_keep_one_link_alive_by_renewing_it_in_a_loop(
+        box, eng, clock, monkeypatch):
+    monkeypatch.setattr(A, "_PUBLISH_RENEW_LOG", {})
+    folder = os.path.abspath(box.folder)
+    box.listen(folder)
+    eng.tunnels.append(eng._t(folder, PORT))
+    for _ in range(A._PUBLISH_AGENT_RENEWS_PER_DAY):
+        out, is_err = tool("publish_renew", id="t1")
+        assert not is_err, out
+    out, is_err = tool("publish_renew", id="t1")
+    assert is_err and out["code"] == "too_many_renewals"
+    assert "Publish panel" in out["error"]
+    assert len(_renews(eng)) == A._PUBLISH_AGENT_RENEWS_PER_DAY
+    clock["t"] += 86401                                   # a day later the count is fresh
+    out, is_err = tool("publish_renew", id="t1")
+    assert not is_err, out
+
+
+def test_the_cap_is_per_app(box, eng, clock, monkeypatch):
+    monkeypatch.setattr(A, "_PUBLISH_RENEW_LOG", {})
+    folder = os.path.abspath(box.folder)
+    for _ in range(A._PUBLISH_AGENT_RENEWS_PER_DAY):
+        assert A._publish_renew_allowed(folder, PORT)
+    assert not A._publish_renew_allowed(folder, PORT)
+    assert A._publish_renew_allowed(folder, PORT + 1)    # another app is unaffected
 
 
 # --------------------------------------------------------------------------- #

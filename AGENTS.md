@@ -3204,6 +3204,14 @@ started and nothing contacts Cloudflare in tests).
   project's folder). Strict mode closes the rest: nothing goes online without the
   user's own click.
 
+**publish_renew has the same gates (2026-10-08, security review of the push).** An agent may renew
+only a tunnel that is still `live`/`starting` (`not_live` otherwise: the user's timer is the limit; after an
+expiry the agent asks the user and calls `publish_start`), the app must still be a server running from the
+project folder (`not_project_server`), strict mode (`agent_publish_requires_approval`) holds a renew for the
+user's click like a start, and at most `_PUBLISH_AGENT_RENEWS_PER_DAY` (3) agent renewals per app per rolling
+day (`too_many_renewals`: ask the user to renew from the Publish panel; the user's own panel click is never
+limited). Covered by `tests/test_publish_agent_port_rules.py`.
+
 ## Publish button in the Build page (2026-10-08)
 
 Owner request: put the running preview on the internet from the Build page,
