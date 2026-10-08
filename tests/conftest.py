@@ -93,6 +93,23 @@ def _clear_recent_hop_failures():
             ledger.clear()
 
 
+def _clear_version_rank():
+    """VERSION RANKING anchors (app._rank_anchors): the newest reachable release
+    per family+tier is cached for 30 s, so one test's fake fleet would otherwise
+    cap the next test's scores."""
+    mod = sys.modules.get("app")
+    reset = getattr(mod, "_rank_reset", None) if mod else None
+    if callable(reset):
+        reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_version_rank():
+    _clear_version_rank()
+    yield
+    _clear_version_rank()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_junk_bench():
     _clear_bench()

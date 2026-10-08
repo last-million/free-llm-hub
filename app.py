@@ -85,6 +85,7 @@ import config
 import image_history
 import craft
 import arena
+import modelrank
 import lowres
 import orchestrator
 import skills
@@ -2364,7 +2365,86 @@ def _canon_model_id(low):
     return out
 
 
-def _benchmark_score(pid, model_id):
+# --------------------------------------------------------------------------- #
+# NEWEST REACHABLE per family+tier (modelrank.py): the anchors the version
+# ordering in _benchmark_score measures an older release against. Built from the
+# models LISTED for enabled providers (never hard-coded: a claude-6 that shows up
+# in a catalog leads on its own and Sonnet 5.5 becomes the fallback), cached
+# _RANK_TTL seconds. Deliberately NOT _declared_fleet(): that calls
+# _benchmark_score itself. Empty / unreadable fleet = no adjustment at all.
+# --------------------------------------------------------------------------- #
+_RANK_TTL = 30.0
+_rank_cache = [0.0, None]                 # [built_at, {(family, tier): (version, score)}]
+_rank_lock = threading.Lock()
+_rank_tls = threading.local()
+
+
+def _rank_fleet_ids():
+    """Model ids the version ranking treats as reachable now: alive models of
+    enabled, keyed providers (cached catalogs, no network) the user has not
+    blocked, minus a provider the quota state has PARKED for _CTX_OVERFLOW_LONG_WAIT
+    or longer (g4f held for 21 h on a Retry-After is not where "the newest
+    Claude" can be reached; a 60 s burst 429 does not count, so the anchors do
+    not flap), minus listings measured to fail. Tests replace this to feed a
+    fake fleet."""
+    out, parked = [], {}
+    for pid, m in _alive_models(_cached_catalogs()):
+        if pid not in parked:
+            try:
+                parked[pid] = _ctx_hop_wait_seconds(pid, "") >= _CTX_OVERFLOW_LONG_WAIT
+            except Exception:                                    # noqa: BLE001
+                parked[pid] = False
+        if parked[pid]:
+            continue
+        try:
+            if _is_model_blocked_by_user(pid, m):
+                continue
+            # A listing measured to fail (2+ outcomes, mostly failures) is a
+            # claim, not a reachable model: one bogus higher-version id on one
+            # relay must not hold every real member of its family down.
+            if _chain_reliability_band(pid, m) >= 2:
+                continue
+        except Exception:                                        # noqa: BLE001
+            pass
+        out.append(m)
+    return out
+
+
+def _rank_reset():
+    """Drop the cached anchors (the next score rebuilds them)."""
+    with _rank_lock:
+        _rank_cache[0], _rank_cache[1] = 0.0, None
+
+
+def _rank_anchors():
+    now = time.time()
+    hit = _rank_cache[1]
+    if hit is not None and now - _rank_cache[0] < _RANK_TTL:
+        return hit
+    # A rebuild scores the fleet (provider-neutral, version ordering off): never
+    # re-enter from the same thread, never queue behind another thread's rebuild.
+    if getattr(_rank_tls, "building", False) or not _rank_lock.acquire(blocking=False):
+        return hit or {}
+    try:
+        _rank_tls.building = True
+        anchors = modelrank.build_anchors(
+            _rank_fleet_ids(), lambda mid: _benchmark_score("", mid, _rank=False),
+            canon=_canon_model_id)
+        _rank_cache[0], _rank_cache[1] = now, anchors
+        return anchors
+    except Exception:                                            # noqa: BLE001
+        _rank_cache[0], _rank_cache[1] = now, hit or {}     # retry in a TTL, not per score
+        return hit or {}
+    finally:
+        _rank_tls.building = False
+        _rank_lock.release()
+
+
+def _rank_anchor_for(family, tier):
+    return _rank_anchors().get((family, tier))
+
+
+def _benchmark_score(pid, model_id, _rank=True):
     """Strength score for a '<model>' on provider `pid` (higher=better). Base
     tier comes from a REAL Artificial Analysis Intelligence Index match when
     one exists (calibrated onto this same scale — see _aa_score_for), else the
@@ -2410,7 +2490,8 @@ def _benchmark_score(pid, model_id):
     if any(t in low for t in ("instruct", "chat", "-it")):
         score += 3
     # A tiny provider bias breaks ties toward fast, reliable free hosts.
-    score += {"cerebras": 2.0, "groq": 1.8, "nvidia": 1.2, "google": 1.0}.get(pid, 0.0)
+    _pbias = {"cerebras": 2.0, "groq": 1.8, "nvidia": 1.2, "google": 1.0}.get(pid, 0.0)
+    score += _pbias
     # Coding-strength adjustment: this hub is coding-heavy, and raw strength != code
     # ability. Boost known-strong 2026 coders; penalize the weak Mistral CHAT family
     # (mistral-large/medium exempt — they are the capable big ones).
@@ -2776,6 +2857,21 @@ def _benchmark_score(pid, model_id):
             if int(_gem.group(1)) + int(_gem.group(2) or 0) / 10.0 >= 3.5:
                 score = max(score, _GEMINI_LITE_FLOOR)
         except ValueError:
+            pass
+    # NEWEST AND BIGGEST FIRST, INSIDE ONE FAMILY (modelrank.py, owner rule
+    # 2026-10-08). After every floor (they are max()es, so nothing earlier could
+    # carry a gap) and before the relay discount: an OLDER release of a
+    # family+tier is held under the newest REACHABLE one by a gap that grows
+    # with the generations between them, Sonnet sits under Opus and Haiku (the
+    # small model) well under Sonnet. It only ever lowers, only members of one
+    # family+tier, only strong ones -- the owner's order BETWEEN families is
+    # untouched and nothing is removed from the chain.
+    if _rank and score >= modelrank.STRONG:
+        try:
+            _rcap = modelrank.cap_for(low, _rank_anchor_for)
+            if _rcap is not None:
+                score = min(score, _rcap + _pbias)
+        except Exception:                                        # noqa: BLE001
             pass
     score -= _shared_budget_penalty(pid, low)
     # RELAY DISCOUNT, applied LAST so it survives the preference floors above
@@ -9533,6 +9629,7 @@ def _rotate_band(ordered):
 # Untried counts as usable -- a model has to be tried to ever earn a record --
 # and nothing is ever dropped.
 _CHAIN_UNRELIABLE = 0.35    # measured: it mostly does not answer
+_CHAIN_MIN_SAMPLES = 2      # ...on at least this many recorded outcomes (one failure is not a record)
 
 
 def _chain_reliability_band(pid, model):
@@ -9558,6 +9655,20 @@ def _chain_reliability_band(pid, model):
     order strength gave it."""
     if not _swarm_has_record(pid, model):
         return 0                       # untried is not a reason to demote
+    # ONE failure is not "measured to fail". The Laplace rate of a single
+    # failure with no success is 1/3 -- under _CHAIN_UNRELIABLE (0.35) -- so a
+    # pair that failed ONCE was queued behind every healthy entry for ~1.8 h
+    # (its lifetime counts fade by half every 8 h). MEASURED 2026-10-08: the two
+    # relay pairs that failed once on a 505K-token request (claude-sonnet-5.5,
+    # gpt-6-astra) sat in the sick tail with exactly one failure each. The tool-
+    # turn rule already asks for _TOOL_MIN_SAMPLES; this is the same rule here.
+    # A mocked/absent record (no row) is judged by the rate alone, as before.
+    with _outcome_lock:
+        rec = _outcomes.get((pid, model))
+        thin = bool(rec) and (int(rec.get("ok", 0)) + int(rec.get("fail", 0))
+                              < _CHAIN_MIN_SAMPLES)
+    if thin:
+        return 0
     return 2 if _reliability(pid, model) < _CHAIN_UNRELIABLE else 0
 
 
@@ -10050,6 +10161,41 @@ def _cap_relay_hops(chain, cap=None):
         return chain
 
 
+def _relay_keep_set(ordered, seen, taken, cap=None):
+    """The relay entries of a tool chain's `ordered` list that keep a relay
+    slot: the BEST `cap - taken` of them, as a set of (pid, model), or None
+    (callers then fall back to the positional rule).
+
+    The slots used to go to the first relays in `ordered`, and `ordered` is not
+    a ranking of relays: the lead group (_lead_first) puts every relay copy of a
+    tool-proven id (gemini-3.x) ahead of relay Claude that sits 0.07 under the
+    lead gate (the relay discount, by design) -- so with google/gemini-3.8-flash
+    alive, three weaker gemini-3 copies took all three slots and relay Opus 5.5,
+    Sonnet 5.5 and gpt-6.1 never entered the chain. Rank within the relays:
+    healthy before unhealthy (measured-to-fail, vision-specialised, last-resort,
+    benched), not-slow before measured-slow, then _agentic_score, then the
+    position it already had. A relay server _relay_tool_sick names gets no slot.
+    Never raises."""
+    try:
+        cap = _TOOL_RELAY_MAX_HOPS if cap is None else cap
+        room = max(0, cap - int(taken))
+        cands = [(i, e) for i, e in enumerate(ordered)
+                 if _is_relay_pid(e[1]) and (e[1], e[2]) not in seen
+                 and not _relay_tool_sick(e[1], e[2])]
+
+        def _key(ie):
+            i, e = ie
+            bad = (_chain_reliability_band(e[1], e[2]) >= 2
+                   or _tool_turn_sick(e[1], e[2])
+                   or _is_vision_specialised(e[2]) or _is_low_quality(e[2])
+                   or _is_pair_benched(e[1], e[2]))
+            return (bad, _tool_turn_slow(e[1], e[2]), -_agentic_score(e), i)
+
+        return {(e[1], e[2]) for _i, e in sorted(cands, key=_key)[:room]}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def _spread_by_provider(entries, per, already=()):
     """Stable partition of (score, pid, model) entries: the first `per` of
     each provider keep their order, every later one goes behind them (same
@@ -10472,12 +10618,21 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         # with alive non-relay candidates left unused.
         try:
             _n_relay = sum(1 for e in chain if _is_relay_pid(e[0]))
+            # The relay slots go to the BEST-RANKED relays (see
+            # _relay_keep_set), not to whichever relays the lead-group and
+            # provider-interleave sorts happened to put first. None = the
+            # positional rule below, exactly as it was.
+            _keep = _relay_keep_set(ordered, seen, _n_relay)
             _kept = []
             for e in ordered:
                 if _is_relay_pid(e[1]) and (e[1], e[2]) not in seen:
-                    if _n_relay >= _TOOL_RELAY_MAX_HOPS or _relay_tool_sick(e[1], e[2]):
+                    if _keep is not None:
+                        if (e[1], e[2]) not in _keep:
+                            continue
+                    elif _n_relay >= _TOOL_RELAY_MAX_HOPS or _relay_tool_sick(e[1], e[2]):
                         continue
-                    _n_relay += 1
+                    else:
+                        _n_relay += 1
                 _kept.append(e)
             if _kept:
                 ordered = _kept

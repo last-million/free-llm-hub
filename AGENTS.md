@@ -3251,3 +3251,112 @@ both-theme contrast measured from the template's own tokens).
 - Not decided here, backend side: whether a tunnel is closed when its preview
   stops (the page shows whatever the status says), and whether `renew` accepts
   a `failed` record (the page uses start for that, never renew).
+
+## Newest and biggest first, inside a family (2026-10-08)
+
+Covered by `tests/test_model_version_ranking.py`. Owner: "he should be smart to
+know higher models by version number, and for Claude: Opus is better than Sonnet
+and Sonnet better than Haiku, and Haiku is a short/small model." MEASURED the
+same day: the g4f rows of claude-opus-5.5, claude-sonnet-5.5, claude-sonnet-4-5,
+claude-sonnet-4, claude-haiku-4-5 and gemini-claude-opus-4-6 all scored the same
+134.0 (the owner floor is family-wide, minus the relay discount 4), so Haiku 4.5
+tied Opus 5.5; GPT-6.x vs 5.6 differed by ~1 point, inside `_AUTO_TOP_BAND`.
+
+- **`modelrank.py`** (pure, stdlib, never raises). `parse(id)` -> (family, tier,
+  (major, minor)) for any spelling: relay prefixes (`srv_x:`, `GithubCopilot:`,
+  `Antigravity:`), `anthropic/`, `models/`, `:free`, `-thinking`, 8-digit date
+  suffixes, `claude-sonnet-4-5` == 4.5, `claude-sonnet-4` == 4.0, `claude-4.5-haiku`,
+  glued `claude40sonnet`, `gemini-claude-opus-4-6` (Claude, not Gemini),
+  `grok-4.20` == 4.2. Families: claude, gpt, gemini, grok, qwen, glm, deepseek,
+  kimi, minimax, mimo, hy. Tiers: claude opus/sonnet/haiku/fable/instant; gemini
+  pro/flash/flash-lite; flash/lite/mini/nano/air/small everywhere; pro for
+  gemini/deepseek/mimo. Unknown family or version -> None -> left alone
+  (`llama`, `mistral`, `gpt-oss`, distills, `gemini-flash-latest`).
+- **The rule** (`_benchmark_score`, after every floor, before the relay
+  discount and `_shared_budget_penalty`): `score = min(score, cap + provider
+  bias)`, `cap = newest reachable score of its family+tier - tier offset - gap`.
+  It only LOWERS, only OLDER members of ONE family+tier, only models scoring
+  >= `modelrank.STRONG` (120, the strong band; a strong newest release is the
+  only anchor, so a 0.5B qwen4 cannot drag qwen3.8). The newest member keeps
+  exactly what it had, so the owner's order BETWEEN families (kimi-k3 138.1 >
+  glm-5.3 138 >= Opus 138 > Space Bunny 137.7 > Pixel Canary 137.6) does not
+  move, nothing exceeds its owner ceiling, and nothing leaves the chain. ONE
+  deliberate exception: rule (b) "Opus over Sonnet" puts the newest Sonnet 5.5
+  (137.4) and Fable (137.7 / 137.6) under the old family-wide 138, i.e. Sonnet 5.5
+  now sits under Space Bunny 137.7 and Pixel Canary 137.6 -- the owner's later,
+  more specific Opus > Sonnet beats the 2026-07-31 family-wide floor (pinned in
+  `test_the_owners_cross_family_order_is_unchanged`).
+- **`gap(newest, version)`**: a newer minor = `MINOR_SPAN` 0.5 x m/(m+4), always
+  < 0.5 (inside the band, the weighted pick still spreads); a major generation =
+  `MAJOR_STEP` 3.0 + the minor swing, so always > 2.5 (an older generation leaves
+  the 2.0 band), plus `LEGACY_EXTRA` 1.5 for each generation past the first
+  (Claude 3.x is not "one release behind"; the boards put it in the D tier).
+  One generation is kept deliberately small: Arena has Opus 4.6/4.7 (1505/1501)
+  level with Opus 5.5 (1504).
+- **Claude tiers** (`tier_offset`): Opus 0; Sonnet 0.6 under Opus (only when an
+  Opus is reachable); Fable 0.3 under Opus (pinned halfway: AA 53 < Sonnet 56,
+  Arena level with Opus); Haiku/instant 6.0 under the Sonnet of the SAME
+  generation (measured against the Sonnet line, so it holds at 4.5 and 5.5;
+  an untiered old `claude-2.1` is measured against Sonnet too). A small NEW
+  model can still beat an OLD big one: Haiku 5.5 outranks Sonnet 3.x (two
+  generations) but not Sonnet 4.5 (one) -- AA says Haiku 5.5 (43) > Sonnet 4.5,
+  the one-generation step is deliberately small, so that stays an open owner
+  call. Resulting scores (non-relay; g4f = minus 4): Opus 5.5 138, Fable 5.1
+  137.7, Sonnet 5.5 137.4, Opus 4.6 135.0, Sonnet 4.5 134.4, Sonnet 4 134.1,
+  Haiku 5.5 131.4, Haiku 4.5 128.4, Claude 3.x ~130.
+- **GPT/Gemini/others**: gpt-6.1 137.2 > gpt-6-astra = gpt-6-luna 137.0 (the
+  codenames keep their present relative order -- AA has astra 53, sol-6.1 52,
+  luna 38; whether luna is a "small tier" like Haiku is an open owner call) >
+  gpt-5.6 134.4 (> 2.5 behind). gemini-3.8-pro > 3.8-flash > 3.5-flash >
+  3.5-flash-lite. Unplaceable ids (gpt-6.1-luna, gemini-3.8-pro, claude-fable-5.5,
+  grok-5) are ordered by version only; no score was invented.
+- **Newest reachable is computed, not hard-coded**: `_rank_anchors()` builds
+  {(family, tier): (version, score)} from `_rank_fleet_ids()` = alive models of
+  enabled, keyed providers (`_alive_models(_cached_catalogs())`, never
+  `_declared_fleet`, which calls `_benchmark_score`), minus user-blocked models,
+  minus listings `_chain_reliability_band` files as measured to fail (a bogus
+  higher-version id on one relay must not hold the real family down; an id nobody
+  has tried yet is still trusted -- rule (e) says "listed"), and minus a provider
+  the quota state has parked >= `_CTX_OVERFLOW_LONG_WAIT`
+  (g4f held 21 h is not where Claude 5.5 can be reached; a 60 s burst 429 does
+  not flap the anchors). Cached `_RANK_TTL` 30 s, built under a non-blocking lock,
+  scoring with `_benchmark_score("", id, _rank=False)` so a rebuild never
+  re-enters itself. A newly listed claude-6 leads on the next rebuild and
+  Sonnet 5.5 becomes the fallback. Empty or broken fleet = no adjustment.
+  `tests/conftest.py` clears the cache around every test (`_rank_reset`).
+- **Relay slots go to the best-ranked relays** (`_relay_keep_set`, used by the
+  tool branch of `_build_chain`): `_TOOL_RELAY_MAX_HOPS` (3) relay hops used to go to
+  the FIRST relays in `ordered`. `_lead_first` puts every relay copy of a
+  tool-proven id (gemini-3.x) in the lead group while relay Claude sits 0.07
+  under the gate (134.0 vs 134.07, the relay discount), so with
+  google/gemini-3.8-flash alive three weaker gemini-3 copies (~130) took all
+  three slots and relay Opus 5.5 / Sonnet 5.5 / gpt-6.1 never entered the chain
+  (reproduced in the test). Now the slots go to the best by (healthy,
+  not measured-slow, `_agentic_score`, position); the kept relays keep the
+  position `ordered` gave them. Fail-open to the positional rule.
+- **One failure is not "measured to fail"** (`_chain_reliability_band`,
+  `_CHAIN_MIN_SAMPLES` 2): one failure and no success is Laplace 1/3, under
+  `_CHAIN_UNRELIABLE` 0.35, so the pair sat in the sick tail for ~1.8 h (the lifetime
+  counts halve every 8 h). The relay pairs claude-sonnet-5.5 and gpt-6-astra were
+  there on exactly one failure each, both from ~505K-token requests no model
+  could hold. A junk answer still counts double; two failures still band 2.
+- **Measured, and deliberately NOT changed** (24 h of `turn-roles.jsonl`, 516
+  tool turns): 0 first picks, 0 failed hops and 0 served turns on any claude-5.5
+  or gpt-6.x pair. claude-sonnet-4-5 served 40 turns, and the router did NOT pick
+  it: 34 of them were `routed` to the g4f space-bunny-free copy (an orchestrator
+  choice), but the first actor of 39 was sonnet-4-5 in ONE hop -- the first entry
+  of the chain walk that fit (85-126K tokens), i.e. the chain-order mechanism the
+  two fixes above address, not a pin (g4f fresh picks since 10-07: 15, 9 sessions; Opus 5, Opus 4.8, gpt-6-luna,
+  gpt-6.1-sol and gpt-6-astra WERE picked and failed: luna HTTP 504 and 403,
+  astra an empty 200, one failure each in perf-stats for the rest). Every g4f
+  row carries `_sustain_penalty` 29.0 (quota.py lists g4f as 5 per MINUTE and
+  `_sustain_penalty` compares the 5 against a per-day yardstick, (150-5)/5), so
+  relay Claude sits ~105 agentic against 137 first-party and leads only when the
+  first-party hosts are out (38 of 516 turns started on g4f). A window-aware fix
+  would also lift llm7/navy/nararouter, whose binding limits are hourly or
+  token-based, and g4f's real budget is ~500K tokens/day (two ~505K-token
+  requests ran at 02:40 and 02:48 on 10-08; by 03:31 g4f held `throttled_until`
+  +21.7 h with count 1 = the gateway's own Retry-After, which `quota.mark_throttled`
+  documents seeing before at 81486 s -- not a stale flag), so the demotion is
+  right in effect and wrong in mechanism -- an owner decision. relay Opus 5.5 still sits 0.07
+  under the lead gate (`_may_lead_pool`) by the owner's relay-discount design.
