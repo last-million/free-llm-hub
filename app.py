@@ -53,6 +53,11 @@ import zipfile
 from urllib.parse import quote, urlsplit
 
 import requests
+try:                                  # urllib3 2.x names a resolver failure
+    from urllib3.exceptions import NameResolutionError as _NameResolutionError
+except ImportError:                   # urllib3 1.x: the message text still matches
+    class _NameResolutionError(Exception):
+        """Never raised; keeps isinstance() valid on urllib3 1.x."""
 from flask.globals import request_ctx
 from flask import (Flask, Response, g, jsonify, make_response, render_template,
                    request, send_file, stream_with_context)
@@ -101,6 +106,12 @@ import clientgone
 # clientgone): every upstream HTTP call made for a request is tracked, and one
 # that would start after the client left is refused.
 clientgone.install_urllib3_hook()
+
+# A short resolver failure no longer burns a whole chain (see netresolve): one
+# retry, then the last known address of a host that resolved before. Pure
+# stdlib, no OS/DNS setting touched; never blocks boot.
+import netresolve
+netresolve.install_at_boot()
 
 # The hub is also an MCP server (POST /mcp, JSON-RPC 2.0) so any MCP-capable
 # agent CLI can call the crews as native tools. The runner goes through the
@@ -3524,6 +3535,8 @@ def _record_outcome(pid, model, ok, junk=False, junk_source="answer"):
         return
     if not ok and _client_gone():
         return          # the client left: not the provider's failure
+    if not ok and _local_net_failed(pid, model):
+        return          # this computer could not resolve the host: not the provider's failure
     try:
         now = time.time()
         weight = _JUNK_FAIL_WEIGHT if (junk and not ok) else 1
@@ -3565,6 +3578,8 @@ def _note_quality_strike(pid, model, reason):
         return
     if _client_gone():
         return          # the client left: not the provider's failure
+    if _local_net_failed(pid, model):
+        return          # a local network failure: not the provider's failure
     try:
         _log.info("[quality] %s/%s: %s -- served uncut, filed as a junk strike",
                   pid, model, reason)
@@ -4461,6 +4476,8 @@ def _note_provider_result(pid, ok, hard_fail=False):
         return
     if not ok and _client_gone():
         return          # the client left: not the provider's failure
+    if not ok and _local_net_failed(pid):
+        return          # a local network failure: not the provider's failure
     if ok:
         # Any real answer is evidence about TWO things: this provider is alive,
         # and so is the network. The second is what lets the timeout breaker tell
@@ -4545,6 +4562,8 @@ def _note_provider_timeout(pid, exc):
         return                              # gate 1: not a provider fact
     if _client_gone():
         return          # the client left: not the provider's failure
+    if _is_local_network_error(exc):
+        return          # this computer's DNS/network, not the provider
     if not _fleet_is_alive():
         return                              # gate 3: the network, not the provider
     try:
@@ -4629,6 +4648,8 @@ def _throttle_failed_hop(pid, model, exc=None, secs=None):
     it stays owned by _upstream_chat's own key-rotation/backoff."""
     if _client_gone():
         return          # the client left: not the provider's failure
+    if _local_net_failed(pid, model):
+        return          # this computer could not resolve the host: not the provider's failure
     secs = secs or _HOP_COOLDOWN_DEFAULT
     try:
         if not model or _is_provider_wide_failure(exc):
@@ -4677,6 +4698,8 @@ def _note_recent_hop_failure(pid, model, kind):
         return
     if _client_gone():
         return          # the client left: not the provider's failure
+    if _local_net_failed(pid, model):
+        return          # this computer could not resolve the host: not the provider's failure
     try:
         with _recent_fail_lock:
             _recent_hop_fail[(pid, model)] = (time.time(), str(kind or "fail"))
@@ -7310,6 +7333,7 @@ def _dispatch_chat(pid, payload, stream):
             # arrives, which is the number that actually describes a stream.
             started = time.perf_counter()
             resp = _nb_close(_upstream_chat(pid, payload, stream))
+            _local_net_clear(pid, (payload or {}).get("model"))   # it resolved
             try:
                 resp._hub_started = started
                 # Size of what was asked, for the long-context speed ledger.
@@ -7330,6 +7354,7 @@ def _dispatch_chat(pid, payload, stream):
         # drops a 0, so those samples would vanish and bias the average slow.
         started = time.perf_counter()
         resp = _upstream_chat(pid, payload, stream)
+        _local_net_clear(pid, (payload or {}).get("model"))       # it resolved
         try:
             if resp is not None and getattr(resp, "status_code", None) == 200:
                 ms = (time.perf_counter() - started) * 1000.0
@@ -7339,6 +7364,13 @@ def _dispatch_chat(pid, payload, stream):
         except Exception:                                            # noqa: BLE001
             pass
         return resp
+    except requests.RequestException as exc:
+        # This computer could not resolve the host / reach the network: mark
+        # the hop so no ledger files it against the provider (see
+        # _local_net_failed) and the chain clock can pause instead of burning
+        # every hop at once. The exception itself passes through unchanged.
+        _mark_local_net_failure(pid, (payload or {}).get("model"), exc)
+        raise
     finally:
         if not _released:
             _inflight_dec(pid)
@@ -9733,6 +9765,8 @@ def _note_tool_turn_outcome(pid, model, ok):
         return
     if not ok and _client_gone():
         return          # the client left: not the provider's failure
+    if not ok and _local_net_failed(pid, model):
+        return          # a local network failure: not the provider's failure
     try:
         now = time.time()
         with _outcome_lock:
@@ -9819,6 +9853,8 @@ def _note_relay_tool_fail(pid, model):
     """One ConnectionError / non-answer from a relay server on a tool turn."""
     if _client_gone():
         return          # the client left: not the provider's failure
+    if _local_net_failed(pid, model):
+        return          # this computer could not resolve the host: not the relay's failure
     server = _relay_server_id(pid, model)
     if not server:
         return
@@ -16007,6 +16043,161 @@ def _client_gone_reply():
         "type": "client_closed_request", "code": "client_disconnected"}}),
         status=_CLIENT_GONE_HTTP, mimetype="application/json",
         headers={"X-Free-LLM-Hub-Last-Error": "cancelled"})
+
+
+# --------------------------------------------------------------------------- #
+# This computer's DNS/network is not a provider outage (see netresolve)
+# --------------------------------------------------------------------------- #
+# Observed 2026-10-08 02:48 UTC: three unrelated hosts (nvidia, z.ai, zenmux)
+# failed to RESOLVE in one second, the chain burned in milliseconds and every
+# one of those providers would have been demoted for ~10 minutes for something
+# that was not theirs. A hop that fails this way is filed against NOBODY (the
+# same list as "Client disconnect stops the work -> Nothing filed against the
+# provider": each ledger returns early while _local_net_failed(pid, model)),
+# and _ChainClock.walk pauses briefly and walks the chain once more instead of
+# spending every hop at once.
+_LOCAL_NET_RE = re.compile(
+    r"failed to resolve|temporary failure in name resolution|name or service not known|"
+    r"getaddrinfo failed|nodename nor servname|no address associated with hostname|"
+    r"network is unreachable|no route to host", re.I)
+_LOCAL_NET_HOST_RE = re.compile(r"host='([^']+)'|failed to resolve '([^']+)'", re.I)
+_LOCAL_NET_ERRNOS = frozenset(
+    getattr(errno, n) for n in ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN")
+    if hasattr(errno, n))
+_LOCAL_NET_WINERRORS = frozenset((10050, 10051, 10065))  # net down / net / host unreachable
+_LOCAL_NET_MARK_TTL = 8.0           # seconds a "this hop failed locally" mark counts
+_local_net_marks = {}               # (pid, model | None) -> (monotonic ts, host)
+_local_net_lock = threading.Lock()
+# Pauses before re-trying the chain after 2+ hosts failed locally in a row
+# (1 s, then 3 s: at most 4 s extra per request), and the sleep behind them
+# (module-level so tests never really sleep).
+_LOCAL_NET_PAUSES = (1.0, 3.0)
+_LOCAL_NET_SLEEP = time.sleep
+_LOCAL_NET_TEXT = ("this computer could not resolve provider hostnames (a DNS/network "
+                   "problem on this machine, not a provider outage); check the "
+                   "connection or DNS, then retry")
+
+
+def _local_net_chain(exc):
+    """exc and everything it wraps, nearest first (bounded)."""
+    seen, queue_, out = set(), [exc], []
+    while queue_ and len(out) < 24:
+        e = queue_.pop(0)
+        if not isinstance(e, BaseException) or id(e) in seen:
+            continue
+        seen.add(id(e))
+        out.append(e)
+        queue_.extend(x for x in (e.__cause__, e.__context__,
+                                  getattr(e, "reason", None)) if isinstance(x, BaseException))
+        queue_.extend(a for a in e.args if isinstance(a, BaseException))
+    return out
+
+
+def _is_local_network_error(exc):
+    """True when exc says THIS machine could not resolve a name or reach the
+    network (urllib3 NameResolutionError, socket.gaierror, "Failed to resolve",
+    "Temporary failure in name resolution", "Name or service not known",
+    "getaddrinfo failed", "Network is unreachable", "No route to host"), looking
+    through __cause__ / __context__ / .reason / args. Resets, RemoteDisconnected
+    and timeouts are provider-side and are NOT this. Never raises."""
+    try:
+        for e in _local_net_chain(exc):
+            if isinstance(e, (socket.gaierror, _NameResolutionError)):
+                return True
+            if isinstance(e, OSError):
+                if (e.errno in _LOCAL_NET_ERRNOS
+                        or getattr(e, "winerror", None) in _LOCAL_NET_WINERRORS):
+                    return True
+            if _LOCAL_NET_RE.search(str(e)):
+                return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return False
+
+
+def _local_net_host(exc, default=None):
+    """The host a local network failure was about (so two pids behind one host
+    are one host), else `default`. Never raises."""
+    try:
+        for e in _local_net_chain(exc):
+            h = getattr(e, "host", None)
+            if isinstance(h, str) and h:
+                return h.lower()
+            m = _LOCAL_NET_HOST_RE.search(str(e))
+            if m:
+                return (m.group(1) or m.group(2)).lower()
+    except Exception:                                            # noqa: BLE001
+        pass
+    return default
+
+
+def _mark_local_net_failure(pid, model, exc):
+    """Remember that this hop just failed because of THIS machine's network.
+    Called where the exception is born (_dispatch_chat); read by the ledgers
+    (_local_net_failed) and by _ChainClock. Never raises."""
+    if not pid or not _is_local_network_error(exc):
+        return
+    try:
+        host = _local_net_host(exc, default=pid)
+        now = time.monotonic()
+        with _local_net_lock:
+            if len(_local_net_marks) > 64:
+                for k in [k for k, v in _local_net_marks.items()
+                          if now - v[0] > _LOCAL_NET_MARK_TTL]:
+                    _local_net_marks.pop(k, None)
+            _local_net_marks[(pid, model)] = (now, host)
+            _local_net_marks[(pid, None)] = (now, host)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _local_net_since(pid, model, since=None):
+    """The host of a local network failure of (pid, model) newer than `since`
+    (a time.monotonic() value; None = within the mark TTL), else None. One dict
+    read when nothing is marked. Never raises."""
+    if not _local_net_marks:
+        return None
+    try:
+        rec = _local_net_marks.get((pid, model))
+        if rec is None:
+            return None
+        ts, host = rec
+        if time.monotonic() - ts > _LOCAL_NET_MARK_TTL:
+            return None
+        if since is not None and ts < since:
+            return None
+        return host
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _local_net_failed(pid, model=None):
+    """True while (pid, model) -- or any model of pid when model is None -- has
+    a fresh local-network-failure mark: the ledgers file nothing for it."""
+    return _local_net_since(pid, model) is not None
+
+
+def _local_net_clear(pid, model):
+    """A real HTTP answer proves the name resolves: drop the marks. Cheap when
+    nothing is marked."""
+    if not _local_net_marks:
+        return
+    try:
+        with _local_net_lock:
+            _local_net_marks.pop((pid, model), None)
+            _local_net_marks.pop((pid, None), None)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _net_only_now():
+    """True when the chain walk of this request ended with nothing but local
+    network failures on 2+ different hosts (set by _ChainClock). Outside a
+    request: False."""
+    try:
+        return bool(getattr(g, "hub_net_only", False))
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def _watch_disconnect_path(path):
@@ -29428,6 +29619,11 @@ def _chain_exhausted_text(errors, last_hard=None, est=0, tools=False):
     """The exhausted-chain error message, in the hub's own words (see above)."""
     hops = _client_hop_errors(errors)
     text = "All providers failed: " + ("; ".join(hops) or "none available")
+    if not last_hard and _net_only_now():
+        # Every hop that ran failed to RESOLVE its host, on 2+ hosts: say whose
+        # problem it is instead of listing providers as if they were down.
+        text = "All providers failed: %s (%s)" % (
+            _LOCAL_NET_TEXT, "; ".join(hops) or "none available")
     try:
         if last_hard:
             code = last_hard.get("http", last_hard.get("status"))
@@ -29736,6 +29932,14 @@ class _ChainClock:
     _prov_secs = None
     _relay_bad = None
     _qf = None                       # best/max fallback plan (plan_quality_fallback)
+    # This computer's network (see _local_net_failed): hops that failed to
+    # resolve their host, in a row / in total, vs hops that failed otherwise.
+    _net_streak = None               # hosts of consecutive local failures
+    _net_hosts = None                # every host that failed locally this walk
+    _net_local = 0
+    _net_other = 0
+    _net_pauses = 0                  # steps of _LOCAL_NET_PAUSES spent
+    _net_rewalked = False
 
     def __init__(self, trivial=False, tools=False, est=0, stream=False, pinned=False):
         # `est` / `stream`: a long request's deadline grows with its size
@@ -29766,6 +29970,16 @@ class _ChainClock:
         self._rest = []              # what the walk has not yielded yet
         self._relay_hops = 0
         self._relay_bad = set()
+        self._net_streak = []
+        self._net_hosts = set()
+        try:
+            if getattr(g, "hub_net_only", False):
+                # An earlier clock of this request (the roles walk before its
+                # `best` fallback, /v1/responses before its storm retry) ended
+                # on local failures; THIS walk tells its own story.
+                g.hub_net_only = False
+        except Exception:                                        # noqa: BLE001
+            pass
         if self.tools:
             try:
                 g.hub_tool_turn = True
@@ -29788,38 +30002,57 @@ class _ChainClock:
         relay server that already failed in this walk. Any other turn: the
         chain as built."""
         self._ensure_ledgers()
-        self._rest = rest = list(chain or ())
+        original = list(chain or ())
+        self._rest = rest = list(original)
         first = True
-        while rest:
-            self._close_hop()
-            if _client_gone():
-                break        # the client left: no further hop (clientgone)
-            if self._quality_due():
-                self._fire_quality_fallback(rest)
-            if self.tools:
-                rest[:] = [e for e in rest if not self._relay_skip(e)]
-                if not rest:
-                    break
-            i = 0
-            if first and self.pinned:
-                # THE USER NAMED THE HEAD (see _build_chain's pinned branch):
-                # it opens the turn even when benched -- the picker below
-                # would silently serve a different model.
-                pass
-            elif (self.trivial or self.tools) and (self._stalled or self.tools):
-                # A junk-benched pair is never what the demotion promotes: it
-                # stays the last hop the built chain made it (see _bench_last).
-                # MEASURED 2026-09-27: nvidia stalled one hop and the benched
-                # dahl pair was walked before nvidia's healthy sibling.
-                i = next((k for k, e in enumerate(rest)
-                          if not self._demoted(e[0])
-                          and not _is_pair_benched(e[0], e[1])), None)
-                if i is None:
+        while True:
+            while rest:
+                self._close_hop()
+                if _client_gone():
+                    break        # the client left: no further hop (clientgone)
+                if self._net_pause_due():
+                    # 2+ different hosts in a row failed to RESOLVE: this
+                    # computer's network blinked, not the providers. Give it a
+                    # moment instead of spending the next hop in milliseconds.
+                    self._net_pause()
+                    if _client_gone():
+                        break
+                if self._quality_due():
+                    self._fire_quality_fallback(rest)
+                if self.tools:
+                    rest[:] = [e for e in rest if not self._relay_skip(e)]
+                    if not rest:
+                        break
+                i = 0
+                if first and self.pinned:
+                    # THE USER NAMED THE HEAD (see _build_chain's pinned branch):
+                    # it opens the turn even when benched -- the picker below
+                    # would silently serve a different model.
+                    pass
+                elif (self.trivial or self.tools) and (self._stalled or self.tools):
+                    # A junk-benched pair is never what the demotion promotes: it
+                    # stays the last hop the built chain made it (see _bench_last).
+                    # MEASURED 2026-09-27: nvidia stalled one hop and the benched
+                    # dahl pair was walked before nvidia's healthy sibling.
                     i = next((k for k, e in enumerate(rest)
-                              if not _is_pair_benched(e[0], e[1])), 0)
-            first = False
-            yield rest.pop(i)
-        self._close_hop()
+                              if not self._demoted(e[0])
+                              and not _is_pair_benched(e[0], e[1])), None)
+                    if i is None:
+                        i = next((k for k, e in enumerate(rest)
+                                  if not _is_pair_benched(e[0], e[1])), 0)
+                first = False
+                yield rest.pop(i)
+            self._close_hop()
+            # The whole chain ended on this computer's network alone (2+ hosts
+            # failed to resolve, nothing else went wrong): wait once more and
+            # walk it ONCE again. Nothing was filed against any provider.
+            if not self._net_rewalk_due():
+                break
+            if not self._net_pause() or _client_gone() or self.spent():
+                break
+            self._net_rewalked = True
+            self._net_streak = []
+            rest.extend(original)
 
     # -- best/max graceful degrade (see _QUALITY_FALLBACK_SHARE) ------------ #
 
@@ -29883,6 +30116,87 @@ class _ChainClock:
             self._prov_secs = {}
         if self._relay_bad is None:
             self._relay_bad = set()
+        if self._net_streak is None:
+            self._net_streak = []
+        if self._net_hosts is None:
+            self._net_hosts = set()
+
+    # -- this computer's network (see _local_net_failed) -------------------- #
+
+    def _net_hop_failed_locally(self, pid, model, host):
+        """The hop that just ended failed to resolve its host: it is nobody's
+        failure, so it is NOT charged to the provider (hop count, seconds, relay
+        strike), and the streak/tally that drives the pause and the final
+        message is updated."""
+        self._ensure_ledgers()
+        self._net_local += 1
+        self._net_streak.append(host)
+        self._net_hosts.add(host)
+        try:
+            self._prov_hops[pid] = max(0, self._prov_hops.get(pid, 0) - 1)
+            if self.tools and _is_relay_pid(pid):
+                self._relay_hops = max(0, self._relay_hops - 1)
+        except Exception:                                        # noqa: BLE001
+            pass
+        self._net_publish()
+
+    def _net_hop_failed_otherwise(self):
+        self._ensure_ledgers()
+        self._net_other += 1
+        self._net_streak = []
+        if self._net_local:
+            self._net_publish()
+
+    def _net_only(self):
+        """Every hop that ran failed locally, on 2+ hosts: the machine's
+        network, not the providers."""
+        return (self._net_local > 0 and self._net_other == 0
+                and len(self._net_hosts or ()) >= 2)
+
+    def _net_publish(self):
+        """Tell the rest of the request (the 503 text) and the Activity row.
+        Request thread only; silently nothing elsewhere."""
+        try:
+            g.hub_net_only = self._net_only()
+            act = getattr(g, "act", None)
+            if act is not None and self._net_local:
+                with _activity_lock:
+                    act["net"] = "network"
+        except Exception:                                        # noqa: BLE001
+            pass
+
+    def _net_pause(self):
+        """Wait out the next step of _LOCAL_NET_PAUSES (1 s, then 3 s), in
+        0.5 s slices that stop when the client leaves, never past the request
+        deadline. False when there was no time for it."""
+        self._ensure_ledgers()
+        step = _LOCAL_NET_PAUSES[min(self._net_pauses, len(_LOCAL_NET_PAUSES) - 1)]
+        self._net_pauses += 1
+        self._net_streak = []
+        left = self.left()
+        secs = step if left is None else min(step, left - 1.0)
+        if secs <= 0 or _client_gone():
+            return False
+        _log.warning("[network] %d hosts failed to resolve in a row (%s); "
+                     "pausing %.0fs before the next hop",
+                     len(self._net_hosts), ", ".join(sorted(self._net_hosts))[:120], secs)
+        remaining = secs
+        while remaining > 0 and not _client_gone():
+            d = min(0.5, remaining)
+            _LOCAL_NET_SLEEP(d)
+            remaining -= d
+        return True
+
+    def _net_pause_due(self):
+        return (len(set(self._net_streak or ())) >= 2
+                and self._net_pauses < len(_LOCAL_NET_PAUSES))
+
+    def _net_rewalk_due(self):
+        """The walk ended and ONLY local failures happened, on 2+ hosts, and a
+        pause step is left: walk the chain once more after it."""
+        return (not self._net_rewalked and self._net_only()
+                and self._net_pauses < len(_LOCAL_NET_PAUSES)
+                and not _client_gone() and not self.spent())
 
     def _demoted(self, pid):
         if pid in self._stalled:
@@ -29914,6 +30228,13 @@ class _ChainClock:
         if not cur:
             return
         pid, model, started = cur
+        host = _local_net_since(pid, model, since=started)
+        if host is not None:
+            # It failed to RESOLVE its host: this computer's problem. Not charged
+            # to the provider -- no time, no relay strike, no hop count.
+            self._net_hop_failed_locally(pid, model, host)
+            return
+        self._net_hop_failed_otherwise()
         try:
             self._prov_secs[pid] = (self._prov_secs.get(pid, 0.0)
                                     + max(0.0, time.monotonic() - started))
@@ -32082,6 +32403,8 @@ def _note_nonanswer(pid, model, kind=_PROMPT_UNSET):
         kind = _take_nonanswer_kind()
     if _client_gone():
         return          # the client left: not the provider's failure
+    if _local_net_failed(pid, model):
+        return          # a local network failure: not the provider's failure
     _record_outcome(pid, model, False)
     if _in_tool_turn():
         _note_relay_tool_fail(pid, model)   # no-op for a non-relay provider
@@ -32220,6 +32543,8 @@ def _record_stream_outcome(pid, model, text, *, tool_calls=False,
         return
     if _client_gone():
         return          # the client left mid-answer: nothing to judge
+    if _local_net_failed(pid, model):
+        return          # a local network failure: nothing to judge
     try:
         ok, strikes = True, []
         if not tool_calls:
@@ -33451,7 +33776,9 @@ def _classify_hop_error(exc=None, status=None, peek=None):
         if isinstance(exc, requests.Timeout):
             return "timeout"
         if isinstance(exc, requests.RequestException):
-            return "conn"
+            # "dns": THIS computer could not resolve the host / reach the
+            # network -- not the provider's failure (see _is_local_network_error).
+            return "dns" if _is_local_network_error(exc) else "conn"
         return "error"      # RuntimeError (no key/base_url, sub relay, ...)
     if status is not None:
         if status in (413, 429):
@@ -34377,6 +34704,8 @@ def _note_swarm_member_fail(pid, model, kind):
         return
     if _client_gone():
         return          # the client left: not the provider's failure
+    if _local_net_failed(pid, model):
+        return          # this computer could not resolve the host: not the provider's failure
     try:
         with _swarm_member_lock:
             _swarm_member_fail[(pid, str(model))] = (time.time(), str(kind or "fail"))
@@ -36495,6 +36824,8 @@ def _split_label(label):
 
 def _team_stats_note(pid, model, role, ok, secs, ts=None):
     """File one specialist call. Never raises."""
+    if not ok and _local_net_failed(pid, model):
+        return          # this computer's network, not the specialist's record
     try:
         with _team_stats_lock:
             lst = _team_stats.setdefault((pid, model), [])
@@ -36592,6 +36923,8 @@ _verifier_stats = {}            # (pid, model) -> [(ts, usable)]
 
 
 def _verifier_stats_note(pid, model, usable, ts=None):
+    if not usable and _local_net_failed(pid, model):
+        return          # this computer's network, not the verifier's record
     try:
         with _team_stats_lock:
             lst = _verifier_stats.setdefault((pid, model), [])

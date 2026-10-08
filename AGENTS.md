@@ -2553,3 +2553,115 @@ UPLOAD per hop, re-sent on every hop. Most of those tokens are OLD tool outputs.
   three handlers. The long-context speed ledger (`_hub_est_tokens`) also still
   records the original size. Batching the clear boundary (a stride) to keep the
   provider cache valid for longer is the HANDOFF "cache-stable prefix" idea.
+
+## Resolver resilience (2026-10-08)
+
+Covered by `tests/test_dns_resilience.py`. What was seen: hub.log 2026-10-08
+02:48:27 UTC, `CHAT-503` with `nvidia`, `glm` (api.z.ai) and `zenmux`
+(zenmux.ai) all failing with `NameResolutionError` in the same second, so the
+whole chain ended in milliseconds and the CLI got a 503. It came one second
+after the hub finished uploading a ~2 MB (504K-token) body on a slow uplink; the
+cause is NOT established (the resolver may have been starved by that upload, or
+it was the local network or the router). A clean 72-lookup test minutes later
+had no failure. Only two log lines carry `NameResolutionError` (the per-hop
+`details=` logging is new), so no frequency is claimed here or anywhere else.
+
+- **`netresolve.py`** (pure stdlib, Python 3.9+, no dependency, no thread, no
+  file, no network of its own; nothing about the machine's DNS/network settings
+  is read or changed). `install()` wraps `socket.getaddrinfo` once per process
+  (idempotent; `_orig` keeps the original reachable, `uninstall()` puts it
+  back only while the wrapper is still the installed one; `stats()`,
+  `reset()`). A lookup that succeeds returns at once and is remembered in a
+  bounded LRU (256 keys: host lowercased, port, family, type, proto, flags) with
+  a wall-clock timestamp. A `socket.gaierror` (any errno, incl. EAI_AGAIN /
+  EAI_NONAME and Windows WSA codes) is retried ONCE after 0.25 s; if it still
+  fails and the same key succeeded less than 7 days ago (`MAX_STALE`) the last
+  known list is returned and `[dns] resolver failed for <host> (<reason>); using
+  the last known address from <N>s ago` is logged, at most once per host per 5
+  minutes; otherwise the ORIGINAL error is re-raised unchanged. A failure is
+  never cached, a name that never resolved never gets a stale answer, a
+  successful lookup is never delayed, and no lock is held across the OS call.
+  Left alone entirely: IP literals (incl. `%scope` and `127.1`), `localhost` /
+  `*.localhost`, bare names without a dot, `host=None`, non-ASCII bytes and
+  bind (`AI_PASSIVE`) calls. For HTTPS URLs TLS still verifies the certificate
+  against the HOSTNAME of the URL (urllib3 passes `server_hostname` from the
+  URL, not from the address), so a stale address can only reach a server that
+  holds a valid certificate for that name; a moved address fails at
+  connect/TLS as before. netresolve cannot see the URL scheme: a plain-http
+  base URL has no certificate check with or without it, and a stale address
+  there is only ever an address that name resolved to.
+- **Switches**: flag `dns_stale_cache` (`config.get_flag`, default ON), read
+  only after a lookup has already failed (a success never touches the config);
+  off = plain passthrough (no retry, no stale). `install_at_boot()` is the one
+  line app.py runs next to `clientgone.install_urllib3_hook()`; it never
+  raises and honours the environment variable `FREE_LLM_HUB_NO_DNS_CACHE=1` and
+  the module attribute `BOOT_INSTALL`. `tests/conftest.py` sets `BOOT_INSTALL =
+  False` at import (before any test imports app) and a `pytest_runtest_teardown`
+  hook wrapper puts the real `socket.getaddrinfo` and netresolve's state back
+  after EVERY test (a hook wrapper, because monkeypatch undoes its own patches
+  after any fixture finalizer of ours). Dedicated tests call `install()`.
+- **A local network failure is nobody's failure** (app.py, section "This
+  computer's DNS/network is not a provider outage"). `_is_local_network_error`
+  walks `__cause__` / `__context__` / `.reason` / `args` for
+  `urllib3.exceptions.NameResolutionError`, `socket.gaierror`, an
+  `ENETUNREACH` / `EHOSTUNREACH` / `ENETDOWN` errno, or the texts "Failed to
+  resolve", "Temporary failure in name resolution", "Name or service not
+  known", "getaddrinfo failed", "nodename nor servname", "No address associated
+  with hostname", "Network is unreachable", "No route to host". Resets,
+  `RemoteDisconnected`, timeouts, refusals and TLS errors are provider-side and
+  are NOT this. `_dispatch_chat` (the entry every CHAIN hop passes through,
+  stream and non-stream, hedge legs and `_dispatch_chat_with_deadline`
+  included; the other direct `_upstream_chat` callers -- the provider Test
+  probe, the canary / probe-all pair probes and `_hub_serves_now` -- are not
+  chain hops and were checked to file no provider ledger when the call raises)
+  marks the hop on a local failure (`_mark_local_net_failure`: an
+  8 s mark per (pid, model) and per pid, host kept) and clears the marks on any
+  HTTP answer. The ledgers return early while `_local_net_failed(pid, model)`,
+  the same list "Client disconnect stops the work" files nothing for:
+  `_record_outcome(False)`, `_note_recent_hop_failure`, `_throttle_failed_hop`,
+  `_note_provider_timeout` (by exception), `_note_provider_result(False)`,
+  `_note_nonanswer`, `_note_relay_tool_fail`, `_note_tool_turn_outcome(False)`,
+  `_note_quality_strike`, `_record_stream_outcome`, `_note_swarm_member_fail`,
+  `_team_stats_note(ok=False)`, `_verifier_stats_note(usable=False)` (the roles
+  actor judge, the fan-out and the swarm stage all reach them). Without that a
+  DNS blip demoted nvidia / glm / zenmux for ~10 minutes after the network was
+  back. `_throttle_failed_hop(exc=...)` called directly with a bare
+  resolution error and no mark still throttles (`test_hop_breaker_scope.py`);
+  in the real flow the mark is what stops it.
+- **The walk waits instead of burning the chain** (`_ChainClock.walk`, so all
+  three protocol loops and the roles actor walk get it with no change in the
+  loops): when 2+ consecutive hops on DIFFERENT hosts (taken from the exception;
+  the pid when absent) failed locally, the walk pauses before the next hop, 1 s
+  and, the next time, 3 s (`_LOCAL_NET_PAUSES`; 0.5 s slices through
+  `_LOCAL_NET_SLEEP`; bounded by `left() - 1` and `_client_gone()`). When the
+  chain ends and EVERY hop that ran failed locally on 2+ hosts and a pause step
+  is left, it pauses once more and walks the chain ONCE again (never a third
+  time: at most 4 s extra per request). A hop that failed locally is not
+  charged to its provider in the clock either (no hop count, seconds or relay
+  strike). `/v1/responses` keeps its own single 6 s transient-storm retry
+  untouched, so there a local-only failure is bounded by (walk + re-walk) x
+  (pass + that retry).
+- **What the client sees**: `_classify_hop_error` returns `dns` for a local
+  error (header `X-Free-LLM-Hub-Last-Error: dns`; every other class is as
+  before). When the whole walk ended on local failures on 2+ hosts and no hard
+  upstream error exists, `_chain_exhausted_text` (call sites unchanged; it
+  reads `g.hub_net_only` set by the clock) says: "All providers failed: this
+  computer could not resolve provider hostnames (a DNS/network problem on this
+  machine, not a provider outage); check the connection or DNS, then retry
+  (<hop classes>)". Still a 503. A new clock clears that flag, so a later pass
+  of the same request (the roles walk before its `best` fallback, the
+  `/v1/responses` storm retry) never inherits an earlier pass's verdict. The
+  Activity row gets `net: "network"` and the
+  dashboard shows a small "network" word beside its status. A chain with no
+  local failure is byte-identical to before.
+- Not done on purpose: nothing was changed in the machine's DNS, no resolver
+  list, DoH or hosts-file logic was added, and a single failing host never makes
+  the hub claim a machine-wide problem (that needs 2+ hosts).
+- Limits worth knowing: the no-filing rule is mark-based (a short process-wide
+  mark per pair, not per exception), so a genuine failure of that same pair
+  within the 8 s mark is also left unfiled; the roles actor-hop cap (4) is not
+  refunded for local failures (the pause and re-walk live in `walk`, the cap
+  still applies); `_note_actor_stall`, `_note_broken_stream` and
+  `_record_long_ctx_speed` are not gated because those events are not
+  resolution failures; with a single failing host the 503 reads as the old
+  generic one.

@@ -12166,7 +12166,11 @@
           '<span class="af-model">' + modelHTML + '</span>' +
           '<span class="af-dur js-af-dur" data-started="' + esc(a.started) + '" data-pending="' + (pending ? '1' : '0') +
             '" data-ms="' + esc(numOr(a.duration_ms, 0)) + '">' + esc(fmtDuration(a.duration_ms)) + '</span>' +
-          '<span class="af-status ' + statusClass + '"' + (statusTitle ? ' title="' + esc(statusTitle) + '"' : '') + '><span class="d"></span>' + esc(statusLabel) + esc(httpTxt) + '</span>' +
+          '<span class="af-status ' + statusClass + '"' + (statusTitle ? ' title="' + esc(statusTitle) + '"' : '') + '><span class="d"></span>' + esc(statusLabel) + esc(httpTxt) +
+            /* This computer could not resolve provider hostnames during the
+               request (a DNS/network problem here, not a provider outage). */
+            (a.net ? ' · <span title="This computer could not resolve provider hostnames (a DNS/network problem on this machine, not a provider outage)">network</span>' : '') +
+          '</span>' +
         '</div>' + detail;
     }).join('');
   }

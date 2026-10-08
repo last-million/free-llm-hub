@@ -13,10 +13,46 @@ ids would inherit another test's demotions.
 
 Both are cleared around every test, and only when app is already imported: a
 test that never touches app must not pay its import.
+
+RESOLVER: netresolve wraps the process-wide socket.getaddrinfo. Importing app
+must never install that wrapper during the suite (this module is imported before
+any test module imports app, so the boot switch is flipped here), and whatever a
+test installs or patches is put back after it: socket.getaddrinfo is the
+original resolver again after EVERY test.
 """
+import socket
 import sys
+import time
 
 import pytest
+
+import netresolve
+
+_REAL_GETADDRINFO = socket.getaddrinfo
+netresolve.BOOT_INSTALL = False
+
+
+def _restore_the_real_resolver():
+    netresolve.uninstall()
+    if socket.getaddrinfo is not _REAL_GETADDRINFO:
+        socket.getaddrinfo = _REAL_GETADDRINFO
+    netresolve._orig = netresolve._import_time
+    netresolve._prev = None
+    netresolve._sleep = time.sleep
+    netresolve._now = time.time
+    netresolve.reset()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """The global resolver and netresolve's own state are the originals after
+    EVERY test, whatever it installed, patched or left behind. A hook wrapper,
+    not a fixture: monkeypatch undoes its patches in its own finalizer, which
+    a fixture of ours would run BEFORE (so a test that patched
+    socket.getaddrinfo while the wrapper was installed had the wrapper put
+    back by monkeypatch after our cleanup)."""
+    yield
+    _restore_the_real_resolver()
 
 
 def _clear_bench():
@@ -35,7 +71,7 @@ def _clear_recent_hop_failures():
         ledger.clear()
     # Tool-turn ledgers (per-pair TTFT/outcomes, per-relay-server failures).
     for name in ("_tool_ttft", "_tool_outcomes", "_relay_tool_fail",
-                 "_swarm_member_fail", "_empty_200"):
+                 "_swarm_member_fail", "_empty_200", "_local_net_marks"):
         other = getattr(mod, name, None) if mod else None
         if isinstance(other, dict):
             other.clear()
@@ -132,6 +168,16 @@ def _no_real_heartbeat_scheduler(monkeypatch):
         monkeypatch.setattr(app, "_start_heartbeat_scheduler", lambda: None)
     except Exception:                                            # noqa: BLE001
         pass
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_network_pauses(monkeypatch):
+    """The chain walk's pause after 2+ hosts fail to resolve (1 s, then 3 s) is
+    a real sleep in production; no test waits for it. tests/test_dns_resilience
+    installs a recording sleep of its own."""
+    import app
+    monkeypatch.setattr(app, "_LOCAL_NET_SLEEP", lambda seconds: None)
     yield
 
 
