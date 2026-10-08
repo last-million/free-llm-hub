@@ -176,6 +176,40 @@ def _no_live_governor(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_tunnel(monkeypatch):
+    """PUBLISH: no test may start a real cloudflared, spawn the publish timer
+    thread, probe a real port or download anything. Every default effect of
+    publish.Manager is replaced by one that fails loudly or finds nothing; the
+    tests that exercise the engine (tests/test_publish_engine.py) inject a fake
+    cloudflared script, a fake clock and a fake downloader through the
+    Manager's constructor, which bypasses these module-level defaults."""
+    try:
+        import publish
+    except Exception:                                            # noqa: BLE001
+        yield
+        return
+
+    def _refuse(*_a, **_k):
+        raise AssertionError("a test tried to start a real cloudflared; inject "
+                             "a fake spawn into publish.Manager")
+
+    def _no_download(*_a, **_k):
+        raise AssertionError("a test tried to download something from the network")
+
+    monkeypatch.setattr(publish, "_spawn", _refuse)
+    monkeypatch.setattr(publish, "_find_cloudflared", lambda bin_dir=None: None)
+    monkeypatch.setattr(publish, "_https_fetch", _no_download)
+    monkeypatch.setattr(publish, "_http_probe", lambda port, timeout=2.0: False)
+    monkeypatch.setattr(publish, "_iter_processes", lambda: iter(()))
+    monkeypatch.setattr(publish.Manager, "_ensure_timer", lambda self: None)
+    yield
+    try:
+        publish.default.shutdown()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+@pytest.fixture(autouse=True)
 def _no_real_heartbeat_scheduler(monkeypatch):
     """The heartbeat scheduler is a daemon thread that, once the kill switch is
     on, starts REAL Multi runs on the owner's projects. No test may launch it;

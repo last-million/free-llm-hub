@@ -123,6 +123,7 @@ netresolve.install_at_boot()
 import vision_status
 import swarm_windows
 import heartbeat
+import publish
 import memory
 import taskboard
 
@@ -39342,6 +39343,115 @@ def api_budgets():
     return jsonify({"runs": runs, "conversations": conversations})
 
 
+# ---------------------------------------------------------------------------
+# PUBLISH: a project's running preview on the internet through a FREE
+# Cloudflare quick tunnel (publish.py). Anyone holding the link can open the
+# app, so every route sits under /api/* (control token + dashboard header) and
+# Publish / Install need the caller to say `confirm: true` -- the click that
+# came after the warning. The public URL leaves the hub ONLY through these
+# responses; it is never logged and never cached (no-store).
+# ---------------------------------------------------------------------------
+
+_PUBLISH_HTTP = {"bad_ttl": 400, "bad_request": 400, "confirm_required": 400,
+                 "forbidden_port": 403, "disabled": 403, "not_found": 404,
+                 "no_preview": 409, "no_cloudflared": 409, "not_http": 409,
+                 "too_many": 409, "already_published": 409, "install_failed": 409}
+
+
+def _publish_json(payload, status=200):
+    resp = jsonify(payload)
+    resp.status_code = status
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _publish_fail(exc):
+    return _publish_json({"error": exc.message, "code": exc.code},
+                         _PUBLISH_HTTP.get(exc.code, 400))
+
+
+def _publish_body():
+    body = request.get_json(force=True, silent=True)
+    return body if isinstance(body, dict) else {}
+
+
+def _publish_unconfirmed(body):
+    """A 400 unless the body says `confirm: true` (literally the boolean)."""
+    if body.get("confirm") is True:
+        return None
+    return _publish_json({"error": "Publishing needs your confirmation: anyone with "
+                          "the link can open the app.", "code": "confirm_required"}, 400)
+
+
+def _publish_id(body):
+    tid = body.get("id")
+    return tid if isinstance(tid, str) and tid else None
+
+
+@app.route("/api/publish", methods=["GET"])
+def api_publish_status():
+    """Every tunnel (optionally one project's), the cloudflared state and the
+    limits. `?project_dir=` filters."""
+    return _publish_json(publish.default.status(request.args.get("project_dir") or None))
+
+
+@app.route("/api/publish/start", methods=["POST"])
+def api_publish_start():
+    body = _publish_body()
+    refusal = _publish_unconfirmed(body)
+    if refusal is not None:
+        return refusal
+    project_dir = body.get("project_dir")
+    if not isinstance(project_dir, str) or not project_dir.strip():
+        return _publish_json({"error": "project_dir is required", "code": "bad_request"}, 400)
+    try:
+        tunnel = publish.default.start(
+            project_dir, port=body.get("port"), ttl_minutes=body.get("ttl_minutes"),
+            source="agent" if body.get("source") == "agent" else "build")
+    except publish.PublishError as exc:
+        return _publish_fail(exc)
+    return _publish_json({"ok": True, "tunnel": tunnel})
+
+
+@app.route("/api/publish/stop", methods=["POST"])
+def api_publish_stop():
+    tid = _publish_id(_publish_body())
+    if tid is None:
+        return _publish_json({"error": "id is required", "code": "bad_request"}, 400)
+    try:
+        tunnel = publish.default.stop(tid)
+    except publish.PublishError as exc:
+        return _publish_fail(exc)
+    return _publish_json({"ok": True, "tunnel": tunnel})
+
+
+@app.route("/api/publish/renew", methods=["POST"])
+def api_publish_renew():
+    body = _publish_body()
+    tid = _publish_id(body)
+    if tid is None:
+        return _publish_json({"error": "id is required", "code": "bad_request"}, 400)
+    try:
+        tunnel = publish.default.renew(tid, ttl_minutes=body.get("ttl_minutes"))
+    except publish.PublishError as exc:
+        return _publish_fail(exc)
+    return _publish_json({"ok": True, "tunnel": tunnel})
+
+
+@app.route("/api/publish/install", methods=["POST"])
+def api_publish_install():
+    """Download the official cloudflared (background; progress in GET
+    /api/publish -> cloudflared). Only ever on this explicit, confirmed call."""
+    refusal = _publish_unconfirmed(_publish_body())
+    if refusal is not None:
+        return refusal
+    try:
+        state = publish.default.install()
+    except publish.PublishError as exc:
+        return _publish_fail(exc)
+    return _publish_json({"ok": True, **state})
+
+
 def _multi_check_kwargs():
     """swarm_windows.start / resume / resume_interrupted kwargs: the free
     verdict (no manager needed) and the search. Same fail-open contract."""
@@ -45423,6 +45533,16 @@ if __name__ == "__main__":
                       len(_stale), ", ".join("%s(%s)" % (p["name"], p["pid"]) for p in _stale)[:300])
     except Exception as _exc:                                    # noqa: BLE001
         _log.warning("[boot] could not check for leftover agent CLIs: %s", _exc)
+    # PUBLISH: cloudflared tunnels the previous hub left running (they carry the
+    # CALVOUN_TUNNEL marker; nothing else is touched) -- stopped before any new
+    # tunnel can be started.
+    try:
+        _tunnels_left = publish.default.sweep_leftovers()
+        if _tunnels_left:
+            _log.info("[boot] stopped %d tunnel process(es) the previous hub left running",
+                      len(_tunnels_left))
+    except Exception as _exc:                                    # noqa: BLE001
+        _log.warning("[boot] could not check for leftover tunnels: %s", _exc)
     # The CLIs the last Stop disconnected, wired again once the server answers.
     threading.Thread(target=lambda: (time.sleep(15), _reconnect_clis_after_stop()),
                      daemon=True, name="stop-reconnect").start()

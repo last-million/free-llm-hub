@@ -286,6 +286,8 @@ keys can actually reach right now, which is the only number that matters.
 ## Security
 
 - **Localhost only.** Binds `127.0.0.1`. Do not port-forward it.
+  The one exception is the explicit, expiring Publish tunnel for a single
+  project preview (below); the hub itself is never exposed.
 - **Keys encrypted at rest.** AES-256-GCM, key in `~/.free-llm-hub/secret.key`.
   `config.json` is `0600` on POSIX.
 - **Control token** on every `/api/*`, plus an anti-CSRF header on writes.
@@ -296,6 +298,41 @@ keys can actually reach right now, which is the only number that matters.
   and `git pull` for its own updates.
 
 ---
+
+## Publish a project online (free Cloudflare tunnel)
+
+Share what you are building with someone who is not on your computer. The hub
+can put a project's running preview on the internet through a **Cloudflare
+Quick Tunnel**: free, no Cloudflare account, nothing to configure.
+
+- **It only happens when you click Publish** (Build page, next to the
+  preview), after a warning. The hub never publishes anything by itself.
+- **Anyone who has the link can open the app.** The address is random and
+  hard to guess, but it is not a password. Do not publish a project that shows
+  private data, and do not put secrets in a published page.
+- **The link expires.** You choose 15 minutes, 1 hour (the default), 4 hours,
+  12 hours or 24 hours. The page shows a countdown; at zero the hub stops the
+  tunnel and the link stops working. **New link** gives a fresh random address
+  and a fresh timer (the old address is dead for good). Stopping the preview,
+  or the hub, also takes the link down. At most three links can be online at
+  once.
+- **Only the project's own web server is exposed**, never the hub, never your
+  files. The hub's own port, ports outside 1024-65535 and well-known database
+  and remote-access ports are refused, and the port must answer a web request.
+- **cloudflared is needed once.** If it is not on your PATH, press *Install
+  cloudflared*: the hub downloads the official build from Cloudflare's GitHub
+  release (HTTPS, checked against the SHA-256 published with the release; if
+  there is no checksum or it does not match, nothing is installed) into
+  `~/.free-llm-hub/bin/`. Nothing is downloaded until you press it. On a
+  system without an official build, install it yourself (`winget install
+  --id Cloudflare.cloudflared`, `brew install cloudflared`, or your
+  distribution's package).
+- **Quick tunnels are for testing and sharing**, not for hosting: Cloudflare
+  gives them no uptime promise, and some networks block them (the hub retries
+  once over HTTP/2). An existing `~/.cloudflared/config.yml` can stop a quick
+  tunnel from starting; move it aside if Publish keeps failing.
+- Switch it off for good with the `publish_enabled` flag (set it to `false`
+  in the config); Publish and Install then refuse.
 
 ## Endpoints
 
@@ -309,7 +346,7 @@ keys can actually reach right now, which is the only number that matters.
 | **Dashboard** | `/api/*` (control-token gated) |
 | **Probes** | `/health`, `/healthz` (liveness), `/ready`, `/readyz` (readiness, 503 + `reason` when not ready) — no token, loopback only, no version or provider data |
 
-169 routes in total; the dashboard is the documentation for the rest.
+174 routes in total; the dashboard is the documentation for the rest.
 
 ---
 
@@ -337,7 +374,7 @@ the most out of free tiers on your own machine.
 python -m pytest -q
 ```
 
-**5996 tests, 362 files.** They are written as evidence: most carry a docstring
+**5996 tests, 367 files.** They are written as evidence: most carry a docstring
 recording the measurement or the live failure that produced them.
 
 ---

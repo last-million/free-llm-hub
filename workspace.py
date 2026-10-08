@@ -809,8 +809,28 @@ def _pump(proc):
             proc.error = "the project stopped on its own"
 
 
+def _publish_stopped(project_dir):
+    """PUBLISH: a tunnel that exposes this preview goes down with it. Lazy
+    import, outside _lock, never raises -- stop() must work without publish."""
+    try:
+        import publish
+        publish.default.project_stopped(project_dir)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _published(project_dir):
+    """PUBLISH: is this project's preview online through a tunnel right now?"""
+    try:
+        import publish
+        return publish.default.has_active(project_dir)
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def stop(project_dir):
     project_dir = os.path.abspath(project_dir)
+    _publish_stopped(project_dir)
     with _lock:
         proc = _procs.pop(project_dir, None)
         if proc:
@@ -1516,6 +1536,10 @@ def reap_idle(now=None):
     now = now or time.time()
     with _lock:
         stale = [d for d, p in _procs.items() if now - p.touched_at > IDLE_TIMEOUT]
+    # PUBLISH: a preview that is online through a tunnel is being used by
+    # someone who is not looking at the dashboard; the tunnel's own expiry (or
+    # the user) ends it, not the idle reaper.
+    stale = [d for d in stale if not _published(d)]
     for d in stale:
         stop(d)
     return stale

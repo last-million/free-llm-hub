@@ -3360,3 +3360,106 @@ tied Opus 5.5; GPT-6.x vs 5.6 differed by ~1 point, inside `_AUTO_TOP_BAND`.
   documents seeing before at 81486 s -- not a stale flag), so the demotion is
   right in effect and wrong in mechanism -- an owner decision. relay Opus 5.5 still sits 0.07
   under the lead gate (`_may_lead_pool`) by the owner's relay-discount design.
+
+## Publish online (free Cloudflare tunnel) (2026-10-08)
+
+Owner: put a project's running preview on the internet with a free Cloudflare
+Quick Tunnel (`cloudflared tunnel --url`, no account), show the link with a
+countdown, expire it, and let the user make a new one. Covered by
+`tests/test_publish_engine.py` (fake cloudflared script, fake clock, fake
+downloader; nothing real is started, contacted or downloaded).
+
+- **`publish.py`** (stdlib, no Flask, never imported by workspace at module
+  level): `PublishError(code, message)`, `Manager` (`status(project_dir=None)`,
+  `start`, `stop`, `renew`, `install`, `tick`, `sweep_leftovers`, `shutdown`,
+  `project_stopped`, `has_active`), module `default`. Every outside effect is
+  a constructor argument (`locate`, `launcher`, `clock`, `wall`, `spawn`,
+  `kill`, `probe`, `preview_port`, `hub_ports`, `fetch`, `system`, `procs`,
+  `flag`, `timer`); `tests/conftest.py::_no_real_tunnel` makes the module-level
+  defaults (spawn, PATH lookup, download, probe, timer thread) fail loudly.
+- **Tunnel dict**: `{id, project_dir, port, url (None unless live), state:
+  starting|live|expired|stopped|failed, error, source: build|agent, started_at,
+  expires_at, ttl_seconds, remaining_seconds}`. `status()` adds `server_time`,
+  `enabled`, `cloudflared {available, path, version, platform, installable,
+  installing, install_error, install_stage, install_progress}`, `limits`.
+  `status(project_dir)` returns ONLY that project's tunnels (normcase+abspath).
+- **Start** records a `starting` row under the lock (counted for dedupe and the
+  limit of 3 BEFORE spawning), spawns outside it and returns at once. Command:
+  `cloudflared tunnel --no-autoupdate --url http://127.0.0.1:<port>
+  --http-host-header 127.0.0.1:<port>` (+ `--protocol http2` on the retry),
+  `CREATE_NO_WINDOW` on Windows, own session on POSIX, stderr merged into
+  stdout, env `CALVOUN_TUNNEL=<id>`, every `TUNNEL_*` var and the hub's port
+  vars dropped. A reader thread per process takes the FIRST valid
+  `https://<label>.trycloudflare.com` (host re-validated with urllib, a trailing
+  boundary so `x.trycloudflare.com.evil.net` and `...com@evil.net` fail,
+  reserved labels `api`/`www` skipped: cloudflared prints
+  `https://api.trycloudflare.com/tunnel` in its failure messages).
+- **Same project + port already starting/live => `start` returns THAT tunnel**
+  (no second process, TTL of the duplicate ignored); `already_published` exists
+  as a code but `start` never raises it. Dead rows of the same project+port are
+  superseded by a new start; at most 10 dead rows are kept.
+- **Time** lives in `tick()` only, driven by ONE daemon timer thread
+  (`publish-timer`, started lazily); tests call `tick()` after advancing the
+  fake clock. No address within 25 s of an attempt => kill and retry once with
+  `--protocol http2`; a second miss, or a process that exits before an address,
+  => `failed` with a fixed plain sentence (never a log line). Expiry =
+  the EARLIER of the monotonic deadline and the wall `expires_at` (monotonic
+  time stops during suspend on Linux/macOS). The TTL starts when the address
+  goes live (`expires_at` is provisional while `starting`). Expired / stopped /
+  failed rows keep their `error` but `url` is None; `stop` on a live row =
+  `stopped`, on a finished row = dismiss it; `renew` replaces the old row.
+- **Never kill by a stale pid**: `_kill_tree` does nothing on Windows for a
+  process that already exited (measured: a late reader-thread cleanup killed the
+  NEXT tunnel's launcher after pid reuse), and never closes the pipe from
+  another thread (a buffered read in the reader holds its lock: 46-58 s hang);
+  the reader closes its own stream. A process whose pipe is held open by a
+  child is still noticed: `tick()` checks `poll()`; and `_on_exit` acts only when
+  `poll()` shows the process really ended (an EOF with the process alive is left
+  to `tick()`). Test pitfall: two fakes appending to one log file overwrite each
+  other on Windows (one file per launch), and `launches()[0]` is not "the first
+  tunnel started" (python start-up order) -- map by the `CALVOUN_TUNNEL` marker.
+- **The URL is a capability.** Returned only by the token-gated API
+  (`Cache-Control: no-store`); every log line, tail and error goes through
+  `scrub()`; hub.log gets the tunnel id and the project's folder name only.
+- **Ports**: hub ports (`PORT` env, 8787, `agentic_chat._port()`), anything
+  outside 1024-65535 and `DENY_PORTS` (databases, brokers, docker/k8s, VNC/RDP,
+  SMB, SSH) => `forbidden_port`; the port must answer an HTTP status line on
+  127.0.0.1 (any status, 5xx included: a compiling dev server). The preview
+  port is `workspace.status(project_dir)` only when `running` AND `port`.
+- **Hooks**: `workspace.stop` -> `publish.default.project_stopped` (lazy import,
+  outside `_lock`); `workspace.reap_idle` skips a previewed project that has an
+  active tunnel (otherwise a 60 min link died at the 30 min idle reap with the
+  dashboard closed); app boot -> `publish.default.sweep_leftovers()` right after
+  the stale-agent-CLI sweep (stops processes carrying `CALVOUN_TUNNEL` that are
+  cloudflared, skipping the registry's own subtree, hub pids and anything else,
+  and any tunnel stamped `CALVOUN_TUNNEL_HOME` = ANOTHER hub's normalised state
+  dir -- a sandboxed test hub booting must not kill the real hub's live links;
+  no stamp = ours);
+  `atexit` -> `default.shutdown()`. A hard kill of the hub leaves cloudflared
+  running until the next boot sweep.
+- **Install** (explicit `POST /api/publish/install {confirm:true}` only): official
+  asset for `platform.system()/machine()` (windows-amd64.exe, linux-amd64|arm64,
+  darwin-amd64|arm64.tgz), release metadata from `api.github.com` (metadata
+  host only), file from `github.com` / `objects.githubusercontent.com` /
+  `release-assets.githubusercontent.com` with https + allowlist re-checked on
+  EVERY redirect hop (`_AllowlistRedirect`). The SHA-256 must come from the
+  asset's `digest` or a line of the release notes naming exactly that asset; two
+  sources that disagree, none, or a mismatch => nothing installed (the partial
+  file is deleted). tgz: no `extract*`; any absolute / `..` / backslash member
+  refuses the whole archive; only the single regular `cloudflared` member is
+  streamed out. Written to `state_dir()/bin/` via `os.replace`, mode 0o755,
+  `cloudflared.version` sidecar = the release tag (the version shown for an
+  installed binary; nothing downloaded is ever run by the hub except at
+  Publish; a PATH binary is asked `--version` once and cached). Runs in a
+  background thread; failures show in `status().cloudflared.install_error`,
+  only an unsupported platform or `disabled` raises synchronously.
+- **Routes** (`# PUBLISH:` section of app.py): `GET /api/publish[?project_dir=]`,
+  `POST /api/publish/start|stop|renew|install`. start and install need the body
+  `confirm` to be literally `true` (`confirm_required`, 400). Errors are
+  `{error, code}` with 400 bad_ttl/bad_request/confirm_required, 403
+  forbidden_port/disabled, 404 not_found, 409 the rest. Flag `publish_enabled`
+  (default true): off refuses start/renew/install, never stop/status.
+- Known limits: an existing `~/.cloudflared/config.yml` can stop a quick tunnel
+  from starting (not worked around: the command is the contract); the
+  checksum-in-release-notes parser is lenient but unverified against a live
+  release; macOS/Windows/Linux asset names are the documented ones.
