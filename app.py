@@ -11643,6 +11643,92 @@ def _declared_provider_windows(cands):
     return sorted(per.values(), reverse=True)
 
 
+def _declared_window_inputs(model_id=None):
+    """WHY the SAFE declared window of a hub id is what it is, as numbers --
+    the read-only twin of _declared_window_for's safe branch (it changes no
+    value and no state; tests pin that its `final` equals the real figure):
+
+      {"mid", "rule", "final", "raw", "rows", "known", "percentile", "cap",
+       "providers": [(pid, largest known window)] biggest first (NON-RELAY
+       provider ids only), "relay_rows"}
+
+    `rule` is what produced `final`: "percentile" (the 25th percentile over
+    rows is the binding figure), "provider cap" (the 3rd-largest provider's
+    window is lower), "floor" (the raw figure was at or below
+    agentic_chat._DECLARED_WINDOW_MIN and was clamped UP to it), "ceiling",
+    "pinned" (a <pid>/<model> id: that model's own window) or "unknown pool"
+    (too few known windows: no figure, the fixed default applies). Diagnostics
+    only (the `[ctx] declared window inputs:` line). None on any failure."""
+    try:
+        cands, pinned = _tier_pool(model_id)
+        out = {"mid": str(model_id or "auto").strip().lower(), "rule": None,
+               "final": None, "raw": None, "rows": len(cands),
+               "known": sum(1 for _p, _m, w in cands if w), "percentile": None,
+               "cap": None, "providers": [],
+               "relay_rows": sum(1 for p, _m, w in cands if w and _is_relay_pid(p))}
+        if pinned:
+            out["rule"] = "pinned"
+            out["final"] = (cands[0][2] or None) if cands else None
+            return out
+        per = {}
+        for p, _m, w in cands:
+            if w and not _is_relay_pid(p):
+                per[p] = max(per.get(p, 0), int(w))
+        out["providers"] = sorted(per.items(), key=lambda kv: (-kv[1], kv[0]))
+        if _pool_too_unknown(cands):
+            out["rule"] = "unknown pool"
+            return out
+        wins = sorted(w for _p, _m, w in cands if w)
+        pct = wins[int(_DECLARED_PCTL * (len(wins) - 1))]
+        out["percentile"] = int(pct)
+        if not out["providers"]:
+            out["rule"] = "unknown pool"          # every known window is a relay's
+            return out
+        held = [w for _p, w in out["providers"]]
+        cap = held[min(_DECLARED_MIN_PROVIDERS, len(held)) - 1]
+        out["cap"] = int(cap)
+        raw = min(pct, cap)
+        out["raw"] = int(raw)
+        lo, hi = agentic_chat._DECLARED_WINDOW_MIN, agentic_chat._DECLARED_WINDOW_MAX
+        out["final"] = max(lo, min(hi, int(raw)))
+        out["rule"] = ("floor" if raw <= lo else "ceiling" if raw >= hi
+                       else "provider cap" if cap < pct else "percentile")
+        return out
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _declared_inputs_line(info, old=None, new=None, tiers=None):
+    """The `[ctx] declared window inputs:` text for one _declared_window_inputs
+    result: provider ids, their windows, the cap, the rule. Only ids and
+    integers -- never a model name, key or token. Never raises."""
+    try:
+        provs = ", ".join("%s %d" % (p, w) for p, w in info["providers"][:12])
+        if len(info["providers"]) > 12:
+            provs += ", +%d more" % (len(info["providers"]) - 12)
+        rule = info["rule"]
+        if rule == "floor":
+            rule = "floor %d (raw %d from the %s)" % (
+                agentic_chat._DECLARED_WINDOW_MIN, info["raw"],
+                "provider cap" if info["cap"] < info["percentile"] else "percentile")
+        elif rule == "percentile" or rule == "provider cap":
+            rule = "%s (raw %d)" % (rule, info["raw"])
+        # The published figure follows the hysteresis (a raise waits 45 min);
+        # say so when the figure computed NOW is already a different one.
+        now = (" [computed now: %s]" % info["final"]
+               if new is not None and info["final"] not in (None, new) else "")
+        return ("tier %s%s%s%s: rule=%s; percentile=%s over %d rows (%d with a known window, "
+                "%d relay rows); 3rd-provider cap=%s; providers counted (%d, largest "
+                "window each): %s" % (
+                    info["mid"], (" safe %s->%s" % (old, new)) if old is not None else "",
+                    now,
+                    (" (+%d more tiers changed)" % (tiers - 1)) if tiers and tiers > 1 else "",
+                    rule, info["percentile"], info["rows"], info["known"],
+                    info["relay_rows"], info["cap"], len(info["providers"]), provs or "none"))
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 # STABLE PUBLISHED FIGURES. MEASURED 2026-10-03/04 (hub.log): the 30-min resync
 # rewrote opencode.json (and codex's catalog) 7 times in ~7 h -- the computed
 # figures follow the live fleet (models coming and going, windows inferred
@@ -26753,6 +26839,37 @@ def _declared_window_signature():
         + (("<none>", agentic_chat.declared_window(None)),)
 
 
+_declared_inputs_logged = {}        # tier id -> (safe, reach) the last inputs line described
+
+
+def _log_declared_inputs(sig, prev):
+    """ONE extra INFO line next to `[ctx] declared windows changed:` saying WHY
+    the safe figure is what it is (providers counted and their largest windows,
+    the 3rd-provider cap, which rule won -- see _declared_window_inputs).
+    Describes one tier: "auto" when it changed, else the first changed one
+    (the line names how many more moved). At most once per changed figure of a
+    tier. Log only: no value, no policy, no state besides that guard; never
+    raises."""
+    try:
+        moved = [e for e in sig
+                 if e[0] in prev and prev[e[0]] != tuple(e[1:])]
+        if not moved:
+            return
+        pick = (next((e for e in moved if e[0] == "auto"), None)
+                or next((e for e in moved if e[0] != "<none>"), None) or moved[0])
+        key = tuple(pick[1:])
+        if _declared_inputs_logged.get(pick[0]) == key:
+            return
+        _declared_inputs_logged[pick[0]] = key
+        info = _declared_window_inputs(None if pick[0] == "<none>" else pick[0])
+        text = (_declared_inputs_line(info, prev[pick[0]][0], pick[1], len(moved))
+                if info else None)
+        if text:
+            _log.info("[ctx] declared window inputs: %s", text)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _resync_declared_windows_if_changed(force=False):
     """_resync_declared_windows when the declared figures differ from the last
     pass (always with force=True). Never raises."""
@@ -26768,6 +26885,7 @@ def _resync_declared_windows_if_changed(force=False):
         if changed:
             # Which figures moved, so a flip is diagnosable from hub.log.
             _log.info("[ctx] declared windows changed: %s", ", ".join(changed)[:600])
+            _log_declared_inputs(sig, prev)
         done = _resync_declared_windows()
         _declared_resync_last[0] = sig
         return done
