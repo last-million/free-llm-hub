@@ -60,6 +60,10 @@ Details in `AGENTS.md` (one section each, appended at the end). Headlines:
   at most 3 tunnels. `cloudflared` is NOT installed on this PC: the Publish panel's Install button
   downloads the official release only after a click and refuses without a matching SHA-256.
   NEVER run against the real Cloudflare yet: every test used a fake. First real run = owner's call.
+  Hardened after the automated push review (`ec277a6`): an AGENT may publish only a server running from
+  the project's own folder (`not_project_server` otherwise); optional strict mode
+  `agent_publish_requires_approval` (default off) makes `publish_start` wait for the user's click in
+  the Publish panel. Residual risk: an agent can name another service's folder as `project_dir`.
 - **Newest and biggest first inside a family** (`modelrank.py`): higher version first, Opus > Sonnet >
   Haiku (Haiku a small model), older generations stay as fallbacks. Two real bugs fixed: weaker relay
   copies took all 3 relay slots; one failure marked a pair "measured to fail" for ~1.8 h. The g4f
