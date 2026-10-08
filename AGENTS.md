@@ -3157,3 +3157,97 @@ started and nothing contacts Cloudflare in tests).
   helper session never gets the line (`swarm_windows.worker_info`, via
   `craft.set_publish_source(_publish_brief_allowed)`): it has no user to ask. A
   hub without `publish.py` answers `disabled` too.
+
+## Publish button in the Build page (2026-10-08)
+
+Owner request: put the running preview on the internet from the Build page,
+through a FREE Cloudflare quick tunnel, with a countdown until the link
+closes. This is the page's half only; the backend (`/api/publish*`) is a
+separate piece. Covered by `tests/test_publish_ui.py` (static checks, the pure
+helpers and the whole state machine run under node against a fake DOM, and
+both-theme contrast measured from the template's own tokens).
+
+- **Contract the page codes against** (and the ONLY routes it calls, through
+  the dashboard's `api()` helper, which adds the control token and the
+  `X-Free-LLM-Hub: dashboard` header on POSTs): `GET /api/publish?project_dir=`
+  -> `{server_time, cloudflared:{available, path, version, platform,
+  installable, installing, install_error}, tunnels:[{id, project_dir, port,
+  url, state: starting|live|expired|stopped|failed, error, source, started_at,
+  expires_at, ttl_seconds, remaining_seconds}], limits:{default_ttl_minutes,
+  ttl_choices, max_tunnels}}`; `POST /api/publish/start {project_dir, port?,
+  ttl_minutes?, confirm:true}`; `/stop {id}`; `/renew {id, ttl_minutes?}`
+  (new URL, fresh timer); `/install {confirm:true}`. Errors are 4xx
+  `{error, code}`; all ten codes (`no_cloudflared`, `no_preview`,
+  `forbidden_port`, `not_http`, `too_many`, `bad_ttl`, `install_failed`,
+  `not_found`, `already_published`, `disabled`) have plain-English text in
+  `PUB_ERRORS`; an unknown code shows the server's message. A 404 with no code
+  (backend missing) or `disabled` turns the button off with a plain reason.
+- **Where**: `#preview-publish` sits in `#preview-bar` after Run / Stop. It
+  uses `aria-disabled` (not `disabled`) so it stays focusable and
+  `aria-describedby="preview-publish-why"` says "Start the preview first"; it
+  stays usable while a tunnel exists for the folder even if the preview
+  stopped, otherwise a live link could not be stopped. While a link is live
+  the button itself reads "Published · 42:10" (the ticking time is
+  `aria-hidden`, so the button's name does not change every second); under
+  5:00 it reads "Closing soon · 4:12" (words, not only colour).
+- **The panel is IN FLOW** (`#publish-panel`, a non-modal `role="dialog"`
+  between the tab row and the frame), not a floating popover: the preview
+  column has `overflow:hidden` and the root is zoomed (`html{zoom:.8}`), so a
+  positioned popover is clipped or lands in the wrong place. Esc closes it and
+  returns focus to the button; the Files tab hides it with the bar
+  (`publish.paneVisible`). Always visible inside: the warning "Anyone with the
+  link can open this app. Don't publish apps that show private data. The link
+  closes by itself when the timer reaches 0:00."; a TTL `<select>` from
+  `limits.ttl_choices` (default preselected); the required tick box "I
+  understand anyone with the link can open this app" which keeps Publish
+  closed (and is cleared after each publication); when `cloudflared.available`
+  is false an explicit "Install cloudflared" button (says it downloads the
+  official release and verifies its checksum; progress from
+  `installing` / `install_error`) plus the manual command for the platform
+  (`darwin` is tested before `win`, since "darwin" contains "win").
+- **States**: `starting` -> "Starting tunnel..." and a 1.5 s poll that stops as
+  soon as nothing is settling; `live` -> https link (`target=_blank
+  rel="noopener noreferrer"`), Copy link, countdown, Stop, New link (asks "Make
+  a new link? The old link stops working right away." first; focus starts on
+  the safe "Keep this link"; renew keeps the previous length); `expired` ->
+  "Link expired" + "Generate new link"; `failed` -> the error in words + "Try
+  again" (back to the form, which asks for the tick again; the dismissed
+  record is remembered locally because the contract has no delete); `stopped`
+  hides. The status for a folder is fetched on `preview.attach` (page load and
+  project switch); `preview.detach` clears every timer; a late answer for a
+  project the user already left is dropped (a sequence counter, no path
+  comparison, so Windows path spellings cannot matter).
+- **Countdown**: on each status answer the page stores `remaining_seconds` (else
+  `expires_at - server_time`, else `started_at + ttl_seconds - server_time`:
+  only server-clock numbers are compared with each other) and anchors it to
+  `performance.now()` taken BEFORE the request (never later than the server's
+  answer, so the clock can only run slightly early). Every tick derives from
+  the anchor, so a throttled background tab cannot drift; the display is
+  rounded UP, so it reads 0:00 exactly when the link closes. `m:ss`, `h:mm:ss`
+  from one hour. `performance.now()` can stand still while a laptop sleeps, so
+  the page re-reads the status when the tab becomes visible again and every
+  30 s while live; at 0:00 it asks the server once, but shows "Link expired"
+  at once.
+- **Screen readers**: the countdown is `role="timer" aria-live="off"`. One
+  polite status region (`#publish-announce`, outside the panel so it speaks
+  with the panel closed) announces only: published, 5:00 left ("less than 5
+  minutes"), 1:00 left, expired, failed, stopped, copied. A page opened at 0:40
+  says the one-minute line and skips the stale five-minute one.
+- **Safety in the DOM**: the markup is written once and the script only toggles
+  `hidden` and sets `textContent` (so the select, the tick box and focus
+  survive the poll and the tick); backend strings never go through
+  `innerHTML`; a link is only ever an `https://` URL with no spaces or quotes
+  (`pubSafeUrl`; anything else is never made a link); the URL is never written
+  to `localStorage` / `sessionStorage` / cookies.
+- **Look**: theme tokens only (no raw colours in the `publish-css` block),
+  existing `.btn` / `.btn.primary` / `.btn.ghost`, inline SVG icons. Panel
+  controls are 44 RENDERED px (`--pub-tap` divides out the root zoom); the bar
+  button grows to 44 on `(pointer:coarse), (max-width:640px)`. URL and command
+  text wrap (`overflow-wrap:anywhere`); the select is `width:100%` over the
+  global 260 px minimum. `prefers-reduced-motion` removes the button
+  transitions and the press scale; no new animation was added. Contrast pairs
+  (text on panel, warning, "closing soon", live badge, error, link, command,
+  select) are measured >= 4.5:1 in both themes by the test.
+- Not decided here, backend side: whether a tunnel is closed when its preview
+  stops (the page shows whatever the status says), and whether `renew` accepts
+  a `failed` record (the page uses start for that, never renew).

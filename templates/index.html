@@ -2859,6 +2859,83 @@
   .preview-auto{ display:inline-flex; align-items:center; gap:5px; flex:none;
     font-size:11.5px; color:var(--text-dim); cursor:pointer; user-select:none; }
   .preview-auto input{ margin:0; cursor:pointer; }
+  /* publish-css:start */
+  /* Publish: the running preview on the internet through a free Cloudflare
+     quick tunnel. The panel is IN FLOW under the tab row (not a floating
+     popover): the preview column clips overflow and the root is zoomed, so
+     a positioned popover would be cut off or land in the wrong place.
+     Theme tokens only. --pub-tap is 44 RENDERED px (the root zoom divided
+     out, same trick as --tap on phones). */
+  .pub-sr{ position:absolute; width:1px; height:1px; margin:-1px; padding:0; overflow:hidden;
+    clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+  .preview-publish{ flex:none; white-space:nowrap; }
+  .preview-publish .pp-text{ display:inline-block; font-variant-numeric:tabular-nums; }
+  .preview-publish[aria-disabled="true"]{ opacity:.5; cursor:not-allowed; }
+  .preview-publish[aria-disabled="true"]:hover{ background:transparent; border-color:var(--border); }
+  .preview-publish[aria-disabled="true"]:active{ transform:none; }
+  .preview-publish.is-live{ color:var(--ok-text); background:var(--accent-soft); border-color:var(--accent-border); }
+  .preview-publish.is-live:hover{ background:var(--accent-soft); border-color:var(--accent); }
+  .preview-publish.is-soon{ color:var(--warn-text); background:var(--warn-soft); border-color:var(--warn-border); }
+  .preview-publish.is-soon:hover{ background:var(--warn-soft); border-color:var(--warn); }
+  .publish-panel{ --pub-tap:calc(44px / var(--ui-scale, .8)); margin:0 10px; padding:12px 14px 14px;
+    border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2);
+    color:var(--text); font-size:13px; line-height:1.5; max-height:min(440px,62vh);
+    overflow:auto; min-width:0; }
+  .publish-head{ display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .publish-title{ flex:1; min-width:0; font-size:14px; font-weight:700; }
+  .publish-title:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+  .publish-x{ flex:none; min-width:var(--pub-tap); padding:0 !important; }
+  .publish-panel .btn{ min-height:var(--pub-tap); padding:0 16px; }
+  .publish-panel .btn.sm{ font-size:12.5px; }
+  .publish-warn{ display:flex; gap:10px; align-items:flex-start; margin:0 0 10px; padding:10px 12px;
+    border:1px solid var(--warn-border); background:var(--warn-soft); color:var(--text);
+    border-radius:var(--radius-sm); }
+  .publish-warn svg{ flex:none; margin-top:2px; color:var(--warn-text); }
+  .publish-warn strong{ color:var(--warn-text); }
+  .publish-h{ margin:0 0 4px; font-size:13.5px; font-weight:700; }
+  .publish-p{ margin:0 0 8px; font-size:12.5px; color:var(--text-dim); }
+  .publish-field{ display:flex; flex-direction:column; gap:4px; margin:0 0 6px; }
+  .publish-field label{ font-size:12.5px; font-weight:600; color:var(--text-dim); }
+  .publish-panel select{ width:100%; min-width:0; max-width:100%; min-height:var(--pub-tap);
+    background-color:var(--surface); }
+  .publish-consent{ display:flex; align-items:flex-start; gap:10px; min-height:var(--pub-tap);
+    padding:8px 0; cursor:pointer; }
+  .publish-consent input{ flex:none; width:20px; height:20px; margin:1px 0 0; cursor:pointer;
+    accent-color:var(--accent); }
+  .publish-actions{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+  .publish-why{ font-size:12.5px; color:var(--text-dim); }
+  .publish-urlrow{ margin:0 0 6px; }
+  .publish-urlrow a{ display:inline-flex; align-items:center; min-height:var(--pub-tap);
+    font-family:var(--mono); font-size:13px; overflow-wrap:anywhere; word-break:break-all; }
+  .publish-timer{ display:flex; flex-wrap:wrap; align-items:baseline; gap:4px 10px; margin:0 0 10px; }
+  .publish-t-label{ font-size:12.5px; color:var(--text-dim); }
+  .publish-countdown{ font-family:var(--mono); font-size:22px; font-weight:700;
+    font-variant-numeric:tabular-nums; letter-spacing:.02em; color:var(--text); }
+  .publish-countdown.is-soon{ color:var(--warn-text); }
+  .publish-soon{ padding:2px 10px; border:1px solid var(--warn-border); border-radius:999px;
+    background:var(--warn-soft); color:var(--warn-text); font-size:12px; font-weight:700; }
+  .publish-cmd{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:0 0 8px; }
+  .publish-cmd code{ flex:1 1 220px; min-width:0; padding:8px 10px; border:1px solid var(--border-soft);
+    border-radius:var(--radius-sm); background:var(--bg-inset); color:var(--code-text);
+    font-family:var(--mono); font-size:12px; overflow-wrap:anywhere; word-break:break-all;
+    user-select:all; }
+  .publish-confirm{ margin-top:10px; padding:10px 12px; border:1px solid var(--border-strong);
+    border-radius:var(--radius-sm); background:var(--surface); }
+  .publish-confirm p{ margin:0 0 8px; }
+  .publish-err{ margin:10px 0 0; padding:8px 10px; border:1px solid var(--danger-border);
+    border-radius:var(--radius-sm); background:var(--danger-soft); color:var(--danger-text);
+    font-size:12.5px; overflow-wrap:anywhere; }
+  .publish-panel a{ color:var(--info-text); }
+  @media (pointer:coarse), (max-width:640px){
+    .preview-publish{ min-height:calc(44px / var(--ui-scale, .8)); padding-left:14px; padding-right:14px; }
+    .publish-panel{ margin:0 8px; }
+    .publish-actions .btn{ flex:1 1 auto; }
+  }
+  @media (prefers-reduced-motion:reduce){
+    .preview-publish, .publish-panel .btn{ transition:none; }
+    .preview-publish:active, .publish-panel .btn:active{ transform:none; }
+  }
+  /* publish-css:end */
   /* What is currently open, and what it costs. */
   .runpanel{ position:fixed; inset:0; z-index:400; display:grid; place-items:center;
     background:var(--scrim, rgba(0,0,0,.55)); }
@@ -3679,6 +3756,18 @@
               <div class="preview-bar" id="preview-bar">
                 <button class="btn sm primary" id="preview-run" type="button">Run</button>
                 <button class="btn sm ghost" id="preview-stop" type="button" hidden>Stop</button>
+                <!-- Publish: puts the running preview on the internet through a
+                     free Cloudflare quick tunnel (the panel is #publish-panel).
+                     aria-disabled, not disabled: it stays focusable so the
+                     reason is reachable. The ticking time is aria-hidden so the
+                     button's name does not change every second. -->
+                <button class="btn sm ghost preview-publish" id="preview-publish" type="button"
+                        aria-disabled="true" aria-expanded="false" aria-controls="publish-panel"
+                        aria-describedby="preview-publish-why" title="Start the preview first">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+                  <span class="pp-text"><span id="preview-publish-label">Publish</span><span id="preview-publish-time" aria-hidden="true" hidden></span></span>
+                </button>
+                <span class="pub-sr" id="preview-publish-why">Start the preview first</span>
                 <span class="preview-state" id="preview-state">not running</span>
                 <label class="preview-auto" title="After each turn: pick up whatever the agent started, run the project if it did not, and refresh this pane">
                   <input type="checkbox" id="preview-auto" checked>
@@ -3711,7 +3800,102 @@
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>
                 </button>
               </div>
+              <!-- Outside #preview-bar on purpose: the Files tab hides the bar, and
+                   the 5:00 / 1:00 / expired announcements must still be spoken. -->
+              <span class="pub-sr" id="publish-announce" role="status" aria-live="polite"></span>
               </div>
+              <!-- PUBLISH panel. In flow (not floating): this column clips its
+                   overflow. Written once; the script only toggles hidden and
+                   sets text, so the select, the tick box and focus survive the
+                   1.5 s poll and the 1 s countdown. Every backend string goes
+                   in with textContent. -->
+              <section class="publish-panel" id="publish-panel" role="dialog" aria-modal="false" aria-labelledby="publish-title" hidden>
+                <div class="publish-head">
+                  <h3 class="publish-title" id="publish-title" tabindex="-1">Publish on the internet</h3>
+                  <button class="btn sm ghost publish-x" id="publish-close" type="button" aria-label="Close the publish panel" title="Close">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                  </button>
+                </div>
+                <div class="publish-warn" id="publish-warning" role="note">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m10.3 3.9-8.2 14A2 2 0 0 0 3.8 21h16.4a2 2 0 0 0 1.7-3.1l-8.2-14a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+                  <p><strong>Before you publish.</strong> Anyone with the link can open this app. Don't publish apps that show private data. The link closes by itself when the timer reaches 0:00.</p>
+                </div>
+
+                <div id="publish-install" hidden>
+                  <p class="publish-h">cloudflared is not installed</p>
+                  <p class="publish-p">Publishing uses cloudflared, Cloudflare's free tunnel tool. The button below downloads the official release from Cloudflare and verifies its checksum before anything runs.</p>
+                  <div class="publish-actions">
+                    <button class="btn" id="publish-install-btn" type="button">Install cloudflared</button>
+                  </div>
+                  <p class="publish-p" id="publish-install-status" role="status" hidden></p>
+                  <div id="publish-manual">
+                    <p class="publish-p">Or install it yourself, then reopen this panel:</p>
+                    <div class="publish-cmd" id="publish-install-cmdrow">
+                      <code id="publish-install-cmd"></code>
+                      <button class="btn sm ghost" id="publish-install-copy" type="button">Copy command</button>
+                    </div>
+                    <p class="publish-p"><a href="https://github.com/cloudflare/cloudflared/releases/latest" target="_blank" rel="noopener noreferrer">Official cloudflared downloads (opens in a new tab)</a></p>
+                  </div>
+                </div>
+
+                <div id="publish-form">
+                  <div class="publish-field">
+                    <label for="publish-ttl">Keep the link open for</label>
+                    <select id="publish-ttl"></select>
+                  </div>
+                  <label class="publish-consent" for="publish-consent">
+                    <input type="checkbox" id="publish-consent" required>
+                    <span>I understand anyone with the link can open this app</span>
+                  </label>
+                  <div class="publish-actions">
+                    <button class="btn primary" id="publish-start" type="button" disabled aria-describedby="publish-start-why">Publish</button>
+                    <span class="publish-why" id="publish-start-why"></span>
+                  </div>
+                </div>
+
+                <div id="publish-live" hidden>
+                  <div id="publish-v-starting" hidden>
+                    <p class="publish-h">Starting tunnel&hellip;</p>
+                    <p class="publish-p">This usually takes a few seconds. The link appears here as soon as it is ready.</p>
+                  </div>
+                  <div id="publish-v-live" hidden>
+                    <p class="publish-h">Your app is public at</p>
+                    <p class="publish-urlrow"><a id="publish-url" href="#" target="_blank" rel="noopener noreferrer"></a></p>
+                    <div class="publish-timer">
+                      <span class="publish-t-label" id="publish-t-label">Time left</span>
+                      <span class="publish-countdown" id="publish-countdown" role="timer" aria-live="off" aria-labelledby="publish-t-label">0:00</span>
+                      <span class="publish-soon" id="publish-soon" hidden>Closing soon</span>
+                    </div>
+                    <div class="publish-actions">
+                      <button class="btn" id="publish-copy" type="button">Copy link</button>
+                      <button class="btn" id="publish-stop" type="button">Stop</button>
+                      <button class="btn" id="publish-renew" type="button">New link</button>
+                    </div>
+                    <div class="publish-confirm" id="publish-renew-confirm" role="group" aria-labelledby="publish-renew-q" hidden>
+                      <p id="publish-renew-q">Make a new link? The old link stops working right away.</p>
+                      <div class="publish-actions">
+                        <button class="btn primary" id="publish-renew-yes" type="button">Make new link</button>
+                        <button class="btn ghost" id="publish-renew-no" type="button">Keep this link</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div id="publish-v-expired" hidden>
+                    <p class="publish-h">Link expired</p>
+                    <p class="publish-p">The public link is closed. Nobody can open it any more.</p>
+                    <div class="publish-actions">
+                      <button class="btn primary" id="publish-expired-renew" type="button">Generate new link</button>
+                    </div>
+                  </div>
+                  <div id="publish-v-failed" hidden>
+                    <p class="publish-h">Could not publish</p>
+                    <p class="publish-err" id="publish-failed-msg"></p>
+                    <div class="publish-actions" style="margin-top:10px">
+                      <button class="btn primary" id="publish-failed-retry" type="button">Try again</button>
+                    </div>
+                  </div>
+                </div>
+                <p class="publish-err" id="publish-error" role="alert" hidden></p>
+              </section>
               <div class="preview-frame-wrap">
                 <iframe id="preview-frame" class="preview-frame" title="Live preview of your project" hidden></iframe>
                 <div class="preview-placeholder" id="preview-placeholder">
@@ -10367,6 +10551,9 @@
           probList.appendChild(li);
         });
         logEl.textContent = (st.log || []).join('\n');
+        /* The Publish button follows the preview: idempotent, this runs on
+           every 2 s status poll. */
+        if (typeof publish !== 'undefined' && publish) publish.previewState(running, st.port);
       }
 
       /* A problem becomes a real instruction, with the raw line attached — the
@@ -10497,6 +10684,7 @@
         filesPane.hidden = !files;
         $('#preview-bar').hidden = files;
         frame.parentElement.hidden = files;
+        if (typeof publish !== 'undefined' && publish) publish.paneVisible(!files);
         probBox.hidden = files || (!probList.children.length && !logEl.textContent);
         if (files && !treeLoaded){ loadTree(treeRel); treeLoaded = true; }
         if (files) startTreeWatch();
@@ -10763,6 +10951,9 @@
           api('/api/workspace/status?project_dir=' + encodeURIComponent(d) + '&discover=1')
             .then(render).catch(function(){});
           poll(); startPolling(); startTreeWatch();
+          /* ...and ask whether this folder already has a public link (a reload
+             must still show the live tunnel and its countdown). */
+          if (typeof publish !== 'undefined' && publish) publish.attach(d);
         },
         noticeUrls: noticeUrlsIn,
         afterTurn: afterTurn,
@@ -10781,9 +10972,514 @@
           treeRel = ''; treeSig = ''; treeSel = '';
           dir = null;
           render({ running: false, state: 'idle' });
+          if (typeof publish !== 'undefined' && publish) publish.detach();
         }
       };
     })();
+
+    /* publish-js:start */
+    /* ── Publish (free Cloudflare quick tunnel) ──────────────────────────────
+       The backend contract is five routes and nothing else:
+         GET  /api/publish?project_dir=   status: cloudflared, tunnels, limits
+         POST /api/publish/start          {project_dir, port?, ttl_minutes?, confirm:true}
+         POST /api/publish/stop           {id}
+         POST /api/publish/renew          {id, ttl_minutes?}   (new URL, fresh timer)
+         POST /api/publish/install        {confirm:true}
+       The DOM is written once in the page; this only toggles hidden and sets
+       text, so the select, the tick box and keyboard focus survive the 1.5 s
+       status poll and the 1 s countdown. Backend strings go in with
+       textContent, and an href only when it starts with https://. The URL is
+       never stored anywhere in the browser. */
+    var publish = (function(){
+      /* publish-pure:start */
+      var PUB_ERRORS = {
+        no_cloudflared: "cloudflared is not installed yet. Install it first, then try again.",
+        no_preview: "Start the preview first, then publish it.",
+        forbidden_port: "This app runs on a port that cannot be published.",
+        not_http: "This app does not answer web (HTTP) requests, so it cannot be published.",
+        too_many: "Too many public links are open already. Stop one first.",
+        bad_ttl: "That time is not allowed. Pick another one from the list.",
+        install_failed: "cloudflared could not be installed. Use the manual command instead.",
+        not_found: "That link no longer exists. Refreshing.",
+        already_published: "This app is already published. Showing the current link.",
+        disabled: "Publishing is turned off on this hub."
+      };
+      var PUB_DEFAULT_TTLS = [15, 60, 240, 720, 1440];
+      var PUB_SOON = 300, PUB_LAST_MINUTE = 60;
+      function pubErrorText(code, fallback){
+        if (code && Object.prototype.hasOwnProperty.call(PUB_ERRORS, code)) return PUB_ERRORS[code];
+        var f = String(fallback == null ? '' : fallback).trim();
+        return f || "Something went wrong. Please try again.";
+      }
+      /* Seconds since the epoch from a number (seconds or ms) or a date string. */
+      function pubEpoch(v){
+        var n = NaN;
+        if (typeof v === 'number') n = v;
+        else if (typeof v === 'string' && v.trim()){
+          n = Number(v);
+          if (!isFinite(n)){ var d = Date.parse(v); return isNaN(d) ? NaN : d / 1000; }
+        }
+        if (!isFinite(n)) return NaN;
+        return n > 100000000000 ? n / 1000 : n;
+      }
+      /* Seconds left AT THE MOMENT THE SERVER ANSWERED. Only server-clock
+         numbers are compared with each other (expires_at - server_time), never
+         with this computer's clock, so a wrong local clock cannot skew it. */
+      function pubRemainingAt(t, serverTime){
+        if (!t) return NaN;
+        if (typeof t.remaining_seconds === 'number' && isFinite(t.remaining_seconds)){
+          return Math.max(0, t.remaining_seconds);
+        }
+        var now = pubEpoch(serverTime), end = pubEpoch(t.expires_at);
+        if (isFinite(now) && isFinite(end)) return Math.max(0, end - now);
+        var start = pubEpoch(t.started_at), ttl = Number(t.ttl_seconds);
+        if (isFinite(now) && isFinite(start) && isFinite(ttl) && ttl > 0) return Math.max(0, start + ttl - now);
+        return NaN;
+      }
+      /* m:ss, or h:mm:ss from one hour up. Rounded UP so the clock reads 0:00
+         exactly when the link closes. */
+      function pubFmtClock(sec){
+        var s = Math.ceil(Number(sec));
+        if (!isFinite(s) || s < 0) s = 0;
+        var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+        var two = function(n){ return (n < 10 ? '0' : '') + n; };
+        return h > 0 ? h + ':' + two(m) + ':' + two(r) : m + ':' + two(r);
+      }
+      function pubIsSoon(sec){ return isFinite(sec) && sec > 0 && sec <= PUB_SOON; }
+      /* The two spoken warnings (5:00 and 1:00 left). Each fires once: the
+         caller keeps `fired` and passes it back. A page opened at 0:40 says
+         the one-minute line and skips the five-minute one. */
+      function pubAnnounce(sec, fired){
+        var f = { m5: !!(fired && fired.m5), m1: !!(fired && fired.m1) };
+        var msg = '';
+        if (!isFinite(sec) || sec <= 0) return { msg: msg, fired: f };
+        if (sec <= PUB_LAST_MINUTE && !f.m1){
+          f.m1 = true; f.m5 = true;
+          msg = "Your public link closes in less than 1 minute.";
+        } else if (sec <= PUB_SOON && !f.m5){
+          f.m5 = true;
+          msg = "Your public link closes in less than 5 minutes.";
+        }
+        return { msg: msg, fired: f };
+      }
+      function pubTtlLabel(min, isDefault){
+        var m = Math.round(Number(min));
+        var t = m < 60 ? m + (m === 1 ? ' minute' : ' minutes')
+              : (m % 60 === 0 ? (m / 60) + (m === 60 ? ' hour' : ' hours')
+                              : Math.floor(m / 60) + ' h ' + (m % 60) + ' min');
+        return isDefault ? t + ' (default)' : t;
+      }
+      function pubSafeUrl(u){
+        var s = String(u == null ? '' : u).trim();
+        return /^https:\/\/[^\s<>"']+$/i.test(s) ? s : '';
+      }
+      /* "darwin" contains "win", so macOS is tested first. */
+      function pubInstallCommand(platform){
+        var p = String(platform || '').toLowerCase();
+        if (p.indexOf('darwin') !== -1 || p.indexOf('mac') !== -1) return 'brew install cloudflared';
+        if (p.indexOf('win') !== -1) return 'winget install --id Cloudflare.cloudflared';
+        if (p.indexOf('linux') !== -1){
+          return 'curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb && sudo dpkg -i cloudflared.deb';
+        }
+        return '';
+      }
+      /* Which tunnel to show for a folder: live, then starting, then expired,
+         then failed (newest first inside a state). `stopped` is never shown.
+         `skip` holds keys the user dismissed ("Try again"). */
+      function pubKey(t){ return t ? [t.id, t.url, t.started_at].join('|') : ''; }
+      function pubPickTunnel(list, skip){
+        var rank = { live: 4, starting: 3, expired: 2, failed: 1 };
+        var best = null;
+        (Array.isArray(list) ? list : []).forEach(function(t){
+          if (!t || !rank[t.state]) return;
+          if (skip && skip[pubKey(t)]) return;
+          if (!best || rank[t.state] > rank[best.state] ||
+              (rank[t.state] === rank[best.state] && pubEpoch(t.started_at) > pubEpoch(best.started_at))){
+            best = t;
+          }
+        });
+        return best;
+      }
+      /* publish-pure:end */
+
+      var btn = $('#preview-publish'), btnLabel = $('#preview-publish-label');
+      var btnTime = $('#preview-publish-time'), whyEl = $('#preview-publish-why');
+      var sayEl = $('#publish-announce');
+      var panel = $('#publish-panel'), titleEl = $('#publish-title'), closeBtn = $('#publish-close');
+      var installBox = $('#publish-install'), installBtn = $('#publish-install-btn');
+      var installStatus = $('#publish-install-status'), installCmd = $('#publish-install-cmd');
+      var installCmdRow = $('#publish-install-cmdrow'), installCopy = $('#publish-install-copy');
+      var installManual = $('#publish-manual');
+      var form = $('#publish-form'), ttlSel = $('#publish-ttl'), consent = $('#publish-consent');
+      var startBtn = $('#publish-start'), startWhy = $('#publish-start-why');
+      var liveBox = $('#publish-live'), vStarting = $('#publish-v-starting'), vLive = $('#publish-v-live');
+      var vExpired = $('#publish-v-expired'), vFailed = $('#publish-v-failed');
+      var urlA = $('#publish-url'), countdown = $('#publish-countdown'), soonTag = $('#publish-soon');
+      var copyBtn = $('#publish-copy'), stopBtn = $('#publish-stop'), renewBtn = $('#publish-renew');
+      var confirmBox = $('#publish-renew-confirm'), confirmYes = $('#publish-renew-yes');
+      var confirmNo = $('#publish-renew-no'), expiredBtn = $('#publish-expired-renew');
+      var failedMsg = $('#publish-failed-msg'), failedBtn = $('#publish-failed-retry');
+      var errEl = $('#publish-error');
+
+      var dir = null, isOpen = false, paneOn = true;
+      var previewOn = false, previewPort = null;
+      var offText = '';                 // set when the hub says publishing is off or missing
+      var data = null, tun = null, key = '';
+      var anchor = 0, remainAt = NaN;   // remainAt seconds were left at performance.now() === anchor
+      var seq = 0, busy = false, installPending = false, failsInRow = 0;
+      var pollT = null, tickT = null, slowT = null, copyBusy = false;
+      var fired = { m5: false, m1: false }, expiryAsked = '', lastView = 'none';
+      var dismissed = {};
+
+      function setText(el, txt){ if (el && el.textContent !== txt) el.textContent = txt; }
+      function setHidden(el, h){ if (el && el.hidden !== !!h) el.hidden = !!h; }
+      function announce(msg){
+        if (!sayEl || !msg) return;
+        sayEl.textContent = '';
+        setTimeout(function(){ sayEl.textContent = msg; }, 40);
+      }
+      function showErr(txt){ setText(errEl, txt || ''); setHidden(errEl, !txt); }
+      function secondsLeft(){
+        return isFinite(remainAt) ? remainAt - (performance.now() - anchor) / 1000 : NaN;
+      }
+      function ttlChoices(){
+        var l = data && data.limits;
+        return (l && Array.isArray(l.ttl_choices) && l.ttl_choices.length) ? l.ttl_choices : PUB_DEFAULT_TTLS;
+      }
+      function view(){
+        if (!tun || tun.state === 'stopped') return 'none';
+        if (tun.state === 'live'){
+          if (!pubSafeUrl(tun.url)) return 'starting';
+          var s = secondsLeft();
+          if (isFinite(s) && s <= 0) return 'expired';
+        }
+        return tun.state;
+      }
+      function buildTtl(){
+        var l = data && data.limits;
+        var choices = ttlChoices();
+        var def = (l && Number(l.default_ttl_minutes)) || 60;
+        var sig = choices.join(',') + '|' + def;
+        if (ttlSel.getAttribute('data-sig') === sig) return;
+        var keep = Number(ttlSel.value);
+        while (ttlSel.firstChild) ttlSel.removeChild(ttlSel.firstChild);
+        choices.forEach(function(m){
+          var o = document.createElement('option');
+          o.value = String(m);
+          o.textContent = pubTtlLabel(m, m === def);
+          ttlSel.appendChild(o);
+        });
+        ttlSel.value = String(choices.indexOf(keep) !== -1 ? keep : def);
+        ttlSel.setAttribute('data-sig', sig);
+      }
+
+      function render(){
+        var v = view();
+        var cf = (data && data.cloudflared) || {};
+        var haveTunnel = v !== 'none';
+        var usable = !!dir && !offText && (previewOn || haveTunnel);
+        var whyNow = offText || 'Start the preview first';
+
+        /* the button, and the live badge on it */
+        btn.setAttribute('aria-disabled', usable ? 'false' : 'true');
+        var tip = usable ? 'Put this preview on the internet' : whyNow;
+        if (btn.title !== tip) btn.title = tip;
+        setText(whyEl, usable ? 'Opens the publish panel' : whyNow);
+        var live = v === 'live';
+        var s = secondsLeft();
+        var soon = live && pubIsSoon(s);
+        btn.classList.toggle('is-live', live && !soon);
+        btn.classList.toggle('is-soon', soon);
+        setText(btnLabel, soon ? 'Closing soon' : live ? 'Published' :
+                          v === 'starting' ? 'Starting…' : v === 'expired' ? 'Link expired' : 'Publish');
+        setHidden(btnTime, !live);
+        if (live) setText(btnTime, ' · ' + (isFinite(s) ? pubFmtClock(s) : '--:--'));
+
+        /* spoken changes, once each (never the per-second tick) */
+        if (v !== lastView){
+          if (v === 'live' && lastView === 'starting') announce('Your app is published. The link is in the panel.');
+          else if (v === 'expired' && lastView === 'live') announce('Your public link has expired.');
+          else if (v === 'failed' && (lastView === 'starting' || lastView === 'live')) announce('Publishing failed.');
+          lastView = v;
+        }
+
+        /* the panel */
+        var shown = isOpen && paneOn;
+        setHidden(panel, !shown);
+        btn.setAttribute('aria-expanded', shown ? 'true' : 'false');
+        setHidden(installBox, !(data && cf.available === false && !haveTunnel));
+        if (cf.available === false){
+          var cmd = pubInstallCommand(cf.platform);
+          setText(installCmd, cmd);
+          setHidden(installCmdRow, !cmd);
+          var auto = cf.installable !== false;
+          setHidden(installBtn, !auto);
+          var working = installPending || !!cf.installing;
+          installBtn.disabled = working;
+          setText(installBtn, working ? 'Installing…' : 'Install cloudflared');
+          var st = working ? 'Downloading cloudflared and checking its checksum. This can take a minute.'
+                 : cf.install_error ? 'Install failed: ' + cf.install_error
+                 : !auto ? 'Automatic install is not available on this computer. Use the command below.' : '';
+          setText(installStatus, st);
+          setHidden(installStatus, !st);
+        }
+
+        setHidden(form, haveTunnel);
+        if (!haveTunnel){
+          var reason = offText ? offText
+                     : !data ? 'Checking…'
+                     : cf.available === false ? 'Install cloudflared first.'
+                     : !previewOn ? 'Start the preview first.'
+                     : !consent.checked ? 'Tick the box above to continue.' : '';
+          startBtn.disabled = !!reason || busy;
+          setText(startBtn, busy ? 'Publishing…' : 'Publish');
+          setText(startWhy, busy ? '' : reason);
+        }
+
+        setHidden(liveBox, !haveTunnel);
+        setHidden(vStarting, v !== 'starting');
+        setHidden(vLive, v !== 'live');
+        setHidden(vExpired, v !== 'expired');
+        setHidden(vFailed, v !== 'failed');
+        if (v !== 'live') setHidden(confirmBox, true);
+        if (live){
+          var u = pubSafeUrl(tun.url);
+          if (urlA.getAttribute('href') !== u) urlA.setAttribute('href', u);
+          setText(urlA, u);
+          setText(countdown, isFinite(s) ? pubFmtClock(s) : 'unknown');
+          countdown.classList.toggle('is-soon', soon);
+          setHidden(soonTag, !soon);
+        }
+        if (v === 'failed'){
+          setText(failedMsg, 'The tunnel could not start.' + (tun.error ? ' ' + String(tun.error).slice(0, 240) : ''));
+        }
+        renewBtn.disabled = busy; stopBtn.disabled = busy;
+        expiredBtn.disabled = busy; failedBtn.disabled = busy;
+      }
+
+      function syncTimers(){
+        var v = view();
+        var cf = (data && data.cloudflared) || {};
+        /* 1.5 s while something is still settling: a tunnel starting, or the
+           cloudflared download. Stops the moment both are done. */
+        var needPoll = !!dir && (v === 'starting' || !!cf.installing || installPending);
+        if (needPoll && !pollT) pollT = setInterval(function(){ if (!document.hidden) load(true); }, 1500);
+        if (!needPoll && pollT){ clearInterval(pollT); pollT = null; }
+        var needTick = v === 'live';
+        if (needTick && !tickT) tickT = setInterval(tick, 1000);
+        if (!needTick && tickT){ clearInterval(tickT); tickT = null; }
+        /* A slow re-sync with the server while live (it can stop or expire a
+           link on its own, and a computer that slept pauses performance.now). */
+        if (needTick && !slowT) slowT = setInterval(function(){ if (!document.hidden) load(true); }, 30000);
+        if (!needTick && slowT){ clearInterval(slowT); slowT = null; }
+      }
+      function stopTimers(){
+        [pollT, tickT, slowT].forEach(function(t){ if (t) clearInterval(t); });
+        pollT = tickT = slowT = null;
+      }
+
+      function tick(){
+        var s = secondsLeft();
+        if (isFinite(s)){
+          var a = pubAnnounce(s, fired);
+          fired = a.fired;
+          if (a.msg) announce(a.msg);
+          if (s <= 0 && expiryAsked !== key){ expiryAsked = key; load(true); }  // the server decides "expired"
+        }
+        render();
+        syncTimers();
+      }
+
+      function adopt(t, serverTime, sentAt){
+        var k = pubKey(t);
+        if (k !== key){ key = k; fired = { m5: false, m1: false }; expiryAsked = ''; }
+        tun = t;
+        if (t && t.state === 'live'){ remainAt = pubRemainingAt(t, serverTime); anchor = sentAt; }
+        else remainAt = NaN;
+      }
+      function ingest(j, sentAt){
+        data = j || {};
+        offText = '';
+        adopt(pubPickTunnel(data.tunnels, dismissed), data.server_time, sentAt);
+        buildTtl();
+        render();
+        syncTimers();
+      }
+      function takeTunnel(t, sentAt){
+        data = data || {};
+        data.tunnels = t ? [t] : [];
+        adopt(pubPickTunnel(data.tunnels, dismissed), data.server_time, sentAt);
+        render();
+        syncTimers();
+      }
+
+      function load(quiet){
+        if (!dir) return Promise.resolve();
+        var d = dir, mine = ++seq, sentAt = performance.now();
+        return api('/api/publish?project_dir=' + encodeURIComponent(d))
+          .then(function(j){
+            if (mine !== seq || d !== dir) return;          // an older answer, or another project
+            failsInRow = 0;
+            ingest(j, sentAt);
+          })
+          .catch(function(err){
+            if (mine !== seq || d !== dir) return;
+            var code = err && err.body && err.body.code;
+            if (code === 'disabled' || (err && err.status === 404 && !code)){
+              offText = code === 'disabled' ? pubErrorText('disabled')
+                      : 'Publishing is not available in this version of the hub.';
+              tun = null; remainAt = NaN;
+              render(); syncTimers();
+              return;
+            }
+            if (++failsInRow >= 3){
+              stopTimers();
+              showErr('Lost contact with the hub. Close and reopen this panel to try again.');
+            } else if (!quiet){
+              showErr(pubErrorText(code, err && err.message));
+            }
+          });
+      }
+
+      function fail(err){
+        var code = err && err.body && err.body.code;
+        showErr(pubErrorText(code, err && err.message));
+        if (code === 'already_published' || code === 'not_found' || code === 'no_cloudflared') load(true);
+      }
+
+      function doStart(){
+        if (startBtn.disabled || !dir) return;
+        var body = { project_dir: dir, ttl_minutes: Number(ttlSel.value) || undefined, confirm: true };
+        if (previewPort) body.port = previewPort;
+        var sentAt = performance.now();
+        busy = true; seq++; showErr(''); render();
+        api('/api/publish/start', { method: 'POST', body: body })
+          .then(function(r){
+            consent.checked = false;                       // each publication is a fresh yes
+            if (r && r.tunnel) takeTunnel(r.tunnel, sentAt);
+            else return load(true);                        // no tunnel in the answer: ask, never show "nothing"
+          })
+          .catch(fail)
+          .then(function(){ busy = false; render(); });
+      }
+      function doStop(){
+        if (!tun || busy) return;
+        busy = true; seq++; showErr(''); render();
+        api('/api/publish/stop', { method: 'POST', body: { id: tun.id } })
+          .then(function(){ announce('Publishing stopped. The link is closed.'); takeTunnel(null, 0); })
+          .catch(fail)
+          .then(function(){ busy = false; render(); return load(true); });
+      }
+      function doRenew(){
+        if (!tun || busy) return;
+        var body = { id: tun.id };
+        var m = Math.round(Number(tun.ttl_seconds) / 60);
+        if (isFinite(m) && ttlChoices().indexOf(m) !== -1) body.ttl_minutes = m;   // same length as before
+        var sentAt = performance.now();
+        busy = true; seq++; showErr(''); setHidden(confirmBox, true); render();
+        api('/api/publish/renew', { method: 'POST', body: body })
+          .then(function(r){
+            announce('A new link is being made. The old link no longer works.');
+            if (r && r.tunnel) takeTunnel(r.tunnel, sentAt);
+            else return load(true);                        // renew's answer is not pinned down: ask
+          })
+          .catch(fail)
+          .then(function(){ busy = false; render(); });
+      }
+      function doInstall(){
+        if (installPending) return;
+        installPending = true; seq++; showErr(''); render(); syncTimers();
+        api('/api/publish/install', { method: 'POST', body: { confirm: true } })
+          .then(function(){ return load(true); })
+          .catch(fail)
+          .then(function(){ installPending = false; render(); syncTimers(); });
+      }
+      function copyWith(text, b, done){
+        if (copyBusy || !text) return;
+        copyBusy = true;
+        copyText(text, b);
+        setTimeout(function(){ announce(b.textContent === 'Copied!' ? done : 'Could not copy. Select the text and copy it by hand.'); }, 200);
+        setTimeout(function(){ copyBusy = false; }, 1600);
+      }
+
+      function setOpen(v, restoreFocus){
+        var wasOpen = isOpen;
+        isOpen = !!v;
+        if (isOpen && !wasOpen){ showErr(''); failsInRow = 0; load(false); }
+        render();
+        if (isOpen && !wasOpen){ if (panel.hidden === false) titleEl.focus(); }
+        else if (!isOpen && wasOpen && restoreFocus) btn.focus();
+      }
+
+      btn.addEventListener('click', function(){
+        if (btn.getAttribute('aria-disabled') === 'true'){ toast(btn.title || 'Start the preview first'); return; }
+        setOpen(!isOpen, true);
+      });
+      closeBtn.addEventListener('click', function(){ setOpen(false, true); });
+      panel.addEventListener('keydown', function(e){
+        if (e.key !== 'Escape') return;
+        e.stopPropagation();
+        if (!confirmBox.hidden){ setHidden(confirmBox, true); renewBtn.focus(); return; }
+        setOpen(false, true);
+      });
+      btn.addEventListener('keydown', function(e){
+        if (e.key === 'Escape' && isOpen){ e.stopPropagation(); setOpen(false, false); }
+      });
+      consent.addEventListener('change', render);
+      startBtn.addEventListener('click', doStart);
+      stopBtn.addEventListener('click', doStop);
+      renewBtn.addEventListener('click', function(){ setHidden(confirmBox, false); confirmNo.focus(); });
+      confirmNo.addEventListener('click', function(){ setHidden(confirmBox, true); renewBtn.focus(); });
+      confirmYes.addEventListener('click', doRenew);
+      expiredBtn.addEventListener('click', doRenew);
+      failedBtn.addEventListener('click', function(){
+        if (key) dismissed[key] = true;                    // back to the form, which asks for the tick again
+        showErr('');
+        adopt(null, null, 0);
+        render(); syncTimers();
+        consent.focus();
+      });
+      installBtn.addEventListener('click', doInstall);
+      copyBtn.addEventListener('click', function(){ copyWith(pubSafeUrl(tun && tun.url), copyBtn, 'Link copied.'); });
+      installCopy.addEventListener('click', function(){ copyWith(installCmd.textContent, installCopy, 'Command copied.'); });
+
+      /* A computer that slept froze performance.now(): ask the server again
+         the moment the tab is back. Timers stop with the page. */
+      document.addEventListener('visibilitychange', function(){ if (!document.hidden && dir) load(true); });
+      window.addEventListener('pagehide', stopTimers);
+
+      function reset(){
+        stopTimers();
+        seq++;
+        data = null; tun = null; key = ''; remainAt = NaN;
+        isOpen = false; busy = false; installPending = false; failsInRow = 0;
+        fired = { m5: false, m1: false }; expiryAsked = ''; lastView = 'none';
+        dismissed = {}; offText = '';
+        consent.checked = false;
+        setHidden(confirmBox, true);
+        showErr('');
+      }
+      buildTtl();
+      render();
+
+      return {
+        attach: function(d){
+          reset(); dir = d;
+          previewOn = false; previewPort = null;      // the preview poll says otherwise within 2 s
+          render(); load(true);
+        },
+        detach: function(){ reset(); dir = null; previewOn = false; previewPort = null; render(); },
+        previewState: function(running, port){
+          var p = Number(port) > 0 ? Number(port) : null;
+          running = !!running;
+          if (running === previewOn && p === previewPort) return;
+          previewOn = running; previewPort = p;
+          render();
+        },
+        paneVisible: function(on){ on = !!on; if (on !== paneOn){ paneOn = on; render(); } }
+      };
+    })();
+    /* publish-js:end */
 
     function prefersReducedMotion(){
       try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; }
