@@ -2484,3 +2484,72 @@ the suite while failing live. Run the suite under the `.venv` after touching
 imports or `requirements.txt`.
 
 The full suite is green (5985 tests, 2026-10-03); a new failure is a real regression.
+
+## Old tool results are cleared on big turns (2026-10-08)
+
+Covered by `tests/test_old_tool_result_clearing.py`. MEASURED hub.log
+2026-10-08 (OpenCode `coding-swarm`): ~85K-token tool turns timed out on free
+models (`CHAT-DEADLINE est=85203 ... _HopBudgetExceeded no answer within
+106s`; only a handful of models hold 85K and they are slow at that size) and,
+on a slow uplink (~20 KB/s measured), an 85K-token body (~340 KB) is ~17 s of
+UPLOAD per hop, re-sent on every hop. Most of those tokens are OLD tool outputs.
+
+- **What**: `ctxwin.clear_old_tool_results(messages, keep_recent=8,
+  min_chars=1500)` -> `(messages, stats)` replaces the CONTENT of an older tool
+  result longer than `min_chars` with ONE line, `[tool output cleared by the hub
+  to save context (was ~N chars): <first 160 chars, one line>. Re-run the command
+  if you need it.]` (`ctxwin.cleared_stub`). No model call. No message is removed
+  or reordered and no id is touched, so every tool call keeps its result by
+  construction. Pure; handles all three wire shapes (OpenAI role `tool`,
+  Anthropic `tool_result` blocks incl. `is_error`, Responses
+  `function_call_output` items); the input is never mutated, a changed message
+  is a copy, and when nothing changes the SAME list comes back.
+- **Never touched**: the newest `keep_recent` message UNITS (a call + its
+  results = one unit; `ctxwin.unit_spans`, which `app._message_units` now
+  delegates to, so compaction and clearing agree), the leading system messages,
+  the message carrying the latest real instruction, the results of the LAST 3
+  failing steps (`ctxwin.looks_failed`: non-zero exit, traceback, failing tests,
+  compiler errors, `is_error`; head+tail of the text only, liberal on purpose --
+  a false positive only protects one more of three units), any message with an
+  image, a CLI's own compaction request, a result already cleared, a request
+  under `OLD_RESULT_CLEAR_FROM_TOKENS` (60000 estimated tokens, tools included).
+- **Wired once**: `app._clear_old_results_for_hop`, called per hop in
+  `_upstream_chat` right after the craft brief / model guide / goal note and
+  BEFORE `_compact_to_budget`. Every protocol (chat, responses, messages; stream
+  and non-stream; pipelines, roles, hedges) reaches a provider through
+  `_clock.dispatch` -> `_dispatch_chat` -> `_upstream_chat` as OpenAI-shaped
+  messages, so this is the one code path. Only what is SENT shrinks: handlers
+  keep the original messages and estimate, so routing is unchanged.
+- **Kill switch**: config flag `old_tool_result_clearing` (default on). Set it
+  `false` in `config.json` (or `config.set_flag("old_tool_result_clearing",
+  False)`) and every hop goes out byte-for-byte as before. Log: one line per
+  request, `[ctx] cleared N old tool results (X -> Y est tokens)`.
+- **Reported usage is unchanged** (CLIs compact on that number): a hop that
+  cleared notes `_ctx_note_hop(pid, model, <size BEFORE clearing>, <size sent>)`
+  whether or not compaction also ran (it used to be noted only when compaction
+  ran, so a clear-only hop would have reported the small upstream count). The
+  refit path composes with it (tested: a first-pass 400 that teaches
+  the window, then the refit).
+- **Compaction still sees what was said**: `_compact_to_budget(...,
+  originals={id(cleared copy): original})` SIZES the cleared messages but feeds
+  the exact facts, the model-written recap and its hashes the originals, as if
+  nothing were cleared. `ctxwin._exact_facts` also skips a stub, so a stub is
+  never mined as "what the file printed" (the refit path has no originals map).
+- **Deterministic / cache-stable**: a stub is a function of that result's text
+  alone (no counters, no clock). Clearing is monotonic in time: a result cleared
+  at turn T is cleared to the same bytes at every later turn, and everything
+  older than turn T's keep window is byte-identical across turns; only the one
+  unit that crosses the window each turn changes. Idempotent (a stub is short
+  and recognised by its prefix).
+- **Measured** (synthetic but realistic 85K history: file reads 3-8K chars, test
+  logs, grep output, tiny edits): 83,258 -> 15,107 est tokens (-82%),
+  355,546 -> 75,543 bytes (-79%), 65 results cleared. That is the upper end:
+  the saving is the share of the request that is OLD tool output (the test
+  asserts only >= 35%). On a 20 KB/s uplink the body goes from ~17.8 s to ~3.8 s.
+- **Left out on purpose**: routing / window filtering still use the ORIGINAL
+  estimate (`est` in the handlers), so a model whose window is under ~85K is
+  still skipped for such a turn even though the cleared body would fit it;
+  re-sizing `est` needs the usage-reporting contract re-threaded through the
+  three handlers. The long-context speed ledger (`_hub_est_tokens`) also still
+  records the original size. Batching the clear boundary (a stride) to keep the
+  provider cache valid for longer is the HANDOFF "cache-stable prefix" idea.

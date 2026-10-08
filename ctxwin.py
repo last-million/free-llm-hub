@@ -245,6 +245,363 @@ def is_compaction_request(messages):
 
 
 # --------------------------------------------------------------------------- #
+# Message units, and old tool results cleared on big turns
+# --------------------------------------------------------------------------- #
+#
+# MEASURED 2026-10-08 (hub.log, OpenCode `coding-swarm`): ~85K-token tool turns
+# on free models timed out (`CHAT-DEADLINE est=85203 ... _HopBudgetExceeded no
+# answer within 106s`). Only a handful of models hold 85K and they are slow at
+# that size; on a slow uplink an 85K-token body (~340 KB) also costs ~17 s of
+# UPLOAD per hop. Most of those tokens are OLD tool outputs (file reads, command
+# logs) the model no longer needs verbatim -- it can re-run the command.
+#
+# `clear_old_tool_results` replaces the CONTENT of an older tool result with one
+# line (what it was, its first characters, how to get it back). No model call,
+# no message removed, no id touched: a tool call keeps its matching result, so a
+# strict provider never sees an orphan. It is a pure function of the history, and
+# the stub of a result depends on THAT result's text alone, so the same result is
+# cleared to the same bytes on every later turn (provider prompt caches stay
+# valid up to the one unit that crosses the keep window each turn).
+
+# Requests below this estimated size are never touched.
+OLD_RESULT_CLEAR_FROM_TOKENS = 60000
+OLD_RESULT_KEEP_RECENT = 8         # newest message units left verbatim
+OLD_RESULT_MIN_CHARS = 1500        # only results LONGER than this are cleared
+OLD_RESULT_KEEP_FAILING = 3        # the last N failing steps keep their output
+OLD_RESULT_EXCERPT_CHARS = 160
+# Every stub starts with this (exact_facts and the idempotence check key on it).
+CLEARED_RESULT_PREFIX = "[tool output cleared by the hub to save context"
+
+_TEXT_PART_TYPES = (None, "text", "input_text", "output_text")
+_IMAGE_PART_TYPES = ("image", "image_url", "input_image")
+
+
+def _block_ids(content, kind, key):
+    return {b.get(key) for b in content
+            if isinstance(b, dict) and b.get("type") == kind and b.get(key)}
+
+
+def is_tool_call_msg(m):
+    """An assistant turn that calls tools, in any of the three wire shapes:
+    OpenAI `tool_calls`, an Anthropic assistant turn with `tool_use` blocks, a
+    Responses `function_call` item."""
+    if not isinstance(m, dict):
+        return False
+    if m.get("type") == "function_call":
+        return True
+    if m.get("role") != "assistant":
+        return False
+    if isinstance(m.get("tool_calls"), list):
+        return True
+    c = m.get("content")
+    return isinstance(c, list) and any(
+        isinstance(b, dict) and b.get("type") == "tool_use" for b in c)
+
+
+def _call_ids(m):
+    ids = set()
+    if m.get("type") == "function_call":
+        i = m.get("call_id") or m.get("id")
+        if i:
+            ids.add(i)
+    tcs = m.get("tool_calls")
+    for tc in (tcs if isinstance(tcs, list) else []):
+        if isinstance(tc, dict) and tc.get("id"):
+            ids.add(tc["id"])
+    if isinstance(m.get("content"), list):
+        ids |= _block_ids(m["content"], "tool_use", "id")
+    return ids
+
+
+def _result_ids(m):
+    """None when `m` is not a tool-result message, else the call ids it
+    answers (possibly none): an OpenAI role "tool" message, a Responses
+    `function_call_output` item, or an Anthropic user turn of `tool_result`
+    blocks."""
+    if m.get("role") == "tool":
+        return {m["tool_call_id"]} if m.get("tool_call_id") else set()
+    if m.get("type") == "function_call_output":
+        i = m.get("call_id") or m.get("id")
+        return {i} if i else set()
+    c = m.get("content")
+    if m.get("role") == "user" and isinstance(c, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+        return _block_ids(c, "tool_result", "tool_use_id")
+    return None
+
+
+def _answers(m, ids):
+    """True when result message `m` belongs to a call run whose ids are `ids`."""
+    if m.get("role") == "tool":
+        return (not ids) or m.get("tool_call_id") in ids
+    rids = _result_ids(m)
+    return rids is not None and ((not ids) or (not rids) or bool(rids & ids))
+
+
+def unit_spans(rest):
+    """The history as UNITS, as (start, end) index pairs into `rest`: an
+    assistant message with tool calls together with the tool results that
+    immediately answer it, or a single other message. Compaction and clearing
+    keep or drop a unit whole, so a call is never separated from its result
+    (which _sanitize_tool_messages would then delete as an orphan).
+
+    A RUN of tool-calling assistant messages is one unit with every result
+    that follows it: /v1/responses turns Codex's parallel calls into one
+    assistant message PER function_call (asst a, asst b, tool a, tool b), and
+    unit-per-assistant let compaction keep tool a while dropping asst a."""
+    spans, i, n = [], 0, len(rest)
+    while i < n:
+        if is_tool_call_msg(rest[i]):
+            j = i + 1
+            while j < n and is_tool_call_msg(rest[j]):
+                j += 1
+            ids = set()
+            for a in rest[i:j]:
+                ids |= _call_ids(a)
+            while j < n and isinstance(rest[j], dict) and _answers(rest[j], ids):
+                j += 1
+            spans.append((i, j))
+            i = j
+        else:
+            spans.append((i, i + 1))
+            i += 1
+    return spans
+
+
+def message_units(rest):
+    """`unit_spans` as lists of the messages themselves (the same objects)."""
+    return [list(rest[a:b]) for a, b in unit_spans(rest)]
+
+
+def _plain_text(c):
+    """The text of a tool result's content when it is ONLY text (a string, or a
+    list of text parts); None for anything else -- an image, a file, nothing."""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list) and c:
+        parts = []
+        for p in c:
+            if isinstance(p, str):
+                parts.append(p)
+            elif (isinstance(p, dict) and p.get("type") in _TEXT_PART_TYPES
+                  and isinstance(p.get("text"), str)):
+                parts.append(p["text"])
+            else:
+                return None
+        return "\n".join(parts)
+    return None
+
+
+def _result_slots(m):
+    """[(slot, text, is_error)] for every tool result message `m` carries; the
+    slot says where the text lives so it can be replaced in place."""
+    out = []
+    if m.get("role") == "tool":
+        out.append((("msg", 0), _plain_text(m.get("content")), False))
+    elif m.get("type") == "function_call_output":
+        out.append((("item", 0), _plain_text(m.get("output")), False))
+    elif m.get("role") == "user" and isinstance(m.get("content"), list):
+        for i, b in enumerate(m["content"]):
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                out.append((("block", i), _plain_text(b.get("content")),
+                            bool(b.get("is_error"))))
+    return out
+
+
+def _has_image(m):
+    c = m.get("content")
+    return isinstance(c, list) and any(
+        isinstance(b, dict) and b.get("type") in _IMAGE_PART_TYPES for b in c)
+
+
+# A step that FAILED keeps its output: the model is probably mid-diagnosis and
+# the error text is exactly what it needs verbatim. Deliberately liberal -- a
+# false positive only protects one more unit, and only the last
+# OLD_RESULT_KEEP_FAILING units are protected at all.
+_FAILED_CS_RE = re.compile(
+    r"Traceback \(most recent call last\)|\bnpm ERR!|\bFAILED\b|\bFAIL\b|"
+    r"\bpanicked at\b|\b[A-Za-z]*(?:SyntaxError|ModuleNotFoundError|ImportError|"
+    r"AssertionError|TypeError|ReferenceError)\b|"
+    r"^\s*(?:Error|ERROR|Fatal|FATAL|fatal)\b|\berror(?:\[\w+\]|\s+TS\d+)?:|"
+    r"\b(?:Unhandled|Uncaught)\b.{0,20}\b(?:rejection|exception|error)\b", re.M)
+_FAILED_CI_RE = re.compile(
+    r"\bexit(?:ed)?(?:\s+(?:with|status|code|value))*\s*[:=]?\s*-?[1-9]\d*\b|"
+    r"\b(?:return ?code|exit_?code)\b\s*[:=]\s*-?[1-9]\d*|"
+    r"\b[1-9]\d*\s+(?:failed|failing|errors?)\b|"
+    r"\bcommand not found\b|no such file or directory|permission denied|"
+    r"segmentation fault|cannot find module|command failed", re.I)
+
+
+def looks_failed(text):
+    """True when a tool result reads like a failing step (non-zero exit,
+    traceback, failing tests, a compiler/shell error). Looks at the head and
+    the tail only: that is where a command prints its verdict, and a file read
+    that merely CONTAINS the word "error" in its middle is not a failure."""
+    if not isinstance(text, str) or not text:
+        return False
+    probe = text if len(text) <= 1600 else text[:800] + "\n" + text[-800:]
+    return bool(_FAILED_CS_RE.search(probe) or _FAILED_CI_RE.search(probe))
+
+
+def cleared_stub(text):
+    """The one line that replaces a cleared result. A function of `text` alone
+    (no counters, no clock) so the same result gets the same bytes every turn."""
+    head = re.sub(r"\s+", " ", text[:OLD_RESULT_EXCERPT_CHARS * 4]).strip()
+    head = head[:OLD_RESULT_EXCERPT_CHARS] or "(no text)"
+    return ("%s (was ~%d chars): %s. Re-run the command if you need it.]"
+            % (CLEARED_RESULT_PREFIX, len(text), head))
+
+
+_IMAGE_KEYS = frozenset(("image_url", "source", "data", "url"))
+
+
+def rough_tokens(obj, _depth=0):
+    """chars/4 over every string in a request (image payload keys skipped).
+    The fallback for a caller with no estimate of its own; app.py passes its
+    tools-aware `_est_tokens` instead."""
+    if _depth > 8:
+        return 0
+    if isinstance(obj, str):
+        return len(obj) // 4
+    if isinstance(obj, dict):
+        return sum(rough_tokens(v, _depth + 1) for k, v in obj.items()
+                   if k not in _IMAGE_KEYS)
+    if isinstance(obj, (list, tuple)):
+        return sum(rough_tokens(v, _depth + 1) for v in obj)
+    return 0
+
+
+def _like(orig, stub):
+    """`stub` in the shape of the content it replaces (text parts stay parts)."""
+    if isinstance(orig, list) and orig and isinstance(orig[0], dict):
+        return [{"type": orig[0].get("type") or "text", "text": stub}]
+    return stub
+
+
+def _with_stubs(m, stubs):
+    """A copy of message `m` with the results in `stubs` ({slot: stub}) replaced."""
+    new = dict(m)
+    for (kind, idx), stub in stubs.items():
+        if kind == "msg":
+            new["content"] = _like(m.get("content"), stub)
+        elif kind == "item":
+            new["output"] = _like(m.get("output"), stub)
+        else:
+            blocks = list(new["content"])
+            blocks[idx] = dict(blocks[idx], content=_like(blocks[idx].get("content"), stub))
+            new["content"] = blocks
+    return new
+
+
+def clear_old_tool_results(messages, keep_recent=OLD_RESULT_KEEP_RECENT,
+                           min_chars=OLD_RESULT_MIN_CHARS, *, est_tokens=None,
+                           min_tokens=OLD_RESULT_CLEAR_FROM_TOKENS,
+                           keep_failing=OLD_RESULT_KEEP_FAILING):
+    """-> (messages, stats). Old tool results longer than `min_chars` are
+    replaced by one `cleared_stub` line; everything else is returned as it was.
+
+    Works on all three wire shapes (OpenAI role "tool" messages, Anthropic
+    `tool_result` blocks, Responses `function_call_output` items). Never removes
+    or reorders a message and never touches an id, so call/result pairing is
+    intact by construction; the input list is not mutated, a changed message
+    is a copy, and when nothing changes the SAME list comes back.
+
+    Left alone, always: the newest `keep_recent` message units, the leading
+    system messages, the latest real user instruction, the results of the last
+    `keep_failing` failing steps, a message carrying an image, a CLI's own
+    compaction request, a request under `min_tokens` (`est_tokens`, else
+    `rough_tokens`; 0 disables the size gate), a result already cleared, and a
+    result the stub would not make shorter.
+
+    Monotonic in time: a result that is cleared at turn T is cleared, to the
+    same bytes, at every later turn (the keep window only moves forward and a
+    failing step can only fall out of the last `keep_failing`)."""
+    stats = {"cleared": 0, "chars_before": 0, "chars_after": 0, "units": 0,
+             "kept_failing": 0, "skipped": None}
+    try:
+        return _clear_old_tool_results(messages, keep_recent, min_chars, est_tokens,
+                                       min_tokens, keep_failing, stats)
+    except Exception:                                            # noqa: BLE001
+        stats.update(cleared=0, chars_before=0, chars_after=0, skipped="error")
+        return messages, stats
+
+
+def _clear_old_tool_results(messages, keep_recent, min_chars, est_tokens, min_tokens,
+                            keep_failing, stats):
+    if not isinstance(messages, list) or not messages:
+        stats["skipped"] = "empty"
+        return messages, stats
+    if min_tokens:
+        est = est_tokens if est_tokens is not None else rough_tokens(messages)
+        if est < min_tokens:
+            stats["skipped"] = "small"
+            return messages, stats
+    if is_compaction_request(messages):
+        stats["skipped"] = "compaction"
+        return messages, stats
+    start = 0
+    while (start < len(messages) and isinstance(messages[start], dict)
+           and messages[start].get("role") in ("system", "developer")):
+        start += 1
+    spans = [(start + a, start + b) for a, b in unit_spans(messages[start:])]
+    stats["units"] = len(spans)
+    older = len(spans) - max(0, int(keep_recent))
+    if older <= 0:
+        stats["skipped"] = "short"
+        return messages, stats
+    # The last `keep_failing` units that hold a failing result, counted from the
+    # END of the whole history (so a step only ever falls OUT of this set).
+    protected = set()
+    if keep_failing and keep_failing > 0:
+        for u in range(len(spans) - 1, -1, -1):
+            a, b = spans[u]
+            if any((err or looks_failed(text)) for k in range(a, b)
+                   if isinstance(messages[k], dict)
+                   for _slot, text, err in _result_slots(messages[k])
+                   if text is None or not text.startswith(CLEARED_RESULT_PREFIX)):
+                protected.add(u)
+                if len(protected) >= keep_failing:
+                    break
+    pinned = None                  # the latest real user instruction
+    for k in range(len(messages) - 1, start - 1, -1):
+        if is_real_instruction(messages[k]):
+            pinned = k
+            break
+    replaced = {}
+    for u in range(older):
+        pending = {}               # message index -> {slot: (stub, chars before)}
+        for k in range(*spans[u]):
+            m = messages[k]
+            if not isinstance(m, dict) or k == pinned or _has_image(m):
+                continue
+            for slot, text, _err in _result_slots(m):
+                if (text is None or len(text) <= min_chars
+                        or text.startswith(CLEARED_RESULT_PREFIX)):
+                    continue
+                stub = cleared_stub(text)
+                if len(stub) < len(text):
+                    pending.setdefault(k, {})[slot] = (stub, len(text))
+        if not pending:
+            continue
+        if u in protected:
+            stats["kept_failing"] += 1
+            continue
+        for k, slots in pending.items():
+            replaced[k] = _with_stubs(messages[k], {s: v[0] for s, v in slots.items()})
+            for stub, n in slots.values():
+                stats["cleared"] += 1
+                stats["chars_before"] += n
+                stats["chars_after"] += len(stub)
+    if not replaced:
+        stats["skipped"] = "nothing"
+        return messages, stats
+    out = list(messages)
+    for k, nm in replaced.items():
+        out[k] = nm
+    return out, stats
+
+
+# --------------------------------------------------------------------------- #
 # Exact facts: what a summary must never paraphrase
 # --------------------------------------------------------------------------- #
 #
@@ -547,6 +904,8 @@ def _exact_facts(messages, max_chars):
                         _drop_path(path)
                     _put_file((path, kind, fact), path, fact)
         elif role == "tool":
+            if text.startswith(CLEARED_RESULT_PREFIX):
+                continue        # a cleared stub is not what the file printed
             cmd, read_path = calls.get(m.get("tool_call_id")) or ("", None)
             for path, fact in _fact_reads(cmd, text, read_path):
                 _put_file((path, cmd or "read"), path, fact)

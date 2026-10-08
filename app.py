@@ -13188,8 +13188,51 @@ def _apply_goal_note(messages):
         return messages
 
 
+def _clear_old_results_for_hop(msgs, tools):
+    """This hop's messages with OLD tool results cleared to one line each
+    (ctxwin.clear_old_tool_results) -> (messages, info).
+
+    The one place the hub clears them: _upstream_chat calls it per hop, BEFORE
+    _compact_to_budget, and every protocol (chat, responses, messages; stream
+    or not) reaches the provider through _upstream_chat as OpenAI-shaped
+    messages, so one call covers all of them. `info` is None when nothing was
+    cleared (flag off, request under ctxwin.OLD_RESULT_CLEAR_FROM_TOKENS,
+    nothing old and long enough, a CLI's own compaction request ...), else
+    {"before", "after": estimated tokens, "cleared": n, "originals":
+    {id(cleared copy): the message it came from}}.
+
+    KILL SWITCH: config flag `old_tool_result_clearing` (default on); set it
+    false in config.json and every request goes out exactly as before.
+
+    Only what is SENT shrinks. The handlers keep the original messages and
+    estimate, so routing and the usage reported to the CLI are unchanged --
+    _upstream_chat tells _ctx_note_hop how much this hop shrank so the
+    reported prompt tokens stay sized on the request the CLI sent (CLIs
+    compact on that number). Fails open: any error returns `msgs` untouched."""
+    try:
+        if not isinstance(msgs, list) or not config.get_flag("old_tool_result_clearing", True):
+            return msgs, None
+        before = _est_tokens(msgs, tools)
+        if before < ctxwin.OLD_RESULT_CLEAR_FROM_TOKENS:
+            return msgs, None
+        out, st = ctxwin.clear_old_tool_results(msgs, est_tokens=before)
+        if out is msgs or not st.get("cleared"):
+            return msgs, None
+        after = _est_tokens(out, tools)
+        # One log line per REQUEST (this runs once per hop).
+        if not _ctx_g("_ctx_clear_logged"):
+            _ctx_set("_ctx_clear_logged", True)
+            _log.info("[ctx] cleared %d old tool results (%d -> %d est tokens)",
+                      st["cleared"], before, after)
+        return out, {"before": before, "after": after, "cleared": st["cleared"],
+                     "originals": {id(c): o for o, c in zip(msgs, out) if c is not o}}
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[ctx] old-result clearing failed", exc_info=True)
+        return msgs, None
+
+
 def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stats=None,
-                       abort_frac=None):
+                       abort_frac=None, originals=None):
     """AUTO-COMPACT: if a conversation is bigger than a model's context budget, drop
     the OLDEST turns (keeping ALL leading system messages + the most RECENT turns that
     fit) and insert a truncation marker. This is what lets a SMALL-context model still
@@ -13218,7 +13261,14 @@ def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stat
     HISTORY that was dropped whole (what the overflow signal keys on). With
     `abort_frac`, a compaction that would drop more than that share returns
     the messages UNCHANGED with stats["overflow"] = True -- before any recap is
-    scheduled -- so the caller can signal overflow instead."""
+    scheduled -- so the caller can signal overflow instead.
+
+    `originals` ({id(message): the message it was cleared from}, see
+    _clear_old_results_for_hop): old tool results the hub cleared to save
+    context are SIZED as the short stubs they are now, but everything that is
+    about WHAT the conversation said -- the exact facts, the model-written
+    recap and its hashes -- reads the originals, as if nothing had been
+    cleared."""
     if not isinstance(messages, list) or not messages or not budget or budget <= 0:
         return messages, False
     target = int(budget * 0.85)   # leave ~15% headroom for the model's own reply
@@ -13276,7 +13326,7 @@ def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stat
     # Room for the EXACT FACTS message (see below), sized on the whole history:
     # the dropped part's block is never bigger (same cap). Nothing reserved
     # when the history carries no such facts.
-    _facts_room = _exact_facts_block(rest, target)
+    _facts_room = _exact_facts_block(_as_originals(rest, originals), target)
     if _facts_room:
         base += _est_tokens([{"role": "system", "content": _facts_room}], overhead=0)
     keep_ids, running = set(), base
@@ -13330,7 +13380,8 @@ def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stat
     # Name the artefacts that were dropped. "Earlier conversation was truncated"
     # tells the model nothing actionable; a list of the files already created
     # tells it the project EXISTS and should be edited, not started again.
-    files = _mentioned_paths(dropped)
+    dropped_src = _as_originals(dropped, originals)   # what was SAID, uncleared
+    files = _mentioned_paths(dropped_src)
     note = ("[Note: earlier turns of THIS SAME conversation were dropped to fit this "
             "model's context window. The work already exists — continue and EDIT it, "
             "do not start a new project.")
@@ -13339,13 +13390,13 @@ def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stat
     note += " Read a file before changing it, and ask the user for anything else you need.]"
     # Tool-call-only turns carry no prose, so they vanished from every notice
     # and recap; a one-line digest keeps "what was already run" visible.
-    digest = _tool_call_digest(dropped)
+    digest = _tool_call_digest(dropped_src)
     if digest:
         note += "\n\n[Earlier tool calls, oldest first]\n" + digest
     # A model-written recap of what was dropped, when a summarizer is wired in.
     # Structural facts (brief + file list) survive either way; the recap adds the
     # part they cannot carry — the DECISIONS and the reasoning behind them.
-    recap = summarizer(dropped) if summarizer else None
+    recap = summarizer(dropped_src) if summarizer else None
     if recap:
         note += "\n\n[Recap of the dropped turns]\n" + recap
     notice = {"role": "system", "content": note}
@@ -13355,7 +13406,7 @@ def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stat
     # the first compaction on; ~5% of the target at most, room reserved above.
     # Its OWN message: the trim below cuts the biggest message head+tail, and
     # inside the notice it lost its header to that cut.
-    facts = _exact_facts_block(dropped, target) if _facts_room else ""
+    facts = _exact_facts_block(dropped_src, target) if _facts_room else ""
     facts_msg = [{"role": "system", "content": facts}] if facts else []
     out = (lead_sys + [notice] + facts_msg + ([brief] if brief_needed else [])
            + [m for m in rest if id(m) in keep_ids])
@@ -13387,9 +13438,17 @@ def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stat
     return out, True
 
 
+def _as_originals(msgs, originals):
+    """`msgs` with every cleared message swapped back for the one it was
+    cleared from (see _compact_to_budget's `originals`); `msgs` itself when
+    nothing was cleared."""
+    if not originals:
+        return msgs
+    return [originals.get(id(m), m) for m in msgs]
+
+
 def _is_tool_call_msg(m):
-    return (isinstance(m, dict) and m.get("role") == "assistant"
-            and isinstance(m.get("tool_calls"), list))
+    return ctxwin.is_tool_call_msg(m)
 
 
 def _message_units(rest):
@@ -13401,27 +13460,11 @@ def _message_units(rest):
     A RUN of tool-calling assistant messages is one unit with every result
     that follows it: /v1/responses turns Codex's parallel calls into one
     assistant message PER function_call (asst a, asst b, tool a, tool b), and
-    unit-per-assistant let compaction keep tool a while dropping asst a."""
-    units, i, n = [], 0, len(rest)
-    while i < n:
-        m = rest[i]
-        if _is_tool_call_msg(m):
-            unit, j = [m], i + 1
-            while j < n and _is_tool_call_msg(rest[j]):
-                unit.append(rest[j])
-                j += 1
-            ids = {tc.get("id") for a in unit for tc in a["tool_calls"]
-                   if isinstance(tc, dict) and tc.get("id")}
-            while (j < n and isinstance(rest[j], dict) and rest[j].get("role") == "tool"
-                   and (not ids or rest[j].get("tool_call_id") in ids)):
-                unit.append(rest[j])
-                j += 1
-            units.append(unit)
-            i = j
-        else:
-            units.append([m])
-            i += 1
-    return units
+    unit-per-assistant let compaction keep tool a while dropping asst a.
+
+    The grouping lives in ctxwin.unit_spans, shared with the old-tool-result
+    clearing so both agree on what one unit is."""
+    return ctxwin.message_units(rest)
 
 
 def _brief_excerpt(msg):
@@ -13797,6 +13840,12 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
             msgs = _apply_goal_note(msgs)
         # A CLI's own compaction request carries the exact facts to copy.
         msgs = _with_cli_compaction_facts(msgs)
+        # OLD TOOL RESULTS, cleared before the window fit (flag
+        # old_tool_result_clearing): the compaction below then works on the
+        # smaller conversation, and the body that goes up the wire (upload time,
+        # prefill) is smaller on every hop of a big turn. `msgs` is rebound so
+        # that payload["messages"] below IS the cleared list.
+        msgs, _clr = _clear_old_results_for_hop(msgs, payload.get("tools"))
         payload = dict(payload)
         payload.pop("_no_craft", None)      # never goes upstream
         payload["messages"] = msgs
@@ -13827,7 +13876,8 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                                             summarizer=_summarizer,
                                             reserve=_reserve, stats=_cstats,
                                             abort_frac=(_CTX_OVERFLOW_DROP_FRAC
-                                                        if _signal else None))
+                                                        if _signal else None),
+                                            originals=(_clr or {}).get("originals"))
         if did:
             # A conversation that just lost turns is a conversation that just
             # lost whatever those turns were carrying -- very often the standing
@@ -13851,9 +13901,18 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                 "%s/%s's %d-token window" % (_cstats.get("before") or 0,
                                              100 * (_cstats.get("dropped_frac") or 0),
                                              pid, payload.get("model"), _budget))
+        # REPORTED USAGE stays sized on the request the CLI sent: the hop's
+        # "before" is the size BEFORE old results were cleared (and before the
+        # window fit), "after" what goes up the wire. A hop that only cleared
+        # (the model's window held the cleared conversation) is noted too --
+        # otherwise upstream's smaller count would reach the CLI as-is and its
+        # own compaction would never fire.
         if did:
-            _ctx_note_hop(pid, payload.get("model"), _cstats.get("before"),
+            _ctx_note_hop(pid, payload.get("model"),
+                          _clr["before"] if _clr else _cstats.get("before"),
                           _cstats.get("after"))
+        elif _clr:
+            _ctx_note_hop(pid, payload.get("model"), _clr["before"], _clr["after"])
         fixed = _sanitize_tool_messages(compacted)
         if did or fixed is not msgs:
             payload = dict(payload)

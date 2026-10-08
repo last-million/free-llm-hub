@@ -206,9 +206,10 @@ All in `AGENTS.md` with tests; headlines only:
 8. **Small tech debt**: two helpers read the project folder from a CLI's env
    block (`_project_dir_from_messages` from the task board, `_v1_project_cwd`
    from the parity work); merge them when either is touched next.
-9. **Next context ideas (research done 2026-10-03, owner to pick):** age-based
+9. **Next context ideas (research done 2026-10-03, owner to pick):** ~~age-based
    clearing of old tool results (keep newest ~5, no model call; measured
-   -52% cost, solve rate flat), cache-stable prefix + one provider per
+   -52% cost, solve rate flat)~~ (done 2026-10-08: AGENTS.md "Old tool
+   results are cleared on big turns"), cache-stable prefix + one provider per
    conversation, function signatures of files read in the recap.
 
 ## Gotchas
