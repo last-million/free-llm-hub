@@ -2779,3 +2779,108 @@ reason a wait can fix"). `[spread]` had the session pinned to a 65K model
   `_ctx_begin(..., signal=False)` calls before the pipeline dispatch must stay
   `signal=False`: arming the overflow signal there would make a pipeline actor
   hop raise `_ContextOverflow` instead of being served compacted.
+
+## Multi planning is time-bounded (2026-10-08)
+
+Covered by `tests/test_multi_planner_time_bounds.py`. Flag `planner_time_bounds`
+(default ON); off = the old unbounded walk, byte for byte. Adds no route.
+
+**Measured** (Build conversation 2e3525ad, cli=codex, quality "multi"; hub.log is
+UTC): a Multi run planned for **526 s** before one helper started. Activity rows
+`hub / swarm / plan`: attempt 1 190 s, error 502, `planner attempt 1 was not a
+plan (0 chars)`; attempt 2 198 s, a plan; then the dry run's OPTIONAL re-ask 138 s,
+error 502, empty again (`Plan check: 8 phases ... planner re-asked once, 0 fixed,
+7 warnings`). The goal was 12 073 chars + 4 078 chars of context.
+
+**Why** (an inference that fits the timing and the missing allowance, NOT observed:
+hub.log has no per-hop planner line, activity rows live in memory only, so which
+models served the hops is not recoverable -- perf-stats `last` rows inside the
+window are shared with other sessions' turns and prove nothing; the new `[plan]
+hops` line below is the remedy): `_swarm_dispatch` sent the planner's
+3000-token budget, strongest-first, to THINKING models (perf-stats non-stream
+averages: nvidia kimi-k3 68 s, glm-5.3-flash 48 s, deepseek-v4.1-flash 198 s) with
+NO reasoning allowance -- the chain loops give a thinker room
+(`_apply_reasoning_effort`) and retry a starved hop (`_starve_retry`); this stage
+did neither -- so hidden reasoning ate the budget: empty text, finish "length",
+~60 s per hop, three hops per attempt (`_SWARM_STAGE_MAX_HOPS`), each allowed
+`_SWARM_HOP_DEADLINE` = 300 s. An empty reply DID already fall through to the next
+hop inside one call; what burned the attempt was the 3-hop cap, a non-plan reply
+(prose) ending the walk, and nothing remembered between attempts, so attempt 2 and
+the re-ask re-walked the same dead head.
+
+**Old worst case**: 2 attempts x 3 hops x 300 s = 1800 s, plus the re-ask's
+3 x 300 s = **2700 s (45 min)** before the first helper. The re-ask is polish (the
+plan already exists), and in the incident it cost 138 s for nothing.
+
+**Now** (`swarm_windows.py`, one window per planner call, thread-local):
+`PLAN_HOP_SECONDS` 90 (a hop), `PLAN_ATTEMPT_SECONDS` 270 (an attempt = three
+full-length hops, the old shape at 90 s), `DRY_RUN_SECONDS` 45 (ALL hops of the
+re-ask), `DRY_RUN_SKIP_AFTER` 240 (no re-ask when the plan alone took longer;
+`report["reask_skipped"]`, said on the "Plan check:" line). `_ask_planner` opens
+the window; the planner reads `planning_seconds_left()` -- a window, not a new
+argument, because every caller binds `planner` with `_pipeline_bound` and the fakes
+take exactly `(system, user)`. `start()` times the plan (`_mono`, a test clock) and
+passes `planned_in` to `dry_run`; it logs `[swarm] planning took ...`.
+**New worst case: 2 x 270 = 540 s**, and no re-ask on a plan that long (a plan inside
+4 min earns a re-ask of <= 45 s). There is deliberately NO total cap that fails a
+slow-but-working plan: an attempt that produced a plan is always taken.
+
+**The planner's hops** (`app.py`: `_PlannerStage`, `_planner_order`,
+`_swarm_dispatch(plan=)`; only `_swarm_windows_planner` passes it -- workers,
+reviewers and synthesis are untouched):
+- hop deadline `min(90, window left)`; a hop with < 8 s left is not started;
+  up to `_PLANNER_MAX_HOPS` = 5 hops inside the attempt (was 3);
+- an EMPTY reply, a cut-off one (finish "length"), prose / JSON with no usable phase
+  (`swarm_windows.plan_readable`), a timeout, an error or a non-200 hands over to
+  the next model INSIDE the same attempt; the longest non-plan reply is still the
+  fallback, so `plan()`'s nudged second attempt works as before;
+- an empty finish-"length" hop is learned (`_note_thinking(..., "starved-empty")`)
+  and filed (`_record_outcome(False)`); a thinker gets `reasoning_effort` low plus
+  the usual allowance (`_apply_reasoning_effort(..., "simple")`: 3000 -> 4024) --
+  a plan is JSON, not deep thought. A model that does not think is untouched;
+- `_planner_order`: inside the top band (`_AUTO_TOP_BAND` of the best
+  `_benchmark_score`, last-resort families never in it, like `_distinct_first`)
+  tool-capable, then not slow (`_planner_slow`: measured non-stream duration >=
+  60% of the hop deadline, else `_is_slow_model`), then not `_thinks_by_default`,
+  then the chain's own order. RE-ORDER ONLY: nothing is dropped, nothing outside
+  the band is promoted, the head never leaves the band;
+- `_PLANNER_FAILED` (planner-local, 10 min, NOT the global recent-failure ledger,
+  which would demote healthy tool-turn models): pairs that failed a planner hop go
+  behind every other, so attempt 2 and the re-ask do not re-walk the same head;
+- ONE log line per planner call (`[plan] hops, 190s in all: nvidia/... empty: out of
+  tokens while thinking (62s) | ... answered (12s)`) and the activity row's chips
+  (`planner: <why>` per failed hop, `planner` for the one that answered; the row's
+  provider/model is the answering model via `_act_pick`).
+
+**Trade-off**: 90 s per hop can clip a mid-speed model (a 2.5-3K-token plan at
+30-40 tok/s is 75-100 s of generation); the walk then hands over to a faster one,
+which is the point, but a slow-and-good planner that used to finish at 150 s now
+loses its turn. Tune `swarm_windows.PLAN_HOP_SECONDS` if the log shows good plans
+dying at 90 s. Also not byte-identical when attempt 1 works: a thinker is sent low
+reasoning effort plus 1024 extra tokens, and hop 1 can differ because of the in-band
+re-order. A pair that just failed the planner may sit behind out-of-band models --
+a deliberate exception to "never leave the band" (it is what `_build_chain` does
+for a recent failure), stated in `_planner_order`'s docstring.
+
+**Open finding, NOT changed (declared windows)**: the log line `[ctx] declared windows
+changed: all 65536/400000->32000/400000 ...` is `safe/reach`; only the SAFE figure
+fell (to `_DECLARED_WINDOW_MIN`, the clamp floor, so the raw value was AT OR BELOW
+it). The REACH figure (opencode, codex, kimi, pi, qwen, openclaw, hermes) stayed
+400000 and no CLI file was rewritten (no `declared windows resynced` line); the
+safe figure reaches only Claude Code, aider and `declared_window(None)`. It is the
+minimum of the 25th percentile over ROWS (relay copies and 8K groq rows included)
+and the window of the 3rd non-relay provider. Two mechanisms produce that exact
+log line and the fleet snapshot is not logged, so they cannot be told apart: (a)
+other providers' rows leave the alive set, the small rows' share crosses 25% and
+the quantile lands in the small-window cluster (a sandboxed probe with a plausible
+fleet reproduces the 65536 <-> 32000 ladder this way; the likelier of the two); (b)
+a <= 32K provider becomes the 3rd-provider cap. Recommended follow-up (not done):
+a log-only line with the percentile, the row count and the top-3 provider windows
+on every change. `_stable_declared_window_for`
+applies a decrease at once and a raise after 45 min, so a one-tick dip pins the safe
+figure for 3 resync ticks = 90 min (the log shows three such cycles on 10-07,
+06:00->07:30, 18:52->20:22 and 21:52->23:22, each exactly 90 min). Owner decision
+needed before touching it (a decrease at once is the documented 503 protection);
+the candidates are (1) leave rows whose window is under `_DECLARED_WINDOW_MIN` out
+of the quantile -- they can never take a CLI turn -- and (2) keep a provider counted
+for the 3rd-provider cap for ~45 min after it last had an alive row.

@@ -2799,6 +2799,90 @@ _PLAN_NUDGE = ("\n\n(Your previous reply could not be read as the JSON object "
                "fences, nothing before the opening brace.)")
 
 
+# --------------------------------------------------------------------------- #
+# PLANNING IS TIME-BOUNDED (2026-10-08, flag `planner_time_bounds`, default on)
+#
+# MEASURED, Build conversation 2e3525ad (hub.log, UTC): a Multi run spent
+# 526 s planning before one helper started -- attempt 1 190 s and EMPTY (0
+# chars), attempt 2 198 s (a plan), then the dry run's optional re-ask 138 s and
+# EMPTY again ("0 fixed, 7 warnings"). Old worst case, nothing in it bounded
+# below the 300 s hop deadline: PLAN_ATTEMPTS 2 x 3 hops x 300 s = 1800 s, plus
+# the re-ask's 3 x 300 s = 2700 s (45 min) before the first helper.
+#
+# So every planner call now runs inside a WINDOW (a thread-local deadline that
+# the injected planner reads with planning_seconds_left() -- a window, not a new
+# argument, because the callers bind `planner` with app._pipeline_bound and the
+# test fakes take exactly (system, user)):
+#   * a planner HOP gets PLAN_HOP_SECONDS (a plan is a short JSON; a model that
+#     has not answered by then hands over to the next chain member);
+#   * one ATTEMPT (all its hops) gets PLAN_ATTEMPT_SECONDS = three full-length
+#     hops, the shape the old three-hop walk had, now at 90 s instead of 300 s;
+#   * the dry run's OPTIONAL re-ask gets DRY_RUN_SECONDS in all, and is skipped
+#     when the plan alone already took longer than DRY_RUN_SKIP_AFTER (4 min):
+#     the run goes ahead with warnings instead of waiting for polish.
+# New worst case: 2 x 270 = 540 s (the re-ask is skipped on any plan that took
+# over 4 min); a plan that arrives inside 4 min earns a re-ask of <= 45 s.
+# There is deliberately NO total cap that fails a slow-but-working plan: an
+# attempt that produced a plan is always taken.
+# Flag off = the old unbounded behaviour, byte for byte.
+# --------------------------------------------------------------------------- #
+PLAN_HOP_SECONDS = 90.0
+PLAN_ATTEMPT_SECONDS = 270.0
+DRY_RUN_SECONDS = 45.0
+DRY_RUN_SKIP_AFTER = 240.0
+
+_PLAN_WINDOW = threading.local()
+_mono = time.monotonic            # a test swaps this for a fake clock
+
+
+def bounds_on():
+    """Flag `planner_time_bounds` (default ON). Never raises."""
+    try:
+        import config
+        return bool(config.get_flag("planner_time_bounds", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def planning_seconds_left():
+    """Seconds left in the planner window open on THIS thread, or None when no
+    window is open (the planner was called outside plan()/dry_run(), or the
+    bounds are off). Never raises."""
+    until = getattr(_PLAN_WINDOW, "until", None)
+    if until is None:
+        return None
+    return max(0.0, until - _mono())
+
+
+def _ask_planner(planner, system, user, seconds):
+    """planner(system, user) inside a window of `seconds` (None = no window,
+    the plain call). The window is thread-local and restored afterwards."""
+    if not seconds:
+        return planner(system, user)
+    prev = getattr(_PLAN_WINDOW, "until", None)
+    _PLAN_WINDOW.until = _mono() + float(seconds)
+    try:
+        return planner(system, user)
+    finally:
+        _PLAN_WINDOW.until = prev
+
+
+def _fmt_minutes(seconds):
+    """"6 min 28 s" / "45 s" for the plan-check line and the log."""
+    s = int(round(float(seconds or 0)))
+    return "%d min %02d s" % (s // 60, s % 60) if s >= 60 else "%d s" % s
+
+
+def plan_readable(text):
+    """True when `text` holds a plan clean_phases can use. The hub's planner
+    walks to its next model on a reply that is not one, inside the same attempt
+    (app._swarm_dispatch), instead of burning the attempt on it."""
+    try:
+        return bool(clean_phases(_extract_json(text), MAX_AGENTS, ()))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _plan_design(obj, phases):
     """The design a plan object carries, {} for a one-phase plan (a small fix
     needs no ceremony) or when there is none."""
@@ -2852,9 +2936,11 @@ def plan(goal, planner, max_phases=MAX_AGENTS, modes=(), manager=None, context="
     system = plan_system(goal).replace("{modes}", mode_list)
     goal = _with_context(goal, context, PLAN_CONTEXT_CHARS)
     ask = goal
+    window = PLAN_ATTEMPT_SECONDS if bounds_on() else None
     for attempt in range(1, PLAN_ATTEMPTS + 1):
+        out["attempts"] = attempt
         try:
-            raw = planner(system, ask)
+            raw = _ask_planner(planner, system, ask, window)
         except Exception as exc:                                 # noqa: BLE001
             _log.warning("[swarm] planner raised on attempt %d: %s", attempt, exc)
             return []
@@ -3123,7 +3209,7 @@ class _PlanMeter:
 
 
 def dry_run(goal, phases, design, project_dir, planner=None, modes=(), context="",
-            notes=(), max_phases=MAX_AGENTS):
+            notes=(), max_phases=MAX_AGENTS, planned_in=0.0):
     """The plan's DRY RUN, before any worker starts: (phases, design, report).
 
     plan_check.check_plan finds what the plan would get wrong and applies what
@@ -3134,17 +3220,28 @@ def dry_run(goal, phases, design, project_dir, planner=None, modes=(), context="
     and the plan they were found in; the revised plan is taken when it fixes
     more than it breaks. Whatever is still wrong is surfaced as a warning and
     the run goes ahead (fail open). No model call besides that one re-ask, no
-    command run."""
+    command run.
+
+    The re-ask is OPTIONAL polish, so it is time-bounded (see PLANNING IS
+    TIME-BOUNDED above): at most DRY_RUN_SECONDS in all, and not asked at all
+    when the plan itself (`planned_in`, seconds) already took longer than
+    DRY_RUN_SKIP_AFTER -- the report then says `reask_skipped`."""
     fixed, report = plan_check.check_plan(phases, design, goal, project_dir,
                                           notes=notes, max_phases=max_phases)
     replan = [f for f in report["findings"] if f.get("action") == "replan"]
-    if replan and planner is not None:
+    bounded = bounds_on()
+    if replan and planner is not None and bounded and planned_in > DRY_RUN_SKIP_AFTER:
+        report["reask_skipped"] = _fmt_minutes(planned_in)
+        _log.info("[swarm] plan re-ask skipped: the plan took %s (over %s)",
+                  _fmt_minutes(planned_in), _fmt_minutes(DRY_RUN_SKIP_AFTER))
+    elif replan and planner is not None:
         mode_list = ", ".join(modes) if modes else "coding"
         ask = plan_check.replan_ask(_with_context(goal, context, PLAN_CONTEXT_CHARS),
                                     replan, fixed, design)
         try:
-            raw = planner(_PLAN_SYSTEM.replace("{helpers}", str(_concurrency()))
-                          .replace("{modes}", mode_list), ask)
+            raw = _ask_planner(planner, _PLAN_SYSTEM.replace("{helpers}", str(_concurrency()))
+                               .replace("{modes}", mode_list), ask,
+                               DRY_RUN_SECONDS if bounded else None)
         except Exception as exc:                                 # noqa: BLE001
             _log.warning("[swarm] plan re-ask raised: %s", exc)
             raw = ""
@@ -3212,13 +3309,21 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     gb = _clip_text(gb, GOAL_BRIEF_CHARS)
     meter = _PlanMeter(manager) if manager is not None else None
     info = {}
+    planned_in = 0.0
     if phases is None:
         if planner is None:
             raise SwarmWindowsError("give either phases or a planner")
         plan_context = (gb + "\n\n" + context).strip() if gb else context
         extra = {"context": plan_context} if plan_context else {}
+        t_plan = _mono()
         phases = plan(goal, planner, modes=modes,
                       manager=meter.ask if meter else None, out=info, **extra)
+        planned_in = max(0.0, _mono() - t_plan)
+        att = int(info.get("attempts") or 0)
+        _log.info("[swarm] planning took %s (%s, %d phase%s)", _fmt_minutes(planned_in),
+                  ("%d planner attempt%s" % (att, "" if att == 1 else "s")) if att
+                  else "manager plan", len(phases or ()),
+                  "" if len(phases or ()) == 1 else "s")
     notes = list(info.get("notes") or ())
     phases = clean_phases({"phases": phases}, modes=modes, notes=notes) if phases else []
     if not phases:
@@ -3230,7 +3335,7 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
     try:
         phases, design, report = dry_run(goal, phases, design, project_dir,
                                          planner=planner, modes=modes, context=context,
-                                         notes=notes)
+                                         notes=notes, planned_in=planned_in)
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("[swarm] plan dry run failed (run goes ahead): %s", exc)
     if review:

@@ -626,6 +626,8 @@ def check_line(report):
     bits = ["%d phase%s" % (n, "" if n == 1 else "s"), "%d start now" % k]
     if report.get("replanned"):
         bits.append("planner re-asked once")
+    elif report.get("reask_skipped"):
+        bits.append("planner re-ask skipped (the plan took %s)" % report["reask_skipped"])
     bits.append("%d fixed" % len(fixed) + (" (%s)" % _clip_items(fixed) if fixed else ""))
     bits.append("%d warning%s" % (len(warns), "" if len(warns) == 1 else "s")
                 + (" (%s)" % _clip_items(warns) if warns else ""))

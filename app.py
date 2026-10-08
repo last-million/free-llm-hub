@@ -19338,16 +19338,25 @@ def _swarm_windows_planner(system, goal):
     # not show.
     act = _act_begin("build" if _build_sid() else "hub", "plan",
                      project=_build_project())
+    # TIME-BOUNDED (see THE PLANNER'S HOPS ARE TIME-BOUNDED): None = the flag
+    # is off = the old unbounded walk. The window it reads is the attempt's
+    # (or the dry-run re-ask's), opened by swarm_windows on this thread.
+    stage = _planner_stage()
     # 3000, not 1500: a five-phase plan with self-contained tasks runs past
     # 1500 tokens, and a reasoning model spends part of the budget thinking
-    # before the first brace -- a truncated object is not a plan.
+    # before the first brace -- a truncated object is not a plan. (Keyword
+    # form on purpose: the budget literal closes the call.)
     try:
         text, _model = _swarm_dispatch(
-            [{"role": "system", "content": system}, {"role": "user", "content": goal}],
-            3000)
+            plan=stage,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": goal}],
+            max_tokens=3000)
     except Exception:                                            # noqa: BLE001
         _act_end(act, False)
         raise
+    finally:
+        _planner_stage_close(stage, act)
     _act_end(act, bool(text))
     return text or ""
 
@@ -34435,9 +34444,174 @@ def _distinct_first(chain, ledger, exclude_pids=()):
         return chain, None
 
 
+# --------------------------------------------------------------------------- #
+# THE PLANNER'S HOPS ARE TIME-BOUNDED (2026-10-08, flag `planner_time_bounds`)
+#
+# MEASURED (hub.log + perf-stats, Build conversation 2e3525ad): a Multi run
+# planned for 526 s -- attempt 1 190 s and EMPTY, attempt 2 198 s, the dry
+# run's optional re-ask 138 s and EMPTY. hub.log has no per-hop planner line,
+# but the shape is a starved reasoning hop repeated: _swarm_dispatch sends the
+# planner's 3000-token budget to strongest-first THINKING models (nvidia
+# kimi-k3 / glm-5.3 / deepseek-v4.1-flash average 68 / 28-48 / 198 s per
+# non-stream hop in perf-stats.json) with no reasoning allowance -- the chain
+# loops give a thinker room (_apply_reasoning_effort) and retry a starved hop
+# (_starve_retry); this stage did neither -- so hidden reasoning ate the budget
+# and the reply came back empty with finish "length", 3 hops x ~60 s per
+# attempt, each hop allowed 300 s.
+#
+# So the planner stage (and ONLY it: workers, reviewers, synthesis are
+# untouched) now:
+#   * gives each hop swarm_windows.PLAN_HOP_SECONDS (90 s) and the attempt the
+#     window swarm_windows opened (PLAN_ATTEMPT_SECONDS);
+#   * puts fast, non-thinking, tool-capable models first INSIDE the top band
+#     (_AUTO_TOP_BAND of the best score) -- a re-order, never a drop, and the
+#     head never leaves the band;
+#   * gives a thinking model room (reasoning_effort low + allowance) so the
+#     budget is not eaten before the first brace;
+#   * moves on INSIDE the attempt on an empty reply, a cut-off one, prose that
+#     is not a plan, a timeout or an error, up to _PLANNER_MAX_HOPS hops;
+#   * remembers the pairs that failed it (_PLANNER_FAILED, planner-local, 10
+#     min) so attempt 2 and the re-ask do not re-walk the same dead head;
+#   * writes ONE log line and the activity row's chips for every planner call.
+# Flag off = the old walk, byte for byte.
+# --------------------------------------------------------------------------- #
+_PLANNER_MAX_HOPS = 5
+_PLANNER_MIN_HOP_SECONDS = 8.0     # a hop with less than this left is not started
+_PLANNER_FAIL_TTL = 600
+_PLANNER_SLOW_SHARE = 0.6          # measured non-stream duration >= this share of the hop deadline = slow
+_PLANNER_FAILED = {}               # (pid, model) -> (epoch, why)
+_planner_lock = threading.Lock()
+_PLANNER_CLOCK = time.monotonic    # a test swaps this for a fake clock
+
+
+class _PlannerStage:
+    """One planner call's clock and trail. `left()` is what its window has
+    left; `fail()` / `ok()` record a hop for the log line and the activity row."""
+
+    def __init__(self, seconds, clock=None):
+        self.clock = clock or _PLANNER_CLOCK
+        self.t0 = self.clock()
+        self.until = self.t0 + max(0.0, float(seconds))
+        self.rows = []              # [(pid, model, outcome, seconds)]
+        self.answered = None
+
+    def left(self):
+        return self.until - self.clock()
+
+    def fail(self, pid, model, started, why):
+        secs = max(0.0, self.clock() - started)
+        self.rows.append((pid, model, why, secs))
+        _planner_mark_failed(pid, model, why)
+
+    def ok(self, pid, model, started):
+        self.rows.append((pid, model, "", max(0.0, self.clock() - started)))
+        self.answered = (pid, model)
+        with _planner_lock:
+            _PLANNER_FAILED.pop((pid, model), None)
+
+
+def _planner_mark_failed(pid, model, why):
+    if not (pid and model) or _client_gone():
+        return
+    with _planner_lock:
+        _PLANNER_FAILED[(pid, model)] = (time.time(), str(why or "failed"))
+
+
+def _planner_recently_failed(pid, model):
+    """True when this pair failed a planner hop inside _PLANNER_FAIL_TTL, or its
+    last hop anywhere stalled (_recent_hop_stall). Never raises."""
+    try:
+        with _planner_lock:
+            rec = _PLANNER_FAILED.get((pid, model))
+            if rec and time.time() - rec[0] > _PLANNER_FAIL_TTL:
+                _PLANNER_FAILED.pop((pid, model), None)
+                rec = None
+        return bool(rec) or bool(_recent_hop_stall(pid, model))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _planner_slow(pid, model):
+    """Slow for a 90 s planner hop: measured non-stream duration at/over
+    _PLANNER_SLOW_SHARE of the hop deadline, else _is_slow_model (measured
+    TTFT, else the reasoning-family name)."""
+    try:
+        ms = _measured_latency_ms(pid, model)
+        if ms is not None and ms >= _PLANNER_SLOW_SHARE * swarm_windows.PLAN_HOP_SECONDS * 1000.0:
+            return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    return bool(_is_slow_model(pid, model))
+
+
+def _planner_order(chain):
+    """The stage chain with FAST, NON-THINKING, tool-capable models first
+    INSIDE the top band (within _AUTO_TOP_BAND of the best _benchmark_score,
+    last-resort families never in it), exactly like _distinct_first reads it.
+    RE-ORDER ONLY: nothing is dropped and the head never leaves the band --
+    except that a pair which just failed the planner (or stalled a hop) goes
+    behind every other, as _build_chain does for a recent failure. Inside the
+    band, ties keep the chain's own order. Never raises."""
+    chain = list(chain or ())
+    if len(chain) < 2:
+        return chain
+    try:
+        scored = [(_benchmark_score(e[0], e[1]), i, e) for i, e in enumerate(chain)]
+        cand = [t for t in scored if not _is_low_quality(t[2][1])]
+        ordered = chain
+        if len(cand) >= 2:
+            best = max(t[0] for t in cand)
+            band = [t for t in cand if t[0] >= best - _AUTO_TOP_BAND]
+            if len(band) >= 2:
+                def _key(t):
+                    _sc, i, e = t
+                    return (not _supports_tools(e[0], e[1]), _planner_slow(e[0], e[1]),
+                            bool(_thinks_by_default(e[0], e[1])), i)
+                inside = {t[1] for t in band}
+                ordered = ([t[2] for t in sorted(band, key=_key)]
+                           + [e for i, e in enumerate(chain) if i not in inside])
+        good = [e for e in ordered if not _planner_recently_failed(e[0], e[1])]
+        bad = [e for e in ordered if _planner_recently_failed(e[0], e[1])]
+        return good + bad
+    except Exception:                                            # noqa: BLE001
+        return chain
+
+
+def _planner_stage():
+    """The stage for the planner call about to run, or None when
+    `planner_time_bounds` is off (= the old walk). Its clock is the window
+    swarm_windows opened for this attempt / re-ask."""
+    if not swarm_windows.bounds_on():
+        return None
+    left = swarm_windows.planning_seconds_left()
+    return _PlannerStage(swarm_windows.PLAN_ATTEMPT_SECONDS if left is None else left)
+
+
+def _planner_stage_close(stage, act=None):
+    """The planner call's trail: ONE log line (per-hop model, outcome and
+    seconds -- hub.log never had one) and the activity row's chips."""
+    if stage is None:
+        return
+    try:
+        bits = []
+        for pid, model, why, secs in stage.rows:
+            bits.append("%s/%s %s (%.0fs)" % (pid, model, why or "answered", secs))
+        if bits:
+            _log.info("[plan] hops, %.0fs in all: %s", stage.clock() - stage.t0,
+                      " | ".join(bits))
+        if act is not None and stage.rows:
+            rows = [{"role": ("planner: " + why)[:48] if why else "planner",
+                     "model": ("%s/%s" % (pid, model))[:64]}
+                    for pid, model, why, _s in stage.rows][:12]
+            with _activity_lock:
+                act["pipeline"] = rows
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 @_usage_source_as("swarm")
 def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_families=(),
-                    ledger=None):
+                    ledger=None, plan=None):
     """One stage of the pipeline, routed and executed through the SAME chain
     every other request uses (so fallback, key rotation, quota accounting and
     the activity trail all behave identically). Returns (text, 'pid/model');
@@ -34454,7 +34628,11 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_fam
     `ledger` (swarm.RunLedger, a WORKER call of a run with distinct models
     on): the stage chain is re-ordered so this worker opens on a model
     identity no other worker of the run has (_distinct_first), and the pair
-    it uses is reserved in the ledger. None = the chain exactly as built."""
+    it uses is reserved in the ledger. None = the chain exactly as built.
+
+    `plan` (a _PlannerStage; the swarm_windows PLANNER's call only): see THE
+    PLANNER'S HOPS ARE TIME-BOUNDED above. None = this function exactly as it
+    was for every other stage."""
     try:
         est = _est_tokens(messages)
         # force_difficulty="hard": every swarm stage is creation work and must
@@ -34476,11 +34654,14 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_fam
                                   key=lambda e: _latency_rank(e[0], e[1]))
         if avoid_families:
             _stage_chain = _avoid_families_last(_stage_chain, avoid_families)
+        if plan is not None:
+            _stage_chain = _planner_order(_stage_chain)
         _reserved = None
         _use_ledger = ledger is not None and not fast and _distinct_models_on()
         if _use_ledger:
             _stage_chain, _reserved = _distinct_first(_stage_chain, ledger, exclude_pids)
-        for hop_pid, hop_model in _stage_chain[:_SWARM_STAGE_MAX_HOPS]:
+        _max_hops = _SWARM_STAGE_MAX_HOPS if plan is None else _PLANNER_MAX_HOPS
+        for hop_pid, hop_model in _stage_chain[:_max_hops]:
             if _client_gone():
                 break        # the client left: the stage ends empty, at once
             if exclude_pids and hop_pid in exclude_pids:
@@ -34498,6 +34679,13 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_fam
             # still in flight when the run's own cap passes may finish, but it
             # may not start a hop the run can no longer afford.
             _hop_deadline = _SWARM_FAST_HOP_DEADLINE if fast else _SWARM_HOP_DEADLINE
+            if plan is not None:
+                # A planner hop is a short JSON: PLAN_HOP_SECONDS, and never
+                # past what the attempt's window has left.
+                _plan_left = plan.left()
+                if _plan_left < _PLANNER_MIN_HOP_SECONDS:
+                    break
+                _hop_deadline = min(swarm_windows.PLAN_HOP_SECONDS, _plan_left)
             _outer_left = _pipeline_time_left()
             if _outer_left is not None:
                 if _outer_left <= 1:
@@ -34513,17 +34701,33 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_fam
             payload = {"model": hop_model, "stream": False,
                        "max_tokens": _hop_max, "messages": messages,
                        "_no_craft": True}   # stripped in _upstream_chat
+            _hop_t0 = plan.clock() if plan is not None else 0.0
+            if plan is not None:
+                # Room for a thinker: LOW effort (a plan is JSON, not deep
+                # thought) plus the allowance the chain loops already give, so
+                # hidden reasoning cannot eat the whole 3000 before the first
+                # brace. A no-op for a model that does not think.
+                _apply_reasoning_effort(payload, hop_model, "simple", pid=hop_pid)
             resp, hop_exc = _dispatch_chat_with_deadline(hop_pid, payload,
                                                          _hop_deadline)
             if resp is None:         # hung hop (deadline) or a failed one
                 _record_outcome(hop_pid, hop_model, False)
+                if plan is not None:
+                    plan.fail(hop_pid, hop_model, _hop_t0,
+                              "no answer in %ds" % int(_hop_deadline) if hop_exc is None
+                              else "error: %s" % type(hop_exc).__name__)
                 continue
             try:
                 if resp.status_code != 200:
                     _record_outcome(hop_pid, hop_model, False)
+                    if plan is not None:
+                        plan.fail(hop_pid, hop_model, _hop_t0,
+                                  "HTTP %s" % resp.status_code)
                     continue
                 data = resp.json() or {}
             except ValueError:
+                if plan is not None:
+                    plan.fail(hop_pid, hop_model, _hop_t0, "unreadable reply")
                 continue
             finally:
                 try:
@@ -34536,9 +34740,24 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_fam
             gate = _answer_gate(data, payload, False, hop=(hop_pid, hop_model))
             if gate == "junk":
                 _record_outcome(hop_pid, hop_model, False, junk=True)
+                if plan is not None:
+                    plan.fail(hop_pid, hop_model, _hop_t0, "junk reply")
                 continue
             choice = (data.get("choices") or [{}])[0]
             text = ((choice.get("message") or {}).get("content") or "").strip()
+            if plan is not None and not text:
+                # EMPTY: finish "length" is the thinker that spent its whole
+                # budget before the first brace (learn it, so the next call
+                # gives it room up front); anything else is an empty 200.
+                # Either way the walk moves on INSIDE this attempt.
+                starved = (choice.get("finish_reason") == "length")
+                if starved:
+                    _note_thinking(hop_pid, hop_model, "starved-empty")
+                _record_outcome(hop_pid, hop_model, False)
+                plan.fail(hop_pid, hop_model, _hop_t0,
+                          "empty: out of tokens while thinking" if starved
+                          else "empty reply")
+                continue
             if text and choice.get("finish_reason") == "length":
                 # Truncated by the PROVIDER's completion cap (observed live:
                 # kilocode/hy3 cut a synthesis mid-attribute, shipping broken
@@ -34548,6 +34767,8 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_fam
                 if len(text) > len(best_partial):
                     best_partial = text
                     best_partial_who = "%s/%s" % (hop_pid, hop_model)
+                if plan is not None:
+                    plan.fail(hop_pid, hop_model, _hop_t0, "cut off at the token cap")
                 continue
             if text and _is_upstream_nonanswer(text):
                 # A relay's error page delivered as a 200 (see
@@ -34555,6 +34776,17 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_fam
                 # synthesises on top of "The model does not exist in
                 # https://api.airforce" as if it were real stage output.
                 _note_nonanswer(hop_pid, hop_model)
+                if plan is not None:
+                    plan.fail(hop_pid, hop_model, _hop_t0, "not an answer")
+                continue
+            if text and plan is not None and not swarm_windows.plan_readable(text):
+                # Prose, or JSON with no usable phase: the next model may do
+                # better, so keep walking (the longest one is the fallback and
+                # reaches plan(), which logs it and re-asks with the nudge).
+                if len(text) > len(best_partial):
+                    best_partial = text
+                    best_partial_who = "%s/%s" % (hop_pid, hop_model)
+                plan.fail(hop_pid, hop_model, _hop_t0, "not a plan")
                 continue
             if text:
                 # Same success hook as every other endpoint: usage accounting
@@ -34562,6 +34794,8 @@ def _swarm_dispatch(messages, max_tokens, exclude_pids=(), fast=False, avoid_fam
                 # the next stage's chain prefers (and a hung hop sinks).
                 _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
                 _act_pick(hop_pid, hop_model)
+                if plan is not None:
+                    plan.ok(hop_pid, hop_model, _hop_t0)
                 return text, "%s/%s" % (hop_pid, hop_model)
         if best_partial:
             return best_partial, best_partial_who
