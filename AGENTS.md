@@ -2884,3 +2884,74 @@ needed before touching it (a decrease at once is the documented 503 protection);
 the candidates are (1) leave rows whose window is under `_DECLARED_WINDOW_MIN` out
 of the quantile -- they can never take a CLI turn -- and (2) keep a provider counted
 for the 3rd-provider cap for ~45 min after it last had an alive row.
+
+
+## Fewer wasted hops (2026-10-08)
+
+Covered by `tests/test_stop_wasted_hops.py`. Owner: swarm modes "race to answer
+first and waste tokens; they should collaborate, and a failed model should hand
+over to the NEXT one". MEASURED (turn-roles.jsonl, 24 h, 514 swarm-mode tool
+turns): there is NO race (`tool_turn_race` off, stall backup on 6% of turns),
+but the turns cost 1235 upstream calls (2.40 per turn) and **413 (33%) were
+failed first hops**: `uncloseai/turboderp/Qwen3.8-27B-exl3` HTTP 400 x173,
+`groq/qwen/qwen3.8-27b` RequestException x49, `kilocode/dots-3-note-preview`
+"200 with an empty message" x20, nvidia glm/kimi/deepseek "no answer in time"
+x42; 86 turns (17%) ended with no server.
+
+- **Why one weak pair kept opening chains** (`[spread] ... pool 1, held elsewhere
+  N`): `_spread_pool` and `_rotate_within_run` measured "comparable" on the RAW
+  benchmark score (a 10-point window) while `_auto_top_band` -- which runs AFTER
+  them -- applies the learned reliability penalty. With the strong models held by
+  sibling sessions (or just stalled: a stall is a `_recent_hop_failure` and drops
+  a model from the primary pick, a HTTP 400 is not), the Qwen at 134 (reliability
+  0.026, penalty 8.5) was the only unheld model in the window, so the next step
+  had a pool of one to "choose" from. Now `_spread_pool` / `_rotate_within_run`
+  measure on `_learned_score` (score minus reliability and answer-quality
+  penalties), use a 6-point window (`_SPREAD_MAX_DROP`, the owner's widest
+  rotation band), and never move a session ONTO a pair that is measured to fail
+  (`_chain_reliability_band` 2), sick on tool turns or resting
+  (`_spread_target_ok`). When nobody eligible is free the sessions SHARE the best
+  (the pool minus measured-to-fail pairs; the full pool when that is all there
+  is). Owner rule intact: parallel helpers still get different models WHEN they
+  are in the band. The fresh pick also drops a model whose KNOWN window cannot
+  hold the request even after the hub's allowed trim (`_roomy` in
+  `_route_by_difficulty`, same bar as the overflow signal), fail-open.
+- **Why the HTTP 400 (all 7 logged bodies)**: `"System message must be at the
+  beginning."` -- the Qwen chat template raises on ANY system message that is not
+  the very first one, including a second leading one, and the hub puts its own
+  (craft brief, model guide, goal note, team notes, compaction notice, exact
+  facts) beside the client's. Not tools, `max_tokens` or private keys. Fix in
+  `_upstream_chat`: the 400 is matched by `_SYSTEM_ORDER_ERR_RE`, the SAME hop is
+  retried at once with every system message merged at index 0 in order
+  (`_merge_system_messages`; text-only, otherwise untouched) and the pair is
+  remembered (`_SYSTEM_FIRST`, 7 days, in memory) so later calls are merged before
+  they go out. The walk never sees the 400, so nothing is spent or filed.
+- **Failure streaks rest the pair** (extends the empty-200 ledger, no new walk):
+  `_note_pair_failure(pid, model, cls)` files `http4xx` (any 4xx except 402/413/
+  429), `exc` (RequestException) and `deadline` (no answer in time, via
+  `_note_recent_hop_failure`) next to the old `empty`. 3 of ONE class inside 15
+  min with no success rest the pair for tool turns: 30 min, doubling per repeat
+  (a failure after a rest ran out with no success since is a repeat), cap 6 h
+  (`_pair_rest`). One delivery (`_record_outcome(ok)`) clears events AND level.
+  Exempt: 429/quota/billing/413, a client that left, a local-network failure
+  (`_local_net_failed`), an explicit `provider/model` request (its chain is seeded
+  before any of this). Resting rides `_tool_turn_sick` (primary pick, chain sick
+  group, quality fallback) plus `_empty_resting` (roles walk tail, orchestrator
+  pin), `_build_chain`'s primary seed and the verifier/specialist pool: always
+  fail-open, the pair stays reachable as the LAST resort. `_empty_200` entries
+  may now be `(epoch, class)`; a bare epoch is the legacy "empty" event.
+- **Known-too-small windows are not walked ahead of a pair that fits**:
+  `_ChainClock._roomy_first` (every tool walk) moves a hop that would only raise
+  `_ContextOverflow` behind the others -- reordered, never dropped, so the native
+  overflow reply still sees them; the user-named head stays first. The roles walk
+  and `_quality_fallback_pick` already skipped such a hop without a call.
+- **Verifier pool**: a pair with >= 6 verifier runs of which under 20% gave a
+  usable verdict leaves the pool while another candidate remains
+  (`_verifier_unusable`, fresh look after 6 h). The verifier GATE is unchanged.
+- **Cost visible**: every roles row now carries `actor_calls` and
+  `wasted_calls` (actor-hop calls that served nothing: failed first hops, a
+  backup that lost, every call of a turn nobody answered; counted at the leg
+  starts, not from `failed`, which also lists hops skipped for a window).
+  `scripts/role_eval.py` prints `summary: N calls/turn, P% of calls wasted` and
+  derives the figure for old rows from `failed`, so before/after compares on the
+  same log (24 h before: 2.40 calls/turn, ~32% wasted).

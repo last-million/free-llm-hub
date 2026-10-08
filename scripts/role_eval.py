@@ -81,6 +81,16 @@ def race_stats(lines):
     }
 
 
+def wasted_of(r):
+    """Calls of one roles row that served nothing: the row's own `wasted_calls`,
+    else (a row written before the field existed) its failed hops that really
+    spent a call -- a hop skipped for a too-small window spent none."""
+    if r.get("wasted_calls") is not None:
+        return int(r.get("wasted_calls") or 0)
+    return sum(1 for f in (r.get("failed") or [])
+               if isinstance(f, dict) and "window too small" not in str(f.get("why")))
+
+
 def roles_stats(rows):
     turns = [r for r in rows if r.get("event", "turn") == "turn" and r.get("turn") == "tool"]
     text = [r for r in rows if r.get("event", "turn") == "turn" and r.get("turn") == "text"]
@@ -99,11 +109,14 @@ def roles_stats(rows):
     rejected = sum(1 for r in turns + text if r.get("corrector") and not r.get("corrected"))
     revise_kept = sum(1 for r in turns + text
                       if r.get("verdict") == "revise" and not r.get("corrector"))
+    wasted = sum(wasted_of(r) for r in turns)
     return {
         "turns": n,
         "served": len(served),
         "calls": calls,
         "calls_per_turn": round(calls / n, 2) if n else None,
+        "wasted_calls": wasted,
+        "wasted_calls_pct": round(100.0 * wasted / calls, 1) if calls else None,
         "calls_per_served_answer": round(calls / len(served), 2) if served else None,
         "input_tokens_sent_per_turn": round(sum(sent) / n) if n else None,
         "latency_p50_s": _pct(lat, 50),
@@ -181,6 +194,11 @@ def main(argv=None):
         print("== %s ==" % name)
         for k, v in out[name].items():
             print("  %-28s %s" % (k, v))
+    r = out["roles"]
+    if r.get("turns"):
+        print("summary: %s calls/turn, %s%% of calls wasted (%s of %s)" % (
+            r.get("calls_per_turn"), r.get("wasted_calls_pct"),
+            r.get("wasted_calls"), r.get("calls")))
     print("sources: %d log file(s), %d roles file(s)" % (len(log_paths), len(role_paths)))
     return out
 

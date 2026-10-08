@@ -3563,6 +3563,8 @@ def _record_outcome(pid, model, ok, junk=False, junk_source="answer"):
         pass
     if junk and not ok:
         _junk_bench_note(pid, model, junk_source)
+    if ok:
+        _clear_empty_200(pid, model)    # one delivery ends a failure streak / rest
     _note_tool_turn_outcome(pid, model, ok)
     _save_perf_stats()
 
@@ -4705,6 +4707,10 @@ def _note_recent_hop_failure(pid, model, kind):
             _recent_hop_fail[(pid, model)] = (time.time(), str(kind or "fail"))
     except Exception:                                            # noqa: BLE001
         pass
+    if kind in _RECENT_STALL_KINDS:
+        # "No answer in time" is one of the same-way failures a streak counts
+        # (see _note_pair_failure); a 429 / junk / invalid kind is not.
+        _note_pair_failure(pid, model, "deadline")
 
 
 def _clear_recent_hop_failure(pid, model):
@@ -7334,6 +7340,7 @@ def _dispatch_chat(pid, payload, stream):
             started = time.perf_counter()
             resp = _nb_close(_upstream_chat(pid, payload, stream))
             _local_net_clear(pid, (payload or {}).get("model"))   # it resolved
+            _streak_note_response(pid, payload, resp)
             try:
                 resp._hub_started = started
                 # Size of what was asked, for the long-context speed ledger.
@@ -7355,6 +7362,7 @@ def _dispatch_chat(pid, payload, stream):
         started = time.perf_counter()
         resp = _upstream_chat(pid, payload, stream)
         _local_net_clear(pid, (payload or {}).get("model"))       # it resolved
+        _streak_note_response(pid, payload, resp)
         try:
             if resp is not None and getattr(resp, "status_code", None) == 200:
                 ms = (time.perf_counter() - started) * 1000.0
@@ -7370,10 +7378,31 @@ def _dispatch_chat(pid, payload, stream):
         # _local_net_failed) and the chain clock can pause instead of burning
         # every hop at once. The exception itself passes through unchanged.
         _mark_local_net_failure(pid, (payload or {}).get("model"), exc)
+        if isinstance(payload, dict) and payload.get("tools"):
+            _note_pair_failure(pid, payload.get("model"), "exc")   # skips a local-net mark
         raise
     finally:
         if not _released:
             _inflight_dec(pid)
+
+
+# HTTP statuses a failure streak does NOT count: 429 (quota / rate limit, with
+# its own cool-downs), 402 (billing), 413 (teaches the window; the learned
+# window then skips the hop before a call is spent).
+_STREAK_SKIP_STATUS = frozenset({402, 413, 429})
+
+
+def _streak_note_response(pid, payload, resp):
+    """A tool turn's 4xx (other than the quota / window ones) is one more
+    same-way failure of this pair (see _note_pair_failure). Never raises."""
+    try:
+        if not (isinstance(payload, dict) and payload.get("tools")):
+            return
+        code = getattr(resp, "status_code", None)
+        if isinstance(code, int) and 400 <= code < 500 and code not in _STREAK_SKIP_STATUS:
+            _note_pair_failure(pid, payload.get("model"), "http4xx")
+    except Exception:                                            # noqa: BLE001
+        pass
 
 
 def _payload_est_tokens(payload):
@@ -8158,7 +8187,43 @@ def _pinned_elsewhere(exclude_key=None):
 # spreading onto. The pick's own softmax treats a few points as "a close
 # competitor" and 20 as "rarely"; a sibling holding the best model is a reason
 # to take the close competitor, never the one 20 points back.
-_SPREAD_MAX_DROP = 10.0
+#
+# FEWER WASTED HOPS (2026-10-08). MEASURED (turn-roles.jsonl, 24 h): 184 of 514
+# swarm-mode turns were ROUTED to uncloseai/Qwen3.8-27B (reliability 0.026, 173
+# failed first hops) with "[spread] ... (pool 1, held elsewhere N)": the strong
+# models were held by sibling sessions, and this 10-point window -- measured on
+# the RAW benchmark score -- still saw the 134 Qwen as "comparable", so it was
+# the only unheld model left and the later steps (_auto_top_band, which does
+# apply the learned penalty) had a pool of one to "choose" from. Sharing the
+# best model beats spreading onto a leftover that fails most turns, so:
+#   * the window is now the owner's widest rotation band (6 = _RUN_ROTATE_WIDE_DROP),
+#   * it is measured on what the pair really delivers (_learned_score), and
+#   * a pair measured to fail, resting after a failure streak, or sick on tool
+#     turns is never a spread/rotation TARGET (_spread_target_ok).
+# Fail-open at every step: no eligible free model -> the full pool comes back.
+_SPREAD_MAX_DROP = 6.0
+
+
+def _learned_score(c):
+    """(score, pid, model) -> the benchmark score minus what the hub has LEARNED
+    about this pair (reliability, answer-quality canary): the strength it
+    actually delivers. Equal to c[0] for a pair with no history. Never raises."""
+    try:
+        return (float(c[0]) - _reliability_penalty(c[1], c[2])
+                - _answer_quality_penalty(c[1], c[2]))
+    except Exception:                                            # noqa: BLE001
+        return c[0]
+
+
+def _spread_target_ok(c):
+    """May a spread/rotation step move a session ONTO this candidate? Not when
+    the pair is measured to fail (reliability band 2), measured sick on tool
+    turns, or resting after a same-way failure streak. Fail-open (True)."""
+    try:
+        return (_chain_reliability_band(c[1], c[2]) < 2
+                and not _tool_turn_sick(c[1], c[2]))
+    except Exception:                                            # noqa: BLE001
+        return True
 
 
 def _spread_pool(pool, exclude_key=None):
@@ -8177,11 +8242,14 @@ def _spread_pool(pool, exclude_key=None):
         taken = _pinned_elsewhere(exclude_key)
         if not taken:
             return pool
-        best = max((c[0] for c in pool), default=0.0)
+        best = max((_learned_score(c) for c in pool), default=0.0)
         free = [c for c in pool
                 if _normalize_model_identity(c[2]) not in taken
-                and c[0] >= best - _SPREAD_MAX_DROP]
-        return free or pool
+                and _learned_score(c) >= best - _SPREAD_MAX_DROP
+                and _spread_target_ok(c)]
+        # Nobody free: the sessions SHARE the best. A pair measured to fail
+        # leaves the pool on this path too (fail-open when that is all there is).
+        return free or [c for c in pool if _spread_target_ok(c)] or pool
     except Exception:                                            # noqa: BLE001
         return pool
 
@@ -8257,7 +8325,8 @@ def _run_used_picks(session_key):
 
 def _rotation_candidate_ok(c):
     try:
-        return not _is_low_quality(c[2]) and not _is_model_blocked_by_user(c[1], c[2])
+        return (not _is_low_quality(c[2]) and not _is_model_blocked_by_user(c[1], c[2])
+                and _spread_target_ok(c))
     except Exception:                                            # noqa: BLE001
         return True
 
@@ -8271,18 +8340,19 @@ def _rotate_within_run(pool, session_key):
         used, used_pids, used_fams = _run_used_picks(session_key)
         if not used or not pool:
             return pool
-        best = max(c[0] for c in pool)
+        best = max(_learned_score(c) for c in pool)
         need = len(used) + 1
 
         def _band(drop):
-            return [c for c in pool if c[0] >= best - drop and _rotation_candidate_ok(c)]
+            return [c for c in pool
+                    if _learned_score(c) >= best - drop and _rotation_candidate_ok(c)]
 
         band = _band(_RUN_ROTATE_MAX_DROP)
         if len({_normalize_model_identity(c[2]) for c in band}) < need:
             band = _band(_RUN_ROTATE_WIDE_DROP)
         fresh = [c for c in band if _normalize_model_identity(c[2]) not in used]
         if not fresh:
-            return pool
+            return [c for c in pool if _spread_target_ok(c)] or pool
         v = _verify()
 
         def _fam(c):
@@ -9132,6 +9202,18 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
             if len({c[1] for c in _wider}) > len({c[1] for c in _normal}):
                 _normal = _wider
         _pool = _normal or _pool
+        # NOT ONTO A MODEL THAT CAN ONLY OVERFLOW (2026-10-08). The pinned branch
+        # above drops a pin whose KNOWN window cannot hold the request, but a
+        # FRESH pick never asked: MEASURED, uncloseai/Qwen3.8-27B (65K window)
+        # opened 184 turns of 85K-377K tokens. "Cannot hold" here means the
+        # hub's own overflow bar -- a model that would still lose more than
+        # _CTX_OVERFLOW_DROP_FRAC of the history after the trim -- so a strong
+        # model on a modestly trimmed context (see the compactable re-admission
+        # above) keeps its place. Fail-open: nothing roomier = the pool as is.
+        _roomy = [c for c in _pool
+                  if _window_fits(c[1], c[2], int(est * (1.0 - _CTX_OVERFLOW_DROP_FRAC)))]
+        if _roomy:
+            _pool = _roomy
         # SPREAD ACROSS CONCURRENT SESSIONS. This is the moment a session
         # decides the model it will keep, so it is the one place where knowing
         # what its siblings are already using changes anything -- afterwards the
@@ -9821,7 +9903,10 @@ def _tool_turn_reliability(pid, model):
 
 
 def _tool_turn_sick(pid, model):
-    """Measured on tool turns to mostly not deliver."""
+    """Measured on tool turns to mostly not deliver, or resting after failing
+    the same way again and again (see _note_pair_failure)."""
+    if _pair_resting(pid, model):
+        return True
     r = _tool_turn_reliability(pid, model)
     return r is not None and r < _TOOL_SICK_RATE
 
@@ -10083,7 +10168,8 @@ def _build_chain(primary_pid, model_id, est=0, require_vision=False, require_too
         chain = [(primary_pid, model_id)]
         seen = {(primary_pid, model_id)}
     elif (_chain_reliability_band(primary_pid, model_id) >= 2
-          or _recent_hop_failure(primary_pid, model_id)):
+          or _recent_hop_failure(primary_pid, model_id)
+          or (require_tools and _pair_resting(primary_pid, model_id))):
         # ...and neither does one that 429'd or ran out its time in the last
         # ten minutes (see _RECENT_FAIL_TTL): the ranked list below puts it in
         # the recent-failure tail instead.
@@ -10595,6 +10681,100 @@ def _remember_unsupported_params(pid, keys):
     with _thinking_lock:
         _PARAM_REJECTED.setdefault(pid, set()).update(keys)
     _log.info("[params] %s rejects %s: dropped from now on", pid, ", ".join(sorted(keys)))
+
+
+# SYSTEM MESSAGE MUST COME FIRST (2026-10-08). MEASURED: uncloseai/turboderp/
+# Qwen3.8-27B-exl3 answered HTTP 400 "System message must be at the beginning."
+# x173 in 24 h (7 of 7 logged bodies), reliability 0.026, and still opened 184
+# swarm-mode turns. Its chat template raises on ANY system message that is not
+# the very first message -- including a SECOND leading one -- and this hub adds
+# its own (craft brief, model guide, goal note, team notes, compaction notice,
+# exact facts) next to the client's. Nothing about the request was wrong; the
+# fix is to send one system message. The first 400 teaches it, the same hop is
+# retried at once with every system message merged at index 0 (in order), and
+# the pair is remembered so later calls are merged BEFORE they go out.
+_SYSTEM_ORDER_ERR_RE = re.compile(
+    r"system (?:role )?messages?\s+(?:must|should|has to|have to|can only|may only|is only|are only)"
+    r"[^.\n]{0,60}(?:begin|first|start)|(?:only|just) one system message|"
+    r"system (?:role )?message[^.\n]{0,40}(?:not allowed|only allowed)[^.\n]{0,30}(?:begin|first|start)", re.I)
+_SYSTEM_FIRST = {}                      # (pid, model) -> epoch learned
+_SYSTEM_FIRST_TTL = 7 * 86400.0
+_system_first_lock = threading.Lock()
+
+
+def _message_plain_text(m):
+    """The text of a message's content (a str, or a list of text parts), or
+    None when it carries anything else (images, ...)."""
+    c = m.get("content") if isinstance(m, dict) else None
+    if c is None:
+        return ""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        out = []
+        for part in c:
+            if isinstance(part, str):
+                out.append(part)
+            elif isinstance(part, dict) and part.get("type") in (None, "text") \
+                    and isinstance(part.get("text"), str):
+                out.append(part["text"])
+            else:
+                return None
+        return "\n".join(out)
+    return None
+
+
+def _merge_system_messages(messages):
+    """`messages` with every role=system message merged into ONE at index 0
+    (texts joined in order by a blank line; the rest keep their order). The
+    SAME list object when there is nothing to do (no system message, or exactly
+    one and already first) or a system message carries non-text content. Never
+    raises."""
+    try:
+        if not isinstance(messages, list):
+            return messages
+        sys_idx = [i for i, m in enumerate(messages)
+                   if isinstance(m, dict) and m.get("role") == "system"]
+        if not sys_idx or (len(sys_idx) == 1 and sys_idx[0] == 0):
+            return messages
+        texts = []
+        for i in sys_idx:
+            t = _message_plain_text(messages[i])
+            if t is None:
+                return messages
+            if t.strip():
+                texts.append(t.strip())
+        rest = [m for i, m in enumerate(messages) if i not in set(sys_idx)]
+        return ([{"role": "system", "content": "\n\n".join(texts)}] if texts else []) + rest
+    except Exception:                                            # noqa: BLE001
+        return messages
+
+
+def _system_first_known(pid, model):
+    """True when this pair has refused a system message that was not first."""
+    try:
+        with _system_first_lock:
+            ts = _SYSTEM_FIRST.get((pid, model))
+            if ts is None:
+                return False
+            if time.time() - ts > _SYSTEM_FIRST_TTL:
+                _SYSTEM_FIRST.pop((pid, model), None)
+                return False
+            return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _remember_system_first(pid, model):
+    try:
+        with _system_first_lock:
+            fresh = (pid, model) not in _SYSTEM_FIRST
+            _SYSTEM_FIRST[(pid, model)] = time.time()
+        if fresh:
+            _log.info("[system-first] %s/%s needs ONE leading system message: merged "
+                      "from now on", pid, model)
+    except Exception:                                            # noqa: BLE001
+        pass
 # A 400 about the reasoning parameter itself (not, say, a context overflow).
 _REASONING_PARAM_ERR_RE = re.compile(
     r"reasoning[_ .]?effort|thinking[_ ]?(?:budget|level|config)"
@@ -14190,6 +14370,13 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
         if did or fixed is not msgs:
             payload = dict(payload)
             payload["messages"] = fixed
+        # A pair that refused a system message that was not first gets ONE
+        # leading system message (see _SYSTEM_ORDER_ERR_RE).
+        if _system_first_known(pid, payload.get("model")):
+            _merged = _merge_system_messages(payload["messages"])
+            if _merged is not payload["messages"]:
+                payload = dict(payload)
+                payload["messages"] = _merged
         # CLAMP THE REPLY BUDGET to what is left of the window (output shares
         # it on most providers) and to the model's learned output cap. Only
         # against a KNOWN window: clamping against a guess would cut answers
@@ -14351,6 +14538,21 @@ def _upstream_chat(pid, payload, stream, only_key=_NO_KEY_PIN):
                     _remember_unsupported_params(pid, _bad)
                     resp.close()
                     payload = {k: v for k, v in payload.items() if k not in _bad}
+                    _post_kw["json"] = payload
+                    resp = (_post_with_header_deadline(_hdr_wait,
+                                                       requests.post, **_post_kw)
+                            if stream else requests.post(**_post_kw))
+            # ...and a template that wants ONE system message, first: merge them
+            # and retry this hop at once (see _SYSTEM_ORDER_ERR_RE).
+            if (resp.status_code in (400, 422) and isinstance(payload, dict)
+                    and isinstance(payload.get("messages"), list)
+                    and _SYSTEM_ORDER_ERR_RE.search(_resp_text_safe(resp))):
+                _merged = _merge_system_messages(payload["messages"])
+                if _merged is not payload["messages"]:
+                    _remember_system_first(pid, payload.get("model"))
+                    resp.close()
+                    payload = dict(payload)
+                    payload["messages"] = _merged
                     _post_kw["json"] = payload
                     resp = (_post_with_header_deadline(_hdr_wait,
                                                        requests.post, **_post_kw)
@@ -30320,6 +30522,8 @@ class _ChainClock:
         self._ensure_ledgers()
         original = list(chain or ())
         self._rest = rest = list(original)
+        if self.tools and self.est:
+            rest[:] = self._roomy_first(rest)
         first = True
         while True:
             while rest:
@@ -30369,6 +30573,28 @@ class _ChainClock:
             self._net_rewalked = True
             self._net_streak = []
             rest.extend(original)
+
+    def _roomy_first(self, entries):
+        """`entries` with the hops whose KNOWN window cannot hold this request
+        even after the hub's allowed trim (see _CTX_OVERFLOW_DROP_FRAC) moved
+        behind the ones that can: such a hop only raises _ContextOverflow, and
+        each one ahead of a real candidate ate a slot of the hop cap and a
+        look of the walk (MEASURED: a 65K-window pair on 85K-377K turns).
+        Reordered, never dropped -- the overflow bookkeeping that decides the
+        native context-length reply still sees them. The user-named head
+        (pinned) stays first. Never raises."""
+        try:
+            if not self.est:
+                return list(entries)
+            keep = 1 if (self.pinned and entries) else 0
+            need = int(self.est * (1.0 - _CTX_OVERFLOW_DROP_FRAC))
+            head, tail = list(entries[:keep]), list(entries[keep:])
+            fits = [e for e in tail if _window_fits(e[0], e[1], need)]
+            if len(fits) == len(tail):
+                return list(entries)
+            return head + fits + [e for e in tail if e not in fits]
+        except Exception:                                        # noqa: BLE001
+            return list(entries)
 
     # -- best/max graceful degrade (see _QUALITY_FALLBACK_SHARE) ------------ #
 
@@ -35919,31 +36145,93 @@ _TOOL_FLEET_MIN_SAMPLES = 5
 _TOOL_FLEET_CLAMP = (12.0, 30.0)
 _TOOL_HEDGE_HUGE_EST = 100000
 _ROLE_MIN_HOP_SECONDS = 20.0         # an actor hop never gets less of the turn
-# Empty / junk 200s on a tool turn: 3 in 10 min rest the pair (even a pin).
+# SAME-WAY FAILURE STREAKS (2026-10-08). Empty / junk 200s were the only failure
+# that ever rested a pair. MEASURED (24 h, 514 swarm-mode tool turns): 413 of
+# 1235 upstream calls were failed first hops -- HTTP 400 x173 from ONE pair,
+# RequestException x49, "no answer in time" x42 -- each repeated by the next
+# turn because nothing remembered that the pair fails THE SAME WAY every time.
+# The ledger below keeps one event list per pair (class-tagged; a plain epoch is
+# the legacy "empty" event) and a REST verdict:
+#   * _STREAK_LIMIT (3) failures of one class inside _STREAK_WINDOW (15 min)
+#     with no success in between rest the pair for tool turns for
+#     _STREAK_REST_BASE (30 min), doubling per repeat up to _STREAK_REST_CAP
+#     (6 h). A repeat = a failure after a rest ran out with no success since
+#     (one probe failure is enough: the pair already proved the point).
+#   * one success clears events AND the rest level (_clear_empty_200).
+#   * never for 429 / quota / billing (those have their own cool-downs), never
+#     for a 413 (that teaches the window), never when the client left, never for
+#     a local-network failure (_local_net_failed) -- none of them is the
+#     provider's fault.
+#   * "resting" only REORDERS: _tool_turn_sick carries it into the primary pick,
+#     the chain's sick group and the quality fallback; the roles walk and the
+#     orchestrator pin consult _empty_resting. Every consumer is fail-open and
+#     keeps the pair as the last resort, and an explicit `provider/model`
+#     request (pinned) seeds its chain before any of that.
 _EMPTY_STREAK_LIMIT = 3
 _EMPTY_STREAK_TTL = 600.0
-_empty_200 = {}                      # (pid, model) -> [epoch, ...]
+_STREAK_LIMIT = 3
+_STREAK_WINDOW = 900.0
+_STREAK_REST_BASE = 1800.0
+_STREAK_REST_CAP = 21600.0
+_STREAK_CLASSES = ("http4xx", "exc", "empty", "deadline")
+_empty_200 = {}                      # (pid, model) -> [epoch | (epoch, class), ...]
 _empty_200_lock = threading.Lock()
+_pair_rest = {}                      # (pid, model) -> {"until", "level", "cls"}
 
 
-def _note_empty_200(pid, model):
-    """File one empty/junk 200 on a tool turn. Not when the client left."""
-    if not (pid and model) or _client_gone():
+def _streak_event(e):
+    """(epoch, class) of one ledger entry; a bare epoch is a legacy 'empty'."""
+    return (e[0], e[1]) if isinstance(e, (tuple, list)) else (e, "empty")
+
+
+def _note_pair_failure(pid, model, cls):
+    """File one failure of class `cls` (one of _STREAK_CLASSES). Not when the
+    client left or this computer's network failed. May start / extend the
+    pair's rest (see the block comment). Never raises."""
+    if not (pid and model) or cls not in _STREAK_CLASSES or _client_gone():
         return
+    try:
+        if _local_net_failed(pid, model):
+            return
+    except Exception:                                            # noqa: BLE001
+        pass
     try:
         now = time.time()
         with _empty_200_lock:
-            row = [t for t in _empty_200.get((pid, model), ()) if now - t <= _EMPTY_STREAK_TTL]
-            row.append(now)
-            _empty_200[(pid, model)] = row[-_EMPTY_STREAK_LIMIT:]
+            row = [e for e in _empty_200.get((pid, model), ())
+                   if now - _streak_event(e)[0] <= _STREAK_WINDOW]
+            row.append((now, cls))
+            row = row[-12:]
+            _empty_200[(pid, model)] = row
+            rest = _pair_rest.get((pid, model))
+            if rest and rest["until"] > now:
+                return                   # already resting
+            if rest and now - rest["until"] > _STREAK_REST_CAP:
+                rest = None              # long quiet since the last rest: fresh start
+                _pair_rest.pop((pid, model), None)
+            same = sum(1 for e in row if _streak_event(e)[1] == cls)
+            if same < _STREAK_LIMIT and not rest:
+                return
+            level = (rest["level"] + 1) if rest else 1
+            ttl = min(_STREAK_REST_CAP, _STREAK_REST_BASE * (2 ** (level - 1)))
+            _pair_rest[(pid, model)] = {"until": now + ttl, "level": level, "cls": cls}
+        _log.info("[streak] %s/%s failed the same way (%s) %d times: resting %d min for "
+                  "tool turns (level %d)", pid, model, cls, same, int(ttl // 60), level)
     except Exception:                                            # noqa: BLE001
         pass
 
 
+def _note_empty_200(pid, model):
+    """File one empty/junk 200 on a tool turn. Not when the client left."""
+    _note_pair_failure(pid, model, "empty")
+
+
 def _clear_empty_200(pid, model):
+    """A real answer: the failure events and the rest level of this pair go."""
     try:
         with _empty_200_lock:
             _empty_200.pop((pid, model), None)
+            _pair_rest.pop((pid, model), None)
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -35953,15 +36241,30 @@ def _empty_streak(pid, model):
     try:
         now = time.time()
         with _empty_200_lock:
-            return len([t for t in _empty_200.get((pid, model), ())
-                        if now - t <= _EMPTY_STREAK_TTL])
+            n = 0
+            for e in _empty_200.get((pid, model), ()):
+                t, c = _streak_event(e)
+                if c == "empty" and now - t <= _EMPTY_STREAK_TTL:
+                    n += 1
+            return n
     except Exception:                                            # noqa: BLE001
         return 0
 
 
+def _pair_resting(pid, model):
+    """True while a same-way failure streak has this pair resting. Never raises."""
+    try:
+        with _empty_200_lock:
+            rest = _pair_rest.get((pid, model))
+            return bool(rest and rest["until"] > time.time())
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _empty_resting(pid, model):
-    """True while the pair is resting after _EMPTY_STREAK_LIMIT empties."""
-    return _empty_streak(pid, model) >= _EMPTY_STREAK_LIMIT
+    """True while the pair is resting: _EMPTY_STREAK_LIMIT empties inside the
+    short TTL, or a same-way failure streak (see _pair_resting)."""
+    return _empty_streak(pid, model) >= _EMPTY_STREAK_LIMIT or _pair_resting(pid, model)
 
 
 def _fleet_tool_p50_ms():
@@ -36003,11 +36306,32 @@ def _tool_hedge_delay(pid, model, est=0):
         return _TOOL_HEDGE_UNKNOWN
 
 
+def _with_wasted_calls(row):
+    """`row` with `wasted_calls`: the actor-hop calls of the turn that served
+    nothing -- failed first hops, a backup that lost or was cut, every call of
+    a turn that ended with no answer. One delivering leg is not waste. Counted
+    at the leg starts (`actor_calls`), NOT from `failed`, which also lists the
+    hops skipped for a too-small window (no call spent) and misses legs cut
+    out of time. Verifier / specialist / corrector calls are not counted here.
+    A row without `actor_calls` (a text review, an old row) is returned as is.
+    Never raises."""
+    try:
+        if not isinstance(row, dict) or "actor_calls" not in row:
+            return row
+        out = dict(row)
+        ok = bool(out.pop("actor_ok", False))
+        out["wasted_calls"] = max(0, int(out.get("actor_calls") or 0) - (1 if ok else 0))
+        return out
+    except Exception:                                            # noqa: BLE001
+        return row
+
+
 def _role_log(row):
     """Append one row to state_dir()/turn-roles.jsonl (rolled to .1 past
     _ROLE_LOG_MAX_BYTES). Read offline by scripts/role_eval.py. Never raises."""
     try:
         path = os.path.join(config.state_dir(), _ROLE_LOG_NAME)
+        row = _with_wasted_calls(row)
         line = json.dumps(dict(row, ts=round(time.time(), 3)), ensure_ascii=False,
                           default=str) + "\n"
         with _role_log_lock:
@@ -36635,6 +36959,7 @@ def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spe
         spent.append((pid, model))
     toks = {0: _role_start_leg(0, pid, model, body, deadline, q, est, kind)}
     rec["calls"] += 1
+    rec["actor_calls"] = int(rec.get("actor_calls") or 0) + 1
     rec["sent_tokens"] += est
     delay = _tool_hedge_delay(pid, model, est)
     partner = clock.tool_hedge_partner(pid, model) if delay < deadline - 1.0 else None
@@ -36672,6 +36997,7 @@ def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spe
                     toks[1] = _role_start_leg(1, p1, m1, body, d1, q, est, kind)
                     pending.add(1)
                     rec["calls"] += 1
+                    rec["actor_calls"] = int(rec.get("actor_calls") or 0) + 1
                     rec["sent_tokens"] += est
                     rec["hedge"] = "%s/%s" % (p1, m1)
                     end = min(max(end, now + d1), turn_end)
@@ -36691,6 +37017,7 @@ def _role_actor_hop(clock, body, pid, model, est, kind, rec, rows, turn_end, spe
             for j in pending:
                 toks[j].cancel("another actor answered first")
             _row(idx, "actor" if idx == 0 else "backup (stall)")
+            rec["actor_ok"] = True
             if pending:
                 _row(min(pending), "%s: stopped, %s answered first" % (
                     "actor" if 0 in pending else "backup (stall)",
@@ -36735,7 +37062,7 @@ def _role_candidates(chain, producer, failed=(), kind=None):
         p, m = e[0], e[1]
         if (p, m) == prod or (p, m) in bad or _is_sub(p):
             continue
-        if _swarm_member_sick(p, m):
+        if _swarm_member_sick(p, m) or _pair_resting(p, m):
             continue
         pairs.append((p, m))
     if not pairs:
@@ -37483,6 +37810,35 @@ def _verifier_rate(pid, model):
     return (sum(1 for e in ev if e[1]) + 1.0) / (len(ev) + 2.0)
 
 
+# A VERIFIER THAT NEVER ANSWERS IS NOT A SECOND OPINION (2026-10-08). MEASURED
+# (turn-roles.jsonl, 24 h): 114 of 159 verifier runs (72%) returned no usable
+# verdict -- nvidia/kimi-k3 35 of 38, nvidia/muse-glimmer-30b 22 of 24,
+# glm/glm-4.7-flash 8 of 8 -- each one a paid call plus up to _VERIFY_DEADLINE
+# seconds of the turn. verify.pick_verifier puts family diversity first, so the
+# usable-verdict rate only broke ties. A pair with >= _VERIFIER_MIN_EVENTS runs
+# of which under _VERIFIER_MIN_RATE were usable leaves the verifier pool while
+# another candidate remains (never the last one), and gets a fresh look after
+# _VERIFIER_RETRY_AFTER with no new run.
+_VERIFIER_MIN_EVENTS = 6
+_VERIFIER_MIN_RATE = 0.2
+_VERIFIER_RETRY_AFTER = 6 * 3600.0
+
+
+def _verifier_unusable(pid, model):
+    """Measured to return no usable verdict (see the block above). Never raises."""
+    try:
+        _team_stats_seed()
+        with _team_stats_lock:
+            ev = list(_verifier_stats.get((pid, model)) or ())
+        if len(ev) < _VERIFIER_MIN_EVENTS:
+            return False
+        if time.time() - max(e[0] for e in ev) > _VERIFIER_RETRY_AFTER:
+            return False
+        return sum(1 for e in ev if e[1]) / float(len(ev)) < _VERIFIER_MIN_RATE
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _rank_verifier_pool(pool):
     """[(pid, model, score)] with the scores of the top-band members replaced
     by 1000 + 100 x usable-verdict rate + 0.01 x score, so verify.pick_verifier
@@ -37491,6 +37847,7 @@ def _rank_verifier_pool(pool):
     the band can win a tie. Never raises."""
     pool = list(pool or ())
     try:
+        pool = [e for e in pool if not _verifier_unusable(e[0], e[1])] or pool
         if len(pool) < 2:
             return pool
         best = max(float(e[2]) for e in pool)
@@ -37765,7 +38122,7 @@ def _tool_turn_roles(body):
            "verifier": None, "verdict": None, "severity": None, "corrector": None,
            "corrected": False, "served": None, "failed": [], "invalid": 0,
            "specialists": [], "specialists_ok": 0, "brief_chars": 0, "team": None,
-           "verifier_unparsed": 0, "verifier_retry": 0}
+           "verifier_unparsed": 0, "verifier_retry": 0, "actor_calls": 0}
     token = _TASK_KIND_CV.set(kind)
     try:
         return _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec,
