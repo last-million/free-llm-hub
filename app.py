@@ -15419,8 +15419,10 @@ def _runtime_error(message=None, retry_after=None):
 
 
 def _drain_headers(reply, retry_after):
-    """Retry-After (whole seconds) plus x-should-retry, on an (response,
-    status) pair. The Stainless SDKs several CLIs use read that header first."""
+    """Retry-After (whole seconds) plus x-should-retry: true, on an (response,
+    status) pair. Claude Code declines to retry a 5xx carrying x-should-retry:
+    false, so the explicit true leaves no doubt; Retry-After stays <= 30 s
+    (Claude Code gives up on anything over 60 s)."""
     resp, status = reply
     resp.headers["Retry-After"] = str(max(1, int(retry_after)))
     resp.headers["x-should-retry"] = "true"
@@ -20670,30 +20672,49 @@ def _file_unresumed_runs():
             pass
 
 
-def _auto_continue_turns(session_ids, plan=None):
+def _auto_continue_turns(session_ids, plan=None, parallel=False):
     """Conversations whose turn a restart cut short AND that asked to continue
     by themselves -- or that a hub-initiated update/restart cut (`plan`, the
     resume marker, regardless of that box): rebuilt and sent the Continue
-    message. Others wait for the owner's Continue. Never raises."""
+    message. Others wait for the owner's Continue. Never raises.
+
+    `parallel` (the boot): each conversation continues on its OWN thread, so
+    one long turn never holds the next conversation back (a turn is drained to
+    its end). Returns the threads started; the default runs them one after
+    another and returns []."""
+    started = []
     for sid in session_ids or ():
         forced = bool(plan is not None and plan.wants_session(sid))
         if not forced and not agentic_history.auto_resume(sid):
             continue
         if forced and sid not in agentic_history.known_session_ids():
             continue                      # the conversation was deleted
-        try:
-            with app.test_request_context("/api/agent/sessions/%s/resume" % sid,
-                                          method="POST", json={}):
-                api_agent_resume_session(sid)
-            noted = False
-            for _ev in agentic_chat.send_message_stream_durable(sid, _CONTINUE_TEXT):
-                if forced and not noted and _ev.get("event") != "error":
-                    noted = True
-                    agentic_chat.live_notice(sid, plan.notice())
-            _log.info("[resume] %s continued by itself after the restart", sid[:12])
-        except Exception as exc:                                 # noqa: BLE001
-            _log.warning("[resume] %s could not continue by itself: %s",
-                         sid[:12], _sanitize(str(exc), 160))
+        if parallel:
+            t = threading.Thread(target=_auto_continue_one, args=(sid, plan, forced),
+                                 daemon=True, name="auto-continue-" + str(sid)[:8])
+            t.start()
+            started.append(t)
+        else:
+            _auto_continue_one(sid, plan, forced)
+    return started
+
+
+def _auto_continue_one(sid, plan, forced):
+    """Rebuild one conversation and send it the Continue message, draining the
+    turn. Never raises."""
+    try:
+        with app.test_request_context("/api/agent/sessions/%s/resume" % sid,
+                                      method="POST", json={}):
+            api_agent_resume_session(sid)
+        noted = False
+        for _ev in agentic_chat.send_message_stream_durable(sid, _CONTINUE_TEXT):
+            if forced and not noted and _ev.get("event") != "error":
+                noted = True
+                agentic_chat.live_notice(sid, plan.notice())
+        _log.info("[resume] %s continued by itself after the restart", sid[:12])
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[resume] %s could not continue by itself: %s",
+                     sid[:12], _sanitize(str(exc), 160))
 
 
 def _resume_interrupted_swarms():
@@ -24430,7 +24451,7 @@ def _recover_memory_state():
             def _continue(back=back, plan=plan):
                 time.sleep(20)
                 try:
-                    _auto_continue_turns(back, plan)
+                    _auto_continue_turns(back, plan, parallel=True)
                 finally:
                     if plan is not None:
                         plan.finish("turns")
@@ -44383,6 +44404,10 @@ _UPDATE_RESUME_WANTED = [True]      # POST /api/hub/restart {resume:false} clear
 def _note_update_labels(before_label, after_label, reason="update"):
     _UPDATE_LABELS.update({"from": str(before_label or ""), "to": str(after_label or ""),
                            "reason": reason})
+    if reason == "update":
+        # A POST /api/hub/restart {resume:false} that was vetoed (Stop) or whose
+        # re-exec failed must not switch the next update's marker off.
+        _UPDATE_RESUME_WANTED[0] = True
 
 
 def _update_drain_max():
@@ -44504,6 +44529,7 @@ def _reexec_soon():
                 _log.info("Update: restart cancelled -- the hub was stopped on purpose.")
                 _end_update_drain()
                 _auto_update_state["updating"] = False
+                _UPDATE_RESUME_WANTED[0] = True
                 return
             _write_update_resume_marker()
         try:
@@ -44513,6 +44539,7 @@ def _reexec_soon():
             _auto_update_state["updating"] = False
             if graceful:
                 _end_update_drain()
+                _UPDATE_RESUME_WANTED[0] = True
     threading.Thread(target=_go, daemon=True).start()
 
 

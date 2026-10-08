@@ -3035,7 +3035,10 @@ and `resume_after_update` (default true).
   <short hash>." (a plain restart: "...after the restart."), via
   `agentic_chat.live_notice` for a turn and a leading `notice` event in the
   run's live feed. Each consumer calls `plan.finish("turns"|"runs")`; the file
-  is deleted when both ran.
+  is deleted when both ran. `_auto_continue_turns(back, plan, parallel=True)`
+  gives every continued conversation its own thread (a continued turn is
+  drained to its end, so one long turn must not hold the next one back) and the
+  turns half is filed once they are dispatched, not when the turns end.
 - **Same path everywhere.** The periodic auto-update and the dashboard's
   update button (`POST /api/auto-update {check:true}`) both end in
   `_finish_update_apply` -> `_reexec_when_idle` / `_reexec_soon`. No restart
@@ -3055,8 +3058,12 @@ and `resume_after_update` (default true).
   "working now · waiting for update", Activity rows still in progress say
   "in progress · waiting for update", and a refused send shows the hub's own
   sentence instead of "stream failed". Static tests only.
-- **What each CLI does with 503 + Retry-After** (read from the installed
-  sources/binaries on this machine, 2026-10-08; the value stays <= 30 s because
+- **What each CLI does with 503 + Retry-After** (read from the GLOBAL installs
+  on this machine, 2026-10-08 -- the hub-isolated builds under
+  `~/.free-llm-hub/isolated-clis` (Claude Code 2.1.220, opencode 1.18.11) were
+  NOT verified; the Claude Code 2.1.220 build has the same
+  `tengu_api_retry_after_too_long` event but its cap value was not read; the
+  value stays <= 30 s because
   Claude Code gives up on anything over 60 s and the OpenAI/Anthropic Python
   SDKs ignore anything over 60 s):
   - Claude Code 2.1.293: retries any status >= 500 (not with `x-should-retry:

@@ -438,6 +438,37 @@ def test_a_request_from_running_work_is_served_a_new_one_is_not(state, monkeypat
     assert ask(None)[1] == 503                  # a terminal CLI waits and retries
 
 
+def test_the_build_prefix_really_carries_a_running_session_through(state, monkeypatch):
+    """Through the WSGI middleware that sets the session in production, not an
+    environ override: a hub-spawned CLI talks to /build/<sid>/v1/..., and the
+    ones that were busy when the drain began keep being served."""
+    _drain(monkeypatch, sessions=("busy-sid",))
+    c = _client()
+    fresh = c.post("/build/fresh-sid/v1/embeddings", json={"model": "auto", "input": "x"})
+    assert fresh.status_code == 503 and "updating to bbbbbbb" in fresh.get_data(as_text=True)
+    assert "Retry-After" in fresh.headers
+    busy = c.post("/build/busy-sid/v1/embeddings", json={"model": "auto", "input": "x"})
+    assert "updating to bbbbbbb" not in busy.get_data(as_text=True)
+    assert "x-should-retry" not in busy.headers
+
+
+def test_a_vetoed_or_failed_restart_does_not_switch_the_next_markers_off(state, monkeypatch):
+    app._UPDATE_RESUME_WANTED[0] = False
+    app._note_update_labels("aaaaaaa", "bbbbbbb")                 # the next update
+    assert app._UPDATE_RESUME_WANTED[0] is True
+    app._UPDATE_RESUME_WANTED[0] = False
+    _drain(monkeypatch)
+    config.set_intentional_stop()
+    monkeypatch.setattr(app.time, "sleep", lambda s: REAL_SLEEP(0.005))
+    app._reexec_soon()
+    for _ in range(200):
+        if app._UPDATE_RESUME_WANTED[0]:
+            break
+        REAL_SLEEP(0.01)
+    config.clear_intentional_stop()
+    assert app._UPDATE_RESUME_WANTED[0] is True
+
+
 def test_the_update_drain_refuses_nothing_for_a_get(state, monkeypatch):
     _drain(monkeypatch)
     with app.app.test_request_context("/v1/models", method="GET"):
@@ -785,6 +816,61 @@ def test_listed_single_turns_continue_regardless_of_the_box(state, monkeypatch):
     assert notes == [("conv-a", "Continued automatically after the update to bbbbbbb.")]
 
 
+def test_one_long_turn_does_not_hold_the_next_conversation_back(state, monkeypatch):
+    """Every conversation an update cut is forced now, so the boot must not drain
+    them one after another (a continued turn is drained to its end)."""
+    monkeypatch.setattr(app.agentic_history, "auto_resume", lambda sid: False)
+    monkeypatch.setattr(app.agentic_history, "known_session_ids", lambda: {"conv-1", "conv-2"})
+    _fresh_marker(sessions=("conv-1", "conv-2"), runs=())
+    plan = app._update_resume_plan()
+    release, second_started = threading.Event(), threading.Event()
+    monkeypatch.setattr(app, "api_agent_resume_session", lambda sid: None)
+    monkeypatch.setattr(app.agentic_chat, "live_notice", lambda sid, t: None)
+
+    def fake_stream(sid, text):
+        if sid == "conv-1":
+            yield {"event": "tool", "text": "working"}
+            release.wait(10)                   # a turn that runs for a long time
+        else:
+            second_started.set()
+            yield {"event": "tool", "text": "working"}
+    monkeypatch.setattr(app.agentic_chat, "send_message_stream_durable", fake_stream)
+
+    threads = app._auto_continue_turns(["conv-1", "conv-2"], plan, parallel=True)
+
+    assert len(threads) == 2
+    assert second_started.wait(3.0), "conv-2 must start while conv-1's turn is still running"
+    release.set()
+    for t in threads:
+        t.join(3.0)
+
+
+def test_the_markers_turns_half_is_filed_once_the_continuations_are_dispatched(
+        state, monkeypatch, fast_sleep):
+    monkeypatch.setattr(app.agentic_history, "known_session_ids", lambda: {"conv-1"})
+    _fresh_marker(sessions=("conv-1",), runs=())
+    monkeypatch.setattr(app.memory, "recover_inflight", lambda: ["conv-1"])
+    monkeypatch.setattr(app.memory, "prune_orphans", lambda *a, **k: [])
+    block, running = threading.Event(), threading.Event()
+    monkeypatch.setattr(app, "api_agent_resume_session", lambda sid: None)
+    monkeypatch.setattr(app.agentic_chat, "live_notice", lambda sid, t: None)
+
+    def endless(sid, text):
+        running.set()
+        block.wait(10)
+        yield {"event": "done"}
+    monkeypatch.setattr(app.agentic_chat, "send_message_stream_durable", endless)
+    plan = app._update_resume_plan()
+    app._recover_memory_state()
+    assert running.wait(3.0)
+    for _ in range(200):
+        if plan._left == {"runs"}:
+            break
+        REAL_SLEEP(0.01)
+    assert plan._left == {"runs"}, "the turns half must not wait for the turn to END"
+    block.set()
+
+
 def test_an_error_first_event_gets_no_notice(state, monkeypatch):
     monkeypatch.setattr(app.agentic_history, "auto_resume", lambda sid: False)
     monkeypatch.setattr(app.agentic_history, "known_session_ids", lambda: {"conv-a"})
@@ -816,11 +902,13 @@ def test_boot_recovery_hands_the_plan_to_the_turn_continuer_and_drops_the_marker
     monkeypatch.setattr(app.memory, "prune_orphans", lambda *a, **k: [])
     seen, done = [], threading.Event()
     monkeypatch.setattr(app, "_auto_continue_turns",
-                        lambda ids, plan=None: (seen.append((list(ids), plan)), done.set()))
+                        lambda ids, plan=None, parallel=False: (
+                            seen.append((list(ids), plan, parallel)), done.set(), [])[2])
     app._recover_memory_state()
     assert done.wait(3.0)
-    ids, plan = seen[0]
+    ids, plan, parallel = seen[0]
     assert ids == ["conv-a", "conv-b"] and plan.wants_session("conv-a")
+    assert parallel is True, "the boot continues every conversation on its own thread"
     assert os.path.exists(GU.marker_path(config.state_dir())), "the runs half has not run yet"
 
     monkeypatch.setattr(app.swarm_windows, "resume_interrupted", lambda *a, **k: [])
