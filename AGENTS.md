@@ -2418,6 +2418,48 @@ a spend budget and stops cleanly when it is spent. Covered by
   `tests/conftest.py` stubs `_start_heartbeat_scheduler` so no test launches
   the real thread.
 
+## CLI and Build parity (2026-10-08)
+
+The quality machinery Multi/swarm already had, extended to terminal CLIs on
+`/v1/*` (opencode chat, codex responses, claude messages) and the Build
+single-model turn. Each gap is flag-gated, fails open and is byte-identical old
+behaviour with its flag off. Covered by `tests/test_cli_build_parity.py`.
+
+- **Web slop -> verifier problems -> corrector** (flag `turn_slop_check`, under
+  the `turn_verifier` kill switch): `_slop_problems_for_proposal` /
+  `_web_writes_in_msg` read what a proposal WRITES -- a tool call whose args
+  carry `.html/.css/.jsx/.tsx/.vue` content, or HTML code fences in the text --
+  and `verify.slop_problems` scores it. Its HIGH findings are folded into
+  `_role_verify_and_correct` as problems at severity high, which drives the
+  existing ONE corrector call; they beat a verifier ACCEPT and, when nothing
+  else would have verified, run no verifier model call. `_max_text_review`
+  inherits it (it delegates to `_role_verify_and_correct`). Web output only.
+- **Single-model team notes** (flag `tool_turn_specialists_single`, under
+  `_team_flag_on`): `_single_turn_team_notes` runs `_team_notes_for_turn` for a
+  HARD, fresh-instruction TOOL turn on auto/best (never pinned, never a
+  pipeline tier), BEFORE the actor, and injects the brief into the messages
+  every hop is built from (`_with_team_notes`) -- so stream and non-stream on
+  all three protocols are covered with no buffering. Called in
+  `_chat_completions_uncached`, the `/v1/responses` and `/v1/messages` handlers
+  right after `_clock.plan_hedge`. Never changes routing or the chain.
+- **Observed evidence + receipts for /v1** (flag `v1_observed_evidence`):
+  `_v1_observe` (called next to `_bandit_credit` on all three routes) reads the
+  history's command tool results (`_tool_call_commands` + `_exit_code_in`),
+  classifies with `evidence.from_event`, dedupes per `tool_call_id` (bounded
+  LRU `_V1_SEEN_IDS`) and writes a `receipts.write` receipt keyed by
+  `ctxwin.conversation_key` for RECOGNISED test/build commands. The hub runs
+  nothing.
+- **Harvested facts for /v1** (flag `v1_memory_facts`): the same `_v1_observe`
+  calls `memory.harvest_facts` into the project scope when the CLI's cwd is
+  known (`_v1_project_cwd`: `<cwd>` / working-directory env lines, an existing
+  dir that is never the hub's own repo). No model call; deduped; bounded.
+- **PROGRESS/todo upkeep re-asked**: `swarm_windows._agent_prompt` re-injects a
+  one-line "re-read PROGRESS.md and refresh your `- [ ] Phase N` line" reminder
+  on a retry/revision/resume (`agent.revisions`/`run.resumes`/`run.restored`;
+  first fresh attempt unchanged); `craft.PLAN_PHASES` tells single sessions to
+  update PROGRESS.md after EACH step (ceiling in
+  `tests/test_craft_briefs.py::test_worst_case_brief_cost` stays 0.135).
+
 ## Tests
 
 Run with either python (the `.venv` has pytest too):

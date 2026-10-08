@@ -1535,6 +1535,16 @@ def _agent_prompt(run, agent):
               "(add it when missing), and when your phase is done tick it "
               "\"- [x]\" with one short line of what you verified. Leave the "
               "other lines as they are." % (run.id, agent.index, agent.title)]
+    # RE-INJECT the todo upkeep on a RETRY / REVISION / CONTINUE / RESUME
+    # (Gap 5a, 2026-10-08). The brief above is re-sent each attempt, but the
+    # instruction reads as a one-time "keep it true"; a continued worker needs
+    # to be told to re-read and refresh its line FIRST. First fresh attempt is
+    # byte-for-byte unchanged.
+    if agent.revisions or getattr(run, "resumes", 0) or getattr(run, "restored", False):
+        parts += ["This continues your phase (retry/resume): re-read PROGRESS.md "
+                  "first and bring your \"- [ ] Phase %d: %s\" line under "
+                  "\"## %s\" up to date before anything else -- tick \"- [x]\" "
+                  "what is now done." % (agent.index, agent.title, run.id)]
     return "\n".join(parts)
 
 

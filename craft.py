@@ -395,8 +395,8 @@ Before touching anything, write the todo list you will work from:
 - DESIGN first for a build/feature (skip for a small fix): components, the interfaces between them, which files each phase touches.
 - Phases, each with a CONCRETE artefact, an observable "done when" and what it NEEDS from another. Phases that need nothing from each other run at the SAME TIME -- do them together.
 - DRY-RUN the plan before editing: every asked part has a phase, no two same-time phases edit one file, each has a done when. Fix the plan first.
-- Keep it in PROGRESS.md as a checklist (- [ ] / - [x] / - [~] in progress); if PROGRESS.md exists, read it first and continue from it.
-- Then execute it, updating the list as each phase lands. Do not stop between phases to report; the list IS the report."""
+- Keep it in PROGRESS.md as a checklist (- [ ] / - [x] / - [~] in progress); if it exists, read it first and continue from it.
+- Execute it, and after EACH step update PROGRESS.md: tick the item - [x] (or - [~]) before starting the next; never leave the list stale. Do not stop between phases to report; the list IS the report."""
 
 
 # DESIGN DECISIONS FIRST, added 2026-10-04 at the owner's request: "slop must be

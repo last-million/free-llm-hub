@@ -35291,6 +35291,214 @@ def _bandit_boot():
         _log.warning("[bandit] not configured: %s", exc)
 
 
+# --------------------------------------------------------------------------- #
+# CLI /v1 parity: observed evidence + receipts + harvested facts (2026-10-08)
+#
+# Build and Multi PARSE a CLI's output and so can write receipts and harvest
+# facts; a terminal CLI on /v1/* hands the hub only the conversation. But the
+# conversation CARRIES what the CLI already ran: an assistant tool_call that
+# runs a command, answered by a tool message with the command's output (and,
+# after translation, Anthropic's is_error). So on every /v1 request the hub
+# reads those results -- it RUNS nothing -- classifies them with evidence.py,
+# writes a receipt (flag v1_observed_evidence) and harvests durable facts into
+# the project's memory scope when the CLI's cwd is known (flag v1_memory_facts).
+# Both are cheap, deduped and fail open; neither changes the reply.
+# --------------------------------------------------------------------------- #
+
+_V1_SEEN_LOCK = threading.Lock()
+_V1_SEEN_IDS = collections.OrderedDict()      # tool_call_id -> True (bounded LRU)
+_V1_SEEN_MAX = 5000
+_V1_CWD_TAG_RE = re.compile(r"<cwd>\s*([^<\n]+?)\s*</cwd>", re.I)
+_V1_CWD_LINE_RE = re.compile(
+    r"(?im)(?:current\s+working\s+directory|working\s+directory|workspace\s+root|"
+    r"project\s+root|\bcwd\b)\s*(?:is\s+|[:=]\s*)[`\"']?\s*"
+    r"([A-Za-z]:[\\/][^\n\r`\"'<>|]+|/[^\n\r`\"'<>|]+)")
+_V1_WRITE_NAME_RE = re.compile(
+    r"(?i)(write|edit|create|multiedit|multi_edit|str_replace\w*|apply_patch|"
+    r"notebookedit|create_file|write_file|edit_file|replace)")
+_PATH_ARG_KEYS = ("file_path", "filepath", "path", "filename", "file", "target_file",
+                  "notebook_path", "abs_path", "fullpath")
+_CONTENT_ARG_KEYS = ("content", "contents", "file_text", "new_string", "newstring",
+                     "code", "new_str", "source", "text", "new_text", "new_content",
+                     "replacement", "code_edit", "insert_text")
+
+
+def _v1_flag(name):
+    try:
+        return bool(config.get_flag(name, True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _v1_seen(tcid):
+    """True when this tool_call_id was already receipted (and records it). LRU."""
+    with _V1_SEEN_LOCK:
+        if tcid in _V1_SEEN_IDS:
+            _V1_SEEN_IDS.move_to_end(tcid)
+            return True
+        _V1_SEEN_IDS[tcid] = True
+        while len(_V1_SEEN_IDS) > _V1_SEEN_MAX:
+            _V1_SEEN_IDS.popitem(last=False)
+        return False
+
+
+def _call_file_path_content(tc):
+    """(path, content) a write/edit tool call names, each None when absent.
+    OpenAI chat shape (function.arguments JSON), or the input/args dict."""
+    try:
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+        args = fn.get("arguments") if isinstance(fn, dict) else None
+        if args is None and isinstance(tc, dict):
+            for k in ("input", "args", "parameters"):
+                if k in tc:
+                    args = tc[k]
+                    break
+        if isinstance(args, str):
+            args = json.loads(args) if args.strip() else {}
+        if not isinstance(args, dict):
+            return None, None
+        path = next((args[k] for k in _PATH_ARG_KEYS
+                     if isinstance(args.get(k), str) and args[k].strip()), None)
+        content = next((args[k] for k in _CONTENT_ARG_KEYS
+                        if isinstance(args.get(k), str) and args[k]), None)
+        return path, content
+    except Exception:                                            # noqa: BLE001
+        return None, None
+
+
+def _v1_project_cwd(messages):
+    """The project folder the CLI states (its <cwd> / working-directory env
+    line), an existing directory that is NOT the hub's own repo. None when
+    nothing usable. Never raises."""
+    try:
+        hub = os.path.normcase(os.path.dirname(os.path.abspath(__file__)))
+        for m in messages or ():
+            if not isinstance(m, dict) or m.get("role") not in ("system", "user", "developer"):
+                continue
+            text = _message_text(m)
+            if not text:
+                continue
+            for raw in _V1_CWD_TAG_RE.findall(text) + _V1_CWD_LINE_RE.findall(text):
+                p = str(raw).strip().strip("`\"'").rstrip(".,; ")
+                if not p:
+                    continue
+                try:
+                    if not os.path.isdir(p):
+                        continue
+                    n = os.path.normcase(os.path.abspath(p))
+                except Exception:                                # noqa: BLE001
+                    continue
+                if n == hub or n.startswith(hub + os.sep) or hub.startswith(n + os.sep):
+                    continue                     # never the hub's own repo dir
+                return os.path.abspath(p)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return None
+
+
+def _v1_evidence_rows(messages):
+    """Classify the not-yet-seen command tool results (a shell/command call
+    answered by a tool message) into evidence rows for RECOGNISED test/build
+    commands. Deduped per tool_call_id (bounded LRU). Never raises."""
+    ev = _evidence()
+    if ev is None:
+        return []
+    try:
+        cmds = _tool_call_commands(messages)
+        if not cmds:
+            return []
+        rows = []
+        for m in messages or ():
+            if not isinstance(m, dict) or m.get("role") != "tool":
+                continue
+            tcid = m.get("tool_call_id")
+            cmd = cmds.get(tcid)
+            if not tcid or not cmd or _v1_seen(tcid):
+                continue
+            out = _message_text(m)
+            is_err = m.get("is_error") if isinstance(m.get("is_error"), bool) else None
+            try:
+                row = ev.from_event({"command": cmd, "exit_code": _exit_code_in(out),
+                                     "output_tail": out, "is_error": is_err})
+            except Exception:                                    # noqa: BLE001
+                continue
+            if row and row.get("tool"):          # a recognised test/build command
+                rows.append(row)
+        return rows
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
+def _v1_last_assistant_text(messages):
+    for m in reversed(messages or ()):
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            t = _message_text(m)
+            if t and t.strip():
+                return t
+    return ""
+
+
+def _v1_write_tool_strings(messages):
+    """"write: <path>" for every file-writing tool call -- what
+    memory.harvest_files reads. Bounded. Never raises."""
+    out = []
+    try:
+        for m in messages or ():
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            for tc in m.get("tool_calls") or ():
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
+                name = (fn.get("name") if isinstance(fn, dict) else "") or ""
+                path, _c = _call_file_path_content(tc)
+                if path and _V1_WRITE_NAME_RE.search(name):
+                    out.append("write: " + str(path))
+    except Exception:                                            # noqa: BLE001
+        return out[-200:]
+    return out[-200:]
+
+
+def _v1_observe(messages, body=None):
+    """Gaps 3 & 4: write OBSERVED-evidence receipts for the recognised
+    test/build commands in the history, and harvest durable facts into the
+    project's memory scope when the CLI's cwd is known. The hub RUNS nothing.
+    Never raises; nothing here affects the reply."""
+    try:
+        if not messages:
+            return
+        key, cwd = None, None
+        rows = _v1_evidence_rows(messages) if _v1_flag("v1_observed_evidence") else []
+        if rows:
+            try:
+                key = _orch_key(body, messages)
+            except Exception:                                    # noqa: BLE001
+                key = None
+            rcpts = _optional_module("receipts", ("write",))
+            if rcpts is not None:
+                cwd = _v1_project_cwd(messages)
+                try:
+                    rcpts.write("v1-" + (key or "conversation"), "v1-turn", rows, cwd=cwd)
+                except Exception:                                # noqa: BLE001
+                    pass
+        if not _v1_flag("v1_memory_facts"):
+            return
+        if cwd is None:
+            cwd = _v1_project_cwd(messages)
+        if not cwd:
+            return
+        if key is None:
+            try:
+                key = _orch_key(body, messages)
+            except Exception:                                    # noqa: BLE001
+                key = None
+        memory.harvest_facts(key or "v1", request=_team_instruction(messages),
+                             reply=_v1_last_assistant_text(messages), project_dir=cwd,
+                             tools=_v1_write_tool_strings(messages), results=rows)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _role_judge(pid, model, resp, exc, body, payload, est, kind):
     """One role call's result -> {"ok": True, "data", "msg", "gate"} or
     {"ok": False, "fail", "why"}. The fan-out's member checks, plus: a tool
@@ -35680,6 +35888,77 @@ def _run_verifier_inner(v, vp, vm, messages, msg, deadline, rec, strict, info):
         return None
 
 
+# --------------------------------------------------------------------------- #
+# Web SLOP in a proposed answer (Gap 1, 2026-10-08)
+#
+# The pipelines already slop-check built web files (swarm_windows._slop_scan,
+# crews); the app's own verifier / corrector did not. Now a proposed step that
+# WRITES a web file (a tool call whose args carry .html/.css/.jsx/.tsx/.vue
+# content) or a Max text answer that returns HTML in a code fence is scanned
+# with verify.slop_problems, and its HIGH findings become verifier problems
+# that drive the existing corrector (ONE call, severity high). Web output only;
+# flag turn_slop_check (default on), under the turn_verifier kill switch.
+# --------------------------------------------------------------------------- #
+
+def _slop_check_on():
+    try:
+        return bool(config.get_flag("turn_slop_check", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _web_writes_in_msg(msg):
+    """[(name, text)] of the web files a proposed message writes: tool-call
+    args writing a web file, plus HTML code fences in its text. Never raises."""
+    out = []
+    try:
+        v = _verify()
+        is_web = getattr(v, "is_web_file", None) if v is not None else None
+
+        def webp(path):
+            if callable(is_web):
+                try:
+                    return bool(is_web(path))
+                except Exception:                                # noqa: BLE001
+                    pass
+            return str(path or "").lower().split("?")[0].endswith(
+                (".html", ".htm", ".css", ".jsx", ".tsx", ".vue", ".svelte"))
+
+        for tc in (msg or {}).get("tool_calls") or ():
+            if not isinstance(tc, dict):
+                continue
+            path, content = _call_file_path_content(tc)
+            if path and content and webp(path):
+                out.append((str(path), content))
+        text = _message_text(msg) or ""
+        blocks = getattr(v, "html_blocks", None) if v is not None else None
+        if callable(blocks) and text:
+            try:
+                out.extend(blocks(text))
+            except Exception:                                    # noqa: BLE001
+                pass
+    except Exception:                                            # noqa: BLE001
+        return []
+    return out[:40]
+
+
+def _slop_problems_for_proposal(msg):
+    """HIGH web-slop findings in a proposed message as problem strings, or []
+    (flag off, no web output, nothing found, or verify absent). Never raises."""
+    if not _slop_check_on():
+        return []
+    v = _verify()
+    if v is None or not hasattr(v, "slop_problems"):
+        return []
+    try:
+        files = _web_writes_in_msg(msg)
+        if not files:
+            return []
+        return list(v.slop_problems(files))[:8]
+    except Exception:                                            # noqa: BLE001
+        return []
+
+
 def _role_verify_and_correct(body, messages, producer, msg, chain, kind, difficulty,
                              rec, rows, turn_end, est, tool_turn=True, failed=()):
     """VERIFIER (+ at most ONE CORRECTOR) for a proposed answer. Returns
@@ -35693,6 +35972,10 @@ def _role_verify_and_correct(body, messages, producer, msg, chain, kind, difficu
         if not config.get_flag("turn_verifier", True):
             return None
         calls = msg.get("tool_calls") or []
+        # Web slop in what the proposal WRITES (Gap 1): its HIGH findings force
+        # a correction even when the verifier would ACCEPT; [] off / non-web.
+        slop = _slop_problems_for_proposal(msg)
+        weak = bool(_model_is_weak(*producer[:2]))
         if tool_turn:
             # The WHOLE assistant message: verify.is_risky reads its tool
             # calls (write/exec on a hard turn) and its text ("done" / "tests
@@ -35702,57 +35985,80 @@ def _role_verify_and_correct(body, messages, producer, msg, chain, kind, difficu
                                         observed_pass=_observed_pass(messages)))
             except Exception:                                    # noqa: BLE001
                 risky = False
-            if not risky and not _model_is_weak(*producer[:2]):
+            if not risky and not weak and not slop:
                 return None
+        else:
+            risky = True                 # a Max text review always verifies
         if turn_end - time.monotonic() < _VERIFY_MIN_SECONDS:
             rec["verdict"] = "skipped: no time left"
             return None
         ppid, pmodel = producer
         pool = _rank_verifier_pool(_role_candidates(chain, producer, failed, kind))
-        try:
-            pick = v.pick_verifier((ppid, pmodel), pool)
-        except Exception:                                        # noqa: BLE001
-            pick = None
-        if not pick:
-            rec["verdict"] = "no verifier available"
-            return None
-        vp, vm = pick[0], pick[1]
-        rec["verifier"] = "%s/%s" % (vp, vm)
-        vinfo = {}
-        verdict = _run_verifier(v, vp, vm, messages, msg,
-                                min(_VERIFY_DEADLINE, turn_end - time.monotonic()), rec,
-                                info=vinfo)
-        if _client_gone():
-            return None
-        if verdict is None and (vinfo.get("unparsed") or vinfo.get("empty")):
-            # A reply that could not be read: ONE retry on the next-best
-            # verifier with the strict one-line contract, if time remains.
-            rec["verifier_unparsed"] = int(rec.get("verifier_unparsed") or 0) + 1
-            left = min(_VERIFY_DEADLINE, turn_end - time.monotonic())
-            if left >= _VERIFY_MIN_SECONDS + 4.0:
-                try:
-                    pick2 = v.pick_verifier(
-                        (ppid, pmodel), [e for e in pool if (e[0], e[1]) != (vp, vm)])
-                except Exception:                                # noqa: BLE001
-                    pick2 = None
-                if pick2:
-                    rec["verifier_retry"] = int(rec.get("verifier_retry") or 0) + 1
-                    vp, vm = pick2[0], pick2[1]
-                    rec["verifier"] = "%s/%s" % (vp, vm)
-                    verdict = _run_verifier(v, vp, vm, messages, msg, left, rec,
-                                            strict=True)
-                    if _client_gone():
-                        return None
-        if verdict is None:
+        # Run the independent verifier unless the ONLY reason we are here is web
+        # slop (then the HIGH findings alone drive the corrector -- no model
+        # call spent on a verdict we would override anyway).
+        run_verifier = risky or weak
+        verdict = None
+        if run_verifier:
+            try:
+                pick = v.pick_verifier((ppid, pmodel), pool)
+            except Exception:                                    # noqa: BLE001
+                pick = None
+            if not pick and not slop:
+                rec["verdict"] = "no verifier available"
+                return None
+            if pick:
+                vp, vm = pick[0], pick[1]
+                rec["verifier"] = "%s/%s" % (vp, vm)
+                vinfo = {}
+                verdict = _run_verifier(v, vp, vm, messages, msg,
+                                        min(_VERIFY_DEADLINE, turn_end - time.monotonic()),
+                                        rec, info=vinfo)
+                if _client_gone():
+                    return None
+                if verdict is None and (vinfo.get("unparsed") or vinfo.get("empty")):
+                    # A reply that could not be read: ONE retry on the next-best
+                    # verifier with the strict one-line contract, if time remains.
+                    rec["verifier_unparsed"] = int(rec.get("verifier_unparsed") or 0) + 1
+                    left = min(_VERIFY_DEADLINE, turn_end - time.monotonic())
+                    if left >= _VERIFY_MIN_SECONDS + 4.0:
+                        try:
+                            pick2 = v.pick_verifier(
+                                (ppid, pmodel), [e for e in pool if (e[0], e[1]) != (vp, vm)])
+                        except Exception:                        # noqa: BLE001
+                            pick2 = None
+                        if pick2:
+                            rec["verifier_retry"] = int(rec.get("verifier_retry") or 0) + 1
+                            vp, vm = pick2[0], pick2[1]
+                            rec["verifier"] = "%s/%s" % (vp, vm)
+                            verdict = _run_verifier(v, vp, vm, messages, msg, left, rec,
+                                                    strict=True)
+                            if _client_gone():
+                                return None
+        if verdict is None and run_verifier and not slop:
             rec["verdict"] = "no verdict (fail-open)"
-            rows.append({"role": "verifier: no verdict", "model": rec["verifier"]})
+            rows.append({"role": "verifier: no verdict", "model": rec.get("verifier")})
             return None
-        ok = bool(verdict.get("ok"))
-        sev = str(verdict.get("severity") or "").strip().lower()
-        rec["verdict"] = "ok" if ok else "revise"
-        rec["severity"] = sev or None
-        rows.append({"role": "verifier: %s" % rec["verdict"], "model": rec["verifier"]})
-        _bandit_reward(kind, ppid, pmodel, 1.0 if ok else 0.5)
+        if verdict is not None:
+            ok = bool(verdict.get("ok"))
+            sev = str(verdict.get("severity") or "").strip().lower()
+            rec["verdict"] = "ok" if ok else "revise"
+            rec["severity"] = sev or None
+            rows.append({"role": "verifier: %s" % rec["verdict"], "model": rec["verifier"]})
+            _bandit_reward(kind, ppid, pmodel, 1.0 if ok else 0.5)
+        else:
+            ok, sev, verdict = True, "low", {"ok": True, "problems": [], "severity": "low"}
+        if slop:
+            # HIGH slop beats an ACCEPT: the corrector gets the slop findings
+            # (ahead of any verifier problems) at high severity.
+            probs = list(slop) + [p for p in (verdict.get("problems") or []) if p]
+            verdict = {"ok": False, "problems": probs[:8], "severity": "high"}
+            ok, sev = False, "high"
+            rec["slop"] = len(slop)
+            rec["verdict"] = "revise"
+            rec["severity"] = "high"
+            rows.append({"role": "slop: %d high" % len(slop),
+                         "model": "%s/%s" % (ppid, pmodel)})
         if ok or sev != "high":
             return None
         if turn_end - time.monotonic() < _CORRECT_MIN_SECONDS:
@@ -36452,6 +36758,55 @@ def _team_notes_for_turn(body, messages, chain, routed, est, real, kind, rec, ro
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("[team] notes skipped: %s", exc)
         return body
+
+
+def _single_turn_team_notes(messages, tools, chain, routed, est, diff, pinned, stream):
+    """Gap 2 (CLI/Build parity): TEAM NOTES for a SINGLE-MODEL (auto/best/mode)
+    HARD, fresh-instruction TOOL turn -- the parallel specialists run BEFORE
+    the actor and their brief is injected into the request actually sent, so
+    the stream path needs no buffering. Returns the messages to send (the
+    originals unchanged when nothing applies). Flag tool_turn_specialists_single
+    (default on) plus the existing _team_flag_on / _specialists_wanted gates.
+    Never changes routing or the chain; never raises."""
+    try:
+        if not messages or not tools or pinned:
+            return messages                  # tool turns on auto/best only
+        if not config.get_flag("tool_turn_specialists_single", True):
+            return messages
+        if not _team_flag_on():
+            return messages
+        body = {"messages": messages, "tools": tools}
+        real = diff if diff in ("simple", "medium", "hard") else None
+        if real is None:
+            try:
+                real = _classify_difficulty(messages, None)
+            except Exception:                                    # noqa: BLE001
+                real = None
+        kind = _task_kind(real or "hard", True, est)
+        started = time.monotonic()
+        rec = {"event": "turn", "turn": "tool", "kind": kind, "difficulty": real,
+               "input_tokens": est, "sent_tokens": 0, "stream": bool(stream), "calls": 0,
+               "actor": None, "actor_hops": 0, "served": None, "failed": [], "invalid": 0,
+               "specialists": [], "specialists_ok": 0, "brief_chars": 0, "team": None,
+               "single": True}
+        turn_end = started + float(_SWARM_TOOL_STREAM_DEADLINE if stream
+                                   else _SWARM_TOOL_HOP_DEADLINE)
+        try:
+            at = getattr(g, "hub_deadline_at", None)
+        except Exception:                                        # noqa: BLE001
+            at = None
+        if isinstance(at, (int, float)):
+            turn_end = min(turn_end, at)
+        rows = []
+        abody = _team_notes_for_turn(body, messages, chain, routed, est, real, kind,
+                                     rec, rows, turn_end)
+        if rec.get("specialists") or rec.get("team") in ("ran", "cached"):
+            rec["latency_s"] = round(time.monotonic() - started, 2)
+            _role_log(rec)
+        new = abody.get("messages") if isinstance(abody, dict) else None
+        return new if new else messages
+    except Exception:                                            # noqa: BLE001
+        return messages
 
 
 @_usage_source_as("swarm")
@@ -38269,6 +38624,9 @@ def v1_chat_completions():
     # The tool results this turn carries credit the models whose calls made
     # them (bandit; a no-op without it). See _bandit_credit.
     _bandit_credit(body.get("messages"))
+    # ...and the same results are OBSERVED evidence: receipts + project facts
+    # (the hub runs nothing). See _v1_observe.
+    _v1_observe(body.get("messages"), body)
     return _chat_completions(body)
 
 
@@ -38675,6 +39033,11 @@ def _chat_completions_uncached(body):
     # (see _HEDGE_DELAY_MIN); the partner's payload is built like the loop's.
     _clock.plan_hedge(_chain, body, diff, est=est, tools=has_tools, images=has_images,
                       output_budget=True)
+    # Gap 2: parallel specialists for a hard, fresh tool turn on auto/best --
+    # their brief rides in the messages every hop is built from (dict(body)).
+    body["messages"] = _single_turn_team_notes(body.get("messages"), body.get("tools"),
+                                               _chain, (pid, resolved), est, diff,
+                                               bool(_pin_kw), stream)
     for hop_pid, hop_model in _clock.walk(_chain):
         if _clock.consumed(hop_pid, hop_model):
             continue              # a hedge already ran this hop
@@ -39651,6 +40014,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
         return _openai_error("No input to send.", 400)
     if not _retry_pass:
         _bandit_credit(messages)       # see _bandit_credit
+        _v1_observe(messages, body)    # observed evidence: receipts + facts
     # Codex picks a MODE on one screen and a REASONING LEVEL on the next; the
     # pair is the hub's (mode, effort). Must happen before the swarm dispatch
     # below, which keys off the model id. /v1/chat/completions has always read
@@ -39770,6 +40134,10 @@ def v1_responses(_retry_pass=False, _hedged=False):
     if not _hedged:
         _clock.plan_hedge(_chain, base_payload, diff, est=est, tools=has_tools,
                           images=has_images, lines=True)
+    # Gap 2: parallel specialists for a hard, fresh tool turn on auto/best.
+    base_payload["messages"] = _single_turn_team_notes(
+        base_payload.get("messages"), base_payload.get("tools"), _chain,
+        (pid, resolved), est, diff, bool(_pin_kw), stream)
     for hop_pid, hop_model in _clock.walk(_chain):
         if _clock.consumed(hop_pid, hop_model):
             continue              # a hedge already ran this hop
@@ -40703,6 +41071,7 @@ def v1_messages():
     if not oai_messages:
         return _anthropic_error("invalid_request_error", "No messages to send.", 400)
     _bandit_credit(oai_messages)       # see _bandit_credit
+    _v1_observe(oai_messages, body)    # observed evidence: receipts + facts
     has_images = image_count > 0
     # A "<category>-<effort>" compound (e.g. from ANTHROPIC_MODEL=coding-swarm)
     # sets the mode and becomes a plain effort tier, before the swarm dispatch
@@ -40827,6 +41196,10 @@ def v1_messages():
     # See the twin in /v1/chat/completions (hedging a trivial turn).
     _clock.plan_hedge(_chain, base_payload, diff, est=est, tools=has_tools,
                       images=has_images, lines=True)
+    # Gap 2: parallel specialists for a hard, fresh tool turn on auto/best.
+    base_payload["messages"] = _single_turn_team_notes(
+        base_payload.get("messages"), base_payload.get("tools"), _chain,
+        (pid, resolved), est, diff, bool(_pin_kw), stream)
     for hop_pid, hop_model in _clock.walk(_chain):
         if _clock.consumed(hop_pid, hop_model):
             continue              # a hedge already ran this hop
