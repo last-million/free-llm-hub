@@ -4581,6 +4581,12 @@ def _live_end(session_id):
     threading.Timer(120, _forget).start()
 
 
+def live_notice(session_id, text):
+    """One notice line in the running turn's live buffer (what a page that is
+    open, or reloads mid-turn, shows). No live turn = nothing happens."""
+    _live_put(session_id, {"event": "notice", "text": str(text)})
+
+
 def turn_is_live(session_id):
     """True while a turn on this session is still producing events."""
     with _LIVE_LOCK:

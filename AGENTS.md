@@ -2964,3 +2964,125 @@ x42; 86 turns (17%) ended with no server.
   `scripts/role_eval.py` prints `summary: N calls/turn, P% of calls wasted` and
   derives the figure for old rows from `failed`, so before/after compares on the
   same log (24 h before: 2.40 calls/turn, ~32% wasted).
+
+## Graceful updates: drain, restart, continue (2026-10-08)
+
+Owner: "even after auto update the hub should let working jobs WAIT RETRYING
+until the update finishes and they continue working after restarting with the
+new system, if there are updates." Covered by `tests/test_graceful_update.py`;
+the pure half is `graceful_update.py` (stdlib only, fake-clock testable).
+Flag `graceful_update` (default on; off = the old behaviour exactly: the
+snapshot wait capped at `_DEFER_RESTART_MAX`, no refusals, no marker, no Stop
+check). Settings `update_drain_max_seconds` (default 600, clamped 1..86400)
+and `resume_after_update` (default true).
+
+- **What was wrong.** `_still_running` counted EVERY `/v1` request in flight
+  next to the snapshot, so a hub that kept receiving work never reached zero
+  and the restart waited up to the 4 h cap; and the jobs a restart finally cut
+  continued only when that conversation's `auto_resume` box was ticked.
+- **Drain** (`_UPDATE_DRAIN`, `_begin_update_drain`, called by
+  `_reexec_when_idle`, i.e. only when an update is pulled AND something is
+  busy; an idle hub restarts at once and never drains): NEW work gets 503 +
+  `Retry-After: N` (N = what is left of the drain, clamped 5..30) + `x-should-retry:
+  true`, message "The hub is updating to <short hash>; retry in N s." (a plain
+  restart: "The hub is restarting; retry in N s."), in the caller's own shape
+  (`_runtime_error(message, retry_after=)`): OpenAI `server_error` for
+  `/v1/chat/completions`, `/v1/responses`, `/v1/completions`, embeddings and
+  images; Anthropic `api_error` for `/v1/messages` (NOT `overloaded_error`:
+  Claude Code counts those toward "Repeated 529 Overloaded errors" for
+  opus/fable/mythos ids, and retries any 5xx anyway); Gemini `UNAVAILABLE`
+  envelope; Ollama `{"error": ...}`; JSON-RPC error for the MCP start tools
+  (`crew_run`, `crew_start`, `swarm_windows_start`); and for the dashboard doors
+  `POST /api/agent/sessions/<sid>/message[/stream]` (`code: hub_updating`),
+  `POST /api/swarm-windows`, `POST /api/enhance-prompt`. Stop's own drain reply
+  is unchanged byte for byte. Heartbeats start nothing (`_hb_busy`), `/ready`
+  says `draining`.
+- **Who is served during the drain.** A request that belongs to running work:
+  its `/build/<sid>` session (`_build_sid`) was busy when the drain began, or
+  is a worker of a run that was running then (`swarm_windows.worker_info`, so a
+  worker started later still counts). That is the running turn asking for its
+  next model call; refusing it would stop the work the drain waits for. Everything
+  else (terminal CLIs, new sessions) waits and retries. Not refused: GETs (model
+  lists, dashboard pages, every read-only `/api` GET), `count_tokens`, MCP reads
+  and Stop. Refused requests are never counted in-flight, so the counter only
+  falls and the wait cannot starve.
+- **Restart.** The moment `_still_running` reaches 0 (polled every second),
+  or when the drain's deadline passes (`update_drain_max_seconds`; the resume
+  marker makes that cut safe) -> `_reexec_soon`. A sticky Stop wins: with the
+  intentional-stop flag (or runtime `desired: stopped`) `_reexec_soon` cancels
+  the restart, ends the drain and clears `updating` (a stopped hub is never
+  brought back by an update; the boot of a user relaunch still clears the flag).
+  The re-exec is `_do_reexec()`; `tests/conftest.py` makes it a tripwire so no
+  test can replace the process.
+- **Resume marker** `state_dir()/update-resume.json` (written atomically,
+  temp file + fsync + `os.replace`, in `_reexec_soon` just before `_do_reexec`):
+  `{v, reason, from, to, written_at, state_dir, sessions: [conversation ids
+  with a turn running], runs: [{run_id, owner}]}`. Left out of it: Multi
+  worker sessions (their run carries them), a conversation that owns a listed
+  run, anything with Stop pending (`last_interrupted` / `stop_pending`), runs
+  that are STOPPED, and conversations deleted from history. Nothing running =
+  no marker.
+- **Boot** (after `memory.recover_inflight`, `swarm_windows.resume_interrupted`,
+  `_auto_continue_turns`, `_file_unresumed_runs`, which run exactly as before):
+  `_update_resume_plan()` reads a FRESH marker once (<= 15 min old, same state
+  dir, well-formed, has work; a stale/corrupt/foreign one is ignored and
+  removed). `_multi_should_auto_resume` then also accepts a listed run (by id
+  or owner) and `_auto_continue_turns(back, plan)` continues a listed turn
+  with `_CONTINUE_TEXT`, both regardless of the per-conversation `auto_resume`
+  box (that box stays the owner's choice for crashes and manual stops).
+  Deleted conversations and stopped runs are skipped. One notice line per
+  continued conversation: "Continued automatically after the update to
+  <short hash>." (a plain restart: "...after the restart."), via
+  `agentic_chat.live_notice` for a turn and a leading `notice` event in the
+  run's live feed. Each consumer calls `plan.finish("turns"|"runs")`; the file
+  is deleted when both ran.
+- **Same path everywhere.** The periodic auto-update and the dashboard's
+  update button (`POST /api/auto-update {check:true}`) both end in
+  `_finish_update_apply` -> `_reexec_when_idle` / `_reexec_soon`. No restart
+  route existed, so `POST /api/hub/restart {resume?: true, drain?: true}`
+  (control token + dashboard header like every POST) was added: same drain,
+  marker and re-exec, 202 `{restarting, waiting_for, resume, draining,
+  max_wait_seconds}`; `resume:false` skips the marker, `drain:false` restarts
+  at once (the marker still protects the work); 409 for a stopped hub or when
+  the flag is off; a second call answers `already`. `GET /api/runtime` and
+  `GET /api/auto-update` carry `updating` / `draining` ({to, retry_after,
+  deadline_in, busy, ...}) for the page. README route count +1 (169).
+- **Page.** One line, `role="status" aria-live="polite"`, in the dashboard
+  header area (`#update-banner`) and on the Build page (`#agent-update-banner`):
+  "The hub is updating. Running jobs finish or wait, then continue by
+  themselves." (theme tokens only). `refreshUpdateStatus()` follows
+  `/api/runtime` (15 s resync, every 5 s while updating). The Running popup says
+  "working now · waiting for update", Activity rows still in progress say
+  "in progress · waiting for update", and a refused send shows the hub's own
+  sentence instead of "stream failed". Static tests only.
+- **What each CLI does with 503 + Retry-After** (read from the installed
+  sources/binaries on this machine, 2026-10-08; the value stays <= 30 s because
+  Claude Code gives up on anything over 60 s and the OpenAI/Anthropic Python
+  SDKs ignore anything over 60 s):
+  - Claude Code 2.1.293: retries any status >= 500 (not with `x-should-retry:
+    false`); Retry-After in whole seconds only, delay = max(RA, backoff), over
+    60 s it stops at once; 10 retries (`CLAUDE_CODE_MAX_RETRIES`), backoff
+    500 ms x2 capped 32 s; ~5 min tolerated at RA 30. The SDK itself has
+    `maxRetries: 0`.
+  - opencode 1.18.35: retries status >= 500 and messages matching
+    `overloaded|service unavailable|server_error|503...`; honors
+    `retry-after-ms`, then `retry-after` seconds, then HTTP-date, NO cap; 5
+    retries (~2.5 min at RA 30); the AI SDK layer is `maxRetries: 0`.
+  - kimi-code 0.39.1: retry list includes 503/529; Retry-After integer seconds
+    only, no cap, replaces the backoff; 10 attempts per step (env
+    `KIMI_LOOP_MAX_ATTEMPTS_PER_STEP`) ~5 min at RA 30. Legacy kimi-cli 1.6:
+    retries 429/500/502/503 3 times at the step layer, its bundled SDKs add 2
+    more and honor Retry-After only when 0 < x <= 60.
+  - codex 0.154.0 (Rust binary): UNVERIFIED for HTTP 503. No Retry-After read
+    for HTTP errors was found (only a "try again in Ns" regex on the message
+    text); the log shows `stream_max_retries` 5 with backoff doubling from
+    ~200 ms (~6 s in total). Expect codex to surface an update that outlasts a
+    few seconds as an error; the one knob is `request_max_retries` /
+    `stream_max_retries` in its provider config, which the hub does not write
+    and this change deliberately does not touch.
+  - aider, qwen-code, pi, hermes, openclaw, gemini-cli: not installed (or no
+    runnable source) here -> no evidence, nothing claimed.
+- **Left open.** codex's short retry budget (above); the drain keeps running
+  turns of a Multi run going and still starting that run's later phases until
+  the cap (it does not pause phase starts); a CLI that gave up before the hub
+  came back is a CLI-side limit, not something the hub can resume.

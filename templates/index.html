@@ -208,6 +208,10 @@
   .lifecycle-row .group.media{margin-left:auto}
   .lifecycle-detail{flex-basis:100%;font-size:12px;color:var(--text-dim);overflow-wrap:anywhere}
   .lifecycle-detail.warn{color:var(--warn-text)}
+  /* the hub is updating (graceful update): one calm line, theme tokens only */
+  .update-banner{margin:0;padding:9px 16px;font-size:13px;line-height:1.45;color:var(--warn-text);background:var(--warn-soft);border-bottom:1px solid var(--warn-border)}
+  .update-banner[hidden]{display:none}
+  .agent-update-banner{border:1px solid var(--warn-border);border-radius:8px;margin:0 0 10px}
 
   /* ---------- sections / view headers ---------- */
   .section{margin-top:26px}
@@ -3145,6 +3149,10 @@
     </div>
   </div>
 </header>
+<!-- The hub pulled an update and is waiting for running work: new requests wait
+     (503 + Retry-After), running jobs finish or retry, then continue by
+     themselves after the restart. Filled and shown by refreshUpdateStatus(). -->
+<div class="update-banner" id="update-banner" role="status" aria-live="polite" hidden></div>
 <main class="wrap">
 
   <!-- Lifecycle and multimodal routing -->
@@ -3591,6 +3599,7 @@
               <!-- THIS WINDOW IS A HELPER of a Multi run: which step, and the
                    conversation it works for (filled by renderPlan from /plan). -->
               <div class="agent-helper-bar" id="agent-helper-bar" role="note" hidden></div>
+              <div class="update-banner agent-update-banner" id="agent-update-banner" role="status" aria-live="polite" hidden></div>
               <div class="agent-plan" id="agent-plan" hidden>
                 <button type="button" class="agent-plan-h" id="agent-plan-toggle" aria-expanded="true">
                   <span class="agent-plan-title" id="agent-plan-title">Plan</span>
@@ -5231,6 +5240,33 @@
   }
 
   /* ---------- lifecycle + multimodal priority ---------- */
+  /* ---------- the hub is updating (graceful update) ----------
+     GET /api/runtime carries `updating` ({to, retry_after, busy, ...}) while
+     the hub drains for an update. Both banners (dashboard header and the
+     Build page) say the same plain sentence; the Running popup and Activity
+     add "waiting for update" to what is still going. Checked on the normal
+     15 s resync, and every 5 s while an update is in progress. */
+  var UPDATE_BANNER_TEXT = 'The hub is updating. Running jobs finish or wait, then continue by themselves.';
+  window.hubUpdating = false;
+  var updateTimer = null;
+  function showUpdateBanner(on){
+    ['update-banner', 'agent-update-banner'].forEach(function(id){
+      var el = document.getElementById(id);
+      if (!el) return;
+      if (on){ el.textContent = UPDATE_BANNER_TEXT; el.hidden = false; }
+      else { el.hidden = true; el.textContent = ''; }
+    });
+  }
+  function refreshUpdateStatus(){
+    return api('/api/runtime').then(function(r){
+      var on = !!(r && r.updating);
+      window.hubUpdating = on;
+      showUpdateBanner(on);
+      if (on && !updateTimer) updateTimer = setInterval(refreshUpdateStatus, 5000);
+      if (!on && updateTimer){ clearInterval(updateTimer); updateTimer = null; }
+    }).catch(function(){ /* the hub is restarting: keep what is shown */ });
+  }
+
   function loadLifecycle(silent){
     return Promise.all([api('/api/hub-mode'), api('/api/media'), api('/api/runtime')])
       .then(function(all){
@@ -9788,7 +9824,8 @@
             return runRow(
               x.project_dir || x.session_id,
               (x.cli || '?') + ' · ' + (x.turn_count || 0) + ' turns · ' +
-                (x.currently_running ? 'working now' : 'idle (nothing running)'),
+                (x.currently_running ? 'working now' + (window.hubUpdating ? ' · waiting for update' : '')
+                                     : 'idle (nothing running)'),
               'End', endSession(x),
               { href: '/agent/' + encodeURIComponent(x.session_id), label: 'this conversation' });
           }
@@ -11480,6 +11517,14 @@
 
     /* Read an SSE body and hand each JSON event to `handle`. */
     function pumpSse(resp, handle){
+      if (resp.status === 503 && !resp.ok){
+        /* The hub is updating: say so in the turn (its plain message), instead
+           of the generic "stream failed". */
+        return resp.json().catch(function(){ return {}; }).then(function(j){
+          handle({ event: 'error', status: 503,
+                   detail: (j && (j.detail || j.error)) || 'The hub is updating; try again in a moment.' });
+        });
+      }
       if (!resp.ok || !resp.body) throw new Error('stream failed (HTTP ' + resp.status + ')');
       var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '';
       function pump(){
@@ -12128,6 +12173,7 @@
          any provider -- shown plainly, with the sizes, never a bare "error". */
       var statusClass = pending ? 'pending' : (st === 'ok' ? 'ok' : (st === 'stalled' ? 'stall' : (st === 'cancelled' ? 'cancel' : (st === 'context' ? 'cancel' : 'err'))));
       var statusLabel = (st === 'in_progress') ? 'in progress' : (st === 'cancelled' ? 'client left' : (st === 'context' ? 'context too long' : st));
+      if (pending && window.hubUpdating) statusLabel += ' · waiting for update';
       var statusTitle = (st === 'cancelled') ? 'The client disconnected before the answer was finished; the hub stopped the work'
         : (st === 'context' ? ('This conversation is too long for any available model' +
             (a.ctx_tokens ? ' (~' + a.ctx_tokens + ' tokens' + (a.ctx_window ? '; the largest holds ' + a.ctx_window : '') + ')' : '') +
@@ -14235,6 +14281,7 @@
   initSettingsDrawer();
   initSettingsExportImport();
   loadLifecycle();
+  refreshUpdateStatus();
   loadImages();
   loadUsage();
   loadStatus().then(function(){ updateChatAuthNote(); updateImageAuthNote(); });
@@ -14267,6 +14314,7 @@
   function resync(){   /* the old 15s server re-sync, now guarded per panel */
     if (document.hidden || hubOffline) return;
     loadStatus(true);   /* header pills + exhaustion banner: always safe to paint */
+    refreshUpdateStatus();
     if (panelIdle($('#sec-lifecycle'))) loadLifecycle(true);
     if (panelIdle($('#sec-images'))) loadImages(true);
     if (panelIdle($('#sec-subs'))) loadSubscriptions(true);

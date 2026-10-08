@@ -101,6 +101,7 @@ import usage_history
 import ctxwin
 import userenv
 import clientgone
+import graceful_update
 
 # A client that leaves while the hub waits stops the work it started (see
 # clientgone): every upstream HTTP call made for a request is tracked, and one
@@ -15390,11 +15391,90 @@ _runtime_server = [None]
 _runtime_shutdown_thread = [None]
 
 
-def _runtime_error():
-    message = "The hub is draining and is not accepting new inference requests."
-    if request.path.startswith("/v1/messages"):
-        return _anthropic_error("overloaded_error", message, 503)
-    return _openai_error(message, 503, "server_error")
+def _runtime_error(message=None, retry_after=None):
+    """The 503 a draining hub answers new work with, in the caller's own error
+    shape. Stop's drain passes nothing (the original reply, byte for byte); the
+    update drain passes a message and `retry_after`, which also adds the
+    Retry-After header and gives the Gemini and Ollama surfaces their own
+    envelopes."""
+    if message is None:
+        message = "The hub is draining and is not accepting new inference requests."
+    path = request.path
+    if retry_after is None:
+        if path.startswith("/v1/messages"):
+            return _anthropic_error("overloaded_error", message, 503)
+        return _openai_error(message, 503, "server_error")
+    if path.startswith("/v1/messages"):
+        # api_error, not overloaded_error: Claude Code counts overload errors
+        # (3 in a row throw "Repeated 529 Overloaded errors" for opus/fable/
+        # mythos model ids) but retries ANY status >= 500 with the header.
+        reply = _anthropic_error("api_error", message, 503)
+    elif path.startswith("/v1beta"):
+        reply = jsonify(wire_gemini.error_payload(message, 503, "UNAVAILABLE")), 503
+    elif _is_ollama_path(path):
+        reply = jsonify(wire_ollama.error_payload(message)), 503
+    else:
+        reply = _openai_error(message, 503, "server_error")
+    return _drain_headers(reply, retry_after)
+
+
+def _drain_headers(reply, retry_after):
+    """Retry-After (whole seconds) plus x-should-retry, on an (response,
+    status) pair. The Stainless SDKs several CLIs use read that header first."""
+    resp, status = reply
+    resp.headers["Retry-After"] = str(max(1, int(retry_after)))
+    resp.headers["x-should-retry"] = "true"
+    return resp, status
+
+
+# -- draining for an update (graceful_update) -------------------------------- #
+# Once an update is pulled and the restart has to wait for running work, NEW
+# work is answered 503 + Retry-After while the work already running finishes
+# (a request from a running turn/run is served: it is that work asking for its
+# next model call). The restart happens the moment nothing is left, or after
+# `update_drain_max_seconds`; the resume marker (see _write_update_resume_marker)
+# makes the second case safe.
+_UPDATE_DRAIN = graceful_update.Drain()
+_DRAIN_AGENT_SEND_RE = re.compile(r"^/api/agent/sessions/[^/]+/message(?:/stream)?$")
+# MCP tools that START work; the others read a run or stop one.
+_DRAIN_MCP_START_TOOLS = frozenset({"crew_run", "crew_start", "swarm_windows_start"})
+
+
+def _graceful_update_on():
+    return config.get_flag("graceful_update", True)
+
+
+def _run_of_session(session_id):
+    try:
+        info = swarm_windows.worker_info(session_id)
+    except Exception:                                            # noqa: BLE001
+        return None
+    return (info or {}).get("run_id")
+
+
+def _update_drain_reply(builder):
+    """`builder(message, retry_after)` -> reply for NEW work while draining for
+    an update, or None when the hub is not draining."""
+    snap = _UPDATE_DRAIN.snapshot()
+    if snap is None:
+        return None
+    retry_after = _UPDATE_DRAIN.retry_after()
+    message = graceful_update.refusal_message(snap["to"], retry_after, snap["reason"])
+    return builder(message, retry_after)
+
+
+def _update_drain_refusal():
+    """The 503 for a NEW inference request while draining for an update; None
+    when not draining or when the request belongs to running work."""
+    if not _UPDATE_DRAIN.active():
+        return None
+    if request.method != "POST":
+        return None            # a model list / probe is a read, not new work
+    if request.path.endswith(("count_tokens", ":countTokens")):
+        return None            # counting tokens runs no model
+    if _UPDATE_DRAIN.admits(_build_sid(), _run_of_session):
+        return None
+    return _update_drain_reply(lambda msg, ra: _runtime_error(msg, retry_after=ra))
 
 
 @app.before_request
@@ -15404,6 +15484,9 @@ def _runtime_before():
     state = config.get_runtime_state()
     if state.get("desired") == "stopped" or state.get("phase") in ("draining", "stopped"):
         return _runtime_error()
+    refusal = _update_drain_refusal()
+    if refusal is not None:
+        return refusal
     with _runtime_condition:
         _runtime_active[0] += 1
     g.runtime_counted = True
@@ -15427,6 +15510,42 @@ def _runtime_after(response):
     else:
         _runtime_request_done()
     return response
+
+
+@app.before_request
+def _update_drain_before():
+    """While draining for an update, the dashboard-side doors to NEW work (a new
+    /agent turn, a new Multi run, the MCP start tools, the prompt enhancer) get
+    the same 503 + Retry-After as /v1. Dashboard pages and every read-only GET
+    stay up. /v1 and the Ollama surface are handled in _runtime_before."""
+    if not _UPDATE_DRAIN.active() or request.method != "POST":
+        return None
+    path = request.path
+    if path.startswith("/v1") or _is_ollama_path(path):
+        return None
+    if _DRAIN_AGENT_SEND_RE.match(path):
+        def _agent(msg, ra):
+            reply = jsonify({"status": 503, "text": None, "detail": msg, "error": msg,
+                             "code": "hub_updating", "retry_after": ra}), 503
+            return _drain_headers(reply, ra)
+        return _update_drain_reply(_agent)
+    if path in ("/api/swarm-windows", "/api/enhance-prompt"):
+        return _update_drain_reply(lambda msg, ra: _runtime_error(msg, retry_after=ra))
+    if path == "/mcp":
+        body = request.get_json(force=True, silent=True)
+        if not isinstance(body, dict) or body.get("method") != "tools/call":
+            return None
+        name = (body.get("params") or {}).get("name") if isinstance(body.get("params"), dict) else None
+        if name not in _DRAIN_MCP_START_TOOLS:
+            return None
+
+        def _mcp(msg, ra):
+            reply = jsonify({"jsonrpc": "2.0", "id": body.get("id"),
+                             "error": {"code": -32000, "message": msg,
+                                       "data": {"retry_after": ra}}}), 503
+            return _drain_headers(reply, ra)
+        return _update_drain_reply(_mcp)
+    return None
 
 # The Ollama surface lives under /api/, which is otherwise the DASHBOARD control
 # API and is gated by the per-install control token plus an anti-CSRF header. No
@@ -19515,7 +19634,7 @@ def _hub_readiness():
     same test `_runtime_before` applies to /v1), never the network."""
     state = config.get_runtime_state() or {}
     phase = state.get("phase")
-    if phase == "draining":
+    if phase == "draining" or _UPDATE_DRAIN.active():
         return False, "draining"
     if state.get("desired") == "stopped" or phase == "stopped":
         return False, "stopped"
@@ -20495,7 +20614,45 @@ def _multi_should_auto_resume(run):
     conversation's run only when that conversation ticked "continue by itself
     after a restart"."""
     owner = getattr(run, "owner", None)
-    return (not owner) or agentic_history.auto_resume(owner)
+    if (not owner) or agentic_history.auto_resume(owner):
+        return True
+    # Cut by a hub-initiated update/restart that promised to continue it: the
+    # per-conversation box stays the owner's choice for crashes and manual
+    # stops, but a restart the hub itself caused does not leave work behind.
+    plan = _update_resume_plan()
+    if plan is None or owner not in agentic_history.known_session_ids():
+        return False
+    return plan.wants_run(getattr(run, "id", None), owner)
+
+
+# The resume marker of the update/restart that started THIS process, read once.
+_UPDATE_PLAN = {"loaded": False, "plan": None}
+_UPDATE_PLAN_LOCK = threading.Lock()
+
+
+def _update_resume_plan():
+    """graceful_update.ResumePlan from a FRESH update-resume.json (<= 15 min old,
+    written for this state dir), else None. Stale, corrupt or foreign markers
+    are ignored (and removed). Never raises."""
+    with _UPDATE_PLAN_LOCK:
+        if not _UPDATE_PLAN["loaded"]:
+            _UPDATE_PLAN["loaded"] = True
+            try:
+                if _graceful_update_on() and _resume_after_update_on():
+                    marker = graceful_update.read_marker(config.state_dir(), time.time())
+                    if marker:
+                        _UPDATE_PLAN["plan"] = graceful_update.ResumePlan(
+                            marker, config.state_dir())
+            except Exception as exc:                             # noqa: BLE001
+                _log.warning("Update: could not read the resume marker: %s", exc)
+        return _UPDATE_PLAN["plan"]
+
+
+def _notice_then(text, events):
+    """`events` with one notice line in front of it."""
+    yield {"event": "notice", "text": text}
+    for ev in events:
+        yield ev
 
 
 def _file_unresumed_runs():
@@ -20513,19 +20670,26 @@ def _file_unresumed_runs():
             pass
 
 
-def _auto_continue_turns(session_ids):
+def _auto_continue_turns(session_ids, plan=None):
     """Conversations whose turn a restart cut short AND that asked to continue
-    by themselves: rebuilt and sent the Continue message. Others wait for the
-    owner's Continue. Never raises."""
+    by themselves -- or that a hub-initiated update/restart cut (`plan`, the
+    resume marker, regardless of that box): rebuilt and sent the Continue
+    message. Others wait for the owner's Continue. Never raises."""
     for sid in session_ids or ():
-        if not agentic_history.auto_resume(sid):
+        forced = bool(plan is not None and plan.wants_session(sid))
+        if not forced and not agentic_history.auto_resume(sid):
             continue
+        if forced and sid not in agentic_history.known_session_ids():
+            continue                      # the conversation was deleted
         try:
             with app.test_request_context("/api/agent/sessions/%s/resume" % sid,
                                           method="POST", json={}):
                 api_agent_resume_session(sid)
+            noted = False
             for _ev in agentic_chat.send_message_stream_durable(sid, _CONTINUE_TEXT):
-                pass
+                if forced and not noted and _ev.get("event") != "error":
+                    noted = True
+                    agentic_chat.live_notice(sid, plan.notice())
             _log.info("[resume] %s continued by itself after the restart", sid[:12])
         except Exception as exc:                                 # noqa: BLE001
             _log.warning("[resume] %s could not continue by itself: %s",
@@ -20537,7 +20701,18 @@ def _resume_interrupted_swarms():
     swarm_windows.resume_interrupted), and put each one that is a
     conversation's turn back where the page can see it -- registered as that
     conversation's run, and its events fed into the live buffer so a reload
-    attaches to it as if nothing had happened."""
+    attaches to it as if nothing had happened. Runs a hub-initiated
+    update/restart cut continue regardless of the conversation's own box (the
+    resume marker, see _update_resume_plan) and say so with one notice line."""
+    plan = _update_resume_plan()
+    try:
+        return _resume_interrupted_swarms_inner(plan)
+    finally:
+        if plan is not None:
+            plan.finish("runs")
+
+
+def _resume_interrupted_swarms_inner(plan):
     try:
         # The manager is re-attached here (when one is enabled NOW): a resumed
         # run used to finish every remaining phase unverified, although the
@@ -20563,11 +20738,16 @@ def _resume_interrupted_swarms():
         with _MULTI_LOCK:
             _MULTI_RUNS[owner] = rid
 
-        def _feed(owner=owner, rid=rid, cli=run.cli_id):
+        note = plan.notice() if plan is not None and plan.wants_run(rid, owner) else ""
+
+        def _feed(owner=owner, rid=rid, cli=run.cli_id, note=note):
             # Drained for its side effect: live_run mirrors every event into
             # the conversation's live buffer, which is what a reloaded page
             # follows.
-            for _ in agentic_chat.live_run(owner, _multi_follow_events(rid, cli)):
+            events = _multi_follow_events(rid, cli)
+            if note:
+                events = _notice_then(note, events)
+            for _ in agentic_chat.live_run(owner, events):
                 pass
         threading.Thread(target=_feed, daemon=True,
                          name="swarm-feed-" + rid).start()
@@ -20898,7 +21078,8 @@ def api_runtime():
     with _runtime_condition:
         active = _runtime_active[0]
     return jsonify({"state": config.get_runtime_state(), "active_requests": active,
-                    "intentional_stop": config.is_intentionally_stopped()})
+                    "intentional_stop": config.is_intentionally_stopped(),
+                    "updating": _update_drain_info()})
 
 
 @app.route("/api/runtime/stop", methods=["POST"])
@@ -24240,10 +24421,25 @@ def _recover_memory_state():
         if back:
             _log.info("filed %d turn(s) cut short by the last shutdown as "
                       "resumable", len(back))
-            # Only the conversations that asked to continue by themselves do;
-            # the rest wait for the owner's Continue.
-            threading.Thread(target=lambda: (time.sleep(20), _auto_continue_turns(back)),
-                             daemon=True, name="auto-continue").start()
+            # Only the conversations that asked to continue by themselves do
+            # -- plus the ones a hub-initiated update/restart cut (the resume
+            # marker, whatever their box says); the rest wait for the owner's
+            # Continue.
+            plan = _update_resume_plan()
+
+            def _continue(back=back, plan=plan):
+                time.sleep(20)
+                try:
+                    _auto_continue_turns(back, plan)
+                finally:
+                    if plan is not None:
+                        plan.finish("turns")
+            threading.Thread(target=_continue, daemon=True,
+                             name="auto-continue").start()
+        else:
+            plan = _update_resume_plan()
+            if plan is not None:
+                plan.finish("turns")           # nothing was cut mid-turn
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("could not recover in-flight turns: %s", exc)
     try:
@@ -38495,7 +38691,10 @@ def _hb_state_set(state):
 
 def _hb_busy(sched):
     """HEARTBEAT skip: the owner is working -- a live Multi run for this
-    project, or any hub request in flight / finished in the last 60s."""
+    project, or any hub request in flight / finished in the last 60s. A hub
+    draining for an update starts nothing new."""
+    if _UPDATE_DRAIN.active():
+        return True
     try:
         project = (sched or {}).get("project_dir")
         for r in swarm_windows.list_runs():
@@ -44103,6 +44302,7 @@ def _finish_update_apply(before_label, after_label, deps_ok):
                  before_label, after_label)
         return _auto_update_state["last_result"]
     _auto_update_state["updating"] = True
+    _note_update_labels(before_label, after_label)
     busy = _agentic_busy_session_ids()
     runs = _swarm_busy_run_ids()
     with _runtime_condition:
@@ -44166,16 +44366,153 @@ def _sync_deps_after_pull():
         return False
 
 
+def _do_reexec():
+    """The one place the hub replaces its own process. Tests replace THIS."""
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# -- graceful update: labels, drain, resume marker ---------------------------- #
+# Every hub-initiated restart (the periodic auto-update, the dashboard's update
+# button, POST /api/hub/restart) ends in _reexec_soon, so the drain and the
+# marker live there and in _reexec_when_idle; flag `graceful_update` off leaves
+# both exactly as they were.
+_UPDATE_LABELS = {"from": "", "to": "", "reason": "update"}
+_UPDATE_RESUME_WANTED = [True]      # POST /api/hub/restart {resume:false} clears it
+
+
+def _note_update_labels(before_label, after_label, reason="update"):
+    _UPDATE_LABELS.update({"from": str(before_label or ""), "to": str(after_label or ""),
+                           "reason": reason})
+
+
+def _update_drain_max():
+    """Seconds the hub waits for running work before restarting anyway."""
+    try:
+        v = float(config.get_setting("update_drain_max_seconds",
+                                     graceful_update.DEFAULT_DRAIN_MAX))
+    except (TypeError, ValueError):
+        return graceful_update.DEFAULT_DRAIN_MAX
+    return min(max(v, 1.0), 24 * 3600.0)
+
+
+def _resume_after_update_on():
+    return bool(config.get_setting("resume_after_update", True))
+
+
+def _begin_update_drain(busy_sessions=None, busy_runs=None):
+    """Start refusing NEW work (503 + Retry-After) while the work running now
+    finishes. Idempotent; False when the flag is off or a drain already runs."""
+    if not _graceful_update_on():
+        return False
+    if busy_sessions is None:
+        busy_sessions = _agentic_busy_session_ids()
+    if busy_runs is None:
+        busy_runs = _swarm_busy_run_ids()
+    started = _UPDATE_DRAIN.begin(
+        _UPDATE_LABELS.get("to"), _UPDATE_LABELS.get("from"),
+        max_seconds=_update_drain_max(), sessions=busy_sessions, runs=busy_runs,
+        reason=_UPDATE_LABELS.get("reason") or "update")
+    if started:
+        _log.info("Update: draining -- new work gets 503 + Retry-After while %d "
+                  "session(s)/%d run(s) finish (at most %.0f s).",
+                  len(busy_sessions), len(busy_runs), _update_drain_max())
+    return started
+
+
+def _end_update_drain():
+    _UPDATE_DRAIN.end()
+
+
+def _restart_is_vetoed_by_stop():
+    """A user Stop is sticky: nothing the hub does by itself may bring a stopped
+    hub back, so a pending update restart gives way to it."""
+    try:
+        if config.is_intentionally_stopped():
+            return True
+        state = config.get_runtime_state() or {}
+        return state.get("desired") == "stopped" or state.get("phase") in ("draining", "stopped")
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _update_resume_candidates():
+    """(session ids, run rows) the restart is about to cut and that should go on
+    afterwards: conversations with a turn running, Multi runs still going (with
+    their conversation owner). Left out: a worker session (its run carries it),
+    an owner whose run carries the turn, anything the owner is stopping, and
+    conversations that no longer exist."""
+    known = agentic_history.known_session_ids()
+    runs = []
+    for r in swarm_windows.list_runs():
+        if r.get("state") in (swarm_windows.PENDING, swarm_windows.RUNNING):
+            owner = r.get("owner")
+            if owner and owner not in known:
+                continue                     # its conversation was deleted
+            runs.append({"run_id": r.get("run_id"), "owner": owner})
+    owners = {r["owner"] for r in runs if r.get("owner")}
+    sessions = []
+    for sid in sorted(_agentic_busy_session_ids()):
+        if sid not in known or sid in owners:
+            continue
+        if swarm_windows.worker_info(sid):
+            continue
+        sess = agentic_chat._REGISTRY.get(sid)
+        if sess is not None and (sess.last_interrupted or sess.stop_pending):
+            continue                         # the owner pressed Stop
+        sessions.append(sid)
+    return sessions, runs
+
+
+def _write_update_resume_marker():
+    """Just before the re-exec: record what is running so the next boot
+    continues it. Nothing running = no marker. Never raises; returns the path."""
+    if not (_graceful_update_on() and _resume_after_update_on()
+            and _UPDATE_RESUME_WANTED[0]):
+        return None
+    try:
+        sessions, runs = _update_resume_candidates()
+        if not sessions and not runs:
+            return None
+        marker = graceful_update.build_marker(
+            _UPDATE_LABELS.get("from"), _UPDATE_LABELS.get("to"), time.time(),
+            config.state_dir(), sessions=sessions, runs=runs,
+            reason=_UPDATE_LABELS.get("reason") or "update")
+        path = graceful_update.write_marker(config.state_dir(), marker)
+        if path:
+            _log.info("Update: resume marker written (%d conversation(s), %d run(s)).",
+                      len(sessions), len(runs))
+        return path
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("Update: could not write the resume marker: %s", exc)
+        return None
+
+
 def _reexec_soon():
     """Replace this process with a fresh one (applies pulled code). Env (incl.
-    PORT) is inherited across execv, so the gateway comes back on the same port."""
+    PORT) is inherited across execv, so the gateway comes back on the same port.
+
+    With `graceful_update` on, a sticky Stop wins over the restart and the work
+    still running at that moment is written to the resume marker first. (When
+    the restart had to wait, _reexec_when_idle has been draining the whole
+    time; an idle hub restarts at once and needs no drain.)"""
+    graceful = _graceful_update_on()
+
     def _go():
         time.sleep(1.0)
+        if graceful:
+            if _restart_is_vetoed_by_stop():
+                _log.info("Update: restart cancelled -- the hub was stopped on purpose.")
+                _end_update_drain()
+                _auto_update_state["updating"] = False
+                return
+            _write_update_resume_marker()
         try:
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            _do_reexec()
         except Exception as exc:
             _log.error("Auto-update re-exec failed: %s", exc)
             _auto_update_state["updating"] = False
+            if graceful:
+                _end_update_drain()
     threading.Thread(target=_go, daemon=True).start()
 
 
@@ -44241,18 +44578,40 @@ def _reexec_when_idle(busy_snapshot, busy_runs=()):
     already in flight on /v1/*) has finished -- and not a moment later, even
     if the hub stays continuously busy. Deliberately does NOT wait for
     sessions that START after the snapshot: an always-on hub could otherwise
-    defer forever and the pulled code would never actually apply."""
+    defer forever and the pulled code would never actually apply.
+
+    GRACEFUL (flag `graceful_update`, default on): the snapshot alone did not
+    stop an always-busy hub from starving the restart, because NEW work kept
+    arriving and kept the in-flight counter up. Now the hub DRAINS while it
+    waits (new work gets 503 + Retry-After, running work finishes), restarts
+    the moment nothing is left, and gives up waiting after
+    `update_drain_max_seconds` -- the resume marker then makes the cut safe
+    (the jobs continue by themselves after the restart)."""
+    graceful = _graceful_update_on()
+    if graceful:
+        _begin_update_drain(busy_snapshot, busy_runs)
+
     def _go():
         # A ceiling, because a swarm that hangs must not defer the update
         # forever. Generous on purpose: a worker may run up to
         # swarm_windows.AGENT_TIMEOUT while it is producing output, and a run
         # is several waves of them, so anything under this is a run that is
         # still legitimately working.
-        deadline = time.time() + _DEFER_RESTART_MAX
+        deadline = time.time() + (_update_drain_max() if graceful else _DEFER_RESTART_MAX)
         while True:
             busy = _still_running(busy_snapshot, busy_runs)
             if not busy:
                 break
+            if graceful:
+                if _UPDATE_DRAIN.expired() or time.time() > deadline:
+                    _log.warning("Update: %d task(s) still running after %.0f s; "
+                                 "restarting anyway, they continue afterwards.",
+                                 busy, _update_drain_max())
+                    break
+                _auto_update_state["last_result"] = (
+                    "update pulled — restart deferred: %d task(s) still running" % busy)
+                time.sleep(1.0)
+                continue
             if time.time() > deadline:
                 _log.warning("Auto-update: %d task(s) still running after %.0f min; "
                              "restarting anyway.", busy, _DEFER_RESTART_MAX / 60.0)
@@ -44308,7 +44667,86 @@ def api_auto_update():
     st["enabled"] = _auto_update_enabled()   # always True (unless the dev env escape)
     st["always_on"] = True
     st["is_git_repo"] = _is_git_repo()
+    st["draining"] = _update_drain_info()
     return jsonify(st)
+
+
+def _update_drain_info():
+    """The dashboard's view of an update drain ({to, retry_after, deadline_in,
+    busy, ...}), or None when the hub is not draining."""
+    snap = _UPDATE_DRAIN.snapshot()
+    if snap is None:
+        return None
+    try:
+        busy = _still_running(snap["sessions"], snap["runs"])
+    except Exception:                                            # noqa: BLE001
+        busy = None
+    return _UPDATE_DRAIN.info(busy)
+
+
+def _current_version_label():
+    """Short label of the code this process runs (git short hash, else the zip
+    manifest's fingerprint). Never raises."""
+    try:
+        if _is_git_repo():
+            rc, out, _ = _git("rev-parse", "--short=7", "HEAD")
+            if rc == 0 and out:
+                return out.strip()
+        manifest = _load_zip_manifest()
+        if manifest:
+            return _manifest_fingerprint(manifest)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return "current"
+
+
+@app.route("/api/hub/restart", methods=["POST"])
+def api_hub_restart():
+    """Restart the hub WITHOUT cutting work: the same drain -> marker -> re-exec
+    path the auto-update uses, for an operator or an agent that would otherwise
+    kill processes. POST {resume?: true, drain?: true}.
+
+    New work gets 503 + Retry-After while running work finishes (at most
+    `update_drain_max_seconds`); the hub then writes update-resume.json and
+    re-executes, and the next boot continues exactly what was running.
+    `resume: false` skips the marker (cut work waits for Continue as after any
+    restart); `drain: false` restarts at once (the marker still protects the
+    work). A user Stop wins: a stopped hub is not restarted."""
+    body = request.get_json(force=True, silent=True)
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "invalid JSON body"}), 400
+    if not _graceful_update_on():
+        return jsonify({"ok": False, "error": "Graceful restart is switched off "
+                        "(flag graceful_update)."}), 409
+    if _restart_is_vetoed_by_stop():
+        return jsonify({"ok": False, "error": "The hub was stopped on purpose; "
+                        "start it yourself."}), 409
+    if _UPDATE_DRAIN.active() or _auto_update_state.get("updating"):
+        return jsonify({"ok": True, "already": True,
+                        "draining": _update_drain_info()}), 202
+    resume = body.get("resume", True) is not False
+    drain = body.get("drain", True) is not False
+    label = _current_version_label()
+    _note_update_labels(label, label, reason="restart")
+    _UPDATE_RESUME_WANTED[0] = resume
+    _auto_update_state["updating"] = True
+    busy = _agentic_busy_session_ids()
+    runs = _swarm_busy_run_ids()
+    with _runtime_condition:
+        inflight = _runtime_active[0]
+    waiting = len(busy) + len(runs) + (1 if inflight else 0)
+    if drain and waiting:
+        _auto_update_state["last_result"] = (
+            "restart requested — waiting for %d task(s) to finish" % waiting)
+        _reexec_when_idle(busy, runs)
+    else:
+        _auto_update_state["last_result"] = "restart requested — restarting"
+        _reexec_soon()
+    return jsonify({"ok": True, "restarting": True, "waiting_for": waiting,
+                    "resume": resume, "draining": _update_drain_info(),
+                    "max_wait_seconds": int(_update_drain_max())}), 202
 
 
 # ---------------------------------------------------------------------------

@@ -356,3 +356,31 @@ def _bandit_tie_break_is_deterministic(request, monkeypatch):
     import app
     monkeypatch.setattr(app, "_bandit_delta", lambda kind, pid, model, base: 0.0)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _graceful_update_stays_in_the_test(monkeypatch):
+    """The update drain, the resume plan and the pending-update labels are
+    process-wide in app.py: a test that began a drain (or read a marker) must
+    not leave /v1 answering 503 for the next one. And no test may ever replace
+    the process -- app._do_reexec is the ONE place the hub re-executes itself,
+    so it is a tripwire here; tests/test_graceful_update.py swaps in a fake."""
+    try:
+        import app
+    except Exception:                                            # noqa: BLE001
+        yield
+        return
+
+    def _no_reexec():
+        raise AssertionError("a test tried to re-exec the hub (app._do_reexec)")
+
+    def _reset():
+        app._UPDATE_DRAIN.end()
+        app._UPDATE_PLAN.update({"loaded": False, "plan": None})
+        app._UPDATE_LABELS.update({"from": "", "to": "", "reason": "update"})
+        app._UPDATE_RESUME_WANTED[0] = True
+
+    monkeypatch.setattr(app, "_do_reexec", _no_reexec)
+    _reset()
+    yield
+    _reset()

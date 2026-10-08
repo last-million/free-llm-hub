@@ -309,7 +309,7 @@ keys can actually reach right now, which is the only number that matters.
 | **Dashboard** | `/api/*` (control-token gated) |
 | **Probes** | `/health`, `/healthz` (liveness), `/ready`, `/readyz` (readiness, 503 + `reason` when not ready) — no token, loopback only, no version or provider data |
 
-168 routes in total; the dashboard is the documentation for the rest.
+169 routes in total; the dashboard is the documentation for the rest.
 
 ---
 
@@ -337,7 +337,7 @@ the most out of free tiers on your own machine.
 python -m pytest -q
 ```
 
-**4474 tests, 278 files.** They are written as evidence: most carry a docstring
+**5996 tests, 362 files.** They are written as evidence: most carry a docstring
 recording the measurement or the live failure that produced them.
 
 ---
