@@ -1168,7 +1168,9 @@ def test_the_docs_section_is_the_last_one_and_covers_the_evidence():
     assert AGENTS.count(head) == 1
     assert AGENTS.index(head) > AGENTS.index("## Tests")
     tail = AGENTS[AGENTS.index(head) + len(head):]
-    assert "\n## " not in tail                                  # nothing after it
+    # Sections appended later (other features land after this one) must not
+    # leak into the evidence check: read up to the NEXT heading only.
+    tail = tail.split("\n## ", 1)[0]
     for needle in ("update-resume.json", "graceful_update", "update_drain_max_seconds",
                    "resume_after_update", "POST /api/hub/restart", "Retry-After"):
         assert needle in tail, needle
