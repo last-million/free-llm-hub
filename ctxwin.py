@@ -1262,9 +1262,11 @@ def _overflow_numbers(requested, window):
     return requested, window
 
 
-def openai_overflow_body(requested, window):
+def openai_overflow_body(requested, window, hint=""):
     """OpenAI's own shape and code -- what opencode, the OpenAI SDKs and codex
-    (non-stream) recognise as 'compact and retry'."""
+    (non-stream) recognise as 'compact and retry'. `hint` (empty by default,
+    so the body is byte-identical when nothing is passed) is appended to the
+    message to make it actionable WITHOUT changing the shape or code."""
     requested, window = _overflow_numbers(requested, window)
     if window:
         msg = ("This model's maximum context length is %d tokens. However, your "
@@ -1273,27 +1275,33 @@ def openai_overflow_body(requested, window):
     else:
         msg = ("Your input exceeds the context window of every available model "
                "(%d tokens). Please reduce the length of the messages." % requested)
+    if hint:
+        msg += hint
     return {"error": {"message": msg, "type": "invalid_request_error",
                       "param": "messages", "code": "context_length_exceeded"}}
 
 
-def anthropic_overflow_body(requested, window):
+def anthropic_overflow_body(requested, window, hint=""):
     """Anthropic's shape. Claude Code keys its reactive compaction on the
-    message starting 'prompt is too long'."""
+    message starting 'prompt is too long', so `hint` is appended AFTER that
+    prefix (empty by default = byte-identical)."""
     requested, window = _overflow_numbers(requested, window)
     msg = "prompt is too long: %d tokens > %d maximum" % (requested, window or max(1, requested - 1))
+    if hint:
+        msg += hint
     return {"type": "error", "error": {"type": "invalid_request_error", "message": msg}}
 
 
-def responses_overflow_events(requested, window, model="auto"):
+def responses_overflow_events(requested, window, model="auto", hint=""):
     """(response.created, response.failed) payloads for a streamed Responses
     request. Codex maps a response.failed whose error.code is
     context_length_exceeded to its ContextWindowExceeded error, marks the window
-    full and auto-compacts; a plain HTTP 400 only surfaces as an error."""
+    full and auto-compacts; a plain HTTP 400 only surfaces as an error. `hint`
+    (empty by default) rides the error message, not the code."""
     rid = "resp_" + hashlib.sha1(str(time.time()).encode()).hexdigest()[:24]
     base = {"id": rid, "object": "response", "created_at": int(time.time()),
             "model": model, "output": []}
-    err = openai_overflow_body(requested, window)["error"]
+    err = openai_overflow_body(requested, window, hint=hint)["error"]
     created = dict(base, status="in_progress")
     failed = dict(base, status="failed",
                   error={"code": "context_length_exceeded", "message": err["message"]})

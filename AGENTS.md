@@ -4284,3 +4284,50 @@ instruction and the planner is told to use storage that needs no install); a
 remembered start is used on an explicit start only (Run, the turn-end preview,
 the run-end check) -- nothing is started at boot; and the status route never
 checks over HTTP.
+
+## Oversized conversations say how to compact (2026-10-10)
+
+Covered by `tests/test_compact_hint.py` (hermetic: the message is built from
+constants + the request's User-Agent; no network). Owner: a Codex conversation
+seen at ~504K tokens grew past every model's window, the hub refused it with the
+native context-length error, and Codex kept re-sending the SAME oversized turn
+instead of compacting. The refusal now TELLS the client how to shrink it.
+
+- **What**: the two refusal paths -- the front door (`_front_door_overflow`) and
+  the hop-exhaustion overflow (`_ctx_overflow_reply`) -- both go through the one
+  choke point `_native_overflow_reply`, which now appends an actionable sentence
+  to the native message: "This conversation is too long for every available model
+  (~N tokens; the largest holds M). Type /compact to shrink it, or start a new
+  conversation." The protocol's native error SHAPE and CODE are unchanged (OpenAI
+  `context_length_exceeded` with `param: messages`; Anthropic message still STARTS
+  with `prompt is too long:`; streamed Responses still `response.failed` with
+  `error.code` `context_length_exceeded`), so every client still treats it as a
+  context error and compacts -- only the human-readable text is made actionable.
+- **Which command, per CLI** (`_ch_compact_hint`, `_ch_overflow_client`, map
+  `_CH_COMPACT_CMD`): the client is the /agent session's CLI, else the
+  User-Agent (`_steer_cli_from_ua`). codex, claude and opencode are each told
+  `/compact` -- VERIFIED READ-ONLY from each installed binary's own strings on
+  2026-10-10: `codex.exe` (`@openai/codex` win32 vendor bin) prints
+  `/compact when the conversation gets long to summ[arize]`; `claude.exe`
+  (isolated `@anthropic-ai/claude-code` 2.1.220) prints `/compact now to control
+  what gets kept` and `/compact mid-task, /clear when switching...`; `opencode.exe`
+  (`opencode-ai` bin) prints `/compact to reduce context`. Any other client
+  (qwen/kimi/aider/hermes/openclaw, an SDK UA, or none) gets the generic "Start a
+  new conversation or shorten the history." -- no command is named unless it was
+  verified.
+- **No fake numbers**: the sizes in the sentence are the SAME `orig`/`window`
+  already in the reply (formatted with thousands separators, matching the Build
+  page's `context_detail`); the hint is a message-string append ONLY. No usage
+  field is added or changed, and no token count is altered to steer the client
+  (the tests assert every structured field, size numbers included, is identical
+  to the no-hint body). `ctxwin.openai_overflow_body` / `anthropic_overflow_body`
+  / `responses_overflow_events` gained an optional `hint=""` (empty = byte-
+  identical to before).
+- **Flag** `context_compact_hint` (`config.get_flag`, default on). Off = the
+  message is byte-identical to before (hint `""`, no extra log line). One log
+  line per refusal: `[ctx] overflow refusal: cli=<id> compact=<cmd|none> ~N
+  tokens, largest window M` (sizes only, no content).
+- **Build page**: the browser's "context too long" message
+  (`agentic_chat.context_detail`) already ends "Press Continue to compact it or
+  start a new conversation." -- the Continue button runs the hub's own
+  compaction, so that text is left as the page's equivalent guidance.

@@ -13034,14 +13034,70 @@ def _note_context_reply(orig, window):
         pass
 
 
+# A conversation too long for every model gets the protocol's NATIVE context
+# error (shape + code unchanged, so the CLI still treats it as a context error
+# and compacts), but the human-readable message is made ACTIONABLE: it names
+# the client's own built-in compaction command when the hub verified one, else
+# a generic way out. Each command below was verified READ-ONLY from the
+# installed CLI's own binary strings (see AGENTS.md "Oversized conversations
+# say how to compact"): codex.exe, claude.exe and opencode.exe each print
+# "/compact". A CLI not in this map gets the generic sentence. Flag
+# context_compact_hint (default on); off = the message is byte-identical to
+# before. Covered by tests/test_compact_hint.py.
+_CH_COMPACT_CMD = {"codex": "/compact", "claude": "/compact", "opencode": "/compact"}
+
+
+def _ch_overflow_client():
+    """The CLI behind this request -- the /agent session's, else the
+    User-Agent's -- or None. Never raises (safe outside a request too)."""
+    try:
+        return _agent_session_cli(_build_sid()) or _steer_cli_from_ua()
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _ch_compact_hint(orig, window):
+    """(suffix, cli, cmd): the actionable sentence to append to a native
+    overflow message, the detected CLI and its verified compaction command
+    (None when unknown). suffix is "" when the context_compact_hint flag is off
+    (then the body stays byte-identical). The sizes mirror the Build page's
+    context_detail text. Never raises."""
+    try:
+        if not config.get_flag("context_compact_hint", True):
+            return "", None, None
+        orig, window = int(orig or 0), int(window or 0)
+        if window and orig:
+            sizes = " (~%s tokens; the largest holds %s)" % (
+                format(orig, ","), format(window, ","))
+        elif orig:
+            sizes = " (~%s tokens)" % format(orig, ",")
+        else:
+            sizes = ""
+        cli = _ch_overflow_client()
+        cmd = _CH_COMPACT_CMD.get(cli or "")
+        if cmd:
+            action = "Type %s to shrink it, or start a new conversation." % cmd
+        else:
+            action = "Start a new conversation or shorten the history."
+        return (" This conversation is too long for every available model%s. %s"
+                % (sizes, action)), cli, cmd
+    except Exception:                                            # noqa: BLE001
+        return "", None, None
+
+
 def _native_overflow_reply(kind, stream, orig, window, model_label, hdrs):
     """The protocol's native "context too long" reply (see _ctx_overflow_reply
     and _front_door_overflow, the two callers)."""
     _note_context_reply(orig, window)
+    hint, _cli, _cmd = _ch_compact_hint(orig, window)
+    if hint:
+        _log.info("[ctx] overflow refusal: cli=%s compact=%s ~%d tokens, "
+                  "largest window %d", _cli or "unknown", _cmd or "none",
+                  int(orig or 0), int(window or 0))
     if kind == "anthropic":
-        return jsonify(ctxwin.anthropic_overflow_body(orig, window)), 400, hdrs
+        return jsonify(ctxwin.anthropic_overflow_body(orig, window, hint=hint)), 400, hdrs
     if kind == "responses" and stream:
-        created, failed = ctxwin.responses_overflow_events(orig, window, model_label)
+        created, failed = ctxwin.responses_overflow_events(orig, window, model_label, hint=hint)
 
         def _gen():
             yield _sse_event("response.created",
@@ -13051,7 +13107,7 @@ def _native_overflow_reply(kind, stream, orig, window, model_label, hdrs):
 
         return Response(stream_with_context(_gen()), mimetype="text/event-stream",
                         headers=dict(_SSE_HEADERS, **hdrs))
-    return jsonify(ctxwin.openai_overflow_body(orig, window)), 400, hdrs
+    return jsonify(ctxwin.openai_overflow_body(orig, window, hint=hint)), 400, hdrs
 
 
 # --------------------------------------------------------------------------- #
