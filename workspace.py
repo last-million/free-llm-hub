@@ -953,26 +953,205 @@ def deploy_check(project_dir, *, probe=None, deadline=25.0):
 
 
 def _http_probe(url):
+    """The HTTP status a server on THIS machine answers `url` with. Only a
+    loopback URL is ever probed, no proxy is used and no redirect is followed
+    (a 3xx is an answer). URLError / socket errors propagate -- deploy_check
+    reads them as "not up yet"."""
+    import urllib.error
+    import urllib.parse
     import urllib.request
-    req = urllib.request.Request(url, method="GET")
+
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return None
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_a, **_k):
+            return None
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:    # noqa: S310
+        with opener.open(urllib.request.Request(url, method="GET"), timeout=5) as resp:
             return getattr(resp, "status", None) or resp.getcode()
     except urllib.error.HTTPError as exc:
-        return exc.code                     # a 4xx/5xx still means it answered
-    # URLError / socket errors propagate -> deploy_check treats them as "not yet"
+        return exc.code                     # a 3xx/4xx/5xx still means it answered
+
+
+# --------------------------------------------------------------------------- #
+# CANONICAL START (2026-10-10). Once the run-end deploy check saw the app answer
+# over HTTP, HOW it started is remembered -- the derived kind, the folder it ran
+# from (relative to the project) and the port it answered on -- so a later Run
+# or a restart starts it the same way instead of re-deriving it (or leaving it
+# to an adopted, hand-started server). The command itself is still DERIVED from
+# the files at start time, never stored and never taken from a request; a
+# record whose folder is gone, became a link, left the project or no longer
+# yields the same kind is ignored and dropped. Kept in the hub's state dir,
+# never in the project.
+# --------------------------------------------------------------------------- #
+
+CANON_PATH = None           # tests point it at a temp file; None = state dir
+CANON_MAX = 500
+_CANON_LOCK = threading.Lock()
+
+
+def _canon_path():
+    if CANON_PATH:
+        return CANON_PATH
+    try:
+        import config
+        return os.path.join(config.state_dir(), "preview-starts.json")
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _canon_key(project_dir):
+    return os.path.normcase(os.path.realpath(project_dir))
+
+
+def _canon_load():
+    path = _canon_path()
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def _canon_save(data):
+    path = _canon_path()
+    if not path:
+        return False
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def remember_start(project_dir):
+    """Remember how the RUNNING preview of `project_dir` was started. Called
+    after a deploy check passed. Returns the record, or None."""
+    project_dir = os.path.abspath(project_dir)
+    with _lock:
+        proc = _procs.get(project_dir)
+    run_dir = getattr(proc, "run_dir", None) if proc else None
+    if proc is None or proc.state != "running" or not run_dir:
+        return None
+    rel = os.path.relpath(run_dir, project_dir).replace("\\", "/")
+    if rel.startswith("..") or os.path.isabs(rel):
+        return None
+    rec = {"kind": proc.kind, "run_dir": rel, "port": int(proc.port), "at": time.time()}
+    with _CANON_LOCK:
+        data = _canon_load()
+        data[_canon_key(project_dir)] = rec
+        if len(data) > CANON_MAX:
+            keep = sorted(data.items(), key=lambda kv: (kv[1] or {}).get("at") or 0)
+            data = dict(keep[-CANON_MAX:])
+        _canon_save(data)
+    return rec
+
+
+def forget_start(project_dir):
+    with _CANON_LOCK:
+        data = _canon_load()
+        if data.pop(_canon_key(project_dir), None) is not None:
+            _canon_save(data)
+
+
+def canonical(project_dir, drop_stale=False):
+    """The remembered start of `project_dir`, validated against the folder as
+    it is NOW, or None. `drop_stale` (start() only) forgets a record that no
+    longer fits. Never raises."""
+    try:
+        with _CANON_LOCK:
+            rec = _canon_load().get(_canon_key(project_dir))
+        if rec is None:
+            return None
+        out = _canon_validate(project_dir, rec)
+        if out is None and drop_stale:
+            forget_start(project_dir)
+        return out
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _canon_validate(project_dir, rec):
+    try:
+        if not isinstance(rec, dict):
+            return None
+        rel, kind = rec.get("run_dir"), rec.get("kind")
+        if not isinstance(rel, str) or not isinstance(kind, str):
+            return None
+        parts = rel.replace("\\", "/").split("/")
+        if os.path.isabs(rel) or ".." in parts:
+            return None
+        run_dir = os.path.normpath(os.path.join(project_dir, rel))
+        if rel not in (".", ""):
+            mod = _deploy_mod()
+            if mod is None or mod.safe_path(run_dir, os.path.realpath(project_dir)) is None:
+                return None
+        if not os.path.isdir(run_dir):
+            return None
+        port = rec.get("port")
+        return {"kind": kind, "run_dir": run_dir, "rel": rel,
+                "port": port if isinstance(port, int) else None, "at": rec.get("at")}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _canonical_spec(canon):
+    """detect()'s spec, re-DERIVED in the remembered folder, when it still
+    yields the remembered kind; else None."""
+    try:
+        spec = _detect_at(canon["run_dir"])
+    except Exception:                                            # noqa: BLE001
+        return None
+    if not spec or spec.get("kind") != canon.get("kind"):
+        return None
+    spec["run_dir"] = canon["run_dir"]
+    spec["canonical"] = True
+    return spec
+
+
+def _preferred_port(port):
+    """The remembered port when it is free and allowed, else a fresh one."""
+    if not isinstance(port, int) or not (1024 <= port <= 65535) or port == _hub_port():
+        return _free_port()
+    with _lock:
+        taken = {p.port for p in _procs.values()}
+    if port in taken or _port_open(port):
+        return _free_port()
+    return port
 
 
 def start(project_dir, on_done=None):
     """Install deps, launch the project, and wait for its port. Returns the
     status dict immediately; the work happens on a worker thread."""
     project_dir = os.path.abspath(project_dir)
-    spec = detect(project_dir)
+    # The way a deploy check last saw it answer, when it still fits the folder
+    # (CANONICAL START above); otherwise derived as always.
+    canon = canonical(project_dir, drop_stale=True)
+    spec = _canonical_spec(canon) if canon else None
+    if canon and spec is None:
+        forget_start(project_dir)            # the project changed shape since
+    if spec is None:
+        spec = detect(project_dir)
     stop(project_dir)
-    port = _free_port()
+    port = _preferred_port(canon.get("port")) if spec.get("canonical") else _free_port()
     proc = _Proc(project_dir, port, spec["kind"])
+    proc.run_dir = spec["run_dir"]
     with _lock:
         _procs[project_dir] = proc
+    if spec.get("canonical"):
+        proc.log("[hub] starting it the remembered way: %s in %s"
+                 % (spec["kind"], canon["rel"]))
     proc.log("[hub] %s on port %d" % (spec["kind"], port))
 
     run_dir = spec["run_dir"]

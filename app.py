@@ -26133,6 +26133,137 @@ def _dp_augment_status(project_dir, st, report=False):
     return st
 
 
+# --------------------------------------------------------------------------- #
+# THIS MACHINE at planning (2026-10-10): envprobe's block for an APP build, fed
+# to the Multi planner and workers (swarm_windows.set_env_source) and to a
+# single session's brief (craft.set_env_source). Flag `planning_env_probe`
+# (default on). The planner may wait up to 8 s for the first probe; every other
+# caller takes what is cached (a request path never waits).
+# --------------------------------------------------------------------------- #
+
+def _dp_env_on():
+    try:
+        return bool(config.get_flag("planning_env_probe", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _dp_env_block(text, who="session"):
+    if not _dp_env_on():
+        return ""
+    try:
+        import envprobe
+        if not envprobe.wants_block(text or ""):
+            return ""
+        snap = envprobe.snapshot(wait=8.0 if who == "planner" else 0.0)
+        return envprobe.block(snap, who=who)
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+craft.set_env_source(lambda text: _dp_env_block(text, "session"))
+swarm_windows.set_env_source(_dp_env_block)
+
+
+# --------------------------------------------------------------------------- #
+# THE RUN-END DEPLOY CHECK (2026-10-10), injected into every Multi run through
+# _multi_check_kwargs: start the finished project through the preview (the
+# deploy-perfect prep + detect, or its remembered start), wait for an HTTP
+# answer, remember how it started when it answered. Flag
+# `deploy_check_after_run` (default on). Only for a run whose goal is an app or
+# web build; a run of docs or a library is never started.
+# --------------------------------------------------------------------------- #
+
+_dp_deploy_wait = 120.0
+
+
+def _dp_run_check_on():
+    try:
+        return bool(config.get_flag("deploy_check_after_run", True)) and _dp_enabled()
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _dp_app_goal(goal):
+    try:
+        import envprobe
+        if envprobe.wants_block(goal or ""):
+            return True
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        return bool(craft.is_web_ui(goal or ""))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _dp_run_deploy_check(run):
+    """swarm_windows' `deploy_check(run)`: None when it does not apply."""
+    if not _dp_run_check_on():
+        return None
+    project_dir = getattr(run, "project_dir", "") or ""
+    if not project_dir or not os.path.isdir(project_dir):
+        return None
+    if not _dp_app_goal(getattr(run, "goal", "") or ""):
+        return None
+    return _dp_start_and_check(project_dir)
+
+
+def _dp_start_and_check(project_dir, wait=None, clock=None, sleep=None, probe=None):
+    """Start `project_dir` through the preview and wait (bounded) for an HTTP
+    answer: {ok, url, port, status} or {ok: False, error, log_tail, url}.
+    Never raises."""
+    wait = _dp_deploy_wait if wait is None else float(wait)
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    try:
+        workspace.start(project_dir)
+    except workspace.WorkspaceError as exc:
+        return {"ok": False, "error": "nothing the preview can start: "
+                + _sanitize(str(exc)), "log_tail": []}
+    except Exception as exc:                                     # noqa: BLE001
+        return {"ok": False, "error": "%s: %s" % (exc.__class__.__name__,
+                                                  _sanitize(str(exc))), "log_tail": []}
+    deadline = clock() + wait
+    st = {}
+    while True:
+        try:
+            st = workspace.status(project_dir) or {}
+        except Exception:                                        # noqa: BLE001
+            st = {}
+        state = st.get("state")
+        if (state == "running" and st.get("url")) or state in ("failed", "stopped", "idle"):
+            break
+        if clock() >= deadline:
+            break
+        sleep(1.0)
+    tail = [_sanitize(str(line))[:300] for line in (st.get("log") or ())
+            if str(line).strip()][-15:]
+    if st.get("state") == "running" and st.get("url"):
+        mod = _dp_module()
+        chk = (mod.deploy_check(st["url"], probe=probe or workspace._http_probe,
+                                now=clock, sleep=sleep,
+                                deadline=min(30.0, max(5.0, deadline - clock())))
+               if mod is not None else {"ok": True})
+        if chk.get("ok"):
+            try:
+                workspace.remember_start(project_dir)
+            except Exception:                                    # noqa: BLE001
+                pass
+            return {"ok": True, "url": st["url"], "port": st.get("port"),
+                    "status": chk.get("status")}
+        return {"ok": False, "url": st.get("url"), "log_tail": tail,
+                "error": "it started but did not answer HTTP at %s (%s)"
+                         % (st["url"], chk.get("error") or "no answer")}
+    if st.get("error"):
+        err = str(st["error"])
+    elif st.get("state") in ("failed", "stopped", "idle"):
+        err = "it stopped before answering"
+    else:
+        err = "it did not start within %d s" % int(wait)
+    return {"ok": False, "error": _sanitize(err), "log_tail": tail, "url": st.get("url")}
+
+
 @app.route("/api/workspace/status", methods=["GET"])
 def api_workspace_status():
     # Gated, unlike stop: this one only READS, and its 400-on-missing-directory
@@ -26631,6 +26762,9 @@ def _multi_run_plan(session_id, project_dir=None):
                 "parallel": swarm_windows.parallel_view(run),
                 # Budget: X / Y in the run header (None when the run has no cap).
                 "budget": swarm_windows.budget_view(run),
+                # "Deployed: <url>" / "Deploy failed: <error>" once the run-end
+                # deploy check ran (None before, or when it does not apply).
+                "deploy": swarm_windows.deploy_view(run),
                 "current": running[0] if running else None,
                 # Picked back up by this process after a restart (it did not
                 # need a click: swarm_windows.resume_interrupted at boot).
@@ -41635,6 +41769,9 @@ def _multi_check_kwargs():
             out["free_verdict"] = _free_verdict
         if _pipeline_search_on():
             out["search"] = True
+        # The run-end deploy check (deploy-perfect, 2026-10-10).
+        if _dp_run_check_on():
+            out["deploy_check"] = _dp_run_deploy_check
     except Exception:                                            # noqa: BLE001
         return {}
     return out

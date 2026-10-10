@@ -452,6 +452,37 @@ def publish_wanted(text, session_id=None):
         return False
 
 
+# THIS MACHINE (2026-10-10): what is installed here, for a request to BUILD an
+# app (envprobe.wants_block) -- so a single session builds something that runs
+# here with one command and picks storage that needs no install. Registered by
+# app.py: fn(text) -> the block or "" (flag off, no snapshot cached yet, not an
+# app build). Unregistered (tests, other processes) = no block.
+_ENV_SOURCE = None
+
+# The ceiling tests/test_craft_briefs.py::test_worst_case_brief_cost enforces
+# (0.135 of the smallest 32K window, chars/4). The machine block is dropped
+# whenever it would push a brief over it, so it can never cost the ceiling:
+# the heaviest bundle (a saas landing page) has ~44 chars of room and is not an
+# app build anyway.
+BRIEF_CEILING_CHARS = int(32768 * 0.135 * 4)
+
+
+def set_env_source(fn):
+    global _ENV_SOURCE
+    _ENV_SOURCE = fn
+
+
+def env_block(text):
+    """The THIS MACHINE block for `text`, or "". Never raises."""
+    if _ENV_SOURCE is None:
+        return ""
+    try:
+        out = _ENV_SOURCE(text)
+    except Exception:                                            # noqa: BLE001
+        return ""
+    return out if isinstance(out, str) else ""
+
+
 # Is this web / UI work? The web_design trigger plus the site nouns that mean a
 # page will be built, and a few non-English forms (the owner writes French).
 # Used by plan_check to decide whether a plan's design gets the slop check;
@@ -533,9 +564,16 @@ def system_message(text, tools=True, session_id=None):
     # Normal and Max (what most sessions run) got no planning instruction at
     # all, which is the reported "i dont see the todolists and phases in work".
     # Tool-less chat is excluded on purpose: a plan is a thing you EXECUTE.
+    # THIS MACHINE (app builds, tool-carrying turns): with the briefs, before
+    # the loop -- and dropped whenever it would cross BRIEF_CEILING_CHARS.
+    env = [e for e in [env_block(text)] if e] if tools else []
     if not hits:
-        return {"role": "system",
-                "content": "\n\n".join(pub + [PLAN_PHASES, ACT_RUN, VERIFY_RUN])} if tools else None
+        if not tools:
+            return None
+        body = "\n\n".join(pub + env + [PLAN_PHASES, ACT_RUN, VERIFY_RUN])
+        if env and len(body) > BRIEF_CEILING_CHARS:
+            body = "\n\n".join(pub + [PLAN_PHASES, ACT_RUN, VERIFY_RUN])
+        return {"role": "system", "content": body}
     # The loop goes LAST: it says "every brief above" and "every ANTI line
     # above", and both references dangle if it is prepended.
     # VERIFY_READ checks against "the ANTI lines above", which only built-in
@@ -548,7 +586,9 @@ def system_message(text, tools=True, session_id=None):
     design = [DESIGN_FIRST] if any(n == "web_design" for n, _b in hits) else []
     tail = ([PLAN_PHASES] + design + [ACT_RUN, VERIFY_RUN] if tools
             else design + [VERIFY_READ] if builtin else [])
-    body = "\n\n".join([b for _n, b in hits] + pub + tail)
+    body = "\n\n".join([b for _n, b in hits] + pub + env + tail)
+    if env and len(body) > BRIEF_CEILING_CHARS:
+        body = "\n\n".join([b for _n, b in hits] + pub + tail)
     return {"role": "system", "content": body}
 
 

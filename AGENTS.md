@@ -4209,10 +4209,78 @@ can still swap a folder for a link in the instant between the run-time re-check
 and npm starting there; that process could run the same command itself, so the
 check closes the "trick the hub" path, not that one.
 
+**Machine probe, run-end deploy check, remembered start** (same day; covered by
+`tests/test_deploy_after_run.py`, hermetic: fake which / run / port_open in
+Windows, Linux and macOS output shapes, fake spawn / run_turn, a faked
+workspace and clock).
+- **`envprobe.py`** (stdlib; every side injectable; module switch `ENABLED`,
+  which `tests/conftest.py` turns off for every test). `probe()` = `shutil.which`
+  + ONE `--version` per tool under 4 s, all on threads (node, npm, pnpm, yarn,
+  bun, python -- python3 / python / py, so a Windows Store alias that prints
+  "Python was not found" falls through to the launcher --, pip, docker, psql,
+  mysql incl. MariaDB's "Distrib" version, redis-server / redis-cli), one
+  `docker info` only when the CLI exists (daemon answering or not), loopback
+  connects to 5432 / 3306 / 6379 and the common dev ports (never a listen, never
+  a kill), `CREATE_NO_WINDOW` on Windows. `snapshot(wait=)` caches it `TTL` (10
+  min) and refreshes in the background; a request path never waits.
+  `block(snap, who)` = ONE short block: "THIS MACHINE: node 22, npm 10, python
+  3.12, docker: no, PostgreSQL: not installed (port 5432 closed), MySQL, Redis: not
+  installed; busy ports: 3000." + "The app MUST run here with one command. Prefer
+  storage that needs no install (SQLite / a JSON file) unless the user explicitly
+  asked for PostgreSQL/MySQL/Redis; if they did and it is not installed, add an
+  explicit setup phase (planner; a worker / session: say exactly what the user
+  must install), and still provide a working local fallback." `wants_block(text)`
+  = a request to BUILD an app (a server, an API, a store, a platform...; EN/FR/
+  ES/PT/DE words) -- not a static page, a question or a fix.
+- **Where it goes** (flag `planning_env_probe`, default on; `app._dp_env_block`):
+  the Multi planner's system prompt (`swarm_windows.plan_system`, which may wait
+  up to 8 s for the first probe), every worker's prompt (`_Run.env_block`,
+  persisted, refreshed on a resume) and a single session's brief
+  (`craft.system_message`, tool-carrying turns, before the loop). The brief stays
+  under the cost ceiling BY CONSTRUCTION: `craft.BRIEF_CEILING_CHARS` = the
+  0.135 x 32768 x 4 of `test_craft_briefs`, and the block is dropped whenever it
+  would cross it (the heaviest bundle, a saas landing page, has ~44 chars of room
+  and is not an app build anyway). Unregistered source / flag off / not an app
+  build = every prompt byte-identical to before.
+- **The run-end deploy check** (flag `deploy_check_after_run`, default on;
+  `app._dp_run_deploy_check`, injected into EVERY run entry point --
+  conversation start/continue, boot resume, REST, MCP, heartbeat -- through
+  `_multi_check_kwargs()` as `deploy_check=`, re-attached on a resume like the
+  free verdict). In `swarm_windows._walk`, after the phases and the review, for a
+  run whose goal is an app or web build: `_dp_start_and_check` starts the project
+  through the preview (`workspace.start`: the deploy-perfect prep + detect, or the
+  remembered start), waits up to `_dp_deploy_wait` (120 s) for it to run and for
+  an HTTP answer (`workspace._http_probe`: loopback URLs only, no proxy, no
+  redirect followed -- a 3xx is an answer), and returns the URL or the exact
+  error with the last 15 log lines (sanitized). The run's result (`format_result`,
+  i.e. the conversation's reply) ends "Deployed: http://127.0.0.1:<port>" or
+  "Deploy failed: <error>" + its last lines; `run.deploy` is persisted (a check a
+  restart cut reads "interrupted" and runs again on the next walk) and the Build
+  page's helpers panel shows it (`_multi_run_plan` `deploy` ->
+  `deployRow`, words not only colour, "Open" only for a loopback URL). On a
+  failure with the budget left, ONE phase labelled `deploy_fix` ("Fix the app so
+  it starts", the error and log lines as its task, the usual helper rules) is
+  queued, then the check runs once more. `run.deploy_fix_used` is persisted:
+  never a second fix phase in a run -- not after a restart, not after a
+  "continue". `_is_review` skips the trailing fix phase, so the review keeps its
+  role.
+- **The remembered start** (`workspace.remember_start`, after a check passed):
+  `{kind, run_dir (relative), port}` in `state_dir()/preview-starts.json`
+  (`workspace.CANON_PATH` in tests), keyed by the project's realpath. `start()`
+  uses it first: the command is still DERIVED from the files in that folder
+  (`_detect_at`) and only when it yields the same kind; the remembered port is
+  asked for when free (`_preferred_port`, never the hub's). A record whose folder
+  is gone, became a link, leaves the project or yields another kind is dropped
+  (`canonical(..., drop_stale=True)`), and the project is detected as always.
+  So a later Run, or the first start after a restart, starts it the same way --
+  no relying on an adopted, hand-started server.
+
 **Left out on purpose**: the hub still does not PATCH a server to serve a
 separate frontend's build output -- it builds the frontend and, when the server
 is a distinct app, emits a clear note ("serve the build output from the API, or
 run the frontend dev server separately") rather than editing the project's
 source; it provisions no database (a Postgres-only app gets the `createdb`
-instruction, not a spun-up server); and the status route never checks over HTTP
--- the explicit check is `workspace.deploy_check(project_dir)` after a start.
+instruction and the planner is told to use storage that needs no install); a
+remembered start is used on an explicit start only (Run, the turn-end preview,
+the run-end check) -- nothing is started at boot; and the status route never
+checks over HTTP.

@@ -2813,6 +2813,11 @@
   .hp-check.observed_fail{ background:var(--danger-soft); color:var(--danger-text); border-color:var(--danger-border); }
   .hp-check.claimed{ background:var(--warn-soft); color:var(--warn-text); border-color:var(--warn-border); }
   .agent-plan-list li.hp-design{ display:block; padding:2px 0 4px; }
+  .agent-plan-list li.hp-deploy{ display:flex; align-items:center; gap:8px; padding:4px 0; font-size:11.5px; }
+  .hp-deploy-text{ overflow-wrap:anywhere; }
+  .hp-deploy.ok .hp-deploy-text{ color:var(--ok-text); }
+  .hp-deploy.fail .hp-deploy-text{ color:var(--danger-text); }
+  .hp-deploy.busy .hp-deploy-text{ color:var(--text-dim); }
   .hp-design summary{ cursor:pointer; font-size:11.5px; color:var(--text-dim); }
   .hp-design summary:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
   .hp-design-text{ margin:4px 0 0; font-family:var(--mono); font-size:11px; color:var(--text-dim);
@@ -12025,7 +12030,30 @@
       if (helpers){
         if (p.design && p.design.line) list.appendChild(designRow(p.design, p.plan_check));
         items.forEach(function(t){ list.appendChild(helperRow(t, p.now)); });
+        if (p.deploy && p.deploy.line) list.appendChild(deployRow(p.deploy));
         items = [];
+      }
+      /* The run-end deploy check: "Deployed: <url>" (with an Open link to the
+         app on THIS machine) or "Deploy failed: <error>" -- in words, not only
+         colour; the failure's last log lines ride in the tooltip. */
+      function deployRow(d){
+        var li = document.createElement('li');
+        li.className = 'hp-deploy ' + (d.state === 'ok' ? 'ok' : (d.state === 'failed' ? 'fail' : 'busy'));
+        var s = document.createElement('span'); s.className = 'hp-deploy-text';
+        s.textContent = d.line;
+        li.appendChild(s);
+        var url = String(d.url || '');
+        if (d.state === 'ok' && /^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d{2,5}\/?$/.test(url)){
+          var a = document.createElement('a'); a.className = 'hp-open';
+          a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+          a.textContent = 'Open ↗';
+          a.setAttribute('aria-label', 'Open the deployed app in a new window');
+          li.appendChild(a);
+        }
+        if (d.state === 'failed' && d.log_tail && d.log_tail.length){
+          li.title = d.log_tail.join('\n');
+        }
+        return li;
       }
       /* The run's design (components, interfaces, who owns which file) as ONE
          collapsed row above the helpers; the plan's dry-run line inside it. */

@@ -644,11 +644,36 @@ def sizeable_goal(goal):
     return len(g) >= _SIZEABLE_CHARS or len(_ENUM_RE.findall(g)) >= 3
 
 
+# THIS MACHINE (2026-10-10): what is installed here (envprobe, via app.py), so
+# the planner picks storage that needs no install and plans a setup phase when
+# the user asked for a database server that is not here, and every worker
+# builds something that runs HERE with one command. Registered by app.py:
+# fn(goal, who) -> the block, or "" (flag off, not an app build). Unregistered
+# = "" = every prompt exactly as before.
+ENV_BLOCK_CHARS = 700
+_ENV_SOURCE = [None]
+
+
+def set_env_source(fn):
+    _ENV_SOURCE[0] = fn if callable(fn) else None
+
+
+def _env_text(goal, who):
+    fn = _ENV_SOURCE[0]
+    if fn is None:
+        return ""
+    try:
+        out = fn(goal or "", who)
+    except Exception:                                            # noqa: BLE001
+        return ""
+    return _clip_text(out, ENV_BLOCK_CHARS) if isinstance(out, str) else ""
+
+
 def plan_system(goal, managed=False, helpers=None):
     """The planner's system prompt for `goal` ({modes} still unfilled): the
     base prompt with the number of helpers that can run at once, plus the
-    micro-task ask for a sizeable goal and the visual-decision ask for a
-    web/UI goal."""
+    micro-task ask for a sizeable goal, the visual-decision ask for a web/UI
+    goal and the THIS MACHINE block for an app build."""
     try:
         n = int(helpers) if helpers else _concurrency()
     except Exception:                                            # noqa: BLE001
@@ -660,10 +685,11 @@ def plan_system(goal, managed=False, helpers=None):
     try:
         import craft
         if craft.skill_enabled("web_design") and craft.is_web_ui(goal or ""):
-            return base + _WEB_PLAN_ASK
+            base += _WEB_PLAN_ASK
     except Exception:                                            # noqa: BLE001
         pass
-    return base
+    env = _env_text(goal, "planner")
+    return base + ("\n" + env + "\n" if env else "")
 
 
 _PLAN_SYSTEM_MANAGED = _PLAN_SYSTEM.replace(
@@ -696,9 +722,12 @@ def _brief_text(value):
 
 def _is_review(run, agent):
     """The appended "Review and finish" phase (see with_review): the last one,
-    under that exact title."""
-    return (agent.title == REVIEW_TITLE and bool(run.agents)
-            and run.agents[-1] is agent)
+    under that exact title. The run-end deploy check's fix phase comes after
+    it and does not take its place (byte-identical when there is none)."""
+    if agent.title != REVIEW_TITLE or not run.agents:
+        return False
+    core = [a for a in run.agents if getattr(a, "label", None) != DEPLOY_FIX_LABEL]
+    return bool(core) and core[-1] is agent
 
 
 def _extract_json(text):
@@ -915,12 +944,15 @@ class _Agent:
                  "event_total", "evidence", "reviewed", "claimed_unobserved",
                  "receipt", "files", "free_check", "widen", "slop",
                  "parallel", "pair_session", "pair_state", "pair_summary",
-                 "pair_error", "pair_started_at", "pair_ended_at")
+                 "pair_error", "pair_started_at", "pair_ended_at", "label")
 
     def __init__(self, index, phase):
         self.index = index
         self.title = phase["title"]
         self.task = phase["task"]
+        # What added this phase when it is not one the planner wrote: the
+        # run-end deploy check's ONE fix phase is "deploy_fix". None = planned.
+        self.label = phase.get("label") or None
         self.done_when = phase.get("done_when") or ""
         self.needs = list(phase.get("needs") or ())
         self.mode = phase.get("mode") or None
@@ -1014,6 +1046,8 @@ class _Agent:
             "free_check": dict(self.free_check) if isinstance(self.free_check, dict) else None,
             "slop": dict(self.slop) if isinstance(self.slop, dict) else None,
         }
+        if self.label:
+            out["label"] = self.label
         if with_events:
             out["log"] = list(self.events)
         return out
@@ -1033,14 +1067,30 @@ class _Run:
                  "context", "resumes", "default_mode", "design", "plan_check",
                  "free_verdict", "search", "search_saved", "goal_brief",
                  "budget", "spent_fn", "budget_elapsed", "budget_walk_start",
-                 "budget_note", "budget_reached")
+                 "budget_note", "budget_reached", "deploy_check", "deploy",
+                 "deploy_fix_used", "env_block")
 
     def __init__(self, goal, project_dir, cli_id, phases, owner=None,
                  manager=None, modes=(), context="", default_mode=None,
                  design=None, check_report=None, free_verdict=None, search=None,
-                 goal_brief="", budget=None, spent=None):
+                 goal_brief="", budget=None, spent=None, deploy_check=None,
+                 env_block=""):
         self.id = "swarm-" + uuid.uuid4().hex[:12]
         self.goal = goal
+        # THE RUN-END DEPLOY CHECK (2026-10-10; app._dp_run_deploy_check):
+        # `deploy_check(run) -> {ok, url, port, error, log_tail} | None` starts
+        # the finished project through the preview and waits for an HTTP
+        # answer. Injected like the manager, so not persisted. None = no check,
+        # i.e. the run ends exactly as before.
+        self.deploy_check = deploy_check if callable(deploy_check) else None
+        # Its outcome ({state, ok, url, port, error, log_tail, attempts, at,
+        # fix_phase}) -- persisted, so the result survives a restart.
+        self.deploy = None
+        # ONE extra fix phase per run, ever: persisted, so neither a restart
+        # nor a "continue" can earn a second one.
+        self.deploy_fix_used = False
+        # THIS MACHINE block every worker reads (envprobe via app); "" = none.
+        self.env_block = _clip_text(env_block, ENV_BLOCK_CHARS)
         # THE DESIGN the plan carried (plan_check.normalize_design; {} for a
         # small fix): every worker's prompt gets it, so helpers working side
         # by side build to the same interfaces. And the plan's DRY RUN report
@@ -1186,6 +1236,9 @@ class _Run:
             "budget_elapsed": self.budget_active_seconds(),
             "budget_note": self.budget_note,
             "budget_reached": self.budget_reached,
+            "deploy": dict(self.deploy) if isinstance(self.deploy, dict) else None,
+            "deploy_fix_used": bool(self.deploy_fix_used),
+            "env_block": self.env_block or "",
             "error": self.error, "created_at": self.created_at,
             "ended_at": self.ended_at,
             "waves": [list(w) for w in self.waves],
@@ -1208,6 +1261,7 @@ class _Run:
                    "needs": list(a.get("needs") or ()), "mode": a.get("mode"),
                    "files": [str(f) for f in (a.get("files") or ())
                              if isinstance(f, str)][:plan_check.MAX_FILES],
+                   "label": a.get("label") if isinstance(a.get("label"), str) else None,
                    **{k: a.get(k) or "" for k in BRIEF_FIELDS}}
                   for a in (row.get("agents") or ())
                   if isinstance(a, dict)]
@@ -1250,6 +1304,15 @@ class _Run:
             row.get("budget_note"), str) else None
         run.budget_reached = row.get("budget_reached") if isinstance(
             row.get("budget_reached"), str) else None
+        dep = row.get("deploy")
+        if isinstance(dep, dict):
+            dep = dict(dep)
+            if dep.get("state") == "checking":
+                # The hub died during the check: the next walk checks again.
+                dep["state"] = "interrupted"
+            run.deploy = dep
+        run.deploy_fix_used = bool(row.get("deploy_fix_used"))
+        run.env_block = _clip_text(row.get("env_block") or "", ENV_BLOCK_CHARS)
         saved = row.get("search")
         if isinstance(saved, dict) and isinstance(saved.get("log"), list):
             run.search_saved = {"posteriors": saved.get("posteriors") or {},
@@ -1522,6 +1585,11 @@ def _agent_prompt(run, agent):
               # port so a worker knows which python is not its to kill (live
               # 2026-09-27: an agent listed python processes and killed one).
               agent_servers.worker_rules()]
+    # THIS MACHINE (envprobe via app): what is installed here and the storage
+    # rule, so the code a worker writes runs HERE. "" = prompt unchanged.
+    env = getattr(run, "env_block", "")
+    if env:
+        parts += ["", env]
     parts += ["", "Work only on YOUR phase, and do it now -- do not ask for "
                   "confirmation. Finish with a short summary of what you "
                   "changed and anything the other agents need to know.",
@@ -2728,6 +2796,11 @@ def _walk(run, spawn, run_turn, on_done=None, configure=None, stop=None):
         if not run.stop_flag.is_set():
             _run_phases(run, list(range(1, len(run.agents) + 1)), spawn, run_turn,
                         configure, stop)
+        # THE APP RUNS HERE, OR THE RUN SAYS WHY (2026-10-10): with the phases
+        # and the review done, the hub starts the project through the preview
+        # and waits for an HTTP answer (injected check; none = as before).
+        if not run.stop_flag.is_set():
+            _deploy_after_run(run, spawn, run_turn, configure, stop)
         if run.stop_flag.is_set():
             run.state = STOPPED
         elif all(a.state == FAILED for a in run.agents):
@@ -2754,6 +2827,142 @@ def _walk(run, spawn, run_turn, on_done=None, configure=None, stop=None):
                 hook(run)
             except Exception:                                    # noqa: BLE001
                 pass
+
+
+# --------------------------------------------------------------------------- #
+# The run-end deploy check (2026-10-10). MEASURED in the incident behind it:
+# five Multi runs of one conversation each re-did the deployment by hand
+# (create .env, build the frontend, patch the server, start it detached, curl
+# it) and the hub only ever ADOPTED what an agent hand-started -- nothing ever
+# checked, at the end of a run, that the app actually starts. Now the hub does:
+# it starts the project through the preview (deploy-perfect prep + detect), waits
+# for an HTTP answer, and the run's result says "Deployed: <url>" or "Deploy
+# failed: <error, last log lines>". On a failure, with the budget left, ONE fix
+# phase is queued with that error as its task, then the check runs once more.
+# Never a second fix phase in the same run (persisted: not after a restart, not
+# after a "continue").
+# --------------------------------------------------------------------------- #
+
+DEPLOY_FIX_LABEL = "deploy_fix"
+DEPLOY_FIX_TITLE = "Fix the app so it starts"
+DEPLOY_LOG_LINES = 15
+
+
+def _deploy_after_run(run, spawn, run_turn, configure=None, stop=None):
+    check = getattr(run, "deploy_check", None)
+    if not callable(check):
+        return
+    if not any(a.state == DONE for a in run.agents
+               if getattr(a, "label", None) != DEPLOY_FIX_LABEL):
+        return                      # nothing was built: nothing to deploy
+    res = _deploy_attempt(run, check)
+    if res is None or res.get("ok") or run.stop_flag.is_set():
+        return
+    if run.deploy_fix_used:
+        return
+    try:
+        reached = bool(run.budget_status()[0])
+    except Exception:                                            # noqa: BLE001
+        reached = False
+    if reached:
+        return
+    agent = _queue_deploy_fix(run, res)
+    _run_phases(run, [agent.index], spawn, run_turn, configure, stop)
+    if run.stop_flag.is_set() or agent.state == STOPPED:
+        return
+    _deploy_attempt(run, check, fixed_by=agent.index)
+
+
+def _deploy_attempt(run, check, fixed_by=None):
+    """Run the injected check once and record it on the run (persisted).
+    Returns the record, or None when the check says it does not apply."""
+    attempts = int((run.deploy or {}).get("attempts") or 0) + 1
+    run.deploy = {"state": "checking", "ok": None, "attempts": attempts,
+                  "at": time.time()}
+    _persist(run)
+    try:
+        res = check(run)
+    except Exception as exc:                                     # noqa: BLE001
+        res = {"ok": False, "error": "%s: %s" % (exc.__class__.__name__, exc)}
+    if not isinstance(res, dict):
+        run.deploy = None
+        _persist(run)
+        return None
+    ok = bool(res.get("ok"))
+    url = res.get("url") if isinstance(res.get("url"), str) else None
+    rec = {"state": "ok" if ok else "failed", "ok": ok, "url": url,
+           "port": res.get("port") if isinstance(res.get("port"), int) else None,
+           "error": None if ok else (_clip_text(str(res.get("error") or "unknown"), 600)),
+           "log_tail": [] if ok else [_clip_text(str(line), 300) for line in
+                                      (res.get("log_tail") or ())][-DEPLOY_LOG_LINES:],
+           "attempts": attempts, "at": time.time()}
+    if fixed_by:
+        rec["fix_phase"] = fixed_by
+    run.deploy = rec
+    _persist(run)
+    _log.info("[swarm] %s deploy check: %s", run.id, deploy_line(run))
+    return rec
+
+
+def _deploy_fix_task(res):
+    lines = ["THE APP DOES NOT START ON THIS MACHINE. The hub started it the way its "
+             "own start command says, and it failed:",
+             "ERROR: " + str(res.get("error") or "unknown")]
+    tail = [str(x) for x in (res.get("log_tail") or ())][-DEPLOY_LOG_LINES:]
+    if tail:
+        lines += ["LAST LINES OF ITS OUTPUT:"] + ["  " + x for x in tail]
+    lines += ["Find the cause and fix it so the app starts with ONE command and "
+              "answers HTTP on its port: read its start script and the files the "
+              "error names, fix the code or the config, and make it run HERE (a "
+              "service this machine does not have needs the local fallback). If you "
+              "run it to check, start it detached as the server rules say and stop "
+              "it after. The hub starts it again when you are done and reports the "
+              "result."]
+    return "\n".join(lines)
+
+
+def _queue_deploy_fix(run, res):
+    with run.lock:
+        run.deploy_fix_used = True
+        idx = len(run.agents) + 1
+        agent = _Agent(idx, {
+            "title": DEPLOY_FIX_TITLE, "task": _deploy_fix_task(res),
+            "done_when": "the app starts with its own start command and answers HTTP",
+            "needs": [], "mode": run.default_mode, "label": DEPLOY_FIX_LABEL})
+        run.agents.append(agent)
+        run.waves.append([idx])
+    _persist(run)
+    return agent
+
+
+def deploy_view(run):
+    """The deploy line for the Build page's helpers panel, or None."""
+    d = getattr(run, "deploy", None)
+    if not isinstance(d, dict):
+        return None
+    return {"line": deploy_line(run), "state": d.get("state"), "ok": d.get("ok"),
+            "url": d.get("url") if d.get("state") == "ok" else None,
+            "log_tail": list(d.get("log_tail") or ())[-5:]}
+
+
+def deploy_line(run, with_log=False):
+    """"Deployed: <url>" / "Deploy failed: <error>" (+ its last log lines)."""
+    d = getattr(run, "deploy", None)
+    if not isinstance(d, dict):
+        return ""
+    st = d.get("state")
+    if st == "checking":
+        return "Deploy check: starting the app..."
+    if st == "interrupted":
+        return "Deploy check interrupted by a hub restart"
+    after = (" (after fix phase %d)" % d["fix_phase"]) if d.get("fix_phase") else ""
+    if st == "ok":
+        return "Deployed: %s%s" % (d.get("url") or "(running)", after)
+    line = "Deploy failed: %s%s" % (d.get("error") or "unknown", after)
+    tail = [str(x) for x in (d.get("log_tail") or ())]
+    if with_log and tail:
+        line += "\nLast lines of its output:\n" + "\n".join("  " + x for x in tail)
+    return line
 
 
 # Called with the run once it has ended, whatever its state and whoever
@@ -2967,14 +3176,20 @@ def interrupted_runs():
                 if getattr(r, "restored", False) and getattr(r, "interrupted", False)]
 
 
-def _attach_checks(run, free_verdict=None, search=None):
-    """Re-attach the free verifier and the search policy on a resume (neither
-    survives a restart as a callable/object; the search's saved log seeds the
-    new policy). Absent kwargs leave the run as it is."""
+def _attach_checks(run, free_verdict=None, search=None, deploy_check=None):
+    """Re-attach the free verifier, the search policy and the run-end deploy
+    check on a resume (none survives a restart as a callable/object; the
+    search's saved log seeds the new policy). Absent kwargs leave the run as it
+    is. The machine block is refreshed (something may have been installed)."""
     if callable(free_verdict):
         run.free_verdict = free_verdict
     if search and run.search is None:
         run.search = _search_policy(search, run)
+    if callable(deploy_check):
+        run.deploy_check = deploy_check
+    env = _env_text(run.goal, "worker")
+    if env:
+        run.env_block = env
 
 
 def _attach_budget(run, budget=None, spent=None):
@@ -2993,7 +3208,8 @@ def _attach_budget(run, budget=None, spent=None):
 
 def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
                        max_age=RESUME_MAX_AGE, stop=None, manager=None, modes=None,
-                       should_resume=None, free_verdict=None, search=None, spent=None):
+                       should_resume=None, free_verdict=None, search=None, spent=None,
+                       deploy_check=None):
     """Pick up every run the last process left mid-way. Returns their ids.
 
     THE WORK GETS FINISHED. A run whose process died was marked failed and
@@ -3052,7 +3268,7 @@ def resume_interrupted(spawn, run_turn, configure=None, on_done=None,
                 run.manager = manager
             if modes and not run.modes:
                 run.modes = tuple(modes)
-            _attach_checks(run, free_verdict, search)
+            _attach_checks(run, free_verdict, search, deploy_check)
             # The cap rode to disk with the run (budget=None keeps it); only
             # the accountant is re-attached, so a budgeted run picked up after
             # a restart still stops where it should.
@@ -3130,7 +3346,7 @@ def unfinished(run):
 def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
            manager=None, modes=None, context=None, default_mode=None,
            free_verdict=None, search=None, goal_brief=None, budget=None,
-           spent=None):
+           spent=None, deploy_check=None):
     """Pick an ENDED run back up where it stopped. Returns the run id, or None
     when there is nothing to resume.
 
@@ -3183,7 +3399,7 @@ def resume(run_id, spawn, run_turn, configure=None, on_done=None, stop=None,
             run.modes = tuple(modes)
         if default_mode:
             run.default_mode = default_mode
-        _attach_checks(run, free_verdict, search)
+        _attach_checks(run, free_verdict, search, deploy_check)
         _attach_budget(run, budget, spent)
     _persist(run)
     threading.Thread(target=_walk, args=(run, spawn, run_turn, on_done, configure, stop),
@@ -3279,7 +3495,7 @@ def _search_policy(search, run=None):
 def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
           on_done=None, configure=None, modes=(), review=True, owner=None, stop=None,
           manager=None, context="", default_mode=None, free_verdict=None, search=None,
-          goal_brief=None, budget=None, spent=None):
+          goal_brief=None, budget=None, spent=None, deploy_check=None):
     """Begin a run. Returns the run id immediately; the work happens on a
     background thread.
 
@@ -3351,7 +3567,8 @@ def start(goal, project_dir, cli_id, spawn, run_turn, phases=None, planner=None,
                manager=manager, modes=modes, context=context,
                default_mode=default_mode, design=design, check_report=report,
                free_verdict=free_verdict, search=_search_policy(search),
-               goal_brief=gb, budget=budget, spent=spent)
+               goal_brief=gb, budget=budget, spent=spent,
+               deploy_check=deploy_check, env_block=_env_text(goal, "worker"))
     if meter:
         run.manager_tokens, run.manager_calls = meter.tokens, meter.calls
     _remember(run)
@@ -3386,6 +3603,8 @@ def result(run_id):
         "manager_tokens": run.manager_tokens,
         "manager_calls": run.manager_calls,
         "budget": budget_view(run),
+        "deploy": deploy_view(run),
+        "deploy_text": deploy_line(run, with_log=True),
     }
 
 
@@ -3423,6 +3642,10 @@ def format_result(run_id):
         # next time." A run with no budget, or one that finished inside it,
         # adds nothing.
         lines.append(budget["note"])
+    if res.get("deploy_text"):
+        # "Deployed: http://127.0.0.1:<port>" or "Deploy failed: <error>" and
+        # its last log lines. A run with no deploy check adds nothing.
+        lines.append(res["deploy_text"])
     return "\n".join(lines).strip()
 
 

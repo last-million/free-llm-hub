@@ -441,3 +441,29 @@ def _graceful_update_stays_in_the_test(monkeypatch):
     _reset()
     yield
     _reset()
+
+
+_DEPLOY_TEST_FILES = {"test_deploy_perfect", "test_deploy_after_run"}
+
+
+@pytest.fixture(autouse=True)
+def _deploy_features_stay_out(request, monkeypatch, tmp_path):
+    """DEPLOY-PERFECT (2026-10-10). The planning-time machine probe runs real
+    `--version` commands, the run-end deploy check starts a real preview, and
+    a passing check writes the remembered start into the state dir. No test
+    file gets any of that: the probe is off everywhere (its tests pass fakes),
+    the canonical-start store is a per-test temp file, and the run-end check is
+    off except in the deploy test files (which inject their own fakes)."""
+    import envprobe
+    import workspace
+    monkeypatch.setattr(envprobe, "ENABLED", False)
+    monkeypatch.setattr(workspace, "CANON_PATH", str(tmp_path / "preview-starts.json"))
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] not in _DEPLOY_TEST_FILES:
+        try:
+            import app
+        except Exception:                                        # noqa: BLE001
+            yield
+            return
+        monkeypatch.setattr(app, "_dp_run_check_on", lambda: False)
+    yield
