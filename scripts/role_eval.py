@@ -13,6 +13,7 @@ latency, zero-answer rate, invalid tool calls, backups, verifier verdicts and
 corrections.
 """
 import argparse
+import datetime
 import glob
 import json
 import os
@@ -33,6 +34,38 @@ def _default_state_dir():
         return config.state_dir()
     except Exception:                                       # noqa: BLE001
         return os.path.join(os.path.expanduser("~"), ".free-llm-hub")
+
+
+def parse_since(text):
+    """A `--since` value -> a unix timestamp (float), or None. Accepts a unix
+    timestamp, an ISO datetime/date (naive = UTC), or a relative age like
+    `36h` / `7d` / `90m` / `2w` (before now). Returns None (no filtering) on
+    anything unreadable."""
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    try:
+        return float(s)                      # a bare unix timestamp
+    except ValueError:
+        pass
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([mhdw])", s, re.I)
+    if m:
+        n = float(m.group(1))
+        unit = {"m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0}[m.group(2).lower()]
+        return _now_ts() - n * unit
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def _now_ts():
+    return datetime.datetime.now(datetime.timezone.utc).timestamp()
 
 
 def _rotated(path):
@@ -92,7 +125,14 @@ def wasted_of(r):
 
 
 def roles_stats(rows):
-    turns = [r for r in rows if r.get("event", "turn") == "turn" and r.get("turn") == "tool"]
+    # ROLES turns only: a `single: true` row is team notes logged for a
+    # single-model (Normal/Max) turn, not a roles-pipeline turn (no actor, no
+    # verdict, served=None), so counting it would inflate turns and no-answer.
+    # Old rows have no `single` field and are kept.
+    turns = [r for r in rows if r.get("event", "turn") == "turn" and r.get("turn") == "tool"
+             and not r.get("single")]
+    single = [r for r in rows if r.get("event", "turn") == "turn" and r.get("turn") == "tool"
+              and r.get("single")]
     text = [r for r in rows if r.get("event", "turn") == "turn" and r.get("turn") == "text"]
     credits = [r for r in rows if r.get("event") == "credit"]
     n = len(turns)
@@ -112,6 +152,7 @@ def roles_stats(rows):
     wasted = sum(wasted_of(r) for r in turns)
     return {
         "turns": n,
+        "single_team_turns": len(single),           # team notes on single-model turns
         "served": len(served),
         "calls": calls,
         "calls_per_turn": round(calls / n, 2) if n else None,
@@ -177,6 +218,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--log", help="hub.log (default: the state dir's, with rotations)")
     ap.add_argument("--roles", help="turn-roles.jsonl (default: the state dir's)")
+    ap.add_argument("--since", help="only roles rows at/after this time: a unix "
+                    "timestamp, an ISO datetime/date (UTC), or a relative age "
+                    "(36h, 7d, 90m, 2w). Rows with no ts are dropped when set.")
     ap.add_argument("--json", action="store_true", help="print JSON")
     args = ap.parse_args(argv)
     state = None
@@ -184,8 +228,15 @@ def main(argv=None):
         state = _default_state_dir()
     log_paths = _rotated(args.log or os.path.join(state, "hub.log"))
     role_paths = _rotated(args.roles or os.path.join(state, "turn-roles.jsonl"))
+    rows = _read_rows(role_paths)
+    since = parse_since(args.since)
+    if since is not None:
+        # Only rows timestamped at/after the cutoff (old rows that predate the
+        # `ts` field cannot be placed in time, so they are dropped here).
+        rows = [r for r in rows if isinstance(r.get("ts"), (int, float)) and r["ts"] >= since]
     out = {"race": race_stats(_read_lines(log_paths)),
-           "roles": roles_stats(_read_rows(role_paths)),
+           "roles": roles_stats(rows),
+           "since": since,
            "sources": {"log": log_paths, "roles": role_paths}}
     if args.json:
         print(json.dumps(out, indent=2))
@@ -195,10 +246,15 @@ def main(argv=None):
         for k, v in out[name].items():
             print("  %-28s %s" % (k, v))
     r = out["roles"]
+    if since is not None:
+        print("since: %s" % datetime.datetime.fromtimestamp(
+            since, datetime.timezone.utc).isoformat())
     if r.get("turns"):
-        print("summary: %s calls/turn, %s%% of calls wasted (%s of %s)" % (
-            r.get("calls_per_turn"), r.get("wasted_calls_pct"),
-            r.get("wasted_calls"), r.get("calls")))
+        # The five numbers the owner compares before/after a change.
+        print("summary: %s roles turns, %s no-answer rate, %s calls/turn, "
+              "%s%% calls wasted, %s verifier usable rate" % (
+                  r.get("turns"), r.get("zero_answer_rate"), r.get("calls_per_turn"),
+                  r.get("wasted_calls_pct"), r.get("verifier_usable_rate")))
     print("sources: %d log file(s), %d roles file(s)" % (len(log_paths), len(role_paths)))
     return out
 

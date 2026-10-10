@@ -3698,3 +3698,93 @@ each re-attach via `_cm_map_put`); in-process liveness uses `_multi_run_for`
 The exact overall caps for codex/claude/kimi are not firmly verified from their
 compiled binaries, so their safe end is the conservative 240 s rather than a tuned
 value.
+
+## Roles: fewer turns with no answer (2026-10-10)
+
+Owner: "crew / swarm roles is shitty: some don't answer." MEASURED by me via
+`scripts/role_eval.py --since 2026-10-08T05:30` over turn-roles.jsonl (2026-10-08
+05:30 UTC -> 2026-10-10): **334 roles turns, 0.141 no-answer rate, 2.03
+calls/turn, 23.4% of calls wasted, 0.589 verifier usable rate** (the 82
+`single:true` team-notes rows of Normal/Max turns are NOT roles turns and are
+now excluded from the roles stats). Of the failed actor hops: `no answer in
+time` 36 (nvidia z-ai/glm-5.3 15, moonshotai/kimi-k3 12, deepseek-v4.1-flash 3,
+glm-5.3-flash 4), `window too small for ~N tokens` ~45 (uncloseai Qwen3.8-27B
+65K, groq qwen3.8 8K cap, nvidia palmyra-med-70b-32k), `RequestException: tool
+schema alone (...) exceeds ...` 6 (groq qwen3.8), HTTP 400 13 (uncloseai
+Qwen3.8-27B 12 -- the system-message 400, learned per boot by `[system-first]`;
+glm/glm-4.5-flash 1), HTTP 404 6 (six niche nvidia ids, each once). Verifier:
+123 runs, 50 no-verdict (41%), of which 28 unparsed and ~22 timeouts on
+default-THINKING models -- the one usable verifier was
+nvidia/.../ising-calibration-1.5-31b (69/81), while kimi-k3 0/6,
+deepseek-v4.1-flash 0/6, glm-5.3-flash 0/3 burned the whole `_VERIFY_DEADLINE`.
+Covered by `tests/test_roles_reliability.py` (hermetic: fake fleets/clock/
+upstream, no network). All new app.py names are `_rr_`. Each change is
+flag-gated and byte-identical to before when its flag is off or it does not
+apply (the request does not clear, no request clock, etc.).
+
+- **Fix #1 -- every fit decision is sized on what the hop will SEND**
+  (`_rr_compute_sent_est` / `_rr_set_request_fit` / `_rr_fit`, flag
+  `rr_fit_on_cleared`, default on). The post-clear estimate is computed with the
+  SAME deterministic path as `_clear_old_results_for_hop` (same flag
+  `old_tool_result_clearing`, same `ctxwin.OLD_RESULT_CLEAR_FROM_TOKENS`, same
+  `ctxwin.clear_old_tool_results`, same `_est_tokens`), stashed once per request
+  on `g.rr_sent_est` by the three `/v1` handlers (and the roles run), and used
+  for: the roles actor skip, the `_route_by_difficulty` pin-drop + fresh-pick
+  roomy filter, `_ChainClock._roomy_first`, `_quality_fallback_pick`, the front
+  door (`_front_door_overflow` refuses only when even the CLEARED size cannot
+  fit), `_ctx_others_cannot_serve`'s `need`, and the long-context band
+  (`_prefer_fast_long_context`'s threshold). WHY those two choices: the
+  long-context band decides hop ORDERING by the work a hop actually does, so it
+  reads the SENT size; the **scaled request deadline keeps the ORIGINAL est** --
+  it is a time CEILING, a larger value only grants more time (never used up once
+  the body is cleared), and sizing it on the smaller cleared estimate could cut
+  a genuinely slow-but-healthy hop. **Reported usage to the CLI stays on the
+  ORIGINAL est** (the `_reported_prompt_tokens` contract; `_rr_fit` is never in
+  that path). The overflow/compaction signal is unaffected: clearing shrinks a
+  message's CONTENT, it never drops a unit, so it is never counted as "dropped
+  history" (and `_compact_to_budget` still sizes the stubs but reads the
+  originals for the recap/facts). `_rr_fit` caps at the caller's est and falls
+  back to it, so a missing app context (the tests) or a mismatched est is safe.
+- **Fix #2 -- a hop the hub already knows it cannot make never spends an actor
+  hop** (`_rr_prefilter_skip`, flag `rr_prefilter_hops`, default on). In the
+  roles walk, BEFORE dispatch: a model that is dead / not offered
+  (`_is_model_skipped`) or whose tool schema alone exceeds its window
+  (`_rr_tools_exceed`, the same test `_upstream_chat` makes before it raises) is
+  skipped with NO call -- no actor hop, no attempt, no `wasted_call`
+  (`actor_calls` is not incremented), no provider failure. A roles hop that
+  comes back 404 (or a 400 naming the model missing) is remembered with the
+  EXISTING dead-model machinery (`_rr_remember_dead_model` ->
+  `_mark_model_dead`/`_maybe_mark_missing_model`, 6 h then re-probe) so the
+  prefilter and `_build_chain` stop picking it next turn.
+- **Fix #3 -- the `best` fallback gets time** (`_rr_roles_turn_end`, flag
+  `rr_reserve_fallback`, default on). The roles stage stops at the stage
+  deadline capped by the request clock MINUS a reserved slice
+  (`_RR_FALLBACK_FRAC` 0.30, clamped 60..120 s), so the single-model `best`
+  fallback (which shares this request's clock after roles returns None) can
+  serve one strong model on the already-cleared context. The reserve is skipped
+  when there is no request clock or it would leave the roles stage under
+  `_RR_ROLES_MIN` (60 s). Checked with the numbers: a big STREAMED turn
+  (request clock capped at `LONG_DEADLINE_STREAM_MAX` 285 s) gives roles 180 s
+  and ~105 s to the fallback; a big NON-stream turn (scaled deadline ~330 s)
+  now gives roles 231 s and 99 s to the fallback instead of 330/0.
+- **Fix #4 -- a verifier that never answers is not a second opinion**
+  (`_rr_verifier_worth` / `_rr_verifier_pool`, flag `rr_verifier_prefilter`,
+  default on, under the `turn_verifier` kill switch; keeps W's
+  `_verifier_unusable` pool filter). After `_rank_verifier_pool`, a candidate
+  that is a default-thinker / measured-slow model with NO usable-verdict record
+  (`_verifier_rate` at/under its Beta(1,1) prior) is dropped -- it reliably
+  times out on the 25 s `_VERIFY_DEADLINE`; a thinker WITH a real usable record
+  is kept. When NONE is worth a call the verifier is SKIPPED (ship the original,
+  `verdict = "skipped: no usable verifier"`) instead of burning a call + the
+  deadline. Read-only steps already skip the verifier (`verify.is_risky`), so
+  that case is untouched. Left out on purpose: shortening the digest for big
+  turns (verify.py is another concern's module, and the data shows the failures
+  were thinking models that time out regardless of input size -- the prefilter
+  removes them).
+- **Fix #5 -- `scripts/role_eval.py --since`** prints, for a time cutoff (a unix
+  timestamp, an ISO datetime/date in UTC, or a relative age like `36h`/`7d`/
+  `2w`), the five numbers the owner compares before/after: roles turns,
+  no-answer rate, calls/turn, wasted %, verifier usable rate. Rows that predate
+  the `ts` field are dropped when `--since` is set; `single:true` team-notes
+  rows are counted separately (`single_team_turns`) and excluded from the roles
+  stats. Old rows (no new fields) still parse.

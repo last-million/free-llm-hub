@@ -3855,7 +3855,7 @@ def _prefer_fast_long_context(chain, est, keep_head=0):
     `keep_head` entries (a pinned model) never move. Below the threshold, or
     with no long-context measurements at all, the chain is returned as is."""
     try:
-        if int(est or 0) < LONG_CTX_SPEED_TOKENS or not chain:
+        if int(_rr_fit(est) or 0) < LONG_CTX_SPEED_TOKENS or not chain:
             return chain
         head, rest = list(chain[:keep_head]), list(chain[keep_head:])
         bands = [_long_ctx_band(e[0], e[1]) for e in rest]
@@ -9202,12 +9202,13 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # session re-picked among the candidates that can (fail-open: when none
         # can, the pool is left as it is and the front door / the overflow
         # reply take over).
-        if _pinned and not _window_fits(_pinned[0], _pinned[1], est):
+        _fe = _rr_fit(est)      # the post-clear size a hop will send (fix #1)
+        if _pinned and not _window_fits(_pinned[0], _pinned[1], _fe):
             _session_pin_drop(_skey)
-            _roomy = [c for c in agentic if _window_fits(c[1], c[2], est)]
+            _roomy = [c for c in agentic if _window_fits(c[1], c[2], _fe)]
             _log.info("[spread] %s pin %s/%s dropped: its known window cannot hold "
                       "~%d tokens (%d of %d candidates can)", (_skey or "-")[:8],
-                      _pinned[0], _pinned[1], est, len(_roomy), len(agentic))
+                      _pinned[0], _pinned[1], _fe, len(_roomy), len(agentic))
             if _roomy:
                 agentic = _roomy
             _pinned = None
@@ -9318,7 +9319,8 @@ def _route_by_difficulty(messages, max_tokens=None, est=None, require_tools=Fals
         # model on a modestly trimmed context (see the compactable re-admission
         # above) keeps its place. Fail-open: nothing roomier = the pool as is.
         _roomy = [c for c in _pool
-                  if _window_fits(c[1], c[2], int(est * (1.0 - _CTX_OVERFLOW_DROP_FRAC)))]
+                  if _window_fits(c[1], c[2],
+                                  int(_rr_fit(est) * (1.0 - _CTX_OVERFLOW_DROP_FRAC)))]
         if _roomy:
             _pool = _roomy
         # SPREAD ACROSS CONCURRENT SESSIONS. This is the moment a session
@@ -12807,7 +12809,7 @@ def _ctx_others_cannot_serve(tried, ov):
         others = [t for t in tried if tuple(t) not in over]
         if not over or not others:
             return None
-        need = int(int(_ctx_g("_ctx_orig_est") or 0) * 1.15) + 512
+        need = int(int(_rr_fit(_ctx_g("_ctx_orig_est") or 0)) * 1.15) + 512
         results = _ctx_g("_ctx_results")
         results = results if isinstance(results, dict) else {}
         why = []
@@ -13029,14 +13031,18 @@ def _front_door_overflow(kind, messages, tools, est, stream=False, model_label="
         if ctxwin.is_compaction_request(messages):
             return None
         bound, n = _front_door_bound(bool(tools), images)
-        if n <= 0 or bound <= 0 or est * 100 <= bound * _FRONT_DOOR_SLACK_PCT:
+        # Fix #1: refuse only when even the post-clear size a hop would SEND
+        # cannot fit the largest window (per-hop clearing shrinks the request).
+        fit = _rr_compute_sent_est(messages, tools, est)
+        if n <= 0 or bound <= 0 or fit * 100 <= bound * _FRONT_DOOR_SLACK_PCT:
             return None
         fixed = _ctx_fixed_part_est(messages, {"tools": tools})
         if _ctx_compaction_futile(fixed, bound):
             return None          # compacting cannot help: the capacity reply applies
-        _log.info("[ctx] %s request of ~%d tokens exceeds 1.15x the largest window any "
-                  "alive model could hold (%d, %d candidates): answering with the "
-                  "native context-length error before any hop", kind, est, bound, n)
+        _log.info("[ctx] %s request of ~%d tokens (~%d after clearing) exceeds 1.15x the "
+                  "largest window any alive model could hold (%d, %d candidates): answering "
+                  "with the native context-length error before any hop",
+                  kind, est, fit, bound, n)
         return _native_overflow_reply(kind, stream, est, bound, model_label,
                                       {"X-Free-LLM-Hub-Last-Error": "context"})
     except Exception:                                            # noqa: BLE001
@@ -13848,6 +13854,221 @@ def _clear_old_results_for_hop(msgs, tools):
     except Exception:                                            # noqa: BLE001
         _log.debug("[ctx] old-result clearing failed", exc_info=True)
         return msgs, None
+
+
+# =========================================================================== #
+# Roles reliability (2026-10-10): fewer tool turns with no answer.
+#
+# MEASURED (turn-roles.jsonl, 2026-10-08 05:30 UTC -> 2026-10-10): 323 roles
+# turns, 47 (15%) with no answer; of the failed actor hops, ~45 were "window
+# too small for ~N tokens" and 6 "tool schema alone exceeds ...". BUT per-hop
+# clearing (_clear_old_results_for_hop) sends far less than the ORIGINAL est --
+# hub.log `[ctx] cleared 53 old tool results (178918 -> 65517 est tokens)` --
+# so those fit decisions rejected models that would actually have fit the SENT
+# size. These helpers size every FIT decision on what the hop will send, skip
+# hops the hub already knows cannot serve WITHOUT spending an actor hop, and
+# reserve a slice of the request clock for the `best` fallback.
+#
+# Every name here starts with `_rr_` (two other sessions edit app.py). Each
+# piece is flag-gated and falls back to today's behaviour (the ORIGINAL est)
+# whenever its flag is off, the request is under the clearing threshold, or
+# anything is unknown -- so a request that does not clear is byte-identical.
+# =========================================================================== #
+
+def _rr_fit_on():
+    """Flag `rr_fit_on_cleared` (default on): size fit/window/route decisions
+    on the post-clear estimate. Off = the ORIGINAL est everywhere, as before."""
+    try:
+        return bool(config.get_flag("rr_fit_on_cleared", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _rr_compute_sent_est(messages, tools, orig_est):
+    """The post-clear estimate = the tokens a hop will actually SEND, using the
+    SAME deterministic path as _clear_old_results_for_hop (same flag, same
+    threshold ctxwin.OLD_RESULT_CLEAR_FROM_TOKENS, same ctxwin.clear_old_tool_results,
+    same _est_tokens). Always <= orig_est; == orig_est when clearing does not
+    apply (flag off, request under the threshold, nothing old enough, error).
+    Never raises."""
+    try:
+        orig = int(orig_est or 0)
+        if not _rr_fit_on():
+            return orig
+        if not isinstance(messages, list) or not config.get_flag(
+                "old_tool_result_clearing", True):
+            return orig
+        if orig < ctxwin.OLD_RESULT_CLEAR_FROM_TOKENS:
+            return orig
+        out, st = ctxwin.clear_old_tool_results(messages, est_tokens=orig)
+        if out is messages or not st.get("cleared"):
+            return orig
+        return min(orig, _est_tokens(out, tools))
+    except Exception:                                            # noqa: BLE001
+        return int(orig_est or 0)
+
+
+def _rr_set_request_fit(messages, tools, orig_est):
+    """Compute the per-request post-clear estimate ONCE and stash it on g so
+    the window/route decisions that only receive `est` (routing's roomy filter,
+    _ChainClock._roomy_first, the quality fallback, the long-context band) can
+    read it through _rr_fit. Returns it. Never raises (a missing app context
+    just means _rr_fit falls back to the original est)."""
+    sent = _rr_compute_sent_est(messages, tools, orig_est)
+    try:
+        g.rr_sent_est = sent
+    except Exception:                                            # noqa: BLE001
+        pass
+    return sent
+
+
+def _rr_fit(orig_est):
+    """The estimate a FIT decision should use: the per-request post-clear size
+    (set by _rr_set_request_fit) when it is known and not larger than `orig_est`,
+    else `orig_est`. The <= guard means a caller passing a different est than the
+    request's is never given an inflated or mismatched number. Reported usage to
+    the CLI never uses this (the _reported_prompt_tokens contract keeps the
+    ORIGINAL size -- CLIs compact on it). Never raises."""
+    try:
+        orig = int(orig_est or 0)
+        if not _rr_fit_on():
+            return orig
+        s = getattr(g, "rr_sent_est", None)
+        if isinstance(s, int) and 0 < s <= orig:
+            return s
+        return orig
+    except Exception:                                            # noqa: BLE001
+        return int(orig_est or 0)
+
+
+def _rr_tools_exceed(pid, model, tools):
+    """True when the TOOL SCHEMA ALONE cannot fit this model's window -- the
+    same test _upstream_chat makes before it raises, so the roles walk can skip
+    the hop instead of paying for the round trip and the RequestException it
+    would raise (MEASURED: groq/qwen3.8-27b, 8K cap, 6 wasted hops). Fails open
+    (False) on anything unknown. Never raises."""
+    try:
+        if not isinstance(tools, list) or not tools:
+            return False
+        return _tools_exceed_budget({"tools": tools}, _model_ctx_budget(pid, model))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _rr_prefilter_skip(pid, model, tools):
+    """A reason the hub ALREADY KNOWS this hop cannot serve, so the roles walk
+    skips it WITHOUT spending an actor hop / attempt / wasted_call / provider
+    failure: the model is dead or not offered (e.g. a 404 model-not-found
+    remembered last turn), or the tool schema alone exceeds its window. None =
+    dispatch it. Flag `rr_prefilter_hops` (default on); off = None (dispatch,
+    as before). Never raises."""
+    try:
+        if not config.get_flag("rr_prefilter_hops", True):
+            return None
+        if _is_model_skipped(pid, model):
+            return "model dead or not offered"
+        if _rr_tools_exceed(pid, model, tools):
+            return "tool schema exceeds this model's window"
+        return None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _rr_remember_dead_model(pid, model, resp):
+    """A roles hop that came back 404 (or a 400 body that names the model as
+    missing): sideline it with the EXISTING dead-model machinery
+    (_mark_model_dead / _maybe_mark_missing_model, 6 h then re-probe) so the
+    walk's _rr_prefilter_skip and _build_chain stop picking it next turn
+    (MEASURED: six niche nvidia ids 404'd once each, every turn). Flag
+    `rr_prefilter_hops`. Never raises."""
+    try:
+        if not config.get_flag("rr_prefilter_hops", True):
+            return
+        if getattr(resp, "status_code", None) == 404:
+            _mark_model_dead(pid, model, 404)
+        else:
+            _maybe_mark_missing_model(pid, model, resp)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+# -- fix #3: reserve a slice of the request clock for the `best` fallback ----- #
+# MEASURED: no-answer roles turns ran to the stage deadline (p50 180 s) and, for
+# a big non-streamed turn, the SCALED request deadline can equal the stage
+# budget, so roles consumed the whole clock and the single-model `best` fallback
+# (which shares it) had nothing left. Reserve a slice so the fallback can serve
+# one strong model on the already-cleared (smaller) context.
+_RR_FALLBACK_MIN = 60.0          # seconds the fallback always keeps, when room allows
+_RR_FALLBACK_MAX = 120.0
+_RR_FALLBACK_FRAC = 0.30         # of the request clock
+_RR_ROLES_MIN = 60.0             # never cut the roles stage below this
+
+
+def _rr_roles_turn_end(started, stage_deadline, deadline_at):
+    """When the roles stage must stop: the stage deadline, capped by the request
+    clock MINUS a reserved fallback slice. The reserve is skipped when there is
+    no request clock (deadline_at is None -- e.g. the tests) or it would starve
+    the roles stage below _RR_ROLES_MIN. Flag `rr_reserve_fallback` (default on);
+    off = stage deadline capped by the request clock exactly as before. Pure and
+    testable; never raises."""
+    try:
+        end = started + float(stage_deadline)
+        if deadline_at is None:
+            return end
+        end = min(end, deadline_at)
+        if not config.get_flag("rr_reserve_fallback", True):
+            return end
+        room = deadline_at - started
+        if room <= 0:
+            return end
+        reserve = min(_RR_FALLBACK_MAX, max(_RR_FALLBACK_MIN, room * _RR_FALLBACK_FRAC))
+        cut = deadline_at - reserve
+        if cut - started >= _RR_ROLES_MIN:
+            end = min(end, cut)
+        return end
+    except Exception:                                            # noqa: BLE001
+        return started + float(stage_deadline)
+
+
+# -- fix #4: a verifier that never answers is not a second opinion ----------- #
+# MEASURED (same window): 123 verifier runs, 50 "no verdict (fail-open)" (41%);
+# the usable verifier was nvidia/.../ising-calibration-1.5-31b (69/81 usable),
+# while default-THINKING models burned the whole _VERIFY_DEADLINE and returned
+# nothing (kimi-k3 0/6, deepseek-v4.1-flash 0/6, glm-5.3-flash 0/3). So a
+# default-thinker / measured-slow candidate is worth a verifier call only once
+# it has actually produced usable verdicts here; otherwise it is dropped, and
+# when NONE is worth a call the verifier is skipped (ship the original, no call).
+
+def _rr_verifier_worth(pid, model):
+    """A verifier candidate worth paying a call for: any model that is NOT a
+    default-thinker and NOT measured-slow, OR one with a real usable-verdict
+    record (_verifier_rate above its Beta(1,1) prior of 0.5). A fresh thinking
+    model reliably times out on the _VERIFY_DEADLINE, so it is not tried. Never
+    raises (True on error -- keep today's behaviour)."""
+    try:
+        slow = False
+        try:
+            slow = bool(_thinks_by_default(pid, model)) or bool(_is_slow_model(pid, model))
+        except Exception:                                        # noqa: BLE001
+            slow = False
+        if not slow:
+            return True
+        return _verifier_rate(pid, model) > 0.5 + 1e-9
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _rr_verifier_pool(pool):
+    """`pool` (already W-filtered + ranked by _rank_verifier_pool) with the
+    candidates not worth a call dropped (keeping order), or [] when NONE is
+    worth it -- the caller then skips the verifier. Flag `rr_verifier_prefilter`
+    (default on); off = the pool unchanged. Never raises."""
+    try:
+        if not config.get_flag("rr_verifier_prefilter", True):
+            return list(pool or ())
+        return [e for e in (pool or ()) if _rr_verifier_worth(e[0], e[1])]
+    except Exception:                                            # noqa: BLE001
+        return list(pool or ())
 
 
 def _compact_to_budget(messages, tools, budget, summarizer=None, reserve=0, stats=None,
@@ -31856,8 +32077,10 @@ def _quality_fallback_pick(entries, tools=False, stalled=(), est=0):
 
         # A pick that cannot hold the request is dropped outright (not fail-open
         # like the preference filters below): handing it the turn only overflows.
+        # Sized on the post-clear size a hop will send (fix #1).
         if est:
-            pool = [c for c in pool if _window_fits(c[1], c[2], est)]
+            _fe = _rr_fit(est)
+            pool = [c for c in pool if _window_fits(c[1], c[2], _fe)]
             if not pool:
                 return []
         # The chain now ends with hops from OUTSIDE a category mode (see
@@ -32066,7 +32289,7 @@ class _ChainClock:
             if not self.est:
                 return list(entries)
             keep = 1 if (self.pinned and entries) else 0
-            need = int(self.est * (1.0 - _CTX_OVERFLOW_DROP_FRAC))
+            need = int(_rr_fit(self.est) * (1.0 - _CTX_OVERFLOW_DROP_FRAC))
             head, tail = list(entries[:keep]), list(entries[keep:])
             fits = [e for e in tail if _window_fits(e[0], e[1], need)]
             if len(fits) == len(tail):
@@ -38269,6 +38492,7 @@ def _role_judge(pid, model, resp, exc, body, payload, est, kind):
             if resp.status_code != 200:
                 _record_outcome(pid, model, False)
                 _swarm_note_member_status(pid, model, resp.status_code)
+                _rr_remember_dead_model(pid, model, resp)   # fix #2: 404 -> not tried again
                 return fail("http", "HTTP %d" % resp.status_code)
             data = resp.json() or {}
         except (ValueError, AttributeError):
@@ -38743,12 +38967,23 @@ def _role_verify_and_correct(body, messages, producer, msg, chain, kind, difficu
             return None
         ppid, pmodel = producer
         pool = _rank_verifier_pool(_role_candidates(chain, producer, failed, kind))
+        # Fix #4: drop verifier candidates not worth a call (a default-thinker /
+        # measured-slow model with no usable-verdict record reliably times out on
+        # the _VERIFY_DEADLINE). [] = none worth it -> skip the verifier below.
+        pool = _rr_verifier_pool(pool)
         # Run the independent verifier unless the ONLY reason we are here is web
         # slop (then the HIGH findings alone drive the corrector -- no model
         # call spent on a verdict we would override anyway).
         run_verifier = risky or weak
         verdict = None
         if run_verifier:
+            if not pool and not slop:
+                # No candidate is worth a verifier call: ship the original
+                # (fail-open) instead of burning a call + _VERIFY_DEADLINE.
+                rec["verdict"] = "skipped: no usable verifier"
+                rows.append({"role": "verifier: skipped (no usable verifier)",
+                             "model": None})
+                return None
             try:
                 pick = v.pick_verifier((ppid, pmodel), pool)
             except Exception:                                    # noqa: BLE001
@@ -39632,6 +39867,11 @@ def _tool_turn_roles(body):
 
 
 def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, started):
+    # Fix #1: size every window/fit decision on what a hop will SEND (the
+    # post-clear estimate), not the ORIGINAL est -- per-hop clearing often more
+    # than halves a big tool turn. Stash it for routing's roomy filter and the
+    # clock (_rr_fit) and keep it locally for the walk's window check below.
+    fit_est = _rr_set_request_fit(messages, tools, est)
     pid, resolved, _d = _route_by_difficulty(messages, body.get("max_tokens"), est,
                                              require_tools=True,
                                              force_difficulty="hard")
@@ -39650,10 +39890,12 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
     # _SWARM_TOOL_STREAM_DEADLINE); the clock below also starts the REQUEST
     # clock, so a fallback after an empty turn shares it.
     clock = _ChainClock(tools=True, est=est, stream=stream)
-    turn_end = started + float(_SWARM_TOOL_STREAM_DEADLINE if stream
-                               else _SWARM_TOOL_HOP_DEADLINE)
-    if clock.deadline_at is not None:
-        turn_end = min(turn_end, clock.deadline_at)
+    # Fix #3: stop the roles stage early enough that the `best` fallback (which
+    # shares this request's clock when roles returns None) still has time to
+    # serve one strong model on the already-cleared context.
+    turn_end = _rr_roles_turn_end(
+        started, _SWARM_TOOL_STREAM_DEADLINE if stream else _SWARM_TOOL_HOP_DEADLINE,
+        clock.deadline_at)
     # Pairs resting after 3 empty/junk 200s go to the TAIL (kept, never dropped).
     chain = ([e for e in chain if not _resting_for_walk(e[0], e[1])]
              + [e for e in chain if _resting_for_walk(e[0], e[1])])
@@ -39667,16 +39909,26 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
             break
         if clock.consumed(hop_pid, hop_model):
             continue                    # the backup already ran it
-        if not _window_fits(hop_pid, hop_model, est):
-            # Its KNOWN window cannot hold this request: dispatching to it only
-            # burns an actor hop on a _ContextOverflow (MEASURED 2026-10-07:
-            # groq/qwen3.8-27b, ~8K TPM, on a 79K turn). Skip it WITHOUT
-            # spending a hop; when nothing left fits the walk ends fast and the
-            # caller falls back to `best`, which emits the native overflow reply.
+        _skip = _rr_prefilter_skip(hop_pid, hop_model, tools)
+        if _skip:
+            # Fix #2: a hop the hub ALREADY KNOWS cannot serve (model dead / not
+            # offered / a 404 remembered last turn, or the tool schema alone over
+            # the window) is skipped WITHOUT a call -- no actor hop, no attempt,
+            # no wasted_call, no provider failure.
+            rows.append({"role": "actor: skipped (%s)" % _skip,
+                         "model": "%s/%s" % (hop_pid, hop_model)})
+            rec["failed"].append({"pair": "%s/%s" % (hop_pid, hop_model), "why": _skip})
+            continue
+        if not _window_fits(hop_pid, hop_model, fit_est):
+            # Its KNOWN window cannot hold the SENT (post-clear) size: dispatching
+            # only burns an actor hop on a _ContextOverflow (MEASURED 2026-10-07:
+            # groq/qwen3.8-27b, ~8K TPM). Skip it WITHOUT spending a hop; when
+            # nothing left fits the walk ends fast and the caller falls back to
+            # `best`, which emits the native overflow reply.
             rows.append({"role": "actor: skipped (window too small)",
                          "model": "%s/%s" % (hop_pid, hop_model)})
             rec["failed"].append({"pair": "%s/%s" % (hop_pid, hop_model),
-                                  "why": "window too small for ~%d tokens" % est})
+                                  "why": "window too small for ~%d tokens" % fit_est})
             continue
         if hops >= _ROLE_MAX_ACTOR_HOPS or time.monotonic() >= turn_end - 1.0:
             break
@@ -41879,6 +42131,7 @@ def _chat_completions_uncached(body):
     # /v1/completions share this router but have no native overflow contract.
     _armed = _request_path_endswith("/v1/chat/completions")
     _est0 = _est_tokens(body.get("messages"), body.get("tools"))
+    _rr_set_request_fit(body.get("messages"), body.get("tools"), _est0)   # fix #1
     # signal=False: this early call only sets up the original size and the
     # steering state; arming the overflow signal here would change how a
     # pipeline actor hop is served (the later _ctx_begin arms the single-model
@@ -43064,6 +43317,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
     # count toward routing so a big request doesn't land on a small-TPM provider).
     tools = _responses_tools_to_chat(body.get("tools"))
     est = _est_tokens(messages, tools)
+    _rr_set_request_fit(messages, tools, est)   # fix #1: fit on the post-clear size
 
     # Same routing as /v1/chat/completions: Auto/empty/claude-* -> difficulty
     # route across available, SIZE-CAPABLE providers; explicit '<pid>/<model>' bypasses.
@@ -44137,6 +44391,7 @@ def v1_messages():
     # by difficulty AND request size (skip small-TPM providers for large requests).
     tools = _anthropic_tools_to_openai(body.get("tools"))
     est = _est_tokens(oai_messages, tools)
+    _rr_set_request_fit(oai_messages, tools, est)   # fix #1: fit on the post-clear size
     has_tools = bool(tools)
     diff = None
     _orch_reply = _orch_command_response("messages", body, oai_messages, est)

@@ -832,7 +832,12 @@ def test_a_codex_shaped_500k_history_is_refused_at_the_door(codex_session):
     world.fleet([("nvidia", "fake-glm-250k", 250000), ("kilocode", "fake-qwen-262k", 262144),
                  H_SMALL + (65536,), H_RELAY + (None,)])
     world.set_chain([H_RELAY, H_SMALL])
-    items = _codex_items(500000)
+    # The front door now sizes on what a hop will SEND, after the hub clears old
+    # tool results (fix #1, 2026-10-10): refuse only when even the CLEARED size
+    # cannot fit. So the oversized bulk here is the LATEST message, which
+    # clearing never touches -- a conversation that is genuinely too big for any
+    # model even after clearing is still refused.
+    items = _codex_items(0, tail="x " * 1_000_000)
     assert A._est_tokens(A._responses_to_chat({"input": items, "instructions": "x"})) > 460000
     for stream in (True, False):
         r = A.app.test_client().post("/build/%s/v1/responses" % SID,
