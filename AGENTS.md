@@ -4107,13 +4107,15 @@ project folder:
 install/build/env work a multi-part app needs before its single start command,
 and surfaces WHY an app is or is not running.
 
-- **`deploy_perfect.py`** (pure, stdlib only, never raises; every filesystem /
-  clock side is an injected callable with an `os`/`time` default):
+- **`deploy_perfect.py`** (stdlib only, never raises, starts no process;
+  `realpath` / `is_link_fn`, the HTTP probe and the clock are injectable):
   - `analyze(project_dir)` -> a plan: `layout` (single | monorepo | workspaces |
-    compose), the `server_dir`/`server_kind` to launch, the EXTRA `steps` beyond
-    the root install (each sub-app's `npm-install` / python `venv`+`pip-install`,
-    then each unbuilt frontend's `npm-build`, as abstract records the caller
-    turns into argv), `frontends`, whether the server likely `serves_frontend`,
+    compose), the `server_dir`/`server_kind` to launch, the EXTRA `steps` after
+    the root install (a DECLARED sub-project's install with lifecycle scripts
+    off, then each unbuilt frontend's build: `{kind, pm, dir, label, timeout}`
+    records the caller turns into argv via `pm_args`; the package manager comes
+    from the lockfile -- npm, pnpm, yarn, yarn berry, bun), `members`,
+    `frontends`, whether the server likely `serves_frontend`,
     an `env` seed directive, a `db` plan (engine from drivers in any
     package.json/requirements + `.env.example`; `required`/`local_ok`; a
     Postgres/MySQL/Mongo note naming `createdb <DB_NAME>` or "point DATABASE_URL
@@ -4132,44 +4134,85 @@ and surfaces WHY an app is or is not running.
     deadline; returns `{ok, status, url, waited, error}`.
 - **`workspace.py` wiring** (reuses the preview's own `_run_blocking` timeouts
   and PID/port kill rules; nothing here starts a server or binds a port):
-  - `start()`'s worker calls `_deploy_prepare(run_dir, project_dir, proc)` ALWAYS
-    (before the root-install branch -- a root `node_modules` does NOT mean the
-    frontend is built): it seeds `.env` from `.env.example` when absent (atomic
-    `os.replace`, never overwrites an existing `.env`), then runs the plan's
-    sub-app installs (`INSTALL_TIMEOUT`) and the frontend build
-    (`BUILD_TIMEOUT`, new = 600 s) via `_run_blocking`. A step that runs out of
-    its time is reported as the preview's error ("... the hub stopped it -- press
-    Run to try again") and a half-written `node_modules`/`.venv` it created is
+  - `start()`'s worker calls `_deploy_prepare(run_dir, project_dir, proc)` on
+    every explicit start, AFTER the root install (a workspaces build needs the
+    root's hoisted packages; a root `node_modules` does NOT mean the frontend is
+    built): it seeds `.env` from `.env.example` when absent (exclusive create,
+    see the security model below), then runs the plan's declared sub-project
+    installs (scripts off, `INSTALL_TIMEOUT`) and the frontend build
+    (`BUILD_TIMEOUT`, new = 600 s) via `_run_blocking`; each step's folder is
+    re-checked (no link, inside the project) when it runs. A step that runs out
+    of its time is reported as the preview's error ("... the hub stopped it --
+    press Run to try again") and a half-written `node_modules` it created is
     removed so the next Run retries, mirroring `install()`. A step that merely
     EXITS non-zero returns None (the start that follows reports the problem in
     the project's own words). A no-op for a plain single project.
-  - `detect()` disambiguation: a bare `frontend/` + `backend/` monorepo with no
-    root start script used to 400 "ambiguous"; it now launches the backend when
-    `deploy_perfect` names a genuine server among the runnable candidates (two
+  - `detect()` disambiguation: a bare conventional pair (`frontend/`+`backend/`,
+    `client/`+`server/`, `web/`+`api/`) with no root start script used to 400
+    "ambiguous"; it now launches the backend when `deploy_perfect` names a
+    genuine server among the runnable candidates (undeclared folders and two
     static sites stay ambiguous -- regression-guarded).
   - `deploy_check(project_dir, probe=None)` -> runs `deploy_perfect.deploy_check`
     against the live `status()['url']` with a stdlib HTTP probe; None when
     nothing runs.
 - **`app.py` wiring** (`_dp_`-prefixed, additive, flag-gated, degrades to the old
-  behaviour): `_dp_augment_status(project_dir, st, http_check=)` adds a plain
-  `deploy` block (summary / layout / notes / db / live URL or the exact HTTP
-  error) to the `GET /api/workspace/status` response so the Build page shows WHY
-  an app is or is not running instead of a bare "not running". The block is added
-  only when there is something to say (a trivial folder is byte-identical to
-  before), and `?deploy_check=1` also confirms a running preview answers over
-  HTTP. No new route was added (the existing status route carries it, like
+  behaviour): with `?deploy_check=1`, `_dp_augment_status(project_dir, st,
+  report=True)` adds a plain `deploy` block (summary / layout / `on_start` steps /
+  notes / db / `last_error`) to the `GET /api/workspace/status` response so the
+  Build page shows WHY an app is or is not running instead of a bare "not
+  running". REPORT ONLY: no subprocess, no HTTP request, no file write (the
+  analysis is cached `_dp_analysis_ttl` = 30 s). Without the parameter the
+  response is byte-identical to before; the block is added only when there is
+  something to say. No new route (the status route carries it, like
   `?discover=1`).
 - **Flag** `deploy_perfect` (`config.get_flag`, default on): off = every hop is
   the old single-package behaviour exactly (no prepare, no detect override, no
   status block).
+
+**Security model** (2026-10-10 review of the first commit; covered by the
+link / realpath / O_EXCL / declared-only / no-subprocess tests in
+`tests/test_deploy_perfect.py`). The preview runs the project's OWN code BY
+DESIGN -- its start command, its root install with that install's scripts, its
+frontend build -- and only on an explicit start (the Run button, the turn-end
+preview start, the run-end deploy check). What deploy-perfect adds is limited:
+- **No links, nothing outside**: every path it reads or writes is refused when
+  it is a symlink, a junction / mount point or an app-exec alias
+  (`deploy_perfect.is_link`: `S_ISLNK`, `os.path.isjunction`, the reparse TAG --
+  cloud-placeholder reparse points are real files) or when its realpath is not
+  inside the project's realpath (component-wise, normcase:
+  `deploy_perfect.inside`). Reads (`safe_read_text`) take regular files only,
+  re-compare the opened file's identity with the path's (a link swapped in
+  between check and open is refused) and are capped (`.env.example` 64 KB,
+  package.json 512 KB).
+- **`.env` is created, never overwritten or written through**:
+  `workspace._create_exclusive`. POSIX: `O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600.
+  WINDOWS: `CreateFile(CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT)` -- MEASURED on
+  this machine, `os.open(O_CREAT|O_EXCL)` through a DANGLING symlink succeeds and
+  creates the link's TARGET, so plain O_EXCL is not enough there. Only
+  well-formed KEY=VALUE lines are copied (comments, junk, control characters,
+  over-long lines dropped; <= 300 keys).
+- **Declared sub-projects only**: package.json `workspaces`,
+  `pnpm-workspace.yaml` (a line-based read of `packages:`, "dir" and "dir/*"
+  only, negations / `**` ignored), or the exact pairs `frontend/`+`backend/`,
+  `client/`+`server/`, `web/`+`api/`. Nothing found by scanning; hidden,
+  linked, node_modules, vendor, examples, fixtures, tests, docs folders are
+  never entered.
+- **Sub-installs run with lifecycle scripts OFF** (`npm|pnpm|yarn|bun install
+  --ignore-scripts`, yarn berry `--mode=skip-build`). Workspace members are not
+  sub-installed at all (the root's install covers them); a pair's backend the
+  ROOT already covers is skipped (a scripts-off sub-install would shadow the
+  root's properly built native packages, e.g. bcrypt); python sub-projects are
+  never installed here (pip runs build code). The root install is unchanged.
+- **A status read only reports** (see the app.py wiring above).
+Residual, in plain words: a process already running in the project (an agent)
+can still swap a folder for a link in the instant between the run-time re-check
+and npm starting there; that process could run the same command itself, so the
+check closes the "trick the hub" path, not that one.
 
 **Left out on purpose**: the hub still does not PATCH a server to serve a
 separate frontend's build output -- it builds the frontend and, when the server
 is a distinct app, emits a clear note ("serve the build output from the API, or
 run the frontend dev server separately") rather than editing the project's
 source; it provisions no database (a Postgres-only app gets the `createdb`
-instruction, not a spun-up server); and the end-of-Multi-run auto deploy-check is
-surfaced through the status route (`?deploy_check=1`) rather than wired into the
-Multi finish path, to avoid colliding with the parallel app.py/swarm_windows.py
-edits -- a one-line `workspace.deploy_check(project_dir)` is the hook when that
-path is free.
+instruction, not a spun-up server); and the status route never checks over HTTP
+-- the explicit check is `workspace.deploy_check(project_dir)` after a start.

@@ -750,20 +750,33 @@ def _deploy_disambiguate(project_dir, candidates):
     return None
 
 
+def _pm_exe(pm):
+    """The executable for a package manager, or None when it is not installed.
+    npm keeps the preview's own spelling (npm.cmd on Windows)."""
+    if pm in (None, "", "npm"):
+        return _npm("npm")
+    try:
+        return shutil.which(pm)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def _deploy_step_argv(step):
-    """Map a deploy_perfect step record to (argv, timeout). None if unknown."""
-    d = step.get("dir")
+    """Map a deploy_perfect step record to (argv, timeout), or None. Installs
+    always carry lifecycle scripts OFF (deploy_perfect.pm_args); a package
+    manager that is not installed falls back to npm."""
+    mod = _deploy_mod()
+    if mod is None:
+        return None
     kind = step.get("kind")
-    if kind == "npm-install":
-        return [_npm("npm"), "install"], INSTALL_TIMEOUT
-    if kind == "npm-build":
-        return [_npm("npm"), "run", "build"], BUILD_TIMEOUT
-    if kind == "venv":
-        return [sys.executable, "-m", "venv", _venv_dir(d)], SETUP_TIMEOUT
-    if kind == "pip-install":
-        return ([_venv_python(d), "-m", "pip", "install", "-q", "-r",
-                 "requirements.txt"], INSTALL_TIMEOUT)
-    return None
+    pm = step.get("pm") or "npm"
+    exe = _pm_exe(mod.pm_exe_name(pm))
+    if exe is None:
+        pm, exe = "npm", _npm("npm")
+    args = mod.pm_args(pm, kind)
+    if not args:
+        return None
+    return [exe] + list(args), (BUILD_TIMEOUT if kind == "build" else INSTALL_TIMEOUT)
 
 
 def _deploy_prepare(run_dir, project_dir, proc):
@@ -785,30 +798,38 @@ def _deploy_prepare(run_dir, project_dir, proc):
         summary = plan.get("summary")
         if summary:
             proc.log("[hub] deploy plan: " + summary)
-        _deploy_seed_env(plan, proc)
+        _deploy_seed_env(plan, proc, project_dir)
+        root_real = os.path.realpath(project_dir)
         for step in plan.get("steps") or []:
             if proc.stopping:
                 return None
+            d = step.get("dir") or ""
+            # Re-checked at RUN time (the plan may be seconds old): never run
+            # anything in a folder that is a link or resolves outside.
+            if mod.safe_path(d, root_real) is None:
+                proc.log("[hub] skipped %s: a link, or outside the project" % d)
+                continue
             mapped = _deploy_step_argv(step)
             if mapped is None:
                 continue
             argv, timeout = mapped
-            # npm-build in a dir whose node_modules is missing cannot run; a
-            # preceding npm-install step handles it, but guard anyway.
-            if step.get("kind") == "npm-build" and not os.path.isdir(
-                    os.path.join(step["dir"], "node_modules")):
+            # A build needs installed packages: its own, or a workspace root's.
+            if step.get("kind") == "build" and not (
+                    os.path.isdir(os.path.join(d, "node_modules"))
+                    or os.path.isdir(os.path.join(project_dir, "node_modules"))):
+                proc.log("[hub] skipped %s: no installed packages" % step.get("label"))
                 continue
+            created = (step.get("kind") == "install"
+                       and not os.path.lexists(os.path.join(d, "node_modules")))
             proc.log("[hub] " + step.get("label", step.get("kind", "")))
-            failure = _run_blocking(argv, step["dir"], proc.log, timeout=timeout,
+            failure = _run_blocking(argv, d, proc.log, timeout=timeout,
                                     label=step.get("label") or step.get("kind"))
             if failure:
-                # A killed install left a half-written tree detect()/its own
-                # presence check would read as "done"; remove it so the next
-                # Run retries, mirroring install().
-                if step.get("kind") in ("npm-install", "venv"):
-                    target = (_venv_dir(step["dir"]) if step["kind"] == "venv"
-                              else os.path.join(step["dir"], "node_modules"))
-                    _remove_partial(target, proc.log)
+                # A killed install left a half-written tree its presence check
+                # would read as "done"; remove it (only when this step created
+                # it) so the next Run retries, mirroring install().
+                if created:
+                    _remove_partial(os.path.join(d, "node_modules"), proc.log)
                 return failure
         for note in plan.get("notes") or []:
             proc.log("[hub] note: " + note)
@@ -819,26 +840,91 @@ def _deploy_prepare(run_dir, project_dir, proc):
     return None
 
 
-def _deploy_seed_env(plan, proc):
+def _open_new_file(path):
+    """An fd for a NEW file at `path`, never following a link that is there.
+
+    POSIX: O_CREAT|O_EXCL fails on any existing name, dangling symlinks
+    included, and O_NOFOLLOW adds the guarantee. WINDOWS IS DIFFERENT --
+    MEASURED 2026-10-10 on this machine: os.open(O_CREAT|O_EXCL) on a DANGLING
+    symlink succeeds and creates the link's TARGET (CREATE_NEW follows the
+    reparse point). So on Windows the file is created with CreateFile(
+    CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT): a link of any kind at `path` is
+    an existing name and the call fails with FileExistsError."""
+    if os.name == "nt":
+        import _winapi
+        import msvcrt
+        handle = _winapi.CreateFile(
+            path, _winapi.GENERIC_WRITE, 0, _winapi.NULL,
+            1,                                   # CREATE_NEW
+            0x80 | 0x00200000,                   # NORMAL | OPEN_REPARSE_POINT
+            _winapi.NULL)
+        try:
+            return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+        except Exception:
+            _winapi.CloseHandle(handle)
+            raise
+    flags = (os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_BINARY", 0))
+    return os.open(path, flags, 0o600)
+
+
+def _create_exclusive(path, content):
+    """Create `path` with `content`, ONLY if nothing (file, link, dangling
+    link) is there -- never following, never overwriting; 0600 on POSIX so a
+    secret-bearing .env is not world readable. Returns (True, None) or
+    (False, why). Never raises."""
+    try:
+        fd = _open_new_file(path)
+    except FileExistsError:
+        return False, "already exists"
+    except OSError as exc:
+        return False, exc.__class__.__name__
+    except Exception as exc:                                     # noqa: BLE001
+        return False, exc.__class__.__name__
+    try:
+        view = memoryview(content.encode("utf-8"))
+        while view:
+            view = view[os.write(fd, view):]
+    except OSError as exc:
+        os.close(fd)
+        try:
+            os.unlink(path)              # ours: we just created it
+        except OSError:
+            pass
+        return False, exc.__class__.__name__
+    os.close(fd)
+    return True, None
+
+
+def _deploy_seed_env(plan, proc, project_dir):
+    """Write `.env` next to a safe `.env.example`: the example must be a
+    regular file inside the project (no link, realpath inside, <= 64 KB), its
+    folder too, and `.env` is created exclusively -- an existing `.env` (or a
+    link planted there) is never touched."""
     mod = _deploy_mod()
     env = plan.get("env") or {}
     example = env.get("example_path")
-    if not (mod and env.get("needs_seed") and example and os.path.isfile(example)):
-        return
-    target = os.path.join(os.path.dirname(example), ".env")
-    if os.path.exists(target):
+    if not (mod and env.get("needs_seed") and example):
         return
     try:
-        with open(example, "r", encoding="utf-8", errors="replace") as fh:
-            body = fh.read()
+        root_real = os.path.realpath(project_dir)
+        parent = os.path.dirname(example)
+        if mod.safe_path(parent, root_real) is None:
+            proc.log("[hub] .env not created: its folder is a link or outside "
+                     "the project")
+            return
+        body, why = mod.safe_read_text(example, root_real, mod.ENV_EXAMPLE_MAX_BYTES)
+        if body is None:
+            proc.log("[hub] .env not created: .env.example was skipped (%s)" % why)
+            return
         seeded = mod.env_seed_plan(body)
         content = seeded.get("content") or ""
         if not content:
             return
-        tmp = target + ".dp-tmp"
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(content)
-        os.replace(tmp, target)
+        ok, why = _create_exclusive(os.path.join(parent, ".env"), content)
+        if not ok:
+            proc.log("[hub] .env not created (%s); nothing was overwritten" % why)
+            return
         proc.log("[hub] wrote .env from .env.example (local dev defaults)")
         for note in seeded.get("notes") or []:
             proc.log("[hub] .env: " + note)
@@ -896,19 +982,6 @@ def start(project_dir, on_done=None):
             if proc.stopping:
                 proc.state = "stopped"
                 return
-            # Deploy-perfect: seed .env and run a monorepo's sub-app installs
-            # and frontend build BEFORE the single start command, regardless of
-            # whether the ROOT needs installing (a root node_modules does not
-            # mean the frontend is built). A no-op for a plain single project.
-            dp_failure = _deploy_prepare(run_dir, project_dir, proc)
-            if proc.stopping:
-                proc.state = "stopped"
-                return
-            if dp_failure:
-                proc.state = "failed"
-                proc.error = ("%s; the hub stopped it -- press Run to try again"
-                              % dp_failure)
-                return
             if spec["needs_install"]:
                 failure = install(run_dir, proc.log)
                 if failure:
@@ -921,6 +994,20 @@ def start(project_dir, on_done=None):
                         proc.error = ("%s; the hub stopped it -- press Run to "
                                       "try again" % failure)
                     return
+            # Deploy-perfect, AFTER the root install (a workspaces build needs
+            # the root's hoisted packages) and only ever on this explicit
+            # start: seed .env, install a DECLARED sub-project with lifecycle
+            # scripts off, build its frontend. A root node_modules does not
+            # mean the frontend is built. A no-op for a plain single project.
+            dp_failure = _deploy_prepare(run_dir, project_dir, proc)
+            if proc.stopping:
+                proc.state = "stopped"
+                return
+            if dp_failure:
+                proc.state = "failed"
+                proc.error = ("%s; the hub stopped it -- press Run to try again"
+                              % dp_failure)
+                return
             proc.state = "starting"
             argv = _argv_with_port(spec["argv"], spec["kind"], port)
             if spec["kind"].startswith("python:"):

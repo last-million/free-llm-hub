@@ -3,36 +3,45 @@
 The preview (workspace.py) already knows how to start ONE package.json or ONE
 app.py: one install, one start command, one port. Real multi-role apps that the
 Build page and Multi runs produce are rarely that simple. The app that prompted
-this module was a monorepo: an Express API in ``backend/`` (Postgres + Stripe)
-and a SEPARATE Vite/React frontend in ``frontend/`` -- two installs and a
-frontend BUILD step, none of which the old ``install()`` ran (it only installs
-the root ``node_modules``). It also needed a ``.env`` and a database. So every
-Multi run re-did the deployment plumbing by hand (create ``.env``, build the
-frontend, patch the server to serve it, start it detached, curl it) and the hub
-only ever ADOPTED the hand-started server -- it never started the app on its
-own. Five runs in a row rebuilt "the frontend shell" from scratch.
+this module was a monorepo: an Express API (Postgres + Stripe) started from the
+root and a SEPARATE Vite/React frontend in ``frontend/`` -- a frontend install
+and BUILD the old preview never ran (it installs the root ``node_modules``
+only). It also needed a ``.env`` and a database. So every Multi run re-did the
+deployment plumbing by hand and the hub only ever ADOPTED a hand-started server.
 
-This module is the PURE brain for doing that automatically and generically:
+This module is the PURE brain for doing that automatically:
 
-* ``analyze(project_dir)`` -- read the layout (single app, monorepo with
-  web+api, npm workspaces, docker compose, python web) and return the extra
-  install / build steps the preview must run beyond the root install, which
-  directory the server runs from, whether a database is needed and whether a
-  local fallback exists, and a one-line human summary.
-* ``env_seed_plan(example_text)`` -- turn a ``.env.example`` into a ``.env`` with
-  SAFE LOCAL defaults: random values ONLY for the project's own internal signing
-  secrets (JWT/session/cookie), real third-party keys left as the example's
-  obvious placeholder (never fabricated), a local database default, PORT kept.
-* ``deploy_check(url, probe=...)`` -- after the server is up, poll it over HTTP
-  until it answers (any status line = alive) or a deadline passes, so the
-  conversation gets the URL or the exact error instead of a silent "not
-  running".
+* ``analyze(project_dir)`` -- the layout (single app, npm/pnpm workspaces, a
+  conventional frontend+backend pair, docker compose), the EXTRA steps the
+  preview must run after its own root install (a declared sub-project's install
+  with lifecycle scripts OFF, a frontend build), the server directory, whether
+  a database is needed and a one-line summary.
+* ``env_seed_plan(example_text)`` -- KEY=VALUE lines of a ``.env.example`` turned
+  into a ``.env`` with SAFE LOCAL defaults.
+* ``deploy_check(url, probe=...)`` -- poll a running preview over HTTP.
 
-It is pure and stdlib-only: every filesystem and clock side is an injected
-callable with an ``os``/``time`` default, nothing here starts a process or binds
-a port (workspace.py owns that, with its PID/port kill rules and timeouts), and
-every public function is wrapped so it NEVER raises -- a broken project must
-degrade to "nothing extra to do", never crash a preview.
+SECURITY MODEL (2026-10-10 review). The preview runs the project's own code BY
+DESIGN -- its start command, its root install scripts, its build -- and only on
+an explicit start. What this module adds is limited so a hostile or careless
+project cannot make the hub act outside it:
+
+* every path it reads is checked first: a symlink, a junction / mount point or
+  an app-exec alias is refused, and so is anything whose realpath is not inside
+  the project's realpath (component-wise, normcase); reads are capped and only
+  regular files are read (``safe_read_text``);
+* sub-projects are ONLY the ones the root DECLARES (package.json
+  ``workspaces``, ``pnpm-workspace.yaml``) or the exact conventional pairs
+  ``frontend/``+``backend/``, ``client/``+``server/``, ``web/``+``api/`` --
+  never anything found by scanning; hidden, linked, node_modules, vendor,
+  examples and fixtures folders are never entered;
+* a sub-project install runs with lifecycle scripts OFF (``--ignore-scripts``,
+  yarn berry ``--mode=skip-build``); python sub-projects are never installed
+  here (pip runs build code); the root install keeps today's behaviour;
+* ``.env`` is written by the caller with an exclusive create, never over an
+  existing file or link (see workspace._deploy_seed_env).
+
+Stdlib only; nothing here starts a process or binds a port, and every public
+function is wrapped so it NEVER raises.
 """
 
 from __future__ import annotations
@@ -41,77 +50,39 @@ import json
 import os
 import re
 import secrets
+import stat
 import time
 
-# --------------------------------------------------------------------------- #
-# Small safe wrappers. Every public entry point funnels its filesystem access
-# through these so a weird path or an unreadable file is "absent", never an
-# exception out of this module.
-# --------------------------------------------------------------------------- #
+# Caps on what is ever read.
+ENV_EXAMPLE_MAX_BYTES = 64 * 1024
+PKG_JSON_MAX_BYTES = 512 * 1024
+TEXT_MAX_BYTES = 256 * 1024
+ENV_LINE_MAX = 1000
+ENV_KEYS_MAX = 300
+MEMBERS_MAX = 24
 
-
-def _os_isdir(p):
-    try:
-        return os.path.isdir(p)
-    except Exception:                                            # noqa: BLE001
-        return False
-
-
-def _os_isfile(p):
-    try:
-        return os.path.isfile(p)
-    except Exception:                                            # noqa: BLE001
-        return False
-
-
-def _os_listdir(p):
-    try:
-        return list(os.listdir(p))
-    except Exception:                                            # noqa: BLE001
-        return []
-
-
-def _os_read_text(p):
-    try:
-        with open(p, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read()
-    except Exception:                                            # noqa: BLE001
-        return None
-
-
-def _read_json_with(read_text, path):
-    raw = read_text(path)
-    if not raw:
-        return None
-    try:
-        out = json.loads(raw)
-        return out if isinstance(out, dict) else None
-    except Exception:                                            # noqa: BLE001
-        return None
-
-
-# Directory names that are never a sub-application to install.
+# Folder names that are never a sub-project and never entered.
 _SKIP_DIRS = {
     "node_modules", ".git", "__pycache__", ".venv", "venv", "env",
-    "dist", "build", "out", ".next", ".nuxt", "coverage", "logs", "log",
-    ".cache", "tmp", "temp", "public", "static", "assets", "docs", ".idea",
-    ".vscode", "test-results", "playwright-report", ".turbo", ".parcel-cache",
+    "vendor", "examples", "example", "fixtures", "fixture", "__fixtures__",
+    "samples", "sample", "test", "tests", "__tests__", "e2e", "docs",
+    "dist", "build", "out", ".next", ".nuxt", "coverage", "logs",
+    "tmp", "temp", "public", "static", "assets",
 }
 
-# A sub-directory whose name says "this is the browser app" / "this is the API".
-_FRONTEND_NAMES = ("frontend", "client", "web", "webapp", "ui", "www", "site", "app")
-_BACKEND_NAMES = ("backend", "server", "api", "service", "services")
+# The only sub-project pairs recognised without a declaration.
+_PAIRS = (("frontend", "backend"), ("client", "server"), ("web", "api"))
 
-# package.json deps that mean "this is a frontend that must be BUILT before a
-# server can serve it".
+_PROJECT_MARKERS = ("package.json", "requirements.txt", "pyproject.toml",
+                    "app.py", "main.py", "manage.py", "server.py")
+
+# package.json deps that mean "a frontend that must be BUILT".
 _FRONTEND_DEP_RE = re.compile(
     r"\b(vite|next|nuxt|react-scripts|@vitejs|@angular|svelte|@sveltejs|"
     r"vue-cli-service|parcel|gatsby|astro|remix|@craco)\b", re.I)
 
-# Where a frontend build lands; if one of these holds files, the build is done.
-_BUILD_OUTPUT_DIRS = ("dist", "build", "out", ".next", ".nuxt", "public/build")
+_BUILD_OUTPUT_DIRS = ("dist", "build", "out", ".next", ".nuxt")
 
-# Database drivers in a package.json / requirements and what they mean.
 _DB_DRIVERS = (
     (re.compile(r"\b(better-sqlite3|sqlite3|aiosqlite)\b", re.I), "sqlite", True),
     (re.compile(r"\b(pg|postgres|postgresql|psycopg2?|asyncpg)\b", re.I), "postgres", False),
@@ -119,113 +90,258 @@ _DB_DRIVERS = (
     (re.compile(r"\b(mongodb|mongoose|pymongo|motor)\b", re.I), "mongodb", False),
 )
 
-# Keys are tokenised on non-alphanumerics (JWT_SECRET -> {jwt, secret}) and
-# matched on WHOLE tokens -- `\b` is no boundary across an underscore (both
-# sides are word characters), and a substring test would read "ses" inside
-# "SESSION". So a token set, not a regex over the raw key.
-
-# An EXTERNAL service: never fabricate a value, keep the example's placeholder
-# so the feature stays disabled until the owner fills it in.
-_THIRD_PARTY_TOKENS = {
-    "stripe", "sendgrid", "twilio", "aws", "ses", "s3", "openai", "anthropic",
-    "supabase", "mailgun", "paypal", "smtp", "google", "github", "gitlab",
-    "slack", "cloudinary", "firebase", "sentry", "datadog", "mailchimp",
-    "recaptcha", "mapbox", "algolia",
+# Reparse tags that REDIRECT (a link of some kind). Other reparse kinds (cloud
+# placeholders, dedup) are real files; the realpath check still applies.
+_LINK_TAGS = {
+    getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C),
+    getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003),
+    getattr(stat, "IO_REPARSE_TAG_APPEXECLINK", 0x8000001B),
 }
-# A token that says "this is one of the project's OWN signing secrets" --
-# safe to generate a random local value for.
-_INTERNAL_PREFIX_TOKENS = {
-    "jwt", "session", "cookie", "signing", "csrf", "encryption", "refresh",
-    "access", "auth", "app",
-}
-_SECRET_NOUNS = {"secret", "token", "key", "salt", "pepper"}
-
-_DB_PASSWORD_RE = re.compile(r"(db|database|postgres|mysql|mongo)[-_ ]?pass", re.I)
 
 
-def _key_tokens(key):
-    return {t.lower() for t in re.split(r"[^A-Za-z0-9]+", key or "") if t}
+# --------------------------------------------------------------------------- #
+# Path safety
+# --------------------------------------------------------------------------- #
+
+
+def is_link(path):
+    """True for a symlink, a junction / mount point, an app-exec alias, or a
+    reparse point whose kind cannot be read. Never raises."""
+    try:
+        st = os.lstat(path)
+    except (OSError, ValueError):
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    try:
+        if os.path.isjunction(path):
+            return True
+    except (AttributeError, OSError, ValueError):
+        pass
+    attrs = getattr(st, "st_file_attributes", 0) or 0
+    if attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+        tag = getattr(st, "st_reparse_tag", None)
+        if tag is None or tag in _LINK_TAGS:
+            return True
+    return False
+
+
+def _norm(path):
+    return os.path.normcase(os.path.abspath(path))
+
+
+def inside(child_real, root_real):
+    """Component-wise: is `child_real` the root itself or under it."""
+    try:
+        c, r = _norm(child_real), _norm(root_real)
+        return os.path.commonpath([c, r]) == r
+    except (ValueError, TypeError):
+        return False
+
+
+def safe_path(path, root_real, *, realpath=None, is_link_fn=None):
+    """`path`'s realpath when it is not a link and resolves inside
+    `root_real`, else None. Never raises."""
+    realpath = realpath or os.path.realpath
+    is_link_fn = is_link_fn or is_link
+    try:
+        if is_link_fn(path):
+            return None
+        real = realpath(path)
+    except Exception:                                            # noqa: BLE001
+        return None
+    return real if inside(real, root_real) else None
+
+
+def safe_read_text(path, root_real, max_bytes, *, realpath=None, is_link_fn=None):
+    """Read a REGULAR file inside the project: ``(text, None)`` or
+    ``(None, why)``. Refuses links, paths resolving outside `root_real`,
+    non-regular files, files that change identity between check and open, and
+    files bigger than `max_bytes`. Never raises."""
+    if safe_path(path, root_real, realpath=realpath, is_link_fn=is_link_fn) is None:
+        return None, "a link, or outside the project"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None, "unreadable"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, "not a regular file"
+        try:
+            lst = os.lstat(path)
+        except OSError:
+            return None, "unreadable"
+        if st.st_ino and lst.st_ino and (st.st_ino, st.st_dev) != (lst.st_ino, lst.st_dev):
+            return None, "changed while being read"
+        if st.st_size > max_bytes:
+            return None, "larger than %d KB" % max(1, max_bytes // 1024)
+        chunks, total = [], 0
+        while True:
+            block = os.read(fd, 65536)
+            if not block:
+                break
+            total += len(block)
+            if total > max_bytes:
+                return None, "larger than %d KB" % max(1, max_bytes // 1024)
+            chunks.append(block)
+        return b"".join(chunks).decode("utf-8", errors="replace"), None
+    except OSError:
+        return None, "unreadable"
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _safe_dir(path, root_real, realpath, is_link_fn):
+    try:
+        return os.path.isdir(path) and safe_path(
+            path, root_real, realpath=realpath, is_link_fn=is_link_fn) is not None
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _plain_file(path, is_link_fn):
+    try:
+        return os.path.isfile(path) and not is_link_fn(path)
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 # --------------------------------------------------------------------------- #
 # .env seeding
 # --------------------------------------------------------------------------- #
 
+_THIRD_PARTY_TOKENS = {
+    "stripe", "sendgrid", "twilio", "aws", "ses", "s3", "openai", "anthropic",
+    "supabase", "mailgun", "paypal", "smtp", "google", "github", "gitlab",
+    "slack", "cloudinary", "firebase", "sentry", "datadog", "mailchimp",
+    "recaptcha", "mapbox", "algolia",
+}
+_INTERNAL_PREFIX_TOKENS = {
+    "jwt", "session", "cookie", "signing", "csrf", "encryption", "refresh",
+    "access", "auth", "app",
+}
+_SECRET_NOUNS = {"secret", "token", "key", "salt", "pepper"}
+_DB_PASSWORD_RE = re.compile(r"(db|database|postgres|mysql|mongo)[-_ ]?pass", re.I)
+_ENV_LINE_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s*=\s*(.*)$")
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _key_tokens(key):
+    # Whole tokens: `\b` is no boundary across "_" and a substring test would
+    # read "ses" inside "SESSION".
+    return {t.lower() for t in re.split(r"[^A-Za-z0-9]+", key or "") if t}
+
 
 def env_seed_plan(example_text, *, secret_factory=None):
-    """Turn a ``.env.example`` body into a ``.env`` body with safe local defaults.
+    """KEY=VALUE lines of a ``.env.example`` body -> a ``.env`` body.
 
-    Returns ``{"content": str, "secrets": [key...], "placeholders": [key...],
-    "notes": [str...]}`` and never raises. ``secret_factory()`` supplies each
-    generated secret (default: a 48-char url-safe random string); inject a
-    deterministic one in tests.
-
-    The rule, in one line: generate randomness ONLY for the project's own
-    internal signing secrets; keep the example's obvious placeholder for every
-    external service; give a local database a working local default; keep
-    everything else (PORT, HOST, localhost DB coordinates) exactly as the author
-    wrote it.
-    """
+    ONLY well-formed KEY=VALUE lines are copied (comments, blank lines, junk,
+    control characters and over-long lines are dropped; at most ENV_KEYS_MAX
+    keys). Random values ONLY for the project's own signing secrets; every
+    external service key keeps the example's placeholder (never fabricated); a
+    bare DB password gets a local default; the rest is kept verbatim. Returns
+    ``{"content", "secrets", "placeholders", "notes"}``; never raises."""
     if secret_factory is None:
         secret_factory = lambda: secrets.token_urlsafe(36)      # noqa: E731
     text = example_text if isinstance(example_text, str) else ""
     try:
         return _env_seed_plan(text, secret_factory)
     except Exception:                                            # noqa: BLE001
-        # Fail closed: an unreadable example yields no file, never a crash.
         return {"content": "", "secrets": [], "placeholders": [], "notes": []}
 
 
 def _env_seed_plan(text, secret_factory):
-    out_lines = []
-    gen_secrets = []
-    placeholders = []
+    out, gen, ph, seen = [], [], [], set()
     for raw in text.splitlines():
-        line = raw.rstrip("\n")
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in line:
-            out_lines.append(line)
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
-        key, _, value = line.partition("=")
-        key_s = key.strip()
-        val = value.strip()
-        new = _env_value_for(key_s, val, secret_factory, gen_secrets, placeholders)
-        out_lines.append("%s=%s" % (key_s, new))
-    content = "\n".join(out_lines)
-    if content and not content.endswith("\n"):
-        content += "\n"
+        if len(line) > ENV_LINE_MAX or _CTRL_RE.search(line):
+            continue
+        m = _ENV_LINE_RE.match(line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        if key in seen:
+            continue
+        if len(seen) >= ENV_KEYS_MAX:
+            break
+        seen.add(key)
+        out.append("%s=%s" % (key, _env_value_for(key, val, secret_factory, gen, ph)))
     notes = []
-    if gen_secrets:
+    if gen:
         notes.append("generated a random local value for %d internal secret(s): %s"
-                     % (len(gen_secrets), ", ".join(gen_secrets)))
-    if placeholders:
+                     % (len(gen), ", ".join(gen)))
+    if ph:
         notes.append("left %d external key(s) as placeholders -- set real values "
-                     "to enable them: %s" % (len(placeholders), ", ".join(placeholders)))
-    return {"content": content, "secrets": gen_secrets,
-            "placeholders": placeholders, "notes": notes}
+                     "to enable them: %s" % (len(ph), ", ".join(ph)))
+    return {"content": ("\n".join(out) + "\n") if out else "", "secrets": gen,
+            "placeholders": ph, "notes": notes}
 
 
-def _env_value_for(key, example_value, secret_factory, gen_secrets, placeholders):
+def _env_value_for(key, example_value, secret_factory, gen, ph):
     toks = _key_tokens(key)
-    # An external service key keeps its placeholder, whatever else it matches.
     if toks & _THIRD_PARTY_TOKENS:
-        placeholders.append(key)
+        ph.append(key)
         return example_value
-    # One of the project's own signing secrets: "secret" alone is enough; a bare
-    # "key"/"token" needs an internal prefix (so API_KEY stays a placeholder,
-    # JWT_SIGNING_KEY does not).
     if toks & _SECRET_NOUNS and (
             "secret" in toks or "salt" in toks or (toks & _INTERNAL_PREFIX_TOKENS)):
-        gen_secrets.append(key)
+        gen.append(key)
         return secret_factory()
     if _DB_PASSWORD_RE.search(key):
-        # A local default that matches the usual local database password so the
-        # app connects to a developer's own database if one is running.
         return example_value or "postgres"
     if key.upper() == "NODE_ENV" and not example_value:
         return "development"
-    # PORT, HOST, DB_HOST=localhost, feature flags, URLs: keep the author's value.
     return example_value
+
+
+# --------------------------------------------------------------------------- #
+# Package managers
+# --------------------------------------------------------------------------- #
+
+
+def pm_for(sub, project_dir):
+    """The package manager a (sub-)project uses, from its lockfile (own, then
+    the root's). Existence checks only."""
+    for d in (sub, project_dir):
+        try:
+            if os.path.isfile(os.path.join(d, "pnpm-lock.yaml")):
+                return "pnpm"
+            if (os.path.isfile(os.path.join(d, "bun.lockb"))
+                    or os.path.isfile(os.path.join(d, "bun.lock"))):
+                return "bun"
+            if os.path.isfile(os.path.join(d, "yarn.lock")):
+                return ("yarn-berry" if os.path.isfile(os.path.join(d, ".yarnrc.yml"))
+                        else "yarn")
+            if os.path.isfile(os.path.join(d, "package-lock.json")):
+                return "npm"
+        except Exception:                                        # noqa: BLE001
+            continue
+    return "npm"
+
+
+def pm_exe_name(pm):
+    return "yarn" if pm == "yarn-berry" else (pm or "npm")
+
+
+def pm_args(pm, kind):
+    """argv after the executable. Installs ALWAYS run with lifecycle scripts
+    off; None for an unknown pair."""
+    if kind == "install":
+        return {"npm": ["install", "--ignore-scripts"],
+                "pnpm": ["install", "--ignore-scripts"],
+                "yarn": ["install", "--ignore-scripts"],
+                "yarn-berry": ["install", "--mode=skip-build"],
+                "bun": ["install", "--ignore-scripts"]}.get(pm)
+    if kind == "build":
+        return ["run", "build"] if pm in ("npm", "pnpm", "yarn", "yarn-berry",
+                                         "bun") else None
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -233,23 +349,15 @@ def _env_value_for(key, example_value, secret_factory, gen_secrets, placeholders
 # --------------------------------------------------------------------------- #
 
 
-def analyze(project_dir, *, read_text=None, isfile=None, isdir=None, listdir=None):
-    """Describe how to make ``project_dir`` deploy, generically. Never raises.
+def analyze(project_dir, *, realpath=None, is_link_fn=None):
+    """Describe how to make ``project_dir`` deploy. Never raises.
 
-    Returns a plan dict (see ``_empty_plan`` for the shape). ``steps`` is the
-    EXTRA work the preview must do beyond its own root install -- sub-application
-    installs and frontend builds, in order -- each an abstract record the caller
-    turns into argv (deploy_perfect does not know a platform's npm shim)::
-
-        {"kind": "npm-install"|"npm-build"|"pip-install"|"venv",
-         "dir": <abspath>, "label": <str>, "timeout": "install"|"build"|"setup"}
-    """
-    read_text = read_text or _os_read_text
-    isfile = isfile or _os_isfile
-    isdir = isdir or _os_isdir
-    listdir = listdir or _os_listdir
+    ``steps`` is the EXTRA work after the preview's own root install, in
+    order: ``{"kind": "install"|"build", "pm", "dir", "label", "timeout"}``."""
+    realpath = realpath or os.path.realpath
+    is_link_fn = is_link_fn or is_link
     try:
-        return _analyze(project_dir, read_text, isfile, isdir, listdir)
+        return _analyze(project_dir, realpath, is_link_fn)
     except Exception:                                            # noqa: BLE001
         return _empty_plan(project_dir)
 
@@ -260,7 +368,8 @@ def _empty_plan(project_dir):
         "project_dir": project_dir,
         "server_dir": project_dir,
         "server_kind": None,
-        "serves_frontend": True,       # a single app serves itself
+        "serves_frontend": True,
+        "members": [],
         "steps": [],
         "env": {"needs_seed": False, "example_path": None},
         "db": {"required": False, "engine": "none", "local_ok": True, "note": None},
@@ -277,214 +386,270 @@ def _rel(base, path):
         return path
 
 
-def _has_build_output(sub, isdir, listdir):
-    for name in _BUILD_OUTPUT_DIRS:
-        d = os.path.join(sub, *name.split("/"))
-        if isdir(d) and listdir(d):
-            return True
-    return False
+def _json(text):
+    if not text:
+        return None
+    try:
+        out = json.loads(text)
+        return out if isinstance(out, dict) else None
+    except Exception:                                            # noqa: BLE001
+        return None
 
 
-def _classify_subapp(sub, read_text, isfile, isdir, listdir):
-    """Return a sub-app record or None (not a runnable node/python app)."""
-    pkg = _read_json_with(read_text, os.path.join(sub, "package.json"))
+def _pnpm_globs(text):
+    """The `packages:` list of a pnpm-workspace.yaml (a tiny, line-based read:
+    no YAML library, nothing evaluated)."""
+    out, in_pkgs = [], False
+    for raw in (text or "").splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not line.startswith((" ", "\t", "-")):
+            in_pkgs = line.strip().rstrip(":") == "packages"
+            continue
+        item = line.strip()
+        if in_pkgs and item.startswith("-"):
+            out.append(item[1:].strip().strip("'\""))
+    return out
+
+
+def _expand_globs(project_dir, root_real, globs, realpath, is_link_fn):
+    """Declared workspace patterns -> member dirs. Only "dir" and "dir/*" are
+    understood; negations, "**" and other glob syntax are ignored; nothing
+    hidden, linked, outside the project or in _SKIP_DIRS is ever entered."""
+    members = []
+
+    def ok_name(name):
+        return name and not name.startswith(".") and name.lower() not in _SKIP_DIRS
+
+    for g in globs:
+        if not isinstance(g, str):
+            continue
+        g = g.strip().replace("\\", "/").strip("/")
+        if not g or g.startswith("!") or "**" in g or os.path.isabs(g):
+            continue
+        parts = g.split("/")
+        star = parts[-1] == "*"
+        base = parts[:-1] if star else parts
+        if not base or any(p in ("", ".", "..") or "*" in p or "?" in p or "[" in p
+                           or not ok_name(p) for p in base):
+            continue
+        base_dir = os.path.join(project_dir, *base)
+        if not _safe_dir(base_dir, root_real, realpath, is_link_fn):
+            continue
+        if not star:
+            candidates = [base_dir]
+        else:
+            try:
+                names = sorted(os.listdir(base_dir))
+            except OSError:
+                names = []
+            candidates = [os.path.join(base_dir, n) for n in names if ok_name(n)]
+        for c in candidates:
+            if c in members or not _safe_dir(c, root_real, realpath, is_link_fn):
+                continue
+            if _plain_file(os.path.join(c, "package.json"), is_link_fn):
+                members.append(c)
+            if len(members) >= MEMBERS_MAX:
+                return members
+    return members
+
+
+def _declared_members(project_dir, root_real, root_pkg, realpath, is_link_fn):
+    """(layout, member dirs): the sub-projects the ROOT declares, or one exact
+    conventional pair. Nothing found by scanning."""
+    globs = []
+    if isinstance(root_pkg, dict):
+        ws = root_pkg.get("workspaces")
+        if isinstance(ws, list):
+            globs += ws
+        elif isinstance(ws, dict) and isinstance(ws.get("packages"), list):
+            globs += ws["packages"]
+    text, _ = safe_read_text(os.path.join(project_dir, "pnpm-workspace.yaml"),
+                             root_real, TEXT_MAX_BYTES, realpath=realpath,
+                             is_link_fn=is_link_fn)
+    if text:
+        globs += _pnpm_globs(text)
+    if globs:
+        return "workspaces", _expand_globs(project_dir, root_real, globs,
+                                           realpath, is_link_fn)
+    for fe, be in _PAIRS:
+        f, b = os.path.join(project_dir, fe), os.path.join(project_dir, be)
+        if not (_safe_dir(f, root_real, realpath, is_link_fn)
+                and _safe_dir(b, root_real, realpath, is_link_fn)):
+            continue
+        if all(any(_plain_file(os.path.join(d, m), is_link_fn) for m in _PROJECT_MARKERS)
+               for d in (f, b)):
+            return "monorepo", [f, b]
+    return None, []
+
+
+def _classify(sub, root_real, realpath, is_link_fn, project_dir):
+    text, _ = safe_read_text(os.path.join(sub, "package.json"), root_real,
+                             PKG_JSON_MAX_BYTES, realpath=realpath, is_link_fn=is_link_fn)
+    pkg = _json(text)
     if isinstance(pkg, dict):
         deps = {}
         for field in ("dependencies", "devDependencies"):
             if isinstance(pkg.get(field), dict):
                 deps.update(pkg[field])
-        depblob = " ".join(deps.keys())
+        depblob = " ".join(str(k) for k in deps.keys())
         scripts = pkg.get("scripts") if isinstance(pkg.get("scripts"), dict) else {}
-        is_frontend = bool(_FRONTEND_DEP_RE.search(depblob)) and bool(scripts.get("build"))
-        return {
-            "dir": sub,
-            "stack": "node",
-            "deps": depblob,
-            "has_node_modules": isdir(os.path.join(sub, "node_modules")),
-            "scripts": {k: scripts.get(k) for k in ("dev", "start", "build", "serve", "preview")},
-            "is_frontend": is_frontend,
-            "built": _has_build_output(sub, isdir, listdir) if is_frontend else True,
-            "name": os.path.basename(sub).lower(),
-        }
-    for entry in ("requirements.txt", "pyproject.toml", "app.py", "main.py",
-                  "manage.py", "server.py"):
-        if isfile(os.path.join(sub, entry)):
-            return {
-                "dir": sub, "stack": "python", "deps": "",
-                "has_node_modules": False, "scripts": {}, "is_frontend": False,
-                "built": True, "name": os.path.basename(sub).lower(),
-                "has_requirements": isfile(os.path.join(sub, "requirements.txt")),
-            }
+        is_fe = bool(_FRONTEND_DEP_RE.search(depblob)) and bool(scripts.get("build"))
+        built = True
+        if is_fe:
+            built = any(_safe_dir(os.path.join(sub, d), root_real, realpath, is_link_fn)
+                        and _nonempty(os.path.join(sub, d)) for d in _BUILD_OUTPUT_DIRS)
+        return {"dir": sub, "stack": "node", "deps": depblob,
+                "has_node_modules": os.path.isdir(os.path.join(sub, "node_modules")),
+                "scripts": {k: scripts.get(k) for k in ("dev", "start", "build", "serve")},
+                "is_frontend": is_fe, "built": built,
+                "pm": pm_for(sub, project_dir)}
+    if any(_plain_file(os.path.join(sub, m), is_link_fn) for m in _PROJECT_MARKERS[1:]):
+        return {"dir": sub, "stack": "python", "deps": "", "has_node_modules": False,
+                "scripts": {}, "is_frontend": False, "built": True, "pm": None}
     return None
 
 
-def _analyze(project_dir, read_text, isfile, isdir, listdir):
+def _nonempty(d):
+    try:
+        return bool(os.listdir(d))
+    except OSError:
+        return False
+
+
+def _analyze(project_dir, realpath, is_link_fn):
     project_dir = os.path.abspath(project_dir)
     plan = _empty_plan(project_dir)
-    if not isdir(project_dir):
+    if not os.path.isdir(project_dir):
         return plan
+    root_real = realpath(project_dir)
 
-    root_pkg = _read_json_with(read_text, os.path.join(project_dir, "package.json"))
-    compose = any(isfile(os.path.join(project_dir, n)) for n in
+    def read(path, cap):
+        return safe_read_text(path, root_real, cap, realpath=realpath,
+                              is_link_fn=is_link_fn)[0]
+
+    root_pkg = _json(read(os.path.join(project_dir, "package.json"), PKG_JSON_MAX_BYTES))
+    compose = any(_plain_file(os.path.join(project_dir, n), is_link_fn) for n in
                   ("docker-compose.yml", "docker-compose.yaml", "compose.yml",
                    "compose.yaml"))
 
-    # Immediate sub-applications.
-    subapps = []
-    for name in sorted(listdir(project_dir)):
-        if name in _SKIP_DIRS or name.startswith("."):
-            continue
-        sub = os.path.join(project_dir, name)
-        if not isdir(sub):
-            continue
-        rec = _classify_subapp(sub, read_text, isfile, isdir, listdir)
-        if rec:
-            subapps.append(rec)
+    kind, member_dirs = _declared_members(project_dir, root_real, root_pkg,
+                                          realpath, is_link_fn)
+    members = [m for m in (_classify(d, root_real, realpath, is_link_fn, project_dir)
+                           for d in member_dirs) if m]
+    frontends = [m for m in members if m["is_frontend"]]
+    backends = [m for m in members if not m["is_frontend"]]
+    plan["members"] = [_rel(project_dir, m["dir"]) for m in members]
+    plan["layout"] = "compose" if compose else (kind or "single")
 
-    frontends = [s for s in subapps if s.get("is_frontend")]
-    backends = [s for s in subapps if not s.get("is_frontend")]
-    workspaces = bool(isinstance(root_pkg, dict) and root_pkg.get("workspaces"))
-
-    # Layout.
-    if compose:
-        plan["layout"] = "compose"
-    elif workspaces:
-        plan["layout"] = "workspaces"
-    elif frontends and (backends or isinstance(root_pkg, dict)):
-        plan["layout"] = "monorepo"
-    elif len(subapps) >= 2:
-        plan["layout"] = "monorepo"
-    else:
-        plan["layout"] = "single"
-
-    # Which directory the SERVER runs from (what the preview should launch).
     plan["server_dir"], plan["server_kind"] = _pick_server(
-        project_dir, root_pkg, backends, isfile)
+        project_dir, root_pkg, backends, is_link_fn)
 
-    # Extra steps beyond the preview's own root install: install every sub-app
-    # that has no deps yet, and BUILD every frontend that is not built. Order:
-    # installs first (a build needs its own deps), frontends before backends so
-    # a server that serves the built frontend finds it.
+    root_has_deps = isinstance(root_pkg, dict) and bool(root_pkg.get("dependencies"))
     steps = []
-    for s in frontends + backends:
-        if s["stack"] == "node" and not s["has_node_modules"]:
-            steps.append({"kind": "npm-install", "dir": s["dir"],
-                          "label": "npm install (%s)" % _rel(project_dir, s["dir"]),
+    if kind == "monorepo":
+        # A pair's members are installed here (scripts OFF) -- except the
+        # server's own folder (today's install() handles the run dir) and a
+        # backend the ROOT already covers (a sub-install would shadow the
+        # root's properly built native packages).
+        for m in frontends + backends:
+            if m["stack"] != "node" or m["has_node_modules"]:
+                continue
+            if os.path.normcase(m["dir"]) == os.path.normcase(plan["server_dir"]):
+                continue
+            if not m["is_frontend"] and root_has_deps and \
+                    os.path.normcase(plan["server_dir"]) == os.path.normcase(project_dir):
+                continue
+            steps.append({"kind": "install", "pm": m["pm"], "dir": m["dir"],
+                          "label": "%s install, scripts off (%s)"
+                          % (pm_exe_name(m["pm"]), _rel(project_dir, m["dir"])),
                           "timeout": "install"})
-        elif s["stack"] == "python" and s.get("has_requirements"):
-            steps.append({"kind": "venv", "dir": s["dir"],
-                          "label": "creating the venv (%s)" % _rel(project_dir, s["dir"]),
-                          "timeout": "setup"})
-            steps.append({"kind": "pip-install", "dir": s["dir"],
-                          "label": "pip install -r requirements.txt (%s)"
-                          % _rel(project_dir, s["dir"]), "timeout": "install"})
-    for s in frontends:
-        if not s["built"] and s["scripts"].get("build"):
-            steps.append({"kind": "npm-build", "dir": s["dir"],
-                          "label": "npm run build (%s)" % _rel(project_dir, s["dir"]),
+    # npm/pnpm workspaces: the root install covers every member; only builds.
+    for m in frontends:
+        if not m["built"] and m["scripts"].get("build"):
+            steps.append({"kind": "build", "pm": m["pm"], "dir": m["dir"],
+                          "label": "%s run build (%s)"
+                          % (pm_exe_name(m["pm"]), _rel(project_dir, m["dir"])),
                           "timeout": "build"})
     plan["steps"] = steps
-    plan["frontends"] = [_rel(project_dir, s["dir"]) for s in frontends]
-
-    # Does the server serve the built frontend itself, or is it a separate app?
-    # We cannot read arbitrary server code purely, so: a single app serves
-    # itself; a monorepo with a separate frontend only "serves" it when the
-    # server dir CONTAINS that frontend's build output (e.g. public/). Otherwise
-    # we flag it so the conversation knows to serve or run it.
+    plan["frontends"] = [_rel(project_dir, m["dir"]) for m in frontends]
     plan["serves_frontend"] = _server_serves_frontend(
-        plan["server_dir"], frontends, isdir, listdir)
+        plan["server_dir"], frontends, root_real, realpath, is_link_fn)
 
-    # Environment.
     ex = None
-    for cand in (os.path.join(project_dir, ".env.example"),
-                 os.path.join(plan["server_dir"], ".env.example")):
-        if isfile(cand):
+    for d in (project_dir, plan["server_dir"]):
+        cand = os.path.join(d, ".env.example")
+        if _plain_file(cand, is_link_fn) and safe_path(
+                cand, root_real, realpath=realpath, is_link_fn=is_link_fn):
             ex = cand
             break
-    has_env = any(isfile(os.path.join(d, ".env"))
-                  for d in (project_dir, plan["server_dir"]))
-    plan["env"] = {"needs_seed": bool(ex and not has_env), "example_path": ex}
+    needs = bool(ex) and not os.path.lexists(os.path.join(os.path.dirname(ex), ".env"))
+    plan["env"] = {"needs_seed": needs, "example_path": ex}
 
-    # Database.
-    plan["db"] = _db_plan(project_dir, root_pkg, backends, read_text, isfile)
-
+    plan["db"] = _db_plan(project_dir, root_pkg, backends, read)
     plan["notes"] = _plan_notes(plan)
     plan["summary"] = summary(plan)
     return plan
 
 
-def _pick_server(project_dir, root_pkg, backends, isfile):
+def _pick_server(project_dir, root_pkg, backends, is_link_fn):
     if isinstance(root_pkg, dict):
         scripts = root_pkg.get("scripts") if isinstance(root_pkg.get("scripts"), dict) else {}
         if any(scripts.get(s) for s in ("start", "dev", "serve")):
             return project_dir, "node"
-    for s in backends:
-        if s["stack"] == "node" and any(s["scripts"].get(x) for x in ("start", "dev", "serve")):
-            return s["dir"], "node"
-    for s in backends:
-        if s["stack"] == "python":
-            return s["dir"], "python"
-    if backends:
-        return backends[0]["dir"], backends[0]["stack"]
-    for entry, kind in (("app.py", "python"), ("main.py", "python"),
-                        ("server.py", "python"), ("manage.py", "python")):
-        if isfile(os.path.join(project_dir, entry)):
-            return project_dir, kind
-    return project_dir, "node" if isinstance(root_pkg, dict) else None
+    for m in backends:
+        if m["stack"] == "node" and any(m["scripts"].get(x) for x in ("start", "dev", "serve")):
+            return m["dir"], "node"
+    for m in backends:
+        if m["stack"] == "python":
+            return m["dir"], "python"
+    for entry in ("app.py", "main.py", "server.py", "manage.py"):
+        if _plain_file(os.path.join(project_dir, entry), is_link_fn):
+            return project_dir, "python"
+    return project_dir, ("node" if isinstance(root_pkg, dict) else None)
 
 
-def _server_serves_frontend(server_dir, frontends, isdir, listdir):
+def _server_serves_frontend(server_dir, frontends, root_real, realpath, is_link_fn):
     if not frontends:
         return True
-    # Evidence that the server bundles the built UI: a public/ or static/ or
-    # dist/ beside the server with files in it.
-    for name in ("public", "static", "dist", "build", "www", "client/dist"):
-        d = os.path.join(server_dir, *name.split("/"))
-        if isdir(d) and listdir(d):
+    for name in ("public", "static", "dist", "build", "www"):
+        d = os.path.join(server_dir, name)
+        if _safe_dir(d, root_real, realpath, is_link_fn) and _nonempty(d):
             return True
     return False
 
 
-def _db_plan(project_dir, root_pkg, backends, read_text, isfile):
+def _db_plan(project_dir, root_pkg, backends, read):
     blob = ""
-    for pkg in [root_pkg] + [None]:
-        if isinstance(pkg, dict):
-            for field in ("dependencies", "devDependencies"):
-                if isinstance(pkg.get(field), dict):
-                    blob += " " + " ".join(pkg[field].keys())
-    for s in backends:
-        blob += " " + s.get("deps", "")
-    req = _os_cat(read_text, os.path.join(project_dir, "requirements.txt"))
-    blob += " " + (req or "")
-    envex = _os_cat(read_text, os.path.join(project_dir, ".env.example")) or ""
+    if isinstance(root_pkg, dict):
+        for field in ("dependencies", "devDependencies"):
+            if isinstance(root_pkg.get(field), dict):
+                blob += " " + " ".join(str(k) for k in root_pkg[field].keys())
+    for m in backends:
+        blob += " " + m.get("deps", "")
+    blob += " " + (read(os.path.join(project_dir, "requirements.txt"), TEXT_MAX_BYTES) or "")
+    envex = read(os.path.join(project_dir, ".env.example"), ENV_EXAMPLE_MAX_BYTES) or ""
     engine, local_ok = "none", True
     for rx, name, ok in _DB_DRIVERS:
         if rx.search(blob) or rx.search(envex):
             engine, local_ok = name, ok
             break
-    if engine == "none":
-        # .env hint without a driver listed.
-        if re.search(r"\b(DATABASE_URL|DB_HOST|POSTGRES|MONGO_URL|MYSQL)\b", envex, re.I):
-            engine, local_ok = "unknown", False
-    required = engine not in ("none", "sqlite")
+    if engine == "none" and re.search(
+            r"\b(DATABASE_URL|DB_HOST|POSTGRES|MONGO_URL|MYSQL)\b", envex, re.I):
+        engine, local_ok = "unknown", False
     note = None
     if engine in ("postgres", "mysql", "mongodb", "unknown"):
         dbname = _env_value_of(envex, "DB_NAME") or _env_value_of(envex, "POSTGRES_DB")
         createdb = (" -- e.g. install it locally and `createdb %s`" % dbname) if (
-            engine == "postgres" and dbname) else ""
+            engine == "postgres" and dbname and re.match(r"^[\w.-]{1,63}$", dbname)) else ""
         note = ("needs a %s database; none is provisioned locally, so the app may "
                 "run in degraded mode%s, or point DATABASE_URL at a hosted database"
                 % (engine if engine != "unknown" else "external", createdb))
     elif engine == "sqlite":
         note = "uses SQLite -- no external database needed"
-    return {"required": required, "engine": engine, "local_ok": local_ok, "note": note}
-
-
-def _os_cat(read_text, path):
-    try:
-        return read_text(path)
-    except Exception:                                            # noqa: BLE001
-        return None
+    return {"required": engine not in ("none", "sqlite"), "engine": engine,
+            "local_ok": local_ok, "note": note}
 
 
 def _env_value_of(text, key):
@@ -522,15 +687,15 @@ def _summary(plan, status):
         fe = ", ".join(plan.get("frontends") or []) or "frontend"
         bits.append("Monorepo: API + separate frontend (%s)" % fe)
     elif layout == "workspaces":
-        bits.append("npm workspaces monorepo")
+        bits.append("workspaces monorepo (%d member%s)" % (
+            len(plan.get("members") or []), "" if len(plan.get("members") or []) == 1 else "s"))
     elif layout == "compose":
         bits.append("Docker Compose app")
     nsteps = len(plan.get("steps") or [])
     if nsteps:
-        bits.append("%d extra setup step(s)" % nsteps)
+        bits.append("%d extra setup step(s) on start" % nsteps)
     if plan.get("env", {}).get("needs_seed"):
-        bits.append(".env seeded from .env.example (internal secrets random; "
-                   "external keys left as placeholders)")
+        bits.append(".env will be seeded from .env.example on start")
     db = plan.get("db", {})
     if db.get("required"):
         bits.append("DB: %s" % (db.get("note") or db.get("engine")))
@@ -545,19 +710,16 @@ def _summary(plan, status):
 
 
 # --------------------------------------------------------------------------- #
-# Deploy check: start happened elsewhere; here we confirm it answers over HTTP.
+# Deploy check: confirm a STARTED preview answers over HTTP.
 # --------------------------------------------------------------------------- #
 
 
 def deploy_check(url, *, probe, now=None, sleep=None, deadline=25.0, interval=1.0):
     """Poll ``url`` until the server answers or ``deadline`` seconds pass.
 
-    ``probe(url)`` returns an HTTP status code (int) when the server answered,
-    or None / raises when it is not up yet. ANY status line counts as alive (a
-    404 or 500 still means a server is listening -- the same rule the preview
-    uses for a bound port). Returns ``{"ok", "status", "url", "waited",
-    "error"}`` and never raises.
-    """
+    ``probe(url)`` returns an HTTP status (int) when it answered, None / raises
+    when it is not up yet. ANY status line counts as alive. Returns
+    ``{"ok", "status", "url", "waited", "error"}``; never raises."""
     now = now or time.monotonic
     sleep = sleep or time.sleep
     start = now()

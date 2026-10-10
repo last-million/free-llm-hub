@@ -26072,42 +26072,58 @@ def _dp_module():
         return None
 
 
-def _dp_augment_status(project_dir, st, http_check=False):
-    """Add a plain-language `deploy` block to a workspace status dict so the
-    Build page shows WHY an app is or is not running (monorepo layout, extra
-    setup, a database it needs, the live URL or the exact error) instead of a
-    bare "not running". Additive and best-effort: the existing keys are never
-    changed, the block is added only when there is something to say, and any
-    failure leaves `st` untouched. With `http_check`, it also confirms a running
-    preview actually answers over HTTP and reports the URL or the error."""
-    if not (_dp_enabled() and isinstance(st, dict)):
+_dp_analysis_cache = {}
+_dp_analysis_ttl = 30.0
+
+
+def _dp_cached_analysis(mod, project_dir):
+    """deploy_perfect.analyze, cached briefly per folder: it only READS (link-
+    and realpath-checked, capped), but a status read should not even repeat
+    that every time it is asked."""
+    key = os.path.normcase(os.path.abspath(project_dir))
+    now = time.time()
+    hit = _dp_analysis_cache.get(key)
+    if hit and now - hit[0] < _dp_analysis_ttl:
+        return hit[1]
+    plan = mod.analyze(project_dir)
+    if len(_dp_analysis_cache) > 256:
+        _dp_analysis_cache.clear()
+    _dp_analysis_cache[key] = (now, plan)
+    return plan
+
+
+def _dp_augment_status(project_dir, st, report=False):
+    """With `report` (the status GET's `deploy_check=1`), add a plain-language
+    `deploy` block -- layout, the setup a start will run, a database it needs,
+    the last error -- so the Build page shows WHY an app is or is not running
+    instead of a bare "not running".
+
+    REPORT ONLY: a status read never installs, builds, starts or probes
+    anything (no subprocess, no HTTP request); those happen only on an
+    explicit start. Additive: existing keys are never changed, the block is
+    added only when there is something to say, and any failure leaves `st`
+    untouched."""
+    if not (report and _dp_enabled() and isinstance(st, dict)):
         return st
     mod = _dp_module()
     if mod is None:
         return st
     try:
-        plan = mod.analyze(project_dir)
-        check = None
-        if http_check:
-            try:
-                check = workspace.deploy_check(project_dir)
-            except Exception:                                    # noqa: BLE001
-                check = None
-        line = mod.summary(plan, st)
+        plan = _dp_cached_analysis(mod, project_dir)
         block = {}
+        line = mod.summary(plan, st)
         if line:
             block["summary"] = line
         if plan.get("layout") not in (None, "single"):
             block["layout"] = plan.get("layout")
+        if plan.get("steps"):
+            block["on_start"] = [s.get("label") for s in plan["steps"]]
         if plan.get("notes"):
             block["notes"] = plan.get("notes")
         if plan.get("db", {}).get("required"):
             block["db"] = plan.get("db")
-        if check is not None:
-            block["http_ok"] = bool(check.get("ok"))
-            block["http_status"] = check.get("status")
-            if check.get("error"):
-                block["http_error"] = check.get("error")
+        if st.get("error"):
+            block["last_error"] = st.get("error")
         if block:
             st = dict(st)
             st["deploy"] = block
@@ -26138,7 +26154,7 @@ def api_workspace_status():
         except Exception:                                        # noqa: BLE001
             _log.debug("[workspace] discovery failed for %s", d, exc_info=True)
     st = _dp_augment_status(d, workspace.status(d),
-                            http_check=request.args.get("deploy_check") == "1")
+                            report=request.args.get("deploy_check") == "1")
     return jsonify(st)
 
 
