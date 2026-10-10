@@ -24,8 +24,10 @@ import pytest
 import app as A
 import config
 
-# The real trusted-folder reader, captured before any fixture patches it.
+# The real trusted-folder reader and the real Multi turn, captured before any
+# fixture patches them.
 _REAL_TRUSTED_CWD = A._cm_trusted_cwd
+_REAL_TURN_EVENTS = A._multi_turn_events
 
 
 # --------------------------------------------------------------------------- #
@@ -86,8 +88,10 @@ def cm(tmp_path, monkeypatch):
     monkeypatch.setattr(A.agentic_history, "set_auto_resume",
                         lambda sid, en: h["auto_resume"].append((sid, en)))
 
-    def _turn_events(sid, info, text):
-        h["turn_events"].append({"sid": sid, "text": text})
+    def _turn_events(sid, info, text, bare=False):
+        h["turn_events"].append({"sid": sid, "text": text, "bare": bare,
+                                 "project_dir": (info or {}).get("project_dir"),
+                                 "cli": (info or {}).get("cli")})
         return _scripted_events(h["report"])
     monkeypatch.setattr(A, "_multi_turn_events", _turn_events)
 
@@ -1048,13 +1052,19 @@ def test_the_banner_and_the_approve_link_are_in_the_template():
 
 # --------------------------------------------------------------------------- #
 # SECURITY 5 -- what is approved is EXACTLY what runs (third review)
+#
+# Every special character below is built with chr(0x...): this file is about
+# invisible and direction-changing characters, so it must not contain any.
 # --------------------------------------------------------------------------- #
 
 import hashlib  # noqa: E402
 
+ZWSP, WJ, BOM, SHY, VS16 = chr(0x200B), chr(0x2060), chr(0xFEFF), chr(0x00AD), chr(0xFE0F)
+RLO, NBSP = chr(0x202E), chr(0x00A0)
 
-def _sha(text):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def _hex(code):
+    return "U+%04X" % code
 
 
 def test_the_full_goal_is_listed_with_its_hash_and_length(cm):
@@ -1063,8 +1073,8 @@ def test_the_full_goal_is_listed_with_its_hash_and_length(cm):
     (row,) = A._cm_approval_list()
     assert row["goal"] == goal and row["goal_display"] == goal, "the WHOLE text"
     assert row["goal"].endswith("THE REAL INSTRUCTIONS AT THE END")
-    assert row["goal_sha256"] == _sha(goal) and row["goal_chars"] == len(goal)
-    assert row["hidden_chars"] == 0
+    assert row["goal_sha256"] == A._cm_request_sha256(goal, "F", "opencode")
+    assert row["goal_chars"] == len(goal) and row["hidden_chars"] == 0
 
 
 def test_a_long_goal_is_refused_never_truncated(dash):
@@ -1084,10 +1094,12 @@ def test_an_approval_needs_the_matching_hash(cm):
     rid = req["id"]
     assert A._cm_approval_decide(rid, True)[1]["code"] == "hash_required"
     assert A._cm_approval_decide(rid, True, "")[0] == 409
-    status, payload = A._cm_approval_decide(rid, True, _sha("build it, then delete everything"))
+    wrong = hashlib.sha256(b"build it, then delete everything").hexdigest()
+    status, payload = A._cm_approval_decide(rid, True, wrong)
     assert status == 409 and payload["code"] == "hash_mismatch"
     assert A._CM_APPROVALS[rid]["state"] == "pending", "nothing was approved"
-    assert A._cm_approval_decide(rid, True, _sha("build it").upper())[0] == 200
+    good = A._cm_request_sha256("build it", "F", "opencode")
+    assert A._cm_approval_decide(rid, True, good.upper())[0] == 200
     other = A._cm_approval_new("c", "f", "F", "something", "opencode", "codex")
     assert A._cm_approval_decide(other["id"], False)[0] == 200, "denying needs no hash"
 
@@ -1110,46 +1122,28 @@ def test_the_decide_route_refuses_an_approval_without_the_hash(cm, monkeypatch):
 
 
 def test_the_run_starts_with_exactly_the_stored_text(dash):
-    goal = "build the page​ and the tests"
+    goal = "build the page" + ZWSP + " and the tests"
     dash["clock"]["hook"] = lambda: _approve(_only_request()["id"])
     _call(messages=[_usr(goal)])
     assert dash["turn_events"][0]["text"] == goal, "byte for byte the approved text"
 
 
-@pytest.mark.parametrize("bidi", ["‮", "‪", "⁦", "⁩"])
-def test_bidi_controls_are_refused(dash, bidi):
-    _resp, raw = _call(messages=[_usr("rename invoice" + bidi + "fdp.exe to report")])
-    text = _content(raw)
-    assert "change the direction of text" in text and "U+%04X" % ord(bidi) in text
-    assert A._CM_APPROVALS == {} and dash["turn_events"] == []
-    assert A._cm_goal_problem("ok" + bidi) and A._cm_goal_problem("plain text") is None
-
-
-def test_zero_width_and_other_hidden_characters_are_shown_visibly(cm):
-    goal = ("a​b‏c⁠d﻿e\U000E0041f­g️h\x07i"
-            "\nline two\twith a tab\r\n")
-    A._cm_approval_new("c", "f", "F", goal, "opencode", "codex")
-    (row,) = A._cm_approval_list()
-    assert row["goal"] == goal and row["goal_sha256"] == _sha(goal), "stored and hashed exactly"
-    assert row["goal_display"] == ("a[U+200B]b[U+200F]c[U+2060]d[U+FEFF]e[U+E0041]f"
-                                   "[U+00AD]g[U+FE0F]h[U+0007]i\nline two\twith a tab\r\n")
-    assert row["hidden_chars"] == 8, "tab, newline and CR stay as they are"
-
-
 def test_mcp_uses_the_same_rules(cm, monkeypatch, mcp_started):
     monkeypatch.setattr(A, "_cm_approval_mode", lambda: "dashboard")
-    out, text = _mcp_start({"goal": "go‮exe.txt", "project_dir": cm["proj"]})
+    out, text = _mcp_start({"goal": "go" + RLO + "exe.txt", "project_dir": cm["proj"]})
     assert out.get("isError") and "direction" in text
+    out, text = _mcp_start({"goal": "run" + chr(0xE0041), "project_dir": cm["proj"]})
+    assert out.get("isError") and "tag characters" in text
     out, text = _mcp_start({"goal": "x" * (A._CM_GOAL_MAX_CHARS + 1), "project_dir": cm["proj"]})
     assert out.get("isError") and "characters long" in text
     assert A._CM_APPROVALS == {}, "nothing stored for a refused request"
-    data = json.loads(_mcp_start({"goal": "fix​it", "project_dir": cm["proj"]})[1])
+    data = json.loads(_mcp_start({"goal": "fix" + ZWSP + "it", "project_dir": cm["proj"]})[1])
     (row,) = A._cm_approval_list()
     assert row["goal_display"] == "fix[U+200B]it" and row["source"] == "mcp"
     assert A._cm_approval_decide(data["id"], True)[0] == 409, "the hash is required"
     _approve(data["id"])
     _mcp_start({"goal": "ignored", "project_dir": cm["proj"], "id": data["id"]})
-    assert mcp_started == [("fix​it", os.path.abspath(cm["proj"]), "opencode")]
+    assert mcp_started == [("fix" + ZWSP + "it", os.path.abspath(cm["proj"]), "opencode")]
 
 
 def test_approve_is_disabled_until_the_full_request_was_opened():
@@ -1159,6 +1153,8 @@ def test_approve_is_disabled_until_the_full_request_was_opened():
     render = block[block.index("function cmApproveRender"):block.index("function cmApproveDecide")]
     decide = block[block.index("function cmApproveDecide"):block.index("function loadCliMultiPending")]
     assert "r.goal_display" in render, "the banner shows the marked-up full text"
+    assert "r.folder_display" in render and "r.helper_cli_display" in render, \
+        "the folder and helper CLI are shown with the same markers"
     assert "'Show the full request (' + chars + ' characters)'" in render
     assert "full.textContent = shown" in render
     assert "innerHTML" not in render and "innerHTML" not in decide
@@ -1170,3 +1166,199 @@ def test_approve_is_disabled_until_the_full_request_was_opened():
     css = [ln for ln in src.splitlines() if ln.strip().startswith(".cm-approve-full{")][0]
     for need in ("var(--mono)", "overflow:auto", "max-height", "white-space:pre-wrap"):
         assert need in css
+
+
+# --------------------------------------------------------------------------- #
+# SECURITY 6 -- an ALLOW-list for what is shown; refused classes; approved runs
+# receive ONLY what was approved (fourth review)
+# --------------------------------------------------------------------------- #
+
+MARKED_CODES = [
+    0x200B, 0x2060, 0xFEFF, 0x00AD, 0x180E, 0xFFF9,       # format (Cf)
+    0x0007, 0x001B, 0x007F, 0x0085,                       # control (Cc)
+    0xE000, 0xF8FF,                                       # private use (Co)
+    0x0378, 0xFDD0,                                       # unassigned / noncharacter (Cn)
+    0xD800,                                               # a lone surrogate (Cs)
+    0x00A0, 0x2003, 0x3000, 0x202F,                       # spaces other than U+0020
+    0x2028, 0x2029,                                       # line / paragraph separator
+    0xFE00, 0xFE0F, 0xE0100, 0xE01EF, 0x180B,             # variation selectors
+    0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0xFFFC,       # glyphless letters / symbols
+    0x2061, 0x2062, 0x2063, 0x2064, 0x034F, 0x17B4,       # invisible operators / marks
+]
+
+
+@pytest.mark.parametrize("code", MARKED_CODES, ids=[_hex(c) for c in MARKED_CODES])
+def test_each_hidden_class_is_shown_as_a_marker(cm, code):
+    goal = "ab" + chr(code) + "cd"
+    A._cm_approval_new("c", "f", "F", goal, "opencode", "codex")
+    (row,) = A._cm_approval_list()
+    assert row["goal"] == goal, "the stored text is unchanged"
+    assert row["goal_display"] == "ab[%s]cd" % _hex(code)
+    assert row["hidden_chars"] == 1
+
+
+DIACRITICS = {
+    "french-combining": "cafe" + chr(0x0301),
+    "french-precomposed": "na" + chr(0x00EF) + "ve r" + chr(0x00E9) + "sum" + chr(0x00E9),
+    "arabic": "".join(chr(c) for c in (0x0643, 0x064E, 0x062A, 0x064E, 0x0628, 0x064E)),
+    "vietnamese": "e" + chr(0x0323) + chr(0x0302),
+    "devanagari": "".join(chr(c) for c in (0x0915, 0x094D, 0x0937, 0x093E)),
+    "hebrew": "".join(chr(c) for c in (0x05E9, 0x05C1, 0x05B8, 0x05DC)),
+}
+
+
+@pytest.mark.parametrize("name", sorted(DIACRITICS))
+def test_diacritics_after_a_base_letter_stay_plain(name):
+    text = DIACRITICS[name]
+    shown, marked = A._cm_goal_display(text)
+    assert shown == text and marked == 0
+
+
+ISOLATED = [
+    ("start", chr(0x0301) + "abc", "[U+0301]abc"),
+    ("after-space", "ab " + chr(0x0301) + "c", "ab [U+0301]c"),
+    ("after-digit", "12" + chr(0x0301), "12[U+0301]"),
+    ("on-a-filler", chr(0x3164) + chr(0x0301), "[U+3164][U+0301]"),
+    ("stacked-past-the-limit", "a" + chr(0x0301) * 6,
+     "a" + chr(0x0301) * 4 + "[U+0301][U+0301]"),
+]
+
+
+@pytest.mark.parametrize("name,text,expected", ISOLATED, ids=[i[0] for i in ISOLATED])
+def test_an_isolated_or_overstacked_combining_mark_is_marked(name, text, expected):
+    assert A._cm_goal_display(text)[0] == expected
+
+
+def test_line_endings_are_canonical_and_not_marked(cm):
+    A._cm_approval_new("c", "f", "F", "one\r\ntwo\rthree\tfour", "opencode", "codex")
+    (row,) = A._cm_approval_list()
+    assert row["goal"] == "one\ntwo\nthree\tfour" and row["hidden_chars"] == 0
+    assert row["goal_sha256"] == A._cm_request_sha256("one\ntwo\nthree\tfour", "F", "opencode")
+
+
+BIDI = [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069,
+        0x061C, 0x200E, 0x200F]
+
+
+@pytest.mark.parametrize("code", BIDI, ids=[_hex(c) for c in BIDI])
+def test_every_bidi_control_and_mark_is_refused(cm, code):
+    p = A._cm_goal_problem("ok" + chr(code) + "ok")
+    assert p and "change the direction of text" in p and _hex(code) in p
+    with pytest.raises(ValueError):
+        A._cm_approval_new("c", "f", "F", "ok" + chr(code), "opencode", "codex")
+    assert A._CM_APPROVALS == {}
+
+
+TAGS = [0xE0000, 0xE0001, 0xE0020, 0xE0041, 0xE005A, 0xE007E, 0xE007F]
+
+
+@pytest.mark.parametrize("code", TAGS, ids=[_hex(c) for c in TAGS])
+def test_every_tag_character_sample_is_refused(cm, code):
+    p = A._cm_goal_problem("run this" + chr(code))
+    assert p and "tag characters" in p and _hex(code) in p
+    with pytest.raises(ValueError):
+        A._cm_approval_new("c", "f", "F", "run" + chr(code), "opencode", "codex")
+
+
+def test_more_than_20_marked_characters_are_refused(cm):
+    assert A._cm_goal_problem("x" + NBSP * 20) is None, "20 markers: accepted"
+    p = A._cm_goal_problem("x" + NBSP * 21)
+    assert p and "21 characters" in p and "at most 20" in p
+    # counted over everything shown: goal + folder + helper CLI
+    p = A._cm_request_problem("x" + NBSP * 15, "F" + NBSP * 6, "opencode")
+    assert p and "21 characters" in p
+
+
+def test_the_folder_and_helper_cli_names_follow_the_same_rules(cm):
+    assert "project folder" in A._cm_request_problem("ok", "F" + RLO, "opencode")
+    assert "helper CLI" in A._cm_request_problem("ok", "F", "open" + chr(0xE0041))
+    A._cm_approval_new("c", "f", "F" + NBSP + "G", "ok", "open" + ZWSP + "code", "codex")
+    (row,) = A._cm_approval_list()
+    assert row["folder_display"] == "F[U+00A0]G"
+    assert row["helper_cli_display"] == "open[U+200B]code"
+    assert row["hidden_chars"] == 2
+
+
+@pytest.mark.parametrize("goal", ["run" + chr(0xE0041) + "this", "x" + NBSP * 21 + "y",
+                                  "rename" + chr(0x200F) + "it"],
+                         ids=["tag", "too-many-markers", "rlm"])
+def test_a_refused_request_never_becomes_pending_from_the_cli(dash, goal):
+    # (inside the text: the CLI path trims leading/trailing whitespace, NBSP
+    # included, before anything is stored -- what is stored is what is shown)
+    _resp, raw = _call(messages=[_usr(goal)])
+    assert "Nothing was started" in _content(raw)
+    assert A._CM_APPROVALS == {} and dash["turn_events"] == []
+
+
+def test_dashboard_runs_are_bare_and_the_other_modes_are_not(dash, monkeypatch):
+    dash["clock"]["hook"] = lambda: _approve(_only_request()["id"])
+    _call()
+    assert dash["turn_events"][-1]["bare"] is True, "an approved run is bare"
+    A._MULTI_RUNS.clear()
+    monkeypatch.setattr(A, "_cm_approval_mode", lambda: "off")
+    _call(messages=[_usr("a different job: add a footer")])
+    assert dash["turn_events"][-1]["bare"] is False, "off keeps today's context"
+
+
+def test_an_approved_run_receives_only_the_approved_goal_and_folder(dash, monkeypatch):
+    """The REAL _multi_turn_events(bare=True): the run gets the approved goal,
+    the approved folder and the approved helper CLI -- no conversation context,
+    no board goal brief, no resume of an earlier run -- and the SHA-256 the
+    owner approved covers exactly those."""
+    seen, context_calls, resumed, listed = {}, [], [], {}
+    monkeypatch.setattr(A, "_multi_turn_events", _REAL_TURN_EVENTS)
+    monkeypatch.setattr(A, "_multi_context",
+                        lambda *a, **k: context_calls.append(1) or "UNAPPROVED CONTEXT")
+    monkeypatch.setattr(A, "_goal_brief_for_project", lambda d: "UNAPPROVED BRIEF")
+    monkeypatch.setattr(A, "_MULTI_POLL", 0.0)
+    monkeypatch.setattr(A, "_multi_link_tasks", lambda *a, **k: None)
+    for name in ("note_turn", "remember_recent", "remember_fact"):
+        monkeypatch.setattr(A.memory, name, lambda *a, **k: 1)
+
+    def _start(goal, project_dir, cli_id, spawn, run_turn, **kw):
+        seen.update(goal=goal, project_dir=project_dir, cli=cli_id, kw=kw)
+        return "run-bare"
+    monkeypatch.setattr(A.swarm_windows, "start", _start)
+    monkeypatch.setattr(A.swarm_windows, "last_run_for", lambda sid: object())
+    monkeypatch.setattr(A.swarm_windows, "unfinished", lambda prev: ["an unfinished phase"])
+    monkeypatch.setattr(A.swarm_windows, "resume",
+                        lambda *a, **k: resumed.append(1) or "run-old")
+
+    def _hook():
+        (row,) = A._cm_approval_list()
+        listed.update(row)
+        _approve(row["id"])
+    dash["clock"]["hook"] = _hook
+    # "continue" with an unfinished earlier run: still a FRESH, bare run.
+    _call(messages=[_usr("continue")])
+    assert seen, "the run started"
+    assert seen["goal"] == "continue" == listed["goal"]
+    assert os.path.normcase(seen["project_dir"]) == os.path.normcase(listed["folder"])
+    assert seen["cli"] == listed["helper_cli"]
+    assert "context" not in seen["kw"], "no conversation context reaches the planner/workers"
+    assert seen["kw"].get("goal_brief") is None, "no board goal brief"
+    assert context_calls == [] and resumed == [], "never built, never resumed"
+    assert "UNAPPROVED" not in repr(seen)
+    assert listed["goal_sha256"] == A._cm_request_sha256(
+        seen["goal"], seen["project_dir"], seen["cli"]), "the hash covers what runs"
+
+
+def test_the_mcp_approved_run_receives_only_the_stored_request(cm, monkeypatch):
+    monkeypatch.setattr(A, "_cm_approval_mode", lambda: "dashboard")
+    seen = {}
+
+    def _start(goal, project_dir, cli_id, spawn, run_turn, **kw):
+        seen.update(goal=goal, project_dir=project_dir, cli=cli_id, kw=kw)
+        return "run-mcp"
+    monkeypatch.setattr(A.swarm_windows, "start", _start)
+    data = json.loads(_mcp_start({"goal": "refactor the parser", "project_dir": cm["proj"],
+                                  "cli": "codex"})[1])
+    (row,) = A._cm_approval_list()
+    _approve(data["id"])
+    _mcp_start({"goal": "IGNORED", "project_dir": cm["tmp"].as_posix(), "cli": "x",
+                "id": data["id"]})
+    assert (seen["goal"], seen["cli"]) == ("refactor the parser", "codex")
+    assert os.path.normcase(seen["project_dir"]) == os.path.normcase(row["folder"])
+    assert "context" not in seen["kw"] and "goal_brief" not in seen["kw"]
+    assert row["goal_sha256"] == A._cm_request_sha256(
+        seen["goal"], seen["project_dir"], seen["cli"])

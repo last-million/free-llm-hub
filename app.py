@@ -20613,11 +20613,17 @@ def _multi_context(session_id, project_dir, text, prev=None):
     return "\n\n".join(parts).strip()[:swarm_windows.CONTEXT_CHARS]
 
 
-def _multi_turn_events(session_id, sess_info, text):
+def _multi_turn_events(session_id, sess_info, text, bare=False):
     """A turn in the "multi" tier: `text` is the goal of a swarm_windows run in
     this conversation's folder, under this conversation's CLI. Whether a
     message is work at all is decided by the routes (_multi_wants_a_swarm);
     a question is answered by the conversation itself.
+
+    bare=True (a terminal-CLI / MCP request the owner APPROVED in the hub
+    dashboard, see _cm_dashboard_turn): the run receives ONLY the approved goal
+    and the folder -- no conversation context (memory, recap, previous run), no
+    board goal brief, never a resume of an earlier run -- so what runs is
+    exactly what was approved. The Build page never passes it.
 
     Yields the normalized events send_message_stream yields, so the route and
     the page treat it as an ordinary turn:
@@ -20653,8 +20659,8 @@ def _multi_turn_events(session_id, sess_info, text):
     # what came before it: the previous run in this conversation, the rolling
     # recap, the session's memory.
     prev = swarm_windows.last_run_for(session_id)
-    context = _multi_context(session_id, project_dir, text, prev)
-    if _multi_is_continue(text) and swarm_windows.unfinished(prev):
+    context = "" if bare else _multi_context(session_id, project_dir, text, prev)
+    if not bare and _multi_is_continue(text) and swarm_windows.unfinished(prev):
         # "continue" after a run that left phases unfinished resumes THOSE
         # phases -- never a fresh plan whose goal is the word "continue".
         todo = swarm_windows.unfinished(prev)
@@ -20700,7 +20706,7 @@ def _multi_turn_events(session_id, sess_info, text):
         default_mode=_session_mode_or_none(sess_info),
         on_done=_multi_owner_record,
         owner=session_id,
-        goal_brief=_goal_brief_for_project(project_dir),
+        goal_brief=None if bare else _goal_brief_for_project(project_dir),
         **_multi_budget_kwargs(session_id),
         **dict(_swarm_windows_manager_kw(), **({"context": context} if context else {})))
     yield {"event": "tool", "text": _MULTI_PLANNING_LINE}
@@ -21373,60 +21379,145 @@ _CM_GOAL_LOG_CHARS = 80         # never log more of a goal than this
 # [U+XXXX] markers (everything else invisible), and the run starts with exactly
 # the stored text.
 _CM_GOAL_MAX_CHARS = 20000      # an approval request holds at most this many
-_CM_BIDI_CONTROLS = frozenset(list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)))
+# Fourth review (of af7fc30): an ALLOW-list, not a deny-list, decides what the
+# banner shows as plain text; everything else is shown as a visible [U+XXXX]
+# marker and counted. Refused outright: the bidi controls and marks below,
+# every Unicode TAG character (U+E0000-U+E007F, "ASCII smuggling": invisible to
+# people, read as text by models), and more than _CM_MAX_MARKED markers.
+_CM_REFUSED_BIDI = frozenset(list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A))
+                             + [0x061C, 0x200E, 0x200F])
+_CM_MAX_MARKED = 20             # more markers than this = refused
+_CM_MAX_MARKS_PER_BASE = 4      # combining marks stacked on one letter, shown plain
+# Lettered or symbol characters that draw NO glyph (Hangul fillers, the blank
+# braille cell, ...), plus the invisible format/mark characters named in the
+# review, so their category never lets them through as plain text.
+_CM_GLYPHLESS = frozenset([0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x180E,
+                           0x2061, 0x2062, 0x2063, 0x2064, 0x034F, 0x17B4, 0x17B5,
+                           0xFFFC])
 
 
-def _cm_is_hidden_char(ch):
-    """Invisible in a browser, or able to change how text around it is shown:
-    format characters (Cf: zero-width U+200B-U+200F, U+2060-U+2064, U+FEFF, the
-    bidi controls, tag characters, soft hyphen...), control characters (Cc)
-    other than tab / newline / carriage return, and variation selectors
-    (invisible, and a known way to smuggle text into a prompt)."""
+def _cm_is_variation_selector(o):
+    """Variation selectors (invisible; a known way to smuggle text into a
+    prompt), Mongolian free variation selectors included."""
+    return (0xFE00 <= o <= 0xFE0F or 0xE0100 <= o <= 0xE01EF
+            or o in (0x180B, 0x180C, 0x180D, 0x180F))
+
+
+def _cm_canonical_goal(text):
+    """Line endings as plain newlines (a pasted CR / CRLF would otherwise be a
+    marked control character). The canonical text is what is shown, hashed and
+    run -- nothing else changes."""
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _cm_goal_display(text):
+    """(shown, marked): the text as the owner sees it, and how many characters
+    were marked. ALLOW-LIST: shown as-is are ONLY the ASCII space, newline and
+    tab; letters, numbers, punctuation and symbols (categories L, N, P, S) that
+    draw a glyph; and combining marks (Mn/Mc/Me) that follow a base LETTER, up to
+    _CM_MAX_MARKS_PER_BASE on one letter (so Arabic / French diacritics stay
+    readable). EVERYTHING else is shown as a visible [U+XXXX] marker: every
+    format / control / private-use / surrogate / unassigned character, every
+    space other than U+0020 (U+00A0, U+3000, U+2028, U+2029...), variation
+    selectors, glyphless letters and symbols (_CM_GLYPHLESS), an isolated
+    combining mark. The stored text (what runs, what is hashed) is unchanged."""
     import unicodedata
-    if ch in "\t\n\r":
-        return False
-    o = ord(ch)
-    if 0xFE00 <= o <= 0xFE0F or 0xE0100 <= o <= 0xE01EF:
-        return True
-    return unicodedata.category(ch) in ("Cf", "Cc")
-
-
-def _cm_goal_display(goal):
-    """(text, hidden): the goal as the owner sees it -- every hidden character
-    replaced by a visible [U+XXXX] marker -- and how many there were. The
-    stored goal (what runs, what is hashed) is never changed."""
-    out, hidden = [], 0
-    for ch in goal or "":
-        if _cm_is_hidden_char(ch):
-            out.append("[U+%04X]" % ord(ch))
-            hidden += 1
-        else:
+    out, marked = [], 0
+    base, marks = False, 0          # last plain character was a letter; marks on it
+    for ch in text or "":
+        o = ord(ch)
+        cat = unicodedata.category(ch)
+        plain = False
+        if ch in " \n\t":
+            plain, base, marks = True, False, 0
+        elif o in _CM_GLYPHLESS or _cm_is_variation_selector(o):
+            plain = False
+        elif cat[0] in "LNPS":
+            plain, base, marks = True, cat[0] == "L", 0
+        elif cat in ("Mn", "Mc", "Me") and base and marks < _CM_MAX_MARKS_PER_BASE:
+            plain, marks = True, marks + 1
+        if plain:
             out.append(ch)
-    return "".join(out), hidden
+            continue
+        out.append("[U+%04X]" % o)
+        marked += 1
+        if cat[0] != "M":           # a marked non-mark character anchors nothing
+            base, marks = False, 0
+    return "".join(out), marked
+
+
+def _cm_refused_chars(text):
+    """(bidi, tags): code points that make a request refused outright."""
+    points = [ord(ch) for ch in text or ""]
+    return (sorted({o for o in points if o in _CM_REFUSED_BIDI}),
+            sorted({o for o in points if 0xE0000 <= o <= 0xE007F}))
+
+
+def _cm_codes(points, limit=6):
+    shown = ", ".join("U+%04X" % o for o in points[:limit])
+    return shown + (" and %d more" % (len(points) - limit) if len(points) > limit else "")
 
 
 def _cm_goal_problem(goal):
     """Why this goal cannot be offered for approval (a plain sentence), or
-    None. Too long is REFUSED, never cut; bidi controls are refused because
-    they can make the text shown for approval read differently from what
-    would run."""
-    g = goal or ""
+    None: longer than _CM_GOAL_MAX_CHARS (REFUSED, never cut); a bidi control or
+    mark (it can make the text shown read differently from what would run); a
+    tag character (invisible to people, read as text by a model); more than
+    _CM_MAX_MARKED characters that would have to be shown as markers."""
+    g = _cm_canonical_goal(goal)
     if len(g) > _CM_GOAL_MAX_CHARS:
         return ("This Multi request is %d characters long; a request for approval "
                 "may be at most %d, so the owner can read all of it. Shorten it (put "
                 "long details in a file in the project and refer to it), then send "
                 "it again. Nothing was started." % (len(g), _CM_GOAL_MAX_CHARS))
-    bidi = sorted({"U+%04X" % ord(ch) for ch in g if ord(ch) in _CM_BIDI_CONTROLS})
+    bidi, tags = _cm_refused_chars(g)
     if bidi:
         return ("This Multi request contains characters that change the direction "
                 "of text (%s), which can make the text shown for approval differ "
                 "from what would run. Remove them, then send it again. Nothing was "
-                "started." % ", ".join(bidi))
+                "started." % _cm_codes(bidi))
+    if tags:
+        return ("This Multi request contains invisible Unicode tag characters (%s): "
+                "people cannot see them, but a model reads them as text. Remove "
+                "them, then send it again. Nothing was started." % _cm_codes(tags))
+    marked = _cm_goal_display(g)[1]
+    if marked > _CM_MAX_MARKED:
+        return ("This Multi request contains %d characters that cannot be shown as "
+                "plain text (they would appear as [U+XXXX] for review); at most %d "
+                "are accepted. Remove them, then send it again. Nothing was "
+                "started." % (marked, _CM_MAX_MARKED))
     return None
 
 
-def _cm_goal_sha256(goal):
-    return hashlib.sha256((goal or "").encode("utf-8", "surrogatepass")).hexdigest()
+def _cm_request_problem(goal, folder, helper_cli):
+    """_cm_goal_problem, plus the same refusals for the folder and helper CLI
+    names (also shown for approval, also covered by the hash), and the marker
+    limit counted over all three."""
+    p = _cm_goal_problem(goal)
+    if p:
+        return p
+    for label, value in (("project folder", folder), ("helper CLI", helper_cli)):
+        bidi, tags = _cm_refused_chars(value)
+        if bidi or tags:
+            return ("The %s name contains characters that can hide or reorder text "
+                    "(%s). Nothing was started." % (label, _cm_codes(bidi + tags)))
+    total = sum(_cm_goal_display(x)[1]
+                for x in (_cm_canonical_goal(goal), folder or "", helper_cli or ""))
+    if total > _CM_MAX_MARKED:
+        return ("This Multi request contains %d characters that cannot be shown as "
+                "plain text; at most %d are accepted. Nothing was started."
+                % (total, _CM_MAX_MARKED))
+    return None
+
+
+def _cm_request_sha256(goal, folder, helper_cli):
+    """SHA-256 of the canonical JSON of EVERYTHING an approved run receives:
+    the goal, the folder and the helper CLI (approved runs get no other context,
+    see _multi_turn_events(bare=True)). Listed as `goal_sha256`."""
+    blob = json.dumps({"folder": folder or "", "goal": goal or "",
+                       "helper_cli": helper_cli or ""},
+                      sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _cm_now():
@@ -21471,16 +21562,20 @@ def _cm_approval_new(convkey, folder_key, folder_display, goal, helper_cli,
                      caller_cli, source="cli"):
     """Record a SINGLE-USE request for the owner's approval; returns a copy.
     In memory, bounded to _CM_APPROVAL_MAX (the oldest goes first). The goal is
-    stored WHOLE with its SHA-256; a goal _cm_goal_problem refuses raises
-    ValueError (the callers check first and answer in plain words)."""
-    problem = _cm_goal_problem(goal)
+    stored WHOLE (line endings canonical) with the SHA-256 of everything an
+    approved run receives (_cm_request_sha256); a request _cm_request_problem
+    refuses raises ValueError (the callers check first and answer in plain
+    words)."""
+    goal = _cm_canonical_goal(goal)
+    problem = _cm_request_problem(goal, folder_display, helper_cli)
     if problem:
         raise ValueError(problem)
     now = _cm_now()
     rid = uuid.uuid4().hex
     row = {"id": rid, "conv": convkey, "folder": folder_key,
-           "folder_display": folder_display, "goal": goal or "",
-           "goal_sha256": _cm_goal_sha256(goal), "goal_chars": len(goal or ""),
+           "folder_display": folder_display, "goal": goal,
+           "goal_sha256": _cm_request_sha256(goal, folder_display, helper_cli),
+           "goal_chars": len(goal),
            "helper_cli": helper_cli, "caller_cli": caller_cli or "unknown",
            "source": source, "created": now, "expires": now + _CM_APPROVAL_TTL,
            "state": "pending"}
@@ -21574,10 +21669,14 @@ def _cm_approval_list():
     out = []
     for r in rows:
         shown, hidden = _cm_goal_display(r["goal"])
+        folder_shown, f_hidden = _cm_goal_display(r["folder_display"])
+        cli_shown, c_hidden = _cm_goal_display(r["helper_cli"])
         out.append({"id": r["id"], "folder": r["folder_display"],
+                    "folder_display": folder_shown,
+                    "helper_cli": r["helper_cli"], "helper_cli_display": cli_shown,
                     "goal": r["goal"], "goal_display": shown,
                     "goal_sha256": r["goal_sha256"], "goal_chars": r["goal_chars"],
-                    "hidden_chars": hidden,
+                    "hidden_chars": hidden + f_hidden + c_hidden,
                     "caller": r["caller_cli"], "source": r["source"],
                     "created": r["created"], "expires": r["expires"]})
     return out
@@ -22035,7 +22134,7 @@ def _cm_attach(body, protocol, owner_sid, run_id, cmd, helper_cli, safe, est,
                                     _cm_helper_count(), header), est)
 
 
-def _cm_launcher(mapkey, folder_key, project_dir, helper_cli, consent=None):
+def _cm_launcher(mapkey, folder_key, project_dir, helper_cli, consent=None, bare=False):
     """Capture NOW, inside the request, what a run start needs -- the category in
     force and a copy of the request context (the planner routes through the
     hub's chain, which reads it; the Build route hands live_run its copy the same
@@ -22057,7 +22156,10 @@ def _cm_launcher(mapkey, folder_key, project_dir, helper_cli, consent=None):
         if not owner_sid:
             return None
         _cm_map_put(mapkey, owner_sid, None, folder=folder_key, consent=consent)
-        producer = _multi_turn_events(owner_sid, sess_info, goal)
+        # bare = an approved request: the run receives ONLY the approved goal
+        # and folder (no conversation context, no goal brief, no resume).
+        producer = (_multi_turn_events(owner_sid, sess_info, goal, bare=True) if bare
+                    else _multi_turn_events(owner_sid, sess_info, goal))
         try:
             events = (agentic_chat.live_run(owner_sid, producer, context=ctx)
                       if ctx is not None else agentic_chat.live_run(owner_sid, producer))
@@ -22072,12 +22174,12 @@ def _cm_launcher(mapkey, folder_key, project_dir, helper_cli, consent=None):
 
 
 def _cm_start(body, protocol, mapkey, folder_key, project_dir, helper_cli, safe,
-              est, goal, consent=None, lead=""):
+              est, goal, consent=None, lead="", bare=False):
     """Start the run EXACTLY like the Build page and answer the CLI turn with its
     live text (owner conversation, _multi_turn_events made durable by live_run).
     None when the owner conversation cannot be opened."""
-    pieces = _cm_launcher(mapkey, folder_key, project_dir, helper_cli, consent)(
-        goal, safe, lead)
+    pieces = _cm_launcher(mapkey, folder_key, project_dir, helper_cli, consent,
+                          bare=bare)(goal, safe, lead)
     if pieces is None:
         return None
     return _cm_emit(body, protocol, pieces, est)
@@ -22132,7 +22234,10 @@ def _cm_dashboard_turn(body, protocol, goal, est, convkey, mapkey, folder_key,
                        project_dir, helper_cli, caller, safe):
     """cli_multi_approval = "dashboard": nothing starts without the owner's
     Approve in the hub dashboard (routes gated by the control token). A request
-    is single-use. Returns a response, or None for today's path."""
+    is single-use. An approved run is BARE: it receives exactly the STORED goal,
+    folder and helper CLI (what the owner saw and the SHA-256 covers) and no
+    other context. Returns a response, or None for today's path."""
+    goal = _cm_canonical_goal(goal)
     wants = []                       # _multi_wants_a_swarm may ask a model: once
 
     def _work():
@@ -22145,10 +22250,10 @@ def _cm_dashboard_turn(body, protocol, goal, est, convkey, mapkey, folder_key,
         # Approved after an earlier turn ended: THIS turn starts it (consumed).
         got = _cm_approval_consume(req["id"])
         if got is not None:
-            out = _cm_start(body, protocol, mapkey, folder_key, project_dir,
-                            got.get("helper_cli") or helper_cli, safe, est, got["goal"],
+            out = _cm_start(body, protocol, mapkey, folder_key, got["folder_display"],
+                            got["helper_cli"], safe, est, got["goal"],
                             lead="Starting the Multi request you approved in the hub "
-                                 "dashboard.\n")
+                                 "dashboard.\n", bare=True)
             return out if out is not None else _cm_say(
                 body, protocol, "Multi could not start: the hub could not open a "
                                 "conversation for it.\n", est)
@@ -22160,25 +22265,26 @@ def _cm_dashboard_turn(body, protocol, goal, est, convkey, mapkey, folder_key,
                        "Nothing was started.\n" % project_dir, est)
     if req and req["state"] == "pending":
         if goal != req["goal"] and _work():
-            problem = _cm_goal_problem(goal)
+            problem = _cm_request_problem(goal, project_dir, helper_cli)
             if problem:                            # refused; the earlier request stays
                 return _cm_say(body, protocol, problem + "\n", est)
             _cm_approval_discard(req["id"])        # the newest instruction replaces it
             req = None
         else:                                      # wait on the SAME request again
-            launch = _cm_launcher(mapkey, folder_key, project_dir,
-                                  req.get("helper_cli") or helper_cli)
+            launch = _cm_launcher(mapkey, folder_key, req["folder_display"],
+                                  req["helper_cli"], bare=True)
             lead = ("Multi is still waiting for your approval in the hub dashboard: "
                     "%s (or the banner on any hub page). Waiting...\n"
                     % _cm_approve_url(req["id"]))
             return _cm_emit(body, protocol, _cm_approval_stream(req, launch, safe, lead), est)
     if not _work():
         return None
-    problem = _cm_goal_problem(goal)
-    if problem:                                    # too long / bidi: refused, never cut
+    problem = _cm_request_problem(goal, project_dir, helper_cli)
+    if problem:                    # too long / bidi / tag / too many markers: refused
         return _cm_say(body, protocol, problem + "\n", est)
     req = _cm_approval_new(convkey, folder_key, project_dir, goal, helper_cli, caller)
-    launch = _cm_launcher(mapkey, folder_key, project_dir, helper_cli)
+    launch = _cm_launcher(mapkey, folder_key, req["folder_display"], req["helper_cli"],
+                          bare=True)
     lead = ("Multi wants to start up to %d helper agents that edit files and run "
             "commands in %s. Approve it in the hub dashboard: %s (or the banner on "
             "any hub page). Waiting...\n"
@@ -22352,11 +22458,13 @@ def _cm_mcp_start(goal, project_dir, cli):
     folder = os.path.abspath(str(project_dir))
     if not os.path.isdir(folder):
         raise RuntimeError("project_dir must be an existing folder")
-    problem = _cm_goal_problem(goal)       # the same rules as a CLI request
+    goal = _cm_canonical_goal(goal)
+    helper = str(cli or "opencode")
+    problem = _cm_request_problem(goal, folder, helper)   # the CLI request's rules
     if problem:
         raise RuntimeError(problem)
-    req = _cm_approval_new("mcp", _cm_folder_key(folder), folder, goal,
-                           str(cli or "opencode"), "mcp", source="mcp")
+    req = _cm_approval_new("mcp", _cm_folder_key(folder), folder, goal, helper, "mcp",
+                           source="mcp")
     return _cm_mcp_pending(req["id"])
 
 
@@ -22376,6 +22484,8 @@ def _cm_mcp_start_approved(rid):
     got = _cm_approval_consume(rid)
     if got is None:
         raise RuntimeError("this request was already used")
+    # Exactly the stored goal, folder and cli (what the SHA-256 covers); the MCP
+    # start passes no conversation context and no goal brief.
     return _cm_mcp_swarm_start_now(got["goal"], got["folder_display"], got["helper_cli"])
 
 

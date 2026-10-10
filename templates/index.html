@@ -15144,10 +15144,15 @@
       row.setAttribute('data-id', id);
       var txt = document.createElement('span');
       txt.className = 'cm-approve-text';
+      /* The folder and the helper CLI are part of what runs (the SHA-256 covers
+         them), so they are shown with the same [U+XXXX] markers as the goal. */
+      var where = String(r.folder_display != null ? r.folder_display : (r.folder || '?'));
+      var helpers = String(r.helper_cli_display != null ? r.helper_cli_display
+                                                        : (r.helper_cli || '?'));
       txt.textContent = (r.source === 'mcp' ? 'An MCP client' : 'A terminal CLI') +
-        ' asks to start Multi in ' + String(r.folder || '?') + ': ' +
+        ' asks to start Multi in ' + where + ' with ' + helpers + ' helpers: ' +
         (shown.length > 200 ? shown.slice(0, 200) + '…' : shown) +
-        (hidden ? '  (' + hidden + ' hidden characters, shown as [U+...])' : '');
+        (hidden ? '  (' + hidden + ' characters shown as [U+...] markers)' : '');
       var more = document.createElement('button');
       more.type = 'button'; more.className = 'btn ghost';
       more.textContent = 'Show the full request (' + chars + ' characters)';

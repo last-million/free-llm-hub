@@ -3719,16 +3719,52 @@ helper CLI sessions on different models + review), not the crew phase pipeline.
     benign first part could hide the real instructions after it). The goal is
     stored whole, at most `_CM_GOAL_MAX_CHARS` (20000); a longer request is
     REFUSED at creation with a plain message (`_cm_goal_problem`), never cut.
-    Its SHA-256 (`_cm_goal_sha256`, over the exact stored text) is listed, and
-    an approval is accepted only when it sends that hash back
-    (`_cm_approval_decide`, `hmac.compare_digest`); the run then starts with that
-    stored text, byte for byte. Hidden text: bidi controls (U+202A-U+202E,
-    U+2066-U+2069) are REFUSED at creation; every other hidden character --
-    format (Cf: zero-width U+200B-U+200F, U+2060-U+2064, U+FEFF, tag characters,
-    soft hyphen...), control (Cc) other than tab / newline / CR, and variation
-    selectors -- is shown VISIBLY as `[U+XXXX]` in `goal_display`
-    (`_cm_goal_display`; the stored, hashed text is unchanged). The MCP pending
-    path applies the same rules (`_cm_mcp_start`).
+    Line endings are canonical (CR / CRLF -> LF, `_cm_canonical_goal`) before
+    anything else; that canonical text is what is shown, hashed and run.
+    `goal_sha256` (kept as the field name) is the SHA-256 of the canonical JSON
+    of EVERYTHING an approved run receives -- {folder, goal, helper_cli}
+    (`_cm_request_sha256`) -- and an approval is accepted only when it sends
+    that hash back (`_cm_approval_decide`, `hmac.compare_digest`).
+  - **What is SHOWN is an ALLOW-list** (fourth review, of af7fc30: the
+    deny-list missed classes). `_cm_goal_display` shows as plain text ONLY the
+    ASCII space, newline and tab; letters, numbers, punctuation and symbols
+    (L*, N*, P*, S*) that draw a glyph; and combining marks (Mn/Mc/Me) that
+    follow a base LETTER, at most `_CM_MAX_MARKS_PER_BASE` (4) on one letter, so
+    French / Arabic / Vietnamese / Devanagari / Hebrew diacritics stay readable.
+    EVERYTHING else is shown as a visible `[U+XXXX]` marker and counted: every
+    Cf / Cc / Co / Cs / Cn character, every space other than U+0020 (Zs, Zl
+    U+2028, Zp U+2029), variation selectors (U+FE00-U+FE0F, U+E0100-U+E01EF,
+    the Mongolian free variation selectors), glyphless letters and symbols
+    (`_CM_GLYPHLESS`: Hangul fillers U+115F U+1160 U+3164 U+FFA0, U+2800, U+180E,
+    U+2061-U+2064, U+034F, U+17B4/U+17B5, U+FFFC) and any isolated or
+    over-stacked combining mark. The same rules apply to the folder and helper
+    CLI names (`folder_display`, `helper_cli_display`; both are covered by the
+    hash, so both are shown). REFUSED outright, with a plain message and
+    nothing pending (`_cm_request_problem`): any bidi control or mark (U+202A-
+    U+202E, U+2066-U+2069, U+061C, U+200E, U+200F); ANY Unicode tag character
+    (U+E0000-U+E007F, "ASCII smuggling": invisible to people, read as text by
+    models); more than `_CM_MAX_MARKED` (20) markers over goal + folder + CLI.
+    The CLI path trims leading/trailing whitespace (NBSP included) before
+    storing, as it always did -- the trimmed text is what is shown and run. The
+    MCP pending path applies the same rules (`_cm_mcp_start`). The test file
+    builds every special character with `chr(0x...)`: it contains no invisible
+    or direction-changing character itself.
+  - **An approved run receives ONLY what was approved -- option (a)** (fourth
+    review). A dashboard-approved CLI request starts through
+    `_multi_turn_events(..., bare=True)`: the run gets the stored goal, the
+    stored folder and the stored helper CLI and NOTHING from the conversation
+    -- no `context=` (owner memory, conversation recap, previous run's result),
+    no board `goal_brief`, and never a resume of an earlier run (a "continue"
+    is approved and run as a fresh goal). Option (b) (showing and hashing the
+    context) was not needed: the workers work on the folder's files, which hold
+    the state. The MCP approved path already passed no context or goal brief
+    (`_cm_mcp_swarm_start_now`). The "chat" and "off" modes (unauthenticated by
+    the owner's choice) keep today's behaviour: conversation context and the
+    "continue" resume. Residual, in plain words: the helpers still read the
+    project's own files, and every hub-run CLI session still gets the hub's
+    usual per-session briefs (craft briefs, model guides, and the board's goal
+    note / brief-file section for that folder, which is owner-managed board
+    data) -- none of that comes from the terminal CLI's request.
   - **"chat".** The owner's explicit choice to accept the risk: today's "go
     multi" flow (pending request 10 min in `_CM_PENDING`, consent remembered for
     the (conversation, folder) for the 7-day map TTL, expired / mismatched "go
