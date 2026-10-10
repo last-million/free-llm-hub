@@ -10,7 +10,7 @@ is only: current state, how to operate, owner rules, open items.
 
 | | |
 |---|---|
-| Branch | `main` after the 2026-10-08 merge (see `git log`), in sync with `origin/main` (another session's landing-page edits are uncommitted: `app.py` `/`+`/hub` routes, `make_landing.py`, `templates/landing.html`, `static/*.webp|jpg` — LEAVE THEM, and never `git add -A`: use explicit paths) |
+| Branch | `main`, in sync with `origin/main`; the working tree is clean except the owner's own untracked `MODELS_BENCHMARK.md` (still stage explicit paths, never `git add -A`) |
 | Running hub | `1bb8c92` on `127.0.0.1:8787` until the next restart (restart through `POST /api/hub/restart {resume:true, drain:true}`: running work waits and continues). NOT live yet: the 2026-10-10 batch below |
 | Tests | 7812 passed, 2 skipped, 0 failed on the final merge (2026-10-08 night, 11.5 min; pytest exit code 0) |
 | Keys | 42 provider keys in `config.load_config()` (check after every restart, never print values) |
@@ -314,12 +314,11 @@ All in `AGENTS.md` with tests; headlines only:
    pick `sonnet` when re-enabling (verified working 2026-09-30, 13.8 s per call).
 4. **g4f relays** (the only route to Claude/GPT) are rate-limited by the
    service (HTTP 429); the hub re-probes every 30 min. Not a hub bug.
-5. **Another local session is building a marketing landing page** (uncommitted:
-   `app.py` `/`+`/hub` routes, `make_landing.py`, `templates/landing.html`,
-   `static/*`). Its tests fail (route count in README, dashboard cache +
-   security headers) — THAT session must finish and commit them. Do NOT commit
-   them for it, and NEVER `git add -A` in this checkout (it sweeps them in — it
-   happened once, `cee5200`, reverted in `90ada7d`). Stage explicit paths only.
+5. **Landing page removed (owner, 2026-10-10: "we don't need it")**: the other session's
+   uncommitted marketing page (`/` landing + `/hub` route in app.py, `make_landing.py`,
+   `templates/landing.html`, 7 images in `static/`) was never pushed; it was moved to
+   `~/.free-llm-hub/backups/landing-removed-20261010/` and app.py restored to the committed code.
+   `/` is the dashboard again. Do not rebuild it unless the owner asks.
 6. **Freebuff / tmux multi-account (declined, do not build):** Freebuff's ToS
    (freebuff.com/terms-of-service) forbids multiple accounts, bot/script/tmux
    control, and proxying its models — so `fbuff.sh` and any hub integration are
