@@ -3632,10 +3632,13 @@ helper CLI sessions on different models + review), not the crew phase pipeline.
   shared helper both paths use. So the run shows in the Build page, the Running
   popup and Activity with Stop/Continue. The helper CLI = the caller's own CLI
   (from the User-Agent, like live window steering) when the hub has a working
-  `agentic_chat._isolated_bin` of it, else the Build default (opencode). The CLI
-  conversation (`ctxwin.conversation_key`) -> {owner sid, run id} is persisted in
-  `state_dir()/cli-multi-runs.json` (atomic write, LRU 200, 7-day TTL,
-  `_cm_map_*`), so later turns of the same CLI conversation find the owner.
+  `agentic_chat._isolated_bin` of it, else the Build default (opencode). The
+  pair (CLI conversation `ctxwin.conversation_key`, folder `_cm_folder_key` =
+  `normcase(realpath(folder))`) -> {owner sid, run id, folder, consent} is
+  persisted in `state_dir()/cli-multi-runs.json` (`_cm_map_key`: conversation
+  key + a hash of the folder; atomic write, LRU 200, 7-day TTL, `_cm_map_put`
+  MERGES so a later write never drops the folder or consent), so later turns of
+  the same CLI conversation in the same folder find the owner.
 - **The CLI turn is answered with TEXT ONLY** (never a tool call), streamed in
   its own protocol (`_cm_emit`: chat chunks; Responses via `_responses_stream` on
   a live chat-SSE line generator through `_ReplayUpstream`; Anthropic via
@@ -3653,15 +3656,52 @@ helper CLI sessions on different models + review), not the crew phase pipeline.
   disconnect or the turn ending does not stop it (`_cm_keepalive_wrap` drains the
   producer on its own daemon thread into an unbounded queue; nothing calls
   `swarm_windows.stop` on disconnect). Only its own Stop does: Build page, Running
-  popup, or a CLI message "stop multi" / "stop" (handled in `_cm_attach`, no model
-  call).
-- **Later turns** of the same CLI conversation while its run is live (any fresh
-  message, "status", "continue") re-attach and stream progress again with NO model
-  call and NO second run (`_cm_attach` via `_multi_follow_events`); "stop multi"
-  stops it. When the run has ended, a new instruction starts a new run and a short
-  "continue" resumes the unfinished phases -- both through `_multi_turn_events`,
-  which already decides resume vs fresh (`_multi_is_continue`) exactly as the
-  Build page does.
+  popup, or a CLI message that is EXACTLY "stop multi" (handled in `_cm_attach`,
+  no model call; see the security bullet below).
+- **Later turns** of the same CLI conversation in the same folder while its run is
+  live (any fresh message, "status", "continue") re-attach and stream progress
+  again with NO model call and NO second run (`_cm_attach` via
+  `_multi_follow_events`); "stop multi" stops it. When the run has ended, a new
+  instruction starts a new run and a short "continue" resumes the unfinished
+  phases -- both through `_multi_turn_events`, which already decides resume vs
+  fresh (`_multi_is_continue`) exactly as the Build page does.
+- **Security fix 1 -- no cross-conversation control** (review of 8f647b8). A
+  conversation key alone is not an identity: its fallback (no session id) hashes
+  the system prompt + first instruction, so two different conversations, even in
+  different folders, can share one -- and the first version looked the map up and
+  re-attached BEFORE the folder was known, and stopped on a bare "stop" or any
+  message containing "stop multi". Now the folder is resolved FIRST (no folder ->
+  today's path), every lookup is scoped to (conversation key, folder), and
+  re-attach / stop happen ONLY when the row's stored folder equals this request's
+  folder AND the live run's own `project_dir` (from `swarm_windows.status`) equals
+  it too (`_cm_live_run`; a missing `project_dir` fails closed). Stop happens only
+  when the WHOLE last user message -- a CLI's `<system-reminder>` blocks removed,
+  trimmed, case-insensitive, trailing punctuation (any script) ignored
+  (`_cm_last_user_command` / `_cm_norm_cmd`) -- is exactly "stop multi": never a
+  bare "stop", never a sentence that merely contains the words.
+- **Security fix 2 -- server-enforced consent** (review of 8f647b8), flag
+  `cli_multi_confirm` (`config.get_flag`, default ON; an unreadable config reads
+  as on). Any local /v1 client (there is no auth when no local API key is set)
+  could otherwise make the hub start helper agents that edit files and run
+  commands on their own in a folder named by request content, bypassing the
+  permission prompts the user's own CLI may use. Now the first eligible turn
+  starts NOTHING: it records a pending request {conversation key, folder, goal,
+  expires in 10 min} (`_CM_PENDING`, in memory, bounded to 100) and answers in
+  text: "Multi starts up to N helper agents that edit files and run commands in
+  <folder> on their own, without asking you. To start, reply exactly: go multi
+  (or pick another tier)." Only a later turn of the SAME conversation key + SAME
+  folder whose whole last user message is exactly "go multi" (same
+  normalisation) starts the run with the STORED goal (`_cm_pending_take`); the
+  consent is then recorded in the map row for that (key, folder) and lasts the
+  7-day map TTL, so later runs in that conversation and folder do not ask again
+  (another folder asks again). An expired or mismatched "go multi" answers that
+  nothing is waiting and starts nothing. Flag off = the direct start of
+  8f647b8. The existing local API key guard (`_guard_v1`, a `before_request` on
+  every /v1 path) still runs before all of this, unchanged.
+- **Residual risk, in plain words:** the hub's MCP tool `swarm_windows_start`
+  can still start a Multi run (helper agents that edit files and run commands)
+  for ANY local client without this consent -- that existing door is unchanged
+  by this fix. The consent above covers only the Multi tier on /v1.
 
 **Per-CLI streaming-timeout evidence (requirement 4).** The question is whether a
 stream that keeps sending content deltas survives long (keepalives every 20 s

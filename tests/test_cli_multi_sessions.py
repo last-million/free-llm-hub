@@ -45,6 +45,11 @@ def cm(tmp_path, monkeypatch):
 
     monkeypatch.setattr(config, "state_dir", lambda: str(tmp_path))
     monkeypatch.setattr(A, "_cm_on", lambda: True)
+    # The tests below that start a run directly do it with `cli_multi_confirm`
+    # OFF; the consent tests switch it back on.
+    monkeypatch.setattr(A, "_cm_confirm_on", lambda: False)
+    h["tmp"] = tmp_path
+    h["proj"] = str(tmp_path / "proj")
 
     # Terminal CLI: no /build prefix, caller opencode, isolated copy exists.
     monkeypatch.setattr(A, "_build_sid", lambda: None)
@@ -92,13 +97,19 @@ def cm(tmp_path, monkeypatch):
     monkeypatch.setattr(A.swarm_windows, "stop", lambda rid: h["stop"].append(rid) or True)
     monkeypatch.setattr(A.swarm_windows, "format_result", lambda rid: "FALLBACK REPORT")
     monkeypatch.setattr(A.swarm_windows, "_concurrency", lambda: 6)
-    # _multi_run_for reads swarm_windows.status(): a simulated run is RUNNING.
+    # _multi_run_for reads swarm_windows.status(): a simulated run is RUNNING in
+    # h["run_dir"] (the project folder unless a test moves it).
+    h["run_dir"] = str(tmp_path / "proj")
     monkeypatch.setattr(A.swarm_windows, "status",
-                        lambda rid, with_events=False: {"run_id": rid, "state": A.swarm_windows.RUNNING})
+                        lambda rid, with_events=False: {"run_id": rid,
+                                                        "state": A.swarm_windows.RUNNING,
+                                                        "project_dir": h["run_dir"]})
 
     A._MULTI_RUNS.clear()
+    A._CM_PENDING.clear()
     yield h
     A._MULTI_RUNS.clear()
+    A._CM_PENDING.clear()
 
 
 USER = [{"role": "user", "content": "build me a dashboard with a chart and a table"}]
@@ -234,10 +245,16 @@ def test_helper_cli_is_the_caller_when_isolated_else_opencode(cm, monkeypatch):
 # The mapping: persisted and found by the next turn
 # --------------------------------------------------------------------------- #
 
+def _mapkey(cm, folder=None, conv="conv-1"):
+    return A._cm_map_key(conv, A._cm_folder_key(folder or cm["proj"]))
+
+
 def test_mapping_is_persisted_and_found_by_the_next_turn(cm):
     _call()                                        # turn 1 opens owner-1
-    row = A._cm_map_get("conv-1")
+    row = A._cm_map_get(_mapkey(cm))
     assert row and row["owner"] == "owner-1"
+    assert row["folder"] == A._cm_folder_key(cm["proj"]), "the folder is stored in the row"
+    assert A._cm_map_get("conv-1") is None, "never keyed by the conversation key alone"
     assert os.path.exists(A._cm_map_path())
     # Turn 2 (run not live): the SAME owner is reused, no second session opened.
     A._MULTI_RUNS.clear()
@@ -287,10 +304,34 @@ def test_stop_multi_stops_the_run_and_starts_nothing(cm):
     assert "Stopping the Multi run" in raw
 
 
-def test_a_plain_stop_message_also_stops_a_live_run(cm):
+@pytest.mark.parametrize("msg", ["stop", "please don't stop multi now",
+                                 "stop multi please", "stop multi, then go"])
+def test_only_the_whole_message_stop_multi_stops(cm, msg):
+    """A bare "stop", or a sentence that merely CONTAINS "stop multi", never
+    stops the run -- it re-attaches instead."""
     _call()
     A._MULTI_RUNS["owner-1"] = "run-1"
-    _call(messages=[{"role": "user", "content": "stop"}])
+    resp, raw = _call(messages=[{"role": "user", "content": msg}])
+    assert resp is not None
+    assert cm["stop"] == [], "%r must not stop the run" % msg
+    assert cm["follow"], "it re-attached instead"
+
+
+@pytest.mark.parametrize("msg", ["Stop Multi", "  stop   multi  ", "STOP MULTI!",
+                                 "stop multi."])
+def test_stop_multi_is_matched_after_normalisation(cm, msg):
+    _call()
+    A._MULTI_RUNS["owner-1"] = "run-1"
+    _call(messages=[{"role": "user", "content": msg}])
+    assert cm["stop"] == ["run-1"]
+
+
+def test_stop_multi_with_a_claude_code_system_reminder_still_matches(cm):
+    _call()
+    A._MULTI_RUNS["owner-1"] = "run-1"
+    _call(messages=[{"role": "user", "content": [
+        {"type": "text", "text": "<system-reminder>be careful</system-reminder>"},
+        {"type": "text", "text": "stop multi"}]}])
     assert cm["stop"] == ["run-1"]
 
 
@@ -392,3 +433,196 @@ def test_a_keepalive_line_is_emitted_when_the_run_is_quiet(cm, monkeypatch):
     assert joined.startswith("HEADER\n")
     assert "still working" in joined
     assert "R" in joined
+
+
+def _content(raw):
+    """The assistant text of a non-stream chat.completions answer."""
+    return json.loads(raw)["choices"][0]["message"]["content"]
+
+
+# --------------------------------------------------------------------------- #
+# SECURITY 1 -- cross-conversation control: everything is scoped to the folder
+# --------------------------------------------------------------------------- #
+
+def _other_folder(cm, monkeypatch):
+    other = cm["tmp"] / "other"
+    other.mkdir(exist_ok=True)
+    monkeypatch.setattr(A, "_v1_project_cwd", lambda msgs: str(other))
+    return str(other)
+
+
+def test_same_key_in_another_folder_does_not_reattach_or_stop(cm, monkeypatch):
+    """Two conversations can share a conversation key (its fallback hashes the
+    system prompt + first instruction). A request from ANOTHER folder must
+    never re-attach to, or stop, this folder's run."""
+    _call()                                        # folder A: owner-1
+    A._MULTI_RUNS["owner-1"] = "run-1"             # A's run is live
+    _other_folder(cm, monkeypatch)
+    monkeypatch.setattr(A, "_multi_wants_a_swarm", lambda t: False)
+    resp, _ = _call(messages=[{"role": "user", "content": "stop multi"}])
+    assert resp is None, "no folder-B run to talk to: today's path"
+    assert cm["stop"] == [] and cm["follow"] == []
+
+
+def test_same_key_in_another_folder_starts_its_own_run(cm, monkeypatch):
+    _call()                                        # folder A: owner-1
+    A._MULTI_RUNS["owner-1"] = "run-1"
+    other = _other_folder(cm, monkeypatch)
+    resp, raw = _call()                            # work, in folder B
+    assert resp is not None and cm["follow"] == [] and cm["stop"] == []
+    assert [r["project"] for r in cm["start_session"]] == [cm["proj"], other]
+    assert "/agent/owner-2" in raw, "folder B got its own owner conversation"
+
+
+def test_a_live_run_working_in_another_folder_is_not_reattached(cm, monkeypatch):
+    """The row's folder matches, but the LIVE run's own project_dir does not:
+    fail closed -- no re-attach, no stop."""
+    _call()
+    A._MULTI_RUNS["owner-1"] = "run-1"
+    cm["run_dir"] = str(cm["tmp"])                 # the run works elsewhere
+    monkeypatch.setattr(A, "_multi_wants_a_swarm", lambda t: False)
+    _call(messages=[{"role": "user", "content": "stop multi"}])
+    assert cm["stop"] == [] and cm["follow"] == []
+
+
+# --------------------------------------------------------------------------- #
+# SECURITY 2 -- server-enforced consent (flag cli_multi_confirm, default on)
+# --------------------------------------------------------------------------- #
+
+def _with_go(goal_msgs=None, go="go multi"):
+    """The CLI's next request after the consent prompt: the whole history,
+    ending on the user's reply."""
+    return (goal_msgs or USER) + [{"role": "assistant", "content": "Multi starts ..."},
+                                  {"role": "user", "content": go}]
+
+
+@pytest.fixture
+def confirm(cm, monkeypatch):
+    monkeypatch.setattr(A, "_cm_confirm_on", lambda: True)
+    return cm
+
+
+def test_confirm_flag_reads_the_setting_default_on(monkeypatch):
+    monkeypatch.setattr(config, "get_flag", lambda name, default=None: default)
+    assert A._cm_confirm_on() is True
+    monkeypatch.setattr(config, "get_flag",
+                        lambda name, default=None:
+                        False if name == "cli_multi_confirm" else default)
+    assert A._cm_confirm_on() is False
+
+
+def test_first_turn_starts_nothing_and_asks_for_go_multi(confirm):
+    resp, raw = _call()
+    assert resp is not None
+    assert confirm["turn_events"] == [] and confirm["start_session"] == [], \
+        "nothing starts before the user says go"
+    text = _content(raw)
+    assert "without asking you" in text and "reply exactly: go multi" in text
+    assert confirm["proj"] in text, "names the folder"
+    assert "up to 6 helper agents" in text
+
+
+@pytest.mark.parametrize("protocol", ["openai", "responses", "anthropic"])
+def test_the_consent_prompt_is_text_only_in_each_protocol(confirm, protocol):
+    resp, raw = _call(protocol=protocol, stream=True)
+    assert "go multi" in raw and '"tool_calls"' not in raw
+    assert confirm["turn_events"] == []
+
+
+def test_go_multi_starts_the_stored_goal(confirm):
+    _call()                                        # the work -> pending
+    resp, raw = _call(messages=_with_go())
+    assert resp is not None
+    assert len(confirm["turn_events"]) == 1, "the run started on 'go multi'"
+    assert confirm["turn_events"][0]["text"] == USER[0]["content"], "with the STORED goal"
+    row = A._cm_map_get(_mapkey(confirm))
+    assert row["consent"] is True and row["folder"] == A._cm_folder_key(confirm["proj"])
+    assert A._CM_PENDING == {}, "the pending request was used up"
+
+
+@pytest.mark.parametrize("go", ["Go Multi", "go multi!", "  go   multi "])
+def test_go_multi_is_matched_after_normalisation(confirm, go):
+    _call()
+    _call(messages=_with_go(go=go))
+    assert len(confirm["turn_events"]) == 1
+
+
+@pytest.mark.parametrize("go", ["go", "ok go multi", "go multi and also add tests"])
+def test_anything_but_exactly_go_multi_does_not_start(confirm, go):
+    _call()
+    _call(messages=_with_go(go=go))
+    assert confirm["turn_events"] == [], "%r is not consent" % go
+
+
+def test_go_multi_twice_does_not_start_twice(confirm):
+    _call()
+    _call(messages=_with_go())
+    A._MULTI_RUNS.clear()                          # (run ended)
+    _resp, raw = _call(messages=_with_go())
+    assert len(confirm["turn_events"]) == 1
+    assert "Nothing is waiting" in _content(raw)
+
+
+def test_an_expired_go_multi_answers_nothing_is_waiting(confirm, monkeypatch):
+    now = [1_000_000.0]
+    monkeypatch.setattr(A, "_cm_now", lambda: now[0])
+    _call()                                        # pending, waits 10 minutes
+    now[0] += A._CM_PENDING_TTL + 1
+    _resp, raw = _call(messages=_with_go())
+    assert confirm["turn_events"] == []
+    assert "Nothing is waiting" in _content(raw)
+
+
+def test_a_go_multi_from_another_folder_or_conversation_starts_nothing(confirm, monkeypatch):
+    _call()                                        # pending: conv-1, folder A
+    other = confirm["tmp"] / "other"
+    other.mkdir()
+    monkeypatch.setattr(A, "_v1_project_cwd", lambda msgs: str(other))
+    _r, raw = _call(messages=_with_go())           # same key, another folder
+    assert "Nothing is waiting" in _content(raw)
+    monkeypatch.setattr(A, "_v1_project_cwd", lambda msgs: confirm["proj"])
+    monkeypatch.setattr(A.ctxwin, "conversation_key", lambda **kw: "conv-2")
+    _r, raw = _call(messages=_with_go())           # same folder, another conversation
+    assert "Nothing is waiting" in _content(raw)
+    assert confirm["turn_events"] == [], "neither mismatched go started a run"
+    monkeypatch.setattr(A.ctxwin, "conversation_key", lambda **kw: "conv-1")
+    _call(messages=_with_go())                     # the real owner still can
+    assert len(confirm["turn_events"]) == 1
+
+
+def test_consent_is_remembered_for_the_conversation_and_folder(confirm):
+    _call()
+    _call(messages=_with_go())                     # consent given, run 1
+    A._MULTI_RUNS.clear()                          # run 1 ended
+    _resp, raw = _call(messages=[{"role": "user",
+                                  "content": "now add a footer and a contact form"}])
+    assert len(confirm["turn_events"]) == 2, "run 2 started directly, no second prompt"
+    assert "without asking you" not in raw
+
+
+def test_consent_does_not_carry_to_another_folder(confirm, monkeypatch):
+    _call()
+    _call(messages=_with_go())                     # consent for folder A
+    A._MULTI_RUNS.clear()
+    _other_folder(confirm, monkeypatch)
+    _r, raw = _call()
+    assert len(confirm["turn_events"]) == 1, "folder B asks again"
+    assert "without asking you" in _content(raw)
+
+
+def test_confirm_flag_off_starts_directly(cm):
+    _resp, raw = _call()                           # fixture default: confirm OFF
+    assert len(cm["turn_events"]) == 1
+    assert "without asking you" not in raw
+
+
+def test_go_multi_with_the_flag_off_is_just_a_message(cm, monkeypatch):
+    monkeypatch.setattr(A, "_multi_wants_a_swarm", lambda t: False)
+    resp, _ = _call(messages=[{"role": "user", "content": "go multi"}])
+    assert resp is None and cm["turn_events"] == []
+
+
+def test_the_pending_store_is_bounded(confirm):
+    for i in range(A._CM_PENDING_MAX + 30):
+        A._cm_pending_put("k%d" % i, "c", "f", "g")
+    assert len(A._CM_PENDING) <= A._CM_PENDING_MAX

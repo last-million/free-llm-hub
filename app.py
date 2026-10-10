@@ -21260,23 +21260,139 @@ def _cm_map_prune(d, now=None):
     return live
 
 
-def _cm_map_get(convkey):
-    if not convkey:
+def _cm_map_get(mapkey):
+    if not mapkey:
         return None
     with _CM_MAP_LOCK:
-        row = _cm_map_prune(_cm_map_load()).get(convkey)
+        row = _cm_map_prune(_cm_map_load()).get(mapkey)
         return dict(row) if isinstance(row, dict) else None
 
 
-def _cm_map_put(convkey, owner, run):
-    """Map this CLI conversation -> {owner sid, run id}. Atomic, LRU 200, 7-day
+def _cm_map_put(mapkey, owner, run, folder=None, consent=None):
+    """Map (CLI conversation, folder) -> {owner sid, run id, folder, consent}.
+    MERGES into the existing row, so a later write (a re-attach refreshing the
+    run id) never drops the recorded folder or consent. Atomic, LRU 200, 7-day
     TTL. Never raises."""
-    if not convkey or not owner:
+    if not mapkey or not owner:
         return
     with _CM_MAP_LOCK:
         d = _cm_map_prune(_cm_map_load())
-        d[convkey] = {"owner": owner, "run": run, "at": time.time()}
+        row = dict(d.get(mapkey) or {})
+        row.update(owner=owner, run=run, at=time.time())
+        if folder is not None:
+            row["folder"] = folder
+        if consent is not None:
+            row["consent"] = bool(consent)
+        d[mapkey] = row
         _cm_map_save(_cm_map_prune(d))
+
+
+# SECURITY (review of 8f647b8). A CLI conversation key alone is not an identity:
+# its fallback (no session id) hashes the system prompt + first instruction, so
+# two different conversations -- even in different folders -- can share one.
+# Every lookup is therefore scoped to (conversation key, folder), the folder is
+# stored in the row, and re-attach / stop also require the LIVE run's own
+# project_dir to be this request's folder.
+def _cm_folder_key(folder):
+    """normcase(realpath(folder)): the folder identity a row is scoped to, or
+    None. Never raises."""
+    try:
+        if not folder:
+            return None
+        return os.path.normcase(os.path.realpath(os.path.abspath(str(folder))))
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _cm_map_key(convkey, folder_key):
+    """The map key for (conversation key, folder). The folder is hashed into a
+    fixed-length suffix (unambiguous) and also stored in full in the row."""
+    return "%s|%s" % (convkey, hashlib.sha1(
+        str(folder_key).encode("utf-8", "replace")).hexdigest()[:16])
+
+
+def _cm_norm_cmd(text):
+    """A message normalised for an EXACT command match: whitespace collapsed and
+    trimmed, lower case, trailing punctuation (any script) dropped."""
+    t = " ".join((text or "").split()).lower()
+    return re.sub(r"[\W_]+$", "", t)
+
+
+def _cm_last_user_command(messages):
+    """The WHOLE last user message, with a CLI's <system-reminder> blocks removed,
+    normalised by _cm_norm_cmd; "" when the conversation does not end on a user
+    message. "stop multi" / "go multi" must be the entire message, never a
+    substring of a longer one."""
+    for m in reversed(messages or []):
+        if not isinstance(m, dict) or m.get("role") == "system":
+            continue
+        if m.get("role") != "user":
+            return ""
+        content = m.get("content")
+        parts = [content] if isinstance(content, str) else [
+            p.get("text") for p in (content or ()) if isinstance(p, dict)
+            and p.get("type") in ("text", "input_text")]
+        t = " ".join(p for p in parts if isinstance(p, str))
+        t = re.sub(r"<system-reminder>.*?</system-reminder>", " ", t, flags=re.S)
+        return _cm_norm_cmd(t)
+    return ""
+
+
+# SECURITY (review of 8f647b8): server-enforced consent. Any local /v1 client
+# (there is no auth when no local API key is set) could otherwise make the hub
+# start helper agents that edit files and run commands, on their own, in a
+# folder named by request content -- bypassing the permission prompts the
+# user's own CLI may use. Flag `cli_multi_confirm` (default on): the first
+# eligible turn starts NOTHING; it records a pending request and asks the user
+# to reply exactly "go multi". Consent is then remembered for that
+# (conversation, folder) for the 7-day map TTL.
+_CM_PENDING = {}                # map key -> {conv, folder, goal, expires}
+_CM_PENDING_LOCK = threading.Lock()
+_CM_PENDING_TTL = 600           # a pending request waits 10 minutes
+_CM_PENDING_MAX = 100           # bounded: oldest-expiring dropped first
+_CM_GO = "go multi"
+_CM_STOP = "stop multi"
+
+
+def _cm_now():
+    """Wall clock for the pending store (a seam for tests)."""
+    return time.time()
+
+
+def _cm_confirm_on():
+    """Flag `cli_multi_confirm` (default on). An unreadable config reads as ON
+    -- the safer side."""
+    try:
+        return bool(config.get_flag("cli_multi_confirm", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _cm_pending_put(mapkey, convkey, folder_key, goal):
+    """Record "this conversation asked for a Multi run in this folder" (the
+    newest goal wins and restarts the 10-minute window). In memory, bounded."""
+    now = _cm_now()
+    with _CM_PENDING_LOCK:
+        for k in [k for k, v in _CM_PENDING.items() if v["expires"] <= now]:
+            del _CM_PENDING[k]
+        if mapkey not in _CM_PENDING:
+            while len(_CM_PENDING) >= _CM_PENDING_MAX:
+                del _CM_PENDING[min(_CM_PENDING, key=lambda k: _CM_PENDING[k]["expires"])]
+        _CM_PENDING[mapkey] = {"conv": convkey, "folder": folder_key, "goal": goal,
+                               "expires": now + _CM_PENDING_TTL}
+
+
+def _cm_pending_take(mapkey, convkey, folder_key):
+    """Pop the unexpired pending request of THIS conversation in THIS folder,
+    or None (expired, another conversation, another folder, or none)."""
+    now = _cm_now()
+    with _CM_PENDING_LOCK:
+        for k in [k for k, v in _CM_PENDING.items() if v["expires"] <= now]:
+            del _CM_PENDING[k]
+        e = _CM_PENDING.get(mapkey)
+        if not e or e.get("conv") != convkey or e.get("folder") != folder_key:
+            return None
+        return _CM_PENDING.pop(mapkey)
 
 
 def _cm_resolves_to_multi(body):
@@ -21330,16 +21446,22 @@ def _cm_helper_count():
         return 6
 
 
-def _cm_live_run_id(owner_sid):
-    """The run id of the live Multi run behind this owner conversation, or None.
-    `_multi_run_for` returns the status DICT (and prunes a dead run); the id
-    itself is in `_MULTI_RUNS`."""
+def _cm_live_run(owner_sid):
+    """(run id, status dict) of the live Multi run behind this owner
+    conversation, or (None, None). `_multi_run_for` returns the status DICT
+    (and prunes a dead run); the id itself is in `_MULTI_RUNS`."""
     if not owner_sid:
-        return None
-    if _multi_run_for(owner_sid):            # truthy + still PENDING/RUNNING
-        with _MULTI_LOCK:
-            return _MULTI_RUNS.get(owner_sid)
-    return None
+        return None, None
+    st = _multi_run_for(owner_sid)           # truthy only while PENDING/RUNNING
+    if not st:
+        return None, None
+    with _MULTI_LOCK:
+        rid = _MULTI_RUNS.get(owner_sid)
+    return (rid, st) if rid else (None, None)
+
+
+def _cm_live_run_id(owner_sid):
+    return _cm_live_run(owner_sid)[0]
 
 
 def _cm_watch_link(owner_sid):
@@ -21368,14 +21490,15 @@ def _cm_chat_json(full, label, est):
             "usage": _cm_usage(est)}
 
 
-def _cm_owner_session(convkey, helper_cli, project_dir, mode, goal_text):
+def _cm_owner_session(mapkey, folder_key, helper_cli, project_dir, mode, goal_text):
     """Find or open the hub /agent conversation that OWNS this CLI
-    conversation's Multi runs. A new one is opened like _hb_conversation does,
-    titled from the goal, quality "multi", auto_resume ticked (so the
-    boot/graceful-update resume cover it). Returns (sid, sess_info) or
-    (None, None). Never raises."""
-    row = _cm_map_get(convkey)
-    sid = row.get("owner") if row else None
+    conversation's Multi runs IN THIS FOLDER (the map key is scoped to the
+    folder, and the row's stored folder must match). A new one is opened like
+    _hb_conversation does, titled from the goal, quality "multi", auto_resume
+    ticked (so the boot/graceful-update resume cover it). Returns
+    (sid, sess_info) or (None, None). Never raises."""
+    row = _cm_map_get(mapkey)
+    sid = row.get("owner") if row and row.get("folder") == folder_key else None
     if sid:
         try:
             info = agentic_chat.get_session(sid)
@@ -21573,27 +21696,60 @@ def _cm_emit(body, protocol, text_stream, est):
     return Response(_gen(), mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
 
 
-def _cm_attach(body, protocol, owner_sid, run_id, text, helper_cli, safe, est, convkey):
-    """A later turn of a CLI conversation whose Multi run is still live: no model
-    call, no second run. "stop multi" stops it; anything else re-attaches and
+def _cm_say(body, protocol, text, est):
+    """A one-message text answer in the caller's protocol (no model call)."""
+    return _cm_emit(body, protocol, iter([text]), est)
+
+
+def _cm_attach(body, protocol, owner_sid, run_id, cmd, helper_cli, safe, est,
+               mapkey, folder_key):
+    """A later turn of a CLI conversation whose Multi run is still live IN THIS
+    FOLDER: no model call, no second run. Only a whole message that is exactly
+    "stop multi" (after _cm_norm_cmd) stops it -- never a bare "stop", never a
+    sentence that merely contains the words. Anything else re-attaches and
     streams the live progress again."""
-    _cm_map_put(convkey, owner_sid, run_id)          # keep the persisted run id fresh
+    _cm_map_put(mapkey, owner_sid, run_id, folder=folder_key)   # refresh the run id
     link = _cm_watch_link(owner_sid)
-    low = " ".join((text or "").split()).lower()
-    if low == "stop" or low.startswith("stop multi") or "stop multi" in low:
+    if cmd == _CM_STOP:
         try:
             swarm_windows.stop(run_id)
         except Exception:                                        # noqa: BLE001
             pass
-
-        def _stopped():
-            yield ("Stopping the Multi run. Its helpers wind down and the partial "
-                   "result is saved in the conversation. Watch it: %s\n" % link)
-        return _cm_emit(body, protocol, _stopped(), est)
+        return _cm_say(body, protocol,
+                       "Stopping the Multi run. Its helpers wind down and the partial "
+                       "result is saved in the conversation. Watch it: %s\n" % link, est)
     header = "Multi: this conversation's run is still working. Watch it live: %s\n" % link
     events = _multi_follow_events(run_id, helper_cli)
     return _cm_emit(body, protocol,
                     _cm_text_stream(owner_sid, run_id, events, link, safe,
+                                    _cm_helper_count(), header), est)
+
+
+def _cm_start(body, protocol, mapkey, folder_key, project_dir, helper_cli, safe,
+              est, goal, consent=None):
+    """Start the run EXACTLY like the Build page and answer the CLI turn with its
+    live text: owner conversation (folder-scoped), then _multi_turn_events made
+    durable by live_run with a copy of this request's context (the planner
+    routes through the hub's chain, as the Build route does). None when the
+    owner conversation cannot be opened. `consent=True` records the user's
+    "go multi" for this (conversation, folder)."""
+    mode = _session_mode_or_none({"mode": _active_mode()})
+    owner_sid, sess_info = _cm_owner_session(mapkey, folder_key, helper_cli,
+                                             project_dir, mode, goal)
+    if not owner_sid:
+        return None
+    _cm_map_put(mapkey, owner_sid, None, folder=folder_key, consent=consent)
+    producer = _multi_turn_events(owner_sid, sess_info, goal)
+    try:
+        events = agentic_chat.live_run(
+            owner_sid, producer, context=request_ctx._get_current_object().copy())
+    except Exception:                                            # noqa: BLE001
+        events = agentic_chat.live_run(owner_sid, producer)
+    link = _cm_watch_link(owner_sid)
+    header = ("Multi: planning the work with up to %d helpers. Watch it live: "
+              "%s\n" % (_cm_helper_count(), link))
+    return _cm_emit(body, protocol,
+                    _cm_text_stream(owner_sid, None, events, link, safe,
                                     _cm_helper_count(), header), est)
 
 
@@ -21620,56 +21776,76 @@ def _cm_multi_cli_intercept(body, protocol, messages, tools, est):
             return None
         if ctxwin.is_compaction_request(messages or []):
             return None
+        # FOLDER FIRST (security): nothing below runs without a known, safe
+        # folder, and every lookup -- the map, the live run, the pending consent
+        # -- is scoped to it. No folder -> today's path.
+        project_dir = _cm_project_dir(messages)
+        folder_key = _cm_folder_key(project_dir)
+        if not project_dir or not folder_key:
+            return None
         text = swarm._last_user_text(messages) or ""
         try:
             convkey = ctxwin.conversation_key(headers=request.headers, body=body,
                                               messages=messages)
         except Exception:                                        # noqa: BLE001
             convkey = ctxwin.conversation_key(messages=messages)
+        mapkey = _cm_map_key(convkey, folder_key)
+        cmd = _cm_last_user_command(messages)
         caller = _cm_caller_cli()
         helper_cli = _cm_helper_cli(caller)
         safe = _cm_safe_end_seconds(caller)
 
-        # A run already live for THIS CLI conversation (same process): re-attach
-        # or stop, without a model call and without starting a second run.
-        row = _cm_map_get(convkey)
+        # A run already live for THIS conversation IN THIS FOLDER (same process):
+        # re-attach or stop, without a model call and without a second run. The
+        # row's stored folder AND the live run's own project_dir must both be
+        # this request's folder.
+        row = _cm_map_get(mapkey)
+        if row and row.get("folder") != folder_key:
+            row = None
         owner = row.get("owner") if row else None
-        live_id = _cm_live_run_id(owner) if owner else None
-        if owner and live_id:
-            return _cm_attach(body, protocol, owner, live_id, text, helper_cli, safe,
-                              est, convkey)
+        if owner:
+            live_id, st = _cm_live_run(owner)
+            if live_id and _cm_folder_key((st or {}).get("project_dir")) == folder_key:
+                return _cm_attach(body, protocol, owner, live_id, cmd, helper_cli,
+                                  safe, est, mapkey, folder_key)
 
-        # Not live -> a NEW instruction (or a short "continue") starts/resumes a
-        # run. Only on a fresh user instruction, in a known safe folder, that
-        # reads as work.
+        # Not live -> only a FRESH user instruction can start (or resume) a run.
         if not _awaiting_new_instruction(messages):
             return None
-        project_dir = _cm_project_dir(messages)
-        if not project_dir:
-            return None
+        confirm = _cm_confirm_on()
+        if confirm and cmd == _CM_GO:
+            # The user's go-ahead for the request THIS conversation recorded in
+            # THIS folder within the last 10 minutes: its stored goal starts.
+            pend = _cm_pending_take(mapkey, convkey, folder_key)
+            if not pend:
+                return _cm_say(body, protocol,
+                               "Nothing is waiting for 'go multi' in %s. A Multi "
+                               "request waits 10 minutes, in the same conversation "
+                               "and folder. Send the work you want done to start "
+                               "one.\n" % project_dir, est)
+            out = _cm_start(body, protocol, mapkey, folder_key, project_dir,
+                            helper_cli, safe, est, pend.get("goal") or "",
+                            consent=True)
+            if out is None:
+                return _cm_say(body, protocol,
+                               "Multi could not start: the hub could not open a "
+                               "conversation for it. Try again, or pick another "
+                               "tier.\n", est)
+            return out
         if not _multi_wants_a_swarm(text):
             return None
-        mode = _session_mode_or_none({"mode": _active_mode()})
-        owner_sid, sess_info = _cm_owner_session(convkey, helper_cli, project_dir, mode, text)
-        if not owner_sid:
-            return None
-        _cm_map_put(convkey, owner_sid, None)
-        # Start EXACTLY like the Build page: _multi_turn_events (plan + helpers +
-        # review), made durable by live_run so the run survives this connection
-        # going away. A copy of this request's context rides onto the thread, as
-        # the Build route does, so the planner routes through the hub's chain.
-        producer = _multi_turn_events(owner_sid, sess_info, text)
-        try:
-            events = agentic_chat.live_run(
-                owner_sid, producer, context=request_ctx._get_current_object().copy())
-        except Exception:                                        # noqa: BLE001
-            events = agentic_chat.live_run(owner_sid, producer)
-        link = _cm_watch_link(owner_sid)
-        header = ("Multi: planning the work with up to %d helpers. Watch it live: "
-                  "%s\n" % (_cm_helper_count(), link))
-        return _cm_emit(body, protocol,
-                        _cm_text_stream(owner_sid, None, events, link, safe,
-                                        _cm_helper_count(), header), est)
+        if confirm and not (row and row.get("consent")):
+            # SERVER-ENFORCED CONSENT: start NOTHING; record the request and ask.
+            _cm_pending_put(mapkey, convkey, folder_key, text)
+            return _cm_say(body, protocol,
+                           "Multi starts up to %d helper agents that edit files and "
+                           "run commands in %s on their own, without asking you. To "
+                           "start, reply exactly: go multi (or pick another tier).\n"
+                           % (_cm_helper_count(), project_dir), est)
+        # Consent already given for this conversation + folder, or the flag is
+        # off (today's direct start).
+        return _cm_start(body, protocol, mapkey, folder_key, project_dir, helper_cli,
+                         safe, est, text)
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("[cli-multi] intercept fell through: %s", _sanitize(str(exc), 200))
         return None
