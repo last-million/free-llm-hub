@@ -3828,6 +3828,10 @@
                     <button class="btn" id="publish-install-btn" type="button">Install cloudflared</button>
                   </div>
                   <p class="publish-p" id="publish-install-status" role="status" hidden></p>
+                  <label class="publish-consent" for="publish-auto" id="publish-auto-row" hidden>
+                    <input type="checkbox" id="publish-auto">
+                    <span>Install cloudflared automatically</span>
+                  </label>
                   <div id="publish-manual">
                     <p class="publish-p">Or install it yourself, then reopen this panel:</p>
                     <div class="publish-cmd" id="publish-install-cmdrow">
@@ -10984,7 +10988,9 @@
          POST /api/publish/start          {project_dir, port?, ttl_minutes?, confirm:true}
          POST /api/publish/stop           {id}
          POST /api/publish/renew          {id, ttl_minutes?}   (new URL, fresh timer)
-         POST /api/publish/install        {confirm:true}
+         POST /api/publish/install        {confirm:true}   or {auto:true|false}
+       (the second sets the hub's own automatic install, which runs by itself
+       about a minute after boot; cloudflared.auto_* says how it went).
        The DOM is written once in the page; this only toggles hidden and sets
        text, so the select, the tick box and keyboard focus survive the 1.5 s
        status poll and the 1 s countdown. Backend strings go in with
@@ -11110,6 +11116,7 @@
       var installStatus = $('#publish-install-status'), installCmd = $('#publish-install-cmd');
       var installCmdRow = $('#publish-install-cmdrow'), installCopy = $('#publish-install-copy');
       var installManual = $('#publish-manual');
+      var autoRow = $('#publish-auto-row'), autoBox = $('#publish-auto');
       var form = $('#publish-form'), ttlSel = $('#publish-ttl'), consent = $('#publish-consent');
       var startBtn = $('#publish-start'), startWhy = $('#publish-start-why');
       var liveBox = $('#publish-live'), vStarting = $('#publish-v-starting'), vLive = $('#publish-v-live');
@@ -11126,7 +11133,7 @@
       var offText = '';                 // set when the hub says publishing is off or missing
       var data = null, tun = null, key = '';
       var anchor = 0, remainAt = NaN;   // remainAt seconds were left at performance.now() === anchor
-      var seq = 0, busy = false, installPending = false, failsInRow = 0;
+      var seq = 0, busy = false, installPending = false, autoPending = false, failsInRow = 0;
       var pollT = null, tickT = null, slowT = null, copyBusy = false;
       var fired = { m5: false, m1: false }, expiryAsked = '', lastView = 'none';
       var dismissed = {};
@@ -11217,8 +11224,20 @@
           var working = installPending || !!cf.installing;
           installBtn.disabled = working;
           setText(installBtn, working ? 'Installing…' : 'Install cloudflared');
-          var st = working ? 'Downloading cloudflared and checking its checksum. This can take a minute.'
-                 : cf.install_error ? 'Install failed: ' + cf.install_error
+          /* The hub's own automatic install: cloudflared.auto_* (absent from an older hub). */
+          var hasAuto = typeof cf.auto_install === 'boolean';
+          var autoState = hasAuto ? String(cf.auto_state || '') : '';
+          var autoFailed = autoState === 'failed' && !!cf.auto_error;
+          var lastErr = cf.install_error && !(autoFailed && cf.install_error === cf.auto_error) ? cf.install_error : '';
+          setHidden(autoRow, !hasAuto || !auto);
+          if (hasAuto && !autoPending && autoBox.checked !== cf.auto_install) autoBox.checked = cf.auto_install;
+          autoBox.disabled = autoPending;
+          var st = working ? (autoState === 'installing'
+                              ? 'Installing cloudflared automatically… The hub downloads the official release and checks its checksum.'
+                              : 'Downloading cloudflared and checking its checksum. This can take a minute.')
+                 : lastErr ? 'Install failed: ' + lastErr
+                 : autoFailed ? 'The automatic install failed: ' + cf.auto_error + ' Press Install cloudflared to try again now, or use the command below.'
+                 : autoState === 'scheduled' ? 'cloudflared will be installed automatically in a moment.'
                  : !auto ? 'Automatic install is not available on this computer. Use the command below.' : '';
           setText(installStatus, st);
           setHidden(installStatus, !st);
@@ -11262,7 +11281,8 @@
         var cf = (data && data.cloudflared) || {};
         /* 1.5 s while something is still settling: a tunnel starting, or the
            cloudflared download. Stops the moment both are done. */
-        var needPoll = !!dir && (v === 'starting' || !!cf.installing || installPending);
+        var needPoll = !!dir && (v === 'starting' || !!cf.installing || installPending ||
+                                 (isOpen && cf.available === false && cf.auto_state === 'scheduled'));
         if (needPoll && !pollT) pollT = setInterval(function(){ if (!document.hidden) load(true); }, 1500);
         if (!needPoll && pollT){ clearInterval(pollT); pollT = null; }
         var needTick = v === 'live';
@@ -11394,6 +11414,17 @@
           .catch(fail)
           .then(function(){ installPending = false; render(); syncTimers(); });
       }
+      /* "Install cloudflared automatically": only the hub's flag changes here;
+         nothing is downloaded by this click. */
+      function doAuto(){
+        if (autoPending) return;
+        var want = !!autoBox.checked;
+        autoPending = true; seq++; showErr(''); render();
+        api('/api/publish/install', { method: 'POST', body: { auto: want } })
+          .then(function(){ return load(true); })
+          .catch(function(err){ autoBox.checked = !want; fail(err); })
+          .then(function(){ autoPending = false; render(); syncTimers(); });
+      }
       function copyWith(text, b, done){
         if (copyBusy || !text) return;
         copyBusy = true;
@@ -11440,6 +11471,7 @@
         consent.focus();
       });
       installBtn.addEventListener('click', doInstall);
+      autoBox.addEventListener('change', doAuto);
       copyBtn.addEventListener('click', function(){ copyWith(pubSafeUrl(tun && tun.url), copyBtn, 'Link copied.'); });
       installCopy.addEventListener('click', function(){ copyWith(installCmd.textContent, installCopy, 'Command copied.'); });
 
@@ -11452,7 +11484,7 @@
         stopTimers();
         seq++;
         data = null; tun = null; key = ''; remainAt = NaN;
-        isOpen = false; busy = false; installPending = false; failsInRow = 0;
+        isOpen = false; busy = false; installPending = false; autoPending = false; failsInRow = 0;
         fired = { m5: false, m1: false }; expiryAsked = ''; lastView = 'none';
         dismissed = {}; offText = '';
         consent.checked = false;

@@ -39775,8 +39775,13 @@ def api_publish_renew():
 @app.route("/api/publish/install", methods=["POST"])
 def api_publish_install():
     """Download the official cloudflared (background; progress in GET
-    /api/publish -> cloudflared). Only ever on this explicit, confirmed call."""
-    refusal = _publish_unconfirmed(_publish_body())
+    /api/publish -> cloudflared) on this explicit, confirmed call -- or by itself
+    after boot (publish.AutoInstaller, see _cfi_start). `{auto: true|false}`
+    instead sets that automatic install's flag and downloads nothing."""
+    body = _publish_body()
+    if "auto" in body:
+        return _cfi_set_auto(body.get("auto"))
+    refusal = _publish_unconfirmed(body)
     if refusal is not None:
         return refusal
     try:
@@ -39784,6 +39789,53 @@ def api_publish_install():
     except publish.PublishError as exc:
         return _publish_fail(exc)
     return _publish_json({"ok": True, **state})
+
+
+# CFI: cloudflared installs itself (publish.AutoInstaller). The boot arms one
+# look ~60 s out; the same verified Manager.install() then runs in the
+# background unless the flag cloudflared_auto_install is off, publishing is
+# off, cloudflared is already there, the platform has no official build, the
+# last automatic attempt failed less than 24 h ago -- or _cfi_blocked() says
+# the hub is draining for an update or was stopped from the dashboard.
+def _cfi_blocked():
+    """Why the automatic cloudflared install must wait right now, or None."""
+    if _UPDATE_DRAIN.active() or _auto_update_state.get("updating"):
+        return "draining"
+    if _restart_is_vetoed_by_stop():
+        return "stopped"
+    return None
+
+
+def _cfi_start():
+    """Boot: arm the automatic cloudflared install (returns at once)."""
+    auto = getattr(publish, "auto", None)
+    if auto is None:
+        return
+    try:
+        auto.start(blocked=_cfi_blocked)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[publish] automatic cloudflared install not armed: %s",
+                     _sanitize(str(exc), 160))
+
+
+def _cfi_set_auto(value):
+    """`POST /api/publish/install {auto: bool}`: the Publish panel's "Install
+    cloudflared automatically" box. Saves the flag and arms (on) or cancels
+    (off) the automatic look; never downloads in this call."""
+    if not isinstance(value, bool):
+        return _publish_json({"error": "auto must be true or false", "code": "bad_request"}, 400)
+    try:
+        auto = getattr(publish, "auto", None)
+        if auto is not None:
+            auto.set_enabled(value)
+        else:
+            config.set_flag("cloudflared_auto_install", value)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[publish] could not save cloudflared_auto_install: %s",
+                     _sanitize(str(exc), 160))
+        return _publish_json({"error": "The setting could not be saved.",
+                              "code": "save_failed"}, 500)
+    return _publish_json({"ok": True, **publish.default.status()})
 
 
 def _multi_check_kwargs():
@@ -45877,6 +45929,7 @@ if __name__ == "__main__":
                       len(_tunnels_left))
     except Exception as _exc:                                    # noqa: BLE001
         _log.warning("[boot] could not check for leftover tunnels: %s", _exc)
+    _cfi_start()   # PUBLISH: cloudflared installs itself ~60 s from now (flag cloudflared_auto_install)
     # The CLIs the last Stop disconnected, wired again once the server answers.
     threading.Thread(target=lambda: (time.sleep(15), _reconnect_clis_after_stop()),
                      daemon=True, name="stop-reconnect").start()

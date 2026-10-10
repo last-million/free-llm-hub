@@ -3491,7 +3491,8 @@ downloader; nothing real is started, contacted or downloaded).
   no stamp = ours);
   `atexit` -> `default.shutdown()`. A hard kill of the hub leaves cloudflared
   running until the next boot sweep.
-- **Install** (explicit `POST /api/publish/install {confirm:true}` only): official
+- **Install** (explicit `POST /api/publish/install {confirm:true}`, or by itself
+  after boot -- see "cloudflared installs itself" below): official
   asset for `platform.system()/machine()` (windows-amd64.exe, linux-amd64|arm64,
   darwin-amd64|arm64.tgz), release metadata from `api.github.com` (metadata
   host only), file from `github.com` / `objects.githubusercontent.com` /
@@ -3517,3 +3518,76 @@ downloader; nothing real is started, contacted or downloaded).
   from starting (not worked around: the command is the contract); the
   checksum-in-release-notes parser is lenient but unverified against a live
   release; macOS/Windows/Linux asset names are the documented ones.
+
+## cloudflared installs itself (2026-10-10)
+
+Owner: the installer must install cloudflared automatically, not only on the
+Publish panel's click. Covered by `tests/test_cloudflared_auto_install.py`
+(fake downloader, fake timer, fake wall clock, state file under tmp_path; no
+network, no real timer thread, nothing left running).
+
+- **What**: `publish.AutoInstaller` (module object `publish.auto`, attached to
+  `publish.default`). About 60 s after boot (`AUTO_DELAY_SECONDS`), when flag
+  `cloudflared_auto_install` (config.get_flag, default True; an unreadable
+  config counts as OFF) and `publish_enabled` are on and no cloudflared is
+  found, it calls the SAME `Manager.install()` the button calls: same release
+  lookup, host allowlist on every redirect hop, SHA-256 check. The auto path
+  downloads, verifies and writes nothing itself; a missing or mismatching
+  checksum leaves nothing installed and is reported (`auto_error` = the
+  engine's sentence).
+- **Never** at import (the constructor stores settings: no thread, no file
+  read), never on the boot thread (`start()` arms one daemon `threading.Timer`
+  named `cloudflared-auto` and returns), never while `blocked()` names a
+  reason. app.py's `_cfi_blocked`: `_UPDATE_DRAIN.active()` or
+  `_auto_update_state["updating"]` -> "draining"; `_restart_is_vetoed_by_stop()`
+  (sticky Stop, runtime drain) -> "stopped". It then looks again
+  `AUTO_RECHECK_SECONDS` (60) later; a `blocked()` that raises also waits.
+- **At most once per 24 h after a failure** (`AUTO_RETRY_SECONDS`), across
+  restarts: `state_dir()/cloudflared-auto.json` = `{v, result
+  (installing|installed|failed|unsupported|interrupted), last_attempt, error,
+  platform, interrupted, updated_at}`, written with mkstemp in the same folder
+  + fsync + `os.replace`. After a failure the next look is armed for the rest
+  of the 24 h (again at each boot). An attempt the hub stopped in the middle of
+  (`installing` found at boot) is tried once more; a second one in a row is
+  `failed`. The Install button works any time and never touches this record.
+- **Unsupported platform** (no `_ASSETS` entry): recorded once (`unsupported`,
+  the platform, the manual-install sentence) and never tried automatically.
+- **Never two downloads**: `Manager.install(on_done=None)` now re-checks
+  `running` inside the lock that starts the worker (the button and the timer
+  could both pass the first check before); `install_started_by(on_done)` tells
+  the AutoInstaller whether ITS call started the download. A download the
+  button started is left alone (`busy`, nothing recorded); the button pressed
+  during an automatic download joins it. `on_done(error|None)` runs once on the
+  worker thread, outside the Manager lock.
+- **Locks**: the AutoInstaller's `_lock` may be held while calling the Manager
+  (order: auto -> manager, never the reverse); `view()` (called by
+  `Manager._cloudflared_info`) takes only the leaf `_io` lock, so a status read
+  never waits on an install decision and can never close a lock cycle.
+- **Status**: `GET /api/publish` -> `cloudflared` gains `auto_install` (the
+  flag), `auto_state` (off | installing | installed | idle | unsupported |
+  failed | scheduled, in that precedence; off = this flag or publishing off),
+  `auto_last_attempt`, `auto_error` (failed/unsupported) and
+  `auto_next_attempt`. A Manager with no AutoInstaller keeps its old fields.
+- **Setting**: no generic flag route fits, so `POST /api/publish/install
+  {auto: true|false}` (`_cfi_set_auto` -> `AutoInstaller.set_enabled`) saves
+  the flag and arms a look `AUTO_REARM_SECONDS` (5) out (on, after boot) or
+  cancels the pending one (off); it never downloads in that call. Non-bool ->
+  400 `bad_request`, a save error -> 500 `save_failed`. Without `auto` the route
+  is the old confirmed install, unchanged. No route added.
+- **Boot**: `_cfi_start()`, one line right after
+  `publish.default.sweep_leftovers()` in `__main__` ->
+  `publish.auto.start(blocked=_cfi_blocked)`. Flag off = nothing armed at all,
+  i.e. the explicit-click behaviour byte for byte. atexit stops the timer.
+- **Panel** (`#publish-install`): checkbox `#publish-auto` "Install cloudflared
+  automatically" (a `.publish-consent` row, 44 rendered px; shown when the hub
+  sends `auto_install` and the platform is installable); "Installing
+  cloudflared automatically…" while the automatic download runs; "The automatic
+  install failed: <error> ..." with the existing Install button and manual
+  command when it failed; "will be installed automatically in a moment" while
+  scheduled (the open panel polls then). The Install button stays an explicit
+  click.
+- `tests/conftest.py::_no_real_tunnel` also fences `publish._auto_timer` (fails
+  loudly) and stops `publish.auto` after every test.
+- Left as is: unticking the box does not cancel a download already running (the
+  engine has no cancel; it finishes); README's Security list of outbound calls
+  was not extended (the change is described in the Publish section).

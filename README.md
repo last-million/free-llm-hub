@@ -319,11 +319,14 @@ Quick Tunnel**: free, no Cloudflare account, nothing to configure.
 - **Only the project's own web server is exposed**, never the hub, never your
   files. The hub's own port, ports outside 1024-65535 and well-known database
   and remote-access ports are refused, and the port must answer a web request.
-- **cloudflared is needed once.** If it is not on your PATH, press *Install
-  cloudflared*: the hub downloads the official build from Cloudflare's GitHub
-  release (HTTPS, checked against the SHA-256 published with the release; if
-  there is no checksum or it does not match, nothing is installed) into
-  `~/.free-llm-hub/bin/`. Nothing is downloaded until you press it. On a
+- **cloudflared is needed once.** If it is not on your PATH, the hub
+  downloads the official build from Cloudflare's GitHub release (HTTPS,
+  checked against the SHA-256 published with the release; if there is no
+  checksum or it does not match, nothing is installed) into
+  `~/.free-llm-hub/bin/`. It installs it by itself about a minute after it
+  starts (a failed attempt is retried at most once a day); to keep it to the
+  *Install cloudflared* button, untick *Install cloudflared automatically* in
+  the Publish panel or set the `cloudflared_auto_install` flag to `false`. On a
   system without an official build, install it yourself (`winget install
   --id Cloudflare.cloudflared`, `brew install cloudflared`, or your
   distribution's package).

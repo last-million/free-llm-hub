@@ -202,11 +202,17 @@ def _no_real_tunnel(monkeypatch):
     monkeypatch.setattr(publish, "_http_probe", lambda port, timeout=2.0: False)
     monkeypatch.setattr(publish, "_iter_processes", lambda: iter(()))
     monkeypatch.setattr(publish.Manager, "_ensure_timer", lambda self: None)
+    if hasattr(publish, "_auto_timer"):     # the automatic cloudflared install's timer
+        def _no_auto_timer(*_a, **_k):
+            raise AssertionError("a test tried to arm the real automatic cloudflared "
+                                 "install; inject timer= into publish.AutoInstaller")
+        monkeypatch.setattr(publish, "_auto_timer", _no_auto_timer)
     yield
-    try:
-        publish.default.shutdown()
-    except Exception:                                            # noqa: BLE001
-        pass
+    for _name, _method in (("auto", "stop"), ("default", "shutdown")):
+        try:
+            getattr(getattr(publish, _name), _method)()
+        except Exception:                                        # noqa: BLE001
+            pass
 
 
 @pytest.fixture(autouse=True)

@@ -28,13 +28,16 @@ SAFETY
   answer a plain HTTP request.
 - cloudflared is stamped with CALVOUN_TUNNEL=<id>, so a leaked one is
   RECOGNISED at the next boot (`sweep_leftovers`) and nothing else is touched.
-- The installer (only on an explicit call) downloads the official release over
-  HTTPS from an allowlist of hosts, on every redirect hop, and refuses anything
-  without a matching published SHA-256. It never runs what it downloaded.
+- The installer (the Install button, or by itself about a minute after boot:
+  `AutoInstaller`, flag `cloudflared_auto_install`) downloads the official
+  release over HTTPS from an allowlist of hosts, on every redirect hop, and
+  refuses anything without a matching published SHA-256. It never runs what
+  it downloaded. The automatic path calls the very same `Manager.install()`.
 """
 import atexit
 import hashlib
 import http.client
+import json
 import logging
 import math
 import os
@@ -184,6 +187,13 @@ def asset_for(system=None, machine=None):
 def manual_install_hint(system=None):
     s = platform_key(system)[0]
     return _MANUAL.get(s, _MANUAL_ANY)
+
+
+def _no_download_text(system, machine):
+    """The one sentence for a platform with no official build to download."""
+    return ("This computer (%s/%s) has no automatic download. Install cloudflared "
+            "yourself with: %s, then reload this page."
+            % (system or "?", machine or "?", manual_install_hint(system)))
 
 
 def check_port(port, hub_ports=()):
@@ -569,7 +579,12 @@ class Manager:
         self._stop_evt = threading.Event()
         self._version_cache = {}
         self._install = {"running": False, "error": None, "stage": None,
-                         "progress": None, "thread": None}
+                         "progress": None, "thread": None, "on_done": None}
+        self._auto = None             # the AutoInstaller whose fields status() shows
+
+    def attach_auto(self, auto):
+        """status()["cloudflared"] gains `auto.view(...)`'s auto_* fields."""
+        self._auto = auto
 
     # ----------------------------------------------------------- plumbing --
     def _home(self):
@@ -652,15 +667,21 @@ class Manager:
         if path:
             error = None
         elif asset is None and not error:
-            error = ("This computer (%s/%s) has no automatic download. Install "
-                     "cloudflared yourself with: %s, then reload this page."
-                     % (system or "?", machine or "?", manual_install_hint(system)))
-        return {"available": bool(path), "path": path,
+            error = _no_download_text(system, machine)
+        enabled = self._enabled()
+        info = {"available": bool(path), "path": path,
                 "version": self._version(path) if path else None,
                 "platform": "%s/%s" % (system, machine),
-                "installable": asset is not None and self._enabled(),
+                "installable": asset is not None and enabled,
                 "installing": bool(inst["running"]), "install_error": error,
                 "install_stage": inst["stage"], "install_progress": inst["progress"]}
+        auto = self._auto
+        if auto is not None:            # lock-free: never waits on the AutoInstaller
+            try:
+                info.update(auto.view(bool(path), asset is not None, enabled, error))
+            except Exception:                                    # noqa: BLE001
+                pass
+        return info
 
     def _version(self, path):
         """Never spawned per poll. An installed binary's version is the tag
@@ -1135,30 +1156,40 @@ class Manager:
                 self._timer = None
 
     # ------------------------------------------------------------ install --
-    def install(self):
-        """Explicit user action: download the official cloudflared in the
-        background. Progress and failure show in status()["cloudflared"]."""
+    def install(self, on_done=None):
+        """Download the official cloudflared in the background: the Install
+        button, or the automatic install (AutoInstaller passes `on_done`, called
+        once with the error text or None when the download THIS call started
+        ends). Never two at once: an install already running is left alone.
+        Progress and failure show in status()["cloudflared"]."""
         self._require_enabled()
         if self._find():
             return self.status()
         with self._lock:
-            if self._install["running"]:
-                return self.status()
+            busy = self._install["running"]
+        if busy:
+            return self.status()
         system, machine = self._sys()
         asset = _ASSETS.get((system, machine))
         if asset is None:
-            raise PublishError("install_failed",
-                               "This computer (%s/%s) has no automatic download. "
-                               "Install cloudflared yourself with: %s, then reload "
-                               "this page." % (system or "?", machine or "?",
-                                               manual_install_hint(system)))
+            raise PublishError("install_failed", _no_download_text(system, machine))
+        th = None
         with self._lock:
-            self._install.update(running=True, error=None, stage="starting", progress=None)
-            th = threading.Thread(target=self._install_worker, args=(asset,),
-                                  daemon=True, name="publish-install")
-            self._install["thread"] = th
-        th.start()
+            if not self._install["running"]:        # re-checked: the button and the timer race
+                self._install.update(running=True, error=None, stage="starting",
+                                     progress=None, on_done=on_done)
+                th = threading.Thread(target=self._install_worker, args=(asset,),
+                                      daemon=True, name="publish-install")
+                self._install["thread"] = th
+        if th is not None:
+            th.start()
         return self.status()
+
+    def install_started_by(self, on_done):
+        """True when the running (or last) download was started with this exact
+        `on_done` -- how the AutoInstaller tells its own attempt from the button's."""
+        with self._lock:
+            return on_done is not None and self._install.get("on_done") is on_done
 
     def _stage(self, stage, progress=None):
         with self._lock:
@@ -1179,10 +1210,16 @@ class Manager:
             self._install["error"] = error
             if error:
                 self._install["stage"] = "failed"
+            on_done = self._install.get("on_done")
         if error:
             _log.warning("[publish] cloudflared install failed: %s", scrub(error))
         else:
             _log.info("[publish] cloudflared installed")
+        if on_done is not None:                 # outside the lock: it takes its own
+            try:
+                on_done(error)
+            except Exception as exc:                             # noqa: BLE001
+                _log.warning("[publish] install callback failed: %s", type(exc).__name__)
 
     def _download(self, url, sink, max_bytes, hosts, on_progress=None):
         fetch = self._fetch_fn or _https_fetch
@@ -1288,14 +1325,374 @@ class Manager:
             pass
 
 
+# --------------------------------------------------------------------------- #
+# cloudflared installs itself (owner request 2026-10-10)
+# --------------------------------------------------------------------------- #
+
+AUTO_FLAG = "cloudflared_auto_install"     # config flag, default on
+AUTO_DELAY_SECONDS = 60.0                  # boot -> the first automatic look
+AUTO_RETRY_SECONDS = 24 * 3600.0           # a failed automatic attempt -> the next one
+AUTO_RECHECK_SECONDS = 60.0                # a drain or a Stop is on -> look again then
+AUTO_REARM_SECONDS = 5.0                   # the panel's box was just ticked
+AUTO_STATE_FILE = "cloudflared-auto.json"  # in state_dir()
+_AUTO_RESULTS = frozenset({"installing", "installed", "failed", "unsupported", "interrupted"})
+_AUTO_CUT_TWICE = ("The automatic install was cut short twice in a row (the hub stopped "
+                   "during the download). Press Install cloudflared to try now.")
+
+
+def _auto_timer(delay, fn):
+    """The real timer: one daemon thread that waits `delay` seconds, then calls
+    `fn`. tests/conftest.py makes it fail loudly; tests inject their own."""
+    t = threading.Timer(max(0.0, float(delay)), fn)
+    t.daemon = True
+    t.name = "cloudflared-auto"
+    t.start()
+    return t
+
+
+def _auto_flag_on():
+    try:
+        import config
+        return config.get_flag(AUTO_FLAG, True)
+    except Exception:                                            # noqa: BLE001
+        return False          # the owner's choice cannot be read: download nothing
+
+
+def _auto_set_flag(value):
+    import config
+    config.set_flag(AUTO_FLAG, bool(value))
+
+
+def _auto_state_path():
+    import config
+    return os.path.join(config.state_dir(), AUTO_STATE_FILE)
+
+
+def _finite(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v) if math.isfinite(v) else None
+
+
+class AutoInstaller:
+    """cloudflared installs itself. About a minute after boot, when the flag
+    `cloudflared_auto_install` (default on) and `publish_enabled` are on and no
+    cloudflared is found, the Manager's OWN `install()` runs in the background:
+    the same release lookup, host allowlist and SHA-256 check as the Install
+    button. Nothing here downloads, verifies or writes a binary itself.
+
+    - Never at import (the constructor only stores its settings), never on the
+      boot thread (`start()` arms one daemon timer and returns), never while
+      `blocked()` names a reason (a graceful-update drain, a dashboard Stop):
+      it looks again AUTO_RECHECK_SECONDS later instead.
+    - At most one automatic attempt per AUTO_RETRY_SECONDS after a failure,
+      across restarts: the last attempt and its result live in
+      state_dir()/cloudflared-auto.json (temp file + fsync + os.replace). An
+      attempt the hub stopped in the middle of is tried once more at the next
+      boot; a second one in a row counts as a failure.
+    - A platform with no official build is recorded `unsupported` and never
+      tried automatically.
+    - Never two downloads at once: the Manager's own `installing` guard; a
+      download the button started is left alone (and not recorded here).
+    Locks: `_lock` (timer + attempt) may be held while calling the Manager
+    (auto -> manager, never the reverse); `view()` takes neither it nor any
+    Manager lock, so a status read never waits on an install decision; `_io`
+    (the state file) is a leaf lock."""
+
+    def __init__(self, manager, *, flag=None, set_flag=None, wall=None, timer=None,
+                 path=None, delay=AUTO_DELAY_SECONDS, retry_seconds=AUTO_RETRY_SECONDS,
+                 recheck_seconds=AUTO_RECHECK_SECONDS, rearm_seconds=AUTO_REARM_SECONDS):
+        self._m = manager
+        self._flag_fn = flag
+        self._set_flag_fn = set_flag
+        self._wall = wall or time.time
+        self._timer_fn = timer             # (delay, fn) -> handle with .cancel()
+        self._path_fn = path
+        self._delay = float(delay)
+        self._retry = float(retry_seconds)
+        self._recheck = float(recheck_seconds)
+        self._rearm = float(rearm_seconds)
+        self._lock = threading.RLock()
+        self._io = threading.Lock()
+        self._blocked = None               # () -> why an install must wait now, or None
+        self._started = False              # start() ran: the hub booted
+        self._handle = self._gen = self._due = None
+        self._mine = None                  # token of the download THIS object started
+        self._record = None                # the state file, read once (None = not yet)
+        manager.attach_auto(self)
+
+    # ------------------------------------------------------------ settings --
+    def enabled(self):
+        try:
+            return bool(self._flag_fn() if self._flag_fn else _auto_flag_on())
+        except Exception:                                        # noqa: BLE001
+            return False
+
+    def set_enabled(self, on):
+        """The Publish panel's "Install cloudflared automatically" box: save the
+        flag, then look again in a few seconds (on) or cancel the pending look
+        (off). Downloads nothing in this call; a download already running ends
+        by itself."""
+        on = bool(on)
+        (self._set_flag_fn or _auto_set_flag)(on)
+        with self._lock:
+            if not on:
+                self._cancel()
+            elif self._started and self._mine is None:
+                self._arm(self._rearm)
+
+    # ------------------------------------------------------ the state file --
+    def _path(self):
+        return self._path_fn() if self._path_fn else _auto_state_path()
+
+    @staticmethod
+    def _clean(rec):
+        result = rec.get("result")
+        err = rec.get("error")
+        plat = rec.get("platform")
+        n = rec.get("interrupted")
+        return {"v": 1, "result": result if result in _AUTO_RESULTS else None,
+                "last_attempt": _finite(rec.get("last_attempt")),
+                "updated_at": _finite(rec.get("updated_at")),
+                "error": scrub(err)[:400] if isinstance(err, str) and err else None,
+                "platform": plat[:40] if isinstance(plat, str) else None,
+                "interrupted": min(n, 9) if isinstance(n, int) and not isinstance(n, bool)
+                and n > 0 else 0}
+
+    def _load(self):
+        """The last automatic attempt, read once. An attempt the previous hub
+        stopped in the middle of reads `interrupted`; a second one in a row,
+        `failed`."""
+        rec = self._record
+        if rec is not None:
+            return rec
+        with self._io:
+            if self._record is not None:
+                return self._record
+            try:
+                with open(self._path(), encoding="utf-8") as fh:
+                    got = json.load(fh)
+            except Exception:                                    # noqa: BLE001
+                got = {}
+            rec = self._clean(got if isinstance(got, dict) else {})
+            if rec["result"] == "installing":
+                n = rec["interrupted"] + 1
+                if n >= 2:
+                    rec.update(result="failed", error=_AUTO_CUT_TWICE, interrupted=0)
+                else:
+                    rec.update(result="interrupted", error=None, interrupted=n)
+            self._record = rec
+            return rec
+
+    def _save(self, **changes):
+        rec = dict(self._load())
+        rec.update(changes)
+        rec["updated_at"] = self._wall()
+        rec = self._clean(rec)
+        with self._io:
+            self._record = rec
+            tmp = None
+            try:
+                path = os.path.abspath(self._path())
+                folder = os.path.dirname(path)
+                os.makedirs(folder, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(prefix=".cloudflared-auto-", suffix=".tmp", dir=folder)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(rec, fh)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
+                tmp = None
+            except Exception as exc:                             # noqa: BLE001
+                _log.warning("[publish] could not save %s: %s", AUTO_STATE_FILE,
+                             type(exc).__name__)
+            finally:
+                if tmp is not None:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+        return rec
+
+    # ----------------------------------------------------------- the timer --
+    def start(self, blocked=None):
+        """Boot (app.py, next to the tunnel sweep): arm ONE look
+        AUTO_DELAY_SECONDS from now and return. `blocked()` names why an install
+        must wait (a graceful-update drain, a dashboard Stop). With the flag off
+        nothing is armed: the Install button stays the only way, as before."""
+        with self._lock:
+            if blocked is not None:
+                self._blocked = blocked
+            self._started = True
+            if self.enabled():
+                self._arm(self._delay)
+
+    def stop(self):
+        """Hub exit: the pending look is cancelled."""
+        with self._lock:
+            self._started = False
+            self._cancel()
+
+    def _arm(self, delay):
+        self._cancel()
+        delay = max(0.0, float(delay))
+        gen = object()
+        self._gen = gen
+        try:
+            handle = (self._timer_fn or _auto_timer)(delay, lambda: self._fire(gen))
+        except BaseException:
+            self._gen = None
+            raise
+        self._handle, self._due = handle, self._wall() + delay
+
+    def _cancel(self):
+        handle = self._handle
+        self._handle = self._gen = self._due = None
+        if handle is not None:
+            try:
+                handle.cancel()
+            except Exception:                                    # noqa: BLE001
+                pass
+
+    def _fire(self, gen):
+        with self._lock:
+            if gen is not self._gen:
+                return                      # cancelled or re-armed since
+            self._handle = self._gen = self._due = None
+        try:
+            self.run_once()
+        except Exception as exc:                                 # noqa: BLE001
+            _log.warning("[publish] automatic cloudflared install: %s", type(exc).__name__)
+
+    # -------------------------------------------------------- one decision --
+    def _why_blocked(self):
+        fn = self._blocked
+        if fn is None:
+            return None
+        try:
+            why = fn()
+        except Exception:                                        # noqa: BLE001
+            return "unknown"                # cannot tell: wait, never guess
+        return str(why) if why else None
+
+    def _unsupported(self, plat, message):
+        rec = self._load()
+        if rec["result"] != "unsupported" or rec["platform"] != plat:
+            self._save(result="unsupported", platform=plat, error=message)
+            _log.info("[publish] no official cloudflared build for %s; it is not "
+                      "installed automatically", plat)
+        return "unsupported"
+
+    def run_once(self):
+        """Install now, look again later, or do nothing. Returns why, in one
+        word: off, disabled, available, unsupported, the blocked() reason,
+        waiting, busy or started (else an engine refusal code)."""
+        with self._lock:
+            if self._mine is not None:
+                return "busy"
+            if not self.enabled():
+                return "off"
+            if not self._m._enabled():
+                return "disabled"
+            if self._m._find():
+                return "available"
+            system, machine = self._m._sys()
+            plat = "%s/%s" % (system, machine)
+            if _ASSETS.get((system, machine)) is None:
+                return self._unsupported(plat, _no_download_text(system, machine))
+            why = self._why_blocked()
+            if why:
+                self._arm(self._recheck)
+                return why
+            rec = self._load()
+            now = self._wall()
+            if rec["result"] == "failed" and rec["last_attempt"] is not None:
+                wait = min(rec["last_attempt"] + self._retry - now, self._retry)
+                if wait > 0:
+                    self._arm(wait)
+                    return "waiting"
+            token = object()
+
+            def done(error, _token=token):
+                self._done(_token, error)
+            try:
+                self._m.install(on_done=done)
+            except PublishError as exc:
+                if exc.code == "install_failed":       # no official build after all
+                    return self._unsupported(plat, exc.message)
+                return exc.code
+            if not self._m.install_started_by(done):
+                return "busy"               # the button's download is running: left alone
+            # Recorded before the worker's done() can run: it waits for _lock.
+            self._mine = token
+            self._save(result="installing", last_attempt=now, error=None, platform=plat,
+                       interrupted=rec["interrupted"] if rec["result"] == "interrupted" else 0)
+        _log.info("[publish] installing cloudflared automatically (the official release, "
+                  "SHA-256 checked); the %s flag turns this off", AUTO_FLAG)
+        return "started"
+
+    def _done(self, token, error):
+        """The download THIS object started ended (called on the engine's
+        worker thread, outside the Manager's lock)."""
+        with self._lock:
+            if token is not self._mine:
+                return
+            self._mine = None
+            if error:
+                self._save(result="failed", error=str(error), interrupted=0)
+                _log.info("[publish] the automatic cloudflared install failed; the next "
+                          "automatic try is in %d h (Install cloudflared works any time)",
+                          int(self._retry // 3600))
+                if self._started and self.enabled():
+                    self._arm(self._retry)
+            else:
+                self._save(result="installed", error=None, interrupted=0)
+
+    # ---------------------------------------------------------- the status --
+    def view(self, available, supported, enabled, install_error=None):
+        """The auto_* fields of GET /api/publish -> cloudflared."""
+        on = self.enabled()
+        rec = self._load()
+        due = self._due
+        if not (on and enabled):
+            state = "off"
+        elif self._mine is not None:
+            state = "installing"
+        elif available:
+            state = "installed" if rec["result"] == "installed" else "idle"
+        elif not supported:
+            state = "unsupported"
+        elif rec["result"] == "failed":
+            state = "failed"
+        elif due is not None:
+            state = "scheduled"
+        else:
+            state = "idle"
+        error = None
+        if state == "failed":
+            error = rec["error"]
+        elif state == "unsupported":
+            error = rec["error"] or install_error
+        nxt = None
+        if due is not None and state in ("scheduled", "failed"):
+            nxt = due
+            if state == "failed" and rec["last_attempt"] is not None:
+                nxt = max(due, rec["last_attempt"] + self._retry)
+        return {"auto_install": on, "auto_state": state,
+                "auto_last_attempt": rec["last_attempt"], "auto_error": error,
+                "auto_next_attempt": nxt}
+
+
 default = Manager()
+auto = AutoInstaller(default)      # armed only by app.py's boot (start()), never here
 
 
 def _shutdown_default():
-    try:
-        default.shutdown()
-    except Exception:                                            # noqa: BLE001
-        pass
+    for fn in (auto.stop, default.shutdown):
+        try:
+            fn()
+        except Exception:                                        # noqa: BLE001
+            pass
 
 
 atexit.register(_shutdown_default)
