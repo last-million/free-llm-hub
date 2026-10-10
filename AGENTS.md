@@ -4063,3 +4063,113 @@ rating), with SOURCE/DATE. All app.py names added for this are `_ev_*`.
   turns. Board evidence sets the order among equally-reliable candidates; it does
   not override a measured failure. The relay discount and sustain penalty are
   untouched (relay Claude stays well below first-party GLM 5.3 on tool turns).
+
+## Apps deploy by themselves (2026-10-10)
+
+Owner: "why can't this conversation deploy the app on the machine? ... help our
+hub to deploy apps perfectly next time." Covered by `tests/test_deploy_perfect.py`
+(hermetic: temp folders of fake package.json / .env.example / marker files, a
+recording `_run_blocking` stub, an injected HTTP probe + clock; no real npm /
+pip / docker / network / server).
+
+**DIAGNOSIS of the incident** (Build conversation `2e3525ad`, codex / quality
+multi, project `project-20261008-025847` -- a role-based "home repair / Fixli"
+marketplace). Read-only, from the hub's own APIs + `~/.free-llm-hub` + the
+project folder:
+1. It is a **two-part monorepo**: root `package.json` start `node
+   backend/server.js` (Express + **Postgres `pg`** + Stripe) AND a SEPARATE
+   Vite/React/TS frontend in `frontend/` (Supabase). `workspace.detect()`/
+   `install()` handle ONE package.json and ONE `npm install` in the ROOT only --
+   the frontend's own install and its **`vite build`** step are never run by the
+   hub, so "the app" works only after an agent hand-builds the frontend and
+   patches the server to serve it, redone every run.
+2. The hub **never started it** -- `workspace.status` was `external:true,
+   "started by the agent"`: it only ADOPTED a server the agent hand-started on
+   port 3000. hub.log has NO `[preview]`/`install`/`detect`/`adopt` line for the
+   project; the install/start pipeline never drove it (only `[swarm] resumed ...`
+   and `[publish] ... tunnel ...` lines).
+3. The app expects **PostgreSQL** (`createdb home_repair_db` in the README) that
+   is not on the machine; the backend degrades gracefully ("Database
+   unavailable; continuing"), but the hub had no DB awareness so a "deploy"
+   looked unverified and agents kept re-addressing it.
+4. **No auto `.env`**: `.env.example` needs JWT/Stripe/SMTP; the hub never seeded
+   `.env`, so each run an agent hand-created it.
+5. **Circular re-deploy**: nothing persisted a canonical "start `node
+   backend/server.js` on 3000, frontend already built" across runs/restarts, so
+   after the 2026-10-10 01:42 update restart the adopted server was lost and
+   turn 14 (`swarm-e0ef19ed87d1`) was **rebuilding the frontend shell from
+   scratch AGAIN** -- the 5th deploy attempt. A killed `backend/
+   node_modules.partial-20261010` (a manual `npm install` cut by the restart;
+   NOT the hub's -- `workspace._remove_partial` rmtree's, it does not rename) was
+   left behind.
+
+**THE FIX (generic, any project, any OS)** -- the hub now does the extra
+install/build/env work a multi-part app needs before its single start command,
+and surfaces WHY an app is or is not running.
+
+- **`deploy_perfect.py`** (pure, stdlib only, never raises; every filesystem /
+  clock side is an injected callable with an `os`/`time` default):
+  - `analyze(project_dir)` -> a plan: `layout` (single | monorepo | workspaces |
+    compose), the `server_dir`/`server_kind` to launch, the EXTRA `steps` beyond
+    the root install (each sub-app's `npm-install` / python `venv`+`pip-install`,
+    then each unbuilt frontend's `npm-build`, as abstract records the caller
+    turns into argv), `frontends`, whether the server likely `serves_frontend`,
+    an `env` seed directive, a `db` plan (engine from drivers in any
+    package.json/requirements + `.env.example`; `required`/`local_ok`; a
+    Postgres/MySQL/Mongo note naming `createdb <DB_NAME>` or "point DATABASE_URL
+    at a hosted database"; SQLite = no external DB), `notes`, and a one-line
+    `summary`.
+  - `env_seed_plan(example_text)` -> a `.env` body with SAFE LOCAL defaults:
+    keys are tokenised on non-alphanumerics and matched on WHOLE tokens (`\b` is
+    no boundary across `_`, and a substring test reads "ses" inside "SESSION"),
+    so a random value is generated ONLY for the project's own internal signing
+    secrets (jwt/session/cookie/signing/... + a secret noun; bare `SECRET` is
+    enough), every EXTERNAL service key (stripe/smtp/github/...) keeps the
+    example's obvious placeholder (never fabricated), a bare DB password gets a
+    local default, PORT/HOST/localhost coordinates are kept verbatim.
+  - `deploy_check(url, probe=...)` -> poll the running preview over HTTP until it
+    answers (ANY status line = alive, the same rule a bound port uses) or a
+    deadline; returns `{ok, status, url, waited, error}`.
+- **`workspace.py` wiring** (reuses the preview's own `_run_blocking` timeouts
+  and PID/port kill rules; nothing here starts a server or binds a port):
+  - `start()`'s worker calls `_deploy_prepare(run_dir, project_dir, proc)` ALWAYS
+    (before the root-install branch -- a root `node_modules` does NOT mean the
+    frontend is built): it seeds `.env` from `.env.example` when absent (atomic
+    `os.replace`, never overwrites an existing `.env`), then runs the plan's
+    sub-app installs (`INSTALL_TIMEOUT`) and the frontend build
+    (`BUILD_TIMEOUT`, new = 600 s) via `_run_blocking`. A step that runs out of
+    its time is reported as the preview's error ("... the hub stopped it -- press
+    Run to try again") and a half-written `node_modules`/`.venv` it created is
+    removed so the next Run retries, mirroring `install()`. A step that merely
+    EXITS non-zero returns None (the start that follows reports the problem in
+    the project's own words). A no-op for a plain single project.
+  - `detect()` disambiguation: a bare `frontend/` + `backend/` monorepo with no
+    root start script used to 400 "ambiguous"; it now launches the backend when
+    `deploy_perfect` names a genuine server among the runnable candidates (two
+    static sites stay ambiguous -- regression-guarded).
+  - `deploy_check(project_dir, probe=None)` -> runs `deploy_perfect.deploy_check`
+    against the live `status()['url']` with a stdlib HTTP probe; None when
+    nothing runs.
+- **`app.py` wiring** (`_dp_`-prefixed, additive, flag-gated, degrades to the old
+  behaviour): `_dp_augment_status(project_dir, st, http_check=)` adds a plain
+  `deploy` block (summary / layout / notes / db / live URL or the exact HTTP
+  error) to the `GET /api/workspace/status` response so the Build page shows WHY
+  an app is or is not running instead of a bare "not running". The block is added
+  only when there is something to say (a trivial folder is byte-identical to
+  before), and `?deploy_check=1` also confirms a running preview answers over
+  HTTP. No new route was added (the existing status route carries it, like
+  `?discover=1`).
+- **Flag** `deploy_perfect` (`config.get_flag`, default on): off = every hop is
+  the old single-package behaviour exactly (no prepare, no detect override, no
+  status block).
+
+**Left out on purpose**: the hub still does not PATCH a server to serve a
+separate frontend's build output -- it builds the frontend and, when the server
+is a distinct app, emits a clear note ("serve the build output from the API, or
+run the frontend dev server separately") rather than editing the project's
+source; it provisions no database (a Postgres-only app gets the `createdb`
+instruction, not a spun-up server); and the end-of-Multi-run auto deploy-check is
+surfaced through the status route (`?deploy_check=1`) rather than wired into the
+Multi finish path, to avoid colliding with the parallel app.py/swarm_windows.py
+edits -- a one-line `workspace.deploy_check(project_dir)` is the hook when that
+path is free.

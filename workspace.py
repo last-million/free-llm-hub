@@ -174,6 +174,17 @@ def detect(project_dir):
     if len(candidates) == 1:
         return candidates[0]
 
+    # A real monorepo (a `frontend/` AND a `backend/`, with no root start
+    # script) lands here as "ambiguous" and used to 400 -- even though the
+    # right thing to launch is unambiguous: the API server, which also serves
+    # the built frontend. deploy_perfect names the server directory; take it
+    # ONLY when it is one of the runnable candidates and a genuine app (never a
+    # guess between two static sites, which stays ambiguous below).
+    if len(candidates) > 1:
+        chosen = _deploy_disambiguate(project_dir, candidates)
+        if chosen is not None:
+            return chosen
+
     raise WorkspaceError(
         "nothing runnable in this folder — no package.json, no app.py/main.py, "
         "no index.html" +
@@ -313,6 +324,10 @@ def _venv_python(project_dir):
 # this machine, OneDrive folder + antivirus included), so 2 min is >10x that.
 INSTALL_TIMEOUT = 600.0
 SETUP_TIMEOUT = 120.0
+# A frontend build (vite build, next build, tsc) is a one-shot download-free
+# compile; give it the same ceiling as the downloads rather than the short
+# local-setup budget -- a cold TypeScript + bundler build can run minutes.
+BUILD_TIMEOUT = 600.0
 # After the tree is killed: how long to wait for it to die and for the last
 # output it wrote to be read.
 _KILL_WAIT = 5.0
@@ -685,6 +700,183 @@ def _argv_with_port(argv, kind, port):
     return argv
 
 
+# --------------------------------------------------------------------------- #
+# "Deploy perfect": the extra install / build / env work a multi-part project
+# needs before the single start command can succeed. The brain is the pure
+# deploy_perfect module; this is the thin side that actually runs the steps
+# with the preview's own timeouts and PID/port kill rules. All of it degrades
+# to the old behaviour when the module or flag is absent.
+# --------------------------------------------------------------------------- #
+
+_DEPLOY_MOD = None
+_DEPLOY_TRIED = False
+
+
+def _deploy_mod():
+    global _DEPLOY_MOD, _DEPLOY_TRIED
+    if not _DEPLOY_TRIED:
+        _DEPLOY_TRIED = True
+        try:
+            import deploy_perfect
+            _DEPLOY_MOD = deploy_perfect
+        except Exception:                                        # noqa: BLE001
+            _DEPLOY_MOD = None
+    return _DEPLOY_MOD
+
+
+def _deploy_enabled():
+    try:
+        import config
+        return bool(config.get_flag("deploy_perfect", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _deploy_disambiguate(project_dir, candidates):
+    """Pick the server candidate for a monorepo, or None. Never raises."""
+    mod = _deploy_mod()
+    if mod is None or not _deploy_enabled():
+        return None
+    try:
+        plan = mod.analyze(project_dir)
+        server_dir = os.path.abspath(plan.get("server_dir") or "")
+        if not plan.get("server_kind"):
+            return None
+        for c in candidates:
+            if os.path.abspath(c.get("run_dir") or "") == server_dir:
+                return c
+    except Exception:                                            # noqa: BLE001
+        return None
+    return None
+
+
+def _deploy_step_argv(step):
+    """Map a deploy_perfect step record to (argv, timeout). None if unknown."""
+    d = step.get("dir")
+    kind = step.get("kind")
+    if kind == "npm-install":
+        return [_npm("npm"), "install"], INSTALL_TIMEOUT
+    if kind == "npm-build":
+        return [_npm("npm"), "run", "build"], BUILD_TIMEOUT
+    if kind == "venv":
+        return [sys.executable, "-m", "venv", _venv_dir(d)], SETUP_TIMEOUT
+    if kind == "pip-install":
+        return ([_venv_python(d), "-m", "pip", "install", "-q", "-r",
+                 "requirements.txt"], INSTALL_TIMEOUT)
+    return None
+
+
+def _deploy_prepare(run_dir, project_dir, proc):
+    """Seed .env and run a monorepo's sub-app installs and frontend builds.
+
+    Returns a failure reason (a step ran out of its time and was killed) so the
+    caller can show it instead of starting half-built, else None. A step that
+    merely EXITS non-zero returns None -- the start that follows reports what is
+    wrong in the project's own words, exactly as install() already does. Never
+    raises: any internal error degrades to "nothing extra to do"."""
+    mod = _deploy_mod()
+    if mod is None or not _deploy_enabled():
+        return None
+    try:
+        plan = mod.analyze(project_dir)
+    except Exception:                                            # noqa: BLE001
+        return None
+    try:
+        summary = plan.get("summary")
+        if summary:
+            proc.log("[hub] deploy plan: " + summary)
+        _deploy_seed_env(plan, proc)
+        for step in plan.get("steps") or []:
+            if proc.stopping:
+                return None
+            mapped = _deploy_step_argv(step)
+            if mapped is None:
+                continue
+            argv, timeout = mapped
+            # npm-build in a dir whose node_modules is missing cannot run; a
+            # preceding npm-install step handles it, but guard anyway.
+            if step.get("kind") == "npm-build" and not os.path.isdir(
+                    os.path.join(step["dir"], "node_modules")):
+                continue
+            proc.log("[hub] " + step.get("label", step.get("kind", "")))
+            failure = _run_blocking(argv, step["dir"], proc.log, timeout=timeout,
+                                    label=step.get("label") or step.get("kind"))
+            if failure:
+                # A killed install left a half-written tree detect()/its own
+                # presence check would read as "done"; remove it so the next
+                # Run retries, mirroring install().
+                if step.get("kind") in ("npm-install", "venv"):
+                    target = (_venv_dir(step["dir"]) if step["kind"] == "venv"
+                              else os.path.join(step["dir"], "node_modules"))
+                    _remove_partial(target, proc.log)
+                return failure
+        for note in plan.get("notes") or []:
+            proc.log("[hub] note: " + note)
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[workspace] deploy prepare failed for %s", project_dir,
+                   exc_info=True)
+        return None
+    return None
+
+
+def _deploy_seed_env(plan, proc):
+    mod = _deploy_mod()
+    env = plan.get("env") or {}
+    example = env.get("example_path")
+    if not (mod and env.get("needs_seed") and example and os.path.isfile(example)):
+        return
+    target = os.path.join(os.path.dirname(example), ".env")
+    if os.path.exists(target):
+        return
+    try:
+        with open(example, "r", encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+        seeded = mod.env_seed_plan(body)
+        content = seeded.get("content") or ""
+        if not content:
+            return
+        tmp = target + ".dp-tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        os.replace(tmp, target)
+        proc.log("[hub] wrote .env from .env.example (local dev defaults)")
+        for note in seeded.get("notes") or []:
+            proc.log("[hub] .env: " + note)
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[workspace] .env seeding failed", exc_info=True)
+
+
+def deploy_check(project_dir, *, probe=None, deadline=25.0):
+    """Confirm the running preview answers over HTTP. Returns the deploy_check
+    dict (ok/status/url/waited/error) or None when nothing is running or the
+    module is absent. Never raises. ``probe(url)->status|None`` defaults to a
+    stdlib HTTP HEAD/GET."""
+    mod = _deploy_mod()
+    if mod is None or not _deploy_enabled():
+        return None
+    st = status(project_dir)
+    url = st.get("url") if isinstance(st, dict) else None
+    if not url:
+        return None
+    if probe is None:
+        probe = _http_probe
+    try:
+        return mod.deploy_check(url, probe=probe, deadline=deadline)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _http_probe(url):
+    import urllib.request
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:    # noqa: S310
+            return getattr(resp, "status", None) or resp.getcode()
+    except urllib.error.HTTPError as exc:
+        return exc.code                     # a 4xx/5xx still means it answered
+    # URLError / socket errors propagate -> deploy_check treats them as "not yet"
+
+
 def start(project_dir, on_done=None):
     """Install deps, launch the project, and wait for its port. Returns the
     status dict immediately; the work happens on a worker thread."""
@@ -703,6 +895,19 @@ def start(project_dir, on_done=None):
         try:
             if proc.stopping:
                 proc.state = "stopped"
+                return
+            # Deploy-perfect: seed .env and run a monorepo's sub-app installs
+            # and frontend build BEFORE the single start command, regardless of
+            # whether the ROOT needs installing (a root node_modules does not
+            # mean the frontend is built). A no-op for a plain single project.
+            dp_failure = _deploy_prepare(run_dir, project_dir, proc)
+            if proc.stopping:
+                proc.state = "stopped"
+                return
+            if dp_failure:
+                proc.state = "failed"
+                proc.error = ("%s; the hub stopped it -- press Run to try again"
+                              % dp_failure)
                 return
             if spec["needs_install"]:
                 failure = install(run_dir, proc.log)

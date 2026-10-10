@@ -26057,6 +26057,66 @@ def api_workspace_browse():
         return jsonify({"error": _sanitize(str(exc))}), 400
 
 
+def _dp_enabled():
+    try:
+        return bool(config.get_flag("deploy_perfect", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _dp_module():
+    try:
+        import deploy_perfect
+        return deploy_perfect
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _dp_augment_status(project_dir, st, http_check=False):
+    """Add a plain-language `deploy` block to a workspace status dict so the
+    Build page shows WHY an app is or is not running (monorepo layout, extra
+    setup, a database it needs, the live URL or the exact error) instead of a
+    bare "not running". Additive and best-effort: the existing keys are never
+    changed, the block is added only when there is something to say, and any
+    failure leaves `st` untouched. With `http_check`, it also confirms a running
+    preview actually answers over HTTP and reports the URL or the error."""
+    if not (_dp_enabled() and isinstance(st, dict)):
+        return st
+    mod = _dp_module()
+    if mod is None:
+        return st
+    try:
+        plan = mod.analyze(project_dir)
+        check = None
+        if http_check:
+            try:
+                check = workspace.deploy_check(project_dir)
+            except Exception:                                    # noqa: BLE001
+                check = None
+        line = mod.summary(plan, st)
+        block = {}
+        if line:
+            block["summary"] = line
+        if plan.get("layout") not in (None, "single"):
+            block["layout"] = plan.get("layout")
+        if plan.get("notes"):
+            block["notes"] = plan.get("notes")
+        if plan.get("db", {}).get("required"):
+            block["db"] = plan.get("db")
+        if check is not None:
+            block["http_ok"] = bool(check.get("ok"))
+            block["http_status"] = check.get("status")
+            if check.get("error"):
+                block["http_error"] = check.get("error")
+        if block:
+            st = dict(st)
+            st["deploy"] = block
+    except Exception:                                            # noqa: BLE001
+        _log.debug("[deploy] status augmentation failed for %s", project_dir,
+                   exc_info=True)
+    return st
+
+
 @app.route("/api/workspace/status", methods=["GET"])
 def api_workspace_status():
     # Gated, unlike stop: this one only READS, and its 400-on-missing-directory
@@ -26077,7 +26137,9 @@ def api_workspace_status():
             workspace.discover(d)
         except Exception:                                        # noqa: BLE001
             _log.debug("[workspace] discovery failed for %s", d, exc_info=True)
-    return jsonify(workspace.status(d))
+    st = _dp_augment_status(d, workspace.status(d),
+                            http_check=request.args.get("deploy_check") == "1")
+    return jsonify(st)
 
 
 @app.route("/api/agent/sessions", methods=["POST"])
