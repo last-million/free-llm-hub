@@ -15496,6 +15496,27 @@ def _learn_tpm_limit(pid, model, resp):
     _set_learned_ctx(pid, model, limit)
 
 
+# ── RELAY QUOTA UNITS (2026-10-10) ─────────────────────────────────────────
+# _sustain_penalty compares a provider's request limit against a per-DAY
+# yardstick (150). FREE_LIMITS stores each limit in its OWN window (minute /
+# day / month), so a relay listed as "5 per MINUTE" (g4f) was read as "5 per
+# DAY" and demoted ~29 points -- a units bug (right in effect, wrong in
+# mechanism: the real g4f budget is token-based, not 5/day). Convert every
+# request limit to a per-day equivalent FIRST, so like compares with like:
+# per-minute x1440, per-hour x24, per-day as-is; an unlisted window (month,
+# unknown) is left as-is -- the conservative choice, and no month-window
+# provider currently lands in the penalty band. When several windows are known
+# the TIGHTEST converted one would bind; quota.status exposes one window per
+# provider, so a single conversion is trivially the tightest. Flag
+# relay_sustain_units (default ON); OFF restores the old penalty byte for byte.
+_RS_WINDOW_PER_DAY = {"minute": 1440.0, "hour": 24.0, "day": 1.0}
+
+
+def _rs_per_day_requests(limit, window):
+    """A request limit stated in its own window, converted to requests-per-day."""
+    return limit * _RS_WINDOW_PER_DAY.get(window or "day", 1.0)
+
+
 def _sustain_penalty(pid):
     """Score demotion (points) for a SCARCE daily budget, applied only in agentic
     ordering. A coding CLI fires hundreds of turns; a 50/day tier (openrouter free)
@@ -15509,7 +15530,15 @@ def _sustain_penalty(pid):
     inside the band and still took ~half of all agentic picks — draining the
     SCARCEST provider first while cerebras sat on 14,400/day. At /5 a 50/day tier
     loses 20 points (nemotron 104 -> 84), which puts it below cerebras (98.8) and
-    google (101) instead of beside them. It stays in the fallback chain."""
+    google (101) instead of beside them. It stays in the fallback chain.
+
+    The budget is compared in PER-DAY requests (_rs_per_day_requests): a limit
+    stored per-minute/hour is abundant per day, so the per-minute relays (g4f,
+    llm7, navy, nararouter) no longer eat a ~26-29 point demotion meant for a
+    scarce DAILY tier. Flag relay_sustain_units (default ON); OFF = the old
+    per-window-blind penalty byte for byte. The other honest, measurement-based
+    demotions (relay discount, lead gate, throttles, measured failure) are
+    unchanged -- see AGENTS.md "Relay quota units (2026-10-10)"."""
     try:
         s = quota.status(pid)
     except Exception:
@@ -15517,7 +15546,11 @@ def _sustain_penalty(pid):
     if not s.get("limit_known"):
         return 0.0
     lim = s.get("limit") or 0
-    if lim <= 0 or lim >= 150:
+    if lim <= 0:
+        return 0.0
+    if config.get_flag("relay_sustain_units", True):
+        lim = _rs_per_day_requests(lim, s.get("window"))
+    if lim >= 150:
         return 0.0
     return (150 - lim) / 5.0
 

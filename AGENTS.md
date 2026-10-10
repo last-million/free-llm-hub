@@ -3462,6 +3462,11 @@ tied Opus 5.5; GPT-6.x vs 5.6 differed by ~1 point, inside `_AUTO_TOP_BAND`.
   documents seeing before at 81486 s -- not a stale flag), so the demotion is
   right in effect and wrong in mechanism -- an owner decision. relay Opus 5.5 still sits 0.07
   under the lead gate (`_may_lead_pool`) by the owner's relay-discount design.
+  SUPERSEDED 2026-10-10: the owner chose to fix the MECHANISM -- see "Relay
+  quota units (2026-10-10)" at the very end of this file; the per-minute relays
+  (g4f, llm7, navy, nararouter) no longer eat the ~26-29 point daily-scarcity
+  penalty, while the relay discount, lead gate, throttles and measured failure
+  still keep them behind a healthy first-party model.
 
 ## Publish online (free Cloudflare tunnel) (2026-10-08)
 
@@ -4398,3 +4403,61 @@ config via `FREE_LLM_HUB_CONFIG`, fake `enc.v1:` key strings, real atomic I/O).
   `cloudflared_auto_install`, `agent_publish`, `graceful_update`, ...) read
   through `get_flag(name, default)`: absent on an old config = their default, so
   they self-migrate and are deliberately not touched.
+
+## Relay quota units (2026-10-10)
+
+OWNER DECISION 2026-10-10: fix the relay penalty MECHANISM. Covered by
+`tests/test_relay_sustain_units.py` (hermetic: `quota.status` faked, no network).
+Flag `relay_sustain_units` (`config.get_flag`, default ON); OFF = the old penalty
+byte for byte. New app.py names are `_rs_*`.
+
+**The bug.** `_sustain_penalty(pid)` demotes a provider whose REQUEST budget is
+scarce PER DAY (a 50/day free tier drains in an hour under a coding CLI, so it
+must not out-rank a sustainable large provider on agentic ordering). It read
+`quota.status(pid)["limit"]` as if it were always per-day, but `quota.FREE_LIMITS`
+stores each limit in its OWN window (`minute` / `day` / `month`). A relay listed
+as "5 requests per MINUTE" (g4f) was read as "5 per DAY" and demoted `(150-5)/5`
+= ~29 points. A units bug: right in effect (g4f's real budget is tiny and
+token-based), wrong in mechanism.
+
+**The fix.** `_rs_per_day_requests(limit, window)` converts the limit to a
+per-day equivalent FIRST, so like compares with like: per-minute x1440, per-hour
+x24, per-day as-is (`_RS_WINDOW_PER_DAY`). An unlisted window (`month`, unknown)
+is left as-is -- the conservative choice; no month-window provider currently
+lands in the penalty band (cohere's 1000/month stays >= 150 as-is, penalty 0).
+When several windows are known the TIGHTEST converted one would bind, but
+`quota.status` exposes one window per provider, so a single conversion is
+trivially the tightest. The 150/day yardstick and the `/5` divisor are unchanged.
+
+**Who changes** (all per-minute windows; penalty before -> after, flag ON):
+g4f 5/min 29.0 -> 0.0, llm7 20/min 26.0 -> 0.0, navy 20/min 26.0 -> 0.0,
+nararouter 10/min 28.0 -> 0.0. Everything else is byte-identical: day-window
+scarcity is untouched (openrouter 50/day keeps 20.0, siliconflow 100/day keeps
+10.0, sambanova 20/day keeps 26.0), abundant day tiers stay 0 (groq 1000/day,
+google 200/day, github-models 150/day, ...), `limit: 0` providers stay 0, an
+unknown budget (nvidia) stays 0, and cohere's month window stays 0.
+
+**What still keeps a failing/relay pair behind** (proven in the test, unchanged
+by this fix): the relay discount (`_RELAY_DISCOUNT["g4f"]` = 4.0 in
+`_benchmark_score` -- `_benchmark_score` never used `_sustain_penalty`, so chat
+ordering and the discount are byte-identical on/off); `_TOOL_RELAY_MAX_HOPS` (3
+relay hops per tool chain); the lead gate (`_may_lead_pool` / `_may_lead_agentic`:
+a relay copy of claude-opus-5.5 is NOT in the lead pool while GLM 5.3 -- agentic
+evidence -- is alive, even with the relay un-penalised); quota throttles (a
+`throttled`/`exhausted` provider is gated by `quota.status`, a layer the scoring
+penalty never reads -- g4f's long Retry-After keeps it out at penalty 0,
+`_canary_provider_eligible` False); and measured failure
+(`_chain_reliability_band` 2 after >= 2 failures, `_reliability_penalty`,
+`_pair_rest`, `_recent_hop_fail`). Fail-open everywhere (`quota.status` raising
+-> penalty 0, as before).
+
+**Before/after on a fleet shaped like the live one** (g4f claude-opus-5.5 /
+gpt-6.1 / claude-sonnet-4-5, llm7, navy, nararouter vs nvidia glm-5.3, kimi-k3,
+groq qwen3.8-27b): `_benchmark_score` is identical on/off for every row. The
+tool turn still OPENS on nvidia/glm-5.3 (agentic score ~138.85); g4f
+claude-opus-5.5's agentic score rises 105.00 -> 134.00 (the 29 points back) but
+stays below GLM and out of the lead pool, so relays are only tried sooner in the
+FALLBACK chain -- the downside the owner accepted. The chat turn opener is
+unchanged (nvidia/kimi-k3, by `_benchmark_score`). The owner accepted that relay
+copies (g4f "Claude Opus 5.5", "GPT-6.x", llm7, navy, nararouter) are tried more
+often before falling back.
