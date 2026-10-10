@@ -43,7 +43,9 @@ def test_the_stop_route_disconnects_before_it_shuts_down():
     body = body[:body.index("\n@app.route")]
     assert body.index("_disconnect_all_clis()") < body.index("_graceful_shutdown_worker")
     assert '"clis_disconnected": cli_result["disconnected"]' in body
-    boot = src[src.index("    _mark_runtime_started()\n"):][:1500]
+    # The boot block keeps growing (each feature adds a boot line); read enough
+    # of it that one more line cannot push the reconnect call out of view.
+    boot = src[src.index("    _mark_runtime_started()\n"):][:4000]
     assert "_reconnect_clis_after_stop()" in boot
 
 
