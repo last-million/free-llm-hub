@@ -11,7 +11,7 @@ is only: current state, how to operate, owner rules, open items.
 | | |
 |---|---|
 | Branch | `main` after the 2026-10-08 merge (see `git log`), in sync with `origin/main` (another session's landing-page edits are uncommitted: `app.py` `/`+`/hub` routes, `make_landing.py`, `templates/landing.html`, `static/*.webp|jpg` — LEAVE THEM, and never `git add -A`: use explicit paths) |
-| Running hub | `eebe22b` on `127.0.0.1:8787` (restarted 2026-10-08 ~04:20 UTC; the owner's Multi run resumed by itself). NOT live yet: everything in "What changed 2026-10-08 night" below (ranking, publish, graceful update, fewer wasted hops) |
+| Running hub | `1bb8c92` on `127.0.0.1:8787` until the next restart (restart through `POST /api/hub/restart {resume:true, drain:true}`: running work waits and continues). NOT live yet: the 2026-10-10 batch below |
 | Tests | 7812 passed, 2 skipped, 0 failed on the final merge (2026-10-08 night, 11.5 min; pytest exit code 0) |
 | Keys | 42 provider keys in `config.load_config()` (check after every restart, never print values) |
 | Open PR | #4 by `osumtr-web`: an improved version landed on `main` (`74c3fde`); the PR is NOT approved/closed yet, see "Open items" |
@@ -48,6 +48,32 @@ unless its "Continue by itself after a restart" box is ticked.
 - Ranking choices made by the owner (do not "fix" them from benchmarks alone):
   Kimi K3 top free model (138.1, just above GLM 5.3's 138); Space Bunny 137.7;
   subscription scope `manager_only` (manager model: sonnet when re-enabled).
+
+## What changed 2026-10-10
+
+- **Multi from a terminal CLI = the Build page's Multi** (`_cm_*`, flag `cli_multi_sessions`):
+  a CLI on `*-multi` with a real task in a known, non-broad project folder starts a real
+  swarm_windows run (planner + up to 6 helpers) owned by a hub conversation (Build page link,
+  auto_resume on); the CLI turn streams progress text, ends safely before the CLI's stream cap
+  (opencode 540 s; codex/claude/kimi 240 s, their caps are INFERRED from compiled binaries) and
+  later messages re-attach; "stop multi" (exact) stops it. Security (review of the commit):
+  runs are keyed by conversation + folder, and the first eligible turn only ASKS -- the user
+  must reply exactly "go multi" (flag `cli_multi_confirm`, default on). Residual: the MCP tool
+  `swarm_windows_start` still starts a run for any local client without that consent.
+- **Roles: fewer turns with no answer** (`_rr_*`): before (2026-10-08 05:30 -> 10-10) 334 roles
+  turns, 14.1% no answer, 23.4% of calls wasted, verifier usable 0.59. Fit decisions now use the
+  size the hop SENDS after clearing old tool results (the ~45 false "window too small" skips),
+  impossible hops (tool schema too big, dead/404 models) cost no attempt, the roles stage reserves
+  a slice for the `best` fallback, thinking/slow verifiers with no usable record are skipped.
+  `python scripts/role_eval.py --since <ISO time>` prints the 5 numbers to compare after.
+- **cloudflared installs itself** (`publish.AutoInstaller`, flag `cloudflared_auto_install`):
+  ~60 s after boot, the same SHA-256-verified official download, at most once per 24 h after a
+  failure, never during a drain/Stop; Publish-panel checkbox to turn it off. README now lists
+  every outbound call (OpenRouter catalog, LMArena dataset, Cloudflare's GitHub releases).
+- **Why GLM 5.3 leads (owner asked)**: by the owner's ranking kimi-k3 138.1 and glm-5.3 138.0 are
+  the two best USABLE models (both nvidia); Claude Opus 5.5 / GPT-6 exist only on g4f relays
+  (134.0 after the relay discount, plus the sustain penalty), so they are backups. Owner can pin
+  one with `/orchestrator <name>` (open decision, see item 1b).
 
 ## What changed 2026-10-08 night
 
