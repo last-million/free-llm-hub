@@ -3618,10 +3618,12 @@ helper CLI sessions on different models + review), not the crew phase pipeline.
   chat (`X-Free-LLM-Hub: dashboard`); tools present; not a compaction request
   (`ctxwin.is_compaction_request`); a fresh user instruction
   (`_awaiting_new_instruction`); a known safe folder (`_cm_project_dir` =
-  `_v1_project_cwd` -- existing dir, never the hub repo -- plus the publish
+  `_cm_trusted_cwd` -- ONLY the CLI's own environment block, see security fix 3
+  -- an existing dir, never the hub repo (`_cm_is_hub_repo`), plus the publish
   broad-folder rule `_publish_folder_too_broad`, so never a root / home / above
   home); and `_multi_wants_a_swarm(text)` says WORK (the same any-language gate
-  the Build page uses).
+  the Build page uses). The goal is the last user message with a CLI's
+  `<system-reminder>` blocks removed.
 - **The run** is started EXACTLY like the Build page: `_cm_multi_cli_intercept`
   opens a hub /agent conversation as the OWNER (like `_hb_start_run`:
   `agentic_chat.start_session(helper_cli, folder, quality="multi", mode=...)`,
@@ -3679,29 +3681,89 @@ helper CLI sessions on different models + review), not the crew phase pipeline.
   trimmed, case-insensitive, trailing punctuation (any script) ignored
   (`_cm_last_user_command` / `_cm_norm_cmd`) -- is exactly "stop multi": never a
   bare "stop", never a sentence that merely contains the words.
-- **Security fix 2 -- server-enforced consent** (review of 8f647b8), flag
-  `cli_multi_confirm` (`config.get_flag`, default ON; an unreadable config reads
-  as on). Any local /v1 client (there is no auth when no local API key is set)
-  could otherwise make the hub start helper agents that edit files and run
-  commands on their own in a folder named by request content, bypassing the
-  permission prompts the user's own CLI may use. Now the first eligible turn
-  starts NOTHING: it records a pending request {conversation key, folder, goal,
-  expires in 10 min} (`_CM_PENDING`, in memory, bounded to 100) and answers in
-  text: "Multi starts up to N helper agents that edit files and run commands in
-  <folder> on their own, without asking you. To start, reply exactly: go multi
-  (or pick another tier)." Only a later turn of the SAME conversation key + SAME
-  folder whose whole last user message is exactly "go multi" (same
-  normalisation) starts the run with the STORED goal (`_cm_pending_take`); the
-  consent is then recorded in the map row for that (key, folder) and lasts the
-  7-day map TTL, so later runs in that conversation and folder do not ask again
-  (another folder asks again). An expired or mismatched "go multi" answers that
-  nothing is waiting and starts nothing. Flag off = the direct start of
-  8f647b8. The existing local API key guard (`_guard_v1`, a `before_request` on
-  every /v1 path) still runs before all of this, unchanged.
-- **Residual risk, in plain words:** the hub's MCP tool `swarm_windows_start`
-  can still start a Multi run (helper agents that edit files and run commands)
-  for ANY local client without this consent -- that existing door is unchanged
-  by this fix. The consent above covers only the Multi tier on /v1.
+- **Security fix 2 -- WHO may start helper agents: setting `cli_multi_approval`**
+  (second review, of main 608dfd6; replaces the boolean flag `cli_multi_confirm`
+  of the first fix). A "go multi" chat reply is an UNAUTHENTICATED /v1 message:
+  /v1 is open on localhost when no local API key is set, and 127.0.0.1 is shared
+  by every OS user of the machine, so any local process could make the hub start
+  helper agents that run commands AS THE HUB OWNER. `_cm_approval_mode()` reads
+  `config.get_setting("cli_multi_approval")`; anything unreadable or unknown =
+  "dashboard".
+  - **"dashboard" (default).** The first eligible turn starts NOTHING: it records
+    a SINGLE-USE request {random id, conversation key, folder, goal, helper cli,
+    caller cli, created, expires in 15 min} (`_CM_APPROVALS`, in memory, bounded
+    to 20, oldest dropped first) and answers in text: "Multi wants to start up
+    to N helper agents that edit files and run commands in <folder>. Approve it
+    in the hub dashboard: http://127.0.0.1:<port>/?approve=<id> (or the banner on
+    any hub page). Waiting...". The SAME turn then looks every 2 s
+    (`_cm_approval_stream`, keepalive every 20 s): approved -> the request is
+    consumed and the run starts and streams in that turn exactly as before;
+    denied / expired -> it says so; past the CLI's safe end -> "Approve it in the
+    dashboard, then send any message here", and a later turn of the same
+    conversation + folder (any message, even one that is not work) starts an
+    approved-but-not-started request with its STORED goal (consumed); a still
+    pending one is waited on again; a resend of the same goal waits on the same
+    request, while new work replaces it (new id). Approval adds 15 minutes for
+    the pickup. A "go multi" reply never bypasses this mode. Approval ONLY
+    through two new token-gated routes (under /api/, so `_local_control_guard`
+    applies: the control token, plus the dashboard header on the POST): `GET
+    /api/cli-multi/pending` (id, folder, goal excerpt <= 300 chars, caller,
+    source, created, expires; pending ones only) and `POST /api/cli-multi/decide
+    {id, approve: true|false}` (200; 400 bad body; 404 gone; 409 already
+    decided). README route count +2 (176). The goal is logged 80 chars at most;
+    the banner shows folder + goal excerpt + caller only.
+  - **"chat".** The owner's explicit choice to accept the risk: today's "go
+    multi" flow (pending request 10 min in `_CM_PENDING`, consent remembered for
+    the (conversation, folder) for the 7-day map TTL, expired / mismatched "go
+    multi" answers that nothing is waiting).
+  - **"off".** Direct start, no approval.
+  - **Dashboard banner** (`templates/index.html`, the one template every hub
+    page renders): `#cm-approve-banner` lists each pending request as "A
+    terminal CLI asks to start Multi in <folder>: <goal>  [Approve] [Deny]" (an
+    MCP request reads "An MCP client asks ..."), all text through textContent,
+    theme tokens only; polled every 10 s and only while the page is visible;
+    `?approve=<id>` scrolls to that request and focuses its Approve button.
+  - **The MCP tool `swarm_windows_start`** (POST /mcp is not token-gated) follows
+    the same setting. "dashboard": the call starts nothing and returns
+    `{pending: true, id, approve_url, note}`; after the owner approves, the client
+    calls `swarm_windows_start` AGAIN with the same arguments plus that `id`, which
+    starts the request's STORED goal, folder and cli (single use;
+    `_cm_mcp_start_approved`; still pending -> the same pending answer; denied /
+    unknown / expired / used -> a tool error). "chat" and "off": the direct start
+    as before (an MCP client has no chat to say "go multi" in). hub_mcp calls the
+    optional `start_approved` callable only when wired, so a fake `_SWARM` without
+    it behaves exactly as before.
+  The existing local API key guard (`_guard_v1`, a `before_request` on every /v1
+  path) still runs before all of this, unchanged.
+- **Security fix 3 -- the folder comes ONLY from the CLI's own environment
+  block** (second review). `_v1_project_cwd` takes the FIRST `<cwd>` tag or
+  "working directory" line in system, USER or developer messages, so pasted text,
+  a CLAUDE.md / file content Claude Code places in a user-role
+  `<system-reminder>`, or any injected block could choose where helper agents
+  run. `_cm_trusted_cwd` accepts a folder only from (a) the `_ENV_BLOCK_RE` spans
+  and `_ENV_LINE_RE` lines of the LEADING system/developer message(s), with
+  `<system-reminder>` blocks removed first (opencode / Claude Code
+  `<env>Working directory: X</env>`, Claude Code's "Primary working directory:
+  X", Kimi Code's "The current working directory is `X`"), or (b) codex's
+  `<environment_context>...<cwd>X</cwd>...</environment_context>` when it is the
+  WHOLE content of a user message (string, or its only non-empty part; exactly
+  one block -- a crafted "block, user text, block" sandwich never matches).
+  Never a line in ordinary user text, a `<system-reminder>`, a tool result, an
+  assistant message or a system message that is not leading. Two or more
+  DIFFERENT folders from trusted places = ambiguous = no run (fall through);
+  the same folder spelled twice is one. The hub-repo and broad-folder refusals
+  still apply after it. `_v1_project_cwd` and its other callers are unchanged.
+- **Residual risk, in plain words:** in the "chat" and "off" modes any local
+  client -- including another OS user's process on the same machine -- can
+  start helper agents that edit files and run commands as the hub owner: "chat"
+  needs only an unauthenticated "go multi" message, "off" needs nothing. That
+  applies to the CLI Multi tier on /v1 AND to the MCP tool
+  `swarm_windows_start`. Only "dashboard" (the default) puts a token-gated human
+  approval in front of every start. Separately, in every mode the folder the
+  owner approves is whatever the CLI's own environment block names: a CLI whose
+  system prompt carries injected instruction text with a fake environment block
+  could still name a folder -- the approval banner shows it, and two different
+  folders mean no run.
 
 **Per-CLI streaming-timeout evidence (requirement 4).** The question is whether a
 stream that keeps sending content deltas survives long (keepalives every 20 s

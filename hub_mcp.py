@@ -174,7 +174,11 @@ def _tools():
                 "phases, and a phase waits for the phases it depends on. "
                 "Returns a run_id immediately -- poll swarm_windows_status. Use "
                 "this for work that splits into independent pieces; use "
-                "crew_run for a single answer written by several models."
+                "crew_run for a single answer written by several models. When "
+                "the hub requires approval (its default), the first call starts "
+                "NOTHING and returns {pending, id, approve_url}: the hub owner "
+                "approves it in the hub dashboard, then call again with the same "
+                "arguments plus that id."
             ),
             "inputSchema": {
                 "type": "object",
@@ -184,7 +188,11 @@ def _tools():
                     "project_dir": {"type": "string",
                                     "description": "Existing folder the agents work in."},
                     "cli": {"type": "string",
-                            "description": "Which CLI each agent runs (default opencode)."}
+                            "description": "Which CLI each agent runs (default opencode)."},
+                    "id": {"type": "string",
+                           "description": ("The id a pending start returned. Pass it "
+                                           "again after the hub owner approved the "
+                                           "request in the dashboard, to start it.")}
                 },
                 "required": ["goal", "project_dir"]
             }
@@ -387,10 +395,21 @@ def _call_swarm_tool(name, arguments):
         if not isinstance(project_dir, str) or not project_dir.strip():
             return _error(-32602, "'project_dir' must be a non-empty string")
         cli = arguments.get("cli") or "opencode"
+        req_id = arguments.get("id")
+        if req_id is not None and not (isinstance(req_id, str) and req_id.strip()):
+            return _error(-32602, "'id' must be a non-empty string")
         try:
-            run_id = _SWARM["start"](goal.strip(), project_dir.strip(), str(cli))
+            if req_id and _SWARM.get("start_approved"):
+                # A start the hub owner was asked to approve: its STORED goal,
+                # folder and cli start (single use), or it is still pending.
+                run_id = _SWARM["start_approved"](req_id.strip())
+            else:
+                run_id = _SWARM["start"](goal.strip(), project_dir.strip(), str(cli))
         except Exception as exc:                                 # noqa: BLE001
             return _text_result("could not start: %s" % exc, is_error=True)
+        if isinstance(run_id, dict) and run_id.get("pending"):
+            # Approval required (the hub's default): nothing has started.
+            return _text_result(json.dumps(run_id, ensure_ascii=False))
         return _text_result(
             "Swarm run %s started. Poll swarm_windows_status with that run_id."
             % run_id)

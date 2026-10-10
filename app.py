@@ -138,15 +138,13 @@ hub_mcp.init(
         # The MCP surface is how a CLI drives the orchestrator -- opencode,
         # codex, claude and the rest all speak it, so one wiring reaches every
         # one of them rather than needing a per-CLI integration.
-        "start": lambda goal, project_dir, cli: swarm_windows.start(
-            goal, project_dir, cli,
-            _swarm_windows_spawn, _swarm_windows_turn,
-            planner=_pipeline_bound(_swarm_windows_planner),
-            configure=_swarm_windows_configure,
-            stop=agentic_chat.stop_session,
-            modes=_worker_mode_keys(),
-            **_swarm_windows_manager_kw(), **_multi_check_kwargs(),
-            **_multi_budget_kwargs()),
+        # SECURITY: POST /mcp is not token-gated, so a start follows the
+        # `cli_multi_approval` setting (default "dashboard": a pending,
+        # single-use request the owner approves in the dashboard; the client
+        # then calls swarm_windows_start again with the returned id). See
+        # _cm_mcp_start / _cm_mcp_start_approved.
+        "start": lambda goal, project_dir, cli: _cm_mcp_start(goal, project_dir, cli),
+        "start_approved": lambda rid: _cm_mcp_start_approved(rid),
         "status": lambda run_id, events=False: swarm_windows.status(run_id, events),
         "stop": swarm_windows.stop,
     },
@@ -21338,34 +21336,161 @@ def _cm_last_user_command(messages):
     return ""
 
 
-# SECURITY (review of 8f647b8): server-enforced consent. Any local /v1 client
-# (there is no auth when no local API key is set) could otherwise make the hub
-# start helper agents that edit files and run commands, on their own, in a
-# folder named by request content -- bypassing the permission prompts the
-# user's own CLI may use. Flag `cli_multi_confirm` (default on): the first
-# eligible turn starts NOTHING; it records a pending request and asks the user
-# to reply exactly "go multi". Consent is then remembered for that
-# (conversation, folder) for the 7-day map TTL.
-_CM_PENDING = {}                # map key -> {conv, folder, goal, expires}
+# SECURITY: WHO may start helper agents. Any local /v1 client (there is no auth
+# when no local API key is set; 127.0.0.1 is shared by every OS user of the
+# machine) could otherwise make the hub start helper agents that edit files and
+# run commands AS THE HUB OWNER. Setting `cli_multi_approval`:
+#   "dashboard" (default) -- the request waits for the owner's Approve in the
+#               hub dashboard (token-gated routes below); single-use.
+#   "chat"      -- the owner's explicit choice to accept the risk: the user
+#               replies exactly "go multi" in the CLI (an UNAUTHENTICATED
+#               message), then consent lasts the 7-day map TTL for that
+#               (conversation, folder).
+#   "off"       -- direct start, no approval (also unauthenticated).
+# Replaces the earlier boolean flag `cli_multi_confirm`. The MCP tool
+# swarm_windows_start follows the same setting (_cm_mcp_start).
+_CM_APPROVAL_MODES = ("dashboard", "chat", "off")
+_CM_PENDING = {}                # "chat" mode: map key -> {conv, folder, goal, expires}
 _CM_PENDING_LOCK = threading.Lock()
-_CM_PENDING_TTL = 600           # a pending request waits 10 minutes
+_CM_PENDING_TTL = 600           # a "go multi" request waits 10 minutes
 _CM_PENDING_MAX = 100           # bounded: oldest-expiring dropped first
 _CM_GO = "go multi"
 _CM_STOP = "stop multi"
+# "dashboard" mode: id -> {id, conv, folder, folder_display, goal, helper_cli,
+# caller_cli, source, created, expires, state: pending|approved|denied}.
+_CM_APPROVALS = collections.OrderedDict()
+_CM_APPROVALS_LOCK = threading.Lock()
+_CM_APPROVAL_TTL = 900          # a request waits 15 minutes (approval adds 15 more)
+_CM_APPROVAL_MAX = 20           # bounded: the oldest is dropped first
+_CM_APPROVAL_POLL = 2.0         # the waiting CLI turn looks every 2 s
+_CM_GOAL_LOG_CHARS = 80         # never log more of a goal than this
+_CM_GOAL_SHOW_CHARS = 300       # what the dashboard banner shows of a goal
 
 
 def _cm_now():
-    """Wall clock for the pending store (a seam for tests)."""
+    """Wall clock for the pending stores (a seam for tests)."""
     return time.time()
 
 
-def _cm_confirm_on():
-    """Flag `cli_multi_confirm` (default on). An unreadable config reads as ON
-    -- the safer side."""
+def _cm_mono():
+    """Monotonic clock for a waiting turn (a seam for tests)."""
+    return time.monotonic()
+
+
+def _cm_sleep(seconds):
+    """The waiting turn's pause between looks (a seam for tests)."""
+    time.sleep(seconds)
+
+
+def _cm_approval_mode():
+    """Setting `cli_multi_approval`: "dashboard" (default) | "chat" | "off".
+    Anything unreadable or unknown reads as "dashboard" -- the safe side."""
     try:
-        return bool(config.get_flag("cli_multi_confirm", True))
+        m = str(config.get_setting("cli_multi_approval", "dashboard") or "").strip().lower()
     except Exception:                                            # noqa: BLE001
-        return True
+        return "dashboard"
+    return m if m in _CM_APPROVAL_MODES else "dashboard"
+
+
+def _cm_approve_url(rid):
+    try:
+        port = agentic_chat._port()
+    except Exception:                                            # noqa: BLE001
+        port = 8787
+    return "http://127.0.0.1:%d/?approve=%s" % (port, rid)
+
+
+def _cm_approvals_prune(now):
+    for k in [k for k, v in _CM_APPROVALS.items() if v["expires"] <= now]:
+        del _CM_APPROVALS[k]
+
+
+def _cm_approval_new(convkey, folder_key, folder_display, goal, helper_cli,
+                     caller_cli, source="cli"):
+    """Record a SINGLE-USE request for the owner's approval; returns a copy.
+    In memory, bounded to _CM_APPROVAL_MAX (the oldest goes first)."""
+    now = _cm_now()
+    rid = uuid.uuid4().hex
+    row = {"id": rid, "conv": convkey, "folder": folder_key,
+           "folder_display": folder_display, "goal": goal or "",
+           "helper_cli": helper_cli, "caller_cli": caller_cli or "unknown",
+           "source": source, "created": now, "expires": now + _CM_APPROVAL_TTL,
+           "state": "pending"}
+    with _CM_APPROVALS_LOCK:
+        _cm_approvals_prune(now)
+        while len(_CM_APPROVALS) >= _CM_APPROVAL_MAX:
+            _CM_APPROVALS.popitem(last=False)
+        _CM_APPROVALS[rid] = row
+    _log.info("[cli-multi] approval requested id=%s from=%s folder=%s goal=%r",
+              rid, row["caller_cli"], os.path.basename(str(folder_display or "")),
+              (goal or "")[:_CM_GOAL_LOG_CHARS])
+    return dict(row)
+
+
+def _cm_approval_get(rid):
+    with _CM_APPROVALS_LOCK:
+        _cm_approvals_prune(_cm_now())
+        row = _CM_APPROVALS.get(rid)
+        return dict(row) if row else None
+
+
+def _cm_approval_find(convkey, folder_key):
+    """The newest live CLI request of this conversation in this folder."""
+    with _CM_APPROVALS_LOCK:
+        _cm_approvals_prune(_cm_now())
+        for row in reversed(list(_CM_APPROVALS.values())):
+            if (row.get("source") == "cli" and row.get("conv") == convkey
+                    and row.get("folder") == folder_key):
+                return dict(row)
+    return None
+
+
+def _cm_approval_decide(rid, approve):
+    """The owner's decision: (http status, payload). Only a PENDING request can
+    be decided, once."""
+    now = _cm_now()
+    with _CM_APPROVALS_LOCK:
+        _cm_approvals_prune(now)
+        row = _CM_APPROVALS.get(rid)
+        if row is None:
+            return 404, {"error": "no such request (it expired or was already used)",
+                         "code": "not_found"}
+        if row["state"] != "pending":
+            return 409, {"error": "this request was already decided", "code": "decided",
+                         "state": row["state"]}
+        row["state"] = "approved" if approve else "denied"
+        if approve:
+            row["expires"] = max(row["expires"], now + _CM_APPROVAL_TTL)
+        state = row["state"]
+    _log.info("[cli-multi] request %s %s in the dashboard", rid, state)
+    return 200, {"ok": True, "id": rid, "state": state}
+
+
+def _cm_approval_consume(rid):
+    """Take an APPROVED request out of the store (single use), or None."""
+    with _CM_APPROVALS_LOCK:
+        _cm_approvals_prune(_cm_now())
+        row = _CM_APPROVALS.get(rid)
+        if not row or row["state"] != "approved":
+            return None
+        return dict(_CM_APPROVALS.pop(rid))
+
+
+def _cm_approval_discard(rid):
+    with _CM_APPROVALS_LOCK:
+        _CM_APPROVALS.pop(rid, None)
+
+
+def _cm_approval_list():
+    """The requests waiting for a decision, for the dashboard banner. The goal
+    is an excerpt; nothing secret is listed."""
+    with _CM_APPROVALS_LOCK:
+        _cm_approvals_prune(_cm_now())
+        rows = [dict(r) for r in _CM_APPROVALS.values() if r["state"] == "pending"]
+    return [{"id": r["id"], "folder": r["folder_display"],
+             "goal": (r["goal"] or "")[:_CM_GOAL_SHOW_CHARS],
+             "caller": r["caller_cli"], "source": r["source"],
+             "created": r["created"], "expires": r["expires"]} for r in rows]
 
 
 def _cm_pending_put(mapkey, convkey, folder_key, goal):
@@ -21401,14 +21526,109 @@ def _cm_resolves_to_multi(body):
     return (body.get("model") or "").strip().lower() == "multi"
 
 
-def _cm_project_dir(messages):
-    """The CLI's project folder for a terminal Multi run, or None: an existing
-    directory that is NOT the hub's own repo (_v1_project_cwd) and NOT a
-    filesystem root / the user's home / anything above it (the publish
-    broad-folder rule). Never raises."""
+# SECURITY (second review, of main 608dfd6): WHERE helper agents run must come
+# from the CLI's OWN environment block. _v1_project_cwd takes the FIRST <cwd> tag
+# or "working directory" line in system, USER or developer messages -- so text a
+# user pasted, a CLAUDE.md / file content Claude Code places in a user-role
+# <system-reminder>, a tool result or any injected block could choose the
+# folder. _cm_trusted_cwd reads ONLY:
+#   (a) the env block / env lines of the LEADING system/developer message(s)
+#       (`<env>... Working directory: X ...</env>` as Claude Code and opencode
+#       write it, Claude Code's "Primary working directory: X", Kimi Code's
+#       "The current working directory is `X`"), <system-reminder> blocks
+#       removed first; and
+#   (b) codex's `<environment_context>...<cwd>X</cwd>...</environment_context>`
+#       when it is the WHOLE content (or the leading part, with nothing else) of
+#       a user message.
+# Never a line in ordinary user text, a <system-reminder>, a tool result or an
+# assistant message. Two or more DIFFERENT folders from trusted places =
+# ambiguous = no run. _v1_project_cwd's other callers are unchanged.
+# Exactly ONE block and nothing else: the tempered dot forbids an inner opening
+# or closing tag, so "<environment_context>A</environment_context> user text
+# <environment_context>B</environment_context>" never matches as a whole.
+_CM_ENV_CONTEXT_ONLY_RE = re.compile(
+    r"\s*<environment_context>(?:(?!</?environment_context>).)*</environment_context>\s*",
+    re.S | re.I)
+_CM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S | re.I)
+
+
+def _cm_msg_text_parts(m):
+    """A message's text parts (string content = one part)."""
+    content = m.get("content")
+    if isinstance(content, str):
+        return [content]
+    return [p.get("text") for p in (content or ()) if isinstance(p, dict)
+            and p.get("type") in ("text", "input_text") and isinstance(p.get("text"), str)]
+
+
+def _cm_paths_in(span):
+    """Folder paths named in one trusted span: <cwd>X</cwd> tags and
+    "working directory: X" lines (the extraction _v1_project_cwd uses)."""
+    out = []
+    for raw in _V1_CWD_TAG_RE.findall(span) + _V1_CWD_LINE_RE.findall(span):
+        p = str(raw).strip().strip("`\"'").rstrip(".,; ")
+        if p:
+            out.append(p)
+    return out
+
+
+def _cm_trusted_cwd(messages):
+    """The ONE folder the CLI's own environment block names, or None (none, or
+    two different ones = ambiguous). See the comment above. Never raises."""
     try:
-        folder = _v1_project_cwd(messages)
-        if not folder or _publish_folder_too_broad(folder):
+        found = {}                               # folder key -> display path
+        msgs = [m for m in (messages or ()) if isinstance(m, dict)]
+        # (a) the leading system/developer messages only.
+        for m in msgs:
+            if m.get("role") not in ("system", "developer"):
+                break
+            text = _CM_REMINDER_RE.sub(" ", "\n".join(_cm_msg_text_parts(m)))
+            spans = [mt.group(0) for mt in _ENV_BLOCK_RE.finditer(text)]
+            spans += [mt.group(0) for mt in _ENV_LINE_RE.finditer(text)]
+            for span in spans:
+                for p in _cm_paths_in(span):
+                    key = _cm_folder_key(p)
+                    if key:
+                        found.setdefault(key, os.path.abspath(p))
+        # (b) codex: a user message that is ONLY its <environment_context>.
+        for m in msgs:
+            if m.get("role") != "user":
+                continue
+            parts = [p for p in _cm_msg_text_parts(m) if p.strip()]
+            if not parts or not _CM_ENV_CONTEXT_ONLY_RE.fullmatch(parts[0]) or len(parts) > 1:
+                continue
+            for raw in _V1_CWD_TAG_RE.findall(parts[0]):
+                p = str(raw).strip().strip("`\"'").rstrip(".,; ")
+                key = _cm_folder_key(p) if p else None
+                if key:
+                    found.setdefault(key, os.path.abspath(p))
+        if len(found) != 1:
+            return None                          # none, or ambiguous
+        folder = next(iter(found.values()))
+        return folder if os.path.isdir(folder) else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _cm_is_hub_repo(folder):
+    """The hub's own repo, inside it, or any folder that contains it."""
+    try:
+        hub = os.path.normcase(os.path.dirname(os.path.abspath(__file__)))
+        n = os.path.normcase(os.path.abspath(folder))
+        return n == hub or n.startswith(hub + os.sep) or hub.startswith(n + os.sep)
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _cm_project_dir(messages):
+    """The CLI's project folder for a terminal Multi run, or None: the single
+    folder its own environment block names (_cm_trusted_cwd), an existing
+    directory that is NOT the hub's own repo and NOT a filesystem root / the
+    user's home / anything above it (the publish broad-folder rule). Never
+    raises."""
+    try:
+        folder = _cm_trusted_cwd(messages)
+        if not folder or _cm_is_hub_repo(folder) or _publish_folder_too_broad(folder):
             return None
         return folder
     except Exception:                                            # noqa: BLE001
@@ -21725,32 +21945,149 @@ def _cm_attach(body, protocol, owner_sid, run_id, cmd, helper_cli, safe, est,
                                     _cm_helper_count(), header), est)
 
 
-def _cm_start(body, protocol, mapkey, folder_key, project_dir, helper_cli, safe,
-              est, goal, consent=None):
-    """Start the run EXACTLY like the Build page and answer the CLI turn with its
-    live text: owner conversation (folder-scoped), then _multi_turn_events made
-    durable by live_run with a copy of this request's context (the planner
-    routes through the hub's chain, as the Build route does). None when the
-    owner conversation cannot be opened. `consent=True` records the user's
-    "go multi" for this (conversation, folder)."""
+def _cm_launcher(mapkey, folder_key, project_dir, helper_cli, consent=None):
+    """Capture NOW, inside the request, what a run start needs -- the category in
+    force and a copy of the request context (the planner routes through the
+    hub's chain, which reads it; the Build route hands live_run its copy the same
+    way) -- and return launch(goal, safe, lead="") -> the turn's text pieces, or
+    None when the owner conversation cannot be opened. A dashboard approval can
+    arrive minutes later on a stream whose view function has already returned,
+    where neither `g` nor the request exist any more: hence the capture.
+    `consent=True` records the user's "go multi" for this (conversation,
+    folder)."""
     mode = _session_mode_or_none({"mode": _active_mode()})
-    owner_sid, sess_info = _cm_owner_session(mapkey, folder_key, helper_cli,
-                                             project_dir, mode, goal)
-    if not owner_sid:
-        return None
-    _cm_map_put(mapkey, owner_sid, None, folder=folder_key, consent=consent)
-    producer = _multi_turn_events(owner_sid, sess_info, goal)
     try:
-        events = agentic_chat.live_run(
-            owner_sid, producer, context=request_ctx._get_current_object().copy())
+        ctx = request_ctx._get_current_object().copy()
     except Exception:                                            # noqa: BLE001
-        events = agentic_chat.live_run(owner_sid, producer)
-    link = _cm_watch_link(owner_sid)
-    header = ("Multi: planning the work with up to %d helpers. Watch it live: "
-              "%s\n" % (_cm_helper_count(), link))
-    return _cm_emit(body, protocol,
-                    _cm_text_stream(owner_sid, None, events, link, safe,
-                                    _cm_helper_count(), header), est)
+        ctx = None
+
+    def launch(goal, safe, lead=""):
+        owner_sid, sess_info = _cm_owner_session(mapkey, folder_key, helper_cli,
+                                                 project_dir, mode, goal)
+        if not owner_sid:
+            return None
+        _cm_map_put(mapkey, owner_sid, None, folder=folder_key, consent=consent)
+        producer = _multi_turn_events(owner_sid, sess_info, goal)
+        try:
+            events = (agentic_chat.live_run(owner_sid, producer, context=ctx)
+                      if ctx is not None else agentic_chat.live_run(owner_sid, producer))
+        except Exception:                                        # noqa: BLE001
+            events = agentic_chat.live_run(owner_sid, producer)
+        link = _cm_watch_link(owner_sid)
+        header = lead + ("Multi: planning the work with up to %d helpers. Watch it "
+                         "live: %s\n" % (_cm_helper_count(), link))
+        return _cm_text_stream(owner_sid, None, events, link, safe,
+                               _cm_helper_count(), header)
+    return launch
+
+
+def _cm_start(body, protocol, mapkey, folder_key, project_dir, helper_cli, safe,
+              est, goal, consent=None, lead=""):
+    """Start the run EXACTLY like the Build page and answer the CLI turn with its
+    live text (owner conversation, _multi_turn_events made durable by live_run).
+    None when the owner conversation cannot be opened."""
+    pieces = _cm_launcher(mapkey, folder_key, project_dir, helper_cli, consent)(
+        goal, safe, lead)
+    if pieces is None:
+        return None
+    return _cm_emit(body, protocol, pieces, est)
+
+
+def _cm_approval_stream(req, launch, safe, lead):
+    """A dashboard-mode turn as text pieces: what is asked and where to approve
+    it, then a look every _CM_APPROVAL_POLL seconds until the owner approves
+    (the request is consumed and the run starts and streams in THIS turn),
+    denies, the request expires, or this CLI turn reaches its safe end (then:
+    approve, and send any message here). A keepalive line at least every 20 s."""
+    rid = req["id"]
+    url = _cm_approve_url(rid)
+    started = last = _cm_mono()
+    yield lead
+    while True:
+        now = _cm_mono()
+        row = _cm_approval_get(rid)
+        if row is None:
+            yield ("\nThe Multi request is no longer waiting (it expired after 15 "
+                   "minutes, or a newer request replaced it). Nothing was started. "
+                   "Send the work again to ask once more.\n")
+            return
+        if row["state"] == "denied":
+            _cm_approval_discard(rid)
+            yield "\nThe Multi request was denied in the hub dashboard. Nothing was started.\n"
+            return
+        if row["state"] == "approved":
+            got = _cm_approval_consume(rid)
+            if got is not None:
+                pieces = launch(got["goal"], max(1, int(safe - (now - started))),
+                                "\nApproved in the hub dashboard.\n")
+                if pieces is None:
+                    yield ("\nMulti could not start: the hub could not open a "
+                           "conversation for it.\n")
+                    return
+                for piece in pieces:
+                    yield piece
+                return
+        if safe and now - started >= safe:
+            yield ("\nStill waiting for approval. Approve it in the dashboard, then "
+                   "send any message here: %s\n" % url)
+            return
+        if now - last >= _CM_KEEPALIVE_SECONDS:
+            el = int(now - started)
+            yield "· waiting for approval (%dm %02ds)\n" % (el // 60, el % 60)
+            last = now
+        _cm_sleep(_CM_APPROVAL_POLL)
+
+
+def _cm_dashboard_turn(body, protocol, goal, est, convkey, mapkey, folder_key,
+                       project_dir, helper_cli, caller, safe):
+    """cli_multi_approval = "dashboard": nothing starts without the owner's
+    Approve in the hub dashboard (routes gated by the control token). A request
+    is single-use. Returns a response, or None for today's path."""
+    wants = []                       # _multi_wants_a_swarm may ask a model: once
+
+    def _work():
+        if not wants:
+            wants.append(bool(_multi_wants_a_swarm(goal)))
+        return wants[0]
+
+    req = _cm_approval_find(convkey, folder_key)
+    if req and req["state"] == "approved":
+        # Approved after an earlier turn ended: THIS turn starts it (consumed).
+        got = _cm_approval_consume(req["id"])
+        if got is not None:
+            out = _cm_start(body, protocol, mapkey, folder_key, project_dir,
+                            got.get("helper_cli") or helper_cli, safe, est, got["goal"],
+                            lead="Starting the Multi request you approved in the hub "
+                                 "dashboard.\n")
+            return out if out is not None else _cm_say(
+                body, protocol, "Multi could not start: the hub could not open a "
+                                "conversation for it.\n", est)
+        req = None
+    if req and req["state"] == "denied":
+        _cm_approval_discard(req["id"])
+        return _cm_say(body, protocol,
+                       "The Multi request for %s was denied in the hub dashboard. "
+                       "Nothing was started.\n" % project_dir, est)
+    if req and req["state"] == "pending":
+        if goal != req["goal"] and _work():
+            _cm_approval_discard(req["id"])        # the newest instruction replaces it
+            req = None
+        else:                                      # wait on the SAME request again
+            launch = _cm_launcher(mapkey, folder_key, project_dir,
+                                  req.get("helper_cli") or helper_cli)
+            lead = ("Multi is still waiting for your approval in the hub dashboard: "
+                    "%s (or the banner on any hub page). Waiting...\n"
+                    % _cm_approve_url(req["id"]))
+            return _cm_emit(body, protocol, _cm_approval_stream(req, launch, safe, lead), est)
+    if not _work():
+        return None
+    req = _cm_approval_new(convkey, folder_key, project_dir, goal, helper_cli, caller)
+    launch = _cm_launcher(mapkey, folder_key, project_dir, helper_cli)
+    lead = ("Multi wants to start up to %d helper agents that edit files and run "
+            "commands in %s. Approve it in the hub dashboard: %s (or the banner on "
+            "any hub page). Waiting...\n"
+            % (_cm_helper_count(), project_dir, _cm_approve_url(req["id"])))
+    return _cm_emit(body, protocol, _cm_approval_stream(req, launch, safe, lead), est)
 
 
 def _cm_multi_cli_intercept(body, protocol, messages, tools, est):
@@ -21783,7 +22120,10 @@ def _cm_multi_cli_intercept(body, protocol, messages, tools, est):
         folder_key = _cm_folder_key(project_dir)
         if not project_dir or not folder_key:
             return None
-        text = swarm._last_user_text(messages) or ""
+        # The goal is the user's own instruction: a CLI's <system-reminder> blocks
+        # (Claude Code puts CLAUDE.md / file content there) are not part of it,
+        # and must not reach the approval banner or the log.
+        text = _CM_REMINDER_RE.sub("", swarm._last_user_text(messages) or "").strip()
         try:
             convkey = ctxwin.conversation_key(headers=request.headers, body=body,
                                               messages=messages)
@@ -21812,7 +22152,13 @@ def _cm_multi_cli_intercept(body, protocol, messages, tools, est):
         # Not live -> only a FRESH user instruction can start (or resume) a run.
         if not _awaiting_new_instruction(messages):
             return None
-        confirm = _cm_confirm_on()
+        approval = _cm_approval_mode()
+        if approval == "dashboard":
+            # Default: the owner approves in the token-gated dashboard; the
+            # unauthenticated /v1 turn itself can never start helper agents.
+            return _cm_dashboard_turn(body, protocol, text, est, convkey, mapkey,
+                                      folder_key, project_dir, helper_cli, caller, safe)
+        confirm = approval == "chat"
         if confirm and cmd == _CM_GO:
             # The user's go-ahead for the request THIS conversation recorded in
             # THIS folder within the last 10 minutes: its stored goal starts.
@@ -21842,13 +22188,92 @@ def _cm_multi_cli_intercept(body, protocol, messages, tools, est):
                            "run commands in %s on their own, without asking you. To "
                            "start, reply exactly: go multi (or pick another tier).\n"
                            % (_cm_helper_count(), project_dir), est)
-        # Consent already given for this conversation + folder, or the flag is
-        # off (today's direct start).
+        # "chat" with consent already given for this conversation + folder, or
+        # "off" (the direct start).
         return _cm_start(body, protocol, mapkey, folder_key, project_dir, helper_cli,
                          safe, est, text)
     except Exception as exc:                                     # noqa: BLE001
         _log.warning("[cli-multi] intercept fell through: %s", _sanitize(str(exc), 200))
         return None
+
+
+# APPROVAL ROUTES (cli_multi_approval = "dashboard"). They live under /api/, so
+# _local_control_guard applies exactly as to every dashboard route: the
+# per-install control token, plus the dashboard header on the POST. This is the
+# ONLY way a pending request becomes approved.
+@app.route("/api/cli-multi/pending", methods=["GET"])
+def _cm_api_pending():
+    """The Multi requests waiting for the owner's decision (the banner)."""
+    return jsonify({"requests": _cm_approval_list(), "mode": _cm_approval_mode()})
+
+
+@app.route("/api/cli-multi/decide", methods=["POST"])
+def _cm_api_decide():
+    """{id, approve: true|false}: approve or deny ONE pending request, once."""
+    body = request.get_json(force=True, silent=True) or {}
+    rid = body.get("id")
+    approve = body.get("approve")
+    if not isinstance(rid, str) or not rid.strip() or not isinstance(approve, bool):
+        return jsonify({"error": "pass {\"id\": string, \"approve\": true or false}",
+                        "code": "bad_request"}), 400
+    status, payload = _cm_approval_decide(rid.strip(), approve)
+    return jsonify(payload), status
+
+
+def _cm_mcp_swarm_start_now(goal, project_dir, cli):
+    """The MCP door's start, exactly as it was before the approval setting."""
+    return swarm_windows.start(
+        goal, project_dir, cli,
+        _swarm_windows_spawn, _swarm_windows_turn,
+        planner=_pipeline_bound(_swarm_windows_planner),
+        configure=_swarm_windows_configure,
+        stop=agentic_chat.stop_session,
+        modes=_worker_mode_keys(),
+        **_swarm_windows_manager_kw(), **_multi_check_kwargs(),
+        **_multi_budget_kwargs())
+
+
+def _cm_mcp_pending(rid):
+    return {"pending": True, "id": rid, "approve_url": _cm_approve_url(rid),
+            "note": ("Nothing has started. The hub owner must approve this request "
+                     "in the hub dashboard (approve_url, or the banner on any hub "
+                     "page). Then call swarm_windows_start again with the same "
+                     "arguments plus this id.")}
+
+
+def _cm_mcp_start(goal, project_dir, cli):
+    """MCP swarm_windows_start under `cli_multi_approval`. "dashboard"
+    (default): record a single-use request and return {pending, id,
+    approve_url} -- nothing starts until the owner approves in the dashboard.
+    "chat" / "off": the direct start (an MCP client has no chat to say
+    "go multi" in; both modes accept unauthenticated local starts)."""
+    if _cm_approval_mode() != "dashboard":
+        return _cm_mcp_swarm_start_now(goal, project_dir, cli)
+    folder = os.path.abspath(str(project_dir))
+    if not os.path.isdir(folder):
+        raise RuntimeError("project_dir must be an existing folder")
+    req = _cm_approval_new("mcp", _cm_folder_key(folder), folder, goal,
+                           str(cli or "opencode"), "mcp", source="mcp")
+    return _cm_mcp_pending(req["id"])
+
+
+def _cm_mcp_start_approved(rid):
+    """MCP swarm_windows_start called again WITH the id a pending start
+    returned: start the APPROVED request (its stored goal, folder and cli; single
+    use), report it still pending, or fail (denied / unknown / expired / used)."""
+    req = _cm_approval_get(rid)
+    if req is None or req.get("source") != "mcp":
+        raise RuntimeError("unknown, expired or already used request id; call "
+                           "swarm_windows_start without an id to ask again")
+    if req["state"] == "denied":
+        _cm_approval_discard(rid)
+        raise RuntimeError("the hub owner denied this request in the dashboard")
+    if req["state"] == "pending":
+        return _cm_mcp_pending(rid)
+    got = _cm_approval_consume(rid)
+    if got is None:
+        raise RuntimeError("this request was already used")
+    return _cm_mcp_swarm_start_now(got["goal"], got["folder_display"], got["helper_cli"])
 
 
 @app.route("/api/swarm-windows", methods=["GET"])

@@ -212,6 +212,12 @@
   .update-banner{margin:0;padding:9px 16px;font-size:13px;line-height:1.45;color:var(--warn-text);background:var(--warn-soft);border-bottom:1px solid var(--warn-border)}
   .update-banner[hidden]{display:none}
   .agent-update-banner{border:1px solid var(--warn-border);border-radius:8px;margin:0 0 10px}
+  /* CLI MULTI APPROVAL banner (theme tokens only) */
+  .cm-approve-banner{margin:0;padding:8px 16px;font-size:13px;line-height:1.45;color:var(--text);background:var(--info-soft);border-bottom:1px solid var(--info-border)}
+  .cm-approve-banner[hidden]{display:none}
+  .cm-approve-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:4px 0}
+  .cm-approve-text{flex:1 1 280px;min-width:0;overflow-wrap:anywhere;color:var(--text)}
+  .cm-approve-row.cm-approve-focus{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--radius-sm)}
 
   /* ---------- sections / view headers ---------- */
   .section{margin-top:26px}
@@ -3230,6 +3236,12 @@
      (503 + Retry-After), running jobs finish or retry, then continue by
      themselves after the restart. Filled and shown by refreshUpdateStatus(). -->
 <div class="update-banner" id="update-banner" role="status" aria-live="polite" hidden></div>
+<!-- CLI MULTI APPROVAL (2026-10-10): a terminal CLI or an MCP client asked to
+     start a Multi run -- helper agents that edit files and run commands. It
+     starts only when the owner presses Approve here (single-use). Filled by
+     loadCliMultiPending() every 10 s while the page is visible; ?approve=<id>
+     scrolls to that request and focuses its Approve button. -->
+<div class="cm-approve-banner" id="cm-approve-banner" role="region" aria-label="Multi start requests waiting for your approval" aria-live="polite" hidden></div>
 <main class="wrap">
 
   <!-- Lifecycle and multimodal routing -->
@@ -15095,6 +15107,61 @@
     resync();           /* catch up on everything the hidden tab missed */
     pollActivity();
     pollTracking();
+  });
+  /* ---------- CLI MULTI APPROVAL (2026-10-10) ----------
+     A terminal CLI (or an MCP client) asked the hub to start a Multi run:
+     helper agents that edit files and run commands in a folder. Nothing starts
+     until you press Approve here; a request is single-use and expires after 15
+     minutes. Polled every 10 s, only while this page is visible. Every piece
+     of request text goes in through textContent, never innerHTML. */
+  var cmApproveWanted = null, cmApproveFocused = false;
+  try { cmApproveWanted = new URLSearchParams(location.search).get('approve'); } catch (e) {}
+  function cmApproveRender(list){
+    var box = $('#cm-approve-banner'); if (!box) return;
+    while (box.firstChild) box.removeChild(box.firstChild);
+    list = Array.isArray(list) ? list : [];
+    box.hidden = list.length === 0;
+    list.forEach(function(r){
+      var row = document.createElement('div');
+      row.className = 'cm-approve-row';
+      row.setAttribute('data-id', String(r.id || ''));
+      var txt = document.createElement('span');
+      txt.className = 'cm-approve-text';
+      txt.textContent = (r.source === 'mcp' ? 'An MCP client' : 'A terminal CLI') +
+        ' asks to start Multi in ' + String(r.folder || '?') + ': ' + String(r.goal || '');
+      var ok = document.createElement('button');
+      ok.type = 'button'; ok.className = 'btn primary'; ok.textContent = 'Approve';
+      var no = document.createElement('button');
+      no.type = 'button'; no.className = 'btn ghost'; no.textContent = 'Deny';
+      ok.addEventListener('click', function(){ cmApproveDecide(r.id, true, row); });
+      no.addEventListener('click', function(){ cmApproveDecide(r.id, false, row); });
+      row.appendChild(txt); row.appendChild(ok); row.appendChild(no);
+      box.appendChild(row);
+      if (cmApproveWanted && String(r.id) === cmApproveWanted && !cmApproveFocused){
+        cmApproveFocused = true;
+        row.classList.add('cm-approve-focus');
+        try { row.scrollIntoView({block: 'center'}); } catch (e) {}
+        try { ok.focus(); } catch (e) {}
+      }
+    });
+  }
+  function cmApproveDecide(id, approve, row){
+    if (row) Array.prototype.forEach.call(row.querySelectorAll('button'),
+                                          function(b){ b.disabled = true; });
+    api('/api/cli-multi/decide', {method: 'POST', body: {id: String(id), approve: !!approve}})
+      .catch(function(e){ toast((e && e.message) || 'Could not save that decision', true); })
+      .then(loadCliMultiPending);
+  }
+  function loadCliMultiPending(){
+    if (document.hidden || hubOffline) return Promise.resolve();
+    return api('/api/cli-multi/pending')
+      .then(function(j){ cmApproveRender(j && j.requests); })
+      .catch(function(){});
+  }
+  loadCliMultiPending();
+  setInterval(function(){ if (!document.hidden) loadCliMultiPending(); }, 10000);
+  document.addEventListener('visibilitychange', function(){
+    if (!document.hidden) loadCliMultiPending();
   });
   /* Model tracking: wire buttons, load once. */
   (function(){

@@ -353,7 +353,7 @@ Quick Tunnel**: free, no Cloudflare account, nothing to configure.
 | **Dashboard** | `/api/*` (control-token gated) |
 | **Probes** | `/health`, `/healthz` (liveness), `/ready`, `/readyz` (readiness, 503 + `reason` when not ready) — no token, loopback only, no version or provider data |
 
-174 routes in total; the dashboard is the documentation for the rest.
+176 routes in total; the dashboard is the documentation for the rest.
 
 ---
 
