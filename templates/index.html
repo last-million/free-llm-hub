@@ -2719,32 +2719,49 @@
   .agent-chat-col .agent-term-line.run > *,
   .agent-chat-col .agent-answer{ min-width:0; max-width:100%; }
   .agent-chat-col .chat-messages{ overflow-x:hidden; }
-  /* The task board: the goal behind the work in this folder and the open
-     tasks. Theme tokens only, so it reads in both themes. */
+  /* The goal (task board), one line right under the Build toolbar: the goal
+     (ellipsis; the full text in its tooltip and in the opened body), how many
+     tasks are open, and a toggle that opens the list and the forms in place.
+     Theme tokens only, so it reads in both themes; 44 px targets on phones. */
   .agent-tasks{ border:1px solid var(--border); border-radius:var(--radius-sm);
-    background:var(--surface); margin-bottom:6px; font-size:12.5px; flex:none;
-    max-height:34%; overflow:auto; padding:6px 10px; }
-  .agent-tasks-h{ display:flex; align-items:center; gap:8px; margin-bottom:4px; }
-  .agent-tasks-goal{ color:var(--text-dim); min-width:0; overflow:hidden;
-    text-overflow:ellipsis; white-space:nowrap; flex:1 1 auto; }
-  .agent-tasks-x{ flex:none; border:1px solid var(--border); background:none;
-    color:var(--text-dim); border-radius:var(--radius-sm); font:inherit;
-    font-size:11px; padding:1px 6px; cursor:pointer; }
-  .agent-tasks-x:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+    background:var(--surface); font-size:12.5px; flex:none; min-width:0; padding:3px 4px 3px 12px; }
+  .agent-tasks-h{ display:flex; align-items:center; flex-wrap:wrap; gap:4px 8px; min-width:0; }
+  .agent-goal-k{ flex:none; font-weight:700; color:var(--text); }
+  .agent-tasks-goal{ flex:1 1 160px; min-width:0; color:var(--text-dim); overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  /* 30 px = 24 rendered at the default 80 % scale: the AA target size on a
+     desktop; phones get 44 below. */
+  .agent-tasks-h .btn, .agent-tasks-foot .btn, .tk-done,
+  .agent-tasks-add input, .agent-tasks-add button{ min-height:30px; }
+  .agent-tasks-h .btn{ flex:none; }
+  .agent-tasks-toggle .att-n{ font-variant-numeric:tabular-nums; }
+  .agent-tasks-toggle .att-ic{ flex:none; transition:transform .15s ease; }
+  .agent-tasks-toggle[aria-expanded="true"] .att-ic{ transform:rotate(180deg); }
+  .agent-tasks-body{ margin:3px 8px 6px 0; padding-top:8px; border-top:1px solid var(--border-soft);
+    max-height:240px; overflow:auto; }
+  .agent-goal-full{ margin:0 0 6px; color:var(--text); overflow-wrap:anywhere; }
+  .agent-tasks-foot{ display:flex; justify-content:flex-end; margin-top:6px; }
   .agent-tasks-list{ list-style:none; margin:0 0 4px; padding:0; display:flex;
     flex-direction:column; gap:3px; }
   .agent-tasks-list li{ display:flex; gap:7px; align-items:center; line-height:1.35; }
-  .agent-tasks-list .tk-text{ flex:1 1 auto; min-width:0; }
+  .agent-tasks-list .tk-text{ flex:1 1 auto; min-width:0; overflow-wrap:anywhere; }
   .agent-tasks-list li.done .tk-text{ color:var(--text-dim); text-decoration:line-through; }
   .tk-chip{ flex:none; font-size:10px; letter-spacing:.04em; text-transform:uppercase;
     border-radius:999px; padding:1px 7px; border:1px solid var(--border);
-    color:var(--text-dim); background:var(--surface-2,var(--bg)); }
-  .tk-chip.doing{ color:var(--accent); border-color:var(--accent); }
-  .tk-chip.done{ color:#fff; background:var(--accent); border-color:var(--accent); }
-  .tk-chip.failed,.tk-chip.blocked{ color:var(--danger-text,#b91c1c); border-color:var(--danger,#b91c1c); }
+    color:var(--text-dim); background:var(--surface-2); }
+  .tk-chip.doing{ color:var(--ok-text); border-color:var(--accent-border); }
+  .tk-chip.done{ color:var(--on-accent); background:var(--accent-strong); border-color:var(--accent-strong); }
+  .tk-chip.failed,.tk-chip.blocked{ color:var(--danger-text); border-color:var(--danger-border); }
   .tk-done{ flex:none; border:1px solid var(--border); background:none; cursor:pointer;
-    color:var(--accent); font:inherit; font-size:11px; padding:1px 6px; border-radius:var(--radius-sm); }
+    color:var(--ok-text); font:inherit; font-size:11px; padding:1px 6px; border-radius:var(--radius-sm); }
   .tk-done:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  @media (max-width:640px){
+    .agent-tasks{ padding-left:10px; }
+    .agent-tasks-h .btn, .tk-done, .agent-tasks-add button, .agent-tasks-add input,
+    .agent-tasks-foot .btn{ min-height:var(--tap, 44px); }
+    .tk-done{ padding:0 12px; }
+  }
+  @media (prefers-reduced-motion:reduce){ .agent-tasks-toggle .att-ic{ transition:none; } }
   .agent-tasks-add{ display:flex; gap:6px; margin-top:4px; }
   .agent-tasks-add input{ flex:1 1 auto; min-width:0; border:1px solid var(--border);
     border-radius:var(--radius-sm); background:var(--bg); color:var(--text);
@@ -3726,6 +3743,45 @@
                   title="Conversations and previews currently open">Running <span id="agent-running-n">0</span></button>
           <button class="btn sm ghost" id="agent-end" type="button">End session</button>
           </div>
+          <!-- THE GOAL (taskboard), right under the Build toolbar and above the
+               helper bar and the Plan/Helpers strip (owner, 2026-10-10: "the
+               goal should appear in the TOP BAR section, not after the
+               helpers"). One line: the goal (ellipsis; full text in the
+               tooltip and in the opened body), how many tasks are open, and a
+               toggle that opens the task list and the forms in place. Folded
+               by default; open/folded is remembered by this browser only. The
+               same goal brief rides into every Multi phase, the Build brief
+               file and the opening turn of a terminal CLI. -->
+          <div class="agent-tasks" id="agent-tasks" hidden>
+            <div class="agent-tasks-h">
+              <span class="agent-goal-k" id="agent-goal-k" hidden>Goal:</span>
+              <span class="agent-tasks-goal" id="agent-tasks-goal">No goal yet</span>
+              <button type="button" class="btn sm ghost agent-goal-set" id="agent-goal-set"
+                      aria-expanded="false" aria-controls="agent-tasks-body">Set goal</button>
+              <button type="button" class="btn sm ghost agent-tasks-toggle" id="agent-tasks-toggle"
+                      aria-expanded="false" aria-controls="agent-tasks-body" hidden>
+                <span class="att-n" id="agent-tasks-n">No open tasks</span>
+                <svg class="att-ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+            </div>
+            <div class="agent-tasks-body" id="agent-tasks-body" hidden>
+              <p class="agent-goal-full" id="agent-goal-full" hidden></p>
+              <ul class="agent-tasks-list" id="agent-tasks-list"></ul>
+              <form class="agent-tasks-add" id="agent-task-form" hidden>
+                <input type="text" id="agent-task-input" maxlength="200"
+                       placeholder="Add a task to this goal" aria-label="New task">
+                <button type="submit">Add</button>
+              </form>
+              <form class="agent-tasks-add" id="agent-goal-form">
+                <input type="text" id="agent-goal-input" maxlength="200"
+                       placeholder="Set the goal for this project" aria-label="New goal">
+                <button type="submit">Save goal</button>
+              </form>
+              <div class="agent-tasks-foot">
+                <button type="button" class="btn sm ghost agent-tasks-x" id="agent-goal-close" hidden>Close goal</button>
+              </div>
+            </div>
+          </div>
           <div class="agent-split" id="agent-split">
             <div class="agent-chat-col">
               <!-- THE PLAN. The hub's copy of the agent's task list (read off the
@@ -3748,28 +3804,6 @@
                 <div class="agent-plan-body" id="agent-plan-body">
                   <ul class="agent-plan-list" id="agent-plan-list"></ul>
                 </div>
-              </div>
-              <!-- TASK BOARD (taskboard): the goal behind the work in this
-                   folder and the tasks agents pick from. The same goal brief
-                   rides into every Multi phase, the Build brief file and the
-                   opening turn of a terminal CLI. -->
-              <div class="agent-tasks" id="agent-tasks" hidden>
-                <div class="agent-tasks-h">
-                  <span class="agent-plan-title">Tasks</span>
-                  <span class="agent-tasks-goal" id="agent-tasks-goal">No goal yet for this project.</span>
-                  <button type="button" class="agent-tasks-x" id="agent-goal-close" hidden>Close goal</button>
-                </div>
-                <ul class="agent-tasks-list" id="agent-tasks-list"></ul>
-                <form class="agent-tasks-add" id="agent-task-form" hidden>
-                  <input type="text" id="agent-task-input" maxlength="200"
-                         placeholder="Add a task to this goal" aria-label="New task">
-                  <button type="submit">Add</button>
-                </form>
-                <form class="agent-tasks-add" id="agent-goal-form">
-                  <input type="text" id="agent-goal-input" maxlength="200"
-                         placeholder="Set the goal for this project" aria-label="New goal">
-                  <button type="submit">Set goal</button>
-                </form>
               </div>
               <div class="chat-messages" id="agent-messages" aria-live="polite">
                 <div class="chat-empty">Send a message to start working with the agent in this folder.</div>
@@ -11746,10 +11780,28 @@
 
     /* ---------- The task board: the goal behind the work ---------- */
     var curGoalId = null;
+    /* The goal row under the toolbar opens in place. Open or folded is this
+       browser's own choice (localStorage, guarded), never server state;
+       folded until the user opens it. */
+    var GOAL_OPEN_KEY = 'flh.goalOpen';
+    function goalOpenSaved(){
+      try { return localStorage.getItem(GOAL_OPEN_KEY) === '1'; } catch (e){ return false; }
+    }
+    function setGoalOpen(on, remember){
+      var body = document.getElementById('agent-tasks-body');
+      if (!body) return;
+      body.hidden = !on;
+      ['agent-tasks-toggle', 'agent-goal-set'].forEach(function(id){
+        var b = document.getElementById(id);
+        if (b) b.setAttribute('aria-expanded', on ? 'true' : 'false');
+      });
+      if (remember){ try { localStorage.setItem(GOAL_OPEN_KEY, on ? '1' : '0'); } catch (e){} }
+    }
     function loadTasks(){
       var panel = document.getElementById('agent-tasks');
       if (!panel) return Promise.resolve();
       if (!curProjectDir){ panel.hidden = true; return Promise.resolve(); }
+      if (panel.hidden) setGoalOpen(goalOpenSaved(), false);
       panel.hidden = false;
       var dir = curProjectDir;
       var q = 'project_dir=' + encodeURIComponent(dir);
@@ -11766,22 +11818,32 @@
       var listEl = document.getElementById('agent-tasks-list');
       var taskForm = document.getElementById('agent-task-form');
       var closeBtn = document.getElementById('agent-goal-close');
+      var keyEl = document.getElementById('agent-goal-k');
+      var fullEl = document.getElementById('agent-goal-full');
+      var countEl = document.getElementById('agent-tasks-n');
+      var toggle = document.getElementById('agent-tasks-toggle');
+      var setBtn = document.getElementById('agent-goal-set');
       if (!goalEl || !listEl) return;
       var active = goalsData.active || (asList(goalsData, ['goals'])[0] || null);
       curGoalId = active ? active.id : null;
-      if (active){
-        goalEl.textContent = active.title + (active.detail ? ' — ' + active.detail : '');
-        if (taskForm) taskForm.hidden = false;
-        if (closeBtn) closeBtn.hidden = false;
-      } else {
-        goalEl.textContent = 'No goal yet for this project.';
-        if (taskForm) taskForm.hidden = true;
-        if (closeBtn) closeBtn.hidden = true;
-      }
+      /* One line: "Goal: <text>" cut with an ellipsis, the whole text in the
+         tooltip and, for touch and keyboard, at the top of the opened body.
+         No goal: "No goal yet" + Set goal, which opens the form. */
+      var full = active ? active.title + (active.detail ? ' — ' + active.detail : '') : '';
+      goalEl.textContent = active ? full : 'No goal yet';
+      goalEl.title = full;
+      if (keyEl) keyEl.hidden = !active;
+      if (fullEl){ fullEl.textContent = full; fullEl.hidden = !active; }
+      if (toggle) toggle.hidden = !active;
+      if (setBtn) setBtn.hidden = !!active;
+      if (taskForm) taskForm.hidden = !active;
+      if (closeBtn) closeBtn.hidden = !active;
       listEl.innerHTML = '';
       var open = (tasks || []).filter(function(t){
         return active && t.goal_id === active.id && t.status !== 'done';
       });
+      if (countEl) countEl.textContent = !open.length ? 'No open tasks'
+        : open.length === 1 ? '1 open task' : open.length + ' open tasks';
       if (!open.length){ return; }
       open.forEach(function(t){
         var li = document.createElement('li');
@@ -11831,7 +11893,25 @@
       if (closeBtn) closeBtn.addEventListener('click', function(){
         if (!curGoalId) return;
         api('/api/goals/' + encodeURIComponent(curGoalId) + '/close',
-            { method: 'POST' }).then(loadTasks).catch(function(){});
+            { method: 'POST' }).then(loadTasks)
+          .then(function(){
+            /* the button just went away with the goal: land on Set goal */
+            var s = document.getElementById('agent-goal-set');
+            if (s && !s.hidden) s.focus();
+          })
+          .catch(function(){});
+      });
+      var toggle = document.getElementById('agent-tasks-toggle');
+      var setBtn = document.getElementById('agent-goal-set');
+      if (toggle) toggle.addEventListener('click', function(){
+        var body = document.getElementById('agent-tasks-body');
+        setGoalOpen(!!(body && body.hidden), true);
+      });
+      /* "No goal yet - Set goal": opens the body on the goal form. */
+      if (setBtn) setBtn.addEventListener('click', function(){
+        setGoalOpen(true, true);
+        var inp = document.getElementById('agent-goal-input');
+        if (inp) inp.focus();
       });
     })();
     /* One helper of a Multi run: its state (icon AND words, never colour

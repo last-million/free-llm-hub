@@ -2358,10 +2358,22 @@ from -- the SAME quality in any terminal CLI and in the Build page. Covered by
   verified/reviewed), FAILED -> `failed` with the reason; at the end worker
   PROGRESS.md `- [x] Phase N` ticks reconcile tasks to `done` (best effort,
   only promotes). The plan/dry-run, evidence and verdict logic are unchanged.
-- **UI**: a "Tasks" panel on the Build page (`#agent-tasks`, theme tokens
-  only) -- active goal line, open tasks with status chips + a Done button,
-  add-goal / add-task inputs, close-goal. `loadTasks()` fetches
-  `/api/goals` + `/api/tasks` for the session's `curProjectDir`.
+- **UI**: `#agent-tasks` on the Build page, theme tokens only. `loadTasks()`
+  fetches `/api/goals` + `/api/tasks` for the session's `curProjectDir`.
+  Since 2026-10-10 (owner: "the goal should appear in the TOP BAR section, not
+  after the helpers") it is ONE row directly under the Build toolbar, first in
+  `#agent-session` and so above the helper bar, the update banner and the
+  Plan/Helpers strip (it used to sit inside the chat column after them):
+  "Goal: <text>" (ellipsis; the whole goal in the tooltip and at the top of
+  the opened body, for touch and keyboard), then an "N open tasks" toggle
+  (`#agent-tasks-toggle`, `aria-expanded`) that opens `#agent-tasks-body` in
+  place -- the open tasks with status chips + Done, the add-task form, the goal
+  form (its button says "Save goal") and Close goal. No goal: "No goal yet" +
+  "Set goal" (`#agent-goal-set`), which opens the body on the goal form. Folded
+  by default; open/folded is the browser's own (`localStorage` key
+  `flh.goalOpen`, guarded), never server state. 44 px targets on phones, 24
+  rendered px on a desktop; the row wraps instead of scrolling sideways.
+  Covered by `tests/test_goal_in_the_top_bar.py`.
 
 ## Heartbeats and budgets (2026-10-07)
 
