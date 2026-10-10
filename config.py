@@ -54,7 +54,22 @@ CONFIG_PATH: str = _default_config_path()
 
 _LOCK = threading.RLock()
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+
+def _stamp_schema_version(cfg: dict) -> None:
+    """Record the schema version as a FLOOR, never a forced value.
+
+    migrations.py owns the forward moves (and raises the stored version to
+    LATEST once it has run); this only keeps the field honest on an ordinary
+    load/save. A config written by a NEWER hub (higher version) is left alone
+    rather than downgraded, and an older one is lifted to the current baseline.
+    """
+    try:
+        cur = int(cfg.get("schema_version"))
+    except (TypeError, ValueError):
+        cur = 0
+    cfg["schema_version"] = cur if cur > SCHEMA_VERSION else SCHEMA_VERSION
 
 
 def _new_hub_mode() -> dict:
@@ -460,7 +475,7 @@ def load_config(strict: bool = False) -> dict:
         cfg["default"] = None
     if not isinstance(cfg.get("local_api_key"), str) or not cfg.get("local_api_key"):
         cfg["local_api_key"] = cfg.get("local_api_key") if isinstance(cfg.get("local_api_key"), str) and cfg.get("local_api_key") else None
-    cfg["schema_version"] = SCHEMA_VERSION
+    _stamp_schema_version(cfg)
     cfg["hub_mode"] = _normalize_state(cfg.get("hub_mode"), _new_hub_mode())
     if not isinstance(cfg["hub_mode"].get("clients"), dict):
         cfg["hub_mode"]["clients"] = {}
@@ -1076,7 +1091,7 @@ def _cas_update(section: str, expected_revision: int, updater) -> dict:
             if section == "hub_mode":
                 current["updated_at"] = _utc_now()
             cfg[section] = current
-            cfg["schema_version"] = SCHEMA_VERSION
+            _stamp_schema_version(cfg)
             save_config(cfg)
             return copy.deepcopy(current)
 

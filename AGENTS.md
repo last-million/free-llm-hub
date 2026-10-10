@@ -4331,3 +4331,70 @@ instead of compacting. The refusal now TELLS the client how to shrink it.
   (`agentic_chat.context_detail`) already ends "Press Continue to compact it or
   start a new conversation." -- the Continue button runs the hub's own
   compaction, so that text is left as the page's equivalent guidance.
+
+## Automatic migrations (2026-10-10)
+
+Owner: every install auto-updates (`git pull` + graceful restart), so a release
+that renames/retires a persisted setting must migrate old state BY ITSELF, and
+must NEVER drop or corrupt an API key -- including on users' installs that get
+the same update. Covered by `tests/test_safe_migrations.py` (hermetic: temp
+config via `FREE_LLM_HUB_CONFIG`, fake `enc.v1:` key strings, real atomic I/O).
+
+- **`migrations.py`** (pure stdlib, never imports app; imports `config` lazily so
+  there is no cycle -- config never imports it). `apply(raw) -> (new, applied)`
+  is pure and IDEMPOTENT and runs on the RAW, encrypted-at-rest config dict: a
+  stored key string (ciphertext or legacy plaintext) is MOVED VERBATIM, never
+  decrypted, re-encrypted or rewritten (AES-GCM would re-nonce; `encrypt()` is
+  idempotent anyway). `LATEST = 3`. Steps are version-gated `(target, id, fn)`;
+  `_effective_start` treats a config still carrying the unambiguous pre-v3 key
+  `cli_multi_confirm` as `< 3` whatever its stamp says, so a premature
+  `schema_version` save between boot and the step cannot skip a pending rename
+  (provider presence is NOT such a signal, so a future release may re-add a
+  retired name without it being re-retired).
+- **The v3 step** (`_to_v3`): (1) `cli_multi_confirm` (bool) ->
+  `cli_multi_approval` (str): `false` -> `"off"`, `true`/anything-else ->
+  `"dashboard"` (the new default and the hub's safe side; never weaker than the
+  owner's prior "require consent"); an existing `cli_multi_approval` is never
+  clobbered and the old key is dropped. (2) rows of removed providers
+  (`RETIRED_PROVIDERS = tokenrouter, agentrouter`) move from `providers` into a
+  top-level `retired_providers` block, keys and all (`retired_at` stamped);
+  `retired_providers` is outside the encrypt/decrypt pass (which only touches
+  `providers`), so those ciphertext strings round-trip byte-for-byte through
+  every ordinary save and `load_config`/`save_config` carry the block
+  unchanged.
+- **`run_migrations(path=None)`** (the boot step): under `config._LOCK` + the
+  cross-process lock, read the raw JSON (no decryption); if `apply` changes
+  nothing, write nothing (idempotent -- no backup, no churn). Otherwise take an
+  atomic 0600 backup to `state_dir()/backups/config-<UTC>-premigrate.json`
+  (byte-for-byte, so `list_backups` sees it) BEFORE the write, run the
+  KEY-SAFETY check, then atomically write the new raw dict (0600, fsync,
+  replace-with-retry, like `save_config` but WITHOUT its encrypt pass) and
+  invalidate the settings cache. A change that would REDUCE the stored keys is
+  ABORTED (live config untouched, backup kept). A missing file (fresh install)
+  or a corrupt one is left alone. It NEVER raises: any failure leaves the config
+  untouched, logs one line, and boot continues (fail-safe).
+- **Key safety** is a count + per-key SHA-256 multiset (`key_fingerprint`,
+  `_keys_preserved`) over every stored key string across `providers`,
+  `retired_providers` and `_unreadable_api_keys` (and a legacy single
+  `api_key`). The digest is of the STORED string, so it never exposes a secret
+  and is invariant under moving a key between maps -- the one thing a safe
+  migration does. Counts and a backup path may be logged; a key value never is.
+- **Wiring**: `config.SCHEMA_VERSION` is `3`; `_stamp_schema_version` records it
+  as a FLOOR (never downgrades a config written by a newer hub, lifts an older
+  one to the baseline) in `load_config` and `_cas_update`. app.py's `__main__`
+  calls `migrations.run_migrations()` as its FIRST action, before
+  `_recover_interrupted_hub_transition` / `_mark_runtime_started` (so nothing
+  stamps the version before pending moves are done) and before
+  `_seed_default_blocks` / `encrypt_existing_secrets`. The auto-update path
+  reaches this same boot -- no separate code path. `GET /api/version` (already
+  control-token gated) gains a `migrations` object
+  `{schema_version, applied, last_backup, keys_count}` via `migrations.status()`
+  -- NO new route, so the README route count is unchanged.
+- **State files are not migrated**: `update-resume.json`, `cli-multi-runs.json`,
+  `preview-starts.json`, `cloudflared-auto.json`, `taskboard.json`, the
+  benchmarks and the quota/perf ledgers hold no keys and already fail open
+  (a missing file = fresh state; an old-shaped one is read defensively), so they
+  need nothing here. New boolean flags of recent releases (`deploy_perfect`,
+  `cloudflared_auto_install`, `agent_publish`, `graceful_update`, ...) read
+  through `get_flag(name, default)`: absent on an old config = their default, so
+  they self-migrate and are deliberately not touched.

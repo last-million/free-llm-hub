@@ -300,6 +300,9 @@ keys can actually reach right now, which is the only number that matters.
   install `cloudflared` for the Publish button (checksum-verified; untick
   "Install cloudflared automatically" in the Publish panel to stop it), and
   `git pull` for its own updates.
+- **Safe updates.** Each update migrates old config state forward automatically
+  at boot (backing the config up first) and never drops or rewrites a stored API
+  key — keys of a removed provider are kept, not discarded.
 
 ---
 

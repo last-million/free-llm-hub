@@ -82,6 +82,7 @@ import model_categories
 import snapshots
 import quick_history
 import config
+import migrations
 import image_history
 import craft
 import arena
@@ -20189,7 +20190,15 @@ def api_version():
     # they disagree about what `version` means, so there is no single answer.
     if _ollama_enabled() and not _has_control_token():
         return jsonify({"version": wire_ollama.OLLAMA_VERSION})
-    return jsonify({"version": _HUB_VERSION, "release": HUB_RELEASE})
+    payload = {"version": _HUB_VERSION, "release": HUB_RELEASE}
+    # Automatic config migrations (2026-10-10): schema version, what the last
+    # boot migrated, the pre-migration backup and the stored-key COUNT (never a
+    # value). Token-gated like the rest of this payload.
+    try:
+        payload["migrations"] = migrations.status()
+    except Exception:                                            # noqa: BLE001
+        pass
+    return jsonify(payload)
 
 
 # Liveness / readiness probes (idea from PR #4). They live outside /api/* so a
@@ -47913,6 +47922,24 @@ _INSTANCE_LOCK = []
 
 if __name__ == "__main__":
     from werkzeug.serving import make_server
+
+    # SAFE MIGRATIONS (2026-10-10): carry old config state forward before ANY
+    # code reads or writes it — the auto-update path reaches this same boot, so
+    # a release that renamed/retired a setting migrates by itself. Runs first,
+    # so nothing stamps the schema version before the pending moves are done; it
+    # never drops a stored API key and never raises (a failure leaves the config
+    # untouched and boot continues).
+    try:
+        _mig = migrations.run_migrations()
+        if _mig.get("changed"):
+            _log.info("[boot] config migrated: %s (schema_version %s, %d key(s))",
+                      _mig.get("applied"), _mig.get("schema_version"),
+                      _mig.get("keys_count"))
+        elif _mig.get("aborted"):
+            _log.error("[boot] a config migration was aborted to protect your "
+                       "keys; see the migrations log line above")
+    except Exception as _exc:                                    # noqa: BLE001
+        _log.warning("[boot] config migration step skipped: %s", _exc)
 
     _recover_interrupted_hub_transition()
     _mark_runtime_started()
