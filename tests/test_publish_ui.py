@@ -1,25 +1,39 @@
-r"""The Build page's Publish button: the running preview on the internet through
-a free Cloudflare quick tunnel, with a countdown until the link closes.
+r"""The Build page's Publish button opens "Publish online": a native modal dialog
+that puts the running preview on the internet through a free Cloudflare quick
+tunnel, with a countdown until the link closes.
 
-REQUESTED 2026-10-08. The backend is a separate piece; this file pins the
-page's half of the contract (five routes, ten error codes) and the things that
-are easy to get wrong in a UI like this:
+REQUESTED 2026-10-08 (the button and its countdown) and 2026-10-10: "the
+Cloudflare thing should open in a POPUP, responsive, clean CSS -- it looks tight
+in that place". The backend is a separate piece; this file pins the page's half
+of the contract (five routes, ten error codes) and the things that are easy to
+get wrong in a UI like this:
 
+  * it is a real <dialog> opened with showModal(): the top layer is never
+    clipped by the preview column, Esc and the focus trap are the browser's
+    own, a press on the backdrop closes it and focus goes back to the button;
+  * it is moved under <body> once, so no hidden ancestor can leave an invisible
+    modal over an inert page; while it is open it speaks through its own live
+    region (everything behind a modal is inert, live regions included);
   * the warning and the tick box that gates "Publish" are always on screen;
   * the countdown is computed from the server's remaining seconds and a LOCAL
-    monotonic clock (never Date.now() against the server's expires_at), is
-    exact to the second, and is not announced every second -- only at 5:00 and
-    1:00 left;
+    monotonic clock (never Date.now() against the server's expires_at), is exact
+    to the second, keeps ticking on the button with the dialog closed, and is
+    not announced every second -- only at 5:00 and 1:00 left;
   * polling runs only while something is settling, and every timer is cleared
     when the project changes;
   * every backend string goes in as text, and a link is only ever https://;
+  * a centred window on a desktop, a full-width bottom sheet on a phone, with
+    44 px targets; screen-relative sizes are percentages because the page root
+    is zoomed (viewport units would shrink with it);
   * the colours are theme tokens and every text pair measures >= 4.5:1 in
     both themes.
 
 The page is one big template, so (like the other UI tests) most checks read it
 as text. The pure helpers and the whole state machine are ALSO run under node
-against a tiny fake DOM, because "the ids exist" proves nothing about a timer.
+against a tiny fake DOM, because "the ids exist" proves nothing about a timer;
+the fake DOM's parent links are held to the real markup below.
 """
+import html.parser
 import io
 import json
 import os
@@ -41,7 +55,7 @@ def _between(start, end, src=HTML):
 JS = _between("/* publish-js:start */", "/* publish-js:end */")
 PURE = _between("/* publish-pure:start */", "/* publish-pure:end */")
 CSS = _between("/* publish-css:start */", "/* publish-css:end */")
-PANEL = _between('<section class="publish-panel"', "</section>")
+DIALOG = _between('<dialog class="publish-dialog"', "</dialog>")
 BAR = _between('<div class="preview-bar" id="preview-bar">', 'id="preview-state"')
 
 CONTRACT_ROUTES = {
@@ -51,22 +65,74 @@ CONTRACT_ROUTES = {
 ERROR_CODES = ["no_cloudflared", "no_preview", "forbidden_port", "not_http", "too_many",
                "bad_ttl", "install_failed", "not_found", "already_published", "disabled"]
 
+# Where the controls the script hides sit, for the fake DOM's closest('[hidden]')
+# (the focus rule). test_the_fake_dom_parents_match_the_markup holds it to the
+# real template, so the fake cannot drift from the page.
+PARENT = {
+    "publish-start": "publish-foot-form",
+    "publish-stop": "publish-foot-live",
+    "publish-renew": "publish-foot-live",
+    "publish-copy": "publish-foot-live",
+    "publish-renew-yes": "publish-renew-confirm",
+    "publish-renew-no": "publish-renew-confirm",
+    "publish-expired-renew": "publish-foot-expired",
+    "publish-failed-retry": "publish-foot-failed",
+    "publish-ttl": "publish-form",
+    "publish-consent": "publish-form",
+    "publish-install-btn": "publish-install",
+    "publish-url": "publish-v-live",
+    "publish-v-live": "publish-live",
+}
+
 
 def _node():
     return shutil.which("node")
 
 
+class _Ancestry(html.parser.HTMLParser):
+    """id -> the ids of its ancestors, nearest first."""
+    VOID = {"input", "br", "img", "meta", "link", "hr", "source", "wbr", "col", "area", "base",
+            "embed", "track", "param"}
+
+    def __init__(self):
+        super().__init__()
+        self.stack, self.up = [], {}
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if a.get("id"):
+            self.up[a["id"]] = [x for x in reversed(self.stack) if x]
+        if tag not in self.VOID:
+            self.stack.append(a.get("id") or "")
+
+    def handle_startendtag(self, tag, attrs):
+        a = dict(attrs)
+        if a.get("id"):
+            self.up[a["id"]] = [x for x in reversed(self.stack) if x]
+
+    def handle_endtag(self, tag):
+        if tag not in self.VOID and self.stack:
+            self.stack.pop()
+
+
+def _ancestors():
+    p = _Ancestry()
+    p.feed(DIALOG + "</dialog>")
+    return p.up
+
+
 # --------------------------------------------------------------------------- #
-# The button and the panel exist, with the right semantics
+# The button, the dialog, and how it opens and closes
 # --------------------------------------------------------------------------- #
 
 def test_the_button_sits_in_the_preview_bar_next_to_run_and_stop():
     assert BAR.index('id="preview-run"') < BAR.index('id="preview-stop"') < BAR.index('id="preview-publish"')
     btn = _between('<button class="btn sm ghost preview-publish"', "</button>", BAR)
-    for needle in ('type="button"', 'aria-disabled="true"', 'aria-expanded="false"',
-                   'aria-controls="publish-panel"', 'aria-describedby="preview-publish-why"',
+    for needle in ('type="button"', 'aria-disabled="true"', 'aria-haspopup="dialog"',
+                   'aria-controls="publish-dialog"', 'aria-describedby="preview-publish-why"',
                    'title="Start the preview first"'):
         assert needle in btn, needle
+    assert "aria-expanded" not in btn, "a modal dialog makes the button inert while open"
     assert 'id="preview-publish-why">Start the preview first<' in BAR
 
 
@@ -76,54 +142,78 @@ def test_the_live_badge_lives_on_the_button_and_does_not_rename_it_every_second(
     assert "aria-hidden" in time_el and "hidden" in time_el
 
 
-def test_one_polite_status_region_outside_the_panel_carries_the_announcements():
-    announce = _between('id="publish-announce"', ">")
-    assert 'role="status"' in announce and 'aria-live="polite"' in announce
-    assert 'id="publish-announce"' not in PANEL, "it must speak even with the panel closed"
-    # ...and outside #preview-bar, which the Files tab hides: the 5:00 / 1:00 lines still speak there.
+def test_two_polite_status_regions_one_outside_one_inside_the_dialog():
+    outside = _between('id="publish-announce"', ">")
+    assert 'role="status"' in outside and 'aria-live="polite"' in outside
+    assert 'id="publish-announce"' not in DIALOG, "it must speak with the dialog closed"
+    # ...and outside #preview-bar, which the Files tab hides.
     between = HTML[HTML.index('id="preview-reload"'):HTML.index('id="publish-announce"')]
     assert "</div>" in between, "the status region must sit after the bar closes"
-    assert HTML.index('id="publish-announce"') < HTML.index('<section class="publish-panel"')
+    inside = _between('id="publish-say"', ">", DIALOG)
+    assert 'role="status"' in inside and 'aria-live="polite"' in inside
+    assert "publish-say" not in _between('<div class="pub-dlg-body"', '<div class="pub-dlg-foot"', DIALOG), \
+        "never inside a section the script hides"
+    assert "var el = isOpen ? sayIn : sayOut;" in JS
 
 
-def test_the_panel_ids_exist():
-    for i in ("publish-panel", "publish-title", "publish-close", "publish-warning",
-              "publish-install", "publish-install-btn", "publish-install-status",
-              "publish-install-cmd", "publish-install-copy", "publish-form", "publish-ttl",
-              "publish-consent", "publish-start", "publish-start-why", "publish-live",
-              "publish-v-starting", "publish-v-live", "publish-v-expired", "publish-v-failed",
-              "publish-url", "publish-countdown", "publish-soon", "publish-copy",
-              "publish-stop", "publish-renew", "publish-renew-confirm", "publish-renew-yes",
-              "publish-renew-no", "publish-expired-renew", "publish-failed-retry",
-              "publish-failed-msg", "publish-error"):
-        assert 'id="%s"' % i in PANEL, i
+def test_the_dialog_ids_exist():
+    for i in ("publish-title", "publish-close", "publish-warning", "publish-warning-text",
+              "publish-body", "publish-install", "publish-install-btn", "publish-install-status",
+              "publish-install-cmd", "publish-install-copy", "publish-auto", "publish-form",
+              "publish-ttl", "publish-consent", "publish-live", "publish-v-starting",
+              "publish-v-live", "publish-v-expired", "publish-v-failed", "publish-url",
+              "publish-countdown", "publish-soon", "publish-failed-msg", "publish-foot",
+              "publish-error", "publish-foot-form", "publish-start", "publish-start-why",
+              "publish-foot-live", "publish-stop", "publish-renew", "publish-copy",
+              "publish-renew-confirm", "publish-renew-yes", "publish-renew-no",
+              "publish-foot-expired", "publish-expired-renew", "publish-foot-failed",
+              "publish-failed-retry", "publish-say"):
+        assert 'id="%s"' % i in DIALOG, i
 
 
-def test_the_panel_is_a_labelled_non_modal_dialog_in_flow():
-    head = _between('<section class="publish-panel"', ">")
-    assert 'role="dialog"' in head and 'aria-modal="false"' in head
-    assert 'aria-labelledby="publish-title"' in head and "hidden" in head
-    # In flow: between the tab/bar row and the frame, never a floating popover.
-    assert HTML.index('<section class="publish-panel"') < HTML.index('<div class="preview-frame-wrap">')
-    assert HTML.index('<section class="publish-panel"') > HTML.index('id="preview-bar"')
-    css = CSS[CSS.index(".publish-panel{"):]
-    css = css[:css.index("}")]
-    assert "position:absolute" not in css and "position:fixed" not in css
+def test_it_is_a_native_modal_dialog_named_and_described():
+    head = _between('<dialog class="publish-dialog"', ">")
+    assert 'id="publish-dialog"' in head
+    assert 'aria-labelledby="publish-title"' in head and 'aria-describedby="publish-warning-text"' in head
+    assert "hidden" not in head and "role=" not in head, "the element is the dialog; closed = not [open]"
+    title = _between('<h2 class="publish-title"', "</h2>", DIALOG)
+    assert 'id="publish-title"' in title and 'tabindex="-1"' in title and ">Publish online" in title
+    x = _between('<button class="btn ghost publish-x" id="publish-close"', "</button>", DIALOG)
+    assert 'aria-label="Close"' in x and "<svg" in x and 'aria-hidden="true"' in x
+    # header, a body that scrolls, a footer -- as divs: the page styles <header>/<footer>
+    assert DIALOG.index('class="pub-dlg-head"') < DIALOG.index('class="pub-dlg-body"') \
+        < DIALOG.index('class="pub-dlg-foot"')
+    assert "<header" not in DIALOG and "<footer" not in DIALOG
+    # opened modally, and moved where no hidden ancestor can swallow it
+    assert "dlg.showModal()" in JS and "dlg.close()" in JS
+    assert "if (dlg.parentNode !== document.body) document.body.appendChild(dlg);" in JS
+    # the old in-flow panel is gone, markup, style and script
+    assert "publish-panel" not in HTML and 'aria-modal="false"' not in DIALOG
+
+
+def test_esc_backdrop_and_the_x_close_it_and_focus_goes_back():
+    assert "closeBtn.addEventListener('click', function(){ setOpen(false, true); });" in JS
+    assert "dlg.addEventListener('cancel'" in JS and "e.preventDefault(); keepLink();" in JS
+    assert "dlg.addEventListener('close'" in JS and "btn.focus()" in JS
+    assert "downOnBackdrop = e.target === dlg" in JS
+    assert "var outside = e.target === dlg && downOnBackdrop;" in JS
+    assert "titleEl.focus()" in JS                         # where focus lands on open
 
 
 def test_the_warning_is_always_visible_and_says_the_three_things():
-    warn = _between('id="publish-warning"', "</div>", PANEL)
+    warn = _between('id="publish-warning"', "</div>", DIALOG)
     assert ("Anyone with the link can open this app. Don't publish apps that show private data. "
             "The link closes by itself when the timer reaches 0:00.") in warn
     assert "hidden" not in warn.split(">")[0], "the warning must not be toggled away"
+    assert 'id="publish-warning-text"' in warn
 
 
 def test_the_tick_box_gates_the_publish_button():
-    assert "I understand anyone with the link can open this app" in PANEL
-    box = _between('<input type="checkbox" id="publish-consent"', ">", PANEL)
+    assert "I understand anyone with the link can open this app" in DIALOG
+    box = _between('<input type="checkbox" id="publish-consent"', ">", DIALOG)
     assert "required" in box
-    assert '<label class="publish-consent" for="publish-consent">' in PANEL
-    start = _between('<button class="btn primary" id="publish-start"', ">", PANEL)
+    assert '<label class="publish-consent" for="publish-consent">' in DIALOG
+    start = _between('<button class="btn primary" id="publish-start"', ">", DIALOG)
     assert " disabled" in start, "closed until the box is ticked"
     # ...and the script keeps it closed for the same reason.
     assert "!consent.checked ? 'Tick the box above to continue.'" in JS
@@ -135,36 +225,55 @@ def test_the_tick_box_gates_the_publish_button():
 
 
 def test_install_offer_is_an_explicit_click_that_says_what_it_does():
-    assert "downloads the official release from Cloudflare and verifies its checksum" in PANEL
-    assert 'id="publish-install-btn" type="button">Install cloudflared<' in PANEL
+    assert "downloads the official release from Cloudflare and verifies its checksum" in DIALOG
+    assert 'id="publish-install-btn" type="button">Install cloudflared<' in DIALOG
     assert "installBtn.addEventListener('click', doInstall)" in JS       # never automatic
     assert "winget install --id Cloudflare.cloudflared" in JS and "brew install cloudflared" in JS
     assert "Install failed: " in JS and "cf.install_error" in JS and "cf.installing" in JS
 
 
 def test_the_ttl_select_and_labelled_choices():
-    sel = _between('<label for="publish-ttl">', "</select>", PANEL)
+    sel = _between('<label for="publish-ttl">', "</select>", DIALOG)
     assert "Keep the link open for" in sel
     assert "ttlChoices()" in JS and "default_ttl_minutes" in JS and "ttl_choices" in JS
 
 
-def test_live_view_has_url_copy_countdown_stop_new_link():
-    live = _between('id="publish-v-live"', 'id="publish-v-expired"', PANEL)
-    anchor = _between('<a id="publish-url"', ">", live)
+def test_live_view_and_footer_rows():
+    live = _between('id="publish-v-live"', 'id="publish-v-expired"', DIALOG)
+    anchor = _between('<a class="publish-url" id="publish-url"', ">", live)
     assert 'target="_blank"' in anchor and 'rel="noopener noreferrer"' in anchor
     timer = _between('<span class="publish-countdown"', ">", live)
     assert 'role="timer"' in timer and 'aria-live="off"' in timer and 'aria-labelledby=' in timer
-    assert ">Copy link<" in live and ">Stop<" in live and ">New link<" in live
     assert "Closing soon" in live
-    assert "Make a new link? The old link stops working right away." in live
-    assert "Link expired" in PANEL and ">Generate new link<" in PANEL
-    assert ">Try again<" in PANEL
+    # the footer: the primary action is the last (right-most) button of its row
+    row = _between('id="publish-foot-live"', "</div>", DIALOG)
+    assert row.index(">Stop publishing<") < row.index(">New link<") < row.index(">Copy link<")
+    assert '<button class="btn primary" id="publish-copy"' in row and "publish-lead" in row
+    form = _between('id="publish-foot-form"', "</div>", DIALOG)
+    assert form.index('id="publish-start-why"') < form.index('id="publish-start"')
+    ask = _between('id="publish-renew-confirm"', 'id="publish-foot-expired"', DIALOG)
+    assert "Make a new link? The old link stops working right away." in ask
+    assert ask.index(">Keep this link<") < ask.index(">Make new link<")
+    assert "Link expired" in DIALOG and ">Generate new link<" in DIALOG
+    assert ">Try again<" in DIALOG
+    # Stop publishing also cancels a tunnel that is still starting
+    assert "setHidden(fLive, !(live || v === 'starting') || !confirmBox.hidden);" in JS
 
 
 def test_the_countdown_words_are_not_colour_alone():
-    # "closing soon" is text on the panel AND on the button label.
+    # "closing soon" is text in the dialog AND on the button label.
     assert "'Closing soon'" in JS and "setHidden(soonTag, !soon)" in JS
     assert "countdown.classList.toggle('is-soon', soon)" in JS
+
+
+def test_the_fake_dom_parents_match_the_markup():
+    up = _ancestors()
+    for child, parent in PARENT.items():
+        assert parent in up[child], (child, parent, up.get(child))
+    # everything the script hides sits inside the dialog, under its body or footer
+    for i in PARENT:
+        assert "publish-dialog" in up[i], i
+    assert up["publish-say"][0] == "publish-dialog"
 
 
 # --------------------------------------------------------------------------- #
@@ -223,32 +332,68 @@ def test_timers_stop_when_things_settle_or_the_page_goes():
         "the countdown must not trust this computer's wall clock"
 
 
-def test_escape_closes_and_returns_focus():
-    assert "e.key !== 'Escape'" in JS and "btn.focus()" in JS
-    assert "titleEl.focus()" in JS
-
-
 # --------------------------------------------------------------------------- #
-# CSS: tokens only, touch targets, no horizontal scroll, reduced motion
+# CSS: tokens only, a window on a desktop, a sheet on a phone, reduced motion
 # --------------------------------------------------------------------------- #
+
+def _rule(selector, src=CSS):
+    i = src.index(selector + "{")
+    return src[i:src.index("}", i)]
+
 
 def test_every_colour_in_the_publish_css_is_a_theme_token():
     assert not re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(", CSS), "hard-coded colour"
-    assert "var(--ok-text)" in CSS and "var(--warn-text)" in CSS and "var(--danger-text)" in CSS
+    for token in ("var(--surface)", "var(--scrim)", "var(--ok-text)", "var(--warn-text)",
+                  "var(--danger-text)", "var(--info-text)"):
+        assert token in CSS, token
 
 
-def test_touch_targets_are_44_rendered_px_and_nothing_scrolls_sideways():
-    assert "--pub-tap:calc(44px / var(--ui-scale, .8))" in CSS      # the root is zoomed
-    assert ".publish-panel .btn{ min-height:var(--pub-tap)" in CSS
-    assert ".publish-consent{" in CSS and "min-height:var(--pub-tap)" in CSS
-    coarse = _between("@media (pointer:coarse), (max-width:640px){", "@media (prefers-reduced-motion")
+def test_a_closed_dialog_stays_closed():
+    """display:flex on the bare class would beat the browser's
+    dialog:not([open]){display:none} and show a closed dialog."""
+    assert "display:" not in _rule(".publish-dialog")
+    assert ".publish-dialog[open]{ display:flex; flex-direction:column;" in CSS
+
+
+def test_desktop_is_a_centred_window_sized_in_percentages():
+    box = _rule(".publish-dialog")
+    assert "width:min(560px, calc(100% - 2 * var(--pub-gutter)))" in box
+    assert "max-height:85%" in box and "margin:auto" in box and "position:fixed" in box
+    assert "--pub-tap:calc(44px / var(--ui-scale, .8))" in box          # 44 RENDERED px
+    assert "--pub-gutter:calc(16px / var(--ui-scale, .8))" in box
+    # vw / vh / dvh resolve unzoomed and then shrink with html{zoom:.8}
+    assert not re.search(r"\d(?:[dsl])?v[hw]\b", CSS)
+    body = _rule(".pub-dlg-body")
+    assert "overflow-y:auto" in body and "min-height:0" in body and "overscroll-behavior:contain" in body
+    assert "flex:none" in _rule(".pub-dlg-foot") and "flex:none" in _rule(".pub-dlg-head")
+    assert "justify-content:flex-end" in _rule(".publish-row")
+
+
+def test_a_phone_gets_a_full_width_bottom_sheet_with_44_px_targets():
+    sheet = _between("@media (max-width:640px){", "@media (prefers-reduced-motion", CSS)
+    assert ".publish-dialog{ width:100%; max-height:90%; margin:auto 0 0;" in sheet
+    assert "border-radius:16px 16px 0 0" in sheet
+    assert "env(safe-area-inset-bottom, 0px) / var(--ui-scale, .8)" in sheet
+    assert ".publish-dialog select{ font-size:calc(16px / var(--ui-scale, .8)); }" in sheet  # no iOS zoom
+    assert ".publish-row .btn{ flex:1 1 auto; }" in sheet
+    assert ".publish-dialog .btn{ min-height:var(--pub-tap)" in CSS
+    assert "width:var(--pub-tap)" in _rule(".publish-dialog .publish-x")
+    assert "min-height:var(--pub-tap)" in _rule(".publish-consent")
+    assert "min-height:var(--pub-tap)" in _rule(".publish-url")
+    coarse = _between("@media (pointer:coarse), (max-width:640px){", "}", CSS)
     assert ".preview-publish{ min-height:calc(44px / var(--ui-scale, .8))" in coarse
-    assert "overflow-wrap:anywhere" in CSS and "word-break:break-all" in CSS
-    assert ".publish-panel select{ width:100%; min-width:0; max-width:100%" in CSS
+    # long text wraps instead of pushing the sheet sideways
+    for sel in (".publish-url", ".publish-cmd code", ".publish-err", ".publish-title"):
+        assert "overflow-wrap:anywhere" in _rule(sel), sel
+    assert "width:100%; min-width:0; max-width:100%" in _rule(".publish-dialog select")
 
 
-def test_motion_is_reduced_on_request_and_the_page_keeps_its_focus_ring():
+def test_motion_is_short_and_off_on_request_and_the_focus_ring_stays():
+    m = re.search(r"animation:pub-in \.(\d+)s ease-out", CSS)
+    assert m and 150 <= int(m.group(1)) * 10 ** (3 - len(m.group(1))) <= 200
+    assert "@keyframes pub-in{ from{ opacity:0; transform:translateY(" in CSS
     rm = CSS[CSS.index("@media (prefers-reduced-motion:reduce){"):]
+    assert ".publish-dialog[open], .publish-dialog[open]::backdrop{ animation:none; }" in rm
     assert "transition:none" in rm
     assert ":focus-visible{outline:2px solid var(--accent)" in HTML      # global ring; nothing here removes it
     assert not re.search(r"outline\s*:\s*(none|0)", CSS)
@@ -291,27 +436,42 @@ def _ratio(a, b):
     return (hi + 0.05) / (lo + 0.05)
 
 
+def test_the_primary_buttons_use_the_green_that_carries_their_text():
+    """The dashboard's own light primary (white on --accent-dim) is 3.3:1; the
+    dialog's primary buttons take the darker green in the light theme."""
+    assert ".btn.primary{background:var(--accent-dim);border-color:var(--accent-dim);color:var(--on-accent)}" in HTML
+    assert ':root[data-theme="light"] .publish-dialog .btn.primary{ background:var(--accent-strong);' in CSS
+    assert ':root[data-theme="light"] .publish-dialog .btn.primary:hover{ background:var(--ok-text);' in CSS
+
+
 @pytest.mark.parametrize("theme", ["dark", "light"])
 def test_every_publish_text_pair_meets_aa(theme):
     t = _theme(theme)
     T = lambda k: _rgba(t[k])                                   # noqa: E731
-    surf, s2 = T("surface"), T("surface-2")
-    warn_box = _over(T("warn-soft"), s2)
+    surf, s2, s3, inset = T("surface"), T("surface-2"), T("surface-3"), T("bg-inset")
+    primary = T("accent-strong") if theme == "light" else T("accent-dim")
+    primary_hover = T("ok-text") if theme == "light" else T("accent")
     pairs = {
-        "panel text": (T("text"), s2),
-        "panel hint text": (T("text-dim"), s2),
-        "warning text": (T("text"), warn_box),
-        "warning label": (T("warn-text"), warn_box),
-        "countdown": (T("text"), s2),
-        "countdown, last minutes": (T("warn-text"), s2),
-        "closing soon tag": (T("warn-text"), warn_box),
+        "dialog text": (T("text"), surf),
+        "dialog hint text": (T("text-dim"), surf),
+        "install card text": (T("text-dim"), s2),
+        "install card link": (T("info-text"), s2),
+        "warning text": (T("text"), _over(T("warn-soft"), surf)),
+        "warning label": (T("warn-text"), _over(T("warn-soft"), surf)),
+        "countdown": (T("text"), surf),
+        "countdown, last minutes": (T("warn-text"), surf),
+        "closing soon tag": (T("warn-text"), _over(T("warn-soft"), surf)),
+        "public link": (T("info-text"), inset),
+        "command": (T("code-text"), inset),
+        "error text": (T("danger-text"), _over(T("danger-soft"), surf)),
+        "stop publishing": (T("danger-text"), surf),
+        "plain button": (T("text"), s2),
+        "close button, hover": (T("text"), s3),
+        "select": (T("text"), s2),
+        "primary button": (T("on-accent"), primary),
+        "primary button, hover": (T("on-accent"), primary_hover),
         "button badge, live": (T("ok-text"), _over(T("accent-soft"), surf)),
         "button badge, closing soon": (T("warn-text"), _over(T("warn-soft"), surf)),
-        "error text": (T("danger-text"), _over(T("danger-soft"), s2)),
-        "link": (T("info-text"), s2),
-        "command": (T("code-text"), T("bg-inset")),
-        "select": (T("text"), surf),
-        "renew confirm": (T("text"), surf),
     }
     low = {k: round(_ratio(*v), 2) for k, v in pairs.items() if _ratio(*v) < 4.5}
     assert not low, "%s theme under 4.5:1: %s" % (theme, low)
@@ -320,6 +480,7 @@ def test_every_publish_text_pair_meets_aa(theme):
 # --------------------------------------------------------------------------- #
 # The pure helpers, run for real
 # --------------------------------------------------------------------------- #
+
 
 def _run_node(script_body, prelude):
     d = tempfile.mkdtemp()
@@ -417,6 +578,7 @@ def test_labels_urls_commands_and_picks(pure):
 HARNESS = r"""
 const fs = require('fs');
 const code = fs.readFileSync(process.argv[2], 'utf8');
+const PARENT = JSON.parse(process.argv[3]);
 const flush = () => new Promise(r => setImmediate(r));
 
 class El {
@@ -434,17 +596,28 @@ class El {
   getAttribute(k){ return k in this.attrs ? this.attrs[k] : null; }
   addEventListener(t, fn){ (this.l[t] = this.l[t] || []).push(fn); }
   fire(t, e){ (this.l[t] || []).forEach(f => f(e || {})); }
-  click(){ this.fire('click'); }
+  click(){ this.fire('click', {target: this}); }
   focus(){ this.env.focused = this.id; }
-  appendChild(c){ this.children.push(c); return c; }
+  appendChild(c){ this.children.push(c); c.parentNode = this; return c; }
   removeChild(c){ this.children = this.children.filter(x => x !== c); }
   get firstChild(){ return this.children[0] || null; }
   has(c){ return this._cls.has(c); }
+  // <dialog>: like a browser, the close event comes a task later.
+  showModal(){ if (this.open) throw new Error('InvalidStateError'); this.open = true; this.env.modals++; }
+  close(){ if (!this.open) return; this.open = false; setImmediate(() => this.fire('close', {})); }
+  // only the dialog holds anything; its controls are the publish-* ids (the outside region excepted)
+  contains(x){ return this.id === 'publish-dialog' && !!x && x.id.indexOf('publish-') === 0 && x.id !== 'publish-announce'; }
+  closest(sel){
+    if (sel !== '[hidden]') throw new Error('unsupported selector ' + sel);
+    for (let n = this; n; n = PARENT[n.id] ? this.env.el(PARENT[n.id]) : null) if (n.hidden) return n;
+    return null;
+  }
 }
 
 function makeEnv(){
   let now = 0, nextId = 1, timers = [];
-  const env = { calls: [], toasts: [], copies: [], els: {}, focused: null, docL: {}, winL: {}, handler: null };
+  const env = { calls: [], toasts: [], copies: [], els: {}, focused: null, docL: {}, winL: {}, handler: null,
+                modals: 0 };
   const setI = (fn, ms) => { const t = {id: nextId++, at: now + ms, every: ms, fn}; timers.push(t); return t.id; };
   const setT = (fn, ms) => { const t = {id: nextId++, at: now + (ms || 0), every: 0, fn}; timers.push(t); return t.id; };
   const clr = id => { timers = timers.filter(t => t.id !== id); };
@@ -465,8 +638,25 @@ function makeEnv(){
   };
   env.el = id => env.els[id] || (env.els[id] = new El(id, env));
   const $ = sel => env.el(sel.replace(/^#/, ''));
-  const doc = { hidden: false, createElement: () => new El('opt', env),
-                addEventListener(t, fn){ env.docL[t] = fn; } };
+  const body = new El('body', env);
+  const doc = { hidden: false, body: body, createElement: () => new El('opt', env),
+                addEventListener(t, fn){ env.docL[t] = fn; },
+                get activeElement(){ return env.focused ? env.el(env.focused) : body; } };
+  env.body = body;
+  // Esc: the browser fires a cancelable "cancel" and closes unless it was prevented.
+  env.esc = async function(){
+    const d = env.el('publish-dialog'), ev = {defaultPrevented: false, preventDefault(){ this.defaultPrevented = true; }};
+    d.fire('cancel', ev);
+    if (!ev.defaultPrevented) d.close();
+    await flush();
+  };
+  // A press: pointerdown on `down`, release (click) on `up` -- the click goes to their common ancestor.
+  env.press = async function(down, up){
+    const d = env.el('publish-dialog');
+    d.fire('pointerdown', {target: env.el(down)});
+    d.fire('click', {target: env.el(up)});
+    await flush();
+  };
   const win = { addEventListener(t, fn){ env.winL[t] = fn; } };
   const api = (path, opts) => {
     env.calls.push({path: path, method: opts && opts.method, body: opts && opts.body});
@@ -522,9 +712,11 @@ const txt = (e, id) => e.el(id).textContent;
     a.endLabel = txt(e, 'preview-publish-label'); a.expiredShown = !e.el('publish-v-expired').hidden;
     a.liveHidden = e.el('publish-v-live').hidden; a.endSay = txt(e, 'publish-announce');
     a.endIntervals = e.intervals();
+    a.neverOpened = e.modals === 0 && !e.el('publish-dialog').open;
+    a.inBody = e.el('publish-dialog').parentNode === e.body;
     e.publish.detach();
     a.afterDetach = {label: txt(e, 'preview-publish-label'), aria: e.el('preview-publish').getAttribute('aria-disabled'),
-                     intervals: e.intervals(), panelHidden: e.el('publish-panel').hidden};
+                     intervals: e.intervals(), dialogOpen: !!e.el('publish-dialog').open};
   }
 
   // B: publish flow -> consent gate, request body, starting poll, live, polling stops
@@ -542,21 +734,28 @@ const txt = (e, id) => e.el(id).textContent;
     b.aria = e.el('preview-publish').getAttribute('aria-disabled');
     b.formShown = !e.el('publish-form').hidden;
     e.el('preview-publish').click(); await flush();
-    b.panelOpen = !e.el('publish-panel').hidden; b.expanded = e.el('preview-publish').getAttribute('aria-expanded');
+    b.dialogOpen = !!e.el('publish-dialog').open; b.modals = e.modals;
     b.focus = e.focused;
     b.disabled0 = e.el('publish-start').disabled; b.why0 = txt(e, 'publish-start-why');
+    b.footForm = !e.el('publish-foot-form').hidden && e.el('publish-foot-live').hidden;
     e.el('publish-consent').checked = true; e.el('publish-consent').fire('change');
     b.disabled1 = e.el('publish-start').disabled;
     e.started = true;
+    e.el('publish-start').focus();                   // a keyboard user presses it
     e.el('publish-start').click(); await flush();
     const post = e.calls.filter(c => c.method === 'POST')[0];
     b.post = post; b.consentAfter = e.el('publish-consent').checked;
     b.startingShown = !e.el('publish-v-starting').hidden; b.btnLabel = txt(e, 'preview-publish-label');
+    b.focusAfterStart = e.focused;                   // its row went away: focus stays in the dialog
+    b.startingFoot = {form: e.el('publish-foot-form').hidden, live: !e.el('publish-foot-live').hidden,
+                      stop: !e.el('publish-stop').hidden, copy: e.el('publish-copy').hidden,
+                      renew: e.el('publish-renew').hidden};
     b.pollOn = e.intervals();
     await e.advance(1500); b.stillStarting = !e.el('publish-v-starting').hidden;
     await e.advance(1500); b.liveShown = !e.el('publish-v-live').hidden;
     b.countdown = txt(e, 'publish-countdown');
-    await e.advance(100); b.say = txt(e, 'publish-announce');
+    await e.advance(100); b.say = txt(e, 'publish-say'); b.sayOutside = txt(e, 'publish-announce');
+    b.liveFoot = !e.el('publish-copy').hidden && !e.el('publish-renew').hidden && !e.el('publish-foot-live').hidden;
     b.intervalsLive = e.intervals();
     const g0 = e.gets(); await e.advance(10000); b.extraGets = e.gets() - g0;
   }
@@ -571,7 +770,7 @@ const txt = (e, id) => e.el(id).textContent;
     c.aria = e.el('preview-publish').getAttribute('aria-disabled'); c.title = e.el('preview-publish').title;
     c.why = txt(e, 'preview-publish-why');
     e.el('preview-publish').click(); await flush();
-    c.toasts = e.toasts; c.panelHidden = e.el('publish-panel').hidden;
+    c.toasts = e.toasts; c.dialogOpen = !!e.el('publish-dialog').open;
     e.publish.previewState(true, 5801);
     c.ariaOn = e.el('preview-publish').getAttribute('aria-disabled');
   }
@@ -629,13 +828,18 @@ const txt = (e, id) => e.el(id).textContent;
     e.el('preview-publish').click(); await flush();
     const f = R.F = {};
     e.el('publish-renew').click(); f.confirmShown = !e.el('publish-renew-confirm').hidden; f.focusYes = e.focused;
+    f.liveRowWhileAsking = e.el('publish-foot-live').hidden;
     e.el('publish-renew-no').click(); f.confirmHidden = e.el('publish-renew-confirm').hidden; f.focusBack = e.focused;
+    e.el('publish-renew').click(); await e.esc();          // Esc backs out of the question first
+    f.escAnswer = {asking: !e.el('publish-renew-confirm').hidden, open: !!e.el('publish-dialog').open,
+                   focus: e.focused, liveRow: !e.el('publish-foot-live').hidden};
     f.noCall = e.calls.filter(c => c.method === 'POST').length;
-    e.el('publish-renew').click(); e.el('publish-renew-yes').click(); await flush();
+    e.el('publish-renew').click(); e.el('publish-renew-yes').focus(); e.el('publish-renew-yes').click(); await flush();
     f.post = e.calls.filter(c => c.method === 'POST')[0];
     f.startingShown = !e.el('publish-v-starting').hidden; f.liveHidden = e.el('publish-v-live').hidden;
     f.hrefStillOld = e.el('publish-url').getAttribute('href');
-    f.say = txt(e, 'publish-announce');
+    f.focusAfter = e.focused;
+    await e.advance(100); f.say = txt(e, 'publish-say');
   }
 
   // G: a late answer for the project we left changes nothing
@@ -652,21 +856,30 @@ const txt = (e, id) => e.el(id).textContent;
     R.G = {label: txt(e, 'preview-publish-label'), intervals: e.intervals(), liveHidden: e.el('publish-v-live').hidden};
   }
 
-  // H: keyboard and the Files tab
+  // H: open, the Files tab, Esc, the X, the backdrop, and a drag out of the content
   {
     const e = makeEnv();
     e.handler = () => status([]);
     e.publish.attach('/p'); e.publish.previewState(true, 5801); await flush();
+    const d = e.el('publish-dialog');
     e.el('preview-publish').click(); await flush();
-    const h = R.H = {open: !e.el('publish-panel').hidden, focus: e.focused};
-    e.publish.paneVisible(false);
-    h.filesHidden = e.el('publish-panel').hidden; h.filesExpanded = e.el('preview-publish').getAttribute('aria-expanded');
-    e.publish.paneVisible(true); h.backShown = !e.el('publish-panel').hidden;
-    let stopped = false;
-    e.el('publish-panel').fire('keydown', {key: 'Escape', stopPropagation(){ stopped = true; }});
-    h.escHidden = e.el('publish-panel').hidden; h.escFocus = e.focused; h.escStopped = stopped;
+    const h = R.H = {open: !!d.open, focus: e.focused, modals: e.modals};
+    e.publish.paneVisible(false); await flush();
+    h.filesClosed = !d.open; h.filesFocus = e.focused;
+    e.publish.paneVisible(true); h.notReopened = !d.open;
     e.el('preview-publish').click(); await flush();
-    e.el('publish-close').click(); h.closeFocus = e.focused;
+    await e.esc();
+    h.escClosed = !d.open; h.escFocus = e.focused;
+    e.el('preview-publish').click(); await flush();
+    e.el('publish-close').click(); await flush();
+    h.xClosed = !d.open; h.xFocus = e.focused;
+    e.el('preview-publish').click(); await flush();
+    await e.press('publish-url', 'publish-dialog');        // a drag from the link text out to the backdrop
+    h.dragKept = !!d.open;
+    await e.press('publish-dialog', 'publish-dialog');     // a press on the backdrop
+    h.backdropClosed = !d.open; h.backdropFocus = e.focused;
+    e.el('preview-publish').click(); await flush();
+    h.reopened = !!d.open; h.reopenFocus = e.focused; h.modalsAfter = e.modals;
   }
 
   // I: a failed tunnel -> plain error, Try again returns to the form (and asks for the tick again)
@@ -722,6 +935,25 @@ const txt = (e, id) => e.el(id).textContent;
                formHidden: e2.el('publish-form').hidden, polling: e2.intervals()};
   }
 
+  // L: the badge ticks with the dialog closed; each announcement goes where it can be heard
+  {
+    const e = makeEnv();
+    e.handler = () => {
+      const left = Math.max(0, 301 - e.now() / 1000);
+      return status([tunnel({remaining_seconds: left, state: left > 0 ? 'live' : 'expired'})]);
+    };
+    e.publish.attach('/p'); await flush();
+    e.el('preview-publish').click(); await flush();
+    await e.advance(2000); await e.advance(100);           // 5:00 passes with the dialog open
+    const l = R.L = {inside5: txt(e, 'publish-say'), outside5: txt(e, 'publish-announce')};
+    e.el('publish-close').click(); await flush();
+    const t0 = txt(e, 'preview-publish-time');
+    await e.advance(3000);
+    l.ticking = [t0, txt(e, 'preview-publish-time')];
+    await e.advance(240000); await e.advance(100);         // 1:00 passes with it closed
+    l.outside1 = txt(e, 'publish-announce');
+  }
+
   console.log(JSON.stringify(R));
 })().catch(e => { console.error(e); process.exit(1); });
 """
@@ -736,7 +968,8 @@ def run():
     io.open(code_path, "w", encoding="utf-8").write(JS)
     harness = os.path.join(d, "harness.js")
     io.open(harness, "w", encoding="utf-8").write(HARNESS)
-    out = subprocess.run([_node(), harness, code_path], capture_output=True, text=True, encoding="utf-8", timeout=180)
+    out = subprocess.run([_node(), harness, code_path, json.dumps(PARENT)],
+                         capture_output=True, text=True, encoding="utf-8", timeout=180)
     assert out.returncode == 0, (out.stdout + out.stderr)[-2000:]
     return json.loads(out.stdout)
 
@@ -769,23 +1002,35 @@ def test_at_zero_it_expires_and_every_timer_stops(run):
 
 def test_leaving_the_project_clears_the_timers_and_the_badge(run):
     d = run["A"]["afterDetach"]
-    assert d == {"label": "Publish", "aria": "true", "intervals": 0, "panelHidden": True}
+    assert d == {"label": "Publish", "aria": "true", "intervals": 0, "dialogOpen": False}
+
+
+def test_the_badge_and_its_timers_need_no_open_dialog(run):
+    a = run["A"]
+    assert a["neverOpened"] is True, "scenario A ran start to expiry with the dialog shut"
+    assert a["inBody"] is True, "the dialog is moved under <body> when the module starts"
 
 
 def test_publish_flow_is_gated_then_polls_until_settled(run):
     b = run["B"]
     assert b["aria"] == "false" and b["formShown"] is True
-    assert b["panelOpen"] is True and b["expanded"] == "true" and b["focus"] == "publish-title"
+    assert b["dialogOpen"] is True and b["modals"] == 1 and b["focus"] == "publish-title"
     assert b["disabled0"] is True and b["why0"] == "Tick the box above to continue."
+    assert b["footForm"] is True
     assert b["disabled1"] is False
     assert b["post"]["path"] == "/api/publish/start"
     assert b["post"]["body"] == {"project_dir": "/p", "ttl_minutes": 60, "confirm": True, "port": 5801}
     assert b["consentAfter"] is False
     assert b["startingShown"] is True and b["btnLabel"] == "Starting…"
+    assert b["focusAfterStart"] == "publish-title", "the pressed button's row went away; focus stays inside"
+    # while it starts, the footer offers only Stop publishing
+    assert b["startingFoot"] == {"form": True, "live": True, "stop": True, "copy": True, "renew": True}
     assert b["pollOn"] == 1
     assert b["stillStarting"] is True and b["liveShown"] is True
     assert b["countdown"] == "59:57"       # 3600 s minus the 3 s the fake clock ran before the answer
-    assert b["say"] == "Your app is published. The link is in the panel."
+    assert b["say"] == "Your app is published. The link is ready."
+    assert b["sayOutside"] == "", "with the dialog open, the inert page behind it is not where it speaks"
+    assert b["liveFoot"] is True
     assert b["intervalsLive"] == 2, "the 1.5 s poll stops the moment the tunnel is live"
     assert b["extraGets"] == 0
 
@@ -794,7 +1039,7 @@ def test_without_a_preview_the_button_explains_instead_of_opening(run):
     c = run["C"]
     assert c["aria"] == "true" and c["title"] == "Start the preview first"
     assert c["why"] == "Start the preview first"
-    assert c["toasts"] == ["Start the preview first"] and c["panelHidden"] is True
+    assert c["toasts"] == ["Start the preview first"] and c["dialogOpen"] is False
     assert c["ariaOn"] == "false"
 
 
@@ -821,22 +1066,38 @@ def test_errors_are_said_in_plain_words(run):
 def test_new_link_asks_first_and_keeps_the_length(run):
     f = run["F"]
     assert f["confirmShown"] is True and f["focusYes"] == "publish-renew-no"      # safe choice has focus
+    assert f["liveRowWhileAsking"] is True, "the question replaces the action row"
     assert f["confirmHidden"] is True and f["focusBack"] == "publish-renew" and f["noCall"] == 0
+    assert f["escAnswer"] == {"asking": False, "open": True, "focus": "publish-renew", "liveRow": True}
     assert f["post"]["path"] == "/api/publish/renew"
     assert f["post"]["body"] == {"id": "t1", "ttl_minutes": 60}
     assert f["startingShown"] is True and f["liveHidden"] is True
+    assert f["focusAfter"] == "publish-title"
+    assert f["say"] == "A new link is being made. The old link no longer works."
 
 
 def test_a_late_answer_for_the_old_project_is_ignored(run):
     assert run["G"] == {"label": "Publish", "intervals": 0, "liveHidden": True}
 
 
-def test_keyboard_and_the_files_tab(run):
+def test_open_close_and_where_focus_goes(run):
     h = run["H"]
-    assert h["open"] is True and h["focus"] == "publish-title"
-    assert h["filesHidden"] is True and h["filesExpanded"] == "false" and h["backShown"] is True
-    assert h["escHidden"] is True and h["escFocus"] == "preview-publish" and h["escStopped"] is True
-    assert h["closeFocus"] == "preview-publish"
+    assert h["open"] is True and h["modals"] == 1 and h["focus"] == "publish-title"
+    # the Files tab hides the button: the dialog closes without sending focus to it
+    assert h["filesClosed"] is True and h["filesFocus"] != "preview-publish" and h["notReopened"] is True
+    assert h["escClosed"] is True and h["escFocus"] == "preview-publish"
+    assert h["xClosed"] is True and h["xFocus"] == "preview-publish"
+    assert h["dragKept"] is True, "a drag that ends on the backdrop is not a press on it"
+    assert h["backdropClosed"] is True and h["backdropFocus"] == "preview-publish"
+    assert h["reopened"] is True and h["reopenFocus"] == "publish-title" and h["modalsAfter"] == 5
+
+
+def test_the_badge_ticks_closed_and_each_warning_is_heard(run):
+    l = run["L"]
+    assert l["inside5"] == "Your public link closes in less than 5 minutes."
+    assert l["outside5"] == ""
+    assert l["ticking"] == [" · 4:59", " · 4:56"]
+    assert l["outside1"] == "Your public link closes in less than 1 minute."
 
 
 def test_a_failed_tunnel_shows_text_and_try_again_asks_for_the_tick_again(run):

@@ -3248,12 +3248,24 @@ both-theme contrast measured from the template's own tokens).
   the button itself reads "Published · 42:10" (the ticking time is
   `aria-hidden`, so the button's name does not change every second); under
   5:00 it reads "Closing soon · 4:12" (words, not only colour).
-- **The panel is IN FLOW** (`#publish-panel`, a non-modal `role="dialog"`
-  between the tab row and the frame), not a floating popover: the preview
-  column has `overflow:hidden` and the root is zoomed (`html{zoom:.8}`), so a
-  positioned popover is clipped or lands in the wrong place. Esc closes it and
-  returns focus to the button; the Files tab hides it with the bar
-  (`publish.paneVisible`). Always visible inside: the warning "Anyone with the
+- **A native modal dialog** (2026-10-10, owner: "open in a POPUP, responsive,
+  clean CSS -- it looks tight in that place"; it was an in-flow panel under the
+  tab row). `<dialog id="publish-dialog">`, opened with `showModal()` from the
+  button in every state (Publish / Starting / Published / Closing soon / Link
+  expired): the top layer is never clipped by the preview column, and Esc, the
+  focus trap and the inert page are the browser's own. The script moves it
+  under `<body>` once: `showModal()` on a dialog with a hidden ancestor leaves
+  an invisible modal over an inert page. Header "Publish online" (`h2`,
+  `tabindex=-1`, takes focus on open; `aria-labelledby` it,
+  `aria-describedby` the warning) + an SVG X; a body that scrolls; a footer
+  with one row per state, the primary action last (right). Esc first backs out
+  of the "new link?" question (`cancel` prevented), then closes; a press that
+  starts AND ends on the backdrop closes (a drag out of the link text does
+  not); the X, Esc and the backdrop all hand focus back to the button. A
+  control that disappears while focused (Publish once the tunnel starts, Stop,
+  the question row) moves focus to the title, never out of the dialog. The
+  Files tab closes it (`publish.paneVisible(false)`, no focus return to the
+  hidden button). Always visible inside: the warning "Anyone with the
   link can open this app. Don't publish apps that show private data. The link
   closes by itself when the timer reaches 0:00."; a TTL `<select>` from
   `limits.ttl_choices` (default preselected); the required tick box "I
@@ -3264,10 +3276,13 @@ both-theme contrast measured from the template's own tokens).
   `installing` / `install_error`) plus the manual command for the platform
   (`darwin` is tested before `win`, since "darwin" contains "win").
 - **States**: `starting` -> "Starting tunnel..." and a 1.5 s poll that stops as
-  soon as nothing is settling; `live` -> https link (`target=_blank
-  rel="noopener noreferrer"`), Copy link, countdown, Stop, New link (asks "Make
+  soon as nothing is settling, with "Stop publishing" in the footer (it also
+  cancels a tunnel that never comes up); `live` -> https link (`target=_blank
+  rel="noopener noreferrer"`), countdown, footer "Stop publishing" (left) /
+  "New link" / "Copy link" (primary, right); New link asks "Make
   a new link? The old link stops working right away." first; focus starts on
-  the safe "Keep this link"; renew keeps the previous length); `expired` ->
+  the safe "Keep this link"; the question replaces the action row; renew keeps
+  the previous length; `expired` ->
   "Link expired" + "Generate new link"; `failed` -> the error in words + "Try
   again" (back to the form, which asks for the tick again; the dismissed
   record is remembered locally because the contract has no delete); `stopped`
@@ -3286,11 +3301,14 @@ both-theme contrast measured from the template's own tokens).
   the page re-reads the status when the tab becomes visible again and every
   30 s while live; at 0:00 it asks the server once, but shows "Link expired"
   at once.
-- **Screen readers**: the countdown is `role="timer" aria-live="off"`. One
-  polite status region (`#publish-announce`, outside the panel so it speaks
-  with the panel closed) announces only: published, 5:00 left ("less than 5
-  minutes"), 1:00 left, expired, failed, stopped, copied. A page opened at 0:40
-  says the one-minute line and skips the stale five-minute one.
+- **Screen readers**: the countdown is `role="timer" aria-live="off"`. Two
+  polite status regions: `#publish-announce` outside the dialog (and outside
+  the bar the Files tab hides) while it is closed, `#publish-say` inside it
+  while it is open -- everything behind a modal is inert, live regions
+  included. They announce only: published, 5:00 left ("less than 5 minutes"),
+  1:00 left, expired, failed, stopped, copied. A page opened at 0:40 says the
+  one-minute line and skips the stale five-minute one. The badge on the
+  button keeps ticking with the dialog closed.
 - **Safety in the DOM**: the markup is written once and the script only toggles
   `hidden` and sets `textContent` (so the select, the tick box and focus
   survive the poll and the tick); backend strings never go through
@@ -3298,14 +3316,28 @@ both-theme contrast measured from the template's own tokens).
   (`pubSafeUrl`; anything else is never made a link); the URL is never written
   to `localStorage` / `sessionStorage` / cookies.
 - **Look**: theme tokens only (no raw colours in the `publish-css` block),
-  existing `.btn` / `.btn.primary` / `.btn.ghost`, inline SVG icons. Panel
-  controls are 44 RENDERED px (`--pub-tap` divides out the root zoom); the bar
-  button grows to 44 on `(pointer:coarse), (max-width:640px)`. URL and command
-  text wrap (`overflow-wrap:anywhere`); the select is `width:100%` over the
-  global 260 px minimum. `prefers-reduced-motion` removes the button
-  transitions and the press scale; no new animation was added. Contrast pairs
-  (text on panel, warning, "closing soon", live badge, error, link, command,
-  select) are measured >= 4.5:1 in both themes by the test.
+  existing `.btn` / `.btn.primary` / `.btn.ghost` / `.btn.danger`, inline SVG
+  icons, `--scrim` backdrop. Desktop: a centred window
+  `min(560px, 100% - 2 x 16 px)`, `max-height:85%`, the body scrolls; phones
+  (<= 640 px): a full-width bottom sheet (`max-height:90%`, top corners
+  rounded, footer padded by `env(safe-area-inset-bottom)`, buttons share the
+  row, the select at 16 rendered px so iOS does not zoom). The root is zoomed
+  (`html{zoom:.8}`) and viewport units resolve unzoomed and then shrink, so
+  screen-relative sizes are PERCENTAGES of the dialog's fixed containing block,
+  never vw/vh/dvh; `--pub-tap` / `--pub-gutter` are 44 / 16 RENDERED px. The
+  dialog's `display:flex` is on `[open]` only (on the bare class it would beat
+  the browser's `dialog:not([open]){display:none}`). The bar button grows to
+  44 on `(pointer:coarse), (max-width:640px)`. URL and command text wrap
+  (`overflow-wrap:anywhere`). Motion: a 180 ms fade + 12 px rise on open, none
+  on close, none at all under `prefers-reduced-motion` (which also drops the
+  button transitions and press scale). The light theme's dashboard-wide
+  `.btn.primary` (white on `--accent-dim`) is 3.3:1, so inside the dialog it
+  takes `--accent-strong` (5.0:1; hover `--ok-text`, 7.1:1). Contrast pairs
+  (dialog text, hints, install card, warning, countdown, "closing soon", link,
+  command, error, Stop publishing, buttons, select, live badge) are measured
+  >= 4.5:1 in both themes by the test. Verified with a static Playwright
+  harness (no hub): every state open and modal, no horizontal overflow at
+  1280x800 or 390x844, every target 44 rendered px.
 - Not decided here, backend side: whether a tunnel is closed when its preview
   stops (the page shows whatever the status says), and whether `renew` accepts
   a `failed` record (the page uses start for that, never renew).
