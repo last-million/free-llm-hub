@@ -156,6 +156,10 @@ def _spy_run_git(calls):
                 rec["askpass_body"] = io.open(ap, encoding="ascii").read()
             except Exception:                                    # noqa: BLE001
                 rec["askpass_body"] = ""
+        hooks = [a.split("=", 1)[1] for a in args if a.startswith("core.hooksPath=")]
+        if hooks:
+            rec["hooks_dir"] = hooks[-1]
+            rec["hooks_empty"] = os.path.isdir(hooks[-1]) and not os.listdir(hooks[-1])
         calls.append(rec)
         return ghpush._real_git(args, cwd=cwd, env=env)
     return run_git
@@ -164,6 +168,9 @@ def _spy_run_git(calls):
 def _gh(tmp_path, http=None, store=None, bare=None, calls=None, **kw):
     bare = bare or _mk_bare(tmp_path)
     calls = calls if calls is not None else []
+    # The stand-in remote is a local path, i.e. git's "file" transport; the hub
+    # itself allows https only.
+    kw.setdefault("allowed_protocols", ("https", "file"))
     return ghpush.GitHub(
         http=http, run_git=_spy_run_git(calls),
         store=store or DictStore(),
@@ -552,6 +559,170 @@ def test_commit_identity_injected_when_the_repo_has_none(tmp_path, monkeypatch):
     args = commit[0]["args"]
     assert "user.name=octocat" in args
     assert "user.email=42+octocat@users.noreply.github.com" in args
+
+
+# --------------------------------------------------------------------------- #
+# Hardening: the project's .git/config and hooks are HOSTILE (2026-10-11).      #
+# --------------------------------------------------------------------------- #
+def _cred_fill(askpass, lines):
+    """Run the generated askpass exactly as git does (git credential fill, no
+    network, no credential helper). Returns (rc, stdout)."""
+    env = dict(os.environ, GIT_ASKPASS=askpass, GH_ASKPASS_TOKEN=TOKEN,
+               GIT_TERMINAL_PROMPT="0")
+    p = subprocess.run(["git", "-c", "credential.helper=", "credential", "fill"],
+                       input="".join(l + "\n" for l in lines) + "\n",
+                       capture_output=True, text=True, env=env, timeout=60)
+    return p.returncode, p.stdout
+
+
+def _sh():
+    """A POSIX sh to execute the script directly: PATH, else Git for Windows'."""
+    import shutil
+    found = shutil.which("sh")
+    if found:
+        return found
+    try:
+        execp = subprocess.run(["git", "--exec-path"], capture_output=True,
+                               text=True, timeout=20).stdout.strip()
+    except Exception:                                            # noqa: BLE001
+        return None
+    for up in (2, 3):
+        root = execp
+        for _ in range(up):
+            root = os.path.dirname(root)
+        cand = os.path.join(root, "usr", "bin", "sh.exe")
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+@requires_git
+def test_askpass_answers_only_for_github_com(tmp_path):
+    script = ghpush.GitHub._write_askpass(str(tmp_path))
+    body = io.open(script, encoding="ascii").read()
+    assert TOKEN not in body and "GH_ASKPASS_TOKEN" in body
+    rc, out = _cred_fill(script, ["protocol=https", "host=github.com"])
+    assert rc == 0
+    assert "username=x-access-token" in out and ("password=" + TOKEN) in out
+    for evil in (["protocol=https", "host=evil.example"],
+                 ["protocol=https", "host=github.com.evil.example"],
+                 ["protocol=https", "host=evil.example", "username=x-access-token"],
+                 ["protocol=https", "host=github.com:8443"],
+                 ["protocol=http", "host=github.com"]):
+        rc, out = _cred_fill(script, evil)
+        assert TOKEN not in out, evil
+        assert rc != 0, evil
+
+
+@requires_git
+def test_askpass_script_executed_directly(tmp_path):
+    sh = _sh()
+    if not sh:
+        pytest.skip("no POSIX sh to run the script directly")
+    script = ghpush.GitHub._write_askpass(str(tmp_path))
+    env = dict(os.environ, GH_ASKPASS_TOKEN=TOKEN)
+
+    def ask(prompt):
+        p = subprocess.run([sh, script, prompt], capture_output=True, text=True,
+                           env=env, timeout=30)
+        return p.stdout.strip()
+    assert ask("Username for 'https://github.com': ") == "x-access-token"
+    assert ask("Password for 'https://x-access-token@github.com': ") == TOKEN
+    assert ask("Username for 'https://evil.example': ") == ""
+    assert ask("Password for 'https://x-access-token@evil.example': ") == ""
+    assert ask("Password for 'https://x-access-token@github.com.evil.example': ") == ""
+    assert ask("Password for 'http://x-access-token@github.com': ") == ""
+
+
+@requires_git
+def test_hardening_flags_on_every_call_and_on_push_fetch(tmp_path):
+    gh, proj, bare, calls, _http = _connected(tmp_path)
+    (proj / "h.txt").write_text("h\n", encoding="utf-8")
+    calls.clear()
+    gh.push(str(proj))
+    gh.sync(str(proj))
+    assert calls
+    for rec in calls:
+        a = rec["args"]
+        assert "core.fsmonitor=false" in a and "credential.helper=" in a, a
+        assert rec.get("hooks_empty") is True, "hooksPath must be an EMPTY private dir"
+        assert rec["env"].get("GIT_ALLOW_PROTOCOL") == "https:file"
+        assert not os.path.exists(rec["hooks_dir"]), "the private dir is removed after"
+    push = [r for r in calls if "push" in r["args"]][-1]["args"]
+    fetch = [r for r in calls if "fetch" in r["args"]][-1]["args"]
+    for a in (push, fetch):
+        assert "http.sslVerify=true" in a and "push.gpgSign=false" in a
+    assert "--no-verify" in push
+
+
+def _plant_hooks(dirpath, markers):
+    os.makedirs(dirpath, exist_ok=True)
+    for name in ("pre-push", "reference-transaction", "post-merge"):
+        mk = (markers / name).as_posix()
+        p = os.path.join(dirpath, name)
+        with open(p, "w", newline="\n") as f:
+            f.write('#!/bin/sh\necho "ran:$GH_ASKPASS_TOKEN" > "%s"\nexit 0\n' % mk)
+        os.chmod(p, 0o755)
+
+
+@requires_git
+def test_planted_project_hooks_never_run(tmp_path):
+    gh, proj, bare, _calls, _http = _connected(tmp_path)
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    evil = tmp_path / "evilhooks"                       # outside the project
+    _plant_hooks(str(proj / ".git" / "hooks"), markers)
+    _plant_hooks(str(evil), markers)
+    _raw_git(str(proj), "config", "core.hooksPath", evil.as_posix())
+    # Control: a plain git push in this project DOES run the planted hook.
+    (proj / "c.txt").write_text("c\n", encoding="utf-8")
+    _raw_git(str(proj), "add", "-A")
+    _raw_git(str(proj), "commit", "-m", "control")
+    _raw_git(str(proj), "push", "github", "HEAD:main")
+    if not (markers / "pre-push").exists():
+        pytest.skip("git hooks cannot run on this machine; nothing to prove")
+    for m in markers.iterdir():
+        m.unlink()
+    # The hub's push and sync never run a project hook.
+    (proj / "d.txt").write_text("d\n", encoding="utf-8")
+    gh.push(str(proj))
+    clone = tmp_path / "clone"
+    _raw_git(str(tmp_path), "clone", str(bare), str(clone))
+    (clone / "r.txt").write_text("r\n", encoding="utf-8")
+    _raw_git(str(clone), "add", "-A")
+    _raw_git(str(clone), "commit", "-m", "remote")
+    _raw_git(str(clone), "push", "origin", "HEAD:main")
+    gh.sync(str(proj))
+    assert (proj / "r.txt").exists()
+    assert list(markers.iterdir()) == [], "a project hook ran during the hub's push/sync"
+
+
+@requires_git
+def test_create_refused_before_post_when_secrets_exist(tmp_path):
+    http = FakeHTTP()
+    gh, _c, _b = _gh(tmp_path, http=http)
+    proj = _mk_project(tmp_path, files={"README.md": "hi\n", ".env": "API_KEY=x\n"})
+    with pytest.raises(ghpush.GhError) as e:
+        gh.create_repo(str(proj), "myrepo")
+    assert e.value.code == "secrets_found"
+    assert not [c for c in http.calls if c["method"] == "POST"], \
+        "nothing may be created on GitHub when the scan finds a secret"
+
+
+@requires_git
+def test_the_hub_allows_only_https_transport(tmp_path):
+    """A planted local/ssh/ext remote cannot be used: the hub's default
+    GIT_ALLOW_PROTOCOL is https only (here a local path, i.e. "file")."""
+    bare = _mk_bare(tmp_path)
+    gh = ghpush.GitHub(http=FakeHTTP(), run_git=_spy_run_git([]), store=DictStore())
+    proj = _mk_project(tmp_path)
+    gh._ensure_repo(str(proj))
+    gh._wire_remote(str(proj), str(bare))
+    with pytest.raises(ghpush.GhError) as e:
+        gh.push(str(proj))
+    assert e.value.code == "push_failed"
+    refs = _raw_git(str(bare), "for-each-ref", check=False).stdout.strip()
+    assert refs == "", "nothing may reach a non-https remote"
 
 
 # --------------------------------------------------------------------------- #

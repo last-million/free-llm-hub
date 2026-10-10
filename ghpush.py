@@ -25,12 +25,18 @@ Safety, stated plainly:
     or a remote URL.
   * git auth for push/fetch goes through a GIT_ASKPASS helper in a private 0700
     temp dir that is deleted right after the command; the token reaches it only
-    through an env var, never a command line. Every git call runs with
+    through an env var, never a command line, and the helper answers ONLY the
+    prompts for exactly https://github.com. Every git call runs with
     ``-c credential.helper=`` (empty) and ``GIT_TERMINAL_PROMPT=0`` so NO
     credential manager is ever read or written — this machine's Windows
     Credential Manager holds a different account and must never be touched.
-  * Before any push, a secret scan of what WOULD be committed blocks the push
-    when it finds a secret file or a secret-shaped string.
+  * The project's .git/config and hooks are written by AI agents and treated as
+    HOSTILE: an empty private core.hooksPath, core.fsmonitor=false, only the
+    https transport (GIT_ALLOW_PROTOCOL), http.sslVerify=true, push.gpgSign=false,
+    no submodule recursion and ``push --no-verify`` (see _git).
+  * Before any push — and before "Create & push" creates anything on GitHub —
+    a secret scan of what WOULD be committed blocks when it finds a secret
+    file or a secret-shaped string.
   * The hub's own repo, a too-broad folder (a drive root / home / above it) and
     a symlinked/junction folder are refused.
 
@@ -342,6 +348,36 @@ def _default_remote_url(login, repo):
 _API = "https://api.github.com"
 _COMMIT_MESSAGE = "Update from Calvoun Build"
 
+# On EVERY git call (command-line -c beats the project's hostile .git/config).
+_SAFE_CONFIG = (
+    "credential.helper=",            # empty resets every helper: no credential manager
+    "credential.useHttpPath=false",  # keep askpass prompts in the exact host-only form
+    "core.fsmonitor=false",          # a planted fsmonitor command never runs
+    "submodule.recurse=false",
+)
+# On push/fetch only (the calls that carry the token in the environment).
+_AUTH_CONFIG = (
+    "http.sslVerify=true",
+    "push.gpgSign=false",            # a planted gpg.program never runs during push
+    "fetch.recurseSubmodules=false",
+    "push.recurseSubmodules=no",
+)
+
+# The askpass helper. Exact prompt strings only; anything else prints nothing
+# and fails, so git never sends the token to another host or over http://.
+_ASKPASS_SH = (
+    "#!/bin/sh\n"
+    "# Calvoun ghpush askpass: answers ONLY for https://github.com.\n"
+    "case \"$1\" in\n"
+    "\"Username for 'https://github.com': \")\n"
+    "  printf '%s\\n' 'x-access-token' ;;\n"
+    "\"Password for 'https://x-access-token@github.com': \")\n"
+    "  printf '%s\\n' \"$GH_ASKPASS_TOKEN\" ;;\n"
+    "*)\n"
+    "  exit 1 ;;\n"
+    "esac\n"
+)
+
 
 def _is_link(path):
     """A symlink, a Windows junction / mount point, or a reparse point."""
@@ -359,7 +395,10 @@ def _is_link(path):
 class GitHub:
     def __init__(self, http=None, run_git=None, clock=None, store=None,
                  remote_url=None, git_path="git",
-                 is_hub_repo=None, too_broad=None):
+                 is_hub_repo=None, too_broad=None, allowed_protocols=("https",)):
+        # Transports git may use (GIT_ALLOW_PROTOCOL). https only in the hub; a
+        # test adds "file" for its local bare remote.
+        self.allowed_protocols = tuple(allowed_protocols)
         self.http = http or _urllib_http
         self.git_path = git_path
         self.run_git = run_git or (lambda args, cwd=None, env=None:
@@ -449,59 +488,73 @@ class GitHub:
     def _git(self, args, cwd, auth=False, identity=False):
         """Run git with the hub's fixed safety flags. ``auth`` adds the ASKPASS
         token path (push/fetch); ``identity`` adds a per-command commit identity
-        when the repo has none configured. Returns (rc, out, err)."""
-        prefix = ["-c", "credential.helper="]
-        if identity and not self._has_identity(cwd):
-            acct = self.store.get_account() or {}
-            login = acct.get("login") or "calvoun-build"
-            uid = acct.get("user_id")
-            email = ("%s+%s@users.noreply.github.com" % (uid, login)) if uid \
-                else ("%s@users.noreply.github.com" % login)
-            prefix += ["-c", "user.name=%s" % login, "-c", "user.email=%s" % email]
-        full = prefix + list(args)
-        env, cleanup = ({}, None)
-        if auth:
-            env, cleanup = self._askpass_env(self._require_token())
-        try:
-            return self.run_git(full, cwd=cwd, env=env)
-        finally:
-            if cleanup:
-                cleanup()
+        when the repo has none configured. Returns (rc, out, err).
 
-    def _askpass_env(self, token):
-        """A private 0700 temp dir holding a GIT_ASKPASS helper that echoes the
-        token from an env var — the token is never on a command line and never
-        in the script body. Returns (env, cleanup)."""
-        d = tempfile.mkdtemp(prefix="ghpush-askpass-")
+        The project's own .git/config and hooks are written by AI agents and
+        are treated as HOSTILE: every call gets an empty private hooks dir
+        (no project hook ever runs), fsmonitor off, credential helpers reset,
+        submodule recursion off and only the allowed transports
+        (GIT_ALLOW_PROTOCOL overrides any protocol.*.allow in the config, so a
+        planted ext::/ssh/local remote cannot run a command or a local
+        receive-pack while the token is in the environment)."""
+        tmp = tempfile.mkdtemp(prefix="ghpush-")
         try:
-            os.chmod(d, stat.S_IRWXU)       # 0700
-        except OSError:
-            pass
-        if os.name == "nt":
-            script = os.path.join(d, "askpass.bat")
-            body = "@echo off\r\necho %GH_ASKPASS_TOKEN%\r\n"
-        else:
-            script = os.path.join(d, "askpass.sh")
-            body = "#!/bin/sh\nprintf '%s' \"$GH_ASKPASS_TOKEN\"\n"
-        with open(script, "w", encoding="ascii", newline="") as f:
-            f.write(body)
-        if os.name != "nt":
             try:
-                os.chmod(script, stat.S_IRWXU)   # 0700
+                os.chmod(tmp, stat.S_IRWXU)       # 0700
             except OSError:
                 pass
-        env = {
-            "GIT_ASKPASS": script,
-            "GH_ASKPASS_TOKEN": token,
-            "GIT_TERMINAL_PROMPT": "0",
-            # Belt and braces: no helper is read even if one is configured.
-            "GIT_CONFIG_NOSYSTEM": "1",
-        }
+            hooks = os.path.join(tmp, "hooks")    # stays EMPTY
+            os.mkdir(hooks)
+            prefix = []
+            for kv in _SAFE_CONFIG:
+                prefix += ["-c", kv]
+            prefix += ["-c", "core.hooksPath=" + hooks]
+            env = {
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_ALLOW_PROTOCOL": ":".join(self.allowed_protocols),
+            }
+            if identity and not self._has_identity(cwd):
+                acct = self.store.get_account() or {}
+                login = acct.get("login") or "calvoun-build"
+                uid = acct.get("user_id")
+                email = ("%s+%s@users.noreply.github.com" % (uid, login)) if uid \
+                    else ("%s@users.noreply.github.com" % login)
+                prefix += ["-c", "user.name=%s" % login, "-c", "user.email=%s" % email]
+            if auth:
+                for kv in _AUTH_CONFIG:
+                    prefix += ["-c", kv]
+                token = self._require_token()
+                env["GIT_ASKPASS"] = self._write_askpass(tmp)
+                env["GH_ASKPASS_TOKEN"] = token
+            return self.run_git(prefix + list(args), cwd=cwd, env=env)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
-        def cleanup():
-            shutil.rmtree(d, ignore_errors=True)
+    @staticmethod
+    def _write_askpass(folder):
+        """The GIT_ASKPASS helper, in the call's private 0700 temp dir. It
+        answers ONLY git's two prompts for exactly https://github.com
+        (username ``x-access-token``, password = the token from the env var
+        GH_ASKPASS_TOKEN) and prints nothing for any other prompt, so a planted
+        ``url.<evil>.insteadOf`` / ``remote.github.pushurl`` / http:// /
+        github.com.evil host never receives the token. The token is never in
+        the script body.
 
-        return env, cleanup
+        ONE POSIX sh script on every platform: Git for Windows runs ``#!/bin/sh``
+        askpass scripts itself (verified 2026-10-11 with ``git credential
+        fill``). A Windows .bat is deliberately NOT used: cmd.exe parses the
+        prompt argument before the script runs, and git URL-decodes a remote's
+        username into that prompt, so a planted push URL could inject a
+        command."""
+        script = os.path.join(folder, "askpass.sh")
+        with open(script, "w", encoding="ascii", newline="\n") as f:
+            f.write(_ASKPASS_SH)
+        try:
+            os.chmod(script, stat.S_IRWXU)   # 0700
+        except OSError:
+            pass
+        return script
 
     def _has_identity(self, cwd):
         rc, out, _ = self._git(["config", "user.email"], cwd=cwd)
@@ -580,6 +633,16 @@ class GitHub:
             i += 1
         return paths
 
+    def _raise_if_secrets(self, folder):
+        findings = scan_secrets(folder, self._staged_paths(folder))
+        if findings:
+            raise GhError("secrets_found",
+                          "Found something that should not be published. "
+                          "Add these to .gitignore, or remove them, then push again.",
+                          extra={"findings": findings,
+                                 "has_gitignore": os.path.isfile(
+                                     os.path.join(folder, ".gitignore"))})
+
     # ---- public operations ------------------------------------------------
     def preview(self, project_dir):
         """Files that would be committed (capped list + total) and the secret
@@ -654,6 +717,11 @@ class GitHub:
         repo = sanitize_repo_name(name)
         if not repo:
             raise GhError("bad_name", "That repository name is not usable on GitHub.")
+        # Secret scan BEFORE anything is created on GitHub: a finding refuses
+        # "Create & push" with nothing made remotely (a local `git init` is the
+        # only side effect -- the scan needs git status to honour .gitignore).
+        self._ensure_repo(folder)
+        self._raise_if_secrets(folder)
         status, data = self._api("POST", "/user/repos", token,
                                  {"name": repo, "private": private, "auto_init": False})
         if status == 201 and isinstance(data, dict) and data.get("full_name"):
@@ -686,15 +754,7 @@ class GitHub:
         self._ensure_repo(folder)
         if not self._github_remote_url(folder):
             raise GhError("not_connected", "Create a GitHub repository first.")
-        paths = self._staged_paths(folder)
-        findings = scan_secrets(folder, paths)
-        if findings:
-            raise GhError("secrets_found",
-                          "Found something that should not be published. "
-                          "Add these to .gitignore, or remove them, then push again.",
-                          extra={"findings": findings,
-                                 "has_gitignore": os.path.isfile(
-                                     os.path.join(folder, ".gitignore"))})
+        self._raise_if_secrets(folder)
         rc, _o, err = self._git(["add", "-A"], cwd=folder)
         if rc != 0:
             raise GhError("git_error", "Could not stage the files. %s" % _tail(err))
@@ -709,7 +769,9 @@ class GitHub:
             raise GhError("nothing_to_commit",
                           "This project has no files to commit yet.")
         branch = self._current_branch(folder)
-        prc, _op, perr = self._git(["push", "github", "HEAD:main"], cwd=folder, auth=True)
+        prc, _op, perr = self._git(
+            ["push", "--no-verify", "--no-recurse-submodules", "github", "HEAD:main"],
+            cwd=folder, auth=True)
         if prc != 0:
             if _is_non_fast_forward(perr):
                 raise GhError("behind_remote",
@@ -726,7 +788,8 @@ class GitHub:
         self._require_token()
         if not self._is_repo(folder) or not self._github_remote_url(folder):
             raise GhError("not_connected", "Connect this project to GitHub first.")
-        frc, _o, ferr = self._git(["fetch", "github"], cwd=folder, auth=True)
+        frc, _o, ferr = self._git(["fetch", "--no-recurse-submodules", "github"],
+                                  cwd=folder, auth=True)
         if frc != 0:
             raise GhError("fetch_failed", "Could not fetch from GitHub. %s" % _tail(ferr))
         ahead, behind = self._ahead_behind(folder)

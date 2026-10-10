@@ -4498,6 +4498,23 @@ message, extra)`. New app.py symbols are `_gh_*`; the routes are a new
   DIFFERENT account and must never be used). Commit identity, only when the repo
   has none configured: `-c user.name=<login> -c user.email=<id>+<login>@users.noreply.github.com`
   per command (never the global config).
+- **Hardening (2026-10-11): the project's .git/config and hooks are HOSTILE**
+  (AI agents write them and can be prompt-injected). Every git call gets
+  `-c core.hooksPath=<empty private temp dir>` + `core.fsmonitor=false` +
+  `credential.useHttpPath=false` + no submodule recursion and env
+  `GIT_ALLOW_PROTOCOL=https` (overrides any planted `protocol.*.allow`, so no
+  ext::/ssh `sshCommand`/local `receivepack` remote runs a command with the
+  token in the env); push/fetch add `http.sslVerify=true` + `push.gpgSign=false`,
+  push adds `--no-verify`. The askpass answers ONLY the exact prompts for
+  `https://github.com` (username `x-access-token`, password from the env var)
+  and prints nothing otherwise, so a planted `url.*.insteadOf` / `pushurl` /
+  http:// host never gets the token. It is ONE `#!/bin/sh` script on every OS
+  (Git for Windows runs it; verified with `git credential fill`) -- a `.bat` is
+  NOT used: cmd parses the prompt argument, and git URL-decodes a remote's
+  username into it. "Create & push" scans for secrets BEFORE the POST: a
+  finding creates nothing on GitHub. RESIDUAL RISK: an agent running as the same
+  OS user can still read `config.json` + `secret.key` and decrypt the token
+  itself; none of this defends against that.
 - **Create.** POST /user/repos `{name, private, auto_init:false}` on the
   authenticated user's account. The name is sanitized to GitHub's rules; a 422
   "already exists" is `repo_exists`, a 401/403 is `bad_scope`. Private is the
