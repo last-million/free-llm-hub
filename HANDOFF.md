@@ -55,6 +55,17 @@ unless its "Continue by itself after a restart" box is ticked.
 
 ## What changed 2026-10-10
 
+- **Batch 2 (same day):** Publish opens a `<dialog>` popup (desktop window / phone bottom sheet);
+  the project goal is one compact row under the Build toolbar; **apps deploy by themselves**
+  (`deploy_perfect.py`, `envprobe.py`): diagnosis of conversation 2e3525ad = a frontend+backend
+  monorepo (Express + Vite) needing PostgreSQL, which is NOT installed here, never installed/
+  built/seeded by the preview, never verified, so each run redid the deploy (5th attempt). Now:
+  the preview installs declared sub-projects (`--ignore-scripts`) and builds the frontend on an
+  explicit start, seeds `.env` from `.env.example` (no symlinks, never overwrite), the planner
+  sees "THIS MACHINE" (prefers SQLite when no DB server), every Multi run ends with a deploy
+  check ("Deployed: <url>" or the exact error + ONE `deploy_fix` phase), and a passing start is
+  remembered (`preview-starts.json`). Flags `deploy_perfect`, `planning_env_probe`,
+  `deploy_check_after_run`. The owner's current app still needs PostgreSQL or a switch to SQLite.
 - **Multi from a terminal CLI = the Build page's Multi** (`_cm_*`, flag `cli_multi_sessions`):
   a CLI on `*-multi` with a real task in a known, non-broad project folder starts a real
   swarm_windows run (planner + up to 6 helpers) owned by a hub conversation (Build page link,
