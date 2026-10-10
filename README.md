@@ -295,7 +295,11 @@ keys can actually reach right now, which is the only number that matters.
 - **No telemetry.** No analytics SDK of any kind is present in the source.
 - **Honest nuance:** the hub does make outbound calls — to the providers you
   enable, to `artificialanalysis.ai` if you supply your own key for rankings,
-  and `git pull` for its own updates.
+  to OpenRouter's public model catalog and LMArena's public leaderboard
+  dataset (no key, for model rankings), to Cloudflare's GitHub releases once to
+  install `cloudflared` for the Publish button (checksum-verified; untick
+  "Install cloudflared automatically" in the Publish panel to stop it), and
+  `git pull` for its own updates.
 
 ---
 
