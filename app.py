@@ -1144,10 +1144,11 @@ _CODEX_LEVELS = [
      "description": "Max - strongest free models only, never the cheap tier"},
     {"effort": "high",
      "description": "Swarm - several models per turn, best answer wins"},
-    # Not "Multi sessions": from codex, "multi" is the crew pipeline (or the
-    # best-of-N fan-out on a tool turn), never real session windows.
+    # From codex, "multi" is real parallel agent sessions in the project folder
+    # when the folder is known (_cm_multi_cli_intercept), else the crew pipeline.
     {"effort": "xhigh",
-     "description": "Multi - phased crew (plan -> work -> review)"},
+     "description": "Multi - real parallel agent sessions in the project folder "
+                    "(crew pipeline when the folder is unknown)"},
 ]
 
 
@@ -20953,6 +20954,506 @@ def _multi_turn_blocking(session_id, sess_info, text):
     return status, reply, detail
 
 
+# ============================================================================ #
+# MULTI FROM THE TERMINAL CLIs (2026-10-10, flag `cli_multi_sessions`)
+#
+# Owner complaint: "inside the CLI the multi mode works as crew, but from the
+# frontend (Build page) Multi works well in parallel." It was true: _crew_name_for
+# mapped "multi" to the crew pipeline for /v1 turns because "a /v1 call carries
+# no project folder to run in" -- which stopped being true once _v1_project_cwd
+# reads the CLI's <cwd>/env block. So a terminal CLI that selects the Multi tier
+# (bare `multi`, `<category>-multi`, codex xhigh/max/ultra) and carries tools now
+# gets the SAME real swarm_windows run the Build page does: a planner, up to N
+# helper CLI sessions on different models working in the project folder, review.
+#
+# The run lives under a hub /agent conversation (the OWNER, opened like
+# _hb_start_run does, auto_resume ticked) so it shows on the Build page / the
+# Running popup / Activity with Stop & Continue, and boot/graceful-update resume
+# cover it. The CLI turn itself is answered with TEXT ONLY (never a tool call),
+# streamed in the caller's own protocol: a watch link, the live events the Build
+# page shows, a keepalive at least every 20 s, then the report -- or, before the
+# CLI's own timeout, a clean "keeps working in the background" hand-off. A client
+# disconnect or the turn ending NEVER stops the run; only its own Stop does
+# (Build page, Running popup, or a CLI message "stop multi").
+#
+# The whole feature is behind `cli_multi_sessions` (default on). Off -> every
+# gate below returns None and the request takes today's crew/roles path byte for
+# byte.
+# ============================================================================ #
+
+_CM_MAP_LRU = 200
+_CM_MAP_TTL = 7 * 86400         # 7 days
+_CM_MAP_LOCK = threading.Lock()
+_CM_KEEPALIVE_SECONDS = 20.0    # a "still working" line at least this often
+# End the CLI turn with a background hand-off BEFORE the client gives up. 240 s
+# when unknown (the spec's default). Per-CLI evidence is in AGENTS.md "Multi from
+# the terminal CLIs": opencode's streaming timeout is idle-based (a stream that
+# keeps sending deltas is not capped under ~10 min), so it watches longer; the
+# rest keep the conservative default.
+_CM_SAFE_END_DEFAULT = 240
+_CM_SAFE_END = {"opencode": 540}
+
+
+def _cm_on():
+    """Flag `cli_multi_sessions` (default on)."""
+    try:
+        return bool(config.get_flag("cli_multi_sessions", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _cm_map_path():
+    return os.path.join(config.state_dir(), "cli-multi-runs.json")
+
+
+def _cm_map_load():
+    try:
+        with open(_cm_map_path(), encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def _cm_map_save(d):
+    try:
+        path = _cm_map_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp-" + uuid.uuid4().hex
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(d, fh)
+        os.replace(tmp, path)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _cm_map_prune(d, now=None):
+    """Drop entries past the 7-day TTL, then keep only the newest LRU 200."""
+    now = time.time() if now is None else now
+    live = {k: v for k, v in (d or {}).items()
+            if isinstance(v, dict) and (now - float(v.get("at") or 0)) <= _CM_MAP_TTL}
+    if len(live) > _CM_MAP_LRU:
+        drop = sorted(live, key=lambda k: float(live[k].get("at") or 0))[:len(live) - _CM_MAP_LRU]
+        for k in drop:
+            del live[k]
+    return live
+
+
+def _cm_map_get(convkey):
+    if not convkey:
+        return None
+    with _CM_MAP_LOCK:
+        row = _cm_map_prune(_cm_map_load()).get(convkey)
+        return dict(row) if isinstance(row, dict) else None
+
+
+def _cm_map_put(convkey, owner, run):
+    """Map this CLI conversation -> {owner sid, run id}. Atomic, LRU 200, 7-day
+    TTL. Never raises."""
+    if not convkey or not owner:
+        return
+    with _CM_MAP_LOCK:
+        d = _cm_map_prune(_cm_map_load())
+        d[convkey] = {"owner": owner, "run": run, "at": time.time()}
+        _cm_map_save(_cm_map_prune(d))
+
+
+def _cm_resolves_to_multi(body):
+    """True when the id (already normalized by _apply_category_effort /
+    _mode_and_effort in the handler) is the Multi tier."""
+    return (body.get("model") or "").strip().lower() == "multi"
+
+
+def _cm_project_dir(messages):
+    """The CLI's project folder for a terminal Multi run, or None: an existing
+    directory that is NOT the hub's own repo (_v1_project_cwd) and NOT a
+    filesystem root / the user's home / anything above it (the publish
+    broad-folder rule). Never raises."""
+    try:
+        folder = _v1_project_cwd(messages)
+        if not folder or _publish_folder_too_broad(folder):
+            return None
+        return folder
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _cm_caller_cli():
+    """The caller's CLI from its User-Agent (how live window steering names it),
+    or None."""
+    try:
+        return _steer_cli_from_ua()
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _cm_helper_cli(caller):
+    """The helper CLI for the workers: the caller's own CLI when the hub has a
+    working isolated copy of it, else the Build page's default (opencode)."""
+    try:
+        if caller and agentic_chat._isolated_bin(caller):
+            return caller
+    except Exception:                                            # noqa: BLE001
+        pass
+    return "opencode"
+
+
+def _cm_safe_end_seconds(caller):
+    return _CM_SAFE_END.get((caller or "").strip().lower(), _CM_SAFE_END_DEFAULT)
+
+
+def _cm_helper_count():
+    try:
+        return max(1, int(swarm_windows._concurrency()))
+    except Exception:                                            # noqa: BLE001
+        return 6
+
+
+def _cm_live_run_id(owner_sid):
+    """The run id of the live Multi run behind this owner conversation, or None.
+    `_multi_run_for` returns the status DICT (and prunes a dead run); the id
+    itself is in `_MULTI_RUNS`."""
+    if not owner_sid:
+        return None
+    if _multi_run_for(owner_sid):            # truthy + still PENDING/RUNNING
+        with _MULTI_LOCK:
+            return _MULTI_RUNS.get(owner_sid)
+    return None
+
+
+def _cm_watch_link(owner_sid):
+    try:
+        port = agentic_chat._port()
+    except Exception:                                            # noqa: BLE001
+        port = 8787
+    return "http://127.0.0.1:%d/agent/%s" % (port, owner_sid)
+
+
+def _cm_goal_title(text):
+    t = " ".join((text or "").split())
+    return ("Multi (CLI): " + t[:60]) if t else "Multi (CLI)"
+
+
+def _cm_usage(est):
+    pt = _reported_prompt_tokens(None, est)
+    return {"prompt_tokens": pt, "completion_tokens": 0, "total_tokens": pt}
+
+
+def _cm_chat_json(full, label, est):
+    return {"id": "chatcmpl-multi-" + uuid.uuid4().hex, "object": "chat.completion",
+            "created": int(time.time()), "model": label,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": full}}],
+            "usage": _cm_usage(est)}
+
+
+def _cm_owner_session(convkey, helper_cli, project_dir, mode, goal_text):
+    """Find or open the hub /agent conversation that OWNS this CLI
+    conversation's Multi runs. A new one is opened like _hb_conversation does,
+    titled from the goal, quality "multi", auto_resume ticked (so the
+    boot/graceful-update resume cover it). Returns (sid, sess_info) or
+    (None, None). Never raises."""
+    row = _cm_map_get(convkey)
+    sid = row.get("owner") if row else None
+    if sid:
+        try:
+            info = agentic_chat.get_session(sid)
+        except Exception:                                        # noqa: BLE001
+            info = None
+        if info is not None:
+            return sid, info
+        # Session gone from memory (or deleted): open a fresh owner below.
+    try:
+        sid = agentic_chat.start_session(helper_cli, project_dir, quality="multi", mode=mode)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[cli-multi] could not open the owner conversation: %s", exc)
+        return None, None
+    try:
+        agentic_history.set_title(sid, _cm_goal_title(goal_text))
+        agentic_history.set_quality(sid, "multi")
+        if mode:
+            agentic_history.set_mode(sid, mode)
+        agentic_history.set_auto_resume(sid, True)
+    except Exception:                                            # noqa: BLE001
+        pass
+    info = agentic_chat.get_session(sid) or {
+        "session_id": sid, "cli": helper_cli, "project_dir": project_dir,
+        "quality": "multi", "mode": mode}
+    return sid, info
+
+
+def _cm_keepalive_wrap(producer, interval):
+    """Yield `producer`'s events, injecting a None every `interval` seconds the
+    source is silent -- so a long, quiet phase still gets a keepalive line. The
+    producer runs on a daemon thread into an unbounded queue, so the Multi run
+    keeps going even if nothing reads this (a client that left). Never raises
+    into the consumer."""
+    q = queue.Queue()
+    _DONE = object()
+
+    def _drain():
+        try:
+            for ev in producer:
+                q.put(ev)
+        except Exception as exc:                                 # noqa: BLE001
+            q.put({"event": "error", "status": 500, "detail": _sanitize(str(exc), 300)})
+        finally:
+            q.put(_DONE)
+
+    threading.Thread(target=_drain, daemon=True, name="cm-multi-ka").start()
+    while True:
+        try:
+            ev = q.get(timeout=interval)
+        except queue.Empty:
+            yield None
+            continue
+        if ev is _DONE:
+            return
+        yield ev
+
+
+def _cm_event_line(ev):
+    """One normalized Multi event as a CLI text line, or None. The plan, the
+    phase started/finished lines and the throttled activity lines are `notice`
+    / `tool` / `output`; the report rides on `message`/`done` and is handled by
+    the caller."""
+    kind = ev.get("event")
+    text = (ev.get("text") or "").strip()
+    if kind in ("notice", "tool", "output") and text:
+        return text
+    return None
+
+
+def _cm_text_stream(owner_sid, run_id, events, link, safe_seconds, helper_n, header):
+    """Yield the CLI turn's text pieces (strings): `header`, the live progress
+    lines, a keepalive at least every 20 s, then the final report + watch link
+    -- or, once `safe_seconds` elapse before the run ends, a clean "keeps
+    working in the background" hand-off (the run keeps going regardless). Pure
+    generator; the run's own on_done records the authoritative reply."""
+    started = time.monotonic()
+    yield header
+    total = [0]
+    done = [0]
+    rid = run_id
+    last = started
+    report = None
+    outcome = None
+    for ev in _cm_keepalive_wrap(events, _CM_KEEPALIVE_SECONDS):
+        now = time.monotonic()
+        if safe_seconds and (now - started) >= safe_seconds and outcome is None:
+            yield ("\nThe Multi run keeps working in the background (%d/%d phases "
+                   "done). Send any message to follow it, or 'stop multi' to stop "
+                   "it. Watch it: %s\n" % (done[0], total[0], link))
+            return
+        if ev is None:                                    # keepalive tick
+            if now - last >= _CM_KEEPALIVE_SECONDS:
+                el = int(now - started)
+                yield "· still working (%dm %02ds)\n" % (el // 60, el % 60)
+                last = now
+            continue
+        kind = ev.get("event")
+        if kind == "notice":
+            m = re.search(r"(\d+)\s+phase", ev.get("text") or "")
+            if m:
+                total[0] = int(m.group(1))
+        if kind == "output" and "-- done" in (ev.get("text") or ""):
+            done[0] += 1
+        if rid is None:
+            rid = _cm_live_run_id(owner_sid)
+        line = _cm_event_line(ev)
+        if line:
+            yield line + "\n"
+            last = now
+        elif kind in ("message", "done"):
+            report = ev.get("text") or report
+        elif kind == "stopped":
+            outcome = "stopped"
+        elif kind == "error":
+            outcome = "error"
+            yield ("\nThe Multi run could not continue: %s\n"
+                   % _sanitize(str(ev.get("detail") or "unknown"), 300))
+    if outcome == "error":
+        yield "\nWatch it: %s\n" % link
+        return
+    if report is None:
+        try:
+            report = swarm_windows.format_result(rid or _cm_live_run_id(owner_sid) or "") or ""
+        except Exception:                                        # noqa: BLE001
+            report = ""
+    tail = ("\n\n" + report.strip()) if report and report.strip() else ""
+    yield "%s\n\nWatch it: %s\n" % (tail, link)
+
+
+def _cm_chat_sse_lines(text_stream, label):
+    """`text_stream` as the RAW BYTE LINES an upstream OpenAI chat SSE stream
+    would carry (no usage chunk: the Responses / Anthropic translators compute
+    usage from prompt_est and steer it once). Fed to _responses_stream /
+    _anthropic_stream through _ReplayUpstream, exactly as the swarm replay is."""
+    base = {"id": "chatcmpl-multi-" + uuid.uuid4().hex, "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": label}
+    yield b"data: " + json.dumps(dict(base, choices=[
+        {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}])).encode("utf-8")
+    yield b""
+    for piece in text_stream:
+        if not piece:
+            continue
+        yield b"data: " + json.dumps(dict(base, choices=[
+            {"index": 0, "delta": {"content": piece}, "finish_reason": None}])).encode("utf-8")
+        yield b""
+    yield b"data: " + json.dumps(dict(base, choices=[
+        {"index": 0, "delta": {}, "finish_reason": "stop"}])).encode("utf-8")
+    yield b""
+    yield b"data: [DONE]"
+
+
+def _cm_emit(body, protocol, text_stream, est):
+    """Answer the CLI turn with TEXT ONLY, in its own protocol -- streamed when
+    the client asked to stream, else one message."""
+    label = (body.get("model") or "multi")
+    hdrs = {"X-Free-LLM-Hub-Provider": "hub",
+            "X-Free-LLM-Hub-Pipeline": "multi (cli sessions)"}
+    stream = bool(body.get("stream"))
+    if protocol == "responses":
+        if not stream:
+            data = _cm_chat_json("".join(text_stream), label, est)
+            return jsonify(_chat_to_responses(data, label)), 200, hdrs
+        return Response(stream_with_context(
+            _responses_stream(_ReplayUpstream(_cm_chat_sse_lines(text_stream, label)),
+                              label, prompt_est=est)),
+            mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
+    if protocol == "anthropic":
+        if not stream:
+            data = _cm_chat_json("".join(text_stream), label, est)
+            return jsonify(_openai_resp_to_anthropic(data, label)), 200, hdrs
+        return Response(stream_with_context(
+            _anthropic_stream(_ReplayUpstream(_cm_chat_sse_lines(text_stream, label)),
+                              label, est)),
+            mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
+    # openai chat.completions
+    if not stream:
+        return jsonify(_cm_chat_json("".join(text_stream), label, est)), 200, hdrs
+
+    def _gen():
+        cid = "chatcmpl-multi-" + uuid.uuid4().hex
+        created = int(time.time())
+        base = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                "model": label}
+        yield "data: %s\n\n" % json.dumps(dict(base, choices=[
+            {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]))
+        for piece in text_stream:
+            if not piece:
+                continue
+            yield "data: %s\n\n" % json.dumps(dict(base, choices=[
+                {"index": 0, "delta": {"content": piece}, "finish_reason": None}]))
+        yield "data: %s\n\n" % json.dumps(dict(base, choices=[
+            {"index": 0, "delta": {}, "finish_reason": "stop"}]))
+        yield "data: %s\n\n" % json.dumps(dict(base, choices=[], usage=_cm_usage(est)))
+        yield "data: [DONE]\n\n"
+    return Response(_gen(), mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
+
+
+def _cm_attach(body, protocol, owner_sid, run_id, text, helper_cli, safe, est, convkey):
+    """A later turn of a CLI conversation whose Multi run is still live: no model
+    call, no second run. "stop multi" stops it; anything else re-attaches and
+    streams the live progress again."""
+    _cm_map_put(convkey, owner_sid, run_id)          # keep the persisted run id fresh
+    link = _cm_watch_link(owner_sid)
+    low = " ".join((text or "").split()).lower()
+    if low == "stop" or low.startswith("stop multi") or "stop multi" in low:
+        try:
+            swarm_windows.stop(run_id)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+        def _stopped():
+            yield ("Stopping the Multi run. Its helpers wind down and the partial "
+                   "result is saved in the conversation. Watch it: %s\n" % link)
+        return _cm_emit(body, protocol, _stopped(), est)
+    header = "Multi: this conversation's run is still working. Watch it live: %s\n" % link
+    events = _multi_follow_events(run_id, helper_cli)
+    return _cm_emit(body, protocol,
+                    _cm_text_stream(owner_sid, run_id, events, link, safe,
+                                    _cm_helper_count(), header), est)
+
+
+def _cm_multi_cli_intercept(body, protocol, messages, tools, est):
+    """THE GATE. A terminal CLI that selected the Multi tier gets a real
+    swarm_windows run in its project folder (same as the Build page); returns a
+    Flask response (text only) or None to fall through to today's path. Every
+    condition must hold, else None. Never raises (any error -> None)."""
+    try:
+        if not _cm_on() or not _cm_resolves_to_multi(body):
+            return None
+        if _build_sid():
+            # A hub-driven session: a /build conversation OR a Multi worker
+            # (swarm_windows.worker_info would name it) -- both reach the hub at
+            # /build/<sid>, so _build_sid() is set only for them, never for a
+            # real terminal CLI. Not a terminal Multi request.
+            return None
+        try:
+            if request.headers.get("X-Free-LLM-Hub") == "dashboard":
+                return None                      # the dashboard's own quick chat
+        except Exception:                                        # noqa: BLE001
+            pass
+        if not tools:
+            return None
+        if ctxwin.is_compaction_request(messages or []):
+            return None
+        text = swarm._last_user_text(messages) or ""
+        try:
+            convkey = ctxwin.conversation_key(headers=request.headers, body=body,
+                                              messages=messages)
+        except Exception:                                        # noqa: BLE001
+            convkey = ctxwin.conversation_key(messages=messages)
+        caller = _cm_caller_cli()
+        helper_cli = _cm_helper_cli(caller)
+        safe = _cm_safe_end_seconds(caller)
+
+        # A run already live for THIS CLI conversation (same process): re-attach
+        # or stop, without a model call and without starting a second run.
+        row = _cm_map_get(convkey)
+        owner = row.get("owner") if row else None
+        live_id = _cm_live_run_id(owner) if owner else None
+        if owner and live_id:
+            return _cm_attach(body, protocol, owner, live_id, text, helper_cli, safe,
+                              est, convkey)
+
+        # Not live -> a NEW instruction (or a short "continue") starts/resumes a
+        # run. Only on a fresh user instruction, in a known safe folder, that
+        # reads as work.
+        if not _awaiting_new_instruction(messages):
+            return None
+        project_dir = _cm_project_dir(messages)
+        if not project_dir:
+            return None
+        if not _multi_wants_a_swarm(text):
+            return None
+        mode = _session_mode_or_none({"mode": _active_mode()})
+        owner_sid, sess_info = _cm_owner_session(convkey, helper_cli, project_dir, mode, text)
+        if not owner_sid:
+            return None
+        _cm_map_put(convkey, owner_sid, None)
+        # Start EXACTLY like the Build page: _multi_turn_events (plan + helpers +
+        # review), made durable by live_run so the run survives this connection
+        # going away. A copy of this request's context rides onto the thread, as
+        # the Build route does, so the planner routes through the hub's chain.
+        producer = _multi_turn_events(owner_sid, sess_info, text)
+        try:
+            events = agentic_chat.live_run(
+                owner_sid, producer, context=request_ctx._get_current_object().copy())
+        except Exception:                                        # noqa: BLE001
+            events = agentic_chat.live_run(owner_sid, producer)
+        link = _cm_watch_link(owner_sid)
+        header = ("Multi: planning the work with up to %d helpers. Watch it live: "
+                  "%s\n" % (_cm_helper_count(), link))
+        return _cm_emit(body, protocol,
+                        _cm_text_stream(owner_sid, None, events, link, safe,
+                                        _cm_helper_count(), header), est)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[cli-multi] intercept fell through: %s", _sanitize(str(exc), 200))
+        return None
+
+
 @app.route("/api/swarm-windows", methods=["GET"])
 def api_swarm_windows_list():
     return jsonify({"runs": swarm_windows.list_runs(),
@@ -35446,11 +35947,12 @@ _VIRTUAL_MODEL_LABELS = {
     "all": "All models · every category, orchestrated",
     "best": "Max · strongest free models only",
     "max": "Max · strongest free models only",
-    # HONEST about what a CLI gets. "Multi sessions" (real agent windows) only
-    # exists on the /agent page; a stateless /v1 turn maps "multi" to the crew
-    # pipeline (tool-free) or the best-of-N fan-out (tool turns) -- see
-    # _crew_name_for. The old label promised the windows.
-    "multi": "Multi · phased crew (plan → work → review)",
+    # HONEST about what a CLI gets. A terminal CLI that selects Multi now gets
+    # REAL parallel agent sessions in its project folder (the same as the /agent
+    # page) via _cm_multi_cli_intercept; when the folder is unknown it falls back
+    # to the crew pipeline. See _crew_name_for.
+    "multi": "Multi · real parallel agent sessions in the project folder "
+             "(crew pipeline when the folder is unknown)",
 }
 
 
@@ -35663,12 +36165,14 @@ def _crew_name_for(model):
     "crew-code" / "crew/code" -> "code"."""
     m = (model or "").strip().lower()
     if m in ("crew", "multi"):
-        # "multi" is the fourth quality tier. In the /agent page it spawns real
-        # agent sessions that work the message in phases; a stateless CLI turn
-        # cannot do that (the CLI IS the agent, and a /v1 call carries no
-        # project folder to run in), so from a CLI it maps to the crew phase
-        # pipeline -- plan, execute, review across several models -- which is
-        # the same "work it in phases" shape and is safe to run per turn.
+        # "multi" is the fourth quality tier. A terminal CLI that selects it now
+        # gets a REAL parallel swarm_windows run in its project folder, the same
+        # as the /agent page -- that happens earlier, in _cm_multi_cli_intercept
+        # (flag cli_multi_sessions), when the CLI's folder is known. This crew
+        # phase pipeline (plan, execute, review across several models) is the
+        # FALLBACK reached only when that gate does not apply: the folder is
+        # unknown, the request is not fresh work, or the flag is off. Same
+        # "work it in phases" shape, safe to run per turn.
         return "auto"
     if m.startswith("crew-"):
         return m[len("crew-"):]
@@ -35681,9 +36185,11 @@ def _is_swarm_model(model):
     m = (model or "").strip().lower()
     if m in _SWARM_IDS or m.startswith("swarm/"):
         return True
-    # "multi" (the fourth tier) runs through the same pipeline path; _crew_name_for
-    # maps it to the crew phase pipeline. Kept out of _SWARM_IDS on purpose so it
-    # is listed once as a TIER, not twice (and not labelled a Pipeline).
+    # "multi" (the fourth tier). From a terminal CLI it is handled earlier by
+    # _cm_multi_cli_intercept (a real parallel swarm_windows run); this pipeline
+    # path is its fallback (_crew_name_for maps it to the crew phase pipeline).
+    # Kept out of _SWARM_IDS on purpose so it is listed once as a TIER, not twice
+    # (and not labelled a Pipeline).
     if m == "multi":
         return True
     if m in crews.CREW_IDS:
@@ -41383,6 +41889,16 @@ def _chat_completions_uncached(body):
                                armed=_armed)
     if _fd is not None:
         return _fd
+    # MULTI FROM A TERMINAL CLI (flag cli_multi_sessions): the Multi tier from a
+    # terminal CLI gets a REAL parallel swarm_windows run in the project folder
+    # (planner + helper sessions + review), not the crew pipeline. Only on the
+    # real /v1/chat/completions route -- Gemini/Ollama/completions share this
+    # router but are not the three CLI protocols. None -> today's path.
+    if _armed:
+        _cm = _cm_multi_cli_intercept(body, "openai", body.get("messages"),
+                                      body.get("tools"), _est0)
+        if _cm is not None:
+            return _cm
     # SWARM: an explicitly-selected virtual model, never an automatic mode — a
     # multi-pass pipeline applied behind a client's back would corrupt the agent
     # loops Codex/Claude Code run (see swarm.py's header). Tool-carrying turns
@@ -42568,6 +43084,13 @@ def v1_responses(_retry_pass=False, _hedged=False):
                                images=has_images)
     if _fd is not None:
         return _fd
+    # MULTI FROM A TERMINAL CLI (flag cli_multi_sessions): a real parallel
+    # swarm_windows run in the project folder, same as the Build page. Before the
+    # swarm dispatch so a Multi work turn takes the real run; a trivial ask fails
+    # the gate and falls through to the fast path below. None -> today's path.
+    _cm = _cm_multi_cli_intercept(body, "responses", messages, tools, est)
+    if _cm is not None:
+        return _cm
     # SWARM on codex's own protocol. This dispatch used to exist only in
     # /v1/chat/completions -- which codex never calls -- so "swarm" arrived here
     # as an unknown bare id and _resolve_model turned it into a literal model on
@@ -43625,6 +44148,12 @@ def v1_messages():
                                stream=bool(body.get("stream")), images=has_images)
     if _fd is not None:
         return _fd
+    # MULTI FROM A TERMINAL CLI (flag cli_multi_sessions): a real parallel
+    # swarm_windows run in the project folder, same as the Build page.
+    # None -> today's path.
+    _cm = _cm_multi_cli_intercept(body, "anthropic", oai_messages, tools, est)
+    if _cm is not None:
+        return _cm
     # Same two modes, on claude's protocol. See the note in /v1/responses.
     if _is_swarm_model(body.get("model")) and _swarm_fast_path(
             dict(body, tools=tools), oai_messages):

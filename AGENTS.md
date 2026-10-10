@@ -3591,3 +3591,110 @@ network, no real timer thread, nothing left running).
 - Left as is: unticking the box does not cancel a download already running (the
   engine has no cancel; it finishes); README's Security list of outbound calls
   was not extended (the change is described in the Publish section).
+
+## Multi from the terminal CLIs (2026-10-10)
+
+Covered by `tests/test_cli_multi_sessions.py`. Owner (2026-10-10): "inside the
+CLI the multi mode works as crew, but from the frontend (Build page) Multi works
+well in parallel." It was true -- `_crew_name_for` mapped "multi" to the crew
+pipeline for a /v1 turn because "a /v1 call carries no project folder to run in",
+which stopped being true once `_v1_project_cwd` / `_project_dir_from_messages`
+read the CLI's `<cwd>`/env block. Now a terminal CLI that selects the Multi tier
+gets the SAME real `swarm_windows` run the Build page does (planner + up to N
+helper CLI sessions on different models + review), not the crew phase pipeline.
+
+- **Flag** `cli_multi_sessions` (`config.get_flag`, default on). Off = today's
+  behaviour byte for byte (every gate returns None, the request takes the crew /
+  roles path). No new `@app.route`.
+- **The gate** (`app._cm_multi_cli_intercept`, called in all three /v1 handlers
+  right before the `_is_swarm_model` dispatch -- chat only on the real
+  `/v1/chat/completions` path, since Gemini/Ollama/`/v1/completions` share that
+  router). ALL must hold, else None -> today's path: the id resolves to the Multi
+  tier after `_apply_category_effort` / `_mode_and_effort` (bare `multi`,
+  `<category>-multi`/`/multi`, codex xhigh/max/ultra); NOT a hub-driven session
+  (`_build_sid()` is set only for `/build/<sid>` -- a Build conversation OR a
+  Multi worker, both reach the hub at that prefix, so a real terminal CLI has it
+  unset; `swarm_windows.worker_info` would name a worker); not the dashboard quick
+  chat (`X-Free-LLM-Hub: dashboard`); tools present; not a compaction request
+  (`ctxwin.is_compaction_request`); a fresh user instruction
+  (`_awaiting_new_instruction`); a known safe folder (`_cm_project_dir` =
+  `_v1_project_cwd` -- existing dir, never the hub repo -- plus the publish
+  broad-folder rule `_publish_folder_too_broad`, so never a root / home / above
+  home); and `_multi_wants_a_swarm(text)` says WORK (the same any-language gate
+  the Build page uses).
+- **The run** is started EXACTLY like the Build page: `_cm_multi_cli_intercept`
+  opens a hub /agent conversation as the OWNER (like `_hb_start_run`:
+  `agentic_chat.start_session(helper_cli, folder, quality="multi", mode=...)`,
+  titled from the goal, `set_quality("multi")`, `set_auto_resume(True)` so
+  boot/graceful-update resume cover it), then reuses `_multi_turn_events(owner,
+  sess_info, text)` (plan + helpers + review + its own on_done recording) made
+  durable by `agentic_chat.live_run` with a copy of the request context -- the
+  shared helper both paths use. So the run shows in the Build page, the Running
+  popup and Activity with Stop/Continue. The helper CLI = the caller's own CLI
+  (from the User-Agent, like live window steering) when the hub has a working
+  `agentic_chat._isolated_bin` of it, else the Build default (opencode). The CLI
+  conversation (`ctxwin.conversation_key`) -> {owner sid, run id} is persisted in
+  `state_dir()/cli-multi-runs.json` (atomic write, LRU 200, 7-day TTL,
+  `_cm_map_*`), so later turns of the same CLI conversation find the owner.
+- **The CLI turn is answered with TEXT ONLY** (never a tool call), streamed in
+  its own protocol (`_cm_emit`: chat chunks; Responses via `_responses_stream` on
+  a live chat-SSE line generator through `_ReplayUpstream`; Anthropic via
+  `_anthropic_stream` the same way -- the swarm replay's trick): a first line with
+  the watch link `http://127.0.0.1:<port>/agent/<owner sid>`, the events the
+  Build page shows, a keepalive "· still working (Nm Ns)" at least every 20 s
+  (`_cm_keepalive_wrap` injects a tick when the source is silent), then the
+  report + link. Usage is the request's own estimate (`_reported_prompt_tokens`),
+  so the CLI's context accounting is unchanged. Non-stream returns the same text
+  as one message.
+- **Safe end before the CLI's cap** (`_cm_safe_end_seconds`, default 240 s): past
+  it the turn ends with "The Multi run keeps working in the background (k/n phases
+  done). Send any message to follow it, or 'stop multi' to stop it. Watch it:
+  <link>". The run NEVER depends on the CLI staying connected: a client
+  disconnect or the turn ending does not stop it (`_cm_keepalive_wrap` drains the
+  producer on its own daemon thread into an unbounded queue; nothing calls
+  `swarm_windows.stop` on disconnect). Only its own Stop does: Build page, Running
+  popup, or a CLI message "stop multi" / "stop" (handled in `_cm_attach`, no model
+  call).
+- **Later turns** of the same CLI conversation while its run is live (any fresh
+  message, "status", "continue") re-attach and stream progress again with NO model
+  call and NO second run (`_cm_attach` via `_multi_follow_events`); "stop multi"
+  stops it. When the run has ended, a new instruction starts a new run and a short
+  "continue" resumes the unfinished phases -- both through `_multi_turn_events`,
+  which already decides resume vs fresh (`_multi_is_continue`) exactly as the
+  Build page does.
+
+**Per-CLI streaming-timeout evidence (requirement 4).** The question is whether a
+stream that keeps sending content deltas survives long (keepalives every 20 s
+defeat an IDLE timeout) or hits an OVERALL request/stream cap (keepalives do NOT
+defeat that). Read from the installed CLIs on this machine on 2026-10-10 (global
+npm + `~/.free-llm-hub/isolated-clis`, read-only); compiled binaries give string
+fragments, not source, so some of this is inferred and marked:
+
+- **opencode 1.18.35** (global) / 1.18.11 (isolated), compiled `opencode.exe`:
+  strings show `idleTimeout` and `requestTimeout:0` (disabled) on the streaming
+  fetch path plus a `DEFAULT_TIMEOUT=600000` ms on the AI-SDK client -- i.e. the
+  cap that matters is IDLE-based (reset by each delta), with no fixed overall
+  stream-duration limit found under ~10 min. A stream that keeps sending content
+  survives well past 30 min. Safe end raised to 540 s (`_CM_SAFE_END`), under the
+  observed 600000 ms, to keep watching longer while staying conservative.
+- **codex 0.154** (the task's version; the isolated launcher here is a 421-byte
+  script, the Rust binary was not locatable for strings). From the graceful-update
+  read + codex's config: `stream_idle_timeout_ms` is an IDLE timeout (default
+  ~300 s), reset by streamed content; no overall request cap is documented.
+  INFERRED (binary not re-read here); safe end kept at the conservative default
+  240 s.
+- **Claude Code 2.1.220** (isolated) / 2.1.293 (global), compiled `claude.exe`:
+  timeout constants are not plain strings in the Bun-compiled binary. From the
+  graceful-update read: Claude Code retries dropped streams and uses an idle, not
+  an overall, timeout; keepalive content keeps a stream alive. INFERRED for the
+  overall-duration question; safe end 240 s.
+- **kimi-code 0.39.1**: not installed as readable JS here (the isolated `kimi`
+  dir holds only config). From the graceful-update read: step-level attempts, no
+  overall stream-duration cap known. INFERRED; safe end 240 s.
+
+Left out on purpose: the persisted map stores the run id best-effort (refreshed on
+each re-attach via `_cm_map_put`); in-process liveness uses `_multi_run_for`
+(cross-restart continuity is the owner conversation + auto_resume, not this map).
+The exact overall caps for codex/claude/kimi are not firmly verified from their
+compiled binaries, so their safe end is the conservative 240 s rather than a tuned
+value.

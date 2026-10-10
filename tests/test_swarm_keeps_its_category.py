@@ -417,9 +417,9 @@ def test_the_activity_row_gets_what_the_trailer_had():
 
 def test_multi_is_labelled_as_what_a_cli_actually_gets():
     import agentic_chat as AC
-    assert "phased crew" in A._virtual_model_label("multi")
+    assert "real parallel agent sessions" in A._virtual_model_label("multi")
     assert "Multi sessions" not in A._virtual_model_label("multi")
     xhigh = [lvl for lvl in A._CODEX_LEVELS if lvl["effort"] == "xhigh"][0]
-    assert "phased crew" in xhigh["description"]
+    assert "real parallel agent sessions" in xhigh["description"]
     assert AC._OPENCODE_EFFORT["multi"].startswith("effort: multi")
     assert "phased crew" in AC._OPENCODE_EFFORT["multi"]

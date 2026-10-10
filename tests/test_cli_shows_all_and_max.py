@@ -50,7 +50,7 @@ def test_multi_is_listed_once_as_a_tier():
     """Not folded into _SWARM_IDS, so it appears once and is labelled a tier."""
     ids = A._virtual_model_ids()
     assert ids.count("multi") == 1
-    assert A._virtual_model_label("multi").startswith("Multi · phased crew")
+    assert A._virtual_model_label("multi").startswith("Multi · real parallel agent sessions")
 
 
 def test_multi_dispatches_through_the_pipeline_path():
