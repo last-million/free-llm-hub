@@ -79,6 +79,10 @@ def _fleet(monkeypatch, failing=(QWEN,), penalty=8.5):
     monkeypatch.setattr(A, "_below_declared_window", lambda pid, m: False)
     monkeypatch.setattr(A, "_is_low_quality", lambda m: False)
     monkeypatch.setattr(A, "_is_pair_benched", lambda pid, m: False)
+    # OWNER DECISION 2026-10-10 board evidence is orthogonal to the spread/walk
+    # MECHANICS tested here (the pools use explicit scores); neutralise it.
+    monkeypatch.setattr(A, "_ev_agentic_bonus", lambda m: 0.0)
+    monkeypatch.setattr(A, "_ev_has_agentic_evidence", lambda m: False)
 
 
 def _route(sid="new-session", est=1000, trace=None):

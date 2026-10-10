@@ -45,9 +45,13 @@ unless its "Continue by itself after a restart" box is ticked.
   answers, no extra markdown files unless asked.
 - No parallel live provider sweeps (rate limits fake regressions). Small UI
   changes: static tests, no screenshots. Big UI work: run the `ui-ux-pro-max` skill.
-- Ranking choices made by the owner (do not "fix" them from benchmarks alone):
-  Kimi K3 top free model (138.1, just above GLM 5.3's 138); Space Bunny 137.7;
-  subscription scope `manager_only` (manager model: sonnet when re-enabled).
+- Ranking follows the public boards (OWNER DECISION 2026-10-10, replaces "Kimi K3
+  top free model 138.1"; see AGENTS.md "Ranking follows the boards"): TOOL turns
+  ordered by Terminal-Bench 4.0 (GLM 5.3 leads, Kimi K3 near the bottom of the
+  six benchmarked free models), CHAT by AA + LMArena (Kimi K3 / GLM 5.3 / Gemini
+  3.8 Flash close at the top). Space Bunny 137.7 and Pixel Canary 137.6 keep their
+  owner floors (no public board). Subscription scope `manager_only` (manager
+  model: sonnet when re-enabled).
 
 ## What changed 2026-10-10
 

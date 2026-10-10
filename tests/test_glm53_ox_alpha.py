@@ -31,13 +31,17 @@ import app
 # 1. glm-5.3 scored exactly the same as glm-5.2
 # --------------------------------------------------------------------------- #
 
-def test_glm_5_3_joins_the_top_band():
-    """It was floored at _PREF_FLOORS[7] (134) as plain "glm-5.x", tied with
-    5.2 -- so the newest, strongest member of the family got no credit for
-    being newer, and sat below claude (138) and every gpt-5.x (135+)."""
-    top = app._PREF_FLOORS[5]                     # the claude/top-band floor
-    assert app._benchmark_score("tokenrouter", "z-ai/glm-5.3-free") >= top
-    assert app._benchmark_score("tokenrouter", "z-ai/glm-5.3") >= top
+def test_glm_5_3_ranked_by_the_boards_now():
+    """OWNER DECISION 2026-10-10: GLM 5.3 is no longer floored at Claude's 138.
+    Its general (chat) score now comes from the boards (AA Index 45 + LMArena
+    1478) and sits in the strong free cluster, close to Kimi K3 and Gemini 3.8
+    Flash, under Claude. Its Terminal-Bench 4.0 lead shows on TOOL turns instead
+    (test_evidence_ranking.py). Still above its own flash cut and above glm-5.2."""
+    for mid in ("z-ai/glm-5.3-free", "z-ai/glm-5.3"):
+        s = app._benchmark_score("tokenrouter", mid)
+        assert 133.0 <= s < app._PREF_FLOORS[5], s          # strong band, under claude's 138
+        assert s > app._benchmark_score("tokenrouter", "z-ai/glm-5.3-flash"), s
+        assert s > app._benchmark_score("glm", "glm-5.2"), s
 
 
 def test_the_flash_variant_is_strong_but_below_the_full_model():
@@ -60,10 +64,14 @@ def test_glm_5_2_is_left_exactly_where_the_user_put_it():
     assert s52 < app._PREF_FLOORS[5]
 
 
-def test_later_glm_versions_stay_in_the_top_band():
-    top = app._PREF_FLOORS[5]
-    assert app._benchmark_score("glm", "glm-5.4") >= top
-    assert app._benchmark_score("glm", "glm-6") >= top
+def test_later_glm_versions_rank_above_5_3():
+    """OWNER DECISION 2026-10-10: a newer version with no board row yet inherits
+    5.3's evidence plus a small bump, so it ranks JUST above 5.3 (not back at the
+    old 138 floor). Once a board lists it, its own numbers win."""
+    base = app._benchmark_score("glm", "glm-5.3")
+    assert app._benchmark_score("glm", "glm-5.4") > base
+    assert app._benchmark_score("glm", "glm-6") > base
+    assert app._benchmark_score("glm", "glm-6") < app._PREF_FLOORS[5]   # still under claude
 
 
 def test_glm_4_is_untouched():

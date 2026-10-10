@@ -45,7 +45,9 @@ RELAY_IDS = ["srv_x:pixel-canary", "Airforce:pixel-canary",
 def test_every_id_shape_outranks_kimi_k3_and_gpt6_astra(model):
     for pid in ("p", "nvidia", "openrouter"):
         pc = s(model, pid)
-        assert pc < s("moonshotai/kimi-k3", pid), (pid, model)     # 2026-09-30
+        # OWNER DECISION 2026-10-10: Kimi K3 is board-ranked now (~134), so Pixel
+        # Canary's kept floor (137.6, no public board) is back above it.
+        assert pc > s("moonshotai/kimi-k3", pid), (pid, model)
         assert pc > s("gpt-6-astra", pid), (pid, model)
         assert pc > s("openai/gpt-6.4-astra", pid), (pid, model)
         assert pc > s("gpt-7", pid), (pid, model)
@@ -55,7 +57,7 @@ def test_every_id_shape_outranks_kimi_k3_and_gpt6_astra(model):
 def test_relay_prefixed_ids_outrank_the_same_relay_kimi_and_gpt6(model):
     # The g4f relay discount applies to every relayed id alike; within the
     # relay the order holds.
-    assert s(model, "g4f") < s("srv_x:kimi-k3", "g4f")              # 2026-09-30
+    assert s(model, "g4f") > s("srv_x:kimi-k3", "g4f")              # 2026-10-10
     assert s(model, "g4f") > s("srv_x:gpt-6-astra", "g4f")
     assert s(model, "g4f") == pytest.approx(app._PREF_FLOORS[11] - app._RELAY_DISCOUNT["g4f"])
 
@@ -81,12 +83,13 @@ def test_fake_catalog_best_pick_is_pixel_canary(monkeypatch):
     }
     monkeypatch.setattr(app, "_available_providers", lambda: list(catalog))
     monkeypatch.setattr(app, "_auto_models", lambda pid: catalog[pid])
-    # Kimi K3 leads since 2026-09-30; Pixel Canary is next, above every GPT.
-    assert app._best_free_pair(working_only=False) == ("nvidia", "moonshotai/kimi-k3")
+    # OWNER DECISION 2026-10-10: Kimi K3 is board-ranked now (~134), below Pixel
+    # Canary's kept floor, so Pixel Canary leads this catalog, above the GPT ladder.
+    assert app._best_free_pair(working_only=False) == ("p", "somevendor/pixel-canary-2")
     ranked = sorted(((s(m, pid), m) for pid, ms in catalog.items() for m in ms),
                     reverse=True)
-    assert [m for _, m in ranked[:3]] == ["moonshotai/kimi-k3", "somevendor/pixel-canary-2",
-                                          "gpt-6-astra"]
+    assert [m for _, m in ranked[:3]] == ["somevendor/pixel-canary-2", "gpt-6-astra",
+                                          "gpt-5.6-sol"]
 
 
 def test_floor_is_a_preference_not_a_natural_score_in_the_spread_band():
@@ -124,7 +127,7 @@ def test_unrelated_canary_ids_score_exactly_as_before(monkeypatch, model):
 def test_flash_cut_gets_the_strong_speed_cap_like_kimi_k3_flash():
     flash = s("pixel-canary-flash")
     assert flash == pytest.approx(app._STRONG_SPEED_CAP)
-    assert flash < s("pixel-canary") < s("kimi-k3")         # kimi-k3 on top since 2026-09-30
+    assert flash < s("kimi-k3") < s("pixel-canary")         # OWNER DECISION 2026-10-10
     assert flash >= app._TOOLS_MIN_SCORE          # still a usable fallback
     assert s("somevendor/Pixel-Canary-2-Flash") == pytest.approx(app._STRONG_SPEED_CAP)
     assert app._is_speed_variant("pixel-canary-flash")

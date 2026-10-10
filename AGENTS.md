@@ -1008,9 +1008,13 @@ comment at the site.
 - AA lookup: OpenRouter vendor namespaces (`deepseek/`, `qwen/`, `xiaomi/`,
   `anthropic/`, `x-ai/`, `minimax/` …) are stripped, and a pre-fix cache's
   vendor-joined keys still match exactly (`_AA_LEGACY_VENDOR_KEYS`).
-- Unchanged because the owner set them or the boards disagree: the Claude floor
-  (Sonnet 5 trails k3 / glm-5.3 / qwen3.8 on both boards), the gpt-5.x and
-  kimi floors, gemini pro-over-flash, and the last-resort tail.
+- Unchanged because the owner set them or the boards disagree: the Claude floor,
+  the gpt-5.x floors, gemini pro-over-flash, and the last-resort tail.
+- SUPERSEDED 2026-10-10 (see "Ranking follows the boards" at the end of this
+  file): the static kimi-k3 (138.1) and glm-5.3 (138) floors are GONE -- those
+  two, plus qwen3.8-27b, are placed by board evidence now, and TOOL turns are
+  ordered by Terminal-Bench 4.0. So MiMo-V2.6-Pro (134.09) vs kimi-k3 is now a
+  genuine ~tie (kimi-k3 ~134.08), not kimi-on-top.
 
 ## /agent servers & hub self-protection (2026-09-27)
 
@@ -3949,3 +3953,69 @@ apply (the request does not clear, no request clock, etc.).
   the `ts` field are dropped when `--since` is set; `single:true` team-notes
   rows are counted separately (`single_team_turns`) and excluded from the roles
   stats. Old rows (no new fields) still parse.
+
+## Ranking follows the boards (2026-10-10)
+
+OWNER DECISION 2026-10-10 (replaces 2026-07-31's "Kimi K3 top free model, 138.1
+just above GLM 5.3's 138"): "benchmark them in our hub like the public boards,
+and in future a NEW version must of course rank higher than them automatically."
+Covered by `tests/test_evidence_ranking.py` (hermetic: fake fleets, no network).
+`benchmarks.py` (pure, stdlib, never raises) + an optional `benchmarks.json`
+override hold a dated, sourced snapshot per model: `tb4` (Terminal-Bench 4.0 %),
+`automation` (AutomationBench %), `aa` (AA Intelligence Index), `arena` (LMArena
+rating), with SOURCE/DATE. All app.py names added for this are `_ev_*`.
+
+- **Two evidence kinds, two paths.** AGENTIC evidence (TB4.0 first,
+  AutomationBench as a sub-point tiebreak) orders TOOL turns: `_agentic_score`
+  adds `benchmarks.agentic_delta` (`_ev_agentic_bonus`) -- monotone, bounded
+  (<= ~11), 10 pts per 100% TB4.0. GENERAL evidence (AA + LMArena) orders
+  TOOL-FREE (chat) turns: `_benchmark_score` places the named models in a narrow
+  strong-band window (`_ev_GEN_LO/HI` 133.0..134.3, capped 134.45 under hy3) by
+  `benchmarks.general_rank` (`_ev_general_floor`). The bonus is 0 and the floor
+  None for any model the boards do not cover, so everything else keeps exactly
+  today's score.
+- **Today's orders** (the six free models the owner benchmarked 2026-10-10):
+  - TOOL: GLM 5.3 (TB 42) > GLM 5.3 Flash (33) > DeepSeek V4.1 Flash (27) >
+    Gemini 3.8 Flash (20) > Kimi K3 (13) > Qwen 3.8 27B (6). GLM 5.3 lands ~2.9
+    clear of Kimi K3 -- OUTSIDE `_AUTO_TOP_BAND` (2.0), a 29-pt TB4.0 gap is never
+    a coin flip -- while GLM 5.3 vs GLM 5.3 Flash (~1.1) stays inside. A model with
+    agentic evidence may lead a tool turn even under the 138 floor
+    (`_may_lead_agentic` + `_ev_has_agentic_evidence`).
+  - CHAT: Kimi K3 ~ Gemini 3.8 Flash ~ GLM 5.3 close at the top (~134.0-134.1),
+    then GLM 5.3 Flash, DeepSeek V4.1 Flash, Qwen 3.8 27B below -- all under Claude
+    (138), Space Bunny (137.7), Pixel Canary (137.6), the gpt ladder and hy3
+    (134.5). Those are UNCHANGED (Claude has the top AA Index; the other two are
+    owner floors with no public board the owner said to keep).
+- **The old floors are replaced, not re-indexed.** The kimi-k3 and glm-5.3 floor
+  CODE in `_benchmark_score` is gone; `_PREF_FLOORS[1]` (138.1) stays in the tuple
+  (other sites read it by index). glm-5.0..5.2 keep `_PREF_FLOORS[7]`.
+- **A new unlisted version auto-ranks above its predecessor.** benchmarks matches
+  by `modelrank.parse` (family, tier) + explicit param size; a version higher than
+  any listed one inherits the newest row + a small version bump (`floor_bump` <=
+  0.30), so glm-5.4 > glm-5.3, kimi-k4 > kimi-k3, deepseek-v4.2-flash > v4.1-flash,
+  qwen3.9-27b > qwen3.8-27b, all still under the owner floors. Once a board lists
+  the new version its own row wins; older versions keep being lowered by modelrank.
+- **Size variants never inherit the full-size flagship floor.** A cut naming a
+  small param count (27b/32b/8b, `_ev_SMALL_PARAM_B` 70) or `-mini`/`-small`
+  (`_ev_small_param_variant`) sits a documented step (`_ev_SIZE_STEP` 1.0) under
+  the flagship floor, newest-first; WITH board evidence it is placed by the boards
+  (Qwen 3.8 27B ~133.08, below GLM 5.3 Flash and DeepSeek V4.1 Flash). qwen3.8-max
+  (not listed) keeps the full qwen floor.
+- **Keyless auto-refresh where a source has the field.** General AA is already
+  refreshed 6-hourly keylessly from OpenRouter's catalog
+  (`_fetch_aa_scores_keyless`). `benchmarks.parse_openrouter_row` is a
+  forward-compatible hook that reads AA agentic/coding sub-indexes from the same
+  catalog-row shape IF they ever appear -- none are published today (verified from
+  the code and the cached response shape: only `intelligence_index` exists), so the
+  dated table drives the agentic numbers. The day OpenRouter publishes
+  Terminal-Bench / AutomationBench, the hook picks them up with no code change.
+- **Visible.** `/api/tracking` rows gain `agentic_evidence` {tb4, automation,
+  source, date, inherited_from?} and `general_evidence` {aa, arena,
+  inherited_from?}.
+- **Caveat -- production vs the pure board order.** The TOOL order above is the
+  BOARD order; `_agentic_score` still subtracts the existing learned/dialect
+  penalties, so e.g. DeepSeek V4.1 Flash's documented 25-pt tool-dialect penalty
+  (`_TOOL_DIALECT_MISMATCH`, malformed tool calls) still demotes it on LIVE tool
+  turns. Board evidence sets the order among equally-reliable candidates; it does
+  not override a measured failure. The relay discount and sustain penalty are
+  untouched (relay Claude stays well below first-party GLM 5.3 on tool turns).

@@ -114,21 +114,20 @@ def test_promoted_families_hit_the_top_bands():
 # Id-keyed like the other floors (no provider-id checks in routing).
 # --------------------------------------------------------------------------- #
 
-def test_user_ranking_kimi_k3_then_claude_then_gpt5_then_gemini():
-    """USER RANKING, 3rd revision 2026-09-30: kimi-k3 > claude/glm-5.3 >
-    gpt-5.x > gemini. The owner put Kimi K3 "just above GLM 5.3" as the top
-    free model (Arena text 1488 vs 1480; AA Index 44 vs 45 -- a tie). The
-    2nd revision (2026-07-31) had it after claude and every gpt-5.x."""
+def test_board_ranking_claude_and_gpt_over_kimi_k3():
+    """OWNER DECISION 2026-10-10 (replaces "kimi-k3 just above GLM 5.3 at 138.1"):
+    Kimi K3 is ranked by the boards now -- AA Index 44 / LMArena 1488 -- which
+    sit UNDER Claude (AA 58) and the GPT-5.x ladder (AA ~52). So on GENERAL (chat)
+    turns Claude and GPT outrank Kimi K3; Kimi's agentic strength shows on TOOL
+    turns instead (test_evidence_ranking.py). Claude and the GPT floor are
+    untouched (families the owner did not re-benchmark this round)."""
     kimi = app._benchmark_score("testpid", "kimi-k3")
     claude = app._benchmark_score("puter", "claude-opus-5")
     gpt = app._benchmark_score("puter", "gpt-5.6-sol")
-    gemini = app._benchmark_score("puter", "gemini-3-pro")
-    assert kimi > claude > gpt > gemini, (kimi, claude, gpt, gemini)
-    # kimi-k3 and claude are flat floors; the GPT floor SCALES with the version
-    # (since 2026-07-31), so it is checked as a band rather than an exact value.
+    assert claude > gpt > kimi, (claude, gpt, kimi)
     assert claude == 138
-    assert abs(kimi - 138.1) < 1e-6
     assert 135 <= gpt < 138
+    assert 133.0 <= kimi < gpt            # strong free cluster, under the owner floors
 
 
 def test_gemini_is_ranked_last_by_getting_no_floor_at_all():

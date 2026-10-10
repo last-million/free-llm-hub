@@ -84,7 +84,9 @@ def test_space_bunny_is_in_the_top_band():
     s = lambda m, p="openrouter": app._benchmark_score(p, m)      # noqa: E731
     assert s("stealth/space-bunny-alpha") == pytest.approx(app._PREF_FLOORS[12])
     assert s("stealth/space-bunny-alpha") > s("pixel-canary")
-    assert s("moonshotai/kimi-k3") > s("stealth/space-bunny-alpha")   # owner, 2026-09-30
+    # OWNER DECISION 2026-10-10: Kimi K3 is board-ranked now (~134); Space Bunny
+    # has no public board, so its owner floor (137.7) stays above Kimi K3.
+    assert s("stealth/space-bunny-alpha") > s("moonshotai/kimi-k3")
     assert app._PREF_FLOORS[12] < app._PREF_FLOORS[5]              # still under Claude's 138
     assert s("srv_x:stealth/space-bunny-alpha", "g4f") == pytest.approx(
         app._PREF_FLOORS[12] - app._RELAY_DISCOUNT["g4f"])

@@ -83,7 +83,11 @@ def test_mimo_26_pro_joins_the_qwen38_level():
     assert mimo >= s("qwen/qwen3.8-max")                        # 46 v 45, 1480 v 1479
     assert mimo > s("deepseek-ai/deepseek-v4.1-flash")          # 39 / 1477
     assert mimo > s("minimax-m3")                               # 29 / 1440
-    assert mimo < s("kimi-k3")                                  # disputed -> unchanged
+    # OWNER DECISION 2026-10-10: Kimi K3 is now ranked by the boards (AA 44 /
+    # Arena 1488), not the old 138.1 floor. Kimi vs MiMo is genuinely disputed
+    # (AA: MiMo 46 > Kimi 44; Arena: Kimi 1488 > MiMo 1480), so they sit close
+    # and the strict order is left unasserted.
+    assert abs(mimo - s("kimi-k3")) < 1.0                       # disputed -> close
 
 
 def test_mimo_floor_matches_relay_spellings():

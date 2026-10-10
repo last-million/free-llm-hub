@@ -16,10 +16,15 @@
 import app
 
 
-def test_latest_qwen_is_floored_beside_its_named_peers():
-    glm = app._benchmark_score("wandb", "zai-org/GLM-5.2")
+def test_latest_qwen_size_variants_sit_below_the_full_flagship():
+    """OWNER DECISION 2026-10-10 (size variants): a small cut (27B/35B) no longer
+    inherits the full-size family floor -- it sits a documented step under it,
+    newest-first, so it ranks below a full glm-5.2. With board evidence
+    (qwen3.8-27b) the placement comes from the boards; without it, the step."""
+    glm = app._benchmark_score("wandb", "zai-org/GLM-5.2")              # ~134 (full size)
     for mid in ("qwen/qwen3.8-27b", "qwen/qwen3.6-27b", "Qwen/Qwen3.5-35B-A3B"):
-        assert app._benchmark_score("groq", mid) >= glm, mid
+        s = app._benchmark_score("groq", mid)
+        assert app._PREF_FLOORS[7] - 2.0 <= s < glm, mid
 
 
 def test_a_newer_qwen_outranks_an_older_one():

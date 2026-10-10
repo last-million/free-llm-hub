@@ -102,6 +102,12 @@ def fleet(monkeypatch):
     # tool-chain rules, not that list.
     monkeypatch.setattr(A, "_is_low_quality", lambda m: False)
     monkeypatch.setattr(A, "_is_tool_proven", lambda m: "gpt-oss" in m)
+    # OWNER DECISION 2026-10-10 board evidence is ORTHOGONAL to the chain
+    # MECHANICS under test here (vision-last, per-provider spread, the walk), and
+    # these synthetic scores put gpt-oss on top on purpose; neutralise the
+    # evidence layer so it decides, exactly as the penalties above are zeroed.
+    monkeypatch.setattr(A, "_ev_agentic_bonus", lambda m: 0.0)
+    monkeypatch.setattr(A, "_ev_has_agentic_evidence", lambda m: False)
     return world
 
 

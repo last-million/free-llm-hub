@@ -263,9 +263,14 @@ def test_the_owners_cross_family_order_is_unchanged(monkeypatch):
               "deepseek-ai/deepseek-v4.1-flash", "deepseek-ai/deepseek-v4-pro"]
     for m in newest:
         assert ranked_[m] == pytest.approx(plain[m]), m
-    assert (ranked_["moonshotai/kimi-k3"] > ranked_["nvidia/z-ai/glm-5.3"]
-            >= ranked_[CLAUDE[0]] > ranked_["stealth/space-bunny-alpha"]
-            > ranked_["pixel-canary"])
+    # OWNER DECISION 2026-10-10: Kimi K3 and GLM 5.3 are ranked by the boards
+    # now (general: AA + LMArena), no longer pinned above Claude. Claude keeps its
+    # floor (it has the top AA Index), and the no-evidence owner floors (Space
+    # Bunny, Pixel Canary) stay above the board-ranked free pair, which sits close
+    # together (Kimi K3 just over GLM 5.3 on the AA+Arena average).
+    assert (ranked_[CLAUDE[0]] > ranked_["stealth/space-bunny-alpha"]
+            > ranked_["pixel-canary"] > ranked_["moonshotai/kimi-k3"]
+            >= ranked_["nvidia/z-ai/glm-5.3"])
 
 
 def test_the_one_deliberate_exception_sonnet_and_fable_sit_under_the_old_138(monkeypatch):
@@ -329,7 +334,9 @@ def test_a_weak_newest_release_is_not_an_anchor(monkeypatch):
     """A tiny new model (size-capped to 30) must not drag the strong older line."""
     _fleet(monkeypatch, ["qwen/qwen3.8-27b", "qwen/qwen4-0.5b"])
     assert score("qwen/qwen4-0.5b") <= 30
-    assert score("qwen/qwen3.8-27b") == pytest.approx(134.08)
+    # OWNER DECISION 2026-10-10: the 27B size variant is placed by its own board
+    # evidence (below the full-size flagship floor), ~133.08 now, not 134.08.
+    assert score("qwen/qwen3.8-27b") == pytest.approx(133.08)
 
 
 def test_the_anchor_scoring_never_re_enters_the_ranking(monkeypatch):

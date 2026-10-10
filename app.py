@@ -86,6 +86,7 @@ import image_history
 import craft
 import arena
 import modelrank
+import benchmarks
 import lowres
 import orchestrator
 import skills
@@ -2444,6 +2445,114 @@ def _rank_anchor_for(family, tier):
     return _rank_anchors().get((family, tier))
 
 
+# --------------------------------------------------------------------------- #
+# BOARD EVIDENCE (benchmarks.py) -- OWNER DECISION 2026-10-10. Agentic evidence
+# (Terminal-Bench 4.0 + AutomationBench) orders TOOL turns; general evidence
+# (AA + LMArena) orders TOOL-FREE turns. See "Ranking follows the boards" in
+# AGENTS.md. All names here are _ev_* (a sibling session also edits app.py).
+# --------------------------------------------------------------------------- #
+# The strong-band window the general evidence places named free models into:
+# kept narrow so the three strongest free chat models sit "close at the top",
+# and under the owner floors above them (hy3 134.5 / claude 138 / space-bunny
+# 137.7 / pixel-canary 137.6 / the gpt ladder). The cap stays just under hy3.
+_ev_GEN_LO = 133.0
+_ev_GEN_HI = 134.3
+_ev_GEN_CAP = 134.45
+
+
+def _ev_general_floor(low):
+    """A board-evidence floor (AA + LMArena) for a model whose general ranking
+    the owner moved off a static floor onto the boards, or None. NOT applied to
+    speed variants (-flash/-air/...): their existing version-ordered floors are
+    already board-sourced and keep newer-above-older. A NEW version with no board
+    row inherits its predecessor's rank plus a small bump (benchmarks.py)."""
+    try:
+        if _SPEED_VARIANT_RE.search(low):
+            return None
+        ev = benchmarks.general_evidence(low)
+        if ev is None:
+            return None
+        rank = benchmarks.general_rank(ev)
+        if rank is None:
+            return None
+        floor = _ev_GEN_LO + (_ev_GEN_HI - _ev_GEN_LO) * rank + ev.get("floor_bump", 0.0)
+        return min(floor, _ev_GEN_CAP)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _ev_agentic_bonus(model_id):
+    """Points added to a TOOL-turn candidate from agentic evidence (TB4.0 first,
+    AutomationBench as a sub-point tiebreak). 0 for a model with no agentic
+    evidence -- so a model the boards do not cover keeps exactly today's score."""
+    try:
+        return benchmarks.agentic_delta(benchmarks.agentic_evidence(model_id))
+    except Exception:                                            # noqa: BLE001
+        return 0.0
+
+
+def _ev_has_agentic_evidence(model_id):
+    """True when the boards give this model an agentic-coding record, so it may
+    lead a tool turn even if its general (chat) score sits under the top floor."""
+    try:
+        return benchmarks.agentic_evidence(model_id) is not None
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _ev_small_param_variant(low):
+    """True for an id naming a small, below-flagship parameter count (27b, 32b,
+    8b, ...) or a -mini/-small cut -- it must not inherit the full-size family
+    flagship's floor (OWNER DECISION 2026-10-10, size variants). A speed cut
+    (-flash/-air) is handled by its own cap and is NOT treated as a size variant
+    here."""
+    try:
+        m = benchmarks._SIZE_RE.search(low or "")
+        if m and int(m.group(1)) <= _ev_SMALL_PARAM_B:
+            return True
+        return bool(_MINI_SUFFIX_RE.search(low or "")) or "-small" in (low or "")
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+# A dense param count at or under this is a small/below-flagship size variant
+# (today's flagships are 200B+ MoE or unlabelled); 70 keeps 27b/32b/8b in, 120b+ out.
+_ev_SMALL_PARAM_B = 70
+# How far under the full-size family flagship floor a size variant with NO board
+# evidence sits (version order among the cuts is preserved). A cut WITH evidence
+# is placed by _ev_general_floor instead; ~1 pt lands both near the same place.
+_ev_SIZE_STEP = 1.0
+
+
+def _ev_agentic_evidence_view(model_id):
+    """The agentic_evidence row shaped for /api/tracking, or None."""
+    try:
+        ev = benchmarks.agentic_evidence(model_id)
+        if ev is None:
+            return None
+        out = {"tb4": ev.get("tb4"), "automation": ev.get("automation"),
+               "source": ev.get("source"), "date": ev.get("date")}
+        if ev.get("inherited_from"):
+            out["inherited_from"] = ev["inherited_from"]
+        return out
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _ev_general_evidence_view(model_id):
+    """The general_evidence row shaped for /api/tracking, or None."""
+    try:
+        ev = benchmarks.general_evidence(model_id)
+        if ev is None:
+            return None
+        out = {"aa": ev.get("aa"), "arena": ev.get("arena")}
+        if ev.get("inherited_from"):
+            out["inherited_from"] = ev["inherited_from"]
+        return out
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def _benchmark_score(pid, model_id, _rank=True):
     """Strength score for a '<model>' on provider `pid` (higher=better). Base
     tier comes from a REAL Artificial Analysis Intelligence Index match when
@@ -2541,21 +2650,14 @@ def _benchmark_score(pid, model_id, _rank=True):
                 score = max(score, _PREF_FLOORS[5] + _band_version_bump(_hmaj, 0, 4, 0))
         except ValueError:
             pass
-    # USER PREFERENCE: Kimi K3 (Moonshot) — top pick for the heaviest tasks, right
-    # behind hy3 and above every other model. Auto-applies when a provider serves a
-    # kimi-k3 id (nothing lists it yet). Matches kimi-k3 / kimi-k3.x / .../kimi-k3.
-    # k3 AND UP. This was the literal string "kimi-k3", so kimi-k4 matched
-    # nothing and scored 108 against k3's 134.8 -- the newer model ranking below
-    # the one it replaces, the same defect found in glm, hunyuan and qwen. The
-    # k2.x ceiling below is unaffected: it is a separate, explicit demotion the
-    # user asked for, and 2 < 3 never reaches this floor.
-    _km = _KIMI_VERSION_RE.search(low)
-    if _km:
-        try:
-            if int(_km.group(1)) >= 3:
-                score = max(score, _PREF_FLOORS[1] + min(int(_km.group(1)) - 3, 9) * 0.1)
-        except ValueError:
-            pass
+    # OWNER DECISION 2026-10-10: Kimi K3 is no longer floored above GLM 5.3. Its
+    # general (chat) score now comes from the boards (AA Index 44 + LMArena 1488)
+    # via _ev_general_floor() applied below, and its TOOL-turn rank from
+    # Terminal-Bench 4.0 (Kimi K3 13% -- last of the six benchmarked free models
+    # on agent work) via the _agentic_score bonus. A newer Kimi inherits K3's
+    # evidence plus a bump (benchmarks.py); modelrank still lowers older versions.
+    # _PREF_FLOORS[1] stays in the tuple (other sites read it by index) but the
+    # old kimi-k3 floor is gone. The k2.x ceiling below is a separate demotion.
     # USER CORRECTION 2026-07-31: "kimi 2.7 is not better than qwen 3.5 or 3.6,
     # or even mimo 2.5." It used to be FLOORED at 133, which ranked it above
     # qwen3.6 (109) and mimo (100) and made it win turns it should not have.
@@ -2635,14 +2737,13 @@ def _benchmark_score(pid, model_id, _rank=True):
     # tying the fast cut with Claude and making it the auto/best/max pick over
     # every full frontier model. The top band is for full models; -flash/-air/
     # -lite/-mini land under _STRONG_SPEED_CAP instead (see the cap below).
-    _glmv = _GLM_VERSION_RE.search(low)
-    if _glmv and not _SPEED_VARIANT_RE.search(low):
-        try:
-            _gmaj, _gmin = int(_glmv.group(1)), int(_glmv.group(2) or 0)
-            if (_gmaj, _gmin) >= (5, 3):
-                score = max(score, _PREF_FLOORS[5] + _band_version_bump(_gmaj, _gmin, 5, 3))
-        except ValueError:
-            pass
+    # OWNER DECISION 2026-10-10 (SUPERSEDES the "ox alpha = top band" block
+    # above): GLM 5.3 is no longer floored at Claude's 138. Its general score now
+    # comes from the boards (AA Index 45 + LMArena 1478) via _ev_general_floor()
+    # below -- which leaves it "close at the top" with Kimi K3 and Gemini 3.8
+    # Flash -- and its TOOL rank from Terminal-Bench 4.0 (GLM 5.3 42%, the top
+    # agentic coder of the six) via the _agentic_score bonus. glm-5.0..5.2 keep
+    # the _PREF_FLOORS[7] floor above; glm-5.4+ inherits 5.3's evidence + a bump.
     # USER PREFERENCE 2026-08-01: "DeepSeek V4 should have priority almost as
     # much as GLM 5.2, and MiniMax M3 is also good, almost like DeepSeek 4."
     # UPDATED 2026-08-01, same day: "deepseek v4 seems good so it should be the
@@ -2698,7 +2799,16 @@ def _benchmark_score(pid, model_id, _rank=True):
             # major version is worth more than a minor: 3.5 -> 134.05,
             # 3.8 -> 134.08, 4.0 -> 134.10, 5.0 -> 134.20.
             _bump = min(_qmaj - 3, 9) * 0.1 + min(_qmin, 9) * 0.01
-            score = max(score, _PREF_FLOORS[7] + _bump)
+            # OWNER DECISION 2026-10-10 (size variants): a SMALL below-flagship
+            # cut (qwen3.8-27b, ...) must NOT inherit the full-size flagship
+            # floor -- it sits a documented step under it (keeping newest-first
+            # order among the cuts). A cut WITH board evidence is then lifted to
+            # its evidence placement by _ev_general_floor() below (Qwen 3.8 27B
+            # below GLM 5.3 Flash and DeepSeek V4.1 Flash).
+            _qbase = _PREF_FLOORS[7]
+            if _ev_small_param_variant(low):
+                _qbase -= _ev_SIZE_STEP
+            score = max(score, _qbase + _bump)
     if _MINIMAX3_RE.search(low):
         score = max(score, _PREF_FLOORS[10])
     # REBENCH 2026-09-27: MiMo-V2.6-Pro sat on the bare Tier S 100, i.e. BELOW
@@ -2858,6 +2968,16 @@ def _benchmark_score(pid, model_id, _rank=True):
                 score = max(score, _GEMINI_LITE_FLOOR)
         except ValueError:
             pass
+    # BOARD EVIDENCE for GENERAL (chat) ranking (OWNER DECISION 2026-10-10).
+    # Places the named free models (Kimi K3, GLM 5.3, Qwen 3.8 27B, and any newer
+    # version inheriting their evidence) in the strong band by AA + LMArena --
+    # "close at the top", under the owner floors. Speed variants are left to
+    # their existing version-ordered floors (_ev_general_floor returns None).
+    # A max() so it only ever lifts to the board placement; modelrank below then
+    # still lowers OLDER versions relative to this (now board-placed) anchor.
+    _ev_floor = _ev_general_floor(low)
+    if _ev_floor is not None:
+        score = max(score, _ev_floor)
     # NEWEST AND BIGGEST FIRST, INSIDE ONE FAMILY (modelrank.py, owner rule
     # 2026-10-08). After every floor (they are max()es, so nothing earlier could
     # carry a gap) and before the relay discount: an OLDER release of a
@@ -15539,8 +15659,14 @@ def _may_lead_agentic(score, model_id):
     fact instead of only being prevented beforehand.
 
     So the gate is WIDENED, not removed: allowlisted, or in the top band. An
-    unproven mid-tier model still may not lead a build."""
-    return _is_tool_proven(model_id) or score >= _PREF_FLOORS[5]
+    unproven mid-tier model still may not lead a build.
+
+    OWNER DECISION 2026-10-10: a model with a real agentic-coding record on the
+    boards (Terminal-Bench 4.0, benchmarks.py) may also lead -- its general
+    (chat) score now sits in the free cluster (~134), under the 138 floor, but
+    its proven agent ability is the whole point of leading a tool turn."""
+    return (_is_tool_proven(model_id) or score >= _PREF_FLOORS[5]
+            or _ev_has_agentic_evidence(model_id))
 
 
 def _may_lead_pool(pool):
@@ -15594,10 +15720,17 @@ def _agentic_score(entry, sustain_override=None):
                else None)
     if penalty is None:
         penalty = _sustain_penalty(entry[1])
+    # OWNER DECISION 2026-10-10: agentic BOARD evidence (Terminal-Bench 4.0 first,
+    # AutomationBench as a sub-point tiebreak) orders tool turns. The bonus is
+    # monotone and bounded (benchmarks.agentic_delta, <= ~11); it is 0 for a model
+    # the boards do not cover, so those keep exactly their prior agentic order.
+    # Sized so a 29-point TB4.0 gap (GLM 5.3 vs Kimi K3) clears _AUTO_TOP_BAND
+    # while a 9-point gap (GLM 5.3 vs GLM 5.3 Flash) stays inside it.
     return (entry[0] - penalty - _tool_dialect_penalty(entry[2])
             - _reliability_penalty(entry[1], entry[2])
             - _latency_penalty(entry[1], entry[2])
-            - _answer_quality_penalty(entry[1], entry[2]))
+            - _answer_quality_penalty(entry[1], entry[2])
+            + _ev_agentic_bonus(entry[2]))
 
 
 def _context_ok(pid, model, est):
@@ -19254,6 +19387,11 @@ def api_tracking():
                 # Its LMArena text rating and rank, when the board has it.
                 "arena_rating": _ar.get("rating") if _ar else None,
                 "arena_rank": _ar.get("rank") if _ar else None,
+                # Board evidence (OWNER DECISION 2026-10-10): agentic = TB4.0 +
+                # AutomationBench (orders tool turns); general = AA + LMArena
+                # (orders chat). None when the boards do not cover the model.
+                "agentic_evidence": _ev_agentic_evidence_view(m),
+                "general_evidence": _ev_general_evidence_view(m),
                 "id": pid + "/" + m, "provider": pid, "model": m,
                 "score": score, "tool_capable": _supports_tools(pid, m),
                 "fast": _is_fast(pid, m), "state": state,

@@ -57,9 +57,14 @@ def test_a_newer_hunyuan_outranks_the_one_it_replaces():
 
 
 def test_they_all_stay_in_the_top_band():
-    """Ordering within the band, not a new tier above everything."""
-    for m in ("z-ai/glm-5.3", "z-ai/glm-6", "tencent/hy4", "tencent/hy6"):
+    """Ordering within the band, not a new tier above everything.
+    OWNER DECISION 2026-10-10: the hunyuan floor is unchanged (no board evidence)
+    so hy4/hy6 stay in the 138 band; GLM is board-ranked now and sits in the
+    strong free cluster (~134), under the owner floors, still newest-first."""
+    for m in ("tencent/hy4", "tencent/hy6"):
         assert TOP <= _s(m) < TOP + 1.0, (m, _s(m))
+    for m in ("z-ai/glm-5.3", "z-ai/glm-6"):
+        assert 133.0 <= _s(m) < TOP, (m, _s(m))
 
 
 def test_the_flash_variant_scales_the_same():

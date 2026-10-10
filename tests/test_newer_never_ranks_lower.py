@@ -26,8 +26,12 @@ import app
 # (label, ids in ascending version order). Every entry is a REAL id shape the
 # catalog uses or would use for the next release of that family.
 _FAMILIES = [
-    ("qwen",     ["qwen/qwen3.6", "qwen/qwen3.8-27b", "qwen/qwen3.9",
-                  "qwen/qwen4", "qwen/qwen4.5", "qwen/qwen5"]),
+    # OWNER DECISION 2026-10-10: the "newer never lower" rule holds WITHIN one
+    # size class. qwen's listed cut is 27B, so this line is all-27B (a 27B cut
+    # sits a step below the full-size floor, but a newer 27B still beats an
+    # older 27B); the full-size progression is covered by test_the_reported_case.
+    ("qwen",     ["qwen/qwen3.6-27b", "qwen/qwen3.8-27b", "qwen/qwen3.9-27b",
+                  "qwen/qwen4-27b", "qwen/qwen4.5-27b", "qwen/qwen5-27b"]),
     ("glm",      ["z-ai/glm-5.3", "z-ai/glm-5.4", "z-ai/glm-6", "z-ai/glm-7"]),
     ("hunyuan",  ["tencent/hy4", "tencent/hy5", "tencent/hy6"]),
     ("deepseek", ["deepseek/deepseek-v4", "deepseek/deepseek-v5",
@@ -61,11 +65,14 @@ def test_the_reported_case():
     assert _score("qwen/qwen4") >= _score("qwen/qwen3.9")
 
 
-def test_qwen_3_8_is_where_the_user_expects_it():
-    """"qwen 3.8 is goood tooo" -- it was already floored; this pins it so a
-    future edit to the qwen regex cannot quietly drop it."""
-    assert _score("qwen/qwen3.8-27b") >= app._PREF_FLOORS[7]
-    assert _score("Qwen/Qwen3.8-27B") >= app._PREF_FLOORS[7]
+def test_qwen_3_8_27b_is_a_size_variant_below_the_flagship():
+    """OWNER DECISION 2026-10-10: the 27B cut is placed by its own board evidence,
+    a documented step under the full-size qwen floor (not at it), and still above
+    older 27B cuts. "qwen 3.8 is goood" still holds -- it leads its size class."""
+    for mid in ("qwen/qwen3.8-27b", "Qwen/Qwen3.8-27B"):
+        s = _score(mid)
+        assert app._PREF_FLOORS[7] - 2.0 <= s < app._PREF_FLOORS[7], (mid, s)
+        assert s > _score("qwen/qwen3.6-27b"), mid
 
 
 def test_older_weak_versions_are_still_not_promoted():

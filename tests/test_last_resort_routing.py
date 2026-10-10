@@ -262,8 +262,9 @@ def test_kimi_k26_k27_are_capped_below_mimo_and_qwen(fresh_quota, monkeypatch):
                      ("cloudflare", "@cf/moonshotai/kimi-k2.6"),
                      ("cloudflare", "@cf/moonshotai/kimi-k2.7-code")):
         assert app._benchmark_score(pid, mid) <= ceiling, (pid, mid)
-    # K3 keeps its own floor, well above the K2 generation
-    assert app._benchmark_score("morph", "morph-kimik3") == app._PREF_FLOORS[1] > ceiling
+    # K3 is board-ranked now (OWNER DECISION 2026-10-10, not the 138.1 floor),
+    # but still well above the capped K2 generation.
+    assert app._benchmark_score("morph", "morph-kimik3") > ceiling
 
 def test_peek_timeout_fast_model_small_request_stays_short():
     assert app._stream_peek_timeout("llama-3.3-70b-versatile", 400) \
