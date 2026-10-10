@@ -4461,3 +4461,107 @@ FALLBACK chain -- the downside the owner accepted. The chat turn opener is
 unchanged (nvidia/kimi-k3, by `_benchmark_score`). The owner accepted that relay
 copies (g4f "Claude Opus 5.5", "GPT-6.x", llm7, navy, nararouter) are tried more
 often before falling back.
+
+## GitHub push for Build projects (2026-10-10)
+
+Owner: from the Build page, push the current project to GitHub -- first time
+create a repo on the owner's OWN account (private by default), afterwards Push /
+Sync on a click. NEVER automatic: every create/push/gitignore write is an
+explicit, confirmed click. Covered by `tests/test_github_push.py` (hermetic:
+fake GitHub HTTP, REAL git in tmp_path against a LOCAL BARE repo via an injected
+remote-URL resolver; an autouse fence fails loudly if anything reaches the real
+api.github.com). Pure engine: `ghpush.py` (stdlib only -- urllib for the REST
+API, subprocess argv lists for git; every side effect injectable: `http`,
+`run_git`, `clock`, `store`, `remote_url`). It raises only `GhError(code,
+message, extra)`. New app.py symbols are `_gh_*`; the routes are a new
+`# GITHUB:` section beside `# PUBLISH:`.
+
+- **Token.** The owner pastes a GitHub token (fine-grained: Contents +
+  Administration read/write for repo creation, Metadata read; or classic
+  `repo`). It is validated with GET /user, then stored ENCRYPTED with the
+  provider-key mechanism (`secretstore.encrypt`) under `config["github"]`
+  (`{token: enc.v1:…, login, user_id, hint}`). It is NEVER logged (the route
+  logs the login only), NEVER returned (status shows `login` + a masked
+  `hint` = type prefix + last four), and NEVER written into `.git/config` or a
+  remote URL. Storing it there (not in `providers`) keeps it OUT of
+  `migrations.key_fingerprint` (so a migration never counts or risks it) and
+  out of config's providers-only encrypt/decrypt pass -- `save_config` carries
+  the pre-encrypted string through untouched and it stays encrypted on load.
+  `tests/test_safe_migrations.py` stays green.
+- **git auth.** The `github` remote URL is `https://github.com/<login>/<repo>.git`
+  with NO token. The token reaches git only through a `GIT_ASKPASS` helper
+  script in a private 0700 temp dir (deleted right after the command) that
+  echoes the env var `GH_ASKPASS_TOKEN` -- the token is never on a command line
+  and never in the script body. Every git call runs with `-c credential.helper=`
+  (empty) + `GIT_TERMINAL_PROMPT=0` + `GIT_CONFIG_NOSYSTEM=1`, so NO credential
+  manager is read or written (this PC's Windows Credential Manager holds a
+  DIFFERENT account and must never be used). Commit identity, only when the repo
+  has none configured: `-c user.name=<login> -c user.email=<id>+<login>@users.noreply.github.com`
+  per command (never the global config).
+- **Create.** POST /user/repos `{name, private, auto_init:false}` on the
+  authenticated user's account. The name is sanitized to GitHub's rules; a 422
+  "already exists" is `repo_exists`, a 401/403 is `bad_scope`. Private is the
+  default; a public repo additionally needs `public_ok`. Then the local repo is
+  wired (`git init -b main` when it has no `.git`; a SEPARATE remote named
+  `github` is added -- `origin` and any other remote are never touched) and the
+  first commit is pushed.
+- **Secret scan before every push** (blocks, code `secrets_found`, offers a
+  .gitignore): file names `.env`/`.env.*` (except `.env.example`), `*.pem`,
+  `*.key`, `id_rsa*`, `*.p12`, `credentials.json`; and content shapes `ghp_`,
+  `github_pat_`, `sk-…`, `AKIA…`, `-----BEGIN … PRIVATE KEY-----`, `xox[baprs]-`,
+  `AIza…`. The scan reads only what WOULD be committed (`git status --porcelain
+  -z --untracked-files=all`, so .gitignore is respected). The default
+  `.gitignore` is `node_modules/`, `.venv/`, `venv/`, `__pycache__/`, `*.pyc`,
+  `.env`, `.env.*`, `!.env.example`, `*.log`, `.DS_Store`. **Build output
+  (`dist/`, `build/`) is deliberately NOT in the default** -- a project may
+  commit it on purpose (e.g. GitHub Pages); the user adds it via the same
+  button. .gitignore is only ever written on an explicit click.
+- **Push.** `git add -A` inside the project (the `git add -A` ban is for the hub
+  repo only), commit `"Update from Calvoun Build"` ONLY when there are staged
+  changes (never an empty commit), then `git push github HEAD:main` -- NEVER a
+  force push. A non-fast-forward is `behind_remote` ("press Sync first").
+- **Sync.** `git fetch github` then `git merge --ff-only github/main`. A
+  diverged history is `diverged` with a plain explanation -- no auto-merge, no
+  rebase.
+- **Refusals** (`_guard_folder`): the hub's own repo (`_cm_is_hub_repo`), a
+  too-broad folder (`_publish_folder_too_broad`: a drive root / home / above
+  it), and a symlinked/junction or non-directory folder. The hub's two guards
+  are injected at import (`ghpush.default.set_guards(...)`); ghpush does the
+  link/dir check itself. `status()` reports a refusal in `project.refused`
+  instead of raising.
+- **State.** Per-project last repo + visibility + last-pushed + ahead/behind
+  (ahead/behind only after a fetch, i.e. on Sync) in
+  `state_dir()/github-projects.json` (atomic write), keyed by the folder's
+  realpath.
+- **Routes** (all `/api/*`, so the existing control-token + dashboard-header
+  guard applies; `Cache-Control: no-store`): `GET /api/github[?project_dir=]`,
+  `POST /api/github/token {token}`, `POST /api/github/token/delete`,
+  `GET /api/github/preview?project_dir=`, `POST /api/github/gitignore
+  {project_dir, add:[…]|default:true, confirm:true}`, `POST /api/github/create
+  {project_dir, name, private (default true), public_ok (needed for public),
+  confirm:true}`, `POST /api/github/push {project_dir, confirm:true}`,
+  `POST /api/github/sync {project_dir}`. +8 routes (README route count 176 ->
+  184; `tests/test_readme_claims.py` counts `@app.route(`).
+- **Flag** `github_push` (`config.get_flag`, default on): off -> every mutation
+  is 403 `disabled`; status still answers (with `enabled:false`).
+- **UI** (`templates/index.html`): a **GitHub** button in `#preview-bar` after
+  `#preview-publish` opens `#github-dialog`, a native `<dialog>` modelled on
+  `#publish-dialog` (moved under `<body>`, `showModal()`, Esc/backdrop/X close,
+  the title takes focus, theme tokens only, 44px targets, bottom sheet
+  <= 640px). Three states: no token (steps + the
+  `https://github.com/settings/personal-access-tokens/new` link + a
+  password input + Save); connected-no-repo (name prefilled from the folder,
+  Private/Public radios with a required public tick, Create & push); linked
+  (repo link, visibility chip, last pushed, ahead/behind, the preview + findings
+  with "Add to .gitignore", Push, Sync, Disconnect). Backend strings go in via
+  `textContent` only; a repo link is only ever a validated `https://` URL
+  (`ghSafeUrl`). CSS is a token-only `/* github-css:start/end */` block; the JS
+  is `/* github-js:start/end */`; both hooked into `preview.attach` /
+  `.detach` / `.paneVisible` next to Publish.
+- **Limits / decisions.** The token is validated once at connect; a token that
+  later loses a scope surfaces as `bad_scope` on create or the git push failing.
+  ahead/behind are shown from the last fetch, not refreshed on plain status (a
+  fetch is network). `dist/`/`build/` are not in the default .gitignore (owner
+  decision, documented above). A file:// local remote (the tests) needs no auth,
+  so the askpass path is asserted on the ENV the hub passes, not on git invoking
+  it.

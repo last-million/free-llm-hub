@@ -126,6 +126,7 @@ import vision_status
 import swarm_windows
 import heartbeat
 import publish
+import ghpush
 import memory
 import taskboard
 
@@ -41856,6 +41857,220 @@ def _cfi_set_auto(value):
         return _publish_json({"error": "The setting could not be saved.",
                               "code": "save_failed"}, 500)
     return _publish_json({"ok": True, **publish.default.status()})
+
+
+# ---------------------------------------------------------------------------
+# GITHUB: push a Build project to GitHub (ghpush.py). First time: create a repo
+# on the owner's OWN account (private by default); afterwards Push / Sync on a
+# click. NEVER automatic -- every create/push/gitignore write needs
+# `confirm: true`. The token is validated, stored ENCRYPTED (secretstore, the
+# provider-key mechanism), never logged, never returned (status shows only the
+# login + a masked hint), never written into .git/config or a remote URL. All
+# routes sit under /api/* (control token + dashboard header). The flag
+# `github_push` (default on) is the kill switch; status still answers when off.
+# ---------------------------------------------------------------------------
+
+_GH_HTTP = {
+    "bad_request": 400, "bad_name": 400, "public_ok_required": 400,
+    "confirm_required": 400,
+    "bad_token": 401,
+    "disabled": 403, "refused": 403, "bad_scope": 403,
+    "not_a_dir": 404, "not_found": 404,
+    "no_token": 409, "not_connected": 409, "repo_exists": 409,
+    "behind_remote": 409, "diverged": 409, "secrets_found": 409,
+    "nothing_to_commit": 409, "no_git": 409,
+    "git_error": 500, "github_error": 502, "network": 502,
+    "push_failed": 502, "fetch_failed": 502,
+    "git_timeout": 504,
+}
+
+# The hub's own folder guards: refuse the hub repo and any too-broad folder.
+# (A symlinked/not-a-dir folder is refused inside ghpush itself.)
+ghpush.default.set_guards(_cm_is_hub_repo, _publish_folder_too_broad)
+
+
+def _gh_json(payload, status=200):
+    resp = jsonify(payload)
+    resp.status_code = status
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _gh_fail(exc):
+    body = {"error": exc.message, "code": exc.code}
+    if getattr(exc, "extra", None):
+        body.update(exc.extra)
+    return _gh_json(body, _GH_HTTP.get(exc.code, 400))
+
+
+def _gh_body():
+    body = request.get_json(force=True, silent=True)
+    return body if isinstance(body, dict) else {}
+
+
+def _gh_enabled():
+    return config.get_flag("github_push", True)
+
+
+def _gh_disabled_reply():
+    return _gh_json({"error": "GitHub push is switched off in this hub.",
+                     "code": "disabled"}, 403)
+
+
+def _gh_unconfirmed(body):
+    if body.get("confirm") is True:
+        return None
+    return _gh_json({"error": "This needs your confirmation.",
+                     "code": "confirm_required"}, 400)
+
+
+def _gh_project_dir(body_or_args, key="project_dir"):
+    v = body_or_args.get(key)
+    return v if isinstance(v, str) and v.strip() else None
+
+
+@app.route("/api/github", methods=["GET"])
+def api_github_status():
+    """Connection (login + masked hint, never the token) and, with
+    `?project_dir=`, that project's git/repo state. Answers even when the flag
+    is off (so the UI can say so)."""
+    project_dir = request.args.get("project_dir") or None
+    try:
+        st = ghpush.default.status(project_dir)
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+    st = dict(st)
+    st["enabled"] = _gh_enabled()
+    return _gh_json(st)
+
+
+@app.route("/api/github/token", methods=["POST"])
+def api_github_token():
+    """Validate a pasted token against GET /user and store it encrypted. The
+    token is read from the body, never echoed back or logged."""
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    body = _gh_body()
+    token = body.get("token")
+    if not isinstance(token, str) or not token.strip():
+        return _gh_json({"error": "Paste a GitHub token.", "code": "bad_token"}, 401)
+    try:
+        info = ghpush.default.connect(token)
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+    _log.info("[github] connected as %s", _sanitize(info.get("login"), 80))
+    return _gh_json({"ok": True, "login": info.get("login"),
+                     "masked_hint": info.get("masked_hint")})
+
+
+@app.route("/api/github/token/delete", methods=["POST"])
+def api_github_token_delete():
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    try:
+        ghpush.default.disconnect()
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+    _log.info("[github] disconnected (token removed)")
+    return _gh_json({"ok": True})
+
+
+@app.route("/api/github/preview", methods=["GET"])
+def api_github_preview():
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    project_dir = request.args.get("project_dir") or None
+    if not project_dir:
+        return _gh_json({"error": "project_dir is required", "code": "bad_request"}, 400)
+    try:
+        return _gh_json(ghpush.default.preview(project_dir))
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+
+
+@app.route("/api/github/gitignore", methods=["POST"])
+def api_github_gitignore():
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    body = _gh_body()
+    refusal = _gh_unconfirmed(body)
+    if refusal is not None:
+        return refusal
+    project_dir = _gh_project_dir(body)
+    if not project_dir:
+        return _gh_json({"error": "project_dir is required", "code": "bad_request"}, 400)
+    add = body.get("add") if isinstance(body.get("add"), list) else None
+    use_default = body.get("default") is True
+    try:
+        result = ghpush.default.add_gitignore(project_dir, add=add, default=use_default)
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+    return _gh_json({"ok": True, **result})
+
+
+@app.route("/api/github/create", methods=["POST"])
+def api_github_create():
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    body = _gh_body()
+    refusal = _gh_unconfirmed(body)
+    if refusal is not None:
+        return refusal
+    project_dir = _gh_project_dir(body)
+    if not project_dir:
+        return _gh_json({"error": "project_dir is required", "code": "bad_request"}, 400)
+    name = body.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return _gh_json({"error": "A repository name is required.", "code": "bad_name"}, 400)
+    private = body.get("private")
+    private = True if private is None else bool(private)
+    public_ok = body.get("public_ok") is True
+    try:
+        st = ghpush.default.create_repo(project_dir, name, private=private,
+                                        public_ok=public_ok)
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+    _log.info("[github] created repo for project (private=%s)", private)
+    st = dict(st)
+    st["enabled"] = True
+    return _gh_json({"ok": True, **st})
+
+
+@app.route("/api/github/push", methods=["POST"])
+def api_github_push():
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    body = _gh_body()
+    refusal = _gh_unconfirmed(body)
+    if refusal is not None:
+        return refusal
+    project_dir = _gh_project_dir(body)
+    if not project_dir:
+        return _gh_json({"error": "project_dir is required", "code": "bad_request"}, 400)
+    try:
+        st = ghpush.default.push(project_dir)
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+    st = dict(st)
+    st["enabled"] = True
+    return _gh_json({"ok": True, **st})
+
+
+@app.route("/api/github/sync", methods=["POST"])
+def api_github_sync():
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    body = _gh_body()
+    project_dir = _gh_project_dir(body)
+    if not project_dir:
+        return _gh_json({"error": "project_dir is required", "code": "bad_request"}, 400)
+    try:
+        st = ghpush.default.sync(project_dir)
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+    st = dict(st)
+    st["enabled"] = True
+    return _gh_json({"ok": True, **st})
 
 
 def _multi_check_kwargs():

@@ -344,6 +344,22 @@ Quick Tunnel**: free, no Cloudflare account, nothing to configure.
 - Switch it off for good with the `publish_enabled` flag (set it to `false`
   in the config); Publish and Install then refuse.
 
+## Push a project to GitHub
+
+Next to Publish, a **GitHub** button pushes the current Build project to a repo
+on your own account. Paste a GitHub token once (fine-grained: Contents and
+Administration read/write, or classic `repo`); it is stored **encrypted** (the
+same mechanism as your provider keys), never logged, never returned and never
+written into `.git/config`. The first time you choose a name and **Private**
+(the default) or Public — a public repo needs an extra tick — and the hub
+creates the repo and pushes. After that it is **Push** and **Sync** on a click;
+nothing is ever automatic. Before every push a secret scan blocks `.env`,
+`*.pem`/`*.key`, `id_rsa*`, `credentials.json` and secret-shaped strings, and
+offers to add them to `.gitignore`. Sync is fast-forward only — a diverged
+history is reported, never merged for you. Build output (`dist/`, `build/`) is
+not in the default `.gitignore`; add it yourself if you don't want it committed.
+Switch it off with the `github_push` flag (default on).
+
 ## Endpoints
 
 | Protocol | Endpoints |
@@ -356,7 +372,7 @@ Quick Tunnel**: free, no Cloudflare account, nothing to configure.
 | **Dashboard** | `/api/*` (control-token gated) |
 | **Probes** | `/health`, `/healthz` (liveness), `/ready`, `/readyz` (readiness, 503 + `reason` when not ready) — no token, loopback only, no version or provider data |
 
-176 routes in total; the dashboard is the documentation for the rest.
+184 routes in total; the dashboard is the documentation for the rest.
 
 ---
 
