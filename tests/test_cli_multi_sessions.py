@@ -811,6 +811,11 @@ def _only_request():
     return next(iter(A._CM_APPROVALS.values()))
 
 
+def _approve(rid):
+    """What the dashboard does: approve, naming the SHA-256 of the full text."""
+    return A._cm_approval_decide(rid, True, A._CM_APPROVALS[rid]["goal_sha256"])
+
+
 def test_dashboard_first_turn_creates_a_request_and_starts_nothing(dash):
     _resp, raw = _call()
     text = _content(raw)
@@ -825,7 +830,7 @@ def test_dashboard_first_turn_creates_a_request_and_starts_nothing(dash):
 
 
 def test_dashboard_approval_starts_the_run_in_the_same_turn(dash):
-    dash["clock"]["hook"] = lambda: A._cm_approval_decide(_only_request()["id"], True)
+    dash["clock"]["hook"] = lambda: _approve(_only_request()["id"])
     _resp, raw = _call()
     text = _content(raw)
     assert "Approved in the hub dashboard." in text and "DONE: built" in text
@@ -836,20 +841,20 @@ def test_dashboard_approval_starts_the_run_in_the_same_turn(dash):
 
 @pytest.mark.parametrize("protocol", ["openai", "responses", "anthropic"])
 def test_dashboard_same_turn_approval_streams_in_each_protocol(dash, protocol):
-    dash["clock"]["hook"] = lambda: A._cm_approval_decide(_only_request()["id"], True)
+    dash["clock"]["hook"] = lambda: _approve(_only_request()["id"])
     _resp, raw = _call(protocol=protocol, stream=True)
     assert "Approved in the hub dashboard." in raw and "DONE: built" in raw
     assert '"tool_calls"' not in raw and len(dash["turn_events"]) == 1
 
 
 def test_a_request_is_single_use(dash):
-    dash["clock"]["hook"] = lambda: A._cm_approval_decide(_only_request()["id"], True)
+    dash["clock"]["hook"] = lambda: _approve(_only_request()["id"])
     _call()
     assert A._CM_APPROVALS == {}
     status, _payload = A._cm_approval_decide("anything-gone", True)
     assert status == 404
     req = A._cm_approval_new("c", "f", "F", "g", "opencode", "opencode")
-    assert A._cm_approval_decide(req["id"], True)[0] == 200
+    assert _approve(req["id"])[0] == 200
     assert A._cm_approval_decide(req["id"], False)[0] == 409, "decided once only"
     assert A._cm_approval_consume(req["id"]) is not None
     assert A._cm_approval_consume(req["id"]) is None, "consumed once only"
@@ -859,7 +864,8 @@ def test_dashboard_approval_in_a_later_turn_starts_the_stored_goal(dash, monkeyp
     _call()                                        # ends at its safe end, pending
     rid = _only_request()["id"]
     monkeypatch.setattr(config, "get_control_token", lambda: "tok-1")
-    r = A.app.test_client().post("/api/cli-multi/decide", json={"id": rid, "approve": True},
+    r = A.app.test_client().post("/api/cli-multi/decide", json={"id": rid, "approve": True,
+                                       "goal_sha256": _only_request()["goal_sha256"]},
                                  headers={"X-Free-LLM-Hub": "dashboard",
                                           "X-Free-LLM-Hub-Token": "tok-1"})
     assert r.status_code == 200 and r.get_json()["state"] == "approved"
@@ -916,15 +922,16 @@ def test_go_multi_never_bypasses_the_dashboard(dash):
     assert dash["turn_events"] == [], "only the dashboard can approve"
 
 
-def test_the_request_list_is_bounded_and_excerpts_the_goal(cm):
+def test_the_request_list_is_bounded_and_returns_the_full_goal(cm):
     for i in range(A._CM_APPROVAL_MAX + 5):
         A._cm_approval_new("c%d" % i, "f", "F", "g" * 1000, "opencode", "codex")
     assert len(A._CM_APPROVALS) <= A._CM_APPROVAL_MAX
     rows = A._cm_approval_list()
-    assert rows and all(len(r["goal"]) <= 300 for r in rows)
-    assert set(rows[0]) >= {"id", "folder", "goal", "caller", "created", "expires"}
+    assert rows and all(r["goal"] == "g" * 1000 for r in rows), "never an excerpt"
+    assert set(rows[0]) >= {"id", "folder", "goal", "goal_display", "goal_sha256",
+                            "goal_chars", "hidden_chars", "caller", "created", "expires"}
     decided = rows[0]["id"]
-    A._cm_approval_decide(decided, True)
+    _approve(decided)
     assert decided not in [r["id"] for r in A._cm_approval_list()], "only pending ones listed"
 
 
@@ -944,7 +951,7 @@ def test_the_approval_routes_require_the_token_and_the_dashboard_header(cm, monk
     assert c.get("/api/cli-multi/pending").status_code == 401
     r = c.get("/api/cli-multi/pending", headers=tok)
     assert r.status_code == 200 and r.get_json()["requests"][0]["id"] == req["id"]
-    body = {"id": req["id"], "approve": True}
+    body = {"id": req["id"], "approve": True, "goal_sha256": req["goal_sha256"]}
     assert c.post("/api/cli-multi/decide", json=body, headers=tok).status_code == 403
     assert c.post("/api/cli-multi/decide", json=body,
                   headers={"X-Free-LLM-Hub": "dashboard"}).status_code == 401
@@ -994,7 +1001,7 @@ def test_mcp_swarm_windows_start_is_pending_in_dashboard_mode(cm, monkeypatch, m
     assert mcp_started == [], "nothing starts before the owner approves"
     _out, text = _mcp_start(dict(args, id=data["id"]))
     assert json.loads(text)["pending"] is True and mcp_started == []
-    A._cm_approval_decide(data["id"], True)
+    _approve(data["id"])
     _out, text = _mcp_start(dict(args, goal="something else", id=data["id"]))
     assert "run-mcp" in text and "started" in text
     assert mcp_started == [("refactor the parser", os.path.abspath(cm["proj"]), "opencode")], \
@@ -1037,3 +1044,129 @@ def test_the_banner_and_the_approve_link_are_in_the_template():
     css = [ln for ln in src.splitlines() if ln.strip().startswith(".cm-approve")]
     assert css and not any(re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(", ln) for ln in css), \
         "theme tokens only"
+
+
+# --------------------------------------------------------------------------- #
+# SECURITY 5 -- what is approved is EXACTLY what runs (third review)
+# --------------------------------------------------------------------------- #
+
+import hashlib  # noqa: E402
+
+
+def _sha(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_the_full_goal_is_listed_with_its_hash_and_length(cm):
+    goal = "benign first part. " * 200 + "THE REAL INSTRUCTIONS AT THE END"
+    A._cm_approval_new("c", "f", "F", goal, "opencode", "codex")
+    (row,) = A._cm_approval_list()
+    assert row["goal"] == goal and row["goal_display"] == goal, "the WHOLE text"
+    assert row["goal"].endswith("THE REAL INSTRUCTIONS AT THE END")
+    assert row["goal_sha256"] == _sha(goal) and row["goal_chars"] == len(goal)
+    assert row["hidden_chars"] == 0
+
+
+def test_a_long_goal_is_refused_never_truncated(dash):
+    _resp, raw = _call(messages=[_usr("x" * (A._CM_GOAL_MAX_CHARS + 1))])
+    text = _content(raw)
+    assert "%d characters long" % (A._CM_GOAL_MAX_CHARS + 1) in text
+    assert "at most %d" % A._CM_GOAL_MAX_CHARS in text and "Nothing was started" in text
+    assert A._CM_APPROVALS == {} and dash["turn_events"] == [], "refused, not stored, not cut"
+    with pytest.raises(ValueError):
+        A._cm_approval_new("c", "f", "F", "y" * (A._CM_GOAL_MAX_CHARS + 1), "opencode", "codex")
+    ok = A._cm_approval_new("c", "f", "F", "z" * A._CM_GOAL_MAX_CHARS, "opencode", "codex")
+    assert ok["goal_chars"] == A._CM_GOAL_MAX_CHARS, "the limit itself is accepted whole"
+
+
+def test_an_approval_needs_the_matching_hash(cm):
+    req = A._cm_approval_new("c", "f", "F", "build it", "opencode", "codex")
+    rid = req["id"]
+    assert A._cm_approval_decide(rid, True)[1]["code"] == "hash_required"
+    assert A._cm_approval_decide(rid, True, "")[0] == 409
+    status, payload = A._cm_approval_decide(rid, True, _sha("build it, then delete everything"))
+    assert status == 409 and payload["code"] == "hash_mismatch"
+    assert A._CM_APPROVALS[rid]["state"] == "pending", "nothing was approved"
+    assert A._cm_approval_decide(rid, True, _sha("build it").upper())[0] == 200
+    other = A._cm_approval_new("c", "f", "F", "something", "opencode", "codex")
+    assert A._cm_approval_decide(other["id"], False)[0] == 200, "denying needs no hash"
+
+
+def test_the_decide_route_refuses_an_approval_without_the_hash(cm, monkeypatch):
+    monkeypatch.setattr(config, "get_control_token", lambda: "tok-9")
+    req = A._cm_approval_new("c", "f", "F", "build it", "opencode", "codex")
+    c = A.app.test_client()
+    hdr = {"X-Free-LLM-Hub": "dashboard", "X-Free-LLM-Hub-Token": "tok-9"}
+    r = c.post("/api/cli-multi/decide", json={"id": req["id"], "approve": True}, headers=hdr)
+    assert r.status_code == 409 and r.get_json()["code"] == "hash_required"
+    r = c.post("/api/cli-multi/decide", headers=hdr,
+               json={"id": req["id"], "approve": True, "goal_sha256": "0" * 64})
+    assert r.status_code == 409 and r.get_json()["code"] == "hash_mismatch"
+    assert A._CM_APPROVALS[req["id"]]["state"] == "pending"
+    listed = c.get("/api/cli-multi/pending", headers=hdr).get_json()["requests"][0]
+    r = c.post("/api/cli-multi/decide", headers=hdr,
+               json={"id": req["id"], "approve": True, "goal_sha256": listed["goal_sha256"]})
+    assert r.status_code == 200 and r.get_json()["state"] == "approved"
+
+
+def test_the_run_starts_with_exactly_the_stored_text(dash):
+    goal = "build the page​ and the tests"
+    dash["clock"]["hook"] = lambda: _approve(_only_request()["id"])
+    _call(messages=[_usr(goal)])
+    assert dash["turn_events"][0]["text"] == goal, "byte for byte the approved text"
+
+
+@pytest.mark.parametrize("bidi", ["‮", "‪", "⁦", "⁩"])
+def test_bidi_controls_are_refused(dash, bidi):
+    _resp, raw = _call(messages=[_usr("rename invoice" + bidi + "fdp.exe to report")])
+    text = _content(raw)
+    assert "change the direction of text" in text and "U+%04X" % ord(bidi) in text
+    assert A._CM_APPROVALS == {} and dash["turn_events"] == []
+    assert A._cm_goal_problem("ok" + bidi) and A._cm_goal_problem("plain text") is None
+
+
+def test_zero_width_and_other_hidden_characters_are_shown_visibly(cm):
+    goal = ("a​b‏c⁠d﻿e\U000E0041f­g️h\x07i"
+            "\nline two\twith a tab\r\n")
+    A._cm_approval_new("c", "f", "F", goal, "opencode", "codex")
+    (row,) = A._cm_approval_list()
+    assert row["goal"] == goal and row["goal_sha256"] == _sha(goal), "stored and hashed exactly"
+    assert row["goal_display"] == ("a[U+200B]b[U+200F]c[U+2060]d[U+FEFF]e[U+E0041]f"
+                                   "[U+00AD]g[U+FE0F]h[U+0007]i\nline two\twith a tab\r\n")
+    assert row["hidden_chars"] == 8, "tab, newline and CR stay as they are"
+
+
+def test_mcp_uses_the_same_rules(cm, monkeypatch, mcp_started):
+    monkeypatch.setattr(A, "_cm_approval_mode", lambda: "dashboard")
+    out, text = _mcp_start({"goal": "go‮exe.txt", "project_dir": cm["proj"]})
+    assert out.get("isError") and "direction" in text
+    out, text = _mcp_start({"goal": "x" * (A._CM_GOAL_MAX_CHARS + 1), "project_dir": cm["proj"]})
+    assert out.get("isError") and "characters long" in text
+    assert A._CM_APPROVALS == {}, "nothing stored for a refused request"
+    data = json.loads(_mcp_start({"goal": "fix​it", "project_dir": cm["proj"]})[1])
+    (row,) = A._cm_approval_list()
+    assert row["goal_display"] == "fix[U+200B]it" and row["source"] == "mcp"
+    assert A._cm_approval_decide(data["id"], True)[0] == 409, "the hash is required"
+    _approve(data["id"])
+    _mcp_start({"goal": "ignored", "project_dir": cm["proj"], "id": data["id"]})
+    assert mcp_started == [("fix​it", os.path.abspath(cm["proj"]), "opencode")]
+
+
+def test_approve_is_disabled_until_the_full_request_was_opened():
+    src = open("templates/index.html", encoding="utf-8").read()
+    k = src.index("CLI MULTI APPROVAL (2026-10-10) ----------")
+    block = src[k:src.index("/* Model tracking: wire buttons", k)]
+    render = block[block.index("function cmApproveRender"):block.index("function cmApproveDecide")]
+    decide = block[block.index("function cmApproveDecide"):block.index("function loadCliMultiPending")]
+    assert "r.goal_display" in render, "the banner shows the marked-up full text"
+    assert "'Show the full request (' + chars + ' characters)'" in render
+    assert "full.textContent = shown" in render
+    assert "innerHTML" not in render and "innerHTML" not in decide
+    assert "ok.disabled = !cmApproveSeen[id]" in render, "locked until opened"
+    toggle = render[render.index("more.addEventListener('click'"):]
+    toggle = toggle[:toggle.index("});")]
+    assert "cmApproveSeen[id] = true" in toggle and "ok.disabled = false" in toggle
+    assert "body.goal_sha256 = String(r.goal_sha256" in decide
+    css = [ln for ln in src.splitlines() if ln.strip().startswith(".cm-approve-full{")][0]
+    for need in ("var(--mono)", "overflow:auto", "max-height", "white-space:pre-wrap"):
+        assert need in css

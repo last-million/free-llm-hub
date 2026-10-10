@@ -21364,7 +21364,69 @@ _CM_APPROVAL_TTL = 900          # a request waits 15 minutes (approval adds 15 m
 _CM_APPROVAL_MAX = 20           # bounded: the oldest is dropped first
 _CM_APPROVAL_POLL = 2.0         # the waiting CLI turn looks every 2 s
 _CM_GOAL_LOG_CHARS = 80         # never log more of a goal than this
-_CM_GOAL_SHOW_CHARS = 300       # what the dashboard banner shows of a goal
+# SECURITY (third review, of 15d1051): WHAT IS APPROVED MUST BE EXACTLY WHAT
+# RUNS. The banner used to show a 300-character excerpt while the full goal ran,
+# so a benign first part could hide the real instructions after it. Now the
+# owner gets the WHOLE stored goal (never cut: a longer one is refused at
+# creation), its SHA-256 binds the approval to that exact text, characters that
+# can hide or reorder text are refused (bidi controls) or shown as visible
+# [U+XXXX] markers (everything else invisible), and the run starts with exactly
+# the stored text.
+_CM_GOAL_MAX_CHARS = 20000      # an approval request holds at most this many
+_CM_BIDI_CONTROLS = frozenset(list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)))
+
+
+def _cm_is_hidden_char(ch):
+    """Invisible in a browser, or able to change how text around it is shown:
+    format characters (Cf: zero-width U+200B-U+200F, U+2060-U+2064, U+FEFF, the
+    bidi controls, tag characters, soft hyphen...), control characters (Cc)
+    other than tab / newline / carriage return, and variation selectors
+    (invisible, and a known way to smuggle text into a prompt)."""
+    import unicodedata
+    if ch in "\t\n\r":
+        return False
+    o = ord(ch)
+    if 0xFE00 <= o <= 0xFE0F or 0xE0100 <= o <= 0xE01EF:
+        return True
+    return unicodedata.category(ch) in ("Cf", "Cc")
+
+
+def _cm_goal_display(goal):
+    """(text, hidden): the goal as the owner sees it -- every hidden character
+    replaced by a visible [U+XXXX] marker -- and how many there were. The
+    stored goal (what runs, what is hashed) is never changed."""
+    out, hidden = [], 0
+    for ch in goal or "":
+        if _cm_is_hidden_char(ch):
+            out.append("[U+%04X]" % ord(ch))
+            hidden += 1
+        else:
+            out.append(ch)
+    return "".join(out), hidden
+
+
+def _cm_goal_problem(goal):
+    """Why this goal cannot be offered for approval (a plain sentence), or
+    None. Too long is REFUSED, never cut; bidi controls are refused because
+    they can make the text shown for approval read differently from what
+    would run."""
+    g = goal or ""
+    if len(g) > _CM_GOAL_MAX_CHARS:
+        return ("This Multi request is %d characters long; a request for approval "
+                "may be at most %d, so the owner can read all of it. Shorten it (put "
+                "long details in a file in the project and refer to it), then send "
+                "it again. Nothing was started." % (len(g), _CM_GOAL_MAX_CHARS))
+    bidi = sorted({"U+%04X" % ord(ch) for ch in g if ord(ch) in _CM_BIDI_CONTROLS})
+    if bidi:
+        return ("This Multi request contains characters that change the direction "
+                "of text (%s), which can make the text shown for approval differ "
+                "from what would run. Remove them, then send it again. Nothing was "
+                "started." % ", ".join(bidi))
+    return None
+
+
+def _cm_goal_sha256(goal):
+    return hashlib.sha256((goal or "").encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _cm_now():
@@ -21408,11 +21470,17 @@ def _cm_approvals_prune(now):
 def _cm_approval_new(convkey, folder_key, folder_display, goal, helper_cli,
                      caller_cli, source="cli"):
     """Record a SINGLE-USE request for the owner's approval; returns a copy.
-    In memory, bounded to _CM_APPROVAL_MAX (the oldest goes first)."""
+    In memory, bounded to _CM_APPROVAL_MAX (the oldest goes first). The goal is
+    stored WHOLE with its SHA-256; a goal _cm_goal_problem refuses raises
+    ValueError (the callers check first and answer in plain words)."""
+    problem = _cm_goal_problem(goal)
+    if problem:
+        raise ValueError(problem)
     now = _cm_now()
     rid = uuid.uuid4().hex
     row = {"id": rid, "conv": convkey, "folder": folder_key,
            "folder_display": folder_display, "goal": goal or "",
+           "goal_sha256": _cm_goal_sha256(goal), "goal_chars": len(goal or ""),
            "helper_cli": helper_cli, "caller_cli": caller_cli or "unknown",
            "source": source, "created": now, "expires": now + _CM_APPROVAL_TTL,
            "state": "pending"}
@@ -21445,9 +21513,12 @@ def _cm_approval_find(convkey, folder_key):
     return None
 
 
-def _cm_approval_decide(rid, approve):
+def _cm_approval_decide(rid, approve, goal_sha256=None):
     """The owner's decision: (http status, payload). Only a PENDING request can
-    be decided, once."""
+    be decided, once. An APPROVAL is accepted only with `goal_sha256` equal to
+    the SHA-256 of the stored goal -- the full text the owner was shown; a
+    missing or different hash is 409 and nothing changes. A denial needs no
+    hash (refusing is always safe)."""
     now = _cm_now()
     with _CM_APPROVALS_LOCK:
         _cm_approvals_prune(now)
@@ -21458,6 +21529,16 @@ def _cm_approval_decide(rid, approve):
         if row["state"] != "pending":
             return 409, {"error": "this request was already decided", "code": "decided",
                          "state": row["state"]}
+        if approve:
+            given = goal_sha256.strip().lower() if isinstance(goal_sha256, str) else ""
+            if not given:
+                return 409, {"error": "approving needs goal_sha256: the SHA-256 of the "
+                                      "full request text you were shown",
+                             "code": "hash_required"}
+            if not hmac.compare_digest(given, row["goal_sha256"]):
+                return 409, {"error": "goal_sha256 does not match the stored request; "
+                                      "nothing was approved",
+                             "code": "hash_mismatch"}
         row["state"] = "approved" if approve else "denied"
         if approve:
             row["expires"] = max(row["expires"], now + _CM_APPROVAL_TTL)
@@ -21482,15 +21563,24 @@ def _cm_approval_discard(rid):
 
 
 def _cm_approval_list():
-    """The requests waiting for a decision, for the dashboard banner. The goal
-    is an excerpt; nothing secret is listed."""
+    """The requests waiting for a decision, for the dashboard banner: the FULL
+    stored goal (exactly what would run), the same text with every hidden
+    character shown as a visible [U+XXXX] marker (`goal_display`, what the
+    banner renders), its SHA-256 (what an approval must send back) and its
+    length. Nothing secret is listed."""
     with _CM_APPROVALS_LOCK:
         _cm_approvals_prune(_cm_now())
         rows = [dict(r) for r in _CM_APPROVALS.values() if r["state"] == "pending"]
-    return [{"id": r["id"], "folder": r["folder_display"],
-             "goal": (r["goal"] or "")[:_CM_GOAL_SHOW_CHARS],
-             "caller": r["caller_cli"], "source": r["source"],
-             "created": r["created"], "expires": r["expires"]} for r in rows]
+    out = []
+    for r in rows:
+        shown, hidden = _cm_goal_display(r["goal"])
+        out.append({"id": r["id"], "folder": r["folder_display"],
+                    "goal": r["goal"], "goal_display": shown,
+                    "goal_sha256": r["goal_sha256"], "goal_chars": r["goal_chars"],
+                    "hidden_chars": hidden,
+                    "caller": r["caller_cli"], "source": r["source"],
+                    "created": r["created"], "expires": r["expires"]})
+    return out
 
 
 def _cm_pending_put(mapkey, convkey, folder_key, goal):
@@ -22070,6 +22160,9 @@ def _cm_dashboard_turn(body, protocol, goal, est, convkey, mapkey, folder_key,
                        "Nothing was started.\n" % project_dir, est)
     if req and req["state"] == "pending":
         if goal != req["goal"] and _work():
+            problem = _cm_goal_problem(goal)
+            if problem:                            # refused; the earlier request stays
+                return _cm_say(body, protocol, problem + "\n", est)
             _cm_approval_discard(req["id"])        # the newest instruction replaces it
             req = None
         else:                                      # wait on the SAME request again
@@ -22081,6 +22174,9 @@ def _cm_dashboard_turn(body, protocol, goal, est, convkey, mapkey, folder_key,
             return _cm_emit(body, protocol, _cm_approval_stream(req, launch, safe, lead), est)
     if not _work():
         return None
+    problem = _cm_goal_problem(goal)
+    if problem:                                    # too long / bidi: refused, never cut
+        return _cm_say(body, protocol, problem + "\n", est)
     req = _cm_approval_new(convkey, folder_key, project_dir, goal, helper_cli, caller)
     launch = _cm_launcher(mapkey, folder_key, project_dir, helper_cli)
     lead = ("Multi wants to start up to %d helper agents that edit files and run "
@@ -22209,14 +22305,18 @@ def _cm_api_pending():
 
 @app.route("/api/cli-multi/decide", methods=["POST"])
 def _cm_api_decide():
-    """{id, approve: true|false}: approve or deny ONE pending request, once."""
+    """{id, approve: true|false, goal_sha256}: approve or deny ONE pending
+    request, once. An approval must carry goal_sha256 -- the SHA-256 of the full
+    request text the owner was shown (GET /api/cli-multi/pending lists it);
+    missing or different = 409 and nothing starts."""
     body = request.get_json(force=True, silent=True) or {}
     rid = body.get("id")
     approve = body.get("approve")
     if not isinstance(rid, str) or not rid.strip() or not isinstance(approve, bool):
-        return jsonify({"error": "pass {\"id\": string, \"approve\": true or false}",
+        return jsonify({"error": "pass {\"id\": string, \"approve\": true or false, "
+                                 "\"goal_sha256\": string}",
                         "code": "bad_request"}), 400
-    status, payload = _cm_approval_decide(rid.strip(), approve)
+    status, payload = _cm_approval_decide(rid.strip(), approve, body.get("goal_sha256"))
     return jsonify(payload), status
 
 
@@ -22252,6 +22352,9 @@ def _cm_mcp_start(goal, project_dir, cli):
     folder = os.path.abspath(str(project_dir))
     if not os.path.isdir(folder):
         raise RuntimeError("project_dir must be an existing folder")
+    problem = _cm_goal_problem(goal)       # the same rules as a CLI request
+    if problem:
+        raise RuntimeError(problem)
     req = _cm_approval_new("mcp", _cm_folder_key(folder), folder, goal,
                            str(cli or "opencode"), "mcp", source="mcp")
     return _cm_mcp_pending(req["id"])

@@ -218,6 +218,8 @@
   .cm-approve-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:4px 0}
   .cm-approve-text{flex:1 1 280px;min-width:0;overflow-wrap:anywhere;color:var(--text)}
   .cm-approve-row.cm-approve-focus{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--radius-sm)}
+  .cm-approve-full{flex:1 1 100%;margin:4px 0 0;max-height:260px;overflow:auto;padding:8px 10px;font-family:var(--mono);font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--code-text);background:var(--bg-inset);border:1px solid var(--border);border-radius:var(--radius-sm)}
+  .cm-approve-full[hidden]{display:none}
 
   /* ---------- sections / view headers ---------- */
   .section{margin-top:26px}
@@ -15114,41 +15116,84 @@
      until you press Approve here; a request is single-use and expires after 15
      minutes. Polled every 10 s, only while this page is visible. Every piece
      of request text goes in through textContent, never innerHTML. */
-  var cmApproveWanted = null, cmApproveFocused = false;
+  var cmApproveWanted = null, cmApproveFocused = false, cmApproveSig = null;
+  /* Per request id: its FULL text was opened at least once (that is what
+     unlocks Approve), and whether the full-text box is open now. Both survive
+     the 10 s poll. */
+  var cmApproveSeen = {}, cmApproveOpen = {};
   try { cmApproveWanted = new URLSearchParams(location.search).get('approve'); } catch (e) {}
   function cmApproveRender(list){
     var box = $('#cm-approve-banner'); if (!box) return;
-    while (box.firstChild) box.removeChild(box.firstChild);
     list = Array.isArray(list) ? list : [];
+    /* Re-render only when the set of requests changed, so an open full-text box
+       keeps its scroll position across polls. */
+    var sig = list.map(function(r){ return String(r.id) + ':' + String(r.goal_sha256); }).join('|');
+    if (sig === cmApproveSig) return;
+    cmApproveSig = sig;
+    while (box.firstChild) box.removeChild(box.firstChild);
     box.hidden = list.length === 0;
     list.forEach(function(r){
+      var id = String(r.id || '');
+      /* goal_display = the WHOLE stored request, every hidden character shown as
+         a visible [U+XXXX] marker: exactly what would run, nothing left out. */
+      var shown = String(r.goal_display != null ? r.goal_display : (r.goal || ''));
+      var chars = Number(r.goal_chars) || shown.length;
+      var hidden = Number(r.hidden_chars) || 0;
       var row = document.createElement('div');
       row.className = 'cm-approve-row';
-      row.setAttribute('data-id', String(r.id || ''));
+      row.setAttribute('data-id', id);
       var txt = document.createElement('span');
       txt.className = 'cm-approve-text';
       txt.textContent = (r.source === 'mcp' ? 'An MCP client' : 'A terminal CLI') +
-        ' asks to start Multi in ' + String(r.folder || '?') + ': ' + String(r.goal || '');
+        ' asks to start Multi in ' + String(r.folder || '?') + ': ' +
+        (shown.length > 200 ? shown.slice(0, 200) + '…' : shown) +
+        (hidden ? '  (' + hidden + ' hidden characters, shown as [U+...])' : '');
+      var more = document.createElement('button');
+      more.type = 'button'; more.className = 'btn ghost';
+      more.textContent = 'Show the full request (' + chars + ' characters)';
+      var full = document.createElement('pre');
+      full.className = 'cm-approve-full';
+      full.id = 'cm-approve-full-' + id;
+      full.tabIndex = 0;                               /* keyboard-scrollable */
+      full.textContent = shown;
+      full.hidden = !cmApproveOpen[id];
+      more.setAttribute('aria-controls', full.id);
+      more.setAttribute('aria-expanded', cmApproveOpen[id] ? 'true' : 'false');
       var ok = document.createElement('button');
       ok.type = 'button'; ok.className = 'btn primary'; ok.textContent = 'Approve';
+      /* Approve stays disabled until the FULL request text was opened once. */
+      ok.disabled = !cmApproveSeen[id];
+      ok.title = ok.disabled ? 'Open the full request first' : '';
       var no = document.createElement('button');
       no.type = 'button'; no.className = 'btn ghost'; no.textContent = 'Deny';
-      ok.addEventListener('click', function(){ cmApproveDecide(r.id, true, row); });
-      no.addEventListener('click', function(){ cmApproveDecide(r.id, false, row); });
-      row.appendChild(txt); row.appendChild(ok); row.appendChild(no);
+      more.addEventListener('click', function(){
+        cmApproveOpen[id] = !cmApproveOpen[id];
+        full.hidden = !cmApproveOpen[id];
+        more.setAttribute('aria-expanded', cmApproveOpen[id] ? 'true' : 'false');
+        if (cmApproveOpen[id]){ cmApproveSeen[id] = true; ok.disabled = false; ok.title = ''; }
+      });
+      ok.addEventListener('click', function(){ cmApproveDecide(r, true, row); });
+      no.addEventListener('click', function(){ cmApproveDecide(r, false, row); });
+      row.appendChild(txt); row.appendChild(more); row.appendChild(ok); row.appendChild(no);
+      row.appendChild(full);
       box.appendChild(row);
-      if (cmApproveWanted && String(r.id) === cmApproveWanted && !cmApproveFocused){
+      if (cmApproveWanted && id === cmApproveWanted && !cmApproveFocused){
         cmApproveFocused = true;
         row.classList.add('cm-approve-focus');
         try { row.scrollIntoView({block: 'center'}); } catch (e) {}
-        try { ok.focus(); } catch (e) {}
+        try { more.focus(); } catch (e) {}           /* Approve is locked until then */
       }
     });
   }
-  function cmApproveDecide(id, approve, row){
+  function cmApproveDecide(r, approve, row){
     if (row) Array.prototype.forEach.call(row.querySelectorAll('button'),
                                           function(b){ b.disabled = true; });
-    api('/api/cli-multi/decide', {method: 'POST', body: {id: String(id), approve: !!approve}})
+    var body = {id: String(r.id), approve: !!approve};
+    /* The approval names the exact text that was shown: the hub accepts it only
+       when this SHA-256 matches the stored request, which is what then runs. */
+    if (approve) body.goal_sha256 = String(r.goal_sha256 || '');
+    cmApproveSig = null;                     /* the next poll redraws what is left */
+    api('/api/cli-multi/decide', {method: 'POST', body: body})
       .catch(function(e){ toast((e && e.message) || 'Could not save that decision', true); })
       .then(loadCliMultiPending);
   }

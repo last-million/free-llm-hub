@@ -3707,11 +3707,28 @@ helper CLI sessions on different models + review), not the crew phase pipeline.
     the pickup. A "go multi" reply never bypasses this mode. Approval ONLY
     through two new token-gated routes (under /api/, so `_local_control_guard`
     applies: the control token, plus the dashboard header on the POST): `GET
-    /api/cli-multi/pending` (id, folder, goal excerpt <= 300 chars, caller,
-    source, created, expires; pending ones only) and `POST /api/cli-multi/decide
-    {id, approve: true|false}` (200; 400 bad body; 404 gone; 409 already
-    decided). README route count +2 (176). The goal is logged 80 chars at most;
-    the banner shows folder + goal excerpt + caller only.
+    /api/cli-multi/pending` (id, folder, the FULL `goal`, `goal_display`,
+    `goal_sha256`, `goal_chars`, `hidden_chars`, caller, source, created,
+    expires; pending ones only) and `POST /api/cli-multi/decide {id, approve:
+    true|false, goal_sha256}` (200; 400 bad body; 404 gone; 409 already decided,
+    or an approval whose `goal_sha256` is missing / differs -- codes
+    `hash_required` / `hash_mismatch`; a denial needs no hash). README route
+    count +2 (176). The goal is logged 80 chars at most.
+  - **What is approved is EXACTLY what runs** (third review, of 15d1051: the
+    banner used to show a 300-character excerpt while the FULL goal ran, so a
+    benign first part could hide the real instructions after it). The goal is
+    stored whole, at most `_CM_GOAL_MAX_CHARS` (20000); a longer request is
+    REFUSED at creation with a plain message (`_cm_goal_problem`), never cut.
+    Its SHA-256 (`_cm_goal_sha256`, over the exact stored text) is listed, and
+    an approval is accepted only when it sends that hash back
+    (`_cm_approval_decide`, `hmac.compare_digest`); the run then starts with that
+    stored text, byte for byte. Hidden text: bidi controls (U+202A-U+202E,
+    U+2066-U+2069) are REFUSED at creation; every other hidden character --
+    format (Cf: zero-width U+200B-U+200F, U+2060-U+2064, U+FEFF, tag characters,
+    soft hyphen...), control (Cc) other than tab / newline / CR, and variation
+    selectors -- is shown VISIBLY as `[U+XXXX]` in `goal_display`
+    (`_cm_goal_display`; the stored, hashed text is unchanged). The MCP pending
+    path applies the same rules (`_cm_mcp_start`).
   - **"chat".** The owner's explicit choice to accept the risk: today's "go
     multi" flow (pending request 10 min in `_CM_PENDING`, consent remembered for
     the (conversation, folder) for the 7-day map TTL, expired / mismatched "go
@@ -3719,10 +3736,16 @@ helper CLI sessions on different models + review), not the crew phase pipeline.
   - **"off".** Direct start, no approval.
   - **Dashboard banner** (`templates/index.html`, the one template every hub
     page renders): `#cm-approve-banner` lists each pending request as "A
-    terminal CLI asks to start Multi in <folder>: <goal>  [Approve] [Deny]" (an
-    MCP request reads "An MCP client asks ..."), all text through textContent,
-    theme tokens only; polled every 10 s and only while the page is visible;
-    `?approve=<id>` scrolls to that request and focuses its Approve button.
+    terminal CLI asks to start Multi in <folder>: <start of the goal>" (an MCP
+    request reads "An MCP client asks ...", hidden characters counted), then
+    "Show the full request (N characters)", which reveals ALL of
+    `goal_display` in a scrollable monospace `<pre>` (textContent only), then
+    [Approve] [Deny]. Approve stays DISABLED until that full text has been
+    opened once (`cmApproveSeen`, kept across polls), and it sends the listed
+    `goal_sha256`. Theme tokens only; polled every 10 s and only while the page
+    is visible, redrawn only when the set of requests changes (an open box
+    keeps its scroll); `?approve=<id>` scrolls to that request and focuses its
+    "Show the full request" button.
   - **The MCP tool `swarm_windows_start`** (POST /mcp is not token-gated) follows
     the same setting. "dashboard": the call starts nothing and returns
     `{pending: true, id, approve_url, note}`; after the owner approves, the client
