@@ -431,3 +431,35 @@ def test_attempt_view_words_the_retry():
     assert v["text"] == "retrying, attempt 2 of %d" % (1 + SW.PHASE_RETRIES)
     a.state = SW.FAILED
     assert SW.attempt_view(a)["text"] == "failed after 2 attempts"
+
+
+# --------------------------------------------------------------------------- #
+# A run resumed after a restart re-runs a phase that had FAILED before it
+# (checked live 2026-10-11 06:22-06:26 on swarm-85890b169900: phase 1, failed
+# "opencode produced no reply" before the restart, ran again after the resume
+# and was then auto-continued on a different model, attempt 2 of 3).
+# --------------------------------------------------------------------------- #
+
+def test_a_resumed_run_runs_a_phase_that_failed_before_the_restart(monkeypatch):
+    monkeypatch.setattr(SW, "SPAWN_STAGGER", 0)
+    phases = [{"title": "A", "task": "do a", "needs": []},
+              {"title": "B", "task": "do b", "needs": [1]},
+              {"title": "C", "task": "do c", "needs": [1, 2]}]
+    run = SW._Run("build it", ".", "opencode", phases)
+    run.agents[0].state = SW.FAILED
+    run.agents[0].error = "opencode produced no reply."
+    run.agents[1].state = SW.RUNNING
+    run.agents[2].state = SW.PENDING
+    run.state = SW.RUNNING
+    SW._persist(run)
+    SW._RUNS.clear()
+    assert SW.load() == 1
+    ran = []
+
+    def run_turn(session_id, prompt):
+        ran.append("do " + "abc"[SW.worker_info(session_id)["index"] - 1])
+        yield {"event": "message", "text": "redone"}
+    assert SW.resume_interrupted(_spawn, run_turn) == [run.id]
+    st = _wait(run.id)
+    assert st["state"] == SW.DONE
+    assert sorted(ran) == ["do a", "do b", "do c"]
