@@ -26383,9 +26383,26 @@ def api_workspace_status():
             workspace.discover(d)
         except Exception:                                        # noqa: BLE001
             _log.debug("[workspace] discovery failed for %s", d, exc_info=True)
-    st = _dp_augment_status(d, workspace.status(d),
+    st = _dp_augment_status(d, _pf_with_frame(d, workspace.status(d)),
                             report=request.args.get("deploy_check") == "1")
     return jsonify(st)
+
+
+def _pf_with_frame(project_dir, st):
+    """PREVIEW FRAME PROXY (2026-10-11): add `frame_url` / `frame_blocked` --
+    what the Build page's iframe loads -- to the status. Only this route (the
+    dashboard's preview poll) asks for it, so no other caller of
+    workspace.status() probes the app or starts a relay. Flag
+    `preview_frame_proxy` off = the status is byte-identical to before."""
+    try:
+        extra = workspace.frame_fields(project_dir, st)
+    except Exception:                                            # noqa: BLE001
+        extra = {}
+    if not extra:
+        return st
+    out = dict(st)
+    out.update(extra)
+    return out
 
 
 @app.route("/api/agent/sessions", methods=["POST"])

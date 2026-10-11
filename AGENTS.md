@@ -4665,3 +4665,68 @@ a new `# GITHUB:` section beside `# PUBLISH:`.
   as separate commits with their messages (the mirror snapshots the work tree).
   The project's `.git/info/exclude` no longer applies (only
   work-tree `.gitignore` files do).
+
+## Preview inside the Build page despite framing headers (2026-10-11)
+
+Covered by `tests/test_preview_frame_proxy.py` (hermetic: a tiny local HTTP
+server sending helmet-like headers, chunked / until-close bodies, redirects and
+a websocket-style Upgrade echo; real sockets on ephemeral ports; everything torn
+down). MEASURED live: the owner's Express app uses helmet (`X-Frame-Options:
+SAMEORIGIN` + CSP `frame-ancestors 'self'`); the preview on 127.0.0.1:5800 is
+another ORIGIN than the dashboard on 127.0.0.1:8787, so Chrome refused the
+iframe ("127.0.0.1 refused to connect.") while the app worked in its own tab.
+Verified in a real Chrome (Playwright) with the same headers: direct frame
+refused, framed through the relay renders.
+
+- **`frameproxy.py`** (stdlib: socket + threading). `FrameProxy(target_port,
+  hub_port, avoid).start()` binds 127.0.0.1 ONLY on a free port (never the
+  hub's, never the target, never `avoid(port)`: workspace passes the hub port
+  and PORT_RANGE) and relays to the preview port. Requests go upstream
+  unchanged, Host included: MEASURED, the app answers the relay's Host, and the
+  absolute links it builds from it point back at the relay. Responses are
+  unchanged EXCEPT: `X-Frame-Options` removed; only the `frame-ancestors`
+  directive removed from `Content-Security-Policy` and `-Report-Only` (every
+  other directive kept byte for byte, `upgrade-insecure-requests` included; a
+  policy left empty is dropped); an absolute `Location` pointing at the real
+  port (127.0.0.1 / localhost / [::1]) is pointed at the relay; and ONE extra
+  header `Content-Security-Policy: frame-ancestors 'self' http://127.0.0.1:<hub>
+  http://localhost:<hub>` on every final response, so the relay can be framed
+  by the hub's dashboard and the app itself, not by any other website (the app
+  asked not to be framed; the exception is the hub only). Bodies are streamed,
+  never buffered or edited: Content-Length, chunked (relayed as chunks), until
+  close, HEAD/204/304, interim 1xx, `Expect: 100-continue`, keep-alive (one
+  fresh upstream connection per request). `Upgrade` + 101 = raw tunnel both
+  ways (Vite / Next HMR). App down = 502 with a plain sentence. `stop()` closes
+  the listener and every open connection, tunnels included (idempotent).
+  `framing_block(headers, hub_port)` = why a browser would refuse to frame it
+  (an enforced CSP frame-ancestors not allowing BOTH hub origins; else XFO
+  DENY/SAMEORIGIN, which a frame-ancestors makes browsers ignore; Report-Only
+  never blocks). `fetch_headers(port)` = one GET / like the iframe, no redirect
+  followed.
+- **When** (`workspace.frame_fields(project_dir, st)`, called ONLY by the
+  `/api/workspace/status` route via `app._pf_with_frame`, so no other
+  `workspace.status()` caller probes or starts anything): for a running
+  preview (ours or adopted), GET / is probed ONCE per (project, port); framing
+  headers -> a relay starts, self-checks through itself, and the status gets
+  `frame_url` = the relay; otherwise `frame_url` = the real URL. Not answering
+  yet -> real URL, probed again after `FRAME_RETRY_SECONDS` (3 s), at most
+  `FRAME_MAX_TRIES` (6). Relay cannot start / fails its self-check ->
+  `frame_blocked: true`. Concurrent polls wait on one decision (`FRAME_WAIT`).
+  Flag `preview_frame_proxy` (`config.get_flag`, default on); off = no frame
+  fields at all (the status is byte-identical) and any relay is closed.
+- **Lifetime = the preview's**: `stop()` (so reap, start's restart, stop_all),
+  `forget()` (adopted), a dead adopted server, the preview no longer running or
+  on another port (next status), `reap_idle`'s `_frame_gc` (no owner left),
+  and `atexit`. In-process daemon threads: a hard kill of the hub takes them.
+- **Page**: the iframe loads `st.frame_url || st.url` (only on a change, so no
+  flicker; Reload busts the cache on that URL); "Open in a new tab", the state
+  line, Publish and the deploy check keep the REAL `url`. `frame_blocked` ->
+  `#preview-blocked`: "This app doesn't allow being shown inside another
+  page." + an "Open in a new tab" button (real URL, `target=_blank
+  rel=noopener noreferrer`) instead of the browser's error page.
+- **Limits**: a parent page cannot see why a cross-origin frame failed, so the
+  plain message relies on the server-side probe + self-check; a page that only
+  blocks on a path other than `/` (and not on `/`'s response or redirect) is
+  framed directly and still shows the browser's error there; JS frame-busting
+  (`top.location = ...`) is not handled; the relay sees the dashboard's own
+  loopback origin only (127.0.0.1 / localhost on the hub's port).

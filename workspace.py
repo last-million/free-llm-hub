@@ -30,6 +30,7 @@ script, a known framework entry point, a static index.html). There is no field
 anywhere that feeds a string to a shell. That is the whole reason `detect()`
 returns a fixed argv list and never a shell string.
 """
+import atexit
 import json
 import logging
 import os
@@ -1302,6 +1303,7 @@ def _published(project_dir):
 def stop(project_dir):
     project_dir = os.path.abspath(project_dir)
     _publish_stopped(project_dir)
+    _frame_stop(project_dir)
     with _lock:
         proc = _procs.pop(project_dir, None)
         if proc:
@@ -1335,6 +1337,7 @@ def stop(project_dir):
 def stop_all():
     for d in list(_procs):
         stop(d)
+    _frame_stop_all()
 
 
 ATTACH_DIR = ".hub-attachments"
@@ -1947,6 +1950,7 @@ def forget(project_dir):
     """Stop showing an adopted server. Deliberately does NOT kill it: we did not
     start it, so we do not own its lifetime — the agent, or the user's own
     terminal, does."""
+    _frame_stop(project_dir)
     with _lock:
         return _adopted.pop(os.path.abspath(project_dir), None) is not None
 
@@ -1962,6 +1966,7 @@ def _adopted_status(project_dir, now=None):
     if not _http_ok(port):
         with _lock:
             _adopted.pop(project_dir, None)
+        _frame_stop(project_dir)
         return None                      # it died; report idle, not a dead link
     return {
         "running": True, "state": "running", "url": url, "port": port,
@@ -2013,6 +2018,7 @@ def reap_idle(now=None):
     stale = [d for d in stale if not _published(d)]
     for d in stale:
         stop(d)
+    _frame_gc()
     return stale
 
 
@@ -2062,3 +2068,234 @@ def status(project_dir):
         "error": proc.error,
         "uptime": int(time.time() - proc.started_at),
     }
+
+
+# --------------------------------------------------------------------------- #
+# PREVIEW FRAME PROXY (2026-10-11). The Build page frames the preview from the
+# dashboard's origin (127.0.0.1:8787); the preview runs on another port, i.e.
+# another ORIGIN. An app sending X-Frame-Options or a CSP frame-ancestors that
+# does not allow the hub (helmet's defaults: SAMEORIGIN + frame-ancestors
+# 'self') was refused by the browser -- "127.0.0.1 refused to connect." --
+# while it worked in its own tab. MEASURED live on the owner's Express app.
+#
+# After the preview answers, GET / is probed ONCE (loopback, no redirect
+# followed). Only when its headers would block the frame is a frameproxy relay
+# started in front of the real port, and the status gets `frame_url` = the
+# relay; otherwise `frame_url` = the real URL. Only the iframe uses frame_url:
+# "Open in a new tab", Publish and the deploy check keep the real `url`. The
+# relay lives exactly as long as the preview: stop / forget / reap / a dead
+# adopted server / a port change / the flag going off / hub exit all close it.
+# Flag `preview_frame_proxy` (default on); off = no frame fields at all.
+# --------------------------------------------------------------------------- #
+
+FRAME_PROBE_TIMEOUT = 2.5      # one GET / on loopback
+FRAME_RETRY_SECONDS = 3.0      # not answering yet: look again on a later poll
+FRAME_MAX_TRIES = 6            # then frame it directly and stop asking
+FRAME_WAIT = 4.0               # a concurrent status call waits this long
+
+_frames = {}                   # project_dir -> _Frame
+_frames_lock = threading.Lock()
+_FRAME_MOD = None
+
+
+def _frame_mod():
+    global _FRAME_MOD
+    if _FRAME_MOD is None:
+        try:
+            import frameproxy
+            _FRAME_MOD = frameproxy
+        except Exception:                                        # noqa: BLE001
+            _FRAME_MOD = False
+    return _FRAME_MOD or None
+
+
+def _frame_proxy_enabled():
+    try:
+        import config
+        return bool(config.get_flag("preview_frame_proxy", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _frame_avoid(port):
+    """Never a port this module hands out, never the hub's."""
+    return port == _hub_port() or PORT_RANGE[0] <= port <= PORT_RANGE[1]
+
+
+class _Frame:
+    def __init__(self, port):
+        self.port = port
+        self.proxy = None
+        self.frame_url = None
+        self.blocked = False
+        self.why = None
+        self.decided = False
+        self.busy = False
+        self.closed = False
+        self.done = threading.Event()
+        self.tries = 0
+        self.next_try = 0.0
+
+    def close(self):
+        with _frames_lock:
+            self.closed = True
+            proxy, self.proxy = self.proxy, None
+        if proxy is not None:
+            try:
+                proxy.stop()
+            except Exception:                                    # noqa: BLE001
+                pass
+
+
+def _frame_stop(project_dir):
+    """Close this project's frame proxy, if any. Never raises."""
+    with _frames_lock:
+        rec = _frames.pop(os.path.abspath(project_dir), None)
+    if rec is not None:
+        rec.close()
+
+
+def _frame_stop_all():
+    with _frames_lock:
+        recs = list(_frames.values())
+        _frames.clear()
+    for rec in recs:
+        rec.close()
+
+
+def _frame_gc():
+    """Close every proxy whose preview is no longer running on its port."""
+    with _frames_lock:
+        items = list(_frames.items())
+    for d, rec in items:
+        with _lock:
+            p = _procs.get(d)
+            a = _adopted.get(d)
+            live = ((p is not None and p.state == "running" and p.port == rec.port)
+                    or (p is None and a is not None and a["port"] == rec.port))
+        if live:
+            continue
+        with _frames_lock:
+            if _frames.get(d) is not rec:
+                continue
+            _frames.pop(d, None)
+        rec.close()
+
+
+def _frame_note(project_dir, line):
+    with _lock:
+        p = _procs.get(project_dir)
+    if p is not None:
+        p.log(line)
+    else:
+        _log.info("%s (%s)", line, os.path.basename(project_dir))
+
+
+def _frame_decide(project_dir, rec, url):
+    fp = _frame_mod()
+    if fp is None:
+        with _frames_lock:
+            rec.decided, rec.frame_url = True, url
+        return
+    hub = _hub_port()
+    headers = fp.fetch_headers(rec.port, timeout=FRAME_PROBE_TIMEOUT)
+    if headers is None:
+        with _frames_lock:
+            rec.tries += 1
+            if rec.tries >= FRAME_MAX_TRIES:
+                rec.decided, rec.frame_url = True, url
+            else:
+                rec.next_try = time.time() + FRAME_RETRY_SECONDS
+        return
+    why = fp.framing_block(headers, hub)
+    if not why:
+        with _frames_lock:
+            rec.decided, rec.frame_url = True, url
+        return
+    proxy = None
+    try:
+        proxy = fp.FrameProxy(rec.port, hub_port=hub, avoid=_frame_avoid).start()
+        check = fp.fetch_headers(proxy.port, timeout=FRAME_PROBE_TIMEOUT)
+        if check is None or fp.framing_block(check, hub):
+            raise OSError("the frame proxy did not pass its own check")
+    except Exception as exc:                                     # noqa: BLE001
+        if proxy is not None:
+            proxy.stop()
+        with _frames_lock:
+            rec.decided, rec.blocked, rec.frame_url, rec.why = True, True, url, why
+        _frame_note(project_dir, "[hub] this app refuses to be shown inside another "
+                                 "page (%s) and the frame proxy could not start: %s"
+                    % (why, exc))
+        return
+    with _frames_lock:
+        stale = rec.closed
+        if not stale:
+            rec.proxy, rec.frame_url, rec.decided, rec.why = proxy, proxy.url, True, why
+    if stale:
+        proxy.stop()
+        return
+    _frame_note(project_dir, "[hub] this app refuses to be shown inside another page "
+                             "(%s); the Build page shows it through a local frame "
+                             "proxy on port %d" % (why, proxy.port))
+
+
+def frame_fields(project_dir, st=None):
+    """{"frame_url", "frame_blocked"} for the Build page's iframe, or {} when
+    the flag is off or nothing is running. `frame_url` is the real URL unless
+    the app's framing headers need the relay; `frame_blocked` means the app
+    refuses framing and no relay could serve it (the page then shows a plain
+    message and the real URL in a new tab). Never raises."""
+    project_dir = os.path.abspath(project_dir)
+    try:
+        if st is None:
+            st = status(project_dir)
+        if not _frame_proxy_enabled():
+            _frame_stop(project_dir)
+            return {}
+        url, port = st.get("url"), st.get("port")
+        if not (st.get("running") and url and port):
+            _frame_stop(project_dir)
+            return {}
+        old = None
+        with _frames_lock:
+            rec = _frames.get(project_dir)
+            if rec is not None and rec.port != port:
+                old = _frames.pop(project_dir)
+                rec = None
+            if rec is None:
+                rec = _frames[project_dir] = _Frame(port)
+            mine = False
+            if not rec.decided and not rec.busy and time.time() >= rec.next_try:
+                rec.busy, mine = True, True
+                rec.done.clear()
+            busy = rec.busy
+        if old is not None:
+            old.close()
+        if mine:
+            try:
+                _frame_decide(project_dir, rec, url)
+            finally:
+                with _frames_lock:
+                    rec.busy = False
+                rec.done.set()
+        elif busy:
+            rec.done.wait(FRAME_WAIT)
+        with _frames_lock:
+            if _frames.get(project_dir) is rec and rec.decided:
+                return {"frame_url": rec.frame_url or url,
+                        "frame_blocked": bool(rec.blocked)}
+        return {"frame_url": url, "frame_blocked": False}
+    except Exception:                                            # noqa: BLE001
+        _log.debug("frame decision failed for %s", project_dir, exc_info=True)
+        url = (st or {}).get("url")
+        return {"frame_url": url, "frame_blocked": False} if url else {}
+
+
+def _frame_atexit():
+    try:
+        _frame_stop_all()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+atexit.register(_frame_atexit)

@@ -4168,6 +4168,14 @@
                   <p>Press <b>Run</b> to start this project and see it here.</p>
                   <p class="preview-hint">Its dependencies install into this folder only — a <code>.venv</code> and its own <code>node_modules</code>.</p>
                 </div>
+                <!-- PREVIEW FRAME PROXY: shown instead of the browser's own "refused
+                     to connect" page when the app forbids framing and the hub's
+                     local frame proxy could not serve it. The link is the REAL url. -->
+                <div class="preview-placeholder" id="preview-blocked" role="status" hidden>
+                  <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                  <p>This app doesn't allow being shown inside another page.</p>
+                  <a class="btn sm" id="preview-blocked-open" href="#" target="_blank" rel="noopener noreferrer">Open in a new tab</a>
+                </div>
               </div>
               <!-- FILES pane: tree on the left, source on the right. -->
               <div class="files-pane" id="files-pane" hidden>
@@ -10764,6 +10772,7 @@
       var runBtn = $('#preview-run'), stopBtn2 = $('#preview-stop');
       var stateEl = $('#preview-state'), openEl = $('#preview-open');
       var reloadBtn = $('#preview-reload'), frame = $('#preview-frame');
+      var blockedBox = $('#preview-blocked'), blockedOpen = $('#preview-blocked-open');
       var placeholder = $('#preview-placeholder'), probBox = $('#preview-problems');
       var probList = $('#preview-problem-list'), probCount = $('#preview-problems-count');
       var logEl = $('#preview-log'), logToggle = $('#preview-log-toggle');
@@ -10783,14 +10792,31 @@
         fullBtn.hidden = !running;
         if (running && st.url){
           openEl.href = st.url;
-          /* Only reassign src on a URL CHANGE — writing the same src reloads the
-             iframe on every poll and the preview would flicker once a second. */
-          if (st.url !== lastUrl){ frame.src = st.url; lastUrl = st.url; }
-          frame.hidden = false;
-          placeholder.hidden = true;
+          /* PREVIEW FRAME PROXY: the iframe loads frame_url -- the hub's local
+             relay when the app forbids being framed (helmet's X-Frame-Options /
+             frame-ancestors), else the real url. "Open in a new tab" and every
+             other use keep the REAL url. frame_blocked = it forbids framing and
+             no relay could serve it: a plain message instead of the browser's
+             own "refused to connect" page. */
+          var frameUrl = st.frame_url || st.url;
+          if (st.frame_blocked){
+            if (lastUrl){ frame.src = 'about:blank'; lastUrl = null; }
+            frame.hidden = true;
+            placeholder.hidden = true;
+            blockedOpen.href = st.url;
+            blockedBox.hidden = false;
+          } else {
+            blockedBox.hidden = true;
+            /* Only reassign src on a URL CHANGE — writing the same src reloads the
+               iframe on every poll and the preview would flicker once a second. */
+            if (frameUrl !== lastUrl){ frame.src = frameUrl; lastUrl = frameUrl; }
+            frame.hidden = false;
+            placeholder.hidden = true;
+          }
           setState((st.kind || 'running') + ' · ' + st.url.replace('http://', ''), 'live');
         } else {
           frame.hidden = true;
+          blockedBox.hidden = true;
           placeholder.hidden = false;
           lastUrl = null;
           if (st.state === 'installing') setState('installing dependencies…');
@@ -11203,6 +11229,7 @@
              none of it belongs to the folder we just moved to. */
           frame.src = 'about:blank';
           frame.hidden = true;
+          blockedBox.hidden = true;
           placeholder.hidden = false;
           setState('not running');
           probList.innerHTML = '';
