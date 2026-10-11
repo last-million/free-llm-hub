@@ -13233,6 +13233,15 @@
         ck.title = HP_CHECK_TIP[t.check.kind] || '';
         top.appendChild(ck);
       }
+      /* Auto-continue: a failed phase re-runs on another model. "retrying,
+         attempt 2 of 3" while it does, "failed after N attempts" once done. */
+      if (t.retry && t.retry.text){
+        var rt = document.createElement('span');
+        rt.className = 'hp-check ' + (state === 'failed' ? 'observed_fail' : 'claimed');
+        rt.textContent = t.retry.text;
+        if (t.retry.last_failure) rt.title = 'Last failure: ' + t.retry.last_failure;
+        top.appendChild(rt);
+      }
       if (t.this){
         var me = document.createElement('span'); me.className = 'hp-this-chip';
         me.textContent = 'this window';

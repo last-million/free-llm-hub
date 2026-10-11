@@ -5111,3 +5111,81 @@ protocol shaping for chat/responses/messages; no network, no real CLI).
   environment block (fix 3); nothing starts helper agents without the mode's own
   gate (fix 2). Result delivery and the live-turn note never cross
   conversations or folders (the owner is read from the folder-scoped map row).
+
+## Failed Multi phases continue by themselves (2026-10-11)
+
+Owner: in Multi runs "sometimes some phases fail and it does not let them
+continue automatically -- that is an issue, fix it." MEASURED on the owner's
+last 20 real runs (`~/.free-llm-hub/swarm-runs/*.json`, read-only): 4 had failed
+phases -- 2x the hub's OWN worker prompt over agentic_chat's per-turn cap
+("Message is 27973 chars; capped at 24000 per turn.", a hub bug), 2x "no output
+for 900s", 1x "opencode produced no reply.", 1x "did not pass verification:
+`npm test` failed" (after its one revision), plus 2x "stopped" (user/budget,
+which must NOT be retried). None of the retryable ones was continued. Covered by
+`tests/test_multi_failed_phases_continue.py` (hermetic: fake spawn/run_turn, no
+network, no CLI, its own swarm-run dir; the ONE file the conftest leaves the
+flag ON -- `_multi_auto_retry_off_unless_tested` forces it OFF everywhere else,
+same pattern as the race / team-notes fixtures). Flag `multi_auto_retry_failed`
+(`config.get_flag`, default ON); OFF = today's behaviour byte for byte.
+
+- **The 24000-char cap (the hub bug).** `agentic_chat.max_message_chars(cli_id)`
+  refuses a turn whose message is over a per-CLI cap (24000 on the direct
+  launch path, 5600 on the cmd.exe shell path), so a worker brief over it FAILED
+  the phase before the model read a word. `_agent_prompt` now GUARANTEES a fit:
+  `_full_agent_prompt` builds the brief exactly as before (byte-for-byte when the
+  flag is off or the brief already fits); over the cap, `_fit_agent_prompt` keeps
+  the INSTRUCTIONS inline (task, done-when, managed brief, revision problems, the
+  review's verification lines, the folder/server rules, the finish+PROGRESS line)
+  and moves the bulky CONTEXT -- the FULL goal, the goal-brief, the shared design,
+  the conversation so far, the dependency summaries, the machine block -- into a
+  hub-written file `.calvoun-brief-ctx-<run>-<idx>.md` in the project folder (the
+  worker is pointed at its absolute path; the name matches agentic_chat's
+  `.calvoun-brief*.md` glob, so the existing git-exclude and stale-sweep cover
+  it). The goal is never silently cut: it is written whole to that file, and when
+  there is no writable folder the context is bounded inline with a visible marker,
+  goal first. `_hard_clip_to_cap` is the last resort if even the instructions
+  exceed the cap. app wires the real cap with
+  `swarm_windows.set_max_chars_fn(agentic_chat.max_message_chars)`; a run with no
+  hook uses `DEFAULT_PROMPT_CAP` (24000).
+
+- **The retry rule.** A phase that ends FAILED for a retryable reason is tried
+  again in a FRESH session on a DIFFERENT model, up to `PHASE_RETRIES` (2) extra
+  attempts (total 1 + PHASE_RETRIES). Retryable = any FAILED reason (no reply,
+  idle/hard timeout, verification still failing after its revision, the cap error
+  if it could still happen, provider/upstream errors) EXCEPT a transient store
+  lock (`_is_transient` -- `_attempts` already exhausts those on the same CLI, and
+  a different model meets the same shared SQLite). A STOPPED phase (user Stop,
+  budget) is never FAILED here, so it is never retried. The old one-shot no-reply
+  retry inside `_attempts` is UNIFIED, not stacked: with the flag on `_attempts`
+  does only its transient retries and the phase-level loop in `_run_agent` is the
+  single retry authority; with the flag off `_attempts` keeps its no-reply retry
+  exactly as before. The retry lives IN the worker's own thread (`_run_agent`'s
+  loop): the thread stays alive across its retries, so the scheduler keeps the
+  phase in its `running`/`unsettled` set and **dependents keep waiting** for it
+  (not "a FAILED need does not block" until the attempts are genuinely spent).
+  A wedged turn (idle/hard timeout) is retried by the scheduler UNBLOCKING it --
+  `stop(session)` ends the stuck CLI turn and the thread returns to its loop and
+  retries (`_retry_phase_unblock_ok`); without a `stop` hook (nothing to unblock
+  with) or with the retry budget spent, the old terminal `_give_up` stands. Each
+  retry retires the session + sets `agent.widen` so `sibling_sessions` names the
+  old one and app's `_rotate_within_run` picks another model, and the next
+  attempt's prompt is told the previous failure (`agent.last_failure`). Budget
+  (`budget_check`), Stop and the RAM/concurrency governor are all honoured (the
+  retry re-enters the scheduler's normal start path).
+
+- **Persisted + visible.** `_Agent.attempts` (extra attempts used) and
+  `last_failure` ride to disk in `row()`/`from_row()`, so a boot resume or a
+  "continue" KEEPS the count -- an exhausted phase does not get a fresh batch
+  (bounded across restarts). `swarm_windows.attempt_view(agent)` words it; app's
+  `_multi_run_plan` shows "retrying, attempt 2 of 3" / "failed after N attempts"
+  and `templates/index.html` `helperRow` draws a chip (theme tokens only);
+  `format_result` ends with "Phases still failing after N attempts each: ..."
+  naming what is genuinely left.
+
+- **Limits.** The transient store lock is deliberately not phase-retried (same
+  CLI, same store). A resume gives an exhausted phase one more run (the continue
+  itself) but no new auto-retries. The idle/timeout unblock-retry needs a real
+  `stop` hook that actually ends the CLI turn (production passes
+  `agentic_chat.stop_session`); without one the old terminal give-up applies. The
+  cap-fit writes into the project folder, so a project with no writable folder
+  falls back to a visible inline trim (goal kept first) rather than a file.

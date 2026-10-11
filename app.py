@@ -8711,6 +8711,10 @@ def _recent_429_count(window=120.0):
 
 swarm_windows.set_fleet_counter(_multi_fleet_size)
 swarm_windows.set_rate_counter(_recent_429_count)
+# A Multi worker's brief must fit the CLI's per-turn message cap, or the phase
+# fails before the model sees it (fixed 2026-10-11): give swarm_windows the real
+# per-CLI cap so it can move the bulky context into a brief file when needed.
+swarm_windows.set_max_chars_fn(agentic_chat.max_message_chars)
 
 
 def _session_pin_drop(key):
@@ -27353,7 +27357,13 @@ def _multi_run_plan(session_id, project_dir=None):
                 model = _WORKER_MODEL.get(a.session_id) if a.session_id else None
             if model:
                 text += " \u00b7 " + model
-            if a.state == swarm_windows.FAILED:
+            # Auto-continue a failed phase (swarm_windows): "retrying, attempt 2
+            # of 3" while it re-runs on another model, "failed after N attempts"
+            # once its budget is spent. None on a first attempt.
+            retry = swarm_windows.attempt_view(a)
+            if retry:
+                text += " \u00b7 " + retry["text"]
+            elif a.state == swarm_windows.FAILED:
                 text += " (failed)"
             # Each helper is a real agent session with its own page: the
             # conversation lists them and opens any one in a new window
@@ -27371,6 +27381,7 @@ def _multi_run_plan(session_id, project_dir=None):
                           # labelled: "12 passed (observed)" / "claimed,
                           # not checked" / "reviewed" (swarm_windows.check_of).
                           "check": swarm_windows.check_of(a),
+                          "retry": retry,
                           "pair": _multi_pair_view(a)})
         running = [t["index"] for t in items if t["doing"]]
         # The stopping place stays visible next to the helpers: a run that was

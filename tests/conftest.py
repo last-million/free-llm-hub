@@ -366,6 +366,26 @@ def _team_notes_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _multi_auto_retry_off_unless_tested(request, monkeypatch):
+    """AUTO-CONTINUE FAILED MULTI PHASES (swarm_windows, flag
+    `multi_auto_retry_failed`) is default ON (2026-10-11), but every other test
+    file pins the pre-feature behaviour: a phase that FAILS (no reply, idle
+    timeout, verification still failing) ends there, _attempts keeps its own
+    one-shot no-reply retry, and _agent_prompt never rewrites an over-cap
+    prompt. Forcing the flag off here keeps all of those byte-for-byte; the
+    feature's own file turns it back on. Same pattern as the race / team-notes
+    fixtures above."""
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_multi_failed_phases_continue":
+        try:
+            import swarm_windows
+            monkeypatch.setattr(swarm_windows, "_auto_retry_on", lambda: False)
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _weak_models_not_force_verified(request, monkeypatch):
     """Tests written with low fake scores (10-100) are about their own subject;
     the "weak actor is always verified" wiring has its own test file."""

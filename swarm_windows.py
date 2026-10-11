@@ -944,7 +944,8 @@ class _Agent:
                  "event_total", "evidence", "reviewed", "claimed_unobserved",
                  "receipt", "files", "free_check", "widen", "slop",
                  "parallel", "pair_session", "pair_state", "pair_summary",
-                 "pair_error", "pair_started_at", "pair_ended_at", "label")
+                 "pair_error", "pair_started_at", "pair_ended_at", "label",
+                 "attempts", "last_failure")
 
     def __init__(self, index, phase):
         self.index = index
@@ -1001,6 +1002,14 @@ class _Agent:
         self.widen = False
         self.problems = []
         self.revisions = 0
+        # AUTO-CONTINUE A FAILED PHASE (2026-10-11, flag multi_auto_retry_failed):
+        # `attempts` is how many EXTRA fresh-session, different-model attempts a
+        # phase that FAILED for a retryable reason has used (0..PHASE_RETRIES).
+        # `last_failure` is the previous attempt's reason, so the next attempt's
+        # prompt is told what to avoid. Both persisted, so a resume/"continue"
+        # keeps the count (the retry budget is bounded ACROSS restarts).
+        self.attempts = 0
+        self.last_failure = None
         self.session_id = None
         self.past_sessions = []
         self.state = PENDING
@@ -1038,6 +1047,8 @@ class _Agent:
             "output_format": self.output_format, "acceptance": self.acceptance,
             "verified": self.verified, "problems": list(self.problems),
             "revisions": self.revisions,
+            "attempts": self.attempts,
+            "last_failure": self.last_failure,
             "reviewed": bool(self.reviewed),
             "claimed_not_observed": bool(self.claimed_unobserved),
             "evidence": [dict(e) for e in self.evidence],
@@ -1334,6 +1345,12 @@ class _Run:
             agent.problems = [str(p) for p in (a.get("problems") or ())][:10]
             agent.revisions = int(a.get("revisions") or 0) if str(
                 a.get("revisions") or 0).isdigit() else 0
+            # Retry budget survives a restart: a phase that already used its
+            # extra attempts does not get a fresh batch when the run resumes.
+            agent.attempts = int(a.get("attempts") or 0) if str(
+                a.get("attempts") or 0).isdigit() else 0
+            agent.last_failure = a.get("last_failure") if isinstance(
+                a.get("last_failure"), str) else None
             agent.session_id = a.get("session_id")
             agent.parallel = bool(a.get("parallel"))
             pr = a.get("pair") if isinstance(a.get("pair"), dict) else None
@@ -1472,6 +1489,35 @@ def design_view(run):
 
 
 def _agent_prompt(run, agent):
+    """One worker's whole brief, GUARANTEED to fit the CLI's per-turn cap.
+
+    _full_agent_prompt builds the brief exactly as it always has. When the
+    auto-continue flag is off, or the brief already fits, that is what ships --
+    byte-for-byte. Otherwise the brief is over agentic_chat's per-turn message
+    cap and would FAIL the phase before the model read a word (MEASURED: two of
+    the four failed-phase cases were "Message is 27973 chars; capped at 24000").
+    _fit_agent_prompt then keeps the instructions inline and moves the bulky
+    CONTEXT (the full goal, the shared design, the conversation so far, the
+    dependency summaries, the machine block) into a hub-written brief file the
+    worker reads -- never silently dropping the goal."""
+    full = _full_agent_prompt(run, agent)
+    if not _auto_retry_on():
+        return full
+    cap = _prompt_cap(run)
+    if cap <= 0 or len(full) <= cap:
+        return full
+    try:
+        fitted = _fit_agent_prompt(run, agent, cap)
+    except Exception as exc:                                     # noqa: BLE001
+        _log.warning("[swarm] could not fit phase %d prompt (%s); hard-clipping",
+                     agent.index, exc)
+        fitted = None
+    if not fitted or len(fitted) > cap:
+        fitted = _hard_clip_to_cap(fitted or full, cap)
+    return fitted
+
+
+def _full_agent_prompt(run, agent):
     """One worker's whole brief.
 
     Parents contribute their SUMMARY, never their transcript. That is the
@@ -1519,6 +1565,14 @@ def _agent_prompt(run, agent):
                   "work is already in the project folder. Fix these problems:"]
         parts += ["- " + p for p in agent.problems]
         parts += [""]
+    if getattr(agent, "attempts", 0) and agent.last_failure:
+        # AUTO-CONTINUE: a previous whole attempt at this phase failed and this
+        # is a fresh session on a different model. Tell it what went wrong so it
+        # does not repeat it; any partial work is already on disk. Only present
+        # on a retry (attempts > 0), so a first attempt's prompt is unchanged.
+        parts += ["A PREVIOUS ATTEMPT AT THIS PHASE FAILED (reason: %s). Any partial "
+                  "work it left is in the project folder. Do the whole phase this time, "
+                  "and avoid whatever caused that failure." % agent.last_failure, ""]
     if _is_review(run, agent) and any(a.verified is not None or a.reviewed
                                       or a.claimed_unobserved for a in run.agents
                                       if a is not agent):
@@ -1616,6 +1670,166 @@ def _agent_prompt(run, agent):
     return "\n".join(parts)
 
 
+# A prefix that matches agentic_chat's `.calvoun-brief*.md` glob, so the overflow
+# brief is git-excluded and stale-swept by the SAME machinery the per-session
+# briefs use, without colliding with the per-session name (`.calvoun-brief-<sid>`).
+_CTX_BRIEF_PREFIX = ".calvoun-brief-ctx-"
+
+
+def _ctx_brief_name(run, agent):
+    return "%s%s-%d.md" % (_CTX_BRIEF_PREFIX, re.sub(r"[^A-Za-z0-9_-]", "", run.id)[:40],
+                           agent.index)
+
+
+def _write_context_brief(run, agent, body):
+    """Write the bulky context into a hub-owned file in the project folder and
+    return its absolute path, or None (no folder, or the write failed -- the
+    caller then bounds the context inline instead). Best-effort; never raises."""
+    folder = getattr(run, "project_dir", None)
+    try:
+        if not folder or not os.path.isdir(folder):
+            return None
+        path = os.path.join(os.path.abspath(folder), _ctx_brief_name(run, agent))
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body.rstrip() + "\n")
+        return path
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _fit_agent_prompt(run, agent, cap):
+    """The worker brief, fitted under `cap`. The INSTRUCTIONS stay inline; the
+    CONTEXT (full goal, goal-brief, design, conversation, dependency summaries,
+    the machine block) goes into a brief file the worker is pointed at, so
+    nothing -- least of all the user's goal -- is silently cut."""
+    lead = [agent.task, ""]
+    if agent.done_when:
+        lead += ["DONE WHEN: " + agent.done_when, ""]
+    for label, value in (("INPUTS", agent.inputs), ("CONSTRAINTS", agent.constraints),
+                         ("ACCEPTANCE (you will be checked against this)", agent.acceptance),
+                         ("YOUR FINAL MESSAGE MUST CONTAIN", agent.output_format)):
+        if value:
+            lead += [label + ": " + value, ""]
+    if agent.revisions and agent.problems:
+        lead += ["A PREVIOUS ATTEMPT AT THIS PHASE WAS CHECKED AND REJECTED. Its work "
+                 "is already in the project folder. Fix these problems:"]
+        lead += ["- " + p for p in agent.problems] + [""]
+    if getattr(agent, "attempts", 0) and agent.last_failure:
+        lead += ["A PREVIOUS ATTEMPT AT THIS PHASE FAILED (reason: %s). Any partial work "
+                 "it left is in the project folder. Do the whole phase this time, and "
+                 "avoid whatever caused that failure." % agent.last_failure, ""]
+    # The review's own per-phase verification lines are instructions (what to
+    # fix, what to leave): keep them inline, as the full prompt does.
+    lead += _review_verification_lines(run, agent)
+    # The CONTEXT, written to the brief file.
+    brief = ["# Context for phase %d (%s) of swarm run %s"
+             % (agent.index, agent.title, run.id), "",
+             "You are agent %d of %d in a parallel swarm. Everything you need is in your "
+             "task (sent to you directly) and in this file; there is nobody to ask." %
+             (agent.index, len(run.agents)), "",
+             "## The overall goal", run.goal or "(none stated)", ""]
+    gb = getattr(run, "goal_brief", "")
+    if gb:
+        brief += ["## The goal behind this work (keep every step serving it)", gb, ""]
+    design = design_block(run, agent)
+    if design:
+        brief += ["## The shared design", design, ""]
+    ctx = _clip_text(getattr(run, "context", ""), WORKER_CONTEXT_CHARS)
+    if ctx:
+        brief += ["## What the conversation already established", ctx, ""]
+    deps = [a for a in run.agents if a.index in agent.needs]
+    finished = [a for a in deps if a.summary]
+    if finished:
+        brief += ["## What the phases you depend on produced"]
+        for d in finished:
+            brief += ["### phase %d (%s)" % (d.index, d.title), d.summary[:DEP_CONTEXT_CHARS], ""]
+    missing = [a for a in deps if not a.summary]
+    if missing:
+        brief += ["NOTE: phase(s) %s did not produce a result. Do your own phase anyway and "
+                  "state what you had to assume." % ", ".join(str(a.index) for a in missing), ""]
+    env = getattr(run, "env_block", "")
+    if env:
+        brief += ["## This machine", env, ""]
+    brief_text = "\n".join(brief)
+    path = _write_context_brief(run, agent, brief_text)
+    if path:
+        lead += ["READ FIRST (context for this phase): %s" % path,
+                 "Open it at that exact path: it holds the overall goal, the shared design, "
+                 "the conversation so far, and what the phases you depend on produced. The "
+                 "full goal is in that file.", ""]
+    else:
+        # No writable folder (or the write failed): bound the context inline so
+        # the brief still fits, keeping the goal FIRST so it is never the part cut.
+        room = max(1000, cap - len("\n".join(lead)) - len(_fit_tail(run, agent)) - 400)
+        lead += ["--- context, not instructions (trimmed to fit this turn) ---",
+                 _clip_text(brief_text, room), ""]
+    lead += _fit_tail(run, agent, as_list=True)
+    out = "\n".join(x for x in lead if x is not None)
+    if len(out) > cap:
+        out = _hard_clip_to_cap(out, cap)
+    return out
+
+
+def _review_verification_lines(run, agent):
+    """The review phase's "VERIFICATION OF THE OTHER PHASES" block as a list of
+    lines (empty for a non-review phase); shared by the full and fitted briefs."""
+    if not (_is_review(run, agent) and any(
+            a.verified is not None or a.reviewed or a.claimed_unobserved
+            for a in run.agents if a is not agent)):
+        return []
+    out = ["VERIFICATION OF THE OTHER PHASES:"]
+    for a in run.agents:
+        if a is agent:
+            continue
+        check = check_of(a) or {}
+        if a.verified is True:
+            out.append("- phase %d (%s): verified -- %s; leave it alone unless something "
+                       "else breaks it" % (a.index, a.title, check.get("text") or "observed"))
+        elif a.verified is False:
+            out.append("- phase %d (%s): FAILED its checks -- fix: %s"
+                       % (a.index, a.title, "; ".join(a.problems) or a.error or "?"))
+        elif a.claimed_unobserved:
+            out.append("- phase %d (%s): says its tests/build pass, but no passing run was "
+                       "observed -- run them" % (a.index, a.title))
+        elif a.reviewed:
+            out.append("- phase %d (%s): reviewed by the manager (its summary, not a test "
+                       "run)" % (a.index, a.title))
+        else:
+            out.append("- phase %d (%s): %s, not checked" % (a.index, a.title, a.state))
+    out += ["Fix what is still failing first; do not redo verified work.", ""]
+    return out
+
+
+def _fit_tail(run, agent, as_list=False):
+    """The closing instructions every fitted brief ends with: where the files
+    go, the server rules, finish-with-a-summary, and the PROGRESS.md upkeep."""
+    tail = ["THE PROJECT FOLDER IS: " + run.project_dir,
+            "Every file you create or edit must be inside that folder. Use paths relative "
+            "to it, or that exact absolute spelling. Do not reuse a path printed by a "
+            "shell, and never write to /, /tmp or /workspace.",
+            agent_servers.worker_rules(),
+            "", "Work only on YOUR phase, and do it now -- do not ask for confirmation. "
+            "Finish with a short summary of what you changed and anything the other "
+            "agents need to know.",
+            "Keep PROGRESS.md in the project folder true for YOUR phase: under a heading "
+            "\"## %s\" keep one line \"- [ ] Phase %d: %s\" (add it when missing), and tick "
+            "\"- [x]\" with one short line of what you verified when done."
+            % (run.id, agent.index, agent.title)]
+    return tail if as_list else "\n".join(tail)
+
+
+def _hard_clip_to_cap(text, cap):
+    """Last resort: a prompt still over the cap is clipped head+tail with a
+    visible marker. Only reached if even the instructions alone exceed the cap."""
+    if len(text) <= cap:
+        return text
+    marker = "\n[... the hub trimmed this turn to fit the CLI's limit; the full context is " \
+             "in the brief file named above ...]\n"
+    keep = max(200, cap - len(marker))
+    head = int(keep * 0.7)
+    return text[:head] + marker + text[-(keep - head):]
+
+
 def _drain(agent, events):
     """Consume one worker's event stream into its ring buffer, and keep the last
     assistant message as its summary.
@@ -1703,6 +1917,145 @@ NO_REPLY_RETRIES = 1
 # every worker is opening the same database.
 SPAWN_STAGGER = 2.0
 
+# --------------------------------------------------------------------------- #
+# FAILED PHASES CONTINUE BY THEMSELVES (2026-10-11)
+# --------------------------------------------------------------------------- #
+# Owner: "sometimes some phases fail and it does not let them continue
+# automatically -- that is an issue, fix it." MEASURED on the owner's last 20
+# real runs: 4 had failed phases -- a worker prompt over agentic_chat's per-turn
+# cap (a hub bug, fixed by _fit_agent_prompt below), a silent "no output for
+# 900s", "opencode produced no reply", and a phase still failing its tests after
+# its one revision. None of those was retried.
+#
+# A phase that ends FAILED for a retryable reason (anything that is NOT a user
+# Stop or a budget stop) is now tried again in a FRESH session on a DIFFERENT
+# model (the existing rotation: _retire_session + agent.widen -> sibling_sessions
+# names the old session, so app's _rotate_within_run picks another model), up to
+# PHASE_RETRIES extra attempts, each told what the previous one failed on. This
+# UNIFIES (does not stack with) the old "one more go" no-reply retry: when the
+# flag is on, _attempts no longer does its own no-reply retry -- the phase-level
+# loop in _run_agent is the single authority, so the total is bounded at
+# 1 + PHASE_RETRIES. Transient store-lock retries (_is_transient) stay inside
+# _attempts and never trigger a phase-level retry (a different model on the same
+# CLI hits the same shared store).
+#
+# The retry lives IN the worker's own thread (_run_agent's loop), never a second
+# thread on the same _Agent: dependents keep waiting because the phase's thread
+# stays alive and in the scheduler's `running`/`unsettled` set throughout its
+# retries. A wedged turn (idle/hard timeout) is retried by the scheduler
+# UNBLOCKING it (stop(session) returns the thread to its loop); without a stop
+# hook the old terminal give-up still applies.
+PHASE_RETRIES = 2
+
+# Flag multi_auto_retry_failed (default ON). OFF restores the behaviour exactly:
+# the no-reply retry stays inside _attempts, no phase-level retry runs, and
+# _agent_prompt never rewrites an over-cap prompt.
+_AUTO_RETRY_FLAG = "multi_auto_retry_failed"
+
+
+def _auto_retry_on():
+    try:
+        import config
+        return bool(config.get_flag(_AUTO_RETRY_FLAG, True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+# THE WORKER PROMPT MUST ALWAYS FIT (2026-10-11). agentic_chat refuses a turn
+# whose message is over a per-CLI cap (max_message_chars: 24000 on the direct
+# path, 5600 on the cmd.exe shell path), so a worker prompt over it failed the
+# phase before the model saw a word -- two of the four measured failures. app
+# wires the real cap; a run with no hook uses DEFAULT_PROMPT_CAP.
+DEFAULT_PROMPT_CAP = 24000
+_MAX_CHARS_HOOK = [None]
+
+
+def set_max_chars_fn(fn):
+    """app registers fn(cli_id) -> the per-turn message cap for that CLI
+    (agentic_chat.max_message_chars). None/unset = DEFAULT_PROMPT_CAP."""
+    _MAX_CHARS_HOOK[0] = fn if callable(fn) else None
+
+
+def _prompt_cap(run):
+    fn = _MAX_CHARS_HOOK[0]
+    if fn:
+        try:
+            v = int(fn(getattr(run, "cli_id", None)))
+            if v > 0:
+                return v
+        except Exception:                                        # noqa: BLE001
+            pass
+    return DEFAULT_PROMPT_CAP
+
+
+def _budget_reached(run):
+    try:
+        return bool(getattr(run, "budget", None) and run.budget_status()[0])
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _retryable_failure(agent):
+    """A FAILED phase the auto-continue should try again. Every FAILED reason
+    is retryable EXCEPT a transient store lock (_attempts already exhausted it;
+    a different model on the same CLI meets the same shared store). A STOPPED
+    phase (user Stop, budget) is never FAILED here, so it is never retried."""
+    if agent.state != FAILED:
+        return False
+    if getattr(agent, "abandoned", False):
+        return False
+    return not _is_transient(agent.error)
+
+
+def _retry_phase(run, agent):
+    """Should _run_agent loop for another fresh-model attempt at this phase?"""
+    if not _auto_retry_on():
+        return False
+    if run.stop_flag.is_set():
+        return False
+    if not _retryable_failure(agent):
+        return False
+    if agent.attempts >= PHASE_RETRIES:
+        return False
+    if _budget_reached(run):
+        return False
+    return True
+
+
+def _retry_phase_unblock_ok(run, agent):
+    """May the scheduler UNBLOCK a wedged (idle/timed-out) RUNNING phase so its
+    thread retries on a fresh model, instead of writing it off? Same gates as
+    _retry_phase, but for a phase that has not reached FAILED yet."""
+    if not _auto_retry_on():
+        return False
+    if run.stop_flag.is_set():
+        return False
+    if agent.attempts >= PHASE_RETRIES:
+        return False
+    if _budget_reached(run):
+        return False
+    return True
+
+
+def attempt_view(agent):
+    """What the Build page says about a phase's retries, or None when it is on
+    its first attempt. Words, not only colour."""
+    try:
+        used = int(getattr(agent, "attempts", 0) or 0)
+    except (TypeError, ValueError):
+        used = 0
+    if used <= 0:
+        return None
+    total = 1 + PHASE_RETRIES
+    out = {"attempt": used + 1, "max": total, "last_failure": getattr(agent, "last_failure", None)}
+    if agent.state == RUNNING:
+        out["text"] = "retrying, attempt %d of %d" % (used + 1, total)
+    elif agent.state == FAILED:
+        out["text"] = "failed after %d attempts" % (used + 1)
+    else:
+        out["text"] = "done on attempt %d of %d" % (used + 1, total)
+    return out
+
 
 def _is_transient(text):
     low = str(text or "").lower()
@@ -1713,7 +2066,6 @@ def _run_agent(run, agent, spawn, run_turn, configure=None):
     if run.stop_flag.is_set():
         agent.state = STOPPED
         return
-    agent.state = RUNNING
     agent.started_at = time.time()
     agent.last_event_at = agent.started_at
     verify = _should_verify(run, agent)
@@ -1721,20 +2073,42 @@ def _run_agent(run, agent, spawn, run_turn, configure=None):
     # command the worker ran that FAILED (and never passed after) is a
     # problem the phase gets its one revision for, at zero manager cost.
     check = not _is_review(run, agent)
+    # Snapshot ONCE: a phase's changes (and its receipt) span every retry.
     before = _snapshot(run.project_dir)
-    outcome = _attempts(run, agent, spawn, run_turn, configure, hold=verify or check)
-    if verify or check:
-        try:
-            _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before,
-                               managed=verify)
-        except Exception as exc:                                 # noqa: BLE001
-            # Verification is an extra, never the thing that loses a phase:
-            # whatever the worker produced stands as it would have without it.
-            _log.warning("[swarm] verification of phase %d raised: %s", agent.index, exc)
-            if agent.state == RUNNING:
-                agent.state = DONE if agent.summary else FAILED
-    else:
-        _settle_checks(agent)
+    while True:
+        agent.state = RUNNING
+        agent.last_event_at = time.time()
+        outcome = _attempts(run, agent, spawn, run_turn, configure, hold=verify or check)
+        if verify or check:
+            try:
+                _verify_and_revise(run, agent, spawn, run_turn, configure, outcome, before,
+                                   managed=verify)
+            except Exception as exc:                             # noqa: BLE001
+                # Verification is an extra, never the thing that loses a phase:
+                # whatever the worker produced stands as it would have without it.
+                _log.warning("[swarm] verification of phase %d raised: %s", agent.index, exc)
+                if agent.state == RUNNING:
+                    agent.state = DONE if agent.summary else FAILED
+        else:
+            _settle_checks(agent)
+        # AUTO-CONTINUE: a retryable FAILED phase gets another fresh-session,
+        # different-model attempt (see PHASE_RETRIES above). The thread stays
+        # alive across this loop, so the scheduler keeps the phase in its
+        # `running`/`unsettled` set and dependents keep waiting for it.
+        if not _retry_phase(run, agent):
+            break
+        agent.attempts += 1
+        agent.last_failure = _clip_text(agent.error or "(failed with no message)", 300)
+        _log.info("[swarm] phase %d failed (%s); auto-continuing on a different model "
+                  "(attempt %d of %d)", agent.index, agent.last_failure,
+                  agent.attempts + 1, 1 + PHASE_RETRIES)
+        _retire_session(agent)
+        agent.error = None
+        agent.widen = True                   # sibling_sessions names the retired one
+        agent.last_event_at = time.time()    # a fresh idle window for the watchdog
+        _persist(run)
+        time.sleep(RETRY_BACKOFF)
+    agent.widen = False
     agent.ended_at = time.time()
     _write_phase_receipt(run, agent, before)
     # Every phase boundary, not every event: a phase is the unit of work worth
@@ -1758,6 +2132,13 @@ def _attempts(run, agent, spawn, run_turn, configure=None, hold=False):
         if agent.state != FAILED:
             break
         if not _is_transient(agent.error):
+            # When auto-continue is ON, the phase-level loop in _run_agent is
+            # the single retry authority (a no-reply failure is retried there,
+            # on a DIFFERENT model) -- so this inner no-reply retry would only
+            # stack. When it is OFF, the old "one more go in a fresh session"
+            # stands exactly as before.
+            if _auto_retry_on():
+                break
             if no_reply_left <= 0 or _NO_REPLY_MARK not in str(agent.error or "").lower():
                 break
             no_reply_left -= 1
@@ -2652,10 +3033,32 @@ def _run_phases_loop(run, indexes, spawn, run_turn, configure=None, stop=None):
                 _finish_pair(agent, pairs.pop(i, None), stop)
                 unsettled.discard(i)
                 continue
+            if getattr(agent, "abandoned", False):
+                # Terminal give-up already happened; its thread is draining the
+                # stopped CLI and will be caught by the not-alive branch above.
+                continue
             # Measured from THIS start too: a resumed phase still carries the
             # previous walk's times until its thread writes new ones.
             began = max(agent.started_at or 0.0, spawned)
             quiet = now - max(agent.last_event_at or 0.0, began)
+            # IDLE (no output): a wedged turn that can still be retried is
+            # UNBLOCKED, not written off -- stop(session) ends the stuck CLI
+            # turn, the worker thread returns to its own loop (see _run_agent)
+            # and retries on a fresh model. The entry stays in `running` /
+            # `unsettled`, so dependents keep waiting. Without a stop hook
+            # (nothing to unblock with) or with the retry budget spent, the old
+            # terminal give-up stands. The 2h HARD cap stays terminal: its clock
+            # runs from this thread's spawn and cannot be reset for a retry.
+            if now - began <= AGENT_TIMEOUT and quiet > AGENT_IDLE_TIMEOUT \
+                    and stop and _retry_phase_unblock_ok(run, agent):
+                agent.last_event_at = now        # don't re-trigger before it retries
+                try:
+                    stop(agent.session_id)
+                except Exception:                # noqa: BLE001
+                    pass
+                _log.info("[swarm] phase %d: no output for %ds; unblocking to "
+                          "auto-continue on a different model", agent.index, int(quiet))
+                continue
             if now - began > AGENT_TIMEOUT:
                 _give_up(agent, "timed out after %ds" % int(AGENT_TIMEOUT), stop)
             elif quiet > AGENT_IDLE_TIMEOUT:
@@ -3594,6 +3997,7 @@ def result(run_id):
                     "session_id": a.session_id, "verified": a.verified,
                     "reviewed": bool(a.reviewed), "check": check_of(a),
                     "receipt": a.receipt,
+                    "attempts": a.attempts, "attempt_view": attempt_view(a),
                     "problems": list(a.problems)}
                    for a in run.agents],
         "done": sum(1 for a in run.agents if a.state == DONE),
@@ -3636,6 +4040,16 @@ def format_result(run_id):
             # exactly as before.
             lines.append("Still failing its checks: " + "; ".join(p["problems"]))
         lines.append("")
+    # Phases that STILL failed after every auto-continue attempt, named so the
+    # reader (and the conversation) knows what is genuinely left. A run with no
+    # such phase adds nothing (every attempts==0 run reads exactly as before).
+    exhausted = [p for p in res["phases"]
+                 if p["state"] == FAILED and (p.get("attempts") or 0) >= PHASE_RETRIES]
+    if exhausted:
+        lines.append("Phases still failing after %d attempts each: %s"
+                     % (1 + PHASE_RETRIES,
+                        "; ".join("Phase %d (%s)" % (p["index"], p["title"])
+                                  for p in exhausted)))
     budget = res.get("budget")
     if budget and budget.get("note"):
         # Said in the conversation: "Budget reached: ... -- N tasks left for
