@@ -86,9 +86,16 @@ requires_git = pytest.mark.skipif(not _git_ok(), reason="git is not available")
 class DictStore:
     """An in-memory token+projects store (no config / secretstore)."""
 
-    def __init__(self, token=TOKEN, login="octocat", user_id=42):
+    def __init__(self, token=TOKEN, login="octocat", user_id=42, client_id=None):
         self._token, self._login, self._uid = token, login, user_id
         self.projects = {}
+        self.client_id = client_id
+
+    def get_client_id(self):
+        return self.client_id
+
+    def set_client_id(self, value):
+        self.client_id = value
 
     def get_token(self):
         return self._token
@@ -131,15 +138,24 @@ class FakeHTTP:
                 "owner": {"login": "octocat"}}),
         }
         self.calls = []
+        self.seq = {}
 
     def set(self, method, path, status, data):
         self.routes[(method, path)] = (status, data)
+
+    def queue(self, method, path, *answers):
+        """Answers returned one per call (then the last one repeats)."""
+        self.seq[(method, path)] = list(answers)
 
     def __call__(self, method, url, headers, body):
         path = url[len(ghpush._API):] if url.startswith(ghpush._API) else url
         self.calls.append({"method": method, "path": path,
                            "headers": dict(headers), "body": body})
-        status, data = self.routes.get((method, path), (404, {"message": "not found"}))
+        q = self.seq.get((method, path))
+        if q:
+            status, data = q.pop(0) if len(q) > 1 else q[0]
+        else:
+            status, data = self.routes.get((method, path), (404, {"message": "not found"}))
         return status, {}, json.dumps(data).encode()
 
 
@@ -1165,6 +1181,657 @@ def test_app_known_project_guard(tmp_path, monkeypatch):
     assert A._gh_known_project(str(known)) is True
     assert A._gh_known_project(str(other)) is False
     assert A.ghpush.default.is_known_project is A._gh_known_project
+
+
+# --------------------------------------------------------------------------- #
+# One-click sign-in (1): GitHub's OAuth DEVICE flow (a Client ID is set).        #
+# --------------------------------------------------------------------------- #
+CID = "Iv1.abcdef1234567890"
+DEVICE_CODE = "3584d83530557fdd1f46af8289938c8ef79f9dc5"
+
+
+def _oauth_http(**over):
+    http = FakeHTTP()
+    http.set("POST", ghpush._DEVICE_CODE_URL, 200, dict({
+        "device_code": DEVICE_CODE, "user_code": "WDJB-MJHT",
+        "verification_uri": "https://github.com/login/device",
+        "expires_in": 900, "interval": 5}, **over))
+    http.queue("POST", ghpush._DEVICE_TOKEN_URL, (200, {"error": "authorization_pending"}))
+    return http
+
+
+def _oauth_gh(tmp_path, http=None, store=None, now=None, **kw):
+    now = now if now is not None else [1000.0]
+    gh = ghpush.GitHub(http=http or _oauth_http(), store=store or DictStore(token=None, client_id=CID),
+                       clock=lambda: now[0], spawn=lambda fn: None,
+                       mirror_root=str(tmp_path / "hub" / "github-mirrors"), **kw)
+    return gh, now
+
+
+def test_device_flow_happy_path(tmp_path):
+    http = _oauth_http()
+    gh, _now = _oauth_gh(tmp_path, http=http)
+    out = gh.start_device()
+    assert out["user_code"] == "WDJB-MJHT"
+    assert out["verification_uri"] == "https://github.com/login/device"
+    assert DEVICE_CODE not in json.dumps(out)
+    req = http.calls[0]
+    assert req["headers"]["Accept"] == "application/json"
+    assert b"client_id=" + CID.encode() in req["body"] and b"scope=repo" in req["body"]
+    assert gh.device_poll_once() is True                       # authorization_pending
+    st = gh.device_status()
+    assert st["state"] == "pending" and st["user_code"] == "WDJB-MJHT"
+    assert DEVICE_CODE not in json.dumps(st)
+    http.queue("POST", ghpush._DEVICE_TOKEN_URL, (200, {"access_token": TOKEN, "scope": "repo"}))
+    assert gh.device_poll_once() is False
+    st = gh.device_status()
+    assert st == {"state": "connected", "login": "octocat"}
+    assert gh.store.get_token() == TOKEN
+    token_req = [c for c in http.calls if c["path"] == ghpush._DEVICE_TOKEN_URL][-1]
+    assert b"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code" in token_req["body"]
+    assert any(c["path"] == "/user" and c["headers"]["Authorization"] == "Bearer " + TOKEN
+               for c in http.calls)
+
+
+def test_device_flow_slow_down_expired_denied(tmp_path):
+    http = _oauth_http()
+    gh, now = _oauth_gh(tmp_path, http=http)
+    gh.start_device()
+    http.queue("POST", ghpush._DEVICE_TOKEN_URL, (200, {"error": "slow_down"}))
+    assert gh.device_poll_once() is True and gh._device["interval"] == 10
+    http.queue("POST", ghpush._DEVICE_TOKEN_URL, (200, {"error": "slow_down", "interval": 30}))
+    gh.device_poll_once()
+    assert gh._device["interval"] == 30
+    http.queue("POST", ghpush._DEVICE_TOKEN_URL, (200, {"error": "expired_token"}))
+    assert gh.device_poll_once() is False and gh.device_status()["state"] == "expired"
+    gh.start_device()
+    http.queue("POST", ghpush._DEVICE_TOKEN_URL, (200, {"error": "access_denied"}))
+    gh.device_poll_once()
+    assert gh.device_status()["state"] == "denied"
+    gh.start_device()
+    n = len(http.calls)
+    now[0] += 901                                              # our own clock says expired
+    assert gh.device_poll_once() is False
+    assert gh.device_status()["state"] == "expired" and len(http.calls) == n
+    assert gh.store.get_token() is None
+
+
+@pytest.mark.parametrize("over", [
+    {"verification_uri": "https://evil.example/login/device"},
+    {"verification_uri": "https://github.com/login/device/"},
+    {"verification_uri": "http://github.com/login/device"},
+    {"user_code": "wdjb-mjht"}, {"user_code": "WDJB-MJHT-X"}, {"device_code": ""}])
+def test_device_flow_refuses_an_unexpected_answer(tmp_path, over):
+    gh, _now = _oauth_gh(tmp_path, http=_oauth_http(**over))
+    with pytest.raises(ghpush.GhError) as e:
+        gh.start_device()
+    assert e.value.code == "github_error"
+    assert gh.device_status() == {"state": "idle"}
+
+
+def test_client_id_is_validated_and_resolved(tmp_path, monkeypatch):
+    store = DictStore(token=None)
+    gh, _now = _oauth_gh(tmp_path, store=store, gh_platform=("FreeBSD", "riscv"),
+                         find_gh=lambda: None)
+    for bad in ("short", "has space in it!!", "x" * 41, "a/b/c/d/e/f/g"):
+        with pytest.raises(ghpush.GhError) as e:
+            gh.set_client_id(bad)
+        assert e.value.code == "bad_client_id"
+    monkeypatch.delenv(ghpush.CLIENT_ID_ENV, raising=False)
+    monkeypatch.setattr(ghpush, "DEFAULT_OAUTH_CLIENT_ID", "")
+    assert gh.oauth_client_id() is None and gh.one_click_available() is False
+    with pytest.raises(ghpush.GhError) as e:
+        gh.start_device()
+    assert e.value.code == "no_client_id"
+    monkeypatch.setattr(ghpush, "DEFAULT_OAUTH_CLIENT_ID", "Ov23liDEFAULT0000")
+    assert gh.oauth_client_id() == "Ov23liDEFAULT0000"
+    monkeypatch.setenv(ghpush.CLIENT_ID_ENV, "Ov23liFROMENV00000")
+    assert gh.oauth_client_id() == "Ov23liFROMENV00000"
+    assert gh.set_client_id(CID) == {"oauth_available": True}
+    assert gh.oauth_client_id() == CID                          # the setting wins
+    gh.set_client_id("")
+    assert store.client_id is None
+
+
+def test_a_second_start_cancels_the_first(tmp_path):
+    http = _oauth_http()
+    gh, _now = _oauth_gh(tmp_path, http=http)
+    gh.start_device()
+    first = gh._device
+    http.set("POST", ghpush._DEVICE_CODE_URL, 200, {
+        "device_code": "second-device-code", "user_code": "ABCD-2345",
+        "verification_uri": "https://github.com/login/device", "expires_in": 900, "interval": 5})
+    gh.start_device()
+    assert first["cancel"].is_set() and first["device_code"] is None
+    assert gh.device_poll_once(first) is False
+    assert gh.device_status()["user_code"] == "ABCD-2345"
+    assert gh.cancel_device() == {"state": "idle"} and gh.device_status() == {"state": "idle"}
+
+
+def test_device_flow_real_thread_finishes(tmp_path):
+    http = _oauth_http()
+    http.queue("POST", ghpush._DEVICE_TOKEN_URL, (200, {"error": "authorization_pending"}),
+               (200, {"error": "authorization_pending"}), (200, {"access_token": TOKEN}))
+    gh = ghpush.GitHub(http=http, store=DictStore(token=None, client_id=CID),
+                       wait=lambda ev, s: ev.is_set(),
+                       mirror_root=str(tmp_path / "hub" / "github-mirrors"))
+    gh.start_device()
+    t = gh._device["thread"]
+    t.join(10)
+    assert not t.is_alive(), "the poller thread must end"
+    assert gh.device_status()["state"] == "connected"
+
+
+def test_device_token_is_stored_encrypted_via_the_paste_path(real_store, tmp_path):
+    import secretstore
+    real_store.set_client_id(CID)
+    http = _oauth_http()
+    gh = ghpush.GitHub(http=http, store=real_store, spawn=lambda fn: None,
+                       mirror_root=str(tmp_path / "hub" / "github-mirrors"))
+    gh.start_device()
+    http.queue("POST", ghpush._DEVICE_TOKEN_URL, (200, {"access_token": TOKEN}))
+    gh.device_poll_once()
+    raw = (tmp_path / "state" / "config.json").read_text(encoding="utf-8")
+    if secretstore.available():
+        assert TOKEN not in raw and DEVICE_CODE not in raw
+        assert secretstore.is_encrypted(json.loads(raw)["github"]["token"])
+    assert real_store.get_token() == TOKEN
+
+
+def test_device_routes_never_leak_the_device_code_or_token(tmp_path, monkeypatch, caplog):
+    import logging
+    c, A = _client()
+    http = _oauth_http()
+    gh, _now = _oauth_gh(tmp_path, http=http)
+    monkeypatch.setattr(A.config, "get_flag", lambda name, default=False: True)
+    monkeypatch.setattr(A.ghpush, "default", gh)
+    caplog.set_level(logging.INFO)
+    texts = []
+    r = c.post("/api/github/device/start", json={}, headers=c._hdr)
+    assert r.status_code == 200
+    assert set(r.get_json()) >= {"user_code", "verification_uri", "expires_in", "interval"}
+    texts.append(r.get_data(as_text=True))
+    gh.device_poll_once()
+    texts.append(c.get("/api/github/device", headers=c._hdr).get_data(as_text=True))
+    http.queue("POST", ghpush._DEVICE_TOKEN_URL, (200, {"access_token": TOKEN}))
+    gh.device_poll_once()
+    r = c.get("/api/github/device", headers=c._hdr)
+    assert r.get_json() == {"state": "connected", "login": "octocat"}
+    texts.append(r.get_data(as_text=True))
+    texts.append(c.get("/api/github", headers=c._hdr).get_data(as_text=True))
+    r = c.post("/api/github/device/cancel", json={}, headers=c._hdr)
+    assert r.get_json() == {"ok": True}
+    for t in texts + [caplog.text]:
+        assert DEVICE_CODE not in t and TOKEN not in t
+
+
+def test_device_start_refused_when_flag_is_off(monkeypatch):
+    c, A = _client()
+    monkeypatch.setattr(A.config, "get_flag",
+                        lambda name, default=False: False if name == "github_push" else default)
+    for path in ("/api/github/device/start", "/api/github/client-id", "/api/github/link",
+                 "/api/github/visibility", "/api/github/unlink"):
+        r = c.post(path, json={"project_dir": "x", "confirm": True, "name": "n",
+                               "private": True, "client_id": CID}, headers=c._hdr)
+        assert r.status_code == 403 and r.get_json()["code"] == "disabled", path
+    assert c.get("/api/github/repos", headers=c._hdr).status_code == 403
+
+
+def test_client_id_route(monkeypatch, tmp_path):
+    c, A = _client()
+    gh, _now = _oauth_gh(tmp_path, store=DictStore(token=None))
+    monkeypatch.setattr(A.config, "get_flag", lambda name, default=False: True)
+    monkeypatch.setattr(A.ghpush, "default", gh)
+    r = c.post("/api/github/client-id", json={"client_id": "nope!"}, headers=c._hdr)
+    assert r.status_code == 400 and r.get_json()["code"] == "bad_client_id"
+    r = c.post("/api/github/client-id", json={"client_id": CID}, headers=c._hdr)
+    assert r.get_json() == {"ok": True, "oauth_available": True}
+    assert c.get("/api/github", headers=c._hdr).get_json()["oauth_available"] is True
+
+
+# --------------------------------------------------------------------------- #
+# One-click sign-in (2): the official GitHub CLI (no OAuth app).                 #
+# --------------------------------------------------------------------------- #
+FAKE_GH = r'''
+import json, os, sys, time
+args = sys.argv[1:]
+d = os.environ["FAKEGH_DIR"]
+mode = os.environ.get("FAKEGH_MODE", "ok")
+cfg = os.environ.get("GH_CONFIG_DIR", "")
+if args[:2] == ["auth", "token"]:
+    try:
+        print(open(os.path.join(cfg, "hosts.yml")).read().strip())
+        sys.exit(0)
+    except OSError:
+        sys.exit(1)
+if args[:2] == ["auth", "login"]:
+    seen = {k: os.environ.get(k) for k in (
+        "GH_CONFIG_DIR", "GH_NO_UPDATE_NOTIFIER", "GIT_CONFIG_GLOBAL", "GH_TOKEN",
+        "GITHUB_TOKEN", "GIT_DIR", "BROWSER", "GH_BROWSER", "GH_PROMPT_DISABLED")}
+    seen["argv"] = args
+    # gh is non-interactive when stdout is not a terminal (here: a pipe). Not
+    # stdin: Python reports Windows' NUL device as a tty, gh does not.
+    seen["tty"] = bool(sys.stdout and sys.stdout.isatty())
+    with open(os.path.join(d, "seen.json"), "w") as f:
+        json.dump(seen, f)
+    url = "https://github.com/login/device/evil" if mode == "badurl" else "https://github.com/login/device"
+    print("\x1b[33m!\x1b[0m First copy your one-time code: \x1b[1mWXYZ-1234\x1b[0m", flush=True)
+    print("Open this URL to continue in your web browser: " + url, flush=True)
+    if mode == "deny":
+        time.sleep(0.2)
+        print("error: access_denied: the user has denied your application access", flush=True)
+        sys.exit(1)
+    end = time.time() + 60
+    while time.time() < end:
+        if os.path.exists(os.path.join(d, "approve")):
+            with open(os.path.join(cfg, "hosts.yml"), "w") as f:
+                f.write(os.environ["FAKEGH_TOKEN"])
+            print("Authentication complete.", flush=True)
+            sys.exit(0)
+        time.sleep(0.05)
+    sys.exit(3)
+sys.exit(2)
+'''
+
+
+def _gh_cli(tmp_path, monkeypatch, mode="ok", now=None, **kw):
+    import sys
+    script = tmp_path / "fake_gh.py"
+    script.write_text(FAKE_GH, encoding="utf-8")
+    d = tmp_path / "ghstate"
+    d.mkdir(exist_ok=True)
+    monkeypatch.setenv("FAKEGH_DIR", str(d))
+    monkeypatch.setenv("FAKEGH_MODE", mode)
+    monkeypatch.setenv("FAKEGH_TOKEN", TOKEN)
+    monkeypatch.setenv("GH_TOKEN", "leaked-env-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "leaked-env-token")
+    monkeypatch.delenv(ghpush.CLIENT_ID_ENV, raising=False)
+    monkeypatch.setattr(ghpush, "DEFAULT_OAUTH_CLIENT_ID", "")
+    kw.setdefault("find_gh", lambda: "fake-gh")
+    store = DictStore(token=None)
+    clock = (lambda: now[0]) if now is not None else None
+    gh = ghpush.GitHub(http=FakeHTTP(), store=store, clock=clock,
+                       mirror_root=str(tmp_path / "hub" / "github-mirrors"),
+                       gh_argv=lambda path: [sys.executable, str(script)],
+                       gh_code_wait=30, gh_poll_step=0.05, **kw)
+    return gh, store, d
+
+
+def _finish(gh, flow):
+    t = flow.get("thread")
+    if t is not None:
+        t.join(30)
+        assert not t.is_alive(), "the GitHub CLI worker must end"
+
+
+def test_gh_login_happy_path(tmp_path, monkeypatch):
+    gh, store, d = _gh_cli(tmp_path, monkeypatch)
+    out = gh.start_device()
+    flow = gh._device
+    assert out["user_code"] == "WXYZ-1234" and out["state"] == "pending"
+    assert out["verification_uri"] == "https://github.com/login/device"
+    seen = json.loads((d / "seen.json").read_text(encoding="utf-8"))
+    tmp = os.path.dirname(seen["GH_CONFIG_DIR"])
+    assert os.path.basename(tmp).startswith("ghpush-gh-")
+    assert seen["GIT_CONFIG_GLOBAL"] == os.path.join(tmp, "gitconfig")
+    assert seen["GH_TOKEN"] is None and seen["GITHUB_TOKEN"] is None and seen["GIT_DIR"] is None
+    assert seen["GH_NO_UPDATE_NOTIFIER"] == "1" and seen["BROWSER"] and seen["GH_BROWSER"]
+    assert seen["tty"] is False
+    for flag in ("--web", "--insecure-storage", "--skip-ssh-key", "--hostname"):
+        assert flag in seen["argv"]
+    assert seen["argv"][seen["argv"].index("--git-protocol") + 1] == "ssh"
+    assert gh.device_status()["user_code"] == "WXYZ-1234"
+    (d / "approve").write_text("", encoding="utf-8")
+    _finish(gh, flow)
+    assert gh.device_status() == {"state": "connected", "login": "octocat"}
+    assert store.get_token() == TOKEN
+    assert not os.path.exists(tmp), "gh's private config dir (it held the token) is deleted"
+
+
+def test_gh_login_denied_and_bad_url(tmp_path, monkeypatch):
+    gh, store, d = _gh_cli(tmp_path, monkeypatch, mode="deny")
+    gh.start_device()
+    flow = gh._device
+    _finish(gh, flow)
+    assert gh.device_status()["state"] == "denied"
+    assert not os.path.exists(flow["tmp"])
+    monkeypatch.setenv("FAKEGH_MODE", "badurl")
+    gh.start_device()
+    flow = gh._device
+    _finish(gh, flow)
+    st = gh.device_status()
+    assert st["state"] == "error" and "unexpected sign-in page" in st["error"]
+    assert flow["proc"].poll() is not None and not os.path.exists(flow["tmp"])
+    assert store.get_token() is None
+
+
+def test_gh_login_cancel_and_timeout_kill_gh(tmp_path, monkeypatch):
+    now = [5000.0]
+    gh, store, d = _gh_cli(tmp_path, monkeypatch, now=now)
+    gh.start_device()
+    flow = gh._device
+    assert gh.cancel_device() == {"state": "idle"}
+    _finish(gh, flow)
+    assert flow["proc"].poll() is not None, "cancel kills the gh process"
+    assert not os.path.exists(flow["tmp"])
+    gh.start_device()
+    flow = gh._device
+    now[0] += 901                                              # the 15-minute limit
+    _finish(gh, flow)
+    assert gh.device_status()["state"] == "expired"
+    assert flow["proc"].poll() is not None and not os.path.exists(flow["tmp"])
+    assert store.get_token() is None
+
+
+def test_gh_second_start_kills_the_first(tmp_path, monkeypatch):
+    gh, _store, _d = _gh_cli(tmp_path, monkeypatch)
+    gh.start_device()
+    first = gh._device
+    gh.start_device()
+    second = gh._device
+    _finish(gh, first)
+    assert first["cancel"].is_set() and first["proc"].poll() is not None
+    assert gh.device_status()["state"] == "pending"
+    gh.cancel_device()
+    _finish(gh, second)
+
+
+def _fake_release(tmp_path, ver="2.60.1", plat="windows_amd64", ext=".zip", binary=b"FAKEGH",
+                  member=None, digest=None, sums_hash=None, url_host="github.com"):
+    import tarfile
+    import zipfile
+    name = "gh_%s_%s%s" % (ver, plat, ext)
+    exe = "gh.exe" if plat.startswith("windows") else "gh"
+    member = member or "gh_%s_%s/bin/%s" % (ver, plat, exe)
+    buf = io.BytesIO()
+    if ext == ".zip":
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("gh_%s_%s/LICENSE" % (ver, plat), "MIT")
+            zf.writestr(member, binary)
+    else:
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            info = tarfile.TarInfo(member)
+            info.size = len(binary)
+            tf.addfile(info, io.BytesIO(binary))
+    archive = buf.getvalue()
+    real = hashlib.sha256(archive).hexdigest()
+    sums = "%s  %s\n%s  gh_%s_checksums.txt.sig\n" % (sums_hash or real, name, "0" * 64, ver)
+    base = "https://%s/cli/cli/releases/download/v%s/" % (url_host, ver)
+    meta = {"tag_name": "v" + ver, "assets": [
+        {"name": name, "browser_download_url": base + name,
+         **({"digest": "sha256:" + digest} if digest else {})},
+        {"name": "gh_%s_checksums.txt" % ver,
+         "browser_download_url": "https://github.com/cli/cli/releases/download/v%s/"
+                                 "gh_%s_checksums.txt" % (ver, ver)}]}
+    table = {ghpush._GH_RELEASE_API: json.dumps(meta).encode(),
+             base + name: archive,
+             "https://github.com/cli/cli/releases/download/v%s/gh_%s_checksums.txt" % (ver, ver):
+                 sums.encode()}
+    calls = []
+
+    def fetch(url, sink, max_bytes, on_progress, hosts):
+        calls.append((url, frozenset(hosts)))
+        assert url in table, url
+        sink(table[url])
+        if on_progress:
+            on_progress(len(table[url]), len(table[url]))
+        return len(table[url])
+    return fetch, calls
+
+
+def _install_flow(gh):
+    import threading
+    flow = {"mode": "gh", "cancel": threading.Event()}
+    gh._device = flow
+    return flow
+
+
+@pytest.mark.parametrize("plat,ext,system,machine", [
+    ("windows_amd64", ".zip", "Windows", "AMD64"),
+    ("linux_arm64", ".tar.gz", "Linux", "aarch64"),
+    ("macOS_arm64", ".zip", "Darwin", "arm64")])
+def test_gh_install_verifies_and_extracts_only_the_binary(tmp_path, plat, ext, system, machine):
+    fetch, calls = _fake_release(tmp_path, plat=plat, ext=ext)
+    gh = ghpush.GitHub(store=DictStore(), gh_fetch=fetch, gh_platform=(system, machine),
+                       gh_bin_dir=str(tmp_path / "bin"), mirror_root=str(tmp_path / "hub" / "m"))
+    final = gh._install_gh(_install_flow(gh))
+    assert open(final, "rb").read() == b"FAKEGH"
+    assert os.path.basename(final) == ("gh.exe" if plat.startswith("windows") else "gh")
+    assert sorted(os.listdir(str(tmp_path / "bin"))) == [os.path.basename(final)]
+    assert calls[0][1] == ghpush._GH_META_HOSTS
+    assert all(h == ghpush._GH_DOWNLOAD_HOSTS for _u, h in calls[1:])
+
+
+@pytest.mark.parametrize("kw", [
+    {"sums_hash": "f" * 64},                                # checksum mismatch
+    {"digest": "e" * 64},                                   # two different checksums
+    {"member": "../../evil/bin/gh.exe"},                    # unsafe archive path
+    {"member": "gh_2.60.1_windows_amd64/README.md"},        # no gh binary
+    {"url_host": "evil.example"}])                          # not the official host
+def test_gh_install_refusals_install_nothing(tmp_path, kw):
+    fetch, _calls = _fake_release(tmp_path, **kw)
+    gh = ghpush.GitHub(store=DictStore(), gh_fetch=fetch, gh_platform=("Windows", "AMD64"),
+                       gh_bin_dir=str(tmp_path / "bin"), mirror_root=str(tmp_path / "hub" / "m"))
+    with pytest.raises(ghpush.GhError):
+        gh._install_gh(_install_flow(gh))
+    assert not os.path.exists(str(tmp_path / "bin" / "gh.exe"))
+
+
+def test_gh_mode_installs_then_signs_in(tmp_path, monkeypatch):
+    import threading
+    fetch, _calls = _fake_release(tmp_path)
+    release = threading.Event()
+
+    def slow_fetch(url, sink, max_bytes, on_progress, hosts):
+        if url.endswith(".zip"):
+            release.wait(30)
+        return fetch(url, sink, max_bytes, on_progress, hosts)
+    bin_dir = tmp_path / "bin"
+    gh, store, d = _gh_cli(
+        tmp_path, monkeypatch, gh_fetch=slow_fetch, gh_platform=("Windows", "AMD64"),
+        gh_bin_dir=str(bin_dir),
+        find_gh=lambda: str(bin_dir / "gh.exe") if (bin_dir / "gh.exe").exists() else None)
+    assert gh.one_click_available() is True                  # installable here
+    out = gh.start_device()
+    flow = gh._device
+    assert out["state"] == "installing" and out["user_code"] is None
+    for _ in range(200):                      # the worker reaches the archive download
+        st = gh.device_status()
+        if st.get("message") == "Downloading the GitHub CLI":
+            break
+        threading.Event().wait(0.02)
+    assert st["state"] == "installing"
+    assert st["message"] == "Downloading the GitHub CLI" and 0 <= st["progress"] <= 1
+    release.set()
+    assert flow["code_seen"].wait(30)
+    assert gh.device_status()["user_code"] == "WXYZ-1234"
+    (d / "approve").write_text("", encoding="utf-8")
+    _finish(gh, flow)
+    assert gh.device_status()["state"] == "connected" and store.get_token() == TOKEN
+
+
+def test_one_click_is_unavailable_without_client_id_or_gh(tmp_path, monkeypatch):
+    c, A = _client()
+    gh, _store, _d = _gh_cli(tmp_path, monkeypatch, find_gh=lambda: None,
+                             gh_platform=("FreeBSD", "riscv"))
+    assert gh.one_click_available() is False
+    monkeypatch.setattr(A.config, "get_flag", lambda name, default=False: True)
+    monkeypatch.setattr(A.ghpush, "default", gh)
+    r = c.post("/api/github/device/start", json={}, headers=c._hdr)
+    assert r.status_code == 409 and r.get_json()["code"] == "no_client_id"
+    assert c.get("/api/github", headers=c._hdr).get_json()["oauth_available"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Existing repositories, visibility, unlink.                                   #
+# --------------------------------------------------------------------------- #
+EXISTING = "https://github.com/octocat/existing.git"
+
+
+def _repo_row(name="existing", owner="octocat", push=True, branch="main", private=True):
+    return {"name": name, "owner": {"login": owner}, "permissions": {"push": push},
+            "default_branch": branch, "private": private}
+
+
+def _linkable(tmp_path, branch="main", nonempty=False, **row):
+    """A GitHub fake with one existing repo backed by a local bare repo."""
+    existing = tmp_path / "existing.git"
+    _raw_git(str(tmp_path), "init", "--bare", "-q", "-b", branch, str(existing))
+    if nonempty:
+        clone = tmp_path / "theirs"
+        _raw_git(str(tmp_path), "clone", "-q", str(existing), str(clone))
+        (clone / "theirs.txt").write_text("their file\n", encoding="utf-8")
+        _raw_git(str(clone), "add", "-A")
+        _raw_git(str(clone), "commit", "-q", "-m", "their commit")
+        _raw_git(str(clone), "push", "-q", "origin", "HEAD:" + branch)
+    http = FakeHTTP()
+    http.set("GET", "/repos/octocat/existing", 200, _repo_row(branch=branch, **row))
+    gh, calls, bare = _gh(tmp_path, http=http, routes={EXISTING: str(existing)})
+    return gh, existing, http, calls
+
+
+def test_list_repos_keeps_only_the_owners_repos_newest_first(tmp_path):
+    http = FakeHTTP()
+    http.set("GET", "/user/repos?affiliation=owner&sort=updated&per_page=100", 200, [
+        {"name": "old", "owner": {"login": "octocat"}, "private": False, "size": 10,
+         "updated_at": "2024-01-01T00:00:00Z", "description": "line1\nline2"},
+        {"name": "new", "owner": {"login": "OctoCat"}, "private": True, "size": 0,
+         "updated_at": "2026-01-01T00:00:00Z", "html_url": "https://evil.example/x"},
+        {"name": "theirs", "owner": {"login": "mallory"}, "private": False, "size": 5},
+        {"name": "../bad", "owner": {"login": "octocat"}}, "junk"])
+    gh, _c, _b = _gh(tmp_path, http=http)
+    repos = gh.list_repos()["repos"]
+    assert [r["name"] for r in repos] == ["new", "old"]
+    assert repos[0] == {"name": "new", "private": True, "empty": True,
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "html_url": "https://github.com/octocat/new", "description": ""}
+    assert repos[1]["description"] == "line1 line2" and repos[1]["empty"] is False
+
+
+@requires_git
+def test_link_an_empty_existing_repo(tmp_path):
+    gh, existing, http, _calls = _linkable(tmp_path)
+    proj = _mk_project(tmp_path)
+    st = gh.link_repo(str(proj), "existing")
+    assert st["project"]["repo"]["full_name"] == "octocat/existing"
+    assert gh.store.get_project(gh._key(str(proj)))["url"] == EXISTING
+    assert _bare_show(existing, "README.md").stdout == "hello\n"
+    assert not [c for c in http.calls if c["method"] == "POST"], "linking creates nothing"
+
+
+@pytest.mark.parametrize("row,code", [
+    ({"owner": "mallory"}, "repo_not_owned"), ({"push": False}, "no_push_permission")])
+def test_link_refuses_other_owners_and_no_push(tmp_path, row, code):
+    gh, existing, _http, _c = _linkable(tmp_path, **row)
+    proj = _mk_project(tmp_path)
+    with pytest.raises(ghpush.GhError) as e:
+        gh.link_repo(str(proj), "existing")
+    assert e.value.code == code
+    assert gh.store.get_project(gh._key(str(proj))) is None and _refs(existing) == ""
+
+
+def test_link_unknown_repo_is_not_found(tmp_path):
+    gh, _c, _b = _gh(tmp_path)
+    with pytest.raises(ghpush.GhError) as e:
+        gh.link_repo(str(_mk_project(tmp_path)), "nope")
+    assert e.value.code == "not_found"
+
+
+@requires_git
+@pytest.mark.parametrize("branch", ["main", "master"])
+def test_link_a_non_empty_repo_commits_on_top(tmp_path, branch):
+    gh, existing, _http, calls = _linkable(tmp_path, branch=branch, nonempty=True)
+    proj = _mk_project(tmp_path)
+    theirs = _raw_git(str(existing), "rev-parse", branch).stdout.strip()
+    with pytest.raises(ghpush.GhError) as e:
+        gh.link_repo(str(proj), "existing")
+    assert e.value.code == "needs_overwrite_ok"
+    assert gh.store.get_project(gh._key(str(proj))) is None
+    assert _raw_git(str(existing), "rev-parse", branch).stdout.strip() == theirs
+    gh.link_repo(str(proj), "existing", overwrite_ok=True)
+    head = _raw_git(str(existing), "rev-parse", branch).stdout.strip()
+    assert head != theirs
+    assert _raw_git(str(existing), "merge-base", "--is-ancestor", theirs, head,
+                    check=False).returncode == 0, "their history is kept (never a force)"
+    assert _raw_git(str(existing), "show", "%s:README.md" % branch).stdout == "hello\n"
+    assert _raw_git(str(existing), "show", "%s:theirs.txt" % branch, check=False).returncode != 0
+    pushes = [r["args"] for r in calls if "push" in r["args"]]
+    assert all("refs/heads/main:refs/heads/%s" % branch in a for a in pushes)
+    assert not any(x.startswith("+") or x in ("-f", "--force") for a in pushes for x in a)
+    assert gh.status(str(proj))["project"]["repo"]["default_branch"] == branch
+
+
+@requires_git
+def test_link_with_secrets_puts_the_mirror_back(tmp_path):
+    gh, existing, _http, _c = _linkable(tmp_path, nonempty=True)
+    proj = _mk_project(tmp_path, files={"README.md": "hi\n", ".env": "K=v\n"})
+    with pytest.raises(ghpush.GhError) as e:
+        gh.link_repo(str(proj), "existing", overwrite_ok=True)
+    assert e.value.code == "secrets_found"
+    m = gh.mirror_path(str(proj))
+    assert _raw_git(m, "rev-parse", "--verify", "--quiet", "refs/heads/main",
+                    check=False).returncode != 0, "the mirror's main is restored (none before)"
+    assert gh.store.get_project(gh._key(str(proj))) is None
+
+
+@requires_git
+def test_link_refuses_an_already_linked_project(tmp_path):
+    gh, proj, _bare, _calls, http = _connected(tmp_path)
+    http.set("GET", "/repos/octocat/existing", 200, _repo_row())
+    with pytest.raises(ghpush.GhError) as e:
+        gh.link_repo(str(proj), "existing")
+    assert e.value.code == "already_linked"
+
+
+@requires_git
+def test_visibility_change_needs_the_public_tick(tmp_path):
+    gh, proj, _bare, _calls, http = _connected(tmp_path)
+    with pytest.raises(ghpush.GhError) as e:
+        gh.set_visibility(str(proj), False)
+    assert e.value.code == "public_ok_required"
+    assert not [c for c in http.calls if c["method"] == "PATCH"]
+    http.set("PATCH", "/repos/octocat/myrepo", 200, {"private": False})
+    assert gh.set_visibility(str(proj), False, public_ok=True) == {"ok": True, "private": False}
+    patch = [c for c in http.calls if c["method"] == "PATCH"][-1]
+    assert json.loads(patch["body"].decode()) == {"private": False}
+    assert gh.status(str(proj))["project"]["repo"]["private"] is False
+    http.set("PATCH", "/repos/octocat/myrepo", 200, {"private": True})
+    assert gh.set_visibility(str(proj), True) == {"ok": True, "private": True}
+    http.set("PATCH", "/repos/octocat/myrepo", 403, {"message": "no"})
+    with pytest.raises(ghpush.GhError) as e:
+        gh.set_visibility(str(proj), True)
+    assert e.value.code == "bad_scope"
+
+
+@requires_git
+def test_unlink_forgets_the_link_and_the_mirror_then_relinks(tmp_path):
+    gh, proj, bare, _calls, http = _connected(tmp_path)
+    m = gh.mirror_path(str(proj))
+    refs_before = _refs(bare)
+    files_before = sorted(os.listdir(str(proj)))
+    assert gh.unlink(str(proj)) == {"ok": True}
+    assert gh.store.get_project(gh._key(str(proj))) is None
+    assert not os.path.exists(m), "the hub's mirror is deleted"
+    assert _refs(bare) == refs_before, "GitHub is never touched"
+    assert sorted(os.listdir(str(proj))) == files_before, "the project is never touched"
+    http.set("GET", "/repos/octocat/myrepo", 200, _repo_row(name="myrepo"))
+    with pytest.raises(ghpush.GhError) as e:
+        gh.link_repo(str(proj), "myrepo")
+    assert e.value.code == "needs_overwrite_ok"
+    gh.link_repo(str(proj), "myrepo", overwrite_ok=True)
+    assert gh.store.get_project(gh._key(str(proj)))["url"] == STORED
+
+
+def test_link_visibility_unlink_routes_check_their_input(monkeypatch):
+    c, A = _client()
+    monkeypatch.setattr(A.config, "get_flag", lambda name, default=False: True)
+    r = c.post("/api/github/link", json={"project_dir": "x", "name": "n"}, headers=c._hdr)
+    assert r.status_code == 400 and r.get_json()["code"] == "confirm_required"
+    r = c.post("/api/github/unlink", json={"project_dir": "x"}, headers=c._hdr)
+    assert r.status_code == 400 and r.get_json()["code"] == "confirm_required"
+    r = c.post("/api/github/visibility", json={"project_dir": "x", "private": "yes"},
+               headers=c._hdr)
+    assert r.status_code == 400 and r.get_json()["code"] == "bad_request"
 
 
 # --------------------------------------------------------------------------- #

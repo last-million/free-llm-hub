@@ -347,12 +347,20 @@ Quick Tunnel**: free, no Cloudflare account, nothing to configure.
 ## Push a project to GitHub
 
 Next to Publish, a **GitHub** button pushes the current Build project to a repo
-on your own account. Paste a GitHub token once (fine-grained: Contents and
-Administration read/write, or classic `repo`); it is stored **encrypted** (the
-same mechanism as your provider keys), never logged and never returned. The
-first time you choose a name and **Private** (the default) or Public — a public
-repo needs an extra tick — and the hub creates the repo and pushes. After that
-it is **Push** and **Sync** on a click; nothing is ever automatic. Only a Build
+on your own account. **Connect with GitHub** signs you in with a one-time code
+you approve on github.com (GitHub's device sign-in; without a GitHub app Client
+ID the hub uses the official GitHub CLI for it, installing it first if needed,
+with its own private settings — your own `gh` login is never touched). Or paste
+a GitHub token (fine-grained: Contents and Administration read/write, or
+classic `repo` — the narrower choice, since one-click sign-in grants `repo`).
+Either way the token is stored **encrypted** (the same mechanism as your
+provider keys), never logged and never returned. The first time you pick a
+**new** repository (a name and **Private** — the default — or Public, which
+needs an extra tick) or one of your **existing** repositories (one that already
+has files needs a tick: your project becomes its latest version, older versions
+stay in its history). After that it is **Push** and **Sync** on a click, you
+can make the repo private or public, and **Unlink** forgets the link without
+touching GitHub or your files; nothing is ever automatic. Only a Build
 project's folder can be pushed. The hub keeps the history in its **own copy**
 of the repository (in its data folder): it never writes your project's `.git`,
 and the git that uses your token never reads the project's git settings or your
@@ -380,7 +388,7 @@ with the `github_push` flag (default on). Needs git 2.32 or newer.
 | **Dashboard** | `/api/*` (control-token gated) |
 | **Probes** | `/health`, `/healthz` (liveness), `/ready`, `/readyz` (readiness, 503 + `reason` when not ready) — no token, loopback only, no version or provider data |
 
-184 routes in total; the dashboard is the documentation for the rest.
+192 routes in total; the dashboard is the documentation for the rest.
 
 ---
 

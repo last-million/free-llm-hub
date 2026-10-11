@@ -41892,11 +41892,12 @@ def _cfi_set_auto(value):
 
 _GH_HTTP = {
     "bad_request": 400, "bad_name": 400, "public_ok_required": 400,
-    "confirm_required": 400,
+    "confirm_required": 400, "bad_client_id": 400,
     "bad_token": 401,
     "disabled": 403, "refused": 403, "bad_scope": 403, "unknown_project": 403,
-    "bad_link": 403,
+    "bad_link": 403, "repo_not_owned": 403, "no_push_permission": 403,
     "not_a_dir": 404, "not_found": 404,
+    "no_client_id": 409, "needs_overwrite_ok": 409,
     "no_token": 409, "not_connected": 409, "repo_exists": 409,
     "already_linked": 409, "behind_remote": 409, "diverged": 409,
     "local_changes": 409, "secrets_found": 409, "nothing_to_commit": 409,
@@ -41994,7 +41995,19 @@ def api_github_status():
         return _gh_fail(exc)
     st = dict(st)
     st["enabled"] = _gh_enabled()
+    st["oauth_available"] = _gh_oauth_available()
     return _gh_json(st)
+
+
+def _gh_oauth_available():
+    """One-click connect works here: an OAuth App Client ID is configured
+    (setting, env or built-in), or the official GitHub CLI is installed or
+    installable on this platform (ghpush.one_click_available)."""
+    try:
+        fn = getattr(ghpush.default, "one_click_available", None)
+        return bool(fn and fn())
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 @app.route("/api/github/token", methods=["POST"])
@@ -42078,9 +42091,10 @@ def api_github_create():
     private = body.get("private")
     private = True if private is None else bool(private)
     public_ok = body.get("public_ok") is True
+    description = body.get("description") if isinstance(body.get("description"), str) else None
     try:
         st = ghpush.default.create_repo(project_dir, name, private=private,
-                                        public_ok=public_ok)
+                                        public_ok=public_ok, description=description)
     except ghpush.GhError as exc:
         return _gh_fail(exc)
     _log.info("[github] created repo for project (private=%s)", private)
@@ -42124,6 +42138,127 @@ def api_github_sync():
     st = dict(st)
     st["enabled"] = True
     return _gh_json({"ok": True, **st})
+
+
+# One-click sign-in -- GitHub's OAuth device flow when a Client ID is set, else
+# the official GitHub CLI's own device login (installed first when missing;
+# state "installing") -- and the Client ID. The device_code, gh's output and
+# the token stay inside ghpush: no route returns or logs any of them.
+@app.route("/api/github/client-id", methods=["POST"])
+def api_github_client_id():
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    value = _gh_body().get("client_id")
+    if value is not None and not isinstance(value, str):
+        return _gh_json({"error": "That does not look like a GitHub app Client ID.",
+                         "code": "bad_client_id"}, 400)
+    try:
+        out = ghpush.default.set_client_id(value or "")
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+    return _gh_json({"ok": True, "oauth_available": bool(out.get("oauth_available"))})
+
+
+@app.route("/api/github/device/start", methods=["POST"])
+def api_github_device_start():
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    try:
+        out = ghpush.default.start_device()
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+    _log.info("[github] one-click sign-in started (%s)",
+              "installing the GitHub CLI" if out.get("state") == "installing"
+              else "waiting for approval on github.com")
+    return _gh_json({k: out.get(k) for k in ("user_code", "verification_uri",
+                                              "expires_in", "interval", "state")})
+
+
+@app.route("/api/github/device", methods=["GET"])
+def api_github_device_status():
+    st = ghpush.default.device_status()
+    return _gh_json({k: st[k] for k in ("state", "user_code", "verification_uri",
+                                        "expires_in", "interval", "login", "error",
+                                        "progress", "message")
+                     if k in st})
+
+
+@app.route("/api/github/device/cancel", methods=["POST"])
+def api_github_device_cancel():
+    ghpush.default.cancel_device()
+    return _gh_json({"ok": True})
+
+
+@app.route("/api/github/repos", methods=["GET"])
+def api_github_repos():
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    try:
+        return _gh_json(ghpush.default.list_repos())
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+
+
+@app.route("/api/github/link", methods=["POST"])
+def api_github_link():
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    body = _gh_body()
+    refusal = _gh_unconfirmed(body)
+    if refusal is not None:
+        return refusal
+    project_dir = _gh_project_dir(body)
+    if not project_dir:
+        return _gh_json({"error": "project_dir is required", "code": "bad_request"}, 400)
+    name = body.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return _gh_json({"error": "Pick a repository.", "code": "bad_name"}, 400)
+    try:
+        st = ghpush.default.link_repo(project_dir, name,
+                                      overwrite_ok=body.get("overwrite_ok") is True)
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+    _log.info("[github] linked a project to an existing repository")
+    st = dict(st)
+    st["enabled"] = True
+    return _gh_json({"ok": True, **st})
+
+
+@app.route("/api/github/visibility", methods=["POST"])
+def api_github_visibility():
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    body = _gh_body()
+    project_dir = _gh_project_dir(body)
+    if not project_dir:
+        return _gh_json({"error": "project_dir is required", "code": "bad_request"}, 400)
+    if not isinstance(body.get("private"), bool):
+        return _gh_json({"error": "Say private: true or false.", "code": "bad_request"}, 400)
+    try:
+        out = ghpush.default.set_visibility(project_dir, body["private"],
+                                            public_ok=body.get("public_ok") is True)
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+    return _gh_json({"ok": True, "private": bool(out.get("private"))})
+
+
+@app.route("/api/github/unlink", methods=["POST"])
+def api_github_unlink():
+    if not _gh_enabled():
+        return _gh_disabled_reply()
+    body = _gh_body()
+    refusal = _gh_unconfirmed(body)
+    if refusal is not None:
+        return refusal
+    project_dir = _gh_project_dir(body)
+    if not project_dir:
+        return _gh_json({"error": "project_dir is required", "code": "bad_request"}, 400)
+    try:
+        ghpush.default.unlink(project_dir)
+    except ghpush.GhError as exc:
+        return _gh_fail(exc)
+    _log.info("[github] unlinked a project (hub mirror removed; GitHub untouched)")
+    return _gh_json({"ok": True})
 
 
 def _multi_check_kwargs():

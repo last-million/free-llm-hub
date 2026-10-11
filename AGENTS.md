@@ -4489,6 +4489,83 @@ a new `# GITHUB:` section beside `# PUBLISH:`.
   out of config's providers-only encrypt/decrypt pass -- `save_config` carries
   the pre-encrypted string through untouched and it stays encrypted on load.
   `tests/test_safe_migrations.py` stays green.
+- **One-click connect (2026-10-11): `POST /api/github/device/start`**, two
+  sources behind the SAME routes; whichever is used, the token ends up in the
+  same validated, encrypted path (`connect()`: GET /user, then
+  `store.set_account`). The device_code, gh's output and the token never reach a
+  response or the log (a test checks responses + caplog).
+  - **OAuth device flow** when a Client ID is configured (setting
+    `github_oauth_client_id`, else env `FREE_LLM_HUB_GITHUB_CLIENT_ID`, else
+    `ghpush.DEFAULT_OAUTH_CLIENT_ID`, today `""`; must match
+    `^[A-Za-z0-9._-]{10,40}$`; `POST /api/github/client-id`, empty clears).
+    POST `github.com/login/device/code` {client_id, scope: repo}; the answer is
+    refused unless `verification_uri` is exactly `https://github.com/login/device`
+    and `user_code` matches `^[A-Z0-9]{4}-[A-Z0-9]{4}$`. ONE daemon poller per flow
+    (a new start or a cancel stops the old one; injectable spawn/wait/clock)
+    POSTs `login/oauth/access_token` every `interval` s:
+    `authorization_pending` keep, `slow_down` interval += 5 (or GitHub's larger
+    value), `expired_token` / our own clock -> expired, `access_denied` -> denied.
+    Scope `repo` means ALL the owner's repositories -- a fine-grained pasted
+    token remains the narrower option.
+  - **The official GitHub CLI** when there is no Client ID (the owner decided not
+    to register an OAuth app). `gh` is found on PATH, else
+    `state_dir()/bin/gh(.exe)`; when missing it is INSTALLED first (state
+    `installing`): the latest github.com/cli/cli release asset for the platform
+    (`gh_<ver>_windows_amd64|arm64.zip`, `linux_amd64|arm64.tar.gz`,
+    `macOS_amd64|arm64.zip`), https + host allowlist on every redirect (publish.py's
+    `_https_fetch`), a github.com URL must sit under `/cli/cli/releases/download/`,
+    SHA-256 from the release's `gh_<ver>_checksums.txt` (and the asset `digest`
+    when listed -- two different values refuse), ONLY `…/bin/gh(.exe)` extracted
+    (no extractall; any unsafe member name refuses the archive), temp file +
+    `os.replace`. A mismatch installs nothing. Then `gh auth login --hostname
+    github.com --web --git-protocol ssh --skip-ssh-key --insecure-storage` (argv,
+    no shell, no TTY: stdin closed, output piped -- gh then prints the code and
+    `Open this URL ... https://github.com/login/device` and opens no browser) with
+    a FRESH private `GH_CONFIG_DIR` (0700 temp dir; `--insecure-storage` keeps the
+    token there, never the keyring), its own empty `GIT_CONFIG_GLOBAL`, every
+    inherited `GH_*` / `GITHUB_*` / `GIT_*` dropped (a `GH_TOKEN` in the
+    environment is never used), `GH_NO_UPDATE_NOTIFIER=1`, `GH_PROMPT_DISABLED=1`
+    and a no-op `BROWSER`/`GH_BROWSER`. The code is parsed from its output; any
+    `login/device` URL other than the exact one stops it. On exit 0, `gh auth
+    token --hostname github.com` (same private dir) -> `connect()`; the dir is
+    deleted. Cancel, a new start, the 15-minute limit (`gh_timeout`) and hub
+    shutdown (`atexit`) kill the gh process tree (publish's `_kill_tree`) and delete
+    the dir. The user's real gh login and global git config are never read or
+    written. The token is gh's own OAuth token (scopes `repo`, `read:org`,
+    `gist`); it shows on GitHub as "GitHub CLI" because it IS the official GitHub
+    CLI logging in, not an imitation. NOT verified against the real gh binary on
+    this machine (gh is not installed here); the output parsing follows gh's
+    non-interactive login flow from its source, and the tests run a fake gh.
+  - `oauth_available` in `GET /api/github` = a Client ID is set OR gh is
+    installed OR installable on this platform (`one_click_available`).
+    `GET /api/github/device` -> `{state: idle|installing|pending|connected|expired|
+    denied|error, user_code?, verification_uri?, expires_in?, interval?, login?,
+    error?, progress?, message?}` -- `progress` (0..1) and `message` (plain text)
+    only while `installing`; a gh flow is `pending` without `user_code` for the
+    second before gh prints it (start waits up to 20 s for it).
+- **New OR existing repository; visibility; unlink (2026-10-11).**
+  `GET /api/github/repos` -> the connected account's OWN repos
+  (`/user/repos?affiliation=owner&sort=updated&per_page=100`; first 100; other
+  owners and odd names dropped), `{name, private, empty (size == 0, display only),
+  updated_at, html_url (rebuilt as https://github.com/<login>/<name>),
+  description}`, newest first. `POST /api/github/link {project_dir, name,
+  confirm, overwrite_ok?}` re-checks `GET /repos/<login>/<name>`: owner must be
+  the connected login (`repo_not_owned`) and `permissions.push` true
+  (`no_push_permission`); the stored URL is rebuilt from login + the API's name
+  and the repo's `default_branch` is stored (validated) -- the hub then pushes
+  `refs/heads/main:refs/heads/<branch>` and Sync fetches that branch. The branch
+  is fetched first: empty -> pushed as for a new repo; NON-empty -> refused with
+  `needs_overwrite_ok` unless the tick was given, then the mirror's main becomes
+  GitHub's branch (the mirror's previous main kept under
+  `refs/hub/before-link-<ts>`), the index starts from it and the snapshot is
+  committed ON TOP -- their history stays, the push is a fast-forward, never
+  forced; a secret finding puts the mirror back and stores nothing. Linking stays
+  refused for an already-linked project. `POST /api/github/visibility
+  {project_dir, private, public_ok?}` -> PATCH `/repos/<login>/<repo>`; public
+  needs `public_ok`. `POST /api/github/unlink {project_dir, confirm}` forgets the
+  stored link and deletes the hub mirror (the mirror path only, never a link
+  target); GitHub and the project's files are never touched, so a deleted or
+  moved repo can be linked again. Create also takes an optional `description`.
 - **Mirror design (2026-10-11, structural; replaces the flag-by-flag hardening
   of 383e5b5).** A project's `.git/config`, hooks and `.gitattributes` are
   written by AI agents that can be prompt-injected, and `~/.gitconfig` is
@@ -4634,8 +4711,12 @@ a new `# GITHUB:` section beside `# PUBLISH:`.
   {project_dir, add:[…]|default:true, confirm:true}`, `POST /api/github/create
   {project_dir, name, private (default true), public_ok (needed for public),
   confirm:true}`, `POST /api/github/push {project_dir, confirm:true}`,
-  `POST /api/github/sync {project_dir}`. +8 routes (README route count 176 ->
-  184; `tests/test_readme_claims.py` counts `@app.route(`).
+  `POST /api/github/sync {project_dir}`, and (2026-10-11)
+  `POST /api/github/client-id`, `POST /api/github/device/start`,
+  `GET /api/github/device`, `POST /api/github/device/cancel`,
+  `GET /api/github/repos`, `POST /api/github/link`, `POST /api/github/visibility`,
+  `POST /api/github/unlink`. 16 routes in all (README route count 176 -> 192;
+  `tests/test_readme_claims.py` counts `@app.route(`).
 - **Flag** `github_push` (`config.get_flag`, default on): off -> every mutation
   is 403 `disabled`; status still answers (with `enabled:false`).
 - **UI** (`templates/index.html`): a **GitHub** button in `#preview-bar` after
@@ -4658,8 +4739,7 @@ a new `# GITHUB:` section beside `# PUBLISH:`.
   fetch is network). `dist/`/`build/` are not in the default .gitignore (owner
   decision, documented above). A file:// local remote (the tests) needs no auth,
   so the askpass is proven separately (through `git credential fill` and run
-  directly). There is no unlink route: a project linked to a repo that was
-  later deleted on GitHub cannot be re-linked from the dashboard. The project's
+  directly). The repo list shows the first 100 of the owner's repos. The project's
   own git history is imported once; commits made later in the project's own
   `.git` reach GitHub only as their CONTENT inside the hub's next snapshot, not
   as separate commits with their messages (the mirror snapshots the work tree).
