@@ -73,6 +73,13 @@ if errorlevel 1 (
 ) else (
   echo [autostart] Self-heal task installed ^(checks every 5 min^).
 )
+rem schtasks /Create cannot set power conditions, and its defaults are "do not
+rem start on batteries" + "stop if going on batteries". MEASURED 2026-10-11: a
+rem laptop on battery skipped every 5-minute check for 47 minutes while the hub
+rem was down after a failed restart. Lift both and run a missed check as soon as
+rem possible. One line (see the caret note above); a failure here only leaves
+rem the old conditions, the task itself stays installed.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable; Set-ScheduledTask -TaskName '%TASK%' -Settings $s | Out-Null" >nul 2>nul
 
 echo.
 echo   Installed. The hub starts at logon and recovers within 5 min if it dies.
