@@ -355,7 +355,9 @@ def test_no_more_than_the_cap_run_at_once():
     flat = [{"title": str(i), "task": "t", "needs": []} for i in range(8)]
     rid = SW.start("g", ".", "opencode", _spawn, run_turn, phases=flat,
                    review=False)
-    st = _wait(rid, timeout=20)
+    # ~17 s alone (8 staggered spawns), so 20 s failed under parallel-suite load
+    # (2026-10-11); the deadline only bounds a hang, the cap is what is tested.
+    st = _wait(rid, timeout=60)
     assert peak[0] <= SW.MAX_CONCURRENT, "peak concurrency was %d" % peak[0]
     assert st["done"] == 8, "everything past the cap must still run"
 
