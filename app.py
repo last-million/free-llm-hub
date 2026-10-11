@@ -4937,7 +4937,8 @@ def _note_recent_hop_failure(pid, model, kind):
     if kind in _RECENT_STALL_KINDS:
         # "No answer in time" is one of the same-way failures a streak counts
         # (see _note_pair_failure); a 429 / junk / invalid kind is not.
-        _note_pair_failure(pid, model, "deadline")
+        _note_pair_failure(pid, model, "reasoning_stall" if kind == "reasoning_stall"
+                           else "deadline")
 
 
 def _clear_recent_hop_failure(pid, model):
@@ -4975,7 +4976,9 @@ def _recent_hop_failure(pid, model):
 # just cost it ~100-120 s of _HopBudgetExceeded -- turn after turn. A pair that
 # 429'd is retried in about a second and may have its quota back; a pair that
 # stalled will most likely stall again.
-_RECENT_STALL_KINDS = ("deadline", "timeout")
+# "reasoning_stall": a streamed hop that only reasoned for its whole budget
+# (see A MODEL THAT ONLY REASONS HANDS OVER) -- it cost a hop budget too.
+_RECENT_STALL_KINDS = ("deadline", "timeout", "reasoning_stall")
 
 
 def _recent_hop_stall(pid, model):
@@ -33625,6 +33628,7 @@ _HOP_CLASS_WORDS = (
     ("_HopBudgetExceeded", "no answer within the hop budget"),
     ("ReadTimeout", "timeout"), ("ConnectTimeout", "connect timeout"),
     ("ConnectionError", "connection error"),
+    ("reasoning_stall (200 but no content)", "only reasoned, no answer in time"),
 )
 
 
@@ -33765,11 +33769,16 @@ def _run_hedge_leg(idx, pid, payload, stream, lines, budget, q, lock, abandoned,
                 try:
                     it = (resp.iter_lines(decode_unicode=False) if lines
                           else resp.iter_content(chunk_size=None))
+                    _leg_left = max(0.0, budget - (time.monotonic() - started))
+                    # A leg holds reasoning only up to its OWN deadline (see A
+                    # MODEL THAT ONLY REASONS HANDS OVER): it never wins the race
+                    # on 400 reasoning frames.
                     status, buffered = _peek_until_content(
-                        it, max(0.0, budget - (time.monotonic() - started)),
+                        it, _leg_left,
                         content_grace=grace,
                         on_content=(lambda: streaming.add(idx))
-                        if streaming is not None else None)
+                        if streaming is not None else None,
+                        reasoning_budget=_rs_leg_budget(_leg_left))
                     # The verdict's KIND lives in THIS thread's slot; carry it
                     # on the leg's response so _record_losers files it right.
                     _tag_nonanswer_kind(resp, _take_nonanswer_kind()
@@ -34611,6 +34620,8 @@ class _ChainClock:
                             obj, "_hub_nonanswer_kind", None))
                     elif verdict == "timeout":
                         _note_recent_hop_failure(p, m, "deadline")
+                    elif verdict == "reasoning_stall":
+                        _rs_note_stall(p, m, time.monotonic() - legs[idx][3])
             except Exception:                                    # noqa: BLE001
                 pass
             _close_hedge_item(item)
@@ -34632,6 +34643,12 @@ class _ChainClock:
             if status == "timeout":
                 _close_hedge_item(item)
                 raise _HopBudgetExceeded("no first content within the hop budget")
+            if status == "reasoning_stall":
+                # Only reasoning for the leg's whole budget; its reader thread is
+                # still alive on `it`, so it is never re-peeked (as "timeout").
+                _rs_note_stall(p, m, time.monotonic() - _t)
+                _close_hedge_item(item)
+                raise _HopBudgetExceeded("only reasoning, no answer within the hop budget")
             self._hop_budget = None
             return _PrePeekedResponse(obj, buffered, it)
         return obj
@@ -34794,6 +34811,15 @@ class _ChainClock:
             if status == "timeout":
                 self._note_stall(pid)        # see walk()
                 self._note_long_stall(pid, model)
+            if status == "reasoning_stall":
+                # Reasoned for the whole budget, never answered (see A MODEL
+                # THAT ONLY REASONS HANDS OVER): a stall of this walk too.
+                self._note_stall(pid)
+                self._note_long_stall(pid, model)
+                secs = (time.monotonic() - self._hop_started
+                        if self._hop_started is not None else None)
+                _rs_note_stall(pid, model, secs)
+                return
             if status == "content":
                 _clear_recent_hop_failure(pid, model)
             elif status == "timeout" and max(self._hop_budget or 0,
@@ -34811,6 +34837,33 @@ class _ChainClock:
             t = min(t, left)
         self._last_peek = max(0.0, t)
         return self._last_peek
+
+    def reasoning_budget(self):
+        """How long the peek may HOLD a streamed hop that only reasons (no
+        visible text, no tool call yet) before it is abandoned as
+        "reasoning_stall" -- see A MODEL THAT ONLY REASONS HANDS OVER. Call it
+        right after peek_timeout() (it reads that value as its floor): max(peek,
+        min(_REASONING_STALL_SECONDS, _REASONING_STALL_SHARE x what is left of
+        the request clock, what is left of the hop budget)), never past the
+        clock. None = flag off: the old rule (reasoning commits the stream)."""
+        if not _rs_on():
+            return None
+        floor = float(getattr(self, "_last_peek", None) or 0.0)
+        try:
+            peek = floor
+            budget = float(_REASONING_STALL_SECONDS)
+            left = self.left()
+            if left is not None:
+                budget = min(budget, _REASONING_STALL_SHARE * max(0.0, left))
+            if self._hop_budget is not None and self._hop_started is not None:
+                budget = min(budget, self._hop_budget
+                             - (time.monotonic() - self._hop_started))
+            budget = max(peek, budget)
+            if left is not None:
+                budget = min(budget, max(0.0, left))
+            return max(0.0, budget)
+        except Exception:                                        # noqa: BLE001
+            return floor
 
     def guard(self, iterator, terminator=None, label=""):
         return _deadline_guard(iterator, self.deadline_at, terminator, label)
@@ -35159,15 +35212,102 @@ def _stream_starve_retry(clock, pid, model, payload, est, has_tools, tools, line
         it = tool_rescue.rescue_stream(it, tools, "lines" if lines else "frames")
     status, buffered = _peek_until_content(
         it, clock.peek_timeout(model, est, pid=pid), content_grace=clock.content_grace(),
-        check=_peek_check(retry, has_tools))
+        check=_peek_check(retry, has_tools),
+        reasoning_budget=clock.reasoning_budget())        # after peek_timeout
     clock.note_peek(pid, model, status)
     if status == "starved":
         _record_outcome(pid, model, False)
     return resp2, it, status, buffered, retry
 
 
+# A MODEL THAT ONLY REASONS HANDS OVER (2026-10-11).
+#
+# MEASURED (hub.log + .1 + .2, 2026-09-26..10-11: 41 times, 29 of them from
+# 10-07 on): Multi helper phases (opencode workers, streamed tool turns on
+# /v1/chat/completions) ended "opencode produced no reply" after
+#   [deadline] <pid>/<model>: cutting the committed stream (keepalive/reasoning
+#   only past the deadline)
+# mostly on nvidia z-ai/glm-5.3 (12) / glm-5.3-flash (11), uncloseai
+# Qwen3.8-27B-exl3 (7) and g4f glm-5.3 (4) -- each spent the whole ~4 min
+# request clock streaming ONLY reasoning. The cause was the peek's
+# end-of-budget verdict: 400 reasoning frames (a thinker emits them in seconds)
+# returned "content", so the stream was COMMITTED to the client on reasoning
+# alone; once committed the chain can no longer hand the turn to another model,
+# and past the deadline _deadline_guard cut it with nothing visible delivered.
+# Nothing was filed against the pair either, so the next attempt landed on it.
+#
+# Now (flag `reasoning_stall_fallback`, default on): reasoning never commits.
+# The peek holds a reasoning-only stream -- nothing is sent, the held frames
+# are replayed losslessly once visible text or a tool call arrives -- for at
+# most _ChainClock.reasoning_budget(): max(peek timeout, min(
+# _REASONING_STALL_SECONDS, _REASONING_STALL_SHARE x what is left of the request
+# clock, the hop budget)). Past it the hop is "reasoning_stall": filed as a
+# recent STALL + a same-way streak + a delivery failure (_rs_note_stall), and
+# the chain walks on to the next model on the remaining clock.
+#
+# _REASONING_STALL_SECONDS = 150, from the data on hand 2026-10-11: healthy
+# thinkers' whole NON-stream answers average 51.5 s (nvidia glm-5.3, n=40) and
+# 69.3 s (nvidia kimi-k3, n=40) in perf-stats.json; the live first-commit p95
+# is <= 74.9 s (/api/model-speed); the 2026-09-27 TTFT snapshot's worst p95 is
+# 62.3 s (tests/test_latency_constants.py); long-context "slow" starts at
+# LONG_CTX_SLOW_MS (120 s). 150 s is ~2x the slowest of those, and it is the
+# hub's existing "this stream stopped delivering" bound (_STREAM_PROGRESS_
+# DEADLINE). The 60% share keeps >= 40% of the clock for the next model (240 s
+# clock: 144 s held, 96 s left). A thinker slower than that -- nvidia
+# deepseek-v4.1-flash averages 198 s for a whole answer -- now hands over
+# instead of holding the request: the trade the owner asked for.
+_REASONING_STALL_SECONDS = 150.0
+_REASONING_STALL_SHARE = 0.6
+# Bytes of held reasoning frames before the hold gives up anyway (~50K tokens
+# of deltas): bounds the memory one held request can take.
+_REASONING_HOLD_MAX_BYTES = 8 << 20
+
+
+def _rs_on():
+    """Flag `reasoning_stall_fallback` (default on). Off = the old peek rule
+    byte for byte (400 reasoning frames commit the stream). Never raises."""
+    try:
+        return bool(config.get_flag("reasoning_stall_fallback", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _rs_note_stall(pid, model, secs=None):
+    """File a streamed hop that only reasoned for its whole budget: a recent
+    STALL (out of the primary pick and to the chain's tail for
+    _RECENT_FAIL_TTL; a session pin re-picks), a "reasoning_stall" streak event
+    (_note_pair_failure: 3 in 15 min rest the pair for tool turns) and a
+    delivery failure (_record_outcome, as the committed-stream stall cut does).
+    Nothing when the client left or this computer's network failed -- every
+    callee checks that again. Never raises."""
+    if not (pid and model):
+        return
+    try:
+        if _client_gone() or _local_net_failed(pid, model):
+            return
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        _log.warning("[reasoning-stall] %s/%s: only reasoning for %ss (no visible text "
+                     "or tool call) -- handed to the next model", pid, model,
+                     "%.0f" % secs if secs is not None else "?")
+    except Exception:                                            # noqa: BLE001
+        pass
+    _note_recent_hop_failure(pid, model, "reasoning_stall")
+    _record_outcome(pid, model, False)
+
+
+def _rs_leg_budget(deadline_s):
+    """The reasoning hold of a hedge leg: its own deadline, never longer (a
+    trivial turn's hop budget is the limit there). None = flag off."""
+    try:
+        return float(deadline_s) if _rs_on() else None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
-                        on_content=None, check=None):
+                        on_content=None, check=None, reasoning_budget=None):
     """Look ahead on a streaming 200 to tell a REAL answer from an EMPTY one before
     committing it to the client. Reads SSE items (bytes) until one carries actual
     content / a tool call (the provider is really answering), or the stream
@@ -35182,9 +35322,19 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
       'timeout' -> nothing usable arrived in time; caller falls through.
       'junk'    -> only with `check` (see _judge_peeked): the peeked answer is
                    degenerate with nothing salvageable; caller falls through.
+      'reasoning_stall' -> only with `reasoning_budget` (see A MODEL THAT ONLY
+                   REASONS HANDS OVER): the stream reasoned for the whole budget
+                   with no visible text or tool call; caller falls through.
+    With `reasoning_budget` (seconds from the start of the peek; None = the old
+    rule), reasoning NEVER commits the stream: past `max_lines` the peek keeps
+    reading while the stream is reasoning only, and past `deadline_s` it keeps
+    waiting while reasoning has been seen, up to max(deadline_s,
+    reasoning_budget). Nothing reaches the client meanwhile; the held frames are
+    replayed losslessly at commit.
     Same daemon-worker discipline as _peek_first_chunk: the buffer/iterator are only
     used when the worker FINISHED (status set) so there's never concurrent iteration."""
     box = {"buf": [], "status": None, "kind": None}
+    hold = reasoning_budget is not None
     prompt = _request_prompt_text()   # the worker has no request context
     started = time.monotonic()
     # A tools turn where "I don't have tools" would be a non-answer: the peek
@@ -35219,14 +35369,24 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
         saw_reasoning = False
         seen_content = []
         read_on_at, read_on_budget = None, 0.0
+        n_read, held = 0, 0
         try:
-            for _ in range(max_lines):
+            while True:
+                # The old `for _ in range(max_lines)`, except that a HELD stream
+                # (reasoning only so far, see `hold`) reads on past max_lines.
+                if n_read >= max_lines and not (
+                        hold and saw_reasoning and not seen_content
+                        and not box.get("nameless_tool")):
+                    break
+                n_read += 1
                 item = next(iterator)
                 buf.append(item)
                 if not item:
                     continue
                 b = item if isinstance(item, (bytes, bytearray)) \
                     else str(item).encode("utf-8", "ignore")
+                if hold:
+                    held += len(b)
                 # A real tool call means the model is DOING the work. Commit at
                 # once: nothing below can improve on that, and every extra frame
                 # here is latency on the turns that are going well.
@@ -35345,6 +35505,13 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                     return
                 if _STREAM_REASONING_RE.search(b):
                     saw_reasoning = True
+                    if hold:
+                        box["reasoning"] = True
+                        if held > _REASONING_HOLD_MAX_BYTES and not seen_content:
+                            # Megabytes of thinking and still not one visible
+                            # token: no answer is coming inside this request.
+                            box["status"] = "reasoning_stall"
+                            return
             # Budget exhausted with no content marker. Only treat that as a real
             # stream if we saw the model THINKING (reasoning deltas) — otherwise it
             # was 400 lines of keepalives/role deltas and committing it hands the
@@ -35387,7 +35554,23 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
         # that is streaming words is never cut here, only one that is silent.
         # `content_grace` bounds the wait (the request deadline's remainder).
         t.join(content_grace)
+    if hold and t.is_alive() and box.get("reasoning") and not box.get("saw_content"):
+        # THE MODEL IS THINKING (see A MODEL THAT ONLY REASONS HANDS OVER):
+        # reasoning proves the upstream is alive, not that an answer is coming.
+        # Hold -- nothing committed, nothing sent -- until visible text or a
+        # tool call arrives, or the reasoning budget runs out.
+        end = started + max(float(deadline_s or 0.0), float(reasoning_budget or 0.0))
+        while t.is_alive():
+            rest = end - time.monotonic()
+            if rest <= 0:
+                break
+            if clientgone.join(t, min(0.5, rest)):
+                return "cancelled", []
+        if t.is_alive() and content_grace and box.get("saw_content"):
+            t.join(content_grace)     # visible text started at the edge of the budget
     if t.is_alive():
+        if hold and box.get("reasoning") and not box.get("saw_content"):
+            return "reasoning_stall", []
         return "timeout", []
     status = box.get("status") or "empty"
     # The verdict's KIND for the caller's _note_nonanswer (same thread as it).
@@ -39694,7 +39877,7 @@ _STREAK_LIMIT = 3
 _STREAK_WINDOW = 900.0
 _STREAK_REST_BASE = 1800.0
 _STREAK_REST_CAP = 21600.0
-_STREAK_CLASSES = ("http4xx", "exc", "empty", "deadline")
+_STREAK_CLASSES = ("http4xx", "exc", "empty", "deadline", "reasoning_stall")
 _empty_200 = {}                      # (pid, model) -> [epoch | (epoch, class), ...]
 _empty_200_lock = threading.Lock()
 _pair_rest = {}                      # (pid, model) -> {"until", "level", "cls"}
@@ -44713,10 +44896,13 @@ def _chat_completions_uncached(body):
                     it = tool_rescue.rescue_stream(it, body.get("tools"), "frames")
                 # Peek until REAL content: a 200 that streams no content must fall
                 # through to the next model, not be handed to the client as empty.
+                # reasoning_budget AFTER peek_timeout (it reads it): reasoning
+                # alone never commits (see A MODEL THAT ONLY REASONS HANDS OVER).
                 status, buffered = _peek_until_content(
                     it, _clock.peek_timeout(hop_model, est, pid=hop_pid),
                     content_grace=_clock.content_grace(),
-                    check=_peek_check(payload, has_tools))
+                    check=_peek_check(payload, has_tools),
+                    reasoning_budget=_clock.reasoning_budget())
                 _clock.note_peek(hop_pid, hop_model, status)
                 if status == "starved":
                     # Ended at "length" on a stub / nothing: hidden reasoning
@@ -45835,7 +46021,8 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 status, buffered = _peek_until_content(
                     line_it, _clock.peek_timeout(hop_model, est, pid=hop_pid),
                     content_grace=_clock.content_grace(),
-                    check=_peek_check(payload, has_tools))
+                    check=_peek_check(payload, has_tools),
+                    reasoning_budget=_clock.reasoning_budget())   # after peek_timeout
                 _clock.note_peek(hop_pid, hop_model, status)
                 if status == "starved":
                     # See the twin in /v1/chat/completions.
@@ -46852,7 +47039,8 @@ def v1_messages():
                 status, buffered = _peek_until_content(
                     line_it, _clock.peek_timeout(hop_model, est, pid=hop_pid),
                     content_grace=_clock.content_grace(),
-                    check=_peek_check(payload, has_tools))
+                    check=_peek_check(payload, has_tools),
+                    reasoning_budget=_clock.reasoning_budget())   # after peek_timeout
                 _clock.note_peek(hop_pid, hop_model, status)
                 if status == "starved":
                     # See the twin in /v1/chat/completions.

@@ -5189,3 +5189,85 @@ same pattern as the race / team-notes fixtures). Flag `multi_auto_retry_failed`
   `agentic_chat.stop_session`); without one the old terminal give-up applies. The
   cap-fit writes into the project folder, so a project with no writable folder
   falls back to a visible inline trim (goal kept first) rather than a file.
+
+## A model that only reasons hands over (2026-10-11)
+
+Owner: Multi helper phases (opencode workers, streamed tool turns on
+`/v1/chat/completions`) failed "opencode produced no reply" even after 3
+attempts. Covered by `tests/test_reasoning_stall_fallback.py` (hermetic: fake
+upstreams streaming reasoning only / reasoning then text, the three real chain
+loops through the test client, no network). Flag `reasoning_stall_fallback`
+(`config.get_flag`, default ON); OFF = the old peek byte for byte. New app.py
+names: `_rs_on`, `_rs_note_stall`, `_rs_leg_budget`, `_REASONING_STALL_*`,
+`_REASONING_HOLD_MAX_BYTES`, `_ChainClock.reasoning_budget`.
+
+- **MEASURED** (hub.log + .1 + .2, read-only): 41 lines `[deadline] <pid>/
+  <model>: cutting the committed stream (keepalive/reasoning only past the
+  deadline)`, 2026-09-26..10-11 (29 from 10-07 on), each followed by "no-reply
+  fallback exhausted ... cli=opencode": nvidia z-ai/glm-5.3 12, glm-5.3-flash
+  11, uncloseai Qwen3.8-27B-exl3 7, g4f glm-5.3 4, others 1-2. Each spent the
+  whole ~4 min clock streaming ONLY reasoning. None gets a hub-sent effort.
+- **Root cause (confirmed in code)**: `_peek_until_content`'s end-of-budget
+  verdict -- after `max_lines` (400) frames with no content, `"content" if
+  saw_reasoning`. A thinker streams 400 reasoning deltas in seconds, so the
+  stream was COMMITTED on reasoning alone; the chain loop then returned the
+  Response and could never hand the turn to another model; `_deadline_guard`
+  later cut it with nothing visible ("length" terminator -> opencode: no
+  reply). Nothing was filed against the pair (the guard only logs), so the
+  next attempt -- and the walk after a 402/budget g4f hop -- landed on it again.
+  (A reasoning stream SLOWER than 400 frames per peek window already fell
+  through as "timeout".)
+- **Mechanism**: with the flag on every streamed peek gets `reasoning_budget`;
+  reasoning NEVER commits. Past `max_lines` the worker keeps reading while the
+  stream is reasoning only; past the peek timeout the main thread keeps
+  waiting while reasoning has been seen, up to `max(peek, reasoning_budget)`.
+  Visible text or a (named) tool call commits exactly as before and the HELD
+  frames are replayed losslessly first (`_chain_buffered`, same bytes as the
+  old committed stream, only later) -- chat clients keep the reasoning text;
+  `/v1/responses` / `/v1/messages` translate it into their usual keepalive
+  comment / ping. Past the budget -> status `reasoning_stall`: `note_peek`
+  files it (`_rs_note_stall`: `_note_recent_hop_failure(..., "reasoning_stall")`
+  -- a STALL kind now, so out of the primary pick, chain tail, a session pin
+  re-picks -- + streak class `reasoning_stall` in `_note_pair_failure` (3 in
+  15 min rest the pair for tool turns) + `_record_outcome(False)`, as the
+  committed-stream stall cut does; nothing when the client left or this
+  computer's network failed) and the loop walks on with the remaining clock.
+  The stream ending with only reasoning is "empty" / "starved" as before.
+  A silent stream (no reasoning) is never extended. Held bytes are capped at
+  `_REASONING_HOLD_MAX_BYTES` (8 MiB, ~50K tokens of deltas) -> stall.
+- **Budget** (`_ChainClock.reasoning_budget`, called right after
+  `peek_timeout`): max(peek timeout, min(`_REASONING_STALL_SECONDS` 150,
+  `_REASONING_STALL_SHARE` 0.6 x what is left of the request clock, what is
+  left of the hop budget)), never past the clock. From data 2026-10-11: healthy
+  thinkers' whole non-stream answers average 51.5 s (nvidia glm-5.3, n=40) and
+  69.3 s (kimi-k3, n=40) in perf-stats.json; live first-commit p95 <= 74.9 s
+  (/api/model-speed); the 09-27 TTFT snapshot's worst p95 62.3 s;
+  LONG_CTX_SLOW_MS 120 s. 150 = ~2x the slowest and the hub's existing
+  `_STREAM_PROGRESS_DEADLINE`; 0.6 leaves >= 40% for the next model (240 s
+  clock: 144 s held, 96 s left). Tool turns keep the provider share cap (hop
+  budget, ~120 s while another provider waits).
+- **What the client sees while held**: nothing -- the HTTP response is not
+  started, exactly as during every peek and chain walk today, so there is no
+  idle timer to feed. Deliberately NOT an early commit + keepalives: once the
+  headers are sent the chain loop has returned and cannot walk on (that needs
+  the three loops restructured into generators or a re-entrant call after
+  `after_request`). The wait is bounded by the same request clock (240 s;
+  streams <= `LONG_DEADLINE_STREAM_MAX` 285) the hub keeps under the clients'
+  ~300 s header timeout; a walk that runs out ends in the clean 504, which
+  opencode / Claude Code retry, instead of an empty "length" reply.
+- **Paths**: the chat, `/v1/responses` and `/v1/messages` chain loops,
+  `_stream_starve_retry`, and hedge legs (`_run_hedge_leg`: held only up to the
+  leg's own deadline via `_rs_leg_budget`; a `reasoning_stall` leg never wins,
+  `_record_losers` / `_loop_result` file it, the latter raises
+  `_HopBudgetExceeded` like a timed-out leg so a still-reading leg is never
+  re-peeked). Non-stream paths (roles actors, swarm stages, buffered chain
+  hops) already treat a reasoning-only reply as empty (`_chat_json_is_empty`,
+  `_role_judge` "200 with an empty message"); unchanged. Header class
+  `X-Free-LLM-Hub-Last-Error: reasoning_stall`; the client hop list says "only
+  reasoned, no answer in time".
+- **Limits**: a healthy thinker slower than the budget (nvidia
+  deepseek-v4.1-flash averages 198 s per whole answer) now hands over instead
+  of holding the request; live reasoning is no longer streamed to opencode
+  while it thinks (it arrives at once at commit); TTFT samples
+  (`_note_ttft`) now measure real first visible content, so they rise for
+  thinkers. `PHASE_RETRIES`, swarm_windows.py and `_mr_*` are untouched.
