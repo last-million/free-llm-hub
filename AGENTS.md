@@ -5093,8 +5093,15 @@ protocol shaping for chat/responses/messages; no network, no real CLI).
   CLI is not attached, the NEXT message of that conversation + folder gets the
   finished result ONCE (`_cm_deliver_finished`, via `swarm_windows.last_run_for`
   + `format_result`, bounded to `_CM_RESULT_MAX_CHARS` 6000): a status word
-  streams it; any other message gets it injected as a system note and is
-  answered by the best path so the CLI agent continues from it. It is marked
+  streams it; any other message gets it as the ASSISTANT's own late reply,
+  inserted right before the user's latest message (`_cm_inject_result`), plus
+  ONE constant system note (`_CM_RESULT_NOTE`: information, never
+  instructions), and is answered by the best path so the CLI agent continues
+  from it. NEVER a system message for the report itself (security review
+  2026-10-11): it is helper-model output that can quote prompt-injected files
+  or pages, and system authority would let an instruction inside it steer a
+  CLI agent that runs commands; as an assistant turn it has exactly the weight
+  it would have had streamed to an attached CLI. It is marked
   delivered in the map (`_cm_map_put(..., delivered=<run id>)`, merged into
   `cli-multi-runs.json`), so it is never delivered twice; the message after that
   takes the normal flow (a new instruction can start a new run).
