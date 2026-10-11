@@ -386,6 +386,22 @@ def _multi_auto_retry_off_unless_tested(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _cli_multi_stay_live_off_unless_tested(request, monkeypatch):
+    """STAY IN THE CLI UNTIL THE RUN ENDS (app, flag `cli_multi_stay_live`) is
+    default ON for opencode (2026-10-11), but the CLI-Multi test files pin the
+    hand-off (opencode's 540 s safe end, the early background hand-off). Off
+    here keeps them byte-for-byte; the feature's own file turns it back on."""
+    mod = getattr(request.node, "module", None)
+    if mod is None or mod.__name__.rsplit(".", 1)[-1] != "test_cli_multi_stays_live":
+        try:
+            import app
+            monkeypatch.setattr(app, "_cm_stay_live", lambda caller: False)
+        except Exception:
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _weak_models_not_force_verified(request, monkeypatch):
     """Tests written with low fake scores (10-100) are about their own subject;
     the "weak actor is always verified" wiring has its own test file."""

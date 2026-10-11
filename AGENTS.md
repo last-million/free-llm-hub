@@ -5335,3 +5335,29 @@ machine, whose install path has spaces ("...\bureau 2024\ALL\python perso\..."):
   `close()` idempotent and also runs it when the body is garbage-collected.
   Reproduced on a real werkzeug server with a client that closes or resets
   mid-stream: no callback before, the callback and a counter back at 0 after.
+
+## Multi from opencode: the turn stays live until the run ends (2026-10-11)
+
+Owner: "why does the CLI send me to localhost to see Multi -- can't I stay just
+in the CLI?" Covered by `tests/test_cli_multi_stays_live.py`. Flag
+`cli_multi_stay_live` (default on); off = the background hand-off as before.
+`tests/conftest.py` turns it off for every other test file.
+
+- **Measured** (opencode 1.19.0, sandboxed config through XDG_* +
+  OPENCODE_CONFIG, a local fake OpenAI-compatible server streaming one content
+  line every 20 s): a 900 s stream completed (exit 0, "FINISHED-OK", one
+  request, no retry). The `DEFAULT_TIMEOUT=600000` string read from the binary
+  earlier is therefore not an overall cap; the stream timeout is idle-based.
+- **What changes for a CLI in `_CM_STAY_LIVE_CLIS` (opencode only)**:
+  `_cm_safe_end_seconds` returns `_CM_STAY_MAX_SECONDS` (6 h, a ceiling for a
+  run that never ends) and `_cm_staying` makes `_cm_text_stream` skip the early
+  background hand-off, so the START turn (and a `status` re-attach) shows the
+  whole run live -- plan, phases, retries, a keepalive line every 20 s, then the
+  report. The header says so ("Esc stops watching, not the run"). The run still
+  never depends on the CLI staying connected.
+- **The report is delivered once**: `_cm_text_stream(on_report=)` marks the run
+  delivered in the CLI map when it streams the finished report (start turn and
+  re-attach), so the next message is not handed the same report again (part D
+  of "Multi from the CLI"). A turn that hands off marks nothing.
+- codex / claude / kimi keep the hand-off: their overall stream limits are not
+  measured.

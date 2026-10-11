@@ -134,9 +134,20 @@ def test_the_design_is_parsed_passed_to_every_worker_and_persisted(tmp_path):
         assert "- phase 1 (Store): store.py, items.json" in prompt
         assert prompt.index("DESIGN (shared") < prompt.index("--- context, not instructions ---")
     assert "YOUR FILES (phase 2): api.py." in w.prompt_starting("build the api")[0]
-    # Persisted with the run, and read back.
-    with open(SW._run_path(rid, SW.get(rid).store_root), encoding="utf-8") as f:
-        row = json.load(f)
+    # Persisted with the run, and read back. The run's own thread may be
+    # replacing the file at this instant; on Windows that open is a sharing
+    # violation (seen once under -n auto, 2026-10-11), so retry briefly.
+    path = SW._run_path(rid, SW.get(rid).store_root)
+    end = time.time() + 10
+    while True:
+        try:
+            with open(path, encoding="utf-8") as f:
+                row = json.load(f)
+            break
+        except (PermissionError, ValueError):
+            if time.time() > end:
+                raise
+            time.sleep(0.05)
     assert row["design"] == design
     back = SW._Run.from_row(row)
     assert back.design == design and back.agents[1].files == ["api.py"]

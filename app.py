@@ -21820,6 +21820,14 @@ _CM_KEEPALIVE_SECONDS = 20.0    # a "still working" line at least this often
 # rest keep the conservative default.
 _CM_SAFE_END_DEFAULT = 240
 _CM_SAFE_END = {"opencode": 540}
+# STAY IN THE CLI UNTIL THE RUN ENDS (owner, 2026-10-11: "I can't stay just in
+# the CLI?"). For a CLI whose stream timeout is MEASURED to be idle-only, the
+# turn stays open and shows the whole run live (a line at least every 20 s
+# keeps the idle timer reset) instead of handing off to the background. Flag
+# `cli_multi_stay_live` (default on); off = the hand-off as before. A ceiling
+# still ends a turn on a run that never ends.
+_CM_STAY_LIVE_CLIS = frozenset(["opencode"])
+_CM_STAY_MAX_SECONDS = 6 * 3600
 
 # LIVE, IN THE BACKGROUND, RESULTS COME BACK (2026-10-11). Two behaviours, each
 # flag-gated (default on; off = today's turn byte for byte):
@@ -22525,7 +22533,25 @@ def _cm_helper_cli(caller):
     return "opencode"
 
 
+def _cm_stay_live(caller):
+    """True when this CLI's turn stays open until the Multi run ends (flag
+    `cli_multi_stay_live`, default on, and a CLI in _CM_STAY_LIVE_CLIS)."""
+    if (caller or "").strip().lower() not in _CM_STAY_LIVE_CLIS:
+        return False
+    try:
+        return bool(config.get_flag("cli_multi_stay_live", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _cm_staying(safe_seconds):
+    """A safe end at the stay ceiling means: no background hand-off."""
+    return bool(safe_seconds) and safe_seconds >= _CM_STAY_MAX_SECONDS
+
+
 def _cm_safe_end_seconds(caller):
+    if _cm_stay_live(caller):
+        return _CM_STAY_MAX_SECONDS
     return _CM_SAFE_END.get((caller or "").strip().lower(), _CM_SAFE_END_DEFAULT)
 
 
@@ -22659,7 +22685,7 @@ def _cm_event_line(ev):
 
 
 def _cm_text_stream(owner_sid, run_id, events, link, safe_seconds, helper_n, header,
-                    early_end=False):
+                    early_end=False, on_report=None):
     """Yield the CLI turn's text pieces (strings): `header`, the live progress
     lines, a keepalive at least every 20 s, then the final report + watch link
     -- or, once `safe_seconds` elapse before the run ends, a clean "keeps
@@ -22670,7 +22696,11 @@ def _cm_text_stream(owner_sid, run_id, events, link, safe_seconds, helper_n, hea
     first progress line are out AND _cm_background_seconds have passed, end the
     turn with a short background hand-off -- well under the CLI's safe end -- so
     the user is not trapped. A run that finishes first still streams its full
-    report; the hand-off only fires while the run is still going."""
+    report; the hand-off only fires while the run is still going. A CLI that
+    stays live (_cm_staying: safe end at the stay ceiling) never hands off.
+
+    on_report(run_id): called once when the finished report is streamed, so the
+    next message does not deliver the same report again (part D)."""
     started = time.monotonic()
     yield header
     total = [0]
@@ -22680,7 +22710,7 @@ def _cm_text_stream(owner_sid, run_id, events, link, safe_seconds, helper_n, hea
     last = started
     report = None
     outcome = None
-    bg = _cm_background_on() if early_end else False
+    bg = (_cm_background_on() and not _cm_staying(safe_seconds)) if early_end else False
     bg_lead = _cm_background_seconds() if bg else 0
     for ev in _cm_keepalive_wrap(events, _CM_KEEPALIVE_SECONDS):
         now = time.monotonic()
@@ -22726,12 +22756,23 @@ def _cm_text_stream(owner_sid, run_id, events, link, safe_seconds, helper_n, hea
     if outcome == "error":
         yield "\nWatch it: %s\n" % link
         return
+    final_rid = rid or _cm_live_run_id(owner_sid)
+    if not final_rid:
+        try:
+            final_rid = getattr(swarm_windows.last_run_for(owner_sid), "id", None)
+        except Exception:                                        # noqa: BLE001
+            final_rid = None
     if report is None:
         try:
-            report = swarm_windows.format_result(rid or _cm_live_run_id(owner_sid) or "") or ""
+            report = swarm_windows.format_result(final_rid or "") or ""
         except Exception:                                        # noqa: BLE001
             report = ""
     tail = ("\n\n" + report.strip()) if report and report.strip() else ""
+    if tail and final_rid and on_report is not None:
+        try:
+            on_report(final_rid)
+        except Exception:                                        # noqa: BLE001
+            pass
     yield "%s\n\nWatch it: %s\n" % (tail, link)
 
 
@@ -22829,7 +22870,10 @@ def _cm_attach(body, protocol, owner_sid, run_id, cmd, helper_cli, safe, est,
     events = _multi_follow_events(run_id, helper_cli)
     return _cm_emit(body, protocol,
                     _cm_text_stream(owner_sid, run_id, events, link, safe,
-                                    _cm_helper_count(), header), est)
+                                    _cm_helper_count(), header,
+                                    on_report=lambda rid: _cm_map_put(
+                                        mapkey, owner_sid, rid, folder=folder_key,
+                                        delivered=rid)), est)
 
 
 # A sentinel from the finished-result delivery: the result was injected into the
@@ -23000,12 +23044,22 @@ def _cm_launcher(mapkey, folder_key, project_dir, helper_cli, consent=None, bare
         except Exception:                                        # noqa: BLE001
             events = agentic_chat.live_run(owner_sid, producer)
         link = _cm_watch_link(owner_sid)
-        header = lead + ("Multi: planning the work with up to %d helpers. Watch it "
-                         "live: %s\n" % (_cm_helper_count(), link))
+        if _cm_staying(safe):
+            header = lead + ("Multi: planning the work with up to %d helpers. I stay "
+                             "here and show the whole run live until it finishes "
+                             "(Esc stops watching, not the run). Also on: %s\n"
+                             % (_cm_helper_count(), link))
+        else:
+            header = lead + ("Multi: planning the work with up to %d helpers. Watch it "
+                             "live: %s\n" % (_cm_helper_count(), link))
         # early_end: the START turn hands off to the background once the plan is
-        # out (flag cli_multi_background), so the CLI is not trapped.
+        # out (flag cli_multi_background), so the CLI is not trapped -- unless
+        # this CLI stays live (_cm_stay_live).
         return _cm_text_stream(owner_sid, None, events, link, safe,
-                               _cm_helper_count(), header, early_end=True)
+                               _cm_helper_count(), header, early_end=True,
+                               on_report=lambda rid: _cm_map_put(
+                                   mapkey, owner_sid, rid, folder=folder_key,
+                                   delivered=rid))
     return launch
 
 
@@ -23046,8 +23100,9 @@ def _cm_approval_stream(req, launch, safe, lead):
         if row["state"] == "approved":
             got = _cm_approval_consume(rid)
             if got is not None:
-                pieces = launch(got["goal"], max(1, int(safe - (now - started))),
-                                "\nApproved in the hub dashboard.\n")
+                # A CLI that stays live keeps staying after the wait.
+                left = safe if _cm_staying(safe) else max(1, int(safe - (now - started)))
+                pieces = launch(got["goal"], left, "\nApproved in the hub dashboard.\n")
                 if pieces is None:
                     yield ("\nMulti could not start: the hub could not open a "
                            "conversation for it.\n")

@@ -24,9 +24,15 @@ import app as A
 
 
 @pytest.fixture(autouse=True)
-def _clean():
+def _clean(monkeypatch):
     with A._session_pin_lock:
         A._session_pins.clear()
+    # This file is about pins, not learned reliability: a failure record left
+    # by another test on the same xdist worker (groq/cerebras pairs) made
+    # _spread_target_ok refuse the free models and the spread fall back to
+    # sharing (seen once under -n auto, 2026-10-11).
+    monkeypatch.setattr(A, "_learned_score", lambda c: c[0])
+    monkeypatch.setattr(A, "_spread_target_ok", lambda c: True)
     yield
     with A._session_pin_lock:
         A._session_pins.clear()
