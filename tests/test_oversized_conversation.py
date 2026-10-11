@@ -481,7 +481,13 @@ def test_the_probe_is_registered_with_the_agent_runner(monkeypatch):
     assert AC.context_too_long(sess, t0, "whatever the CLI said") ==         {"tokens": 504077, "window": 262144}
 
 
-def test_an_agent_sessions_overflow_reaches_the_ledger_end_to_end(world):
+def test_an_agent_sessions_overflow_reaches_the_ledger_end_to_end(world, monkeypatch):
+    # The native "context too long" path marks the ledger; the grow guard would
+    # instead answer a codex turn successfully, so it is off for this assertion.
+    _real_flag = A.config.get_flag
+    monkeypatch.setattr(A.config, "get_flag",
+                        lambda k, d=None, r=_real_flag: False if k == "context_grow_guard"
+                        else r(k, d))
     world.fleet(MEASURED)
     world.set_chain([H_RELAY])
     t0 = time.time() - 1
@@ -827,7 +833,14 @@ def test_what_codex_is_told_for_the_compound_id(codex_session):
         assert A._ctx_steer_pair() == (272000, 262144)
 
 
-def test_a_codex_shaped_500k_history_is_refused_at_the_door(codex_session):
+def test_a_codex_shaped_500k_history_is_refused_at_the_door(codex_session, monkeypatch):
+    # The grow guard (tests/test_context_grow_guard.py) would turn a codex
+    # overflow into a successful compaction nudge; here we pin the front-door
+    # NATIVE-reply mechanics, so the guard is off.
+    _real_flag = A.config.get_flag
+    monkeypatch.setattr(A.config, "get_flag",
+                        lambda k, d=None, r=_real_flag: False if k == "context_grow_guard"
+                        else r(k, d))
     world = codex_session
     world.fleet([("nvidia", "fake-glm-250k", 250000), ("kilocode", "fake-qwen-262k", 262144),
                  H_SMALL + (65536,), H_RELAY + (None,)])

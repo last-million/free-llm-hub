@@ -4883,3 +4883,63 @@ helped by the 10-10 `rr_fit_on_cleared` fit-on-cleared-size fix.
 (per-hop class, first-hop class, turn-level distinct-cause sets, how many spent
 no call, backup/verifier counts, calls distribution). Without the flag the
 output is unchanged; `--json` renders the cause-set tuples as " + "-joined names.
+
+## Conversations are compacted before they outgrow the models (2026-10-11)
+
+Owner: a codex Build-page conversation grew to ~504K tokens, past every model's
+window; every turn then failed and codex re-sent the same oversized turn for
+hours instead of compacting. Covered by `tests/test_context_grow_guard.py`
+(hermetic: fake upstream + fake fleet reused from `test_oversized_conversation`).
+Flag `context_grow_guard` (`config.get_flag`, default on); off = byte-identical
+old behaviour. New app.py symbols are `_cg_`.
+
+**Root cause.**
+- **MEASURED** (the hub's own isolated codex rollouts, read-only under
+  `~/.free-llm-hub/isolated-clis/codex/config/sessions`): codex auto-compacts
+  from the usage the hub reports on a SERVED turn and recovers. In
+  `2026/10/07/rollout-...-01a11461...` (the 504K incident) one turn reported
+  `last_token_usage.input_tokens=610042` against a believed window of 258400,
+  codex emitted a `context_compacted` event, and the next turn dropped to
+  13821 and the session carried on. Codex honours `model_context_window` from
+  its config (258400 was the hub's declared reach-window resync value at the
+  time; now 400000). The codex docs confirm `model_auto_compact_token_limit`
+  is "Token threshold that triggers automatic history compaction", scope
+  `total` = the full active context. **No** codex rollout on this machine ever
+  received a `context_length_exceeded`.
+- **INFERRED** (the hours-long loop itself; those hub.log lines have rotated
+  away and were not re-measurable): on an overflow the hub answers with the
+  native context error or a 503 -- a FAILED turn, which carries NO usage report
+  -- so codex's compaction never fires from it and codex retries the same
+  oversized turn. The streamed `response.failed`/`context_length_exceeded` is
+  *supposed* to make codex compact (per the `responses_overflow_events`
+  comment), but the one recovery actually observed was through a served turn's
+  reported usage, not an error, and the incident showed 503s (the pre-front-door
+  `_ctx_overflow_reply` returns None -> 503 when a hop failed on a 5xx/timeout).
+
+**Fix (owner-approved fallback).** When a proven-auto-compact CLI (`codex`,
+`_CG_AUTOCOMPACT_CLIS`) is about to get the native overflow reply, `_cg_grow_guard`
+instead returns a SHORT SUCCESSFUL reply (`_cg_success_reply`, mirroring
+`_orch_command_response`'s per-protocol no-model-call shaping) whose reported
+prompt/input tokens are `max(est, declared_compact_limit + _CG_REPORT_MARGIN)`
+-- at/over codex's own auto-compact threshold -- so codex compacts on its NEXT
+turn (its PROVEN trigger). Message: "This conversation is too long for the
+available models; the hub is compacting it now -- please send your message
+again." Hooked in the two overflow ENTRY points (`_front_door_overflow`,
+`_ctx_overflow_reply`), NOT inside `_native_overflow_reply`, so the compact-hint
+path's direct native replies are unchanged.
+
+**Never loops.** Fires at most once per conversation per `_CG_FIRE_TTL` (300 s),
+keyed by `_cg_conv_key` (the `_build_sid()` /agent session, else the CLI from
+`_ch_overflow_client`). A second overflow inside that window -- the CLI did not
+compact, or compaction did not shrink it enough -- falls back to today's native
+error + `/compact` hint. A CLI's own compaction request never reaches the guard
+(the front door excludes it; it is small enough to fit anyway). Scope is codex
+only, the one CLI proven here; claude/opencode keep the native reply (their
+`/compact` hint is their documented trigger and no loop was observed for them).
+
+**Left as is / not re-measured**: the 504K loop's exact hub.log lines (rotated);
+codex's precise internal compaction math; why a given session grew that far
+before compacting (the served-turn path works, so the remaining gap was only the
+overflow/error turns, which this guard converts). The two codex front-door tests
+in `tests/test_oversized_conversation.py` set `context_grow_guard` off to keep
+pinning the native-reply mechanics.

@@ -13022,6 +13022,9 @@ def _ctx_overflow_reply(kind, stream=False, model_label="auto"):
         _log.info("[ctx] %s request of ~%d tokens overflowed every hop (largest window "
                   "tried %d): answering with the native context-length error", kind,
                   orig, window)
+    guarded = _cg_grow_guard(kind, stream, orig, window, model_label)
+    if guarded is not None:
+        return guarded
     return _native_overflow_reply(kind, stream, orig, window, model_label, hdrs)
 
 
@@ -13085,6 +13088,162 @@ def _ch_compact_hint(orig, window):
                 % (sizes, action)), cli, cmd
     except Exception:                                            # noqa: BLE001
         return "", None, None
+
+
+# --------------------------------------------------------------------------- #
+# GROW GUARD: make a steered CLI compact instead of retrying an overflow
+# --------------------------------------------------------------------------- #
+# MEASURED (isolated codex rollout .../2026/10/07/rollout-...-01a11461..., the
+# ~504K Build-page incident): on a SERVED turn codex auto-compacts from the
+# usage the hub reports. One turn reported last_token_usage.input_tokens=610042
+# against a believed window of 258400, codex emitted a `context_compacted`
+# event, and the very next turn dropped to 13821 and the session carried on.
+# PROVEN: codex honours model_context_window from its config (258400 here -- the
+# hub's resync value at the time, since risen to 400000) and triggers its OWN
+# auto-compaction off the reported usage at the turn boundary.
+#
+# INFERRED (the hours-long retry loop itself; those hub.log lines have rotated
+# away and could not be re-measured): when the conversation outgrows every
+# model, the hub answers with the native context error or a 503 -- a FAILED
+# turn, which carries NO usage report -- so codex's compaction never fires from
+# it and codex just retries the same oversized turn. Supporting evidence: NO
+# codex rollout on this machine ever received a context_length_exceeded, and the
+# only recovery observed was through a served turn's reported usage, not an
+# error.
+#
+# So when a proven-auto-compact CLI is about to get the native overflow reply,
+# this guard instead returns a SHORT SUCCESSFUL reply whose reported usage is
+# at/over that CLI's own auto-compaction threshold, so the CLI compacts on its
+# NEXT turn (codex's PROVEN trigger) rather than retrying an error. It fires at
+# most once per conversation per _CG_FIRE_TTL; a second overflow inside that
+# window -- the CLI did not compact, or compaction did not shrink it enough --
+# falls back to today's native error + /compact hint, so it can NEVER loop. A
+# CLI's own compaction request never reaches here (the front door excludes it,
+# and a compaction request is small enough to fit anyway). Hooked in the two
+# overflow entry points (_front_door_overflow, _ctx_overflow_reply), NOT in
+# _native_overflow_reply, so a direct native reply (the compact-hint path) is
+# unchanged. Flag context_grow_guard (default on); off = the native reply,
+# byte-identical to before. Covered by tests/test_context_grow_guard.py.
+_CG_AUTOCOMPACT_CLIS = {"codex"}     # the one proven here to compact on reported usage
+_CG_FIRE_TTL = 300.0
+_CG_MAX = 512
+_CG_REPORT_MARGIN = 8192
+_CG_REPORT_DEFAULT = 400000
+_CG_MESSAGE = ("This conversation is too long for the available models; the hub is "
+               "compacting it now -- please send your message again.")
+_CG_FIRED = {}
+_CG_LOCK = threading.Lock()
+
+
+def _cg_conv_key(cli):
+    """A stable key for the conversation this overflow belongs to: the /agent
+    session id when present (the Build page), else the CLI name. Never raises."""
+    try:
+        sid = _build_sid()
+        if sid:
+            return "sid:" + str(sid)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return "ua:" + (cli or "?")
+
+
+def _cg_report_floor(cli):
+    """The usage figure to report must clear the CLI's own auto-compaction
+    threshold. For codex that is model_auto_compact_token_limit (the hub writes
+    declared_compact_limit); a margin guarantees the threshold is crossed even
+    when the request only just overflowed a small fleet. Never raises."""
+    try:
+        if cli == "codex":
+            lim = int(agentic_chat.declared_compact_limit("auto", cli="codex") or 0)
+            if lim > 0:
+                return lim + _CG_REPORT_MARGIN
+    except Exception:                                            # noqa: BLE001
+        pass
+    return _CG_REPORT_DEFAULT
+
+
+def _cg_success_reply(kind, stream, report, model_label):
+    """A short SUCCESSFUL reply in `kind` (openai | responses | anthropic) whose
+    reported prompt/input tokens are `report`, with no model call. Mirrors
+    _orch_command_response's per-protocol shaping (both are hub-authored, no-
+    model-call replies). Returns a Flask response/tuple, or None on a build
+    failure so the caller falls back to the native error. Never raises."""
+    try:
+        data = _hub_text_completion(_CG_MESSAGE, model_label)
+        data["usage"] = {"prompt_tokens": int(report), "completion_tokens": 0,
+                         "total_tokens": int(report)}
+        hdrs = {"X-Free-LLM-Hub-Provider": "hub",
+                "X-Free-LLM-Hub-Model": "context-grow-guard"}
+        try:
+            _act_pick("hub", "context-grow-guard")
+        except Exception:                                        # noqa: BLE001
+            pass
+        if kind == "responses":
+            if not stream:
+                return jsonify(_chat_to_responses(data, model_label)), 200, hdrs
+            return Response(stream_with_context(_responses_stream(
+                _ReplayUpstream(_swarm_sse_lines(data)), model_label,
+                prompt_est=int(report))),
+                mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
+        if kind == "anthropic":
+            if not stream:
+                return jsonify(_openai_resp_to_anthropic(data, model_label)), 200, hdrs
+            return Response(stream_with_context(_anthropic_stream(
+                _ReplayUpstream(_swarm_sse_lines(data)), model_label, int(report))),
+                mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
+        if not stream:
+            return jsonify(data), 200, hdrs
+
+        def _one_shot():
+            for chunk in _swarm_stream_chunks(data):
+                yield "data: %s\n\n" % json.dumps(chunk)
+            usage_line = _swarm_usage_line(data)
+            if usage_line is not None:
+                yield usage_line.decode("utf-8") + "\n\n"
+            yield "data: [DONE]\n\n"
+        return Response(stream_with_context(_one_shot()),
+                        mimetype="text/event-stream", headers=dict(_SSE_HEADERS, **hdrs))
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _cg_grow_guard(kind, stream, orig, window, model_label):
+    """When a proven-auto-compact CLI (codex) is about to get the native
+    overflow reply, return a successful reply that makes it compact on its next
+    turn instead (see the block comment). Else None -> the native reply. Fires
+    once per conversation per _CG_FIRE_TTL; a repeat inside the window falls
+    back to the native error, so it can never loop. Never raises."""
+    try:
+        if not config.get_flag("context_grow_guard", True):
+            return None
+        cli = _ch_overflow_client()
+        if cli not in _CG_AUTOCOMPACT_CLIS:
+            return None
+        key = _cg_conv_key(cli)
+        now = time.time()
+        with _CG_LOCK:
+            last = _CG_FIRED.get(key)
+            if last is not None and now - last < _CG_FIRE_TTL:
+                _log.info("[ctx] grow-guard: %s already asked to compact for %s -- "
+                          "native context error (no loop)", cli, key)
+                return None
+            _CG_FIRED[key] = now          # reserve the slot before a slow build
+            if len(_CG_FIRED) > _CG_MAX:
+                for k in [k for k, t in list(_CG_FIRED.items()) if now - t >= _CG_FIRE_TTL]:
+                    _CG_FIRED.pop(k, None)
+        report = max(int(orig or 0), _cg_report_floor(cli))
+        reply = _cg_success_reply(kind, stream, report, model_label)
+        if reply is None:
+            with _CG_LOCK:
+                _CG_FIRED.pop(key, None)        # build failed; let native run and re-arm
+            return None
+        _log.info("[ctx] grow-guard: %s conversation %s too long (~%d tokens, largest "
+                  "window %d) -- returning a successful reply reporting %d tokens so it "
+                  "auto-compacts next turn", cli, key, int(orig or 0), int(window or 0),
+                  report)
+        return reply
+    except Exception:                                            # noqa: BLE001
+        return None
 
 
 def _native_overflow_reply(kind, stream, orig, window, model_label, hdrs):
@@ -13219,6 +13378,9 @@ def _front_door_overflow(kind, messages, tools, est, stream=False, model_label="
                   "largest window any alive model could hold (%d, %d candidates): answering "
                   "with the native context-length error before any hop",
                   kind, est, fit, bound, n)
+        guarded = _cg_grow_guard(kind, stream, est, bound, model_label)
+        if guarded is not None:
+            return guarded
         return _native_overflow_reply(kind, stream, est, bound, model_label,
                                       {"X-Free-LLM-Hub-Last-Error": "context"})
     except Exception:                                            # noqa: BLE001
