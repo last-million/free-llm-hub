@@ -1238,7 +1238,10 @@ def test_a_worker_that_keeps_producing_output_is_not_timed_out(monkeypatch):
 
 def test_a_worker_that_goes_silent_is_given_up_on_and_stopped(monkeypatch):
     monkeypatch.setattr(SW, "AGENT_TIMEOUT", 3600.0)
-    monkeypatch.setattr(SW, "AGENT_IDLE_TIMEOUT", 0.4)
+    # 1.5 s, not 0.4 s: under a loaded parallel suite the idle limit could run
+    # out before the worker's session existed, so there was nothing to stop
+    # yet (failed twice 2026-10-11). Production's limit is 900 s.
+    monkeypatch.setattr(SW, "AGENT_IDLE_TIMEOUT", 1.5)
     stopped = []
     release = threading.Event()
 
