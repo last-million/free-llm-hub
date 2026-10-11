@@ -3054,6 +3054,52 @@
   .gh-findings ul{ margin:0; padding-left:18px; display:flex; flex-direction:column; gap:3px;
     font-family:var(--mono); font-size:12.5px; color:var(--text); }
   .gh-findings .btn{ align-self:flex-start; }
+  /* github-ui (2026-10-11): one-click connect, existing repos, visibility,
+     unlink. Token-only like the rest of this block. */
+  .github-dialog a.btn{ color:var(--text); text-decoration:none; }
+  .github-dialog a.btn.primary{ color:var(--on-accent); }
+  .gh-device, .gh-device > div{ display:flex; flex-direction:column; gap:10px; }
+  .gh-code{ margin:0; padding:12px 14px; border:1px solid var(--border); border-radius:var(--radius-sm);
+    background:var(--bg-inset); color:var(--text); text-align:center;
+    font-family:var(--mono); font-size:28px; font-weight:700; line-height:1.2;
+    letter-spacing:.22em; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; user-select:all; }
+  .gh-code:empty{ display:none; }
+  .gh-wait{ color:var(--text); font-weight:600; }
+  .gh-device-time{ font-family:var(--mono); font-weight:700; font-variant-numeric:tabular-nums; color:var(--text); }
+  .gh-details{ border-top:1px solid var(--border-soft); padding-top:4px; }
+  .gh-details > summary{ display:flex; align-items:center; min-height:var(--pub-tap); cursor:pointer;
+    font-size:13.5px; font-weight:600; color:var(--text-dim); }
+  .gh-details > summary:hover{ color:var(--text); }
+  .gh-details > summary:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
+  .gh-details-body{ display:flex; flex-direction:column; gap:12px; padding-top:4px; }
+  .gh-clientid{ display:flex; flex-direction:column; gap:8px; padding:10px 12px;
+    border:1px solid var(--border-soft); border-radius:var(--radius-sm); background:var(--surface); }
+  .gh-inline{ display:flex; flex-wrap:wrap; gap:8px; align-items:stretch; }
+  .gh-inline .gh-input{ flex:1 1 200px; width:auto; }
+  .gh-inline .btn{ flex:none; }
+  .github-dialog .gh-input.gh-plain{ font-family:inherit; }
+  .gh-opt{ font-weight:400; }
+  .gh-mode{ display:flex; flex-wrap:wrap; gap:4px 20px; margin:0 0 12px; padding:6px 12px;
+    border:1px solid var(--border-soft); border-radius:var(--radius-sm); }
+  .gh-mode legend{ padding:0 4px; font-size:13px; font-weight:600; color:var(--text-dim); }
+  .gh-mode-opt{ flex:1 1 180px; }
+  .gh-panel{ display:flex; flex-direction:column; gap:12px; }
+  .gh-panel > .btn{ align-self:flex-start; }
+  .gh-repo-list{ margin:0; padding:0 12px; max-height:280px; overflow:auto; overscroll-behavior:contain;
+    border:1px solid var(--border-soft); border-radius:var(--radius-sm); }
+  .gh-repo-row{ align-items:center; border-bottom:1px solid var(--border-soft); padding:8px 0; }
+  .gh-repo-row:last-child{ border-bottom:0; }
+  .gh-repo-main{ display:flex; flex-wrap:wrap; align-items:center; gap:4px 8px; min-width:0; }
+  .gh-repo-name{ font-family:var(--mono); font-size:13px; font-weight:600; color:var(--text); overflow-wrap:anywhere; }
+  .gh-repo-desc{ flex-basis:100%; font-size:12.5px; color:var(--text-dim); overflow-wrap:anywhere; }
+  .gh-chip.is-empty{ font-weight:600; }
+  .gh-overwrite .publish-consent, .gh-public-confirm .publish-consent{ padding:0; min-height:0; }
+  .gh-confirm-body{ display:flex; flex-direction:column; gap:10px; min-width:0; }
+  .gh-manage{ margin-top:2px; }
+  @media (max-width:640px){
+    .gh-code{ font-size:24px; letter-spacing:.16em; }
+    .gh-inline .btn, .gh-manage .btn{ flex:1 1 auto; }
+  }
   /* github-css:end */
   /* What is currently open, and what it costs. */
   .runpanel{ position:fixed; inset:0; z-index:400; display:grid; place-items:center;
@@ -4066,8 +4112,9 @@
                    Publish (moved under <body>, showModal, Esc/backdrop/X close,
                    the title takes focus). It reuses the .publish-dialog layout
                    and theme tokens; only backend strings go in, via textContent.
-                   Three states: no token -> connect; connected, no repo ->
-                   create; linked -> push/sync. -->
+                   Three states: not connected -> Connect with GitHub (device
+                   code) or a pasted token; connected, no repo -> a new or an
+                   existing repository; linked -> push/sync, visibility, unlink. -->
               <dialog class="publish-dialog github-dialog" id="github-dialog" aria-labelledby="github-title" aria-describedby="github-sub">
                 <div class="pub-dlg-head">
                   <h2 class="publish-title" id="github-title" tabindex="-1">Push to GitHub</h2>
@@ -4078,21 +4125,63 @@
                 <div class="pub-dlg-body" id="github-body">
                   <p class="publish-p" id="github-sub">Push this Build project to a repository on your own GitHub account.</p>
                   <p class="publish-err" id="github-error" role="alert" hidden></p>
+                  <p class="publish-err" id="github-refused" hidden></p>
 
-                  <!-- (a) no token -->
+                  <!-- (a) not connected: one-click connect (GitHub's device
+                       login: a short code typed on github.com), or a pasted
+                       token in the collapsed fallback below it. -->
                   <div id="github-connect" hidden>
                     <div class="publish-card">
                       <h3 class="publish-h">Connect your GitHub account</h3>
-                      <p class="publish-p">Create a token, then paste it below. The hub stores it encrypted and never shows it again.</p>
-                      <ol class="gh-steps">
-                        <li>Open <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">GitHub token settings (new tab)</a>.</li>
-                        <li>Give it access to the repositories you want to push.</li>
-                        <li>Permissions: <b>Contents</b> read/write, <b>Administration</b> read/write (to create repos), <b>Metadata</b> read. A classic token needs <b>repo</b>.</li>
-                      </ol>
-                      <div class="publish-field">
-                        <label for="github-token">GitHub token</label>
-                        <input type="password" id="github-token" class="gh-input" autocomplete="off" spellcheck="false" placeholder="github_pat_… or ghp_…">
+                      <p class="publish-p" id="github-connect-lead">Sign in on GitHub with a one-time code. The hub keeps the access encrypted and never shows it again.</p>
+
+                      <div class="gh-device" id="github-device" hidden>
+                        <div id="github-device-pending" hidden>
+                          <p class="publish-p">Enter this code at github.com/login/device:</p>
+                          <p class="gh-code" id="github-device-code" aria-live="polite"></p>
+                          <div class="publish-actions">
+                            <button class="btn" id="github-device-copy" type="button">Copy code</button>
+                            <a class="btn primary gh-open" id="github-device-open" href="#" target="_blank" rel="noopener noreferrer" hidden>Open GitHub</a>
+                          </div>
+                          <p class="publish-p gh-wait" id="github-device-wait">Waiting for you to approve on GitHub…</p>
+                          <p class="gh-meta" id="github-device-timer"><span>Code expires in </span><span class="gh-device-time" id="github-device-time" role="timer" aria-live="off"></span></p>
+                        </div>
+                        <div id="github-device-installing" hidden>
+                          <p class="publish-p gh-wait">Installing GitHub's official tool (gh)… this happens once.</p>
+                          <p class="gh-meta" id="github-device-progress" aria-live="off"></p>
+                        </div>
+                        <p class="publish-err" id="github-device-msg" hidden></p>
                       </div>
+
+                      <details class="gh-details" id="github-token-details">
+                        <summary id="github-token-summary">Or paste a token instead</summary>
+                        <div class="gh-details-body">
+                          <div class="gh-clientid" id="github-clientid-box" hidden>
+                            <p class="publish-p">One-click connect needs a GitHub app Client ID.</p>
+                            <div class="publish-field">
+                              <label for="github-client-id">GitHub app Client ID</label>
+                              <div class="gh-inline">
+                                <input type="text" id="github-client-id" class="gh-input" autocomplete="off" spellcheck="false" placeholder="Ov23li…">
+                                <button class="btn" id="github-client-save" type="button">Save</button>
+                              </div>
+                            </div>
+                            <p class="publish-err" id="github-client-err" role="alert" hidden></p>
+                          </div>
+                          <ol class="gh-steps">
+                            <li>Open <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">GitHub token settings (new tab)</a>.</li>
+                            <li>Give it access to the repositories you want to push.</li>
+                            <li>Permissions: <b>Contents</b> read/write, <b>Administration</b> read/write (to create repos), <b>Metadata</b> read. A classic token needs <b>repo</b>.</li>
+                          </ol>
+                          <div class="publish-field">
+                            <label for="github-token">GitHub token</label>
+                            <div class="gh-inline">
+                              <input type="password" id="github-token" class="gh-input" autocomplete="off" spellcheck="false" placeholder="github_pat_… or ghp_…">
+                              <button class="btn" id="github-save" type="button">Save token</button>
+                            </div>
+                          </div>
+                          <p class="publish-err" id="github-token-err" role="alert" hidden></p>
+                        </div>
+                      </details>
                     </div>
                   </div>
 
@@ -4103,21 +4192,53 @@
                     <button class="btn sm ghost" id="github-disconnect" type="button">Disconnect GitHub</button>
                   </div>
 
-                  <!-- (b) connected, no repo -->
+                  <!-- (b) connected, no repo: a new repository, or one that exists -->
                   <div id="github-create" hidden>
-                    <div class="publish-field">
-                      <label for="github-name">Repository name</label>
-                      <input type="text" id="github-name" class="gh-input" autocomplete="off" spellcheck="false">
-                    </div>
-                    <fieldset class="gh-vis">
-                      <legend>Who can see it</legend>
-                      <label class="gh-radio"><input type="radio" name="github-vis" id="github-vis-private" value="private" checked><span><b>Private</b> — only you (recommended)</span></label>
-                      <label class="gh-radio"><input type="radio" name="github-vis" id="github-vis-public" value="public"><span><b>Public</b> — anyone on the internet</span></label>
+                    <fieldset class="gh-mode" id="github-mode">
+                      <legend>Push to</legend>
+                      <label class="gh-radio gh-mode-opt"><input type="radio" name="github-mode" id="github-mode-new" value="new" checked><span><b>New repository</b></span></label>
+                      <label class="gh-radio gh-mode-opt"><input type="radio" name="github-mode" id="github-mode-existing" value="existing"><span><b>Existing repository</b></span></label>
                     </fieldset>
-                    <label class="publish-consent" for="github-public-ok" id="github-public-row" hidden>
-                      <input type="checkbox" id="github-public-ok">
-                      <span>I understand anyone on the internet can see this code</span>
-                    </label>
+
+                    <div class="gh-panel" id="github-new">
+                      <div class="publish-field">
+                        <label for="github-name">Repository name</label>
+                        <input type="text" id="github-name" class="gh-input" autocomplete="off" spellcheck="false">
+                      </div>
+                      <div class="publish-field">
+                        <label for="github-desc">Description <span class="gh-opt">(optional)</span></label>
+                        <input type="text" id="github-desc" class="gh-input gh-plain" autocomplete="off" maxlength="350">
+                      </div>
+                      <fieldset class="gh-vis">
+                        <legend>Who can see it</legend>
+                        <label class="gh-radio"><input type="radio" name="github-vis" id="github-vis-private" value="private" checked><span><b>Private</b> — only you (recommended)</span></label>
+                        <label class="gh-radio"><input type="radio" name="github-vis" id="github-vis-public" value="public"><span><b>Public</b> — anyone on the internet</span></label>
+                      </fieldset>
+                      <label class="publish-consent" for="github-public-ok" id="github-public-row" hidden>
+                        <input type="checkbox" id="github-public-ok">
+                        <span>Anyone on the internet can see this code</span>
+                      </label>
+                    </div>
+
+                    <div class="gh-panel" id="github-existing" hidden>
+                      <p class="publish-p" id="github-repos-status" role="status"></p>
+                      <button class="btn sm" id="github-repos-retry" type="button" hidden>Try again</button>
+                      <div class="publish-field" id="github-repo-filter-row" hidden>
+                        <label for="github-repo-filter">Filter repositories</label>
+                        <input type="search" id="github-repo-filter" class="gh-input gh-plain" autocomplete="off" spellcheck="false">
+                      </div>
+                      <fieldset class="gh-repo-list" id="github-repo-list" hidden>
+                        <legend class="pub-sr">Your repositories</legend>
+                        <div id="github-repo-rows"></div>
+                      </fieldset>
+                      <div class="publish-warn gh-overwrite" id="github-overwrite-row" hidden>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m10.3 3.9-8.2 14A2 2 0 0 0 3.8 21h16.4a2 2 0 0 0 1.7-3.1l-8.2-14a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+                        <label class="publish-consent" for="github-overwrite-ok">
+                          <input type="checkbox" id="github-overwrite-ok">
+                          <span>This repository already has files. Pushing will make its latest version match this project (older versions stay in the history).</span>
+                        </label>
+                      </div>
+                    </div>
                   </div>
 
                   <!-- (c) linked -->
@@ -4129,6 +4250,25 @@
                         <span class="gh-meta" id="github-pushed"></span>
                         <span class="gh-meta" id="github-counts"></span>
                       </div>
+                      <div class="publish-actions gh-manage" id="github-manage">
+                        <button class="btn sm ghost" id="github-make-private" type="button" hidden>Make private</button>
+                        <button class="btn sm ghost" id="github-make-public" type="button" hidden>Make public</button>
+                        <button class="btn sm ghost" id="github-unlink" type="button">Unlink this project</button>
+                      </div>
+                      <div class="publish-warn gh-public-confirm" id="github-public-confirm" hidden>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m10.3 3.9-8.2 14A2 2 0 0 0 3.8 21h16.4a2 2 0 0 0 1.7-3.1l-8.2-14a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+                        <div class="gh-confirm-body">
+                          <label class="publish-consent" for="github-make-public-ok">
+                            <input type="checkbox" id="github-make-public-ok">
+                            <span>Anyone on the internet can see this code</span>
+                          </label>
+                          <div class="publish-actions">
+                            <button class="btn sm" id="github-make-public-no" type="button">Keep it private</button>
+                            <button class="btn sm primary" id="github-make-public-yes" type="button">Make public</button>
+                          </div>
+                        </div>
+                      </div>
+                      <p class="publish-err" id="github-manage-err" role="alert" hidden></p>
                     </div>
                     <div class="publish-card gh-preview">
                       <h3 class="publish-h">What will be pushed</h3>
@@ -4146,17 +4286,28 @@
                   </div>
                 </div>
                 <div class="pub-dlg-foot" id="github-foot">
+                  <p class="publish-err" id="github-foot-err" role="alert" hidden></p>
                   <div class="publish-row" id="github-foot-connect" hidden>
                     <span class="publish-why" id="github-connect-why"></span>
-                    <button class="btn primary" id="github-save" type="button">Save token</button>
+                    <button class="btn" id="github-device-cancel" type="button" hidden>Cancel</button>
+                    <button class="btn primary" id="github-device-retry" type="button" hidden>Try again</button>
+                    <button class="btn primary" id="github-connect-btn" type="button" hidden>Connect with GitHub</button>
                   </div>
                   <div class="publish-row" id="github-foot-create" hidden>
                     <span class="publish-why" id="github-create-why"></span>
                     <button class="btn primary" id="github-create-btn" type="button">Create &amp; push</button>
+                    <button class="btn primary" id="github-link-btn" type="button" hidden>Link &amp; push</button>
                   </div>
                   <div class="publish-row" id="github-foot-linked" hidden>
                     <button class="btn" id="github-sync" type="button">Sync</button>
                     <button class="btn primary" id="github-push" type="button">Push</button>
+                  </div>
+                  <div class="publish-confirm" id="github-unlink-confirm" hidden>
+                    <p id="github-unlink-text"></p>
+                    <div class="publish-row">
+                      <button class="btn" id="github-unlink-no" type="button">Keep the link</button>
+                      <button class="btn danger" id="github-unlink-yes" type="button">Unlink</button>
+                    </div>
                   </div>
                 </div>
                 <span class="pub-sr" id="github-say" role="status" aria-live="polite"></span>
@@ -11864,14 +12015,23 @@
 
     /* github-js:start */
     /* ── Push to GitHub ──────────────────────────────────────────────────────
-       The backend is eight routes; this is their UI. Three states:
-         not connected -> connect (paste a token, saved encrypted server-side);
-         connected, no repo -> create (name + private/public, Create & push);
-         linked -> Push / Sync, with a preview of what would be committed and
-         the secret findings that would block a push.
+       The UI of the /api/github* routes. States:
+         not connected -> "Connect with GitHub" (GitHub's device login: the hub
+           asks for a one-time code, the owner types it on github.com, this
+           dialog polls until GitHub says yes); a pasted token stays as the
+           collapsed fallback;
+         connected, no repo -> a NEW repository (name, description, private
+           by default, public only with a tick) or an EXISTING one of the
+           owner's (a non-empty one only with the overwrite tick);
+         linked -> Push / Sync, Make private / Make public (public with the
+           tick), Unlink (a confirm step in the dialog), the preview of what
+           would be committed and the secret findings that block a push.
        Backend strings go in with textContent only; a repo link is only ever a
-       safe https:// URL. The dialog is the same native <dialog> pattern as
-       Publish (moved under <body>, showModal, Esc/backdrop/X close). */
+       safe https:// URL and the device link only ever GitHub's own device
+       page. The device state is polled every 3 s ONLY while a login is
+       pending (or the gh tool installing) AND the dialog is open. The dialog
+       is the same native <dialog> pattern as Publish (moved under <body>,
+       showModal, Esc/backdrop/X close). */
     var github = (function(){
       var GH_ERRORS = {
         bad_token: 'GitHub did not accept that token. Check it has not expired and has the right permissions.',
@@ -11892,12 +12052,35 @@
         git_too_old: 'GitHub push needs a newer git. Update git, then try again.',
         scan_failed: 'The secret check could not finish, so nothing was pushed. Try again.',
         network: 'Could not reach GitHub. Check your connection and try again.',
-        disabled: 'GitHub push is switched off in this hub.'
+        disabled: 'GitHub push is switched off in this hub.',
+        bad_client_id: 'That does not look like a GitHub app Client ID.',
+        no_client_id: 'One-click connect needs a GitHub app Client ID. Add it below, or paste a token instead.',
+        github_error: 'GitHub did not answer as expected. Try again in a moment.',
+        needs_overwrite_ok: 'This repository already has files. Tick the box to make its latest version match this project.',
+        repo_not_owned: 'That repository belongs to another account. Pick one of your own.',
+        no_push_permission: 'This account cannot push to that repository.',
+        not_found: 'That repository was not found on GitHub. Reload the list and pick again.',
+        public_ok_required: 'Tick the box to confirm anyone on the internet can see this code.'
       };
-      function ghErr(code, msg){ return GH_ERRORS[code] || msg || 'Something went wrong.'; }
+      var GH_DEVICE_URL = 'https://github.com/login/device';
+      var DEVICE_STATES = ['idle', 'pending', 'installing', 'connected', 'expired', 'denied', 'error'];
+      function has(o, k){ return Object.prototype.hasOwnProperty.call(o, k); }
+      function ghErr(code, msg){ return (code && has(GH_ERRORS, code) ? GH_ERRORS[code] : '') || msg || 'Something went wrong.'; }
+      function codeOf(err){ var b = err && err.body; return (b && typeof b.code === 'string') ? b.code : ''; }
+      /* The server's own sentence first; the plain words for its code when it
+         sent none; a generic line last (never "400 BAD REQUEST"). */
+      function errText(err, fallback){
+        var b = (err && err.body) || {};
+        if (typeof b.error === 'string' && b.error.trim()) return b.error.trim();
+        var code = codeOf(err);
+        if (code && has(GH_ERRORS, code)) return GH_ERRORS[code];
+        return fallback || 'Something went wrong. Try again.';
+      }
       function ghSafeUrl(u){
         return (typeof u === 'string' && /^https:\/\/[^\s"'<>]+$/.test(u)) ? u : '';
       }
+      /* The device link is GitHub's device page and nothing else. */
+      function ghDeviceUrl(u){ return u === GH_DEVICE_URL ? u : ''; }
       function baseName(d){
         var parts = String(d || '').split(/[\\/]/).filter(Boolean);
         return parts.length ? parts[parts.length - 1] : '';
@@ -11916,29 +12099,72 @@
         if (b) bits.push(b + ' on GitHub not here');
         return bits.join(' · ');
       }
+      function fmtClock(s){
+        s = Math.max(0, Math.floor(s || 0));
+        var m = Math.floor(s / 60), r = s % 60;
+        return m + ':' + (r < 10 ? '0' : '') + r;
+      }
+      function progressText(p, secs){
+        if (typeof p === 'number' && isFinite(p)){
+          var pct = Math.round(p <= 1 ? p * 100 : p);
+          return 'Downloading… ' + Math.max(0, Math.min(100, pct)) + '%';
+        }
+        if (typeof p === 'string' && p.trim()) return p.trim().slice(0, 200);
+        return 'Working… ' + fmtClock(secs) + ' so far';
+      }
 
       var btn = $('#preview-github');
       var dlg = $('#github-dialog'), titleEl = $('#github-title'), closeBtn = $('#github-close');
       var sayIn = $('#github-say');
-      var errEl = $('#github-error'), subEl = $('#github-sub');
-      var connectBox = $('#github-connect'), tokenInput = $('#github-token');
+      var errEl = $('#github-error'), subEl = $('#github-sub'), refusedEl = $('#github-refused');
+      var footErr = $('#github-foot-err'), tokenErr = $('#github-token-err');
+      var clientErr = $('#github-client-err'), manageErr = $('#github-manage-err');
+      var connectBox = $('#github-connect'), connectLead = $('#github-connect-lead');
+      var deviceBox = $('#github-device'), devPendingBox = $('#github-device-pending');
+      var devCode = $('#github-device-code'), devCopy = $('#github-device-copy'), devOpen = $('#github-device-open');
+      var devTimerRow = $('#github-device-timer'), devTime = $('#github-device-time');
+      var devInstalling = $('#github-device-installing'), devProgress = $('#github-device-progress');
+      var devMsg = $('#github-device-msg');
+      var tokenDetails = $('#github-token-details'), tokenInput = $('#github-token'), saveBtn = $('#github-save');
+      var clientBox = $('#github-clientid-box'), clientInput = $('#github-client-id'), clientSave = $('#github-client-save');
       var accountBox = $('#github-account'), loginEl = $('#github-login'), hintEl = $('#github-hint');
       var disconnectBtn = $('#github-disconnect');
-      var createBox = $('#github-create'), nameInput = $('#github-name');
+      var createBox = $('#github-create'), modeNew = $('#github-mode-new'), modeExisting = $('#github-mode-existing');
+      var newPanel = $('#github-new'), nameInput = $('#github-name'), descInput = $('#github-desc');
       var visPrivate = $('#github-vis-private'), visPublic = $('#github-vis-public');
       var publicRow = $('#github-public-row'), publicOk = $('#github-public-ok');
+      var existingPanel = $('#github-existing'), reposStatus = $('#github-repos-status'), reposRetry = $('#github-repos-retry');
+      var filterRow = $('#github-repo-filter-row'), filterInput = $('#github-repo-filter');
+      var repoList = $('#github-repo-list'), rowsEl = $('#github-repo-rows');
+      var overwriteRow = $('#github-overwrite-row'), overwriteOk = $('#github-overwrite-ok');
       var linkedBox = $('#github-linked'), repoUrl = $('#github-repo-url');
       var visChip = $('#github-visibility'), pushedEl = $('#github-pushed'), countsEl = $('#github-counts');
+      var makePrivateBtn = $('#github-make-private'), makePublicBtn = $('#github-make-public'), unlinkBtn = $('#github-unlink');
+      var publicConfirm = $('#github-public-confirm'), makePublicOk = $('#github-make-public-ok');
+      var makePublicNo = $('#github-make-public-no'), makePublicYes = $('#github-make-public-yes');
       var prevSummary = $('#github-preview-summary'), filesEl = $('#github-files');
       var findingsBox = $('#github-findings'), findingsList = $('#github-findings-list'), gitignoreBtn = $('#github-gitignore');
-      var fConnect = $('#github-foot-connect'), connectWhy = $('#github-connect-why'), saveBtn = $('#github-save');
-      var fCreate = $('#github-foot-create'), createWhy = $('#github-create-why'), createBtn = $('#github-create-btn');
+      var fConnect = $('#github-foot-connect'), connectWhy = $('#github-connect-why'), connectBtn = $('#github-connect-btn');
+      var cancelBtn = $('#github-device-cancel'), retryBtn = $('#github-device-retry');
+      var fCreate = $('#github-foot-create'), createWhy = $('#github-create-why');
+      var createBtn = $('#github-create-btn'), linkBtn = $('#github-link-btn');
       var fLinked = $('#github-foot-linked'), pushBtn = $('#github-push'), syncBtn = $('#github-sync');
+      var unlinkBox = $('#github-unlink-confirm'), unlinkText = $('#github-unlink-text');
+      var unlinkNo = $('#github-unlink-no'), unlinkYes = $('#github-unlink-yes');
       if (dlg.parentNode !== document.body) document.body.appendChild(dlg);
 
-      var dir = null, isOpen = false, seq = 0, busy = false;
+      var dir = null, isOpen = false, seq = 0, busy = '';
       var data = null, offText = '', namePrefilled = false;
       var preview = null, lastFindings = [];
+      /* device login */
+      var device = { state: 'idle' }, devSeq = 0, devLeft = null, devAnchor = 0, installStart = null;
+      var devPoll = null, devTick = null, devPolling = false, devFails = 0, copyBusy = false;
+      var clientIdNeeded = false, detailsAutoOpened = false;
+      /* existing repositories */
+      var mode = 'new', repos = [], reposState = '', reposErr = '', reposSeq = 0;
+      var picked = null, needOverwrite = {}, repoInputs = {};
+      /* confirm steps */
+      var askPublic = false, askUnlink = false;
 
       function setText(el, t){ if (el && el.textContent !== t) el.textContent = t; }
       function setHidden(el, h){ if (el && el.hidden !== !!h) el.hidden = !!h; }
@@ -11947,17 +12173,30 @@
         sayIn.textContent = '';
         setTimeout(function(){ sayIn.textContent = msg; }, 40);
       }
-      function showErr(t){ setText(errEl, t || ''); setHidden(errEl, !t); }
+      function showErrIn(el, t){ setText(el, t || ''); setHidden(el, !t); }
+      function showErr(t){ showErrIn(errEl, t); }
+      function clearErrs(){ [errEl, footErr, tokenErr, clientErr, manageErr].forEach(function(el){ showErrIn(el, ''); }); }
+      function now(){ return performance.now(); }
 
       function stateOf(){
         if (offText) return 'off';
         if (!data) return 'loading';
         if (!data.connected) return 'connect';
         var p = data.project || {};
+        if (p.refused) return 'refused';
         if (p.repo && p.has_remote) return 'linked';
         return 'create';
       }
+      function oauthOn(){ return !!(data && data.oauth_available); }
+      function devActive(){ return device.state === 'pending' || device.state === 'installing'; }
+      function devEnded(){ return device.state === 'expired' || device.state === 'denied' || device.state === 'error'; }
+      function devLeftNow(){
+        if (devLeft == null) return null;
+        return Math.max(0, Math.ceil(devLeft - (now() - devAnchor) / 1000));
+      }
 
+      /* A control that disappears while focused hands focus to the title,
+         never out of the dialog. */
       function keepFocus(){
         if (!isOpen) return;
         var a = document.activeElement;
@@ -11975,63 +12214,224 @@
         var connected = !!(data && data.connected);
         setHidden(accountBox, !connected || s === 'off');
         if (connected){
-          setText(loginEl, (data.login || '') + '');
+          setText(loginEl, String(data.login || ''));
           setText(hintEl, data.masked_hint ? '(' + data.masked_hint + ')' : '');
         }
+        var refused = s === 'refused' ? String((data.project || {}).refused || ghErr('refused')) : '';
+        setText(refusedEl, refused); setHidden(refusedEl, !refused);
 
         setHidden(connectBox, s !== 'connect');
         setHidden(createBox, s !== 'create');
         setHidden(linkedBox, s !== 'linked');
-
-        /* create state */
-        if (s === 'create'){
-          if (!namePrefilled && !nameInput.value){ nameInput.value = baseName(dir); namePrefilled = true; }
-          var pub = visPublic.checked;
-          setHidden(publicRow, !pub);
-        }
-
-        /* linked state */
-        if (s === 'linked'){
-          var p = data.project || {}, repo = p.repo || {};
-          var u = ghSafeUrl(repo.html_url);
-          if (repoUrl.getAttribute('href') !== (u || '#')) repoUrl.setAttribute('href', u || '#');
-          setText(repoUrl, repo.full_name || u || '');
-          var priv = repo.private !== false;
-          setText(visChip, priv ? 'Private' : 'Public');
-          visChip.classList.toggle('is-private', priv);
-          visChip.classList.toggle('is-public', !priv);
-          setText(pushedEl, pushedText(p.last_pushed));
-          setText(countsEl, countsText(p));
-          renderPreview();
-        }
+        if (s === 'connect') renderConnect();
+        if (s === 'create') renderCreate();
+        if (s === 'linked') renderLinked();
 
         /* footers */
-        setHidden(fConnect, s !== 'connect');
+        setHidden(fConnect, s !== 'connect' || !((oauthOn() && device.state === 'idle') || devActive() || devEnded()));
         setHidden(fCreate, s !== 'create');
-        setHidden(fLinked, s !== 'linked');
-        if (s === 'connect'){
-          saveBtn.disabled = busy || !tokenInput.value.trim();
-          setText(saveBtn, busy ? 'Checking…' : 'Save token');
-          setText(connectWhy, busy ? '' : (tokenInput.value.trim() ? '' : 'Paste a token to continue.'));
-        }
-        if (s === 'create'){
-          var needTick = visPublic.checked && !publicOk.checked;
-          createBtn.disabled = busy || !nameInput.value.trim() || needTick;
-          setText(createBtn, busy ? 'Creating…' : 'Create & push');
-          setText(createWhy, busy ? '' : needTick ? 'Tick the box to make it public.'
-                  : !nameInput.value.trim() ? 'Name the repository.' : '');
-        }
-        if (s === 'linked'){
-          var blocked = !!(lastFindings && lastFindings.length);
-          pushBtn.disabled = busy || blocked;
-          setText(pushBtn, busy ? 'Pushing…' : 'Push');
-          syncBtn.disabled = busy;
-          setText(syncBtn, busy ? 'Working…' : 'Sync');
-        }
+        setHidden(fLinked, s !== 'linked' || askUnlink);
+        setHidden(unlinkBox, s !== 'linked' || !askUnlink);
         renderFindings();
-        gitignoreBtn.disabled = busy;
-        disconnectBtn.disabled = busy;
+        gitignoreBtn.disabled = !!busy;
+        setText(gitignoreBtn, busy === 'gitignore' ? 'Adding…' : 'Add these to .gitignore');
+        disconnectBtn.disabled = !!busy;
+        setText(disconnectBtn, busy === 'disconnect' ? 'Disconnecting…' : 'Disconnect GitHub');
         keepFocus();
+      }
+
+      function renderConnect(){
+        var st = device.state, b = !!busy, oauth = oauthOn();
+        setText(connectLead, oauth
+          ? 'Sign in on GitHub with a one-time code. The hub keeps the access encrypted and never shows it again.'
+          : 'Paste a GitHub token below. The hub stores it encrypted and never shows it again.');
+        setHidden(deviceBox, !(devActive() || devEnded()));
+        setHidden(devPendingBox, st !== 'pending');
+        setHidden(devInstalling, st !== 'installing');
+        var msg = st === 'expired' ? 'The code expired before it was approved on GitHub.'
+                : st === 'denied' ? 'The sign-in was declined on GitHub.'
+                : st === 'error' ? (device.error || 'Something went wrong while connecting to GitHub.')
+                : '';
+        setText(devMsg, msg); setHidden(devMsg, !msg);
+        if (st === 'pending'){
+          setText(devCode, String(device.user_code || ''));
+          var u = ghDeviceUrl(device.verification_uri);
+          setHidden(devOpen, !u);
+          if (devOpen.getAttribute('href') !== (u || '#')) devOpen.setAttribute('href', u || '#');
+          var left = devLeftNow();
+          setHidden(devTimerRow, left == null);
+          setText(devTime, left == null ? '' : fmtClock(left));
+          devCopy.disabled = !device.user_code;
+        } else {
+          setText(devCode, '');
+          setHidden(devOpen, true);
+          if (devOpen.getAttribute('href') !== '#') devOpen.setAttribute('href', '#');
+        }
+        if (st === 'installing'){
+          setText(devProgress, progressText(device.progress,
+                  installStart == null ? 0 : (now() - installStart) / 1000));
+        }
+        /* The Client ID field appears only when GitHub's app id is what is
+           missing (device/start said no_client_id). */
+        setHidden(clientBox, !clientIdNeeded);
+        if (!oauth && !detailsAutoOpened){ detailsAutoOpened = true; tokenDetails.open = true; }
+        clientSave.disabled = b || !clientInput.value.trim();
+        setText(clientSave, busy === 'client' ? 'Saving…' : 'Save');
+        saveBtn.disabled = b || !tokenInput.value.trim();
+        setText(saveBtn, busy === 'save' ? 'Checking…' : 'Save token');
+
+        setHidden(connectBtn, !(oauth && st === 'idle'));
+        connectBtn.disabled = b;
+        setText(connectBtn, (busy === 'connect' && st === 'idle') ? 'Starting…' : 'Connect with GitHub');
+        setHidden(cancelBtn, !devActive());
+        cancelBtn.disabled = b;
+        setText(cancelBtn, busy === 'cancel' ? 'Cancelling…' : 'Cancel');
+        setHidden(retryBtn, !devEnded());
+        retryBtn.disabled = b;
+        setText(retryBtn, (busy === 'connect' && devEnded()) ? 'Starting…' : 'Try again');
+        setText(connectWhy, busy === 'connect' ? 'Asking GitHub for a code…'
+                : st === 'installing' ? 'Cancel stops the install and the sign-in.' : '');
+      }
+
+      function pickedRepo(){
+        if (!picked) return null;
+        for (var i = 0; i < repos.length; i++) if (repos[i].name === picked) return repos[i];
+        return null;
+      }
+      /* Not marked empty = has files = the tick is required (the safe side). */
+      function overwriteNeeded(r){ return !!r && (r.empty !== true || needOverwrite[r.name] === true); }
+      function filtered(){
+        var q = (filterInput.value || '').trim().toLowerCase();
+        if (!q || repos.length <= 10) return repos;
+        return repos.filter(function(r){
+          return r.name.toLowerCase().indexOf(q) >= 0 || String(r.description || '').toLowerCase().indexOf(q) >= 0;
+        });
+      }
+
+      function renderCreate(){
+        var b = !!busy;
+        if (!namePrefilled && !nameInput.value){ nameInput.value = baseName(dir); namePrefilled = true; }
+        modeNew.checked = mode === 'new';
+        modeExisting.checked = mode === 'existing';
+        setHidden(newPanel, mode !== 'new');
+        setHidden(existingPanel, mode !== 'existing');
+        setHidden(publicRow, !visPublic.checked);
+        if (mode === 'existing') renderRepos();
+        setHidden(createBtn, mode !== 'new');
+        setHidden(linkBtn, mode !== 'existing');
+        if (mode === 'new'){
+          var needTick = visPublic.checked && !publicOk.checked;
+          createBtn.disabled = b || !nameInput.value.trim() || needTick;
+          setText(createBtn, busy === 'create' ? 'Creating…' : 'Create & push');
+          setText(createWhy, b ? '' : needTick ? 'Tick the box to make it public.'
+                  : !nameInput.value.trim() ? 'Name the repository.' : '');
+        } else {
+          var r = pickedRepo(), needOw = overwriteNeeded(r);
+          linkBtn.disabled = b || !r || (needOw && !overwriteOk.checked);
+          setText(linkBtn, busy === 'link' ? 'Linking…' : 'Link & push');
+          setText(createWhy, b ? '' : !r ? (reposState === 'ok' && repos.length ? 'Pick a repository.' : '')
+                  : (needOw && !overwriteOk.checked) ? 'Tick the box to replace what is there.' : '');
+        }
+      }
+
+      function renderRepos(){
+        var b = !!busy, st = reposState;
+        var list = st === 'ok' ? filtered() : [];
+        var said = st === 'loading' ? 'Loading your repositories…'
+                 : st === 'error' ? reposErr
+                 : (st === 'ok' && !repos.length) ? 'No repositories on this account yet. Choose New repository instead.'
+                 : (st === 'ok' && !list.length) ? 'No repository matches that filter.'
+                 : '';
+        setText(reposStatus, said); setHidden(reposStatus, !said);
+        setHidden(reposRetry, st !== 'error');
+        reposRetry.disabled = b;
+        setHidden(filterRow, !(st === 'ok' && repos.length > 10));
+        setHidden(repoList, !list.length);
+        if (picked && !list.some(function(r){ return r.name === picked; })) picked = null;
+        var sig = list.map(function(r){
+          return r.name + '|' + (r.private === false ? 'public' : 'private') + '|' + (r.empty === true ? 'empty' : '') + '|' + (r.description || '');
+        }).join('\n');
+        if (rowsEl.getAttribute('data-sig') !== sig){
+          rowsEl.setAttribute('data-sig', sig);
+          rowsEl.innerHTML = '';
+          repoInputs = {};
+          list.forEach(function(r){
+            var lab = document.createElement('label');
+            lab.className = 'gh-radio gh-repo-row';
+            var inp = document.createElement('input');
+            inp.type = 'radio'; inp.name = 'github-repo'; inp.value = r.name;
+            inp.addEventListener('change', function(){ if (inp.checked) pickRepo(r.name); });
+            var main = document.createElement('span');
+            main.className = 'gh-repo-main';
+            var nm = document.createElement('span');
+            nm.className = 'gh-repo-name'; nm.textContent = r.name;
+            main.appendChild(nm);
+            var vis = document.createElement('span');
+            vis.className = 'gh-chip ' + (r.private === false ? 'is-public' : 'is-private');
+            vis.textContent = r.private === false ? 'Public' : 'Private';
+            main.appendChild(vis);
+            if (r.empty === true){
+              var em = document.createElement('span');
+              em.className = 'gh-chip is-empty'; em.textContent = 'empty';
+              main.appendChild(em);
+            }
+            if (r.description){
+              var ds = document.createElement('span');
+              ds.className = 'gh-repo-desc'; ds.textContent = String(r.description);
+              main.appendChild(ds);
+            }
+            lab.appendChild(inp); lab.appendChild(main);
+            rowsEl.appendChild(lab);
+            repoInputs[r.name] = inp;
+          });
+        }
+        Object.keys(repoInputs).forEach(function(n){
+          var inp = repoInputs[n];
+          if (inp.checked !== (n === picked)) inp.checked = (n === picked);
+          inp.disabled = b;
+        });
+        var ow = overwriteNeeded(pickedRepo());
+        setHidden(overwriteRow, !ow);
+        if (!ow && overwriteOk.checked) overwriteOk.checked = false;
+        overwriteOk.disabled = b;
+      }
+
+      function renderLinked(){
+        var b = !!busy, p = data.project || {}, repo = p.repo || {};
+        var u = ghSafeUrl(repo.html_url);
+        if (repoUrl.getAttribute('href') !== (u || '#')) repoUrl.setAttribute('href', u || '#');
+        setText(repoUrl, String(repo.full_name || u || ''));
+        var priv = repo.private !== false;
+        setText(visChip, priv ? 'Private' : 'Public');
+        visChip.classList.toggle('is-private', priv);
+        visChip.classList.toggle('is-public', !priv);
+        setText(pushedEl, pushedText(p.last_pushed));
+        setText(countsEl, countsText(p));
+        renderPreview();
+
+        if (!priv) askPublic = false;
+        setHidden(makePrivateBtn, priv);
+        setHidden(makePublicBtn, !priv || askPublic);
+        makePrivateBtn.disabled = b;
+        setText(makePrivateBtn, busy === 'vis' ? 'Making private…' : 'Make private');
+        makePublicBtn.disabled = b;
+        setHidden(publicConfirm, !askPublic);
+        makePublicOk.disabled = b;
+        makePublicNo.disabled = b;
+        makePublicYes.disabled = b || !makePublicOk.checked;
+        setText(makePublicYes, busy === 'vis' ? 'Making public…' : 'Make public');
+        unlinkBtn.disabled = b || askUnlink;
+        setText(unlinkText, 'Forget the link to ' + String(repo.full_name || 'this repository') +
+                '? Nothing is deleted on GitHub or in your project.');
+        unlinkNo.disabled = b;
+        unlinkYes.disabled = b;
+        setText(unlinkYes, busy === 'unlink' ? 'Unlinking…' : 'Unlink');
+
+        var blocked = !!(lastFindings && lastFindings.length);
+        pushBtn.disabled = b || blocked;
+        setText(pushBtn, busy === 'push' ? 'Pushing…' : 'Push');
+        syncBtn.disabled = b;
+        setText(syncBtn, busy === 'sync' ? 'Syncing…' : 'Sync');
       }
 
       function renderFindings(){
@@ -12055,12 +12455,16 @@
         setText(prevSummary, n === 0 ? 'Nothing new to commit.'
                 : n === 1 ? '1 file will be committed.'
                 : n + ' files will be committed' + (preview.files && preview.files.length < n ? ' (showing ' + preview.files.length + ')' : '') + '.');
-        filesEl.innerHTML = '';
-        (preview.files || []).forEach(function(path){
-          var li = document.createElement('li');
-          li.textContent = path;
-          filesEl.appendChild(li);
-        });
+        var sig = (preview.files || []).join('\n');
+        if (filesEl.getAttribute('data-sig') !== sig){
+          filesEl.setAttribute('data-sig', sig);
+          filesEl.innerHTML = '';
+          (preview.files || []).forEach(function(path){
+            var li = document.createElement('li');
+            li.textContent = path;
+            filesEl.appendChild(li);
+          });
+        }
         setHidden(filesEl, !(preview.files && preview.files.length));
       }
 
@@ -12078,17 +12482,26 @@
             if (stateOf() === 'linked') loadPreview(); })
           .catch(function(err){
             if (mine !== seq || d !== dir) return;
-            var code = err && err.body && err.body.code;
+            var code = codeOf(err);
             if (code === 'disabled' || (err && err.status === 404 && !code)){
               offText = ghErr('disabled'); data = { connected:false }; render(); return;
             }
-            if (!quiet) showErr(ghErr(code, err && err.message));
+            if (!quiet) showErr(errText(err));
           });
+      }
+      /* After a create / link: the answer is the status when it carries one,
+         else the status is read again. */
+      function settle(j){
+        if (j && typeof j === 'object' && has(j, 'connected')){
+          ingest(j); if (stateOf() === 'linked') loadPreview();
+          return Promise.resolve();
+        }
+        return load(true);
       }
 
       function loadPreview(){
         if (!dir) return;
-        var d = dir, mine = seq;
+        var d = dir;
         preview = null; render();
         api('/api/github/preview?project_dir=' + encodeURIComponent(d))
           .then(function(j){ if (d !== dir) return; preview = j || {};
@@ -12096,93 +12509,347 @@
           .catch(function(){ if (d !== dir) return; preview = { total_files: 0, files: [] }; renderPreview(); });
       }
 
-      function fail(err){ showErr(ghErr(err && err.body && err.body.code, err && err.message)); }
+      function fail(err, where){ showErrIn(where || footErr, errText(err)); }
 
+      /* ── device login ───────────────────────────────────────────────────── */
+      function devWanted(){ return isOpen && devActive(); }
+      function syncDevTimers(){
+        var want = devWanted();
+        if (want && devPoll == null) devPoll = setInterval(pollDevice, 3000);
+        if (!want && devPoll != null){ clearInterval(devPoll); devPoll = null; }
+        var tick = want && device.state === 'pending' && devLeft != null;
+        if (tick && devTick == null) devTick = setInterval(tickDevice, 1000);
+        if (!tick && devTick != null){ clearInterval(devTick); devTick = null; }
+      }
+      function tickDevice(){
+        if (device.state !== 'pending'){ syncDevTimers(); return; }
+        var left = devLeftNow();
+        if (left != null && left <= 0){
+          devSeq++;
+          device = { state: 'expired' }; devLeft = null;
+          announce('The code expired.');
+          render(); syncDevTimers();
+          if (isOpen && !retryBtn.hidden) retryBtn.focus();
+          return;
+        }
+        setText(devTime, left == null ? '' : fmtClock(left));
+      }
+      function ingestDevice(j, t0, fromStart){
+        j = (j && typeof j === 'object') ? j : {};
+        var st = typeof j.state === 'string' ? j.state : (j.user_code ? 'pending' : 'idle');
+        if (DEVICE_STATES.indexOf(st) < 0) st = 'error';
+        var prev = device.state, wasActive = devActive();
+        if (st === 'connected'){
+          devSeq++; device = { state: 'idle' }; devLeft = null; installStart = null; devFails = 0;
+          syncDevTimers();
+          /* Only a login THIS dialog was waiting on is news. */
+          if (wasActive || fromStart){
+            announce('GitHub connected' + (typeof j.login === 'string' && j.login ? ' as ' + j.login : '') + '.');
+            load(true);
+          }
+          render();
+          return;
+        }
+        var keep = st === 'pending' && prev === 'pending';
+        device = {
+          state: st,
+          user_code: typeof j.user_code === 'string' ? j.user_code : (keep ? device.user_code : ''),
+          verification_uri: typeof j.verification_uri === 'string' ? j.verification_uri : (keep ? device.verification_uri : ''),
+          error: typeof j.error === 'string' ? j.error : '',
+          progress: j.progress != null ? j.progress : j.message
+        };
+        if (st === 'pending'){
+          if (typeof j.expires_in === 'number' && isFinite(j.expires_in)){ devLeft = Math.max(0, j.expires_in); devAnchor = t0; }
+        } else devLeft = null;
+        if (st === 'installing'){
+          if (prev !== 'installing'){ installStart = now(); announce("Installing GitHub's official tool. This happens once."); }
+        } else installStart = null;
+        if (st === 'expired' && prev !== 'expired') announce('The code expired.');
+        if (st === 'denied' && prev !== 'denied') announce('The sign-in was declined on GitHub.');
+        if (st === 'error' && prev !== 'error') announce('Connecting to GitHub failed.');
+        render(); syncDevTimers();
+        if (!isOpen) return;
+        var a = document.activeElement;
+        var lost = !a || a === titleEl || (a.closest && a.closest('[hidden]'));
+        if (st === 'pending' && prev !== 'pending' && (fromStart || lost)) devCopy.focus();
+        else if (st === 'installing' && fromStart) cancelBtn.focus();
+        else if (devEnded() && (wasActive || fromStart) && lost) retryBtn.focus();
+      }
+      function pollDevice(){
+        if (devPolling || !devWanted() || busy === 'cancel') return;
+        devPolling = true;
+        var mine = devSeq, t0 = now();
+        api('/api/github/device')
+          .then(function(j){ if (mine !== devSeq) return; devFails = 0; ingestDevice(j, t0); })
+          .catch(function(err){
+            if (mine !== devSeq) return;
+            /* A blip is not a failure; three in a row is. */
+            if (++devFails >= 3){
+              devFails = 0; devSeq++;
+              device = { state: 'error', error: errText(err, 'Lost touch with the hub while waiting for GitHub.') };
+              devLeft = null; render(); syncDevTimers();
+            }
+          })
+          .then(function(){ devPolling = false; });
+      }
+      /* One read when the dialog opens: picks a pending login back up. */
+      function readDevice(){
+        var mine = devSeq, t0 = now();
+        return api('/api/github/device')
+          .then(function(j){ if (mine !== devSeq || !isOpen) return; ingestDevice(j, t0); })
+          .catch(function(){});
+      }
+      function doConnect(){
+        if (busy) return;
+        var mine = ++devSeq, t0 = now(), focusClient = false;
+        busy = 'connect'; clearErrs(); render();
+        api('/api/github/device/start', { method:'POST', body:{} })
+          .then(function(j){ if (mine !== devSeq) return; devFails = 0; ingestDevice(j, t0, true); })
+          .catch(function(err){
+            if (mine !== devSeq) return;
+            if (codeOf(err) === 'no_client_id'){ clientIdNeeded = true; tokenDetails.open = true; focusClient = true; }
+            fail(err);
+          })
+          .then(function(){ busy = ''; render(); syncDevTimers(); if (focusClient) clientInput.focus(); });
+      }
+      function doCancel(){
+        if (busy) return;
+        devSeq++;
+        busy = 'cancel'; clearErrs(); render();
+        api('/api/github/device/cancel', { method:'POST', body:{} })
+          .then(function(){ device = { state: 'idle' }; devLeft = null; installStart = null; announce('Sign-in cancelled.'); })
+          .catch(function(err){ fail(err); })
+          .then(function(){ busy = ''; render(); syncDevTimers(); if (!connectBtn.hidden) connectBtn.focus(); });
+      }
+      function doCopy(){
+        var c = device.user_code;
+        if (!c || copyBusy) return;
+        copyBusy = true;
+        copyText(c, devCopy);
+        setTimeout(function(){ announce(devCopy.textContent === 'Copied!' ? 'Copied' : 'Could not copy. Select the code and copy it by hand.'); }, 200);
+        setTimeout(function(){ copyBusy = false; }, 1600);
+      }
+      function openDevicePage(e){
+        var u = ghDeviceUrl(device.verification_uri);
+        if (!u){ if (e && e.preventDefault) e.preventDefault(); return; }
+        /* The link itself opens it (target=_blank, noopener noreferrer); a
+           window.open from the same click is tried first and, when it works,
+           the link's own navigation is skipped. */
+        try {
+          if (window && typeof window.open === 'function'){
+            window.open(u, '_blank', 'noopener,noreferrer');
+            if (e && e.preventDefault) e.preventDefault();
+          }
+        } catch (x) { /* the link opens it */ }
+      }
+      function doClientSave(){
+        var id = clientInput.value.trim();
+        if (!id || busy) return;
+        busy = 'client'; clearErrs(); render();
+        api('/api/github/client-id', { method:'POST', body:{ client_id: id } })
+          .then(function(j){
+            clientInput.value = '';
+            if (data) data.oauth_available = !!(j && j.oauth_available);
+            if (j && j.oauth_available) clientIdNeeded = false;
+            announce('Client ID saved.');
+            return load(true);
+          })
+          .catch(function(err){ fail(err, clientErr); })
+          .then(function(){ busy = ''; render(); if (!clientIdNeeded && !connectBtn.hidden) connectBtn.focus(); });
+      }
+
+      /* ── token, account ────────────────────────────────────────────────── */
       function doSave(){
         var token = tokenInput.value.trim();
         if (!token || busy) return;
-        busy = true; seq++; showErr(''); render();
+        busy = 'save'; seq++; clearErrs(); render();
         api('/api/github/token', { method:'POST', body:{ token: token } })
           .then(function(){ tokenInput.value = ''; announce('GitHub connected.'); return load(true); })
-          .catch(fail)
-          .then(function(){ busy = false; render(); });
+          .catch(function(err){ fail(err, tokenErr); })
+          .then(function(){ busy = ''; render(); });
       }
       function doDisconnect(){
         if (busy) return;
-        busy = true; seq++; showErr(''); render();
+        busy = 'disconnect'; seq++; clearErrs(); render();
         api('/api/github/token/delete', { method:'POST', body:{} })
-          .then(function(){ announce('GitHub disconnected.'); namePrefilled = false; preview = null; lastFindings = []; return load(true); })
-          .catch(fail)
-          .then(function(){ busy = false; render(); });
+          .then(function(){ announce('GitHub disconnected.'); namePrefilled = false; preview = null; lastFindings = [];
+            repos = []; reposState = ''; picked = null; askPublic = false; askUnlink = false; return load(true); })
+          .catch(function(err){ fail(err, errEl); })
+          .then(function(){ busy = ''; render(); });
+      }
+
+      /* ── create / link ─────────────────────────────────────────────────── */
+      function loadRepos(){
+        var mine = ++reposSeq, d = dir;
+        reposState = 'loading'; reposErr = ''; render();
+        api('/api/github/repos')
+          .then(function(j){
+            if (mine !== reposSeq || d !== dir) return;
+            repos = ((j && j.repos) || []).filter(function(r){ return r && typeof r.name === 'string' && r.name; });
+            reposState = 'ok'; render();
+          })
+          .catch(function(err){
+            if (mine !== reposSeq || d !== dir) return;
+            reposState = 'error'; reposErr = errText(err, 'Could not load your repositories.'); render();
+          });
+      }
+      function setMode(m){
+        if (m === mode) return;
+        mode = m; showErrIn(footErr, '');
+        if (mode === 'existing' && (reposState === '' || reposState === 'error')) loadRepos();
+        else render();
+      }
+      function pickRepo(name){
+        picked = name; overwriteOk.checked = false; showErrIn(footErr, ''); render();
       }
       function doCreate(){
         if (createBtn.disabled || !dir) return;
         var body = { project_dir: dir, name: nameInput.value.trim(),
                      private: !visPublic.checked, confirm: true };
+        var desc = descInput.value.trim();
+        if (desc) body.description = desc;
         if (visPublic.checked) body.public_ok = !!publicOk.checked;
-        busy = true; seq++; showErr(''); render();
+        busy = 'create'; seq++; clearErrs(); render();
         api('/api/github/create', { method:'POST', body: body })
-          .then(function(j){ announce('Repository created and pushed.'); lastFindings = []; ingest(j); loadPreview(); })
+          .then(function(j){ announce('Repository created and pushed.'); lastFindings = []; return settle(j); })
           .catch(function(err){
-            var code = err && err.body && err.body.code;
-            if (code === 'secrets_found'){ lastFindings = (err.body.findings) || []; load(true); }
+            if (codeOf(err) === 'secrets_found'){ lastFindings = (err.body.findings) || []; load(true); }
+            if (codeOf(err) === 'already_linked') load(true);
             fail(err);
           })
-          .then(function(){ busy = false; render(); });
+          .then(function(){ busy = ''; render(); });
       }
+      function doLink(){
+        var r = pickedRepo();
+        if (linkBtn.disabled || !dir || !r) return;
+        var body = { project_dir: dir, name: r.name, confirm: true };
+        if (overwriteNeeded(r) && overwriteOk.checked) body.overwrite_ok = true;
+        var focusTick = false;
+        busy = 'link'; seq++; clearErrs(); render();
+        api('/api/github/link', { method:'POST', body: body })
+          .then(function(j){ announce('Linked and pushed.'); lastFindings = []; picked = null;
+            overwriteOk.checked = false; return settle(j); })
+          .catch(function(err){
+            var code = codeOf(err);
+            if (code === 'needs_overwrite_ok'){ needOverwrite[r.name] = true; overwriteOk.checked = false; focusTick = true; }
+            if (code === 'secrets_found'){ lastFindings = (err.body && err.body.findings) || []; }
+            if (code === 'already_linked') load(true);
+            fail(err);
+          })
+          .then(function(){ busy = ''; render(); if (focusTick && !overwriteRow.hidden) overwriteOk.focus(); });
+      }
+
+      /* ── linked: push, sync, visibility, unlink ────────────────────────── */
       function doPush(){
         if (pushBtn.disabled || !dir) return;
-        busy = true; seq++; showErr(''); render();
+        busy = 'push'; seq++; clearErrs(); render();
         api('/api/github/push', { method:'POST', body:{ project_dir: dir, confirm: true } })
           .then(function(j){ announce('Pushed to GitHub.'); lastFindings = []; ingest(j); loadPreview(); })
           .catch(function(err){
-            var code = err && err.body && err.body.code;
-            if (code === 'secrets_found'){ lastFindings = (err.body && err.body.findings) || []; renderPreview(); }
+            if (codeOf(err) === 'secrets_found'){ lastFindings = (err.body && err.body.findings) || []; renderPreview(); }
             fail(err);
           })
-          .then(function(){ busy = false; render(); });
+          .then(function(){ busy = ''; render(); });
       }
       function doSync(){
         if (syncBtn.disabled || !dir) return;
-        busy = true; seq++; showErr(''); render();
+        busy = 'sync'; seq++; clearErrs(); render();
         api('/api/github/sync', { method:'POST', body:{ project_dir: dir } })
           .then(function(j){ announce('Synced with GitHub.'); ingest(j); loadPreview(); })
-          .catch(fail)
-          .then(function(){ busy = false; render(); });
+          .catch(function(err){ fail(err); })
+          .then(function(){ busy = ''; render(); });
+      }
+      function askMakePublic(){
+        if (busy) return;
+        askPublic = true; makePublicOk.checked = false; showErrIn(manageErr, ''); render();
+        makePublicOk.focus();
+      }
+      function keepPrivate(){ askPublic = false; makePublicOk.checked = false; render(); makePublicBtn.focus(); }
+      function doVisibility(makePrivate){
+        if (busy || !dir) return;
+        var body = { project_dir: dir, private: !!makePrivate };
+        if (!makePrivate){
+          if (!makePublicOk.checked) return;     /* the tick is required */
+          body.public_ok = true;
+        }
+        var nowPriv = null;
+        busy = 'vis'; clearErrs(); render();
+        api('/api/github/visibility', { method:'POST', body: body })
+          .then(function(j){
+            nowPriv = (j && typeof j.private === 'boolean') ? j.private : !!makePrivate;
+            if (data && data.project && data.project.repo) data.project.repo.private = nowPriv;
+            askPublic = false; makePublicOk.checked = false;
+            announce(nowPriv ? 'The repository is private now.' : 'The repository is public now.');
+          })
+          .catch(function(err){
+            if (codeOf(err) === 'public_ok_required'){ askPublic = true; makePublicOk.checked = false; }
+            fail(err, manageErr);
+          })
+          .then(function(){
+            busy = ''; render();
+            if (nowPriv === true && !makePublicBtn.hidden) makePublicBtn.focus();
+            else if (nowPriv === false && !makePrivateBtn.hidden) makePrivateBtn.focus();
+          });
+      }
+      function askUnlinkStep(){
+        if (busy) return;
+        askUnlink = true; askPublic = false; render(); unlinkNo.focus();
+      }
+      function keepLink(){ askUnlink = false; render(); unlinkBtn.focus(); }
+      function doUnlink(){
+        if (busy || !dir || !askUnlink) return;
+        busy = 'unlink'; seq++; clearErrs(); render();
+        api('/api/github/unlink', { method:'POST', body:{ project_dir: dir, confirm: true } })
+          .then(function(){
+            askUnlink = false; preview = null; lastFindings = []; picked = null; mode = 'new';
+            namePrefilled = false; nameInput.value = ''; descInput.value = '';
+            announce('Unlinked. Nothing was deleted on GitHub or in your project.');
+            return load(true);
+          })
+          .catch(function(err){ fail(err); })
+          .then(function(){ busy = ''; render(); });
       }
       function doGitignore(){
         if (busy || !dir || !lastFindings.length) return;
         var add = lastFindings.map(function(f){ return f.path; });
-        busy = true; seq++; showErr(''); render();
+        busy = 'gitignore'; seq++; clearErrs(); render();
         api('/api/github/gitignore', { method:'POST', body:{ project_dir: dir, add: add, confirm: true } })
           .then(function(){ announce('Added to .gitignore.'); lastFindings = [];
             if (stateOf() === 'linked') loadPreview(); else render(); })
-          .catch(fail)
-          .then(function(){ busy = false; render(); });
+          .catch(function(err){ fail(err); })
+          .then(function(){ busy = ''; render(); });
       }
 
+      /* ── open / close ──────────────────────────────────────────────────── */
       function setOpen(v, restoreFocus){
         v = !!v;
         if (v === isOpen) return;
         if (v){
-          isOpen = true; showErr(''); render();
+          isOpen = true; clearErrs(); render();
           try { if (!dlg.open) dlg.showModal(); }
           catch (e){ isOpen = false; render(); return; }
           titleEl.focus();
-          load(false);
+          syncDevTimers();
+          load(false).then(function(){ if (isOpen && stateOf() === 'connect' && !busy) readDevice(); });
         } else {
-          isOpen = false;
+          isOpen = false; askPublic = false; askUnlink = false;
           if (dlg.open) dlg.close();
-          render();
+          render(); syncDevTimers();
           if (restoreFocus) btn.focus();
         }
       }
 
       btn.addEventListener('click', function(){ setOpen(true, true); });
       closeBtn.addEventListener('click', function(){ setOpen(false, true); });
+      /* Esc first backs out of an open question (unlink, make public), then closes. */
+      dlg.addEventListener('cancel', function(e){
+        if (askUnlink){ e.preventDefault(); keepLink(); return; }
+        if (askPublic){ e.preventDefault(); keepPrivate(); }
+      });
       dlg.addEventListener('close', function(){
         if (!isOpen || dlg.open) return;
-        isOpen = false; render(); btn.focus();
+        isOpen = false; askPublic = false; askUnlink = false;
+        render(); syncDevTimers(); btn.focus();
       });
       var downOnBackdrop = false;
       dlg.addEventListener('pointerdown', function(e){ downOnBackdrop = e.target === dlg; });
@@ -12191,24 +12858,51 @@
         if (outside) setOpen(false, true);
       });
       tokenInput.addEventListener('input', render);
+      clientInput.addEventListener('input', render);
       nameInput.addEventListener('input', render);
+      filterInput.addEventListener('input', render);
       visPrivate.addEventListener('change', function(){ publicOk.checked = false; render(); });
       visPublic.addEventListener('change', render);
       publicOk.addEventListener('change', render);
+      modeNew.addEventListener('change', function(){ if (modeNew.checked) setMode('new'); });
+      modeExisting.addEventListener('change', function(){ if (modeExisting.checked) setMode('existing'); });
+      overwriteOk.addEventListener('change', render);
+      makePublicOk.addEventListener('change', render);
       saveBtn.addEventListener('click', doSave);
+      clientSave.addEventListener('click', doClientSave);
+      connectBtn.addEventListener('click', doConnect);
+      retryBtn.addEventListener('click', doConnect);
+      cancelBtn.addEventListener('click', doCancel);
+      devCopy.addEventListener('click', doCopy);
+      devOpen.addEventListener('click', openDevicePage);
       disconnectBtn.addEventListener('click', doDisconnect);
       createBtn.addEventListener('click', doCreate);
+      linkBtn.addEventListener('click', doLink);
+      reposRetry.addEventListener('click', loadRepos);
       pushBtn.addEventListener('click', doPush);
       syncBtn.addEventListener('click', doSync);
+      makePrivateBtn.addEventListener('click', function(){ doVisibility(true); });
+      makePublicBtn.addEventListener('click', askMakePublic);
+      makePublicNo.addEventListener('click', keepPrivate);
+      makePublicYes.addEventListener('click', function(){ doVisibility(false); });
+      unlinkBtn.addEventListener('click', askUnlinkStep);
+      unlinkNo.addEventListener('click', keepLink);
+      unlinkYes.addEventListener('click', doUnlink);
       gitignoreBtn.addEventListener('click', doGitignore);
 
       function reset(){
-        seq++;
+        seq++; devSeq++; reposSeq++;
         if (isOpen || dlg.open){ isOpen = false; if (dlg.open) dlg.close(); }
-        data = null; offText = ''; busy = false; preview = null; lastFindings = [];
-        namePrefilled = false; tokenInput.value = ''; nameInput.value = '';
+        data = null; offText = ''; busy = ''; preview = null; lastFindings = [];
+        namePrefilled = false; tokenInput.value = ''; nameInput.value = ''; descInput.value = '';
         visPrivate.checked = true; visPublic.checked = false; publicOk.checked = false;
-        showErr('');
+        device = { state: 'idle' }; devLeft = null; installStart = null; devFails = 0; devPolling = false;
+        clientIdNeeded = false; detailsAutoOpened = false; clientInput.value = '';
+        mode = 'new'; repos = []; reposState = ''; reposErr = ''; picked = null; needOverwrite = {};
+        filterInput.value = ''; overwriteOk.checked = false;
+        askPublic = false; askUnlink = false; makePublicOk.checked = false;
+        syncDevTimers();
+        clearErrs();
       }
       render();
 
