@@ -5312,3 +5312,26 @@ created) while swarm-7d2d17f482bd kept working; the Send button read as
   when its text changes. Send reads "Queue" and a message typed then waits in
   the existing queue (`_bgRunLive` in `doSend` / `queueDrain`); it goes out
   when the run ends, with a toast pointing at the filed report.
+
+## A restart comes back, without a 600 s wait (2026-10-11)
+
+Covered by `tests/test_restart_comes_back.py`. MEASURED on the owner's
+machine, whose install path has spaces ("...\bureau 2024\ALL\python perso\..."):
+
+- **The re-exec died silently** (19:00 and 22:06). `os.execv` on Windows joins
+  its arguments with plain spaces, so the new interpreter read
+  "2024\ALL\python" as its script, printed "can't open file" into the hidden
+  console and exited. `_reexec_argv` quotes each argument with
+  `subprocess.list2cmdline` on Windows (unchanged elsewhere), and `_do_reexec`
+  logs "Re-exec: starting a fresh hub process" first. A real child process
+  re-executed from a folder with spaces receives its arguments unchanged.
+- **Every restart waited its full 600 s drain** with `active_requests` 7 and
+  nothing running. werkzeug's dev server (`serving.py`, `run_wsgi.execute`)
+  drains the request socket inside its `finally` and only then calls the
+  body's `close()`. When the client left mid-stream, that read raised too and
+  `close()` was skipped, so every `response.call_on_close()` callback was lost
+  (the /v1 in-flight counter, the Activity backstop, the clientgone forget).
+  `_AlwaysClose` (wrapped by `_BuildPrefix`, the outermost WSGI layer) makes
+  `close()` idempotent and also runs it when the body is garbage-collected.
+  Reproduced on a real werkzeug server with a client that closes or resets
+  mid-stream: no callback before, the callback and a counter back at 0 after.

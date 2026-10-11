@@ -16518,6 +16518,48 @@ _INFERENCE_PATHS = {
 _BUILD_PREFIX_RE = re.compile(r"^/build/([A-Za-z0-9_-]{1,64})(/.*)$")
 
 
+class _AlwaysClose:
+    """A WSGI body whose close() runs even when the server forgets to call it.
+
+    MEASURED 2026-10-11 (werkzeug serving.py, run_wsgi.execute): after the
+    body loop, werkzeug drains the request socket INSIDE the finally block and
+    only then calls application_iter.close(). When the client left mid-stream
+    (a CLI that cancelled, closed or reset its connection), the failed write
+    is followed by a read that raises too, the exception is swallowed as
+    "connection dropped", and close() is never called. Every
+    response.call_on_close() callback was then lost: the /v1 in-flight counter
+    (_runtime_active) climbed to 7 with nothing running, and each update or
+    restart waited its full 600 s drain refusing new work. close() is
+    idempotent and also runs when the body is garbage-collected."""
+
+    __slots__ = ("_src", "_it", "_closed", "__weakref__")
+
+    def __init__(self, src):
+        self._src = src
+        self._it = iter(src)
+        self._closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._it)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self._src, "close", None)
+        if close is not None:
+            close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
 class _BuildPrefix:
     """Strip /build/<session_id> and remember it for the request."""
 
@@ -16529,7 +16571,7 @@ class _BuildPrefix:
         if m:
             environ["flh.build_session"] = m.group(1)
             environ["PATH_INFO"] = m.group(2)
-        return self._wsgi(environ, start_response)
+        return _AlwaysClose(self._wsgi(environ, start_response))
 
 
 app.wsgi_app = _BuildPrefix(app.wsgi_app)
@@ -48622,9 +48664,27 @@ def _sync_deps_after_pull():
         return False
 
 
+def _reexec_argv(executable=None, argv=None, nt=None):
+    """The argument list for the re-exec. On Windows os.execv joins its
+    arguments with plain spaces and does NOT quote them, so an interpreter
+    path with a space split into several arguments. MEASURED 2026-10-11: this
+    install lives under "...\\bureau 2024\\ALL\\python perso\\...", the new
+    process read "2024\\ALL\\python" as its script, printed "can't open file"
+    into the hidden console and exited; the hub stayed down with no log line
+    (19:00 and 22:06). Each argument is quoted the way the Windows command
+    line is parsed back (subprocess.list2cmdline), so it arrives unchanged."""
+    executable = sys.executable if executable is None else executable
+    args = [executable] + list(sys.argv if argv is None else argv)
+    if (os.name == "nt") if nt is None else nt:
+        args = [subprocess.list2cmdline([a]) for a in args]
+    return args
+
+
 def _do_reexec():
     """The one place the hub replaces its own process. Tests replace THIS."""
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    args = _reexec_argv()
+    _log.info("Re-exec: starting a fresh hub process (%s)", " ".join(args[1:])[:200])
+    os.execv(sys.executable, args)
 
 
 # -- graceful update: labels, drain, resume marker ---------------------------- #
