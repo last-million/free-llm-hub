@@ -4134,12 +4134,15 @@
                       <h3 class="publish-h">What will be pushed</h3>
                       <p class="publish-p" id="github-preview-summary">Checking…</p>
                       <ul class="gh-files" id="github-files" hidden></ul>
-                      <div class="gh-findings" id="github-findings" hidden>
-                        <p class="publish-p gh-findings-head">Not pushed — these look like secrets:</p>
-                        <ul id="github-findings-list"></ul>
-                        <button class="btn sm" id="github-gitignore" type="button">Add these to .gitignore</button>
-                      </div>
                     </div>
+                  </div>
+
+                  <!-- Secret-scan findings: shown in the create AND linked states
+                       (Create & push is refused before anything is made on GitHub). -->
+                  <div class="gh-findings" id="github-findings" hidden>
+                    <p class="publish-p gh-findings-head">Not pushed — these look like secrets:</p>
+                    <ul id="github-findings-list"></ul>
+                    <button class="btn sm" id="github-gitignore" type="button">Add these to .gitignore</button>
                   </div>
                 </div>
                 <div class="pub-dlg-foot" id="github-foot">
@@ -11855,6 +11858,11 @@
         not_connected: 'Create a GitHub repository for this project first.',
         no_token: 'Connect your GitHub account first.',
         refused: 'This folder cannot be pushed from here.',
+        unknown_project: 'Only a Build project folder can be pushed to GitHub.',
+        already_linked: 'This project is already linked to a GitHub repository.',
+        bad_link: 'This project is linked to a repository of another GitHub account. Connect that account to push.',
+        local_changes: 'GitHub has newer changes and this project has changes too. Nothing was touched.',
+        git_too_old: 'GitHub push needs a newer git. Update git, then try again.',
         network: 'Could not reach GitHub. Check your connection and try again.',
         disabled: 'GitHub push is switched off in this hub.'
       };
@@ -11992,21 +12000,28 @@
           syncBtn.disabled = busy;
           setText(syncBtn, busy ? 'Working…' : 'Sync');
         }
+        renderFindings();
+        gitignoreBtn.disabled = busy;
         disconnectBtn.disabled = busy;
         keepFocus();
       }
 
-      function renderPreview(){
-        var findings = lastFindings || [];
+      function renderFindings(){
+        var s = stateOf();
+        var findings = (s === 'create' || s === 'linked') ? (lastFindings || []) : [];
         setHidden(findingsBox, !findings.length);
-        if (findings.length){
-          findingsList.innerHTML = '';
-          findings.forEach(function(f){
-            var li = document.createElement('li');
-            li.textContent = f.path + (f.detail ? ' — ' + f.detail : '');
-            findingsList.appendChild(li);
-          });
-        }
+        var sig = findings.map(function(f){ return f.path + '|' + f.kind; }).join('\n');
+        if (findingsList.getAttribute('data-sig') === sig) return;
+        findingsList.setAttribute('data-sig', sig);
+        findingsList.innerHTML = '';
+        findings.forEach(function(f){
+          var li = document.createElement('li');
+          li.textContent = f.path + (f.detail ? ' — ' + f.detail : '');
+          findingsList.appendChild(li);
+        });
+      }
+
+      function renderPreview(){
         if (!preview){ setText(prevSummary, 'Checking…'); setHidden(filesEl, true); return; }
         var n = preview.total_files || 0;
         setText(prevSummary, n === 0 ? 'Nothing new to commit.'
@@ -12112,7 +12127,8 @@
         var add = lastFindings.map(function(f){ return f.path; });
         busy = true; seq++; showErr(''); render();
         api('/api/github/gitignore', { method:'POST', body:{ project_dir: dir, add: add, confirm: true } })
-          .then(function(){ announce('Added to .gitignore.'); lastFindings = []; loadPreview(); })
+          .then(function(){ announce('Added to .gitignore.'); lastFindings = [];
+            if (stateOf() === 'linked') loadPreview(); else render(); })
           .catch(fail)
           .then(function(){ busy = false; render(); });
       }

@@ -1,51 +1,59 @@
-"""GitHub push for Build projects (2026-10-10).
+"""GitHub push for Build projects (2026-10-10, mirror design 2026-10-11).
 
 Push the current Build project to GitHub from the dashboard: create a repo on
 the owner's OWN account (private by default), then Push / Sync whenever they
 click. Nothing is ever automatic — every create/push is an explicit button.
 
-Shape (same as publish.py / deploy_perfect.py): a small, mostly-pure module
-whose every side effect is INJECTABLE, so the whole thing runs hermetically in a
-test with a fake GitHub HTTP and real git against a local bare repo.
+THE DESIGN (2026-10-11, structural, after two security reviews)
+---------------------------------------------------------------
+A Build project's own ``.git/config``, hooks and ``.gitattributes`` are written
+by AI agents that can be prompt-injected, and the user's ``~/.gitconfig`` is
+writable by the same user. So the git process that carries the token never
+reads either:
 
-  * ``http(method, url, headers, body) -> (status, headers, body_bytes)`` — the
-    GitHub REST call (urllib by default).
-  * ``run_git(args, cwd=, env=) -> (returncode, stdout, stderr)`` — git, argv
-    list, no shell (subprocess by default).
-  * ``clock() -> float`` — the wall clock (time.time by default).
-  * ``store`` — where the token (ENCRYPTED, same AES-256-GCM as the provider
-    keys) and the per-project state live (ConfigStore by default).
-  * ``remote_url(login, repo) -> url`` — the git remote URL (the https GitHub
-    URL by default; a test points it at a local bare repo).
+  * Every project gets a HUB-OWNED BARE MIRROR at
+    ``state_dir()/github-mirrors/<sha256(normcase realpath)[:16]>.git``, created
+    with ``git init --bare`` from an empty template; its config is written only
+    by the hub. All history the feature makes lives there.
+  * Every git call runs with a SANITIZED environment: every inherited ``GIT_*``
+    variable dropped, ``GIT_CONFIG_GLOBAL`` = an empty hub-owned file (and HOME
+    / XDG_CONFIG_HOME = a hub-owned dir, so no ~/.gitconfig, XDG config or
+    ~/.netrc), system config kept (admin-owned; Git for Windows keeps its TLS
+    settings there), ``GIT_TERMINAL_PROMPT=0``, ``GIT_ALLOW_PROTOCOL`` limited
+    to what the call needs. Plus ``-c`` overrides: an EMPTY private
+    ``core.hooksPath``, ``core.fsmonitor=false``, credential helpers reset,
+    no submodule recursion, no signing.
+  * No git call ever uses the project's ``.git`` as its GIT_DIR. A snapshot is
+    ``git --git-dir=<mirror> --work-tree=<project> add -A`` + a commit with an
+    explicit identity: the project's ``.gitignore`` / ``.gitattributes`` are
+    work-tree files and still apply, but filter drivers are only defined in
+    config and the mirror has none. A project that already has its own history
+    is imported ONCE (``fetch <project path> HEAD:refs/heads/main``, no token);
+    the project's own ``.git`` is never written by this feature.
+  * Push / fetch (the only calls with the token) go from the MIRROR to the
+    EXPLICIT stored URL ``https://github.com/<login>/<repo>.git`` — never a
+    remote name — validated against the connected account's login before every
+    use. The URL is written only when the hub itself creates the repo through
+    the API for that account; no request can set or change it.
+  * The token reaches git only through a GIT_ASKPASS helper (a private 0700
+    temp dir, deleted after the call) that answers ONLY git's exact prompts for
+    ``https://github.com`` (username ``x-access-token``, password from an env
+    var). ``http.sslVerify=true``; never a force push.
 
-Safety, stated plainly:
-  * The token is validated against GET /user, stored ENCRYPTED (secretstore,
-    the mechanism the provider keys use), NEVER logged, NEVER returned (status
-    shows only the login and a masked hint), and NEVER written into .git/config
-    or a remote URL.
-  * git auth for push/fetch goes through a GIT_ASKPASS helper in a private 0700
-    temp dir that is deleted right after the command; the token reaches it only
-    through an env var, never a command line, and the helper answers ONLY the
-    prompts for exactly https://github.com. Every git call runs with
-    ``-c credential.helper=`` (empty) and ``GIT_TERMINAL_PROMPT=0`` so NO
-    credential manager is ever read or written — this machine's Windows
-    Credential Manager holds a different account and must never be touched.
-  * The project's .git/config and hooks are written by AI agents and treated as
-    HOSTILE: an empty private core.hooksPath, core.fsmonitor=false, only the
-    https transport (GIT_ALLOW_PROTOCOL), http.sslVerify=true, push.gpgSign=false,
-    no submodule recursion and ``push --no-verify`` (see _git).
-  * Before any push — and before "Create & push" creates anything on GitHub —
-    a secret scan of what WOULD be committed blocks when it finds a secret
-    file or a secret-shaped string.
-  * The hub's own repo, a too-broad folder (a drive root / home / above it) and
-    a symlinked/junction folder are refused.
+Shape (same as publish.py / deploy_perfect.py): every side effect injectable —
+``http``, ``run_git``, ``clock``, ``store``, ``mirror_root`` and, for tests
+only, ``transport_url`` (maps the validated stored URL to the URL git uses;
+identity in the hub, a local bare repo in tests). Raises only ``GhError``.
+Pure stdlib (+ deploy_perfect's stdlib-only link/read helpers). ``config`` /
+``secretstore`` are imported lazily.
 
-This module raises only ``GhError(code, message)`` to callers. Pure stdlib.
-``config`` / ``secretstore`` are imported lazily inside ConfigStore, so there is
-no import cycle and a test can use a fake store with neither present.
+RESIDUAL RISK: an agent running as the same OS user can read ``config.json`` +
+``secret.key`` (and write the hub's state dir) and so decrypt or use the token
+itself. Nothing here can defend against that.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -56,6 +64,8 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+
+import deploy_perfect
 
 # --------------------------------------------------------------------------- #
 # Error type.                                                                  #
@@ -102,36 +112,32 @@ _SECRET_CONTENT = [
     ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
 ]
 
-_CONTENT_READ_CAP = 512 * 1024      # bytes read per file for the content scan
+_CONTENT_READ_CAP = 512 * 1024        # characters scanned per file
 _CONTENT_SIZE_SKIP = 8 * 1024 * 1024  # never read a file larger than this
+_GITIGNORE_MAX = 256 * 1024           # a .gitignore bigger than this is refused
 
 
 def scan_secrets(root, status_entries):
     """Findings for the files in ``status_entries`` (relative paths of what would
     be committed). Each finding: ``{path, kind: "file"|"content", detail}``.
-    Reading a file never raises out of here."""
+    Files are read only through deploy_perfect.safe_read_text: a link, a path
+    resolving outside the project or a non-regular file is never read. Never
+    raises."""
     findings = []
+    try:
+        root_real = os.path.realpath(root)
+    except Exception:                                            # noqa: BLE001
+        return findings
     for rel in status_entries:
         base = os.path.basename(rel)
         if base.lower() != ".env.example" and _SECRET_FILE_RE.match(base):
             findings.append({"path": rel, "kind": "file",
                              "detail": "This looks like a secret file and should not be committed."})
-            # A secret file is reported by name; also scan its content below only
-            # if it is small, but the name finding already blocks the push.
-        full = os.path.join(root, rel)
-        try:
-            if os.path.islink(full) or not os.path.isfile(full):
-                continue
-            if os.path.getsize(full) > _CONTENT_SIZE_SKIP:
-                continue
-            with open(full, "rb") as f:
-                chunk = f.read(_CONTENT_READ_CAP)
-        except OSError:
+        text, _why = deploy_perfect.safe_read_text(
+            os.path.join(root, rel), root_real, _CONTENT_SIZE_SKIP)
+        if not text:
             continue
-        try:
-            text = chunk.decode("utf-8", "replace")
-        except Exception:                                            # noqa: BLE001
-            continue
+        text = text[:_CONTENT_READ_CAP]
         for name, rx in _SECRET_CONTENT:
             if rx.search(text):
                 findings.append({"path": rel, "kind": "content",
@@ -178,6 +184,24 @@ def _mask(token):
         return "token on file"
     head = t.split("_")[0][:11] if "_" in t[:12] else t[:4]
     return "%s…%s" % (head, t[-4:])
+
+
+_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+
+
+def canonical_url(login, repo):
+    return "https://github.com/%s/%s.git" % (login, repo)
+
+
+def valid_url(url, login):
+    """The ONLY shape a stored push URL may have:
+    ``https://github.com/<connected login>/<repo>.git``. Login compared without
+    case (GitHub logins are case-insensitive); host and scheme exact."""
+    if not isinstance(url, str) or not isinstance(login, str) or not _LOGIN_RE.match(login):
+        return False
+    m = re.match(r"^https://github\.com/(?i:%s)/([A-Za-z0-9._-]+)\.git$" % re.escape(login), url)
+    return bool(m) and m.group(1) not in (".", "..")
 
 
 # --------------------------------------------------------------------------- #
@@ -272,27 +296,28 @@ class ConfigStore:
             projects.pop(key, None)
         else:
             projects[key] = data
-        self._atomic_write_projects(projects)
+        _atomic_write(self._projects_file(), json.dumps(projects, indent=2, ensure_ascii=False))
 
-    def _atomic_write_projects(self, projects):
-        path = self._projects_file()
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".github-projects-", suffix=".tmp",
-                                   dir=parent or ".")
+
+def _atomic_write(path, text):
+    """Write ``text`` to ``path`` through a temp file in the same folder and
+    ``os.replace``: a link sitting at ``path`` is REPLACED, its target is never
+    written."""
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".%s." % os.path.basename(path), suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(projects, f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -322,12 +347,12 @@ def _urllib_http(method, url, headers, body):
 
 
 def _real_git(args, cwd=None, env=None, git_path="git"):
-    full_env = dict(os.environ)
-    if env:
-        full_env.update(env)
+    """Run git. ``env`` is the COMPLETE environment (the caller sanitized it);
+    nothing is merged in from os.environ here."""
     try:
         p = subprocess.run(
-            [git_path] + list(args), cwd=cwd, env=full_env,
+            [git_path] + list(args), cwd=cwd,
+            env=dict(env) if env is not None else None,
             capture_output=True, text=True, timeout=180,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return p.returncode, (p.stdout or ""), (p.stderr or "")
@@ -337,34 +362,40 @@ def _real_git(args, cwd=None, env=None, git_path="git"):
         raise GhError("git_timeout", "A git command took too long and was stopped.")
 
 
-def _default_remote_url(login, repo):
-    return "https://github.com/%s/%s.git" % (login, repo)
-
-
 # --------------------------------------------------------------------------- #
 # The client.                                                                  #
 # --------------------------------------------------------------------------- #
 
 _API = "https://api.github.com"
 _COMMIT_MESSAGE = "Update from Calvoun Build"
+_MAIN = "refs/heads/main"
+_TRACK = "refs/remotes/github/main"
 
-# On EVERY git call (command-line -c beats the project's hostile .git/config).
+# On EVERY git call (command-line -c is the highest-precedence config).
 _SAFE_CONFIG = (
     "credential.helper=",            # empty resets every helper: no credential manager
     "credential.useHttpPath=false",  # keep askpass prompts in the exact host-only form
-    "core.fsmonitor=false",          # a planted fsmonitor command never runs
+    "core.fsmonitor=false",
     "submodule.recurse=false",
+    "commit.gpgSign=false",
+    "tag.gpgSign=false",
 )
 # On push/fetch only (the calls that carry the token in the environment).
 _AUTH_CONFIG = (
     "http.sslVerify=true",
-    "push.gpgSign=false",            # a planted gpg.program never runs during push
+    "push.gpgSign=false",
     "fetch.recurseSubmodules=false",
     "push.recurseSubmodules=no",
 )
+# Dropped from the inherited environment besides every GIT_* variable.
+_DROP_ENV = ("CURL_HOME",)
 
 # The askpass helper. Exact prompt strings only; anything else prints nothing
 # and fails, so git never sends the token to another host or over http://.
+# ONE POSIX sh script on every platform: Git for Windows runs #!/bin/sh askpass
+# scripts itself (verified 2026-10-11 with `git credential fill`). A .bat is
+# NOT used: cmd.exe parses the prompt argument before the script runs, and git
+# URL-decodes a remote's username into that prompt.
 _ASKPASS_SH = (
     "#!/bin/sh\n"
     "# Calvoun ghpush askpass: answers ONLY for https://github.com.\n"
@@ -378,26 +409,28 @@ _ASKPASS_SH = (
     "esac\n"
 )
 
+_MIN_GIT = (2, 32)        # GIT_CONFIG_GLOBAL
+
 
 def _is_link(path):
     """A symlink, a Windows junction / mount point, or a reparse point."""
     try:
-        if os.path.islink(path):
-            return True
-        if hasattr(os.path, "isjunction") and os.path.isjunction(path):
-            return True
-        st = os.lstat(path)
-        return bool(getattr(st, "st_reparse_tag", 0))
-    except OSError:
+        return bool(deploy_perfect.is_link(path) or os.path.islink(path))
+    except Exception:                                            # noqa: BLE001
         return False
+
+
+def _real(path):
+    return os.path.normcase(os.path.realpath(os.path.abspath(str(path))))
 
 
 class GitHub:
     def __init__(self, http=None, run_git=None, clock=None, store=None,
-                 remote_url=None, git_path="git",
-                 is_hub_repo=None, too_broad=None, allowed_protocols=("https",)):
-        # Transports git may use (GIT_ALLOW_PROTOCOL). https only in the hub; a
-        # test adds "file" for its local bare remote.
+                 transport_url=None, git_path="git",
+                 is_hub_repo=None, too_broad=None, is_known_project=None,
+                 allowed_protocols=("https",), mirror_root=None):
+        # Transports a push/fetch may use (GIT_ALLOW_PROTOCOL). https only in
+        # the hub; a test adds "file" for its local bare remote.
         self.allowed_protocols = tuple(allowed_protocols)
         self.http = http or _urllib_http
         self.git_path = git_path
@@ -405,16 +438,47 @@ class GitHub:
                                    _real_git(args, cwd=cwd, env=env, git_path=self.git_path))
         self.clock = clock or time.time
         self.store = store if store is not None else ConfigStore()
-        self.remote_url = remote_url or _default_remote_url
+        # TEST SEAM: maps the validated stored https URL to what git is given.
+        self.transport_url = transport_url or (lambda url: url)
+        self._mirror_root = mirror_root
         self.is_hub_repo = is_hub_repo
         self.too_broad = too_broad
+        self.is_known_project = is_known_project
+        self._git_ok = False
 
-    def set_guards(self, is_hub_repo, too_broad):
+    def set_guards(self, is_hub_repo, too_broad, is_known_project=None):
         """Wire the hub's own folder guards (app._cm_is_hub_repo /
-        app._publish_folder_too_broad). Kept injectable so a pure test can
-        define its own."""
+        app._publish_folder_too_broad / app._gh_known_project). Kept injectable
+        so a pure test can define its own."""
         self.is_hub_repo = is_hub_repo
         self.too_broad = too_broad
+        self.is_known_project = is_known_project
+
+    # ---- hub-owned locations ----------------------------------------------
+    def mirror_root(self):
+        if self._mirror_root:
+            return os.path.abspath(self._mirror_root)
+        import config
+        return os.path.join(config.state_dir(), "github-mirrors")
+
+    def _hub_dir(self, name):
+        d = os.path.join(self.mirror_root(), "_" + name)
+        if _is_link(d):
+            raise GhError("refused", "A hub folder was replaced by a link; refusing to use it.")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _empty_global(self):
+        """The hub-owned, EMPTY global git config every call uses."""
+        path = os.path.join(self.mirror_root(), "_empty-gitconfig")
+        try:
+            st = os.lstat(path)
+            if stat.S_ISREG(st.st_mode) and st.st_size == 0 and not _is_link(path):
+                return path
+        except OSError:
+            pass
+        _atomic_write(path, "")
+        return path
 
     # ---- folder guard -----------------------------------------------------
     def _guard_folder(self, project_dir):
@@ -429,6 +493,13 @@ class GitHub:
             raise GhError("refused", "The hub's own repository cannot be pushed from here.")
         if self.too_broad and self.too_broad(p):
             raise GhError("refused", "That folder is too broad to be a project.")
+        state = _real(os.path.dirname(self.mirror_root()))
+        real = _real(p)
+        if deploy_perfect.inside(real, state) or deploy_perfect.inside(state, real):
+            raise GhError("refused", "The hub's own data folder cannot be pushed.")
+        if self.is_known_project is not None and not self.is_known_project(p):
+            raise GhError("unknown_project",
+                          "Only a Build project's folder can be pushed to GitHub.")
         return p
 
     # ---- GitHub REST ------------------------------------------------------
@@ -458,6 +529,8 @@ class GitHub:
         token = token.strip()
         status, data = self._api("GET", "/user", token)
         if status == 200 and isinstance(data, dict) and data.get("login"):
+            if not _LOGIN_RE.match(str(data["login"])):
+                raise GhError("github_error", "GitHub returned an unusable account name.")
             return {"login": data["login"], "id": data.get("id")}
         if status in (401, 403):
             raise GhError("bad_token",
@@ -484,19 +557,44 @@ class GitHub:
             raise GhError("no_token", "Connect your GitHub account first.")
         return token
 
-    # ---- git plumbing -----------------------------------------------------
-    def _git(self, args, cwd, auth=False, identity=False):
-        """Run git with the hub's fixed safety flags. ``auth`` adds the ASKPASS
-        token path (push/fetch); ``identity`` adds a per-command commit identity
-        when the repo has none configured. Returns (rc, out, err).
+    def _identity(self):
+        acct = self.store.get_account() or {}
+        login = acct.get("login") or "calvoun-build"
+        uid = acct.get("user_id")
+        email = ("%s+%s@users.noreply.github.com" % (uid, login)) if uid \
+            else ("%s@users.noreply.github.com" % login)
+        return login, email
 
-        The project's own .git/config and hooks are written by AI agents and
-        are treated as HOSTILE: every call gets an empty private hooks dir
-        (no project hook ever runs), fsmonitor off, credential helpers reset,
-        submodule recursion off and only the allowed transports
-        (GIT_ALLOW_PROTOCOL overrides any protocol.*.allow in the config, so a
-        planted ext::/ssh/local remote cannot run a command or a local
-        receive-pack while the token is in the environment)."""
+    # ---- git plumbing -----------------------------------------------------
+    def _env(self, protocols, token=None, askpass=None):
+        """The COMPLETE environment of a hub git call: the inherited one minus
+        every GIT_* variable (GIT_DIR, GIT_CONFIG_*, GIT_SSH_COMMAND, GIT_TRACE*,
+        GIT_SSL_NO_VERIFY ...), HOME / XDG_CONFIG_HOME pointed at a hub-owned
+        dir, the empty hub-owned global config, no terminal prompt and only the
+        transports this call needs. System config is kept (admin-owned)."""
+        env = {}
+        for k, v in os.environ.items():
+            ku = k.upper()
+            if ku.startswith("GIT_") or ku in _DROP_ENV:
+                continue
+            env[k] = v
+        home = self._hub_dir("home")
+        env["HOME"] = home
+        env["XDG_CONFIG_HOME"] = home
+        env["GIT_CONFIG_GLOBAL"] = self._empty_global()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_ALLOW_PROTOCOL"] = ":".join(protocols)
+        if token is not None:
+            env["GIT_ASKPASS"] = askpass
+            env["GH_ASKPASS_TOKEN"] = token
+        return env
+
+    def _git(self, args, git_dir=None, work_tree=None, auth=False,
+             identity=False, protocols=None):
+        """Run one hub git call: sanitized env, an EMPTY private hooks dir, the
+        safety ``-c`` set, explicit --git-dir / --work-tree. ``auth`` adds the
+        askpass token path and is only ever used with the mirror as GIT_DIR.
+        Returns (rc, stdout, stderr)."""
         tmp = tempfile.mkdtemp(prefix="ghpush-")
         try:
             try:
@@ -509,44 +607,29 @@ class GitHub:
             for kv in _SAFE_CONFIG:
                 prefix += ["-c", kv]
             prefix += ["-c", "core.hooksPath=" + hooks]
-            env = {
-                "GIT_TERMINAL_PROMPT": "0",
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_ALLOW_PROTOCOL": ":".join(self.allowed_protocols),
-            }
-            if identity and not self._has_identity(cwd):
-                acct = self.store.get_account() or {}
-                login = acct.get("login") or "calvoun-build"
-                uid = acct.get("user_id")
-                email = ("%s+%s@users.noreply.github.com" % (uid, login)) if uid \
-                    else ("%s@users.noreply.github.com" % login)
-                prefix += ["-c", "user.name=%s" % login, "-c", "user.email=%s" % email]
+            if identity:
+                login, email = self._identity()
+                prefix += ["-c", "user.name=" + login, "-c", "user.email=" + email]
+            token = askpass = None
             if auth:
                 for kv in _AUTH_CONFIG:
                     prefix += ["-c", kv]
                 token = self._require_token()
-                env["GIT_ASKPASS"] = self._write_askpass(tmp)
-                env["GH_ASKPASS_TOKEN"] = token
+                askpass = self._write_askpass(tmp)
+            if git_dir:
+                prefix.append("--git-dir=" + git_dir)
+            if work_tree:
+                prefix.append("--work-tree=" + work_tree)
+            env = self._env(protocols or self.allowed_protocols, token, askpass)
+            cwd = work_tree or git_dir or self.mirror_root()
             return self.run_git(prefix + list(args), cwd=cwd, env=env)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
     @staticmethod
     def _write_askpass(folder):
-        """The GIT_ASKPASS helper, in the call's private 0700 temp dir. It
-        answers ONLY git's two prompts for exactly https://github.com
-        (username ``x-access-token``, password = the token from the env var
-        GH_ASKPASS_TOKEN) and prints nothing for any other prompt, so a planted
-        ``url.<evil>.insteadOf`` / ``remote.github.pushurl`` / http:// /
-        github.com.evil host never receives the token. The token is never in
-        the script body.
-
-        ONE POSIX sh script on every platform: Git for Windows runs ``#!/bin/sh``
-        askpass scripts itself (verified 2026-10-11 with ``git credential
-        fill``). A Windows .bat is deliberately NOT used: cmd.exe parses the
-        prompt argument before the script runs, and git URL-decodes a remote's
-        username into that prompt, so a planted push URL could inject a
-        command."""
+        """The GIT_ASKPASS helper (see _ASKPASS_SH) in the call's private 0700
+        temp dir. The token is never in the script body."""
         script = os.path.join(folder, "askpass.sh")
         with open(script, "w", encoding="ascii", newline="\n") as f:
             f.write(_ASKPASS_SH)
@@ -556,62 +639,69 @@ class GitHub:
             pass
         return script
 
-    def _has_identity(self, cwd):
-        rc, out, _ = self._git(["config", "user.email"], cwd=cwd)
-        if rc == 0 and out.strip():
-            rc2, out2, _ = self._git(["config", "user.name"], cwd=cwd)
-            return rc2 == 0 and bool(out2.strip())
-        return False
-
-    def _is_repo(self, folder):
-        return os.path.isdir(os.path.join(folder, ".git"))
-
-    def _ensure_repo(self, folder):
-        if self._is_repo(folder):
+    def _check_git(self):
+        if self._git_ok:
             return
-        rc, _out, err = self._git(["init", "-b", "main"], cwd=folder)
-        if rc != 0:
-            # Older git without -b: init, then name the unborn branch main.
-            rc2, _o2, err2 = self._git(["init"], cwd=folder)
-            if rc2 != 0:
-                raise GhError("git_error", "Could not create a git repository here. %s"
-                              % _tail(err2 or err))
-            self._git(["symbolic-ref", "HEAD", "refs/heads/main"], cwd=folder)
+        rc, out, _ = self._git(["--version"])
+        m = re.search(r"(\d+)\.(\d+)", out or "")
+        if rc != 0 or not m:
+            raise GhError("no_git", "git is not installed or not on PATH.")
+        if (int(m.group(1)), int(m.group(2))) < _MIN_GIT:
+            raise GhError("git_too_old", "GitHub push needs git %d.%d or newer." % _MIN_GIT)
+        self._git_ok = True
 
-    def _current_branch(self, folder):
-        rc, out, _ = self._git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=folder)
-        b = (out or "").strip()
-        return b if rc == 0 and b and b != "HEAD" else "main"
+    # ---- the hub-owned mirror ---------------------------------------------
+    def _key(self, folder):
+        return _real(folder)
 
-    def _has_commit(self, folder):
-        rc, _out, _err = self._git(["rev-parse", "--verify", "HEAD"], cwd=folder)
+    def mirror_path(self, folder):
+        digest = hashlib.sha256(_real(folder).encode("utf-8")).hexdigest()[:16]
+        return os.path.join(self.mirror_root(), digest + ".git")
+
+    def _mirror_ready(self, m):
+        return os.path.isfile(os.path.join(m, "HEAD"))
+
+    def _has_main(self, m):
+        rc, _o, _e = self._git(["rev-parse", "--verify", "--quiet", _MAIN], git_dir=m)
         return rc == 0
 
-    def _remotes(self, folder):
-        rc, out, _ = self._git(["remote"], cwd=folder)
-        return [r.strip() for r in (out or "").splitlines() if r.strip()] if rc == 0 else []
+    def _ensure_mirror(self, folder):
+        """Create the hub-owned bare mirror (once) and import the project's own
+        history ONCE when it has some. The project's .git is only READ, by that
+        one tokenless local fetch."""
+        m = self.mirror_path(folder)
+        if _is_link(m):
+            raise GhError("refused", "The hub's copy of this project was replaced by a link.")
+        if not self._mirror_ready(m):
+            template = self._hub_dir("template")          # empty: no sample hooks
+            rc, _o, err = self._git(["init", "--bare", "--quiet", "-b", "main",
+                                     "--template=" + template, m])
+            if rc != 0:
+                raise GhError("git_error", "Could not prepare the hub's copy of this "
+                                           "project. %s" % _tail(err))
+            for key, value in (("core.hooksPath", self._hub_dir("nohooks")),
+                               ("core.fsmonitor", "false"),
+                               ("gc.autoDetach", "false")):
+                self._git(["config", key, value], git_dir=m)
+            if os.path.lexists(os.path.join(folder, ".git")):
+                # Tokenless, local transport only. A failure (no commits yet,
+                # not a repo, another owner) just means no history to import.
+                self._git(["fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
+                           folder, "HEAD:" + _MAIN], git_dir=m, protocols=("file",))
+        if not os.path.exists(os.path.join(m, "index")) and self._has_main(m):
+            # Start the index from main (tracked-but-ignored files stay tracked).
+            self._git(["read-tree", _MAIN], git_dir=m, work_tree=folder)
+        return m
 
-    def _github_remote_url(self, folder):
-        rc, out, _ = self._git(["remote", "get-url", "github"], cwd=folder)
-        return (out or "").strip() if rc == 0 else None
-
-    def _wire_remote(self, folder, url):
-        """Point the ``github`` remote at ``url`` (add it, or update ONLY the
-        github remote — origin and any other remote are never touched)."""
-        if "github" in self._remotes(folder):
-            self._git(["remote", "set-url", "github", url], cwd=folder)
-        else:
-            self._git(["remote", "add", "github", url], cwd=folder)
-
-    # ---- what would be committed -----------------------------------------
-    def _staged_paths(self, folder):
-        """Relative paths that would go into the next commit: everything git
-        status shows as added/modified/untracked (ignored files are excluded by
-        git). Deletions are left out."""
-        rc, out, _ = self._git(
-            ["status", "--porcelain", "-z", "--untracked-files=all"], cwd=folder)
+    def _would_commit(self, folder, m):
+        """Relative paths the next snapshot would add or change (the mirror's
+        index vs the project's work tree; .gitignore respected). Deletions are
+        left out. Fails CLOSED: an unreadable status is an error, never "no
+        files"."""
+        rc, out, err = self._git(["status", "--porcelain", "-z", "--untracked-files=all"],
+                                 git_dir=m, work_tree=folder)
         if rc != 0:
-            return []
+            raise GhError("git_error", "Could not read the project's files. %s" % _tail(err))
         entries = out.split("\x00")
         paths = []
         i = 0
@@ -623,65 +713,112 @@ class GitHub:
             xy, path = e[:2], e[3:]
             if xy[:1] in ("R", "C"):
                 i += 1                       # the rename/copy source is the next field
-            if "D" in xy and path:
-                # a pure deletion contributes no file to scan
-                if xy in ("D ", " D", "DD"):
-                    i += 1
-                    continue
+            if xy in ("D ", " D", "DD"):
+                i += 1
+                continue
             if path:
                 paths.append(path)
             i += 1
         return paths
 
-    def _raise_if_secrets(self, folder):
-        findings = scan_secrets(folder, self._staged_paths(folder))
+    def _raise_if_secrets(self, folder, m):
+        findings = scan_secrets(folder, self._would_commit(folder, m))
         if findings:
             raise GhError("secrets_found",
                           "Found something that should not be published. "
-                          "Add these to .gitignore, or remove them, then push again.",
+                          "Add these to .gitignore, or remove them, then try again.",
                           extra={"findings": findings,
                                  "has_gitignore": os.path.isfile(
                                      os.path.join(folder, ".gitignore"))})
 
+    def _snapshot(self, folder, m):
+        """Secret-scan, then ``add -A`` + commit into the MIRROR (no token in
+        the environment). Commits only when something changed."""
+        self._raise_if_secrets(folder, m)
+        rc, _o, err = self._git(["add", "-A"], git_dir=m, work_tree=folder)
+        if rc != 0:
+            raise GhError("git_error", "Could not stage the files. %s" % _tail(err))
+        has_main = self._has_main(m)
+        drc, _o2, _e2 = self._git(["diff", "--cached", "--quiet"], git_dir=m, work_tree=folder)
+        if drc == 0:                              # nothing staged
+            if not has_main:
+                raise GhError("nothing_to_commit", "This project has no files to commit yet.")
+            return False
+        crc, _oc, cerr = self._git(["commit", "--quiet", "-m", _COMMIT_MESSAGE],
+                                   git_dir=m, work_tree=folder, identity=True)
+        if crc != 0:
+            raise GhError("git_error", "Could not commit. %s" % _tail(cerr))
+        return True
+
+    def _linked_url(self, folder):
+        """The stored push URL, validated against the CONNECTED account."""
+        row = self.store.get_project(self._key(folder)) or {}
+        url = row.get("url")
+        if not url:
+            raise GhError("not_connected", "Create a GitHub repository for this project first.")
+        acct = self.store.get_account() or {}
+        if not valid_url(url, acct.get("login")):
+            raise GhError("bad_link",
+                          "This project's GitHub link does not belong to the connected "
+                          "account, so nothing was pushed.")
+        return url
+
+    def _ahead_behind(self, m):
+        rc, out, _ = self._git(["rev-list", "--left-right", "--count",
+                                "%s...%s" % (_MAIN, _TRACK)], git_dir=m)
+        if rc != 0:
+            return None, None
+        try:
+            left, right = (out or "").split()[:2]
+            return int(left), int(right)
+        except (ValueError, IndexError):
+            return None, None
+
     # ---- public operations ------------------------------------------------
     def preview(self, project_dir):
-        """Files that would be committed (capped list + total) and the secret
-        findings that would block a push."""
+        """Files the next push would commit (capped list + total) and the secret
+        findings that would block it. Only for a linked project."""
         folder = self._guard_folder(project_dir)
-        self._ensure_repo(folder)
-        paths = self._staged_paths(folder)
-        findings = scan_secrets(folder, paths)
+        self._check_git()
+        self._linked_url(folder)
+        m = self._ensure_mirror(folder)
+        paths = self._would_commit(folder, m)
         return {
             "files": paths[:200],
             "total_files": len(paths),
-            "findings": findings,
+            "findings": scan_secrets(folder, paths),
             "has_gitignore": os.path.isfile(os.path.join(folder, ".gitignore")),
         }
 
     def add_gitignore(self, project_dir, add=None, default=False):
-        """Append lines to .gitignore (creating it). ``default`` writes the
-        hub's default set; ``add`` is an explicit list of paths. Only ever
-        appends lines not already present. Returns ``{written:[...]}``."""
+        """Append lines to the project's .gitignore (creating it). ``default``
+        writes the hub's default set; ``add`` is a list of plain paths (no
+        control characters, no "!" negation, no comment). Only lines not yet
+        present are added. A .gitignore that is a link or not a regular file is
+        refused; the write replaces the file itself, never a link target.
+        Returns ``{written:[...]}``."""
         folder = self._guard_folder(project_dir)
-        want = []
-        if default:
-            want.extend(DEFAULT_GITIGNORE)
-        if add:
-            for p in add:
-                if isinstance(p, str) and p.strip():
-                    want.append(p.strip())
+        want = list(DEFAULT_GITIGNORE) if default else []
+        for p in (add or []):
+            if not isinstance(p, str):
+                continue
+            p = p.strip().replace("\\", "/")
+            if (not p or len(p) > 300 or p.startswith(("!", "#"))
+                    or any(ord(c) < 32 or ord(c) == 127 for c in p)):
+                raise GhError("bad_request", "That is not a path that can go into .gitignore.")
+            want.append(p)
         if not want:
             raise GhError("bad_request", "Nothing to add to .gitignore.")
         path = os.path.join(folder, ".gitignore")
         existing = ""
-        present = set()
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    existing = f.read()
-            except OSError:
-                existing = ""
-            present = {ln.strip() for ln in existing.splitlines() if ln.strip()}
+        if os.path.lexists(path):
+            if _is_link(path):
+                raise GhError("refused", "This project's .gitignore is a link; the hub will not write through it.")
+            text, why = deploy_perfect.safe_read_text(path, os.path.realpath(folder), _GITIGNORE_MAX)
+            if text is None:
+                raise GhError("refused", "This project's .gitignore cannot be read safely (%s)." % why)
+            existing = text
+        present = {ln.strip() for ln in existing.splitlines() if ln.strip()}
         written = []
         for line in want:
             if line not in present:
@@ -698,17 +835,18 @@ class GitHub:
             out += "\n# Added by Calvoun Build\n"
         out += "\n".join(written) + "\n"
         try:
-            with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(out)
+            _atomic_write(path, out)
         except OSError as exc:
             raise GhError("git_error", "Could not write .gitignore (%s)." % exc)
         return {"written": written}
 
     def create_repo(self, project_dir, name, private=True, public_ok=False):
         """Create a repo on the authenticated user's account (auto_init:false),
-        wire the ``github`` remote and push. ``private`` defaults True; a public
-        repo additionally needs ``public_ok`` true."""
+        store its URL and push the first snapshot. ``private`` defaults True; a
+        public repo additionally needs ``public_ok``. The secret scan runs
+        BEFORE anything is created on GitHub."""
         folder = self._guard_folder(project_dir)
+        self._check_git()
         token = self._require_token()
         private = bool(private)
         if not private and not public_ok:
@@ -717,11 +855,13 @@ class GitHub:
         repo = sanitize_repo_name(name)
         if not repo:
             raise GhError("bad_name", "That repository name is not usable on GitHub.")
-        # Secret scan BEFORE anything is created on GitHub: a finding refuses
-        # "Create & push" with nothing made remotely (a local `git init` is the
-        # only side effect -- the scan needs git status to honour .gitignore).
-        self._ensure_repo(folder)
-        self._raise_if_secrets(folder)
+        if (self.store.get_project(self._key(folder)) or {}).get("url"):
+            raise GhError("already_linked", "This project is already linked to a GitHub repository.")
+        login = (self.store.get_account() or {}).get("login")
+        if not login or not _LOGIN_RE.match(str(login)):
+            raise GhError("no_token", "Connect your GitHub account first.")
+        m = self._ensure_mirror(folder)
+        self._raise_if_secrets(folder, m)
         status, data = self._api("POST", "/user/repos", token,
                                  {"name": repo, "private": private, "auto_init": False})
         if status == 201 and isinstance(data, dict) and data.get("full_name"):
@@ -736,114 +876,104 @@ class GitHub:
         else:
             raise GhError("github_error",
                           "GitHub could not create the repository (HTTP %s)." % status)
-        self._ensure_repo(folder)
-        acct = self.store.get_account() or {}
-        login = info.get("owner", {}).get("login") or acct.get("login")
-        self._wire_remote(folder, self.remote_url(login, repo))
-        self._record(folder, info)
-        # Push the first commit. A secrets block propagates (the repo now exists,
-        # so a later Push after fixing them works).
-        self.push(project_dir)
+        owner = str((info.get("owner") or {}).get("login") or login)
+        made = str(info.get("name") or str(info.get("full_name")).split("/")[-1] or repo)
+        url = canonical_url(login, made)
+        if owner.lower() != str(login).lower() or not _REPO_NAME_RE.match(made) \
+                or not valid_url(url, login):
+            raise GhError("github_error", "GitHub answered with a repository that is not "
+                                          "on your account; nothing was linked.")
+        self.store.set_project(self._key(folder), {
+            "url": url,
+            "full_name": "%s/%s" % (login, made),
+            "private": bool(info.get("private", private)),
+            "created_at": self.clock(),
+            "last_pushed": None, "ahead": None, "behind": None,
+        })
+        self._snapshot(folder, m)
+        self._push_mirror(folder, m, url)
         return self.status(project_dir)
 
     def push(self, project_dir):
-        """Secret-scan, stage (git add -A), commit only when there are changes,
-        then ``git push github HEAD:main``. Never force-pushes."""
+        """Snapshot the work tree into the mirror, then push the mirror's main
+        to the stored URL. Never a force push."""
         folder = self._guard_folder(project_dir)
+        self._check_git()
         self._require_token()
-        self._ensure_repo(folder)
-        if not self._github_remote_url(folder):
-            raise GhError("not_connected", "Create a GitHub repository first.")
-        self._raise_if_secrets(folder)
-        rc, _o, err = self._git(["add", "-A"], cwd=folder)
-        if rc != 0:
-            raise GhError("git_error", "Could not stage the files. %s" % _tail(err))
-        staged_rc, _o2, _e2 = self._git(["diff", "--cached", "--quiet"], cwd=folder)
-        has_commit = self._has_commit(folder)
-        if staged_rc != 0:                       # there ARE staged changes
-            crc, _oc, cerr = self._git(["commit", "-m", _COMMIT_MESSAGE],
-                                       cwd=folder, identity=True)
-            if crc != 0:
-                raise GhError("git_error", "Could not commit. %s" % _tail(cerr))
-        elif not has_commit:
-            raise GhError("nothing_to_commit",
-                          "This project has no files to commit yet.")
-        branch = self._current_branch(folder)
+        url = self._linked_url(folder)
+        m = self._ensure_mirror(folder)
+        self._snapshot(folder, m)
+        self._push_mirror(folder, m, url)
+        return self.status(project_dir)
+
+    def _push_mirror(self, folder, m, url):
+        url = self._linked_url(folder) if url is None else url
         prc, _op, perr = self._git(
-            ["push", "--no-verify", "--no-recurse-submodules", "github", "HEAD:main"],
-            cwd=folder, auth=True)
+            ["push", "--quiet", "--no-verify", "--no-recurse-submodules",
+             self.transport_url(url), "%s:%s" % (_MAIN, _MAIN)],
+            git_dir=m, auth=True)
         if prc != 0:
             if _is_non_fast_forward(perr):
                 raise GhError("behind_remote",
                               "GitHub has changes this copy doesn't. Press Sync first, "
                               "then push again.")
             raise GhError("push_failed", "The push to GitHub failed. %s" % _tail(perr))
-        self._touch_pushed(folder, branch)
-        return self.status(project_dir)
-
-    def sync(self, project_dir):
-        """``git fetch github`` then a fast-forward-only merge. A diverged
-        history is reported, never auto-merged or rebased."""
-        folder = self._guard_folder(project_dir)
-        self._require_token()
-        if not self._is_repo(folder) or not self._github_remote_url(folder):
-            raise GhError("not_connected", "Connect this project to GitHub first.")
-        frc, _o, ferr = self._git(["fetch", "--no-recurse-submodules", "github"],
-                                  cwd=folder, auth=True)
-        if frc != 0:
-            raise GhError("fetch_failed", "Could not fetch from GitHub. %s" % _tail(ferr))
-        ahead, behind = self._ahead_behind(folder)
-        if behind and ahead:
-            raise GhError("diverged",
-                          "This copy and GitHub have each changed since they last "
-                          "matched (%d local, %d on GitHub). Open the project and "
-                          "merge them by hand — the hub will not merge automatically."
-                          % (ahead, behind))
-        if behind:
-            mrc, _om, merr = self._git(["merge", "--ff-only", "github/main"], cwd=folder)
-            if mrc != 0:
-                raise GhError("diverged",
-                              "GitHub's changes could not be fast-forwarded in. "
-                              "Merge them by hand. %s" % _tail(merr))
-        ahead, behind = self._ahead_behind(folder)
-        self._record_counts(folder, ahead, behind)
-        return self.status(project_dir)
-
-    def _ahead_behind(self, folder):
-        """(ahead, behind) of HEAD vs github/main, or (None, None) when the
-        remote branch is unknown."""
-        rc, out, _ = self._git(
-            ["rev-list", "--left-right", "--count", "HEAD...github/main"], cwd=folder)
-        if rc != 0:
-            return None, None
-        try:
-            left, right = (out or "").split()[:2]
-            return int(left), int(right)
-        except (ValueError, IndexError):
-            return None, None
-
-    # ---- project state ----------------------------------------------------
-    def _key(self, folder):
-        return os.path.normcase(os.path.realpath(os.path.abspath(folder)))
-
-    def _record(self, folder, info):
-        self.store.set_project(self._key(folder), {
-            "full_name": info.get("full_name"),
-            "html_url": info.get("html_url"),
-            "private": bool(info.get("private")),
-            "default_branch": info.get("default_branch") or "main",
-            "created_at": self.clock(),
-            "last_pushed": None,
-            "ahead": None, "behind": None,
-        })
-
-    def _touch_pushed(self, folder, branch):
+        self._git(["update-ref", _TRACK, _MAIN], git_dir=m)
         key = self._key(folder)
         row = self.store.get_project(key) or {}
-        row["last_pushed"] = self.clock()
-        row["branch"] = branch
-        row["ahead"] = 0
+        row.update({"last_pushed": self.clock(), "ahead": 0, "behind": 0})
         self.store.set_project(key, row)
+
+    def sync(self, project_dir):
+        """Fetch GitHub's main into the mirror. When GitHub is strictly ahead and
+        the project's work tree is unchanged since the mirror's main, the work
+        tree is fast-forwarded from the mirror; otherwise nothing is touched."""
+        folder = self._guard_folder(project_dir)
+        self._check_git()
+        self._require_token()
+        url = self._linked_url(folder)
+        m = self._ensure_mirror(folder)
+        frc, _o, ferr = self._git(
+            ["fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
+             self.transport_url(url), "+%s:%s" % (_MAIN, _TRACK)],
+            git_dir=m, auth=True)
+        if frc != 0:
+            if "couldn't find remote ref" in (ferr or "").lower():
+                self._record_counts(folder, None, 0)         # GitHub is still empty
+                return self.status(project_dir)
+            raise GhError("fetch_failed", "Could not fetch from GitHub. %s" % _tail(ferr))
+        has_main = self._has_main(m)
+        if has_main:
+            ahead, behind = self._ahead_behind(m)
+        else:
+            rc, out, _ = self._git(["rev-list", "--count", _TRACK], git_dir=m)
+            ahead, behind = 0, (int(out.strip()) if rc == 0 and out.strip().isdigit() else 0)
+        if ahead and behind:
+            raise GhError("diverged",
+                          "This copy and GitHub have each changed since they last "
+                          "matched (%d here, %d on GitHub). The hub will not merge "
+                          "them; merge them by hand." % (ahead, behind))
+        if behind:
+            if self._would_commit(folder, m):
+                raise GhError("local_changes",
+                              "GitHub has newer changes, and this project also has "
+                              "changes that are not on GitHub yet. Nothing was "
+                              "touched: set your changes aside, Sync, then re-apply "
+                              "them.")
+            trees = [_MAIN, _TRACK] if has_main else [_TRACK]
+            rrc, _or, rerr = self._git(["read-tree", "-u", "-m"] + trees,
+                                       git_dir=m, work_tree=folder)
+            if rrc != 0:
+                raise GhError("local_changes",
+                              "The project's files could not be updated safely. %s" % _tail(rerr))
+            old = []
+            if has_main:
+                orc, oout, _ = self._git(["rev-parse", _MAIN], git_dir=m)
+                old = [oout.strip()] if orc == 0 and oout.strip() else []
+            self._git(["update-ref", _MAIN, _TRACK] + old, git_dir=m)
+            ahead, behind = self._ahead_behind(m)
+        self._record_counts(folder, ahead, behind)
+        return self.status(project_dir)
 
     def _record_counts(self, folder, ahead, behind):
         key = self._key(folder)
@@ -857,7 +987,7 @@ class GitHub:
 
     def status(self, project_dir=None):
         """Connection + (optionally) one project's state. Never returns a token.
-        Reads only local git and the remembered project row — no network."""
+        Runs no git and no network: the stored row and the mirror's presence."""
         acct = self.store.get_account()
         out = {
             "connected": bool(acct),
@@ -873,19 +1003,20 @@ class GitHub:
             out["project"] = {"dir": project_dir, "refused": exc.message,
                               "code": exc.code}
             return out
-        is_repo = self._is_repo(folder)
-        remote = self._github_remote_url(folder) if is_repo else None
         row = self.store.get_project(self._key(folder)) or {}
+        url = row.get("url")
         repo = None
-        if row.get("full_name"):
-            repo = {"full_name": row.get("full_name"), "html_url": row.get("html_url"),
-                    "private": row.get("private"), "default_branch": row.get("default_branch")}
+        if url:
+            full = url[len("https://github.com/"):-len(".git")]
+            repo = {"full_name": full, "html_url": url[:-len(".git")],
+                    "private": row.get("private"), "default_branch": "main",
+                    "account_matches": valid_url(url, (acct or {}).get("login"))}
         out["project"] = {
             "dir": folder,
-            "is_repo": is_repo,
-            "has_remote": bool(remote),
+            "is_repo": self._mirror_ready(self.mirror_path(folder)),
+            "has_remote": bool(url),
             "repo": repo,
-            "branch": self._current_branch(folder) if is_repo else None,
+            "branch": "main",
             "ahead": row.get("ahead"),
             "behind": row.get("behind"),
             "last_pushed": row.get("last_pushed"),
@@ -920,5 +1051,5 @@ def _is_non_fast_forward(stderr):
             or "failed to push some refs" in s)
 
 
-# The module-level singleton app.py uses. Its guards are wired at boot.
+# The module-level singleton app.py uses. Its guards are wired at import.
 default = GitHub()

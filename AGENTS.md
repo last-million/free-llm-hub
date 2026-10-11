@@ -4468,13 +4468,14 @@ Owner: from the Build page, push the current project to GitHub -- first time
 create a repo on the owner's OWN account (private by default), afterwards Push /
 Sync on a click. NEVER automatic: every create/push/gitignore write is an
 explicit, confirmed click. Covered by `tests/test_github_push.py` (hermetic:
-fake GitHub HTTP, REAL git in tmp_path against a LOCAL BARE repo via an injected
-remote-URL resolver; an autouse fence fails loudly if anything reaches the real
-api.github.com). Pure engine: `ghpush.py` (stdlib only -- urllib for the REST
+fake GitHub HTTP, REAL git in tmp_path against LOCAL BARE repos that stand in
+for GitHub via the injected `transport_url` test seam; an autouse fence fails
+loudly if anything reaches the real api.github.com). Pure engine: `ghpush.py`
+(stdlib + deploy_perfect's stdlib-only link/read helpers -- urllib for the REST
 API, subprocess argv lists for git; every side effect injectable: `http`,
-`run_git`, `clock`, `store`, `remote_url`). It raises only `GhError(code,
-message, extra)`. New app.py symbols are `_gh_*`; the routes are a new
-`# GITHUB:` section beside `# PUBLISH:`.
+`run_git`, `clock`, `store`, `mirror_root`, `transport_url`). It raises only
+`GhError(code, message, extra)`. New app.py symbols are `_gh_*`; the routes are
+a new `# GITHUB:` section beside `# PUBLISH:`.
 
 - **Token.** The owner pastes a GitHub token (fine-grained: Contents +
   Administration read/write for repo creation, Metadata read; or classic
@@ -4482,74 +4483,131 @@ message, extra)`. New app.py symbols are `_gh_*`; the routes are a new
   provider-key mechanism (`secretstore.encrypt`) under `config["github"]`
   (`{token: enc.v1:…, login, user_id, hint}`). It is NEVER logged (the route
   logs the login only), NEVER returned (status shows `login` + a masked
-  `hint` = type prefix + last four), and NEVER written into `.git/config` or a
-  remote URL. Storing it there (not in `providers`) keeps it OUT of
+  `hint` = type prefix + last four), and never written to disk by git (a test
+  reads every file the hub's git wrote). Storing it there (not in `providers`) keeps it OUT of
   `migrations.key_fingerprint` (so a migration never counts or risks it) and
   out of config's providers-only encrypt/decrypt pass -- `save_config` carries
   the pre-encrypted string through untouched and it stays encrypted on load.
   `tests/test_safe_migrations.py` stays green.
-- **git auth.** The `github` remote URL is `https://github.com/<login>/<repo>.git`
-  with NO token. The token reaches git only through a `GIT_ASKPASS` helper
-  script in a private 0700 temp dir (deleted right after the command) that
-  echoes the env var `GH_ASKPASS_TOKEN` -- the token is never on a command line
-  and never in the script body. Every git call runs with `-c credential.helper=`
-  (empty) + `GIT_TERMINAL_PROMPT=0` + `GIT_CONFIG_NOSYSTEM=1`, so NO credential
-  manager is read or written (this PC's Windows Credential Manager holds a
-  DIFFERENT account and must never be used). Commit identity, only when the repo
-  has none configured: `-c user.name=<login> -c user.email=<id>+<login>@users.noreply.github.com`
-  per command (never the global config).
-- **Hardening (2026-10-11): the project's .git/config and hooks are HOSTILE**
-  (AI agents write them and can be prompt-injected). Every git call gets
-  `-c core.hooksPath=<empty private temp dir>` + `core.fsmonitor=false` +
-  `credential.useHttpPath=false` + no submodule recursion and env
-  `GIT_ALLOW_PROTOCOL=https` (overrides any planted `protocol.*.allow`, so no
-  ext::/ssh `sshCommand`/local `receivepack` remote runs a command with the
-  token in the env); push/fetch add `http.sslVerify=true` + `push.gpgSign=false`,
-  push adds `--no-verify`. The askpass answers ONLY the exact prompts for
-  `https://github.com` (username `x-access-token`, password from the env var)
-  and prints nothing otherwise, so a planted `url.*.insteadOf` / `pushurl` /
-  http:// host never gets the token. It is ONE `#!/bin/sh` script on every OS
-  (Git for Windows runs it; verified with `git credential fill`) -- a `.bat` is
-  NOT used: cmd parses the prompt argument, and git URL-decodes a remote's
-  username into it. "Create & push" scans for secrets BEFORE the POST: a
-  finding creates nothing on GitHub. RESIDUAL RISK: an agent running as the same
-  OS user can still read `config.json` + `secret.key` and decrypt the token
-  itself; none of this defends against that.
+- **Mirror design (2026-10-11, structural; replaces the flag-by-flag hardening
+  of 383e5b5).** A project's `.git/config`, hooks and `.gitattributes` are
+  written by AI agents that can be prompt-injected, and `~/.gitconfig` is
+  same-user writable, so the git process that carries the token reads NEITHER.
+  Flag-by-flag `-c` overrides lose to URL-specific keys
+  (`http.https://github.com/.sslVerify`, `http.<url>.proxy`,
+  `credential.<url>.helper`) and cannot stop `filter.*`/`gpg.program` in
+  add/commit, nor a planted `remote.*.pushurl` / `insteadOf` redirecting the
+  push into another of the owner's repos.
+  - **Hub-owned bare mirror** per project:
+    `state_dir()/github-mirrors/<sha256(normcase realpath)[:16]>.git`, made with
+    `git init --bare -b main --template=<empty hub dir>`; its config is written
+    only by the hub (`core.hooksPath` = an empty hub dir, `core.fsmonitor=false`).
+    No git call ever uses the project's `.git` as its GIT_DIR, and this feature
+    never writes the project's `.git` (a test byte-compares `.git/config` and
+    `HEAD`). A project with its own history is imported ONCE, tokenless and
+    local-only: `git --git-dir=<mirror> fetch <project path> HEAD:refs/heads/main`.
+  - **Sanitized env on every call** (`GitHub._env`): every inherited `GIT_*`
+    variable dropped (GIT_DIR, GIT_CONFIG_PARAMETERS/COUNT, GIT_SSL_NO_VERIFY,
+    GIT_TRACE*, GIT_TEMPLATE_DIR ...) and `CURL_HOME`; `GIT_CONFIG_GLOBAL` = an
+    empty hub-owned file and `HOME` / `XDG_CONFIG_HOME` = a hub-owned dir (no
+    ~/.gitconfig, XDG config or ~/.netrc); system config KEPT (admin-owned; Git
+    for Windows keeps its TLS settings there -- 383e5b5's `GIT_CONFIG_NOSYSTEM`
+    is gone); `GIT_TERMINAL_PROMPT=0`; `GIT_ALLOW_PROTOCOL` = only what the call
+    needs (`file` for the import, `https` for push/fetch). Plus `-c`: an EMPTY
+    private `core.hooksPath` (per call, removed after), `core.fsmonitor=false`,
+    `credential.helper=` (empty: no credential manager -- this PC's Windows
+    Credential Manager holds a DIFFERENT account), `credential.useHttpPath=false`,
+    no submodule recursion, no commit/tag/push signing. Needs git >= 2.32
+    (`GIT_CONFIG_GLOBAL`; `git_too_old` otherwise).
+  - **Snapshot (no token):** `git --git-dir=<mirror> --work-tree=<project> add -A`
+    then `commit` with an explicit `-c user.name=<login> -c
+    user.email=<id>+<login>@users.noreply.github.com`. The project's
+    `.gitignore` / `.gitattributes` are work-tree files and still apply, but a
+    filter driver exists only in config and the mirror has none.
+  - **Push / fetch (the only calls with the token)** run from the MIRROR to the
+    EXPLICIT stored URL `https://github.com/<login>/<repo>.git` -- never a
+    remote name. The URL is stored in `github-projects.json` only when the hub
+    itself created the repo through the API for the connected account (owner +
+    name checked), and is re-validated before EVERY use against
+    `^https://github\.com/<connected login>/[A-Za-z0-9._-]+\.git$`
+    (`ghpush.valid_url`); anything else is `bad_link` (also after reconnecting
+    a different account). No request can set or change it: `create` on a
+    linked project is `already_linked`. `transport_url` maps the validated URL to
+    what git is given -- identity in the hub, a local bare repo in tests.
+  - **The token** reaches git only through a `GIT_ASKPASS` helper in the call's
+    private 0700 temp dir that answers ONLY git's exact prompts for
+    `https://github.com` (username `x-access-token`, password from the env var
+    `GH_ASKPASS_TOKEN`; never in the script body, never on a command line) and
+    prints nothing for any other host or http://. ONE `#!/bin/sh` script on
+    every OS (Git for Windows runs it; verified with `git credential fill`); a
+    `.bat` is NOT used: cmd parses the prompt argument, and git URL-decodes a
+    remote's username into it. Push/fetch add `http.sslVerify=true`; push adds
+    `--no-verify`; never a force push.
+  - **Proven by tests:** a hostile project `.git/config` (url-specific
+    sslVerify/proxy, `http.sslCAInfo`, `http.curloptResolve`, `insteadOf` /
+    `pushInsteadOf` / `pushurl`, credential helpers, `filter.*` +
+    `.gitattributes`, `gpg.program` + `commit.gpgSign`, `core.fsmonitor`,
+    `core.hooksPath`, `.git/hooks`) and a hostile global config + GIT_* env
+    (GIT_CONFIG_GLOBAL, GIT_CONFIG_COUNT, GIT_TEMPLATE_DIR, HOME/XDG) never run a
+    planted program (marker files stay absent; a control shows plain git DOES
+    run them) and the push lands in the stored-URL repo, never the planted one.
+  - **RESIDUAL RISK:** an agent running as the same OS user can still read
+    `config.json` + `secret.key` (and write the hub's state dir) and decrypt or
+    use the token itself; nothing here defends against that.
 - **Create.** POST /user/repos `{name, private, auto_init:false}` on the
   authenticated user's account. The name is sanitized to GitHub's rules; a 422
   "already exists" is `repo_exists`, a 401/403 is `bad_scope`. Private is the
-  default; a public repo additionally needs `public_ok`. Then the local repo is
-  wired (`git init -b main` when it has no `.git`; a SEPARATE remote named
-  `github` is added -- `origin` and any other remote are never touched) and the
-  first commit is pushed.
+  default; a public repo additionally needs `public_ok`. The secret scan runs
+  BEFORE the POST (a finding creates nothing on GitHub); then the URL is stored
+  and the first snapshot pushed. The project gets no `.git` from this feature.
 - **Secret scan before every push** (blocks, code `secrets_found`, offers a
   .gitignore): file names `.env`/`.env.*` (except `.env.example`), `*.pem`,
   `*.key`, `id_rsa*`, `*.p12`, `credentials.json`; and content shapes `ghp_`,
   `github_pat_`, `sk-…`, `AKIA…`, `-----BEGIN … PRIVATE KEY-----`, `xox[baprs]-`,
-  `AIza…`. The scan reads only what WOULD be committed (`git status --porcelain
-  -z --untracked-files=all`, so .gitignore is respected). The default
+  `AIza…`. The scan reads only what WOULD be committed (the mirror's index vs
+  the work tree: `git --git-dir=<mirror> --work-tree=<project> status --porcelain
+  -z --untracked-files=all`, so .gitignore is respected; an unreadable status is
+  an error, never "no files"), and reads files only through
+  `deploy_perfect.safe_read_text` (no links, nothing outside the project). The default
   `.gitignore` is `node_modules/`, `.venv/`, `venv/`, `__pycache__/`, `*.pyc`,
   `.env`, `.env.*`, `!.env.example`, `*.log`, `.DS_Store`. **Build output
   (`dist/`, `build/`) is deliberately NOT in the default** -- a project may
   commit it on purpose (e.g. GitHub Pages); the user adds it via the same
-  button. .gitignore is only ever written on an explicit click.
-- **Push.** `git add -A` inside the project (the `git add -A` ban is for the hub
-  repo only), commit `"Update from Calvoun Build"` ONLY when there are staged
-  changes (never an empty commit), then `git push github HEAD:main` -- NEVER a
-  force push. A non-fast-forward is `behind_remote` ("press Sync first").
-- **Sync.** `git fetch github` then `git merge --ff-only github/main`. A
-  diverged history is `diverged` with a plain explanation -- no auto-merge, no
-  rebase.
-- **Refusals** (`_guard_folder`): the hub's own repo (`_cm_is_hub_repo`), a
-  too-broad folder (`_publish_folder_too_broad`: a drive root / home / above
-  it), and a symlinked/junction or non-directory folder. The hub's two guards
-  are injected at import (`ghpush.default.set_guards(...)`); ghpush does the
-  link/dir check itself. `status()` reports a refusal in `project.refused`
-  instead of raising.
-- **State.** Per-project last repo + visibility + last-pushed + ahead/behind
-  (ahead/behind only after a fetch, i.e. on Sync) in
-  `state_dir()/github-projects.json` (atomic write), keyed by the folder's
-  realpath.
+  button. .gitignore is only ever written on an explicit click, only with plain
+  paths (no control characters, no `!` negation, no comment), never through a
+  link: a `.gitignore` that is a link (`deploy_perfect.is_link`: symlink,
+  junction, reparse point) or not a regular file is refused, the read goes
+  through `deploy_perfect.safe_read_text`, and the write is a temp file in the
+  same folder + `os.replace` (replaces the file itself, never a link target).
+  It is the only file this feature writes inside a project besides Sync's
+  checkout (done by git, which refuses symlinked leading paths).
+- **Push.** Snapshot into the mirror (secret scan first; commit
+  `"Update from Calvoun Build"` ONLY when something changed -- never an empty
+  commit), then `git --git-dir=<mirror> push --no-verify <stored URL>
+  refs/heads/main:refs/heads/main` -- NEVER a force push. A non-fast-forward is
+  `behind_remote` ("press Sync first").
+- **Sync.** Fetch GitHub's main into the mirror's `refs/remotes/github/main`.
+  When GitHub is strictly ahead AND the work tree is unchanged since the
+  mirror's main, the work tree is fast-forwarded from the mirror
+  (`read-tree -u -m main github/main`, then main moves); local changes are
+  `local_changes` and a two-sided history is `diverged` -- both with a plain
+  message and NOTHING touched. No auto-merge, no rebase.
+- **Refusals / authorization** (`_guard_folder`, every operation): the hub's
+  own repo (`_cm_is_hub_repo`), a too-broad folder (`_publish_folder_too_broad`:
+  a drive root / home / above it), the hub's own state dir or anything inside or
+  around it (it holds `config.json` + `secret.key`), a symlinked/junction or
+  non-directory folder, and -- `unknown_project` -- any folder that is not a
+  Build project: `app._gh_known_project` accepts only the `project_dir` of an
+  open /agent session or a saved Build conversation (same realpath). The three
+  app guards are injected at import (`ghpush.default.set_guards(...)`). Push /
+  Sync / Preview need a stored link (`not_connected`); every mutation needs the
+  control token + dashboard header + (create/push/gitignore) `confirm: true`;
+  public also `public_ok`. `status()` runs no git and no network and reports a
+  refusal in `project.refused` instead of raising.
+- **State.** Per-project `{url, full_name, private, created_at, last_pushed,
+  ahead, behind, last_fetched}` (ahead/behind only after a fetch, i.e. on Sync)
+  in `state_dir()/github-projects.json` (atomic write), keyed by the folder's
+  normcase realpath; the mirror sits beside it in `github-mirrors/`.
 - **Routes** (all `/api/*`, so the existing control-token + dashboard-header
   guard applies; `Cache-Control: no-store`): `GET /api/github[?project_dir=]`,
   `POST /api/github/token {token}`, `POST /api/github/token/delete`,
@@ -4580,5 +4638,11 @@ message, extra)`. New app.py symbols are `_gh_*`; the routes are a new
   ahead/behind are shown from the last fetch, not refreshed on plain status (a
   fetch is network). `dist/`/`build/` are not in the default .gitignore (owner
   decision, documented above). A file:// local remote (the tests) needs no auth,
-  so the askpass path is asserted on the ENV the hub passes, not on git invoking
-  it.
+  so the askpass is proven separately (through `git credential fill` and run
+  directly). There is no unlink route: a project linked to a repo that was
+  later deleted on GitHub cannot be re-linked from the dashboard. The project's
+  own git history is imported once; commits made later in the project's own
+  `.git` reach GitHub only as their CONTENT inside the hub's next snapshot, not
+  as separate commits with their messages (the mirror snapshots the work tree).
+  The project's `.git/info/exclude` no longer applies (only
+  work-tree `.gitignore` files do).

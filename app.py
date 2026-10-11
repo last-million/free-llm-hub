@@ -41865,28 +41865,64 @@ def _cfi_set_auto(value):
 # click. NEVER automatic -- every create/push/gitignore write needs
 # `confirm: true`. The token is validated, stored ENCRYPTED (secretstore, the
 # provider-key mechanism), never logged, never returned (status shows only the
-# login + a masked hint), never written into .git/config or a remote URL. All
-# routes sit under /api/* (control token + dashboard header). The flag
-# `github_push` (default on) is the kill switch; status still answers when off.
+# login + a masked hint). Git runs on a HUB-OWNED bare mirror per project with
+# a sanitized environment, so the token-carrying git never reads the project's
+# .git/config or ~/.gitconfig, and pushes only to the stored, validated URL
+# (see ghpush.py). Only Build project folders (_gh_known_project). All routes
+# sit under /api/* (control token + dashboard header). The flag `github_push`
+# (default on) is the kill switch; status still answers when off.
 # ---------------------------------------------------------------------------
 
 _GH_HTTP = {
     "bad_request": 400, "bad_name": 400, "public_ok_required": 400,
     "confirm_required": 400,
     "bad_token": 401,
-    "disabled": 403, "refused": 403, "bad_scope": 403,
+    "disabled": 403, "refused": 403, "bad_scope": 403, "unknown_project": 403,
+    "bad_link": 403,
     "not_a_dir": 404, "not_found": 404,
     "no_token": 409, "not_connected": 409, "repo_exists": 409,
-    "behind_remote": 409, "diverged": 409, "secrets_found": 409,
-    "nothing_to_commit": 409, "no_git": 409,
+    "already_linked": 409, "behind_remote": 409, "diverged": 409,
+    "local_changes": 409, "secrets_found": 409, "nothing_to_commit": 409,
+    "no_git": 409, "git_too_old": 409,
     "git_error": 500, "github_error": 502, "network": 502,
     "push_failed": 502, "fetch_failed": 502,
     "git_timeout": 504,
 }
 
-# The hub's own folder guards: refuse the hub repo and any too-broad folder.
-# (A symlinked/not-a-dir folder is refused inside ghpush itself.)
-ghpush.default.set_guards(_cm_is_hub_repo, _publish_folder_too_broad)
+
+def _gh_known_project(folder):
+    """AUTHORIZATION: only a Build project's folder may be pushed -- one that an
+    open /agent session or a saved Build conversation uses (same realpath).
+    Any other folder of the user's (home subfolders, other repos) is refused,
+    whatever a request names. Never raises (an error = not known)."""
+    try:
+        want = _publish_real(folder)
+    except Exception:                                            # noqa: BLE001
+        return False
+    dirs = []
+    try:
+        dirs += [r.get("project_dir") for r in agentic_chat.list_sessions() or []]
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        dirs += [r.get("project_dir")
+                 for r in agentic_history.list_conversations(limit=5000) or []]
+    except Exception:                                            # noqa: BLE001
+        pass
+    for d in dirs:
+        if isinstance(d, str) and d:
+            try:
+                if _publish_real(d) == want:
+                    return True
+            except Exception:                                    # noqa: BLE001
+                continue
+    return False
+
+
+# The hub's own folder guards: refuse the hub repo, any too-broad folder and
+# anything that is not a Build project. (A symlinked/not-a-dir folder and the
+# hub's own state dir are refused inside ghpush itself.)
+ghpush.default.set_guards(_cm_is_hub_repo, _publish_folder_too_broad, _gh_known_project)
 
 
 def _gh_json(payload, status=200):

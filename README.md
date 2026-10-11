@@ -349,16 +349,22 @@ Quick Tunnel**: free, no Cloudflare account, nothing to configure.
 Next to Publish, a **GitHub** button pushes the current Build project to a repo
 on your own account. Paste a GitHub token once (fine-grained: Contents and
 Administration read/write, or classic `repo`); it is stored **encrypted** (the
-same mechanism as your provider keys), never logged, never returned and never
-written into `.git/config`. The first time you choose a name and **Private**
-(the default) or Public — a public repo needs an extra tick — and the hub
-creates the repo and pushes. After that it is **Push** and **Sync** on a click;
-nothing is ever automatic. Before every push a secret scan blocks `.env`,
-`*.pem`/`*.key`, `id_rsa*`, `credentials.json` and secret-shaped strings, and
-offers to add them to `.gitignore`. Sync is fast-forward only — a diverged
-history is reported, never merged for you. Build output (`dist/`, `build/`) is
-not in the default `.gitignore`; add it yourself if you don't want it committed.
-Switch it off with the `github_push` flag (default on).
+same mechanism as your provider keys), never logged and never returned. The
+first time you choose a name and **Private** (the default) or Public — a public
+repo needs an extra tick — and the hub creates the repo and pushes. After that
+it is **Push** and **Sync** on a click; nothing is ever automatic. Only a Build
+project's folder can be pushed. The hub keeps the history in its **own copy**
+of the repository (in its data folder): it never writes your project's `.git`,
+and the git that uses your token never reads the project's git settings or your
+`~/.gitconfig`, so an agent cannot redirect the push or capture the token
+through them. It always pushes to the exact repository it created for your
+account. Before every push — and before the repo is created — a secret scan
+blocks `.env`, `*.pem`/`*.key`, `id_rsa*`, `credentials.json` and
+secret-shaped strings, and offers to add them to `.gitignore`. Sync only
+fast-forwards a project with no unpushed changes; otherwise it says so and
+touches nothing. Build output (`dist/`, `build/`) is not in the default
+`.gitignore`; add it yourself if you don't want it committed. Switch it off
+with the `github_push` flag (default on). Needs git 2.32 or newer.
 
 ## Endpoints
 
