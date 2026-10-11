@@ -5036,3 +5036,71 @@ a Settings switch, ON by default; Activity shows it. Covered by
   think clears it.
 - **Off**: the old difficulty mapping byte for byte
   (`tests/test_difficulty_routing.py` pins it with the flag off).
+
+## Multi from the CLI: live, in the background, results come back (2026-10-11)
+
+Owner: when a terminal CLI (opencode / codex / claude) uses the Multi tier the
+owner wants ALL FOUR -- see everything live IN the CLI turn, keep working in the
+CLI while the run runs, approve from the CLI, and get the result back
+automatically. Built on top of "Multi from the terminal CLIs (2026-10-10)";
+everything stays in app.py's `_cm_*` section, its tests and the Settings UI. Two
+new flags, each `config.get_flag`, default ON, OFF = that turn byte for byte:
+`cli_multi_background` and `cli_multi_result_inject`. Covered by
+`tests/test_cli_multi_live_and_async.py` (hermetic: fake runs/clock, real
+protocol shaping for chat/responses/messages; no network, no real CLI).
+
+- **A -- see everything live.** MEASURED first: `_cm_event_line` already turns
+  each normalized Multi event into ONE text line, so the CLI turn carries the
+  plan ("Multi sessions: N phases ... run X"), the plan lines ("Plan - start
+  now: 1 - Build | 2 - Test"), each phase starting ("Phase 1/2 Build"),
+  finishing ("Phase 1/2 Build -- done: ...") or FAILING ("-- failed: ..."), the
+  throttled per-phase activity ("Phase 2 - edit app.py"), a keepalive
+  ("- still working (Nm Ss)") at least every 20 s, then the final report. A
+  retry (a failed phase re-run by swarm_windows) shows up naturally as the
+  phase transitioning FAILED -> RUNNING -> DONE again. The model name per phase
+  is NOT in the event stream (it is a helpers-panel/`_multi_run_plan` field,
+  out of this section's scope); the lines are one-per-event and already
+  throttled, so nothing floods. The new test MEASURES this exact text.
+- **B -- keep working while the run runs.** The START turn now hands off EARLY
+  (`_cm_text_stream(early_end=True)`): once the plan and the first progress line
+  are out AND `_cm_background_seconds()` (setting `cli_multi_background_seconds`,
+  default 20, clamped 5..600) have passed, it ends with "Multi is working in the
+  background in this folder (k/n phases done). Type `status` ... `stop multi`
+  ...". A run that FINISHES first still streams its full report (the fast test
+  path: no real time passes, so early-end never fires); the safe-end cap
+  (`_cm_safe_end_seconds`) stays the fallback for a background-off turn. While a
+  run is live (`_cm_live_turn`): `stop multi` stops it; a STATUS word ("status"
+  / "statut" / "progress" / "etat" / "state" / a bare "?", any script --
+  `_cm_is_status`) streams progress with no model call (today's re-attach); ANY
+  OTHER real instruction is NO LONGER swallowed -- it is answered by a single
+  strong model (`body["model"]="best"`, tools kept) with a one-line note about
+  the background run injected as a system message (`_cm_inject_system_note`,
+  placed right after the leading system messages), and NO second run is ever
+  started in the folder. Background off -> every non-stop message re-attaches
+  (today's behaviour).
+- **C -- approve from the CLI, visibly chosen.** `cli_multi_approval`
+  (dashboard | chat | off) is now a control in the Settings drawer
+  (`#cli-multi-group`, select `#cm-approval-mode`) with a plain security warning
+  for chat/off (any local, unauthenticated program could start helper agents
+  that run as the owner). It reads the mode from GET `/api/cli-multi/pending`
+  (`mode`) and writes it to the new POST `/api/cli-multi/approval` {mode}
+  (control-token + dashboard-header gated like every /api/ POST; +1 route,
+  README 192 -> 193). "chat" mode's CLI wording is clearer and the whole-message
+  consent now also accepts "yes" / "oui" (exact match after `_cm_norm_cmd`, like
+  "stop multi"; `_cm_is_go` / `_CM_GO_WORDS`). Default stays "dashboard"; the
+  main session flips the owner's live config after deploy.
+- **D -- the result comes back automatically.** When a run finishes while the
+  CLI is not attached, the NEXT message of that conversation + folder gets the
+  finished result ONCE (`_cm_deliver_finished`, via `swarm_windows.last_run_for`
+  + `format_result`, bounded to `_CM_RESULT_MAX_CHARS` 6000): a status word
+  streams it; any other message gets it injected as a system note and is
+  answered by the best path so the CLI agent continues from it. It is marked
+  delivered in the map (`_cm_map_put(..., delivered=<run id>)`, merged into
+  `cli-multi-runs.json`), so it is never delivered twice; the message after that
+  takes the normal flow (a new instruction can start a new run).
+- **Security unchanged.** Everything above is scoped to (conversation key,
+  folder) and, for a live run, to the live run's own `project_dir`
+  (security fix 1 of 2026-10-10); the folder still comes only from the CLI's own
+  environment block (fix 3); nothing starts helper agents without the mode's own
+  gate (fix 2). Result delivery and the live-turn note never cross
+  conversations or folders (the owner is read from the folder-scoped map row).

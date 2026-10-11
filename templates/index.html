@@ -220,6 +220,8 @@
   .cm-approve-row.cm-approve-focus{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--radius-sm)}
   .cm-approve-full{flex:1 1 100%;margin:4px 0 0;max-height:260px;overflow:auto;padding:8px 10px;font-family:var(--mono);font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--code-text);background:var(--bg-inset);border:1px solid var(--border);border-radius:var(--radius-sm)}
   .cm-approve-full[hidden]{display:none}
+  /* The Settings-drawer warning when CLI Multi approval is set to chat/off. */
+  .sd-help.sd-warn{color:var(--warn-text,var(--danger-text))}
 
   /* ---------- sections / view headers ---------- */
   .section{margin-top:26px}
@@ -4850,6 +4852,15 @@
       </select>
       <p class="sd-help" id="lowres-status">Checking this machine&hellip;</p>
       <p class="sd-help">Runs fewer multi-session workers at once (each is a CLI process of 150&ndash;400&nbsp;MB): 1&ndash;2 instead of 4 when active, and 1 whenever free memory drops under 1.5&nbsp;GB. Auto turns it on under 8&nbsp;GB of RAM or 4 cores.</p>
+    </div>
+    <div class="sd-group" id="cli-multi-group">
+      <div class="sd-label">Multi from a terminal CLI</div>
+      <select id="cm-approval-mode" aria-label="Who may start Multi helper agents from a terminal CLI">
+        <option value="dashboard">Approve each run here (recommended)</option>
+        <option value="chat">Approve by typing in the CLI</option>
+        <option value="off">Start with no approval</option>
+      </select>
+      <p class="sd-help" id="cm-approval-help">When a terminal CLI (opencode / codex / claude) picks the Multi tier, it runs real helper agents that edit files and run commands in the project folder.</p>
     </div>
     <div class="sd-group sd-wide" id="heartbeats-group">
       <div class="sd-label">Heartbeats</div>
@@ -16701,9 +16712,38 @@
   function loadCliMultiPending(){
     if (document.hidden || hubOffline) return Promise.resolve();
     return api('/api/cli-multi/pending')
-      .then(function(j){ cmApproveRender(j && j.requests); })
+      .then(function(j){ cmApproveRender(j && j.requests); cmRenderApproval(j && j.mode); })
       .catch(function(){});
   }
+  /* The approval-mode control (Settings drawer): dashboard | chat | off. The
+     chat/off modes let a local, unauthenticated CLI message start helper agents
+     that run as you, so the help text warns about it. */
+  function cmApprovalHelp(mode){
+    if (mode === 'off')
+      return 'No approval: any local program can start helper agents that edit files and run commands as you, with no confirmation. Only for a machine you fully trust.';
+    if (mode === 'chat')
+      return 'The user replies exactly “go multi” (or “yes” / “oui”) in the CLI to start a run. That reply is unauthenticated — any local program could send it — so helper agents can run as you. The default is safer.';
+    return 'A CLI run waits for your Approve here (or the banner on any hub page) before any helper agent starts. Single-use, expires in 15 minutes. Recommended.';
+  }
+  function cmRenderApproval(mode){
+    var sel = $('#cm-approval-mode'), help = $('#cm-approval-help');
+    var m = mode || (sel ? sel.value : 'dashboard');
+    if (sel && mode) sel.value = m;
+    if (help){ help.textContent = cmApprovalHelp(sel ? sel.value : m);
+      help.classList.toggle('sd-warn', (sel ? sel.value : m) !== 'dashboard'); }
+  }
+  (function initCliMultiApproval(){
+    var sel = $('#cm-approval-mode'); if (!sel) return;
+    cmRenderApproval(null);
+    sel.addEventListener('change', function(){
+      var want = sel.value; sel.disabled = true;
+      api('/api/cli-multi/approval', {method: 'POST', body: {mode: want}})
+        .then(function(r){ cmRenderApproval(r && r.mode); toast('Multi from a CLI: ' + want); })
+        .catch(function(e){ toast('Could not save that: ' + ((e && e.message) || ''), true);
+                            loadCliMultiPending(); })
+        .then(function(){ sel.disabled = false; });
+    });
+  })();
   loadCliMultiPending();
   setInterval(function(){ if (!document.hidden) loadCliMultiPending(); }, 10000);
   document.addEventListener('visibilitychange', function(){

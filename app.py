@@ -21706,6 +21706,30 @@ _CM_KEEPALIVE_SECONDS = 20.0    # a "still working" line at least this often
 _CM_SAFE_END_DEFAULT = 240
 _CM_SAFE_END = {"opencode": 540}
 
+# LIVE, IN THE BACKGROUND, RESULTS COME BACK (2026-10-11). Two behaviours, each
+# flag-gated (default on; off = today's turn byte for byte):
+#  - cli_multi_background: after the plan and the first progress lines are out,
+#    the START turn ends EARLY with a background hand-off (well under the CLI's
+#    safe end), so the CLI is not trapped. While a run is live a later message
+#    that is a status word streams progress (no model call); ANY OTHER real
+#    instruction is answered by a single strong model (the `best` path, tools
+#    kept) with a one-line note, and NEVER starts a second run in the folder.
+#  - cli_multi_result_inject: when a run finishes while the CLI is not attached,
+#    the NEXT message of that conversation + folder gets the finished result
+#    ONCE (streamed for a status word, else injected as a system note so the CLI
+#    agent continues from it), then it is marked delivered in the map.
+_CM_BACKGROUND_SECONDS_DEFAULT = 20   # hand off this long after the plan is out
+_CM_BACKGROUND_MIN = 5
+_CM_BACKGROUND_MAX = 600
+_CM_RESULT_MAX_CHARS = 6000           # a finished report injected/streamed, bounded
+# Whole-message consent in "chat" mode, and the status words that stream
+# progress while a run is live (exact match after _cm_norm_cmd; "?" is handled
+# separately because _cm_norm_cmd strips it to "").
+_CM_GO_WORDS = frozenset(["go multi", "oui", "yes"])
+_CM_STATUS_WORDS = frozenset(["status", "statut", "progress", "progres",
+                              "progrès", "etat", "état", "state"])
+_CM_QUESTION_ONLY = ("?", "？", "؟")
+
 
 def _cm_on():
     """Flag `cli_multi_sessions` (default on)."""
@@ -21713,6 +21737,36 @@ def _cm_on():
         return bool(config.get_flag("cli_multi_sessions", True))
     except Exception:                                            # noqa: BLE001
         return True
+
+
+def _cm_background_on():
+    """Flag `cli_multi_background` (default on): end the START turn early with a
+    background hand-off, and answer a non-status message by the best path while a
+    run is live instead of swallowing it in a re-attach. Off -> today's turn."""
+    try:
+        return bool(config.get_flag("cli_multi_background", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _cm_result_inject_on():
+    """Flag `cli_multi_result_inject` (default on): deliver a finished run's
+    result on the next message of its conversation + folder."""
+    try:
+        return bool(config.get_flag("cli_multi_result_inject", True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _cm_background_seconds():
+    """How long after the plan is out the START turn hands off (setting
+    `cli_multi_background_seconds`, default 20, clamped 5..600)."""
+    try:
+        v = int(config.get_setting("cli_multi_background_seconds",
+                                   _CM_BACKGROUND_SECONDS_DEFAULT))
+    except Exception:                                            # noqa: BLE001
+        v = _CM_BACKGROUND_SECONDS_DEFAULT
+    return max(_CM_BACKGROUND_MIN, min(_CM_BACKGROUND_MAX, v))
 
 
 def _cm_map_path():
@@ -21760,10 +21814,11 @@ def _cm_map_get(mapkey):
         return dict(row) if isinstance(row, dict) else None
 
 
-def _cm_map_put(mapkey, owner, run, folder=None, consent=None):
-    """Map (CLI conversation, folder) -> {owner sid, run id, folder, consent}.
-    MERGES into the existing row, so a later write (a re-attach refreshing the
-    run id) never drops the recorded folder or consent. Atomic, LRU 200, 7-day
+def _cm_map_put(mapkey, owner, run, folder=None, consent=None, delivered=None):
+    """Map (CLI conversation, folder) -> {owner sid, run id, folder, consent,
+    delivered}. MERGES into the existing row, so a later write (a re-attach
+    refreshing the run id, or marking a finished result delivered) never drops
+    the recorded folder, consent or delivered marker. Atomic, LRU 200, 7-day
     TTL. Never raises."""
     if not mapkey or not owner:
         return
@@ -21775,6 +21830,8 @@ def _cm_map_put(mapkey, owner, run, folder=None, consent=None):
             row["folder"] = folder
         if consent is not None:
             row["consent"] = bool(consent)
+        if delivered is not None:
+            row["delivered"] = delivered
         d[mapkey] = row
         _cm_map_save(_cm_map_prune(d))
 
@@ -21810,11 +21867,11 @@ def _cm_norm_cmd(text):
     return re.sub(r"[\W_]+$", "", t)
 
 
-def _cm_last_user_command(messages):
-    """The WHOLE last user message, with a CLI's <system-reminder> blocks removed,
-    normalised by _cm_norm_cmd; "" when the conversation does not end on a user
-    message. "stop multi" / "go multi" must be the entire message, never a
-    substring of a longer one."""
+def _cm_raw_last_user(messages):
+    """The WHOLE last user message as text (joined), with a CLI's
+    <system-reminder> blocks removed; "" when the conversation does not end on a
+    user message. Not lowercased or punctuation-stripped -- see
+    _cm_last_user_command for the command form."""
     for m in reversed(messages or []):
         if not isinstance(m, dict) or m.get("role") == "system":
             continue
@@ -21825,9 +21882,30 @@ def _cm_last_user_command(messages):
             p.get("text") for p in (content or ()) if isinstance(p, dict)
             and p.get("type") in ("text", "input_text")]
         t = " ".join(p for p in parts if isinstance(p, str))
-        t = re.sub(r"<system-reminder>.*?</system-reminder>", " ", t, flags=re.S)
-        return _cm_norm_cmd(t)
+        return re.sub(r"<system-reminder>.*?</system-reminder>", " ", t, flags=re.S)
     return ""
+
+
+def _cm_last_user_command(messages):
+    """The WHOLE last user message, with a CLI's <system-reminder> blocks removed,
+    normalised by _cm_norm_cmd; "" when the conversation does not end on a user
+    message. "stop multi" / "go multi" must be the entire message, never a
+    substring of a longer one."""
+    return _cm_norm_cmd(_cm_raw_last_user(messages))
+
+
+def _cm_is_go(cmd):
+    """A whole-message consent in "chat" mode: "go multi", or just "yes" / "oui"
+    (exact match after _cm_norm_cmd), the same whole-message style as stop."""
+    return cmd in _CM_GO_WORDS
+
+
+def _cm_is_status(cmd, messages):
+    """A whole-message request to SEE a live run's progress (no model call):
+    a status word, or a bare "?" (any script -- _cm_norm_cmd strips it to "")."""
+    if cmd in _CM_STATUS_WORDS:
+        return True
+    return " ".join((_cm_raw_last_user(messages) or "").split()) in _CM_QUESTION_ONLY
 
 
 # SECURITY: WHO may start helper agents. Any local /v1 client (there is no auth
@@ -22465,22 +22543,38 @@ def _cm_event_line(ev):
     return None
 
 
-def _cm_text_stream(owner_sid, run_id, events, link, safe_seconds, helper_n, header):
+def _cm_text_stream(owner_sid, run_id, events, link, safe_seconds, helper_n, header,
+                    early_end=False):
     """Yield the CLI turn's text pieces (strings): `header`, the live progress
     lines, a keepalive at least every 20 s, then the final report + watch link
     -- or, once `safe_seconds` elapse before the run ends, a clean "keeps
     working in the background" hand-off (the run keeps going regardless). Pure
-    generator; the run's own on_done records the authoritative reply."""
+    generator; the run's own on_done records the authoritative reply.
+
+    early_end (the START turn, flag cli_multi_background): once the plan and the
+    first progress line are out AND _cm_background_seconds have passed, end the
+    turn with a short background hand-off -- well under the CLI's safe end -- so
+    the user is not trapped. A run that finishes first still streams its full
+    report; the hand-off only fires while the run is still going."""
     started = time.monotonic()
     yield header
     total = [0]
     done = [0]
+    lines_out = [0]
     rid = run_id
     last = started
     report = None
     outcome = None
+    bg = _cm_background_on() if early_end else False
+    bg_lead = _cm_background_seconds() if bg else 0
     for ev in _cm_keepalive_wrap(events, _CM_KEEPALIVE_SECONDS):
         now = time.monotonic()
+        if (bg and outcome is None and report is None and lines_out[0] >= 1
+                and (now - started) >= bg_lead):
+            yield ("\nMulti is working in the background in this folder (%d/%d phases "
+                   "done). Type `status` to see progress, or `stop multi` to stop it. "
+                   "Watch it: %s\n" % (done[0], total[0], link))
+            return
         if safe_seconds and (now - started) >= safe_seconds and outcome is None:
             yield ("\nThe Multi run keeps working in the background (%d/%d phases "
                    "done). Send any message to follow it, or 'stop multi' to stop "
@@ -22504,6 +22598,7 @@ def _cm_text_stream(owner_sid, run_id, events, link, safe_seconds, helper_n, hea
         line = _cm_event_line(ev)
         if line:
             yield line + "\n"
+            lines_out[0] += 1
             last = now
         elif kind in ("message", "done"):
             report = ev.get("text") or report
@@ -22622,6 +22717,111 @@ def _cm_attach(body, protocol, owner_sid, run_id, cmd, helper_cli, safe, est,
                                     _cm_helper_count(), header), est)
 
 
+# A sentinel from the finished-result delivery: the result was injected into the
+# request as a system note, so the intercept returns None (the best path answers).
+_CM_FELL_THROUGH = object()
+
+
+def _cm_run_progress(st):
+    """(done, total) phases from a live run's status dict. Never raises."""
+    try:
+        agents = [a for a in (st or {}).get("agents") or [] if isinstance(a, dict)]
+        total = int((st or {}).get("total") or len(agents))
+        done = sum(1 for a in agents if a.get("state") == swarm_windows.DONE)
+        return done, total
+    except Exception:                                            # noqa: BLE001
+        return 0, 0
+
+
+def _cm_inject_system_note(messages, text):
+    """Insert ONE hub system note right after the request's leading system
+    messages, so the model that answers reads it as context. In place -- the
+    caller's downstream uses the same list. Never raises."""
+    if not isinstance(messages, list):
+        return
+    i = 0
+    while i < len(messages) and isinstance(messages[i], dict) \
+            and messages[i].get("role") == "system":
+        i += 1
+    messages.insert(i, {"role": "system", "content": text})
+
+
+def _cm_live_turn(body, protocol, messages, owner, live_id, st, cmd, helper_cli,
+                  safe, est, mapkey, folder_key):
+    """A later turn while THIS conversation's Multi run is live IN THIS FOLDER.
+    "stop multi" stops it; a status word ("status"/"statut"/"progress"/"?")
+    streams the live progress (no model call, no second run); ANY OTHER real
+    instruction is NOT swallowed -- with cli_multi_background on it is answered
+    by a single strong model (the `best` path, tools kept) with a one-line note
+    about the background run, and no second run is ever started in this folder.
+    Background off -> today's re-attach for every non-stop message."""
+    if cmd == _CM_STOP:
+        return _cm_attach(body, protocol, owner, live_id, cmd, helper_cli, safe,
+                          est, mapkey, folder_key)
+    if _cm_is_status(cmd, messages) or not _cm_background_on():
+        return _cm_attach(body, protocol, owner, live_id, cmd, helper_cli, safe,
+                          est, mapkey, folder_key)
+    # A real instruction while the run works: answer it by the best path, note
+    # the background run in one line, never start a second run in this folder.
+    _cm_map_put(mapkey, owner, live_id, folder=folder_key)
+    done, total = _cm_run_progress(st)
+    link = _cm_watch_link(owner)
+    _cm_inject_system_note(messages,
+        "[hub] A Multi run the user started is still working in the BACKGROUND in "
+        "this folder (%d/%d phases done) -- watch it: %s . You are a single model "
+        "answering THIS message so the user is not blocked; you are NOT that run and "
+        "must not duplicate its work. Begin your reply with one short line: "
+        "\"Note: a Multi run is still working in the background (%d/%d phases) — "
+        "say 'status' to follow it or 'stop multi' to stop it.\" Then answer "
+        "normally." % (done, total, link, done, total))
+    body["model"] = "best"
+    return None                 # fall through to the best path (tools kept)
+
+
+def _cm_deliver_finished(body, protocol, messages, owner, cmd, est, mapkey,
+                         folder_key):
+    """Part D: a finished, undelivered Multi result for this conversation + folder,
+    handed to the CLI ONCE. A status word streams it (no model call); any other
+    message gets it injected as a system note and is answered by the best path so
+    the CLI agent continues from it. Marks it delivered in the map. Returns a
+    Response, _CM_FELL_THROUGH (injected -> the intercept falls through), or None
+    (nothing to deliver -> the normal flow continues). Never raises."""
+    try:
+        run = swarm_windows.last_run_for(owner)
+    except Exception:                                            # noqa: BLE001
+        run = None
+    rid = getattr(run, "id", None) if run else None
+    if not rid:
+        return None
+    state = getattr(run, "state", None)
+    if state is not None and state not in (swarm_windows.DONE, swarm_windows.FAILED,
+                                           swarm_windows.STOPPED):
+        return None                                   # a live run is handled above
+    row = _cm_map_get(mapkey) or {}
+    if row.get("delivered") == rid:
+        return None
+    try:
+        report = (swarm_windows.format_result(rid) or "").strip()
+    except Exception:                                            # noqa: BLE001
+        report = ""
+    if not report:
+        return None
+    _cm_map_put(mapkey, owner, rid, folder=folder_key, delivered=rid)
+    link = _cm_watch_link(owner)
+    shown = report if len(report) <= _CM_RESULT_MAX_CHARS else (
+        report[:_CM_RESULT_MAX_CHARS] + "\n[… result truncated by the hub …]")
+    if _cm_is_status(cmd, messages):
+        return _cm_say(body, protocol,
+                       "The Multi run in this folder has finished.\n\n%s\n\nWatch "
+                       "it: %s\n" % (shown, link), est)
+    _cm_inject_system_note(messages,
+        "[hub] The Multi run the user started in this folder has FINISHED. Its full "
+        "result follows -- read it and continue the work from it (do not start over)."
+        "\n\n%s\n\nWatch it: %s" % (shown, link))
+    body["model"] = "best"
+    return _CM_FELL_THROUGH
+
+
 def _cm_launcher(mapkey, folder_key, project_dir, helper_cli, consent=None, bare=False):
     """Capture NOW, inside the request, what a run start needs -- the category in
     force and a copy of the request context (the planner routes through the
@@ -22656,8 +22856,10 @@ def _cm_launcher(mapkey, folder_key, project_dir, helper_cli, consent=None, bare
         link = _cm_watch_link(owner_sid)
         header = lead + ("Multi: planning the work with up to %d helpers. Watch it "
                          "live: %s\n" % (_cm_helper_count(), link))
+        # early_end: the START turn hands off to the background once the plan is
+        # out (flag cli_multi_background), so the CLI is not trapped.
         return _cm_text_stream(owner_sid, None, events, link, safe,
-                               _cm_helper_count(), header)
+                               _cm_helper_count(), header, early_end=True)
     return launch
 
 
@@ -22836,8 +23038,21 @@ def _cm_multi_cli_intercept(body, protocol, messages, tools, est):
         if owner:
             live_id, st = _cm_live_run(owner)
             if live_id and _cm_folder_key((st or {}).get("project_dir")) == folder_key:
-                return _cm_attach(body, protocol, owner, live_id, cmd, helper_cli,
-                                  safe, est, mapkey, folder_key)
+                return _cm_live_turn(body, protocol, messages, owner, live_id, st,
+                                     cmd, helper_cli, safe, est, mapkey, folder_key)
+
+        # NOT LIVE. If this conversation's last run in this folder FINISHED and
+        # its result was never handed to the CLI, deliver it now -- ONCE (part D).
+        # A status word streams it; any other message gets it injected as context
+        # and is answered by the best path. Scoped to (conversation, folder) and
+        # the owner, like everything else.
+        if _cm_result_inject_on() and owner:
+            done = _cm_deliver_finished(body, protocol, messages, owner, cmd, est,
+                                        mapkey, folder_key)
+            if done is _CM_FELL_THROUGH:
+                return None                  # injected; the best path answers
+            if done is not None:
+                return done                  # streamed the finished result
 
         # Not live -> only a FRESH user instruction can start (or resume) a run.
         if not _awaiting_new_instruction(messages):
@@ -22849,9 +23064,10 @@ def _cm_multi_cli_intercept(body, protocol, messages, tools, est):
             return _cm_dashboard_turn(body, protocol, text, est, convkey, mapkey,
                                       folder_key, project_dir, helper_cli, caller, safe)
         confirm = approval == "chat"
-        if confirm and cmd == _CM_GO:
-            # The user's go-ahead for the request THIS conversation recorded in
-            # THIS folder within the last 10 minutes: its stored goal starts.
+        if confirm and _cm_is_go(cmd):
+            # The user's go-ahead ("go multi", or just "yes" / "oui") for the
+            # request THIS conversation recorded in THIS folder within the last
+            # 10 minutes: its stored goal starts.
             pend = _cm_pending_take(mapkey, convkey, folder_key)
             if not pend:
                 return _cm_say(body, protocol,
@@ -22876,7 +23092,8 @@ def _cm_multi_cli_intercept(body, protocol, messages, tools, est):
             return _cm_say(body, protocol,
                            "Multi starts up to %d helper agents that edit files and "
                            "run commands in %s on their own, without asking you. To "
-                           "start, reply exactly: go multi (or pick another tier).\n"
+                           "start, reply exactly: go multi (or just 'yes' / 'oui') "
+                           "-- or pick another tier.\n"
                            % (_cm_helper_count(), project_dir), est)
         # "chat" with consent already given for this conversation + folder, or
         # "off" (the direct start).
@@ -22912,6 +23129,20 @@ def _cm_api_decide():
                         "code": "bad_request"}), 400
     status, payload = _cm_approval_decide(rid.strip(), approve, body.get("goal_sha256"))
     return jsonify(payload), status
+
+
+@app.route("/api/cli-multi/approval", methods=["POST"])
+def _cm_api_set_approval():
+    """Set `cli_multi_approval` (dashboard | chat | off) from the Settings
+    drawer. Gated like every /api/ POST (control token + dashboard header). The
+    current mode is read from GET /api/cli-multi/pending (`mode`)."""
+    body = request.get_json(force=True, silent=True) or {}
+    mode = str(body.get("mode") or "").strip().lower()
+    if mode not in _CM_APPROVAL_MODES:
+        return jsonify({"error": "mode must be one of: %s." % ", ".join(_CM_APPROVAL_MODES),
+                        "code": "bad_request"}), 400
+    config.set_setting("cli_multi_approval", mode)
+    return jsonify({"mode": _cm_approval_mode()})
 
 
 def _cm_mcp_swarm_start_now(goal, project_dir, cli):

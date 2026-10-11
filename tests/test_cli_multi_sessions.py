@@ -292,11 +292,14 @@ def test_map_store_round_trip_lru_and_ttl(cm):
 # Later turns while the run is live: re-attach / stop, no model call, no 2nd run
 # --------------------------------------------------------------------------- #
 
-def test_live_run_reattaches_without_a_second_run(cm):
+def test_live_run_reattaches_on_a_status_word_without_a_second_run(cm):
+    # REPLACED (2026-10-11): while a run is live, only a STATUS word re-attaches;
+    # a real instruction is now answered by the best path (see
+    # test_cli_multi_live_and_async.py). This pins the status-word re-attach.
     _call()                                        # start -> owner-1
     A._MULTI_RUNS["owner-1"] = "run-1"             # simulate the run still live
     before = len(cm["turn_events"])
-    resp, raw = _call()
+    resp, raw = _call(messages=[{"role": "user", "content": "status"}])
     assert resp is not None
     assert len(cm["turn_events"]) == before, "no second run started"
     assert cm["follow"] and cm["follow"][-1]["run"] == "run-1", "re-attached"
@@ -318,13 +321,15 @@ def test_stop_multi_stops_the_run_and_starts_nothing(cm):
                                  "stop multi please", "stop multi, then go"])
 def test_only_the_whole_message_stop_multi_stops(cm, msg):
     """A bare "stop", or a sentence that merely CONTAINS "stop multi", never
-    stops the run -- it re-attaches instead."""
+    stops the run. REPLACED (2026-10-11): such a real instruction is no longer
+    swallowed by a re-attach -- it is answered by the best path (resp None,
+    falls through), so it neither stops NOR re-attaches."""
     _call()
     A._MULTI_RUNS["owner-1"] = "run-1"
     resp, raw = _call(messages=[{"role": "user", "content": msg}])
-    assert resp is not None
     assert cm["stop"] == [], "%r must not stop the run" % msg
-    assert cm["follow"], "it re-attached instead"
+    assert not cm["follow"], "a non-status instruction does not re-attach"
+    assert resp is None, "it is answered by the best path (intercept falls through)"
 
 
 @pytest.mark.parametrize("msg", ["Stop Multi", "  stop   multi  ", "STOP MULTI!",
@@ -392,6 +397,10 @@ def test_usage_reports_the_requests_own_estimate(cm):
 # --------------------------------------------------------------------------- #
 
 def test_safe_end_hands_off_to_the_background_before_the_cap(cm, monkeypatch):
+    # REPLACED default (2026-10-11): the START turn now hands off EARLY when
+    # cli_multi_background is on (covered in test_cli_multi_live_and_async.py).
+    # This pins the safe-end FALLBACK, so background is turned off here.
+    monkeypatch.setattr(A, "_cm_background_on", lambda: False)
     # A clock that jumps past the safe window after the stream starts, so the
     # run has not finished when the safe end fires.
     ticks = iter([0.0] + [10_000.0] * 60)
