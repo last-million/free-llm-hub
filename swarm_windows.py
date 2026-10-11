@@ -3692,6 +3692,22 @@ def last_run_for(owner):
     return max(mine, key=lambda r: r.created_at) if mine else None
 
 
+def live_runs():
+    """Every run still PENDING or RUNNING, newest first."""
+    with _LOCK:
+        runs = [r for r in _RUNS.values() if r.state in (PENDING, RUNNING)]
+    return sorted(runs, key=lambda r: -r.created_at)
+
+
+def live_run_for(owner):
+    """The newest PENDING/RUNNING run of conversation `owner`, or None. The
+    Build page shows THIS one while it works: a run started later that already
+    ended must not hide it (MEASURED 2026-10-11, conversation f0e3b185)."""
+    if not owner:
+        return None
+    return next((r for r in live_runs() if getattr(r, "owner", None) == owner), None)
+
+
 def worker_info(session_id):
     """{run_id, index, title, owner, state} when `session_id` is (or was) a
     worker of a run, else None -- lets a list of sessions say "helper 2 of

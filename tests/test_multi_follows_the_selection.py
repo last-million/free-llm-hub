@@ -52,7 +52,7 @@ def test_the_session_category_becomes_the_workers_category():
 
 def test_both_multi_paths_pass_the_selection():
     src = open("app.py", encoding="utf-8").read()
-    body = src[src.index("def _multi_turn_events("):]
+    body = src[src.index("def _multi_turn_events_claimed("):]
     body = body[:body.index("\ndef ", 10)]
     assert body.count("modes=_multi_worker_modes(sess_info)") == 2
     assert body.count("default_mode=_session_mode_or_none(sess_info)") == 2

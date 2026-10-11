@@ -39,7 +39,8 @@ def test_send_stays_enabled_and_says_queue_while_busy():
 
 def test_a_message_sent_while_busy_is_queued_not_dropped():
     fn = _fn("function doSend(){")
-    assert "if (turnBusy){" in fn and "queueAdd(text);" in fn
+    # A Multi run still working in the background queues it too (2026-10-11).
+    assert "if (turnBusy || _bgRunLive){" in fn and "queueAdd(text);" in fn
     assert "if (sendBtn.disabled) return;" not in fn, "the old refusal"
 
 
@@ -79,7 +80,7 @@ def test_a_stopped_turn_is_marked_as_one():
 
 def test_nothing_is_sent_into_a_turn_already_running():
     fn = _fn("function queueDrain(){")
-    assert "if (turnBusy || _queuePaused || !sessionId || !_queue.length) return;" in fn
+    assert "if (turnBusy || _bgRunLive || _queuePaused || !sessionId || !_queue.length) return;" in fn
 
 
 # --------------------------------------------------------------------------- #

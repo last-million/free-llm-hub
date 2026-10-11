@@ -5279,3 +5279,36 @@ names: `_rs_on`, `_rs_note_stall`, `_rs_leg_budget`, `_REASONING_STALL_*`,
   delta followed by endless empty / keep-alive frames grew the buffer without
   bound for the whole hold budget. Past the cap with no visible content: status
   `reasoning_stall` (or `empty` when no reasoning was seen at all).
+
+## One Multi run at a time, and the page says it is still working (2026-10-11)
+
+Covered by `tests/test_one_multi_run_at_a_time.py`. MEASURED 2026-10-11
+(conversation f0e3b185, folder "bount en", opencode in the terminal): a
+message sent while the first run was still PLANNING (3 min) passed the
+"already working" check -- `_multi_run_for` only knew runs whose plan had
+finished (`_MULTI_RUNS`) -- so a second run (swarm-df98fc7678fb) worked the same
+folder beside swarm-7d2d17f482bd. The later run ended first, and the
+conversation's page then showed the old PROGRESS.md (`last_run_for` = newest
+created) while swarm-7d2d17f482bd kept working; the Send button read as
+"finished" while /activity showed its helpers running.
+
+- **Claim** (`_multi_claim` / `_multi_release`, `_MULTI_CLAIMS`): every Multi
+  turn (`_multi_turn_events`, Build page and terminal CLI alike) claims its
+  conversation and folder under `_MULTI_LOCK` BEFORE it plans and keeps the
+  claim until the turn's generator ends (closed early = released too). The body
+  is `_multi_turn_events_claimed`. Refused with 409 + a plain sentence: a turn
+  of this conversation still planning/starting, a live run of this
+  conversation (`swarm_windows.live_runs`, also covers boot-resumed runs), and,
+  under flag `multi_one_run_per_folder` (default on), another conversation's
+  claim or live run in the same folder (`_cm_folder_key`).
+- **The page shows the working run**: `_multi_run_plan` takes
+  `swarm_windows.live_run_for(owner)` (newest PENDING/RUNNING) before
+  `last_run_for`.
+- **Background bar** (`#agent-bg-run`, `renderBgRun`): while the
+  conversation's own run is live and no turn is open (a CLI run that handed
+  back, a page opened mid-run), one status line above the message box says
+  "Multi run still working in the background -- phase N of M: <title> (retry
+  text)" with "Stop the run" (`DELETE /api/swarm-windows/<id>`); redrawn only
+  when its text changes. Send reads "Queue" and a message typed then waits in
+  the existing queue (`_bgRunLive` in `doSend` / `queueDrain`); it goes out
+  when the run ends, with a toast pointing at the filed report.

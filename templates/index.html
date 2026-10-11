@@ -3918,6 +3918,11 @@
                    interrupted, click it to continue exactly where it stopped,
                    or type something normally". -->
               <div class="agent-plan-cut agent-resume" id="agent-plan-cut" role="status" hidden></div>
+              <!-- A MULTI RUN STILL WORKING after the turn handed back (a
+                   terminal CLI's run, or a page opened mid-run). MEASURED
+                   2026-10-11: the Send button read as "finished" while run
+                   swarm-7d2d17f482bd kept working; say so, and offer Stop. -->
+              <div class="agent-plan-cut agent-resume agent-bg-run" id="agent-bg-run" role="status" hidden></div>
               <div class="chat-input-row">
                 <textarea id="agent-text" placeholder="Tell the agent what to do&hellip;  (Enter to send, Shift+Enter for a new line, paste or drop a screenshot)" aria-label="Message to agent" rows="2"></textarea>
                 <div class="chat-send-col">
@@ -13175,6 +13180,8 @@
        alone), the model it runs on, how long it has taken, what it is doing
        now, and its own page in a new window. */
     var _planLive = false;
+    var _bgRunLive = false;
+    var _bgRunKey = '';
     var _resumeDismissed = '';
     var HP_STATE = { done:'done', running:'working', pending:'waiting', failed:'failed', stopped:'stopped' };
     var HP_CHECK_TIP = {
@@ -13270,10 +13277,24 @@
       var stopped = p.interrupted || null;
       renderResume(stopped);
       renderHelperBar(p.helper || null, items.length);
+      /* This conversation's own run is still working (not a helper's page). */
+      var bgLive = !!p.run_id && !p.helper &&
+        (p.run_state === 'running' || p.run_state === 'pending');
+      var wasBg = _bgRunLive;
+      _bgRunLive = bgLive;
+      renderBgRun(bgLive ? p : null);
+      /* The run ended: say so (its report is filed in this conversation's
+         history), and messages typed while it worked go out now. */
+      if (wasBg && !bgLive){
+        if (p.run_state === 'done' || p.run_state === 'failed')
+          toast('Multi run ' + (p.run_state === 'done' ? 'finished' : 'ended with failed phases') +
+                ' — reload the page to see its report');
+        if (!turnBusy) queueDrain();
+      }
       box.hidden = !items.length;
-      if (box.hidden) return;
+      if (box.hidden){ _planLive = bgLive; return; }
       var helpers = !!p.run_id;
-      _planLive = helpers && items.some(function(t){ return t.doing; });
+      _planLive = bgLive || (helpers && items.some(function(t){ return t.doing; }));
       $('#agent-plan-title').textContent = helpers ? 'Helpers' : 'Plan';
       $('#agent-plan-n').textContent = !items.length ? '' :
         (helpers && p.current ? 'step ' + p.current + ' of ' + items.length + ' \u00b7 ' : '') +
@@ -13358,6 +13379,50 @@
           a.setAttribute('aria-label', 'Open the conversation this helper works for in a new window');
           bar.appendChild(a);
         }
+      }
+      /* The conversation's Multi run keeps working after its turn handed the
+         page back: say so above the message box, with the phase it is on and
+         a Stop. Redrawn only when what it says changes, so a focused Stop
+         keeps its focus across the 5 s refresh. */
+      function renderBgRun(run){
+        var bar = $('#agent-bg-run');
+        if (!bar) return;
+        if (!turnBusy){
+          sendBtn.textContent = run ? 'Queue' : 'Send';
+          sendBtn.title = run ? 'The Multi run is still working — this message waits and goes out when it ends' : '';
+        }
+        var tasks = (run && run.tasks) || [];
+        var cur = null;
+        tasks.forEach(function(t){ if (!cur && t.doing) cur = t; });
+        var key = run ? run.run_id + '|' + (cur ? cur.index + '|' + ((cur.retry && cur.retry.text) || '') : '') : '';
+        bar.hidden = !run || turnBusy;
+        if (bar.hidden){ _bgRunKey = ''; return; }
+        if (key === _bgRunKey) return;
+        _bgRunKey = key;
+        bar.innerHTML = '';
+        var what = document.createElement('div'); what.className = 'pc-what';
+        var b = document.createElement('b');
+        b.textContent = 'Multi run still working in the background';
+        what.appendChild(b);
+        what.appendChild(document.createTextNode(cur
+          ? ' — phase ' + cur.index + ' of ' + tasks.length + ': ' + (cur.title || '') +
+            (cur.retry && cur.retry.text ? ' (' + cur.retry.text + ')' : '') + '.'
+          : ' (' + (run.done || 0) + '/' + tasks.length + ' phases done).'));
+        var hint = document.createElement('div'); hint.className = 'pc-hint';
+        hint.textContent = 'Not finished yet. A message you send now waits and goes out when the run ends.';
+        what.appendChild(hint);
+        bar.appendChild(what);
+        var stop = document.createElement('button');
+        stop.type = 'button'; stop.className = 'btn sm danger';
+        stop.textContent = 'Stop the run';
+        stop.setAttribute('aria-label', 'Stop Multi run ' + run.run_id);
+        stop.addEventListener('click', function(){
+          stop.disabled = true;
+          api('/api/swarm-windows/' + encodeURIComponent(run.run_id), { method: 'DELETE' })
+            .then(function(){ toast('Multi run stopped'); _bgRunKey = ''; loadPlan(); })
+            .catch(function(e){ toast(e.message, true); stop.disabled = false; });
+        });
+        bar.appendChild(stop);
       }
       /* The stopping place is drawn by renderResume, above the message box. */
       function renderResume(stopped){
@@ -13651,7 +13716,7 @@
     /* Send the next waiting message, if the agent is free and nothing paused
        the queue. Called after every finished turn. */
     function queueDrain(){
-      if (turnBusy || _queuePaused || !sessionId || !_queue.length) return;
+      if (turnBusy || _bgRunLive || _queuePaused || !sessionId || !_queue.length) return;
       var next = _queue.shift();
       queueSave();
       queueRender();
@@ -13709,8 +13774,9 @@
                shots.map(function(s){ return '  ' + s.path; }).join('\n');
       }
       if (!text) return;
-      if (turnBusy){
-        /* The agent is on a turn: this one waits its turn. */
+      if (turnBusy || _bgRunLive){
+        /* The agent is on a turn, or this conversation's Multi run is still
+           working: this one waits its turn. */
         queueAdd(text);
         textEl.value = '';
         return;

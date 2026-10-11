@@ -20770,6 +20770,13 @@ _MULTI_PLAN_HEARTBEAT = 20.0    # a "still planning" line this often
 _MULTI_PLANNING_LINE = ("Planning the work \u2014 deciding the steps and which "
                         "helpers can work at the same time\u2026")
 _MULTI_PLANNING = {}            # conversation -> when its Multi plan started
+# ONE RUN AT A TIME. MEASURED 2026-10-11 (conversation f0e3b185, folder "bount
+# en"): a message sent while the first run was still PLANNING (3 min) passed
+# the "already working" check -- that only knew runs whose plan had finished
+# (_MULTI_RUNS) -- and a second run (swarm-df98fc7678fb) worked the same folder
+# beside swarm-7d2d17f482bd. A turn now CLAIMS its conversation (and folder)
+# under _MULTI_LOCK before it plans, and keeps the claim until it ends.
+_MULTI_CLAIMS = {}              # conversation -> (folder key, when claimed)
 # WHAT A WORKER IS DOING, on the conversation's page. MEASURED 2026-09-30:
 # phase 2 of run swarm-4f2aab7204a4 worked for an hour (164 edit/bash/notes
 # events) and the page showed nothing between "phase 2 started" and the
@@ -21108,7 +21115,66 @@ def _multi_context(session_id, project_dir, text, prev=None):
     return "\n\n".join(parts).strip()[:swarm_windows.CONTEXT_CHARS]
 
 
+def _multi_claim(session_id, project_dir):
+    """Reserve `session_id` (and its folder) for one Multi turn. Returns None
+    when the claim was taken, else the plain sentence saying why not: a turn
+    of this conversation is already planning or running, or (flag
+    `multi_one_run_per_folder`, default on) another conversation's run works
+    the same folder. Atomic under _MULTI_LOCK, so two messages sent at the
+    same moment can never both start a run."""
+    folder = _cm_folder_key(project_dir)
+    per_folder = config.get_flag("multi_one_run_per_folder", True)
+    live = []
+    try:
+        live = swarm_windows.live_runs()
+    except Exception:                                            # noqa: BLE001
+        live = []
+    now = time.time()
+    with _MULTI_LOCK:
+        mine = _MULTI_CLAIMS.get(session_id)
+        if mine:
+            return ("A Multi run for this conversation is still being planned or "
+                    "started (%ds so far). It continues by itself; send your "
+                    "message again when it has finished." % int(now - mine[1]))
+        if any(getattr(r, "owner", None) == session_id for r in live):
+            return ("A multi-session run is already working on this conversation. "
+                    "Wait for it, or press Stop.")
+        if per_folder and folder:
+            for sid, (fk, _t) in _MULTI_CLAIMS.items():
+                if fk == folder:
+                    return ("Another conversation is starting a Multi run in this "
+                            "folder (/agent/%s). One run per folder at a time: "
+                            "wait for it, or stop it." % sid)
+            for r in live:
+                if _cm_folder_key(getattr(r, "project_dir", None)) == folder:
+                    where = ("/agent/%s" % r.owner) if getattr(r, "owner", None) else r.id
+                    return ("Multi run %s is already working in this folder (%s). "
+                            "One run per folder at a time: wait for it, or stop it."
+                            % (r.id, where))
+        _MULTI_CLAIMS[session_id] = (folder, now)
+    return None
+
+
+def _multi_release(session_id):
+    with _MULTI_LOCK:
+        _MULTI_CLAIMS.pop(session_id, None)
+
+
 def _multi_turn_events(session_id, sess_info, text, bare=False):
+    """The Multi turn below, run under this conversation's claim
+    (_multi_claim): a second message while a run is planning or working gets
+    the 409 sentence instead of a second run."""
+    busy = _multi_claim(session_id, sess_info.get("project_dir") or "")
+    if busy:
+        yield {"event": "error", "status": 409, "detail": busy}
+        return
+    try:
+        yield from _multi_turn_events_claimed(session_id, sess_info, text, bare=bare)
+    finally:
+        _multi_release(session_id)
+
+
+def _multi_turn_events_claimed(session_id, sess_info, text, bare=False):
     """A turn in the "multi" tier: `text` is the goal of a swarm_windows run in
     this conversation's folder, under this conversation's CLI. Whether a
     message is work at all is decided by the routes (_multi_wants_a_swarm);
@@ -27342,7 +27408,8 @@ def _multi_run_plan(session_id, project_dir=None):
         # accurate, the old plan from PROGRESS.md").
         helper = swarm_windows.worker_info(session_id)
         run = (swarm_windows.get(helper["run_id"]) if helper
-               else swarm_windows.last_run_for(session_id))
+               else (swarm_windows.live_run_for(session_id)
+                     or swarm_windows.last_run_for(session_id)))
         if run is None:
             return None
         live = run.state in (swarm_windows.PENDING, swarm_windows.RUNNING)
