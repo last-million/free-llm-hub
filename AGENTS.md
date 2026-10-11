@@ -4810,3 +4810,76 @@ refused, framed through the relay renders.
   framed directly and still shows the browser's error there; JS frame-busting
   (`top.location = ...`) is not handled; the relay sees the dashboard's own
   loopback origin only (127.0.0.1 / localhost on the hub's port).
+
+## Roles: the no-answer causes, measured (2026-10-11)
+
+Owner goal: roles tool turns (swarm/crew*/multi/compound tiers on /v1, flag
+`tool_turn_race` OFF) must not END WITH NO ANSWER on ~14% of turns -- target
+< 5%, without more wasted calls. Covered by `tests/test_roles_no_answer.py`
+(hermetic: the deadline math and the `role_eval --why` breakdown run directly,
+no network, no file writes). New app.py names are `_rn_`. Each fix is
+flag-gated (`config.get_flag`, default on; off = byte-identical).
+
+**MEASURED** with `python scripts/role_eval.py --since <cutoff> --why` on the
+owner's `turn-roles.jsonl`. The live hub switched to the RACE path on 2026-10-10
+(0 roles rows after ~06:00, so `--since 2026-10-10T06:00` is empty); the latest
+roles window with data is the one the 2026-10-10 "fewer turns with no answer"
+doc measured, `--since 2026-10-08T05:30`: **334 roles turns, 47 no-answer
+(14.1%), 2.03 calls/turn, 23.4% of calls wasted, 0.589 verifier usable rate**.
+The `_rr_*` fixes of 2026-10-10 are in the code but there is no post-fix roles
+data to measure them against, so this window is the pre-`_rn_` baseline.
+
+**Top causes of the 47 no-answer turns** (`--why`): per-hop failure classes 49
+window, 30 deadline, 18 http4xx, 6 429, 1 invalid. Turn-level: `deadline+window`
+10, `window` 9, no-failed-hop 9, `deadline+http4xx+window` 7. 12 of 47 spent NO
+call (no fitting model at that moment). hub.log makes the shape plain: a BIG
+`coding|hard|tools|l` turn (input 60-102K, sent 260-510K across hops) whose
+opening actor is a slow thinker ("no answer in time") OR space-bunny / kimi-k3
+returning "200 with an empty message" burns the whole ~180 s stage across 3-4
+short actor hops; the `best` fallback then gets ~0 s ("nothing served after
+180s" -> CHAT-DEADLINE "request deadline reached"). The 10-10 reserve fix
+(`rr_reserve_fallback`) addresses the fallback starvation; what is LEFT is the
+roles stage itself failing on big turns, two ways:
+
+1. **The one slow-but-working thinker is cut too short.** A 60K+ hard turn
+   needs a thinker 120-180 s, but `_role_hop_deadline` caps a big request to
+   `_LONG_CTX_ROLE_ATTEMPTS` (2) -> ~room/2 ~= 90 s per hop, and the walk tries
+   3-4 of them, each cut just before it answers; the stall-backup barely gets a
+   window. -> **Fix `rn_big_turn_one_attempt`** (`_rn_actor_attempts`, wired at
+   the `_role_actor_hop` call site in `_tool_turn_roles_run`): on a request
+   >= `LONG_CTX_SPEED_TOKENS` the first fitting actor opens on ONE long attempt
+   (`attempts_left=1` -> the whole remaining room, and its PARALLEL stall-backup
+   -- a different model -- then also gets a real window via `_role_share(room,
+   max(1, attempts_left-1))`). The slow thinker that could finish gets ~2x the
+   time, and the turn ends in 1-2 calls, not 3-4. Flag off, or a small request
+   -> the old `max(1, min(3, _ROLE_MAX_ACTOR_HOPS-hops+1))`, byte-for-byte.
+   `_role_hop_deadline` itself is unchanged, so its direct unit tests in
+   `tests/test_cli_big_turn_reliability.py` (which pass `attempts_left=3`) stay
+   green.
+2. **An empty-returning pair burns the whole big-turn window.** space-bunny /
+   kimi-k3 stream reasoning/keepalive for the full ~180 s then return an empty
+   200; non-streamed actor hops have no peek to cut them, so the stage AND the
+   fallback are starved. -> **Fix `rn_empty_actor_cap_big`** (in
+   `_role_hop_deadline`): on a big request a pair with a recent empty/junk 200
+   (`_empty_streak(pid, model) >= 1`, the existing ledger) gets only a short
+   PROBE window as actor (`_RN_EMPTY_PROBE_SECONDS` = 45 s, applied AFTER the
+   measured-slow floor so it caps even that); if it produces nothing in the
+   probe the walk moves on with the budget intact. ONLY known-empty pairs are
+   capped -- a slow-but-working thinker is untouched (fix 1 gives it MORE time).
+   An explicit budget still wins. Flag off / clean pair / small turn -> no cap.
+
+**Expected effect** (deterministic from the mechanism; no post-fix live data
+exists yet, so no live rate is claimed): on the big `coding|hard|tools|l` turns
+that dominate the no-answer log, fix 1 turns 3-4 short sequential actor hops
+(each timing out at ~room/2) into 1 actor + 1 parallel backup, both on the full
+window -- calls/turn on those turns FALL (4 -> ~2, so wasted % falls too) and
+the one model that can finish gets the time to do it; fix 2 stops an
+empty-returning pair from spending the whole window, freeing it for a model that
+can answer. Neither raises calls/turn. The ~26% of no-answers that spent no call
+(no fitting model at that moment) are capacity, not a roles bug, and are already
+helped by the 10-10 `rr_fit_on_cleared` fit-on-cleared-size fix.
+
+**`scripts/role_eval.py --why`**: classifies the no-answer ROLES turns by cause
+(per-hop class, first-hop class, turn-level distinct-cause sets, how many spent
+no call, backup/verifier counts, calls distribution). Without the flag the
+output is unchanged; `--json` renders the cause-set tuples as " + "-joined names.

@@ -39864,6 +39864,36 @@ _LONG_CTX_ROLE_ATTEMPTS = 2
 _LONG_CTX_ROLE_FLOOR_SHARE = 0.6
 _LONG_CTX_ROLE_FLOOR_MARGIN = 1.2
 
+# Roles: the no-answer causes, measured 2026-10-11 (see AGENTS.md at the END).
+# Two flag-gated big-turn timing fixes; `_rn_` names are this session's.
+_RN_EMPTY_PROBE_SECONDS = 45.0   # a recently-empty pair's actor window on a big turn
+
+
+def _rn_flag(name):
+    """A _rn_ fix flag (config.get_flag, default True); off = byte-identical to
+    before. Never raises."""
+    try:
+        return bool(config.get_flag(name, True))
+    except Exception:                                            # noqa: BLE001
+        return True
+
+
+def _rn_actor_attempts(est, base):
+    """Fix (rn_big_turn_one_attempt, default on): a BIG request's roles actor
+    opens on ONE long attempt (the whole remaining room) instead of the usual
+    2-3 short ones. A slow-but-working thinker on a 60K+ context then gets the
+    time to finish (MEASURED: the `coding|hard|tools|l` turns that burned 3-4
+    ~45-90 s hops and still timed out dominate the no-answer log), and its
+    PARALLEL stall-backup (a different model) still races it -- so the turn
+    ends in 1-2 calls, not 3-4. Flag off, or a small request -> `base`
+    unchanged. Never raises."""
+    try:
+        if int(est or 0) >= LONG_CTX_SPEED_TOKENS and _rn_flag("rn_big_turn_one_attempt"):
+            return 1
+    except Exception:                                            # noqa: BLE001
+        pass
+    return base
+
 
 def _role_share(room, attempts_left):
     """Seconds one attempt may take of `room` when `attempts_left` attempts
@@ -39909,6 +39939,17 @@ def _role_hop_deadline(clock, pid, model, room_total, attempts_left, est, budget
         if floor:
             share = min(room_total, max(share, min(floor * _LONG_CTX_ROLE_FLOOR_MARGIN,
                                                    room_total * _LONG_CTX_ROLE_FLOOR_SHARE)))
+        # Fix (rn_empty_actor_cap_big, default on): on a BIG request a pair the
+        # hub saw return an empty/junk 200 recently gets only a short PROBE
+        # window as actor, so an empty-returning thinker (space-bunny / kimi-k3
+        # in the log: "200 with an empty message" after burning ~180 s) cannot
+        # eat the whole stage and starve the walk AND the `best` fallback. Only
+        # KNOWN-empty pairs are capped -- a slow-but-working thinker is untouched
+        # (it is given MORE time by rn_big_turn_one_attempt). Never the floor /
+        # measured-slow lift above.
+        if (int(est or 0) >= LONG_CTX_SPEED_TOKENS and _rn_flag("rn_empty_actor_cap_big")
+                and _empty_streak(pid, model) >= 1):
+            share = min(share, _RN_EMPTY_PROBE_SECONDS)
         return share if budget is None else min(budget, share)
     except Exception:                                            # noqa: BLE001
         share = _role_share(room_total, attempts_left)
@@ -41219,7 +41260,8 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
                                                _benchmark_score(hop_pid, hop_model)), 3)
         served = _role_actor_hop(clock, abody, hop_pid, hop_model, est, kind, rec, rows,
                                  turn_end, spent,
-                                 attempts_left=max(1, min(3, _ROLE_MAX_ACTOR_HOPS - hops + 1)))
+                                 attempts_left=_rn_actor_attempts(
+                                     est, max(1, min(3, _ROLE_MAX_ACTOR_HOPS - hops + 1))))
         if served:
             break
     rec["actor_hops"] = hops

@@ -189,6 +189,73 @@ def roles_stats(rows):
     }
 
 
+def _hop_cause(why):
+    """One failed-hop `why` string -> a coarse cause class, for --why."""
+    w = str(why or "").lower()
+    if "window too small" in w or "schema" in w and "exceed" in w or "too small for" in w:
+        return "window"
+    if "no answer in time" in w or "deadline" in w or "hop budget" in w or "no content" in w:
+        return "deadline"
+    if "429" in w:
+        return "429"
+    if re.search(r"\bhttp 5\d\d\b", w) or re.search(r"\b5\d\d\b", w):
+        return "5xx"
+    if re.search(r"\bhttp 4\d\d\b", w) or re.search(r"\b4\d\d\b", w):
+        return "http4xx"
+    if "empty" in w or "junk" in w:
+        return "empty/junk"
+    if "invalid" in w or "prose" in w or "cannot run" in w or "refus" in w or "announc" in w:
+        return "invalid/prose"
+    if "dns" in w or "resolve" in w or "network" in w:
+        return "dns"
+    if "conn" in w or "exception" in w or "reset" in w or "refused" in w:
+        return "exc"
+    return "other"
+
+
+def why_breakdown(rows):
+    """For --why: classify the no-answer ROLES turns by cause. Returns a dict
+    (hop classes, first-hop class, turn-level distinct-cause sets, how many
+    spent no call, backup/verifier counts, calls distribution)."""
+    turns = [r for r in rows if r.get("event", "turn") == "turn" and r.get("turn") == "tool"
+             and not r.get("single")]
+    noans = [r for r in turns if not r.get("served")]
+    hop = {}
+    first = {}
+    sets = {}
+    calls_hist = {}
+    zero_call = backup = verifier = 0
+    for r in noans:
+        failed = r.get("failed") or []
+        c = int(r.get("calls") or 0)
+        calls_hist[c] = calls_hist.get(c, 0) + 1
+        if c == 0:
+            zero_call += 1
+        if r.get("hedge"):
+            backup += 1
+        if r.get("verifier"):
+            verifier += 1
+        whys = [_hop_cause(f.get("why")) if isinstance(f, dict) else _hop_cause(f)
+                for f in failed]
+        for w in whys:
+            hop[w] = hop.get(w, 0) + 1
+        first[whys[0] if whys else "no-failed-hop"] = \
+            first.get(whys[0] if whys else "no-failed-hop", 0) + 1
+        key = tuple(sorted(set(whys))) if whys else ("no-failed-hop",)
+        sets[key] = sets.get(key, 0) + 1
+    return {
+        "no_answer_turns": len(noans),
+        "of_turns": len(turns),
+        "hop_classes": dict(sorted(hop.items(), key=lambda kv: -kv[1])),
+        "first_hop_class": dict(sorted(first.items(), key=lambda kv: -kv[1])),
+        "turn_cause_sets": dict(sorted(sets.items(), key=lambda kv: -kv[1])),
+        "spent_no_call": zero_call,
+        "backup_fired": backup,
+        "verifier_ran": verifier,
+        "calls_distribution": dict(sorted(calls_hist.items())),
+    }
+
+
 def _read_lines(paths):
     for p in paths:
         try:
@@ -222,6 +289,10 @@ def main(argv=None):
                     "timestamp, an ISO datetime/date (UTC), or a relative age "
                     "(36h, 7d, 90m, 2w). Rows with no ts are dropped when set.")
     ap.add_argument("--json", action="store_true", help="print JSON")
+    ap.add_argument("--why", action="store_true",
+                    help="also break the no-answer ROLES turns down by cause "
+                    "(per-hop class, first-hop class, turn-level cause sets). "
+                    "Without it the output is unchanged.")
     args = ap.parse_args(argv)
     state = None
     if not (args.log and args.roles):
@@ -238,7 +309,13 @@ def main(argv=None):
            "roles": roles_stats(rows),
            "since": since,
            "sources": {"log": log_paths, "roles": role_paths}}
+    if args.why:
+        out["why"] = why_breakdown(rows)
     if args.json:
+        if "why" in out:
+            # tuple keys are not JSON; render the cause sets as " + "-joined names
+            out["why"]["turn_cause_sets"] = {
+                " + ".join(k): v for k, v in out["why"]["turn_cause_sets"].items()}
         print(json.dumps(out, indent=2))
         return out
     for name in ("race", "roles"):
@@ -255,6 +332,23 @@ def main(argv=None):
               "%s%% calls wasted, %s verifier usable rate" % (
                   r.get("turns"), r.get("zero_answer_rate"), r.get("calls_per_turn"),
                   r.get("wasted_calls_pct"), r.get("verifier_usable_rate")))
+    if "why" in out:
+        w = out["why"]
+        print("== why (no-answer roles turns) ==")
+        print("  %-28s %s of %s" % ("no_answer_turns", w["no_answer_turns"], w["of_turns"]))
+        print("  %-28s %s" % ("spent_no_call", w["spent_no_call"]))
+        print("  %-28s %s" % ("backup_fired", w["backup_fired"]))
+        print("  %-28s %s" % ("verifier_ran", w["verifier_ran"]))
+        print("  %-28s %s" % ("calls_distribution", w["calls_distribution"]))
+        print("  per-hop failure classes:")
+        for c, n in w["hop_classes"].items():
+            print("    %4d  %s" % (n, c))
+        print("  first-hop class per turn:")
+        for c, n in w["first_hop_class"].items():
+            print("    %4d  %s" % (n, c))
+        print("  turn-level distinct-cause sets:")
+        for c, n in list(w["turn_cause_sets"].items())[:12]:
+            print("    %4d  %s" % (n, " + ".join(c)))
     print("sources: %d log file(s), %d roles file(s)" % (len(log_paths), len(role_paths)))
     return out
 
