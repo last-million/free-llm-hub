@@ -35261,6 +35261,9 @@ _REASONING_STALL_SHARE = 0.6
 # Bytes of held reasoning frames before the hold gives up anyway (~50K tokens
 # of deltas): bounds the memory one held request can take.
 _REASONING_HOLD_MAX_BYTES = 8 << 20
+# What one held frame costs beyond its bytes (list slot + object header): a
+# stream of empty / tiny frames is bounded too, not only a stream of big ones.
+_REASONING_HOLD_FRAME_OVERHEAD = 64
 
 
 def _rs_on():
@@ -35381,12 +35384,21 @@ def _peek_until_content(iterator, deadline_s, max_lines=400, content_grace=0.0,
                 n_read += 1
                 item = next(iterator)
                 buf.append(item)
+                if hold:
+                    # Security review of 488d4fb: count EVERY held frame --
+                    # blank keep-alive lines and non-reasoning frames too, plus
+                    # a fixed per-frame overhead -- and check the cap on EVERY
+                    # frame. Checked only on reasoning frames, one reasoning
+                    # delta followed by endless empty / keep-alive frames grew
+                    # the buffer without bound for the whole hold budget.
+                    held += (len(item) if item else 0) + _REASONING_HOLD_FRAME_OVERHEAD
+                    if held > _REASONING_HOLD_MAX_BYTES and not seen_content:
+                        box["status"] = "reasoning_stall" if saw_reasoning else "empty"
+                        return
                 if not item:
                     continue
                 b = item if isinstance(item, (bytes, bytearray)) \
                     else str(item).encode("utf-8", "ignore")
-                if hold:
-                    held += len(b)
                 # A real tool call means the model is DOING the work. Commit at
                 # once: nothing below can improve on that, and every extra frame
                 # here is latency on the turns that are going well.

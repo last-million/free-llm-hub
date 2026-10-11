@@ -5271,3 +5271,11 @@ names: `_rs_on`, `_rs_note_stall`, `_rs_leg_budget`, `_REASONING_STALL_*`,
   while it thinks (it arrives at once at commit); TTFT samples
   (`_note_ttft`) now measure real first visible content, so they rise for
   thinkers. `PHASE_RETRIES`, swarm_windows.py and `_mr_*` are untouched.
+- **Hold cap counts every frame** (security review of 488d4fb): while a
+  stream is held, EVERY frame -- blank keep-alive lines and non-reasoning
+  frames included -- adds its bytes plus `_REASONING_HOLD_FRAME_OVERHEAD` (64)
+  to the held total, and `_REASONING_HOLD_MAX_BYTES` (8 MiB) is checked on
+  every frame. It used to be checked only on reasoning frames, so one reasoning
+  delta followed by endless empty / keep-alive frames grew the buffer without
+  bound for the whole hold budget. Past the cap with no visible content: status
+  `reasoning_stall` (or `empty` when no reasoning was seen at all).

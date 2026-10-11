@@ -370,3 +370,41 @@ def test_a_buffered_reply_that_only_reasoned_is_empty():
     data = {"choices": [{"index": 0, "finish_reason": "stop", "message": {
         "role": "assistant", "content": "", "reasoning_content": "long thoughts"}}]}
     assert A._chat_json_is_empty(data)
+
+
+# --------------------------------------------------------------------------- #
+# Security review of 488d4fb: the hold cap counts EVERY frame. Checked only on
+# reasoning frames, ONE reasoning delta followed by endless empty or keep-alive
+# frames grew the held buffer without bound for the whole hold budget.
+# --------------------------------------------------------------------------- #
+
+def _one_reasoning_then(filler):
+    def gen():
+        yield _frame({"reasoning_content": "thinking"}, "frames")
+        while True:
+            yield filler
+    return gen()
+
+
+@pytest.mark.parametrize("filler", [b"", b": keepalive\n\n",
+                                    b'data: {"choices":[{"delta":{}}]}\n\n'])
+def test_hold_cap_counts_every_frame_not_only_reasoning(monkeypatch, filler):
+    monkeypatch.setattr(A, "_REASONING_HOLD_MAX_BYTES", 4000)
+    t0 = time.monotonic()
+    status, buf = A._peek_until_content(_one_reasoning_then(filler), 5.0,
+                                        reasoning_budget=30.0)
+    assert status == "reasoning_stall"
+    # bounded by the cap (each frame costs at least the fixed overhead), not by
+    # the 30 s budget
+    assert len(buf) <= 4000 // A._REASONING_HOLD_FRAME_OVERHEAD + 2
+    assert time.monotonic() - t0 < 5.0
+
+
+def test_hold_cap_without_any_reasoning_is_an_empty_hop(monkeypatch):
+    monkeypatch.setattr(A, "_REASONING_HOLD_MAX_BYTES", 2000)
+
+    def junk():
+        while True:
+            yield b"x" * 500
+    status, _buf = A._peek_until_content(junk(), 5.0, reasoning_budget=30.0)
+    assert status == "empty"
