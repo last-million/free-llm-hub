@@ -58,7 +58,10 @@ def test_large_max_tokens_bumps_score():
 # _apply_reasoning_effort
 # --------------------------------------------------------------------------- #
 
-def test_effort_follows_difficulty_on_reasoning_models():
+def test_effort_follows_difficulty_on_reasoning_models(monkeypatch):
+    # The old mapping, with max_reasoning off (on, medium is "high" too --
+    # tests/test_max_reasoning.py).
+    monkeypatch.setattr(app, "_mr_on", lambda: False)
     for difficulty, effort in (("simple", "low"), ("medium", "medium"), ("hard", "high")):
         payload = {"max_tokens": 8000}
         out = app._apply_reasoning_effort(payload, "gpt-oss-120b", difficulty)

@@ -5001,3 +5001,33 @@ before compacting (the served-turn path works, so the remaining gap was only the
 overflow/error turns, which this guard converts). The two codex front-door tests
 in `tests/test_oversized_conversation.py` set `context_grow_guard` off to keep
 pinning the native-reply mechanics.
+
+## Max reasoning & deep thinking (2026-10-11)
+
+Owner: "always the max of reasoning and deep thinking, for the best quality";
+a Settings switch, ON by default; Activity shows it. Covered by
+`tests/test_max_reasoning.py`. New app.py names are `_mr_`.
+
+- **Flag** `max_reasoning` (`config.get_flag`, default ON; an unreadable config
+  counts as OFF). Settings drawer switch `#drawer-reasoning-switch`
+  ("Reasoning & deep thinking (max)"), `GET/POST /api/reasoning {enabled}`
+  (control-token gated like every `/api/*`). README route count 192 -> 193.
+- **On**, `_apply_reasoning_effort` gives every MEDIUM or HARD turn effort
+  `high` on every model that can think: reasoning-named (`_SLOW_MODEL_RE`),
+  default thinkers (`_thinks_by_default`) AND catalog hybrids (`_can_think`,
+  which only think when asked -- this switches them on). Still capped by
+  `_EFFORT_MIN_BUDGET` (high on a < 2000-token budget returned EMPTY,
+  measured) and never sent to a pair that rejected the parameter.
+- **Unchanged**: `simple` / unknown difficulty (one-word asks, the hub's own
+  probes, the planner's deliberate `simple`), the verifier / specialists (they
+  never call it), and TOOL turns whose SENT size (`g.rr_sent_est`, or `est=`)
+  is >= `LONG_CTX_SPEED_TOKENS` (60K): there the old mapping applies, because
+  slow thinkers were the main cause of big tool turns ending with no answer
+  (turn-roles.jsonl 2026-10-08..10). Roles calls (`_role_start_leg`) get
+  `high` under 60K sent and NOTHING above it (they never had a hub effort).
+- **Activity**: `_mr_note` / `_act_pick` keep `act["reasoning"]` in step with
+  the picked hop: `deep` (effort high) -> chip "deep thinking", `on` (the model
+  reasons at a lower or its own level) -> chip "reasoning"; a hop that does not
+  think clears it.
+- **Off**: the old difficulty mapping byte for byte
+  (`tests/test_difficulty_routing.py` pins it with the flag off).

@@ -549,6 +549,8 @@
           border:1px solid var(--border-soft);white-space:nowrap}
   .af-src.build{background:var(--accent-soft);color:var(--ok-text);
                 border-color:var(--accent-border)}
+  .af-think.deep{background:var(--accent-soft);color:var(--ok-text);
+                  border-color:var(--accent-border)}
   /* Image/video/audio preview: fit the pane, never stretch past it, and
      show the checker ground so a transparent PNG is readable. */
   .file-media{display:flex;align-items:center;justify-content:center;
@@ -4830,6 +4832,14 @@
         <span class="lbl">Enhance opening prompts</span>
       </label>
       <p class="sd-help">Rewrites the <em>first</em> prompt of a dashboard chat, and every image prompt, into a sharper version before sending &mdash; so a two-word ask still gets the model&rsquo;s best work. Anti-slop by design: no &ldquo;masterpiece, 8k&rdquo; padding, no role-play framing. You always see the rewrite and can revert it. Requests from your CLIs are never touched.</p>
+    </div>
+    <div class="sd-group">
+      <label class="switch" title="Ask every model that can think for its highest reasoning effort on real tasks">
+        <input id="drawer-reasoning-switch" type="checkbox" aria-label="Reasoning and deep thinking">
+        <span class="track" aria-hidden="true"></span>
+        <span class="lbl">Reasoning &amp; deep thinking (max)</span>
+      </label>
+      <p class="sd-help">On: every model that can think is asked for its <em>highest</em> reasoning effort on real tasks, for the best answers (they take longer). One-word asks and the hub&rsquo;s own checks stay light, and very large agent turns (60K+ tokens) keep each model&rsquo;s own setting, because more thinking there made answers time out. Activity shows <b>deep thinking</b> or <b>reasoning</b> on each request.</p>
     </div>
     <div class="sd-group" id="lowres-group">
       <div class="sd-label">Low-memory mode</div>
@@ -14434,6 +14444,11 @@
             : '<span class="af-src" title="An external client pointed at this hub">CLI</span>') +
           '<span class="af-proto">' + esc(protoLabel(a.protocol)) + (a.stream ? ' · stream' : '') + '</span>' +
           '<span class="af-model">' + modelHTML + '</span>' +
+          /* The served model was asked to think (max_reasoning): "deep" =
+             highest effort, "on" = it reasons at a lower or its own level. */
+          (a.reasoning === 'deep'
+            ? '<span class="af-src af-think deep" title="This model was asked for its highest reasoning effort">deep thinking</span>'
+            : (a.reasoning ? '<span class="af-src af-think" title="This model reasons before it answers">reasoning</span>' : '')) +
           '<span class="af-dur js-af-dur" data-started="' + esc(a.started) + '" data-pending="' + (pending ? '1' : '0') +
             '" data-ms="' + esc(numOr(a.duration_ms, 0)) + '">' + esc(fmtDuration(a.duration_ms)) + '</span>' +
           '<span class="af-status ' + statusClass + '"' + (statusTitle ? ' title="' + esc(statusTitle) + '"' : '') + '><span class="d"></span>' + esc(statusLabel) + esc(httpTxt) +
@@ -14783,6 +14798,29 @@
           toast('Prompt enhancement ' + (sw.checked ? 'on' : 'off'));
         })
         .catch(function(e){ toast('Prompt enhance: ' + e.message, true); sw.checked = !want; })
+        .then(function(){ sw.disabled = false; });
+    });
+  }
+
+  /* ---------- reasoning & deep thinking toggle (Settings, default on) ---------- */
+  function loadReasoning(silent){
+    return api('/api/reasoning').then(function(r){
+      var sw = $('#drawer-reasoning-switch');
+      if (sw) sw.checked = !!(r && r.enabled);
+    }).catch(function(e){ if (!silent) toast('Reasoning: ' + e.message, true); });
+  }
+  function initReasoning(){
+    var sw = $('#drawer-reasoning-switch');
+    if (!sw) return;
+    sw.addEventListener('change', function(){
+      var want = sw.checked;
+      sw.disabled = true;
+      api('/api/reasoning', { method: 'POST', body: { enabled: want } })
+        .then(function(r){
+          sw.checked = !!(r && r.enabled);
+          toast('Reasoning & deep thinking ' + (sw.checked ? 'on' : 'off'));
+        })
+        .catch(function(e){ toast('Reasoning: ' + e.message, true); sw.checked = !want; })
         .then(function(){ sw.disabled = false; });
     });
   }
@@ -15728,6 +15766,7 @@
   function loadSettingsView(silent){
     try { loadTestVerification(silent); } catch (e) {}
     try { loadPromptEnhance(silent); } catch (e) {}
+    try { loadReasoning(silent); } catch (e) {}
     try { loadSkills(silent); } catch (e) {}
     try { loadLowres(silent); } catch (e) {}
     try { loadSocialWebSearch(silent); } catch (e) {}
@@ -15742,7 +15781,7 @@
     var c = $('#settings-drawer-close');
     if (c) c.focus();
     loadTestVerification(true);
-    loadPromptEnhance(true); loadSkills(true); loadLowres(true); loadHeartbeats(true);
+    loadPromptEnhance(true); loadReasoning(true); loadSkills(true); loadLowres(true); loadHeartbeats(true);
     loadSocialWebSearch(true); loadSdModels(true);
     loadUpdateStatus(true);
   }
@@ -16466,6 +16505,7 @@
   initVisionGap();
   initTestVerification();
   initPromptEnhance();
+  initReasoning();
   initSkills();
   initLowres();
   initHeartbeats();

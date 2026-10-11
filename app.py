@@ -7863,10 +7863,75 @@ def _strip_private_keys(payload):
     return payload
 
 
-def _apply_reasoning_effort(payload, model, difficulty, pid=None):
+# --------------------------------------------------------------------------- #
+# MAX REASONING (owner 2026-10-11: "always the max of reasoning and deep
+# thinking, for the best quality"). Flag `max_reasoning` (config.get_flag,
+# default ON; Settings -> "Reasoning & deep thinking", GET/POST
+# /api/reasoning). On: every REAL turn (difficulty medium or hard) asks every
+# model that can think for effort "high" -- default thinkers AND hybrids that
+# think only when asked -- still capped by the output budget
+# (_EFFORT_MIN_BUDGET: "high" on a tiny budget returns EMPTY, measured).
+# Unchanged: "simple" turns (one-word asks and the hub's own probes,
+# classification and planner) and AGENT turns whose sent size is past
+# LONG_CTX_SPEED_TOKENS -- MEASURED (turn-roles.jsonl 2026-10-08..10) slow
+# thinkers were the main cause of big tool turns ending with no answer, so
+# those keep each model's own default. Off = the old mapping byte for byte.
+# The Activity row carries `reasoning`: "deep" (effort high) or "on" (the
+# served model thinks at a lower or its default level).
+# --------------------------------------------------------------------------- #
+def _mr_on():
+    try:
+        return bool(config.get_flag("max_reasoning", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _mr_big_agent_turn(payload, est=None):
+    """A tool turn whose SENT size is past LONG_CTX_SPEED_TOKENS."""
+    try:
+        if not (isinstance(payload, dict) and payload.get("tools")):
+            return False
+        n = est if est is not None else getattr(g, "rr_sent_est", None)
+        return bool(n) and int(n) >= LONG_CTX_SPEED_TOKENS
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _mr_label(pid, model, payload, default):
+    eff = payload.get("reasoning_effort") if isinstance(payload, dict) else None
+    if eff and _reasoning_rejected(pid, model):
+        eff = None
+    if str(eff or "").lower() == "high":
+        return "deep"
+    return "on" if (eff or default) else None
+
+
+def _mr_note(pid, model, label):
+    """Remember this hop's reasoning label for the Activity row (request
+    thread only; silently nothing elsewhere). _act_pick reads it too, so the
+    row follows whichever hop is picked last, in either order."""
+    try:
+        labels = getattr(g, "mr_labels", None)
+        if labels is None:
+            labels = {}
+            g.mr_labels = labels
+        labels[(pid, model)] = label
+        act = getattr(g, "act", None)
+        if act is not None and act.get("provider") == pid and act.get("model") == model:
+            with _activity_lock:
+                if label:
+                    act["reasoning"] = label
+                else:
+                    act.pop("reasoning", None)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _apply_reasoning_effort(payload, model, difficulty, pid=None, est=None):
     """For a thinking model: set reasoning_effort (from the task difficulty, LOW
     on a small ask) and raise max_tokens by a reasoning allowance so hidden
     thinking cannot eat the visible answer. No-op for non-thinking models.
+    With `max_reasoning` on, a medium/hard turn gets "high" (see above).
 
     The effort is CAPPED by the output budget. Thinking is spent from the same
     max_tokens as the answer, so 'high' effort on a small budget makes the model
@@ -7887,7 +7952,15 @@ def _apply_reasoning_effort(payload, model, difficulty, pid=None):
     key = _budget_key(payload)
     budget = int(payload[key]) if key else 0
     effort = None
-    if slow and difficulty:
+    if (difficulty in ("medium", "hard") and _mr_on()
+            and not _mr_big_agent_turn(payload, est)):
+        effort = "high"
+        if budget > 0:
+            order = {"low": 0, "medium": 1, "high": 2}
+            for need, cap in _EFFORT_MIN_BUDGET:
+                if budget < need and order.get(effort, 1) > order[cap]:
+                    effort = cap
+    elif slow and difficulty:
         effort = _DIFFICULTY_EFFORT.get(difficulty, "medium")
         if budget > 0:
             order = {"low": 0, "medium": 1, "high": 2}
@@ -7903,6 +7976,7 @@ def _apply_reasoning_effort(payload, model, difficulty, pid=None):
         in_force = str(effort or payload.get("reasoning_effort") or "medium").lower()
         payload[key] = budget + _THINKING_ALLOWANCE.get(in_force, 2048)
         payload[_CALLER_MAX_KEY] = budget
+    _mr_note(pid, model, _mr_label(pid, model, payload, default))
     return payload
 
 
@@ -16568,6 +16642,12 @@ def _act_pick(pid, model):
             if len(hops) < 12:
                 hops.append("%s/%s" % (pid, model))
             act["routed"] = act.get("routed") or ("%s/%s" % (pid, model))
+            # Reasoning label of THIS hop (_mr_note); a hop with none clears it.
+            label = (getattr(g, "mr_labels", None) or {}).get((pid, model))
+            if label:
+                act["reasoning"] = label
+            else:
+                act.pop("reasoning", None)
 
 
 def _act_pipeline_watcher():
@@ -32064,6 +32144,16 @@ def api_prompt_enhance_flag():
     return jsonify({"enabled": config.get_flag("prompt_enhance", True)})
 
 
+@app.route("/api/reasoning", methods=["GET", "POST"])
+def api_max_reasoning_flag():
+    """Settings switch "Reasoning & deep thinking" (flag `max_reasoning`,
+    default ON, owner 2026-10-11). See _mr_on."""
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        config.set_flag("max_reasoning", bool(body.get("enabled")))
+    return jsonify({"enabled": config.get_flag("max_reasoning", True)})
+
+
 @app.route("/api/enhance-prompt", methods=["POST"])
 def api_enhance_prompt():
     """{prompt, kind:'chat'|'image'} -> {original, enhanced, changed, model}.
@@ -39994,6 +40084,15 @@ def _role_start_leg(idx, pid, model, body, deadline, q, est, kind):
     payload = dict(body)
     payload["model"] = model
     payload["stream"] = False
+    # Max reasoning (see _mr_on): a role call under LONG_CTX_SPEED_TOKENS asks a
+    # thinking model for "high"; bigger turns and the flag off send what they
+    # always did (no hub effort at all).
+    try:
+        sent = _rr_fit(est)
+        if _mr_on() and sent and int(sent) < LONG_CTX_SPEED_TOKENS:
+            _apply_reasoning_effort(payload, model, "hard", pid=pid, est=sent)
+    except Exception:                                            # noqa: BLE001
+        pass
 
     def _go():
         t0 = time.monotonic()
