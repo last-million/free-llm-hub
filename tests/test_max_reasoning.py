@@ -53,14 +53,22 @@ def test_real_turns_get_high_effort_on_every_thinker():
         assert out["reasoning_effort"] == "high", diff
 
 
-def test_a_hybrid_is_switched_on_for_a_real_turn_only():
+def test_a_hybrid_is_never_switched_on():
+    """MEASURED live 2026-10-11: nvidia/z-ai/glm-5.3 (a catalog hybrid) sent an
+    effort switched its thinking on, spent ~4 min and returned EMPTY twice."""
     A._learn_ctx_from_catalog("openrouter", {"data": [
         {"id": "vendor/hybrid-mr", "supported_parameters": ["reasoning", "tools"]}]})
-    out = A._apply_reasoning_effort({"max_tokens": 8000}, "vendor/hybrid-mr", "hard",
-                                    pid="openrouter")
-    assert out["reasoning_effort"] == "high"
-    out = A._apply_reasoning_effort({"max_tokens": 40}, "vendor/hybrid-mr", "simple",
-                                    pid="openrouter")
+    for diff in ("simple", "medium", "hard"):
+        out = A._apply_reasoning_effort({"max_tokens": 8000}, "vendor/hybrid-mr", diff,
+                                        pid="openrouter")
+        assert "reasoning_effort" not in out, diff
+
+
+def test_a_pair_only_learned_to_think_is_not_maxed():
+    pair = ("nvidia", "z-ai/glm-5.3")
+    A._note_thinking(*pair)
+    assert A._thinks_by_default(*pair)
+    out = A._apply_reasoning_effort({"max_tokens": 32000}, pair[1], "hard", pid=pair[0])
     assert "reasoning_effort" not in out
 
 

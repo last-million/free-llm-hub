@@ -5013,11 +5013,16 @@ a Settings switch, ON by default; Activity shows it. Covered by
   ("Reasoning & deep thinking (max)"), `GET/POST /api/reasoning {enabled}`
   (control-token gated like every `/api/*`). README route count 192 -> 193.
 - **On**, `_apply_reasoning_effort` gives every MEDIUM or HARD turn effort
-  `high` on every model that can think: reasoning-named (`_SLOW_MODEL_RE`),
-  default thinkers (`_thinks_by_default`) AND catalog hybrids (`_can_think`,
-  which only think when asked -- this switches them on). Still capped by
-  `_EFFORT_MIN_BUDGET` (high on a < 2000-token budget returned EMPTY,
-  measured) and never sent to a pair that rejected the parameter.
+  `high` on every model that thinks by NAME or DOCS (`_SLOW_MODEL_RE`,
+  `_THINKING_DOC_RE`: reasoning families, Gemini 2.5/3.x non-lite, gpt-5,
+  o-series, MiniMax-M). Still capped by `_EFFORT_MIN_BUDGET` (high on a
+  < 2000-token budget returned EMPTY, measured) and never sent to a pair that
+  rejected the parameter. NEVER to a catalog hybrid (`_can_think` only) nor a
+  pair only LEARNED to think (`_THINKING_LEARNED` -- that evidence can come
+  from a hub-sent effort): MEASURED live 2026-10-11 05:37, the first version
+  sent nvidia/z-ai/glm-5.3 (a hybrid) an effort; it switched thinking on,
+  spent ~4 min, returned EMPTY twice and the request hit its deadline. Those
+  keep the old rule (allowance, no effort).
 - **Unchanged**: `simple` / unknown difficulty (one-word asks, the hub's own
   probes, the planner's deliberate `simple`), the verifier / specialists (they
   never call it), and TOOL turns whose SENT size (`g.rr_sent_est`, or `est=`)

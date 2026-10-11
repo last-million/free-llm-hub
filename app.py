@@ -7868,8 +7868,10 @@ def _strip_private_keys(payload):
 # thinking, for the best quality"). Flag `max_reasoning` (config.get_flag,
 # default ON; Settings -> "Reasoning & deep thinking", GET/POST
 # /api/reasoning). On: every REAL turn (difficulty medium or hard) asks every
-# model that can think for effort "high" -- default thinkers AND hybrids that
-# think only when asked -- still capped by the output budget
+# model that thinks by NAME or DOCS (_SLOW_MODEL_RE, _THINKING_DOC_RE) for
+# effort "high" -- never a catalog hybrid or a pair only LEARNED to think
+# (measured: a hybrid switched on returned empty after ~4 min) -- still capped
+# by the output budget
 # (_EFFORT_MIN_BUDGET: "high" on a tiny budget returns EMPTY, measured).
 # Unchanged: "simple" turns (one-word asks and the hub's own probes,
 # classification and planner) and AGENT turns whose sent size is past
@@ -7952,7 +7954,14 @@ def _apply_reasoning_effort(payload, model, difficulty, pid=None, est=None):
     key = _budget_key(payload)
     budget = int(payload[key]) if key else 0
     effort = None
-    if (difficulty in ("medium", "hard") and _mr_on()
+    # Only a model that thinks by NAME or DOCS (reasoning family, docs table) is
+    # maxed. MEASURED live 2026-10-11 05:37: nvidia/z-ai/glm-5.3 (a catalog
+    # hybrid, not a known thinker) was sent an effort, switched its thinking
+    # on, spent ~4 min and returned EMPTY twice (the whole request deadline).
+    # A hybrid -- and a pair only LEARNED to think (that evidence can come from
+    # a hub-sent effort) -- keeps the old rule: room, no effort.
+    named = slow or bool(_THINKING_DOC_RE.search(low))
+    if (named and difficulty in ("medium", "hard") and _mr_on()
             and not _mr_big_agent_turn(payload, est)):
         effort = "high"
         if budget > 0:
