@@ -23,6 +23,24 @@ racing the tests for the same files.
 `basetemp` is only set when the user has not passed --basetemp explicitly, so
 this never overrides a deliberate choice on CI or another machine.
 
+PARALLEL RUNS (pytest-xdist, `-n auto`). Everything below was written for ONE
+process, so under xdist the roles are split:
+
+  * the CONTROLLER (the process you started) owns the run-wide things: it picks
+    basetemp (xdist hands every worker `<basetemp>/popen-gwN`, so a worker never
+    re-points it -- the `--basetemp` guard below already skips it), and it is the
+    ONLY process that fingerprints the real CLI configs and applies the
+    end-of-run tripwire. It runs no tests.
+  * every WORKER gets its own sandbox home and its own hub-state directory
+    (config.json, memory, swarm runs, the isolated claude settings), all under
+    one run-scoped folder `<system temp>/hub-pytest-xdist-<run id>/<worker id>/`
+    that the controller removes after a clean run. The shared fixed folders
+    (`hub-pytest-home`, `hub-pytest-hub-state`) are the SERIAL layout and are
+    left exactly as they were: a worker that shared them would see another
+    worker's config.json mid-test.
+  * a worker never fingerprints or compares anything: its HOME is already a
+    sandbox, and files another worker's sandbox touches are not a leak.
+
 WHY THE FREE_LLM_HUB_CONFIG PART EXISTS. config.py / usage_history.py /
 quota.py / quick_history.py / image_history.py / agentic_history.py all
 resolve their on-disk path through `os.environ.get("FREE_LLM_HUB_CONFIG")`,
@@ -55,10 +73,91 @@ above -- a file's own monkeypatch.setenv still wins for the duration of that
 test, and an operator/CI override of the real env var is never touched.
 """
 import os
+import shutil
 import sys
 import tempfile
+import time
 
 import pytest
+
+
+# Set by pytest_configure in an xdist WORKER: the run-scoped folder that holds
+# this worker's private sandbox home and hub-state. None in a serial run and in
+# the xdist controller, which keep the original shared folders.
+_WORKER_ROOT = None
+_XDIST_DIR_PREFIX = "hub-pytest-xdist-"
+
+
+def _xdist_worker_id(config):
+    """The worker's id ("gw0"...) inside an xdist worker, else None. Taken from
+    config.workerinput, not from the PYTEST_XDIST_WORKER variable: that one is
+    inherited by any child process a test starts (a nested pytest included)."""
+    info = getattr(config, "workerinput", None)
+    if isinstance(info, dict) and info.get("workerid"):
+        return str(info["workerid"])
+    return None
+
+
+def _is_xdist_controller(config):
+    """True in the process that distributes tests to workers (xdist already
+    turned `-n auto` into a worker count and set `tx` by now)."""
+    return (_xdist_worker_id(config) is None
+            and bool(getattr(config.option, "tx", None))
+            and getattr(config.option, "dist", "no") != "no")
+
+
+def _hub_state_dir():
+    """Where this process keeps the hub's isolated state."""
+    if _WORKER_ROOT:
+        return os.path.join(_WORKER_ROOT, "hub-state")
+    return os.path.join(tempfile.gettempdir(), "hub-pytest-hub-state")
+
+
+def _sandbox_home_dir():
+    if _WORKER_ROOT:
+        return os.path.join(_WORKER_ROOT, "home")
+    return os.path.join(tempfile.gettempdir(), "hub-pytest-home")
+
+
+def _force_rmtree(path):
+    """rmtree that also removes read-only files. The snapshot tests leave bare
+    git repositories in the hub state, and git's object files are read-only, so
+    on Windows a plain rmtree(ignore_errors=True) silently left the folder
+    behind (seen: a run's gwN/hub-state/snapshots/*.git survived every clean
+    run)."""
+    import stat
+
+    def _fix(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+            func(target)
+        except OSError:
+            pass
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_fix)
+    else:
+        shutil.rmtree(path, onerror=_fix)
+
+
+def _prune_stale_xdist_dirs(max_age_seconds=24 * 3600):
+    """A run that was killed never reached its cleanup; drop what is a day old.
+    Best effort -- a folder another live run is using is far younger."""
+    base = tempfile.gettempdir()
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return
+    cutoff = time.time() - max_age_seconds
+    for name in names:
+        if not name.startswith(_XDIST_DIR_PREFIX):
+            continue
+        path = os.path.join(base, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                _force_rmtree(path)
+        except OSError:
+            pass
 
 
 @pytest.fixture(autouse=True)
@@ -76,8 +175,7 @@ def _isolated_claude_settings_stay_out_of_the_real_home(monkeypatch):
         orig = ac._claude_settings_file
     except Exception:                                            # noqa: BLE001
         return
-    sandbox = os.path.join(tempfile.gettempdir(), "hub-pytest-hub-state",
-                           "isolated-claude-config")
+    sandbox = os.path.join(_hub_state_dir(), "isolated-claude-config")
 
     def redirected(config_home):
         if os.path.normcase(os.path.abspath(config_home)) == real:
@@ -187,10 +285,14 @@ def _fingerprint_real_cli_configs(home):
 
 
 def _sandbox_the_home(config):
-    real_home = os.path.expanduser("~")
-    config._real_home = real_home
-    config._real_cli_before = _fingerprint_real_cli_configs(real_home)
-    sandbox = os.path.join(tempfile.gettempdir(), "hub-pytest-home")
+    if not _WORKER_ROOT:
+        # Serial run or the xdist controller: the one process that compares the
+        # REAL files before and after. A worker's "home" already is a sandbox
+        # (inherited from the controller), so it fingerprints nothing.
+        real_home = os.path.expanduser("~")
+        config._real_home = real_home
+        config._real_cli_before = _fingerprint_real_cli_configs(real_home)
+    sandbox = _sandbox_home_dir()
     config._saved_home_env = {v: os.environ.get(v) for v in _HOME_VARS + _SCRUBBED_ENV_VARS}
     for var in _SCRUBBED_ENV_VARS:
         os.environ.pop(var, None)
@@ -218,10 +320,22 @@ def pytest_unconfigure(config):
             os.environ.pop(var, None)
         else:
             os.environ[var] = val
+    # The xdist controller removes the run's worker folders once every worker
+    # has exited (unconfigure comes after the workers are torn down) -- but only
+    # after a clean run: a failing one keeps them for the post-mortem.
+    run_dir = getattr(config, "_xdist_run_dir", None)
+    if run_dir and getattr(config, "_xdist_run_clean", False):
+        try:
+            _force_rmtree(run_dir)
+        except OSError:
+            pass
 
 
 def pytest_sessionfinish(session, exitstatus):
     config = session.config
+    if getattr(config, "_xdist_run_dir", None):
+        # `exitstatus` is the controller's own, which is what the run reports.
+        config._xdist_run_clean = (int(exitstatus) == 0)
     before = getattr(config, "_real_cli_before", None)
     if not before:
         return
@@ -239,6 +353,24 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 def pytest_configure(config):
+    global _WORKER_ROOT
+    worker_id = _xdist_worker_id(config)
+    controller = _is_xdist_controller(config)
+    if controller:
+        # One id for the whole run; the workers are spawned after this hook, so
+        # they inherit it. A folder per run keeps two suites that happen to run
+        # at the same time (two checkouts) out of each other's way.
+        import uuid
+        _prune_stale_xdist_dirs()
+        run_id = uuid.uuid4().hex[:8]
+        os.environ["HUB_PYTEST_RUN_ID"] = run_id
+        config._xdist_run_dir = os.path.join(tempfile.gettempdir(),
+                                             _XDIST_DIR_PREFIX + run_id)
+    elif worker_id:
+        run_id = os.environ.get("HUB_PYTEST_RUN_ID") or \
+            str(config.workerinput.get("testrunuid") or "")[:8] or "norun"
+        _WORKER_ROOT = os.path.join(tempfile.gettempdir(), _XDIST_DIR_PREFIX + run_id,
+                                    worker_id)
     _sandbox_the_home(config)
     base = os.path.join(tempfile.gettempdir(), "hub-pytest-base")
 
@@ -261,6 +393,13 @@ def pytest_configure(config):
         else:
             config.option.basetemp = base
 
+    if controller:
+        # The xdist controller runs no test and touches no hub state. The
+        # workers inherit this environment, so setting FREE_LLM_HUB_CONFIG here
+        # would hand every one of them the SAME config.json; each worker sets
+        # its own below.
+        return
+
     if not os.environ.get("FREE_LLM_HUB_CONFIG"):
         # A SIBLING of `base`, deliberately -- `base` is handed to pytest as
         # basetemp above, and pytest owns/prunes that directory itself (found
@@ -270,7 +409,7 @@ def pytest_configure(config):
         # it reproduced only through the full `pytest` entrypoint -- a bare
         # `python -c` calling this same code left the file sitting there fine,
         # because nothing was cleaning it).
-        hub_state = os.path.join(tempfile.gettempdir(), "hub-pytest-hub-state")
+        hub_state = _hub_state_dir()
         try:
             os.makedirs(hub_state, exist_ok=True)
         except OSError:
@@ -309,7 +448,7 @@ def pytest_configure(config):
                       ("FREE_LLM_HUB_SWARM_DIR", "swarm-runs")):
         if os.environ.get(var):
             continue
-        path = os.path.join(tempfile.gettempdir(), "hub-pytest-hub-state", name)
+        path = os.path.join(_hub_state_dir(), name)
         try:
             os.makedirs(path, exist_ok=True)
         except OSError:

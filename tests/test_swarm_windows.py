@@ -1252,7 +1252,14 @@ def test_a_worker_that_goes_silent_is_given_up_on_and_stopped(monkeypatch):
     assert st["agents"][0]["error"].startswith("no output for")
     assert len(stopped) == 1, "the hub was asked to stop the worker's CLI"
     release.set()
-    time.sleep(0.3)
+    # Wait for the late message to be recorded instead of sleeping a fixed 0.3 s:
+    # on a loaded machine (a parallel run, a busy laptop) the worker thread can
+    # take longer than that to wake up and file it. The assertions below are
+    # unchanged; only the wait is now bounded by a deadline rather than a guess.
+    deadline = time.time() + 15
+    while time.time() < deadline and SW.status(rid)["agents"][0]["summary"] != "too late":
+        time.sleep(0.02)
+    time.sleep(0.1)                  # let a (wrong) state flip land, if there were one
     # the late result does not flip the phase the run already moved past
     st = SW.status(rid)
     assert st["agents"][0]["state"] == SW.FAILED

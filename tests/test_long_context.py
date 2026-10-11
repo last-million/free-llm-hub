@@ -139,7 +139,11 @@ def test_the_chain_clock_carries_the_scaled_limit(monkeypatch):
     with A.app.test_request_context():
         c = A._ChainClock(est=220000, stream=False)
         assert c.limit == pytest.approx(480)
-        assert 470 < c.left() <= 480
+        # left() is (start + 480) - now. When the monotonic clock has not ticked
+        # between creating the clock and reading it (Windows' ~15 ms resolution)
+        # that is 480 plus float rounding error (seen: 480.00000000000364 in a
+        # parallel run), so the upper bound carries a tolerance for it.
+        assert 470 < c.left() <= 480 + 1e-6
     with A.app.test_request_context():
         c = A._ChainClock()
         assert c.limit == 240

@@ -2494,6 +2494,64 @@ Run with either python (the `.venv` has pytest too):
     python -m pytest tests/ -q
     .venv\Scripts\python.exe -m pytest tests/ -q
 
+### Parallel run (pytest-xdist, 2026-10-11) -- use this for a full-suite check
+
+    python -m pip install -r requirements-dev.txt        # once: pytest + pytest-xdist
+    python -m pytest tests/ -q -p no:cacheprovider -n auto --basetemp=C:/t/xd
+
+Measured on this PC (4 cores / 8 threads, with the hub and other programs
+running): serial 15:06 to 17:02 min; `-n auto` (4 workers) three runs in a row
+4:20, 4:25 and 4:30, every one with the SAME result as serial, 8511 passed /
+3 skipped / 0 failed (a busy PC made one earlier run take 6:07; `-n logical` =
+8 workers was no faster, 4:40). `-n auto` = physical cores when psutil is
+installed. `tests/test_github_push.py` alone takes ~90 s, so it is the floor.
+
+- `--basetemp=<SHORT path>` on Windows: the default base
+  (`%TEMP%\hub-pytest-base\popen-gwN\...`) is long and git-based tests break on
+  long paths. Two suites running at once need two different basetemps. Leave it
+  out elsewhere and root `conftest.py` picks `<system temp>/hub-pytest-base`.
+- `-p no:cacheprovider` keeps `.pytest_cache` out of the OneDrive-synced
+  checkout. Default `--dist load` is fine; `--dist loadgroup` +
+  `@pytest.mark.xdist_group("name")` is the escape hatch for a test that truly
+  cannot share the machine (none needs it today).
+- **What xdist changes** (root `conftest.py`, covered by running it): the
+  controller picks basetemp (workers get `<basetemp>/popen-gwN`; a worker never
+  re-points it) and is the ONLY process that fingerprints the real CLI configs
+  and applies the end-of-run tripwire. Each worker gets its own sandbox home and
+  its own hub-state folder (config.json, memory, swarm runs, isolated claude
+  settings) under `<system temp>/hub-pytest-xdist-<run id>/gwN/`, removed after
+  a clean run (kept after a failing one; a day-old leftover is pruned at the
+  next start). The serial layout (`hub-pytest-home`, `hub-pytest-hub-state`) is
+  unchanged. The tripwire can still fire on a file the LIVE hub rewrites during
+  the run (`~/.codex/model_catalog.json`, `~/.config/opencode/opencode.json`
+  after its catalog resync): look at which files it names before suspecting a
+  test; do not remove the tripwire.
+- **Use serial** (no `-n`, or `-n0`) for: one test or one file (workers cost ~6 s
+  of start-up), `--pdb`, `-s`, `-x` bisecting an ordering problem, and the FIRST
+  re-run of anything that failed in parallel -- a test that fails only under
+  `-n` is a shared-resource or timing bug in the test, not a flake to ignore.
+- **Writing tests that survive parallel runs**: temp files from `tmp_path` or
+  `tempfile.mkdtemp` (never a fixed name under the system temp dir); bind port 0
+  and read the port back (never a literal); wait for a condition with a deadline
+  (`while time.time() < end and not cond(): sleep(0.02)`) instead of a fixed
+  `sleep` after releasing a thread; a timing bound should be best-of-N or a
+  ratio against a reference timed the same way. Hardened this way on 2026-10-11:
+  `test_swarm_windows::test_a_worker_that_goes_silent_is_given_up_on_and_stopped`,
+  `test_publish_engine::test_one_timer_thread_for_any_number_of_tunnels`,
+  `test_answer_check::test_fast_on_20kb` (same bound, up to 4 attempts) and
+  `test_long_context::test_the_chain_clock_carries_the_scaled_limit` (float
+  rounding when the Windows clock has not ticked). The publish and answer_check
+  ones were found by running 8 workers beside 6 CPU-burning processes, so they
+  are hardened against artificial load, not against anything seen in normal use.
+- **A fresh worker has a fresh config**: the control gate (`_local_control_guard`)
+  enforces a token only if one EXISTS and `config.get_control_token()` never
+  creates it, so a test that asserts a 401 must call
+  `config.ensure_control_token()` (or monkeypatch `get_control_token`) itself.
+  Five tests used to rely on a token left by an earlier test or run
+  (`test_github_push`, `test_foreign_surfaces_routes`, `test_named_chains`) and
+  failed on whichever worker reached them first. Every one of the 377 test files
+  was then run alone on a fresh worker (`-n 1`); all pass.
+
 The hub itself RUNS from the `.venv`, so a dependency present only in the
 system python (PyYAML, tzdata — both missing there until 2026-09-30) passes
 the suite while failing live. Run the suite under the `.venv` after touching

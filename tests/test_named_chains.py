@@ -109,7 +109,11 @@ def test_it_reports_which_entries_are_still_live(client, chains, catalog):
 
 def test_the_routes_are_control_gated(client):
     """Deliberately NOT on the temp-config fixture: a fresh config has no
-    control token, and the gate correctly does nothing when none is set."""
+    control token, and the gate correctly does nothing when none is set. So the
+    token is created here (it used to come from whatever an earlier test or an
+    earlier run had left in the shared config, which a fresh pytest-xdist worker
+    does not have)."""
+    config.ensure_control_token()
     assert client.get("/api/chains").status_code == 401
 
 

@@ -1903,8 +1903,13 @@ def test_route_create_needs_confirm(monkeypatch):
     assert r.get_json()["code"] == "confirm_required"
 
 
-def test_route_mutations_need_the_control_token():
-    c, _A = _client()
+def test_route_mutations_need_the_control_token(monkeypatch):
+    c, A = _client()
+    # The gate only enforces a token that EXISTS, and get_control_token() never
+    # creates one. This test used to rely on some earlier test (or an earlier
+    # run's persisted config) having created it, so it failed with a 404 for any
+    # worker that reached it first. State the precondition instead.
+    monkeypatch.setattr(A.config, "get_control_token", lambda: "a-token-for-this-test")
     for path in ("/api/github/push", "/api/github/create", "/api/github/sync",
                  "/api/github/token", "/api/github/gitignore"):
         r = c.post(path, json={"project_dir": "x", "confirm": True},

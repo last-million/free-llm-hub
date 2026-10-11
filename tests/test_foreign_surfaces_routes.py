@@ -25,6 +25,12 @@ import config
 
 @pytest.fixture
 def client():
+    # The control gate only enforces a token that EXISTS, and a fresh config has
+    # none. These tests assert 401s, so they used to depend on an earlier test
+    # (or an earlier run's persisted config) having created one -- they failed
+    # for any pytest-xdist worker that reached them first. Create it here, the
+    # way _ctl() below already does.
+    config.ensure_control_token()
     return A.app.test_client()
 
 

@@ -707,7 +707,10 @@ def test_one_timer_thread_for_any_number_of_tunnels(rig, monkeypatch):
     wait_until(lambda: {r["state"] for r in m.status()["tunnels"]} == {"expired"},
                what="the timer to expire both")
     m.shutdown()
-    assert not timers[0].is_alive()
+    # shutdown() joins the timer for at most 2 s, so on a machine so loaded that
+    # a tick takes longer the thread is still on its way out when it returns:
+    # the contract is "it stops", not "it has stopped by the next line".
+    wait_until(lambda: not timers[0].is_alive(), what="the timer thread to exit")
 
 
 def test_the_test_suite_cannot_start_a_real_cloudflared_or_a_timer():

@@ -1,0 +1,14 @@
+# Test-only tools. The hub itself never imports any of these, so they are NOT in
+# requirements.txt (run.bat / run.sh install that file and nothing else).
+#
+#     python -m pip install -r requirements-dev.txt
+#
+# Pinned to the versions the suite was last verified with (same rule as
+# requirements.txt: bump deliberately, run the whole suite, update together).
+-r requirements.txt
+pytest==9.1.1
+
+# Runs the suite in parallel: `python -m pytest tests/ -q -n auto` (see "Tests"
+# in AGENTS.md for the exact command). Official PyPI package of the pytest-dev
+# organisation; it pulls in execnet.
+pytest-xdist==3.8.0

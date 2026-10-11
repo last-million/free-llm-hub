@@ -416,6 +416,17 @@ the most out of free tiers on your own machine.
 python -m pytest -q
 ```
 
+The full suite takes a while serially (15 to 17 min here). In about a third of
+the time, with the same result, install `pytest-xdist`
+(`python -m pip install -r requirements-dev.txt`) and run:
+
+```bash
+python -m pytest tests/ -q -p no:cacheprovider -n auto --basetemp=C:/t/xd
+```
+
+(`--basetemp` is a short scratch folder, which Windows needs; see `AGENTS.md`,
+"Tests", for when to run serially instead.)
+
 **7814 tests, 367 files.** They are written as evidence: most carry a docstring
 recording the measurement or the live failure that produced them.
 
