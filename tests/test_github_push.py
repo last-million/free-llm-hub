@@ -181,7 +181,7 @@ def _bare_count(bare):
 
 
 def _spy_run_git(calls):
-    def run_git(args, cwd=None, env=None):
+    def run_git(args, cwd=None, env=None, **kw):
         env = dict(env or {})
         rec = {"args": list(args), "cwd": cwd, "env": env}
         ap = env.get("GIT_ASKPASS")
@@ -196,7 +196,7 @@ def _spy_run_git(calls):
             rec["hooks_dir"] = hooks[-1]
             rec["hooks_empty"] = os.path.isdir(hooks[-1]) and not os.listdir(hooks[-1])
         calls.append(rec)
-        return ghpush._real_git(args, cwd=cwd, env=env)
+        return ghpush._real_git(args, cwd=cwd, env=env, **kw)
     return run_git
 
 
@@ -495,13 +495,49 @@ def test_secret_content_blocks_push(tmp_path):
     assert any(f["kind"] == "content" for f in e.value.extra["findings"])
 
 
-def test_env_example_is_not_a_secret(tmp_path):
-    (tmp_path / ".env.example").write_text("", encoding="utf-8")
-    (tmp_path / ".env.local").write_text("", encoding="utf-8")
-    got = {f["path"]: f["kind"] for f in
-           ghpush.scan_secrets(str(tmp_path), [".env.example", ".env.local"])}
-    assert ".env.example" not in got
-    assert got.get(".env.local") == "file"
+def test_env_example_is_not_a_secret():
+    assert not ghpush.is_secret_name(".env.example")
+    assert ghpush.is_secret_name(".env.local")
+    assert ghpush.scan_blob(".env.example", b"KEY=\n") == []
+    assert [f["kind"] for f in ghpush.scan_blob("a/.env.local", b"")] == ["file"]
+
+
+@pytest.mark.parametrize("name", [
+    "id_ed25519", "id_ed25519.pub", "id_ecdsa", "id_dsa", "id_rsa", "cert.pfx",
+    "release.jks", "app.keystore", ".npmrc", ".pypirc", ".netrc", ".git-credentials",
+    "prod.tfstate", "prod.tfstate.backup", "server.pem", "tls.key", "store.p12",
+    "credentials.json", ".env"])
+def test_each_secret_file_name_is_found(name):
+    assert ghpush.is_secret_name(name), name
+    assert any(f["kind"] == "file" for f in ghpush.scan_blob("sub/" + name, b"x"))
+
+
+@pytest.mark.parametrize("name", ["README.md", "keyboard.js", "npmrc.txt", "tfstate.md",
+                                  "env.py", ".env.example"])
+def test_ordinary_file_names_are_not_secrets(name):
+    assert not ghpush.is_secret_name(name), name
+
+
+@pytest.mark.parametrize("data", [
+    b"STRIPE=sk_live_" + b"a1B2c3D4e5F6g7H8i9J0k1L2",
+    b"r = 'rk_live_" + b"Z9y8X7w6V5u4T3s2R1q0'",
+    b"token: glpat-" + b"abcdefghij0123456789",
+    b"HF=hf_" + b"A" * 34,
+    b"key xai-" + b"q" * 48,
+    b'{"type": "service_account", "private_key": "-----BEGIN PRIVATE KEY-----\\nMII"}',
+    b"-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n",
+    b"ghp_" + b"c" * 36,
+    b"\x00\xff\x10binary AKIA" + b"ABCDEFGHIJKLMNOP" + b"\x00\xfe",
+])
+def test_each_secret_content_pattern_is_found(data):
+    found = ghpush.scan_blob("f.bin", data)
+    assert any(f["kind"] == "content" for f in found), data[:40]
+
+
+@pytest.mark.parametrize("data", [b"sk_test_abcdefghijklmnopqrstuv", b"hf_short",
+                                  b"no secrets here\n", b"\x00\x01\x02"])
+def test_ordinary_content_is_not_flagged(data):
+    assert ghpush.scan_blob("f.txt", data) == []
 
 
 @requires_git
@@ -558,6 +594,132 @@ def test_gitignore_write_replaces_the_file_atomically(tmp_path):
     body = (proj / ".gitignore").read_text(encoding="utf-8")
     assert body.startswith("keep-me\n") and "x.log" in body
     assert not [p for p in os.listdir(str(proj)) if p.endswith(".tmp")]
+
+
+# --------------------------------------------------------------------------- #
+# The scan reads EXACTLY the staged blobs and fails CLOSED (2026-10-11).        #
+# --------------------------------------------------------------------------- #
+def _staged_in_mirror(gh, proj):
+    """What the mirror's index holds beyond main (empty = nothing staged)."""
+    m = gh.mirror_path(str(proj))
+    return _raw_git(str(proj), "--git-dir=" + m, "--work-tree=" + str(proj),
+                    "diff", "--cached", "--name-only").stdout.strip()
+
+
+def _wrapped(inner, before=None, after=None):
+    """A run_git around the spy: `before(args)` runs first, `after(args, result)`
+    may rewrite the result."""
+    def run_git(args, cwd=None, env=None, **kw):
+        if before:
+            before(args)
+        res = inner(args, cwd=cwd, env=env, **kw)
+        return after(args, res) if after else res
+    return run_git
+
+
+@requires_git
+def test_a_file_over_the_cap_blocks_until_ignored(tmp_path):
+    gh, _calls, bare = _gh(tmp_path, scan_cap=1000)
+    proj = _mk_project(tmp_path)
+    gh.create_repo(str(proj), "myrepo")
+    n = _bare_count(bare)
+    (proj / "big.bin").write_bytes(b"x" * 2000)
+    with pytest.raises(ghpush.GhError) as e:
+        gh.push(str(proj))
+    assert e.value.code == "secrets_found"
+    assert [f["kind"] for f in e.value.extra["findings"] if f["path"] == "big.bin"] == ["too_large"]
+    assert _bare_count(bare) == n and _staged_in_mirror(gh, proj) == ""
+    gh.add_gitignore(str(proj), add=["big.bin"])          # the "add these" flow
+    gh.push(str(proj))
+    assert _bare_show(bare, "big.bin").returncode != 0
+
+
+@requires_git
+def test_an_unreadable_blob_blocks(tmp_path):
+    proj = _mk_project(tmp_path)
+    (proj / "odd.txt").write_bytes(b"odd\n")      # bytes: no CRLF for autocrlf to rewrite
+    target = _raw_git(str(proj), "hash-object", "--no-filters", "odd.txt").stdout.strip().encode()
+
+    def hide(args, res):
+        rc, out, err = res
+        if "cat-file" in args and "--batch-check" in args:
+            out = out.replace(target + b" blob", target + b" missing")
+        return rc, out, err
+    calls = []
+    gh, _c, bare = _gh(tmp_path, calls=calls)
+    gh.run_git = _wrapped(_spy_run_git(calls), after=hide)
+    with pytest.raises(ghpush.GhError) as e:
+        gh.create_repo(str(proj), "myrepo")
+    assert e.value.code == "secrets_found"
+    assert {"path": "odd.txt", "kind": "unchecked"} in [
+        {"path": f["path"], "kind": f["kind"]} for f in e.value.extra["findings"]]
+    assert not [c for c in gh.http.calls if c["method"] == "POST"]
+    assert _staged_in_mirror(gh, proj) == ""
+
+
+@requires_git
+def test_a_scan_error_raises_and_never_passes(tmp_path):
+    gh, proj, bare, calls, _http = _connected(tmp_path)
+    n = _bare_count(bare)
+
+    def broken(args, res):
+        if "cat-file" in args and "--batch" in args:
+            return 1, b"", "fatal: simulated failure"
+        return res
+    gh.run_git = _wrapped(_spy_run_git(calls), after=broken)
+    (proj / "new.txt").write_text("n\n", encoding="utf-8")
+    with pytest.raises(ghpush.GhError) as e:
+        gh.push(str(proj))
+    assert e.value.code == "scan_failed"
+    assert _bare_count(bare) == n
+    assert _staged_in_mirror(gh, proj) == ""
+
+
+@requires_git
+def test_a_secret_past_512_kb_is_found(tmp_path):
+    gh, proj, bare, _calls, _http = _connected(tmp_path)
+    (proj / "bundle.js").write_bytes(b"a" * (600 * 1024) + b"\nconst t='ghp_" + b"d" * 36 + b"';\n")
+    with pytest.raises(ghpush.GhError) as e:
+        gh.push(str(proj))
+    assert e.value.code == "secrets_found"
+    assert any(f["path"] == "bundle.js" and f["kind"] == "content"
+               for f in e.value.extra["findings"])
+    assert _bare_show(bare, "bundle.js").returncode != 0
+
+
+@requires_git
+def test_a_file_rewritten_just_before_add_is_caught(tmp_path):
+    """The old scan read the work tree, then `add -A` ran: a secret written in
+    between was committed unscanned. The scan now reads the STAGED blob."""
+    gh, proj, bare, calls, _http = _connected(tmp_path)
+    n = _bare_count(bare)
+    (proj / "late.txt").write_text("harmless\n", encoding="utf-8")
+    fired = []
+
+    def plant(args):
+        if "add" in args and "-A" in args and not fired:
+            fired.append(1)
+            (proj / "late.txt").write_text("k = 'ghp_" + "e" * 36 + "'\n", encoding="utf-8")
+    gh.run_git = _wrapped(_spy_run_git(calls), before=plant)
+    with pytest.raises(ghpush.GhError) as e:
+        gh.push(str(proj))
+    assert fired
+    assert e.value.code == "secrets_found"
+    assert any(f["path"] == "late.txt" and f["kind"] == "content"
+               for f in e.value.extra["findings"])
+    assert _bare_count(bare) == n and _bare_show(bare, "late.txt").returncode != 0
+    assert _staged_in_mirror(gh, proj) == "", "the index is reset after a block"
+
+
+@requires_git
+def test_preview_matches_the_push_scan_and_leaves_nothing_staged(tmp_path):
+    gh, proj, _bare, _calls, _http = _connected(tmp_path)
+    (proj / "deploy.pfx").write_bytes(b"\x30\x82")
+    (proj / "ok.txt").write_text("ok\n", encoding="utf-8")
+    pv = gh.preview(str(proj))
+    assert set(pv["files"]) == {"deploy.pfx", "ok.txt"}
+    assert [f["path"] for f in pv["findings"]] == ["deploy.pfx"]
+    assert _staged_in_mirror(gh, proj) == ""
 
 
 # --------------------------------------------------------------------------- #

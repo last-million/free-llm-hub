@@ -30,6 +30,11 @@ reads either:
     config and the mirror has none. A project that already has its own history
     is imported ONCE (``fetch <project path> HEAD:refs/heads/main``, no token);
     the project's own ``.git`` is never written by this feature.
+  * The secret scan reads EXACTLY what a commit records: ``add -A`` into the
+    mirror index first (no token), then every staged blob is read from the
+    mirror (``cat-file --batch``) and scanned whole. It fails CLOSED: an
+    unreadable blob or one over ``scan_cap`` (20 MB) is a blocking finding, a
+    scan error raises; a block resets the index, so nothing is committed.
   * Push / fetch (the only calls with the token) go from the MIRROR to the
     EXPLICIT stored URL ``https://github.com/<login>/<repo>.git`` — never a
     remote name — validated against the connected account's login before every
@@ -61,6 +66,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -94,56 +100,70 @@ _SECRET_FILE_RE = re.compile(
         \.env(\.[^/\\]+)?        # .env, .env.local, .env.production ...
         | .*\.pem
         | .*\.key
-        | id_rsa.*               # id_rsa, id_rsa.pub, id_rsa_old
-        | .*\.p12
+        | id_rsa.* | id_ed25519.* | id_ecdsa.* | id_dsa.*   # SSH keys (+ .pub)
+        | .*\.p12 | .*\.pfx
+        | .*\.jks | .*\.keystore
         | credentials\.json
+        | \.npmrc | \.pypirc | \.netrc | \.git-credentials
+        | .*\.tfstate(\.[^/\\]+)?    # terraform state (+ .backup)
     )$""",
     re.IGNORECASE | re.VERBOSE,
 )
 
-# Secret-shaped CONTENT. Each is a named finding so the UI can say what it is.
+# Secret-shaped CONTENT, matched on the WHOLE staged blob (bytes read as
+# latin-1, so binary files are scanned too). Each is a named finding.
 _SECRET_CONTENT = [
     ("github_token", re.compile(r"\bghp_[A-Za-z0-9]{36,}\b")),
     ("github_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{50,}\b")),
     ("openai_key", re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}\b")),
+    ("stripe_live_key", re.compile(r"\b[sr]k_live_[A-Za-z0-9]{10,}\b")),
+    ("gitlab_token", re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}\b")),
+    ("huggingface_token", re.compile(r"\bhf_[A-Za-z0-9]{30,}\b")),
+    ("xai_key", re.compile(r"\bxai-[A-Za-z0-9]{40,}\b")),
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("openssh_private_key", re.compile(r"-----BEGIN OPENSSH PRIVATE KEY-----")),
     ("private_key_block", re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")),
+    ("service_account_key", re.compile(r'"private_key"\s*:\s*"-----BEGIN')),
     ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
     ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
 ]
 
-_CONTENT_READ_CAP = 512 * 1024        # characters scanned per file
-_CONTENT_SIZE_SKIP = 8 * 1024 * 1024  # never read a file larger than this
+SCAN_CAP = 20 * 1024 * 1024           # a staged blob bigger than this BLOCKS (not checked)
+_BATCH_BYTES = 64 * 1024 * 1024       # blob bytes read per `cat-file --batch` call
 _GITIGNORE_MAX = 256 * 1024           # a .gitignore bigger than this is refused
 
 
-def scan_secrets(root, status_entries):
-    """Findings for the files in ``status_entries`` (relative paths of what would
-    be committed). Each finding: ``{path, kind: "file"|"content", detail}``.
-    Files are read only through deploy_perfect.safe_read_text: a link, a path
-    resolving outside the project or a non-regular file is never read. Never
-    raises."""
-    findings = []
+def is_secret_name(basename):
+    """A file NAME that must never be published (.env.example is allowed)."""
+    b = (basename or "").strip()
+    return b.lower() != ".env.example" and bool(_SECRET_FILE_RE.match(b))
+
+
+def _finding(path, kind, detail):
+    return {"path": path, "kind": kind, "detail": detail}
+
+
+def scan_blob(path, data):
+    """Findings for ONE staged blob: its name, then its whole content (bytes,
+    read as latin-1 so every byte maps to one character and binary files are
+    scanned too; a symlink blob holds the link path and is scanned the same).
+    Pure; never raises."""
+    out = []
+    if is_secret_name(path.rsplit("/", 1)[-1]):
+        out.append(_finding(path, "file",
+                            "This looks like a secret file and should not be committed."))
     try:
-        root_real = os.path.realpath(root)
+        text = bytes(data or b"").decode("latin-1")
     except Exception:                                            # noqa: BLE001
-        return findings
-    for rel in status_entries:
-        base = os.path.basename(rel)
-        if base.lower() != ".env.example" and _SECRET_FILE_RE.match(base):
-            findings.append({"path": rel, "kind": "file",
-                             "detail": "This looks like a secret file and should not be committed."})
-        text, _why = deploy_perfect.safe_read_text(
-            os.path.join(root, rel), root_real, _CONTENT_SIZE_SKIP)
-        if not text:
-            continue
-        text = text[:_CONTENT_READ_CAP]
-        for name, rx in _SECRET_CONTENT:
-            if rx.search(text):
-                findings.append({"path": rel, "kind": "content",
-                                 "detail": "A %s appears in this file." % name.replace("_", " ")})
-                break
-    return findings
+        out.append(_finding(path, "unchecked",
+                            "This file could not be checked; add it to .gitignore."))
+        return out
+    for name, rx in _SECRET_CONTENT:
+        if rx.search(text):
+            out.append(_finding(path, "content",
+                                "A %s appears in this file." % name.replace("_", " ")))
+            break
+    return out
 
 
 # The default .gitignore. Build output (dist/, build/) is DELIBERATELY NOT
@@ -346,16 +366,20 @@ def _urllib_http(method, url, headers, body):
         raise GhError("network", "Could not reach GitHub (%s)." % type(exc).__name__)
 
 
-def _real_git(args, cwd=None, env=None, git_path="git"):
+def _real_git(args, cwd=None, env=None, git_path="git", stdin=None, binary=False):
     """Run git. ``env`` is the COMPLETE environment (the caller sanitized it);
-    nothing is merged in from os.environ here."""
+    nothing is merged in from os.environ here. ``stdin`` (bytes) is fed in;
+    ``binary`` returns stdout as bytes (blob contents). Text is UTF-8 with
+    replacement, so a path or message in another encoding never crashes."""
     try:
         p = subprocess.run(
             [git_path] + list(args), cwd=cwd,
             env=dict(env) if env is not None else None,
-            capture_output=True, text=True, timeout=180,
+            input=stdin, capture_output=True, timeout=300,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return p.returncode, (p.stdout or ""), (p.stderr or "")
+        out = p.stdout or b""
+        err = (p.stderr or b"").decode("utf-8", "replace")
+        return p.returncode, (out if binary else out.decode("utf-8", "replace")), err
     except FileNotFoundError:
         raise GhError("no_git", "git is not installed or not on PATH.")
     except subprocess.TimeoutExpired:
@@ -428,14 +452,18 @@ class GitHub:
     def __init__(self, http=None, run_git=None, clock=None, store=None,
                  transport_url=None, git_path="git",
                  is_hub_repo=None, too_broad=None, is_known_project=None,
-                 allowed_protocols=("https",), mirror_root=None):
+                 allowed_protocols=("https",), mirror_root=None, scan_cap=SCAN_CAP):
         # Transports a push/fetch may use (GIT_ALLOW_PROTOCOL). https only in
         # the hub; a test adds "file" for its local bare remote.
         self.allowed_protocols = tuple(allowed_protocols)
+        self.scan_cap = int(scan_cap)
+        self._locks = {}
+        self._locks_guard = threading.Lock()
         self.http = http or _urllib_http
         self.git_path = git_path
-        self.run_git = run_git or (lambda args, cwd=None, env=None:
-                                   _real_git(args, cwd=cwd, env=env, git_path=self.git_path))
+        self.run_git = run_git or (lambda args, cwd=None, env=None, **kw:
+                                   _real_git(args, cwd=cwd, env=env,
+                                             git_path=self.git_path, **kw))
         self.clock = clock or time.time
         self.store = store if store is not None else ConfigStore()
         # TEST SEAM: maps the validated stored https URL to what git is given.
@@ -590,7 +618,7 @@ class GitHub:
         return env
 
     def _git(self, args, git_dir=None, work_tree=None, auth=False,
-             identity=False, protocols=None):
+             identity=False, protocols=None, stdin=None, binary=False):
         """Run one hub git call: sanitized env, an EMPTY private hooks dir, the
         safety ``-c`` set, explicit --git-dir / --work-tree. ``auth`` adds the
         askpass token path and is only ever used with the mirror as GIT_DIR.
@@ -622,7 +650,12 @@ class GitHub:
                 prefix.append("--work-tree=" + work_tree)
             env = self._env(protocols or self.allowed_protocols, token, askpass)
             cwd = work_tree or git_dir or self.mirror_root()
-            return self.run_git(prefix + list(args), cwd=cwd, env=env)
+            extra = {}
+            if stdin is not None:
+                extra["stdin"] = stdin
+            if binary:
+                extra["binary"] = True
+            return self.run_git(prefix + list(args), cwd=cwd, env=env, **extra)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -721,23 +754,168 @@ class GitHub:
             i += 1
         return paths
 
-    def _raise_if_secrets(self, folder, m):
-        findings = scan_secrets(folder, self._would_commit(folder, m))
-        if findings:
-            raise GhError("secrets_found",
-                          "Found something that should not be published. "
-                          "Add these to .gitignore, or remove them, then try again.",
-                          extra={"findings": findings,
-                                 "has_gitignore": os.path.isfile(
-                                     os.path.join(folder, ".gitignore"))})
+    # ---- the secret scan: EXACTLY the staged blobs ------------------------
+    #
+    # The scan reads what `git add -A` put into the mirror's index -- the very
+    # blobs a commit would record -- not the work tree, so a file rewritten
+    # after the scan cannot slip through (the old work-tree scan had that gap).
+    # It fails CLOSED: a blob that cannot be read, or is bigger than scan_cap,
+    # is itself a blocking finding, and any scan error raises. The index is put
+    # back to HEAD whenever it is not about to be committed, so between
+    # operations the mirror's index always equals its main.
 
-    def _snapshot(self, folder, m):
-        """Secret-scan, then ``add -A`` + commit into the MIRROR (no token in
-        the environment). Commits only when something changed."""
-        self._raise_if_secrets(folder, m)
+    def _mirror_lock(self, m):
+        with self._locks_guard:
+            lk = self._locks.get(m)
+            if lk is None:
+                lk = self._locks[m] = threading.RLock()
+            return lk
+
+    def _reset_index(self, folder, m):
+        """Put the mirror's index back to main (or empty when there is none).
+        Index only: the work tree is never touched."""
+        args = ["read-tree", _MAIN] if self._has_main(m) else ["read-tree", "--empty"]
+        rc, _o, err = self._git(args, git_dir=m, work_tree=folder)
+        if rc != 0:
+            raise GhError("git_error", "Could not reset the hub's index. %s" % _tail(err))
+
+    def _staged_entries(self, folder, m):
+        """``[(path, mode, sha)]`` of every staged addition / modification /
+        type change (deletions carry no content). Raises on any git error."""
+        rc, out, err = self._git(
+            ["diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames",
+             "--no-ext-diff", "--no-textconv", "--diff-filter=ACMRT"],
+            git_dir=m, work_tree=folder)
+        if rc != 0:
+            raise GhError("scan_failed", "Could not list the files to check. %s" % _tail(err))
+        toks = out.split("\x00")
+        entries = []
+        i = 0
+        while i < len(toks):
+            meta = toks[i]
+            if not meta.startswith(":"):
+                i += 1
+                continue
+            if i + 1 >= len(toks):
+                raise GhError("scan_failed", "Could not read the list of files to check.")
+            parts = meta[1:].split()
+            if len(parts) < 5:
+                raise GhError("scan_failed", "Could not read the list of files to check.")
+            entries.append((toks[i + 1], parts[1], parts[3]))
+            i += 2
+        return entries
+
+    def _cat(self, m, shas, mode):
+        """``cat-file --batch-check`` (mode "check") or ``--batch`` (mode
+        "content") over object ids fed on stdin (ids only: no path ever reaches
+        the batch input). Returns {sha: (type, size)} or {sha: bytes|None}."""
+        stdin = "".join(s + "\n" for s in shas).encode("ascii")
+        flag = "--batch-check" if mode == "check" else "--batch"
+        rc, out, err = self._git(["cat-file", flag], git_dir=m, stdin=stdin, binary=True)
+        if rc != 0:
+            raise GhError("scan_failed", "Could not read the files to check. %s" % _tail(err))
+        result, pos = {}, 0
+        for sha in shas:
+            nl = out.find(b"\n", pos)
+            if nl < 0:
+                raise GhError("scan_failed", "Could not read the files to check.")
+            head = out[pos:nl].split()
+            pos = nl + 1
+            if len(head) < 3 or head[1] in (b"missing", b"ambiguous"):
+                result[sha] = None
+                continue
+            size = int(head[2])
+            if mode == "check":
+                result[sha] = (head[1].decode("ascii", "replace"), size)
+            else:
+                if pos + size > len(out):
+                    raise GhError("scan_failed", "A file to check was cut short.")
+                result[sha] = out[pos:pos + size]
+                pos += size + 1                    # the blob, then a newline
+        return result
+
+    def _scan_staged(self, folder, m):
+        """Stage everything into the mirror index (no token in the environment)
+        and scan the staged blobs. Returns ``(paths, findings)`` with the index
+        STAGED; on any error the index is reset and the error raised."""
         rc, _o, err = self._git(["add", "-A"], git_dir=m, work_tree=folder)
         if rc != 0:
+            self._reset_index(folder, m)
             raise GhError("git_error", "Could not stage the files. %s" % _tail(err))
+        try:
+            entries = self._staged_entries(folder, m)
+            findings, readable = [], []
+            blobs = [e for e in entries if e[1] != "160000"]   # a gitlink is a pointer, no content
+            info = self._cat(m, sorted({e[2] for e in blobs}), "check") if blobs else {}
+            for path, _mode, sha in blobs:
+                t = info.get(sha)
+                if not t or t[0] != "blob":
+                    findings.append(_finding(path, "unchecked",
+                                             "This file could not be checked; add it to .gitignore."))
+                    if is_secret_name(path.rsplit("/", 1)[-1]):
+                        findings.append(_finding(path, "file", "This looks like a secret "
+                                                 "file and should not be committed."))
+                elif t[1] > self.scan_cap:
+                    findings.append(_finding(path, "too_large",
+                                             "Too large to check (over %d MB); add it to "
+                                             ".gitignore." % (self.scan_cap // (1024 * 1024) or 1)))
+                    if is_secret_name(path.rsplit("/", 1)[-1]):
+                        findings.append(_finding(path, "file", "This looks like a secret "
+                                                 "file and should not be committed."))
+                else:
+                    readable.append((path, sha, t[1]))
+            batch, size = [], 0
+            for item in readable + [None]:
+                if item is not None and (not batch or size + item[2] <= _BATCH_BYTES):
+                    batch.append(item)
+                    size += item[2]
+                    continue
+                if batch:
+                    data = self._cat(m, sorted({b[1] for b in batch}), "content")
+                    for path, sha, _n in batch:
+                        blob = data.get(sha)
+                        if blob is None:
+                            findings.append(_finding(path, "unchecked", "This file could not "
+                                                     "be checked; add it to .gitignore."))
+                        else:
+                            findings.extend(scan_blob(path, blob))
+                if item is not None:
+                    batch, size = [item], item[2]
+                else:
+                    batch = []
+            return [e[0] for e in entries], findings
+        except GhError:
+            self._reset_index(folder, m)
+            raise
+        except Exception as exc:                                 # noqa: BLE001
+            self._reset_index(folder, m)
+            raise GhError("scan_failed", "The secret check failed (%s); nothing was "
+                                         "pushed." % type(exc).__name__)
+
+    def _secrets_error(self, folder, findings):
+        return GhError("secrets_found",
+                       "Found something that should not be published. "
+                       "Add these to .gitignore, or remove them, then try again.",
+                       extra={"findings": findings,
+                              "has_gitignore": os.path.isfile(os.path.join(folder, ".gitignore"))})
+
+    def _check_only(self, folder, m):
+        """Scan what a snapshot WOULD commit, then put the index back. Returns
+        ``(paths, findings)``."""
+        try:
+            return self._scan_staged(folder, m)
+        finally:
+            self._reset_index(folder, m)
+
+    def _snapshot(self, folder, m):
+        """``add -A`` into the MIRROR, scan exactly the staged blobs, then
+        commit THAT index (no token in the environment). A finding resets the
+        index and raises; nothing is committed. Commits only when something
+        changed."""
+        _paths, findings = self._scan_staged(folder, m)
+        if findings:
+            self._reset_index(folder, m)
+            raise self._secrets_error(folder, findings)
         has_main = self._has_main(m)
         drc, _o2, _e2 = self._git(["diff", "--cached", "--quiet"], git_dir=m, work_tree=folder)
         if drc == 0:                              # nothing staged
@@ -747,6 +925,7 @@ class GitHub:
         crc, _oc, cerr = self._git(["commit", "--quiet", "-m", _COMMIT_MESSAGE],
                                    git_dir=m, work_tree=folder, identity=True)
         if crc != 0:
+            self._reset_index(folder, m)
             raise GhError("git_error", "Could not commit. %s" % _tail(cerr))
         return True
 
@@ -777,16 +956,18 @@ class GitHub:
     # ---- public operations ------------------------------------------------
     def preview(self, project_dir):
         """Files the next push would commit (capped list + total) and the secret
-        findings that would block it. Only for a linked project."""
+        findings that would block it -- the same staged-blob scan a push runs,
+        then the index is put back. Only for a linked project."""
         folder = self._guard_folder(project_dir)
         self._check_git()
         self._linked_url(folder)
         m = self._ensure_mirror(folder)
-        paths = self._would_commit(folder, m)
+        with self._mirror_lock(m):
+            paths, findings = self._check_only(folder, m)
         return {
             "files": paths[:200],
             "total_files": len(paths),
-            "findings": scan_secrets(folder, paths),
+            "findings": findings,
             "has_gitignore": os.path.isfile(os.path.join(folder, ".gitignore")),
         }
 
@@ -855,13 +1036,20 @@ class GitHub:
         repo = sanitize_repo_name(name)
         if not repo:
             raise GhError("bad_name", "That repository name is not usable on GitHub.")
-        if (self.store.get_project(self._key(folder)) or {}).get("url"):
-            raise GhError("already_linked", "This project is already linked to a GitHub repository.")
         login = (self.store.get_account() or {}).get("login")
         if not login or not _LOGIN_RE.match(str(login)):
             raise GhError("no_token", "Connect your GitHub account first.")
+        with self._mirror_lock(self.mirror_path(folder)):
+            return self._create_locked(project_dir, folder, token, login, repo, private)
+
+    def _create_locked(self, project_dir, folder, token, login, repo, private):
+        if (self.store.get_project(self._key(folder)) or {}).get("url"):
+            raise GhError("already_linked", "This project is already linked to a GitHub repository.")
         m = self._ensure_mirror(folder)
-        self._raise_if_secrets(folder, m)
+        # The staged-blob scan BEFORE anything is created on GitHub.
+        _paths, findings = self._check_only(folder, m)
+        if findings:
+            raise self._secrets_error(folder, findings)
         status, data = self._api("POST", "/user/repos", token,
                                  {"name": repo, "private": private, "auto_init": False})
         if status == 201 and isinstance(data, dict) and data.get("full_name"):
@@ -901,9 +1089,10 @@ class GitHub:
         self._check_git()
         self._require_token()
         url = self._linked_url(folder)
-        m = self._ensure_mirror(folder)
-        self._snapshot(folder, m)
-        self._push_mirror(folder, m, url)
+        with self._mirror_lock(self.mirror_path(folder)):
+            m = self._ensure_mirror(folder)
+            self._snapshot(folder, m)
+            self._push_mirror(folder, m, url)
         return self.status(project_dir)
 
     def _push_mirror(self, folder, m, url):
@@ -932,6 +1121,10 @@ class GitHub:
         self._check_git()
         self._require_token()
         url = self._linked_url(folder)
+        with self._mirror_lock(self.mirror_path(folder)):
+            return self._sync_locked(project_dir, folder, url)
+
+    def _sync_locked(self, project_dir, folder, url):
         m = self._ensure_mirror(folder)
         frc, _o, ferr = self._git(
             ["fetch", "--quiet", "--no-tags", "--no-recurse-submodules",

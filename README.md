@@ -359,8 +359,10 @@ and the git that uses your token never reads the project's git settings or your
 `~/.gitconfig`, so an agent cannot redirect the push or capture the token
 through them. It always pushes to the exact repository it created for your
 account. Before every push — and before the repo is created — a secret scan
-blocks `.env`, `*.pem`/`*.key`, `id_rsa*`, `credentials.json` and
-secret-shaped strings, and offers to add them to `.gitignore`. Sync only
+of exactly what would be committed blocks `.env` files, private keys and
+certificates, credential files (`.npmrc`, `.netrc`, `credentials.json` …) and
+secret-shaped strings; a file too large (over 20 MB) or impossible to check
+blocks too. It offers to add them to `.gitignore`. Sync only
 fast-forwards a project with no unpushed changes; otherwise it says so and
 touches nothing. Build output (`dist/`, `build/`) is not in the default
 `.gitignore`; add it yourself if you don't want it committed. Switch it off

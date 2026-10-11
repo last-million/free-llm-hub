@@ -4560,15 +4560,34 @@ a new `# GITHUB:` section beside `# PUBLISH:`.
   default; a public repo additionally needs `public_ok`. The secret scan runs
   BEFORE the POST (a finding creates nothing on GitHub); then the URL is stored
   and the first snapshot pushed. The project gets no `.git` from this feature.
-- **Secret scan before every push** (blocks, code `secrets_found`, offers a
-  .gitignore): file names `.env`/`.env.*` (except `.env.example`), `*.pem`,
-  `*.key`, `id_rsa*`, `*.p12`, `credentials.json`; and content shapes `ghp_`,
-  `github_pat_`, `sk-…`, `AKIA…`, `-----BEGIN … PRIVATE KEY-----`, `xox[baprs]-`,
-  `AIza…`. The scan reads only what WOULD be committed (the mirror's index vs
-  the work tree: `git --git-dir=<mirror> --work-tree=<project> status --porcelain
-  -z --untracked-files=all`, so .gitignore is respected; an unreadable status is
-  an error, never "no files"), and reads files only through
-  `deploy_perfect.safe_read_text` (no links, nothing outside the project). The default
+- **Secret scan before every push and before create's POST -- of EXACTLY the
+  staged blobs, failing CLOSED (2026-10-11, replaces the work-tree scan).**
+  `git --git-dir=<mirror> --work-tree=<project> add -A` first (no token in the
+  env), then `diff --cached --raw -z --no-abbrev --no-renames
+  --diff-filter=ACMRT` lists every staged addition/modification and each staged
+  BLOB is read from the mirror (`cat-file --batch-check` for sizes, then
+  `cat-file --batch` fed object ids on stdin, <= 64 MB of blobs per call) and
+  scanned WHOLE (bytes read as latin-1, so binary files are scanned too; a
+  symlink blob holds its link path and is scanned the same; a gitlink, mode
+  160000, is a pointer with no content and is skipped). What is scanned is what
+  the commit records: the commit uses that same index, so a file rewritten
+  between an old scan point and `add` is caught (the work-tree scan had that
+  gap). Fail closed: a blob that cannot be read, or is bigger than `scan_cap`
+  (`SCAN_CAP`, 20 MB), is itself a blocking finding (kinds `unchecked` /
+  `too_large`, "add it to .gitignore"); any scan error raises `scan_failed`,
+  never "no findings". On a finding or an error the mirror's index is reset to
+  main (`read-tree refs/heads/main`, `read-tree --empty` when there is none) and
+  nothing is committed; between operations the index always equals main.
+  Preview runs the same scan and resets the index. Operations on one mirror hold
+  a per-mirror lock. Blocks with code `secrets_found` and offers a .gitignore.
+  File names: `.env`/`.env.*` (except `.env.example`), `*.pem`, `*.key`,
+  `id_rsa*`, `id_ed25519*`, `id_ecdsa*`, `id_dsa*`, `*.p12`, `*.pfx`, `*.jks`,
+  `*.keystore`, `credentials.json`, `.npmrc`, `.pypirc`, `.netrc`,
+  `.git-credentials`, `*.tfstate` (+ `.backup`). Content: `ghp_`, `github_pat_`,
+  `sk-…`, `sk_live_` / `rk_live_` (Stripe), `glpat-`, `hf_` (30+), `xai-` (40+),
+  `AKIA…`, `-----BEGIN OPENSSH PRIVATE KEY-----`, `-----BEGIN … PRIVATE KEY-----`,
+  `"private_key": "-----BEGIN` (service-account JSON), `xox[baprs]-`, `AIza…`.
+  Limit: a secret in a UTF-16 file or split across lines is not matched. The default
   `.gitignore` is `node_modules/`, `.venv/`, `venv/`, `__pycache__/`, `*.pyc`,
   `.env`, `.env.*`, `!.env.example`, `*.log`, `.DS_Store`. **Build output
   (`dist/`, `build/`) is deliberately NOT in the default** -- a project may
@@ -4581,7 +4600,7 @@ a new `# GITHUB:` section beside `# PUBLISH:`.
   same folder + `os.replace` (replaces the file itself, never a link target).
   It is the only file this feature writes inside a project besides Sync's
   checkout (done by git, which refuses symlinked leading paths).
-- **Push.** Snapshot into the mirror (secret scan first; commit
+- **Push.** Snapshot into the mirror (stage, scan the staged blobs, commit that index;
   `"Update from Calvoun Build"` ONLY when something changed -- never an empty
   commit), then `git --git-dir=<mirror> push --no-verify <stored URL>
   refs/heads/main:refs/heads/main` -- NEVER a force push. A non-fast-forward is

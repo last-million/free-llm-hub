@@ -41884,7 +41884,7 @@ _GH_HTTP = {
     "already_linked": 409, "behind_remote": 409, "diverged": 409,
     "local_changes": 409, "secrets_found": 409, "nothing_to_commit": 409,
     "no_git": 409, "git_too_old": 409,
-    "git_error": 500, "github_error": 502, "network": 502,
+    "git_error": 500, "scan_failed": 500, "github_error": 502, "network": 502,
     "push_failed": 502, "fetch_failed": 502,
     "git_timeout": 504,
 }
