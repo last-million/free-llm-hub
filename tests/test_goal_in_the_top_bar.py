@@ -69,15 +69,14 @@ def test_the_script_fills_the_line_and_remembers_open_or_folded_per_browser():
     assert "goalEl.textContent = active ? full : 'No goal yet';" in JS
     assert "fullEl.textContent = full;" in JS                       # ...and in the opened body
     assert "'No open tasks'" in JS and "'1 open task'" in JS and "' open tasks'" in JS
-    assert "var GOAL_OPEN_KEY = 'flh.goalOpen';" in JS
-    assert "try { return localStorage.getItem(GOAL_OPEN_KEY) === '1'; } catch (e){ return false; }" in JS
-    assert "try { localStorage.setItem(GOAL_OPEN_KEY, on ? '1' : '0'); } catch (e){}" in JS
     assert "b.setAttribute('aria-expanded', on ? 'true' : 'false')" in JS
-    # Set goal opens the body on the form; Close goal hands focus to Set goal
-    assert "setGoalOpen(true, true);" in JS and "if (inp) inp.focus();" in JS
+    # Set goal opens the panel on the form; Close goal hands focus to Set goal
+    assert "setGoalOpen(true);" in JS and "if (inp) inp.focus();" in JS
     assert "if (s && !s.hidden) s.focus();" in JS
-    # the open/folded flag is the only thing this keeps in the browser
-    assert len(re.findall(r"localStorage\.", JS)) == 2
+    # 2026-10-19: the body is a floating panel now -- closed at load and on a
+    # project switch, nothing kept in the browser
+    assert "if (panel.hidden) setGoalOpen(false);" in JS
+    assert len(re.findall(r"localStorage\.", JS)) == 0
 
 
 def test_the_css_is_tokens_only_wraps_and_has_phone_targets():
@@ -90,7 +89,8 @@ def test_the_css_is_tokens_only_wraps_and_has_phone_targets():
     for sel in (".agent-tasks-h .btn", ".tk-done", ".agent-tasks-add button", ".agent-tasks-add input"):
         assert sel in phone, sel
     assert "@media (prefers-reduced-motion:reduce){ .agent-tasks-toggle .att-ic{ transition:none; } }" in CSS
-    assert "max-height:240px; overflow:auto" in _between(".agent-tasks-body{", "}", CSS)
+    # 2026-10-19: the body is the floating panel under the goal in the first bar
+    assert "max-height:360px; overflow:auto" in _between(".agent-tasks-body{", "}", CSS)
     for sel in (".agent-goal-full{", ".agent-tasks-list .tk-text{"):
         assert "overflow-wrap:anywhere" in _between(sel, "}", CSS), sel
 
@@ -133,6 +133,10 @@ def test_every_goal_row_text_pair_meets_aa(theme):
         "Goal: label": (T("text"), T("surface")),
         "goal text": (T("text-dim"), T("surface")),
         "toggle / Set goal / Close goal": (T("text"), T("surface")),
+        # 2026-10-19: in the first bar the goal sits on --surface-2
+        "goal in the bar": (T("text-dim"), T("surface-2")),
+        "label in the bar": (T("text"), T("surface-2")),
+        "Set goal in the bar": (T("ok-text"), T("surface-2")),
         "full goal": (T("text"), T("surface")),
         "task chip": (T("text-dim"), T("surface-2")),
         "doing chip": (T("ok-text"), T("surface-2")),

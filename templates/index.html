@@ -2580,6 +2580,22 @@
     /* the category <select> shrank to 29px ("Cl") beside the effort pills */
     body.cx-agent-view #sec-agent .agent-session-bar .agent-mode{ flex:0 0 auto; min-width:130px; }
   }
+  /* ONE height for every control of the session bar (owner, 2026-10-19: "all
+     elements well designed and responsive"): buttons, selects and the
+     quality pills were 20-27px side by side. 30px = 24 rendered on a
+     desktop; the 44px tap target on a phone. */
+  body.cx-agent-view #sec-agent .agent-session-bar .btn,
+  body.cx-agent-view #sec-agent .agent-session-bar .agent-mode{ min-height:30px; }
+  body.cx-agent-view #sec-agent .agent-quality .q-opt span{ display:inline-flex;
+    align-items:center; min-height:24px; }
+  @media (max-width:640px){
+    body.cx-agent-view #sec-agent .agent-session-bar .btn,
+    body.cx-agent-view #sec-agent .agent-session-bar .agent-mode,
+    body.cx-agent-view #sec-agent .agent-autoresume{ min-height:var(--tap, 44px); }
+    body.cx-agent-view #sec-agent .agent-quality .q-opt span{
+      min-height:calc(var(--tap, 44px) - 6px); }
+    body.cx-agent-view #sec-agent .agent-autoresume{ margin-left:0; }
+  }
   /* The permissions disclosure STAYS — it is a deliberate safety notice and its
      own comment says never to gate it. It is made compact here, not hidden:
      smaller type, one line, still fully readable. */
@@ -2730,20 +2746,81 @@
   .agent-tasks{ border:1px solid var(--border); border-radius:var(--radius-sm);
     background:var(--surface); font-size:12.5px; flex:none; min-width:0; padding:3px 4px 3px 12px; }
   .agent-tasks-h{ display:flex; align-items:center; flex-wrap:wrap; gap:4px 8px; min-width:0; }
-  /* In the top bar (see placeGoal): no box of its own, a divider before it,
-     the rest of the bar's line; opened, the list takes the bar's full width. */
-  .agent-collapse-bar, .agent-session-bar{ flex-wrap:wrap; }
-  .agent-collapse-bar > .agent-tasks, .agent-session-bar > .agent-tasks{
-    flex:1 1 220px; min-width:0; border:0; border-left:1px solid var(--border);
-    border-radius:0; background:none; padding:0 0 0 8px; }
-  .agent-collapse-bar > .agent-tasks:has(> .agent-tasks-body:not([hidden])),
-  .agent-session-bar > .agent-tasks:has(> .agent-tasks-body:not([hidden])){
-    flex-basis:100%; order:9; border-left:0; padding:4px 0 0; }
+  /* THE GOAL LIVES IN THE FIRST BAR (owner, 2026-10-19: "the goal bar must be
+     inside the first bar ... when it is collapsed I see the goal too"). One
+     compact part of #agent-collapse-bar, open or folded, so it never moves:
+     beside the permissions notice while the top is open, after the summary
+     while it is folded. The list and the forms open as a panel under it that
+     floats over the page instead of pushing the chat down. Phones: open, the
+     bar takes its own line above the notice; folded, the goal is the bar's
+     second line, inside the same box. */
+  .agent-collapse-bar > .agent-tasks{ position:relative; flex:0 1 auto; min-width:0;
+    max-width:460px; display:flex; align-items:center; padding:0 2px 0 9px;
+    border:1px solid var(--border); border-radius:var(--radius-sm);
+    background:var(--surface-2); font-size:12px; cursor:default; }
+  #agent-section:not(.agent-has-session) .agent-collapse-bar > .agent-tasks{ display:none; }
+  .agent-collapse-bar > .agent-tasks > .agent-tasks-h{ flex:1 1 auto; flex-wrap:nowrap;
+    gap:6px; min-height:32px; }
+  .agent-goal-ic{ flex:none; color:var(--ok-text); }
+  .agent-collapse-bar .agent-tasks-goal{ flex:1 1 auto; min-width:0; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  .agent-collapse-bar .agent-tasks-h .btn{ display:inline-flex; align-items:center; gap:5px;
+    min-height:26px; padding:0 8px; border:0; border-radius:6px; background:none;
+    box-shadow:none; color:var(--text); font-weight:600; white-space:nowrap; }
+  .agent-collapse-bar .agent-tasks-h .btn[hidden]{ display:none; }
+  .agent-collapse-bar .agent-tasks-h .btn:hover{ background:var(--surface-3); }
+  .agent-collapse-bar .agent-tasks-h .btn:focus-visible{ outline:2px solid var(--accent);
+    outline-offset:1px; }
+  .agent-collapse-bar .agent-tasks-h .agent-goal-set{ color:var(--ok-text); }
+  .agent-collapse-bar > .agent-tasks > .agent-tasks-body{ position:absolute; z-index:45;
+    top:calc(100% + 6px); right:-1px; width:440px; max-width:calc(100vw - 48px);
+    margin:0; padding:10px 12px; border:1px solid var(--border); border-radius:var(--radius);
+    background:var(--surface); box-shadow:0 14px 34px -10px var(--scrim); cursor:auto;
+    max-height:360px; overflow:auto; overscroll-behavior:contain; }
+  .agent-collapse-bar > .agent-tasks > .agent-tasks-body[hidden]{ display:none; }
+  /* Panel header: a title and an X that closes the panel only. */
+  .agent-tasks-top{ display:flex; align-items:center; justify-content:space-between;
+    gap:8px; margin:-4px -6px 6px 0; }
+  .agent-tasks-title{ font-size:11px; font-weight:700; letter-spacing:.04em;
+    text-transform:uppercase; color:var(--text-dim); }
+  .agent-tasks-close{ flex:none; display:inline-grid; place-items:center; width:30px;
+    height:30px; padding:0; border:1px solid transparent; border-radius:var(--radius-sm);
+    background:none; color:var(--text-dim); cursor:pointer; touch-action:manipulation; }
+  .agent-tasks-close:hover{ background:var(--surface-2); border-color:var(--border); color:var(--text); }
+  .agent-tasks-close:focus-visible{ outline:2px solid var(--accent); outline-offset:1px; }
+  /* Finishing the goal is a deliberate act: it asks once more. */
+  #agent-goal-close.armed{ border-color:var(--danger-border); color:var(--danger-text); }
+  @media (max-width:640px){
+    .agent-tasks-close{ width:var(--tap, 44px); height:var(--tap, 44px); }
+  }
+  /* Open: [notice | goal + chevron]. A narrower window keeps the notice readable. */
+  @media (max-width:1100px){ .agent-collapse-bar > .agent-tasks{ max-width:300px; } }
+  @media (max-width:860px){ .agent-collapse-bar > .agent-tasks{ max-width:220px; } }
+  /* Folded: [permissions | what runs ... | goal | chevron], ONE thin line. */
+  body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-bar > .agent-tasks{
+    max-width:48%; font-size:11.5px; }
   @media (min-width:641px){
+    body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-bar > .agent-tasks > .agent-tasks-h{
+      min-height:24px; }
+    body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-bar .agent-tasks-h .btn{
+      min-height:22px; }
+  }
+  @media (max-width:640px){
+    /* Open: the bar is the first line, the goal takes what the chevron leaves.
+       One column, so the long goal can never widen a second one off-screen. */
+    body.cx-on.cx-agent-view main.wrap > section#agent-section.cx-active.agent-has-session:not(.agent-top-collapsed){
+      grid-template-columns:minmax(0,1fr); }
+    body.cx-agent-view #agent-section.agent-has-session:not(.agent-top-collapsed) > #agent-collapse-bar{
+      grid-column:1 / -1; order:-1; margin:0 0 8px; }
+    .agent-collapse-bar > .agent-tasks{ flex:1 1 auto; max-width:none; font-size:13px; }
+    /* Folded: line 1 permissions + what runs + chevron, line 2 the goal. */
+    body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-bar{ flex-wrap:wrap; }
+    body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-summary{ flex:1 1 0; }
     body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-bar > .agent-tasks{
-      font-size:11.5px; }
-    body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-bar > .agent-tasks .agent-tasks-h .btn{
-      min-height:24px; padding-top:0; padding-bottom:0; }
+      order:3; flex:1 1 100%; max-width:none; font-size:13px; }
+    .agent-collapse-bar .agent-tasks-h .btn{ min-height:var(--tap, 44px); padding:0 12px; }
+    .agent-collapse-bar > .agent-tasks > .agent-tasks-body{ left:-1px; right:-1px;
+      width:auto; max-width:none; }
   }
   .agent-goal-k{ flex:none; font-weight:700; color:var(--text); }
   .agent-tasks-goal{ flex:1 1 160px; min-width:0; color:var(--text-dim); overflow:hidden;
@@ -3862,9 +3939,14 @@
                toggle that opens the task list and the forms in place. Folded
                by default; open/folded is remembered by this browser only. The
                same goal brief rides into every Multi phase, the Build brief
-               file and the opening turn of a terminal CLI. -->
+               file and the opening turn of a terminal CLI.
+               2026-10-19 (owner: "the goal bar must be inside the first bar"):
+               the script moves it into #agent-collapse-bar at load and it
+               stays there, open or folded (see placeGoal); the body opens as
+               a panel floating under it. -->
           <div class="agent-tasks" id="agent-tasks" hidden>
             <div class="agent-tasks-h">
+              <svg class="agent-goal-ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r=".6"/></svg>
               <span class="agent-goal-k" id="agent-goal-k" hidden>Goal:</span>
               <span class="agent-tasks-goal" id="agent-tasks-goal">No goal yet</span>
               <button type="button" class="btn sm ghost agent-goal-set" id="agent-goal-set"
@@ -3875,7 +3957,16 @@
                 <svg class="att-ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m6 9 6 6 6-6"/></svg>
               </button>
             </div>
-            <div class="agent-tasks-body" id="agent-tasks-body" hidden>
+            <div class="agent-tasks-body" id="agent-tasks-body" role="group" aria-label="Goal and tasks" hidden>
+              <!-- The X only closes this panel; the goal stays (owner,
+                   2026-10-19: "an icon to remove it alone"). -->
+              <div class="agent-tasks-top">
+                <span class="agent-tasks-title">Goal &amp; tasks</span>
+                <button type="button" class="agent-tasks-close" id="agent-tasks-close"
+                        aria-label="Close this panel" title="Close this panel (Esc). The goal stays.">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+              </div>
               <p class="agent-goal-full" id="agent-goal-full" hidden></p>
               <ul class="agent-tasks-list" id="agent-tasks-list"></ul>
               <form class="agent-tasks-add" id="agent-task-form" hidden>
@@ -3889,7 +3980,8 @@
                 <button type="submit">Save goal</button>
               </form>
               <div class="agent-tasks-foot">
-                <button type="button" class="btn sm ghost agent-tasks-x" id="agent-goal-close" hidden>Close goal</button>
+                <button type="button" class="btn sm ghost agent-tasks-x" id="agent-goal-close"
+                        title="Finish this goal: it leaves the bar. To only close this panel, use the X." hidden>Mark goal done</button>
               </div>
             </div>
           </div>
@@ -5359,20 +5451,21 @@
       text.textContent = line || 'Session open';
       summary.title = 'Full permissions. ' + (info || line);
     }
-    /* THE GOAL LIVES IN THE TOP BAR (owner, 2026-10-19: "the goal bar should
-       be included in the first bar ... it takes space too"). One element,
-       moved: into the folded summary bar when the top is collapsed, into the
-       session bar when it is open -- never a row of its own. */
-    function placeGoal(on){
+    /* THE GOAL LIVES IN THE FIRST BAR (owner, 2026-10-19: "the goal bar must
+       be inside the first bar ... when it is collapsed I see the goal too").
+       Moved once into #agent-collapse-bar, just before the chevron, and it
+       stays there open or folded, so it never jumps; the CSS hides it while
+       no session is open (.agent-has-session, set by summarize()). */
+    function placeGoal(){
       var t = document.getElementById('agent-tasks');
-      var host = document.getElementById(on ? 'agent-collapse-bar' : 'agent-session-bar');
+      var host = document.getElementById('agent-collapse-bar');
       if (!t || !host || t.parentNode === host) return;
-      if (on) host.insertBefore(t, btn); else host.appendChild(t);
+      host.insertBefore(t, btn);
     }
     function paint(on){
       collapsed = on;
       summarize();
-      placeGoal(on);
+      placeGoal();
       sec.classList.toggle('agent-top-collapsed', on);
       summary.hidden = !on;
       btn.setAttribute('aria-expanded', on ? 'false' : 'true');
@@ -5428,7 +5521,7 @@
     var warn = document.getElementById('agent-warning');
     if (bar) bar.addEventListener('click', function(e){
       if (isControl(e.target)) return;
-      /* The goal row sits in this bar while folded: reading it never folds. */
+      /* The goal sits in this bar: reading it or its panel never folds. */
       if (e.target && e.target.closest && e.target.closest('#agent-tasks')) return;
       setCollapsed(!collapsed, true);
     });
@@ -13083,14 +13176,10 @@
 
     /* ---------- The task board: the goal behind the work ---------- */
     var curGoalId = null;
-    /* The goal row under the toolbar opens in place. Open or folded is this
-       browser's own choice (localStorage, guarded), never server state;
-       folded until the user opens it. */
-    var GOAL_OPEN_KEY = 'flh.goalOpen';
-    function goalOpenSaved(){
-      try { return localStorage.getItem(GOAL_OPEN_KEY) === '1'; } catch (e){ return false; }
-    }
-    function setGoalOpen(on, remember){
+    /* The goal in the first bar opens a panel floating under it (it never
+       pushes the chat down). Closed at load and on a project switch; Esc or a
+       click anywhere else closes it. Nothing is stored. */
+    function setGoalOpen(on){
       var body = document.getElementById('agent-tasks-body');
       if (!body) return;
       body.hidden = !on;
@@ -13098,13 +13187,12 @@
         var b = document.getElementById(id);
         if (b) b.setAttribute('aria-expanded', on ? 'true' : 'false');
       });
-      if (remember){ try { localStorage.setItem(GOAL_OPEN_KEY, on ? '1' : '0'); } catch (e){} }
     }
     function loadTasks(){
       var panel = document.getElementById('agent-tasks');
       if (!panel) return Promise.resolve();
-      if (!curProjectDir){ panel.hidden = true; return Promise.resolve(); }
-      if (panel.hidden) setGoalOpen(goalOpenSaved(), false);
+      if (!curProjectDir){ panel.hidden = true; setGoalOpen(false); return Promise.resolve(); }
+      if (panel.hidden) setGoalOpen(false);
       panel.hidden = false;
       var dir = curProjectDir;
       var q = 'project_dir=' + encodeURIComponent(dir);
@@ -13193,8 +13281,25 @@
           .then(function(){ if (inp) inp.value = ''; return loadTasks(); })
           .catch(function(){});
       });
+      /* "Mark goal done" FINISHES the goal (it leaves the bar), so it asks
+         once more: the first click turns it into "Click again to finish",
+         a second click within 4 s does it. The X above only closes the panel. */
+      var armTimer = null;
+      function disarm(){
+        clearTimeout(armTimer);
+        if (!closeBtn) return;
+        closeBtn.classList.remove('armed');
+        closeBtn.textContent = 'Mark goal done';
+      }
       if (closeBtn) closeBtn.addEventListener('click', function(){
         if (!curGoalId) return;
+        if (!closeBtn.classList.contains('armed')){
+          closeBtn.classList.add('armed');
+          closeBtn.textContent = 'Click again to finish the goal';
+          armTimer = setTimeout(disarm, 4000);
+          return;
+        }
+        disarm();
         api('/api/goals/' + encodeURIComponent(curGoalId) + '/close',
             { method: 'POST' }).then(loadTasks)
           .then(function(){
@@ -13208,13 +13313,43 @@
       var setBtn = document.getElementById('agent-goal-set');
       if (toggle) toggle.addEventListener('click', function(){
         var body = document.getElementById('agent-tasks-body');
-        setGoalOpen(!!(body && body.hidden), true);
+        setGoalOpen(!!(body && body.hidden));
       });
-      /* "No goal yet - Set goal": opens the body on the goal form. */
+      /* "No goal yet - Set goal": opens the panel on the goal form. */
       if (setBtn) setBtn.addEventListener('click', function(){
-        setGoalOpen(true, true);
+        var body = document.getElementById('agent-tasks-body');
+        if (body && !body.hidden){ setGoalOpen(false); return; }
+        setGoalOpen(true);
         var inp = document.getElementById('agent-goal-input');
         if (inp) inp.focus();
+      });
+      function goalPanelOpen(){
+        var body = document.getElementById('agent-tasks-body');
+        return !!(body && !body.hidden);
+      }
+      /* The X: closes the panel only, the goal stays. */
+      var xBtn = document.getElementById('agent-tasks-close');
+      if (xBtn) xBtn.addEventListener('click', function(){
+        disarm();
+        setGoalOpen(false);
+        var back = (toggle && !toggle.hidden) ? toggle : setBtn;
+        if (back && !back.hidden) back.focus();
+      });
+      /* Esc closes the panel and hands focus back to what opened it (a modal
+         dialog on top keeps its own Esc). */
+      document.addEventListener('keydown', function(e){
+        if (e.key !== 'Escape' || !goalPanelOpen()) return;
+        if (document.querySelector('dialog[open]')) return;
+        setGoalOpen(false);
+        var back = (toggle && !toggle.hidden) ? toggle : setBtn;
+        if (back && !back.hidden) back.focus();
+      });
+      /* A click anywhere outside the goal closes its panel. */
+      document.addEventListener('click', function(e){
+        if (!goalPanelOpen()) return;
+        var box = document.getElementById('agent-tasks');
+        if (box && e.target && box.contains(e.target)) return;
+        setGoalOpen(false);
       });
     })();
     /* One helper of a Multi run: its state (icon AND words, never colour

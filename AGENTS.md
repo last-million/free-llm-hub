@@ -2369,11 +2369,11 @@ from -- the SAME quality in any terminal CLI and in the Build page. Covered by
   (`#agent-tasks-toggle`, `aria-expanded`) that opens `#agent-tasks-body` in
   place -- the open tasks with status chips + Done, the add-task form, the goal
   form (its button says "Save goal") and Close goal. No goal: "No goal yet" +
-  "Set goal" (`#agent-goal-set`), which opens the body on the goal form. Folded
-  by default; open/folded is the browser's own (`localStorage` key
-  `flh.goalOpen`, guarded), never server state. 44 px targets on phones, 24
-  rendered px on a desktop; the row wraps instead of scrolling sideways.
-  Covered by `tests/test_goal_in_the_top_bar.py`.
+  "Set goal" (`#agent-goal-set`), which opens the body on the goal form.
+  SUPERSEDED 2026-10-19 (see "The goal lives in the first bar" at the end of
+  this file): it now sits in the first bar and the body is a floating panel,
+  closed at load, nothing stored in the browser. Covered by
+  `tests/test_goal_in_the_top_bar.py`.
 
 ## Heartbeats and budgets (2026-10-07)
 
@@ -5454,14 +5454,35 @@ update marker. `_cm_note_owner_turn` (called by every CLI launch, approved or
 not) now records the CLI's request as the owner's user turn first -- creating
 the record -- then sets quality, mode and auto_resume. Never raises.
 
-## The goal row lives in the top bar (2026-10-19)
+## The goal lives in the first bar (2026-10-19)
 
-Owner: "the goal bar should be included in the first bar ... it takes space".
-Covered by `tests/test_goal_in_the_session_bar.py`. `placeGoal(on)` (called by
-the collapse logic's `paint`) moves `#agent-tasks` into `#agent-collapse-bar`
-(before the chevron) when the top is folded and into `#agent-session-bar` when
-it is open: no row of its own. In a bar it has no box, a divider before it;
-opened, its body takes the bar's full width (`:has(> .agent-tasks-body:not(
-[hidden]))`). A click on it never folds the top. Desktop buttons are 24 px tall
-in the folded bar; phones keep 44 px. The element's place in the HTML (and
-`tests/test_goal_in_the_top_bar.py`) is unchanged: only the script moves it.
+Owner: "the goal bar should be included in the first bar ... it takes space",
+then "inside the first bar ... when it is collapsed I see the goal too ... UI/UX
+perfect and responsive". Covered by `tests/test_goal_in_the_session_bar.py`
+(+ `test_goal_in_the_top_bar.py`). Checked in a real browser at 1440, 1280 and
+390 px, both states, no sideways scroll.
+
+- `placeGoal()` (from the collapse logic's `paint`) moves `#agent-tasks` ONCE
+  into `#agent-collapse-bar`, before the chevron; it stays there open or
+  folded, so it never jumps. Hidden while no session is open
+  (`#agent-section:not(.agent-has-session)`). Its place in the HTML is unchanged.
+- One compact chip (target icon, "Goal:", text with ellipsis + tooltip, "N open
+  tasks" toggle or "No goal yet" + "Set goal"), `--surface-2`, as tall as the
+  chevron. Open desktop: `[permissions notice | goal | chevron]` (goal max 460 /
+  300 / 220 px by width). Folded desktop: ONE line `[permissions | what runs |
+  goal | chevron]`. Phone open: one grid column, the bar first (`order:-1`),
+  then the notice. Phone folded: one glowing box, line 1 permissions + summary
+  + chevron, line 2 the goal. 44 px targets on phones.
+- `#agent-tasks-body` is a panel floating under the chip (absolute, z-index
+  45, max 360 px, scrolls; full width on phones): it never pushes the chat
+  down. Closed at load and on a project switch; Esc (focus back to the
+  toggle / Set goal; an open `<dialog>` keeps its own Esc) or a click outside
+  closes it. Nothing is stored in the browser (the old `flh.goalOpen` key is
+  gone). A click on the goal or its panel never folds the top.
+- Owner, same day: "when I click Close goal it removes it, we want an icon to
+  remove it alone". The panel has a header with an X (`#agent-tasks-close`)
+  that ONLY closes the panel. The button that finishes the goal (POST
+  `/api/goals/<id>/close`, id `agent-goal-close`) now reads "Mark goal done"
+  and needs a second click within 4 s ("Click again to finish the goal").
+- Session bar: every control one height (30 px = 24 rendered on a desktop,
+  44 px on a phone): buttons, the two selects, the quality pills.
