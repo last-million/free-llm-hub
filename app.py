@@ -25759,6 +25759,20 @@ _DEFAULT_BLOCKED_IDENTITIES = frozenset({
     "lfm-2.5-2.6b",
     "poolside-laguna-s-2.1",
     "step-3.7-flash",
+    # OWNER DECISION 2026-10-19: the owner's newer blocks ship too (NVIDIA
+    # Cosmos-Reason2 8B, Ising Calibration 1.5, Ling 3.1 Flash, Mistral 7B v0.3
+    # and Mistral Large on every host, Muse Glimmer 30B, NeVA 22B, Step 5
+    # Preview, Xing 4.0, Zamba2 7B).
+    "cosmos-reason2-8b",
+    "ising-calibration-1.5-31b",
+    "ling-3.1-flash",
+    "mistral-7b-instruct-v0.3",
+    "mistral-large", "mistral-large-2-instruct",
+    "muse-glimmer-30b",
+    "neva-22b",
+    "step-5-preview",
+    "xing4.0-29b-a4b",
+    "zamba2-7b-instruct",
 })
 # Exact provider/model pairs the owner switched off where the SAME model stays
 # fine on other hosts (identity-level blocking would lose those copies).

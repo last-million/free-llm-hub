@@ -5375,3 +5375,25 @@ counts failed hops per relay server (`_ChainClock._relay_strikes`, filed in
 rest of the walk after `_RELAY_WALK_STRIKES` (2), so one model-specific failure
 never loses the whole backend. Fail-open: when only that server is left it is
 still walked. Flag `relay_walk_skip` (default on); off = the chain as built.
+
+## Tests run inside WSL are observed evidence (2026-10-19)
+
+Covered by `tests/test_evidence_wsl.py`. MEASURED (Multi run
+swarm-a35f33083165, folder "bount en"): helpers ran `wsl bash -c "cd ~/bount-en
+&& python3 -m pytest tests/..."`; `evidence.inner_command` did not look behind
+`wsl`, so phases whose tests passed read "claimed, not checked". It now unwraps
+`wsl [-d/--distribution X] [-u/--user X] [--cd X] [--shell-type X] [-e/--exec/--]
+CMD...` (also `wsl.exe` by a Windows path, and inside codex's pwsh wrapper; up to
+4 nested wrappers), then the usual shell `-c` body. `wsl --list` / `--shutdown`
+/ bare `wsl` are not a command and stay non-evidence. The hub still runs nothing
+itself: it reads what the CLI already ran (WSL passes the exit code through).
+
+## Default blocklist, owner's 2026-10-19 additions
+
+`_DEFAULT_BLOCKED_IDENTITIES` gained the owner's newer blocks (cosmos-reason2-8b,
+ising-calibration-1.5-31b, ling-3.1-flash, mistral-7b-instruct-v0.3,
+mistral-large, mistral-large-2-instruct, muse-glimmer-30b, neva-22b,
+step-5-preview, xing4.0-29b-a4b, zamba2-7b-instruct). `_seed_default_blocks`
+delivers them once to every install on its next boot; an untick is respected.
+The owner's extra provider/model pairs were NOT shipped: each belongs to a
+family already blocked, and the g4f `srv_*` ids are install-specific.

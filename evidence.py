@@ -63,6 +63,42 @@ def clean_output(text):
 
 _SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "pwsh", "powershell", "cmd"}
 _BODY_FLAGS = {"-c", "-lc", "-ic", "-lic", "-command", "/c", "/k", "/s/c"}
+# WSL runs its arguments as a Linux command: `wsl [options] [--|-e] CMD...`.
+# MEASURED 2026-10-19 (run swarm-a35f33083165, folder "bount en"): helpers ran
+# `wsl bash -c "cd ~/bount-en && python3 -m pytest tests/..."`, the hub did not
+# see pytest behind `wsl`, and phases that passed read "claimed, not checked".
+_WSL = "wsl"
+_WSL_VALUE_OPTS = {"-d", "--distribution", "-u", "--user", "--cd", "--shell-type",
+                   "--distribution-id"}
+_WSL_EXEC_OPTS = {"-e", "--exec", "--"}
+
+
+def _unwrap_wsl(cmd, first):
+    """`wsl [options] CMD...` -> 'CMD...' (shell-quoted), or None when it is
+    not a WSL launch of a command (wsl --list, wsl alone, unparsable).
+    `first` is the raw program token: only what FOLLOWS it is shlex-split, so a
+    Windows path to wsl.exe keeps its backslashes."""
+    if _base(first) != _WSL:
+        return None
+    try:
+        argv = [first] + shlex.split(cmd.lstrip()[len(first):], posix=True)
+    except ValueError:
+        return None
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        low = tok.lower()
+        if low in _WSL_EXEC_OPTS:
+            i += 1
+            break
+        if low in _WSL_VALUE_OPTS:
+            i += 2
+            continue
+        if tok.startswith("-"):
+            return None          # wsl --list / --install / --shutdown ...: not a command
+        break
+    rest = argv[i:]
+    return shlex.join(rest) if rest else None
 
 
 def _base(token):
@@ -87,12 +123,18 @@ def inner_command(command):
     returned as it is (shlex would eat a Windows path's backslashes)."""
     cmd = " ".join(str(command or "").split()) if "\n" not in str(command or "") \
         else str(command).strip()
-    for _ in range(3):                      # nested wrappers, bounded
+    for _ in range(4):                      # nested wrappers (pwsh > wsl > bash), bounded
         first = cmd.lstrip().split(None, 1)[0] if cmd.strip() else ""
         if first[:1] in "'\"":
             q = first[0]
             end = cmd.lstrip().find(q, 1)
             first = cmd.lstrip()[: end + 1] if end > 0 else first
+        if _base(first) == _WSL:
+            inner = _unwrap_wsl(cmd, first)
+            if inner is None:
+                return cmd
+            cmd = inner.strip()
+            continue
         if _base(first) not in _SHELLS:
             return cmd
         try:
