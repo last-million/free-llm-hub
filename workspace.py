@@ -223,6 +223,10 @@ def missing_tools(project_dir):
     machine without it fails with something like "[WinError 2] The system
     cannot find the file specified", which tells a beginner nothing at all."""
     project_dir = os.path.abspath(project_dir or "")
+    if _wsl(project_dir):
+        # Its tools live in the distro, not on this Windows PATH; a missing one
+        # shows in the preview log in the distro's own words.
+        return []
     need = []                                   # [(tool, needed_for)]
 
     pkg = _read_json(os.path.join(project_dir, "package.json"))
@@ -309,9 +313,39 @@ def _venv_python(project_dir):
     no dependencies should still start instantly instead of paying for a venv it
     does not need."""
     vd = _venv_dir(project_dir)
+    if _wsl(project_dir):
+        # A project inside WSL has a LINUX venv (.venv/bin/python, a Linux
+        # binary): _wsl_argv maps it to its Linux path; no venv -> python3.
+        exe = os.path.join(vd, "bin", "python")
+        return exe if os.path.exists(exe) else "python3"
     exe = (os.path.join(vd, "Scripts", "python.exe") if os.name == "nt"
            else os.path.join(vd, "bin", "python"))
     return exe if os.path.isfile(exe) else sys.executable
+
+
+def _wsl(path):
+    """(distro, linux path) when `path` is inside a WSL distro, else None."""
+    try:
+        import wslpath
+        return wslpath.parse(path)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _wsl_argv(argv, cwd, env=None):
+    """`argv` run INSIDE the WSL distro of `cwd` (see wslpath), or None when
+    `cwd` is a normal folder. cmd.exe cannot work in a \\\\wsl.localhost folder
+    and a Windows npm.cmd / python.exe would build Windows files in a Linux
+    project, so the preview runs the project's tools in its own distro."""
+    if not _wsl(cwd):
+        return None
+    try:
+        import wslpath
+        vd = _venv_dir(cwd)
+        return wslpath.wrap_argv(argv, cwd, env=env,
+                                 venv=vd if os.path.isdir(vd) else None)
+    except Exception:                                            # noqa: BLE001
+        return None
 
 
 # Every setup command has a time limit (2026-10-04 audit: _run_blocking had
@@ -417,6 +451,10 @@ def _run_blocking(argv, cwd, log, timeout=None, label=None):
     past `timeout` seconds the whole process tree is killed and the reason
     reads "<label> did not finish in N s". timeout None = no limit."""
     label = label or os.path.basename(str(argv[0]))
+    wargv = _wsl_argv(argv, cwd)
+    if wargv:
+        log("[hub] in WSL: " + wargv[-1])
+        argv, cwd = wargv, None        # wsl.exe sets the Linux folder itself
     try:
         p = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True,
@@ -1201,6 +1239,14 @@ def start(project_dir, on_done=None):
                 # (Flask projects hid this, because the hub itself has Flask.)
                 argv = [_venv_python(run_dir)] + list(argv[1:])
             proc.log("[hub] " + " ".join(argv))
+            env = _env_for(run_dir, port)
+            launch_cwd = run_dir
+            wargv = _wsl_argv(argv, run_dir, env=env)
+            if wargv:
+                # A project inside WSL runs in its distro; Windows still
+                # reaches it on 127.0.0.1:<port> (WSL forwards localhost).
+                proc.log("[hub] in WSL: " + wargv[-1])
+                argv, launch_cwd = wargv, None
             try:
                 # Checking `stopping` and publishing `popen` under the SAME lock
                 # stop() uses makes the two mutually exclusive: either stop()
@@ -1212,7 +1258,7 @@ def start(project_dir, on_done=None):
                         proc.state = "stopped"
                         return
                     proc.popen = subprocess.Popen(
-                        argv, cwd=run_dir, env=_env_for(run_dir, port),
+                        argv, cwd=launch_cwd, env=env,
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         text=True, encoding="utf-8", errors="replace",
                         # Own group so stop() takes the whole tree: npm spawns
@@ -1411,7 +1457,26 @@ def list_dirs(path=None):
     return {"path": root,
             "parent": parent if parent and parent != root else None,
             "dirs": out,
-            "runnable": _is_runnable(root)}
+            "runnable": _is_runnable(root),
+            # Shortcuts into each WSL distro (\\wsl.localhost\<distro>\home):
+            # projects that live in WSL open from there, any distro.
+            "wsl": _wsl_roots()}
+
+
+_WSL_ROOTS = {"at": 0.0, "rows": []}
+
+
+def _wsl_roots():
+    now = time.time()
+    if now - _WSL_ROOTS["at"] < 60:
+        return list(_WSL_ROOTS["rows"])
+    try:
+        import wslpath
+        rows = wslpath.roots()
+    except Exception:                                            # noqa: BLE001
+        rows = []
+    _WSL_ROOTS.update(at=now, rows=rows)
+    return list(rows)
 
 
 def _is_runnable(path):

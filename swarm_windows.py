@@ -1638,7 +1638,7 @@ def _full_agent_prompt(run, agent):
               # Detached spellings measured to return, and the hub's PID and
               # port so a worker knows which python is not its to kill (live
               # 2026-09-27: an agent listed python processes and killed one).
-              agent_servers.worker_rules()]
+              agent_servers.worker_rules(project_dir=run.project_dir)]
     # THIS MACHINE (envprobe via app): what is installed here and the storage
     # rule, so the code a worker writes runs HERE. "" = prompt unchanged.
     env = getattr(run, "env_block", "")
@@ -1807,7 +1807,7 @@ def _fit_tail(run, agent, as_list=False):
             "Every file you create or edit must be inside that folder. Use paths relative "
             "to it, or that exact absolute spelling. Do not reuse a path printed by a "
             "shell, and never write to /, /tmp or /workspace.",
-            agent_servers.worker_rules(),
+            agent_servers.worker_rules(project_dir=run.project_dir),
             "", "Work only on YOUR phase, and do it now -- do not ask for confirmation. "
             "Finish with a short summary of what you changed and anything the other "
             "agents need to know.",
@@ -2887,7 +2887,7 @@ def _pair_prompt(run, agent):
         "SHORT summary: files you wrote, problems you found in the lead's work.",
         "", "THE PROJECT FOLDER IS: " + run.project_dir,
         "The overall goal is: " + run.goal, "Phase: " + agent.title,
-        "", agent_servers.worker_rules()]
+        "", agent_servers.worker_rules(project_dir=run.project_dir)]
     return "\n".join(lines)
 
 

@@ -2634,7 +2634,7 @@ def write_task_brief(project_dir, text, memory_block="", session_id=None):
         # opencode turn that parked `python app.py` in its shell, then listed
         # and killed python processes. The rules, with the detached spellings
         # measured on this machine, live in agent_servers.
-        parts = [header, folder, agent_servers.brief_section()]
+        parts = [header, folder, agent_servers.brief_section(project_dir=project_dir)]
         # THE GOAL BEHIND THE WORK (taskboard, via app): the same brief the
         # terminal CLIs and the Multi phases see, so the Build page has the
         # same goal alignment. Absent (no active goal / feature off) = the

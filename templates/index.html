@@ -10596,8 +10596,21 @@
             pathEl.textContent = r.path;
             scrim.querySelector('[data-up]').disabled = !r.parent;
             listEl.innerHTML = '';
+            /* Projects that live in WSL: one shortcut per distro (its /home),
+               so any WSL folder can be picked like a Windows one. */
+            (r.wsl || []).forEach(function(w){
+              if (String(r.path || '').toLowerCase().indexOf(String(w.path || '').toLowerCase()) === 0) return;
+              var s = document.createElement('button');
+              s.type = 'button';
+              s.className = 'dirpick-item';
+              s.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg><span></span>';
+              s.querySelector('span').textContent = w.name;
+              s.title = w.path;
+              s.addEventListener('click', function(){ load(w.path); });
+              listEl.appendChild(s);
+            });
             if (!r.dirs.length){
-              listEl.innerHTML = '<div class="dirpick-item" style="cursor:default;opacity:.7">No sub-folders here.</div>';
+              listEl.insertAdjacentHTML('beforeend', '<div class="dirpick-item" style="cursor:default;opacity:.7">No sub-folders here.</div>');
             }
             r.dirs.forEach(function(d){
               var b = document.createElement('button');

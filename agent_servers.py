@@ -300,14 +300,51 @@ def stop_examples(port="PORT", windows=None):
     ]
 
 
-def brief_section(pids=None, port=None, windows=None):
-    """The brief file's section on servers. Markdown; dynamic hub PID/port."""
+def wsl_section(project_dir):
+    """The brief's block for a project that lives INSIDE WSL (a
+    \\\\wsl.localhost\\<distro>\\... folder), or "" for any other folder. Any
+    agent, any distro: commands run in the distro through wsl.exe, a real
+    program every shell tool can call."""
+    try:
+        import wslpath
+        p = wslpath.parse(project_dir)
+    except Exception:                                            # noqa: BLE001
+        return ""
+    if not p:
+        return ""
+    distro, linux = p
+    run = wslpath.run_hint(project_dir, "<command>")
+    test = wslpath.run_hint(project_dir, "python3 -m pytest -q")
+    serve = wslpath.run_hint(project_dir, "nohup <server command> > server.log 2>&1 & "
+                                           "echo $! > %s" % PID_FILE)
+    stop = wslpath.run_hint(project_dir, "kill $(cat %s)" % PID_FILE)
+    nl = chr(10)
+    return nl.join([
+        "## This project lives in WSL (%s: `%s`)" % (distro, linux),
+        "",
+        "- Your file tools read and write it through this Windows path; the "
+        "same files are `%s` inside the %s distro." % (linux, distro),
+        "- Run EVERY build, test, install, git and server command INSIDE WSL, "
+        "from whatever shell your tool runs: `%s` (for example `%s`). Never "
+        "through cmd.exe or the Windows git/npm/pip/python on this folder: "
+        "cmd.exe cannot work in it, Windows git refuses it as \"dubious "
+        "ownership\", and Windows npm/pip would put Windows packages into a "
+        "Linux project." % (run, test),
+        "- A server inside WSL: start it detached with `%s`, stop it with `%s`. "
+        "Windows reaches it on `http://127.0.0.1:PORT`." % (serve, stop),
+    ])
+
+
+def brief_section(pids=None, port=None, windows=None, project_dir=None):
+    """The brief file's section on servers. Markdown; dynamic hub PID/port.
+    A project inside WSL gets wsl_section first."""
     pids = hub_pids() if pids is None else list(pids)
     port = hub_port() if port is None else port
     if windows is None:
         windows = os.name == "nt"
     nl = chr(10)
-    lines = [
+    wsl = wsl_section(project_dir) if project_dir else ""
+    lines = ([wsl, ""] if wsl else []) + [
         "## Servers, watchers and other commands that never exit",
         "",
         "A dev server or a watcher run in the FOREGROUND never returns: your shell "
@@ -387,13 +424,23 @@ def brief_section(pids=None, port=None, windows=None):
     return nl.join(lines)
 
 
-def worker_rules(pids=None, port=None, windows=None):
+def worker_rules(pids=None, port=None, windows=None, project_dir=None):
     """The same rules, short enough for a swarm worker's argv-borne prompt."""
     pids = hub_pids() if pids is None else list(pids)
     port = hub_port() if port is None else port
     ex = "; ".join("%s: `%s`" % (s, e) for s, e in
                    detach_examples("CMD", windows=windows)[:2])
-    return ("Never run a server or watcher in the foreground: the shell tool waits "
+    wsl = ""
+    try:
+        import wslpath
+        if project_dir and wslpath.parse(project_dir):
+            wsl = ("THIS PROJECT LIVES IN WSL: run every build/test/install/git/"
+                   "server command inside it, `%s`, never via cmd.exe or Windows "
+                   "git/npm/python on this folder. "
+                   % wslpath.run_hint(project_dir, "<command>"))
+    except Exception:                                            # noqa: BLE001
+        wsl = ""
+    return wsl + ("Never run a server or watcher in the foreground: the shell tool waits "
             "for it and the turn hangs. Start it DETACHED, log and PID recorded "
             "(%s), check it with one request with a timeout, or leave it to the "
             "hub's preview. Stop only what you started, by that PID or its port, "

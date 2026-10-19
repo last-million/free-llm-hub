@@ -5397,3 +5397,45 @@ step-5-preview, xing4.0-29b-a4b, zamba2-7b-instruct). `_seed_default_blocks`
 delivers them once to every install on its next boot; an untick is respected.
 The owner's extra provider/model pairs were NOT shipped: each belongs to a
 family already blocked, and the g4f `srv_*` ids are install-specific.
+
+## Projects that live in WSL, any agent, any distro (2026-10-19)
+
+Owner: "some agents work in WSL -- it must work for any agent or project".
+Covered by `tests/test_wsl_projects.py` (hermetic: no WSL needed). MEASURED on
+the owner's machine: a `\wsl.localhost\Ubuntu\home\...` folder keeps its UNC
+form through `abspath`/`realpath`, is readable and writable, and the agent
+CLIs (claude, codex, opencode) launch DIRECTLY in it (`agentic_chat._launcher`
+resolves their shims, no cmd.exe). What broke was everything that went
+through cmd.exe or Windows tools: the preview's `npm.cmd install` / `run dev`
+(cmd.exe falls back to C:\Windows), the brief's `cmd /c` server recipe, and
+Windows git ("dubious ownership"). Also found: the owner's Multi project was a
+Windows folder while helpers ran tests in a SEPARATE WSL copy (`~/bount-en`).
+
+- **`wslpath.py`** (pure stdlib, never raises): `parse(path)` -> (distro,
+  linux path) for `\wsl.localhost\<d>\...`, `\wsl$\<d>\...` and slash
+  spellings, else None; `wrap_argv(argv, cwd, env, venv)` ->
+  `wsl.exe -d <d> --cd <linux> -e bash -lic '<exports>; exec <cmd>'`
+  (npm/npx/pnpm/yarn/bun/node by name, a python -> the project's Linux venv or
+  `python3`, project paths -> Linux paths, only the preview's own env keys
+  exported). `-e`, not `--`: MEASURED, with `--` the distro's default shell
+  re-parses the line and expands every `$` first. Login + interactive bash so
+  nvm / ~/.local/bin tools are on PATH. `run_hint(path, cmd)` -> `wsl -d <d>
+  -e bash -lic 'cd <linux> && <cmd>'` for agents (no `--cd` argument: Git Bash
+  rewrites a bare /home/... into a Windows path). `distros()` / `roots()` from
+  the `\wsl.localhost` share, else `wsl -l -q` (UTF-16).
+- **Preview** (`workspace`): `_run_blocking` (installs, deploy steps) and the
+  server start run a WSL project's commands through `_wsl_argv` (cwd None,
+  wsl sets the folder); `_venv_python` -> `.venv/bin/python` or `python3`;
+  `missing_tools` skips the Windows PATH check. MEASURED live: a server started
+  this way answered on Windows' 127.0.0.1 (WSL localhost forwarding) and
+  `taskkill /T` on wsl.exe freed the port, so Stop works unchanged.
+- **Brief** (every CLI, Build + Multi): `agent_servers.brief_section(
+  project_dir=)` puts `wsl_section` first (run every build/test/install/git/
+  server command inside WSL with the exact `wsl ... -e bash -lic` line, never
+  cmd.exe or Windows git/npm/pip; detached server and stop by PID inside WSL);
+  `worker_rules(project_dir=)` gets the same rule in one sentence. A normal
+  folder's brief is byte-identical.
+- **Picker**: `list_dirs` returns `wsl` shortcuts (one per distro, at its
+  /home, cached 60 s); the dialog draws them above the folder list.
+- Not changed: the hub still runs no test itself; snapshots over the WSL share
+  can be slow (they may time out and the turn runs without one).
