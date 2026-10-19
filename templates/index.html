@@ -2730,6 +2730,21 @@
   .agent-tasks{ border:1px solid var(--border); border-radius:var(--radius-sm);
     background:var(--surface); font-size:12.5px; flex:none; min-width:0; padding:3px 4px 3px 12px; }
   .agent-tasks-h{ display:flex; align-items:center; flex-wrap:wrap; gap:4px 8px; min-width:0; }
+  /* In the top bar (see placeGoal): no box of its own, a divider before it,
+     the rest of the bar's line; opened, the list takes the bar's full width. */
+  .agent-collapse-bar, .agent-session-bar{ flex-wrap:wrap; }
+  .agent-collapse-bar > .agent-tasks, .agent-session-bar > .agent-tasks{
+    flex:1 1 220px; min-width:0; border:0; border-left:1px solid var(--border);
+    border-radius:0; background:none; padding:0 0 0 8px; }
+  .agent-collapse-bar > .agent-tasks:has(> .agent-tasks-body:not([hidden])),
+  .agent-session-bar > .agent-tasks:has(> .agent-tasks-body:not([hidden])){
+    flex-basis:100%; order:9; border-left:0; padding:4px 0 0; }
+  @media (min-width:641px){
+    body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-bar > .agent-tasks{
+      font-size:11.5px; }
+    body.cx-agent-view #agent-section.agent-top-collapsed .agent-collapse-bar > .agent-tasks .agent-tasks-h .btn{
+      min-height:24px; padding-top:0; padding-bottom:0; }
+  }
   .agent-goal-k{ flex:none; font-weight:700; color:var(--text); }
   .agent-tasks-goal{ flex:1 1 160px; min-width:0; color:var(--text-dim); overflow:hidden;
     text-overflow:ellipsis; white-space:nowrap; }
@@ -5344,9 +5359,20 @@
       text.textContent = line || 'Session open';
       summary.title = 'Full permissions. ' + (info || line);
     }
+    /* THE GOAL LIVES IN THE TOP BAR (owner, 2026-10-19: "the goal bar should
+       be included in the first bar ... it takes space too"). One element,
+       moved: into the folded summary bar when the top is collapsed, into the
+       session bar when it is open -- never a row of its own. */
+    function placeGoal(on){
+      var t = document.getElementById('agent-tasks');
+      var host = document.getElementById(on ? 'agent-collapse-bar' : 'agent-session-bar');
+      if (!t || !host || t.parentNode === host) return;
+      if (on) host.insertBefore(t, btn); else host.appendChild(t);
+    }
     function paint(on){
       collapsed = on;
       summarize();
+      placeGoal(on);
       sec.classList.toggle('agent-top-collapsed', on);
       summary.hidden = !on;
       btn.setAttribute('aria-expanded', on ? 'false' : 'true');
@@ -5402,6 +5428,8 @@
     var warn = document.getElementById('agent-warning');
     if (bar) bar.addEventListener('click', function(e){
       if (isControl(e.target)) return;
+      /* The goal row sits in this bar while folded: reading it never folds. */
+      if (e.target && e.target.closest && e.target.closest('#agent-tasks')) return;
       setCollapsed(!collapsed, true);
     });
     if (warn) warn.addEventListener('click', function(e){

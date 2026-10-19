@@ -22661,6 +22661,25 @@ def _cm_owner_session(mapkey, folder_key, helper_cli, project_dir, mode, goal_te
     return sid, info
 
 
+def _cm_note_owner_turn(sid, info, project_dir, helper_cli, mode, goal):
+    """The CLI's request becomes the owner conversation's user turn, which also
+    CREATES its history record; then quality, mode and "continue by itself
+    after a restart" are set on a record that exists. MEASURED 2026-10-19
+    (swarm-25d638086224, started from opencode in a terminal): the record did
+    not exist until the run's report was filed, so set_auto_resume was a no-op,
+    the owner was unknown to the boot resume, and a hub restart left the run
+    "interrupted" instead of continuing it. Never raises."""
+    try:
+        agentic_history.record_turn(sid, (info or {}).get("cli") or helper_cli,
+                                    project_dir, "user", goal)
+        agentic_history.set_quality(sid, "multi")
+        if mode:
+            agentic_history.set_mode(sid, mode)
+        agentic_history.set_auto_resume(sid, True)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _cm_keepalive_wrap(producer, interval):
     """Yield `producer`'s events, injecting a None every `interval` seconds the
     source is silent -- so a long, quiet phase still gets a keepalive line. The
@@ -23052,6 +23071,7 @@ def _cm_launcher(mapkey, folder_key, project_dir, helper_cli, consent=None, bare
                                                  project_dir, mode, goal)
         if not owner_sid:
             return None
+        _cm_note_owner_turn(owner_sid, sess_info, project_dir, helper_cli, mode, goal)
         _cm_map_put(mapkey, owner_sid, None, folder=folder_key, consent=consent)
         # bare = an approved request: the run receives ONLY the approved goal
         # and folder (no conversation context, no goal brief, no resume).

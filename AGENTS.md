@@ -5439,3 +5439,29 @@ Windows folder while helpers ran tests in a SEPARATE WSL copy (`~/bount-en`).
   /home, cached 60 s); the dialog draws them above the folder list.
 - Not changed: the hub still runs no test itself; snapshots over the WSL share
   can be slow (they may time out and the turn runs without one).
+
+## A Multi run started from a terminal survives a restart (2026-10-19)
+
+Covered by `tests/test_cli_multi_survives_restart.py`. MEASURED
+(swarm-25d638086224, opencode in a terminal, folder "bount en"): after the
+graceful restart the run was "failed", phase 6 "interrupted by a hub restart".
+The owner conversation `_cm_owner_session` opens for a CLI had NO history
+record until the run's report was filed (`agentic_history` creates the record
+on the first `record_turn`), so `set_auto_resume(True)` / `set_quality` were
+no-ops, `known_session_ids()` did not list the owner, and
+`_multi_should_auto_resume` refused both the per-conversation box and the
+update marker. `_cm_note_owner_turn` (called by every CLI launch, approved or
+not) now records the CLI's request as the owner's user turn first -- creating
+the record -- then sets quality, mode and auto_resume. Never raises.
+
+## The goal row lives in the top bar (2026-10-19)
+
+Owner: "the goal bar should be included in the first bar ... it takes space".
+Covered by `tests/test_goal_in_the_session_bar.py`. `placeGoal(on)` (called by
+the collapse logic's `paint`) moves `#agent-tasks` into `#agent-collapse-bar`
+(before the chevron) when the top is folded and into `#agent-session-bar` when
+it is open: no row of its own. In a bar it has no box, a divider before it;
+opened, its body takes the bar's full width (`:has(> .agent-tasks-body:not(
+[hidden]))`). A click on it never folds the top. Desktop buttons are 24 px tall
+in the folded bar; phones keep 44 px. The element's place in the HTML (and
+`tests/test_goal_in_the_top_bar.py`) is unchanged: only the script moves it.
