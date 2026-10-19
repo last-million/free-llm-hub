@@ -5361,3 +5361,17 @@ in the CLI?" Covered by `tests/test_cli_multi_stays_live.py`. Flag
   of "Multi from the CLI"). A turn that hands off marks nothing.
 - codex / claude / kimi keep the hand-off: their overall stream limits are not
   measured.
+
+## One relay backend, one walk (2026-10-19)
+
+Covered by `tests/test_relay_server_once_per_walk.py`. MEASURED 2026-10-18
+17:17 (RESPONSES-503, no tools, 12 hops): five hops went to the same g4f
+backend `srv_mr9dda21bf67b4c62086` (opus-5.5, sonnet-5.5, fable-5.1, a
+community opus, opus-4.7), each a 200 "nonanswer" -- the backend's own key had
+"reached its budget" (the canary saw the same notice later). Tool walks already
+drop a relay server after one failed hop (`_relay_skip`); any OTHER walk now
+counts failed hops per relay server (`_ChainClock._relay_strikes`, filed in
+`_close_hop`, never for a local-network failure) and drops that server for the
+rest of the walk after `_RELAY_WALK_STRIKES` (2), so one model-specific failure
+never loses the whole backend. Fail-open: when only that server is left it is
+still walked. Flag `relay_walk_skip` (default on); off = the chain as built.

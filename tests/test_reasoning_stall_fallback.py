@@ -199,7 +199,10 @@ def test_messages_a_reasoning_only_hop_hands_over(quiet, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 def test_a_thinker_that_answers_in_time_is_not_cut_and_keeps_its_reasoning(quiet, monkeypatch):
-    monkeypatch.setattr(A, "_REASONING_STALL_SECONDS", 6.0)
+    # 30 s, not 6: under a loaded parallel suite (12 min run, 2026-10-19) the
+    # 500 fake frames took longer than 6 s and the thinker was handed over. The
+    # stream ends as soon as the frames are sent, so the test is no slower.
+    monkeypatch.setattr(A, "_REASONING_STALL_SECONDS", 30.0)
     # 500 reasoning frames: past the old 400-frame commit point AND past the
     # 0.3 s peek window, then visible text.
     calls = _fleet(monkeypatch, _thinks_then_answers(500, ANSWER), _answers("never"))

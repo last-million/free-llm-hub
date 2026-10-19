@@ -10289,6 +10289,25 @@ def _relay_server_id(pid, model):
         return None
 
 
+# ONE RELAY SERVER, ONE WALK (2026-10-19). MEASURED 2026-10-18 17:17: a
+# /v1/responses turn (no tools) walked 12 hops and 503'd; five of them were the
+# same g4f backend srv_mr9dda21bf67b4c62086 (opus-5.5, sonnet-5.5, fable-5.1,
+# opus-4.7, a community opus), each a 200 "nonanswer": that backend's key had
+# "reached its budget" (the canary saw the same notice), so every model behind
+# it failed alike. Tool walks already drop a relay server after ONE failure
+# (_relay_skip); any other walk now drops it after _RELAY_WALK_STRIKES failed
+# hops -- two, so one model-specific failure never loses the whole backend.
+# Fail-open (only that server left -> it is walked), flag `relay_walk_skip`.
+_RELAY_WALK_STRIKES = 2
+
+
+def _relay_walk_skip_on():
+    try:
+        return bool(config.get_flag("relay_walk_skip", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _note_relay_tool_fail(pid, model):
     """One ConnectionError / non-answer from a relay server on a tool turn."""
     if _client_gone():
@@ -34177,6 +34196,7 @@ class _ChainClock:
         self._rest = []              # what the walk has not yielded yet
         self._relay_hops = 0
         self._relay_bad = set()
+        self._relay_strikes = {}     # relay server -> failed hops in THIS walk
         self._net_streak = []
         self._net_hosts = set()
         try:
@@ -34207,7 +34227,8 @@ class _ChainClock:
         _TOOL_PER_PROVIDER_HOPS failed hops or its share of the deadline
         (_provider_cap), and skips relay hops past _TOOL_RELAY_MAX_HOPS or on a
         relay server that already failed in this walk. Any other turn: the
-        chain as built."""
+        chain as built, minus a relay server that failed _RELAY_WALK_STRIKES
+        hops in this walk (fail-open)."""
         self._ensure_ledgers()
         original = list(chain or ())
         self._rest = rest = list(original)
@@ -34232,6 +34253,10 @@ class _ChainClock:
                     rest[:] = [e for e in rest if not self._relay_skip(e)]
                     if not rest:
                         break
+                elif self._relay_bad:
+                    # Fail-open: when only the failed server is left, keep it.
+                    rest[:] = [e for e in rest
+                               if _relay_server_id(e[0], e[1]) not in self._relay_bad] or rest
                 i = 0
                 if first and self.pinned:
                     # THE USER NAMED THE HEAD (see _build_chain's pinned branch):
@@ -34347,6 +34372,8 @@ class _ChainClock:
             self._prov_secs = {}
         if self._relay_bad is None:
             self._relay_bad = set()
+        if getattr(self, "_relay_strikes", None) is None:
+            self._relay_strikes = {}
         if self._net_streak is None:
             self._net_streak = []
         if self._net_hosts is None:
@@ -34471,6 +34498,14 @@ class _ChainClock:
                                     + max(0.0, time.monotonic() - started))
             if self.tools and _is_relay_pid(pid):
                 self._relay_bad.add(_relay_server_id(pid, model))
+            elif _is_relay_pid(pid) and _relay_walk_skip_on():
+                # ANY other turn: a relay server that failed _RELAY_WALK_STRIKES
+                # hops in this walk is not walked again in it (see walk).
+                server = _relay_server_id(pid, model)
+                n = self._relay_strikes.get(server, 0) + 1
+                self._relay_strikes[server] = n
+                if n >= _RELAY_WALK_STRIKES:
+                    self._relay_bad.add(server)
         except Exception:                                        # noqa: BLE001
             pass
 
