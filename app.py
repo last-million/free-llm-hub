@@ -25205,10 +25205,19 @@ def _ensure_mcp_servers_once():
         # all, so `spec.get("url") is None` was also true for playwright and
         # bolted the hub's URL onto it -- registering a browser subprocess as
         # an HTTP server pointing at the hub, in every CLI.
-        if spec.get("url") == _HUB_URL_SENTINEL:
+        hub_entry = spec.get("url") == _HUB_URL_SENTINEL
+        if hub_entry:
             spec["url"] = _hub_mcp_url()
         for cli in mcp_manager.supported_clis():
             for isolated in (False, True):
+                # The hub's OWN tools go into a CLI's real config only while
+                # that CLI is connected to the hub (owner, 2026-10-20: a
+                # disconnected CLI shows nothing of the hub). MEASURED: this
+                # boot pass re-registered them in four disconnected CLIs 27 s
+                # after the sweep removed them. The hub's isolated copies keep
+                # them (Build / Multi sessions run there).
+                if hub_entry and not isolated and not _cli_hub_connected(cli):
+                    continue
                 try:
                     ok, msg = mcp_manager.add_server(cli, name, dict(spec),
                                                      isolated=isolated)
@@ -30969,7 +30978,19 @@ def _hub_mcp_kept(cli_id):
 # had already disconnected. Only an entry pointing at THIS hub's /mcp is
 # touched; the hub's own isolated CLI copies (Build/Multi sessions) keep theirs.
 _HUB_MCP_REMOVED_SETTING = "hub_mcp_removed_clis"
-_HUB_TRACE_SWEEP_SETTING = "hub_trace_sweep_v1"
+# v2: v1 ran while the boot MCP pass (_ensure_mcp_servers_once) still put the
+# hub's entry back into every CLI 27 s later; it now skips disconnected CLIs.
+_HUB_TRACE_SWEEP_SETTING = "hub_trace_sweep_v2"
+
+
+def _cli_hub_connected(cli_id):
+    """Is this CLI's real config wired to the hub right now? Fails closed
+    (False) -- a failed check must not write the hub's tools into a CLI."""
+    try:
+        entry = _get_cli_entry(cli_id)
+        return bool(entry) and bool(_cli_connected(entry)[0])
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def _is_hub_mcp_url(url):

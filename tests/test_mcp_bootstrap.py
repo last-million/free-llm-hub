@@ -23,6 +23,15 @@ import app
 import mcp_manager as m
 
 
+@pytest.fixture(autouse=True)
+def _every_cli_connected(monkeypatch):
+    """Since 2026-10-20 the boot pass puts the hub's own entry only into CLIs
+    CONNECTED to the hub (tests/test_disconnect_removes_hub_tools.py covers
+    that rule). These tests check the file formats, so every CLI reads as
+    connected here."""
+    monkeypatch.setattr(app, "_cli_hub_connected", lambda cli: True)
+
+
 @pytest.fixture
 def home(monkeypatch):
     d = tempfile.mkdtemp(prefix="hub-pytest-mcpboot-")

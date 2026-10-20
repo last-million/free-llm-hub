@@ -5539,3 +5539,11 @@ TEST ONLY" models from a catalog a July hub-era session wrote by hand.
   disconnected codex, delete that catalog and its `model_catalog_json` key and
   codex shows its own live model list again. A catalog without those words is
   still never touched.
+- **The boot MCP pass respects it** (`_ensure_mcp_servers_once`, MEASURED
+  16:38: it put `free-llm-hub` back into kimi, codex, claude and openclaw 27 s
+  after the v1 sweep): the hub's OWN entry goes into a CLI's real config only
+  while `_cli_hub_connected` (fails closed); the hub's isolated copies always
+  get it, and context7 / playwright are unchanged. The sweep key moved to
+  `hub_trace_sweep_v2` so it runs once more on installs where v1 was undone.
+  `tests/test_mcp_bootstrap.py` reads every CLI as connected (it tests the file
+  formats).

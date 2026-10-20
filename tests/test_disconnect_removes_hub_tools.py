@@ -145,3 +145,27 @@ def test_one_boot_sweep_cleans_disconnected_clis_once(home, monkeypatch):
     mcp_manager.add_server("codex", "free-llm-hub", {"url": HUB_ROOT + "/mcp"})
     assert app._sweep_disconnected_cli_traces() == []
     assert "free-llm-hub" in [e["name"] for e in mcp_manager.list_servers()["codex"]]
+
+
+def test_the_boot_pass_registers_the_hubs_tools_only_in_connected_clis(monkeypatch):
+    """MEASURED 2026-10-20 16:38: _ensure_mcp_servers_once put free-llm-hub
+    back into kimi, codex, claude and openclaw 27 s after the sweep removed it,
+    because it registered the hub in EVERY CLI at every boot."""
+    calls = []
+    monkeypatch.setattr(mcp_manager, "add_server",
+                        lambda cli, name, spec, isolated=False:
+                        calls.append((cli, name, isolated)) or (True, "added"))
+    monkeypatch.setattr(mcp_manager, "supported_clis", lambda: ("codex", "opencode"))
+    monkeypatch.setattr(app, "_cli_hub_connected", lambda cli: cli == "opencode")
+    app._ensure_mcp_servers_once()
+    hub = [(c, iso) for c, n, iso in calls if n == "free-llm-hub"]
+    assert ("opencode", False) in hub, "a connected CLI gets the hub's tools"
+    assert ("codex", False) not in hub, "a disconnected CLI never does"
+    assert ("codex", True) in hub and ("opencode", True) in hub, "the hub's own copies do"
+    others = [(c, iso) for c, n, iso in calls if n == "context7"]
+    assert ("codex", False) in others, "third-party servers are unchanged"
+
+
+def test_the_connected_check_fails_closed(monkeypatch):
+    monkeypatch.setattr(app, "_get_cli_entry", lambda cid: (_ for _ in ()).throw(OSError("x")))
+    assert app._cli_hub_connected("codex") is False
