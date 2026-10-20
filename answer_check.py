@@ -991,15 +991,32 @@ _NOTICE_CALLER_RE = re.compile(
 _NOTICE_TOPIC_RE = re.compile(
     r"\bbudget|\bquota|\bbilling|\bcredits?\b|\brate[- ]?limit|\bapi[- ]?keys?\b|"
     r"\bwallet", re.I)
+# MEASURED 2026-10-20 03:59 (opencode session 04f3e590): g4f's
+# Perplexity:claude45sonnetthinking answered a turn with the one sentence "Sign up
+# and repeat your request." -- its backend wants a logged-in user. No quota word,
+# so the check above let it through, the hub served it and the CLI's turn ended
+# on it. A SHORT reply that only tells the caller to sign up / log in is never
+# an answer, whatever the user asked about (a real reply about a sign-up page
+# says what was built, it does not ask the caller to repeat the request).
+_SIGNUP_MAX_CHARS = 300
+_SIGNUP_NOTICE_RE = re.compile(
+    r"^\W*(?:please\s+)?(?:sign[- ]?(?:up|in)|log[- ]?in|register)\b[^\n]{0,80}?"
+    r"\b(?:(?:repeat|resend|retry|re-send)\b[^\n]{0,20}\brequest\b|to continue\b|"
+    r"to use (?:this|the) (?:service|model|api|chat)\b)|"
+    r"^\W*(?:an? )?(?:account|login|log[- ]in|sign[- ]?in|authentication) (?:is )?required\b",
+    re.I)
 
 
 def _provider_notice(masked, prompt_text):
     """0 when the whole reply is an upstream quota/billing/rate-limit notice
-    addressed to the API caller, else None. Judged on the code-masked text,
-    skipped when the user's own prompt is about those topics."""
+    addressed to the API caller, or a short sign-up / log-in demand, else None.
+    Judged on the code-masked text; the quota check is skipped when the user's
+    own prompt is about those topics."""
     head = (masked or "").strip()
     if not head or len(head) > _NOTICE_MAX_CHARS:
         return None
+    if len(head) <= _SIGNUP_MAX_CHARS and _SIGNUP_NOTICE_RE.search(head):
+        return 0
     if prompt_text and _NOTICE_TOPIC_RE.search(_instruction(str(prompt_text)) or ""):
         return None
     if not _NOTICE_RE.search(head[:400]):

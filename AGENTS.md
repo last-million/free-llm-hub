@@ -5486,3 +5486,20 @@ perfect and responsive". Covered by `tests/test_goal_in_the_session_bar.py`
   and needs a second click within 4 s ("Click again to finish the goal").
 - Session bar: every control one height (30 px = 24 rendered on a desktop,
   44 px on a phone): buttons, the two selects, the quality pills.
+
+## "Sign up" from a relay is not an answer (2026-10-20)
+
+Covered by `tests/test_provider_notice.py`. MEASURED 2026-10-20 03:59 (opencode
+session 04f3e590, pinned by `[spread]` while 8 Multi sessions held the strong
+models): g4f's `Perplexity:claude45sonnetthinking` answered the turn with the one
+sentence "Sign up and repeat your request." (the canary got the same reply at
+04:35). `answer_check._provider_notice` only knew quota / budget / credit /
+rate-limit notices, so the reply passed, the hub served it as the final text and
+the CLI's turn ended on it -- the user had to type "continue". `_SIGNUP_NOTICE_RE`
+now also rejects a SHORT reply (<= `_SIGNUP_MAX_CHARS`, 300) that only tells the
+caller to sign up / sign in / log in and repeat the request, continue or use the
+service, or says login / an account is required -- on RELAY hops only (like the
+quota check), and whatever the user asked about (a real reply about a sign-up
+page says what was built). Junk = cut at 0, the hop fails over, and the junk
+strike benches the pair like the budget notices. Real short answers about sign-up
+pages pass (tested).

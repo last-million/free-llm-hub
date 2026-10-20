@@ -65,6 +65,36 @@ def test_ordinary_answers_and_code_are_untouched():
     assert ac.inspect(code, prompt_text="write a retry wrapper", relay=True)["ok"]
 
 
+# MEASURED 2026-10-20 03:59 (opencode session 04f3e590): g4f's
+# Perplexity:claude45sonnetthinking answered the turn with this one sentence (the
+# canary saw the same reply at 04:35); the hub served it and the CLI's turn
+# ended on it, so the user had to type "continue".
+SIGN_UP = "Sign up and repeat your request."
+LOG_IN = "Please log in to continue."
+LOGIN_REQUIRED = "Login required. Sign in at https://example.invalid/login and try again."
+
+
+def test_a_sign_up_or_log_in_notice_from_a_relay_is_not_an_answer():
+    for text in (SIGN_UP, LOG_IN, LOGIN_REQUIRED, "Please sign in and repeat your request"):
+        for prompt in ("fix the failing test in app.py", "continue",
+                       "add a sign up page with login"):
+            r = ac.inspect(text, prompt_text=prompt, relay=True)
+            assert not r["ok"], (text, prompt)
+            assert "provider_notice" in r["reasons"]
+            assert r["salvage"] is None
+        assert ac.is_provider_notice(text, "continue")
+        assert not ac.reads_as_answer(text, last_prompt="continue", relay=True)
+
+
+def test_real_answers_about_sign_up_pages_still_pass():
+    for text in ("Sign up and login pages are done: run npm start and open /signup.",
+                 "Sign up now works; the form posts to /api/register and shows errors inline.",
+                 "Log in with the admin account from .env.example, then open /dashboard."):
+        assert ac.inspect(text, prompt_text="add a sign up page with login", relay=True)["ok"], text
+    # a direct provider is never judged a notice
+    assert ac.inspect(SIGN_UP, prompt_text="continue")["ok"]
+
+
 def test_a_long_answer_mentioning_a_notice_is_an_answer():
     text = ("The deployment failed because the API key used for this request has reached "
             "its budget; raise the key budget, then try again. " +
