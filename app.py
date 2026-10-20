@@ -30943,9 +30943,9 @@ def _read_json_object(path):
 
 def _hub_mcp_kept(cli_id):
     """Path of the CLI config that still registers the hub's own MCP server
-    (the crew tools), or None. That entry is deliberately NOT removed by
-    Disconnect (see AGENTS.md "MCP: the hub as a tool server") -- it is
-    reported so the user knows it is there and where to remove it."""
+    (the crew tools), or None. Disconnect removes that entry now
+    (_hub_mcp_remove, owner 2026-10-20); this still reports it when the
+    removal was switched off or could not be done."""
     try:
         if cli_id not in mcp_manager.supported_clis():
             return None
@@ -30957,6 +30957,117 @@ def _hub_mcp_kept(cli_id):
         return path if _strip_hub_mcp_table(text) != text else None
     except Exception:                                            # noqa: BLE001
         return None
+
+
+# ---- a disconnected CLI shows nothing of the hub (owner, 2026-10-20) ----
+# "When I disconnect a CLI from the hub, nothing of the hub should appear in
+# it" -- every CLI, not only codex. MEASURED on the owner's machine: claude,
+# codex, openclaw and kimi were disconnected but still listed the hub's tools
+# (the "free-llm-hub" MCP server: crews, publish, Multi), which Disconnect kept
+# on purpose until now. Disconnect removes it, Connect puts back exactly the
+# entries a Disconnect removed, and one boot sweep cleans the CLIs an older hub
+# had already disconnected. Only an entry pointing at THIS hub's /mcp is
+# touched; the hub's own isolated CLI copies (Build/Multi sessions) keep theirs.
+_HUB_MCP_REMOVED_SETTING = "hub_mcp_removed_clis"
+_HUB_TRACE_SWEEP_SETTING = "hub_trace_sweep_v1"
+
+
+def _is_hub_mcp_url(url):
+    """True for http(s)://127.0.0.1|localhost|[::1]:<this hub's port>/mcp."""
+    try:
+        u = urlsplit(str(url or "").strip())
+        return (u.scheme in ("http", "https")
+                and (u.hostname or "").lower() in ("127.0.0.1", "localhost", "::1")
+                and u.port == PORT and (u.path or "").rstrip("/") == "/mcp")
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _hub_mcp_removed_note(cli_id, add):
+    """Remember (or forget) that a Disconnect removed this CLI's hub entry."""
+    try:
+        cur = [c for c in (config.get_setting(_HUB_MCP_REMOVED_SETTING) or [])
+               if isinstance(c, str)]
+        new = sorted(set(cur) | {cli_id}) if add else [c for c in cur if c != cli_id]
+        if new != cur:
+            config.set_setting(_HUB_MCP_REMOVED_SETTING, new or None)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _hub_mcp_remove(cli_id):
+    """Remove the hub's own MCP server entries from the CLI's GLOBAL config.
+    Returns the names removed ([] when there was none, the flag
+    `disconnect_removes_hub_mcp` is off, or anything failed). Never raises."""
+    try:
+        if not config.get_flag("disconnect_removes_hub_mcp", True):
+            return []
+        if cli_id not in mcp_manager.supported_clis():
+            return []
+        entries = mcp_manager.list_servers().get(cli_id) or []
+    except Exception:                                            # noqa: BLE001
+        return []
+    removed = []
+    for e in entries:
+        name = e.get("name") if isinstance(e, dict) else None
+        if not name or not _is_hub_mcp_url(e.get("url")):
+            continue
+        try:
+            ok, _msg = mcp_manager.remove_server(cli_id, name)
+        except Exception:                                        # noqa: BLE001
+            ok = False
+        if ok:
+            removed.append(name)
+    if removed:
+        _hub_mcp_removed_note(cli_id, True)
+    return removed
+
+
+def _hub_mcp_restore(cli_id):
+    """Connect: put back the hub's MCP entry a Disconnect removed (only then).
+    Returns True when it was put back. Never raises."""
+    try:
+        if cli_id not in (config.get_setting(_HUB_MCP_REMOVED_SETTING) or []):
+            return False
+        ok, msg = mcp_manager.add_server(cli_id, "free-llm-hub", {"url": _hub_mcp_url()})
+        ok = ok or str(msg).lower() == "exists"
+    except Exception:                                            # noqa: BLE001
+        return False
+    if ok:
+        _hub_mcp_removed_note(cli_id, False)
+    return ok
+
+
+def _sweep_disconnected_cli_traces():
+    """ONCE per install, at boot: remove the hub's MCP entry from every CLI
+    that is not connected to the hub (the ones an older hub disconnected and
+    left with the hub's tools). A later "Enable hub crews in this CLI" click is
+    the owner's own choice and is never undone. Returns the CLI ids cleaned."""
+    try:
+        if config.get_setting(_HUB_TRACE_SWEEP_SETTING):
+            return []
+    except Exception:                                            # noqa: BLE001
+        return []
+    cleaned = []
+    for cid in mcp_manager.supported_clis():
+        entry = _get_cli_entry(cid)
+        if not entry:
+            continue
+        try:
+            if _cli_row(entry).get("connected"):
+                continue
+        except Exception:                                        # noqa: BLE001
+            continue
+        if _hub_mcp_remove(cid):
+            cleaned.append(cid)
+    try:
+        config.set_setting(_HUB_TRACE_SWEEP_SETTING, True)
+    except Exception:                                            # noqa: BLE001
+        pass
+    if cleaned:
+        _log.info("[clis] removed the hub's tools from disconnected CLI(s): %s",
+                  ", ".join(cleaned))
+    return cleaned
 
 
 # ---- codex ----
@@ -31063,19 +31174,34 @@ def _codex_catalog_path(config_path=None):
     return os.path.join(os.path.dirname(config_path or _p_codex()), "model_catalog.json")
 
 
+# Hub entries an OLDER hub-era setup wrote by hand (MEASURED on the owner's
+# ~/.codex/model_catalog.json of 2026-07-27: "Auto - Free LLM Hub",
+# "DeepSeek V4 Pro (nvidia, via hub) - TEST ONLY", descriptions naming the
+# "Calvoun Free LLM Hub" / "free-hub") carry no "(Calvoun hub)" label, so a
+# disconnected codex kept showing them.
+_CODEX_HUB_ENTRY_RE = re.compile(r"calvoun|free[- ]?llm[- ]?hub|\bfree-hub\b|\bvia hub\b", re.I)
+
+
 def _codex_catalog_is_hubs(path):
-    """Did THIS hub write that catalog? Every hub entry is labelled
-    '... (Calvoun hub)' by _codex_catalog_label. An unreadable file is never
-    ours -- it is left exactly where it is."""
+    """Did THIS hub (or an older hub-era setup) write that catalog? Every hub
+    entry is labelled '... (Calvoun hub)' by _codex_catalog_label; older ones
+    name the hub in their display name or description. An unreadable file is
+    never ours -- it is left exactly where it is."""
     data, ok = _read_json_object(path)
     if not ok:
         return False
     models = data.get("models")
     if not isinstance(models, list):
         return False
-    return any(isinstance(m, dict)
-               and str(m.get("display_name") or "").endswith("(Calvoun hub)")
-               for m in models)
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        name = str(m.get("display_name") or "")
+        if name.endswith("(Calvoun hub)"):
+            return True
+        if _CODEX_HUB_ENTRY_RE.search(name + " " + str(m.get("description") or "")):
+            return True
+    return False
 
 
 def _codex_wired_to_hub(config_path=None):
@@ -33003,6 +33129,8 @@ def api_cli_autofix(cid):
         _mark_hub_mode_unmanaged()
         if entry.get("id") == "codex":
             _refresh_codex_catalog_soon()
+        if _hub_mcp_restore(entry["id"]):
+            result["mcp_restored"] = True
     return jsonify(result)
 
 
@@ -33085,9 +33213,15 @@ def api_cli_disconnect(cid):
         notes.append("%s's own /model catalog was restored." % entry.get("name", entry["id"]))
     if result.get("catalog"):
         out["catalog"] = result["catalog"]
-    # Deliberately KEPT (documented design): the hub's MCP server entry, i.e.
-    # the crew tools. It adds no model, effort or mode -- it is reported so the
-    # user knows it is there and where to remove it.
+    # The hub's MCP server entry (crews, publish, Multi tools) goes too (owner,
+    # 2026-10-20: a disconnected CLI shows nothing of the hub); Connect puts it
+    # back. Still reported as kept when the removal is off or failed.
+    mcp_removed = _hub_mcp_remove(entry["id"])
+    if mcp_removed:
+        out["mcp_removed"] = mcp_removed
+        out["changed"] = True
+        notes.append("The hub's tools (crews, Publish, Multi) were removed from %s too."
+                     % entry.get("name", entry["id"]))
     mcp_path = _hub_mcp_kept(entry["id"])
     if mcp_path:
         out["mcp_kept"] = _short(mcp_path)
@@ -49437,7 +49571,8 @@ if __name__ == "__main__":
         _log.warning("[boot] could not check for leftover tunnels: %s", _exc)
     _cfi_start()   # PUBLISH: cloudflared installs itself ~60 s from now (flag cloudflared_auto_install)
     # The CLIs the last Stop disconnected, wired again once the server answers.
-    threading.Thread(target=lambda: (time.sleep(15), _reconnect_clis_after_stop()),
+    threading.Thread(target=lambda: (time.sleep(15), _reconnect_clis_after_stop(),
+                                     _sweep_disconnected_cli_traces()),
                      daemon=True, name="stop-reconnect").start()
     _bootstrap_no_key_providers()  # no-key providers have nothing to configure -> on
     _init_quota_persistence()      # restore quota/dead-model state from the last run

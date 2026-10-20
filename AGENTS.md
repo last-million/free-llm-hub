@@ -426,8 +426,10 @@ above only suggests).
   settings.json defaults) and restores the pre-hub default from the
   Connect-time `.freehub-bak` (never from a hub-wired backup).
 - `_repair_opencode_config` is a no-op without a `free-llm-hub` provider block.
-- The hub MCP server entry (crews) is KEPT by design and reported as
-  `mcp_kept` in the disconnect response. Covered by
+- SUPERSEDED 2026-10-20 (see "A disconnected CLI shows nothing of the hub"
+  at the end of this file): the hub MCP server entry is now REMOVED on
+  disconnect too (`mcp_removed`); `mcp_kept` only reports it when the removal
+  is switched off or failed. Covered by
   `tests/test_cli_disconnect_leaves_no_trace.py`.
 
 ## Shared env vars are not a CLI's connection (2026-09-27)
@@ -5503,3 +5505,37 @@ quota check), and whatever the user asked about (a real reply about a sign-up
 page says what was built). Junk = cut at 0, the hop fails over, and the junk
 strike benches the pair like the budget notices. Real short answers about sign-up
 pages pass (tested).
+
+## A disconnected CLI shows nothing of the hub (2026-10-20)
+
+Owner: "when I disconnect a CLI from Free LLM Hub, nothing of the hub should
+appear -- not only codex, every CLI." Covered by
+`tests/test_disconnect_removes_hub_tools.py`. MEASURED on the owner's machine
+(read-only audit of every CLI config): claude, codex, openclaw and kimi were
+disconnected yet still registered the hub's MCP server (crews, Publish, Multi
+tools), and codex still listed "Auto - Free LLM Hub" + two "(..., via hub) -
+TEST ONLY" models from a catalog a July hub-era session wrote by hand.
+
+- **The hub's tools go on Disconnect** (`_hub_mcp_remove`, flag
+  `disconnect_removes_hub_mcp`, default on): every entry in the CLI's GLOBAL
+  MCP config whose url is THIS hub's `/mcp` (`_is_hub_mcp_url`: 127.0.0.1 /
+  localhost / [::1], the hub's port, path /mcp) is removed through
+  `mcp_manager.remove_server` (legacy kimi TOML included). The user's other
+  servers are never touched; the hub's isolated CLI copies (Build / Multi
+  sessions) keep theirs. Response `mcp_removed`, note "The hub's tools ...
+  were removed". Flag off = the old `mcp_kept` report.
+- **Connect puts them back** (`_hub_mcp_restore`): only for a CLI whose entry a
+  Disconnect removed (setting `hub_mcp_removed_clis`); response
+  `mcp_restored`. Stop's disconnect-all / boot reconnect go through the same
+  routes, so they round-trip.
+- **One boot sweep** (`_sweep_disconnected_cli_traces`, after the Stop
+  reconnect, setting `hub_trace_sweep_v1`): once per install, the hub's MCP
+  entry is removed from every MCP-capable CLI that is not connected. It never
+  runs again, so a later "Enable hub crews in this CLI" click is kept.
+- **Older hand-written codex catalogs count as the hub's**
+  (`_codex_catalog_is_hubs`): besides the "(Calvoun hub)" label, any entry whose
+  display name or description names "Calvoun", "Free LLM Hub", "free-hub" or
+  "via hub" (`_CODEX_HUB_ENTRY_RE`). So Disconnect, and the boot refresh of a
+  disconnected codex, delete that catalog and its `model_catalog_json` key and
+  codex shows its own live model list again. A catalog without those words is
+  still never touched.

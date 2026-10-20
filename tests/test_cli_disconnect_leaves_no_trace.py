@@ -488,7 +488,10 @@ def test_routes_report_disconnected_from_the_real_files(home, monkeypatch):
 
         r = c.post("/api/clis/opencode/disconnect", headers=headers).get_json()
         assert r["ok"] and r["connected"] is False
-        assert r["mcp_kept"] and "MCP" in r["note"]
+        # 2026-10-20: the hub's tools go too (test_disconnect_removes_hub_tools)
+        assert r["mcp_removed"] == ["free-llm-hub"] and "tools" in r["note"]
+        assert "mcp_kept" not in r
+        assert "free-llm-hub" not in (_rj(p).get("mcp") or {})
 
         rows = {r["id"]: r for r in c.get("/api/clis", headers=headers).get_json()}
         assert rows["codex"]["connected"] is False
