@@ -275,6 +275,17 @@ def cap(parsed, anchor_for):
         top = anchor_for(fam, "opus") if fam == "claude" else None
         has_opus = top is not None
         out = float(nscore) - tier_offset(fam, tier, has_opus) - gap(nver, ver)
+        if ref != tier:
+            # Measured against ANOTHER line (luna against the flagship, haiku
+            # against sonnet), an older release of this tier must still sit
+            # under the newer ones of its own tier even when that line's
+            # anchor is older than both (owner's fleet 2026-10-23: the only
+            # reachable GPT flagship was gpt-5.4, so gpt-6-luna and gpt-5.6-luna
+            # tied). Also hold it under its own line's newest, offset applied.
+            own = anchor_for(fam, tier)
+            if own is not None and tuple(ver) <= tuple(own[0]):
+                out = min(out, float(own[1]) - tier_offset(fam, tier, has_opus)
+                          - gap(own[0], ver))
         # SAME GENERATION, SAME ORDER (2026-10-23). Opus 5.5 and Sonnet 5.5 are
         # one release batch (Fable numbers its own line, so it is not clamped).
         # Measured on a mixed fleet: with claude-opus-6 listed and no sonnet-6,

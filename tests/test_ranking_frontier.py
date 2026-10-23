@@ -77,8 +77,14 @@ def seed(pid, model, ok, fail, rok=None, rfail=0, idle_hours=0.0):
     A._outcomes[(pid, model)] = rec
 
 
+def seed_tools(pid, model, ok=8, fail=0):
+    """A measured TOOL-turn record (in memory only, like the hub's)."""
+    A._tool_outcomes[(pid, model)] = {"ok": ok, "fail": fail, "last": time.time()}
+
+
 def seed_healthy(pid, model):
     seed(pid, model, 30, 1, rok=8, rfail=0)
+    seed_tools(pid, model)
 
 
 def chat(pid, model):
@@ -192,7 +198,13 @@ def test_the_owners_real_ledger_rows_decide_real_from_dummy():
     for dead in (DEAD_OPUS, DEAD_SOL61, DEAD_FABLE):
         assert not A._relay_proven(RELAY, dead), dead
         assert tool(RELAY, dead) < chat(RELAY, dead) - 5, "the measured failure also demotes it"
-    assert A._relay_proven(RELAY, LUNA6), "37 ok / 1 fail, 9 ok today: a real model"
+    # live check 2026-10-23: the luna ids ANSWER but never emit a native tool call,
+    # so chat health alone (37 ok / 1 fail) is not proof...
+    assert not A._relay_proven(RELAY, LUNA6)
+    seed_tools(RELAY, LUNA6, ok=0, fail=5)
+    assert not A._relay_proven(RELAY, LUNA6), "...and failing tool turns veto it"
+    seed_tools(RELAY, LUNA6)                     # only a measured tool-turn record proves it
+    assert A._relay_proven(RELAY, LUNA6), "37 ok / 1 fail, 8 tool turns ok: a real tool model"
     assert not A._relay_proven(RELAY, LUNA56), "good but idle 22 h: the fade makes it unproven again"
     # the real one pays no discount, but it is LUNA: the small tier stays under the flagships
     assert chat(RELAY, LUNA6) == pytest.approx(chat("openai", LUNA6))
@@ -286,6 +298,24 @@ def test_luna_is_the_small_gpt_tier_like_haiku(monkeypatch):
     assert sol > astra > luna > luna56
     assert astra - luna > 5.5 and sol - luna > 5.5
     assert R.parse("gpt-6-luna").tier == "luna" and R.parse("gpt-6-astra").tier == ""
+
+
+def test_lunas_keep_their_own_order_when_the_reachable_flagship_is_older(monkeypatch):
+    # The owner's fleet 2026-10-23: every GPT-6 flagship copy is a dead stub (not
+    # reachable), so the only flagship left is gpt-5.4. Both lunas are NEWER than
+    # that anchor; they used to tie at flagship - 6.
+    _fleet(monkeypatch, ["gpt-5.4", "gpt-6-luna", "gpt-5.6-luna"])
+    l6, l56, flagship = chat("x", "gpt-6-luna"), chat("x", "gpt-5.6-luna"), chat("x", "gpt-5.4")
+    assert l6 > l56, (l6, l56)
+    assert flagship - l6 >= R.GPT_LUNA_UNDER_FLAGSHIP - 1e-9 - 0.01
+    # ...and a proven luna keeps that order with no relay discount
+    assert chat("x", "gpt-6-luna") <= A._PREF_FLOORS[5] - R.GPT_LUNA_UNDER_FLAGSHIP
+
+
+def test_borrowed_figures_are_labelled_in_the_tracking_view():
+    view = A._ev_agentic_evidence_view("gemini-4-argon")
+    assert view["tb4"] == 20 and view["inherited_fields"] == {"tb4": "gemini-3.8-flash"}
+    assert "inherited_fields" not in A._ev_agentic_evidence_view("claude-opus-5.5")
 
 
 def test_a_small_release_never_anchors_the_flagship_line(monkeypatch):

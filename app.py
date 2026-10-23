@@ -1875,8 +1875,12 @@ def _relay_proven(pid, model):
         ok = float(rec.get("ok") or 0) * 0.5 ** (max(0.0, now - last) / _OUTCOME_IDLE_HALF_LIFE)
         if ok < _RP_MIN_OK or _reliability(pid, model) < _RP_MIN_RATE:
             return False
+        # A relay copy that merely ANSWERS is not a tool-capable model: live
+        # check 2026-10-23, the luna ids answer chat but never emit a native
+        # tool call. So proof needs a MEASURED tool-turn record (>= _TOOL_MIN_
+        # SAMPLES tool turns, rate >= _RP_MIN_TOOL_RATE), not just chat health.
         tool = _tool_turn_reliability(pid, model)
-        if tool is not None and tool < _RP_MIN_TOOL_RATE:
+        if tool is None or tool < _RP_MIN_TOOL_RATE:
             return False
         if (_tool_turn_sick(pid, model) or _empty_resting(pid, model)
                 or _is_pair_benched(pid, model) or _answer_quality_penalty(pid, model) > 0
@@ -2682,6 +2686,9 @@ def _ev_agentic_evidence_view(model_id):
                "source": ev.get("source"), "date": ev.get("date")}
         if ev.get("inherited_from"):
             out["inherited_from"] = ev["inherited_from"]
+        if ev.get("inherited_fields"):
+            # a figure BORROWED from an older listed row, not read from a page
+            out["inherited_fields"] = ev["inherited_fields"]
         return out
     except Exception:                                            # noqa: BLE001
         return None

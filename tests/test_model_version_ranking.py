@@ -239,8 +239,9 @@ def test_gpt_orders_by_version_and_keeps_codenames_as_they_were(monkeypatch):
     # Luna is the small tier (AA v4.3.2 Luna 38 vs Astra 53 / Sol-6.1 52; Arena
     # 1441 vs 1475 / 1479), GPT_LUNA_UNDER_FLAGSHIP under the flagship line,
     # while Astra and Sol (one line) still tie within a version.
-    # luna 6.0 is measured against the newest flagship (6.1): 6.0 + the 0.1 gap
-    assert sol61 - luna6 == pytest.approx(R.GPT_LUNA_UNDER_FLAGSHIP + R.gap((6, 1), (6, 0)))
+    # luna 6.0 sits 6.0 under its own release's ladder rung (137.0), i.e. just
+    # over 6 under the 6.1 flagship (137.2)
+    assert R.GPT_LUNA_UNDER_FLAGSHIP <= sol61 - luna6 <= R.GPT_LUNA_UNDER_FLAGSHIP + 0.3
     assert 5.5 < astra6 - luna6 < 6.5        # ~6 under the flagship Astra of its own release
     assert 0 < sol61 - astra6 < 0.5          # one minor release: inside the band
     _fleet(monkeypatch, [])
