@@ -45,7 +45,11 @@ PARSE_CASES = [
     ("KiloCode:stealth/claude-opus-4.8", "claude", "opus", (4, 8)),
     ("claude-2.1", "claude", "", (2, 1)),
     ("claude-instant-1.2", "claude", "instant", (1, 2)),
-    ("gpt-5.6-luna", "gpt", "", (5, 6)),
+    ("gpt-5.6-luna", "gpt", "luna", (5, 6)),         # luna = the small GPT tier (2026-10-23)
+    ("srv_x:openai/gpt-6-luna", "gpt", "luna", (6, 0)),
+    ("openai/gpt-5.6-terra", "gpt", "terra", (5, 6)),
+    ("gpt-6.2-vega", "gpt", "", (6, 2)),             # an unknown codename gets no tier
+    ("gpt-6-lunar", "gpt", "", (6, 0)),              # whole tokens only
     ("srv_x:openai/gpt-6.1-sol", "gpt", "", (6, 1)),
     ("gpt-6-astra", "gpt", "", (6, 0)),
     ("gpt-5-mini", "gpt", "mini", (5, 0)),
@@ -228,15 +232,21 @@ def test_legacy_claude_is_not_in_the_top_band_any_more(ranked):
 def test_gpt_orders_by_version_and_keeps_codenames_as_they_were(monkeypatch):
     _fleet(monkeypatch, FLEET)
     sol61, astra6, luna6, luna56, g55, g4o = [score(m, RELAY) for m in GPT]
-    assert sol61 > astra6 > luna56
-    assert sol61 > luna6 > luna56
+    assert sol61 > astra6 > luna6 > luna56
     assert astra6 - luna56 >= 2.5 and sol61 - luna56 >= 2.5
     assert sol61 > g55 > g4o
-    # the codenames of one version keep exactly the score they had with no
-    # ranking at all (no evidence to split them)
+    # SUPERSEDES the 2026-10-08 "codenames keep exactly the score they had":
+    # Luna is the small tier (AA v4.3.2 Luna 38 vs Astra 53 / Sol-6.1 52; Arena
+    # 1441 vs 1475 / 1479), GPT_LUNA_UNDER_FLAGSHIP under the flagship line,
+    # while Astra and Sol (one line) still tie within a version.
+    # luna 6.0 is measured against the newest flagship (6.1): 6.0 + the 0.1 gap
+    assert sol61 - luna6 == pytest.approx(R.GPT_LUNA_UNDER_FLAGSHIP + R.gap((6, 1), (6, 0)))
+    assert 5.5 < astra6 - luna6 < 6.5        # ~6 under the flagship Astra of its own release
+    assert 0 < sol61 - astra6 < 0.5          # one minor release: inside the band
     _fleet(monkeypatch, [])
     plain = {m: score(m, RELAY) for m in GPT}
-    assert plain[GPT[1]] == plain[GPT[2]] == astra6 == luna6
+    # no fleet reachable -> no adjustment at all (the ladder as it was)
+    assert plain[GPT[1]] == plain[GPT[2]] == astra6
     assert plain[GPT[0]] == sol61
 
 
@@ -304,8 +314,11 @@ def test_a_newly_listed_claude_6_leads_automatically(monkeypatch):
     _fleet(monkeypatch, FLEET + ["claude-opus-6"])
     assert score("claude-opus-6") == pytest.approx(A._PREF_FLOORS[5])
     assert score("claude-opus-6") - score(CLAUDE[0]) >= 2.5
-    # Sonnet has no 6 yet, so Sonnet 5.5 is still the newest Sonnet
-    assert score(CLAUDE[1]) == pytest.approx(A._PREF_FLOORS[5] - R.OPUS_OVER_SONNET)
+    # Sonnet has no 6 yet, so Sonnet 5.5 is still the newest Sonnet -- but it
+    # is held under Opus 5.5 of its OWN generation (2026-10-23: same generation,
+    # same order). Before, it kept 137.4 while Opus 5.5 fell to 135.3.
+    assert score(CLAUDE[1]) < score(CLAUDE[0])
+    assert score(CLAUDE[1]) == pytest.approx(score(CLAUDE[0]) - R.OPUS_OVER_SONNET)
     _fleet(monkeypatch, FLEET + ["claude-opus-6", "claude-sonnet-6"])
     assert score("claude-sonnet-6") == pytest.approx(A._PREF_FLOORS[5] - R.OPUS_OVER_SONNET)
     assert score("claude-sonnet-6") - score(CLAUDE[1]) >= 2.5, "5.5 is the fallback now"
