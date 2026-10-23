@@ -5547,3 +5547,39 @@ TEST ONLY" models from a catalog a July hub-era session wrote by hand.
   `hub_trace_sweep_v2` so it runs once more on installs where v1 was undone.
   `tests/test_mcp_bootstrap.py` reads every CLI as connected (it tests the file
   formats).
+
+## Relay tool dead ends, and pairs that never chain (2026-10-23)
+
+Covered by `tests/test_relay_tool_deadend.py`, `tests/test_never_chains.py` and
+`tests/test_memory_survives_model_switch.py`. Report: opencode `coding-swarm`
+session ses_e9602c99 stopped after every step (a "go" per step, 18:54-19:26) and
+blamed tool results not reaching the model.
+
+- **Delivery was fine.** MEASURED against the live hub: the report's four
+  acceptance cases (echo token, 10 KB, quotes + unicode, two calls) and five
+  history shapes (result last / then text / system first / newline assistant /
+  result final) all returned the tool output to the model. opencode's DB holds
+  no tool part after the last good write, i.e. the hub never returned a call.
+- **Cause: a pair that cannot chain.** g4f's poe-GLM backends were served on 39
+  tool turns in 14 days (turn-roles.jsonl) and made a tool call on none (100%
+  text; every other pair with >= 8 turns 0-9%, glm/glm-4.5-flash 42%). Probe:
+  0 calls in 6/6 runs against 6/6 correct calls from glm/glm-4.5-flash. The
+  relay also answered "The model returned an invalid or undeclared tool request;
+  no tool was executed." as the content -- clean prose, so it was served and the
+  CLI's loop ended. That sentence is written upstream, not in this repo.
+- **`answer_check` `tool_deadend`**: on a RELAY hop of a TOOL turn, a short reply
+  (<= 400 chars, a leading `<think>` ignored) that is that "invalid / undeclared
+  tool request" sentence fails the hop (junk, no salvage), so the walk goes on
+  and the pair rests. Not on direct providers, tool-free turns, or when the
+  user's own prompt quotes it. `reads_as_answer` never releases it early.
+- **`_never_chains`** (flag `tool_chain_watch`, default on):
+  `_note_continuation_outcome` (roles path, after a served actor) counts
+  text-only serves of a CONTINUATION (`_turn_used_tools`); `_NEVER_CHAIN_MIN` (8)
+  in a row marks the pair for `_NEVER_CHAIN_TTL` (6 h); one tool call clears it.
+  `_tool_turn_sick` includes it, so the pair goes behind the pairs that call
+  (primary pick, chain sick group, quality fallback) -- never out of the chain.
+  Plain non-roles tiers read the mark but do not feed it.
+- **Memory across a model/effort switch** is keyed by `ctxwin.conversation_key`
+  (session id, else a content hash), never by the model; the test pins 14
+  model/effort spellings.
+- Left alone: the poe replies carry raw `<think>` text in the content.

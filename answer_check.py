@@ -1032,6 +1032,46 @@ def is_provider_notice(text, prompt_text=None):
         return False
 
 
+# MEASURED 2026-10-23 (opencode `coding-swarm`, session ses_e9602c99, 18:54-19:26):
+# g4f's poe backend (GLM-5.3-Flash-T) typed its tool call as text, the gateway
+# could not parse it and answered HTTP 200 with its OWN sentence as the content:
+# "The model returned an invalid or undeclared tool request; no tool was
+# executed." Nothing in it is an answer, but it reads as clean prose, so the hub
+# served it, the CLI saw no tool_calls and the turn ended -- once per "go" for
+# half an hour. On a live probe that pair gave 0 tool calls in 6/6 runs where a
+# native-tool model gave the right call 6/6. Relay hops on a TOOL turn only (a
+# direct provider reports a bad call as an HTTP error), and a short reply only:
+# an explanation that quotes the sentence is an answer.
+_DEADEND_MAX_CHARS = 400
+_TOOL_DEADEND_RE = re.compile(
+    r"\b(?:the )?model (?:returned|produced|emitted|sent) an? "
+    r"(?:invalid|undeclared|malformed|unknown|unsupported)"
+    r"(?: or (?:invalid|undeclared|malformed|unknown|unsupported))? "
+    r"(?:tool|function)[ -](?:request|call)s?\b", re.I)
+
+
+def _tool_deadend(masked, prompt_text):
+    """0 when the whole reply is a relay's "invalid tool request" dead end, else
+    None. A leading <think> block is ignored; the check is skipped when the
+    user's own prompt quotes the sentence (they are asking ABOUT it)."""
+    head = _THINK_BLOCK_RE.sub("", masked or "").strip()
+    if not head or len(head) > _DEADEND_MAX_CHARS:
+        return None
+    if not _TOOL_DEADEND_RE.search(head):
+        return None
+    if prompt_text and _TOOL_DEADEND_RE.search(str(prompt_text)):
+        return None
+    return 0
+
+
+def is_tool_deadend(text, prompt_text=None):
+    """Public form of the dead-end check (see _tool_deadend). Never raises."""
+    try:
+        return isinstance(text, str) and _tool_deadend(_mask_code(text), prompt_text) == 0
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _meta_leak(masked, text, prompt_text, at_start=True):
     """Offset of leaked metadata/template junk in `text` (indices shared with
     `masked`), or None. `at_start`: `text` is the reply's head, so the
@@ -1279,6 +1319,8 @@ def reads_as_answer(text, *, last_prompt=None, relay=False):
             return False
         if relay and is_provider_notice(text, last_prompt):
             return False
+        if relay and is_tool_deadend(text, last_prompt):
+            return False
         words = text.split()
         if len(words) < _EARLY_MIN_WORDS:
             return False
@@ -1347,6 +1389,10 @@ def inspect(text, *, prompt_text=None, tools_offered=False, finish_reason=None,
             # API quota must never be taken for a notice.
             ("provider_notice", lambda: (None if offset or not relay else
                                          _provider_notice(masked, last_prompt))),
+            # Same hops, TOOL turns only: the relay's own "invalid tool request"
+            # sentence is a failed hop, never the reply that ends the loop.
+            ("tool_deadend", lambda: (None if offset or not (relay and tools_offered)
+                                      else _tool_deadend(masked, last_prompt))),
         )
         for reason, fn in checks:
             cut = fn()

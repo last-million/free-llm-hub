@@ -10236,10 +10236,64 @@ def _tool_turn_reliability(pid, model):
         return None
 
 
+# A pair that never CHAINS (2026-10-23). MEASURED over 14 days of turn-roles.jsonl
+# (546 served tool turns): three g4f poe-GLM backends were served on 39 tool turns
+# and made a tool call on NONE of them, every other pair with >= 8 turns sat at
+# 0-9% text. Clean text is a valid ending, so the delivery ledger above filed each
+# one as a success, the roles layer kept electing them, and the CLI's loop stopped
+# after every step (a "go" per step, opencode session ses_e9602c99). Only a
+# CONTINUATION (tools already ran this turn) can show it, and only a long unbroken
+# run of text-only serves marks the pair; one tool call clears it. The mark
+# expires, so a repaired relay is tried again. Flag `tool_chain_watch` (default on).
+_NEVER_CHAIN_MIN = 8                 # text-only continuations in a row
+_NEVER_CHAIN_TTL = 6 * 3600.0        # seconds the mark is remembered
+_chain_seen = {}                     # (pid, model) -> {"text": n, "last": ts}
+
+
+def _note_continuation_outcome(pid, model, messages, msg):
+    """File one SERVED tool-turn reply: did the pair chain (tool_calls) or answer
+    in text? Counted only on a continuation. Never raises."""
+    try:
+        if not (pid and model) or not isinstance(msg, dict):
+            return
+        if not config.get_flag("tool_chain_watch", True):
+            return
+        if not isinstance(messages, list) or not _turn_used_tools(messages):
+            return
+        now = time.time()
+        with _outcome_lock:
+            if msg.get("tool_calls"):
+                _chain_seen.pop((pid, model), None)       # it can chain: forgiven
+                return
+            if not str(msg.get("content") or "").strip():
+                return
+            rec = _chain_seen.get((pid, model))
+            if not rec or now - rec.get("last", 0) > _NEVER_CHAIN_TTL:
+                rec = {"text": 0, "last": now}
+            rec["text"] += 1
+            rec["last"] = now
+            _chain_seen[(pid, model)] = rec
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _never_chains(pid, model):
+    """True while the pair's last _NEVER_CHAIN_MIN continuations were all text."""
+    try:
+        with _outcome_lock:
+            rec = _chain_seen.get((pid, model))
+        return bool(rec and rec["text"] >= _NEVER_CHAIN_MIN
+                    and time.time() - rec.get("last", 0) <= _NEVER_CHAIN_TTL
+                    and config.get_flag("tool_chain_watch", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _tool_turn_sick(pid, model):
     """Measured on tool turns to mostly not deliver, or resting after failing
-    the same way again and again (see _note_pair_failure)."""
-    if _pair_resting(pid, model):
+    the same way again and again (see _note_pair_failure), or never chaining a
+    tool call mid-loop (see _never_chains)."""
+    if _pair_resting(pid, model) or _never_chains(pid, model):
         return True
     r = _tool_turn_reliability(pid, model)
     return r is not None and r < _TOOL_SICK_RATE
@@ -42415,6 +42469,7 @@ def _tool_turn_roles_run(body, messages, tools, stream, est, real, kind, rec, st
     if _client_gone():
         return None
     _bandit_remember(msg.get("tool_calls"), spid, smodel, kind)
+    _note_continuation_outcome(spid, smodel, messages, msg)
     rec["served"] = "%s/%s" % (spid, smodel)
     rec["outcome"] = "tool call" if msg.get("tool_calls") else "text"
     _log.info("[roles] %s/%s served after %d actor hop(s), %d call(s)%s%s%s", spid, smodel,
