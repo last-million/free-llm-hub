@@ -24,8 +24,10 @@ routing heuristics.
 
 ## Last-resort families & routing transparency
 
-- `_LOW_QUALITY_RE` (nemotron ANY variant, gpt-oss, gemma) is a chain-ORDERING
-  rule, not a score: AA scores (`_aa_score_for`) override the Tier-C demotion
+- `_LOW_QUALITY_RE` (nemotron ANY variant, gpt-oss, gemma -- SUPERSEDED
+  2026-10-23 for nemotron: the 3.5+ generation is exempt, see "Nemotron 3.5 and
+  later are normal models" next to "Default blocklist, owner's 2026-10-19
+  additions") is a chain-ORDERING rule, not a score: AA scores (`_aa_score_for`) override the Tier-C demotion
   and `_TOOL_PROVEN` still names nemotron/gpt-oss, so scores alone always
   landed the chain on them. `_build_chain` and `_route_by_difficulty`
   partition them to the TAIL — after every other alive candidate (and after
@@ -5399,6 +5401,72 @@ step-5-preview, xing4.0-29b-a4b, zamba2-7b-instruct). `_seed_default_blocks`
 delivers them once to every install on its next boot; an untick is respected.
 The owner's extra provider/model pairs were NOT shipped: each belongs to a
 family already blocked, and the g4f `srv_*` ids are install-specific.
+
+## Nemotron 3.5 and later are normal models (2026-10-23)
+
+Owner: "check the new blacklist is updated as default ... and allow the latest
+nemotron 3.5". Covered by `tests/test_nemotron_generation.py`,
+`tests/test_default_blocklist.py`, `tests/test_last_resort_routing.py`. The
+blocked / last-resort-tail question only; WHERE a 3.5 model scores is the
+ranking section's job.
+
+- **Seen in the catalogs** (hub `/v1/models` + `aa_scores.json`, 2026-10-23):
+  nvidia `nemotron-3.5-super-vl-120b-a12b` (AA 76.1, above 3 Ultra's 72.4),
+  `-lightning-30b-a3b` (62.2), `-bolt-e4b` (4B edge), `-content-safety`; the same
+  on openrouter / kilocode (`nemotron-3.5-super-vl:free`, `-lightning:free`) and
+  through g4f. Nothing newer exists yet.
+- **`nemotron_gen.py`** (pure, stdlib, never raises, no import from app). ONE
+  constant, `ALLOWED_FROM = (3, 5)`, compared as an (major, minor) int tuple
+  against the version in the id. `generation(id)` / `is_current_chat(id)` /
+  `is_non_chat(id)`. Reads `nemotron-<ver>[-tier...]` (3.5, v3.5, 3-5, 3_5, any
+  relay prefix, `:free`) and the old order `nemotron-<tier>-<ver>`; a relay
+  prefix is never read (only what follows the word "nemotron"). DEFAULT DENY:
+  anything it cannot read as a version >= the cut keeps the old behaviour.
+  - **Not current**: Nemotron 3 nano/super/ultra (3.0); the 2024 **Nemotron-4
+    340B** (the number 4 is NOT newer than 3.5 -- NVIDIA restarted numbering;
+    a size straight after the version, `_LEGACY_RE`, mini/minitron); the
+    `llama-3.x-nemotron-*` / `mistral-nemotron` fine-tunes and `-v1.5` / `-v2`
+    ids (no leading version); utility variants (`NON_CHAT_WORDS`: safety, parse,
+    reward, embed, rerank ...) at ANY generation.
+  - **Current**: 3.5, 3.6, 3.10, 4 / 4.0 / 5 written `nemotron-4-ultra`,
+    `nemotron-4.0-nano` ... -- a future generation passes with no code change.
+    Limit: a future `nemotron-<ver>-<size>` with a size right after the version
+    reads as the legacy 340B shape and stays denied.
+- **`_is_low_quality`** (the only consumer of `_LOW_QUALITY_RE`): False for a
+  current chat Nemotron unless the id also names gpt-oss / gemma (never
+  exempted). Everything that partitions to the tail goes through it.
+- **`_is_tool_proven`**: `_TOOL_PROVEN` names "nemotron" from the Nemotron 3
+  builds (2026-07-25). With the tail gone, that substring put a current
+  Nemotron at hop 2 of a tool chain at score 10 (measured with a chain probe),
+  so a current Nemotron no longer counts as tool-proven; it competes on score /
+  board evidence (`_may_lead_agentic`) like any model and joins the list after
+  a real multi-file build.
+- **Shipped list diff**: removed `nemotron-3.5-lightning-30b`,
+  `nemotron-3.5-lightning-30b-a3b`; added `nemotron-3-super-120b-a12b` (the
+  shipped bare `nemotron-3-super` is an exact identity and did not cover the
+  host spelling) and `codellama-70b` (both from the owner's live blocklist,
+  generic identities). `nemotron-3.5-content-safety` stays shipped (classifier).
+  Not shipped from the owner's list: `nemotron-3.5-lightning` and
+  `nemotron-3.5-super-vl-120b-a12b` (contradict this decision; hand-ticked, so
+  they stay on that machine until unticked). A guard test fails if a shipped
+  identity is ever a current chat Nemotron. Live check: the owner's 59 seeded ids
+  equal the 59 shipped before this change (nothing unblocked by the owner).
+- **One-time take-back for existing installs** (`_retire_default_blocks`, called
+  first in `_seed_default_blocks`, above its early return; consistent with
+  "Automatic migrations": idempotent, no keys, recorded). `_RETIRED_DEFAULT_BLOCKS`
+  = the two removed ids. Per retired id not yet in setting
+  `default_blocks_retired_done`: remove it from `blocked_identities` ONLY if it is
+  also in `default_blocks_seeded_ids` (what the hub offered), then mark it done
+  either way (a later re-tick is never undone; an untick is never re-added). It
+  writes only those two settings, never `providers`. Kept in app.py, not
+  `migrations.py`: a plain list setting, and a `schema_version` bump would
+  collide with other work. Limit: the snapshot records what was OFFERED, so a user
+  who hand-ticked a retired id before the hub ever offered it, or re-ticked it
+  before the step first ran, loses that tick once.
+- **Left to others**: `-vl-` is in `NOT_TOOL_CAPABLE`, so `nemotron-3.5-super-vl-
+  120b-a12b` never serves a tool turn (the `:free` spelling without a trailing
+  dash does); `nemotron-3.5-bolt-e4b` (4B) leaves the tail and is ordered by
+  score; Tier C in `_BENCH_FAMILY` still lists "nemotron" for ids without an AA row.
 
 ## Projects that live in WSL, any agent, any distro (2026-10-19)
 
