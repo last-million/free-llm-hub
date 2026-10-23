@@ -10250,22 +10250,22 @@ _NEVER_CHAIN_TTL = 6 * 3600.0        # seconds the mark is remembered
 _chain_seen = {}                     # (pid, model) -> {"text": n, "last": ts}
 
 
-def _note_continuation_outcome(pid, model, messages, msg):
-    """File one SERVED tool-turn reply: did the pair chain (tool_calls) or answer
-    in text? Counted only on a continuation. Never raises."""
+def _file_chain_reply(pid, model, continuation, called, text):
+    """The one place the ledger is written. `called`: the served reply carried a
+    tool call -- on ANY tool turn that proves the pair can call and clears the
+    mark (a healthy pair doing simple "call a tool, then answer" tasks only ever
+    shows text on its continuations). Text counts only on a CONTINUATION (tools
+    already ran this turn); on an opening turn it may just be a question.
+    Never raises."""
     try:
-        if not (pid and model) or not isinstance(msg, dict):
-            return
-        if not config.get_flag("tool_chain_watch", True):
-            return
-        if not isinstance(messages, list) or not _turn_used_tools(messages):
+        if not (pid and model) or not config.get_flag("tool_chain_watch", True):
             return
         now = time.time()
         with _outcome_lock:
-            if msg.get("tool_calls"):
-                _chain_seen.pop((pid, model), None)       # it can chain: forgiven
+            if called:
+                _chain_seen.pop((pid, model), None)           # it can chain: forgiven
                 return
-            if not str(msg.get("content") or "").strip():
+            if not continuation or not str(text or "").strip():
                 return
             rec = _chain_seen.get((pid, model))
             if not rec or now - rec.get("last", 0) > _NEVER_CHAIN_TTL:
@@ -10273,6 +10273,51 @@ def _note_continuation_outcome(pid, model, messages, msg):
             rec["text"] += 1
             rec["last"] = now
             _chain_seen[(pid, model)] = rec
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _note_continuation_outcome(pid, model, messages, msg):
+    """File one SERVED tool-turn reply when the request's messages are at hand
+    (the roles path). Never raises."""
+    try:
+        if not isinstance(msg, dict) or not isinstance(messages, list):
+            return
+        _file_chain_reply(pid, model, _turn_used_tools(messages),
+                          bool(msg.get("tool_calls")), msg.get("content"))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _mark_continuation(messages):
+    """Remember, for THIS request, whether tools already ran this turn. Set once
+    where the single-model chain clock is made (chat, responses and messages
+    handlers), so the stream and non-stream funnels below need no messages."""
+    try:
+        g.hub_continuation = bool(_turn_used_tools(messages))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _note_request_reply(pid, model, *, called, text):
+    """File one reply served by a SINGLE-MODEL chain (every protocol, stream and
+    non-stream) on a tool turn. Never raises; nothing when the client left or
+    this computer's network failed (not the pair's behaviour)."""
+    try:
+        if not _in_tool_turn() or _client_gone() or _local_net_failed(pid, model):
+            return
+        _file_chain_reply(pid, model, bool(getattr(g, "hub_continuation", False)),
+                          bool(called), text)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def _note_request_data(pid, model, data):
+    """_note_request_reply for a non-stream chat-completions body. Never raises."""
+    try:
+        msg = ((data.get("choices") or [{}])[0].get("message") or {})
+        _note_request_reply(pid, model, called=bool(msg.get("tool_calls")),
+                            text=msg.get("content"))
     except Exception:                                            # noqa: BLE001
         pass
 
@@ -37253,6 +37298,8 @@ def _record_stream_outcome(pid, model, text, *, tool_calls=False,
             strikes = _answer_quality_strikes(v.get("reasons")) if ok else []
         # A stream that failed the gate degenerated: a junk strike, not a miss.
         _record_outcome(pid, model, ok, junk=not ok)
+        if ok:
+            _note_request_reply(pid, model, called=tool_calls, text=text)   # never-chains ledger
         if strikes:
             # Delivered uncut (it may be a real value) -- see _note_quality_strike.
             _note_quality_strike(pid, model, strikes[0])
@@ -45196,6 +45243,7 @@ def _chat_completions_uncached(body):
     _clock = _ChainClock(trivial=_is_trivial_turn(
         body.get("messages"), body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)),
         tools=has_tools, est=est, stream=stream, pinned=bool(_pin_kw))
+    _mark_continuation(body.get("messages"))                     # never-chains ledger
     _plan_quality_fallback(_clock, body.get("model"), has_images, bool(_pin_kw),
                            body.get("messages"), body.get("max_tokens"))
     # Context bookkeeping for this request (original size, conversation id).
@@ -45453,6 +45501,7 @@ def _chat_completions_uncached(body):
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
+            _note_request_data(hop_pid, hop_model, data)         # never-chains ledger
             # The CLIENT sees the size of the request it sent, not of the
             # compacted one (usage_history above keeps the real upstream count).
             _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
@@ -46327,6 +46376,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
     _clock = _ChainClock(trivial=_is_trivial_turn(
         messages, body.get("max_output_tokens"), diff, est, pinned=bool(_pin_kw)),
         tools=has_tools, est=est, stream=stream, pinned=bool(_pin_kw))
+    _mark_continuation(messages)                                 # never-chains ledger
     _plan_quality_fallback(_clock, body.get("model"), has_images, bool(_pin_kw),
                            messages, body.get("max_output_tokens"))
     _chain = _build_chain(pid, resolved, est, require_vision=has_images,
@@ -46565,6 +46615,7 @@ def v1_responses(_retry_pass=False, _hedged=False):
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
+            _note_request_data(hop_pid, hop_model, data)         # never-chains ledger
             _ctx_fix_chat_usage(data, est, hop_pid, hop_model)
             _fit_visible_to_caller(data, payload)
             _rv = _max_text_review(body.get("model"), diff, has_tools, messages,
@@ -47406,6 +47457,7 @@ def v1_messages():
     _clock = _ChainClock(trivial=_is_trivial_turn(
         oai_messages, body.get("max_tokens"), diff, est, pinned=bool(_pin_kw)),
         tools=has_tools, est=est, stream=stream, pinned=bool(_pin_kw))
+    _mark_continuation(oai_messages)                             # never-chains ledger
     _plan_quality_fallback(_clock, body.get("model"), has_images, bool(_pin_kw),
                            oai_messages, body.get("max_tokens"))
     _chain = _build_chain(pid, resolved, est, require_vision=has_images,
@@ -47576,6 +47628,7 @@ def v1_messages():
                 resp.close()
                 continue
             _record_chat_usage(hop_pid, hop_model, data, est, ok=gate == "ok")
+            _note_request_data(hop_pid, hop_model, data)         # never-chains ledger
             _ctx_fix_chat_usage(data, input_est, hop_pid, hop_model)
             _fit_visible_to_caller(data, payload)
             _rv = _max_text_review(body.get("model"), diff, has_tools, oai_messages,

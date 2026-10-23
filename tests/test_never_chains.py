@@ -76,6 +76,15 @@ def test_opening_turns_do_not_count():
     assert not A._never_chains(*PAIR)
 
 
+def test_a_call_on_an_opening_turn_also_clears_it():
+    # A healthy pair doing "call a tool, then answer" tasks shows text on every
+    # continuation; its opening-turn calls are what prove it can call.
+    _text_serves(A._NEVER_CHAIN_MIN + 2)
+    assert A._never_chains(*PAIR)
+    A._note_continuation_outcome(*PAIR, OPENING, CALL)
+    assert not A._never_chains(*PAIR)
+
+
 def test_a_pair_that_calls_is_untouched():
     for _ in range(20):
         A._note_continuation_outcome(*OTHER, MID_LOOP, CALL)

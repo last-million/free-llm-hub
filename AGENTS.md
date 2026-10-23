@@ -5572,13 +5572,24 @@ blamed tool results not reaching the model.
   tool request" sentence fails the hop (junk, no salvage), so the walk goes on
   and the pair rests. Not on direct providers, tool-free turns, or when the
   user's own prompt quotes it. `reads_as_answer` never releases it early.
-- **`_never_chains`** (flag `tool_chain_watch`, default on):
-  `_note_continuation_outcome` (roles path, after a served actor) counts
-  text-only serves of a CONTINUATION (`_turn_used_tools`); `_NEVER_CHAIN_MIN` (8)
-  in a row marks the pair for `_NEVER_CHAIN_TTL` (6 h); one tool call clears it.
-  `_tool_turn_sick` includes it, so the pair goes behind the pairs that call
-  (primary pick, chain sick group, quality fallback) -- never out of the chain.
-  Plain non-roles tiers read the mark but do not feed it.
+- **`_never_chains`** (flag `tool_chain_watch`, default on): `_file_chain_reply`
+  is the one writer. Text-only serves of a CONTINUATION (`_turn_used_tools`)
+  count; `_NEVER_CHAIN_MIN` (8) in a row mark the pair for `_NEVER_CHAIN_TTL`
+  (6 h); a tool call on ANY tool turn, an opening turn included, clears it (a
+  healthy pair doing "call a tool, then answer" tasks only ever shows text on its
+  continuations); text on an opening turn never counts. `_tool_turn_sick`
+  includes it, so the pair goes behind the pairs that call (primary pick, chain
+  sick group, quality fallback) -- never out of the chain.
+- **Every way in feeds it**: the roles path (`_note_continuation_outcome`, after
+  a served actor) and the single-model tiers on all three protocols (chat =
+  opencode/qwen/kimi/..., responses = codex, messages = Claude Code), stream and
+  non-stream. Each handler marks `g.hub_continuation` where it builds its
+  `_ChainClock` (`_mark_continuation`); `_record_stream_outcome` (every stream
+  end) and `_note_request_data` (the three non-stream serving sites) call
+  `_note_request_reply`. Nothing is filed for a stream that failed the answer
+  gate, a client that left, or a local network failure. Covered end to end by
+  `tests/test_never_chains_all_protocols.py` (six paths x four facts, with a
+  negative control that fails when the feed is disabled).
 - **Memory across a model/effort switch** is keyed by `ctxwin.conversation_key`
   (session id, else a content hash), never by the model; the test pins 14
   model/effort spellings.
