@@ -46,6 +46,18 @@ _MINOR_HALF = 4.0
 OPUS_OVER_SONNET = 0.6
 FABLE_UNDER_OPUS = 0.3
 HAIKU_UNDER_SONNET = 6.0
+# GPT codename tiers (2026-10-23). Luna is the SMALL model of every GPT release,
+# the way Haiku is Claude's: Artificial Analysis v4.3.2 (read 2026-10-23) GPT-6
+# Luna 38 against GPT-6 Astra 53 and GPT-6.1 Sol 52 (14-15 points, the same
+# distance as Haiku 5.5 43 under Sonnet 5.5 56), LMArena gpt-6-luna 1441 against
+# gpt-6-astra 1475 / gpt-6-1-sol 1479 -- so it sits GPT_LUNA_UNDER_FLAGSHIP under
+# the flagship line, and a luna release never anchors that line. Terra is the
+# middle cut (the owner's puter floors already put it one point under Sol; AA
+# GPT-5.6 Sol 47.1 / Terra 42.1). Sol and Astra are flagship cuts of the SAME
+# line and tie at one version (no board splits them within a generation beyond
+# the release number: Astra AA 53 / Arena 1475 vs Sol-6.1 52 / 1479).
+GPT_LUNA_UNDER_FLAGSHIP = 6.0
+GPT_TERRA_UNDER_FLAGSHIP = 1.0
 # Only models in the strong band are ordered by version (and only a strong
 # newest release is an anchor): a 0.5B "qwen4" must not drag qwen3.8 down.
 STRONG = 120.0
@@ -94,9 +106,17 @@ def _minor(text):
 def _tier(family, low):
     """Size / speed tier from the id's words. Only the tiers that sit on their
     own rung: flash, flash-lite, lite, mini, nano, air, small, and `pro` where a
-    vendor ships pro AND flash (gemini, deepseek, mimo)."""
+    vendor ships pro AND flash (gemini, deepseek, mimo); for GPT the codenames
+    luna (small) and terra (middle). Matched as WHOLE tokens, so an unknown
+    codename ('gpt-6.2-vega') or a substring ('lunar') gets no tier and is
+    ordered by version only -- no score is invented for a name nobody has
+    measured."""
     toks = [t for t in _TOK.split(low) if t]
     has = set(toks)
+    if family == "gpt":
+        for t in ("luna", "terra"):
+            if t in has:
+                return t
     flash = any(t.startswith("flash") for t in toks)
     if flash and "lite" in has:
         return "flash-lite"
@@ -207,13 +227,22 @@ def _reference_tiers(family, tier):
         if tier == "":
             return ("sonnet", "opus", "fable", tier)
         return (tier,)
+    if family == "gpt" and tier in ("luna", "terra"):
+        # measured against the newest FLAGSHIP (untiered: sol / astra / gpt-N.M)
+        return ("", tier)
     return (tier,)
 
 
 def tier_offset(family, tier, has_opus):
-    """Points a tier sits under the family's top tier. Claude only; the Opus >
-    Sonnet gap only applies when an Opus is reachable (no Opus, nothing to be
-    under), the 'Haiku is small' gap always."""
+    """Points a tier sits under the family's top tier. Claude and GPT (luna,
+    terra); the Opus > Sonnet gap only applies when an Opus is reachable (no
+    Opus, nothing to be under), the 'Haiku is small' gap always."""
+    if family == "gpt":
+        if tier == "luna":
+            return GPT_LUNA_UNDER_FLAGSHIP
+        if tier == "terra":
+            return GPT_TERRA_UNDER_FLAGSHIP
+        return 0.0
     if family != "claude" or tier == "opus":
         return 0.0
     mid = OPUS_OVER_SONNET if has_opus else 0.0
@@ -243,8 +272,35 @@ def cap(parsed, anchor_for):
         nver, nscore = anchor
         if ref == tier and tuple(ver) > tuple(nver):
             return None               # newer than anything reachable: leave it
-        has_opus = fam == "claude" and anchor_for(fam, "opus") is not None
-        return float(nscore) - tier_offset(fam, tier, has_opus) - gap(nver, ver)
+        top = anchor_for(fam, "opus") if fam == "claude" else None
+        has_opus = top is not None
+        out = float(nscore) - tier_offset(fam, tier, has_opus) - gap(nver, ver)
+        if ref != tier:
+            # Measured against ANOTHER line (luna against the flagship, haiku
+            # against sonnet), an older release of this tier must still sit
+            # under the newer ones of its own tier even when that line's
+            # anchor is older than both (owner's fleet 2026-10-23: the only
+            # reachable GPT flagship was gpt-5.4, so gpt-6-luna and gpt-5.6-luna
+            # tied). Also hold it under its own line's newest, offset applied.
+            own = anchor_for(fam, tier)
+            if own is not None and tuple(ver) <= tuple(own[0]):
+                out = min(out, float(own[1]) - tier_offset(fam, tier, has_opus)
+                          - gap(own[0], ver))
+        # SAME GENERATION, SAME ORDER (2026-10-23). Opus 5.5 and Sonnet 5.5 are
+        # one release batch (Fable numbers its own line, so it is not clamped).
+        # Measured on a mixed fleet: with claude-opus-6 listed and no sonnet-6,
+        # the newest Sonnet (5.5) kept its own line's top rank (137.4) while
+        # Opus 5.5 was pushed a whole generation down (135.3) -- Sonnet above
+        # Opus of the SAME generation. Every lower tier at version V is also held
+        # under the Opus line's implied score at V (Opus anchor minus the gap
+        # from the newest Opus), minus its offset. Nothing moves when that
+        # generation is the newest Opus (the gap is 0 and the number is exactly
+        # the one above), and it only ever lowers.
+        if (has_opus and tier in ("sonnet", "haiku", "instant", "")
+                and tuple(ver) <= tuple(top[0])):
+            implied = float(top[1]) - gap(top[0], ver)
+            out = min(out, implied - tier_offset(fam, tier, True))
+        return out
     except Exception:                                            # noqa: BLE001
         return None
 

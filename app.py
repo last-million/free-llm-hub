@@ -1725,6 +1725,27 @@ def _strong_new_version_score(low):
     return best
 
 
+_NEMOTRON_VER_RE = re.compile(
+    r"(?<![a-z0-9])nemotron-?(?:(?:nano|super|ultra|lightning|bolt)-)?(\d+)(?:\.(\d+))?(?!\d)")
+
+
+def _nemotron_version_bump(low):
+    """Points above the 3.0 line for a NEMOTRON id's release number (see its
+    use in _benchmark_score). 0 for anything that is not 'nemotron-<N[.M]>'
+    with a generation under 20 ('llama-3.1-nemotron-70b' reads a size, not a
+    version, and gets 0)."""
+    try:
+        m = _NEMOTRON_VER_RE.search(low or "")
+        if not m:
+            return 0.0
+        major, minor = int(m.group(1)), int(m.group(2) or 0)
+        if major > 20:
+            return 0.0
+        return max(0.0, (major - 3) * 0.5 + min(minor, 9) * 0.05)
+    except Exception:                                            # noqa: BLE001
+        return 0.0
+
+
 def _strong_root_version_excess(low):
     """How far past its pin the matched strong root's version is (0..9), so a
     CAPPED speed variant still orders newer-above-older (glm-5.4-flash over
@@ -1798,6 +1819,99 @@ def _band_version_bump(major, minor, base_major, base_minor):
 # by max(score, floor), which is exactly why g4f's relayed 'claude-sonnet-4'
 # inherited claude's full 138 and owned the top slot.
 _RELAY_DISCOUNT = {"g4f": 4.0}
+
+# PROVEN RELAY COPIES OF CLAUDE / GPT (2026-10-23, flag `relay_proven_lead`).
+# The relay discount says "a relay serves an id, it does not guarantee the
+# model": MEASURED on the owner's ledger (perf-stats.json), every flagship copy
+# on srv_mr9dda... is a dead budget stub (claude-opus-5.5 0 ok / 21 fail,
+# claude-fable-5.1 0/33, gpt-6.1-sol 0/20, gpt-6-sol 0/8, each ~2.5 s) while a
+# GPT-6 Luna copy on srv_mrdypihj... really answers (37 ok / 1 fail). A name
+# cannot tell the two apart; MEASURED health can. So, for the two families whose
+# relays are metered re-sellers of a paid API (claude, gpt):
+#   * a pair with a fresh, healthy delivery record (_relay_proven) pays NO relay
+#     discount and keeps its board evidence -- a real Opus on a relay competes
+#     with first-party models on the same terms;
+#   * every other pair (never tried, stale, flaky, failing) is exactly what it
+#     was before: discount in place AND the board bonus withheld on tool turns,
+#     so the new Terminal-Bench rows cannot float an untried id to the top.
+# Open-weight relays (GLM, Kimi, DeepSeek, ...) are left alone: no stub evidence.
+_RP_FAMILIES = ("claude", "gpt")
+_RP_MIN_OK = 6.0                 # successes, AFTER the idle fade _reliability applies
+_RP_MIN_RATE = 0.75              # blended (lifetime + last 24 h) delivery rate
+_RP_MIN_TOOL_RATE = 0.60         # when tool turns were measured at all
+_RP_FRESH_SECONDS = 24 * 3600    # the last outcome must be this recent
+
+
+def _rp_on():
+    try:
+        return bool(config.get_flag("relay_proven_lead", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _rp_claim_pair(pid, model):
+    """True for a discounted relay pid serving a claude / gpt id."""
+    try:
+        if not pid or pid not in _RELAY_DISCOUNT or not model:
+            return False
+        p = modelrank.parse(model)
+        return p is not None and p.family in _RP_FAMILIES
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _relay_proven(pid, model):
+    """True when this relay (pid, model) has a MEASURED healthy record: enough
+    recent successes, a high blended delivery rate, and nothing that says it
+    is failing right now. Fails CLOSED (False) on any doubt or error."""
+    try:
+        if not _rp_claim_pair(pid, model) or not _rp_on():
+            return False
+        now = time.time()
+        with _outcome_lock:
+            rec = dict(_outcomes.get((pid, model)) or {})
+        last = float(rec.get("last") or 0)
+        if not rec or now - last > _RP_FRESH_SECONDS:
+            return False
+        ok = float(rec.get("ok") or 0) * 0.5 ** (max(0.0, now - last) / _OUTCOME_IDLE_HALF_LIFE)
+        if ok < _RP_MIN_OK or _reliability(pid, model) < _RP_MIN_RATE:
+            return False
+        # A relay copy that merely ANSWERS is not a tool-capable model: live
+        # check 2026-10-23, the luna ids answer chat but never emit a native
+        # tool call. So proof needs a MEASURED tool-turn record (>= _TOOL_MIN_
+        # SAMPLES tool turns, rate >= _RP_MIN_TOOL_RATE), not just chat health.
+        tool = _tool_turn_reliability(pid, model)
+        if tool is None or tool < _RP_MIN_TOOL_RATE:
+            return False
+        if (_tool_turn_sick(pid, model) or _empty_resting(pid, model)
+                or _is_pair_benched(pid, model) or _answer_quality_penalty(pid, model) > 0
+                or _chain_reliability_band(pid, model) >= 2
+                or _recent_hop_failure(pid, model) is not None
+                or _relay_tool_sick(pid, model) or _is_model_skipped(pid, model)):
+            return False
+        never = globals().get("_never_chains")        # a sibling change may add it
+        if callable(never) and never(pid, model):
+            return False
+        return True
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _relay_discount(pid, model):
+    """The relay discount `_benchmark_score` subtracts: 0 for a proven claude /
+    gpt relay pair, the table value otherwise."""
+    disc = _RELAY_DISCOUNT.get(pid, 0.0)
+    if disc and _relay_proven(pid, model):
+        return 0.0
+    return disc
+
+
+def _rp_withholds_evidence(pid, model):
+    """True when board evidence must NOT count for this pair: a claude / gpt
+    relay copy with no proven record. Flag `relay_proven_lead` OFF means no
+    pair can be proven, so every such relay copy is held back exactly as it
+    was before the rule existed (discount in place, no board bonus)."""
+    return _rp_claim_pair(pid, model) and not _relay_proven(pid, model)
 
 # REVISED 2026-07-31 (2nd pass, user correction):
 #   "kimi k3 is the best one AFTER gpt models from 5 up and claude models"
@@ -2184,7 +2298,43 @@ def _aa_score_for(model_id):
             hit = _aa_scores.get(v + norm)
             if hit is not None:
                 break
+    if hit is None and norm:
+        # Still EXACT, after the two spellings that hid a listed model
+        # (2026-10-23): a relay's server prefix ('srv_x:' / 'pa:hash:') and a
+        # parameter-size tail the AA slug does not carry. MEASURED: nvidia's
+        # 'nemotron-3.5-super-vl-120b-a12b' scored 32 while the same weights on
+        # openrouter ('nemotron-3.5-super-vl:free') scored 76 from AA.
+        for alt in _aa_alt_slugs(model_id):
+            hit = _aa_scores.get(alt)
+            if hit is not None:
+                break
     return hit
+
+
+_AA_RELAY_PREFIX_RE = re.compile(r"^(?:srv_[a-z0-9]+:|pa:[a-z0-9]+:)+")
+_AA_SIZE_TAIL_RE = re.compile(r"\d+ba\d+b$")
+
+
+def _aa_alt_slugs(model_id):
+    """Candidate AA keys for an id whose plain slug missed: the relay server
+    prefix dropped, and/or a trailing MoE size group ('120b-a12b') dropped (a
+    dense '27b' tail is NOT dropped: 'qwen3.8-14b' must never read as the
+    flagship). Each candidate must still equal an AA key EXACTLY."""
+    try:
+        t = (model_id or "").strip().lower()
+        stripped = _AA_RELAY_PREFIX_RE.sub("", t)
+        bases = [_normalize_aa_slug(stripped)] if stripped != t else []
+        bases.append(_normalize_aa_slug(t))
+        out = []
+        for b in bases:
+            if b and b not in out:
+                out.append(b)
+            nxt = _AA_SIZE_TAIL_RE.sub("", b)
+            if nxt and nxt != b and nxt not in out:
+                out.append(nxt)
+        return out
+    except Exception:                                            # noqa: BLE001
+        return []
 
 
 def _aa_refresh_once():
@@ -2537,6 +2687,9 @@ def _ev_agentic_evidence_view(model_id):
                "source": ev.get("source"), "date": ev.get("date")}
         if ev.get("inherited_from"):
             out["inherited_from"] = ev["inherited_from"]
+        if ev.get("inherited_fields"):
+            # a figure BORROWED from an older listed row, not read from a page
+            out["inherited_fields"] = ev["inherited_fields"]
         return out
     except Exception:                                            # noqa: BLE001
         return None
@@ -2997,6 +3150,15 @@ def _benchmark_score(pid, model_id, _rank=True):
         except Exception:                                        # noqa: BLE001
             pass
     score -= _shared_budget_penalty(pid, low)
+    # NEMOTRON: NEWER ABOVE OLDER (2026-10-23). The family is last-resort and
+    # scores 20-95 depending on whether AA lists the exact id, so the strong-band
+    # cap in modelrank cannot order it (a low, unevidenced newest release would
+    # drag an AA-scored older one down). A tiny monotone bump instead -- never
+    # lowers anything, 0 for the 3.0 line, +0.05 per minor, +0.5 per major -- so
+    # nemotron-3.6 > 3.5 > 3 and nemotron-4 > 3.6 at equal evidence, while an
+    # AA-evidenced older id is still placed by its own number until AA lists the
+    # newer one.
+    score += _nemotron_version_bump(low)
     # RELAY DISCOUNT, applied LAST so it survives the preference floors above
     # (those use max(score, floor), so a bias added earlier would be erased).
     #
@@ -3015,7 +3177,7 @@ def _benchmark_score(pid, model_id, _rank=True):
     # first-party field (138 -> 134) rather than below it.
     if _arena_based:
         score = min(score, arena.HUB_CAP)
-    score -= _RELAY_DISCOUNT.get(pid, 0.0)
+    score -= _relay_discount(pid, model_id)
     return score
 
 
@@ -16148,6 +16310,18 @@ def _may_lead_agentic(score, model_id):
             or _ev_has_agentic_evidence(model_id))
 
 
+def _rp_evidence_only_lead(pid, model_id, score):
+    """True when a claude / gpt RELAY copy with no proven record would lead a
+    tool turn on board evidence alone (it is not allowlisted and does not clear
+    the top floor): its id is a claim (see _relay_proven), so evidence cannot
+    promote it. Applied by _may_lead_pool, which has the pid."""
+    try:
+        return (_rp_withholds_evidence(pid, model_id) and not _is_tool_proven(model_id)
+                and score < _PREF_FLOORS[5])
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _may_lead_pool(pool):
     """The (score, pid, model) entries of `pool` that may lead a tool turn:
     _may_lead_agentic, plus every model at least as strong as the strongest
@@ -16160,7 +16334,9 @@ def _may_lead_pool(pool):
     so 22 of 24 turns ran on gemini flash."""
     try:
         proven_best = max((c[0] for c in pool if _is_tool_proven(c[2])), default=None)
-        return [c for c in pool if _may_lead_agentic(c[0], c[2])
+        return [c for c in pool
+                if (_may_lead_agentic(c[0], c[2])
+                    and not _rp_evidence_only_lead(c[1], c[2], c[0]))
                 or (proven_best is not None and c[0] >= proven_best)]
     except Exception:                                            # noqa: BLE001
         return [c for c in pool if _may_lead_agentic(c[0], c[2])]
@@ -16221,7 +16397,8 @@ def _agentic_score(entry, sustain_override=None):
             - _reliability_penalty(entry[1], entry[2])
             - _latency_penalty(entry[1], entry[2])
             - _answer_quality_penalty(entry[1], entry[2])
-            + _ev_agentic_bonus(entry[2]))
+            + (0.0 if _rp_withholds_evidence(entry[1], entry[2])
+               else _ev_agentic_bonus(entry[2])))
 
 
 def _context_ok(pid, model, est):

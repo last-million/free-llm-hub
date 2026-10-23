@@ -61,6 +61,55 @@ TABLE = {
     "qwen3.8-27b":         {"tb4":  6, "automation": 48, "aa": 34, "arena": 1438},
 }
 
+# Rows read LATER than the snapshot above carry their own source/date (the
+# module-level SOURCE/DATE are only the default). Every number below was read
+# from the page named in "source" on 2026-10-23 -- none is estimated. A field
+# the page did not show is None (never guessed): the model then keeps its
+# family floor for that kind of evidence.
+#   * Terminal-Bench 4.0 (artificialanalysis.ai/evaluations/terminalbench-4-0,
+#     AA harness): the page text exposes ONLY the top three of 32 charted
+#     models -- Kimi K3.1 Pro 67.2, Claude Sonnet 5.5 (Max, Default Fallback)
+#     63.6, Claude Opus 5.5 (Max, Default Fallback) 59.6. No other model's TB4.0
+#     figure was readable (GPT-6.x, Fable, Haiku, Gemini, Nemotron: NOT FOUND, so
+#     they carry no row and keep their family floor).
+#   * AutomationBench-AA (artificialanalysis.ai/evaluations/automationbench-aa):
+#     top three only -- Gemini 4 Argon (High) 77.5, Kimi K3.1 Pro 73.3,
+#     MiniMax-M3.1-Flash 72.5 (MiniMax is a speed cut with no TB4.0/AA figure
+#     read, so it is not listed).
+#   * AA Intelligence Index v4.3.2 (artificialanalysis.ai/leaderboards/models):
+#     Opus 5.5 58 (max, fallback), Sonnet 5.5 56 (max, fallback), Kimi K3.1 Pro
+#     55, Gemini 4 Argon 53 (high). LMArena text (arena.ai board of 2026-10-20,
+#     the hub's arena_scores.json): claude-opus-5-5-(high) 1508.8,
+#     claude-sonnet-5-5-(xhigh) 1477.1, gemini-4-argon-(high) 1523.9; Kimi K3.1
+#     Pro has no Arena row.
+_AA_TB4 = "https://artificialanalysis.ai/evaluations/terminalbench-4-0"
+_AA_AUTO = "https://artificialanalysis.ai/evaluations/automationbench-aa"
+_AA_IDX = "https://artificialanalysis.ai/leaderboards/models"
+_ROW_DATE = "2026-10-23"
+TABLE.update({
+    "claude-opus-5.5": {
+        "tb4": 59.6, "automation": None, "aa": 58, "arena": 1508.8,
+        "date": _ROW_DATE,
+        "source": "AA Terminal-Bench 4.0 (Max, Default Fallback) %s; AA Index "
+                  "v4.3.2 %s; LMArena claude-opus-5-5-(high)" % (_AA_TB4, _AA_IDX)},
+    "claude-sonnet-5.5": {
+        "tb4": 63.6, "automation": None, "aa": 56, "arena": 1477.1,
+        "date": _ROW_DATE,
+        "source": "AA Terminal-Bench 4.0 (Max, Default Fallback) %s; AA Index "
+                  "v4.3.2 %s; LMArena claude-sonnet-5-5-(xhigh)" % (_AA_TB4, _AA_IDX)},
+    "moonshotai/kimi-k3.1-pro": {
+        "tb4": 67.2, "automation": 73.3, "aa": 55, "arena": None,
+        "date": _ROW_DATE,
+        "source": "AA Terminal-Bench 4.0 %s; AutomationBench-AA %s; AA Index "
+                  "v4.3.2 %s" % (_AA_TB4, _AA_AUTO, _AA_IDX)},
+    "gemini-4-argon": {
+        "tb4": None, "automation": 77.5, "aa": 53, "arena": 1523.9,
+        "date": _ROW_DATE,
+        "source": "AutomationBench-AA (High) %s; AA Index v4.3.2 (high) %s; "
+                  "LMArena gemini-4-argon-(high). No Terminal-Bench 4.0 figure "
+                  "was readable" % (_AA_AUTO, _AA_IDX)},
+})
+
 # --------------------------------------------------------------------------- #
 # Mappings (monotone, bounded, documented). Both are product decisions, not
 # capability estimates, so they live here beside the numbers they consume.
@@ -165,6 +214,37 @@ def _vnum(ver):
         return 0.0
 
 
+def _fill_from_older(out, parsed, size, ver):
+    """A row whose page did not show a figure (None) takes it from the same
+    family's newest OLDER listed release (same parameter size; the same tier
+    wins a tie on version):
+    the rule every unlisted newer version already follows ("a newer release is
+    at least as good as the one it replaces"), applied to the one hole a LISTED
+    row can have. Gemini 4 Argon has an AutomationBench figure but no Terminal-
+    Bench 4.0 one; without this its older sibling gemini-3.8-flash (TB4.0 20)
+    outscored it on tool turns. Never touches a figure the row has, never
+    invents one, and records where it came from."""
+    try:
+        for field in ("tb4", "automation"):
+            if out.get(field) is not None:
+                continue
+            best = None
+            for (fam, tier, sz), grp in _groups().items():
+                if fam != parsed.family or sz != size:
+                    continue
+                for v, (mid, ev) in grp.items():
+                    if v >= tuple(ver) or ev.get(field) is None:
+                        continue
+                    key = (v, tier == parsed.tier)
+                    if best is None or key > best[0]:
+                        best = (key, mid, ev[field])
+            if best is not None:
+                out[field] = best[2]
+                out.setdefault("inherited_fields", {})[field] = best[1]
+    except Exception:
+        pass
+
+
 def _evidence(model_id):
     """The raw evidence row for a model id, with inheritance. Returns a dict
     {tb4, automation, aa, arena, source, date[, inherited_from, floor_bump]} or
@@ -176,19 +256,31 @@ def _evidence(model_id):
         low = str(model_id or "").lower()
         gkey = (p.family, p.tier, _size_of(low))
         group = _groups().get(gkey)
+        if not group and p.tier == "pro":
+            # A vendor's PRO cut is never ranked under its own FLASH cut (owner
+            # rule: "gemini pro is better than gemini flash"). With no row for
+            # the pro line, it takes the flash line's evidence -- the least the
+            # boards support, and nothing invented: without this a pro id scored
+            # NOTHING on a tool turn while its flash sibling scored +2.6.
+            group = _groups().get((p.family, "flash", gkey[2]))
         if not group:
             return None
         ver = tuple(p.version)
         if ver in group:
             mid, ev = group[ver]
             out = dict(ev)
-            out.update(source=SOURCE, date=DATE, floor_bump=0.0)
+            out.setdefault("source", SOURCE)
+            out.setdefault("date", DATE)
+            out["floor_bump"] = 0.0
+            _fill_from_older(out, p, gkey[2], ver)
             return out
         newest = max(group)                         # highest listed version
         if ver > newest:                            # a newer, unlisted release
             mid, ev = group[newest]
             out = dict(ev)
-            out.update(source=SOURCE, date=DATE, inherited_from=mid,
+            out.setdefault("source", SOURCE)
+            out.setdefault("date", DATE)
+            out.update(inherited_from=mid,
                        floor_bump=max(0.0, min((_vnum(ver) - _vnum(newest))
                                                * _INHERIT_PER_VERSION, _INHERIT_MAX)))
             return out

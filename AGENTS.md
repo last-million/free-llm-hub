@@ -5662,3 +5662,124 @@ blamed tool results not reaching the model.
   (session id, else a content hash), never by the model; the test pins 14
   model/effort spellings.
 - Left alone: the poe replies carry raw `<think>` text in the content.
+
+## Frontier ranking: real Claude / GPT first, new ids rank themselves (2026-10-23)
+
+Covered by `tests/test_ranking_frontier.py` (hermetic: the AA cache, the fleet and
+the outcome ledger are replaced per test). Owner: "the most prioritised model is
+GLM ... Claude and GPT must actually work, not be dummies ... new models must
+rank right automatically."
+
+- **Why GLM led tool turns (measured with the owner's cached boards)**: nvidia
+  z-ai/glm-5.3 = 134.03 chat + 4.82 Terminal-Bench 4.0 bonus (TB 42) = 138.85;
+  relay claude-opus-5.5 = 138 - 4.0 relay discount = 134.00 with NO bonus (no
+  Claude row existed). The lead gate was NOT the barrier (relay Opus/GPT are in
+  `_may_lead_pool` on the live fleet); the score was.
+- **Real vs dummy is measured, not named** (owner's perf-stats.json,
+  2026-10-23): every flagship relay copy on `srv_mr9dda...` is a dead budget
+  stub (claude-opus-5.5 0 ok / 21 fail, fable-5.1 0/33, gpt-6.1-sol 0/20,
+  gpt-6-sol 0/8, ~2.5 s each) while `srv_mrdypihj...:gpt-6-luna` really answers
+  (37 ok / 1 fail). On this machine NO flagship Claude/GPT is reachable, so GLM
+  5.3 leading today is correct; the tests use these rows as fixtures.
+- **Board rows added to `benchmarks.TABLE`** (each row has its own `date` and
+  `source`; read from artificialanalysis.ai on 2026-10-23, never estimated):
+  Terminal-Bench 4.0 (AA harness; the page text exposes the top 3 of 32 only):
+  Kimi K3.1 Pro 67.2, Claude Sonnet 5.5 (Max, Default Fallback) 63.6, Claude Opus
+  5.5 59.6. AutomationBench-AA (top 3): Gemini 4 Argon (High) 77.5, Kimi K3.1 Pro
+  73.3 (MiniMax-M3.1-Flash 72.5 NOT added: a speed cut with no other figure).
+  AA Index v4.3.2: Opus 5.5 58, Sonnet 5.5 56, K3.1 Pro 55, Argon 53, Astra 53,
+  GPT-6.1 Sol 52, Fable 5.1 53, Haiku 5.5 43, GPT-6 Luna 38, Nemotron 3.5 Super
+  VL 26 / 3 Ultra 23. NOT FOUND (no row, family floor kept): any TB4.0 or
+  AutomationBench figure for GPT-6.x, Fable, Haiku, Gemini pro, Nemotron. A listed
+  row's missing figure is filled ONLY from the same family's newest older listed
+  row (`_fill_from_older`, recorded in `inherited_fields`): Argon takes
+  gemini-3.8-flash's TB 20, so a newer Gemini no longer scores under its older
+  sibling. A pro cut with no row takes its flash line's evidence (pro >= flash).
+- **Tool-turn order now** (first-party / healthy): Opus 5.5 144.0 > Sonnet 5.5
+  143.8 (Opus stays 0.2 over Sonnet) > Kimi K3.1 Pro 141.8 > GLM 5.3 138.9 > GLM
+  5.3 Flash 137.5 > Gemini 4 Argon 137.1 > Gemini 3.8 Flash 136.7. Unlisted newer
+  ids inherit their predecessor's evidence + a bump (claude-opus-6,
+  claude-sonnet-5.6, kimi-k3.2, glm-5.4 ...).
+- **GPT codename tiers** (`modelrank`): `luna` = the small tier, `terra` =
+  middle, matched as whole tokens; sol / astra / `gpt-N.M` are one flagship line;
+  an unknown codename gets no tier (version only, no invented score). Luna sits
+  `GPT_LUNA_UNDER_FLAGSHIP` 6.0 under the flagship line (AA Luna 38 vs Astra 53 /
+  Sol-6.1 52, Arena 1441 vs 1475 / 1479: the Haiku-under-Sonnet distance), terra
+  1.0 (the owner's puter floors). A luna release never anchors the flagship line.
+  SUPERSEDES the 2026-10-08 "open owner call" (Luna tied Astra at 137.0). An older
+  luna is also held under the newer lunas of its OWN line (the owner's fleet has
+  only gpt-5.4 as a reachable flagship, which used to tie gpt-6-luna and
+  gpt-5.6-luna). **OPEN OWNER CALL: GPT-6 Sol vs Astra.** They still tie at 137.0
+  (gpt-6-sol = gpt-6-astra) although the boards put Sol-6.0 below: LMArena (read
+  from the hub's cached 2026-10-20 board) gpt-6-sol 1458.8 vs gpt-6-astra 1475.5 /
+  gpt-6-1-sol 1479.4; AA Index read from the page: Astra 53, Sol-6.1 52, and NO
+  GPT-6 Sol row (the ~47.8 seen in the hub's calibrated AA cache is derived, not a
+  page reading). No tie-break was added: a gap size would be an invented number.
+- **Same generation, same order** (`modelrank.cap`): a Sonnet / Haiku / untiered
+  Claude at version V is also held under the Opus line's implied score at V
+  (anchor minus the gap from the newest Opus) minus its offset. With claude-opus-6
+  listed and no sonnet-6, Sonnet 5.5 used to keep 137.4 while Opus 5.5 fell to
+  135.3; it is now 134.7 (0.6 under Opus 5.5). Nothing moves while a generation is
+  the newest Opus. Fable is not clamped (its own numbering). The pinned
+  `test_a_newly_listed_claude_6...` assertion was changed deliberately.
+- **`relay_proven_lead`** (flag, default on; `_relay_proven`, `_relay_discount`,
+  `_rp_withholds_evidence`): for relay pids in `_RELAY_DISCOUNT` (g4f) serving a
+  claude or gpt id, a pair with a MEASURED healthy record pays no relay discount
+  (in `_benchmark_score`, the one seam, so every caller agrees) and keeps its
+  board bonus and evidence-lead; every other pair (untried, stale, thin, flaky,
+  failing) is exactly as before: discount in place, board bonus withheld on tool
+  turns, no evidence-lead. Proven = persisted `_outcomes` row, last outcome < 24 h,
+  >= 6 successes after the idle fade, blended `_reliability` >= 0.75, a MEASURED
+  tool-turn record (`_tool_turn_reliability`: >= 3 tool turns, rate >= 0.60 --
+  required, because a relay copy that merely answers chat is not tool-capable:
+  live check 2026-10-23, the luna ids answer but never emit a native tool call,
+  and only claude-haiku-5-5 via pa:fec3c477 is a working Claude-class pair), and
+  not resting / empty-resting / benched / canary-penalized /
+  `_chain_reliability_band` 2 / recently failed / `_relay_tool_sick` /
+  model-skipped / `_never_chains` (a hook, used if present). Fails closed.
+  Open-weight relays (GLM, Kimi, DeepSeek) are untouched; flag off = no pair can
+  be proven = the old relay ordering. `_outcomes` is persisted (perf-stats.json);
+  `_tool_outcomes` is in memory only, so after a restart a pair must re-earn its
+  tool-turn record (it is still tried as a fallback hop) before it can lead. On
+  the owner's data nothing qualifies today: the flagship copies are dead stubs
+  and the lunas have chat health but no tool-turn proof.
+- **Nemotron**: `_aa_score_for` retries EXACT keys after dropping a relay server
+  prefix (`srv_x:` / `pa:hash:`) and a MoE size tail (`-120b-a12b`; a dense `27b`
+  is never dropped): nvidia nemotron-3.5-super-vl-120b-a12b 32.0 -> 82.4 (AA 26;
+  the same weights on openrouter already scored 76). `_nemotron_version_bump`
+  (+0.05 per minor, +0.5 per major over 3.0, never lowers) orders nemotron-3.5 <
+  3.6 < 4 at equal evidence. An AA-listed older id still outranks an unlisted
+  newer one until the 6-hourly AA refresh lists it (a strong-band cap was tried
+  and rejected: a low, unevidenced newest release dragged an AA-scored older one
+  from 93.6 to 24). Last-resort tail ordering (`_LOW_QUALITY_RE`) is unchanged.
+  The bump is a tie-break of at most 0.5, not a real-world claim that
+  `nemotron-4` beats `3.x` (the live nvidia/nemotron-4-340b is a 2024 model).
+- **Borrowed, not read**: Gemini 4 Argon's Terminal-Bench 4.0 figure (20) is
+  gemini-3.8-flash's, copied by `_fill_from_older`; `/api/tracking`'s
+  `agentic_evidence` now carries `inherited_fields` so it is never shown as a page
+  reading. Without it Argon would trail 3.8 Flash on tool turns (135.1 vs 136.7);
+  drop the fill if you prefer that order.
+- **Owner's world vs the tables**: the table below scores every copy as reachable.
+  With the production anchor filter and the owner's ledger loaded (dead stubs are
+  not anchors), the relay flagships sit at tool 126-129 (reliability penalty), the
+  unproven Lunas at ~126-130, GLM 5.3 (nvidia) at 138.13 and leads -- correctly, since
+  no flagship Claude/GPT copy answers on this machine. The running hub (v0.5.7)
+  still carries the old g4f scarcity penalty (~29), so what the owner sees today
+  is lower than HEAD's 134.00 for an untried relay Opus.
+- **Untouched owner decisions**: Claude floor 138, Space Bunny 137.7, Pixel Canary
+  137.6, the gpt ladder (cap claude - 0.5), hy3 134.5, the Opus > Fable > Sonnet
+  pins, relay discount 4.0, `_AUTO_TOP_BAND`. Open owner calls: Gemini 4 Argon is
+  Arena #1 and AA 53 (= Astra) yet sits at 134.3 under the gpt ladder per the
+  2026-07-31 "claude > gpt > gemini" order; Fable (AA 53 < Sonnet 56) has no TB
+  row so it trails Opus/Sonnet by ~6 on tool turns.
+
+| id (chat / tool) | first-party | g4f relay, untried |
+| --- | --- | --- |
+| claude-opus-5.5 | 138.0 / 138.0 -> 144.0 | 134.0 / 134.0 (same) |
+| claude-sonnet-5.5 | 137.4 / 137.4 -> 143.8 | 133.4 / 133.4 (same) |
+| claude-fable-5.1, claude-haiku-5.5 | 137.7, 131.4 (same) | 133.7, 127.4 (same) |
+| gpt-6.1-sol / gpt-6-astra | 137.2 / 137.0 (same) | 133.2 / 133.0 (same) |
+| gpt-6-luna / gpt-5.6-luna | 137.0 -> 131.1 / 134.4 -> 128.4 | 133.0 -> 127.1 (131.1 when proven) |
+| gemini-4-argon | 134.07 / 134.07 -> 134.30 / 137.08 | 130.3 |
+| z-ai/glm-5.3 (nvidia) | 134.03 / 138.85 (same) | 130.03 / 134.85 |
+| kimi-k3.1-pro | 134.1 / 136.0 -> 134.3 / 141.8 | - |
