@@ -54,11 +54,12 @@ def test_quality_score_never_raises_on_a_junk_model_id():
 
 
 def test_a_provider_with_a_genuinely_strong_free_model_is_recommended(isolated_config):
-    """opencode-zen's default free model is deepseek-v4-flash-free -- top
-    tier per tonight's own deepseek ranking work. It was never in the old
-    hand-curated recommended set (only puter was), so this only passes if
-    quality is now actually being computed, not just read from a flag."""
-    row = app._provider_row("opencode-zen", live_models=False)
+    """modelscope's default free models (Qwen3-235B, GLM-5) score top tier. It
+    was never in the old hand-curated recommended set (only puter was), so this
+    only passes if quality is actually being computed, not just read from a flag.
+    (Was opencode-zen until 2026-10-24: its free tier is now gated to the OpenCode
+    client itself -- HTTP 403 FreeTierError -- so it is paid-marked with no defaults.)"""
+    row = app._provider_row("modelscope", live_models=False)
     assert row["quality_score"] >= app._RECOMMENDED_QUALITY_THRESHOLD
     assert row["recommended"] is True
 

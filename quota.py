@@ -91,6 +91,17 @@ FREE_LIMITS = {
     # consecutive-hard-failure breaker, which parks nvidia for 30min and re-probes,
     # so it retires itself automatically instead of being permanently pre-banned.
     "nvidia":        {"limit": None,  "window": "day", "unknown": True},
+    # inception: docs.inceptionlabs.ai/get-started/rate-limits (read 2026-10-23), Free Tier =
+    # 1,000 API requests/min, 1M input + 100K output tokens/min. The real budget is the
+    # ONE-TIME 100M-token signup credit, which is token-denominated and not tracked here.
+    "inception":     {"limit": 1000,  "window": "minute"},
+    # codecraft: "1M tokens free every month" (prompt + reply) on codecraftapi.com; request
+    # and per-minute limits are not published, so the request budget is UNKNOWN (like nvidia).
+    "codecraft":     {"limit": None,  "window": "month", "unknown": True},
+    # radoxai: "0.5M tokens every month, no card"; freemodel: "1M tokens free every month".
+    # Neither publishes request or per-minute limits, so the request budget is UNKNOWN.
+    "radoxai":       {"limit": None,  "window": "month", "unknown": True},
+    "freemodel":     {"limit": None,  "window": "month", "unknown": True},
     "morph":         {"limit": 0,     "window": "month"},   # medium: the official "200 req free every month" headline meters TOKENS (250K/mo = $2.50); a coding CLI's 20-50K-token turns make the real allowance ~5-12 req/month, so 200 reported quota long after Morph starts rejecting.
     "qwen":          {"limit": 0,     "window": "day"},     # medium: consumable 1M-tokens-PER-MODEL / 90-day trial, then AllocationQuota.FreeTierOnly on every call. (Documented rate is 600 RPM with no per-day cap.)
 

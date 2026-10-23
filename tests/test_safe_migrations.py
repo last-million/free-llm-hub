@@ -127,7 +127,7 @@ def test_apply_is_idempotent():
 
 def test_schema_version_is_bumped_to_latest():
     new, _ = migrations.apply(old_config())
-    assert new["schema_version"] == migrations.LATEST == 3
+    assert new["schema_version"] == migrations.LATEST == 4
 
 
 def test_a_newer_config_is_not_downgraded():
@@ -184,7 +184,7 @@ def test_run_writes_backs_up_first_and_keeps_keys(cfgfile):
     report = migrations.run_migrations()
 
     assert report["ok"] and report["changed"]
-    assert report["schema_version"] == 3
+    assert report["schema_version"] == 4
     assert report["keys_count"] == 5
     # the pre-migration backup holds the ORIGINAL bytes -> it was taken first
     assert report["last_backup"] and os.path.isfile(report["last_backup"])
@@ -208,7 +208,7 @@ def test_run_is_idempotent_and_takes_no_second_backup(cfgfile):
     report2 = migrations.run_migrations()
 
     assert report2["ok"] and not report2["changed"]
-    assert report2["schema_version"] == 3
+    assert report2["schema_version"] == 4
     assert open(cfgfile, "rb").read() == bytes_after_first      # not rewritten
     backups_after_second = sorted(os.listdir(os.path.join(os.path.dirname(cfgfile),
                                                           "backups")))
@@ -232,7 +232,7 @@ def test_run_on_a_corrupt_file_leaves_it_untouched(cfgfile):
 
 
 def test_run_on_a_fresh_latest_config_does_nothing(cfgfile):
-    write_raw(cfgfile, {"schema_version": 3, "providers": {}, "cli_multi_approval": "off"})
+    write_raw(cfgfile, {"schema_version": 4, "providers": {}, "cli_multi_approval": "off"})
     before = open(cfgfile, "rb").read()
     report = migrations.run_migrations()
     assert report["ok"] and not report["changed"]
@@ -283,7 +283,7 @@ def test_config_reads_the_migrated_values(cfgfile):
     assert config.get_setting("cli_multi_approval") == "off"
     cfg = config.load_config()                                  # loads cleanly
     assert "groq" in cfg["providers"]
-    assert cfg["schema_version"] == 3
+    assert cfg["schema_version"] == 4
     assert set(cfg.get("retired_providers") or {}) == {"tokenrouter", "agentrouter"}
 
 
@@ -303,7 +303,7 @@ def test_status_has_the_four_fields(cfgfile):
     migrations.run_migrations()
     st = migrations.status()
     assert set(("schema_version", "applied", "last_backup", "keys_count")) <= set(st)
-    assert st["schema_version"] == 3
+    assert st["schema_version"] == 4
     assert st["keys_count"] == 5
 
 
@@ -314,3 +314,62 @@ def test_backup_and_config_are_0600_on_posix(cfgfile):
     for p in (cfgfile, report["last_backup"]):
         mode = stat.S_IMODE(os.stat(p).st_mode)
         assert mode == 0o600
+
+
+# --------------------------------------------------------------------------- #
+# v4 (2026-10-24): Together AI left the registry, its keys must not              #
+# --------------------------------------------------------------------------- #
+def together_config(version=3):
+    return {"schema_version": version,
+            "providers": {"groq": {"api_keys": ["enc.v1:GROQ1"]},
+                          "together": {"api_keys": ["enc.v1:TGP1", "enc.v1:TGP2"],
+                                       "enabled": False}}}
+
+
+def test_v4_moves_a_saved_together_row_to_retired_with_its_keys():
+    new, applied = migrations.apply(together_config())
+    assert "together" not in new["providers"] and "groq" in new["providers"]
+    assert new["retired_providers"]["together"]["api_keys"] == ["enc.v1:TGP1", "enc.v1:TGP2"]
+    assert new["retired_providers"]["together"].get("retired_at")
+    assert applied == ["v4:retire_together"]
+    assert new["schema_version"] == migrations.LATEST
+
+
+def test_v4_leaves_a_config_without_together_alone_apart_from_the_version():
+    new, applied = migrations.apply({"schema_version": 3,
+                                     "providers": {"groq": {"api_keys": ["enc.v1:G"]}}})
+    assert applied == [] and "retired_providers" not in new
+    assert new["providers"] == {"groq": {"api_keys": ["enc.v1:G"]}}
+
+
+def test_a_v2_config_gets_both_the_v3_and_the_v4_retirements():
+    raw = old_config()
+    raw["providers"]["together"] = {"api_keys": ["enc.v1:TGP9"]}
+    new, applied = migrations.apply(raw)
+    assert set(new["retired_providers"]) == {"tokenrouter", "agentrouter", "together"}
+    assert "together" not in new["providers"]
+    assert any(a.startswith("v4:") for a in applied)
+
+
+def test_v4_is_idempotent_and_never_loses_a_key():
+    cfg = together_config()
+    before = migrations.key_fingerprint(cfg)
+    once, _ = migrations.apply(cfg)
+    twice, applied2 = migrations.apply(once)
+    assert twice == once and applied2 == []
+    assert migrations._keys_preserved(before, migrations.key_fingerprint(twice))
+
+
+def test_v4_unions_keys_if_both_maps_somehow_hold_together():
+    cfg = together_config()
+    cfg["retired_providers"] = {"together": {"api_keys": ["enc.v1:OLD", "enc.v1:TGP1"],
+                                             "retired_at": "2026-01-01T00:00:00Z"}}
+    new, _ = migrations.apply(cfg)
+    assert new["retired_providers"]["together"]["api_keys"] == [
+        "enc.v1:OLD", "enc.v1:TGP1", "enc.v1:TGP2"]
+
+
+def test_the_floor_in_config_stays_below_latest_so_an_early_save_cannot_skip_v4():
+    # config stamps its own floor on every save; if that floor were already 4 a
+    # save between boot and the migration would make the retirement look done.
+    assert config.SCHEMA_VERSION < migrations.LATEST

@@ -41,7 +41,7 @@ from typing import Optional
 _log = logging.getLogger("migrations")
 
 # The schema version this hub migrates UP TO. Bump when you add a step below.
-LATEST = 3
+LATEST = 4
 
 # Providers removed from the registry whose rows (and any keys) are carried
 # forward under ``retired_providers`` rather than left in the active map. Only
@@ -50,6 +50,11 @@ LATEST = 3
 # from this tuple — the retire step is version-gated so it never fires on a
 # config already at/after the version that retired it.
 RETIRED_PROVIDERS = ("tokenrouter", "agentrouter")
+# Retired by the v4 step (2026-10-24): Together AI. Its free tier is gone (a new
+# account is read-only until a deposit, confirmed on a real account 2026-08-30;
+# the official billing docs say no free trial and a $5 minimum purchase), so the
+# owner had it removed. A separate tuple, because each retire step is version-gated.
+RETIRED_PROVIDERS_V4 = ("together",)
 
 # Remembered for the status route; set by the last run_migrations() of the
 # process (boot). Never holds a key value — counts and a backup path only.
@@ -81,7 +86,7 @@ def _rename_cli_multi_approval(raw: dict) -> dict:
     return raw
 
 
-def _retire_removed_providers(raw: dict) -> dict:
+def _retire_removed_providers(raw: dict, pids=None) -> dict:
     """Move rows of removed providers into ``retired_providers`` (keys kept).
 
     The whole row moves VERBATIM (every ``api_keys`` / ``api_key`` /
@@ -93,7 +98,7 @@ def _retire_removed_providers(raw: dict) -> dict:
     providers = raw.get("providers")
     if not isinstance(providers, dict):
         return raw
-    present = [p for p in RETIRED_PROVIDERS if p in providers]
+    present = [p for p in (RETIRED_PROVIDERS if pids is None else pids) if p in providers]
     if not present:
         return raw
     raw = dict(raw)
@@ -140,10 +145,17 @@ def _to_v3(raw: dict) -> dict:
     return raw
 
 
+def _to_v4(raw: dict) -> dict:
+    """Release 2026-10-24: Together AI left the registry; its row (and any keys)
+    moves to ``retired_providers`` verbatim, exactly like the v3 retirements."""
+    return _retire_removed_providers(raw, RETIRED_PROVIDERS_V4)
+
+
 # Ordered (target_version, id, fn). A step runs when the config's effective
 # start version is below target_version.
 _STEPS = (
     (3, "v3:rename_cli_multi_approval+retire_providers", _to_v3),
+    (4, "v4:retire_together", _to_v4),
 )
 
 

@@ -1818,7 +1818,11 @@ def _band_version_bump(major, minor, base_major, base_minor):
 # floors (see the end of _benchmark_score) — a bias added earlier would be wiped
 # by max(score, floor), which is exactly why g4f's relayed 'claude-sonnet-4'
 # inherited claude's full 138 and owned the top slot.
-_RELAY_DISCOUNT = {"g4f": 4.0}
+# codecraft (2026-10-23): a pay-gateway with no company details that CLAIMS Claude
+# and GPT ids. Same class as g4f: discounted, and (via _rp_claim_pair) a claimed
+# Claude/GPT earns the discount-free lead only with a MEASURED healthy record.
+# radoxai / freemodel (2026-10-24): the same white-label gateway kit as codecraft.
+_RELAY_DISCOUNT = {"g4f": 4.0, "codecraft": 4.0, "radoxai": 4.0, "freemodel": 4.0}
 
 # PROVEN RELAY COPIES OF CLAUDE / GPT (2026-10-23, flag `relay_proven_lead`).
 # The relay discount says "a relay serves an id, it does not guarantee the
@@ -2056,11 +2060,15 @@ _AA_SLUG_STRIP_RE = re.compile(
     # 'deepseek/deepseek-v4.1-flash' keyed as 'deepseekdeepseekv41flash' and
     # nvidia's 'deepseek-ai/deepseek-v4.1-flash' as 'deepseekv41flash', so AA's
     # real number never reached deepseek, minimax, qwen, mimo, claude or grok.
-    r"deepseek/|minimax/|qwen/|xiaomi/|anthropic/|x-ai/|mistralai/|tencent/|ibm/)+")
+    # 2026-10-23: 'inception/' too. OpenRouter's catalog slugs Mercury as
+    # 'inception/mercury-2.5', so AA's real 61.5 was keyed 'inceptionmercury25'
+    # and the plain id 'mercury-2.5' (Inception's own API) never found it.
+    r"deepseek/|minimax/|qwen/|xiaomi/|anthropic/|x-ai/|mistralai/|tencent/|ibm/|"
+    r"inception/)+")
 # Cache files written before that fix still hold vendor-joined keys; exact
 # lookups retry with these prefixes (see _aa_score_for) until the next refresh.
 _AA_LEGACY_VENDOR_KEYS = ("deepseek", "minimax", "qwen", "xiaomi", "anthropic",
-                          "xai", "mistralai", "tencent", "ibm")
+                          "xai", "mistralai", "tencent", "ibm", "inception")
 _AA_SLUG_SUFFIX_RE = re.compile(r"(?::free|:beta|:extended|:nitro|:floor|:online)+$", re.IGNORECASE)
 _AA_SLUG_PUNCT_RE = re.compile(r"[^a-z0-9]+")
 
@@ -2335,6 +2343,115 @@ def _aa_alt_slugs(model_id):
         return out
     except Exception:                                            # noqa: BLE001
         return []
+
+
+# --------------------------------------------------------------------------- #
+# NEWEST BEATS ITS PREDECESSOR, FOR EVERY FAMILY (2026-10-23, flag `newest_wins`)
+#
+# Owner: "the hub should detect new models automatically and always use the
+# newest ones, because of course they are better than the previous ones."
+# Discovery already notices a new model within MODEL_CACHE_TTL (10 min), and the
+# known strong families already rank by version (_STRONG_ROOTS, modelrank.py,
+# benchmarks.py). Every OTHER family did not: Inception's new `mercury-3` met the
+# "mercury" Tier-C substring (26) beside its predecessor's Artificial Analysis
+# 61.5, so it would have been the worst Mercury in the hub until a board listed it.
+#
+# So a model with NO data of its own -- no AA row, and only a family-table default
+# (<= _GV_NO_DATA_MAX) or the unknown 10 -- inherits the score of the newest LOWER
+# version of the SAME stem and tail that is reachable in the fleet and HAS an AA
+# row, plus a small bump (never more than _GV_BUMP_CAP, so it stays beside its
+# predecessor and the weighted pick still spreads). Board data always wins: a model
+# AA lists keeps its own number even when it is lower than its predecessor's, and
+# a different tail (-coder, -flash, a size) is a different product that is never
+# inherited from. Nothing here scores the fleet, so it cannot re-enter
+# _benchmark_score; modelrank's own anchor build (_rank=False) skips it.
+# --------------------------------------------------------------------------- #
+_GV_RE = re.compile(
+    r"^(?P<stem>[a-z][a-z]*(?:-[a-z]+)*?)-?v?(?P<maj>\d{1,3})(?:\.(?P<min>\d{1,2}))?"
+    r"(?P<tail>(?:-[a-z0-9.]+)*)$")
+_GV_BUMP_PER_TENTH = 0.1
+_GV_BUMP_CAP = 1.5
+_GV_NO_DATA_MAX = 26            # the Tier-C family default; any tier above has an opinion
+_GV_TTL = 30.0
+_gv_cache = [0.0, None]         # [built_at, {(stem, tail): [(version, aa_score), ...]}]
+_gv_lock = threading.Lock()
+
+
+def _gv_on():
+    try:
+        return bool(config.get_flag("newest_wins", True))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def _gv_reset():
+    with _gv_lock:
+        _gv_cache[0], _gv_cache[1] = 0.0, None
+
+
+def _gv_parse(model_id):
+    """(stem, (major, minor), tail) for 'mercury-2.5' / 'acme/zorblax-2:free' /
+    'srv_x:glm-5.3-flash', or None when the id carries no clean version."""
+    try:
+        t = str(model_id or "").strip().lower()
+        t = _AA_RELAY_PREFIX_RE.sub("", t)
+        t = _AA_SLUG_SUFFIX_RE.sub("", t)
+        t = t.rsplit("/", 1)[-1]
+        m = _GV_RE.match(t)
+        if not m or len(m.group("stem")) < 3:
+            return None
+        return m.group("stem"), (int(m.group("maj")), int(m.group("min") or 0)), \
+            m.group("tail") or ""
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def _gv_index():
+    """{(stem, tail): [(version, aa_score)]} over the reachable fleet's models that
+    have an AA row. Cached _GV_TTL seconds; never queues behind a rebuild."""
+    now = time.time()
+    hit = _gv_cache[1]
+    if hit is not None and now - _gv_cache[0] < _GV_TTL:
+        return hit
+    if not _gv_lock.acquire(blocking=False):
+        return hit or {}
+    try:
+        idx, seen = {}, set()
+        for mid in _rank_fleet_ids():
+            if not isinstance(mid, str) or mid in seen:
+                continue
+            seen.add(mid)
+            p = _gv_parse(mid)
+            aa = _aa_score_for(mid) if p else None
+            if p and aa is not None:
+                idx.setdefault((p[0], p[2]), []).append((p[1], float(aa)))
+        for rows in idx.values():
+            rows.sort()
+        _gv_cache[0], _gv_cache[1] = now, idx
+        return idx
+    except Exception:                                            # noqa: BLE001
+        _gv_cache[0], _gv_cache[1] = now, hit or {}     # retry in a TTL, not per score
+        return hit or {}
+    finally:
+        _gv_lock.release()
+
+
+def _generic_predecessor_score(model_id):
+    """The AA score of the newest LOWER version of this model's family (same stem
+    and tail, reachable now) plus a bump, or None. Never raises."""
+    try:
+        p = _gv_parse(model_id)
+        if not p or not _gv_on():
+            return None
+        stem, ver, tail = p
+        older = [(v, sc) for v, sc in _gv_index().get((stem, tail), ()) if v < ver]
+        if not older:
+            return None
+        pv, ps = max(older)
+        tenths = (ver[0] - pv[0]) * 10 + (ver[1] - pv[1])
+        return ps + min(_GV_BUMP_CAP, max(_GV_BUMP_PER_TENTH, _GV_BUMP_PER_TENTH * tenths))
+    except Exception:                                            # noqa: BLE001
+        return None
 
 
 def _aa_refresh_once():
@@ -2742,6 +2859,12 @@ def _benchmark_score(pid, model_id, _rank=True):
         _from_board = arena.hub_score(_entry.get("rating")) if _entry else None
         if _from_board is not None:
             score, _arena_based = _from_board, True
+    # NEWEST BEATS ITS PREDECESSOR, FOR EVERY FAMILY (see _generic_predecessor_score):
+    # no data of its own -> the newest lower version's AA score plus a small bump.
+    if _rank and aa is None and not _arena_based and score <= _GV_NO_DATA_MAX:
+        _inh = _generic_predecessor_score(model_id)
+        if _inh is not None and _inh > score:
+            score = _inh
     # Explicit parameter size nudges within a family (…-70b > …-8b).
     params_b = None
     m = re.search(r"(\d{1,4})\s*b\b", low)
@@ -10331,7 +10454,7 @@ _TOOL_PROVIDER_SHARE = 0.5           # of the request deadline, per provider
 _TOOL_PROVIDER_SHARE_HUGE = 0.75     # ...for a prompt past STREAM_HUGE_REQUEST_TOKENS
 _TOOL_PROVIDER_MIN_SECONDS = 60.0    # never a smaller per-provider allowance
 _TOOL_PROVIDER_MIN_HOP = 20.0        # never squeeze a capped hop below this
-_TOOL_RELAY_PIDS = ("g4f",)
+_TOOL_RELAY_PIDS = ("g4f", "codecraft", "radoxai", "freemodel")
 _TOOL_RELAY_MAX_HOPS = 3             # relay hops per tool chain / walk
 _RELAY_TOOL_FAIL_TTL = 900.0         # seconds a relay-server failure is remembered
 _RELAY_TOOL_FAIL_LIMIT = 2           # failures in the TTL -> skipped on tool turns
@@ -18323,9 +18446,10 @@ _RECOMMENDED_QUALITY_THRESHOLD = 95
 # this is a snapshot list, same tradeoff the static 'recommended' flag
 # already makes. Update when a real new batch lands.
 _NEW_PROVIDER_IDS = frozenset((
-    "deepinfra", "together", "hyperbolic", "nebius", "cohere",
+    "deepinfra", "hyperbolic", "nebius", "cohere",
     "scaleway", "stepfun", "aion", "sealion", "requesty",
     "dahl",
+    "inception", "codecraft", "radoxai", "freemodel",       # added 2026-10-23/24
     # Not a new provider, but newly NEEDING SETUP: g4f.space ended anonymous
     # access on 2026-08-06 (keyless chat now 402s "No cake credits"), so it
     # went from working-out-of-the-box to needing a free key from
@@ -18334,6 +18458,11 @@ _NEW_PROVIDER_IDS = frozenset((
     # (Also the date the three per-upstream g4f-* cards merged into this one.)
     "g4f",
 ))
+# The newest batch (2026-10-24, owner request: "show them first in Recommended, labelled New"):
+# the page sorts these ahead of every other Recommended card. A subset of the list above on
+# purpose -- the older "new" badges (g4f needing a key, the 2026-08 batch) keep their label
+# but no longer jump the queue.
+_FRESH_PROVIDER_IDS = frozenset(("inception", "codecraft", "radoxai", "freemodel"))
 
 
 def _provider_quality_score(pid, free_models):
@@ -18367,6 +18496,28 @@ def _sized(v):
 
 
 _NO_KEY_DETAIL = "No API key saved — add one or switch it off"
+
+# A provider CARD never does network discovery (a list/save must be instant), so it used
+# to judge every provider by the registry's built-in default ids -- even when the hub held
+# a fresh live catalog. MEASURED 2026-10-24: ZenMux, OpenCode Zen, Dahl, Kilo Code and G4F
+# all read "all models dead" because their defaults had been renamed away, while Kilo Code
+# and G4F were serving tool turns all day. The live list the routing layer already cached
+# is used instead (no network), when it is at most _CARD_CACHE_MAX_AGE old; otherwise the
+# defaults, exactly as before.
+_CARD_CACHE_MAX_AGE = 24 * 3600
+
+
+def _card_free_models(pid, live):
+    """The free-model list a provider card judges and shows. Never raises."""
+    try:
+        if not live:
+            with _model_cache_lock:
+                hit = _model_cache.get(pid)
+            if hit and hit[1] and time.time() - hit[0] < _CARD_CACHE_MAX_AGE:
+                return [m for m in hit[1] if isinstance(m, str)]
+    except Exception:                                            # noqa: BLE001
+        pass
+    return provider_free_models(pid, live=live)
 
 
 def _provider_out_status(pid, p, free_models=None):
@@ -18517,7 +18668,7 @@ def _provider_row(pid, live_models=False):
     # Provider rows never trigger a network model-discovery call by default:
     # a save/list must be instant and can't fail on a provider's flaky /models
     # endpoint. The live model list is served separately by GET /api/models.
-    free_models = provider_free_models(pid, live=live_models)
+    free_models = _card_free_models(pid, live_models)
     out_status = _provider_out_status(pid, p, free_models)
     return {
         # Why the card is out and until when, plus who spent this window's
@@ -18559,6 +18710,7 @@ def _provider_row(pid, live_models=False):
                        _RECOMMENDED_QUALITY_THRESHOLD,
         "quality_score": _provider_quality_score(pid, p.get("default_free_models")),
         "new": pid in _NEW_PROVIDER_IDS,
+        "fresh": pid in _FRESH_PROVIDER_IDS,
     }
 
 

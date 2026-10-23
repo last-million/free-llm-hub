@@ -5783,3 +5783,64 @@ rank right automatically."
 | gemini-4-argon | 134.07 / 134.07 -> 134.30 / 137.08 | 130.3 |
 | z-ai/glm-5.3 (nvidia) | 134.03 / 138.85 (same) | 130.03 / 134.85 |
 | kimi-k3.1-pro | 134.1 / 136.0 -> 134.3 / 141.8 | - |
+
+## New providers, Together removed, and why cards read "all models dead" (2026-10-24)
+
+Covered by `tests/test_inception_and_codecraft_providers.py`,
+`tests/test_provider_cards_and_stale_defaults.py`,
+`tests/test_newest_wins_every_family.py` and `tests/test_safe_migrations.py` (v4).
+
+- **Inception (Mercury)**, pid `inception`: official OpenAI-compatible API
+  `https://api.inceptionlabs.ai/v1`; every new key gets 100M free tokens (one-time, no
+  card); free tier 1,000 req/min, 1M input + 100K output tokens/min. `/v1/models` is
+  PUBLIC and carries pricing + context, so `free_filter: pricing_zero` reads it live:
+  only `mercury-3` (1M ctx, tools, priced $0 today) routes as free; `mercury-2` /
+  `2.5` are billed models the credit also covers (pin-only). AA puts Mercury at 60-61.5
+  (mid-tier, fast): not a flagship.
+- **codecraft / radoxai / freemodel**: ONE white-label gateway kit (same page, six model
+  cards, "31-33 models", `claude-opus-4.8` sample, plan table) on different servers. No
+  company details, crypto payment, and freemodel.in's public catalog lists Claude Opus
+  5.5 / Fable / Mythos / GPT-5.6 Sol at ~$0.056 per MILLION input tokens (no genuine
+  resale sustains that), and its catalog took 31 s to download. Owner asked for them
+  in Recommended anyway; they are RELAY class (`_RELAY_DISCOUNT` 4.0 and
+  `_TOOL_RELAY_PIDS`: relay answer gates, no board bonus for a claimed Claude/GPT until
+  `_relay_proven`), `free_filter: family` with open-weight ids only, and their notes say
+  not to send private code. Free plans: codecraft 1M tokens/month, radoxai 0.5M,
+  freemodel 1M. `/v1/models` needs a key on the first two (401), so their pinned ids come
+  from the marketing page until a key is added and Test is pressed.
+- **Newest first, labelled New**: `_FRESH_PROVIDER_IDS` (the four above) -> row field
+  `fresh`; the page sorts them ahead of every other Recommended card
+  (`byFreshThenConnectedQuality`) and they carry the existing "New" badge
+  (`_NEW_PROVIDER_IDS`). Older "new" badges (g4f, the 2026-08 batch) keep their label but
+  no longer jump the queue.
+- **Together AI removed** at owner request. No free tier since 2026-08-30 (real account:
+  read-only until a deposit); re-checked against Together's own billing pages
+  (no free trial, $5 minimum). Migration **v4** (`migrations.LATEST` 4) moves a saved
+  `together` row to `retired_providers` with its keys verbatim, like v3 did for
+  tokenrouter/agentrouter. `config.SCHEMA_VERSION` stays 3 on purpose: it is the floor an
+  ordinary save stamps, and a floor of 4 would let an early save make v4 look done.
+- **Why the cards were red** (ZenMux, OpenCode Zen, Kilo Code, G4F, Dahl): a provider
+  card never does network discovery, so it judged "all models dead" against the
+  registry's built-in `default_free_models` -- every one of which had been renamed away
+  upstream -- while Kilo Code (`recursive/flint-v1.0:free`, HTTP 200) and G4F served
+  tool turns all day. `_card_free_models` now uses the hub's cached live catalog (<= 24 h
+  old, no network) and falls back to the defaults. Defaults refreshed: kilocode, zenmux
+  (`z-ai/glm-4.6v-flash-free`, `glm-4.7-flash-free`), dahl (`GLM-5.3-Flash`,
+  `DeepSeek-V4-Flash-0731`, `MiniMax-M2.7`).
+- **Real causes per provider** (per-key Test + direct probes 2026-10-24): LLM7 = the
+  provider's own 429 cooldown; Dahl = both keys spent (HTTP 402 "available tokens
+  exhausted", mint a new key); ZenMux = 1 of 5 keys works, the others are PAYG keys that
+  403 "no permission" on free models; **OpenCode Zen = unusable from any client but
+  OpenCode** (HTTP 403 `FreeTierError` on a live `-free` id with every key; it answered
+  plain clients on 2026-07-27, gated since) -> `paid: True`, no defaults, no longer
+  Recommended.
+- **Newest wins in every family** (`_generic_predecessor_score`, flag `newest_wins`,
+  default on): a model with NO data of its own (no AA row, only a Tier-C/D table default
+  or the unknown 10) inherits the AA score of the newest LOWER version of the same stem
+  and tail that is reachable in the fleet, plus 0.1 per tenth of a version, capped at
+  1.5. Boards always win; a different tail (-coder, a size) is never inherited from.
+  Found because `"mercury"` sat in the legacy Tier-C family (26): `mercury-3` would have
+  been the worst Mercury until AA listed it. Also `inception/` joined
+  `_AA_SLUG_STRIP_RE` and `_AA_LEGACY_VENDOR_KEYS`, because the AA cache keyed Mercury as
+  `inceptionmercury25` and the plain id never found it. Model discovery already refreshes
+  every `MODEL_CACHE_TTL` (600 s), so new models appear with no restart.

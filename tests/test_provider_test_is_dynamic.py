@@ -96,6 +96,9 @@ def test_the_pins_are_still_there_as_a_fallback():
     assert 'p.get("default_free_models")' in src
 
 
-def test_opencode_zen_still_declares_pins_for_that_fallback():
+def test_a_keyless_gateway_still_declares_pins_for_that_fallback():
+    # (was opencode-zen; since 2026-10-24 that one is paid-marked with NO pins on
+    # purpose -- its free tier answers HTTP 403 to any client but OpenCode itself.)
     import providers as prov
-    assert prov.get_provider("opencode-zen").get("default_free_models")
+    assert prov.get_provider("kilocode").get("default_free_models")
+    assert prov.get_provider("opencode-zen").get("default_free_models") == []

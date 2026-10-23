@@ -7117,7 +7117,14 @@
     // Recommended providers are pinned in their own zone ABOVE every group
     // and are therefore excluded from the category groups below (no
     // duplicate cards).
-    var recG = shown.filter(function(p){ return p.recommended; }).sort(byConnectedThenQuality);
+    // The newest batch (p.fresh, labelled "New") leads the Recommended zone, then the
+    // usual connected-then-quality order.
+    function byFreshThenConnectedQuality(a, b){
+      var fa = a.fresh ? 1 : 0, fb = b.fresh ? 1 : 0;
+      if (fa !== fb) return fb - fa;
+      return byConnectedThenQuality(a, b);
+    }
+    var recG = shown.filter(function(p){ return p.recommended; }).sort(byFreshThenConnectedQuality);
     var unpinned = shown.filter(function(p){ return !p.recommended; });
     var keylessG = unpinned.filter(isKeyless).sort(byConnectedThenQuality);
     var rest = unpinned.filter(function(p){ return !isKeyless(p); });

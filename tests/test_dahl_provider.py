@@ -32,15 +32,20 @@ def test_registered_with_the_verified_endpoints():
 
 
 def test_only_models_that_actually_answer_are_listed():
-    """GLM-5.2 is advertised as coming soon but 400s 'unsupported model' today."""
-    assert P["default_free_models"] == ["moonshotai/Kimi-K2.6",
-                                        "MiniMaxAI/MiniMax-M2.7"]
+    """GLM-5.2 was advertised as coming soon but 400'd 'unsupported model'. Only an id
+    verified to ANSWER is pinned (2026-10-24: MiniMax-M2.7; the two newer catalog ids,
+    GLM-5.3-Flash and DeepSeek-V4-Flash-0731, wait for a working key's Test)."""
+    assert P["default_free_models"] == ["MiniMaxAI/MiniMax-M2.7"]
     assert not any("glm" in m.lower() for m in P["default_free_models"])
 
 
-def test_kimi_id_is_k2_6_not_k2_7():
-    """/v1/models returns moonshotai/Kimi-K2.6. A wrong id 400s on every call."""
-    assert "moonshotai/Kimi-K2.6" in P["default_free_models"]
+def test_no_pinned_id_has_left_the_catalog():
+    """A wrong id 400s on every call. Kimi-K2.6 was pinned until it left /v1/models
+    (read 2026-10-24); every pinned id must be one that catalog still serves."""
+    served = {"MiniMaxAI/MiniMax-M2.7", "zai-org/GLM-5.3-Flash",
+              "deepseek-ai/DeepSeek-V4-Flash-0731"}
+    assert set(P["default_free_models"]) <= served
+    assert "moonshotai/Kimi-K2.6" not in P["default_free_models"]
 
 
 def test_no_vision_models_even_though_the_site_badges_vision():

@@ -175,7 +175,12 @@ PROVIDERS: Dict[str, dict] = {
         # `content` (harmless — _strip_thinking handles it — but noisier).
         # zai-org/GLM-5.2 is advertised on the site as "Soon" but 400s
         # 'unsupported model' today. Do NOT add it until it answers.
-        "default_free_models": ["moonshotai/Kimi-K2.6", "MiniMaxAI/MiniMax-M2.7"],
+        # 2026-10-24: Kimi-K2.6 left the catalog. /v1/models now serves three ids
+        # (GLM-5.3-Flash, DeepSeek-V4-Flash-0731, MiniMax-M2.7) but both saved keys are
+        # spent (HTTP 402), so only MiniMax-M2.7 -- the one id verified to ANSWER earlier and
+        # still listed -- is pinned. Live discovery (free_filter "all") adds the other two on a
+        # keyed provider; pin them here once a fresh key's Test confirms they generate.
+        "default_free_models": ["MiniMaxAI/MiniMax-M2.7"],
         # NO vision_models on purpose: the catalog page badges both models
         # "Vision", but a data-URI image is SILENTLY DROPPED — 200 OK,
         # prompt_tokens counts the text only, and the model answers "I cannot see
@@ -934,8 +939,19 @@ PROVIDERS: Dict[str, dict] = {
         # this probe; needs a generous max_tokens or reasoning-aware detection to be
         # recognized as alive, same class of issue _peek_until_content already handles
         # for streaming via saw_reasoning — see _finish()'s non-streaming probe path).
-        "default_free_models": ["deepseek-v4-flash-free", "north-mini-code-free", "mimo-v2.5-free"],
-        "notes": "OpenCode's own multi-model gateway. Free = zero-priced '-free' models (DeepSeek/MiniMax/GLM/Nemotron).",
+        # NOT USABLE FROM THE HUB, measured 2026-10-24. The free models DID answer a plain
+        # HTTP client on 2026-07-27 (see above); OpenCode has since gated them. With a model
+        # taken from its LIVE catalog (glm-5.3-flash-free) every saved key now gets HTTP 403
+        # {"type":"FreeTierError","message":"OpenCode's free tier can only be used from
+        # within OpenCode. Download it at https://opencode.ai and keep building."}. The keys
+        # and ids are fine; the tier is gated to OpenCode's own client, and this hub never
+        # spoofs a client. (The official `opencode` CLI does answer free models with no
+        # login -- a CLI relay is the only compliant path; it was considered, not built.)
+        # So: paid-marked with no defaults, the Together precedent -- out of free routing and
+        # no longer "Recommended" on the strength of ids it will not serve us.
+        "paid": True,
+        "default_free_models": [],
+        "notes": "NOT usable from this hub: OpenCode's free '-free' models answer HTTP 403 FreeTierError (\"OpenCode's free tier can only be used from within OpenCode\") to any other client, whatever the key; your keys are not the problem. It worked from a plain client until OpenCode gated it (verified 2026-07-27, gated by 2026-10-24). Kept so a funded account can still pin opencode-zen/<paid model>.",
     },
     "llama": {
         "name": "Meta Llama API",
@@ -1035,8 +1051,12 @@ PROVIDERS: Dict[str, dict] = {
         "signup_url": "https://zenmux.ai/settings/keys",
         "key_hint": "sk-...",
         "free_filter": "pricing_zero",
-        "default_free_models": ["moonshotai/kimi-k2.7-code-free", "z-ai/glm-5.2-free"],
-        "notes": "Model router with free '-free' variants (Kimi/GLM). Free = zero-priced models.",
+        # 2026-10-24: kimi-k2.7-code-free and glm-5.2-free no longer exist; the live
+        # catalog's free ones are the two below (the per-key Test answered correctly
+        # on glm-4.6v-flash-free). Several keys on this provider are PAYG keys that
+        # 403 "no permission" on free models -- the Test shows which keys work.
+        "default_free_models": ["z-ai/glm-4.6v-flash-free", "z-ai/glm-4.7-flash-free"],
+        "notes": "Model router with free '-free' variants (GLM flash today). Free = zero-priced models. A key created as pay-as-you-go (api_key_source: payg) gets HTTP 403 'no permission' on the free models; press Test to see which of your keys work and remove the rest.",
     },
     "unorouter": {
         "name": "UnoRouter",
@@ -1387,8 +1407,114 @@ PROVIDERS: Dict[str, dict] = {
         # Chat-verified 200 anonymously on 2026-07-30 (fallback if discovery
         # fails). openai/gpt-4.1:free 404s "unavailable for free" — free slugs
         # rotate with the upstream OpenRouter pool.
-        "default_free_models": ["stepfun/step-3.7-flash:free"],
+        # 2026-10-24: stepfun/step-3.7-flash:free is gone from the catalog (it made the
+        # card read "all models dead" while the provider was serving fine). Replaced by
+        # recursive/flint-v1.0:free, which answered HTTP 200 anonymously today and has
+        # served the hub's tool turns all day. Discovery still finds the other :free ids.
+        "default_free_models": ["recursive/flint-v1.0:free"],
         "notes": "Anonymous free tier of the Kilo Code OpenRouter relay: no signup, the literal bearer 'anonymous' authenticates. Free ids carry the ':free' suffix. Unstable community-run gateway: the anonymous tier is a courtesy, rate limits are unpublished (quota tracks it as UNKNOWN), quality varies and it can go down without warning — no SLA.",
+    },
+    # ADDED 2026-10-23 at owner request ("add inception, the diffusion model, with
+    # free API quota"). Facts READ from the official docs and the live API the same
+    # day, not recalled:
+    #   * OpenAI-compatible, https://api.inceptionlabs.ai/v1, Bearer key from
+    #     platform.inceptionlabs.ai/dashboard/api-keys.
+    #   * "Each new user is initially assigned 100 million free tokens", no payment
+    #     details required (docs.inceptionlabs.ai/get-started). A ONE-TIME credit,
+    #     not a monthly quota. Free-tier rate limit (docs rate-limits page): 1,000
+    #     requests/min, 1,000,000 input + 100,000 output tokens/min.
+    #   * GET /v1/models is PUBLIC (200 with no key) and carries OpenRouter-style
+    #     pricing, context_length and supported_features, so free-ness AND windows
+    #     are discoverable: mercury-3 (1M ctx, tools, priced $0 today), mercury-2.5
+    #     (260K, $0.20/$0.75 per M), mercury-2 (128K, $0.25/$0.75), mercury-decide
+    #     (65K, a classifier, no tools -- not a chat model).
+    # pricing_zero (NOT "all"): only a zero-priced id is routed as free, and the
+    # filter reads the live catalog, so mercury-3 leaves free routing the day
+    # Inception puts a price on it. mercury-2 / 2.5 are billed models the signup
+    # credit happens to cover: they stay pin-only (inception/mercury-2.5).
+    "inception": {
+        "name": "Inception (Mercury)",
+        # Hand-curated Recommended zone, owner request 2026-10-23.
+        "recommended": True,
+        "base_url": "https://api.inceptionlabs.ai/v1",
+        "models_url": "https://api.inceptionlabs.ai/v1/models",
+        "signup_url": "https://platform.inceptionlabs.ai/dashboard/api-keys",
+        "key_hint": "key from platform.inceptionlabs.ai (API Keys page)",
+        "free_filter": "pricing_zero",
+        "default_free_models": ["mercury-3"],
+        "notes": "Official API of Inception Labs, maker of the Mercury DIFFUSION LLMs (they generate many tokens in parallel, so replies are very fast). Every new key starts with 100,000,000 free tokens (one-time, no card required) and the free tier allows 1,000 requests/min, 1M input and 100K output tokens/min (docs checked 2026-10-23). Only zero-priced models are routed as free: today that is mercury-3 (1M context, tool calling). mercury-2 and mercury-2.5 (tool calling too) are billed models the free credit also covers — pin inception/mercury-2.5 to use them. If you add a card on the Billing page, the priced ones become billable. Quality: fast but mid-tier on the public boards (Artificial Analysis 60 for mercury-2, 61.5 for mercury-2.5; Arena 1342), so the hub uses it for quick turns and as a fast fallback, not as a flagship.",
+    },
+    # ADDED 2026-10-23 at owner request ("add codecraftapi.com as provider, in the
+    # recommended list"). READ from codecraftapi.com the same day -- and this is a
+    # judgment call the owner made over these red flags, recorded so it is not lost:
+    #   * a paid, token-based OpenAI-compatible gateway ("33 models", only six shown);
+    #     base https://codecraftapi.com/v1, keys start "cc_", "1M tokens free every
+    #     month, no card" (prompt + reply combined), plans differ only in volume;
+    #   * NO company name/address/contact on the site, pays via crypto (Binance
+    #     Pay), claims frontier models (Claude Opus 4.8, Claude Fable 5, GPT-5.6
+    #     Luna) at gateway prices, and a web search found nothing independent about
+    #     the domain. Treat every claimed proprietary id as unproven.
+    #   * GET /v1/models answers 401 without a key, so the ids below come from the
+    #     marketing page, NOT from the API -- they are unverified until a key is added.
+    # So: relay class (see app._RELAY_DISCOUNT / _TOOL_RELAY_PIDS: 4-point discount,
+    # notice and dead-end gates, no board bonus for a claimed Claude/GPT until a
+    # MEASURED healthy record exists), and the free list is the open-weight ids only.
+    "codecraft": {
+        "name": "CodeCraft API",
+        # Hand-curated Recommended zone at the owner's explicit request.
+        "recommended": True,
+        "base_url": "https://codecraftapi.com/v1",
+        "models_url": "https://codecraftapi.com/v1/models",
+        "signup_url": "https://codecraftapi.com/register",
+        "key_hint": "cc_...",
+        "free_filter": "family",
+        "free_families": ["deepseek-v4-flash", "deepseek-v4-pro", "qwen3.8-27b",
+                          "seed-2.1-turbo"],
+        "default_free_models": ["deepseek-v4-flash-0731", "qwen3.8-27b",
+                                "seed-2.1-turbo", "deepseek-v4-pro-0813"],
+        "notes": "Third-party gateway, free plan = 1,000,000 tokens per month (prompt + reply), no card, same catalog on every plan; per-minute limits are not published. CAUTION: the site shows no company details, accepts crypto payments and claims Claude/GPT models it cannot be verified to be authorised to resell — treat it as an untrusted relay and do NOT send private code, secrets or customer data through it. The hub discounts it like g4f and only routes the open-weight ids below as free; any Claude/GPT id it lists stays pin-only until it earns a measured healthy record. The model list needs a key (401 without), so the ids come from the marketing page: after adding a key press Test, and if discovery shows different ids the free_families need updating.",
+    },
+    # ADDED 2026-10-24 at owner request ("add radoxai.com ... and freemodel.in, show
+    # them first in Recommended, labelled New"). READ from the two sites the same day.
+    # BOTH ARE THE SAME PRODUCT AS codecraftapi.com: identical page template, the same
+    # six model cards (gemma-2-2b, deepseek-v4-flash-0731, gpt-5.6-luna, deepseek-v4-pro-0813,
+    # qwen3.8-27b, seed-2.1-turbo), the same "31-33 models" claim, the same claude-opus-4.8
+    # sample and plan structure -- on DIFFERENT servers (radoxai.com and codecraftapi.com
+    # behind Cloudflare, freemodel.in on its own host), so one white-label gateway kit, not
+    # provably one operator. None names a company; crypto is accepted (freemodel.in: crypto
+    # only). freemodel.in's public /v1/models lists 53 ids incl. claude-opus-5-5,
+    # claude-fable-5-1, claude-mythos-preview, gpt-5.6-sol and gpt-6-luna at ~$0.056 per
+    # MILLION input tokens -- a price no genuine Opus/Sol resale can sustain, so every
+    # claimed Claude/GPT id is treated as unproven. Its catalog also took 31 s to download.
+    # Same handling as codecraft: relay class (app._RELAY_DISCOUNT / _TOOL_RELAY_PIDS) and
+    # only open-weight ids as free.
+    "radoxai": {
+        "name": "Radox AI",
+        "recommended": True,
+        "base_url": "https://radoxai.com/v1",
+        "models_url": "https://radoxai.com/v1/models",
+        "signup_url": "https://radoxai.com/register",
+        "key_hint": "sk-...",
+        "free_filter": "family",
+        "free_families": ["deepseek-v4-flash", "deepseek-v4-pro", "qwen3.8-27b", "seed-2.1-turbo"],
+        "default_free_models": ["deepseek-v4-flash-0731", "qwen3.8-27b",
+                                "seed-2.1-turbo", "deepseek-v4-pro-0813"],
+        "notes": "Third-party gateway, free plan = 500,000 tokens per month (prompt + reply), no card, same catalog on every plan; per-minute limits are not published. CAUTION: same page template, model list and claims as codecraftapi.com and freemodel.in, no company details, crypto accepted, and it claims Claude/GPT models it cannot be verified to resell — treat it as an untrusted relay and do NOT send private code, secrets or customer data through it. The hub discounts it like g4f and only routes the open-weight ids as free; any Claude/GPT id stays pin-only until it earns a measured healthy record. The model list needs a key (401 without), so the ids come from the marketing page: after adding a key press Test.",
+    },
+    "freemodel": {
+        "name": "FreeModel",
+        "recommended": True,
+        "base_url": "https://freemodel.in/v1",
+        "models_url": "https://freemodel.in/v1/models",
+        "signup_url": "https://freemodel.in/register",
+        "key_hint": "cc_...",
+        "free_filter": "family",
+        "free_families": ["deepseek-v4-flash", "deepseek-v4.1-flash", "qwen3.8-27b",
+                          "seed-2.1-turbo", "mimo-v2.6-flash", "glm-5.3-flash"],
+        # All four are in the live catalog (read 2026-10-24); open-weight models only.
+        "default_free_models": ["deepseek-v4.1-flash", "glm-5.3-flash",
+                                "mimo-v2.6-flash", "qwen3.8-27b"],
+        "notes": "Third-party gateway, free plan = 1,000,000 tokens per month (prompt + reply), no card, same catalog on every plan; usage beyond it bills your balance (empty balance = HTTP 402). Its /v1/models is public but SLOW (31 s for 53 ids when read), so discovery may fall back to the pinned ids. CAUTION: same page template, model list and claims as codecraftapi.com and radoxai.com, no company details, payment in crypto only, and a catalog of Claude Opus 5.5 / Fable / Mythos / GPT-5.6 Sol at ~$0.056 per million input tokens, which no genuine resale can sustain — treat it as an untrusted relay and do NOT send private code, secrets or customer data through it. The hub discounts it like g4f and only routes open-weight ids as free.",
     },
     "puter": {
         "name": "Puter",
@@ -1561,36 +1687,19 @@ PROVIDERS: Dict[str, dict] = {
         ],
         "notes": "Serverless OpenAI-compatible inference. Free = DeepInfra's legacy Open Source models (no card to use them; a card only unlocks the PAID catalog). Covers many of the same flagship ids as the rest of the fleet, so the hub can spread a single model across hosts. Limit ~10 req/min on the free OS models (real 429s sideline it); billable if you pin a non-OS id.",
     },
-    "together": {
-        "name": "Together AI",
-        "base_url": "https://api.together.xyz/v1",
-        "models_url": "https://api.together.xyz/v1/models",
-        "signup_url": "https://api.together.xyz/settings/api-keys",
-        "key_hint": "tgp_... (requires a funded account — see notes)",
-        # NO LONGER FREE, confirmed 2026-08-30 on a real account. Together now
-        # puts a new account in READ-ONLY mode until it takes a deposit — its
-        # own dashboard says "You're currently in read-only mode. Make an
-        # initial deposit to unlock full access." A key issued in that state is
-        # created fine but rejected on EVERY authenticated endpoint (/v1/models,
-        # /v1/completions, /v1/chat/completions, /v1/fine-tunes all 401 "Invalid
-        # API key provided"), which reads exactly like a mistyped key and cost a
-        # long debugging detour. Two freshly-generated keys, 20 minutes old,
-        # behaved identically.
-        #
-        # paid + empty default_free_models is the puter precedent: a populated
-        # free list is returned as "free models" REGARDLESS of free_filter and
-        # would put a deposit-gated provider back into free auto-rotation, where
-        # every pick is a wasted hop. It stays in the registry (not deleted) so
-        # anyone who does fund an account can still pin '<pid>/<model>'
-        # explicitly, and so this finding is not lost the next time someone
-        # wonders why Together is missing.
-        "paid": True,
-        "free_filter": "family",
-        "free_exact": False,
-        "free_families": ["-free"],
-        "default_free_models": [],
-        "notes": "NOT free as of 2026-08-30: a new account is held in read-only mode until you make an initial deposit, and keys issued before that 401 on every endpoint with a misleading 'Invalid API key provided'. Kept out of free routing entirely. The '-Free'/'-Turbo-Free' slugs still exist and become reachable via an explicit '<pid>/<model>' pin once the account is funded.",
-    },
+    # REMOVED 2026-10-24 at explicit owner request ("check if Together AI doesn't give
+    # free API anymore; if not, remove it"). It has not been free since 2026-08-30:
+    # a new account is held in READ-ONLY mode until an initial deposit, and a key issued
+    # before that 401s "Invalid API key provided" on EVERY endpoint (confirmed on a real
+    # account with two fresh keys). Re-checked 2026-10-24 against Together's own pages:
+    # support.together.ai "Changes to free tier and billing" (updated 2026-06-01) and
+    # docs.together.ai/docs/billing say there is no free trial and a $5 minimum credit
+    # purchase; the third-party "$1/$5 free credits" pages are stale. A saved key moves
+    # to config's `retired_providers` (migrations v4), never deleted. Kept as a comment,
+    # not code, so a future re-add starts from the measured facts:
+    #   base_url    https://api.together.xyz/v1
+    #   signup_url  https://api.together.xyz/settings/api-keys
+    #   nature      prepaid ($5 minimum), no free tier
     "hyperbolic": {
         "name": "Hyperbolic",
         "base_url": "https://api.hyperbolic.xyz/v1",
